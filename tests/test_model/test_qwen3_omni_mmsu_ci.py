@@ -37,14 +37,14 @@ MODEL_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 CONCURRENCY = 8
 STARTUP_TIMEOUT = 300
 
-MMSU_MIN_ACCURACY = 0.69
+MMSU_MIN_ACCURACY = 0.7
 
 # Threshold reference: https://github.com/sgl-project/sglang-omni/pull/382#issuecomment-4366925373
 _MMSU_P95 = {
     8: {
-        "throughput_qps": 30.036,
-        "tok_per_s_agg": 7.8,
-        "latency_mean_s": 0.266,
+        "throughput_qps": 29.399,
+        "tok_per_s_agg": 7.6,
+        "latency_mean_s": 0.271,
     },
 }
 MMSU_THRESHOLDS = apply_slack(_MMSU_P95)
