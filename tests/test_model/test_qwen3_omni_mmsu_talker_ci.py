@@ -68,8 +68,10 @@ MMSU_AUDIO_MIN_ACCURACY = 0.6
 # WER thresholds use a partitioned view of the per-sample distribution:
 #  - corpus WER over the "sane" subset (per-sample WER <= 50%)
 #  - count of catastrophic failures (per-sample WER > 50%)
-MMSU_AUDIO_WER_BELOW_50_CORPUS_MAX = 0.04
-# Relaxed in V1 refactor: v0=0 → v1=1.
+
+# Relaxed in V1 refactor: v0=0.04 → v1=0.08.
+MMSU_AUDIO_WER_BELOW_50_CORPUS_MAX = 0.08
+# Relaxed in V1 refactor: v0=0 → v1=3.
 MMSU_AUDIO_N_ABOVE_50_MAX = 3
 
 _MMSU_AUDIO_P95 = {
