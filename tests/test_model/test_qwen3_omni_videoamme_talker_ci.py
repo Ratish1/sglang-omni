@@ -49,7 +49,7 @@ _VIDEOAMME_TALKER_AUDIO_P95 = {
         "throughput_qps": 0.127,
         "tok_per_s_agg": 1.3,
         "latency_mean_s": 35.227,
-        "rtf_mean": 7.0128,
+        "rtf_mean": 6.8759,
     },
 }
 VIDEOAMME_TALKER_THRESHOLDS = apply_slack(_VIDEOAMME_TALKER_AUDIO_P95)

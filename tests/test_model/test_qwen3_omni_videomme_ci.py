@@ -33,7 +33,7 @@ VIDEOMME_MIN_ACCURACY = 0.53
 _VIDEOMME_P95 = {
     16: {
         "throughput_qps": 0.229,
-        "tok_per_s_agg": 2.1,
+        "tok_per_s_agg": 2.0,
         "latency_mean_s": 53.48,
     },
 }
