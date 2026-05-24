@@ -10,8 +10,8 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.communication_op import (
-    attention_tensor_model_parallel_all_reduce,
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce as attention_tensor_model_parallel_all_reduce,
 )
 
 # Optional monkey patches (example):

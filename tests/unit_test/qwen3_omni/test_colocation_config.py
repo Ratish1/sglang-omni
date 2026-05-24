@@ -191,6 +191,8 @@ def test_default_speech_allows_thinker_tp_placement() -> None:
     thinker.tp_size = 2
     thinker.parallelism.tp = 2
     thinker.gpu = [0, 1]
+    _stage(config, "talker_ar").gpu = 2
+    _stage(config, "code2wav").gpu = 2
 
     plan = build_stage_placement_plan(config)
 
