@@ -10,6 +10,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.communication_op import (
+    attention_tensor_model_parallel_all_reduce,
+)
 
 # Optional monkey patches (example):
 # def tensor_model_parallel_all_reduce(x):
@@ -18,5 +21,6 @@ from sglang.srt.distributed import (
 __all__ = [
     "get_tensor_model_parallel_rank",
     "get_tensor_model_parallel_world_size",
+    "attention_tensor_model_parallel_all_reduce",
     "tensor_model_parallel_all_reduce",
 ]

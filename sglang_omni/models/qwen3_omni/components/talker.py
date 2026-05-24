@@ -23,7 +23,10 @@ from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerTextConfig,
 )
 from sglang_omni.vendor.sglang.core import ForwardBatch
-from sglang_omni.vendor.sglang.distributed import tensor_model_parallel_all_reduce
+from sglang_omni.vendor.sglang.distributed import (
+    attention_tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce,
+)
 from sglang_omni.vendor.sglang.layers import (
     MergedColumnParallelLinear,
     QuantizationConfig,
@@ -53,6 +56,17 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         batch, num_kv_heads, n_rep, seq_len, head_dim
     )
     return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
+
+
+def _reduce_attention_output_if_needed(
+    attn: Qwen3OmniMoeThinkerTextAttention,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Complete TP attention output when code predictor bypasses LayerCommunicator."""
+    o_proj = attn.o_proj
+    if getattr(o_proj, "tp_size", 1) <= 1 or getattr(o_proj, "reduce_results", True):
+        return output
+    return attention_tensor_model_parallel_all_reduce(output)
 
 
 class ResizeMLP(nn.Module):
@@ -575,6 +589,10 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            hidden_states = _reduce_attention_output_if_needed(
+                layer.self_attn,
+                hidden_states,
+            )
             hidden_states = residual + hidden_states
 
             # Pre-norm MLP with residual
@@ -712,6 +730,7 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             batch_size * seq_len, attn.num_heads * attn.head_dim
         )
         attn_output, _ = attn.o_proj(attn_output)
+        attn_output = _reduce_attention_output_if_needed(attn, attn_output)
         return attn_output.reshape(batch_size, seq_len, hidden_size)
 
 
@@ -1381,6 +1400,7 @@ class Qwen3OmniTalker(nn.Module):
             batch_size, attn.num_heads * attn.head_dim
         )
         attn_output, _ = attn.o_proj(attn_output)
+        attn_output = _reduce_attention_output_if_needed(attn, attn_output)
         return attn_output.reshape(batch_size, 1, hidden_size)
 
     def code_predictor_forward(
