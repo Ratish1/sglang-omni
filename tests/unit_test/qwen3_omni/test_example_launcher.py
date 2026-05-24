@@ -29,6 +29,7 @@ def _load_example_module():
 _mod = _load_example_module()
 _launch_speech_server = _mod._launch_speech_server
 _parse_thinker_tp_gpu_list = _mod._parse_thinker_tp_gpu_list
+_parse_talker_tp_gpu_list = _mod._parse_talker_tp_gpu_list
 
 
 def _make_args(**overrides) -> argparse.Namespace:
@@ -42,6 +43,8 @@ def _make_args(**overrides) -> argparse.Namespace:
         gpu_audio_encoder=0,
         thinker_tp_size=1,
         gpu_thinker_tp=None,
+        talker_tp_size=1,
+        gpu_talker_tp=None,
         relay_backend="shm",
         thinker_max_seq_len=8192,
         mem_fraction_static=None,
@@ -97,6 +100,21 @@ def test_tp1_default_config_contract(mock_launch_server):
     assert thinker.gpu == 0
 
 
+def test_talker_tp2_config_contract_keeps_code2wav_single_rank(mock_launch_server):
+    args = _make_args(talker_tp_size=2, gpu_talker_tp="1,2", gpu_code2wav=2)
+    _launch_speech_server(args)
+
+    config = mock_launch_server.call_args[0][0]
+    talker = _stage(config, "talker_ar")
+    code2wav = _stage(config, "code2wav")
+
+    assert talker.tp_size == 2
+    assert talker.parallelism.tp == 2
+    assert talker.gpu == [1, 2]
+    assert code2wav.tp_size == 1
+    assert code2wav.gpu == 2
+
+
 def test_mem_fractions_applied(mock_launch_server):
     args = _make_args(
         thinker_mem_fraction_static=0.55,
@@ -113,7 +131,7 @@ def test_mem_fractions_applied(mock_launch_server):
 
 
 def test_parse_thinker_tp_rejects_length_mismatch():
-    with pytest.raises(ValueError, match="1 entries.*thinker-tp-size=2"):
+    with pytest.raises(ValueError, match="1 entries.*tp_size=2"):
         _parse_thinker_tp_gpu_list("0", tp_size=2)
 
 
@@ -132,6 +150,11 @@ def test_parse_thinker_tp_rejects_non_integers():
         _parse_thinker_tp_gpu_list("x,1", tp_size=2)
 
 
+def test_parse_talker_tp_rejects_duplicates():
+    with pytest.raises(ValueError, match="distinct"):
+        _parse_talker_tp_gpu_list("1,1", tp_size=2)
+
+
 def test_tp_greater_than_1_requires_gpu_thinker_tp(mock_launch_server):
     args = _make_args(thinker_tp_size=2, gpu_thinker_tp=None)
     with pytest.raises(ValueError, match="requires --gpu-thinker-tp"):
@@ -143,6 +166,34 @@ def test_tp_greater_than_1_requires_gpu_thinker_tp(mock_launch_server):
 def test_gpu_thinker_tp_rejected_when_tp1(mock_launch_server):
     args = _make_args(thinker_tp_size=1, gpu_thinker_tp="0,1")
     with pytest.raises(ValueError, match="only applies when.*thinker-tp-size > 1"):
+        _launch_speech_server(args)
+
+    mock_launch_server.assert_not_called()
+
+
+def test_talker_tp_greater_than_1_requires_gpu_talker_tp(mock_launch_server):
+    args = _make_args(talker_tp_size=2, gpu_talker_tp=None)
+    with pytest.raises(ValueError, match="requires --gpu-talker-tp"):
+        _launch_speech_server(args)
+
+    mock_launch_server.assert_not_called()
+
+
+def test_gpu_talker_tp_rejected_when_tp1(mock_launch_server):
+    args = _make_args(talker_tp_size=1, gpu_talker_tp="1,2")
+    with pytest.raises(ValueError, match="only applies when.*talker-tp-size > 1"):
+        _launch_speech_server(args)
+
+    mock_launch_server.assert_not_called()
+
+
+def test_code_predictor_scalar_override_rejected_for_talker_tp(mock_launch_server):
+    args = _make_args(
+        talker_tp_size=2,
+        gpu_talker_tp="1,2",
+        gpu_code_predictor=1,
+    )
+    with pytest.raises(ValueError, match="code_predictor"):
         _launch_speech_server(args)
 
     mock_launch_server.assert_not_called()

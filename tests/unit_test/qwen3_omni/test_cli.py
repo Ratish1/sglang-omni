@@ -59,6 +59,8 @@ def _serve_kwargs(**overrides):
         log_level="info",
         thinker_tp_size=None,
         thinker_gpus=None,
+        talker_tp_size=None,
+        talker_gpus=None,
         talker_gpu=None,
         code2wav_gpu=None,
         thinker_cuda_graph="default",
@@ -205,6 +207,8 @@ def test_speech_colocated_rejects_talker_gpu_override_to_other_gpu():
             config,
             thinker_tp_size=None,
             thinker_gpus=None,
+            talker_tp_size=None,
+            talker_gpus=None,
             talker_gpu=1,
             code2wav_gpu=None,
         )
@@ -218,8 +222,25 @@ def test_speech_colocated_rejects_code2wav_gpu_override_to_other_gpu():
             config,
             thinker_tp_size=None,
             thinker_gpus=None,
+            talker_tp_size=None,
+            talker_gpus=None,
             talker_gpu=None,
             code2wav_gpu=1,
+        )
+
+
+def test_speech_colocated_rejects_talker_tp_override():
+    config = Qwen3OmniSpeechColocatedPipelineConfig(model_path="dummy")
+
+    with pytest.raises(typer.BadParameter, match="talker-tp-size"):
+        apply_parallelism_cli_overrides(
+            config,
+            thinker_tp_size=None,
+            thinker_gpus=None,
+            talker_tp_size=2,
+            talker_gpus="0,1",
+            talker_gpu=None,
+            code2wav_gpu=None,
         )
 
 
@@ -230,12 +251,44 @@ def test_speech_colocated_allows_gpu_override_to_same_gpu():
         config,
         thinker_tp_size=None,
         thinker_gpus=None,
+        talker_tp_size=None,
+        talker_gpus=None,
         talker_gpu=0,
         code2wav_gpu=0,
     )
 
     assert next(stage for stage in config.stages if stage.name == "talker_ar").gpu == 0
     assert next(stage for stage in config.stages if stage.name == "code2wav").gpu == 0
+
+
+def test_talker_parallelism_rejects_scalar_and_list_conflict():
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+
+    with pytest.raises(typer.BadParameter, match="cannot be combined"):
+        apply_parallelism_cli_overrides(
+            config,
+            thinker_tp_size=None,
+            thinker_gpus=None,
+            talker_tp_size=2,
+            talker_gpus="1,2",
+            talker_gpu=1,
+            code2wav_gpu=None,
+        )
+
+
+def test_talker_parallelism_requires_one_gpu_per_tp_rank():
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+
+    with pytest.raises(typer.BadParameter, match="exactly 2 GPU ids"):
+        apply_parallelism_cli_overrides(
+            config,
+            thinker_tp_size=None,
+            thinker_gpus=None,
+            talker_tp_size=2,
+            talker_gpus="1,2,3",
+            talker_gpu=None,
+            code2wav_gpu=None,
+        )
 
 
 def test_cuda_graph_cli_override_reaches_resolved_sglang_args():

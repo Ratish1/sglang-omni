@@ -392,11 +392,71 @@ def _validate_colocated_gpu_override(
         )
 
 
+def _validate_colocated_stage_parallelism_override(
+    pipeline_config: PipelineConfig,
+    *,
+    stage_name: str,
+    flag_prefix: str,
+    tp_size: int | None,
+    gpu_override: int | list[int] | None,
+) -> None:
+    if type(pipeline_config).__name__ != _QWEN_COLOCATED_CONFIG_CLASS:
+        return
+    if tp_size is not None and tp_size != 1:
+        raise typer.BadParameter(
+            f"--{flag_prefix}-tp-size cannot enable TP with --colocate"
+        )
+    if gpu_override is None:
+        return
+    if isinstance(gpu_override, list):
+        if len(gpu_override) != 1:
+            raise typer.BadParameter(
+                f"--{flag_prefix}-gpus cannot enable TP with --colocate"
+            )
+        gpu = int(gpu_override[0])
+    else:
+        gpu = int(gpu_override)
+    _validate_colocated_gpu_override(
+        pipeline_config,
+        stage_name=stage_name,
+        flag_name=f"--{flag_prefix}-gpus",
+        gpu=gpu,
+    )
+
+
+def _apply_stage_parallelism_override(
+    pipeline_config: PipelineConfig,
+    *,
+    stage_name: str,
+    tp_size: int | None,
+    gpu_override: int | list[int] | None,
+) -> None:
+    if tp_size is None and gpu_override is None:
+        return
+
+    matching_stages = _find_matching_stages(
+        pipeline_config,
+        stage_name=stage_name,
+        reason="tensor parallel settings",
+    )
+    for stage in matching_stages:
+        if tp_size is not None:
+            stage.tp_size = int(tp_size)
+            stage.parallelism.tp = stage.tp_size
+        if gpu_override is not None:
+            stage.gpu = gpu_override
+        _validate_stage_parallelism_config(stage_name, stage.tp_size, stage.gpu)
+        if stage.tp_size == 1 and isinstance(stage.gpu, list):
+            stage.gpu = int(stage.gpu[0])
+
+
 def apply_parallelism_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
     thinker_tp_size: int | None,
     thinker_gpus: str | None,
+    talker_tp_size: int | None,
+    talker_gpus: str | None,
     talker_gpu: int | None,
     code2wav_gpu: int | None,
 ) -> PipelineConfig:
@@ -405,22 +465,27 @@ def apply_parallelism_cli_overrides(
         if thinker_gpus is not None
         else None
     )
-    if thinker_tp_size is not None or thinker_gpu_override is not None:
-        thinker_stages = _find_matching_stages(
-            pipeline_config,
-            stage_name="thinker",
-            reason="tensor parallel settings",
-        )
-        for stage in thinker_stages:
-            if thinker_tp_size is not None:
-                stage.tp_size = int(thinker_tp_size)
-                stage.parallelism.tp = stage.tp_size
-            if thinker_gpu_override is not None:
-                stage.gpu = thinker_gpu_override
-            _validate_stage_parallelism_config("thinker", stage.tp_size, stage.gpu)
-            if stage.tp_size == 1 and isinstance(stage.gpu, list):
-                stage.gpu = int(stage.gpu[0])
+    talker_gpu_override = (
+        _parse_gpu_placement("talker_gpus", talker_gpus)
+        if talker_gpus is not None
+        else None
+    )
+    if talker_gpu is not None and talker_gpu_override is not None:
+        raise typer.BadParameter("--talker-gpu cannot be combined with --talker-gpus")
 
+    _validate_colocated_stage_parallelism_override(
+        pipeline_config,
+        stage_name="talker_ar",
+        flag_prefix="talker",
+        tp_size=talker_tp_size,
+        gpu_override=talker_gpu_override,
+    )
+    _apply_stage_parallelism_override(
+        pipeline_config,
+        stage_name="thinker",
+        tp_size=thinker_tp_size,
+        gpu_override=thinker_gpu_override,
+    )
     _validate_colocated_gpu_override(
         pipeline_config,
         stage_name="talker_ar",
@@ -433,10 +498,13 @@ def apply_parallelism_cli_overrides(
         flag_name="--code2wav-gpu",
         gpu=code2wav_gpu,
     )
-    _apply_stage_gpu_override(
+    _apply_stage_parallelism_override(
         pipeline_config,
         stage_name="talker_ar",
-        gpu=talker_gpu,
+        tp_size=talker_tp_size,
+        gpu_override=(
+            talker_gpu_override if talker_gpu_override is not None else talker_gpu
+        ),
     )
     _apply_stage_gpu_override(
         pipeline_config,
@@ -634,6 +702,22 @@ def serve(
             help="GPU ids for thinker TP ranks, e.g. '0,1' or '[0, 1]'.",
         ),
     ] = None,
+    talker_tp_size: Annotated[
+        int | None,
+        typer.Option(
+            "--talker-tp-size",
+            "--talker_tp_size",
+            help="Set tensor parallel size for talker_ar stage.",
+        ),
+    ] = None,
+    talker_gpus: Annotated[
+        str | None,
+        typer.Option(
+            "--talker-gpus",
+            "--talker_gpus",
+            help="GPU ids for talker_ar TP ranks, e.g. '2,3' or '[2, 3]'.",
+        ),
+    ] = None,
     talker_gpu: Annotated[
         int | None,
         typer.Option(
@@ -752,6 +836,8 @@ def serve(
         merged_config,
         thinker_tp_size=thinker_tp_size,
         thinker_gpus=thinker_gpus,
+        talker_tp_size=talker_tp_size,
+        talker_gpus=talker_gpus,
         talker_gpu=talker_gpu,
         code2wav_gpu=code2wav_gpu,
     )

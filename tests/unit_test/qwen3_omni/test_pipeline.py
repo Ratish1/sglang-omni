@@ -608,6 +608,8 @@ def test_qwen_cli_thinker_tp_override_keeps_parallelism_alias_in_sync() -> None:
         config,
         thinker_tp_size=2,
         thinker_gpus="0,1",
+        talker_tp_size=None,
+        talker_gpus=None,
         talker_gpu=None,
         code2wav_gpu=None,
     )
@@ -616,6 +618,28 @@ def test_qwen_cli_thinker_tp_override_keeps_parallelism_alias_in_sync() -> None:
     assert thinker.tp_size == 2
     assert thinker.parallelism.tp == 2
     assert thinker.gpu == [0, 1]
+
+
+def test_qwen_cli_talker_tp_override_keeps_parallelism_alias_in_sync() -> None:
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+
+    apply_parallelism_cli_overrides(
+        config,
+        thinker_tp_size=None,
+        thinker_gpus=None,
+        talker_tp_size=2,
+        talker_gpus="2,3",
+        talker_gpu=None,
+        code2wav_gpu=3,
+    )
+
+    talker = _stage(config, "talker_ar")
+    code2wav = _stage(config, "code2wav")
+    assert talker.tp_size == 2
+    assert talker.parallelism.tp == 2
+    assert talker.gpu == [2, 3]
+    assert code2wav.tp_size == 1
+    assert code2wav.gpu == 3
 
 
 def test_qwen_thinker_auto_path_applies_encoder_reserve() -> None:

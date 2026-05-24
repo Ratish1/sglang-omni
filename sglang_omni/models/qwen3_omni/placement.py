@@ -41,6 +41,7 @@ class Qwen3OmniPlacementPolicy:
         has_speech_stage = "talker_ar" in stage_map or "code2wav" in stage_map
         if has_speech_stage:
             self._validate_speech_topology(stage_map)
+            self._validate_code2wav_parallelism(stage_map)
 
         if not has_speech_stage:
             return
@@ -55,8 +56,6 @@ class Qwen3OmniPlacementPolicy:
         talker = plan.stages.get("talker_ar")
         if thinker is None or talker is None:
             return
-        if thinker.tp_size != 1 or talker.tp_size != 1:
-            return
         if not set(thinker.gpu_ids).intersection(talker.gpu_ids):
             return
 
@@ -64,6 +63,11 @@ class Qwen3OmniPlacementPolicy:
             "Qwen thinker and talker_ar may share a GPU only with "
             f"{_COLOCATED_CONFIG_CLASS}"
         )
+
+    def _validate_code2wav_parallelism(self, stage_map) -> None:
+        stage = stage_map.get("code2wav")
+        if stage is not None and stage.tp_size != 1:
+            raise ValueError("Qwen code2wav does not support TP")
 
     def _validate_colocated_qwen_parallelism(self, stage_map) -> None:
         for stage_name in _AR_STAGES:

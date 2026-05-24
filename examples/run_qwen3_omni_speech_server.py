@@ -22,6 +22,12 @@ Usage::
         --thinker-tp-size 4 --gpu-thinker-tp 0,1,2,3 \
         --gpu-talker 4 --gpu-code2wav 4
 
+    # Talker TP=2 across two cards, code2wav stays single-rank:
+    python examples/run_qwen3_omni_speech_server.py \
+        --gpu-thinker 0 \
+        --talker-tp-size 2 --gpu-talker-tp 1,2 \
+        --gpu-code2wav 2
+
     # Then test:
     curl http://localhost:8000/v1/chat/completions \\
         -H "Content-Type: application/json" \\
@@ -85,6 +91,26 @@ def parse_args() -> argparse.Namespace:
             "Comma-separated GPU ids for thinker when --thinker-tp-size > 1, "
             "e.g. '0,1'. Length must equal --thinker-tp-size. Overrides "
             "--gpu-thinker when set."
+        ),
+    )
+    parser.add_argument(
+        "--talker-tp-size",
+        type=int,
+        default=1,
+        help=(
+            "Tensor-parallel size for the talker_ar stage. When > 1, also "
+            "pass --gpu-talker-tp with exactly that many GPU ids. code2wav "
+            "remains a separate single-rank stage."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-talker-tp",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated GPU ids for talker_ar when --talker-tp-size > 1, "
+            "e.g. '1,2'. Length must equal --talker-tp-size. Overrides "
+            "--gpu-talker when set."
         ),
     )
 
@@ -188,25 +214,32 @@ def _set_stage_tp_size(config: Any, stage_name: str, tp_size: int) -> None:
     )
 
 
-def _parse_thinker_tp_gpu_list(spec: str, tp_size: int) -> list[int]:
+def _parse_tp_gpu_list(flag_name: str, spec: str, tp_size: int) -> list[int]:
     try:
         gpu_ids = [int(piece.strip()) for piece in spec.split(",") if piece.strip()]
     except ValueError as exc:
         raise ValueError(
-            f"--gpu-thinker-tp must be a comma-separated list of integers, "
-            f"got {spec!r}"
+            f"{flag_name} must be a comma-separated list of integers, got {spec!r}"
         ) from exc
     for gpu in gpu_ids:
         if gpu < 0:
-            raise ValueError(f"--gpu-thinker-tp GPU ids must be >= 0, got {gpu_ids}")
+            raise ValueError(f"{flag_name} GPU ids must be >= 0, got {gpu_ids}")
     if len(gpu_ids) != tp_size:
         raise ValueError(
-            f"--gpu-thinker-tp has {len(gpu_ids)} entries but --thinker-tp-size="
+            f"{flag_name} has {len(gpu_ids)} entries but requested tp_size="
             f"{tp_size} requires exactly {tp_size}"
         )
     if len(set(gpu_ids)) != len(gpu_ids):
-        raise ValueError(f"--gpu-thinker-tp must list distinct GPU ids, got {gpu_ids}")
+        raise ValueError(f"{flag_name} must list distinct GPU ids, got {gpu_ids}")
     return gpu_ids
+
+
+def _parse_thinker_tp_gpu_list(spec: str, tp_size: int) -> list[int]:
+    return _parse_tp_gpu_list("--gpu-thinker-tp", spec, tp_size)
+
+
+def _parse_talker_tp_gpu_list(spec: str, tp_size: int) -> list[int]:
+    return _parse_tp_gpu_list("--gpu-talker-tp", spec, tp_size)
 
 
 def _launch_speech_server(args: argparse.Namespace) -> None:
@@ -220,15 +253,15 @@ def _launch_speech_server(args: argparse.Namespace) -> None:
     ):
         _validate_fraction(flag_name, value)
 
-    gpu_code_predictor = (
-        args.gpu_code_predictor
-        if args.gpu_code_predictor is not None
-        else args.gpu_talker
-    )
-    if gpu_code_predictor != args.gpu_talker:
+    if args.talker_tp_size < 1:
+        raise ValueError(f"--talker-tp-size must be >= 1, got {args.talker_tp_size}")
+    if args.gpu_code_predictor is not None and (
+        args.talker_tp_size > 1 or args.gpu_code_predictor != args.gpu_talker
+    ):
         raise ValueError(
             "Qwen3 speech pipeline does not expose a separate code_predictor "
-            "stage. Use the same GPU for --gpu-code-predictor and --gpu-talker."
+            "stage. For TP=1, use the same GPU for --gpu-code-predictor and "
+            "--gpu-talker; for talker TP, omit --gpu-code-predictor."
         )
 
     config = Qwen3OmniSpeechPipelineConfig(
@@ -248,8 +281,8 @@ def _launch_speech_server(args: argparse.Namespace) -> None:
                 "--thinker-tp-size > 1 requires --gpu-thinker-tp "
                 "(comma-separated GPU ids, one per TP rank)."
             )
-        thinker_gpu_ids = _parse_thinker_tp_gpu_list(
-            args.gpu_thinker_tp, args.thinker_tp_size
+        thinker_gpu_ids = _parse_tp_gpu_list(
+            "--gpu-thinker-tp", args.gpu_thinker_tp, args.thinker_tp_size
         )
         _set_stage_tp_size(config, "thinker", args.thinker_tp_size)
         _set_stage_gpu(config, "thinker", thinker_gpu_ids)
@@ -266,7 +299,24 @@ def _launch_speech_server(args: argparse.Namespace) -> None:
             )
         _set_stage_gpu(config, "thinker", args.gpu_thinker)
 
-    _set_stage_gpu(config, "talker_ar", args.gpu_talker)
+    if args.talker_tp_size > 1:
+        if args.gpu_talker_tp is None:
+            raise ValueError(
+                "--talker-tp-size > 1 requires --gpu-talker-tp "
+                "(comma-separated GPU ids, one per TP rank)."
+            )
+        talker_gpu_ids = _parse_tp_gpu_list(
+            "--gpu-talker-tp", args.gpu_talker_tp, args.talker_tp_size
+        )
+        _set_stage_tp_size(config, "talker_ar", args.talker_tp_size)
+        _set_stage_gpu(config, "talker_ar", talker_gpu_ids)
+    else:
+        if args.gpu_talker_tp is not None:
+            raise ValueError(
+                "--gpu-talker-tp only applies when --talker-tp-size > 1; "
+                "for TP=1, use --gpu-talker."
+            )
+        _set_stage_gpu(config, "talker_ar", args.gpu_talker)
     _set_stage_gpu(config, "code2wav", args.gpu_code2wav)
 
     thinker_mem_fraction = (

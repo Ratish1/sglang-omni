@@ -9,6 +9,8 @@ from sglang_omni.models.qwen3_omni.config import (
     Qwen3OmniSpeechPipelineConfig,
     Variants,
 )
+from sglang_omni.pipeline.mp_runner import _build_stage_groups
+from sglang_omni.pipeline.runtime_config import prepare_pipeline_runtime
 
 
 def _stage(config, name: str):
@@ -195,6 +197,96 @@ def test_default_speech_allows_thinker_tp_placement() -> None:
     assert plan.stages["thinker"].gpu_ids == (0, 1)
 
 
+def test_default_speech_allows_talker_tp_with_single_rank_code2wav() -> None:
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+    talker = _stage(config, "talker_ar")
+    talker.tp_size = 2
+    talker.parallelism.tp = 2
+    talker.gpu = [1, 2]
+    _stage(config, "code2wav").gpu = 2
+
+    plan = build_stage_placement_plan(config)
+    topology = build_process_topology_plan(config, plan)
+
+    assert plan.stages["talker_ar"].gpu_ids == (1, 2)
+    assert plan.stages["code2wav"].gpu_ids == (2,)
+    assert topology.tp_stage_to_processes["talker_ar"] == (
+        "talker_ar_tp0",
+        "talker_ar_tp1",
+    )
+    assert "talker_ar" not in topology.stage_to_process
+    assert topology.stage_to_process["code2wav"] == "code2wav"
+
+
+def test_default_speech_talker_tp_builds_rank_specific_stage_specs() -> None:
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+    talker = _stage(config, "talker_ar")
+    talker.tp_size = 2
+    talker.parallelism.tp = 2
+    talker.gpu = [1, 2]
+    _stage(config, "code2wav").gpu = 2
+
+    prep = prepare_pipeline_runtime(config)
+    try:
+        groups = _build_stage_groups(
+            config,
+            stages_cfg=prep.stages_cfg,
+            name_map=prep.name_map,
+            endpoints=prep.endpoints,
+            placement_plan=prep.placement_plan,
+            process_plan=prep.process_plan,
+        )
+    finally:
+        prep.runtime_dir.close()
+
+    specs = [
+        spec
+        for group in groups
+        for process in group.process_specs
+        for spec in process.stage_specs
+        if spec.stage_name == "talker_ar"
+    ]
+    assert [spec.role for spec in specs] == ["leader", "follower"]
+    assert [spec.gpu_id for spec in specs] == [1, 2]
+    assert [spec.tp_rank for spec in specs] == [0, 1]
+    assert {spec.tp_size for spec in specs} == {2}
+    assert specs[0].recv_endpoint
+    assert specs[1].recv_endpoint == ""
+    assert specs[0].nccl_port is not None
+    assert specs[0].nccl_port == specs[1].nccl_port
+    assert [spec.factory_args["gpu_id"] for spec in specs] == [1, 2]
+    assert [spec.factory_args["tp_rank"] for spec in specs] == [0, 1]
+    assert {spec.factory_args["tp_size"] for spec in specs} == {2}
+    assert specs[0].factory_args["nccl_port"] == specs[0].nccl_port
+    assert specs[1].factory_args["nccl_port"] == specs[0].nccl_port
+
+
+def test_default_speech_rejects_talker_tp_overlap_with_thinker() -> None:
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+    thinker = _stage(config, "thinker")
+    thinker.tp_size = 2
+    thinker.parallelism.tp = 2
+    thinker.gpu = [0, 1]
+    talker = _stage(config, "talker_ar")
+    talker.tp_size = 2
+    talker.parallelism.tp = 2
+    talker.gpu = [1, 2]
+
+    with pytest.raises(ValueError, match="may share a GPU only"):
+        build_stage_placement_plan(config)
+
+
+def test_default_speech_rejects_code2wav_tp() -> None:
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+    code2wav = _stage(config, "code2wav")
+    code2wav.tp_size = 2
+    code2wav.parallelism.tp = 2
+    code2wav.gpu = [1, 2]
+
+    with pytest.raises(ValueError, match="code2wav does not support TP"):
+        build_stage_placement_plan(config)
+
+
 def test_colocated_config_rejects_thinker_tp() -> None:
     config = Qwen3OmniSpeechColocatedPipelineConfig(model_path="dummy")
     _set_colocated_runtime(config)
@@ -204,4 +296,16 @@ def test_colocated_config_rejects_thinker_tp() -> None:
     thinker.gpu = [0, 1]
 
     with pytest.raises(ValueError, match="thinker TP"):
+        build_stage_placement_plan(config)
+
+
+def test_colocated_config_rejects_talker_tp() -> None:
+    config = Qwen3OmniSpeechColocatedPipelineConfig(model_path="dummy")
+    _set_colocated_runtime(config)
+    talker = _stage(config, "talker_ar")
+    talker.tp_size = 2
+    talker.parallelism.tp = 2
+    talker.gpu = [0, 1]
+
+    with pytest.raises(ValueError, match="talker_ar TP"):
         build_stage_placement_plan(config)
