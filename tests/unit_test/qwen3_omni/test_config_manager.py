@@ -143,6 +143,38 @@ def test_qwen3_omni_h20_colocated_example_config_loads_and_plans() -> None:
     }
 
 
+def test_qwen3_omni_fp8_h200_colocated_config_matches_h200_budget_shape() -> None:
+    h200_config_path = (
+        _REPO_ROOT / "examples" / "configs" / "qwen3_omni_colocated_h200.yaml"
+    )
+    fp8_h200_config_path = (
+        _REPO_ROOT / "examples" / "configs" / "qwen3_omni_fp8_colocated_h200.yaml"
+    )
+
+    h200_config = ConfigManager.from_file(str(h200_config_path)).config
+    fp8_h200_config = ConfigManager.from_file(str(fp8_h200_config_path)).config
+    fp8_plan = build_stage_placement_plan(fp8_h200_config)
+
+    assert isinstance(fp8_h200_config, Qwen3OmniSpeechColocatedPipelineConfig)
+    assert fp8_h200_config.name == "qwen3-omni-fp8-colocated-h200"
+    assert fp8_h200_config.model_path == "marksverdhei/Qwen3-Omni-30B-A3B-FP8"
+    assert fp8_plan.gpus[0].total_gpu_memory_fraction == pytest.approx(0.94)
+    assert [stage.name for stage in fp8_h200_config.stages] == [
+        stage.name for stage in h200_config.stages
+    ]
+    assert {
+        stage.name: stage.runtime.resources.total_gpu_memory_fraction
+        for stage in fp8_h200_config.stages
+        if stage.runtime.resources.total_gpu_memory_fraction is not None
+    } == pytest.approx(
+        {
+            stage.name: stage.runtime.resources.total_gpu_memory_fraction
+            for stage in h200_config.stages
+            if stage.runtime.resources.total_gpu_memory_fraction is not None
+        }
+    )
+
+
 def test_qwen3_omni_mmsu_example_config_uses_text_pipeline() -> None:
     config_path = _REPO_ROOT / "examples" / "configs" / "qwen3_omni_mmsu.yaml"
 
