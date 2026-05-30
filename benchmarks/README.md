@@ -13,6 +13,7 @@ benchmarks/
 ├── dataset/        # Dataset loaders + download helpers
 ├── benchmarker/    # Framework: runner, data structures, utilities
 ├── eval/           # Entry-point scripts (one per task × model)
+├── tts_serving/    # TTS serving harness and Docker contract
 ├── cache/          # (gitignored) dataset caches
 └── results/        # (gitignored) evaluation outputs
 ```
@@ -82,6 +83,11 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
     --ref-format references \
     --max-concurrency 16 \
     --output-dir results/higgs_tts_en --lang en --max-samples 50
+
+# 2f. TTS serving harness contract
+python -m benchmarks.eval.benchmark_tts_serving \
+    --spec /etc/benchmark/spec.json \
+    --out /var/benchmark/out
 
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
 python -m benchmarks.eval.benchmark_omni_seedtts \
