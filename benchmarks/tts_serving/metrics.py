@@ -22,6 +22,7 @@ class ScenarioResult:
     scenario_id: str
     endpoint: str
     category: str
+    load_concurrency: int | None = None
     status: str = "error"
     success: bool = False
     expected_success: bool = True

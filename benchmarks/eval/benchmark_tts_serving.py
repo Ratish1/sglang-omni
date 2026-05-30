@@ -63,26 +63,55 @@ async def _run_benchmark(
         headers=headers,
         connector=connector,
     ) as session:
-        semaphore = asyncio.Semaphore(spec.params.max_concurrency)
-
-        async def run_one(scenario: Scenario) -> ScenarioResult:
-            async with semaphore:
-                if scenario.method == "WS":
-                    return await run_ws_scenario(session, spec, scenario)
-                return await run_http_scenario(session, spec, scenario)
-
-        tasks: list[asyncio.Task[ScenarioResult]] = []
-        rng = random.Random(spec.seed)
-        for scenario in scenarios:
-            if spec.params.request_rate != float("inf"):
-                await asyncio.sleep(rng.expovariate(spec.params.request_rate))
-            tasks.append(asyncio.create_task(run_one(scenario)))
-        started = time.perf_counter()
-        results = list(await asyncio.gather(*tasks))
-        harness_log.append(
-            f"completed {len(results)} scenarios in {time.perf_counter() - started:.3f}s"
-        )
+        results: list[ScenarioResult] = []
+        for level in _concurrency_levels(spec):
+            results.extend(
+                await _run_benchmark_level(
+                    session,
+                    spec,
+                    scenarios,
+                    level,
+                    harness_log,
+                )
+            )
         return results
+
+
+async def _run_benchmark_level(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenarios: list[Scenario],
+    max_concurrency: int,
+    harness_log: list[str],
+) -> list[ScenarioResult]:
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def run_one(scenario: Scenario) -> ScenarioResult:
+        async with semaphore:
+            if scenario.method == "WS":
+                result = await run_ws_scenario(session, spec, scenario)
+            else:
+                result = await run_http_scenario(session, spec, scenario)
+            result.load_concurrency = max_concurrency
+            return result
+
+    tasks: list[asyncio.Task[ScenarioResult]] = []
+    rng = random.Random(spec.seed + max_concurrency)
+    for scenario in scenarios:
+        if spec.params.request_rate != float("inf"):
+            await asyncio.sleep(rng.expovariate(spec.params.request_rate))
+        tasks.append(asyncio.create_task(run_one(scenario)))
+    started = time.perf_counter()
+    results = list(await asyncio.gather(*tasks))
+    harness_log.append(
+        f"completed {len(results)} scenarios at concurrency={max_concurrency} "
+        f"in {time.perf_counter() - started:.3f}s"
+    )
+    return results
+
+
+def _concurrency_levels(spec: BenchmarkSpec) -> tuple[int, ...]:
+    return spec.params.concurrency_levels or (spec.params.max_concurrency,)
 
 
 def _auth_headers(spec: BenchmarkSpec) -> dict[str, str]:
@@ -109,7 +138,8 @@ def main() -> int:
     scenarios = build_scenarios(spec)
     harness_log.append(
         f"loaded spec={Path(args.spec)} profile={spec.params.profile} "
-        f"traffic_requests={spec.params.total_requests} scenarios={len(scenarios)}"
+        f"traffic_requests={spec.params.total_requests} scenarios={len(scenarios)} "
+        f"concurrency_levels={list(_concurrency_levels(spec))}"
     )
     try:
         results = asyncio.run(_run_benchmark(spec, scenarios, harness_log))

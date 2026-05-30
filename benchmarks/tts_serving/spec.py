@@ -38,6 +38,7 @@ class BenchmarkParams:
     profile: str = "ci"
     total_requests: int = 100
     max_concurrency: int = 8
+    concurrency_levels: tuple[int, ...] | None = None
     request_rate: float = float("inf")
     timeout_s: int = 120
     enabled_endpoints: tuple[str, ...] = DEFAULT_ENDPOINTS
@@ -58,6 +59,7 @@ class BenchmarkParams:
 
         total_requests = _positive_int(obj, "total_requests", cls.total_requests)
         max_concurrency = _positive_int(obj, "max_concurrency", cls.max_concurrency)
+        concurrency_levels = _concurrency_levels(obj.get("concurrency_levels"))
         timeout_s = _positive_int(obj, "timeout_s", cls.timeout_s)
         request_rate = _request_rate(obj.get("request_rate", cls.request_rate))
 
@@ -73,7 +75,10 @@ class BenchmarkParams:
         return cls(
             profile=profile,
             total_requests=total_requests,
-            max_concurrency=max_concurrency,
+            max_concurrency=(
+                max(concurrency_levels) if concurrency_levels else max_concurrency
+            ),
+            concurrency_levels=concurrency_levels,
             request_rate=request_rate,
             timeout_s=timeout_s,
             enabled_endpoints=tuple(enabled),
@@ -175,3 +180,17 @@ def _request_rate(value: Any) -> float:
     if not isinstance(value, bool) and isinstance(value, (int, float)) and value > 0:
         return float(value)
     raise SpecError("params.request_rate must be a positive number or 'inf'")
+
+
+def _concurrency_levels(value: Any) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise SpecError("params.concurrency_levels must be a non-empty list")
+    levels: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise SpecError("params.concurrency_levels must contain positive integers")
+        if item not in levels:
+            levels.append(item)
+    return tuple(levels)

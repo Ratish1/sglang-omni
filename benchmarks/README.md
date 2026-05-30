@@ -89,6 +89,14 @@ python -m benchmarks.eval.benchmark_tts_serving \
     --spec /etc/benchmark/spec.json \
     --out /var/benchmark/out
 
+# Example stress spec params:
+# {
+#   "profile": "stress",
+#   "total_requests": 600,
+#   "concurrency_levels": [1, 4, 8, 16, 32, 64, 128],
+#   "request_rate": "inf"
+# }
+
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
 python -m benchmarks.eval.benchmark_omni_seedtts \
     --meta zhaochenyang20/seed-tts-eval-arrow \

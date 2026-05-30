@@ -55,6 +55,9 @@ def build_results_report(
             "profile": spec.params.profile,
             "total_requests": spec.params.total_requests,
             "max_concurrency": spec.params.max_concurrency,
+            "concurrency_levels": list(
+                spec.params.concurrency_levels or (spec.params.max_concurrency,)
+            ),
             "request_rate": (
                 "inf"
                 if spec.params.request_rate == float("inf")
@@ -71,6 +74,7 @@ def build_results_report(
             "status_counts": dict(status_counts),
             "category_counts": dict(category_counts),
             "by_category": _by_category(spec, results),
+            "by_concurrency": _by_concurrency(spec, results),
         },
         "failures": [
             result.to_json() for result in results if not _result_passed(spec, result)
@@ -136,3 +140,35 @@ def _by_category(
             "succeeded" if _result_passed(spec, result) else "failed"
         ] += 1
     return {key: dict(value) for key, value in grouped.items()}
+
+
+def _by_concurrency(
+    spec: BenchmarkSpec, results: list[ScenarioResult]
+) -> dict[str, dict[str, Any]]:
+    grouped: dict[int, list[ScenarioResult]] = defaultdict(list)
+    for result in results:
+        if result.load_concurrency is not None:
+            grouped[result.load_concurrency].append(result)
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for level, level_results in sorted(grouped.items()):
+        latencies = [r.latency_s for r in level_results if r.latency_s > 0]
+        ttfas = [r.ttfa_s for r in level_results if r.ttfa_s is not None]
+        rtfs = [r.rtf for r in level_results if r.rtf > 0]
+        summaries[str(level)] = {
+            "total": len(level_results),
+            "succeeded": sum(
+                1 for result in level_results if _result_passed(spec, result)
+            ),
+            "failed": sum(
+                1 for result in level_results if not _result_passed(spec, result)
+            ),
+            "latency_s": _summary(latencies),
+            "ttfa_s": _summary(ttfas),
+            "rtf": _summary(rtfs),
+            "status_counts": dict(Counter(result.status for result in level_results)),
+            "category_counts": dict(
+                Counter(result.category for result in level_results)
+            ),
+        }
+    return summaries

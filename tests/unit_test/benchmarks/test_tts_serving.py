@@ -49,6 +49,30 @@ def test_tts_serving_spec_rejects_smoke_profile() -> None:
         )
 
 
+def test_tts_serving_spec_accepts_concurrency_sweep() -> None:
+    spec = BenchmarkSpec.from_obj(
+        {
+            "base_url": "http://localhost:8000",
+            "model_name": "higgs",
+            "params": {"concurrency_levels": [1, 4, 16, 16, 64]},
+        }
+    )
+
+    assert spec.params.concurrency_levels == (1, 4, 16, 64)
+    assert spec.params.max_concurrency == 64
+
+
+def test_tts_serving_spec_rejects_invalid_concurrency_sweep() -> None:
+    with pytest.raises(SpecError, match="params.concurrency_levels"):
+        BenchmarkSpec.from_obj(
+            {
+                "base_url": "http://localhost:8000",
+                "model_name": "higgs",
+                "params": {"concurrency_levels": [1, 0, 8]},
+            }
+        )
+
+
 def test_report_separates_traffic_requests_from_capability_probes() -> None:
     spec = BenchmarkSpec.from_obj(
         {
@@ -77,6 +101,42 @@ def test_report_separates_traffic_requests_from_capability_probes() -> None:
     assert report["overall"]["traffic_total"] == 3
     assert report["overall"]["capability_probe_total"] == 2
     assert report["overall"]["total"] == 5
+
+
+def test_report_groups_metrics_by_concurrency_level() -> None:
+    spec = BenchmarkSpec.from_obj(
+        {
+            "base_url": "http://localhost:8000",
+            "model_name": "higgs",
+            "params": {"concurrency_levels": [1, 8]},
+        }
+    )
+    results = [
+        ScenarioResult(
+            scenario_id="c1",
+            endpoint="speech",
+            category="well_formed",
+            status="ok",
+            success=True,
+            load_concurrency=1,
+            latency_s=1.0,
+        ),
+        ScenarioResult(
+            scenario_id="c8",
+            endpoint="speech",
+            category="well_formed",
+            status="failed",
+            success=False,
+            load_concurrency=8,
+            latency_s=2.0,
+        ),
+    ]
+
+    report = build_results_report(spec, results)
+
+    assert report["config"]["concurrency_levels"] == [1, 8]
+    assert report["metrics"]["by_concurrency"]["1"]["succeeded"] == 1
+    assert report["metrics"]["by_concurrency"]["8"]["failed"] == 1
 
 
 def test_http_speech_2xx_without_audio_is_invalid() -> None:
