@@ -8,6 +8,11 @@ from collections import Counter, defaultdict
 from typing import Any
 
 from benchmarks.tts_serving.metrics import ScenarioResult
+from benchmarks.tts_serving.scenarios import (
+    SCENARIO_SCHEMA_VERSION,
+    Scenario,
+    scenario_set_hash,
+)
 from benchmarks.tts_serving.spec import BenchmarkSpec
 
 
@@ -15,6 +20,7 @@ def build_results_report(
     spec: BenchmarkSpec,
     results: list[ScenarioResult],
     *,
+    scenarios: list[Scenario] | None = None,
     harness_status: str = "ok",
     harness_error: str | None = None,
 ) -> dict[str, Any]:
@@ -31,11 +37,14 @@ def build_results_report(
     latencies = [r.latency_s for r in results if r.latency_s > 0]
     ttfas = [r.ttfa_s for r in results if r.ttfa_s is not None]
     rtfs = [r.rtf for r in results if r.rtf > 0]
+    queue_waits = [r.queue_wait_s for r in results if r.queue_wait_s is not None]
     passed = harness_status == "ok" and _is_benchmark_passed(
         spec, results, capabilities
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "scenario_schema_version": SCENARIO_SCHEMA_VERSION,
+        "scenario_set_hash": scenario_set_hash(scenarios) if scenarios else None,
         "harness_status": harness_status,
         "harness_error": harness_error,
         "overall": {
@@ -52,8 +61,13 @@ def build_results_report(
             "model_name": spec.model_name,
             "run_id": spec.run_id,
             "seed": spec.seed,
+            "provider_label": spec.params.provider_label,
+            "implementation_label": spec.params.implementation_label,
             "profile": spec.params.profile,
             "total_requests": spec.params.total_requests,
+            "stage_request_total": sum(
+                stage.request_count for stage in spec.params.load_stages
+            ),
             "max_concurrency": spec.params.max_concurrency,
             "concurrency_levels": list(
                 spec.params.concurrency_levels or (spec.params.max_concurrency,)
@@ -65,15 +79,30 @@ def build_results_report(
             ),
             "timeout_s": spec.params.timeout_s,
             "enabled_endpoints": list(spec.params.enabled_endpoints),
+            "load_stages": [stage.to_json() for stage in spec.params.load_stages],
         },
         "capabilities": capabilities,
         "metrics": {
             "latency_s": _summary(latencies),
             "ttfa_s": _summary(ttfas),
+            "queue_wait_s": _summary(queue_waits),
             "rtf": _summary(rtfs),
             "status_counts": dict(status_counts),
+            "http_status_counts": dict(
+                Counter(
+                    str(result.http_status)
+                    for result in results
+                    if result.http_status is not None
+                )
+            ),
+            "error_class_counts": dict(
+                Counter(result.error_class for result in results if result.error_class)
+            ),
             "category_counts": dict(category_counts),
+            "endpoint_mix": dict(Counter(result.endpoint for result in results)),
             "by_category": _by_category(spec, results),
+            "by_stage": _by_stage(spec, results),
+            "by_endpoint": _by_endpoint(spec, results),
             "by_concurrency": _by_concurrency(spec, results),
         },
         "failures": [
@@ -107,18 +136,29 @@ def _capabilities(results: list[ScenarioResult]) -> dict[str, str]:
     caps: dict[str, str] = {}
     for result in results:
         if result.capability:
-            caps[result.endpoint] = result.capability
+            caps[result.endpoint] = _merge_capability(
+                caps.get(result.endpoint), result.capability
+            )
     return caps
 
 
 def _summary(values: list[float]) -> dict[str, float | None]:
     if not values:
-        return {"mean": None, "p50": None, "p95": None, "max": None}
+        return {
+            "mean": None,
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "p99_9": None,
+            "max": None,
+        }
     values_sorted = sorted(values)
     return {
         "mean": statistics.fmean(values_sorted),
         "p50": _percentile(values_sorted, 0.50),
         "p95": _percentile(values_sorted, 0.95),
+        "p99": _percentile(values_sorted, 0.99),
+        "p99_9": _percentile(values_sorted, 0.999),
         "max": max(values_sorted),
     }
 
@@ -142,6 +182,30 @@ def _by_category(
     return {key: dict(value) for key, value in grouped.items()}
 
 
+def _by_stage(
+    spec: BenchmarkSpec, results: list[ScenarioResult]
+) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[ScenarioResult]] = defaultdict(list)
+    for result in results:
+        grouped[result.stage_id or "unknown"].append(result)
+    return {
+        stage_id: _result_group_summary(spec, stage_results)
+        for stage_id, stage_results in sorted(grouped.items())
+    }
+
+
+def _by_endpoint(
+    spec: BenchmarkSpec, results: list[ScenarioResult]
+) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[ScenarioResult]] = defaultdict(list)
+    for result in results:
+        grouped[result.endpoint].append(result)
+    return {
+        endpoint: _result_group_summary(spec, endpoint_results)
+        for endpoint, endpoint_results in sorted(grouped.items())
+    }
+
+
 def _by_concurrency(
     spec: BenchmarkSpec, results: list[ScenarioResult]
 ) -> dict[str, dict[str, Any]]:
@@ -152,23 +216,63 @@ def _by_concurrency(
 
     summaries: dict[str, dict[str, Any]] = {}
     for level, level_results in sorted(grouped.items()):
-        latencies = [r.latency_s for r in level_results if r.latency_s > 0]
-        ttfas = [r.ttfa_s for r in level_results if r.ttfa_s is not None]
-        rtfs = [r.rtf for r in level_results if r.rtf > 0]
-        summaries[str(level)] = {
-            "total": len(level_results),
-            "succeeded": sum(
-                1 for result in level_results if _result_passed(spec, result)
-            ),
-            "failed": sum(
-                1 for result in level_results if not _result_passed(spec, result)
-            ),
-            "latency_s": _summary(latencies),
-            "ttfa_s": _summary(ttfas),
-            "rtf": _summary(rtfs),
-            "status_counts": dict(Counter(result.status for result in level_results)),
-            "category_counts": dict(
-                Counter(result.category for result in level_results)
-            ),
-        }
+        summaries[str(level)] = _result_group_summary(spec, level_results)
     return summaries
+
+
+def _result_group_summary(
+    spec: BenchmarkSpec, results: list[ScenarioResult]
+) -> dict[str, Any]:
+    latencies = [result.latency_s for result in results if result.latency_s > 0]
+    ttfas = [result.ttfa_s for result in results if result.ttfa_s is not None]
+    rtfs = [result.rtf for result in results if result.rtf > 0]
+    queue_waits = [
+        result.queue_wait_s for result in results if result.queue_wait_s is not None
+    ]
+    first_start = min(
+        (result.actual_start_s for result in results if result.actual_start_s),
+        default=None,
+    )
+    last_completion = max(
+        (result.completed_s for result in results if result.completed_s),
+        default=None,
+    )
+    wall_time_s = (
+        last_completion - first_start
+        if first_start is not None and last_completion is not None
+        else None
+    )
+    succeeded = sum(1 for result in results if _result_passed(spec, result))
+    failed = len(results) - succeeded
+    return {
+        "total": len(results),
+        "succeeded": succeeded,
+        "failed": failed,
+        "wall_time_s": wall_time_s,
+        "achieved_rps": (
+            len(results) / wall_time_s if wall_time_s and wall_time_s > 0 else None
+        ),
+        "latency_s": _summary(latencies),
+        "ttfa_s": _summary(ttfas),
+        "queue_wait_s": _summary(queue_waits),
+        "rtf": _summary(rtfs),
+        "status_counts": dict(Counter(result.status for result in results)),
+        "http_status_counts": dict(
+            Counter(
+                str(result.http_status)
+                for result in results
+                if result.http_status is not None
+            )
+        ),
+        "error_class_counts": dict(
+            Counter(result.error_class for result in results if result.error_class)
+        ),
+        "category_counts": dict(Counter(result.category for result in results)),
+    }
+
+
+def _merge_capability(current: str | None, new: str) -> str:
+    priority = {"fail": 3, "pass": 2, "missing": 1}
+    if current is None:
+        return new
+    return new if priority.get(new, 0) > priority.get(current, 0) else current

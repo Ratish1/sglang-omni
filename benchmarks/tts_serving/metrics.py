@@ -22,21 +22,35 @@ class ScenarioResult:
     scenario_id: str
     endpoint: str
     category: str
+    stage_id: str | None = None
+    load_mode: str | None = None
     load_concurrency: int | None = None
     status: str = "error"
     success: bool = False
     expected_success: bool = True
     http_status: int | None = None
+    http_status_class: str | None = None
     latency_s: float = 0.0
+    planned_start_s: float | None = None
+    actual_start_s: float | None = None
+    completed_s: float | None = None
+    queue_wait_s: float | None = None
     ttfa_s: float | None = None
     inter_chunk_s: list[float] = field(default_factory=list)
     audio_bytes: int = 0
+    request_bytes: int = 0
+    response_bytes: int = 0
+    batch_size: int | None = None
     audio_duration_s: float = 0.0
     rtf: float = 0.0
     error_type: str | None = None
+    error_class: str | None = None
     error: str | None = None
     capability: str | None = None
     response_headers: dict[str, str] = field(default_factory=dict)
+    ws_event_counts: dict[str, int] = field(default_factory=dict)
+    ws_close_reason: str | None = None
+    was_cancelled: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -81,6 +95,14 @@ def parse_sse_audio_event(line: str) -> tuple[bytes | None, dict[str, Any] | Non
 
 
 def finish_timing(result: ScenarioResult, start: float) -> None:
-    result.latency_s = time.perf_counter() - start
+    now = time.perf_counter()
+    result.latency_s = now - start
+    result.completed_s = now
     if result.audio_duration_s > 0:
         result.rtf = result.latency_s / result.audio_duration_s
+
+
+def classify_http_status(status: int | None) -> str | None:
+    if status is None:
+        return None
+    return f"{status // 100}xx"

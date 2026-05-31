@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from benchmarks.tts_serving.metrics import ScenarioResult
-from benchmarks.tts_serving.scenarios import Scenario
+from benchmarks.tts_serving.scenarios import (
+    SCENARIO_SCHEMA_VERSION,
+    Scenario,
+    scenario_set_hash,
+)
 from benchmarks.tts_serving.spec import BenchmarkSpec
 
 
@@ -47,6 +51,9 @@ def write_artifacts(
             "base_url": spec.base_url,
             "test_type": spec.test_type,
             "profile": spec.params.profile,
+            "scenario_schema_version": SCENARIO_SCHEMA_VERSION,
+            "scenario_set_hash": scenario_set_hash(scenarios),
+            "load_stages": [stage.to_json() for stage in spec.params.load_stages],
             "artifacts": {
                 "results": "results.json",
                 "requests": "raw/requests.jsonl",

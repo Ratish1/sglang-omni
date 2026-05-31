@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import binascii
+import json
 import time
 from collections.abc import Mapping
 
@@ -12,6 +13,7 @@ import aiohttp
 
 from benchmarks.tts_serving.metrics import (
     ScenarioResult,
+    classify_http_status,
     duration_from_audio_bytes,
     finish_timing,
     parse_sse_audio_event,
@@ -20,6 +22,7 @@ from benchmarks.tts_serving.scenarios import Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
 
 AUDIO_RESPONSE_FORMATS = {"wav", "pcm", "mp3", "flac", "aac", "opus"}
+OPTIONAL_ENDPOINTS = {"voices", "batch", "websocket"}
 
 
 async def run_http_scenario(
@@ -32,6 +35,7 @@ async def run_http_scenario(
         endpoint=scenario.endpoint,
         category=scenario.category,
         expected_success=scenario.expect_success,
+        batch_size=scenario.planned_metadata.get("batch_size"),
     )
     url = f"{spec.base_url}{scenario.path}"
     start = time.perf_counter()
@@ -39,8 +43,18 @@ async def run_http_scenario(
         if scenario.method == "GET":
             async with session.get(url) as response:
                 await _handle_probe_response(response, result)
+        elif scenario.method == "DELETE":
+            async with session.delete(url) as response:
+                await _handle_binary_response(response, result, scenario)
         else:
-            async with session.post(url, json=scenario.payload) as response:
+            body = _request_body(scenario)
+            kwargs = (
+                {"data": body}
+                if scenario.body_type == "multipart"
+                else {"json": scenario.payload}
+            )
+            result.request_bytes = _request_size(scenario)
+            async with session.post(url, **kwargs) as response:
                 if scenario.endpoint == "speech_sse":
                     await _handle_sse_response(response, result, start, scenario)
                 else:
@@ -48,6 +62,7 @@ async def run_http_scenario(
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         result.status = "transport_error"
         result.error_type = exc.__class__.__name__
+        result.error_class = "transport_error"
         result.error = str(exc)
     finally:
         finish_timing(result, start)
@@ -58,6 +73,7 @@ async def _handle_probe_response(
     response: aiohttp.ClientResponse, result: ScenarioResult
 ) -> None:
     result.http_status = response.status
+    result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
     if response.status == 404:
         result.status = "missing"
@@ -69,7 +85,7 @@ async def _handle_probe_response(
         result.status = "ok"
         result.capability = "pass"
         result.success = True
-        await response.read()
+        result.response_bytes = len(await response.read())
         return
     result.status = "failed"
     result.capability = "fail"
@@ -82,10 +98,17 @@ async def _handle_binary_response(
     scenario: Scenario,
 ) -> None:
     result.http_status = response.status
+    result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
     body = await response.read()
-    result.audio_bytes = len(body)
-    if response.status == 404 and scenario.category == "capability_probe":
+    result.response_bytes = len(body)
+    if response.status >= 400 and not scenario.expect_success:
+        result.success = False
+        result.status = "expected_error"
+        result.error_class = "expected_client_error"
+        result.error = body.decode("utf-8", errors="replace")
+        return
+    if response.status == 404 and _is_optional_endpoint(scenario):
         result.status = "missing"
         result.capability = "missing"
         result.error = body.decode("utf-8", errors="replace")
@@ -104,16 +127,26 @@ async def _handle_binary_response(
         if not scenario.expect_success:
             _mark_unexpected_success(result, scenario)
             return
+        if scenario.endpoint == "batch":
+            _handle_batch_success(body, result)
+            return
+        if scenario.endpoint == "voices":
+            result.success = True
+            result.status = "ok"
+            result.capability = "pass"
+            return
         response_format = str(scenario.payload.get("response_format", ""))
         if not _is_audio_response(body, response.headers, response_format):
             result.success = False
             result.status = "invalid_audio_response"
+            result.error_class = "protocol_error"
             result.error = (
                 "speech endpoint returned 2xx without an audio-like response "
                 f"(content-type={response.headers.get('Content-Type')!r}, "
                 f"bytes={len(body)})"
             )
             return
+        result.audio_bytes = len(body)
         result.audio_duration_s = duration_from_audio_bytes(
             body,
             content_type=response.headers.get("Content-Type"),
@@ -124,6 +157,9 @@ async def _handle_binary_response(
         return
     result.success = False
     result.status = "expected_error" if not scenario.expect_success else "failed"
+    result.error_class = (
+        "expected_client_error" if not scenario.expect_success else "http_error"
+    )
     result.error = body.decode("utf-8", errors="replace")
 
 
@@ -134,10 +170,20 @@ async def _handle_sse_response(
     scenario: Scenario,
 ) -> None:
     result.http_status = response.status
+    result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
     if response.status != 200:
         body = await response.text()
+        result.response_bytes = len(body.encode("utf-8"))
+        if response.status == 404 and _is_optional_endpoint(scenario):
+            result.status = "missing"
+            result.capability = "missing"
+            result.error = body
+            return
         result.status = "expected_error" if not scenario.expect_success else "failed"
+        result.error_class = (
+            "expected_client_error" if not scenario.expect_success else "http_error"
+        )
         result.error = body
         return
 
@@ -171,6 +217,7 @@ async def _handle_sse_response(
         return
     result.success = result.audio_bytes > 0
     result.status = "ok" if result.success else "empty_stream"
+    result.response_bytes = result.audio_bytes
 
 
 def _merge_sse_line(
@@ -198,6 +245,7 @@ def _merge_sse_line(
         result.inter_chunk_s.append(now - chunk_times[-1])
     chunk_times.append(now)
     result.audio_bytes += len(audio_bytes)
+    result.response_bytes += len(audio_bytes)
     audio = event.get("audio") if isinstance(event, dict) else None
     result.audio_duration_s += duration_from_audio_bytes(
         audio_bytes,
@@ -220,6 +268,7 @@ def _merge_sse_line(
 def _mark_unexpected_success(result: ScenarioResult, scenario: Scenario) -> None:
     result.success = False
     result.status = "unexpected_success"
+    result.error_class = "unexpected_success"
     result.error = (
         f"scenario {scenario.id} expected an error but received HTTP "
         f"{result.http_status}"
@@ -254,3 +303,83 @@ def _is_audio_response(
     if fmt in AUDIO_RESPONSE_FORMATS:
         return content_type == "application/octet-stream"
     return False
+
+
+def _request_body(scenario: Scenario) -> aiohttp.FormData:
+    form = aiohttp.FormData()
+    for key, value in scenario.form_fields.items():
+        form.add_field(key, value)
+    if scenario.upload_field:
+        form.add_field(
+            scenario.upload_field,
+            _synthetic_audio_bytes(scenario.upload_size_bytes),
+            filename=scenario.upload_filename or "audio.wav",
+            content_type=scenario.upload_content_type or "audio/wav",
+        )
+    return form
+
+
+def _synthetic_audio_bytes(size: int) -> bytes:
+    if size <= 0:
+        return b""
+    if size < 44:
+        return _wav_header(0)[:size]
+    payload_size = size - 44
+    return _wav_header(payload_size) + b"\0" * payload_size
+
+
+def _wav_header(payload_size: int) -> bytes:
+    return (
+        b"RIFF"
+        + (36 + payload_size).to_bytes(4, "little")
+        + b"WAVEfmt "
+        + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")
+        + (1).to_bytes(2, "little")
+        + (24000).to_bytes(4, "little")
+        + (48000).to_bytes(4, "little")
+        + (2).to_bytes(2, "little")
+        + (16).to_bytes(2, "little")
+        + b"data"
+        + payload_size.to_bytes(4, "little")
+    )
+
+
+def _request_size(scenario: Scenario) -> int:
+    if scenario.body_type == "multipart":
+        return (
+            sum(len(key) + len(value) for key, value in scenario.form_fields.items())
+            + scenario.upload_size_bytes
+        )
+    try:
+        return len(json.dumps(scenario.payload, ensure_ascii=False).encode("utf-8"))
+    except TypeError:
+        return 0
+
+
+def _is_optional_endpoint(scenario: Scenario) -> bool:
+    return scenario.endpoint in OPTIONAL_ENDPOINTS
+
+
+def _handle_batch_success(body: bytes, result: ScenarioResult) -> None:
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        result.status = "invalid_batch_response"
+        result.success = False
+        result.error_type = exc.__class__.__name__
+        result.error_class = "protocol_error"
+        result.error = f"batch endpoint returned invalid JSON: {exc}"
+        return
+    required_keys = {"results", "total", "succeeded", "failed"}
+    if not isinstance(payload, dict) or not required_keys <= set(payload):
+        result.status = "invalid_batch_response"
+        result.success = False
+        result.error_class = "protocol_error"
+        result.error = (
+            "batch endpoint returned JSON without results/total/succeeded/failed"
+        )
+        return
+    result.status = "ok"
+    result.success = True
+    result.capability = "pass"

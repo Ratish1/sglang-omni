@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import random
 import time
 from pathlib import Path
 
@@ -39,7 +38,7 @@ from benchmarks.tts_serving.http_client import run_http_scenario
 from benchmarks.tts_serving.metrics import ScenarioResult
 from benchmarks.tts_serving.report import build_results_report
 from benchmarks.tts_serving.scenarios import Scenario, build_scenarios
-from benchmarks.tts_serving.spec import BenchmarkSpec, SpecError, load_spec
+from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage, SpecError, load_spec
 from benchmarks.tts_serving.ws_client import run_ws_scenario
 
 
@@ -64,54 +63,161 @@ async def _run_benchmark(
         connector=connector,
     ) as session:
         results: list[ScenarioResult] = []
-        for level in _concurrency_levels(spec):
+        for stage in spec.params.load_stages:
+            stage_scenarios = [
+                scenario for scenario in scenarios if scenario.stage_id == stage.id
+            ]
             results.extend(
-                await _run_benchmark_level(
+                await _run_stage(
                     session,
                     spec,
-                    scenarios,
-                    level,
+                    stage,
+                    stage_scenarios,
                     harness_log,
                 )
             )
         return results
 
 
-async def _run_benchmark_level(
+async def _run_stage(
     session: aiohttp.ClientSession,
     spec: BenchmarkSpec,
+    stage: LoadStage,
     scenarios: list[Scenario],
-    max_concurrency: int,
     harness_log: list[str],
 ) -> list[ScenarioResult]:
-    semaphore = asyncio.Semaphore(max_concurrency)
+    if stage.mode == "closed_loop":
+        return await _run_closed_loop_stage(
+            session, spec, stage, scenarios, harness_log
+        )
+    return await _run_scheduled_stage(session, spec, stage, scenarios, harness_log)
 
-    async def run_one(scenario: Scenario) -> ScenarioResult:
-        async with semaphore:
-            if scenario.method == "WS":
-                result = await run_ws_scenario(session, spec, scenario)
-            else:
-                result = await run_http_scenario(session, spec, scenario)
-            result.load_concurrency = max_concurrency
-            return result
 
-    tasks: list[asyncio.Task[ScenarioResult]] = []
-    rng = random.Random(spec.seed + max_concurrency)
-    for scenario in scenarios:
-        if spec.params.request_rate != float("inf"):
-            await asyncio.sleep(rng.expovariate(spec.params.request_rate))
-        tasks.append(asyncio.create_task(run_one(scenario)))
+async def _run_closed_loop_stage(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+    scenarios: list[Scenario],
+    harness_log: list[str],
+) -> list[ScenarioResult]:
+    scenario_iter = iter(scenarios)
+    results: list[ScenarioResult] = []
     started = time.perf_counter()
-    results = list(await asyncio.gather(*tasks))
+
+    async def worker() -> None:
+        for scenario in scenario_iter:
+            actual_start = time.perf_counter()
+            result = await _run_one_scenario(session, spec, scenario)
+            _attach_schedule_metadata(
+                result,
+                stage=stage,
+                planned_start=actual_start,
+                actual_start=actual_start,
+            )
+            results.append(result)
+
+    await asyncio.gather(
+        *(worker() for _ in range(min(stage.max_concurrency, len(scenarios))))
+    )
     harness_log.append(
-        f"completed {len(results)} scenarios at concurrency={max_concurrency} "
-        f"in {time.perf_counter() - started:.3f}s"
+        f"stage={stage.id} mode={stage.mode} completed {len(results)} scenarios "
+        f"at concurrency={stage.max_concurrency} in {time.perf_counter() - started:.3f}s"
     )
     return results
 
 
-def _concurrency_levels(spec: BenchmarkSpec) -> tuple[int, ...]:
-    return spec.params.concurrency_levels or (spec.params.max_concurrency,)
+async def _run_scheduled_stage(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+    scenarios: list[Scenario],
+    harness_log: list[str],
+) -> list[ScenarioResult]:
+    semaphore = asyncio.Semaphore(stage.max_concurrency)
+    stage_start = time.perf_counter()
+    offsets = _planned_offsets(stage, len(scenarios))
+
+    async def run_planned(scenario: Scenario, offset: float) -> ScenarioResult:
+        planned_start = stage_start + offset
+        await asyncio.sleep(max(0.0, planned_start - time.perf_counter()))
+        async with semaphore:
+            actual_start = time.perf_counter()
+            result = await _run_one_scenario(session, spec, scenario)
+            _attach_schedule_metadata(
+                result,
+                stage=stage,
+                planned_start=planned_start,
+                actual_start=actual_start,
+            )
+            return result
+
+    started = time.perf_counter()
+    results = list(
+        await asyncio.gather(
+            *(
+                run_planned(scenario, offset)
+                for scenario, offset in zip(scenarios, offsets, strict=True)
+            )
+        )
+    )
+    harness_log.append(
+        f"stage={stage.id} mode={stage.mode} completed {len(results)} scenarios "
+        f"at concurrency={stage.max_concurrency} in {time.perf_counter() - started:.3f}s"
+    )
+    return results
+
+
+async def _run_one_scenario(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+) -> ScenarioResult:
+    if scenario.method == "WS":
+        return await run_ws_scenario(session, spec, scenario)
+    return await run_http_scenario(session, spec, scenario)
+
+
+def _attach_schedule_metadata(
+    result: ScenarioResult,
+    *,
+    stage: LoadStage,
+    planned_start: float,
+    actual_start: float,
+) -> None:
+    result.stage_id = stage.id
+    result.load_mode = stage.mode
+    result.load_concurrency = stage.max_concurrency
+    result.planned_start_s = planned_start
+    result.actual_start_s = actual_start
+    result.queue_wait_s = max(0.0, actual_start - planned_start)
+
+
+def _planned_offsets(stage: LoadStage, request_count: int) -> list[float]:
+    if request_count <= 0:
+        return []
+    if stage.mode == "burst":
+        return [0.0] * request_count
+    if stage.mode == "ramp":
+        return _ramp_offsets(stage, request_count)
+    if stage.mode == "soak" and stage.duration_s:
+        if request_count == 1:
+            return [0.0]
+        step = stage.duration_s / float(request_count - 1)
+        return [index * step for index in range(request_count)]
+    return [index / stage.request_rate for index in range(request_count)]
+
+
+def _ramp_offsets(stage: LoadStage, request_count: int) -> list[float]:
+    start_rate = stage.start_request_rate or stage.request_rate
+    end_rate = stage.request_rate
+    elapsed = 0.0
+    offsets: list[float] = []
+    for index in range(request_count):
+        offsets.append(elapsed)
+        position = index / max(request_count - 1, 1)
+        current_rate = start_rate + (end_rate - start_rate) * position
+        elapsed += 1.0 / current_rate
+    return offsets
 
 
 def _auth_headers(spec: BenchmarkSpec) -> dict[str, str]:
@@ -136,14 +242,15 @@ def main() -> int:
         return 2
 
     scenarios = build_scenarios(spec)
+    stage_request_total = sum(stage.request_count for stage in spec.params.load_stages)
     harness_log.append(
         f"loaded spec={Path(args.spec)} profile={spec.params.profile} "
-        f"traffic_requests={spec.params.total_requests} scenarios={len(scenarios)} "
-        f"concurrency_levels={list(_concurrency_levels(spec))}"
+        f"stage_requests={stage_request_total} scenarios={len(scenarios)} "
+        f"load_stages={[stage.id for stage in spec.params.load_stages]}"
     )
     try:
         results = asyncio.run(_run_benchmark(spec, scenarios, harness_log))
-        report = build_results_report(spec, results)
+        report = build_results_report(spec, results, scenarios=scenarios)
         write_artifacts(out_dir, spec, scenarios, results, report)
         write_harness_log(out_dir, harness_log)
     except ArtifactError as exc:
@@ -154,6 +261,7 @@ def main() -> int:
         report = build_results_report(
             spec,
             [],
+            scenarios=scenarios,
             harness_status="error",
             harness_error=f"{exc.__class__.__name__}: {exc}",
         )
