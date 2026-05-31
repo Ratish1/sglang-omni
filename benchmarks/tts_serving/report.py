@@ -338,12 +338,11 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         if scenario.capability_key == "voices.upload"
         and scenario.planned_metadata.get("upload_case") == "near_limit"
     }
-    cache_eviction_formats = {
-        str(scenario.planned_metadata.get("upload_format"))
+    cache_pressure_voice_counts = [
+        scenario.planned_metadata.get("voice_count")
         for scenario in scenarios
-        if scenario.capability_key == "voices.upload"
-        and scenario.planned_metadata.get("upload_case") == "cache_eviction"
-    }
+        if scenario.capability_key == "voices.cache_pressure"
+    ]
     speaker_cap_cases = sum(
         1
         for scenario in scenarios
@@ -369,7 +368,11 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         "near_limit_formats": sorted(near_limit_formats),
         "near_limit_missing_formats": near_limit_missing_formats,
         "near_limit_contract_complete": not near_limit_missing_formats,
-        "cache_eviction_formats": sorted(cache_eviction_formats),
+        "metadata_sequence_present": any(
+            scenario.capability_key == "voices.upload_metadata"
+            for scenario in scenarios
+        ),
+        "cache_pressure_voice_counts": cache_pressure_voice_counts,
         "speaker_cap_cases": speaker_cap_cases,
         "speaker_cap_attempts": speaker_cap_attempts,
         "near_limit_pr1_gap": None,
@@ -391,20 +394,32 @@ def _coverage_failures(
     voice_upload_coverage: dict[str, Any],
 ) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
-    endpoint_set = {scenario.endpoint for scenario in scenarios}
-    if "speech" in endpoint_set:
+    enabled_endpoint_set = _enabled_endpoint_set(spec)
+    generated_endpoint_set = {scenario.endpoint for scenario in scenarios}
+    for endpoint in sorted(enabled_endpoint_set - generated_endpoint_set):
+        failures.append(_coverage_gap(f"{endpoint}.enabled", [endpoint]))
+    if "speech" in enabled_endpoint_set:
         failures.extend(_speech_coverage_failures(scenarios))
-    if "speech_sse" in endpoint_set and not _has_capability(scenarios, "speech.sse"):
+    if "speech_sse" in enabled_endpoint_set and not _has_capability(
+        scenarios, "speech.sse"
+    ):
         failures.append(_coverage_gap("speech.sse", ["speech.sse"]))
-    if "batch" in endpoint_set:
+    if "batch" in enabled_endpoint_set:
         failures.extend(_batch_coverage_failures(scenarios))
-    if "voices" in endpoint_set:
+    if "voices" in enabled_endpoint_set:
         failures.extend(
             _voice_coverage_failures(spec, scenarios, voice_upload_coverage)
         )
-    if "websocket" in endpoint_set:
+    if "websocket" in enabled_endpoint_set:
         failures.extend(_websocket_coverage_failures(scenarios))
     return failures
+
+
+def _enabled_endpoint_set(spec: BenchmarkSpec) -> set[str]:
+    endpoint_set: set[str] = set()
+    for stage in spec.params.load_stages:
+        endpoint_set.update(stage.enabled_endpoints or spec.params.enabled_endpoints)
+    return endpoint_set
 
 
 def _speech_coverage_failures(scenarios: list[Scenario]) -> list[dict[str, Any]]:
@@ -523,7 +538,7 @@ def _voice_coverage_failures(
         if scenario.stage_id not in cap_stage_ids
     ]
     failures: list[dict[str, Any]] = []
-    if regular_voice_scenarios:
+    if regular_voice_scenarios or _regular_voice_coverage_required(spec):
         failures.extend(_regular_voice_coverage_failures(regular_voice_scenarios))
         if (
             voice_upload_coverage["regular_upload_format_contract_present"]
@@ -535,14 +550,42 @@ def _voice_coverage_failures(
                     voice_upload_coverage["near_limit_missing_formats"],
                 )
             )
+        if not voice_upload_coverage["metadata_sequence_present"]:
+            failures.append(
+                _coverage_gap(
+                    "voices.upload_metadata",
+                    ["voices.upload_metadata"],
+                )
+            )
     if cap_stage_ids and voice_upload_coverage["speaker_cap_attempts"] <= 0:
         failures.append(_coverage_gap("voices.speaker_cap", ["speaker_cap_sequence"]))
-    if _configured_voice_cache_eviction_count(spec) and not any(
-        scenario.planned_metadata.get("upload_case") == "cache_eviction"
-        for scenario in voice_scenarios
+    if _configured_voice_cache_eviction_count(spec) and not _has_capability(
+        voice_scenarios, "voices.cache_pressure"
     ):
-        failures.append(_coverage_gap("voices.cache_eviction", ["cache_eviction"]))
+        failures.append(
+            _coverage_gap("voices.cache_pressure", ["voices.cache_pressure"])
+        )
     return failures
+
+
+def _regular_voice_coverage_required(spec: BenchmarkSpec) -> bool:
+    for stage in spec.params.load_stages:
+        endpoints = stage.enabled_endpoints or spec.params.enabled_endpoints
+        if "voices" not in endpoints:
+            continue
+        if _effective_voice_speaker_cap_count(spec, stage):
+            continue
+        return True
+    return False
+
+
+def _effective_voice_speaker_cap_count(spec: BenchmarkSpec, stage: Any) -> int:
+    if stage.voice_speaker_cap_count:
+        return stage.voice_speaker_cap_count
+    endpoints = stage.enabled_endpoints or spec.params.enabled_endpoints
+    if tuple(endpoints) == ("voices",):
+        return spec.params.voice_speaker_cap_count
+    return 0
 
 
 def _regular_voice_coverage_failures(scenarios: list[Scenario]) -> list[dict[str, Any]]:
@@ -586,6 +629,7 @@ def _regular_voice_coverage_failures(scenarios: list[Scenario]) -> list[dict[str
                 "delete",
                 "lifecycle",
                 "upload_delete_race",
+                "upload_metadata",
             },
             {
                 _voice_case(scenario)
@@ -653,6 +697,8 @@ def _voice_case(scenario: Scenario) -> str | None:
         return "lifecycle"
     if scenario.capability_key == "voices.upload_delete_race":
         return "upload_delete_race"
+    if scenario.capability_key == "voices.upload_metadata":
+        return "upload_metadata"
     return scenario.planned_metadata.get("upload_case")
 
 

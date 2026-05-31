@@ -1045,23 +1045,20 @@ def _required_voice_scenarios(
             _voice_delete(next_index + 3, spec, stage),
             _voice_lifecycle(next_index + 4, spec, stage),
             _voice_upload_delete_race(next_index + 5, spec, stage),
+            _voice_upload_metadata_sequence(next_index + 6, spec, stage),
         ]
     )
-    next_index += 6
+    next_index += 7
     voice_cache_eviction_count = _stage_voice_cache_eviction_count(spec, stage)
-    for pressure_index in range(voice_cache_eviction_count):
+    if voice_cache_eviction_count:
         scenarios.append(
-            _voice_upload(
-                next_index + pressure_index,
+            _voice_cache_pressure_sequence(
+                next_index,
                 spec,
                 stage,
-                upload_size=VOICE_NEAR_LIMIT_BYTES,
-                upload_format="wav",
-                content_type="audio/wav",
-                case="cache_eviction",
+                voice_count=voice_cache_eviction_count,
             )
         )
-    next_index += voice_cache_eviction_count
     return scenarios
 
 
@@ -1191,6 +1188,89 @@ def _voice_speaker_cap_sequence(
             "voice_name_prefix": name_prefix,
             "attempt_count": attempt_count,
             "speaker_max_uploaded": SPEAKER_MAX_UPLOADED,
+        },
+    )
+
+
+def _voice_upload_metadata_sequence(
+    index: int,
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+) -> Scenario:
+    run_scope = hashlib.sha256(
+        f"{spec.run_id or ''}:{spec.seed}:{stage.id}:metadata:{index}".encode("utf-8")
+    ).hexdigest()[:8]
+    name_prefix = f"bench_voice_metadata_{stage.id}_{run_scope}_{index:05d}"
+    return Scenario(
+        id=_scenario_id(stage, "voices_upload_metadata", index),
+        endpoint="voices",
+        category="voices",
+        stage_id=stage.id,
+        capability_key="voices.upload_metadata",
+        method="VOICE_UPLOAD_METADATA_SEQUENCE",
+        path="/v1/audio/voices",
+        body_type="multipart",
+        form_fields={
+            "name": name_prefix,
+            "consent": "true",
+            "ref_text": "Voice metadata benchmark reference text.",
+            "speaker_description": "Synthetic benchmark voice used for metadata listing checks.",
+        },
+        upload_field="audio_sample",
+        upload_filename=f"{name_prefix}.wav",
+        upload_content_type="audio/wav",
+        upload_size_bytes=VOICE_SMALL_UPLOAD_BYTES,
+        description="upload accepted voice formats and verify uploaded voice metadata listing",
+        planned_metadata={
+            "upload_case": "metadata_sequence",
+            "voice_name_prefix": name_prefix,
+            "accepted_formats": [
+                upload_format for upload_format, _ in VOICE_UPLOAD_SUCCESS_FORMATS
+            ],
+        },
+    )
+
+
+def _voice_cache_pressure_sequence(
+    index: int,
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+    *,
+    voice_count: int,
+) -> Scenario:
+    run_scope = hashlib.sha256(
+        f"{spec.run_id or ''}:{spec.seed}:{stage.id}:cache:{index}".encode("utf-8")
+    ).hexdigest()[:8]
+    name_prefix = f"bench_voice_cache_{stage.id}_{run_scope}_{index:05d}"
+    return Scenario(
+        id=_scenario_id(stage, "voices_cache_pressure", index),
+        endpoint="voices",
+        category="voices",
+        stage_id=stage.id,
+        capability_key="voices.cache_pressure",
+        method="VOICE_CACHE_PRESSURE_SEQUENCE",
+        path="/v1/audio/voices",
+        body_type="multipart",
+        form_fields={
+            "name": name_prefix,
+            "consent": "true",
+            "ref_text": "Voice cache pressure benchmark reference text.",
+            "speaker_description": "Synthetic benchmark voice used for cache pressure checks.",
+        },
+        upload_field="audio_sample",
+        upload_filename=f"{name_prefix}.wav",
+        upload_content_type="audio/wav",
+        upload_size_bytes=VOICE_SMALL_UPLOAD_BYTES,
+        description=(
+            "upload voices, synthesize with them, revisit early voices, and "
+            "delete the created voice set"
+        ),
+        planned_metadata={
+            "upload_case": "cache_pressure_sequence",
+            "upload_format": "wav",
+            "upload_size_bytes": VOICE_SMALL_UPLOAD_BYTES,
+            "voice_name_prefix": name_prefix,
+            "voice_count": voice_count,
         },
     )
 

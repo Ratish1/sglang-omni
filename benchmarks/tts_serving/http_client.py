@@ -21,7 +21,12 @@ from benchmarks.tts_serving.metrics import (
     finish_timing,
     parse_sse_audio_event,
 )
-from benchmarks.tts_serving.scenarios import SPEAKER_MAX_UPLOADED, Scenario
+from benchmarks.tts_serving.scenarios import (
+    SPEAKER_MAX_UPLOADED,
+    VOICE_SMALL_UPLOAD_BYTES,
+    VOICE_UPLOAD_SUCCESS_FORMATS,
+    Scenario,
+)
 from benchmarks.tts_serving.spec import BenchmarkSpec
 from benchmarks.tts_serving.urls import api_url
 from benchmarks.tts_serving.voice_upload_fixtures import (
@@ -77,6 +82,10 @@ async def run_http_scenario(
             await _run_voice_upload_delete_race(session, spec, scenario, result)
         elif scenario.method == "VOICE_SPEAKER_CAP_SEQUENCE":
             await _run_voice_speaker_cap_sequence(session, spec, scenario, result)
+        elif scenario.method == "VOICE_UPLOAD_METADATA_SEQUENCE":
+            await _run_voice_upload_metadata_sequence(session, spec, scenario, result)
+        elif scenario.method == "VOICE_CACHE_PRESSURE_SEQUENCE":
+            await _run_voice_cache_pressure_sequence(session, spec, scenario, result)
         elif scenario.method == "GET":
             async with session.get(url) as response:
                 await _handle_probe_response(response, result, scenario)
@@ -406,6 +415,7 @@ def _mark_unsupported_contract(
     scenario: Scenario,
     *,
     body: str,
+    path: str | None = None,
 ) -> None:
     result.success = False
     result.status = "unsupported_contract"
@@ -414,7 +424,7 @@ def _mark_unsupported_contract(
     result.error = (
         "enabled benchmark contract is unsupported: "
         f"endpoint={scenario.endpoint}, operation={scenario.capability_key}, "
-        f"path={scenario.path}, http_status={result.http_status}, body={body}"
+        f"path={path or scenario.path}, http_status={result.http_status}, body={body}"
     )
 
 
@@ -526,31 +536,57 @@ def _is_expected_client_error_scenario(scenario: Scenario) -> bool:
 def _request_body(
     scenario: Scenario, *, form_fields: Mapping[str, str] | None = None
 ) -> aiohttp.FormData:
+    return _voice_upload_body(
+        scenario,
+        form_fields=form_fields or scenario.form_fields,
+        upload_format=str(scenario.planned_metadata.get("upload_format", "wav")),
+        content_type=scenario.upload_content_type or "audio/wav",
+        upload_size=scenario.upload_size_bytes,
+        upload_case=str(scenario.planned_metadata.get("upload_case", "format")),
+        filename=scenario.upload_filename or "audio.wav",
+    )
+
+
+def _voice_upload_body(
+    scenario: Scenario,
+    *,
+    form_fields: Mapping[str, str],
+    upload_format: str,
+    content_type: str,
+    upload_size: int,
+    upload_case: str,
+    filename: str,
+) -> aiohttp.FormData:
     form = aiohttp.FormData()
-    for key, value in (form_fields or scenario.form_fields).items():
+    for key, value in form_fields.items():
         form.add_field(key, value)
     if scenario.upload_field:
         form.add_field(
             scenario.upload_field,
-            _synthetic_upload_bytes(scenario),
-            filename=scenario.upload_filename or "audio.wav",
-            content_type=scenario.upload_content_type or "audio/wav",
+            _synthetic_upload_bytes_for(
+                upload_case=upload_case,
+                upload_format=upload_format,
+                upload_size=upload_size,
+            ),
+            filename=filename,
+            content_type=content_type,
         )
     return form
 
 
-def _synthetic_upload_bytes(scenario: Scenario) -> bytes:
-    upload_case = str(scenario.planned_metadata.get("upload_case", "format"))
+def _synthetic_upload_bytes_for(
+    *,
+    upload_case: str,
+    upload_format: str,
+    upload_size: int,
+) -> bytes:
     if upload_case == "corrupt_audio":
-        return _pad_bytes(b"not-a-valid-audio-upload", scenario.upload_size_bytes)
-    upload_format = str(scenario.planned_metadata.get("upload_format", "wav"))
+        return _pad_bytes(b"not-a-valid-audio-upload", upload_size)
     if upload_case in {"near_limit", "cache_eviction"}:
-        return get_near_limit_voice_upload_fixture(
-            upload_format, scenario.upload_size_bytes
-        )
+        return get_near_limit_voice_upload_fixture(upload_format, upload_size)
     if upload_case == "format" and upload_format != "wav":
         return get_voice_upload_fixture(upload_format)
-    return _synthetic_audio_bytes(scenario.upload_size_bytes, upload_format)
+    return _synthetic_audio_bytes(upload_size, upload_format)
 
 
 def _synthetic_audio_bytes(size: int, upload_format: str = "wav") -> bytes:
@@ -611,10 +647,47 @@ def _voice_request_size(
     *,
     form_fields: Mapping[str, str],
 ) -> int:
-    return (
-        sum(len(key) + len(value) for key, value in form_fields.items())
-        + scenario.upload_size_bytes
+    return _voice_request_size_for(
+        form_fields=form_fields,
+        upload_size=scenario.upload_size_bytes,
     )
+
+
+def _voice_request_size_for(
+    *,
+    form_fields: Mapping[str, str],
+    upload_size: int,
+) -> int:
+    return (
+        sum(len(key) + len(value) for key, value in form_fields.items()) + upload_size
+    )
+
+
+def _voice_sequence_upload_size(upload_format: str) -> int:
+    if upload_format == "wav":
+        return VOICE_SMALL_UPLOAD_BYTES
+    return len(get_voice_upload_fixture(upload_format))
+
+
+def _voice_sequence_form_fields(
+    scenario: Scenario,
+    *,
+    voice_name: str,
+    ref_text: str,
+    speaker_description: str,
+) -> dict[str, str]:
+    form_fields = dict(scenario.form_fields)
+    form_fields["name"] = voice_name
+    form_fields["ref_text"] = ref_text
+    form_fields["speaker_description"] = speaker_description
+    return form_fields
+
+
+def _cache_revisit_voice_names(voice_names: list[str]) -> list[str]:
+    if len(voice_names) <= 2:
+        return voice_names
+    midpoint = len(voice_names) // 2
+    return [voice_names[0], voice_names[midpoint], voice_names[-1], voice_names[0]]
 
 
 def _speaker_cap_form_fields(
@@ -908,6 +981,140 @@ async def _run_voice_speaker_cap_sequence(
             _mark_cleanup_error_if_primary_path_passed(result, cleanup_error)
 
 
+async def _run_voice_upload_metadata_sequence(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+) -> None:
+    voice_name_prefix = str(scenario.planned_metadata.get("voice_name_prefix", ""))
+    if not voice_name_prefix:
+        _mark_protocol_error(
+            result,
+            status="invalid_benchmark_scenario",
+            error="voice metadata sequence requires voice_name_prefix",
+        )
+        return
+
+    upload_url = api_url(spec.base_url, scenario.path)
+    created_voice_names: list[str] = []
+    expected_entries: dict[str, dict[str, str]] = {}
+    try:
+        for upload_format, content_type in VOICE_UPLOAD_SUCCESS_FORMATS:
+            voice_name = f"{voice_name_prefix}_{upload_format}"
+            fields = _voice_sequence_form_fields(
+                scenario,
+                voice_name=voice_name,
+                ref_text=f"Voice metadata reference text for {upload_format}.",
+                speaker_description=(
+                    f"Synthetic metadata sequence voice in {upload_format} format."
+                ),
+            )
+            created_voice_names.append(voice_name)
+            expected_entries[voice_name] = {
+                "ref_text": fields["ref_text"],
+                "speaker_description": fields["speaker_description"],
+            }
+            if not await _post_expected_voice_upload(
+                session,
+                upload_url,
+                scenario,
+                result,
+                form_fields=fields,
+                upload_format=upload_format,
+                content_type=content_type,
+                upload_size=_voice_sequence_upload_size(upload_format),
+                upload_case="format",
+                operation=f"metadata upload {upload_format}",
+            ):
+                return
+
+        voice_list = await _get_voice_list(session, spec, scenario, result)
+        if voice_list is None:
+            return
+        if not _validate_uploaded_voice_metadata_sequence(
+            voice_list,
+            expected_entries,
+            result,
+        ):
+            return
+        _mark_success(result, capability="pass")
+    finally:
+        cleanup_error = await _cleanup_voice_names(session, spec, created_voice_names)
+        if cleanup_error is not None:
+            _mark_cleanup_error_if_primary_path_passed(result, cleanup_error)
+
+
+async def _run_voice_cache_pressure_sequence(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+) -> None:
+    voice_count = _metadata_positive_int(scenario, "voice_count")
+    voice_name_prefix = str(scenario.planned_metadata.get("voice_name_prefix", ""))
+    if voice_count is None or not voice_name_prefix:
+        _mark_protocol_error(
+            result,
+            status="invalid_benchmark_scenario",
+            error="voice cache pressure sequence requires voice_count and voice_name_prefix",
+        )
+        return
+
+    upload_url = api_url(spec.base_url, scenario.path)
+    created_voice_names: list[str] = []
+    try:
+        for voice_index in range(voice_count):
+            voice_name = f"{voice_name_prefix}_{voice_index:04d}"
+            fields = _voice_sequence_form_fields(
+                scenario,
+                voice_name=voice_name,
+                ref_text=f"Voice cache pressure reference text {voice_index}.",
+                speaker_description=(
+                    f"Synthetic cache pressure voice number {voice_index}."
+                ),
+            )
+            created_voice_names.append(voice_name)
+            if not await _post_expected_voice_upload(
+                session,
+                upload_url,
+                scenario,
+                result,
+                form_fields=fields,
+                upload_format="wav",
+                content_type="audio/wav",
+                upload_size=VOICE_SMALL_UPLOAD_BYTES,
+                upload_case="format",
+                operation=f"cache pressure upload {voice_index}",
+            ):
+                return
+            if not await _post_speech_with_uploaded_voice(
+                session,
+                spec,
+                scenario,
+                result,
+                voice_name=voice_name,
+                prompt=f"Cache pressure synthesis request {voice_index}.",
+            ):
+                return
+
+        for voice_name in _cache_revisit_voice_names(created_voice_names):
+            if not await _post_speech_with_uploaded_voice(
+                session,
+                spec,
+                scenario,
+                result,
+                voice_name=voice_name,
+                prompt=f"Cache revisit synthesis request for {voice_name}.",
+            ):
+                return
+        _mark_success(result, capability="pass")
+    finally:
+        cleanup_error = await _cleanup_voice_names(session, spec, created_voice_names)
+        if cleanup_error is not None:
+            _mark_cleanup_error_if_primary_path_passed(result, cleanup_error)
+
+
 def _speaker_cap_sequence_config(
     scenario: Scenario,
     result: ScenarioResult,
@@ -1114,7 +1321,80 @@ async def _post_voice_upload(
     *,
     form_fields: Mapping[str, str],
 ) -> dict[str, Any] | None:
-    body = _request_body(scenario, form_fields=form_fields)
+    return await _post_voice_upload_audio(
+        session,
+        upload_url,
+        scenario,
+        result,
+        form_fields=form_fields,
+        upload_format=str(scenario.planned_metadata.get("upload_format", "wav")),
+        content_type=scenario.upload_content_type or "audio/wav",
+        upload_size=scenario.upload_size_bytes,
+        upload_case=str(scenario.planned_metadata.get("upload_case", "format")),
+        filename=scenario.upload_filename or "audio.wav",
+    )
+
+
+async def _post_expected_voice_upload(
+    session: aiohttp.ClientSession,
+    upload_url: str,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    form_fields: Mapping[str, str],
+    upload_format: str,
+    content_type: str,
+    upload_size: int,
+    upload_case: str,
+    operation: str,
+) -> bool:
+    result.request_bytes += _voice_request_size_for(
+        form_fields=form_fields,
+        upload_size=upload_size,
+    )
+    payload = await _post_voice_upload_audio(
+        session,
+        upload_url,
+        scenario,
+        result,
+        form_fields=form_fields,
+        upload_format=upload_format,
+        content_type=content_type,
+        upload_size=upload_size,
+        upload_case=upload_case,
+        filename=f"{form_fields.get('name', 'voice')}.{upload_format}",
+    )
+    if payload is None:
+        return False
+    return _require_voice_upload_identifier(
+        payload,
+        result,
+        error=f"{operation} response must include an identifier",
+    )
+
+
+async def _post_voice_upload_audio(
+    session: aiohttp.ClientSession,
+    upload_url: str,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    form_fields: Mapping[str, str],
+    upload_format: str,
+    content_type: str,
+    upload_size: int,
+    upload_case: str,
+    filename: str,
+) -> dict[str, Any] | None:
+    body = _voice_upload_body(
+        scenario,
+        form_fields=form_fields,
+        upload_format=upload_format,
+        content_type=content_type,
+        upload_size=upload_size,
+        upload_case=upload_case,
+        filename=filename,
+    )
     async with session.post(upload_url, data=body) as response:
         result.http_status = response.status
         result.http_status_class = classify_http_status(response.status)
@@ -1142,6 +1422,56 @@ async def _post_voice_upload(
         status="invalid_voice_response",
         error_prefix="voice upload response returned invalid JSON",
     )
+
+
+async def _post_speech_with_uploaded_voice(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    voice_name: str,
+    prompt: str,
+) -> bool:
+    payload = {
+        "model": spec.model_name,
+        "input": prompt,
+        "voice": voice_name,
+        "response_format": "pcm",
+        "speed": 1.0,
+    }
+    result.request_bytes += len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    speech_url = api_url(spec.base_url, "/v1/audio/speech")
+    async with session.post(speech_url, json=payload) as response:
+        result.http_status = response.status
+        result.http_status_class = classify_http_status(response.status)
+        result.response_headers = dict(response.headers)
+        body = await response.read()
+        result.response_bytes += len(body)
+        body_text = body.decode("utf-8", errors="replace")
+        if response.status in UNSUPPORTED_HTTP_STATUSES:
+            _mark_unsupported_contract(
+                result,
+                scenario,
+                body=body_text,
+                path="/v1/audio/speech",
+            )
+            return False
+        if not 200 <= response.status < 300:
+            _classify_http_failure(response.status, body_text, result, scenario)
+            return False
+        if not _is_audio_response(body, response.headers, "pcm"):
+            _mark_protocol_error(
+                result,
+                status="invalid_audio_response",
+                error=(
+                    "speech endpoint returned 2xx without PCM audio while using "
+                    f"uploaded voice {voice_name!r}"
+                ),
+            )
+            return False
+        result.audio_bytes += len(body)
+        return True
 
 
 async def _raw_post(
@@ -1263,6 +1593,48 @@ def _validate_overwritten_voice_entry(
     return True
 
 
+def _validate_uploaded_voice_metadata_sequence(
+    payload: dict[str, Any],
+    expected_entries: Mapping[str, Mapping[str, str]],
+    result: ScenarioResult,
+) -> bool:
+    if not _is_valid_voice_list_response(payload):
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=(
+                "voice metadata sequence requires voice list response with "
+                "valid preset and uploaded voice metadata"
+            ),
+        )
+        return False
+    for voice_name, expected_fields in expected_entries.items():
+        entries = _uploaded_voice_entries(payload, voice_name)
+        if len(entries) != 1:
+            _mark_protocol_error(
+                result,
+                status="invalid_voice_response",
+                error=(
+                    "voice metadata sequence must expose exactly one uploaded "
+                    f"voice named {voice_name!r}; observed={len(entries)}"
+                ),
+            )
+            return False
+        entry = entries[0]
+        for key, expected_value in expected_fields.items():
+            if entry.get(key) != expected_value:
+                _mark_protocol_error(
+                    result,
+                    status="invalid_voice_response",
+                    error=(
+                        "voice metadata sequence did not preserve "
+                        f"{key} for {voice_name!r}"
+                    ),
+                )
+                return False
+    return True
+
+
 async def _get_voice_list(
     session: aiohttp.ClientSession,
     spec: BenchmarkSpec,
@@ -1371,13 +1743,13 @@ async def _cleanup_voice_names(
         try:
             status, body, _ = await _raw_delete(session, delete_url)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            return f"speaker cap cleanup failed for {voice_name!r}: {exc}"
+            return f"voice cleanup failed for {voice_name!r}: {exc}"
         body_text = body.decode("utf-8", errors="replace")
         if status == 404:
             continue
         if not 200 <= status < 300 or not _is_valid_voice_delete_success(body):
             return (
-                f"speaker cap cleanup failed for {voice_name!r}: "
+                f"voice cleanup failed for {voice_name!r}: "
                 f"status={status}, body={body_text}"
             )
     return None
@@ -1393,15 +1765,14 @@ def _scenario_response_format(scenario: Scenario) -> str | None:
 def _handle_batch_success(
     body: bytes, result: ScenarioResult, scenario: Scenario
 ) -> None:
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        _mark_protocol_error(
-            result,
-            status="invalid_batch_response",
-            error=f"batch endpoint returned invalid JSON: {exc}",
-        )
-        result.error_type = exc.__class__.__name__
+    payload = _json_from_bytes(
+        body,
+        result,
+        status="invalid_batch_response",
+        error_prefix="batch endpoint returned invalid JSON",
+        default_empty={},
+    )
+    if payload is None:
         return
     required_keys = {"id", "results", "total", "succeeded", "failed"}
     if not isinstance(payload, dict) or not required_keys <= set(payload):
@@ -1549,15 +1920,14 @@ def _expected_batch_response_format(scenario: Scenario, index: int) -> str:
 def _handle_voice_success(
     body: bytes, result: ScenarioResult, scenario: Scenario
 ) -> None:
-    try:
-        payload = json.loads(body.decode("utf-8")) if body else {}
-    except json.JSONDecodeError as exc:
-        _mark_protocol_error(
-            result,
-            status="invalid_voice_response",
-            error=f"voice endpoint returned invalid JSON: {exc}",
-        )
-        result.error_type = exc.__class__.__name__
+    payload = _json_from_bytes(
+        body,
+        result,
+        status="invalid_voice_response",
+        error_prefix="voice endpoint returned invalid JSON",
+        default_empty={},
+    )
+    if payload is None:
         return
     if scenario.capability_key == "voices.list":
         if _is_valid_voice_list_response(payload):
@@ -1649,15 +2019,14 @@ def _json_object_from_bytes(
     status: str,
     error_prefix: str,
 ) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(body.decode("utf-8")) if body else {}
-    except json.JSONDecodeError as exc:
-        _mark_protocol_error(
-            result,
-            status=status,
-            error=f"{error_prefix}: {exc}",
-        )
-        result.error_type = exc.__class__.__name__
+    payload = _json_from_bytes(
+        body,
+        result,
+        status=status,
+        error_prefix=error_prefix,
+        default_empty={},
+    )
+    if payload is None:
         return None
     if not isinstance(payload, dict):
         _mark_protocol_error(
@@ -1667,6 +2036,30 @@ def _json_object_from_bytes(
         )
         return None
     return payload
+
+
+def _json_from_bytes(
+    body: bytes,
+    result: ScenarioResult,
+    *,
+    status: str,
+    error_prefix: str,
+    default_empty: Any = None,
+) -> Any | None:
+    try:
+        return (
+            json.loads(body.decode("utf-8", errors="replace"))
+            if body
+            else default_empty
+        )
+    except json.JSONDecodeError as exc:
+        _mark_protocol_error(
+            result,
+            status=status,
+            error=f"{error_prefix}: {exc}",
+        )
+        result.error_type = exc.__class__.__name__
+        return None
 
 
 def _is_valid_preset_voice(item: Any) -> bool:
@@ -1750,7 +2143,7 @@ def _uploaded_voice_names_with_prefix(
 
 def _is_valid_voice_delete_success(body: bytes) -> bool:
     try:
-        payload = json.loads(body.decode("utf-8")) if body else {}
+        payload = json.loads(body.decode("utf-8", errors="replace")) if body else {}
     except json.JSONDecodeError:
         return False
     if not isinstance(payload, dict):
