@@ -94,6 +94,7 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #   "profile": "stress",
 #   "enabled_endpoints": ["speech", "speech_sse", "voices", "batch", "websocket"],
 #   "allow_missing_optional_endpoints": false,
+#   "voice_cache_pressure_count": 64,
 #   "load_stages": [
 #     {"id": "closed-1", "mode": "closed_loop", "request_count": 32, "max_concurrency": 1},
 #     {"id": "closed-16", "mode": "closed_loop", "request_count": 128, "max_concurrency": 16},
