@@ -44,6 +44,7 @@ def _result_for(scenario: Scenario) -> ScenarioResult:
         scenario_id=scenario.id,
         endpoint=scenario.endpoint,
         category=scenario.category,
+        capability_key=scenario.capability_key,
         expected_success=scenario.expect_success,
     )
 
@@ -153,7 +154,7 @@ def test_stress_scenarios_include_required_serving_families() -> None:
                 {
                     "id": "burst-128",
                     "mode": "burst",
-                    "request_count": 48,
+                    "request_count": 80,
                     "max_concurrency": 128,
                 }
             ],
@@ -168,13 +169,43 @@ def test_stress_scenarios_include_required_serving_families() -> None:
         for scenario in scenarios
         if scenario.endpoint == "batch"
     }
+    languages = {
+        scenario.planned_metadata.get("language")
+        for scenario in scenarios
+        if scenario.category == "speech_language"
+    }
+    response_formats = {
+        scenario.planned_metadata.get("response_format")
+        for scenario in scenarios
+        if scenario.category == "speech_response_format"
+    }
+    task_types = {
+        scenario.planned_metadata.get("task_type")
+        for scenario in scenarios
+        if scenario.category == "speech_task_type"
+    }
 
     assert len(ids) == len(set(ids))
-    assert len(scenarios) == 48
+    assert len(scenarios) == 80
     assert scenario_set_hash(scenarios) == scenario_set_hash(build_scenarios(spec))
     assert {"speech_baseline", "speech_malformed", "batch", "voices"} <= categories
     assert {"websocket", "websocket_malformed", "websocket_disconnect"} <= categories
-    assert {1, 2, 32} <= batch_sizes
+    assert {
+        "Auto",
+        "Chinese",
+        "English",
+        "Japanese",
+        "Korean",
+        "German",
+        "French",
+        "Russian",
+        "Portuguese",
+        "Spanish",
+        "Italian",
+    } <= languages
+    assert {"wav", "pcm", "mp3", "flac", "aac", "opus"} <= response_formats
+    assert {"Base", "CustomVoice", "VoiceDesign"} <= task_types
+    assert {1, 2, 8, 32} <= batch_sizes
     assert any(
         scenario.upload_size_bytes >= (10 * 1024 * 1024) - 1 for scenario in scenarios
     )
@@ -199,6 +230,7 @@ def test_report_includes_tail_stage_endpoint_and_error_taxonomy() -> None:
             scenario_id=scenarios[0].id,
             endpoint="speech",
             category="speech_baseline",
+            capability_key="speech.create",
             stage_id="burst",
             load_mode="burst",
             load_concurrency=2,
@@ -213,6 +245,7 @@ def test_report_includes_tail_stage_endpoint_and_error_taxonomy() -> None:
             scenario_id=scenarios[1].id,
             endpoint="batch",
             category="batch",
+            capability_key="batch.create",
             stage_id="burst",
             load_mode="burst",
             load_concurrency=2,
@@ -239,6 +272,46 @@ def test_report_includes_tail_stage_endpoint_and_error_taxonomy() -> None:
     assert report["metrics"]["by_stage"]["burst"]["achieved_rps"] is not None
     assert report["metrics"]["by_endpoint"]["batch"]["status_counts"]["missing"] == 1
     assert report["metrics"]["error_class_counts"]["http_error"] == 1
+    assert report["operation_capabilities"]["batch.create"] == "missing"
+
+
+def test_report_marks_endpoint_partial_when_operations_are_mixed() -> None:
+    spec = _spec()
+    results = [
+        ScenarioResult(
+            scenario_id="voices-list",
+            endpoint="voices",
+            category="voices",
+            capability_key="voices.list",
+            status="ok",
+            success=True,
+            capability="pass",
+        ),
+        ScenarioResult(
+            scenario_id="voices-upload",
+            endpoint="voices",
+            category="voices",
+            capability_key="voices.upload",
+            status="missing",
+            success=False,
+            capability="missing",
+        ),
+        ScenarioResult(
+            scenario_id="voices-upload-later",
+            endpoint="voices",
+            category="voices",
+            capability_key="voices.upload",
+            status="ok",
+            success=True,
+            capability="pass",
+        ),
+    ]
+
+    report = build_results_report(spec, results, scenarios=[])
+
+    assert report["operation_capabilities"]["voices.list"] == "pass"
+    assert report["operation_capabilities"]["voices.upload"] == "partial"
+    assert report["capabilities"]["voices"] == "partial"
 
 
 def test_http_batch_success_requires_batch_result_schema() -> None:
@@ -247,6 +320,35 @@ def test_http_batch_success_requires_batch_result_schema() -> None:
         endpoint="batch",
         category="batch",
         stage_id="burst",
+        capability_key="batch.create",
+        path="/v1/audio/speech/batch",
+        payload={"items": [{"input": "hello"}]},
+        planned_metadata={"batch_size": 1},
+    )
+    result = _result_for(scenario)
+    response = _FakeResponse(
+        status=200,
+        body=(
+            b'{"results": [{"status": "ok", "audio_data": "abc"}], '
+            b'"total": 1, "succeeded": 1, "failed": 0}'
+        ),
+        headers={"Content-Type": "application/json"},
+    )
+
+    asyncio.run(_handle_binary_response(response, result, scenario))
+
+    assert result.status == "ok"
+    assert result.success is True
+    assert result.capability == "pass"
+
+
+def test_http_batch_wrong_item_count_is_protocol_error() -> None:
+    scenario = Scenario(
+        id="batch-bad-count",
+        endpoint="batch",
+        category="batch",
+        stage_id="burst",
+        capability_key="batch.create",
         path="/v1/audio/speech/batch",
         payload={"items": [{"input": "hello"}]},
         planned_metadata={"batch_size": 1},
@@ -260,9 +362,8 @@ def test_http_batch_success_requires_batch_result_schema() -> None:
 
     asyncio.run(_handle_binary_response(response, result, scenario))
 
-    assert result.status == "ok"
-    assert result.success is True
-    assert result.capability == "pass"
+    assert result.status == "invalid_batch_response"
+    assert result.capability == "fail"
 
 
 def test_http_optional_success_404_is_missing() -> None:
@@ -271,6 +372,7 @@ def test_http_optional_success_404_is_missing() -> None:
         endpoint="batch",
         category="batch",
         stage_id="burst",
+        capability_key="batch.create",
         path="/v1/audio/speech/batch",
     )
     result = _result_for(scenario)
@@ -288,6 +390,7 @@ def test_http_expected_voice_delete_404_is_expected_error() -> None:
         endpoint="voices",
         category="voices",
         stage_id="burst",
+        capability_key="voices.delete",
         method="DELETE",
         path="/v1/audio/voices/missing",
         expect_success=False,
@@ -299,7 +402,27 @@ def test_http_expected_voice_delete_404_is_expected_error() -> None:
     asyncio.run(_handle_binary_response(response, result, scenario))
 
     assert result.status == "expected_error"
-    assert result.capability is None
+    assert result.capability == "pass"
+
+
+def test_http_malformed_request_500_is_server_failure() -> None:
+    scenario = Scenario(
+        id="speech-malformed-500",
+        endpoint="speech",
+        category="speech_malformed",
+        stage_id="burst",
+        capability_key="speech.validation",
+        payload={"response_format": "wav"},
+        expect_success=False,
+        expected_status_class="client_error",
+    )
+    result = _result_for(scenario)
+    response = _FakeResponse(status=500, body=b"crash")
+
+    asyncio.run(_handle_binary_response(response, result, scenario))
+
+    assert result.status == "failed"
+    assert result.error_class == "server_error"
 
 
 def test_http_speech_2xx_without_audio_is_invalid() -> None:
@@ -308,6 +431,7 @@ def test_http_speech_2xx_without_audio_is_invalid() -> None:
         endpoint="speech",
         category="speech_baseline",
         stage_id="burst",
+        capability_key="speech.create",
         payload={"response_format": "wav"},
     )
     result = _result_for(scenario)
@@ -329,6 +453,7 @@ def test_http_malformed_request_2xx_is_unexpected_success() -> None:
         endpoint="speech",
         category="speech_malformed",
         stage_id="burst",
+        capability_key="speech.validation",
         payload={"response_format": "wav"},
         expect_success=False,
     )
@@ -343,6 +468,27 @@ def test_http_malformed_request_2xx_is_unexpected_success() -> None:
 
     assert result.status == "unexpected_success"
     assert result.error_class == "unexpected_success"
+
+
+def test_http_voice_invalid_2xx_body_is_protocol_error() -> None:
+    scenario = Scenario(
+        id="voice-upload",
+        endpoint="voices",
+        category="voices",
+        stage_id="burst",
+        capability_key="voices.upload",
+    )
+    result = _result_for(scenario)
+    response = _FakeResponse(
+        status=200,
+        body=b'{"ok": true}',
+        headers={"Content-Type": "application/json"},
+    )
+
+    asyncio.run(_handle_binary_response(response, result, scenario))
+
+    assert result.status == "invalid_voice_response"
+    assert result.capability == "fail"
 
 
 def test_websocket_expected_error_does_not_fail_endpoint_capability() -> None:
@@ -362,6 +508,20 @@ def test_websocket_expected_error_does_not_fail_endpoint_capability() -> None:
     assert event_type == "error"
     assert result.status == "expected_error"
     assert result.capability == "pass"
+
+
+def test_websocket_audio_event_without_data_is_protocol_error() -> None:
+    result = ScenarioResult(
+        scenario_id="ws-normal",
+        endpoint="websocket",
+        category="websocket",
+    )
+
+    event_type = _merge_text_event('{"type": "response.audio.delta"}', result)
+
+    assert event_type == "audio"
+    assert result.status == "failed"
+    assert result.error_class == "protocol_error"
 
 
 def test_websocket_audio_event_records_audio_bytes() -> None:
@@ -430,6 +590,80 @@ async def test_websocket_script_exercises_stateful_sequence() -> None:
     assert result.status == "ok"
     assert result.success is True
     assert result.ws_event_counts["binary"] == 1
+
+
+@pytest.mark.asyncio
+async def test_websocket_binary_before_audio_start_fails_sequence() -> None:
+    async def handle_ws(request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_bytes(b"pcm")
+        await ws.close()
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/v1/audio/speech/stream", handle_ws)
+    runner, base_url = await _start_app(app)
+    try:
+        spec = BenchmarkSpec.from_obj(
+            {
+                "base_url": base_url,
+                "model_name": "higgs",
+                "params": {"timeout_s": 5},
+            }
+        )
+        scenario = next(
+            scenario for scenario in build_scenarios(spec) if scenario.method == "WS"
+        )
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            result = await run_ws_scenario(session, spec, scenario)
+    finally:
+        await runner.cleanup()
+
+    assert result.status == "failed"
+    assert result.error_class == "protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_websocket_disconnect_requires_post_close_liveness() -> None:
+    async def handle_ws(request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        async for _ in ws:
+            pass
+        return ws
+
+    async def handle_speech(request: web.Request) -> web.Response:
+        await request.json()
+        return web.Response(body=_wav_bytes(), content_type="audio/wav")
+
+    app = web.Application()
+    app.router.add_get("/v1/audio/speech/stream", handle_ws)
+    app.router.add_post("/v1/audio/speech", handle_speech)
+    runner, base_url = await _start_app(app)
+    try:
+        spec = BenchmarkSpec.from_obj(
+            {
+                "base_url": base_url,
+                "model_name": "higgs",
+                "params": {"timeout_s": 5},
+            }
+        )
+        scenario = next(
+            scenario
+            for scenario in build_scenarios(spec)
+            if scenario.capability_key == "ws.disconnect"
+        )
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            result = await run_ws_scenario(session, spec, scenario)
+    finally:
+        await runner.cleanup()
+
+    assert result.status == "ok"
+    assert result.was_cancelled is True
+    assert result.capability == "pass"
 
 
 @pytest.mark.asyncio
