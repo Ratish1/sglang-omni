@@ -58,7 +58,7 @@ async def _run_benchmark(
 ) -> list[ScenarioResult]:
     timeout = aiohttp.ClientTimeout(total=spec.params.timeout_s)
     headers = _auth_headers(spec)
-    connector = aiohttp.TCPConnector(limit=max(spec.params.max_concurrency * 2, 8))
+    connector = aiohttp.TCPConnector(limit=_connector_limit(spec))
     async with aiohttp.ClientSession(
         timeout=timeout,
         headers=headers,
@@ -135,36 +135,46 @@ async def _run_scheduled_stage(
     scenarios: list[Scenario],
     harness_log: list[str],
 ) -> list[ScenarioResult]:
-    semaphore = asyncio.Semaphore(stage.max_concurrency)
     stage_start = time.perf_counter()
     offsets = _planned_offsets(stage, len(scenarios), seed=spec.seed)
 
     async def run_planned(scenario: Scenario, offset: float) -> ScenarioResult:
         planned_start = stage_start + offset
-        await asyncio.sleep(max(0.0, planned_start - time.perf_counter()))
-        async with semaphore:
-            actual_start = time.perf_counter()
-            result = await _run_one_scenario(session, spec, scenario)
-            _attach_schedule_metadata(
-                result,
-                stage=stage,
-                planned_start=planned_start,
-                actual_start=actual_start,
-            )
-            return result
+        actual_start = time.perf_counter()
+        result = await _run_one_scenario(session, spec, scenario)
+        _attach_schedule_metadata(
+            result,
+            stage=stage,
+            planned_start=planned_start,
+            actual_start=actual_start,
+        )
+        return result
 
     started = time.perf_counter()
-    tasks = [
-        asyncio.create_task(run_planned(scenario, offset))
-        for scenario, offset in zip(scenarios, offsets, strict=True)
+    pending: set[asyncio.Task[ScenarioResult]] = set()
+    results: list[ScenarioResult] = []
+    for scenario, offset in zip(scenarios, offsets, strict=True):
+        planned_start = stage_start + offset
+        delay_s = planned_start - time.perf_counter()
+        if delay_s > 0:
+            await asyncio.sleep(delay_s)
+        pending.add(asyncio.create_task(run_planned(scenario, offset)))
+        done = {task for task in pending if task.done()}
+        if done:
+            pending.difference_update(done)
+            results.extend(task.result() for task in done)
+    if pending:
+        results.extend(await asyncio.gather(*pending))
+    generator_lag_s = [
+        result.queue_wait_s for result in results if result.queue_wait_s is not None
     ]
-    results = await asyncio.gather(*tasks)
     harness_log.append(
         f"stage={stage.id} mode={stage.mode} completed {len(results)} scenarios "
         f"at concurrency={stage.max_concurrency} in {time.perf_counter() - started:.3f}s "
-        "with open-loop arrivals scheduled independently of completions"
+        "with scheduled arrivals emitted independently of request completions "
+        f"(generator_lag_max={max(generator_lag_s, default=0.0):.6f}s)"
     )
-    return list(results)
+    return results
 
 
 async def _run_one_scenario(
@@ -201,7 +211,8 @@ def _planned_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list
         return [0.0] * request_count
     if stage.mode == "ramp":
         return _ramp_offsets(stage, request_count, seed=seed)
-    if stage.mode == "soak" and stage.duration_s:
+    if stage.mode == "soak" and stage.arrival_distribution == "deterministic":
+        assert stage.duration_s is not None
         if request_count == 1:
             return [0.0]
         step = stage.duration_s / float(request_count - 1)
@@ -215,6 +226,12 @@ def _planned_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list
             elapsed += rng.expovariate(stage.request_rate)
         return offsets
     return [index / stage.request_rate for index in range(request_count)]
+
+
+def _connector_limit(spec: BenchmarkSpec) -> int:
+    if any(stage.mode != "closed_loop" for stage in spec.params.load_stages):
+        return 0
+    return max(spec.params.max_concurrency * 2, 8)
 
 
 def _ramp_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list[float]:

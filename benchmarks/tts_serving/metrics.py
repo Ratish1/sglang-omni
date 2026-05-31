@@ -41,6 +41,7 @@ class ScenarioResult:
     audio_bytes: int = 0
     request_bytes: int = 0
     response_bytes: int = 0
+    response_format: str | None = None
     batch_size: int | None = None
     audio_duration_s: float = 0.0
     rtf: float = 0.0

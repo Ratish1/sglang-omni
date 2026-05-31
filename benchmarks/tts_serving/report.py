@@ -93,6 +93,12 @@ def build_results_report(
             "ttfa_s": _summary(ttfas),
             "queue_wait_s": _summary(queue_waits),
             "rtf": _summary(rtfs),
+            "rtf_sampled_formats": ["wav", "pcm"],
+            "rtf_unsupported_format_counts": _rtf_unsupported_format_counts(results),
+            "rtf_note": (
+                "RTF is computed only when audio duration can be derived from WAV "
+                "headers or raw PCM byte counts; compressed responses are excluded."
+            ),
             "status_counts": dict(status_counts),
             "http_status_counts": dict(
                 Counter(
@@ -110,6 +116,7 @@ def build_results_report(
             "by_category": _by_category(spec, results),
             "by_stage": _by_stage(spec, results),
             "by_endpoint": _by_endpoint(spec, results),
+            "by_operation": _by_operation(spec, results),
             "by_concurrency": _by_concurrency(spec, results),
         },
         "failures": [
@@ -238,6 +245,18 @@ def _by_endpoint(
     }
 
 
+def _by_operation(
+    spec: BenchmarkSpec, results: list[ScenarioResult]
+) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[ScenarioResult]] = defaultdict(list)
+    for result in results:
+        grouped[result.capability_key or result.endpoint].append(result)
+    return {
+        operation: _result_group_summary(spec, operation_results)
+        for operation, operation_results in sorted(grouped.items())
+    }
+
+
 def _by_concurrency(
     spec: BenchmarkSpec, results: list[ScenarioResult]
 ) -> dict[str, dict[str, Any]]:
@@ -331,6 +350,20 @@ def _admission_status_counts(results: list[ScenarioResult]) -> dict[str, int]:
             counts["transport_error"] += 1
         if result.error_type and "Timeout" in result.error_type:
             counts["timeout"] += 1
+    return dict(counts)
+
+
+def _rtf_unsupported_format_counts(results: list[ScenarioResult]) -> dict[str, int]:
+    counts = Counter()
+    for result in results:
+        response_format = (result.response_format or "").lower()
+        if (
+            response_format
+            and response_format not in {"wav", "pcm"}
+            and result.audio_bytes > 0
+            and result.rtf == 0
+        ):
+            counts[response_format] += 1
     return dict(counts)
 
 

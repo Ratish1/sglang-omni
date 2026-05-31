@@ -28,6 +28,7 @@ async def run_sdk_scenario(spec: BenchmarkSpec, scenario: Scenario) -> ScenarioR
         category=scenario.category,
         capability_key=scenario.capability_key,
         expected_success=scenario.expect_success,
+        response_format="wav",
     )
     try:
         await asyncio.to_thread(_run_openai_speech_create, spec, scenario, result)

@@ -84,6 +84,10 @@ class LoadStage:
             raise SpecError(
                 "params.load_stages[].start_request_rate is required for ramp stages"
             )
+        if mode == "soak" and duration_s is None:
+            raise SpecError(
+                "params.load_stages[].duration_s is required for soak stages"
+            )
         return cls(
             id=stage_id,
             mode=mode,
@@ -156,6 +160,8 @@ class BenchmarkParams:
             isinstance(item, str) for item in enabled
         ):
             raise SpecError("params.enabled_endpoints must be a list of strings")
+        if not enabled:
+            raise SpecError("params.enabled_endpoints must not be empty")
         unknown = sorted(set(enabled) - set(DEFAULT_ENDPOINTS))
         if unknown:
             raise SpecError(f"unknown enabled_endpoints: {unknown}")
