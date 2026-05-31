@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import random
@@ -56,6 +57,7 @@ DEFAULT_REFERENCE_TEXT = (
 VOICE_DESIGN_INSTRUCTIONS = (
     "A warm, steady adult voice with precise articulation and no dramatic affect."
 )
+INITIAL_CODEC_CHUNK_FRAMES = 4
 
 PROFILE_MIXES = {
     "production": (
@@ -208,6 +210,8 @@ def _required_stage_scenarios(
         for task_type in TASK_TYPES:
             speech_core.append(_speech_task_type(next_index, spec, stage, task_type))
             next_index += 1
+        speech_core.append(_speech_initial_codec_chunk_frames(next_index, spec, stage))
+        next_index += 1
         groups.append(speech_core)
 
         groups.append([_speech_openai_sdk(next_index, spec, stage)])
@@ -218,6 +222,10 @@ def _required_stage_scenarios(
             speech_edges.append(_speech_length(next_index, spec, stage))
             next_index += 1
         speech_edges.append(_speech_reference_success(next_index, spec, stage))
+        next_index += 1
+        speech_edges.append(_speech_reference_base64_success(next_index, spec, stage))
+        next_index += 1
+        speech_edges.append(_speech_reference_xvector_only(next_index, spec, stage))
         next_index += 1
         for reference_case, ref_audio in REFERENCE_FAILURES:
             speech_edges.append(
@@ -519,6 +527,29 @@ def _speech_openai_sdk(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Sce
     )
 
 
+def _speech_initial_codec_chunk_frames(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload.update(
+        {
+            "response_format": "pcm",
+            "initial_codec_chunk_frames": INITIAL_CODEC_CHUNK_FRAMES,
+            "seed": spec.seed + index,
+        }
+    )
+    return Scenario(
+        id=_scenario_id(stage, "speech_initial_codec_chunk_frames", index),
+        endpoint="speech",
+        category="speech_codec_chunking",
+        stage_id=stage.id,
+        capability_key="speech.create",
+        payload=payload,
+        description="speech request with initial codec chunk frame override",
+        planned_metadata={"initial_codec_chunk_frames": INITIAL_CODEC_CHUNK_FRAMES},
+    )
+
+
 def _speech_length(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
     text = LENGTH_EXTREME_TEXTS[index % len(LENGTH_EXTREME_TEXTS)]
     expect_success = bool(text.strip())
@@ -570,6 +601,49 @@ def _speech_reference_success(
         expected_status_class="success",
         description="valid or intentionally bad reference audio",
         planned_metadata={"reference_case": "valid_reference"},
+    )
+
+
+def _speech_reference_base64_success(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload["ref_audio"] = _tiny_wav_data_uri()
+    payload["ref_text"] = "A tiny inline reference audio sample."
+    payload["response_format"] = "wav"
+    return Scenario(
+        id=_scenario_id(stage, "speech_reference_base64", index),
+        endpoint="speech",
+        category="speech_reference",
+        stage_id=stage.id,
+        capability_key="speech.reference",
+        payload=payload,
+        expect_success=True,
+        expected_status_class="success",
+        description="valid base64 ref_audio voice cloning request",
+        planned_metadata={"reference_case": "valid_base64_ref_audio"},
+    )
+
+
+def _speech_reference_xvector_only(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload["ref_audio"] = _reference_audio(spec)
+    payload["ref_text"] = _reference_text(spec)
+    payload["x_vector_only_mode"] = True
+    payload["response_format"] = "wav"
+    return Scenario(
+        id=_scenario_id(stage, "speech_reference_xvector_only", index),
+        endpoint="speech",
+        category="speech_reference",
+        stage_id=stage.id,
+        capability_key="speech.reference",
+        payload=payload,
+        expect_success=True,
+        expected_status_class="success",
+        description="valid ref_audio request with x_vector_only_mode",
+        planned_metadata={"reference_case": "x_vector_only_mode"},
     )
 
 
@@ -639,6 +713,12 @@ def _malformed_payloads(spec: BenchmarkSpec, index: int) -> list[dict[str, Any]]
         },
         {
             "model": spec.model_name,
+            "input": "Invalid high speed request",
+            "response_format": "wav",
+            "speed": 4.1,
+        },
+        {
+            "model": spec.model_name,
             "input": "Streaming format violation",
             "response_format": "wav",
             "stream": True,
@@ -658,7 +738,7 @@ def _malformed_payloads(spec: BenchmarkSpec, index: int) -> list[dict[str, Any]]
 
 
 def _malformed_case_count() -> int:
-    return 10
+    return 11
 
 
 def _speech_malformed(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
@@ -873,9 +953,10 @@ def _required_voice_scenarios(
             _voice_overwrite(next_index + 3, spec, stage),
             _voice_delete(next_index + 4, spec, stage),
             _voice_lifecycle(next_index + 5, spec, stage),
+            _voice_upload_delete_race(next_index + 6, spec, stage),
         ]
     )
-    next_index += 6
+    next_index += 7
     voice_cache_eviction_count = _stage_voice_cache_eviction_count(spec, stage)
     for pressure_index in range(voice_cache_eviction_count):
         scenarios.append(
@@ -1066,6 +1147,39 @@ def _voice_overwrite(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scena
     )
 
 
+def _voice_upload_delete_race(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    name = f"bench_voice_race_{stage.id}_{index:05d}"
+    return Scenario(
+        id=_scenario_id(stage, "voices_upload_delete_race", index),
+        endpoint="voices",
+        category="voices",
+        stage_id=stage.id,
+        capability_key="voices.upload_delete_race",
+        method="VOICE_UPLOAD_DELETE_RACE",
+        path="/v1/audio/voices",
+        body_type="multipart",
+        form_fields={
+            "name": name,
+            "consent": "true",
+            "ref_text": "Voice upload/delete race benchmark reference text.",
+            "speaker_description": "Synthetic benchmark voice used for race checks.",
+        },
+        upload_field="audio_sample",
+        upload_filename=f"{name}.wav",
+        upload_content_type="audio/wav",
+        upload_size_bytes=VOICE_SMALL_UPLOAD_BYTES,
+        description="same-name voice upload racing with delete",
+        planned_metadata={
+            "upload_case": "upload_delete_race",
+            "upload_format": "wav",
+            "upload_size_bytes": VOICE_SMALL_UPLOAD_BYTES,
+            "voice_name": name,
+        },
+    )
+
+
 def _websocket_normal(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
     return Scenario(
         id=_scenario_id(stage, "websocket_normal", index),
@@ -1190,6 +1304,26 @@ def _reference_audio(spec: BenchmarkSpec) -> str:
 
 def _reference_text(spec: BenchmarkSpec) -> str:
     return spec.params.seedtts_ref_text or DEFAULT_REFERENCE_TEXT
+
+
+def _tiny_wav_data_uri() -> str:
+    payload_size = 48
+    wav = (
+        b"RIFF"
+        + (36 + payload_size).to_bytes(4, "little")
+        + b"WAVEfmt "
+        + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")
+        + (1).to_bytes(2, "little")
+        + (24000).to_bytes(4, "little")
+        + (48000).to_bytes(4, "little")
+        + (2).to_bytes(2, "little")
+        + (16).to_bytes(2, "little")
+        + b"data"
+        + payload_size.to_bytes(4, "little")
+        + b"\0" * payload_size
+    )
+    return "data:audio/wav;base64," + base64.b64encode(wav).decode("ascii")
 
 
 def _websocket_input_done_without_config(

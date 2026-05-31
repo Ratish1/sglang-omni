@@ -16,7 +16,7 @@ from benchmarks.tts_serving.metrics import (
 )
 from benchmarks.tts_serving.scenarios import Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
-from benchmarks.tts_serving.urls import api_url, websocket_url
+from benchmarks.tts_serving.urls import websocket_url
 
 WS_CONTROL_EVENT_TYPES = {
     "session.created",
@@ -52,7 +52,7 @@ async def run_ws_scenario(
                 expect_success=scenario.expect_success,
             )
         if scenario.capability_key == "ws.disconnect" and result.status == "ok":
-            await _probe_speech_after_disconnect(session, spec, result)
+            await _probe_websocket_after_disconnect(session, spec, scenario, result)
     except aiohttp.WSServerHandshakeError as exc:
         result.http_status = exc.status
         if exc.status in UNSUPPORTED_WS_STATUSES:
@@ -438,41 +438,30 @@ def _mark_unsupported_ws_contract(
     )
 
 
-async def _probe_speech_after_disconnect(
+async def _probe_websocket_after_disconnect(
     session: aiohttp.ClientSession,
     spec: BenchmarkSpec,
+    scenario: Scenario,
     result: ScenarioResult,
 ) -> None:
-    url = api_url(spec.base_url, "/v1/audio/speech")
+    url = websocket_url(spec.base_url, scenario.path)
     try:
-        async with session.post(
-            url,
-            json={
-                "model": spec.model_name,
-                "input": "Post-disconnect liveness probe.",
-                "voice": "default",
-                "response_format": "wav",
-            },
-        ) as response:
-            await response.read()
-            if 200 <= response.status < 300:
-                result.capability = "pass"
-                return
-            result.status = "failed"
-            result.success = False
-            result.capability = "fail"
-            result.http_status = response.status
-            result.error_class = (
-                "server_error" if response.status >= 500 else "http_error"
+        async with session.ws_connect(url) as ws:
+            await _run_ws_script(
+                ws,
+                result,
+                _default_script(spec),
+                timeout_s=spec.params.timeout_s,
+                expect_success=True,
             )
-            result.error = "post-disconnect speech liveness probe failed"
+        result.ws_close_reason = "client_closed"
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         result.status = "transport_error"
         result.success = False
         result.capability = "fail"
         result.error_type = exc.__class__.__name__
         result.error_class = "transport_error"
-        result.error = f"post-disconnect speech liveness probe failed: {exc}"
+        result.error = f"post-disconnect WebSocket liveness probe failed: {exc}"
 
 
 def _default_script(spec: BenchmarkSpec) -> list[dict]:

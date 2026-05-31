@@ -103,6 +103,9 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #     {"id": "voice-cache-evict", "mode": "closed_loop", "request_count": 96,
 #      "max_concurrency": 16, "enabled_endpoints": ["voices"],
 #      "voice_cache_eviction_count": 64, "voice_speaker_cap_count": 0},
+#     {"id": "voice-speaker-cap", "mode": "closed_loop", "request_count": 1040,
+#      "max_concurrency": 32, "enabled_endpoints": ["voices"],
+#      "voice_cache_eviction_count": 0, "voice_speaker_cap_count": 1001},
 #     {"id": "mixed-burst-256", "mode": "burst", "request_count": 512,
 #      "max_concurrency": 256}
 #   ]

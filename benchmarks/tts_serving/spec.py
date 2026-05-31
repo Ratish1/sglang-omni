@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,48 @@ VALID_PROFILES = {"production", "stress"}
 VALID_LOAD_MODES = {"closed_loop", "open_loop", "ramp", "burst", "soak"}
 VALID_ARRIVAL_DISTRIBUTIONS = {"deterministic", "poisson"}
 DEFAULT_ENDPOINTS = ("speech", "speech_sse", "voices", "batch", "websocket")
+TOP_LEVEL_KEYS = {
+    "base_url",
+    "model_name",
+    "test_type",
+    "run_id",
+    "seed",
+    "auth",
+    "params",
+}
+AUTH_KEYS = {"api_key_env"}
+PARAM_KEYS = {
+    "profile",
+    "total_requests",
+    "max_concurrency",
+    "concurrency_levels",
+    "load_stages",
+    "request_rate",
+    "timeout_s",
+    "enabled_endpoints",
+    "seedtts_ref_audio",
+    "seedtts_ref_text",
+    "voice_cache_eviction_count",
+    "voice_speaker_cap_count",
+    "provider_label",
+    "implementation_label",
+}
+LOAD_STAGE_KEYS = {
+    "id",
+    "mode",
+    "request_count",
+    "total_requests",
+    "max_concurrency",
+    "concurrency",
+    "request_rate",
+    "start_request_rate",
+    "duration_s",
+    "arrival_distribution",
+    "enabled_endpoints",
+    "voice_cache_eviction_count",
+    "voice_speaker_cap_count",
+}
+SOAK_REQUEST_RATE_TOLERANCE = 1e-9
 
 
 class SpecError(ValueError):
@@ -29,6 +72,7 @@ class AuthSpec:
             return cls()
         if not isinstance(obj, dict):
             raise SpecError("auth must be an object when provided")
+        _reject_unknown_keys(obj, AUTH_KEYS, "auth")
         api_key_env = obj.get("api_key_env")
         if api_key_env is not None and not isinstance(api_key_env, str):
             raise SpecError("auth.api_key_env must be a string")
@@ -53,6 +97,7 @@ class LoadStage:
     def from_obj(cls, obj: Any, *, index: int) -> LoadStage:
         if not isinstance(obj, dict):
             raise SpecError("params.load_stages entries must be objects")
+        _reject_unknown_keys(obj, LOAD_STAGE_KEYS, "params.load_stages[]")
         stage_id = _str_value(obj, "id", f"stage-{index + 1}")
         mode = _str_value(obj, "mode", "closed_loop")
         if mode not in VALID_LOAD_MODES:
@@ -70,6 +115,7 @@ class LoadStage:
             "max_concurrency",
             _positive_int(obj, "concurrency", 8),
         )
+        request_rate_provided = "request_rate" in obj
         request_rate = _request_rate(obj.get("request_rate", float("inf")))
         start_request_rate = _optional_request_rate(obj.get("start_request_rate"))
         duration_s = _optional_positive_float(obj.get("duration_s"), "duration_s")
@@ -91,9 +137,22 @@ class LoadStage:
             raise SpecError(
                 "params.load_stages[].duration_s is required for soak stages"
             )
-        if mode == "soak" and request_rate == float("inf"):
+        if mode == "soak":
             assert duration_s is not None
-            request_rate = request_count / duration_s
+            effective_request_rate = request_count / duration_s
+            if request_rate == float("inf"):
+                request_rate = effective_request_rate
+            elif request_rate_provided and not math.isclose(
+                request_rate,
+                effective_request_rate,
+                rel_tol=SOAK_REQUEST_RATE_TOLERANCE,
+                abs_tol=SOAK_REQUEST_RATE_TOLERANCE,
+            ):
+                raise SpecError(
+                    "params.load_stages[].request_rate for soak stages must match "
+                    "request_count / duration_s; omit request_rate to use the "
+                    f"derived value {effective_request_rate}"
+                )
         enabled_endpoints = _optional_enabled_endpoints(
             obj.get("enabled_endpoints"),
             "params.load_stages[].enabled_endpoints",
@@ -165,6 +224,7 @@ class BenchmarkParams:
             obj = {}
         if not isinstance(obj, dict):
             raise SpecError("params must be an object when provided")
+        _reject_unknown_keys(obj, PARAM_KEYS, "params")
 
         profile = _str_value(obj, "profile", cls.profile)
         if profile not in VALID_PROFILES:
@@ -231,6 +291,7 @@ class BenchmarkSpec:
     def from_obj(cls, obj: Any) -> BenchmarkSpec:
         if not isinstance(obj, dict):
             raise SpecError("spec must be a JSON object")
+        _reject_unknown_keys(obj, TOP_LEVEL_KEYS, "spec")
         base_url = _required_str(obj, "base_url").rstrip("/")
         model_name = _required_str(obj, "model_name")
         test_type = _str_value(obj, "test_type", "engine")
@@ -267,6 +328,12 @@ def _required_str(obj: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise SpecError(f"{key} must be a non-empty string")
     return value
+
+
+def _reject_unknown_keys(obj: dict[str, Any], allowed: set[str], path: str) -> None:
+    unknown = sorted(set(obj) - allowed)
+    if unknown:
+        raise SpecError(f"unknown {path} keys: {unknown}")
 
 
 def _optional_str(obj: dict[str, Any], key: str) -> str | None:
