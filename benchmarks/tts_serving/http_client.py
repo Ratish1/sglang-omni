@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import binascii
 import json
 import time
@@ -13,6 +14,7 @@ from typing import Any
 import aiohttp
 
 from benchmarks.tts_serving.metrics import (
+    SSE_DONE_MARKER,
     ScenarioResult,
     classify_http_status,
     duration_from_audio_bytes,
@@ -44,7 +46,15 @@ async def run_http_scenario(
     url = f"{spec.base_url}{scenario.path}"
     start = time.perf_counter()
     try:
-        if scenario.method == "GET":
+        if scenario.method == "VOICE_LIFECYCLE":
+            await _run_voice_lifecycle(
+                session,
+                spec,
+                scenario,
+                result,
+                allow_missing=spec.params.allow_missing_optional_endpoints,
+            )
+        elif scenario.method == "GET":
             async with session.get(url) as response:
                 await _handle_probe_response(
                     response,
@@ -213,28 +223,52 @@ async def _handle_sse_response(
             return
         _classify_http_failure(response.status, body, result, scenario)
         return
+    content_type = str(response.headers.get("Content-Type", "")).lower()
+    if "text/event-stream" not in content_type:
+        body = await response.read()
+        result.response_bytes = len(body)
+        _mark_protocol_error(
+            result,
+            status="invalid_sse_response",
+            error=(
+                "SSE speech endpoint returned 2xx without text/event-stream "
+                f"content-type: {response.headers.get('Content-Type')!r}"
+            ),
+        )
+        return
 
     buffer = bytearray()
     chunk_times: list[float] = []
+    saw_done = False
     async for chunk in response.content.iter_any():
         buffer.extend(chunk)
         while b"\n" in buffer:
             raw_line, _, rest = buffer.partition(b"\n")
             buffer = bytearray(rest)
+            saw_done = (
+                _merge_sse_line(
+                    raw_line.decode("utf-8", errors="replace").strip(),
+                    result,
+                    start,
+                    chunk_times,
+                    scenario,
+                )
+                or saw_done
+            )
+            if result.status == "failed":
+                break
+        if result.status == "failed":
+            break
+    if result.status != "failed" and buffer.strip():
+        saw_done = (
             _merge_sse_line(
-                raw_line.decode("utf-8", errors="replace").strip(),
+                bytes(buffer).decode("utf-8", errors="replace").strip(),
                 result,
                 start,
                 chunk_times,
                 scenario,
             )
-    if buffer.strip():
-        _merge_sse_line(
-            bytes(buffer).decode("utf-8", errors="replace").strip(),
-            result,
-            start,
-            chunk_times,
-            scenario,
+            or saw_done
         )
     if result.status == "failed":
         result.success = False
@@ -250,6 +284,14 @@ async def _handle_sse_response(
         )
         result.response_bytes = result.audio_bytes
         return
+    if not saw_done:
+        _mark_protocol_error(
+            result,
+            status="incomplete_sse_stream",
+            error="SSE speech endpoint completed without terminal data: [DONE]",
+        )
+        result.response_bytes = result.audio_bytes
+        return
     _mark_success(result)
     result.response_bytes = result.audio_bytes
 
@@ -260,7 +302,11 @@ def _merge_sse_line(
     start: float,
     chunk_times: list[float],
     scenario: Scenario,
-) -> None:
+) -> bool:
+    if not line or line.startswith(":"):
+        return False
+    if line == SSE_DONE_MARKER:
+        return True
     try:
         audio_bytes, event = parse_sse_audio_event(line)
     except (ValueError, binascii.Error) as exc:
@@ -269,11 +315,16 @@ def _merge_sse_line(
         result.error_type = exc.__class__.__name__
         result.error_class = "protocol_error"
         result.error = f"malformed SSE audio event: {exc}"
-        return
+        return False
     if event is None:
-        return
+        return False
     if audio_bytes is None:
-        return
+        _mark_protocol_error(
+            result,
+            status="invalid_sse_response",
+            error=f"SSE event did not include base64 audio payload: {event}",
+        )
+        return False
     now = time.perf_counter()
     if result.ttfa_s is None:
         result.ttfa_s = now - start
@@ -299,6 +350,7 @@ def _merge_sse_line(
             else 24000
         ),
     )
+    return False
 
 
 def _mark_unexpected_success(result: ScenarioResult, scenario: Scenario) -> None:
@@ -353,6 +405,20 @@ def _classify_http_failure(
         result.status = "failed"
         result.error_class = "server_error"
         result.capability = "fail"
+        return
+    if scenario.capability_key == "voices.delete" and not scenario.expect_success:
+        if _is_valid_missing_voice_delete_response(status, body):
+            result.status = "expected_error"
+            result.error_class = "expected_client_error"
+            result.capability = "pass"
+            return
+        result.status = "invalid_voice_response"
+        result.error_class = "protocol_error"
+        result.capability = "fail"
+        result.error = (
+            "missing voice delete must return HTTP 404 JSON with "
+            f"success=false and error details; received status={status}, body={body}"
+        )
         return
     if (
         400 <= status < 500
@@ -482,6 +548,69 @@ def _request_size(scenario: Scenario) -> int:
         return 0
 
 
+async def _run_voice_lifecycle(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    allow_missing: bool,
+) -> None:
+    upload_url = f"{spec.base_url}{scenario.path}"
+    body = _request_body(scenario)
+    result.request_bytes = _request_size(scenario)
+    async with session.post(upload_url, data=body) as upload_response:
+        result.http_status = upload_response.status
+        result.http_status_class = classify_http_status(upload_response.status)
+        result.response_headers = dict(upload_response.headers)
+        upload_body = await upload_response.read()
+        result.response_bytes += len(upload_body)
+        if upload_response.status == 404:
+            _mark_missing_contract(
+                result,
+                scenario,
+                body=upload_body.decode("utf-8", errors="replace"),
+                allow_missing=allow_missing,
+            )
+            return
+        if not 200 <= upload_response.status < 300:
+            _classify_http_failure(
+                upload_response.status,
+                upload_body.decode("utf-8", errors="replace"),
+                result,
+                scenario,
+            )
+            return
+        _handle_voice_success(upload_body, result, scenario)
+        if not result.success:
+            return
+
+    voice_name = str(scenario.planned_metadata.get("voice_name", ""))
+    delete_url = f"{spec.base_url}/v1/audio/voices/{voice_name}"
+    async with session.delete(delete_url) as delete_response:
+        result.http_status = delete_response.status
+        result.http_status_class = classify_http_status(delete_response.status)
+        result.response_headers = dict(delete_response.headers)
+        delete_body = await delete_response.read()
+        result.response_bytes += len(delete_body)
+        if not 200 <= delete_response.status < 300:
+            _classify_http_failure(
+                delete_response.status,
+                delete_body.decode("utf-8", errors="replace"),
+                result,
+                scenario,
+            )
+            return
+        if not _is_valid_voice_delete_success(delete_body):
+            _mark_protocol_error(
+                result,
+                status="invalid_voice_response",
+                error="voice lifecycle delete response must be success JSON",
+            )
+            return
+    _mark_success(result, capability="pass")
+
+
 def _is_optional_endpoint(scenario: Scenario) -> bool:
     return scenario.endpoint in OPTIONAL_ENDPOINTS
 
@@ -499,12 +628,12 @@ def _handle_batch_success(
         )
         result.error_type = exc.__class__.__name__
         return
-    required_keys = {"results", "total", "succeeded", "failed"}
+    required_keys = {"id", "results", "total", "succeeded", "failed"}
     if not isinstance(payload, dict) or not required_keys <= set(payload):
         _mark_protocol_error(
             result,
             status="invalid_batch_response",
-            error="batch endpoint returned JSON without results/total/succeeded/failed",
+            error="batch endpoint returned JSON without id/results/total/succeeded/failed",
         )
         return
     batch_size = int(scenario.planned_metadata.get("batch_size") or 0)
@@ -512,6 +641,13 @@ def _handle_batch_success(
     total = payload.get("total")
     succeeded = payload.get("succeeded")
     failed = payload.get("failed")
+    if not isinstance(payload.get("id"), str) or not payload["id"]:
+        _mark_protocol_error(
+            result,
+            status="invalid_batch_response",
+            error="batch endpoint id must be a non-empty string",
+        )
+        return
     if (
         not isinstance(results, list)
         or not isinstance(total, int)
@@ -615,11 +751,8 @@ def _handle_voice_success(
             ),
         )
         return
-    if scenario.capability_key == "voices.upload":
-        if isinstance(payload, dict) and any(
-            isinstance(payload.get(key), str) and payload[key]
-            for key in ("id", "voice_id", "name")
-        ):
+    if scenario.capability_key in {"voices.upload", "voices.lifecycle"}:
+        if _voice_upload_response_identifier(payload):
             _mark_success(result, capability="pass")
             return
         _mark_protocol_error(
@@ -638,12 +771,19 @@ def _is_valid_batch_item(item: Any, *, expected_index: int) -> bool:
         return False
     status = item.get("status")
     if status in SUCCESS_BATCH_STATUSES:
-        return (
-            isinstance(item.get("audio_data"), str)
-            and bool(item["audio_data"])
-            and isinstance(item.get("media_type"), str)
-            and bool(item["media_type"])
-        )
+        audio_data = item.get("audio_data")
+        media_type = item.get("media_type")
+        if not isinstance(audio_data, str) or not audio_data:
+            return False
+        if not isinstance(media_type, str) or not _is_valid_batch_media_type(
+            media_type
+        ):
+            return False
+        try:
+            decoded = base64.b64decode(audio_data, validate=True)
+        except binascii.Error:
+            return False
+        return bool(decoded)
     if status in FAILED_BATCH_STATUSES:
         error = item.get("error")
         return isinstance(error, (dict, str)) and bool(error)
@@ -678,14 +818,91 @@ def _is_valid_uploaded_voice_metadata(item: Any) -> bool:
         all(key in item for key in required)
         and isinstance(item["name"], str)
         and bool(item["name"])
-        and isinstance(item["consent"], bool)
-        and isinstance(item["created_at"], str)
-        and bool(item["created_at"])
-        and isinstance(item["file_size"], int)
-        and item["file_size"] >= 0
+        and isinstance(item["consent"], (bool, str))
+        and bool(str(item["consent"]))
+        and isinstance(item["created_at"], (str, int, float))
+        and bool(str(item["created_at"]))
+        and _is_nonnegative_file_size(item["file_size"])
         and isinstance(item["mime_type"], str)
         and bool(item["mime_type"])
     )
+
+
+def _voice_upload_response_identifier(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("success") is False:
+        return None
+    for key in ("id", "voice_id", "name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    voice = payload.get("voice")
+    if isinstance(voice, str) and voice:
+        return voice
+    if isinstance(voice, dict):
+        for key in ("id", "voice_id", "name"):
+            value = voice.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _is_valid_voice_delete_success(body: bytes) -> bool:
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("success") is False:
+        return False
+    if payload.get("deleted") is True:
+        return True
+    return payload.get("success") is True or any(
+        isinstance(payload.get(key), str) and payload[key]
+        for key in ("id", "voice_id", "name")
+    )
+
+
+def _is_valid_missing_voice_delete_response(status: int, body: str) -> bool:
+    if status != 404:
+        return False
+    try:
+        payload = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict) or payload.get("success") is not False:
+        return False
+    error = payload.get("error")
+    return isinstance(error, (dict, str)) and bool(error)
+
+
+def _is_nonnegative_file_size(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return value >= 0
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value) >= 0
+    return False
+
+
+def _is_valid_batch_media_type(media_type: str) -> bool:
+    normalized = media_type.lower().split(";", 1)[0]
+    return normalized in {
+        "audio/wav",
+        "audio/x-wav",
+        "audio/pcm",
+        "audio/raw",
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/flac",
+        "audio/aac",
+        "audio/ogg",
+        "audio/opus",
+        "application/octet-stream",
+    }
 
 
 def _mark_protocol_error(result: ScenarioResult, *, status: str, error: str) -> None:

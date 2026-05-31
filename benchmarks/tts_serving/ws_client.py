@@ -124,52 +124,60 @@ async def _expect_next_event(
     expected_event: str,
     expect_success: bool,
 ) -> bool:
-    msg = await ws.receive()
-    if msg.type == aiohttp.WSMsgType.BINARY:
-        _record_ws_event(result, "binary")
-        if expected_event not in {"audio", "binary"}:
-            _mark_ws_protocol_error(
-                result,
-                f"received binary audio while expecting {expected_event}",
-            )
-            return False
-        if result.ws_active_sentence_index is None:
-            _mark_ws_protocol_error(result, "received binary audio before audio.start")
-            return False
-        result.audio_bytes += len(msg.data)
-        result.ws_active_sentence_bytes += len(msg.data)
-        result.response_bytes += len(msg.data)
-        result.status = "ok"
-        result.success = True
-        result.capability = "pass"
-        return True
-    if msg.type == aiohttp.WSMsgType.TEXT:
-        event_type = _merge_text_event(msg.data, result, expect_success=expect_success)
-        if result.status in {"failed", "expected_error"}:
-            return event_type == expected_event or expected_event == "error"
-        if _event_matches(event_type, expected_event):
-            return True
-        _mark_ws_protocol_error(
-            result,
-            f"received WebSocket event {event_type!r} while expecting {expected_event!r}",
-        )
-        return False
-    if msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE}:
-        result.ws_close_reason = "server_closed"
-        if expected_event == "close":
+    while True:
+        msg = await ws.receive()
+        if msg.type == aiohttp.WSMsgType.BINARY:
+            _record_ws_event(result, "binary")
+            if expected_event not in {"audio", "binary"}:
+                _mark_ws_protocol_error(
+                    result,
+                    f"received binary audio while expecting {expected_event}",
+                )
+                return False
+            if result.ws_active_sentence_index is None:
+                _mark_ws_protocol_error(
+                    result, "received binary audio before audio.start"
+                )
+                return False
+            result.audio_bytes += len(msg.data)
+            result.ws_active_sentence_bytes += len(msg.data)
+            result.response_bytes += len(msg.data)
             result.status = "ok"
             result.success = True
             result.capability = "pass"
             return True
-        _mark_ws_protocol_error(result, "WebSocket closed before expected event")
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            event_type = _merge_text_event(
+                msg.data, result, expect_success=expect_success
+            )
+            if result.status in {"failed", "expected_error"}:
+                return event_type == expected_event or expected_event == "error"
+            if _event_matches(event_type, expected_event):
+                return True
+            if event_type in WS_CONTROL_EVENT_TYPES:
+                continue
+            _mark_ws_protocol_error(
+                result,
+                f"received WebSocket event {event_type!r} while expecting {expected_event!r}",
+            )
+            return False
+        if msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE}:
+            result.ws_close_reason = "server_closed"
+            if expected_event == "close":
+                result.status = "ok"
+                result.success = True
+                result.capability = "pass"
+                return True
+            _mark_ws_protocol_error(result, "WebSocket closed before expected event")
+            return False
+        if msg.type == aiohttp.WSMsgType.ERROR:
+            result.status = "failed"
+            result.capability = "fail"
+            result.error_class = "transport_error"
+            result.error = str(ws.exception())
+            return False
+        _mark_ws_protocol_error(result, f"unexpected WebSocket frame type: {msg.type}")
         return False
-    if msg.type == aiohttp.WSMsgType.ERROR:
-        result.status = "failed"
-        result.capability = "fail"
-        result.error_class = "transport_error"
-        result.error = str(ws.exception())
-        return False
-    return False
 
 
 def _merge_text_event(
