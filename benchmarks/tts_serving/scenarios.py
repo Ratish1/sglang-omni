@@ -507,12 +507,8 @@ def _speech_task_type(
         }
     )
     if task_type == "Base":
-        payload["references"] = [
-            {
-                "audio_path": _reference_audio(spec),
-                "text": _reference_text(spec),
-            }
-        ]
+        payload["ref_audio"] = _reference_audio(spec)
+        payload["ref_text"] = _reference_text(spec)
     if task_type == "CustomVoice":
         payload["voice"] = "Vivian"
     if task_type == "VoiceDesign":

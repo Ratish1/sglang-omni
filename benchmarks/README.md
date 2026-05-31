@@ -105,8 +105,8 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #     {"id": "voice-cache-evict", "mode": "closed_loop", "request_count": 96,
 #      "max_concurrency": 16, "enabled_endpoints": ["voices"],
 #      "voice_cache_eviction_count": 64, "voice_speaker_cap_count": 0},
-#     {"id": "voice-speaker-cap", "mode": "closed_loop", "request_count": 1040,
-#      "max_concurrency": 32, "enabled_endpoints": ["voices"],
+#     {"id": "voice-speaker-cap", "mode": "closed_loop", "request_count": 2,
+#      "max_concurrency": 1, "enabled_endpoints": ["voices"],
 #      "voice_cache_eviction_count": 0, "voice_speaker_cap_count": 1001},
 #     {"id": "mixed-burst-256", "mode": "burst", "request_count": 512,
 #      "max_concurrency": 256}
@@ -115,6 +115,8 @@ python -m benchmarks.eval.benchmark_tts_serving \
 # Voice speaker-cap stages run as a state-aware sequence: the harness lists
 # existing uploaded voices first, uploads only the names needed to reach
 # SPEAKER_MAX_UPLOADED, then requires the first overflow upload to fail.
+# voice_speaker_cap_count is the sequence's internal upload-attempt budget,
+# not the outer load-stage request count.
 # Missing just-under-10MB upload coverage for accepted non-WAV formats is
 # reported as a benchmark coverage gap until valid fixtures are added.
 # Cross-model voice cache invalidation is outside the single base_url/model_name

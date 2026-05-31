@@ -841,6 +841,7 @@ async def _run_voice_speaker_cap_sequence(
         ):
             return
         overflow_name = f"{voice_name_prefix}_overflow"
+        created_voice_names.append(overflow_name)
         if not await _expect_speaker_cap_rejection(
             session,
             upload_url,
