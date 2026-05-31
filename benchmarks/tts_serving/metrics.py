@@ -50,6 +50,9 @@ class ScenarioResult:
     capability: str | None = None
     response_headers: dict[str, str] = field(default_factory=dict)
     ws_event_counts: dict[str, int] = field(default_factory=dict)
+    ws_active_sentence_index: int | None = None
+    ws_active_sentence_bytes: int = 0
+    ws_completed_sentences: int = 0
     ws_close_reason: str | None = None
     was_cancelled: bool = False
 

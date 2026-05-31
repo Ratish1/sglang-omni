@@ -83,6 +83,7 @@ def build_results_report(
             "allow_missing_optional_endpoints": (
                 spec.params.allow_missing_optional_endpoints
             ),
+            "voice_cache_pressure_count": spec.params.voice_cache_pressure_count,
             "load_stages": [stage.to_json() for stage in spec.params.load_stages],
         },
         "capabilities": capabilities,
@@ -100,6 +101,7 @@ def build_results_report(
                     if result.http_status is not None
                 )
             ),
+            "admission_status_counts": _admission_status_counts(results),
             "error_class_counts": dict(
                 Counter(result.error_class for result in results if result.error_class)
             ),
@@ -259,6 +261,11 @@ def _result_group_summary(
     queue_waits = [
         result.queue_wait_s for result in results if result.queue_wait_s is not None
     ]
+    planned_starts = [
+        result.planned_start_s
+        for result in results
+        if result.planned_start_s is not None
+    ]
     first_start = min(
         (result.actual_start_s for result in results if result.actual_start_s),
         default=None,
@@ -272,6 +279,9 @@ def _result_group_summary(
         if first_start is not None and last_completion is not None
         else None
     )
+    planned_window_s = (
+        max(planned_starts) - min(planned_starts) if len(planned_starts) > 1 else None
+    )
     succeeded = sum(1 for result in results if _result_passed(spec, result))
     failed = len(results) - succeeded
     return {
@@ -279,6 +289,12 @@ def _result_group_summary(
         "succeeded": succeeded,
         "failed": failed,
         "wall_time_s": wall_time_s,
+        "planned_window_s": planned_window_s,
+        "offered_rps": (
+            len(results) / planned_window_s
+            if planned_window_s and planned_window_s > 0
+            else None
+        ),
         "achieved_rps": (
             len(results) / wall_time_s if wall_time_s and wall_time_s > 0 else None
         ),
@@ -294,6 +310,7 @@ def _result_group_summary(
                 if result.http_status is not None
             )
         ),
+        "admission_status_counts": _admission_status_counts(results),
         "error_class_counts": dict(
             Counter(result.error_class for result in results if result.error_class)
         ),
@@ -303,6 +320,18 @@ def _result_group_summary(
 
 def _roll_up_endpoint_capability(statuses: list[str]) -> str:
     return _roll_up_capability(statuses)
+
+
+def _admission_status_counts(results: list[ScenarioResult]) -> dict[str, int]:
+    counts = Counter()
+    for result in results:
+        if result.http_status in {429, 503}:
+            counts[str(result.http_status)] += 1
+        if result.status == "transport_error":
+            counts["transport_error"] += 1
+        if result.error_type and "Timeout" in result.error_type:
+            counts["timeout"] += 1
+    return dict(counts)
 
 
 def _roll_up_capability(statuses: list[str]) -> str:

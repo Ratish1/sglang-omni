@@ -28,6 +28,30 @@ MULTILINGUAL_TEXTS = (
 )
 RESPONSE_FORMATS = ("wav", "pcm", "mp3", "flac", "aac", "opus")
 TASK_TYPES = ("Base", "CustomVoice", "VoiceDesign")
+BATCH_SIZES = (1, 2, 8, 32)
+VOICE_UPLOAD_FORMATS = (
+    ("wav", "audio/wav"),
+    ("mp3", "audio/mpeg"),
+    ("flac", "audio/flac"),
+    ("ogg", "audio/ogg"),
+    ("aac", "audio/aac"),
+    ("webm", "audio/webm"),
+    ("mp4", "audio/mp4"),
+)
+VOICE_SMALL_UPLOAD_BYTES = 4096
+VOICE_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+VOICE_NEAR_LIMIT_BYTES = VOICE_MAX_UPLOAD_BYTES - 1
+VOICE_OVERSIZED_BYTES = VOICE_MAX_UPLOAD_BYTES + 1
+DEFAULT_REFERENCE_AUDIO = (
+    "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/"
+    "en/prompt-wavs/common_voice_en_10119832.wav"
+)
+DEFAULT_REFERENCE_TEXT = (
+    "We asked over twenty different people, and they all said it was his."
+)
+VOICE_DESIGN_INSTRUCTIONS = (
+    "A warm, steady adult voice with precise articulation and no dramatic affect."
+)
 
 PROFILE_MIXES = {
     "ci": (
@@ -35,6 +59,7 @@ PROFILE_MIXES = {
         ("speech_language", 12),
         ("speech_length", 8),
         ("speech_reference", 10),
+        ("speech_sdk", 4),
         ("speech_sse", 10),
         ("speech_malformed", 8),
         ("batch", 4),
@@ -46,6 +71,7 @@ PROFILE_MIXES = {
         ("speech_language", 12),
         ("speech_length", 8),
         ("speech_reference", 10),
+        ("speech_sdk", 4),
         ("speech_sse", 12),
         ("speech_malformed", 10),
         ("batch", 6),
@@ -57,6 +83,7 @@ PROFILE_MIXES = {
         ("speech_language", 8),
         ("speech_length", 10),
         ("speech_reference", 10),
+        ("speech_sdk", 5),
         ("speech_sse", 12),
         ("speech_malformed", 14),
         ("batch", 10),
@@ -163,49 +190,44 @@ def _build_stage_scenarios(spec: BenchmarkSpec, stage: LoadStage) -> list[Scenar
 def _required_stage_scenarios(
     spec: BenchmarkSpec, stage: LoadStage, endpoint_set: set[str]
 ) -> list[Scenario]:
-    required = [
-        _speech_baseline(0, spec, stage, random.Random(f"{spec.seed}:{stage.id}:0")),
-    ]
-    for language_index in range(len(MULTILINGUAL_TEXTS)):
+    required: list[Scenario] = []
+    if "speech" in endpoint_set:
         required.append(
-            _speech_language(len(required), spec, stage, language_index=language_index)
+            _speech_baseline(0, spec, stage, random.Random(f"{spec.seed}:{stage.id}:0"))
         )
-    for response_format in RESPONSE_FORMATS:
-        required.append(
-            _speech_format(len(required), spec, stage, response_format=response_format)
-        )
-    for task_type in TASK_TYPES:
-        required.append(_speech_task_type(len(required), spec, stage, task_type))
-    for _ in LENGTH_EXTREME_TEXTS:
-        required.append(_speech_length(len(required), spec, stage))
-    for _ in REFERENCE_FAILURES:
-        required.append(_speech_reference(len(required), spec, stage))
-    for _ in range(_malformed_case_count()):
-        required.append(_speech_malformed(len(required), spec, stage))
+        for language_index in range(len(MULTILINGUAL_TEXTS)):
+            required.append(
+                _speech_language(
+                    len(required), spec, stage, language_index=language_index
+                )
+            )
+        for response_format in RESPONSE_FORMATS:
+            required.append(
+                _speech_format(
+                    len(required), spec, stage, response_format=response_format
+                )
+            )
+        for task_type in TASK_TYPES:
+            required.append(_speech_task_type(len(required), spec, stage, task_type))
+        required.append(_speech_openai_sdk(len(required), spec, stage))
+        for _ in LENGTH_EXTREME_TEXTS:
+            required.append(_speech_length(len(required), spec, stage))
+        for _ in REFERENCE_FAILURES:
+            required.append(_speech_reference(len(required), spec, stage))
+        for _ in range(_malformed_case_count()):
+            required.append(_speech_malformed(len(required), spec, stage))
     if "speech_sse" in endpoint_set:
         required.append(_speech_sse(len(required), spec, stage))
     if "batch" in endpoint_set:
         required.extend(
             [
-                _batch_request(len(required), spec, stage, batch_size=1),
-                _batch_request(len(required) + 1, spec, stage, batch_size=2),
-                _batch_request(len(required) + 2, spec, stage, batch_size=8),
-                _batch_request(len(required) + 3, spec, stage, batch_size=32),
+                _batch_request(len(required) + offset, spec, stage, batch_size=size)
+                for offset, size in enumerate(BATCH_SIZES)
             ]
         )
     if "voices" in endpoint_set:
         required.extend(
-            [
-                _voices_list(len(required), spec, stage),
-                _voice_upload(len(required) + 1, spec, stage, upload_size=1024),
-                _voice_upload(
-                    len(required) + 2,
-                    spec,
-                    stage,
-                    upload_size=(10 * 1024 * 1024) - 1,
-                ),
-                _voice_delete(len(required) + 3, spec, stage),
-            ]
+            _required_voice_scenarios(spec, stage, start_index=len(required))
         )
     if "websocket" in endpoint_set:
         required.extend(
@@ -236,17 +258,26 @@ def _weighted_scenario(
         return _speech_length(index, spec, stage)
     if scenario_type == "speech_reference":
         return _speech_reference(index, spec, stage)
+    if scenario_type == "speech_sdk":
+        return _speech_openai_sdk(index, spec, stage)
     if scenario_type == "speech_sse":
         return _speech_sse(index, spec, stage)
     if scenario_type == "speech_malformed":
         return _speech_malformed(index, spec, stage)
     if scenario_type == "batch":
-        return _batch_request(index, spec, stage, batch_size=rng.choice((1, 2, 8, 32)))
+        return _batch_request(index, spec, stage, batch_size=rng.choice(BATCH_SIZES))
     if scenario_type == "voices":
         return rng.choice(
             (
                 _voices_list(index, spec, stage),
-                _voice_upload(index, spec, stage, upload_size=4096),
+                _voice_upload(
+                    index,
+                    spec,
+                    stage,
+                    upload_size=VOICE_SMALL_UPLOAD_BYTES,
+                    upload_format="wav",
+                    content_type="audio/wav",
+                ),
                 _voice_delete(index, spec, stage),
             )
         )
@@ -282,6 +313,8 @@ def _choose_scenario_type(
 def _scenario_type_enabled(scenario_type: str, endpoint_set: set[str]) -> bool:
     if scenario_type == "speech_sse":
         return "speech_sse" in endpoint_set
+    if scenario_type == "speech_sdk":
+        return "speech" in endpoint_set
     if scenario_type == "batch":
         return "batch" in endpoint_set
     if scenario_type == "voices":
@@ -310,18 +343,14 @@ def _speech_baseline(
     index: int, spec: BenchmarkSpec, stage: LoadStage, rng: random.Random
 ) -> Scenario:
     response_format = rng.choice(RESPONSE_FORMATS)
-    task_type = rng.choice(TASK_TYPES)
     payload = _base_payload(spec, rng.choice(BASE_TEXTS))
     payload.update(
         {
             "response_format": response_format,
             "speed": rng.choice((0.25, 1.0, 4.0)),
-            "task_type": task_type,
             "seed": spec.seed + index,
         }
     )
-    if task_type == "VoiceDesign":
-        payload["instructions"] = "A clear and steady adult voice."
     return Scenario(
         id=_scenario_id(stage, "speech_baseline", index),
         endpoint="speech",
@@ -330,7 +359,7 @@ def _speech_baseline(
         capability_key="speech.create",
         payload=payload,
         description="well-formed single-shot speech",
-        planned_metadata={"response_format": response_format, "task_type": task_type},
+        planned_metadata={"response_format": response_format},
     )
 
 
@@ -398,15 +427,17 @@ def _speech_task_type(
             "seed": spec.seed + index,
         }
     )
-    if task_type == "VoiceDesign":
-        payload["instructions"] = "A clear and steady adult voice."
-    if task_type == "CustomVoice" and spec.params.seedtts_ref_audio:
+    if task_type == "Base":
         payload["references"] = [
             {
-                "audio_path": spec.params.seedtts_ref_audio,
-                "text": spec.params.seedtts_ref_text or "",
+                "audio_path": _reference_audio(spec),
+                "text": _reference_text(spec),
             }
         ]
+    if task_type == "CustomVoice":
+        payload["voice"] = "Vivian"
+    if task_type == "VoiceDesign":
+        payload["instructions"] = VOICE_DESIGN_INSTRUCTIONS
     return Scenario(
         id=_scenario_id(stage, f"speech_task_{task_type.lower()}", index),
         endpoint="speech",
@@ -416,6 +447,28 @@ def _speech_task_type(
         payload=payload,
         description=f"well-formed speech task_type={task_type}",
         planned_metadata={"task_type": task_type},
+    )
+
+
+def _speech_openai_sdk(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
+    payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload.update(
+        {
+            "response_format": "wav",
+            "speed": 1.0,
+            "seed": spec.seed + index,
+        }
+    )
+    return Scenario(
+        id=_scenario_id(stage, "speech_openai_sdk", index),
+        endpoint="speech",
+        category="speech_openai_sdk",
+        stage_id=stage.id,
+        capability_key="speech.openai_sdk",
+        method="SDK",
+        payload=payload,
+        description="official OpenAI Python SDK speech create + stream_to_file path",
+        planned_metadata={"response_format": "wav"},
     )
 
 
@@ -440,10 +493,10 @@ def _speech_length(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenari
 
 def _speech_reference(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
     payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
-    ref_audio = spec.params.seedtts_ref_audio
-    ref_text = spec.params.seedtts_ref_text
-    if ref_audio and index % 3 == 0:
-        payload["references"] = [{"audio_path": ref_audio, "text": ref_text or ""}]
+    if index % 3 == 0:
+        payload["references"] = [
+            {"audio_path": _reference_audio(spec), "text": _reference_text(spec)}
+        ]
         expect_success = True
         expected_status_class = "success"
         reference_case = "valid_reference"
@@ -592,16 +645,116 @@ def _voices_list(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
     )
 
 
+def _required_voice_scenarios(
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+    *,
+    start_index: int,
+) -> list[Scenario]:
+    scenarios: list[Scenario] = [
+        _voices_list(start_index, spec, stage),
+    ]
+    next_index = start_index + 1
+    for upload_format, content_type in VOICE_UPLOAD_FORMATS:
+        scenarios.append(
+            _voice_upload(
+                next_index,
+                spec,
+                stage,
+                upload_size=VOICE_SMALL_UPLOAD_BYTES,
+                upload_format=upload_format,
+                content_type=content_type,
+            )
+        )
+        next_index += 1
+    scenarios.extend(
+        [
+            _voice_upload(
+                next_index,
+                spec,
+                stage,
+                upload_size=VOICE_NEAR_LIMIT_BYTES,
+                upload_format="wav",
+                content_type="audio/wav",
+                case="near_limit",
+            ),
+            _voice_upload(
+                next_index + 1,
+                spec,
+                stage,
+                upload_size=VOICE_OVERSIZED_BYTES,
+                upload_format="wav",
+                content_type="audio/wav",
+                case="oversized",
+                expect_success=False,
+                expected_status_class="client_error",
+            ),
+            _voice_upload(
+                next_index + 2,
+                spec,
+                stage,
+                upload_size=VOICE_SMALL_UPLOAD_BYTES,
+                upload_format="wav",
+                content_type="application/octet-stream",
+                case="corrupt_audio",
+                expect_success=False,
+                expected_status_class="client_error",
+            ),
+            _voice_upload(
+                next_index + 3,
+                spec,
+                stage,
+                upload_size=VOICE_SMALL_UPLOAD_BYTES,
+                upload_format="wav",
+                content_type="audio/wav",
+                case="same_name_a",
+                voice_name=f"bench_voice_overwrite_{stage.id}",
+            ),
+            _voice_upload(
+                next_index + 4,
+                spec,
+                stage,
+                upload_size=VOICE_SMALL_UPLOAD_BYTES,
+                upload_format="wav",
+                content_type="audio/wav",
+                case="same_name_b",
+                voice_name=f"bench_voice_overwrite_{stage.id}",
+            ),
+            _voice_delete(next_index + 5, spec, stage),
+        ]
+    )
+    next_index += 6
+    for pressure_index in range(spec.params.voice_cache_pressure_count):
+        scenarios.append(
+            _voice_upload(
+                next_index + pressure_index,
+                spec,
+                stage,
+                upload_size=VOICE_SMALL_UPLOAD_BYTES,
+                upload_format="wav",
+                content_type="audio/wav",
+                case="cache_pressure",
+            )
+        )
+    return scenarios
+
+
 def _voice_upload(
     index: int,
     spec: BenchmarkSpec,
     stage: LoadStage,
     *,
     upload_size: int,
+    upload_format: str,
+    content_type: str,
+    case: str = "format",
+    voice_name: str | None = None,
+    expect_success: bool = True,
+    expected_status_class: str = "success",
 ) -> Scenario:
-    name = f"bench_voice_{stage.id}_{index:05d}"
+    name = voice_name or f"bench_voice_{stage.id}_{index:05d}_{upload_format}_{case}"
     return Scenario(
-        id=_scenario_id(stage, "voices_upload", index),
+        id=_scenario_id(stage, f"voices_upload_{upload_format}_{case}", index),
         endpoint="voices",
         category="voices",
         stage_id=stage.id,
@@ -615,12 +768,18 @@ def _voice_upload(
             "speaker_description": "Synthetic benchmark voice.",
         },
         upload_field="audio_sample",
-        upload_filename=f"{name}.wav",
-        upload_content_type="audio/wav",
+        upload_filename=f"{name}.{upload_format}",
+        upload_content_type=content_type,
         upload_size_bytes=upload_size,
-        expected_status_class="success",
-        description="voice upload request with bounded synthetic audio bytes",
-        planned_metadata={"upload_size_bytes": upload_size, "voice_name": name},
+        expect_success=expect_success,
+        expected_status_class=expected_status_class,
+        description=f"voice upload {case} request in {upload_format} format",
+        planned_metadata={
+            "upload_case": case,
+            "upload_format": upload_format,
+            "upload_size_bytes": upload_size,
+            "voice_name": name,
+        },
     )
 
 
@@ -658,7 +817,7 @@ def _websocket_normal(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
                     "model": spec.model_name,
                     "voice": "default",
                     "response_format": "pcm",
-                    "stream_audio": True,
+                    "stream_audio": False,
                     "split_granularity": "sentence",
                 },
             },
@@ -674,6 +833,14 @@ def _websocket_normal(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
         ],
         description="stateful WebSocket speech stream",
     )
+
+
+def _reference_audio(spec: BenchmarkSpec) -> str:
+    return spec.params.seedtts_ref_audio or DEFAULT_REFERENCE_AUDIO
+
+
+def _reference_text(spec: BenchmarkSpec) -> str:
+    return spec.params.seedtts_ref_text or DEFAULT_REFERENCE_TEXT
 
 
 def _websocket_input_done_without_config(
@@ -737,7 +904,7 @@ def _websocket_disconnect(
                     "model": spec.model_name,
                     "voice": "default",
                     "response_format": "pcm",
-                    "stream_audio": True,
+                    "stream_audio": False,
                     "split_granularity": "sentence",
                 },
             },

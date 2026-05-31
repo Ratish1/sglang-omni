@@ -123,6 +123,7 @@ class BenchmarkParams:
     allow_missing_optional_endpoints: bool = False
     seedtts_ref_audio: str | None = None
     seedtts_ref_text: str | None = None
+    voice_cache_pressure_count: int = 0
     provider_label: str | None = None
     implementation_label: str | None = None
 
@@ -179,6 +180,11 @@ class BenchmarkParams:
             ),
             seedtts_ref_audio=_optional_str(obj, "seedtts_ref_audio"),
             seedtts_ref_text=_optional_str(obj, "seedtts_ref_text"),
+            voice_cache_pressure_count=_nonnegative_int(
+                obj,
+                "voice_cache_pressure_count",
+                cls.voice_cache_pressure_count,
+            ),
             provider_label=_optional_str(obj, "provider_label"),
             implementation_label=_optional_str(obj, "implementation_label"),
         )
@@ -256,6 +262,13 @@ def _positive_int(obj: dict[str, Any], key: str, default: int) -> int:
     value = obj.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise SpecError(f"params.{key} must be a positive integer")
+    return value
+
+
+def _nonnegative_int(obj: dict[str, Any], key: str, default: int) -> int:
+    value = obj.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SpecError(f"params.{key} must be a non-negative integer")
     return value
 
 
