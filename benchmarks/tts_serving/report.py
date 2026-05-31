@@ -48,7 +48,8 @@ def build_results_report(
         for result in results
     )
     voice_upload_coverage = _voice_upload_coverage(scenarios or [])
-    coverage_contract_valid = True
+    coverage_failures = _coverage_failures(scenarios or [], voice_upload_coverage)
+    coverage_contract_valid = not coverage_failures
     passed = (
         harness_status == "ok"
         and load_generation_valid
@@ -163,7 +164,7 @@ def build_results_report(
             for result in results
             if result.status == "unsupported_contract"
         ],
-        "coverage_failures": _coverage_failures(scenarios or [], voice_upload_coverage),
+        "coverage_failures": coverage_failures,
     }
 
 
@@ -356,6 +357,7 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
     return {
         "accepted_format_cases": sorted(successful_formats),
         "configured_accepted_formats": configured_formats,
+        "regular_upload_format_contract_present": bool(successful_formats),
         "near_limit_formats": sorted(near_limit_formats),
         "near_limit_missing_formats": near_limit_missing_formats,
         "near_limit_contract_complete": not near_limit_missing_formats,
@@ -365,8 +367,8 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         "near_limit_pr1_gap": (
             (
                 "Valid just-under-10MB fixtures are currently generated only for WAV; "
-                "missing non-WAV near-limit formats are reported as a benchmark "
-                "coverage gap instead of using invalid padded containers."
+                "missing non-WAV near-limit formats mark the benchmark coverage "
+                "contract invalid instead of using invalid padded containers."
             )
             if near_limit_missing_formats
             else None
@@ -387,7 +389,11 @@ def _coverage_failures(
     scenarios: list[Scenario], voice_upload_coverage: dict[str, Any]
 ) -> list[dict[str, Any]]:
     voices_enabled = any(scenario.endpoint == "voices" for scenario in scenarios)
-    if not voices_enabled or voice_upload_coverage["near_limit_contract_complete"]:
+    if (
+        not voices_enabled
+        or not voice_upload_coverage["regular_upload_format_contract_present"]
+        or voice_upload_coverage["near_limit_contract_complete"]
+    ):
         return []
     return [
         {
