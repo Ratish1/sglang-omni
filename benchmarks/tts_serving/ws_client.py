@@ -24,6 +24,7 @@ WS_CONTROL_EVENT_TYPES = {
     "response.created",
     "input.ack",
 }
+UNSUPPORTED_WS_STATUSES = {404, 405, 501}
 
 
 async def run_ws_scenario(
@@ -54,7 +55,7 @@ async def run_ws_scenario(
             await _probe_speech_after_disconnect(session, spec, result)
     except aiohttp.WSServerHandshakeError as exc:
         result.http_status = exc.status
-        if exc.status == 404:
+        if exc.status in UNSUPPORTED_WS_STATUSES:
             _mark_unsupported_ws_contract(
                 result,
                 scenario,

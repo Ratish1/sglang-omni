@@ -43,8 +43,11 @@ def build_results_report(
     generator_lags = [
         r.generator_lag_s for r in results if r.generator_lag_s is not None
     ]
-    passed = harness_status == "ok" and _is_benchmark_passed(
-        spec, results, capabilities
+    load_generation_valid = not any(result.load_generator_lagged for result in results)
+    passed = (
+        harness_status == "ok"
+        and load_generation_valid
+        and _is_benchmark_passed(spec, results, capabilities)
     )
     return {
         "schema_version": 2,
@@ -59,6 +62,7 @@ def build_results_report(
             "capability_probe_total": capability_total,
             "succeeded": succeeded,
             "failed": failed,
+            "load_generation_valid": load_generation_valid,
         },
         "config": {
             "test_type": spec.test_type,
@@ -110,6 +114,11 @@ def build_results_report(
             ),
             "load_generator_lagged": any(
                 result.load_generator_lagged for result in results
+            ),
+            "load_generation_error": (
+                "scheduled arrivals lagged beyond benchmark threshold"
+                if not load_generation_valid
+                else None
             ),
             "rtf": _summary(rtfs),
             "rtf_sampled_formats": ["wav", "pcm"],
@@ -324,18 +333,28 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         if scenario.capability_key == "voices.upload"
         and scenario.planned_metadata.get("upload_case") == "speaker_cap"
     )
+    configured_formats = [
+        upload_format for upload_format, _ in VOICE_UPLOAD_SUCCESS_FORMATS
+    ]
+    near_limit_missing_formats = sorted(
+        set(configured_formats) - set(near_limit_formats)
+    )
     return {
         "accepted_format_cases": sorted(successful_formats),
-        "configured_accepted_formats": [
-            upload_format for upload_format, _ in VOICE_UPLOAD_SUCCESS_FORMATS
-        ],
+        "configured_accepted_formats": configured_formats,
         "near_limit_formats": sorted(near_limit_formats),
+        "near_limit_missing_formats": near_limit_missing_formats,
+        "near_limit_contract_complete": not near_limit_missing_formats,
         "cache_eviction_formats": sorted(cache_eviction_formats),
         "speaker_cap_cases": speaker_cap_cases,
-        "near_limit_note": (
-            "Near-limit upload pressure uses WAV because the benchmark generates "
-            "valid large audio bytes locally; compact embedded fixtures cover "
-            "non-WAV accepted formats without inflating the repository."
+        "near_limit_pr1_gap": (
+            (
+                "Valid just-under-10MB fixtures are currently generated only for WAV; "
+                "non-WAV near-limit formats are reported as an explicit coverage gap "
+                "instead of using invalid padded containers."
+            )
+            if near_limit_missing_formats
+            else None
         ),
     }
 

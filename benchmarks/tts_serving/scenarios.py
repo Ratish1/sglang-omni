@@ -870,32 +870,14 @@ def _required_voice_scenarios(
                 expect_success=False,
                 expected_status_class="client_error",
             ),
-            _voice_upload(
-                next_index + 3,
-                spec,
-                stage,
-                upload_size=VOICE_SMALL_UPLOAD_BYTES,
-                upload_format="wav",
-                content_type="audio/wav",
-                case="same_name_a",
-                voice_name=f"bench_voice_overwrite_{stage.id}",
-            ),
-            _voice_upload(
-                next_index + 4,
-                spec,
-                stage,
-                upload_size=VOICE_SMALL_UPLOAD_BYTES,
-                upload_format="wav",
-                content_type="audio/wav",
-                case="same_name_b",
-                voice_name=f"bench_voice_overwrite_{stage.id}",
-            ),
-            _voice_delete(next_index + 5, spec, stage),
-            _voice_lifecycle(next_index + 6, spec, stage),
+            _voice_overwrite(next_index + 3, spec, stage),
+            _voice_delete(next_index + 4, spec, stage),
+            _voice_lifecycle(next_index + 5, spec, stage),
         ]
     )
-    next_index += 7
-    for pressure_index in range(spec.params.voice_cache_eviction_count):
+    next_index += 6
+    voice_cache_eviction_count = _stage_voice_cache_eviction_count(spec, stage)
+    for pressure_index in range(voice_cache_eviction_count):
         scenarios.append(
             _voice_upload(
                 next_index + pressure_index,
@@ -907,7 +889,7 @@ def _required_voice_scenarios(
                 case="cache_eviction",
             )
         )
-    next_index += spec.params.voice_cache_eviction_count
+    next_index += voice_cache_eviction_count
     successful_uploads = sum(
         1
         for scenario in scenarios
@@ -915,7 +897,8 @@ def _required_voice_scenarios(
         and scenario.expect_success
     )
     speaker_cap_successes_remaining = max(SPEAKER_MAX_UPLOADED - successful_uploads, 0)
-    for cap_index in range(spec.params.voice_speaker_cap_count):
+    voice_speaker_cap_count = _stage_voice_speaker_cap_count(spec, stage)
+    for cap_index in range(voice_speaker_cap_count):
         expect_success = cap_index < speaker_cap_successes_remaining
         scenarios.append(
             _voice_upload(
@@ -931,6 +914,27 @@ def _required_voice_scenarios(
             )
         )
     return scenarios
+
+
+def _stage_voice_cache_eviction_count(spec: BenchmarkSpec, stage: LoadStage) -> int:
+    if stage.voice_cache_eviction_count:
+        return stage.voice_cache_eviction_count
+    if _is_dedicated_voice_stage(spec, stage):
+        return spec.params.voice_cache_eviction_count
+    return 0
+
+
+def _stage_voice_speaker_cap_count(spec: BenchmarkSpec, stage: LoadStage) -> int:
+    if stage.voice_speaker_cap_count:
+        return stage.voice_speaker_cap_count
+    if _is_dedicated_voice_stage(spec, stage):
+        return spec.params.voice_speaker_cap_count
+    return 0
+
+
+def _is_dedicated_voice_stage(spec: BenchmarkSpec, stage: LoadStage) -> bool:
+    endpoints = stage.enabled_endpoints or spec.params.enabled_endpoints
+    return tuple(endpoints) == ("voices",)
 
 
 def _voice_upload(
@@ -1024,6 +1028,37 @@ def _voice_lifecycle(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scena
         description="upload a voice and delete the same voice name",
         planned_metadata={
             "upload_case": "lifecycle",
+            "upload_format": "wav",
+            "upload_size_bytes": VOICE_SMALL_UPLOAD_BYTES,
+            "voice_name": name,
+        },
+    )
+
+
+def _voice_overwrite(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
+    name = f"bench_voice_overwrite_stateful_{stage.id}_{index:05d}"
+    return Scenario(
+        id=_scenario_id(stage, "voices_overwrite", index),
+        endpoint="voices",
+        category="voices",
+        stage_id=stage.id,
+        capability_key="voices.overwrite",
+        method="VOICE_OVERWRITE",
+        path="/v1/audio/voices",
+        body_type="multipart",
+        form_fields={
+            "name": name,
+            "consent": "true",
+            "ref_text": "Voice overwrite benchmark reference text.",
+            "speaker_description": "Synthetic benchmark voice before overwrite.",
+        },
+        upload_field="audio_sample",
+        upload_filename=f"{name}.wav",
+        upload_content_type="audio/wav",
+        upload_size_bytes=VOICE_SMALL_UPLOAD_BYTES,
+        description="upload two voices with the same name and verify overwrite semantics",
+        planned_metadata={
+            "upload_case": "overwrite",
             "upload_format": "wav",
             "upload_size_bytes": VOICE_SMALL_UPLOAD_BYTES,
             "voice_name": name,

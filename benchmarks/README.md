@@ -93,8 +93,6 @@ python -m benchmarks.eval.benchmark_tts_serving \
 # {
 #   "profile": "stress",
 #   "enabled_endpoints": ["speech", "speech_sse", "voices", "batch", "websocket"],
-#   "voice_cache_eviction_count": 64,
-#   "voice_speaker_cap_count": 0,
 #   "load_stages": [
 #     {"id": "closed-1", "mode": "closed_loop", "request_count": 32, "max_concurrency": 1},
 #     {"id": "closed-16", "mode": "closed_loop", "request_count": 128, "max_concurrency": 16},
@@ -103,11 +101,14 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #     {"id": "ws-burst-512", "mode": "burst", "request_count": 512, "max_concurrency": 512,
 #      "enabled_endpoints": ["websocket"]},
 #     {"id": "voice-cache-evict", "mode": "closed_loop", "request_count": 96,
-#      "max_concurrency": 16, "enabled_endpoints": ["voices"]},
+#      "max_concurrency": 16, "enabled_endpoints": ["voices"],
+#      "voice_cache_eviction_count": 64, "voice_speaker_cap_count": 0},
 #     {"id": "mixed-burst-256", "mode": "burst", "request_count": 512,
 #      "max_concurrency": 256}
 #   ]
 # }
+# Near-limit non-WAV upload cases are reported as an explicit PR1 coverage gap
+# until valid just-under-10MB fixtures can be added without padded fake containers.
 
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
 python -m benchmarks.eval.benchmark_omni_seedtts \

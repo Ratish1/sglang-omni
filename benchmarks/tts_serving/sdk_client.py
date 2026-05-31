@@ -20,6 +20,8 @@ from benchmarks.tts_serving.metrics import (
 from benchmarks.tts_serving.scenarios import Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
 
+UNSUPPORTED_HTTP_STATUSES = {404, 405, 501}
+
 
 async def run_sdk_scenario(spec: BenchmarkSpec, scenario: Scenario) -> ScenarioResult:
     start = time.perf_counter()
@@ -138,7 +140,7 @@ def _classify_sdk_status_error(
     result.success = False
     result.error_type = exc.__class__.__name__
     result.error = str(exc)
-    if status_code == 404 and scenario.expect_success:
+    if status_code in UNSUPPORTED_HTTP_STATUSES and scenario.expect_success:
         result.status = "unsupported_contract"
         result.capability = "fail"
         result.error_class = "unsupported_endpoint"

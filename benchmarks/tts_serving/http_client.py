@@ -27,6 +27,7 @@ from benchmarks.tts_serving.urls import api_url
 from benchmarks.tts_serving.voice_upload_fixtures import get_voice_upload_fixture
 
 AUDIO_RESPONSE_FORMATS = {"wav", "pcm", "mp3", "flac", "aac", "opus"}
+UNSUPPORTED_HTTP_STATUSES = {404, 405, 501}
 SUCCESS_BATCH_STATUSES = {"ok", "success", "succeeded"}
 FAILED_BATCH_STATUSES = {"error", "failed"}
 VALID_BATCH_TASK_TYPES = {"Base", "CustomVoice", "VoiceDesign"}
@@ -64,6 +65,8 @@ async def run_http_scenario(
                 scenario,
                 result,
             )
+        elif scenario.method == "VOICE_OVERWRITE":
+            await _run_voice_overwrite(session, spec, scenario, result)
         elif scenario.method == "GET":
             async with session.get(url) as response:
                 await _handle_probe_response(response, result, scenario)
@@ -107,7 +110,7 @@ async def _handle_probe_response(
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
-    if response.status == 404:
+    if response.status in UNSUPPORTED_HTTP_STATUSES:
         _mark_unsupported_contract(
             result,
             scenario,
@@ -136,7 +139,7 @@ async def _handle_binary_response(
     result.response_headers = dict(response.headers)
     body = await response.read()
     result.response_bytes = len(body)
-    if response.status == 404 and scenario.capability_key != "voices.delete":
+    if _is_unsupported_http_status(response.status, scenario):
         _mark_unsupported_contract(
             result,
             scenario,
@@ -191,7 +194,7 @@ async def _handle_sse_response(
     if response.status != 200:
         body = await response.text()
         result.response_bytes = len(body.encode("utf-8"))
-        if response.status == 404:
+        if response.status in UNSUPPORTED_HTTP_STATUSES:
             _mark_unsupported_contract(result, scenario, body=body)
             return
         _classify_http_failure(response.status, body, result, scenario)
@@ -380,10 +383,8 @@ def _classify_http_failure(
 ) -> None:
     result.success = False
     result.error = body
-    if 500 <= status:
-        result.status = "failed"
-        result.error_class = "server_error"
-        result.capability = "fail"
+    if _is_unsupported_http_status(status, scenario):
+        _mark_unsupported_contract(result, scenario, body=body)
         return
     if scenario.capability_key == "voices.delete" and not scenario.expect_success:
         if _is_valid_missing_voice_delete_response(status, body):
@@ -399,14 +400,26 @@ def _classify_http_failure(
             f"success=false and error details; received status={status}, body={body}"
         )
         return
-    if status == 404:
-        _mark_unsupported_contract(result, scenario, body=body)
+    if 500 <= status:
+        result.status = "failed"
+        result.error_class = "server_error"
+        result.capability = "fail"
         return
     if (
         400 <= status < 500
         and not scenario.expect_success
         and scenario.expected_status_class == "client_error"
     ):
+        if not _is_valid_error_response(body):
+            _mark_protocol_error(
+                result,
+                status="invalid_error_response",
+                error=(
+                    "expected client-error scenario returned HTTP "
+                    f"{status} without structured error JSON: {body}"
+                ),
+            )
+            return
         result.status = "expected_error"
         result.error_class = "expected_client_error"
         result.capability = "pass"
@@ -452,9 +465,19 @@ def _is_audio_response(
     return False
 
 
-def _request_body(scenario: Scenario) -> aiohttp.FormData:
+def _is_unsupported_http_status(status: int, scenario: Scenario) -> bool:
+    if status not in UNSUPPORTED_HTTP_STATUSES:
+        return False
+    if scenario.capability_key == "voices.delete" and not scenario.expect_success:
+        return status != 404
+    return True
+
+
+def _request_body(
+    scenario: Scenario, *, form_fields: Mapping[str, str] | None = None
+) -> aiohttp.FormData:
     form = aiohttp.FormData()
-    for key, value in scenario.form_fields.items():
+    for key, value in (form_fields or scenario.form_fields).items():
         form.add_field(key, value)
     if scenario.upload_field:
         form.add_field(
@@ -547,7 +570,7 @@ async def _run_voice_lifecycle(
         result.response_headers = dict(upload_response.headers)
         upload_body = await upload_response.read()
         result.response_bytes += len(upload_body)
-        if upload_response.status == 404:
+        if upload_response.status in UNSUPPORTED_HTTP_STATUSES:
             _mark_unsupported_contract(
                 result,
                 scenario,
@@ -590,6 +613,147 @@ async def _run_voice_lifecycle(
             )
             return
     _mark_success(result, capability="pass")
+
+
+async def _run_voice_overwrite(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+) -> None:
+    upload_url = api_url(spec.base_url, scenario.path)
+    voice_name = str(scenario.planned_metadata.get("voice_name", ""))
+    result.request_bytes = _request_size(scenario) * 2
+
+    first_fields = dict(scenario.form_fields)
+    second_fields = dict(scenario.form_fields)
+    first_fields["speaker_description"] = "Synthetic benchmark voice before overwrite."
+    second_fields["speaker_description"] = "Synthetic benchmark voice after overwrite."
+
+    first_payload = await _post_voice_upload(
+        session,
+        upload_url,
+        scenario,
+        result,
+        form_fields=first_fields,
+    )
+    if first_payload is None:
+        return
+    if not _voice_upload_response_identifier(first_payload):
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error="first same-name voice upload response must include an identifier",
+        )
+        return
+
+    second_payload = await _post_voice_upload(
+        session,
+        upload_url,
+        scenario,
+        result,
+        form_fields=second_fields,
+    )
+    if second_payload is None:
+        return
+    if not _voice_upload_response_identifier(second_payload):
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error="second same-name voice upload response must include an identifier",
+        )
+        return
+    if not _is_voice_overwrite_ack(second_payload):
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=(
+                "second same-name upload must include an overwrite warning or "
+                f"replacement indicator: {second_payload}"
+            ),
+        )
+        return
+
+    list_url = api_url(spec.base_url, "/v1/audio/voices")
+    async with session.get(list_url) as list_response:
+        result.http_status = list_response.status
+        result.http_status_class = classify_http_status(list_response.status)
+        result.response_headers = dict(list_response.headers)
+        list_body = await list_response.read()
+        result.response_bytes += len(list_body)
+        if list_response.status in UNSUPPORTED_HTTP_STATUSES:
+            _mark_unsupported_contract(
+                result,
+                scenario,
+                body=list_body.decode("utf-8", errors="replace"),
+            )
+            return
+        if not 200 <= list_response.status < 300:
+            _classify_http_failure(
+                list_response.status,
+                list_body.decode("utf-8", errors="replace"),
+                result,
+                scenario,
+            )
+            return
+    voice_list = _json_object_from_bytes(
+        list_body,
+        result,
+        status="invalid_voice_response",
+        error_prefix="voice overwrite list response returned invalid JSON",
+    )
+    if voice_list is None:
+        return
+    entries = _uploaded_voice_entries(voice_list, voice_name)
+    if len(entries) != 1:
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=(
+                "same-name voice overwrite must leave exactly one uploaded "
+                f"voice named {voice_name!r}; observed={len(entries)}"
+            ),
+        )
+        return
+    _mark_success(result, capability="pass")
+
+
+async def _post_voice_upload(
+    session: aiohttp.ClientSession,
+    upload_url: str,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    form_fields: Mapping[str, str],
+) -> dict[str, Any] | None:
+    body = _request_body(scenario, form_fields=form_fields)
+    async with session.post(upload_url, data=body) as response:
+        result.http_status = response.status
+        result.http_status_class = classify_http_status(response.status)
+        result.response_headers = dict(response.headers)
+        response_body = await response.read()
+        result.response_bytes += len(response_body)
+        if response.status in UNSUPPORTED_HTTP_STATUSES:
+            _mark_unsupported_contract(
+                result,
+                scenario,
+                body=response_body.decode("utf-8", errors="replace"),
+            )
+            return None
+        if not 200 <= response.status < 300:
+            _classify_http_failure(
+                response.status,
+                response_body.decode("utf-8", errors="replace"),
+                result,
+                scenario,
+            )
+            return None
+    return _json_object_from_bytes(
+        response_body,
+        result,
+        status="invalid_voice_response",
+        error_prefix="voice upload response returned invalid JSON",
+    )
 
 
 def _scenario_response_format(scenario: Scenario) -> str | None:
@@ -848,6 +1012,33 @@ def _is_valid_voice_list_response(payload: Any) -> bool:
     )
 
 
+def _json_object_from_bytes(
+    body: bytes,
+    result: ScenarioResult,
+    *,
+    status: str,
+    error_prefix: str,
+) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except json.JSONDecodeError as exc:
+        _mark_protocol_error(
+            result,
+            status=status,
+            error=f"{error_prefix}: {exc}",
+        )
+        result.error_type = exc.__class__.__name__
+        return None
+    if not isinstance(payload, dict):
+        _mark_protocol_error(
+            result,
+            status=status,
+            error=f"{error_prefix}: response must be a JSON object",
+        )
+        return None
+    return payload
+
+
 def _is_valid_preset_voice(item: Any) -> bool:
     if isinstance(item, str):
         return bool(item)
@@ -894,6 +1085,27 @@ def _voice_upload_response_identifier(payload: Any) -> str | None:
     return None
 
 
+def _is_voice_overwrite_ack(payload: dict[str, Any]) -> bool:
+    if payload.get("overwritten") is True or payload.get("replaced") is True:
+        return True
+    for key in ("warning", "message"):
+        value = payload.get(key)
+        if isinstance(value, str) and "overwrit" in value.lower():
+            return True
+    return False
+
+
+def _uploaded_voice_entries(payload: dict[str, Any], voice_name: str) -> list[dict]:
+    uploaded_voices = payload.get("uploaded_voices")
+    if not isinstance(uploaded_voices, list):
+        return []
+    return [
+        item
+        for item in uploaded_voices
+        if isinstance(item, dict) and item.get("name") == voice_name
+    ]
+
+
 def _is_valid_voice_delete_success(body: bytes) -> bool:
     try:
         payload = json.loads(body.decode("utf-8")) if body else {}
@@ -922,6 +1134,21 @@ def _is_valid_missing_voice_delete_response(status: int, body: str) -> bool:
         return False
     error = payload.get("error")
     return isinstance(error, (dict, str)) and bool(error)
+
+
+def _is_valid_error_response(body: str) -> bool:
+    if not body.strip() or body.lstrip().startswith("<"):
+        return False
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return any(
+        isinstance(payload.get(key), (dict, list, str)) and bool(payload[key])
+        for key in ("error", "message", "detail")
+    )
 
 
 def _is_nonnegative_file_size(value: Any) -> bool:

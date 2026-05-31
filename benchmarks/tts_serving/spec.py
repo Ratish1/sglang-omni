@@ -46,6 +46,8 @@ class LoadStage:
     duration_s: float | None = None
     arrival_distribution: str = "deterministic"
     enabled_endpoints: tuple[str, ...] | None = None
+    voice_cache_eviction_count: int = 0
+    voice_speaker_cap_count: int = 0
 
     @classmethod
     def from_obj(cls, obj: Any, *, index: int) -> LoadStage:
@@ -77,7 +79,7 @@ class LoadStage:
                 "params.load_stages[].arrival_distribution must be one of "
                 f"{sorted(VALID_ARRIVAL_DISTRIBUTIONS)}"
             )
-        if mode in {"open_loop", "ramp", "soak"} and request_rate == float("inf"):
+        if mode in {"open_loop", "ramp"} and request_rate == float("inf"):
             raise SpecError(
                 "params.load_stages[].request_rate must be finite for " f"{mode} stages"
             )
@@ -89,9 +91,20 @@ class LoadStage:
             raise SpecError(
                 "params.load_stages[].duration_s is required for soak stages"
             )
+        if mode == "soak" and request_rate == float("inf"):
+            assert duration_s is not None
+            request_rate = request_count / duration_s
         enabled_endpoints = _optional_enabled_endpoints(
             obj.get("enabled_endpoints"),
             "params.load_stages[].enabled_endpoints",
+        )
+        voice_cache_eviction_count = _nonnegative_int_value(
+            obj.get("voice_cache_eviction_count", 0),
+            "params.load_stages[].voice_cache_eviction_count",
+        )
+        voice_speaker_cap_count = _nonnegative_int_value(
+            obj.get("voice_speaker_cap_count", 0),
+            "params.load_stages[].voice_speaker_cap_count",
         )
         return cls(
             id=stage_id,
@@ -103,6 +116,8 @@ class LoadStage:
             duration_s=duration_s,
             arrival_distribution=arrival_distribution,
             enabled_endpoints=enabled_endpoints,
+            voice_cache_eviction_count=voice_cache_eviction_count,
+            voice_speaker_cap_count=voice_speaker_cap_count,
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -122,6 +137,8 @@ class LoadStage:
                 if self.enabled_endpoints is not None
                 else None
             ),
+            "voice_cache_eviction_count": self.voice_cache_eviction_count,
+            "voice_speaker_cap_count": self.voice_speaker_cap_count,
         }
 
 
@@ -276,9 +293,12 @@ def _positive_int(obj: dict[str, Any], key: str, default: int) -> int:
 
 
 def _nonnegative_int(obj: dict[str, Any], key: str, default: int) -> int:
-    value = obj.get(key, default)
+    return _nonnegative_int_value(obj.get(key, default), f"params.{key}")
+
+
+def _nonnegative_int_value(value: Any, key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise SpecError(f"params.{key} must be a non-negative integer")
+        raise SpecError(f"{key} must be a non-negative integer")
     return value
 
 

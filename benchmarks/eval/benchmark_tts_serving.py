@@ -255,12 +255,13 @@ def _planned_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list
         return [0.0] * request_count
     if stage.mode == "ramp":
         return _ramp_offsets(stage, request_count, seed=seed)
-    if stage.mode == "soak" and stage.arrival_distribution == "deterministic":
+    if stage.mode == "soak":
         assert stage.duration_s is not None
         if request_count == 1:
             return [0.0]
-        step = stage.duration_s / float(request_count - 1)
-        return [index * step for index in range(request_count)]
+        if stage.arrival_distribution == "poisson":
+            return _duration_scaled_poisson_offsets(stage, request_count, seed=seed)
+        return _duration_spaced_offsets(stage.duration_s, request_count)
     if stage.arrival_distribution == "poisson":
         rng = random.Random(f"{seed}:{stage.id}:arrival")
         elapsed = 0.0
@@ -293,6 +294,30 @@ def _ramp_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list[fl
         else:
             elapsed += 1.0 / current_rate
     return offsets
+
+
+def _duration_spaced_offsets(duration_s: float, request_count: int) -> list[float]:
+    if request_count == 1:
+        return [0.0]
+    step = duration_s / float(request_count - 1)
+    return [index * step for index in range(request_count)]
+
+
+def _duration_scaled_poisson_offsets(
+    stage: LoadStage, request_count: int, *, seed: int
+) -> list[float]:
+    assert stage.duration_s is not None
+    rng = random.Random(f"{seed}:{stage.id}:soak-arrival")
+    elapsed = 0.0
+    offsets: list[float] = []
+    for _ in range(request_count):
+        offsets.append(elapsed)
+        elapsed += rng.expovariate(stage.request_rate)
+    last_offset = offsets[-1]
+    if last_offset <= 0:
+        return offsets
+    scale = stage.duration_s / last_offset
+    return [offset * scale for offset in offsets]
 
 
 def _auth_headers(spec: BenchmarkSpec) -> dict[str, str]:
