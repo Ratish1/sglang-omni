@@ -154,23 +154,17 @@ async def _run_scheduled_stage(
             return result
 
     started = time.perf_counter()
-    results: list[ScenarioResult] = []
-    pending: set[asyncio.Task[ScenarioResult]] = set()
-    max_pending = max(stage.max_concurrency * 4, 128)
-    for scenario, offset in zip(scenarios, offsets, strict=True):
-        pending.add(asyncio.create_task(run_planned(scenario, offset)))
-        if len(pending) >= max_pending:
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED
-            )
-            results.extend(task.result() for task in done)
-    if pending:
-        results.extend(await asyncio.gather(*pending))
+    tasks = [
+        asyncio.create_task(run_planned(scenario, offset))
+        for scenario, offset in zip(scenarios, offsets, strict=True)
+    ]
+    results = await asyncio.gather(*tasks)
     harness_log.append(
         f"stage={stage.id} mode={stage.mode} completed {len(results)} scenarios "
-        f"at concurrency={stage.max_concurrency} in {time.perf_counter() - started:.3f}s"
+        f"at concurrency={stage.max_concurrency} in {time.perf_counter() - started:.3f}s "
+        "with open-loop arrivals scheduled independently of completions"
     )
-    return results
+    return list(results)
 
 
 async def _run_one_scenario(
