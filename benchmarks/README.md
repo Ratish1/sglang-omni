@@ -98,7 +98,7 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #     {"id": "closed-1", "mode": "closed_loop", "request_count": 32, "max_concurrency": 1},
 #     {"id": "closed-16", "mode": "closed_loop", "request_count": 128, "max_concurrency": 16},
 #     {"id": "ramp-128", "mode": "ramp", "request_count": 256, "max_concurrency": 128,
-#      "start_request_rate": 2, "request_rate": 64},
+#      "start_request_rate": 2, "request_rate": 64, "arrival_distribution": "poisson"},
 #     {"id": "burst-128", "mode": "burst", "request_count": 256, "max_concurrency": 128}
 #   ]
 # }
