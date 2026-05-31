@@ -101,10 +101,19 @@ def parse_sse_audio_event(line: str) -> tuple[bytes | None, dict[str, Any] | Non
     if not line.startswith(SSE_DATA_PREFIX) or line == SSE_DONE_MARKER:
         return None, None
     event = json.loads(line[len(SSE_DATA_PREFIX) :])
+    if not isinstance(event, dict):
+        raise ValueError("SSE data payload must be a JSON object")
     audio = event.get("audio")
-    if not isinstance(audio, dict) or not audio.get("data"):
+    if audio is None:
         return None, event
-    return base64.b64decode(audio["data"]), event
+    if not isinstance(audio, dict):
+        raise ValueError("SSE audio field must be a JSON object")
+    audio_data = audio.get("data")
+    if not audio_data:
+        return None, event
+    if not isinstance(audio_data, str):
+        raise ValueError("SSE audio.data field must be a base64 string")
+    return base64.b64decode(audio_data, validate=True), event
 
 
 def finish_timing(result: ScenarioResult, start: float) -> None:

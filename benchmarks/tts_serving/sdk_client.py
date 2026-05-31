@@ -55,7 +55,11 @@ def _run_openai_speech_create(
         result.error = "openai package is required for SDK benchmark scenarios"
         return
 
-    client = OpenAI(base_url=_sdk_base_url(spec.base_url), api_key=_sdk_api_key(spec))
+    client = OpenAI(
+        base_url=_sdk_base_url(spec.base_url),
+        api_key=_sdk_api_key(spec),
+        timeout=spec.params.timeout_s,
+    )
     request = _sdk_request(scenario.payload, spec.model_name)
     result.request_bytes = _json_size(request)
     try:

@@ -718,47 +718,87 @@ def _speech_sse(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
     )
 
 
-def _malformed_payloads(spec: BenchmarkSpec, index: int) -> list[dict[str, Any]]:
+def _malformed_payloads(
+    spec: BenchmarkSpec, index: int
+) -> list[tuple[str, dict[str, Any]]]:
     return [
-        {"model": spec.model_name, "voice": "default", "response_format": "wav"},
-        {"model": spec.model_name, "input": "", "voice": "default"},
-        {"model": spec.model_name, "input": 123, "response_format": "wav"},
-        {
-            "model": spec.model_name,
-            "input": "Invalid format",
-            "response_format": "bogus",
-        },
-        {"model": spec.model_name, "input": "Invalid language", "language": "Klingon"},
-        {"model": spec.model_name, "input": "Invalid task", "task_type": "NotATask"},
-        {
-            "model": spec.model_name,
-            "input": "Invalid speed request",
-            "response_format": "wav",
-            "speed": -1.0,
-        },
-        {
-            "model": spec.model_name,
-            "input": "Invalid high speed request",
-            "response_format": "wav",
-            "speed": 4.1,
-        },
-        {
-            "model": spec.model_name,
-            "input": "Streaming format violation",
-            "response_format": "wav",
-            "stream": True,
-        },
-        {
-            "model": spec.model_name,
-            "input": "Invalid max token request",
-            "response_format": "wav",
-            "max_new_tokens": -1,
-        },
-        {
-            "model": spec.model_name,
-            "input": ADVERSARIAL_TEXTS[index % len(ADVERSARIAL_TEXTS)],
-            "response_format": "wav",
-        },
+        (
+            "missing_input",
+            {"model": spec.model_name, "voice": "default", "response_format": "wav"},
+        ),
+        ("empty_input", {"model": spec.model_name, "input": "", "voice": "default"}),
+        (
+            "wrong_input_type",
+            {"model": spec.model_name, "input": 123, "response_format": "wav"},
+        ),
+        (
+            "bad_response_format",
+            {
+                "model": spec.model_name,
+                "input": "Invalid format",
+                "response_format": "bogus",
+            },
+        ),
+        (
+            "bad_language",
+            {
+                "model": spec.model_name,
+                "input": "Invalid language",
+                "language": "Klingon",
+            },
+        ),
+        (
+            "bad_task_type",
+            {
+                "model": spec.model_name,
+                "input": "Invalid task",
+                "task_type": "NotATask",
+            },
+        ),
+        (
+            "speed_below_min",
+            {
+                "model": spec.model_name,
+                "input": "Invalid speed request",
+                "response_format": "wav",
+                "speed": -1.0,
+            },
+        ),
+        (
+            "speed_above_max",
+            {
+                "model": spec.model_name,
+                "input": "Invalid high speed request",
+                "response_format": "wav",
+                "speed": 4.1,
+            },
+        ),
+        (
+            "stream_non_pcm",
+            {
+                "model": spec.model_name,
+                "input": "Streaming format violation",
+                "response_format": "wav",
+                "stream": True,
+            },
+        ),
+        (
+            "negative_max_new_tokens",
+            {
+                "model": spec.model_name,
+                "input": "Invalid max token request",
+                "response_format": "wav",
+                "max_new_tokens": -1,
+            },
+        ),
+        (
+            "adversarial_text",
+            {
+                "model": spec.model_name,
+                "input": ADVERSARIAL_TEXTS[index % len(ADVERSARIAL_TEXTS)],
+                "response_format": "wav",
+            },
+        ),
     ]
 
 
@@ -768,7 +808,7 @@ def _malformed_case_count() -> int:
 
 def _speech_malformed(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
     candidates = _malformed_payloads(spec, index)
-    payload = candidates[index % len(candidates)]
+    malformed_case, payload = candidates[index % len(candidates)]
     expect_success = payload.get("input") in ADVERSARIAL_TEXTS
     return Scenario(
         id=_scenario_id(stage, "speech_malformed", index),
@@ -780,6 +820,7 @@ def _speech_malformed(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
         expect_success=expect_success,
         expected_status_class="success" if expect_success else "client_error",
         description="malformed or adversarial request should not crash server",
+        planned_metadata={"malformed_case": malformed_case},
     )
 
 
@@ -963,19 +1004,23 @@ def _required_voice_scenarios(
             )
         )
         next_index += 1
-    scenarios.extend(
-        [
+    for upload_format, content_type in VOICE_UPLOAD_SUCCESS_FORMATS:
+        scenarios.append(
             _voice_upload(
                 next_index,
                 spec,
                 stage,
                 upload_size=VOICE_NEAR_LIMIT_BYTES,
-                upload_format="wav",
-                content_type="audio/wav",
+                upload_format=upload_format,
+                content_type=content_type,
                 case="near_limit",
-            ),
+            )
+        )
+        next_index += 1
+    scenarios.extend(
+        [
             _voice_upload(
-                next_index + 1,
+                next_index,
                 spec,
                 stage,
                 upload_size=VOICE_OVERSIZED_BYTES,
@@ -986,7 +1031,7 @@ def _required_voice_scenarios(
                 expected_status_class="client_error",
             ),
             _voice_upload(
-                next_index + 2,
+                next_index + 1,
                 spec,
                 stage,
                 upload_size=VOICE_SMALL_UPLOAD_BYTES,
@@ -996,13 +1041,13 @@ def _required_voice_scenarios(
                 expect_success=False,
                 expected_status_class="client_error",
             ),
-            _voice_overwrite(next_index + 3, spec, stage),
-            _voice_delete(next_index + 4, spec, stage),
-            _voice_lifecycle(next_index + 5, spec, stage),
-            _voice_upload_delete_race(next_index + 6, spec, stage),
+            _voice_overwrite(next_index + 2, spec, stage),
+            _voice_delete(next_index + 3, spec, stage),
+            _voice_lifecycle(next_index + 4, spec, stage),
+            _voice_upload_delete_race(next_index + 5, spec, stage),
         ]
     )
-    next_index += 7
+    next_index += 6
     voice_cache_eviction_count = _stage_voice_cache_eviction_count(spec, stage)
     for pressure_index in range(voice_cache_eviction_count):
         scenarios.append(

@@ -9,7 +9,15 @@ from typing import Any
 
 from benchmarks.tts_serving.metrics import ScenarioResult
 from benchmarks.tts_serving.scenarios import (
+    BATCH_OVERSIZED_SIZE,
+    BATCH_SIZES,
+    LENGTH_EXTREME_TEXTS,
+    MULTILINGUAL_TEXTS,
+    REFERENCE_FAILURES,
+    RESPONSE_FORMATS,
     SCENARIO_SCHEMA_VERSION,
+    TASK_TYPES,
+    VOICE_UPLOAD_REJECT_FORMATS,
     VOICE_UPLOAD_SUCCESS_FORMATS,
     Scenario,
     scenario_set_hash,
@@ -48,7 +56,7 @@ def build_results_report(
         for result in results
     )
     voice_upload_coverage = _voice_upload_coverage(scenarios or [])
-    coverage_failures = _coverage_failures(scenarios or [], voice_upload_coverage)
+    coverage_failures = _coverage_failures(spec, scenarios or [], voice_upload_coverage)
     coverage_contract_valid = not coverage_failures
     passed = (
         harness_status == "ok"
@@ -364,15 +372,7 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         "cache_eviction_formats": sorted(cache_eviction_formats),
         "speaker_cap_cases": speaker_cap_cases,
         "speaker_cap_attempts": speaker_cap_attempts,
-        "near_limit_pr1_gap": (
-            (
-                "Valid just-under-10MB fixtures are currently generated only for WAV; "
-                "missing non-WAV near-limit formats mark the benchmark coverage "
-                "contract invalid instead of using invalid padded containers."
-            )
-            if near_limit_missing_formats
-            else None
-        ),
+        "near_limit_pr1_gap": None,
     }
 
 
@@ -386,23 +386,281 @@ def _speaker_cap_attempt_count(scenario: Scenario) -> int:
 
 
 def _coverage_failures(
-    scenarios: list[Scenario], voice_upload_coverage: dict[str, Any]
+    spec: BenchmarkSpec,
+    scenarios: list[Scenario],
+    voice_upload_coverage: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    voices_enabled = any(scenario.endpoint == "voices" for scenario in scenarios)
-    if (
-        not voices_enabled
-        or not voice_upload_coverage["regular_upload_format_contract_present"]
-        or voice_upload_coverage["near_limit_contract_complete"]
-    ):
-        return []
-    return [
-        {
-            "contract": "voices.near_limit_upload_formats",
-            "status": "coverage_gap",
-            "missing_formats": voice_upload_coverage["near_limit_missing_formats"],
-            "error": voice_upload_coverage["near_limit_pr1_gap"],
-        }
+    failures: list[dict[str, Any]] = []
+    endpoint_set = {scenario.endpoint for scenario in scenarios}
+    if "speech" in endpoint_set:
+        failures.extend(_speech_coverage_failures(scenarios))
+    if "speech_sse" in endpoint_set and not _has_capability(scenarios, "speech.sse"):
+        failures.append(_coverage_gap("speech.sse", ["speech.sse"]))
+    if "batch" in endpoint_set:
+        failures.extend(_batch_coverage_failures(scenarios))
+    if "voices" in endpoint_set:
+        failures.extend(
+            _voice_coverage_failures(spec, scenarios, voice_upload_coverage)
+        )
+    if "websocket" in endpoint_set:
+        failures.extend(_websocket_coverage_failures(scenarios))
+    return failures
+
+
+def _speech_coverage_failures(scenarios: list[Scenario]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    speech_scenarios = [
+        scenario for scenario in scenarios if scenario.endpoint == "speech"
     ]
+    languages = {language for language, _ in MULTILINGUAL_TEXTS}
+    failures.extend(
+        _value_coverage_gap(
+            "speech.languages",
+            languages,
+            _metadata_values(speech_scenarios, "language"),
+        )
+    )
+    failures.extend(
+        _value_coverage_gap(
+            "speech.response_formats",
+            set(RESPONSE_FORMATS),
+            _metadata_values(speech_scenarios, "response_format"),
+        )
+    )
+    failures.extend(
+        _value_coverage_gap(
+            "speech.task_types",
+            set(TASK_TYPES),
+            _metadata_values(speech_scenarios, "task_type"),
+        )
+    )
+    failures.extend(
+        _value_coverage_gap(
+            "speech.length_extremes",
+            {len(text) for text in LENGTH_EXTREME_TEXTS},
+            _metadata_values(speech_scenarios, "input_chars"),
+        )
+    )
+    failures.extend(
+        _value_coverage_gap(
+            "speech.reference_cases",
+            {
+                "valid_reference",
+                "valid_base64_ref_audio",
+                "x_vector_only_mode",
+                *(case for case, _ in REFERENCE_FAILURES),
+            },
+            _metadata_values(speech_scenarios, "reference_case"),
+        )
+    )
+    failures.extend(
+        _value_coverage_gap(
+            "speech.malformed_cases",
+            {
+                "missing_input",
+                "empty_input",
+                "wrong_input_type",
+                "bad_response_format",
+                "bad_language",
+                "bad_task_type",
+                "speed_below_min",
+                "speed_above_max",
+                "stream_non_pcm",
+                "negative_max_new_tokens",
+                "adversarial_text",
+            },
+            _metadata_values(speech_scenarios, "malformed_case"),
+        )
+    )
+    if not any(
+        scenario.planned_metadata.get("initial_codec_chunk_frames")
+        for scenario in speech_scenarios
+    ):
+        failures.append(_coverage_gap("speech.initial_codec_chunk_frames", ["present"]))
+    if not _has_capability(speech_scenarios, "speech.openai_sdk"):
+        failures.append(_coverage_gap("speech.openai_sdk", ["speech.openai_sdk"]))
+    return failures
+
+
+def _batch_coverage_failures(scenarios: list[Scenario]) -> list[dict[str, Any]]:
+    batch_scenarios = [
+        scenario for scenario in scenarios if scenario.endpoint == "batch"
+    ]
+    failures: list[dict[str, Any]] = []
+    failures.extend(
+        _value_coverage_gap(
+            "batch.sizes",
+            {*BATCH_SIZES, BATCH_OVERSIZED_SIZE},
+            _metadata_values(batch_scenarios, "batch_size"),
+        )
+    )
+    failures.extend(
+        _value_coverage_gap(
+            "batch.cases",
+            {"all_valid", "item_error", "item_overrides"},
+            _metadata_values(batch_scenarios, "batch_case"),
+        )
+    )
+    return failures
+
+
+def _voice_coverage_failures(
+    spec: BenchmarkSpec,
+    scenarios: list[Scenario],
+    voice_upload_coverage: dict[str, Any],
+) -> list[dict[str, Any]]:
+    voice_scenarios = [
+        scenario for scenario in scenarios if scenario.endpoint == "voices"
+    ]
+    cap_stage_ids = {
+        scenario.stage_id
+        for scenario in voice_scenarios
+        if scenario.capability_key == "voices.speaker_cap"
+    }
+    regular_voice_scenarios = [
+        scenario
+        for scenario in voice_scenarios
+        if scenario.stage_id not in cap_stage_ids
+    ]
+    failures: list[dict[str, Any]] = []
+    if regular_voice_scenarios:
+        failures.extend(_regular_voice_coverage_failures(regular_voice_scenarios))
+        if (
+            voice_upload_coverage["regular_upload_format_contract_present"]
+            and not voice_upload_coverage["near_limit_contract_complete"]
+        ):
+            failures.append(
+                _coverage_gap(
+                    "voices.near_limit_upload_formats",
+                    voice_upload_coverage["near_limit_missing_formats"],
+                )
+            )
+    if cap_stage_ids and voice_upload_coverage["speaker_cap_attempts"] <= 0:
+        failures.append(_coverage_gap("voices.speaker_cap", ["speaker_cap_sequence"]))
+    if _configured_voice_cache_eviction_count(spec) and not any(
+        scenario.planned_metadata.get("upload_case") == "cache_eviction"
+        for scenario in voice_scenarios
+    ):
+        failures.append(_coverage_gap("voices.cache_eviction", ["cache_eviction"]))
+    return failures
+
+
+def _regular_voice_coverage_failures(scenarios: list[Scenario]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    if not _has_capability(scenarios, "voices.list"):
+        failures.append(_coverage_gap("voices.list", ["voices.list"]))
+    failures.extend(
+        _value_coverage_gap(
+            "voices.accepted_upload_formats",
+            {upload_format for upload_format, _ in VOICE_UPLOAD_SUCCESS_FORMATS},
+            {
+                scenario.planned_metadata.get("upload_format")
+                for scenario in scenarios
+                if scenario.capability_key == "voices.upload"
+                and scenario.expect_success
+                and scenario.planned_metadata.get("upload_case") == "format"
+            },
+        )
+    )
+    failures.extend(
+        _value_coverage_gap(
+            "voices.synthetic_reject_formats",
+            {upload_format for upload_format, _ in VOICE_UPLOAD_REJECT_FORMATS},
+            {
+                scenario.planned_metadata.get("upload_format")
+                for scenario in scenarios
+                if scenario.capability_key == "voices.upload"
+                and not scenario.expect_success
+                and scenario.planned_metadata.get("upload_case")
+                == "synthetic_header_reject"
+            },
+        )
+    )
+    failures.extend(
+        _value_coverage_gap(
+            "voices.lifecycle_cases",
+            {
+                "oversized",
+                "corrupt_audio",
+                "overwrite",
+                "delete",
+                "lifecycle",
+                "upload_delete_race",
+            },
+            {
+                _voice_case(scenario)
+                for scenario in scenarios
+                if scenario.endpoint == "voices"
+            },
+        )
+    )
+    return failures
+
+
+def _websocket_coverage_failures(scenarios: list[Scenario]) -> list[dict[str, Any]]:
+    return _value_coverage_gap(
+        "websocket.cases",
+        {
+            "ws.normal",
+            "ws.multi_sentence",
+            "ws.stream_audio",
+            "ws.done_before_config",
+            "ws.malformed_json",
+            "ws.disconnect",
+        },
+        {
+            scenario.capability_key
+            for scenario in scenarios
+            if scenario.endpoint == "websocket"
+        },
+    )
+
+
+def _metadata_values(scenarios: list[Scenario], key: str) -> set[Any]:
+    return {
+        scenario.planned_metadata.get(key)
+        for scenario in scenarios
+        if scenario.planned_metadata.get(key) is not None
+    }
+
+
+def _value_coverage_gap(
+    contract: str, expected: set[Any], actual: set[Any]
+) -> list[dict[str, Any]]:
+    missing = sorted(expected - actual)
+    return [_coverage_gap(contract, missing)] if missing else []
+
+
+def _coverage_gap(contract: str, missing: list[Any]) -> dict[str, Any]:
+    return {
+        "contract": contract,
+        "status": "coverage_gap",
+        "missing": missing,
+        "error": f"enabled benchmark contract is missing required scenarios: {missing}",
+    }
+
+
+def _has_capability(scenarios: list[Scenario], capability_key: str) -> bool:
+    return any(scenario.capability_key == capability_key for scenario in scenarios)
+
+
+def _voice_case(scenario: Scenario) -> str | None:
+    if scenario.capability_key == "voices.overwrite":
+        return "overwrite"
+    if scenario.capability_key == "voices.delete":
+        return "delete"
+    if scenario.capability_key == "voices.lifecycle":
+        return "lifecycle"
+    if scenario.capability_key == "voices.upload_delete_race":
+        return "upload_delete_race"
+    return scenario.planned_metadata.get("upload_case")
+
+
+def _configured_voice_cache_eviction_count(spec: BenchmarkSpec) -> int:
+    stage_count = sum(
+        stage.voice_cache_eviction_count for stage in spec.params.load_stages
+    )
+    return stage_count or spec.params.voice_cache_eviction_count
 
 
 def _result_group_summary(

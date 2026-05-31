@@ -24,7 +24,10 @@ from benchmarks.tts_serving.metrics import (
 from benchmarks.tts_serving.scenarios import SPEAKER_MAX_UPLOADED, Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
 from benchmarks.tts_serving.urls import api_url
-from benchmarks.tts_serving.voice_upload_fixtures import get_voice_upload_fixture
+from benchmarks.tts_serving.voice_upload_fixtures import (
+    get_near_limit_voice_upload_fixture,
+    get_voice_upload_fixture,
+)
 
 AUDIO_RESPONSE_FORMATS = {"wav", "pcm", "mp3", "flac", "aac", "opus"}
 MIN_SPEECH_SPEED = 0.25
@@ -117,7 +120,7 @@ async def _handle_probe_response(
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
-    if response.status in UNSUPPORTED_HTTP_STATUSES:
+    if _is_unsupported_http_status(response.status, scenario):
         _mark_unsupported_contract(
             result,
             scenario,
@@ -201,7 +204,7 @@ async def _handle_sse_response(
     if response.status != 200:
         body = await response.text()
         result.response_bytes = len(body.encode("utf-8"))
-        if response.status in UNSUPPORTED_HTTP_STATUSES:
+        if _is_unsupported_http_status(response.status, scenario):
             _mark_unsupported_contract(result, scenario, body=body)
             return
         _classify_http_failure(response.status, body, result, scenario)
@@ -238,11 +241,11 @@ async def _handle_sse_response(
                 )
                 or saw_done
             )
-            if result.status == "failed":
+            if _result_has_terminal_error(result):
                 break
-        if result.status == "failed":
+        if _result_has_terminal_error(result):
             break
-    if result.status != "failed" and buffer.strip():
+    if not _result_has_terminal_error(result) and buffer.strip():
         saw_done = (
             _merge_sse_line(
                 bytes(buffer).decode("utf-8", errors="replace").strip(),
@@ -253,7 +256,7 @@ async def _handle_sse_response(
             )
             or saw_done
         )
-    if result.status == "failed":
+    if _result_has_terminal_error(result):
         result.success = False
         return
     if not scenario.expect_success:
@@ -292,7 +295,7 @@ def _merge_sse_line(
         return True
     try:
         audio_bytes, event = parse_sse_audio_event(line)
-    except (ValueError, binascii.Error) as exc:
+    except (TypeError, ValueError, binascii.Error) as exc:
         result.status = "failed"
         result.capability = "fail"
         result.error_type = exc.__class__.__name__
@@ -319,21 +322,48 @@ def _merge_sse_line(
     result.audio_bytes += len(audio_bytes)
     result.response_bytes += len(audio_bytes)
     audio = event.get("audio") if isinstance(event, dict) else None
+    if not isinstance(audio, dict):
+        _mark_protocol_error(
+            result,
+            status="invalid_sse_response",
+            error=f"SSE audio event has invalid audio metadata: {event}",
+        )
+        return False
+    audio_format = audio.get("format")
+    if audio_format is None:
+        audio_format = scenario.payload.get("response_format", "")
+    if not isinstance(audio_format, str):
+        _mark_protocol_error(
+            result,
+            status="invalid_sse_response",
+            error=f"SSE audio.format must be a string: {event}",
+        )
+        return False
+    mime_type = audio.get("mime_type")
+    if mime_type is not None and not isinstance(mime_type, str):
+        _mark_protocol_error(
+            result,
+            status="invalid_sse_response",
+            error=f"SSE audio.mime_type must be a string when present: {event}",
+        )
+        return False
+    sample_rate = audio.get("sample_rate", 24000)
+    if (
+        not isinstance(sample_rate, int)
+        or isinstance(sample_rate, bool)
+        or sample_rate <= 0
+    ):
+        _mark_protocol_error(
+            result,
+            status="invalid_sse_response",
+            error=f"SSE audio.sample_rate must be a positive integer: {event}",
+        )
+        return False
     result.audio_duration_s += duration_from_audio_bytes(
         audio_bytes,
-        content_type=(
-            (audio or {}).get("mime_type") if isinstance(audio, dict) else None
-        ),
-        response_format=(
-            (audio or {}).get("format")
-            if isinstance(audio, dict)
-            else str(scenario.payload.get("response_format", ""))
-        ),
-        sample_rate=(
-            (audio or {}).get("sample_rate", 24000)
-            if isinstance(audio, dict)
-            else 24000
-        ),
+        content_type=mime_type,
+        response_format=audio_format,
+        sample_rate=sample_rate,
     )
     return False
 
@@ -355,6 +385,12 @@ def _mark_unexpected_success(result: ScenarioResult, scenario: Scenario) -> None
     result.error = (
         f"scenario {scenario.id} expected an error but received HTTP "
         f"{result.http_status}"
+    )
+
+
+def _result_has_terminal_error(result: ScenarioResult) -> bool:
+    return result.error_class is not None or (
+        result.status not in {"error", "ok"} and not result.success
     )
 
 
@@ -390,14 +426,14 @@ def _classify_http_failure(
 ) -> None:
     result.success = False
     result.error = body
-    if _is_unsupported_http_status(status, scenario):
-        _mark_unsupported_contract(result, scenario, body=body)
-        return
     if scenario.capability_key == "voices.delete" and not scenario.expect_success:
         if _is_valid_missing_voice_delete_response(status, body):
             result.status = "expected_error"
             result.error_class = "expected_client_error"
             result.capability = "pass"
+            return
+        if _is_unsupported_http_status(status, scenario):
+            _mark_unsupported_contract(result, scenario, body=body)
             return
         result.status = "invalid_voice_response"
         result.error_class = "protocol_error"
@@ -407,16 +443,7 @@ def _classify_http_failure(
             f"success=false and error details; received status={status}, body={body}"
         )
         return
-    if 500 <= status:
-        result.status = "failed"
-        result.error_class = "server_error"
-        result.capability = "fail"
-        return
-    if (
-        400 <= status < 500
-        and not scenario.expect_success
-        and scenario.expected_status_class == "client_error"
-    ):
+    if 400 <= status < 500 and _is_expected_client_error_scenario(scenario):
         if not _is_valid_error_response(body):
             _mark_protocol_error(
                 result,
@@ -430,6 +457,14 @@ def _classify_http_failure(
         result.status = "expected_error"
         result.error_class = "expected_client_error"
         result.capability = "pass"
+        return
+    if _is_unsupported_http_status(status, scenario):
+        _mark_unsupported_contract(result, scenario, body=body)
+        return
+    if 500 <= status:
+        result.status = "failed"
+        result.error_class = "server_error"
+        result.capability = "fail"
         return
     result.status = "failed"
     result.error_class = "http_error"
@@ -477,7 +512,15 @@ def _is_unsupported_http_status(status: int, scenario: Scenario) -> bool:
         return False
     if scenario.capability_key == "voices.delete" and not scenario.expect_success:
         return status != 404
+    if _is_expected_client_error_scenario(scenario):
+        return False
     return True
+
+
+def _is_expected_client_error_scenario(scenario: Scenario) -> bool:
+    return (
+        not scenario.expect_success and scenario.expected_status_class == "client_error"
+    )
 
 
 def _request_body(
@@ -501,6 +544,10 @@ def _synthetic_upload_bytes(scenario: Scenario) -> bytes:
     if upload_case == "corrupt_audio":
         return _pad_bytes(b"not-a-valid-audio-upload", scenario.upload_size_bytes)
     upload_format = str(scenario.planned_metadata.get("upload_format", "wav"))
+    if upload_case in {"near_limit", "cache_eviction"}:
+        return get_near_limit_voice_upload_fixture(
+            upload_format, scenario.upload_size_bytes
+        )
     if upload_case == "format" and upload_format != "wav":
         return get_voice_upload_fixture(upload_format)
     return _synthetic_audio_bytes(scenario.upload_size_bytes, upload_format)

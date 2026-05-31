@@ -111,3 +111,142 @@ def get_voice_upload_fixture(upload_format: str) -> bytes:
             f"unknown voice upload fixture format: {upload_format}"
         ) from exc
     return gzip.decompress(base64.b64decode(encoded))
+
+
+@lru_cache(maxsize=None)
+def get_near_limit_voice_upload_fixture(upload_format: str, size: int) -> bytes:
+    if size <= 0:
+        return b""
+    if upload_format == "wav":
+        return _wav_with_junk_padding(size)
+    data = get_voice_upload_fixture(upload_format)
+    if size < len(data):
+        raise ValueError(
+            f"near-limit size {size} is smaller than {upload_format} fixture"
+        )
+    if upload_format in {"mp3", "aac"}:
+        return _id3_padded(data, size)
+    if upload_format == "flac":
+        return _flac_padded(data, size)
+    if upload_format == "mp4":
+        return _mp4_padded(data, size)
+    if upload_format == "webm":
+        return _webm_padded(data, size)
+    if upload_format == "ogg":
+        return _right_padded(data, size)
+    raise ValueError(f"unknown voice upload fixture format: {upload_format}")
+
+
+def _id3_padded(data: bytes, size: int) -> bytes:
+    padding_size = size - len(data) - 10
+    if padding_size < 0:
+        raise ValueError("ID3 padding target is too small")
+    return b"ID3\x04\x00\x00" + _synchsafe(padding_size) + b"\0" * padding_size + data
+
+
+def _synchsafe(value: int) -> bytes:
+    if value < 0 or value >= 1 << 28:
+        raise ValueError(f"ID3 synchsafe value out of range: {value}")
+    return bytes(
+        (
+            (value >> 21) & 0x7F,
+            (value >> 14) & 0x7F,
+            (value >> 7) & 0x7F,
+            value & 0x7F,
+        )
+    )
+
+
+def _flac_padded(data: bytes, size: int) -> bytes:
+    if not data.startswith(b"fLaC"):
+        raise ValueError("FLAC fixture does not start with fLaC marker")
+    pos = 4
+    out = bytearray(data[:4])
+    while True:
+        if pos + 4 > len(data):
+            raise ValueError("FLAC fixture ended before metadata completed")
+        header = data[pos]
+        block_type = header & 0x7F
+        block_len = int.from_bytes(data[pos + 1 : pos + 4], "big")
+        block_start = pos + 4
+        block_end = block_start + block_len
+        if block_end > len(data):
+            raise ValueError("FLAC metadata block exceeds fixture size")
+        block = data[block_start:block_end]
+        pos = block_end
+        if header & 0x80:
+            out.append(block_type)
+            out.extend(block_len.to_bytes(3, "big"))
+            out.extend(block)
+            break
+        out.append(header)
+        out.extend(block_len.to_bytes(3, "big"))
+        out.extend(block)
+    frames = data[pos:]
+    padding_size = size - len(out) - 4 - len(frames)
+    if padding_size < 0 or padding_size >= 1 << 24:
+        raise ValueError(f"FLAC padding size out of range: {padding_size}")
+    out.append(0x81)
+    out.extend(padding_size.to_bytes(3, "big"))
+    out.extend(b"\0" * padding_size)
+    out.extend(frames)
+    return bytes(out)
+
+
+def _mp4_padded(data: bytes, size: int) -> bytes:
+    if len(data) < 8:
+        raise ValueError("MP4 fixture is too small")
+    first_box_size = int.from_bytes(data[:4], "big")
+    if first_box_size < 8 or first_box_size > len(data):
+        raise ValueError("MP4 fixture has invalid first box size")
+    padding_size = size - len(data) - 8
+    if padding_size < 0:
+        raise ValueError("MP4 padding target is too small")
+    free_box = (padding_size + 8).to_bytes(4, "big") + b"free" + b"\0" * padding_size
+    return data[:first_box_size] + free_box + data[first_box_size:]
+
+
+def _webm_padded(data: bytes, size: int) -> bytes:
+    padding_size = size - len(data) - 9
+    if padding_size < 0 or padding_size >= 1 << 56:
+        raise ValueError(f"WebM padding size out of range: {padding_size}")
+    return data + b"\xEC\x01" + padding_size.to_bytes(7, "big") + b"\0" * padding_size
+
+
+def _wav_with_junk_padding(size: int) -> bytes:
+    payload_size = min(4096, max(size - 44, 0))
+    junk_size = size - 44 - payload_size - 8
+    if junk_size < 0:
+        return _wav_header(payload_size)[:size]
+    return (
+        _wav_header(payload_size, riff_size=size - 8)
+        + b"\0" * payload_size
+        + b"JUNK"
+        + junk_size.to_bytes(4, "little")
+        + b"\0" * junk_size
+    )
+
+
+def _wav_header(payload_size: int, *, riff_size: int | None = None) -> bytes:
+    return (
+        b"RIFF"
+        + ((36 + payload_size) if riff_size is None else riff_size).to_bytes(
+            4, "little"
+        )
+        + b"WAVEfmt "
+        + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")
+        + (1).to_bytes(2, "little")
+        + (24000).to_bytes(4, "little")
+        + (48000).to_bytes(4, "little")
+        + (2).to_bytes(2, "little")
+        + (16).to_bytes(2, "little")
+        + b"data"
+        + payload_size.to_bytes(4, "little")
+    )
+
+
+def _right_padded(data: bytes, size: int) -> bytes:
+    if size <= len(data):
+        return data[:size]
+    return data + b"\0" * (size - len(data))

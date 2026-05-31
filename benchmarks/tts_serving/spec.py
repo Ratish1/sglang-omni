@@ -466,7 +466,7 @@ def _validate_voice_speaker_cap_stages(
     default_enabled_endpoints: tuple[str, ...],
     default_voice_speaker_cap_count: int,
 ) -> None:
-    default_count_has_stage = False
+    default_count_stage_ids: list[str] = []
     for stage in stages:
         voice_speaker_cap_count = _effective_voice_speaker_cap_count(
             stage,
@@ -476,7 +476,7 @@ def _validate_voice_speaker_cap_stages(
         if not voice_speaker_cap_count:
             continue
         if not stage.voice_speaker_cap_count:
-            default_count_has_stage = True
+            default_count_stage_ids.append(stage.id)
         endpoints = stage.enabled_endpoints or default_enabled_endpoints
         if endpoints != ("voices",):
             raise SpecError(
@@ -488,10 +488,11 @@ def _validate_voice_speaker_cap_stages(
             raise SpecError("voice_speaker_cap_count stages must use max_concurrency=1")
         if stage.request_count != 2:
             raise SpecError("voice_speaker_cap_count stages must use request_count=2")
-    if default_voice_speaker_cap_count and not default_count_has_stage:
+    if default_voice_speaker_cap_count and len(default_count_stage_ids) != 1:
         raise SpecError(
-            "params.voice_speaker_cap_count requires a dedicated load stage with "
-            "enabled_endpoints ['voices']; prefer stage-level voice_speaker_cap_count"
+            "params.voice_speaker_cap_count requires exactly one dedicated load "
+            "stage with enabled_endpoints ['voices']; prefer stage-level "
+            "voice_speaker_cap_count when multiple voices stages exist"
         )
 
 

@@ -117,8 +117,6 @@ python -m benchmarks.eval.benchmark_tts_serving \
 # SPEAKER_MAX_UPLOADED, then requires the first overflow upload to fail.
 # voice_speaker_cap_count is the sequence's internal upload-attempt budget,
 # not the outer load-stage request count.
-# Missing just-under-10MB upload coverage for accepted non-WAV formats marks
-# the coverage contract invalid when the regular voice upload matrix is enabled.
 # Cross-model voice cache invalidation is outside the single base_url/model_name
 # PR1 harness shape and needs a later multi-target benchmark spec.
 
