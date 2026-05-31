@@ -7,7 +7,7 @@ import aiohttp
 import pytest
 from aiohttp import web
 
-from benchmarks.eval.benchmark_tts_serving import _run_benchmark
+from benchmarks.eval.benchmark_tts_serving import _planned_offsets, _run_benchmark
 from benchmarks.tts_serving.http_client import _handle_binary_response
 from benchmarks.tts_serving.metrics import ScenarioResult
 from benchmarks.tts_serving.report import build_results_report
@@ -79,6 +79,20 @@ def _wav_bytes(payload_size: int = 16) -> bytes:
     )
 
 
+def _audio_response_for_format(response_format: str) -> tuple[bytes, str]:
+    if response_format == "pcm":
+        return b"\0" * 64, "application/octet-stream"
+    if response_format == "mp3":
+        return b"ID3" + b"\0" * 64, "audio/mpeg"
+    if response_format == "flac":
+        return b"fLaC" + b"\0" * 64, "audio/flac"
+    if response_format == "opus":
+        return b"OggS" + b"\0" * 64, "audio/ogg"
+    if response_format == "aac":
+        return b"\xff\xf1" + b"\0" * 64, "audio/aac"
+    return _wav_bytes(), "audio/wav"
+
+
 async def _start_app(app: web.Application) -> tuple[web.AppRunner, str]:
     runner = web.AppRunner(app)
     await runner.setup()
@@ -127,6 +141,33 @@ def test_spec_parses_explicit_load_stages() -> None:
     assert spec.params.load_stages[0].start_request_rate == 2.0
     assert spec.params.load_stages[0].request_rate == 64.0
     assert spec.params.max_concurrency == 128
+
+
+def test_ramp_stage_uses_seeded_poisson_arrivals() -> None:
+    spec = _spec(
+        {
+            "load_stages": [
+                {
+                    "id": "ramp-128",
+                    "mode": "ramp",
+                    "request_count": 8,
+                    "max_concurrency": 128,
+                    "start_request_rate": 2,
+                    "request_rate": 64,
+                    "arrival_distribution": "poisson",
+                },
+            ],
+        }
+    )
+    stage = spec.params.load_stages[0]
+
+    poisson_offsets = _planned_offsets(stage, 8, seed=601)
+    repeated_offsets = _planned_offsets(stage, 8, seed=601)
+    other_seed_offsets = _planned_offsets(stage, 8, seed=602)
+
+    assert poisson_offsets == repeated_offsets
+    assert poisson_offsets != other_seed_offsets
+    assert poisson_offsets != sorted(index / stage.request_rate for index in range(8))
 
 
 def test_spec_rejects_invalid_load_stage() -> None:
@@ -249,7 +290,7 @@ def test_report_includes_tail_stage_endpoint_and_error_taxonomy() -> None:
             stage_id="burst",
             load_mode="burst",
             load_concurrency=2,
-            status="missing",
+            status="missing_contract",
             success=False,
             latency_s=0.4,
             actual_start_s=10.1,
@@ -257,8 +298,8 @@ def test_report_includes_tail_stage_endpoint_and_error_taxonomy() -> None:
             queue_wait_s=0.1,
             http_status=404,
             http_status_class="4xx",
-            error_class="http_error",
-            capability="missing",
+            error_class="missing_contract",
+            capability="fail",
         ),
     ]
 
@@ -266,13 +307,16 @@ def test_report_includes_tail_stage_endpoint_and_error_taxonomy() -> None:
 
     assert report["schema_version"] == 2
     assert report["scenario_set_hash"] == scenario_set_hash(scenarios)
-    assert report["overall"]["passed"] is True
+    assert report["overall"]["passed"] is False
     assert report["metrics"]["latency_s"]["p99"] == 0.4
     assert report["metrics"]["latency_s"]["p99_9"] == 0.4
     assert report["metrics"]["by_stage"]["burst"]["achieved_rps"] is not None
-    assert report["metrics"]["by_endpoint"]["batch"]["status_counts"]["missing"] == 1
-    assert report["metrics"]["error_class_counts"]["http_error"] == 1
-    assert report["operation_capabilities"]["batch.create"] == "missing"
+    assert (
+        report["metrics"]["by_endpoint"]["batch"]["status_counts"]["missing_contract"]
+        == 1
+    )
+    assert report["metrics"]["error_class_counts"]["missing_contract"] == 1
+    assert report["operation_capabilities"]["batch.create"] == "fail"
 
 
 def test_report_marks_endpoint_partial_when_operations_are_mixed() -> None:
@@ -329,7 +373,8 @@ def test_http_batch_success_requires_batch_result_schema() -> None:
     response = _FakeResponse(
         status=200,
         body=(
-            b'{"results": [{"status": "ok", "audio_data": "abc"}], '
+            b'{"results": [{"index": 0, "status": "ok", '
+            b'"audio_data": "abc", "media_type": "audio/wav"}], '
             b'"total": 1, "succeeded": 1, "failed": 0}'
         ),
         headers={"Content-Type": "application/json"},
@@ -366,7 +411,7 @@ def test_http_batch_wrong_item_count_is_protocol_error() -> None:
     assert result.capability == "fail"
 
 
-def test_http_optional_success_404_is_missing() -> None:
+def test_http_enabled_endpoint_404_is_missing_contract() -> None:
     scenario = Scenario(
         id="batch-missing",
         endpoint="batch",
@@ -380,8 +425,9 @@ def test_http_optional_success_404_is_missing() -> None:
 
     asyncio.run(_handle_binary_response(response, result, scenario))
 
-    assert result.status == "missing"
-    assert result.capability == "missing"
+    assert result.status == "missing_contract"
+    assert result.error_class == "missing_contract"
+    assert result.capability == "fail"
 
 
 def test_http_expected_voice_delete_404_is_expected_error() -> None:
@@ -510,6 +556,24 @@ def test_websocket_expected_error_does_not_fail_endpoint_capability() -> None:
     assert result.capability == "pass"
 
 
+def test_websocket_audio_done_with_error_false_is_valid() -> None:
+    result = ScenarioResult(
+        scenario_id="ws-normal",
+        endpoint="websocket",
+        category="websocket",
+    )
+
+    event_type = _merge_text_event(
+        '{"type": "audio.done", "sentence_index": 0, '
+        '"total_bytes": 1024, "error": false}',
+        result,
+    )
+
+    assert event_type == "audio.done"
+    assert result.status == "ok"
+    assert result.capability == "pass"
+
+
 def test_websocket_audio_event_without_data_is_protocol_error() -> None:
     result = ScenarioResult(
         scenario_id="ws-normal",
@@ -556,10 +620,24 @@ async def test_websocket_script_exercises_stateful_sequence() -> None:
                 payload = msg.json()
                 received.append(payload)
                 if payload.get("type") == "input.done":
-                    await ws.send_json({"type": "audio.start"})
+                    await ws.send_json(
+                        {
+                            "type": "audio.start",
+                            "sentence_index": 0,
+                            "format": "pcm",
+                            "sample_rate": 24000,
+                        }
+                    )
                     await ws.send_bytes(b"pcm")
-                    await ws.send_json({"type": "audio.done"})
-                    await ws.send_json({"type": "session.done"})
+                    await ws.send_json(
+                        {
+                            "type": "audio.done",
+                            "sentence_index": 0,
+                            "total_bytes": 3,
+                            "error": False,
+                        }
+                    )
+                    await ws.send_json({"type": "session.done", "total_sentences": 1})
         return ws
 
     app = web.Application()
@@ -677,7 +755,10 @@ async def test_runner_burst_stage_records_queue_wait_with_fake_server() -> None:
             or payload.get("ref_audio")
         ):
             return web.json_response({"error": "bad request"}, status=400)
-        return web.Response(body=_wav_bytes(), content_type="audio/wav")
+        body, content_type = _audio_response_for_format(
+            payload.get("response_format", "wav")
+        )
+        return web.Response(body=body, content_type=content_type)
 
     app = web.Application()
     app.router.add_post("/v1/audio/speech", handle_speech)
