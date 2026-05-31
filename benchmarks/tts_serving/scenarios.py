@@ -172,6 +172,8 @@ def _build_stage_scenarios(spec: BenchmarkSpec, stage: LoadStage) -> list[Scenar
     rng = random.Random(f"{spec.seed}:{stage.id}")
     endpoint_set = set(stage.enabled_endpoints or spec.params.enabled_endpoints)
     required_scenarios = _required_stage_scenarios(spec, stage, endpoint_set)
+    if _stage_voice_speaker_cap_count(spec, stage):
+        return required_scenarios
     scenarios = required_scenarios[: stage.request_count]
     if any(scenario.method == "VOICE_SPEAKER_CAP_SEQUENCE" for scenario in scenarios):
         return scenarios

@@ -230,6 +230,21 @@ class BenchmarkParams:
             concurrency_levels=concurrency_levels,
             request_rate=request_rate,
         )
+        voice_cache_eviction_count = _nonnegative_int(
+            obj,
+            "voice_cache_eviction_count",
+            cls.voice_cache_eviction_count,
+        )
+        voice_speaker_cap_count = _nonnegative_int(
+            obj,
+            "voice_speaker_cap_count",
+            cls.voice_speaker_cap_count,
+        )
+        _validate_voice_speaker_cap_stages(
+            load_stages,
+            default_enabled_endpoints=enabled,
+            default_voice_speaker_cap_count=voice_speaker_cap_count,
+        )
 
         return cls(
             profile=profile,
@@ -246,16 +261,8 @@ class BenchmarkParams:
             enabled_endpoints=enabled,
             seedtts_ref_audio=_optional_str(obj, "seedtts_ref_audio"),
             seedtts_ref_text=_optional_str(obj, "seedtts_ref_text"),
-            voice_cache_eviction_count=_nonnegative_int(
-                obj,
-                "voice_cache_eviction_count",
-                cls.voice_cache_eviction_count,
-            ),
-            voice_speaker_cap_count=_nonnegative_int(
-                obj,
-                "voice_speaker_cap_count",
-                cls.voice_speaker_cap_count,
-            ),
+            voice_cache_eviction_count=voice_cache_eviction_count,
+            voice_speaker_cap_count=voice_speaker_cap_count,
             provider_label=_optional_str(obj, "provider_label"),
             implementation_label=_optional_str(obj, "implementation_label"),
         )
@@ -451,3 +458,44 @@ def _validate_unique_stage_ids(stages: tuple[LoadStage, ...]) -> None:
         if stage.id in seen:
             raise SpecError(f"duplicate params.load_stages[].id: {stage.id}")
         seen.add(stage.id)
+
+
+def _validate_voice_speaker_cap_stages(
+    stages: tuple[LoadStage, ...],
+    *,
+    default_enabled_endpoints: tuple[str, ...],
+    default_voice_speaker_cap_count: int,
+) -> None:
+    for stage in stages:
+        voice_speaker_cap_count = _effective_voice_speaker_cap_count(
+            stage,
+            default_enabled_endpoints=default_enabled_endpoints,
+            default_voice_speaker_cap_count=default_voice_speaker_cap_count,
+        )
+        if not voice_speaker_cap_count:
+            continue
+        endpoints = stage.enabled_endpoints or default_enabled_endpoints
+        if endpoints != ("voices",):
+            raise SpecError(
+                "voice_speaker_cap_count stages must enable only ['voices']"
+            )
+        if stage.mode != "closed_loop":
+            raise SpecError("voice_speaker_cap_count stages must use closed_loop mode")
+        if stage.max_concurrency != 1:
+            raise SpecError("voice_speaker_cap_count stages must use max_concurrency=1")
+        if stage.request_count != 2:
+            raise SpecError("voice_speaker_cap_count stages must use request_count=2")
+
+
+def _effective_voice_speaker_cap_count(
+    stage: LoadStage,
+    *,
+    default_enabled_endpoints: tuple[str, ...],
+    default_voice_speaker_cap_count: int,
+) -> int:
+    if stage.voice_speaker_cap_count:
+        return stage.voice_speaker_cap_count
+    endpoints = stage.enabled_endpoints or default_enabled_endpoints
+    if endpoints == ("voices",):
+        return default_voice_speaker_cap_count
+    return 0

@@ -958,6 +958,7 @@ async def _fill_speaker_cap(
 ) -> bool:
     for cap_index in range(upload_count):
         voice_name = f"{voice_name_prefix}_{cap_index:04d}"
+        created_voice_names.append(voice_name)
         if not await _upload_expected_speaker_cap_voice(
             session,
             upload_url,
@@ -966,7 +967,6 @@ async def _fill_speaker_cap(
             voice_name=voice_name,
         ):
             return False
-        created_voice_names.append(voice_name)
     return True
 
 
@@ -1028,7 +1028,7 @@ async def _expect_speaker_cap_rejection(
         )
         result.error_class = "unexpected_success"
         return False
-    if 400 <= status < 500:
+    if status == 400:
         if not _is_valid_error_response(body_text):
             _mark_protocol_error(
                 result,
@@ -1040,6 +1040,16 @@ async def _expect_speaker_cap_rejection(
             )
             return False
         return True
+    if 400 <= status < 500:
+        _mark_protocol_error(
+            result,
+            status="invalid_error_response",
+            error=(
+                "speaker cap overflow must return HTTP 400 with structured error "
+                f"JSON, got HTTP {status}: {body_text}"
+            ),
+        )
+        return False
 
     result.status = "failed"
     result.success = False
