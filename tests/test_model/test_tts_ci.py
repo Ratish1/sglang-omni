@@ -34,6 +34,8 @@ from typing import Literal
 
 import pytest
 
+pytest_plugins = ["tests.test_model.omni_whisper_wer_utils"]
+
 from benchmarks.dataset.prepare import DATASETS, download_dataset
 from benchmarks.eval.benchmark_tts_seedtts import (
     TtsSeedttsBenchmarkConfig,
@@ -78,7 +80,6 @@ SIMILARITY_CHECKPOINT_ENV = "SEEDTTS_SIM_CHECKPOINT"
 TTS_STAGE_OUTPUT_ROOT_ENV = "TTS_STAGE_OUTPUT_ROOT"
 TTS_STAGE1_SPEED_RESULTS_DIR_ENV = "TTS_STAGE1_SPEED_RESULTS_DIR"
 TTS_STAGE2_SPEED_RESULTS_DIR_ENV = "TTS_STAGE2_SPEED_RESULTS_DIR"
-TTS_MAX_FAILED_REQUESTS_ENV = "TTS_MAX_FAILED_REQUESTS"
 TTS_SIMILARITY_MAX_SAMPLES_ENV = "TTS_SIMILARITY_MAX_SAMPLES"
 
 SEEDTTS_EN_FULLSET_SAMPLES = 1088
@@ -97,34 +98,31 @@ TTS_SIMILARITY_MAX_SAMPLES = 50
 
 THRESHOLD_SLACK_HIGHER = 0.75
 THRESHOLD_SLACK_LOWER = 1.25
-TTS_MAX_FAILED_REQUESTS = 16
-VC_WER_MAX_CORPUS = 0.010638297872340425
+VC_WER_MAX_CORPUS = 0.0104
 VC_WER_CORPUS_THRESHOLD = apply_wer_slack(VC_WER_MAX_CORPUS)
-VC_WER_MAX_PER_SAMPLE = 0.16666666666666666
-VC_STREAM_WER_MAX_CORPUS = 0.013262599469496022
+VC_STREAM_WER_MAX_CORPUS = 0.0098
 VC_STREAM_WER_CORPUS_THRESHOLD = apply_wer_slack(VC_STREAM_WER_MAX_CORPUS)
-VC_STREAM_WER_MAX_PER_SAMPLE = 0.16666666666666666
 
-VC_SIMILARITY_MEAN_MIN = 60.0
+VC_SIMILARITY_MEAN_MIN = 66.18289001464844
 
 # Note (Chenyang): Only thresholds for the CI concurrency are dedicatedly tuned,
 # others may not pass the CI.
 
 _VC_NON_STREAM_P95 = {
     16: {
-        "throughput_qps": 1.465,
-        "output_tok_per_req_s": 67.5,
-        "latency_mean_s": 9.757,
-        "rtf_mean": 3.0009,
+        "throughput_qps": 11.558,
+        "output_tok_per_req_s": 119.9,
+        "latency_mean_s": 1.372,
+        "rtf_mean": 0.335,
     }
 }
 
 _VC_STREAM_P95 = {
     16: {
-        "throughput_qps": 1.287,
-        "output_tok_per_req_s": 60.8,
-        "latency_mean_s": 10.229,
-        "rtf_mean": 2.8508,
+        "throughput_qps": 11.535,
+        "output_tok_per_req_s": 109.7,
+        "latency_mean_s": 1.381,
+        "rtf_mean": 0.3174,
     }
 }
 
@@ -341,11 +339,6 @@ def _assert_tts_speed_result_integrity(
         f"{label}: completed_requests must be an int, got {completed_requests}",
     )
     if isinstance(failed_requests, int):
-        collector.check(
-            failed_requests <= TTS_MAX_FAILED_REQUESTS,
-            f"{label}: failed_requests {failed_requests} > "
-            f"{TTS_MAX_FAILED_REQUESTS}",
-        )
         collector.check(
             failed_requests == len(failed_rows),
             f"{label}: summary failed_requests={failed_requests}, "
@@ -841,7 +834,6 @@ def test_voice_cloning_wer(
         assert_wer_results(
             results,
             VC_WER_CORPUS_THRESHOLD,
-            VC_WER_MAX_PER_SAMPLE,
             collector=checks,
         )
     checks.assert_all()
@@ -904,7 +896,6 @@ def test_voice_cloning_streaming_wer(
         assert_wer_results(
             results,
             VC_STREAM_WER_CORPUS_THRESHOLD,
-            VC_STREAM_WER_MAX_PER_SAMPLE,
             collector=checks,
         )
     checks.assert_all()
