@@ -89,12 +89,18 @@ python -m benchmarks.eval.benchmark_tts_serving \
     --spec /etc/benchmark/spec.json \
     --out /var/benchmark/out
 
-# Example stress spec params:
+# Example staged stress spec params:
 # {
 #   "profile": "stress",
-#   "total_requests": 600,
-#   "concurrency_levels": [1, 4, 8, 16, 32, 64, 128],
-#   "request_rate": "inf"
+#   "enabled_endpoints": ["speech", "speech_sse", "voices", "batch", "websocket"],
+#   "allow_missing_optional_endpoints": true,
+#   "load_stages": [
+#     {"id": "closed-1", "mode": "closed_loop", "request_count": 32, "max_concurrency": 1},
+#     {"id": "closed-16", "mode": "closed_loop", "request_count": 128, "max_concurrency": 16},
+#     {"id": "ramp-128", "mode": "ramp", "request_count": 256, "max_concurrency": 128,
+#      "start_request_rate": 2, "request_rate": 64},
+#     {"id": "burst-128", "mode": "burst", "request_count": 256, "max_concurrency": 128}
+#   ]
 # }
 
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
