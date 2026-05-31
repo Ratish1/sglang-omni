@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import json
 import time
 
@@ -15,14 +13,6 @@ from benchmarks.tts_serving.metrics import ScenarioResult, finish_timing
 from benchmarks.tts_serving.scenarios import Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
 
-WS_AUDIO_EVENT_TYPES = {
-    "audio",
-    "audio.delta",
-    "audio.speech.chunk",
-    "output_audio.delta",
-    "response.audio.delta",
-    "speech.audio.delta",
-}
 WS_CONTROL_EVENT_TYPES = {
     "session.created",
     "session.updated",
@@ -74,6 +64,7 @@ async def run_ws_scenario(
             result.error = str(exc)
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         result.status = "transport_error"
+        result.capability = "fail"
         result.error_type = exc.__class__.__name__
         result.error_class = "transport_error"
         result.error = str(exc)
@@ -142,7 +133,11 @@ async def _expect_next_event(
                 f"received binary audio while expecting {expected_event}",
             )
             return False
+        if result.ws_active_sentence_index is None:
+            _mark_ws_protocol_error(result, "received binary audio before audio.start")
+            return False
         result.audio_bytes += len(msg.data)
+        result.ws_active_sentence_bytes += len(msg.data)
         result.response_bytes += len(msg.data)
         result.status = "ok"
         result.success = True
@@ -209,27 +204,18 @@ def _merge_text_event(
     if event_type in WS_CONTROL_EVENT_TYPES:
         return event_type
 
-    audio = event.get("audio")
-    if event_type in WS_AUDIO_EVENT_TYPES or isinstance(audio, (dict, str)):
-        if isinstance(audio, dict) and isinstance(audio.get("data"), str):
-            audio_len = _encoded_audio_len(audio["data"])
-            result.audio_bytes += audio_len
-            result.response_bytes += audio_len
-        elif isinstance(audio, str):
-            audio_len = _encoded_audio_len(audio)
-            result.audio_bytes += audio_len
-            result.response_bytes += audio_len
-        else:
-            _mark_ws_protocol_error(result, f"audio event missing audio data: {data}")
-            return "audio"
-        result.status = "ok"
-        result.success = True
-        result.capability = "pass"
-        return "audio"
     if event_type == "audio.start":
         if not _is_valid_audio_start(event):
             _mark_ws_protocol_error(result, f"invalid audio.start event: {data}")
             return event_type
+        if result.ws_active_sentence_index is not None:
+            _mark_ws_protocol_error(
+                result,
+                "received audio.start before the previous sentence completed",
+            )
+            return event_type
+        result.ws_active_sentence_index = event["sentence_index"]
+        result.ws_active_sentence_bytes = 0
         result.status = "ok"
         result.capability = "pass"
         return event_type
@@ -243,6 +229,21 @@ def _merge_text_event(
             result.error_class = "server_error_event"
             result.error = data
             return "error"
+        if event["sentence_index"] != result.ws_active_sentence_index:
+            _mark_ws_protocol_error(
+                result,
+                "audio.done sentence_index does not match active sentence",
+            )
+            return event_type
+        if event["total_bytes"] != result.ws_active_sentence_bytes:
+            _mark_ws_protocol_error(
+                result,
+                "audio.done total_bytes does not match received binary audio bytes",
+            )
+            return event_type
+        result.ws_completed_sentences += 1
+        result.ws_active_sentence_index = None
+        result.ws_active_sentence_bytes = 0
         result.status = "ok"
         result.capability = "pass"
         return event_type
@@ -250,19 +251,24 @@ def _merge_text_event(
         if not _is_valid_session_done(event):
             _mark_ws_protocol_error(result, f"invalid session.done event: {data}")
             return event_type
+        if result.ws_active_sentence_index is not None:
+            _mark_ws_protocol_error(
+                result,
+                "session.done arrived before active sentence completed",
+            )
+            return event_type
+        if event["total_sentences"] != result.ws_completed_sentences:
+            _mark_ws_protocol_error(
+                result,
+                "session.done total_sentences does not match completed sentences",
+            )
+            return event_type
         result.status = "ok"
         result.capability = "pass"
         return event_type
 
     _mark_ws_protocol_error(result, f"unexpected WebSocket event: {data}")
     return event_type
-
-
-def _encoded_audio_len(value: str) -> int:
-    try:
-        return len(base64.b64decode(value, validate=True))
-    except binascii.Error:
-        return len(value)
 
 
 def _is_ws_error_event(event_type: str) -> bool:
@@ -273,10 +279,12 @@ def _is_valid_audio_start(event: dict) -> bool:
     return (
         isinstance(event.get("sentence_index"), int)
         and event["sentence_index"] >= 0
+        and isinstance(event.get("sentence_text"), str)
+        and bool(event["sentence_text"])
         and isinstance(event.get("format"), str)
-        and bool(event["format"])
+        and event["format"] == "pcm"
         and isinstance(event.get("sample_rate"), int)
-        and event["sample_rate"] > 0
+        and event["sample_rate"] == 24000
     )
 
 
@@ -390,11 +398,14 @@ def _default_script(spec: BenchmarkSpec) -> list[dict]:
                 "model": spec.model_name,
                 "voice": "default",
                 "response_format": "pcm",
-                "stream_audio": True,
+                "stream_audio": False,
                 "split_granularity": "sentence",
             },
         },
         {"action": "send_json", "payload": {"type": "input.text", "text": "Hello."}},
         {"action": "send_json", "payload": {"type": "input.done"}},
+        {"action": "expect", "event": "audio.start"},
         {"action": "expect", "event": "audio"},
+        {"action": "expect", "event": "audio.done"},
+        {"action": "expect", "event": "session.done"},
     ]

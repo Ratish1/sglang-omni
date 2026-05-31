@@ -39,6 +39,7 @@ from benchmarks.tts_serving.http_client import run_http_scenario
 from benchmarks.tts_serving.metrics import ScenarioResult
 from benchmarks.tts_serving.report import build_results_report
 from benchmarks.tts_serving.scenarios import Scenario, build_scenarios
+from benchmarks.tts_serving.sdk_client import run_sdk_scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage, SpecError, load_spec
 from benchmarks.tts_serving.ws_client import run_ws_scenario
 
@@ -179,6 +180,8 @@ async def _run_one_scenario(
 ) -> ScenarioResult:
     if scenario.method == "WS":
         return await run_ws_scenario(session, spec, scenario)
+    if scenario.method == "SDK":
+        return await run_sdk_scenario(spec, scenario)
     return await run_http_scenario(session, spec, scenario)
 
 

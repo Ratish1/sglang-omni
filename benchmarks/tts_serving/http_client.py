@@ -86,6 +86,7 @@ async def run_http_scenario(
                     )
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         result.status = "transport_error"
+        result.capability = "fail"
         result.error_type = exc.__class__.__name__
         result.error_class = "transport_error"
         result.error = str(exc)
@@ -410,20 +411,46 @@ def _request_body(scenario: Scenario) -> aiohttp.FormData:
     if scenario.upload_field:
         form.add_field(
             scenario.upload_field,
-            _synthetic_audio_bytes(scenario.upload_size_bytes),
+            _synthetic_upload_bytes(scenario),
             filename=scenario.upload_filename or "audio.wav",
             content_type=scenario.upload_content_type or "audio/wav",
         )
     return form
 
 
-def _synthetic_audio_bytes(size: int) -> bytes:
+def _synthetic_upload_bytes(scenario: Scenario) -> bytes:
+    upload_case = str(scenario.planned_metadata.get("upload_case", "format"))
+    if upload_case == "corrupt_audio":
+        return _pad_bytes(b"not-a-valid-audio-upload", scenario.upload_size_bytes)
+    upload_format = str(scenario.planned_metadata.get("upload_format", "wav"))
+    return _synthetic_audio_bytes(scenario.upload_size_bytes, upload_format)
+
+
+def _synthetic_audio_bytes(size: int, upload_format: str = "wav") -> bytes:
     if size <= 0:
         return b""
+    if upload_format == "mp3":
+        return _pad_bytes(b"ID3", size)
+    if upload_format == "flac":
+        return _pad_bytes(b"fLaC", size)
+    if upload_format == "ogg":
+        return _pad_bytes(b"OggS", size)
+    if upload_format == "aac":
+        return _pad_bytes(b"\xff\xf1", size)
+    if upload_format == "webm":
+        return _pad_bytes(b"\x1a\x45\xdf\xa3", size)
+    if upload_format == "mp4":
+        return _pad_bytes(b"\x00\x00\x00\x18ftypmp42", size)
     if size < 44:
         return _wav_header(0)[:size]
     payload_size = size - 44
     return _wav_header(payload_size) + b"\0" * payload_size
+
+
+def _pad_bytes(prefix: bytes, size: int) -> bytes:
+    if size <= len(prefix):
+        return prefix[:size]
+    return prefix + (b"\0" * (size - len(prefix)))
 
 
 def _wav_header(payload_size: int) -> bytes:
@@ -575,18 +602,16 @@ def _handle_voice_success(
         result.error_type = exc.__class__.__name__
         return
     if scenario.capability_key == "voices.list":
-        voices = _voice_list_items(payload)
-        if voices is not None and all(
-            _is_valid_voice_metadata(item) for item in voices
-        ):
+        if _is_valid_voice_list_response(payload):
             _mark_success(result, capability="pass")
             return
         _mark_protocol_error(
             result,
             status="invalid_voice_response",
             error=(
-                "voice list response must be a list or object with voices/data list "
-                "whose items include voice metadata"
+                "voice list response must be an object with voices and "
+                "uploaded_voices; uploaded entries require name, consent, "
+                "created_at, file_size, and mime_type"
             ),
         )
         return
@@ -625,19 +650,41 @@ def _is_valid_batch_item(item: Any, *, expected_index: int) -> bool:
     return False
 
 
-def _voice_list_items(payload: Any) -> list[Any] | None:
-    if isinstance(payload, list):
-        return payload
+def _is_valid_voice_list_response(payload: Any) -> bool:
     if not isinstance(payload, dict):
-        return None
-    voices = payload.get("voices", payload.get("data"))
-    return voices if isinstance(voices, list) else None
+        return False
+    voices = payload.get("voices")
+    uploaded_voices = payload.get("uploaded_voices")
+    if not isinstance(voices, list) or not isinstance(uploaded_voices, list):
+        return False
+    return all(_is_valid_preset_voice(item) for item in voices) and all(
+        _is_valid_uploaded_voice_metadata(item) for item in uploaded_voices
+    )
 
 
-def _is_valid_voice_metadata(item: Any) -> bool:
+def _is_valid_preset_voice(item: Any) -> bool:
+    if isinstance(item, str):
+        return bool(item)
     return isinstance(item, dict) and any(
-        isinstance(item.get(key), str) and item[key]
-        for key in ("id", "voice_id", "name")
+        isinstance(item.get(key), str) and item[key] for key in ("name", "voice", "id")
+    )
+
+
+def _is_valid_uploaded_voice_metadata(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    required = ("name", "consent", "created_at", "file_size", "mime_type")
+    return (
+        all(key in item for key in required)
+        and isinstance(item["name"], str)
+        and bool(item["name"])
+        and isinstance(item["consent"], bool)
+        and isinstance(item["created_at"], str)
+        and bool(item["created_at"])
+        and isinstance(item["file_size"], int)
+        and item["file_size"] >= 0
+        and isinstance(item["mime_type"], str)
+        and bool(item["mime_type"])
     )
 
 
