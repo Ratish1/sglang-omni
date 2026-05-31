@@ -112,8 +112,13 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #      "max_concurrency": 256}
 #   ]
 # }
+# Voice speaker-cap stages run as a state-aware sequence: the harness lists
+# existing uploaded voices first, uploads only the names needed to reach
+# SPEAKER_MAX_UPLOADED, then requires the first overflow upload to fail.
 # Missing just-under-10MB upload coverage for accepted non-WAV formats is
 # reported as a benchmark coverage gap until valid fixtures are added.
+# Cross-model voice cache invalidation is outside the single base_url/model_name
+# PR1 harness shape and needs a later multi-target benchmark spec.
 
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
 python -m benchmarks.eval.benchmark_omni_seedtts \

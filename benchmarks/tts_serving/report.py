@@ -338,8 +338,14 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
     speaker_cap_cases = sum(
         1
         for scenario in scenarios
-        if scenario.capability_key == "voices.upload"
-        and scenario.planned_metadata.get("upload_case") == "speaker_cap"
+        if scenario.capability_key in {"voices.upload", "voices.speaker_cap"}
+        and scenario.planned_metadata.get("upload_case")
+        in {"speaker_cap", "speaker_cap_sequence"}
+    )
+    speaker_cap_attempts = sum(
+        _speaker_cap_attempt_count(scenario)
+        for scenario in scenarios
+        if scenario.capability_key in {"voices.upload", "voices.speaker_cap"}
     )
     configured_formats = [
         upload_format for upload_format, _ in VOICE_UPLOAD_SUCCESS_FORMATS
@@ -355,6 +361,7 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         "near_limit_contract_complete": not near_limit_missing_formats,
         "cache_eviction_formats": sorted(cache_eviction_formats),
         "speaker_cap_cases": speaker_cap_cases,
+        "speaker_cap_attempts": speaker_cap_attempts,
         "near_limit_pr1_gap": (
             (
                 "Valid just-under-10MB fixtures are currently generated only for WAV; "
@@ -365,6 +372,15 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
             else None
         ),
     }
+
+
+def _speaker_cap_attempt_count(scenario: Scenario) -> int:
+    if scenario.planned_metadata.get("upload_case") == "speaker_cap":
+        return 1
+    if scenario.planned_metadata.get("upload_case") == "speaker_cap_sequence":
+        attempt_count = scenario.planned_metadata.get("attempt_count")
+        return attempt_count if isinstance(attempt_count, int) else 0
+    return 0
 
 
 def _coverage_failures(

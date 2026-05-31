@@ -21,12 +21,14 @@ from benchmarks.tts_serving.metrics import (
     finish_timing,
     parse_sse_audio_event,
 )
-from benchmarks.tts_serving.scenarios import Scenario
+from benchmarks.tts_serving.scenarios import SPEAKER_MAX_UPLOADED, Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
 from benchmarks.tts_serving.urls import api_url
 from benchmarks.tts_serving.voice_upload_fixtures import get_voice_upload_fixture
 
 AUDIO_RESPONSE_FORMATS = {"wav", "pcm", "mp3", "flac", "aac", "opus"}
+MIN_SPEECH_SPEED = 0.25
+MAX_SPEECH_SPEED = 4.0
 UNSUPPORTED_HTTP_STATUSES = {404, 405, 501}
 SUCCESS_BATCH_STATUSES = {"ok", "success", "succeeded"}
 FAILED_BATCH_STATUSES = {"error", "failed"}
@@ -70,6 +72,8 @@ async def run_http_scenario(
             await _run_voice_overwrite(session, spec, scenario, result)
         elif scenario.method == "VOICE_UPLOAD_DELETE_RACE":
             await _run_voice_upload_delete_race(session, spec, scenario, result)
+        elif scenario.method == "VOICE_SPEAKER_CAP_SEQUENCE":
+            await _run_voice_speaker_cap_sequence(session, spec, scenario, result)
         elif scenario.method == "GET":
             async with session.get(url) as response:
                 await _handle_probe_response(response, result, scenario)
@@ -548,14 +552,38 @@ def _wav_header(payload_size: int) -> bytes:
 
 def _request_size(scenario: Scenario) -> int:
     if scenario.body_type == "multipart":
-        return (
-            sum(len(key) + len(value) for key, value in scenario.form_fields.items())
-            + scenario.upload_size_bytes
-        )
+        return _voice_request_size(scenario, form_fields=scenario.form_fields)
     try:
         return len(json.dumps(scenario.payload, ensure_ascii=False).encode("utf-8"))
     except TypeError:
         return 0
+
+
+def _voice_request_size(
+    scenario: Scenario,
+    *,
+    form_fields: Mapping[str, str],
+) -> int:
+    return (
+        sum(len(key) + len(value) for key, value in form_fields.items())
+        + scenario.upload_size_bytes
+    )
+
+
+def _speaker_cap_form_fields(
+    scenario: Scenario,
+    voice_name: str,
+) -> dict[str, str]:
+    form_fields = dict(scenario.form_fields)
+    form_fields["name"] = voice_name
+    return form_fields
+
+
+def _metadata_positive_int(scenario: Scenario, key: str) -> int | None:
+    value = scenario.planned_metadata.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
 
 
 async def _run_voice_lifecycle(
@@ -769,6 +797,257 @@ async def _run_voice_upload_delete_race(
     _mark_success(result, capability="pass")
 
 
+async def _run_voice_speaker_cap_sequence(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+) -> None:
+    sequence_config = _speaker_cap_sequence_config(scenario, result)
+    if sequence_config is None:
+        return
+    attempt_count, voice_name_prefix = sequence_config
+
+    upload_url = api_url(spec.base_url, scenario.path)
+    created_voice_names: list[str] = []
+    try:
+        uploaded_voices = await _speaker_cap_uploaded_voices_after_stale_cleanup(
+            session,
+            spec,
+            scenario,
+            result,
+            voice_name_prefix=voice_name_prefix,
+        )
+        if uploaded_voices is None:
+            return
+
+        remaining_before_cap = max(SPEAKER_MAX_UPLOADED - len(uploaded_voices), 0)
+        if not _speaker_cap_attempts_cross_cap(
+            result,
+            uploaded_count=len(uploaded_voices),
+            attempt_count=attempt_count,
+            remaining_before_cap=remaining_before_cap,
+        ):
+            return
+
+        if not await _fill_speaker_cap(
+            session,
+            upload_url,
+            scenario,
+            result,
+            voice_name_prefix=voice_name_prefix,
+            upload_count=remaining_before_cap,
+            created_voice_names=created_voice_names,
+        ):
+            return
+        overflow_name = f"{voice_name_prefix}_overflow"
+        if not await _expect_speaker_cap_rejection(
+            session,
+            upload_url,
+            scenario,
+            result,
+            voice_name=overflow_name,
+        ):
+            return
+        _mark_success(result, capability="pass")
+    finally:
+        cleanup_error = await _cleanup_voice_names(
+            session,
+            spec,
+            created_voice_names,
+        )
+        if cleanup_error is not None:
+            _mark_cleanup_error_if_primary_path_passed(result, cleanup_error)
+
+
+def _speaker_cap_sequence_config(
+    scenario: Scenario,
+    result: ScenarioResult,
+) -> tuple[int, str] | None:
+    attempt_count = _metadata_positive_int(scenario, "attempt_count")
+    if attempt_count is None:
+        _mark_protocol_error(
+            result,
+            status="invalid_benchmark_scenario",
+            error="speaker cap sequence requires positive integer attempt_count",
+        )
+        return None
+    voice_name_prefix = str(scenario.planned_metadata.get("voice_name_prefix", ""))
+    if not voice_name_prefix:
+        _mark_protocol_error(
+            result,
+            status="invalid_benchmark_scenario",
+            error="speaker cap sequence requires voice_name_prefix",
+        )
+        return None
+    return attempt_count, voice_name_prefix
+
+
+async def _speaker_cap_uploaded_voices_after_stale_cleanup(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    voice_name_prefix: str,
+) -> list[dict[str, Any]] | None:
+    uploaded_voices = await _get_uploaded_voices(session, spec, scenario, result)
+    if uploaded_voices is None:
+        return None
+
+    stale_voice_names = _uploaded_voice_names_with_prefix(
+        uploaded_voices,
+        voice_name_prefix,
+    )
+    cleanup_error = await _cleanup_voice_names(session, spec, stale_voice_names)
+    if cleanup_error is not None:
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=cleanup_error,
+        )
+        return None
+    if not stale_voice_names:
+        return uploaded_voices
+    return await _get_uploaded_voices(session, spec, scenario, result)
+
+
+def _mark_cleanup_error_if_primary_path_passed(
+    result: ScenarioResult,
+    cleanup_error: str,
+) -> None:
+    if result.error_class is None:
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=cleanup_error,
+        )
+
+
+def _speaker_cap_attempts_cross_cap(
+    result: ScenarioResult,
+    *,
+    uploaded_count: int,
+    attempt_count: int,
+    remaining_before_cap: int,
+) -> bool:
+    if attempt_count > remaining_before_cap:
+        return True
+    _mark_protocol_error(
+        result,
+        status="invalid_benchmark_scenario",
+        error=(
+            "speaker cap sequence did not include enough upload attempts to "
+            f"cross the cap (uploaded={uploaded_count}, cap={SPEAKER_MAX_UPLOADED}, "
+            f"attempts={attempt_count})"
+        ),
+    )
+    return False
+
+
+async def _fill_speaker_cap(
+    session: aiohttp.ClientSession,
+    upload_url: str,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    voice_name_prefix: str,
+    upload_count: int,
+    created_voice_names: list[str],
+) -> bool:
+    for cap_index in range(upload_count):
+        voice_name = f"{voice_name_prefix}_{cap_index:04d}"
+        if not await _upload_expected_speaker_cap_voice(
+            session,
+            upload_url,
+            scenario,
+            result,
+            voice_name=voice_name,
+        ):
+            return False
+        created_voice_names.append(voice_name)
+    return True
+
+
+async def _upload_expected_speaker_cap_voice(
+    session: aiohttp.ClientSession,
+    upload_url: str,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    voice_name: str,
+) -> bool:
+    form_fields = _speaker_cap_form_fields(scenario, voice_name)
+    result.request_bytes += _voice_request_size(scenario, form_fields=form_fields)
+    payload = await _post_voice_upload(
+        session,
+        upload_url,
+        scenario,
+        result,
+        form_fields=form_fields,
+    )
+    if payload is None:
+        return False
+    return _require_voice_upload_identifier(
+        payload,
+        result,
+        error=f"speaker cap upload response must include an identifier for {voice_name!r}",
+    )
+
+
+async def _expect_speaker_cap_rejection(
+    session: aiohttp.ClientSession,
+    upload_url: str,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    voice_name: str,
+) -> bool:
+    form_fields = _speaker_cap_form_fields(scenario, voice_name)
+    body = _request_body(scenario, form_fields=form_fields)
+    result.request_bytes += _voice_request_size(scenario, form_fields=form_fields)
+    status, response_body, headers = await _raw_post(session, upload_url, body)
+    result.http_status = status
+    result.http_status_class = classify_http_status(status)
+    result.response_headers = headers
+    result.response_bytes += len(response_body)
+    body_text = response_body.decode("utf-8", errors="replace")
+
+    if status in UNSUPPORTED_HTTP_STATUSES:
+        _mark_unsupported_contract(result, scenario, body=body_text)
+        return False
+    if 200 <= status < 300:
+        _mark_protocol_error(
+            result,
+            status="unexpected_success",
+            error=(
+                "speaker cap overflow upload unexpectedly succeeded after "
+                f"{SPEAKER_MAX_UPLOADED} uploaded voices"
+            ),
+        )
+        result.error_class = "unexpected_success"
+        return False
+    if 400 <= status < 500:
+        if not _is_valid_error_response(body_text):
+            _mark_protocol_error(
+                result,
+                status="invalid_error_response",
+                error=(
+                    "speaker cap overflow returned HTTP "
+                    f"{status} without structured error JSON: {body_text}"
+                ),
+            )
+            return False
+        return True
+
+    result.status = "failed"
+    result.success = False
+    result.error_class = "server_error" if status >= 500 else "http_error"
+    result.capability = "fail"
+    result.error = body_text
+    return False
+
+
 async def _post_voice_upload(
     session: aiohttp.ClientSession,
     upload_url: str,
@@ -962,6 +1241,29 @@ async def _get_voice_list(
     )
 
 
+async def _get_uploaded_voices(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+) -> list[dict[str, Any]] | None:
+    voice_list = await _get_voice_list(session, spec, scenario, result)
+    if voice_list is None:
+        return None
+    if not _is_valid_voice_list_response(voice_list):
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=(
+                "voice list response must be an object with voices and "
+                "uploaded_voices before speaker cap validation"
+            ),
+        )
+        return None
+    uploaded_voices = voice_list["uploaded_voices"]
+    return [voice for voice in uploaded_voices if isinstance(voice, dict)]
+
+
 async def _delete_voice_by_name(
     session: aiohttp.ClientSession,
     spec: BenchmarkSpec,
@@ -999,6 +1301,28 @@ async def _delete_voice_by_name(
             )
             return False
     return True
+
+
+async def _cleanup_voice_names(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    voice_names: list[str],
+) -> str | None:
+    for voice_name in reversed(voice_names):
+        delete_url = api_url(spec.base_url, f"/v1/audio/voices/{voice_name}")
+        try:
+            status, body, _ = await _raw_delete(session, delete_url)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            return f"speaker cap cleanup failed for {voice_name!r}: {exc}"
+        body_text = body.decode("utf-8", errors="replace")
+        if status == 404:
+            continue
+        if not 200 <= status < 300 or not _is_valid_voice_delete_success(body):
+            return (
+                f"speaker cap cleanup failed for {voice_name!r}: "
+                f"status={status}, body={body_text}"
+            )
+    return None
 
 
 def _scenario_response_format(scenario: Scenario) -> str | None:
@@ -1145,7 +1469,10 @@ def _is_expected_batch_item_failure(item: Any) -> bool:
         return True
     speed = item.get("speed")
     return speed is not None and (
-        isinstance(speed, bool) or not isinstance(speed, (int, float)) or speed <= 0
+        isinstance(speed, bool)
+        or not isinstance(speed, (int, float))
+        or speed < MIN_SPEECH_SPEED
+        or speed > MAX_SPEECH_SPEED
     )
 
 
@@ -1349,6 +1676,18 @@ def _uploaded_voice_entries(payload: dict[str, Any], voice_name: str) -> list[di
         for item in uploaded_voices
         if isinstance(item, dict) and item.get("name") == voice_name
     ]
+
+
+def _uploaded_voice_names_with_prefix(
+    uploaded_voices: list[dict[str, Any]],
+    voice_name_prefix: str,
+) -> list[str]:
+    names: list[str] = []
+    for voice in uploaded_voices:
+        name = voice.get("name")
+        if isinstance(name, str) and name.startswith(voice_name_prefix):
+            names.append(name)
+    return names
 
 
 def _is_valid_voice_delete_success(body: bytes) -> bool:

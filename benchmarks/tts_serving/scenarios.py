@@ -171,9 +171,10 @@ def scenario_set_hash(scenarios: list[Scenario]) -> str:
 def _build_stage_scenarios(spec: BenchmarkSpec, stage: LoadStage) -> list[Scenario]:
     rng = random.Random(f"{spec.seed}:{stage.id}")
     endpoint_set = set(stage.enabled_endpoints or spec.params.enabled_endpoints)
-    scenarios = _required_stage_scenarios(spec, stage, endpoint_set)[
-        : stage.request_count
-    ]
+    required_scenarios = _required_stage_scenarios(spec, stage, endpoint_set)
+    scenarios = required_scenarios[: stage.request_count]
+    if any(scenario.method == "VOICE_SPEAKER_CAP_SEQUENCE" for scenario in scenarios):
+        return scenarios
     for index in range(len(scenarios), stage.request_count):
         scenarios.append(
             _weighted_scenario(
@@ -921,6 +922,18 @@ def _required_voice_scenarios(
     *,
     start_index: int,
 ) -> list[Scenario]:
+    voice_speaker_cap_count = _stage_voice_speaker_cap_count(spec, stage)
+    if voice_speaker_cap_count:
+        return [
+            _voices_list(start_index, spec, stage),
+            _voice_speaker_cap_sequence(
+                start_index + 1,
+                spec,
+                stage,
+                attempt_count=voice_speaker_cap_count,
+            ),
+        ]
+
     scenarios: list[Scenario] = [
         _voices_list(start_index, spec, stage),
     ]
@@ -1006,29 +1019,6 @@ def _required_voice_scenarios(
             )
         )
     next_index += voice_cache_eviction_count
-    successful_uploads = sum(
-        1
-        for scenario in scenarios
-        if scenario.capability_key in {"voices.upload", "voices.lifecycle"}
-        and scenario.expect_success
-    )
-    speaker_cap_successes_remaining = max(SPEAKER_MAX_UPLOADED - successful_uploads, 0)
-    voice_speaker_cap_count = _stage_voice_speaker_cap_count(spec, stage)
-    for cap_index in range(voice_speaker_cap_count):
-        expect_success = cap_index < speaker_cap_successes_remaining
-        scenarios.append(
-            _voice_upload(
-                next_index + cap_index,
-                spec,
-                stage,
-                upload_size=VOICE_SMALL_UPLOAD_BYTES,
-                upload_format="wav",
-                content_type="audio/wav",
-                case="speaker_cap",
-                expect_success=expect_success,
-                expected_status_class="success" if expect_success else "client_error",
-            )
-        )
     return scenarios
 
 
@@ -1117,6 +1107,48 @@ def _voice_delete(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario
         expected_status_class="client_error",
         description="delete missing voice should return a controlled error",
         planned_metadata={"voice_name": name},
+    )
+
+
+def _voice_speaker_cap_sequence(
+    index: int,
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+    *,
+    attempt_count: int,
+) -> Scenario:
+    run_scope = hashlib.sha256(
+        f"{spec.run_id or ''}:{spec.seed}:{stage.id}:{index}".encode("utf-8")
+    ).hexdigest()[:8]
+    name_prefix = f"bench_voice_speaker_cap_{stage.id}_{run_scope}_{index:05d}"
+    return Scenario(
+        id=_scenario_id(stage, "voices_speaker_cap", index),
+        endpoint="voices",
+        category="voices",
+        stage_id=stage.id,
+        capability_key="voices.speaker_cap",
+        method="VOICE_SPEAKER_CAP_SEQUENCE",
+        path="/v1/audio/voices",
+        body_type="multipart",
+        form_fields={
+            "name": name_prefix,
+            "consent": "true",
+            "ref_text": "Voice speaker cap benchmark reference text.",
+            "speaker_description": "Synthetic benchmark voice used for speaker cap checks.",
+        },
+        upload_field="audio_sample",
+        upload_filename=f"{name_prefix}.wav",
+        upload_content_type="audio/wav",
+        upload_size_bytes=VOICE_SMALL_UPLOAD_BYTES,
+        description="state-aware upload sequence that proves the speaker cap boundary",
+        planned_metadata={
+            "upload_case": "speaker_cap_sequence",
+            "upload_format": "wav",
+            "upload_size_bytes": VOICE_SMALL_UPLOAD_BYTES,
+            "voice_name_prefix": name_prefix,
+            "attempt_count": attempt_count,
+            "speaker_max_uploaded": SPEAKER_MAX_UPLOADED,
+        },
     )
 
 
