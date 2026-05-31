@@ -254,6 +254,8 @@ def _required_stage_scenarios(
             for offset, size in enumerate(BATCH_SIZES)
         ]
         next_index += len(batch_scenarios)
+        batch_scenarios.append(_batch_item_overrides(next_index, spec, stage))
+        next_index += 1
         batch_scenarios.append(
             _batch_request(
                 next_index,
@@ -724,6 +726,75 @@ def _batch_request(
         expected_status_class=expected_status_class,
         description=f"batch speech request with {batch_size} items",
         planned_metadata={"batch_size": batch_size},
+    )
+
+
+def _batch_item_overrides(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    items: list[dict[str, Any]] = [
+        {
+            "input": "Default batch item should inherit the top-level voice and speed.",
+            "response_format": "wav",
+        },
+        {
+            "input": "Esta frase valida el idioma por elemento dentro del lote.",
+            "language": "Spanish",
+            "response_format": "pcm",
+        },
+        {
+            "input": "A slow item should not change neighboring batch items.",
+            "speed": 0.25,
+            "response_format": "wav",
+        },
+        {
+            "input": "A fast item should remain isolated to this index.",
+            "speed": 4.0,
+            "response_format": "pcm",
+        },
+        {
+            "input": "Reference conditioning inside a batch item.",
+            "task_type": "Base",
+            "references": [
+                {"audio_path": _reference_audio(spec), "text": _reference_text(spec)}
+            ],
+            "response_format": "wav",
+        },
+        {
+            "input": "Please design a calm and precise voice for this item.",
+            "task_type": "VoiceDesign",
+            "instructions": VOICE_DESIGN_INSTRUCTIONS,
+            "response_format": "wav",
+        },
+        {
+            "input": "Use a named preset voice for this one item.",
+            "task_type": "CustomVoice",
+            "voice": "Vivian",
+            "response_format": "pcm",
+        },
+        {"input": "", "response_format": "bogus"},
+    ]
+    payload = {
+        "model": spec.model_name,
+        "voice": "default",
+        "response_format": "wav",
+        "speed": 1.0,
+        "items": items,
+    }
+    return Scenario(
+        id=_scenario_id(stage, "batch_item_overrides", index),
+        endpoint="batch",
+        category="batch",
+        stage_id=stage.id,
+        capability_key="batch.create",
+        path="/v1/audio/speech/batch",
+        payload=payload,
+        description="batch speech request with per-item overrides and one bad item",
+        planned_metadata={
+            "batch_size": len(items),
+            "batch_case": "item_overrides",
+            "expected_item_failures": [len(items) - 1],
+        },
     )
 
 

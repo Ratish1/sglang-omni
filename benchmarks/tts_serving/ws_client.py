@@ -12,6 +12,7 @@ import aiohttp
 from benchmarks.tts_serving.metrics import ScenarioResult, finish_timing
 from benchmarks.tts_serving.scenarios import Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
+from benchmarks.tts_serving.urls import api_url, websocket_url
 
 WS_CONTROL_EVENT_TYPES = {
     "session.created",
@@ -34,7 +35,7 @@ async def run_ws_scenario(
         expected_success=scenario.expect_success,
         response_format="pcm",
     )
-    url = _ws_url(spec.base_url, scenario.path)
+    url = websocket_url(spec.base_url, scenario.path)
     start = time.perf_counter()
     try:
         async with session.ws_connect(url) as ws:
@@ -240,21 +241,28 @@ def _merge_text_event(
     try:
         event = json.loads(data)
     except json.JSONDecodeError as exc:
-        result.status = "failed" if expect_success else "expected_error"
-        result.capability = "fail" if expect_success else "pass"
+        result.status = "failed"
+        result.capability = "fail"
         result.error_type = exc.__class__.__name__
         result.error_class = "protocol_error"
         result.error = f"malformed WebSocket JSON event: {exc}"
         return "error"
     if not isinstance(event, dict):
-        result.status = "failed" if expect_success else "expected_error"
-        result.capability = "fail" if expect_success else "pass"
+        result.status = "failed"
+        result.capability = "fail"
+        result.error_class = "protocol_error"
         result.error = "WebSocket event is not a JSON object"
         return "error"
 
     event_type = str(event.get("type", ""))
     _record_ws_event(result, event_type or "text")
     if _is_ws_error_event(event_type):
+        if not _is_valid_ws_error_event(event):
+            _mark_ws_protocol_error(
+                result,
+                f"invalid WebSocket error event: {data}",
+            )
+            return "error"
         result.status = "failed" if expect_success else "expected_error"
         result.capability = "fail" if expect_success else "pass"
         result.error_class = "server_error_event"
@@ -334,6 +342,13 @@ def _is_ws_error_event(event_type: str) -> bool:
     return event_type == "error" or event_type.endswith(".error")
 
 
+def _is_valid_ws_error_event(event: dict) -> bool:
+    return any(
+        isinstance(event.get(key), (dict, str)) and bool(event[key])
+        for key in ("error", "message", "code")
+    )
+
+
 def _is_valid_audio_start(event: dict) -> bool:
     return (
         isinstance(event.get("sentence_index"), int)
@@ -361,14 +376,6 @@ def _is_valid_session_done(event: dict) -> bool:
     return (
         isinstance(event.get("total_sentences"), int) and event["total_sentences"] >= 0
     )
-
-
-def _ws_url(base_url: str, path: str) -> str:
-    if base_url.startswith("https://"):
-        return "wss://" + base_url[len("https://") :] + path
-    if base_url.startswith("http://"):
-        return "ws://" + base_url[len("http://") :] + path
-    return base_url.rstrip("/") + path
 
 
 def _record_ws_event(result: ScenarioResult, event_type: str) -> None:
@@ -430,7 +437,7 @@ async def _probe_speech_after_disconnect(
     spec: BenchmarkSpec,
     result: ScenarioResult,
 ) -> None:
-    url = f"{spec.base_url}/v1/audio/speech"
+    url = api_url(spec.base_url, "/v1/audio/speech")
     try:
         async with session.post(
             url,

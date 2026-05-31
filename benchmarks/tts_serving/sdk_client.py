@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,11 @@ def _run_openai_speech_create(
         result.error_class = "transport_error"
         result.error = str(exc)
         return
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            with suppress(Exception):
+                close()
 
     result.response_bytes = len(body)
     if not body.startswith(b"RIFF"):

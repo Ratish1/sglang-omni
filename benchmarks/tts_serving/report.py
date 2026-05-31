@@ -10,6 +10,7 @@ from typing import Any
 from benchmarks.tts_serving.metrics import ScenarioResult
 from benchmarks.tts_serving.scenarios import (
     SCENARIO_SCHEMA_VERSION,
+    VOICE_UPLOAD_SUCCESS_FORMATS,
     Scenario,
     scenario_set_hash,
 )
@@ -39,6 +40,9 @@ def build_results_report(
     ttfas = [r.ttfa_s for r in results if r.ttfa_s is not None]
     rtfs = [r.rtf for r in results if r.rtf > 0]
     queue_waits = [r.queue_wait_s for r in results if r.queue_wait_s is not None]
+    generator_lags = [
+        r.generator_lag_s for r in results if r.generator_lag_s is not None
+    ]
     passed = harness_status == "ok" and _is_benchmark_passed(
         spec, results, capabilities
     )
@@ -84,6 +88,7 @@ def build_results_report(
                 spec.params.allow_missing_optional_endpoints
             ),
             "voice_cache_pressure_count": spec.params.voice_cache_pressure_count,
+            "voice_upload_coverage": _voice_upload_coverage(scenarios or []),
             "load_stages": [stage.to_json() for stage in spec.params.load_stages],
         },
         "capabilities": capabilities,
@@ -92,6 +97,11 @@ def build_results_report(
             "latency_s": _summary(latencies),
             "ttfa_s": _summary(ttfas),
             "queue_wait_s": _summary(queue_waits),
+            "generator_lag_s": _summary(generator_lags),
+            "peak_inflight": max(
+                (result.peak_inflight for result in results if result.peak_inflight),
+                default=None,
+            ),
             "rtf": _summary(rtfs),
             "rtf_sampled_formats": ["wav", "pcm"],
             "rtf_unsupported_format_counts": _rtf_unsupported_format_counts(results),
@@ -271,6 +281,34 @@ def _by_concurrency(
     return summaries
 
 
+def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
+    successful_formats = {
+        str(scenario.planned_metadata.get("upload_format"))
+        for scenario in scenarios
+        if scenario.capability_key == "voices.upload"
+        and scenario.expect_success
+        and scenario.planned_metadata.get("upload_case") == "format"
+    }
+    near_limit_formats = {
+        str(scenario.planned_metadata.get("upload_format"))
+        for scenario in scenarios
+        if scenario.capability_key == "voices.upload"
+        and scenario.planned_metadata.get("upload_case") == "near_limit"
+    }
+    return {
+        "accepted_format_cases": sorted(successful_formats),
+        "configured_accepted_formats": [
+            upload_format for upload_format, _ in VOICE_UPLOAD_SUCCESS_FORMATS
+        ],
+        "near_limit_formats": sorted(near_limit_formats),
+        "near_limit_note": (
+            "Near-limit upload pressure uses WAV because the benchmark generates "
+            "valid large audio bytes locally; compact embedded fixtures cover "
+            "non-WAV accepted formats without inflating the repository."
+        ),
+    }
+
+
 def _result_group_summary(
     spec: BenchmarkSpec, results: list[ScenarioResult]
 ) -> dict[str, Any]:
@@ -279,6 +317,11 @@ def _result_group_summary(
     rtfs = [result.rtf for result in results if result.rtf > 0]
     queue_waits = [
         result.queue_wait_s for result in results if result.queue_wait_s is not None
+    ]
+    generator_lags = [
+        result.generator_lag_s
+        for result in results
+        if result.generator_lag_s is not None
     ]
     planned_starts = [
         result.planned_start_s
@@ -309,6 +352,17 @@ def _result_group_summary(
         "failed": failed,
         "wall_time_s": wall_time_s,
         "planned_window_s": planned_window_s,
+        "configured_max_concurrency": sorted(
+            {
+                result.configured_max_concurrency
+                for result in results
+                if result.configured_max_concurrency is not None
+            }
+        ),
+        "peak_inflight": max(
+            (result.peak_inflight for result in results if result.peak_inflight),
+            default=None,
+        ),
         "offered_rps": (
             len(results) / planned_window_s
             if planned_window_s and planned_window_s > 0
@@ -320,6 +374,7 @@ def _result_group_summary(
         "latency_s": _summary(latencies),
         "ttfa_s": _summary(ttfas),
         "queue_wait_s": _summary(queue_waits),
+        "generator_lag_s": _summary(generator_lags),
         "rtf": _summary(rtfs),
         "status_counts": dict(Counter(result.status for result in results)),
         "http_status_counts": dict(

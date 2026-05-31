@@ -23,12 +23,22 @@ from benchmarks.tts_serving.metrics import (
 )
 from benchmarks.tts_serving.scenarios import Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
+from benchmarks.tts_serving.urls import api_url
 from benchmarks.tts_serving.voice_upload_fixtures import get_voice_upload_fixture
 
 AUDIO_RESPONSE_FORMATS = {"wav", "pcm", "mp3", "flac", "aac", "opus"}
 OPTIONAL_ENDPOINTS = {"voices", "batch", "websocket"}
 SUCCESS_BATCH_STATUSES = {"ok", "success", "succeeded"}
 FAILED_BATCH_STATUSES = {"error", "failed"}
+VALID_BATCH_TASK_TYPES = {"Base", "CustomVoice", "VoiceDesign"}
+EXPECTED_BATCH_MEDIA_TYPES = {
+    "wav": {"audio/wav", "audio/x-wav", "application/octet-stream", ""},
+    "pcm": {"application/octet-stream", "audio/pcm", "audio/raw"},
+    "mp3": {"audio/mpeg", "audio/mp3"},
+    "flac": {"audio/flac"},
+    "aac": {"audio/aac", "audio/aacp"},
+    "opus": {"audio/opus", "audio/ogg"},
+}
 
 
 async def run_http_scenario(
@@ -45,7 +55,7 @@ async def run_http_scenario(
         response_format=_scenario_response_format(scenario),
         batch_size=scenario.planned_metadata.get("batch_size"),
     )
-    url = f"{spec.base_url}{scenario.path}"
+    url = api_url(spec.base_url, scenario.path)
     start = time.perf_counter()
     try:
         if scenario.method == "VOICE_LIFECYCLE":
@@ -571,7 +581,7 @@ async def _run_voice_lifecycle(
     *,
     allow_missing: bool,
 ) -> None:
-    upload_url = f"{spec.base_url}{scenario.path}"
+    upload_url = api_url(spec.base_url, scenario.path)
     body = _request_body(scenario)
     result.request_bytes = _request_size(scenario)
     async with session.post(upload_url, data=body) as upload_response:
@@ -601,7 +611,7 @@ async def _run_voice_lifecycle(
             return
 
     voice_name = str(scenario.planned_metadata.get("voice_name", ""))
-    delete_url = f"{spec.base_url}/v1/audio/voices/{voice_name}"
+    delete_url = api_url(spec.base_url, f"/v1/audio/voices/{voice_name}")
     async with session.delete(delete_url) as delete_response:
         result.http_status = delete_response.status
         result.http_status_class = classify_http_status(delete_response.status)
@@ -699,39 +709,42 @@ def _handle_batch_success(
             error="batch endpoint succeeded + failed does not equal total",
         )
         return
-    expected_item_failures = sum(
-        1
-        for item in scenario.payload.get("items", [])
-        if not isinstance(item, dict)
-        or not isinstance(item.get("input"), str)
-        or not item.get("input", "").strip()
-        or item.get("response_format") == "bogus"
-    )
-    if failed < expected_item_failures:
+    expected_item_failures = _expected_batch_item_failures(scenario)
+    expected_failed = len(expected_item_failures)
+    if failed != expected_failed or succeeded != total - expected_failed:
         _mark_protocol_error(
             result,
             status="invalid_batch_response",
             error=(
-                "batch endpoint did not report expected item-level failures "
-                f"(expected_at_least={expected_item_failures}, failed={failed})"
+                "batch endpoint did not report the exact expected item-level "
+                f"outcome counts (expected_succeeded={total - expected_failed}, "
+                f"succeeded={succeeded}, expected_failed={expected_failed}, "
+                f"failed={failed})"
             ),
         )
         return
     observed_success = 0
     observed_failed = 0
     for index, item in enumerate(results):
-        if not _is_valid_batch_item(item, expected_index=index):
+        expect_item_failure = index in expected_item_failures
+        expected_format = _expected_batch_response_format(scenario, index)
+        validation_error = _validate_batch_item(
+            item,
+            expected_index=index,
+            expected_format=expected_format,
+            expect_failure=expect_item_failure,
+        )
+        if validation_error is not None:
             _mark_protocol_error(
                 result,
                 status="invalid_batch_response",
-                error=f"batch endpoint result item has invalid schema at index {index}",
+                error=f"batch endpoint result item {index}: {validation_error}",
             )
             return
-        item_status = str(item["status"])
-        if item_status in SUCCESS_BATCH_STATUSES:
-            observed_success += 1
-        else:
+        if expect_item_failure:
             observed_failed += 1
+        else:
+            observed_success += 1
     if observed_success != succeeded or observed_failed != failed:
         _mark_protocol_error(
             result,
@@ -744,6 +757,47 @@ def _handle_batch_success(
         )
         return
     _mark_success(result, capability="pass")
+
+
+def _expected_batch_item_failures(scenario: Scenario) -> set[int]:
+    items = scenario.payload.get("items", [])
+    if not isinstance(items, list):
+        return set()
+    return {
+        index
+        for index, item in enumerate(items)
+        if _is_expected_batch_item_failure(item)
+    }
+
+
+def _is_expected_batch_item_failure(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return True
+    input_text = item.get("input")
+    if not isinstance(input_text, str) or not input_text.strip():
+        return True
+    response_format = item.get("response_format")
+    if response_format is not None and response_format not in AUDIO_RESPONSE_FORMATS:
+        return True
+    task_type = item.get("task_type")
+    if task_type is not None and task_type not in VALID_BATCH_TASK_TYPES:
+        return True
+    speed = item.get("speed")
+    return speed is not None and (
+        isinstance(speed, bool) or not isinstance(speed, (int, float)) or speed <= 0
+    )
+
+
+def _expected_batch_response_format(scenario: Scenario, index: int) -> str:
+    items = scenario.payload.get("items", [])
+    item_format = None
+    if (
+        isinstance(items, list)
+        and index < len(items)
+        and isinstance(items[index], dict)
+    ):
+        item_format = items[index].get("response_format")
+    return str(item_format or scenario.payload.get("response_format") or "wav")
 
 
 def _handle_voice_success(
@@ -786,30 +840,48 @@ def _handle_voice_success(
     _mark_success(result, capability="pass")
 
 
-def _is_valid_batch_item(item: Any, *, expected_index: int) -> bool:
+def _validate_batch_item(
+    item: Any,
+    *,
+    expected_index: int,
+    expected_format: str,
+    expect_failure: bool,
+) -> str | None:
     if not isinstance(item, dict):
-        return False
+        return "result item must be a JSON object"
     if item.get("index") != expected_index:
-        return False
+        return (
+            "index mismatch "
+            f"(expected={expected_index}, observed={item.get('index')})"
+        )
     status = item.get("status")
-    if status in SUCCESS_BATCH_STATUSES:
-        audio_data = item.get("audio_data")
-        media_type = item.get("media_type")
-        if not isinstance(audio_data, str) or not audio_data:
-            return False
-        if not isinstance(media_type, str) or not _is_valid_batch_media_type(
-            media_type
-        ):
-            return False
-        try:
-            decoded = base64.b64decode(audio_data, validate=True)
-        except binascii.Error:
-            return False
-        return bool(decoded)
-    if status in FAILED_BATCH_STATUSES:
+    if expect_failure:
+        if status not in FAILED_BATCH_STATUSES:
+            return f"expected failed status, observed={status!r}"
         error = item.get("error")
-        return isinstance(error, (dict, str)) and bool(error)
-    return False
+        if not isinstance(error, (dict, str)) or not error:
+            return "failed item must include non-empty error details"
+        return None
+    if status not in SUCCESS_BATCH_STATUSES:
+        return f"expected success status, observed={status!r}"
+    audio_data = item.get("audio_data")
+    media_type = item.get("media_type")
+    if not isinstance(audio_data, str) or not audio_data:
+        return "successful item must include non-empty base64 audio_data"
+    if not isinstance(media_type, str) or not _is_valid_batch_media_type(
+        media_type, expected_format=expected_format
+    ):
+        return (
+            "successful item media_type does not match requested format "
+            f"(format={expected_format!r}, media_type={media_type!r})"
+        )
+    try:
+        decoded = base64.b64decode(audio_data, validate=True)
+    except binascii.Error as exc:
+        return f"successful item audio_data is not valid base64: {exc}"
+    if not decoded:
+        return "successful item audio_data decoded to empty bytes"
+    return None
 
 
 def _is_valid_voice_list_response(payload: Any) -> bool:
@@ -910,21 +982,9 @@ def _is_nonnegative_file_size(value: Any) -> bool:
     return False
 
 
-def _is_valid_batch_media_type(media_type: str) -> bool:
+def _is_valid_batch_media_type(media_type: str, *, expected_format: str) -> bool:
     normalized = media_type.lower().split(";", 1)[0]
-    return normalized in {
-        "audio/wav",
-        "audio/x-wav",
-        "audio/pcm",
-        "audio/raw",
-        "audio/mpeg",
-        "audio/mp3",
-        "audio/flac",
-        "audio/aac",
-        "audio/ogg",
-        "audio/opus",
-        "application/octet-stream",
-    }
+    return normalized in EXPECTED_BATCH_MEDIA_TYPES.get(expected_format.lower(), set())
 
 
 def _mark_protocol_error(result: ScenarioResult, *, status: str, error: str) -> None:

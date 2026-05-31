@@ -26,6 +26,8 @@ class ScenarioResult:
     stage_id: str | None = None
     load_mode: str | None = None
     load_concurrency: int | None = None
+    configured_max_concurrency: int | None = None
+    peak_inflight: int | None = None
     status: str = "error"
     success: bool = False
     expected_success: bool = True
@@ -36,6 +38,7 @@ class ScenarioResult:
     actual_start_s: float | None = None
     completed_s: float | None = None
     queue_wait_s: float | None = None
+    generator_lag_s: float | None = None
     ttfa_s: float | None = None
     inter_chunk_s: list[float] = field(default_factory=list)
     audio_bytes: int = 0

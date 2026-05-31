@@ -105,22 +105,33 @@ async def _run_closed_loop_stage(
     scenario_iter = iter(scenarios)
     results: list[ScenarioResult] = []
     started = time.perf_counter()
+    active_requests = 0
+    peak_inflight = 0
 
     async def worker() -> None:
+        nonlocal active_requests, peak_inflight
         for scenario in scenario_iter:
             actual_start = time.perf_counter()
-            result = await _run_one_scenario(session, spec, scenario)
+            active_requests += 1
+            peak_inflight = max(peak_inflight, active_requests)
+            try:
+                result = await _run_one_scenario(session, spec, scenario)
+            finally:
+                active_requests -= 1
             _attach_schedule_metadata(
                 result,
                 stage=stage,
                 planned_start=actual_start,
                 actual_start=actual_start,
+                peak_inflight=peak_inflight,
             )
             results.append(result)
 
     await asyncio.gather(
         *(worker() for _ in range(min(stage.max_concurrency, len(scenarios))))
     )
+    for result in results:
+        result.peak_inflight = peak_inflight
     harness_log.append(
         f"stage={stage.id} mode={stage.mode} completed {len(results)} scenarios "
         f"at concurrency={stage.max_concurrency} in {time.perf_counter() - started:.3f}s"
@@ -137,16 +148,25 @@ async def _run_scheduled_stage(
 ) -> list[ScenarioResult]:
     stage_start = time.perf_counter()
     offsets = _planned_offsets(stage, len(scenarios), seed=spec.seed)
+    active_requests = 0
+    peak_inflight = 0
 
     async def run_planned(scenario: Scenario, offset: float) -> ScenarioResult:
+        nonlocal active_requests, peak_inflight
         planned_start = stage_start + offset
         actual_start = time.perf_counter()
-        result = await _run_one_scenario(session, spec, scenario)
+        active_requests += 1
+        peak_inflight = max(peak_inflight, active_requests)
+        try:
+            result = await _run_one_scenario(session, spec, scenario)
+        finally:
+            active_requests -= 1
         _attach_schedule_metadata(
             result,
             stage=stage,
             planned_start=planned_start,
             actual_start=actual_start,
+            generator_lag=max(0.0, actual_start - planned_start),
         )
         return result
 
@@ -165,12 +185,17 @@ async def _run_scheduled_stage(
             results.extend(task.result() for task in done)
     if pending:
         results.extend(await asyncio.gather(*pending))
+    for result in results:
+        result.peak_inflight = peak_inflight
     generator_lag_s = [
-        result.queue_wait_s for result in results if result.queue_wait_s is not None
+        result.generator_lag_s
+        for result in results
+        if result.generator_lag_s is not None
     ]
     harness_log.append(
         f"stage={stage.id} mode={stage.mode} completed {len(results)} scenarios "
-        f"at concurrency={stage.max_concurrency} in {time.perf_counter() - started:.3f}s "
+        f"with configured_max_concurrency={stage.max_concurrency} "
+        f"peak_inflight={peak_inflight} in {time.perf_counter() - started:.3f}s "
         "with scheduled arrivals emitted independently of request completions "
         f"(generator_lag_max={max(generator_lag_s, default=0.0):.6f}s)"
     )
@@ -195,13 +220,18 @@ def _attach_schedule_metadata(
     stage: LoadStage,
     planned_start: float,
     actual_start: float,
+    peak_inflight: int | None = None,
+    generator_lag: float | None = None,
 ) -> None:
     result.stage_id = stage.id
     result.load_mode = stage.mode
     result.load_concurrency = stage.max_concurrency
+    result.configured_max_concurrency = stage.max_concurrency
+    result.peak_inflight = peak_inflight
     result.planned_start_s = planned_start
     result.actual_start_s = actual_start
     result.queue_wait_s = max(0.0, actual_start - planned_start)
+    result.generator_lag_s = generator_lag
 
 
 def _planned_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list[float]:
