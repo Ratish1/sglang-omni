@@ -120,7 +120,7 @@ class BenchmarkParams:
     request_rate: float = float("inf")
     timeout_s: int = 120
     enabled_endpoints: tuple[str, ...] = DEFAULT_ENDPOINTS
-    allow_missing_optional_endpoints: bool = True
+    allow_missing_optional_endpoints: bool = False
     seedtts_ref_audio: str | None = None
     seedtts_ref_text: str | None = None
     provider_label: str | None = None

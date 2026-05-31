@@ -80,6 +80,9 @@ def build_results_report(
             ),
             "timeout_s": spec.params.timeout_s,
             "enabled_endpoints": list(spec.params.enabled_endpoints),
+            "allow_missing_optional_endpoints": (
+                spec.params.allow_missing_optional_endpoints
+            ),
             "load_stages": [stage.to_json() for stage in spec.params.load_stages],
         },
         "capabilities": capabilities,
@@ -111,7 +114,14 @@ def build_results_report(
             result.to_json() for result in results if not _result_passed(spec, result)
         ][:100],
         "missing_capabilities": [
-            result.to_json() for result in results if result.status == "missing"
+            result.to_json()
+            for result in results
+            if result.status in {"missing", "missing_contract"}
+        ],
+        "missing_contracts": [
+            result.to_json()
+            for result in results
+            if result.status == "missing_contract"
         ],
     }
 

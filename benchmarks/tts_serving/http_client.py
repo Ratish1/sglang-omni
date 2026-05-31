@@ -8,6 +8,7 @@ import binascii
 import json
 import time
 from collections.abc import Mapping
+from typing import Any
 
 import aiohttp
 
@@ -23,6 +24,8 @@ from benchmarks.tts_serving.spec import BenchmarkSpec
 
 AUDIO_RESPONSE_FORMATS = {"wav", "pcm", "mp3", "flac", "aac", "opus"}
 OPTIONAL_ENDPOINTS = {"voices", "batch", "websocket"}
+SUCCESS_BATCH_STATUSES = {"ok", "success", "succeeded"}
+FAILED_BATCH_STATUSES = {"error", "failed"}
 
 
 async def run_http_scenario(
@@ -43,10 +46,20 @@ async def run_http_scenario(
     try:
         if scenario.method == "GET":
             async with session.get(url) as response:
-                await _handle_probe_response(response, result, scenario)
+                await _handle_probe_response(
+                    response,
+                    result,
+                    scenario,
+                    allow_missing=spec.params.allow_missing_optional_endpoints,
+                )
         elif scenario.method == "DELETE":
             async with session.delete(url) as response:
-                await _handle_binary_response(response, result, scenario)
+                await _handle_binary_response(
+                    response,
+                    result,
+                    scenario,
+                    allow_missing=spec.params.allow_missing_optional_endpoints,
+                )
         else:
             body = _request_body(scenario)
             kwargs = (
@@ -57,9 +70,20 @@ async def run_http_scenario(
             result.request_bytes = _request_size(scenario)
             async with session.post(url, **kwargs) as response:
                 if scenario.endpoint == "speech_sse":
-                    await _handle_sse_response(response, result, start, scenario)
+                    await _handle_sse_response(
+                        response,
+                        result,
+                        start,
+                        scenario,
+                        allow_missing=spec.params.allow_missing_optional_endpoints,
+                    )
                 else:
-                    await _handle_binary_response(response, result, scenario)
+                    await _handle_binary_response(
+                        response,
+                        result,
+                        scenario,
+                        allow_missing=spec.params.allow_missing_optional_endpoints,
+                    )
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         result.status = "transport_error"
         result.error_type = exc.__class__.__name__
@@ -71,16 +95,22 @@ async def run_http_scenario(
 
 
 async def _handle_probe_response(
-    response: aiohttp.ClientResponse, result: ScenarioResult, scenario: Scenario
+    response: aiohttp.ClientResponse,
+    result: ScenarioResult,
+    scenario: Scenario,
+    *,
+    allow_missing: bool = False,
 ) -> None:
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
     if response.status == 404:
-        result.status = "missing"
-        result.capability = "missing"
-        result.success = False
-        result.error = await response.text()
+        _mark_missing_contract(
+            result,
+            scenario,
+            body=await response.text(),
+            allow_missing=allow_missing,
+        )
         return
     if 200 <= response.status < 300:
         body = await response.read()
@@ -98,6 +128,8 @@ async def _handle_binary_response(
     response: aiohttp.ClientResponse,
     result: ScenarioResult,
     scenario: Scenario,
+    *,
+    allow_missing: bool = False,
 ) -> None:
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
@@ -109,9 +141,12 @@ async def _handle_binary_response(
         and scenario.expect_success
         and _is_optional_endpoint(scenario)
     ):
-        result.status = "missing"
-        result.capability = "missing"
-        result.error = body.decode("utf-8", errors="replace")
+        _mark_missing_contract(
+            result,
+            scenario,
+            body=body.decode("utf-8", errors="replace"),
+            allow_missing=allow_missing,
+        )
         return
     if 200 <= response.status < 300:
         if not scenario.expect_success:
@@ -125,13 +160,15 @@ async def _handle_binary_response(
             return
         response_format = str(scenario.payload.get("response_format", ""))
         if not _is_audio_response(body, response.headers, response_format):
-            result.success = False
-            result.status = "invalid_audio_response"
-            result.error_class = "protocol_error"
-            result.error = (
-                "speech endpoint returned 2xx without an audio-like response "
-                f"(content-type={response.headers.get('Content-Type')!r}, "
-                f"bytes={len(body)})"
+            _mark_protocol_error(
+                result,
+                status="invalid_audio_response",
+                error=(
+                    "speech endpoint returned 2xx without the requested audio "
+                    f"contract (format={response_format!r}, "
+                    f"content-type={response.headers.get('Content-Type')!r}, "
+                    f"bytes={len(body)})"
+                ),
             )
             return
         result.audio_bytes = len(body)
@@ -152,6 +189,8 @@ async def _handle_sse_response(
     result: ScenarioResult,
     start: float,
     scenario: Scenario,
+    *,
+    allow_missing: bool = False,
 ) -> None:
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
@@ -164,9 +203,12 @@ async def _handle_sse_response(
             and scenario.expect_success
             and _is_optional_endpoint(scenario)
         ):
-            result.status = "missing"
-            result.capability = "missing"
-            result.error = body
+            _mark_missing_contract(
+                result,
+                scenario,
+                body=body,
+                allow_missing=allow_missing,
+            )
             return
         _classify_http_failure(response.status, body, result, scenario)
         return
@@ -199,8 +241,15 @@ async def _handle_sse_response(
     if not scenario.expect_success:
         _mark_unexpected_success(result, scenario)
         return
-    result.success = result.audio_bytes > 0
-    result.status = "ok" if result.success else "empty_stream"
+    if result.audio_bytes <= 0:
+        _mark_protocol_error(
+            result,
+            status="empty_stream",
+            error="SSE speech endpoint completed without audio bytes",
+        )
+        result.response_bytes = result.audio_bytes
+        return
+    _mark_success(result)
     result.response_bytes = result.audio_bytes
 
 
@@ -215,7 +264,9 @@ def _merge_sse_line(
         audio_bytes, event = parse_sse_audio_event(line)
     except (ValueError, binascii.Error) as exc:
         result.status = "failed"
+        result.capability = "fail"
         result.error_type = exc.__class__.__name__
+        result.error_class = "protocol_error"
         result.error = f"malformed SSE audio event: {exc}"
         return
     if event is None:
@@ -252,6 +303,7 @@ def _merge_sse_line(
 def _mark_unexpected_success(result: ScenarioResult, scenario: Scenario) -> None:
     result.success = False
     result.status = "unexpected_success"
+    result.capability = "fail"
     result.error_class = "unexpected_success"
     result.error = (
         f"scenario {scenario.id} expected an error but received HTTP "
@@ -259,11 +311,33 @@ def _mark_unexpected_success(result: ScenarioResult, scenario: Scenario) -> None
     )
 
 
-def _mark_success(result: ScenarioResult, *, capability: str | None = None) -> None:
+def _mark_success(result: ScenarioResult, *, capability: str | None = "pass") -> None:
     result.success = True
     result.status = "ok"
     if capability is not None:
         result.capability = capability
+
+
+def _mark_missing_contract(
+    result: ScenarioResult,
+    scenario: Scenario,
+    *,
+    body: str,
+    allow_missing: bool,
+) -> None:
+    result.success = False
+    result.error_class = "missing_contract"
+    result.error = (
+        "required benchmark contract is missing: "
+        f"endpoint={scenario.endpoint}, operation={scenario.capability_key}, "
+        f"path={scenario.path}, http_status={result.http_status}, body={body}"
+    )
+    if allow_missing:
+        result.status = "missing"
+        result.capability = "missing"
+        return
+    result.status = "missing_contract"
+    result.capability = "fail"
 
 
 def _classify_http_failure(
@@ -290,7 +364,7 @@ def _classify_http_failure(
         return
     result.status = "failed"
     result.error_class = "http_error"
-    if _is_optional_endpoint(scenario):
+    if scenario.expect_success or _is_optional_endpoint(scenario):
         result.capability = "fail"
 
 
@@ -303,24 +377,29 @@ def _is_audio_response(
         return False
     content_type = str(headers.get("Content-Type", "")).lower().split(";", 1)[0]
     fmt = response_format.lower()
-    if content_type.startswith("audio/"):
-        return True
     if fmt == "wav":
-        return body.startswith(b"RIFF")
+        return body.startswith(b"RIFF") and content_type in {
+            "audio/wav",
+            "audio/x-wav",
+            "application/octet-stream",
+            "",
+        }
     if fmt == "pcm":
-        return content_type == "application/octet-stream"
+        return content_type in {"application/octet-stream", "audio/pcm", "audio/raw"}
     if fmt == "mp3":
-        return body.startswith(b"ID3") or (
-            len(body) >= 2 and body[0] == 0xFF and (body[1] & 0xE0) == 0xE0
+        return (
+            content_type in {"audio/mpeg", "audio/mp3"}
+            or body.startswith(b"ID3")
+            or (len(body) >= 2 and body[0] == 0xFF and (body[1] & 0xE0) == 0xE0)
         )
     if fmt == "flac":
-        return body.startswith(b"fLaC")
+        return body.startswith(b"fLaC") or content_type == "audio/flac"
     if fmt == "opus":
-        return body.startswith(b"OggS")
+        return body.startswith(b"OggS") or content_type in {"audio/opus", "audio/ogg"}
     if fmt == "aac":
-        return len(body) >= 2 and body[0] == 0xFF and (body[1] & 0xF0) == 0xF0
-    if fmt in AUDIO_RESPONSE_FORMATS:
-        return content_type == "application/octet-stream"
+        return content_type in {"audio/aac", "audio/aacp"} or (
+            len(body) >= 2 and body[0] == 0xFF and (body[1] & 0xF0) == 0xF0
+        )
     return False
 
 
@@ -453,14 +532,32 @@ def _handle_batch_success(
             ),
         )
         return
-    for item in results:
-        if not isinstance(item, dict):
+    observed_success = 0
+    observed_failed = 0
+    for index, item in enumerate(results):
+        if not _is_valid_batch_item(item, expected_index=index):
             _mark_protocol_error(
                 result,
                 status="invalid_batch_response",
-                error="batch endpoint result item is not an object",
+                error=f"batch endpoint result item has invalid schema at index {index}",
             )
             return
+        item_status = str(item["status"])
+        if item_status in SUCCESS_BATCH_STATUSES:
+            observed_success += 1
+        else:
+            observed_failed += 1
+    if observed_success != succeeded or observed_failed != failed:
+        _mark_protocol_error(
+            result,
+            status="invalid_batch_response",
+            error=(
+                "batch endpoint item statuses do not match top-level counts "
+                f"(item_success={observed_success}, succeeded={succeeded}, "
+                f"item_failed={observed_failed}, failed={failed})"
+            ),
+        )
+        return
     _mark_success(result, capability="pass")
 
 
@@ -478,16 +575,19 @@ def _handle_voice_success(
         result.error_type = exc.__class__.__name__
         return
     if scenario.capability_key == "voices.list":
-        if isinstance(payload, list) or (
-            isinstance(payload, dict)
-            and isinstance(payload.get("voices", payload.get("data")), list)
+        voices = _voice_list_items(payload)
+        if voices is not None and all(
+            _is_valid_voice_metadata(item) for item in voices
         ):
             _mark_success(result, capability="pass")
             return
         _mark_protocol_error(
             result,
             status="invalid_voice_response",
-            error="voice list response must be a list or object with voices/data list",
+            error=(
+                "voice list response must be a list or object with voices/data list "
+                "whose items include voice metadata"
+            ),
         )
         return
     if scenario.capability_key == "voices.upload":
@@ -504,6 +604,41 @@ def _handle_voice_success(
         )
         return
     _mark_success(result, capability="pass")
+
+
+def _is_valid_batch_item(item: Any, *, expected_index: int) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if item.get("index") != expected_index:
+        return False
+    status = item.get("status")
+    if status in SUCCESS_BATCH_STATUSES:
+        return (
+            isinstance(item.get("audio_data"), str)
+            and bool(item["audio_data"])
+            and isinstance(item.get("media_type"), str)
+            and bool(item["media_type"])
+        )
+    if status in FAILED_BATCH_STATUSES:
+        error = item.get("error")
+        return isinstance(error, (dict, str)) and bool(error)
+    return False
+
+
+def _voice_list_items(payload: Any) -> list[Any] | None:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    voices = payload.get("voices", payload.get("data"))
+    return voices if isinstance(voices, list) else None
+
+
+def _is_valid_voice_metadata(item: Any) -> bool:
+    return isinstance(item, dict) and any(
+        isinstance(item.get(key), str) and item[key]
+        for key in ("id", "voice_id", "name")
+    )
 
 
 def _mark_protocol_error(result: ScenarioResult, *, status: str, error: str) -> None:

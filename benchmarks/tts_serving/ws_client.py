@@ -59,13 +59,19 @@ async def run_ws_scenario(
     except aiohttp.WSServerHandshakeError as exc:
         result.http_status = exc.status
         if exc.status == 404:
-            result.status = "missing"
-            result.capability = "missing"
+            _mark_missing_ws_contract(
+                result,
+                scenario,
+                error=str(exc),
+                allow_missing=spec.params.allow_missing_optional_endpoints,
+            )
         else:
             result.status = "failed"
             result.capability = "fail"
+            result.error_class = "http_error"
         result.error_type = exc.__class__.__name__
-        result.error = str(exc)
+        if result.error is None:
+            result.error = str(exc)
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         result.status = "transport_error"
         result.error_type = exc.__class__.__name__
@@ -194,7 +200,7 @@ def _merge_text_event(
 
     event_type = str(event.get("type", ""))
     _record_ws_event(result, event_type or "text")
-    if "error" in event_type or "error" in event:
+    if _is_ws_error_event(event_type):
         result.status = "failed" if expect_success else "expected_error"
         result.capability = "fail" if expect_success else "pass"
         result.error_class = "server_error_event"
@@ -220,7 +226,30 @@ def _merge_text_event(
         result.success = True
         result.capability = "pass"
         return "audio"
-    if event_type in {"audio.start", "audio.done", "session.done"}:
+    if event_type == "audio.start":
+        if not _is_valid_audio_start(event):
+            _mark_ws_protocol_error(result, f"invalid audio.start event: {data}")
+            return event_type
+        result.status = "ok"
+        result.capability = "pass"
+        return event_type
+    if event_type == "audio.done":
+        if not _is_valid_audio_done(event):
+            _mark_ws_protocol_error(result, f"invalid audio.done event: {data}")
+            return event_type
+        if event.get("error") is True:
+            result.status = "failed" if expect_success else "expected_error"
+            result.capability = "fail" if expect_success else "pass"
+            result.error_class = "server_error_event"
+            result.error = data
+            return "error"
+        result.status = "ok"
+        result.capability = "pass"
+        return event_type
+    if event_type == "session.done":
+        if not _is_valid_session_done(event):
+            _mark_ws_protocol_error(result, f"invalid session.done event: {data}")
+            return event_type
         result.status = "ok"
         result.capability = "pass"
         return event_type
@@ -234,6 +263,37 @@ def _encoded_audio_len(value: str) -> int:
         return len(base64.b64decode(value, validate=True))
     except binascii.Error:
         return len(value)
+
+
+def _is_ws_error_event(event_type: str) -> bool:
+    return event_type == "error" or event_type.endswith(".error")
+
+
+def _is_valid_audio_start(event: dict) -> bool:
+    return (
+        isinstance(event.get("sentence_index"), int)
+        and event["sentence_index"] >= 0
+        and isinstance(event.get("format"), str)
+        and bool(event["format"])
+        and isinstance(event.get("sample_rate"), int)
+        and event["sample_rate"] > 0
+    )
+
+
+def _is_valid_audio_done(event: dict) -> bool:
+    return (
+        isinstance(event.get("sentence_index"), int)
+        and event["sentence_index"] >= 0
+        and isinstance(event.get("total_bytes"), int)
+        and event["total_bytes"] >= 0
+        and isinstance(event.get("error"), bool)
+    )
+
+
+def _is_valid_session_done(event: dict) -> bool:
+    return (
+        isinstance(event.get("total_sentences"), int) and event["total_sentences"] >= 0
+    )
 
 
 def _ws_url(base_url: str, path: str) -> str:
@@ -260,6 +320,28 @@ def _mark_ws_protocol_error(result: ScenarioResult, error: str) -> None:
     result.capability = "fail"
     result.error_class = "protocol_error"
     result.error = error
+
+
+def _mark_missing_ws_contract(
+    result: ScenarioResult,
+    scenario: Scenario,
+    *,
+    error: str,
+    allow_missing: bool,
+) -> None:
+    result.success = False
+    result.error_class = "missing_contract"
+    result.error = (
+        "required benchmark contract is missing: "
+        f"endpoint={scenario.endpoint}, operation={scenario.capability_key}, "
+        f"path={scenario.path}, http_status={result.http_status}, error={error}"
+    )
+    if allow_missing:
+        result.status = "missing"
+        result.capability = "missing"
+        return
+    result.status = "missing_contract"
+    result.capability = "fail"
 
 
 async def _probe_speech_after_disconnect(

@@ -203,7 +203,7 @@ def _planned_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list
     if stage.mode == "burst":
         return [0.0] * request_count
     if stage.mode == "ramp":
-        return _ramp_offsets(stage, request_count)
+        return _ramp_offsets(stage, request_count, seed=seed)
     if stage.mode == "soak" and stage.duration_s:
         if request_count == 1:
             return [0.0]
@@ -220,16 +220,20 @@ def _planned_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list
     return [index / stage.request_rate for index in range(request_count)]
 
 
-def _ramp_offsets(stage: LoadStage, request_count: int) -> list[float]:
+def _ramp_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list[float]:
     start_rate = stage.start_request_rate or stage.request_rate
     end_rate = stage.request_rate
     elapsed = 0.0
     offsets: list[float] = []
+    rng = random.Random(f"{seed}:{stage.id}:ramp-arrival")
     for index in range(request_count):
         offsets.append(elapsed)
         position = index / max(request_count - 1, 1)
         current_rate = start_rate + (end_rate - start_rate) * position
-        elapsed += 1.0 / current_rate
+        if stage.arrival_distribution == "poisson":
+            elapsed += rng.expovariate(current_rate)
+        else:
+            elapsed += 1.0 / current_rate
     return offsets
 
 
