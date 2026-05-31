@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage
+from benchmarks.tts_serving.voice_upload_fixtures import VOICE_UPLOAD_FIXTURE_SIZES
 
 SCENARIO_SCHEMA_VERSION = 2
 
@@ -30,8 +31,8 @@ RESPONSE_FORMATS = ("wav", "pcm", "mp3", "flac", "aac", "opus")
 TASK_TYPES = ("Base", "CustomVoice", "VoiceDesign")
 BATCH_SIZES = (1, 2, 8, 32)
 BATCH_OVERSIZED_SIZE = 33
-VOICE_UPLOAD_SUCCESS_FORMATS = (("wav", "audio/wav"),)
-VOICE_UPLOAD_REJECT_FORMATS = (
+VOICE_UPLOAD_SUCCESS_FORMATS = (
+    ("wav", "audio/wav"),
     ("mp3", "audio/mpeg"),
     ("flac", "audio/flac"),
     ("ogg", "audio/ogg"),
@@ -39,6 +40,7 @@ VOICE_UPLOAD_REJECT_FORMATS = (
     ("webm", "audio/webm"),
     ("mp4", "audio/mp4"),
 )
+VOICE_UPLOAD_REJECT_FORMATS = VOICE_UPLOAD_SUCCESS_FORMATS[1:]
 VOICE_SMALL_UPLOAD_BYTES = 4096
 VOICE_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 VOICE_NEAR_LIMIT_BYTES = VOICE_MAX_UPLOAD_BYTES - 1
@@ -226,8 +228,18 @@ def _required_stage_scenarios(
         for _ in LENGTH_EXTREME_TEXTS:
             speech_edges.append(_speech_length(next_index, spec, stage))
             next_index += 1
-        for _ in REFERENCE_FAILURES:
-            speech_edges.append(_speech_reference(next_index, spec, stage))
+        speech_edges.append(_speech_reference_success(next_index, spec, stage))
+        next_index += 1
+        for reference_case, ref_audio in REFERENCE_FAILURES:
+            speech_edges.append(
+                _speech_reference_failure(
+                    next_index,
+                    spec,
+                    stage,
+                    reference_case=reference_case,
+                    ref_audio=ref_audio,
+                )
+            )
             next_index += 1
         for _ in range(_malformed_case_count()):
             speech_edges.append(_speech_malformed(next_index, spec, stage))
@@ -536,20 +548,25 @@ def _speech_length(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenari
 
 
 def _speech_reference(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
-    payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
     if index % 3 == 0:
-        payload["references"] = [
-            {"audio_path": _reference_audio(spec), "text": _reference_text(spec)}
-        ]
-        expect_success = True
-        expected_status_class = "success"
-        reference_case = "valid_reference"
-    else:
-        reference_case, ref_audio = REFERENCE_FAILURES[index % len(REFERENCE_FAILURES)]
-        payload["ref_audio"] = ref_audio
-        payload["ref_text"] = "Synthetic reference text."
-        expect_success = False
-        expected_status_class = "client_error"
+        return _speech_reference_success(index, spec, stage)
+    reference_case, ref_audio = REFERENCE_FAILURES[index % len(REFERENCE_FAILURES)]
+    return _speech_reference_failure(
+        index,
+        spec,
+        stage,
+        reference_case=reference_case,
+        ref_audio=ref_audio,
+    )
+
+
+def _speech_reference_success(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload["references"] = [
+        {"audio_path": _reference_audio(spec), "text": _reference_text(spec)}
+    ]
     payload["response_format"] = "wav"
     return Scenario(
         id=_scenario_id(stage, "speech_reference", index),
@@ -558,9 +575,35 @@ def _speech_reference(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
         stage_id=stage.id,
         capability_key="speech.reference",
         payload=payload,
-        expect_success=expect_success,
-        expected_status_class=expected_status_class,
+        expect_success=True,
+        expected_status_class="success",
         description="valid or intentionally bad reference audio",
+        planned_metadata={"reference_case": "valid_reference"},
+    )
+
+
+def _speech_reference_failure(
+    index: int,
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+    *,
+    reference_case: str,
+    ref_audio: str,
+) -> Scenario:
+    payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload["ref_audio"] = ref_audio
+    payload["ref_text"] = "Synthetic reference text."
+    payload["response_format"] = "wav"
+    return Scenario(
+        id=_scenario_id(stage, "speech_reference", index),
+        endpoint="speech",
+        category="speech_reference",
+        stage_id=stage.id,
+        capability_key="speech.reference",
+        payload=payload,
+        expect_success=False,
+        expected_status_class="client_error",
+        description="intentionally bad reference audio",
         planned_metadata={"reference_case": reference_case},
     )
 
@@ -713,7 +756,7 @@ def _required_voice_scenarios(
                 next_index,
                 spec,
                 stage,
-                upload_size=VOICE_SMALL_UPLOAD_BYTES,
+                upload_size=_voice_upload_size(upload_format),
                 upload_format=upload_format,
                 content_type=content_type,
             )
@@ -849,6 +892,12 @@ def _voice_upload(
             "voice_name": name,
         },
     )
+
+
+def _voice_upload_size(upload_format: str) -> int:
+    if upload_format == "wav":
+        return VOICE_SMALL_UPLOAD_BYTES
+    return VOICE_UPLOAD_FIXTURE_SIZES[upload_format]
 
 
 def _voice_delete(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
@@ -1004,14 +1053,13 @@ def _websocket_stream_audio(
                 "action": "send_json",
                 "payload": {
                     "type": "input.text",
-                    "text": "Stream this sentence in more than one audio chunk.",
+                    "text": "Stream this longer sentence incrementally so the client can validate multiple binary audio chunks before completion. "
+                    * 8,
                 },
             },
             {"action": "send_json", "payload": {"type": "input.done"}},
             {"action": "expect", "event": "audio.start"},
-            {"action": "expect", "event": "audio"},
-            {"action": "expect", "event": "audio"},
-            {"action": "expect", "event": "audio.done"},
+            {"action": "expect_audio_until_done", "min_binary_frames": 2},
             {"action": "expect", "event": "session.done"},
         ],
         description="WebSocket stream_audio=true path requiring incremental binary audio",

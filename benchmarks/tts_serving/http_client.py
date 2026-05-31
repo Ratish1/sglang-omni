@@ -23,6 +23,7 @@ from benchmarks.tts_serving.metrics import (
 )
 from benchmarks.tts_serving.scenarios import Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
+from benchmarks.tts_serving.voice_upload_fixtures import get_voice_upload_fixture
 
 AUDIO_RESPONSE_FORMATS = {"wav", "pcm", "mp3", "flac", "aac", "opus"}
 OPTIONAL_ENDPOINTS = {"voices", "batch", "websocket"}
@@ -41,6 +42,7 @@ async def run_http_scenario(
         category=scenario.category,
         capability_key=scenario.capability_key,
         expected_success=scenario.expect_success,
+        response_format=_scenario_response_format(scenario),
         batch_size=scenario.planned_metadata.get("batch_size"),
     )
     url = f"{spec.base_url}{scenario.path}"
@@ -319,6 +321,8 @@ def _merge_sse_line(
     if event is None:
         return False
     if audio_bytes is None:
+        if _is_terminal_sse_json_event(event):
+            return False
         _mark_protocol_error(
             result,
             status="invalid_sse_response",
@@ -351,6 +355,15 @@ def _merge_sse_line(
         ),
     )
     return False
+
+
+def _is_terminal_sse_json_event(event: Any) -> bool:
+    if not isinstance(event, dict):
+        return False
+    if event.get("audio") is not None:
+        return False
+    finish_reason = event.get("finish_reason")
+    return isinstance(finish_reason, str) and bool(finish_reason)
 
 
 def _mark_unexpected_success(result: ScenarioResult, scenario: Scenario) -> None:
@@ -489,6 +502,8 @@ def _synthetic_upload_bytes(scenario: Scenario) -> bytes:
     if upload_case == "corrupt_audio":
         return _pad_bytes(b"not-a-valid-audio-upload", scenario.upload_size_bytes)
     upload_format = str(scenario.planned_metadata.get("upload_format", "wav"))
+    if upload_case == "format" and upload_format != "wav":
+        return get_voice_upload_fixture(upload_format)
     return _synthetic_audio_bytes(scenario.upload_size_bytes, upload_format)
 
 
@@ -613,6 +628,13 @@ async def _run_voice_lifecycle(
 
 def _is_optional_endpoint(scenario: Scenario) -> bool:
     return scenario.endpoint in OPTIONAL_ENDPOINTS
+
+
+def _scenario_response_format(scenario: Scenario) -> str | None:
+    response_format = scenario.planned_metadata.get("response_format")
+    if response_format is None:
+        response_format = scenario.payload.get("response_format")
+    return str(response_format) if response_format is not None else None
 
 
 def _handle_batch_success(

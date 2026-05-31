@@ -32,6 +32,7 @@ async def run_ws_scenario(
         category=scenario.category,
         capability_key=scenario.capability_key,
         expected_success=scenario.expect_success,
+        response_format="pcm",
     )
     url = _ws_url(spec.base_url, scenario.path)
     start = time.perf_counter()
@@ -105,6 +106,15 @@ async def _run_ws_script(
                 )
                 if not matched:
                     return
+            elif action_type == "expect_audio_until_done":
+                matched = await _expect_audio_until_done(
+                    ws,
+                    result,
+                    min_binary_frames=int(action.get("min_binary_frames", 1)),
+                    expect_success=expect_success,
+                )
+                if not matched:
+                    return
             else:
                 result.status = "failed"
                 result.capability = "fail"
@@ -127,25 +137,13 @@ async def _expect_next_event(
     while True:
         msg = await ws.receive()
         if msg.type == aiohttp.WSMsgType.BINARY:
-            _record_ws_event(result, "binary")
             if expected_event not in {"audio", "binary"}:
                 _mark_ws_protocol_error(
                     result,
                     f"received binary audio while expecting {expected_event}",
                 )
                 return False
-            if result.ws_active_sentence_index is None:
-                _mark_ws_protocol_error(
-                    result, "received binary audio before audio.start"
-                )
-                return False
-            result.audio_bytes += len(msg.data)
-            result.ws_active_sentence_bytes += len(msg.data)
-            result.response_bytes += len(msg.data)
-            result.status = "ok"
-            result.success = True
-            result.capability = "pass"
-            return True
+            return _record_binary_audio(msg.data, result)
         if msg.type == aiohttp.WSMsgType.TEXT:
             event_type = _merge_text_event(
                 msg.data, result, expect_success=expect_success
@@ -169,6 +167,59 @@ async def _expect_next_event(
                 result.capability = "pass"
                 return True
             _mark_ws_protocol_error(result, "WebSocket closed before expected event")
+            return False
+        if msg.type == aiohttp.WSMsgType.ERROR:
+            result.status = "failed"
+            result.capability = "fail"
+            result.error_class = "transport_error"
+            result.error = str(ws.exception())
+            return False
+        _mark_ws_protocol_error(result, f"unexpected WebSocket frame type: {msg.type}")
+        return False
+
+
+async def _expect_audio_until_done(
+    ws: aiohttp.ClientWebSocketResponse,
+    result: ScenarioResult,
+    *,
+    min_binary_frames: int,
+    expect_success: bool,
+) -> bool:
+    binary_frames = 0
+    while True:
+        msg = await ws.receive()
+        if msg.type == aiohttp.WSMsgType.BINARY:
+            if not _record_binary_audio(msg.data, result):
+                return False
+            binary_frames += 1
+            continue
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            event_type = _merge_text_event(
+                msg.data, result, expect_success=expect_success
+            )
+            if result.status in {"failed", "expected_error"}:
+                return event_type == "error"
+            if event_type in WS_CONTROL_EVENT_TYPES:
+                continue
+            if event_type == "audio.done":
+                if binary_frames < min_binary_frames:
+                    _mark_ws_protocol_error(
+                        result,
+                        "stream_audio=true completed before the required "
+                        f"incremental audio chunks (expected>={min_binary_frames}, "
+                        f"observed={binary_frames})",
+                    )
+                    return False
+                return True
+            _mark_ws_protocol_error(
+                result,
+                "received WebSocket event "
+                f"{event_type!r} while streaming binary audio until audio.done",
+            )
+            return False
+        if msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE}:
+            result.ws_close_reason = "server_closed"
+            _mark_ws_protocol_error(result, "WebSocket closed before audio.done")
             return False
         if msg.type == aiohttp.WSMsgType.ERROR:
             result.status = "failed"
@@ -322,6 +373,20 @@ def _ws_url(base_url: str, path: str) -> str:
 
 def _record_ws_event(result: ScenarioResult, event_type: str) -> None:
     result.ws_event_counts[event_type] = result.ws_event_counts.get(event_type, 0) + 1
+
+
+def _record_binary_audio(data: bytes, result: ScenarioResult) -> bool:
+    _record_ws_event(result, "binary")
+    if result.ws_active_sentence_index is None:
+        _mark_ws_protocol_error(result, "received binary audio before audio.start")
+        return False
+    result.audio_bytes += len(data)
+    result.ws_active_sentence_bytes += len(data)
+    result.response_bytes += len(data)
+    result.status = "ok"
+    result.success = True
+    result.capability = "pass"
+    return True
 
 
 def _event_matches(event_type: str | None, expected_event: str) -> bool:
