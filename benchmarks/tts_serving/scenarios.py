@@ -11,7 +11,10 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage
-from benchmarks.tts_serving.voice_upload_fixtures import VOICE_UPLOAD_FIXTURE_SIZES
+from benchmarks.tts_serving.voice_upload_fixtures import (
+    VOICE_UPLOAD_FIXTURE_SIZES,
+    VOICE_UPLOAD_WAV_FIXTURE_SIZE,
+)
 
 SCENARIO_SCHEMA_VERSION = 2
 
@@ -42,7 +45,7 @@ VOICE_UPLOAD_SUCCESS_FORMATS = (
     ("mp4", "audio/mp4"),
 )
 VOICE_UPLOAD_REJECT_FORMATS = VOICE_UPLOAD_SUCCESS_FORMATS[1:]
-VOICE_SMALL_UPLOAD_BYTES = 4096
+VOICE_SMALL_UPLOAD_BYTES = VOICE_UPLOAD_WAV_FIXTURE_SIZE
 VOICE_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 VOICE_NEAR_LIMIT_BYTES = VOICE_MAX_UPLOAD_BYTES - 1
 VOICE_OVERSIZED_BYTES = VOICE_MAX_UPLOAD_BYTES + 1

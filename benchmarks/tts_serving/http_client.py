@@ -32,6 +32,7 @@ from benchmarks.tts_serving.urls import api_url
 from benchmarks.tts_serving.voice_upload_fixtures import (
     get_near_limit_voice_upload_fixture,
     get_voice_upload_fixture,
+    get_wav_upload_fixture,
 )
 
 AUDIO_RESPONSE_FORMATS = {"wav", "pcm", "mp3", "flac", "aac", "opus"}
@@ -129,23 +130,22 @@ async def _handle_probe_response(
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
+    body, body_text = await _response_body_and_text(response)
+    result.response_bytes = len(body)
     if _is_unsupported_http_status(response.status, scenario):
         _mark_unsupported_contract(
             result,
             scenario,
-            body=await response.text(),
+            body=body_text,
         )
         return
     if 200 <= response.status < 300:
-        body = await response.read()
-        result.response_bytes = len(body)
         if scenario.endpoint == "voices":
             _handle_voice_success(body, result, scenario)
             return
         _mark_success(result, capability="pass")
         return
-    body = await response.text()
-    _classify_http_failure(response.status, body, result, scenario)
+    _classify_http_failure(response.status, body_text, result, scenario)
 
 
 async def _handle_binary_response(
@@ -211,12 +211,12 @@ async def _handle_sse_response(
     result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
     if response.status != 200:
-        body = await response.text()
-        result.response_bytes = len(body.encode("utf-8"))
+        body, body_text = await _response_body_and_text(response)
+        result.response_bytes = len(body)
         if _is_unsupported_http_status(response.status, scenario):
-            _mark_unsupported_contract(result, scenario, body=body)
+            _mark_unsupported_contract(result, scenario, body=body_text)
             return
-        _classify_http_failure(response.status, body, result, scenario)
+        _classify_http_failure(response.status, body_text, result, scenario)
         return
     content_type = str(response.headers.get("Content-Type", "")).lower()
     if "text/event-stream" not in content_type:
@@ -289,6 +289,13 @@ async def _handle_sse_response(
         return
     _mark_success(result)
     result.response_bytes = result.audio_bytes
+
+
+async def _response_body_and_text(
+    response: aiohttp.ClientResponse,
+) -> tuple[bytes, str]:
+    body = await response.read()
+    return body, body.decode("utf-8", errors="replace")
 
 
 def _merge_sse_line(
@@ -584,7 +591,7 @@ def _synthetic_upload_bytes_for(
         return _pad_bytes(b"not-a-valid-audio-upload", upload_size)
     if upload_case in {"near_limit", "cache_eviction"}:
         return get_near_limit_voice_upload_fixture(upload_format, upload_size)
-    if upload_case == "format" and upload_format != "wav":
+    if upload_case == "format":
         return get_voice_upload_fixture(upload_format)
     return _synthetic_audio_bytes(upload_size, upload_format)
 
@@ -604,33 +611,13 @@ def _synthetic_audio_bytes(size: int, upload_format: str = "wav") -> bytes:
         return _pad_bytes(b"\x1a\x45\xdf\xa3", size)
     if upload_format == "mp4":
         return _pad_bytes(b"\x00\x00\x00\x18ftypmp42", size)
-    if size < 44:
-        return _wav_header(0)[:size]
-    payload_size = size - 44
-    return _wav_header(payload_size) + b"\0" * payload_size
+    return get_wav_upload_fixture(size)
 
 
 def _pad_bytes(prefix: bytes, size: int) -> bytes:
     if size <= len(prefix):
         return prefix[:size]
     return prefix + (b"\0" * (size - len(prefix)))
-
-
-def _wav_header(payload_size: int) -> bytes:
-    return (
-        b"RIFF"
-        + (36 + payload_size).to_bytes(4, "little")
-        + b"WAVEfmt "
-        + (16).to_bytes(4, "little")
-        + (1).to_bytes(2, "little")
-        + (1).to_bytes(2, "little")
-        + (24000).to_bytes(4, "little")
-        + (48000).to_bytes(4, "little")
-        + (2).to_bytes(2, "little")
-        + (16).to_bytes(2, "little")
-        + b"data"
-        + payload_size.to_bytes(4, "little")
-    )
 
 
 def _request_size(scenario: Scenario) -> int:
