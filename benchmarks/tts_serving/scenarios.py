@@ -120,7 +120,7 @@ REFERENCE_FAILURES = (
     ),
     ("html_url", "https://example.com/"),
     ("wrong_content_type", "https://www.iana.org/_img/2013.1/iana-logo-header.svg"),
-    ("timeout_url", "http://192.0.2.1/seedtts/timeout.wav"),
+    ("unreachable_url", "http://192.0.2.1/seedtts/unreachable.wav"),
     ("disallowed_file", "file:///etc/passwd"),
 )
 
@@ -253,10 +253,26 @@ def _required_stage_scenarios(
         next_index += 1
     if "batch" in endpoint_set:
         batch_scenarios = [
-            _batch_request(next_index + offset, spec, stage, batch_size=size)
+            _batch_request(
+                next_index + offset,
+                spec,
+                stage,
+                batch_size=size,
+                inject_item_error=False,
+            )
             for offset, size in enumerate(BATCH_SIZES)
         ]
         next_index += len(batch_scenarios)
+        batch_scenarios.append(
+            _batch_request(
+                next_index,
+                spec,
+                stage,
+                batch_size=32,
+                inject_item_error=True,
+            )
+        )
+        next_index += 1
         batch_scenarios.append(_batch_item_overrides(next_index, spec, stage))
         next_index += 1
         batch_scenarios.append(
@@ -593,9 +609,9 @@ def _speech_reference_success(
     index: int, spec: BenchmarkSpec, stage: LoadStage
 ) -> Scenario:
     payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
-    payload["references"] = [
-        {"audio_path": _reference_audio(spec), "text": _reference_text(spec)}
-    ]
+    payload["task_type"] = "Base"
+    payload["ref_audio"] = _reference_audio(spec)
+    payload["ref_text"] = _reference_text(spec)
     payload["response_format"] = "wav"
     return Scenario(
         id=_scenario_id(stage, "speech_reference", index),
@@ -615,6 +631,7 @@ def _speech_reference_base64_success(
     index: int, spec: BenchmarkSpec, stage: LoadStage
 ) -> Scenario:
     payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload["task_type"] = "Base"
     payload["ref_audio"] = _tiny_wav_data_uri()
     payload["ref_text"] = "A tiny inline reference audio sample."
     payload["response_format"] = "wav"
@@ -636,6 +653,7 @@ def _speech_reference_xvector_only(
     index: int, spec: BenchmarkSpec, stage: LoadStage
 ) -> Scenario:
     payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload["task_type"] = "Base"
     payload["ref_audio"] = _reference_audio(spec)
     payload["ref_text"] = _reference_text(spec)
     payload["x_vector_only_mode"] = True
@@ -663,6 +681,7 @@ def _speech_reference_failure(
     ref_audio: str,
 ) -> Scenario:
     payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload["task_type"] = "Base"
     payload["ref_audio"] = ref_audio
     payload["ref_text"] = "Synthetic reference text."
     payload["response_format"] = "wav"
@@ -771,7 +790,7 @@ def _batch_request(
     stage: LoadStage,
     *,
     batch_size: int,
-    inject_item_error: bool = True,
+    inject_item_error: bool = False,
     expect_success: bool = True,
     expected_status_class: str = "success",
 ) -> Scenario:
@@ -801,7 +820,10 @@ def _batch_request(
         expect_success=expect_success,
         expected_status_class=expected_status_class,
         description=f"batch speech request with {batch_size} items",
-        planned_metadata={"batch_size": batch_size},
+        planned_metadata={
+            "batch_size": batch_size,
+            "batch_case": "item_error" if inject_item_error else "all_valid",
+        },
     )
 
 
@@ -826,15 +848,21 @@ def _batch_item_overrides(
         {
             "input": "A fast item should remain isolated to this index.",
             "speed": 4.0,
+            "max_new_tokens": 512,
             "response_format": "pcm",
         },
         {
             "input": "Reference conditioning inside a batch item.",
             "task_type": "Base",
-            "references": [
-                {"audio_path": _reference_audio(spec), "text": _reference_text(spec)}
-            ],
+            "ref_audio": _reference_audio(spec),
+            "ref_text": _reference_text(spec),
+            "x_vector_only_mode": True,
             "response_format": "wav",
+        },
+        {
+            "input": "Codec chunking should be isolated to this batch item.",
+            "initial_codec_chunk_frames": INITIAL_CODEC_CHUNK_FRAMES,
+            "response_format": "pcm",
         },
         {
             "input": "Please design a calm and precise voice for this item.",

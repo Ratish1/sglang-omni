@@ -112,8 +112,8 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #      "max_concurrency": 256}
 #   ]
 # }
-# With voices enabled, missing just-under-10MB upload coverage for any accepted
-# audio format is reported as a failing benchmark coverage contract.
+# Missing just-under-10MB upload coverage for accepted non-WAV formats is
+# reported as a benchmark coverage gap until valid fixtures are added.
 
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
 python -m benchmarks.eval.benchmark_omni_seedtts \

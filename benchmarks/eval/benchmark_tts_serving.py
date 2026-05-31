@@ -154,11 +154,9 @@ async def _run_scheduled_stage(
     peak_inflight = 0
 
     async def run_planned(scenario: Scenario, offset: float) -> ScenarioResult:
-        nonlocal active_requests, peak_inflight
+        nonlocal active_requests
         planned_start = stage_start + offset
         actual_start = time.perf_counter()
-        active_requests += 1
-        peak_inflight = max(peak_inflight, active_requests)
         try:
             result = await _run_one_scenario(session, spec, scenario)
         finally:
@@ -182,13 +180,28 @@ async def _run_scheduled_stage(
         delay_s = planned_start - time.perf_counter()
         if delay_s > 0:
             await asyncio.sleep(delay_s)
-        pending.add(asyncio.create_task(run_planned(scenario, offset)))
-        scheduled_task_count += 1
-        peak_pending_tasks = max(peak_pending_tasks, len(pending))
         done = {task for task in pending if task.done()}
         if done:
             pending.difference_update(done)
             results.extend(task.result() for task in done)
+        scheduled_task_count += 1
+        if active_requests >= stage.max_concurrency:
+            actual_start = time.perf_counter()
+            results.append(
+                _load_generator_saturated_result(
+                    scenario,
+                    stage=stage,
+                    planned_start=planned_start,
+                    actual_start=actual_start,
+                    active_requests=active_requests,
+                    generator_lag=max(0.0, actual_start - planned_start),
+                )
+            )
+            continue
+        active_requests += 1
+        peak_inflight = max(peak_inflight, active_requests)
+        pending.add(asyncio.create_task(run_planned(scenario, offset)))
+        peak_pending_tasks = max(peak_pending_tasks, len(pending))
     if pending:
         results.extend(await asyncio.gather(*pending))
     for result in results:
@@ -214,6 +227,45 @@ async def _run_scheduled_stage(
         f"load_generator_lagged={load_generator_lagged})"
     )
     return results
+
+
+def _load_generator_saturated_result(
+    scenario: Scenario,
+    *,
+    stage: LoadStage,
+    planned_start: float,
+    actual_start: float,
+    active_requests: int,
+    generator_lag: float,
+) -> ScenarioResult:
+    result = ScenarioResult(
+        scenario_id=scenario.id,
+        endpoint=scenario.endpoint,
+        category=scenario.category,
+        capability_key=scenario.capability_key,
+        expected_success=scenario.expect_success,
+        response_format=str(scenario.payload.get("response_format", "")) or None,
+        batch_size=scenario.planned_metadata.get("batch_size"),
+        status="load_generator_saturated",
+        success=False,
+        capability="fail",
+        error_class="load_generator_saturation",
+        error=(
+            "scheduled arrival could not start because benchmark client "
+            f"reached max_concurrency={stage.max_concurrency} "
+            f"(active_requests={active_requests})"
+        ),
+        load_generator_saturated=True,
+    )
+    _attach_schedule_metadata(
+        result,
+        stage=stage,
+        planned_start=planned_start,
+        actual_start=actual_start,
+        peak_inflight=active_requests,
+        generator_lag=generator_lag,
+    )
+    return result
 
 
 async def _run_one_scenario(

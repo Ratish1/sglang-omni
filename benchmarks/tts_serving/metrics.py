@@ -31,6 +31,7 @@ class ScenarioResult:
     peak_pending_tasks: int | None = None
     scheduled_task_count: int | None = None
     load_generator_lagged: bool = False
+    load_generator_saturated: bool = False
     status: str = "error"
     success: bool = False
     expected_success: bool = True
