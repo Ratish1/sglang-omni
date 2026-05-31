@@ -203,7 +203,7 @@ def _mp4_padded(data: bytes, size: int) -> bytes:
     if padding_size < 0:
         raise ValueError("MP4 padding target is too small")
     free_box = (padding_size + 8).to_bytes(4, "big") + b"free" + b"\0" * padding_size
-    return data[:first_box_size] + free_box + data[first_box_size:]
+    return data + free_box
 
 
 def _webm_padded(data: bytes, size: int) -> bytes:
