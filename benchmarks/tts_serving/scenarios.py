@@ -29,8 +29,9 @@ MULTILINGUAL_TEXTS = (
 RESPONSE_FORMATS = ("wav", "pcm", "mp3", "flac", "aac", "opus")
 TASK_TYPES = ("Base", "CustomVoice", "VoiceDesign")
 BATCH_SIZES = (1, 2, 8, 32)
-VOICE_UPLOAD_FORMATS = (
-    ("wav", "audio/wav"),
+BATCH_OVERSIZED_SIZE = 33
+VOICE_UPLOAD_SUCCESS_FORMATS = (("wav", "audio/wav"),)
+VOICE_UPLOAD_REJECT_FORMATS = (
     ("mp3", "audio/mpeg"),
     ("flac", "audio/flac"),
     ("ogg", "audio/ogg"),
@@ -190,55 +191,96 @@ def _build_stage_scenarios(spec: BenchmarkSpec, stage: LoadStage) -> list[Scenar
 def _required_stage_scenarios(
     spec: BenchmarkSpec, stage: LoadStage, endpoint_set: set[str]
 ) -> list[Scenario]:
-    required: list[Scenario] = []
+    groups: list[list[Scenario]] = []
+    next_index = 0
     if "speech" in endpoint_set:
-        required.append(
-            _speech_baseline(0, spec, stage, random.Random(f"{spec.seed}:{stage.id}:0"))
+        speech_core: list[Scenario] = []
+        speech_core.append(
+            _speech_baseline(
+                next_index,
+                spec,
+                stage,
+                random.Random(f"{spec.seed}:{stage.id}:{next_index}"),
+            )
         )
+        next_index += 1
         for language_index in range(len(MULTILINGUAL_TEXTS)):
-            required.append(
-                _speech_language(
-                    len(required), spec, stage, language_index=language_index
-                )
+            speech_core.append(
+                _speech_language(next_index, spec, stage, language_index=language_index)
             )
+            next_index += 1
         for response_format in RESPONSE_FORMATS:
-            required.append(
-                _speech_format(
-                    len(required), spec, stage, response_format=response_format
-                )
+            speech_core.append(
+                _speech_format(next_index, spec, stage, response_format=response_format)
             )
+            next_index += 1
         for task_type in TASK_TYPES:
-            required.append(_speech_task_type(len(required), spec, stage, task_type))
-        required.append(_speech_openai_sdk(len(required), spec, stage))
+            speech_core.append(_speech_task_type(next_index, spec, stage, task_type))
+            next_index += 1
+        groups.append(speech_core)
+
+        groups.append([_speech_openai_sdk(next_index, spec, stage)])
+        next_index += 1
+
+        speech_edges: list[Scenario] = []
         for _ in LENGTH_EXTREME_TEXTS:
-            required.append(_speech_length(len(required), spec, stage))
+            speech_edges.append(_speech_length(next_index, spec, stage))
+            next_index += 1
         for _ in REFERENCE_FAILURES:
-            required.append(_speech_reference(len(required), spec, stage))
+            speech_edges.append(_speech_reference(next_index, spec, stage))
+            next_index += 1
         for _ in range(_malformed_case_count()):
-            required.append(_speech_malformed(len(required), spec, stage))
+            speech_edges.append(_speech_malformed(next_index, spec, stage))
+            next_index += 1
+        groups.append(speech_edges)
     if "speech_sse" in endpoint_set:
-        required.append(_speech_sse(len(required), spec, stage))
+        groups.append([_speech_sse(next_index, spec, stage)])
+        next_index += 1
     if "batch" in endpoint_set:
-        required.extend(
-            [
-                _batch_request(len(required) + offset, spec, stage, batch_size=size)
-                for offset, size in enumerate(BATCH_SIZES)
-            ]
+        batch_scenarios = [
+            _batch_request(next_index + offset, spec, stage, batch_size=size)
+            for offset, size in enumerate(BATCH_SIZES)
+        ]
+        next_index += len(batch_scenarios)
+        batch_scenarios.append(
+            _batch_request(
+                next_index,
+                spec,
+                stage,
+                batch_size=BATCH_OVERSIZED_SIZE,
+                inject_item_error=False,
+                expect_success=False,
+                expected_status_class="client_error",
+            )
         )
+        next_index += 1
+        groups.append(batch_scenarios)
     if "voices" in endpoint_set:
-        required.extend(
-            _required_voice_scenarios(spec, stage, start_index=len(required))
-        )
+        voice_scenarios = _required_voice_scenarios(spec, stage, start_index=next_index)
+        next_index += len(voice_scenarios)
+        groups.append(voice_scenarios)
     if "websocket" in endpoint_set:
-        required.extend(
+        groups.append(
             [
-                _websocket_normal(len(required), spec, stage),
-                _websocket_input_done_without_config(len(required) + 1, spec, stage),
-                _websocket_malformed_json(len(required) + 2, spec, stage),
-                _websocket_disconnect(len(required) + 3, spec, stage),
+                _websocket_normal(next_index, spec, stage),
+                _websocket_multi_sentence(next_index + 1, spec, stage),
+                _websocket_stream_audio(next_index + 2, spec, stage),
+                _websocket_input_done_without_config(next_index + 3, spec, stage),
+                _websocket_malformed_json(next_index + 4, spec, stage),
+                _websocket_disconnect(next_index + 5, spec, stage),
             ]
         )
-    return required
+    return _round_robin_groups(groups)
+
+
+def _round_robin_groups(groups: list[list[Scenario]]) -> list[Scenario]:
+    interleaved: list[Scenario] = []
+    max_len = max((len(group) for group in groups), default=0)
+    for offset in range(max_len):
+        for group in groups:
+            if offset < len(group):
+                interleaved.append(group[offset])
+    return interleaved
 
 
 def _weighted_scenario(
@@ -284,6 +326,8 @@ def _weighted_scenario(
     return rng.choice(
         (
             _websocket_normal(index, spec, stage),
+            _websocket_multi_sentence(index, spec, stage),
+            _websocket_stream_audio(index, spec, stage),
             _websocket_malformed_json(index, spec, stage),
             _websocket_disconnect(index, spec, stage),
         )
@@ -601,7 +645,14 @@ def _speech_malformed(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
 
 
 def _batch_request(
-    index: int, spec: BenchmarkSpec, stage: LoadStage, *, batch_size: int
+    index: int,
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+    *,
+    batch_size: int,
+    inject_item_error: bool = True,
+    expect_success: bool = True,
+    expected_status_class: str = "success",
 ) -> Scenario:
     items: list[dict[str, Any]] = []
     for item_index in range(batch_size):
@@ -609,7 +660,7 @@ def _batch_request(
             "input": BASE_TEXTS[item_index % len(BASE_TEXTS)],
             "response_format": "pcm" if item_index % 2 else "wav",
         }
-        if item_index == batch_size - 1 and batch_size >= 32:
+        if inject_item_error and item_index == batch_size - 1 and batch_size >= 32:
             item = {"input": "", "response_format": "bogus"}
         items.append(item)
     payload = {
@@ -626,7 +677,8 @@ def _batch_request(
         capability_key="batch.create",
         path="/v1/audio/speech/batch",
         payload=payload,
-        expected_status_class="success",
+        expect_success=expect_success,
+        expected_status_class=expected_status_class,
         description=f"batch speech request with {batch_size} items",
         planned_metadata={"batch_size": batch_size},
     )
@@ -655,7 +707,7 @@ def _required_voice_scenarios(
         _voices_list(start_index, spec, stage),
     ]
     next_index = start_index + 1
-    for upload_format, content_type in VOICE_UPLOAD_FORMATS:
+    for upload_format, content_type in VOICE_UPLOAD_SUCCESS_FORMATS:
         scenarios.append(
             _voice_upload(
                 next_index,
@@ -664,6 +716,21 @@ def _required_voice_scenarios(
                 upload_size=VOICE_SMALL_UPLOAD_BYTES,
                 upload_format=upload_format,
                 content_type=content_type,
+            )
+        )
+        next_index += 1
+    for upload_format, content_type in VOICE_UPLOAD_REJECT_FORMATS:
+        scenarios.append(
+            _voice_upload(
+                next_index,
+                spec,
+                stage,
+                upload_size=VOICE_SMALL_UPLOAD_BYTES,
+                upload_format=upload_format,
+                content_type=content_type,
+                case="synthetic_header_reject",
+                expect_success=False,
+                expected_status_class="client_error",
             )
         )
         next_index += 1
@@ -721,9 +788,10 @@ def _required_voice_scenarios(
                 voice_name=f"bench_voice_overwrite_{stage.id}",
             ),
             _voice_delete(next_index + 5, spec, stage),
+            _voice_lifecycle(next_index + 6, spec, stage),
         ]
     )
-    next_index += 6
+    next_index += 7
     for pressure_index in range(spec.params.voice_cache_pressure_count):
         scenarios.append(
             _voice_upload(
@@ -800,6 +868,37 @@ def _voice_delete(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario
     )
 
 
+def _voice_lifecycle(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
+    name = f"bench_voice_lifecycle_{stage.id}_{index:05d}"
+    return Scenario(
+        id=_scenario_id(stage, "voices_lifecycle", index),
+        endpoint="voices",
+        category="voices",
+        stage_id=stage.id,
+        capability_key="voices.lifecycle",
+        method="VOICE_LIFECYCLE",
+        path="/v1/audio/voices",
+        body_type="multipart",
+        form_fields={
+            "name": name,
+            "consent": "true",
+            "ref_text": "Voice lifecycle benchmark reference text.",
+            "speaker_description": "Synthetic benchmark voice used for delete checks.",
+        },
+        upload_field="audio_sample",
+        upload_filename=f"{name}.wav",
+        upload_content_type="audio/wav",
+        upload_size_bytes=VOICE_SMALL_UPLOAD_BYTES,
+        description="upload a voice and delete the same voice name",
+        planned_metadata={
+            "upload_case": "lifecycle",
+            "upload_format": "wav",
+            "upload_size_bytes": VOICE_SMALL_UPLOAD_BYTES,
+            "voice_name": name,
+        },
+    )
+
+
 def _websocket_normal(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
     return Scenario(
         id=_scenario_id(stage, "websocket_normal", index),
@@ -832,6 +931,90 @@ def _websocket_normal(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
             {"action": "expect", "event": "session.done"},
         ],
         description="stateful WebSocket speech stream",
+    )
+
+
+def _websocket_multi_sentence(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    return Scenario(
+        id=_scenario_id(stage, "websocket_multi_sentence", index),
+        endpoint="websocket",
+        category="websocket",
+        stage_id=stage.id,
+        capability_key="ws.multi_sentence",
+        method="WS",
+        path="/v1/audio/speech/stream",
+        script=[
+            {
+                "action": "send_json",
+                "payload": {
+                    "type": "session.config",
+                    "model": spec.model_name,
+                    "voice": "default",
+                    "response_format": "pcm",
+                    "stream_audio": False,
+                    "split_granularity": "sentence",
+                },
+            },
+            {
+                "action": "send_json",
+                "payload": {
+                    "type": "input.text",
+                    "text": "First sentence. Second sentence.",
+                },
+            },
+            {"action": "send_json", "payload": {"type": "input.done"}},
+            {"action": "expect", "event": "audio.start"},
+            {"action": "expect", "event": "audio"},
+            {"action": "expect", "event": "audio.done"},
+            {"action": "expect", "event": "audio.start"},
+            {"action": "expect", "event": "audio"},
+            {"action": "expect", "event": "audio.done"},
+            {"action": "expect", "event": "session.done"},
+        ],
+        description="WebSocket speech stream with multiple sentence boundaries",
+    )
+
+
+def _websocket_stream_audio(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    return Scenario(
+        id=_scenario_id(stage, "websocket_stream_audio", index),
+        endpoint="websocket",
+        category="websocket",
+        stage_id=stage.id,
+        capability_key="ws.stream_audio",
+        method="WS",
+        path="/v1/audio/speech/stream",
+        script=[
+            {
+                "action": "send_json",
+                "payload": {
+                    "type": "session.config",
+                    "model": spec.model_name,
+                    "voice": "default",
+                    "response_format": "pcm",
+                    "stream_audio": True,
+                    "split_granularity": "sentence",
+                },
+            },
+            {
+                "action": "send_json",
+                "payload": {
+                    "type": "input.text",
+                    "text": "Stream this sentence in more than one audio chunk.",
+                },
+            },
+            {"action": "send_json", "payload": {"type": "input.done"}},
+            {"action": "expect", "event": "audio.start"},
+            {"action": "expect", "event": "audio"},
+            {"action": "expect", "event": "audio"},
+            {"action": "expect", "event": "audio.done"},
+            {"action": "expect", "event": "session.done"},
+        ],
+        description="WebSocket stream_audio=true path requiring incremental binary audio",
     )
 
 
