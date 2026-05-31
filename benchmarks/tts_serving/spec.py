@@ -10,6 +10,7 @@ from typing import Any
 
 VALID_TEST_TYPES = {"engine", "e2e", "external"}
 VALID_PROFILES = {"ci", "production", "stress"}
+VALID_LOAD_MODES = {"closed_loop", "open_loop", "ramp", "burst", "soak"}
 DEFAULT_ENDPOINTS = ("speech", "speech_sse", "voices", "batch", "websocket")
 
 
@@ -34,17 +35,86 @@ class AuthSpec:
 
 
 @dataclass(frozen=True)
+class LoadStage:
+    id: str
+    mode: str
+    request_count: int
+    max_concurrency: int
+    request_rate: float = float("inf")
+    start_request_rate: float | None = None
+    duration_s: float | None = None
+
+    @classmethod
+    def from_obj(cls, obj: Any, *, index: int) -> LoadStage:
+        if not isinstance(obj, dict):
+            raise SpecError("params.load_stages entries must be objects")
+        stage_id = _str_value(obj, "id", f"stage-{index + 1}")
+        mode = _str_value(obj, "mode", "closed_loop")
+        if mode not in VALID_LOAD_MODES:
+            raise SpecError(
+                f"params.load_stages[].mode must be one of {sorted(VALID_LOAD_MODES)}"
+            )
+
+        request_count = _positive_int(
+            obj,
+            "request_count",
+            _positive_int(obj, "total_requests", 100),
+        )
+        max_concurrency = _positive_int(
+            obj,
+            "max_concurrency",
+            _positive_int(obj, "concurrency", 8),
+        )
+        request_rate = _request_rate(obj.get("request_rate", float("inf")))
+        start_request_rate = _optional_request_rate(obj.get("start_request_rate"))
+        duration_s = _optional_positive_float(obj.get("duration_s"), "duration_s")
+        if mode in {"open_loop", "ramp", "soak"} and request_rate == float("inf"):
+            raise SpecError(
+                "params.load_stages[].request_rate must be finite for " f"{mode} stages"
+            )
+        if mode == "ramp" and start_request_rate is None:
+            raise SpecError(
+                "params.load_stages[].start_request_rate is required for ramp stages"
+            )
+        return cls(
+            id=stage_id,
+            mode=mode,
+            request_count=request_count,
+            max_concurrency=max_concurrency,
+            request_rate=request_rate,
+            start_request_rate=start_request_rate,
+            duration_s=duration_s,
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "mode": self.mode,
+            "request_count": self.request_count,
+            "max_concurrency": self.max_concurrency,
+            "request_rate": (
+                "inf" if self.request_rate == float("inf") else self.request_rate
+            ),
+            "start_request_rate": self.start_request_rate,
+            "duration_s": self.duration_s,
+        }
+
+
+@dataclass(frozen=True)
 class BenchmarkParams:
     profile: str = "ci"
     total_requests: int = 100
     max_concurrency: int = 8
     concurrency_levels: tuple[int, ...] | None = None
+    load_stages: tuple[LoadStage, ...] = field(default_factory=tuple)
     request_rate: float = float("inf")
     timeout_s: int = 120
     enabled_endpoints: tuple[str, ...] = DEFAULT_ENDPOINTS
     allow_missing_optional_endpoints: bool = True
     seedtts_ref_audio: str | None = None
     seedtts_ref_text: str | None = None
+    provider_label: str | None = None
+    implementation_label: str | None = None
 
     @classmethod
     def from_obj(cls, obj: Any) -> BenchmarkParams:
@@ -62,6 +132,13 @@ class BenchmarkParams:
         concurrency_levels = _concurrency_levels(obj.get("concurrency_levels"))
         timeout_s = _positive_int(obj, "timeout_s", cls.timeout_s)
         request_rate = _request_rate(obj.get("request_rate", cls.request_rate))
+        load_stages = _load_stages(
+            obj.get("load_stages"),
+            total_requests=total_requests,
+            max_concurrency=max_concurrency,
+            concurrency_levels=concurrency_levels,
+            request_rate=request_rate,
+        )
 
         enabled = obj.get("enabled_endpoints", list(DEFAULT_ENDPOINTS))
         if not isinstance(enabled, list) or not all(
@@ -76,9 +153,12 @@ class BenchmarkParams:
             profile=profile,
             total_requests=total_requests,
             max_concurrency=(
-                max(concurrency_levels) if concurrency_levels else max_concurrency
+                max(stage.max_concurrency for stage in load_stages)
+                if load_stages
+                else max_concurrency
             ),
             concurrency_levels=concurrency_levels,
+            load_stages=load_stages,
             request_rate=request_rate,
             timeout_s=timeout_s,
             enabled_endpoints=tuple(enabled),
@@ -89,6 +169,8 @@ class BenchmarkParams:
             ),
             seedtts_ref_audio=_optional_str(obj, "seedtts_ref_audio"),
             seedtts_ref_text=_optional_str(obj, "seedtts_ref_text"),
+            provider_label=_optional_str(obj, "provider_label"),
+            implementation_label=_optional_str(obj, "implementation_label"),
         )
 
 
@@ -182,6 +264,23 @@ def _request_rate(value: Any) -> float:
     raise SpecError("params.request_rate must be a positive number or 'inf'")
 
 
+def _optional_request_rate(value: Any) -> float | None:
+    if value is None:
+        return None
+    rate = _request_rate(value)
+    if rate == float("inf"):
+        raise SpecError("params.load_stages[].start_request_rate must be finite")
+    return rate
+
+
+def _optional_positive_float(value: Any, key: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise SpecError(f"params.load_stages[].{key} must be a positive number")
+    return float(value)
+
+
 def _concurrency_levels(value: Any) -> tuple[int, ...] | None:
     if value is None:
         return None
@@ -194,3 +293,41 @@ def _concurrency_levels(value: Any) -> tuple[int, ...] | None:
         if item not in levels:
             levels.append(item)
     return tuple(levels)
+
+
+def _load_stages(
+    value: Any,
+    *,
+    total_requests: int,
+    max_concurrency: int,
+    concurrency_levels: tuple[int, ...] | None,
+    request_rate: float,
+) -> tuple[LoadStage, ...]:
+    if value is not None:
+        if not isinstance(value, list) or not value:
+            raise SpecError("params.load_stages must be a non-empty list")
+        stages = tuple(
+            LoadStage.from_obj(item, index=index) for index, item in enumerate(value)
+        )
+        _validate_unique_stage_ids(stages)
+        return stages
+
+    levels = concurrency_levels or (max_concurrency,)
+    return tuple(
+        LoadStage(
+            id=f"c{level}",
+            mode="closed_loop",
+            request_count=total_requests,
+            max_concurrency=level,
+            request_rate=request_rate,
+        )
+        for level in levels
+    )
+
+
+def _validate_unique_stage_ids(stages: tuple[LoadStage, ...]) -> None:
+    seen: set[str] = set()
+    for stage in stages:
+        if stage.id in seen:
+            raise SpecError(f"duplicate params.load_stages[].id: {stage.id}")
+        seen.add(stage.id)
