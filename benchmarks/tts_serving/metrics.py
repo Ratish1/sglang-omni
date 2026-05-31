@@ -22,6 +22,7 @@ class ScenarioResult:
     scenario_id: str
     endpoint: str
     category: str
+    capability_key: str | None = None
     stage_id: str | None = None
     load_mode: str | None = None
     load_concurrency: int | None = None

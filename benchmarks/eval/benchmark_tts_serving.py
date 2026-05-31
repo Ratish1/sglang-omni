@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import random
 import time
 from pathlib import Path
 
@@ -135,7 +136,7 @@ async def _run_scheduled_stage(
 ) -> list[ScenarioResult]:
     semaphore = asyncio.Semaphore(stage.max_concurrency)
     stage_start = time.perf_counter()
-    offsets = _planned_offsets(stage, len(scenarios))
+    offsets = _planned_offsets(stage, len(scenarios), seed=spec.seed)
 
     async def run_planned(scenario: Scenario, offset: float) -> ScenarioResult:
         planned_start = stage_start + offset
@@ -152,14 +153,18 @@ async def _run_scheduled_stage(
             return result
 
     started = time.perf_counter()
-    results = list(
-        await asyncio.gather(
-            *(
-                run_planned(scenario, offset)
-                for scenario, offset in zip(scenarios, offsets, strict=True)
+    results: list[ScenarioResult] = []
+    pending: set[asyncio.Task[ScenarioResult]] = set()
+    max_pending = max(stage.max_concurrency * 4, 128)
+    for scenario, offset in zip(scenarios, offsets, strict=True):
+        pending.add(asyncio.create_task(run_planned(scenario, offset)))
+        if len(pending) >= max_pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
             )
-        )
-    )
+            results.extend(task.result() for task in done)
+    if pending:
+        results.extend(await asyncio.gather(*pending))
     harness_log.append(
         f"stage={stage.id} mode={stage.mode} completed {len(results)} scenarios "
         f"at concurrency={stage.max_concurrency} in {time.perf_counter() - started:.3f}s"
@@ -192,7 +197,7 @@ def _attach_schedule_metadata(
     result.queue_wait_s = max(0.0, actual_start - planned_start)
 
 
-def _planned_offsets(stage: LoadStage, request_count: int) -> list[float]:
+def _planned_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list[float]:
     if request_count <= 0:
         return []
     if stage.mode == "burst":
@@ -204,6 +209,14 @@ def _planned_offsets(stage: LoadStage, request_count: int) -> list[float]:
             return [0.0]
         step = stage.duration_s / float(request_count - 1)
         return [index * step for index in range(request_count)]
+    if stage.arrival_distribution == "poisson":
+        rng = random.Random(f"{seed}:{stage.id}:arrival")
+        elapsed = 0.0
+        offsets: list[float] = []
+        for _ in range(request_count):
+            offsets.append(elapsed)
+            elapsed += rng.expovariate(stage.request_rate)
+        return offsets
     return [index / stage.request_rate for index in range(request_count)]
 
 

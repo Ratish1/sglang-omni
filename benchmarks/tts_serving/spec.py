@@ -11,6 +11,7 @@ from typing import Any
 VALID_TEST_TYPES = {"engine", "e2e", "external"}
 VALID_PROFILES = {"ci", "production", "stress"}
 VALID_LOAD_MODES = {"closed_loop", "open_loop", "ramp", "burst", "soak"}
+VALID_ARRIVAL_DISTRIBUTIONS = {"deterministic", "poisson"}
 DEFAULT_ENDPOINTS = ("speech", "speech_sse", "voices", "batch", "websocket")
 
 
@@ -43,6 +44,7 @@ class LoadStage:
     request_rate: float = float("inf")
     start_request_rate: float | None = None
     duration_s: float | None = None
+    arrival_distribution: str = "deterministic"
 
     @classmethod
     def from_obj(cls, obj: Any, *, index: int) -> LoadStage:
@@ -68,6 +70,12 @@ class LoadStage:
         request_rate = _request_rate(obj.get("request_rate", float("inf")))
         start_request_rate = _optional_request_rate(obj.get("start_request_rate"))
         duration_s = _optional_positive_float(obj.get("duration_s"), "duration_s")
+        arrival_distribution = _str_value(obj, "arrival_distribution", "deterministic")
+        if arrival_distribution not in VALID_ARRIVAL_DISTRIBUTIONS:
+            raise SpecError(
+                "params.load_stages[].arrival_distribution must be one of "
+                f"{sorted(VALID_ARRIVAL_DISTRIBUTIONS)}"
+            )
         if mode in {"open_loop", "ramp", "soak"} and request_rate == float("inf"):
             raise SpecError(
                 "params.load_stages[].request_rate must be finite for " f"{mode} stages"
@@ -84,6 +92,7 @@ class LoadStage:
             request_rate=request_rate,
             start_request_rate=start_request_rate,
             duration_s=duration_s,
+            arrival_distribution=arrival_distribution,
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -97,6 +106,7 @@ class LoadStage:
             ),
             "start_request_rate": self.start_request_rate,
             "duration_s": self.duration_s,
+            "arrival_distribution": self.arrival_distribution,
         }
 
 

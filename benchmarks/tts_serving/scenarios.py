@@ -104,6 +104,7 @@ class Scenario:
     endpoint: str
     category: str
     stage_id: str
+    capability_key: str
     payload: dict[str, Any] = field(default_factory=dict)
     method: str = "POST"
     path: str = "/v1/audio/speech"
@@ -164,10 +165,23 @@ def _required_stage_scenarios(
 ) -> list[Scenario]:
     required = [
         _speech_baseline(0, spec, stage, random.Random(f"{spec.seed}:{stage.id}:0")),
-        _speech_length(1, spec, stage),
-        _speech_malformed(2, spec, stage),
-        _speech_reference(3, spec, stage),
     ]
+    for language_index in range(len(MULTILINGUAL_TEXTS)):
+        required.append(
+            _speech_language(len(required), spec, stage, language_index=language_index)
+        )
+    for response_format in RESPONSE_FORMATS:
+        required.append(
+            _speech_format(len(required), spec, stage, response_format=response_format)
+        )
+    for task_type in TASK_TYPES:
+        required.append(_speech_task_type(len(required), spec, stage, task_type))
+    for _ in LENGTH_EXTREME_TEXTS:
+        required.append(_speech_length(len(required), spec, stage))
+    for _ in REFERENCE_FAILURES:
+        required.append(_speech_reference(len(required), spec, stage))
+    for _ in range(_malformed_case_count()):
+        required.append(_speech_malformed(len(required), spec, stage))
     if "speech_sse" in endpoint_set:
         required.append(_speech_sse(len(required), spec, stage))
     if "batch" in endpoint_set:
@@ -175,7 +189,8 @@ def _required_stage_scenarios(
             [
                 _batch_request(len(required), spec, stage, batch_size=1),
                 _batch_request(len(required) + 1, spec, stage, batch_size=2),
-                _batch_request(len(required) + 2, spec, stage, batch_size=32),
+                _batch_request(len(required) + 2, spec, stage, batch_size=8),
+                _batch_request(len(required) + 3, spec, stage, batch_size=32),
             ]
         )
     if "voices" in endpoint_set:
@@ -312,6 +327,7 @@ def _speech_baseline(
         endpoint="speech",
         category="speech_baseline",
         stage_id=stage.id,
+        capability_key="speech.create",
         payload=payload,
         description="well-formed single-shot speech",
         planned_metadata={"response_format": response_format, "task_type": task_type},
@@ -319,14 +335,25 @@ def _speech_baseline(
 
 
 def _speech_language(
-    index: int, spec: BenchmarkSpec, stage: LoadStage, rng: random.Random
+    index: int,
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+    rng: random.Random | None = None,
+    *,
+    language_index: int | None = None,
 ) -> Scenario:
-    language, text = rng.choice(MULTILINGUAL_TEXTS)
+    if language_index is None:
+        assert rng is not None
+        language, text = rng.choice(MULTILINGUAL_TEXTS)
+    else:
+        language, text = MULTILINGUAL_TEXTS[language_index % len(MULTILINGUAL_TEXTS)]
     payload = _base_payload(spec, text)
     payload.update(
         {
             "language": language,
-            "response_format": rng.choice(("wav", "pcm")),
+            "response_format": (
+                rng.choice(("wav", "pcm")) if rng is not None else "wav"
+            ),
             "instructions": "Keep pronunciation natural and do not translate.",
             "seed": spec.seed + index,
         }
@@ -336,9 +363,59 @@ def _speech_language(
         endpoint="speech",
         category="speech_language",
         stage_id=stage.id,
+        capability_key="speech.language",
         payload=payload,
         description=f"supported language {language}",
         planned_metadata={"language": language},
+    )
+
+
+def _speech_format(
+    index: int, spec: BenchmarkSpec, stage: LoadStage, *, response_format: str
+) -> Scenario:
+    payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload.update({"response_format": response_format, "seed": spec.seed + index})
+    return Scenario(
+        id=_scenario_id(stage, f"speech_format_{response_format}", index),
+        endpoint="speech",
+        category="speech_response_format",
+        stage_id=stage.id,
+        capability_key="speech.create",
+        payload=payload,
+        description=f"well-formed speech with {response_format} response",
+        planned_metadata={"response_format": response_format},
+    )
+
+
+def _speech_task_type(
+    index: int, spec: BenchmarkSpec, stage: LoadStage, task_type: str
+) -> Scenario:
+    payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload.update(
+        {
+            "response_format": "wav",
+            "task_type": task_type,
+            "seed": spec.seed + index,
+        }
+    )
+    if task_type == "VoiceDesign":
+        payload["instructions"] = "A clear and steady adult voice."
+    if task_type == "CustomVoice" and spec.params.seedtts_ref_audio:
+        payload["references"] = [
+            {
+                "audio_path": spec.params.seedtts_ref_audio,
+                "text": spec.params.seedtts_ref_text or "",
+            }
+        ]
+    return Scenario(
+        id=_scenario_id(stage, f"speech_task_{task_type.lower()}", index),
+        endpoint="speech",
+        category="speech_task_type",
+        stage_id=stage.id,
+        capability_key="speech.create",
+        payload=payload,
+        description=f"well-formed speech task_type={task_type}",
+        planned_metadata={"task_type": task_type},
     )
 
 
@@ -352,6 +429,7 @@ def _speech_length(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenari
         endpoint="speech",
         category="speech_length_extreme",
         stage_id=stage.id,
+        capability_key="speech.validation" if not expect_success else "speech.create",
         payload=payload,
         expect_success=expect_success,
         expected_status_class="success" if expect_success else "client_error",
@@ -381,6 +459,7 @@ def _speech_reference(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
         endpoint="speech",
         category="speech_reference",
         stage_id=stage.id,
+        capability_key="speech.reference",
         payload=payload,
         expect_success=expect_success,
         expected_status_class=expected_status_class,
@@ -403,13 +482,14 @@ def _speech_sse(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
         endpoint="speech_sse",
         category="speech_sse",
         stage_id=stage.id,
+        capability_key="speech.sse",
         payload=payload,
         description="REST SSE streaming speech",
     )
 
 
-def _speech_malformed(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
-    candidates = [
+def _malformed_payloads(spec: BenchmarkSpec, index: int) -> list[dict[str, Any]]:
+    return [
         {"model": spec.model_name, "voice": "default", "response_format": "wav"},
         {"model": spec.model_name, "input": "", "voice": "default"},
         {"model": spec.model_name, "input": 123, "response_format": "wav"},
@@ -444,6 +524,14 @@ def _speech_malformed(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
             "response_format": "wav",
         },
     ]
+
+
+def _malformed_case_count() -> int:
+    return 10
+
+
+def _speech_malformed(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
+    candidates = _malformed_payloads(spec, index)
     payload = candidates[index % len(candidates)]
     expect_success = payload.get("input") in ADVERSARIAL_TEXTS
     return Scenario(
@@ -451,6 +539,7 @@ def _speech_malformed(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
         endpoint="speech",
         category="speech_malformed",
         stage_id=stage.id,
+        capability_key="speech.create" if expect_success else "speech.validation",
         payload=payload,
         expect_success=expect_success,
         expected_status_class="success" if expect_success else "client_error",
@@ -481,6 +570,7 @@ def _batch_request(
         endpoint="batch",
         category="batch",
         stage_id=stage.id,
+        capability_key="batch.create",
         path="/v1/audio/speech/batch",
         payload=payload,
         expected_status_class="success",
@@ -495,6 +585,7 @@ def _voices_list(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
         endpoint="voices",
         category="voices",
         stage_id=stage.id,
+        capability_key="voices.list",
         method="GET",
         path="/v1/audio/voices",
         description="voice list request",
@@ -514,6 +605,7 @@ def _voice_upload(
         endpoint="voices",
         category="voices",
         stage_id=stage.id,
+        capability_key="voices.upload",
         path="/v1/audio/voices",
         body_type="multipart",
         form_fields={
@@ -539,6 +631,7 @@ def _voice_delete(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario
         endpoint="voices",
         category="voices",
         stage_id=stage.id,
+        capability_key="voices.delete",
         method="DELETE",
         path=f"/v1/audio/voices/{name}",
         expect_success=False,
@@ -554,6 +647,7 @@ def _websocket_normal(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
         endpoint="websocket",
         category="websocket",
         stage_id=stage.id,
+        capability_key="ws.normal",
         method="WS",
         path="/v1/audio/speech/stream",
         script=[
@@ -590,6 +684,7 @@ def _websocket_input_done_without_config(
         endpoint="websocket",
         category="websocket_malformed",
         stage_id=stage.id,
+        capability_key="ws.done_before_config",
         method="WS",
         path="/v1/audio/speech/stream",
         expect_success=False,
@@ -610,6 +705,7 @@ def _websocket_malformed_json(
         endpoint="websocket",
         category="websocket_malformed",
         stage_id=stage.id,
+        capability_key="ws.malformed_json",
         method="WS",
         path="/v1/audio/speech/stream",
         expect_success=False,
@@ -630,6 +726,7 @@ def _websocket_disconnect(
         endpoint="websocket",
         category="websocket_disconnect",
         stage_id=stage.id,
+        capability_key="ws.disconnect",
         method="WS",
         path="/v1/audio/speech/stream",
         script=[

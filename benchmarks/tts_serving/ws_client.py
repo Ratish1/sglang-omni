@@ -40,6 +40,7 @@ async def run_ws_scenario(
         scenario_id=scenario.id,
         endpoint=scenario.endpoint,
         category=scenario.category,
+        capability_key=scenario.capability_key,
         expected_success=scenario.expect_success,
     )
     url = _ws_url(spec.base_url, scenario.path)
@@ -53,6 +54,8 @@ async def run_ws_scenario(
                 timeout_s=spec.params.timeout_s,
                 expect_success=scenario.expect_success,
             )
+        if scenario.capability_key == "ws.disconnect" and result.status == "ok":
+            await _probe_speech_after_disconnect(session, spec, result)
     except aiohttp.WSServerHandshakeError as exc:
         result.http_status = exc.status
         if exc.status == 404:
@@ -93,10 +96,11 @@ async def _run_ws_script(
                 result.status = "ok"
                 result.success = True
                 result.capability = "pass"
+                result.was_cancelled = True
                 result.ws_close_reason = "client_closed"
                 return
             elif action_type == "expect":
-                matched = await _receive_until(
+                matched = await _expect_next_event(
                     ws,
                     result,
                     expected_event=str(action.get("event", "")),
@@ -116,50 +120,54 @@ async def _run_ws_script(
         result.capability = "pass"
 
 
-async def _receive_until(
+async def _expect_next_event(
     ws: aiohttp.ClientWebSocketResponse,
     result: ScenarioResult,
     *,
     expected_event: str,
     expect_success: bool,
 ) -> bool:
-    while True:
-        msg = await ws.receive()
-        if msg.type == aiohttp.WSMsgType.BINARY:
-            _record_ws_event(result, "binary")
-            result.audio_bytes += len(msg.data)
-            result.response_bytes += len(msg.data)
-            if expected_event in {"audio", "binary"}:
-                result.status = "ok"
-                result.success = True
-                result.capability = "pass"
-                return True
-            continue
-        if msg.type == aiohttp.WSMsgType.TEXT:
-            event_type = _merge_text_event(
-                msg.data, result, expect_success=expect_success
+    msg = await ws.receive()
+    if msg.type == aiohttp.WSMsgType.BINARY:
+        _record_ws_event(result, "binary")
+        if expected_event not in {"audio", "binary"}:
+            _mark_ws_protocol_error(
+                result,
+                f"received binary audio while expecting {expected_event}",
             )
-            if result.status in {"failed", "expected_error"}:
-                return event_type == expected_event or expected_event == "error"
-            if _event_matches(event_type, expected_event):
-                return True
-            continue
-        if msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE}:
-            result.ws_close_reason = "server_closed"
-            if expected_event == "close":
-                result.status = "ok"
-                result.success = True
-                result.capability = "pass"
-                return True
-            result.status = "failed"
-            result.capability = "fail"
-            result.error = "WebSocket closed before expected event"
             return False
-        if msg.type == aiohttp.WSMsgType.ERROR:
-            result.status = "failed"
-            result.capability = "fail"
-            result.error = str(ws.exception())
-            return False
+        result.audio_bytes += len(msg.data)
+        result.response_bytes += len(msg.data)
+        result.status = "ok"
+        result.success = True
+        result.capability = "pass"
+        return True
+    if msg.type == aiohttp.WSMsgType.TEXT:
+        event_type = _merge_text_event(msg.data, result, expect_success=expect_success)
+        if result.status in {"failed", "expected_error"}:
+            return event_type == expected_event or expected_event == "error"
+        if _event_matches(event_type, expected_event):
+            return True
+        _mark_ws_protocol_error(
+            result,
+            f"received WebSocket event {event_type!r} while expecting {expected_event!r}",
+        )
+        return False
+    if msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE}:
+        result.ws_close_reason = "server_closed"
+        if expected_event == "close":
+            result.status = "ok"
+            result.success = True
+            result.capability = "pass"
+            return True
+        _mark_ws_protocol_error(result, "WebSocket closed before expected event")
+        return False
+    if msg.type == aiohttp.WSMsgType.ERROR:
+        result.status = "failed"
+        result.capability = "fail"
+        result.error_class = "transport_error"
+        result.error = str(ws.exception())
+        return False
     return False
 
 
@@ -197,9 +205,6 @@ def _merge_text_event(
 
     audio = event.get("audio")
     if event_type in WS_AUDIO_EVENT_TYPES or isinstance(audio, (dict, str)):
-        result.status = "ok"
-        result.success = True
-        result.capability = "pass"
         if isinstance(audio, dict) and isinstance(audio.get("data"), str):
             audio_len = _encoded_audio_len(audio["data"])
             result.audio_bytes += audio_len
@@ -208,15 +213,19 @@ def _merge_text_event(
             audio_len = _encoded_audio_len(audio)
             result.audio_bytes += audio_len
             result.response_bytes += audio_len
+        else:
+            _mark_ws_protocol_error(result, f"audio event missing audio data: {data}")
+            return "audio"
+        result.status = "ok"
+        result.success = True
+        result.capability = "pass"
         return "audio"
     if event_type in {"audio.start", "audio.done", "session.done"}:
         result.status = "ok"
         result.capability = "pass"
         return event_type
 
-    result.status = "failed"
-    result.capability = "fail"
-    result.error = f"unexpected WebSocket event: {data}"
+    _mark_ws_protocol_error(result, f"unexpected WebSocket event: {data}")
     return event_type
 
 
@@ -243,6 +252,51 @@ def _event_matches(event_type: str | None, expected_event: str) -> bool:
     if expected_event == "audio":
         return event_type == "audio"
     return event_type == expected_event
+
+
+def _mark_ws_protocol_error(result: ScenarioResult, error: str) -> None:
+    result.status = "failed"
+    result.success = False
+    result.capability = "fail"
+    result.error_class = "protocol_error"
+    result.error = error
+
+
+async def _probe_speech_after_disconnect(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    result: ScenarioResult,
+) -> None:
+    url = f"{spec.base_url}/v1/audio/speech"
+    try:
+        async with session.post(
+            url,
+            json={
+                "model": spec.model_name,
+                "input": "Post-disconnect liveness probe.",
+                "voice": "default",
+                "response_format": "wav",
+            },
+        ) as response:
+            await response.read()
+            if 200 <= response.status < 300:
+                result.capability = "pass"
+                return
+            result.status = "failed"
+            result.success = False
+            result.capability = "fail"
+            result.http_status = response.status
+            result.error_class = (
+                "server_error" if response.status >= 500 else "http_error"
+            )
+            result.error = "post-disconnect speech liveness probe failed"
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        result.status = "transport_error"
+        result.success = False
+        result.capability = "fail"
+        result.error_type = exc.__class__.__name__
+        result.error_class = "transport_error"
+        result.error = f"post-disconnect speech liveness probe failed: {exc}"
 
 
 def _default_script(spec: BenchmarkSpec) -> list[dict]:

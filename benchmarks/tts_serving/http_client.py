@@ -34,6 +34,7 @@ async def run_http_scenario(
         scenario_id=scenario.id,
         endpoint=scenario.endpoint,
         category=scenario.category,
+        capability_key=scenario.capability_key,
         expected_success=scenario.expect_success,
         batch_size=scenario.planned_metadata.get("batch_size"),
     )
@@ -42,7 +43,7 @@ async def run_http_scenario(
     try:
         if scenario.method == "GET":
             async with session.get(url) as response:
-                await _handle_probe_response(response, result)
+                await _handle_probe_response(response, result, scenario)
         elif scenario.method == "DELETE":
             async with session.delete(url) as response:
                 await _handle_binary_response(response, result, scenario)
@@ -70,7 +71,7 @@ async def run_http_scenario(
 
 
 async def _handle_probe_response(
-    response: aiohttp.ClientResponse, result: ScenarioResult
+    response: aiohttp.ClientResponse, result: ScenarioResult, scenario: Scenario
 ) -> None:
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
@@ -82,14 +83,15 @@ async def _handle_probe_response(
         result.error = await response.text()
         return
     if 200 <= response.status < 300:
-        result.status = "ok"
-        result.capability = "pass"
-        result.success = True
-        result.response_bytes = len(await response.read())
+        body = await response.read()
+        result.response_bytes = len(body)
+        if scenario.endpoint == "voices":
+            _handle_voice_success(body, result, scenario)
+            return
+        _mark_success(result, capability="pass")
         return
-    result.status = "failed"
-    result.capability = "fail"
-    result.error = await response.text()
+    body = await response.text()
+    _classify_http_failure(response.status, body, result, scenario)
 
 
 async def _handle_binary_response(
@@ -102,25 +104,13 @@ async def _handle_binary_response(
     result.response_headers = dict(response.headers)
     body = await response.read()
     result.response_bytes = len(body)
-    if response.status >= 400 and not scenario.expect_success:
-        result.success = False
-        result.status = "expected_error"
-        result.error_class = "expected_client_error"
-        result.error = body.decode("utf-8", errors="replace")
-        return
-    if response.status == 404 and _is_optional_endpoint(scenario):
+    if (
+        response.status == 404
+        and scenario.expect_success
+        and _is_optional_endpoint(scenario)
+    ):
         result.status = "missing"
         result.capability = "missing"
-        result.error = body.decode("utf-8", errors="replace")
-        return
-    if scenario.category == "capability_probe":
-        if 200 <= response.status < 300:
-            result.status = "ok"
-            result.capability = "pass"
-            result.success = True
-            return
-        result.status = "failed"
-        result.capability = "fail"
         result.error = body.decode("utf-8", errors="replace")
         return
     if 200 <= response.status < 300:
@@ -128,12 +118,10 @@ async def _handle_binary_response(
             _mark_unexpected_success(result, scenario)
             return
         if scenario.endpoint == "batch":
-            _handle_batch_success(body, result)
+            _handle_batch_success(body, result, scenario)
             return
         if scenario.endpoint == "voices":
-            result.success = True
-            result.status = "ok"
-            result.capability = "pass"
+            _handle_voice_success(body, result, scenario)
             return
         response_format = str(scenario.payload.get("response_format", ""))
         if not _is_audio_response(body, response.headers, response_format):
@@ -152,15 +140,11 @@ async def _handle_binary_response(
             content_type=response.headers.get("Content-Type"),
             response_format=response_format,
         )
-        result.success = True
-        result.status = "ok"
+        _mark_success(result)
         return
-    result.success = False
-    result.status = "expected_error" if not scenario.expect_success else "failed"
-    result.error_class = (
-        "expected_client_error" if not scenario.expect_success else "http_error"
+    _classify_http_failure(
+        response.status, body.decode("utf-8", errors="replace"), result, scenario
     )
-    result.error = body.decode("utf-8", errors="replace")
 
 
 async def _handle_sse_response(
@@ -175,16 +159,16 @@ async def _handle_sse_response(
     if response.status != 200:
         body = await response.text()
         result.response_bytes = len(body.encode("utf-8"))
-        if response.status == 404 and _is_optional_endpoint(scenario):
+        if (
+            response.status == 404
+            and scenario.expect_success
+            and _is_optional_endpoint(scenario)
+        ):
             result.status = "missing"
             result.capability = "missing"
             result.error = body
             return
-        result.status = "expected_error" if not scenario.expect_success else "failed"
-        result.error_class = (
-            "expected_client_error" if not scenario.expect_success else "http_error"
-        )
-        result.error = body
+        _classify_http_failure(response.status, body, result, scenario)
         return
 
     buffer = bytearray()
@@ -275,6 +259,41 @@ def _mark_unexpected_success(result: ScenarioResult, scenario: Scenario) -> None
     )
 
 
+def _mark_success(result: ScenarioResult, *, capability: str | None = None) -> None:
+    result.success = True
+    result.status = "ok"
+    if capability is not None:
+        result.capability = capability
+
+
+def _classify_http_failure(
+    status: int,
+    body: str,
+    result: ScenarioResult,
+    scenario: Scenario,
+) -> None:
+    result.success = False
+    result.error = body
+    if 500 <= status:
+        result.status = "failed"
+        result.error_class = "server_error"
+        result.capability = "fail"
+        return
+    if (
+        400 <= status < 500
+        and not scenario.expect_success
+        and scenario.expected_status_class == "client_error"
+    ):
+        result.status = "expected_error"
+        result.error_class = "expected_client_error"
+        result.capability = "pass"
+        return
+    result.status = "failed"
+    result.error_class = "http_error"
+    if _is_optional_endpoint(scenario):
+        result.capability = "fail"
+
+
 def _is_audio_response(
     body: bytes,
     headers: Mapping[str, str],
@@ -361,25 +380,135 @@ def _is_optional_endpoint(scenario: Scenario) -> bool:
     return scenario.endpoint in OPTIONAL_ENDPOINTS
 
 
-def _handle_batch_success(body: bytes, result: ScenarioResult) -> None:
+def _handle_batch_success(
+    body: bytes, result: ScenarioResult, scenario: Scenario
+) -> None:
     try:
         payload = json.loads(body.decode("utf-8"))
     except json.JSONDecodeError as exc:
-        result.status = "invalid_batch_response"
-        result.success = False
+        _mark_protocol_error(
+            result,
+            status="invalid_batch_response",
+            error=f"batch endpoint returned invalid JSON: {exc}",
+        )
         result.error_type = exc.__class__.__name__
-        result.error_class = "protocol_error"
-        result.error = f"batch endpoint returned invalid JSON: {exc}"
         return
     required_keys = {"results", "total", "succeeded", "failed"}
     if not isinstance(payload, dict) or not required_keys <= set(payload):
-        result.status = "invalid_batch_response"
-        result.success = False
-        result.error_class = "protocol_error"
-        result.error = (
-            "batch endpoint returned JSON without results/total/succeeded/failed"
+        _mark_protocol_error(
+            result,
+            status="invalid_batch_response",
+            error="batch endpoint returned JSON without results/total/succeeded/failed",
         )
         return
-    result.status = "ok"
-    result.success = True
-    result.capability = "pass"
+    batch_size = int(scenario.planned_metadata.get("batch_size") or 0)
+    results = payload.get("results")
+    total = payload.get("total")
+    succeeded = payload.get("succeeded")
+    failed = payload.get("failed")
+    if (
+        not isinstance(results, list)
+        or not isinstance(total, int)
+        or not isinstance(succeeded, int)
+        or not isinstance(failed, int)
+    ):
+        _mark_protocol_error(
+            result,
+            status="invalid_batch_response",
+            error="batch endpoint returned non-integer counts or non-list results",
+        )
+        return
+    if total != batch_size or len(results) != batch_size:
+        _mark_protocol_error(
+            result,
+            status="invalid_batch_response",
+            error=(
+                "batch endpoint result count mismatch "
+                f"(expected={batch_size}, total={total}, results={len(results)})"
+            ),
+        )
+        return
+    if succeeded + failed != total:
+        _mark_protocol_error(
+            result,
+            status="invalid_batch_response",
+            error="batch endpoint succeeded + failed does not equal total",
+        )
+        return
+    expected_item_failures = sum(
+        1
+        for item in scenario.payload.get("items", [])
+        if not isinstance(item, dict)
+        or not isinstance(item.get("input"), str)
+        or not item.get("input", "").strip()
+        or item.get("response_format") == "bogus"
+    )
+    if failed < expected_item_failures:
+        _mark_protocol_error(
+            result,
+            status="invalid_batch_response",
+            error=(
+                "batch endpoint did not report expected item-level failures "
+                f"(expected_at_least={expected_item_failures}, failed={failed})"
+            ),
+        )
+        return
+    for item in results:
+        if not isinstance(item, dict):
+            _mark_protocol_error(
+                result,
+                status="invalid_batch_response",
+                error="batch endpoint result item is not an object",
+            )
+            return
+    _mark_success(result, capability="pass")
+
+
+def _handle_voice_success(
+    body: bytes, result: ScenarioResult, scenario: Scenario
+) -> None:
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except json.JSONDecodeError as exc:
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=f"voice endpoint returned invalid JSON: {exc}",
+        )
+        result.error_type = exc.__class__.__name__
+        return
+    if scenario.capability_key == "voices.list":
+        if isinstance(payload, list) or (
+            isinstance(payload, dict)
+            and isinstance(payload.get("voices", payload.get("data")), list)
+        ):
+            _mark_success(result, capability="pass")
+            return
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error="voice list response must be a list or object with voices/data list",
+        )
+        return
+    if scenario.capability_key == "voices.upload":
+        if isinstance(payload, dict) and any(
+            isinstance(payload.get(key), str) and payload[key]
+            for key in ("id", "voice_id", "name")
+        ):
+            _mark_success(result, capability="pass")
+            return
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error="voice upload response must include id, voice_id, or name",
+        )
+        return
+    _mark_success(result, capability="pass")
+
+
+def _mark_protocol_error(result: ScenarioResult, *, status: str, error: str) -> None:
+    result.status = status
+    result.success = False
+    result.capability = "fail"
+    result.error_class = "protocol_error"
+    result.error = error

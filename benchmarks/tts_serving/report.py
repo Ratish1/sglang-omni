@@ -31,7 +31,8 @@ def build_results_report(
     capability_total = total - traffic_total
     succeeded = sum(1 for result in results if _result_passed(spec, result))
     failed = total - succeeded
-    capabilities = _capabilities(results)
+    operation_capabilities = _operation_capabilities(results)
+    capabilities = _endpoint_capabilities(results, operation_capabilities)
     category_counts = Counter(result.category for result in results)
     status_counts = Counter(result.status for result in results)
     latencies = [r.latency_s for r in results if r.latency_s > 0]
@@ -82,6 +83,7 @@ def build_results_report(
             "load_stages": [stage.to_json() for stage in spec.params.load_stages],
         },
         "capabilities": capabilities,
+        "operation_capabilities": operation_capabilities,
         "metrics": {
             "latency_s": _summary(latencies),
             "ttfa_s": _summary(ttfas),
@@ -132,14 +134,32 @@ def _result_passed(spec: BenchmarkSpec, result: ScenarioResult) -> bool:
     return result.status == "expected_error"
 
 
-def _capabilities(results: list[ScenarioResult]) -> dict[str, str]:
-    caps: dict[str, str] = {}
+def _operation_capabilities(results: list[ScenarioResult]) -> dict[str, str]:
+    grouped: dict[str, list[str]] = defaultdict(list)
     for result in results:
         if result.capability:
-            caps[result.endpoint] = _merge_capability(
-                caps.get(result.endpoint), result.capability
-            )
-    return caps
+            key = result.capability_key or result.endpoint
+            grouped[key].append(result.capability)
+    return {
+        key: _roll_up_capability(statuses) for key, statuses in sorted(grouped.items())
+    }
+
+
+def _endpoint_capabilities(
+    results: list[ScenarioResult],
+    operation_capabilities: dict[str, str],
+) -> dict[str, str]:
+    endpoint_operations: dict[str, set[str]] = defaultdict(set)
+    for result in results:
+        key = result.capability_key or result.endpoint
+        if key in operation_capabilities:
+            endpoint_operations[result.endpoint].add(key)
+    return {
+        endpoint: _roll_up_endpoint_capability(
+            [operation_capabilities[key] for key in sorted(keys)]
+        )
+        for endpoint, keys in sorted(endpoint_operations.items())
+    }
 
 
 def _summary(values: list[float]) -> dict[str, float | None]:
@@ -271,8 +291,16 @@ def _result_group_summary(
     }
 
 
-def _merge_capability(current: str | None, new: str) -> str:
-    priority = {"fail": 3, "pass": 2, "missing": 1}
-    if current is None:
-        return new
-    return new if priority.get(new, 0) > priority.get(current, 0) else current
+def _roll_up_endpoint_capability(statuses: list[str]) -> str:
+    return _roll_up_capability(statuses)
+
+
+def _roll_up_capability(statuses: list[str]) -> str:
+    if not statuses:
+        return "missing"
+    if "fail" in statuses:
+        return "fail"
+    unique = set(statuses)
+    if len(unique) == 1:
+        return statuses[0]
+    return "partial"
