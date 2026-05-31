@@ -9,7 +9,11 @@ import time
 
 import aiohttp
 
-from benchmarks.tts_serving.metrics import ScenarioResult, finish_timing
+from benchmarks.tts_serving.metrics import (
+    ScenarioResult,
+    duration_from_audio_bytes,
+    finish_timing,
+)
 from benchmarks.tts_serving.scenarios import Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
 from benchmarks.tts_serving.urls import api_url, websocket_url
@@ -51,11 +55,10 @@ async def run_ws_scenario(
     except aiohttp.WSServerHandshakeError as exc:
         result.http_status = exc.status
         if exc.status == 404:
-            _mark_missing_ws_contract(
+            _mark_unsupported_ws_contract(
                 result,
                 scenario,
                 error=str(exc),
-                allow_missing=spec.params.allow_missing_optional_endpoints,
             )
         else:
             result.status = "failed"
@@ -283,6 +286,7 @@ def _merge_text_event(
             return event_type
         result.ws_active_sentence_index = event["sentence_index"]
         result.ws_active_sentence_bytes = 0
+        result.ws_active_sample_rate = event["sample_rate"]
         result.status = "ok"
         result.capability = "pass"
         return event_type
@@ -311,6 +315,7 @@ def _merge_text_event(
         result.ws_completed_sentences += 1
         result.ws_active_sentence_index = None
         result.ws_active_sentence_bytes = 0
+        result.ws_active_sample_rate = None
         result.status = "ok"
         result.capability = "pass"
         return event_type
@@ -390,6 +395,11 @@ def _record_binary_audio(data: bytes, result: ScenarioResult) -> bool:
     result.audio_bytes += len(data)
     result.ws_active_sentence_bytes += len(data)
     result.response_bytes += len(data)
+    result.audio_duration_s += duration_from_audio_bytes(
+        data,
+        response_format="pcm",
+        sample_rate=result.ws_active_sample_rate or 24000,
+    )
     result.status = "ok"
     result.success = True
     result.capability = "pass"
@@ -410,26 +420,21 @@ def _mark_ws_protocol_error(result: ScenarioResult, error: str) -> None:
     result.error = error
 
 
-def _mark_missing_ws_contract(
+def _mark_unsupported_ws_contract(
     result: ScenarioResult,
     scenario: Scenario,
     *,
     error: str,
-    allow_missing: bool,
 ) -> None:
     result.success = False
-    result.error_class = "missing_contract"
+    result.status = "unsupported_contract"
+    result.capability = "fail"
+    result.error_class = "unsupported_endpoint"
     result.error = (
-        "required benchmark contract is missing: "
+        "enabled benchmark contract is unsupported: "
         f"endpoint={scenario.endpoint}, operation={scenario.capability_key}, "
         f"path={scenario.path}, http_status={result.http_status}, error={error}"
     )
-    if allow_missing:
-        result.status = "missing"
-        result.capability = "missing"
-        return
-    result.status = "missing_contract"
-    result.capability = "fail"
 
 
 async def _probe_speech_after_disconnect(

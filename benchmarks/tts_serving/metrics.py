@@ -28,6 +28,9 @@ class ScenarioResult:
     load_concurrency: int | None = None
     configured_max_concurrency: int | None = None
     peak_inflight: int | None = None
+    peak_pending_tasks: int | None = None
+    scheduled_task_count: int | None = None
+    load_generator_lagged: bool = False
     status: str = "error"
     success: bool = False
     expected_success: bool = True
@@ -55,6 +58,7 @@ class ScenarioResult:
     response_headers: dict[str, str] = field(default_factory=dict)
     ws_event_counts: dict[str, int] = field(default_factory=dict)
     ws_active_sentence_index: int | None = None
+    ws_active_sample_rate: int | None = None
     ws_active_sentence_bytes: int = 0
     ws_completed_sentences: int = 0
     ws_close_reason: str | None = None

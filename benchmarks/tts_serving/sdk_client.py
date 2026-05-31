@@ -139,9 +139,9 @@ def _classify_sdk_status_error(
     result.error_type = exc.__class__.__name__
     result.error = str(exc)
     if status_code == 404 and scenario.expect_success:
-        result.status = "missing_contract"
+        result.status = "unsupported_contract"
         result.capability = "fail"
-        result.error_class = "missing_contract"
+        result.error_class = "unsupported_endpoint"
         return
     if status_code >= 500:
         result.status = "failed"

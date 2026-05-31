@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /workspace
 
-RUN python -m pip install --no-cache-dir aiohttp openai==2.6.1
+RUN python -m pip install --no-cache-dir aiohttp==3.13.5 openai==2.6.1
 RUN mkdir -p /workspace/benchmarks/eval /workspace/benchmarks/tts_serving
 
 COPY benchmarks/eval/benchmark_tts_serving.py /workspace/benchmarks/eval/benchmark_tts_serving.py

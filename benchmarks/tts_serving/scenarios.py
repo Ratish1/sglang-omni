@@ -45,6 +45,7 @@ VOICE_SMALL_UPLOAD_BYTES = 4096
 VOICE_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 VOICE_NEAR_LIMIT_BYTES = VOICE_MAX_UPLOAD_BYTES - 1
 VOICE_OVERSIZED_BYTES = VOICE_MAX_UPLOAD_BYTES + 1
+SPEAKER_MAX_UPLOADED = 1000
 DEFAULT_REFERENCE_AUDIO = (
     "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/"
     "en/prompt-wavs/common_voice_en_10119832.wav"
@@ -57,41 +58,29 @@ VOICE_DESIGN_INSTRUCTIONS = (
 )
 
 PROFILE_MIXES = {
-    "ci": (
-        ("speech_baseline", 42),
-        ("speech_language", 12),
-        ("speech_length", 8),
-        ("speech_reference", 10),
-        ("speech_sdk", 4),
-        ("speech_sse", 10),
-        ("speech_malformed", 8),
-        ("batch", 4),
-        ("voices", 3),
-        ("websocket", 3),
-    ),
     "production": (
-        ("speech_baseline", 34),
-        ("speech_language", 12),
-        ("speech_length", 8),
+        ("speech_baseline", 30),
+        ("speech_language", 11),
+        ("speech_length", 9),
         ("speech_reference", 10),
         ("speech_sdk", 4),
         ("speech_sse", 12),
         ("speech_malformed", 10),
-        ("batch", 6),
-        ("voices", 4),
-        ("websocket", 4),
+        ("batch", 8),
+        ("voices", 6),
+        ("websocket", 6),
     ),
     "stress": (
-        ("speech_baseline", 22),
-        ("speech_language", 8),
-        ("speech_length", 10),
+        ("speech_baseline", 16),
+        ("speech_language", 6),
+        ("speech_length", 12),
         ("speech_reference", 10),
         ("speech_sdk", 5),
         ("speech_sse", 12),
-        ("speech_malformed", 14),
-        ("batch", 10),
-        ("voices", 7),
-        ("websocket", 7),
+        ("speech_malformed", 16),
+        ("batch", 14),
+        ("voices", 12),
+        ("websocket", 15),
     ),
 }
 
@@ -173,7 +162,7 @@ def scenario_set_hash(scenarios: list[Scenario]) -> str:
 
 def _build_stage_scenarios(spec: BenchmarkSpec, stage: LoadStage) -> list[Scenario]:
     rng = random.Random(f"{spec.seed}:{stage.id}")
-    endpoint_set = set(spec.params.enabled_endpoints)
+    endpoint_set = set(stage.enabled_endpoints or spec.params.enabled_endpoints)
     scenarios = _required_stage_scenarios(spec, stage, endpoint_set)[
         : stage.request_count
     ]
@@ -906,16 +895,39 @@ def _required_voice_scenarios(
         ]
     )
     next_index += 7
-    for pressure_index in range(spec.params.voice_cache_pressure_count):
+    for pressure_index in range(spec.params.voice_cache_eviction_count):
         scenarios.append(
             _voice_upload(
                 next_index + pressure_index,
                 spec,
                 stage,
+                upload_size=VOICE_NEAR_LIMIT_BYTES,
+                upload_format="wav",
+                content_type="audio/wav",
+                case="cache_eviction",
+            )
+        )
+    next_index += spec.params.voice_cache_eviction_count
+    successful_uploads = sum(
+        1
+        for scenario in scenarios
+        if scenario.capability_key in {"voices.upload", "voices.lifecycle"}
+        and scenario.expect_success
+    )
+    speaker_cap_successes_remaining = max(SPEAKER_MAX_UPLOADED - successful_uploads, 0)
+    for cap_index in range(spec.params.voice_speaker_cap_count):
+        expect_success = cap_index < speaker_cap_successes_remaining
+        scenarios.append(
+            _voice_upload(
+                next_index + cap_index,
+                spec,
+                stage,
                 upload_size=VOICE_SMALL_UPLOAD_BYTES,
                 upload_format="wav",
                 content_type="audio/wav",
-                case="cache_pressure",
+                case="speaker_cap",
+                expect_success=expect_success,
+                expected_status_class="success" if expect_success else "client_error",
             )
         )
     return scenarios

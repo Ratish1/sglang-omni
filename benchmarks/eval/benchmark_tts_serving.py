@@ -43,6 +43,8 @@ from benchmarks.tts_serving.sdk_client import run_sdk_scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage, SpecError, load_spec
 from benchmarks.tts_serving.ws_client import run_ws_scenario
 
+LOAD_GENERATOR_LAGGED_THRESHOLD_S = 1.0
+
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="TTS serving benchmark harness.")
@@ -173,12 +175,16 @@ async def _run_scheduled_stage(
     started = time.perf_counter()
     pending: set[asyncio.Task[ScenarioResult]] = set()
     results: list[ScenarioResult] = []
+    peak_pending_tasks = 0
+    scheduled_task_count = 0
     for scenario, offset in zip(scenarios, offsets, strict=True):
         planned_start = stage_start + offset
         delay_s = planned_start - time.perf_counter()
         if delay_s > 0:
             await asyncio.sleep(delay_s)
         pending.add(asyncio.create_task(run_planned(scenario, offset)))
+        scheduled_task_count += 1
+        peak_pending_tasks = max(peak_pending_tasks, len(pending))
         done = {task for task in pending if task.done()}
         if done:
             pending.difference_update(done)
@@ -192,12 +198,20 @@ async def _run_scheduled_stage(
         for result in results
         if result.generator_lag_s is not None
     ]
+    max_generator_lag_s = max(generator_lag_s, default=0.0)
+    load_generator_lagged = max_generator_lag_s > LOAD_GENERATOR_LAGGED_THRESHOLD_S
+    for result in results:
+        result.peak_pending_tasks = peak_pending_tasks
+        result.scheduled_task_count = scheduled_task_count
+        result.load_generator_lagged = load_generator_lagged
     harness_log.append(
         f"stage={stage.id} mode={stage.mode} completed {len(results)} scenarios "
         f"with configured_max_concurrency={stage.max_concurrency} "
         f"peak_inflight={peak_inflight} in {time.perf_counter() - started:.3f}s "
         "with scheduled arrivals emitted independently of request completions "
-        f"(generator_lag_max={max(generator_lag_s, default=0.0):.6f}s)"
+        f"(generator_lag_max={max_generator_lag_s:.6f}s, "
+        f"peak_pending_tasks={peak_pending_tasks}, "
+        f"load_generator_lagged={load_generator_lagged})"
     )
     return results
 

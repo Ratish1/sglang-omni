@@ -27,7 +27,6 @@ from benchmarks.tts_serving.urls import api_url
 from benchmarks.tts_serving.voice_upload_fixtures import get_voice_upload_fixture
 
 AUDIO_RESPONSE_FORMATS = {"wav", "pcm", "mp3", "flac", "aac", "opus"}
-OPTIONAL_ENDPOINTS = {"voices", "batch", "websocket"}
 SUCCESS_BATCH_STATUSES = {"ok", "success", "succeeded"}
 FAILED_BATCH_STATUSES = {"error", "failed"}
 VALID_BATCH_TASK_TYPES = {"Base", "CustomVoice", "VoiceDesign"}
@@ -64,24 +63,13 @@ async def run_http_scenario(
                 spec,
                 scenario,
                 result,
-                allow_missing=spec.params.allow_missing_optional_endpoints,
             )
         elif scenario.method == "GET":
             async with session.get(url) as response:
-                await _handle_probe_response(
-                    response,
-                    result,
-                    scenario,
-                    allow_missing=spec.params.allow_missing_optional_endpoints,
-                )
+                await _handle_probe_response(response, result, scenario)
         elif scenario.method == "DELETE":
             async with session.delete(url) as response:
-                await _handle_binary_response(
-                    response,
-                    result,
-                    scenario,
-                    allow_missing=spec.params.allow_missing_optional_endpoints,
-                )
+                await _handle_binary_response(response, result, scenario)
         else:
             body = _request_body(scenario)
             kwargs = (
@@ -97,15 +85,9 @@ async def run_http_scenario(
                         result,
                         start,
                         scenario,
-                        allow_missing=spec.params.allow_missing_optional_endpoints,
                     )
                 else:
-                    await _handle_binary_response(
-                        response,
-                        result,
-                        scenario,
-                        allow_missing=spec.params.allow_missing_optional_endpoints,
-                    )
+                    await _handle_binary_response(response, result, scenario)
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         result.status = "transport_error"
         result.capability = "fail"
@@ -121,18 +103,15 @@ async def _handle_probe_response(
     response: aiohttp.ClientResponse,
     result: ScenarioResult,
     scenario: Scenario,
-    *,
-    allow_missing: bool = False,
 ) -> None:
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
     if response.status == 404:
-        _mark_missing_contract(
+        _mark_unsupported_contract(
             result,
             scenario,
             body=await response.text(),
-            allow_missing=allow_missing,
         )
         return
     if 200 <= response.status < 300:
@@ -151,24 +130,17 @@ async def _handle_binary_response(
     response: aiohttp.ClientResponse,
     result: ScenarioResult,
     scenario: Scenario,
-    *,
-    allow_missing: bool = False,
 ) -> None:
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
     body = await response.read()
     result.response_bytes = len(body)
-    if (
-        response.status == 404
-        and scenario.expect_success
-        and _is_optional_endpoint(scenario)
-    ):
-        _mark_missing_contract(
+    if response.status == 404 and scenario.capability_key != "voices.delete":
+        _mark_unsupported_contract(
             result,
             scenario,
             body=body.decode("utf-8", errors="replace"),
-            allow_missing=allow_missing,
         )
         return
     if 200 <= response.status < 300:
@@ -212,8 +184,6 @@ async def _handle_sse_response(
     result: ScenarioResult,
     start: float,
     scenario: Scenario,
-    *,
-    allow_missing: bool = False,
 ) -> None:
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
@@ -221,17 +191,8 @@ async def _handle_sse_response(
     if response.status != 200:
         body = await response.text()
         result.response_bytes = len(body.encode("utf-8"))
-        if (
-            response.status == 404
-            and scenario.expect_success
-            and _is_optional_endpoint(scenario)
-        ):
-            _mark_missing_contract(
-                result,
-                scenario,
-                body=body,
-                allow_missing=allow_missing,
-            )
+        if response.status == 404:
+            _mark_unsupported_contract(result, scenario, body=body)
             return
         _classify_http_failure(response.status, body, result, scenario)
         return
@@ -394,26 +355,21 @@ def _mark_success(result: ScenarioResult, *, capability: str | None = "pass") ->
         result.capability = capability
 
 
-def _mark_missing_contract(
+def _mark_unsupported_contract(
     result: ScenarioResult,
     scenario: Scenario,
     *,
     body: str,
-    allow_missing: bool,
 ) -> None:
     result.success = False
-    result.error_class = "missing_contract"
+    result.status = "unsupported_contract"
+    result.capability = "fail"
+    result.error_class = "unsupported_endpoint"
     result.error = (
-        "required benchmark contract is missing: "
+        "enabled benchmark contract is unsupported: "
         f"endpoint={scenario.endpoint}, operation={scenario.capability_key}, "
         f"path={scenario.path}, http_status={result.http_status}, body={body}"
     )
-    if allow_missing:
-        result.status = "missing"
-        result.capability = "missing"
-        return
-    result.status = "missing_contract"
-    result.capability = "fail"
 
 
 def _classify_http_failure(
@@ -443,6 +399,9 @@ def _classify_http_failure(
             f"success=false and error details; received status={status}, body={body}"
         )
         return
+    if status == 404:
+        _mark_unsupported_contract(result, scenario, body=body)
+        return
     if (
         400 <= status < 500
         and not scenario.expect_success
@@ -454,7 +413,7 @@ def _classify_http_failure(
         return
     result.status = "failed"
     result.error_class = "http_error"
-    if scenario.expect_success or _is_optional_endpoint(scenario):
+    if scenario.expect_success:
         result.capability = "fail"
 
 
@@ -578,8 +537,6 @@ async def _run_voice_lifecycle(
     spec: BenchmarkSpec,
     scenario: Scenario,
     result: ScenarioResult,
-    *,
-    allow_missing: bool,
 ) -> None:
     upload_url = api_url(spec.base_url, scenario.path)
     body = _request_body(scenario)
@@ -591,11 +548,10 @@ async def _run_voice_lifecycle(
         upload_body = await upload_response.read()
         result.response_bytes += len(upload_body)
         if upload_response.status == 404:
-            _mark_missing_contract(
+            _mark_unsupported_contract(
                 result,
                 scenario,
                 body=upload_body.decode("utf-8", errors="replace"),
-                allow_missing=allow_missing,
             )
             return
         if not 200 <= upload_response.status < 300:
@@ -634,10 +590,6 @@ async def _run_voice_lifecycle(
             )
             return
     _mark_success(result, capability="pass")
-
-
-def _is_optional_endpoint(scenario: Scenario) -> bool:
-    return scenario.endpoint in OPTIONAL_ENDPOINTS
 
 
 def _scenario_response_format(scenario: Scenario) -> str | None:

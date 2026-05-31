@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 VALID_TEST_TYPES = {"engine", "e2e", "external"}
-VALID_PROFILES = {"ci", "production", "stress"}
+VALID_PROFILES = {"production", "stress"}
 VALID_LOAD_MODES = {"closed_loop", "open_loop", "ramp", "burst", "soak"}
 VALID_ARRIVAL_DISTRIBUTIONS = {"deterministic", "poisson"}
 DEFAULT_ENDPOINTS = ("speech", "speech_sse", "voices", "batch", "websocket")
@@ -45,6 +45,7 @@ class LoadStage:
     start_request_rate: float | None = None
     duration_s: float | None = None
     arrival_distribution: str = "deterministic"
+    enabled_endpoints: tuple[str, ...] | None = None
 
     @classmethod
     def from_obj(cls, obj: Any, *, index: int) -> LoadStage:
@@ -88,6 +89,10 @@ class LoadStage:
             raise SpecError(
                 "params.load_stages[].duration_s is required for soak stages"
             )
+        enabled_endpoints = _optional_enabled_endpoints(
+            obj.get("enabled_endpoints"),
+            "params.load_stages[].enabled_endpoints",
+        )
         return cls(
             id=stage_id,
             mode=mode,
@@ -97,6 +102,7 @@ class LoadStage:
             start_request_rate=start_request_rate,
             duration_s=duration_s,
             arrival_distribution=arrival_distribution,
+            enabled_endpoints=enabled_endpoints,
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -111,12 +117,17 @@ class LoadStage:
             "start_request_rate": self.start_request_rate,
             "duration_s": self.duration_s,
             "arrival_distribution": self.arrival_distribution,
+            "enabled_endpoints": (
+                list(self.enabled_endpoints)
+                if self.enabled_endpoints is not None
+                else None
+            ),
         }
 
 
 @dataclass(frozen=True)
 class BenchmarkParams:
-    profile: str = "ci"
+    profile: str = "production"
     total_requests: int = 100
     max_concurrency: int = 8
     concurrency_levels: tuple[int, ...] | None = None
@@ -124,10 +135,10 @@ class BenchmarkParams:
     request_rate: float = float("inf")
     timeout_s: int = 120
     enabled_endpoints: tuple[str, ...] = DEFAULT_ENDPOINTS
-    allow_missing_optional_endpoints: bool = False
     seedtts_ref_audio: str | None = None
     seedtts_ref_text: str | None = None
-    voice_cache_pressure_count: int = 0
+    voice_cache_eviction_count: int = 0
+    voice_speaker_cap_count: int = 0
     provider_label: str | None = None
     implementation_label: str | None = None
 
@@ -147,6 +158,10 @@ class BenchmarkParams:
         concurrency_levels = _concurrency_levels(obj.get("concurrency_levels"))
         timeout_s = _positive_int(obj, "timeout_s", cls.timeout_s)
         request_rate = _request_rate(obj.get("request_rate", cls.request_rate))
+        enabled = _enabled_endpoints(
+            obj.get("enabled_endpoints", list(DEFAULT_ENDPOINTS)),
+            "params.enabled_endpoints",
+        )
         load_stages = _load_stages(
             obj.get("load_stages"),
             total_requests=total_requests,
@@ -154,17 +169,6 @@ class BenchmarkParams:
             concurrency_levels=concurrency_levels,
             request_rate=request_rate,
         )
-
-        enabled = obj.get("enabled_endpoints", list(DEFAULT_ENDPOINTS))
-        if not isinstance(enabled, list) or not all(
-            isinstance(item, str) for item in enabled
-        ):
-            raise SpecError("params.enabled_endpoints must be a list of strings")
-        if not enabled:
-            raise SpecError("params.enabled_endpoints must not be empty")
-        unknown = sorted(set(enabled) - set(DEFAULT_ENDPOINTS))
-        if unknown:
-            raise SpecError(f"unknown enabled_endpoints: {unknown}")
 
         return cls(
             profile=profile,
@@ -178,18 +182,18 @@ class BenchmarkParams:
             load_stages=load_stages,
             request_rate=request_rate,
             timeout_s=timeout_s,
-            enabled_endpoints=tuple(enabled),
-            allow_missing_optional_endpoints=_bool_value(
-                obj,
-                "allow_missing_optional_endpoints",
-                cls.allow_missing_optional_endpoints,
-            ),
+            enabled_endpoints=enabled,
             seedtts_ref_audio=_optional_str(obj, "seedtts_ref_audio"),
             seedtts_ref_text=_optional_str(obj, "seedtts_ref_text"),
-            voice_cache_pressure_count=_nonnegative_int(
+            voice_cache_eviction_count=_nonnegative_int(
                 obj,
-                "voice_cache_pressure_count",
-                cls.voice_cache_pressure_count,
+                "voice_cache_eviction_count",
+                cls.voice_cache_eviction_count,
+            ),
+            voice_speaker_cap_count=_nonnegative_int(
+                obj,
+                "voice_speaker_cap_count",
+                cls.voice_speaker_cap_count,
             ),
             provider_label=_optional_str(obj, "provider_label"),
             implementation_label=_optional_str(obj, "implementation_label"),
@@ -278,13 +282,6 @@ def _nonnegative_int(obj: dict[str, Any], key: str, default: int) -> int:
     return value
 
 
-def _bool_value(obj: dict[str, Any], key: str, default: bool) -> bool:
-    value = obj.get(key, default)
-    if not isinstance(value, bool):
-        raise SpecError(f"params.{key} must be a boolean")
-    return value
-
-
 def _request_rate(value: Any) -> float:
     if value == "inf":
         return float("inf")
@@ -324,6 +321,24 @@ def _concurrency_levels(value: Any) -> tuple[int, ...] | None:
     return tuple(levels)
 
 
+def _enabled_endpoints(value: Any, key: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise SpecError(f"{key} must be a list of strings")
+    if not value:
+        raise SpecError(f"{key} must not be empty")
+    unknown = sorted(set(value) - set(DEFAULT_ENDPOINTS))
+    if unknown:
+        raise SpecError(f"unknown {key}: {unknown}")
+    deduped = list(dict.fromkeys(value))
+    return tuple(deduped)
+
+
+def _optional_enabled_endpoints(value: Any, key: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    return _enabled_endpoints(value, key)
+
+
 def _load_stages(
     value: Any,
     *,
@@ -349,6 +364,7 @@ def _load_stages(
             request_count=total_requests,
             max_concurrency=level,
             request_rate=request_rate,
+            enabled_endpoints=None,
         )
         for level in levels
     )

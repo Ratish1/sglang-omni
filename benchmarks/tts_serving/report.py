@@ -84,10 +84,8 @@ def build_results_report(
             ),
             "timeout_s": spec.params.timeout_s,
             "enabled_endpoints": list(spec.params.enabled_endpoints),
-            "allow_missing_optional_endpoints": (
-                spec.params.allow_missing_optional_endpoints
-            ),
-            "voice_cache_pressure_count": spec.params.voice_cache_pressure_count,
+            "voice_cache_eviction_count": spec.params.voice_cache_eviction_count,
+            "voice_speaker_cap_count": spec.params.voice_speaker_cap_count,
             "voice_upload_coverage": _voice_upload_coverage(scenarios or []),
             "load_stages": [stage.to_json() for stage in spec.params.load_stages],
         },
@@ -101,6 +99,17 @@ def build_results_report(
             "peak_inflight": max(
                 (result.peak_inflight for result in results if result.peak_inflight),
                 default=None,
+            ),
+            "peak_pending_tasks": max(
+                (
+                    result.peak_pending_tasks
+                    for result in results
+                    if result.peak_pending_tasks
+                ),
+                default=None,
+            ),
+            "load_generator_lagged": any(
+                result.load_generator_lagged for result in results
             ),
             "rtf": _summary(rtfs),
             "rtf_sampled_formats": ["wav", "pcm"],
@@ -127,20 +136,16 @@ def build_results_report(
             "by_stage": _by_stage(spec, results),
             "by_endpoint": _by_endpoint(spec, results),
             "by_operation": _by_operation(spec, results),
-            "by_concurrency": _by_concurrency(spec, results),
+            "by_configured_concurrency": _by_configured_concurrency(spec, results),
+            "by_peak_inflight": _by_peak_inflight(spec, results),
         },
         "failures": [
             result.to_json() for result in results if not _result_passed(spec, result)
         ][:100],
-        "missing_capabilities": [
+        "unsupported_contracts": [
             result.to_json()
             for result in results
-            if result.status in {"missing", "missing_contract"}
-        ],
-        "missing_contracts": [
-            result.to_json()
-            for result in results
-            if result.status == "missing_contract"
+            if result.status == "unsupported_contract"
         ],
     }
 
@@ -156,8 +161,6 @@ def _is_benchmark_passed(
 
 
 def _result_passed(spec: BenchmarkSpec, result: ScenarioResult) -> bool:
-    if result.status == "missing" and spec.params.allow_missing_optional_endpoints:
-        return True
     if result.expected_success:
         return result.success
     return result.status == "expected_error"
@@ -267,13 +270,27 @@ def _by_operation(
     }
 
 
-def _by_concurrency(
+def _by_configured_concurrency(
     spec: BenchmarkSpec, results: list[ScenarioResult]
 ) -> dict[str, dict[str, Any]]:
     grouped: dict[int, list[ScenarioResult]] = defaultdict(list)
     for result in results:
         if result.load_concurrency is not None:
             grouped[result.load_concurrency].append(result)
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for level, level_results in sorted(grouped.items()):
+        summaries[str(level)] = _result_group_summary(spec, level_results)
+    return summaries
+
+
+def _by_peak_inflight(
+    spec: BenchmarkSpec, results: list[ScenarioResult]
+) -> dict[str, dict[str, Any]]:
+    grouped: dict[int, list[ScenarioResult]] = defaultdict(list)
+    for result in results:
+        if result.peak_inflight is not None:
+            grouped[result.peak_inflight].append(result)
 
     summaries: dict[str, dict[str, Any]] = {}
     for level, level_results in sorted(grouped.items()):
@@ -295,12 +312,26 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         if scenario.capability_key == "voices.upload"
         and scenario.planned_metadata.get("upload_case") == "near_limit"
     }
+    cache_eviction_formats = {
+        str(scenario.planned_metadata.get("upload_format"))
+        for scenario in scenarios
+        if scenario.capability_key == "voices.upload"
+        and scenario.planned_metadata.get("upload_case") == "cache_eviction"
+    }
+    speaker_cap_cases = sum(
+        1
+        for scenario in scenarios
+        if scenario.capability_key == "voices.upload"
+        and scenario.planned_metadata.get("upload_case") == "speaker_cap"
+    )
     return {
         "accepted_format_cases": sorted(successful_formats),
         "configured_accepted_formats": [
             upload_format for upload_format, _ in VOICE_UPLOAD_SUCCESS_FORMATS
         ],
         "near_limit_formats": sorted(near_limit_formats),
+        "cache_eviction_formats": sorted(cache_eviction_formats),
+        "speaker_cap_cases": speaker_cap_cases,
         "near_limit_note": (
             "Near-limit upload pressure uses WAV because the benchmark generates "
             "valid large audio bytes locally; compact embedded fixtures cover "
@@ -362,6 +393,25 @@ def _result_group_summary(
         "peak_inflight": max(
             (result.peak_inflight for result in results if result.peak_inflight),
             default=None,
+        ),
+        "peak_pending_tasks": max(
+            (
+                result.peak_pending_tasks
+                for result in results
+                if result.peak_pending_tasks
+            ),
+            default=None,
+        ),
+        "scheduled_task_count": max(
+            (
+                result.scheduled_task_count
+                for result in results
+                if result.scheduled_task_count
+            ),
+            default=None,
+        ),
+        "load_generator_lagged": any(
+            result.load_generator_lagged for result in results
         ),
         "offered_rps": (
             len(results) / planned_window_s

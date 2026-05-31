@@ -93,14 +93,19 @@ python -m benchmarks.eval.benchmark_tts_serving \
 # {
 #   "profile": "stress",
 #   "enabled_endpoints": ["speech", "speech_sse", "voices", "batch", "websocket"],
-#   "allow_missing_optional_endpoints": false,
-#   "voice_cache_pressure_count": 64,
+#   "voice_cache_eviction_count": 64,
+#   "voice_speaker_cap_count": 0,
 #   "load_stages": [
 #     {"id": "closed-1", "mode": "closed_loop", "request_count": 32, "max_concurrency": 1},
 #     {"id": "closed-16", "mode": "closed_loop", "request_count": 128, "max_concurrency": 16},
 #     {"id": "ramp-128", "mode": "ramp", "request_count": 256, "max_concurrency": 128,
 #      "start_request_rate": 2, "request_rate": 64, "arrival_distribution": "poisson"},
-#     {"id": "burst-128", "mode": "burst", "request_count": 256, "max_concurrency": 128}
+#     {"id": "ws-burst-512", "mode": "burst", "request_count": 512, "max_concurrency": 512,
+#      "enabled_endpoints": ["websocket"]},
+#     {"id": "voice-cache-evict", "mode": "closed_loop", "request_count": 96,
+#      "max_concurrency": 16, "enabled_endpoints": ["voices"]},
+#     {"id": "mixed-burst-256", "mode": "burst", "request_count": 512,
+#      "max_concurrency": 256}
 #   ]
 # }
 
