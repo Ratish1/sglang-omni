@@ -44,9 +44,14 @@ def build_results_report(
         r.generator_lag_s for r in results if r.generator_lag_s is not None
     ]
     load_generation_valid = not any(result.load_generator_lagged for result in results)
+    voice_upload_coverage = _voice_upload_coverage(scenarios or [])
+    coverage_contract_valid = _coverage_contract_valid(
+        scenarios or [], voice_upload_coverage
+    )
     passed = (
         harness_status == "ok"
         and load_generation_valid
+        and coverage_contract_valid
         and _is_benchmark_passed(spec, results, capabilities)
     )
     return {
@@ -63,6 +68,7 @@ def build_results_report(
             "succeeded": succeeded,
             "failed": failed,
             "load_generation_valid": load_generation_valid,
+            "coverage_contract_valid": coverage_contract_valid,
         },
         "config": {
             "test_type": spec.test_type,
@@ -70,6 +76,7 @@ def build_results_report(
             "model_name": spec.model_name,
             "run_id": spec.run_id,
             "seed": spec.seed,
+            "platform_metadata": spec.platform_metadata,
             "provider_label": spec.params.provider_label,
             "implementation_label": spec.params.implementation_label,
             "profile": spec.params.profile,
@@ -90,7 +97,7 @@ def build_results_report(
             "enabled_endpoints": list(spec.params.enabled_endpoints),
             "voice_cache_eviction_count": spec.params.voice_cache_eviction_count,
             "voice_speaker_cap_count": spec.params.voice_speaker_cap_count,
-            "voice_upload_coverage": _voice_upload_coverage(scenarios or []),
+            "voice_upload_coverage": voice_upload_coverage,
             "load_stages": [stage.to_json() for stage in spec.params.load_stages],
         },
         "capabilities": capabilities,
@@ -156,6 +163,7 @@ def build_results_report(
             for result in results
             if result.status == "unsupported_contract"
         ],
+        "coverage_failures": _coverage_failures(scenarios or [], voice_upload_coverage),
     }
 
 
@@ -350,13 +358,38 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         "near_limit_pr1_gap": (
             (
                 "Valid just-under-10MB fixtures are currently generated only for WAV; "
-                "non-WAV near-limit formats are reported as an explicit coverage gap "
-                "instead of using invalid padded containers."
+                "when voices are enabled, missing non-WAV near-limit formats make "
+                "the benchmark fail instead of using invalid padded containers."
             )
             if near_limit_missing_formats
             else None
         ),
     }
+
+
+def _coverage_contract_valid(
+    scenarios: list[Scenario], voice_upload_coverage: dict[str, Any]
+) -> bool:
+    voices_enabled = any(scenario.endpoint == "voices" for scenario in scenarios)
+    if voices_enabled and not voice_upload_coverage["near_limit_contract_complete"]:
+        return False
+    return True
+
+
+def _coverage_failures(
+    scenarios: list[Scenario], voice_upload_coverage: dict[str, Any]
+) -> list[dict[str, Any]]:
+    voices_enabled = any(scenario.endpoint == "voices" for scenario in scenarios)
+    if not voices_enabled or voice_upload_coverage["near_limit_contract_complete"]:
+        return []
+    return [
+        {
+            "contract": "voices.near_limit_upload_formats",
+            "status": "failed",
+            "missing_formats": voice_upload_coverage["near_limit_missing_formats"],
+            "error": voice_upload_coverage["near_limit_pr1_gap"],
+        }
+    ]
 
 
 def _result_group_summary(

@@ -98,6 +98,8 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #     {"id": "closed-16", "mode": "closed_loop", "request_count": 128, "max_concurrency": 16},
 #     {"id": "ramp-128", "mode": "ramp", "request_count": 256, "max_concurrency": 128,
 #      "start_request_rate": 2, "request_rate": 64, "arrival_distribution": "poisson"},
+#     {"id": "soak-300s", "mode": "soak", "request_count": 512, "duration_s": 300,
+#      "max_concurrency": 128, "arrival_distribution": "poisson"},
 #     {"id": "ws-burst-512", "mode": "burst", "request_count": 512, "max_concurrency": 512,
 #      "enabled_endpoints": ["websocket"]},
 #     {"id": "voice-cache-evict", "mode": "closed_loop", "request_count": 96,
@@ -110,8 +112,8 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #      "max_concurrency": 256}
 #   ]
 # }
-# Near-limit non-WAV upload cases are reported as an explicit PR1 coverage gap
-# until valid just-under-10MB fixtures can be added without padded fake containers.
+# With voices enabled, missing just-under-10MB upload coverage for any accepted
+# audio format is reported as a failing benchmark coverage contract.
 
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
 python -m benchmarks.eval.benchmark_omni_seedtts \

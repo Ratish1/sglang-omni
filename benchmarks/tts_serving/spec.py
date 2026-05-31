@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -55,7 +54,6 @@ LOAD_STAGE_KEYS = {
     "voice_cache_eviction_count",
     "voice_speaker_cap_count",
 }
-SOAK_REQUEST_RATE_TOLERANCE = 1e-9
 
 
 class SpecError(ValueError):
@@ -115,7 +113,6 @@ class LoadStage:
             "max_concurrency",
             _positive_int(obj, "concurrency", 8),
         )
-        request_rate_provided = "request_rate" in obj
         request_rate = _request_rate(obj.get("request_rate", float("inf")))
         start_request_rate = _optional_request_rate(obj.get("start_request_rate"))
         duration_s = _optional_positive_float(obj.get("duration_s"), "duration_s")
@@ -139,20 +136,7 @@ class LoadStage:
             )
         if mode == "soak":
             assert duration_s is not None
-            effective_request_rate = request_count / duration_s
-            if request_rate == float("inf"):
-                request_rate = effective_request_rate
-            elif request_rate_provided and not math.isclose(
-                request_rate,
-                effective_request_rate,
-                rel_tol=SOAK_REQUEST_RATE_TOLERANCE,
-                abs_tol=SOAK_REQUEST_RATE_TOLERANCE,
-            ):
-                raise SpecError(
-                    "params.load_stages[].request_rate for soak stages must match "
-                    "request_count / duration_s; omit request_rate to use the "
-                    f"derived value {effective_request_rate}"
-                )
+            request_rate = request_count / duration_s
         enabled_endpoints = _optional_enabled_endpoints(
             obj.get("enabled_endpoints"),
             "params.load_stages[].enabled_endpoints",
@@ -286,12 +270,15 @@ class BenchmarkSpec:
     seed: int = 601
     auth: AuthSpec = field(default_factory=AuthSpec)
     params: BenchmarkParams = field(default_factory=BenchmarkParams)
+    platform_metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_obj(cls, obj: Any) -> BenchmarkSpec:
         if not isinstance(obj, dict):
             raise SpecError("spec must be a JSON object")
-        _reject_unknown_keys(obj, TOP_LEVEL_KEYS, "spec")
+        platform_metadata = {
+            key: value for key, value in obj.items() if key not in TOP_LEVEL_KEYS
+        }
         base_url = _required_str(obj, "base_url").rstrip("/")
         model_name = _required_str(obj, "model_name")
         test_type = _str_value(obj, "test_type", "engine")
@@ -309,6 +296,7 @@ class BenchmarkSpec:
             seed=seed,
             auth=AuthSpec.from_obj(obj.get("auth")),
             params=BenchmarkParams.from_obj(obj.get("params")),
+            platform_metadata=platform_metadata,
         )
 
 

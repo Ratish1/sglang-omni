@@ -77,10 +77,10 @@ def duration_from_audio_bytes(
 ) -> float:
     fmt = (response_format or "").lower()
     ctype = (content_type or "").lower()
-    if fmt == "pcm" or "audio/pcm" in ctype or ctype == "application/octet-stream":
-        return len(data) / float(sample_rate * PCM_CHANNELS * PCM_SAMPLE_WIDTH)
     if len(data) > 44 and data[:4] == b"RIFF":
         return _wav_duration(data)
+    if fmt == "pcm" or "audio/pcm" in ctype or "audio/raw" in ctype:
+        return len(data) / float(sample_rate * PCM_CHANNELS * PCM_SAMPLE_WIDTH)
     return 0.0
 
 

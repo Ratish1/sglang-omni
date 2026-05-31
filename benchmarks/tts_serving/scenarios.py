@@ -112,9 +112,15 @@ ADVERSARIAL_TEXTS = (
 
 REFERENCE_FAILURES = (
     ("bad_base64", "data:audio/wav;base64,not-valid-base64"),
-    ("not_found_url", "https://example.invalid/seedtts/missing.wav"),
+    ("dns_failure_url", "https://example.invalid/seedtts/missing.wav"),
+    (
+        "not_found_url",
+        "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/"
+        "resolve/main/en/prompt-wavs/does-not-exist-issue-601.wav",
+    ),
     ("html_url", "https://example.com/"),
-    ("wrong_content_type", "https://example.com/index.html"),
+    ("wrong_content_type", "https://www.iana.org/_img/2013.1/iana-logo-header.svg"),
+    ("timeout_url", "http://192.0.2.1/seedtts/timeout.wav"),
     ("disallowed_file", "file:///etc/passwd"),
 )
 
@@ -339,6 +345,7 @@ def _weighted_scenario(
             _websocket_normal(index, spec, stage),
             _websocket_multi_sentence(index, spec, stage),
             _websocket_stream_audio(index, spec, stage),
+            _websocket_input_done_without_config(index, spec, stage),
             _websocket_malformed_json(index, spec, stage),
             _websocket_disconnect(index, spec, stage),
         )
