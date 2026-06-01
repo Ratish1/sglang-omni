@@ -198,57 +198,106 @@ async def run_voice_lifecycle(
     result: ScenarioResult,
 ) -> None:
     upload_url = api_url(spec.base_url, scenario.path)
-    body = request_body(scenario)
-    result.request_bytes = request_size(scenario)
-    async with session.post(upload_url, data=body) as upload_response:
-        result.http_status = upload_response.status
-        result.http_status_class = classify_http_status(upload_response.status)
-        result.response_headers = dict(upload_response.headers)
-        upload_body = await upload_response.read()
-        result.response_bytes += len(upload_body)
-        if upload_response.status in UNSUPPORTED_HTTP_STATUSES:
-            _mark_unsupported_contract(
-                result,
-                scenario,
-                body=upload_body.decode("utf-8", errors="replace"),
-            )
-            return
-        if not 200 <= upload_response.status < 300:
-            _classify_http_failure(
-                upload_response.status,
-                upload_body.decode("utf-8", errors="replace"),
-                result,
-                scenario,
-            )
-            return
-        handle_voice_success(upload_body, result, scenario)
-        if not result.success:
-            return
-
     voice_name = str(scenario.planned_metadata.get("voice_name", ""))
-    delete_url = api_url(spec.base_url, f"/v1/audio/voices/{voice_name}")
-    async with session.delete(delete_url) as delete_response:
-        result.http_status = delete_response.status
-        result.http_status_class = classify_http_status(delete_response.status)
-        result.response_headers = dict(delete_response.headers)
-        delete_body = await delete_response.read()
-        result.response_bytes += len(delete_body)
-        if not 200 <= delete_response.status < 300:
-            _classify_http_failure(
-                delete_response.status,
-                delete_body.decode("utf-8", errors="replace"),
-                result,
+    created_voice_names: list[str] = []
+    try:
+        result.request_bytes = request_size(scenario)
+        payload = await _post_voice_upload(
+            session,
+            upload_url,
+            scenario,
+            result,
+            form_fields=scenario.form_fields,
+        )
+        if payload is None:
+            return
+        created_voice_names.append(voice_name)
+        if not _require_voice_upload_identifier(
+            payload,
+            result,
+            error="voice lifecycle upload response must include an identifier",
+        ):
+            return
+        before_delete = await _require_uploaded_voice_present(
+            session,
+            spec,
+            scenario,
+            result,
+            voice_name,
+            operation="voice lifecycle upload",
+        )
+        if before_delete is None:
+            return
+        if not await _delete_voice_by_name(session, spec, scenario, result, voice_name):
+            return
+        after_delete = await _get_voice_list(session, spec, scenario, result)
+        if after_delete is None:
+            return
+        if not _require_voice_absent_in_list(after_delete, result, voice_name):
+            return
+        if not await _expect_deleted_voice_speech_404(
+            session, spec, scenario, result, voice_name
+        ):
+            return
+        if not _validate_delete_invalidation_counter(
+            before_delete,
+            after_delete,
+            result,
+        ):
+            return
+        _mark_success(result, capability="pass")
+    finally:
+        cleanup_error = await _cleanup_voice_names(session, spec, created_voice_names)
+        if cleanup_error is not None:
+            _mark_cleanup_error_if_primary_path_passed(result, cleanup_error)
+
+
+async def run_voice_upload(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+) -> None:
+    upload_url = api_url(spec.base_url, scenario.path)
+    voice_name = str(scenario.planned_metadata.get("voice_name", ""))
+    created_voice_names: list[str] = []
+    try:
+        result.request_bytes = request_size(scenario)
+        payload = await _post_voice_upload(
+            session,
+            upload_url,
+            scenario,
+            result,
+            form_fields=scenario.form_fields,
+        )
+        if payload is None:
+            return
+        created_voice_names.append(voice_name)
+        if not _require_voice_upload_identifier(
+            payload,
+            result,
+            error="voice upload response must include id, voice_id, or name",
+        ):
+            return
+        if (
+            await _require_uploaded_voice_present(
+                session,
+                spec,
                 scenario,
-            )
-            return
-        if not _is_valid_voice_delete_success(delete_body):
-            _mark_protocol_error(
                 result,
-                status="invalid_voice_response",
-                error="voice lifecycle delete response must be success JSON",
+                voice_name,
+                operation="voice upload",
             )
+            is None
+        ):
             return
-    _mark_success(result, capability="pass")
+        if not await _delete_voice_by_name(session, spec, scenario, result, voice_name):
+            return
+        _mark_success(result, capability="pass")
+    finally:
+        cleanup_error = await _cleanup_voice_names(session, spec, created_voice_names)
+        if cleanup_error is not None:
+            _mark_cleanup_error_if_primary_path_passed(result, cleanup_error)
 
 
 async def run_voice_overwrite(
@@ -977,6 +1026,53 @@ async def _post_speech_with_uploaded_voice(
         return True
 
 
+async def _expect_deleted_voice_speech_404(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    voice_name: str,
+) -> bool:
+    payload = {
+        "model": spec.model_name,
+        "input": "This request must fail because the uploaded voice was deleted.",
+        "voice": voice_name,
+        "response_format": "pcm",
+        "speed": 1.0,
+    }
+    result.request_bytes += len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    speech_url = api_url(spec.base_url, "/v1/audio/speech")
+    async with session.post(speech_url, json=payload) as response:
+        result.http_status = response.status
+        result.http_status_class = classify_http_status(response.status)
+        result.response_headers = dict(response.headers)
+        body = await response.read()
+        result.response_bytes += len(body)
+        status = response.status
+    body_text = body.decode("utf-8", errors="replace")
+    if status != 404:
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=(
+                "speech with a deleted uploaded voice must return HTTP 404 "
+                f"with structured error JSON; got HTTP {status}: {body_text}"
+            ),
+        )
+        return False
+    if not _is_valid_error_response(status, body_text, expected_status=404):
+        _mark_protocol_error(
+            result,
+            status="invalid_error_response",
+            error=(
+                "speech with a deleted uploaded voice returned HTTP 404 without "
+                f"OpenAI-compatible error JSON: {body_text}"
+            ),
+        )
+        return False
+    return True
+
+
 async def _raw_post(
     session: aiohttp.ClientSession,
     url: str,
@@ -991,6 +1087,14 @@ async def _raw_delete(
     url: str,
 ) -> RawVoiceResponse:
     async with session.delete(url) as response:
+        return response.status, await response.read(), dict(response.headers)
+
+
+async def _raw_get(
+    session: aiohttp.ClientSession,
+    url: str,
+) -> RawVoiceResponse:
+    async with session.get(url) as response:
         return response.status, await response.read(), dict(response.headers)
 
 
@@ -1138,6 +1242,49 @@ def _validate_uploaded_voice_metadata_sequence(
     return True
 
 
+def _validate_delete_invalidation_counter(
+    before_delete: dict[str, Any],
+    after_delete: dict[str, Any],
+    result: ScenarioResult,
+) -> bool:
+    before_counter = _recursive_counter_value(
+        before_delete, "delete_invalidation_counter"
+    )
+    after_counter = _recursive_counter_value(
+        after_delete, "delete_invalidation_counter"
+    )
+    if before_counter is None or after_counter is None:
+        return True
+    if after_counter > before_counter:
+        return True
+    _mark_protocol_error(
+        result,
+        status="invalid_voice_response",
+        error=(
+            "voice delete did not advance delete_invalidation_counter "
+            f"(before={before_counter}, after={after_counter})"
+        ),
+    )
+    return False
+
+
+def _recursive_counter_value(payload: Any, key: str) -> int | None:
+    if isinstance(payload, dict):
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        for child in payload.values():
+            found = _recursive_counter_value(child, key)
+            if found is not None:
+                return found
+    if isinstance(payload, list):
+        for child in payload:
+            found = _recursive_counter_value(child, key)
+            if found is not None:
+                return found
+    return None
+
+
 async def _get_voice_list(
     session: aiohttp.ClientSession,
     spec: BenchmarkSpec,
@@ -1197,6 +1344,71 @@ async def _get_uploaded_voices(
     return [voice for voice in uploaded_voices if isinstance(voice, dict)]
 
 
+async def _require_uploaded_voice_present(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    voice_name: str,
+    *,
+    operation: str,
+) -> dict[str, Any] | None:
+    voice_list = await _get_voice_list(session, spec, scenario, result)
+    if voice_list is None:
+        return None
+    if not _is_valid_voice_list_response(voice_list):
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=(
+                f"{operation} requires voice list response with valid preset "
+                "and uploaded voice metadata"
+            ),
+        )
+        return None
+    entries = _uploaded_voice_entries(voice_list, voice_name)
+    if len(entries) != 1:
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=(
+                f"{operation} must expose exactly one uploaded voice named "
+                f"{voice_name!r}; observed={len(entries)}"
+            ),
+        )
+        return None
+    return voice_list
+
+
+def _require_voice_absent_in_list(
+    voice_list: dict[str, Any],
+    result: ScenarioResult,
+    voice_name: str,
+) -> bool:
+    if not _is_valid_voice_list_response(voice_list):
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=(
+                "post-delete voice list response must include valid voices and "
+                "uploaded_voices metadata"
+            ),
+        )
+        return False
+    entries = _uploaded_voice_entries(voice_list, voice_name)
+    if entries:
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=(
+                "voice delete reported success but uploaded_voices still contains "
+                f"{voice_name!r}"
+            ),
+        )
+        return False
+    return True
+
+
 async def _delete_voice_by_name(
     session: aiohttp.ClientSession,
     spec: BenchmarkSpec,
@@ -1233,6 +1445,11 @@ async def _delete_voice_by_name(
                 error="voice cleanup delete response must be success JSON",
             )
             return False
+    voice_list = await _get_voice_list(session, spec, scenario, result)
+    if voice_list is None:
+        return False
+    if not _require_voice_absent_in_list(voice_list, result, voice_name):
+        return False
     return True
 
 
@@ -1249,12 +1466,64 @@ async def _cleanup_voice_names(
             return f"voice cleanup failed for {voice_name!r}: {exc}"
         body_text = body.decode("utf-8", errors="replace")
         if status == 404:
+            absent_error = await _cleanup_voice_absence_error(session, spec, voice_name)
+            if absent_error is not None:
+                return absent_error
             continue
         if not 200 <= status < 300 or not _is_valid_voice_delete_success(body):
             return (
                 f"voice cleanup failed for {voice_name!r}: "
                 f"status={status}, body={body_text}"
             )
+        absent_error = await _cleanup_voice_absence_error(session, spec, voice_name)
+        if absent_error is not None:
+            return absent_error
+    return None
+
+
+async def _cleanup_voice_absence_error(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    voice_name: str,
+) -> str | None:
+    list_url = api_url(spec.base_url, "/v1/audio/voices")
+    try:
+        status, body, _ = await _raw_get(session, list_url)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        return f"voice cleanup list verification failed for {voice_name!r}: {exc}"
+    body_text = body.decode("utf-8", errors="replace")
+    if status in UNSUPPORTED_HTTP_STATUSES:
+        return (
+            f"voice cleanup list verification failed for {voice_name!r}: "
+            f"voice list endpoint unsupported after delete, status={status}, body={body_text}"
+        )
+    if not 200 <= status < 300:
+        return (
+            f"voice cleanup list verification failed for {voice_name!r}: "
+            f"status={status}, body={body_text}"
+        )
+    try:
+        payload = json.loads(body_text) if body else {}
+    except json.JSONDecodeError as exc:
+        return (
+            f"voice cleanup list verification failed for {voice_name!r}: "
+            f"invalid JSON: {exc}"
+        )
+    if not isinstance(payload, dict):
+        return (
+            f"voice cleanup list verification failed for {voice_name!r}: "
+            "voice list response must be a JSON object"
+        )
+    if not _is_valid_voice_list_response(payload):
+        return (
+            f"voice cleanup list verification failed for {voice_name!r}: "
+            "voice list response must include valid voices and uploaded_voices metadata"
+        )
+    if _uploaded_voice_entries(payload, voice_name):
+        return (
+            f"voice cleanup failed for {voice_name!r}: delete returned success "
+            "but uploaded_voices still contains the voice"
+        )
     return None
 
 

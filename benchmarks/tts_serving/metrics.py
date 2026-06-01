@@ -143,10 +143,11 @@ def parse_sse_audio_event(line: str) -> tuple[bytes | None, dict[str, Any] | Non
 
 
 def finish_timing(result: ScenarioResult, start: float) -> None:
-    now = time.perf_counter()
-    result.latency_s = now - start
-    result.completed_s = now
-    if result.audio_duration_s > 0:
+    if result.completed_s is None:
+        now = time.perf_counter()
+        result.latency_s = now - start
+        result.completed_s = now
+    if result.audio_duration_s > 0 and result.rtf <= 0:
         result.rtf = result.latency_s / result.audio_duration_s
 
 

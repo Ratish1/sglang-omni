@@ -10,11 +10,11 @@ import random
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from benchmarks.tts_serving.metrics import PCM_SAMPLE_RATE, PCM_SAMPLE_WIDTH
 from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage
 from benchmarks.tts_serving.voice_upload_fixtures import (
     VOICE_UPLOAD_FIXTURE_SIZES,
     VOICE_UPLOAD_WAV_FIXTURE_SIZE,
+    get_wav_upload_fixture,
 )
 
 SCENARIO_SCHEMA_VERSION = 2
@@ -79,10 +79,6 @@ VOICE_DESIGN_INSTRUCTIONS = (
     "A warm, steady adult voice with precise articulation and no dramatic affect."
 )
 INITIAL_CODEC_CHUNK_FRAMES = 4
-TINY_WAV_PAYLOAD_BYTES = 48
-WAV_PCM_BITS_PER_SAMPLE = 16
-WAV_PCM_FORMAT_CODE = 1
-WAV_MONO_CHANNELS = 1
 
 PROFILE_MIXES = {
     "production": (
@@ -768,8 +764,8 @@ def _speech_reference_base64_success(
 ) -> Scenario:
     payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
     payload["task_type"] = "Base"
-    payload["ref_audio"] = _tiny_wav_data_uri()
-    payload["ref_text"] = "A tiny inline reference audio sample."
+    payload["ref_audio"] = _valid_reference_wav_data_uri()
+    payload["ref_text"] = "A valid inline reference audio sample for voice cloning."
     payload["response_format"] = "wav"
     return Scenario(
         id=_scenario_id(stage, "speech_reference_base64", index),
@@ -1737,23 +1733,8 @@ def _reference_text(spec: BenchmarkSpec) -> str:
     return spec.params.seedtts_ref_text or DEFAULT_REFERENCE_TEXT
 
 
-def _tiny_wav_data_uri() -> str:
-    payload_size = TINY_WAV_PAYLOAD_BYTES
-    wav = (
-        b"RIFF"
-        + (36 + payload_size).to_bytes(4, "little")
-        + b"WAVEfmt "
-        + (16).to_bytes(4, "little")
-        + WAV_PCM_FORMAT_CODE.to_bytes(2, "little")
-        + WAV_MONO_CHANNELS.to_bytes(2, "little")
-        + PCM_SAMPLE_RATE.to_bytes(4, "little")
-        + (PCM_SAMPLE_RATE * PCM_SAMPLE_WIDTH).to_bytes(4, "little")
-        + PCM_SAMPLE_WIDTH.to_bytes(2, "little")
-        + WAV_PCM_BITS_PER_SAMPLE.to_bytes(2, "little")
-        + b"data"
-        + payload_size.to_bytes(4, "little")
-        + b"\0" * payload_size
-    )
+def _valid_reference_wav_data_uri() -> str:
+    wav = get_wav_upload_fixture(VOICE_UPLOAD_WAV_FIXTURE_SIZE)
     return "data:audio/wav;base64," + base64.b64encode(wav).decode("ascii")
 
 

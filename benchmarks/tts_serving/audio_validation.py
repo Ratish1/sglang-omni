@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import struct
+import subprocess
 from dataclasses import dataclass
+from shutil import which
 
 from benchmarks.tts_serving.metrics import (
     MIN_AUDIO_FRAME_PREFIX_BYTES,
@@ -26,6 +28,8 @@ MIN_PCM_AUDIO_BYTES = int(
 )
 MIN_COMPRESSED_AUDIO_BYTES = 32
 MAX_PRINTABLE_ASCII_RATIO = 0.95
+COMPRESSED_DECODE_TIMEOUT_S = 10
+FFMPEG_DECODE_CHANNELS = 1
 
 PCM_CONTENT_TYPES = frozenset({"application/octet-stream", "audio/pcm", "audio/raw"})
 EXPECTED_AUDIO_CONTENT_TYPES = {
@@ -74,13 +78,24 @@ def validate_audio_response(
             require_signal=True,
         )
     if fmt == "mp3":
-        return _validate_compressed(body, fmt, _has_mp3_prefix(body))
+        return _validate_compressed(
+            body, fmt, _has_mp3_prefix(body), require_min_audio=require_min_audio
+        )
     if fmt == "flac":
-        return _validate_compressed(body, fmt, body.startswith(b"fLaC"))
+        return _validate_compressed(
+            body, fmt, body.startswith(b"fLaC"), require_min_audio=require_min_audio
+        )
     if fmt == "opus":
-        return _validate_compressed(body, fmt, body.startswith(b"OggS"))
+        return _validate_compressed(
+            body, fmt, body.startswith(b"OggS"), require_min_audio=require_min_audio
+        )
     if fmt == "aac":
-        return _validate_compressed(body, fmt, _has_aac_adts_prefix(body))
+        return _validate_compressed(
+            body,
+            fmt,
+            _has_aac_adts_prefix(body),
+            require_min_audio=require_min_audio,
+        )
     return AudioValidation(False, f"unsupported response format: {response_format!r}")
 
 
@@ -162,6 +177,8 @@ def _validate_compressed(
     body: bytes,
     response_format: str,
     has_prefix: bool,
+    *,
+    require_min_audio: bool,
 ) -> AudioValidation:
     if len(body) < MIN_COMPRESSED_AUDIO_BYTES:
         return AudioValidation(
@@ -173,7 +190,78 @@ def _validate_compressed(
             False,
             f"{response_format} audio is missing the expected container prefix",
         )
-    return AudioValidation(True)
+    decoded = _decode_compressed_to_pcm(body, response_format)
+    if not decoded.ok:
+        return AudioValidation(False, decoded.error)
+    return _validate_pcm(
+        decoded.pcm,
+        sample_rate=PCM_SAMPLE_RATE,
+        require_min_audio=require_min_audio,
+        require_signal=True,
+    )
+
+
+@dataclass(frozen=True)
+class _DecodedPcm:
+    ok: bool
+    pcm: bytes = b""
+    error: str | None = None
+
+
+def _decode_compressed_to_pcm(body: bytes, response_format: str) -> _DecodedPcm:
+    ffmpeg = which("ffmpeg")
+    if ffmpeg is None:
+        return _DecodedPcm(
+            False,
+            error=(
+                "ffmpeg is required to validate compressed TTS audio responses "
+                f"({response_format})"
+            ),
+        )
+    try:
+        completed = subprocess.run(
+            [
+                ffmpeg,
+                "-v",
+                "error",
+                "-i",
+                "pipe:0",
+                "-f",
+                "s16le",
+                "-acodec",
+                "pcm_s16le",
+                "-ac",
+                str(FFMPEG_DECODE_CHANNELS),
+                "-ar",
+                str(PCM_SAMPLE_RATE),
+                "pipe:1",
+            ],
+            input=body,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=COMPRESSED_DECODE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return _DecodedPcm(False, error=f"{response_format} decode timed out")
+    if completed.returncode != 0:
+        return _DecodedPcm(
+            False,
+            error=(
+                f"{response_format} decode failed: "
+                f"{_decoder_stderr(completed.stderr)}"
+            ),
+        )
+    if not completed.stdout:
+        return _DecodedPcm(False, error=f"{response_format} decoded to empty PCM")
+    return _DecodedPcm(True, pcm=completed.stdout)
+
+
+def _decoder_stderr(stderr: bytes) -> str:
+    text = stderr.decode("utf-8", errors="replace").strip()
+    if not text:
+        return "<empty stderr>"
+    return text[:500]
 
 
 def _wav_info(data: bytes) -> tuple[int, int, int, bytes] | None:

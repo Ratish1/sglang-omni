@@ -32,7 +32,9 @@ async def run_sdk_scenario(spec: BenchmarkSpec, scenario: Scenario) -> ScenarioR
         response_format=_scenario_response_format(scenario),
     )
     try:
-        await asyncio.to_thread(_run_openai_speech_create, spec, scenario, result)
+        await asyncio.to_thread(
+            _run_openai_speech_create, spec, scenario, result, start
+        )
     finally:
         finish_timing(result, start)
     return result
@@ -42,6 +44,7 @@ def _run_openai_speech_create(
     spec: BenchmarkSpec,
     scenario: Scenario,
     result: ScenarioResult,
+    start: float,
 ) -> None:
     try:
         from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
@@ -67,6 +70,7 @@ def _run_openai_speech_create(
             response = client.audio.speech.create(**request)
             response.stream_to_file(str(output_path))
             body = output_path.read_bytes()
+            finish_timing(result, start)
     except APIStatusError as exc:
         _classify_sdk_status_error(exc, result, scenario)
         return

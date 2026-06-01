@@ -87,6 +87,8 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
 python -m benchmarks.eval.benchmark_tts_serving \
     --spec /etc/benchmark/spec.json \
     --out /var/benchmark/out
+# Direct Python runs require ffmpeg for compressed audio validation; the
+# benchmark Docker image installs it.
 
 # Single-stage local spec.json:
 # {

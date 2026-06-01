@@ -44,6 +44,7 @@ from benchmarks.tts_serving.voice_client import (
     run_voice_lifecycle,
     run_voice_overwrite,
     run_voice_speaker_cap_sequence,
+    run_voice_upload,
     run_voice_upload_delete_race,
     run_voice_upload_metadata_sequence,
 )
@@ -83,12 +84,14 @@ async def run_http_scenario(
             await run_voice_upload_metadata_sequence(session, spec, scenario, result)
         elif scenario.method == "VOICE_CACHE_PRESSURE_SEQUENCE":
             await run_voice_cache_pressure_sequence(session, spec, scenario, result)
+        elif scenario.capability_key == "voices.upload" and scenario.expect_success:
+            await run_voice_upload(session, spec, scenario, result)
         elif scenario.method == "GET":
             async with session.get(url) as response:
                 await _handle_probe_response(response, result, scenario)
         elif scenario.method == "DELETE":
             async with session.delete(url) as response:
-                await _handle_binary_response(response, result, scenario)
+                await _handle_binary_response(response, result, start, scenario)
         else:
             body = request_body(scenario)
             kwargs = (
@@ -106,7 +109,7 @@ async def run_http_scenario(
                         scenario,
                     )
                 else:
-                    await _handle_binary_response(response, result, scenario)
+                    await _handle_binary_response(response, result, start, scenario)
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         result.status = "transport_error"
         result.capability = "fail"
@@ -147,12 +150,14 @@ async def _handle_probe_response(
 async def _handle_binary_response(
     response: aiohttp.ClientResponse,
     result: ScenarioResult,
+    start: float,
     scenario: Scenario,
 ) -> None:
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
     body = await response.read()
+    finish_timing(result, start)
     result.response_bytes = len(body)
     if _is_unsupported_http_status(response.status, scenario):
         _mark_unsupported_contract(
