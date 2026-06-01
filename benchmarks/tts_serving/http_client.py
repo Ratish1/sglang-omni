@@ -524,7 +524,11 @@ def _classify_http_failure(
                 ),
             )
             return
-        if not _is_valid_error_response(status, body):
+        if not _is_valid_error_response(
+            status,
+            body,
+            expected_status=expected_status,
+        ):
             _mark_protocol_error(
                 result,
                 status="invalid_error_response",
@@ -1314,7 +1318,7 @@ async def _expect_speaker_cap_rejection(
         result.error_class = "unexpected_success"
         return False
     if status == 400:
-        if not _is_valid_error_response(status, body_text):
+        if not _is_valid_error_response(status, body_text, expected_status=400):
             _mark_protocol_error(
                 result,
                 status="invalid_error_response",
@@ -2056,7 +2060,6 @@ def _validate_batch_item(
         return BatchItemValidation(
             error="successful item audio_data decoded to empty bytes"
         )
-    headers = {"Content-Type": media_type}
     validation = validate_audio_response(
         decoded,
         response_format=expected_format,
@@ -2250,8 +2253,13 @@ def _is_valid_missing_voice_delete_response(status: int, body: str) -> bool:
 def _is_valid_error_response(
     status: int,
     body: str,
+    *,
+    expected_status: int,
 ) -> bool:
-    return 400 <= status < 500 and is_openai_error_response(body)
+    return status == expected_status and is_openai_error_response(
+        body,
+        expected_status=expected_status,
+    )
 
 
 def _is_nonnegative_file_size(value: Any) -> bool:

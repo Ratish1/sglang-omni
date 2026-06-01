@@ -89,7 +89,7 @@ python -m benchmarks.eval.benchmark_tts_serving \
     --spec /etc/benchmark/spec.json \
     --out /var/benchmark/out
 
-# Minimal local spec.json:
+# Single-stage local spec.json:
 # {
 #   "base_url": "http://127.0.0.1:8000",
 #   "model_name": "boson-sglang/higgs-audio-v3-tts-4b-base",
@@ -133,6 +133,8 @@ python -m benchmarks.eval.benchmark_tts_serving \
 # speaker_max_uploaded must match the server-side SPEAKER_MAX_UPLOADED setting.
 # voice_speaker_cap_count is the sequence's internal upload-attempt budget,
 # not the outer load-stage request count.
+# Speaker-cap and cache-pressure contracts are activated by their dedicated
+# load-stage settings.
 # Voice cache pressure is reported as traffic pressure unless the benchmark can
 # observe cache eviction, hit/miss, byte-usage, or delete-invalidation counters.
 # The example uses 768 unique voices to pressure a 512MiB voice-artifact LRU

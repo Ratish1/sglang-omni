@@ -222,4 +222,4 @@ def _is_openai_error_body(
     *,
     expected_status: int,
 ) -> bool:
-    return 400 <= expected_status < 500 and is_openai_error_response(body)
+    return is_openai_error_response(body, expected_status=expected_status)

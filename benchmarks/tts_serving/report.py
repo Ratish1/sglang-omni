@@ -20,7 +20,9 @@ from benchmarks.tts_serving.scenarios import (
     SDK_RESPONSE_FORMATS,
     SPEED_BOUNDARY_VALUES,
     TASK_TYPES,
+    VOICE_NEAR_LIMIT_DEFERRED_FORMATS,
     VOICE_NEAR_LIMIT_FORMATS,
+    VOICE_NEAR_LIMIT_GENERATED_FORMATS,
     VOICE_UPLOAD_REJECT_FORMATS,
     VOICE_UPLOAD_SUCCESS_FORMATS,
     WEBSOCKET_SPLIT_GRANULARITIES,
@@ -28,6 +30,14 @@ from benchmarks.tts_serving.scenarios import (
     scenario_set_hash,
 )
 from benchmarks.tts_serving.spec import BenchmarkSpec, redact_sensitive_metadata
+
+VOICE_CACHE_OBSERVABILITY_COUNTERS = (
+    "eviction_count",
+    "hit_count",
+    "miss_count",
+    "cache_byte_usage",
+    "delete_invalidation_counter",
+)
 
 
 def build_results_report(
@@ -373,8 +383,14 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
     configured_near_limit_formats = [
         upload_format for upload_format, _ in VOICE_NEAR_LIMIT_FORMATS
     ]
-    near_limit_missing_formats = sorted(
-        set(configured_near_limit_formats) - set(near_limit_formats)
+    generated_near_limit_formats = [
+        upload_format for upload_format, _ in VOICE_NEAR_LIMIT_GENERATED_FORMATS
+    ]
+    deferred_near_limit_formats = [
+        upload_format for upload_format, _ in VOICE_NEAR_LIMIT_DEFERRED_FORMATS
+    ]
+    near_limit_missing_generated_formats = sorted(
+        set(generated_near_limit_formats) - set(near_limit_formats)
     )
     return {
         "accepted_format_cases": sorted(successful_formats),
@@ -382,8 +398,10 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         "regular_upload_format_contract_present": bool(successful_formats),
         "near_limit_formats": sorted(near_limit_formats),
         "configured_near_limit_formats": configured_near_limit_formats,
-        "near_limit_missing_formats": near_limit_missing_formats,
-        "near_limit_contract_complete": not near_limit_missing_formats,
+        "generated_near_limit_formats": generated_near_limit_formats,
+        "deferred_near_limit_formats": deferred_near_limit_formats,
+        "near_limit_missing_generated_formats": near_limit_missing_generated_formats,
+        "near_limit_contract_complete": not near_limit_missing_generated_formats,
         "metadata_sequence_present": any(
             scenario.capability_key == "voices.upload_metadata"
             for scenario in scenarios
@@ -448,13 +466,19 @@ def _coverage_matrix(
         ("voices", "api.voices"),
         ("websocket", "api.websocket"),
     ):
+        endpoint_enabled = endpoint in enabled_endpoint_set
         rows.append(
             _coverage_matrix_row(
                 spec,
                 contract,
-                tested=endpoint in generated_endpoint_set,
+                tested=endpoint_enabled and endpoint in generated_endpoint_set,
                 expected=[endpoint],
                 observed=sorted(generated_endpoint_set & {endpoint}),
+                out_of_scope_reason=(
+                    None
+                    if endpoint_enabled
+                    else "endpoint is not enabled by this benchmark spec"
+                ),
             )
         )
 
@@ -486,7 +510,7 @@ def _coverage_matrix_failures(
             error=str(row["error"]),
         )
         for row in coverage_matrix
-        if row.get("status") != "tested"
+        if row.get("status") not in {"tested", "out_of_scope"}
         and row.get("contract") not in existing_contracts
     ]
 
@@ -689,6 +713,7 @@ def _voice_coverage_matrix(
     configured_cache_pressure_voice_count = (
         _configured_voice_cache_pressure_voice_count(spec)
     )
+    configured_speaker_cap_count = _configured_voice_speaker_cap_count(spec)
     rows = [
         _coverage_matrix_row(
             spec,
@@ -749,8 +774,19 @@ def _voice_coverage_matrix(
             spec,
             "voices.near_limit_upload_formats",
             tested=voice_upload_coverage["near_limit_contract_complete"],
-            expected=voice_upload_coverage["configured_near_limit_formats"],
+            expected=voice_upload_coverage["generated_near_limit_formats"],
             observed=voice_upload_coverage["near_limit_formats"],
+        ),
+        _coverage_matrix_row(
+            spec,
+            "voices.near_limit_deferred_formats",
+            tested=False,
+            expected=voice_upload_coverage["deferred_near_limit_formats"],
+            observed=[],
+            out_of_scope_reason=(
+                "format-valid near-limit padding is not implemented for these "
+                "container formats"
+            ),
         ),
         _coverage_matrix_row(
             spec,
@@ -799,38 +835,48 @@ def _voice_coverage_matrix(
         _coverage_matrix_row(
             spec,
             "voices.speaker_cap",
-            tested=voice_upload_coverage["speaker_cap_attempts"] > 0,
+            tested=(
+                configured_speaker_cap_count > 0
+                and voice_upload_coverage["speaker_cap_attempts"] > 0
+            ),
             expected=["speaker_cap_sequence"],
             observed=(
                 ["speaker_cap_sequence"]
                 if voice_upload_coverage["speaker_cap_attempts"] > 0
                 else []
             ),
+            out_of_scope_reason=(
+                None
+                if configured_speaker_cap_count
+                else "speaker-cap sequence is not configured in this benchmark spec"
+            ),
         ),
         _coverage_matrix_row(
             spec,
             "voices.cache_pressure_traffic",
-            tested=_has_capability(
-                voice_scenarios,
-                "voices.cache_pressure_traffic",
+            tested=(
+                configured_cache_pressure_voice_count > 0
+                and _has_capability(
+                    voice_scenarios,
+                    "voices.cache_pressure_traffic",
+                )
             ),
             expected=["voices.cache_pressure_traffic"],
             observed=_capabilities_for(
                 voice_scenarios,
                 {"voices.cache_pressure_traffic"},
             ),
+            out_of_scope_reason=(
+                None
+                if configured_cache_pressure_voice_count
+                else "voice cache-pressure traffic is not configured in this benchmark spec"
+            ),
         ),
         _coverage_matrix_row(
             spec,
             "voices.cache_observability",
             tested=False,
-            expected=[
-                "eviction_count",
-                "hit_count",
-                "miss_count",
-                "cache_byte_usage",
-                "delete_invalidation_counter",
-            ],
+            expected=list(VOICE_CACHE_OBSERVABILITY_COUNTERS),
             observed=(
                 ["instrumentation_missing"]
                 if configured_cache_pressure_voice_count
@@ -846,6 +892,11 @@ def _voice_coverage_matrix(
                 "eviction/hit/miss/byte/delete-invalidation instrumentation"
                 if configured_cache_pressure_voice_count
                 else None
+            ),
+            out_of_scope_reason=(
+                None
+                if configured_cache_pressure_voice_count
+                else "voice cache-pressure traffic is not configured in this benchmark spec"
             ),
         ),
     ]
@@ -914,11 +965,17 @@ def _coverage_matrix_row(
     observed: list[Any],
     gap_status: str = "coverage_gap",
     gap_error: str | None = None,
+    out_of_scope_reason: str | None = None,
 ) -> dict[str, Any]:
     if tested:
         status = "tested"
         reason = None
         missing: list[Any] = []
+        error = None
+    elif out_of_scope_reason:
+        status = "out_of_scope"
+        reason = out_of_scope_reason
+        missing = []
         error = None
     else:
         status = gap_status
@@ -1078,7 +1135,7 @@ def _voice_coverage_failures(
             failures.append(
                 _coverage_gap(
                     "voices.near_limit_upload_formats",
-                    voice_upload_coverage["near_limit_missing_formats"],
+                    voice_upload_coverage["near_limit_missing_generated_formats"],
                 )
             )
         if not voice_upload_coverage["metadata_sequence_present"]:
@@ -1103,7 +1160,7 @@ def _voice_coverage_failures(
         failures.append(
             _coverage_gap(
                 "voices.cache_observability",
-                ["eviction_count", "hit_count", "miss_count"],
+                list(VOICE_CACHE_OBSERVABILITY_COUNTERS),
                 status="instrumentation_missing",
                 error=(
                     "voice cache pressure requires observable cache counters; "
@@ -1337,6 +1394,13 @@ def _configured_voice_cache_pressure_voice_count(spec: BenchmarkSpec) -> int:
         stage.voice_cache_pressure_voice_count for stage in spec.params.load_stages
     )
     return stage_count or spec.params.voice_cache_pressure_voice_count
+
+
+def _configured_voice_speaker_cap_count(spec: BenchmarkSpec) -> int:
+    stage_count = sum(
+        stage.voice_speaker_cap_count for stage in spec.params.load_stages
+    )
+    return stage_count or spec.params.voice_speaker_cap_count
 
 
 def _result_group_summary(
