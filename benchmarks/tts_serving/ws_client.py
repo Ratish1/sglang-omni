@@ -6,14 +6,17 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from dataclasses import dataclass, field
 
 import aiohttp
 
+from benchmarks.tts_serving.audio_validation import (
+    validate_audio_response,
+    validate_pcm_chunk,
+)
 from benchmarks.tts_serving.metrics import (
     PCM_SAMPLE_RATE,
-    PCM_SAMPLE_WIDTH,
     ScenarioResult,
-    duration_from_audio_bytes,
     finish_timing,
 )
 from benchmarks.tts_serving.scenarios import Scenario
@@ -27,6 +30,11 @@ WS_CONTROL_EVENT_TYPES = {
     "input.ack",
 }
 UNSUPPORTED_WS_STATUSES = {404, 405, 501}
+
+
+@dataclass
+class WebSocketAudioState:
+    active_sentence_audio: bytearray = field(default_factory=bytearray)
 
 
 async def run_ws_scenario(
@@ -89,6 +97,7 @@ async def _run_ws_script(
     timeout_s: int,
     expect_success: bool,
 ) -> None:
+    audio_state = WebSocketAudioState()
     async with asyncio.timeout(timeout_s):
         for action in script:
             action_type = str(action.get("action"))
@@ -108,6 +117,7 @@ async def _run_ws_script(
                 matched = await _expect_next_event(
                     ws,
                     result,
+                    audio_state,
                     expected_event=str(action.get("event", "")),
                     expect_success=expect_success,
                 )
@@ -117,6 +127,7 @@ async def _run_ws_script(
                 matched = await _expect_audio_until_done(
                     ws,
                     result,
+                    audio_state,
                     min_binary_frames=int(action.get("min_binary_frames", 1)),
                     expect_success=expect_success,
                 )
@@ -137,6 +148,7 @@ async def _run_ws_script(
 async def _expect_next_event(
     ws: aiohttp.ClientWebSocketResponse,
     result: ScenarioResult,
+    audio_state: WebSocketAudioState,
     *,
     expected_event: str,
     expect_success: bool,
@@ -150,10 +162,13 @@ async def _expect_next_event(
                     f"received binary audio while expecting {expected_event}",
                 )
                 return False
-            return _record_binary_audio(msg.data, result)
+            return _record_binary_audio(msg.data, result, audio_state)
         if msg.type == aiohttp.WSMsgType.TEXT:
             event_type = _merge_text_event(
-                msg.data, result, expect_success=expect_success
+                msg.data,
+                result,
+                audio_state,
+                expect_success=expect_success,
             )
             if result.status in {"failed", "expected_error"}:
                 return event_type == expected_event or expected_event == "error"
@@ -188,6 +203,7 @@ async def _expect_next_event(
 async def _expect_audio_until_done(
     ws: aiohttp.ClientWebSocketResponse,
     result: ScenarioResult,
+    audio_state: WebSocketAudioState,
     *,
     min_binary_frames: int,
     expect_success: bool,
@@ -196,13 +212,16 @@ async def _expect_audio_until_done(
     while True:
         msg = await ws.receive()
         if msg.type == aiohttp.WSMsgType.BINARY:
-            if not _record_binary_audio(msg.data, result):
+            if not _record_binary_audio(msg.data, result, audio_state):
                 return False
             binary_frames += 1
             continue
         if msg.type == aiohttp.WSMsgType.TEXT:
             event_type = _merge_text_event(
-                msg.data, result, expect_success=expect_success
+                msg.data,
+                result,
+                audio_state,
+                expect_success=expect_success,
             )
             if result.status in {"failed", "expected_error"}:
                 return event_type == "error"
@@ -241,6 +260,7 @@ async def _expect_audio_until_done(
 def _merge_text_event(
     data: str,
     result: ScenarioResult,
+    audio_state: WebSocketAudioState,
     *,
     expect_success: bool = True,
 ) -> str | None:
@@ -292,6 +312,7 @@ def _merge_text_event(
         result.ws_active_sentence_index = event["sentence_index"]
         result.ws_active_sentence_bytes = 0
         result.ws_active_sample_rate = event["sample_rate"]
+        audio_state.active_sentence_audio = bytearray()
         result.status = "ok"
         result.capability = "pass"
         return event_type
@@ -325,10 +346,24 @@ def _merge_text_event(
                 "audio.done total_bytes must be positive for successful audio",
             )
             return event_type
+        validation = validate_audio_response(
+            bytes(audio_state.active_sentence_audio),
+            response_format="pcm",
+            sample_rate=result.ws_active_sample_rate or PCM_SAMPLE_RATE,
+            require_content_type=False,
+        )
+        if not validation.ok:
+            _mark_ws_protocol_error(
+                result,
+                f"WebSocket sentence PCM is invalid: {validation.error}",
+            )
+            return event_type
+        result.audio_duration_s += validation.duration_s
         result.ws_completed_sentences += 1
         result.ws_active_sentence_index = None
         result.ws_active_sentence_bytes = 0
         result.ws_active_sample_rate = None
+        audio_state.active_sentence_audio = bytearray()
         result.status = "ok"
         result.capability = "pass"
         return event_type
@@ -400,7 +435,11 @@ def _record_ws_event(result: ScenarioResult, event_type: str) -> None:
     result.ws_event_counts[event_type] = result.ws_event_counts.get(event_type, 0) + 1
 
 
-def _record_binary_audio(data: bytes, result: ScenarioResult) -> bool:
+def _record_binary_audio(
+    data: bytes,
+    result: ScenarioResult,
+    audio_state: WebSocketAudioState,
+) -> bool:
     _record_ws_event(result, "binary")
     if result.ws_active_sentence_index is None:
         _mark_ws_protocol_error(result, "received binary audio before audio.start")
@@ -408,20 +447,20 @@ def _record_binary_audio(data: bytes, result: ScenarioResult) -> bool:
     if not data:
         _mark_ws_protocol_error(result, "received empty WebSocket binary audio frame")
         return False
-    if len(data) % PCM_SAMPLE_WIDTH:
+    validation = validate_pcm_chunk(
+        data,
+        sample_rate=result.ws_active_sample_rate or PCM_SAMPLE_RATE,
+    )
+    if not validation.ok:
         _mark_ws_protocol_error(
             result,
-            "WebSocket PCM binary audio frame is not aligned to 16-bit samples",
+            f"WebSocket binary audio frame is not valid PCM: {validation.error}",
         )
         return False
     result.audio_bytes += len(data)
     result.ws_active_sentence_bytes += len(data)
     result.response_bytes += len(data)
-    result.audio_duration_s += duration_from_audio_bytes(
-        data,
-        response_format="pcm",
-        sample_rate=result.ws_active_sample_rate or PCM_SAMPLE_RATE,
-    )
+    audio_state.active_sentence_audio.extend(data)
     result.status = "ok"
     result.success = True
     result.capability = "pass"

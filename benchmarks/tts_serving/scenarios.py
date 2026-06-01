@@ -36,6 +36,7 @@ RESPONSE_FORMATS = ("wav", "pcm", "mp3", "flac", "aac", "opus")
 SDK_RESPONSE_FORMATS = RESPONSE_FORMATS
 TASK_TYPES = ("Base", "CustomVoice", "VoiceDesign")
 SPEED_BOUNDARY_VALUES = (0.25, 1.0, 4.0)
+WEBSOCKET_SPLIT_GRANULARITIES = ("sentence", "clause")
 BATCH_SIZES = (1, 2, 8, 32)
 BATCH_OVERSIZED_SIZE = 33
 VOICE_UPLOAD_SUCCESS_FORMATS = (
@@ -138,6 +139,21 @@ REFERENCE_FAILURES = (
     ("wrong_content_type", "https://www.iana.org/_img/2013.1/iana-logo-header.svg"),
     ("unreachable_url", "http://192.0.2.1/seedtts/unreachable.wav"),
     ("disallowed_file", "file:///etc/passwd"),
+)
+MALFORMED_CASE_NAMES = (
+    "missing_input",
+    "missing_model",
+    "missing_voice",
+    "empty_input",
+    "wrong_input_type",
+    "bad_response_format",
+    "bad_language",
+    "bad_task_type",
+    "speed_below_min",
+    "speed_above_max",
+    "stream_non_pcm",
+    "negative_max_new_tokens",
+    "adversarial_text",
 )
 
 
@@ -335,9 +351,10 @@ def _required_stage_scenarios(
                 _websocket_normal(next_index, spec, stage),
                 _websocket_multi_sentence(next_index + 1, spec, stage),
                 _websocket_stream_audio(next_index + 2, spec, stage),
-                _websocket_input_done_without_config(next_index + 3, spec, stage),
-                _websocket_malformed_json(next_index + 4, spec, stage),
-                _websocket_disconnect(next_index + 5, spec, stage),
+                _websocket_clause_split(next_index + 3, spec, stage),
+                _websocket_input_done_without_config(next_index + 4, spec, stage),
+                _websocket_malformed_json(next_index + 5, spec, stage),
+                _websocket_disconnect(next_index + 6, spec, stage),
             ]
         )
     return _round_robin_groups(groups)
@@ -403,6 +420,7 @@ def _weighted_scenario(
             _websocket_normal(index, spec, stage),
             _websocket_multi_sentence(index, spec, stage),
             _websocket_stream_audio(index, spec, stage),
+            _websocket_clause_split(index, spec, stage),
             _websocket_input_done_without_config(index, spec, stage),
             _websocket_malformed_json(index, spec, stage),
             _websocket_disconnect(index, spec, stage),
@@ -839,16 +857,34 @@ def _malformed_payloads(
             "missing_input",
             {"model": spec.model_name, "voice": "default", "response_format": "wav"},
         ),
+        (
+            "missing_model",
+            {"input": "Missing model", "voice": "default", "response_format": "wav"},
+        ),
+        (
+            "missing_voice",
+            {
+                "model": spec.model_name,
+                "input": "Missing voice",
+                "response_format": "wav",
+            },
+        ),
         ("empty_input", {"model": spec.model_name, "input": "", "voice": "default"}),
         (
             "wrong_input_type",
-            {"model": spec.model_name, "input": 123, "response_format": "wav"},
+            {
+                "model": spec.model_name,
+                "input": 123,
+                "voice": "default",
+                "response_format": "wav",
+            },
         ),
         (
             "bad_response_format",
             {
                 "model": spec.model_name,
                 "input": "Invalid format",
+                "voice": "default",
                 "response_format": "bogus",
             },
         ),
@@ -857,6 +893,7 @@ def _malformed_payloads(
             {
                 "model": spec.model_name,
                 "input": "Invalid language",
+                "voice": "default",
                 "language": "Klingon",
             },
         ),
@@ -865,6 +902,7 @@ def _malformed_payloads(
             {
                 "model": spec.model_name,
                 "input": "Invalid task",
+                "voice": "default",
                 "task_type": "NotATask",
             },
         ),
@@ -873,6 +911,7 @@ def _malformed_payloads(
             {
                 "model": spec.model_name,
                 "input": "Invalid speed request",
+                "voice": "default",
                 "response_format": "wav",
                 "speed": -1.0,
             },
@@ -882,6 +921,7 @@ def _malformed_payloads(
             {
                 "model": spec.model_name,
                 "input": "Invalid high speed request",
+                "voice": "default",
                 "response_format": "wav",
                 "speed": 4.1,
             },
@@ -891,6 +931,7 @@ def _malformed_payloads(
             {
                 "model": spec.model_name,
                 "input": "Streaming format violation",
+                "voice": "default",
                 "response_format": "wav",
                 "stream": True,
             },
@@ -900,6 +941,7 @@ def _malformed_payloads(
             {
                 "model": spec.model_name,
                 "input": "Invalid max token request",
+                "voice": "default",
                 "response_format": "wav",
                 "max_new_tokens": -1,
             },
@@ -909,6 +951,7 @@ def _malformed_payloads(
             {
                 "model": spec.model_name,
                 "input": ADVERSARIAL_TEXTS[index % len(ADVERSARIAL_TEXTS)],
+                "voice": "default",
                 "response_format": "wav",
             },
         ),
@@ -916,11 +959,13 @@ def _malformed_payloads(
 
 
 def _malformed_case_count() -> int:
-    return 11
+    return len(MALFORMED_CASE_NAMES)
 
 
 def _speech_malformed(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
     candidates = _malformed_payloads(spec, index)
+    if tuple(case for case, _ in candidates) != MALFORMED_CASE_NAMES:
+        raise RuntimeError("malformed scenario names drifted from coverage contract")
     malformed_case, payload = candidates[index % len(candidates)]
     expect_success = payload.get("input") in ADVERSARIAL_TEXTS
     return Scenario(
@@ -1626,6 +1671,53 @@ def _websocket_stream_audio(
             {"action": "expect", "event": "session.done"},
         ],
         description="WebSocket stream_audio=true path requiring incremental binary audio",
+    )
+
+
+def _websocket_clause_split(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    return Scenario(
+        id=_scenario_id(stage, "websocket_clause_split", index),
+        endpoint="websocket",
+        category="websocket",
+        stage_id=stage.id,
+        capability_key="ws.clause_split",
+        method="WS",
+        path="/v1/audio/speech/stream",
+        script=[
+            {
+                "action": "send_json",
+                "payload": {
+                    "type": "session.config",
+                    "model": spec.model_name,
+                    "voice": "default",
+                    "response_format": "pcm",
+                    "stream_audio": False,
+                    "split_granularity": "clause",
+                },
+            },
+            {
+                "action": "send_json",
+                "payload": {
+                    "type": "input.text",
+                    "text": "第一段，第二段；第三段。",
+                },
+            },
+            {"action": "send_json", "payload": {"type": "input.done"}},
+            {"action": "expect", "event": "audio.start"},
+            {"action": "expect", "event": "audio"},
+            {"action": "expect", "event": "audio.done"},
+            {"action": "expect", "event": "audio.start"},
+            {"action": "expect", "event": "audio"},
+            {"action": "expect", "event": "audio.done"},
+            {"action": "expect", "event": "audio.start"},
+            {"action": "expect", "event": "audio"},
+            {"action": "expect", "event": "audio.done"},
+            {"action": "expect", "event": "session.done"},
+        ],
+        description="WebSocket speech stream with clause-level splitting",
+        planned_metadata={"split_granularity": "clause"},
     )
 
 

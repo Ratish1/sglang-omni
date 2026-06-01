@@ -12,23 +12,13 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from benchmarks.tts_serving.metrics import (
-    MIN_AUDIO_FRAME_PREFIX_BYTES,
-    PCM_SAMPLE_WIDTH,
-    ScenarioResult,
-    duration_from_audio_bytes,
-    finish_timing,
-)
+from benchmarks.tts_serving.audio_validation import validate_audio_response
+from benchmarks.tts_serving.error_contract import is_openai_error_response
+from benchmarks.tts_serving.metrics import ScenarioResult, finish_timing
 from benchmarks.tts_serving.scenarios import Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
 
 UNSUPPORTED_HTTP_STATUSES = {404, 405, 501}
-SDK_AUDIO_PREFIXES = {
-    "wav": (b"RIFF",),
-    "flac": (b"fLaC",),
-    "aac": (b"\xff\xf1", b"\xff\xf9"),
-    "opus": (b"OggS",),
-}
 
 
 async def run_sdk_scenario(spec: BenchmarkSpec, scenario: Scenario) -> ScenarioResult:
@@ -95,20 +85,23 @@ def _run_openai_speech_create(
 
     result.response_bytes = len(body)
     response_format = _scenario_response_format(scenario)
-    if not _is_sdk_audio_response(body, response_format):
+    validation = validate_audio_response(
+        body,
+        response_format=response_format,
+        require_content_type=False,
+    )
+    if not validation.ok:
         result.status = "invalid_audio_response"
         result.capability = "fail"
         result.error_class = "protocol_error"
         result.error = (
             "OpenAI SDK speech.create stream_to_file did not produce requested "
-            f"audio bytes (format={response_format!r}, bytes={len(body)})"
+            f"audio bytes (format={response_format!r}, bytes={len(body)}, "
+            f"validation_error={validation.error})"
         )
         return
     result.audio_bytes = len(body)
-    result.audio_duration_s = duration_from_audio_bytes(
-        body,
-        response_format=response_format,
-    )
+    result.audio_duration_s = validation.duration_s
     result.status = "ok"
     result.success = True
     result.capability = "pass"
@@ -131,34 +124,6 @@ def _scenario_response_format(scenario: Scenario) -> str:
         or scenario.payload.get("response_format")
         or "wav"
     )
-
-
-def _is_sdk_audio_response(body: bytes, response_format: str) -> bool:
-    if not body:
-        return False
-    if response_format == "pcm":
-        return _is_sdk_pcm_response(body)
-    if response_format == "mp3":
-        return body.startswith(b"ID3") or (
-            len(body) >= MIN_AUDIO_FRAME_PREFIX_BYTES
-            and body[0] == 0xFF
-            and (body[1] & 0xE0) == 0xE0
-        )
-    return any(
-        body.startswith(prefix)
-        for prefix in SDK_AUDIO_PREFIXES.get(response_format, ())
-    )
-
-
-def _is_sdk_pcm_response(body: bytes) -> bool:
-    if len(body) % PCM_SAMPLE_WIDTH:
-        return False
-    stripped = body.lstrip()[:32].lower()
-    if stripped.startswith((b"{", b"[", b"<html", b"<!doctype", b"<body")):
-        return False
-    if body.startswith((b"RIFF", b"ID3", b"fLaC", b"OggS")):
-        return False
-    return True
 
 
 def _sdk_base_url(base_url: str) -> str:
@@ -223,7 +188,6 @@ def _classify_sdk_status_error(
         if not _is_openai_error_body(
             body,
             expected_status=expected_status,
-            expected_error_type=scenario.expected_error_type or "BadRequestError",
         ):
             result.status = "invalid_error_response"
             result.capability = "fail"
@@ -257,25 +221,5 @@ def _is_openai_error_body(
     body: str,
     *,
     expected_status: int,
-    expected_error_type: str,
 ) -> bool:
-    if not body.strip() or body.lstrip().startswith("<"):
-        return False
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        return False
-    if not isinstance(payload, dict):
-        return False
-    error = payload.get("error")
-    if not isinstance(error, dict):
-        return False
-    if not isinstance(error.get("message"), str) or not error["message"].strip():
-        return False
-    if error.get("type") != expected_error_type:
-        return False
-    if error.get("code") != expected_status:
-        return False
-    return "param" in error and (
-        error["param"] is None or isinstance(error["param"], str)
-    )
+    return 400 <= expected_status < 500 and is_openai_error_response(body)

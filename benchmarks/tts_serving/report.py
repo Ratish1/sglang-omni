@@ -12,6 +12,7 @@ from benchmarks.tts_serving.scenarios import (
     BATCH_OVERSIZED_SIZE,
     BATCH_SIZES,
     LENGTH_EXTREME_TEXTS,
+    MALFORMED_CASE_NAMES,
     MULTILINGUAL_TEXTS,
     REFERENCE_FAILURES,
     RESPONSE_FORMATS,
@@ -22,6 +23,7 @@ from benchmarks.tts_serving.scenarios import (
     VOICE_NEAR_LIMIT_FORMATS,
     VOICE_UPLOAD_REJECT_FORMATS,
     VOICE_UPLOAD_SUCCESS_FORMATS,
+    WEBSOCKET_SPLIT_GRANULARITIES,
     Scenario,
     scenario_set_hash,
 )
@@ -177,11 +179,10 @@ def build_results_report(
         "failures": [
             result.to_json() for result in results if not _result_passed(spec, result)
         ][:100],
-        "unsupported_contracts": [
-            result.to_json()
-            for result in results
-            if result.status == "unsupported_contract"
-        ],
+        "unsupported_contracts": _unsupported_contract_summary(
+            results,
+            scenarios or [],
+        ),
         "coverage_failures": coverage_failures,
         "coverage_matrix": coverage_matrix,
     }
@@ -568,34 +569,10 @@ def _speech_coverage_matrix(
             "speech.malformed_cases",
             tested=not _value_coverage_gap(
                 "speech.malformed_cases",
-                {
-                    "missing_input",
-                    "empty_input",
-                    "wrong_input_type",
-                    "bad_response_format",
-                    "bad_language",
-                    "bad_task_type",
-                    "speed_below_min",
-                    "speed_above_max",
-                    "stream_non_pcm",
-                    "negative_max_new_tokens",
-                    "adversarial_text",
-                },
+                set(MALFORMED_CASE_NAMES),
                 _metadata_values(speech_scenarios, "malformed_case"),
             ),
-            expected=[
-                "missing_input",
-                "empty_input",
-                "wrong_input_type",
-                "bad_response_format",
-                "bad_language",
-                "bad_task_type",
-                "speed_below_min",
-                "speed_above_max",
-                "stream_non_pcm",
-                "negative_max_new_tokens",
-                "adversarial_text",
-            ],
+            expected=list(MALFORMED_CASE_NAMES),
             observed=sorted(_metadata_values(speech_scenarios, "malformed_case")),
         ),
         _coverage_matrix_row(
@@ -883,6 +860,7 @@ def _websocket_coverage_matrix(
         scenario for scenario in scenarios if scenario.endpoint == "websocket"
     ]
     split_values = _websocket_split_granularity_values(websocket_scenarios)
+    non_sentence_split_values = set(WEBSOCKET_SPLIT_GRANULARITIES) - {"sentence"}
     return [
         _coverage_matrix_row(
             spec,
@@ -892,6 +870,7 @@ def _websocket_coverage_matrix(
                 "ws.normal",
                 "ws.multi_sentence",
                 "ws.stream_audio",
+                "ws.clause_split",
                 "ws.done_before_config",
                 "ws.malformed_json",
                 "ws.disconnect",
@@ -902,6 +881,7 @@ def _websocket_coverage_matrix(
                     "ws.normal",
                     "ws.multi_sentence",
                     "ws.stream_audio",
+                    "ws.clause_split",
                     "ws.done_before_config",
                     "ws.malformed_json",
                     "ws.disconnect",
@@ -918,8 +898,8 @@ def _websocket_coverage_matrix(
         _coverage_matrix_row(
             spec,
             "websocket.split_granularity.non_sentence",
-            tested=bool(split_values - {"sentence"}),
-            expected=["non_sentence"],
+            tested=non_sentence_split_values <= split_values,
+            expected=sorted(non_sentence_split_values),
             observed=sorted(split_values - {"sentence"}),
         ),
     ]
@@ -1022,19 +1002,7 @@ def _speech_coverage_failures(scenarios: list[Scenario]) -> list[dict[str, Any]]
     failures.extend(
         _value_coverage_gap(
             "speech.malformed_cases",
-            {
-                "missing_input",
-                "empty_input",
-                "wrong_input_type",
-                "bad_response_format",
-                "bad_language",
-                "bad_task_type",
-                "speed_below_min",
-                "speed_above_max",
-                "stream_non_pcm",
-                "negative_max_new_tokens",
-                "adversarial_text",
-            },
+            set(MALFORMED_CASE_NAMES),
             _metadata_values(speech_scenarios, "malformed_case"),
         )
     )
@@ -1227,6 +1195,7 @@ def _websocket_coverage_failures(scenarios: list[Scenario]) -> list[dict[str, An
             "ws.normal",
             "ws.multi_sentence",
             "ws.stream_audio",
+            "ws.clause_split",
             "ws.done_before_config",
             "ws.malformed_json",
             "ws.disconnect",
@@ -1298,6 +1267,55 @@ def _websocket_split_granularity_values(scenarios: list[Scenario]) -> set[str]:
             if isinstance(split_granularity, str) and split_granularity:
                 values.add(split_granularity)
     return values
+
+
+def _unsupported_contract_summary(
+    results: list[ScenarioResult],
+    scenarios: list[Scenario],
+) -> list[dict[str, Any]]:
+    scenario_by_id = {scenario.id: scenario for scenario in scenarios}
+    grouped: dict[tuple[str, str, str, int | None], list[ScenarioResult]] = defaultdict(
+        list
+    )
+    for result in results:
+        if result.status != "unsupported_contract":
+            continue
+        scenario = scenario_by_id.get(result.scenario_id)
+        path = scenario.path if scenario is not None else ""
+        grouped[
+            (
+                result.endpoint,
+                result.capability_key or result.endpoint,
+                path,
+                result.http_status,
+            )
+        ].append(result)
+
+    summaries: list[dict[str, Any]] = []
+    for (endpoint, operation, path, http_status), group in sorted(grouped.items()):
+        summaries.append(
+            {
+                "endpoint": endpoint,
+                "operation": operation,
+                "path": path or None,
+                "http_status": http_status,
+                "count": len(group),
+                "samples": [
+                    {
+                        "scenario_id": result.scenario_id,
+                        "error": _truncate(result.error, 500),
+                    }
+                    for result in group[:5]
+                ],
+            }
+        )
+    return summaries
+
+
+def _truncate(value: str | None, limit: int) -> str | None:
+    if value is None or len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
 
 
 def _voice_case(scenario: Scenario) -> str | None:

@@ -580,7 +580,14 @@ def get_voice_upload_fixture(upload_format: str) -> bytes:
         raise ValueError(
             f"unknown voice upload fixture format: {upload_format}"
         ) from exc
-    return gzip.decompress(base64.b64decode(encoded))
+    data = gzip.decompress(base64.b64decode(encoded))
+    expected_size = VOICE_UPLOAD_FIXTURE_SIZES[upload_format]
+    if len(data) != expected_size:
+        raise ValueError(
+            f"{upload_format} fixture size mismatch: "
+            f"expected={expected_size}, observed={len(data)}"
+        )
+    return data
 
 
 @lru_cache(maxsize=None)

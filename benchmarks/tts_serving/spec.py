@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 VALID_TEST_TYPES = {"engine", "e2e", "external"}
 VALID_PROFILES = {"production", "stress"}
@@ -14,6 +16,7 @@ VALID_LOAD_MODES = {"closed_loop", "open_loop", "ramp", "burst", "soak"}
 VALID_ARRIVAL_DISTRIBUTIONS = {"deterministic", "poisson"}
 DEFAULT_ENDPOINTS = ("speech", "speech_sse", "voices", "batch", "websocket")
 DEFAULT_SPEAKER_MAX_UPLOADED = 1000
+SAFE_STAGE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 SENSITIVE_METADATA_KEY_TERMS = (
     "api_key",
     "apikey",
@@ -87,8 +90,10 @@ class AuthSpec:
             raise SpecError("auth must be an object when provided")
         _reject_unknown_keys(obj, AUTH_KEYS, "auth")
         api_key_env = obj.get("api_key_env")
-        if api_key_env is not None and not isinstance(api_key_env, str):
-            raise SpecError("auth.api_key_env must be a string")
+        if api_key_env is not None:
+            if not isinstance(api_key_env, str) or not api_key_env.strip():
+                raise SpecError("auth.api_key_env must be a non-empty string")
+            api_key_env = api_key_env.strip()
         return cls(api_key_env=api_key_env)
 
 
@@ -112,7 +117,7 @@ class LoadStage:
         if not isinstance(obj, dict):
             raise SpecError("params.load_stages entries must be objects")
         _reject_unknown_keys(obj, LOAD_STAGE_KEYS, "params.load_stages[]")
-        stage_id = _str_value(obj, "id", f"stage-{index + 1}")
+        stage_id = _safe_stage_id(_str_value(obj, "id", f"stage-{index + 1}"))
         mode = _str_value(obj, "mode", "closed_loop")
         if mode not in VALID_LOAD_MODES:
             raise SpecError(
@@ -122,15 +127,23 @@ class LoadStage:
         request_count = _positive_int(
             obj,
             "request_count",
-            _positive_int(obj, "total_requests", 100),
+            _positive_int(obj, "total_requests", 100, path="params.load_stages[]"),
+            path="params.load_stages[]",
         )
         max_concurrency = _positive_int(
             obj,
             "max_concurrency",
-            _positive_int(obj, "concurrency", 8),
+            _positive_int(obj, "concurrency", 8, path="params.load_stages[]"),
+            path="params.load_stages[]",
         )
-        request_rate = _request_rate(obj.get("request_rate", float("inf")))
-        start_request_rate = _optional_request_rate(obj.get("start_request_rate"))
+        request_rate = _request_rate(
+            obj.get("request_rate", float("inf")),
+            path="params.load_stages[].request_rate",
+        )
+        start_request_rate = _optional_request_rate(
+            obj.get("start_request_rate"),
+            path="params.load_stages[].start_request_rate",
+        )
         duration_s = _optional_positive_float(obj.get("duration_s"), "duration_s")
         arrival_distribution = _str_value(obj, "arrival_distribution", "deterministic")
         if arrival_distribution not in VALID_ARRIVAL_DISTRIBUTIONS:
@@ -315,7 +328,7 @@ class BenchmarkSpec:
         platform_metadata = {
             key: value for key, value in obj.items() if key not in TOP_LEVEL_KEYS
         }
-        base_url = _required_str(obj, "base_url").rstrip("/")
+        base_url = _validate_base_url(_required_str(obj, "base_url"))
         model_name = _required_str(obj, "model_name")
         test_type = _str_value(obj, "test_type", "engine")
         if test_type not in VALID_TEST_TYPES:
@@ -398,10 +411,33 @@ def _str_value(obj: dict[str, Any], key: str, default: str) -> str:
     return value
 
 
-def _positive_int(obj: dict[str, Any], key: str, default: int) -> int:
+def _validate_base_url(value: str) -> str:
+    base_url = value.rstrip("/")
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise SpecError("base_url must be an absolute http(s) URL")
+    return base_url
+
+
+def _safe_stage_id(value: str) -> str:
+    if not SAFE_STAGE_ID_RE.fullmatch(value):
+        raise SpecError(
+            "params.load_stages[].id must contain only ASCII letters, digits, "
+            "'.', '_', or '-', and must be at most 64 characters"
+        )
+    return value
+
+
+def _positive_int(
+    obj: dict[str, Any],
+    key: str,
+    default: int,
+    *,
+    path: str = "params",
+) -> int:
     value = obj.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise SpecError(f"params.{key} must be a positive integer")
+        raise SpecError(f"{path}.{key} must be a positive integer")
     return value
 
 
@@ -423,20 +459,24 @@ def _optional_positive_int_value(value: Any, key: str) -> int | None:
     return value
 
 
-def _request_rate(value: Any) -> float:
+def _request_rate(value: Any, *, path: str = "params.request_rate") -> float:
     if value == "inf":
         return float("inf")
     if not isinstance(value, bool) and isinstance(value, (int, float)) and value > 0:
         return float(value)
-    raise SpecError("params.request_rate must be a positive number or 'inf'")
+    raise SpecError(f"{path} must be a positive number or 'inf'")
 
 
-def _optional_request_rate(value: Any) -> float | None:
+def _optional_request_rate(
+    value: Any,
+    *,
+    path: str = "params.load_stages[].start_request_rate",
+) -> float | None:
     if value is None:
         return None
-    rate = _request_rate(value)
+    rate = _request_rate(value, path=path)
     if rate == float("inf"):
-        raise SpecError("params.load_stages[].start_request_rate must be finite")
+        raise SpecError(f"{path} must be finite")
     return rate
 
 

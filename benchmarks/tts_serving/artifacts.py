@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 from benchmarks.tts_serving.metrics import ScenarioResult
 from benchmarks.tts_serving.scenarios import (
@@ -16,6 +18,8 @@ from benchmarks.tts_serving.scenarios import (
     scenario_set_hash,
 )
 from benchmarks.tts_serving.spec import BenchmarkSpec, redact_sensitive_metadata
+
+SENSITIVE_AUDIO_REFERENCE_KEYS = {"audio", "audio_sample", "ref_audio"}
 
 
 class ArtifactError(RuntimeError):
@@ -63,7 +67,10 @@ def write_artifacts(
             },
         },
     )
-    _write_jsonl(out_dir / "raw" / "requests.jsonl", scenarios)
+    _write_jsonl(
+        out_dir / "raw" / "requests.jsonl",
+        [_sanitize_scenario_for_artifact(scenario) for scenario in scenarios],
+    )
     _write_jsonl(out_dir / "raw" / "events.jsonl", results)
 
 
@@ -101,3 +108,48 @@ def _to_json(value: Any) -> Any:
     if is_dataclass(value):
         return asdict(value)
     return value
+
+
+def _sanitize_scenario_for_artifact(scenario: Scenario) -> dict[str, Any]:
+    payload = scenario.to_json()
+    if isinstance(payload.get("payload"), dict):
+        payload["payload"] = _sanitize_payload_value(payload["payload"])
+    return payload
+
+
+def _sanitize_payload_value(value: Any, *, key: str | None = None) -> Any:
+    if key in SENSITIVE_AUDIO_REFERENCE_KEYS and isinstance(value, str):
+        return _summarize_audio_reference(value)
+    if isinstance(value, dict):
+        return {
+            item_key: _sanitize_payload_value(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_payload_value(item) for item in value]
+    return value
+
+
+def _summarize_audio_reference(value: str) -> dict[str, Any]:
+    digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
+    parsed = urlparse(value)
+    summary: dict[str, Any] = {
+        "redacted": True,
+        "chars": len(value),
+        "sha256_16": digest,
+        "scheme": parsed.scheme or None,
+    }
+    if parsed.scheme in {"http", "https"}:
+        netloc = parsed.hostname or ""
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port is not None:
+            netloc = f"{netloc}:{port}"
+        summary["url"] = urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+    elif parsed.scheme:
+        summary["kind"] = f"{parsed.scheme}_uri"
+    else:
+        summary["kind"] = "inline_or_path"
+    return summary

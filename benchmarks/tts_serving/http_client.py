@@ -14,19 +14,18 @@ from typing import Any
 
 import aiohttp
 
+from benchmarks.tts_serving.audio_validation import (
+    EXPECTED_AUDIO_CONTENT_TYPES,
+    PCM_CONTENT_TYPES,
+    validate_audio_response,
+    validate_pcm_chunk,
+)
+from benchmarks.tts_serving.error_contract import is_openai_error_response
 from benchmarks.tts_serving.metrics import (
-    MIN_AUDIO_FRAME_PREFIX_BYTES,
     PCM_SAMPLE_RATE,
-    PCM_SAMPLE_WIDTH,
     SSE_DONE_MARKER,
-    WAV_FORMAT_END,
-    WAV_FORMAT_OFFSET,
-    WAV_HEADER_BYTES,
-    WAV_RIFF_MARKER,
-    WAV_WAVE_MARKER,
     ScenarioResult,
     classify_http_status,
-    duration_from_audio_bytes,
     finish_timing,
     parse_sse_audio_event,
 )
@@ -50,15 +49,7 @@ UNSUPPORTED_HTTP_STATUSES = {404, 405, 501}
 SUCCESS_BATCH_STATUSES = {"ok", "success", "succeeded"}
 FAILED_BATCH_STATUSES = {"error", "failed"}
 VALID_BATCH_TASK_TYPES = {"Base", "CustomVoice", "VoiceDesign"}
-PCM_CONTENT_TYPES = frozenset({"application/octet-stream", "audio/pcm", "audio/raw"})
-EXPECTED_BATCH_MEDIA_TYPES = {
-    "wav": {"audio/wav", "audio/x-wav", "application/octet-stream", ""},
-    "pcm": PCM_CONTENT_TYPES,
-    "mp3": {"audio/mpeg", "audio/mp3"},
-    "flac": {"audio/flac"},
-    "aac": {"audio/aac", "audio/aacp"},
-    "opus": {"audio/opus", "audio/ogg"},
-}
+EXPECTED_BATCH_MEDIA_TYPES = EXPECTED_AUDIO_CONTENT_TYPES
 RawVoiceResponse = tuple[int, bytes, dict[str, str]]
 
 
@@ -192,7 +183,12 @@ async def _handle_binary_response(
             _handle_voice_success(body, result, scenario)
             return
         response_format = str(scenario.payload.get("response_format", ""))
-        if not _is_audio_response(body, response.headers, response_format):
+        validation = validate_audio_response(
+            body,
+            response_format=response_format,
+            content_type=response.headers.get("Content-Type"),
+        )
+        if not validation.ok:
             _mark_protocol_error(
                 result,
                 status="invalid_audio_response",
@@ -200,16 +196,12 @@ async def _handle_binary_response(
                     "speech endpoint returned 2xx without the requested audio "
                     f"contract (format={response_format!r}, "
                     f"content-type={response.headers.get('Content-Type')!r}, "
-                    f"bytes={len(body)})"
+                    f"bytes={len(body)}, validation_error={validation.error})"
                 ),
             )
             return
         result.audio_bytes = len(body)
-        result.audio_duration_s = duration_from_audio_bytes(
-            body,
-            content_type=response.headers.get("Content-Type"),
-            response_format=response_format,
-        )
+        result.audio_duration_s = validation.duration_s
         _mark_success(result)
         return
     _classify_http_failure(
@@ -249,6 +241,7 @@ async def _handle_sse_response(
         return
 
     buffer = bytearray()
+    audio_buffer = bytearray()
     chunk_times: list[float] = []
     saw_done = False
     async for chunk in response.content.iter_any():
@@ -263,6 +256,7 @@ async def _handle_sse_response(
                     start,
                     chunk_times,
                     scenario,
+                    audio_buffer,
                 )
                 or saw_done
             )
@@ -278,6 +272,7 @@ async def _handle_sse_response(
                 start,
                 chunk_times,
                 scenario,
+                audio_buffer,
             )
             or saw_done
         )
@@ -303,6 +298,20 @@ async def _handle_sse_response(
         )
         result.response_bytes = result.audio_bytes
         return
+    validation = validate_audio_response(
+        bytes(audio_buffer),
+        response_format="pcm",
+        content_type="audio/pcm",
+    )
+    if not validation.ok:
+        _mark_protocol_error(
+            result,
+            status="invalid_sse_response",
+            error=f"SSE stream completed with invalid aggregate PCM: {validation.error}",
+        )
+        result.response_bytes = result.audio_bytes
+        return
+    result.audio_duration_s = validation.duration_s
     _mark_success(result)
     result.response_bytes = result.audio_bytes
 
@@ -320,6 +329,7 @@ def _merge_sse_line(
     start: float,
     chunk_times: list[float],
     scenario: Scenario,
+    audio_buffer: bytearray,
 ) -> bool:
     if not line or line.startswith(":"):
         return False
@@ -386,16 +396,6 @@ def _merge_sse_line(
             ),
         )
         return False
-    if not _is_pcm_audio_bytes(audio_bytes):
-        _mark_protocol_error(
-            result,
-            status="invalid_sse_response",
-            error=(
-                "SSE audio.data must decode to non-empty 16-bit PCM bytes "
-                f"(decoded_bytes={len(audio_bytes)})"
-            ),
-        )
-        return False
     sample_rate = audio.get("sample_rate", PCM_SAMPLE_RATE)
     if (
         not isinstance(sample_rate, int)
@@ -408,20 +408,31 @@ def _merge_sse_line(
             error=f"SSE audio.sample_rate must be a positive integer: {event}",
         )
         return False
+    chunk_validation = validate_pcm_chunk(
+        audio_bytes,
+        sample_rate=sample_rate,
+    )
+    if not chunk_validation.ok:
+        _mark_protocol_error(
+            result,
+            status="invalid_sse_response",
+            error=(
+                "SSE audio.data must decode to valid 16-bit PCM chunk "
+                f"(decoded_bytes={len(audio_bytes)}, "
+                f"validation_error={chunk_validation.error})"
+            ),
+        )
+        return False
     now = time.perf_counter()
     if result.ttfa_s is None:
         result.ttfa_s = now - start
     elif chunk_times:
         result.inter_chunk_s.append(now - chunk_times[-1])
     chunk_times.append(now)
+    audio_buffer.extend(audio_bytes)
     result.audio_bytes += len(audio_bytes)
     result.response_bytes += len(audio_bytes)
-    result.audio_duration_s += duration_from_audio_bytes(
-        audio_bytes,
-        content_type=normalized_mime_type,
-        response_format=audio_format,
-        sample_rate=sample_rate,
-    )
+    result.audio_duration_s += chunk_validation.duration_s
     return False
 
 
@@ -513,11 +524,7 @@ def _classify_http_failure(
                 ),
             )
             return
-        if not _is_valid_error_response(
-            status,
-            body,
-            expected_error_type=_expected_client_error_type(scenario, status),
-        ):
+        if not _is_valid_error_response(status, body):
             _mark_protocol_error(
                 result,
                 status="invalid_error_response",
@@ -545,67 +552,6 @@ def _classify_http_failure(
         result.capability = "fail"
 
 
-def _is_audio_response(
-    body: bytes,
-    headers: Mapping[str, str],
-    response_format: str,
-) -> bool:
-    if not body:
-        return False
-    content_type = str(headers.get("Content-Type", "")).lower().split(";", 1)[0]
-    fmt = response_format.lower()
-    if fmt == "wav":
-        return (
-            len(body) > WAV_HEADER_BYTES
-            and body.startswith(WAV_RIFF_MARKER)
-            and body[WAV_FORMAT_OFFSET:WAV_FORMAT_END] == WAV_WAVE_MARKER
-            and content_type
-            in {
-                "audio/wav",
-                "audio/x-wav",
-                "application/octet-stream",
-                "",
-            }
-        )
-    if fmt == "pcm":
-        return _is_pcm_audio_bytes(body) and content_type in PCM_CONTENT_TYPES
-    if fmt == "mp3":
-        return _content_type_matches(content_type, fmt) and _has_mp3_prefix(body)
-    if fmt == "flac":
-        return _content_type_matches(content_type, fmt) and body.startswith(b"fLaC")
-    if fmt == "opus":
-        return _content_type_matches(content_type, fmt) and body.startswith(b"OggS")
-    if fmt == "aac":
-        return _content_type_matches(content_type, fmt) and _has_aac_adts_prefix(body)
-    return False
-
-
-def _content_type_matches(content_type: str, response_format: str) -> bool:
-    return content_type in EXPECTED_BATCH_MEDIA_TYPES.get(
-        response_format.lower(), set()
-    )
-
-
-def _has_mp3_prefix(body: bytes) -> bool:
-    return body.startswith(b"ID3") or (
-        len(body) >= MIN_AUDIO_FRAME_PREFIX_BYTES
-        and body[0] == 0xFF
-        and (body[1] & 0xE0) == 0xE0
-    )
-
-
-def _has_aac_adts_prefix(body: bytes) -> bool:
-    return (
-        len(body) >= MIN_AUDIO_FRAME_PREFIX_BYTES
-        and body[0] == 0xFF
-        and (body[1] & 0xF0) == 0xF0
-    )
-
-
-def _is_pcm_audio_bytes(body: bytes) -> bool:
-    return bool(body) and len(body) % PCM_SAMPLE_WIDTH == 0
-
-
 def _is_unsupported_http_status(status: int, scenario: Scenario) -> bool:
     if status not in UNSUPPORTED_HTTP_STATUSES:
         return False
@@ -624,13 +570,6 @@ def _is_expected_client_error_scenario(scenario: Scenario) -> bool:
 
 def _expected_client_error_status(scenario: Scenario) -> int:
     return scenario.expected_http_status or 400
-
-
-def _expected_client_error_type(scenario: Scenario, status: int) -> str:
-    return scenario.expected_error_type or {
-        400: "BadRequestError",
-        404: "NotFoundError",
-    }.get(status, "")
 
 
 def _request_body(
@@ -1552,17 +1491,23 @@ async def _post_speech_with_uploaded_voice(
         if not 200 <= response.status < 300:
             _classify_http_failure(response.status, body_text, result, scenario)
             return False
-        if not _is_audio_response(body, response.headers, "pcm"):
+        validation = validate_audio_response(
+            body,
+            response_format="pcm",
+            content_type=response.headers.get("Content-Type"),
+        )
+        if not validation.ok:
             _mark_protocol_error(
                 result,
                 status="invalid_audio_response",
                 error=(
                     "speech endpoint returned 2xx without PCM audio while using "
-                    f"uploaded voice {voice_name!r}"
+                    f"uploaded voice {voice_name!r}: {validation.error}"
                 ),
             )
             return False
         result.audio_bytes += len(body)
+        result.audio_duration_s += validation.duration_s
         return True
 
 
@@ -2112,21 +2057,22 @@ def _validate_batch_item(
             error="successful item audio_data decoded to empty bytes"
         )
     headers = {"Content-Type": media_type}
-    if not _is_audio_response(decoded, headers, expected_format):
+    validation = validate_audio_response(
+        decoded,
+        response_format=expected_format,
+        content_type=media_type,
+    )
+    if not validation.ok:
         return BatchItemValidation(
             error=(
                 "successful item audio_data does not match requested audio "
                 f"contract (format={expected_format!r}, media_type={media_type!r}, "
-                f"decoded_bytes={len(decoded)})"
+                f"decoded_bytes={len(decoded)}, validation_error={validation.error})"
             )
         )
     return BatchItemValidation(
         audio_bytes=len(decoded),
-        audio_duration_s=duration_from_audio_bytes(
-            decoded,
-            content_type=media_type,
-            response_format=expected_format,
-        ),
+        audio_duration_s=validation.duration_s,
     )
 
 
@@ -2304,35 +2250,8 @@ def _is_valid_missing_voice_delete_response(status: int, body: str) -> bool:
 def _is_valid_error_response(
     status: int,
     body: str,
-    *,
-    expected_error_type: str | None = None,
 ) -> bool:
-    if not body.strip() or body.lstrip().startswith("<"):
-        return False
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        return False
-    if not isinstance(payload, dict):
-        return False
-    expected_type = expected_error_type or {
-        400: "BadRequestError",
-        404: "NotFoundError",
-    }.get(status)
-    if expected_type is None:
-        return False
-    error = payload.get("error")
-    if not isinstance(error, dict):
-        return False
-    if not isinstance(error.get("message"), str) or not error["message"].strip():
-        return False
-    if error.get("type") != expected_type:
-        return False
-    if error.get("code") != status:
-        return False
-    return "param" in error and (
-        error["param"] is None or isinstance(error["param"], str)
-    )
+    return 400 <= status < 500 and is_openai_error_response(body)
 
 
 def _is_nonnegative_file_size(value: Any) -> bool:

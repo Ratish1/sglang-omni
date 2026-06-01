@@ -117,7 +117,7 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #        "enabled_endpoints": ["websocket"]},
 #       {"id": "voice-cache-pressure", "mode": "closed_loop", "request_count": 96,
 #        "max_concurrency": 16, "enabled_endpoints": ["voices"],
-#        "voice_cache_pressure_voice_count": 64, "voice_speaker_cap_count": 0},
+#        "voice_cache_pressure_voice_count": 768, "voice_speaker_cap_count": 0},
 #       {"id": "voice-speaker-cap", "mode": "closed_loop", "request_count": 2,
 #        "max_concurrency": 1, "enabled_endpoints": ["voices"],
 #        "voice_cache_pressure_voice_count": 0, "voice_speaker_cap_count": 1001,
@@ -135,6 +135,8 @@ python -m benchmarks.eval.benchmark_tts_serving \
 # not the outer load-stage request count.
 # Voice cache pressure is reported as traffic pressure unless the benchmark can
 # observe cache eviction, hit/miss, byte-usage, or delete-invalidation counters.
+# The example uses 768 unique voices to pressure a 512MiB voice-artifact LRU
+# while staying below the default 1000 uploaded-speaker cap.
 # Current servers may fail this benchmark until the Issue #601 serving APIs land.
 
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
