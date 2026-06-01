@@ -33,5 +33,7 @@ def is_openai_error_response(body: str, *, expected_status: int) -> bool:
         return False
     if error.get("code") != expected_status:
         return False
+    if "param" not in error:
+        return False
     param = error.get("param")
     return param is None or isinstance(param, str)
