@@ -17,15 +17,15 @@ from benchmarks.tts_serving.scenarios import (
     RESPONSE_FORMATS,
     SCENARIO_SCHEMA_VERSION,
     SDK_RESPONSE_FORMATS,
+    SPEED_BOUNDARY_VALUES,
     TASK_TYPES,
-    VOICE_NEAR_LIMIT_DEFERRED_FORMATS,
-    VOICE_NEAR_LIMIT_SUCCESS_FORMATS,
+    VOICE_NEAR_LIMIT_FORMATS,
     VOICE_UPLOAD_REJECT_FORMATS,
     VOICE_UPLOAD_SUCCESS_FORMATS,
     Scenario,
     scenario_set_hash,
 )
-from benchmarks.tts_serving.spec import BenchmarkSpec
+from benchmarks.tts_serving.spec import BenchmarkSpec, redact_sensitive_metadata
 
 
 def build_results_report(
@@ -95,7 +95,7 @@ def build_results_report(
             "model_name": spec.model_name,
             "run_id": spec.run_id,
             "seed": spec.seed,
-            "platform_metadata": spec.platform_metadata,
+            "platform_metadata": redact_sensitive_metadata(spec.platform_metadata),
             "provider_label": spec.params.provider_label,
             "implementation_label": spec.params.implementation_label,
             "profile": spec.params.profile,
@@ -114,12 +114,9 @@ def build_results_report(
             ),
             "timeout_s": spec.params.timeout_s,
             "enabled_endpoints": list(spec.params.enabled_endpoints),
-            "voice_cache_eviction_count": spec.params.voice_cache_eviction_count,
+            "voice_cache_pressure_voice_count": spec.params.voice_cache_pressure_voice_count,
             "voice_speaker_cap_count": spec.params.voice_speaker_cap_count,
             "speaker_max_uploaded": spec.params.speaker_max_uploaded,
-            "coverage_out_of_scope": [
-                exclusion.to_json() for exclusion in spec.params.coverage_out_of_scope
-            ],
             "voice_upload_coverage": voice_upload_coverage,
             "load_stages": [stage.to_json() for stage in spec.params.load_stages],
         },
@@ -373,10 +370,7 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         upload_format for upload_format, _ in VOICE_UPLOAD_SUCCESS_FORMATS
     ]
     configured_near_limit_formats = [
-        upload_format for upload_format, _ in VOICE_NEAR_LIMIT_SUCCESS_FORMATS
-    ]
-    deferred_near_limit_formats = [
-        upload_format for upload_format, _ in VOICE_NEAR_LIMIT_DEFERRED_FORMATS
+        upload_format for upload_format, _ in VOICE_NEAR_LIMIT_FORMATS
     ]
     near_limit_missing_formats = sorted(
         set(configured_near_limit_formats) - set(near_limit_formats)
@@ -389,7 +383,6 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         "configured_near_limit_formats": configured_near_limit_formats,
         "near_limit_missing_formats": near_limit_missing_formats,
         "near_limit_contract_complete": not near_limit_missing_formats,
-        "near_limit_deferred_formats": deferred_near_limit_formats,
         "metadata_sequence_present": any(
             scenario.capability_key == "voices.upload_metadata"
             for scenario in scenarios
@@ -397,7 +390,6 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         "cache_pressure_voice_counts": cache_pressure_voice_counts,
         "speaker_cap_cases": speaker_cap_cases,
         "speaker_cap_attempts": speaker_cap_attempts,
-        "near_limit_pr1_gap": None,
     }
 
 
@@ -435,25 +427,8 @@ def _coverage_failures(
         )
     if "websocket" in enabled_endpoint_set:
         failures.extend(_websocket_coverage_failures(scenarios))
-    failures = _apply_coverage_exclusions(spec, failures)
     failures.extend(_coverage_matrix_failures(coverage_matrix, failures))
     return failures
-
-
-def _apply_coverage_exclusions(
-    spec: BenchmarkSpec,
-    failures: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    excluded = {item.id for item in spec.params.coverage_out_of_scope}
-    if not excluded:
-        return failures
-    return [
-        failure
-        for failure in failures
-        if not (
-            isinstance(failure.get("contract"), str) and failure["contract"] in excluded
-        )
-    ]
 
 
 def _coverage_matrix(
@@ -479,11 +454,6 @@ def _coverage_matrix(
                 tested=endpoint in generated_endpoint_set,
                 expected=[endpoint],
                 observed=sorted(generated_endpoint_set & {endpoint}),
-                disabled_reason=(
-                    "endpoint disabled by params.enabled_endpoints/load_stages"
-                    if endpoint not in enabled_endpoint_set
-                    else None
-                ),
             )
         )
 
@@ -515,7 +485,7 @@ def _coverage_matrix_failures(
             error=str(row["error"]),
         )
         for row in coverage_matrix
-        if row.get("status") not in {"tested", "out_of_scope"}
+        if row.get("status") != "tested"
         and row.get("contract") not in existing_contracts
     ]
 
@@ -560,6 +530,17 @@ def _speech_coverage_matrix(
             ),
             expected=list(TASK_TYPES),
             observed=sorted(_metadata_values(speech_scenarios, "task_type")),
+        ),
+        _coverage_matrix_row(
+            spec,
+            "speech.speed_boundaries",
+            tested=not _value_coverage_gap(
+                "speech.speed_boundaries",
+                set(SPEED_BOUNDARY_VALUES),
+                _metadata_values(speech_scenarios, "speed_boundary"),
+            ),
+            expected=list(SPEED_BOUNDARY_VALUES),
+            observed=sorted(_metadata_values(speech_scenarios, "speed_boundary")),
         ),
         _coverage_matrix_row(
             spec,
@@ -728,7 +709,9 @@ def _voice_coverage_matrix(
     voice_scenarios = [
         scenario for scenario in scenarios if scenario.endpoint == "voices"
     ]
-    configured_cache_count = _configured_voice_cache_eviction_count(spec)
+    configured_cache_pressure_voice_count = (
+        _configured_voice_cache_pressure_voice_count(spec)
+    )
     rows = [
         _coverage_matrix_row(
             spec,
@@ -794,13 +777,6 @@ def _voice_coverage_matrix(
         ),
         _coverage_matrix_row(
             spec,
-            "voices.near_limit_deferred_formats",
-            tested=False,
-            expected=voice_upload_coverage["near_limit_deferred_formats"],
-            observed=[],
-        ),
-        _coverage_matrix_row(
-            spec,
             "voices.lifecycle_cases",
             tested=not _value_coverage_gap(
                 "voices.lifecycle_cases",
@@ -843,57 +819,59 @@ def _voice_coverage_matrix(
             expected=["voices.upload_metadata"],
             observed=_capabilities_for(voice_scenarios, {"voices.upload_metadata"}),
         ),
+        _coverage_matrix_row(
+            spec,
+            "voices.speaker_cap",
+            tested=voice_upload_coverage["speaker_cap_attempts"] > 0,
+            expected=["speaker_cap_sequence"],
+            observed=(
+                ["speaker_cap_sequence"]
+                if voice_upload_coverage["speaker_cap_attempts"] > 0
+                else []
+            ),
+        ),
+        _coverage_matrix_row(
+            spec,
+            "voices.cache_pressure_traffic",
+            tested=_has_capability(
+                voice_scenarios,
+                "voices.cache_pressure_traffic",
+            ),
+            expected=["voices.cache_pressure_traffic"],
+            observed=_capabilities_for(
+                voice_scenarios,
+                {"voices.cache_pressure_traffic"},
+            ),
+        ),
+        _coverage_matrix_row(
+            spec,
+            "voices.cache_observability",
+            tested=False,
+            expected=[
+                "eviction_count",
+                "hit_count",
+                "miss_count",
+                "cache_byte_usage",
+                "delete_invalidation_counter",
+            ],
+            observed=(
+                ["instrumentation_missing"]
+                if configured_cache_pressure_voice_count
+                else []
+            ),
+            gap_status=(
+                "instrumentation_missing"
+                if configured_cache_pressure_voice_count
+                else "coverage_gap"
+            ),
+            gap_error=(
+                "voice cache pressure traffic ran without observable cache "
+                "eviction/hit/miss/byte/delete-invalidation instrumentation"
+                if configured_cache_pressure_voice_count
+                else None
+            ),
+        ),
     ]
-    if _configured_voice_speaker_cap_count(spec):
-        rows.append(
-            _coverage_matrix_row(
-                spec,
-                "voices.speaker_cap",
-                tested=voice_upload_coverage["speaker_cap_attempts"] > 0,
-                expected=["speaker_cap_sequence"],
-                observed=(
-                    ["speaker_cap_sequence"]
-                    if voice_upload_coverage["speaker_cap_attempts"] > 0
-                    else []
-                ),
-            )
-        )
-    if configured_cache_count:
-        rows.extend(
-            [
-                _coverage_matrix_row(
-                    spec,
-                    "voices.cache_pressure_traffic",
-                    tested=_has_capability(
-                        voice_scenarios,
-                        "voices.cache_pressure_traffic",
-                    ),
-                    expected=["voices.cache_pressure_traffic"],
-                    observed=_capabilities_for(
-                        voice_scenarios,
-                        {"voices.cache_pressure_traffic"},
-                    ),
-                ),
-                _coverage_matrix_row(
-                    spec,
-                    "voices.cache_observability",
-                    tested=False,
-                    expected=[
-                        "eviction_count",
-                        "hit_count",
-                        "miss_count",
-                        "cache_byte_usage",
-                        "delete_invalidation_counter",
-                    ],
-                    observed=["instrumentation_missing"],
-                    gap_status="instrumentation_missing",
-                    gap_error=(
-                        "voice cache pressure traffic ran without observable cache "
-                        "eviction/hit/miss/byte/delete-invalidation instrumentation"
-                    ),
-                ),
-            ]
-        )
     return rows
 
 
@@ -954,25 +932,13 @@ def _coverage_matrix_row(
     tested: bool,
     expected: list[Any],
     observed: list[Any],
-    disabled_reason: str | None = None,
     gap_status: str = "coverage_gap",
     gap_error: str | None = None,
 ) -> dict[str, Any]:
-    exclusions = {item.id: item.reason for item in spec.params.coverage_out_of_scope}
     if tested:
         status = "tested"
         reason = None
         missing: list[Any] = []
-        error = None
-    elif disabled_reason is not None:
-        status = "out_of_scope"
-        reason = disabled_reason
-        missing = []
-        error = None
-    elif contract in exclusions:
-        status = "out_of_scope"
-        reason = exclusions[contract]
-        missing = []
         error = None
     else:
         status = gap_status
@@ -1025,6 +991,13 @@ def _speech_coverage_failures(scenarios: list[Scenario]) -> list[dict[str, Any]]
             "speech.task_types",
             set(TASK_TYPES),
             _metadata_values(speech_scenarios, "task_type"),
+        )
+    )
+    failures.extend(
+        _value_coverage_gap(
+            "speech.speed_boundaries",
+            set(SPEED_BOUNDARY_VALUES),
+            _metadata_values(speech_scenarios, "speed_boundary"),
         )
     )
     failures.extend(
@@ -1149,7 +1122,7 @@ def _voice_coverage_failures(
             )
     if cap_stage_ids and voice_upload_coverage["speaker_cap_attempts"] <= 0:
         failures.append(_coverage_gap("voices.speaker_cap", ["speaker_cap_sequence"]))
-    if _configured_voice_cache_eviction_count(spec) and not _has_capability(
+    if _configured_voice_cache_pressure_voice_count(spec) and not _has_capability(
         voice_scenarios, "voices.cache_pressure_traffic"
     ):
         failures.append(
@@ -1158,7 +1131,7 @@ def _voice_coverage_failures(
                 ["voices.cache_pressure_traffic"],
             )
         )
-    if _configured_voice_cache_eviction_count(spec):
+    if _configured_voice_cache_pressure_voice_count(spec):
         failures.append(
             _coverage_gap(
                 "voices.cache_observability",
@@ -1341,18 +1314,11 @@ def _voice_case(scenario: Scenario) -> str | None:
     return scenario.planned_metadata.get("upload_case")
 
 
-def _configured_voice_cache_eviction_count(spec: BenchmarkSpec) -> int:
+def _configured_voice_cache_pressure_voice_count(spec: BenchmarkSpec) -> int:
     stage_count = sum(
-        stage.voice_cache_eviction_count for stage in spec.params.load_stages
+        stage.voice_cache_pressure_voice_count for stage in spec.params.load_stages
     )
-    return stage_count or spec.params.voice_cache_eviction_count
-
-
-def _configured_voice_speaker_cap_count(spec: BenchmarkSpec) -> int:
-    stage_count = sum(
-        stage.voice_speaker_cap_count for stage in spec.params.load_stages
-    )
-    return stage_count or spec.params.voice_speaker_cap_count
+    return stage_count or spec.params.voice_cache_pressure_voice_count
 
 
 def _result_group_summary(

@@ -15,7 +15,7 @@ from benchmarks.tts_serving.scenarios import (
     Scenario,
     scenario_set_hash,
 )
-from benchmarks.tts_serving.spec import BenchmarkSpec
+from benchmarks.tts_serving.spec import BenchmarkSpec, redact_sensitive_metadata
 
 
 class ArtifactError(RuntimeError):
@@ -50,7 +50,7 @@ def write_artifacts(
             "model_name": spec.model_name,
             "base_url": spec.base_url,
             "test_type": spec.test_type,
-            "platform_metadata": spec.platform_metadata,
+            "platform_metadata": redact_sensitive_metadata(spec.platform_metadata),
             "profile": spec.params.profile,
             "scenario_schema_version": SCENARIO_SCHEMA_VERSION,
             "scenario_set_hash": scenario_set_hash(scenarios),

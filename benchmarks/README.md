@@ -89,30 +89,43 @@ python -m benchmarks.eval.benchmark_tts_serving \
     --spec /etc/benchmark/spec.json \
     --out /var/benchmark/out
 
-# Example staged stress spec params:
+# Minimal local spec.json:
 # {
-#   "profile": "stress",
-#   "enabled_endpoints": ["speech", "speech_sse", "voices", "batch", "websocket"],
-#   "speaker_max_uploaded": 1000,
-#   "load_stages": [
-#     {"id": "closed-1", "mode": "closed_loop", "request_count": 32, "max_concurrency": 1},
-#     {"id": "closed-16", "mode": "closed_loop", "request_count": 128, "max_concurrency": 16},
-#     {"id": "ramp-128", "mode": "ramp", "request_count": 256, "max_concurrency": 128,
-#      "start_request_rate": 2, "request_rate": 64, "arrival_distribution": "poisson"},
-#     {"id": "soak-300s", "mode": "soak", "request_count": 512, "duration_s": 300,
-#      "max_concurrency": 128, "arrival_distribution": "poisson"},
-#     {"id": "ws-burst-512", "mode": "burst", "request_count": 512, "max_concurrency": 512,
-#      "enabled_endpoints": ["websocket"]},
-#     {"id": "voice-cache-evict", "mode": "closed_loop", "request_count": 96,
-#      "max_concurrency": 16, "enabled_endpoints": ["voices"],
-#      "voice_cache_eviction_count": 64, "voice_speaker_cap_count": 0},
-#     {"id": "voice-speaker-cap", "mode": "closed_loop", "request_count": 2,
-#      "max_concurrency": 1, "enabled_endpoints": ["voices"],
-#      "voice_cache_eviction_count": 0, "voice_speaker_cap_count": 1001,
-#      "speaker_max_uploaded": 1000},
-#     {"id": "mixed-burst-256", "mode": "burst", "request_count": 512,
-#      "max_concurrency": 256}
-#   ]
+#   "base_url": "http://127.0.0.1:8000",
+#   "model_name": "boson-sglang/higgs-audio-v3-tts-4b-base",
+#   "test_type": "engine",
+#   "params": {"profile": "production", "total_requests": 100, "max_concurrency": 8}
+# }
+#
+# Full-contract staged stress spec.json:
+# {
+#   "base_url": "http://127.0.0.1:8000",
+#   "model_name": "boson-sglang/higgs-audio-v3-tts-4b-base",
+#   "test_type": "engine",
+#   "params": {
+#     "profile": "stress",
+#     "enabled_endpoints": ["speech", "speech_sse", "voices", "batch", "websocket"],
+#     "speaker_max_uploaded": 1000,
+#     "load_stages": [
+#       {"id": "closed-1", "mode": "closed_loop", "request_count": 32, "max_concurrency": 1},
+#       {"id": "closed-16", "mode": "closed_loop", "request_count": 128, "max_concurrency": 16},
+#       {"id": "ramp-128", "mode": "ramp", "request_count": 256, "max_concurrency": 128,
+#        "start_request_rate": 2, "request_rate": 64, "arrival_distribution": "poisson"},
+#       {"id": "soak-300s", "mode": "soak", "request_count": 512, "duration_s": 300,
+#        "max_concurrency": 128, "arrival_distribution": "poisson"},
+#       {"id": "ws-burst-512", "mode": "burst", "request_count": 512, "max_concurrency": 512,
+#        "enabled_endpoints": ["websocket"]},
+#       {"id": "voice-cache-pressure", "mode": "closed_loop", "request_count": 96,
+#        "max_concurrency": 16, "enabled_endpoints": ["voices"],
+#        "voice_cache_pressure_voice_count": 64, "voice_speaker_cap_count": 0},
+#       {"id": "voice-speaker-cap", "mode": "closed_loop", "request_count": 2,
+#        "max_concurrency": 1, "enabled_endpoints": ["voices"],
+#        "voice_cache_pressure_voice_count": 0, "voice_speaker_cap_count": 1001,
+#        "speaker_max_uploaded": 1000},
+#       {"id": "mixed-burst-256", "mode": "burst", "request_count": 512,
+#        "max_concurrency": 256}
+#     ]
+#   }
 # }
 # Voice speaker-cap stages run as a state-aware sequence: the harness lists
 # existing uploaded voices first, uploads only the names needed to reach
@@ -122,6 +135,7 @@ python -m benchmarks.eval.benchmark_tts_serving \
 # not the outer load-stage request count.
 # Voice cache pressure is reported as traffic pressure unless the benchmark can
 # observe cache eviction, hit/miss, byte-usage, or delete-invalidation counters.
+# Current servers may fail this benchmark until the Issue #601 serving APIs land.
 
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
 python -m benchmarks.eval.benchmark_omni_seedtts \

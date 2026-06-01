@@ -14,38 +14,18 @@ VALID_LOAD_MODES = {"closed_loop", "open_loop", "ramp", "burst", "soak"}
 VALID_ARRIVAL_DISTRIBUTIONS = {"deterministic", "poisson"}
 DEFAULT_ENDPOINTS = ("speech", "speech_sse", "voices", "batch", "websocket")
 DEFAULT_SPEAKER_MAX_UPLOADED = 1000
-VALID_COVERAGE_CONTRACTS = {
-    "api.speech",
-    "api.speech_sse",
-    "api.batch",
-    "api.voices",
-    "api.websocket",
-    "speech.languages",
-    "speech.response_formats",
-    "speech.task_types",
-    "speech.reference_cases",
-    "speech.malformed_cases",
-    "speech.length_extremes",
-    "speech.initial_codec_chunk_frames",
-    "speech.openai_sdk",
-    "speech.openai_sdk_response_formats",
-    "speech.openai_sdk_error_contract",
-    "batch.sizes",
-    "batch.cases",
-    "voices.list",
-    "voices.accepted_upload_formats",
-    "voices.synthetic_reject_formats",
-    "voices.near_limit_upload_formats",
-    "voices.near_limit_deferred_formats",
-    "voices.lifecycle_cases",
-    "voices.upload_metadata",
-    "voices.speaker_cap",
-    "voices.cache_pressure_traffic",
-    "voices.cache_observability",
-    "websocket.cases",
-    "websocket.split_granularity.sentence",
-    "websocket.split_granularity.non_sentence",
-}
+SENSITIVE_METADATA_KEY_TERMS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "headers",
+    "password",
+    "secret",
+    "test_env",
+    "token",
+)
+REDACTED_METADATA_VALUE = "[REDACTED]"
 TOP_LEVEL_KEYS = {
     "base_url",
     "model_name",
@@ -67,10 +47,9 @@ PARAM_KEYS = {
     "enabled_endpoints",
     "seedtts_ref_audio",
     "seedtts_ref_text",
-    "voice_cache_eviction_count",
+    "voice_cache_pressure_voice_count",
     "voice_speaker_cap_count",
     "speaker_max_uploaded",
-    "coverage_out_of_scope",
     "provider_label",
     "implementation_label",
 }
@@ -86,7 +65,7 @@ LOAD_STAGE_KEYS = {
     "duration_s",
     "arrival_distribution",
     "enabled_endpoints",
-    "voice_cache_eviction_count",
+    "voice_cache_pressure_voice_count",
     "voice_speaker_cap_count",
     "speaker_max_uploaded",
 }
@@ -94,30 +73,6 @@ LOAD_STAGE_KEYS = {
 
 class SpecError(ValueError):
     """Raised when /etc/benchmark/spec.json is invalid."""
-
-
-@dataclass(frozen=True)
-class CoverageExclusion:
-    id: str
-    reason: str
-
-    @classmethod
-    def from_obj(cls, obj: Any, *, index: int) -> CoverageExclusion:
-        if not isinstance(obj, dict):
-            raise SpecError("params.coverage_out_of_scope entries must be objects")
-        _reject_unknown_keys(obj, {"id", "reason"}, "params.coverage_out_of_scope[]")
-        contract_id = _required_str(obj, "id")
-        if contract_id not in VALID_COVERAGE_CONTRACTS:
-            raise SpecError(
-                "params.coverage_out_of_scope[].id must be one of "
-                f"{sorted(VALID_COVERAGE_CONTRACTS)}; got {contract_id!r} "
-                f"at index {index}"
-            )
-        reason = _required_str(obj, "reason")
-        return cls(id=contract_id, reason=reason)
-
-    def to_json(self) -> dict[str, str]:
-        return {"id": self.id, "reason": self.reason}
 
 
 @dataclass(frozen=True)
@@ -148,7 +103,7 @@ class LoadStage:
     duration_s: float | None = None
     arrival_distribution: str = "deterministic"
     enabled_endpoints: tuple[str, ...] | None = None
-    voice_cache_eviction_count: int = 0
+    voice_cache_pressure_voice_count: int = 0
     voice_speaker_cap_count: int = 0
     speaker_max_uploaded: int | None = None
 
@@ -202,9 +157,9 @@ class LoadStage:
             obj.get("enabled_endpoints"),
             "params.load_stages[].enabled_endpoints",
         )
-        voice_cache_eviction_count = _nonnegative_int_value(
-            obj.get("voice_cache_eviction_count", 0),
-            "params.load_stages[].voice_cache_eviction_count",
+        voice_cache_pressure_voice_count = _nonnegative_int_value(
+            obj.get("voice_cache_pressure_voice_count", 0),
+            "params.load_stages[].voice_cache_pressure_voice_count",
         )
         voice_speaker_cap_count = _nonnegative_int_value(
             obj.get("voice_speaker_cap_count", 0),
@@ -224,7 +179,7 @@ class LoadStage:
             duration_s=duration_s,
             arrival_distribution=arrival_distribution,
             enabled_endpoints=enabled_endpoints,
-            voice_cache_eviction_count=voice_cache_eviction_count,
+            voice_cache_pressure_voice_count=voice_cache_pressure_voice_count,
             voice_speaker_cap_count=voice_speaker_cap_count,
             speaker_max_uploaded=speaker_max_uploaded,
         )
@@ -246,7 +201,7 @@ class LoadStage:
                 if self.enabled_endpoints is not None
                 else None
             ),
-            "voice_cache_eviction_count": self.voice_cache_eviction_count,
+            "voice_cache_pressure_voice_count": self.voice_cache_pressure_voice_count,
             "voice_speaker_cap_count": self.voice_speaker_cap_count,
             "speaker_max_uploaded": self.speaker_max_uploaded,
         }
@@ -264,10 +219,9 @@ class BenchmarkParams:
     enabled_endpoints: tuple[str, ...] = DEFAULT_ENDPOINTS
     seedtts_ref_audio: str | None = None
     seedtts_ref_text: str | None = None
-    voice_cache_eviction_count: int = 0
+    voice_cache_pressure_voice_count: int = 0
     voice_speaker_cap_count: int = 0
     speaker_max_uploaded: int = DEFAULT_SPEAKER_MAX_UPLOADED
-    coverage_out_of_scope: tuple[CoverageExclusion, ...] = field(default_factory=tuple)
     provider_label: str | None = None
     implementation_label: str | None = None
 
@@ -299,10 +253,10 @@ class BenchmarkParams:
             concurrency_levels=concurrency_levels,
             request_rate=request_rate,
         )
-        voice_cache_eviction_count = _nonnegative_int(
+        voice_cache_pressure_voice_count = _nonnegative_int(
             obj,
-            "voice_cache_eviction_count",
-            cls.voice_cache_eviction_count,
+            "voice_cache_pressure_voice_count",
+            cls.voice_cache_pressure_voice_count,
         )
         voice_speaker_cap_count = _nonnegative_int(
             obj,
@@ -314,7 +268,6 @@ class BenchmarkParams:
             "speaker_max_uploaded",
             cls.speaker_max_uploaded,
         )
-        coverage_out_of_scope = _coverage_out_of_scope(obj.get("coverage_out_of_scope"))
         _validate_voice_speaker_cap_stages(
             load_stages,
             default_enabled_endpoints=enabled,
@@ -336,10 +289,9 @@ class BenchmarkParams:
             enabled_endpoints=enabled,
             seedtts_ref_audio=_optional_str(obj, "seedtts_ref_audio"),
             seedtts_ref_text=_optional_str(obj, "seedtts_ref_text"),
-            voice_cache_eviction_count=voice_cache_eviction_count,
+            voice_cache_pressure_voice_count=voice_cache_pressure_voice_count,
             voice_speaker_cap_count=voice_speaker_cap_count,
             speaker_max_uploaded=speaker_max_uploaded,
-            coverage_out_of_scope=coverage_out_of_scope,
             provider_label=_optional_str(obj, "provider_label"),
             implementation_label=_optional_str(obj, "implementation_label"),
         )
@@ -395,6 +347,28 @@ def load_spec(path: str | Path) -> BenchmarkSpec:
     return BenchmarkSpec.from_obj(raw)
 
 
+def redact_sensitive_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (
+                REDACTED_METADATA_VALUE
+                if _is_sensitive_metadata_key(str(key))
+                else redact_sensitive_metadata(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_sensitive_metadata(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_sensitive_metadata(item) for item in value]
+    return value
+
+
+def _is_sensitive_metadata_key(key: str) -> bool:
+    normalized = key.lower().replace("-", "_")
+    return any(term in normalized for term in SENSITIVE_METADATA_KEY_TERMS)
+
+
 def _required_str(obj: dict[str, Any], key: str) -> str:
     value = obj.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -447,25 +421,6 @@ def _optional_positive_int_value(value: Any, key: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise SpecError(f"{key} must be a positive integer")
     return value
-
-
-def _coverage_out_of_scope(value: Any) -> tuple[CoverageExclusion, ...]:
-    if value is None:
-        return ()
-    if not isinstance(value, list):
-        raise SpecError("params.coverage_out_of_scope must be a list")
-    exclusions = tuple(
-        CoverageExclusion.from_obj(item, index=index)
-        for index, item in enumerate(value)
-    )
-    seen: set[str] = set()
-    for exclusion in exclusions:
-        if exclusion.id in seen:
-            raise SpecError(
-                f"duplicate params.coverage_out_of_scope[].id: {exclusion.id}"
-            )
-        seen.add(exclusion.id)
-    return exclusions
 
 
 def _request_rate(value: Any) -> float:

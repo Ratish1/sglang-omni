@@ -14,6 +14,7 @@ from typing import Any
 
 from benchmarks.tts_serving.metrics import (
     MIN_AUDIO_FRAME_PREFIX_BYTES,
+    PCM_SAMPLE_WIDTH,
     ScenarioResult,
     duration_from_audio_bytes,
     finish_timing,
@@ -136,7 +137,7 @@ def _is_sdk_audio_response(body: bytes, response_format: str) -> bool:
     if not body:
         return False
     if response_format == "pcm":
-        return True
+        return _is_sdk_pcm_response(body)
     if response_format == "mp3":
         return body.startswith(b"ID3") or (
             len(body) >= MIN_AUDIO_FRAME_PREFIX_BYTES
@@ -147,6 +148,17 @@ def _is_sdk_audio_response(body: bytes, response_format: str) -> bool:
         body.startswith(prefix)
         for prefix in SDK_AUDIO_PREFIXES.get(response_format, ())
     )
+
+
+def _is_sdk_pcm_response(body: bytes) -> bool:
+    if len(body) % PCM_SAMPLE_WIDTH:
+        return False
+    stripped = body.lstrip()[:32].lower()
+    if stripped.startswith((b"{", b"[", b"<html", b"<!doctype", b"<body")):
+        return False
+    if body.startswith((b"RIFF", b"ID3", b"fLaC", b"OggS")):
+        return False
+    return True
 
 
 def _sdk_base_url(base_url: str) -> str:

@@ -35,6 +35,7 @@ MULTILINGUAL_TEXTS = (
 RESPONSE_FORMATS = ("wav", "pcm", "mp3", "flac", "aac", "opus")
 SDK_RESPONSE_FORMATS = RESPONSE_FORMATS
 TASK_TYPES = ("Base", "CustomVoice", "VoiceDesign")
+SPEED_BOUNDARY_VALUES = (0.25, 1.0, 4.0)
 BATCH_SIZES = (1, 2, 8, 32)
 BATCH_OVERSIZED_SIZE = 33
 VOICE_UPLOAD_SUCCESS_FORMATS = (
@@ -47,19 +48,12 @@ VOICE_UPLOAD_SUCCESS_FORMATS = (
     ("mp4", "audio/mp4"),
 )
 VOICE_UPLOAD_REJECT_FORMATS = VOICE_UPLOAD_SUCCESS_FORMATS[1:]
-VOICE_NEAR_LIMIT_SUCCESS_FORMATS = (
+VOICE_NEAR_LIMIT_FORMATS = VOICE_UPLOAD_SUCCESS_FORMATS
+VOICE_NEAR_LIMIT_GENERATED_FORMATS = (
     ("wav", "audio/wav"),
     ("mp3", "audio/mpeg"),
     ("flac", "audio/flac"),
     ("mp4", "audio/mp4"),
-)
-_VOICE_NEAR_LIMIT_SUCCESS_FORMAT_NAMES = {
-    upload_format for upload_format, _ in VOICE_NEAR_LIMIT_SUCCESS_FORMATS
-}
-VOICE_NEAR_LIMIT_DEFERRED_FORMATS = tuple(
-    item
-    for item in VOICE_UPLOAD_SUCCESS_FORMATS
-    if item[0] not in _VOICE_NEAR_LIMIT_SUCCESS_FORMAT_NAMES
 )
 VOICE_SMALL_UPLOAD_BYTES = VOICE_UPLOAD_WAV_FIXTURE_SIZE
 VOICE_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -242,6 +236,9 @@ def _required_stage_scenarios(
             next_index += 1
         for task_type in TASK_TYPES:
             speech_core.append(_speech_task_type(next_index, spec, stage, task_type))
+            next_index += 1
+        for speed in SPEED_BOUNDARY_VALUES:
+            speech_core.append(_speech_speed_boundary(next_index, spec, stage, speed))
             next_index += 1
         speech_core.append(_speech_initial_codec_chunk_frames(next_index, spec, stage))
         next_index += 1
@@ -470,7 +467,7 @@ def _speech_baseline(
     payload.update(
         {
             "response_format": response_format,
-            "speed": rng.choice((0.25, 1.0, 4.0)),
+            "speed": rng.choice(SPEED_BOUNDARY_VALUES),
             "seed": spec.seed + index,
         }
     )
@@ -566,6 +563,29 @@ def _speech_task_type(
         payload=payload,
         description=f"well-formed speech task_type={task_type}",
         planned_metadata={"task_type": task_type},
+    )
+
+
+def _speech_speed_boundary(
+    index: int, spec: BenchmarkSpec, stage: LoadStage, speed: float
+) -> Scenario:
+    payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload.update(
+        {
+            "response_format": "wav",
+            "speed": speed,
+            "seed": spec.seed + index,
+        }
+    )
+    return Scenario(
+        id=_scenario_id(stage, f"speech_speed_{str(speed).replace('.', '_')}", index),
+        endpoint="speech",
+        category="speech_speed_boundary",
+        stage_id=stage.id,
+        capability_key="speech.create",
+        payload=payload,
+        description=f"well-formed speech speed boundary {speed}",
+        planned_metadata={"speed_boundary": speed},
     )
 
 
@@ -1105,7 +1125,7 @@ def _required_voice_scenarios(
             )
         )
         next_index += 1
-    for upload_format, content_type in VOICE_NEAR_LIMIT_SUCCESS_FORMATS:
+    for upload_format, content_type in VOICE_NEAR_LIMIT_GENERATED_FORMATS:
         scenarios.append(
             _voice_upload(
                 next_index,
@@ -1154,24 +1174,28 @@ def _required_voice_scenarios(
         ]
     )
     next_index += 7
-    voice_cache_eviction_count = _stage_voice_cache_eviction_count(spec, stage)
-    if voice_cache_eviction_count:
+    voice_cache_pressure_voice_count = _stage_voice_cache_pressure_voice_count(
+        spec, stage
+    )
+    if voice_cache_pressure_voice_count:
         scenarios.append(
             _voice_cache_pressure_sequence(
                 next_index,
                 spec,
                 stage,
-                voice_count=voice_cache_eviction_count,
+                voice_count=voice_cache_pressure_voice_count,
             )
         )
     return scenarios
 
 
-def _stage_voice_cache_eviction_count(spec: BenchmarkSpec, stage: LoadStage) -> int:
-    if stage.voice_cache_eviction_count:
-        return stage.voice_cache_eviction_count
+def _stage_voice_cache_pressure_voice_count(
+    spec: BenchmarkSpec, stage: LoadStage
+) -> int:
+    if stage.voice_cache_pressure_voice_count:
+        return stage.voice_cache_pressure_voice_count
     if _is_dedicated_voice_stage(spec, stage):
-        return spec.params.voice_cache_eviction_count
+        return spec.params.voice_cache_pressure_voice_count
     return 0
 
 

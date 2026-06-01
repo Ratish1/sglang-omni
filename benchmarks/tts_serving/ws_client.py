@@ -271,7 +271,9 @@ def _merge_text_event(
             return "error"
         result.status = "failed" if expect_success else "expected_error"
         result.capability = "fail" if expect_success else "pass"
-        result.error_class = "server_error_event"
+        result.error_class = (
+            "server_error_event" if expect_success else "expected_client_error"
+        )
         result.error = data
         return "error"
     if event_type in WS_CONTROL_EVENT_TYPES:
@@ -300,7 +302,9 @@ def _merge_text_event(
         if event.get("error") is True:
             result.status = "failed" if expect_success else "expected_error"
             result.capability = "fail" if expect_success else "pass"
-            result.error_class = "server_error_event"
+            result.error_class = (
+                "server_error_event" if expect_success else "expected_client_error"
+            )
             result.error = data
             return "error"
         if event["sentence_index"] != result.ws_active_sentence_index:

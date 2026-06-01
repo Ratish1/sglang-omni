@@ -93,17 +93,34 @@ def duration_from_audio_bytes(
 
 
 def _wav_duration(data: bytes) -> float:
-    try:
-        sample_rate = struct.unpack_from("<I", data, 24)[0]
-        channels = struct.unpack_from("<H", data, 22)[0]
-        bits = struct.unpack_from("<H", data, 34)[0]
-    except struct.error:
+    if len(data) < 12 or data[:4] != WAV_RIFF_MARKER or data[8:12] != WAV_WAVE_MARKER:
         return 0.0
-    if sample_rate <= 0 or channels <= 0 or bits <= 0:
+    sample_rate = 0
+    channels = 0
+    bits = 0
+    data_size = 0
+    pos = 12
+    while pos + WAV_CHUNK_HEADER_BYTES <= len(data):
+        chunk_id = data[pos : pos + 4]
+        chunk_size = int.from_bytes(data[pos + 4 : pos + 8], "little")
+        chunk_start = pos + WAV_CHUNK_HEADER_BYTES
+        chunk_end = chunk_start + chunk_size
+        if chunk_end > len(data):
+            break
+        if chunk_id == b"fmt " and chunk_size >= 16:
+            try:
+                channels = struct.unpack_from("<H", data, chunk_start + 2)[0]
+                sample_rate = struct.unpack_from("<I", data, chunk_start + 4)[0]
+                bits = struct.unpack_from("<H", data, chunk_start + 14)[0]
+            except struct.error:
+                return 0.0
+        elif chunk_id == b"data":
+            data_size = chunk_size
+            break
+        pos = chunk_end + (chunk_size % 2)
+    if sample_rate <= 0 or channels <= 0 or bits <= 0 or data_size <= 0:
         return 0.0
-    return max(len(data) - WAV_HEADER_BYTES, 0) / float(
-        sample_rate * channels * bits // 8
-    )
+    return data_size / float(sample_rate * channels * bits // 8)
 
 
 def parse_sse_audio_event(line: str) -> tuple[bytes | None, dict[str, Any] | None]:
