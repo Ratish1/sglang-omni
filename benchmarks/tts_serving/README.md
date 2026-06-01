@@ -15,11 +15,11 @@ benchmark spec should pass.
 ```text
 spec.json
   -> spec parser
-  -> deterministic scenario builder
+  -> serving-stress scenario builder
   -> load-stage scheduler
-  -> HTTP, SSE, SDK, WebSocket, voice, and batch clients
+  -> HTTP/SSE/SDK/WebSocket/voice/batch clients
   -> response classifiers
-  -> benchmark artifacts
+  -> results.json + manifest.json + raw JSONL + logs
 ```
 
 The benchmark does not launch the target service. It reads the target address
