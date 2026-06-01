@@ -15,7 +15,15 @@ from typing import Any
 import aiohttp
 
 from benchmarks.tts_serving.metrics import (
+    MIN_AUDIO_FRAME_PREFIX_BYTES,
+    PCM_SAMPLE_RATE,
+    PCM_SAMPLE_WIDTH,
     SSE_DONE_MARKER,
+    WAV_FORMAT_END,
+    WAV_FORMAT_OFFSET,
+    WAV_HEADER_BYTES,
+    WAV_RIFF_MARKER,
+    WAV_WAVE_MARKER,
     ScenarioResult,
     classify_http_status,
     duration_from_audio_bytes,
@@ -42,9 +50,10 @@ UNSUPPORTED_HTTP_STATUSES = {404, 405, 501}
 SUCCESS_BATCH_STATUSES = {"ok", "success", "succeeded"}
 FAILED_BATCH_STATUSES = {"error", "failed"}
 VALID_BATCH_TASK_TYPES = {"Base", "CustomVoice", "VoiceDesign"}
+PCM_CONTENT_TYPES = frozenset({"application/octet-stream", "audio/pcm", "audio/raw"})
 EXPECTED_BATCH_MEDIA_TYPES = {
     "wav": {"audio/wav", "audio/x-wav", "application/octet-stream", ""},
-    "pcm": {"application/octet-stream", "audio/pcm", "audio/raw"},
+    "pcm": PCM_CONTENT_TYPES,
     "mp3": {"audio/mpeg", "audio/mp3"},
     "flac": {"audio/flac"},
     "aac": {"audio/aac", "audio/aacp"},
@@ -336,14 +345,6 @@ def _merge_sse_line(
             error=f"SSE event did not include base64 audio payload: {event}",
         )
         return False
-    now = time.perf_counter()
-    if result.ttfa_s is None:
-        result.ttfa_s = now - start
-    elif chunk_times:
-        result.inter_chunk_s.append(now - chunk_times[-1])
-    chunk_times.append(now)
-    result.audio_bytes += len(audio_bytes)
-    result.response_bytes += len(audio_bytes)
     audio = event.get("audio") if isinstance(event, dict) else None
     if not isinstance(audio, dict):
         _mark_protocol_error(
@@ -353,13 +354,15 @@ def _merge_sse_line(
         )
         return False
     audio_format = audio.get("format")
-    if audio_format is None:
-        audio_format = scenario.payload.get("response_format", "")
-    if not isinstance(audio_format, str):
+    expected_format = str(scenario.payload.get("response_format", ""))
+    if not isinstance(audio_format, str) or audio_format != expected_format:
         _mark_protocol_error(
             result,
             status="invalid_sse_response",
-            error=f"SSE audio.format must be a string: {event}",
+            error=(
+                "SSE audio.format must match requested response_format "
+                f"(expected={expected_format!r}, observed={audio_format!r})"
+            ),
         )
         return False
     mime_type = audio.get("mime_type")
@@ -370,7 +373,30 @@ def _merge_sse_line(
             error=f"SSE audio.mime_type must be a string when present: {event}",
         )
         return False
-    sample_rate = audio.get("sample_rate", 24000)
+    normalized_mime_type = (
+        (mime_type or "application/octet-stream").lower().split(";", 1)[0]
+    )
+    if audio_format != "pcm" or normalized_mime_type not in PCM_CONTENT_TYPES:
+        _mark_protocol_error(
+            result,
+            status="invalid_sse_response",
+            error=(
+                "SSE stream=true audio chunks must be PCM "
+                f"(format={audio_format!r}, mime_type={mime_type!r})"
+            ),
+        )
+        return False
+    if not _is_pcm_audio_bytes(audio_bytes):
+        _mark_protocol_error(
+            result,
+            status="invalid_sse_response",
+            error=(
+                "SSE audio.data must decode to non-empty 16-bit PCM bytes "
+                f"(decoded_bytes={len(audio_bytes)})"
+            ),
+        )
+        return False
+    sample_rate = audio.get("sample_rate", PCM_SAMPLE_RATE)
     if (
         not isinstance(sample_rate, int)
         or isinstance(sample_rate, bool)
@@ -382,9 +408,17 @@ def _merge_sse_line(
             error=f"SSE audio.sample_rate must be a positive integer: {event}",
         )
         return False
+    now = time.perf_counter()
+    if result.ttfa_s is None:
+        result.ttfa_s = now - start
+    elif chunk_times:
+        result.inter_chunk_s.append(now - chunk_times[-1])
+    chunk_times.append(now)
+    result.audio_bytes += len(audio_bytes)
+    result.response_bytes += len(audio_bytes)
     result.audio_duration_s += duration_from_audio_bytes(
         audio_bytes,
-        content_type=mime_type,
+        content_type=normalized_mime_type,
         response_format=audio_format,
         sample_rate=sample_rate,
     )
@@ -521,29 +555,55 @@ def _is_audio_response(
     content_type = str(headers.get("Content-Type", "")).lower().split(";", 1)[0]
     fmt = response_format.lower()
     if fmt == "wav":
-        return body.startswith(b"RIFF") and content_type in {
-            "audio/wav",
-            "audio/x-wav",
-            "application/octet-stream",
-            "",
-        }
-    if fmt == "pcm":
-        return content_type in {"application/octet-stream", "audio/pcm", "audio/raw"}
-    if fmt == "mp3":
         return (
-            content_type in {"audio/mpeg", "audio/mp3"}
-            or body.startswith(b"ID3")
-            or (len(body) >= 2 and body[0] == 0xFF and (body[1] & 0xE0) == 0xE0)
+            len(body) > WAV_HEADER_BYTES
+            and body.startswith(WAV_RIFF_MARKER)
+            and body[WAV_FORMAT_OFFSET:WAV_FORMAT_END] == WAV_WAVE_MARKER
+            and content_type
+            in {
+                "audio/wav",
+                "audio/x-wav",
+                "application/octet-stream",
+                "",
+            }
         )
+    if fmt == "pcm":
+        return _is_pcm_audio_bytes(body) and content_type in PCM_CONTENT_TYPES
+    if fmt == "mp3":
+        return _content_type_matches(content_type, fmt) and _has_mp3_prefix(body)
     if fmt == "flac":
-        return body.startswith(b"fLaC") or content_type == "audio/flac"
+        return _content_type_matches(content_type, fmt) and body.startswith(b"fLaC")
     if fmt == "opus":
-        return body.startswith(b"OggS") or content_type in {"audio/opus", "audio/ogg"}
+        return _content_type_matches(content_type, fmt) and body.startswith(b"OggS")
     if fmt == "aac":
-        return content_type in {"audio/aac", "audio/aacp"} or (
-            len(body) >= 2 and body[0] == 0xFF and (body[1] & 0xF0) == 0xF0
-        )
+        return _content_type_matches(content_type, fmt) and _has_aac_adts_prefix(body)
     return False
+
+
+def _content_type_matches(content_type: str, response_format: str) -> bool:
+    return content_type in EXPECTED_BATCH_MEDIA_TYPES.get(
+        response_format.lower(), set()
+    )
+
+
+def _has_mp3_prefix(body: bytes) -> bool:
+    return body.startswith(b"ID3") or (
+        len(body) >= MIN_AUDIO_FRAME_PREFIX_BYTES
+        and body[0] == 0xFF
+        and (body[1] & 0xE0) == 0xE0
+    )
+
+
+def _has_aac_adts_prefix(body: bytes) -> bool:
+    return (
+        len(body) >= MIN_AUDIO_FRAME_PREFIX_BYTES
+        and body[0] == 0xFF
+        and (body[1] & 0xF0) == 0xF0
+    )
+
+
+def _is_pcm_audio_bytes(body: bytes) -> bool:
+    return bool(body) and len(body) % PCM_SAMPLE_WIDTH == 0
 
 
 def _is_unsupported_http_status(status: int, scenario: Scenario) -> bool:

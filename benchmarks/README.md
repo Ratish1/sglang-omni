@@ -94,32 +94,6 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #   "profile": "stress",
 #   "enabled_endpoints": ["speech", "speech_sse", "voices", "batch", "websocket"],
 #   "speaker_max_uploaded": 1000,
-#   "coverage_out_of_scope": [
-#     {"id": "deployment.custom_voice_dir",
-#      "reason": "standalone PR1 harness receives an already-running base_url"},
-#     {"id": "deployment.custom_voice_manifest",
-#      "reason": "standalone PR1 harness does not launch the server"},
-#     {"id": "deployment.speaker_samples_dir",
-#      "reason": "standalone PR1 harness does not launch the server"},
-#     {"id": "deployment.tts_batch_max_items",
-#      "reason": "server launch knob is calibrated outside the base_url contract"},
-#     {"id": "deployment.stage_overrides.max_num_seqs",
-#      "reason": "stage override enforcement requires server-launch control"},
-#     {"id": "deployment.stage_overrides.gpu_memory_utilization",
-#      "reason": "stage override enforcement requires server-launch control"},
-#     {"id": "state.uploaded_voice_restart_persistence",
-#      "reason": "restart persistence requires server lifecycle control"},
-#     {"id": "state.cross_model_shared_lru_invalidation",
-#      "reason": "cross-model LRU validation requires a multi-target harness"},
-#     {"id": "target.supported_model_matrix",
-#      "reason": "this run targets one model_name from spec.json"},
-#     {"id": "target.multi_target_comparison",
-#      "reason": "benchmark platform comparison is outside the single base_url run"},
-#     {"id": "voices.near_limit_deferred_formats",
-#      "reason": "near-limit Ogg/AAC/WebM need format-valid large fixtures"},
-#     {"id": "websocket.split_granularity.non_sentence",
-#      "reason": "PR1 exercises sentence granularity until additional server values are confirmed"}
-#   ],
 #   "load_stages": [
 #     {"id": "closed-1", "mode": "closed_loop", "request_count": 32, "max_concurrency": 1},
 #     {"id": "closed-16", "mode": "closed_loop", "request_count": 128, "max_concurrency": 16},
@@ -148,8 +122,6 @@ python -m benchmarks.eval.benchmark_tts_serving \
 # not the outer load-stage request count.
 # Voice cache pressure is reported as traffic pressure unless the benchmark can
 # observe cache eviction, hit/miss, byte-usage, or delete-invalidation counters.
-# Cross-model voice cache invalidation is outside the single base_url/model_name
-# PR1 harness shape and needs a later multi-target benchmark spec.
 
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
 python -m benchmarks.eval.benchmark_omni_seedtts \

@@ -10,6 +10,8 @@ import time
 import aiohttp
 
 from benchmarks.tts_serving.metrics import (
+    PCM_SAMPLE_RATE,
+    PCM_SAMPLE_WIDTH,
     ScenarioResult,
     duration_from_audio_bytes,
     finish_timing,
@@ -313,6 +315,12 @@ def _merge_text_event(
                 "audio.done total_bytes does not match received binary audio bytes",
             )
             return event_type
+        if event["total_bytes"] <= 0:
+            _mark_ws_protocol_error(
+                result,
+                "audio.done total_bytes must be positive for successful audio",
+            )
+            return event_type
         result.ws_completed_sentences += 1
         result.ws_active_sentence_index = None
         result.ws_active_sentence_bytes = 0
@@ -364,7 +372,7 @@ def _is_valid_audio_start(event: dict) -> bool:
         and isinstance(event.get("format"), str)
         and event["format"] == "pcm"
         and isinstance(event.get("sample_rate"), int)
-        and event["sample_rate"] == 24000
+        and event["sample_rate"] == PCM_SAMPLE_RATE
     )
 
 
@@ -393,13 +401,22 @@ def _record_binary_audio(data: bytes, result: ScenarioResult) -> bool:
     if result.ws_active_sentence_index is None:
         _mark_ws_protocol_error(result, "received binary audio before audio.start")
         return False
+    if not data:
+        _mark_ws_protocol_error(result, "received empty WebSocket binary audio frame")
+        return False
+    if len(data) % PCM_SAMPLE_WIDTH:
+        _mark_ws_protocol_error(
+            result,
+            "WebSocket PCM binary audio frame is not aligned to 16-bit samples",
+        )
+        return False
     result.audio_bytes += len(data)
     result.ws_active_sentence_bytes += len(data)
     result.response_bytes += len(data)
     result.audio_duration_s += duration_from_audio_bytes(
         data,
         response_format="pcm",
-        sample_rate=result.ws_active_sample_rate or 24000,
+        sample_rate=result.ws_active_sample_rate or PCM_SAMPLE_RATE,
     )
     result.status = "ok"
     result.success = True

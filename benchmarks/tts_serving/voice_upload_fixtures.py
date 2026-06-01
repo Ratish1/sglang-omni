@@ -7,13 +7,20 @@ import base64
 import gzip
 from functools import lru_cache
 
-VOICE_UPLOAD_SAMPLE_RATE = 24000
-VOICE_UPLOAD_SAMPLE_WIDTH_BYTES = 2
+from benchmarks.tts_serving.metrics import (
+    PCM_SAMPLE_RATE,
+    PCM_SAMPLE_WIDTH,
+    WAV_CHUNK_HEADER_BYTES,
+    WAV_HEADER_BYTES,
+)
+
+VOICE_UPLOAD_SAMPLE_RATE = PCM_SAMPLE_RATE
+VOICE_UPLOAD_SAMPLE_WIDTH_BYTES = PCM_SAMPLE_WIDTH
 VOICE_UPLOAD_DURATION_S = 1.2
 VOICE_UPLOAD_WAV_PAYLOAD_BYTES = int(
     VOICE_UPLOAD_SAMPLE_RATE * VOICE_UPLOAD_SAMPLE_WIDTH_BYTES * VOICE_UPLOAD_DURATION_S
 )
-VOICE_UPLOAD_WAV_FIXTURE_SIZE = 44 + VOICE_UPLOAD_WAV_PAYLOAD_BYTES
+VOICE_UPLOAD_WAV_FIXTURE_SIZE = WAV_HEADER_BYTES + VOICE_UPLOAD_WAV_PAYLOAD_BYTES
 
 VOICE_UPLOAD_FIXTURE_SIZES = {
     "mp3": 10220,
@@ -580,9 +587,9 @@ def get_voice_upload_fixture(upload_format: str) -> bytes:
 def get_wav_upload_fixture(size: int) -> bytes:
     if size <= 0:
         return b""
-    if size < 44:
+    if size < WAV_HEADER_BYTES:
         return _wav_header(0)[:size]
-    payload_size = size - 44
+    payload_size = size - WAV_HEADER_BYTES
     return _wav_header(payload_size) + _tone_pcm(payload_size)
 
 
@@ -680,8 +687,8 @@ def _mp4_padded(data: bytes, size: int) -> bytes:
 
 
 def _wav_with_junk_padding(size: int) -> bytes:
-    payload_size = min(VOICE_UPLOAD_WAV_PAYLOAD_BYTES, max(size - 44, 0))
-    junk_size = size - 44 - payload_size - 8
+    payload_size = min(VOICE_UPLOAD_WAV_PAYLOAD_BYTES, max(size - WAV_HEADER_BYTES, 0))
+    junk_size = size - WAV_HEADER_BYTES - payload_size - WAV_CHUNK_HEADER_BYTES
     if junk_size < 0:
         return get_wav_upload_fixture(size)
     return (
@@ -694,6 +701,7 @@ def _wav_with_junk_padding(size: int) -> bytes:
 
 
 def _wav_header(payload_size: int, *, riff_size: int | None = None) -> bytes:
+    byte_rate = VOICE_UPLOAD_SAMPLE_RATE * VOICE_UPLOAD_SAMPLE_WIDTH_BYTES
     return (
         b"RIFF"
         + ((36 + payload_size) if riff_size is None else riff_size).to_bytes(
@@ -703,9 +711,9 @@ def _wav_header(payload_size: int, *, riff_size: int | None = None) -> bytes:
         + (16).to_bytes(4, "little")
         + (1).to_bytes(2, "little")
         + (1).to_bytes(2, "little")
-        + (24000).to_bytes(4, "little")
-        + (48000).to_bytes(4, "little")
-        + (2).to_bytes(2, "little")
+        + VOICE_UPLOAD_SAMPLE_RATE.to_bytes(4, "little")
+        + byte_rate.to_bytes(4, "little")
+        + VOICE_UPLOAD_SAMPLE_WIDTH_BYTES.to_bytes(2, "little")
         + (16).to_bytes(2, "little")
         + b"data"
         + payload_size.to_bytes(4, "little")

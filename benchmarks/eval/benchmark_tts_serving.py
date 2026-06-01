@@ -45,6 +45,8 @@ from benchmarks.tts_serving.ws_client import run_ws_scenario
 LOAD_GENERATOR_LAGGED_THRESHOLD_S = 1.0
 DEFAULT_SPEC_PATH = "/etc/benchmark/spec.json"
 DEFAULT_OUT_DIR = "/var/benchmark/out"
+SUMMARY_LINE_WIDTH = 72
+SUMMARY_LABEL_WIDTH = 30
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -374,6 +376,43 @@ def _auth_headers(spec: BenchmarkSpec) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _print_results_summary(report: dict, out_dir: Path) -> None:
+    overall = report.get("overall", {})
+    config = report.get("config", {})
+    metrics = report.get("metrics", {})
+    latency = metrics.get("latency_s", {}) if isinstance(metrics, dict) else {}
+    status_counts = (
+        metrics.get("status_counts", {}) if isinstance(metrics, dict) else {}
+    )
+    line_width = SUMMARY_LINE_WIDTH
+    label_width = SUMMARY_LABEL_WIDTH
+    print(f"\n{'=' * line_width}")
+    print(f"{'TTS Serving Benchmark Result':^{line_width}}")
+    print(f"{'=' * line_width}")
+    print(f"  {'Model:':<{label_width}} {config.get('model_name', 'N/A')}")
+    print(f"  {'Profile:':<{label_width}} {config.get('profile', 'N/A')}")
+    print(f"  {'Passed:':<{label_width}} {overall.get('passed')}")
+    print(f"  {'Total scenarios:':<{label_width}} {overall.get('total')}")
+    print(f"  {'Succeeded:':<{label_width}} {overall.get('succeeded')}")
+    print(f"  {'Failed:':<{label_width}} {overall.get('failed')}")
+    print(
+        f"  {'Coverage contract valid:':<{label_width}} "
+        f"{overall.get('coverage_contract_valid')}"
+    )
+    print(
+        f"  {'Load generation valid:':<{label_width}} "
+        f"{overall.get('load_generation_valid')}"
+    )
+    print(f"{'-' * line_width}")
+    print(f"  {'Latency mean (s):':<{label_width}} {latency.get('mean')}")
+    print(f"  {'Latency p95 (s):':<{label_width}} {latency.get('p95')}")
+    print(f"  {'Latency p99 (s):':<{label_width}} {latency.get('p99')}")
+    print(f"  {'Peak inflight:':<{label_width}} {metrics.get('peak_inflight')}")
+    print(f"  {'Status counts:':<{label_width}} {status_counts}")
+    print(f"  {'Results JSON:':<{label_width}} {out_dir / 'results.json'}")
+    print(f"{'=' * line_width}")
+
+
 def main() -> int:
     args = _build_arg_parser().parse_args()
     harness_log: list[str] = []
@@ -396,6 +435,7 @@ def main() -> int:
         report = build_results_report(spec, results, scenarios=scenarios)
         write_artifacts(out_dir, spec, scenarios, results, report)
         write_harness_log(out_dir, harness_log)
+        _print_results_summary(report, out_dir)
     except ArtifactError as exc:
         print(f"benchmark harness failed: {exc}")
         return 2

@@ -13,6 +13,13 @@ from typing import Any
 PCM_SAMPLE_RATE = 24000
 PCM_CHANNELS = 1
 PCM_SAMPLE_WIDTH = 2
+MIN_AUDIO_FRAME_PREFIX_BYTES = 2
+WAV_HEADER_BYTES = 44
+WAV_CHUNK_HEADER_BYTES = 8
+WAV_FORMAT_OFFSET = 8
+WAV_FORMAT_END = 12
+WAV_RIFF_MARKER = b"RIFF"
+WAV_WAVE_MARKER = b"WAVE"
 SSE_DATA_PREFIX = "data: "
 SSE_DONE_MARKER = "data: [DONE]"
 
@@ -78,7 +85,7 @@ def duration_from_audio_bytes(
 ) -> float:
     fmt = (response_format or "").lower()
     ctype = (content_type or "").lower()
-    if len(data) > 44 and data[:4] == b"RIFF":
+    if len(data) > WAV_HEADER_BYTES and data[:4] == WAV_RIFF_MARKER:
         return _wav_duration(data)
     if fmt == "pcm" or "audio/pcm" in ctype or "audio/raw" in ctype:
         return len(data) / float(sample_rate * PCM_CHANNELS * PCM_SAMPLE_WIDTH)
@@ -94,7 +101,9 @@ def _wav_duration(data: bytes) -> float:
         return 0.0
     if sample_rate <= 0 or channels <= 0 or bits <= 0:
         return 0.0
-    return max(len(data) - 44, 0) / float(sample_rate * channels * bits // 8)
+    return max(len(data) - WAV_HEADER_BYTES, 0) / float(
+        sample_rate * channels * bits // 8
+    )
 
 
 def parse_sse_audio_event(line: str) -> tuple[bytes | None, dict[str, Any] | None]:

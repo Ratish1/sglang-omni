@@ -10,6 +10,7 @@ import random
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from benchmarks.tts_serving.metrics import PCM_SAMPLE_RATE, PCM_SAMPLE_WIDTH
 from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage
 from benchmarks.tts_serving.voice_upload_fixtures import (
     VOICE_UPLOAD_FIXTURE_SIZES,
@@ -75,6 +76,10 @@ VOICE_DESIGN_INSTRUCTIONS = (
     "A warm, steady adult voice with precise articulation and no dramatic affect."
 )
 INITIAL_CODEC_CHUNK_FRAMES = 4
+TINY_WAV_PAYLOAD_BYTES = 48
+WAV_PCM_BITS_PER_SAMPLE = 16
+WAV_PCM_FORMAT_CODE = 1
+WAV_MONO_CHANNELS = 1
 
 PROFILE_MIXES = {
     "production": (
@@ -1609,18 +1614,18 @@ def _reference_text(spec: BenchmarkSpec) -> str:
 
 
 def _tiny_wav_data_uri() -> str:
-    payload_size = 48
+    payload_size = TINY_WAV_PAYLOAD_BYTES
     wav = (
         b"RIFF"
         + (36 + payload_size).to_bytes(4, "little")
         + b"WAVEfmt "
         + (16).to_bytes(4, "little")
-        + (1).to_bytes(2, "little")
-        + (1).to_bytes(2, "little")
-        + (24000).to_bytes(4, "little")
-        + (48000).to_bytes(4, "little")
-        + (2).to_bytes(2, "little")
-        + (16).to_bytes(2, "little")
+        + WAV_PCM_FORMAT_CODE.to_bytes(2, "little")
+        + WAV_MONO_CHANNELS.to_bytes(2, "little")
+        + PCM_SAMPLE_RATE.to_bytes(4, "little")
+        + (PCM_SAMPLE_RATE * PCM_SAMPLE_WIDTH).to_bytes(4, "little")
+        + PCM_SAMPLE_WIDTH.to_bytes(2, "little")
+        + WAV_PCM_BITS_PER_SAMPLE.to_bytes(2, "little")
         + b"data"
         + payload_size.to_bytes(4, "little")
         + b"\0" * payload_size

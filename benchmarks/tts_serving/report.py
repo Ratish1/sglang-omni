@@ -495,7 +495,6 @@ def _coverage_matrix(
         rows.extend(_voice_coverage_matrix(spec, scenarios, voice_upload_coverage))
     if "websocket" in enabled_endpoint_set:
         rows.extend(_websocket_coverage_matrix(spec, scenarios))
-    rows.extend(_deployment_coverage_matrix(spec, scenarios))
     return rows
 
 
@@ -620,6 +619,17 @@ def _speech_coverage_matrix(
         ),
         _coverage_matrix_row(
             spec,
+            "speech.length_extremes",
+            tested=not _value_coverage_gap(
+                "speech.length_extremes",
+                {len(text) for text in LENGTH_EXTREME_TEXTS},
+                _metadata_values(speech_scenarios, "input_chars"),
+            ),
+            expected=sorted({len(text) for text in LENGTH_EXTREME_TEXTS}),
+            observed=sorted(_metadata_values(speech_scenarios, "input_chars")),
+        ),
+        _coverage_matrix_row(
+            spec,
             "speech.initial_codec_chunk_frames",
             tested=any(
                 scenario.planned_metadata.get("initial_codec_chunk_frames")
@@ -719,7 +729,7 @@ def _voice_coverage_matrix(
         scenario for scenario in scenarios if scenario.endpoint == "voices"
     ]
     configured_cache_count = _configured_voice_cache_eviction_count(spec)
-    return [
+    rows = [
         _coverage_matrix_row(
             spec,
             "voices.list",
@@ -788,10 +798,6 @@ def _voice_coverage_matrix(
             tested=False,
             expected=voice_upload_coverage["near_limit_deferred_formats"],
             observed=[],
-            gap_error=(
-                "near-limit fixtures for these container formats are not generated "
-                "until the benchmark has format-valid padding fixtures"
-            ),
         ),
         _coverage_matrix_row(
             spec,
@@ -837,53 +843,58 @@ def _voice_coverage_matrix(
             expected=["voices.upload_metadata"],
             observed=_capabilities_for(voice_scenarios, {"voices.upload_metadata"}),
         ),
-        _coverage_matrix_row(
-            spec,
-            "voices.speaker_cap",
-            tested=voice_upload_coverage["speaker_cap_attempts"] > 0,
-            expected=["speaker_cap_sequence"],
-            observed=(
-                ["speaker_cap_sequence"]
-                if voice_upload_coverage["speaker_cap_attempts"] > 0
-                else []
-            ),
-        ),
-        _coverage_matrix_row(
-            spec,
-            "voices.cache_pressure_traffic",
-            tested=(
-                configured_cache_count > 0
-                and _has_capability(voice_scenarios, "voices.cache_pressure_traffic")
-            ),
-            expected=["voices.cache_pressure_traffic"],
-            observed=_capabilities_for(
-                voice_scenarios,
-                {"voices.cache_pressure_traffic"},
-            ),
-        ),
-        _coverage_matrix_row(
-            spec,
-            "voices.cache_observability",
-            tested=False,
-            expected=[
-                "eviction_count",
-                "hit_count",
-                "miss_count",
-                "cache_byte_usage",
-                "delete_invalidation_counter",
-            ],
-            observed=["instrumentation_missing"] if configured_cache_count else [],
-            gap_status=(
-                "instrumentation_missing" if configured_cache_count else "coverage_gap"
-            ),
-            gap_error=(
-                "voice cache pressure traffic ran without observable cache "
-                "eviction/hit/miss/byte/delete-invalidation instrumentation"
-                if configured_cache_count
-                else None
-            ),
-        ),
     ]
+    if _configured_voice_speaker_cap_count(spec):
+        rows.append(
+            _coverage_matrix_row(
+                spec,
+                "voices.speaker_cap",
+                tested=voice_upload_coverage["speaker_cap_attempts"] > 0,
+                expected=["speaker_cap_sequence"],
+                observed=(
+                    ["speaker_cap_sequence"]
+                    if voice_upload_coverage["speaker_cap_attempts"] > 0
+                    else []
+                ),
+            )
+        )
+    if configured_cache_count:
+        rows.extend(
+            [
+                _coverage_matrix_row(
+                    spec,
+                    "voices.cache_pressure_traffic",
+                    tested=_has_capability(
+                        voice_scenarios,
+                        "voices.cache_pressure_traffic",
+                    ),
+                    expected=["voices.cache_pressure_traffic"],
+                    observed=_capabilities_for(
+                        voice_scenarios,
+                        {"voices.cache_pressure_traffic"},
+                    ),
+                ),
+                _coverage_matrix_row(
+                    spec,
+                    "voices.cache_observability",
+                    tested=False,
+                    expected=[
+                        "eviction_count",
+                        "hit_count",
+                        "miss_count",
+                        "cache_byte_usage",
+                        "delete_invalidation_counter",
+                    ],
+                    observed=["instrumentation_missing"],
+                    gap_status="instrumentation_missing",
+                    gap_error=(
+                        "voice cache pressure traffic ran without observable cache "
+                        "eviction/hit/miss/byte/delete-invalidation instrumentation"
+                    ),
+                ),
+            ]
+        )
+    return rows
 
 
 def _websocket_coverage_matrix(
@@ -932,110 +943,6 @@ def _websocket_coverage_matrix(
             tested=bool(split_values - {"sentence"}),
             expected=["non_sentence"],
             observed=sorted(split_values - {"sentence"}),
-        ),
-    ]
-
-
-def _deployment_coverage_matrix(
-    spec: BenchmarkSpec,
-    scenarios: list[Scenario],
-) -> list[dict[str, Any]]:
-    voice_scenarios = [
-        scenario for scenario in scenarios if scenario.endpoint == "voices"
-    ]
-    return [
-        _coverage_matrix_row(
-            spec,
-            "deployment.custom_voice_dir",
-            tested=False,
-            expected=["custom_voice_dir"],
-            observed=[],
-        ),
-        _coverage_matrix_row(
-            spec,
-            "deployment.custom_voice_manifest",
-            tested=False,
-            expected=["manifest loading"],
-            observed=[],
-        ),
-        _coverage_matrix_row(
-            spec,
-            "deployment.speaker_samples_dir",
-            tested=False,
-            expected=["SPEAKER_SAMPLES_DIR"],
-            observed=[],
-        ),
-        _coverage_matrix_row(
-            spec,
-            "deployment.speaker_max_uploaded",
-            tested=any(
-                scenario.planned_metadata.get("speaker_max_uploaded")
-                for scenario in voice_scenarios
-            ),
-            expected=[spec.params.speaker_max_uploaded],
-            observed=sorted(
-                {
-                    scenario.planned_metadata.get("speaker_max_uploaded")
-                    for scenario in voice_scenarios
-                    if scenario.planned_metadata.get("speaker_max_uploaded")
-                }
-            ),
-        ),
-        _coverage_matrix_row(
-            spec,
-            "deployment.tts_batch_max_items",
-            tested=False,
-            expected=["tts_batch_max_items variants"],
-            observed=[],
-        ),
-        _coverage_matrix_row(
-            spec,
-            "deployment.stage_overrides.max_num_seqs",
-            tested=False,
-            expected=["--stage-overrides max_num_seqs"],
-            observed=[],
-        ),
-        _coverage_matrix_row(
-            spec,
-            "deployment.stage_overrides.gpu_memory_utilization",
-            tested=False,
-            expected=["--stage-overrides gpu_memory_utilization"],
-            observed=[],
-        ),
-        _coverage_matrix_row(
-            spec,
-            "state.uploaded_voice_restart_persistence",
-            tested=False,
-            expected=["restart persistence"],
-            observed=[],
-        ),
-        _coverage_matrix_row(
-            spec,
-            "state.cross_model_shared_lru_invalidation",
-            tested=False,
-            expected=["cross-model shared-LRU invalidation"],
-            observed=[],
-        ),
-        _coverage_matrix_row(
-            spec,
-            "target.supported_model_matrix",
-            tested=False,
-            expected=["supported-model matrix"],
-            observed=[spec.model_name],
-        ),
-        _coverage_matrix_row(
-            spec,
-            "target.multi_target_comparison",
-            tested=False,
-            expected=["multi-target comparison"],
-            observed=[
-                item
-                for item in (
-                    spec.params.provider_label,
-                    spec.params.implementation_label,
-                )
-                if item
-            ],
         ),
     ]
 
@@ -1231,17 +1138,6 @@ def _voice_coverage_failures(
                 _coverage_gap(
                     "voices.near_limit_upload_formats",
                     voice_upload_coverage["near_limit_missing_formats"],
-                )
-            )
-        if voice_upload_coverage["near_limit_deferred_formats"]:
-            failures.append(
-                _coverage_gap(
-                    "voices.near_limit_deferred_formats",
-                    voice_upload_coverage["near_limit_deferred_formats"],
-                    error=(
-                        "near-limit fixtures are not generated for these formats "
-                        "until format-valid padding fixtures exist"
-                    ),
                 )
             )
         if not voice_upload_coverage["metadata_sequence_present"]:
@@ -1450,6 +1346,13 @@ def _configured_voice_cache_eviction_count(spec: BenchmarkSpec) -> int:
         stage.voice_cache_eviction_count for stage in spec.params.load_stages
     )
     return stage_count or spec.params.voice_cache_eviction_count
+
+
+def _configured_voice_speaker_cap_count(spec: BenchmarkSpec) -> int:
+    stage_count = sum(
+        stage.voice_speaker_cap_count for stage in spec.params.load_stages
+    )
+    return stage_count or spec.params.voice_speaker_cap_count
 
 
 def _result_group_summary(

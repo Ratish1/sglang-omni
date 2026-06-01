@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from benchmarks.tts_serving.metrics import (
+    MIN_AUDIO_FRAME_PREFIX_BYTES,
     ScenarioResult,
     duration_from_audio_bytes,
     finish_timing,
@@ -138,7 +139,9 @@ def _is_sdk_audio_response(body: bytes, response_format: str) -> bool:
         return True
     if response_format == "mp3":
         return body.startswith(b"ID3") or (
-            len(body) >= 2 and body[0] == 0xFF and (body[1] & 0xE0) == 0xE0
+            len(body) >= MIN_AUDIO_FRAME_PREFIX_BYTES
+            and body[0] == 0xFF
+            and (body[1] & 0xE0) == 0xE0
         )
     return any(
         body.startswith(prefix)
