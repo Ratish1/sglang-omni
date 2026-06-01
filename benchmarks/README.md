@@ -91,7 +91,7 @@ python -m benchmarks.eval.benchmark_tts_serving \
 # Single-stage local spec.json:
 # {
 #   "base_url": "http://127.0.0.1:8000",
-#   "model_name": "boson-sglang/higgs-audio-v3-tts-4b-base",
+#   "model_name": "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999",
 #   "test_type": "engine",
 #   "params": {"profile": "production", "total_requests": 100, "max_concurrency": 8}
 # }
@@ -99,7 +99,7 @@ python -m benchmarks.eval.benchmark_tts_serving \
 # Full-contract staged stress spec.json:
 # {
 #   "base_url": "http://127.0.0.1:8000",
-#   "model_name": "boson-sglang/higgs-audio-v3-tts-4b-base",
+#   "model_name": "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999",
 #   "test_type": "engine",
 #   "params": {
 #     "profile": "stress",
@@ -121,8 +121,8 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #        "max_concurrency": 1, "enabled_endpoints": ["voices"],
 #        "voice_cache_pressure_voice_count": 0, "voice_speaker_cap_count": 1001,
 #        "speaker_max_uploaded": 1000},
-#       {"id": "mixed-burst-256", "mode": "burst", "request_count": 512,
-#        "max_concurrency": 256}
+#       {"id": "mixed-burst-512", "mode": "burst", "request_count": 512,
+#        "max_concurrency": 512}
 #     ]
 #   }
 # }

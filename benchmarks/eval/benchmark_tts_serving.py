@@ -393,8 +393,8 @@ def _print_results_summary(report: dict, out_dir: Path) -> None:
     print(f"  {'Profile:':<{label_width}} {config.get('profile', 'N/A')}")
     print(f"  {'Passed:':<{label_width}} {overall.get('passed')}")
     print(f"  {'Total scenarios:':<{label_width}} {overall.get('total')}")
-    print(f"  {'Succeeded:':<{label_width}} {overall.get('succeeded')}")
-    print(f"  {'Failed:':<{label_width}} {overall.get('failed')}")
+    print(f"  {'Passed scenarios:':<{label_width}} {overall.get('succeeded')}")
+    print(f"  {'Failed scenarios:':<{label_width}} {overall.get('failed')}")
     print(
         f"  {'Coverage contract valid:':<{label_width}} "
         f"{overall.get('coverage_contract_valid')}"
