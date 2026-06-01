@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Deterministic production-shaped scenarios for the TTS serving benchmark."""
+"""Deterministic serving-stress scenarios for the TTS serving benchmark."""
 
 from __future__ import annotations
 
@@ -81,18 +81,6 @@ VOICE_DESIGN_INSTRUCTIONS = (
 INITIAL_CODEC_CHUNK_FRAMES = 4
 
 PROFILE_MIXES = {
-    "production": (
-        ("speech_baseline", 30),
-        ("speech_language", 11),
-        ("speech_length", 9),
-        ("speech_reference", 10),
-        ("speech_sdk", 4),
-        ("speech_sse", 12),
-        ("speech_malformed", 10),
-        ("batch", 8),
-        ("voices", 6),
-        ("websocket", 6),
-    ),
     "stress": (
         ("speech_baseline", 16),
         ("speech_language", 6),
@@ -108,7 +96,7 @@ PROFILE_MIXES = {
 }
 
 BASE_TEXTS = (
-    "Today is a good day to validate production text to speech serving.",
+    "Today is a good day to validate text to speech serving behavior.",
     "The quick brown fox jumps over the lazy dog while the server streams audio.",
     "Please read this sentence in a steady, clear, and natural voice.",
     "A short request should still return complete audio and usage metadata.",
@@ -137,7 +125,7 @@ REFERENCE_FAILURES = (
     (
         "not_found_url",
         "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/"
-        "resolve/main/en/prompt-wavs/does-not-exist-issue-601.wav",
+        "resolve/main/en/prompt-wavs/does-not-exist.wav",
     ),
     ("html_url", "https://example.com/"),
     ("wrong_content_type", "https://www.iana.org/_img/2013.1/iana-logo-header.svg"),

@@ -11,11 +11,13 @@ from typing import Any
 from urllib.parse import urlparse
 
 VALID_TEST_TYPES = {"engine", "e2e", "external"}
-VALID_PROFILES = {"production", "stress"}
+DEFAULT_PROFILE = "stress"
+VALID_PROFILES = {DEFAULT_PROFILE}
 VALID_LOAD_MODES = {"closed_loop", "open_loop", "ramp", "burst", "soak"}
 VALID_ARRIVAL_DISTRIBUTIONS = {"deterministic", "poisson"}
 DEFAULT_ENDPOINTS = ("speech", "speech_sse", "voices", "batch", "websocket")
 DEFAULT_SPEAKER_MAX_UPLOADED = 1000
+DEFAULT_SEED = 0
 SAFE_STAGE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 SENSITIVE_METADATA_KEY_TERMS = (
     "api_key",
@@ -222,7 +224,7 @@ class LoadStage:
 
 @dataclass(frozen=True)
 class BenchmarkParams:
-    profile: str = "production"
+    profile: str = DEFAULT_PROFILE
     total_requests: int = 100
     max_concurrency: int = 8
     concurrency_levels: tuple[int, ...] | None = None
@@ -316,7 +318,7 @@ class BenchmarkSpec:
     model_name: str
     test_type: str = "engine"
     run_id: str | None = None
-    seed: int = 601
+    seed: int = DEFAULT_SEED
     auth: AuthSpec = field(default_factory=AuthSpec)
     params: BenchmarkParams = field(default_factory=BenchmarkParams)
     platform_metadata: dict[str, Any] = field(default_factory=dict)
@@ -333,7 +335,7 @@ class BenchmarkSpec:
         test_type = _str_value(obj, "test_type", "engine")
         if test_type not in VALID_TEST_TYPES:
             raise SpecError(f"test_type must be one of {sorted(VALID_TEST_TYPES)}")
-        seed = obj.get("seed", 601)
+        seed = obj.get("seed", DEFAULT_SEED)
         if not isinstance(seed, int):
             raise SpecError("seed must be an integer")
         run_id = _optional_str(obj, "run_id")

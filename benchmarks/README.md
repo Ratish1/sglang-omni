@@ -83,65 +83,6 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
     --max-concurrency 16 \
     --output-dir results/higgs_tts_en --lang en --max-samples 50
 
-# 2f. TTS serving harness contract
-python -m benchmarks.eval.benchmark_tts_serving \
-    --spec /etc/benchmark/spec.json \
-    --out /var/benchmark/out
-# Direct Python runs require ffmpeg for compressed audio validation; the
-# benchmark Docker image installs it.
-
-# Single-stage local spec.json:
-# {
-#   "base_url": "http://127.0.0.1:8000",
-#   "model_name": "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999",
-#   "test_type": "engine",
-#   "params": {"profile": "production", "total_requests": 100, "max_concurrency": 8}
-# }
-#
-# Full-contract staged stress spec.json:
-# {
-#   "base_url": "http://127.0.0.1:8000",
-#   "model_name": "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999",
-#   "test_type": "engine",
-#   "params": {
-#     "profile": "stress",
-#     "enabled_endpoints": ["speech", "speech_sse", "voices", "batch", "websocket"],
-#     "speaker_max_uploaded": 1000,
-#     "load_stages": [
-#       {"id": "closed-1", "mode": "closed_loop", "request_count": 32, "max_concurrency": 1},
-#       {"id": "closed-16", "mode": "closed_loop", "request_count": 128, "max_concurrency": 16},
-#       {"id": "ramp-128", "mode": "ramp", "request_count": 256, "max_concurrency": 128,
-#        "start_request_rate": 2, "request_rate": 64, "arrival_distribution": "poisson"},
-#       {"id": "soak-300s", "mode": "soak", "request_count": 512, "duration_s": 300,
-#        "max_concurrency": 128, "arrival_distribution": "poisson"},
-#       {"id": "ws-burst-512", "mode": "burst", "request_count": 512, "max_concurrency": 512,
-#        "enabled_endpoints": ["websocket"]},
-#       {"id": "voice-cache-pressure", "mode": "closed_loop", "request_count": 96,
-#        "max_concurrency": 16, "enabled_endpoints": ["voices"],
-#        "voice_cache_pressure_voice_count": 768, "voice_speaker_cap_count": 0},
-#       {"id": "voice-speaker-cap", "mode": "closed_loop", "request_count": 2,
-#        "max_concurrency": 1, "enabled_endpoints": ["voices"],
-#        "voice_cache_pressure_voice_count": 0, "voice_speaker_cap_count": 1001,
-#        "speaker_max_uploaded": 1000},
-#       {"id": "mixed-burst-512", "mode": "burst", "request_count": 512,
-#        "max_concurrency": 512}
-#     ]
-#   }
-# }
-# Voice speaker-cap stages run as a state-aware sequence: the harness lists
-# existing uploaded voices first, uploads only the names needed to reach
-# speaker_max_uploaded, then requires the first overflow upload to fail.
-# speaker_max_uploaded must match the server-side SPEAKER_MAX_UPLOADED setting.
-# voice_speaker_cap_count is the sequence's internal upload-attempt budget,
-# not the outer load-stage request count.
-# Speaker-cap and cache-pressure contracts are activated by their dedicated
-# load-stage settings.
-# Voice cache pressure is reported as traffic pressure unless the benchmark can
-# observe cache eviction, hit/miss, byte-usage, or delete-invalidation counters.
-# The example uses 768 unique voices to pressure a 512MiB voice-artifact LRU
-# while staying below the default 1000 uploaded-speaker cap.
-# Current servers may fail this benchmark until the Issue #601 serving APIs land.
-
 # 3a. Qwen3-Omni — full pipeline (generate + transcribe)
 python -m benchmarks.eval.benchmark_omni_seedtts \
     --meta zhaochenyang20/seed-tts-eval-arrow \
@@ -198,11 +139,15 @@ python -m benchmarks.eval.benchmark_omni_videoamme \
 | Script | Task | Model | API |
 |--------|------|-------|-----|
 | `eval/benchmark_tts_seedtts.py` | TTS speed + WER (unified) | e.g. S2-Pro, Voxtral, Higgs TTS | `/v1/audio/speech` |
+| `eval/benchmark_tts_serving.py` | TTS serving contract | OpenAI-compatible TTS models | `/v1/audio/speech`, SSE, WebSocket, voice and batch contracts |
 | `eval/benchmark_omni_seedtts.py` | TTS speed + WER (unified) | Qwen3-Omni | `/v1/chat/completions` |
 | `eval/benchmark_omni_mmsu.py` | MMSU (audio comprehension) | Qwen3-Omni | `/v1/chat/completions` |
 | `eval/benchmark_omni_mmmu.py` | MMMU (VLM accuracy + speed) | Qwen3-Omni | `/v1/chat/completions` |
 | `eval/benchmark_omni_videomme.py` | Video-MME (video understanding) | Qwen3-Omni | `/v1/chat/completions` |
 | `eval/benchmark_omni_videoamme.py` | Video-AMME (video + audio question understanding) | Qwen3-Omni | `/v1/chat/completions` |
+
+See [tts_serving/README.md](tts_serving/README.md) for the TTS serving
+benchmark design, harness contract, scenario matrix, and Docker usage.
 
 The two `*_seedtts.py` scripts merge the previous `benchmark_*_tts_speed.py`
 and `voice_clone_*_wer.py` pairs into a single two-phase pipeline: phase 1

@@ -1,0 +1,236 @@
+# TTS Serving Benchmark
+
+This benchmark validates the serving behavior of SGLang Omni's
+OpenAI-compatible TTS service. It is separate from SeedTTS quality evaluation:
+SeedTTS measures model quality and speed on a fixed corpus, while this
+benchmark exercises API contracts, malformed requests, stateful voice
+operations, streaming behavior, and high-concurrency load.
+
+Note: before all serving APIs are integrated, enabled-but-missing contracts are
+expected to fail explicitly; after those APIs are integrated, the same
+benchmark spec should pass.
+
+## Design
+
+```text
+spec.json
+  -> spec parser
+  -> deterministic scenario builder
+  -> load-stage scheduler
+  -> HTTP, SSE, SDK, WebSocket, voice, and batch clients
+  -> response classifiers
+  -> benchmark artifacts
+```
+
+The benchmark does not launch the target service. It reads the target address
+from `spec.json`, generates a deterministic scenario matrix, runs the configured
+load stages, classifies every response, and writes structured artifacts.
+
+The harness exit code only describes the benchmark runner:
+
+- `0`: the harness ran and wrote `results.json`. The service can still fail the
+  benchmark through `overall.passed=false`.
+- non-zero: the harness could not run, such as an invalid spec or an unwritable
+  output directory.
+
+## Harness Contract
+
+The Docker entry point uses fixed input and output paths:
+
+```text
+/etc/benchmark/spec.json   # input spec
+/var/benchmark/out/        # output directory
+```
+
+The default entry point is:
+
+```bash
+python -m benchmarks.eval.benchmark_tts_serving \
+  --spec /etc/benchmark/spec.json \
+  --out /var/benchmark/out
+```
+
+Direct Python runs require `ffmpeg` on `PATH` for compressed audio validation.
+The Docker image installs `ffmpeg`.
+
+## File Structure
+
+```text
+benchmark_tts_serving.py       # entry point under benchmarks/eval/
+spec.py                        # spec schema and load-stage defaults
+scenarios.py                   # deterministic scenario matrix
+http_client.py                 # HTTP and SSE request dispatch
+sdk_client.py                  # OpenAI SDK compatibility path
+ws_client.py                   # WebSocket speech-stream path
+voice_client.py                # uploaded-voice lifecycle and cache pressure
+batch_client.py                # batch speech response validation
+audio_validation.py            # WAV/PCM and decoded compressed-audio checks
+report.py                      # results.json aggregation and coverage contract
+artifacts.py                   # manifest, raw JSONL, and harness log writing
+examples/                      # runnable spec examples
+Dockerfile                     # standalone benchmark image
+```
+
+## Spec Reference
+
+Top-level fields:
+
+| Field | Description |
+|-------|-------------|
+| `base_url` | Target service address, for example `http://127.0.0.1:8000`. |
+| `model_name` | Model id copied into OpenAI-compatible requests. |
+| `test_type` | Artifact label for benchmark systems. Valid values: `engine`, `e2e`, `external`. |
+| `run_id` | Optional run identifier included in artifacts. |
+| `seed` | Deterministic seed for scenario ordering and open-loop arrivals. Defaults to `0`. |
+| `auth.api_key_env` | Optional environment variable name containing a bearer token. |
+| `params` | Benchmark profile, endpoints, load stages, timeout, and voice limits. |
+
+Common `params` fields:
+
+| Field | Description |
+|-------|-------------|
+| `profile` | Serving-stress scenario mix. Valid value: `stress`. |
+| `enabled_endpoints` | Endpoint families to exercise: `speech`, `speech_sse`, `voices`, `batch`, `websocket`. |
+| `total_requests` | Request count used when `load_stages` is not provided. |
+| `max_concurrency` | Concurrency used when `load_stages` is not provided. |
+| `load_stages` | Explicit staged load plan. |
+| `timeout_s` | Per-request timeout. |
+| `speaker_max_uploaded` | Expected server-side uploaded-speaker cap. |
+| `voice_cache_pressure_voice_count` | Number of unique uploaded voices for cache-pressure stages. |
+| `voice_speaker_cap_count` | Upload-attempt budget for speaker-cap stages. |
+
+Load-stage fields:
+
+| Field | Description |
+|-------|-------------|
+| `id` | Stable stage id used in scenario ids and artifacts. |
+| `mode` | `closed_loop`, `open_loop`, `ramp`, `burst`, or `soak`. |
+| `request_count` | Number of scheduled scenarios for the stage. |
+| `max_concurrency` | Maximum in-flight requests for the stage. |
+| `request_rate` | Requests per second for `open_loop` and `ramp`; derived from `duration_s` for `soak`. |
+| `start_request_rate` | Initial requests per second for `ramp`. |
+| `duration_s` | Wall-clock duration for `soak`. |
+| `arrival_distribution` | `deterministic` or `poisson`. |
+| `enabled_endpoints` | Optional per-stage endpoint override. |
+
+## Endpoint Contracts
+
+`enabled_endpoints` controls which API families are part of the run:
+
+| Endpoint family | Contract |
+|-----------------|----------|
+| `speech` | `POST /v1/audio/speech` with response formats, task types, language handling, speed bounds, reference audio, SDK compatibility, and malformed-request classification. |
+| `speech_sse` | `POST /v1/audio/speech` with server-sent event streaming and streaming error cases. |
+| `batch` | `POST /v1/audio/speech/batch` with 1-32 item batches, per-item overrides, item-level success/error records, and oversized batch rejection. |
+| `voices` | `GET`, `POST`, and `DELETE /v1/audio/voices` with upload formats, metadata, overwrite, delete, speaker-cap, cleanup, race, and cache-pressure behavior. |
+| `websocket` | `/v1/audio/speech/stream` with session configuration, incremental text input, binary audio frames, event ordering, client disconnect, malformed JSON, and missing-config errors. |
+
+## Basic Usage
+
+Start a compatible TTS service, then run the checked-in serving-stress spec:
+
+```bash
+python -m benchmarks.eval.benchmark_tts_serving \
+  --spec benchmarks/tts_serving/examples/stress.json \
+  --out results/tts_serving/stress
+```
+
+The example spec uses `http://127.0.0.1:8000` and the Higgs TTS model id.
+Edit `base_url`, `model_name`, and `auth.api_key_env` for a different target or
+authenticated deployment.
+
+## Docker
+
+Build the standalone image:
+
+```bash
+docker build -f benchmarks/tts_serving/Dockerfile \
+  -t sglang-omni-tts-serving-benchmark .
+```
+
+Run the image with a spec mounted at the contract path:
+
+```bash
+docker run --rm \
+  -v "$PWD/benchmarks/tts_serving/examples/stress.json:/etc/benchmark/spec.json:ro" \
+  -v "$PWD/results/tts_serving/stress:/var/benchmark/out" \
+  sglang-omni-tts-serving-benchmark
+```
+
+When the target service is outside the container network, set `base_url` to an
+address reachable from the container.
+
+## Scenario Matrix
+
+The matrix is deterministic for a given spec seed. It covers:
+
+- speech success paths across response formats, task types, speed boundaries,
+  reference-audio shapes, SDK calls, and SSE streaming
+- malformed speech requests that must return OpenAI-compatible error envelopes
+- multilingual and adversarial text payloads
+- batch speech creation and item-level result validation
+- uploaded-voice list, upload, overwrite, delete, metadata, speaker-cap, and
+  upload/delete race contracts
+- voice cache pressure traffic and cache-observability coverage gaps
+- WebSocket speech-stream setup, event order, audio events, and error cases
+
+Voice scenarios are stateful. Successful standalone uploads verify uploaded
+metadata with `GET /v1/audio/voices`, delete the created voice, and list again
+to prove cleanup. Lifecycle delete also requires a structured 404 when a
+deleted voice is used for synthesis. Repeated runs should not consume
+persistent speaker slots or change later baselines.
+
+Compressed response formats are decoded through `ffmpeg` before validation.
+The benchmark checks decoded PCM duration and non-zero signal so container
+headers or placeholder bytes cannot pass as generated audio.
+
+## Serving-Stress Profile
+
+`examples/stress.json` is the serving-stress example. Its stages are:
+
+| Stage | Purpose |
+|-------|---------|
+| `closed-1` | Serial baseline that isolates contract failures from concurrency effects. |
+| `closed-16` | Moderate closed-loop concurrency. |
+| `ramp-128` | Poisson ramp from low request rate to high request rate. |
+| `soak-300s` | Sustained load over a fixed duration. |
+| `ws-burst-512` | WebSocket-only burst pressure. |
+| `voice-cache-pressure` | Uploaded-voice churn below the speaker cap. |
+| `voice-speaker-cap` | State-aware speaker-cap validation. |
+| `mixed-burst-512` | Full-endpoint burst with `request_count=512` and `max_concurrency=512`. |
+
+The mixed burst intentionally matches request count and concurrency so the
+client can emit the full burst without creating artificial
+`load_generator_saturated` records.
+
+Speaker-cap stages list existing uploaded voices first, upload only the names
+needed to reach `speaker_max_uploaded`, and require the first overflow upload
+to fail. Set `speaker_max_uploaded` to the server-side uploaded-speaker cap.
+
+Cache-pressure stages generate traffic pressure. Full cache validation also
+requires observable counters for eviction, hit, miss, byte usage, and
+delete-invalidation behavior.
+
+## Results
+
+The output directory contains:
+
+```text
+results.json          # summary, coverage contract, metrics, unsupported APIs
+manifest.json         # spec hash and artifact metadata
+raw/*.jsonl           # per-scenario records
+logs/harness.log      # load-stage execution notes
+```
+
+`results.json` includes:
+
+| Field | Meaning |
+|-------|---------|
+| `overall.passed` | End-to-end benchmark pass/fail for the configured contracts. |
+| `harness_status` | Whether the harness ran successfully. |
+| `overall.coverage_contract_valid` | Whether required scenario coverage was achieved. |
+| `overall.load_generation_valid` | Whether the client emitted the intended load without saturation or excessive lag. |
+| `metrics.status_counts` | Count of `ok`, protocol failures, unsupported contracts, and load-generator failures. |
+| `metrics.endpoint_mix` | Executed scenario count by endpoint family. |
+| `unsupported_contracts` | Enabled API contracts that were missing or unsupported. |
+| `coverage_failures` | Coverage requirements that traffic alone could not prove. |
