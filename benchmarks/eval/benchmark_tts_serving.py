@@ -34,7 +34,6 @@ from benchmarks.tts_serving.artifacts import (
     write_artifacts,
     write_harness_log,
 )
-from benchmarks.tts_serving.assets import DEFAULT_OUT_DIR, DEFAULT_SPEC_PATH
 from benchmarks.tts_serving.http_client import run_http_scenario
 from benchmarks.tts_serving.metrics import ScenarioResult
 from benchmarks.tts_serving.report import build_results_report
@@ -44,6 +43,8 @@ from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage, SpecError, loa
 from benchmarks.tts_serving.ws_client import run_ws_scenario
 
 LOAD_GENERATOR_LAGGED_THRESHOLD_S = 1.0
+DEFAULT_SPEC_PATH = "/etc/benchmark/spec.json"
+DEFAULT_OUT_DIR = "/var/benchmark/out"
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

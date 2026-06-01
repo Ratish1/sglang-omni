@@ -468,7 +468,22 @@ def _classify_http_failure(
         )
         return
     if 400 <= status < 500 and _is_expected_client_error_scenario(scenario):
-        if not _is_valid_error_response(status, body):
+        expected_status = _expected_client_error_status(scenario)
+        if status != expected_status:
+            _mark_protocol_error(
+                result,
+                status="invalid_error_response",
+                error=(
+                    "expected client-error scenario returned wrong HTTP status "
+                    f"(expected={expected_status}, observed={status}): {body}"
+                ),
+            )
+            return
+        if not _is_valid_error_response(
+            status,
+            body,
+            expected_error_type=_expected_client_error_type(scenario, status),
+        ):
             _mark_protocol_error(
                 result,
                 status="invalid_error_response",
@@ -545,6 +560,17 @@ def _is_expected_client_error_scenario(scenario: Scenario) -> bool:
     return (
         not scenario.expect_success and scenario.expected_status_class == "client_error"
     )
+
+
+def _expected_client_error_status(scenario: Scenario) -> int:
+    return scenario.expected_http_status or 400
+
+
+def _expected_client_error_type(scenario: Scenario, status: int) -> str:
+    return scenario.expected_error_type or {
+        400: "BadRequestError",
+        404: "NotFoundError",
+    }.get(status, "")
 
 
 def _request_body(
@@ -2215,7 +2241,12 @@ def _is_valid_missing_voice_delete_response(status: int, body: str) -> bool:
     return isinstance(error, (dict, str)) and bool(error)
 
 
-def _is_valid_error_response(status: int, body: str) -> bool:
+def _is_valid_error_response(
+    status: int,
+    body: str,
+    *,
+    expected_error_type: str | None = None,
+) -> bool:
     if not body.strip() or body.lstrip().startswith("<"):
         return False
     try:
@@ -2224,7 +2255,10 @@ def _is_valid_error_response(status: int, body: str) -> bool:
         return False
     if not isinstance(payload, dict):
         return False
-    expected_type = {400: "BadRequestError", 404: "NotFoundError"}.get(status)
+    expected_type = expected_error_type or {
+        400: "BadRequestError",
+        404: "NotFoundError",
+    }.get(status)
     if expected_type is None:
         return False
     error = payload.get("error")

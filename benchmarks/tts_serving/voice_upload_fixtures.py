@@ -597,8 +597,12 @@ def get_near_limit_voice_upload_fixture(upload_format: str, size: int) -> bytes:
         raise ValueError(
             f"near-limit size {size} is smaller than {upload_format} fixture"
         )
-    if upload_format in {"mp3", "ogg", "aac", "webm"}:
+    if upload_format == "mp3":
         return _id3_padded(data, size)
+    if upload_format in {"ogg", "aac", "webm"}:
+        raise ValueError(
+            f"near-limit {upload_format} fixture requires format-valid padding"
+        )
     if upload_format == "flac":
         return _flac_padded(data, size)
     if upload_format == "mp4":

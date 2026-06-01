@@ -32,6 +32,7 @@ MULTILINGUAL_TEXTS = (
     ("Italian", "Questa e una frase italiana per testare il servizio vocale."),
 )
 RESPONSE_FORMATS = ("wav", "pcm", "mp3", "flac", "aac", "opus")
+SDK_RESPONSE_FORMATS = RESPONSE_FORMATS
 TASK_TYPES = ("Base", "CustomVoice", "VoiceDesign")
 BATCH_SIZES = (1, 2, 8, 32)
 BATCH_OVERSIZED_SIZE = 33
@@ -45,6 +46,20 @@ VOICE_UPLOAD_SUCCESS_FORMATS = (
     ("mp4", "audio/mp4"),
 )
 VOICE_UPLOAD_REJECT_FORMATS = VOICE_UPLOAD_SUCCESS_FORMATS[1:]
+VOICE_NEAR_LIMIT_SUCCESS_FORMATS = (
+    ("wav", "audio/wav"),
+    ("mp3", "audio/mpeg"),
+    ("flac", "audio/flac"),
+    ("mp4", "audio/mp4"),
+)
+_VOICE_NEAR_LIMIT_SUCCESS_FORMAT_NAMES = {
+    upload_format for upload_format, _ in VOICE_NEAR_LIMIT_SUCCESS_FORMATS
+}
+VOICE_NEAR_LIMIT_DEFERRED_FORMATS = tuple(
+    item
+    for item in VOICE_UPLOAD_SUCCESS_FORMATS
+    if item[0] not in _VOICE_NEAR_LIMIT_SUCCESS_FORMAT_NAMES
+)
 VOICE_SMALL_UPLOAD_BYTES = VOICE_UPLOAD_WAV_FIXTURE_SIZE
 VOICE_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 VOICE_NEAR_LIMIT_BYTES = VOICE_MAX_UPLOAD_BYTES - 1
@@ -139,6 +154,8 @@ class Scenario:
     path: str = "/v1/audio/speech"
     expect_success: bool = True
     expected_status_class: str = "success"
+    expected_http_status: int | None = None
+    expected_error_type: str | None = None
     description: str = ""
     body_type: str = "json"
     form_fields: dict[str, str] = field(default_factory=dict)
@@ -225,8 +242,19 @@ def _required_stage_scenarios(
         next_index += 1
         groups.append(speech_core)
 
-        groups.append([_speech_openai_sdk(next_index, spec, stage)])
+        sdk_scenarios = [
+            _speech_openai_sdk(
+                next_index + offset,
+                spec,
+                stage,
+                response_format=response_format,
+            )
+            for offset, response_format in enumerate(SDK_RESPONSE_FORMATS)
+        ]
+        next_index += len(sdk_scenarios)
+        sdk_scenarios.append(_speech_openai_sdk_error(next_index, spec, stage))
         next_index += 1
+        groups.append(sdk_scenarios)
 
         speech_edges: list[Scenario] = []
         for _ in LENGTH_EXTREME_TEXTS:
@@ -289,6 +317,8 @@ def _required_stage_scenarios(
                 inject_item_error=False,
                 expect_success=False,
                 expected_status_class="client_error",
+                expected_http_status=400,
+                expected_error_type="BadRequestError",
             )
         )
         next_index += 1
@@ -339,7 +369,12 @@ def _weighted_scenario(
     if scenario_type == "speech_reference":
         return _speech_reference(index, spec, stage)
     if scenario_type == "speech_sdk":
-        return _speech_openai_sdk(index, spec, stage)
+        return _speech_openai_sdk(
+            index,
+            spec,
+            stage,
+            response_format=rng.choice(SDK_RESPONSE_FORMATS),
+        )
     if scenario_type == "speech_sse":
         return _speech_sse(index, spec, stage)
     if scenario_type == "speech_malformed":
@@ -529,8 +564,47 @@ def _speech_task_type(
     )
 
 
-def _speech_openai_sdk(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
+def _speech_openai_sdk(
+    index: int,
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+    *,
+    response_format: str,
+) -> Scenario:
     payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload.update(
+        {
+            "response_format": response_format,
+            "speed": 1.0,
+            "seed": spec.seed + index,
+        }
+    )
+    return Scenario(
+        id=_scenario_id(stage, f"speech_openai_sdk_{response_format}", index),
+        endpoint="speech",
+        category="speech_openai_sdk",
+        stage_id=stage.id,
+        capability_key="speech.openai_sdk",
+        method="SDK",
+        payload=payload,
+        description=(
+            "official OpenAI Python SDK speech create + stream_to_file path "
+            f"for {response_format}"
+        ),
+        planned_metadata={
+            "sdk_case": "success",
+            "sdk_response_format": response_format,
+            "response_format": response_format,
+        },
+    )
+
+
+def _speech_openai_sdk_error(
+    index: int,
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+) -> Scenario:
+    payload = _base_payload(spec, "")
     payload.update(
         {
             "response_format": "wav",
@@ -539,15 +613,23 @@ def _speech_openai_sdk(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Sce
         }
     )
     return Scenario(
-        id=_scenario_id(stage, "speech_openai_sdk", index),
+        id=_scenario_id(stage, "speech_openai_sdk_error", index),
         endpoint="speech",
         category="speech_openai_sdk",
         stage_id=stage.id,
-        capability_key="speech.openai_sdk",
+        capability_key="speech.openai_sdk_error",
         method="SDK",
         payload=payload,
-        description="official OpenAI Python SDK speech create + stream_to_file path",
-        planned_metadata={"response_format": "wav"},
+        expect_success=False,
+        expected_status_class="client_error",
+        expected_http_status=400,
+        expected_error_type="BadRequestError",
+        description="official OpenAI Python SDK speech validation error path",
+        planned_metadata={
+            "sdk_case": "expected_error",
+            "sdk_error_case": "empty_input",
+            "response_format": "wav",
+        },
     )
 
 
@@ -588,6 +670,8 @@ def _speech_length(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenari
         payload=payload,
         expect_success=expect_success,
         expected_status_class="success" if expect_success else "client_error",
+        expected_http_status=None if expect_success else 400,
+        expected_error_type=None if expect_success else "BadRequestError",
         description="empty, tiny, or pathologically long input",
         planned_metadata={"input_chars": len(text)},
     )
@@ -695,6 +779,8 @@ def _speech_reference_failure(
         payload=payload,
         expect_success=False,
         expected_status_class="client_error",
+        expected_http_status=400,
+        expected_error_type="BadRequestError",
         description="intentionally bad reference audio",
         planned_metadata={"reference_case": reference_case},
     )
@@ -821,6 +907,8 @@ def _speech_malformed(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
         payload=payload,
         expect_success=expect_success,
         expected_status_class="success" if expect_success else "client_error",
+        expected_http_status=None if expect_success else 400,
+        expected_error_type=None if expect_success else "BadRequestError",
         description="malformed or adversarial request should not crash server",
         planned_metadata={"malformed_case": malformed_case},
     )
@@ -835,6 +923,8 @@ def _batch_request(
     inject_item_error: bool = False,
     expect_success: bool = True,
     expected_status_class: str = "success",
+    expected_http_status: int | None = None,
+    expected_error_type: str | None = None,
 ) -> Scenario:
     items: list[dict[str, Any]] = []
     for item_index in range(batch_size):
@@ -861,6 +951,8 @@ def _batch_request(
         payload=payload,
         expect_success=expect_success,
         expected_status_class=expected_status_class,
+        expected_http_status=expected_http_status,
+        expected_error_type=expected_error_type,
         description=f"batch speech request with {batch_size} items",
         planned_metadata={
             "batch_size": batch_size,
@@ -1003,10 +1095,12 @@ def _required_voice_scenarios(
                 case="synthetic_header_reject",
                 expect_success=False,
                 expected_status_class="client_error",
+                expected_http_status=400,
+                expected_error_type="BadRequestError",
             )
         )
         next_index += 1
-    for upload_format, content_type in VOICE_UPLOAD_SUCCESS_FORMATS:
+    for upload_format, content_type in VOICE_NEAR_LIMIT_SUCCESS_FORMATS:
         scenarios.append(
             _voice_upload(
                 next_index,
@@ -1031,6 +1125,8 @@ def _required_voice_scenarios(
                 case="oversized",
                 expect_success=False,
                 expected_status_class="client_error",
+                expected_http_status=400,
+                expected_error_type="BadRequestError",
             ),
             _voice_upload(
                 next_index + 1,
@@ -1042,6 +1138,8 @@ def _required_voice_scenarios(
                 case="corrupt_audio",
                 expect_success=False,
                 expected_status_class="client_error",
+                expected_http_status=400,
+                expected_error_type="BadRequestError",
             ),
             _voice_overwrite(next_index + 2, spec, stage),
             _voice_delete(next_index + 3, spec, stage),
@@ -1101,6 +1199,8 @@ def _voice_upload(
     voice_name: str | None = None,
     expect_success: bool = True,
     expected_status_class: str = "success",
+    expected_http_status: int | None = None,
+    expected_error_type: str | None = None,
 ) -> Scenario:
     name = voice_name or f"bench_voice_{stage.id}_{index:05d}_{upload_format}_{case}"
     return Scenario(
@@ -1123,6 +1223,8 @@ def _voice_upload(
         upload_size_bytes=upload_size,
         expect_success=expect_success,
         expected_status_class=expected_status_class,
+        expected_http_status=expected_http_status,
+        expected_error_type=expected_error_type,
         description=f"voice upload {case} request in {upload_format} format",
         planned_metadata={
             "upload_case": case,
@@ -1151,6 +1253,7 @@ def _voice_delete(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario
         path=f"/v1/audio/voices/{name}",
         expect_success=False,
         expected_status_class="client_error",
+        expected_http_status=404,
         description="delete missing voice should return a controlled error",
         planned_metadata={"voice_name": name},
     )

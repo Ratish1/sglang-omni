@@ -115,6 +115,8 @@ python -m benchmarks.eval.benchmark_tts_serving \
 #      "reason": "this run targets one model_name from spec.json"},
 #     {"id": "target.multi_target_comparison",
 #      "reason": "benchmark platform comparison is outside the single base_url run"},
+#     {"id": "voices.near_limit_deferred_formats",
+#      "reason": "near-limit Ogg/AAC/WebM need format-valid large fixtures"},
 #     {"id": "websocket.split_granularity.non_sentence",
 #      "reason": "PR1 exercises sentence granularity until additional server values are confirmed"}
 #   ],

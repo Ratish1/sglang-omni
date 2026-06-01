@@ -16,7 +16,10 @@ from benchmarks.tts_serving.scenarios import (
     REFERENCE_FAILURES,
     RESPONSE_FORMATS,
     SCENARIO_SCHEMA_VERSION,
+    SDK_RESPONSE_FORMATS,
     TASK_TYPES,
+    VOICE_NEAR_LIMIT_DEFERRED_FORMATS,
+    VOICE_NEAR_LIMIT_SUCCESS_FORMATS,
     VOICE_UPLOAD_REJECT_FORMATS,
     VOICE_UPLOAD_SUCCESS_FORMATS,
     Scenario,
@@ -369,16 +372,24 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
     configured_formats = [
         upload_format for upload_format, _ in VOICE_UPLOAD_SUCCESS_FORMATS
     ]
+    configured_near_limit_formats = [
+        upload_format for upload_format, _ in VOICE_NEAR_LIMIT_SUCCESS_FORMATS
+    ]
+    deferred_near_limit_formats = [
+        upload_format for upload_format, _ in VOICE_NEAR_LIMIT_DEFERRED_FORMATS
+    ]
     near_limit_missing_formats = sorted(
-        set(configured_formats) - set(near_limit_formats)
+        set(configured_near_limit_formats) - set(near_limit_formats)
     )
     return {
         "accepted_format_cases": sorted(successful_formats),
         "configured_accepted_formats": configured_formats,
         "regular_upload_format_contract_present": bool(successful_formats),
         "near_limit_formats": sorted(near_limit_formats),
+        "configured_near_limit_formats": configured_near_limit_formats,
         "near_limit_missing_formats": near_limit_missing_formats,
         "near_limit_contract_complete": not near_limit_missing_formats,
+        "near_limit_deferred_formats": deferred_near_limit_formats,
         "metadata_sequence_present": any(
             scenario.capability_key == "voices.upload_metadata"
             for scenario in scenarios
@@ -623,14 +634,42 @@ def _speech_coverage_matrix(
         ),
         _coverage_matrix_row(
             spec,
+            "speech.openai_sdk_response_formats",
+            tested=not _value_coverage_gap(
+                "speech.openai_sdk_response_formats",
+                set(SDK_RESPONSE_FORMATS),
+                _metadata_values(speech_scenarios, "sdk_response_format"),
+            ),
+            expected=list(SDK_RESPONSE_FORMATS),
+            observed=sorted(_metadata_values(speech_scenarios, "sdk_response_format")),
+        ),
+        _coverage_matrix_row(
+            spec,
+            "speech.openai_sdk_error_contract",
+            tested=_has_capability(speech_scenarios, "speech.openai_sdk_error"),
+            expected=["speech.openai_sdk_error"],
+            observed=sorted(
+                {
+                    scenario.capability_key
+                    for scenario in speech_scenarios
+                    if scenario.capability_key == "speech.openai_sdk_error"
+                }
+            ),
+        ),
+        _coverage_matrix_row(
+            spec,
             "speech.openai_sdk",
-            tested=_has_capability(speech_scenarios, "speech.openai_sdk"),
+            tested=(
+                _has_capability(speech_scenarios, "speech.openai_sdk")
+                and _has_capability(speech_scenarios, "speech.openai_sdk_error")
+            ),
             expected=["speech.openai_sdk"],
             observed=sorted(
                 {
                     scenario.capability_key
                     for scenario in speech_scenarios
-                    if scenario.capability_key == "speech.openai_sdk"
+                    if scenario.capability_key
+                    in {"speech.openai_sdk", "speech.openai_sdk_error"}
                 }
             ),
         ),
@@ -740,8 +779,19 @@ def _voice_coverage_matrix(
             spec,
             "voices.near_limit_upload_formats",
             tested=voice_upload_coverage["near_limit_contract_complete"],
-            expected=voice_upload_coverage["configured_accepted_formats"],
+            expected=voice_upload_coverage["configured_near_limit_formats"],
             observed=voice_upload_coverage["near_limit_formats"],
+        ),
+        _coverage_matrix_row(
+            spec,
+            "voices.near_limit_deferred_formats",
+            tested=False,
+            expected=voice_upload_coverage["near_limit_deferred_formats"],
+            observed=[],
+            gap_error=(
+                "near-limit fixtures for these container formats are not generated "
+                "until the benchmark has format-valid padding fixtures"
+            ),
         ),
         _coverage_matrix_row(
             spec,
@@ -1113,8 +1163,20 @@ def _speech_coverage_failures(scenarios: list[Scenario]) -> list[dict[str, Any]]
         for scenario in speech_scenarios
     ):
         failures.append(_coverage_gap("speech.initial_codec_chunk_frames", ["present"]))
-    if not _has_capability(speech_scenarios, "speech.openai_sdk"):
-        failures.append(_coverage_gap("speech.openai_sdk", ["speech.openai_sdk"]))
+    failures.extend(
+        _value_coverage_gap(
+            "speech.openai_sdk_response_formats",
+            set(SDK_RESPONSE_FORMATS),
+            _metadata_values(speech_scenarios, "sdk_response_format"),
+        )
+    )
+    if not _has_capability(speech_scenarios, "speech.openai_sdk_error"):
+        failures.append(
+            _coverage_gap(
+                "speech.openai_sdk_error_contract",
+                ["speech.openai_sdk_error"],
+            )
+        )
     return failures
 
 
@@ -1169,6 +1231,17 @@ def _voice_coverage_failures(
                 _coverage_gap(
                     "voices.near_limit_upload_formats",
                     voice_upload_coverage["near_limit_missing_formats"],
+                )
+            )
+        if voice_upload_coverage["near_limit_deferred_formats"]:
+            failures.append(
+                _coverage_gap(
+                    "voices.near_limit_deferred_formats",
+                    voice_upload_coverage["near_limit_deferred_formats"],
+                    error=(
+                        "near-limit fixtures are not generated for these formats "
+                        "until format-valid padding fixtures exist"
+                    ),
                 )
             )
         if not voice_upload_coverage["metadata_sequence_present"]:
