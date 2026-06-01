@@ -9,6 +9,7 @@ import binascii
 import json
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
@@ -22,7 +23,6 @@ from benchmarks.tts_serving.metrics import (
     parse_sse_audio_event,
 )
 from benchmarks.tts_serving.scenarios import (
-    SPEAKER_MAX_UPLOADED,
     VOICE_SMALL_UPLOAD_BYTES,
     VOICE_UPLOAD_SUCCESS_FORMATS,
     Scenario,
@@ -51,6 +51,13 @@ EXPECTED_BATCH_MEDIA_TYPES = {
     "opus": {"audio/opus", "audio/ogg"},
 }
 RawVoiceResponse = tuple[int, bytes, dict[str, str]]
+
+
+@dataclass(frozen=True)
+class BatchItemValidation:
+    error: str | None = None
+    audio_bytes: int = 0
+    audio_duration_s: float = 0.0
 
 
 async def run_http_scenario(
@@ -461,13 +468,13 @@ def _classify_http_failure(
         )
         return
     if 400 <= status < 500 and _is_expected_client_error_scenario(scenario):
-        if not _is_valid_error_response(body):
+        if not _is_valid_error_response(status, body):
             _mark_protocol_error(
                 result,
                 status="invalid_error_response",
                 error=(
                     "expected client-error scenario returned HTTP "
-                    f"{status} without structured error JSON: {body}"
+                    f"{status} without OpenAI-compatible error JSON: {body}"
                 ),
             )
             return
@@ -913,7 +920,7 @@ async def _run_voice_speaker_cap_sequence(
     sequence_config = _speaker_cap_sequence_config(scenario, result)
     if sequence_config is None:
         return
-    attempt_count, voice_name_prefix = sequence_config
+    attempt_count, voice_name_prefix, speaker_max_uploaded = sequence_config
 
     upload_url = api_url(spec.base_url, scenario.path)
     created_voice_names: list[str] = []
@@ -928,12 +935,13 @@ async def _run_voice_speaker_cap_sequence(
         if uploaded_voices is None:
             return
 
-        remaining_before_cap = max(SPEAKER_MAX_UPLOADED - len(uploaded_voices), 0)
+        remaining_before_cap = max(speaker_max_uploaded - len(uploaded_voices), 0)
         if not _speaker_cap_attempts_cross_cap(
             result,
             uploaded_count=len(uploaded_voices),
             attempt_count=attempt_count,
             remaining_before_cap=remaining_before_cap,
+            speaker_max_uploaded=speaker_max_uploaded,
         ):
             return
 
@@ -955,6 +963,7 @@ async def _run_voice_speaker_cap_sequence(
             scenario,
             result,
             voice_name=overflow_name,
+            speaker_max_uploaded=speaker_max_uploaded,
         ):
             return
         _mark_success(result, capability="pass")
@@ -1105,7 +1114,7 @@ async def _run_voice_cache_pressure_sequence(
 def _speaker_cap_sequence_config(
     scenario: Scenario,
     result: ScenarioResult,
-) -> tuple[int, str] | None:
+) -> tuple[int, str, int] | None:
     attempt_count = _metadata_positive_int(scenario, "attempt_count")
     if attempt_count is None:
         _mark_protocol_error(
@@ -1122,7 +1131,15 @@ def _speaker_cap_sequence_config(
             error="speaker cap sequence requires voice_name_prefix",
         )
         return None
-    return attempt_count, voice_name_prefix
+    speaker_max_uploaded = _metadata_positive_int(scenario, "speaker_max_uploaded")
+    if speaker_max_uploaded is None:
+        _mark_protocol_error(
+            result,
+            status="invalid_benchmark_scenario",
+            error="speaker cap sequence requires positive integer speaker_max_uploaded",
+        )
+        return None
+    return attempt_count, voice_name_prefix, speaker_max_uploaded
 
 
 async def _speaker_cap_uploaded_voices_after_stale_cleanup(
@@ -1172,6 +1189,7 @@ def _speaker_cap_attempts_cross_cap(
     uploaded_count: int,
     attempt_count: int,
     remaining_before_cap: int,
+    speaker_max_uploaded: int,
 ) -> bool:
     if attempt_count > remaining_before_cap:
         return True
@@ -1180,7 +1198,7 @@ def _speaker_cap_attempts_cross_cap(
         status="invalid_benchmark_scenario",
         error=(
             "speaker cap sequence did not include enough upload attempts to "
-            f"cross the cap (uploaded={uploaded_count}, cap={SPEAKER_MAX_UPLOADED}, "
+            f"cross the cap (uploaded={uploaded_count}, cap={speaker_max_uploaded}, "
             f"attempts={attempt_count})"
         ),
     )
@@ -1244,6 +1262,7 @@ async def _expect_speaker_cap_rejection(
     result: ScenarioResult,
     *,
     voice_name: str,
+    speaker_max_uploaded: int,
 ) -> bool:
     form_fields = _speaker_cap_form_fields(scenario, voice_name)
     body = _request_body(scenario, form_fields=form_fields)
@@ -1264,13 +1283,13 @@ async def _expect_speaker_cap_rejection(
             status="unexpected_success",
             error=(
                 "speaker cap overflow upload unexpectedly succeeded after "
-                f"{SPEAKER_MAX_UPLOADED} uploaded voices"
+                f"{speaker_max_uploaded} uploaded voices"
             ),
         )
         result.error_class = "unexpected_success"
         return False
     if status == 400:
-        if not _is_valid_error_response(body_text):
+        if not _is_valid_error_response(status, body_text):
             _mark_protocol_error(
                 result,
                 status="invalid_error_response",
@@ -1826,6 +1845,8 @@ def _handle_batch_success(
         return
     observed_success = 0
     observed_failed = 0
+    successful_audio_bytes = 0
+    successful_audio_duration_s = 0.0
     for index, item in enumerate(results):
         expect_item_failure = index in expected_item_failures
         expected_format = _expected_batch_response_format(scenario, index)
@@ -1835,17 +1856,19 @@ def _handle_batch_success(
             expected_format=expected_format,
             expect_failure=expect_item_failure,
         )
-        if validation_error is not None:
+        if validation_error.error is not None:
             _mark_protocol_error(
                 result,
                 status="invalid_batch_response",
-                error=f"batch endpoint result item {index}: {validation_error}",
+                error=f"batch endpoint result item {index}: {validation_error.error}",
             )
             return
         if expect_item_failure:
             observed_failed += 1
         else:
             observed_success += 1
+            successful_audio_bytes += validation_error.audio_bytes
+            successful_audio_duration_s += validation_error.audio_duration_s
     if observed_success != succeeded or observed_failed != failed:
         _mark_protocol_error(
             result,
@@ -1857,6 +1880,8 @@ def _handle_batch_success(
             ),
         )
         return
+    result.audio_bytes += successful_audio_bytes
+    result.audio_duration_s += successful_audio_duration_s
     _mark_success(result, capability="pass")
 
 
@@ -1949,42 +1974,74 @@ def _validate_batch_item(
     expected_index: int,
     expected_format: str,
     expect_failure: bool,
-) -> str | None:
+) -> BatchItemValidation:
     if not isinstance(item, dict):
-        return "result item must be a JSON object"
+        return BatchItemValidation(error="result item must be a JSON object")
     if item.get("index") != expected_index:
-        return (
-            "index mismatch "
-            f"(expected={expected_index}, observed={item.get('index')})"
+        return BatchItemValidation(
+            error=(
+                "index mismatch "
+                f"(expected={expected_index}, observed={item.get('index')})"
+            )
         )
     status = item.get("status")
     if expect_failure:
         if status not in FAILED_BATCH_STATUSES:
-            return f"expected failed status, observed={status!r}"
+            return BatchItemValidation(
+                error=f"expected failed status, observed={status!r}"
+            )
         error = item.get("error")
         if not isinstance(error, (dict, str)) or not error:
-            return "failed item must include non-empty error details"
-        return None
+            return BatchItemValidation(
+                error="failed item must include non-empty error details"
+            )
+        return BatchItemValidation()
     if status not in SUCCESS_BATCH_STATUSES:
-        return f"expected success status, observed={status!r}"
+        return BatchItemValidation(
+            error=f"expected success status, observed={status!r}"
+        )
     audio_data = item.get("audio_data")
     media_type = item.get("media_type")
     if not isinstance(audio_data, str) or not audio_data:
-        return "successful item must include non-empty base64 audio_data"
+        return BatchItemValidation(
+            error="successful item must include non-empty base64 audio_data"
+        )
     if not isinstance(media_type, str) or not _is_valid_batch_media_type(
         media_type, expected_format=expected_format
     ):
-        return (
-            "successful item media_type does not match requested format "
-            f"(format={expected_format!r}, media_type={media_type!r})"
+        return BatchItemValidation(
+            error=(
+                "successful item media_type does not match requested format "
+                f"(format={expected_format!r}, media_type={media_type!r})"
+            )
         )
     try:
         decoded = base64.b64decode(audio_data, validate=True)
     except binascii.Error as exc:
-        return f"successful item audio_data is not valid base64: {exc}"
+        return BatchItemValidation(
+            error=f"successful item audio_data is not valid base64: {exc}"
+        )
     if not decoded:
-        return "successful item audio_data decoded to empty bytes"
-    return None
+        return BatchItemValidation(
+            error="successful item audio_data decoded to empty bytes"
+        )
+    headers = {"Content-Type": media_type}
+    if not _is_audio_response(decoded, headers, expected_format):
+        return BatchItemValidation(
+            error=(
+                "successful item audio_data does not match requested audio "
+                f"contract (format={expected_format!r}, media_type={media_type!r}, "
+                f"decoded_bytes={len(decoded)})"
+            )
+        )
+    return BatchItemValidation(
+        audio_bytes=len(decoded),
+        audio_duration_s=duration_from_audio_bytes(
+            decoded,
+            content_type=media_type,
+            response_format=expected_format,
+        ),
+    )
 
 
 def _is_valid_voice_list_response(payload: Any) -> bool:
@@ -2158,7 +2215,7 @@ def _is_valid_missing_voice_delete_response(status: int, body: str) -> bool:
     return isinstance(error, (dict, str)) and bool(error)
 
 
-def _is_valid_error_response(body: str) -> bool:
+def _is_valid_error_response(status: int, body: str) -> bool:
     if not body.strip() or body.lstrip().startswith("<"):
         return False
     try:
@@ -2167,9 +2224,20 @@ def _is_valid_error_response(body: str) -> bool:
         return False
     if not isinstance(payload, dict):
         return False
-    return any(
-        isinstance(payload.get(key), (dict, list, str)) and bool(payload[key])
-        for key in ("error", "message", "detail")
+    expected_type = {400: "BadRequestError", 404: "NotFoundError"}.get(status)
+    if expected_type is None:
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+    if not isinstance(error.get("message"), str) or not error["message"].strip():
+        return False
+    if error.get("type") != expected_type:
+        return False
+    if error.get("code") != status:
+        return False
+    return "param" in error and (
+        error["param"] is None or isinstance(error["param"], str)
     )
 
 

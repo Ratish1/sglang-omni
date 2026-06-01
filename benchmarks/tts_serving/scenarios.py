@@ -49,7 +49,6 @@ VOICE_SMALL_UPLOAD_BYTES = VOICE_UPLOAD_WAV_FIXTURE_SIZE
 VOICE_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 VOICE_NEAR_LIMIT_BYTES = VOICE_MAX_UPLOAD_BYTES - 1
 VOICE_OVERSIZED_BYTES = VOICE_MAX_UPLOAD_BYTES + 1
-SPEAKER_MAX_UPLOADED = 1000
 DEFAULT_REFERENCE_AUDIO = (
     "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/"
     "en/prompt-wavs/common_voice_en_10119832.wav"
@@ -1086,6 +1085,10 @@ def _is_dedicated_voice_stage(spec: BenchmarkSpec, stage: LoadStage) -> bool:
     return tuple(endpoints) == ("voices",)
 
 
+def _stage_speaker_max_uploaded(spec: BenchmarkSpec, stage: LoadStage) -> int:
+    return stage.speaker_max_uploaded or spec.params.speaker_max_uploaded
+
+
 def _voice_upload(
     index: int,
     spec: BenchmarkSpec,
@@ -1164,6 +1167,7 @@ def _voice_speaker_cap_sequence(
         f"{spec.run_id or ''}:{spec.seed}:{stage.id}:{index}".encode("utf-8")
     ).hexdigest()[:8]
     name_prefix = f"bench_voice_speaker_cap_{stage.id}_{run_scope}_{index:05d}"
+    speaker_max_uploaded = _stage_speaker_max_uploaded(spec, stage)
     return Scenario(
         id=_scenario_id(stage, "voices_speaker_cap", index),
         endpoint="voices",
@@ -1190,7 +1194,7 @@ def _voice_speaker_cap_sequence(
             "upload_size_bytes": VOICE_SMALL_UPLOAD_BYTES,
             "voice_name_prefix": name_prefix,
             "attempt_count": attempt_count,
-            "speaker_max_uploaded": SPEAKER_MAX_UPLOADED,
+            "speaker_max_uploaded": speaker_max_uploaded,
         },
     )
 
@@ -1250,7 +1254,7 @@ def _voice_cache_pressure_sequence(
         endpoint="voices",
         category="voices",
         stage_id=stage.id,
-        capability_key="voices.cache_pressure",
+        capability_key="voices.cache_pressure_traffic",
         method="VOICE_CACHE_PRESSURE_SEQUENCE",
         path="/v1/audio/voices",
         body_type="multipart",
@@ -1274,6 +1278,8 @@ def _voice_cache_pressure_sequence(
             "upload_size_bytes": VOICE_SMALL_UPLOAD_BYTES,
             "voice_name_prefix": name_prefix,
             "voice_count": voice_count,
+            "cache_contract": "traffic_only",
+            "cache_observability": "instrumentation_missing",
         },
     )
 
