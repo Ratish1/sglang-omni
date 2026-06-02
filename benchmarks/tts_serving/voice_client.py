@@ -36,6 +36,7 @@ from benchmarks.tts_serving.voice_upload_fixtures import (
 )
 
 RawVoiceResponse = tuple[int, bytes, dict[str, str]]
+MAX_CLEANUP_FAILURE_DETAILS = 20
 
 
 def request_body(
@@ -1458,27 +1459,39 @@ async def _cleanup_voice_names(
     spec: BenchmarkSpec,
     voice_names: list[str],
 ) -> str | None:
+    failures: list[str] = []
     for voice_name in reversed(voice_names):
         delete_url = api_url(spec.base_url, f"/v1/audio/voices/{voice_name}")
         try:
             status, body, _ = await _raw_delete(session, delete_url)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            return f"voice cleanup failed for {voice_name!r}: {exc}"
+            failures.append(f"voice cleanup failed for {voice_name!r}: {exc}")
+            continue
         body_text = body.decode("utf-8", errors="replace")
         if status == 404:
             absent_error = await _cleanup_voice_absence_error(session, spec, voice_name)
             if absent_error is not None:
-                return absent_error
+                failures.append(absent_error)
             continue
         if not 200 <= status < 300 or not _is_valid_voice_delete_success(body):
-            return (
+            failures.append(
                 f"voice cleanup failed for {voice_name!r}: "
                 f"status={status}, body={body_text}"
             )
+            continue
         absent_error = await _cleanup_voice_absence_error(session, spec, voice_name)
         if absent_error is not None:
-            return absent_error
-    return None
+            failures.append(absent_error)
+    return _voice_cleanup_error_message(failures)
+
+
+def _voice_cleanup_error_message(failures: list[str]) -> str | None:
+    if not failures:
+        return None
+    visible_failures = failures[:MAX_CLEANUP_FAILURE_DETAILS]
+    hidden_count = len(failures) - len(visible_failures)
+    suffix = f"; ... {hidden_count} additional cleanup failures" if hidden_count else ""
+    return "; ".join(visible_failures) + suffix
 
 
 async def _cleanup_voice_absence_error(

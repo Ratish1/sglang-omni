@@ -292,8 +292,13 @@ def _required_stage_scenarios(
             next_index += 1
         groups.append(speech_edges)
     if "speech_sse" in endpoint_set:
-        groups.append([_speech_sse(next_index, spec, stage)])
-        next_index += 1
+        groups.append(
+            [
+                _speech_sse(next_index, spec, stage),
+                _speech_sse_non_pcm_error(next_index + 1, spec, stage),
+            ]
+        )
+        next_index += 2
     if "batch" in endpoint_set:
         batch_scenarios = [
             _batch_request(
@@ -838,6 +843,33 @@ def _speech_sse(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenario:
         capability_key="speech.sse",
         payload=payload,
         description="REST SSE streaming speech",
+    )
+
+
+def _speech_sse_non_pcm_error(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    payload = _base_payload(spec, "Streaming must reject non-PCM response formats.")
+    payload.update(
+        {
+            "stream": True,
+            "response_format": "wav",
+            "seed": spec.seed + index,
+        }
+    )
+    return Scenario(
+        id=_scenario_id(stage, "speech_sse_non_pcm", index),
+        endpoint="speech_sse",
+        category="speech_sse",
+        stage_id=stage.id,
+        capability_key="speech.sse.validation",
+        payload=payload,
+        expect_success=False,
+        expected_status_class="client_error",
+        expected_http_status=400,
+        expected_error_type="BadRequestError",
+        description="SSE streaming request with invalid non-PCM response format",
+        planned_metadata={"sse_error_case": "stream_non_pcm"},
     )
 
 
