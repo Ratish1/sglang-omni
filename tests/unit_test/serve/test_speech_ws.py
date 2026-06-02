@@ -102,6 +102,22 @@ def test_speech_websocket_rejects_missing_initial_config() -> None:
     assert event["error"]["param"] == "type"
 
 
+def test_speech_websocket_rejects_binary_client_frames() -> None:
+    client = TestClient(create_app(StreamingSpeechClient(), model_name="tts"))
+
+    with client.websocket_connect("/v1/audio/speech/stream") as websocket:
+        websocket.send_json({"type": "session.config", "response_format": "pcm"})
+        assert websocket.receive_json()["type"] == "session.configured"
+
+        websocket.send_bytes(b"not-json-text")
+        event = websocket.receive_json()
+        assert event["type"] == "error"
+        assert "text frames" in event["error"]["message"]
+
+        websocket.send_json({"type": "input.done"})
+        assert websocket.receive_json()["type"] == "session.done"
+
+
 def test_speech_websocket_supports_non_streaming_sentence_frames() -> None:
     client_impl = StreamingSpeechClient()
     client = TestClient(create_app(client_impl, model_name="tts"))

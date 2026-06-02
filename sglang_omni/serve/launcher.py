@@ -42,6 +42,7 @@ from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
 from sglang_omni.serve.openai_api import create_app
+from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 from sglang_omni.utils.gpu_memory import (
     GpuDeviceInfo,
     format_bytes_gib,
@@ -294,7 +295,7 @@ async def _run_server(
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
-    tts_batch_max_items: int = 32,
+    tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
 ) -> None:
     """Start the pipeline and run the OpenAI server.
 
@@ -409,7 +410,7 @@ def launch_server(
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
-    tts_batch_max_items: int = 32,
+    tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
 ) -> None:
     """Blocking helper: start the pipeline and OpenAI-compatible server.
 

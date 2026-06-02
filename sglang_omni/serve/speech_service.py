@@ -7,6 +7,7 @@ import asyncio
 import base64
 import importlib.util
 import shutil
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -17,6 +18,7 @@ from pydantic import ValidationError
 from sglang_omni.client import ClientError, GenerateRequest, SamplingParams
 from sglang_omni.client.audio import FORMAT_MIME_TYPES, to_numpy
 from sglang_omni.serve.protocol import (
+    DEFAULT_TTS_BATCH_MAX_ITEMS,
     SUPPORTED_TTS_LANGUAGES,
     SUPPORTED_TTS_RESPONSE_FORMATS,
     SUPPORTED_TTS_TASK_TYPES,
@@ -62,7 +64,7 @@ class SpeechService:
         requires_uploaded_voice_for_named_voice: bool = False,
         allowed_local_media_paths: list[str | Path] | None = None,
         voice_store: SpeakerSampleStore | None = None,
-        tts_batch_max_items: int = 32,
+        tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
     ) -> None:
         if tts_batch_max_items < 1:
             raise ValueError("tts_batch_max_items must be greater than 0")
@@ -295,31 +297,42 @@ class SpeechService:
         results: list[SpeechBatchResult | None] = [None] * len(batch.items)
         tasks: list[asyncio.Task[SpeechBatchResult]] = []
         task_indexes: list[int] = []
+        task_request_ids: list[str] = []
 
         for index, item in enumerate(batch.items):
             try:
                 request = self._build_batch_item_request(batch, item, index=index)
             except SpeechAPIError as exc:
-                results[index] = _batch_error_result(index, exc)
+                results[index] = _batch_error_result(
+                    index, _batch_item_error(exc, index=index)
+                )
                 continue
+            item_request_id = f"{request_id}-{index}"
             task = asyncio.create_task(
                 self._run_batch_item(
                     client,
                     request,
-                    request_id=f"{request_id}-{index}",
+                    request_id=item_request_id,
                     index=index,
                 )
             )
             tasks.append(task)
             task_indexes.append(index)
+            task_request_ids.append(item_request_id)
 
         if tasks:
-            task_results = await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                task_results = await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                await self._cancel_batch_items(client, tasks, task_request_ids)
+                raise
             for index, task_result in zip(task_indexes, task_results, strict=True):
                 if isinstance(task_result, SpeechBatchResult):
                     results[index] = task_result
                 elif isinstance(task_result, SpeechAPIError):
-                    results[index] = _batch_error_result(index, task_result)
+                    results[index] = _batch_error_result(
+                        index, _batch_item_error(task_result, index=index)
+                    )
                 else:
                     results[index] = _batch_error_result(
                         index, internal_error(str(task_result))
@@ -364,6 +377,19 @@ class SpeechService:
             media_type=result.mime_type,
         )
 
+    async def _cancel_batch_items(
+        self,
+        client: "Client",
+        tasks: list[asyncio.Task[SpeechBatchResult]],
+        request_ids: list[str],
+    ) -> None:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for request_id in request_ids:
+            with suppress(Exception):
+                await client.abort(request_id)
+
     def _build_batch_item_request(
         self,
         batch: CreateSpeechBatchRequest,
@@ -384,7 +410,10 @@ class SpeechService:
         try:
             request = CreateSpeechRequest.model_validate(payload)
         except ValidationError as exc:
-            raise bad_request(_validation_error_message(exc)) from exc
+            raise bad_request(
+                _validation_error_message(exc),
+                param=_validation_error_param(exc, prefix=f"items.{index}"),
+            ) from exc
         return self.prepare_request(request)
 
     def _validate_batch_defaults(self, batch: CreateSpeechBatchRequest) -> None:
@@ -561,6 +590,18 @@ def _batch_error_result(index: int, error: SpeechAPIError) -> SpeechBatchResult:
     )
 
 
+def _batch_item_error(error: SpeechAPIError, *, index: int) -> SpeechAPIError:
+    if error.param is None or error.param.startswith("items."):
+        return error
+    return SpeechAPIError(
+        message=error.message,
+        status_code=error.status_code,
+        error_type=error.error_type,
+        param=f"items.{index}.{error.param}",
+        code=error.code,
+    )
+
+
 def speech_audio_delta(
     audio_data: Any,
     *,
@@ -646,6 +687,16 @@ def _validation_error_message(exc: ValidationError) -> str:
     location = ".".join(str(item) for item in first_error.get("loc", ()))
     message = first_error.get("msg") or "invalid speech request"
     return f"{location}: {message}" if location else str(message)
+
+
+def _validation_error_param(
+    exc: ValidationError, *, prefix: str | None = None
+) -> str | None:
+    first_error = exc.errors()[0] if exc.errors() else {}
+    location = ".".join(str(item) for item in first_error.get("loc", ()))
+    if not location:
+        return prefix
+    return f"{prefix}.{location}" if prefix else location
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

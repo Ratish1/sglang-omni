@@ -178,6 +178,7 @@ SUPPORTED_TTS_LANGUAGES = frozenset(
 SUPPORTED_TTS_TASK_TYPES = frozenset({"Base", "CustomVoice", "VoiceDesign"})
 TTS_SPEED_MIN = 0.25
 TTS_SPEED_MAX = 4.0
+DEFAULT_TTS_BATCH_MAX_ITEMS = 32
 
 
 class SpeechReference(BaseModel):
@@ -241,7 +242,7 @@ class SpeechBatchItem(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    input: Any
+    input: Any = None
     voice: Any = Field(
         default=None,
         validation_alias=AliasChoices("voice", "speaker"),

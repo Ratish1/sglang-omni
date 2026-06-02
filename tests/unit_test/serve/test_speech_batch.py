@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from sglang_omni.client.types import SpeechResult
 from sglang_omni.serve import create_app
+from sglang_omni.serve.speech_service import SpeechService
 
 
 class RecordingBatchSpeechClient:
@@ -35,10 +38,33 @@ class RecordingBatchSpeechClient:
         )
 
 
+class BlockingBatchSpeechClient:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.aborted: list[str] = []
+
+    async def speech(
+        self,
+        request: Any,
+        *,
+        request_id: str,
+        response_format: str = "wav",
+        speed: float = 1.0,
+        allow_format_fallback: bool = True,
+    ) -> SpeechResult:
+        del request, request_id, response_format, speed, allow_format_fallback
+        self.started.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+
+
 def test_batch_speech_preserves_order_and_item_errors() -> None:
     client_impl = RecordingBatchSpeechClient()
     client = TestClient(
-        create_app(client_impl, model_name="tts", tts_batch_max_items=4)
+        create_app(client_impl, model_name="tts", tts_batch_max_items=5)
     )
 
     response = client.post(
@@ -50,21 +76,23 @@ def test_batch_speech_preserves_order_and_item_errors() -> None:
                 {"input": "   "},
                 {"input": "third", "response_format": "pcm"},
                 {"input": 123},
+                {"response_format": "wav"},
             ],
         },
     )
 
     assert response.status_code == 200
     body = response.json()
-    assert body["total"] == 4
+    assert body["total"] == 5
     assert body["succeeded"] == 2
-    assert body["failed"] == 2
-    assert [item["index"] for item in body["results"]] == [0, 1, 2, 3]
+    assert body["failed"] == 3
+    assert [item["index"] for item in body["results"]] == [0, 1, 2, 3, 4]
     assert body["results"][0]["status"] == "success"
     assert body["results"][1]["status"] == "error"
-    assert body["results"][1]["error"]["param"] == "input"
+    assert body["results"][1]["error"]["param"] == "items.1.input"
     assert body["results"][2]["media_type"] == "audio/pcm"
-    assert body["results"][3]["error"]["param"] == "input"
+    assert body["results"][3]["error"]["param"] == "items.3.input"
+    assert body["results"][4]["error"]["param"] == "items.4.input"
     assert [request.prompt for request in client_impl.requests] == ["first", "third"]
 
 
@@ -98,3 +126,22 @@ def test_batch_speech_rejects_streaming_items() -> None:
     assert item["status"] == "error"
     assert item["error"]["param"] == "items.0.stream"
     assert client_impl.requests == []
+
+
+def test_batch_speech_cancellation_aborts_started_items() -> None:
+    async def run() -> None:
+        service = SpeechService(default_model="tts")
+        batch = service.parse_batch_request({"items": [{"input": "one"}]})
+        client_impl = BlockingBatchSpeechClient()
+
+        task = asyncio.create_task(
+            service.create_speech_batch(client_impl, batch, request_id="batch")
+        )
+        await client_impl.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert client_impl.aborted == ["batch-0"]
+
+    asyncio.run(run())

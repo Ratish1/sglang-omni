@@ -9,6 +9,7 @@ import yaml
 
 from sglang_omni.config import PipelineConfig
 from sglang_omni.config.manager import ConfigManager
+from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 
 logger = logging.getLogger(__name__)
 
@@ -841,7 +842,7 @@ def serve(
             "--tts_batch_max_items",
             help="Maximum number of items accepted by /v1/audio/speech/batch.",
         ),
-    ] = 32,
+    ] = DEFAULT_TTS_BATCH_MAX_ITEMS,
     mem_fraction_static: Annotated[
         float | None,
         typer.Option(

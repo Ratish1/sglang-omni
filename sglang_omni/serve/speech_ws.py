@@ -71,11 +71,11 @@ class SpeechWebSocketSession:
 
     async def _receive_config(self) -> bool:
         try:
-            raw = await asyncio.wait_for(
-                self.websocket.receive_text(),
-                timeout=CONFIG_TIMEOUT_S,
+            raw = await self._receive_text_frame(
+                timeout_s=CONFIG_TIMEOUT_S,
+                max_bytes=MAX_CONFIG_MESSAGE_BYTES,
+                message_kind="session",
             )
-            self._validate_message_size(raw, MAX_CONFIG_MESSAGE_BYTES, "session")
             payload = self._parse_message(raw)
             if payload.get("type") != "session.config":
                 await self._send_error(
@@ -111,11 +111,11 @@ class SpeechWebSocketSession:
     async def _message_loop(self) -> None:
         while not self.closed:
             try:
-                raw = await asyncio.wait_for(
-                    self.websocket.receive_text(),
-                    timeout=IDLE_TIMEOUT_S,
+                raw = await self._receive_text_frame(
+                    timeout_s=IDLE_TIMEOUT_S,
+                    max_bytes=MAX_TEXT_MESSAGE_BYTES,
+                    message_kind="text",
                 )
-                self._validate_message_size(raw, MAX_TEXT_MESSAGE_BYTES, "text")
                 payload = self._parse_message(raw)
             except asyncio.TimeoutError:
                 await self._send_error(bad_request("speech WebSocket idle timeout"))
@@ -350,6 +350,33 @@ class SpeechWebSocketSession:
         if not isinstance(payload, dict):
             raise ValueError("speech WebSocket messages must be JSON objects")
         return payload
+
+    async def _receive_text_frame(
+        self,
+        *,
+        timeout_s: float,
+        max_bytes: int,
+        message_kind: str,
+    ) -> str:
+        message = await asyncio.wait_for(self.websocket.receive(), timeout=timeout_s)
+        message_type = message.get("type")
+        if message_type == "websocket.disconnect":
+            raise WebSocketDisconnect
+        if message_type != "websocket.receive":
+            raise ValueError(
+                f"unsupported speech WebSocket ASGI message: {message_type}"
+            )
+
+        raw = message.get("text")
+        if raw is None:
+            frame_bytes = message.get("bytes")
+            if frame_bytes is not None and len(frame_bytes) > max_bytes:
+                raise ValueError(
+                    f"{message_kind} WebSocket message exceeds {max_bytes} bytes"
+                )
+            raise ValueError("speech WebSocket client messages must be text frames")
+        self._validate_message_size(raw, max_bytes, message_kind)
+        return raw
 
     @staticmethod
     def _validate_message_size(raw: str, max_bytes: int, message_kind: str) -> None:

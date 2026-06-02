@@ -44,6 +44,7 @@ from sglang_omni.client import (
 from sglang_omni.client.audio import DEFAULT_SAMPLE_RATE, encode_audio
 from sglang_omni.http.favicon import register_favicon
 from sglang_omni.serve.protocol import (
+    DEFAULT_TTS_BATCH_MAX_ITEMS,
     ChatCompletionAudio,
     ChatCompletionChoice,
     ChatCompletionRequest,
@@ -94,7 +95,7 @@ def create_app(
     requires_uploaded_voice_for_named_voice: bool = False,
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
-    tts_batch_max_items: int = 32,
+    tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
 ) -> FastAPI:
     """Create a FastAPI application with OpenAI-compatible endpoints.
 
