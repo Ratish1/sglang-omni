@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from sglang_omni.client import Client, GenerateChunk
+from sglang_omni.client import Client, ClientError, GenerateChunk
 from sglang_omni.client.types import GenerateRequest
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.proto import CompleteMessage, OmniRequest, StreamMessage
@@ -121,6 +121,21 @@ class SuccessfulSpeechClient:
         )
 
 
+class EmptyStreamingSpeechClient:
+    def health(self) -> dict[str, Any]:
+        return {"running": True}
+
+    async def generate(self, request: Any, request_id: str | None = None):
+        del request
+        yield GenerateChunk(
+            request_id=request_id or "speech-1",
+            modality="audio",
+            audio_data=None,
+            sample_rate=24000,
+            finish_reason="stop",
+        )
+
+
 class SuccessfulTranscriptionClient:
     def __init__(self) -> None:
         self.requests: list[GenerateRequest] = []
@@ -207,6 +222,32 @@ def test_speech_endpoint_returns_binary_audio() -> None:
     assert response.headers["content-type"] == "audio/wav"
 
 
+def test_speech_endpoint_rejects_invalid_json_with_openai_error() -> None:
+    client = TestClient(create_app(SuccessfulSpeechClient(), model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech",
+        content=b"{",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "BadRequestError"
+
+
+def test_speech_endpoint_stream_without_audio_returns_error() -> None:
+    client = TestClient(create_app(EmptyStreamingSpeechClient(), model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={"input": "hello", "stream": True, "response_format": "pcm"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["type"] == "InternalServerError"
+    assert "No audio output generated" in response.json()["error"]["message"]
+
+
 def test_chat_stream_failure_closes_without_done_sentinel() -> None:
     chunks: list[str] = []
     client = _fault_client("qwen3-omni")
@@ -256,6 +297,11 @@ def test_speech_stream_success_emits_done_sentinel() -> None:
     payload = json.loads(chunks[-2][len("data: ") :])
     assert payload["audio"] is None
     assert payload["finish_reason"] == "stop"
+
+
+def test_speech_stream_without_audio_fails_without_done_sentinel() -> None:
+    with pytest.raises(ClientError, match="No audio output generated"):
+        asyncio.run(_collect_speech_stream(EmptyStreamingSpeechClient()))
 
 
 def test_speech_stream_failure_closes_without_done_sentinel() -> None:

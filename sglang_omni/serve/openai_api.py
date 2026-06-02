@@ -18,9 +18,9 @@ import json
 import logging
 import time
 import uuid
-from typing import Any
+from typing import Any, AsyncIterator
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile, WebSocket
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     JSONResponse,
@@ -58,6 +58,7 @@ from sglang_omni.serve.protocol import (
 )
 from sglang_omni.serve.speech_errors import (
     SpeechAPIError,
+    bad_request,
     internal_error,
     speech_error_response,
 )
@@ -514,26 +515,41 @@ def _register_realtime(app: FastAPI) -> None:
 
 def _register_speech(app: FastAPI) -> None:
     @app.post("/v1/audio/speech")
-    async def create_speech(payload: Any = Body(...)) -> Response:
+    async def create_speech(request: Request) -> Response:
         client: Client = app.state.client
         speech_service: SpeechService = app.state.speech_service
 
         request_id = f"speech-{uuid.uuid4()}"
         try:
+            payload = await request.json()
             req = speech_service.parse_request(payload)
-            gen_req = speech_service.build_generate_request(req)
+            gen_req = speech_service.build_generate_request(req, validate=False)
+        except json.JSONDecodeError as exc:
+            return speech_error_response(
+                bad_request("speech request body must be valid JSON")
+            )
         except SpeechAPIError as exc:
             return speech_error_response(exc)
 
         if req.stream:
+            speech_events = _speech_stream(
+                client=client,
+                gen_req=gen_req,
+                request_id=request_id,
+                response_format=req.response_format,
+                speed=req.speed,
+            )
+            try:
+                first_event = await anext(speech_events)
+            except ClientError as exc:
+                return speech_error_response(internal_error(str(exc)))
+            except Exception as exc:
+                logger.exception(
+                    "Error opening speech stream for request %s", request_id
+                )
+                return speech_error_response(internal_error(str(exc)))
             return StreamingResponse(
-                _speech_stream(
-                    client=client,
-                    gen_req=gen_req,
-                    request_id=request_id,
-                    response_format=req.response_format,
-                    speed=req.speed,
-                ),
+                _prepend_speech_stream_event(first_event, speech_events),
                 media_type="text/event-stream",
             )
 
@@ -607,6 +623,8 @@ async def _speech_stream(
             speed=speed,
             allow_format_fallback=False,
         )
+        if not audio_bytes:
+            continue
         actual_format = MIME_TO_FORMAT.get(mime_type, response_format)
         payload = {
             "id": f"speech-{request_id}",
@@ -623,6 +641,9 @@ async def _speech_stream(
         yield f"data: {json.dumps(payload)}\n\n"
         chunk_index += 1
 
+    if chunk_index == 0:
+        raise ClientError("No audio output generated from the pipeline.")
+
     final_payload = {
         "id": f"speech-{request_id}",
         "object": "audio.speech.chunk",
@@ -633,6 +654,15 @@ async def _speech_stream(
     }
     yield f"data: {json.dumps(final_payload)}\n\n"
     yield f"data: {STREAM_DONE_SENTINEL}\n\n"
+
+
+async def _prepend_speech_stream_event(
+    first_event: str,
+    stream: AsyncIterator[str],
+) -> AsyncIterator[str]:
+    yield first_event
+    async for event in stream:
+        yield event
 
 
 def _select_speech_audio_delta(

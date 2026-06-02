@@ -136,7 +136,7 @@ For natural-sounding Fish Speech S2-Pro results, use Voice Cloning with a refere
 
 ### Voice Cloning
 
-The examples below use a sample clip from [`seed-tts-eval-mini`](https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini). The `references` field accepts `audio_path` (a local path or HTTP URL) and `text` (transcript of that audio).
+The examples below use a sample clip from [`seed-tts-eval-mini`](https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini). The `references` field accepts `audio_path` (remote URL, data URL, or allowed `file://` URI) and `text` (transcript of that audio).
 
 1. Non-streaming request
 

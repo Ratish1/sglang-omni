@@ -113,6 +113,42 @@ def test_file_reference_requires_allowlist() -> None:
     assert exc_info.value.param == "ref_audio"
 
 
+@pytest.mark.parametrize(
+    ("ref_audio", "expected_param"),
+    [
+        ("/tmp/reference.wav", "ref_audio"),
+        ("relative/reference.wav", "ref_audio"),
+        ("ftp://example.com/reference.wav", "ref_audio"),
+        ("data:audio/wav;base64", "ref_audio"),
+    ],
+)
+def test_reference_audio_rejects_unsupported_sources(
+    ref_audio: str, expected_param: str
+) -> None:
+    service = SpeechService(default_model="tts")
+
+    with pytest.raises(SpeechAPIError) as exc_info:
+        service.parse_request({"input": "hello", "ref_audio": ref_audio})
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == expected_param
+
+
+def test_reference_list_rejects_raw_local_path() -> None:
+    service = SpeechService(default_model="tts")
+
+    with pytest.raises(SpeechAPIError) as exc_info:
+        service.parse_request(
+            {
+                "input": "hello",
+                "references": [{"audio_path": "/tmp/reference.wav"}],
+            }
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == "references.audio_path"
+
+
 def test_allowed_local_media_path_must_be_directory(tmp_path: Path) -> None:
     missing = tmp_path / "missing"
 
@@ -133,7 +169,7 @@ def test_file_reference_resolves_inside_allowlist(tmp_path: Path) -> None:
     request = service.parse_request(
         {"input": "hello", "ref_audio": audio_path.as_uri()}
     )
-    gen_req = service.build_generate_request(request)
+    gen_req = service.build_generate_request(request, validate=False)
 
     assert request.ref_audio == str(audio_path.resolve())
     assert gen_req.prompt == {

@@ -112,10 +112,16 @@ class SpeechService:
 
         return request.model_copy(update=updates)
 
-    def build_generate_request(self, request: CreateSpeechRequest) -> GenerateRequest:
+    def build_generate_request(
+        self,
+        request: CreateSpeechRequest,
+        *,
+        validate: bool = True,
+    ) -> GenerateRequest:
         """Convert a validated speech request into a client GenerateRequest."""
 
-        request = self.prepare_request(request)
+        if validate:
+            request = self.prepare_request(request)
         explicit_generation_params = sorted(
             field
             for field in (
@@ -260,8 +266,20 @@ class SpeechService:
 
     def _normalize_media_reference(self, value: str, *, param: str) -> str:
         url = urlparse(value)
-        if url.scheme != "file":
+        if url.scheme in {"http", "https"}:
             return value
+        if url.scheme == "data":
+            if "," not in (url.path or ""):
+                raise bad_request(
+                    "ref_audio data URL must include base64 media data",
+                    param=param,
+                )
+            return value
+        if url.scheme != "file":
+            raise bad_request(
+                "ref_audio must be an http, https, data, or file:// URL",
+                param=param,
+            )
         if not self.allowed_local_media_paths:
             raise bad_request(
                 "file:// ref_audio requires --allowed-local-media-path",

@@ -9,7 +9,7 @@ from typing import Any
 from fastapi.responses import JSONResponse
 
 
-@dataclass(frozen=True)
+@dataclass
 class SpeechAPIError(Exception):
     """A user-visible TTS API error."""
 
