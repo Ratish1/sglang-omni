@@ -9,7 +9,10 @@ from typing import Any
 import torch
 
 from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
-from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
+from sglang_omni.models.higgs_tts.payload_types import (
+    INITIAL_CODEC_CHUNK_FRAMES_PARAM,
+    HiggsTtsState,
+)
 from sglang_omni.models.higgs_tts.utils import reverse_delay_pattern
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
@@ -26,6 +29,7 @@ class _HiggsStreamState:
     has_emitted: bool = False
     num_codebooks: int | None = None
     codebook_size: int | None = None
+    initial_codec_chunk_frames: int | None = None
 
 
 class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
@@ -91,6 +95,9 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
                 codebook_size=payload.data["codebook_size"],
                 source="payload",
             )
+            self._latch_initial_codec_chunk_frames(
+                request_id, stream_state, payload.request.params
+            )
             return
         if (
             stream_state.num_codebooks is not None
@@ -106,6 +113,9 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
                     "codebook_size", stream_state.codebook_size
                 ),
                 source="payload",
+            )
+            self._latch_initial_codec_chunk_frames(
+                request_id, stream_state, payload.request.params
             )
             return
         raise RuntimeError(
@@ -231,6 +241,7 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
                 codebook_size=metadata["codebook_size"],
                 source="stream metadata",
             )
+        self._latch_initial_codec_chunk_frames(request_id, state, metadata)
 
     @staticmethod
     def _latch_stream_contract(
@@ -279,6 +290,44 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
             )
         return state.num_codebooks, state.codebook_size
 
+    @staticmethod
+    def _latch_initial_codec_chunk_frames(
+        request_id: str,
+        state: _HiggsStreamState,
+        source: Any,
+    ) -> None:
+        if not isinstance(source, dict):
+            return
+        if INITIAL_CODEC_CHUNK_FRAMES_PARAM not in source:
+            return
+        value = source[INITIAL_CODEC_CHUNK_FRAMES_PARAM]
+        if isinstance(value, bool):
+            raise TypeError(
+                f"Higgs stream initial_codec_chunk_frames for {request_id!r} "
+                "must be an integer"
+            )
+        try:
+            frames = int(value)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"Higgs stream initial_codec_chunk_frames for {request_id!r} "
+                "must be an integer"
+            ) from exc
+        if frames <= 0:
+            raise ValueError(
+                f"Higgs stream initial_codec_chunk_frames for {request_id!r} "
+                "must be > 0"
+            )
+        if (
+            state.initial_codec_chunk_frames is not None
+            and state.initial_codec_chunk_frames != frames
+        ):
+            raise ValueError(
+                f"Higgs stream initial_codec_chunk_frames changed for {request_id!r}: "
+                f"{state.initial_codec_chunk_frames} -> {frames}"
+            )
+        state.initial_codec_chunk_frames = frames
+
     def _decode_delta(
         self, state: _HiggsStreamState, *, is_final: bool
     ) -> dict[str, Any] | None:
@@ -290,15 +339,27 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
             return None
         raw_total = delayed_count - num_codebooks + 1
 
-        next_decode_rows = state.next_decode_rows or max(
-            num_codebooks, self._stream_stride
-        )
+        if not state.has_emitted and state.initial_codec_chunk_frames is not None:
+            first_decode_rows = state.initial_codec_chunk_frames + num_codebooks - 1
+            next_decode_rows = state.next_decode_rows or max(
+                num_codebooks, first_decode_rows
+            )
+        else:
+            next_decode_rows = state.next_decode_rows or max(
+                num_codebooks, self._stream_stride
+            )
         if not is_final and delayed_count < next_decode_rows:
             state.next_decode_rows = next_decode_rows
             return None
 
         emit_until_raw = raw_total
-        if not is_final and self._stream_holdback_tokens:
+        if (
+            not is_final
+            and not state.has_emitted
+            and state.initial_codec_chunk_frames is not None
+        ):
+            emit_until_raw = min(raw_total, state.initial_codec_chunk_frames)
+        elif not is_final and self._stream_holdback_tokens:
             emit_until_raw = max(0, raw_total - self._stream_holdback_tokens)
         can_flush_codec_tail = is_final and self._samples_per_frame is not None
         if emit_until_raw < state.emitted_raw_frames or (

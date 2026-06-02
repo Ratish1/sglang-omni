@@ -370,6 +370,7 @@ def test_speech_request_passes_streaming_control_fields() -> None:
     assert tts_params["initial_codec_chunk_frames"] == 8
     assert tts_params["x_vector_only_mode"] is True
     assert tts_params["response_format"] == "pcm"
+    assert gen_req.extra_params == {"initial_codec_chunk_frames": 8}
 
 
 def test_transcription_request_builds_asr_generate_request() -> None:

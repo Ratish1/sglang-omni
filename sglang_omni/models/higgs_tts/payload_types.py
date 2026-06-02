@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+INITIAL_CODEC_CHUNK_FRAMES_PARAM = "initial_codec_chunk_frames"
+
 
 @dataclass
 class HiggsTtsState:
@@ -102,4 +104,4 @@ class HiggsTtsState:
         )
 
 
-__all__ = ["HiggsTtsState"]
+__all__ = ["HiggsTtsState", "INITIAL_CODEC_CHUNK_FRAMES_PARAM"]

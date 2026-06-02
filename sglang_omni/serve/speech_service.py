@@ -196,11 +196,18 @@ class SpeechService:
         if references:
             prompt = {"text": request.input, "references": references}
 
+        extra_params: dict[str, Any] = {}
+        if request.initial_codec_chunk_frames is not None:
+            extra_params["initial_codec_chunk_frames"] = (
+                request.initial_codec_chunk_frames
+            )
+
         return GenerateRequest(
             model=request.model or self.default_model,
             prompt=prompt,
             sampling=sampling,
             stage_params=request.stage_params,
+            extra_params=extra_params,
             stream=request.stream,
             output_modalities=["audio"],
             metadata={
