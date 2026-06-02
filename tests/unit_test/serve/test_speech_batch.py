@@ -174,12 +174,64 @@ def test_batch_speech_rejects_stringified_default_types(
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [
+        ("token_count", 0),
+        ("token_count", -1),
+        ("duration_tokens", 0),
+        ("duration_tokens", -1),
+    ],
+)
+def test_batch_speech_rejects_non_positive_default_duration_fields(
+    field_name: str, value: int
+) -> None:
+    client_impl = RecordingBatchSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech/batch",
+        json={field_name: value, "items": [{"input": "one"}]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == field_name
+    assert client_impl.requests == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
         ("token_count", "5"),
         ("duration_tokens", "5"),
     ],
 )
 def test_batch_speech_rejects_stringified_item_integer_overrides(
     field_name: str, value: str
+) -> None:
+    client_impl = RecordingBatchSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech/batch",
+        json={"items": [{"input": "one", field_name: value}]},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["results"][0]
+    assert item["status"] == "error"
+    assert item["error"]["param"] == f"items.0.{field_name}"
+    assert client_impl.requests == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("token_count", 0),
+        ("token_count", -1),
+        ("duration_tokens", 0),
+        ("duration_tokens", -1),
+    ],
+)
+def test_batch_speech_rejects_non_positive_item_duration_fields(
+    field_name: str, value: int
 ) -> None:
     client_impl = RecordingBatchSpeechClient()
     client = TestClient(create_app(client_impl, model_name="tts"))

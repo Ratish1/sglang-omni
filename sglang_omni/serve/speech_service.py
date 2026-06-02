@@ -155,6 +155,8 @@ class SpeechService:
             request.initial_codec_chunk_frames,
             param="initial_codec_chunk_frames",
         )
+        _validate_positive_int(request.token_count, param="token_count")
+        _validate_positive_int(request.duration_tokens, param="duration_tokens")
         _validate_non_negative_int(request.seed, param="seed")
 
         ref_audio = request.ref_audio

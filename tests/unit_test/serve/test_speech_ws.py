@@ -309,6 +309,34 @@ def test_speech_websocket_rejects_stringified_config_types(
     assert event["error"]["param"] == field_name
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("token_count", 0),
+        ("token_count", -1),
+        ("duration_tokens", 0),
+        ("duration_tokens", -1),
+    ],
+)
+def test_speech_websocket_rejects_non_positive_duration_fields(
+    field_name: str, value: int
+) -> None:
+    client = TestClient(create_app(StreamingSpeechClient(), model_name="tts"))
+
+    with client.websocket_connect("/v1/audio/speech/stream") as websocket:
+        websocket.send_json(
+            {
+                "type": "session.config",
+                field_name: value,
+                "response_format": "pcm",
+            }
+        )
+        event = websocket.receive_json()
+
+    assert event["type"] == "error"
+    assert event["error"]["param"] == field_name
+
+
 def test_speech_websocket_streaming_accepts_speed() -> None:
     client = TestClient(create_app(StreamingSpeechClient(), model_name="tts"))
 

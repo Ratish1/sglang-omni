@@ -67,6 +67,10 @@ def test_speech_service_rejects_stringified_duration_fields(field_name: str) -> 
             {"input": "hello", "initial_codec_chunk_frames": 0},
             "initial_codec_chunk_frames",
         ),
+        ({"input": "hello", "token_count": 0}, "token_count"),
+        ({"input": "hello", "token_count": -1}, "token_count"),
+        ({"input": "hello", "duration_tokens": 0}, "duration_tokens"),
+        ({"input": "hello", "duration_tokens": -1}, "duration_tokens"),
     ],
 )
 def test_speech_service_rejects_invalid_boundary_values(
