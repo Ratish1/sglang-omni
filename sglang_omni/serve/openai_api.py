@@ -70,7 +70,7 @@ from sglang_omni.serve.speech_service import (
     SpeechService,
     build_speech_generate_request,
 )
-from sglang_omni.serve.speech_voices import SpeakerSampleStore
+from sglang_omni.serve.speech_voices import MAX_VOICE_UPLOAD_BYTES, SpeakerSampleStore
 
 logger = logging.getLogger(__name__)
 MIME_TO_FORMAT = {mime: fmt for fmt, mime in FORMAT_MIME_TYPES.items()}
@@ -164,7 +164,7 @@ def _register_voices(app: FastAPI) -> None:
             response = voice_store.upload(
                 name=name,
                 consent=consent,
-                audio_bytes=await audio_sample.read(),
+                audio_bytes=await _read_voice_upload(audio_sample),
                 filename=audio_sample.filename,
                 content_type=audio_sample.content_type,
                 ref_text=ref_text,
@@ -192,6 +192,16 @@ def _register_voices(app: FastAPI) -> None:
                 "message": f"Voice '{name}' deleted successfully",
             }
         )
+
+
+async def _read_voice_upload(audio_sample: UploadFile) -> bytes:
+    audio_bytes = await audio_sample.read(MAX_VOICE_UPLOAD_BYTES + 1)
+    if len(audio_bytes) > MAX_VOICE_UPLOAD_BYTES:
+        raise bad_request(
+            f"audio_sample must be at most {MAX_VOICE_UPLOAD_BYTES} bytes",
+            param="audio_sample",
+        )
+    return audio_bytes
 
 
 def _register_health(app: FastAPI) -> None:
