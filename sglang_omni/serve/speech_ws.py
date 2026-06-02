@@ -247,6 +247,7 @@ class SpeechWebSocketSession:
             raise
         except Exception as exc:
             failed = True
+            await self._abort_request(request_id)
             if isinstance(exc, SpeechAPIError):
                 error = exc
             else:

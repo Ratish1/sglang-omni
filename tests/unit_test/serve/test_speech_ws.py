@@ -93,6 +93,23 @@ class TwoChunkStreamingSpeechClient:
         self.aborted.append(request_id)
 
 
+class InvalidAudioStreamingSpeechClient:
+    def __init__(self) -> None:
+        self.aborted: list[str] = []
+
+    async def generate(self, request: Any, request_id: str | None = None):
+        del request
+        yield GenerateChunk(
+            request_id=request_id or "speech-ws",
+            modality="audio",
+            audio_data=object(),
+            sample_rate=24000,
+        )
+
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+
+
 class CompletedSpeechClient:
     def __init__(self) -> None:
         self.aborted: list[str] = []
@@ -344,6 +361,28 @@ def test_speech_websocket_send_failure_aborts_active_stream() -> None:
             await session._generate_sentence("Hello.")
 
         assert client_impl.aborted == [websocket.sent_text[0]["id"]]
+        assert session.active_request_id is None
+
+    asyncio.run(run())
+
+
+def test_speech_websocket_stream_exception_aborts_active_request() -> None:
+    async def run() -> None:
+        client_impl = InvalidAudioStreamingSpeechClient()
+        websocket = RecordingWebSocket()
+        session = SpeechWebSocketSession(
+            websocket,
+            client=client_impl,
+            speech_service=SpeechService(default_model="tts"),
+        )
+        session.config = SpeechStreamSessionConfig(stream_audio=True)
+
+        await session._generate_sentence("Hello.")
+
+        assert client_impl.aborted == [websocket.sent_text[0]["id"]]
+        assert websocket.sent_text[-2]["type"] == "error"
+        assert websocket.sent_text[-1]["type"] == "audio.done"
+        assert websocket.sent_text[-1]["error"] is True
         assert session.active_request_id is None
 
     asyncio.run(run())
