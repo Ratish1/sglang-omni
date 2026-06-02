@@ -147,6 +147,8 @@ def test_batch_speech_rejects_invalid_envelope_before_item_work() -> None:
     [
         ("speed", "1.2"),
         ("max_new_tokens", "5"),
+        ("token_count", "5"),
+        ("duration_tokens", "5"),
         ("x_vector_only_mode", "true"),
     ],
 )
@@ -166,6 +168,31 @@ def test_batch_speech_rejects_stringified_default_types(
 
     assert response.status_code == 400
     assert response.json()["error"]["param"] == field_name
+    assert client_impl.requests == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("token_count", "5"),
+        ("duration_tokens", "5"),
+    ],
+)
+def test_batch_speech_rejects_stringified_item_integer_overrides(
+    field_name: str, value: str
+) -> None:
+    client_impl = RecordingBatchSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech/batch",
+        json={"items": [{"input": "one", field_name: value}]},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["results"][0]
+    assert item["status"] == "error"
+    assert item["error"]["param"] == f"items.0.{field_name}"
     assert client_impl.requests == []
 
 

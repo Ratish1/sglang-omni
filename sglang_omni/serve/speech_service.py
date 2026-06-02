@@ -467,7 +467,13 @@ class SpeechService:
                     raise bad_request(
                         f"{field_name} must be a string", param=field_name
                     )
-        for field_name in ("max_new_tokens", "initial_codec_chunk_frames", "seed"):
+        for field_name in (
+            "max_new_tokens",
+            "initial_codec_chunk_frames",
+            "token_count",
+            "duration_tokens",
+            "seed",
+        ):
             if field_name in payload and payload[field_name] is not None:
                 value = payload[field_name]
                 if isinstance(value, bool) or not isinstance(value, int):

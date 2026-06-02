@@ -286,6 +286,8 @@ def test_speech_websocket_unknown_message_type_is_recoverable() -> None:
         ("stream_audio", "true"),
         ("speed", "1.2"),
         ("max_new_tokens", "5"),
+        ("token_count", "5"),
+        ("duration_tokens", "5"),
     ],
 )
 def test_speech_websocket_rejects_stringified_config_types(

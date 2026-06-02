@@ -43,6 +43,17 @@ def test_speech_service_rejects_boolean_seed() -> None:
     assert exc_info.value.param == "seed"
 
 
+@pytest.mark.parametrize("field_name", ["token_count", "duration_tokens"])
+def test_speech_service_rejects_stringified_duration_fields(field_name: str) -> None:
+    service = SpeechService(default_model="tts")
+
+    with pytest.raises(SpeechAPIError) as exc_info:
+        service.parse_request({"input": "hello", field_name: "5"})
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == field_name
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_param"),
     [
