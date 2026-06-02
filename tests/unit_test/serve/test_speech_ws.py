@@ -15,7 +15,7 @@ from sglang_omni.client.types import SpeechResult
 from sglang_omni.serve import create_app
 from sglang_omni.serve.protocol import SpeechStreamSessionConfig
 from sglang_omni.serve.speech_service import SpeechService
-from sglang_omni.serve.speech_ws import SpeechWebSocketSession
+from sglang_omni.serve.speech_ws import MAX_TEXT_MESSAGE_BYTES, SpeechWebSocketSession
 
 
 class StreamingSpeechClient:
@@ -69,6 +69,53 @@ class BlockingStreamingSpeechClient:
         self.aborted.append(request_id)
 
 
+class BlockingSpeechClient:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.aborted: list[str] = []
+
+    async def speech(
+        self,
+        request: Any,
+        *,
+        request_id: str,
+        response_format: str = "wav",
+        speed: float = 1.0,
+        allow_format_fallback: bool = True,
+    ) -> SpeechResult:
+        del request, request_id, response_format, speed, allow_format_fallback
+        self.started.set()
+        await asyncio.Future()
+        return SpeechResult(audio_bytes=b"", mime_type="audio/wav", format="wav")
+
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+
+
+class ReleasableSpeechClient:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.aborted: list[str] = []
+
+    async def speech(
+        self,
+        request: Any,
+        *,
+        request_id: str,
+        response_format: str = "wav",
+        speed: float = 1.0,
+        allow_format_fallback: bool = True,
+    ) -> SpeechResult:
+        del request, request_id, response_format, speed, allow_format_fallback
+        self.started.set()
+        await self.release.wait()
+        return SpeechResult(audio_bytes=b"RIFF", mime_type="audio/wav", format="wav")
+
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+
+
 class TwoChunkStreamingSpeechClient:
     def __init__(self) -> None:
         self.aborted: list[str] = []
@@ -88,6 +135,25 @@ class TwoChunkStreamingSpeechClient:
             sample_rate=24000,
             finish_reason="stop",
         )
+
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+
+
+class PausingStreamingSpeechClient:
+    def __init__(self) -> None:
+        self.aborted: list[str] = []
+
+    async def generate(self, request: Any, request_id: str | None = None):
+        del request
+        yield GenerateChunk(
+            request_id=request_id or "speech-ws",
+            modality="audio",
+            audio_data=[0.0, 0.1, -0.1, 0.0],
+            sample_rate=24000,
+        )
+        await asyncio.Future()
+        yield GenerateChunk(request_id=request_id or "speech-ws")
 
     async def abort(self, request_id: str) -> None:
         self.aborted.append(request_id)
@@ -131,8 +197,16 @@ class CompletedSpeechClient:
 
 
 class RecordingWebSocket:
-    def __init__(self, *, fail_bytes: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_bytes: bool = False,
+        receive_messages: list[dict[str, Any]] | None = None,
+        receive_after_bytes: int = 0,
+    ) -> None:
         self.fail_bytes = fail_bytes
+        self.receive_messages = list(receive_messages or [])
+        self.receive_after_bytes = receive_after_bytes
         self.application_state = WebSocketState.CONNECTED
         self.client_state = WebSocketState.CONNECTED
         self.sent_text: list[dict[str, Any]] = []
@@ -147,6 +221,18 @@ class RecordingWebSocket:
             self.client_state = WebSocketState.DISCONNECTED
             raise RuntimeError("client disconnected")
         self.sent_bytes.append(payload)
+
+    async def receive(self) -> dict[str, Any]:
+        while self.receive_after_bytes > len(self.sent_bytes):
+            await asyncio.sleep(0)
+        if self.receive_messages:
+            message = self.receive_messages.pop(0)
+            if message.get("type") == "websocket.disconnect":
+                self.application_state = WebSocketState.DISCONNECTED
+                self.client_state = WebSocketState.DISCONNECTED
+            return message
+        await asyncio.Future()
+        raise AssertionError("unreachable")
 
     async def close(self) -> None:
         self.application_state = WebSocketState.DISCONNECTED
@@ -436,3 +522,109 @@ def test_speech_websocket_completed_send_failure_does_not_abort() -> None:
         assert session.active_request_id is None
 
     asyncio.run(run())
+
+
+def test_speech_websocket_peer_disconnect_aborts_blocked_speech() -> None:
+    async def run() -> None:
+        client_impl = BlockingSpeechClient()
+        websocket = RecordingWebSocket(
+            receive_messages=[{"type": "websocket.disconnect"}]
+        )
+        session = SpeechWebSocketSession(
+            websocket,
+            client=client_impl,
+            speech_service=SpeechService(default_model="tts"),
+        )
+        session.config = SpeechStreamSessionConfig(stream_audio=False)
+
+        with pytest.raises(WebSocketDisconnect):
+            await session._generate_sentence("Hello.")
+
+        assert client_impl.aborted == [websocket.sent_text[0]["id"]]
+        assert session.active_request_id is None
+
+    asyncio.run(run())
+
+
+def test_speech_websocket_peer_disconnect_aborts_blocked_stream() -> None:
+    async def run() -> None:
+        client_impl = BlockingStreamingSpeechClient()
+        websocket = RecordingWebSocket(
+            receive_messages=[{"type": "websocket.disconnect"}]
+        )
+        session = SpeechWebSocketSession(
+            websocket,
+            client=client_impl,
+            speech_service=SpeechService(default_model="tts"),
+        )
+        session.config = SpeechStreamSessionConfig(stream_audio=True)
+
+        with pytest.raises(WebSocketDisconnect):
+            await session._generate_sentence("Hello.")
+
+        assert client_impl.aborted == [websocket.sent_text[0]["id"]]
+        assert session.active_request_id is None
+
+    asyncio.run(run())
+
+
+def test_speech_websocket_peer_disconnect_aborts_between_stream_chunks() -> None:
+    async def run() -> None:
+        client_impl = PausingStreamingSpeechClient()
+        websocket = RecordingWebSocket(
+            receive_messages=[{"type": "websocket.disconnect"}],
+            receive_after_bytes=1,
+        )
+        session = SpeechWebSocketSession(
+            websocket,
+            client=client_impl,
+            speech_service=SpeechService(default_model="tts"),
+        )
+        session.config = SpeechStreamSessionConfig(stream_audio=True)
+
+        with pytest.raises(WebSocketDisconnect):
+            await session._generate_sentence("Hello.")
+
+        assert websocket.sent_bytes
+        assert client_impl.aborted == [websocket.sent_text[0]["id"]]
+        assert session.active_request_id is None
+
+    asyncio.run(run())
+
+
+def test_speech_websocket_disconnect_watch_preserves_client_frames() -> None:
+    async def run() -> None:
+        client_impl = ReleasableSpeechClient()
+        queued_message = {
+            "type": "websocket.receive",
+            "text": json.dumps({"type": "input.done"}),
+        }
+        websocket = RecordingWebSocket(receive_messages=[queued_message])
+        session = SpeechWebSocketSession(
+            websocket,
+            client=client_impl,
+            speech_service=SpeechService(default_model="tts"),
+        )
+        session.config = SpeechStreamSessionConfig(stream_audio=False)
+
+        task = asyncio.create_task(session._generate_sentence("Hello."))
+        await client_impl.started.wait()
+        await asyncio.wait_for(_wait_for_buffered_receive(session), timeout=1.0)
+        client_impl.release.set()
+        await task
+
+        raw = await session._receive_text_frame(
+            timeout_s=0.01,
+            max_bytes=MAX_TEXT_MESSAGE_BYTES,
+            message_kind="text",
+        )
+
+        assert json.loads(raw)["type"] == "input.done"
+        assert client_impl.aborted == []
+
+    asyncio.run(run())
+
+
+async def _wait_for_buffered_receive(session: SpeechWebSocketSession) -> None:
+    while not session.buffered_receive_messages:
+        await asyncio.sleep(0)

@@ -7,6 +7,9 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import deque
+from collections.abc import Awaitable
+from contextlib import suppress
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -59,6 +62,7 @@ class SpeechWebSocketSession:
         self.buffer = ""
         self.sentence_index = 0
         self.active_request_id: str | None = None
+        self.buffered_receive_messages: deque[dict[str, Any]] = deque()
 
     async def run(self) -> None:
         try:
@@ -228,14 +232,12 @@ class SpeechWebSocketSession:
         failed = False
         try:
             if self.config.stream_audio:
-                total_bytes = await self._stream_sentence_audio(
-                    sentence,
-                    request_id=request_id,
+                total_bytes = await self._run_generation_until_disconnect(
+                    self._stream_sentence_audio(sentence, request_id=request_id)
                 )
             else:
-                total_bytes = await self._send_sentence_audio(
-                    sentence,
-                    request_id=request_id,
+                total_bytes = await self._run_generation_until_disconnect(
+                    self._send_sentence_audio(sentence, request_id=request_id)
                 )
         except asyncio.CancelledError:
             failed = True
@@ -356,6 +358,32 @@ class SpeechWebSocketSession:
             raise ValueError("speech WebSocket messages must be JSON objects")
         return payload
 
+    async def _run_generation_until_disconnect(self, generation: Awaitable[int]) -> int:
+        generation_task = asyncio.ensure_future(generation)
+        disconnect_task = asyncio.create_task(self._watch_client_disconnect())
+        done, _ = await asyncio.wait(
+            {generation_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if generation_task in done:
+            disconnect_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await disconnect_task
+            return generation_task.result()
+
+        generation_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await generation_task
+        disconnect_task.result()
+        raise WebSocketDisconnect
+
+    async def _watch_client_disconnect(self) -> None:
+        while True:
+            message = await self.websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect
+            self.buffered_receive_messages.append(message)
+
     async def _receive_text_frame(
         self,
         *,
@@ -363,7 +391,12 @@ class SpeechWebSocketSession:
         max_bytes: int,
         message_kind: str,
     ) -> str:
-        message = await asyncio.wait_for(self.websocket.receive(), timeout=timeout_s)
+        if self.buffered_receive_messages:
+            message = self.buffered_receive_messages.popleft()
+        else:
+            message = await asyncio.wait_for(
+                self.websocket.receive(), timeout=timeout_s
+            )
         message_type = message.get("type")
         if message_type == "websocket.disconnect":
             raise WebSocketDisconnect
