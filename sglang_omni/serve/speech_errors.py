@@ -8,10 +8,6 @@ from typing import Any
 
 from fastapi.responses import JSONResponse
 
-OPENAI_BAD_REQUEST = "BadRequestError"
-OPENAI_NOT_FOUND = "NotFoundError"
-OPENAI_INTERNAL_ERROR = "InternalServerError"
-
 
 @dataclass(frozen=True)
 class SpeechAPIError(Exception):
@@ -81,19 +77,9 @@ def bad_request(message: str, *, param: str | None = None) -> SpeechAPIError:
     return SpeechAPIError(
         message=message,
         status_code=400,
-        error_type=OPENAI_BAD_REQUEST,
+        error_type="BadRequestError",
         param=param,
         code=400,
-    )
-
-
-def not_found(message: str, *, param: str | None = None) -> SpeechAPIError:
-    return SpeechAPIError(
-        message=message,
-        status_code=404,
-        error_type=OPENAI_NOT_FOUND,
-        param=param,
-        code=404,
     )
 
 
@@ -101,7 +87,7 @@ def internal_error(message: str, *, param: str | None = None) -> SpeechAPIError:
     return SpeechAPIError(
         message=message,
         status_code=500,
-        error_type=OPENAI_INTERNAL_ERROR,
+        error_type="InternalServerError",
         param=param,
         code=500,
     )
