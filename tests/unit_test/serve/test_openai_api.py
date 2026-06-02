@@ -15,7 +15,6 @@ from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.proto import CompleteMessage, OmniRequest, StreamMessage
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import (
-    _build_speech_generate_request,
     _chat_stream,
     _speech_stream,
     build_speech_generate_request,
@@ -300,7 +299,6 @@ def test_speech_request_records_explicit_generation_params() -> None:
 
     gen_req = build_speech_generate_request(req, "qwen3-tts")
 
-    assert _build_speech_generate_request is build_speech_generate_request
     assert gen_req.sampling.temperature == 0.8
     assert gen_req.sampling.top_k == 30
     assert gen_req.sampling.seed == 123
@@ -311,7 +309,7 @@ def test_speech_request_records_explicit_generation_params() -> None:
     ]
 
 
-def test_speech_request_passes_issue_601_fields() -> None:
+def test_speech_request_passes_streaming_control_fields() -> None:
     req = CreateSpeechRequest(
         input="hello",
         initial_codec_chunk_frames=8,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -23,29 +24,6 @@ from sglang_omni.serve.protocol import (
 )
 from sglang_omni.serve.speech_errors import bad_request, internal_error
 
-_GENERATION_FIELDS = (
-    "max_new_tokens",
-    "temperature",
-    "top_p",
-    "top_k",
-    "repetition_penalty",
-    "seed",
-)
-_OPTIONAL_INT_FIELDS = ("max_new_tokens", "initial_codec_chunk_frames")
-_OPTIONAL_FLOAT_FIELDS = ("speed", "temperature", "top_p", "repetition_penalty")
-_OPTIONAL_BOOL_FIELDS = ("stream", "x_vector_only_mode")
-_STRING_FIELDS = (
-    "model",
-    "input",
-    "voice",
-    "speaker",
-    "response_format",
-    "task_type",
-    "language",
-    "instructions",
-    "ref_audio",
-    "ref_text",
-)
 _LANGUAGE_CANONICAL = {
     language.lower(): language for language in SUPPORTED_TTS_LANGUAGES
 }
@@ -113,12 +91,12 @@ class SpeechService:
         if request.language is not None:
             updates["language"] = _normalize_language(request.language)
 
-        for field_name in _OPTIONAL_INT_FIELDS:
-            value = getattr(request, field_name)
-            if value is not None and int(value) <= 0:
-                raise bad_request(
-                    f"{field_name} must be greater than 0", param=field_name
-                )
+        _validate_positive_int(request.max_new_tokens, param="max_new_tokens")
+        _validate_positive_int(
+            request.initial_codec_chunk_frames,
+            param="initial_codec_chunk_frames",
+        )
+        _validate_non_negative_int(request.seed, param="seed")
 
         ref_audio = request.ref_audio
         if ref_audio is not None:
@@ -139,7 +117,16 @@ class SpeechService:
 
         request = self.prepare_request(request)
         explicit_generation_params = sorted(
-            field for field in _GENERATION_FIELDS if field in request.model_fields_set
+            field
+            for field in (
+                "max_new_tokens",
+                "temperature",
+                "top_p",
+                "top_k",
+                "repetition_penalty",
+                "seed",
+            )
+            if field in request.model_fields_set
         )
 
         tts_params: dict[str, Any] = {
@@ -149,30 +136,44 @@ class SpeechService:
         }
         if explicit_generation_params:
             tts_params["explicit_generation_params"] = explicit_generation_params
-        _set_if_present(tts_params, "task_type", request.task_type)
-        _set_if_present(tts_params, "language", request.language)
-        _set_if_present(tts_params, "instructions", request.instructions)
-        _set_if_present(tts_params, "ref_audio", request.ref_audio)
-        _set_if_present(tts_params, "ref_text", request.ref_text)
-        _set_if_present(tts_params, "x_vector_only_mode", request.x_vector_only_mode)
-        _set_if_present(
-            tts_params,
-            "initial_codec_chunk_frames",
-            request.initial_codec_chunk_frames,
-        )
-        _set_if_present(tts_params, "token_count", request.token_count)
-        _set_if_present(tts_params, "duration_tokens", request.duration_tokens)
-        _set_if_present(tts_params, "seed", request.seed)
+        if request.task_type is not None:
+            tts_params["task_type"] = request.task_type
+        if request.language is not None:
+            tts_params["language"] = request.language
+        if request.instructions is not None:
+            tts_params["instructions"] = request.instructions
+        if request.ref_audio is not None:
+            tts_params["ref_audio"] = request.ref_audio
+        if request.ref_text is not None:
+            tts_params["ref_text"] = request.ref_text
+        if request.x_vector_only_mode is not None:
+            tts_params["x_vector_only_mode"] = request.x_vector_only_mode
+        if request.initial_codec_chunk_frames is not None:
+            tts_params["initial_codec_chunk_frames"] = (
+                request.initial_codec_chunk_frames
+            )
+        if request.token_count is not None:
+            tts_params["token_count"] = request.token_count
+        if request.duration_tokens is not None:
+            tts_params["duration_tokens"] = request.duration_tokens
+        if request.seed is not None:
+            tts_params["seed"] = request.seed
 
         sampling = SamplingParams(
             temperature=0.8, top_p=0.8, top_k=30, repetition_penalty=1.1
         )
-        _set_if_present(sampling, "max_new_tokens", request.max_new_tokens)
-        _set_if_present(sampling, "temperature", request.temperature)
-        _set_if_present(sampling, "top_p", request.top_p)
-        _set_if_present(sampling, "top_k", request.top_k)
-        _set_if_present(sampling, "repetition_penalty", request.repetition_penalty)
-        _set_if_present(sampling, "seed", request.seed)
+        if request.max_new_tokens is not None:
+            sampling.max_new_tokens = request.max_new_tokens
+        if request.temperature is not None:
+            sampling.temperature = request.temperature
+        if request.top_p is not None:
+            sampling.top_p = request.top_p
+        if request.top_k is not None:
+            sampling.top_k = request.top_k
+        if request.repetition_penalty is not None:
+            sampling.repetition_penalty = request.repetition_penalty
+        if request.seed is not None:
+            sampling.seed = request.seed
 
         prompt: Any = request.input
         references: list[dict[str, Any]] = []
@@ -203,13 +204,24 @@ class SpeechService:
         )
 
     def _validate_raw_payload(self, payload: dict[str, Any]) -> None:
-        for field_name in _STRING_FIELDS:
+        for field_name in (
+            "model",
+            "input",
+            "voice",
+            "speaker",
+            "response_format",
+            "task_type",
+            "language",
+            "instructions",
+            "ref_audio",
+            "ref_text",
+        ):
             if field_name in payload and payload[field_name] is not None:
                 if not isinstance(payload[field_name], str):
                     raise bad_request(
                         f"{field_name} must be a string", param=field_name
                     )
-        for field_name in _OPTIONAL_INT_FIELDS:
+        for field_name in ("max_new_tokens", "initial_codec_chunk_frames", "seed"):
             if field_name in payload and payload[field_name] is not None:
                 value = payload[field_name]
                 if isinstance(value, bool) or not isinstance(value, int):
@@ -220,14 +232,14 @@ class SpeechService:
             value = payload["top_k"]
             if isinstance(value, bool) or not isinstance(value, int):
                 raise bad_request("top_k must be an integer", param="top_k")
-        for field_name in _OPTIONAL_FLOAT_FIELDS:
+        for field_name in ("speed", "temperature", "top_p", "repetition_penalty"):
             if field_name in payload and payload[field_name] is not None:
                 value = payload[field_name]
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     raise bad_request(
                         f"{field_name} must be a number", param=field_name
                     )
-        for field_name in _OPTIONAL_BOOL_FIELDS:
+        for field_name in ("stream", "x_vector_only_mode"):
             if field_name in payload and payload[field_name] is not None:
                 if not isinstance(payload[field_name], bool):
                     raise bad_request(
@@ -264,6 +276,16 @@ class SpeechService:
         file_path = Path(url2pathname(url.path)).expanduser().resolve()
         for allowed_path in self.allowed_local_media_paths:
             if _is_relative_to(file_path, allowed_path):
+                if not file_path.exists():
+                    raise bad_request(
+                        f"file:// ref_audio path does not exist: {file_path}",
+                        param=param,
+                    )
+                if not file_path.is_file():
+                    raise bad_request(
+                        f"file:// ref_audio path must be a file: {file_path}",
+                        param=param,
+                    )
                 return str(file_path)
         raise bad_request(
             f"file:// ref_audio path is outside allowed local media paths: {file_path}",
@@ -282,6 +304,16 @@ def _normalize_response_format(value: str) -> str:
     return fmt
 
 
+def _validate_positive_int(value: int | None, *, param: str) -> None:
+    if value is not None and value <= 0:
+        raise bad_request(f"{param} must be greater than 0", param=param)
+
+
+def _validate_non_negative_int(value: int | None, *, param: str) -> None:
+    if value is not None and value < 0:
+        raise bad_request(f"{param} must be greater than or equal to 0", param=param)
+
+
 def _validate_encoder_dependency(response_format: str) -> None:
     if response_format == "flac":
         _require_module("soundfile", "soundfile is required for response_format='flac'")
@@ -290,6 +322,11 @@ def _validate_encoder_dependency(response_format: str) -> None:
             "pydub",
             f"pydub is required for response_format={response_format!r}",
         )
+        if shutil.which("ffmpeg") is None and shutil.which("avconv") is None:
+            raise internal_error(
+                "ffmpeg or avconv is required for "
+                f"response_format={response_format!r}"
+            )
 
 
 def _require_module(module_name: str, message: str) -> None:
@@ -313,15 +350,6 @@ def _normalize_task_type(value: str) -> str:
         supported = ", ".join(sorted(SUPPORTED_TTS_TASK_TYPES))
         raise bad_request(f"task_type must be one of: {supported}", param="task_type")
     return normalized
-
-
-def _set_if_present(target: Any, name: str, value: Any) -> None:
-    if value is None:
-        return
-    if isinstance(target, dict):
-        target[name] = value
-        return
-    setattr(target, name, value)
 
 
 def _validation_error_message(exc: ValidationError) -> str:

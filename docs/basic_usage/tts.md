@@ -195,6 +195,28 @@ with open("output.wav", "wb") as f:
     f.write(resp.content)
 ```
 
+### OpenAI Python SDK
+
+The endpoint is compatible with the OpenAI Python SDK when the client points to
+the SGLang-Omni server:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY",
+)
+
+response = client.audio.speech.create(
+    model="fishaudio/s2-pro",
+    voice="default",
+    input="Hello, how are you?",
+    response_format="wav",
+)
+response.stream_to_file("output.wav")
+```
+
 ### Voice Cloning
 
 ```python

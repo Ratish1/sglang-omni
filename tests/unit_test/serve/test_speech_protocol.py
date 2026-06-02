@@ -33,7 +33,44 @@ def test_speech_service_requires_pcm_for_http_streaming() -> None:
     assert exc_info.value.param == "response_format"
 
 
-def test_speech_service_normalizes_issue_fields_into_tts_params() -> None:
+def test_speech_service_rejects_boolean_seed() -> None:
+    service = SpeechService(default_model="tts")
+
+    with pytest.raises(SpeechAPIError) as exc_info:
+        service.parse_request({"input": "hello", "seed": True})
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == "seed"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_param"),
+    [
+        ({"input": "hello", "response_format": "gif"}, "response_format"),
+        ({"input": "hello", "speed": 0.24}, "speed"),
+        ({"input": "hello", "speed": 4.01}, "speed"),
+        ({"input": "hello", "language": "Klingon"}, "language"),
+        ({"input": "hello", "task_type": "Narration"}, "task_type"),
+        ({"input": "hello", "max_new_tokens": 0}, "max_new_tokens"),
+        (
+            {"input": "hello", "initial_codec_chunk_frames": 0},
+            "initial_codec_chunk_frames",
+        ),
+    ],
+)
+def test_speech_service_rejects_invalid_boundary_values(
+    payload: dict[str, object], expected_param: str
+) -> None:
+    service = SpeechService(default_model="tts")
+
+    with pytest.raises(SpeechAPIError) as exc_info:
+        service.parse_request(payload)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == expected_param
+
+
+def test_speech_service_normalizes_tts_extension_fields_into_tts_params() -> None:
     service = SpeechService(default_model="tts")
     request = CreateSpeechRequest.model_validate(
         {
@@ -103,6 +140,35 @@ def test_file_reference_resolves_inside_allowlist(tmp_path: Path) -> None:
         "text": "hello",
         "references": [{"audio_path": str(audio_path.resolve())}],
     }
+
+
+def test_file_reference_rejects_missing_file_inside_allowlist(tmp_path: Path) -> None:
+    service = SpeechService(
+        default_model="tts",
+        allowed_local_media_paths=[tmp_path],
+    )
+    missing_path = tmp_path / "missing.wav"
+
+    with pytest.raises(SpeechAPIError) as exc_info:
+        service.parse_request({"input": "hello", "ref_audio": missing_path.as_uri()})
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == "ref_audio"
+
+
+def test_file_reference_rejects_directory_inside_allowlist(tmp_path: Path) -> None:
+    audio_dir = tmp_path / "reference-dir"
+    audio_dir.mkdir()
+    service = SpeechService(
+        default_model="tts",
+        allowed_local_media_paths=[tmp_path],
+    )
+
+    with pytest.raises(SpeechAPIError) as exc_info:
+        service.parse_request({"input": "hello", "ref_audio": audio_dir.as_uri()})
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == "ref_audio"
 
 
 def test_file_reference_rejects_symlink_escape(tmp_path: Path) -> None:

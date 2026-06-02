@@ -212,6 +212,15 @@ def encode_audio(
                 "pydub not installed; falling back to WAV for %s request", fmt
             )
             return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
+        except Exception as exc:
+            if not allow_format_fallback:
+                raise ValueError(
+                    f"Failed to encode response_format={fmt!r}: {exc}"
+                ) from exc
+            logger.warning(
+                "Failed to encode %s; falling back to WAV", fmt, exc_info=True
+            )
+            return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
 
     # Unknown format -> fall back to WAV
     if not allow_format_fallback:
