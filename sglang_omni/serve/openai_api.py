@@ -22,7 +22,6 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import time
 import uuid
 from contextlib import suppress
@@ -81,7 +80,6 @@ from sglang_omni.serve.speech_ws import SpeechWebSocketSession
 logger = logging.getLogger(__name__)
 STREAM_DONE_SENTINEL = "[DONE]"
 BATCH_DISCONNECT_POLL_INTERVAL_S = 0.05
-TTS_BATCH_DISCONNECT_WATCH_ENV = "SGLANG_OMNI_TTS_BATCH_DISCONNECT_WATCH"
 
 _BAD_REQUEST_MARKERS = (
     "longer than the model's context length",
@@ -764,20 +762,13 @@ def _register_speech_batch(app: FastAPI) -> None:
         try:
             payload = await request.json()
             batch = speech_service.parse_batch_request(payload)
-            if _is_tts_batch_disconnect_watch_enabled():
-                response = await _create_speech_batch_with_disconnect_watch(
-                    request,
-                    client=client,
-                    speech_service=speech_service,
-                    batch=batch,
-                    request_id=request_id,
-                )
-            else:
-                response = await speech_service.create_speech_batch(
-                    client,
-                    batch,
-                    request_id=request_id,
-                )
+            response = await _create_speech_batch_with_disconnect_watch(
+                request,
+                client=client,
+                speech_service=speech_service,
+                batch=batch,
+                request_id=request_id,
+            )
         except json.JSONDecodeError:
             return speech_error_response(
                 bad_request("speech batch request body must be valid JSON")
@@ -789,11 +780,6 @@ def _register_speech_batch(app: FastAPI) -> None:
             return speech_error_response(internal_error(str(exc)))
         response = SpeechBatchResponse.model_validate(response)
         return JSONResponse(content=response.model_dump(exclude_none=True))
-
-
-def _is_tts_batch_disconnect_watch_enabled() -> bool:
-    value = os.getenv(TTS_BATCH_DISCONNECT_WATCH_ENV, "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 async def _create_speech_batch_with_disconnect_watch(

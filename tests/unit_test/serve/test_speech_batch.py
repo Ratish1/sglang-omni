@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from sglang_omni.client import ClientError
 from sglang_omni.client.types import SpeechResult
 from sglang_omni.serve import create_app
+from sglang_omni.serve.openai_api import _create_speech_batch_with_disconnect_watch
 from sglang_omni.serve.speech_service import SpeechService
 
 
@@ -60,6 +61,14 @@ class BlockingBatchSpeechClient:
 
     async def abort(self, request_id: str) -> None:
         self.aborted.append(request_id)
+
+
+class DisconnectingBatchRequest:
+    def __init__(self, client_impl: BlockingBatchSpeechClient) -> None:
+        self.client_impl = client_impl
+
+    async def is_disconnected(self) -> bool:
+        return self.client_impl.started.is_set()
 
 
 class MixedBatchSpeechClient:
@@ -294,6 +303,27 @@ def test_batch_speech_cancellation_aborts_started_items() -> None:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+        assert client_impl.aborted == ["batch-0"]
+
+    asyncio.run(run())
+
+
+def test_batch_speech_request_disconnect_aborts_started_items() -> None:
+    async def run() -> None:
+        service = SpeechService(default_model="tts")
+        batch = service.parse_batch_request({"items": [{"input": "one"}]})
+        client_impl = BlockingBatchSpeechClient()
+        request = DisconnectingBatchRequest(client_impl)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _create_speech_batch_with_disconnect_watch(
+                request,
+                client=client_impl,
+                speech_service=service,
+                batch=batch,
+                request_id="batch",
+            )
 
         assert client_impl.aborted == ["batch-0"]
 
