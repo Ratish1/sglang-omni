@@ -294,6 +294,7 @@ async def _run_server(
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
+    tts_batch_max_items: int = 32,
 ) -> None:
     """Start the pipeline and run the OpenAI server.
 
@@ -339,6 +340,7 @@ async def _run_server(
             ),
             enable_realtime=enable_realtime,
             allowed_local_media_path=allowed_local_media_path,
+            tts_batch_max_items=tts_batch_max_items,
         )
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
@@ -407,6 +409,7 @@ def launch_server(
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
+    tts_batch_max_items: int = 32,
 ) -> None:
     """Blocking helper: start the pipeline and OpenAI-compatible server.
 
@@ -423,6 +426,8 @@ def launch_server(
             endpoint (OpenAI Realtime API).
         allowed_local_media_path: Directory allowed for ``file://`` media
             references in TTS requests.
+        tts_batch_max_items: Maximum items accepted by
+            ``/v1/audio/speech/batch``.
     """
     asyncio.run(
         _run_server(
@@ -434,5 +439,6 @@ def launch_server(
             client_kwargs=client_kwargs,
             enable_realtime=enable_realtime,
             allowed_local_media_path=allowed_local_media_path,
+            tts_batch_max_items=tts_batch_max_items,
         )
     )

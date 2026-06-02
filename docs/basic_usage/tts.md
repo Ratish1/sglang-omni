@@ -49,6 +49,17 @@ sgl-omni serve \
   --port 8000
 ```
 
+Batch speech requests accept up to 32 items by default. Change the limit at
+server startup when larger or smaller request envelopes are needed:
+
+```bash
+sgl-omni serve \
+  --model-path fishaudio/s2-pro \
+  --config examples/configs/s2pro_tts.yaml \
+  --tts-batch-max-items 32 \
+  --port 8000
+```
+
 For Voxtral:
 
 ```bash
@@ -176,6 +187,93 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
 The server returns a stream of SSE events. Each event contains an
 `audio.speech.chunk` object with a base64-encoded PCM chunk. The stream ends
 with `data: [DONE]`.
+
+### Batch Speech
+
+Use `/v1/audio/speech/batch` when one client request should synthesize several
+independent utterances. Batch defaults are merged with each item, and item
+fields override the defaults. The server submits each item through the normal
+speech path; this endpoint does not add a separate model-side batch kernel.
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "response_format": "wav",
+    "items": [
+      {"input": "First sentence."},
+      {"input": "Second sentence.", "speed": 1.1},
+      {
+        "input": "Use a reference clip for this item.",
+        "ref_audio": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
+        "ref_text": "We asked over twenty different people, and they all said it was his."
+      }
+    ]
+  }'
+```
+
+The response preserves item order. Successful items contain base64-encoded
+audio bytes and the selected media type. Failed items contain an OpenAI-style
+error object at the item level; invalid batch envelopes, such as too many
+items, fail the HTTP request.
+
+### WebSocket Speech Streaming
+
+Use `/v1/audio/speech/stream` for stateful text input over a persistent
+WebSocket. The first message must be `session.config`. Then send `input.text`
+messages and finish with `input.done`. For `stream_audio=true`, the response
+format must be `pcm`; audio is sent as binary WebSocket frames between
+`audio.start` and `audio.done` JSON events.
+
+```python
+import asyncio
+import json
+
+import websockets
+
+
+async def main():
+    async with websockets.connect(
+        "ws://localhost:8000/v1/audio/speech/stream"
+    ) as ws:
+        await ws.send(json.dumps({
+            "type": "session.config",
+            "session": {
+                "voice": "default",
+                "response_format": "pcm",
+                "stream_audio": True,
+                "split_granularity": "sentence",
+            },
+        }))
+        print(await ws.recv())
+
+        await ws.send(json.dumps({
+            "type": "input.text",
+            "text": "Hello from the speech WebSocket. This is the second sentence.",
+        }))
+        await ws.send(json.dumps({"type": "input.done"}))
+
+        pcm_chunks = []
+        while True:
+            message = await ws.recv()
+            if isinstance(message, bytes):
+                pcm_chunks.append(message)
+                continue
+            event = json.loads(message)
+            print(event)
+            if event["type"] == "session.done":
+                break
+
+        with open("websocket_output.pcm", "wb") as f:
+            f.write(b"".join(pcm_chunks))
+
+
+asyncio.run(main())
+```
+
+`split_granularity` can be `sentence` or `clause`. Unknown message types and
+malformed JSON return a WebSocket `error` event. Missing or invalid initial
+configuration returns an error and closes the session.
 
 ### Uploaded Voices
 

@@ -217,6 +217,12 @@ def _validate_allowed_local_media_path(value: str | None) -> str | None:
     return str(path.resolve())
 
 
+def _validate_tts_batch_max_items(value: int) -> int:
+    if value < 1:
+        raise typer.BadParameter("--tts-batch-max-items must be greater than 0")
+    return int(value)
+
+
 def apply_mem_fraction_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
@@ -828,6 +834,14 @@ def serve(
             ),
         ),
     ] = None,
+    tts_batch_max_items: Annotated[
+        int,
+        typer.Option(
+            "--tts-batch-max-items",
+            "--tts_batch_max_items",
+            help="Maximum number of items accepted by /v1/audio/speech/batch.",
+        ),
+    ] = 32,
     mem_fraction_static: Annotated[
         float | None,
         typer.Option(
@@ -1119,4 +1133,5 @@ def serve(
         allowed_local_media_path=_validate_allowed_local_media_path(
             allowed_local_media_path
         ),
+        tts_batch_max_items=_validate_tts_batch_max_items(tts_batch_max_items),
     )

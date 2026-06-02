@@ -4,6 +4,8 @@
 Provides the following endpoints:
 - POST /v1/chat/completions  — Text (+ audio) chat completions
 - POST /v1/audio/speech      — Text-to-speech synthesis
+- POST /v1/audio/speech/batch — Batch text-to-speech synthesis
+- WS   /v1/audio/speech/stream — Stateful TTS WebSocket streaming
 - GET  /v1/audio/voices      — List preset and uploaded TTS voices
 - POST /v1/audio/voices      — Upload a persistent TTS reference voice
 - DELETE /v1/audio/voices/{name} — Delete an uploaded TTS voice
@@ -39,12 +41,7 @@ from sglang_omni.client import (
     Message,
     SamplingParams,
 )
-from sglang_omni.client.audio import (
-    DEFAULT_SAMPLE_RATE,
-    FORMAT_MIME_TYPES,
-    encode_audio,
-    to_numpy,
-)
+from sglang_omni.client.audio import DEFAULT_SAMPLE_RATE, encode_audio
 from sglang_omni.http.favicon import register_favicon
 from sglang_omni.serve.protocol import (
     ChatCompletionAudio,
@@ -56,6 +53,7 @@ from sglang_omni.serve.protocol import (
     ChatCompletionStreamResponse,
     ModelCard,
     ModelList,
+    SpeechBatchResponse,
     TranscriptionResponse,
     UsageResponse,
     VoiceListResponse,
@@ -68,12 +66,14 @@ from sglang_omni.serve.speech_errors import (
 )
 from sglang_omni.serve.speech_service import (
     SpeechService,
+    audio_format_from_mime_type,
     build_speech_generate_request,
+    speech_audio_delta,
 )
 from sglang_omni.serve.speech_voices import MAX_VOICE_UPLOAD_BYTES, SpeakerSampleStore
+from sglang_omni.serve.speech_ws import SpeechWebSocketSession
 
 logger = logging.getLogger(__name__)
-MIME_TO_FORMAT = {mime: fmt for fmt, mime in FORMAT_MIME_TYPES.items()}
 STREAM_DONE_SENTINEL = "[DONE]"
 
 _BAD_REQUEST_MARKERS = (
@@ -94,6 +94,7 @@ def create_app(
     requires_uploaded_voice_for_named_voice: bool = False,
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
+    tts_batch_max_items: int = 32,
 ) -> FastAPI:
     """Create a FastAPI application with OpenAI-compatible endpoints.
 
@@ -106,6 +107,8 @@ def create_app(
             endpoint (OpenAI Realtime API).
         allowed_local_media_path: Directory allowed for ``file://`` TTS
             reference audio.
+        tts_batch_max_items: Maximum items accepted by
+            ``/v1/audio/speech/batch``.
 
     Returns:
         Configured FastAPI application.
@@ -134,6 +137,7 @@ def create_app(
             [allowed_local_media_path] if allowed_local_media_path else None
         ),
         voice_store=app.state.speaker_sample_store,
+        tts_batch_max_items=tts_batch_max_items,
     )
 
     # Register all routes
@@ -143,6 +147,8 @@ def create_app(
     _register_chat_completions(app)
     _register_voices(app)
     _register_speech(app)
+    _register_speech_batch(app)
+    _register_speech_ws(app)
     _register_transcriptions(app)
     if enable_realtime:
         _register_realtime(app)
@@ -682,7 +688,7 @@ async def _speech_stream(
             continue
 
         sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
-        audio_data, emitted_samples = _select_speech_audio_delta(
+        audio_data, emitted_samples = speech_audio_delta(
             chunk.audio_data,
             emitted_samples=emitted_samples,
             is_terminal=chunk.finish_reason is not None,
@@ -699,7 +705,7 @@ async def _speech_stream(
         )
         if not audio_bytes:
             continue
-        actual_format = MIME_TO_FORMAT.get(mime_type, response_format)
+        actual_format = audio_format_from_mime_type(mime_type, response_format)
         payload = {
             "id": f"speech-{request_id}",
             "object": "audio.speech.chunk",
@@ -739,30 +745,46 @@ async def _prepend_speech_stream_event(
         yield event
 
 
-def _select_speech_audio_delta(
-    audio_data: Any,
-    *,
-    emitted_samples: int,
-    is_terminal: bool,
-) -> tuple[Any | None, int]:
-    audio = to_numpy(audio_data)
-    if audio.ndim > 1:
-        audio = audio.squeeze()
-    if audio.ndim > 1:
-        if audio.shape[0] < audio.shape[-1]:
-            audio = audio[0]
-        else:
-            audio = audio[:, 0]
-
-    total_samples = int(audio.shape[-1]) if audio.ndim else 0
-    if not is_terminal:
-        return audio, emitted_samples + total_samples
-    if total_samples <= emitted_samples:
-        return None, emitted_samples
-    return audio[emitted_samples:], total_samples
-
-
 _build_speech_generate_request = build_speech_generate_request
+
+
+def _register_speech_batch(app: FastAPI) -> None:
+    @app.post("/v1/audio/speech/batch")
+    async def create_speech_batch(request: Request) -> JSONResponse:
+        client: Client = app.state.client
+        speech_service: SpeechService = app.state.speech_service
+        request_id = f"speech-batch-{uuid.uuid4()}"
+        try:
+            payload = await request.json()
+            batch = speech_service.parse_batch_request(payload)
+            response = await speech_service.create_speech_batch(
+                client,
+                batch,
+                request_id=request_id,
+            )
+        except json.JSONDecodeError:
+            return speech_error_response(
+                bad_request("speech batch request body must be valid JSON")
+            )
+        except SpeechAPIError as exc:
+            return speech_error_response(exc)
+        except Exception as exc:
+            logger.exception("Error generating speech batch for request %s", request_id)
+            return speech_error_response(internal_error(str(exc)))
+        response = SpeechBatchResponse.model_validate(response)
+        return JSONResponse(content=response.model_dump(exclude_none=True))
+
+
+def _register_speech_ws(app: FastAPI) -> None:
+    @app.websocket("/v1/audio/speech/stream")
+    async def speech_stream(websocket: WebSocket) -> None:
+        await websocket.accept()
+        session = SpeechWebSocketSession(
+            websocket,
+            client=app.state.client,
+            speech_service=app.state.speech_service,
+        )
+        await session.run()
 
 
 def _register_transcriptions(app: FastAPI) -> None:
