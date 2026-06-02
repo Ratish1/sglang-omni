@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Annotated, Literal, NoReturn
 
 import typer
@@ -205,6 +206,15 @@ def _validate_encoder_mem_reserve(value: float | None) -> float | None:
     if not 0.0 <= value < 1.0:
         raise typer.BadParameter("--encoder-mem-reserve must be in [0, 1)")
     return float(value)
+
+
+def _validate_allowed_local_media_path(value: str | None) -> str | None:
+    if value is None:
+        return None
+    path = Path(value).expanduser()
+    if not path.exists() or not path.is_dir():
+        raise typer.BadParameter("--allowed-local-media-path must be a directory")
+    return str(path.resolve())
 
 
 def apply_mem_fraction_cli_overrides(
@@ -807,6 +817,17 @@ def serve(
     model_name: Annotated[
         str, typer.Option(help="Model name for /v1/models (default: pipeline name).")
     ] = None,
+    allowed_local_media_path: Annotated[
+        str | None,
+        typer.Option(
+            "--allowed-local-media-path",
+            "--allowed_local_media_path",
+            help=(
+                "Directory allowed for file:// media references in TTS requests. "
+                "Local file references are disabled when this is omitted."
+            ),
+        ),
+    ] = None,
     mem_fraction_static: Annotated[
         float | None,
         typer.Option(
@@ -1095,4 +1116,7 @@ def serve(
         model_name=model_name,
         log_level=log_level,
         enable_realtime=enable_realtime,
+        allowed_local_media_path=_validate_allowed_local_media_path(
+            allowed_local_media_path
+        ),
     )

@@ -135,6 +135,7 @@ def encode_audio(
     response_format: str = "wav",
     sample_rate: int = DEFAULT_SAMPLE_RATE,
     speed: float = 1.0,
+    allow_format_fallback: bool = True,
 ) -> tuple[bytes, str]:
     """Encode audio data to the requested format.
 
@@ -143,6 +144,8 @@ def encode_audio(
         response_format: Target format (wav, mp3, flac, opus, aac, pcm)
         sample_rate: Audio sample rate in Hz
         speed: Speed adjustment factor (1.0 = normal)
+        allow_format_fallback: If True, return WAV when a compressed encoder is
+            unavailable or the format is unknown. If False, raise ValueError.
 
     Returns:
         (encoded_bytes, mime_type)
@@ -183,6 +186,10 @@ def encode_audio(
                 sf.write(buf, arr, sample_rate, format="FLAC")
                 return buf.getvalue(), mime
             except ImportError:
+                if not allow_format_fallback:
+                    raise ValueError(
+                        "soundfile is required to encode response_format='flac'"
+                    )
                 logger.warning(
                     "soundfile not installed; falling back to WAV for FLAC request"
                 )
@@ -199,12 +206,16 @@ def encode_audio(
             seg.export(buf, format=export_fmt)
             return buf.getvalue(), mime
         except ImportError:
+            if not allow_format_fallback:
+                raise ValueError(f"pydub is required to encode response_format={fmt!r}")
             logger.warning(
                 "pydub not installed; falling back to WAV for %s request", fmt
             )
             return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
 
     # Unknown format -> fall back to WAV
+    if not allow_format_fallback:
+        raise ValueError(f"Unsupported audio format: {response_format!r}")
     logger.warning("Unknown audio format '%s'; falling back to WAV", fmt)
     return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
 

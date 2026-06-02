@@ -293,6 +293,7 @@ async def _run_server(
     log_level: str = "info",
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
+    allowed_local_media_path: str | None = None,
 ) -> None:
     """Start the pipeline and run the OpenAI server.
 
@@ -334,6 +335,7 @@ async def _run_server(
             client,
             model_name=model_name or pipeline_config.name,
             enable_realtime=enable_realtime,
+            allowed_local_media_path=allowed_local_media_path,
         )
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
@@ -401,6 +403,7 @@ def launch_server(
     log_level: str = "info",
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
+    allowed_local_media_path: str | None = None,
 ) -> None:
     """Blocking helper: start the pipeline and OpenAI-compatible server.
 
@@ -415,6 +418,8 @@ def launch_server(
             :class:`~sglang_omni.client.Client`.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
             endpoint (OpenAI Realtime API).
+        allowed_local_media_path: Directory allowed for ``file://`` media
+            references in TTS requests.
     """
     asyncio.run(
         _run_server(
@@ -425,5 +430,6 @@ def launch_server(
             log_level=log_level,
             client_kwargs=client_kwargs,
             enable_realtime=enable_realtime,
+            allowed_local_media_path=allowed_local_media_path,
         )
     )

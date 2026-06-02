@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
 # Shared / Common
@@ -159,11 +159,33 @@ class ChatCompletionStreamResponse(BaseModel):
 # Speech (TTS)
 # ---------------------------------------------------------------------------
 
+SUPPORTED_TTS_RESPONSE_FORMATS = frozenset({"wav", "mp3", "flac", "pcm", "aac", "opus"})
+SUPPORTED_TTS_LANGUAGES = frozenset(
+    {
+        "Auto",
+        "Chinese",
+        "English",
+        "Japanese",
+        "Korean",
+        "German",
+        "French",
+        "Russian",
+        "Portuguese",
+        "Spanish",
+        "Italian",
+    }
+)
+SUPPORTED_TTS_TASK_TYPES = frozenset({"Base", "CustomVoice", "VoiceDesign"})
+TTS_SPEED_MIN = 0.25
+TTS_SPEED_MAX = 4.0
+
 
 class SpeechReference(BaseModel):
     """Reference item for voice cloning in /v1/audio/speech."""
 
     audio_path: str | None = None
+    ref_audio: str | None = None
+    audio: str | None = None
     text: str | None = None
     vq_codes: list[list[int]] | list[int] | None = None
 
@@ -180,7 +202,10 @@ class CreateSpeechRequest(BaseModel):
     # Standard OpenAI fields
     model: str | None = None
     input: str
-    voice: str = "default"
+    voice: str = Field(
+        default="default",
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
     response_format: str = "wav"
     speed: float = 1.0
     stream: bool = False
@@ -194,11 +219,13 @@ class CreateSpeechRequest(BaseModel):
     ref_audio: str | None = None  # path or URL to reference audio
     ref_text: str | None = None  # transcript of reference audio
     references: list[SpeechReference] | None = None  # S2-Pro-style refs
+    x_vector_only_mode: bool | None = None
     token_count: int | None = None  # MOSS-TTS duration token target
     duration_tokens: int | None = None  # alias for token_count
 
     # Generation parameters
     max_new_tokens: int | None = None
+    initial_codec_chunk_frames: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -207,6 +234,103 @@ class CreateSpeechRequest(BaseModel):
 
     # Per-stage overrides (sglang-omni specific)
     stage_params: dict[str, dict[str, Any]] | None = None
+
+
+class SpeechVoiceMetadata(BaseModel):
+    """Metadata for an uploaded TTS voice."""
+
+    name: str
+    consent: str | None = None
+    created_at: int | None = None
+    file_size: int | None = None
+    mime_type: str | None = None
+    ref_text: str | None = None
+    speaker_description: str | None = None
+
+
+class SpeechVoiceListResponse(BaseModel):
+    """Response for GET /v1/audio/voices."""
+
+    voices: list[str] = Field(default_factory=lambda: ["default"])
+    uploaded_voices: list[SpeechVoiceMetadata] = Field(default_factory=list)
+    cache_stats: dict[str, int] = Field(default_factory=dict)
+
+
+class SpeechBatchItem(BaseModel):
+    """One item inside a batch speech request."""
+
+    model: str | None = None
+    input: str
+    voice: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
+    response_format: str | None = None
+    speed: float | None = None
+    stream: bool | None = None
+    task_type: str | None = None
+    language: str | None = None
+    instructions: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    references: list[SpeechReference] | None = None
+    x_vector_only_mode: bool | None = None
+    max_new_tokens: int | None = None
+    initial_codec_chunk_frames: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    seed: int | None = None
+    stage_params: dict[str, dict[str, Any]] | None = None
+
+
+class CreateSpeechBatchRequest(BaseModel):
+    """Batch text-to-speech request."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    model: str | None = None
+    voice: str = Field(
+        default="default",
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
+    response_format: str = "wav"
+    speed: float = 1.0
+    task_type: str | None = None
+    language: str | None = None
+    instructions: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    x_vector_only_mode: bool | None = None
+    max_new_tokens: int | None = None
+    initial_codec_chunk_frames: int | None = None
+    items: list[SpeechBatchItem]
+
+
+class SpeechWebSocketSessionConfig(BaseModel):
+    """Initial config message for /v1/audio/speech/stream."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: str = "session.config"
+    model: str | None = None
+    voice: str = Field(
+        default="default",
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
+    response_format: str = "pcm"
+    speed: float = 1.0
+    stream_audio: bool = True
+    split_granularity: str = "sentence"
+    task_type: str | None = None
+    language: str | None = None
+    instructions: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    x_vector_only_mode: bool | None = None
+    max_new_tokens: int | None = None
+    initial_codec_chunk_frames: int | None = None
 
 
 # ---------------------------------------------------------------------------

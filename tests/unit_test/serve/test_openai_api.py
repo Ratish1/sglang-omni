@@ -103,6 +103,24 @@ class SuccessfulSpeechClient:
             finish_reason="stop",
         )
 
+    async def speech(
+        self,
+        request: GenerateRequest,
+        *,
+        request_id: str,
+        response_format: str = "wav",
+        speed: float = 1.0,
+        allow_format_fallback: bool = True,
+    ):
+        from sglang_omni.client.types import SpeechResult
+
+        del request, request_id, speed, allow_format_fallback
+        return SpeechResult(
+            audio_bytes=b"RIFF",
+            mime_type=f"audio/{response_format}",
+            format=response_format,
+        )
+
 
 class SuccessfulTranscriptionClient:
     def __init__(self) -> None:
@@ -150,7 +168,44 @@ def test_non_streaming_http_faults_return_500(model_name: str) -> None:
         },
     )
     assert speech_resp.status_code == 500
-    assert "cuda out of memory" in speech_resp.json()["detail"]
+    assert speech_resp.json()["error"]["type"] == "InternalServerError"
+    assert "cuda out of memory" in speech_resp.json()["error"]["message"]
+
+
+def test_speech_endpoint_rejects_invalid_request_with_openai_error() -> None:
+    client = TestClient(create_app(SuccessfulSpeechClient(), model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "input": "hello",
+            "stream": True,
+            "response_format": "wav",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "message": "stream=true requires response_format='pcm'",
+            "type": "BadRequestError",
+            "param": "response_format",
+            "code": 400,
+        }
+    }
+
+
+def test_speech_endpoint_returns_binary_audio() -> None:
+    client = TestClient(create_app(SuccessfulSpeechClient(), model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={"input": "hello", "response_format": "wav"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"RIFF"
+    assert response.headers["content-type"] == "audio/wav"
 
 
 def test_chat_stream_failure_closes_without_done_sentinel() -> None:
@@ -254,6 +309,23 @@ def test_speech_request_records_explicit_generation_params() -> None:
         "temperature",
         "top_k",
     ]
+
+
+def test_speech_request_passes_issue_601_fields() -> None:
+    req = CreateSpeechRequest(
+        input="hello",
+        initial_codec_chunk_frames=8,
+        x_vector_only_mode=True,
+        response_format="pcm",
+        stream=True,
+    )
+
+    gen_req = build_speech_generate_request(req, "qwen3-tts")
+    tts_params = gen_req.metadata["tts_params"]
+
+    assert tts_params["initial_codec_chunk_frames"] == 8
+    assert tts_params["x_vector_only_mode"] is True
+    assert tts_params["response_format"] == "pcm"
 
 
 def test_transcription_request_builds_asr_generate_request() -> None:

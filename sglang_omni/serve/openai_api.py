@@ -20,7 +20,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     JSONResponse,
@@ -51,11 +51,19 @@ from sglang_omni.serve.protocol import (
     ChatCompletionStreamChoice,
     ChatCompletionStreamDelta,
     ChatCompletionStreamResponse,
-    CreateSpeechRequest,
     ModelCard,
     ModelList,
     TranscriptionResponse,
     UsageResponse,
+)
+from sglang_omni.serve.speech_errors import (
+    SpeechAPIError,
+    internal_error,
+    speech_error_response,
+)
+from sglang_omni.serve.speech_service import (
+    SpeechService,
+    build_speech_generate_request,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +86,7 @@ def create_app(
     *,
     model_name: str | None = None,
     enable_realtime: bool = False,
+    allowed_local_media_path: str | None = None,
 ) -> FastAPI:
     """Create a FastAPI application with OpenAI-compatible endpoints.
 
@@ -86,6 +95,8 @@ def create_app(
         model_name: Default model name to report in responses and /v1/models.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
             endpoint (OpenAI Realtime API).
+        allowed_local_media_path: Directory allowed for ``file://`` TTS
+            reference audio.
 
     Returns:
         Configured FastAPI application.
@@ -104,6 +115,12 @@ def create_app(
     app.state.client = client
     app.state.model_name = model_name or "sglang-omni"
     app.state.realtime_enabled = enable_realtime
+    app.state.speech_service = SpeechService(
+        default_model=app.state.model_name,
+        allowed_local_media_paths=(
+            [allowed_local_media_path] if allowed_local_media_path else None
+        ),
+    )
 
     # Register all routes
     register_favicon(app)
@@ -497,13 +514,17 @@ def _register_realtime(app: FastAPI) -> None:
 
 def _register_speech(app: FastAPI) -> None:
     @app.post("/v1/audio/speech")
-    async def create_speech(req: CreateSpeechRequest) -> Response:
+    async def create_speech(payload: Any = Body(...)) -> Response:
         client: Client = app.state.client
-        default_model: str = app.state.model_name
+        speech_service: SpeechService = app.state.speech_service
 
         request_id = f"speech-{uuid.uuid4()}"
+        try:
+            req = speech_service.parse_request(payload)
+            gen_req = speech_service.build_generate_request(req)
+        except SpeechAPIError as exc:
+            return speech_error_response(exc)
 
-        gen_req = build_speech_generate_request(req, default_model)
         if req.stream:
             return StreamingResponse(
                 _speech_stream(
@@ -522,12 +543,13 @@ def _register_speech(app: FastAPI) -> None:
                 request_id=request_id,
                 response_format=req.response_format,
                 speed=req.speed,
+                allow_format_fallback=False,
             )
         except ClientError as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            return speech_error_response(internal_error(str(exc)))
         except Exception as exc:
             logger.exception("Error generating speech for request %s", request_id)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            return speech_error_response(internal_error(str(exc)))
 
         headers = {
             "Content-Disposition": f'attachment; filename="speech.{result.format}"',
@@ -583,6 +605,7 @@ async def _speech_stream(
             response_format=response_format,
             sample_rate=sample_rate,
             speed=speed,
+            allow_format_fallback=False,
         )
         actual_format = MIME_TO_FORMAT.get(mime_type, response_format)
         payload = {
@@ -633,98 +656,6 @@ def _select_speech_audio_delta(
     if total_samples <= emitted_samples:
         return None, emitted_samples
     return audio[emitted_samples:], total_samples
-
-
-def build_speech_generate_request(
-    req: CreateSpeechRequest,
-    default_model: str,
-) -> GenerateRequest:
-    """Convert a CreateSpeechRequest into a client GenerateRequest."""
-
-    generation_fields = (
-        "max_new_tokens",
-        "temperature",
-        "top_p",
-        "top_k",
-        "repetition_penalty",
-        "seed",
-    )
-    explicit_generation_params = sorted(
-        field for field in generation_fields if field in req.model_fields_set
-    )
-
-    # Build TTS-specific parameters to pass through the pipeline
-    tts_params: dict[str, Any] = {
-        "voice": req.voice,
-        "response_format": req.response_format,
-        "speed": req.speed,
-    }
-    if explicit_generation_params:
-        tts_params["explicit_generation_params"] = explicit_generation_params
-    if req.task_type is not None:
-        tts_params["task_type"] = req.task_type
-    if req.language is not None:
-        tts_params["language"] = req.language
-    if req.instructions is not None:
-        tts_params["instructions"] = req.instructions
-    if req.ref_audio is not None:
-        tts_params["ref_audio"] = req.ref_audio
-    if req.ref_text is not None:
-        tts_params["ref_text"] = req.ref_text
-    if req.token_count is not None:
-        tts_params["token_count"] = req.token_count
-    if req.duration_tokens is not None:
-        tts_params["duration_tokens"] = req.duration_tokens
-    if req.seed is not None:
-        tts_params["seed"] = req.seed
-
-    # Sampling params — use S2-Pro-tuned defaults
-    sampling = SamplingParams(
-        temperature=0.8, top_p=0.8, top_k=30, repetition_penalty=1.1
-    )
-    if req.max_new_tokens is not None:
-        sampling.max_new_tokens = req.max_new_tokens
-    if req.temperature is not None:
-        sampling.temperature = req.temperature
-    if req.top_p is not None:
-        sampling.top_p = req.top_p
-    if req.top_k is not None:
-        sampling.top_k = req.top_k
-    if req.repetition_penalty is not None:
-        sampling.repetition_penalty = req.repetition_penalty
-    if req.seed is not None:
-        sampling.seed = req.seed
-
-    # Build prompt: plain string if no references, dict otherwise
-    prompt: Any = req.input
-    references: list[dict[str, Any]] = []
-    if req.references:
-        references.extend(
-            [reference.model_dump(exclude_none=True) for reference in req.references]
-        )
-
-    # Backward compatibility with ref_audio/ref_text form.
-    if req.ref_audio is not None:
-        ref: dict[str, Any] = {"audio_path": req.ref_audio}
-        if req.ref_text is not None:
-            ref["text"] = req.ref_text
-        references.append(ref)
-
-    if references:
-        prompt = {"text": req.input, "references": references}
-
-    return GenerateRequest(
-        model=req.model or default_model,
-        prompt=prompt,
-        sampling=sampling,
-        stage_params=req.stage_params,
-        stream=req.stream,
-        output_modalities=["audio"],
-        metadata={
-            "task": "tts",
-            "tts_params": tts_params,
-        },
-    )
 
 
 _build_speech_generate_request = build_speech_generate_request
