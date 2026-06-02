@@ -139,13 +139,13 @@ Reference output:
 
 Unlike a standard request where you wait for the full audio to be generated before receiving anything, streaming lets you start receiving and playing audio **while generation is still in progress**. This significantly reduces time-to-first-audio, which matters for real-time or interactive use cases.
 
-Higgs TTS implements streaming via [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events). Each SSE event carries a base64-encoded WAV chunk. Your client can decode and play each chunk as it arrives, rather than buffering the entire response.
+Higgs TTS implements streaming via [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events). Each SSE event carries a base64-encoded PCM chunk. Your client can decode and play each chunk as it arrives, rather than buffering the entire response.
 
-Enable streaming by setting `"stream": true` in the request body. During generation, the vocoder emits incremental audio chunks; the terminal event is intentionally slim and carries metadata such as `sample_rate` and `usage` instead of repeating the full waveform. Inside the pipeline, audio chunks use the compact `audio_waveform` payload (`bytes` plus `audio_waveform_shape`, `audio_waveform_dtype`, and `sample_rate`), which the HTTP layer encodes into the SSE `audio.data` field.
+Enable streaming by setting `"stream": true` and `"response_format": "pcm"` in the request body. During generation, the vocoder emits incremental audio chunks; the terminal event is intentionally slim and carries metadata such as `sample_rate` and `usage` instead of repeating the full waveform. Inside the pipeline, audio chunks use the compact `audio_waveform` payload (`bytes` plus `audio_waveform_shape`, `audio_waveform_dtype`, and `sample_rate`), which the HTTP layer encodes into the SSE `audio.data` field.
 
 1. Use curl
 
-Set `"stream": true` in your request body:
+Set `"stream": true` and `"response_format": "pcm"` in your request body:
 
 ```bash
 curl -N -X POST http://localhost:8000/v1/audio/speech \
@@ -156,7 +156,8 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
       "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
       "text": "We asked over twenty different people, and they all said it was his."
     }],
-    "stream": true
+    "stream": true,
+    "response_format": "pcm"
   }'
 ```
 The `-N` flag disables curl's output buffering so SSE events are printed as they arrive.
@@ -166,9 +167,11 @@ The `-N` flag disables curl's output buffering so SSE events are printed as they
 This example decodes each chunk and writes it to a WAV file incrementally. In a real application, you would pipe the decoded bytes directly to an audio player (e.g., via `pyaudio` or `sounddevice`).
 
 ```python
-import requests
 import base64
 import json
+import wave
+
+import requests
 
 REFERENCE_AUDIO = "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav"
 REFERENCE_TEXT = "We asked over twenty different people, and they all said it was his."
@@ -180,27 +183,34 @@ with requests.post(
         "input": SPEECH_INPUT,
         "references": [{"audio_path": REFERENCE_AUDIO, "text": REFERENCE_TEXT}],
         "stream": True,
+        "response_format": "pcm",
     },
     stream=True,
 ) as resp:
     resp.raise_for_status()
-    with open("output_streaming.wav", "wb") as f:
-        for line in resp.iter_lines():
-            if not line or line == b"data: [DONE]":
-                continue
-            if not line.startswith(b"data: "):
-                continue
+    chunks = []
+    for line in resp.iter_lines():
+        if not line or line == b"data: [DONE]":
+            continue
+        if not line.startswith(b"data: "):
+            continue
 
-            event = json.loads(line[len(b"data: "):])
+        event = json.loads(line[len(b"data: "):])
 
-            if event.get("finish_reason") == "stop":
-                break
+        if event.get("finish_reason") == "stop":
+            break
 
-            audio_data = event.get("audio") or {}
-            if audio_data.get("data"):
-                chunk = base64.b64decode(audio_data["data"])
-                f.write(chunk)
-                # In a real app: feed `chunk` to your audio player here
+        audio_data = event.get("audio") or {}
+        if audio_data.get("data"):
+            chunk = base64.b64decode(audio_data["data"])
+            chunks.append(chunk)
+            # In a real app: feed `chunk` to your audio player here
+
+with wave.open("output_streaming.wav", "wb") as f:
+    f.setnchannels(1)
+    f.setsampwidth(2)
+    f.setframerate(24000)
+    f.writeframes(b"".join(chunks))
 ```
 
 Reference output:
@@ -213,7 +223,7 @@ Reference output:
 #### What the SSE response looks like
 Each event follows the standard SSE format:
 ```
-data: {"id": "speech-...", "object": "audio.speech.chunk", "index": 0, "audio": {"data": "<base64-encoded WAV bytes>", "format": "wav", ...}, "finish_reason": null}
+data: {"id": "speech-...", "object": "audio.speech.chunk", "index": 0, "audio": {"data": "<base64-encoded PCM bytes>", "format": "pcm", ...}, "finish_reason": null}
 data: {"id": "speech-...", "object": "audio.speech.chunk", "index": 1, "audio": null, "finish_reason": "stop", "usage": {...}}
 data: [DONE]
 ```

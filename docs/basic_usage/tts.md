@@ -38,6 +38,17 @@ sgl-omni serve \
   --port 8000
 ```
 
+Local `file://` reference audio is disabled by default. To allow local
+reference files, launch with an explicit directory:
+
+```bash
+sgl-omni serve \
+  --model-path fishaudio/s2-pro \
+  --config examples/configs/s2pro_tts.yaml \
+  --allowed-local-media-path /path/to/reference-audio \
+  --port 8000
+```
+
 For Voxtral:
 
 ```bash
@@ -144,7 +155,9 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 2. Streaming
 
-Enable streaming to receive audio chunks in real time via Server-Sent Events (SSE). Set `"stream": true`:
+Enable streaming to receive audio chunks in real time via Server-Sent Events
+(SSE). HTTP streaming uses raw PCM chunks, so set both `"stream": true` and
+`"response_format": "pcm"`:
 
 ```bash
 curl -N -X POST http://localhost:8000/v1/audio/speech \
@@ -155,11 +168,14 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
       "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
       "text": "We asked over twenty different people, and they all said it was his."
     }],
-    "stream": true
+    "stream": true,
+    "response_format": "pcm"
   }'
 ```
 
-The server returns a stream of SSE events. Each event contains an `audio.speech.chunk` object with a base64-encoded audio chunk. The stream ends with `data: [DONE]`.
+The server returns a stream of SSE events. Each event contains an
+`audio.speech.chunk` object with a base64-encoded PCM chunk. The stream ends
+with `data: [DONE]`.
 
 ## Use Python
 
@@ -207,7 +223,7 @@ with open("output.wav", "wb") as f:
 2. Streaming Request
 
 ```python
-import base64, io, json, wave
+import base64, json, wave
 
 import requests
 
@@ -215,11 +231,10 @@ payload = {
     "input": SPEECH_INPUT,
     "references": [{"audio_path": REFERENCE_AUDIO, "text": REFERENCE_TEXT}],
     "stream": True,
-    "response_format": "wav",
+    "response_format": "pcm",
 }
 
 chunks = []
-fmt = None
 with requests.post(
     "http://localhost:8000/v1/audio/speech",
     json=payload,
@@ -236,17 +251,12 @@ with requests.post(
         b64 = (json.loads(data).get("audio") or {}).get("data")
         if not b64:
             continue
-        with wave.open(io.BytesIO(base64.b64decode(b64)), "rb") as w:
-            if fmt is None:
-                fmt = w.getnchannels(), w.getsampwidth(), w.getframerate()
-            chunks.append(w.readframes(w.getnframes()))
+        chunks.append(base64.b64decode(b64))
 
-assert fmt
-nc, sw, fr = fmt
 with wave.open("output_stream.wav", "wb") as w:
-    w.setnchannels(nc)
-    w.setsampwidth(sw)
-    w.setframerate(fr)
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(24000)
     w.writeframes(b"".join(chunks))
 ```
 
@@ -258,21 +268,36 @@ The table below lists all parameters accepted by the `/v1/audio/speech` endpoint
 |---|---|---|---|
 | `input` | string | (required) | Text to synthesize |
 | `voice` | string | `"default"` | Voice identifier |
-| `response_format` | string | `"wav"` | Output audio format |
-| `speed` | float | `1.0` | Playback speed multiplier |
-| `stream` | bool | `false` | Enable streaming via SSE |
-| `references` | list | `null` | Reference audio for voice cloning; each item has `audio_path` (local path / remote url) and `text` |
-| `ref_audio` | string | `null` | Reference audio path / URL / base64 string; equivalent to `references[0].audio_path` |
+| `response_format` | string | `"wav"` | Output audio format: `wav`, `mp3`, `flac`, `pcm`, `aac`, or `opus` |
+| `speed` | float | `1.0` | Playback speed multiplier from `0.25` to `4.0` |
+| `stream` | bool | `false` | Enable streaming via SSE; when true, `response_format` must be `pcm` |
+| `references` | list | `null` | Reference audio for voice cloning; each item has `audio_path` (remote URL, data URL, or allowed `file://` URI) and `text` |
+| `ref_audio` | string | `null` | Reference audio URL, allowed `file://` URI, or base64 data URL; equivalent to `references[0].audio_path` |
 | `ref_text` | string | `null` | Transcript for `ref_audio`; equivalent to `references[0].text` |
-| `language` | string | `null` | Model-specific language hint; Qwen3-TTS Base defaults to `auto` |
+| `language` | string | `null` | Language hint: `Auto`, `Chinese`, `English`, `Japanese`, `Korean`, `German`, `French`, `Russian`, `Portuguese`, `Spanish`, or `Italian` |
 | `task_type` | string | `null` | Qwen3-TTS task type: `Base`, `CustomVoice`, or `VoiceDesign`; inferred as `Base` when reference audio/text is present, otherwise `CustomVoice` |
 | `instructions` | string | `null` | Qwen3-TTS style or VoiceDesign instructions |
 | `max_new_tokens` | int | `null` | Maximum number of generated tokens |
+| `initial_codec_chunk_frames` | int | `null` | Initial codec chunk size hint for streaming-capable TTS models |
+| `x_vector_only_mode` | bool | `null` | Qwen3-TTS Base speaker-embedding mode |
 | `temperature` | float | `null` | Sampling temperature |
 | `top_p` | float | `null` | Top-p sampling |
 | `top_k` | int | `null` | Top-k sampling |
 | `repetition_penalty` | float | `null` | Repetition penalty |
 | `seed` | int | `null` | Model-specific; Qwen3-TTS Base accepts request-scoped seed, Voxtral TTS currently rejects seed |
+
+Invalid speech requests return an OpenAI-style error envelope:
+
+```json
+{
+  "error": {
+    "message": "stream=true requires response_format='pcm'",
+    "type": "BadRequestError",
+    "param": "response_format",
+    "code": 400
+  }
+}
+```
 
 ## H200 SeedTTS Benchmark Commands
 
