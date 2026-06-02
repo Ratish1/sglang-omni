@@ -189,6 +189,8 @@ class SpeechWebSocketSession:
                 "session.config session must be an object",
                 param="session",
             )
+        self.speech_service.validate_raw_speech_fields(raw_config)
+        _validate_raw_session_fields(raw_config)
         config = SpeechStreamSessionConfig.model_validate(raw_config)
         if config.split_granularity not in SUPPORTED_SPLIT_GRANULARITIES:
             supported = ", ".join(sorted(SUPPORTED_SPLIT_GRANULARITIES))
@@ -200,11 +202,6 @@ class SpeechWebSocketSession:
             raise bad_request(
                 "stream_audio=true requires response_format='pcm'",
                 param="response_format",
-            )
-        if config.stream_audio and config.speed != 1.0:
-            raise bad_request(
-                "stream_audio=true requires speed=1.0",
-                param="speed",
             )
         self.speech_service.prepare_request(
             self._speech_request_from_config(config, "probe")
@@ -240,9 +237,13 @@ class SpeechWebSocketSession:
                     sentence,
                     request_id=request_id,
                 )
+        except asyncio.CancelledError:
+            failed = True
+            await self._abort_request(request_id)
+            raise
         except WebSocketDisconnect:
             failed = True
-            await self._abort_active_request()
+            await self._abort_request(request_id)
             raise
         except Exception as exc:
             failed = True
@@ -253,7 +254,8 @@ class SpeechWebSocketSession:
                 logger.exception("TTS WebSocket sentence failed: %s", request_id)
             await self._send_error(error)
         finally:
-            self.active_request_id = None
+            if self.active_request_id == request_id:
+                self.active_request_id = None
             if self.websocket.application_state == WebSocketState.CONNECTED:
                 await self._send_json(
                     {
@@ -287,12 +289,12 @@ class SpeechWebSocketSession:
                 audio_data,
                 response_format="pcm",
                 sample_rate=sample_rate,
-                speed=1.0,
+                speed=self.config.speed,
                 allow_format_fallback=False,
             )
             if not audio_bytes:
                 continue
-            await self.websocket.send_bytes(audio_bytes)
+            await self._send_audio_frame(audio_bytes, active_request_id=request_id)
             total_bytes += len(audio_bytes)
             chunk_count += 1
         if chunk_count == 0:
@@ -310,7 +312,9 @@ class SpeechWebSocketSession:
             speed=request.speed,
             allow_format_fallback=False,
         )
-        await self.websocket.send_bytes(result.audio_bytes)
+        if self.active_request_id == request_id:
+            self.active_request_id = None
+        await self._send_audio_frame(result.audio_bytes)
         return len(result.audio_bytes)
 
     def _speech_request_from_config(
@@ -405,9 +409,30 @@ class SpeechWebSocketSession:
             }
         )
 
+    async def _send_audio_frame(
+        self, audio_bytes: bytes, *, active_request_id: str | None = None
+    ) -> None:
+        try:
+            await self.websocket.send_bytes(audio_bytes)
+        except WebSocketDisconnect:
+            if active_request_id is not None:
+                await self._abort_request(active_request_id)
+            raise
+        except Exception as exc:
+            if active_request_id is not None:
+                await self._abort_request(active_request_id)
+            raise WebSocketDisconnect from exc
+
+    async def _abort_request(self, request_id: str) -> None:
+        if self.active_request_id != request_id:
+            return
+        self.active_request_id = None
+        if hasattr(self.client, "abort"):
+            await self.client.abort(request_id)
+
     async def _abort_active_request(self) -> None:
-        if self.active_request_id is not None and hasattr(self.client, "abort"):
-            await self.client.abort(self.active_request_id)
+        if self.active_request_id is not None:
+            await self._abort_request(self.active_request_id)
 
     async def teardown(self) -> None:
         self.closed = True
@@ -425,3 +450,18 @@ def _speech_error_from_exception(exc: Exception) -> SpeechAPIError:
         location = ".".join(str(item) for item in first_error.get("loc", ()))
         return bad_request(f"{location}: {message}" if location else str(message))
     return bad_request(str(exc))
+
+
+def _validate_raw_session_fields(payload: dict[str, Any]) -> None:
+    if "stream_audio" in payload and payload["stream_audio"] is not None:
+        if not isinstance(payload["stream_audio"], bool):
+            raise bad_request(
+                "stream_audio must be a boolean",
+                param="stream_audio",
+            )
+    if "split_granularity" in payload and payload["split_granularity"] is not None:
+        if not isinstance(payload["split_granularity"], str):
+            raise bad_request(
+                "split_granularity must be a string",
+                param="split_granularity",
+            )

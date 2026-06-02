@@ -85,7 +85,7 @@ class SpeechService:
 
         if not isinstance(payload, dict):
             raise bad_request("speech request body must be a JSON object")
-        self._validate_raw_payload(payload)
+        self.validate_raw_speech_fields(payload)
         try:
             request = CreateSpeechRequest.model_validate(payload)
         except ValidationError as exc:
@@ -97,6 +97,10 @@ class SpeechService:
 
         if not isinstance(payload, dict):
             raise bad_request("speech batch request body must be a JSON object")
+        default_payload = {
+            key: value for key, value in payload.items() if key != "items"
+        }
+        self.validate_raw_speech_fields(default_payload)
         try:
             request = CreateSpeechBatchRequest.model_validate(payload)
         except ValidationError as exc:
@@ -400,7 +404,7 @@ class SpeechService:
         payload = batch.model_dump(exclude={"items"}, exclude_none=True)
         item_payload = item.model_dump(exclude_none=True)
         payload.update(item_payload)
-        self._validate_raw_payload(payload)
+        self.validate_raw_speech_fields(payload)
         if item_payload.get("stream"):
             raise bad_request(
                 "stream is not supported for batch speech requests",
@@ -445,7 +449,7 @@ class SpeechService:
             )
         return uploaded_voice
 
-    def _validate_raw_payload(self, payload: dict[str, Any]) -> None:
+    def validate_raw_speech_fields(self, payload: dict[str, Any]) -> None:
         for field_name in (
             "model",
             "input",

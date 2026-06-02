@@ -221,9 +221,12 @@ items, fail the HTTP request.
 
 Use `/v1/audio/speech/stream` for stateful text input over a persistent
 WebSocket. The first message must be `session.config`. Then send `input.text`
-messages and finish with `input.done`. For `stream_audio=true`, the response
-format must be `pcm`; audio is sent as binary WebSocket frames between
-`audio.start` and `audio.done` JSON events.
+messages and finish with `input.done`. The server acknowledges the initial
+configuration with `session.configured`. `stream_audio` defaults to `false`;
+with that default, each completed text segment returns one binary audio frame
+between `audio.start` and `audio.done`. For `stream_audio=true`, the response
+format must be `pcm`, and audio is sent as incremental binary PCM frames
+between `audio.start` and `audio.done`.
 
 ```python
 import asyncio

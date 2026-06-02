@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from sglang_omni.client import ClientError
 from sglang_omni.client.types import SpeechResult
 from sglang_omni.serve import create_app
 from sglang_omni.serve.speech_service import SpeechService
@@ -61,6 +62,35 @@ class BlockingBatchSpeechClient:
         self.aborted.append(request_id)
 
 
+class MixedBatchSpeechClient:
+    def __init__(self) -> None:
+        self.requests: list[str] = []
+
+    def health(self) -> dict[str, Any]:
+        return {"running": True}
+
+    async def speech(
+        self,
+        request: Any,
+        *,
+        request_id: str,
+        response_format: str = "wav",
+        speed: float = 1.0,
+        allow_format_fallback: bool = True,
+    ) -> SpeechResult:
+        del request_id, speed, allow_format_fallback
+        self.requests.append(request.prompt)
+        if request.prompt == "slow":
+            await asyncio.sleep(0.01)
+        if request.prompt == "fail":
+            raise ClientError("model failed")
+        return SpeechResult(
+            audio_bytes=f"audio:{request.prompt}".encode(),
+            mime_type=f"audio/{response_format}",
+            format=response_format,
+        )
+
+
 def test_batch_speech_preserves_order_and_item_errors() -> None:
     client_impl = RecordingBatchSpeechClient()
     client = TestClient(
@@ -112,6 +142,33 @@ def test_batch_speech_rejects_invalid_envelope_before_item_work() -> None:
     assert client_impl.requests == []
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("speed", "1.2"),
+        ("max_new_tokens", "5"),
+        ("x_vector_only_mode", "true"),
+    ],
+)
+def test_batch_speech_rejects_stringified_default_types(
+    field_name: str, value: str
+) -> None:
+    client_impl = RecordingBatchSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech/batch",
+        json={
+            field_name: value,
+            "items": [{"input": "one"}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == field_name
+    assert client_impl.requests == []
+
+
 def test_batch_speech_rejects_streaming_items() -> None:
     client_impl = RecordingBatchSpeechClient()
     client = TestClient(create_app(client_impl, model_name="tts"))
@@ -126,6 +183,23 @@ def test_batch_speech_rejects_streaming_items() -> None:
     assert item["status"] == "error"
     assert item["error"]["param"] == "items.0.stream"
     assert client_impl.requests == []
+
+
+def test_batch_speech_isolates_runtime_failures_and_preserves_order() -> None:
+    client_impl = MixedBatchSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech/batch",
+        json={"items": [{"input": "slow"}, {"input": "fail"}, {"input": "fast"}]},
+    )
+
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert [item["index"] for item in results] == [0, 1, 2]
+    assert [item["status"] for item in results] == ["success", "error", "success"]
+    assert results[1]["error"]["type"] == "InternalServerError"
+    assert set(client_impl.requests) == {"slow", "fail", "fast"}
 
 
 def test_batch_speech_cancellation_aborts_started_items() -> None:
