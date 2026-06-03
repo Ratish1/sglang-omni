@@ -28,10 +28,16 @@ load stages, classifies every response, and writes structured artifacts.
 
 The harness exit code only describes the benchmark runner:
 
-- `0`: the harness ran and wrote `results.json`. The service can still fail the
-  benchmark through `overall.passed=false`.
-- non-zero: the harness could not run, such as an invalid spec or an unwritable
-  output directory.
+- `0`: the harness completed normally and wrote artifacts. The service can
+  still fail the benchmark through `overall.passed=false`.
+- non-zero: the harness hit an infrastructure or runtime error, such as an
+  invalid spec, artifact-write failure, or unhandled runner exception. When the
+  runner can still write artifacts, `results.json` records
+  `harness_status="error"` and `harness_error`.
+
+Use both the process exit code and `results.json`: the exit code reports
+whether the harness ran correctly, while `overall.passed` reports whether the
+target service passed the configured serving contracts.
 
 ## Harness Contract
 
@@ -98,6 +104,8 @@ Common `params` fields:
 | `speaker_max_uploaded` | Expected server-side uploaded-speaker cap. |
 | `voice_cache_pressure_voice_count` | Number of unique uploaded voices for cache-pressure stages. |
 | `voice_speaker_cap_count` | Upload-attempt budget for speaker-cap stages. |
+| `file_ref_audio` | Optional `file://` reference audio URI sent to the target service. Required for full speech reference coverage. The target service must be launched with an allowed-local-media path that contains this file. |
+| `file_ref_text` | Optional transcript for `file_ref_audio`; defaults to the SeedTTS reference text. |
 
 Load-stage fields:
 
@@ -107,7 +115,7 @@ Load-stage fields:
 | `mode` | `closed_loop`, `open_loop`, `ramp`, `burst`, or `soak`. |
 | `request_count` | Number of scheduled scenarios for the stage. |
 | `max_concurrency` | Maximum in-flight requests for the stage. |
-| `request_rate` | Requests per second for `open_loop` and `ramp`; derived from `duration_s` for `soak`. |
+| `request_rate` | Requests per second for `open_loop` and `ramp`. Do not set this for `soak`; it is derived from `request_count / duration_s`. |
 | `start_request_rate` | Initial requests per second for `ramp`. |
 | `duration_s` | Wall-clock duration for `soak`. |
 | `arrival_distribution` | `deterministic` or `poisson`. |
@@ -152,20 +160,24 @@ Run the image with a spec mounted at the contract path:
 
 ```bash
 docker run --rm \
+  --user "$(id -u):$(id -g)" \
   -v "$PWD/benchmarks/tts_serving/examples/stress.json:/etc/benchmark/spec.json:ro" \
   -v "$PWD/results/tts_serving/stress:/var/benchmark/out" \
   sglang-omni-tts-serving-benchmark
 ```
 
 When the target service is outside the container network, set `base_url` to an
-address reachable from the container.
+address reachable from the container. If `file_ref_audio` is configured, the
+URI must point to a file visible to the target service, not to a file inside the
+benchmark container.
 
 ## Scenario Matrix
 
 The matrix is deterministic for a given spec seed. It covers:
 
 - speech success paths across response formats, task types, speed boundaries,
-  reference-audio shapes, SDK calls, and SSE streaming
+  reference-audio shapes, allowed `file://` references, SDK calls, and SSE
+  streaming
 - malformed speech requests that must return OpenAI-compatible error envelopes
 - multilingual and adversarial text payloads
 - batch speech creation and item-level result validation
@@ -217,7 +229,7 @@ The output directory contains:
 
 ```text
 results.json          # summary, coverage contract, metrics, unsupported APIs
-manifest.json         # spec hash and artifact metadata
+manifest.json         # parsed-spec hash, scenario-set hash, and artifact metadata
 raw/*.jsonl           # per-scenario records
 logs/harness.log      # load-stage execution notes
 ```

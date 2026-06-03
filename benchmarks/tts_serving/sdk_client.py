@@ -14,11 +14,10 @@ from typing import Any
 
 from benchmarks.tts_serving.audio_validation import validate_audio_response
 from benchmarks.tts_serving.error_contract import is_openai_error_response
+from benchmarks.tts_serving.http_contracts import UNSUPPORTED_HTTP_STATUSES
 from benchmarks.tts_serving.metrics import ScenarioResult, finish_timing
 from benchmarks.tts_serving.scenarios import Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
-
-UNSUPPORTED_HTTP_STATUSES = {404, 405, 501}
 
 
 async def run_sdk_scenario(spec: BenchmarkSpec, scenario: Scenario) -> ScenarioResult:
@@ -34,6 +33,14 @@ async def run_sdk_scenario(spec: BenchmarkSpec, scenario: Scenario) -> ScenarioR
     try:
         await asyncio.to_thread(
             _run_openai_speech_create, spec, scenario, result, start
+        )
+    except Exception as exc:
+        result.status = "failed"
+        result.capability = "fail"
+        result.error_type = exc.__class__.__name__
+        result.error_class = "client_error"
+        result.error = (
+            f"OpenAI SDK benchmark scenario failed before classification: {exc}"
         )
     finally:
         finish_timing(result, start)

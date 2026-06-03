@@ -20,7 +20,6 @@ from benchmarks.tts_serving.scenarios import (
     SDK_RESPONSE_FORMATS,
     SPEED_BOUNDARY_VALUES,
     TASK_TYPES,
-    VOICE_NEAR_LIMIT_DEFERRED_FORMATS,
     VOICE_NEAR_LIMIT_FORMATS,
     VOICE_NEAR_LIMIT_GENERATED_FORMATS,
     VOICE_UPLOAD_REJECT_FORMATS,
@@ -70,17 +69,24 @@ def build_results_report(
         result.load_generator_lagged or result.load_generator_saturated
         for result in results
     )
-    voice_upload_coverage = _voice_upload_coverage(scenarios or [])
-    coverage_matrix = _coverage_matrix(spec, scenarios or [], voice_upload_coverage)
+    planned_scenarios = scenarios or []
+    executed_scenarios = _executed_scenarios(planned_scenarios, results)
+    planned_voice_upload_coverage = _voice_upload_coverage(planned_scenarios)
+    voice_upload_coverage = _voice_upload_coverage(executed_scenarios)
+    planned_coverage_matrix = _coverage_matrix(
+        spec, planned_scenarios, planned_voice_upload_coverage
+    )
+    coverage_matrix = _coverage_matrix(spec, executed_scenarios, voice_upload_coverage)
     coverage_failures = _coverage_failures(
         spec,
-        scenarios or [],
+        executed_scenarios,
         voice_upload_coverage,
         coverage_matrix,
     )
     coverage_contract_valid = not coverage_failures
     passed = (
         harness_status == "ok"
+        and total > 0
         and load_generation_valid
         and coverage_contract_valid
         and _is_benchmark_passed(spec, results, capabilities)
@@ -115,6 +121,8 @@ def build_results_report(
             "stage_request_total": sum(
                 stage.request_count for stage in spec.params.load_stages
             ),
+            "planned_scenario_total": len(planned_scenarios),
+            "executed_coverage_scenario_total": len(executed_scenarios),
             "max_concurrency": spec.params.max_concurrency,
             "concurrency_levels": list(
                 spec.params.concurrency_levels or (spec.params.max_concurrency,)
@@ -195,6 +203,7 @@ def build_results_report(
         ),
         "coverage_failures": coverage_failures,
         "coverage_matrix": coverage_matrix,
+        "planned_coverage_matrix": planned_coverage_matrix,
     }
 
 
@@ -212,6 +221,28 @@ def _result_passed(spec: BenchmarkSpec, result: ScenarioResult) -> bool:
     if result.expected_success:
         return result.success
     return result.status == "expected_error"
+
+
+def _executed_scenarios(
+    scenarios: list[Scenario],
+    results: list[ScenarioResult],
+) -> list[Scenario]:
+    executable_result_ids = {
+        result.scenario_id
+        for result in results
+        if _result_reached_contract_classifier(result)
+    }
+    return [scenario for scenario in scenarios if scenario.id in executable_result_ids]
+
+
+def _result_reached_contract_classifier(result: ScenarioResult) -> bool:
+    if result.status in {"load_generator_saturated", "transport_error"}:
+        return False
+    if result.load_generator_saturated:
+        return False
+    if result.error_class in {"transport_error", "client_error"}:
+        return False
+    return True
 
 
 def _operation_capabilities(results: list[ScenarioResult]) -> dict[str, str]:
@@ -386,9 +417,6 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
     generated_near_limit_formats = [
         upload_format for upload_format, _ in VOICE_NEAR_LIMIT_GENERATED_FORMATS
     ]
-    deferred_near_limit_formats = [
-        upload_format for upload_format, _ in VOICE_NEAR_LIMIT_DEFERRED_FORMATS
-    ]
     near_limit_missing_generated_formats = sorted(
         set(generated_near_limit_formats) - set(near_limit_formats)
     )
@@ -399,7 +427,6 @@ def _voice_upload_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
         "near_limit_formats": sorted(near_limit_formats),
         "configured_near_limit_formats": configured_near_limit_formats,
         "generated_near_limit_formats": generated_near_limit_formats,
-        "deferred_near_limit_formats": deferred_near_limit_formats,
         "near_limit_missing_generated_formats": near_limit_missing_generated_formats,
         "near_limit_contract_complete": not near_limit_missing_generated_formats,
         "metadata_sequence_present": any(
@@ -575,6 +602,7 @@ def _speech_coverage_matrix(
                 {
                     "valid_reference",
                     "valid_base64_ref_audio",
+                    "valid_file_ref_audio",
                     "x_vector_only_mode",
                     *(case for case, _ in REFERENCE_FAILURES),
                 },
@@ -583,6 +611,7 @@ def _speech_coverage_matrix(
             expected=[
                 "valid_reference",
                 "valid_base64_ref_audio",
+                "valid_file_ref_audio",
                 "x_vector_only_mode",
                 *(case for case, _ in REFERENCE_FAILURES),
             ],
@@ -776,17 +805,6 @@ def _voice_coverage_matrix(
             tested=voice_upload_coverage["near_limit_contract_complete"],
             expected=voice_upload_coverage["generated_near_limit_formats"],
             observed=voice_upload_coverage["near_limit_formats"],
-        ),
-        _coverage_matrix_row(
-            spec,
-            "voices.near_limit_deferred_formats",
-            tested=False,
-            expected=voice_upload_coverage["deferred_near_limit_formats"],
-            observed=[],
-            out_of_scope_reason=(
-                "format-valid near-limit padding is not implemented for these "
-                "container formats"
-            ),
         ),
         _coverage_matrix_row(
             spec,
@@ -1050,6 +1068,7 @@ def _speech_coverage_failures(scenarios: list[Scenario]) -> list[dict[str, Any]]
             {
                 "valid_reference",
                 "valid_base64_ref_audio",
+                "valid_file_ref_audio",
                 "x_vector_only_mode",
                 *(case for case, _ in REFERENCE_FAILURES),
             },

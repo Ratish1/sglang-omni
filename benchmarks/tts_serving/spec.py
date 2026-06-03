@@ -52,6 +52,8 @@ PARAM_KEYS = {
     "enabled_endpoints",
     "seedtts_ref_audio",
     "seedtts_ref_text",
+    "file_ref_audio",
+    "file_ref_text",
     "voice_cache_pressure_voice_count",
     "voice_speaker_cap_count",
     "speaker_max_uploaded",
@@ -124,6 +126,11 @@ class LoadStage:
         if mode not in VALID_LOAD_MODES:
             raise SpecError(
                 f"params.load_stages[].mode must be one of {sorted(VALID_LOAD_MODES)}"
+            )
+        if mode == "soak" and "request_rate" in obj:
+            raise SpecError(
+                "params.load_stages[].request_rate is derived from request_count "
+                "and duration_s for soak stages"
             )
 
         request_count = _positive_int(
@@ -234,6 +241,8 @@ class BenchmarkParams:
     enabled_endpoints: tuple[str, ...] = DEFAULT_ENDPOINTS
     seedtts_ref_audio: str | None = None
     seedtts_ref_text: str | None = None
+    file_ref_audio: str | None = None
+    file_ref_text: str | None = None
     voice_cache_pressure_voice_count: int = 0
     voice_speaker_cap_count: int = 0
     speaker_max_uploaded: int = DEFAULT_SPEAKER_MAX_UPLOADED
@@ -304,6 +313,8 @@ class BenchmarkParams:
             enabled_endpoints=enabled,
             seedtts_ref_audio=_optional_str(obj, "seedtts_ref_audio"),
             seedtts_ref_text=_optional_str(obj, "seedtts_ref_text"),
+            file_ref_audio=_optional_file_uri(obj, "file_ref_audio"),
+            file_ref_text=_optional_str(obj, "file_ref_text"),
             voice_cache_pressure_voice_count=voice_cache_pressure_voice_count,
             voice_speaker_cap_count=voice_speaker_cap_count,
             speaker_max_uploaded=speaker_max_uploaded,
@@ -403,6 +414,16 @@ def _optional_str(obj: dict[str, Any], key: str) -> str | None:
         return None
     if not isinstance(value, str) or not value.strip():
         raise SpecError(f"{key} must be a non-empty string when provided")
+    return value
+
+
+def _optional_file_uri(obj: dict[str, Any], key: str) -> str | None:
+    value = _optional_str(obj, key)
+    if value is None:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme != "file" or not parsed.path:
+        raise SpecError(f"params.{key} must be a file:// URI when provided")
     return value
 
 

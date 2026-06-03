@@ -50,20 +50,8 @@ VOICE_UPLOAD_SUCCESS_FORMATS = (
 )
 VOICE_UPLOAD_REJECT_FORMATS = VOICE_UPLOAD_SUCCESS_FORMATS[1:]
 VOICE_NEAR_LIMIT_FORMATS = VOICE_UPLOAD_SUCCESS_FORMATS
-VOICE_NEAR_LIMIT_GENERATED_FORMATS = (
-    ("wav", "audio/wav"),
-    ("mp3", "audio/mpeg"),
-    ("flac", "audio/flac"),
-    ("mp4", "audio/mp4"),
-)
-VOICE_NEAR_LIMIT_GENERATED_FORMAT_NAMES = frozenset(
-    upload_format for upload_format, _ in VOICE_NEAR_LIMIT_GENERATED_FORMATS
-)
-VOICE_NEAR_LIMIT_DEFERRED_FORMATS = tuple(
-    format_pair
-    for format_pair in VOICE_NEAR_LIMIT_FORMATS
-    if format_pair[0] not in VOICE_NEAR_LIMIT_GENERATED_FORMAT_NAMES
-)
+VOICE_NEAR_LIMIT_GENERATED_FORMATS = VOICE_NEAR_LIMIT_FORMATS
+VOICE_NEAR_LIMIT_DEFERRED_FORMATS: tuple[tuple[str, str], ...] = ()
 VOICE_SMALL_UPLOAD_BYTES = VOICE_UPLOAD_WAV_FIXTURE_SIZE
 VOICE_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 VOICE_NEAR_LIMIT_BYTES = VOICE_MAX_UPLOAD_BYTES - 1
@@ -200,10 +188,8 @@ def _build_stage_scenarios(spec: BenchmarkSpec, stage: LoadStage) -> list[Scenar
     required_scenarios = _required_stage_scenarios(spec, stage, endpoint_set)
     if _stage_voice_speaker_cap_count(spec, stage):
         return required_scenarios
-    scenarios = required_scenarios[: stage.request_count]
-    if any(scenario.method == "VOICE_SPEAKER_CAP_SEQUENCE" for scenario in scenarios):
-        return scenarios
-    for index in range(len(scenarios), stage.request_count):
+    scenarios = list(required_scenarios)
+    for index in range(len(scenarios), max(stage.request_count, len(scenarios))):
         scenarios.append(
             _weighted_scenario(
                 index=index,
@@ -274,6 +260,9 @@ def _required_stage_scenarios(
         next_index += 1
         speech_edges.append(_speech_reference_base64_success(next_index, spec, stage))
         next_index += 1
+        if spec.params.file_ref_audio:
+            speech_edges.append(_speech_reference_file_success(next_index, spec, stage))
+            next_index += 1
         speech_edges.append(_speech_reference_xvector_only(next_index, spec, stage))
         next_index += 1
         for reference_case, ref_audio in REFERENCE_FAILURES:
@@ -771,6 +760,28 @@ def _speech_reference_base64_success(
         expected_status_class="success",
         description="valid base64 ref_audio voice cloning request",
         planned_metadata={"reference_case": "valid_base64_ref_audio"},
+    )
+
+
+def _speech_reference_file_success(
+    index: int, spec: BenchmarkSpec, stage: LoadStage
+) -> Scenario:
+    payload = _base_payload(spec, BASE_TEXTS[index % len(BASE_TEXTS)])
+    payload["task_type"] = "Base"
+    payload["ref_audio"] = spec.params.file_ref_audio
+    payload["ref_text"] = spec.params.file_ref_text or _reference_text(spec)
+    payload["response_format"] = "wav"
+    return Scenario(
+        id=_scenario_id(stage, "speech_reference_file", index),
+        endpoint="speech",
+        category="speech_reference",
+        stage_id=stage.id,
+        capability_key="speech.reference",
+        payload=payload,
+        expect_success=True,
+        expected_status_class="success",
+        description="valid file:// ref_audio voice cloning request",
+        planned_metadata={"reference_case": "valid_file_ref_audio"},
     )
 
 
@@ -1607,8 +1618,7 @@ def _websocket_normal(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
             },
             {"action": "send_json", "payload": {"type": "input.done"}},
             {"action": "expect", "event": "audio.start"},
-            {"action": "expect", "event": "audio"},
-            {"action": "expect", "event": "audio.done"},
+            {"action": "expect_audio_until_done"},
             {"action": "expect", "event": "session.done"},
         ],
         description="stateful WebSocket speech stream",
@@ -1647,11 +1657,9 @@ def _websocket_multi_sentence(
             },
             {"action": "send_json", "payload": {"type": "input.done"}},
             {"action": "expect", "event": "audio.start"},
-            {"action": "expect", "event": "audio"},
-            {"action": "expect", "event": "audio.done"},
+            {"action": "expect_audio_until_done"},
             {"action": "expect", "event": "audio.start"},
-            {"action": "expect", "event": "audio"},
-            {"action": "expect", "event": "audio.done"},
+            {"action": "expect_audio_until_done"},
             {"action": "expect", "event": "session.done"},
         ],
         description="WebSocket speech stream with multiple sentence boundaries",
@@ -1730,14 +1738,11 @@ def _websocket_clause_split(
             },
             {"action": "send_json", "payload": {"type": "input.done"}},
             {"action": "expect", "event": "audio.start"},
-            {"action": "expect", "event": "audio"},
-            {"action": "expect", "event": "audio.done"},
+            {"action": "expect_audio_until_done"},
             {"action": "expect", "event": "audio.start"},
-            {"action": "expect", "event": "audio"},
-            {"action": "expect", "event": "audio.done"},
+            {"action": "expect_audio_until_done"},
             {"action": "expect", "event": "audio.start"},
-            {"action": "expect", "event": "audio"},
-            {"action": "expect", "event": "audio.done"},
+            {"action": "expect_audio_until_done"},
             {"action": "expect", "event": "session.done"},
         ],
         description="WebSocket speech stream with clause-level splitting",

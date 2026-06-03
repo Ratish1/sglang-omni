@@ -31,7 +31,9 @@ MAX_PRINTABLE_ASCII_RATIO = 0.95
 COMPRESSED_DECODE_TIMEOUT_S = 10
 FFMPEG_DECODE_CHANNELS = 1
 
-PCM_CONTENT_TYPES = frozenset({"application/octet-stream", "audio/pcm", "audio/raw"})
+PCM_CONTENT_TYPES = frozenset(
+    {"application/octet-stream", "audio/pcm", "audio/raw", ""}
+)
 EXPECTED_AUDIO_CONTENT_TYPES = {
     "wav": {"audio/wav", "audio/x-wav", "application/octet-stream", ""},
     "pcm": PCM_CONTENT_TYPES,

@@ -6,11 +6,13 @@ from __future__ import annotations
 import asyncio
 import binascii
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
 
 from benchmarks.tts_serving.audio_validation import (
+    MIN_PCM_AUDIO_BYTES,
     PCM_CONTENT_TYPES,
     validate_audio_response,
     validate_pcm_chunk,
@@ -48,6 +50,13 @@ from benchmarks.tts_serving.voice_client import (
     run_voice_upload_delete_race,
     run_voice_upload_metadata_sequence,
 )
+
+
+@dataclass
+class SseAudioState:
+    total_bytes: int = 0
+    duration_s: float = 0.0
+    has_signal: bool = False
 
 
 async def run_http_scenario(
@@ -116,6 +125,12 @@ async def run_http_scenario(
         result.error_type = exc.__class__.__name__
         result.error_class = "transport_error"
         result.error = str(exc)
+    except Exception as exc:
+        result.status = "failed"
+        result.capability = "fail"
+        result.error_type = exc.__class__.__name__
+        result.error_class = "client_error"
+        result.error = f"HTTP benchmark scenario failed before classification: {exc}"
     finally:
         finish_timing(result, start)
     return result
@@ -171,13 +186,14 @@ async def _handle_binary_response(
             _mark_unexpected_success(result, scenario)
             return
         if scenario.endpoint == "batch":
-            handle_batch_success(body, result, scenario)
+            await asyncio.to_thread(handle_batch_success, body, result, scenario)
             return
         if scenario.endpoint == "voices":
             handle_voice_success(body, result, scenario)
             return
         response_format = str(scenario.payload.get("response_format", ""))
-        validation = validate_audio_response(
+        validation = await asyncio.to_thread(
+            validate_audio_response,
             body,
             response_format=response_format,
             content_type=response.headers.get("Content-Type"),
@@ -235,7 +251,7 @@ async def _handle_sse_response(
         return
 
     buffer = bytearray()
-    audio_buffer = bytearray()
+    audio_state = SseAudioState()
     chunk_times: list[float] = []
     saw_done = False
     async for chunk in response.content.iter_any():
@@ -250,7 +266,7 @@ async def _handle_sse_response(
                     start,
                     chunk_times,
                     scenario,
-                    audio_buffer,
+                    audio_state,
                 )
                 or saw_done
             )
@@ -266,7 +282,7 @@ async def _handle_sse_response(
                 start,
                 chunk_times,
                 scenario,
-                audio_buffer,
+                audio_state,
             )
             or saw_done
         )
@@ -292,20 +308,26 @@ async def _handle_sse_response(
         )
         result.response_bytes = result.audio_bytes
         return
-    validation = validate_audio_response(
-        bytes(audio_buffer),
-        response_format="pcm",
-        content_type="audio/pcm",
-    )
-    if not validation.ok:
+    if audio_state.total_bytes < MIN_PCM_AUDIO_BYTES:
         _mark_protocol_error(
             result,
             status="invalid_sse_response",
-            error=f"SSE stream completed with invalid aggregate PCM: {validation.error}",
+            error=(
+                "SSE stream completed before the minimum generated-audio duration "
+                f"(bytes={audio_state.total_bytes}, minimum={MIN_PCM_AUDIO_BYTES})"
+            ),
         )
         result.response_bytes = result.audio_bytes
         return
-    result.audio_duration_s = validation.duration_s
+    if not audio_state.has_signal:
+        _mark_protocol_error(
+            result,
+            status="invalid_sse_response",
+            error="SSE stream completed with only zero-amplitude PCM chunks",
+        )
+        result.response_bytes = result.audio_bytes
+        return
+    result.audio_duration_s = audio_state.duration_s
     _mark_success(result)
     result.response_bytes = result.audio_bytes
 
@@ -323,7 +345,7 @@ def _merge_sse_line(
     start: float,
     chunk_times: list[float],
     scenario: Scenario,
-    audio_buffer: bytearray,
+    audio_state: SseAudioState,
 ) -> bool:
     if not line or line.startswith(":"):
         return False
@@ -423,10 +445,11 @@ def _merge_sse_line(
     elif chunk_times:
         result.inter_chunk_s.append(now - chunk_times[-1])
     chunk_times.append(now)
-    audio_buffer.extend(audio_bytes)
+    audio_state.total_bytes += len(audio_bytes)
+    audio_state.duration_s += chunk_validation.duration_s
+    audio_state.has_signal = audio_state.has_signal or any(audio_bytes)
     result.audio_bytes += len(audio_bytes)
     result.response_bytes += len(audio_bytes)
-    result.audio_duration_s += chunk_validation.duration_s
     return False
 
 

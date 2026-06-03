@@ -6,14 +6,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import aiohttp
 
-from benchmarks.tts_serving.audio_validation import (
-    validate_audio_response,
-    validate_pcm_chunk,
-)
+from benchmarks.tts_serving.audio_validation import validate_pcm_chunk
+from benchmarks.tts_serving.http_contracts import UNSUPPORTED_HTTP_STATUSES
 from benchmarks.tts_serving.metrics import (
     PCM_SAMPLE_RATE,
     ScenarioResult,
@@ -29,12 +27,13 @@ WS_CONTROL_EVENT_TYPES = {
     "response.created",
     "input.ack",
 }
-UNSUPPORTED_WS_STATUSES = {404, 405, 501}
+UNSUPPORTED_WS_STATUSES = UNSUPPORTED_HTTP_STATUSES
 
 
 @dataclass
 class WebSocketAudioState:
-    active_sentence_audio: bytearray = field(default_factory=bytearray)
+    active_sentence_duration_s: float = 0.0
+    active_sentence_has_signal: bool = False
 
 
 async def run_ws_scenario(
@@ -84,6 +83,14 @@ async def run_ws_scenario(
         result.error_type = exc.__class__.__name__
         result.error_class = "transport_error"
         result.error = str(exc)
+    except Exception as exc:
+        result.status = "failed"
+        result.capability = "fail"
+        result.error_type = exc.__class__.__name__
+        result.error_class = "client_error"
+        result.error = (
+            f"WebSocket benchmark scenario failed before classification: {exc}"
+        )
     finally:
         finish_timing(result, start)
     return result
@@ -231,8 +238,8 @@ async def _expect_audio_until_done(
                 if binary_frames < min_binary_frames:
                     _mark_ws_protocol_error(
                         result,
-                        "stream_audio=true completed before the required "
-                        f"incremental audio chunks (expected>={min_binary_frames}, "
+                        "audio completed before the required binary frames "
+                        f"(expected>={min_binary_frames}, "
                         f"observed={binary_frames})",
                     )
                     return False
@@ -312,7 +319,8 @@ def _merge_text_event(
         result.ws_active_sentence_index = event["sentence_index"]
         result.ws_active_sentence_bytes = 0
         result.ws_active_sample_rate = event["sample_rate"]
-        audio_state.active_sentence_audio = bytearray()
+        audio_state.active_sentence_duration_s = 0.0
+        audio_state.active_sentence_has_signal = False
         result.status = "ok"
         result.capability = "pass"
         return event_type
@@ -346,24 +354,19 @@ def _merge_text_event(
                 "audio.done total_bytes must be positive for successful audio",
             )
             return event_type
-        validation = validate_audio_response(
-            bytes(audio_state.active_sentence_audio),
-            response_format="pcm",
-            sample_rate=result.ws_active_sample_rate or PCM_SAMPLE_RATE,
-            require_content_type=False,
-        )
-        if not validation.ok:
+        if not audio_state.active_sentence_has_signal:
             _mark_ws_protocol_error(
                 result,
-                f"WebSocket sentence PCM is invalid: {validation.error}",
+                "WebSocket sentence PCM has no non-zero audio signal",
             )
             return event_type
-        result.audio_duration_s += validation.duration_s
+        result.audio_duration_s += audio_state.active_sentence_duration_s
         result.ws_completed_sentences += 1
         result.ws_active_sentence_index = None
         result.ws_active_sentence_bytes = 0
         result.ws_active_sample_rate = None
-        audio_state.active_sentence_audio = bytearray()
+        audio_state.active_sentence_duration_s = 0.0
+        audio_state.active_sentence_has_signal = False
         result.status = "ok"
         result.capability = "pass"
         return event_type
@@ -460,7 +463,10 @@ def _record_binary_audio(
     result.audio_bytes += len(data)
     result.ws_active_sentence_bytes += len(data)
     result.response_bytes += len(data)
-    audio_state.active_sentence_audio.extend(data)
+    audio_state.active_sentence_duration_s += validation.duration_s
+    audio_state.active_sentence_has_signal = (
+        audio_state.active_sentence_has_signal or any(data)
+    )
     result.status = "ok"
     result.success = True
     result.capability = "pass"
@@ -540,7 +546,6 @@ def _default_script(spec: BenchmarkSpec) -> list[dict]:
         {"action": "send_json", "payload": {"type": "input.text", "text": "Hello."}},
         {"action": "send_json", "payload": {"type": "input.done"}},
         {"action": "expect", "event": "audio.start"},
-        {"action": "expect", "event": "audio"},
-        {"action": "expect", "event": "audio.done"},
+        {"action": "expect_audio_until_done"},
         {"action": "expect", "event": "session.done"},
     ]

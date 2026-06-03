@@ -6,12 +6,13 @@ The harness follows the benchmark platform contract:
 - read /etc/benchmark/spec.json by default
 - write outputs under /var/benchmark/out by default
 - exit 0 when the harness ran, even when the server/model failed
-- exit non-zero only for harness infrastructure failures
+- exit non-zero for invalid specs, artifact failures, or unhandled harness errors
 
 Docker:
     docker build -f benchmarks/tts_serving/Dockerfile \
       -t sglang-omni-tts-serving-benchmark .
     docker run --rm \
+      --user "$(id -u):$(id -g)" \
       -v "$PWD/spec.json:/etc/benchmark/spec.json:ro" \
       -v "$PWD/out:/var/benchmark/out" \
       sglang-omni-tts-serving-benchmark
@@ -93,6 +94,12 @@ async def _run_stage(
     scenarios: list[Scenario],
     harness_log: list[str],
 ) -> list[ScenarioResult]:
+    if len(scenarios) > stage.request_count:
+        harness_log.append(
+            f"stage={stage.id} scheduled {len(scenarios)} scenarios although "
+            f"request_count={stage.request_count}; required benchmark contracts "
+            "are never truncated"
+        )
     if stage.mode == "closed_loop":
         return await _run_closed_loop_stage(
             session, spec, stage, scenarios, harness_log
@@ -186,7 +193,7 @@ async def _run_scheduled_stage(
         done = {task for task in pending if task.done()}
         if done:
             pending.difference_update(done)
-            results.extend(task.result() for task in done)
+            results.extend(_harvest_completed_tasks(done))
         scheduled_task_count += 1
         if active_requests >= stage.max_concurrency:
             actual_start = time.perf_counter()
@@ -206,7 +213,7 @@ async def _run_scheduled_stage(
         pending.add(asyncio.create_task(run_planned(scenario, offset)))
         peak_pending_tasks = max(peak_pending_tasks, len(pending))
     if pending:
-        results.extend(await asyncio.gather(*pending))
+        results.extend(await _gather_pending_tasks(pending))
     for result in results:
         result.peak_inflight = peak_inflight
     generator_lag_s = [
@@ -276,11 +283,72 @@ async def _run_one_scenario(
     spec: BenchmarkSpec,
     scenario: Scenario,
 ) -> ScenarioResult:
-    if scenario.method == "WS":
-        return await run_ws_scenario(session, spec, scenario)
-    if scenario.method == "SDK":
-        return await run_sdk_scenario(spec, scenario)
-    return await run_http_scenario(session, spec, scenario)
+    try:
+        if scenario.method == "WS":
+            return await run_ws_scenario(session, spec, scenario)
+        if scenario.method == "SDK":
+            return await run_sdk_scenario(spec, scenario)
+        return await run_http_scenario(session, spec, scenario)
+    except Exception as exc:
+        return _scenario_exception_result(scenario, exc)
+
+
+def _harvest_completed_tasks(
+    tasks: set[asyncio.Task[ScenarioResult]],
+) -> list[ScenarioResult]:
+    results: list[ScenarioResult] = []
+    for task in tasks:
+        try:
+            results.append(task.result())
+        except Exception as exc:
+            results.append(_task_exception_result(exc))
+    return results
+
+
+async def _gather_pending_tasks(
+    tasks: set[asyncio.Task[ScenarioResult]],
+) -> list[ScenarioResult]:
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    results: list[ScenarioResult] = []
+    for raw_result in raw_results:
+        if isinstance(raw_result, ScenarioResult):
+            results.append(raw_result)
+        elif isinstance(raw_result, Exception):
+            results.append(_task_exception_result(raw_result))
+    return results
+
+
+def _scenario_exception_result(scenario: Scenario, exc: Exception) -> ScenarioResult:
+    result = ScenarioResult(
+        scenario_id=scenario.id,
+        endpoint=scenario.endpoint,
+        category=scenario.category,
+        capability_key=scenario.capability_key,
+        expected_success=scenario.expect_success,
+        response_format=str(scenario.payload.get("response_format", "")) or None,
+        batch_size=scenario.planned_metadata.get("batch_size"),
+        status="failed",
+        success=False,
+        capability="fail",
+        error_type=exc.__class__.__name__,
+        error_class="client_error",
+        error=f"benchmark scenario failed before response classification: {exc}",
+    )
+    return result
+
+
+def _task_exception_result(exc: Exception) -> ScenarioResult:
+    return ScenarioResult(
+        scenario_id="benchmark-task-exception",
+        endpoint="unknown",
+        category="harness_task",
+        status="failed",
+        success=False,
+        capability="fail",
+        error_type=exc.__class__.__name__,
+        error_class="client_error",
+        error=f"benchmark task failed before scenario result was recorded: {exc}",
+    )
 
 
 def _attach_schedule_metadata(

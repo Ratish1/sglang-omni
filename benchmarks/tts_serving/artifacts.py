@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
+import tempfile
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 from urllib.parse import urlparse, urlunparse
 
 from benchmarks.tts_serving.metrics import ScenarioResult
@@ -56,6 +61,7 @@ def write_artifacts(
             "test_type": spec.test_type,
             "platform_metadata": redact_sensitive_metadata(spec.platform_metadata),
             "profile": spec.params.profile,
+            "spec_hash": _spec_hash(spec),
             "scenario_schema_version": SCENARIO_SCHEMA_VERSION,
             "scenario_set_hash": scenario_set_hash(scenarios),
             "load_stages": [stage.to_json() for stage in spec.params.load_stages],
@@ -75,39 +81,85 @@ def write_artifacts(
 
 
 def write_harness_log(out_dir: Path, lines: list[str]) -> None:
-    try:
-        (out_dir / "logs" / "harness.log").write_text(
-            "\n".join(lines) + "\n", encoding="utf-8"
-        )
-    except OSError as exc:
-        raise ArtifactError(f"failed to write harness log: {exc}") from exc
+    _atomic_write_text(out_dir / "logs" / "harness.log", "\n".join(lines) + "\n")
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     try:
-        path.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        raise ArtifactError(f"failed to write {path}: {exc}") from exc
+        text = json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise ArtifactError(f"failed to serialize {path}: {exc}") from exc
+    _atomic_write_text(path, text)
 
 
 def _write_jsonl(path: Path, rows: list[Any]) -> None:
+    def write_rows(f: TextIO) -> None:
+        for row in rows:
+            f.write(json.dumps(_to_json(row), ensure_ascii=False, allow_nan=False))
+            f.write("\n")
+
+    _atomic_write(path, write_rows)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    _atomic_write(path, lambda f: f.write(text))
+
+
+def _atomic_write(path: Path, write: Callable[[TextIO], None]) -> None:
+    fd: int | None = None
+    tmp_path: Path | None = None
     try:
-        with path.open("w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(_to_json(row), ensure_ascii=False) + "\n")
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        tmp_path = Path(tmp_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None
+            write(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except (TypeError, ValueError) as exc:
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+        if tmp_path is not None:
+            with suppress(OSError):
+                tmp_path.unlink()
+        raise ArtifactError(f"failed to serialize {path}: {exc}") from exc
     except OSError as exc:
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+        if tmp_path is not None:
+            with suppress(OSError):
+                tmp_path.unlink()
         raise ArtifactError(f"failed to write {path}: {exc}") from exc
 
 
 def _to_json(value: Any) -> Any:
     if hasattr(value, "to_json"):
-        return value.to_json()
+        return _to_json(value.to_json())
     if is_dataclass(value):
-        return asdict(value)
+        return _to_json(asdict(value))
+    if isinstance(value, dict):
+        return {key: _to_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_json(item) for item in value]
+    if isinstance(value, tuple):
+        return [_to_json(item) for item in value]
+    if isinstance(value, float) and math.isinf(value):
+        return "inf" if value > 0 else "-inf"
     return value
+
+
+def _spec_hash(spec: BenchmarkSpec) -> str:
+    serialized = json.dumps(
+        _to_json(spec),
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _sanitize_scenario_for_artifact(scenario: Scenario) -> dict[str, Any]:
