@@ -96,10 +96,11 @@ class HiggsTTSModelRunner(ModelRunner):
         # one step under lookahead. For Higgs the decode input_ids is masked by
         # _decode_step_embeds_cg (rows with codes use _cg_active_last_codes), so
         # this only feeds the upstream bookkeeping. clamp>=0 keeps STOP_CODE(-1)
-        # rows in embed_tokens range. _decode_pack_gpu also masks rows that were
-        # already done before this step; the host collect only overwrites this
-        # tensor for rare host-only skips such as chunked or pre-finished rows.
-        result.next_token_ids = self.model._cg_next_token_ids[:n_real].clone()
+        # rows in embed_tokens range; the host collect later overwrites with the
+        # skip-aware cb0 for output reporting.
+        result.next_token_ids = (
+            self.model._cg_codes_BN[:n_real, 0].clamp_min(0).to(torch.long).clone()
+        )
         return host_buf
 
     def post_decode_resolve(
@@ -236,7 +237,6 @@ class HiggsTTSModelRunner(ModelRunner):
             )
         with _record_function("higgs.runner.decode_pack_gpu"):
             staging = self._decode_pack_gpu(n_real)
-        result.next_token_ids = self.model._cg_next_token_ids[:n_real].clone()
         with _record_function("higgs.runner.decode_collect_d2h_blocking"):
             combined_cpu = staging[:n_real].cpu()  # one blocking D2H (sync path)
         with _record_function("higgs.runner.decode_collect_host"):
@@ -264,12 +264,6 @@ class HiggsTTSModelRunner(ModelRunner):
             staging[:n_real, num_codebooks + 1] = model._cg_active_generation_done[
                 :n_real
             ]
-            cb0 = model._cg_codes_BN[:n_real, 0].clamp_min(0)
-            model._cg_next_token_ids[:n_real] = torch.where(
-                model._cg_was_done[:n_real],
-                torch.zeros_like(cb0),
-                cb0,
-            )
             return staging
 
     def _decode_collect_host(
@@ -288,14 +282,12 @@ class HiggsTTSModelRunner(ModelRunner):
                 was_done_cpu = combined_cpu[:, num_codebooks].bool().tolist()
                 gen_done_after_cpu = combined_cpu[:, num_codebooks + 1].bool().tolist()
             cb0_per_row: list[int] = []
-            needs_host_next_token_ids = result.next_token_ids is None
             with _record_function("higgs.runner.decode_collect_host_loop"):
                 for b, sched_req in enumerate(requests):
                     data = sched_req.data
                     req = data.req
                     if req.is_chunked > 0:
                         cb0_per_row.append(0)
-                        needs_host_next_token_ids = True
                         continue
                     # Already finished in an earlier step? Skip its append. Under async
                     # lookahead the finished req gets one extra (wasted) forward before
@@ -305,7 +297,6 @@ class HiggsTTSModelRunner(ModelRunner):
                     # own collect (finish is set later, in process_batch_result).
                     if req.finished():
                         cb0_per_row.append(0)
-                        needs_host_next_token_ids = True
                         continue
                     if was_done_cpu[b]:
                         cb0_per_row.append(0)
@@ -325,13 +316,12 @@ class HiggsTTSModelRunner(ModelRunner):
                         cb0_per_row.append(int(codes_N[0].item()))
                     self._mark_sampler_finished(req, data.generation_done)
 
-            if needs_host_next_token_ids:
-                with _record_function("higgs.runner.decode_collect_next_token_tensor"):
-                    result.next_token_ids = torch.tensor(
-                        cb0_per_row,
-                        dtype=torch.long,
-                        device=result.logits_output.next_token_logits.device,
-                    )
+            with _record_function("higgs.runner.decode_collect_next_token_tensor"):
+                result.next_token_ids = torch.tensor(
+                    cb0_per_row,
+                    dtype=torch.long,
+                    device=result.logits_output.next_token_logits.device,
+                )
 
     def _build_prefill_input_embeds(
         self,
