@@ -22,7 +22,6 @@ from typing import Any, Callable
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
-from sglang_omni.scheduling.profiler_control import handle_profiler_message
 
 logger = logging.getLogger(__name__)
 
@@ -112,8 +111,6 @@ class StreamingSimpleScheduler:
                 msg = self._next_message()
                 if msg is None:
                     continue
-                if handle_profiler_message(msg):
-                    continue
                 if self._is_aborted(msg.request_id):
                     continue
                 try:
@@ -140,8 +137,6 @@ class StreamingSimpleScheduler:
     def _handle_message(
         self, msg: IncomingMessage, loop: asyncio.AbstractEventLoop
     ) -> None:
-        if handle_profiler_message(msg):
-            return
         if msg.type == "new_request":
             self._handle_new_request_batch(self._collect_new_request_batch(msg), loop)
             return

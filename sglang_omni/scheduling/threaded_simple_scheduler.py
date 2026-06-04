@@ -12,9 +12,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable
 
-from sglang_omni.profiler.torch_profiler import record_function as _record_function
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
-from sglang_omni.scheduling.profiler_control import handle_profiler_message
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +48,6 @@ class ThreadedSimpleScheduler:
                     msg = self.inbox.get(timeout=0.1)
                 except _queue_mod.Empty:
                     continue
-                if handle_profiler_message(msg):
-                    continue
                 if msg.type != "new_request":
                     continue
                 with self._lock:
@@ -83,11 +79,10 @@ class ThreadedSimpleScheduler:
             time.sleep(0.001)
 
     def _run_one(self, payload: Any) -> Any:
-        with _record_function("sglang_omni.profiler.canary.threaded_simple.run_one"):
-            result = self._fn(payload)
-            if inspect.isawaitable(result):
-                result = asyncio.run(result)
-            return result
+        result = self._fn(payload)
+        if inspect.isawaitable(result):
+            result = asyncio.run(result)
+        return result
 
     def _finish(self, request_id: str, future: Future) -> None:
         with self._lock:

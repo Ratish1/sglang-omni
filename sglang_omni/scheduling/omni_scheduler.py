@@ -32,7 +32,6 @@ from sglang.srt.utils import broadcast_pyobj
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.torch_profiler import record_function as _record_function
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
-from sglang_omni.scheduling.profiler_control import handle_profiler_message
 
 logger = logging.getLogger(__name__)
 
@@ -434,17 +433,10 @@ class OmniScheduler:
         return new_reqs
 
     def _recv_scheduler_messages(self) -> list[IncomingMessage]:
-        local_msgs = self._drain_local_inbox()
-        recv_msgs: list[IncomingMessage] = []
-        for msg in local_msgs:
-            if handle_profiler_message(msg):
-                continue
-            recv_msgs.append(msg)
-
         if self.tp_size == 1:
-            return recv_msgs
+            return self._drain_local_inbox()
 
-        recv_msgs = recv_msgs if self.is_entry_rank else []
+        recv_msgs = self._drain_local_inbox() if self.is_entry_rank else []
         return broadcast_pyobj(
             recv_msgs,
             self.tp_group.rank,

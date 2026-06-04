@@ -38,7 +38,6 @@ from sglang_omni.proto import (
 )
 from sglang_omni.relay.base import Relay, create_relay
 from sglang_omni.scheduling.messages import IncomingMessage
-from sglang_omni.scheduling.profiler_control import profiler_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -1205,13 +1204,15 @@ class Stage:
 
     def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id
-        if msg.enable_torch:
+        if msg.enable_torch and not TorchProfiler.is_active():
             base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
             template = f"{base_tpl}_pid{os.getpid()}"
             prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
             if prof_dir and not os.path.isabs(template):
                 template = os.path.join(prof_dir, template)
-            self._queue_scheduler_profiler_start(run_id, template)
+            TorchProfiler.start(template, run_id=run_id)
+            with _record_function(f"sglang_omni.profiler.canary_start.{self.name}"):
+                pass
         if msg.event_dir is not None:
             try:
                 _get_recorder().start(
@@ -1226,66 +1227,15 @@ class Stage:
 
     def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
         # run_id=None is a wildcard (stop whatever's active).
-        self._queue_scheduler_profiler_stop(msg.run_id)
+        if TorchProfiler.is_active() and (
+            msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
+        ):
+            TorchProfiler.stop(run_id=msg.run_id)
         recorder = _get_recorder()
         if recorder.is_active() and (
             msg.run_id is None or recorder.active_run_id() == msg.run_id
         ):
             recorder.stop(run_id=msg.run_id)
-
-    def _queue_scheduler_profiler_start(
-        self, run_id: str | None, trace_path_template: str
-    ) -> None:
-        if self.scheduler is None:
-            TorchProfiler.start(trace_path_template, run_id=run_id)
-            return
-
-        done = threading.Event()
-        self.scheduler.inbox.put(
-            IncomingMessage(
-                request_id=profiler_request_id("start", run_id),
-                type="profiler_start",
-                data={
-                    "run_id": run_id,
-                    "trace_path_template": trace_path_template,
-                    "stage": self.name,
-                    "done_event": done,
-                },
-            )
-        )
-        if not done.wait(timeout=30.0):
-            logger.warning(
-                "Stage %s timed out waiting for scheduler profiler_start run_id=%s",
-                self.name,
-                run_id,
-            )
-
-    def _queue_scheduler_profiler_stop(self, run_id: str | None) -> None:
-        if self.scheduler is None:
-            if TorchProfiler.is_active() and (
-                run_id is None or TorchProfiler.get_active_run_id() == run_id
-            ):
-                TorchProfiler.stop(run_id=run_id)
-            return
-
-        done = threading.Event()
-        self.scheduler.inbox.put(
-            IncomingMessage(
-                request_id=profiler_request_id("stop", run_id),
-                type="profiler_stop",
-                data={
-                    "run_id": run_id,
-                    "stage": self.name,
-                    "done_event": done,
-                },
-            )
-        )
-        if not done.wait(timeout=60.0):
-            logger.warning(
-                "Stage %s timed out waiting for scheduler profiler_stop run_id=%s",
-                self.name,
-                run_id,
-            )
 
     def _on_background_task_done(self, task: asyncio.Task, label: str) -> None:
         if task.cancelled():
