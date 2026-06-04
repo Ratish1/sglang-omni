@@ -100,17 +100,60 @@ def _manual_trace_event(name: str, *, start_us: int, duration_us: int) -> dict:
     }
 
 
-def _append_events_to_chrome_trace(json_file: str, events: list[dict]) -> None:
+def _trace_start_us(trace_events: list[dict]) -> int | None:
+    timestamps = [
+        event["ts"]
+        for event in trace_events
+        if isinstance(event, dict) and isinstance(event.get("ts"), (int, float))
+    ]
+    if not timestamps:
+        return None
+    return int(min(timestamps))
+
+
+def _align_manual_events_to_trace(
+    events: list[dict],
+    *,
+    trace_start_us: int,
+    manual_start_us: int,
+) -> list[dict]:
+    offset_us = trace_start_us - manual_start_us
+    aligned: list[dict] = []
+    for event in events:
+        copied = dict(event)
+        ts = copied.get("ts")
+        if isinstance(ts, (int, float)):
+            copied["ts"] = int(ts + offset_us)
+        aligned.append(copied)
+    return aligned
+
+
+def _append_events_to_chrome_trace(
+    json_file: str,
+    events: list[dict],
+    *,
+    manual_start_us: int,
+) -> int:
     if not events:
-        return
+        return 0
     with open(json_file, encoding="utf-8") as f:
         trace = json.load(f)
     trace_events = trace.setdefault("traceEvents", [])
     if not isinstance(trace_events, list):
         raise TypeError("Chrome trace 'traceEvents' must be a list")
-    trace_events.extend(events)
+    trace_start_us = _trace_start_us(trace_events)
+    if trace_start_us is None:
+        aligned_events = events
+    else:
+        aligned_events = _align_manual_events_to_trace(
+            events,
+            trace_start_us=trace_start_us,
+            manual_start_us=manual_start_us,
+        )
+    trace_events.extend(aligned_events)
     with open(json_file, "w", encoding="utf-8") as f:
         json.dump(trace, f, separators=(",", ":"))
+    return len(aligned_events)
 
 
 class TorchProfiler(ProfilerBase):
@@ -125,6 +168,7 @@ class TorchProfiler(ProfilerBase):
 
     _active_run_id: str | None = None
     _owner_thread_id: int | None = None
+    _manual_start_us: int | None = None
     _lock = threading.Lock()
     _manual_events: list[dict] = []
     _manual_events_lock = threading.Lock()
@@ -161,6 +205,7 @@ class TorchProfiler(ProfilerBase):
                 cls._profiler = None
                 cls._active_run_id = None
                 cls._owner_thread_id = None
+                cls._manual_start_us = None
                 cls._trace_template = ""
 
             # 2. Make path absolute
@@ -168,6 +213,7 @@ class TorchProfiler(ProfilerBase):
             cls._trace_template = trace_path_template
             cls._active_run_id = run_id
             cls._owner_thread_id = threading.get_ident()
+            cls._manual_start_us = time.perf_counter_ns() // 1000
             cls._clear_manual_events()
 
             # Expected paths
@@ -267,6 +313,7 @@ class TorchProfiler(ProfilerBase):
                 cls._profiler = None
                 cls._active_run_id = None
                 cls._owner_thread_id = None
+                cls._manual_start_us = None
                 cls._trace_template = ""
                 return {"trace": gz_path, "table": None}
 
@@ -296,6 +343,7 @@ class TorchProfiler(ProfilerBase):
             cls._profiler = None
             cls._active_run_id = None
             cls._owner_thread_id = None
+            cls._manual_start_us = None
             cls._trace_template = ""
 
             return {"trace": gz_path, "table": None}
@@ -343,9 +391,20 @@ class TorchProfiler(ProfilerBase):
         if not events:
             logger.info("No sglang-omni trace ranges captured for %s", json_file)
             return
-        _append_events_to_chrome_trace(json_file, events)
+        manual_start_us = cls._manual_start_us
+        if manual_start_us is None:
+            logger.warning(
+                "Dropping %d sglang-omni trace ranges without profiler start timestamp",
+                len(events),
+            )
+            return
+        event_count = _append_events_to_chrome_trace(
+            json_file,
+            events,
+            manual_start_us=manual_start_us,
+        )
         logger.info(
-            "Appended %d sglang-omni trace ranges to %s", len(events), json_file
+            "Appended %d sglang-omni trace ranges to %s", event_count, json_file
         )
 
     @classmethod
