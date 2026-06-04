@@ -25,6 +25,7 @@ from sglang_omni.models.higgs_tts._vendored.higgs_audio_v2_tokenizer_hf import (
     HiggsAudioV2TokenizerConfig,
     HiggsAudioV2TokenizerModel,
 )
+from sglang_omni.models.tts_runtime import run_bucketed_batch
 
 WaveformInput = torch.Tensor | np.ndarray
 
@@ -83,7 +84,7 @@ def _load_codec_state_dict(tts_ckpt_dir: str) -> dict[str, torch.Tensor]:
             if full_name.startswith(_CODEC_IN_TTS_CKPT_PREFIX):
                 shards.setdefault(shard, []).append(full_name)
     else:
-        shards = {"model.safetensors": None}  # single-shard layout
+        shards = {"model.safetensors": None}
 
     state: dict[str, torch.Tensor] = {}
     for shard, names in shards.items():
@@ -194,35 +195,16 @@ class HiggsAudioCodec:
         batch_fn,
         error_label: str,
     ) -> list[torch.Tensor]:
-        """Run single_fn on singleton buckets and batch_fn on multi-item buckets."""
-        if not items:
-            return []
-        if len(items) == 1:
-            return [single_fn(items[0])]
-
-        buckets: dict[int, list[int]] = {}
-        for i, item in enumerate(items):
-            buckets.setdefault(bucket_key_fn(item), []).append(i)
-
-        results: list[torch.Tensor | None] = [None] * len(items)
-        for indices in buckets.values():
-            if len(indices) == 1:
-                results[indices[0]] = single_fn(items[indices[0]])
-            else:
-                batch_results = batch_fn([items[i] for i in indices])
-                for idx, result in zip(indices, batch_results):
-                    results[idx] = result
-
-        out: list[torch.Tensor] = []
-        for i, result in enumerate(results):
-            if result is None:
-                raise RuntimeError(f"{error_label} did not produce result for item {i}")
-            out.append(result)
-        return out
+        return run_bucketed_batch(
+            items,
+            bucket_key_fn=bucket_key_fn,
+            single_fn=single_fn,
+            batch_fn=batch_fn,
+            error_label=error_label,
+        )
 
     @torch.no_grad()
     def encode_batch(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
-        # Offline/bulk encoding utility.
         padded: list[torch.Tensor] = []
         for w in waveforms:
             wav = _to_mono_3d(w).to(torch.float32)
