@@ -323,13 +323,10 @@ def _has_aac_adts_prefix(body: bytes) -> bool:
 
 
 def _has_nonzero_int16_sample(body: bytes) -> bool:
-    sample_count = len(body) // PCM_SAMPLE_WIDTH
-    if sample_count <= 0:
+    aligned_bytes = len(body) - (len(body) % PCM_SAMPLE_WIDTH)
+    if aligned_bytes <= 0:
         return False
-    for (sample,) in struct.iter_unpack("<h", body[: sample_count * PCM_SAMPLE_WIDTH]):
-        if sample:
-            return True
-    return False
+    return body[:aligned_bytes].count(0) != aligned_bytes
 
 
 def _printable_ascii_ratio(body: bytes) -> float:
