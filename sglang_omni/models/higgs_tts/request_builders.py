@@ -27,7 +27,7 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     num_ref_codes_consumed: int = 0
     num_codebooks: int = 8
     codebook_size: int = 1026
-    output_codes: list[Any] = field(default_factory=list)
+    output_codes: list[list[int] | torch.Tensor] = field(default_factory=list)
     generation_done: bool = False
     engine_start_s: float = 0.0
     stream_metadata: dict[str, Any] | None = None

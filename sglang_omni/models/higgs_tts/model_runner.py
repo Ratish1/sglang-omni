@@ -395,8 +395,9 @@ class HiggsTTSModelRunner(ModelRunner):
                 if data.stream_metadata is None:
                     data.output_codes.append(codes_N.detach().cpu().tolist())
                 else:
-                    data.output_codes.append(codes_N.detach().cpu().clone())
-                    self._emit_code_chunk(sched_req, data.output_codes[-1])
+                    code_chunk = codes_N.detach().cpu().clone()
+                    data.output_codes.append(code_chunk)
+                    self._emit_code_chunk(sched_req, code_chunk)
                 self._mark_sampler_finished(req, data.generation_done)
                 cb0_per_row.append(int(codes_N[0].item()))
 
