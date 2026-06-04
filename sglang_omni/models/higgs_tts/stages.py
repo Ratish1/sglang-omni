@@ -346,29 +346,11 @@ def create_audio_encoder_executor(
         cache_device="cpu",
     )
 
-    def _encode_impl(payload: StagePayload) -> StagePayload:
-        state = HiggsTtsState.from_dict(payload.data)
-        waveform = state.reference_waveform
-        if waveform is None:
-            return payload
-
-        cached_delayed = reference_code_cache.get(state.reference_cache_key)
-        if cached_delayed is not None:
-            delayed_rows = cached_delayed.tolist()
-        else:
-            ref_codes_TN = codec.encode_reference(waveform, sample_rate=24000).to(
-                torch.long
-            )
-            if ref_codes_TN.ndim != 2 or ref_codes_TN.shape[1] != num_codebooks:
-                raise ValueError(
-                    f"codec output must be [T, {num_codebooks}], got "
-                    f"{tuple(ref_codes_TN.shape)}"
-                )
-            delayed = apply_delay_pattern(ref_codes_TN)
-            delayed_rows = delayed.tolist()
-            reference_code_cache.put(
-                state.reference_cache_key, delayed.to("cpu", torch.int32)
-            )
+    def _finish_encoded_payload(
+        payload: StagePayload,
+        state: HiggsTtsState,
+        delayed_rows: list[list[int]],
+    ) -> StagePayload:
         state.reference_codes_delayed = delayed_rows
         state.prompt_token_ids = adapter.build_prompt(
             state.target_text or "",
@@ -382,12 +364,94 @@ def create_audio_encoder_executor(
         payload.data = state.to_dict()
         return payload
 
+    def _delay_and_cache_reference_codes(
+        state: HiggsTtsState,
+        ref_codes_TN: torch.Tensor,
+    ) -> list[list[int]]:
+        if ref_codes_TN.ndim != 2 or ref_codes_TN.shape[1] != num_codebooks:
+            raise ValueError(
+                f"codec output must be [T, {num_codebooks}], got "
+                f"{tuple(ref_codes_TN.shape)}"
+            )
+        delayed = apply_delay_pattern(ref_codes_TN.to(torch.long))
+        delayed_rows = delayed.tolist()
+        reference_code_cache.put(
+            state.reference_cache_key, delayed.to("cpu", torch.int32)
+        )
+        return delayed_rows
+
+    def _encode_impl(payload: StagePayload) -> StagePayload:
+        state = HiggsTtsState.from_dict(payload.data)
+        waveform = state.reference_waveform
+        if waveform is None:
+            return payload
+
+        cached_delayed = reference_code_cache.get(state.reference_cache_key)
+        if cached_delayed is not None:
+            delayed_rows = cached_delayed.tolist()
+        else:
+            ref_codes_TN = codec.encode_reference(waveform, sample_rate=24000).to(
+                torch.long
+            )
+            delayed_rows = _delay_and_cache_reference_codes(state, ref_codes_TN)
+        return _finish_encoded_payload(payload, state, delayed_rows)
+
+    def _encode_batch_impl(payloads: list[StagePayload]) -> list[StagePayload]:
+        results: list[StagePayload | None] = [None] * len(payloads)
+        active: list[tuple[int, StagePayload, HiggsTtsState, torch.Tensor]] = []
+
+        with _record_function("higgs.audio_encoder.batch_prepare"):
+            for idx, payload in enumerate(payloads):
+                state = HiggsTtsState.from_dict(payload.data)
+                waveform = state.reference_waveform
+                if waveform is None:
+                    results[idx] = payload
+                    continue
+
+                cached_delayed = reference_code_cache.get(state.reference_cache_key)
+                if cached_delayed is not None:
+                    results[idx] = _finish_encoded_payload(
+                        payload, state, cached_delayed.tolist()
+                    )
+                    continue
+
+                active.append((idx, payload, state, waveform))
+
+        if active:
+            with _record_function("higgs.audio_encoder.batch_model_encode"):
+                ref_code_batches = codec.encode_batch([item[3] for item in active])
+            if len(ref_code_batches) != len(active):
+                raise RuntimeError(
+                    f"Higgs codec encode_batch returned {len(ref_code_batches)} "
+                    f"results for {len(active)} requests"
+                )
+            with _record_function("higgs.audio_encoder.batch_finalize"):
+                for (idx, payload, state, _), ref_codes_TN in zip(
+                    active, ref_code_batches
+                ):
+                    delayed_rows = _delay_and_cache_reference_codes(state, ref_codes_TN)
+                    results[idx] = _finish_encoded_payload(payload, state, delayed_rows)
+
+        missing = [idx for idx, result in enumerate(results) if result is None]
+        if missing:
+            raise RuntimeError(
+                f"Higgs audio encoder batch did not produce results for indices "
+                f"{missing}"
+            )
+        return [result for result in results if result is not None]
+
     def _encode(payload: StagePayload) -> StagePayload:
         with _record_function("higgs.audio_encoder"):
             return _encode_impl(payload)
 
+    def _encode_batch(payloads: list[StagePayload]) -> list[StagePayload]:
+        with _record_function("higgs.audio_encoder"):
+            with _record_function("higgs.audio_encoder.batch"):
+                return _encode_batch_impl(payloads)
+
     return SimpleScheduler(
         _encode,
+        batch_compute_fn=_encode_batch,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
     )

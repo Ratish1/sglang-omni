@@ -27,7 +27,7 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     num_ref_codes_consumed: int = 0
     num_codebooks: int = 8
     codebook_size: int = 1026
-    output_codes: list[torch.Tensor] = field(default_factory=list)
+    output_codes: list[Any] = field(default_factory=list)
     generation_done: bool = False
     engine_start_s: float = 0.0
     stream_metadata: dict[str, Any] | None = None
@@ -147,9 +147,15 @@ def build_higgs_stream_metadata(
 def apply_higgs_result(state: HiggsTtsState, data: HiggsSGLangRequestData) -> None:
     with _record_function("higgs.request_builder.apply_result"):
         if data.output_codes:
-            codes = torch.stack(data.output_codes, dim=0).to(torch.long)
-            state.output_codes_delayed = codes.tolist()
-            state.completion_tokens = int(codes.shape[0])
+            rows: list[list[int]] = []
+            for row in data.output_codes:
+                if isinstance(row, torch.Tensor):
+                    tensor_row = row.detach().to(device="cpu", dtype=torch.long)
+                    rows.append([int(code) for code in tensor_row.tolist()])
+                else:
+                    rows.append([int(code) for code in row])
+            state.output_codes_delayed = rows
+            state.completion_tokens = len(rows)
         else:
             state.output_codes_delayed = None
         state.prompt_tokens = len(data.input_ids)

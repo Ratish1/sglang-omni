@@ -192,29 +192,31 @@ class HiggsTTSModelRunner(ModelRunner):
     @staticmethod
     def _extract_decode_sampling_params(forward_batch, n_real: int):
         """Pull per-row temperature / top_p / top_k off sglang's
-        ``sampling_info`` with safe defaults. ``top_k`` values outside
-        ``(0, K_MAX)`` (including sglang's ``TOP_K_ALL`` sentinel for
-        unspecified top_k) are normalized to ``None`` — the downstream
-        buffer maps that to ``K_MAX`` = no-op filter.
+        normalized ``sampling_info``. ``top_k`` values outside ``(0, K_MAX)``
+        (including sglang's ``TOP_K_ALL`` sentinel for unspecified top_k) are
+        normalized to ``None`` — the downstream buffer maps that to ``K_MAX``.
         """
-        sampling_info = getattr(forward_batch, "sampling_info", None)
-        if sampling_info is None or n_real == 0:
-            return ([1.0] * n_real, [1.0] * n_real, [None] * n_real)
+        with _record_function("higgs.runner.decode_sampling_params"):
+            sampling_info = getattr(forward_batch, "sampling_info", None)
+            if sampling_info is None or n_real == 0:
+                return ([1.0] * n_real, [1.0] * n_real, [None] * n_real)
 
-        temps_raw = _flat_sampling_attr(sampling_info, "temperatures") or [1.0] * n_real
-        top_ps_raw = _flat_sampling_attr(sampling_info, "top_ps") or [1.0] * n_real
-        top_ks_raw = _flat_sampling_attr(sampling_info, "top_ks")
+            temps_raw = (
+                _flat_sampling_attr(sampling_info, "temperatures") or [1.0] * n_real
+            )
+            top_ps_raw = _flat_sampling_attr(sampling_info, "top_ps") or [1.0] * n_real
+            top_ks_raw = _flat_sampling_attr(sampling_info, "top_ks")
 
-        temps = [float(t) for t in temps_raw[:n_real]]
-        top_ps = [float(t) for t in top_ps_raw[:n_real]]
-        if top_ks_raw is None:
-            top_ks: list[int | None] = [None] * n_real
-        else:
-            top_ks = [
-                int(t) if (t is not None and 0 < int(t) < K_MAX) else None
-                for t in top_ks_raw[:n_real]
-            ]
-        return temps, top_ps, top_ks
+            temps = [float(t) for t in temps_raw[:n_real]]
+            top_ps = [float(t) for t in top_ps_raw[:n_real]]
+            if top_ks_raw is None:
+                top_ks: list[int | None] = [None] * n_real
+            else:
+                top_ks = [
+                    int(t) if (t is not None and 0 < int(t) < K_MAX) else None
+                    for t in top_ks_raw[:n_real]
+                ]
+            return temps, top_ps, top_ks
 
     def _collect_step_outputs_cg(
         self, result: Any, forward_batch: Any, requests: list
@@ -275,40 +277,50 @@ class HiggsTTSModelRunner(ModelRunner):
         with _record_function("higgs.runner.decode_collect_host_impl"):
             model = self.model
             num_codebooks = model._cg_codes_BN.shape[1]
-            codes_BN_cpu = combined_cpu[:, :num_codebooks]
-            was_done_cpu = combined_cpu[:, num_codebooks].bool().tolist()
-            gen_done_after_cpu = combined_cpu[:, num_codebooks + 1].bool().tolist()
+            with _record_function("higgs.runner.decode_collect_host_unpack"):
+                codes_BN_cpu = combined_cpu[:, :num_codebooks]
+                was_done_cpu = combined_cpu[:, num_codebooks].bool().tolist()
+                gen_done_after_cpu = combined_cpu[:, num_codebooks + 1].bool().tolist()
             cb0_per_row: list[int] = []
-            for b, sched_req in enumerate(requests):
-                data = sched_req.data
-                req = data.req
-                if req.is_chunked > 0:
-                    cb0_per_row.append(0)
-                    continue
-                # Already finished in an earlier step? Skip its append. Under async
-                # lookahead the finished req gets one extra (wasted) forward before
-                # being dropped; this prevents leaking that overrun token. Catches
-                # length finishes too (which `_cg_was_done`, an EOC-only flag, does
-                # not). No-op for the sync path: a req is never finished() at its
-                # own collect (finish is set later, in process_batch_result).
-                if req.finished():
-                    cb0_per_row.append(0)
-                    continue
-                if was_done_cpu[b]:
-                    cb0_per_row.append(0)
-                    continue
-                codes_N = codes_BN_cpu[b].to(torch.long).clone()
-                data.output_codes.append(codes_N)
-                data.generation_done = bool(gen_done_after_cpu[b])
-                self._emit_code_chunk(sched_req, codes_N)
-                self._mark_sampler_finished(req, data.generation_done)
-                cb0_per_row.append(int(codes_N[0].item()))
+            with _record_function("higgs.runner.decode_collect_host_loop"):
+                for b, sched_req in enumerate(requests):
+                    data = sched_req.data
+                    req = data.req
+                    if req.is_chunked > 0:
+                        cb0_per_row.append(0)
+                        continue
+                    # Already finished in an earlier step? Skip its append. Under async
+                    # lookahead the finished req gets one extra (wasted) forward before
+                    # being dropped; this prevents leaking that overrun token. Catches
+                    # length finishes too (which `_cg_was_done`, an EOC-only flag, does
+                    # not). No-op for the sync path: a req is never finished() at its
+                    # own collect (finish is set later, in process_batch_result).
+                    if req.finished():
+                        cb0_per_row.append(0)
+                        continue
+                    if was_done_cpu[b]:
+                        cb0_per_row.append(0)
+                        continue
 
-            result.next_token_ids = torch.tensor(
-                cb0_per_row,
-                dtype=torch.long,
-                device=result.logits_output.next_token_logits.device,
-            )
+                    codes_row = codes_BN_cpu[b]
+                    data.generation_done = bool(gen_done_after_cpu[b])
+                    if data.stream_metadata is None:
+                        codes_list = codes_row.tolist()
+                        data.output_codes.append(codes_list)
+                        cb0_per_row.append(codes_list[0])
+                    else:
+                        codes_N = codes_row.to(torch.long).clone()
+                        data.output_codes.append(codes_N)
+                        self._emit_code_chunk(sched_req, codes_N)
+                        cb0_per_row.append(int(codes_N[0].item()))
+                    self._mark_sampler_finished(req, data.generation_done)
+
+            with _record_function("higgs.runner.decode_collect_next_token_tensor"):
+                result.next_token_ids = torch.tensor(
+                    cb0_per_row,
+                    dtype=torch.long,
+                    device=result.logits_output.next_token_logits.device,
+                )
 
     def _build_prefill_input_embeds(
         self,
@@ -377,11 +389,14 @@ class HiggsTTSModelRunner(ModelRunner):
                     cb0_per_row.append(0)
                     continue
                 codes_N = codes_log[-1]
-                data.output_codes.append(codes_N.detach().cpu().clone())
                 data.generation_done = bool(
                     model._sampler_pool.generation_done[row].item()
                 )
-                self._emit_code_chunk(sched_req, data.output_codes[-1])
+                if data.stream_metadata is None:
+                    data.output_codes.append(codes_N.detach().cpu().tolist())
+                else:
+                    data.output_codes.append(codes_N.detach().cpu().clone())
+                    self._emit_code_chunk(sched_req, data.output_codes[-1])
                 self._mark_sampler_finished(req, data.generation_done)
                 cb0_per_row.append(int(codes_N[0].item()))
 
