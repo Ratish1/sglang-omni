@@ -50,6 +50,7 @@ from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     HiggsStreamingVocoderScheduler,
 )
 from sglang_omni.preprocessing.cache_key import hash_bytes, hash_media_item
+from sglang_omni.profiler.torch_profiler import record_function as _record_function
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
@@ -206,7 +207,7 @@ def create_preprocessing_executor(
     )
     reference_waveform_cache_lock = threading.Lock()
 
-    def _preprocess(payload: StagePayload) -> StagePayload:
+    def _preprocess_impl(payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs or {}
         params = payload.request.params or {}
         if isinstance(inputs, str):
@@ -303,6 +304,10 @@ def create_preprocessing_executor(
         payload.data = state.to_dict()
         return payload
 
+    def _preprocess(payload: StagePayload) -> StagePayload:
+        with _record_function("higgs.preprocessing"):
+            return _preprocess_impl(payload)
+
     return ThreadedSimpleScheduler(_preprocess, max_concurrency=max_concurrency)
 
 
@@ -341,7 +346,7 @@ def create_audio_encoder_executor(
         cache_device="cpu",
     )
 
-    def _encode(payload: StagePayload) -> StagePayload:
+    def _encode_impl(payload: StagePayload) -> StagePayload:
         state = HiggsTtsState.from_dict(payload.data)
         waveform = state.reference_waveform
         if waveform is None:
@@ -376,6 +381,10 @@ def create_audio_encoder_executor(
         state.reference_text = None
         payload.data = state.to_dict()
         return payload
+
+    def _encode(payload: StagePayload) -> StagePayload:
+        with _record_function("higgs.audio_encoder"):
+            return _encode_impl(payload)
 
     return SimpleScheduler(
         _encode,

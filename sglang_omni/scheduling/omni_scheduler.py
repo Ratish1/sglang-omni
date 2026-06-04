@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.torch_profiler import record_function as _record_function
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
@@ -477,7 +478,8 @@ class OmniScheduler:
                 event_name="scheduler_request_build_start",
             )
             try:
-                req_data = self._request_builder(payload)
+                with _record_function("omni.scheduler.request_builder"):
+                    req_data = self._request_builder(payload)
             except Exception as exc:
                 logger.exception(f"OmniScheduler: request builder failed for {req_id}")
                 self._emit_request_error(req_id, exc)
@@ -600,11 +602,12 @@ class OmniScheduler:
         )
 
     def run_batch(self, batch, pp_proxy_tensors=None):
-        try:
-            return self._run_batch(batch, pp_proxy_tensors)
-        except Exception as exc:
-            self._handle_batch_failure(batch, exc)
-            return _FAILED_BATCH_RESULT
+        with _record_function("omni.scheduler.run_batch"):
+            try:
+                return self._run_batch(batch, pp_proxy_tensors)
+            except Exception as exc:
+                self._handle_batch_failure(batch, exc)
+                return _FAILED_BATCH_RESULT
 
     def _run_batch(self, batch, pp_proxy_tensors=None):
         """Run a batch through the model runner.
@@ -617,10 +620,14 @@ class OmniScheduler:
         """
         self._emit_prefill_start_for_batch(batch)
         if self._model_runner is not None:
-            sched_output = self._build_sched_output(batch)
-            mr_output = self._model_runner.execute(sched_output)
-            self._emit_stream_output(sched_output, mr_output)
-            return self._make_batch_result(batch, mr_output)
+            with _record_function("omni.scheduler.build_sched_output"):
+                sched_output = self._build_sched_output(batch)
+            with _record_function("omni.scheduler.model_runner_execute"):
+                mr_output = self._model_runner.execute(sched_output)
+            with _record_function("omni.scheduler.emit_stream_output"):
+                self._emit_stream_output(sched_output, mr_output)
+            with _record_function("omni.scheduler.make_batch_result"):
+                return self._make_batch_result(batch, mr_output)
         # Fallback: call upstream's run_batch (uses tp_worker directly)
         return _Upstream.run_batch(self, batch, pp_proxy_tensors)
 
@@ -682,8 +689,10 @@ class OmniScheduler:
         Returns ``(sched_output, pending_step)``; the caller holds the pending
         step (launch-first keeps two steps momentarily in flight)."""
         self._emit_prefill_start_for_batch(batch)
-        sched_output = self._build_sched_output(batch)
-        pending_step = self._model_runner.execute_launch(sched_output)
+        with _record_function("omni.scheduler.build_sched_output"):
+            sched_output = self._build_sched_output(batch)
+        with _record_function("omni.scheduler.async_decode_launch"):
+            pending_step = self._model_runner.execute_launch(sched_output)
         return sched_output, pending_step
 
     def _run_batch_resolve(self, batch, sched_output, pending_step, skip_rids=()):
@@ -697,10 +706,12 @@ class OmniScheduler:
         """
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
-        mr_output = self._model_runner.execute_resolve(pending_step)
+        with _record_function("omni.scheduler.async_decode_resolve"):
+            mr_output = self._model_runner.execute_resolve(pending_step)
         if mr_output is None:
             return _FAILED_BATCH_RESULT
-        self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
+        with _record_function("omni.scheduler.emit_stream_output"):
+            self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
         return GenerationBatchResult(
             logits_output=None,
             next_token_ids=pending_step.batch_result.next_token_ids,
@@ -900,20 +911,23 @@ class OmniScheduler:
         # (which is mostly Python-side dispatch into many small CUDA kernels)
         # slows ~600x, dropping audio QPS from >10 to <0.5.
         while self._running:
-            recv_reqs = self.recv_requests()
-            recv_reqs.extend(self._take_deferred_request_payloads())
-            self.process_input_requests(recv_reqs)
+            with _record_function("omni.scheduler.recv_process_requests"):
+                recv_reqs = self.recv_requests()
+                recv_reqs.extend(self._take_deferred_request_payloads())
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 time.sleep(0.001)
                 continue
 
-            batch = self.get_next_batch_to_run()
+            with _record_function("omni.scheduler.get_next_batch_to_run"):
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             if batch:
                 result = self.run_batch(batch)
                 if result is not _FAILED_BATCH_RESULT:
-                    self.process_batch_result(batch, result)
+                    with _record_function("omni.scheduler.process_batch_result"):
+                        self.process_batch_result(batch, result)
             else:
                 self.self_check_during_idle()
                 time.sleep(0.001)
@@ -927,17 +941,20 @@ class OmniScheduler:
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            with _record_function("omni.scheduler.process_batch_result"):
+                self.process_batch_result(tmp_batch, tmp_result)
 
         while self._running:
-            recv_reqs = self.recv_requests()
-            recv_reqs.extend(self._take_deferred_request_payloads())
-            self.process_input_requests(recv_reqs)
+            with _record_function("omni.scheduler.recv_process_requests"):
+                recv_reqs = self.recv_requests()
+                recv_reqs.extend(self._take_deferred_request_payloads())
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 time.sleep(0.001)
                 continue
 
-            batch = self.get_next_batch_to_run()
+            with _record_function("omni.scheduler.get_next_batch_to_run"):
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
@@ -1006,9 +1023,10 @@ class OmniScheduler:
         pre_finished = [r.finished() for r in batch.reqs]
         # rids finished in a PRIOR step (overrun) — suppress their stream emit
         skip_rids = {batch.reqs[i].rid for i, was in enumerate(pre_finished) if was}
-        result = self._run_batch_resolve(
-            batch, sched_output, pending_step, skip_rids=skip_rids
-        )
+        with _record_function("omni.scheduler.resolve_pending_async"):
+            result = self._run_batch_resolve(
+                batch, sched_output, pending_step, skip_rids=skip_rids
+            )
         if result is _FAILED_BATCH_RESULT:
             return
         keep = [i for i, was_finished in enumerate(pre_finished) if not was_finished]
@@ -1023,7 +1041,8 @@ class OmniScheduler:
             # positional batch tensors), so trimming reqs in lockstep suffices.
             batch.reqs = [batch.reqs[i] for i in keep]
         if batch.reqs:
-            self.process_batch_result(batch, result)
+            with _record_function("omni.scheduler.process_batch_result"):
+                self.process_batch_result(batch, result)
 
     def _resolve_pending_async(self) -> None:
         """Resolve + process the in-flight decode step, if any. Used to flush
@@ -1049,15 +1068,17 @@ class OmniScheduler:
         first and run synchronously (the in-flight step is never stranded).
         """
         while self._running:
-            recv_reqs = self.recv_requests()
-            recv_reqs.extend(self._take_deferred_request_payloads())
-            self.process_input_requests(recv_reqs)
+            with _record_function("omni.scheduler.recv_process_requests"):
+                recv_reqs = self.recv_requests()
+                recv_reqs.extend(self._take_deferred_request_payloads())
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 self._resolve_pending_async()
                 time.sleep(0.001)
                 continue
 
-            batch = self.get_next_batch_to_run()
+            with _record_function("omni.scheduler.get_next_batch_to_run"):
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             use_lookahead = (
@@ -1113,7 +1134,8 @@ class OmniScheduler:
                 if batch:
                     result = self.run_batch(batch)
                     if result is not _FAILED_BATCH_RESULT:
-                        self.process_batch_result(batch, result)
+                        with _record_function("omni.scheduler.process_batch_result"):
+                            self.process_batch_result(batch, result)
                 else:
                     self.self_check_during_idle()
                     time.sleep(0.001)

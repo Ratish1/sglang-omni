@@ -25,6 +25,7 @@ from sglang_omni.models.higgs_tts._vendored.higgs_audio_v2_tokenizer_hf import (
     HiggsAudioV2TokenizerConfig,
     HiggsAudioV2TokenizerModel,
 )
+from sglang_omni.profiler.torch_profiler import record_function as _record_function
 
 WaveformInput = torch.Tensor | np.ndarray
 
@@ -174,16 +175,20 @@ class HiggsAudioCodec:
         ``[-1, 1]``. Resamples to 24 kHz; clips < 1 s are zero-padded since
         the encoder errors otherwise.
         """
-        wav = _to_mono_3d(waveform).to(torch.float32)
-        sr = sample_rate or self.SAMPLE_RATE
-        if sr != self.SAMPLE_RATE:
-            wav = torchaudio.functional.resample(wav, sr, self.SAMPLE_RATE)
-        if wav.shape[-1] < self.SAMPLE_RATE:
-            wav = F.pad(wav, (0, self.SAMPLE_RATE - wav.shape[-1]))
+        with _record_function("higgs.codec.encode_reference"):
+            wav = _to_mono_3d(waveform).to(torch.float32)
+            sr = sample_rate or self.SAMPLE_RATE
+            if sr != self.SAMPLE_RATE:
+                with _record_function("higgs.codec.resample_reference"):
+                    wav = torchaudio.functional.resample(wav, sr, self.SAMPLE_RATE)
+            if wav.shape[-1] < self.SAMPLE_RATE:
+                wav = F.pad(wav, (0, self.SAMPLE_RATE - wav.shape[-1]))
 
-        wav = wav.to(device=self.device, dtype=self._dtype)
-        codes_BNT = self.model.encode(wav).audio_codes
-        return codes_BNT.squeeze(0).transpose(0, 1).to(torch.long).cpu()
+            wav = wav.to(device=self.device, dtype=self._dtype)
+            with _record_function("higgs.codec.model_encode"):
+                codes_BNT = self.model.encode(wav).audio_codes
+            with _record_function("higgs.codec.encode_d2h"):
+                return codes_BNT.squeeze(0).transpose(0, 1).to(torch.long).cpu()
 
     def _bucketed_batch(
         self,
@@ -223,57 +228,73 @@ class HiggsAudioCodec:
     @torch.no_grad()
     def encode_batch(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
         # Offline/bulk encoding utility.
-        padded: list[torch.Tensor] = []
-        for w in waveforms:
-            wav = _to_mono_3d(w).to(torch.float32)
-            if wav.shape[-1] < self.SAMPLE_RATE:
-                wav = F.pad(wav, (0, self.SAMPLE_RATE - wav.shape[-1]))
-            padded.append(wav)
+        with _record_function("higgs.codec.encode_batch"):
+            padded: list[torch.Tensor] = []
+            for w in waveforms:
+                wav = _to_mono_3d(w).to(torch.float32)
+                if wav.shape[-1] < self.SAMPLE_RATE:
+                    wav = F.pad(wav, (0, self.SAMPLE_RATE - wav.shape[-1]))
+                padded.append(wav)
 
-        def _batch_fn(batch_items: list[torch.Tensor]) -> list[torch.Tensor]:
-            batch = torch.cat(batch_items).to(device=self.device, dtype=self._dtype)
-            codes_BNT = self.model.encode(batch).audio_codes.to(torch.long).cpu()
-            return [codes_BNT[j].transpose(0, 1) for j in range(len(batch_items))]
+            def _batch_fn(batch_items: list[torch.Tensor]) -> list[torch.Tensor]:
+                with _record_function("higgs.codec.model_encode_batch"):
+                    batch = torch.cat(batch_items).to(
+                        device=self.device, dtype=self._dtype
+                    )
+                    codes_BNT = (
+                        self.model.encode(batch).audio_codes.to(torch.long).cpu()
+                    )
+                    return [
+                        codes_BNT[j].transpose(0, 1) for j in range(len(batch_items))
+                    ]
 
-        return self._bucketed_batch(
-            padded,
-            bucket_key_fn=lambda w: w.shape[-1],
-            single_fn=self.encode_reference,
-            batch_fn=_batch_fn,
-            error_label="encode_batch",
-        )
+            return self._bucketed_batch(
+                padded,
+                bucket_key_fn=lambda w: w.shape[-1],
+                single_fn=self.encode_reference,
+                batch_fn=_batch_fn,
+                error_label="encode_batch",
+            )
 
     @torch.no_grad()
     def decode(self, codes_TN: torch.Tensor) -> torch.Tensor:
         """``[T, num_codebooks]`` → mono waveform ``[L]``."""
-        if codes_TN.ndim != 2:
-            raise ValueError(
-                f"codes must be 2-D [T, num_codebooks], got {tuple(codes_TN.shape)}"
+        with _record_function("higgs.codec.decode"):
+            if codes_TN.ndim != 2:
+                raise ValueError(
+                    f"codes must be 2-D [T, num_codebooks], got {tuple(codes_TN.shape)}"
+                )
+            codes_BNT = (
+                codes_TN.transpose(0, 1)
+                .unsqueeze(0)
+                .to(device=self.device, dtype=torch.long)
             )
-        codes_BNT = (
-            codes_TN.transpose(0, 1)
-            .unsqueeze(0)
-            .to(device=self.device, dtype=torch.long)
-        )
-        return self.model.decode(codes_BNT).audio_values.squeeze(0).squeeze(0).cpu()
+            with _record_function("higgs.codec.model_decode"):
+                audio = self.model.decode(codes_BNT).audio_values
+            with _record_function("higgs.codec.decode_d2h"):
+                return audio.squeeze(0).squeeze(0).cpu()
 
     @torch.no_grad()
     def decode_batch(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """Batch-decode variable-length ``[T_i, N]`` tensors into ``[L_i]`` waveforms."""
 
         def _batch_fn(batch_items: list[torch.Tensor]) -> list[torch.Tensor]:
-            stacked = torch.stack(batch_items)
-            codes_BNT = stacked.transpose(1, 2).to(device=self.device, dtype=torch.long)
-            audio = self.model.decode(codes_BNT).audio_values.cpu()
-            return [audio[j, 0] for j in range(len(batch_items))]
+            with _record_function("higgs.codec.model_decode_batch"):
+                stacked = torch.stack(batch_items)
+                codes_BNT = stacked.transpose(1, 2).to(
+                    device=self.device, dtype=torch.long
+                )
+                audio = self.model.decode(codes_BNT).audio_values.cpu()
+                return [audio[j, 0] for j in range(len(batch_items))]
 
-        return self._bucketed_batch(
-            codes_list,
-            bucket_key_fn=lambda c: c.shape[0],
-            single_fn=self.decode,
-            batch_fn=_batch_fn,
-            error_label="decode_batch",
-        )
+        with _record_function("higgs.codec.decode_batch"):
+            return self._bucketed_batch(
+                codes_list,
+                bucket_key_fn=lambda c: c.shape[0],
+                single_fn=self.decode,
+                batch_fn=_batch_fn,
+                error_label="decode_batch",
+            )
 
 
 __all__ = ["HiggsAudioCodec"]

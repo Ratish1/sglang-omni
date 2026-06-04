@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang_omni.profiler.torch_profiler import record_function as _record_function
+
 
 class HiggsFusedMultiTextEmbedding(nn.Module):
     """Fused multi-codebook embedding: one ``[N*V, D]`` weight + offset lookup.
@@ -27,11 +29,12 @@ class HiggsFusedMultiTextEmbedding(nn.Module):
         self.vocab_size = vocab_size
 
     def forward(self, codes_LN: torch.Tensor) -> torch.Tensor:
-        N = self.num_codebooks
-        V = self.vocab_size
-        offsets = torch.arange(N, device=codes_LN.device, dtype=codes_LN.dtype) * V
-        fused_ids = codes_LN + offsets
-        return F.embedding(fused_ids, self.weight).sum(dim=-2)
+        with _record_function("higgs.fused_multi_text_embedding"):
+            N = self.num_codebooks
+            V = self.vocab_size
+            offsets = torch.arange(N, device=codes_LN.device, dtype=codes_LN.dtype) * V
+            fused_ids = codes_LN + offsets
+            return F.embedding(fused_ids, self.weight).sum(dim=-2)
 
 
 class HiggsFusedMultiTextHead(nn.Module):
@@ -47,12 +50,13 @@ class HiggsFusedMultiTextHead(nn.Module):
         self.vocab_size = vocab_size
 
     def generate(self, hidden_LD: torch.Tensor) -> torch.Tensor:
-        logits = F.linear(hidden_LD, self.weight)
-        return logits.reshape(
-            hidden_LD.shape[0],
-            self.num_codebooks,
-            self.vocab_size,
-        )
+        with _record_function("higgs.fused_multi_text_head"):
+            logits = F.linear(hidden_LD, self.weight)
+            return logits.reshape(
+                hidden_LD.shape[0],
+                self.num_codebooks,
+                self.vocab_size,
+            )
 
 
 __all__ = ["HiggsFusedMultiTextEmbedding", "HiggsFusedMultiTextHead"]

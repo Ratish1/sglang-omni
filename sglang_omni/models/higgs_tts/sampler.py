@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import torch
 
 from sglang_omni.models.higgs_tts.utils import BOC_ID, EOC_ID
+from sglang_omni.profiler.torch_profiler import record_function as _record_function
 
 # Sentinel returned by ``step`` after ``generation_done``; engine treats as stop.
 STOP_CODE = -1
@@ -229,40 +230,49 @@ def _sample_independent_batched(
     branchless (compute both, then ``torch.where``) because this runs inside the
     captured CUDA graph, where data-dependent host control flow is illegal.
     """
-    B, N, V = logits_BNV.shape
+    with _record_function("higgs.sampler.sample_independent_batched"):
+        B, N, V = logits_BNV.shape
 
-    # Per-row greedy mask (broadcast over codebooks). argmax over RAW logits,
-    # exactly as _sample_independent does.
-    greedy_B1 = (temperature <= _GREEDY_TEMP_THRESHOLD).view(B, 1)
-    if top_k_buf is not None:
-        greedy_B1 = greedy_B1 | (top_k_buf == 1).view(B, 1)
-    argmax_BN = logits_BNV.argmax(dim=-1)
+        # Per-row greedy mask (broadcast over codebooks). argmax over RAW logits,
+        # exactly as _sample_independent does.
+        greedy_B1 = (temperature <= _GREEDY_TEMP_THRESHOLD).view(B, 1)
+        if top_k_buf is not None:
+            greedy_B1 = greedy_B1 | (top_k_buf == 1).view(B, 1)
+        with _record_function("higgs.sampler.argmax"):
+            argmax_BN = logits_BNV.argmax(dim=-1)
 
-    safe_temp = temperature.clamp(min=_GREEDY_TEMP_THRESHOLD).view(B, 1, 1)
-    logits = logits_BNV / safe_temp
+        safe_temp = temperature.clamp(min=_GREEDY_TEMP_THRESHOLD).view(B, 1, 1)
+        logits = logits_BNV / safe_temp
 
-    if top_k_buf is not None:
-        top_vals = logits.topk(K_MAX, dim=-1).values
-        k_idx = top_k_buf.view(B, 1, 1).expand(-1, N, 1).clamp(min=1, max=K_MAX) - 1
-        kth = top_vals.gather(-1, k_idx)
-        logits = torch.where(logits < kth, float("-inf"), logits)
+        if top_k_buf is not None:
+            with _record_function("higgs.sampler.top_k_filter"):
+                top_vals = logits.topk(K_MAX, dim=-1).values
+                k_idx = (
+                    top_k_buf.view(B, 1, 1).expand(-1, N, 1).clamp(min=1, max=K_MAX) - 1
+                )
+                kth = top_vals.gather(-1, k_idx)
+                logits = torch.where(logits < kth, float("-inf"), logits)
 
-    if top_p is not None:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-        cum_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-        thresh = top_p.view(B, 1, 1)
-        remove = cum_probs > thresh
-        remove[..., 1:] = remove[..., :-1].clone()
-        remove[..., 0] = False
-        scatter = torch.zeros_like(remove)
-        scatter.scatter_(-1, sorted_indices, remove)
-        logits = torch.where(scatter, float("-inf"), logits)
+        if top_p is not None:
+            with _record_function("higgs.sampler.top_p_filter"):
+                sorted_logits, sorted_indices = torch.sort(
+                    logits, descending=True, dim=-1
+                )
+                cum_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                thresh = top_p.view(B, 1, 1)
+                remove = cum_probs > thresh
+                remove[..., 1:] = remove[..., :-1].clone()
+                remove[..., 0] = False
+                scatter = torch.zeros_like(remove)
+                scatter.scatter_(-1, sorted_indices, remove)
+                logits = torch.where(scatter, float("-inf"), logits)
 
-    probs = logits.softmax(dim=-1)
-    codes_flat = probs.reshape(B * N, V).multinomial(num_samples=1).squeeze(-1)
-    sampled_BN = codes_flat.view(B, N)
+        with _record_function("higgs.sampler.multinomial"):
+            probs = logits.softmax(dim=-1)
+            codes_flat = probs.reshape(B * N, V).multinomial(num_samples=1).squeeze(-1)
+            sampled_BN = codes_flat.view(B, N)
 
-    return torch.where(greedy_B1, argmax_BN, sampled_BN).to(torch.long)
+        return torch.where(greedy_B1, argmax_BN, sampled_BN).to(torch.long)
 
 
 def batched_step(
@@ -280,36 +290,41 @@ def batched_step(
     :func:`batched_step_direct`, scatter the new state back. Done rows
     return :data:`STOP_CODE` with state untouched.
     """
-    delay_count = state.delay_count[row_indices]
-    eoc_countdown = state.eoc_countdown[row_indices]
-    generation_done = state.generation_done[row_indices]
-    last_codes = state.last_codes[row_indices]
+    with _record_function("higgs.sampler.batched_step"):
+        with _record_function("higgs.sampler.gather_state"):
+            delay_count = state.delay_count[row_indices]
+            eoc_countdown = state.eoc_countdown[row_indices]
+            generation_done = state.generation_done[row_indices]
+            last_codes = state.last_codes[row_indices]
 
-    (
-        out_codes,
-        new_delay_count,
-        new_eoc_countdown,
-        new_generation_done,
-        new_last_codes,
-    ) = batched_step_direct(
-        logits_BNV,
-        delay_count,
-        eoc_countdown,
-        generation_done,
-        last_codes,
-        temperature=temperature,
-        top_p=top_p,
-        top_k_buf=top_k_buf,
-        boc_id=boc_id,
-        eoc_id=eoc_id,
-    )
+        (
+            out_codes,
+            new_delay_count,
+            new_eoc_countdown,
+            new_generation_done,
+            new_last_codes,
+        ) = batched_step_direct(
+            logits_BNV,
+            delay_count,
+            eoc_countdown,
+            generation_done,
+            last_codes,
+            temperature=temperature,
+            top_p=top_p,
+            top_k_buf=top_k_buf,
+            boc_id=boc_id,
+            eoc_id=eoc_id,
+        )
 
-    state.delay_count[row_indices] = new_delay_count.to(state.delay_count.dtype)
-    state.eoc_countdown[row_indices] = new_eoc_countdown.to(state.eoc_countdown.dtype)
-    state.generation_done[row_indices] = new_generation_done
-    state.last_codes[row_indices] = new_last_codes
+        with _record_function("higgs.sampler.scatter_state"):
+            state.delay_count[row_indices] = new_delay_count.to(state.delay_count.dtype)
+            state.eoc_countdown[row_indices] = new_eoc_countdown.to(
+                state.eoc_countdown.dtype
+            )
+            state.generation_done[row_indices] = new_generation_done
+            state.last_codes[row_indices] = new_last_codes
 
-    return out_codes
+        return out_codes
 
 
 def batched_step_direct(
@@ -329,61 +344,70 @@ def batched_step_direct(
     no ``state``/``row_indices`` indirection. Caller persists the returned
     new state. See :func:`batched_step` for arg semantics.
     """
-    B, N, V = logits_BNV.shape
-    device = logits_BNV.device
+    with _record_function("higgs.sampler.batched_step_direct"):
+        B, N, V = logits_BNV.shape
+        device = logits_BNV.device
 
-    delay_count = delay_count.to(torch.long)
-    eoc_countdown = eoc_countdown.to(torch.long)
+        delay_count = delay_count.to(torch.long)
+        eoc_countdown = eoc_countdown.to(torch.long)
 
-    codes_BN = _sample_independent_batched(
-        logits_BNV,
-        temperature=temperature,
-        top_p=top_p,
-        top_k_buf=top_k_buf,
-    )
-
-    cb_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, N)
-    in_delay = (delay_count < N).unsqueeze(-1)
-    delay_mask = in_delay & (cb_idx > delay_count.unsqueeze(-1))
-    codes_BN = torch.where(delay_mask, torch.full_like(codes_BN, boc_id), codes_BN)
-
-    active = ~generation_done
-    in_delay_active = active & (delay_count < N)
-    in_winddown_active = active & (eoc_countdown >= 0) & (~in_delay_active)
-    cb0_eoc_now_active = (
-        active & (~in_delay_active) & (~in_winddown_active) & (codes_BN[:, 0] == eoc_id)
-    )
-
-    new_delay_count = torch.where(in_delay_active, delay_count + 1, delay_count)
-
-    if N > 2:
-        new_eoc_countdown = torch.where(
-            cb0_eoc_now_active,
-            torch.full_like(eoc_countdown, N - 2),
-            torch.where(in_winddown_active, eoc_countdown - 1, eoc_countdown),
+        codes_BN = _sample_independent_batched(
+            logits_BNV,
+            temperature=temperature,
+            top_p=top_p,
+            top_k_buf=top_k_buf,
         )
-        done_this_step = in_winddown_active & (new_eoc_countdown <= 0)
-    else:
-        new_eoc_countdown = torch.where(
-            in_winddown_active, eoc_countdown - 1, eoc_countdown
-        )
-        done_this_step = cb0_eoc_now_active | (
-            in_winddown_active & (new_eoc_countdown <= 0)
-        )
-    new_generation_done = generation_done | done_this_step
 
-    update_codes = (active & (~done_this_step)).unsqueeze(-1)
-    new_last_codes = torch.where(update_codes, codes_BN, last_codes)
+        with _record_function("higgs.sampler.delay_pattern_update"):
+            cb_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, N)
+            in_delay = (delay_count < N).unsqueeze(-1)
+            delay_mask = in_delay & (cb_idx > delay_count.unsqueeze(-1))
+            codes_BN = torch.where(
+                delay_mask, torch.full_like(codes_BN, boc_id), codes_BN
+            )
 
-    stop = torch.full_like(codes_BN, STOP_CODE)
-    out_codes = torch.where(generation_done.unsqueeze(-1), stop, codes_BN)
-    return (
-        out_codes,
-        new_delay_count,
-        new_eoc_countdown,
-        new_generation_done,
-        new_last_codes,
-    )
+        with _record_function("higgs.sampler.eoc_state_update"):
+            active = ~generation_done
+            in_delay_active = active & (delay_count < N)
+            in_winddown_active = active & (eoc_countdown >= 0) & (~in_delay_active)
+            cb0_eoc_now_active = (
+                active
+                & (~in_delay_active)
+                & (~in_winddown_active)
+                & (codes_BN[:, 0] == eoc_id)
+            )
+
+            new_delay_count = torch.where(in_delay_active, delay_count + 1, delay_count)
+
+            if N > 2:
+                new_eoc_countdown = torch.where(
+                    cb0_eoc_now_active,
+                    torch.full_like(eoc_countdown, N - 2),
+                    torch.where(in_winddown_active, eoc_countdown - 1, eoc_countdown),
+                )
+                done_this_step = in_winddown_active & (new_eoc_countdown <= 0)
+            else:
+                new_eoc_countdown = torch.where(
+                    in_winddown_active, eoc_countdown - 1, eoc_countdown
+                )
+                done_this_step = cb0_eoc_now_active | (
+                    in_winddown_active & (new_eoc_countdown <= 0)
+                )
+            new_generation_done = generation_done | done_this_step
+
+            update_codes = (active & (~done_this_step)).unsqueeze(-1)
+            new_last_codes = torch.where(update_codes, codes_BN, last_codes)
+
+        with _record_function("higgs.sampler.stop_mask"):
+            stop = torch.full_like(codes_BN, STOP_CODE)
+            out_codes = torch.where(generation_done.unsqueeze(-1), stop, codes_BN)
+        return (
+            out_codes,
+            new_delay_count,
+            new_eoc_countdown,
+            new_generation_done,
+            new_last_codes,
+        )
 
 
 __all__ = [

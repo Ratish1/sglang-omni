@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from sglang_omni.profiler.torch_profiler import record_function as _record_function
 from sglang_omni.scheduling.types import ModelRunnerOutput, RequestOutput
 
 logger = logging.getLogger(__name__)
@@ -108,13 +109,21 @@ class ModelRunner:
             forward_batch, schedule_batch, scheduler_output.requests, is_prefill
         )
         if is_prefill:
-            self.post_prefill(
-                batch_result, forward_batch, schedule_batch, scheduler_output.requests
-            )
+            with _record_function("omni.model_runner.post_prefill"):
+                self.post_prefill(
+                    batch_result,
+                    forward_batch,
+                    schedule_batch,
+                    scheduler_output.requests,
+                )
         else:
-            self.post_decode(
-                batch_result, forward_batch, schedule_batch, scheduler_output.requests
-            )
+            with _record_function("omni.model_runner.post_decode"):
+                self.post_decode(
+                    batch_result,
+                    forward_batch,
+                    schedule_batch,
+                    scheduler_output.requests,
+                )
         return self._finalize(
             batch_result,
             forward_batch,
@@ -147,19 +156,21 @@ class ModelRunner:
             is_prefill,
             is_lookahead=True,
         )
-        host_buf = self.post_decode_launch(
-            batch_result, forward_batch, scheduler_output.requests
-        )
+        with _record_function("omni.model_runner.post_decode_launch"):
+            host_buf = self.post_decode_launch(
+                batch_result, forward_batch, scheduler_output.requests
+            )
         # Publish this step's output token ids now (post_decode_launch set them
         # from GPU state without a host sync) so the NEXT decode step's
         # get_next_batch_to_run / prepare_for_decode can build its input_ids —
         # under lookahead the host collect (resolve) lags by one step.
         if batch_result.next_token_ids is not None:
             schedule_batch.output_ids = batch_result.next_token_ids
-        event = torch.cuda.Event()
-        # Recorded AFTER the async D2H enqueued by post_decode_launch, so
-        # event.query()==True means the host buffer is ready (design.md §3).
-        event.record()
+        with _record_function("omni.model_runner.async_event_record"):
+            event = torch.cuda.Event()
+            # Recorded AFTER the async D2H enqueued by post_decode_launch, so
+            # event.query()==True means the host buffer is ready (design.md §3).
+            event.record()
         return _PendingStep(
             event=event,
             host_buf=host_buf,
@@ -182,23 +193,25 @@ class ModelRunner:
         """
         if pending is None:
             return None
-        if pending.event.query():
-            self._async_query_hit += 1
-        else:
-            pending.event.synchronize()
-            self._async_query_miss += 1
+        with _record_function("omni.model_runner.async_event_wait"):
+            if pending.event.query():
+                self._async_query_hit += 1
+            else:
+                pending.event.synchronize()
+                self._async_query_miss += 1
         skip_rids = {
             req.request_id
             for req in pending.scheduler_output.requests
             if req.data.req.finished()
         }
-        self.post_decode_resolve(
-            pending.host_buf,
-            pending.batch_result,
-            pending.forward_batch,
-            pending.schedule_batch,
-            pending.scheduler_output.requests,
-        )
+        with _record_function("omni.model_runner.post_decode_resolve"):
+            self.post_decode_resolve(
+                pending.host_buf,
+                pending.batch_result,
+                pending.forward_batch,
+                pending.schedule_batch,
+                pending.scheduler_output.requests,
+            )
         return self._finalize(
             pending.batch_result,
             pending.forward_batch,
@@ -213,39 +226,40 @@ class ModelRunner:
         """Build the ForwardBatch + capture-hidden mode. Returns
         ``(forward_batch, schedule_batch, model_worker_batch, is_prefill)``, or
         None when there is no batch to run."""
-        from sglang.srt.model_executor.forward_batch_info import (
-            CaptureHiddenMode,
-            ForwardBatch,
-        )
-
-        if self.device.type == "cuda":
-            torch.cuda.set_device(self.device)
-
-        schedule_batch = scheduler_output.batch_data
-        if schedule_batch is None:
-            return None
-
-        model_worker_batch = schedule_batch.get_model_worker_batch()
-        is_prefill = bool(schedule_batch.forward_mode.is_extend())
-
-        capture_hidden_mode = (
-            self.requested_capture_hidden_mode_prefill(
-                schedule_batch, scheduler_output.requests
+        with _record_function("omni.model_runner.build_forward_batch"):
+            from sglang.srt.model_executor.forward_batch_info import (
+                CaptureHiddenMode,
+                ForwardBatch,
             )
-            if is_prefill
-            else self.requested_capture_hidden_mode_decode(
-                schedule_batch, scheduler_output.requests
-            )
-        )
-        if capture_hidden_mode is not None:
-            model_worker_batch.capture_hidden_mode = capture_hidden_mode
-        elif self.output_processor._capture_hidden:
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.tp_worker.model_runner
-        )
-        return forward_batch, schedule_batch, model_worker_batch, is_prefill
+            if self.device.type == "cuda":
+                torch.cuda.set_device(self.device)
+
+            schedule_batch = scheduler_output.batch_data
+            if schedule_batch is None:
+                return None
+
+            model_worker_batch = schedule_batch.get_model_worker_batch()
+            is_prefill = bool(schedule_batch.forward_mode.is_extend())
+
+            capture_hidden_mode = (
+                self.requested_capture_hidden_mode_prefill(
+                    schedule_batch, scheduler_output.requests
+                )
+                if is_prefill
+                else self.requested_capture_hidden_mode_decode(
+                    schedule_batch, scheduler_output.requests
+                )
+            )
+            if capture_hidden_mode is not None:
+                model_worker_batch.capture_hidden_mode = capture_hidden_mode
+            elif self.output_processor._capture_hidden:
+                model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.tp_worker.model_runner
+            )
+            return forward_batch, schedule_batch, model_worker_batch, is_prefill
 
     def _prepare_and_forward(
         self,
@@ -259,22 +273,27 @@ class ModelRunner:
         """Prepare hook → standard forward (if not custom) → sample-before-post
         block. Returns ``batch_result``."""
         if is_prefill:
-            self.before_prefill(forward_batch, schedule_batch, requests)
-            batch_result = self.custom_prefill_forward(
-                forward_batch, schedule_batch, requests
-            )
+            with _record_function("omni.model_runner.before_prefill"):
+                self.before_prefill(forward_batch, schedule_batch, requests)
+            with _record_function("omni.model_runner.custom_prefill_forward"):
+                batch_result = self.custom_prefill_forward(
+                    forward_batch, schedule_batch, requests
+                )
         else:
-            self.before_decode(
-                forward_batch,
-                schedule_batch,
-                requests,
-                is_lookahead=is_lookahead,
-            )
-            batch_result = self.custom_decode_forward(
-                forward_batch, schedule_batch, requests
-            )
+            with _record_function("omni.model_runner.before_decode"):
+                self.before_decode(
+                    forward_batch,
+                    schedule_batch,
+                    requests,
+                    is_lookahead=is_lookahead,
+                )
+            with _record_function("omni.model_runner.custom_decode_forward"):
+                batch_result = self.custom_decode_forward(
+                    forward_batch, schedule_batch, requests
+                )
         if batch_result is None:
-            batch_result = self.tp_worker.forward_batch_generation(forward_batch)
+            with _record_function("omni.model_runner.forward_batch_generation"):
+                batch_result = self.tp_worker.forward_batch_generation(forward_batch)
 
         if (
             not schedule_batch.is_prefill_only
@@ -287,9 +306,10 @@ class ModelRunner:
                 )
             )
         ):
-            batch_result.next_token_ids = self._sample_next_token_ids(
-                batch_result.logits_output, forward_batch, schedule_batch, requests
-            )
+            with _record_function("omni.model_runner.sample_before_post"):
+                batch_result.next_token_ids = self._sample_next_token_ids(
+                    batch_result.logits_output, forward_batch, schedule_batch, requests
+                )
             schedule_batch.output_ids = batch_result.next_token_ids
         return batch_result
 
@@ -316,44 +336,48 @@ class ModelRunner:
         a stale-length output_ids on the running batch, which the next
         prepare_for_decode turns into an input_ids that mismatches seq_lens once
         a request finishes mid-batch (the bs>1 replay size mismatch)."""
-        if schedule_batch.is_prefill_only:
-            if batch_result.next_token_ids is None:
-                batch_result.next_token_ids = torch.zeros(
-                    len(model_worker_batch.seq_lens),
-                    dtype=torch.long,
-                    device=model_worker_batch.input_ids.device,
-                )
-        elif batch_result.next_token_ids is None:
-            batch_result.next_token_ids = self._sample_next_token_ids(
-                batch_result.logits_output,
-                forward_batch,
-                schedule_batch,
-                scheduler_output.requests,
+        with _record_function("omni.model_runner.finalize"):
+            if schedule_batch.is_prefill_only:
+                if batch_result.next_token_ids is None:
+                    batch_result.next_token_ids = torch.zeros(
+                        len(model_worker_batch.seq_lens),
+                        dtype=torch.long,
+                        device=model_worker_batch.input_ids.device,
+                    )
+            elif batch_result.next_token_ids is None:
+                with _record_function("omni.model_runner.final_sample"):
+                    batch_result.next_token_ids = self._sample_next_token_ids(
+                        batch_result.logits_output,
+                        forward_batch,
+                        schedule_batch,
+                        scheduler_output.requests,
+                    )
+            if set_output_ids:
+                schedule_batch.output_ids = batch_result.next_token_ids
+
+            with _record_function("omni.model_runner.output_processor"):
+                outputs = self.output_processor.process(batch_result, scheduler_output)
+            with _record_function("omni.model_runner.post_process_outputs"):
+                self.post_process_outputs(batch_result, scheduler_output, outputs)
+            skip_rids = skip_rids or set()
+            for sched_req in scheduler_output.requests:
+                if sched_req.request_id in skip_rids:
+                    continue
+                data = sched_req.data
+                data.generation_steps = int(data.generation_steps) + 1
+                req_output = outputs[sched_req.request_id]
+                extra = req_output.extra
+                if isinstance(extra, dict) and extra:
+                    data.extra_model_outputs.update(extra)
+            req_ids = [req.request_id for req in scheduler_output.requests]
+            req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+
+            return ModelRunnerOutput(
+                outputs=outputs,
+                req_ids=req_ids,
+                req_id_to_index=req_id_to_index,
+                can_run_cuda_graph=bool(batch_result.can_run_cuda_graph),
             )
-        if set_output_ids:
-            schedule_batch.output_ids = batch_result.next_token_ids
-
-        outputs = self.output_processor.process(batch_result, scheduler_output)
-        self.post_process_outputs(batch_result, scheduler_output, outputs)
-        skip_rids = skip_rids or set()
-        for sched_req in scheduler_output.requests:
-            if sched_req.request_id in skip_rids:
-                continue
-            data = sched_req.data
-            data.generation_steps = int(data.generation_steps) + 1
-            req_output = outputs[sched_req.request_id]
-            extra = req_output.extra
-            if isinstance(extra, dict) and extra:
-                data.extra_model_outputs.update(extra)
-        req_ids = [req.request_id for req in scheduler_output.requests]
-        req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
-
-        return ModelRunnerOutput(
-            outputs=outputs,
-            req_ids=req_ids,
-            req_id_to_index=req_id_to_index,
-            can_run_cuda_graph=bool(batch_result.can_run_cuda_graph),
-        )
 
     # ------------------------------------------------------------------
     # Hooks — override in subclasses
@@ -480,9 +504,10 @@ class ModelRunner:
         schedule_batch: Any,
         requests: list,
     ) -> Any:
-        self._apply_repetition_penalty(logits_output, requests)
-        self._apply_codec_suppress_tokens(logits_output, requests)
-        return self.tp_worker.model_runner.sample(logits_output, forward_batch)
+        with _record_function("omni.model_runner.sample_next_token_ids"):
+            self._apply_repetition_penalty(logits_output, requests)
+            self._apply_codec_suppress_tokens(logits_output, requests)
+            return self.tp_worker.model_runner.sample(logits_output, forward_batch)
 
     def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
         logits = logits_output.next_token_logits

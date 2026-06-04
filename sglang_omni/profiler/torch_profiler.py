@@ -8,8 +8,10 @@ import os
 import subprocess
 import threading
 from contextlib import nullcontext
+from types import TracebackType
 
 from torch.profiler import ProfilerActivity, profile
+from torch.profiler import record_function as _torch_record_function
 
 from .base_profiler import ProfilerBase
 
@@ -18,6 +20,34 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+class _NoOpRecordFunction:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        return False
+
+
+_NOOP_RECORD_FUNCTION = _NoOpRecordFunction()
+
+
+def record_function(name: str):
+    """Annotate a region in torch profiler traces.
+
+    Keep the helper local to the Omni profiler package so Higgs/model code does
+    not import torch profiler internals directly.
+    """
+
+    if not TorchProfiler.is_active():
+        return _NOOP_RECORD_FUNCTION
+    return _torch_record_function(name)
 
 
 class TorchProfiler(ProfilerBase):
@@ -43,6 +73,7 @@ class TorchProfiler(ProfilerBase):
         Start the profiler with the given trace path template.
         """
         with cls._lock:
+            rank = cls._get_rank()
 
             # 1. Cleanup any existing profiler
             if cls._profiler is not None:
@@ -64,8 +95,6 @@ class TorchProfiler(ProfilerBase):
                 cls._profiler = None
                 cls._active_run_id = None
                 cls._trace_template = ""
-
-            rank = cls._get_rank()
 
             # 2. Make path absolute
             trace_path_template = os.path.abspath(trace_path_template)

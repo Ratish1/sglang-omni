@@ -16,6 +16,7 @@ from sglang_omni.models.tts_streaming import (
     resolve_initial_codec_chunk_frames,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.torch_profiler import record_function as _record_function
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
@@ -139,78 +140,80 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
     def on_stream_chunk(
         self, request_id: str, item: StreamItem
     ) -> list[OutgoingMessage]:
-        state = self._stream_states.setdefault(request_id, _HiggsStreamState())
-        self._latch_stream_metadata(request_id, state, item.metadata)
+        with _record_function("higgs.vocoder.on_stream_chunk"):
+            state = self._stream_states.setdefault(request_id, _HiggsStreamState())
+            self._latch_stream_metadata(request_id, state, item.metadata)
 
-        row = item.data
-        if not isinstance(row, torch.Tensor):
-            raise TypeError(
-                f"Higgs stream chunk for {request_id!r} must carry a torch.Tensor, "
-                f"got {type(row).__name__}"
-            )
-        row = row.to(dtype=torch.long)
-        if row.ndim != 1:
-            raise ValueError(
-                f"Higgs stream chunk must be 1-D [N], got {tuple(row.shape)}"
-            )
+            row = item.data
+            if not isinstance(row, torch.Tensor):
+                raise TypeError(
+                    f"Higgs stream chunk for {request_id!r} must carry a torch.Tensor, "
+                    f"got {type(row).__name__}"
+                )
+            row = row.to(dtype=torch.long)
+            if row.ndim != 1:
+                raise ValueError(
+                    f"Higgs stream chunk must be 1-D [N], got {tuple(row.shape)}"
+                )
 
-        num_codebooks = self._require_stream_contract(state, request_id)[0]
-        if int(row.shape[0]) != num_codebooks:
-            raise ValueError(
-                f"Higgs stream chunk has {int(row.shape[0])} codebooks, "
-                f"expected {num_codebooks}"
-            )
-        state.delayed_rows.append(row)
+            num_codebooks = self._require_stream_contract(state, request_id)[0]
+            if int(row.shape[0]) != num_codebooks:
+                raise ValueError(
+                    f"Higgs stream chunk has {int(row.shape[0])} codebooks, "
+                    f"expected {num_codebooks}"
+                )
+            state.delayed_rows.append(row)
 
-        output = self._decode_delta(state, is_final=False)
-        if output is None:
-            return []
-        return [
-            OutgoingMessage(
-                request_id=request_id,
-                type="stream",
-                data=output,
-                metadata={"modality": "audio"},
-            )
-        ]
-
-    def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
-        payload = self._stream_payloads[request_id]
-        state = self._stream_states.setdefault(request_id, _HiggsStreamState())
-        output = self._decode_delta(state, is_final=True)
-        if output is None and not state.has_emitted:
-            output = self._audio_payload_from_stage_payload(payload)
-
-        messages: list[OutgoingMessage] = []
-        if output is not None:
-            messages.append(
+            output = self._decode_delta(state, is_final=False)
+            if output is None:
+                return []
+            return [
                 OutgoingMessage(
                     request_id=request_id,
                     type="stream",
                     data=output,
                     metadata={"modality": "audio"},
                 )
-            )
+            ]
 
-        final_data: dict[str, Any] = {
-            "modality": "audio",
-            "sample_rate": self._sample_rate,
-        }
-        usage = self._build_usage(HiggsTtsState.from_dict(payload.data))
-        if usage is not None:
-            final_data["usage"] = usage
-        messages.append(
-            OutgoingMessage(
-                request_id=request_id,
-                type="result",
-                data=StagePayload(
-                    request_id=payload.request_id,
-                    request=payload.request,
-                    data=final_data,
-                ),
+    def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
+        with _record_function("higgs.vocoder.on_stream_done"):
+            payload = self._stream_payloads[request_id]
+            state = self._stream_states.setdefault(request_id, _HiggsStreamState())
+            output = self._decode_delta(state, is_final=True)
+            if output is None and not state.has_emitted:
+                output = self._audio_payload_from_stage_payload(payload)
+
+            messages: list[OutgoingMessage] = []
+            if output is not None:
+                messages.append(
+                    OutgoingMessage(
+                        request_id=request_id,
+                        type="stream",
+                        data=output,
+                        metadata={"modality": "audio"},
+                    )
+                )
+
+            final_data: dict[str, Any] = {
+                "modality": "audio",
+                "sample_rate": self._sample_rate,
+            }
+            usage = self._build_usage(HiggsTtsState.from_dict(payload.data))
+            if usage is not None:
+                final_data["usage"] = usage
+            messages.append(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="result",
+                    data=StagePayload(
+                        request_id=payload.request_id,
+                        request=payload.request,
+                        data=final_data,
+                    ),
+                )
             )
-        )
-        return messages
+            return messages
 
     def clear_stream_state(self, request_id: str) -> None:
         self._stream_states.pop(request_id, None)
@@ -324,85 +327,94 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
     def _decode_delta(
         self, state: _HiggsStreamState, *, is_final: bool
     ) -> dict[str, Any] | None:
-        delayed_count = len(state.delayed_rows)
-        if delayed_count == 0:
-            return None
-        num_codebooks, codebook_size = self._require_stream_contract(state, "<stream>")
-        if delayed_count < num_codebooks:
-            return None
-        raw_total = delayed_count - num_codebooks + 1
+        with _record_function("higgs.vocoder.decode_delta"):
+            delayed_count = len(state.delayed_rows)
+            if delayed_count == 0:
+                return None
+            num_codebooks, codebook_size = self._require_stream_contract(
+                state, "<stream>"
+            )
+            if delayed_count < num_codebooks:
+                return None
+            raw_total = delayed_count - num_codebooks + 1
 
-        steady_codec_frames = max(1, self._stream_stride - num_codebooks + 1)
-        use_initial_chunk = (
-            state.initial_codec_chunk_frames > 0
-            and state.initial_codec_chunk_frames < steady_codec_frames
-            and not state.has_emitted
-        )
-        first_decode_rows = max(
-            num_codebooks,
-            state.initial_codec_chunk_frames + num_codebooks - 1,
-        )
-        next_decode_rows = state.next_decode_rows or (
-            first_decode_rows
-            if use_initial_chunk and not is_final
-            else max(num_codebooks, self._stream_stride)
-        )
-        if not is_final and delayed_count < next_decode_rows:
-            state.next_decode_rows = next_decode_rows
-            return None
+            steady_codec_frames = max(1, self._stream_stride - num_codebooks + 1)
+            use_initial_chunk = (
+                state.initial_codec_chunk_frames > 0
+                and state.initial_codec_chunk_frames < steady_codec_frames
+                and not state.has_emitted
+            )
+            first_decode_rows = max(
+                num_codebooks,
+                state.initial_codec_chunk_frames + num_codebooks - 1,
+            )
+            next_decode_rows = state.next_decode_rows or (
+                first_decode_rows
+                if use_initial_chunk and not is_final
+                else max(num_codebooks, self._stream_stride)
+            )
+            if not is_final and delayed_count < next_decode_rows:
+                state.next_decode_rows = next_decode_rows
+                return None
 
-        emit_until_raw = raw_total
-        if use_initial_chunk and not is_final:
-            emit_until_raw = min(raw_total, state.initial_codec_chunk_frames)
-        elif not is_final and self._stream_holdback_tokens:
-            emit_until_raw = max(0, raw_total - self._stream_holdback_tokens)
-        can_flush_codec_tail = is_final and self._samples_per_frame is not None
-        if emit_until_raw < state.emitted_raw_frames or (
-            emit_until_raw == state.emitted_raw_frames and not can_flush_codec_tail
-        ):
-            state.next_decode_rows = delayed_count + self._stream_followup_stride
-            return None
+            emit_until_raw = raw_total
+            if use_initial_chunk and not is_final:
+                emit_until_raw = min(raw_total, state.initial_codec_chunk_frames)
+            elif not is_final and self._stream_holdback_tokens:
+                emit_until_raw = max(0, raw_total - self._stream_holdback_tokens)
+            can_flush_codec_tail = is_final and self._samples_per_frame is not None
+            if emit_until_raw < state.emitted_raw_frames or (
+                emit_until_raw == state.emitted_raw_frames and not can_flush_codec_tail
+            ):
+                state.next_decode_rows = delayed_count + self._stream_followup_stride
+                return None
 
-        window_start_raw = max(
-            0, state.emitted_raw_frames - self._stream_overlap_tokens
-        )
-        rows_end = emit_until_raw + num_codebooks - 1
-        rows = state.delayed_rows[window_start_raw:rows_end]
-        audio = self._decode_delayed_rows(
-            rows,
-            num_codebooks=num_codebooks,
-            codebook_size=codebook_size,
-        )
+            window_start_raw = max(
+                0, state.emitted_raw_frames - self._stream_overlap_tokens
+            )
+            rows_end = emit_until_raw + num_codebooks - 1
+            rows = state.delayed_rows[window_start_raw:rows_end]
+            with _record_function("higgs.vocoder.decode_delayed_rows"):
+                audio = self._decode_delayed_rows(
+                    rows,
+                    num_codebooks=num_codebooks,
+                    codebook_size=codebook_size,
+                )
 
-        decoded_raw_frames = emit_until_raw - window_start_raw
-        samples_per_frame = self._samples_per_frame or max(
-            int(audio.shape[-1]) // max(decoded_raw_frames, 1), 1
-        )
-        trim_frames = state.emitted_raw_frames - window_start_raw
-        trim_samples = min(int(trim_frames * samples_per_frame), int(audio.shape[-1]))
-        if not is_final and self._samples_per_frame is not None:
-            new_frames = emit_until_raw - state.emitted_raw_frames
-            emit_samples = int(new_frames * samples_per_frame)
-            delta = audio[trim_samples : trim_samples + emit_samples].contiguous()
-        else:
-            delta = audio[trim_samples:].contiguous()
-        if delta.numel() == 0:
-            state.next_decode_rows = delayed_count + self._stream_followup_stride
-            return None
+            with _record_function("higgs.vocoder.trim_delta"):
+                decoded_raw_frames = emit_until_raw - window_start_raw
+                samples_per_frame = self._samples_per_frame or max(
+                    int(audio.shape[-1]) // max(decoded_raw_frames, 1), 1
+                )
+                trim_frames = state.emitted_raw_frames - window_start_raw
+                trim_samples = min(
+                    int(trim_frames * samples_per_frame), int(audio.shape[-1])
+                )
+                if not is_final and self._samples_per_frame is not None:
+                    new_frames = emit_until_raw - state.emitted_raw_frames
+                    emit_samples = int(new_frames * samples_per_frame)
+                    delta = audio[
+                        trim_samples : trim_samples + emit_samples
+                    ].contiguous()
+                else:
+                    delta = audio[trim_samples:].contiguous()
+            if delta.numel() == 0:
+                state.next_decode_rows = delayed_count + self._stream_followup_stride
+                return None
 
-        state.emitted_raw_frames = emit_until_raw
-        state.next_decode_rows = self._next_decode_rows_after_emit(
-            delayed_count,
-            num_codebooks=num_codebooks,
-            emitted_initial_chunk=use_initial_chunk and not is_final,
-        )
-        state.has_emitted = True
-        return audio_waveform_payload(
-            delta,
-            sample_rate=self._sample_rate,
-            modality="audio",
-            source_hint="Higgs TTS streaming",
-        )
+            state.emitted_raw_frames = emit_until_raw
+            state.next_decode_rows = self._next_decode_rows_after_emit(
+                delayed_count,
+                num_codebooks=num_codebooks,
+                emitted_initial_chunk=use_initial_chunk and not is_final,
+            )
+            state.has_emitted = True
+            return audio_waveform_payload(
+                delta,
+                sample_rate=self._sample_rate,
+                modality="audio",
+                source_hint="Higgs TTS streaming",
+            )
 
     def _next_decode_rows_after_emit(
         self,
@@ -432,43 +444,54 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
         )
 
     def _vocode_payload(self, payload: StagePayload) -> StagePayload:
-        return self._vocode_payloads([payload])[0]
+        with _record_function("higgs.vocoder.vocode_payload"):
+            return self._vocode_payloads([payload])[0]
 
     def _vocode_payloads(self, payloads: list[StagePayload]) -> list[StagePayload]:
-        items = [self._prepare_vocoder_item(payload) for payload in payloads]
-        valid = [(i, codes) for i, (_, codes) in enumerate(items) if codes is not None]
-        waveforms: list[torch.Tensor | None] = [None] * len(items)
-        if valid:
-            indices, codes_list = zip(*valid)
-            wavs = self._codec.decode_batch(list(codes_list))
-            if len(wavs) != len(valid):
-                raise RuntimeError(
-                    f"Higgs vocoder decode_batch returned {len(wavs)} audios "
-                    f"for {len(valid)} requests"
-                )
-            for idx, wav in zip(indices, wavs):
-                waveforms[idx] = wav
-        return [
-            self._store_vocoder_result(payload, state, wav)
-            for payload, (state, _), wav in zip(payloads, items, waveforms)
-        ]
+        with _record_function("higgs.vocoder.vocode_payloads"):
+            with _record_function("higgs.vocoder.prepare_batch_items"):
+                items = [self._prepare_vocoder_item(payload) for payload in payloads]
+                valid = [
+                    (i, codes)
+                    for i, (_, codes) in enumerate(items)
+                    if codes is not None
+                ]
+            waveforms: list[torch.Tensor | None] = [None] * len(items)
+            if valid:
+                indices, codes_list = zip(*valid)
+                with _record_function("higgs.vocoder.codec_decode_batch"):
+                    wavs = self._codec.decode_batch(list(codes_list))
+                if len(wavs) != len(valid):
+                    raise RuntimeError(
+                        f"Higgs vocoder decode_batch returned {len(wavs)} audios "
+                        f"for {len(valid)} requests"
+                    )
+                for idx, wav in zip(indices, wavs):
+                    waveforms[idx] = wav
+            with _record_function("higgs.vocoder.store_batch_results"):
+                return [
+                    self._store_vocoder_result(payload, state, wav)
+                    for payload, (state, _), wav in zip(payloads, items, waveforms)
+                ]
 
     def _prepare_vocoder_item(
         self,
         payload: StagePayload,
     ) -> tuple[HiggsTtsState, torch.Tensor | None]:
-        state = HiggsTtsState.from_dict(payload.data)
-        delayed_rows = state.output_codes_delayed
-        if not delayed_rows:
-            return state, None
-        delayed_LN = torch.tensor(delayed_rows, dtype=torch.long)
-        if delayed_LN.shape[0] < state.num_codebooks:
-            return state, None
-        codes_TN = reverse_delay_pattern(delayed_LN)
-        codec_vocab = int(state.codebook_size) - 2
-        return state, torch.where(
-            codes_TN >= codec_vocab, torch.zeros_like(codes_TN), codes_TN
-        )
+        with _record_function("higgs.vocoder.prepare_vocoder_item"):
+            state = HiggsTtsState.from_dict(payload.data)
+            delayed_rows = state.output_codes_delayed
+            if not delayed_rows:
+                return state, None
+            delayed_LN = torch.tensor(delayed_rows, dtype=torch.long)
+            if delayed_LN.shape[0] < state.num_codebooks:
+                return state, None
+            with _record_function("higgs.vocoder.reverse_delay_pattern"):
+                codes_TN = reverse_delay_pattern(delayed_LN)
+            codec_vocab = int(state.codebook_size) - 2
+            return state, torch.where(
+                codes_TN >= codec_vocab, torch.zeros_like(codes_TN), codes_TN
+            )
 
     def _store_vocoder_result(
         self,
@@ -476,30 +499,32 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
         state: HiggsTtsState,
         waveform: torch.Tensor | None,
     ) -> StagePayload:
-        data = audio_waveform_payload(
-            waveform if waveform is not None else [],
-            sample_rate=self._sample_rate,
-            modality="audio",
-            source_hint="Higgs TTS vocoder",
-        )
-        usage = self._build_usage(state)
-        if usage is not None:
-            data["usage"] = usage
-        payload.data = data
-        return payload
+        with _record_function("higgs.vocoder.store_vocoder_result"):
+            data = audio_waveform_payload(
+                waveform if waveform is not None else [],
+                sample_rate=self._sample_rate,
+                modality="audio",
+                source_hint="Higgs TTS vocoder",
+            )
+            usage = self._build_usage(state)
+            if usage is not None:
+                data["usage"] = usage
+            payload.data = data
+            return payload
 
     def _decode_state_to_audio(self, state: HiggsTtsState) -> torch.Tensor | None:
-        delayed_rows = state.output_codes_delayed
-        if not delayed_rows:
-            return None
-        rows = [torch.tensor(row, dtype=torch.long) for row in delayed_rows]
-        if len(rows) < int(state.num_codebooks):
-            return None
-        return self._decode_delayed_rows(
-            rows,
-            num_codebooks=int(state.num_codebooks),
-            codebook_size=int(state.codebook_size),
-        )
+        with _record_function("higgs.vocoder.decode_state_to_audio"):
+            delayed_rows = state.output_codes_delayed
+            if not delayed_rows:
+                return None
+            rows = [torch.tensor(row, dtype=torch.long) for row in delayed_rows]
+            if len(rows) < int(state.num_codebooks):
+                return None
+            return self._decode_delayed_rows(
+                rows,
+                num_codebooks=int(state.num_codebooks),
+                codebook_size=int(state.codebook_size),
+            )
 
     def _decode_delayed_rows(
         self,
@@ -508,18 +533,21 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
         num_codebooks: int,
         codebook_size: int,
     ) -> torch.Tensor:
-        if len(rows) < int(num_codebooks):
-            raise ValueError(
-                f"Higgs delayed rows must include at least {num_codebooks} rows, "
-                f"got {len(rows)}"
+        with _record_function("higgs.vocoder.decode_delayed_rows_impl"):
+            if len(rows) < int(num_codebooks):
+                raise ValueError(
+                    f"Higgs delayed rows must include at least {num_codebooks} rows, "
+                    f"got {len(rows)}"
+                )
+            delayed_LN = torch.stack(rows, dim=0).to(torch.long)
+            with _record_function("higgs.vocoder.reverse_delay_pattern"):
+                codes_TN = reverse_delay_pattern(delayed_LN)
+            codec_vocab = int(codebook_size) - 2
+            codes_TN = torch.where(
+                codes_TN >= codec_vocab, torch.zeros_like(codes_TN), codes_TN
             )
-        delayed_LN = torch.stack(rows, dim=0).to(torch.long)
-        codes_TN = reverse_delay_pattern(delayed_LN)
-        codec_vocab = int(codebook_size) - 2
-        codes_TN = torch.where(
-            codes_TN >= codec_vocab, torch.zeros_like(codes_TN), codes_TN
-        )
-        return self._codec.decode(codes_TN).detach().to(torch.float32)
+            with _record_function("higgs.vocoder.codec_decode"):
+                return self._codec.decode(codes_TN).detach().to(torch.float32)
 
     @staticmethod
     def _build_usage(state: HiggsTtsState) -> dict[str, Any] | None:

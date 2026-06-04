@@ -23,6 +23,7 @@ from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
 from sglang_omni.preprocessing.audio import AudioMediaIO
 from sglang_omni.preprocessing.base import _is_url
 from sglang_omni.preprocessing.resource_connector import global_http_connection
+from sglang_omni.profiler.torch_profiler import record_function as _record_function
 
 # Codec-vocab specials (inside the [N*V] codebook space, NOT the text vocab).
 BOC_ID = 1024
@@ -34,38 +35,40 @@ _CODEC_CACHE: dict[tuple[str, str, str], HiggsAudioCodec] = {}
 
 def apply_delay_pattern(codes_TN: torch.Tensor) -> torch.Tensor:
     """``[T, N]`` raw codes → ``[T + N - 1, N]`` delayed, BOC/EOC padded."""
-    if codes_TN.ndim != 2:
-        raise ValueError(
-            f"codes_TN must be 2-D [T, N], got shape {tuple(codes_TN.shape)}"
+    with _record_function("higgs.utils.apply_delay_pattern"):
+        if codes_TN.ndim != 2:
+            raise ValueError(
+                f"codes_TN must be 2-D [T, N], got shape {tuple(codes_TN.shape)}"
+            )
+        T, N = codes_TN.shape
+        out = torch.full(
+            (T + N - 1, N), EOC_ID, device=codes_TN.device, dtype=codes_TN.dtype
         )
-    T, N = codes_TN.shape
-    out = torch.full(
-        (T + N - 1, N), EOC_ID, device=codes_TN.device, dtype=codes_TN.dtype
-    )
-    t_idx = torch.arange(T + N - 1, device=codes_TN.device)
-    for c in range(N):
-        out[t_idx < c, c] = BOC_ID
-        out[c : c + T, c] = codes_TN[:, c]
-    return out
+        t_idx = torch.arange(T + N - 1, device=codes_TN.device)
+        for c in range(N):
+            out[t_idx < c, c] = BOC_ID
+            out[c : c + T, c] = codes_TN[:, c]
+        return out
 
 
 def reverse_delay_pattern(delayed_LN: torch.Tensor) -> torch.Tensor:
     """``[L, N]`` delayed (L >= N) → ``[L - (N - 1), N]`` raw codes."""
-    if delayed_LN.ndim != 2:
-        raise ValueError(
-            f"delayed_LN must be 2-D [L, N], got shape {tuple(delayed_LN.shape)}"
-        )
-    L, N = delayed_LN.shape
-    T = L - (N - 1)
-    if T <= 0:
-        raise ValueError(
-            f"delayed_LN has L={L}, N={N}; need L >= N so at least one "
-            f"data row can be recovered."
-        )
-    out = torch.empty((T, N), device=delayed_LN.device, dtype=delayed_LN.dtype)
-    for c in range(N):
-        out[:, c] = delayed_LN[c : c + T, c]
-    return out
+    with _record_function("higgs.utils.reverse_delay_pattern"):
+        if delayed_LN.ndim != 2:
+            raise ValueError(
+                f"delayed_LN must be 2-D [L, N], got shape {tuple(delayed_LN.shape)}"
+            )
+        L, N = delayed_LN.shape
+        T = L - (N - 1)
+        if T <= 0:
+            raise ValueError(
+                f"delayed_LN has L={L}, N={N}; need L >= N so at least one "
+                f"data row can be recovered."
+            )
+        out = torch.empty((T, N), device=delayed_LN.device, dtype=delayed_LN.dtype)
+        for c in range(N):
+            out[:, c] = delayed_LN[c : c + T, c]
+        return out
 
 
 def truncate_rope_to_bf16(model: torch.nn.Module) -> None:
@@ -122,27 +125,32 @@ def load_audio_to_24k(reference_audio: Any) -> tuple[np.ndarray, int]:
 
     def _load_path_or_url(src: str | Path) -> tuple[np.ndarray, int]:
         if isinstance(src, str) and _is_url(src):
-            response = global_http_connection.get_sync_client().get(src)
-            response.raise_for_status()
-            audio, sr = io.load_bytes(response.content)
+            with _record_function("higgs.utils.load_audio_url"):
+                response = global_http_connection.get_sync_client().get(src)
+                response.raise_for_status()
+                audio, sr = io.load_bytes(response.content)
         else:
-            audio, sr = io.load_file(Path(src))
+            with _record_function("higgs.utils.load_audio_file"):
+                audio, sr = io.load_file(Path(src))
         return np.asarray(audio, dtype=np.float32), int(sr)
 
-    if isinstance(reference_audio, (str, Path)):
-        return _load_path_or_url(reference_audio)
+    with _record_function("higgs.utils.load_audio_to_24k"):
+        if isinstance(reference_audio, (str, Path)):
+            return _load_path_or_url(reference_audio)
 
-    if "audio_path" in reference_audio or "path" in reference_audio:
-        return _load_path_or_url(
-            reference_audio.get("audio_path") or reference_audio["path"]
-        )
-    if "bytes" in reference_audio:
-        audio, sr = io.load_bytes(reference_audio["bytes"])
+        if "audio_path" in reference_audio or "path" in reference_audio:
+            return _load_path_or_url(
+                reference_audio.get("audio_path") or reference_audio["path"]
+            )
+        if "bytes" in reference_audio:
+            with _record_function("higgs.utils.load_audio_bytes"):
+                audio, sr = io.load_bytes(reference_audio["bytes"])
+            return np.asarray(audio, dtype=np.float32), int(sr)
+        media_type = reference_audio.get("media_type", "audio/wav")
+        data = reference_audio.get("base64") or reference_audio["data"]
+        with _record_function("higgs.utils.load_audio_base64"):
+            audio, sr = io.load_base64(media_type, data)
         return np.asarray(audio, dtype=np.float32), int(sr)
-    media_type = reference_audio.get("media_type", "audio/wav")
-    data = reference_audio.get("base64") or reference_audio["data"]
-    audio, sr = io.load_base64(media_type, data)
-    return np.asarray(audio, dtype=np.float32), int(sr)
 
 
 __all__ = [
