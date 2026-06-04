@@ -18,6 +18,10 @@ import time
 from typing import Any, Awaitable, Callable
 
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.profiler_control import (
+    handle_profiler_message,
+    is_profiler_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +222,8 @@ class SimpleScheduler:
                 msg = self._next_message()
                 if msg is None:
                     continue
+                if handle_profiler_message(msg):
+                    continue
 
                 if msg.type == "new_request":
                     if self._consume_if_aborted(msg.request_id):
@@ -259,6 +265,8 @@ class SimpleScheduler:
                     )
                 except _queue_mod.Empty:
                     continue
+                if handle_profiler_message(msg):
+                    continue
                 await async_inbox.put(msg)
 
         async def worker() -> None:
@@ -266,6 +274,9 @@ class SimpleScheduler:
                 try:
                     msg = await asyncio.wait_for(async_inbox.get(), timeout=0.1)
                 except asyncio.TimeoutError:
+                    continue
+                if is_profiler_message(msg):
+                    handle_profiler_message(msg)
                     continue
                 if msg.type != "new_request":
                     continue
