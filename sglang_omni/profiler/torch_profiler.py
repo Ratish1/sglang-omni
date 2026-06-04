@@ -3,10 +3,12 @@
 # Original files:
 # - https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/profiler/torch_profiler.py
 
+import json
 import logging
 import os
 import subprocess
 import threading
+import time
 from contextlib import nullcontext
 from types import TracebackType
 
@@ -38,6 +40,34 @@ class _NoOpRecordFunction:
 _NOOP_RECORD_FUNCTION = _NoOpRecordFunction()
 
 
+class _OmniRecordFunction:
+    def __init__(self, name: str):
+        self.name = name
+        self._torch_context = _torch_record_function(name)
+        self._start_us: int | None = None
+
+    def __enter__(self):
+        self._start_us = time.perf_counter_ns() // 1000
+        return self._torch_context.__enter__()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        end_us = time.perf_counter_ns() // 1000
+        torch_result = self._torch_context.__exit__(exc_type, exc, tb)
+        start_us = self._start_us
+        if start_us is not None:
+            TorchProfiler.add_manual_event(
+                self.name,
+                start_us=start_us,
+                duration_us=max(end_us - start_us, 0),
+            )
+        return bool(torch_result)
+
+
 def record_function(name: str):
     """Annotate a region in torch profiler traces.
 
@@ -45,7 +75,34 @@ def record_function(name: str):
     not import torch profiler internals directly.
     """
 
-    return _torch_record_function(name)
+    if not TorchProfiler.is_active():
+        return _NOOP_RECORD_FUNCTION
+    return _OmniRecordFunction(name)
+
+
+def _manual_trace_event(name: str, *, start_us: int, duration_us: int) -> dict:
+    return {
+        "ph": "X",
+        "cat": "sglang_omni",
+        "name": name,
+        "pid": os.getpid(),
+        "tid": threading.get_native_id(),
+        "ts": start_us,
+        "dur": duration_us,
+    }
+
+
+def _append_events_to_chrome_trace(json_file: str, events: list[dict]) -> None:
+    if not events:
+        return
+    with open(json_file, encoding="utf-8") as f:
+        trace = json.load(f)
+    trace_events = trace.setdefault("traceEvents", [])
+    if not isinstance(trace_events, list):
+        raise TypeError("Chrome trace 'traceEvents' must be a list")
+    trace_events.extend(events)
+    with open(json_file, "w", encoding="utf-8") as f:
+        json.dump(trace, f, separators=(",", ":"))
 
 
 class TorchProfiler(ProfilerBase):
@@ -60,6 +117,8 @@ class TorchProfiler(ProfilerBase):
 
     _active_run_id: str | None = None
     _lock = threading.Lock()
+    _manual_events: list[dict] = []
+    _manual_events_lock = threading.Lock()
 
     @classmethod
     def get_active_run_id(cls) -> str | None:
@@ -98,6 +157,7 @@ class TorchProfiler(ProfilerBase):
             trace_path_template = os.path.abspath(trace_path_template)
             cls._trace_template = trace_path_template
             cls._active_run_id = run_id
+            cls._clear_manual_events()
 
             # Expected paths
             json_file = f"{trace_path_template}_rank{rank}.trace.json"
@@ -115,6 +175,7 @@ class TorchProfiler(ProfilerBase):
                 # A. Export JSON Trace
                 try:
                     p.export_chrome_trace(json_file)
+                    cls._append_manual_events(json_file)
                     logger.info(f"[Rank {rank}] Trace exported to {json_file}")
 
                     try:
@@ -202,6 +263,7 @@ class TorchProfiler(ProfilerBase):
             try:
                 os.makedirs(os.path.dirname(json_path), exist_ok=True)
                 profiler.export_chrome_trace(json_path)
+                cls._append_manual_events(json_path)
                 logger.info("[Rank %s] Trace exported to %s", rank, json_path)
                 try:
                     subprocess.Popen(["gzip", "-f", json_path])
@@ -233,6 +295,40 @@ class TorchProfiler(ProfilerBase):
     @classmethod
     def is_active(cls) -> bool:
         return cls._profiler is not None
+
+    @classmethod
+    def add_manual_event(cls, name: str, *, start_us: int, duration_us: int) -> None:
+        if cls._profiler is None:
+            return
+        event = _manual_trace_event(
+            name,
+            start_us=start_us,
+            duration_us=duration_us,
+        )
+        with cls._manual_events_lock:
+            cls._manual_events.append(event)
+
+    @classmethod
+    def _clear_manual_events(cls) -> None:
+        with cls._manual_events_lock:
+            cls._manual_events = []
+
+    @classmethod
+    def _pop_manual_events(cls) -> list[dict]:
+        with cls._manual_events_lock:
+            events = cls._manual_events
+            cls._manual_events = []
+        return events
+
+    @classmethod
+    def _append_manual_events(cls, json_file: str) -> None:
+        events = cls._pop_manual_events()
+        if not events:
+            return
+        _append_events_to_chrome_trace(json_file, events)
+        logger.info(
+            "Appended %d sglang-omni trace ranges to %s", len(events), json_file
+        )
 
     @classmethod
     def get_step_context(cls):
