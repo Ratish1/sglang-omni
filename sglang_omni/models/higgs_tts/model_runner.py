@@ -115,7 +115,12 @@ class HiggsTTSModelRunner(ModelRunner):
             return
         n_real = len(requests)
         with _record_function("higgs.runner.decode_collect_host"):
-            self._decode_collect_host(host_buf[:n_real], result, requests)
+            self._decode_collect_host(
+                host_buf[:n_real],
+                result,
+                requests,
+                next_token_device=None,
+            )
 
     def _populate_cg_buffers(
         self, forward_batch, requests, *, is_lookahead: bool = False
@@ -240,7 +245,12 @@ class HiggsTTSModelRunner(ModelRunner):
         with _record_function("higgs.runner.decode_collect_d2h_blocking"):
             combined_cpu = staging[:n_real].cpu()  # one blocking D2H (sync path)
         with _record_function("higgs.runner.decode_collect_host"):
-            self._decode_collect_host(combined_cpu, result, requests)
+            self._decode_collect_host(
+                combined_cpu,
+                result,
+                requests,
+                next_token_device=result.logits_output.next_token_logits.device,
+            )
 
     def _decode_pack_gpu(self, n_real: int) -> torch.Tensor:
         """Scatter shadow sampler state back into the pool and pack the three
@@ -267,12 +277,22 @@ class HiggsTTSModelRunner(ModelRunner):
             return staging
 
     def _decode_collect_host(
-        self, combined_cpu: torch.Tensor, result: Any, requests: list
+        self,
+        combined_cpu: torch.Tensor,
+        result: Any,
+        requests: list,
+        *,
+        next_token_device: torch.device | None,
     ) -> None:
         """Host-side collect loop over an already-D2H'd staging snapshot:
         append per-request codes, mark finishes, build ``result.next_token_ids``.
         Skips chunked and already-done rows (the latter is what makes the
         one-step-lookahead overrun harmless — see r1_idempotency_check.md).
+
+        ``next_token_device`` is set for the synchronous path because those ids
+        are published as ``schedule_batch.output_ids`` for the next decode step.
+        Async resolve passes ``None``: launch already published GPU cb0 for the
+        next step, so resolve only needs a CPU ``.tolist()``-compatible result.
         """
         with _record_function("higgs.runner.decode_collect_host_impl"):
             model = self.model
@@ -312,11 +332,17 @@ class HiggsTTSModelRunner(ModelRunner):
                     self._mark_sampler_finished(req, data.generation_done)
 
             with _record_function("higgs.runner.decode_collect_next_token_tensor"):
-                result.next_token_ids = torch.tensor(
-                    cb0_per_row,
-                    dtype=torch.long,
-                    device=result.logits_output.next_token_logits.device,
-                )
+                if next_token_device is None:
+                    result.next_token_ids = torch.tensor(
+                        cb0_per_row,
+                        dtype=torch.long,
+                    )
+                else:
+                    result.next_token_ids = torch.tensor(
+                        cb0_per_row,
+                        dtype=torch.long,
+                        device=next_token_device,
+                    )
 
     def _build_prefill_input_embeds(
         self,
