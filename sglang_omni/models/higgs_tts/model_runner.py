@@ -304,14 +304,15 @@ class HiggsTTSModelRunner(ModelRunner):
 
                     codes_row = codes_BN_cpu[b]
                     data.generation_done = bool(gen_done_after_cpu[b])
-                    if data.stream_metadata is None:
+                    if data.stream_metadata is None and self._async_enabled:
                         codes_list = codes_row.tolist()
                         data.output_codes.append(codes_list)
                         cb0_per_row.append(codes_list[0])
                     else:
                         codes_N = codes_row.to(torch.long).clone()
                         data.output_codes.append(codes_N)
-                        self._emit_code_chunk(sched_req, codes_N)
+                        if data.stream_metadata is not None:
+                            self._emit_code_chunk(sched_req, codes_N)
                         cb0_per_row.append(int(codes_N[0].item()))
                     self._mark_sampler_finished(req, data.generation_done)
 
@@ -392,12 +393,13 @@ class HiggsTTSModelRunner(ModelRunner):
                 data.generation_done = bool(
                     model._sampler_pool.generation_done[row].item()
                 )
-                if data.stream_metadata is None:
+                if data.stream_metadata is None and self._async_enabled:
                     data.output_codes.append(codes_N.detach().cpu().tolist())
                 else:
                     code_chunk = codes_N.detach().cpu().clone()
                     data.output_codes.append(code_chunk)
-                    self._emit_code_chunk(sched_req, code_chunk)
+                    if data.stream_metadata is not None:
+                        self._emit_code_chunk(sched_req, code_chunk)
                 self._mark_sampler_finished(req, data.generation_done)
                 cb0_per_row.append(int(codes_N[0].item()))
 
