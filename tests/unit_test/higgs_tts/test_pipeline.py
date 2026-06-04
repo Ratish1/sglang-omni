@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from sglang_omni.models.higgs_tts import stages
+from sglang_omni.models.higgs_tts import reference_identity, stages
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
@@ -125,13 +125,13 @@ def test_higgs_reference_cache_key_round_trip() -> None:
 def test_higgs_reference_cache_key_tracks_file_content(tmp_path) -> None:
     ref_audio = tmp_path / "ref.wav"
     ref_audio.write_bytes(b"a")
-    first_key = stages._reference_audio_cache_key(ref_audio)
+    first_key = reference_identity.reference_audio_cache_key(ref_audio)
 
     # Same content -> stable key (so repeat requests hit the cache).
-    assert first_key == stages._reference_audio_cache_key(ref_audio)
+    assert first_key == reference_identity.reference_audio_cache_key(ref_audio)
 
     ref_audio.write_bytes(b"longer")
-    second_key = stages._reference_audio_cache_key(ref_audio)
+    second_key = reference_identity.reference_audio_cache_key(ref_audio)
 
     # Different content -> different key (so a replaced file is not stale-served).
     assert first_key is not None and first_key.startswith("file:")
@@ -144,13 +144,21 @@ def test_higgs_reference_cache_key_same_size_edit_and_urls(tmp_path) -> None:
     head, tail = b"H" * 8192, b"T" * 8192
     ref_audio = tmp_path / "ref.wav"
     ref_audio.write_bytes(head + b"a" * 4096 + tail)
-    key_a = stages._reference_audio_cache_key(ref_audio)
+    key_a = reference_identity.reference_audio_cache_key(ref_audio)
     ref_audio.write_bytes(head + b"b" * 4096 + tail)  # same size, middle differs
-    assert key_a is not None and key_a != stages._reference_audio_cache_key(ref_audio)
+    assert key_a is not None and key_a != reference_identity.reference_audio_cache_key(
+        ref_audio
+    )
 
     # URLs and missing files are not cached.
-    assert stages._reference_audio_cache_key("https://example.com/ref.wav") is None
-    assert stages._reference_audio_cache_key(str(tmp_path / "missing.wav")) is None
+    assert (
+        reference_identity.reference_audio_cache_key("https://example.com/ref.wav")
+        is None
+    )
+    assert (
+        reference_identity.reference_audio_cache_key(str(tmp_path / "missing.wav"))
+        is None
+    )
 
 
 def test_higgs_reference_cache_key_memoizes_stable_file_hash(
@@ -158,9 +166,9 @@ def test_higgs_reference_cache_key_memoizes_stable_file_hash(
 ) -> None:
     ref_audio = tmp_path / "ref.wav"
     ref_audio.write_bytes(b"fake wav bytes")
-    stages._REF_PATH_HASH_MEMO.clear()
+    reference_identity._REF_PATH_HASH_MEMO.clear()
     read_calls = 0
-    original_read_bytes = stages.Path.read_bytes
+    original_read_bytes = reference_identity.Path.read_bytes
 
     def counting_read_bytes(path):
         nonlocal read_calls
@@ -168,10 +176,10 @@ def test_higgs_reference_cache_key_memoizes_stable_file_hash(
             read_calls += 1
         return original_read_bytes(path)
 
-    monkeypatch.setattr(stages.Path, "read_bytes", counting_read_bytes)
+    monkeypatch.setattr(reference_identity.Path, "read_bytes", counting_read_bytes)
 
-    first_key = stages._reference_audio_cache_key(ref_audio)
-    second_key = stages._reference_audio_cache_key(ref_audio)
+    first_key = reference_identity.reference_audio_cache_key(ref_audio)
+    second_key = reference_identity.reference_audio_cache_key(ref_audio)
 
     assert first_key == second_key
     assert read_calls == 1
@@ -180,10 +188,10 @@ def test_higgs_reference_cache_key_memoizes_stable_file_hash(
 def test_higgs_reference_cache_key_ignores_media_type() -> None:
     raw = b"\x01\x02\x03fake-audio-bytes"
     encoded = base64.b64encode(raw).decode()
-    key_wav = stages._reference_audio_cache_key(
+    key_wav = reference_identity.reference_audio_cache_key(
         {"base64": encoded, "media_type": "audio/wav"}
     )
-    key_mp3 = stages._reference_audio_cache_key(
+    key_mp3 = reference_identity.reference_audio_cache_key(
         {"base64": encoded, "media_type": "audio/mpeg"}
     )
 
@@ -191,7 +199,7 @@ def test_higgs_reference_cache_key_ignores_media_type() -> None:
     assert key_wav is not None
     assert key_wav == key_mp3
     # Raw bytes and equivalent base64 resolve to the same content key.
-    assert stages._reference_audio_cache_key({"bytes": raw}) == key_wav
+    assert reference_identity.reference_audio_cache_key({"bytes": raw}) == key_wav
 
 
 def test_higgs_audio_encoder_uses_reference_code_cache(monkeypatch) -> None:
