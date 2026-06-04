@@ -41,13 +41,17 @@ _NOOP_RECORD_FUNCTION = _NoOpRecordFunction()
 
 
 class _OmniRecordFunction:
-    def __init__(self, name: str):
+    def __init__(self, name: str, *, use_torch_context: bool):
         self.name = name
-        self._torch_context = _torch_record_function(name)
+        self._torch_context = (
+            _torch_record_function(name) if use_torch_context else None
+        )
         self._start_us: int | None = None
 
     def __enter__(self):
         self._start_us = time.perf_counter_ns() // 1000
+        if self._torch_context is None:
+            return None
         return self._torch_context.__enter__()
 
     def __exit__(
@@ -57,7 +61,6 @@ class _OmniRecordFunction:
         tb: TracebackType | None,
     ) -> bool:
         end_us = time.perf_counter_ns() // 1000
-        torch_result = self._torch_context.__exit__(exc_type, exc, tb)
         start_us = self._start_us
         if start_us is not None:
             TorchProfiler.add_manual_event(
@@ -65,7 +68,9 @@ class _OmniRecordFunction:
                 start_us=start_us,
                 duration_us=max(end_us - start_us, 0),
             )
-        return bool(torch_result)
+        if self._torch_context is None:
+            return False
+        return bool(self._torch_context.__exit__(exc_type, exc, tb))
 
 
 def record_function(name: str):
@@ -77,7 +82,10 @@ def record_function(name: str):
 
     if not TorchProfiler.is_active():
         return _NOOP_RECORD_FUNCTION
-    return _OmniRecordFunction(name)
+    return _OmniRecordFunction(
+        name,
+        use_torch_context=TorchProfiler.is_owner_thread(),
+    )
 
 
 def _manual_trace_event(name: str, *, start_us: int, duration_us: int) -> dict:
@@ -116,6 +124,7 @@ class TorchProfiler(ProfilerBase):
     _trace_template: str = ""
 
     _active_run_id: str | None = None
+    _owner_thread_id: int | None = None
     _lock = threading.Lock()
     _manual_events: list[dict] = []
     _manual_events_lock = threading.Lock()
@@ -151,12 +160,14 @@ class TorchProfiler(ProfilerBase):
                     )
                 cls._profiler = None
                 cls._active_run_id = None
+                cls._owner_thread_id = None
                 cls._trace_template = ""
 
             # 2. Make path absolute
             trace_path_template = os.path.abspath(trace_path_template)
             cls._trace_template = trace_path_template
             cls._active_run_id = run_id
+            cls._owner_thread_id = threading.get_ident()
             cls._clear_manual_events()
 
             # Expected paths
@@ -255,6 +266,7 @@ class TorchProfiler(ProfilerBase):
                 )
                 cls._profiler = None
                 cls._active_run_id = None
+                cls._owner_thread_id = None
                 cls._trace_template = ""
                 return {"trace": gz_path, "table": None}
 
@@ -283,6 +295,7 @@ class TorchProfiler(ProfilerBase):
 
             cls._profiler = None
             cls._active_run_id = None
+            cls._owner_thread_id = None
             cls._trace_template = ""
 
             return {"trace": gz_path, "table": None}
@@ -295,6 +308,10 @@ class TorchProfiler(ProfilerBase):
     @classmethod
     def is_active(cls) -> bool:
         return cls._profiler is not None
+
+    @classmethod
+    def is_owner_thread(cls) -> bool:
+        return cls._owner_thread_id == threading.get_ident()
 
     @classmethod
     def add_manual_event(cls, name: str, *, start_us: int, duration_us: int) -> None:
@@ -324,6 +341,7 @@ class TorchProfiler(ProfilerBase):
     def _append_manual_events(cls, json_file: str) -> None:
         events = cls._pop_manual_events()
         if not events:
+            logger.info("No sglang-omni trace ranges captured for %s", json_file)
             return
         _append_events_to_chrome_trace(json_file, events)
         logger.info(
