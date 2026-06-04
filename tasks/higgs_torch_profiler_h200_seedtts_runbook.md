@@ -8,7 +8,8 @@ first, inspect the trace, then iterate.
 
 - Workload: full SeedTTS EN generation, no `--max-samples`.
 - Concurrency: 16.
-- Server mode: CUDA graph on, torch.compile off, async decode on.
+- Server mode: plain Higgs serve command. Higgs owns the CUDA graph and async
+  decode defaults internally.
 - Profile window: only the full generation benchmark. Server startup, first
   request cold work, and ASR/WER are outside the torch-profiler window.
 - Output: request events plus `trace_rank*.trace.json.gz`.
@@ -37,10 +38,7 @@ mkdir -p "${PROFILE_ROOT}"
 
 CUDA_VISIBLE_DEVICES=0 python -m sglang_omni.cli serve \
   --model-path "${MODEL_PATH}" \
-  --port "${PORT}" \
-  --talker-cuda-graph on \
-  --talker-torch-compile off \
-  --async-decode on
+  --port "${PORT}"
 ```
 
 ## Terminal 2: Run The Single Profile Test

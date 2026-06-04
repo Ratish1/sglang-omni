@@ -45,8 +45,6 @@ def record_function(name: str):
     not import torch profiler internals directly.
     """
 
-    if not TorchProfiler.is_active():
-        return _NOOP_RECORD_FUNCTION
     return _torch_record_function(name)
 
 
@@ -187,6 +185,17 @@ class TorchProfiler(ProfilerBase):
                 profiler.stop()
             except Exception as e:
                 logger.warning("[Rank %s] Profiler stop failed: %s", rank, e)
+
+            if os.path.exists(json_path) or os.path.exists(gz_path):
+                logger.info(
+                    "[Rank %s] Trace already exported to %s",
+                    rank,
+                    gz_path if os.path.exists(gz_path) else json_path,
+                )
+                cls._profiler = None
+                cls._active_run_id = None
+                cls._trace_template = ""
+                return {"trace": gz_path, "table": None}
 
             # No schedule → on_trace_ready isn't fired on stop, so
             # export here.

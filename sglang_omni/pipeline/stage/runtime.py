@@ -24,6 +24,7 @@ from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
 from sglang_omni.profiler.event_recorder import set_active_stage as _set_active_stage
 from sglang_omni.profiler.torch_profiler import TorchProfiler
+from sglang_omni.profiler.torch_profiler import record_function as _record_function
 from sglang_omni.proto import (
     CompleteMessage,
     DataReadyMessage,
@@ -638,20 +639,21 @@ class Stage:
 
     async def _execute(self, payload: Any) -> None:
         request_id = payload.request_id
-        _emit_event(
-            request_id=request_id,
-            stage=self.name,
-            event_name="stage_dispatch",
-        )
-        if (
-            self.role == "leader"
-            and self._tp_fanout is not None
-            and getattr(self.scheduler, "requires_tp_work_fanout", False)
-        ):
-            self._tp_fanout.fanout_work(payload)
-        self.scheduler.inbox.put(
-            IncomingMessage(request_id=request_id, type="new_request", data=payload)
-        )
+        with _record_function(f"omni.stage.{self.name}.execute"):
+            _emit_event(
+                request_id=request_id,
+                stage=self.name,
+                event_name="stage_dispatch",
+            )
+            if (
+                self.role == "leader"
+                and self._tp_fanout is not None
+                and getattr(self.scheduler, "requires_tp_work_fanout", False)
+            ):
+                self._tp_fanout.fanout_work(payload)
+            self.scheduler.inbox.put(
+                IncomingMessage(request_id=request_id, type="new_request", data=payload)
+            )
 
     # ------------------------------------------------------------------
     # Outbox drain: scheduler results → route downstream
@@ -1209,6 +1211,8 @@ class Stage:
             if prof_dir and not os.path.isabs(template):
                 template = os.path.join(prof_dir, template)
             TorchProfiler.start(template, run_id=run_id)
+            with _record_function(f"sglang_omni.profiler.canary_start.{self.name}"):
+                pass
         if msg.event_dir is not None:
             try:
                 _get_recorder().start(
