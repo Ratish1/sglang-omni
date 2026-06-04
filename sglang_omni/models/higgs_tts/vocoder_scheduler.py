@@ -11,6 +11,7 @@ import torch
 from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.utils import reverse_delay_pattern
+from sglang_omni.models.tts_runtime import build_tts_usage, require_batch_result_count
 from sglang_omni.models.tts_streaming import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     resolve_initial_codec_chunk_frames,
@@ -441,11 +442,12 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
         if valid:
             indices, codes_list = zip(*valid)
             wavs = self._codec.decode_batch(list(codes_list))
-            if len(wavs) != len(valid):
-                raise RuntimeError(
-                    f"Higgs vocoder decode_batch returned {len(wavs)} audios "
-                    f"for {len(valid)} requests"
-                )
+            require_batch_result_count(
+                owner="Higgs vocoder decode_batch",
+                result_label="audios",
+                actual=len(wavs),
+                expected=len(valid),
+            )
             for idx, wav in zip(indices, wavs):
                 waveforms[idx] = wav
         return [
@@ -523,16 +525,11 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     @staticmethod
     def _build_usage(state: HiggsTtsState) -> dict[str, Any] | None:
-        if not (state.prompt_tokens or state.completion_tokens or state.engine_time_s):
-            return None
-        usage: dict[str, Any] = {
-            "prompt_tokens": state.prompt_tokens,
-            "completion_tokens": state.completion_tokens,
-            "total_tokens": state.prompt_tokens + state.completion_tokens,
-        }
-        if state.engine_time_s:
-            usage["engine_time_s"] = round(state.engine_time_s, 6)
-        return usage
+        return build_tts_usage(
+            prompt_tokens=state.prompt_tokens,
+            completion_tokens=state.completion_tokens,
+            engine_time_s=state.engine_time_s,
+        )
 
     @staticmethod
     def _resolve_samples_per_frame(codec: HiggsAudioCodec) -> int | None:
