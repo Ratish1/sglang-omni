@@ -176,6 +176,9 @@ class HiggsTTSModel(nn.Module):
             pool_size, num_codebooks + 2, dtype=torch.long, device=cg_device
         )
         self._cg_was_done = torch.zeros(pool_size, dtype=torch.bool, device=cg_device)
+        self._cg_next_token_ids = torch.zeros(
+            pool_size, dtype=torch.long, device=cg_device
+        )
 
         self._cg_active_delay_count = torch.zeros(
             pool_size, dtype=torch.int32, device=cg_device
