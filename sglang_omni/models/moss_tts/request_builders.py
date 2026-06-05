@@ -650,7 +650,7 @@ def apply_sglang_moss_tts_result(
             start, end = bounds
             payload_rows = rows[start:end]
             state.assistant_start_length = 0
-        state.delayed_audio_codes = payload_rows[:, 1:].detach().cpu()
+        state.delayed_audio_codes = payload_rows[:, 1:].detach()
     else:
         n_vq = (
             int(data.prompt_rows.shape[1] - 1)
@@ -665,7 +665,7 @@ def apply_sglang_moss_tts_result(
     return StagePayload(
         request_id=payload.request_id,
         request=payload.request,
-        data=state.to_dict(),
+        data=state.to_dict(preserve_tensor_device=True),
     )
 
 

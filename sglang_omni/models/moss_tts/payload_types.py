@@ -43,16 +43,19 @@ class MossTTSState:
     engine_time_s: float = 0.0
 
     @staticmethod
-    def _tensor_to_payload(value: Any) -> Any:
+    def _tensor_to_payload(value: Any, *, preserve_tensor_device: bool = False) -> Any:
         try:
             import torch
         except ImportError:
             torch = None
         if torch is not None and isinstance(value, torch.Tensor):
-            return value.detach().cpu()
+            value = value.detach()
+            if preserve_tensor_device:
+                return value
+            return value.cpu()
         return value
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, preserve_tensor_device: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
             "text": self.text,
             "generation_kwargs": dict(self.generation_kwargs),
@@ -70,7 +73,8 @@ class MossTTSState:
             data["token_count"] = int(self.token_count)
         if self.delayed_audio_codes is not None:
             data["delayed_audio_codes"] = self._tensor_to_payload(
-                self.delayed_audio_codes
+                self.delayed_audio_codes,
+                preserve_tensor_device=preserve_tensor_device,
             )
         if self.assistant_start_length:
             data["assistant_start_length"] = int(self.assistant_start_length)

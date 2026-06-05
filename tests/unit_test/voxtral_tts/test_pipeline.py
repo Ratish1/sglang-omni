@@ -13,7 +13,10 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.models.voxtral_tts.config import VoxtralTTSPipelineConfig
 from sglang_omni.models.voxtral_tts.io import VoxtralTTSState
 from sglang_omni.models.voxtral_tts.pipeline import stages
-from sglang_omni.models.voxtral_tts.request_builders import build_sglang_voxtral_request
+from sglang_omni.models.voxtral_tts.request_builders import (
+    apply_sglang_voxtral_result,
+    build_sglang_voxtral_request,
+)
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.types import RequestOutput
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -162,6 +165,31 @@ def test_voxtral_audio_codes_payload_is_compact() -> None:
     assert "audio_codes_bytes" in data
     assert "audio_codes" not in data
     assert restored.audio_codes.tolist() == [[1, 2], [3, 4]]
+
+
+def test_voxtral_result_adapter_keeps_code_handoff_tensor_native() -> None:
+    state = VoxtralTTSState(input_ids=[1, 2], voice="neutral", max_new_tokens=8)
+    payload = StagePayload(
+        request_id="req-voxtral",
+        request=OmniRequest(inputs="", params={}),
+        data=state.to_dict(),
+    )
+    data = SimpleNamespace(
+        input_ids=torch.tensor([1, 2], dtype=torch.long),
+        output_codes=[
+            torch.empty((2,), dtype=torch.long, device="meta"),
+            torch.empty((2,), dtype=torch.long, device="meta"),
+        ],
+    )
+
+    result = apply_sglang_voxtral_result(payload, data)
+
+    assert "audio_codes_bytes" not in result.data
+    assert isinstance(result.data["audio_codes"], torch.Tensor)
+    assert result.data["audio_codes"].device.type == "meta"
+    assert result.data["audio_codes"].shape == (2, 2)
+    assert result.data["prompt_tokens"] == 2
+    assert result.data["completion_tokens"] == 2
 
 
 def test_voxtral_collect_audio_step_reuses_output_tokens_for_eos_filter() -> None:

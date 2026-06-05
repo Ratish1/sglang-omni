@@ -724,6 +724,27 @@ def test_qwen3_tts_result_adapter_keeps_code_handoff_tensor_native() -> None:
     assert result.data["completion_tokens"] == 2
 
 
+def test_qwen3_tts_result_adapter_does_not_force_code_handoff_to_cpu() -> None:
+    payload = make_payload(inputs="target")
+    data = Qwen3TTSSGLangRequestData(
+        req=SimpleNamespace(output_ids=[]),
+        output_codes=[
+            torch.empty((2,), dtype=torch.long, device="meta"),
+            torch.empty((2,), dtype=torch.long, device="meta"),
+        ],
+        ref_code=torch.empty((1, 2), dtype=torch.long, device="meta"),
+        ref_code_len=1,
+        stage_payload=payload,
+    )
+
+    result = apply_sglang_qwen3_tts_result(payload, data)
+
+    codes = result.data["audio_codes"]
+    assert isinstance(codes, torch.Tensor)
+    assert codes.device.type == "meta"
+    assert codes.shape == (3, 2)
+
+
 def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

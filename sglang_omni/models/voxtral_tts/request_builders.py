@@ -95,7 +95,7 @@ def apply_sglang_voxtral_result(
     return StagePayload(
         request_id=payload.request_id,
         request=payload.request,
-        data=state.to_dict(),
+        data=state.to_dict(compact_audio_codes=False),
     )
 
 

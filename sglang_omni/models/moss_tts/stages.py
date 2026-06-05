@@ -313,7 +313,10 @@ def create_vocoder_executor(
         state = load_state(payload)
         if state.delayed_audio_codes is None:
             raise RuntimeError("MOSS-TTS vocoder requires delayed_audio_codes")
-        delayed_codes = torch.as_tensor(state.delayed_audio_codes, dtype=torch.long)
+        if isinstance(state.delayed_audio_codes, torch.Tensor):
+            delayed_codes = state.delayed_audio_codes.to(dtype=torch.long)
+        else:
+            delayed_codes = torch.as_tensor(state.delayed_audio_codes, dtype=torch.long)
         if delayed_codes.numel() == 0:
             raise RuntimeError("MOSS-TTS generated no delayed audio codes")
         return state, delayed_codes

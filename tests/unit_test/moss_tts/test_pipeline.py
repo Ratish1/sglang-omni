@@ -282,6 +282,19 @@ def test_moss_tts_state_round_trip_keeps_tensors_native() -> None:
     assert restored.assistant_start_length == 2
 
 
+def test_moss_tts_state_payload_does_not_force_code_handoff_to_cpu() -> None:
+    codes = torch.empty((2, 2), dtype=torch.long, device="meta")
+    state = MossTTSState(delayed_audio_codes=codes)
+
+    data = state.to_dict(preserve_tensor_device=True)
+    restored = MossTTSState.from_dict(data)
+
+    assert isinstance(data["delayed_audio_codes"], torch.Tensor)
+    assert data["delayed_audio_codes"].device.type == "meta"
+    assert restored.delayed_audio_codes.device.type == "meta"
+    assert restored.delayed_audio_codes.shape == (2, 2)
+
+
 def test_moss_tts_maps_references_token_count_and_deterministic_defaults() -> None:
     payload = make_payload(
         inputs={
