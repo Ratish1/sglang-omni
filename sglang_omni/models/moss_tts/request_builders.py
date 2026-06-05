@@ -9,7 +9,6 @@ import hashlib
 import io
 import os
 import re
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -18,6 +17,7 @@ import torch
 
 from sglang_omni.models.moss_tts.payload_types import MossTTSState
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.prepared_request_store import PreparedRequestStore
 from sglang_omni.scheduling.types import ARRequestData
 
 MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
@@ -115,13 +115,16 @@ class MossTTSPreprocessingContext:
 
 
 _PREPROCESSING_CONTEXT: MossTTSPreprocessingContext | None = None
-_PREPARED_REQUESTS: dict[str, MossTTSPreparedRequest] = {}
+_PREPARED_REQUEST_STORE: PreparedRequestStore[MossTTSPreparedRequest] = (
+    PreparedRequestStore()
+)
+_PREPARED_REQUESTS = _PREPARED_REQUEST_STORE.prepared
 # Request ids currently inside preprocess_moss_tts_payload.
-_INFLIGHT_REQUESTS: set[str] = set()
+_INFLIGHT_REQUESTS = _PREPARED_REQUEST_STORE.inflight
 # In-flight requests whose abort arrived before the handoff was published, so
 # compute drops the pending insert instead of leaking it into _PREPARED_REQUESTS.
-_ABORTED_REQUESTS: set[str] = set()
-_PREPARED_REQUESTS_LOCK = threading.Lock()
+_ABORTED_REQUESTS = _PREPARED_REQUEST_STORE.aborted
+_PREPARED_REQUESTS_LOCK = _PREPARED_REQUEST_STORE.lock
 
 
 def set_moss_tts_preprocessing_context(*, processor: Any) -> None:
@@ -130,9 +133,7 @@ def set_moss_tts_preprocessing_context(*, processor: Any) -> None:
     global _PREPROCESSING_CONTEXT
     with _PREPARED_REQUESTS_LOCK:
         _PREPROCESSING_CONTEXT = MossTTSPreprocessingContext(processor=processor)
-        _PREPARED_REQUESTS.clear()
-        _INFLIGHT_REQUESTS.clear()
-        _ABORTED_REQUESTS.clear()
+        _PREPARED_REQUEST_STORE.clear_locked()
 
 
 def clear_moss_tts_preprocessing_context() -> None:
@@ -141,9 +142,7 @@ def clear_moss_tts_preprocessing_context() -> None:
     global _PREPROCESSING_CONTEXT
     with _PREPARED_REQUESTS_LOCK:
         _PREPROCESSING_CONTEXT = None
-        _PREPARED_REQUESTS.clear()
-        _INFLIGHT_REQUESTS.clear()
-        _ABORTED_REQUESTS.clear()
+        _PREPARED_REQUEST_STORE.clear_locked()
 
 
 def cleanup_prepared_moss_tts_request(request_id: str) -> None:
@@ -154,12 +153,7 @@ def cleanup_prepared_moss_tts_request(request_id: str) -> None:
     leaves nothing behind.
     """
 
-    rid = str(request_id)
-    with _PREPARED_REQUESTS_LOCK:
-        if _PREPARED_REQUESTS.pop(rid, None) is not None:
-            return
-        if rid in _INFLIGHT_REQUESTS:
-            _ABORTED_REQUESTS.add(rid)
+    _PREPARED_REQUEST_STORE.cleanup(request_id)
 
 
 def pop_prepared_moss_tts_request(
@@ -169,8 +163,7 @@ def pop_prepared_moss_tts_request(
     marker = data.get(_MOSS_TTS_PREPARED_MARKER)
     if marker is None:
         return None
-    with _PREPARED_REQUESTS_LOCK:
-        prepared = _PREPARED_REQUESTS.pop(str(marker), None)
+    prepared = _PREPARED_REQUEST_STORE.pop(str(marker))
     if prepared is None:
         raise RuntimeError(
             "MOSS-TTS preprocessing state is missing for prepared payload "
@@ -465,7 +458,7 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
     with _PREPARED_REQUESTS_LOCK:
         context = _PREPROCESSING_CONTEXT
         if context is not None:
-            _INFLIGHT_REQUESTS.add(rid)
+            _PREPARED_REQUEST_STORE.inflight.add(rid)
     if context is None:
         raise RuntimeError(
             "MOSS-TTS preprocessing context is not initialized; "
@@ -475,17 +468,10 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
     try:
         prepared = _prepare_moss_tts_request(payload, processor=context.processor)
     except BaseException:
-        with _PREPARED_REQUESTS_LOCK:
-            _INFLIGHT_REQUESTS.discard(rid)
-            _ABORTED_REQUESTS.discard(rid)
+        _PREPARED_REQUEST_STORE.discard_inflight_after_error(rid)
         raise
-    with _PREPARED_REQUESTS_LOCK:
-        _INFLIGHT_REQUESTS.discard(rid)
-        aborted = rid in _ABORTED_REQUESTS
-        _ABORTED_REQUESTS.discard(rid)
-        if not aborted:
-            # Aborted-while-preprocessing drops the handoff so it never lingers.
-            _PREPARED_REQUESTS[rid] = prepared
+    # Aborted-while-preprocessing drops the handoff so it never lingers.
+    _PREPARED_REQUEST_STORE.publish(rid, prepared)
 
     data = prepared.state.to_dict()
     data[_MOSS_TTS_PREPARED_MARKER] = payload.request_id

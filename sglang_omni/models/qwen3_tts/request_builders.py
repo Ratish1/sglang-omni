@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,6 +14,10 @@ import torch
 from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.prepared_request_store import (
+    PreparedRequestStore,
+    prepared_marker_from_data,
+)
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
 QWEN3_TTS_DEFAULT_MAX_NEW_TOKENS = 2048
@@ -121,8 +124,11 @@ class Qwen3TTSPreprocessingContext:
 
 
 _PREPROCESSING_CONTEXT: Qwen3TTSPreprocessingContext | None = None
-_PREPARED_REQUESTS: dict[str, Qwen3TTSPreparedRequest] = {}
-_PREPARED_REQUESTS_LOCK = threading.Lock()
+_PREPARED_REQUEST_STORE: PreparedRequestStore[Qwen3TTSPreparedRequest] = (
+    PreparedRequestStore()
+)
+_PREPARED_REQUESTS = _PREPARED_REQUEST_STORE.prepared
+_PREPARED_REQUESTS_LOCK = _PREPARED_REQUEST_STORE.lock
 
 
 def set_qwen3_tts_preprocessing_context(*, model: Any, wrapper: Any) -> None:
@@ -134,7 +140,7 @@ def set_qwen3_tts_preprocessing_context(*, model: Any, wrapper: Any) -> None:
             model=model,
             wrapper=wrapper,
         )
-        _PREPARED_REQUESTS.clear()
+        _PREPARED_REQUEST_STORE.clear_locked()
 
 
 def clear_qwen3_tts_preprocessing_context() -> None:
@@ -143,15 +149,11 @@ def clear_qwen3_tts_preprocessing_context() -> None:
     global _PREPROCESSING_CONTEXT
     with _PREPARED_REQUESTS_LOCK:
         _PREPROCESSING_CONTEXT = None
-        _PREPARED_REQUESTS.clear()
+        _PREPARED_REQUEST_STORE.clear_locked()
 
 
 def _prepared_request_id(payload: StagePayload) -> str | None:
-    data = payload.data
-    if not isinstance(data, dict):
-        return None
-    marker = data.get(_QWEN3_TTS_PREPARED_MARKER)
-    return str(marker) if marker is not None else None
+    return prepared_marker_from_data(payload.data, _QWEN3_TTS_PREPARED_MARKER)
 
 
 def pop_prepared_qwen3_tts_request(
@@ -162,8 +164,7 @@ def pop_prepared_qwen3_tts_request(
     prepared_request_id = _prepared_request_id(payload)
     if prepared_request_id is None:
         return None
-    with _PREPARED_REQUESTS_LOCK:
-        prepared = _PREPARED_REQUESTS.pop(prepared_request_id, None)
+    prepared = _PREPARED_REQUEST_STORE.pop(prepared_request_id)
     if prepared is None:
         raise RuntimeError(
             "Qwen3-TTS preprocessing state is missing for prepared payload "
@@ -175,8 +176,7 @@ def pop_prepared_qwen3_tts_request(
 def cleanup_prepared_qwen3_tts_request(request_id: str) -> None:
     """Drop any prepared Qwen3-TTS handoff state for an aborted request."""
 
-    with _PREPARED_REQUESTS_LOCK:
-        _PREPARED_REQUESTS.pop(str(request_id), None)
+    _PREPARED_REQUEST_STORE.cleanup(request_id)
 
 
 def build_qwen3_tts_state(payload: StagePayload) -> Qwen3TTSState:
@@ -674,13 +674,17 @@ def preprocess_qwen3_tts_payload(payload: StagePayload) -> StagePayload:
             "create_sglang_tts_engine_executor must register it before requests run"
         )
 
-    prepared = _prepare_qwen3_tts_request(
-        payload,
-        model=context.model,
-        wrapper=context.wrapper,
-    )
-    with _PREPARED_REQUESTS_LOCK:
-        _PREPARED_REQUESTS[payload.request_id] = prepared
+    _PREPARED_REQUEST_STORE.mark_inflight(payload.request_id)
+    try:
+        prepared = _prepare_qwen3_tts_request(
+            payload,
+            model=context.model,
+            wrapper=context.wrapper,
+        )
+    except BaseException:
+        _PREPARED_REQUEST_STORE.discard_inflight_after_error(payload.request_id)
+        raise
+    _PREPARED_REQUEST_STORE.publish(payload.request_id, prepared)
 
     data = prepared.state.to_dict()
     data[_QWEN3_TTS_PREPARED_MARKER] = payload.request_id
