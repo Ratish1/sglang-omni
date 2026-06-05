@@ -14,8 +14,9 @@ import torch
 from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.prepared_request_store import (
+from sglang_omni.scheduling.request_lifecycle import (
     PreparedRequestStore,
+    attach_sglang_req_compat,
     prepared_marker_from_data,
 )
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
@@ -746,12 +747,16 @@ def build_sglang_qwen3_tts_request(
         eos_token_ids={int(model.config.codec_eos_token_id)},
         vocab_size=int(model.config.vocab_size),
     )
-    req.tokenizer = None
-    req._input_embeds_are_projected = True
-    req._codec_suppress_tokens = tuple(
+    codec_suppress_tokens = tuple(
         token_id
         for token_id in range(model.config.vocab_size - 1024, model.config.vocab_size)
         if token_id != int(model.config.codec_eos_token_id)
+    )
+    attach_sglang_req_compat(
+        req,
+        tokenizer=None,
+        codec_suppress_tokens=codec_suppress_tokens,
+        input_embeds_are_projected=True,
     )
 
     ref_code_len = (

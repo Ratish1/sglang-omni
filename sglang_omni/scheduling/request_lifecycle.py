@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prepared request handoff state shared by staged schedulers."""
+"""Request lifecycle helpers shared by staged schedulers."""
 
 from __future__ import annotations
 
 import threading
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 PreparedT = TypeVar("PreparedT")
+_UNSET = object()
 
 
 class PreparedRequestStore(Generic[PreparedT]):
@@ -65,3 +66,20 @@ def prepared_marker_from_data(data: object, marker_key: str) -> str | None:
         return None
     marker = data.get(marker_key)
     return str(marker) if marker is not None else None
+
+
+def attach_sglang_req_compat(
+    req: Any,
+    *,
+    tokenizer: Any = _UNSET,
+    codec_suppress_tokens: Any = _UNSET,
+    input_embeds_are_projected: Any = _UNSET,
+) -> None:
+    """Attach Omni compatibility attrs consumed by SGLang backend hooks."""
+
+    if tokenizer is not _UNSET:
+        req.tokenizer = tokenizer
+    if codec_suppress_tokens is not _UNSET:
+        req._codec_suppress_tokens = codec_suppress_tokens
+    if input_embeds_are_projected is not _UNSET:
+        req._input_embeds_are_projected = bool(input_embeds_are_projected)

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from sglang_omni.scheduling.prepared_request_store import (
+from sglang_omni.scheduling.request_lifecycle import (
     PreparedRequestStore,
     prepared_marker_from_data,
 )
