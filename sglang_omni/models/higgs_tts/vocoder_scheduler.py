@@ -7,18 +7,10 @@ from typing import Any
 
 import torch
 
+from sglang_omni.models.higgs_tts import streaming_vocoder
 from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
 from sglang_omni.models.higgs_tts.codebook_layout import reverse_delay_pattern
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
-from sglang_omni.models.higgs_tts.streaming_vocoder import (
-    HiggsStreamConfig,
-    HiggsStreamState,
-    build_higgs_stream_delta,
-    latch_higgs_stream_contract,
-    latch_higgs_stream_metadata,
-    latch_initial_codec_chunk_frames_from_mapping,
-    require_higgs_stream_contract,
-)
 from sglang_omni.models.tts_runtime import build_tts_usage, require_batch_result_count
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
@@ -54,9 +46,9 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
         self._stream_overlap_tokens = int(stream_overlap_tokens)
         self._stream_holdback_tokens = int(stream_holdback_tokens)
         self._sample_rate = HiggsAudioCodec.SAMPLE_RATE
-        self._stream_states: dict[str, HiggsStreamState] = {}
+        self._stream_states: dict[str, streaming_vocoder.HiggsStreamState] = {}
         self._samples_per_frame = self._resolve_samples_per_frame(codec)
-        self._stream_config = HiggsStreamConfig(
+        self._stream_config = streaming_vocoder.HiggsStreamConfig(
             stream_stride=self._stream_stride,
             stream_followup_stride=self._stream_followup_stride,
             stream_overlap_tokens=self._stream_overlap_tokens,
@@ -81,7 +73,9 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
         return bool(params.get("stream", False))
 
     def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
-        stream_state = self._stream_states.setdefault(request_id, HiggsStreamState())
+        stream_state = self._stream_states.setdefault(
+            request_id, streaming_vocoder.HiggsStreamState()
+        )
         if not isinstance(payload.data, dict):
             raise TypeError(
                 f"Higgs streaming payload for {request_id!r} must be a dict, "
@@ -91,14 +85,14 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
             key for key in ("num_codebooks", "codebook_size") if key not in payload.data
         ]
         if not missing:
-            latch_higgs_stream_contract(
+            streaming_vocoder.latch_higgs_stream_contract(
                 request_id,
                 stream_state,
                 num_codebooks=payload.data["num_codebooks"],
                 codebook_size=payload.data["codebook_size"],
                 source="payload",
             )
-            latch_initial_codec_chunk_frames_from_mapping(
+            streaming_vocoder.latch_initial_codec_chunk_frames_from_mapping(
                 payload.request_id,
                 stream_state,
                 (
@@ -113,7 +107,7 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
             stream_state.num_codebooks is not None
             and stream_state.codebook_size is not None
         ):
-            latch_higgs_stream_contract(
+            streaming_vocoder.latch_higgs_stream_contract(
                 request_id,
                 stream_state,
                 num_codebooks=payload.data.get(
@@ -124,7 +118,7 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
                 ),
                 source="payload",
             )
-            latch_initial_codec_chunk_frames_from_mapping(
+            streaming_vocoder.latch_initial_codec_chunk_frames_from_mapping(
                 payload.request_id,
                 stream_state,
                 (
@@ -143,8 +137,10 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
     def on_stream_chunk(
         self, request_id: str, item: StreamItem
     ) -> list[OutgoingMessage]:
-        state = self._stream_states.setdefault(request_id, HiggsStreamState())
-        latch_higgs_stream_metadata(
+        state = self._stream_states.setdefault(
+            request_id, streaming_vocoder.HiggsStreamState()
+        )
+        streaming_vocoder.latch_higgs_stream_metadata(
             request_id,
             state,
             item.metadata,
@@ -163,7 +159,9 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
                 f"Higgs stream chunk must be 1-D [N], got {tuple(row.shape)}"
             )
 
-        num_codebooks = require_higgs_stream_contract(state, request_id)[0]
+        num_codebooks = streaming_vocoder.require_higgs_stream_contract(
+            state, request_id
+        )[0]
         if int(row.shape[0]) != num_codebooks:
             raise ValueError(
                 f"Higgs stream chunk has {int(row.shape[0])} codebooks, "
@@ -171,7 +169,7 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
             )
         state.delayed_rows.append(row)
 
-        output = build_higgs_stream_delta(
+        output = streaming_vocoder.build_higgs_stream_delta(
             state,
             config=self._stream_config,
             decode_delayed_rows=self._decode_delayed_rows,
@@ -190,8 +188,10 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
         payload = self._stream_payloads[request_id]
-        state = self._stream_states.setdefault(request_id, HiggsStreamState())
-        output = build_higgs_stream_delta(
+        state = self._stream_states.setdefault(
+            request_id, streaming_vocoder.HiggsStreamState()
+        )
+        output = streaming_vocoder.build_higgs_stream_delta(
             state,
             config=self._stream_config,
             decode_delayed_rows=self._decode_delayed_rows,

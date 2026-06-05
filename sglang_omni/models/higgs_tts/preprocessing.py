@@ -198,13 +198,3 @@ def encode_higgs_reference_audio(
     state.target_text = None
     state.reference_text = None
     return state
-
-
-__all__ = [
-    "HiggsPreparedReference",
-    "HiggsPreprocessingConfig",
-    "build_higgs_preprocessed_state",
-    "encode_higgs_reference_audio",
-    "normalize_higgs_inputs",
-    "prepare_higgs_reference",
-]

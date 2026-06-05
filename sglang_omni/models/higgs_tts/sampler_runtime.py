@@ -111,6 +111,3 @@ class HiggsSamplerRuntime:
             if was_done_cpu[b]:
                 continue
             self._output_codes.setdefault(req_id, []).append(codes_BN[b])
-
-
-__all__ = ["HiggsSamplerRuntime"]

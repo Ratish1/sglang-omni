@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reference-audio cache key helpers for Higgs TTS."""
+"""Stable reference identity helpers for Higgs TTS."""
 
 from __future__ import annotations
 

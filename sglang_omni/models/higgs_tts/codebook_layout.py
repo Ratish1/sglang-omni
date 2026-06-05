@@ -60,12 +60,3 @@ def to_codes_TN(raw: Any, num_codebooks: int) -> torch.Tensor | None:
             f"reference_codes must have shape [T, {num_codebooks}], got {tuple(t.shape)}"
         )
     return t.to(torch.long)
-
-
-__all__ = [
-    "BOC_ID",
-    "EOC_ID",
-    "apply_delay_pattern",
-    "reverse_delay_pattern",
-    "to_codes_TN",
-]
