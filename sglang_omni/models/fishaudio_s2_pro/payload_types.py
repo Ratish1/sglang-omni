@@ -49,7 +49,18 @@ class S2ProState:
             return t.tolist()
         return t
 
-    def to_dict(self) -> dict[str, Any]:
+    @staticmethod
+    def _output_codes_to_payload(
+        output_codes: Any, *, preserve_tensor_device: bool = False
+    ) -> Any:
+        if isinstance(output_codes, torch.Tensor):
+            output_codes = output_codes.detach()
+            if preserve_tensor_device:
+                return output_codes
+            return output_codes.tolist()
+        return output_codes
+
+    def to_dict(self, *, preserve_tensor_device: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {}
         if self.input_ids is not None:
             data["input_ids"] = self._tensor_to_list(self.input_ids)
@@ -68,7 +79,10 @@ class S2ProState:
         data["ras_temperature"] = self.ras_temperature
         data["ras_top_p"] = self.ras_top_p
         if self.output_codes is not None:
-            data["output_codes"] = self._tensor_to_list(self.output_codes)
+            data["output_codes"] = self._output_codes_to_payload(
+                self.output_codes,
+                preserve_tensor_device=preserve_tensor_device,
+            )
         if self.prompt_tokens:
             data["prompt_tokens"] = self.prompt_tokens
         if self.completion_tokens:
@@ -87,6 +101,9 @@ class S2ProState:
         vq_parts = data.get("vq_parts")
         if vq_parts is not None:
             vq_parts = [torch.tensor(p) if isinstance(p, list) else p for p in vq_parts]
+        output_codes = data.get("output_codes")
+        if output_codes is not None and not isinstance(output_codes, torch.Tensor):
+            output_codes = torch.tensor(output_codes)
         return cls(
             input_ids=data.get("input_ids"),
             vq_mask_tokens=data.get("vq_mask_tokens"),
@@ -101,9 +118,7 @@ class S2ProState:
             ras_window=data.get("ras_window", 16),
             ras_temperature=data.get("ras_temperature", 1.0),
             ras_top_p=data.get("ras_top_p", 0.9),
-            output_codes=(
-                torch.tensor(data["output_codes"]) if "output_codes" in data else None
-            ),
+            output_codes=output_codes,
             prompt_tokens=data.get("prompt_tokens", 0),
             completion_tokens=data.get("completion_tokens", 0),
             engine_time_s=data.get("engine_time_s", 0.0),

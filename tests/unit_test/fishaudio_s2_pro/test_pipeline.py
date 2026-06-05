@@ -59,7 +59,9 @@ def test_fish_config_state_and_tokenizer_prompt_contracts() -> None:
         vq_parts=[torch.tensor([[10, 11], [20, 21]])],
         output_codes=torch.tensor([[100, 101], [1, 2], [3, 4]]),
     )
-    restored = S2ProState.from_dict(state.to_dict())
+    state_dict = state.to_dict()
+    assert state_dict["output_codes"] == [[100, 101], [1, 2], [3, 4]]
+    restored = S2ProState.from_dict(state_dict)
     assert restored.input_ids == [1, 2, 3]
     assert torch.equal(restored.vq_parts[0], torch.tensor([[10, 11], [20, 21]]))
     assert torch.equal(
@@ -123,7 +125,32 @@ def test_fish_tts_request_and_result_adapters_preserve_tensor_contracts() -> Non
     result_payload = result_adapter(adapted)
     assert adapted.stage_payload is payload
     assert result_payload.request is payload.request
-    assert result_payload.data["output_codes"] == [[100], [1], [2]]
+    assert torch.equal(
+        result_payload.data["output_codes"],
+        torch.tensor([[100], [1], [2]], dtype=torch.long),
+    )
+
+
+def test_fish_tts_result_adapter_preserves_output_codes_tensor_device() -> None:
+    """Keeps AR-to-vocoder code handoff on the producing tensor device."""
+    payload = make_s2pro_payload(request_id="req-meta")
+    _, result_adapter = make_tts_scheduler_adapters(tokenizer=FakeFishTokenizer())
+    adapted = S2ProSGLangRequestData(
+        input_ids=torch.empty((3,), dtype=torch.long, device="meta"),
+        req=object(),
+    )
+    adapted.stage_payload = payload
+    adapted.output_codes = [
+        torch.empty((3, 1), dtype=torch.long, device="meta"),
+    ]
+
+    result_payload = result_adapter(adapted)
+
+    output_codes = result_payload.data["output_codes"]
+    assert isinstance(output_codes, torch.Tensor)
+    assert output_codes.device.type == "meta"
+    assert tuple(output_codes.shape) == (3, 1)
+    assert S2ProState.from_dict(result_payload.data).output_codes is output_codes
 
 
 @pytest.mark.parametrize("top_k", [0, 31])

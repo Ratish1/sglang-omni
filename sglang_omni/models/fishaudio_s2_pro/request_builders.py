@@ -159,7 +159,7 @@ def make_tts_scheduler_adapters(*, tokenizer: Any):
         return StagePayload(
             request_id=payload.request_id,
             request=payload.request,
-            data=state.to_dict(),
+            data=state.to_dict(preserve_tensor_device=True),
         )
 
     return request_builder, result_adapter
