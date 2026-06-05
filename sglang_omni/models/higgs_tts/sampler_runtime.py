@@ -111,3 +111,20 @@ class HiggsSamplerRuntime:
             if was_done_cpu[b]:
                 continue
             self._output_codes.setdefault(req_id, []).append(codes_BN[b])
+
+    def pack_decode_collect_staging(self, n_real: int) -> torch.Tensor:
+        """Scatter CG shadow state back into the pool and pack collect staging."""
+        rows_t = self._cg_row_indices[:n_real]
+        pool = self._sampler_pool
+        pool.delay_count[rows_t] = self._cg_active_delay_count[:n_real]
+        pool.eoc_countdown[rows_t] = self._cg_active_eoc_countdown[:n_real]
+        pool.generation_done[rows_t] = self._cg_active_generation_done[:n_real]
+        pool.last_codes[rows_t] = self._cg_active_last_codes[:n_real]
+
+        # Note(Jiaxin): pack the 3 tensors so a single D2H pulls them all back.
+        num_codebooks = self._cg_codes_BN.shape[1]
+        staging = self._cg_collect_staging
+        staging[:n_real, :num_codebooks] = self._cg_codes_BN[:n_real]
+        staging[:n_real, num_codebooks] = self._cg_was_done[:n_real]
+        staging[:n_real, num_codebooks + 1] = self._cg_active_generation_done[:n_real]
+        return staging
