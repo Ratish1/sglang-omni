@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,6 +11,11 @@ import torch
 
 from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+from sglang_omni.models.tts_sampling_seed import (
+    derive_tts_sampling_seed,
+    new_tts_sampling_seed,
+    normalize_tts_sampling_seed,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.request_lifecycle import (
     PreparedRequestStore,
@@ -48,31 +51,17 @@ _IMPLICIT_SAMPLING_DEFAULTS = {
     "repetition_penalty": {1.0, 1.1},
 }
 
-_QWEN3_TTS_SAMPLING_SEED_MASK = 0x7FFFFFFF
-
 
 def _new_qwen3_tts_sampling_seed() -> int:
-    return int.from_bytes(os.urandom(4), "little") & _QWEN3_TTS_SAMPLING_SEED_MASK
+    return new_tts_sampling_seed()
 
 
 def _normalize_qwen3_tts_seed(seed: Any) -> int:
-    if isinstance(seed, bool):
-        raise ValueError("Qwen3-TTS seed must be an integer")
-    if isinstance(seed, float) and not seed.is_integer():
-        raise ValueError("Qwen3-TTS seed must be an integer")
-    try:
-        normalized = int(seed)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Qwen3-TTS seed must be an integer") from exc
-    return normalized & _QWEN3_TTS_SAMPLING_SEED_MASK
+    return normalize_tts_sampling_seed(seed, owner="Qwen3-TTS")
 
 
 def _derive_qwen3_tts_child_seed(seed: int, label: str) -> int:
-    digest = hashlib.blake2b(
-        f"qwen3-tts:{seed}:{label}".encode("utf-8"),
-        digest_size=8,
-    ).digest()
-    return int.from_bytes(digest, "little") & _QWEN3_TTS_SAMPLING_SEED_MASK
+    return derive_tts_sampling_seed("qwen3-tts", seed, label)
 
 
 def derive_qwen3_tts_sampling_seeds(seed: int) -> tuple[int, int]:

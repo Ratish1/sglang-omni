@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import torch
 
+from sglang_omni.models import tts_sampling_seed
 from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_builders
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
@@ -796,7 +797,7 @@ def test_qwen3_tts_request_data_uses_private_sampling_seeds(
     install_fake_sglang(monkeypatch)
     urandom_values = iter([b"\x39\x30\x00\x00", b"\x32\x09\x01\x00"])
     monkeypatch.setattr(
-        qwen3_request_builders.os,
+        tts_sampling_seed.os,
         "urandom",
         lambda size: next(urandom_values) if size == 4 else b"\x00" * size,
     )
