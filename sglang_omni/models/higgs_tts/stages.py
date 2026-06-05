@@ -31,17 +31,19 @@ import torchaudio.functional as F_audio
 from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizerFast
 
+from sglang_omni.models.higgs_tts.codebook_layout import (
+    apply_delay_pattern,
+    to_codes_TN,
+)
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.reference_identity import reference_audio_cache_key
 from sglang_omni.models.higgs_tts.request_builders import make_higgs_scheduler_adapters
 from sglang_omni.models.higgs_tts.text_tokenizer import HiggsTokenizerAdapter
 from sglang_omni.models.higgs_tts.utils import (
-    apply_delay_pattern,
     get_or_load_codec,
     load_audio_to_24k,
     resolve_checkpoint,
-    to_codes_TN,
     truncate_rope_to_bf16,
 )
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (

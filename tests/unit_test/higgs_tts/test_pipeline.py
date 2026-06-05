@@ -9,11 +9,11 @@ import numpy as np
 import torch
 
 from sglang_omni.models.higgs_tts import reference_identity, stages
+from sglang_omni.models.higgs_tts.codebook_layout import EOC_ID, apply_delay_pattern
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import build_higgs_stream_metadata
-from sglang_omni.models.higgs_tts.utils import EOC_ID, apply_delay_pattern
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     HiggsStreamingVocoderScheduler,
 )
