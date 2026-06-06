@@ -13,14 +13,12 @@ import torch
 class S2ProState:
     """Per-request pipeline state for S2-Pro TTS."""
 
-    # -- From preprocessing ------------------------------------------------
     input_ids: Any = None  # [seq_len] as list
     vq_mask_tokens: Any | None = None  # [seq_len] bool as list
     vq_parts: Any | None = None  # list of [num_codebooks, T_i] as nested lists
     num_codebooks: int = 10
     codebook_size: int = 4096
 
-    # -- Generation params -------------------------------------------------
     max_new_tokens: int = 1024
     temperature: float = 0.8
     top_p: float = 0.8
@@ -30,18 +28,14 @@ class S2ProState:
     ras_temperature: float = 1.0
     ras_top_p: float = 0.9
 
-    # -- From TTS engine ---------------------------------------------------
     output_codes: Any | None = None  # [num_codebooks+1, T] as nested list
     prompt_tokens: int = 0
     completion_tokens: int = 0
     engine_time_s: float = 0.0
     finish_reason: str | None = None
 
-    # -- From vocoder ------------------------------------------------------
     audio_samples: Any | None = None
     sample_rate: int = 44100
-
-    # -- Helpers -----------------------------------------------------------
 
     @staticmethod
     def _tensor_to_list(t: Any) -> Any:
