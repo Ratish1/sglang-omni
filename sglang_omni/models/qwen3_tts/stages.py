@@ -293,10 +293,7 @@ def create_vocoder_executor(
         if state.audio_codes is None:
             raise RuntimeError("Qwen3-TTS vocoder requires audio_codes from tts_engine")
 
-        if isinstance(state.audio_codes, torch.Tensor):
-            codes = state.audio_codes.to(dtype=torch.long)
-        else:
-            codes = torch.as_tensor(state.audio_codes, dtype=torch.long)
+        codes = torch.as_tensor(state.audio_codes, dtype=torch.long)
         return state, codes
 
     def _store_vocoder_result(

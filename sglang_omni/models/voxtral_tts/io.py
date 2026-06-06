@@ -67,7 +67,7 @@ class VoxtralTTSState:
             return t.tolist()
         return t
 
-    def to_dict(self, *, compact_audio_codes: bool = True) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
         if self.input_ids is not None:
             data["input_ids"] = self.input_ids
@@ -75,10 +75,7 @@ class VoxtralTTSState:
             data["voice"] = self.voice
         data["max_new_tokens"] = self.max_new_tokens
         if self.audio_codes is not None:
-            if compact_audio_codes:
-                data.update(_encode_audio_codes(self.audio_codes))
-            else:
-                data["audio_codes"] = self.audio_codes
+            data.update(_encode_audio_codes(self.audio_codes))
         if self.prompt_tokens:
             data["prompt_tokens"] = self.prompt_tokens
         if self.completion_tokens:
