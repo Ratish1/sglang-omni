@@ -30,6 +30,7 @@ from sglang_omni.models.moss_tts.request_builders import (
     build_row_cache_key_ids,
     build_sglang_moss_tts_request,
     clear_moss_tts_preprocessing_context,
+    derive_moss_tts_sampling_seed,
     preprocess_moss_tts_payload,
     set_moss_tts_preprocessing_context,
 )
@@ -280,6 +281,13 @@ def test_moss_tts_state_round_trip_keeps_tensors_native() -> None:
     assert restored.token_count == 180
     assert torch.equal(restored.delayed_audio_codes, codes)
     assert restored.assistant_start_length == 2
+
+
+def test_moss_tts_public_seed_derivation_is_stable() -> None:
+    assert derive_moss_tts_sampling_seed(123) == derive_moss_tts_sampling_seed(123)
+    assert derive_moss_tts_sampling_seed(123) != derive_moss_tts_sampling_seed(124)
+    assert 0 <= derive_moss_tts_sampling_seed(123456) <= 0x7FFFFFFF
+    assert derive_moss_tts_sampling_seed(123456) == 150057362
 
 
 def test_moss_tts_maps_references_token_count_and_deterministic_defaults() -> None:
