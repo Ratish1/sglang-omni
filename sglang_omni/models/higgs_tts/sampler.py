@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang_omni.models.higgs_tts.utils import BOC_ID, EOC_ID
+from sglang_omni.models.higgs_tts.codebook_layout import BOC_ID, EOC_ID
 
 # Sentinel returned by ``step`` after ``generation_done``; engine treats as stop.
 STOP_CODE = -1
@@ -30,11 +30,6 @@ class HiggsSamplerState:
     eoc_countdown: int | None = None
     generation_done: bool = False
     last_codes: torch.Tensor | None = None
-
-
-# ---------------------------------------------------------------------------
-# Batched (CUDA-Graph-compatible) sampler state
-# ---------------------------------------------------------------------------
 
 
 class HiggsBatchedSamplerState:
@@ -204,11 +199,6 @@ def step(
         state.last_codes = codes_N.clone()
 
     return codes_N
-
-
-# ---------------------------------------------------------------------------
-# Batched (CUDA-Graph-friendly) sampler step
-# ---------------------------------------------------------------------------
 
 
 def _sample_independent_batched(

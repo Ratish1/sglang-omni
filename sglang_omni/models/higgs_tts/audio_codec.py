@@ -83,7 +83,7 @@ def _load_codec_state_dict(tts_ckpt_dir: str) -> dict[str, torch.Tensor]:
             if full_name.startswith(_CODEC_IN_TTS_CKPT_PREFIX):
                 shards.setdefault(shard, []).append(full_name)
     else:
-        shards = {"model.safetensors": None}  # single-shard layout
+        shards = {"model.safetensors": None}
 
     state: dict[str, torch.Tensor] = {}
     for shard, names in shards.items():
@@ -194,13 +194,12 @@ class HiggsAudioCodec:
         batch_fn,
         error_label: str,
     ) -> list[torch.Tensor]:
-        """Run single_fn on singleton buckets and batch_fn on multi-item buckets."""
         if not items:
             return []
         if len(items) == 1:
             return [single_fn(items[0])]
 
-        buckets: dict[int, list[int]] = {}
+        buckets: dict[object, list[int]] = {}
         for i, item in enumerate(items):
             buckets.setdefault(bucket_key_fn(item), []).append(i)
 
@@ -208,10 +207,10 @@ class HiggsAudioCodec:
         for indices in buckets.values():
             if len(indices) == 1:
                 results[indices[0]] = single_fn(items[indices[0]])
-            else:
-                batch_results = batch_fn([items[i] for i in indices])
-                for idx, result in zip(indices, batch_results):
-                    results[idx] = result
+                continue
+            batch_results = batch_fn([items[i] for i in indices])
+            for idx, result in zip(indices, batch_results):
+                results[idx] = result
 
         out: list[torch.Tensor] = []
         for i, result in enumerate(results):
@@ -222,7 +221,6 @@ class HiggsAudioCodec:
 
     @torch.no_grad()
     def encode_batch(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
-        # Offline/bulk encoding utility.
         padded: list[torch.Tensor] = []
         for w in waveforms:
             wav = _to_mono_3d(w).to(torch.float32)
