@@ -7,8 +7,8 @@ benchmark exercises API contracts, malformed requests, stateful voice
 operations, streaming behavior, and high-concurrency load.
 
 Note: before all serving APIs are integrated, enabled-but-missing contracts are
-expected to fail explicitly; after those APIs are integrated, the same
-benchmark spec should pass.
+expected to fail explicitly. After those APIs are integrated,
+`examples/stress.json` should pass.
 
 ## Design
 
@@ -105,7 +105,7 @@ Common `params` fields:
 | `voice_cache_pressure_voice_count` | Number of unique uploaded voices for cache-pressure stages. |
 | `voice_speaker_cap_count` | Upload-attempt budget for speaker-cap stages. |
 | `file_ref_audio` | Optional `file://` reference audio URI sent to the target service. Required for full speech reference coverage. The target service must be launched with an allowed-local-media path that contains this file. |
-| `file_ref_text` | Optional transcript for `file_ref_audio`; defaults to the SeedTTS reference text. |
+| `file_ref_text` | Optional transcript for `file_ref_audio`. Defaults to the SeedTTS reference text. |
 
 Load-stage fields:
 
@@ -115,7 +115,7 @@ Load-stage fields:
 | `mode` | `closed_loop`, `open_loop`, `ramp`, `burst`, or `soak`. |
 | `request_count` | Number of scheduled scenarios for the stage. |
 | `max_concurrency` | Maximum in-flight requests for the stage. |
-| `request_rate` | Requests per second for `open_loop` and `ramp`. Do not set this for `soak`; it is derived from `request_count / duration_s`. |
+| `request_rate` | Requests per second for `open_loop` and `ramp`. Do not set this for `soak` because it is derived from `request_count / duration_s`. |
 | `start_request_rate` | Initial requests per second for `ramp`. |
 | `duration_s` | Wall-clock duration for `soak`. |
 | `arrival_distribution` | `deterministic` or `poisson`. |
@@ -132,6 +132,46 @@ Load-stage fields:
 | `batch` | `POST /v1/audio/speech/batch` with 1-32 item batches, per-item overrides, item-level success/error records, and oversized batch rejection. |
 | `voices` | `GET`, `POST`, and `DELETE /v1/audio/voices` with upload formats, metadata, overwrite, delete, speaker-cap, cleanup, race, and cache-pressure behavior. |
 | `websocket` | `/v1/audio/speech/stream` with session configuration, incremental text input, binary audio frames, event ordering, client disconnect, malformed JSON, and missing-config errors. |
+
+Voice cache-pressure scenarios require `GET /v1/audio/voices` to expose a
+`cache_stats` object with `entries`, `memory_bytes`, `max_bytes`,
+`eviction_count`, `hit_count`, `miss_count`, and
+`delete_invalidation_counter`. The cache-pressure sequence uploads unique
+voices, synthesizes with each voice, revisits older voices, deletes the created
+set, and requires the miss, hit, memory, and delete-invalidation counters to
+move according to those operations. If the generated traffic reaches the
+advertised cache budget, `eviction_count` must move as well.
+
+## Response Body Contracts
+
+Malformed HTTP requests must return a structured JSON error body:
+
+```json
+{
+  "error": {
+    "message": "human-readable error",
+    "type": "BadRequestError",
+    "param": "field_name_or_null",
+    "code": 400
+  }
+}
+```
+
+Missing resources must use the same shape with `type: "NotFoundError"` and
+`code: 404`. The missing-voice `DELETE /v1/audio/voices/{name}` contract is a
+voice-management response instead of the generic error envelope:
+
+```json
+{
+  "success": false,
+  "error": {
+    "message": "voice not found"
+  }
+}
+```
+
+The harness accepts `error` as either a non-empty object or a non-empty string
+for this delete-specific response.
 
 ## Basic Usage
 
@@ -178,12 +218,12 @@ The matrix is deterministic for a given spec seed. It covers:
 - speech success paths across response formats, task types, speed boundaries,
   reference-audio shapes, allowed `file://` references, SDK calls, and SSE
   streaming
-- malformed speech requests that must return OpenAI-compatible error envelopes
+- malformed speech requests that must return the structured error envelope
 - multilingual and adversarial text payloads
 - batch speech creation and item-level result validation
 - uploaded-voice list, upload, overwrite, delete, metadata, speaker-cap, and
   upload/delete race contracts
-- voice cache pressure traffic and cache-observability coverage gaps
+- voice cache pressure traffic with observable cache counters
 - WebSocket speech-stream setup, event order, audio events, and error cases
 
 Voice scenarios are stateful. Successful standalone uploads verify uploaded
@@ -207,7 +247,7 @@ headers or placeholder bytes cannot pass as generated audio.
 | `ramp-128` | Poisson ramp from low request rate to high request rate. |
 | `soak-300s` | Sustained load over a fixed duration. |
 | `ws-burst-512` | WebSocket-only burst pressure. |
-| `voice-cache-pressure` | Uploaded-voice churn below the speaker cap. |
+| `voice-cache-pressure` | Uploaded-voice cache pressure below the speaker cap. |
 | `voice-speaker-cap` | State-aware speaker-cap validation. |
 | `mixed-burst-512` | Full-endpoint burst with `request_count=512` and `max_concurrency=512`. |
 
@@ -219,9 +259,10 @@ Speaker-cap stages list existing uploaded voices first, upload only the names
 needed to reach `speaker_max_uploaded`, and require the first overflow upload
 to fail. Set `speaker_max_uploaded` to the server-side uploaded-speaker cap.
 
-Cache-pressure stages generate traffic pressure. Full cache validation also
-requires observable counters for eviction, hit, miss, byte usage, and
-delete-invalidation behavior.
+Cache-pressure stages require observable counters for entries, memory usage,
+hits, misses, delete invalidation, and eviction behavior when the cache reaches
+capacity. Missing counters or counters that do not match the generated traffic
+fail the serving contract.
 
 ## Results
 

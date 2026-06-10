@@ -30,6 +30,10 @@ MIN_COMPRESSED_AUDIO_BYTES = 32
 MAX_PRINTABLE_ASCII_RATIO = 0.95
 COMPRESSED_DECODE_TIMEOUT_S = 10
 FFMPEG_DECODE_CHANNELS = 1
+MAX_DECODED_PCM_BYTES = 64 * 1024 * 1024
+COMPRESSED_DECODE_MAX_DURATION_S = (MAX_DECODED_PCM_BYTES + PCM_SAMPLE_WIDTH) / (
+    PCM_SAMPLE_RATE * FFMPEG_DECODE_CHANNELS * PCM_SAMPLE_WIDTH
+)
 
 PCM_CONTENT_TYPES = frozenset(
     {"application/octet-stream", "audio/pcm", "audio/raw", ""}
@@ -236,6 +240,8 @@ def _decode_compressed_to_pcm(body: bytes, response_format: str) -> _DecodedPcm:
                 str(FFMPEG_DECODE_CHANNELS),
                 "-ar",
                 str(PCM_SAMPLE_RATE),
+                "-t",
+                f"{COMPRESSED_DECODE_MAX_DURATION_S:.6f}",
                 "pipe:1",
             ],
             input=body,
@@ -256,6 +262,14 @@ def _decode_compressed_to_pcm(body: bytes, response_format: str) -> _DecodedPcm:
         )
     if not completed.stdout:
         return _DecodedPcm(False, error=f"{response_format} decoded to empty PCM")
+    if len(completed.stdout) >= MAX_DECODED_PCM_BYTES:
+        return _DecodedPcm(
+            False,
+            error=(
+                f"{response_format} decoded PCM exceeds benchmark validation cap "
+                f"(bytes={len(completed.stdout)}, max_bytes={MAX_DECODED_PCM_BYTES})"
+            ),
+        )
     return _DecodedPcm(True, pcm=completed.stdout)
 
 

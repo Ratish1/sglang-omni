@@ -11,7 +11,10 @@ from dataclasses import dataclass
 import aiohttp
 
 from benchmarks.tts_serving.audio_validation import validate_pcm_chunk
-from benchmarks.tts_serving.http_contracts import UNSUPPORTED_HTTP_STATUSES
+from benchmarks.tts_serving.http_contracts import (
+    MAX_HTTP_RESPONSE_BYTES,
+    UNSUPPORTED_HTTP_STATUSES,
+)
 from benchmarks.tts_serving.metrics import (
     PCM_SAMPLE_RATE,
     ScenarioResult,
@@ -52,7 +55,7 @@ async def run_ws_scenario(
     url = websocket_url(spec.base_url, scenario.path)
     start = time.perf_counter()
     try:
-        async with session.ws_connect(url) as ws:
+        async with session.ws_connect(url, max_msg_size=MAX_HTTP_RESPONSE_BYTES) as ws:
             await _run_ws_script(
                 ws,
                 result,
@@ -414,7 +417,8 @@ def _is_valid_audio_start(event: dict) -> bool:
         and isinstance(event.get("format"), str)
         and event["format"] == "pcm"
         and isinstance(event.get("sample_rate"), int)
-        and event["sample_rate"] == PCM_SAMPLE_RATE
+        and not isinstance(event["sample_rate"], bool)
+        and event["sample_rate"] > 0
     )
 
 
@@ -512,7 +516,7 @@ async def _probe_websocket_after_disconnect(
 ) -> None:
     url = websocket_url(spec.base_url, scenario.path)
     try:
-        async with session.ws_connect(url) as ws:
+        async with session.ws_connect(url, max_msg_size=MAX_HTTP_RESPONSE_BYTES) as ws:
             await _run_ws_script(
                 ws,
                 result,

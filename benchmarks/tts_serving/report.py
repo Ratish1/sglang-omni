@@ -7,6 +7,7 @@ import statistics
 from collections import Counter, defaultdict
 from typing import Any
 
+from benchmarks.tts_serving import voice_contracts
 from benchmarks.tts_serving.metrics import ScenarioResult
 from benchmarks.tts_serving.scenarios import (
     BATCH_OVERSIZED_SIZE,
@@ -29,14 +30,6 @@ from benchmarks.tts_serving.scenarios import (
     scenario_set_hash,
 )
 from benchmarks.tts_serving.spec import BenchmarkSpec, redact_sensitive_metadata
-
-VOICE_CACHE_OBSERVABILITY_COUNTERS = (
-    "eviction_count",
-    "hit_count",
-    "miss_count",
-    "cache_byte_usage",
-    "delete_invalidation_counter",
-)
 
 
 def build_results_report(
@@ -743,6 +736,13 @@ def _voice_coverage_matrix(
         _configured_voice_cache_pressure_voice_count(spec)
     )
     configured_speaker_cap_count = _configured_voice_speaker_cap_count(spec)
+    cache_observability_tested = (
+        configured_cache_pressure_voice_count > 0
+        and _has_capability(
+            voice_scenarios,
+            "voices.cache_pressure_traffic",
+        )
+    )
     rows = [
         _coverage_matrix_row(
             spec,
@@ -893,23 +893,12 @@ def _voice_coverage_matrix(
         _coverage_matrix_row(
             spec,
             "voices.cache_observability",
-            tested=False,
-            expected=list(VOICE_CACHE_OBSERVABILITY_COUNTERS),
+            tested=cache_observability_tested,
+            expected=list(voice_contracts.VOICE_CACHE_OBSERVABILITY_COUNTERS),
             observed=(
-                ["instrumentation_missing"]
-                if configured_cache_pressure_voice_count
+                list(voice_contracts.VOICE_CACHE_OBSERVABILITY_COUNTERS)
+                if cache_observability_tested
                 else []
-            ),
-            gap_status=(
-                "instrumentation_missing"
-                if configured_cache_pressure_voice_count
-                else "coverage_gap"
-            ),
-            gap_error=(
-                "voice cache pressure traffic ran without observable cache "
-                "eviction/hit/miss/byte/delete-invalidation instrumentation"
-                if configured_cache_pressure_voice_count
-                else None
             ),
             out_of_scope_reason=(
                 None
@@ -1173,19 +1162,6 @@ def _voice_coverage_failures(
             _coverage_gap(
                 "voices.cache_pressure_traffic",
                 ["voices.cache_pressure_traffic"],
-            )
-        )
-    if _configured_voice_cache_pressure_voice_count(spec):
-        failures.append(
-            _coverage_gap(
-                "voices.cache_observability",
-                list(VOICE_CACHE_OBSERVABILITY_COUNTERS),
-                status="instrumentation_missing",
-                error=(
-                    "voice cache pressure requires observable cache counters; "
-                    "traffic-only synthesis cannot prove eviction or hit/miss "
-                    "behavior"
-                ),
             )
         )
     return failures

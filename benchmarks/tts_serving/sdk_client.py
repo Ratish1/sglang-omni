@@ -14,7 +14,10 @@ from typing import Any
 
 from benchmarks.tts_serving.audio_validation import validate_audio_response
 from benchmarks.tts_serving.error_contract import is_openai_error_response
-from benchmarks.tts_serving.http_contracts import UNSUPPORTED_HTTP_STATUSES
+from benchmarks.tts_serving.http_contracts import (
+    MAX_HTTP_RESPONSE_BYTES,
+    UNSUPPORTED_HTTP_STATUSES,
+)
 from benchmarks.tts_serving.metrics import ScenarioResult, finish_timing
 from benchmarks.tts_serving.scenarios import Scenario
 from benchmarks.tts_serving.spec import BenchmarkSpec
@@ -76,6 +79,17 @@ def _run_openai_speech_create(
             output_path = Path(tmp_dir) / f"speech.{response_format}"
             response = client.audio.speech.create(**request)
             response.stream_to_file(str(output_path))
+            output_size = output_path.stat().st_size
+            if output_size > MAX_HTTP_RESPONSE_BYTES:
+                result.response_bytes = output_size
+                result.status = "response_too_large"
+                result.capability = "fail"
+                result.error_class = "protocol_error"
+                result.error = (
+                    "OpenAI SDK speech.create output exceeded benchmark read cap "
+                    f"(bytes_read={output_size}, max_bytes={MAX_HTTP_RESPONSE_BYTES})"
+                )
+                return
             body = output_path.read_bytes()
             finish_timing(result, start)
     except APIStatusError as exc:

@@ -19,6 +19,8 @@ from benchmarks.tts_serving.audio_validation import (
 )
 from benchmarks.tts_serving.batch_client import handle_batch_success
 from benchmarks.tts_serving.http_contracts import (
+    MAX_HTTP_RESPONSE_BYTES,
+    ResponseBodyTooLarge,
     _classify_http_failure,
     _is_unsupported_http_status,
     _mark_protocol_error,
@@ -26,6 +28,7 @@ from benchmarks.tts_serving.http_contracts import (
     _mark_unexpected_success,
     _mark_unsupported_contract,
     _result_has_terminal_error,
+    read_response_body,
 )
 from benchmarks.tts_serving.metrics import (
     PCM_SAMPLE_RATE,
@@ -144,7 +147,11 @@ async def _handle_probe_response(
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
-    body, body_text = await _response_body_and_text(response)
+    try:
+        body, body_text = await _response_body_and_text(response)
+    except ResponseBodyTooLarge as exc:
+        _mark_response_body_too_large(result, exc)
+        return
     result.response_bytes = len(body)
     if _is_unsupported_http_status(response.status, scenario):
         _mark_unsupported_contract(
@@ -171,7 +178,12 @@ async def _handle_binary_response(
     result.http_status = response.status
     result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
-    body = await response.read()
+    try:
+        body = await read_response_body(response)
+    except ResponseBodyTooLarge as exc:
+        finish_timing(result, start)
+        _mark_response_body_too_large(result, exc)
+        return
     finish_timing(result, start)
     result.response_bytes = len(body)
     if _is_unsupported_http_status(response.status, scenario):
@@ -229,7 +241,11 @@ async def _handle_sse_response(
     result.http_status_class = classify_http_status(response.status)
     result.response_headers = dict(response.headers)
     if response.status != 200:
-        body, body_text = await _response_body_and_text(response)
+        try:
+            body, body_text = await _response_body_and_text(response)
+        except ResponseBodyTooLarge as exc:
+            _mark_response_body_too_large(result, exc)
+            return
         result.response_bytes = len(body)
         if _is_unsupported_http_status(response.status, scenario):
             _mark_unsupported_contract(result, scenario, body=body_text)
@@ -238,7 +254,11 @@ async def _handle_sse_response(
         return
     content_type = str(response.headers.get("Content-Type", "")).lower()
     if "text/event-stream" not in content_type:
-        body = await response.read()
+        try:
+            body = await read_response_body(response)
+        except ResponseBodyTooLarge as exc:
+            _mark_response_body_too_large(result, exc)
+            return
         result.response_bytes = len(body)
         _mark_protocol_error(
             result,
@@ -253,8 +273,19 @@ async def _handle_sse_response(
     buffer = bytearray()
     audio_state = SseAudioState()
     chunk_times: list[float] = []
+    streamed_response_bytes = 0
     saw_done = False
     async for chunk in response.content.iter_any():
+        streamed_response_bytes += len(chunk)
+        if streamed_response_bytes > MAX_HTTP_RESPONSE_BYTES:
+            _mark_response_body_too_large(
+                result,
+                ResponseBodyTooLarge(
+                    bytes_read=streamed_response_bytes,
+                    max_bytes=MAX_HTTP_RESPONSE_BYTES,
+                ),
+            )
+            return
         buffer.extend(chunk)
         while b"\n" in buffer:
             raw_line, _, rest = buffer.partition(b"\n")
@@ -335,8 +366,23 @@ async def _handle_sse_response(
 async def _response_body_and_text(
     response: aiohttp.ClientResponse,
 ) -> tuple[bytes, str]:
-    body = await response.read()
+    body = await read_response_body(response)
     return body, body.decode("utf-8", errors="replace")
+
+
+def _mark_response_body_too_large(
+    result: ScenarioResult,
+    exc: ResponseBodyTooLarge,
+) -> None:
+    result.response_bytes = exc.bytes_read
+    _mark_protocol_error(
+        result,
+        status="response_too_large",
+        error=(
+            "HTTP response exceeded benchmark read cap "
+            f"(bytes_read={exc.bytes_read}, max_bytes={exc.max_bytes})"
+        ),
+    )
 
 
 def _merge_sse_line(

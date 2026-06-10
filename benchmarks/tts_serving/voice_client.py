@@ -10,9 +10,11 @@ from typing import Any
 
 import aiohttp
 
+from benchmarks.tts_serving import voice_contracts
 from benchmarks.tts_serving.audio_validation import validate_audio_response
 from benchmarks.tts_serving.http_contracts import (
     UNSUPPORTED_HTTP_STATUSES,
+    ResponseBodyTooLarge,
     _classify_http_failure,
     _is_valid_error_response,
     _json_from_bytes,
@@ -20,6 +22,7 @@ from benchmarks.tts_serving.http_contracts import (
     _mark_protocol_error,
     _mark_success,
     _mark_unsupported_contract,
+    read_response_body,
 )
 from benchmarks.tts_serving.metrics import ScenarioResult, classify_http_status
 from benchmarks.tts_serving.scenarios import (
@@ -310,6 +313,7 @@ async def run_voice_overwrite(
     upload_url = api_url(spec.base_url, scenario.path)
     voice_name = str(scenario.planned_metadata.get("voice_name", ""))
     result.request_bytes = request_size(scenario) * 2
+    created_voice_names: list[str] = []
 
     before_description = "Synthetic benchmark voice before overwrite."
     after_description = "Synthetic benchmark voice after overwrite."
@@ -318,62 +322,69 @@ async def run_voice_overwrite(
     first_fields["speaker_description"] = before_description
     second_fields["speaker_description"] = after_description
 
-    first_payload = await _post_voice_upload(
-        session,
-        upload_url,
-        scenario,
-        result,
-        form_fields=first_fields,
-    )
-    if first_payload is None:
-        return
-    if not _require_voice_upload_identifier(
-        first_payload,
-        result,
-        error="first same-name voice upload response must include an identifier",
-    ):
-        return
-
-    second_payload = await _post_voice_upload(
-        session,
-        upload_url,
-        scenario,
-        result,
-        form_fields=second_fields,
-    )
-    if second_payload is None:
-        return
-    if not _require_voice_upload_identifier(
-        second_payload,
-        result,
-        error="second same-name voice upload response must include an identifier",
-    ):
-        return
-    if not _is_voice_overwrite_ack(second_payload):
-        _mark_protocol_error(
+    try:
+        first_payload = await _post_voice_upload(
+            session,
+            upload_url,
+            scenario,
             result,
-            status="invalid_voice_response",
-            error=(
-                "second same-name upload must include an overwrite warning or "
-                f"replacement indicator: {second_payload}"
-            ),
+            form_fields=first_fields,
         )
-        return
+        if first_payload is None:
+            return
+        created_voice_names.append(voice_name)
+        if not _require_voice_upload_identifier(
+            first_payload,
+            result,
+            error="first same-name voice upload response must include an identifier",
+        ):
+            return
 
-    voice_list = await _get_voice_list(session, spec, scenario, result)
-    if voice_list is None:
-        return
-    entries = _uploaded_voice_entries(voice_list, voice_name)
-    if not _validate_overwritten_voice_entry(
-        entries,
-        result,
-        voice_name=voice_name,
-        expected_speaker_description=after_description,
-    ):
-        return
-    if not await _delete_voice_by_name(session, spec, scenario, result, voice_name):
-        return
-    _mark_success(result, capability="pass")
+        second_payload = await _post_voice_upload(
+            session,
+            upload_url,
+            scenario,
+            result,
+            form_fields=second_fields,
+        )
+        if second_payload is None:
+            return
+        if not _require_voice_upload_identifier(
+            second_payload,
+            result,
+            error="second same-name voice upload response must include an identifier",
+        ):
+            return
+        if not voice_contracts.is_voice_overwrite_ack(second_payload):
+            _mark_protocol_error(
+                result,
+                status="invalid_voice_response",
+                error=(
+                    "second same-name upload must include an overwrite warning or "
+                    f"replacement indicator: {second_payload}"
+                ),
+            )
+            return
+
+        voice_list = await _get_voice_list(session, spec, scenario, result)
+        if voice_list is None:
+            return
+        entries = voice_contracts.uploaded_voice_entries(voice_list, voice_name)
+        if not _validate_overwritten_voice_entry(
+            entries,
+            result,
+            voice_name=voice_name,
+            expected_speaker_description=after_description,
+        ):
+            return
+        if not await _delete_voice_by_name(session, spec, scenario, result, voice_name):
+            return
+        created_voice_names.clear()
+        _mark_success(result, capability="pass")
+    finally:
+        cleanup_error = await _cleanup_voice_names(session, spec, created_voice_names)
+        if cleanup_error is not None:
+            _mark_cleanup_error_if_primary_path_passed(result, cleanup_error)
 
 
 async def run_voice_upload_delete_race(
@@ -385,71 +396,82 @@ async def run_voice_upload_delete_race(
     upload_url = api_url(spec.base_url, scenario.path)
     voice_name = str(scenario.planned_metadata.get("voice_name", ""))
     result.request_bytes = request_size(scenario) * 2
+    created_voice_names: list[str] = []
 
-    initial_payload = await _post_voice_upload(
-        session,
-        upload_url,
-        scenario,
-        result,
-        form_fields=scenario.form_fields,
-    )
-    if initial_payload is None:
-        return
-    if not _require_voice_upload_identifier(
-        initial_payload,
-        result,
-        error="initial race voice upload response must include an identifier",
-    ):
-        return
-
-    race_upload_fields = dict(scenario.form_fields)
-    race_upload_fields["speaker_description"] = (
-        "Synthetic benchmark voice uploaded concurrently with delete."
-    )
-    upload_body = request_body(scenario, form_fields=race_upload_fields)
-    delete_url = api_url(spec.base_url, f"/v1/audio/voices/{voice_name}")
-    upload_response, delete_response = await asyncio.gather(
-        _raw_post(session, upload_url, upload_body),
-        _raw_delete(session, delete_url),
-    )
-    _merge_raw_voice_response(upload_response, result)
-    _merge_raw_voice_response(delete_response, result)
-    if not _classify_voice_race_response(
-        upload_response,
-        result,
-        scenario,
-        operation="concurrent voice upload",
-        requires_voice_identifier=True,
-    ):
-        return
-    if not _classify_voice_race_response(
-        delete_response,
-        result,
-        scenario,
-        operation="concurrent voice delete",
-        requires_delete_success=True,
-    ):
-        return
-
-    voice_list = await _get_voice_list(session, spec, scenario, result)
-    if voice_list is None:
-        return
-    entries = _uploaded_voice_entries(voice_list, voice_name)
-    if len(entries) > 1:
-        _mark_protocol_error(
+    try:
+        initial_payload = await _post_voice_upload(
+            session,
+            upload_url,
+            scenario,
             result,
-            status="invalid_voice_response",
-            error=(
-                "same-name upload/delete race must not leave duplicate uploaded "
-                f"voices named {voice_name!r}; observed={len(entries)}"
-            ),
+            form_fields=scenario.form_fields,
         )
+        if initial_payload is None:
+            return
+        created_voice_names.append(voice_name)
+        if not _require_voice_upload_identifier(
+            initial_payload,
+            result,
+            error="initial race voice upload response must include an identifier",
+        ):
+            return
+
+        race_upload_fields = dict(scenario.form_fields)
+        race_upload_fields["speaker_description"] = (
+            "Synthetic benchmark voice uploaded concurrently with delete."
+        )
+        upload_body = request_body(scenario, form_fields=race_upload_fields)
+        delete_url = api_url(spec.base_url, f"/v1/audio/voices/{voice_name}")
+        upload_response, delete_response = await asyncio.gather(
+            _raw_post(session, upload_url, upload_body),
+            _raw_delete(session, delete_url),
+        )
+        _merge_raw_voice_response(upload_response, result)
+        _merge_raw_voice_response(delete_response, result)
+        if not _classify_voice_race_response(
+            upload_response,
+            result,
+            scenario,
+            operation="concurrent voice upload",
+            requires_voice_identifier=True,
+        ):
+            return
+        if not _classify_voice_race_response(
+            delete_response,
+            result,
+            scenario,
+            operation="concurrent voice delete",
+            requires_delete_success=True,
+        ):
+            return
+
+        voice_list = await _get_voice_list(session, spec, scenario, result)
+        if voice_list is None:
+            return
+        entries = voice_contracts.uploaded_voice_entries(voice_list, voice_name)
+        if len(entries) > 1:
+            _mark_protocol_error(
+                result,
+                status="invalid_voice_response",
+                error=(
+                    "same-name upload/delete race must not leave duplicate uploaded "
+                    f"voices named {voice_name!r}; observed={len(entries)}"
+                ),
+            )
+            return
+        if entries and not await _delete_voice_by_name(
+            session, spec, scenario, result, voice_name
+        ):
+            return
+        created_voice_names.clear()
+        _mark_success(result, capability="pass")
+    except ResponseBodyTooLarge as exc:
+        _mark_voice_response_too_large(result, exc)
         return
-    if entries and not await _delete_voice_by_name(
-        session, spec, scenario, result, voice_name
-    ):
-        return
-    _mark_success(result, capability="pass")
+    finally:
+        cleanup_error = await _cleanup_voice_names(session, spec, created_voice_names)
+        if cleanup_error is not None:
+            _mark_cleanup_error_if_primary_path_passed(result, cleanup_error)
 
 
 async def run_voice_speaker_cap_sequence(
@@ -598,58 +620,294 @@ async def run_voice_cache_pressure_sequence(
         )
         return
 
-    upload_url = api_url(spec.base_url, scenario.path)
     created_voice_names: list[str] = []
     try:
-        for voice_index in range(voice_count):
-            voice_name = f"{voice_name_prefix}_{voice_index:04d}"
-            fields = _voice_sequence_form_fields(
-                scenario,
-                voice_name=voice_name,
-                ref_text=f"Voice cache pressure reference text {voice_index}.",
-                speaker_description=(
-                    f"Synthetic cache pressure voice number {voice_index}."
-                ),
-            )
-            created_voice_names.append(voice_name)
-            if not await _post_expected_voice_upload(
-                session,
-                upload_url,
-                scenario,
-                result,
-                form_fields=fields,
-                upload_format="wav",
-                content_type="audio/wav",
-                upload_size=VOICE_SMALL_UPLOAD_BYTES,
-                upload_case="format",
-                operation=f"cache pressure upload {voice_index}",
-            ):
-                return
-            if not await _post_speech_with_uploaded_voice(
-                session,
-                spec,
-                scenario,
-                result,
-                voice_name=voice_name,
-                prompt=f"Cache pressure synthesis request {voice_index}.",
-            ):
-                return
-
-        for voice_name in _cache_revisit_voice_names(created_voice_names):
-            if not await _post_speech_with_uploaded_voice(
-                session,
-                spec,
-                scenario,
-                result,
-                voice_name=voice_name,
-                prompt=f"Cache revisit synthesis request for {voice_name}.",
-            ):
-                return
+        if not await _run_voice_cache_pressure_primary_path(
+            session,
+            spec,
+            scenario,
+            result,
+            voice_name_prefix=voice_name_prefix,
+            voice_count=voice_count,
+            created_voice_names=created_voice_names,
+        ):
+            return
         _mark_success(result, capability="pass")
     finally:
         cleanup_error = await _cleanup_voice_names(session, spec, created_voice_names)
         if cleanup_error is not None:
             _mark_cleanup_error_if_primary_path_passed(result, cleanup_error)
+
+
+async def _run_voice_cache_pressure_primary_path(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    voice_name_prefix: str,
+    voice_count: int,
+    created_voice_names: list[str],
+) -> bool:
+    before_stats = await _voice_cache_stats_snapshot(
+        session,
+        spec,
+        scenario,
+        result,
+        operation="before cache pressure",
+    )
+    if before_stats is None:
+        return False
+
+    after_unique_stats = await _cache_pressure_unique_phase(
+        session,
+        spec,
+        scenario,
+        result,
+        before_stats=before_stats,
+        voice_name_prefix=voice_name_prefix,
+        voice_count=voice_count,
+        created_voice_names=created_voice_names,
+    )
+    if after_unique_stats is None:
+        return False
+
+    after_revisit_stats = await _cache_pressure_revisit_phase(
+        session,
+        spec,
+        scenario,
+        result,
+        after_unique_stats=after_unique_stats,
+        created_voice_names=created_voice_names,
+    )
+    if after_revisit_stats is None:
+        return False
+
+    return await _cache_pressure_cleanup_phase(
+        session,
+        spec,
+        scenario,
+        result,
+        after_revisit_stats=after_revisit_stats,
+        created_voice_names=created_voice_names,
+    )
+
+
+async def _cache_pressure_unique_phase(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    before_stats: dict[str, int],
+    voice_name_prefix: str,
+    voice_count: int,
+    created_voice_names: list[str],
+) -> dict[str, int] | None:
+    if not await _upload_and_synthesize_cache_pressure_voices(
+        session,
+        spec,
+        scenario,
+        result,
+        voice_name_prefix=voice_name_prefix,
+        voice_count=voice_count,
+        created_voice_names=created_voice_names,
+    ):
+        return None
+
+    after_unique_stats = await _voice_cache_stats_snapshot(
+        session,
+        spec,
+        scenario,
+        result,
+        operation="after unique cache pressure requests",
+    )
+    if after_unique_stats is None:
+        return None
+    if not voice_contracts.validate_cache_pressure_unique_stats(
+        before_stats,
+        after_unique_stats,
+        voice_count=voice_count,
+        result=result,
+    ):
+        return None
+    return after_unique_stats
+
+
+async def _cache_pressure_revisit_phase(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    after_unique_stats: dict[str, int],
+    created_voice_names: list[str],
+) -> dict[str, int] | None:
+    revisit_voice_names = await _revisit_cache_pressure_voices(
+        session,
+        spec,
+        scenario,
+        result,
+        created_voice_names,
+    )
+    if revisit_voice_names is None:
+        return None
+
+    after_revisit_stats = await _voice_cache_stats_snapshot(
+        session,
+        spec,
+        scenario,
+        result,
+        operation="after cache revisit requests",
+    )
+    if after_revisit_stats is None:
+        return None
+    if not voice_contracts.validate_cache_pressure_revisit_stats(
+        after_unique_stats,
+        after_revisit_stats,
+        revisit_count=len(revisit_voice_names),
+        result=result,
+    ):
+        return None
+    return after_revisit_stats
+
+
+async def _cache_pressure_cleanup_phase(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    after_revisit_stats: dict[str, int],
+    created_voice_names: list[str],
+) -> bool:
+    cleanup = await _cleanup_cache_pressure_voices(
+        session,
+        spec,
+        scenario,
+        result,
+        created_voice_names,
+    )
+    if cleanup is None:
+        return False
+    after_cleanup_stats, cleanup_count = cleanup
+    return voice_contracts.validate_cache_pressure_cleanup_stats(
+        after_revisit_stats,
+        after_cleanup_stats,
+        deleted_count=cleanup_count,
+        result=result,
+    )
+
+
+async def _voice_cache_stats_snapshot(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    operation: str,
+) -> dict[str, int] | None:
+    voice_list = await _get_voice_list(session, spec, scenario, result)
+    if voice_list is None:
+        return None
+    return voice_contracts.require_voice_cache_stats(
+        voice_list, result, operation=operation
+    )
+
+
+async def _upload_and_synthesize_cache_pressure_voices(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    *,
+    voice_name_prefix: str,
+    voice_count: int,
+    created_voice_names: list[str],
+) -> bool:
+    upload_url = api_url(spec.base_url, scenario.path)
+    for voice_index in range(voice_count):
+        voice_name = f"{voice_name_prefix}_{voice_index:04d}"
+        fields = _voice_sequence_form_fields(
+            scenario,
+            voice_name=voice_name,
+            ref_text=f"Voice cache pressure reference text {voice_index}.",
+            speaker_description=f"Synthetic cache pressure voice number {voice_index}.",
+        )
+        created_voice_names.append(voice_name)
+        if not await _post_expected_voice_upload(
+            session,
+            upload_url,
+            scenario,
+            result,
+            form_fields=fields,
+            upload_format="wav",
+            content_type="audio/wav",
+            upload_size=VOICE_SMALL_UPLOAD_BYTES,
+            upload_case="format",
+            operation=f"cache pressure upload {voice_index}",
+        ):
+            return False
+        if not await _post_speech_with_uploaded_voice(
+            session,
+            spec,
+            scenario,
+            result,
+            voice_name=voice_name,
+            prompt=f"Cache pressure synthesis request {voice_index}.",
+        ):
+            return False
+    return True
+
+
+async def _revisit_cache_pressure_voices(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    voice_names: list[str],
+) -> list[str] | None:
+    revisit_voice_names = _cache_revisit_voice_names(voice_names)
+    for voice_name in revisit_voice_names:
+        if not await _post_speech_with_uploaded_voice(
+            session,
+            spec,
+            scenario,
+            result,
+            voice_name=voice_name,
+            prompt=f"Cache revisit synthesis request for {voice_name}.",
+        ):
+            return None
+    return revisit_voice_names
+
+
+async def _cleanup_cache_pressure_voices(
+    session: aiohttp.ClientSession,
+    spec: BenchmarkSpec,
+    scenario: Scenario,
+    result: ScenarioResult,
+    created_voice_names: list[str],
+) -> tuple[dict[str, int], int] | None:
+    cleanup_count = len(created_voice_names)
+    cleanup_error = await _cleanup_voice_names(session, spec, created_voice_names)
+    if cleanup_error is not None:
+        _mark_protocol_error(
+            result,
+            status="invalid_voice_response",
+            error=cleanup_error,
+        )
+        return None
+    created_voice_names.clear()
+    after_cleanup_stats = await _voice_cache_stats_snapshot(
+        session,
+        spec,
+        scenario,
+        result,
+        operation="after cache pressure cleanup",
+    )
+    if after_cleanup_stats is None:
+        return None
+    return after_cleanup_stats, cleanup_count
 
 
 def _speaker_cap_sequence_config(
@@ -695,7 +953,7 @@ async def _speaker_cap_uploaded_voices_after_stale_cleanup(
     if uploaded_voices is None:
         return None
 
-    stale_voice_names = _uploaded_voice_names_with_prefix(
+    stale_voice_names = voice_contracts.uploaded_voice_names_with_prefix(
         uploaded_voices,
         voice_name_prefix,
     )
@@ -808,7 +1066,11 @@ async def _expect_speaker_cap_rejection(
     form_fields = _speaker_cap_form_fields(scenario, voice_name)
     body = request_body(scenario, form_fields=form_fields)
     result.request_bytes += _voice_request_size(scenario, form_fields=form_fields)
-    status, response_body, headers = await _raw_post(session, upload_url, body)
+    try:
+        status, response_body, headers = await _raw_post(session, upload_url, body)
+    except ResponseBodyTooLarge as exc:
+        _mark_voice_response_too_large(result, exc)
+        return False
     result.http_status = status
     result.http_status_class = classify_http_status(status)
     result.response_headers = headers
@@ -946,8 +1208,9 @@ async def _post_voice_upload_audio(
         result.http_status = response.status
         result.http_status_class = classify_http_status(response.status)
         result.response_headers = dict(response.headers)
-        response_body = await response.read()
-        result.response_bytes += len(response_body)
+        response_body = await _read_voice_response_body(response, result)
+        if response_body is None:
+            return None
         if response.status in UNSUPPORTED_HTTP_STATUSES:
             _mark_unsupported_contract(
                 result,
@@ -993,8 +1256,9 @@ async def _post_speech_with_uploaded_voice(
         result.http_status = response.status
         result.http_status_class = classify_http_status(response.status)
         result.response_headers = dict(response.headers)
-        body = await response.read()
-        result.response_bytes += len(body)
+        body = await _read_voice_response_body(response, result)
+        if body is None:
+            return False
         body_text = body.decode("utf-8", errors="replace")
         if response.status in UNSUPPORTED_HTTP_STATUSES:
             _mark_unsupported_contract(
@@ -1047,8 +1311,9 @@ async def _expect_deleted_voice_speech_404(
         result.http_status = response.status
         result.http_status_class = classify_http_status(response.status)
         result.response_headers = dict(response.headers)
-        body = await response.read()
-        result.response_bytes += len(body)
+        body = await _read_voice_response_body(response, result)
+        if body is None:
+            return False
         status = response.status
     body_text = body.decode("utf-8", errors="replace")
     if status != 404:
@@ -1080,7 +1345,8 @@ async def _raw_post(
     body: aiohttp.FormData,
 ) -> RawVoiceResponse:
     async with session.post(url, data=body) as response:
-        return response.status, await response.read(), dict(response.headers)
+        body = await read_response_body(response)
+        return response.status, body, dict(response.headers)
 
 
 async def _raw_delete(
@@ -1088,7 +1354,8 @@ async def _raw_delete(
     url: str,
 ) -> RawVoiceResponse:
     async with session.delete(url) as response:
-        return response.status, await response.read(), dict(response.headers)
+        body = await read_response_body(response)
+        return response.status, body, dict(response.headers)
 
 
 async def _raw_get(
@@ -1096,7 +1363,36 @@ async def _raw_get(
     url: str,
 ) -> RawVoiceResponse:
     async with session.get(url) as response:
-        return response.status, await response.read(), dict(response.headers)
+        body = await read_response_body(response)
+        return response.status, body, dict(response.headers)
+
+
+async def _read_voice_response_body(
+    response: aiohttp.ClientResponse,
+    result: ScenarioResult,
+) -> bytes | None:
+    try:
+        body = await read_response_body(response)
+    except ResponseBodyTooLarge as exc:
+        _mark_voice_response_too_large(result, exc)
+        return None
+    result.response_bytes += len(body)
+    return body
+
+
+def _mark_voice_response_too_large(
+    result: ScenarioResult,
+    exc: ResponseBodyTooLarge,
+) -> None:
+    result.response_bytes += exc.bytes_read
+    _mark_protocol_error(
+        result,
+        status="response_too_large",
+        error=(
+            "HTTP response exceeded benchmark read cap "
+            f"(bytes_read={exc.bytes_read}, max_bytes={exc.max_bytes})"
+        ),
+    )
 
 
 def _merge_raw_voice_response(
@@ -1138,14 +1434,16 @@ def _classify_voice_race_response(
         )
         if payload is None:
             return False
-        if not _voice_upload_response_identifier(payload):
+        if not voice_contracts.voice_upload_response_identifier(payload):
             _mark_protocol_error(
                 result,
                 status="invalid_voice_response",
                 error=f"{operation} response must include an identifier",
             )
             return False
-    if requires_delete_success and not _is_valid_voice_delete_success(body):
+    if requires_delete_success and not voice_contracts.is_valid_voice_delete_success(
+        body
+    ):
         _mark_protocol_error(
             result,
             status="invalid_voice_response",
@@ -1161,7 +1459,7 @@ def _require_voice_upload_identifier(
     *,
     error: str,
 ) -> bool:
-    if _voice_upload_response_identifier(payload):
+    if voice_contracts.voice_upload_response_identifier(payload):
         return True
     _mark_protocol_error(
         result,
@@ -1206,7 +1504,7 @@ def _validate_uploaded_voice_metadata_sequence(
     expected_entries: Mapping[str, Mapping[str, str]],
     result: ScenarioResult,
 ) -> bool:
-    if not _is_valid_voice_list_response(payload):
+    if not voice_contracts.is_valid_voice_list_response(payload):
         _mark_protocol_error(
             result,
             status="invalid_voice_response",
@@ -1217,7 +1515,7 @@ def _validate_uploaded_voice_metadata_sequence(
         )
         return False
     for voice_name, expected_fields in expected_entries.items():
-        entries = _uploaded_voice_entries(payload, voice_name)
+        entries = voice_contracts.uploaded_voice_entries(payload, voice_name)
         if len(entries) != 1:
             _mark_protocol_error(
                 result,
@@ -1297,8 +1595,9 @@ async def _get_voice_list(
         result.http_status = list_response.status
         result.http_status_class = classify_http_status(list_response.status)
         result.response_headers = dict(list_response.headers)
-        list_body = await list_response.read()
-        result.response_bytes += len(list_body)
+        list_body = await _read_voice_response_body(list_response, result)
+        if list_body is None:
+            return None
         if list_response.status in UNSUPPORTED_HTTP_STATUSES:
             _mark_unsupported_contract(
                 result,
@@ -1331,7 +1630,7 @@ async def _get_uploaded_voices(
     voice_list = await _get_voice_list(session, spec, scenario, result)
     if voice_list is None:
         return None
-    if not _is_valid_voice_list_response(voice_list):
+    if not voice_contracts.is_valid_voice_list_response(voice_list):
         _mark_protocol_error(
             result,
             status="invalid_voice_response",
@@ -1357,7 +1656,7 @@ async def _require_uploaded_voice_present(
     voice_list = await _get_voice_list(session, spec, scenario, result)
     if voice_list is None:
         return None
-    if not _is_valid_voice_list_response(voice_list):
+    if not voice_contracts.is_valid_voice_list_response(voice_list):
         _mark_protocol_error(
             result,
             status="invalid_voice_response",
@@ -1367,7 +1666,7 @@ async def _require_uploaded_voice_present(
             ),
         )
         return None
-    entries = _uploaded_voice_entries(voice_list, voice_name)
+    entries = voice_contracts.uploaded_voice_entries(voice_list, voice_name)
     if len(entries) != 1:
         _mark_protocol_error(
             result,
@@ -1386,7 +1685,7 @@ def _require_voice_absent_in_list(
     result: ScenarioResult,
     voice_name: str,
 ) -> bool:
-    if not _is_valid_voice_list_response(voice_list):
+    if not voice_contracts.is_valid_voice_list_response(voice_list):
         _mark_protocol_error(
             result,
             status="invalid_voice_response",
@@ -1396,7 +1695,7 @@ def _require_voice_absent_in_list(
             ),
         )
         return False
-    entries = _uploaded_voice_entries(voice_list, voice_name)
+    entries = voice_contracts.uploaded_voice_entries(voice_list, voice_name)
     if entries:
         _mark_protocol_error(
             result,
@@ -1422,8 +1721,9 @@ async def _delete_voice_by_name(
         result.http_status = delete_response.status
         result.http_status_class = classify_http_status(delete_response.status)
         result.response_headers = dict(delete_response.headers)
-        delete_body = await delete_response.read()
-        result.response_bytes += len(delete_body)
+        delete_body = await _read_voice_response_body(delete_response, result)
+        if delete_body is None:
+            return False
         if delete_response.status in UNSUPPORTED_HTTP_STATUSES:
             _mark_unsupported_contract(
                 result,
@@ -1439,7 +1739,7 @@ async def _delete_voice_by_name(
                 scenario,
             )
             return False
-        if not _is_valid_voice_delete_success(delete_body):
+        if not voice_contracts.is_valid_voice_delete_success(delete_body):
             _mark_protocol_error(
                 result,
                 status="invalid_voice_response",
@@ -1464,7 +1764,7 @@ async def _cleanup_voice_names(
         delete_url = api_url(spec.base_url, f"/v1/audio/voices/{voice_name}")
         try:
             status, body, _ = await _raw_delete(session, delete_url)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, ResponseBodyTooLarge) as exc:
             failures.append(f"voice cleanup failed for {voice_name!r}: {exc}")
             continue
         body_text = body.decode("utf-8", errors="replace")
@@ -1473,7 +1773,10 @@ async def _cleanup_voice_names(
             if absent_error is not None:
                 failures.append(absent_error)
             continue
-        if not 200 <= status < 300 or not _is_valid_voice_delete_success(body):
+        if (
+            not 200 <= status < 300
+            or not voice_contracts.is_valid_voice_delete_success(body)
+        ):
             failures.append(
                 f"voice cleanup failed for {voice_name!r}: "
                 f"status={status}, body={body_text}"
@@ -1502,7 +1805,7 @@ async def _cleanup_voice_absence_error(
     list_url = api_url(spec.base_url, "/v1/audio/voices")
     try:
         status, body, _ = await _raw_get(session, list_url)
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+    except (aiohttp.ClientError, asyncio.TimeoutError, ResponseBodyTooLarge) as exc:
         return f"voice cleanup list verification failed for {voice_name!r}: {exc}"
     body_text = body.decode("utf-8", errors="replace")
     if status in UNSUPPORTED_HTTP_STATUSES:
@@ -1527,12 +1830,12 @@ async def _cleanup_voice_absence_error(
             f"voice cleanup list verification failed for {voice_name!r}: "
             "voice list response must be a JSON object"
         )
-    if not _is_valid_voice_list_response(payload):
+    if not voice_contracts.is_valid_voice_list_response(payload):
         return (
             f"voice cleanup list verification failed for {voice_name!r}: "
             "voice list response must include valid voices and uploaded_voices metadata"
         )
-    if _uploaded_voice_entries(payload, voice_name):
+    if voice_contracts.uploaded_voice_entries(payload, voice_name):
         return (
             f"voice cleanup failed for {voice_name!r}: delete returned success "
             "but uploaded_voices still contains the voice"
@@ -1553,7 +1856,7 @@ def handle_voice_success(
     if payload is None:
         return
     if scenario.capability_key == "voices.list":
-        if _is_valid_voice_list_response(payload):
+        if voice_contracts.is_valid_voice_list_response(payload):
             _mark_success(result, capability="pass")
             return
         _mark_protocol_error(
@@ -1567,7 +1870,7 @@ def handle_voice_success(
         )
         return
     if scenario.capability_key in {"voices.upload", "voices.lifecycle"}:
-        if _voice_upload_response_identifier(payload):
+        if voice_contracts.voice_upload_response_identifier(payload):
             _mark_success(result, capability="pass")
             return
         _mark_protocol_error(
@@ -1577,121 +1880,3 @@ def handle_voice_success(
         )
         return
     _mark_success(result, capability="pass")
-
-
-def _is_valid_voice_list_response(payload: Any) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    voices = payload.get("voices")
-    uploaded_voices = payload.get("uploaded_voices")
-    if not isinstance(voices, list) or not isinstance(uploaded_voices, list):
-        return False
-    return all(_is_valid_preset_voice(item) for item in voices) and all(
-        _is_valid_uploaded_voice_metadata(item) for item in uploaded_voices
-    )
-
-
-def _is_valid_preset_voice(item: Any) -> bool:
-    if isinstance(item, str):
-        return bool(item)
-    return isinstance(item, dict) and any(
-        isinstance(item.get(key), str) and item[key] for key in ("name", "voice", "id")
-    )
-
-
-def _is_valid_uploaded_voice_metadata(item: Any) -> bool:
-    if not isinstance(item, dict):
-        return False
-    required = ("name", "consent", "created_at", "file_size", "mime_type")
-    return (
-        all(key in item for key in required)
-        and isinstance(item["name"], str)
-        and bool(item["name"])
-        and isinstance(item["consent"], (bool, str))
-        and bool(str(item["consent"]))
-        and isinstance(item["created_at"], (str, int, float))
-        and bool(str(item["created_at"]))
-        and _is_nonnegative_file_size(item["file_size"])
-        and isinstance(item["mime_type"], str)
-        and bool(item["mime_type"])
-    )
-
-
-def _voice_upload_response_identifier(payload: Any) -> str | None:
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("success") is False:
-        return None
-    for key in ("id", "voice_id", "name"):
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    voice = payload.get("voice")
-    if isinstance(voice, str) and voice:
-        return voice
-    if isinstance(voice, dict):
-        for key in ("id", "voice_id", "name"):
-            value = voice.get(key)
-            if isinstance(value, str) and value:
-                return value
-    return None
-
-
-def _is_voice_overwrite_ack(payload: dict[str, Any]) -> bool:
-    if payload.get("overwritten") is True or payload.get("replaced") is True:
-        return True
-    for key in ("warning", "message"):
-        value = payload.get(key)
-        if isinstance(value, str) and "overwrit" in value.lower():
-            return True
-    return False
-
-
-def _uploaded_voice_entries(payload: dict[str, Any], voice_name: str) -> list[dict]:
-    uploaded_voices = payload.get("uploaded_voices")
-    if not isinstance(uploaded_voices, list):
-        return []
-    return [
-        item
-        for item in uploaded_voices
-        if isinstance(item, dict) and item.get("name") == voice_name
-    ]
-
-
-def _uploaded_voice_names_with_prefix(
-    uploaded_voices: list[dict[str, Any]],
-    voice_name_prefix: str,
-) -> list[str]:
-    names: list[str] = []
-    for voice in uploaded_voices:
-        name = voice.get("name")
-        if isinstance(name, str) and name.startswith(voice_name_prefix):
-            names.append(name)
-    return names
-
-
-def _is_valid_voice_delete_success(body: bytes) -> bool:
-    try:
-        payload = json.loads(body.decode("utf-8", errors="replace")) if body else {}
-    except json.JSONDecodeError:
-        return False
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("success") is False:
-        return False
-    if payload.get("deleted") is True:
-        return True
-    return payload.get("success") is True or any(
-        isinstance(payload.get(key), str) and payload[key]
-        for key in ("id", "voice_id", "name")
-    )
-
-
-def _is_nonnegative_file_size(value: Any) -> bool:
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, (int, float)):
-        return value >= 0
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value) >= 0
-    return False

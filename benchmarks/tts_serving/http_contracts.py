@@ -6,11 +6,38 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import aiohttp
+
 from benchmarks.tts_serving.error_contract import is_openai_error_response
 from benchmarks.tts_serving.metrics import ScenarioResult
 from benchmarks.tts_serving.scenarios import Scenario
 
 UNSUPPORTED_HTTP_STATUSES = {404, 405, 501}
+MAX_HTTP_RESPONSE_BYTES = 64 * 1024 * 1024
+HTTP_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
+
+
+class ResponseBodyTooLarge(RuntimeError):
+    def __init__(self, *, bytes_read: int, max_bytes: int) -> None:
+        super().__init__(
+            f"HTTP response exceeded benchmark read cap "
+            f"(bytes_read={bytes_read}, max_bytes={max_bytes})"
+        )
+        self.bytes_read = bytes_read
+        self.max_bytes = max_bytes
+
+
+async def read_response_body(response: aiohttp.ClientResponse) -> bytes:
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(HTTP_RESPONSE_READ_CHUNK_BYTES):
+        next_size = len(body) + len(chunk)
+        if next_size > MAX_HTTP_RESPONSE_BYTES:
+            raise ResponseBodyTooLarge(
+                bytes_read=next_size,
+                max_bytes=MAX_HTTP_RESPONSE_BYTES,
+            )
+        body.extend(chunk)
+    return bytes(body)
 
 
 def _mark_unexpected_success(result: ScenarioResult, scenario: Scenario) -> None:

@@ -1489,8 +1489,8 @@ def _voice_cache_pressure_sequence(
             "upload_size_bytes": VOICE_SMALL_UPLOAD_BYTES,
             "voice_name_prefix": name_prefix,
             "voice_count": voice_count,
-            "cache_contract": "traffic_only",
-            "cache_observability": "instrumentation_missing",
+            "cache_contract": "traffic_and_observability",
+            "cache_observability": "required",
         },
     )
 
