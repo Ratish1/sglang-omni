@@ -811,3 +811,68 @@ Next validation gate for #762-style work:
    native lifecycle mismatch.
 3. Use c8/full SeedTTS for throughput and WER distributions, comparing against
    `B/B` variance rather than demanding cross-run code-hash identity.
+
+### 2026-06-13 Fixed-Batch Native Result
+
+Status: #762-style native forward-sample path passed the fixed-batch lifecycle
+correctness gate.
+
+Observed fixed-batch coverage:
+
+- Exact buckets: bs `1,2,4,8`.
+- Padded-to-8 stress: raw bs `1,2,4`.
+- Inputs fixed between legacy and native:
+  - hidden states;
+  - request order;
+  - non-contiguous pool rows;
+  - seeds;
+  - base positions;
+  - padding rows.
+- Compared outputs/state:
+  - stop choice;
+  - RVQ codes;
+  - full generated rows;
+  - feedback embeddings;
+  - GPU radix ids;
+  - active pool writes;
+  - inactive pool writes;
+  - padding-row writes.
+
+All mismatch counts were zero. Feedback `max_abs`, `mean_abs`, and `max_rel`
+were zero. Inactive pool writes were zero.
+
+Interpretation:
+
+- This is the missing proof that the native/pool-resident lifecycle can preserve
+  semantics when the scheduler/batch shape is controlled.
+- The earlier normal-c8 native-vs-baseline hash mismatch should now be treated
+  as a serving-schedule/batch-composition measurement problem, not as evidence
+  of native path math or pool-state corruption.
+- This still does not make normal c8 quality automatically acceptable. The
+  reused c8 `n200` outputs showed clear speed improvement, but WER was outside
+  the observed `B/B` WER band.
+
+Normal c8 `n200` reused-output quality/speed summary:
+
+- Baseline qps range: `3.266-3.291`.
+- Native qps range: `3.841-3.931`.
+- Native qps versus baseline mean: about `+18.5%`.
+- Native RTF versus baseline mean: about `-15.1%`.
+- Native latency versus baseline mean: about `-16.0%`.
+- Baseline corpus WER range: `1.52%-1.80%`.
+- Native corpus WER range: `1.90%-2.28%`.
+- Baseline below-50 WER range: `1.38%-1.52%`.
+- Native below-50 WER range: `1.57%-1.81%`.
+
+Decision:
+
+- Do not resurrect MOSS frame-decode `torch.compile`; it failed direct parity.
+- Treat native/pool-resident forward sampling as the valid next performance
+  candidate, but do not duplicate PR `#762` blindly. If upstream #762 remains
+  the same implementation surface, the best path is to use this branch as the
+  evidence/debug branch and either:
+  - comment the fixed-batch correctness and c8 quality evidence on #762; or
+  - build a follow-up branch on top of #762 after it lands.
+- Before recommending merge for production, run full SeedTTS quality with
+  repeated baseline/native comparisons, or isolate why reused c8 `n200` WER is
+  consistently higher despite fixed-batch parity.
