@@ -936,6 +936,8 @@ Ranked next routes:
    - If it stabilizes B/B, run native-vs-baseline under the same mode to isolate
      true lifecycle differences. Treat speed separately because deterministic
      mode may reduce throughput.
+   - This is a diagnostic control only. It is not the production optimization
+     and should not be used to avoid proving parity for the actual candidate.
 
 3. **Fused post-logit sampling custom op.**
    - Keep `F.linear(...).float()` and local-transformer math raw/exact.
@@ -976,9 +978,10 @@ Not recommended as the next route:
 
 Immediate next experiment:
 
-1. Run `B/B c8 n200` with `--enable-deterministic-inference` and code trace.
-2. If B/B stabilizes, run baseline/native with the same flag and compare hashes,
-   speed, and WER.
-3. In parallel, add a direct parity microbench harness around
-   `sample_seeded_branchless()` so a future Triton/custom sampler can be tested
-   independently of the full MOSS model.
+1. Use `scripts/debug/moss_local_sampler_microbench.py` to prove the current
+   sampler contract independently of the full serving loop.
+2. Add a future `module:function` candidate to that harness before wiring any
+   custom sampler into `_decode_frame_graphable()`.
+3. Run `B/B c8 n200` with `--enable-deterministic-inference` only as a control
+   to characterize batch-composition sensitivity, not as a replacement for the
+   custom-op parity gate.
