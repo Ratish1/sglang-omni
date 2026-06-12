@@ -876,3 +876,109 @@ Decision:
 - Before recommending merge for production, run full SeedTTS quality with
   repeated baseline/native comparisons, or isolate why reused c8 `n200` WER is
   consistently higher despite fixed-batch parity.
+
+### 2026-06-13 Custom Kernel / SGLang-Style Follow-Up
+
+Status: do not stop at the failed `torch.compile` boundary. The failed result
+only rejects Inductor-lowered frame math as tested; it does not reject custom
+kernels or SGLang-style opaque ops that preserve the MOSS Local contract.
+
+Relevant SGLang architecture findings:
+
+- SGLang does not rely on `torch.compile` blindly. External kernels are exposed
+  as `torch.ops.sgl_kernel.*` through `sgl-kernel/csrc/common_extension.cc` with
+  explicit schemas and CUDA implementations. The `sgl-kernel` README calls out
+  that schemas are needed for `torch.compile`.
+- Python-side custom ops use `sglang.srt.utils.custom_op.register_custom_op()`
+  or `direct_register_custom_op()` with fake implementations for Dynamo/fake
+  tensor propagation. This is how SGLang makes external kernels opaque and
+  compile-compatible instead of tracing through unsupported internals.
+- SGLang uses `torch.compile` selectively for stable tensor transforms and
+  per-layer functions. It avoids compiling boundaries whose lowered math changes
+  the semantic output.
+- SGLang has `--enable-deterministic-inference`, which enables
+  `batch_invariant_ops`. That swaps selected ATen ops (`mm`, `addmm`,
+  `_log_softmax`, `mean`, `rms_norm`, `bmm`) to batch-invariant Triton/DeepGEMM
+  variants. This is directly relevant to the observed c8 baseline-vs-baseline
+  instability, but it is a reproducibility/debug axis first, not automatically a
+  production speed win.
+- `sglang-omni` does not currently own a CUDA extension tree. Durable native
+  kernels should likely live in `sgl-kernel`; a faster experiment can use
+  Python/Triton in Omni if the objective is proof of parity and speed before
+  upstreaming.
+
+MOSS Local contract to preserve:
+
+- `MossTTSLocalSGLangModel.forward()` produces Qwen backbone hidden states.
+- `_decode_frame_graphable()` consumes one hidden row per request and runs:
+  local transformer step 0, binary stop sampling, then 12 audio-codebook
+  sampling steps with feedback embeddings and local transformer recurrence.
+- Sampling uses request seed plus logical position. The seed gives deterministic
+  sampling only for fixed logits.
+- Direct parity is the gate. Any custom op must match generated stop/codes/rows,
+  feedback embeddings, radix ids, and pool writes for fixed hidden states and
+  fixed batch order before c8/full quality matters.
+
+Ranked next routes:
+
+1. **Native pool-resident path (#762-style), then quality debug.**
+   - It preserves raw math and already passed fixed-batch parity.
+   - It is the lowest-risk speed path because it targets state movement and graph
+     boundaries rather than logits.
+   - Remaining question: why reused c8 `n200` WER was above the baseline repeat
+     band despite fixed-batch parity. Run full SeedTTS repeated baseline/native
+     before accepting or rejecting it.
+
+2. **Deterministic/batch-invariant control run.**
+   - Run baseline-vs-baseline c8 with `--enable-deterministic-inference`.
+   - Goal: determine whether SGLang's batch-invariant mode stabilizes the MOSS
+     Local hidden/logit hashes across different batch compositions.
+   - If it stabilizes B/B, run native-vs-baseline under the same mode to isolate
+     true lifecycle differences. Treat speed separately because deterministic
+     mode may reduce throughput.
+
+3. **Fused post-logit sampling custom op.**
+   - Keep `F.linear(...).float()` and local-transformer math raw/exact.
+   - Replace the launch-heavy `sample_seeded_branchless()` sequence with a
+     custom op that consumes fp32 logits, temperature, top-p/top-k, seed, and
+     position, and returns the sampled id.
+   - Candidate implementation:
+     - prototype in Python/Triton under Omni for audio vocab `1024` and text
+       vocab `2`;
+     - if parity/speed pass, move to `sgl-kernel` with C++ schema, CUDA impl,
+       Python wrapper, fake impl, tests, and benchmark.
+   - Risk: matching PyTorch sort/softmax/cumsum/Gumbel tie behavior exactly is
+     non-trivial. Acceptance is code parity, not numeric closeness.
+
+4. **Fused row/radix/feedback/pool-write kernel.**
+   - After stop/codes are known, fuse row construction, GPU radix hash, feedback
+     embedding accumulation, and pool feedback write.
+   - This avoids changing local-transformer/logit math and should have lower
+     parity risk than custom sampling.
+   - #762 already moves much of this direction into pool-resident state; this
+     route is most useful as a follow-up if profiles still show row/hash/feedback
+     time after #762-style integration.
+
+5. **Custom exact logit projection kernel only if needed.**
+   - The attempted Inductor-compiled `F.linear(...).float()` target failed
+     parity. A custom kernel would need to match the baseline cuBLAS/ATen
+     accumulation behavior closely enough that RVQ argmax/sample choices do not
+     change.
+   - This is high risk because the failed logits-target compile already proved
+     this boundary is numerically sensitive.
+
+Not recommended as the next route:
+
+- Re-enabling full frame-decode `torch.compile`.
+- Re-enabling logits-only `torch.compile`.
+- Treating c8 hash mismatch as proof of model-path corruption without first
+  fixing or recording batch composition.
+
+Immediate next experiment:
+
+1. Run `B/B c8 n200` with `--enable-deterministic-inference` and code trace.
+2. If B/B stabilizes, run baseline/native with the same flag and compare hashes,
+   speed, and WER.
+3. In parallel, add a direct parity microbench harness around
+   `sample_seeded_branchless()` so a future Triton/custom sampler can be tested
+   independently of the full MOSS model.
