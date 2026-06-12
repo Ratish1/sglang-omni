@@ -627,3 +627,61 @@ Next remote run:
    lowerings perturb discrete code selection. Then the next candidate is not
    `torch.compile`; it is native CUDA graph/pool work or a custom parity-tested
    kernel boundary.
+
+### 2026-06-12 Logits Target Result
+
+Status: failed direct parity.
+
+The `logits` compile target still changed generated codes for
+`max-autotune-no-cudagraphs` before CUDA graph capture and under manual CUDA
+graph replay. Text-logit argmax stayed stable, but text logits drifted by about
+`1e-2`; later audio channels had logit argmax/code mismatches, and feedback
+embedding drift reached visible magnitudes after code divergence.
+
+Interpretation:
+
+- The failed `full` target showed the outer recurrent/sampled loop is too wide.
+- The failed `logits` target shows the remaining hot compiled surface
+  (`F.linear(...).float()` over bf16 activations/weights) is also not
+  parity-safe for discrete RVQ generation.
+- This is not a scheduler, batching, CUDA graph, or vocoder issue. The first
+  failure is direct raw-vs-compiled logits/code parity.
+- A compile mode that preserves exact ATen/cuBLAS behavior would likely erase
+  the performance benefit. That can be tested for completeness, but it is not a
+  promising production throughput path.
+
+Decision:
+
+Do not continue shrinking `torch.compile` around MOSS Local frame-decode math as
+the primary route. The next useful performance work should keep raw math kernels
+and optimize graph boundaries/state movement.
+
+### Next Candidate: Pool-Resident Native Frame Path
+
+The closest existing upstream direction is PR `#762`
+(`[Perf] MOSS-TTS Local v1.5: native pool-resident CUDA graph for the
+frame-decode sampling path`), built on top of the pool-state direction in
+PR `#759`.
+
+Why this is the next candidate:
+
+- It keeps `_decode_frame_graphable()` raw, so it should preserve the eager/CUDA
+  graph math path that already passed code-quality gates.
+- It moves decode inputs/outputs into `MossTTSLocalDecodeStatePool` and samples
+  inside the model forward path, reducing separate frame graph staging,
+  output-clone, feedback-write, and post-backbone boundary work.
+- This targets the measured remaining bottleneck (`collect_frame` and graph
+  boundary/state orchestration) instead of changing matmul/SDPA kernels.
+
+Validation order for this candidate:
+
+1. Direct parity: raw current main/branch versus PR-762-style forward-sample path
+   for bs `1,2,4,8`, comparing generated rows, feedback, and radix ids.
+2. `c1 n=50` code-trace parity. Code hashes must match before any speed claim.
+3. `c8 n=200` speed/profile with request events and fine scopes.
+4. Full SeedTTS EN only if c1/c8 code hashes pass or any differences are
+   explicitly understood.
+
+If #762 fails code-hash parity, stop and debug lifecycle/state movement. If #762
+passes parity but does not improve E2E, use the profiles to decide between
+feedback write, row/radix path, or vocoder/codec bottlenecks next.
