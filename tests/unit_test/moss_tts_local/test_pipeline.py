@@ -172,6 +172,9 @@ def test_frame_decode_compile_helper_is_opt_in(monkeypatch):
 
     model = MossTTSLocalSGLangModel.__new__(MossTTSLocalSGLangModel)
     model._compiled_frame_decode_graphable = None
+    model._compiled_frame_text_logits = None
+    model._compiled_frame_audio_logits = None
+    model._frame_compile_configured = False
     model._decode_frame_graphable = raw_decode
 
     assert (
@@ -194,6 +197,71 @@ def test_frame_decode_compile_helper_is_opt_in(monkeypatch):
         == "compiled-frame-decode"
     )
     assert len(compile_calls) == 1
+
+
+def test_frame_decode_logits_compile_target_keeps_outer_callable(monkeypatch):
+    pytest.importorskip("sglang")
+    cuda_graph_runner = pytest.importorskip(
+        "sglang.srt.model_executor.cuda_graph_runner"
+    )
+    from sglang_omni.models.moss_tts_local.sglang_model import MossTTSLocalSGLangModel
+
+    set_config_calls = []
+    compile_calls = []
+
+    monkeypatch.setattr(
+        cuda_graph_runner,
+        "set_torch_compile_config",
+        lambda: set_config_calls.append(True),
+    )
+
+    def raw_decode(**kwargs):
+        return kwargs
+
+    def text_logits(hidden_states):
+        return hidden_states
+
+    def audio_logits(hidden_states, weight):
+        return hidden_states @ weight.T
+
+    def fake_compile(target, *, mode):
+        compile_calls.append((target, mode))
+        return f"compiled-{target.__name__}"
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    model = MossTTSLocalSGLangModel.__new__(MossTTSLocalSGLangModel)
+    model._compiled_frame_decode_graphable = None
+    model._compiled_frame_text_logits = None
+    model._compiled_frame_audio_logits = None
+    model._frame_compile_configured = False
+    model._decode_frame_graphable = raw_decode
+    model._frame_text_logits_eager = text_logits
+    model._frame_audio_logits_eager = audio_logits
+
+    selected = model._frame_decode_graphable_for_capture(
+        enable_torch_compile=True,
+        torch_compile_mode="default",
+        torch_compile_target="logits",
+    )
+    assert selected is raw_decode
+    assert model._compiled_frame_decode_graphable is None
+    assert model._compiled_frame_text_logits == "compiled-text_logits"
+    assert model._compiled_frame_audio_logits == "compiled-audio_logits"
+    assert compile_calls == [(text_logits, "default"), (audio_logits, "default")]
+    assert set_config_calls == [True]
+
+
+def test_frame_decode_compile_target_rejects_unknown_value():
+    pytest.importorskip("sglang")
+    from sglang_omni.models.moss_tts_local.sglang_model import MossTTSLocalSGLangModel
+
+    model = MossTTSLocalSGLangModel.__new__(MossTTSLocalSGLangModel)
+    with pytest.raises(ValueError, match="frame torch compile target"):
+        model._frame_decode_graphable_for_capture(
+            enable_torch_compile=True,
+            torch_compile_target="everything",
+        )
 
 
 def test_rotate_half_interleaved_matches_upstream():

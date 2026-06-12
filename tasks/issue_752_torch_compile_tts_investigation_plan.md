@@ -489,3 +489,141 @@ Regression tests for later code changes:
 ## Immediate Next Step
 
 Start with Phase 1 and Phase 2 on the H100 container using this branch. Compare B, D1, D2, and D3 before making a recommendation. Do not implement a separate MOSS Local backbone compile path: use SGLang's existing compile+CUDA-graph runner for the backbone and the new MOSS-local opt-in path only for frame decode.
+
+## 2026-06-12 Correctness Update: D2 Is Not Yet A Safe PR
+
+The full SeedTTS EN run showed a real speed win for the frame-local compile
+candidate (`D2`), but subsequent code-hash tracing changed the decision gate.
+On the same debug commit, `B` versus `D2` produced different generated audio
+code hashes for all `c1` stochastic `n=200` samples while preserving shape and
+token counts. A greedy-ish `n=200` run also changed almost every code hash. That
+means the compile candidate is changing the frame decoder's model output
+directly; this is not just ASR variance, c8 batch packing, vocoder behavior, or
+queue timing.
+
+Current mechanical interpretation:
+
+- The pipeline boundary is `preprocessing -> tts_engine -> vocoder`; the code
+  hash is captured before vocoder, so the quality drift is inside the AR/local
+  decode path.
+- The SGLang Qwen3 backbone is not the D2 change. D2 compiles the MOSS-specific
+  frame-local callable before manual CUDA graph capture.
+- CUDA graph replay is active in both B and D2. CUDA graph only replays the
+  captured work; it does not prove that the captured compiled work is equivalent
+  to the uncompiled work.
+- The compiled function is not a pure feed-forward block. It includes seeded
+  sampling, feedback accumulation, and repeated calls to
+  `local_transformer.step()`.
+- `local_transformer.step()` mutates a persistent module-owned KV cache with
+  indexed writes, then immediately reads slices from that cache through SDPA.
+  That stateful mutation/read contract is the highest-risk compile boundary.
+- `sample_seeded_branchless()` calls SGLang's already-compiled
+  `multinomial_with_seed()`. This nested compiled sampler is a secondary suspect,
+  but the greedy-ish drift means sampler randomness is not the only possible
+  cause.
+
+Do not open the clean `D2` performance PR as a safe optimization until direct
+frame-level parity proves semantic equivalence or we narrow the compile boundary
+to an equivalent subgraph.
+
+### Next Strict Debug Pass
+
+Goal: isolate the first operation whose raw/eager and compiled outputs diverge,
+without running another full end-to-end benchmark first.
+
+Required remote tests:
+
+1. Direct callable parity for `_decode_frame_graphable`.
+   - Load the real MOSS Local model on H100.
+   - Build identical static inputs for `bs in [1, 2, 4, 8]`.
+   - Compare raw callable versus `torch.compile` callable before CUDA graph
+     capture.
+   - Sweep compile modes: `default`, `reduce-overhead`,
+     `max-autotune-no-cudagraphs`.
+   - Report stop-token mismatches, per-channel code mismatches, feedback
+     `max_abs`, `mean_abs`, and first divergent channel/position.
+
+2. Direct CUDA graph parity.
+   - Capture raw `_decode_frame_graphable` and compiled `_decode_frame_graphable`
+     into separate manual CUDA graphs with the same static buffers.
+   - Replay both on identical inputs.
+   - This separates `torch.compile` drift from manual CUDA graph capture/replay
+     drift.
+
+3. Component isolation.
+   - Compare raw versus compiled `sample_seeded_branchless()` on saved logits,
+     seeds, and positions.
+   - Compare raw versus compiled `local_transformer.step()` at each local
+     position, with cache reset between trials.
+   - If `local_transformer.step()` diverges, rerun with an explicitly stateless
+     step variant or fresh external KV buffers to test whether module-owned cache
+     mutation is the trigger.
+
+4. Generation trace rerun only after the direct parity failure is understood.
+   - Run `c1 n=50` with code trace for the best semantically equivalent candidate.
+   - If no candidate is code-hash stable under c1, stop the PR and report
+     "frame-local torch.compile changes generated codes" as the issue finding.
+
+Acceptance for a compile PR:
+
+- direct frame parity passes for raw versus compiled at all tested batch sizes;
+- raw-CUDA-graph versus compiled-CUDA-graph parity also passes;
+- c1 code hashes are stable or any difference is explained by an intentional,
+  documented sampling change;
+- full SeedTTS quality does not regress beyond the project's accepted variance;
+- speed win remains material at concurrency 8 after the safe boundary is used.
+
+If parity fails in the current full `_decode_frame_graphable` boundary, the next
+engineering direction is not "tune compile harder." It is to create a smaller
+compile surface: pure linear/MLP/normalization subgraphs or a stateless
+functional local-transformer step whose KV buffers are explicit inputs/outputs.
+
+### 2026-06-12 Smaller Boundary Implementation
+
+Status: implemented on the debug branch as a new experimental compile target.
+
+New factory arg:
+
+```yaml
+factory_args:
+  frame_decode_torch_compile: true
+  frame_decode_torch_compile_mode: max-autotune-no-cudagraphs
+  frame_decode_torch_compile_target: logits
+```
+
+Targets:
+
+- `full`: previous D2 behavior. Compiles the entire `_decode_frame_graphable`
+  callable. This is known to fail direct parity and must not be treated as a
+  safe PR candidate.
+- `logits`: keeps the outer frame loop, local transformer steps, sampling, and
+  feedback accumulation in the raw callable, but compiles only the text/audio
+  `F.linear(...).float()` logit projection helpers before manual CUDA graph
+  capture.
+
+Why this target is the next smallest useful candidate:
+
+- The failed direct test showed sampler-only parity was clean.
+- Standalone `local_transformer.step()` parity was clean.
+- The full-loop compile changed the first local-step output when compiled in
+  context, so the outer recurrent/sampled loop is too wide.
+- Compiling only logit projections tests whether any useful matmul compile
+  surface remains while avoiding compile over the recurrent KV mutation/read
+  loop and the sampled feedback loop.
+
+Next remote run:
+
+1. Repeat direct frame parity for `frame_decode_torch_compile_target=logits`
+   with modes `default`, `reduce-overhead`, and `max-autotune-no-cudagraphs`.
+2. Add logits-level metrics:
+   - text logits `max_abs`, `mean_abs`, argmax mismatch;
+   - per-channel audio logits `max_abs`, `mean_abs`, argmax mismatch;
+   - sampled code mismatch by channel.
+3. Compare raw callable versus logits-target callable before CUDA graph capture.
+4. Capture raw and logits-target callables into separate manual CUDA graphs and
+   compare replay parity.
+5. If direct parity passes, run `c1 n=50` code trace before any c8/full benchmark.
+6. If logits-target parity fails, stop and report that even compiled projection
+   lowerings perturb discrete code selection. Then the next candidate is not
+   `torch.compile`; it is native CUDA graph/pool work or a custom parity-tested
+   kernel boundary.

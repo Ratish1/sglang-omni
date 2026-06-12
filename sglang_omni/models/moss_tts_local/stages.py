@@ -503,6 +503,7 @@ def create_sglang_tts_engine_executor(
     server_args_overrides: dict[str, Any] | None = None,
     frame_decode_torch_compile: bool = False,
     frame_decode_torch_compile_mode: str | None = None,
+    frame_decode_torch_compile_target: str = "full",
 ) -> Any:
     from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
     from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
@@ -580,6 +581,7 @@ def create_sglang_tts_engine_executor(
             list(overrides.get("cuda_graph_bs") or [1, 2, 4, 8, 16]),
             enable_torch_compile=bool(frame_decode_torch_compile),
             torch_compile_mode=frame_decode_torch_compile_mode,
+            torch_compile_target=frame_decode_torch_compile_target,
         )
 
     output_proc = SGLangOutputProcessor(
