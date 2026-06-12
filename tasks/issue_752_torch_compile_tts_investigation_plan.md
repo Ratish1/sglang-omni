@@ -985,3 +985,29 @@ Immediate next experiment:
 3. Run `B/B c8 n200` with `--enable-deterministic-inference` only as a control
    to characterize batch-composition sensitivity, not as a replacement for the
    custom-op parity gate.
+
+### 2026-06-13 Sampler-Only Compile Boundary
+
+The H100 sampler microbench at commit `dc7c5bdb` changed the conclusion for one
+specific boundary:
+
+- `torch.compile(sample_seeded_branchless, mode=max-autotune-no-cudagraphs)`
+  produced zero eager mismatches and zero manual CUDA-graph mismatches across 32
+  cases: bs `1,2,4,8`, vocab `2/1024`, and wide/near-tie/descending/spiky
+  logits.
+- The compiled sampler was materially faster in isolation: roughly `3x` eager,
+  `4.5-5x` CUDA graph for vocab 2, and about `7x` CUDA graph for vocab 1024.
+- This does not revive full-frame or logits-only compile. Those boundaries
+  already failed direct frame/code parity because they changed local-transformer
+  or projection numerics. The safe inference is narrower: sampler-only compile
+  is now a valid candidate to test inside the existing frame CUDA graph.
+
+Implementation direction:
+
+- Add `frame_decode_torch_compile_target: sampler`.
+- Keep `_decode_frame_graphable()` itself eager for local-transformer and logits.
+- Compile only the `sample_seeded_branchless()` callable before frame CUDA graph
+  warmup/capture.
+- Acceptance gates are direct frame parity first, then c1 code trace, then c8
+  speed/WER. Do not use normal c8 hash equality as the correctness gate unless
+  batch composition is fixed.

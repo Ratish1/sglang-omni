@@ -138,6 +138,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         self._compiled_frame_decode_graphable: Callable[..., Any] | None = None
         self._compiled_frame_text_logits: Callable[..., Any] | None = None
         self._compiled_frame_audio_logits: Callable[..., Any] | None = None
+        self._compiled_frame_sampler: Callable[..., Any] | None = None
         self._frame_compile_configured = False
 
     def acquire_row(self, rid: str) -> int:
@@ -372,16 +373,19 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         if not enable_torch_compile:
             return self._decode_frame_graphable
         compile_target = str(torch_compile_target or "full").strip().lower()
-        if compile_target not in {"full", "logits"}:
+        if compile_target not in {"full", "logits", "sampler"}:
             raise ValueError(
                 "MOSS-TTS Local frame torch compile target must be one of "
-                f"{('full', 'logits')}, got {torch_compile_target!r}"
+                f"{('full', 'logits', 'sampler')}, got {torch_compile_target!r}"
             )
         compile_mode = (
             torch_compile_mode
             or os.environ.get("SGLANG_TORCH_COMPILE_MODE")
             or "max-autotune-no-cudagraphs"
         )
+        if compile_target == "sampler":
+            self._ensure_frame_sampler_compile(compile_mode)
+            return self._decode_frame_graphable
         if compile_target == "logits":
             self._ensure_frame_logits_compile(compile_mode)
             return self._decode_frame_graphable
@@ -425,6 +429,19 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             )
             logger.info(
                 "Compiled MOSS-TTS Local frame logit projections (mode=%s)",
+                compile_mode,
+            )
+
+    def _ensure_frame_sampler_compile(self, compile_mode: str) -> None:
+        if self._compiled_frame_sampler is None:
+            self._ensure_frame_compile_config()
+            self._compiled_frame_sampler = torch.compile(
+                sample_seeded_branchless,
+                mode=compile_mode,
+            )
+            self._sample_seeded_branchless = self._compiled_frame_sampler
+            logger.info(
+                "Compiled MOSS-TTS Local frame sampler (mode=%s)",
                 compile_mode,
             )
 

@@ -129,6 +129,11 @@ separate:
 Use `SGLANG_TORCH_COMPILE_MODE=max-autotune-no-cudagraphs` unless deliberately
 testing another mode; Inductor-owned cudagraphs should not be mixed into this
 path while SGLang and MOSS Local already manage explicit CUDA graph capture.
+For MOSS Local, prefer testing the narrowest target first:
+`frame_decode_torch_compile_target: sampler` compiles only the seeded
+top-k/top-p sampler used 13 times per frame. Wider targets (`logits` or
+`full`) also lower projection/local-transformer math and must pass direct code
+parity before any speed claim is meaningful.
 
 Custom callsites can call `sglang_omni.profiler.event_recorder.emit(...)` to
 add domain-specific events. Events from inactive recorders are no-ops, so

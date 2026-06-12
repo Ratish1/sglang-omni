@@ -174,6 +174,7 @@ def test_frame_decode_compile_helper_is_opt_in(monkeypatch):
     model._compiled_frame_decode_graphable = None
     model._compiled_frame_text_logits = None
     model._compiled_frame_audio_logits = None
+    model._compiled_frame_sampler = None
     model._frame_compile_configured = False
     model._decode_frame_graphable = raw_decode
 
@@ -234,6 +235,7 @@ def test_frame_decode_logits_compile_target_keeps_outer_callable(monkeypatch):
     model._compiled_frame_decode_graphable = None
     model._compiled_frame_text_logits = None
     model._compiled_frame_audio_logits = None
+    model._compiled_frame_sampler = None
     model._frame_compile_configured = False
     model._decode_frame_graphable = raw_decode
     model._frame_text_logits_eager = text_logits
@@ -249,6 +251,58 @@ def test_frame_decode_logits_compile_target_keeps_outer_callable(monkeypatch):
     assert model._compiled_frame_text_logits == "compiled-text_logits"
     assert model._compiled_frame_audio_logits == "compiled-audio_logits"
     assert compile_calls == [(text_logits, "default"), (audio_logits, "default")]
+    assert set_config_calls == [True]
+
+
+def test_frame_decode_sampler_compile_target_keeps_outer_callable(monkeypatch):
+    pytest.importorskip("sglang")
+    cuda_graph_runner = pytest.importorskip(
+        "sglang.srt.model_executor.cuda_graph_runner"
+    )
+    from sglang_omni.models.moss_tts_local.local_transformer import (
+        sample_seeded_branchless,
+    )
+    from sglang_omni.models.moss_tts_local.sglang_model import MossTTSLocalSGLangModel
+
+    set_config_calls = []
+    compile_calls = []
+
+    monkeypatch.setattr(
+        cuda_graph_runner,
+        "set_torch_compile_config",
+        lambda: set_config_calls.append(True),
+    )
+
+    def raw_decode(**kwargs):
+        return kwargs
+
+    def fake_compile(target, *, mode):
+        compile_calls.append((target, mode))
+        return f"compiled-{target.__name__}"
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    model = MossTTSLocalSGLangModel.__new__(MossTTSLocalSGLangModel)
+    model._compiled_frame_decode_graphable = None
+    model._compiled_frame_text_logits = None
+    model._compiled_frame_audio_logits = None
+    model._compiled_frame_sampler = None
+    model._frame_compile_configured = False
+    model._decode_frame_graphable = raw_decode
+    model._sample_seeded_branchless = sample_seeded_branchless
+
+    selected = model._frame_decode_graphable_for_capture(
+        enable_torch_compile=True,
+        torch_compile_mode="default",
+        torch_compile_target="sampler",
+    )
+    assert selected is raw_decode
+    assert model._compiled_frame_decode_graphable is None
+    assert model._compiled_frame_text_logits is None
+    assert model._compiled_frame_audio_logits is None
+    assert model._compiled_frame_sampler == "compiled-sample_seeded_branchless"
+    assert model._sample_seeded_branchless == "compiled-sample_seeded_branchless"
+    assert compile_calls == [(sample_seeded_branchless, "default")]
     assert set_config_calls == [True]
 
 
