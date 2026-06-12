@@ -685,3 +685,70 @@ Validation order for this candidate:
 If #762 fails code-hash parity, stop and debug lifecycle/state movement. If #762
 passes parity but does not improve E2E, use the profiles to decide between
 feedback write, row/radix path, or vocoder/codec bottlenecks next.
+
+### 2026-06-13 Native Forward-Sample Result
+
+Status: not accepted, but not falsified as direct math corruption.
+
+Observed result:
+
+- Direct raw-vs-native parity passed for bs `1,2,4,8`.
+- `c1 n50` code trace passed: `50/50` code hashes matched.
+- `c8 n200` code trace failed: `69/200` matched and `131/200` differed.
+- A temporary `c8 n20` frame trace found changed samples whose first divergence
+  was already at frame 0, with the same seed, same base position, same completion
+  token count, and both sides using the legacy frame path for that first frame.
+
+Interpretation:
+
+- Because frame 0 was still on the legacy path, the first observed divergence is
+  not explained by final row clone, journal collection, native output buffers, or
+  post-decode feedback write.
+- Since direct parity and `c1` passed, the native path does not appear to change
+  fixed-shape math by itself.
+- The leading hypothesis is concurrent-serving batch-shape sensitivity: enabling
+  the faster native path changes scheduler timing/batch composition, and MOSS
+  Local frame-0 output can differ when the same request is prefilled/decoded in a
+  different batch shape or row position.
+- This may be a real production reproducibility issue, but it is not yet proof
+  that PR `#762` has an invalid state transition.
+
+Required controls before deciding:
+
+1. Run `B` vs `B` c8 `n200` twice with the same request set/seeds and code trace.
+   - If hashes differ across baseline repeats, strict cross-run c8 hash parity is
+     not a valid acceptance gate unless batch composition is also fixed.
+   - If baseline repeats are stable, then #762 likely changed a lifecycle or
+     state transition under concurrency.
+2. Run `native` vs `native` c8 `n200` twice.
+   - This separates candidate nondeterminism from B/native scheduling drift.
+3. Add first-frame trace fields for the first divergent sample:
+   - stable sample id / normalized text;
+   - request id;
+   - frame index / `generation_steps`;
+   - `is_extend`, `is_decode`, and frame path (`legacy`, `forward_sample`);
+   - batch size and request index in batch;
+   - ordered request ids/text ids in the batch;
+   - hidden-state row hash and small stats (`max_abs`, `mean`, `std`);
+   - text logits hash/argmax and first divergent audio channel logits hash/argmax;
+   - seed/base position.
+4. If B-vs-B is unstable, rerun B/native under a fixed schedule:
+   - c1 remains the correctness gate for math equivalence;
+   - use a deterministic batch replay/direct harness for bs `1,2,4,8` and
+     selected mixed prefill/decode batches;
+   - use c8 for performance and quality, but do not require cross-run code-hash
+     identity unless batch shapes match.
+5. If B-vs-B is stable but native differs, inspect the first invalid lifecycle
+   transition:
+   - `_cg_pool_rows` staging before decode;
+   - padding-row handling;
+   - request order alignment in `_collect_frame_from_forward_sample`;
+   - `generation_steps` ownership and commit timing;
+   - chunked prefill finalization and `finalize_skip_rids`.
+
+Acceptance rule update:
+
+For #762-style native work, direct fixed-shape parity and c1 code-hash parity are
+necessary. c8 code-hash parity is only decisive if the baseline is repeat-stable
+or if the compared runs have matching batch composition for the divergent
+samples.
