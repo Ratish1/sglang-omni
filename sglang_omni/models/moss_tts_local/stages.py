@@ -477,6 +477,8 @@ def create_sglang_tts_engine_executor(
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
     server_args_overrides: dict[str, Any] | None = None,
+    frame_decode_torch_compile: bool = False,
+    frame_decode_torch_compile_mode: str | None = None,
 ) -> Any:
     from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
     from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
@@ -519,6 +521,11 @@ def create_sglang_tts_engine_executor(
     )
 
     want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
+    if frame_decode_torch_compile and not want_cuda_graph:
+        raise ValueError(
+            "frame_decode_torch_compile requires MOSS Local frame CUDA graph capture; "
+            "enable CUDA graph or unset frame_decode_torch_compile"
+        )
     if want_cuda_graph:
         server_args.disable_cuda_graph = True
 
@@ -546,7 +553,9 @@ def create_sglang_tts_engine_executor(
         # micro-steps and 13 seeded sampling passes per frame): eager it is
         # kernel-launch-bound at ~22 ms/frame independent of batch size.
         model.init_frame_decode_graphs(
-            list(overrides.get("cuda_graph_bs") or [1, 2, 4, 8, 16])
+            list(overrides.get("cuda_graph_bs") or [1, 2, 4, 8, 16]),
+            enable_torch_compile=bool(frame_decode_torch_compile),
+            torch_compile_mode=frame_decode_torch_compile_mode,
         )
 
     output_proc = SGLangOutputProcessor(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import struct
 
 import numpy as np
@@ -143,6 +144,62 @@ def test_local_transformer_rejects_out_of_range_position():
     )
     with pytest.raises(ValueError):
         module.step(torch.randn(1, 32), N_VQ + 1)
+
+
+def test_frame_decode_compile_helper_is_opt_in(monkeypatch):
+    pytest.importorskip("sglang")
+    try:
+        compile_config_module = importlib.import_module(
+            "sglang.srt.compilation.torch_compile_decoration"
+        )
+    except ImportError:
+        compile_config_module = pytest.importorskip(
+            "sglang.srt.model_executor.cuda_graph_runner"
+        )
+    from sglang_omni.models.moss_tts_local.sglang_model import MossTTSLocalSGLangModel
+
+    set_config_calls = []
+    compile_calls = []
+
+    monkeypatch.setattr(
+        compile_config_module,
+        "set_torch_compile_config",
+        lambda: set_config_calls.append(True),
+    )
+
+    def raw_decode(**kwargs):
+        return kwargs
+
+    def fake_compile(target, *, mode):
+        compile_calls.append((target, mode))
+        return "compiled-frame-decode"
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    model = MossTTSLocalSGLangModel.__new__(MossTTSLocalSGLangModel)
+    model._compiled_frame_decode_graphable = None
+    model._decode_frame_graphable = raw_decode
+
+    assert (
+        model._frame_decode_graphable_for_capture(enable_torch_compile=False)
+        is raw_decode
+    )
+    assert compile_calls == []
+    assert set_config_calls == []
+
+    compiled = model._frame_decode_graphable_for_capture(
+        enable_torch_compile=True,
+        torch_compile_mode="reduce-overhead",
+    )
+    assert compiled == "compiled-frame-decode"
+    assert compile_calls == [(raw_decode, "reduce-overhead")]
+    assert set_config_calls == [True]
+
+    assert (
+        model._frame_decode_graphable_for_capture(enable_torch_compile=True)
+        == "compiled-frame-decode"
+    )
+    assert len(compile_calls) == 1
 
 
 def test_rotate_half_interleaved_matches_upstream():
