@@ -15,6 +15,7 @@ the model runner after each backbone step.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable, Iterable, Optional, Tuple
 
 import torch
@@ -134,6 +135,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         # above. Allocated here, before any frame/backbone graph capture, so
         # its addresses are fixed for the process lifetime.
         self._state_pool = MossTTSLocalDecodeStatePool(self)
+        self._compiled_frame_decode_graphable: Callable[..., Any] | None = None
 
     def acquire_row(self, rid: str) -> int:
         """Assign (or return the existing) decode-state pool row for ``rid``."""
@@ -357,6 +359,35 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
 
     _sample_seeded_branchless = staticmethod(sample_seeded_branchless)
 
+    def _frame_decode_graphable_for_capture(
+        self,
+        *,
+        enable_torch_compile: bool,
+        torch_compile_mode: str | None = None,
+    ) -> Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not enable_torch_compile:
+            return self._decode_frame_graphable
+        if self._compiled_frame_decode_graphable is None:
+            from sglang.srt.model_executor.cuda_graph_runner import (
+                set_torch_compile_config,
+            )
+
+            set_torch_compile_config()
+            compile_mode = (
+                torch_compile_mode
+                or os.environ.get("SGLANG_TORCH_COMPILE_MODE")
+                or "max-autotune-no-cudagraphs"
+            )
+            self._compiled_frame_decode_graphable = torch.compile(
+                self._decode_frame_graphable,
+                mode=compile_mode,
+            )
+            logger.info(
+                "Compiled MOSS-TTS Local frame decode graphable callable (mode=%s)",
+                compile_mode,
+            )
+        return self._compiled_frame_decode_graphable
+
     @torch.no_grad()
     def _decode_frame_graphable(
         self,
@@ -424,7 +455,13 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         return stop_choice, torch.stack(codes, dim=-1), feedback
 
     @torch.no_grad()
-    def init_frame_decode_graphs(self, batch_sizes: list[int]) -> None:
+    def init_frame_decode_graphs(
+        self,
+        batch_sizes: list[int],
+        *,
+        enable_torch_compile: bool = False,
+        torch_compile_mode: str | None = None,
+    ) -> None:
         """Capture the per-frame local decode (1 + n_vq micro-steps plus all
         13 seeded sampling passes) into one CUDA graph per batch-size bucket.
 
@@ -444,6 +481,10 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             max(max(buckets), max_eager_bs), device, self.dtype
         )
         self.local_transformer.freeze_kv_cache()
+        frame_decode = self._frame_decode_graphable_for_capture(
+            enable_torch_compile=enable_torch_compile,
+            torch_compile_mode=torch_compile_mode,
+        )
         self._frame_graphs: dict[
             int,
             tuple[
@@ -477,15 +518,13 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             warmup_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(warmup_stream):
                 for _ in range(2):
-                    self._decode_frame_graphable(**static_inputs)
+                    frame_decode(**static_inputs)
             torch.cuda.current_stream().wait_stream(warmup_stream)
             torch.cuda.synchronize()
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                stop_choice, codes, feedback = self._decode_frame_graphable(
-                    **static_inputs
-                )
+                stop_choice, codes, feedback = frame_decode(**static_inputs)
             self._frame_graphs[bucket] = (
                 graph,
                 static_inputs,
@@ -494,7 +533,10 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 feedback,
             )
         logger.info(
-            "MOSS-TTS Local frame-decode CUDA graphs captured for bs=%s", buckets
+            "MOSS-TTS Local frame-decode CUDA graphs captured for bs=%s "
+            "(torch_compile=%s)",
+            buckets,
+            bool(enable_torch_compile),
         )
 
     @property

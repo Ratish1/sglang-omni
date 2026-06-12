@@ -106,6 +106,19 @@ These ranges are gated by `torch.autograd._profiler_enabled()` and are intended
 to split the post-backbone boundary into graph replay, copy/snapshot work,
 tensor construction, radix hashing, feedback staging, and journal creation.
 
+For MOSS-TTS Local `torch.compile` experiments, keep the two compile surfaces
+separate:
+
+- the Qwen3 backbone uses SGLang's native compile path during decode CUDA graph
+  capture and can be toggled with `--talker_torch_compile on`;
+- the MOSS-specific frame-local decoder is outside SGLang's normal decode graph
+  runner and can be compiled before frame CUDA graph capture by setting
+  `frame_decode_torch_compile: true` in the `tts_engine` factory args.
+
+Use `SGLANG_TORCH_COMPILE_MODE=max-autotune-no-cudagraphs` unless deliberately
+testing another mode; Inductor-owned cudagraphs should not be mixed into this
+path while SGLang and MOSS Local already manage explicit CUDA graph capture.
+
 Custom callsites can call `sglang_omni.profiler.event_recorder.emit(...)` to
 add domain-specific events. Events from inactive recorders are no-ops, so
 instrumentation sites do not need to guard against the disabled case.
