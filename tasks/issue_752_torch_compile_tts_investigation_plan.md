@@ -752,3 +752,62 @@ For #762-style native work, direct fixed-shape parity and c1 code-hash parity ar
 necessary. c8 code-hash parity is only decisive if the baseline is repeat-stable
 or if the compared runs have matching batch composition for the divergent
 samples.
+
+### 2026-06-13 c8 Repeat-Control Result
+
+Status: baseline c8 code hashes are not repeat-stable under normal concurrent
+serving.
+
+Observed result:
+
+- `B` vs `B`, c8 `n200`: `106/200` hashes matched, `94/200` differed, with one
+  shape/completion-token delta.
+- `native` vs `native`, c8 `n200`: `109/200` hashes matched, `91/200` differed,
+  with one shape/completion-token delta.
+- The first `B/B` divergent sample differed at frame 0 / `generation_steps=0`
+  despite the same seed, same base position, and CUDA graph path.
+- The divergent sample had different batch composition: one run placed it at
+  batch size `3`, request index `2`; the other placed it at batch size `1`,
+  request index `0`.
+- Hidden-state hash and text/audio logit hashes differed before the sampled row
+  differed. Text/audio argmax stayed stable for the first observed logit rows,
+  but later sampled RVQ codes diverged.
+
+Code-level interpretation:
+
+- In the baseline path, `MossTTSLocalSGLangModel.forward()` returns the backbone
+  sample hidden states, and `MossTTSLocalModelRunner._collect_frame()` samples
+  the local frame from those hidden states. Therefore a changed hidden-state
+  hash at frame 0 is upstream of legacy-vs-native collection and upstream of
+  final row clone/journal behavior.
+- SGLang decode CUDA graph accepts any raw batch up to the max captured batch
+  when padding is enabled, then pads to the nearest captured `cuda_graph_bs`
+  bucket in `CudaGraphRunner.replay_prepare()`. Different raw batch size,
+  request row, and batch composition can exercise different attention metadata
+  and reduction/order behavior before MOSS Local frame sampling sees logits.
+- The MOSS Local sampler is seeded by request seed and logical position, but
+  the seed only makes sampling deterministic for fixed logits. It does not make
+  logits invariant to batch-shape/order changes in the Qwen backbone.
+
+Decision:
+
+- Do not treat c8 cross-run code-hash equality as a correctness gate unless the
+  compared runs have fixed batch grouping/order or baseline `B/B` is proven
+  repeat-stable under the same harness.
+- The previous #762 c8 hash mismatch is not proof of native-path state
+  corruption, because the baseline itself changes hashes when scheduling changes
+  batch composition.
+- This does not weaken the rejection of frame-decode `torch.compile`: D2 and
+  logits-target compile already failed direct raw-vs-compiled parity with fixed
+  shapes.
+
+Next validation gate for #762-style work:
+
+1. Build or run a fixed-batch replay/direct harness that feeds identical hidden
+   states, pool rows, seeds, base positions, and padding rows into legacy and
+   native paths for bs `1,2,4,8`.
+2. Add c8 serving trace fields for batch order and pool-row mapping so any
+   future c8 mismatch can be classified as scheduler batch drift versus a true
+   native lifecycle mismatch.
+3. Use c8/full SeedTTS for throughput and WER distributions, comparing against
+   `B/B` variance rather than demanding cross-run code-hash identity.
