@@ -11,6 +11,7 @@ from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 from sglang_omni.models.moss_tts_local.radix_hash import gpu_radix_row_hash
 from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.scheduling.types import RequestOutput
 
 
@@ -164,21 +165,36 @@ class MossTTSLocalModelRunner(ModelRunner):
             raise RuntimeError(
                 "MOSS-TTS Local model output did not include hidden states"
             )
+        hidden_ndim = int(hidden_states.ndim)
         if hidden_states.ndim == 3:
             hidden_states = hidden_states[:, -1, :]
 
         cfg = self.model.config
         device = hidden_states.device
         pool = self.model._state_pool
+        datas = [sched_req.data for sched_req in requests]
+        batch_size = len(datas)
+        num_channels = int(cfg.n_vq) + 1
+        recorder = self._active_event_recorder()
+        collect_metadata = self._collect_frame_profile_metadata(
+            schedule_batch=schedule_batch,
+            batch_size=batch_size,
+            num_channels=num_channels,
+            hidden_ndim=hidden_ndim,
+            hidden_size=int(hidden_states.shape[-1]),
+        )
+        self._emit_profile_event(
+            recorder,
+            requests,
+            "moss_tts_local_collect_frame_start",
+            collect_metadata,
+        )
         pool_rows = []
         for sched_req in requests:
             rid = sched_req.request_id
             row = self.model.acquire_row(rid)
             pool_rows.append(row)
             pool.ensure_params(row, rid, sched_req.data)
-        datas = [sched_req.data for sched_req in requests]
-        batch_size = len(datas)
-        num_channels = int(cfg.n_vq) + 1
 
         row_t = torch.tensor(
             pool_rows, dtype=torch.long, device=pool.feedback_embeds.device
@@ -229,8 +245,30 @@ class MossTTSLocalModelRunner(ModelRunner):
                 positions=gen_steps * num_channels + channel + 1,
             )
 
-        use_graph = rep_histories is None and batch_size <= getattr(
-            self.model, "frame_graph_max_bs", 0
+        frame_graph_max_bs = int(getattr(self.model, "frame_graph_max_bs", 0) or 0)
+        fallback_reason = self._frame_decode_fallback_reason(
+            batch_size=batch_size,
+            frame_graph_max_bs=frame_graph_max_bs,
+            has_repetition_penalty=rep_histories is not None,
+        )
+        use_graph = fallback_reason is None
+        frame_metadata = dict(collect_metadata)
+        frame_metadata.update(
+            {
+                "used_frame_graph": use_graph,
+                "frame_decode_path": "cuda_graph" if use_graph else "eager",
+                "frame_graph_max_bs": frame_graph_max_bs,
+                "fallback_reason": fallback_reason,
+                "repetition_penalty_rows": sum(
+                    1 for penalty in rep_penalties if penalty != 1.0
+                ),
+            }
+        )
+        self._emit_profile_event(
+            recorder,
+            requests,
+            "moss_tts_local_frame_decode_start",
+            frame_metadata,
         )
         if use_graph:
             stop_choice, codes, feedback = self.model.decode_frame_graphed(
@@ -244,6 +282,12 @@ class MossTTSLocalModelRunner(ModelRunner):
                 seeds=sampling_seeds,
                 base_positions=gen_steps * num_channels,
             )
+            self._emit_profile_event(
+                recorder,
+                requests,
+                "moss_tts_local_frame_decode_end",
+                frame_metadata,
+            )
             # The graph outputs are static buffers that the next replay (any
             # later prefill or decode step) overwrites; snapshot what we keep.
             codes = codes.clone()
@@ -253,6 +297,12 @@ class MossTTSLocalModelRunner(ModelRunner):
                 hidden_states,
                 sample_text=sample_text,
                 sample_audio=sample_audio,
+            )
+            self._emit_profile_event(
+                recorder,
+                requests,
+                "moss_tts_local_frame_decode_end",
+                frame_metadata,
             )
             embeds = None
 
@@ -280,7 +330,21 @@ class MossTTSLocalModelRunner(ModelRunner):
             for i, sched_req in enumerate(requests)
             if not self._is_chunked_request(sched_req)
         ]
+        collect_end_metadata = dict(frame_metadata)
+        collect_end_metadata.update(
+            {
+                "emitted_count": len(emit_indices),
+                "chunked_count": batch_size - len(emit_indices),
+                "has_journal": bool(emit_indices),
+            }
+        )
         if not emit_indices:
+            self._emit_profile_event(
+                recorder,
+                requests,
+                "moss_tts_local_collect_frame_end",
+                collect_end_metadata,
+            )
             return
 
         emit_index_t = torch.tensor(emit_indices, dtype=torch.long, device=rows.device)
@@ -296,6 +360,79 @@ class MossTTSLocalModelRunner(ModelRunner):
             pool_rows=emit_pool_rows,
             rows=rows.index_select(0, emit_index_t),
         )
+        self._emit_profile_event(
+            recorder,
+            requests,
+            "moss_tts_local_collect_frame_end",
+            collect_end_metadata,
+        )
+
+    @staticmethod
+    def _active_event_recorder() -> Any | None:
+        recorder = _get_event_recorder()
+        return recorder if recorder.is_active() else None
+
+    @staticmethod
+    def _emit_profile_event(
+        recorder: Any | None,
+        requests: list,
+        event_name: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        if recorder is None:
+            return
+        for sched_req in requests:
+            recorder.emit(
+                request_id=sched_req.request_id,
+                stage=None,
+                event_name=event_name,
+                metadata=metadata,
+            )
+
+    @staticmethod
+    def _collect_frame_profile_metadata(
+        *,
+        schedule_batch: Any,
+        batch_size: int,
+        num_channels: int,
+        hidden_ndim: int,
+        hidden_size: int,
+    ) -> dict[str, Any]:
+        forward_mode = getattr(schedule_batch, "forward_mode", None)
+        is_extend = (
+            forward_mode is not None
+            and hasattr(forward_mode, "is_extend")
+            and bool(forward_mode.is_extend())
+        )
+        is_decode = (
+            forward_mode is not None
+            and hasattr(forward_mode, "is_decode")
+            and bool(forward_mode.is_decode())
+        )
+        return {
+            "batch_size": int(batch_size),
+            "num_channels": int(num_channels),
+            "hidden_ndim": int(hidden_ndim),
+            "hidden_size": int(hidden_size),
+            "is_extend": is_extend,
+            "is_decode": is_decode,
+            "shared_batch_interval": True,
+        }
+
+    @staticmethod
+    def _frame_decode_fallback_reason(
+        *,
+        batch_size: int,
+        frame_graph_max_bs: int,
+        has_repetition_penalty: bool,
+    ) -> str | None:
+        if has_repetition_penalty:
+            return "repetition_penalty"
+        if frame_graph_max_bs <= 0:
+            return "frame_graph_unavailable"
+        if batch_size > frame_graph_max_bs:
+            return "batch_exceeds_frame_graph"
+        return None
 
     @staticmethod
     def _row_radix_token_ids(

@@ -7,6 +7,7 @@ CPU-only: the pool derives its sizing/placement from a fake model exposing a
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import torch
@@ -20,6 +21,7 @@ from sglang_omni.models.moss_tts_local.state_pool import (
     MossTTSLocalDecodeJournal,
     MossTTSLocalDecodeStatePool,
 )
+from sglang_omni.profiler.event_recorder import get_recorder, reset_active_stage
 from sglang_omni.proto import OmniRequest, StagePayload
 
 _HIDDEN = 8
@@ -325,6 +327,100 @@ def test_double_collect_overwrites_feedback():
         pool.feedback_embeds[row],
         torch.full((hidden_size,), 2, dtype=torch.bfloat16),
     )
+
+
+def test_collect_frame_emits_profile_events_when_request_profiler_active(tmp_path):
+    hidden_size = 4
+    weight = torch.zeros(2, hidden_size, dtype=torch.bfloat16)
+    embedding = SimpleNamespace(weight=weight)
+    model = SimpleNamespace(
+        _decode_input_embedding=embedding,
+        _state_pool=None,
+        config=SimpleNamespace(
+            n_vq=12,
+            audio_assistant_slot_token_id=1000,
+            audio_end_token_id=1001,
+        ),
+        frame_graph_max_bs=0,
+        device=torch.device("cpu"),
+    )
+    pool = MossTTSLocalDecodeStatePool(model)
+    model._state_pool = pool
+    model.acquire_row = pool.acquire_row
+
+    def decode_frame(hidden_states, *, sample_text, sample_audio):
+        del hidden_states, sample_text, sample_audio
+        return (
+            torch.zeros(1, dtype=torch.long),
+            torch.full((1, 12), 7, dtype=torch.long),
+        )
+
+    model.decode_frame = decode_frame
+    model._prepare_multi_modal_inputs = lambda rows: torch.ones(
+        (rows.shape[0], hidden_size), dtype=torch.bfloat16
+    )
+
+    runner = object.__new__(MossTTSLocalModelRunner)
+    runner.model = model
+    data = SimpleNamespace(
+        req=SimpleNamespace(is_chunked=0),
+        text_temperature=1.0,
+        text_top_p=1.0,
+        text_top_k=50,
+        audio_temperature=1.0,
+        audio_top_p=1.0,
+        audio_top_k=50,
+        sampling_seed=0,
+        generation_steps=0,
+        audio_repetition_penalty=1.0,
+        output_rows=[],
+    )
+    request = SimpleNamespace(request_id="rid", data=data)
+    result = SimpleNamespace(
+        logits_output=SimpleNamespace(hidden_states=torch.zeros(1, hidden_size))
+    )
+    schedule_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(
+            is_extend=lambda: False,
+            is_decode=lambda: True,
+        )
+    )
+
+    rec = get_recorder()
+    if rec.is_active():
+        rec.stop()
+    reset_active_stage(None)
+    path = rec.start(
+        run_id="moss-local-test", event_dir=str(tmp_path), stage="tts_engine"
+    )
+    try:
+        runner._collect_frame(result, None, schedule_batch, [request])
+    finally:
+        rec.stop()
+        reset_active_stage(None)
+
+    with open(path, "r", encoding="utf-8") as fp:
+        events = [json.loads(line) for line in fp if line.strip()]
+
+    names = [event["event_name"] for event in events]
+    assert names == [
+        "moss_tts_local_collect_frame_start",
+        "moss_tts_local_frame_decode_start",
+        "moss_tts_local_frame_decode_end",
+        "moss_tts_local_collect_frame_end",
+    ]
+    assert {event["stage"] for event in events} == {"tts_engine"}
+    frame_metadata = events[1]["metadata"]
+    assert frame_metadata["batch_size"] == 1
+    assert frame_metadata["is_decode"] is True
+    assert frame_metadata["used_frame_graph"] is False
+    assert frame_metadata["frame_decode_path"] == "eager"
+    assert frame_metadata["fallback_reason"] == "frame_graph_unavailable"
+    assert frame_metadata["shared_batch_interval"] is True
+    end_metadata = events[-1]["metadata"]
+    assert end_metadata["emitted_count"] == 1
+    assert end_metadata["chunked_count"] == 0
+    assert end_metadata["has_journal"] is True
 
 
 def test_resume_reprefill_overwrites_stranded_feedback():

@@ -317,6 +317,32 @@ def test_stage_breakdown_covers_preprocess_encoder_and_prefill(
     assert by_key[talker_ttfcc_key].total_ms == 4.0
 
 
+def test_stage_breakdown_covers_moss_tts_local_frame_intervals(
+    tmp_path: Path,
+) -> None:
+    events = [
+        _ev("r1", "tts_engine", "moss_tts_local_collect_frame_start", 0),
+        _ev("r1", "tts_engine", "moss_tts_local_frame_decode_start", 500_000),
+        _ev("r1", "tts_engine", "moss_tts_local_frame_decode_end", 3_500_000),
+        _ev("r1", "tts_engine", "moss_tts_local_collect_frame_end", 5_000_000),
+    ]
+    _write_events(tmp_path / "events_x.jsonl", events)
+
+    rows = stage_breakdown(source=tmp_path)
+    by_key = {(r.stage, r.interval_name): r for r in rows}
+
+    collect_key = (
+        "tts_engine",
+        "moss_tts_local_collect_frame_start->moss_tts_local_collect_frame_end",
+    )
+    frame_key = (
+        "tts_engine",
+        "moss_tts_local_frame_decode_start->moss_tts_local_frame_decode_end",
+    )
+    assert by_key[collect_key].total_ms == 5.0
+    assert by_key[frame_key].total_ms == 3.0
+
+
 def test_stage_breakdown_emits_both_intervals_sharing_opener(
     tmp_path: Path,
 ) -> None:

@@ -75,6 +75,14 @@ Supporting events used for finer-grained breakdown:
 | Stage | `stage_stream_chunk_received` | Each stream chunk materialized and ready for the receiver scheduler, including coordinator terminal chunks |
 | AR scheduler | `scheduler_queue_enter` | Built request entered the scheduler queue |
 | AR scheduler | `scheduler_first_emit` | First `stream_output_builder` emission per request |
+| MOSS-TTS Local AR | `moss_tts_local_collect_frame_start` / `_end` | `_collect_frame()` boundary after the backbone forward: frame decode, radix id build, feedback staging, and journal creation. Metadata includes `batch_size`, graph/eager path, fallback reason, emitted/chunked counts. |
+| MOSS-TTS Local AR | `moss_tts_local_frame_decode_start` / `_end` | Local frame decoder boundary only, either CUDA graph replay or eager fallback. Metadata includes `used_frame_graph`, `frame_decode_path`, `frame_graph_max_bs`, and `fallback_reason`. |
+
+MOSS-TTS Local frame events are emitted once per request for timeline
+reconstruction, but each interval describes a batch-shared operation. Their
+metadata carries `shared_batch_interval=true`; use p50/p95 and path/fallback
+metadata for diagnosis, and avoid interpreting summed `total_ms` as unique GPU
+time across all requests.
 
 Custom callsites can call `sglang_omni.profiler.event_recorder.emit(...)` to
 add domain-specific events. Events from inactive recorders are no-ops, so
