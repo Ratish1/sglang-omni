@@ -155,6 +155,27 @@ Adjacent upstream/open work that affects next steps:
 - Issue `#757` and PR `#759` move active rows, `generation_steps`, and repetition-penalty history into the MOSS Local state pool. This directly targets our remaining `param_gather` / `sampling_state` / launch-prep layer. Treat it as the next baseline delta to compare against D2, not as a replacement for D2.
 - Issue `#736` is the larger target: make the frame path native over the row-indexed state pool and remove per-frame host/copy glue around the already captured frame graph.
 
+Latest B/D2/P/P+D2 matrix from `/data/moss_local_issue752_p_vs_d2_20260612_143506`:
+
+- B/D2 ran on this branch at `2cd6b905`; P/P+D2 ran on a local PR `#759`-equivalent integration at `ab012cb8`.
+- No D1/D3; no PR `#755` preprocessing/quantizer compile.
+- End-to-end n50:
+  - B: `3.186` QPS, `0.6139` RTF mean, `2.440s` latency.
+  - D2: `3.462` QPS, `0.5536` RTF mean, `2.188s` latency.
+  - P: `2.894` QPS, `0.6703` RTF mean, `2.671s` latency.
+  - P+D2: `2.526` QPS, `0.7908` RTF mean, `3.061s` latency.
+- D2 is again the only end-to-end win: about `+8.7%` QPS and `-9.8%` RTF vs B.
+- All cases used frame CUDA graph for every frame, with no fallback and no repetition-penalty rows.
+- P improves scoped launch-state work (`param_gather`, `sampling_state`) but regresses end-to-end. P+D2 improves scoped `_collect_frame` and graph metrics but regresses end-to-end even more.
+- Trace-level P+D2 counters look locally attractive (`_collect_frame` avg `9.052ms`, `cudaStreamSynchronize` total `168.4ms`) while n50 request throughput is worst. This means the regression is outside the current MOSS fine scopes or the scoped n8 trace window is not representative of n50.
+
+Decision from this matrix:
+
+- Keep D2 scoped to `_decode_frame_graphable()` as the current supported compile candidate.
+- Do not recommend P or P+D2 from this integration.
+- Do not conclude that pool-resident state is conceptually bad. PR `#759` moves work out of `_collect_frame()` into `before_decode()` / finalize hooks, so scoped `_collect_frame` wins can hide total scheduler-loop cost. The next analysis must include stage breakdown, scheduler loop time, `before_decode`, `_finalize`/generation-step commit, and result/vocoder handoff.
+- The P regression should be root-caused before any attempt to widen the MOSS frame graph boundary.
+
 MOSS Delay code:
 
 - `sglang_omni/models/moss_tts/stages.py` also defaults `enable_torch_compile=False`.
@@ -316,6 +337,24 @@ trace runtime counters. Fine JSONL scopes are useful for relative boundaries,
 but any large late-scope delta must be cross-checked against
 `cudaStreamSynchronize`, `cudaGraphLaunch`, and function-level trace spans before
 calling it the root cause.
+
+Because P/P+D2 regressed end-to-end despite better `_collect_frame` scopes, the
+next diagnostic run must add or extract timings outside `_collect_frame`:
+
+- `before_decode` / `_write_decode_input_embedding`, especially row preparation
+  moved there by P.
+- `post_process_outputs` and `_finalize`, especially `on_generation_steps_advanced`
+  / pool generation-step commits.
+- scheduler-loop iteration time around `run_batch` and `process_batch_result`.
+- stage breakdown for `tts_engine/stage_input_received -> stage_complete`,
+  `tts_engine/scheduler_prefill_start -> scheduler_first_emit`, and handoff to
+  vocoder.
+- queueing/hop time into vocoder, because a slower tts-engine drain can reduce
+  end-to-end QPS even when frame scopes shrink.
+
+If these show that P merely moves work out of measured collect scopes, then P
+should be either rejected as currently implemented or reduced to only the pieces
+that are proven additive with D2.
 
 ### Phase 4: Do Not Duplicate Existing Compile PRs
 
