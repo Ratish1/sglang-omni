@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import json
 import logging
 import os
 import queue
@@ -126,6 +128,28 @@ def _build_usage(state: MossTTSLocalState) -> dict[str, Any] | None:
     if state.engine_time_s:
         usage["engine_time_s"] = round(float(state.engine_time_s), 6)
     return usage
+
+
+def _maybe_write_code_trace(
+    payload: StagePayload,
+    state: MossTTSLocalState,
+    codes: torch.Tensor,
+) -> None:
+    trace_path = os.environ.get("SGLANG_MOSS_TTS_LOCAL_CODE_TRACE_PATH")
+    if not trace_path:
+        return
+    codes_cpu = codes.detach().to(device="cpu", dtype=torch.int16).contiguous()
+    record = {
+        "request_id": str(payload.request_id),
+        "text": state.text,
+        "audio_codes_shape": list(codes_cpu.shape),
+        "audio_codes_sha256": hashlib.sha256(codes_cpu.numpy().tobytes()).hexdigest(),
+        "completion_tokens": int(state.completion_tokens),
+        "prompt_tokens": int(state.prompt_tokens),
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(trace_path)), exist_ok=True)
+    with open(trace_path, "a") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 class _BatchedReferenceEncoder:
@@ -620,6 +644,7 @@ def create_vocoder_executor(
     def _store_vocoder_result(
         payload: StagePayload,
         state: MossTTSLocalState,
+        codes: torch.Tensor,
         wav: torch.Tensor,
         sample_rate: int,
     ) -> StagePayload:
@@ -628,6 +653,7 @@ def create_vocoder_executor(
         audio_payload = audio_waveform_payload(
             wav, source_hint="MOSS-TTS Local", keep_channels=True
         )
+        _maybe_write_code_trace(payload, state, codes)
         state.audio_codes = None
         state.sample_rate = int(sample_rate)
         payload = store_state(payload, state)
@@ -664,7 +690,9 @@ def create_vocoder_executor(
                 results.append(store_state(payload, state))
                 continue
             wav = torch.as_tensor(next(decoded)).detach().to("cpu")
-            results.append(_store_vocoder_result(payload, state, wav, sample_rate))
+            results.append(
+                _store_vocoder_result(payload, state, codes, wav, sample_rate)
+            )
         return results
 
     def _vocode(payload: StagePayload) -> StagePayload:
