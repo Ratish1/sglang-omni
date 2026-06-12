@@ -140,6 +140,7 @@ _STAGE_INTERVAL_EVENTS = (
     ("scheduler_request_build_start", "scheduler_request_build_end"),
     ("scheduler_prefill_start", "stage_first_stream_chunk_sent"),
     ("scheduler_prefill_start", "scheduler_first_emit"),
+    ("code2wav_decode_start", "code2wav_decode_end"),
 )
 
 

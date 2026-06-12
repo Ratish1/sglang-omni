@@ -18,6 +18,7 @@ import queue as _queue_mod
 import time
 import types
 from collections import deque
+from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
@@ -28,13 +29,29 @@ from sglang.srt.managers.scheduler import Scheduler as _Upstream
 from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.utils import broadcast_pyobj
+from torch.profiler import record_function
 
 from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
+from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
+from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
 
 _FAILED_BATCH_RESULT = object()
+
+
+def _batch_profile_name(prefix: str, batch: Any) -> str:
+    reqs = getattr(batch, "reqs", None) or []
+    stage = _get_active_stage() or "unknown"
+    return f"{prefix}:stage={stage}:bs={len(reqs)}"
+
+
+def _maybe_record_function(name: str):
+    if TorchProfiler.is_active():
+        return record_function(name)
+    return nullcontext()
 
 
 class _NoOpSender:
@@ -615,14 +632,17 @@ class OmniScheduler:
         ``ModelRunnerOutput``.  The upstream ``process_batch_result`` expects
         a ``GenerationBatchResult``.  We bridge the two formats here.
         """
-        self._emit_prefill_start_for_batch(batch)
-        if self._model_runner is not None:
-            sched_output = self._build_sched_output(batch)
-            mr_output = self._model_runner.execute(sched_output)
-            self._emit_stream_output(sched_output, mr_output)
-            return self._make_batch_result(batch, mr_output)
-        # Fallback: call upstream's run_batch (uses tp_worker directly)
-        return _Upstream.run_batch(self, batch, pp_proxy_tensors)
+        with _maybe_record_function(
+            _batch_profile_name("omni_scheduler_run_batch", batch)
+        ):
+            self._emit_prefill_start_for_batch(batch)
+            if self._model_runner is not None:
+                sched_output = self._build_sched_output(batch)
+                mr_output = self._model_runner.execute(sched_output)
+                self._emit_stream_output(sched_output, mr_output)
+                return self._make_batch_result(batch, mr_output)
+            # Fallback: call upstream's run_batch (uses tp_worker directly)
+            return _Upstream.run_batch(self, batch, pp_proxy_tensors)
 
     def _build_sched_output(self, batch):
         """Wrap a ScheduleBatch into the SchedulerOutput the model runner
@@ -681,10 +701,13 @@ class OmniScheduler:
         (forward + sample + async D2H of the collect snapshot), without waiting.
         Returns ``(sched_output, pending_step)``; the caller holds the pending
         step (launch-first keeps two steps momentarily in flight)."""
-        self._emit_prefill_start_for_batch(batch)
-        sched_output = self._build_sched_output(batch)
-        pending_step = self._model_runner.execute_launch(sched_output)
-        return sched_output, pending_step
+        with _maybe_record_function(
+            _batch_profile_name("omni_scheduler_run_batch_launch", batch)
+        ):
+            self._emit_prefill_start_for_batch(batch)
+            sched_output = self._build_sched_output(batch)
+            pending_step = self._model_runner.execute_launch(sched_output)
+            return sched_output, pending_step
 
     def _run_batch_resolve(self, batch, sched_output, pending_step, skip_rids=()):
         """Async: resolve the given launched step (wait event, host collect),
@@ -697,15 +720,18 @@ class OmniScheduler:
         """
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
-        mr_output = self._model_runner.execute_resolve(pending_step)
-        if mr_output is None:
-            return _FAILED_BATCH_RESULT
-        self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
-        return GenerationBatchResult(
-            logits_output=None,
-            next_token_ids=pending_step.batch_result.next_token_ids,
-            can_run_cuda_graph=mr_output.can_run_cuda_graph,
-        )
+        with _maybe_record_function(
+            _batch_profile_name("omni_scheduler_run_batch_resolve", batch)
+        ):
+            mr_output = self._model_runner.execute_resolve(pending_step)
+            if mr_output is None:
+                return _FAILED_BATCH_RESULT
+            self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
+            return GenerationBatchResult(
+                logits_output=None,
+                next_token_ids=pending_step.batch_result.next_token_ids,
+                can_run_cuda_graph=mr_output.can_run_cuda_graph,
+            )
 
     def _handle_batch_failure(self, batch: Any, error: Exception) -> None:
         reqs = list(batch.reqs)
@@ -717,11 +743,21 @@ class OmniScheduler:
 
     def _emit_prefill_start_for_batch(self, batch: Any) -> None:
         """Emit once when a request's first executable batch is selected."""
-        metadata = {}
-        for attr in ("is_prefill_only", "is_extend_in_batch"):
-            if hasattr(batch, attr):
-                metadata[attr] = bool(getattr(batch, attr))
-        for req in getattr(batch, "reqs", []) or []:
+        reqs = list(getattr(batch, "reqs", []) or [])
+        metadata = None
+        if _get_recorder().is_active():
+            input_lens = [
+                len(getattr(req, "origin_input_ids", []) or []) for req in reqs
+            ]
+            metadata = {
+                "batch_size": len(reqs),
+                "input_tokens_total": sum(input_lens),
+                "input_tokens_max": max(input_lens, default=0),
+            }
+            for attr in ("is_prefill_only", "is_extend_in_batch"):
+                if hasattr(batch, attr):
+                    metadata[attr] = bool(getattr(batch, attr))
+        for req in reqs:
             rid = req.rid
             if rid in self._prefill_start_done:
                 continue

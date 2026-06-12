@@ -7,19 +7,29 @@ runs vocoder incrementally, outputs final audio via outbox.
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from typing import Any
 
 import numpy as np
 import torch
+from torch.profiler import record_function
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
+from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_record_function(name: str):
+    if TorchProfiler.is_active():
+        return record_function(name)
+    return nullcontext()
 
 
 def load_code2wav_model(
@@ -240,14 +250,42 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         context = min(self._left_context_size, start)
         window = torch.stack(code_chunks[start - context : end], dim=0)
         codes = window.transpose(0, 1).unsqueeze(0)
-        with torch.no_grad():
-            if self._device.type == "cuda":
-                torch.cuda.set_device(self._device)
-            wav = self._model(codes)
+        recorder_active = _get_recorder().is_active()
+        if recorder_active:
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_decode_start",
+                metadata={
+                    "start": int(start),
+                    "end": int(end),
+                    "new_chunks": int(end - start),
+                    "context_chunks": int(context),
+                    "code_shape": list(codes.shape),
+                },
+            )
+        with _maybe_record_function(
+            "code2wav_decode:" f"new_chunks={end - start}:context_chunks={context}"
+        ):
+            with torch.no_grad():
+                if self._device.type == "cuda":
+                    torch.cuda.set_device(self._device)
+                wav = self._model(codes)
         trim = context * self._total_upsample
         if trim:
             wav = wav[..., trim:]
         audio = wav.reshape(-1).detach().cpu().float().numpy().copy()
+        if recorder_active:
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_decode_end",
+                metadata={
+                    "start": int(start),
+                    "end": int(end),
+                    "samples": int(audio.shape[0]),
+                },
+            )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "Code2Wav decode window=%s start=%s end=%s trim=%s samples=%s",
