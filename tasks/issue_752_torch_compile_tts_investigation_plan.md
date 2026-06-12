@@ -135,6 +135,26 @@ Latest remote B/D2 evidence from `/data/moss_local_issue752_bd2_scoped_20260612_
 
 Working interpretation: frame-local compile is a real candidate because it compiles the small repeated local decoder before explicit frame CUDA graph capture, matching SGLang's compile-with-cudagraph philosophy but avoiding the graph-break-heavy Qwen backbone surface. It is not yet a production recommendation until ABAB repeats, quality parity, cold/warm startup cost, and fine-scope attribution are confirmed.
 
+Latest remote fine-scope B/D2 evidence from `/data/moss_local_issue752_bd2_fine_20260612_141125` at commit `bb6d71d5`:
+
+- B, n50: `2.870` QPS, `0.6583` RTF mean, `2.636s` latency mean.
+- D2, n50: `3.202` QPS, `0.5960` RTF mean, `2.383s` latency mean.
+- D2 vs B: `+11.6%` QPS, `-9.5%` RTF mean, `-9.6%` latency mean.
+- Every frame used `frame_decode_path=cuda_graph`; no fallback and no repetition-penalty rows.
+- Frame event avg drops from `1.224ms` to `0.849ms`; collect-frame avg drops from `12.525ms` to `8.474ms`.
+- Torch trace n8 agrees on the compute/replay mechanism: `decode_frame_graphed` avg drops `1.244ms -> 0.585ms`, `cudaGraphLaunch` avg drops `0.764ms -> 0.461ms`, and `cudaStreamSynchronize` total drops `928.90ms -> 523.75ms`.
+- Fine JSONL scopes show the largest apparent delta in `feedback_write` (`3.835ms -> 0.436ms`), but this should be treated as a boundary/backlog symptom, not proof that the Python assignment itself became faster. Scope timestamps wrap asynchronous CUDA work plus synchronous JSONL event emission, so downstream scopes can absorb upstream GPU backlog. The trace-level graph replay and stream-sync deltas are the stronger attribution.
+- Startup cost remains non-trivial: total ready `35.04s -> 55.06s`, with D2 frame compile/capture about `22.23s`.
+
+Updated read: D2 is now the strongest `torch.compile` surface for issue #752, but the remaining optimization stack is below it: pool-resident launch state, graph-boundary widening, and async-safe state transitions.
+
+Adjacent upstream/open work that affects next steps:
+
+- PR `#751` is a negative result for Qwen/backbone compile on top of CUDA graph. Do not duplicate that path unless maintainers request another confirmation.
+- PR `#755` compiles the preprocessing codec/quantizer. It is valid, but it is a separate preprocessing surface and should not be mixed into D2 attribution.
+- Issue `#757` and PR `#759` move active rows, `generation_steps`, and repetition-penalty history into the MOSS Local state pool. This directly targets our remaining `param_gather` / `sampling_state` / launch-prep layer. Treat it as the next baseline delta to compare against D2, not as a replacement for D2.
+- Issue `#736` is the larger target: make the frame path native over the row-indexed state pool and remove per-frame host/copy glue around the already captured frame graph.
+
 MOSS Delay code:
 
 - `sglang_omni/models/moss_tts/stages.py` also defaults `enable_torch_compile=False`.
@@ -265,7 +285,39 @@ Decision gate:
 - If codec/quantizer dominates at higher concurrency, coordinate with PR `#755`.
 - If queueing/stage transfer dominates, compile is the wrong lever.
 
-### Phase 3: Do Not Duplicate Existing Compile PRs
+### Phase 3: Compare D2 Against Pool-State Cleanup, Not Against More Backbone Compile
+
+Goal: isolate the next layer after frame-local compile.
+
+Do not fold preprocessing compile (#755) into this matrix. It is a valid
+end-to-end serving improvement but answers a different question.
+
+Primary matrix once #759-style pool-state changes are available on the branch
+or on an upstream baseline:
+
+- B: CUDA graph only.
+- D2: frame-local compile before frame CUDA graph capture.
+- P: pool-resident launch-state cleanup only (`generation_steps`, active rows,
+  and repetition history in pool tensors).
+- P+D2: pool-state cleanup plus frame-local compile.
+
+Readout:
+
+- If P and D2 are additive, support both: D2 reduces the captured frame graph's
+  replay cost, while P reduces launch prep and state marshalling.
+- If P absorbs most of D2's end-to-end gain, keep D2 as optional and recommend
+  P first because it has no compile startup cost.
+- If P+D2 worsens startup or introduces graph breaks, keep D2 scoped exactly to
+  `_decode_frame_graphable()` and do not widen compile until graph-boundary
+  ownership is proven.
+
+The next instrumentation should report both request-event fine scopes and torch
+trace runtime counters. Fine JSONL scopes are useful for relative boundaries,
+but any large late-scope delta must be cross-checked against
+`cudaStreamSynchronize`, `cudaGraphLaunch`, and function-level trace spans before
+calling it the root cause.
+
+### Phase 4: Do Not Duplicate Existing Compile PRs
 
 Goal: align with open work instead of creating a parallel implementation.
 
