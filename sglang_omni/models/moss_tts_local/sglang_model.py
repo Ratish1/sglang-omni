@@ -368,9 +368,14 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         if not enable_torch_compile:
             return self._decode_frame_graphable
         if self._compiled_frame_decode_graphable is None:
-            from sglang.srt.model_executor.cuda_graph_runner import (
-                set_torch_compile_config,
-            )
+            try:
+                from sglang.srt.compilation.torch_compile_decoration import (
+                    set_torch_compile_config,
+                )
+            except ImportError:
+                from sglang.srt.model_executor.cuda_graph_runner import (
+                    set_torch_compile_config,
+                )
 
             set_torch_compile_config()
             compile_mode = (
