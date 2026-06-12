@@ -521,6 +521,11 @@ def create_sglang_tts_engine_executor(
     )
 
     want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
+    if frame_decode_torch_compile and not want_cuda_graph:
+        raise ValueError(
+            "frame_decode_torch_compile requires MOSS Local frame CUDA graph capture; "
+            "enable CUDA graph or unset frame_decode_torch_compile"
+        )
     if want_cuda_graph:
         server_args.disable_cuda_graph = True
 
