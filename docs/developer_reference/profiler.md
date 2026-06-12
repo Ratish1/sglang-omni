@@ -84,6 +84,28 @@ metadata carries `shared_batch_interval=true`; use p50/p95 and path/fallback
 metadata for diagnosis, and avoid interpreting summed `total_ms` as unique GPU
 time across all requests.
 
+When torch profiling is active, MOSS-TTS Local also emits scoped trace ranges
+inside `_collect_frame()`:
+
+- `moss_tts_local.collect_frame.setup`
+- `moss_tts_local.collect_frame.pool_rows`
+- `moss_tts_local.collect_frame.param_gather`
+- `moss_tts_local.collect_frame.sampling_state`
+- `moss_tts_local.collect_frame.path_select`
+- `moss_tts_local.frame_decode.cuda_graph`
+- `moss_tts_local.frame_decode.eager`
+- `moss_tts_local.collect_frame.graph_output_clone`
+- `moss_tts_local.collect_frame.row_build`
+- `moss_tts_local.collect_frame.radix_hash`
+- `moss_tts_local.collect_frame.eager_feedback_embed`
+- `moss_tts_local.collect_frame.emit_filter`
+- `moss_tts_local.collect_frame.feedback_write`
+- `moss_tts_local.collect_frame.journal`
+
+These ranges are gated by `torch.autograd._profiler_enabled()` and are intended
+to split the post-backbone boundary into graph replay, copy/snapshot work,
+tensor construction, radix hashing, feedback staging, and journal creation.
+
 Custom callsites can call `sglang_omni.profiler.event_recorder.emit(...)` to
 add domain-specific events. Events from inactive recorders are no-ops, so
 instrumentation sites do not need to guard against the disabled case.
