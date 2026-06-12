@@ -343,6 +343,41 @@ def test_stage_breakdown_covers_moss_tts_local_frame_intervals(
     assert by_key[frame_key].total_ms == 3.0
 
 
+def test_stage_breakdown_covers_moss_tts_local_fine_frame_intervals(
+    tmp_path: Path,
+) -> None:
+    events = [
+        _ev("r1", "tts_engine", "moss_tts_local_collect_frame_radix_hash_start", 0),
+        _ev("r1", "tts_engine", "moss_tts_local_collect_frame_radix_hash_end", 700_000),
+        _ev(
+            "r1",
+            "tts_engine",
+            "moss_tts_local_frame_decode_cuda_graph_start",
+            1_000_000,
+        ),
+        _ev(
+            "r1", "tts_engine", "moss_tts_local_frame_decode_cuda_graph_end", 1_900_000
+        ),
+    ]
+    _write_events(tmp_path / "events_x.jsonl", events)
+
+    rows = stage_breakdown(source=tmp_path)
+    by_key = {(r.stage, r.interval_name): r for r in rows}
+
+    radix_key = (
+        "tts_engine",
+        "moss_tts_local_collect_frame_radix_hash_start"
+        "->moss_tts_local_collect_frame_radix_hash_end",
+    )
+    frame_key = (
+        "tts_engine",
+        "moss_tts_local_frame_decode_cuda_graph_start"
+        "->moss_tts_local_frame_decode_cuda_graph_end",
+    )
+    assert by_key[radix_key].total_ms == 0.7
+    assert by_key[frame_key].total_ms == 0.9
+
+
 def test_stage_breakdown_emits_both_intervals_sharing_opener(
     tmp_path: Path,
 ) -> None:

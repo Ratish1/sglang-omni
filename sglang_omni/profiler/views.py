@@ -132,7 +132,27 @@ def reconstruct_timelines(
 
 # (opener, closer) pairs framing a stage-local interval. Opener can
 # appear in multiple pairs (e.g. prefill_start closes against both
-# first_emit and first_stream_chunk_sent → thinker TTFT / talker TTFCC).
+# first_emit and first_stream_chunk_sent -> thinker TTFT / talker TTFCC).
+_MOSS_TTS_LOCAL_FINE_FRAME_SCOPE_EVENTS = tuple(
+    (f"{name}_start", f"{name}_end")
+    for name in (
+        "moss_tts_local_collect_frame_setup",
+        "moss_tts_local_collect_frame_pool_rows",
+        "moss_tts_local_collect_frame_param_gather",
+        "moss_tts_local_collect_frame_sampling_state",
+        "moss_tts_local_collect_frame_path_select",
+        "moss_tts_local_frame_decode_cuda_graph",
+        "moss_tts_local_frame_decode_eager",
+        "moss_tts_local_collect_frame_graph_output_clone",
+        "moss_tts_local_collect_frame_row_build",
+        "moss_tts_local_collect_frame_radix_hash",
+        "moss_tts_local_collect_frame_eager_feedback_embed",
+        "moss_tts_local_collect_frame_emit_filter",
+        "moss_tts_local_collect_frame_feedback_write",
+        "moss_tts_local_collect_frame_journal",
+    )
+)
+
 _STAGE_INTERVAL_EVENTS = (
     ("stage_input_received", "stage_complete"),
     ("encoder_start", "encoder_end"),
@@ -142,7 +162,7 @@ _STAGE_INTERVAL_EVENTS = (
     ("scheduler_prefill_start", "scheduler_first_emit"),
     ("moss_tts_local_collect_frame_start", "moss_tts_local_collect_frame_end"),
     ("moss_tts_local_frame_decode_start", "moss_tts_local_frame_decode_end"),
-)
+) + _MOSS_TTS_LOCAL_FINE_FRAME_SCOPE_EVENTS
 
 
 @dataclass

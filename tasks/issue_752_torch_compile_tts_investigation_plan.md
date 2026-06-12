@@ -123,6 +123,18 @@ The first source of truth for generated frame content is the per-step `MossTTSLo
 
 That ownership split is semantically valid today, but it explains why a wider frame graph cannot simply read all launch metadata from the pool yet: generation steps and active row slots are still host-side/request-list derived.
 
+Latest remote B/D2 evidence from `/data/moss_local_issue752_bd2_scoped_20260612_110825`:
+
+- B, n50: `3.160` QPS, `0.6232` RTF mean, `2.465s` latency mean, collect-frame `11.606ms` avg, frame-decode `0.895ms` avg.
+- D2, n50: `3.609` QPS, `0.5246` RTF mean, `2.092s` latency mean, collect-frame `7.383ms` avg, frame-decode `0.563ms` avg.
+- D2 vs B: `+14.2%` QPS, `+15.8%` better RTF, `+15.1%` better latency.
+- Both cases used frame CUDA graph for every frame, with no fallback and no repetition-penalty rows.
+- n8 torch trace agrees directionally: `decode_frame_graphed` drops from `1.223ms` avg to `0.583ms`, `cudaGraphLaunch` total drops from `270.480ms` to `158.442ms`, and `cudaStreamSynchronize` total drops from `1433.220ms` to `810.828ms`.
+- Startup cost increased from roughly `30s` to `60s`; earlier cold-ish D2 startup was much worse, so cold/warm compile cache behavior still needs a controlled measurement.
+- Chrome trace still did not preserve `moss_tts_local.*` `record_function` labels, even though the helper was entered. The branch now has opt-in JSONL fine-scope events via `SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1` so the next scoped run can get scope-level evidence independent of Chrome trace label export.
+
+Working interpretation: frame-local compile is a real candidate because it compiles the small repeated local decoder before explicit frame CUDA graph capture, matching SGLang's compile-with-cudagraph philosophy but avoiding the graph-break-heavy Qwen backbone surface. It is not yet a production recommendation until ABAB repeats, quality parity, cold/warm startup cost, and fine-scope attribution are confirmed.
+
 MOSS Delay code:
 
 - `sglang_omni/models/moss_tts/stages.py` also defaults `enable_torch_compile=False`.

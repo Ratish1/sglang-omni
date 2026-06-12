@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -160,7 +162,12 @@ class MossTTSLocalModelRunner(ModelRunner):
         del forward_batch
         if not requests:
             return
-        with self._profile_scope("moss_tts_local.collect_frame.setup"):
+        recorder = self._active_event_recorder()
+        with self._profile_scope(
+            "moss_tts_local.collect_frame.setup",
+            recorder=recorder,
+            requests=requests,
+        ):
             hidden_states = getattr(result.logits_output, "hidden_states", None)
             if not isinstance(hidden_states, torch.Tensor):
                 raise RuntimeError(
@@ -176,7 +183,6 @@ class MossTTSLocalModelRunner(ModelRunner):
             datas = [sched_req.data for sched_req in requests]
             batch_size = len(datas)
             num_channels = int(cfg.n_vq) + 1
-            recorder = self._active_event_recorder()
             collect_metadata = self._collect_frame_profile_metadata(
                 schedule_batch=schedule_batch,
                 batch_size=batch_size,
@@ -191,7 +197,12 @@ class MossTTSLocalModelRunner(ModelRunner):
                 collect_metadata,
             )
 
-        with self._profile_scope("moss_tts_local.collect_frame.pool_rows"):
+        with self._profile_scope(
+            "moss_tts_local.collect_frame.pool_rows",
+            recorder=recorder,
+            requests=requests,
+            metadata=collect_metadata,
+        ):
             pool_rows = []
             for sched_req in requests:
                 rid = sched_req.request_id
@@ -199,7 +210,12 @@ class MossTTSLocalModelRunner(ModelRunner):
                 pool_rows.append(row)
                 pool.ensure_params(row, rid, sched_req.data)
 
-        with self._profile_scope("moss_tts_local.collect_frame.param_gather"):
+        with self._profile_scope(
+            "moss_tts_local.collect_frame.param_gather",
+            recorder=recorder,
+            requests=requests,
+            metadata=collect_metadata,
+        ):
             row_t = torch.tensor(
                 pool_rows, dtype=torch.long, device=pool.feedback_embeds.device
             )
@@ -220,7 +236,12 @@ class MossTTSLocalModelRunner(ModelRunner):
             audio_top_k = params["audio_top_k"]
             sampling_seeds = params["seeds"]
 
-        with self._profile_scope("moss_tts_local.collect_frame.sampling_state"):
+        with self._profile_scope(
+            "moss_tts_local.collect_frame.sampling_state",
+            recorder=recorder,
+            requests=requests,
+            metadata=collect_metadata,
+        ):
             gen_steps = torch.tensor(
                 [int(d.generation_steps) for d in datas],
                 dtype=torch.long,
@@ -253,7 +274,12 @@ class MossTTSLocalModelRunner(ModelRunner):
                 positions=gen_steps * num_channels + channel + 1,
             )
 
-        with self._profile_scope("moss_tts_local.collect_frame.path_select"):
+        with self._profile_scope(
+            "moss_tts_local.collect_frame.path_select",
+            recorder=recorder,
+            requests=requests,
+            metadata=collect_metadata,
+        ):
             frame_graph_max_bs = int(getattr(self.model, "frame_graph_max_bs", 0) or 0)
             fallback_reason = self._frame_decode_fallback_reason(
                 batch_size=batch_size,
@@ -280,7 +306,12 @@ class MossTTSLocalModelRunner(ModelRunner):
                 frame_metadata,
             )
         if use_graph:
-            with self._profile_scope("moss_tts_local.frame_decode.cuda_graph"):
+            with self._profile_scope(
+                "moss_tts_local.frame_decode.cuda_graph",
+                recorder=recorder,
+                requests=requests,
+                metadata=frame_metadata,
+            ):
                 stop_choice, codes, feedback = self.model.decode_frame_graphed(
                     hidden_states,
                     text_temperature=text_temp,
@@ -300,11 +331,21 @@ class MossTTSLocalModelRunner(ModelRunner):
             )
             # The graph outputs are static buffers that the next replay (any
             # later prefill or decode step) overwrites; snapshot what we keep.
-            with self._profile_scope("moss_tts_local.collect_frame.graph_output_clone"):
+            with self._profile_scope(
+                "moss_tts_local.collect_frame.graph_output_clone",
+                recorder=recorder,
+                requests=requests,
+                metadata=frame_metadata,
+            ):
                 codes = codes.clone()
                 embeds = feedback.clone()
         else:
-            with self._profile_scope("moss_tts_local.frame_decode.eager"):
+            with self._profile_scope(
+                "moss_tts_local.frame_decode.eager",
+                recorder=recorder,
+                requests=requests,
+                metadata=frame_metadata,
+            ):
                 stop_choice, codes = self.model.decode_frame(
                     hidden_states,
                     sample_text=sample_text,
@@ -318,7 +359,12 @@ class MossTTSLocalModelRunner(ModelRunner):
             )
             embeds = None
 
-        with self._profile_scope("moss_tts_local.collect_frame.row_build"):
+        with self._profile_scope(
+            "moss_tts_local.collect_frame.row_build",
+            recorder=recorder,
+            requests=requests,
+            metadata=frame_metadata,
+        ):
             slot_id = int(cfg.audio_assistant_slot_token_id)
             end_id = int(cfg.audio_end_token_id)
             next_text = torch.where(
@@ -333,20 +379,33 @@ class MossTTSLocalModelRunner(ModelRunner):
             rows[:, 0] = next_text
             rows[:, 1:] = codes
 
-        with self._profile_scope("moss_tts_local.collect_frame.radix_hash"):
+        with self._profile_scope(
+            "moss_tts_local.collect_frame.radix_hash",
+            recorder=recorder,
+            requests=requests,
+            metadata=frame_metadata,
+        ):
             next_token_ids = self._row_radix_token_ids(rows, next_text, end_id)
             result.next_token_ids = next_token_ids
             schedule_batch.output_ids = next_token_ids
 
         if embeds is None:
             with self._profile_scope(
-                "moss_tts_local.collect_frame.eager_feedback_embed"
+                "moss_tts_local.collect_frame.eager_feedback_embed",
+                recorder=recorder,
+                requests=requests,
+                metadata=frame_metadata,
             ):
                 embeds = self.model._prepare_multi_modal_inputs(
                     rows.to(device=self.model.device)
                 )
 
-        with self._profile_scope("moss_tts_local.collect_frame.emit_filter"):
+        with self._profile_scope(
+            "moss_tts_local.collect_frame.emit_filter",
+            recorder=recorder,
+            requests=requests,
+            metadata=frame_metadata,
+        ):
             emit_indices = [
                 i
                 for i, sched_req in enumerate(requests)
@@ -369,7 +428,12 @@ class MossTTSLocalModelRunner(ModelRunner):
             )
             return
 
-        with self._profile_scope("moss_tts_local.collect_frame.feedback_write"):
+        with self._profile_scope(
+            "moss_tts_local.collect_frame.feedback_write",
+            recorder=recorder,
+            requests=requests,
+            metadata=collect_end_metadata,
+        ):
             emit_index_t = torch.tensor(
                 emit_indices, dtype=torch.long, device=rows.device
             )
@@ -381,7 +445,12 @@ class MossTTSLocalModelRunner(ModelRunner):
                 dtype=pool.feedback_embeds.dtype,
             )
 
-        with self._profile_scope("moss_tts_local.collect_frame.journal"):
+        with self._profile_scope(
+            "moss_tts_local.collect_frame.journal",
+            recorder=recorder,
+            requests=[requests[i] for i in emit_indices],
+            metadata=collect_end_metadata,
+        ):
             result.moss_journal = MossTTSLocalDecodeJournal(
                 rids=[requests[i].request_id for i in emit_indices],
                 pool_rows=emit_pool_rows,
@@ -395,8 +464,46 @@ class MossTTSLocalModelRunner(ModelRunner):
         )
 
     @staticmethod
-    def _profile_scope(name: str):
-        return torch.profiler.record_function(name)
+    @contextmanager
+    def _profile_scope(
+        name: str,
+        *,
+        recorder: Any | None = None,
+        requests: list | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        emit_fine_events = (
+            recorder is not None
+            and bool(requests)
+            and os.environ.get("SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS") == "1"
+        )
+        event_base = name.replace(".", "_")
+        if emit_fine_events:
+            event_metadata = dict(metadata or {})
+            event_metadata.update(
+                {
+                    "scope": name,
+                    "shared_batch_interval": True,
+                    "fine_frame_scope": True,
+                }
+            )
+            MossTTSLocalModelRunner._emit_profile_event(
+                recorder,
+                requests,
+                f"{event_base}_start",
+                event_metadata,
+            )
+        try:
+            with torch.profiler.record_function(name):
+                yield
+        finally:
+            if emit_fine_events:
+                MossTTSLocalModelRunner._emit_profile_event(
+                    recorder,
+                    requests,
+                    f"{event_base}_end",
+                    event_metadata,
+                )
 
     @staticmethod
     def _active_event_recorder() -> Any | None:

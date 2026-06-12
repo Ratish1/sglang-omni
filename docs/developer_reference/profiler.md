@@ -107,6 +107,16 @@ branch and are intended to split the post-backbone boundary into graph replay,
 copy/snapshot work, tensor construction, radix hashing, feedback staging, and
 journal creation.
 
+If Chrome trace export drops user `record_function` names, set
+`SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1` for a scoped run. This emits
+matching request-event intervals for the same scopes, using sanitized event
+names such as `moss_tts_local_frame_decode_cuda_graph_start` /
+`moss_tts_local_frame_decode_cuda_graph_end`. These are opt-in because they
+multiply event volume in the per-frame loop. Like the broader MOSS Local frame
+events, scope intervals are batch-shared and emitted once per active request, so
+percentiles and relative deltas are meaningful but summed totals are not unique
+GPU time.
+
 For MOSS-TTS Local `torch.compile` experiments, keep the two compile surfaces
 separate:
 
