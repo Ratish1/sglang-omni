@@ -102,9 +102,10 @@ inside `_collect_frame()`:
 - `moss_tts_local.collect_frame.feedback_write`
 - `moss_tts_local.collect_frame.journal`
 
-These ranges are gated by `torch.autograd._profiler_enabled()` and are intended
-to split the post-backbone boundary into graph replay, copy/snapshot work,
-tensor construction, radix hashing, feedback staging, and journal creation.
+These `torch.profiler.record_function` ranges are always entered in the debug
+branch and are intended to split the post-backbone boundary into graph replay,
+copy/snapshot work, tensor construction, radix hashing, feedback staging, and
+journal creation.
 
 For MOSS-TTS Local `torch.compile` experiments, keep the two compile surfaces
 separate:

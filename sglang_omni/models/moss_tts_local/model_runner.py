@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from typing import Any
 
 import torch
@@ -397,10 +396,7 @@ class MossTTSLocalModelRunner(ModelRunner):
 
     @staticmethod
     def _profile_scope(name: str):
-        profiler_enabled = getattr(torch.autograd, "_profiler_enabled", None)
-        if profiler_enabled is not None and profiler_enabled():
-            return torch.profiler.record_function(name)
-        return contextlib.nullcontext()
+        return torch.profiler.record_function(name)
 
     @staticmethod
     def _active_event_recorder() -> Any | None:
