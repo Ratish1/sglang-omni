@@ -614,11 +614,12 @@ class OmniScheduler:
         )
 
     def run_batch(self, batch, pp_proxy_tensors=None):
-        try:
-            return self._run_batch(batch, pp_proxy_tensors)
-        except Exception as exc:
-            self._handle_batch_failure(batch, exc)
-            return _FAILED_BATCH_RESULT
+        with torch.profiler.record_function("omni_scheduler.run_batch"):
+            try:
+                return self._run_batch(batch, pp_proxy_tensors)
+            except Exception as exc:
+                self._handle_batch_failure(batch, exc)
+                return _FAILED_BATCH_RESULT
 
     def _run_batch(self, batch, pp_proxy_tensors=None):
         """Run a batch through the model runner.
@@ -629,19 +630,25 @@ class OmniScheduler:
         ``ModelRunnerOutput``.  The upstream ``process_batch_result`` expects
         a ``GenerationBatchResult``.  We bridge the two formats here.
         """
-        self._emit_prefill_start_for_batch(batch)
+        with torch.profiler.record_function("omni_scheduler.emit_prefill_start"):
+            self._emit_prefill_start_for_batch(batch)
         if self._model_runner is not None:
             # Mirror upstream run_batch's per-forward counter: OmniScheduler
             # overrides run_batch, so without this forward_ct stays 0 and
             # SGLANG_TEST_RETRACT fires every step. Only the custom-runner path
             # needs it (the fallback reaches upstream run_batch, which counts).
             self.forward_ct = getattr(self, "forward_ct", 0) + 1
-            sched_output = self._build_sched_output(batch)
-            mr_output = self._model_runner.execute(sched_output)
-            self._emit_stream_output(sched_output, mr_output)
-            return self._make_batch_result(batch, mr_output)
+            with torch.profiler.record_function("omni_scheduler.build_sched_output"):
+                sched_output = self._build_sched_output(batch)
+            with torch.profiler.record_function("omni_scheduler.model_runner_execute"):
+                mr_output = self._model_runner.execute(sched_output)
+            with torch.profiler.record_function("omni_scheduler.emit_stream_output"):
+                self._emit_stream_output(sched_output, mr_output)
+            with torch.profiler.record_function("omni_scheduler.make_batch_result"):
+                return self._make_batch_result(batch, mr_output)
         # Fallback: call upstream's run_batch (uses tp_worker directly)
-        return _Upstream.run_batch(self, batch, pp_proxy_tensors)
+        with torch.profiler.record_function("omni_scheduler.upstream_run_batch"):
+            return _Upstream.run_batch(self, batch, pp_proxy_tensors)
 
     def _build_sched_output(self, batch):
         """Wrap a ScheduleBatch into the SchedulerOutput the model runner
@@ -700,12 +707,15 @@ class OmniScheduler:
         (forward + sample, then ``post_decode_launch`` publishes the resolve
         payload), without waiting. Returns ``(sched_output, pending_step)``; the
         caller holds the pending step (launch-first keeps two steps in flight)."""
-        self._emit_prefill_start_for_batch(batch)
+        with torch.profiler.record_function("omni_scheduler.launch.emit_prefill_start"):
+            self._emit_prefill_start_for_batch(batch)
         # One forward per launch; mirror upstream run_batch's per-forward
         # counter (the matching resolve does no forward, so it must not count).
         self.forward_ct = getattr(self, "forward_ct", 0) + 1
-        sched_output = self._build_sched_output(batch)
-        pending_step = self._model_runner.execute_launch(sched_output)
+        with torch.profiler.record_function("omni_scheduler.launch.build_sched_output"):
+            sched_output = self._build_sched_output(batch)
+        with torch.profiler.record_function("omni_scheduler.model_runner_launch"):
+            pending_step = self._model_runner.execute_launch(sched_output)
         return sched_output, pending_step
 
     def _run_batch_resolve(self, batch, sched_output, pending_step, skip_rids=()):
@@ -719,15 +729,20 @@ class OmniScheduler:
         """
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
-        mr_output = self._model_runner.execute_resolve(pending_step)
+        with torch.profiler.record_function("omni_scheduler.model_runner_resolve"):
+            mr_output = self._model_runner.execute_resolve(pending_step)
         if mr_output is None:
             return _FAILED_BATCH_RESULT
-        self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
-        return GenerationBatchResult(
-            logits_output=None,
-            next_token_ids=pending_step.batch_result.next_token_ids,
-            can_run_cuda_graph=mr_output.can_run_cuda_graph,
-        )
+        with torch.profiler.record_function(
+            "omni_scheduler.resolve.emit_stream_output"
+        ):
+            self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
+        with torch.profiler.record_function("omni_scheduler.resolve.batch_result"):
+            return GenerationBatchResult(
+                logits_output=None,
+                next_token_ids=pending_step.batch_result.next_token_ids,
+                can_run_cuda_graph=mr_output.can_run_cuda_graph,
+            )
 
     def _handle_batch_failure(self, batch: Any, error: Exception) -> None:
         reqs = list(batch.reqs)
@@ -1439,17 +1454,21 @@ class OmniScheduler:
         decode first and run synchronously (the in-flight step is never stranded).
         """
         while self._running:
-            self._process_admin_requests()
-            recv_reqs = self.recv_requests()
-            recv_reqs.extend(self._take_deferred_request_payloads())
-            self.process_input_requests(recv_reqs)
+            with torch.profiler.record_function("omni_scheduler.admin_requests"):
+                self._process_admin_requests()
+            with torch.profiler.record_function("omni_scheduler.recv_requests"):
+                recv_reqs = self.recv_requests()
+                recv_reqs.extend(self._take_deferred_request_payloads())
+            with torch.profiler.record_function("omni_scheduler.process_input"):
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 self._process_admin_requests()
                 self._resolve_pending_async()
                 time.sleep(0.001)
                 continue
 
-            batch = self.get_next_batch_to_run()
+            with torch.profiler.record_function("omni_scheduler.get_next_batch"):
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             # Route through sync when the runner's collect has a sync-only
@@ -1464,7 +1483,8 @@ class OmniScheduler:
 
             if use_lookahead:
                 try:
-                    sched_output, pending_step = self._run_batch_launch(batch)
+                    with torch.profiler.record_function("omni_scheduler.async_launch"):
+                        sched_output, pending_step = self._run_batch_launch(batch)
                 except Exception as exc:
                     self._handle_batch_failure(batch, exc)
                 else:
@@ -1473,7 +1493,10 @@ class OmniScheduler:
                     if prev_pending is not None:
                         pb, ps, pstep = prev_pending
                         try:
-                            self._resolve_and_process(pb, ps, pstep)
+                            with torch.profiler.record_function(
+                                "omni_scheduler.async_resolve_previous"
+                            ):
+                                self._resolve_and_process(pb, ps, pstep)
                         except Exception as exc:
                             self._handle_batch_failure(pb, exc)
             else:
@@ -1486,7 +1509,10 @@ class OmniScheduler:
                 # Skip the drain call entirely in the common no-pending case (the
                 # bs=1 steady state) — _resolve_pending_async would just no-op.
                 if self._async_pending is not None:
-                    self._resolve_pending_async()
+                    with torch.profiler.record_function(
+                        "omni_scheduler.async_drain_pending"
+                    ):
+                        self._resolve_pending_async()
                     # Stale-batch overrun: `batch` was built (get_next_batch_to_run,
                     # top of loop) BEFORE this drain, which can finish OR retract reqs
                     # still present in it. Drop them before run_batch so they are not
@@ -1495,11 +1521,16 @@ class OmniScheduler:
                     batch = self._drop_stale_overrun(batch)
                     self.cur_batch = batch
                 if batch:
-                    result = self.run_batch(batch)
+                    with torch.profiler.record_function("omni_scheduler.sync_batch"):
+                        result = self.run_batch(batch)
                     if result is not _FAILED_BATCH_RESULT:
-                        self.process_batch_result(batch, result)
+                        with torch.profiler.record_function(
+                            "omni_scheduler.process_batch_result"
+                        ):
+                            self.process_batch_result(batch, result)
                 else:
-                    self.self_check_during_idle()
+                    with torch.profiler.record_function("omni_scheduler.idle_check"):
+                        self.self_check_during_idle()
                     time.sleep(0.001)
 
             self.last_batch = batch

@@ -478,3 +478,66 @@ Correctness guard:
 5. Run c8 n8/c8 n50 profile matrix and write a triage report.
 6. Pick the next optimization PR only after the triage identifies a dominant
    boundary.
+
+## Implementation Pass 2026-06-13
+
+Implemented on `perf/issue-752-moss-tts-compile-investigation` after merging
+`upstream/main`.
+
+What changed:
+
+- MOSS Local AR runner:
+  - broad request events:
+    - `moss_tts_local_collect_frame_start/end`;
+    - `moss_tts_local_frame_decode_start/end`;
+  - fine `record_function` and optional JSONL scopes for:
+    - `moss_tts_local.before_decode`;
+    - `moss_tts_local.before_decode.prepare_active_rows`;
+    - `moss_tts_local.before_decode.feedback_gather_copy`;
+    - `moss_tts_local.before_decode.input_ids_write`;
+    - `moss_tts_local.collect_frame.setup`;
+    - `moss_tts_local.collect_frame.pool_rows`;
+    - `moss_tts_local.collect_frame.param_gather`;
+    - `moss_tts_local.collect_frame.sampling_state`;
+    - `moss_tts_local.collect_frame.path_select`;
+    - `moss_tts_local.frame_decode.cuda_graph`;
+    - `moss_tts_local.frame_decode.eager`;
+    - `moss_tts_local.collect_frame.graph_output_clone`;
+    - `moss_tts_local.collect_frame.row_build`;
+    - `moss_tts_local.collect_frame.radix_hash`;
+    - `moss_tts_local.collect_frame.eager_feedback_embed`;
+    - `moss_tts_local.collect_frame.emit_filter`;
+    - `moss_tts_local.collect_frame.feedback_write`;
+    - `moss_tts_local.collect_frame.audio_history_update`;
+    - `moss_tts_local.collect_frame.journal`;
+    - `moss_tts_local.async_launch.radix_hash_publish`;
+    - `moss_tts_local.async_resolve.restore_next_token_ids`.
+- Base model runner:
+  - added `omni_model_runner.*` ranges around forward-batch build,
+    before hooks, forward, post hooks, sampling, output processing, async
+    launch, async event wait, async resolve, and generation-step advance.
+- Omni scheduler:
+  - added `omni_scheduler.*` ranges around request receive/process, batch
+    selection, sync batch execution, async launch, previous-step resolve,
+    pending drain, stream output, and batch-result processing.
+- MOSS Local vocoder:
+  - broad request events:
+    - `moss_tts_local_vocoder_batch_start/end`;
+    - `moss_tts_local_vocoder_decode_start/end`;
+  - `record_function` ranges for code preparation, codec decode, sample-rate
+    lookup, wav CPU materialization, and result store.
+- Profiler views/docs/tests:
+  - added the new MOSS AR/vocoder interval pairs to the stage breakdown view;
+  - documented the new trace ladder in `docs/developer_reference/profiler.md`.
+
+Hot-path safety notes:
+
+- No tensor value materialization was added to the MOSS AR path.
+- The new AR metadata is scalar/shape/path information only.
+- Fine per-frame JSONL events remain opt-in through
+  `SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1`.
+
+Local verification:
+
+- `python -m py_compile` on touched runtime/profiler files.
+- `pytest -q tests/unit_test/profiler/test_views.py`.

@@ -325,6 +325,10 @@ def test_stage_breakdown_covers_moss_tts_local_frame_intervals(
         _ev("r1", "tts_engine", "moss_tts_local_frame_decode_start", 500_000),
         _ev("r1", "tts_engine", "moss_tts_local_frame_decode_end", 3_500_000),
         _ev("r1", "tts_engine", "moss_tts_local_collect_frame_end", 5_000_000),
+        _ev("r1", "vocoder", "moss_tts_local_vocoder_batch_start", 6_000_000),
+        _ev("r1", "vocoder", "moss_tts_local_vocoder_decode_start", 6_500_000),
+        _ev("r1", "vocoder", "moss_tts_local_vocoder_decode_end", 9_000_000),
+        _ev("r1", "vocoder", "moss_tts_local_vocoder_batch_end", 10_000_000),
     ]
     _write_events(tmp_path / "events_x.jsonl", events)
 
@@ -341,6 +345,16 @@ def test_stage_breakdown_covers_moss_tts_local_frame_intervals(
     )
     assert by_key[collect_key].total_ms == 5.0
     assert by_key[frame_key].total_ms == 3.0
+    vocoder_key = (
+        "vocoder",
+        "moss_tts_local_vocoder_batch_start->moss_tts_local_vocoder_batch_end",
+    )
+    codec_key = (
+        "vocoder",
+        "moss_tts_local_vocoder_decode_start->moss_tts_local_vocoder_decode_end",
+    )
+    assert by_key[vocoder_key].total_ms == 4.0
+    assert by_key[codec_key].total_ms == 2.5
 
 
 def test_stage_breakdown_covers_moss_tts_local_fine_frame_intervals(
@@ -357,6 +371,30 @@ def test_stage_breakdown_covers_moss_tts_local_fine_frame_intervals(
         ),
         _ev(
             "r1", "tts_engine", "moss_tts_local_frame_decode_cuda_graph_end", 1_900_000
+        ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "moss_tts_local_before_decode_feedback_gather_copy_start",
+            2_000_000,
+        ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "moss_tts_local_before_decode_feedback_gather_copy_end",
+            2_400_000,
+        ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "moss_tts_local_async_launch_radix_hash_publish_start",
+            3_000_000,
+        ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "moss_tts_local_async_launch_radix_hash_publish_end",
+            3_300_000,
         ),
     ]
     _write_events(tmp_path / "events_x.jsonl", events)
@@ -376,6 +414,18 @@ def test_stage_breakdown_covers_moss_tts_local_fine_frame_intervals(
     )
     assert by_key[radix_key].total_ms == 0.7
     assert by_key[frame_key].total_ms == 0.9
+    feedback_key = (
+        "tts_engine",
+        "moss_tts_local_before_decode_feedback_gather_copy_start"
+        "->moss_tts_local_before_decode_feedback_gather_copy_end",
+    )
+    async_publish_key = (
+        "tts_engine",
+        "moss_tts_local_async_launch_radix_hash_publish_start"
+        "->moss_tts_local_async_launch_radix_hash_publish_end",
+    )
+    assert by_key[feedback_key].total_ms == 0.4
+    assert by_key[async_publish_key].total_ms == 0.3
 
 
 def test_stage_breakdown_emits_both_intervals_sharing_opener(

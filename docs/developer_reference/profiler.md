@@ -77,6 +77,8 @@ Supporting events used for finer-grained breakdown:
 | AR scheduler | `scheduler_first_emit` | First `stream_output_builder` emission per request |
 | MOSS-TTS Local AR | `moss_tts_local_collect_frame_start` / `_end` | `_collect_frame()` boundary after the backbone forward: frame decode, radix id build, feedback staging, and journal creation. Metadata includes `batch_size`, graph/eager path, fallback reason, emitted/chunked counts. |
 | MOSS-TTS Local AR | `moss_tts_local_frame_decode_start` / `_end` | Local frame decoder boundary only, either CUDA graph replay or eager fallback. Metadata includes `used_frame_graph`, `frame_decode_path`, `frame_graph_max_bs`, and `fallback_reason`. |
+| MOSS-TTS Local vocoder | `moss_tts_local_vocoder_batch_start` / `_end` | Batched code-to-waveform boundary. Metadata includes `batch_size` and `decode_count`. |
+| MOSS-TTS Local vocoder | `moss_tts_local_vocoder_decode_start` / `_end` | Codec `decode_audio_codes(...)` boundary, excluding result packaging and waveform CPU materialization. |
 
 MOSS-TTS Local frame events are emitted once per request for timeline
 reconstruction, but each interval describes a batch-shared operation. Their
@@ -87,6 +89,10 @@ time across all requests.
 When torch profiling is active, MOSS-TTS Local also emits scoped trace ranges
 inside `_collect_frame()`:
 
+- `moss_tts_local.before_decode`
+- `moss_tts_local.before_decode.prepare_active_rows`
+- `moss_tts_local.before_decode.feedback_gather_copy`
+- `moss_tts_local.before_decode.input_ids_write`
 - `moss_tts_local.collect_frame.setup`
 - `moss_tts_local.collect_frame.pool_rows`
 - `moss_tts_local.collect_frame.param_gather`
@@ -100,12 +106,28 @@ inside `_collect_frame()`:
 - `moss_tts_local.collect_frame.eager_feedback_embed`
 - `moss_tts_local.collect_frame.emit_filter`
 - `moss_tts_local.collect_frame.feedback_write`
+- `moss_tts_local.collect_frame.audio_history_update`
 - `moss_tts_local.collect_frame.journal`
+- `moss_tts_local.async_launch.radix_hash_publish`
+- `moss_tts_local.async_resolve.restore_next_token_ids`
+
+The base Omni model runner and scheduler also emit `record_function` ranges
+with `omni_model_runner.*` and `omni_scheduler.*` prefixes around batch build,
+forward, post hooks, async launch/resolve, event waits, stream emission, and
+result processing. These give a trace ladder from scheduler batch selection
+down to the MOSS frame loop.
+
+The MOSS-TTS Local vocoder emits trace ranges for:
+
+- `moss_tts_local.vocoder.prepare_codes`
+- `moss_tts_local.vocoder.decode_audio_codes`
+- `moss_tts_local.vocoder.wav_to_cpu`
+- `moss_tts_local.vocoder.store_result`
 
 These `torch.profiler.record_function` ranges are always entered in the debug
 branch and are intended to split the post-backbone boundary into graph replay,
-copy/snapshot work, tensor construction, radix hashing, feedback staging, and
-journal creation.
+copy/snapshot work, tensor construction, radix hashing, feedback staging,
+journal creation, async handoff, and code-to-waveform work.
 
 If Chrome trace export drops user `record_function` names, set
 `SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1` for a scoped run. This emits

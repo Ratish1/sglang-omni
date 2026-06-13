@@ -33,6 +33,7 @@ from sglang_omni.models.moss_tts_local.request_builders import (
 from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
 )
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
@@ -683,10 +684,43 @@ def create_vocoder_executor(
         )
 
     def _vocode_batch(payloads: list[StagePayload]) -> list[StagePayload]:
-        prepared = [_prepare_codes(payload) for payload in payloads]
-        codes_list = [codes for _, codes in prepared if codes is not None]
-        decoded = iter(processor.decode_audio_codes(codes_list))
-        sample_rate = _sample_rate()
+        batch_metadata = {
+            "batch_size": len(payloads),
+            "shared_batch_interval": True,
+        }
+        for payload in payloads:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="moss_tts_local_vocoder_batch_start",
+                metadata=batch_metadata,
+            )
+        with torch.profiler.record_function("moss_tts_local.vocoder.prepare_codes"):
+            prepared = [_prepare_codes(payload) for payload in payloads]
+            codes_list = [codes for _, codes in prepared if codes is not None]
+        decode_metadata = dict(batch_metadata)
+        decode_metadata["decode_count"] = len(codes_list)
+        for payload in payloads:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="moss_tts_local_vocoder_decode_start",
+                metadata=decode_metadata,
+            )
+        with torch.profiler.record_function(
+            "moss_tts_local.vocoder.decode_audio_codes"
+        ):
+            decoded_outputs = list(processor.decode_audio_codes(codes_list))
+            decoded = iter(decoded_outputs)
+        for payload in payloads:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="moss_tts_local_vocoder_decode_end",
+                metadata=decode_metadata,
+            )
+        with torch.profiler.record_function("moss_tts_local.vocoder.sample_rate"):
+            sample_rate = _sample_rate()
         results = []
         for payload, (state, codes) in zip(payloads, prepared):
             if codes is None:
@@ -695,9 +729,18 @@ def create_vocoder_executor(
                 state.audio_codes = None
                 results.append(store_state(payload, state))
                 continue
-            wav = torch.as_tensor(next(decoded)).detach().to("cpu")
-            results.append(
-                _store_vocoder_result(payload, state, codes, wav, sample_rate)
+            with torch.profiler.record_function("moss_tts_local.vocoder.wav_to_cpu"):
+                wav = torch.as_tensor(next(decoded)).detach().to("cpu")
+            with torch.profiler.record_function("moss_tts_local.vocoder.store_result"):
+                results.append(
+                    _store_vocoder_result(payload, state, codes, wav, sample_rate)
+                )
+        for payload in payloads:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="moss_tts_local_vocoder_batch_end",
+                metadata=decode_metadata,
             )
         return results
 

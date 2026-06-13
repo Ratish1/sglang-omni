@@ -149,7 +149,14 @@ _MOSS_TTS_LOCAL_FINE_FRAME_SCOPE_EVENTS = tuple(
         "moss_tts_local_collect_frame_eager_feedback_embed",
         "moss_tts_local_collect_frame_emit_filter",
         "moss_tts_local_collect_frame_feedback_write",
+        "moss_tts_local_collect_frame_audio_history_update",
         "moss_tts_local_collect_frame_journal",
+        "moss_tts_local_before_decode",
+        "moss_tts_local_before_decode_prepare_active_rows",
+        "moss_tts_local_before_decode_feedback_gather_copy",
+        "moss_tts_local_before_decode_input_ids_write",
+        "moss_tts_local_async_launch_radix_hash_publish",
+        "moss_tts_local_async_resolve_restore_next_token_ids",
     )
 )
 
@@ -162,6 +169,8 @@ _STAGE_INTERVAL_EVENTS = (
     ("scheduler_prefill_start", "scheduler_first_emit"),
     ("moss_tts_local_collect_frame_start", "moss_tts_local_collect_frame_end"),
     ("moss_tts_local_frame_decode_start", "moss_tts_local_frame_decode_end"),
+    ("moss_tts_local_vocoder_batch_start", "moss_tts_local_vocoder_batch_end"),
+    ("moss_tts_local_vocoder_decode_start", "moss_tts_local_vocoder_decode_end"),
 ) + _MOSS_TTS_LOCAL_FINE_FRAME_SCOPE_EVENTS
 
 
