@@ -138,7 +138,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         self._compiled_frame_decode_graphable: Callable[..., Any] | None = None
         self._compiled_frame_text_logits: Callable[..., Any] | None = None
         self._compiled_frame_audio_logits: Callable[..., Any] | None = None
-        self._compiled_frame_sampler: Callable[..., Any] | None = None
+        self._compiled_frame_sampler: Callable[..., torch.Tensor] | None = None
         self._frame_compile_configured = False
 
     def acquire_row(self, rid: str) -> int:
@@ -378,11 +378,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 "MOSS-TTS Local frame torch compile target must be one of "
                 f"{('full', 'logits', 'sampler')}, got {torch_compile_target!r}"
             )
-        compile_mode = (
-            torch_compile_mode
-            or os.environ.get("SGLANG_TORCH_COMPILE_MODE")
-            or "max-autotune-no-cudagraphs"
-        )
+        compile_mode = self._frame_compile_mode(torch_compile_mode)
         if compile_target == "sampler":
             self._ensure_frame_sampler_compile(compile_mode)
             return self._decode_frame_graphable
@@ -432,8 +428,17 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 compile_mode,
             )
 
-    def _ensure_frame_sampler_compile(self, compile_mode: str) -> None:
+    @staticmethod
+    def _frame_compile_mode(compile_mode: str | None = None) -> str:
+        return (
+            compile_mode
+            or os.environ.get("SGLANG_TORCH_COMPILE_MODE")
+            or "max-autotune-no-cudagraphs"
+        )
+
+    def _ensure_frame_sampler_compile(self, compile_mode: str | None = None) -> None:
         if self._compiled_frame_sampler is None:
+            compile_mode = self._frame_compile_mode(compile_mode)
             self._ensure_frame_compile_config()
             self._compiled_frame_sampler = torch.compile(
                 sample_seeded_branchless,
@@ -572,6 +577,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             max(max(buckets), max_eager_bs), device, self.dtype
         )
         self.local_transformer.freeze_kv_cache()
+        self._ensure_frame_sampler_compile(torch_compile_mode)
         frame_decode = self._frame_decode_graphable_for_capture(
             enable_torch_compile=enable_torch_compile,
             torch_compile_mode=torch_compile_mode,
