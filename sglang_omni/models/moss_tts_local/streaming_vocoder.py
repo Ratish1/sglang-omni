@@ -10,7 +10,8 @@ requests decode through dedicated offline slots of the same session (the
 codec forbids nested ``streaming()`` contexts), and every step advances all
 participating slots by one uniform length with the rest masked via
 ``exec_mask``. Until the first streaming request arrives, non-streaming
-requests take the pre-existing ``processor.decode_audio_codes`` path.
+requests take the configured offline codec path, which defaults to the
+pre-existing ``processor.decode_audio_codes`` behavior.
 """
 
 from __future__ import annotations
@@ -41,6 +42,9 @@ logger = logging.getLogger(__name__)
 
 _SOURCE_HINT = "MOSS-TTS Local"
 _VOCODER_EVENTS_ENV = "SGLANG_MOSS_TTS_LOCAL_VOCODER_EVENTS"
+_NONSTREAM_CODEC_PATH_ENV = "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH"
+_NONSTREAM_MAX_STEP_FRAMES_ENV = "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_MAX_STEP_FRAMES"
+_NONSTREAM_CODEC_PATHS = frozenset({"processor", "direct_batch", "session"})
 
 
 def _env_enabled(name: str, *, default: bool = False) -> bool:
@@ -127,6 +131,33 @@ def _resolve_sample_rate(processor: Any) -> int:
         )
         or 48000
     )
+
+
+def _resolve_nonstream_codec_path() -> str:
+    value = os.environ.get(_NONSTREAM_CODEC_PATH_ENV, "processor").strip().lower()
+    if value not in _NONSTREAM_CODEC_PATHS:
+        raise ValueError(
+            f"{_NONSTREAM_CODEC_PATH_ENV} must be one of "
+            f"{sorted(_NONSTREAM_CODEC_PATHS)}, got {value!r}"
+        )
+    return value
+
+
+def _resolve_nonstream_max_step_frames(default: int) -> int:
+    value = os.environ.get(_NONSTREAM_MAX_STEP_FRAMES_ENV)
+    if value is None:
+        return int(default)
+    try:
+        resolved = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_NONSTREAM_MAX_STEP_FRAMES_ENV} must be an integer, got {value!r}"
+        ) from exc
+    if resolved < 0:
+        raise ValueError(
+            f"{_NONSTREAM_MAX_STEP_FRAMES_ENV} must be >= 0, got {resolved}"
+        )
+    return resolved
 
 
 def _build_usage(state: MossTTSLocalState) -> dict[str, Any] | None:
@@ -327,7 +358,9 @@ class _CodecStreamSession:
                     positive = [r for r in remaining if r > 0]
                     if not positive:
                         break
-                    if any(r >= max_step_frames for r in positive):
+                    if max_step_frames > 0 and any(
+                        r >= max_step_frames for r in positive
+                    ):
                         step_t = max_step_frames
                     else:
                         step_t = min(positive)
@@ -409,15 +442,33 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             )
         self._processor = processor
         self._codec = codec
+        self._codec_device = next(codec.parameters()).device
         self._stream_slots = int(stream_slots)
         self._stream_chunk_frames = int(stream_chunk_frames)
         self._default_initial_chunk_frames = max(
             0, min(int(initial_chunk_frames), int(stream_chunk_frames))
         )
         self._max_step_frames = int(max_step_frames)
+        self._nonstream_max_step_frames = _resolve_nonstream_max_step_frames(
+            max_step_frames
+        )
         self._offline_slots = max(int(max_batch_size), 1)
         self._n_vq = int(processor.model_config.n_vq)
         self._sample_rate = _resolve_sample_rate(processor)
+        self._nonstream_codec_path = _resolve_nonstream_codec_path()
+        if self._nonstream_codec_path == "direct_batch" and not hasattr(
+            self._codec, "batch_decode"
+        ):
+            raise RuntimeError(
+                "MOSS-TTS Local direct nonstream codec path requires "
+                "processor.audio_tokenizer.batch_decode"
+            )
+        logger.info(
+            "MOSS-TTS Local non-streaming codec path: %s "
+            "(nonstream_max_step_frames=%s)",
+            self._nonstream_codec_path,
+            self._nonstream_max_step_frames,
+        )
         self._session: _CodecStreamSession | None = None
         self._stream_states: dict[str, _LocalStreamState] = {}
         super().__init__(
@@ -820,18 +871,91 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
     ) -> list[torch.Tensor]:
         """Decode ``[T, >=n_vq]`` row tensors to fp32 CPU waveforms."""
         request_ids = request_ids or []
-        if self._session is None:
-            # Processor path opens its own streaming context; illegal once a
-            # session is live.
-            with _vocoder_scope(
-                "moss_tts_local.vocoder.nonstream_processor_decode",
+        if not codes_list:
+            return []
+        if self._session is not None or self._nonstream_codec_path == "session":
+            return self._decode_codes_rows_session(
+                codes_list,
                 request_ids=request_ids,
-                metadata={"decode_count": len(codes_list)},
-            ):
-                return [
-                    torch.as_tensor(wav).detach().to("cpu")
-                    for wav in self._processor.decode_audio_codes(codes_list)
-                ]
+                requested_path=self._nonstream_codec_path,
+            )
+        if self._nonstream_codec_path == "direct_batch":
+            return self._decode_codes_rows_direct_batch(
+                codes_list,
+                request_ids=request_ids,
+            )
+        return self._decode_codes_rows_processor(
+            codes_list,
+            request_ids=request_ids,
+        )
+
+    def _decode_codes_rows_processor(
+        self,
+        codes_list: list[torch.Tensor],
+        *,
+        request_ids: list[str],
+    ) -> list[torch.Tensor]:
+        # Processor path opens its own streaming context; illegal once a
+        # session is live.
+        with _vocoder_scope(
+            "moss_tts_local.vocoder.nonstream_processor_decode",
+            request_ids=request_ids,
+            metadata={
+                "decode_count": len(codes_list),
+                "requested_path": self._nonstream_codec_path,
+                "actual_path": "processor",
+            },
+        ):
+            return [
+                torch.as_tensor(wav).detach().to("cpu")
+                for wav in self._processor.decode_audio_codes(codes_list)
+            ]
+
+    def _decode_codes_rows_direct_batch(
+        self,
+        codes_list: list[torch.Tensor],
+        *,
+        request_ids: list[str],
+    ) -> list[torch.Tensor]:
+        channels_first = [
+            codes[:, : self._n_vq]
+            .transpose(0, 1)
+            .to(device=self._codec_device, dtype=torch.long)
+            .contiguous()
+            for codes in codes_list
+        ]
+        with _vocoder_scope(
+            "moss_tts_local.vocoder.nonstream_direct_batch_decode",
+            request_ids=request_ids,
+            metadata={
+                "decode_count": len(channels_first),
+                "requested_path": self._nonstream_codec_path,
+                "actual_path": "direct_batch",
+            },
+        ):
+            with torch.no_grad():
+                decoded = self._codec.batch_decode(channels_first)
+            audio = decoded.audio
+            audio_lengths = decoded.audio_lengths
+            if audio is None or audio_lengths is None:
+                raise RuntimeError(
+                    "MOSS-TTS Local direct codec decode returned no audio"
+                )
+            return [
+                audio[i, :, : int(audio_lengths[i].item())]
+                .detach()
+                .to("cpu", torch.float32)
+                .contiguous()
+                for i in range(len(channels_first))
+            ]
+
+    def _decode_codes_rows_session(
+        self,
+        codes_list: list[torch.Tensor],
+        *,
+        request_ids: list[str],
+        requested_path: str,
+    ) -> list[torch.Tensor]:
         channels_first = [
             codes[:, : self._n_vq].transpose(0, 1).contiguous() for codes in codes_list
         ]
@@ -840,12 +964,17 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         with _vocoder_scope(
             "moss_tts_local.vocoder.nonstream_session_decode",
             request_ids=request_ids,
-            metadata={"decode_count": len(channels_first)},
+            metadata={
+                "decode_count": len(channels_first),
+                "requested_path": requested_path,
+                "actual_path": "session",
+                "max_step_frames": int(self._nonstream_max_step_frames),
+            },
         ):
             with self._state_lock:
-                wavs = self._session.decode_offline(
+                wavs = self._ensure_session().decode_offline(
                     channels_first,
-                    max_step_frames=self._max_step_frames,
+                    max_step_frames=self._nonstream_max_step_frames,
                     request_ids=request_ids,
                 )
             return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]

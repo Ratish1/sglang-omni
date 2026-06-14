@@ -189,6 +189,7 @@ _MOSS_TTS_LOCAL_VOCODER_SCOPE_EVENTS = tuple(
         "moss_tts_local_vocoder_nonstream_batch_decode_rows",
         "moss_tts_local_vocoder_nonstream_batch_store_result",
         "moss_tts_local_vocoder_nonstream_processor_decode",
+        "moss_tts_local_vocoder_nonstream_direct_batch_decode",
         "moss_tts_local_vocoder_nonstream_session_decode",
     )
 )

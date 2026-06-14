@@ -146,6 +146,7 @@ non-streaming paths:
 - `moss_tts_local.vocoder.nonstream_batch.decode_rows`
 - `moss_tts_local.vocoder.nonstream_batch.store_result`
 - `moss_tts_local.vocoder.nonstream_processor_decode`
+- `moss_tts_local.vocoder.nonstream_direct_batch_decode`
 - `moss_tts_local.vocoder.nonstream_session_decode`
 
 These `torch.profiler.record_function` ranges are always entered in the debug
@@ -179,6 +180,16 @@ Set `SGLANG_MOSS_TTS_LOCAL_VOCODER_EVENTS=1` before server startup to mirror
 the native vocoder ranges into request-event JSONL. Use this with n8/n16
 profiling only; every streaming codec step emits shared-batch intervals for
 each participating request.
+
+Set `SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH=processor|direct_batch|session`
+before server startup to A/B the non-streaming MOSS-TTS Local code-to-waveform
+backend. `processor` preserves the checkpoint processor path and is the
+default. `direct_batch` calls the v2 audio tokenizer's native `batch_decode`
+directly while no streaming session is active. `session` forces the persistent
+offline streaming lane used after a streaming session exists. When using the
+session path, `SGLANG_MOSS_TTS_LOCAL_NONSTREAM_MAX_STEP_FRAMES` controls the
+offline chunk size; `0` means use the shortest remaining utterance segment for
+each step instead of imposing a fixed maximum.
 
 For trace export triage, use:
 
