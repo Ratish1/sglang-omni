@@ -387,8 +387,9 @@ async def _run_launcher_with_fake_runner(
     config: PipelineConfig,
     serve_mock: AsyncMock,
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[object, FastAPI]:
+) -> tuple[object, FastAPI, SimpleNamespace]:
     app = FastAPI()
+    profiler_calls = SimpleNamespace(starts=[], stops=[])
 
     from sglang_omni.serve import launcher
 
@@ -431,10 +432,10 @@ async def _run_launcher_with_fake_runner(
             del stage_control_endpoints
 
         async def broadcast_start(self, **kwargs) -> None:
-            del kwargs
+            profiler_calls.starts.append(kwargs)
 
         async def broadcast_stop(self, **kwargs) -> None:
-            del kwargs
+            profiler_calls.stops.append(kwargs)
 
     monkeypatch.setattr(launcher, "_find_available_port", lambda host, port: port)
     monkeypatch.setattr(launcher, "MultiProcessPipelineRunner", FakeRunner)
@@ -444,7 +445,7 @@ async def _run_launcher_with_fake_runner(
 
     await launcher._run_server(config, port=8000)
     assert runner_ref is not None
-    return runner_ref, app
+    return runner_ref, app, profiler_calls
 
 
 @pytest.mark.asyncio
@@ -455,7 +456,7 @@ async def test_launcher_uses_runner_and_mounts_profiler_routes(
     config = _make_config(tmp_path)
     server_serve = AsyncMock(return_value=None)
 
-    runner, app = await _run_launcher_with_fake_runner(
+    runner, app, profiler_calls = await _run_launcher_with_fake_runner(
         config=config,
         serve_mock=server_serve,
         monkeypatch=monkeypatch,
@@ -476,6 +477,10 @@ async def test_launcher_uses_runner_and_mounts_profiler_routes(
             stop_resp = client.post("/stop_profile", json={})
         assert start_resp.status_code == 200
         assert stop_resp.status_code == 200
+        assert profiler_calls.starts
+        assert profiler_calls.starts[0]["enable_torch"] is False
+        assert profiler_calls.starts[0]["event_dir"] == str(tmp_path / "events")
+        assert profiler_calls.stops == [{"run_id": None}]
     finally:
         rec = get_recorder()
         if rec.is_active():
