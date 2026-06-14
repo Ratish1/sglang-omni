@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -28,6 +30,8 @@ from sglang_omni.models.tts_streaming import (
     resolve_initial_codec_chunk_frames,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
+from sglang_omni.profiler.trace_ranges import profile_range
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
@@ -36,6 +40,81 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 _SOURCE_HINT = "MOSS-TTS Local"
+_VOCODER_EVENTS_ENV = "SGLANG_MOSS_TTS_LOCAL_VOCODER_EVENTS"
+
+
+def _env_enabled(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _active_event_recorder() -> Any | None:
+    recorder = _get_event_recorder()
+    return recorder if recorder.is_active() else None
+
+
+def _event_base(name: str) -> str:
+    return name.replace(".", "_")
+
+
+def _emit_vocoder_event(
+    recorder: Any | None,
+    request_ids: list[str] | tuple[str, ...],
+    event_name: str,
+    metadata: Mapping[str, Any] | None,
+) -> None:
+    if recorder is None:
+        return
+    event_metadata = dict(metadata or {})
+    for request_id in request_ids:
+        recorder.emit(
+            request_id=request_id,
+            stage=None,
+            event_name=event_name,
+            metadata=event_metadata,
+        )
+
+
+@contextmanager
+def _vocoder_scope(
+    name: str,
+    *,
+    request_ids: list[str] | tuple[str, ...] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+):
+    request_ids = tuple(request_ids or ())
+    recorder = _active_event_recorder()
+    emit_events = (
+        bool(request_ids) and recorder is not None and _env_enabled(_VOCODER_EVENTS_ENV)
+    )
+    event_metadata = dict(metadata or {})
+    event_metadata.update(
+        {
+            "scope": name,
+            "shared_batch_interval": True,
+            "vocoder_scope": True,
+        }
+    )
+    if emit_events:
+        _emit_vocoder_event(
+            recorder,
+            request_ids,
+            f"{_event_base(name)}_start",
+            event_metadata,
+        )
+    try:
+        with profile_range(name):
+            yield
+    finally:
+        if emit_events:
+            _emit_vocoder_event(
+                recorder,
+                request_ids,
+                f"{_event_base(name)}_end",
+                event_metadata,
+            )
 
 
 def _resolve_sample_rate(processor: Any) -> int:
@@ -117,7 +196,13 @@ class _CodecStreamSession:
         with torch.no_grad():
             self._codec.apply(_reset)
 
-    def step(self, slot_codes: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+    def step(
+        self,
+        slot_codes: dict[int, torch.Tensor],
+        *,
+        request_ids: list[str] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[int, torch.Tensor]:
         """Advance the participating slots by one uniform-length step.
 
         ``slot_codes`` maps slot -> ``[n_vq, T]`` codes with the SAME ``T``
@@ -132,70 +217,148 @@ class _CodecStreamSession:
                 f"streaming step requires a uniform length, got {sorted(step_lengths)}"
             )
         (step_t,) = step_lengths
-        n_vq = int(next(iter(slot_codes.values())).shape[0])
-        codes_step = torch.zeros(
-            n_vq, self._batch_size, step_t, dtype=torch.long, device=self._device
-        )
-        codes_lengths = torch.zeros(
-            self._batch_size, dtype=torch.long, device=self._device
-        )
-        exec_mask = torch.zeros(self._batch_size, dtype=torch.bool, device=self._device)
-        for slot, codes in slot_codes.items():
-            codes_step[:, slot, :] = codes.to(device=self._device, dtype=torch.long)
-            codes_lengths[slot] = step_t
-            exec_mask[slot] = True
-        with torch.no_grad():
-            self._codec._set_streaming_exec_mask(exec_mask)
-            result = self._codec._decode_frame(codes_step, codes_lengths)
-        # One batched D2H per step, active slots only.
-        slots = list(slot_codes)
-        audio_cpu = result.audio[slots].detach().to("cpu", torch.float32)
-        lengths_cpu = result.audio_lengths[slots].detach().to("cpu")
-        out: dict[int, torch.Tensor] = {}
-        for index, slot in enumerate(slots):
-            n_samples = int(lengths_cpu[index])
-            out[slot] = audio_cpu[index, :, :n_samples]
-        return out
+        request_ids = request_ids or []
+        scope_metadata = {
+            "participant_count": len(slot_codes),
+            "step_frames": int(step_t),
+            "batch_size": self._batch_size,
+            "stream_slots": self._stream_slots,
+            "offline_slots": self._offline_slots,
+            **dict(metadata or {}),
+        }
+        with _vocoder_scope(
+            "moss_tts_local.vocoder.stream_step",
+            request_ids=request_ids,
+            metadata=scope_metadata,
+        ):
+            with _vocoder_scope(
+                "moss_tts_local.vocoder.stream_step.build_inputs",
+                request_ids=request_ids,
+                metadata=scope_metadata,
+            ):
+                n_vq = int(next(iter(slot_codes.values())).shape[0])
+                codes_step = torch.zeros(
+                    n_vq,
+                    self._batch_size,
+                    step_t,
+                    dtype=torch.long,
+                    device=self._device,
+                )
+                codes_lengths = torch.zeros(
+                    self._batch_size, dtype=torch.long, device=self._device
+                )
+                exec_mask = torch.zeros(
+                    self._batch_size, dtype=torch.bool, device=self._device
+                )
+                for slot, codes in slot_codes.items():
+                    codes_step[:, slot, :] = codes.to(
+                        device=self._device, dtype=torch.long
+                    )
+                    codes_lengths[slot] = step_t
+                    exec_mask[slot] = True
+            with torch.no_grad():
+                with _vocoder_scope(
+                    "moss_tts_local.vocoder.stream_step.set_exec_mask",
+                    request_ids=request_ids,
+                    metadata=scope_metadata,
+                ):
+                    self._codec._set_streaming_exec_mask(exec_mask)
+                with _vocoder_scope(
+                    "moss_tts_local.vocoder.stream_step.decode_frame",
+                    request_ids=request_ids,
+                    metadata=scope_metadata,
+                ):
+                    result = self._codec._decode_frame(codes_step, codes_lengths)
+            # One batched D2H per step, active slots only.
+            slots = list(slot_codes)
+            with _vocoder_scope(
+                "moss_tts_local.vocoder.stream_step.d2h",
+                request_ids=request_ids,
+                metadata=scope_metadata,
+            ):
+                audio_cpu = result.audio[slots].detach().to("cpu", torch.float32)
+                lengths_cpu = result.audio_lengths[slots].detach().to("cpu")
+            out: dict[int, torch.Tensor] = {}
+            with _vocoder_scope(
+                "moss_tts_local.vocoder.stream_step.slice_outputs",
+                request_ids=request_ids,
+                metadata=scope_metadata,
+            ):
+                for index, slot in enumerate(slots):
+                    n_samples = int(lengths_cpu[index])
+                    out[slot] = audio_cpu[index, :, :n_samples]
+            return out
 
     def decode_offline(
-        self, codes_list: list[torch.Tensor], *, max_step_frames: int
+        self,
+        codes_list: list[torch.Tensor],
+        *,
+        max_step_frames: int,
+        request_ids: list[str] | None = None,
     ) -> list[torch.Tensor]:
         """Decode complete utterances ``[n_vq, T]`` through the offline lane.
 
         Replays the codec's own chunked ``batch_decode`` step plan so the
         output matches the non-session ``processor.decode_audio_codes`` path.
         """
-        wavs: list[torch.Tensor] = []
-        for wave_start in range(0, len(codes_list), self._offline_slots):
-            wave = codes_list[wave_start : wave_start + self._offline_slots]
-            slots = [self._stream_slots + i for i in range(len(wave))]
-            self._reset_slots(slots)
-            cursors = [0] * len(wave)
-            chunks: list[list[torch.Tensor]] = [[] for _ in wave]
-            while True:
-                remaining = [
-                    int(codes.shape[1]) - cur for codes, cur in zip(wave, cursors)
-                ]
-                positive = [r for r in remaining if r > 0]
-                if not positive:
-                    break
-                if any(r >= max_step_frames for r in positive):
-                    step_t = max_step_frames
-                else:
-                    step_t = min(positive)
-                plan = {
-                    slots[i]: wave[i][:, cursors[i] : cursors[i] + step_t]
-                    for i, rem in enumerate(remaining)
-                    if rem >= step_t
-                }
-                decoded = self.step(plan)
-                for i in range(len(wave)):
-                    if slots[i] in plan:
-                        chunks[i].append(decoded[slots[i]])
-                        cursors[i] += step_t
-            for item_chunks in chunks:
-                wavs.append(torch.cat(item_chunks, dim=-1))
-        return wavs
+        request_ids = request_ids or []
+        metadata = {
+            "decode_count": len(codes_list),
+            "max_step_frames": int(max_step_frames),
+            "offline_slots": self._offline_slots,
+        }
+        with _vocoder_scope(
+            "moss_tts_local.vocoder.offline_decode",
+            request_ids=request_ids,
+            metadata=metadata,
+        ):
+            wavs: list[torch.Tensor] = []
+            for wave_start in range(0, len(codes_list), self._offline_slots):
+                wave = codes_list[wave_start : wave_start + self._offline_slots]
+                wave_request_ids = request_ids[wave_start : wave_start + len(wave)]
+                slots = [self._stream_slots + i for i in range(len(wave))]
+                self._reset_slots(slots)
+                cursors = [0] * len(wave)
+                chunks: list[list[torch.Tensor]] = [[] for _ in wave]
+                while True:
+                    remaining = [
+                        int(codes.shape[1]) - cur for codes, cur in zip(wave, cursors)
+                    ]
+                    positive = [r for r in remaining if r > 0]
+                    if not positive:
+                        break
+                    if any(r >= max_step_frames for r in positive):
+                        step_t = max_step_frames
+                    else:
+                        step_t = min(positive)
+                    plan = {
+                        slots[i]: wave[i][:, cursors[i] : cursors[i] + step_t]
+                        for i, rem in enumerate(remaining)
+                        if rem >= step_t
+                    }
+                    plan_request_ids = [
+                        wave_request_ids[i]
+                        for i, rem in enumerate(remaining)
+                        if rem >= step_t and i < len(wave_request_ids)
+                    ]
+                    decoded = self.step(
+                        plan,
+                        request_ids=plan_request_ids,
+                        metadata={
+                            **metadata,
+                            "offline_step": True,
+                            "wave_start": int(wave_start),
+                            "step_frames": int(step_t),
+                            "participant_count": len(plan),
+                        },
+                    )
+                    for i in range(len(wave)):
+                        if slots[i] in plan:
+                            chunks[i].append(decoded[slots[i]])
+                            cursors[i] += step_t
+                for item_chunks in chunks:
+                    wavs.append(torch.cat(item_chunks, dim=-1))
+            return wavs
 
 
 @dataclass
@@ -306,82 +469,103 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
     def on_stream_chunk(
         self, request_id: str, item: StreamItem
     ) -> list[OutgoingMessage]:
-        state = self._stream_states.setdefault(request_id, _LocalStreamState())
-        self._latch_stream_metadata(request_id, state, item.metadata)
+        with _vocoder_scope(
+            "moss_tts_local.vocoder.stream_chunk",
+            request_ids=[request_id],
+            metadata={"chunk_id": int(item.chunk_id)},
+        ):
+            state = self._stream_states.setdefault(request_id, _LocalStreamState())
+            self._latch_stream_metadata(request_id, state, item.metadata)
 
-        row = item.data
-        if not isinstance(row, torch.Tensor):
-            raise TypeError(
-                f"MOSS-TTS Local stream chunk for {request_id!r} must carry a "
-                f"torch.Tensor, got {type(row).__name__}"
-            )
-        row = row.to(dtype=torch.long)
-        n_vq = state.n_vq if state.n_vq is not None else self._n_vq
-        if row.ndim != 1 or int(row.shape[0]) < n_vq + 1:
-            raise ValueError(
-                f"MOSS-TTS Local stream chunk must be a 1-D row with at least "
-                f"{n_vq + 1} channels (text + codes), got {tuple(row.shape)}"
-            )
-        # Row layout matches output_rows: [text_token, code_0, ..., code_{n_vq-1}].
-        state.pending.append(row[1 : 1 + n_vq])
-        self._ensure_slot(state)
-        self._pump_streams()
+            row = item.data
+            if not isinstance(row, torch.Tensor):
+                raise TypeError(
+                    f"MOSS-TTS Local stream chunk for {request_id!r} must carry a "
+                    f"torch.Tensor, got {type(row).__name__}"
+                )
+            row = row.to(dtype=torch.long)
+            n_vq = state.n_vq if state.n_vq is not None else self._n_vq
+            if row.ndim != 1 or int(row.shape[0]) < n_vq + 1:
+                raise ValueError(
+                    f"MOSS-TTS Local stream chunk must be a 1-D row with at least "
+                    f"{n_vq + 1} channels (text + codes), got {tuple(row.shape)}"
+                )
+            # Row layout matches output_rows: [text_token, code_0, ..., code_{n_vq-1}].
+            state.pending.append(row[1 : 1 + n_vq])
+            self._ensure_slot(state)
+            self._pump_streams(trigger_request_id=request_id)
         return []
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
-        payload = self._stream_payloads[request_id]
-        state = self._stream_states.setdefault(request_id, _LocalStreamState())
+        with _vocoder_scope(
+            "moss_tts_local.vocoder.stream_done",
+            request_ids=[request_id],
+            metadata={},
+        ):
+            payload = self._stream_payloads[request_id]
+            state = self._stream_states.setdefault(request_id, _LocalStreamState())
 
-        audio_parts: list[torch.Tensor] = []
-        if state.slot is None and state.pending:
-            # Slot-starved: every frame is still buffered, decode offline.
-            codes = torch.stack(state.pending, dim=1)
-            state.pending = []
-            audio_parts.extend(
-                self._ensure_session().decode_offline(
-                    [codes], max_step_frames=self._max_step_frames
+            audio_parts: list[torch.Tensor] = []
+            if state.slot is None and state.pending:
+                # Slot-starved: every frame is still buffered, decode offline.
+                codes = torch.stack(state.pending, dim=1)
+                state.pending = []
+                audio_parts.extend(
+                    self._ensure_session().decode_offline(
+                        [codes],
+                        max_step_frames=self._max_step_frames,
+                        request_ids=[request_id],
+                    )
+                )
+            elif state.slot is not None:
+                session = self._ensure_session()
+                while state.pending:
+                    step_t = min(len(state.pending), self._max_step_frames)
+                    codes = torch.stack(state.pending[:step_t], dim=1)
+                    del state.pending[:step_t]
+                    audio_parts.append(
+                        session.step(
+                            {state.slot: codes},
+                            request_ids=[request_id],
+                            metadata={
+                                "final_flush": True,
+                                "step_frames": int(step_t),
+                            },
+                        )[state.slot]
+                    )
+                session.release(state.slot)
+                state.slot = None
+
+            if not audio_parts and not state.emitted_any:
+                fallback = self._decode_payload_codes(payload)
+                if fallback is not None:
+                    audio_parts.append(fallback)
+
+            messages: list[OutgoingMessage] = []
+            if audio_parts:
+                audio = torch.cat(audio_parts, dim=-1)
+                state.emitted_any = True
+                messages.append(self._chunk_message(request_id, audio))
+
+            final_data: dict[str, Any] = {
+                "modality": "audio",
+                "sample_rate": self._sample_rate,
+            }
+            usage = _build_usage(MossTTSLocalState.from_dict(payload.data))
+            if usage is not None:
+                final_data["usage"] = usage
+            messages.append(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="result",
+                    data=StagePayload(
+                        request_id=payload.request_id,
+                        request=payload.request,
+                        data=final_data,
+                    ),
                 )
             )
-        elif state.slot is not None:
-            session = self._ensure_session()
-            while state.pending:
-                step_t = min(len(state.pending), self._max_step_frames)
-                codes = torch.stack(state.pending[:step_t], dim=1)
-                del state.pending[:step_t]
-                audio_parts.append(session.step({state.slot: codes})[state.slot])
-            session.release(state.slot)
-            state.slot = None
-
-        if not audio_parts and not state.emitted_any:
-            fallback = self._decode_payload_codes(payload)
-            if fallback is not None:
-                audio_parts.append(fallback)
-
-        messages: list[OutgoingMessage] = []
-        if audio_parts:
-            audio = torch.cat(audio_parts, dim=-1)
-            state.emitted_any = True
-            messages.append(self._chunk_message(request_id, audio))
-
-        final_data: dict[str, Any] = {
-            "modality": "audio",
-            "sample_rate": self._sample_rate,
-        }
-        usage = _build_usage(MossTTSLocalState.from_dict(payload.data))
-        if usage is not None:
-            final_data["usage"] = usage
-        messages.append(
-            OutgoingMessage(
-                request_id=request_id,
-                type="result",
-                data=StagePayload(
-                    request_id=payload.request_id,
-                    request=payload.request,
-                    data=final_data,
-                ),
-            )
-        )
-        return messages
+            return messages
 
     def clear_stream_state(self, request_id: str) -> None:
         state = self._stream_states.pop(request_id, None)
@@ -457,7 +641,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         else:
             state.threshold = self._stream_chunk_frames
 
-    def _pump_streams(self) -> None:
+    def _pump_streams(self, *, trigger_request_id: str | None = None) -> None:
         """Decode every stream whose buffer crossed its threshold.
 
         A step costs one decoder forward over the full slot width, so a due
@@ -496,10 +680,35 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 self._max_step_frames,
             )
             plan: dict[int, torch.Tensor] = {}
+            participant_ids: list[str] = []
             for _, state in participants:
                 plan[state.slot] = torch.stack(state.pending[:step_t], dim=1)
+            for request_id, _ in participants:
+                participant_ids.append(request_id)
+            metadata = {
+                "participant_count": len(participants),
+                "slotted_count": len(slotted),
+                "due_count": len(due),
+                "step_frames": int(step_t),
+                "join_floor": int(join_floor),
+                "trigger_request_id": trigger_request_id,
+                "stream_slots_used": sum(
+                    1
+                    for _, state in self._stream_states.items()
+                    if state.slot is not None
+                ),
+            }
             try:
-                decoded = self._ensure_session().step(plan)
+                with _vocoder_scope(
+                    "moss_tts_local.vocoder.pump_streams",
+                    request_ids=participant_ids,
+                    metadata=metadata,
+                ):
+                    decoded = self._ensure_session().step(
+                        plan,
+                        request_ids=participant_ids,
+                        metadata=metadata,
+                    )
             except Exception as exc:
                 logger.exception(
                     "MOSS-TTS Local streaming decode step failed; aborting %d "
@@ -528,13 +737,18 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         return len(state.pending) >= floor
 
     def _chunk_message(self, request_id: str, audio: torch.Tensor) -> OutgoingMessage:
-        data = audio_waveform_payload(
-            audio.detach().to("cpu", torch.float32),
-            sample_rate=self._sample_rate,
-            modality="audio",
-            source_hint=f"{_SOURCE_HINT} streaming",
-            keep_channels=True,
-        )
+        with _vocoder_scope(
+            "moss_tts_local.vocoder.chunk_message",
+            request_ids=[request_id],
+            metadata={"samples": int(audio.shape[-1]) if audio.ndim else 0},
+        ):
+            data = audio_waveform_payload(
+                audio.detach().to("cpu", torch.float32),
+                sample_rate=self._sample_rate,
+                modality="audio",
+                source_hint=f"{_SOURCE_HINT} streaming",
+                keep_channels=True,
+            )
         return OutgoingMessage(
             request_id=request_id,
             type="stream",
@@ -550,9 +764,16 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         if rows.numel() == 0:
             return None
         codes = rows[:, : self._n_vq].transpose(0, 1).contiguous()
-        return self._ensure_session().decode_offline(
-            [codes], max_step_frames=self._max_step_frames
-        )[0]
+        with _vocoder_scope(
+            "moss_tts_local.vocoder.decode_payload_codes",
+            request_ids=[payload.request_id],
+            metadata={"frames": int(codes.shape[1])},
+        ):
+            return self._ensure_session().decode_offline(
+                [codes],
+                max_step_frames=self._max_step_frames,
+                request_ids=[payload.request_id],
+            )[0]
 
     # ------------------------------------------------------------------
     # Non-streaming path
@@ -591,39 +812,96 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             payload.data["usage"] = usage
         return payload
 
-    def _decode_codes_rows(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
+    def _decode_codes_rows(
+        self,
+        codes_list: list[torch.Tensor],
+        *,
+        request_ids: list[str] | None = None,
+    ) -> list[torch.Tensor]:
         """Decode ``[T, >=n_vq]`` row tensors to fp32 CPU waveforms."""
+        request_ids = request_ids or []
         if self._session is None:
             # Processor path opens its own streaming context; illegal once a
             # session is live.
-            return [
-                torch.as_tensor(wav).detach().to("cpu")
-                for wav in self._processor.decode_audio_codes(codes_list)
-            ]
+            with _vocoder_scope(
+                "moss_tts_local.vocoder.nonstream_processor_decode",
+                request_ids=request_ids,
+                metadata={"decode_count": len(codes_list)},
+            ):
+                return [
+                    torch.as_tensor(wav).detach().to("cpu")
+                    for wav in self._processor.decode_audio_codes(codes_list)
+                ]
         channels_first = [
             codes[:, : self._n_vq].transpose(0, 1).contiguous() for codes in codes_list
         ]
         # abort() resets slots under _state_lock from other threads; serialize
         # every session access on the same lock.
-        with self._state_lock:
-            wavs = self._session.decode_offline(
-                channels_first, max_step_frames=self._max_step_frames
-            )
-        return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]
+        with _vocoder_scope(
+            "moss_tts_local.vocoder.nonstream_session_decode",
+            request_ids=request_ids,
+            metadata={"decode_count": len(channels_first)},
+        ):
+            with self._state_lock:
+                wavs = self._session.decode_offline(
+                    channels_first,
+                    max_step_frames=self._max_step_frames,
+                    request_ids=request_ids,
+                )
+            return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]
 
     def _vocode_batch(self, payloads: list[StagePayload]) -> list[StagePayload]:
-        prepared = [self._prepare_codes(payload) for payload in payloads]
-        codes_list = [codes for _, codes in prepared if codes is not None]
-        decoded = iter(self._decode_codes_rows(codes_list)) if codes_list else iter(())
-        results = []
-        for payload, (state, codes) in zip(payloads, prepared):
-            if codes is None:
-                state.audio_codes = None
-                payload.data = state.to_dict()
-                results.append(payload)
-                continue
-            results.append(self._store_vocoder_result(payload, state, next(decoded)))
-        return results
+        request_ids = [payload.request_id for payload in payloads]
+        with _vocoder_scope(
+            "moss_tts_local.vocoder.nonstream_batch",
+            request_ids=request_ids,
+            metadata={"batch_size": len(payloads)},
+        ):
+            with _vocoder_scope(
+                "moss_tts_local.vocoder.nonstream_batch.prepare_codes",
+                request_ids=request_ids,
+                metadata={"batch_size": len(payloads)},
+            ):
+                prepared = [self._prepare_codes(payload) for payload in payloads]
+                codes_list = [codes for _, codes in prepared if codes is not None]
+            with _vocoder_scope(
+                "moss_tts_local.vocoder.nonstream_batch.decode_rows",
+                request_ids=request_ids,
+                metadata={
+                    "batch_size": len(payloads),
+                    "decode_count": len(codes_list),
+                },
+            ):
+                decoded = (
+                    iter(
+                        self._decode_codes_rows(
+                            codes_list,
+                            request_ids=[
+                                payload.request_id
+                                for payload, (_, codes) in zip(payloads, prepared)
+                                if codes is not None
+                            ],
+                        )
+                    )
+                    if codes_list
+                    else iter(())
+                )
+            results = []
+            for payload, (state, codes) in zip(payloads, prepared):
+                if codes is None:
+                    state.audio_codes = None
+                    payload.data = state.to_dict()
+                    results.append(payload)
+                    continue
+                with _vocoder_scope(
+                    "moss_tts_local.vocoder.nonstream_batch.store_result",
+                    request_ids=[payload.request_id],
+                    metadata={},
+                ):
+                    results.append(
+                        self._store_vocoder_result(payload, state, next(decoded))
+                    )
+            return results
 
     def _vocode(self, payload: StagePayload) -> StagePayload:
         return self._vocode_batch([payload])[0]

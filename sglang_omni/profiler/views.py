@@ -169,18 +169,46 @@ _MOSS_TTS_LOCAL_FINE_FRAME_SCOPE_EVENTS = tuple(
     )
 )
 
+_MOSS_TTS_LOCAL_VOCODER_SCOPE_EVENTS = tuple(
+    (f"{name}_start", f"{name}_end")
+    for name in (
+        "moss_tts_local_vocoder_stream_chunk",
+        "moss_tts_local_vocoder_stream_done",
+        "moss_tts_local_vocoder_pump_streams",
+        "moss_tts_local_vocoder_stream_step",
+        "moss_tts_local_vocoder_stream_step_build_inputs",
+        "moss_tts_local_vocoder_stream_step_set_exec_mask",
+        "moss_tts_local_vocoder_stream_step_decode_frame",
+        "moss_tts_local_vocoder_stream_step_d2h",
+        "moss_tts_local_vocoder_stream_step_slice_outputs",
+        "moss_tts_local_vocoder_chunk_message",
+        "moss_tts_local_vocoder_decode_payload_codes",
+        "moss_tts_local_vocoder_offline_decode",
+        "moss_tts_local_vocoder_nonstream_batch",
+        "moss_tts_local_vocoder_nonstream_batch_prepare_codes",
+        "moss_tts_local_vocoder_nonstream_batch_decode_rows",
+        "moss_tts_local_vocoder_nonstream_batch_store_result",
+        "moss_tts_local_vocoder_nonstream_processor_decode",
+        "moss_tts_local_vocoder_nonstream_session_decode",
+    )
+)
+
 _STAGE_INTERVAL_EVENTS = (
-    ("stage_input_received", "stage_complete"),
-    ("encoder_start", "encoder_end"),
-    ("preprocess_start", "preprocess_end"),
-    ("scheduler_request_build_start", "scheduler_request_build_end"),
-    ("scheduler_prefill_start", "stage_first_stream_chunk_sent"),
-    ("scheduler_prefill_start", "scheduler_first_emit"),
-    ("moss_tts_local_collect_frame_start", "moss_tts_local_collect_frame_end"),
-    ("moss_tts_local_frame_decode_start", "moss_tts_local_frame_decode_end"),
-    ("moss_tts_local_vocoder_batch_start", "moss_tts_local_vocoder_batch_end"),
-    ("moss_tts_local_vocoder_decode_start", "moss_tts_local_vocoder_decode_end"),
-) + _MOSS_TTS_LOCAL_FINE_FRAME_SCOPE_EVENTS
+    (
+        ("stage_input_received", "stage_complete"),
+        ("encoder_start", "encoder_end"),
+        ("preprocess_start", "preprocess_end"),
+        ("scheduler_request_build_start", "scheduler_request_build_end"),
+        ("scheduler_prefill_start", "stage_first_stream_chunk_sent"),
+        ("scheduler_prefill_start", "scheduler_first_emit"),
+        ("moss_tts_local_collect_frame_start", "moss_tts_local_collect_frame_end"),
+        ("moss_tts_local_frame_decode_start", "moss_tts_local_frame_decode_end"),
+        ("moss_tts_local_vocoder_batch_start", "moss_tts_local_vocoder_batch_end"),
+        ("moss_tts_local_vocoder_decode_start", "moss_tts_local_vocoder_decode_end"),
+    )
+    + _MOSS_TTS_LOCAL_FINE_FRAME_SCOPE_EVENTS
+    + _MOSS_TTS_LOCAL_VOCODER_SCOPE_EVENTS
+)
 
 
 @dataclass

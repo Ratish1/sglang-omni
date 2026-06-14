@@ -126,12 +126,27 @@ forward, post hooks, async launch/resolve, event waits, stream emission, and
 result processing. These give a trace ladder from scheduler batch selection
 down to the MOSS frame loop.
 
-The MOSS-TTS Local vocoder emits trace ranges for:
+The MOSS-TTS Local vocoder emits trace ranges for both streaming and
+non-streaming paths:
 
-- `moss_tts_local.vocoder.prepare_codes`
-- `moss_tts_local.vocoder.decode_audio_codes`
-- `moss_tts_local.vocoder.wav_to_cpu`
-- `moss_tts_local.vocoder.store_result`
+- `moss_tts_local.vocoder.stream_chunk`
+- `moss_tts_local.vocoder.pump_streams`
+- `moss_tts_local.vocoder.stream_step`
+- `moss_tts_local.vocoder.stream_step.build_inputs`
+- `moss_tts_local.vocoder.stream_step.set_exec_mask`
+- `moss_tts_local.vocoder.stream_step.decode_frame`
+- `moss_tts_local.vocoder.stream_step.d2h`
+- `moss_tts_local.vocoder.stream_step.slice_outputs`
+- `moss_tts_local.vocoder.chunk_message`
+- `moss_tts_local.vocoder.stream_done`
+- `moss_tts_local.vocoder.offline_decode`
+- `moss_tts_local.vocoder.decode_payload_codes`
+- `moss_tts_local.vocoder.nonstream_batch`
+- `moss_tts_local.vocoder.nonstream_batch.prepare_codes`
+- `moss_tts_local.vocoder.nonstream_batch.decode_rows`
+- `moss_tts_local.vocoder.nonstream_batch.store_result`
+- `moss_tts_local.vocoder.nonstream_processor_decode`
+- `moss_tts_local.vocoder.nonstream_session_decode`
 
 These `torch.profiler.record_function` ranges are always entered in the debug
 branch and are intended to split the post-backbone boundary into graph replay,
@@ -159,6 +174,11 @@ wrap checkpoint remote-code vocoder methods with additional ranges. The wrapper
 is diagnostic-only and currently targets the processor `decode_audio_codes`
 method plus common audio-tokenizer decode helpers when present. Use it only for
 small n8/n16 profiling windows.
+
+Set `SGLANG_MOSS_TTS_LOCAL_VOCODER_EVENTS=1` before server startup to mirror
+the native vocoder ranges into request-event JSONL. Use this with n8/n16
+profiling only; every streaming codec step emits shared-batch intervals for
+each participating request.
 
 For trace export triage, use:
 

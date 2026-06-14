@@ -464,6 +464,80 @@ def test_stage_breakdown_covers_moss_tts_local_fine_frame_intervals(
     assert by_key[feedback_embed_key].total_ms == 0.6
 
 
+def test_stage_breakdown_covers_moss_tts_local_vocoder_scope_intervals(
+    tmp_path: Path,
+) -> None:
+    events = [
+        _ev("r1", "vocoder", "moss_tts_local_vocoder_stream_step_start", 0),
+        _ev(
+            "r1",
+            "vocoder",
+            "moss_tts_local_vocoder_stream_step_decode_frame_start",
+            100_000,
+        ),
+        _ev(
+            "r1",
+            "vocoder",
+            "moss_tts_local_vocoder_stream_step_decode_frame_end",
+            900_000,
+        ),
+        _ev(
+            "r1",
+            "vocoder",
+            "moss_tts_local_vocoder_stream_step_d2h_start",
+            1_000_000,
+        ),
+        _ev(
+            "r1",
+            "vocoder",
+            "moss_tts_local_vocoder_stream_step_d2h_end",
+            1_300_000,
+        ),
+        _ev("r1", "vocoder", "moss_tts_local_vocoder_stream_step_end", 1_500_000),
+        _ev(
+            "r1",
+            "vocoder",
+            "moss_tts_local_vocoder_chunk_message_start",
+            1_600_000,
+        ),
+        _ev(
+            "r1",
+            "vocoder",
+            "moss_tts_local_vocoder_chunk_message_end",
+            1_900_000,
+        ),
+    ]
+    _write_events(tmp_path / "events_x.jsonl", events)
+
+    rows = stage_breakdown(source=tmp_path)
+    by_key = {(r.stage, r.interval_name): r for r in rows}
+
+    step_key = (
+        "vocoder",
+        "moss_tts_local_vocoder_stream_step_start"
+        "->moss_tts_local_vocoder_stream_step_end",
+    )
+    decode_key = (
+        "vocoder",
+        "moss_tts_local_vocoder_stream_step_decode_frame_start"
+        "->moss_tts_local_vocoder_stream_step_decode_frame_end",
+    )
+    d2h_key = (
+        "vocoder",
+        "moss_tts_local_vocoder_stream_step_d2h_start"
+        "->moss_tts_local_vocoder_stream_step_d2h_end",
+    )
+    chunk_key = (
+        "vocoder",
+        "moss_tts_local_vocoder_chunk_message_start"
+        "->moss_tts_local_vocoder_chunk_message_end",
+    )
+    assert by_key[step_key].total_ms == 1.5
+    assert by_key[decode_key].total_ms == 0.8
+    assert by_key[d2h_key].total_ms == 0.3
+    assert by_key[chunk_key].total_ms == 0.3
+
+
 def test_stage_breakdown_emits_both_intervals_sharing_opener(
     tmp_path: Path,
 ) -> None:
