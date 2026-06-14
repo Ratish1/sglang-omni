@@ -145,6 +145,28 @@ and `embeds` directly instead of materializing an `emit_indices` tensor and
 running multiple `index_select` operations. Metadata includes
 `all_rows_emit=true/false`.
 
+Set `SGLANG_OMNI_NVTX_RANGES=1` before server startup to mirror these
+`record_function` ranges into NVTX ranges. This is intended for Perfetto/Nsight
+sync attribution when Chrome trace export drops user labels. Keep it off for
+normal speed/WER runs.
+
+Set `SGLANG_MOSS_TTS_LOCAL_VOCODER_DEEP_PROFILE=1` before server startup to
+wrap checkpoint remote-code vocoder methods with additional ranges. The wrapper
+is diagnostic-only and currently targets the processor `decode_audio_codes`
+method plus common audio-tokenizer decode helpers when present. Use it only for
+small n8/n16 profiling windows.
+
+For trace export triage, use:
+
+```bash
+python scripts/debug/trace_summary.py \
+  /path/to/trace.json.gz \
+  --out-dir /path/to/reports
+```
+
+The script writes `trace_summary.txt`, `trace_summary.json`, and
+`perfetto_sync_queries.sql`.
+
 If Chrome trace export drops user `record_function` names, set
 `SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1` for a scoped run. This emits
 matching request-event intervals for the same scopes, using sanitized event

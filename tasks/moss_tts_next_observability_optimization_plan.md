@@ -575,3 +575,50 @@ Remote validation gate:
 - Accept only if completion/failure count is unchanged, WER is neutral within
   observed baseline variance, and `feedback_write` or its child scopes move in
   the expected direction.
+
+## Vocode/Trace Autopsy Pass 2026-06-14
+
+Focused validation showed the all-emitted feedback-write fast path was real:
+`feedback_write` dropped from roughly 3.8 ms to 0.9 ms, while full SeedTTS
+speed improved without WER regression. The remaining end-to-end bottleneck is
+the MOSS vocoder/code2wav path; `vocoder_decode` is nearly the whole vocoder
+batch interval.
+
+Implemented on the debug branch:
+
+- Added `sglang_omni.profiler.trace_ranges.profile_range(...)`, which emits
+  PyTorch `record_function` ranges and, when `SGLANG_OMNI_NVTX_RANGES=1`, NVTX
+  ranges with the same names.
+- Routed MOSS Local AR `_profile_scope(...)` through `profile_range(...)` so
+  all existing AR scopes can appear in NVTX-aware tooling without changing
+  their request-event behavior.
+- Routed MOSS Local vocoder trace ranges through `profile_range(...)`.
+- Added `SGLANG_MOSS_TTS_LOCAL_VOCODER_DEEP_PROFILE=1` as a startup-only
+  diagnostic wrapper for checkpoint remote-code methods:
+  - processor `decode_audio_codes`;
+  - common audio-tokenizer decode helpers when present;
+  - common audio-tokenizer model decode helpers when present.
+- Added `scripts/debug/trace_summary.py` to summarize PyTorch Chrome traces and
+  emit:
+  - `trace_summary.txt`;
+  - `trace_summary.json`;
+  - `perfetto_sync_queries.sql`.
+
+Mechanical contract:
+
+- Normal serving remains unchanged when both env vars are unset.
+- NVTX and remote-code wrappers are profiling tools only; do not use them for
+  final speed/WER measurements.
+- The dynamic method wrappers are applied once at vocoder startup and preserve
+  the wrapped callable's arguments and return value.
+
+Remote validation gate:
+
+- Run normal full SeedTTS speed/WER without NVTX or deep wrappers to keep the
+  release-facing number clean.
+- Run a small c8 n8/c8 n16 torch profile with
+  `SGLANG_OMNI_NVTX_RANGES=1` and
+  `SGLANG_MOSS_TTS_LOCAL_VOCODER_DEEP_PROFILE=1`.
+- Run `scripts/debug/trace_summary.py` on the trace and inspect
+  `perfetto_sync_queries.sql` in Perfetto only if the summary still cannot
+  attribute the top synchronizations.

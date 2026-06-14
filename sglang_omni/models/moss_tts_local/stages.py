@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import hashlib
 import json
 import logging
@@ -34,6 +35,7 @@ from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
 )
 from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.trace_ranges import profile_range
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
@@ -116,6 +118,71 @@ def _load_moss_tts_local_processor(model_path: str, *, device: str) -> Any:
             # would corrupt the quantizer codebooks.
             audio_tokenizer.to(device)
     return processor
+
+
+def _maybe_wrap_profile_callable(obj: Any, attr: str, label: str) -> bool:
+    fn = getattr(obj, attr, None)
+    if not callable(fn) or bool(getattr(fn, "_sglang_omni_profile_wrapped", False)):
+        return False
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with profile_range(label):
+            return fn(*args, **kwargs)
+
+    wrapped._sglang_omni_profile_wrapped = True
+    try:
+        setattr(obj, attr, wrapped)
+    except Exception:
+        return False
+    return True
+
+
+def _maybe_wrap_moss_vocoder_deep_profile(processor: Any) -> None:
+    """Instrument remote-code codec methods when explicitly requested.
+
+    The MOSS processor and audio tokenizer live in checkpoint custom code, so
+    this uses conservative method wrapping instead of importing their concrete
+    classes. It is startup-only, env-gated diagnostic tooling.
+    """
+    if os.environ.get("SGLANG_MOSS_TTS_LOCAL_VOCODER_DEEP_PROFILE") != "1":
+        return
+
+    wrapped_labels = []
+
+    def wrap(obj: Any, attr: str, label: str) -> None:
+        if obj is not None and _maybe_wrap_profile_callable(obj, attr, label):
+            wrapped_labels.append(label)
+
+    wrap(
+        processor,
+        "decode_audio_codes",
+        "moss_tts_local.vocoder.processor.decode_audio_codes",
+    )
+    audio_tokenizer = getattr(processor, "audio_tokenizer", None)
+    for attr in (
+        "decode",
+        "decode_batch",
+        "decode_helper",
+        "decode_helper_batch",
+        "decode_audio_codes",
+        "_decode",
+        "_decode_frame",
+    ):
+        wrap(audio_tokenizer, attr, f"moss_tts_local.vocoder.audio_tokenizer.{attr}")
+
+    tokenizer_model = getattr(audio_tokenizer, "model", None)
+    for attr in ("decode", "decode_batch", "_decode", "_decode_frame"):
+        wrap(
+            tokenizer_model,
+            attr,
+            f"moss_tts_local.vocoder.audio_tokenizer.model.{attr}",
+        )
+
+    logger.info(
+        "MOSS-TTS Local vocoder deep profiling wrappers enabled: %s",
+        wrapped_labels or "none",
+    )
 
 
 def _build_usage(state: MossTTSLocalState) -> dict[str, Any] | None:
@@ -634,6 +701,7 @@ def create_vocoder_executor(
 ) -> SimpleScheduler:
     device = _resolve_codec_device(device, gpu_id)
     processor = _load_moss_tts_local_processor(model_path, device=device)
+    _maybe_wrap_moss_vocoder_deep_profile(processor)
 
     def _prepare_codes(
         payload: StagePayload,
@@ -695,7 +763,7 @@ def create_vocoder_executor(
                 event_name="moss_tts_local_vocoder_batch_start",
                 metadata=batch_metadata,
             )
-        with torch.profiler.record_function("moss_tts_local.vocoder.prepare_codes"):
+        with profile_range("moss_tts_local.vocoder.prepare_codes"):
             prepared = [_prepare_codes(payload) for payload in payloads]
             codes_list = [codes for _, codes in prepared if codes is not None]
         decode_metadata = dict(batch_metadata)
@@ -707,9 +775,7 @@ def create_vocoder_executor(
                 event_name="moss_tts_local_vocoder_decode_start",
                 metadata=decode_metadata,
             )
-        with torch.profiler.record_function(
-            "moss_tts_local.vocoder.decode_audio_codes"
-        ):
+        with profile_range("moss_tts_local.vocoder.decode_audio_codes"):
             decoded_outputs = list(processor.decode_audio_codes(codes_list))
             decoded = iter(decoded_outputs)
         for payload in payloads:
@@ -719,7 +785,7 @@ def create_vocoder_executor(
                 event_name="moss_tts_local_vocoder_decode_end",
                 metadata=decode_metadata,
             )
-        with torch.profiler.record_function("moss_tts_local.vocoder.sample_rate"):
+        with profile_range("moss_tts_local.vocoder.sample_rate"):
             sample_rate = _sample_rate()
         results = []
         for payload, (state, codes) in zip(payloads, prepared):
@@ -729,9 +795,9 @@ def create_vocoder_executor(
                 state.audio_codes = None
                 results.append(store_state(payload, state))
                 continue
-            with torch.profiler.record_function("moss_tts_local.vocoder.wav_to_cpu"):
+            with profile_range("moss_tts_local.vocoder.wav_to_cpu"):
                 wav = torch.as_tensor(next(decoded)).detach().to("cpu")
-            with torch.profiler.record_function("moss_tts_local.vocoder.store_result"):
+            with profile_range("moss_tts_local.vocoder.store_result"):
                 results.append(
                     _store_vocoder_result(payload, state, codes, wav, sample_rate)
                 )

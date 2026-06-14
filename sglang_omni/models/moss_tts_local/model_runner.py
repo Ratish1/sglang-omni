@@ -14,6 +14,7 @@ from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 from sglang_omni.models.moss_tts_local.radix_hash import gpu_radix_row_hash
 from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
+from sglang_omni.profiler.trace_ranges import profile_range
 from sglang_omni.scheduling.types import RequestOutput
 
 
@@ -785,7 +786,7 @@ class MossTTSLocalModelRunner(ModelRunner):
                 event_metadata,
             )
         try:
-            with torch.profiler.record_function(name):
+            with profile_range(name):
                 yield
         finally:
             if emit_fine_events:
