@@ -174,8 +174,11 @@ normal speed/WER runs.
 Set `SGLANG_MOSS_TTS_LOCAL_VOCODER_DEEP_PROFILE=1` before server startup to
 wrap checkpoint remote-code vocoder methods with additional ranges. The wrapper
 is diagnostic-only and currently targets the processor `decode_audio_codes`
-method plus common audio-tokenizer decode helpers when present. Use it only for
-small n8/n16 profiling windows.
+method, common audio-tokenizer decode helpers, quantizer `decode_codes`, decoder
+module forwards, and decoder transformer layer attention/FFN forwards when
+present. These ranges are high-cardinality; use them only for small n8/n16
+profiling windows, preferably with `SGLANG_OMNI_NVTX_RANGES=1` and Nsight
+Systems when Chrome trace export drops user labels.
 
 Set `SGLANG_MOSS_TTS_LOCAL_VOCODER_EVENTS=1` before server startup to mirror
 the native vocoder ranges into request-event JSONL. Use this with n8/n16

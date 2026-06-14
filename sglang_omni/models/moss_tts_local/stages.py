@@ -148,6 +148,7 @@ def _maybe_wrap_moss_vocoder_deep_profile(processor: Any) -> None:
     audio_tokenizer = getattr(processor, "audio_tokenizer", None)
     for attr in (
         "decode",
+        "batch_decode",
         "decode_batch",
         "decode_helper",
         "decode_helper_batch",
@@ -164,6 +165,41 @@ def _maybe_wrap_moss_vocoder_deep_profile(processor: Any) -> None:
             attr,
             f"moss_tts_local.vocoder.audio_tokenizer.model.{attr}",
         )
+
+    quantizer = getattr(audio_tokenizer, "quantizer", None)
+    wrap(
+        quantizer,
+        "decode_codes",
+        "moss_tts_local.vocoder.audio_tokenizer.quantizer.decode_codes",
+    )
+
+    decoder = getattr(audio_tokenizer, "decoder", None)
+    if decoder is not None:
+        for decoder_index, decoder_module in enumerate(decoder):
+            decoder_name = decoder_module.__class__.__name__
+            decoder_label = (
+                "moss_tts_local.vocoder.audio_tokenizer.decoder."
+                f"{decoder_index}.{decoder_name}"
+            )
+            wrap(decoder_module, "forward", f"{decoder_label}.forward")
+
+            transformer = getattr(decoder_module, "transformer", None)
+            layers = getattr(transformer, "layers", None)
+            if layers is None:
+                continue
+            for layer_index, layer in enumerate(layers):
+                layer_label = f"{decoder_label}.layer.{layer_index}"
+                wrap(layer, "forward", f"{layer_label}.forward")
+                wrap(
+                    getattr(layer, "self_attn", None),
+                    "forward",
+                    f"{layer_label}.self_attn.forward",
+                )
+                wrap(
+                    getattr(layer, "ffn", None),
+                    "forward",
+                    f"{layer_label}.ffn.forward",
+                )
 
     logger.info(
         "MOSS-TTS Local vocoder deep profiling wrappers enabled: %s",
