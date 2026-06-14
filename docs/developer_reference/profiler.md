@@ -147,6 +147,7 @@ non-streaming paths:
 - `moss_tts_local.vocoder.nonstream_batch.store_result`
 - `moss_tts_local.vocoder.nonstream_processor_decode`
 - `moss_tts_local.vocoder.nonstream_direct_batch_decode`
+- `moss_tts_local.vocoder.nonstream_direct_chunked_decode`
 - `moss_tts_local.vocoder.nonstream_session_decode`
 
 These `torch.profiler.record_function` ranges are always entered in the debug
@@ -181,15 +182,21 @@ the native vocoder ranges into request-event JSONL. Use this with n8/n16
 profiling only; every streaming codec step emits shared-batch intervals for
 each participating request.
 
-Set `SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH=processor|direct_batch|session`
+Set
+`SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH=processor|direct_batch|direct_chunked|session`
 before server startup to A/B the non-streaming MOSS-TTS Local code-to-waveform
 backend. `processor` preserves the checkpoint processor path and is the
-default. `direct_batch` calls the v2 audio tokenizer's native `batch_decode`
-directly while no streaming session is active. `session` forces the persistent
-offline streaming lane used after a streaming session exists. When using the
-session path, `SGLANG_MOSS_TTS_LOCAL_NONSTREAM_MAX_STEP_FRAMES` controls the
-offline chunk size; `0` means use the shortest remaining utterance segment for
-each step instead of imposing a fixed maximum.
+default. `direct_batch` calls the v2 audio tokenizer's native non-chunked
+`batch_decode` directly while no streaming session is active; this is a
+research control because it does not preserve the processor's chunked decode
+contract. `direct_chunked` also bypasses the processor wrapper, but keeps the
+tokenizer `batch_decode(..., chunk_duration=...)` path. Set
+`SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CHUNK_DURATION` to override the default `8.0`
+seconds used by that path. `session` forces the persistent offline streaming
+lane used after a streaming session exists. When using the session path,
+`SGLANG_MOSS_TTS_LOCAL_NONSTREAM_MAX_STEP_FRAMES` controls the offline chunk
+size; `0` means use the shortest remaining utterance segment for each step
+instead of imposing a fixed maximum.
 
 For trace export triage, use:
 
