@@ -426,8 +426,19 @@ async def _run_launcher_with_fake_runner(
         async def wait_failed(self) -> None:
             await asyncio.Future()
 
+    class FakeProfilerControl:
+        def __init__(self, stage_control_endpoints: dict[str, str]) -> None:
+            del stage_control_endpoints
+
+        async def broadcast_start(self, **kwargs) -> None:
+            del kwargs
+
+        async def broadcast_stop(self, **kwargs) -> None:
+            del kwargs
+
     monkeypatch.setattr(launcher, "_find_available_port", lambda host, port: port)
     monkeypatch.setattr(launcher, "MultiProcessPipelineRunner", FakeRunner)
+    monkeypatch.setattr(launcher, "ProfilerControlClient", FakeProfilerControl)
     monkeypatch.setattr(launcher, "create_app", lambda *a, **k: app)
     monkeypatch.setattr(launcher.uvicorn.Server, "serve", serve_mock)
 
@@ -453,9 +464,22 @@ async def test_launcher_uses_runner_and_mounts_profiler_routes(
     assert runner.started
     assert runner.stopped
     server_serve.assert_awaited_once()
-    mounted_paths = {route.path for route in app.routes}
-    assert "/start_profile" in mounted_paths
-    assert "/stop_profile" in mounted_paths
+    try:
+        with TestClient(app) as client:
+            start_resp = client.post(
+                "/start_profile",
+                json={
+                    "enable_torch": False,
+                    "event_dir": str(tmp_path / "events"),
+                },
+            )
+            stop_resp = client.post("/stop_profile", json={})
+        assert start_resp.status_code == 200
+        assert stop_resp.status_code == 200
+    finally:
+        rec = get_recorder()
+        if rec.is_active():
+            rec.stop()
 
 
 def test_start_profile_request_only_mode_does_not_require_trace_template(
