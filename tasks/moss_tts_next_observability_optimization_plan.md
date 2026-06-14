@@ -622,3 +622,148 @@ Remote validation gate:
 - Run `scripts/debug/trace_summary.py` on the trace and inspect
   `perfetto_sync_queries.sql` in Perfetto only if the summary still cannot
   attribute the top synchronizations.
+
+## Full-Stack Architecture Attribution Pass 2026-06-14
+
+The feedback-write fast path is a narrow common-path optimization, not a
+global architectural result. Treat it as provisional until ABAB runs prove it
+is outside normal run variance. The next serious optimization pass should
+profile the entire MOSS Local stack and choose work from measured ownership
+boundaries rather than isolated local deltas.
+
+### Current Flow And Cost Boundaries
+
+```text
+client concurrency
+  -> preprocessing/reference encode
+  -> OmniScheduler admission and batching
+  -> SGLang Qwen3 backbone prefill/decode
+       owns KV/radix/cache, backbone CUDA graph buckets
+  -> MossTTSLocalModelRunner._run_frame_decode
+       owns MOSS local frame graph replay, sampler, state pool,
+       row/radix key build, feedback embedding write, journal
+  -> streaming/vocoder scheduler
+       owns code batching, checkpoint remote-code decode_audio_codes,
+       wav CPU materialization and payload packaging
+  -> coordinator/client
+```
+
+Important contracts:
+
+- MOSS Local default AR cap is `max_running_requests=16`.
+- MOSS Local frame CUDA graph buckets default to `[1, 2, 4, 8, 16]`.
+- The decode-state pool is sized from `max_running_requests + 1`; the extra row
+  is reserved padding for graph replay.
+- `decode_frame_graphed()` pads runtime batch size to the nearest captured
+  frame bucket and discards padding rows after replay.
+- SGLang's normal CUDA graph policy can capture much larger buckets on H100,
+  but it also reserves memory proportional to `cuda_graph_max_bs`; it is not a
+  free knob.
+
+### CUDA Graph Bucket Decision
+
+Do not test frame buckets 32/64 by only changing `cuda_graph_bs`. With the
+current cap of 16, such graphs are unreachable and only increase startup/memory.
+
+To make bs=32 or bs=64 meaningful, the experiment must change the whole serving
+contract together:
+
+- client concurrency: c32/c64;
+- `max_running_requests`: 32/64;
+- `cuda_graph_bs`: include 32/64;
+- `cuda_graph_max_bs`: 32/64;
+- `torch_compile_max_bs`: match the captured maximum if the backbone compile
+  path is under test;
+- state-pool capacity: follows `max_running_requests`;
+- memory headroom: verify no KV/graph/vocoder OOM and no retraction pressure.
+
+Acceptance criteria for larger buckets:
+
+- actual frame `batch_size` histogram shows meaningful mass above 16;
+- `frame_decode_path=cuda_graph` remains dominant;
+- no increase in queueing latency or vocoder backlog that hides AR gains;
+- full SeedTTS WER/completion counts remain within baseline variance;
+- startup/capture time and memory reservation are acceptable for release.
+
+### Profiling Matrix
+
+Run this as multi-phase evidence, not as a single giant benchmark:
+
+1. `c8` baseline quality/performance.
+   - Purpose: release-facing regression guard.
+   - Env: no NVTX, no deep wrappers.
+   - Output: speed/WER, events, server log.
+
+2. `c8` deep torch profile.
+   - Purpose: source attribution.
+   - Env:
+     `SGLANG_OMNI_NVTX_RANGES=1`,
+     `SGLANG_MOSS_TTS_LOCAL_VOCODER_DEEP_PROFILE=1`,
+     optionally `SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1`.
+   - Size: n8/n16 only.
+   - Output: Chrome trace, JSONL events, `trace_summary.py` reports, Perfetto
+     SQL if needed.
+
+3. `c16` normal run.
+   - Purpose: check saturation at the current max bucket.
+   - Env: clean.
+   - Output: speed/WER, batch histogram, vocoder backlog indicators.
+
+4. `c32`/`max_running_requests=32` architecture experiment.
+   - Purpose: prove whether larger concurrency and buckets can improve RTF.
+   - Env: clean first, profiler second only if speed moves.
+   - Compare:
+     - max 16 buckets with c32 traffic;
+     - max 32 buckets with c32 traffic.
+   - Stop if actual frame batches rarely exceed 16 or vocoder queueing grows.
+
+5. `c64` only if c32 proves actual batches above 16 and does not increase
+   vocoder or scheduler queueing.
+
+### Perfetto Requirement
+
+Use `scripts/debug/trace_summary.py` first. Perfetto is mandatory only when one
+of these remains ambiguous:
+
+- top `cudaStreamSynchronize` / `cudaDeviceSynchronize` slices have no useful
+  parent context;
+- `vocoder_decode` remains dominant but the wrapped remote-code method labels
+  do not expose the internal owner;
+- CUDA graph replay appears fast but CPU-side staging still dominates and the
+  source cannot be separated from scheduler/result processing;
+- a larger-bucket experiment improves local frame time but hurts end-to-end
+  latency, implying queueing or stage backpressure.
+
+### Debug Branch Cleanup Rule
+
+Keep:
+
+- sampler compile;
+- request-event and torch/NVTX profiling;
+- code-trace/parity harnesses when they answer a current correctness question;
+- full-stack trace summary tooling.
+
+Remove or quarantine:
+
+- `full` and `logits` frame compile targets, because direct parity rejected
+  them;
+- any debug knob whose only effect is to re-enable a known non-parity-safe path;
+- stale docs that make rejected targets sound acceptable.
+
+### Candidate Optimization Classes After Attribution
+
+Prioritize only after a full-stack trace identifies ownership:
+
+- scheduler/batching: admission policy, async launch threshold, c16/c32
+  saturation, stale-batch drain cost;
+- backbone graph policy: bucket coverage, compile graph breaks, memory
+  reservation;
+- MOSS frame loop: radix hash, state-pool writes, graph output snapshots,
+  feedback staging;
+- vocoder/code2wav: remote-code decode batching, stream synchronization,
+  waveform CPU transfer, streaming chunk sizing;
+- inter-stage handoff: payload serialization, stream chunk count, coordinator
+  backpressure.
+
+Do not choose custom kernels until the trace proves the hot operation is stable,
+small, and semantically isolated enough for a parity test.

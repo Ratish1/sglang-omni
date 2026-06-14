@@ -135,9 +135,6 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         # above. Allocated here, before any frame/backbone graph capture, so
         # its addresses are fixed for the process lifetime.
         self._state_pool = MossTTSLocalDecodeStatePool(self)
-        self._compiled_frame_decode_graphable: Callable[..., Any] | None = None
-        self._compiled_frame_text_logits: Callable[..., Any] | None = None
-        self._compiled_frame_audio_logits: Callable[..., Any] | None = None
         self._compiled_frame_sampler: Callable[..., torch.Tensor] | None = None
         self._frame_compile_configured = False
 
@@ -363,40 +360,6 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
 
     _sample_seeded_branchless = staticmethod(sample_seeded_branchless)
 
-    def _frame_decode_graphable_for_capture(
-        self,
-        *,
-        enable_torch_compile: bool,
-        torch_compile_mode: str | None = None,
-        torch_compile_target: str = "full",
-    ) -> Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        if not enable_torch_compile:
-            return self._decode_frame_graphable
-        compile_target = str(torch_compile_target or "full").strip().lower()
-        if compile_target not in {"full", "logits", "sampler"}:
-            raise ValueError(
-                "MOSS-TTS Local frame torch compile target must be one of "
-                f"{('full', 'logits', 'sampler')}, got {torch_compile_target!r}"
-            )
-        compile_mode = self._frame_compile_mode(torch_compile_mode)
-        if compile_target == "sampler":
-            self._ensure_frame_sampler_compile(compile_mode)
-            return self._decode_frame_graphable
-        if compile_target == "logits":
-            self._ensure_frame_logits_compile(compile_mode)
-            return self._decode_frame_graphable
-        if self._compiled_frame_decode_graphable is None:
-            self._ensure_frame_compile_config()
-            self._compiled_frame_decode_graphable = torch.compile(
-                self._decode_frame_graphable,
-                mode=compile_mode,
-            )
-            logger.info(
-                "Compiled MOSS-TTS Local frame decode graphable callable (mode=%s)",
-                compile_mode,
-            )
-        return self._compiled_frame_decode_graphable
-
     def _ensure_frame_compile_config(self) -> None:
         if self._frame_compile_configured:
             return
@@ -411,22 +374,6 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
 
         set_torch_compile_config()
         self._frame_compile_configured = True
-
-    def _ensure_frame_logits_compile(self, compile_mode: str) -> None:
-        if self._compiled_frame_text_logits is None:
-            self._ensure_frame_compile_config()
-            self._compiled_frame_text_logits = torch.compile(
-                self._frame_text_logits_eager,
-                mode=compile_mode,
-            )
-            self._compiled_frame_audio_logits = torch.compile(
-                self._frame_audio_logits_eager,
-                mode=compile_mode,
-            )
-            logger.info(
-                "Compiled MOSS-TTS Local frame logit projections (mode=%s)",
-                compile_mode,
-            )
 
     @staticmethod
     def _frame_compile_mode(compile_mode: str | None = None) -> str:
@@ -449,39 +396,6 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 "Compiled MOSS-TTS Local frame sampler (mode=%s)",
                 compile_mode,
             )
-
-    @staticmethod
-    def _frame_linear_logits_eager(
-        hidden_states: torch.Tensor, weight: torch.Tensor
-    ) -> torch.Tensor:
-        return F.linear(hidden_states, weight).float()
-
-    def _frame_text_logits_eager(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self._frame_linear_logits_eager(
-            hidden_states,
-            self.local_text_lm_head.weight,
-        )
-
-    def _frame_audio_logits_eager(
-        self,
-        hidden_states: torch.Tensor,
-        weight: torch.Tensor,
-    ) -> torch.Tensor:
-        return self._frame_linear_logits_eager(hidden_states, weight)
-
-    def _frame_text_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._compiled_frame_text_logits is not None:
-            return self._compiled_frame_text_logits(hidden_states)
-        return self._frame_text_logits_eager(hidden_states)
-
-    def _frame_audio_logits(
-        self,
-        hidden_states: torch.Tensor,
-        weight: torch.Tensor,
-    ) -> torch.Tensor:
-        if self._compiled_frame_audio_logits is not None:
-            return self._compiled_frame_audio_logits(hidden_states, weight)
-        return self._frame_audio_logits_eager(hidden_states, weight)
 
     @torch.no_grad()
     def _decode_frame_graphable(
@@ -513,7 +427,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         local_hidden = self.local_transformer.step(
             hidden_states.to(dtype=self.dtype), 0
         )
-        text_logits = self._frame_text_logits(local_hidden)
+        text_logits = F.linear(local_hidden, self.local_text_lm_head.weight).float()
         stop_choice = self._sample_seeded_branchless(
             text_logits,
             temperature=text_temperature,
@@ -531,7 +445,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         current = local_hidden
         for channel in range(self.n_vq):
             head_weight = self._audio_embedding_weight(channel)
-            logits = self._frame_audio_logits(current, head_weight)
+            logits = F.linear(current, head_weight).float()
             code = self._sample_seeded_branchless(
                 logits,
                 temperature=audio_temperature,
@@ -554,9 +468,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         self,
         batch_sizes: list[int],
         *,
-        enable_torch_compile: bool = False,
         torch_compile_mode: str | None = None,
-        torch_compile_target: str = "full",
     ) -> None:
         """Capture the per-frame local decode (1 + n_vq micro-steps plus all
         13 seeded sampling passes) into one CUDA graph per batch-size bucket.
@@ -578,11 +490,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         )
         self.local_transformer.freeze_kv_cache()
         self._ensure_frame_sampler_compile(torch_compile_mode)
-        frame_decode = self._frame_decode_graphable_for_capture(
-            enable_torch_compile=enable_torch_compile,
-            torch_compile_mode=torch_compile_mode,
-            torch_compile_target=torch_compile_target,
-        )
+        frame_decode = self._decode_frame_graphable
         self._frame_graphs: dict[
             int,
             tuple[
@@ -631,11 +539,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 feedback,
             )
         logger.info(
-            "MOSS-TTS Local frame-decode CUDA graphs captured for bs=%s "
-            "(torch_compile=%s, torch_compile_target=%s)",
-            buckets,
-            bool(enable_torch_compile),
-            str(torch_compile_target or "full"),
+            "MOSS-TTS Local frame-decode CUDA graphs captured for bs=%s", buckets
         )
 
     @property

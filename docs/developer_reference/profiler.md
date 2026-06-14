@@ -183,17 +183,15 @@ separate:
 - the Qwen3 backbone uses SGLang's native compile path during decode CUDA graph
   capture and can be toggled with `--talker_torch_compile on`;
 - the MOSS-specific frame-local decoder is outside SGLang's normal decode graph
-  runner and can be compiled before frame CUDA graph capture by setting
-  `frame_decode_torch_compile: true` in the `tts_engine` factory args.
+  runner. Its seeded sampler is compiled before MOSS frame CUDA graph capture.
 
 Use `SGLANG_TORCH_COMPILE_MODE=max-autotune-no-cudagraphs` unless deliberately
 testing another mode; Inductor-owned cudagraphs should not be mixed into this
 path while SGLang and MOSS Local already manage explicit CUDA graph capture.
-For MOSS Local, prefer testing the narrowest target first:
-`frame_decode_torch_compile_target: sampler` compiles only the seeded
-top-k/top-p sampler used 13 times per frame. Wider targets (`logits` or
-`full`) also lower projection/local-transformer math and must pass direct code
-parity before any speed claim is meaningful.
+For MOSS Local, keep compilation scoped to `sample_seeded_branchless`, the
+seeded top-k/top-p sampler used 13 times per frame. Wider frame targets
+(`logits` or `full`) failed direct code parity during the issue #752
+investigation and should not be re-enabled without a new parity proof.
 
 Custom callsites can call `sglang_omni.profiler.event_recorder.emit(...)` to
 add domain-specific events. Events from inactive recorders are no-ops, so
