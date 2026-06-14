@@ -143,7 +143,11 @@ chunked-prefill partial-emission path. In the normal path, request order already
 matches pool-row order, so the runner can reuse `row_t`, `rows`, `gen_steps`,
 and `embeds` directly instead of materializing an `emit_indices` tensor and
 running multiple `index_select` operations. Metadata includes
-`all_rows_emit=true/false`.
+`all_rows_emit=true/false` and `feedback_fast_path_enabled=true/false`.
+
+Set `SGLANG_MOSS_TTS_LOCAL_FEEDBACK_FAST_PATH=0` before server startup to force
+the indexed feedback-write path for A/B testing. The default is enabled because
+the normal MOSS Local decode path usually emits every row in the batch.
 
 Set `SGLANG_OMNI_NVTX_RANGES=1` before server startup to mirror these
 `record_function` ranges into NVTX ranges. This is intended for Perfetto/Nsight

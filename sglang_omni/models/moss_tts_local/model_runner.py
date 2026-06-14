@@ -574,8 +574,12 @@ class MossTTSLocalModelRunner(ModelRunner):
                 metadata=metadata,
             ):
                 all_rows_emit = len(emit_indices) == batch_size
+                feedback_fast_path_enabled = self._env_enabled(
+                    "SGLANG_MOSS_TTS_LOCAL_FEEDBACK_FAST_PATH"
+                )
                 metadata["all_rows_emit"] = all_rows_emit
-                if all_rows_emit:
+                metadata["feedback_fast_path_enabled"] = feedback_fast_path_enabled
+                if all_rows_emit and feedback_fast_path_enabled:
                     with self._profile_scope(
                         "moss_tts_local.collect_frame.feedback_write.all_emit_alias",
                         recorder=recorder,
@@ -802,6 +806,13 @@ class MossTTSLocalModelRunner(ModelRunner):
                     f"{event_base}_end",
                     event_metadata,
                 )
+
+    @staticmethod
+    def _env_enabled(name: str, *, default: bool = True) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
 
     @staticmethod
     def _active_event_recorder() -> Any | None:
