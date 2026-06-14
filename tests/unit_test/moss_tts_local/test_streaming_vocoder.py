@@ -138,6 +138,21 @@ class FakeProcessor:
         return wavs
 
 
+class _BatchSensitiveCodec(FakeCodec):
+    """Fake codec that exposes decode batch-size drift in waveform values."""
+
+    def _decode_frame(self, codes: torch.Tensor, codes_lengths: torch.Tensor):
+        result = super()._decode_frame(codes, codes_lengths)
+        result.audio = result.audio + 10000.0 * int(codes.shape[1])
+        return result
+
+
+class _BatchSensitiveProcessor(FakeProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.audio_tokenizer = _BatchSensitiveCodec()
+
+
 def reference_waveform(rows: torch.Tensor) -> torch.Tensor:
     """Stateless offline decode of [T, n_vq] codes rows."""
     codes = rows[:, :N_VQ]
@@ -674,6 +689,41 @@ def test_non_streaming_path_with_and_without_live_session(monkeypatch) -> None:
     np.testing.assert_array_equal(
         waves_after[0], reference_waveform(rows_1[:, 1:]).numpy()
     )
+
+
+def test_exact_session_nonstream_path_matches_processor_batch_shape(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH",
+        "exact_session",
+    )
+    processor = _BatchSensitiveProcessor()
+    rows_1 = _rows(11, seed=63)
+    rows_2 = _rows(4, seed=64)
+    expected = processor.decode_audio_codes([rows_1[:, 1:], rows_2[:, 1:]])
+
+    scheduler = _make_scheduler(monkeypatch, processor, max_batch_size=2)
+
+    def offline_payload(rows: torch.Tensor, request_id: str) -> StagePayload:
+        state = MossTTSLocalState(text="x", audio_codes=rows[:, 1:].clone())
+        return StagePayload(
+            request_id=request_id,
+            request=OmniRequest(inputs="", params={}),
+            data=state.to_dict(),
+        )
+
+    results = scheduler._vocode_batch(
+        [offline_payload(rows_1, "r1"), offline_payload(rows_2, "r2")]
+    )
+
+    assert scheduler._session is None
+    assert scheduler._offline_session is not None
+    assert scheduler._offline_session_batch_size == 2
+    decoded = [_decode_audio(result.data) for result in results]
+    for actual, expected_wav in zip(decoded, expected):
+        np.testing.assert_array_equal(actual, expected_wav.numpy())
+    scheduler.stop()
 
 
 def test_offline_lane_waves_split_across_slots(monkeypatch) -> None:

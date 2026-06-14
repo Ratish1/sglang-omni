@@ -46,7 +46,7 @@ _NONSTREAM_CODEC_PATH_ENV = "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH"
 _NONSTREAM_MAX_STEP_FRAMES_ENV = "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_MAX_STEP_FRAMES"
 _NONSTREAM_CHUNK_DURATION_ENV = "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CHUNK_DURATION"
 _NONSTREAM_CODEC_PATHS = frozenset(
-    {"processor", "direct_batch", "direct_chunked", "session"}
+    {"processor", "direct_batch", "direct_chunked", "session", "exact_session"}
 )
 _DEFAULT_NONSTREAM_CHUNK_DURATION_S = 8.0
 
@@ -177,6 +177,33 @@ def _resolve_nonstream_chunk_duration() -> float:
     if resolved <= 0:
         raise ValueError(f"{_NONSTREAM_CHUNK_DURATION_ENV} must be > 0, got {resolved}")
     return resolved
+
+
+def _resolve_nonstream_chunk_frames(codec: Any, chunk_duration: float) -> int:
+    sampling_rate = int(
+        getattr(codec, "sampling_rate", 0)
+        or getattr(getattr(codec, "config", None), "sampling_rate", 0)
+        or getattr(getattr(codec, "config", None), "sample_rate", 0)
+        or 48000
+    )
+    downsample_rate = int(
+        getattr(codec, "downsample_rate", 0)
+        or getattr(getattr(codec, "config", None), "downsample_rate", 0)
+        or 3840
+    )
+    chunk_length = int(round(float(chunk_duration) * sampling_rate))
+    if chunk_length <= 0:
+        raise ValueError(
+            "non-streaming codec chunk duration is too small and resolves to "
+            f"{chunk_length} samples"
+        )
+    if chunk_length % downsample_rate != 0:
+        raise ValueError(
+            "non-streaming codec chunk duration must produce a sample count "
+            f"divisible by the codec downsample rate; got chunk_length={chunk_length}, "
+            f"downsample_rate={downsample_rate}"
+        )
+    return chunk_length // downsample_rate
 
 
 def _build_usage(state: MossTTSLocalState) -> dict[str, Any] | None:
@@ -356,6 +383,7 @@ class _CodecStreamSession:
             "decode_count": len(codes_list),
             "max_step_frames": int(max_step_frames),
             "offline_slots": self._offline_slots,
+            "session_batch_size": self._batch_size,
         }
         with _vocoder_scope(
             "moss_tts_local.vocoder.offline_decode",
@@ -370,6 +398,7 @@ class _CodecStreamSession:
                 self._reset_slots(slots)
                 cursors = [0] * len(wave)
                 chunks: list[list[torch.Tensor]] = [[] for _ in wave]
+                step_index = 0
                 while True:
                     remaining = [
                         int(codes.shape[1]) - cur for codes, cur in zip(wave, cursors)
@@ -388,6 +417,9 @@ class _CodecStreamSession:
                         for i, rem in enumerate(remaining)
                         if rem >= step_t
                     }
+                    active_indices = [
+                        i for i, rem in enumerate(remaining) if rem >= step_t
+                    ]
                     plan_request_ids = [
                         wave_request_ids[i]
                         for i, rem in enumerate(remaining)
@@ -400,10 +432,20 @@ class _CodecStreamSession:
                             **metadata,
                             "offline_step": True,
                             "wave_start": int(wave_start),
+                            "step_index": int(step_index),
                             "step_frames": int(step_t),
                             "participant_count": len(plan),
+                            "active_indices": active_indices,
+                            "active_slots": list(plan),
+                            "active_mask_bits": "".join(
+                                "1" if slot in plan else "0"
+                                for slot in range(self._batch_size)
+                            ),
+                            "remaining_frames": remaining,
+                            "cursors": cursors,
                         },
                     )
+                    step_index += 1
                     for i in range(len(wave)):
                         if slots[i] in plan:
                             chunks[i].append(decoded[slots[i]])
@@ -476,6 +518,9 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         self._sample_rate = _resolve_sample_rate(processor)
         self._nonstream_codec_path = _resolve_nonstream_codec_path()
         self._nonstream_chunk_duration = _resolve_nonstream_chunk_duration()
+        self._nonstream_chunk_frames = _resolve_nonstream_chunk_frames(
+            self._codec, self._nonstream_chunk_duration
+        )
         if self._nonstream_codec_path in {"direct_batch", "direct_chunked"} and (
             not hasattr(self._codec, "batch_decode")
         ):
@@ -485,12 +530,16 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             )
         logger.info(
             "MOSS-TTS Local non-streaming codec path: %s "
-            "(nonstream_max_step_frames=%s, nonstream_chunk_duration=%s)",
+            "(nonstream_max_step_frames=%s, nonstream_chunk_duration=%s, "
+            "nonstream_chunk_frames=%s)",
             self._nonstream_codec_path,
             self._nonstream_max_step_frames,
             self._nonstream_chunk_duration,
+            self._nonstream_chunk_frames,
         )
         self._session: _CodecStreamSession | None = None
+        self._offline_session: _CodecStreamSession | None = None
+        self._offline_session_batch_size: int | None = None
         self._stream_states: dict[str, _LocalStreamState] = {}
         super().__init__(
             self._vocode,
@@ -517,6 +566,13 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             if self._session is not None:
                 self._session.close()
                 self._session = None
+            self._close_offline_session()
+
+    def _close_offline_session(self) -> None:
+        if self._offline_session is not None:
+            self._offline_session.close()
+            self._offline_session = None
+            self._offline_session_batch_size = None
 
     # ------------------------------------------------------------------
     # Streaming hooks
@@ -650,12 +706,36 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     def _ensure_session(self) -> _CodecStreamSession:
         if self._session is None:
+            self._close_offline_session()
             self._session = _CodecStreamSession(
                 self._codec,
                 stream_slots=self._stream_slots,
                 offline_slots=self._offline_slots,
             )
         return self._session
+
+    def _ensure_offline_session(self, batch_size: int) -> _CodecStreamSession:
+        if batch_size < 1:
+            raise ValueError(
+                f"offline session batch_size must be >= 1, got {batch_size}"
+            )
+        if self._session is not None:
+            raise RuntimeError(
+                "exact non-streaming session decode is unavailable while the "
+                "live streaming session is active"
+            )
+        if (
+            self._offline_session is None
+            or self._offline_session_batch_size != batch_size
+        ):
+            self._close_offline_session()
+            self._offline_session = _CodecStreamSession(
+                self._codec,
+                stream_slots=0,
+                offline_slots=batch_size,
+            )
+            self._offline_session_batch_size = batch_size
+        return self._offline_session
 
     def _ensure_slot(self, state: _LocalStreamState) -> None:
         if state.slot is None:
@@ -900,6 +980,11 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 request_ids=request_ids,
                 requested_path=self._nonstream_codec_path,
             )
+        if self._nonstream_codec_path == "exact_session":
+            return self._decode_codes_rows_exact_session(
+                codes_list,
+                request_ids=request_ids,
+            )
         if self._nonstream_codec_path == "direct_batch":
             return self._decode_codes_rows_direct_batch(
                 codes_list,
@@ -985,6 +1070,38 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 .contiguous()
                 for i in range(len(channels_first))
             ]
+
+    def _decode_codes_rows_exact_session(
+        self,
+        codes_list: list[torch.Tensor],
+        *,
+        request_ids: list[str],
+    ) -> list[torch.Tensor]:
+        channels_first = [
+            codes[:, : self._n_vq].transpose(0, 1).contiguous() for codes in codes_list
+        ]
+        batch_size = len(channels_first)
+        with _vocoder_scope(
+            "moss_tts_local.vocoder.nonstream_exact_session_decode",
+            request_ids=request_ids,
+            metadata={
+                "decode_count": batch_size,
+                "requested_path": self._nonstream_codec_path,
+                "actual_path": "exact_session",
+                "chunk_duration": self._nonstream_chunk_duration,
+                "chunk_frames": int(self._nonstream_chunk_frames),
+            },
+        ):
+            # Match processor.batch_decode(..., chunk_duration=...) exactly at
+            # the batch-shape boundary. A larger persistent streaming slot
+            # width changes downstream kernel shapes and can introduce drift.
+            with self._state_lock:
+                wavs = self._ensure_offline_session(batch_size).decode_offline(
+                    channels_first,
+                    max_step_frames=self._nonstream_chunk_frames,
+                    request_ids=request_ids,
+                )
+            return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]
 
     def _decode_codes_rows_session(
         self,
