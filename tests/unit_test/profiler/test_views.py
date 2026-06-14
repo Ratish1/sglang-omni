@@ -396,6 +396,30 @@ def test_stage_breakdown_covers_moss_tts_local_fine_frame_intervals(
             "moss_tts_local_async_launch_radix_hash_publish_end",
             3_300_000,
         ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "moss_tts_local_collect_frame_feedback_write_all_emit_alias_start",
+            4_000_000,
+        ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "moss_tts_local_collect_frame_feedback_write_all_emit_alias_end",
+            4_200_000,
+        ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "moss_tts_local_collect_frame_feedback_write_feedback_embed_write_start",
+            5_000_000,
+        ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "moss_tts_local_collect_frame_feedback_write_feedback_embed_write_end",
+            5_600_000,
+        ),
     ]
     _write_events(tmp_path / "events_x.jsonl", events)
 
@@ -424,8 +448,20 @@ def test_stage_breakdown_covers_moss_tts_local_fine_frame_intervals(
         "moss_tts_local_async_launch_radix_hash_publish_start"
         "->moss_tts_local_async_launch_radix_hash_publish_end",
     )
+    all_emit_key = (
+        "tts_engine",
+        "moss_tts_local_collect_frame_feedback_write_all_emit_alias_start"
+        "->moss_tts_local_collect_frame_feedback_write_all_emit_alias_end",
+    )
+    feedback_embed_key = (
+        "tts_engine",
+        "moss_tts_local_collect_frame_feedback_write_feedback_embed_write_start"
+        "->moss_tts_local_collect_frame_feedback_write_feedback_embed_write_end",
+    )
     assert by_key[feedback_key].total_ms == 0.4
     assert by_key[async_publish_key].total_ms == 0.3
+    assert by_key[all_emit_key].total_ms == 0.2
+    assert by_key[feedback_embed_key].total_ms == 0.6
 
 
 def test_stage_breakdown_emits_both_intervals_sharing_opener(

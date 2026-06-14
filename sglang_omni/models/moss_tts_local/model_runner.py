@@ -566,25 +566,86 @@ class MossTTSLocalModelRunner(ModelRunner):
                 requests=requests,
                 metadata=metadata,
             ):
-                emit_index_t = torch.tensor(
-                    emit_indices, dtype=torch.long, device=rows.device
-                )
-                emit_pool_rows = [pool_rows[i] for i in emit_indices]
-                emit_row_t = row_t[emit_index_t.to(device=row_t.device)]
-                emit_rows = rows.index_select(0, emit_index_t)
-                emit_steps = gen_steps.index_select(
-                    0, emit_index_t.to(device=gen_steps.device)
-                )
-                pool.sampling_steps[emit_row_t] = (emit_steps + 1).to(
-                    device=pool.sampling_steps.device, dtype=torch.int64
-                )
-                emit_embeds = embeds.index_select(
-                    0, emit_index_t.to(device=embeds.device)
-                )
-                pool.feedback_embeds[emit_row_t] = emit_embeds.detach().to(
-                    device=pool.feedback_embeds.device,
-                    dtype=pool.feedback_embeds.dtype,
-                )
+                all_rows_emit = len(emit_indices) == batch_size
+                metadata["all_rows_emit"] = all_rows_emit
+                if all_rows_emit:
+                    with self._profile_scope(
+                        "moss_tts_local.collect_frame.feedback_write.all_emit_alias",
+                        recorder=recorder,
+                        requests=requests,
+                        metadata=metadata,
+                    ):
+                        # Normal path: every request emitted, and request order
+                        # already matches row/pool order. Reuse the aligned
+                        # tensors instead of materializing an emit-index tensor
+                        # and gathering the same rows back out.
+                        emit_pool_rows = pool_rows
+                        emit_row_t = row_t
+                        emit_rows = rows
+                        emit_steps = gen_steps
+                        emit_embeds = embeds
+                else:
+                    with self._profile_scope(
+                        "moss_tts_local.collect_frame.feedback_write.emit_index_tensor",
+                        recorder=recorder,
+                        requests=requests,
+                        metadata=metadata,
+                    ):
+                        emit_index_t = torch.tensor(
+                            emit_indices, dtype=torch.long, device=rows.device
+                        )
+                    with self._profile_scope(
+                        "moss_tts_local.collect_frame.feedback_write.emit_row_select",
+                        recorder=recorder,
+                        requests=requests,
+                        metadata=metadata,
+                    ):
+                        emit_pool_rows = [pool_rows[i] for i in emit_indices]
+                        emit_row_t = row_t[emit_index_t.to(device=row_t.device)]
+                    with self._profile_scope(
+                        "moss_tts_local.collect_frame.feedback_write.emit_rows_select",
+                        recorder=recorder,
+                        requests=requests,
+                        metadata=metadata,
+                    ):
+                        emit_rows = rows.index_select(0, emit_index_t)
+                    with self._profile_scope(
+                        "moss_tts_local.collect_frame.feedback_write.emit_steps_select",
+                        recorder=recorder,
+                        requests=requests,
+                        metadata=metadata,
+                    ):
+                        emit_steps = gen_steps.index_select(
+                            0, emit_index_t.to(device=gen_steps.device)
+                        )
+                    with self._profile_scope(
+                        "moss_tts_local.collect_frame.feedback_write.emit_embeds_select",
+                        recorder=recorder,
+                        requests=requests,
+                        metadata=metadata,
+                    ):
+                        emit_embeds = embeds.index_select(
+                            0, emit_index_t.to(device=embeds.device)
+                        )
+                with self._profile_scope(
+                    "moss_tts_local.collect_frame.feedback_write.sampling_step_write",
+                    recorder=recorder,
+                    requests=requests,
+                    metadata=metadata,
+                ):
+                    pool.sampling_steps[emit_row_t] = (emit_steps + 1).to(
+                        device=pool.sampling_steps.device, dtype=torch.int64
+                    )
+                with self._profile_scope(
+                    "moss_tts_local.collect_frame.feedback_write.feedback_embed_write",
+                    recorder=recorder,
+                    requests=requests,
+                    metadata=metadata,
+                ):
+                    pool.feedback_embeds[emit_row_t] = emit_embeds.detach().to(
+                        device=pool.feedback_embeds.device,
+                        dtype=pool.feedback_embeds.dtype,
+                    )
             if has_audio_repetition_penalty:
                 with self._profile_scope(
                     "moss_tts_local.collect_frame.audio_history_update",
@@ -592,12 +653,15 @@ class MossTTSLocalModelRunner(ModelRunner):
                     requests=requests,
                     metadata=metadata,
                 ):
-                    keep_history = (
-                        next_text.index_select(
-                            0, emit_index_t.to(device=next_text.device)
+                    if len(emit_indices) == batch_size:
+                        keep_history = next_text != end_id
+                    else:
+                        keep_history = (
+                            next_text.index_select(
+                                0, emit_index_t.to(device=next_text.device)
+                            )
+                            != end_id
                         )
-                        != end_id
-                    )
                     emit_penalty_active = (
                         pool.audio_repetition_penalty[emit_row_t]
                         .to(device=keep_history.device)
@@ -614,10 +678,17 @@ class MossTTSLocalModelRunner(ModelRunner):
                 requests=[requests[i] for i in emit_indices],
                 metadata=metadata,
             ):
+                with self._profile_scope(
+                    "moss_tts_local.collect_frame.journal.rows",
+                    recorder=recorder,
+                    requests=[requests[i] for i in emit_indices],
+                    metadata=metadata,
+                ):
+                    journal_rows = emit_rows
                 result.moss_journal = MossTTSLocalDecodeJournal(
                     rids=[requests[i].request_id for i in emit_indices],
                     pool_rows=emit_pool_rows,
-                    rows=emit_rows,
+                    rows=journal_rows,
                 )
         # Always return rows so both the sync inline path and the async launch
         # publish next_token_ids; an all-chunked batch just attaches no journal.

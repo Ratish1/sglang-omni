@@ -106,8 +106,17 @@ inside `_collect_frame()`:
 - `moss_tts_local.collect_frame.eager_feedback_embed`
 - `moss_tts_local.collect_frame.emit_filter`
 - `moss_tts_local.collect_frame.feedback_write`
+- `moss_tts_local.collect_frame.feedback_write.all_emit_alias`
+- `moss_tts_local.collect_frame.feedback_write.emit_index_tensor`
+- `moss_tts_local.collect_frame.feedback_write.emit_row_select`
+- `moss_tts_local.collect_frame.feedback_write.emit_rows_select`
+- `moss_tts_local.collect_frame.feedback_write.emit_steps_select`
+- `moss_tts_local.collect_frame.feedback_write.emit_embeds_select`
+- `moss_tts_local.collect_frame.feedback_write.sampling_step_write`
+- `moss_tts_local.collect_frame.feedback_write.feedback_embed_write`
 - `moss_tts_local.collect_frame.audio_history_update`
 - `moss_tts_local.collect_frame.journal`
+- `moss_tts_local.collect_frame.journal.rows`
 - `moss_tts_local.async_launch.radix_hash_publish`
 - `moss_tts_local.async_resolve.restore_next_token_ids`
 
@@ -128,6 +137,13 @@ These `torch.profiler.record_function` ranges are always entered in the debug
 branch and are intended to split the post-backbone boundary into graph replay,
 copy/snapshot work, tensor construction, radix hashing, feedback staging,
 journal creation, async handoff, and code-to-waveform work.
+
+The `feedback_write.*` scopes also separate the normal all-emitted path from the
+chunked-prefill partial-emission path. In the normal path, request order already
+matches pool-row order, so the runner can reuse `row_t`, `rows`, `gen_steps`,
+and `embeds` directly instead of materializing an `emit_indices` tensor and
+running multiple `index_select` operations. Metadata includes
+`all_rows_emit=true/false`.
 
 If Chrome trace export drops user `record_function` names, set
 `SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1` for a scoped run. This emits

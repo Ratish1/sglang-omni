@@ -541,3 +541,37 @@ Local verification:
 
 - `python -m py_compile` on touched runtime/profiler files.
 - `pytest -q tests/unit_test/profiler/test_views.py`.
+
+## Feedback-Write Pass 2026-06-14
+
+Focused profiling showed `moss_tts_local.collect_frame.feedback_write` as the
+largest remaining AR-side frame scope while frame CUDA graph replay was already
+sub-millisecond. The common path emits every row in the batch; only
+non-final chunked-prefill rows require partial emission.
+
+Implemented on the debug branch:
+
+- Split `feedback_write` into micro-scopes:
+  - `feedback_write.all_emit_alias`;
+  - `feedback_write.emit_index_tensor`;
+  - `feedback_write.emit_row_select`;
+  - `feedback_write.emit_rows_select`;
+  - `feedback_write.emit_steps_select`;
+  - `feedback_write.emit_embeds_select`;
+  - `feedback_write.sampling_step_write`;
+  - `feedback_write.feedback_embed_write`;
+  - `journal.rows`.
+- Added an all-emitted fast path that reuses `row_t`, `rows`, `gen_steps`,
+  `embeds`, and `pool_rows` directly instead of materializing an emit-index
+  tensor and running `index_select` calls.
+- Preserved the existing partial-emission path for chunked-prefill.
+- Added `all_rows_emit` metadata to separate normal-path timing from fallback
+  timing in request-event reports.
+
+Remote validation gate:
+
+- Run B vs patched c8 n50 speed with WER.
+- Run fine c8 n16 with `SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1`.
+- Accept only if completion/failure count is unchanged, WER is neutral within
+  observed baseline variance, and `feedback_write` or its child scopes move in
+  the expected direction.
