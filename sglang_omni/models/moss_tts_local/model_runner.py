@@ -373,23 +373,41 @@ class MossTTSLocalModelRunner(ModelRunner):
             )
         emit_indices = sorted(emit_set)
         if emit_indices:
-            emit_index_t = torch.tensor(
-                emit_indices, dtype=torch.long, device=rows.device
-            )
-            emit_pool_rows = [pool_rows[i] for i in emit_indices]
-            emit_row_t = row_t[emit_index_t.to(device=row_t.device)]
-            emit_rows = rows.index_select(0, emit_index_t)
-            emit_steps = gen_steps.index_select(
-                0, emit_index_t.to(device=gen_steps.device)
-            )
+            if len(emit_indices) == batch_size:
+                # Common decode path: every request emitted, and request order
+                # already matches row/pool order. Reuse aligned tensors instead
+                # of gathering the same rows back through an emit-index tensor.
+                emit_pool_rows = pool_rows
+                emit_row_t = row_t
+                emit_rows = rows
+                emit_steps = gen_steps
+                emit_embeds = embeds
+            else:
+                emit_index_t = torch.tensor(
+                    emit_indices, dtype=torch.long, device=rows.device
+                )
+                emit_pool_rows = [pool_rows[i] for i in emit_indices]
+                emit_row_t = row_t[emit_index_t.to(device=row_t.device)]
+                emit_rows = rows.index_select(0, emit_index_t)
+                emit_steps = gen_steps.index_select(
+                    0, emit_index_t.to(device=gen_steps.device)
+                )
+                emit_embeds = embeds.index_select(
+                    0, emit_index_t.to(device=embeds.device)
+                )
             pool.sampling_steps[emit_row_t] = (emit_steps + 1).to(
                 device=pool.sampling_steps.device, dtype=torch.int64
             )
             if has_audio_repetition_penalty:
-                keep_history = (
-                    next_text.index_select(0, emit_index_t.to(device=next_text.device))
-                    != end_id
-                )
+                if len(emit_indices) == batch_size:
+                    keep_history = next_text != end_id
+                else:
+                    keep_history = (
+                        next_text.index_select(
+                            0, emit_index_t.to(device=next_text.device)
+                        )
+                        != end_id
+                    )
                 emit_penalty_active = (
                     pool.audio_repetition_penalty[emit_row_t]
                     .to(device=keep_history.device)
@@ -400,7 +418,6 @@ class MossTTSLocalModelRunner(ModelRunner):
                     emit_row_t[keep_history.to(device=emit_row_t.device)],
                     emit_rows[keep_history.to(device=emit_rows.device)],
                 )
-            emit_embeds = embeds.index_select(0, emit_index_t.to(device=embeds.device))
             pool.feedback_embeds[emit_row_t] = emit_embeds.detach().to(
                 device=pool.feedback_embeds.device,
                 dtype=pool.feedback_embeds.dtype,
