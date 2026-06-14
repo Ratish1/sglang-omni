@@ -539,7 +539,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                 feedback,
             )
         logger.info(
-            "MOSS-TTS Local frame-decode CUDA graphs captured for bs=%s", buckets
+            f"MOSS-TTS Local frame-decode CUDA graphs captured for bs={buckets}"
         )
 
     @property
