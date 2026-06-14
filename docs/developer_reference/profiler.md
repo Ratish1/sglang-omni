@@ -175,10 +175,29 @@ Set `SGLANG_MOSS_TTS_LOCAL_VOCODER_DEEP_PROFILE=1` before server startup to
 wrap checkpoint remote-code vocoder methods with additional ranges. The wrapper
 is diagnostic-only and currently targets the processor `decode_audio_codes`
 method, common audio-tokenizer decode helpers, quantizer `decode_codes`, decoder
-module forwards, and decoder transformer layer attention/FFN forwards when
-present. These ranges are high-cardinality; use them only for small n8/n16
-profiling windows, preferably with `SGLANG_OMNI_NVTX_RANGES=1` and Nsight
-Systems when Chrome trace export drops user labels.
+module forwards, decoder transformer layer attention/FFN forwards, and
+attention micro-scopes when present. These ranges are high-cardinality; use
+them only for small n8/n16 profiling windows, preferably with
+`SGLANG_OMNI_NVTX_RANGES=1` and Nsight Systems when Chrome trace export drops
+user labels.
+
+MOSS audio-tokenizer decoder attention micro-scopes use labels such as:
+
+- `moss_tts_local.vocoder.audio_tokenizer.decoder.<i>.<module>.layer.<j>.self_attn._project_qkv`
+- `moss_tts_local.vocoder.audio_tokenizer.decoder.<i>.<module>.layer.<j>.self_attn.in_proj`
+- `moss_tts_local.vocoder.audio_tokenizer.decoder.<i>.<module>.layer.<j>.self_attn._ensure_streaming_cache`
+- `moss_tts_local.vocoder.audio_tokenizer.decoder.<i>.<module>.layer.<j>.self_attn._build_streaming_kv`
+- `moss_tts_local.vocoder.audio_tokenizer.decoder.<i>.<module>.layer.<j>.self_attn._run_flash_attention`
+- `moss_tts_local.vocoder.audio_tokenizer.decoder.<i>.<module>.layer.<j>.self_attn.out_proj`
+- `moss_tts_local.vocoder.audio_tokenizer.decoder.<i>.<module>.layer.<j>.self_attn._update_streaming_cache`
+- `moss_tts_local.vocoder.audio_tokenizer.decoder.<i>.<module>.layer.<j>.self_attn._forward_streaming_flash`
+- `moss_tts_local.vocoder.audio_tokenizer.decoder.<i>.<module>.layer.<j>.self_attn._forward_streaming_sdpa`
+
+The streaming FlashAttention implementation has local Python packing and
+unpacking work inside `_forward_streaming_flash`. That local loop is not
+replaced by the profiler wrapper; estimate it as the residual inside
+`_forward_streaming_flash` after subtracting the nested QKV, KV build, flash
+attention, cache-update, and projection ranges.
 
 Set `SGLANG_MOSS_TTS_LOCAL_VOCODER_EVENTS=1` before server startup to mirror
 the native vocoder ranges into request-event JSONL. Use this with n8/n16

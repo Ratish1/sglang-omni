@@ -10,7 +10,7 @@ import os
 import queue
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -124,6 +124,35 @@ def _maybe_wrap_profile_callable(obj: Any, attr: str, label: str) -> bool:
     return True
 
 
+def _maybe_wrap_moss_attention_micro_profile(
+    self_attn: Any,
+    *,
+    label_prefix: str,
+    wrap: Callable[[Any, str, str], None],
+) -> None:
+    """Add low-level labels inside remote-code codec attention modules."""
+    for attr in (
+        "resolve_attention_implementation",
+        "_project_qkv",
+        "_apply_dense_rope",
+        "_apply_packed_rope",
+        "_ensure_streaming_cache",
+        "_build_streaming_kv",
+        "_update_streaming_cache",
+        "_build_streaming_sdpa_bias",
+        "_run_flash_attention",
+        "_forward_streaming_flash",
+        "_forward_streaming_sdpa",
+        "_forward_non_streaming_flash",
+        "_forward_non_streaming_sdpa",
+    ):
+        wrap(self_attn, attr, f"{label_prefix}.{attr}")
+
+    wrap(getattr(self_attn, "in_proj", None), "forward", f"{label_prefix}.in_proj")
+    wrap(getattr(self_attn, "out_proj", None), "forward", f"{label_prefix}.out_proj")
+    wrap(getattr(self_attn, "rope", None), "forward", f"{label_prefix}.rope")
+
+
 def _maybe_wrap_moss_vocoder_deep_profile(processor: Any) -> None:
     """Instrument remote-code codec methods when explicitly requested.
 
@@ -195,6 +224,11 @@ def _maybe_wrap_moss_vocoder_deep_profile(processor: Any) -> None:
                     "forward",
                     f"{layer_label}.self_attn.forward",
                 )
+                _maybe_wrap_moss_attention_micro_profile(
+                    getattr(layer, "self_attn", None),
+                    label_prefix=f"{layer_label}.self_attn",
+                    wrap=wrap,
+                )
                 wrap(
                     getattr(layer, "ffn", None),
                     "forward",
@@ -202,8 +236,9 @@ def _maybe_wrap_moss_vocoder_deep_profile(processor: Any) -> None:
                 )
 
     logger.info(
-        "MOSS-TTS Local vocoder deep profiling wrappers enabled: %s",
-        wrapped_labels or "none",
+        "MOSS-TTS Local vocoder deep profiling wrappers enabled: count=%d, sample=%s",
+        len(wrapped_labels),
+        wrapped_labels[:16] if wrapped_labels else "none",
     )
 
 
