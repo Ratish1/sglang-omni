@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from contextlib import suppress
+import hashlib
+import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -48,6 +50,8 @@ if TYPE_CHECKING:
         UploadedVoiceReference,
     )
 
+logger = logging.getLogger(__name__)
+
 _TTS_LANGUAGE_ALIASES = {
     language.lower(): language for language in SUPPORTED_TTS_LANGUAGES
 }
@@ -64,6 +68,13 @@ RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 1
 @dataclass(frozen=True)
 class PreparedSpeechRequest:
     request: CreateSpeechRequest
+    reference_descriptors: list[dict[str, Any]]
+    uploaded_voice: "UploadedVoiceReference | None" = None
+
+
+@dataclass(frozen=True)
+class PreparedSpeechReferences:
+    request_updates: dict[str, Any]
     reference_descriptors: list[dict[str, Any]]
     uploaded_voice: "UploadedVoiceReference | None" = None
 
@@ -164,10 +175,17 @@ class SpeechRequestValidator:
     ) -> PreparedSpeechRequest:
         """Validate a parsed request and build backend reference descriptors."""
 
-        updates: dict[str, Any] = {}
-        reference_descriptors: list[dict[str, Any]] = []
+        updates = self._prepare_generation_updates(request)
+        prepared_references = self._prepare_reference_fields(request)
+        updates.update(prepared_references.request_updates)
+        prepared_request = request.model_copy(update=updates)
+        return PreparedSpeechRequest(
+            request=prepared_request,
+            reference_descriptors=prepared_references.reference_descriptors,
+            uploaded_voice=prepared_references.uploaded_voice,
+        )
 
-        input_text = request.input
+    def validate_input_text(self, input_text: str) -> None:
         if not isinstance(input_text, str) or not input_text.strip():
             raise bad_request("input must be a non-empty string", param="input")
         if len(input_text) > MAX_SPEECH_INPUT_CHARS:
@@ -176,6 +194,11 @@ class SpeechRequestValidator:
                 param="input",
             )
 
+    def _prepare_generation_updates(
+        self, request: CreateSpeechRequest
+    ) -> dict[str, Any]:
+        self.validate_input_text(request.input)
+        updates: dict[str, Any] = {}
         response_format = _normalize_response_format(request.response_format)
         if request.stream and response_format != "pcm":
             raise bad_request(
@@ -204,6 +227,13 @@ class SpeechRequestValidator:
             param=INITIAL_CODEC_CHUNK_FRAMES_PARAM,
         )
         _validate_non_negative_int(request.seed, param="seed")
+        return updates
+
+    def _prepare_reference_fields(
+        self, request: CreateSpeechRequest
+    ) -> PreparedSpeechReferences:
+        updates: dict[str, Any] = {}
+        reference_descriptors: list[dict[str, Any]] = []
         uploaded_voice = self._resolve_uploaded_voice_reference(request)
 
         ref_audio = request.ref_audio
@@ -235,9 +265,8 @@ class SpeechRequestValidator:
             reference_descriptors.append(descriptor)
             updates["task_type"] = "Base"
 
-        prepared_request = request.model_copy(update=updates)
-        return PreparedSpeechRequest(
-            request=prepared_request,
+        return PreparedSpeechReferences(
+            request_updates=updates,
             reference_descriptors=reference_descriptors,
             uploaded_voice=uploaded_voice,
         )
@@ -290,6 +319,8 @@ class SpeechRequestValidator:
         tasks: list[asyncio.Task[SpeechBatchResult]] = []
         task_indexes: list[int] = []
         task_request_ids: list[str] = []
+        reference_tasks: dict[str, asyncio.Task[PreparedSpeechReferences]] = {}
+        reference_task_lock = asyncio.Lock()
 
         for index, item in enumerate(batch.items):
             try:
@@ -306,6 +337,8 @@ class SpeechRequestValidator:
                     request,
                     request_id=item_request_id,
                     index=index,
+                    reference_tasks=reference_tasks,
+                    reference_task_lock=reference_task_lock,
                 )
             )
             tasks.append(task)
@@ -348,8 +381,14 @@ class SpeechRequestValidator:
         *,
         request_id: str,
         index: int,
+        reference_tasks: dict[str, asyncio.Task[PreparedSpeechReferences]],
+        reference_task_lock: asyncio.Lock,
     ) -> SpeechBatchResult:
-        prepared = await asyncio.to_thread(self.prepare_generation_request, request)
+        prepared = await self._prepare_batch_item_request(
+            request,
+            reference_tasks=reference_tasks,
+            reference_task_lock=reference_task_lock,
+        )
         gen_req = self.build_generate_request(
             prepared.request,
             validate=False,
@@ -375,6 +414,31 @@ class SpeechRequestValidator:
             media_type=result.mime_type,
         )
 
+    async def _prepare_batch_item_request(
+        self,
+        request: CreateSpeechRequest,
+        *,
+        reference_tasks: dict[str, asyncio.Task[PreparedSpeechReferences]],
+        reference_task_lock: asyncio.Lock,
+    ) -> PreparedSpeechRequest:
+        updates = self._prepare_generation_updates(request)
+        cache_key = _batch_reference_cache_key(request)
+        async with reference_task_lock:
+            task = reference_tasks.get(cache_key)
+            if task is None:
+                task = asyncio.create_task(
+                    asyncio.to_thread(self._prepare_reference_fields, request)
+                )
+                reference_tasks[cache_key] = task
+
+        prepared_references = await task
+        updates.update(prepared_references.request_updates)
+        return PreparedSpeechRequest(
+            request=request.model_copy(update=updates),
+            reference_descriptors=prepared_references.reference_descriptors,
+            uploaded_voice=prepared_references.uploaded_voice,
+        )
+
     async def _cancel_batch_items(
         self,
         client: "Client",
@@ -385,8 +449,14 @@ class SpeechRequestValidator:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         for request_id in request_ids:
-            with suppress(Exception):
+            try:
                 await client.abort(request_id)
+            except Exception:
+                logger.warning(
+                    "Failed to abort speech batch item request %s",
+                    request_id,
+                    exc_info=True,
+                )
 
     def _build_batch_item_request(
         self,
@@ -442,11 +512,6 @@ class SpeechRequestValidator:
             param=INITIAL_CODEC_CHUNK_FRAMES_PARAM,
         )
         _validate_non_negative_int(batch.seed, param="seed")
-        if batch.ref_audio is not None:
-            self._load_media_reference_descriptor(batch.ref_audio, param="ref_audio")
-        if batch.references:
-            for reference in batch.references:
-                self._normalize_speech_reference(reference)
         if (
             self.voice_store is not None
             and self.supports_uploaded_voice_references
@@ -816,6 +881,15 @@ def _batch_item_error(error: SpeechAPIError, *, index: int) -> SpeechAPIError:
         param=f"items.{index}.{error.param}",
         code=error.code,
     )
+
+
+def _batch_reference_cache_key(request: CreateSpeechRequest) -> str:
+    values = request.model_dump(
+        mode="json",
+        include={"voice", "task_type", "ref_audio", "ref_text", "references"},
+    )
+    serialized = json.dumps(values, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _validate_positive_int(value: int | None, *, param: str) -> None:

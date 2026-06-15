@@ -249,26 +249,24 @@ class SpeechWebSocketSession:
         self.sentence_index += 1
         request_id = f"{self.session_id}-{sentence_index}"
         self.active_request_id = request_id
-        await self._send_json(
-            {
-                "type": "audio.start",
-                "id": request_id,
-                "sentence_index": sentence_index,
-                "sentence_text": sentence,
-                "format": self.config.response_format,
-                "sample_rate": DEFAULT_SAMPLE_RATE,
-            }
-        )
         total_bytes = 0
         failed = False
         try:
             if self.config.stream_audio:
                 total_bytes = await self._run_generation_until_disconnect(
-                    self._stream_sentence_audio(sentence, request_id=request_id)
+                    self._stream_sentence_audio(
+                        sentence,
+                        request_id=request_id,
+                        sentence_index=sentence_index,
+                    )
                 )
             else:
                 total_bytes = await self._run_generation_until_disconnect(
-                    self._send_sentence_audio(sentence, request_id=request_id)
+                    self._send_sentence_audio(
+                        sentence,
+                        request_id=request_id,
+                        sentence_index=sentence_index,
+                    )
                 )
         except asyncio.CancelledError:
             failed = True
@@ -301,7 +299,13 @@ class SpeechWebSocketSession:
                     }
                 )
 
-    async def _stream_sentence_audio(self, sentence: str, *, request_id: str) -> int:
+    async def _stream_sentence_audio(
+        self,
+        sentence: str,
+        *,
+        request_id: str,
+        sentence_index: int,
+    ) -> int:
         assert self.config is not None
         request = self._speech_request_from_config(sentence=sentence, stream=True)
         gen_req = self.speech_service.build_generate_request(
@@ -313,6 +317,7 @@ class SpeechWebSocketSession:
         emitted_samples = 0
         total_bytes = 0
         chunk_count = 0
+        started = False
         async for chunk in self.client.generate(gen_req, request_id=request_id):
             if chunk.audio_data is None:
                 continue
@@ -331,6 +336,14 @@ class SpeechWebSocketSession:
             audio_bytes = encode_pcm(audio_data, sample_rate)
             if not audio_bytes:
                 continue
+            if not started:
+                await self._send_audio_start(
+                    request_id=request_id,
+                    sentence_index=sentence_index,
+                    sentence=sentence,
+                    sample_rate=sample_rate,
+                )
+                started = True
             await self._send_audio_frame(audio_bytes, active_request_id=request_id)
             total_bytes += len(audio_bytes)
             chunk_count += 1
@@ -338,7 +351,13 @@ class SpeechWebSocketSession:
             raise ClientError("No audio output generated from the pipeline.")
         return total_bytes
 
-    async def _send_sentence_audio(self, sentence: str, *, request_id: str) -> int:
+    async def _send_sentence_audio(
+        self,
+        sentence: str,
+        *,
+        request_id: str,
+        sentence_index: int,
+    ) -> int:
         assert self.config is not None
         request = self._speech_request_from_config(sentence=sentence, stream=False)
         gen_req = self.speech_service.build_generate_request(
@@ -356,6 +375,12 @@ class SpeechWebSocketSession:
         )
         if self.active_request_id == request_id:
             self.active_request_id = None
+        await self._send_audio_start(
+            request_id=request_id,
+            sentence_index=sentence_index,
+            sentence=sentence,
+            sample_rate=result.sample_rate or DEFAULT_SAMPLE_RATE,
+        )
         await self._send_audio_frame(result.audio_bytes)
         return len(result.audio_bytes)
 
@@ -366,9 +391,11 @@ class SpeechWebSocketSession:
         *,
         stream: bool | None = None,
     ) -> CreateSpeechRequest:
-        return CreateSpeechRequest.model_validate(
+        request = CreateSpeechRequest.model_validate(
             self._speech_payload_from_config(config, sentence, stream=stream)
         )
+        self.speech_service.validate_input_text(request.input)
+        return request
 
     def _speech_payload_from_config(
         self,
@@ -379,7 +406,10 @@ class SpeechWebSocketSession:
     ) -> dict[str, Any]:
         config = config or self.config
         assert config is not None
-        payload = config.model_dump(exclude={"stream_audio", "split_granularity"})
+        payload = config.model_dump(
+            exclude={"stream_audio", "split_granularity"},
+            exclude_none=True,
+        )
         payload["input"] = sentence
         payload["stream"] = config.stream_audio if stream is None else stream
         return payload
@@ -529,6 +559,26 @@ class SpeechWebSocketSession:
                     param=error.param,
                     code=error.code,
                 ),
+            }
+        )
+
+    async def _send_audio_start(
+        self,
+        *,
+        request_id: str,
+        sentence_index: int,
+        sentence: str,
+        sample_rate: int,
+    ) -> None:
+        assert self.config is not None
+        await self._send_json(
+            {
+                "type": "audio.start",
+                "id": request_id,
+                "sentence_index": sentence_index,
+                "sentence_text": sentence,
+                "format": self.config.response_format,
+                "sample_rate": sample_rate,
             }
         )
 

@@ -940,6 +940,7 @@ def _register_speech(app: FastAPI) -> None:
         if req.stream:
             try:
                 return await _speech_audio_response(
+                    request=request,
                     client=client,
                     gen_req=gen_req,
                     request_id=request_id,
@@ -1086,6 +1087,7 @@ def _speech_pcm_chunk_bytes(
 
 
 async def _speech_audio_response(
+    request: Request,
     client: Client,
     gen_req: GenerateRequest,
     request_id: str,
@@ -1097,9 +1099,29 @@ async def _speech_audio_response(
     first_audio_bytes: bytes | None = None
     stream_sample_rate: int | None = None
     stream_completed = False
+    stream_closed = False
+    disconnect_task = asyncio.create_task(_wait_for_request_disconnect(request))
+    next_chunk_task: asyncio.Task[Any] | None = None
 
     try:
-        async for chunk in chunk_stream:
+        while True:
+            next_chunk_task = asyncio.create_task(anext(chunk_stream))
+            done, _ = await asyncio.wait(
+                {next_chunk_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                if not next_chunk_task.done():
+                    await _cancel_task_bounded(next_chunk_task)
+                await _abort_and_close_speech_stream(client, request_id, chunk_stream)
+                stream_closed = True
+                raise asyncio.CancelledError
+
+            try:
+                chunk = next_chunk_task.result()
+            except StopAsyncIteration:
+                stream_completed = True
+                break
             if chunk.audio_data is None:
                 continue
 
@@ -1112,13 +1134,12 @@ async def _speech_audio_response(
             )
             if first_audio_bytes is not None:
                 break
-        else:
-            stream_completed = True
 
         if first_audio_bytes is None or stream_sample_rate is None:
             raise RuntimeError("No audio output generated from the pipeline.")
     except asyncio.CancelledError:
-        await _abort_and_close_speech_stream(client, request_id, chunk_stream)
+        if not stream_closed:
+            await _abort_and_close_speech_stream(client, request_id, chunk_stream)
         raise
     except Exception:
         if not stream_completed:
@@ -1126,6 +1147,11 @@ async def _speech_audio_response(
         else:
             await _close_async_iterator_if_supported(chunk_stream)
         raise
+    finally:
+        if next_chunk_task is not None and not next_chunk_task.done():
+            await _cancel_task_bounded(next_chunk_task)
+        if not disconnect_task.done():
+            await _cancel_task_bounded(disconnect_task)
 
     async def _body():
         nonlocal emitted_samples

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
@@ -63,6 +64,12 @@ class BlockingBatchSpeechClient:
         self.aborted.append(request_id)
 
 
+class FailingAbortBatchSpeechClient(BlockingBatchSpeechClient):
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+        raise RuntimeError("abort failed")
+
+
 class DisconnectingBatchRequest:
     def __init__(self, client_impl: BlockingBatchSpeechClient) -> None:
         self.client_impl = client_impl
@@ -98,6 +105,18 @@ class MixedBatchSpeechClient:
             mime_type=f"audio/{response_format}",
             format=response_format,
         )
+
+
+class CountingReferenceSpeechRequestValidator(SpeechRequestValidator):
+    def __init__(self) -> None:
+        super().__init__(default_model="tts")
+        self.reference_loads: list[str] = []
+
+    def _load_media_reference_descriptor(
+        self, value: str, *, param: str
+    ) -> dict[str, str]:
+        self.reference_loads.append(value)
+        return {"data": "UklGRg==", "media_type": "audio/wav"}
 
 
 def test_batch_speech_preserves_order_and_item_errors() -> None:
@@ -333,6 +352,27 @@ def test_batch_speech_cancellation_aborts_started_items() -> None:
     asyncio.run(run())
 
 
+def test_batch_speech_logs_abort_failures(caplog: pytest.LogCaptureFixture) -> None:
+    async def run() -> None:
+        service = SpeechRequestValidator(default_model="tts")
+        batch = service.parse_batch_request({"items": [{"input": "one"}]})
+        client_impl = FailingAbortBatchSpeechClient()
+
+        with caplog.at_level(logging.WARNING):
+            task = asyncio.create_task(
+                service.create_speech_batch(client_impl, batch, request_id="batch")
+            )
+            await client_impl.started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert client_impl.aborted == ["batch-0"]
+        assert "Failed to abort speech batch item request batch-0" in caplog.text
+
+    asyncio.run(run())
+
+
 def test_batch_speech_request_disconnect_aborts_started_items() -> None:
     async def run() -> None:
         service = SpeechRequestValidator(default_model="tts")
@@ -350,5 +390,37 @@ def test_batch_speech_request_disconnect_aborts_started_items() -> None:
             )
 
         assert client_impl.aborted == ["batch-0"]
+
+    asyncio.run(run())
+
+
+def test_batch_speech_reuses_shared_default_reference_loads() -> None:
+    async def run() -> None:
+        service = CountingReferenceSpeechRequestValidator()
+        client_impl = RecordingBatchSpeechClient()
+        batch = service.parse_batch_request(
+            {
+                "ref_audio": "data:audio/wav;base64,AAAA",
+                "items": [
+                    {"input": "first"},
+                    {"input": "second", "speed": 1.1, "temperature": 0.7},
+                    {"input": "override", "ref_audio": "data:audio/wav;base64,BBBB"},
+                ],
+            }
+        )
+
+        response = await service.create_speech_batch(
+            client_impl,
+            batch,
+            request_id="batch",
+        )
+
+        assert response.succeeded == 3
+        assert service.reference_loads == [
+            "data:audio/wav;base64,AAAA",
+            "data:audio/wav;base64,BBBB",
+        ]
+        assert client_impl.requests[1].metadata["tts_params"]["speed"] == 1.1
+        assert client_impl.requests[1].sampling.temperature == 0.7
 
     asyncio.run(run())
