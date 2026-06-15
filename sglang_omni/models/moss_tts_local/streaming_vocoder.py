@@ -265,6 +265,14 @@ class _CodecDecodeFrameCudaGraph:
             _ = codec._decode_frame(codes_step, codes_lengths)
         torch.cuda.synchronize(device)
 
+        def _reset(module: Any) -> None:
+            state = getattr(module, "_streaming_state", None)
+            if state is not None:
+                state.reset(torch.ones(batch_size, dtype=torch.bool, device=device))
+
+        with torch.no_grad():
+            codec.apply(_reset)
+
         graph = torch.cuda.CUDAGraph()
         with torch.no_grad(), torch.cuda.graph(graph):
             codec._set_streaming_exec_mask(exec_mask)
