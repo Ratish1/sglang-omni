@@ -388,11 +388,16 @@ def main() -> int:
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20260615)
     parser.add_argument("--include-direct-chunked", action="store_true")
+    parser.add_argument("--codec-cuda-graph", action="store_true")
     parser.add_argument("--fail-on-parity", action="store_true")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
     _disable_request_profiling_env()
+    if args.codec_cuda_graph:
+        os.environ["SGLANG_MOSS_TTS_LOCAL_CODEC_CUDA_GRAPH"] = "1"
+    else:
+        os.environ.pop("SGLANG_MOSS_TTS_LOCAL_CODEC_CUDA_GRAPH", None)
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -454,6 +459,7 @@ def main() -> int:
         "warmup": args.warmup,
         "iters": args.iters,
         "include_direct_chunked": bool(args.include_direct_chunked),
+        "codec_cuda_graph": bool(args.codec_cuda_graph),
         "failures": failures,
         "cases": cases,
     }

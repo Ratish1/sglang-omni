@@ -227,6 +227,15 @@ streaming session exists. When using the legacy session path,
 size; `0` means use the shortest remaining utterance segment for each step
 instead of imposing a fixed maximum.
 
+Set `SGLANG_MOSS_TTS_LOCAL_CODEC_CUDA_GRAPH=1` with
+`SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH=exact_session` to enable the
+experimental codec step CUDA graph path. The scheduler pre-captures the fixed
+`chunk_duration` step shape when the non-streaming offline session is created,
+resets all codec slots, and then replays that graph only for matching full
+chunk steps. Tail chunks and unsupported shapes fall back to eager
+`_decode_frame`. Successful graph replays emit
+`moss_tts_local.vocoder.stream_step.decode_frame_cuda_graph`.
+
 For trace export triage, use:
 
 ```bash

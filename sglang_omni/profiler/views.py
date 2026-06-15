@@ -179,6 +179,7 @@ _MOSS_TTS_LOCAL_VOCODER_SCOPE_EVENTS = tuple(
         "moss_tts_local_vocoder_stream_step_build_inputs",
         "moss_tts_local_vocoder_stream_step_set_exec_mask",
         "moss_tts_local_vocoder_stream_step_decode_frame",
+        "moss_tts_local_vocoder_stream_step_decode_frame_cuda_graph",
         "moss_tts_local_vocoder_stream_step_d2h",
         "moss_tts_local_vocoder_stream_step_slice_outputs",
         "moss_tts_local_vocoder_chunk_message",

@@ -45,6 +45,7 @@ _VOCODER_EVENTS_ENV = "SGLANG_MOSS_TTS_LOCAL_VOCODER_EVENTS"
 _NONSTREAM_CODEC_PATH_ENV = "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH"
 _NONSTREAM_MAX_STEP_FRAMES_ENV = "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_MAX_STEP_FRAMES"
 _NONSTREAM_CHUNK_DURATION_ENV = "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CHUNK_DURATION"
+_NONSTREAM_CODEC_CUDA_GRAPH_ENV = "SGLANG_MOSS_TTS_LOCAL_CODEC_CUDA_GRAPH"
 _NONSTREAM_CODEC_PATHS = frozenset(
     {"processor", "direct_batch", "direct_chunked", "session", "exact_session"}
 )
@@ -206,6 +207,10 @@ def _resolve_nonstream_chunk_frames(codec: Any, chunk_duration: float) -> int:
     return chunk_length // downsample_rate
 
 
+def _codec_cuda_graph_enabled() -> bool:
+    return _env_enabled(_NONSTREAM_CODEC_CUDA_GRAPH_ENV)
+
+
 def _build_usage(state: MossTTSLocalState) -> dict[str, Any] | None:
     if not (state.prompt_tokens or state.completion_tokens or state.engine_time_s):
         return None
@@ -219,6 +224,69 @@ def _build_usage(state: MossTTSLocalState) -> dict[str, Any] | None:
     return usage
 
 
+@dataclass
+class _CodecDecodeFrameCudaGraph:
+    """Captured codec ``_decode_frame`` for one fixed streaming step shape."""
+
+    graph: torch.cuda.CUDAGraph
+    codes_step: torch.Tensor
+    codes_lengths: torch.Tensor
+    exec_mask: torch.Tensor
+    result: Any
+    step_t: int
+
+    @classmethod
+    def capture(
+        cls,
+        codec: Any,
+        *,
+        batch_size: int,
+        n_vq: int,
+        step_t: int,
+        device: torch.device,
+    ) -> "_CodecDecodeFrameCudaGraph":
+        codes_step = torch.zeros(
+            n_vq,
+            batch_size,
+            step_t,
+            dtype=torch.long,
+            device=device,
+        )
+        codes_lengths = torch.full(
+            (batch_size,),
+            step_t,
+            dtype=torch.long,
+            device=device,
+        )
+        exec_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        with torch.no_grad():
+            codec._set_streaming_exec_mask(exec_mask)
+            _ = codec._decode_frame(codes_step, codes_lengths)
+        torch.cuda.synchronize(device)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.no_grad(), torch.cuda.graph(graph):
+            codec._set_streaming_exec_mask(exec_mask)
+            result = codec._decode_frame(codes_step, codes_lengths)
+        torch.cuda.synchronize(device)
+
+        return cls(
+            graph=graph,
+            codes_step=codes_step,
+            codes_lengths=codes_lengths,
+            exec_mask=exec_mask,
+            result=result,
+            step_t=step_t,
+        )
+
+    def replay(self, codec: Any) -> Any:
+        # Re-bind the codec state in case a slot reset replaced the mask object.
+        codec._set_streaming_exec_mask(self.exec_mask)
+        self.graph.replay()
+        return self.result
+
+
 class _CodecStreamSession:
     """A persistent batched ``codec.streaming()`` session with slot bookkeeping.
 
@@ -229,7 +297,15 @@ class _CodecStreamSession:
     scheduler loop thread.
     """
 
-    def __init__(self, codec: Any, *, stream_slots: int, offline_slots: int) -> None:
+    def __init__(
+        self,
+        codec: Any,
+        *,
+        stream_slots: int,
+        offline_slots: int,
+        n_vq: int | None = None,
+        cuda_graph_step_frames: tuple[int, ...] = (),
+    ) -> None:
         self._codec = codec
         self._stream_slots = int(stream_slots)
         self._offline_slots = int(offline_slots)
@@ -238,8 +314,11 @@ class _CodecStreamSession:
         self._free_stream_slots = list(range(self._stream_slots))
         self._exit_stack = contextlib.ExitStack()
         self._closed = False
+        self._cuda_graphs: dict[int, _CodecDecodeFrameCudaGraph] = {}
+        self._cuda_graph_disabled_reason: str | None = None
         with torch.no_grad():
             self._exit_stack.enter_context(codec.streaming(self._batch_size))
+        self._capture_cuda_graphs(n_vq=n_vq, step_frames=cuda_graph_step_frames)
 
     def acquire(self) -> int | None:
         if not self._free_stream_slots:
@@ -272,6 +351,49 @@ class _CodecStreamSession:
 
         with torch.no_grad():
             self._codec.apply(_reset)
+
+    def _capture_cuda_graphs(
+        self,
+        *,
+        n_vq: int | None,
+        step_frames: tuple[int, ...],
+    ) -> None:
+        if not step_frames or n_vq is None:
+            return
+        if self._device.type != "cuda" or not torch.cuda.is_available():
+            self._cuda_graph_disabled_reason = "non_cuda_device"
+            return
+
+        captured: dict[int, _CodecDecodeFrameCudaGraph] = {}
+        try:
+            for step_t in sorted({int(value) for value in step_frames if value > 0}):
+                captured[step_t] = _CodecDecodeFrameCudaGraph.capture(
+                    self._codec,
+                    batch_size=self._batch_size,
+                    n_vq=int(n_vq),
+                    step_t=step_t,
+                    device=self._device,
+                )
+        except Exception as exc:
+            self._cuda_graph_disabled_reason = type(exc).__name__
+            self._cuda_graphs.clear()
+            logger.warning(
+                "MOSS-TTS Local codec CUDA graph capture failed; using eager "
+                "codec steps (reason=%s)",
+                self._cuda_graph_disabled_reason,
+                exc_info=True,
+            )
+        else:
+            self._cuda_graphs = captured
+            if captured:
+                logger.info(
+                    "MOSS-TTS Local codec CUDA graphs captured for step_frames=%s "
+                    "(batch_size=%s)",
+                    sorted(captured),
+                    self._batch_size,
+                )
+        finally:
+            self._reset_slots(list(range(self._batch_size)))
 
     def step(
         self,
@@ -308,25 +430,34 @@ class _CodecStreamSession:
             request_ids=request_ids,
             metadata=scope_metadata,
         ):
+            graph_entry = self._cuda_graphs.get(int(step_t))
             with _vocoder_scope(
                 "moss_tts_local.vocoder.stream_step.build_inputs",
                 request_ids=request_ids,
                 metadata=scope_metadata,
             ):
                 n_vq = int(next(iter(slot_codes.values())).shape[0])
-                codes_step = torch.zeros(
-                    n_vq,
-                    self._batch_size,
-                    step_t,
-                    dtype=torch.long,
-                    device=self._device,
-                )
-                codes_lengths = torch.zeros(
-                    self._batch_size, dtype=torch.long, device=self._device
-                )
-                exec_mask = torch.zeros(
-                    self._batch_size, dtype=torch.bool, device=self._device
-                )
+                if graph_entry is None:
+                    codes_step = torch.zeros(
+                        n_vq,
+                        self._batch_size,
+                        step_t,
+                        dtype=torch.long,
+                        device=self._device,
+                    )
+                    codes_lengths = torch.zeros(
+                        self._batch_size, dtype=torch.long, device=self._device
+                    )
+                    exec_mask = torch.zeros(
+                        self._batch_size, dtype=torch.bool, device=self._device
+                    )
+                else:
+                    codes_step = graph_entry.codes_step
+                    codes_lengths = graph_entry.codes_lengths
+                    exec_mask = graph_entry.exec_mask
+                    codes_step.zero_()
+                    codes_lengths.zero_()
+                    exec_mask.zero_()
                 for slot, codes in slot_codes.items():
                     codes_step[:, slot, :] = codes.to(
                         device=self._device, dtype=torch.long
@@ -334,18 +465,42 @@ class _CodecStreamSession:
                     codes_lengths[slot] = step_t
                     exec_mask[slot] = True
             with torch.no_grad():
-                with _vocoder_scope(
-                    "moss_tts_local.vocoder.stream_step.set_exec_mask",
-                    request_ids=request_ids,
-                    metadata=scope_metadata,
-                ):
-                    self._codec._set_streaming_exec_mask(exec_mask)
-                with _vocoder_scope(
-                    "moss_tts_local.vocoder.stream_step.decode_frame",
-                    request_ids=request_ids,
-                    metadata=scope_metadata,
-                ):
-                    result = self._codec._decode_frame(codes_step, codes_lengths)
+                if graph_entry is None:
+                    with _vocoder_scope(
+                        "moss_tts_local.vocoder.stream_step.set_exec_mask",
+                        request_ids=request_ids,
+                        metadata={
+                            **scope_metadata,
+                            "codec_cuda_graph": False,
+                            "codec_cuda_graph_reason": (
+                                self._cuda_graph_disabled_reason or "not_captured"
+                            ),
+                        },
+                    ):
+                        self._codec._set_streaming_exec_mask(exec_mask)
+                    with _vocoder_scope(
+                        "moss_tts_local.vocoder.stream_step.decode_frame",
+                        request_ids=request_ids,
+                        metadata={
+                            **scope_metadata,
+                            "codec_cuda_graph": False,
+                            "codec_cuda_graph_reason": (
+                                self._cuda_graph_disabled_reason or "not_captured"
+                            ),
+                        },
+                    ):
+                        result = self._codec._decode_frame(codes_step, codes_lengths)
+                else:
+                    with _vocoder_scope(
+                        "moss_tts_local.vocoder.stream_step.decode_frame_cuda_graph",
+                        request_ids=request_ids,
+                        metadata={
+                            **scope_metadata,
+                            "codec_cuda_graph": True,
+                            "codec_cuda_graph_step_frames": int(graph_entry.step_t),
+                        },
+                    ):
+                        result = graph_entry.replay(self._codec)
             # One batched D2H per step, active slots only.
             slots = list(slot_codes)
             with _vocoder_scope(
@@ -531,11 +686,12 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         logger.info(
             "MOSS-TTS Local non-streaming codec path: %s "
             "(nonstream_max_step_frames=%s, nonstream_chunk_duration=%s, "
-            "nonstream_chunk_frames=%s)",
+            "nonstream_chunk_frames=%s, codec_cuda_graph=%s)",
             self._nonstream_codec_path,
             self._nonstream_max_step_frames,
             self._nonstream_chunk_duration,
             self._nonstream_chunk_frames,
+            _codec_cuda_graph_enabled(),
         )
         self._session: _CodecStreamSession | None = None
         self._offline_session: _CodecStreamSession | None = None
@@ -733,6 +889,12 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 self._codec,
                 stream_slots=0,
                 offline_slots=batch_size,
+                n_vq=self._n_vq,
+                cuda_graph_step_frames=(
+                    (self._nonstream_chunk_frames,)
+                    if _codec_cuda_graph_enabled()
+                    else ()
+                ),
             )
             self._offline_session_batch_size = batch_size
         return self._offline_session
