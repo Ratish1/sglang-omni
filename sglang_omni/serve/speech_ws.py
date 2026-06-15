@@ -9,7 +9,6 @@ import logging
 import uuid
 from collections import deque
 from collections.abc import Awaitable
-from contextlib import suppress
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -30,16 +29,24 @@ from sglang_omni.serve.speech_errors import (
     internal_error,
     openai_error_payload,
 )
-from sglang_omni.serve.speech_service import SpeechRequestValidator
+from sglang_omni.serve.speech_service import (
+    MAX_REFERENCE_AUDIO_BYTES,
+    PreparedSpeechRequest,
+    SpeechRequestValidator,
+)
 
 logger = logging.getLogger(__name__)
 
 CONFIG_TIMEOUT_S = 10.0
 IDLE_TIMEOUT_S = 30.0
-MAX_CONFIG_MESSAGE_BYTES = 4 * 1024 * 1024
+BASE64_ENCODED_REFERENCE_AUDIO_BYTES = ((MAX_REFERENCE_AUDIO_BYTES + 2) // 3) * 4
+MAX_CONFIG_MESSAGE_BYTES = BASE64_ENCODED_REFERENCE_AUDIO_BYTES + 1024 * 1024
 MAX_TEXT_MESSAGE_BYTES = 128 * 1024
 MAX_BUFFERED_TEXT_CHARS = 256 * 1024
 MAX_BUFFERED_RECEIVE_MESSAGES_DURING_GENERATION = 16
+MAX_BUFFERED_RECEIVE_BYTES_DURING_GENERATION = (
+    MAX_BUFFERED_RECEIVE_MESSAGES_DURING_GENERATION * MAX_TEXT_MESSAGE_BYTES
+)
 SENTENCE_BOUNDARIES = frozenset(".!?。！？")
 CLAUSE_BOUNDARIES = frozenset(".!?。！？,，;；")
 SUPPORTED_SPLIT_GRANULARITIES = frozenset({"sentence", "clause"})
@@ -47,6 +54,13 @@ SUPPORTED_SPLIT_GRANULARITIES = frozenset({"sentence", "clause"})
 
 def new_speech_ws_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+async def _cancel_tasks(*tasks: asyncio.Task[Any]) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class SpeechWebSocketSession:
@@ -69,6 +83,8 @@ class SpeechWebSocketSession:
         self.sentence_index = 0
         self.active_request_id: str | None = None
         self.buffered_receive_messages: deque[dict[str, Any]] = deque()
+        self.buffered_receive_message_bytes = 0
+        self.config_prepared_request: PreparedSpeechRequest | None = None
 
     async def run(self) -> None:
         try:
@@ -95,7 +111,7 @@ class SpeechWebSocketSession:
                     )
                 )
                 return False
-            self.config = self._parse_config(payload)
+            self.config = await self._parse_config(payload)
             await self._send_json(
                 {
                     "type": "session.configured",
@@ -187,7 +203,7 @@ class SpeechWebSocketSession:
             }
         )
 
-    def _parse_config(
+    async def _parse_config(
         self,
         payload: dict[str, Any],
     ) -> SpeechStreamSessionConfig:
@@ -213,9 +229,18 @@ class SpeechWebSocketSession:
                 "stream_audio=true requires response_format='pcm'",
                 param="response_format",
             )
-        self.speech_service.parse_request(
-            self._speech_payload_from_config(config, "probe")
+        prepared = await asyncio.to_thread(
+            self.speech_service.parse_generation_request,
+            self._speech_payload_from_config(config, "probe"),
         )
+        config_fields = set(SpeechStreamSessionConfig.model_fields)
+        prepared_updates = {
+            key: value
+            for key, value in prepared.request.model_dump().items()
+            if key in config_fields
+        }
+        self.config_prepared_request = prepared
+        config = config.model_copy(update=prepared_updates)
         return config
 
     async def _generate_sentence(self, sentence: str) -> None:
@@ -279,12 +304,11 @@ class SpeechWebSocketSession:
     async def _stream_sentence_audio(self, sentence: str, *, request_id: str) -> int:
         assert self.config is not None
         request = self._speech_request_from_config(sentence=sentence, stream=True)
-        prepared = self.speech_service.prepare_generation_request(request)
         gen_req = self.speech_service.build_generate_request(
-            prepared.request,
+            request,
             validate=False,
-            reference_descriptors=prepared.reference_descriptors,
-            uploaded_voice=prepared.uploaded_voice,
+            reference_descriptors=self._config_reference_descriptors(),
+            uploaded_voice=self._config_uploaded_voice(),
         )
         emitted_samples = 0
         total_bytes = 0
@@ -317,7 +341,12 @@ class SpeechWebSocketSession:
     async def _send_sentence_audio(self, sentence: str, *, request_id: str) -> int:
         assert self.config is not None
         request = self._speech_request_from_config(sentence=sentence, stream=False)
-        gen_req = self.speech_service.build_generate_request(request)
+        gen_req = self.speech_service.build_generate_request(
+            request,
+            validate=False,
+            reference_descriptors=self._config_reference_descriptors(),
+            uploaded_voice=self._config_uploaded_voice(),
+        )
         result = await self.client.speech(
             gen_req,
             request_id=request_id,
@@ -355,6 +384,16 @@ class SpeechWebSocketSession:
         payload["stream"] = config.stream_audio if stream is None else stream
         return payload
 
+    def _config_reference_descriptors(self) -> list[dict[str, Any]]:
+        if self.config_prepared_request is None:
+            return []
+        return self.config_prepared_request.reference_descriptors
+
+    def _config_uploaded_voice(self) -> Any:
+        if self.config_prepared_request is None:
+            return None
+        return self.config_prepared_request.uploaded_voice
+
     def _pop_complete_segments(self) -> list[str]:
         assert self.config is not None
         boundaries = (
@@ -382,34 +421,42 @@ class SpeechWebSocketSession:
     async def _run_generation_until_disconnect(self, generation: Awaitable[int]) -> int:
         generation_task = asyncio.ensure_future(generation)
         disconnect_task = asyncio.create_task(self._watch_client_disconnect())
-        done, _ = await asyncio.wait(
-            {generation_task, disconnect_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if generation_task in done:
-            disconnect_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await disconnect_task
-            return generation_task.result()
+        try:
+            done, _ = await asyncio.wait(
+                {generation_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if generation_task in done:
+                await _cancel_tasks(disconnect_task)
+                return generation_task.result()
 
-        generation_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await generation_task
-        disconnect_task.result()
-        raise WebSocketDisconnect
+            await _cancel_tasks(generation_task)
+            disconnect_task.result()
+            raise WebSocketDisconnect
+        except asyncio.CancelledError:
+            await _cancel_tasks(generation_task, disconnect_task)
+            raise
+        except Exception:
+            await _cancel_tasks(generation_task, disconnect_task)
+            raise
 
     async def _watch_client_disconnect(self) -> None:
         while True:
             message = await self.websocket.receive()
             if message.get("type") == "websocket.disconnect":
                 raise WebSocketDisconnect
+            message_size = self._receive_message_size(message)
             if (
                 len(self.buffered_receive_messages)
                 >= MAX_BUFFERED_RECEIVE_MESSAGES_DURING_GENERATION
+                or message_size > MAX_TEXT_MESSAGE_BYTES
+                or self.buffered_receive_message_bytes + message_size
+                > MAX_BUFFERED_RECEIVE_BYTES_DURING_GENERATION
             ):
                 self.closed = True
                 raise WebSocketDisconnect
             self.buffered_receive_messages.append(message)
+            self.buffered_receive_message_bytes += message_size
 
     async def _receive_text_frame(
         self,
@@ -420,6 +467,11 @@ class SpeechWebSocketSession:
     ) -> str:
         if self.buffered_receive_messages:
             message = self.buffered_receive_messages.popleft()
+            self.buffered_receive_message_bytes = max(
+                0,
+                self.buffered_receive_message_bytes
+                - self._receive_message_size(message),
+            )
         else:
             message = await asyncio.wait_for(
                 self.websocket.receive(), timeout=timeout_s
@@ -442,6 +494,16 @@ class SpeechWebSocketSession:
             raise ValueError("speech WebSocket client messages must be text frames")
         self._validate_message_size(raw, max_bytes, message_kind)
         return raw
+
+    @staticmethod
+    def _receive_message_size(message: dict[str, Any]) -> int:
+        text = message.get("text")
+        if isinstance(text, str):
+            return len(text.encode("utf-8"))
+        frame_bytes = message.get("bytes")
+        if isinstance(frame_bytes, (bytes, bytearray, memoryview)):
+            return len(frame_bytes)
+        return 0
 
     @staticmethod
     def _validate_message_size(raw: str, max_bytes: int, message_kind: str) -> None:

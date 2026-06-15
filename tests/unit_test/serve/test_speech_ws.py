@@ -13,6 +13,7 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from sglang_omni.client import GenerateChunk
 from sglang_omni.client.types import SpeechResult
 from sglang_omni.serve import create_app
+from sglang_omni.serve import speech_ws as speech_ws_module
 from sglang_omni.serve.protocol import SpeechStreamSessionConfig
 from sglang_omni.serve.speech_service import SpeechRequestValidator
 from sglang_omni.serve.speech_ws import (
@@ -178,6 +179,16 @@ class InvalidAudioStreamingSpeechClient:
 
     async def abort(self, request_id: str) -> None:
         self.aborted.append(request_id)
+
+
+class CountingSpeechRequestValidator(SpeechRequestValidator):
+    def __init__(self) -> None:
+        super().__init__(default_model="tts")
+        self.prepare_count = 0
+
+    def prepare_generation_request(self, request: Any) -> Any:
+        self.prepare_count += 1
+        return super().prepare_generation_request(request)
 
 
 class CompletedSpeechClient:
@@ -466,6 +477,37 @@ def test_speech_websocket_cancellation_aborts_active_request() -> None:
     asyncio.run(run())
 
 
+def test_speech_websocket_parent_cancellation_cleans_generation_tasks() -> None:
+    async def run() -> None:
+        client_impl = BlockingStreamingSpeechClient()
+        websocket = RecordingWebSocket()
+        session = SpeechWebSocketSession(
+            websocket,
+            client=client_impl,
+            speech_service=SpeechRequestValidator(default_model="tts"),
+        )
+        session.config = SpeechStreamSessionConfig(stream_audio=True)
+        before_tasks = asyncio.all_tasks()
+
+        task = asyncio.create_task(session._generate_sentence("Hello."))
+        await client_impl.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+
+        leaked_tasks = [
+            pending_task
+            for pending_task in asyncio.all_tasks()
+            if pending_task not in before_tasks and not pending_task.done()
+        ]
+        assert leaked_tasks == []
+        assert client_impl.aborted == [websocket.sent_text[0]["id"]]
+        assert session.active_request_id is None
+
+    asyncio.run(run())
+
+
 def test_speech_websocket_send_failure_aborts_active_stream() -> None:
     async def run() -> None:
         client_impl = TwoChunkStreamingSpeechClient()
@@ -596,6 +638,33 @@ def test_speech_websocket_peer_disconnect_aborts_between_stream_chunks() -> None
     asyncio.run(run())
 
 
+def test_speech_websocket_reuses_prepared_session_references() -> None:
+    async def run() -> None:
+        client_impl = StreamingSpeechClient()
+        speech_service = CountingSpeechRequestValidator()
+        websocket = RecordingWebSocket()
+        session = SpeechWebSocketSession(
+            websocket,
+            client=client_impl,
+            speech_service=speech_service,
+        )
+
+        session.config = await session._parse_config(
+            {
+                "type": "session.config",
+                "stream_audio": True,
+                "response_format": "pcm",
+            }
+        )
+        await session._generate_sentence("First.")
+        await session._generate_sentence("Second.")
+
+        assert speech_service.prepare_count == 1
+        assert client_impl.generated_prompts == ["First.", "Second."]
+
+    asyncio.run(run())
+
+
 def test_speech_websocket_disconnect_watch_preserves_client_frames() -> None:
     async def run() -> None:
         client_impl = ReleasableSpeechClient()
@@ -656,6 +725,79 @@ def test_speech_websocket_disconnect_watch_aborts_on_buffer_overflow() -> None:
             len(session.buffered_receive_messages)
             == MAX_BUFFERED_RECEIVE_MESSAGES_DURING_GENERATION
         )
+        assert client_impl.aborted == [websocket.sent_text[0]["id"]]
+        assert session.active_request_id is None
+        assert session.closed is True
+
+    asyncio.run(run())
+
+
+def test_speech_websocket_disconnect_watch_rejects_oversized_buffered_frame() -> None:
+    async def run() -> None:
+        client_impl = PausingStreamingSpeechClient()
+        websocket = RecordingWebSocket(
+            receive_messages=[
+                {
+                    "type": "websocket.receive",
+                    "text": "x" * (MAX_TEXT_MESSAGE_BYTES + 1),
+                }
+            ],
+            receive_after_bytes=1,
+        )
+        session = SpeechWebSocketSession(
+            websocket,
+            client=client_impl,
+            speech_service=SpeechRequestValidator(default_model="tts"),
+        )
+        session.config = SpeechStreamSessionConfig(stream_audio=True)
+
+        with pytest.raises(WebSocketDisconnect):
+            await session._generate_sentence("Hello.")
+
+        assert len(session.buffered_receive_messages) == 0
+        assert session.buffered_receive_message_bytes == 0
+        assert client_impl.aborted == [websocket.sent_text[0]["id"]]
+        assert session.active_request_id is None
+        assert session.closed is True
+
+    asyncio.run(run())
+
+
+def test_speech_websocket_disconnect_watch_aborts_on_buffered_byte_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        first_message = json.dumps({"type": "input.text", "text": "queued"})
+        byte_cap = len(first_message) + 1
+        monkeypatch.setattr(
+            speech_ws_module,
+            "MAX_BUFFERED_RECEIVE_BYTES_DURING_GENERATION",
+            byte_cap,
+        )
+        client_impl = PausingStreamingSpeechClient()
+        websocket = RecordingWebSocket(
+            receive_messages=[
+                {"type": "websocket.receive", "text": first_message},
+                {
+                    "type": "websocket.receive",
+                    "text": json.dumps({"type": "input.text", "text": "overflow"}),
+                },
+            ],
+            receive_after_bytes=1,
+        )
+        session = SpeechWebSocketSession(
+            websocket,
+            client=client_impl,
+            speech_service=SpeechRequestValidator(default_model="tts"),
+        )
+        session.config = SpeechStreamSessionConfig(stream_audio=True)
+
+        with pytest.raises(WebSocketDisconnect):
+            await session._generate_sentence("Hello.")
+
+        assert len(session.buffered_receive_messages) == 1
+        assert session.buffered_receive_message_bytes == len(first_message)
+        assert session.buffered_receive_message_bytes <= byte_cap
         assert client_impl.aborted == [websocket.sent_text[0]["id"]]
         assert session.active_request_id is None
         assert session.closed is True

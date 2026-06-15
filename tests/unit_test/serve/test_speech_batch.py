@@ -273,6 +273,30 @@ def test_batch_speech_rejects_streaming_items() -> None:
     assert client_impl.requests == []
 
 
+def test_batch_speech_rejects_unknown_item_fields() -> None:
+    client_impl = RecordingBatchSpeechClient()
+    client = TestClient(create_app(client_impl, model_name="tts"))
+
+    response = client.post(
+        "/v1/audio/speech/batch",
+        json={
+            "items": [
+                {"input": "first"},
+                {"input": "wrong model", "model": "other-tts"},
+                {"input": "third"},
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["succeeded"] == 2
+    assert body["failed"] == 1
+    assert body["results"][1]["status"] == "error"
+    assert body["results"][1]["error"]["param"] == "items.1.model"
+    assert [request.prompt for request in client_impl.requests] == ["first", "third"]
+
+
 def test_batch_speech_isolates_runtime_failures_and_preserves_order() -> None:
     client_impl = MixedBatchSpeechClient()
     client = TestClient(create_app(client_impl, model_name="tts"))

@@ -31,10 +31,17 @@ uv pip install --no-deps qwen-tts==0.1.1
 
 ## Launch the Server
 
+The reference-audio examples below fetch clips from Hugging Face, so the
+commands include the Hugging Face host and its current download redirect host.
+Omit those flags when your requests use only text, uploaded voices, local/file
+references, or data URLs.
+
 ```bash
 sgl-omni serve \
   --model-path fishaudio/s2-pro \
   --config examples/configs/s2pro_tts.yaml \
+  --allowed-media-domain huggingface.co \
+  --allowed-media-domain cas-bridge.xethub.hf.co \
   --port 8000
 ```
 
@@ -46,6 +53,8 @@ sgl-omni serve \
   --model-path fishaudio/s2-pro \
   --config examples/configs/s2pro_tts.yaml \
   --tts-batch-max-items 32 \
+  --allowed-media-domain huggingface.co \
+  --allowed-media-domain cas-bridge.xethub.hf.co \
   --port 8000
 ```
 
@@ -55,6 +64,8 @@ For Voxtral:
 sgl-omni serve \
   --model-path mistralai/Voxtral-4B-TTS-2603 \
   --config examples/configs/voxtral_tts.yaml \
+  --allowed-media-domain huggingface.co \
+  --allowed-media-domain cas-bridge.xethub.hf.co \
   --port 8000
 ```
 
@@ -64,6 +75,8 @@ For Qwen3-TTS Base:
 sgl-omni serve \
   --model-path Qwen/Qwen3-TTS-12Hz-0.6B-Base \
   --config examples/configs/qwen3_tts_0_6b.yaml \
+  --allowed-media-domain huggingface.co \
+  --allowed-media-domain cas-bridge.xethub.hf.co \
   --port 8000
 ```
 
@@ -73,6 +86,8 @@ For Qwen3-TTS CustomVoice:
 sgl-omni serve \
   --model-path Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
   --config examples/configs/qwen3_tts_0_6b_customvoice.yaml \
+  --allowed-media-domain huggingface.co \
+  --allowed-media-domain cas-bridge.xethub.hf.co \
   --port 8000
 ```
 
@@ -82,6 +97,8 @@ For Qwen3-TTS VoiceDesign:
 sgl-omni serve \
   --model-path Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
   --config examples/configs/qwen3_tts_1_7b_voicedesign.yaml \
+  --allowed-media-domain huggingface.co \
+  --allowed-media-domain cas-bridge.xethub.hf.co \
   --port 8000
 ```
 
@@ -91,6 +108,8 @@ For MOSS-TTS:
 sgl-omni serve \
   --model-path OpenMOSS-Team/MOSS-TTS-v1.5 \
   --config examples/configs/moss_tts.yaml \
+  --allowed-media-domain huggingface.co \
+  --allowed-media-domain cas-bridge.xethub.hf.co \
   --port 8000
 ```
 

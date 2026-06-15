@@ -349,7 +349,7 @@ class SpeechRequestValidator:
         request_id: str,
         index: int,
     ) -> SpeechBatchResult:
-        prepared = self.prepare_generation_request(request)
+        prepared = await asyncio.to_thread(self.prepare_generation_request, request)
         gen_req = self.build_generate_request(
             prepared.request,
             validate=False,
@@ -395,6 +395,13 @@ class SpeechRequestValidator:
         *,
         index: int,
     ) -> CreateSpeechRequest:
+        extra_fields = sorted((item.model_extra or {}).keys())
+        if extra_fields:
+            field_name = extra_fields[0]
+            raise bad_request(
+                f"unsupported batch item field: {field_name}",
+                param=f"items.{index}.{field_name}",
+            )
         payload = batch.model_dump(exclude={"items"}, exclude_none=True)
         item_payload = item.model_dump(exclude_none=True)
         payload.update(item_payload)

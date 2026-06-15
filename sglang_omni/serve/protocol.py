@@ -229,7 +229,7 @@ class CreateSpeechRequest(BaseModel):
 class SpeechBatchItem(BaseModel):
     """One item in a batch text-to-speech request."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     input: Any = None
     voice: Any = Field(

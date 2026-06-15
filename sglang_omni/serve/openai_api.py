@@ -995,7 +995,7 @@ def _register_speech_batch(app: FastAPI) -> None:
         request_id = f"speech-batch-{uuid.uuid4()}"
         try:
             payload = await request.json()
-            batch = speech_service.parse_batch_request(payload)
+            batch = await asyncio.to_thread(speech_service.parse_batch_request, payload)
             response = await _create_speech_batch_with_disconnect_watch(
                 request,
                 client=client,
