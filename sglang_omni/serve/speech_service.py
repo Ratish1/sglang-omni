@@ -6,8 +6,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import hashlib
-import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,6 +61,7 @@ MAX_SPEECH_INPUT_CHARS = 4096
 MAX_REFERENCE_AUDIO_BYTES = 10 * 1024 * 1024
 _REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "audio")
 RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 1
+_ReferenceCacheKey = tuple[Any, ...]
 
 
 @dataclass(frozen=True)
@@ -319,7 +318,9 @@ class SpeechRequestValidator:
         tasks: list[asyncio.Task[SpeechBatchResult]] = []
         task_indexes: list[int] = []
         task_request_ids: list[str] = []
-        reference_tasks: dict[str, asyncio.Task[PreparedSpeechReferences]] = {}
+        reference_tasks: dict[
+            _ReferenceCacheKey, asyncio.Task[PreparedSpeechReferences]
+        ] = {}
         reference_task_lock = asyncio.Lock()
 
         for index, item in enumerate(batch.items):
@@ -381,7 +382,9 @@ class SpeechRequestValidator:
         *,
         request_id: str,
         index: int,
-        reference_tasks: dict[str, asyncio.Task[PreparedSpeechReferences]],
+        reference_tasks: dict[
+            _ReferenceCacheKey, asyncio.Task[PreparedSpeechReferences]
+        ],
         reference_task_lock: asyncio.Lock,
     ) -> SpeechBatchResult:
         prepared = await self._prepare_batch_item_request(
@@ -418,7 +421,9 @@ class SpeechRequestValidator:
         self,
         request: CreateSpeechRequest,
         *,
-        reference_tasks: dict[str, asyncio.Task[PreparedSpeechReferences]],
+        reference_tasks: dict[
+            _ReferenceCacheKey, asyncio.Task[PreparedSpeechReferences]
+        ],
         reference_task_lock: asyncio.Lock,
     ) -> PreparedSpeechRequest:
         updates = self._prepare_generation_updates(request)
@@ -883,13 +888,28 @@ def _batch_item_error(error: SpeechAPIError, *, index: int) -> SpeechAPIError:
     )
 
 
-def _batch_reference_cache_key(request: CreateSpeechRequest) -> str:
-    values = request.model_dump(
-        mode="json",
-        include={"voice", "task_type", "ref_audio", "ref_text", "references"},
+def _batch_reference_cache_key(request: CreateSpeechRequest) -> _ReferenceCacheKey:
+    references = tuple(
+        _freeze_reference_value(reference.model_dump(mode="json", exclude_none=True))
+        for reference in request.references or ()
     )
-    serialized = json.dumps(values, sort_keys=True)
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return (
+        request.voice,
+        request.task_type,
+        request.ref_audio,
+        request.ref_text,
+        references,
+    )
+
+
+def _freeze_reference_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple(
+            (key, _freeze_reference_value(item)) for key, item in sorted(value.items())
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_reference_value(item) for item in value)
+    return value
 
 
 def _validate_positive_int(value: int | None, *, param: str) -> None:
