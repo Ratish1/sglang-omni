@@ -15,7 +15,11 @@ from sglang_omni.client.types import SpeechResult
 from sglang_omni.serve import create_app
 from sglang_omni.serve.protocol import SpeechStreamSessionConfig
 from sglang_omni.serve.speech_service import SpeechRequestValidator
-from sglang_omni.serve.speech_ws import MAX_TEXT_MESSAGE_BYTES, SpeechWebSocketSession
+from sglang_omni.serve.speech_ws import (
+    MAX_BUFFERED_RECEIVE_MESSAGES_DURING_GENERATION,
+    MAX_TEXT_MESSAGE_BYTES,
+    SpeechWebSocketSession,
+)
 
 
 class StreamingSpeechClient:
@@ -621,6 +625,40 @@ def test_speech_websocket_disconnect_watch_preserves_client_frames() -> None:
 
         assert json.loads(raw)["type"] == "input.done"
         assert client_impl.aborted == []
+
+    asyncio.run(run())
+
+
+def test_speech_websocket_disconnect_watch_aborts_on_buffer_overflow() -> None:
+    async def run() -> None:
+        client_impl = PausingStreamingSpeechClient()
+        websocket = RecordingWebSocket(
+            receive_messages=[
+                {
+                    "type": "websocket.receive",
+                    "text": json.dumps({"type": "input.text", "text": str(index)}),
+                }
+                for index in range(MAX_BUFFERED_RECEIVE_MESSAGES_DURING_GENERATION + 1)
+            ],
+            receive_after_bytes=1,
+        )
+        session = SpeechWebSocketSession(
+            websocket,
+            client=client_impl,
+            speech_service=SpeechRequestValidator(default_model="tts"),
+        )
+        session.config = SpeechStreamSessionConfig(stream_audio=True)
+
+        with pytest.raises(WebSocketDisconnect):
+            await session._generate_sentence("Hello.")
+
+        assert (
+            len(session.buffered_receive_messages)
+            == MAX_BUFFERED_RECEIVE_MESSAGES_DURING_GENERATION
+        )
+        assert client_impl.aborted == [websocket.sent_text[0]["id"]]
+        assert session.active_request_id is None
+        assert session.closed is True
 
     asyncio.run(run())
 

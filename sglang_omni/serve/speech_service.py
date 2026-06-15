@@ -414,13 +414,56 @@ class SpeechRequestValidator:
             ) from exc
 
     def _validate_batch_defaults(self, batch: CreateSpeechBatchRequest) -> None:
-        payload = batch.model_dump(exclude={"items"}, exclude_none=True)
-        payload["input"] = "__batch_defaults_validation__"
-        try:
-            request = CreateSpeechRequest.model_validate(payload)
-        except ValidationError as exc:
-            raise bad_request(_validation_error_message(exc)) from exc
-        self.prepare_request(request)
+        response_format = _normalize_response_format(batch.response_format)
+        self._validate_encoder_dependency(response_format)
+        if not TTS_SPEED_MIN <= float(batch.speed) <= TTS_SPEED_MAX:
+            raise bad_request(
+                f"speed must be between {TTS_SPEED_MIN} and {TTS_SPEED_MAX}",
+                param="speed",
+            )
+        task_type = (
+            _normalize_task_type(batch.task_type)
+            if batch.task_type is not None
+            else None
+        )
+        if batch.language is not None:
+            _normalize_language(batch.language)
+        for field_name in ("max_new_tokens", "token_count", "duration_tokens"):
+            _validate_positive_int(getattr(batch, field_name), param=field_name)
+        _validate_non_negative_int(
+            batch.initial_codec_chunk_frames,
+            param=INITIAL_CODEC_CHUNK_FRAMES_PARAM,
+        )
+        _validate_non_negative_int(batch.seed, param="seed")
+        if batch.ref_audio is not None:
+            self._load_media_reference_descriptor(batch.ref_audio, param="ref_audio")
+        if batch.references:
+            for reference in batch.references:
+                self._normalize_speech_reference(reference)
+        if (
+            self.voice_store is not None
+            and self.supports_uploaded_voice_references
+            and batch.ref_audio is None
+            and not batch.references
+            and batch.voice
+            and batch.voice.lower() != "default"
+        ):
+            uploaded_voice = self.voice_store.resolve_reference(batch.voice)
+            if uploaded_voice is None and self.requires_uploaded_voice_for_named_voice:
+                raise bad_request(
+                    f"Unknown voice '{batch.voice}'. Upload a voice first via "
+                    "POST /v1/audio/voices, or use ref_audio + ref_text.",
+                    param="voice",
+                )
+            if (
+                uploaded_voice is not None
+                and task_type is not None
+                and task_type != "Base"
+            ):
+                raise bad_request(
+                    "uploaded voice requests require task_type='Base'",
+                    param="task_type",
+                )
 
     def _resolve_uploaded_voice_reference(
         self, request: CreateSpeechRequest

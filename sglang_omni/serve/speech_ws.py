@@ -39,6 +39,7 @@ IDLE_TIMEOUT_S = 30.0
 MAX_CONFIG_MESSAGE_BYTES = 4 * 1024 * 1024
 MAX_TEXT_MESSAGE_BYTES = 128 * 1024
 MAX_BUFFERED_TEXT_CHARS = 256 * 1024
+MAX_BUFFERED_RECEIVE_MESSAGES_DURING_GENERATION = 16
 SENTENCE_BOUNDARIES = frozenset(".!?。！？")
 CLAUSE_BOUNDARIES = frozenset(".!?。！？,，;；")
 SUPPORTED_SPLIT_GRANULARITIES = frozenset({"sentence", "clause"})
@@ -402,6 +403,12 @@ class SpeechWebSocketSession:
             message = await self.websocket.receive()
             if message.get("type") == "websocket.disconnect":
                 raise WebSocketDisconnect
+            if (
+                len(self.buffered_receive_messages)
+                >= MAX_BUFFERED_RECEIVE_MESSAGES_DURING_GENERATION
+            ):
+                self.closed = True
+                raise WebSocketDisconnect
             self.buffered_receive_messages.append(message)
 
     async def _receive_text_frame(
@@ -481,8 +488,7 @@ class SpeechWebSocketSession:
         if self.active_request_id != request_id:
             return
         self.active_request_id = None
-        if hasattr(self.client, "abort"):
-            await self.client.abort(request_id)
+        await self.client.abort(request_id)
 
     async def _abort_active_request(self) -> None:
         if self.active_request_id is not None:
