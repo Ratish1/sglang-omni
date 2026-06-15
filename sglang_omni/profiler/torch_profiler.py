@@ -29,6 +29,7 @@ class TorchProfiler(ProfilerBase):
 
     _profiler: profile | None = None
     _trace_template: str = ""
+    _trace_template_has_rank: bool = False
 
     _active_run_id: str | None = None
     _lock = threading.Lock()
@@ -38,16 +39,45 @@ class TorchProfiler(ProfilerBase):
         return cls._active_run_id
 
     @classmethod
-    def start(cls, trace_path_template: str, run_id: str | None = None) -> str:
+    def _trace_json_path(
+        cls,
+        trace_path_template: str,
+        *,
+        rank: int,
+        template_has_rank: bool,
+    ) -> str:
+        base_path = (
+            trace_path_template
+            if template_has_rank
+            else f"{trace_path_template}_rank{rank}"
+        )
+        return f"{base_path}.trace.json"
+
+    @classmethod
+    def start(
+        cls,
+        trace_path_template: str,
+        run_id: str | None = None,
+        *,
+        template_has_rank: bool = False,
+    ) -> str:
         """
         Start the profiler with the given trace path template.
         """
         with cls._lock:
+            rank = cls._get_rank()
 
             # 1. Cleanup any existing profiler
             if cls._profiler is not None:
                 if run_id is not None and cls._active_run_id == run_id:
-                    return f"{cls._trace_template}_rank{rank}.trace.json.gz"
+                    return (
+                        cls._trace_json_path(
+                            cls._trace_template,
+                            rank=rank,
+                            template_has_rank=cls._trace_template_has_rank,
+                        )
+                        + ".gz"
+                    )
 
                 logger.warning(
                     "[Rank %s] Torch profiler already active (run_id=%s), restarting for run_id=%s",
@@ -64,16 +94,20 @@ class TorchProfiler(ProfilerBase):
                 cls._profiler = None
                 cls._active_run_id = None
                 cls._trace_template = ""
-
-            rank = cls._get_rank()
+                cls._trace_template_has_rank = False
 
             # 2. Make path absolute
             trace_path_template = os.path.abspath(trace_path_template)
             cls._trace_template = trace_path_template
+            cls._trace_template_has_rank = bool(template_has_rank)
             cls._active_run_id = run_id
 
             # Expected paths
-            json_file = f"{trace_path_template}_rank{rank}.trace.json"
+            json_file = cls._trace_json_path(
+                trace_path_template,
+                rank=rank,
+                template_has_rank=bool(template_has_rank),
+            )
 
             os.makedirs(os.path.dirname(json_file), exist_ok=True)
 
@@ -123,7 +157,7 @@ class TorchProfiler(ProfilerBase):
             cls._profiler.start()
 
             # Return the expected final path
-            return f"{trace_path_template}_rank{rank}.trace.json.gz"
+            return f"{json_file}.gz"
 
     @classmethod
     def stop(cls, *, run_id: str | None = None) -> dict | None:
@@ -149,8 +183,11 @@ class TorchProfiler(ProfilerBase):
                 )
                 return None
 
-            base_path = f"{cls._trace_template}_rank{rank}"
-            json_path = f"{base_path}.trace.json"
+            json_path = cls._trace_json_path(
+                cls._trace_template,
+                rank=rank,
+                template_has_rank=cls._trace_template_has_rank,
+            )
             gz_path = f"{json_path}.gz"
 
             profiler = cls._profiler
@@ -184,6 +221,7 @@ class TorchProfiler(ProfilerBase):
             cls._profiler = None
             cls._active_run_id = None
             cls._trace_template = ""
+            cls._trace_template_has_rank = False
 
             return {"trace": gz_path, "table": None}
 

@@ -13,6 +13,7 @@ import inspect
 import logging
 import os
 import queue as _queue_mod
+import string
 import threading
 from contextlib import suppress
 from typing import Any, Callable, Literal
@@ -46,6 +47,42 @@ logger = logging.getLogger(__name__)
 
 GetNextFn = Callable[[str, Any], str | list[str] | None]
 GetStreamDoneTargetsFn = Callable[[str, Any], str | list[str] | None]
+
+_TRACE_TEMPLATE_FIELDS = frozenset({"run_id", "stage", "pid", "rank"})
+
+
+def _format_trace_path_template(
+    template: str,
+    *,
+    run_id: str,
+    stage: str,
+    pid: int,
+    rank: int,
+) -> tuple[str, bool]:
+    """Format a torch-profiler path template without losing pid/rank uniqueness.
+
+    Historically templates accepted ``{run_id}`` and ``{stage}``; the stage
+    runtime appended ``_pid...`` and :class:`TorchProfiler` appended
+    ``_rank...``. This helper also accepts explicit ``{pid}`` and ``{rank}``
+    placeholders while preserving that legacy suffix behavior when either is
+    omitted.
+    """
+    fields = {
+        field_name
+        for _, field_name, _, _ in string.Formatter().parse(template)
+        if field_name
+    }
+    invalid = fields - _TRACE_TEMPLATE_FIELDS
+    if invalid:
+        raise ValueError(
+            "trace_path_template only supports placeholders "
+            f"{sorted(_TRACE_TEMPLATE_FIELDS)}, got {sorted(invalid)}"
+        )
+
+    formatted = template.format(run_id=run_id, stage=stage, pid=pid, rank=rank)
+    if "pid" not in fields:
+        formatted = f"{formatted}_pid{pid}"
+    return formatted, "rank" in fields
 
 
 class Stage:
@@ -1327,12 +1364,26 @@ class Stage:
     def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id
         if msg.enable_torch and not TorchProfiler.is_active():
-            base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
-            template = f"{base_tpl}_pid{os.getpid()}"
-            prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
-            if prof_dir and not os.path.isabs(template):
-                template = os.path.join(prof_dir, template)
-            TorchProfiler.start(template, run_id=run_id)
+            try:
+                template, template_has_rank = _format_trace_path_template(
+                    msg.trace_path_template,
+                    run_id=run_id,
+                    stage=self.name,
+                    pid=os.getpid(),
+                    rank=TorchProfiler._get_rank(),
+                )
+                prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
+                if prof_dir and not os.path.isabs(template):
+                    template = os.path.join(prof_dir, template)
+                TorchProfiler.start(
+                    template,
+                    run_id=run_id,
+                    template_has_rank=template_has_rank,
+                )
+            except Exception:
+                logger.warning(
+                    "Stage %s failed to start torch profiler", self.name, exc_info=True
+                )
         if msg.event_dir is not None:
             try:
                 _get_recorder().start(

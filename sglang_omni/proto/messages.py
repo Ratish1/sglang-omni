@@ -247,7 +247,7 @@ class ProfilerStartMessage:
     """Profiler start for a stage."""
 
     run_id: str
-    trace_path_template: str  # e.g. "/tmp/profiles/{run_id}/{stage}/trace"
+    trace_path_template: str  # Supports {run_id}, {stage}, {pid}, {rank}.
     event_dir: str | None = None  # Per-stage JSONL event sink dir for request profiling
     enable_torch: bool = True  # When False, only request-level events are captured
 

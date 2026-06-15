@@ -410,6 +410,13 @@ multi-GB trace — only opt in when you need that specific information.
 | POST | `/start_request_profile` | `{"run_id": ?, "event_dir": ?}` | Event recorder only — no torch trace. Lower overhead; safer to leave on. |
 | POST | `/stop_request_profile` | `{"run_id": ?}` | Same wildcard semantics as `/stop_profile`. |
 
+`trace_path_template` supports `{run_id}`, `{stage}`, `{pid}`, and `{rank}`.
+If `{pid}` or `{rank}` are omitted, the runtime appends them automatically, so
+`"/tmp/profiles/{run_id}/{stage}"` and
+`"/tmp/profiles/{run_id}/{stage}_pid{pid}_rank{rank}"` both produce unique
+per-process/per-rank trace files. Unknown placeholders disable torch profiling
+for that stage and are logged as a warning instead of crashing the pipeline.
+
 Example: record cheap events on every request without a kernel trace:
 
 ```bash
