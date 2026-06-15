@@ -254,6 +254,24 @@ python scripts/debug/trace_summary.py \
 The script writes `trace_summary.txt`, `trace_summary.json`, and
 `perfetto_sync_queries.sql`.
 
+For Nsight Systems SQLite exports from MOSS-TTS Local non-streaming codec
+profiles, use:
+
+```bash
+python scripts/debug/nsys_moss_codec_summary.py \
+  /path/to/nsys_moss_vocoder_processor.sqlite \
+  --out-dir /path/to/reports
+```
+
+This script expects traces collected with both
+`SGLANG_OMNI_NVTX_RANGES=1` and
+`SGLANG_MOSS_TTS_LOCAL_VOCODER_DEEP_PROFILE=1`. It writes
+`nsys_moss_codec_summary.md` and `nsys_moss_codec_summary.json`, including
+codec decoder label totals, nested decoder/attention overlap under
+`processor.decode_audio_codes`, CUDA runtime overlap, and kernel overlap.
+Use it before proposing codec optimizations so the target is tied to the
+remote-code decoder internals rather than the Omni packaging boundary.
+
 If Chrome trace export drops user `record_function` names, set
 `SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1` for a scoped run. This emits
 matching request-event intervals for the same scopes, using sanitized event
