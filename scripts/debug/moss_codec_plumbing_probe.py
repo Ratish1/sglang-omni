@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import statistics
 import sys
 import time
@@ -120,26 +121,185 @@ def _torch_arange_cache() -> Iterator[dict[str, Any]]:
         torch.arange = original_arange  # type: ignore[assignment]
 
 
-def _candidate_context(name: str) -> contextlib.AbstractContextManager[dict[str, Any]]:
+def _set_torch_compile_config() -> None:
+    try:
+        from sglang.srt.compilation.torch_compile_decoration import (
+            set_torch_compile_config,
+        )
+    except ImportError:
+        from sglang.srt.model_executor.cuda_graph_runner import set_torch_compile_config
+
+    set_torch_compile_config()
+
+
+def _resolve_compile_mode(compile_mode: str | None) -> str:
+    return (
+        compile_mode
+        or os.environ.get("SGLANG_TORCH_COMPILE_MODE")
+        or "max-autotune-no-cudagraphs"
+    )
+
+
+@contextlib.contextmanager
+def _inductor_gemm_autotune() -> Iterator[dict[str, Any]]:
+    """Temporarily enable per-shape GEMM autotuning for compiled candidates."""
+
+    try:
+        from torch._inductor import config as inductor_config
+    except Exception:
+        yield {"supported": False}
+        return
+
+    previous: dict[str, Any] = {}
+    updates = {
+        "max_autotune_gemm": True,
+        "max_autotune_gemm_backends": "TRITON,ATEN",
+    }
+    for key, value in updates.items():
+        if hasattr(inductor_config, key):
+            previous[key] = getattr(inductor_config, key)
+            setattr(inductor_config, key, value)
+    try:
+        yield {"supported": True, "updated": sorted(previous)}
+    finally:
+        for key, value in previous.items():
+            setattr(inductor_config, key, value)
+
+
+def _iter_projected_transformers(codec: Any) -> list[Any]:
+    decoder = getattr(codec, "decoder", None)
+    if decoder is None:
+        return []
+    modules = []
+    for module in decoder:
+        if all(
+            hasattr(module, name)
+            for name in ("input_proj", "transformer", "output_proj")
+        ):
+            modules.append(module)
+    return modules
+
+
+def _iter_transformer_layers(codec: Any) -> list[Any]:
+    layers = []
+    for module in _iter_projected_transformers(codec):
+        transformer = getattr(module, "transformer", None)
+        module_layers = getattr(transformer, "layers", None)
+        if module_layers is not None:
+            layers.extend(list(module_layers))
+    return layers
+
+
+def _iter_self_attention_modules(codec: Any) -> list[Any]:
+    modules = []
+    for layer in _iter_transformer_layers(codec):
+        self_attn = getattr(layer, "self_attn", None)
+        if self_attn is not None:
+            modules.append(self_attn)
+    return modules
+
+
+def _compile_targets_for_candidate(codec: Any, name: str) -> tuple[str, list[Any]]:
+    if name == "compile_projected_transformers":
+        return "projected_transformer.forward", _iter_projected_transformers(codec)
+    if name == "compile_transformer_layers":
+        return "transformer_layer.forward", _iter_transformer_layers(codec)
+    if name == "compile_self_attn":
+        return "self_attn.forward", _iter_self_attention_modules(codec)
+    raise ValueError(f"unknown compile candidate {name!r}")
+
+
+@contextlib.contextmanager
+def _compile_codec_decoder_for_candidate(
+    processor: Any,
+    name: str,
+    *,
+    compile_mode: str | None,
+) -> Iterator[dict[str, Any]]:
+    """Patch selected codec decoder forward methods with torch.compile.
+
+    The patch preserves module identity so the codec's StreamingModule child
+    cache and per-module streaming state remain owned by the original objects.
+    """
+
+    codec = getattr(processor, "audio_tokenizer", None)
+    if codec is None:
+        raise RuntimeError("processor has no audio_tokenizer")
+
+    target_label, modules = _compile_targets_for_candidate(codec, name)
+    if not modules:
+        raise RuntimeError(f"{name} found no codec decoder modules to compile")
+
+    resolved_mode = _resolve_compile_mode(compile_mode)
+    _set_torch_compile_config()
+
+    originals: list[tuple[Any, Any]] = []
+    for module in modules:
+        original_forward = module.forward
+        compiled_forward = torch.compile(original_forward, mode=resolved_mode)
+        originals.append((module, original_forward))
+        module.forward = compiled_forward  # type: ignore[method-assign]
+
+    try:
+        yield {
+            "target": target_label,
+            "compiled_count": len(originals),
+            "compile_mode": resolved_mode,
+        }
+    finally:
+        for module, original_forward in originals:
+            module.forward = original_forward  # type: ignore[method-assign]
+
+
+def _candidate_context(
+    name: str,
+    *,
+    processor: Any,
+    compile_mode: str | None,
+) -> contextlib.AbstractContextManager[dict[str, Any]]:
     if name == "baseline":
         return _no_patch()
     if name == "arange_cache":
         return _torch_arange_cache()
     if name == "cudnn_sdp_disabled":
         return _cuda_cudnn_sdp_disabled()
+    if name == "gemm_autotune":
+        return _inductor_gemm_autotune()
+    if name in {
+        "compile_projected_transformers",
+        "compile_transformer_layers",
+        "compile_self_attn",
+    }:
+        return _compile_codec_decoder_for_candidate(
+            processor,
+            name,
+            compile_mode=compile_mode,
+        )
     raise ValueError(f"unknown candidate {name!r}")
 
 
 @contextlib.contextmanager
-def _applied_candidate(name: str) -> Iterator[dict[str, Any]]:
-    if name == "arange_cache+cudnn_sdp_disabled":
-        with contextlib.ExitStack() as stack:
-            arange_stats = stack.enter_context(_torch_arange_cache())
-            sdp_stats = stack.enter_context(_cuda_cudnn_sdp_disabled())
-            yield {"arange_cache": arange_stats, "cudnn_sdp_disabled": sdp_stats}
-        return
-    with _candidate_context(name) as stats:
-        yield stats
+def _applied_candidate(
+    name: str,
+    *,
+    processor: Any,
+    compile_mode: str | None,
+) -> Iterator[dict[str, Any]]:
+    parts = [part.strip() for part in name.split("+") if part.strip()]
+    if not parts:
+        raise ValueError("empty candidate name")
+    with contextlib.ExitStack() as stack:
+        stats = {
+            part: stack.enter_context(
+                _candidate_context(
+                    part,
+                    processor=processor,
+                    compile_mode=compile_mode,
+                )
+            )
+            for part in parts
+        }
+        yield stats[parts[0]] if len(parts) == 1 else stats
 
 
 def _time_once(
@@ -205,6 +365,7 @@ def _run_candidate_case(
     warmup: int,
     iters: int,
     device: torch.device,
+    compile_mode: str | None,
 ) -> dict[str, Any]:
     codes_list = _make_codes(
         processor=processor,
@@ -224,7 +385,11 @@ def _run_candidate_case(
             warmup=warmup,
             iters=iters,
         )
-        with _applied_candidate(candidate) as patch_stats:
+        with _applied_candidate(
+            candidate,
+            processor=processor,
+            compile_mode=compile_mode,
+        ) as patch_stats:
             candidate_wavs = _scheduler_processor_decode(scheduler, codes_list)
             parity = _parity(baseline_wavs, candidate_wavs)
             candidate_timing = _time_block(
@@ -374,6 +539,14 @@ def main() -> int:
         "--candidates",
         default="arange_cache,cudnn_sdp_disabled,arange_cache+cudnn_sdp_disabled",
     )
+    parser.add_argument(
+        "--compile-mode",
+        default=None,
+        help=(
+            "torch.compile mode for compile_* candidates. Defaults to "
+            "SGLANG_TORCH_COMPILE_MODE or max-autotune-no-cudagraphs."
+        ),
+    )
     parser.add_argument("--batch-sizes", default="1,2,4,8")
     parser.add_argument("--scenarios", default="under100,exact100,above100,mixed")
     parser.add_argument("--warmup", type=int, default=2)
@@ -413,6 +586,7 @@ def main() -> int:
                         warmup=args.warmup,
                         iters=args.iters,
                         device=device,
+                        compile_mode=args.compile_mode,
                     )
                     cases.append(case)
                     print(

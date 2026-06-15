@@ -281,6 +281,7 @@ For same-process MOSS-TTS Local codec decoder plumbing probes, use:
 python scripts/debug/moss_codec_plumbing_probe.py \
   --model-path OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
   --device cuda \
+  --candidates compile_projected_transformers,compile_transformer_layers,compile_self_attn \
   --batch-sizes 1,2,4,8 \
   --scenarios under100,exact100,above100,mixed \
   --warmup 2 \
@@ -293,6 +294,26 @@ compares temporary in-process decoder-plumbing candidates against the unpatched
 processor path on the same generated audio-code tensors. Treat it as a Phase 1
 gate: a candidate must pass exact waveform parity for every shape and show a
 consistent timing win before it is worth a server, Nsight, or SeedTTS run.
+Available plumbing candidates include:
+
+- `arange_cache`: caches immutable `torch.arange` outputs as a low-level
+  plumbing control.
+- `cudnn_sdp_disabled`: disables cuDNN SDPA in-process as an attention-backend
+  control. Reject if waveform parity changes.
+- `compile_projected_transformers`: compiles each codec projected-transformer
+  block's `forward` method while preserving module identity.
+- `compile_transformer_layers`: compiles each codec transformer layer's
+  `forward` method.
+- `compile_self_attn`: compiles each codec self-attention module's `forward`
+  method.
+- `gemm_autotune+compile_transformer_layers` or another `gemm_autotune+...`
+  combination: temporarily enables Inductor per-shape GEMM autotuning for the
+  compiled candidate.
+
+The compile candidates patch `forward` methods temporarily and restore them
+after each case. They intentionally do not replace modules, because the
+MOSS-Audio-Tokenizer streaming implementation owns per-module streaming state
+and caches the `StreamingModule` child traversal.
 
 If Chrome trace export drops user `record_function` names, set
 `SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1` for a scoped run. This emits
@@ -319,6 +340,10 @@ For MOSS Local, keep compilation scoped to `sample_seeded_branchless`, the
 seeded top-k/top-p sampler used 13 times per frame. Wider frame targets
 (`logits` or `full`) failed direct code parity during the issue #752
 investigation and should not be re-enabled without a new parity proof.
+Codec decoder compile candidates are a separate research surface. They must
+stay behind the same-process plumbing probe until they pass exact waveform
+parity and stable timing; only then should they be promoted to server-level
+validation.
 
 Custom callsites can call `sglang_omni.profiler.event_recorder.emit(...)` to
 add domain-specific events. Events from inactive recorders are no-ops, so
