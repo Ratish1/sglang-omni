@@ -218,23 +218,14 @@ tokenizer `batch_decode(..., chunk_duration=...)` path. Set
 seconds used by that path. `exact_session` uses a persistent non-streaming
 codec session whose batch size exactly matches the current non-streaming decode
 batch, then replays the same chunk-frame plan as
-`batch_decode(..., chunk_duration=...)`. This is the correctness-first stepping
-stone for codec CUDA graph experiments: it avoids the larger live-streaming
-slot width used by `session`, which can change kernel shapes and numerical
-parity. `session` forces the persistent offline streaming lane used after a
-streaming session exists. When using the legacy session path,
+`batch_decode(..., chunk_duration=...)`. This is a correctness-first research
+control: it avoids the larger live-streaming slot width used by `session`,
+which can change kernel shapes and numerical parity. `session` forces the
+persistent offline streaming lane used after a streaming session exists. When
+using the legacy session path,
 `SGLANG_MOSS_TTS_LOCAL_NONSTREAM_MAX_STEP_FRAMES` controls the offline chunk
 size; `0` means use the shortest remaining utterance segment for each step
 instead of imposing a fixed maximum.
-
-Set `SGLANG_MOSS_TTS_LOCAL_CODEC_CUDA_GRAPH=1` with
-`SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH=exact_session` to enable the
-experimental codec step CUDA graph path. The scheduler pre-captures the fixed
-`chunk_duration` step shape when the non-streaming offline session is created,
-resets all codec slots, and then replays that graph only for matching full
-chunk steps. Tail chunks and unsupported shapes fall back to eager
-`_decode_frame`. Successful graph replays emit
-`moss_tts_local.vocoder.stream_step.decode_frame_cuda_graph`.
 
 For trace export triage, use:
 
