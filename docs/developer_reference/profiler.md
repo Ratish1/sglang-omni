@@ -315,6 +315,30 @@ after each case. They intentionally do not replace modules, because the
 MOSS-Audio-Tokenizer streaming implementation owns per-module streaming state
 and caches the `StreamingModule` child traversal.
 
+For a narrower semantic probe of the hottest codec decoder attention boundary,
+use:
+
+```bash
+python scripts/debug/moss_codec_self_attn_probe.py \
+  --model-path OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+  --device cuda \
+  --decoder-index 0 \
+  --layer-index 0 \
+  --candidates target_identity,target_arange_cache \
+  --batch-sizes 1 \
+  --scenarios exact100 \
+  --warmup 1 \
+  --iters 3 \
+  --out /path/to/moss_codec_self_attn_probe.json
+```
+
+This still runs the real `processor.decode_audio_codes` path, but captures the
+target self-attention output and streaming state after every call. A candidate
+must pass all three exact gates before its timing is useful: full waveform
+parity, target self-attention output parity, and target streaming-state parity.
+Use this before porting or hoisting MOSS codec attention plumbing; it catches
+state corruption that may not be obvious from waveform timing alone.
+
 If Chrome trace export drops user `record_function` names, set
 `SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1` for a scoped run. This emits
 matching request-event intervals for the same scopes, using sanitized event
