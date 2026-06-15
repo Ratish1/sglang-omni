@@ -137,6 +137,69 @@ def test_stage_breakdown_keeps_intervals_stage_local(tmp_path: Path) -> None:
     assert encoder_rows == []
 
 
+def test_stage_breakdown_includes_moss_nonstream_vocoder_subscopes(
+    tmp_path: Path,
+) -> None:
+    events = [
+        _ev(
+            "r1",
+            "vocoder",
+            "moss_tts_local_vocoder_nonstream_processor_decode_codec_call_start",
+            0,
+            actual_path="processor",
+            frame_lengths=[100],
+            total_frames=100,
+        ),
+        _ev(
+            "r1",
+            "vocoder",
+            "moss_tts_local_vocoder_nonstream_processor_decode_codec_call_end",
+            2_500_000,
+            actual_path="processor",
+            frame_lengths=[100],
+            total_frames=100,
+        ),
+        _ev(
+            "r1",
+            "vocoder",
+            "moss_tts_local_vocoder_nonstream_direct_chunked_decode_materialize_start",
+            3_000_000,
+            actual_path="direct_chunked",
+            frame_lengths=[100],
+            total_frames=100,
+        ),
+        _ev(
+            "r1",
+            "vocoder",
+            "moss_tts_local_vocoder_nonstream_direct_chunked_decode_materialize_end",
+            3_400_000,
+            actual_path="direct_chunked",
+            frame_lengths=[100],
+            total_frames=100,
+        ),
+    ]
+    _write_events(tmp_path / "events_vocoder.jsonl", events)
+
+    rows = stage_breakdown(source=tmp_path)
+    by_interval = {row.interval_name: row for row in rows}
+
+    processor_row = by_interval[
+        "moss_tts_local_vocoder_nonstream_processor_decode_codec_call_start"
+        "->moss_tts_local_vocoder_nonstream_processor_decode_codec_call_end"
+    ]
+    assert processor_row.stage == "vocoder"
+    assert processor_row.count == 1
+    assert processor_row.avg_ms == 2.5
+
+    direct_row = by_interval[
+        "moss_tts_local_vocoder_nonstream_direct_chunked_decode_materialize_start"
+        "->moss_tts_local_vocoder_nonstream_direct_chunked_decode_materialize_end"
+    ]
+    assert direct_row.stage == "vocoder"
+    assert direct_row.count == 1
+    assert direct_row.avg_ms == 0.4
+
+
 # ---------------------------------------------------------------------------
 # Hop breakdown
 # ---------------------------------------------------------------------------

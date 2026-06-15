@@ -6,10 +6,12 @@ This debug-branch tool isolates the non-streaming codec question from server
 batching, ASR, request profiling, and scheduler noise:
 
     same audio codes -> processor.decode_audio_codes vs exact_session
+    same audio codes -> processor.decode_audio_codes vs direct_chunked
 
 Use this before making any performance claim for the non-streaming codec path.
 The correctness gate is exact waveform parity. The performance gate is
 same-process wall time with CUDA synchronized around every measured decode.
+Use ``--include-direct-chunked`` for the parity-safe direct tokenizer control.
 """
 
 from __future__ import annotations
@@ -370,7 +372,10 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--model-path",
         default="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5",

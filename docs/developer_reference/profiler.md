@@ -146,10 +146,26 @@ non-streaming paths:
 - `moss_tts_local.vocoder.nonstream_batch.decode_rows`
 - `moss_tts_local.vocoder.nonstream_batch.store_result`
 - `moss_tts_local.vocoder.nonstream_processor_decode`
+- `moss_tts_local.vocoder.nonstream_processor_decode.codec_call`
+- `moss_tts_local.vocoder.nonstream_processor_decode.materialize`
 - `moss_tts_local.vocoder.nonstream_direct_batch_decode`
+- `moss_tts_local.vocoder.nonstream_direct_batch_decode.prepare_inputs`
+- `moss_tts_local.vocoder.nonstream_direct_batch_decode.codec_call`
+- `moss_tts_local.vocoder.nonstream_direct_batch_decode.materialize`
 - `moss_tts_local.vocoder.nonstream_direct_chunked_decode`
+- `moss_tts_local.vocoder.nonstream_direct_chunked_decode.prepare_inputs`
+- `moss_tts_local.vocoder.nonstream_direct_chunked_decode.codec_call`
+- `moss_tts_local.vocoder.nonstream_direct_chunked_decode.materialize`
 - `moss_tts_local.vocoder.nonstream_exact_session_decode`
+- `moss_tts_local.vocoder.nonstream_exact_session_decode.materialize`
 - `moss_tts_local.vocoder.nonstream_session_decode`
+- `moss_tts_local.vocoder.nonstream_session_decode.materialize`
+
+Non-streaming codec events include shape metadata: `decode_count`,
+`frame_lengths`, `total_frames`, `min_frames`, `max_frames`, `n_vq`,
+`chunk_duration`, `chunk_frames`, `chunk_counts`, and `total_chunks`. Use these
+fields to separate true codec kernel cost from ragged batch shape, input
+materialization, and waveform CPU materialization.
 
 These `torch.profiler.record_function` ranges are always entered in the debug
 branch and are intended to split the post-backbone boundary into graph replay,

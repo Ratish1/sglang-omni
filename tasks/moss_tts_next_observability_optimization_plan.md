@@ -767,3 +767,140 @@ Prioritize only after a full-stack trace identifies ownership:
 
 Do not choose custom kernels until the trace proves the hot operation is stable,
 small, and semantically isolated enough for a parity test.
+
+## Non-Streaming Codec Attribution Phase
+
+Status: implemented on `perf/issue-752-moss-tts-compile-investigation` after
+rejecting the codec `_decode_frame` CUDA graph experiment.
+
+### Problem Summary
+
+MOSS-TTS Local non-streaming RTF is now dominated by the code-to-waveform path,
+but the prior codec experiments mixed three different questions:
+
+- semantic equivalence of alternate decode APIs;
+- server-level throughput under noisy stage scheduling;
+- low-level decoder kernel ownership inside the checkpoint remote code.
+
+The next work must isolate the default non-streaming `processor` path and the
+parity-safe `direct_chunked` control. Streaming is explicitly out of scope for
+this phase.
+
+Success criteria:
+
+- default behavior remains `SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH=processor`;
+- rejected codec CUDA graph code and docs stay removed;
+- request-event JSONL can split non-streaming codec work into input
+  materialization, codec call, waveform materialization, and result storage;
+- each non-streaming decode interval carries batch/shape/chunk metadata so a
+  trace can explain whether cost is from decoder compute, ragged shapes, host
+  transfer, or chunk policy;
+- no performance claim is made for `exact_session`.
+
+### Current-State Evidence
+
+- `sglang_omni/models/moss_tts_local/streaming_vocoder.py` owns the
+  non-streaming vocoder contract. `_vocode_batch()` prepares rows, calls
+  `_decode_codes_rows()`, then packages waveform payloads.
+- `_decode_codes_rows()` dispatches between `processor`, `direct_batch`,
+  `direct_chunked`, `exact_session`, and `session`. Only `processor` is default.
+- `direct_batch` bypasses `chunk_duration=8` and is not parity-preserving.
+- `direct_chunked` preserves the processor chunk-duration invariant and is the
+  only alternate backend worth keeping as a parity-safe control.
+- `exact_session` is exact in direct parity but was rejected as a standalone
+  performance optimization by ABBA and same-process timing. Keep it as a
+  research control only.
+- The codec `_decode_frame` CUDA graph was rejected because streaming codec
+  state evolves across chunk steps; replaying one captured step is not
+  semantically equivalent for multi-chunk utterances.
+
+### Boundary Map
+
+```text
+vocoder StagePayload batch
+  CPU rows: [T, n_vq] per request
+    -> _vocode_batch.prepare_codes
+    -> _decode_codes_rows dispatch
+       processor:
+         processor.decode_audio_codes(codes_list)
+       direct_chunked:
+         CPU rows -> channels_first GPU tensors [n_vq, T]
+         audio_tokenizer.batch_decode(..., chunk_duration=8)
+       exact_session/session:
+         research controls only; no default speed claim
+    -> waveform materialization to CPU fp32 [channels, samples]
+    -> _store_vocoder_result payload packaging
+```
+
+Cost model:
+
+- `prepare_codes`: per request, CPU tensor construction.
+- `prepare_inputs`: per batch, CPU-to-GPU and layout materialization for direct
+  paths.
+- `codec_call`: dominant GPU decoder path; owns remote-code decoder/attention
+  kernels.
+- `materialize`: per result, waveform slicing/copy to CPU fp32.
+- `store_result`: payload packaging; should remain negligible.
+
+### Execution Plan
+
+Single phase, because this is observability only and preserves all runtime
+defaults.
+
+1. Add non-streaming decode metadata in
+   `sglang_omni/models/moss_tts_local/streaming_vocoder.py`.
+   - Metadata: `decode_count`, `frame_lengths`, `total_frames`, `min_frames`,
+     `max_frames`, `n_vq`, `chunk_duration`, `chunk_frames`, `chunk_counts`,
+     `total_chunks`, `requested_path`, and `actual_path`.
+   - Contract: metadata must describe the original request rows before backend
+     conversion.
+
+2. Split non-streaming codec scopes.
+   - `processor`: `codec_call` and `materialize`.
+   - `direct_batch` / `direct_chunked`: `prepare_inputs`, `codec_call`,
+     `materialize`.
+   - `exact_session` / `session`: `materialize` only, because the session step
+     loop already has internal scopes.
+
+3. Register new event pairs in `sglang_omni/profiler/views.py`.
+   - Reports must aggregate the new scopes automatically from JSONL.
+
+4. Update `docs/developer_reference/profiler.md`.
+   - Document the new non-streaming scopes and shape metadata.
+   - Keep `exact_session` wording as a research control, not a recommended
+     speed path.
+
+5. Keep `scripts/debug/moss_local_codec_same_process_bench.py` focused on
+   parity/timing controls.
+   - Use `--include-direct-chunked` when validating the parity-safe alternate
+     backend.
+
+### Validation Plan
+
+Local:
+
+- `python -m py_compile sglang_omni/models/moss_tts_local/streaming_vocoder.py sglang_omni/profiler/views.py scripts/debug/moss_local_codec_same_process_bench.py`
+- `python scripts/debug/moss_local_codec_same_process_bench.py --help`
+- `python -m pytest -q tests/unit_test/profiler/test_views.py`
+- `pre-commit run --files ...`
+
+Remote H100:
+
+- First run a normal non-streaming SeedTTS speed/WER baseline on `processor`
+  with no deep profile env.
+- Then run a small n16 `processor` profile with
+  `SGLANG_MOSS_TTS_LOCAL_VOCODER_EVENTS=1`,
+  `SGLANG_MOSS_TTS_LOCAL_VOCODER_DEEP_PROFILE=1`, and
+  `SGLANG_OMNI_NVTX_RANGES=1`.
+- Run `direct_chunked` only as a parity-safe control:
+  `SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH=direct_chunked`.
+- Stop any optimization claim unless `direct_chunked` wins in ABBA-style
+  scoped decode timing and full SeedTTS WER stays within baseline variance.
+
+### Rejected Paths
+
+- Do not rerun codec `_decode_frame` CUDA graph unless the remote-code codec
+  state ownership is redesigned so capture includes the correct multi-step
+  state transition.
+- Do not use deterministic inference as a substitute for semantic parity.
+- Do not work on streaming chunk policy in this phase.

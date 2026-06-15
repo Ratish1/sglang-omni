@@ -189,10 +189,20 @@ _MOSS_TTS_LOCAL_VOCODER_SCOPE_EVENTS = tuple(
         "moss_tts_local_vocoder_nonstream_batch_decode_rows",
         "moss_tts_local_vocoder_nonstream_batch_store_result",
         "moss_tts_local_vocoder_nonstream_processor_decode",
+        "moss_tts_local_vocoder_nonstream_processor_decode_codec_call",
+        "moss_tts_local_vocoder_nonstream_processor_decode_materialize",
         "moss_tts_local_vocoder_nonstream_direct_batch_decode",
+        "moss_tts_local_vocoder_nonstream_direct_batch_decode_prepare_inputs",
+        "moss_tts_local_vocoder_nonstream_direct_batch_decode_codec_call",
+        "moss_tts_local_vocoder_nonstream_direct_batch_decode_materialize",
         "moss_tts_local_vocoder_nonstream_direct_chunked_decode",
+        "moss_tts_local_vocoder_nonstream_direct_chunked_decode_prepare_inputs",
+        "moss_tts_local_vocoder_nonstream_direct_chunked_decode_codec_call",
+        "moss_tts_local_vocoder_nonstream_direct_chunked_decode_materialize",
         "moss_tts_local_vocoder_nonstream_exact_session_decode",
+        "moss_tts_local_vocoder_nonstream_exact_session_decode_materialize",
         "moss_tts_local_vocoder_nonstream_session_decode",
+        "moss_tts_local_vocoder_nonstream_session_decode_materialize",
     )
 )
 
