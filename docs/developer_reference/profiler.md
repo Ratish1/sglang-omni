@@ -275,6 +275,25 @@ columns that appear as numeric ids in some SQLite exports.
 Use it before proposing codec optimizations so the target is tied to the
 remote-code decoder internals rather than the Omni packaging boundary.
 
+For same-process MOSS-TTS Local codec decoder plumbing probes, use:
+
+```bash
+python scripts/debug/moss_codec_plumbing_probe.py \
+  --model-path OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+  --device cuda \
+  --batch-sizes 1,2,4,8 \
+  --scenarios under100,exact100,above100,mixed \
+  --warmup 2 \
+  --iters 8 \
+  --out /path/to/moss_codec_plumbing_probe.json
+```
+
+This keeps the semantic path fixed at `processor.decode_audio_codes` and
+compares temporary in-process decoder-plumbing candidates against the unpatched
+processor path on the same generated audio-code tensors. Treat it as a Phase 1
+gate: a candidate must pass exact waveform parity for every shape and show a
+consistent timing win before it is worth a server, Nsight, or SeedTTS run.
+
 If Chrome trace export drops user `record_function` names, set
 `SGLANG_MOSS_TTS_LOCAL_FINE_FRAME_EVENTS=1` for a scoped run. This emits
 matching request-event intervals for the same scopes, using sanitized event
