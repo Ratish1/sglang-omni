@@ -43,6 +43,7 @@ from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recor
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
 from sglang_omni.serve.openai_api import create_app
 from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
+from sglang_omni.utils.gpu_compat import apply_gpu_compat_env_defaults
 from sglang_omni.utils.gpu_memory import (
     GpuDeviceInfo,
     format_bytes_gib,
@@ -295,6 +296,7 @@ async def _run_server(
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
+    allowed_media_domains: list[str] | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
 ) -> None:
     """Start the pipeline and run the OpenAI server.
@@ -339,8 +341,12 @@ async def _run_server(
             requires_uploaded_voice_for_named_voice=(
                 pipeline_config.requires_uploaded_voice_for_named_voice()
             ),
+            supports_uploaded_voice_references=(
+                pipeline_config.supports_uploaded_voice_references()
+            ),
             enable_realtime=enable_realtime,
             allowed_local_media_path=allowed_local_media_path,
+            allowed_media_domains=allowed_media_domains,
             tts_batch_max_items=tts_batch_max_items,
         )
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
@@ -410,6 +416,7 @@ def launch_server(
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
+    allowed_media_domains: list[str] | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
 ) -> None:
     """Blocking helper: start the pipeline and OpenAI-compatible server.
@@ -427,9 +434,11 @@ def launch_server(
             endpoint (OpenAI Realtime API).
         allowed_local_media_path: Directory allowed for ``file://`` media
             references in TTS requests.
+        allowed_media_domains: Domains allowed for remote TTS reference audio.
         tts_batch_max_items: Maximum items accepted by
             ``/v1/audio/speech/batch``.
     """
+    apply_gpu_compat_env_defaults()
     asyncio.run(
         _run_server(
             pipeline_config,
@@ -440,6 +449,7 @@ def launch_server(
             client_kwargs=client_kwargs,
             enable_realtime=enable_realtime,
             allowed_local_media_path=allowed_local_media_path,
+            allowed_media_domains=allowed_media_domains,
             tts_batch_max_items=tts_batch_max_items,
         )
     )

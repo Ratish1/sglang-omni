@@ -17,7 +17,12 @@ from pydantic import ValidationError
 from starlette.websockets import WebSocketState
 
 from sglang_omni.client import Client, ClientError
-from sglang_omni.client.audio import DEFAULT_SAMPLE_RATE, encode_audio
+from sglang_omni.client.audio import (
+    DEFAULT_SAMPLE_RATE,
+    apply_speed,
+    encode_pcm,
+    to_numpy,
+)
 from sglang_omni.serve.protocol import CreateSpeechRequest, SpeechStreamSessionConfig
 from sglang_omni.serve.speech_errors import (
     SpeechAPIError,
@@ -25,7 +30,7 @@ from sglang_omni.serve.speech_errors import (
     internal_error,
     openai_error_payload,
 )
-from sglang_omni.serve.speech_service import SpeechService, speech_audio_delta
+from sglang_omni.serve.speech_service import SpeechRequestValidator
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +56,7 @@ class SpeechWebSocketSession:
         websocket: WebSocket,
         *,
         client: Client,
-        speech_service: SpeechService,
+        speech_service: SpeechRequestValidator,
     ) -> None:
         self.websocket = websocket
         self.client = client
@@ -207,8 +212,8 @@ class SpeechWebSocketSession:
                 "stream_audio=true requires response_format='pcm'",
                 param="response_format",
             )
-        self.speech_service.prepare_request(
-            self._speech_request_from_config(config, "probe")
+        self.speech_service.parse_request(
+            self._speech_payload_from_config(config, "probe")
         )
         return config
 
@@ -273,7 +278,13 @@ class SpeechWebSocketSession:
     async def _stream_sentence_audio(self, sentence: str, *, request_id: str) -> int:
         assert self.config is not None
         request = self._speech_request_from_config(sentence=sentence, stream=True)
-        gen_req = self.speech_service.build_generate_request(request)
+        prepared = self.speech_service.prepare_generation_request(request)
+        gen_req = self.speech_service.build_generate_request(
+            prepared.request,
+            validate=False,
+            reference_descriptors=prepared.reference_descriptors,
+            uploaded_voice=prepared.uploaded_voice,
+        )
         emitted_samples = 0
         total_bytes = 0
         chunk_count = 0
@@ -281,20 +292,18 @@ class SpeechWebSocketSession:
             if chunk.audio_data is None:
                 continue
             sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
-            audio_data, emitted_samples = speech_audio_delta(
+            audio_data, emitted_samples = _speech_audio_delta(
                 chunk.audio_data,
                 emitted_samples=emitted_samples,
                 is_terminal=chunk.finish_reason is not None,
             )
             if audio_data is None:
                 continue
-            audio_bytes, _ = encode_audio(
-                audio_data,
-                response_format="pcm",
-                sample_rate=sample_rate,
-                speed=self.config.speed,
-                allow_format_fallback=False,
-            )
+            if self.config.speed != 1.0:
+                audio_data, sample_rate = apply_speed(
+                    audio_data, self.config.speed, sample_rate
+                )
+            audio_bytes = encode_pcm(audio_data, sample_rate)
             if not audio_bytes:
                 continue
             await self._send_audio_frame(audio_bytes, active_request_id=request_id)
@@ -327,12 +336,23 @@ class SpeechWebSocketSession:
         *,
         stream: bool | None = None,
     ) -> CreateSpeechRequest:
+        return CreateSpeechRequest.model_validate(
+            self._speech_payload_from_config(config, sentence, stream=stream)
+        )
+
+    def _speech_payload_from_config(
+        self,
+        config: SpeechStreamSessionConfig | None = None,
+        sentence: str = "",
+        *,
+        stream: bool | None = None,
+    ) -> dict[str, Any]:
         config = config or self.config
         assert config is not None
         payload = config.model_dump(exclude={"stream_audio", "split_granularity"})
         payload["input"] = sentence
         payload["stream"] = config.stream_audio if stream is None else stream
-        return CreateSpeechRequest.model_validate(payload)
+        return payload
 
     def _pop_complete_segments(self) -> list[str]:
         assert self.config is not None
@@ -484,6 +504,27 @@ def _speech_error_from_exception(exc: Exception) -> SpeechAPIError:
         location = ".".join(str(item) for item in first_error.get("loc", ()))
         return bad_request(f"{location}: {message}" if location else str(message))
     return bad_request(str(exc))
+
+
+def _speech_audio_delta(
+    audio_data: Any,
+    *,
+    emitted_samples: int,
+    is_terminal: bool,
+) -> tuple[Any | None, int]:
+    audio = to_numpy(audio_data)
+    if audio.ndim > 1:
+        audio = audio.squeeze()
+    if audio.ndim > 1:
+        channel_axis = 0 if audio.shape[0] < audio.shape[-1] else -1
+        audio = audio.mean(axis=channel_axis).astype("float32")
+
+    total_samples = int(audio.shape[-1]) if audio.ndim else 0
+    if not is_terminal:
+        return audio, emitted_samples + total_samples
+    if total_samples <= emitted_samples:
+        return None, emitted_samples
+    return audio[emitted_samples:], total_samples
 
 
 def _validate_raw_session_fields(payload: dict[str, Any]) -> None:

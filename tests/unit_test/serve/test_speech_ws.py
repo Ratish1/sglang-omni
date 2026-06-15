@@ -14,7 +14,7 @@ from sglang_omni.client import GenerateChunk
 from sglang_omni.client.types import SpeechResult
 from sglang_omni.serve import create_app
 from sglang_omni.serve.protocol import SpeechStreamSessionConfig
-from sglang_omni.serve.speech_service import SpeechService
+from sglang_omni.serve.speech_service import SpeechRequestValidator
 from sglang_omni.serve.speech_ws import MAX_TEXT_MESSAGE_BYTES, SpeechWebSocketSession
 
 
@@ -446,7 +446,7 @@ def test_speech_websocket_cancellation_aborts_active_request() -> None:
         session = SpeechWebSocketSession(
             websocket,
             client=client_impl,
-            speech_service=SpeechService(default_model="tts"),
+            speech_service=SpeechRequestValidator(default_model="tts"),
         )
         session.config = SpeechStreamSessionConfig(stream_audio=True)
 
@@ -469,7 +469,7 @@ def test_speech_websocket_send_failure_aborts_active_stream() -> None:
         session = SpeechWebSocketSession(
             websocket,
             client=client_impl,
-            speech_service=SpeechService(default_model="tts"),
+            speech_service=SpeechRequestValidator(default_model="tts"),
         )
         session.config = SpeechStreamSessionConfig(stream_audio=True)
 
@@ -489,7 +489,7 @@ def test_speech_websocket_stream_exception_aborts_active_request() -> None:
         session = SpeechWebSocketSession(
             websocket,
             client=client_impl,
-            speech_service=SpeechService(default_model="tts"),
+            speech_service=SpeechRequestValidator(default_model="tts"),
         )
         session.config = SpeechStreamSessionConfig(stream_audio=True)
 
@@ -511,7 +511,7 @@ def test_speech_websocket_completed_send_failure_does_not_abort() -> None:
         session = SpeechWebSocketSession(
             websocket,
             client=client_impl,
-            speech_service=SpeechService(default_model="tts"),
+            speech_service=SpeechRequestValidator(default_model="tts"),
         )
         session.config = SpeechStreamSessionConfig(stream_audio=False)
 
@@ -533,7 +533,7 @@ def test_speech_websocket_peer_disconnect_aborts_blocked_speech() -> None:
         session = SpeechWebSocketSession(
             websocket,
             client=client_impl,
-            speech_service=SpeechService(default_model="tts"),
+            speech_service=SpeechRequestValidator(default_model="tts"),
         )
         session.config = SpeechStreamSessionConfig(stream_audio=False)
 
@@ -555,7 +555,7 @@ def test_speech_websocket_peer_disconnect_aborts_blocked_stream() -> None:
         session = SpeechWebSocketSession(
             websocket,
             client=client_impl,
-            speech_service=SpeechService(default_model="tts"),
+            speech_service=SpeechRequestValidator(default_model="tts"),
         )
         session.config = SpeechStreamSessionConfig(stream_audio=True)
 
@@ -578,7 +578,7 @@ def test_speech_websocket_peer_disconnect_aborts_between_stream_chunks() -> None
         session = SpeechWebSocketSession(
             websocket,
             client=client_impl,
-            speech_service=SpeechService(default_model="tts"),
+            speech_service=SpeechRequestValidator(default_model="tts"),
         )
         session.config = SpeechStreamSessionConfig(stream_audio=True)
 
@@ -603,7 +603,7 @@ def test_speech_websocket_disconnect_watch_preserves_client_frames() -> None:
         session = SpeechWebSocketSession(
             websocket,
             client=client_impl,
-            speech_service=SpeechService(default_model="tts"),
+            speech_service=SpeechRequestValidator(default_model="tts"),
         )
         session.config = SpeechStreamSessionConfig(stream_audio=False)
 

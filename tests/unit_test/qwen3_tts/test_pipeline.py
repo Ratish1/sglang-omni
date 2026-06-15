@@ -30,8 +30,11 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+from sglang_omni.scheduling.speaker_cache import (
+    SpeakerCacheKey,
+    get_speaker_artifact_cache,
+)
 from sglang_omni.scheduling.types import RequestOutput
-from sglang_omni.serve.speaker_cache import SpeakerCacheKey, get_speaker_artifact_cache
 
 
 def install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -231,6 +234,31 @@ def test_qwen3_tts_config_and_registry_contracts() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("model_path", "expected"),
+    [
+        ("Qwen/Qwen3-TTS-12Hz-0.6B-Base", True),
+        ("Qwen/Qwen3-TTS-12Hz-1.7B-Base/", True),
+        ("/models/Qwen3-TTS-12Hz-0.6B-Base/snapshots/abc123", True),
+        ("/models/qwen3_tts_12hz_1_7b_base/checkpoint", True),
+        ("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", False),
+        ("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", False),
+        ("/models/Qwen3-TTS-12Hz-0.6B-CustomVoice/snapshots/abc123", False),
+        ("/models/qwen3_tts_base/Qwen3-TTS-12Hz-0.6B-CustomVoice", False),
+        ("/models/qwen3_tts_base/Qwen3-TTS-12Hz-1.7B-VoiceDesign", False),
+        ("model", False),
+    ],
+)
+def test_qwen3_tts_base_path_detection_for_uploaded_voice_requirement(
+    model_path: str,
+    expected: bool,
+) -> None:
+    config = Qwen3TTSPipelineConfig(model_path=model_path)
+
+    assert config.requires_uploaded_voice_for_named_voice() is expected
+    assert config.supports_uploaded_voice_references() is expected
+
+
 def test_qwen3_tts_state_round_trip_preserves_request_fields() -> None:
     state = Qwen3TTSState(
         text="hello",
@@ -243,7 +271,6 @@ def test_qwen3_tts_state_round_trip_preserves_request_fields() -> None:
         ref_text="reference",
         uploaded_voice_name="guide",
         uploaded_voice_created_at=7,
-        uploaded_voice_fingerprint="abc",
         generation_kwargs={"max_new_tokens": 128, "temperature": 0.7},
         audio_codes=[[1, 2], [3, 4]],
         ref_code_len=1,
@@ -261,7 +288,6 @@ def test_qwen3_tts_state_round_trip_preserves_request_fields() -> None:
     assert restored.ref_text == "reference"
     assert restored.uploaded_voice_name == "guide"
     assert restored.uploaded_voice_created_at == 7
-    assert restored.uploaded_voice_fingerprint == "abc"
     assert restored.generation_kwargs["max_new_tokens"] == 128
     assert restored.audio_codes == [[1, 2], [3, 4]]
     assert restored.ref_code_len == 1
@@ -518,7 +544,6 @@ def test_qwen3_tts_uploaded_voice_clone_prompt_uses_shared_cache(
                 "ref_text": "reference",
                 "uploaded_voice_name": "guide",
                 "uploaded_voice_created_at": created_at,
-                "uploaded_voice_fingerprint": "abc",
             },
         )
 
@@ -622,7 +647,6 @@ def test_qwen3_tts_uploaded_voice_x_vector_cache_omits_ref_code(
             "ref_audio": "voice.wav",
             "uploaded_voice_name": "guide",
             "uploaded_voice_created_at": 9,
-            "uploaded_voice_fingerprint": "abc",
             "x_vector_only_mode": True,
         },
     )
@@ -1583,7 +1607,6 @@ def test_qwen3_tts_decode_forward_does_not_clear_feedback_mask(
     torch.nn.Module.__init__(model)
     model.codec_embedding = torch.nn.Embedding(8, 4)
     model.layers = torch.nn.ModuleList([])
-    model._compiled_decode_layers = model.layers
     model.start_layer = 0
     model.end_layer = 0
     model.norm = IdentityNorm()
@@ -1872,12 +1895,13 @@ def test_qwen3_tts_compile_backbone_compiles_every_layer(
     ]
 
 
-def test_qwen3_tts_engine_reenables_cuda_graph_after_bootstrap(
+def test_qwen3_tts_engine_applies_compat_overrides_and_reenables_cuda_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Qwen3-TTS defers graph capture until custom buffers are ready."""
     install_fake_sglang(monkeypatch)
     from transformers import AutoProcessor
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    from transformers.utils import generic
 
     from sglang_omni.models.qwen3_tts import model_runner as model_runner_mod
     from sglang_omni.models.qwen3_tts import stages
@@ -1887,6 +1911,17 @@ def test_qwen3_tts_engine_reenables_cuda_graph_after_bootstrap(
     from sglang_omni.scheduling import bootstrap as bootstrap_mod
     from sglang_omni.scheduling import omni_scheduler as scheduler_mod
     from sglang_omni.scheduling import sglang_backend
+
+    check_model_inputs_calls = []
+
+    def transformers_56_check_model_inputs(func):
+        check_model_inputs_calls.append(func)
+        return f"wrapped:{func.__name__}"
+
+    monkeypatch.setattr(
+        generic, "check_model_inputs", transformers_56_check_model_inputs
+    )
+    monkeypatch.delitem(ROPE_INIT_FUNCTIONS, "default", raising=False)
 
     build_kwargs: dict = {}
     infrastructure_saw_graph_disabled: list[bool] = []
@@ -1995,12 +2030,41 @@ def test_qwen3_tts_engine_reenables_cuda_graph_after_bootstrap(
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
-    scheduler = stages.create_sglang_tts_engine_executor("model", device="cuda:0")
+    scheduler = stages.create_sglang_tts_engine_executor(
+        "model",
+        device="cuda:0",
+        server_args_overrides={"mem_fraction_static": 0.7, "max_running_requests": 2},
+    )
 
     assert build_kwargs["disable_cuda_graph"] is False
     assert build_kwargs["enable_torch_compile"] is True
     assert build_kwargs["sampling_backend"] == "pytorch"
+    assert build_kwargs["mem_fraction_static"] == 0.7
+    assert build_kwargs["max_running_requests"] == 2
     assert build_kwargs["torch_compile_max_bs"] == 16
+
+    def target():
+        return None
+
+    decorator = generic.check_model_inputs()
+    assert decorator(target) == "wrapped:target"
+    assert generic.check_model_inputs(target) == "wrapped:target"
+    assert check_model_inputs_calls == [target, target]
+
+    inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS["default"](
+        SimpleNamespace(
+            rope_theta=10000.0,
+            hidden_size=8,
+            num_attention_heads=2,
+        ),
+        None,
+    )
+    assert attention_scaling == 1.0
+    torch.testing.assert_close(
+        inv_freq,
+        torch.tensor([1.0, 0.01], dtype=torch.float32),
+    )
+
     assert infrastructure_saw_graph_disabled == [True]
     assert len(compile_calls) == 1
     assert init_graph_calls == [True]

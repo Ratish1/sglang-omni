@@ -5,13 +5,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import logging
 import os
 import re
 import tempfile
 import time
-import wave
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
@@ -20,7 +18,7 @@ from typing import Any
 import numpy as np
 
 from sglang_omni.client.audio import DEFAULT_SAMPLE_RATE, encode_wav
-from sglang_omni.serve.speaker_cache import (
+from sglang_omni.scheduling.speaker_cache import (
     SpeakerArtifactCache,
     SpeakerCacheKey,
     get_speaker_artifact_cache,
@@ -38,7 +36,7 @@ VOICE_SILENCE_THRESHOLD = 1e-5
 VOICE_METADATA_INT_FIELDS = frozenset(
     {"created_at", "file_size", "sample_rate", "num_samples"}
 )
-VOICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+VOICE_NAME_PATTERN = re.compile(r"^(?=.*[A-Za-z0-9])[A-Za-z0-9_.-]+$")
 DEFAULT_VOICE_PRESETS = ("default",)
 ACCEPTED_VOICE_UPLOAD_MIME_TYPES = frozenset(
     {
@@ -181,6 +179,8 @@ class SpeakerSampleStore:
         speaker_description: str | None = None,
     ) -> dict[str, Any]:
         normalized_name = normalize_voice_name(name)
+        if normalized_name in DEFAULT_VOICE_PRESETS:
+            raise bad_request("name is reserved for a preset voice", param="name")
         display_name = name.strip()
         consent = _normalize_required_text(consent, "consent")
         ref_text = _normalize_optional_text(ref_text)
@@ -254,12 +254,11 @@ class SpeakerSampleStore:
             try:
                 voice.file_path.unlink(missing_ok=True)
             except OSError as exc:
-                logger.warning(
+                logger.exception(
                     "Failed to delete voice file %s: %s", voice.file_path, exc
                 )
-                raise bad_request(
+                raise internal_error(
                     f"Failed to delete voice '{voice.name}' from storage",
-                    param="name",
                 ) from exc
             self._voices.pop(normalized)
             self.cache.clear_voice(normalized)
@@ -296,6 +295,7 @@ class SpeakerSampleStore:
         except SpeechAPIError as exc:
             logger.warning("%s; uploaded voices will not be restored", exc.message)
             return
+        candidates: list[UploadedVoice] = []
         for path in sorted(self.root_dir.glob("*.safetensors")):
             try:
                 with safe_open(str(path), framework="np") as handle:
@@ -307,6 +307,23 @@ class SpeakerSampleStore:
                 voice = _voice_from_metadata(metadata, path)
             except SpeechAPIError as exc:
                 logger.warning("Skipping invalid voice metadata %s: %s", path, exc)
+                continue
+            candidates.append(voice)
+        candidates.sort(key=lambda voice: voice.created_at, reverse=True)
+        for voice in candidates:
+            if voice.normalized_name in restored:
+                logger.warning(
+                    "Skipping duplicate restored voice %s for name %s",
+                    voice.file_path,
+                    voice.normalized_name,
+                )
+                continue
+            if len(restored) >= self.max_uploaded:
+                logger.warning(
+                    "Skipping restored voice %s because SPEAKER_MAX_UPLOADED=%d",
+                    voice.file_path,
+                    self.max_uploaded,
+                )
                 continue
             restored[voice.normalized_name] = voice
             last_timestamp = max(last_timestamp, voice.created_at)
@@ -403,45 +420,18 @@ def _resolve_upload_mime_type(filename: str | None, content_type: str | None) ->
 
 def _decode_reference_audio(audio_bytes: bytes) -> tuple[np.ndarray, int]:
     try:
-        return _decode_wav_upload(audio_bytes)
-    except ValueError:
-        pass
-    try:
         from sglang_omni.preprocessing.audio import AudioMediaIO
 
         samples, sample_rate = AudioMediaIO(target_sr=DEFAULT_SAMPLE_RATE).load_bytes(
             audio_bytes
         )
     except Exception as exc:
+        logger.debug("Failed to decode uploaded voice sample", exc_info=True)
         raise bad_request(
-            f"audio_sample could not be decoded: {exc}",
+            "audio_sample could not be decoded as a supported audio format",
             param="audio_sample",
         ) from exc
     return np.asarray(samples, dtype=np.float32), int(sample_rate)
-
-
-def _decode_wav_upload(audio_bytes: bytes) -> tuple[np.ndarray, int]:
-    try:
-        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
-            channels = wav_file.getnchannels()
-            sample_width = wav_file.getsampwidth()
-            sample_rate = wav_file.getframerate()
-            frames = wav_file.readframes(wav_file.getnframes())
-    except wave.Error as exc:
-        raise ValueError(str(exc)) from exc
-    if channels <= 0 or sample_rate <= 0 or not frames:
-        raise ValueError("invalid WAV reference audio")
-    if sample_width == 1:
-        audio = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128) / 128
-    elif sample_width == 2:
-        audio = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
-    elif sample_width == 4:
-        audio = np.frombuffer(frames, dtype="<i4").astype(np.float32) / 2147483648.0
-    else:
-        raise ValueError(f"unsupported WAV sample width: {sample_width}")
-    if channels > 1:
-        audio = audio.reshape(-1, channels).mean(axis=1)
-    return audio.astype(np.float32, copy=False), int(sample_rate)
 
 
 def _validate_reference_audio(samples: np.ndarray, sample_rate: int) -> None:
@@ -501,14 +491,14 @@ def _write_voice_temp_file(
         raise
     except Exception as exc:
         tmp_path.unlink(missing_ok=True)
-        raise bad_request(f"Failed to save uploaded voice: {exc}") from exc
+        raise internal_error("Failed to save uploaded voice") from exc
 
 
 def _replace_voice_file(temp_path: Path, path: Path) -> None:
     try:
         os.replace(temp_path, path)
     except OSError as exc:
-        raise bad_request(f"Failed to save uploaded voice: {exc}") from exc
+        raise internal_error("Failed to save uploaded voice") from exc
 
 
 def _safetensors_safe_open() -> Any:
@@ -543,21 +533,24 @@ def _voice_from_metadata(metadata: dict[str, str], path: Path) -> UploadedVoice:
     if normalized_name is None or name is None:
         raise bad_request("voice metadata is missing name")
     values: dict[str, Any] = dict(metadata)
-    for key in VOICE_METADATA_INT_FIELDS:
-        if key in values:
-            values[key] = int(values[key])
-    return UploadedVoice(
-        name=name,
-        normalized_name=normalize_voice_name(normalized_name),
-        consent=values.get("consent", ""),
-        created_at=int(values.get("created_at", 0)),
-        file_size=int(values.get("file_size", path.stat().st_size)),
-        mime_type=values.get("mime_type", "audio/wav"),
-        original_filename=values.get("original_filename", ""),
-        sample_rate=int(values.get("sample_rate", DEFAULT_SAMPLE_RATE)),
-        num_samples=int(values.get("num_samples", 0)),
-        fingerprint=values.get("fingerprint", ""),
-        file_path=path,
-        ref_text=values.get("ref_text"),
-        speaker_description=values.get("speaker_description"),
-    )
+    try:
+        for key in VOICE_METADATA_INT_FIELDS:
+            if key in values:
+                values[key] = int(values[key])
+        return UploadedVoice(
+            name=name,
+            normalized_name=normalize_voice_name(normalized_name),
+            consent=values.get("consent", ""),
+            created_at=int(values.get("created_at", 0)),
+            file_size=int(values.get("file_size", path.stat().st_size)),
+            mime_type=values.get("mime_type", "audio/wav"),
+            original_filename=values.get("original_filename", ""),
+            sample_rate=int(values.get("sample_rate", DEFAULT_SAMPLE_RATE)),
+            num_samples=int(values.get("num_samples", 0)),
+            fingerprint=values.get("fingerprint", ""),
+            file_path=path,
+            ref_text=values.get("ref_text"),
+            speaker_description=values.get("speaker_description"),
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise bad_request(f"voice metadata is invalid: {path}") from exc

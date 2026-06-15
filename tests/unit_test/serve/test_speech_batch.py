@@ -12,7 +12,7 @@ from sglang_omni.client import ClientError
 from sglang_omni.client.types import SpeechResult
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import _create_speech_batch_with_disconnect_watch
-from sglang_omni.serve.speech_service import SpeechService
+from sglang_omni.serve.speech_service import SpeechRequestValidator
 
 
 class RecordingBatchSpeechClient:
@@ -286,13 +286,13 @@ def test_batch_speech_isolates_runtime_failures_and_preserves_order() -> None:
     results = response.json()["results"]
     assert [item["index"] for item in results] == [0, 1, 2]
     assert [item["status"] for item in results] == ["success", "error", "success"]
-    assert results[1]["error"]["type"] == "InternalServerError"
+    assert results[1]["error"]["type"] == "server_error"
     assert set(client_impl.requests) == {"slow", "fail", "fast"}
 
 
 def test_batch_speech_cancellation_aborts_started_items() -> None:
     async def run() -> None:
-        service = SpeechService(default_model="tts")
+        service = SpeechRequestValidator(default_model="tts")
         batch = service.parse_batch_request({"items": [{"input": "one"}]})
         client_impl = BlockingBatchSpeechClient()
 
@@ -311,7 +311,7 @@ def test_batch_speech_cancellation_aborts_started_items() -> None:
 
 def test_batch_speech_request_disconnect_aborts_started_items() -> None:
     async def run() -> None:
-        service = SpeechService(default_model="tts")
+        service = SpeechRequestValidator(default_model="tts")
         batch = service.parse_batch_request({"items": [{"input": "one"}]})
         client_impl = BlockingBatchSpeechClient()
         request = DisconnectingBatchRequest(client_impl)
