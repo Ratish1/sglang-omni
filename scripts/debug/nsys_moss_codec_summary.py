@@ -132,7 +132,12 @@ def _name_from_row(
     keys = row.keys()
     for col in text_cols:
         if col in keys and row[col] not in (None, ""):
-            return str(row[col])
+            value = row[col]
+            if isinstance(value, int):
+                return string_ids.get(value, str(value))
+            if isinstance(value, str) and value.isdigit():
+                return string_ids.get(int(value), value)
+            return str(value)
     for col in id_cols:
         if col in keys and row[col] is not None:
             value = string_ids.get(int(row[col]))
@@ -271,6 +276,88 @@ def _children_by_parent_name(
     return rows
 
 
+def _top_scope_child_overlap(
+    parents: list[Slice],
+    children: list[Slice],
+    *,
+    scope_names: list[str],
+    children_per_scope: int,
+) -> list[dict[str, Any]]:
+    rows = []
+    for scope_name in scope_names:
+        scope_slices = [item for item in parents if item.name == scope_name]
+        if not scope_slices:
+            continue
+        scope_summary = _summary(scope_slices)
+        for child in _overlap_by_name(scope_slices, children)[:children_per_scope]:
+            rows.append(
+                {
+                    "scope": scope_name,
+                    "scope_total_ms": scope_summary["total_ms"],
+                    **child,
+                }
+            )
+    return rows
+
+
+def _kernel_category(name: str) -> str:
+    lowered = name.lower()
+    if "sdpa" in lowered or "flashattn" in lowered or "flash_attn" in lowered:
+        return "sdpa_or_flash_attention"
+    if "layer_norm" in lowered or "layernorm" in lowered:
+        return "layer_norm"
+    if (
+        "direct_copy" in lowered
+        or "copy_kernel" in lowered
+        or "catarraybatchedcopy" in lowered
+        or "bfloat16_copy" in lowered
+    ):
+        return "copy_or_layout"
+    if (
+        "arange" in lowered
+        or "remainder" in lowered
+        or "compare" in lowered
+        or "where" in lowered
+        or "bitwise" in lowered
+        or "index" in lowered
+        or "fill" in lowered
+    ):
+        return "index_mask_or_fill"
+    if "cos_kernel" in lowered or "sin_kernel" in lowered:
+        return "rope_trig"
+    if (
+        "nvjet" in lowered
+        or "gemm" in lowered
+        or "wgmma" in lowered
+        or "cutlass" in lowered
+    ):
+        return "gemm_or_matmul"
+    if (
+        "elementwise" in lowered
+        or "cudafunctor_add" in lowered
+        or "binaryfunctor" in lowered
+        or "gelu" in lowered
+        or "exp_kernel" in lowered
+    ):
+        return "elementwise"
+    return "other"
+
+
+def _kernel_category_rows(kernel_overlap: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"count": 0, "overlap_ms": 0.0, "duration_ms": 0.0}
+    )
+    for row in kernel_overlap:
+        category = _kernel_category(row["name"])
+        target = grouped[category]
+        target["count"] += int(row["count"])
+        target["overlap_ms"] += float(row["overlap_ms"])
+        target["duration_ms"] += float(row["duration_ms"])
+    rows = [{"category": key, **value} for key, value in grouped.items()]
+    rows.sort(key=lambda row: float(row["overlap_ms"]), reverse=True)
+    return rows
+
+
 def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     def fmt_ms(value: Any) -> str:
         return f"{float(value):.3f}"
@@ -335,6 +422,20 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     lines.extend(
         [
             "",
+            "## Kernel Category Overlap Under processor.decode_audio_codes",
+            "",
+            "| category | count | overlap ms | duration ms |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for row in report["kernel_category_overlap"]:
+        lines.append(
+            f"| `{row['category']}` | {row['count']} | {fmt_ms(row['overlap_ms'])} | {fmt_ms(row['duration_ms'])} |"
+        )
+
+    lines.extend(
+        [
+            "",
             "## Top Kernel Overlap Under processor.decode_audio_codes",
             "",
             "| kernel | count | overlap ms | duration ms |",
@@ -344,6 +445,46 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     for row in report["kernel_overlap"][:30]:
         lines.append(
             f"| `{row['name']}` | {row['count']} | {fmt_ms(row['overlap_ms'])} | {fmt_ms(row['duration_ms'])} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Top Runtime Overlap By Hot Decoder Scope",
+            "",
+            "| scope | runtime | count | overlap ms | scope total ms |",
+            "|---|---|---:|---:|---:|",
+        ]
+    )
+    for row in report["hot_scope_runtime_overlap"][:80]:
+        lines.append(
+            "| `{scope}` | `{name}` | {count} | {overlap} | {scope_total} |".format(
+                scope=row["scope"],
+                name=row["name"],
+                count=row["count"],
+                overlap=fmt_ms(row["overlap_ms"]),
+                scope_total=fmt_ms(row["scope_total_ms"]),
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Top Kernel Overlap By Hot Decoder Scope",
+            "",
+            "| scope | kernel | count | overlap ms | scope total ms |",
+            "|---|---|---:|---:|---:|",
+        ]
+    )
+    for row in report["hot_scope_kernel_overlap"][:80]:
+        lines.append(
+            "| `{scope}` | `{name}` | {count} | {overlap} | {scope_total} |".format(
+                scope=row["scope"],
+                name=row["name"],
+                count=row["count"],
+                overlap=fmt_ms(row["overlap_ms"]),
+                scope_total=fmt_ms(row["scope_total_ms"]),
+            )
         )
 
     lines.extend(
@@ -410,6 +551,11 @@ def summarize(sqlite_path: Path) -> dict[str, Any]:
         parent_contains=_PROCESSOR_LABEL,
         child_contains=decoder_labels,
     )
+    hot_scope_names = list(
+        dict.fromkeys(row["name"] for row in decoder_subscope_overlap[:16])
+    )
+    runtime_overlap = _overlap_by_name(processor_ranges, runtime)
+    kernel_overlap = _overlap_by_name(processor_ranges, kernels)
     top_moss_nvtx = [
         row for row in _by_name(nvtx) if "moss_tts_local.vocoder" in row["name"]
     ]
@@ -426,8 +572,21 @@ def summarize(sqlite_path: Path) -> dict[str, Any]:
         "decoder_subscope_summary": _duration_summary(
             decoder_subscope_overlap, "overlap_ms"
         ),
-        "runtime_overlap": _overlap_by_name(processor_ranges, runtime),
-        "kernel_overlap": _overlap_by_name(processor_ranges, kernels),
+        "runtime_overlap": runtime_overlap,
+        "kernel_overlap": kernel_overlap,
+        "kernel_category_overlap": _kernel_category_rows(kernel_overlap),
+        "hot_scope_runtime_overlap": _top_scope_child_overlap(
+            nvtx,
+            runtime,
+            scope_names=hot_scope_names,
+            children_per_scope=4,
+        ),
+        "hot_scope_kernel_overlap": _top_scope_child_overlap(
+            nvtx,
+            kernels,
+            scope_names=hot_scope_names,
+            children_per_scope=6,
+        ),
         "top_moss_nvtx": top_moss_nvtx,
     }
 

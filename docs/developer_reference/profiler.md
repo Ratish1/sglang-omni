@@ -268,7 +268,10 @@ This script expects traces collected with both
 `SGLANG_MOSS_TTS_LOCAL_VOCODER_DEEP_PROFILE=1`. It writes
 `nsys_moss_codec_summary.md` and `nsys_moss_codec_summary.json`, including
 codec decoder label totals, nested decoder/attention overlap under
-`processor.decode_audio_codes`, CUDA runtime overlap, and kernel overlap.
+`processor.decode_audio_codes`, CUDA runtime overlap, kernel category overlap,
+kernel overlap, and the top CUDA runtime/kernel overlap under the hottest
+decoder scopes. The parser resolves Nsight `StringIds`, including kernel-name
+columns that appear as numeric ids in some SQLite exports.
 Use it before proposing codec optimizations so the target is tied to the
 remote-code decoder internals rather than the Omni packaging boundary.
 

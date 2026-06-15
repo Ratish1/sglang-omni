@@ -58,11 +58,11 @@ def _write_fake_nsys_sqlite(path) -> None:
         )
         conn.execute(
             "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
-            "(start INTEGER, end INTEGER, demangledNameId INTEGER, globalTid INTEGER)"
+            "(start INTEGER, end INTEGER, shortName INTEGER, globalTid INTEGER)"
         )
         conn.executemany(
             "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL "
-            "(start, end, demangledNameId, globalTid) VALUES (?, ?, ?, ?)",
+            "(start, end, shortName, globalTid) VALUES (?, ?, ?, ?)",
             [
                 (260_000, 290_000, 6, 11),
                 (1_200_000, 1_300_000, 6, 11),
@@ -94,7 +94,20 @@ def test_nsys_moss_codec_summary_overlaps_processor_scope(tmp_path) -> None:
         kernels["cudnn_generated_fort_native_sdpa_sm90_flash_kernel"]["overlap_ms"]
         == 0.03
     )
+    assert report["kernel_category_overlap"][0]["category"] == (
+        "sdpa_or_flash_attention"
+    )
 
     decoder_labels = {row["label"]: row for row in report["decoder_subscope_overlap"]}
     assert decoder_labels[".self_attn.forward"]["overlap_ms"] == 0.5
     assert decoder_labels[".self_attn._forward_streaming_sdpa"]["overlap_ms"] == 0.2
+
+    hot_scope_kernels = {
+        (row["scope"], row["name"]): row for row in report["hot_scope_kernel_overlap"]
+    }
+    hot_scope_key = (
+        "moss_tts_local.vocoder.audio_tokenizer.decoder.0."
+        "ProjectedTransformer.layer.0.self_attn._forward_streaming_sdpa",
+        "cudnn_generated_fort_native_sdpa_sm90_flash_kernel",
+    )
+    assert hot_scope_kernels[hot_scope_key]["overlap_ms"] == 0.03
