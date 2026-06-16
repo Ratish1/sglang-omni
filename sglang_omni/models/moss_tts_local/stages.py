@@ -43,7 +43,7 @@ from sglang_omni.utils.misc import avail_gpu_mem
 
 logger = logging.getLogger(__name__)
 
-_MOSS_COLOCATED_CODEC_MEM_RESERVE = 0.0
+_MOSS_COLOCATED_CODEC_MEM_RESERVE = 0.25
 
 _MOSS_TTS_LOCAL_INSTALL_HINT = (
     "MOSS-TTS Local support requires the upstream custom Transformers code. "

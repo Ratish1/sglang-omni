@@ -354,7 +354,7 @@ def test_pipeline_stage_wiring():
     assert config.supports_uploaded_voice_references() is True
     assert stages["tts_engine"].process == "pipeline"
     assert stages["tts_engine"].gpu == 0
-    assert stages["tts_engine"].factory_args["codec_mem_reserve"] == 0.0
+    assert stages["tts_engine"].factory_args["codec_mem_reserve"] == pytest.approx(0.25)
     tts_engine_runtime = stages["tts_engine"].runtime
     assert tts_engine_runtime.resources.total_gpu_memory_fraction == pytest.approx(0.85)
     assert tts_engine_runtime.sglang_server_args.mem_fraction_static is None

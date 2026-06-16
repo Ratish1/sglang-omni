@@ -15,6 +15,7 @@ import os
 import queue as _queue_mod
 import string
 import threading
+import time
 from contextlib import suppress
 from typing import Any, Callable, Literal
 
@@ -686,10 +687,23 @@ class Stage:
                 )
                 return
             self._stream_queue.put_done(request_id, from_stage=from_stage)
+            enqueued_ns = time.time_ns()
+            queue_depth_before = self.scheduler.inbox.qsize()
+            _emit_event(
+                request_id=request_id,
+                stage=self.name,
+                event_name="stage_scheduler_enqueue",
+                metadata={
+                    "message_type": "stream_done",
+                    "queue_depth_before": queue_depth_before,
+                },
+                timestamp_ns=enqueued_ns,
+            )
             self.scheduler.inbox.put(
                 IncomingMessage(
                     request_id=request_id,
                     type="stream_done",
+                    enqueued_ns=enqueued_ns,
                 )
             )
 
@@ -722,16 +736,37 @@ class Stage:
         )
 
     def _route_stream_item(self, request_id: str, item: StreamItem) -> None:
+        enqueued_ns = time.time_ns()
+        queue_depth_before = self.scheduler.inbox.qsize()
+        _emit_event(
+            request_id=request_id,
+            stage=self.name,
+            event_name="stage_scheduler_enqueue",
+            metadata={
+                "message_type": "stream_chunk",
+                "queue_depth_before": queue_depth_before,
+            },
+            timestamp_ns=enqueued_ns,
+        )
         self.scheduler.inbox.put(
-            IncomingMessage(request_id=request_id, type="stream_chunk", data=item)
+            IncomingMessage(
+                request_id=request_id,
+                type="stream_chunk",
+                data=item,
+                enqueued_ns=enqueued_ns,
+            )
         )
 
     async def _execute(self, payload: Any) -> None:
         request_id = payload.request_id
+        enqueued_ns = time.time_ns()
+        queue_depth_before = self.scheduler.inbox.qsize()
         _emit_event(
             request_id=request_id,
             stage=self.name,
             event_name="stage_dispatch",
+            metadata={"scheduler_queue_depth_before": queue_depth_before},
+            timestamp_ns=enqueued_ns,
         )
         if (
             self.role == "leader"
@@ -740,7 +775,12 @@ class Stage:
         ):
             self._tp_fanout.fanout_work(payload)
         self.scheduler.inbox.put(
-            IncomingMessage(request_id=request_id, type="new_request", data=payload)
+            IncomingMessage(
+                request_id=request_id,
+                type="new_request",
+                data=payload,
+                enqueued_ns=enqueued_ns,
+            )
         )
 
     async def _on_admin(self, msg: AdminMessage) -> None:

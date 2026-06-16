@@ -36,6 +36,13 @@ def _emit_scheduler_event(
     )
 
 
+def _dequeue_metadata(msg: IncomingMessage) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"message_type": msg.type}
+    if msg.enqueued_ns is not None:
+        metadata["queue_wait_ms"] = (time.time_ns() - msg.enqueued_ns) / 1_000_000.0
+    return metadata
+
+
 class SimpleScheduler:
     """Process requests one at a time via a callable.
 
@@ -262,7 +269,7 @@ class SimpleScheduler:
                     _emit_scheduler_event(
                         msg.request_id,
                         "simple_scheduler_dequeue",
-                        {"message_type": msg.type},
+                        _dequeue_metadata(msg),
                     )
                     if self._consume_if_aborted(msg.request_id):
                         continue
@@ -316,7 +323,7 @@ class SimpleScheduler:
                 _emit_scheduler_event(
                     msg.request_id,
                     "simple_scheduler_dequeue",
-                    {"message_type": msg.type},
+                    _dequeue_metadata(msg),
                 )
                 if self._consume_if_aborted(msg.request_id):
                     continue

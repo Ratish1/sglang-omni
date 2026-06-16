@@ -45,6 +45,13 @@ def _emit_scheduler_event(
     )
 
 
+def _dequeue_metadata(msg: IncomingMessage) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"message_type": msg.type}
+    if msg.enqueued_ns is not None:
+        metadata["queue_wait_ms"] = (time.time_ns() - msg.enqueued_ns) / 1_000_000.0
+    return metadata
+
+
 class StreamingSimpleScheduler:
     """Scheduler base for simple stages with streaming input.
 
@@ -130,7 +137,7 @@ class StreamingSimpleScheduler:
                 _emit_scheduler_event(
                     msg.request_id,
                     "streaming_simple_scheduler_dequeue",
-                    {"message_type": msg.type},
+                    _dequeue_metadata(msg),
                 )
                 try:
                     self._handle_message(msg, loop)
