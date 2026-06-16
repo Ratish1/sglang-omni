@@ -28,6 +28,8 @@ from sglang_omni.models.tts_streaming import (
     resolve_initial_codec_chunk_frames,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
@@ -614,7 +616,22 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
     def _vocode_batch(self, payloads: list[StagePayload]) -> list[StagePayload]:
         prepared = [self._prepare_codes(payload) for payload in payloads]
         codes_list = [codes for _, codes in prepared if codes is not None]
-        decoded = iter(self._decode_codes_rows(codes_list)) if codes_list else iter(())
+        profiled_payloads = [
+            payload
+            for payload, (_, codes) in zip(payloads, prepared)
+            if codes is not None
+        ]
+        profile_active = bool(codes_list and _get_event_recorder().is_active())
+        if profile_active:
+            self._emit_vocoder_decode_events(
+                "vocoder_decode_start", profiled_payloads, codes_list
+            )
+        decoded_wavs = self._decode_codes_rows(codes_list) if codes_list else []
+        if profile_active:
+            self._emit_vocoder_decode_events(
+                "vocoder_decode_end", profiled_payloads, codes_list
+            )
+        decoded = iter(decoded_wavs)
         results = []
         for payload, (state, codes) in zip(payloads, prepared):
             if codes is None:
@@ -627,6 +644,30 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     def _vocode(self, payload: StagePayload) -> StagePayload:
         return self._vocode_batch([payload])[0]
+
+    def _emit_vocoder_decode_events(
+        self,
+        event_name: str,
+        payloads: list[StagePayload],
+        codes_list: list[torch.Tensor],
+    ) -> None:
+        batch_size = len(codes_list)
+        total_frames = sum(int(codes.shape[0]) for codes in codes_list)
+        max_frames = max((int(codes.shape[0]) for codes in codes_list), default=0)
+        path = "processor" if self._session is None else "session"
+        for payload, codes in zip(payloads, codes_list):
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name=event_name,
+                metadata={
+                    "path": path,
+                    "batch_size": batch_size,
+                    "frames": int(codes.shape[0]),
+                    "total_frames": total_frames,
+                    "max_frames": max_frames,
+                },
+            )
 
 
 __all__ = ["MossTTSLocalStreamingVocoderScheduler"]
