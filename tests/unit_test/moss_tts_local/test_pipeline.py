@@ -361,9 +361,9 @@ def test_pipeline_stage_wiring():
     assert stages["vocoder"].process == "pipeline"
     assert stages["vocoder"].gpu == 0
     assert stages["vocoder"].factory_args["device"] == "cuda:0"
-    assert stages["vocoder"].factory_args["max_batch_size"] == 16
-    assert stages["vocoder"].factory_args["max_batch_wait_ms"] == 8
-    assert stages["vocoder"].factory_args["max_batch_frames"] == 1200
+    assert "max_batch_size" not in stages["vocoder"].factory_args
+    assert "max_batch_wait_ms" not in stages["vocoder"].factory_args
+    assert "max_batch_frames" not in stages["vocoder"].factory_args
 
     placement = build_stage_placement_plan(config)
     assert placement.stages["tts_engine"].gpu_ids == (0,)

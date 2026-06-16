@@ -735,9 +735,15 @@ def test_nonstream_vocoder_batches_by_total_frame_cost(monkeypatch) -> None:
         max_batch_size=4,
         max_batch_frames=10,
     )
-    first = _terminal_payload(_rows(4, seed=80), request_id="a")
-    second = _terminal_payload(_rows(6, seed=81), request_id="b")
-    third = _terminal_payload(_rows(1, seed=82), request_id="c")
+    first = _terminal_payload(
+        _rows(4, seed=80), request_id="a", params={"stream": False}
+    )
+    second = _terminal_payload(
+        _rows(6, seed=81), request_id="b", params={"stream": False}
+    )
+    third = _terminal_payload(
+        _rows(1, seed=82), request_id="c", params={"stream": False}
+    )
     scheduler.inbox.put(IncomingMessage("b", "new_request", second))
     scheduler.inbox.put(IncomingMessage("c", "new_request", third))
 

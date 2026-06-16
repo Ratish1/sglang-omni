@@ -20,17 +20,6 @@ _PKG = "sglang_omni.models.moss_tts_local"
 def _stages(*, codec_device: str) -> list[StageConfig]:
     colocated_codec = codec_device == "cuda:0"
     vocoder_factory_args = {"device": codec_device}
-    if colocated_codec:
-        # The default single-GPU topology queues terminal non-streaming
-        # requests behind the same codec decoder. Give it a modest batching
-        # window and a frame-count cap; split keeps the lower-latency defaults.
-        vocoder_factory_args.update(
-            {
-                "max_batch_size": 16,
-                "max_batch_wait_ms": 8,
-                "max_batch_frames": 1200,
-            }
-        )
     return [
         StageConfig(
             name="preprocessing",
