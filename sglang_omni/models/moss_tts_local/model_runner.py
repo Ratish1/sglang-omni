@@ -11,6 +11,7 @@ from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 from sglang_omni.models.moss_tts_local.radix_hash import gpu_radix_row_hash
 from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.types import RequestOutput
 
@@ -334,6 +335,14 @@ class MossTTSLocalModelRunner(ModelRunner):
         use_graph = (
             not has_audio_repetition_penalty and batch_size <= frame_graph_max_bs
         )
+        self._emit_frame_decode_events(
+            "moss_ar_frame_decode_start",
+            requests,
+            batch_size=batch_size,
+            use_graph=use_graph,
+            has_audio_repetition_penalty=has_audio_repetition_penalty,
+            frame_graph_max_bs=frame_graph_max_bs,
+        )
         if use_graph:
             stop_choice, codes, feedback = self.model.decode_frame_graphed(
                 hidden_states,
@@ -374,6 +383,14 @@ class MossTTSLocalModelRunner(ModelRunner):
             embeds = self.model._prepare_multi_modal_inputs(
                 rows.to(device=self.model.device)
             )
+        self._emit_frame_decode_events(
+            "moss_ar_frame_decode_end",
+            requests,
+            batch_size=batch_size,
+            use_graph=use_graph,
+            has_audio_repetition_penalty=has_audio_repetition_penalty,
+            frame_graph_max_bs=frame_graph_max_bs,
+        )
         emit_indices = sorted(emit_set)
         if emit_indices:
             emit_index_t = torch.tensor(
@@ -416,6 +433,39 @@ class MossTTSLocalModelRunner(ModelRunner):
         # Always return rows so both the sync inline path and the async launch
         # publish next_token_ids; an all-chunked batch just attaches no journal.
         return rows, end_id
+
+    @staticmethod
+    def _emit_frame_decode_events(
+        event_name: str,
+        requests: list,
+        *,
+        batch_size: int,
+        use_graph: bool,
+        has_audio_repetition_penalty: bool,
+        frame_graph_max_bs: int,
+    ) -> None:
+        recorder = _get_event_recorder()
+        if not recorder.is_active():
+            return
+        metadata = {
+            "batch_size": int(batch_size),
+            "use_graph": bool(use_graph),
+            "has_audio_repetition_penalty": bool(has_audio_repetition_penalty),
+            "frame_graph_max_bs": int(frame_graph_max_bs),
+        }
+        for batch_index, sched_req in enumerate(requests):
+            data = getattr(sched_req, "data", None)
+            event_metadata = dict(metadata)
+            event_metadata["batch_index"] = batch_index
+            generation_steps = getattr(data, "generation_steps", None)
+            if generation_steps is not None:
+                event_metadata["generation_steps"] = int(generation_steps)
+            recorder.emit(
+                request_id=sched_req.request_id,
+                stage=None,
+                event_name=event_name,
+                metadata=event_metadata,
+            )
 
     def post_decode_launch(self, result: Any, forward_batch: Any, requests: list):
         """Async-decode GPU half of ``post_decode``: run the frame micro-decode

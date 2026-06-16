@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.scheduling.types import ModelRunnerOutput, RequestOutput
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,17 @@ class ModelRunner:
         batch_result = self._prepare_and_forward(
             forward_batch, schedule_batch, scheduler_output.requests, is_prefill
         )
+        self._emit_ar_events(
+            "ar_post_forward_start",
+            scheduler_output.requests,
+            self._ar_profile_metadata(
+                forward_batch,
+                schedule_batch,
+                scheduler_output.requests,
+                is_prefill,
+                batch_result=batch_result,
+            ),
+        )
         if is_prefill:
             self.post_prefill(
                 batch_result, forward_batch, schedule_batch, scheduler_output.requests
@@ -123,6 +135,17 @@ class ModelRunner:
             self.post_decode(
                 batch_result, forward_batch, schedule_batch, scheduler_output.requests
             )
+        self._emit_ar_events(
+            "ar_post_forward_end",
+            scheduler_output.requests,
+            self._ar_profile_metadata(
+                forward_batch,
+                schedule_batch,
+                scheduler_output.requests,
+                is_prefill,
+                batch_result=batch_result,
+            ),
+        )
         return self._finalize(
             batch_result,
             forward_batch,
@@ -159,8 +182,30 @@ class ModelRunner:
             is_prefill,
             is_lookahead=True,
         )
+        self._emit_ar_events(
+            "ar_post_forward_start",
+            scheduler_output.requests,
+            self._ar_profile_metadata(
+                forward_batch,
+                schedule_batch,
+                scheduler_output.requests,
+                is_prefill,
+                batch_result=batch_result,
+            ),
+        )
         launch_buf = self.post_decode_launch(
             batch_result, forward_batch, scheduler_output.requests
+        )
+        self._emit_ar_events(
+            "ar_post_forward_end",
+            scheduler_output.requests,
+            self._ar_profile_metadata(
+                forward_batch,
+                schedule_batch,
+                scheduler_output.requests,
+                is_prefill,
+                batch_result=batch_result,
+            ),
         )
         # Publish this step's output token ids now (post_decode_launch set them
         # from GPU state without a host sync) so the NEXT decode step's
@@ -275,6 +320,10 @@ class ModelRunner:
     ):
         """Prepare hook → standard forward (if not custom) → sample-before-post
         block. Returns ``batch_result``."""
+        metadata = self._ar_profile_metadata(
+            forward_batch, schedule_batch, requests, is_prefill
+        )
+        self._emit_ar_events("ar_prepare_start", requests, metadata)
         if is_prefill:
             self.before_prefill(forward_batch, schedule_batch, requests)
             batch_result = self.custom_prefill_forward(
@@ -290,8 +339,21 @@ class ModelRunner:
             batch_result = self.custom_decode_forward(
                 forward_batch, schedule_batch, requests
             )
+        self._emit_ar_events("ar_prepare_end", requests, metadata)
         if batch_result is None:
+            self._emit_ar_events("ar_forward_start", requests, metadata)
             batch_result = self.tp_worker.forward_batch_generation(forward_batch)
+            self._emit_ar_events(
+                "ar_forward_end",
+                requests,
+                self._ar_profile_metadata(
+                    forward_batch,
+                    schedule_batch,
+                    requests,
+                    is_prefill,
+                    batch_result=batch_result,
+                ),
+            )
 
         if (
             not schedule_batch.is_prefill_only
@@ -309,6 +371,94 @@ class ModelRunner:
             )
             schedule_batch.output_ids = batch_result.next_token_ids
         return batch_result
+
+    def _ar_profile_metadata(
+        self,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+        is_prefill: bool,
+        *,
+        batch_result: Any | None = None,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "phase": "prefill" if is_prefill else "decode",
+            "request_batch_size": len(requests),
+        }
+        for name in ("batch_size", "global_num_tokens"):
+            value = getattr(forward_batch, name, None)
+            if value is not None:
+                try:
+                    metadata[name] = int(value)
+                except (TypeError, ValueError):
+                    metadata[name] = repr(value)
+        forward_mode = getattr(schedule_batch, "forward_mode", None)
+        if forward_mode is not None:
+            mode_name = type(forward_mode).__name__
+            for attr in ("is_extend", "is_decode"):
+                fn = getattr(forward_mode, attr, None)
+                if callable(fn):
+                    try:
+                        if bool(fn()):
+                            mode_name = attr.removeprefix("is_")
+                            break
+                    except Exception:
+                        pass
+            metadata["forward_mode"] = mode_name
+        if hasattr(schedule_batch, "is_prefill_only"):
+            metadata["is_prefill_only"] = bool(schedule_batch.is_prefill_only)
+        if batch_result is not None:
+            metadata["can_run_cuda_graph"] = bool(
+                getattr(batch_result, "can_run_cuda_graph", False)
+            )
+        return metadata
+
+    @staticmethod
+    def _is_prefill_batch(schedule_batch: Any) -> bool:
+        forward_mode = getattr(schedule_batch, "forward_mode", None)
+        is_extend = getattr(forward_mode, "is_extend", None)
+        if callable(is_extend):
+            try:
+                return bool(is_extend())
+            except Exception:
+                return False
+        return False
+
+    def _emit_ar_events(
+        self,
+        event_name: str,
+        requests: list,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        recorder = _get_event_recorder()
+        if not recorder.is_active():
+            return
+        base_metadata = dict(metadata or {})
+        batch_size = len(requests)
+        for batch_index, sched_req in enumerate(requests):
+            request_id = getattr(sched_req, "request_id", None)
+            if request_id is None:
+                data = getattr(sched_req, "data", None)
+                req = getattr(data, "req", None)
+                request_id = getattr(req, "rid", None)
+            if request_id is None:
+                continue
+            data = getattr(sched_req, "data", None)
+            event_metadata = dict(base_metadata)
+            event_metadata["batch_index"] = batch_index
+            event_metadata["batch_size"] = batch_size
+            generation_steps = getattr(data, "generation_steps", None)
+            if generation_steps is not None:
+                try:
+                    event_metadata["generation_steps"] = int(generation_steps)
+                except (TypeError, ValueError):
+                    event_metadata["generation_steps"] = repr(generation_steps)
+            recorder.emit(
+                request_id=request_id,
+                stage=None,
+                event_name=event_name,
+                metadata=event_metadata,
+            )
 
     def finalize_skip_rids(self, scheduler_output) -> set[str]:
         """Request ids whose ``generation_steps`` must NOT advance this step.
@@ -360,6 +510,13 @@ class ModelRunner:
         a stale-length output_ids on the running batch, which the next
         prepare_for_decode turns into an input_ids that mismatches seq_lens once
         a request finishes mid-batch (the bs>1 replay size mismatch)."""
+        metadata = self._ar_profile_metadata(
+            forward_batch,
+            schedule_batch,
+            scheduler_output.requests,
+            self._is_prefill_batch(schedule_batch),
+        )
+        self._emit_ar_events("ar_finalize_start", scheduler_output.requests, metadata)
         if schedule_batch.is_prefill_only:
             if batch_result.next_token_ids is None:
                 batch_result.next_token_ids = torch.zeros(
@@ -396,6 +553,17 @@ class ModelRunner:
         req_ids = [req.request_id for req in scheduler_output.requests]
         req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
 
+        self._emit_ar_events(
+            "ar_finalize_end",
+            scheduler_output.requests,
+            self._ar_profile_metadata(
+                forward_batch,
+                schedule_batch,
+                scheduler_output.requests,
+                self._is_prefill_batch(schedule_batch),
+                batch_result=batch_result,
+            ),
+        )
         return ModelRunnerOutput(
             outputs=outputs,
             req_ids=req_ids,

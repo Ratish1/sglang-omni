@@ -317,6 +317,73 @@ def test_stage_breakdown_covers_preprocess_encoder_and_prefill(
     assert by_key[talker_ttfcc_key].total_ms == 4.0
 
 
+def test_stage_breakdown_covers_ar_runner_and_moss_frame_decode(
+    tmp_path: Path,
+) -> None:
+    events = [
+        _ev("r1", "tts_engine", "ar_prepare_start", 0, phase="prefill"),
+        _ev("r1", "tts_engine", "ar_prepare_end", 700_000, phase="prefill"),
+        _ev("r1", "tts_engine", "ar_forward_start", 800_000, phase="prefill"),
+        _ev(
+            "r1",
+            "tts_engine",
+            "ar_forward_end",
+            9_800_000,
+            phase="prefill",
+            can_run_cuda_graph=True,
+        ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "ar_post_forward_start",
+            9_900_000,
+            phase="prefill",
+        ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "moss_ar_frame_decode_start",
+            10_000_000,
+            batch_size=4,
+            use_graph=True,
+        ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "moss_ar_frame_decode_end",
+            13_500_000,
+            batch_size=4,
+            use_graph=True,
+        ),
+        _ev(
+            "r1",
+            "tts_engine",
+            "ar_post_forward_end",
+            13_600_000,
+            phase="prefill",
+        ),
+        _ev("r1", "tts_engine", "ar_finalize_start", 13_700_000),
+        _ev("r1", "tts_engine", "ar_finalize_end", 14_100_000),
+    ]
+    _write_events(tmp_path / "events_x.jsonl", events)
+    rows = stage_breakdown(source=tmp_path)
+    by_key = {(r.stage, r.interval_name): r for r in rows}
+
+    assert by_key[("tts_engine", "ar_prepare_start->ar_prepare_end")].total_ms == 0.7
+    assert by_key[("tts_engine", "ar_forward_start->ar_forward_end")].total_ms == 9.0
+    assert (
+        by_key[("tts_engine", "ar_post_forward_start->ar_post_forward_end")].total_ms
+        == 3.7
+    )
+    assert (
+        by_key[
+            ("tts_engine", "moss_ar_frame_decode_start->moss_ar_frame_decode_end")
+        ].total_ms
+        == 3.5
+    )
+    assert by_key[("tts_engine", "ar_finalize_start->ar_finalize_end")].total_ms == 0.4
+
+
 def test_stage_breakdown_emits_both_intervals_sharing_opener(
     tmp_path: Path,
 ) -> None:

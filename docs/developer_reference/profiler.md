@@ -75,6 +75,11 @@ Supporting events used for finer-grained breakdown:
 | Stage | `stage_stream_chunk_received` | Each stream chunk materialized and ready for the receiver scheduler, including coordinator terminal chunks |
 | AR scheduler | `scheduler_queue_enter` | Built request entered the scheduler queue |
 | AR scheduler | `scheduler_first_emit` | First `stream_output_builder` emission per request |
+| AR model runner | `ar_prepare_start` / `ar_prepare_end` | Hook and input-buffer preparation before the model forward |
+| AR model runner | `ar_forward_start` / `ar_forward_end` | Standard SGLang model forward, including CUDA graph replay when active |
+| AR model runner | `ar_post_forward_start` / `ar_post_forward_end` | Model-specific post-forward collect hook |
+| AR model runner | `ar_finalize_start` / `ar_finalize_end` | Output processing and per-request generation-step bookkeeping |
+| MOSS-TTS Local AR | `moss_ar_frame_decode_start` / `moss_ar_frame_decode_end` | MOSS local frame micro-decode after the backbone returns hidden states |
 
 Custom callsites can call `sglang_omni.profiler.event_recorder.emit(...)` to
 add domain-specific events. Events from inactive recorders are no-ops, so
