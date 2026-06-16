@@ -10,6 +10,7 @@ import torch
 
 from sglang_omni.client.audio import encode_audio, encode_wav
 from sglang_omni.config.placement import build_stage_placement_plan
+from sglang_omni.models.moss_tts_local import stages as moss_local_stages
 from sglang_omni.models.moss_tts_local.config import (
     MossTTSLocalColocatedPipelineConfig,
     MossTTSLocalPipelineConfig,
@@ -353,10 +354,10 @@ def test_pipeline_stage_wiring():
     assert config.supports_uploaded_voice_references() is True
     assert stages["tts_engine"].process == "pipeline"
     assert stages["tts_engine"].gpu == 0
+    assert stages["tts_engine"].factory_args["codec_mem_reserve"] == pytest.approx(0.25)
     tts_engine_runtime = stages["tts_engine"].runtime
-    assert tts_engine_runtime.sglang_server_args.mem_fraction_static == pytest.approx(
-        0.85
-    )
+    assert tts_engine_runtime.resources.total_gpu_memory_fraction == pytest.approx(0.85)
+    assert tts_engine_runtime.sglang_server_args.mem_fraction_static is None
     assert stages["vocoder"].process == "pipeline"
     assert stages["vocoder"].gpu == 0
     assert stages["vocoder"].factory_args["device"] == "cuda:0"
@@ -381,7 +382,68 @@ def test_pipeline_stage_wiring():
     split_stages = {stage.name: stage for stage in split.stages}
     assert split_stages["preprocessing"].factory_args["device"] == "cuda:1"
     assert split_stages["tts_engine"].factory_args["gpu_id"] == 0
+    assert split_stages["tts_engine"].factory_args["codec_mem_reserve"] == 0.0
     assert split_stages["vocoder"].factory_args["device"] == "cuda:1"
+
+
+def test_colocated_moss_ar_memory_contract_reserves_codec_budget():
+    overrides: dict[str, object] = {}
+    contract = moss_local_stages._apply_colocated_codec_memory_contract(
+        overrides,
+        stage_name="tts_engine",
+        total_gpu_memory_fraction=0.85,
+        codec_mem_reserve=0.25,
+    )
+    assert overrides["mem_fraction_static"] == pytest.approx(0.6)
+    assert contract.mem_fraction_static_pinned is True
+    assert contract.effective_total_gpu_memory_fraction == pytest.approx(0.6)
+    assert contract.applied_codec_mem_reserve == pytest.approx(0.25)
+
+
+def test_colocated_moss_ar_memory_contract_allows_matching_explicit_budget():
+    overrides: dict[str, object] = {"mem_fraction_static": 0.6}
+    contract = moss_local_stages._apply_colocated_codec_memory_contract(
+        overrides,
+        stage_name="tts_engine",
+        total_gpu_memory_fraction=0.6,
+        codec_mem_reserve=0.0,
+    )
+    assert overrides["mem_fraction_static"] == pytest.approx(0.6)
+    assert contract.mem_fraction_static_pinned is True
+    assert contract.effective_total_gpu_memory_fraction == pytest.approx(0.6)
+    assert contract.applied_codec_mem_reserve == 0.0
+
+
+def test_colocated_moss_ar_memory_contract_rejects_conflicting_budget():
+    overrides: dict[str, object] = {"mem_fraction_static": 0.85}
+    with pytest.raises(ValueError, match="conflicting colocated memory contracts"):
+        moss_local_stages._apply_colocated_codec_memory_contract(
+            overrides,
+            stage_name="tts_engine",
+            total_gpu_memory_fraction=0.6,
+            codec_mem_reserve=0.0,
+        )
+
+
+def test_colocated_moss_ar_memory_contract_rejects_explicit_budget_with_reserve():
+    overrides: dict[str, object] = {"mem_fraction_static": 0.6}
+    with pytest.raises(ValueError, match="cannot apply codec_mem_reserve"):
+        moss_local_stages._apply_colocated_codec_memory_contract(
+            overrides,
+            stage_name="tts_engine",
+            total_gpu_memory_fraction=0.6,
+            codec_mem_reserve=0.25,
+        )
+
+
+def test_colocated_moss_ar_memory_contract_rejects_too_small_effective_budget():
+    with pytest.raises(ValueError, match="below the safe floor"):
+        moss_local_stages._apply_colocated_codec_memory_contract(
+            {},
+            stage_name="tts_engine",
+            total_gpu_memory_fraction=0.2,
+            codec_mem_reserve=0.15,
+        )
 
 
 def test_special_token_defaults_match_v15_checkpoint():
@@ -1773,4 +1835,5 @@ def test_async_decode_cli_accepts_moss_local():
     args = resolve_stage_factory_args(stage, config)
     assert args["enable_async_decode"] is True
     assert args["async_decode_min_batch_size"] == 4
-    assert args["server_args_overrides"]["mem_fraction_static"] == pytest.approx(0.85)
+    assert args["total_gpu_memory_fraction"] == pytest.approx(0.85)
+    assert "server_args_overrides" not in args

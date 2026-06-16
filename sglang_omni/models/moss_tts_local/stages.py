@@ -10,6 +10,7 @@ import os
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
@@ -37,8 +38,12 @@ from sglang_omni.preprocessing.cache_key import (
 from sglang_omni.profiler.trace_ranges import profile_range
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
+from sglang_omni.utils.gpu_memory import format_bytes_gib, get_process_gpu_memory_bytes
+from sglang_omni.utils.misc import avail_gpu_mem
 
 logger = logging.getLogger(__name__)
+
+_MOSS_COLOCATED_CODEC_MEM_RESERVE = 0.25
 
 _MOSS_TTS_LOCAL_INSTALL_HINT = (
     "MOSS-TTS Local support requires the upstream custom Transformers code. "
@@ -50,6 +55,94 @@ _MOSS_TTS_LOCAL_INSTALL_HINT = (
 # ~4.3 GB bf16 codec instance): `model.streaming()` flips module-global codec
 # state, so a decode on a shared instance would corrupt a concurrent
 # reference encode (see streaming_vocoder.py).
+
+
+@dataclass(frozen=True)
+class _ArMemoryContract:
+    mem_fraction_static_pinned: bool
+    effective_total_gpu_memory_fraction: float | None
+    applied_codec_mem_reserve: float
+
+
+def _apply_colocated_codec_memory_contract(
+    overrides: dict[str, Any],
+    *,
+    stage_name: str,
+    total_gpu_memory_fraction: float | None,
+    codec_mem_reserve: float = 0.0,
+) -> _ArMemoryContract:
+    """Derive or validate SGLang AR memory args for colocated MOSS Local.
+
+    The single-GPU MOSS Local topology runs the AR engine, preprocessing codec
+    encoder, and vocoder codec decoder in one process. The AR KV cache must
+    therefore be sized from the stage's total GPU budget after reserving memory
+    for the two codec processor instances and their transient activations.
+    """
+
+    if total_gpu_memory_fraction is None:
+        return _ArMemoryContract(
+            mem_fraction_static_pinned=overrides.get("mem_fraction_static") is not None,
+            effective_total_gpu_memory_fraction=None,
+            applied_codec_mem_reserve=0.0,
+        )
+
+    explicit_mem_fraction = overrides.get("mem_fraction_static")
+    if explicit_mem_fraction is not None:
+        if codec_mem_reserve:
+            raise ValueError(
+                f"Stage {stage_name} cannot apply codec_mem_reserve when "
+                "runtime.sglang_server_args.mem_fraction_static is explicitly set."
+            )
+        if abs(float(explicit_mem_fraction) - total_gpu_memory_fraction) > 1e-3:
+            raise ValueError(
+                f"Stage {stage_name} sets conflicting colocated memory contracts: "
+                "runtime.resources.total_gpu_memory_fraction="
+                f"{total_gpu_memory_fraction:.3f} and "
+                "runtime.sglang_server_args.mem_fraction_static="
+                f"{float(explicit_mem_fraction):.3f}. Use one value or make the "
+                "explicit SGLang override match the stage total budget."
+            )
+        return _ArMemoryContract(
+            mem_fraction_static_pinned=True,
+            effective_total_gpu_memory_fraction=total_gpu_memory_fraction,
+            applied_codec_mem_reserve=0.0,
+        )
+
+    effective_total_gpu_memory_fraction = _apply_colocated_codec_mem_reserve(
+        total_gpu_memory_fraction,
+        codec_mem_reserve,
+    )
+    overrides["mem_fraction_static"] = effective_total_gpu_memory_fraction
+    applied_codec_mem_reserve = (
+        codec_mem_reserve
+        if effective_total_gpu_memory_fraction != total_gpu_memory_fraction
+        else 0.0
+    )
+    return _ArMemoryContract(
+        mem_fraction_static_pinned=True,
+        effective_total_gpu_memory_fraction=effective_total_gpu_memory_fraction,
+        applied_codec_mem_reserve=applied_codec_mem_reserve,
+    )
+
+
+def _apply_colocated_codec_mem_reserve(
+    total_gpu_memory_fraction: float,
+    codec_mem_reserve: float,
+) -> float:
+    if not 0.0 <= codec_mem_reserve < 1.0:
+        raise ValueError("codec_mem_reserve must be in [0, 1)")
+    if codec_mem_reserve == 0:
+        return total_gpu_memory_fraction
+
+    effective_total_gpu_memory_fraction = total_gpu_memory_fraction - codec_mem_reserve
+    if effective_total_gpu_memory_fraction < 0.1:
+        raise ValueError(
+            f"colocated total_gpu_memory_fraction {total_gpu_memory_fraction:.3f} "
+            f"minus codec_mem_reserve {codec_mem_reserve:.3f} = "
+            f"{effective_total_gpu_memory_fraction:.3f} is below the safe floor "
+            "0.1; lower codec_mem_reserve or increase the tts_engine stage budget."
+        )
+    return round(effective_total_gpu_memory_fraction, 3)
 
 
 def _normalize_processor_config(processor: Any) -> None:
@@ -297,7 +390,8 @@ class _BatchedReferenceEncoder:
         self._check_reference_duration(path)
         future: concurrent.futures.Future = concurrent.futures.Future()
         self._queue.put((path, future))
-        return future.result(timeout=self.ENCODE_TIMEOUT_S)
+        with profile_range("moss_tts_local.preprocessing.reference_encode.wait"):
+            return future.result(timeout=self.ENCODE_TIMEOUT_S)
 
     def _drain_batch(self) -> list[tuple[str, concurrent.futures.Future]]:
         batch = [self._queue.get()]
@@ -317,7 +411,10 @@ class _BatchedReferenceEncoder:
             unique_paths = list(dict.fromkeys(path for path, _ in batch))
             results: dict[str, Any] = {}
             try:
-                encoded = self._processor.encode_audios_from_path(unique_paths)
+                with profile_range(
+                    "moss_tts_local.preprocessing.reference_encode.batch"
+                ):
+                    encoded = self._processor.encode_audios_from_path(unique_paths)
                 results = dict(zip(unique_paths, encoded))
             except Exception:
                 logger.exception(
@@ -326,9 +423,12 @@ class _BatchedReferenceEncoder:
                 )
                 for path in unique_paths:
                     try:
-                        results[path] = self._processor.encode_audios_from_path([path])[
-                            0
-                        ]
+                        with profile_range(
+                            "moss_tts_local.preprocessing.reference_encode.fallback"
+                        ):
+                            results[path] = self._processor.encode_audios_from_path(
+                                [path]
+                            )[0]
                     except Exception as exc:
                         results[path] = exc
             for path, future in batch:
@@ -430,7 +530,8 @@ class CachedReferenceEncoder:
         if stored is not None:
             # Note(Jiaxin): clone on hit so callers can't mutate the shared entry.
             self._maybe_log()
-            return stored.clone().to(torch.long)
+            with profile_range("moss_tts_local.preprocessing.reference_cache.hit"):
+                return stored.clone().to(torch.long)
 
         if follower_fut is not None:
             # Note(Jiaxin): each follower raises a FRESH RuntimeError — sharing one
@@ -438,7 +539,10 @@ class CachedReferenceEncoder:
             # (same lesson as _BatchedReferenceEncoder._worker).
             timeout = _BatchedReferenceEncoder.ENCODE_TIMEOUT_S + 10
             try:
-                stored = follower_fut.result(timeout=timeout)
+                with profile_range(
+                    "moss_tts_local.preprocessing.reference_cache.wait_inflight"
+                ):
+                    stored = follower_fut.result(timeout=timeout)
             except Exception as cause:
                 raise RuntimeError(
                     f"reference encode failed for {desc}: {cause}"
@@ -447,7 +551,10 @@ class CachedReferenceEncoder:
 
         assert leader_fut is not None
         try:
-            result = encode_fn()
+            with profile_range(
+                "moss_tts_local.preprocessing.reference_cache.miss_encode"
+            ):
+                result = encode_fn()
         except BaseException as exc:
             with self._lock:
                 self._inflight.pop(key, None)
@@ -592,6 +699,8 @@ def create_sglang_tts_engine_executor(
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
     server_args_overrides: dict[str, Any] | None = None,
+    total_gpu_memory_fraction: float | None = None,
+    codec_mem_reserve: float = _MOSS_COLOCATED_CODEC_MEM_RESERVE,
     frame_decode_torch_compile_mode: str | None = None,
     enable_async_decode: bool = False,
     async_decode_min_batch_size: int = 2,
@@ -618,20 +727,59 @@ def create_sglang_tts_engine_executor(
         "enable_torch_compile": False,
         "max_prefill_tokens": 8192,
         "max_running_requests": 16,
-        # Headroom for the two ~4.3 GB bf16 codec instances; back off further
-        # when everything co-locates on a single GPU.
-        "mem_fraction_static": 0.6 if torch.cuda.device_count() > 1 else 0.5,
         "sampling_backend": "pytorch",
         "torch_compile_max_bs": 16,
         "trust_remote_code": True,
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    env_codec_mem_reserve = os.environ.get("MOSS_TTS_LOCAL_CODEC_MEM_RESERVE")
+    if env_codec_mem_reserve is not None:
+        codec_mem_reserve = float(env_codec_mem_reserve)
+    has_explicit_colocated_mem_fraction = (
+        total_gpu_memory_fraction is not None
+        and overrides.get("mem_fraction_static") is not None
+    )
+    colocated_codec_mem_reserve = (
+        codec_mem_reserve
+        if total_gpu_memory_fraction is not None
+        and not has_explicit_colocated_mem_fraction
+        else 0.0
+    )
+    memory_contract = _apply_colocated_codec_memory_contract(
+        overrides,
+        stage_name="tts_engine",
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+        codec_mem_reserve=colocated_codec_mem_reserve,
+    )
+    if overrides.get("mem_fraction_static") is None:
+        # Legacy/custom configs without the typed runtime resource retain the
+        # previous conservative fallback. The default config now uses the
+        # colocated memory contract above.
+        overrides["mem_fraction_static"] = 0.6 if torch.cuda.device_count() > 1 else 0.5
 
     server_args = build_sglang_server_args(
         checkpoint_dir,
         context_length=8192,
         **overrides,
+    )
+    pre_load_avail_mem = avail_gpu_mem(gpu_id)
+    pre_load_process_mem = get_process_gpu_memory_bytes(gpu_id)
+    logger.info(
+        "moss_tts_local_ar_startup stage=tts_engine gpu_id=%s "
+        "context_length=%s total_gpu_memory_fraction=%s "
+        "effective_total_gpu_memory_fraction=%s mem_fraction_static=%s "
+        "codec_mem_reserve=%s pre_load_avail_mem=%s pid=%s "
+        "pre_load_process_mem=%s",
+        gpu_id,
+        8192,
+        total_gpu_memory_fraction,
+        memory_contract.effective_total_gpu_memory_fraction,
+        server_args.mem_fraction_static,
+        memory_contract.applied_codec_mem_reserve,
+        pre_load_avail_mem,
+        os.getpid(),
+        format_bytes_gib(pre_load_process_mem),
     )
 
     want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))

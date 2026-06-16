@@ -9,8 +9,8 @@ from pydantic import Field
 
 from sglang_omni.config import (
     PipelineConfig,
-    SGLangServerArgsConfig,
     StageConfig,
+    StageResourceConfig,
     StageRuntimeConfig,
 )
 
@@ -18,6 +18,7 @@ _PKG = "sglang_omni.models.moss_tts_local"
 
 
 def _stages(*, codec_device: str) -> list[StageConfig]:
+    colocated_codec = codec_device == "cuda:0"
     return [
         StageConfig(
             name="preprocessing",
@@ -36,9 +37,13 @@ def _stages(*, codec_device: str) -> list[StageConfig]:
             name="tts_engine",
             process="pipeline",
             factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
-            factory_args={"gpu_id": 0, "dtype": "bfloat16"},
+            factory_args={
+                "gpu_id": 0,
+                "dtype": "bfloat16",
+                "codec_mem_reserve": 0.25 if colocated_codec else 0.0,
+            },
             runtime=StageRuntimeConfig(
-                sglang_server_args=SGLangServerArgsConfig(mem_fraction_static=0.85),
+                resources=StageResourceConfig(total_gpu_memory_fraction=0.85),
             ),
             gpu=0,
             next="vocoder",
