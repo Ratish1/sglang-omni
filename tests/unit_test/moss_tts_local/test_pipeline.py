@@ -446,6 +446,111 @@ def test_colocated_moss_ar_memory_contract_rejects_too_small_effective_budget():
         )
 
 
+def test_colocated_moss_ar_factory_threads_effective_budget(monkeypatch):
+    import sys
+    import types
+
+    from sglang_omni.models.moss_tts_local import stages
+    from sglang_omni.scheduling import bootstrap, omni_scheduler, sglang_backend
+
+    captured: dict[str, object] = {}
+
+    def fake_build_sglang_server_args(model_path, context_length, **kwargs):
+        captured["model_path"] = model_path
+        captured["context_length"] = context_length
+        captured["build_kwargs"] = dict(kwargs)
+        return types.SimpleNamespace(
+            disable_cuda_graph=True,
+            mem_fraction_static=kwargs["mem_fraction_static"],
+        )
+
+    def fake_create_sglang_infrastructure(
+        server_args,
+        gpu_id,
+        *,
+        model_arch_override=None,
+        total_gpu_memory_fraction=None,
+    ):
+        captured["infrastructure_kwargs"] = {
+            "gpu_id": gpu_id,
+            "model_arch_override": model_arch_override,
+            "total_gpu_memory_fraction": total_gpu_memory_fraction,
+            "mem_fraction_static": server_args.mem_fraction_static,
+        }
+        model = types.SimpleNamespace(reset_request=lambda request_id: None)
+        model_runner = types.SimpleNamespace(model=model)
+        model_worker = types.SimpleNamespace(model_runner=model_runner)
+        return (
+            model_worker,
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+        )
+
+    class FakeOutputProcessor:
+        def __init__(self, **kwargs) -> None:
+            captured["output_processor_kwargs"] = kwargs
+
+    class FakeMossTTSLocalModelRunner:
+        def __init__(self, model_worker, output_proc) -> None:
+            captured["model_runner_args"] = (model_worker, output_proc)
+
+        def set_stream_outbox(self, outbox) -> None:
+            captured["stream_outbox"] = outbox
+
+    class FakeOmniScheduler:
+        def __init__(self, **kwargs) -> None:
+            captured["scheduler_kwargs"] = kwargs
+            self.outbox = object()
+
+    fake_model_runner_module = types.ModuleType(
+        "sglang_omni.models.moss_tts_local.model_runner"
+    )
+    fake_model_runner_module.MossTTSLocalModelRunner = FakeMossTTSLocalModelRunner
+
+    monkeypatch.setattr(stages, "_resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(stages, "avail_gpu_mem", lambda gpu_id: 90.0)
+    monkeypatch.setattr(stages, "get_process_gpu_memory_bytes", lambda gpu_id: None)
+    monkeypatch.setattr(
+        stages,
+        "make_moss_tts_local_scheduler_adapters",
+        lambda model: (lambda payload: payload, lambda data: data),
+    )
+    monkeypatch.setattr(
+        sglang_backend,
+        "build_sglang_server_args",
+        fake_build_sglang_server_args,
+    )
+    monkeypatch.setattr(sglang_backend, "SGLangOutputProcessor", FakeOutputProcessor)
+    monkeypatch.setattr(
+        bootstrap,
+        "create_sglang_infrastructure",
+        fake_create_sglang_infrastructure,
+    )
+    monkeypatch.setattr(omni_scheduler, "OmniScheduler", FakeOmniScheduler)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang_omni.models.moss_tts_local.model_runner",
+        fake_model_runner_module,
+    )
+
+    stages.create_sglang_tts_engine_executor(
+        "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5",
+        total_gpu_memory_fraction=0.85,
+        codec_mem_reserve=0.25,
+    )
+
+    assert captured["build_kwargs"]["mem_fraction_static"] == pytest.approx(0.6)
+    infrastructure_kwargs = captured["infrastructure_kwargs"]
+    assert infrastructure_kwargs["gpu_id"] == 0
+    assert infrastructure_kwargs["model_arch_override"] == "MossTTSLocalSGLangModel"
+    assert infrastructure_kwargs["total_gpu_memory_fraction"] == pytest.approx(0.6)
+    assert infrastructure_kwargs["mem_fraction_static"] == pytest.approx(0.6)
+
+
 def test_special_token_defaults_match_v15_checkpoint():
     defaults = dict(moss_tts_local_special_token_defaults())
     assert defaults["audio_start_token_id"] == 151669

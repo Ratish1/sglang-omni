@@ -798,6 +798,7 @@ def create_sglang_tts_engine_executor(
         server_args,
         gpu_id,
         model_arch_override="MossTTSLocalSGLangModel",
+        total_gpu_memory_fraction=memory_contract.effective_total_gpu_memory_fraction,
     )
 
     if want_cuda_graph:
