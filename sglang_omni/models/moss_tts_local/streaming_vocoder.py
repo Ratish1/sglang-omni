@@ -9,10 +9,8 @@ codec: streaming requests occupy a slot for their lifetime, non-streaming
 requests decode through dedicated offline slots of the same session (the
 codec forbids nested ``streaming()`` contexts), and every step advances all
 participating slots by one uniform length with the rest masked via
-``exec_mask``. By default, non-streaming requests take the pre-existing
-``processor.decode_audio_codes`` path until the first streaming request opens
-the session; an opt-in non-streaming session path can open the same session
-for complete offline decodes without changing the external response contract.
+``exec_mask``. Until the first streaming request arrives, non-streaming
+requests take the pre-existing ``processor.decode_audio_codes`` path.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping
+from typing import Any, Mapping
 
 import torch
 
@@ -38,8 +36,6 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 _SOURCE_HINT = "MOSS-TTS Local"
-NonstreamDecodePath = Literal["processor", "session"]
-_NONSTREAM_DECODE_PATHS = frozenset(("processor", "session"))
 
 
 def _resolve_sample_rate(processor: Any) -> int:
@@ -225,7 +221,6 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         max_step_frames: int = 100,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 2,
-        nonstream_decode_path: NonstreamDecodePath = "processor",
     ) -> None:
         if stream_slots < 1:
             raise ValueError(f"stream_slots must be >= 1, got {stream_slots}")
@@ -233,11 +228,6 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             raise ValueError(
                 "stream_chunk_frames must be in (0, max_step_frames], got "
                 f"{stream_chunk_frames} (max_step_frames={max_step_frames})"
-            )
-        if nonstream_decode_path not in _NONSTREAM_DECODE_PATHS:
-            raise ValueError(
-                f"nonstream_decode_path must be one of "
-                f"{sorted(_NONSTREAM_DECODE_PATHS)}, got {nonstream_decode_path!r}"
             )
         codec = getattr(processor, "audio_tokenizer", None)
         if codec is None:
@@ -263,7 +253,6 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         )
         self._max_step_frames = int(max_step_frames)
         self._offline_slots = max(int(max_batch_size), 1)
-        self._nonstream_decode_path: NonstreamDecodePath = nonstream_decode_path
         self._n_vq = int(processor.model_config.n_vq)
         self._sample_rate = _resolve_sample_rate(processor)
         self._session: _CodecStreamSession | None = None
@@ -604,7 +593,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     def _decode_codes_rows(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """Decode ``[T, >=n_vq]`` row tensors to fp32 CPU waveforms."""
-        if self._session is None and self._nonstream_decode_path == "processor":
+        if self._session is None:
             # Processor path opens its own streaming context; illegal once a
             # session is live.
             return [
@@ -617,7 +606,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         # abort() resets slots under _state_lock from other threads; serialize
         # every session access on the same lock.
         with self._state_lock:
-            wavs = self._ensure_session().decode_offline(
+            wavs = self._session.decode_offline(
                 channels_first, max_step_frames=self._max_step_frames
             )
         return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]
