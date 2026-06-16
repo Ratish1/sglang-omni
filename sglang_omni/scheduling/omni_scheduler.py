@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.ranges import torch_profile_range
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_MODEL_INFO,
@@ -686,14 +687,16 @@ class OmniScheduler:
         # model runner already set batch.output_ids during execute/resolve.
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
-        next_token_ids = batch.output_ids
-        if isinstance(next_token_ids, torch.Tensor):
-            batch.input_ids = next_token_ids.to(torch.int64)
-        return GenerationBatchResult(
-            logits_output=None,
-            next_token_ids=next_token_ids,
-            can_run_cuda_graph=mr_output.can_run_cuda_graph,
-        )
+        with torch_profile_range("omni.make_batch_result"):
+            next_token_ids = batch.output_ids
+            if isinstance(next_token_ids, torch.Tensor):
+                with torch_profile_range("omni.make_batch_result.input_ids_to_int64"):
+                    batch.input_ids = next_token_ids.to(torch.int64)
+            return GenerationBatchResult(
+                logits_output=None,
+                next_token_ids=next_token_ids,
+                can_run_cuda_graph=mr_output.can_run_cuda_graph,
+            )
 
     def _run_batch_launch(self, batch):
         """Async: build SchedulerOutput and launch the decode step on the GPU

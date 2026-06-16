@@ -30,6 +30,7 @@ from sglang_omni.models.tts_streaming import (
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
+from sglang_omni.profiler.ranges import torch_profile_range
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
@@ -148,11 +149,12 @@ class _CodecStreamSession:
             exec_mask[slot] = True
         with torch.no_grad():
             self._codec._set_streaming_exec_mask(exec_mask)
-            result = self._codec._decode_frame(codes_step, codes_lengths)
-        # One batched D2H per step, active slots only.
+            with torch_profile_range("moss.vocoder.session_step_decode"):
+                result = self._codec._decode_frame(codes_step, codes_lengths)
         slots = list(slot_codes)
-        audio_cpu = result.audio[slots].detach().to("cpu", torch.float32)
-        lengths_cpu = result.audio_lengths[slots].detach().to("cpu")
+        with torch_profile_range("moss.vocoder.session_step_d2h"):
+            audio_cpu = result.audio[slots].detach().to("cpu", torch.float32)
+            lengths_cpu = result.audio_lengths[slots].detach().to("cpu")
         out: dict[int, torch.Tensor] = {}
         for index, slot in enumerate(slots):
             n_samples = int(lengths_cpu[index])
@@ -167,37 +169,38 @@ class _CodecStreamSession:
         Replays the codec's own chunked ``batch_decode`` step plan so the
         output matches the non-session ``processor.decode_audio_codes`` path.
         """
-        wavs: list[torch.Tensor] = []
-        for wave_start in range(0, len(codes_list), self._offline_slots):
-            wave = codes_list[wave_start : wave_start + self._offline_slots]
-            slots = [self._stream_slots + i for i in range(len(wave))]
-            self._reset_slots(slots)
-            cursors = [0] * len(wave)
-            chunks: list[list[torch.Tensor]] = [[] for _ in wave]
-            while True:
-                remaining = [
-                    int(codes.shape[1]) - cur for codes, cur in zip(wave, cursors)
-                ]
-                positive = [r for r in remaining if r > 0]
-                if not positive:
-                    break
-                if any(r >= max_step_frames for r in positive):
-                    step_t = max_step_frames
-                else:
-                    step_t = min(positive)
-                plan = {
-                    slots[i]: wave[i][:, cursors[i] : cursors[i] + step_t]
-                    for i, rem in enumerate(remaining)
-                    if rem >= step_t
-                }
-                decoded = self.step(plan)
-                for i in range(len(wave)):
-                    if slots[i] in plan:
-                        chunks[i].append(decoded[slots[i]])
-                        cursors[i] += step_t
-            for item_chunks in chunks:
-                wavs.append(torch.cat(item_chunks, dim=-1))
-        return wavs
+        with torch_profile_range("moss.vocoder.session_decode_offline"):
+            wavs: list[torch.Tensor] = []
+            for wave_start in range(0, len(codes_list), self._offline_slots):
+                wave = codes_list[wave_start : wave_start + self._offline_slots]
+                slots = [self._stream_slots + i for i in range(len(wave))]
+                self._reset_slots(slots)
+                cursors = [0] * len(wave)
+                chunks: list[list[torch.Tensor]] = [[] for _ in wave]
+                while True:
+                    remaining = [
+                        int(codes.shape[1]) - cur for codes, cur in zip(wave, cursors)
+                    ]
+                    positive = [r for r in remaining if r > 0]
+                    if not positive:
+                        break
+                    if any(r >= max_step_frames for r in positive):
+                        step_t = max_step_frames
+                    else:
+                        step_t = min(positive)
+                    plan = {
+                        slots[i]: wave[i][:, cursors[i] : cursors[i] + step_t]
+                        for i, rem in enumerate(remaining)
+                        if rem >= step_t
+                    }
+                    decoded = self.step(plan)
+                    for i in range(len(wave)):
+                        if slots[i] in plan:
+                            chunks[i].append(decoded[slots[i]])
+                            cursors[i] += step_t
+                for item_chunks in chunks:
+                    wavs.append(torch.cat(item_chunks, dim=-1))
+            return wavs
 
 
 @dataclass
@@ -563,14 +566,15 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
     def _prepare_codes(
         self, payload: StagePayload
     ) -> tuple[MossTTSLocalState, torch.Tensor | None]:
-        state = MossTTSLocalState.from_dict(payload.data)
-        if state.audio_codes is None:
-            raise RuntimeError("MOSS-TTS Local vocoder requires audio_codes")
-        codes = torch.as_tensor(state.audio_codes, dtype=torch.long)
-        if codes.numel() == 0:
-            # Emit no audio: only this request fails downstream, not the batch.
-            return state, None
-        return state, codes
+        with torch_profile_range("moss.vocoder.prepare_codes"):
+            state = MossTTSLocalState.from_dict(payload.data)
+            if state.audio_codes is None:
+                raise RuntimeError("MOSS-TTS Local vocoder requires audio_codes")
+            codes = torch.as_tensor(state.audio_codes, dtype=torch.long)
+            if codes.numel() == 0:
+                # emit no audio: only this request fails downstream, not the batch
+                return state, None
+            return state, codes
 
     def _store_vocoder_result(
         self,
@@ -578,69 +582,70 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         state: MossTTSLocalState,
         wav: torch.Tensor,
     ) -> StagePayload:
-        # The v2 codec is natively stereo: keep [channels, samples] end to end.
-        audio_payload = audio_waveform_payload(
-            wav, source_hint=_SOURCE_HINT, keep_channels=True
-        )
-        state.audio_codes = None
-        state.sample_rate = self._sample_rate
-        payload.data = state.to_dict()
-        payload.data.update(audio_payload)
-        payload.data["sample_rate"] = state.sample_rate
-        payload.data["modality"] = "audio"
-        usage = _build_usage(state)
-        if usage is not None:
-            payload.data["usage"] = usage
-        return payload
+        with torch_profile_range("moss.vocoder.store_result"):
+            audio_payload = audio_waveform_payload(
+                wav, source_hint=_SOURCE_HINT, keep_channels=True
+            )
+            state.audio_codes = None
+            state.sample_rate = self._sample_rate
+            payload.data = state.to_dict()
+            payload.data.update(audio_payload)
+            payload.data["sample_rate"] = state.sample_rate
+            payload.data["modality"] = "audio"
+            usage = _build_usage(state)
+            if usage is not None:
+                payload.data["usage"] = usage
+            return payload
 
     def _decode_codes_rows(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """Decode ``[T, >=n_vq]`` row tensors to fp32 CPU waveforms."""
-        if self._session is None:
-            # Processor path opens its own streaming context; illegal once a
-            # session is live.
-            return [
-                torch.as_tensor(wav).detach().to("cpu")
-                for wav in self._processor.decode_audio_codes(codes_list)
+        with torch_profile_range("moss.vocoder.decode_codes_rows"):
+            if self._session is None:
+                return [
+                    torch.as_tensor(wav).detach().to("cpu")
+                    for wav in self._processor.decode_audio_codes(codes_list)
+                ]
+            channels_first = [
+                codes[:, : self._n_vq].transpose(0, 1).contiguous()
+                for codes in codes_list
             ]
-        channels_first = [
-            codes[:, : self._n_vq].transpose(0, 1).contiguous() for codes in codes_list
-        ]
-        # abort() resets slots under _state_lock from other threads; serialize
-        # every session access on the same lock.
-        with self._state_lock:
-            wavs = self._session.decode_offline(
-                channels_first, max_step_frames=self._max_step_frames
-            )
-        return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]
+            with self._state_lock:
+                wavs = self._session.decode_offline(
+                    channels_first, max_step_frames=self._max_step_frames
+                )
+            return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]
 
     def _vocode_batch(self, payloads: list[StagePayload]) -> list[StagePayload]:
-        prepared = [self._prepare_codes(payload) for payload in payloads]
-        codes_list = [codes for _, codes in prepared if codes is not None]
-        profiled_payloads = [
-            payload
-            for payload, (_, codes) in zip(payloads, prepared)
-            if codes is not None
-        ]
-        profile_active = bool(codes_list and _get_event_recorder().is_active())
-        if profile_active:
-            self._emit_vocoder_decode_events(
-                "vocoder_decode_start", profiled_payloads, codes_list
-            )
-        decoded_wavs = self._decode_codes_rows(codes_list) if codes_list else []
-        if profile_active:
-            self._emit_vocoder_decode_events(
-                "vocoder_decode_end", profiled_payloads, codes_list
-            )
-        decoded = iter(decoded_wavs)
-        results = []
-        for payload, (state, codes) in zip(payloads, prepared):
-            if codes is None:
-                state.audio_codes = None
-                payload.data = state.to_dict()
-                results.append(payload)
-                continue
-            results.append(self._store_vocoder_result(payload, state, next(decoded)))
-        return results
+        with torch_profile_range("moss.vocoder.vocode_batch"):
+            prepared = [self._prepare_codes(payload) for payload in payloads]
+            codes_list = [codes for _, codes in prepared if codes is not None]
+            profiled_payloads = [
+                payload
+                for payload, (_, codes) in zip(payloads, prepared)
+                if codes is not None
+            ]
+            profile_active = bool(codes_list and _get_event_recorder().is_active())
+            if profile_active:
+                self._emit_vocoder_decode_events(
+                    "vocoder_decode_start", profiled_payloads, codes_list
+                )
+            decoded_wavs = self._decode_codes_rows(codes_list) if codes_list else []
+            if profile_active:
+                self._emit_vocoder_decode_events(
+                    "vocoder_decode_end", profiled_payloads, codes_list
+                )
+            decoded = iter(decoded_wavs)
+            results = []
+            for payload, (state, codes) in zip(payloads, prepared):
+                if codes is None:
+                    state.audio_codes = None
+                    payload.data = state.to_dict()
+                    results.append(payload)
+                    continue
+                results.append(
+                    self._store_vocoder_result(payload, state, next(decoded))
+                )
+            return results
 
     def _vocode(self, payload: StagePayload) -> StagePayload:
         return self._vocode_batch([payload])[0]

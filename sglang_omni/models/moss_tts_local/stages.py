@@ -34,6 +34,7 @@ from sglang_omni.models.moss_tts_local.streaming_vocoder import (
 from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
 )
+from sglang_omni.profiler.ranges import torch_profile_range
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
 
@@ -240,7 +241,8 @@ class _BatchedReferenceEncoder:
             unique_paths = list(dict.fromkeys(path for path, _ in batch))
             results: dict[str, Any] = {}
             try:
-                encoded = self._processor.encode_audios_from_path(unique_paths)
+                with torch_profile_range("moss.ref_encode.batch"):
+                    encoded = self._processor.encode_audios_from_path(unique_paths)
                 results = dict(zip(unique_paths, encoded))
             except Exception:
                 logger.exception(
@@ -249,9 +251,10 @@ class _BatchedReferenceEncoder:
                 )
                 for path in unique_paths:
                     try:
-                        results[path] = self._processor.encode_audios_from_path([path])[
-                            0
-                        ]
+                        with torch_profile_range("moss.ref_encode.single_fallback"):
+                            results[path] = self._processor.encode_audios_from_path(
+                                [path]
+                            )[0]
                     except Exception as exc:
                         results[path] = exc
             for path, future in batch:

@@ -24,6 +24,7 @@ from sglang_omni.models.moss_tts.request_builders import (
 )
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
 from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
+from sglang_omni.profiler.ranges import torch_profile_range
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.types import ARRequestData
 
@@ -255,24 +256,27 @@ def _build_processor_message(
     ref_audio = state.ref_audio
     if reference_encoder is not None and isinstance(ref_audio, str):
         if _DATA_URI_RE.match(ref_audio) is None:
-            # File-path refs share one batched codec forward via the coalescer.
-            reference = [reference_encoder.encode(ref_audio)]
+            with torch_profile_range("moss.preprocess.reference_encode"):
+                # file-path refs share one batched codec forward via the coalescer
+                reference = [reference_encoder.encode(ref_audio)]
         elif hasattr(reference_encoder, "encode_data_uri"):
-            # Data-URI refs through the same LRU (bytes: keyspace).
-            reference = [
-                reference_encoder.encode_data_uri(ref_audio, processor=processor)
-            ]
+            with torch_profile_range("moss.preprocess.reference_encode"):
+                # data-uri refs through the same LRU bytes keyspace
+                reference = [
+                    reference_encoder.encode_data_uri(ref_audio, processor=processor)
+                ]
         else:
             reference = _reference_for_processor(processor, ref_audio)
     else:
         reference = _reference_for_processor(processor, ref_audio)
-    return processor.build_user_message(
-        text=state.text,
-        reference=reference,
-        instruction=state.instructions,
-        tokens=state.token_count,
-        language=state.language,
-    )
+    with torch_profile_range("moss.preprocess.build_user_message"):
+        return processor.build_user_message(
+            text=state.text,
+            reference=reference,
+            instruction=state.instructions,
+            tokens=state.token_count,
+            language=state.language,
+        )
 
 
 def _prepare_moss_tts_local_request(
@@ -281,20 +285,25 @@ def _prepare_moss_tts_local_request(
     processor: Any,
     reference_encoder: Any = None,
 ) -> MossTTSLocalPreparedRequest:
-    state = build_moss_tts_local_state(payload)
-    message = _build_processor_message(processor, state, reference_encoder)
-    batch = processor([[message]], mode="generation")
-    input_rows = batch["input_ids"]
-    if input_rows.ndim != 3 or int(input_rows.shape[0]) != 1:
-        raise ValueError(
-            "MOSS-TTS Local processor must return input_ids with shape [1, T, C]"
-        )
-    prompt_rows = input_rows[0].detach().to(dtype=torch.long, device="cpu")
-    input_ids_list = build_row_cache_key_ids(prompt_rows)
+    with torch_profile_range("moss.preprocess.build_state"):
+        state = build_moss_tts_local_state(payload)
+    with torch_profile_range("moss.preprocess.build_processor_message"):
+        message = _build_processor_message(processor, state, reference_encoder)
+    with torch_profile_range("moss.preprocess.processor_generation"):
+        batch = processor([[message]], mode="generation")
+    with torch_profile_range("moss.preprocess.build_row_cache_ids"):
+        input_rows = batch["input_ids"]
+        if input_rows.ndim != 3 or int(input_rows.shape[0]) != 1:
+            raise ValueError(
+                "MOSS-TTS Local processor must return input_ids with shape [1, T, C]"
+            )
+        prompt_rows = input_rows[0].detach().to(dtype=torch.long, device="cpu")
+        input_ids_list = build_row_cache_key_ids(prompt_rows)
+        input_ids = torch.tensor(input_ids_list, dtype=torch.long)
     return MossTTSLocalPreparedRequest(
         state=state,
         input_ids_list=input_ids_list,
-        input_ids=torch.tensor(input_ids_list, dtype=torch.long),
+        input_ids=input_ids,
         prompt_rows=prompt_rows,
         gen_kwargs=state.generation_kwargs,
     )

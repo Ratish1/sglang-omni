@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 
+from sglang_omni.profiler.ranges import torch_profile_range
 from sglang_omni.scheduling.types import RequestOutput, SchedulerOutput
 
 
@@ -31,11 +32,12 @@ class SGLangOutputProcessor:
         model_output: Any,
         scheduler_output: SchedulerOutput,
     ) -> dict[str, RequestOutput]:
-        token_list = (
-            model_output.next_token_ids.tolist()
-            if model_output.next_token_ids is not None
-            else []
-        )
+        with torch_profile_range("omni.output_processor.token_tolist"):
+            token_list = (
+                model_output.next_token_ids.tolist()
+                if model_output.next_token_ids is not None
+                else []
+            )
 
         hidden_extras_by_request: dict[int, dict[str, Any] | None] = {}
         if self._capture_hidden:
