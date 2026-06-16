@@ -17,9 +17,23 @@ import threading
 import time
 from typing import Any, Awaitable, Callable
 
+from sglang_omni.profiler.event_recorder import get_recorder
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_scheduler_event(
+    request_id: str,
+    event_name: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    get_recorder().emit(
+        request_id=request_id,
+        stage=None,
+        event_name=event_name,
+        metadata=metadata,
+    )
 
 
 class SimpleScheduler:
@@ -158,6 +172,11 @@ class SimpleScheduler:
     ) -> None:
         if self._consume_if_aborted(msg.request_id):
             return
+        _emit_scheduler_event(
+            msg.request_id,
+            "simple_scheduler_compute_start",
+            {"mode": "single"},
+        )
         try:
             result = self._fn(msg.data)
             if asyncio.iscoroutine(result):
@@ -166,6 +185,12 @@ class SimpleScheduler:
             if self._consume_if_aborted(msg.request_id):
                 return
             raise
+        finally:
+            _emit_scheduler_event(
+                msg.request_id,
+                "simple_scheduler_compute_end",
+                {"mode": "single"},
+            )
         if self._consume_if_aborted(msg.request_id):
             return
         self._emit_result(msg.request_id, result, self.outbox)
@@ -180,14 +205,28 @@ class SimpleScheduler:
                 self._run_single(msg, loop)
             return
 
-        payloads = [msg.data for msg in batch]
-        results = self._batch_fn(payloads)
-        if asyncio.iscoroutine(results):
-            results = loop.run_until_complete(results)
-        if len(results) != len(batch):
-            raise ValueError(
-                f"batch_compute_fn returned {len(results)} results for {len(batch)} requests"
+        for msg in batch:
+            _emit_scheduler_event(
+                msg.request_id,
+                "simple_scheduler_compute_start",
+                {"mode": "batch", "batch_size": len(batch)},
             )
+        payloads = [msg.data for msg in batch]
+        try:
+            results = self._batch_fn(payloads)
+            if asyncio.iscoroutine(results):
+                results = loop.run_until_complete(results)
+            if len(results) != len(batch):
+                raise ValueError(
+                    f"batch_compute_fn returned {len(results)} results for {len(batch)} requests"
+                )
+        finally:
+            for msg in batch:
+                _emit_scheduler_event(
+                    msg.request_id,
+                    "simple_scheduler_compute_end",
+                    {"mode": "batch", "batch_size": len(batch)},
+                )
         for msg, result in zip(batch, results):
             if self._consume_if_aborted(msg.request_id):
                 continue
@@ -220,6 +259,11 @@ class SimpleScheduler:
                     continue
 
                 if msg.type == "new_request":
+                    _emit_scheduler_event(
+                        msg.request_id,
+                        "simple_scheduler_dequeue",
+                        {"message_type": msg.type},
+                    )
                     if self._consume_if_aborted(msg.request_id):
                         continue
                     batch = [msg]
@@ -269,9 +313,19 @@ class SimpleScheduler:
                     continue
                 if msg.type != "new_request":
                     continue
+                _emit_scheduler_event(
+                    msg.request_id,
+                    "simple_scheduler_dequeue",
+                    {"message_type": msg.type},
+                )
                 if self._consume_if_aborted(msg.request_id):
                     continue
                 try:
+                    _emit_scheduler_event(
+                        msg.request_id,
+                        "simple_scheduler_compute_start",
+                        {"mode": "concurrent"},
+                    )
                     result = await asyncio.to_thread(
                         self._run_compute_in_thread, msg.data
                     )
@@ -285,6 +339,12 @@ class SimpleScheduler:
                         "SimpleScheduler: compute_fn failed for %s", msg.request_id
                     )
                     self._emit_error(msg.request_id, exc, self.outbox)
+                finally:
+                    _emit_scheduler_event(
+                        msg.request_id,
+                        "simple_scheduler_compute_end",
+                        {"mode": "concurrent"},
+                    )
 
         bridge_task = asyncio.create_task(bridge_inbox())
         worker_tasks = [

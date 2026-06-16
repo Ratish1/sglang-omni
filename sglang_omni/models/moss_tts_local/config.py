@@ -18,7 +18,6 @@ _PKG = "sglang_omni.models.moss_tts_local"
 
 
 def _stages(*, codec_device: str) -> list[StageConfig]:
-    colocated_codec = codec_device == "cuda:0"
     return [
         StageConfig(
             name="preprocessing",
@@ -40,7 +39,7 @@ def _stages(*, codec_device: str) -> list[StageConfig]:
             factory_args={
                 "gpu_id": 0,
                 "dtype": "bfloat16",
-                "codec_mem_reserve": 0.25 if colocated_codec else 0.0,
+                "codec_mem_reserve": 0.0,
             },
             runtime=StageRuntimeConfig(
                 resources=StageResourceConfig(total_gpu_memory_fraction=0.85),

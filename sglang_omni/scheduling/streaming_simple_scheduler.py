@@ -21,6 +21,7 @@ import time
 from typing import Any, Callable
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.event_recorder import get_recorder
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,19 @@ _ABORTED_REQUEST_ID_LIMIT = 10000
 _ABORTED_REQUEST_ID_RETAINED = 5000
 _COMPLETED_NON_STREAMING_REQUEST_ID_LIMIT = 10000
 _COMPLETED_NON_STREAMING_REQUEST_ID_RETAINED = 5000
+
+
+def _emit_scheduler_event(
+    request_id: str,
+    event_name: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    get_recorder().emit(
+        request_id=request_id,
+        stage=None,
+        event_name=event_name,
+        metadata=metadata,
+    )
 
 
 class StreamingSimpleScheduler:
@@ -113,6 +127,11 @@ class StreamingSimpleScheduler:
                     continue
                 if self._is_aborted(msg.request_id):
                     continue
+                _emit_scheduler_event(
+                    msg.request_id,
+                    "streaming_simple_scheduler_dequeue",
+                    {"message_type": msg.type},
+                )
                 try:
                     self._handle_message(msg, loop)
                 except Exception as exc:
@@ -311,7 +330,19 @@ class StreamingSimpleScheduler:
         for msg in streaming:
             if self._is_aborted(msg.request_id):
                 continue
-            self._handle_streaming_new_request(msg.request_id, msg.data)
+            _emit_scheduler_event(
+                msg.request_id,
+                "streaming_simple_scheduler_stream_request_start",
+                {"message_type": "new_request"},
+            )
+            try:
+                self._handle_streaming_new_request(msg.request_id, msg.data)
+            finally:
+                _emit_scheduler_event(
+                    msg.request_id,
+                    "streaming_simple_scheduler_stream_request_end",
+                    {"message_type": "new_request"},
+                )
 
         if non_streaming:
             self._run_non_streaming_batch(non_streaming, loop)
@@ -345,17 +376,34 @@ class StreamingSimpleScheduler:
                 if self._is_aborted(msg.request_id):
                     continue
                 try:
+                    _emit_scheduler_event(
+                        msg.request_id,
+                        "streaming_simple_scheduler_compute_start",
+                        {"mode": "single"},
+                    )
                     result = self._run_compute(msg.data, loop)
                 except Exception as exc:
                     if not self._is_aborted(msg.request_id):
                         self._emit_error(msg.request_id, exc)
                         self._record_completed_non_streaming_request_id(msg.request_id)
                     continue
+                finally:
+                    _emit_scheduler_event(
+                        msg.request_id,
+                        "streaming_simple_scheduler_compute_end",
+                        {"mode": "single"},
+                    )
                 if not self._is_aborted(msg.request_id):
                     self._emit_result(msg.request_id, result)
                     self._record_completed_non_streaming_request_id(msg.request_id)
             return
 
+        for msg in valid:
+            _emit_scheduler_event(
+                msg.request_id,
+                "streaming_simple_scheduler_compute_start",
+                {"mode": "batch", "batch_size": len(valid)},
+            )
         try:
             results = self._batch_fn([msg.data for msg in valid])
             if asyncio.iscoroutine(results):
@@ -366,6 +414,13 @@ class StreamingSimpleScheduler:
                     self._emit_error(msg.request_id, exc)
                     self._record_completed_non_streaming_request_id(msg.request_id)
             return
+        finally:
+            for msg in valid:
+                _emit_scheduler_event(
+                    msg.request_id,
+                    "streaming_simple_scheduler_compute_end",
+                    {"mode": "batch", "batch_size": len(valid)},
+                )
         if len(results) != len(valid):
             exc = ValueError(
                 f"batch_compute_fn returned {len(results)} results for "
@@ -413,9 +468,21 @@ class StreamingSimpleScheduler:
                 f"{request_id!r}, got {type(item).__name__}"
             )
         with self._state_lock:
-            for out in self.on_stream_chunk(request_id, item):
-                if not self._is_aborted(request_id):
-                    self.outbox.put(out)
+            _emit_scheduler_event(
+                request_id,
+                "streaming_simple_scheduler_chunk_start",
+                {"chunk_id": item.chunk_id, "from_stage": item.from_stage},
+            )
+            try:
+                for out in self.on_stream_chunk(request_id, item):
+                    if not self._is_aborted(request_id):
+                        self.outbox.put(out)
+            finally:
+                _emit_scheduler_event(
+                    request_id,
+                    "streaming_simple_scheduler_chunk_end",
+                    {"chunk_id": item.chunk_id, "from_stage": item.from_stage},
+                )
 
     def _handle_stream_done(self, request_id: str) -> None:
         with self._state_lock:
@@ -424,9 +491,21 @@ class StreamingSimpleScheduler:
                     return
                 self._pending_done.add(request_id)
                 return
-            for out in self.on_stream_done(request_id):
-                if not self._is_aborted(request_id):
-                    self.outbox.put(out)
+            _emit_scheduler_event(
+                request_id,
+                "streaming_simple_scheduler_done_start",
+                None,
+            )
+            try:
+                for out in self.on_stream_done(request_id):
+                    if not self._is_aborted(request_id):
+                        self.outbox.put(out)
+            finally:
+                _emit_scheduler_event(
+                    request_id,
+                    "streaming_simple_scheduler_done_end",
+                    None,
+                )
             if not self._is_aborted(request_id):
                 self._clear_request_state(request_id)
 

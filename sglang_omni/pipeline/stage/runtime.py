@@ -321,7 +321,11 @@ class Stage:
             request_id=request_id,
             stage=self.name,
             event_name="stage_input_received",
-            metadata={"from_stage": "coordinator", "kind": "submit"},
+            metadata={
+                "from_stage": "coordinator",
+                "kind": "submit",
+                "transport": "coordinator",
+            },
         )
 
         payload = msg.data  # StagePayload from coordinator
@@ -349,7 +353,12 @@ class Stage:
             await self._send_failure(request_id, f"relay read failed: {exc}")
             return
 
-        await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
+        await self._receive_payload_from_stage(
+            request_id,
+            msg.from_stage,
+            payload,
+            transport="relay",
+        )
 
     async def receive_local_payload(
         self,
@@ -357,7 +366,12 @@ class Stage:
         from_stage: str,
         payload: Any,
     ) -> None:
-        await self._receive_payload_from_stage(request_id, from_stage, payload)
+        await self._receive_payload_from_stage(
+            request_id,
+            from_stage,
+            payload,
+            transport="local_object",
+        )
 
     async def receive_local_stream_chunk(
         self,
@@ -380,6 +394,7 @@ class Stage:
             request_id=request_id,
             from_stage=from_stage,
             chunk_id=chunk_id,
+            transport="local_object",
         )
         await self._route_stream_item_or_fail(request_id, item)
 
@@ -396,6 +411,7 @@ class Stage:
             from_stage,
             is_done=is_done,
             error=error,
+            transport="local_object",
         )
 
     async def _receive_payload_from_stage(
@@ -403,6 +419,8 @@ class Stage:
         request_id: str,
         from_stage: str,
         payload: Any,
+        *,
+        transport: str,
     ) -> None:
         if request_id in self._aborted:
             return
@@ -417,7 +435,11 @@ class Stage:
             request_id=request_id,
             stage=self.name,
             event_name="stage_input_received",
-            metadata={"from_stage": from_stage, "kind": "payload"},
+            metadata={
+                "from_stage": from_stage,
+                "kind": "payload",
+                "transport": transport,
+            },
         )
         merged = self.input_handler.receive(request_id, from_stage, payload)
         if merged is not None:
@@ -455,6 +477,7 @@ class Stage:
                 request_id=msg.request_id,
                 from_stage=msg.from_stage,
                 chunk_id=msg.chunk_id,
+                transport="cuda_ipc",
             )
             await self._route_stream_item_or_fail(request_id, item)
             return
@@ -487,6 +510,7 @@ class Stage:
             request_id=msg.request_id,
             from_stage=msg.from_stage,
             chunk_id=msg.chunk_id,
+            transport="relay",
         )
         await self._route_stream_item_or_fail(request_id, item)
 
@@ -496,12 +520,17 @@ class Stage:
         request_id: str,
         from_stage: str,
         chunk_id: int | None,
+        transport: str,
     ) -> None:
         _emit_event(
             request_id=request_id,
             stage=self.name,
             event_name="stage_stream_chunk_received",
-            metadata={"from_stage": from_stage, "chunk_id": chunk_id},
+            metadata={
+                "from_stage": from_stage,
+                "chunk_id": chunk_id,
+                "transport": transport,
+            },
         )
 
     async def _route_stream_item_or_fail(
@@ -609,6 +638,7 @@ class Stage:
             msg.from_stage,
             is_done=msg.is_done,
             error=msg.error,
+            transport="relay",
         )
 
     async def _receive_stream_signal(
@@ -618,9 +648,21 @@ class Stage:
         *,
         is_done: bool = False,
         error: str | None = None,
+        transport: str,
     ) -> None:
         if request_id in self._aborted:
             return
+        _emit_event(
+            request_id=request_id,
+            stage=self.name,
+            event_name="stage_stream_signal_received",
+            metadata={
+                "from_stage": from_stage,
+                "is_done": is_done,
+                "has_error": error is not None,
+                "transport": transport,
+            },
+        )
         self._active_requests.add(request_id)
         if error:
             await self._queue_stream_error(
@@ -1023,7 +1065,7 @@ class Stage:
             request_id=request_id,
             stage=self.name,
             event_name="stage_hop_sent",
-            metadata={"to_stage": target},
+            metadata={"to_stage": target, "transport": "relay"},
         )
         await self.control_plane.send_to_stage(target, endpoint, msg)
         await op.wait_for_completion()
@@ -1142,13 +1184,22 @@ class Stage:
         chunk_modality = (
             metadata.get("modality") if isinstance(metadata, dict) else None
         )
+        transport = (
+            "local_object"
+            if target in self._same_process_targets
+            else ("cuda_ipc" if target in self._same_gpu_targets else "relay")
+        )
         if request_id not in self._first_stream_chunk_seen:
             self._first_stream_chunk_seen.add(request_id)
             _emit_event(
                 request_id=request_id,
                 stage=self.name,
                 event_name="stage_first_stream_chunk_sent",
-                metadata={"to_stage": target, "modality": chunk_modality},
+                metadata={
+                    "to_stage": target,
+                    "modality": chunk_modality,
+                    "transport": transport,
+                },
             )
         _emit_event(
             request_id=request_id,
@@ -1158,6 +1209,7 @@ class Stage:
                 "to_stage": target,
                 "chunk_id": chunk_id,
                 "modality": chunk_modality,
+                "transport": transport,
             },
         )
         if target in self._same_process_targets:
@@ -1210,6 +1262,17 @@ class Stage:
                     "requires a local dispatcher"
                 )
             self._record_local_stream_target(request_id, target)
+            _emit_event(
+                request_id=request_id,
+                stage=self.name,
+                event_name="stage_stream_signal_sent",
+                metadata={
+                    "to_stage": target,
+                    "is_done": is_done,
+                    "has_error": error is not None,
+                    "transport": "local_object",
+                },
+            )
             await self._local_dispatcher.send_stream_signal(
                 from_stage=self.name,
                 to_stage=target,
@@ -1219,6 +1282,19 @@ class Stage:
             )
             return
         self._record_nonlocal_stream_target(request_id, target)
+        _emit_event(
+            request_id=request_id,
+            stage=self.name,
+            event_name="stage_stream_signal_sent",
+            metadata={
+                "to_stage": target,
+                "is_done": is_done,
+                "has_error": error is not None,
+                "transport": (
+                    "cuda_ipc" if target in self._same_gpu_targets else "relay"
+                ),
+            },
+        )
         await relay_io.send_stream_signal(
             self.control_plane,
             request_id=request_id,
@@ -1270,6 +1346,7 @@ class Stage:
                     "to_stage": "coordinator",
                     "chunk_id": chunk_id,
                     "modality": modality,
+                    "transport": "coordinator",
                 },
             )
         _emit_event(
@@ -1280,6 +1357,7 @@ class Stage:
                 "to_stage": "coordinator",
                 "chunk_id": chunk_id,
                 "modality": modality,
+                "transport": "coordinator",
             },
         )
         await self.control_plane.send_stream(msg)
