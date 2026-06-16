@@ -15,6 +15,8 @@ from sglang_omni.config import (
 )
 
 _PKG = "sglang_omni.models.moss_tts_local"
+_COLOCATED_TOTAL_GPU_MEMORY_FRACTION = 0.90
+_COLOCATED_CODEC_MEM_RESERVE = 0.05
 
 
 def _stages(*, codec_device: str) -> list[StageConfig]:
@@ -41,10 +43,14 @@ def _stages(*, codec_device: str) -> list[StageConfig]:
             factory_args={
                 "gpu_id": 0,
                 "dtype": "bfloat16",
-                "codec_mem_reserve": 0.25 if colocated_codec else 0.0,
+                "codec_mem_reserve": (
+                    _COLOCATED_CODEC_MEM_RESERVE if colocated_codec else 0.0
+                ),
             },
             runtime=StageRuntimeConfig(
-                resources=StageResourceConfig(total_gpu_memory_fraction=0.85),
+                resources=StageResourceConfig(
+                    total_gpu_memory_fraction=_COLOCATED_TOTAL_GPU_MEMORY_FRACTION
+                ),
             ),
             gpu=0,
             next="vocoder",

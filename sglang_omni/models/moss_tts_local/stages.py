@@ -43,7 +43,7 @@ from sglang_omni.utils.misc import avail_gpu_mem
 
 logger = logging.getLogger(__name__)
 
-_MOSS_COLOCATED_CODEC_MEM_RESERVE = 0.25
+_MOSS_COLOCATED_CODEC_MEM_RESERVE = 0.05
 _MOSS_PREPROCESSING_MAX_CONCURRENCY_ENV = "MOSS_TTS_LOCAL_PREPROCESSING_MAX_CONCURRENCY"
 _MOSS_PREPROCESSING_ENCODE_BATCH_SIZE_ENV = (
     "MOSS_TTS_LOCAL_PREPROCESSING_ENCODE_BATCH_SIZE"
@@ -95,9 +95,11 @@ def _apply_colocated_codec_memory_contract(
     """Derive or validate SGLang AR memory args for colocated MOSS Local.
 
     The single-GPU MOSS Local topology runs the AR engine, preprocessing codec
-    encoder, and vocoder codec decoder in one process. The AR KV cache must
-    therefore be sized from the stage's total GPU budget after reserving memory
-    for the two codec processor instances and their transient activations.
+    encoder, and vocoder codec decoder in one process. Process-memory based AR
+    profiling already accounts for the preprocessing codec that was loaded
+    before the AR worker starts, so this reserve is intentionally small: it is
+    slack for the later vocoder codec load, CUDA graph/backend workspaces, and
+    transient codec activations, not a second full charge for preprocessing.
     """
 
     if total_gpu_memory_fraction is None:
