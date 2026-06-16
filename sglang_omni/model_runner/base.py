@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from sglang_omni.profiler.trace_ranges import profile_range
 from sglang_omni.scheduling.types import ModelRunnerOutput, RequestOutput
 
 logger = logging.getLogger(__name__)
@@ -108,17 +109,17 @@ class ModelRunner:
         ``_finalize``) that ``execute_launch`` + ``execute_resolve`` also use,
         in the same order. Async decode splits this at the post-decode boundary.
         """
-        with torch.profiler.record_function("omni_model_runner.execute.build"):
+        with profile_range("omni_model_runner.execute.build"):
             built = self._build_forward_batch(scheduler_output)
         if built is None:
             return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
         forward_batch, schedule_batch, model_worker_batch, is_prefill = built
-        with torch.profiler.record_function("omni_model_runner.execute.forward"):
+        with profile_range("omni_model_runner.execute.forward"):
             batch_result = self._prepare_and_forward(
                 forward_batch, schedule_batch, scheduler_output.requests, is_prefill
             )
         if is_prefill:
-            with torch.profiler.record_function("omni_model_runner.post_prefill"):
+            with profile_range("omni_model_runner.post_prefill"):
                 self.post_prefill(
                     batch_result,
                     forward_batch,
@@ -126,14 +127,14 @@ class ModelRunner:
                     scheduler_output.requests,
                 )
         else:
-            with torch.profiler.record_function("omni_model_runner.post_decode"):
+            with profile_range("omni_model_runner.post_decode"):
                 self.post_decode(
                     batch_result,
                     forward_batch,
                     schedule_batch,
                     scheduler_output.requests,
                 )
-        with torch.profiler.record_function("omni_model_runner.finalize"):
+        with profile_range("omni_model_runner.finalize"):
             return self._finalize(
                 batch_result,
                 forward_batch,
@@ -158,13 +159,13 @@ class ModelRunner:
         scheduling has two steps momentarily in flight: the just-launched step
         N and the not-yet-resolved step N-1.
         """
-        with torch.profiler.record_function("omni_model_runner.launch.build"):
+        with profile_range("omni_model_runner.launch.build"):
             built = self._build_forward_batch(scheduler_output)
         if built is None:
             return None
         forward_batch, schedule_batch, model_worker_batch, is_prefill = built
         assert not is_prefill, "async lookahead launch is decode-only"
-        with torch.profiler.record_function("omni_model_runner.launch.forward"):
+        with profile_range("omni_model_runner.launch.forward"):
             batch_result = self._prepare_and_forward(
                 forward_batch,
                 schedule_batch,
@@ -172,7 +173,7 @@ class ModelRunner:
                 is_prefill,
                 is_lookahead=True,
             )
-        with torch.profiler.record_function("omni_model_runner.post_decode_launch"):
+        with profile_range("omni_model_runner.post_decode_launch"):
             launch_buf = self.post_decode_launch(
                 batch_result, forward_batch, scheduler_output.requests
             )
@@ -210,7 +211,7 @@ class ModelRunner:
         """
         if pending is None:
             return None
-        with torch.profiler.record_function("omni_model_runner.resolve.wait_event"):
+        with profile_range("omni_model_runner.resolve.wait_event"):
             if pending.event.query():
                 self._async_query_hit += 1
             else:
@@ -224,7 +225,7 @@ class ModelRunner:
             if req.data.req.finished()
             or bool(getattr(req.data.req, "is_retracted", False))
         }
-        with torch.profiler.record_function("omni_model_runner.post_decode_resolve"):
+        with profile_range("omni_model_runner.post_decode_resolve"):
             self.post_decode_resolve(
                 pending.launch_buf,
                 pending.batch_result,
@@ -232,7 +233,7 @@ class ModelRunner:
                 pending.schedule_batch,
                 pending.scheduler_output.requests,
             )
-        with torch.profiler.record_function("omni_model_runner.resolve.finalize"):
+        with profile_range("omni_model_runner.resolve.finalize"):
             return self._finalize(
                 pending.batch_result,
                 pending.forward_batch,
@@ -252,7 +253,7 @@ class ModelRunner:
             ForwardBatch,
         )
 
-        with torch.profiler.record_function("omni_model_runner.set_device"):
+        with profile_range("omni_model_runner.set_device"):
             if self.device.type == "cuda":
                 torch.cuda.set_device(self.device)
 
@@ -260,7 +261,7 @@ class ModelRunner:
         if schedule_batch is None:
             return None
 
-        with torch.profiler.record_function("omni_model_runner.get_worker_batch"):
+        with profile_range("omni_model_runner.get_worker_batch"):
             model_worker_batch = schedule_batch.get_model_worker_batch()
             is_prefill = bool(schedule_batch.forward_mode.is_extend())
 
@@ -278,7 +279,7 @@ class ModelRunner:
         elif self.output_processor._capture_hidden:
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
-        with torch.profiler.record_function("omni_model_runner.forward_batch_init"):
+        with profile_range("omni_model_runner.forward_batch_init"):
             forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.tp_worker.model_runner
             )
@@ -296,30 +297,26 @@ class ModelRunner:
         """Prepare hook → standard forward (if not custom) → sample-before-post
         block. Returns ``batch_result``."""
         if is_prefill:
-            with torch.profiler.record_function("omni_model_runner.before_prefill"):
+            with profile_range("omni_model_runner.before_prefill"):
                 self.before_prefill(forward_batch, schedule_batch, requests)
-            with torch.profiler.record_function(
-                "omni_model_runner.custom_prefill_forward"
-            ):
+            with profile_range("omni_model_runner.custom_prefill_forward"):
                 batch_result = self.custom_prefill_forward(
                     forward_batch, schedule_batch, requests
                 )
         else:
-            with torch.profiler.record_function("omni_model_runner.before_decode"):
+            with profile_range("omni_model_runner.before_decode"):
                 self.before_decode(
                     forward_batch,
                     schedule_batch,
                     requests,
                     is_lookahead=is_lookahead,
                 )
-            with torch.profiler.record_function(
-                "omni_model_runner.custom_decode_forward"
-            ):
+            with profile_range("omni_model_runner.custom_decode_forward"):
                 batch_result = self.custom_decode_forward(
                     forward_batch, schedule_batch, requests
                 )
         if batch_result is None:
-            with torch.profiler.record_function("omni_model_runner.forward"):
+            with profile_range("omni_model_runner.forward"):
                 batch_result = self.tp_worker.forward_batch_generation(forward_batch)
 
         if (
@@ -333,7 +330,7 @@ class ModelRunner:
                 )
             )
         ):
-            with torch.profiler.record_function("omni_model_runner.sample"):
+            with profile_range("omni_model_runner.sample"):
                 batch_result.next_token_ids = self._sample_next_token_ids(
                     batch_result.logits_output, forward_batch, schedule_batch, requests
                 )
@@ -390,7 +387,7 @@ class ModelRunner:
         a stale-length output_ids on the running batch, which the next
         prepare_for_decode turns into an input_ids that mismatches seq_lens once
         a request finishes mid-batch (the bs>1 replay size mismatch)."""
-        with torch.profiler.record_function("omni_model_runner.finalize.sample"):
+        with profile_range("omni_model_runner.finalize.sample"):
             if schedule_batch.is_prefill_only:
                 if batch_result.next_token_ids is None:
                     batch_result.next_token_ids = torch.zeros(
@@ -408,13 +405,13 @@ class ModelRunner:
             if set_output_ids:
                 schedule_batch.output_ids = batch_result.next_token_ids
 
-        with torch.profiler.record_function("omni_model_runner.output_process"):
+        with profile_range("omni_model_runner.output_process"):
             outputs = self.output_processor.process(batch_result, scheduler_output)
-        with torch.profiler.record_function("omni_model_runner.post_process_outputs"):
+        with profile_range("omni_model_runner.post_process_outputs"):
             self.post_process_outputs(batch_result, scheduler_output, outputs)
         skip_rids = (skip_rids or set()) | self.finalize_skip_rids(scheduler_output)
         advanced_steps = []
-        with torch.profiler.record_function("omni_model_runner.advance_steps"):
+        with profile_range("omni_model_runner.advance_steps"):
             for sched_req in scheduler_output.requests:
                 if sched_req.request_id in skip_rids:
                     continue
