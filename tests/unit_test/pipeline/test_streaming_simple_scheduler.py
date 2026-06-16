@@ -95,6 +95,25 @@ def test_streaming_simple_scheduler_batches_non_streaming_requests() -> None:
     assert [msg.request_id for msg in _drain_results(scheduler)] == ["a", "b", "c"]
 
 
+def test_streaming_simple_scheduler_respects_non_streaming_batch_cost() -> None:
+    scheduler = _TestStreamingScheduler(max_batch_size=4)
+    scheduler._request_cost_fn = lambda payload: int(payload.data["cost"])
+    scheduler._max_batch_cost = 10
+    first = IncomingMessage("a", "new_request", _payload("a"))
+    first.data.data["cost"] = 4
+    second = IncomingMessage("b", "new_request", _payload("b"))
+    second.data.data["cost"] = 6
+    third = IncomingMessage("c", "new_request", _payload("c"))
+    third.data.data["cost"] = 1
+    scheduler.inbox.put(second)
+    scheduler.inbox.put(third)
+
+    batch = scheduler._collect_new_request_batch(first)
+
+    assert [msg.request_id for msg in batch] == ["a", "b"]
+    assert scheduler._next_message().request_id == "c"
+
+
 def test_streaming_simple_scheduler_keeps_streaming_request_out_of_batch() -> None:
     scheduler = _TestStreamingScheduler(max_batch_size=3)
     first = IncomingMessage("a", "new_request", _payload("a"))

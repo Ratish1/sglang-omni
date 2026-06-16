@@ -45,6 +45,7 @@ _VOCODER_EVENTS_ENV = "SGLANG_MOSS_TTS_LOCAL_VOCODER_EVENTS"
 _NONSTREAM_CODEC_PATH_ENV = "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CODEC_PATH"
 _NONSTREAM_MAX_STEP_FRAMES_ENV = "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_MAX_STEP_FRAMES"
 _NONSTREAM_CHUNK_DURATION_ENV = "SGLANG_MOSS_TTS_LOCAL_NONSTREAM_CHUNK_DURATION"
+_NONSTREAM_MAX_BATCH_FRAMES_ENV = "MOSS_TTS_LOCAL_VOCODER_MAX_BATCH_FRAMES"
 _NONSTREAM_CODEC_PATHS = frozenset(
     {"processor", "direct_batch", "direct_chunked", "session", "exact_session"}
 )
@@ -176,6 +177,22 @@ def _resolve_nonstream_chunk_duration() -> float:
         ) from exc
     if resolved <= 0:
         raise ValueError(f"{_NONSTREAM_CHUNK_DURATION_ENV} must be > 0, got {resolved}")
+    return resolved
+
+
+def _resolve_nonstream_max_batch_frames(value: int | None) -> int | None:
+    env_value = os.environ.get(_NONSTREAM_MAX_BATCH_FRAMES_ENV)
+    raw_value = env_value if env_value is not None else value
+    if raw_value is None:
+        return None
+    try:
+        resolved = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{_NONSTREAM_MAX_BATCH_FRAMES_ENV} must be an integer, got {raw_value!r}"
+        ) from exc
+    if resolved <= 0:
+        return None
     return resolved
 
 
@@ -510,6 +527,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         max_step_frames: int = 100,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 2,
+        max_batch_frames: int | None = None,
     ) -> None:
         if stream_slots < 1:
             raise ValueError(f"stream_slots must be >= 1, got {stream_slots}")
@@ -546,6 +564,9 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             max_step_frames
         )
         self._offline_slots = max(int(max_batch_size), 1)
+        self._nonstream_max_batch_frames = _resolve_nonstream_max_batch_frames(
+            max_batch_frames
+        )
         self._n_vq = int(processor.model_config.n_vq)
         self._sample_rate = _resolve_sample_rate(processor)
         self._nonstream_codec_path = _resolve_nonstream_codec_path()
@@ -563,11 +584,12 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         logger.info(
             "MOSS-TTS Local non-streaming codec path: %s "
             "(nonstream_max_step_frames=%s, nonstream_chunk_duration=%s, "
-            "nonstream_chunk_frames=%s)",
+            "nonstream_chunk_frames=%s, nonstream_max_batch_frames=%s)",
             self._nonstream_codec_path,
             self._nonstream_max_step_frames,
             self._nonstream_chunk_duration,
             self._nonstream_chunk_frames,
+            self._nonstream_max_batch_frames,
         )
         self._session: _CodecStreamSession | None = None
         self._offline_session: _CodecStreamSession | None = None
@@ -578,6 +600,8 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             batch_compute_fn=self._vocode_batch,
             max_batch_size=max_batch_size,
             max_batch_wait_ms=max_batch_wait_ms,
+            request_cost_fn=self._nonstream_payload_frame_cost,
+            max_batch_cost=self._nonstream_max_batch_frames,
         )
 
     def start(self) -> None:
@@ -975,6 +999,22 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             return state, None
         return state, codes
 
+    def _nonstream_payload_frame_cost(self, payload: StagePayload) -> int:
+        try:
+            if self.is_streaming_payload(payload):
+                return 0
+            state = MossTTSLocalState.from_dict(payload.data)
+            audio_codes = state.audio_codes
+            if audio_codes is None:
+                return 0
+            shape = getattr(audio_codes, "shape", None)
+            if shape is not None and len(shape) >= 1:
+                return max(int(shape[0]), 0)
+            return max(len(audio_codes), 0)
+        except Exception:
+            # Let validation fail in _prepare_codes; cost is only a batching hint.
+            return 0
+
     def _store_vocoder_result(
         self,
         payload: StagePayload,
@@ -1236,10 +1276,24 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     def _vocode_batch(self, payloads: list[StagePayload]) -> list[StagePayload]:
         request_ids = [payload.request_id for payload in payloads]
+        frame_lengths: list[int] = []
+        for payload in payloads:
+            try:
+                state = MossTTSLocalState.from_dict(payload.data)
+                audio_codes = state.audio_codes
+                shape = getattr(audio_codes, "shape", None)
+                frame_lengths.append(int(shape[0]) if shape is not None else 0)
+            except Exception:
+                frame_lengths.append(0)
         with _vocoder_scope(
             "moss_tts_local.vocoder.nonstream_batch",
             request_ids=request_ids,
-            metadata={"batch_size": len(payloads)},
+            metadata={
+                "batch_size": len(payloads),
+                "frame_lengths": frame_lengths,
+                "total_frames": int(sum(frame_lengths)),
+                "max_batch_frames": self._nonstream_max_batch_frames or 0,
+            },
         ):
             with _vocoder_scope(
                 "moss_tts_local.vocoder.nonstream_batch.prepare_codes",
@@ -1256,6 +1310,10 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                     "decode_count": len(codes_list),
                     "codec_path": self._nonstream_codec_path,
                     "frame_lengths": [int(codes.shape[0]) for codes in codes_list],
+                    "total_frames": int(
+                        sum(int(codes.shape[0]) for codes in codes_list)
+                    ),
+                    "max_batch_frames": self._nonstream_max_batch_frames or 0,
                 },
             ):
                 decoded = (

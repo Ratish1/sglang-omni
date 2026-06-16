@@ -361,6 +361,9 @@ def test_pipeline_stage_wiring():
     assert stages["vocoder"].process == "pipeline"
     assert stages["vocoder"].gpu == 0
     assert stages["vocoder"].factory_args["device"] == "cuda:0"
+    assert stages["vocoder"].factory_args["max_batch_size"] == 16
+    assert stages["vocoder"].factory_args["max_batch_wait_ms"] == 8
+    assert stages["vocoder"].factory_args["max_batch_frames"] == 1200
 
     placement = build_stage_placement_plan(config)
     assert placement.stages["tts_engine"].gpu_ids == (0,)
@@ -384,6 +387,7 @@ def test_pipeline_stage_wiring():
     assert split_stages["tts_engine"].factory_args["gpu_id"] == 0
     assert split_stages["tts_engine"].factory_args["codec_mem_reserve"] == 0.0
     assert split_stages["vocoder"].factory_args["device"] == "cuda:1"
+    assert "max_batch_frames" not in split_stages["vocoder"].factory_args
 
 
 def test_colocated_moss_ar_memory_contract_reserves_codec_budget():

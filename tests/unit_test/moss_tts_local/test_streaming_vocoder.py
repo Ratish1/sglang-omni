@@ -34,6 +34,7 @@ from sglang_omni.models.moss_tts_local.streaming_vocoder import (
 from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling.messages import IncomingMessage
 
 N_VQ = 4
 SAMPLES_PER_FRAME = 4
@@ -724,6 +725,28 @@ def test_exact_session_nonstream_path_matches_processor_batch_shape(
     for actual, expected_wav in zip(decoded, expected):
         np.testing.assert_array_equal(actual, expected_wav.numpy())
     scheduler.stop()
+
+
+def test_nonstream_vocoder_batches_by_total_frame_cost(monkeypatch) -> None:
+    processor = FakeProcessor()
+    scheduler = _make_scheduler(
+        monkeypatch,
+        processor,
+        max_batch_size=4,
+        max_batch_frames=10,
+    )
+    first = _terminal_payload(_rows(4, seed=80), request_id="a")
+    second = _terminal_payload(_rows(6, seed=81), request_id="b")
+    third = _terminal_payload(_rows(1, seed=82), request_id="c")
+    scheduler.inbox.put(IncomingMessage("b", "new_request", second))
+    scheduler.inbox.put(IncomingMessage("c", "new_request", third))
+
+    batch = scheduler._collect_new_request_batch(
+        IncomingMessage("a", "new_request", first)
+    )
+
+    assert [msg.request_id for msg in batch] == ["a", "b"]
+    assert scheduler._next_message().request_id == "c"
 
 
 def test_offline_lane_waves_split_across_slots(monkeypatch) -> None:

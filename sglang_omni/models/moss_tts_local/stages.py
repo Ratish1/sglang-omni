@@ -44,12 +44,33 @@ from sglang_omni.utils.misc import avail_gpu_mem
 logger = logging.getLogger(__name__)
 
 _MOSS_COLOCATED_CODEC_MEM_RESERVE = 0.25
+_MOSS_PREPROCESSING_MAX_CONCURRENCY_ENV = "MOSS_TTS_LOCAL_PREPROCESSING_MAX_CONCURRENCY"
+_MOSS_PREPROCESSING_ENCODE_BATCH_SIZE_ENV = (
+    "MOSS_TTS_LOCAL_PREPROCESSING_ENCODE_BATCH_SIZE"
+)
+_MOSS_PREPROCESSING_ENCODE_BATCH_WAIT_MS_ENV = (
+    "MOSS_TTS_LOCAL_PREPROCESSING_ENCODE_BATCH_WAIT_MS"
+)
+_MOSS_VOCODER_MAX_BATCH_SIZE_ENV = "MOSS_TTS_LOCAL_VOCODER_MAX_BATCH_SIZE"
+_MOSS_VOCODER_MAX_BATCH_WAIT_MS_ENV = "MOSS_TTS_LOCAL_VOCODER_MAX_BATCH_WAIT_MS"
+_MOSS_VOCODER_MAX_BATCH_FRAMES_ENV = "MOSS_TTS_LOCAL_VOCODER_MAX_BATCH_FRAMES"
 
 _MOSS_TTS_LOCAL_INSTALL_HINT = (
     "MOSS-TTS Local support requires the upstream custom Transformers code. "
     "Launch with trust_remote_code=True and make sure the checkpoint can load "
     "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2."
 )
+
+
+def _env_int_override(name: str, current: int | None) -> int | None:
+    value = os.environ.get(name)
+    if value is None:
+        return current
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+
 
 # NOTE: preprocessing and vocoder stages each load their own processor (and
 # ~4.3 GB bf16 codec instance): `model.streaming()` flips module-global codec
@@ -666,6 +687,18 @@ def create_preprocessing_executor(
             "off",
             "",
         )
+    max_concurrency = int(
+        _env_int_override(_MOSS_PREPROCESSING_MAX_CONCURRENCY_ENV, max_concurrency)
+    )
+    encode_batch_size = int(
+        _env_int_override(_MOSS_PREPROCESSING_ENCODE_BATCH_SIZE_ENV, encode_batch_size)
+    )
+    encode_batch_wait_ms = int(
+        _env_int_override(
+            _MOSS_PREPROCESSING_ENCODE_BATCH_WAIT_MS_ENV,
+            encode_batch_wait_ms,
+        )
+    )
     device = _resolve_codec_device(device, gpu_id)
     processor = _load_moss_tts_local_processor(model_path, device=device)
     reference_encoder: Any = _BatchedReferenceEncoder(
@@ -862,14 +895,34 @@ def create_vocoder_executor(
     gpu_id: int | None = None,
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
+    max_batch_frames: int | None = None,
     stream_slots: int = 8,
     stream_chunk_frames: int = 25,
     initial_chunk_frames: int = 5,
     max_step_frames: int = 100,
 ) -> MossTTSLocalStreamingVocoderScheduler:
+    max_batch_size = int(
+        _env_int_override(_MOSS_VOCODER_MAX_BATCH_SIZE_ENV, max_batch_size)
+    )
+    max_batch_wait_ms = int(
+        _env_int_override(_MOSS_VOCODER_MAX_BATCH_WAIT_MS_ENV, max_batch_wait_ms)
+    )
+    max_batch_frames = _env_int_override(
+        _MOSS_VOCODER_MAX_BATCH_FRAMES_ENV,
+        max_batch_frames,
+    )
     device = _resolve_codec_device(device, gpu_id)
     processor = _load_moss_tts_local_processor(model_path, device=device)
     _maybe_wrap_moss_vocoder_deep_profile(processor)
+    logger.info(
+        "MOSS-TTS Local vocoder policy: device=%s max_batch_size=%s "
+        "max_batch_wait_ms=%s max_batch_frames=%s stream_slots=%s",
+        device,
+        max_batch_size,
+        max_batch_wait_ms,
+        max_batch_frames,
+        stream_slots,
+    )
     return MossTTSLocalStreamingVocoderScheduler(
         processor,
         stream_slots=stream_slots,
@@ -878,4 +931,5 @@ def create_vocoder_executor(
         max_step_frames=max_step_frames,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        max_batch_frames=max_batch_frames,
     )
