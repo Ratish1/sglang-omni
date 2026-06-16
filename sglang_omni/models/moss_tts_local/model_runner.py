@@ -34,7 +34,6 @@ class MossTTSLocalModelRunner(ModelRunner):
         super().__init__(tp_worker, output_processor)
         self._outbox: Any | None = None
         self._vocoder_target = "vocoder"
-        self._decode_row_id_cache: dict[tuple[str, int], torch.Tensor] = {}
 
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
@@ -202,21 +201,12 @@ class MossTTSLocalModelRunner(ModelRunner):
         forward_batch.moss_pool_rows = pool_rows
         forward_batch.moss_has_audio_repetition_penalty = has_audio_repetition_penalty
 
-        forward_batch.input_ids[:batch_size].copy_(
-            self._decode_row_ids(batch_size, forward_batch.input_ids.device)
+        row_ids = torch.arange(
+            batch_size,
+            dtype=torch.long,
+            device=forward_batch.input_ids.device,
         )
-
-    def _decode_row_ids(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        cache = getattr(self, "_decode_row_id_cache", None)
-        if cache is None:
-            cache = {}
-            self._decode_row_id_cache = cache
-        key = (str(device), int(batch_size))
-        row_ids = cache.get(key)
-        if row_ids is None:
-            row_ids = torch.arange(batch_size, dtype=torch.long, device=device)
-            cache[key] = row_ids
-        return row_ids
+        forward_batch.input_ids[:batch_size].copy_(row_ids)
 
     def _collect_frame(
         self,
@@ -403,37 +393,23 @@ class MossTTSLocalModelRunner(ModelRunner):
         )
         emit_indices = sorted(emit_set)
         if emit_indices:
-            all_rows_emit = len(emit_indices) == batch_size
-            if all_rows_emit:
-                emit_pool_rows = pool_rows
-                emit_row_t = row_t
-                emit_rows = rows
-                emit_steps = gen_steps
-                emit_embeds = embeds
-                emit_next_text = next_text
-                emit_rids = [sched_req.request_id for sched_req in requests]
-            else:
-                emit_index_t = torch.tensor(
-                    emit_indices, dtype=torch.long, device=rows.device
-                )
-                emit_pool_rows = [pool_rows[i] for i in emit_indices]
-                emit_row_t = row_t[emit_index_t.to(device=row_t.device)]
-                emit_rows = rows.index_select(0, emit_index_t)
-                emit_steps = gen_steps.index_select(
-                    0, emit_index_t.to(device=gen_steps.device)
-                )
-                emit_embeds = embeds.index_select(
-                    0, emit_index_t.to(device=embeds.device)
-                )
-                emit_next_text = next_text.index_select(
-                    0, emit_index_t.to(device=next_text.device)
-                )
-                emit_rids = [requests[i].request_id for i in emit_indices]
+            emit_index_t = torch.tensor(
+                emit_indices, dtype=torch.long, device=rows.device
+            )
+            emit_pool_rows = [pool_rows[i] for i in emit_indices]
+            emit_row_t = row_t[emit_index_t.to(device=row_t.device)]
+            emit_rows = rows.index_select(0, emit_index_t)
+            emit_steps = gen_steps.index_select(
+                0, emit_index_t.to(device=gen_steps.device)
+            )
             pool.sampling_steps[emit_row_t] = (emit_steps + 1).to(
                 device=pool.sampling_steps.device, dtype=torch.int64
             )
             if has_audio_repetition_penalty:
-                keep_history = emit_next_text != end_id
+                keep_history = (
+                    next_text.index_select(0, emit_index_t.to(device=next_text.device))
+                    != end_id
+                )
                 emit_penalty_active = (
                     pool.audio_repetition_penalty[emit_row_t]
                     .to(device=keep_history.device)
@@ -444,12 +420,13 @@ class MossTTSLocalModelRunner(ModelRunner):
                     emit_row_t[keep_history.to(device=emit_row_t.device)],
                     emit_rows[keep_history.to(device=emit_rows.device)],
                 )
+            emit_embeds = embeds.index_select(0, emit_index_t.to(device=embeds.device))
             pool.feedback_embeds[emit_row_t] = emit_embeds.detach().to(
                 device=pool.feedback_embeds.device,
                 dtype=pool.feedback_embeds.dtype,
             )
             result.moss_journal = MossTTSLocalDecodeJournal(
-                rids=emit_rids,
+                rids=[requests[i].request_id for i in emit_indices],
                 pool_rows=emit_pool_rows,
                 rows=emit_rows,
             )
@@ -632,16 +609,12 @@ class MossTTSLocalModelRunner(ModelRunner):
             return
         if pool is None or not advanced_steps:
             return
+        steps = [int(generation_steps) for _, generation_steps in advanced_steps]
         try:
             row_t = forward_batch.moss_pool_row_t
         except AttributeError:
             row_t = None
-        if row_t is not None and int(row_t.numel()) == len(advanced_steps):
-            if not getattr(self, "_async_enabled", False):
-                row_t = row_t.to(device=pool.generation_steps.device, dtype=torch.long)
-                pool.generation_steps[row_t] = pool.sampling_steps[row_t]
-                return
-            steps = [int(generation_steps) for _, generation_steps in advanced_steps]
+        if row_t is not None and int(row_t.numel()) == len(steps):
             step_t = torch.tensor(steps, dtype=torch.long, device=row_t.device)
             pool.commit_generation_steps(row_t, step_t)
             return
