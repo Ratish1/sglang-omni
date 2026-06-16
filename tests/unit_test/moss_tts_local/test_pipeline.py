@@ -796,6 +796,36 @@ def test_batched_reference_encoder_coalesces_and_isolates_errors():
     assert any(len(c) > 1 for c in calls) or len(calls) >= 3
 
 
+def test_vocoder_factory_passes_nonstream_decode_path(monkeypatch) -> None:
+    from sglang_omni.models.moss_tts_local import stages
+
+    class _FakeScheduler:
+        def __init__(self, processor, **kwargs):
+            del processor
+            self.kwargs = kwargs
+
+    captured = {}
+
+    monkeypatch.setattr(
+        stages, "_load_moss_tts_local_processor", lambda *a, **k: object()
+    )
+    monkeypatch.setattr(
+        stages,
+        "MossTTSLocalStreamingVocoderScheduler",
+        lambda processor, **kwargs: captured.setdefault(
+            "scheduler", _FakeScheduler(processor, **kwargs)
+        ),
+    )
+
+    scheduler = stages.create_vocoder_executor(
+        "fake-model",
+        device="cpu",
+        nonstream_decode_path="session",
+    )
+
+    assert scheduler.kwargs["nonstream_decode_path"] == "session"
+
+
 # ---------------------------------------------------------------------------
 # CachedReferenceEncoder  (T3–T9)
 # ---------------------------------------------------------------------------
