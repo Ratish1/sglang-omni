@@ -23,13 +23,6 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
-from sglang_omni.models.moss_tts_local.vocoder_backends import (
-    NonStreamingVocoderBackend,
-    ProcessorDecodeBackend,
-    SessionDecodeBackend,
-    SGLangCodecDecodeBackend,
-    resolve_nonstream_vocoder_backend,
-)
 from sglang_omni.models.tts_streaming import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     resolve_initial_codec_chunk_frames,
@@ -233,7 +226,6 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         max_step_frames: int = 100,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 2,
-        nonstream_vocoder_backend: str | None = None,
     ) -> None:
         if stream_slots < 1:
             raise ValueError(f"stream_slots must be >= 1, got {stream_slots}")
@@ -270,28 +262,11 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         self._sample_rate = _resolve_sample_rate(processor)
         self._session: _CodecStreamSession | None = None
         self._stream_states: dict[str, _LocalStreamState] = {}
-        self._configured_nonstream_backend = resolve_nonstream_vocoder_backend(
-            nonstream_vocoder_backend
-        )
         super().__init__(
             self._vocode,
             batch_compute_fn=self._vocode_batch,
             max_batch_size=max_batch_size,
             max_batch_wait_ms=max_batch_wait_ms,
-        )
-        self._processor_decode_backend = ProcessorDecodeBackend(processor)
-        self._session_decode_backend = SessionDecodeBackend(
-            session_provider=self._ensure_session,
-            state_lock=self._state_lock,
-            n_vq=self._n_vq,
-            max_step_frames=self._max_step_frames,
-        )
-        self._sglang_decode_backend = SGLangCodecDecodeBackend(processor)
-        logger.info(
-            "MOSS-TTS Local non-streaming vocoder backend=%s "
-            "(processor backend uses session fallback when a streaming session is "
-            "already open)",
-            self._configured_nonstream_backend,
         )
 
     def start(self) -> None:
@@ -625,16 +600,20 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
     def _decode_codes_rows(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """Decode ``[T, >=n_vq]`` row tensors to fp32 CPU waveforms."""
         with torch_profile_range("moss.vocoder.decode_codes_rows"):
-            return self._select_nonstream_backend().decode_rows(codes_list)
-
-    def _select_nonstream_backend(self) -> NonStreamingVocoderBackend:
-        if self._configured_nonstream_backend == "sglang":
-            return self._sglang_decode_backend
-        if self._configured_nonstream_backend == "session":
-            return self._session_decode_backend
-        if self._session is not None:
-            return self._session_decode_backend
-        return self._processor_decode_backend
+            if self._session is None:
+                return [
+                    torch.as_tensor(wav).detach().to("cpu")
+                    for wav in self._processor.decode_audio_codes(codes_list)
+                ]
+            channels_first = [
+                codes[:, : self._n_vq].transpose(0, 1).contiguous()
+                for codes in codes_list
+            ]
+            with self._state_lock:
+                wavs = self._session.decode_offline(
+                    channels_first, max_step_frames=self._max_step_frames
+                )
+            return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]
 
     def _vocode_batch(self, payloads: list[StagePayload]) -> list[StagePayload]:
         with torch_profile_range("moss.vocoder.vocode_batch"):
@@ -680,14 +659,14 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         batch_size = len(codes_list)
         total_frames = sum(int(codes.shape[0]) for codes in codes_list)
         max_frames = max((int(codes.shape[0]) for codes in codes_list), default=0)
-        backend = self._select_nonstream_backend()
+        path = "processor" if self._session is None else "session"
         for payload, codes in zip(payloads, codes_list):
             _emit_event(
                 request_id=payload.request_id,
                 stage=None,
                 event_name=event_name,
                 metadata={
-                    "path": backend.name,
+                    "path": path,
                     "batch_size": batch_size,
                     "frames": int(codes.shape[0]),
                     "total_frames": total_frames,
