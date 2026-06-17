@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -357,6 +358,54 @@ def test_projected_transformer_uses_single_unpadded_pack_fast_path(
     assert max_k == 4
     assert out.shape == (1, 7, 4)
     assert torch.equal(out_lengths, lengths)
+
+
+def test_cached_packed_rope_matches_moss_interleaved_reference() -> None:
+    q = torch.randn(5, 2, 6)
+    k = torch.randn(5, 2, 6)
+    position_ids = torch.tensor([0, 1, 2, 3, 4])
+    max_period = 10000.0
+    cache = vocoder_decoder._MossPackedRopeCache(max_period=max_period)
+
+    out_q, out_k = vocoder_decoder._apply_cached_packed_rope(
+        q,
+        k,
+        position_ids,
+        max_positions=5,
+        cache=cache,
+    )
+
+    half_dim = q.shape[-1] // 2
+    ds = torch.arange(half_dim, dtype=torch.float32)
+    freqs = torch.exp(ds * (-math.log(max_period) * 2 / q.shape[-1]))
+    phase = position_ids.float().view(-1, 1, 1) * freqs.view(1, 1, -1)
+    cos = torch.cos(phase)
+    sin = torch.sin(phase)
+    q_pair = q.view(*q.shape[:-1], half_dim, 2)
+    k_pair = k.view(*k.shape[:-1], half_dim, 2)
+    qr, qi = q_pair[..., 0].float(), q_pair[..., 1].float()
+    kr, ki = k_pair[..., 0].float(), k_pair[..., 1].float()
+    ref_q = torch.stack(
+        [
+            (qr * cos - qi * sin).to(q.dtype),
+            (qr * sin + qi * cos).to(q.dtype),
+        ],
+        dim=-1,
+    ).view_as(q)
+    ref_k = torch.stack(
+        [
+            (kr * cos - ki * sin).to(k.dtype),
+            (kr * sin + ki * cos).to(k.dtype),
+        ],
+        dim=-1,
+    ).view_as(k)
+
+    assert torch.equal(out_q, ref_q)
+    assert torch.equal(out_k, ref_k)
+    assert cache._cos is not None
+    cos_ptr = cache._cos.data_ptr()
+    _ = cache.get(device=q.device, head_dim=q.shape[-1], max_positions=3)
+    assert cache._cos.data_ptr() == cos_ptr
 
 
 def test_projected_transformer_streaming_path_does_not_reenter_source_stage() -> None:

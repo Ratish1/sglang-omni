@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 import importlib
 import logging
+import math
 import os
 import time
 from collections.abc import Iterable, Iterator
@@ -196,6 +197,103 @@ def _unpack_single_unpadded_sequence(
     return packed_x.reshape(1, packed_x.shape[0], packed_x.shape[-1])
 
 
+class _MossPackedRopeCache:
+    def __init__(self, *, max_period: float) -> None:
+        self.max_period = float(max_period)
+        self._device: torch.device | None = None
+        self._head_dim = 0
+        self._cos: torch.Tensor | None = None
+        self._sin: torch.Tensor | None = None
+
+    def get(
+        self,
+        *,
+        device: torch.device,
+        head_dim: int,
+        max_positions: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if max_positions <= 0:
+            raise ValueError(f"max_positions must be positive, got {max_positions}")
+        if head_dim <= 0 or head_dim % 2 != 0:
+            raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
+        if (
+            self._cos is not None
+            and self._sin is not None
+            and self._device == device
+            and self._head_dim == head_dim
+            and self._cos.shape[0] >= max_positions
+        ):
+            return self._cos[:max_positions], self._sin[:max_positions]
+
+        half_dim = head_dim // 2
+        ds = torch.arange(half_dim, device=device, dtype=torch.float32)
+        freqs = torch.exp(ds * (-math.log(self.max_period) * 2 / head_dim))
+        positions = torch.arange(
+            max_positions, device=device, dtype=torch.float32
+        ).view(-1, 1)
+        phase = positions * freqs.view(1, -1)
+        self._device = device
+        self._head_dim = head_dim
+        self._cos = torch.cos(phase)
+        self._sin = torch.sin(phase)
+        return self._cos, self._sin
+
+
+def _apply_cached_packed_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    position_ids: torch.Tensor,
+    *,
+    max_positions: int,
+    cache: _MossPackedRopeCache,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k.shape != q.shape:
+        raise ValueError(
+            f"Expected k.shape == q.shape, got k={tuple(k.shape)} q={tuple(q.shape)}"
+        )
+    if q.dim() != 3:
+        raise ValueError(
+            f"packed RoPE expects [tokens, heads, dim], got {tuple(q.shape)}"
+        )
+    _, _, head_dim = q.shape
+    if head_dim <= 0 or head_dim % 2 != 0:
+        raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
+    cos_cache, sin_cache = cache.get(
+        device=q.device,
+        head_dim=head_dim,
+        max_positions=max_positions,
+    )
+    if position_ids.numel() == max_positions:
+        cos = cos_cache.view(max_positions, 1, head_dim // 2)
+        sin = sin_cache.view(max_positions, 1, head_dim // 2)
+    else:
+        cos = cos_cache.index_select(0, position_ids).view(
+            position_ids.numel(), 1, head_dim // 2
+        )
+        sin = sin_cache.index_select(0, position_ids).view(
+            position_ids.numel(), 1, head_dim // 2
+        )
+
+    dims = q.shape[:-1]
+    q_pair = q.view(*dims, head_dim // 2, 2)
+    k_pair = k.view(*dims, head_dim // 2, 2)
+    qr, qi = q_pair[..., 0].float(), q_pair[..., 1].float()
+    kr, ki = k_pair[..., 0].float(), k_pair[..., 1].float()
+
+    qor = qr * cos - qi * sin
+    qoi = qr * sin + qi * cos
+    kor = kr * cos - ki * sin
+    koi = kr * sin + ki * cos
+
+    q_out = torch.stack([qor.to(q.dtype), qoi.to(q.dtype)], dim=-1).view(
+        *dims, head_dim
+    )
+    k_out = torch.stack([kor.to(k.dtype), koi.to(k.dtype)], dim=-1).view(
+        *dims, head_dim
+    )
+    return q_out, k_out
+
+
 class MossTTSLocalAttention(nn.Module):
     """MOSS local-causal self attention over dense or packed decoder frames."""
 
@@ -228,6 +326,8 @@ class MossTTSLocalAttention(nn.Module):
         )
         self._attention_kernel = _attention_kernel_preference()
         self._sglang_flash_attn_varlen_func = _load_sglang_flash_attn_varlen_func()
+        max_period = getattr(self.rope, "max_period", 10000.0)
+        self._packed_rope_cache = _MossPackedRopeCache(max_period=max_period)
         if (
             self._attention_kernel == _ATTENTION_KERNEL_SGLANG
             and self._sglang_flash_attn_varlen_func is None
@@ -381,9 +481,19 @@ class MossTTSLocalAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         position_ids: torch.Tensor,
+        *,
+        max_positions: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.rope is None:
             return q, k
+        if self._attention_kernel == _ATTENTION_KERNEL_SGLANG:
+            return _apply_cached_packed_rope(
+                q,
+                k,
+                position_ids,
+                max_positions=max_positions,
+                cache=self._packed_rope_cache,
+            )
         if self._apply_rope_with_positions is None:
             return self.source._apply_packed_rope(q, k, position_ids)
         max_period = getattr(self.rope, "max_period", None)
@@ -421,7 +531,12 @@ class MossTTSLocalAttention(nn.Module):
                 "has_rope": self.rope is not None,
             },
         ):
-            q, k = self._apply_packed_rope(q, k, position_ids)
+            q, k = self._apply_packed_rope(
+                q,
+                k,
+                position_ids,
+                max_positions=max_seqlen,
+            )
         out = self._run_flash_attention(
             q,
             k,
