@@ -33,18 +33,11 @@ _ATTENTION_KERNEL_ENV = "SGLANG_OMNI_MOSS_LOCAL_VOCODER_ATTENTION_KERNEL"
 _ATTENTION_DETAIL_PROFILE_ENV = (
     "SGLANG_OMNI_MOSS_LOCAL_VOCODER_ATTENTION_DETAIL_PROFILE"
 )
-_ROPE_KERNEL_ENV = "SGLANG_OMNI_MOSS_LOCAL_VOCODER_ROPE_KERNEL"
 _ATTENTION_KERNEL_REMOTE = "remote"
 _ATTENTION_KERNEL_SGLANG = "sglang"
-_ROPE_KERNEL_TORCH_CACHED = "torch-cached"
-_ROPE_KERNEL_SGLANG = "sglang"
 _SUPPORTED_ATTENTION_KERNELS = {
     _ATTENTION_KERNEL_REMOTE,
     _ATTENTION_KERNEL_SGLANG,
-}
-_SUPPORTED_ROPE_KERNELS = {
-    _ROPE_KERNEL_TORCH_CACHED,
-    _ROPE_KERNEL_SGLANG,
 }
 _ATTN_PROFILE_REQUEST_IDS: ContextVar[tuple[str, ...]] = ContextVar(
     "moss_tts_local_attn_profile_request_ids", default=()
@@ -65,16 +58,6 @@ def _attention_kernel_preference() -> str:
     return value
 
 
-def _rope_kernel_preference() -> str:
-    value = os.environ.get(_ROPE_KERNEL_ENV, _ROPE_KERNEL_TORCH_CACHED)
-    value = value.strip().lower()
-    if value not in _SUPPORTED_ROPE_KERNELS:
-        raise ValueError(
-            f"{_ROPE_KERNEL_ENV} must be one of {sorted(_SUPPORTED_ROPE_KERNELS)}"
-        )
-    return value
-
-
 @functools.lru_cache(maxsize=1)
 def _attention_detail_profile_enabled() -> bool:
     value = os.environ.get(_ATTENTION_DETAIL_PROFILE_ENV, "")
@@ -89,16 +72,6 @@ def _load_sglang_flash_attn_varlen_func() -> Any | None:
         logger.debug("SGLang flash attention unavailable for MOSS vocoder: %s", exc)
         return None
     return flash_attn_varlen_func
-
-
-@functools.lru_cache(maxsize=1)
-def _load_sglang_rope_func() -> Any | None:
-    try:
-        from sglang.jit_kernel.rope import apply_rope_inplace
-    except Exception as exc:
-        logger.debug("SGLang RoPE unavailable for MOSS vocoder: %s", exc)
-        return None
-    return apply_rope_inplace
 
 
 def _module_list(value: Any) -> list[nn.Module]:
@@ -231,7 +204,6 @@ class _MossPackedRopeCache:
         self._head_dim = 0
         self._cos: torch.Tensor | None = None
         self._sin: torch.Tensor | None = None
-        self._cos_sin: torch.Tensor | None = None
 
     def get(
         self,
@@ -264,20 +236,7 @@ class _MossPackedRopeCache:
         self._head_dim = head_dim
         self._cos = torch.cos(phase)
         self._sin = torch.sin(phase)
-        self._cos_sin = torch.cat([self._cos, self._sin], dim=-1)
         return self._cos, self._sin
-
-    def get_sglang_cos_sin(
-        self,
-        *,
-        device: torch.device,
-        head_dim: int,
-        max_positions: int,
-    ) -> torch.Tensor:
-        self.get(device=device, head_dim=head_dim, max_positions=max_positions)
-        if self._cos_sin is None:
-            raise RuntimeError("RoPE cos/sin cache was not initialized")
-        return self._cos_sin[:max_positions]
 
 
 def _apply_cached_packed_rope(
@@ -335,44 +294,6 @@ def _apply_cached_packed_rope(
     return q_out, k_out
 
 
-def _apply_sglang_packed_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    position_ids: torch.Tensor,
-    *,
-    max_positions: int,
-    cache: _MossPackedRopeCache,
-    apply_rope_inplace: Any,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if k.shape != q.shape:
-        raise ValueError(
-            f"Expected k.shape == q.shape, got k={tuple(k.shape)} q={tuple(q.shape)}"
-        )
-    if q.dim() != 3:
-        raise ValueError(
-            f"packed RoPE expects [tokens, heads, dim], got {tuple(q.shape)}"
-        )
-    _, _, head_dim = q.shape
-    if head_dim <= 0 or head_dim % 2 != 0:
-        raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
-    cos_sin_cache = cache.get_sglang_cos_sin(
-        device=q.device,
-        head_dim=head_dim,
-        max_positions=max_positions,
-    )
-    q_out = q.clone() if q.is_contiguous() else q.contiguous()
-    k_out = k.clone() if k.is_contiguous() else k.contiguous()
-    apply_rope_inplace(
-        q_out,
-        k_out,
-        cos_sin_cache,
-        position_ids,
-        is_neox=False,
-        rope_dim=head_dim,
-    )
-    return q_out, k_out
-
-
 class MossTTSLocalAttention(nn.Module):
     """MOSS local-causal self attention over dense or packed decoder frames."""
 
@@ -404,9 +325,7 @@ class MossTTSLocalAttention(nn.Module):
             self._remote_module, "flash_attn_varlen_func", None
         )
         self._attention_kernel = _attention_kernel_preference()
-        self._rope_kernel = _rope_kernel_preference()
         self._sglang_flash_attn_varlen_func = _load_sglang_flash_attn_varlen_func()
-        self._sglang_rope_func = _load_sglang_rope_func()
         max_period = getattr(self.rope, "max_period", 10000.0)
         self._packed_rope_cache = _MossPackedRopeCache(max_period=max_period)
         if (
@@ -416,11 +335,6 @@ class MossTTSLocalAttention(nn.Module):
             raise RuntimeError(
                 f"{_ATTENTION_KERNEL_ENV}=sglang requires "
                 "sglang.jit_kernel.flash_attention.flash_attn_varlen_func"
-            )
-        if self._rope_kernel == _ROPE_KERNEL_SGLANG and self._sglang_rope_func is None:
-            raise RuntimeError(
-                f"{_ROPE_KERNEL_ENV}=sglang requires "
-                "sglang.jit_kernel.rope.apply_rope_inplace"
             )
 
     def resolve_attention_implementation(
@@ -573,15 +487,6 @@ class MossTTSLocalAttention(nn.Module):
         if self.rope is None:
             return q, k
         if self._attention_kernel == _ATTENTION_KERNEL_SGLANG:
-            if self._rope_kernel == _ROPE_KERNEL_SGLANG:
-                return _apply_sglang_packed_rope(
-                    q,
-                    k,
-                    position_ids,
-                    max_positions=max_positions,
-                    cache=self._packed_rope_cache,
-                    apply_rope_inplace=self._sglang_rope_func,
-                )
             return _apply_cached_packed_rope(
                 q,
                 k,
@@ -624,7 +529,6 @@ class MossTTSLocalAttention(nn.Module):
                 "attention_kernel": self._attention_kernel,
                 "tokens": int(x.shape[0]),
                 "has_rope": self.rope is not None,
-                "rope_kernel": self._rope_kernel,
             },
         ):
             q, k = self._apply_packed_rope(
