@@ -339,7 +339,7 @@ def test_projected_transformer_uses_single_unpadded_pack_fast_path(
         causal: bool,
         window_size: tuple[int, int],
     ) -> torch.Tensor:
-        calls.append((q.shape, cu_q.clone(), cu_k.clone(), max_q, max_k))
+        calls.append((q.shape, cu_q.data_ptr(), cu_k.data_ptr(), max_q, max_k))
         return q
 
     monkeypatch.setattr(vocoder_decoder, "_pack_padded_sequence", fail_masked_pack)
@@ -348,16 +348,31 @@ def test_projected_transformer_uses_single_unpadded_pack_fast_path(
     lengths = torch.tensor([4])
 
     out, out_lengths = wrapper(x, lengths)
+    _ = wrapper(x, lengths)
 
-    assert len(calls) == 1
-    q_shape, cu_q, cu_k, max_q, max_k = calls[0]
+    assert len(calls) == 2
+    q_shape, cu_q_ptr, cu_k_ptr, max_q, max_k = calls[0]
     assert q_shape[0] == 4
-    assert cu_q.tolist() == [0, 4]
-    assert cu_k.tolist() == [0, 4]
+    assert cu_q_ptr == cu_k_ptr
+    assert calls[1][1] == cu_q_ptr
+    assert calls[1][2] == cu_k_ptr
     assert max_q == 4
     assert max_k == 4
     assert out.shape == (1, 7, 4)
     assert torch.equal(out_lengths, lengths)
+
+
+def test_single_unpadded_pack_metadata_cache_reuses_tensors() -> None:
+    cache = vocoder_decoder._SingleUnpaddedMetadataCache()
+    x = torch.randn(1, 4, 6)
+
+    _, cu_1, pos_1 = vocoder_decoder._pack_single_unpadded_sequence(x, cache)
+    _, cu_2, pos_2 = vocoder_decoder._pack_single_unpadded_sequence(x, cache)
+
+    assert cu_1.data_ptr() == cu_2.data_ptr()
+    assert pos_1.data_ptr() == pos_2.data_ptr()
+    assert cu_1.tolist() == [0, 4]
+    assert pos_1.tolist() == [0, 1, 2, 3]
 
 
 def test_cached_packed_rope_matches_moss_interleaved_reference() -> None:

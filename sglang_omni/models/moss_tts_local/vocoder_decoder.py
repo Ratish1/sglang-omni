@@ -172,12 +172,43 @@ def _pack_padded_sequence(
 
 def _pack_single_unpadded_sequence(
     x: torch.Tensor,
+    metadata_cache: "_SingleUnpaddedMetadataCache | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _, max_seqlen, _ = x.shape
     packed_x = x.reshape(max_seqlen, x.shape[-1])
-    cu_seqlens = torch.tensor([0, max_seqlen], dtype=torch.int32, device=x.device)
-    position_ids = torch.arange(max_seqlen, device=x.device, dtype=torch.long)
+    if metadata_cache is None:
+        cu_seqlens = torch.tensor([0, max_seqlen], dtype=torch.int32, device=x.device)
+        position_ids = torch.arange(max_seqlen, device=x.device, dtype=torch.long)
+    else:
+        cu_seqlens, position_ids = metadata_cache.get(
+            device=x.device,
+            max_seqlen=max_seqlen,
+        )
     return packed_x, cu_seqlens, position_ids
+
+
+class _SingleUnpaddedMetadataCache:
+    def __init__(self) -> None:
+        self._items: dict[
+            tuple[str, int | None, int], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+
+    def get(
+        self,
+        *,
+        device: torch.device,
+        max_seqlen: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if max_seqlen <= 0:
+            raise ValueError(f"max_seqlen must be positive, got {max_seqlen}")
+        key = (device.type, device.index, max_seqlen)
+        cached = self._items.get(key)
+        if cached is not None:
+            return cached
+        cu_seqlens = torch.tensor([0, max_seqlen], dtype=torch.int32, device=device)
+        position_ids = torch.arange(max_seqlen, device=device, dtype=torch.long)
+        self._items[key] = (cu_seqlens, position_ids)
+        return cu_seqlens, position_ids
 
 
 def _unpack_packed_sequence(
@@ -861,6 +892,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         self.output_proj = getattr(source, "output_proj", None)
         self.transformer = MossTTSLocalTransformer(getattr(source, "transformer"))
         self.is_streaming = bool(getattr(source, "is_streaming", False))
+        self._single_unpadded_metadata_cache = _SingleUnpaddedMetadataCache()
         if self.input_proj is None or self.output_proj is None:
             raise ValueError("MOSS vocoder projected transformer requires projections")
 
@@ -883,12 +915,16 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         backend = self.transformer.resolve_attention_implementation(x)
         if not self.source.is_streaming and backend == "flash_attention_2":
             batch_size, max_seqlen, _ = x.shape
-            if max_seqlen > 0 and bool(input_lengths.any().item()):
+            if max_seqlen > 0 and batch_size == 1:
+                max_valid_seqlen = max_seqlen
+                pack_mode = "single_unpadded"
+            elif max_seqlen > 0 and bool(input_lengths.any().item()):
                 max_valid_seqlen = int(input_lengths.max().item())
-                if batch_size == 1 and max_valid_seqlen == max_seqlen:
-                    pack_mode = "single_unpadded"
-                else:
-                    pack_mode = "masked"
+                pack_mode = "masked"
+            else:
+                max_valid_seqlen = 0
+                pack_mode = ""
+            if max_valid_seqlen > 0:
                 with _attention_profile_interval(
                     "projected_pack_padded",
                     metadata={
@@ -901,7 +937,10 @@ class MossTTSLocalProjectedTransformer(nn.Module):
                 ):
                     if pack_mode == "single_unpadded":
                         packed_x, cu_seqlens, position_ids = (
-                            _pack_single_unpadded_sequence(x)
+                            _pack_single_unpadded_sequence(
+                                x,
+                                self._single_unpadded_metadata_cache,
+                            )
                         )
                         valid_mask = None
                     else:
