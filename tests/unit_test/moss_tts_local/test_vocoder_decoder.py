@@ -35,6 +35,7 @@ class _FakeAttention(nn.Module):
         self.head_dim = hidden_size // self.num_heads
         self.causal = True
         self.context = 4
+        self.attention_implementation = "sdpa"
         self.in_proj = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
@@ -260,6 +261,50 @@ def test_projected_transformer_sdpa_path_does_not_reenter_source_stage() -> None
     out, out_lengths = wrapper(x, lengths)
 
     assert source.seen_input_shape is None
+    assert out.shape == (2, 7, 4)
+    assert torch.equal(out_lengths, lengths)
+
+
+def test_projected_transformer_uses_sglang_flash_fallback() -> None:
+    source = _FallbackProjectedStage()
+    source.transformer.layers[0].self_attn.attention_implementation = (
+        "flash_attention_2"
+    )
+    wrapper = MossTTSLocalProjectedTransformer(source)
+    attn = wrapper.transformer.layers[0].self_attn
+    attn._attention_kernel = "sglang"
+    attn._supports_sglang_flash_attention = lambda _: True  # type: ignore[method-assign]
+    calls = []
+
+    def fake_flash_attn(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
+        max_q: int,
+        max_k: int,
+        *,
+        causal: bool,
+        window_size: tuple[int, int],
+    ) -> torch.Tensor:
+        calls.append((cu_q.clone(), cu_k.clone(), max_q, max_k, window_size))
+        return q
+
+    attn._sglang_flash_attn_varlen_func = fake_flash_attn
+    x = torch.randn(2, 3, 4)
+    lengths = torch.tensor([4, 3])
+
+    out, out_lengths = wrapper(x, lengths)
+
+    assert source.seen_input_shape is None
+    assert len(calls) == 1
+    cu_q, cu_k, max_q, max_k, window_size = calls[0]
+    assert cu_q.tolist() == [0, 4, 7]
+    assert cu_k.tolist() == [0, 4, 7]
+    assert max_q == 4
+    assert max_k == 4
+    assert window_size == (source.transformer.layers[0].self_attn.context, 0)
     assert out.shape == (2, 7, 4)
     assert torch.equal(out_lengths, lengths)
 

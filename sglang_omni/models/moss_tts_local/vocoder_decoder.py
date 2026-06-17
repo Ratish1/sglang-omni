@@ -199,6 +199,49 @@ class MossTTSLocalAttention(nn.Module):
                 "sglang.jit_kernel.flash_attention.flash_attn_varlen_func"
             )
 
+    def resolve_attention_implementation(
+        self,
+        x: torch.Tensor,
+        *,
+        is_streaming: bool = False,
+    ) -> str:
+        backend = self.source.resolve_attention_implementation(
+            x,
+            is_streaming=is_streaming,
+        )
+        if backend == "flash_attention_2":
+            return backend
+        if (
+            self._attention_kernel == _ATTENTION_KERNEL_SGLANG
+            and getattr(self.source, "attention_implementation", None)
+            == "flash_attention_2"
+            and self._supports_sglang_flash_attention(x)
+        ):
+            return "flash_attention_2"
+        return backend
+
+    def _supports_sglang_flash_attention(self, x: torch.Tensor) -> bool:
+        if self._sglang_flash_attn_varlen_func is None or x.device.type != "cuda":
+            return False
+        return self._backend_check_dtype(x) == torch.bfloat16
+
+    def _backend_check_dtype(self, x: torch.Tensor) -> torch.dtype:
+        get_backend_check_dtype = getattr(self.source, "_get_backend_check_dtype", None)
+        if callable(get_backend_check_dtype):
+            return get_backend_check_dtype(x)
+        if x.device.type != "cuda":
+            return x.dtype
+        try:
+            autocast_enabled = torch.is_autocast_enabled("cuda")
+        except TypeError:
+            autocast_enabled = torch.is_autocast_enabled()
+        if not autocast_enabled:
+            return x.dtype
+        try:
+            return torch.get_autocast_dtype("cuda")
+        except TypeError:
+            return torch.get_autocast_gpu_dtype()
+
     def forward(
         self,
         query: torch.Tensor,
@@ -209,7 +252,7 @@ class MossTTSLocalAttention(nn.Module):
         input_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         streaming_state = getattr(self.source, "_streaming_state", None)
-        backend = self.source.resolve_attention_implementation(
+        backend = self.resolve_attention_implementation(
             query,
             is_streaming=streaming_state is not None,
         )
@@ -579,7 +622,15 @@ class MossTTSLocalTransformer(nn.Module):
         )
 
     def resolve_attention_implementation(self, x: torch.Tensor) -> str:
-        return self.source.resolve_attention_implementation(x)
+        if len(self.layers) == 0:
+            return "sdpa"
+        first_layer = self.layers[0]
+        if not isinstance(first_layer, MossTTSLocalTransformerLayer):
+            return self.source.resolve_attention_implementation(x)
+        return first_layer.self_attn.resolve_attention_implementation(
+            x,
+            is_streaming=getattr(self.source, "_streaming_state", None) is not None,
+        )
 
     def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         streaming_state = getattr(self.source, "_streaming_state", None)
