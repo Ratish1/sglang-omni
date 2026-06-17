@@ -26,6 +26,7 @@ from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
     MossTTSLocalVocoderDecoder,
     build_moss_tts_local_vocoder_decoder,
+    profile_moss_tts_local_vocoder_attention,
     use_moss_tts_local_vocoder_decoder,
 )
 from sglang_omni.models.tts_streaming import (
@@ -622,32 +623,45 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 payload.data["usage"] = usage
             return payload
 
-    def _decode_codes_rows(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
+    def _decode_codes_rows(
+        self,
+        codes_list: list[torch.Tensor],
+        *,
+        profile_request_id: str | None = None,
+        profile_metadata: dict[str, Any] | None = None,
+    ) -> list[torch.Tensor]:
         """Decode ``[T, >=n_vq]`` row tensors to fp32 CPU waveforms."""
         with torch_profile_range("moss.vocoder.decode_codes_rows"):
-            if self._session is None:
-                if self._nonstream_decoder is not None:
-                    with use_moss_tts_local_vocoder_decoder(
-                        self._codec,
-                        self._nonstream_decoder,
-                    ):
-                        return [
-                            torch.as_tensor(wav).detach().to("cpu")
-                            for wav in self._processor.decode_audio_codes(codes_list)
-                        ]
-                return [
-                    torch.as_tensor(wav).detach().to("cpu")
-                    for wav in self._processor.decode_audio_codes(codes_list)
+            with profile_moss_tts_local_vocoder_attention(
+                profile_request_id, profile_metadata
+            ):
+                if self._session is None:
+                    if self._nonstream_decoder is not None:
+                        with use_moss_tts_local_vocoder_decoder(
+                            self._codec,
+                            self._nonstream_decoder,
+                        ):
+                            return [
+                                torch.as_tensor(wav).detach().to("cpu")
+                                for wav in self._processor.decode_audio_codes(
+                                    codes_list
+                                )
+                            ]
+                    return [
+                        torch.as_tensor(wav).detach().to("cpu")
+                        for wav in self._processor.decode_audio_codes(codes_list)
+                    ]
+                channels_first = [
+                    codes[:, : self._n_vq].transpose(0, 1).contiguous()
+                    for codes in codes_list
                 ]
-            channels_first = [
-                codes[:, : self._n_vq].transpose(0, 1).contiguous()
-                for codes in codes_list
-            ]
-            with self._state_lock:
-                wavs = self._session.decode_offline(
-                    channels_first, max_step_frames=self._max_step_frames
-                )
-            return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]
+                with self._state_lock:
+                    wavs = self._session.decode_offline(
+                        channels_first, max_step_frames=self._max_step_frames
+                    )
+                return [
+                    wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs
+                ]
 
     def _vocode_batch(self, payloads: list[StagePayload]) -> list[StagePayload]:
         with torch_profile_range("moss.vocoder.vocode_batch"):
@@ -663,7 +677,25 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 self._emit_vocoder_decode_events(
                     "vocoder_decode_start", profiled_payloads, codes_list
                 )
-            decoded_wavs = self._decode_codes_rows(codes_list) if codes_list else []
+            profile_request_id = (
+                profiled_payloads[0].request_id if profiled_payloads else None
+            )
+            profile_metadata = {
+                "batch_size": len(codes_list),
+                "total_frames": sum(int(codes.shape[0]) for codes in codes_list),
+                "max_frames": max(
+                    (int(codes.shape[0]) for codes in codes_list), default=0
+                ),
+            }
+            decoded_wavs = (
+                self._decode_codes_rows(
+                    codes_list,
+                    profile_request_id=profile_request_id,
+                    profile_metadata=profile_metadata,
+                )
+                if codes_list
+                else []
+            )
             if profile_active:
                 self._emit_vocoder_decode_events(
                     "vocoder_decode_end", profiled_payloads, codes_list

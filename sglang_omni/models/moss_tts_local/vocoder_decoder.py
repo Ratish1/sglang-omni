@@ -13,13 +13,17 @@ import functools
 import importlib
 import logging
 import os
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import torch
 from torch import nn
 
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.ranges import torch_profile_range
 
 logger = logging.getLogger(__name__)
@@ -31,6 +35,12 @@ _SUPPORTED_ATTENTION_KERNELS = {
     _ATTENTION_KERNEL_REMOTE,
     _ATTENTION_KERNEL_SGLANG,
 }
+_ATTN_PROFILE_REQUEST_ID: ContextVar[str | None] = ContextVar(
+    "moss_tts_local_attn_profile_request_id", default=None
+)
+_ATTN_PROFILE_METADATA: ContextVar[dict[str, Any] | None] = ContextVar(
+    "moss_tts_local_attn_profile_metadata", default=None
+)
 
 
 def _attention_kernel_preference() -> str:
@@ -62,6 +72,56 @@ def _module_list(value: Any) -> list[nn.Module]:
     ):
         return list(value)
     return []
+
+
+@contextmanager
+def profile_moss_tts_local_vocoder_attention(
+    request_id: str | None,
+    metadata: dict[str, Any] | None = None,
+) -> Iterator[None]:
+    token_id = _ATTN_PROFILE_REQUEST_ID.set(request_id)
+    token_metadata = _ATTN_PROFILE_METADATA.set(metadata)
+    try:
+        yield
+    finally:
+        _ATTN_PROFILE_METADATA.reset(token_metadata)
+        _ATTN_PROFILE_REQUEST_ID.reset(token_id)
+
+
+@contextmanager
+def _attention_profile_interval(
+    event_base: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> Iterator[None]:
+    with torch_profile_range(f"moss.vocoder.attn.{event_base}"):
+        request_id = _ATTN_PROFILE_REQUEST_ID.get()
+        recorder = _get_event_recorder()
+        if request_id is None or not recorder.is_active():
+            yield
+            return
+
+        merged_metadata = dict(_ATTN_PROFILE_METADATA.get() or {})
+        if metadata is not None:
+            merged_metadata.update(metadata)
+        start_ns = time.time_ns()
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name=f"moss_vocoder_attn_{event_base}_start",
+            metadata=merged_metadata,
+            timestamp_ns=start_ns,
+        )
+        try:
+            yield
+        finally:
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name=f"moss_vocoder_attn_{event_base}_end",
+                metadata=merged_metadata,
+                timestamp_ns=time.time_ns(),
+            )
 
 
 def _pack_padded_sequence(
@@ -258,12 +318,19 @@ class MossTTSLocalAttention(nn.Module):
             if self.context is not None and self.causal
             else (-1, -1)
         )
-        range_name = (
-            "moss.vocoder.attn.flash_sglang"
+        event_base = (
+            "flash_sglang"
             if self._attention_kernel == _ATTENTION_KERNEL_SGLANG
-            else "moss.vocoder.attn.flash_remote"
+            else "flash_remote"
         )
-        with torch_profile_range(range_name):
+        with _attention_profile_interval(
+            event_base,
+            metadata={
+                "max_seqlen_q": max_seqlen_q,
+                "max_seqlen_k": max_seqlen_k,
+                "window_size": window_size,
+            },
+        ):
             out = flash_attn_varlen_func(
                 q.contiguous(),
                 k.contiguous(),
@@ -283,17 +350,27 @@ class MossTTSLocalAttention(nn.Module):
         state: Any,
     ) -> torch.Tensor:
         batch_size, chunk_length, _ = x.shape
-        with torch_profile_range("moss.vocoder.attn.project_qkv"):
+        with _attention_profile_interval(
+            "project_qkv",
+            metadata={
+                "batch_size": batch_size,
+                "chunk_length": chunk_length,
+                "embed_dim": self.embed_dim,
+                "num_heads": self.num_heads,
+                "head_dim": self.head_dim,
+                "context": self.context,
+            },
+        ):
             q, k_cur, v_cur = self._project_qkv(x)
         if self.rope is not None:
-            with torch_profile_range("moss.vocoder.attn.rope"):
+            with _attention_profile_interval("rope"):
                 q, k_cur = self.rope(q, k_cur, state.offset, time_before_heads=False)
         pos_q = state.offset.view(-1, 1) + torch.arange(
             chunk_length,
             device=x.device,
             dtype=torch.long,
         ).view(1, -1)
-        with torch_profile_range("moss.vocoder.attn.ensure_cache"):
+        with _attention_profile_interval("ensure_cache"):
             cached_k, cached_v, cached_pos = self.source._ensure_streaming_cache(
                 state,
                 batch_size,
@@ -301,7 +378,7 @@ class MossTTSLocalAttention(nn.Module):
                 k_cur.dtype,
             )
 
-        with torch_profile_range("moss.vocoder.attn.build_kv"):
+        with _attention_profile_interval("build_kv"):
             k_all, v_all, pos_k = self.source._build_streaming_kv(
                 cached_k,
                 cached_v,
@@ -318,7 +395,7 @@ class MossTTSLocalAttention(nn.Module):
         cu_k = [0]
         max_kv_len = 0
 
-        with torch_profile_range("moss.vocoder.attn.pack_varlen"):
+        with _attention_profile_interval("pack_varlen"):
             for batch_idx in range(batch_size):
                 valid_k = pos_k[batch_idx] >= 0
                 q_i = q[batch_idx].transpose(0, 1).contiguous()
@@ -346,7 +423,7 @@ class MossTTSLocalAttention(nn.Module):
             max_seqlen_k=max_kv_len,
         )
 
-        with torch_profile_range("moss.vocoder.attn.unpack_varlen"):
+        with _attention_profile_interval("unpack_varlen"):
             outputs = []
             start = 0
             for _ in range(batch_size):
@@ -357,7 +434,7 @@ class MossTTSLocalAttention(nn.Module):
             out = torch.stack(outputs, dim=0)
             out = out.transpose(1, 2).reshape(batch_size, chunk_length, self.embed_dim)
 
-        with torch_profile_range("moss.vocoder.attn.update_cache"):
+        with _attention_profile_interval("update_cache"):
             self._update_streaming_cache_in_place(
                 state,
                 cached_k,
