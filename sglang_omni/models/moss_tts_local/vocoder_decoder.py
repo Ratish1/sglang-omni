@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Owned MOSS-TTS Local vocoder decoder stages.
+"""Patched MOSS-TTS Local vocoder decoder stages.
 
 This module mirrors the remote MOSS-Audio-Tokenizer-v2 decoder stage mechanics
 without changing the scheduler, codec embeddings, or waveform projection code.
-It is intentionally MOSS-specific: the decoder is a chain of projected
-transformers and patch transforms, not a generic LLM model runner.
+It is intentionally MOSS-specific: the interception point is the decoder's
+projected transformer stages, not the codec embeddings or waveform projection.
 """
 
 from __future__ import annotations
@@ -29,13 +29,6 @@ def _module_list(value: Any) -> list[nn.Module]:
     ):
         return list(value)
     return []
-
-
-def _first_attr(obj: Any, *names: str) -> Any:
-    for name in names:
-        if hasattr(obj, name):
-            return getattr(obj, name)
-    return None
 
 
 def _pack_padded_sequence(
@@ -296,13 +289,11 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         input_lengths: torch.Tensor,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        source_x = x
+        if self.is_streaming:
+            return self.source(x, input_lengths, **kwargs)
+
         x = self.input_proj(x.transpose(1, 2))
-        if (
-            not self.is_streaming
-            and self.transformer.resolve_attention_implementation(x)
-            == "flash_attention_2"
-        ):
+        if self.transformer.resolve_attention_implementation(x) == "flash_attention_2":
             batch_size, max_seqlen, _ = x.shape
             if max_seqlen > 0 and bool(input_lengths.any().item()):
                 max_valid_seqlen = int(input_lengths.max().item())
@@ -327,56 +318,12 @@ class MossTTSLocalProjectedTransformer(nn.Module):
             else:
                 x = x.new_zeros(x.shape)
         else:
-            return self.source(source_x, input_lengths, **kwargs)
+            x = self.transformer(x, input_lengths=input_lengths, **kwargs)
         return self.output_proj(x).transpose(1, 2), input_lengths
 
 
-class MossTTSLocalPatchTransform(nn.Module):
-    """MOSS codec patch reshape stage."""
-
-    def __init__(self, source: nn.Module) -> None:
-        super().__init__()
-        object.__setattr__(self, "source", source)
-        self.patch_size = int(getattr(source, "patch_size"))
-        self.downsample_ratio = getattr(source, "downsample_ratio", None)
-        self.is_downsample = bool(getattr(source, "is_downsample", False))
-        self.module_type = getattr(source, "module_type", "PatchedPretransform")
-
-    def encode(
-        self,
-        x: torch.Tensor,
-        input_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, dim, _ = x.shape
-        patch = self.patch_size
-        x = x.reshape(batch_size, dim, -1, patch)
-        x = x.permute(0, 1, 3, 2).reshape(batch_size, dim * patch, -1)
-        return x, input_lengths // patch
-
-    def decode(
-        self,
-        x: torch.Tensor,
-        input_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, patched_dim, length = x.shape
-        patch = self.patch_size
-        dim = patched_dim // patch
-        x = x.reshape(batch_size, dim, patch, length)
-        x = x.permute(0, 1, 3, 2).reshape(batch_size, dim, length * patch)
-        return x, input_lengths * patch
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        input_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.is_downsample:
-            return self.encode(x, input_lengths)
-        return self.decode(x, input_lengths)
-
-
 class MossTTSLocalVocoderDecoder(nn.Module):
-    """Iterable MOSS vocoder decoder replacement."""
+    """Iterable MOSS vocoder decoder with patched projected transformers."""
 
     def __init__(self, source: nn.Module) -> None:
         super().__init__()
@@ -392,7 +339,7 @@ class MossTTSLocalVocoderDecoder(nn.Module):
         if hasattr(stage, "transformer"):
             return MossTTSLocalProjectedTransformer(stage)
         if hasattr(stage, "patch_size"):
-            return MossTTSLocalPatchTransform(stage)
+            return stage
         raise ValueError(
             f"unsupported MOSS vocoder decoder stage {stage.__class__.__name__}"
         )
@@ -456,7 +403,6 @@ def use_moss_tts_local_vocoder_decoder(
 
 __all__ = [
     "MossTTSLocalAttention",
-    "MossTTSLocalPatchTransform",
     "MossTTSLocalProjectedTransformer",
     "MossTTSLocalTransformer",
     "MossTTSLocalTransformerLayer",

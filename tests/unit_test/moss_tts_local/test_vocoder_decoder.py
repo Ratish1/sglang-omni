@@ -6,7 +6,6 @@ import torch
 from torch import nn
 
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
-    MossTTSLocalPatchTransform,
     MossTTSLocalProjectedTransformer,
     MossTTSLocalTransformerLayer,
     MossTTSLocalVocoderDecoder,
@@ -96,6 +95,13 @@ class _PatchStage(nn.Module):
         self.is_downsample = is_downsample
         self.module_type = "PatchedPretransform"
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return x, input_lengths
+
 
 class _CountingLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int) -> None:
@@ -142,19 +148,7 @@ class _CountingLayer(_FakeLayer):
         self.layer_scale_2 = _CountingLayerScale(hidden_size)
 
 
-def test_patch_transform_decode_matches_moss_layout() -> None:
-    stage = MossTTSLocalPatchTransform(_PatchStage(patch_size=2, is_downsample=False))
-    x = torch.arange(1 * 4 * 3).reshape(1, 4, 3)
-    lengths = torch.tensor([3])
-
-    out, out_lengths = stage(x, lengths)
-
-    expected = torch.tensor([[[0, 3, 1, 4, 2, 5], [6, 9, 7, 10, 8, 11]]])
-    assert torch.equal(out, expected)
-    assert torch.equal(out_lengths, torch.tensor([6]))
-
-
-def test_projected_transformer_fallback_receives_original_layout() -> None:
+def test_projected_transformer_sdpa_path_does_not_reenter_source_stage() -> None:
     source = _FallbackProjectedStage()
     wrapper = MossTTSLocalProjectedTransformer(source)
     x = torch.randn(2, 3, 4)
@@ -162,9 +156,9 @@ def test_projected_transformer_fallback_receives_original_layout() -> None:
 
     out, out_lengths = wrapper(x, lengths)
 
-    assert source.seen_input_shape == (2, 3, 4)
-    assert torch.equal(out, x + 10)
-    assert torch.equal(out_lengths, lengths + 1)
+    assert source.seen_input_shape is None
+    assert out.shape == (2, 7, 4)
+    assert torch.equal(out_lengths, lengths)
 
 
 def test_transformer_layer_uses_source_modules_for_primitive_ops() -> None:
@@ -183,11 +177,10 @@ def test_transformer_layer_uses_source_modules_for_primitive_ops() -> None:
 
 
 def test_vocoder_decoder_wraps_supported_stage_types() -> None:
-    decoder = nn.ModuleList(
-        [_FallbackProjectedStage(), _PatchStage(patch_size=2, is_downsample=False)]
-    )
+    patch_stage = _PatchStage(patch_size=2, is_downsample=False)
+    decoder = nn.ModuleList([_FallbackProjectedStage(), patch_stage])
     wrapped = MossTTSLocalVocoderDecoder(decoder)
 
     assert len(wrapped) == 2
     assert isinstance(wrapped[0], MossTTSLocalProjectedTransformer)
-    assert isinstance(wrapped[1], MossTTSLocalPatchTransform)
+    assert wrapped[1] is patch_stage
