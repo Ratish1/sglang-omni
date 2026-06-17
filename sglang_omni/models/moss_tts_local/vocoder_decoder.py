@@ -275,7 +275,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
 
     def __init__(self, source: nn.Module) -> None:
         super().__init__()
-        object.__setattr__(self, "source", source)
+        self.source = source
         self.input_proj = getattr(source, "input_proj", None)
         self.output_proj = getattr(source, "output_proj", None)
         self.transformer = MossTTSLocalTransformer(getattr(source, "transformer"))
@@ -289,7 +289,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         input_lengths: torch.Tensor,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.is_streaming:
+        if self.is_streaming or bool(getattr(self.source, "is_streaming", False)):
             return self.source(x, input_lengths, **kwargs)
 
         x = self.input_proj(x.transpose(1, 2))

@@ -161,6 +161,20 @@ def test_projected_transformer_sdpa_path_does_not_reenter_source_stage() -> None
     assert torch.equal(out_lengths, lengths)
 
 
+def test_projected_transformer_delegates_when_source_is_streaming() -> None:
+    source = _FallbackProjectedStage()
+    source.is_streaming = True
+    wrapper = MossTTSLocalProjectedTransformer(source)
+    x = torch.randn(2, 3, 4)
+    lengths = torch.tensor([4, 3])
+
+    out, out_lengths = wrapper(x, lengths)
+
+    assert source.seen_input_shape == (2, 3, 4)
+    assert torch.equal(out, x + 10)
+    assert torch.equal(out_lengths, lengths + 1)
+
+
 def test_transformer_layer_uses_source_modules_for_primitive_ops() -> None:
     source = _CountingLayer(hidden_size=6)
     wrapper = MossTTSLocalTransformerLayer(source)
