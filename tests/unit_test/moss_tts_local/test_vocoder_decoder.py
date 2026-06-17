@@ -377,60 +377,6 @@ def test_attention_streaming_flash_cache_update_preserves_storage() -> None:
     ]
 
 
-def test_attention_streaming_flash_can_use_sglang_workspace() -> None:
-    source = _StreamingFlashAttention(hidden_size=6)
-    wrapper = MossTTSLocalAttention(source)
-    calls: list[dict[str, object]] = []
-
-    class _FakeWorkspace:
-        @classmethod
-        def create(cls, **kwargs: object) -> "_FakeWorkspace":
-            calls.append({"workspace": kwargs})
-            return cls()
-
-    def fake_chunked_attention(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        cache_pos: torch.Tensor,
-        offset: torch.Tensor,
-        exec_mask: torch.Tensor,
-        workspace: object,
-        *,
-        context: int,
-        flash_attn_varlen_func: object,
-    ) -> torch.Tensor:
-        del v, cache_k, cache_v, exec_mask, workspace, flash_attn_varlen_func
-        calls.append({"q_shape": tuple(q.shape), "k_shape": tuple(k.shape)})
-        batch_size, _, chunk_len, _ = q.shape
-        positions = offset.view(-1, 1) + torch.arange(chunk_len).view(1, -1)
-        cache_pos.copy_(positions[:, -context:])
-        offset.add_(chunk_len)
-        return q
-
-    wrapper._attention_kernel = "sglang-workspace"
-    wrapper._chunked_workspace_cls = _FakeWorkspace
-    wrapper._chunked_attention_with_cache = fake_chunked_attention
-    wrapper._sglang_flash_attn_varlen_func = object()
-    x = torch.randn(2, 4, 6)
-
-    out = wrapper(x, input_lengths=torch.tensor([4, 4]))
-
-    assert source.streaming_flash_calls == 0
-    assert source.cache_updates == 0
-    assert source._streaming_state.offset.tolist() == [4, 4]
-    assert source._streaming_state.cached_positions is not None
-    assert source._streaming_state.cached_positions.tolist() == [
-        [0, 1, 2, 3],
-        [0, 1, 2, 3],
-    ]
-    assert calls[0]["workspace"]["context"] == source.context
-    assert calls[1]["q_shape"] == (2, source.num_heads, 4, source.head_dim)
-    assert out.shape == x.shape
-
-
 def test_attention_kernel_defaults_to_remote(monkeypatch) -> None:
     monkeypatch.delenv("SGLANG_OMNI_MOSS_LOCAL_VOCODER_ATTENTION_KERNEL", raising=False)
     source = _FakeAttention(hidden_size=6)

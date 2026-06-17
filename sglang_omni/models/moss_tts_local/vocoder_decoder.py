@@ -20,16 +20,16 @@ from typing import Any
 import torch
 from torch import nn
 
+from sglang_omni.profiler.ranges import torch_profile_range
+
 logger = logging.getLogger(__name__)
 
 _ATTENTION_KERNEL_ENV = "SGLANG_OMNI_MOSS_LOCAL_VOCODER_ATTENTION_KERNEL"
 _ATTENTION_KERNEL_REMOTE = "remote"
 _ATTENTION_KERNEL_SGLANG = "sglang"
-_ATTENTION_KERNEL_SGLANG_WORKSPACE = "sglang-workspace"
 _SUPPORTED_ATTENTION_KERNELS = {
     _ATTENTION_KERNEL_REMOTE,
     _ATTENTION_KERNEL_SGLANG,
-    _ATTENTION_KERNEL_SGLANG_WORKSPACE,
 }
 
 
@@ -52,22 +52,6 @@ def _load_sglang_flash_attn_varlen_func() -> Any | None:
         logger.debug("SGLang flash attention unavailable for MOSS vocoder: %s", exc)
         return None
     return flash_attn_varlen_func
-
-
-@functools.lru_cache(maxsize=1)
-def _load_sglang_chunked_local_attention() -> tuple[Any, Any] | None:
-    try:
-        from sglang.jit_kernel.chunked_local_attention import (
-            LocalCausalVarlenWorkspace,
-            local_causal_varlen_attention_with_cache,
-        )
-    except Exception as exc:
-        logger.debug(
-            "SGLang chunked local attention unavailable for MOSS vocoder: %s",
-            exc,
-        )
-        return None
-    return LocalCausalVarlenWorkspace, local_causal_varlen_attention_with_cache
 
 
 def _module_list(value: Any) -> list[nn.Module]:
@@ -137,15 +121,14 @@ class MossTTSLocalAttention(nn.Module):
         )
         self._attention_kernel = _attention_kernel_preference()
         self._sglang_flash_attn_varlen_func = _load_sglang_flash_attn_varlen_func()
-        chunked_attention = _load_sglang_chunked_local_attention()
-        if chunked_attention is None:
-            self._chunked_workspace_cls = None
-            self._chunked_attention_with_cache = None
-        else:
-            self._chunked_workspace_cls = chunked_attention[0]
-            self._chunked_attention_with_cache = chunked_attention[1]
-        self._chunked_workspace_key: tuple[Any, ...] | None = None
-        self._chunked_workspace: Any | None = None
+        if (
+            self._attention_kernel == _ATTENTION_KERNEL_SGLANG
+            and self._sglang_flash_attn_varlen_func is None
+        ):
+            raise RuntimeError(
+                f"{_ATTENTION_KERNEL_ENV}=sglang requires "
+                "sglang.jit_kernel.flash_attention.flash_attn_varlen_func"
+            )
 
     def forward(
         self,
@@ -275,17 +258,23 @@ class MossTTSLocalAttention(nn.Module):
             if self.context is not None and self.causal
             else (-1, -1)
         )
-        out = flash_attn_varlen_func(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            causal=self.causal,
-            window_size=window_size,
+        range_name = (
+            "moss.vocoder.attn.flash_sglang"
+            if self._attention_kernel == _ATTENTION_KERNEL_SGLANG
+            else "moss.vocoder.attn.flash_remote"
         )
+        with torch_profile_range(range_name):
+            out = flash_attn_varlen_func(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=self.causal,
+                window_size=window_size,
+            )
         return out
 
     def _forward_streaming_flash(
@@ -294,43 +283,33 @@ class MossTTSLocalAttention(nn.Module):
         state: Any,
     ) -> torch.Tensor:
         batch_size, chunk_length, _ = x.shape
-        q, k_cur, v_cur = self._project_qkv(x)
+        with torch_profile_range("moss.vocoder.attn.project_qkv"):
+            q, k_cur, v_cur = self._project_qkv(x)
         if self.rope is not None:
-            q, k_cur = self.rope(q, k_cur, state.offset, time_before_heads=False)
+            with torch_profile_range("moss.vocoder.attn.rope"):
+                q, k_cur = self.rope(q, k_cur, state.offset, time_before_heads=False)
         pos_q = state.offset.view(-1, 1) + torch.arange(
             chunk_length,
             device=x.device,
             dtype=torch.long,
         ).view(1, -1)
-        cached_k, cached_v, cached_pos = self.source._ensure_streaming_cache(
-            state,
-            batch_size,
-            k_cur.device,
-            k_cur.dtype,
-        )
-        if (
-            self._attention_kernel == _ATTENTION_KERNEL_SGLANG_WORKSPACE
-            and self.context is not None
-        ):
-            return self._forward_streaming_sglang_workspace(
-                q,
-                k_cur,
-                v_cur,
+        with torch_profile_range("moss.vocoder.attn.ensure_cache"):
+            cached_k, cached_v, cached_pos = self.source._ensure_streaming_cache(
+                state,
+                batch_size,
+                k_cur.device,
+                k_cur.dtype,
+            )
+
+        with torch_profile_range("moss.vocoder.attn.build_kv"):
+            k_all, v_all, pos_k = self.source._build_streaming_kv(
                 cached_k,
                 cached_v,
                 cached_pos,
-                state,
-                batch_size=batch_size,
-                chunk_length=chunk_length,
+                k_cur,
+                v_cur,
+                pos_q,
             )
-        k_all, v_all, pos_k = self.source._build_streaming_kv(
-            cached_k,
-            cached_v,
-            cached_pos,
-            k_cur,
-            v_cur,
-            pos_q,
-        )
 
         q_chunks = []
         k_chunks = []
@@ -339,129 +318,61 @@ class MossTTSLocalAttention(nn.Module):
         cu_k = [0]
         max_kv_len = 0
 
-        for batch_idx in range(batch_size):
-            valid_k = pos_k[batch_idx] >= 0
-            q_i = q[batch_idx].transpose(0, 1).contiguous()
-            k_i = k_all[batch_idx, :, valid_k, :].transpose(0, 1).contiguous()
-            v_i = v_all[batch_idx, :, valid_k, :].transpose(0, 1).contiguous()
-            q_chunks.append(q_i)
-            k_chunks.append(k_i)
-            v_chunks.append(v_i)
-            cu_q.append(cu_q[-1] + q_i.shape[0])
-            cu_k.append(cu_k[-1] + k_i.shape[0])
-            max_kv_len = max(max_kv_len, int(k_i.shape[0]))
+        with torch_profile_range("moss.vocoder.attn.pack_varlen"):
+            for batch_idx in range(batch_size):
+                valid_k = pos_k[batch_idx] >= 0
+                q_i = q[batch_idx].transpose(0, 1).contiguous()
+                k_i = k_all[batch_idx, :, valid_k, :].transpose(0, 1).contiguous()
+                v_i = v_all[batch_idx, :, valid_k, :].transpose(0, 1).contiguous()
+                q_chunks.append(q_i)
+                k_chunks.append(k_i)
+                v_chunks.append(v_i)
+                cu_q.append(cu_q[-1] + q_i.shape[0])
+                cu_k.append(cu_k[-1] + k_i.shape[0])
+                max_kv_len = max(max_kv_len, int(k_i.shape[0]))
+            q_pack = torch.cat(q_chunks, dim=0)
+            k_pack = torch.cat(k_chunks, dim=0)
+            v_pack = torch.cat(v_chunks, dim=0)
+            cu_q_tensor = torch.tensor(cu_q, device=x.device, dtype=torch.int32)
+            cu_k_tensor = torch.tensor(cu_k, device=x.device, dtype=torch.int32)
 
         out_flat = self._run_flash_attention(
-            torch.cat(q_chunks, dim=0),
-            torch.cat(k_chunks, dim=0),
-            torch.cat(v_chunks, dim=0),
-            torch.tensor(cu_q, device=x.device, dtype=torch.int32),
-            torch.tensor(cu_k, device=x.device, dtype=torch.int32),
+            q_pack,
+            k_pack,
+            v_pack,
+            cu_q_tensor,
+            cu_k_tensor,
             max_seqlen_q=chunk_length,
             max_seqlen_k=max_kv_len,
         )
 
-        outputs = []
-        start = 0
-        for _ in range(batch_size):
-            outputs.append(
-                out_flat[start : start + chunk_length].transpose(0, 1).contiguous()
-            )
-            start += chunk_length
-        out = torch.stack(outputs, dim=0)
-        out = out.transpose(1, 2).reshape(batch_size, chunk_length, self.embed_dim)
+        with torch_profile_range("moss.vocoder.attn.unpack_varlen"):
+            outputs = []
+            start = 0
+            for _ in range(batch_size):
+                outputs.append(
+                    out_flat[start : start + chunk_length].transpose(0, 1).contiguous()
+                )
+                start += chunk_length
+            out = torch.stack(outputs, dim=0)
+            out = out.transpose(1, 2).reshape(batch_size, chunk_length, self.embed_dim)
 
-        self._update_streaming_cache_in_place(
-            state,
-            cached_k,
-            cached_v,
-            cached_pos,
-            k_all,
-            v_all,
-            pos_k,
-        )
-        state.offset[:] = torch.where(
-            state.exec_mask,
-            state.offset + chunk_length,
-            state.offset,
-        )
+        with torch_profile_range("moss.vocoder.attn.update_cache"):
+            self._update_streaming_cache_in_place(
+                state,
+                cached_k,
+                cached_v,
+                cached_pos,
+                k_all,
+                v_all,
+                pos_k,
+            )
+            state.offset[:] = torch.where(
+                state.exec_mask,
+                state.offset + chunk_length,
+                state.offset,
+            )
         return out
-
-    def _get_chunked_workspace(
-        self,
-        *,
-        batch_size: int,
-        chunk_length: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Any:
-        if self._chunked_workspace_cls is None:
-            raise RuntimeError(
-                "SGLang chunked local attention is unavailable; install a patched "
-                "SGLang with sglang.jit_kernel.chunked_local_attention"
-            )
-        if self.context is None:
-            raise RuntimeError("SGLang chunked local attention requires finite context")
-        key = (
-            batch_size,
-            chunk_length,
-            int(self.context),
-            self.num_heads,
-            self.head_dim,
-            device,
-            dtype,
-        )
-        if self._chunked_workspace_key != key:
-            self._chunked_workspace = self._chunked_workspace_cls.create(
-                max_batch_size=batch_size,
-                max_chunk_len=chunk_length,
-                context=int(self.context),
-                num_heads=self.num_heads,
-                head_dim=self.head_dim,
-                device=device,
-                dtype=dtype,
-            )
-            self._chunked_workspace_key = key
-        return self._chunked_workspace
-
-    def _forward_streaming_sglang_workspace(
-        self,
-        q: torch.Tensor,
-        k_cur: torch.Tensor,
-        v_cur: torch.Tensor,
-        cached_k: torch.Tensor,
-        cached_v: torch.Tensor,
-        cached_pos: torch.Tensor,
-        state: Any,
-        *,
-        batch_size: int,
-        chunk_length: int,
-    ) -> torch.Tensor:
-        if self._chunked_attention_with_cache is None:
-            raise RuntimeError(
-                "SGLang chunked local attention is unavailable; install a patched "
-                "SGLang with sglang.jit_kernel.chunked_local_attention"
-            )
-        workspace = self._get_chunked_workspace(
-            batch_size=batch_size,
-            chunk_length=chunk_length,
-            device=q.device,
-            dtype=q.dtype,
-        )
-        out = self._chunked_attention_with_cache(
-            q,
-            k_cur,
-            v_cur,
-            cached_k,
-            cached_v,
-            cached_pos,
-            state.offset,
-            state.exec_mask,
-            workspace,
-            context=int(self.context),
-            flash_attn_varlen_func=self._sglang_flash_attn_varlen_func,
-        )
-        return out.transpose(1, 2).reshape(batch_size, chunk_length, self.embed_dim)
 
     def _update_streaming_cache_in_place(
         self,
