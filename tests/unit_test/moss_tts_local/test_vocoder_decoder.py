@@ -43,7 +43,9 @@ class _FakeAttention(nn.Module):
 
 
 class _FakeStreamingState:
-    pass
+    def __init__(self, batch_size: int = 2) -> None:
+        self.offset = torch.zeros(batch_size, dtype=torch.long)
+        self.exec_mask = torch.ones(batch_size, dtype=torch.bool)
 
 
 class _StreamingAttention(_FakeAttention):
@@ -60,6 +62,78 @@ class _StreamingAttention(_FakeAttention):
         assert state is self._streaming_state
         self.streaming_sdpa_calls += 1
         return x + 2
+
+
+class _StreamingFlashAttention(_FakeAttention):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__(hidden_size)
+        self._streaming_state = _FakeStreamingState()
+        self.cache_updates = 0
+        self.streaming_flash_calls = 0
+
+    def resolve_attention_implementation(
+        self, _: torch.Tensor, *, is_streaming: bool = False
+    ) -> str:
+        assert is_streaming
+        return "flash_attention_2"
+
+    def _forward_streaming_flash(
+        self,
+        _: torch.Tensor,
+        __: _FakeStreamingState,
+    ) -> torch.Tensor:
+        self.streaming_flash_calls += 1
+        raise AssertionError("wrapper should own streaming flash attention")
+
+    def _ensure_streaming_cache(
+        self,
+        state: _FakeStreamingState,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert state is self._streaming_state
+        cache_shape = (batch_size, self.num_heads, self.context, self.head_dim)
+        cached_k = torch.zeros(cache_shape, device=device, dtype=dtype)
+        cached_v = torch.zeros_like(cached_k)
+        cached_pos = torch.full(
+            (batch_size, self.context),
+            -1,
+            device=device,
+            dtype=torch.long,
+        )
+        return cached_k, cached_v, cached_pos
+
+    def _build_streaming_kv(
+        self,
+        cached_k: torch.Tensor,
+        cached_v: torch.Tensor,
+        cached_pos: torch.Tensor,
+        k_cur: torch.Tensor,
+        v_cur: torch.Tensor,
+        pos_q: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.cat([cached_k, k_cur], dim=2),
+            torch.cat([cached_v, v_cur], dim=2),
+            torch.cat([cached_pos, pos_q], dim=1),
+        )
+
+    def _update_streaming_cache(
+        self,
+        state: _FakeStreamingState,
+        cached_k: torch.Tensor,
+        cached_v: torch.Tensor,
+        cached_pos: torch.Tensor,
+        k_all: torch.Tensor,
+        v_all: torch.Tensor,
+        pos_k: torch.Tensor,
+    ) -> None:
+        assert state is self._streaming_state
+        assert cached_k.shape == cached_v.shape
+        assert cached_pos.shape == pos_k[:, : self.context].shape
+        assert k_all.shape == v_all.shape
+        self.cache_updates += 1
 
 
 class _FakeLayer(nn.Module):
@@ -205,6 +279,47 @@ def test_attention_uses_source_streaming_state_when_active() -> None:
 
     assert source.streaming_sdpa_calls == 1
     assert torch.allclose(out, source.out_proj(x + 2))
+
+
+def test_attention_owns_streaming_flash_path() -> None:
+    source = _StreamingFlashAttention(hidden_size=6)
+    wrapper = MossTTSLocalAttention(source)
+    calls: list[tuple[torch.Tensor, torch.Tensor, int, int, tuple[int, int]]] = []
+
+    def fake_flash_attn(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
+        max_q: int,
+        max_k: int,
+        *,
+        causal: bool,
+        window_size: tuple[int, int],
+    ) -> torch.Tensor:
+        assert causal
+        calls.append((cu_q, cu_k, max_q, max_k, window_size))
+        assert k.shape == v.shape
+        return q
+
+    wrapper._attention_kernel = "sglang"
+    wrapper._sglang_flash_attn_varlen_func = fake_flash_attn
+    x = torch.randn(2, 4, 6)
+
+    out = wrapper(x, input_lengths=torch.tensor([4, 4]))
+
+    assert source.streaming_flash_calls == 0
+    assert source.cache_updates == 1
+    assert source._streaming_state.offset.tolist() == [4, 4]
+    assert len(calls) == 1
+    cu_q, cu_k, max_q, max_k, window_size = calls[0]
+    assert cu_q.tolist() == [0, 4, 8]
+    assert cu_k.tolist() == [0, 4, 8]
+    assert max_q == 4
+    assert max_k == 4
+    assert window_size == (source.context, 0)
+    assert out.shape == x.shape
 
 
 def test_transformer_layer_uses_source_modules_for_primitive_ops() -> None:

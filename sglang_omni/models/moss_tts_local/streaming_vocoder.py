@@ -289,7 +289,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             )
         decoder = build_moss_tts_local_vocoder_decoder(self._codec)
         logger.info(
-            "MOSS-TTS Local non-streaming vocoder decoder=owned-pytorch stages=%d",
+            "MOSS-TTS Local non-streaming vocoder decoder=owned stages=%d",
             len(decoder),
         )
         return decoder

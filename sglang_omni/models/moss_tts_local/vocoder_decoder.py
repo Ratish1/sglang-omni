@@ -9,8 +9,10 @@ projected transformer stages, not the codec embeddings or waveform projection.
 
 from __future__ import annotations
 
+import functools
 import importlib
 import logging
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -19,6 +21,32 @@ import torch
 from torch import nn
 
 logger = logging.getLogger(__name__)
+
+_ATTENTION_KERNEL_ENV = "SGLANG_OMNI_MOSS_LOCAL_VOCODER_ATTENTION_KERNEL"
+_ATTENTION_KERNEL_REMOTE = "remote"
+_ATTENTION_KERNEL_SGLANG = "sglang"
+_SUPPORTED_ATTENTION_KERNELS = {_ATTENTION_KERNEL_REMOTE, _ATTENTION_KERNEL_SGLANG}
+
+
+def _attention_kernel_preference() -> str:
+    value = os.environ.get(_ATTENTION_KERNEL_ENV, _ATTENTION_KERNEL_SGLANG)
+    value = value.strip().lower()
+    if value not in _SUPPORTED_ATTENTION_KERNELS:
+        raise ValueError(
+            f"{_ATTENTION_KERNEL_ENV} must be one of "
+            f"{sorted(_SUPPORTED_ATTENTION_KERNELS)}"
+        )
+    return value
+
+
+@functools.lru_cache(maxsize=1)
+def _load_sglang_flash_attn_varlen_func() -> Any | None:
+    try:
+        from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+    except Exception as exc:
+        logger.debug("SGLang flash attention unavailable for MOSS vocoder: %s", exc)
+        return None
+    return flash_attn_varlen_func
 
 
 def _module_list(value: Any) -> list[nn.Module]:
@@ -86,6 +114,8 @@ class MossTTSLocalAttention(nn.Module):
         self._flash_attn_varlen_func = getattr(
             self._remote_module, "flash_attn_varlen_func", None
         )
+        self._attention_kernel = _attention_kernel_preference()
+        self._sglang_flash_attn_varlen_func = _load_sglang_flash_attn_varlen_func()
 
     def forward(
         self,
@@ -107,7 +137,7 @@ class MossTTSLocalAttention(nn.Module):
                     f"streaming attention expects a 3D tensor, got {tuple(query.shape)}"
                 )
             out = (
-                self.source._forward_streaming_flash(query, streaming_state)
+                self._forward_streaming_flash(query, streaming_state)
                 if backend == "flash_attention_2"
                 else self.source._forward_streaming_sdpa(query, streaming_state)
             )
@@ -178,11 +208,38 @@ class MossTTSLocalAttention(nn.Module):
         max_seqlen: int,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        flash_attn_varlen_func = self._flash_attn_varlen_func
-        if flash_attn_varlen_func is None:
-            raise RuntimeError("flash attention is not available for MOSS vocoder")
         q, k, v = self._project_qkv(x)
         q, k = self._apply_packed_rope(q, k, position_ids)
+        out = self._run_flash_attention(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+        )
+        return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
+
+    def _run_flash_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        flash_attn_varlen_func = (
+            self._sglang_flash_attn_varlen_func
+            if self._attention_kernel == _ATTENTION_KERNEL_SGLANG
+            else None
+        )
+        if flash_attn_varlen_func is None:
+            flash_attn_varlen_func = self._flash_attn_varlen_func
+        if flash_attn_varlen_func is None:
+            raise RuntimeError("flash attention is not available for MOSS vocoder")
         window_size = (
             (int(self.context), 0)
             if self.context is not None and self.causal
@@ -192,14 +249,98 @@ class MossTTSLocalAttention(nn.Module):
             q.contiguous(),
             k.contiguous(),
             v.contiguous(),
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
             causal=self.causal,
             window_size=window_size,
         )
-        return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
+        return out
+
+    def _forward_streaming_flash(
+        self,
+        x: torch.Tensor,
+        state: Any,
+    ) -> torch.Tensor:
+        batch_size, chunk_length, _ = x.shape
+        q, k_cur, v_cur = self._project_qkv(x)
+        if self.rope is not None:
+            q, k_cur = self.rope(q, k_cur, state.offset, time_before_heads=False)
+        pos_q = state.offset.view(-1, 1) + torch.arange(
+            chunk_length,
+            device=x.device,
+            dtype=torch.long,
+        ).view(1, -1)
+        cached_k, cached_v, cached_pos = self.source._ensure_streaming_cache(
+            state,
+            batch_size,
+            k_cur.device,
+            k_cur.dtype,
+        )
+        k_all, v_all, pos_k = self.source._build_streaming_kv(
+            cached_k,
+            cached_v,
+            cached_pos,
+            k_cur,
+            v_cur,
+            pos_q,
+        )
+
+        q_chunks = []
+        k_chunks = []
+        v_chunks = []
+        cu_q = [0]
+        cu_k = [0]
+        max_kv_len = 0
+
+        for batch_idx in range(batch_size):
+            valid_k = pos_k[batch_idx] >= 0
+            q_i = q[batch_idx].transpose(0, 1).contiguous()
+            k_i = k_all[batch_idx, :, valid_k, :].transpose(0, 1).contiguous()
+            v_i = v_all[batch_idx, :, valid_k, :].transpose(0, 1).contiguous()
+            q_chunks.append(q_i)
+            k_chunks.append(k_i)
+            v_chunks.append(v_i)
+            cu_q.append(cu_q[-1] + q_i.shape[0])
+            cu_k.append(cu_k[-1] + k_i.shape[0])
+            max_kv_len = max(max_kv_len, int(k_i.shape[0]))
+
+        out_flat = self._run_flash_attention(
+            torch.cat(q_chunks, dim=0),
+            torch.cat(k_chunks, dim=0),
+            torch.cat(v_chunks, dim=0),
+            torch.tensor(cu_q, device=x.device, dtype=torch.int32),
+            torch.tensor(cu_k, device=x.device, dtype=torch.int32),
+            max_seqlen_q=chunk_length,
+            max_seqlen_k=max_kv_len,
+        )
+
+        outputs = []
+        start = 0
+        for _ in range(batch_size):
+            outputs.append(
+                out_flat[start : start + chunk_length].transpose(0, 1).contiguous()
+            )
+            start += chunk_length
+        out = torch.stack(outputs, dim=0)
+        out = out.transpose(1, 2).reshape(batch_size, chunk_length, self.embed_dim)
+
+        self.source._update_streaming_cache(
+            state,
+            cached_k,
+            cached_v,
+            cached_pos,
+            k_all,
+            v_all,
+            pos_k,
+        )
+        state.offset[:] = torch.where(
+            state.exec_mask,
+            state.offset + chunk_length,
+            state.offset,
+        )
+        return out
 
 
 class MossTTSLocalTransformerLayer(nn.Module):
@@ -407,7 +548,7 @@ def install_moss_tts_local_vocoder_decoder(codec: Any) -> nn.Module:
     owned_decoder = MossTTSLocalVocoderDecoder(original_decoder)
     codec.decoder = owned_decoder
     logger.info(
-        "MOSS-TTS Local vocoder decoder=owned-pytorch stages=%d",
+        "MOSS-TTS Local vocoder decoder=owned stages=%d",
         len(owned_decoder),
     )
     return original_decoder
