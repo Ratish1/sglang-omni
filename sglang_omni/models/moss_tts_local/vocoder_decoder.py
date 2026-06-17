@@ -29,7 +29,7 @@ _SUPPORTED_ATTENTION_KERNELS = {_ATTENTION_KERNEL_REMOTE, _ATTENTION_KERNEL_SGLA
 
 
 def _attention_kernel_preference() -> str:
-    value = os.environ.get(_ATTENTION_KERNEL_ENV, _ATTENTION_KERNEL_SGLANG)
+    value = os.environ.get(_ATTENTION_KERNEL_ENV, _ATTENTION_KERNEL_REMOTE)
     value = value.strip().lower()
     if value not in _SUPPORTED_ATTENTION_KERNELS:
         raise ValueError(

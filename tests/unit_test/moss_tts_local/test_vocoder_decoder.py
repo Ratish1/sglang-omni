@@ -322,6 +322,14 @@ def test_attention_owns_streaming_flash_path() -> None:
     assert out.shape == x.shape
 
 
+def test_attention_kernel_defaults_to_remote(monkeypatch) -> None:
+    monkeypatch.delenv("SGLANG_OMNI_MOSS_LOCAL_VOCODER_ATTENTION_KERNEL", raising=False)
+    source = _FakeAttention(hidden_size=6)
+    wrapper = MossTTSLocalAttention(source)
+
+    assert wrapper._attention_kernel == "remote"
+
+
 def test_transformer_layer_uses_source_modules_for_primitive_ops() -> None:
     source = _CountingLayer(hidden_size=6)
     wrapper = MossTTSLocalTransformerLayer(source)
