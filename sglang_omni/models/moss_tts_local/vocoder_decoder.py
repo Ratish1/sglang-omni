@@ -722,11 +722,10 @@ class MossTTSLocalProjectedTransformer(nn.Module):
             batch_size, max_seqlen, _ = x.shape
             if max_seqlen > 0 and bool(input_lengths.any().item()):
                 max_valid_seqlen = int(input_lengths.max().item())
-                pack_mode = (
-                    "single_unpadded"
-                    if batch_size == 1 and max_valid_seqlen == max_seqlen
-                    else "masked"
-                )
+                if batch_size == 1 and max_valid_seqlen == max_seqlen:
+                    pack_mode = "single_unpadded"
+                else:
+                    pack_mode = "masked"
                 with _attention_profile_interval(
                     "projected_pack_padded",
                     metadata={
