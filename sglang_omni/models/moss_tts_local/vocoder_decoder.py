@@ -25,7 +25,12 @@ logger = logging.getLogger(__name__)
 _ATTENTION_KERNEL_ENV = "SGLANG_OMNI_MOSS_LOCAL_VOCODER_ATTENTION_KERNEL"
 _ATTENTION_KERNEL_REMOTE = "remote"
 _ATTENTION_KERNEL_SGLANG = "sglang"
-_SUPPORTED_ATTENTION_KERNELS = {_ATTENTION_KERNEL_REMOTE, _ATTENTION_KERNEL_SGLANG}
+_ATTENTION_KERNEL_SGLANG_WORKSPACE = "sglang-workspace"
+_SUPPORTED_ATTENTION_KERNELS = {
+    _ATTENTION_KERNEL_REMOTE,
+    _ATTENTION_KERNEL_SGLANG,
+    _ATTENTION_KERNEL_SGLANG_WORKSPACE,
+}
 
 
 def _attention_kernel_preference() -> str:
@@ -47,6 +52,22 @@ def _load_sglang_flash_attn_varlen_func() -> Any | None:
         logger.debug("SGLang flash attention unavailable for MOSS vocoder: %s", exc)
         return None
     return flash_attn_varlen_func
+
+
+@functools.lru_cache(maxsize=1)
+def _load_sglang_chunked_local_attention() -> tuple[Any, Any] | None:
+    try:
+        from sglang.jit_kernel.chunked_local_attention import (
+            LocalCausalVarlenWorkspace,
+            local_causal_varlen_attention_with_cache,
+        )
+    except Exception as exc:
+        logger.debug(
+            "SGLang chunked local attention unavailable for MOSS vocoder: %s",
+            exc,
+        )
+        return None
+    return LocalCausalVarlenWorkspace, local_causal_varlen_attention_with_cache
 
 
 def _module_list(value: Any) -> list[nn.Module]:
@@ -116,6 +137,15 @@ class MossTTSLocalAttention(nn.Module):
         )
         self._attention_kernel = _attention_kernel_preference()
         self._sglang_flash_attn_varlen_func = _load_sglang_flash_attn_varlen_func()
+        chunked_attention = _load_sglang_chunked_local_attention()
+        if chunked_attention is None:
+            self._chunked_workspace_cls = None
+            self._chunked_attention_with_cache = None
+        else:
+            self._chunked_workspace_cls = chunked_attention[0]
+            self._chunked_attention_with_cache = chunked_attention[1]
+        self._chunked_workspace_key: tuple[Any, ...] | None = None
+        self._chunked_workspace: Any | None = None
 
     def forward(
         self,
@@ -278,6 +308,21 @@ class MossTTSLocalAttention(nn.Module):
             k_cur.device,
             k_cur.dtype,
         )
+        if (
+            self._attention_kernel == _ATTENTION_KERNEL_SGLANG_WORKSPACE
+            and self.context is not None
+        ):
+            return self._forward_streaming_sglang_workspace(
+                q,
+                k_cur,
+                v_cur,
+                cached_k,
+                cached_v,
+                cached_pos,
+                state,
+                batch_size=batch_size,
+                chunk_length=chunk_length,
+            )
         k_all, v_all, pos_k = self.source._build_streaming_kv(
             cached_k,
             cached_v,
@@ -341,6 +386,82 @@ class MossTTSLocalAttention(nn.Module):
             state.offset,
         )
         return out
+
+    def _get_chunked_workspace(
+        self,
+        *,
+        batch_size: int,
+        chunk_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Any:
+        if self._chunked_workspace_cls is None:
+            raise RuntimeError(
+                "SGLang chunked local attention is unavailable; install a patched "
+                "SGLang with sglang.jit_kernel.chunked_local_attention"
+            )
+        if self.context is None:
+            raise RuntimeError("SGLang chunked local attention requires finite context")
+        key = (
+            batch_size,
+            chunk_length,
+            int(self.context),
+            self.num_heads,
+            self.head_dim,
+            device,
+            dtype,
+        )
+        if self._chunked_workspace_key != key:
+            self._chunked_workspace = self._chunked_workspace_cls.create(
+                max_batch_size=batch_size,
+                max_chunk_len=chunk_length,
+                context=int(self.context),
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                device=device,
+                dtype=dtype,
+            )
+            self._chunked_workspace_key = key
+        return self._chunked_workspace
+
+    def _forward_streaming_sglang_workspace(
+        self,
+        q: torch.Tensor,
+        k_cur: torch.Tensor,
+        v_cur: torch.Tensor,
+        cached_k: torch.Tensor,
+        cached_v: torch.Tensor,
+        cached_pos: torch.Tensor,
+        state: Any,
+        *,
+        batch_size: int,
+        chunk_length: int,
+    ) -> torch.Tensor:
+        if self._chunked_attention_with_cache is None:
+            raise RuntimeError(
+                "SGLang chunked local attention is unavailable; install a patched "
+                "SGLang with sglang.jit_kernel.chunked_local_attention"
+            )
+        workspace = self._get_chunked_workspace(
+            batch_size=batch_size,
+            chunk_length=chunk_length,
+            device=q.device,
+            dtype=q.dtype,
+        )
+        out = self._chunked_attention_with_cache(
+            q,
+            k_cur,
+            v_cur,
+            cached_k,
+            cached_v,
+            cached_pos,
+            state.offset,
+            state.exec_mask,
+            workspace,
+            context=int(self.context),
+            flash_attn_varlen_func=self._sglang_flash_attn_varlen_func,
+        )
+        return out.transpose(1, 2).reshape(batch_size, chunk_length, self.embed_dim)
 
     def _update_streaming_cache_in_place(
         self,
