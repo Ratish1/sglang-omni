@@ -212,7 +212,7 @@ class MossTTSLocalAttention(nn.Module):
             out = (
                 self._forward_streaming_flash(query, streaming_state)
                 if backend == "flash_attention_2"
-                else self.source._forward_streaming_sdpa(query, streaming_state)
+                else self._forward_streaming_sdpa(query, streaming_state)
             )
             return self.out_proj(out)
         if backend == "flash_attention_2":
@@ -224,22 +224,53 @@ class MossTTSLocalAttention(nn.Module):
                 raise ValueError(
                     "packed flash attention requires cu_seqlens, max_seqlen, and position_ids"
                 )
-            return self._forward_packed_flash(
-                query,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                position_ids=position_ids,
-            )
+            with _attention_profile_interval(
+                "packed_flash_path",
+                metadata={
+                    "attention_kernel": self._attention_kernel,
+                    "query_dim": query.dim(),
+                    "query_tokens": int(query.shape[0]),
+                    "max_seqlen": max_seqlen,
+                },
+            ):
+                return self._forward_packed_flash(
+                    query,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    position_ids=position_ids,
+                )
         if query.dim() != 3:
             raise ValueError(
                 f"dense attention expects a 3D tensor, got {tuple(query.shape)}"
             )
         if input_lengths is None:
             raise ValueError("dense attention requires input_lengths")
-        return self.source(
-            query,
-            input_lengths=input_lengths,
-        )
+        with _attention_profile_interval(
+            "dense_source_path",
+            metadata={
+                "attention_kernel": self._attention_kernel,
+                "query_dim": query.dim(),
+                "batch_size": int(query.shape[0]),
+                "max_seqlen": int(query.shape[1]),
+            },
+        ):
+            return self.source(
+                query,
+                input_lengths=input_lengths,
+            )
+
+    def _forward_streaming_sdpa(
+        self, query: torch.Tensor, streaming_state: Any
+    ) -> torch.Tensor:
+        with _attention_profile_interval(
+            "streaming_sdpa_path",
+            metadata={
+                "attention_kernel": self._attention_kernel,
+                "batch_size": int(query.shape[0]),
+                "chunk_length": int(query.shape[1]),
+            },
+        ):
+            return self.source._forward_streaming_sdpa(query, streaming_state)
 
     def _project_qkv(
         self, x: torch.Tensor
@@ -600,19 +631,39 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         input_lengths: torch.Tensor,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.input_proj(x.transpose(1, 2))
-        if (
-            not self.source.is_streaming
-            and self.transformer.resolve_attention_implementation(x)
-            == "flash_attention_2"
+        with _attention_profile_interval(
+            "projected_input_proj",
+            metadata={
+                "batch_size": int(x.shape[0]),
+                "input_channels": int(x.shape[1]),
+                "max_seqlen": int(x.shape[2]),
+                "stage_type": self.source.__class__.__name__,
+            },
         ):
+            x = self.input_proj(x.transpose(1, 2))
+        backend = self.transformer.resolve_attention_implementation(x)
+        if not self.source.is_streaming and backend == "flash_attention_2":
             batch_size, max_seqlen, _ = x.shape
             if max_seqlen > 0 and bool(input_lengths.any().item()):
                 max_valid_seqlen = int(input_lengths.max().item())
-                packed_x, valid_mask, cu_seqlens, position_ids = _pack_padded_sequence(
-                    x,
-                    input_lengths,
-                )
+                with _attention_profile_interval(
+                    "projected_pack_padded",
+                    metadata={
+                        "backend": backend,
+                        "batch_size": batch_size,
+                        "max_seqlen": max_seqlen,
+                        "max_valid_seqlen": max_valid_seqlen,
+                    },
+                ):
+                    (
+                        packed_x,
+                        valid_mask,
+                        cu_seqlens,
+                        position_ids,
+                    ) = _pack_padded_sequence(
+                        x,
+                        input_lengths,
+                    )
                 packed_x = self.transformer(
                     packed_x,
                     cu_seqlens=cu_seqlens,
@@ -621,17 +672,43 @@ class MossTTSLocalProjectedTransformer(nn.Module):
                     input_lengths=input_lengths,
                     **kwargs,
                 )
-                x = _unpack_packed_sequence(
-                    packed_x,
-                    valid_mask,
-                    batch_size,
-                    max_seqlen,
-                )
+                with _attention_profile_interval(
+                    "projected_unpack_padded",
+                    metadata={
+                        "backend": backend,
+                        "batch_size": batch_size,
+                        "max_seqlen": max_seqlen,
+                        "max_valid_seqlen": max_valid_seqlen,
+                    },
+                ):
+                    x = _unpack_packed_sequence(
+                        packed_x,
+                        valid_mask,
+                        batch_size,
+                        max_seqlen,
+                    )
             else:
                 x = x.new_zeros(x.shape)
         else:
-            x = self.transformer(x, input_lengths=input_lengths, **kwargs)
-        return self.output_proj(x).transpose(1, 2), input_lengths
+            with _attention_profile_interval(
+                "projected_dense_path",
+                metadata={
+                    "backend": backend,
+                    "is_streaming": bool(self.source.is_streaming),
+                    "batch_size": int(x.shape[0]),
+                    "max_seqlen": int(x.shape[1]),
+                },
+            ):
+                x = self.transformer(x, input_lengths=input_lengths, **kwargs)
+        with _attention_profile_interval(
+            "projected_output_proj",
+            metadata={
+                "backend": backend,
+                "batch_size": int(x.shape[0]),
+                "max_seqlen": int(x.shape[1]),
+            },
+        ):
+            return self.output_proj(x).transpose(1, 2), input_lengths
 
 
 class MossTTSLocalVocoderDecoder(nn.Module):
