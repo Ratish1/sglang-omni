@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
+    MossTTSLocalAttention,
     MossTTSLocalProjectedTransformer,
     MossTTSLocalTransformerLayer,
     MossTTSLocalVocoderDecoder,
@@ -39,6 +40,26 @@ class _FakeAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, **_: object) -> torch.Tensor:
         return x
+
+
+class _FakeStreamingState:
+    pass
+
+
+class _StreamingAttention(_FakeAttention):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__(hidden_size)
+        self._streaming_state = _FakeStreamingState()
+        self.streaming_sdpa_calls = 0
+
+    def _forward_streaming_sdpa(
+        self,
+        x: torch.Tensor,
+        state: _FakeStreamingState,
+    ) -> torch.Tensor:
+        assert state is self._streaming_state
+        self.streaming_sdpa_calls += 1
+        return x + 2
 
 
 class _FakeLayer(nn.Module):
@@ -161,7 +182,7 @@ def test_projected_transformer_sdpa_path_does_not_reenter_source_stage() -> None
     assert torch.equal(out_lengths, lengths)
 
 
-def test_projected_transformer_delegates_when_source_is_streaming() -> None:
+def test_projected_transformer_streaming_path_does_not_reenter_source_stage() -> None:
     source = _FallbackProjectedStage()
     source.is_streaming = True
     wrapper = MossTTSLocalProjectedTransformer(source)
@@ -170,9 +191,20 @@ def test_projected_transformer_delegates_when_source_is_streaming() -> None:
 
     out, out_lengths = wrapper(x, lengths)
 
-    assert source.seen_input_shape == (2, 3, 4)
-    assert torch.equal(out, x + 10)
-    assert torch.equal(out_lengths, lengths + 1)
+    assert source.seen_input_shape is None
+    assert out.shape == (2, 7, 4)
+    assert torch.equal(out_lengths, lengths)
+
+
+def test_attention_uses_source_streaming_state_when_active() -> None:
+    source = _StreamingAttention(hidden_size=6)
+    wrapper = MossTTSLocalAttention(source)
+    x = torch.randn(2, 4, 6)
+
+    out = wrapper(x, input_lengths=torch.tensor([4, 4]))
+
+    assert source.streaming_sdpa_calls == 1
+    assert torch.allclose(out, source.out_proj(x + 2))
 
 
 def test_transformer_layer_uses_source_modules_for_primitive_ops() -> None:

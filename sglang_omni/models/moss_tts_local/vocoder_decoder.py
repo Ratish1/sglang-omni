@@ -96,10 +96,22 @@ class MossTTSLocalAttention(nn.Module):
         position_ids: torch.Tensor | None = None,
         input_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        streaming_state = getattr(self.source, "_streaming_state", None)
         backend = self.source.resolve_attention_implementation(
             query,
-            is_streaming=False,
+            is_streaming=streaming_state is not None,
         )
+        if streaming_state is not None:
+            if query.dim() != 3:
+                raise ValueError(
+                    f"streaming attention expects a 3D tensor, got {tuple(query.shape)}"
+                )
+            out = (
+                self.source._forward_streaming_flash(query, streaming_state)
+                if backend == "flash_attention_2"
+                else self.source._forward_streaming_sdpa(query, streaming_state)
+            )
+            return self.out_proj(out)
         if backend == "flash_attention_2":
             if query.dim() != 2:
                 raise ValueError(
@@ -245,13 +257,21 @@ class MossTTSLocalTransformer(nn.Module):
         return self.source.resolve_attention_implementation(x)
 
     def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        streaming_state = getattr(self.source, "_streaming_state", None)
         if self.positional_embedding in {"sin", "sin_rope"}:
             if self._create_sin_embedding is None:
                 raise RuntimeError(
                     "MOSS vocoder transformer cannot create sin embeddings"
                 )
             if x.dim() == 3:
-                positions = torch.arange(x.shape[1], device=x.device).view(1, -1)
+                offsets = (
+                    streaming_state.offsets
+                    if streaming_state is not None
+                    else torch.zeros(1, dtype=torch.long, device=x.device)
+                )
+                positions = torch.arange(x.shape[1], device=x.device).view(
+                    1, -1
+                ) + offsets.view(-1, 1)
             else:
                 positions = kwargs.get("position_ids")
                 if positions is None:
@@ -267,6 +287,12 @@ class MossTTSLocalTransformer(nn.Module):
             x = x + self.positional_scale * pos_emb
         for layer in self.layers:
             x = layer(x, **kwargs)
+        if streaming_state is not None and x.dim() == 3:
+            streaming_state.offsets[:] = torch.where(
+                streaming_state.exec_mask,
+                streaming_state.offsets + x.shape[1],
+                streaming_state.offsets,
+            )
         return x
 
 
@@ -289,11 +315,12 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         input_lengths: torch.Tensor,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.is_streaming or bool(getattr(self.source, "is_streaming", False)):
-            return self.source(x, input_lengths, **kwargs)
-
         x = self.input_proj(x.transpose(1, 2))
-        if self.transformer.resolve_attention_implementation(x) == "flash_attention_2":
+        if (
+            not self.source.is_streaming
+            and self.transformer.resolve_attention_implementation(x)
+            == "flash_attention_2"
+        ):
             batch_size, max_seqlen, _ = x.shape
             if max_seqlen > 0 and bool(input_lengths.any().item()):
                 max_valid_seqlen = int(input_lengths.max().item())
