@@ -11,7 +11,7 @@ import torch
 from sglang_omni.profiler.ranges import torch_profile_range
 
 NONSTREAM_VOCODER_BACKEND_ENV = "MOSS_TTS_LOCAL_NONSTREAM_VOCODER_BACKEND"
-_SUPPORTED_BACKENDS = frozenset({"processor", "session"})
+_SUPPORTED_BACKENDS = frozenset({"processor", "session", "sglang"})
 
 
 class NonStreamingVocoderBackend(Protocol):
@@ -87,10 +87,26 @@ class SessionDecodeBackend:
             return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]
 
 
+class SGLangCodecDecodeBackend:
+    """Future SGLang-native codec decoder backend."""
+
+    name = "sglang"
+
+    def decode_rows(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
+        del codes_list
+        raise NotImplementedError(
+            "MOSS-TTS Local native SGLang codec decoder execution is not "
+            "implemented yet. The 'sglang' non-streaming vocoder backend is "
+            "accepted only as an explicit fail-closed selection while the "
+            "codec decoder contract is validated."
+        )
+
+
 __all__ = [
     "NONSTREAM_VOCODER_BACKEND_ENV",
     "NonStreamingVocoderBackend",
     "ProcessorDecodeBackend",
+    "SGLangCodecDecodeBackend",
     "SessionDecodeBackend",
     "resolve_nonstream_vocoder_backend",
 ]

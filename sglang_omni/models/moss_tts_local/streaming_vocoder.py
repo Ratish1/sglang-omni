@@ -27,6 +27,7 @@ from sglang_omni.models.moss_tts_local.vocoder_backends import (
     NonStreamingVocoderBackend,
     ProcessorDecodeBackend,
     SessionDecodeBackend,
+    SGLangCodecDecodeBackend,
     resolve_nonstream_vocoder_backend,
 )
 from sglang_omni.models.tts_streaming import (
@@ -285,9 +286,11 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             n_vq=self._n_vq,
             max_step_frames=self._max_step_frames,
         )
+        self._sglang_decode_backend = SGLangCodecDecodeBackend()
         logger.info(
             "MOSS-TTS Local non-streaming vocoder backend=%s "
-            "(session fallback when a streaming session is already open)",
+            "(processor backend uses session fallback when a streaming session is "
+            "already open)",
             self._configured_nonstream_backend,
         )
 
@@ -625,6 +628,8 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             return self._select_nonstream_backend().decode_rows(codes_list)
 
     def _select_nonstream_backend(self) -> NonStreamingVocoderBackend:
+        if self._configured_nonstream_backend == "sglang":
+            return self._sglang_decode_backend
         if self._configured_nonstream_backend == "session":
             return self._session_decode_backend
         if self._session is not None:

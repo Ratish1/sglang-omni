@@ -714,10 +714,34 @@ def test_resolve_nonstream_backend_env(monkeypatch) -> None:
     assert resolve_nonstream_vocoder_backend() == "processor"
     monkeypatch.setenv(NONSTREAM_VOCODER_BACKEND_ENV, " SESSION ")
     assert resolve_nonstream_vocoder_backend() == "session"
+    monkeypatch.setenv(NONSTREAM_VOCODER_BACKEND_ENV, " SGLANG ")
+    assert resolve_nonstream_vocoder_backend() == "sglang"
     monkeypatch.setenv(NONSTREAM_VOCODER_BACKEND_ENV, " ")
     assert resolve_nonstream_vocoder_backend() == "processor"
     with pytest.raises(ValueError, match="expected one of"):
-        resolve_nonstream_vocoder_backend("sglang")
+        resolve_nonstream_vocoder_backend("bogus")
+
+
+def test_explicit_sglang_backend_fails_closed_at_decode_time(monkeypatch) -> None:
+    del monkeypatch
+    processor = FakeProcessor()
+    scheduler = MossTTSLocalStreamingVocoderScheduler(
+        processor,
+        nonstream_vocoder_backend="sglang",
+    )
+    rows = _rows(3, seed=65)
+    state = MossTTSLocalState(text="x", audio_codes=rows[:, 1:].clone())
+    payload = StagePayload(
+        request_id="r",
+        request=OmniRequest(inputs="", params={}),
+        data=state.to_dict(),
+    )
+
+    assert scheduler._select_nonstream_backend().name == "sglang"
+    with pytest.raises(NotImplementedError, match="native SGLang codec decoder"):
+        scheduler._vocode_batch([payload])
+    assert processor.decode_calls == 0
+    assert scheduler._session is None
 
 
 def test_nonstream_backend_startup_log_is_not_per_request(monkeypatch, caplog) -> None:
