@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
+import sglang_omni.models.moss_tts_local.vocoder_decoder as vocoder_decoder
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
     MossTTSLocalAttention,
     MossTTSLocalProjectedTransformer,
@@ -306,6 +307,55 @@ def test_projected_transformer_uses_sglang_flash_fallback() -> None:
     assert max_k == 4
     assert window_size == (source.transformer.layers[0].self_attn.context, 0)
     assert out.shape == (2, 7, 4)
+    assert torch.equal(out_lengths, lengths)
+
+
+def test_projected_transformer_uses_single_unpadded_pack_fast_path(
+    monkeypatch,
+) -> None:
+    source = _FallbackProjectedStage()
+    source.transformer.layers[0].self_attn.attention_implementation = (
+        "flash_attention_2"
+    )
+    wrapper = MossTTSLocalProjectedTransformer(source)
+    attn = wrapper.transformer.layers[0].self_attn
+    attn._attention_kernel = "sglang"
+    attn._supports_sglang_flash_attention = lambda _: True  # type: ignore[method-assign]
+    calls = []
+
+    def fail_masked_pack(_: torch.Tensor, __: torch.Tensor) -> None:
+        raise AssertionError("single unpadded input should not use masked pack")
+
+    def fake_flash_attn(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
+        max_q: int,
+        max_k: int,
+        *,
+        causal: bool,
+        window_size: tuple[int, int],
+    ) -> torch.Tensor:
+        calls.append((q.shape, cu_q.clone(), cu_k.clone(), max_q, max_k))
+        return q
+
+    monkeypatch.setattr(vocoder_decoder, "_pack_padded_sequence", fail_masked_pack)
+    attn._sglang_flash_attn_varlen_func = fake_flash_attn
+    x = torch.randn(1, 3, 4)
+    lengths = torch.tensor([4])
+
+    out, out_lengths = wrapper(x, lengths)
+
+    assert len(calls) == 1
+    q_shape, cu_q, cu_k, max_q, max_k = calls[0]
+    assert q_shape[0] == 4
+    assert cu_q.tolist() == [0, 4]
+    assert cu_k.tolist() == [0, 4]
+    assert max_q == 4
+    assert max_k == 4
+    assert out.shape == (1, 7, 4)
     assert torch.equal(out_lengths, lengths)
 
 

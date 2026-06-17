@@ -147,6 +147,16 @@ def _pack_padded_sequence(
     return packed_x, valid_mask, cu_seqlens, position_ids
 
 
+def _pack_single_unpadded_sequence(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _, max_seqlen, _ = x.shape
+    packed_x = x.reshape(max_seqlen, x.shape[-1])
+    cu_seqlens = torch.tensor([0, max_seqlen], dtype=torch.int32, device=x.device)
+    position_ids = torch.arange(max_seqlen, device=x.device, dtype=torch.long)
+    return packed_x, cu_seqlens, position_ids
+
+
 def _unpack_packed_sequence(
     packed_x: torch.Tensor,
     valid_mask: torch.Tensor,
@@ -156,6 +166,12 @@ def _unpack_packed_sequence(
     x = packed_x.new_zeros(batch_size, max_seqlen, packed_x.shape[-1])
     x[valid_mask] = packed_x
     return x
+
+
+def _unpack_single_unpadded_sequence(
+    packed_x: torch.Tensor,
+) -> torch.Tensor:
+    return packed_x.reshape(1, packed_x.shape[0], packed_x.shape[-1])
 
 
 class MossTTSLocalAttention(nn.Module):
@@ -706,6 +722,11 @@ class MossTTSLocalProjectedTransformer(nn.Module):
             batch_size, max_seqlen, _ = x.shape
             if max_seqlen > 0 and bool(input_lengths.any().item()):
                 max_valid_seqlen = int(input_lengths.max().item())
+                pack_mode = (
+                    "single_unpadded"
+                    if batch_size == 1 and max_valid_seqlen == max_seqlen
+                    else "masked"
+                )
                 with _attention_profile_interval(
                     "projected_pack_padded",
                     metadata={
@@ -713,17 +734,24 @@ class MossTTSLocalProjectedTransformer(nn.Module):
                         "batch_size": batch_size,
                         "max_seqlen": max_seqlen,
                         "max_valid_seqlen": max_valid_seqlen,
+                        "pack_mode": pack_mode,
                     },
                 ):
-                    (
-                        packed_x,
-                        valid_mask,
-                        cu_seqlens,
-                        position_ids,
-                    ) = _pack_padded_sequence(
-                        x,
-                        input_lengths,
-                    )
+                    if pack_mode == "single_unpadded":
+                        packed_x, cu_seqlens, position_ids = (
+                            _pack_single_unpadded_sequence(x)
+                        )
+                        valid_mask = None
+                    else:
+                        (
+                            packed_x,
+                            valid_mask,
+                            cu_seqlens,
+                            position_ids,
+                        ) = _pack_padded_sequence(
+                            x,
+                            input_lengths,
+                        )
                 packed_x = self.transformer(
                     packed_x,
                     cu_seqlens=cu_seqlens,
@@ -739,14 +767,18 @@ class MossTTSLocalProjectedTransformer(nn.Module):
                         "batch_size": batch_size,
                         "max_seqlen": max_seqlen,
                         "max_valid_seqlen": max_valid_seqlen,
+                        "pack_mode": pack_mode,
                     },
                 ):
-                    x = _unpack_packed_sequence(
-                        packed_x,
-                        valid_mask,
-                        batch_size,
-                        max_seqlen,
-                    )
+                    if valid_mask is None:
+                        x = _unpack_single_unpadded_sequence(packed_x)
+                    else:
+                        x = _unpack_packed_sequence(
+                            packed_x,
+                            valid_mask,
+                            batch_size,
+                            max_seqlen,
+                        )
             else:
                 x = x.new_zeros(x.shape)
         else:
