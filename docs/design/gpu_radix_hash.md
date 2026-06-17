@@ -23,7 +23,7 @@ That host sync blocks CUDA-graph capture and the async-decode lookahead
 ## Approach
 
 `sglang_omni/models/moss_tts_local/radix_hash.py` computes the generated-row key
-with a fixed-coefficient polynomial (Horner) hash:
+entirely in int64 torch ops -- a fixed-coefficient polynomial (Horner) hash:
 
 ```
 acc = 0
@@ -37,11 +37,6 @@ key = audio_end_id                              # EOS rows (torch.where)
 * `HASH_SPACE = 151643` -- `<|endoftext|>` opens the special/control id band.
   Continuing keys fold strictly below it; EOS rows keep the raw `audio_end` id
   (in the band) so `Req._check_vocab_boundary_finish` still fires eos.
-* The torch implementation is the reference path. When Triton is available on
-  CUDA, the generated-row path uses a fused one-kernel implementation of the
-  same recurrence to avoid the many tiny `remainder`/`where`/copy kernels in the
-  per-frame post-forward tail. Set `MOSS_TTS_LOCAL_FUSED_RADIX_HASH=0` to force
-  the torch reference implementation.
 
 The prompt path is **unchanged**: `build_row_cache_key_ids` (blake2b) stays for
 prompt preprocessing. Only `model_runner._row_radix_token_ids`'s generated-row
@@ -50,13 +45,12 @@ is not on the decode hot path and never enters a capture region.
 
 ## Capture-safety argument
 
-The hash uses only device int64 ops (`mul`, `add`, `remainder`, `where`) over a
-**static** channel count, on the input tensor's device. There is no `.cpu()`,
-`.item()`, `.tolist()`, numpy round-trip, data-dependent control flow, or
-dynamic shape. The torch reference path unrolls into a fixed op sequence at
-trace/capture time; the Triton path fuses the same static loop into one launch.
-Therefore the function introduces no host sync and is CUDA-graph capturable /
-async-decode safe once the fused kernel is compiled.
+The hash uses only elementwise int64 ops (`mul`, `add`, `remainder`,
+`where`) over a **static** channel count, on the input tensor's device. There is
+no `.cpu()`, `.item()`, `.tolist()`, numpy round-trip, data-dependent control
+flow, or dynamic shape. The Python `for` over `range(13)` unrolls into a fixed
+op sequence at trace/capture time. Therefore the function introduces no host
+sync and is CUDA-graph capturable / async-decode safe.
 
 ### No int64 overflow
 
@@ -100,8 +94,6 @@ layers:
 2. **Key layer (algorithm properties).** Determinism, collision behaviour, EOS
    preservation, output domain, and dtype/device-follow are covered as CPU unit
    tests in `tests/unit_test/moss_tts_local/test_radix_hash.py` (green on CPU).
-   The same file also includes CUDA-only fused-vs-reference parity tests,
-   including non-contiguous `rows` and `next_text` views.
 
 The output layer is the behaviour-neutrality guarantee; the key layer pins the
 hash's own contract independent of any GPU run.
