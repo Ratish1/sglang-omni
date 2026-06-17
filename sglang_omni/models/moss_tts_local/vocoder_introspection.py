@@ -251,6 +251,9 @@ def summarize_projected_transformer(stage: Any, *, stage_index: int) -> dict[str
     layers = _module_list(getattr(transformer, "layers", None)) if transformer else []
     first_layer = layers[0] if layers else None
     first_attn = _first_attr(first_layer, "self_attn", "attn") if first_layer else None
+    first_attn_summary = (
+        summarize_attention(first_attn) if first_attn is not None else None
+    )
     input_proj = getattr(stage, "input_proj", None)
     output_proj = getattr(stage, "output_proj", None)
     first_ffn = _first_attr(first_layer, "ffn", "mlp") if first_layer else None
@@ -276,16 +279,8 @@ def summarize_projected_transformer(stage: Any, *, stage_index: int) -> dict[str
             else None
         ),
         "layers": len(layers),
-        "heads": (
-            _maybe_int(_first_attr(first_attn, "num_heads", "n_heads"))
-            if first_attn is not None
-            else None
-        ),
-        "head_dim": (
-            _maybe_int(_first_attr(first_attn, "head_dim", "head_size"))
-            if first_attn is not None
-            else None
-        ),
+        "heads": first_attn_summary.get("num_heads") if first_attn_summary else None,
+        "head_dim": first_attn_summary.get("head_dim") if first_attn_summary else None,
         "ffn": _maybe_int(
             getattr(ffn_modules[0], "out_features", None) if ffn_modules else None
         ),

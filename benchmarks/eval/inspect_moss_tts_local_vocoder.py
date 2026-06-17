@@ -68,6 +68,36 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _cuda_sdp_settings() -> dict[str, bool | None]:
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    if cuda_backend is None:
+        return {
+            "cudnn_sdp": None,
+            "flash_sdp": None,
+            "math_sdp": None,
+            "mem_efficient_sdp": None,
+        }
+
+    def _enabled(name: str) -> bool | None:
+        fn = getattr(cuda_backend, name, None)
+        return bool(fn()) if callable(fn) else None
+
+    return {
+        "cudnn_sdp": _enabled("cudnn_sdp_enabled"),
+        "flash_sdp": _enabled("flash_sdp_enabled"),
+        "math_sdp": _enabled("math_sdp_enabled"),
+        "mem_efficient_sdp": _enabled("mem_efficient_sdp_enabled"),
+    }
+
+
+def _disable_cudnn_sdp() -> None:
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    fn = getattr(cuda_backend, "enable_cudnn_sdp", None)
+    if not callable(fn):
+        raise RuntimeError("this PyTorch build does not expose enable_cudnn_sdp")
+    fn(False)
+
+
 def _audio_vocab_size(processor: Any) -> int:
     for owner in (
         getattr(processor, "model_config", None),
@@ -263,6 +293,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         f"- schema: `{report['schema']}`",
         f"- model: `{report['model_path']}`",
         f"- device: `{report['device']}`",
+        f"- cuda sdp: `{report['torch_backends']['cuda_sdp']}`",
         "",
         "## Decoder",
         "",
@@ -339,6 +370,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-step-frames", type=int, default=100)
+    parser.add_argument(
+        "--disable-cudnn-sdp",
+        action="store_true",
+        help="disable torch.backends.cuda cuDNN SDPA before loading/probing",
+    )
     parser.add_argument("--skip-probes", action="store_true")
     parser.add_argument("--no-markdown", action="store_true")
     return parser
@@ -354,6 +390,9 @@ def main() -> None:
         raise SystemExit("--iterations must be >= 1")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.disable_cudnn_sdp:
+        logger.info("Disabling torch.backends.cuda cuDNN SDPA")
+        _disable_cudnn_sdp()
 
     logger.info("Loading MOSS-TTS Local processor for %s", args.model)
     processor = _load_moss_tts_local_processor(args.model, device=args.device)
@@ -362,6 +401,7 @@ def main() -> None:
         "schema": "moss_tts_local_vocoder_phase0_report_v1",
         "model_path": args.model,
         "device": str(device),
+        "torch_backends": {"cuda_sdp": _cuda_sdp_settings()},
         "introspection": summarize_moss_tts_local_vocoder(processor),
         "decode_probes": [],
     }
