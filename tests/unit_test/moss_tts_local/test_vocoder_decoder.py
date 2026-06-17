@@ -46,6 +46,9 @@ class _FakeStreamingState:
     def __init__(self, batch_size: int = 2) -> None:
         self.offset = torch.zeros(batch_size, dtype=torch.long)
         self.exec_mask = torch.ones(batch_size, dtype=torch.bool)
+        self.cached_keys: torch.Tensor | None = None
+        self.cached_values: torch.Tensor | None = None
+        self.cached_positions: torch.Tensor | None = None
 
 
 class _StreamingAttention(_FakeAttention):
@@ -94,15 +97,18 @@ class _StreamingFlashAttention(_FakeAttention):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert state is self._streaming_state
         cache_shape = (batch_size, self.num_heads, self.context, self.head_dim)
-        cached_k = torch.zeros(cache_shape, device=device, dtype=dtype)
-        cached_v = torch.zeros_like(cached_k)
-        cached_pos = torch.full(
-            (batch_size, self.context),
-            -1,
-            device=device,
-            dtype=torch.long,
-        )
-        return cached_k, cached_v, cached_pos
+        if state.cached_keys is None:
+            state.cached_keys = torch.zeros(cache_shape, device=device, dtype=dtype)
+            state.cached_values = torch.zeros_like(state.cached_keys)
+            state.cached_positions = torch.full(
+                (batch_size, self.context),
+                -1,
+                device=device,
+                dtype=torch.long,
+            )
+        assert state.cached_values is not None
+        assert state.cached_positions is not None
+        return state.cached_keys, state.cached_values, state.cached_positions
 
     def _build_streaming_kv(
         self,
@@ -129,11 +135,8 @@ class _StreamingFlashAttention(_FakeAttention):
         v_all: torch.Tensor,
         pos_k: torch.Tensor,
     ) -> None:
-        assert state is self._streaming_state
-        assert cached_k.shape == cached_v.shape
-        assert cached_pos.shape == pos_k[:, : self.context].shape
-        assert k_all.shape == v_all.shape
         self.cache_updates += 1
+        raise AssertionError("wrapper should own streaming cache update")
 
 
 class _FakeLayer(nn.Module):
@@ -310,8 +313,13 @@ def test_attention_owns_streaming_flash_path() -> None:
     out = wrapper(x, input_lengths=torch.tensor([4, 4]))
 
     assert source.streaming_flash_calls == 0
-    assert source.cache_updates == 1
+    assert source.cache_updates == 0
     assert source._streaming_state.offset.tolist() == [4, 4]
+    assert source._streaming_state.cached_positions is not None
+    assert source._streaming_state.cached_positions.tolist() == [
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
+    ]
     assert len(calls) == 1
     cu_q, cu_k, max_q, max_k, window_size = calls[0]
     assert cu_q.tolist() == [0, 4, 8]
@@ -320,6 +328,53 @@ def test_attention_owns_streaming_flash_path() -> None:
     assert max_k == 4
     assert window_size == (source.context, 0)
     assert out.shape == x.shape
+
+
+def test_attention_streaming_flash_cache_update_preserves_storage() -> None:
+    source = _StreamingFlashAttention(hidden_size=6)
+    wrapper = MossTTSLocalAttention(source)
+
+    def fake_flash_attn(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
+        max_q: int,
+        max_k: int,
+        *,
+        causal: bool,
+        window_size: tuple[int, int],
+    ) -> torch.Tensor:
+        return q
+
+    wrapper._attention_kernel = "sglang"
+    wrapper._sglang_flash_attn_varlen_func = fake_flash_attn
+    x = torch.randn(2, 4, 6)
+
+    _ = wrapper(x, input_lengths=torch.tensor([4, 4]))
+    state = source._streaming_state
+    assert state.cached_keys is not None
+    assert state.cached_values is not None
+    assert state.cached_positions is not None
+    keys_ptr = state.cached_keys.data_ptr()
+    values_ptr = state.cached_values.data_ptr()
+    positions_ptr = state.cached_positions.data_ptr()
+
+    state.exec_mask = torch.tensor([True, False])
+    _ = wrapper(x, input_lengths=torch.tensor([4, 4]))
+
+    assert state.cached_keys is not None
+    assert state.cached_values is not None
+    assert state.cached_positions is not None
+    assert state.cached_keys.data_ptr() == keys_ptr
+    assert state.cached_values.data_ptr() == values_ptr
+    assert state.cached_positions.data_ptr() == positions_ptr
+    assert state.offset.tolist() == [8, 4]
+    assert state.cached_positions.tolist() == [
+        [4, 5, 6, 7],
+        [0, 1, 2, 3],
+    ]
 
 
 def test_attention_kernel_defaults_to_remote(monkeypatch) -> None:

@@ -1,518 +1,474 @@
-# MOSS-TTS Local SGLang-Backed Vocoder Transformer Plan
+# MOSS-TTS Local SGLang Vocoder Attention Plan
 
 ## Objective
 
-Improve non-streaming MOSS-TTS Local generation speed by replacing the pure
-PyTorch transformer work inside the vocoder decoder with mechanically equivalent
-SGLang-backed modules and kernels.
+Optimize MOSS-TTS Local non-streaming vocoder throughput by patching SGLang with
+a reusable helper for the MOSS vocoder's small-batch, chunked, local-causal
+attention pattern, then integrating that helper into `sglang-omni` without
+changing waveform semantics.
 
-This is not a new public vocoder backend abstraction. The serving boundary stays
-the current MOSS-TTS Local vocoder stage:
+The target is not another model-local function pointer swap. The target is to
+move the repeated MOSS attention packing, cumulative-length creation, unpacking,
+and cache update mechanics into a SGLang-owned workspace/helper that keeps
+storage stable and removes hot-path Python/list/allocation overhead.
 
-```text
-tts_engine audio codes
-  -> MossTTSLocalStreamingVocoderScheduler
-  -> processor/audio_tokenizer decode path
-  -> waveform response
-```
+Success criteria:
 
-The patch target is the decoder transformer internals below that boundary. The
-first success condition is exact or tightly bounded waveform parity against the
-current processor decode path. Performance changes only count after parity and
-zero failed benchmark requests are established.
+- MOSS vocoder waveform parity stays exact: `max_abs_delta == 0` against the
+  current processor decode path on the real model.
+- Full SeedTTS 1088 generate-only run completes with `failed == 0`.
+- Performance improves over the current remote-attention baseline, not just over
+  the invalidated SGLang-kernel import experiment.
+- The SGLang patch is generic enough to live in SGLang `jit_kernel` code, while
+  MOSS-specific traversal and RoPE/session wiring stays in `sglang-omni`.
 
 ## Current Evidence
 
-### Runtime boundary in sglang-omni
+Decision-relevant files read:
 
-Files read:
-
+- `sglang_omni/models/moss_tts_local/vocoder_decoder.py`
+  - Owns the current MOSS decoder wrapper.
+  - `_forward_streaming_flash()` still builds Python lists, cats Q/K/V,
+    constructs fresh `torch.tensor(cu_q/cu_k)`, unpacks through Python lists,
+    then delegates cache updates to the remote module.
 - `sglang_omni/models/moss_tts_local/streaming_vocoder.py`
-- `sglang_omni/models/moss_tts_local/stages.py`
-- `sglang_omni/models/fishaudio_s2_pro/sglang_model.py`
-- `sglang_omni/vendor/sglang/layers.py`
+  - Owns non-streaming and streaming vocoder request execution.
+  - Non-streaming with the owned decoder still calls
+    `processor.decode_audio_codes(...)`, temporarily replacing `codec.decoder`.
+  - The processor decode path internally drives chunked codec decode, so the
+    "non-streaming" benchmark still exercises streaming-style codec state.
+- MOSS remote tokenizer source:
+  - `MossAudioTokenizerMultiheadAttention._forward_streaming_flash()` has the
+    same list/pack/cat/cu-tensor shape as our wrapper.
+  - `_update_streaming_cache()` preserves semantics by committing cache and
+    offsets only under `exec_mask`.
+- `/Users/ratish/sglang/python/sglang/jit_kernel/flash_attention.py`
+  - Exposes `flash_attn_varlen_func` and `flash_attn_with_kvcache`.
+  - `flash_attn_with_kvcache` can update KV in-place, but its fused append
+    semantics do not directly match MOSS `exec_mask` commit semantics.
+- `/Users/ratish/sglang/python/sglang/jit_kernel/flash_attention_v3.py`
+  - SGLang FA3 path loads kernels-community or `sgl_kernel` kernels.
+  - Varlen has fallback behavior; kvcache path is stricter and should remain
+    guarded.
+- `/Users/ratish/sglang/python/sglang/srt/layers/attention/vision.py`
+  - Useful precedent for shape-cached `cu_seqlens` and max-seqlen resolution.
+  - Not a drop-in MOSS implementation.
+- `/Users/ratish/sglang/python/sglang/srt/layers/radix_attention.py`
+  - Coupled to `ForwardBatch`, SGLang attention backend state, and KV pools.
+  - Not the right first target for an audio-tokenizer decoder called inside
+    `sglang-omni`.
+- `/Users/ratish/sglang/python/sglang/srt/layers/attention/flashinfer_backend.py`
+  and `triton_backend.py`
+  - Their speed comes from planned request/token metadata, cache locations, and
+    paged or sliding-window KV pools. The useful lesson is stable metadata and
+    preallocated state, not forcing the vocoder into `ForwardBatch`.
+- `vocoder.json`
+  - Confirms six transformer decoder stages, 92 transformer layers total,
+    LayerNorm, GELU, RoPE/sin positional logic, and local-causal attention
+    contexts.
 
-Current behavior:
+Measured state:
 
-- `create_vocoder_executor(...)` loads the MOSS processor, moves
-  `processor.audio_tokenizer` to the vocoder GPU, and constructs
-  `MossTTSLocalStreamingVocoderScheduler`.
-- The vocoder scheduler owns request aggregation, decode events, audio format
-  conversion, and the final response payload.
-- Non-streaming decode currently uses `_decode_codes_rows(...)`.
-  - If no streaming session exists, it calls
-    `processor.decode_audio_codes(codes_list)` directly.
-  - If a streaming session exists, it uses `_CodecStreamSession.decode_offline`
-    under the session state lock.
-- Streaming decode remains tied to `codec.streaming(batch_size)` state and slot
-  management. This plan does not change streaming behavior.
+| case | completed | failed | qps | rtf mean | latency mean | output tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| processor baseline | 1088 | 0 | 4.925 | 0.3881 | 1.622 | 271.0 |
+| owned + SGLang varlen import | 1088 | 0 | 4.864 | 0.3923 | 1.642 | 267.6 |
+| owned + remote varlen | 1088 | 0 | 4.963 | 0.3845 | 1.609 | 273.1 |
 
-### Codec decoder shape
+Interpretation:
 
-Files read:
+- The owned decoder is parity-clean.
+- The SGLang varlen function import is not the optimization. It preserves the
+  remote PyTorch control-flow bottleneck.
+- A real SGLang patch must remove repeated Python packing/allocation and make
+  cache/workspace storage stable.
 
-- `local_codec.json`
-- `local_codec_b8.json`
-- `digest.json`
-
-The decoder is a staged audio decoder, not one ordinary LLM block:
-
-| stage | type | input | hidden | output | layers | heads | head dim | context |
-|---:|---|---:|---:|---:|---:|---:|---:|---:|
-| 0 | Transformer | 768 | 1280 | 1280 | 32 | 20 | 64 | 10.0 |
-| 1 | PatchedPretransform | - | - | - | - | - | - | patch 2 |
-| 2 | Transformer | 640 | 768 | 768 | 12 | 12 | 64 | 10.0 |
-| 3 | PatchedPretransform | - | - | - | - | - | - | patch 2 |
-| 4 | Transformer | 384 | 768 | 768 | 12 | 12 | 64 | 8.0 |
-| 5 | PatchedPretransform | - | - | - | - | - | - | patch 2 |
-| 6 | Transformer | 384 | 768 | 768 | 12 | 12 | 64 | 4.0 |
-| 7 | PatchedPretransform | - | - | - | - | - | - | patch 2 |
-| 8 | Transformer | 384 | 768 | 768 | 12 | 12 | 64 | 2.0 |
-| 9 | PatchedPretransform | - | - | - | - | - | - | patch 2 |
-| 10 | Transformer | 384 | 768 | 240 | 12 | 12 | 64 | 1.0 |
-| 11 | PatchedPretransform | - | - | - | - | - | - | patch 240 |
-
-Totals:
-
-- 12 decoder stages
-- 6 projected transformer stages
-- 6 reshape-only patch stages
-- 92 transformer layers
-- LayerNorm, not RMSNorm
-- plain GELU FFN, not gated GEGLU/SwiGLU
-- RoPE positional encoding
-- local causal attention windows from the stage `context_duration`
-
-Important remote-module semantics:
-
-- `MossAudioTokenizerProjectedTransformer.forward(...)` transposes
-  `(B, D, T) -> (B, T, D)`, applies input projection, packs padded sequences
-  for flash attention, runs the transformer, unpacks, applies output
-  projection, then transposes back.
-- That path includes per-stage Python synchronizations:
-  `input_lengths.any().item()` and `input_lengths.max().item()`.
-- `MossAudioTokenizerTransformerLayer.forward(...)` is:
-  - LayerNorm
-  - self-attention
-  - learned layer scale on attention output
-  - residual add
-  - LayerNorm
-  - `Linear -> GELU -> Linear`
-  - learned layer scale on FFN output
-  - residual add
-- `MossAudioTokenizerMultiheadAttention._forward_non_streaming_flash(...)`:
-  - projects packed QKV
-  - applies packed RoPE using `position_ids`
-  - calls flash attention with packed sequence metadata
-  - reshapes back to packed hidden dimension
-- `MossAudioTokenizerPatchedPretransform.decode(...)` is reshape/permutation:
-  `(B, D*patch, L) -> (B, D, L*patch)`.
-
-### Probe results
-
-Current processor decode and offline session decode are numerically identical in
-the captured probes, but the offline session wrapper is not a performance win:
-
-| batch | frames | processor mean ms | session mean ms | max abs delta |
-|---:|---:|---:|---:|---:|
-| 1 | 25 | 79.717 | 111.375 | 0.0 |
-| 1 | 100 | 100.260 | 108.663 | 0.0 |
-| 1 | 300 | 269.980 | 284.825 | 0.0 |
-| 8 | 100 | 158.213 | 194.695 | 0.0 |
-| 8 | 300 | 486.572 | 484.792 | 0.0 |
-
-The streaming-session offline lane is therefore useful as a parity reference,
-not as the optimization target.
-
-### Invalidated experiment
-
-The direct SGLang attention-function patch is invalidated and must not be
-reintroduced:
-
-| case | completed / failed | qps | rtf mean | latency mean | p95 | p99 | output tok/s |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| processor baseline | 1088 / 0 | 4.925 | 0.3881 | 1.622 | 2.152 | 2.716 | 271.0 |
-| direct sglang patch | 1084 / 4 | 2.295 | 0.8403 | 3.480 | 4.085 | 6.967 | 126.4 |
-
-That patch changed a low-level attention call while leaving the remote PyTorch
-control flow, packing, syncs, allocation pattern, and layer loop in place. It
-also introduced failures. The new plan must own the transformer implementation
-before replacing internals with SGLang primitives.
-
-### SGLang source findings
-
-Files read from `/Users/ratish/sglang`:
-
-- `python/sglang/jit_kernel/flash_attention.py`
-- `python/sglang/srt/layers/attention/vision.py`
-- `python/sglang/srt/layers/linear.py`
-- `python/sglang/srt/layers/activation.py`
-- `python/sglang/srt/model_executor/forward_batch_info.py`
-- `python/sglang/srt/models/registry.py`
-
-Relevant reusable pieces:
-
-- `sglang.jit_kernel.flash_attention.flash_attn_varlen_func(...)` supports
-  packed varlen QKV, `cu_seqlens_q`, `cu_seqlens_k`, `max_seqlen_q`,
-  `max_seqlen_k`, `causal`, and `window_size`.
-- `VisionAttention` is the closest SGLang precedent for full-sequence,
-  no-KV-cache multimodal attention. It uses SGLang QKV/projection layers and
-  a selected QKV backend, but it is not a drop-in MOSS layer.
-- `ColumnParallelLinear`, `RowParallelLinear`, `ReplicatedLinear`, and
-  `QKVParallelLinear` can be used once weight loading and tensor-parallel
-  semantics are proven for this decoder. For TP=1, correctness can be proven
-  first before adding sharded loading.
-- `ModelRegistry` supports external model packages, but the normal SGLang model
-  runner expects LLM-style `input_ids`, positions, and `ForwardBatch`.
-
-Pieces that do not semantically match MOSS vocoder:
-
-- `RadixAttention` is KV-cache serving attention and requires `ForwardBatch`.
-  The MOSS non-streaming vocoder is a dense/packed decoder over codec frames,
-  not a token decode loop with SGLang scheduler-owned KV cache.
-- SGLang RMSNorm and fused residual RMSNorm kernels do not match MOSS
-  LayerNorm.
-- `SiluAndMul`, `GeluAndMul`, and gated activation kernels do not match the
-  MOSS plain `Linear -> GELU -> Linear` FFN.
-- Forcing the whole vocoder through `ModelRunner.forward(input_ids, positions,
-  forward_batch, ...)` would introduce a fake token-serving interface before
-  the decoder mechanics are proven. That should not be Phase 1.
-
-## Correct Patch Boundary
-
-The clean boundary is not a top-level `processor/session/sglang` backend switch.
-
-The clean boundary is:
+## Boundary Map
 
 ```text
-MOSS vocoder scheduler and audio response code
-  unchanged
+sglang-omni request path
+  MossTTSLocalStreamingVocoderScheduler
+    owns request batching, payloads, CPU audio output, session lifecycle
+    unchanged except selecting optimized owned decoder
 
-MOSS audio tokenizer decode frame setup
-  initially reused for codec/code embedding and waveform plumbing
+  MossTTSLocalVocoderDecoder
+    owns MOSS module traversal, stage wrapping, RoPE call ordering, parity with
+    the remote tokenizer implementation
+    calls SGLang helper for local-causal chunked attention workspace execution
 
-MOSS decoder transformer chain
-  replaced with an owned, parity-tested implementation
-  then optimized stage by stage with SGLang kernels/layers
+SGLang core patch
+  sglang.jit_kernel.chunked_local_attention
+    owns reusable workspace tensors, varlen metadata reuse, pack/unpack helpers,
+    in-place cache update helpers, optional guarded kvcache path
+
+not first target
+  RadixAttention / FlashInferBackend / TritonBackend
+    keep tied to SRT LLM serving, ForwardBatch, request pools, and token KV pools
 ```
 
-The implementation should use names that describe MOSS decoder mechanics, not a
-generic backend abstraction:
+## Mechanical Shape
 
-- `MossTTSLocalVocoderDecoder`
-- `MossTTSLocalProjectedTransformer`
-- `MossTTSLocalTransformerLayer`
-- `MossTTSLocalAttention`
-- `MossTTSLocalPatchTransform`
+The helper must preserve the known MOSS state layout:
 
-Avoid names like:
+```text
+B = batch size
+T = current chunk length
+C = local context
+H = num heads
+D = head dim
+E = H * D
 
-- `CodecDecoderContract`
-- `ProcessorDecodeBackend`
-- `SessionDecodeBackend`
-- `SGLangCodecBackend`
+x                  [B, T, E]
+q, k_cur, v_cur    [B, H, T, D]
+cached_keys        [B, H, C, D]
+cached_values      [B, H, C, D]
+cached_positions   [B, C] int64, -1 means invalid
+offset             [B] int64
+exec_mask          [B] bool
+```
 
-The first implementation should live under
-`sglang_omni/models/moss_tts_local/`, because the current work is a MOSS-TTS
-Local integration patch. If the owned implementation proves useful and clean, we
-can later split reusable pieces into the SGLang source tree or a vendor wrapper.
+The workspace shape should be reusable across layers with the same
+`(Bmax, Tmax, C, H, D, dtype, device)`:
 
-## Mechanical Invariants
+```text
+q_pack      [Bmax * Tmax, H, D]
+k_pack      [Bmax * (C + Tmax), H, D]
+v_pack      [Bmax * (C + Tmax), H, D]
+out_pack    [Bmax * Tmax, H, D]
+cu_q        [Bmax + 1] int32
+cu_k        [Bmax + 1] int32
+k_lens      [Bmax] int32
+```
 
-These invariants must be enforced by construction-time validation and parity
-tests, not by hardcoded assumptions in the hot path:
+The first parity-preserving call remains:
 
-1. Stage topology must be read from the loaded remote model modules or config.
-2. Every projected transformer stage must preserve:
-   - input projection weights and bias
-   - output projection weights and bias
-   - transformer layer order
-   - LayerNorm weights and bias
-   - layer-scale tensors
-   - QKV fused projection layout
-   - output projection layout
-   - FFN `Linear -> GELU -> Linear` layout
-   - RoPE settings
-   - causal/local attention window settings
-3. Patch stages must preserve exact reshape/permutation behavior and length
-   updates.
-4. Packed and dense paths must produce the same output shape as the processor
-   path:
-   - stage input: `(B, D, T)`
-   - transformer input: `(B, T, D)`
-   - packed attention input: `(total_valid_tokens, D)`
-   - stage output: `(B, D_out, T_out)`
-5. Non-streaming decode must not use streaming chunk emission or streaming
-   state mutation.
-6. Any SGLang kernel substitution must have an exact semantic match or remain
-   out of scope.
+```python
+flash_attn_varlen_func(
+    q_pack[:total_q],
+    k_pack[:total_k],
+    v_pack[:total_k],
+    cu_q[:B + 1],
+    cu_k[:B + 1],
+    max_seqlen_q=T,
+    max_seqlen_k=max_k,
+    causal=True,
+    window_size=(context, 0),
+)
+```
+
+Important invariants:
+
+- RoPE stays outside the helper in Phase 1. The helper receives already-rotated
+  `q` and `k_cur`.
+- Do not filter `exec_mask == False` rows out of attention in the parity path.
+  Remote MOSS computes all rows and only gates cache/offset commit.
+- Cache updates must write into stable storage with `copy_`, not rebind
+  `state.cached_keys`, `state.cached_values`, or `state.cached_positions`.
+- `window_size` must match the remote call: `(context, 0)`.
+- `flash_attn_with_kvcache` is not the default Phase 1 path because fused append
+  does not directly represent "compute every row, commit only active rows".
+
+## Design
+
+Multi-phase plan, because this crosses two repositories and one hot GPU path:
+
+- SGLang core gets a reusable local-causal chunked attention workspace/helper.
+- SGLang-Omni gets MOSS-specific integration and parity/benchmark gates.
+- The kvcache and custom-kernel paths stay separate until the static varlen
+  workspace proves correctness and measurable benefit.
+
+### SGLang core API sketch
+
+New SGLang file:
+
+```text
+/Users/ratish/sglang/python/sglang/jit_kernel/chunked_local_attention.py
+```
+
+Initial public surface:
+
+```python
+@dataclass
+class LocalCausalVarlenWorkspace:
+    q_pack: torch.Tensor
+    k_pack: torch.Tensor
+    v_pack: torch.Tensor
+    out_pack: torch.Tensor
+    cu_q: torch.Tensor
+    cu_k: torch.Tensor
+    k_lens: torch.Tensor
+    max_batch_size: int
+    max_chunk_len: int
+    context: int
+    num_heads: int
+    head_dim: int
+
+    @classmethod
+    def create(...)
+
+def local_causal_varlen_attention_with_cache(
+    q: torch.Tensor,              # [B, H, T, D]
+    k: torch.Tensor,              # [B, H, T, D]
+    v: torch.Tensor,              # [B, H, T, D]
+    cache_k: torch.Tensor,        # [B, H, C, D]
+    cache_v: torch.Tensor,        # [B, H, C, D]
+    cache_pos: torch.Tensor,      # [B, C]
+    offset: torch.Tensor,         # [B]
+    exec_mask: torch.Tensor,      # [B]
+    workspace: LocalCausalVarlenWorkspace,
+    *,
+    context: int,
+    flash_attn_varlen_func: Callable | None = None,
+) -> torch.Tensor:               # [B, H, T, D]
+    ...
+```
+
+Export option:
+
+```text
+/Users/ratish/sglang/python/sglang/jit_kernel/flash_attention.py
+```
+
+Either re-export the new symbols there, or keep direct import from
+`sglang.jit_kernel.chunked_local_attention`.
+
+### SGLang-Omni integration sketch
+
+Changed file:
+
+```text
+sglang_omni/models/moss_tts_local/vocoder_decoder.py
+```
+
+Add:
+
+- Lazy import for the SGLang workspace helper.
+- One workspace per attention wrapper or per stage/layer shape. Prefer per
+  attention wrapper first for simple lifetime ownership; optimize sharing after
+  correctness.
+- Environment/config switch:
+  - `remote`: existing remote varlen path.
+  - `sglang-varlen`: current kernel import path for comparison only.
+  - `sglang-workspace`: new SGLang static workspace helper.
+- Fallback to `remote` if the SGLang helper is unavailable.
+
+Do not add a generic vocoder backend abstraction.
 
 ## Execution Plan
 
-### Phase 0: Source extraction and parity harness
+### Phase 1: stable cache update parity
 
-Goal: make the decoder mechanics inspectable and testable before writing the
-replacement module.
+Goal: remove cache rebinding before introducing new SGLang workspace execution.
 
-Tasks:
+Changes:
 
-1. Add a development-only extractor that records the loaded decoder topology:
-   - stage index and type
-   - projection dimensions
-   - layer count
-   - head count and head dim
-   - FFN size
-   - context window
-   - attention implementation choice
-   - tensor dtypes and devices
-2. Extract the source or bytecode-derived behavior for the functions we must
-   reproduce:
-   - `_decode_frame` call shape
-   - projected transformer forward
-   - transformer forward
-   - layer forward
-   - attention packed flash path
-   - RoPE helper
-   - patch transform encode/decode
-3. Add a local H100 parity script that compares:
-   - processor decode output
-   - current session offline decode output
-   - future owned decoder output
-4. Run probes for:
-   - batch 1, frames 25
-   - batch 1, frames 100
-   - batch 1, frames 300
-   - batch 8, frames 100
-   - batch 8, frames 300
+- In `MossTTSLocalAttention`, stop delegating streaming cache update to the
+  remote `_update_streaming_cache()` if that method rebinds tensors.
+- Add a local `_update_streaming_cache_in_place(...)` that mirrors remote logic
+  but writes with `copy_`.
+- Keep attention packing and kernel calls unchanged.
 
-Exit criteria:
+Exit gate:
 
-- Extractor output matches the known 12-stage, 92-layer topology.
-- Processor and session outputs remain `max_abs_delta == 0.0` in the probe set.
-- No production serving code changes yet.
+- Unit parity: owned decoder still produces `max_abs_delta == 0` for all
+  existing vocoder probes.
+- State stability probe: `data_ptr()` for cached K/V/positions does not change
+  across several chunk steps.
+- Full 1088 generate-only result does not regress beyond normal run noise.
 
-### Phase 1: Owned PyTorch-equivalent decoder
+### Phase 2: SGLang static varlen workspace helper
 
-Goal: own the decoder transformer chain without changing numerics or serving
-behavior.
+Goal: land the real SGLang-level reusable helper.
 
-Tasks:
+Changes in `/Users/ratish/sglang`:
 
-1. Add a MOSS-specific decoder module under
-   `sglang_omni/models/moss_tts_local/`, for example
-   `vocoder_decoder.py`.
-2. Build module objects from the loaded remote decoder modules, not from
-   hardcoded constants:
-   - copy or reference weights from the loaded `audio_tokenizer.decoder`
-   - validate the stage types and dimensions
-   - fail fast on unknown stage shapes
-3. Implement:
-   - projected transformer stage
-   - transformer layer
-   - packed attention path
-   - dense fallback path only if the loaded processor can select it
-   - patch transform stage
-4. Keep plain PyTorch math first:
-   - `torch.nn.functional.linear`
-   - `torch.nn.functional.layer_norm`
-   - `torch.nn.functional.gelu`
-   - current flash attention path only if it is exactly reproduced
-5. Wire this only behind an internal experimental constructor option or local
-   dev flag, not as a public backend API.
+- Add `python/sglang/jit_kernel/chunked_local_attention.py`.
+- Implement `LocalCausalVarlenWorkspace.create(...)`.
+- Implement a first Python/Torch packing version that writes into preallocated
+  tensors and reuses `cu_q/cu_k`.
+- Keep FlashAttention math unchanged through `flash_attn_varlen_func`.
+- Add SGLang tests with synthetic tensors:
+  - compare against the exact Python list/pack reference.
+  - cover contexts `125`, `250`, `400`.
+  - cover `B in {1, 2, 4, 8, 16}`.
+  - cover `T in {1, 5, 25, 100}`.
+  - cover inactive `exec_mask` rows.
+  - cover partially filled cache with `cache_pos == -1`.
 
-Exit criteria:
+Exit gate:
 
-- Owned decoder produces matching waveform for the Phase 0 probe set.
-- Full 1088 generate-only run has 0 failures.
-- RTF is not used as the success metric yet; this phase proves ownership and
-  correctness.
-- Existing streaming tests still pass.
+- SGLang helper output equals the Python reference for attention output and
+  cache/offset state.
+- No SRT `ForwardBatch`, paged KV pool, or `RadixAttention` dependency enters
+  this helper.
 
-### Phase 2: Replace attention internals with SGLang varlen attention
+### Phase 3: SGLang-Omni MOSS integration
 
-Goal: use SGLang attention primitives inside the owned MOSS attention module,
-with exact MOSS semantics.
+Goal: route MOSS vocoder attention through the new SGLang helper.
 
-Tasks:
+Changes:
 
-1. Generate packed sequence metadata once per stage input:
-   - valid mask
-   - packed tensor
-   - `cu_seqlens`
-   - `position_ids`
-   - max valid sequence length
-2. Remove per-layer remote-module packing and Python syncs from the hot path.
-3. Implement QKV projection and RoPE in the owned attention module.
-4. Call `sglang.jit_kernel.flash_attention.flash_attn_varlen_func(...)` with:
-   - packed QKV
-   - identical `cu_seqlens_q` and `cu_seqlens_k`
-   - stage max sequence length
-   - `causal=True`
-   - `window_size=(left_context, 0)` when the MOSS local context is finite
-   - matching softmax scale
-5. Prove that the local causal window interpretation matches MOSS SDPA and
-   flash paths. Do not assume the same `context_duration` unit until it is
-   traced to frame positions.
+- Update `sglang_omni/models/moss_tts_local/vocoder_decoder.py`.
+- Add a workspace owner to `MossTTSLocalAttention`.
+- Use `sglang-workspace` path inside `_forward_streaming_flash()` after RoPE.
+- Keep packed non-streaming path unchanged unless the helper is explicitly
+  extended for it.
+- Keep the default as `remote` until full benchmark proves improvement.
 
-Exit criteria:
+Exit gate:
 
-- Stage-level parity for every transformer stage.
-- End-to-end waveform parity within accepted tolerance.
-- No failed requests on 1088 generate-only.
-- RTF must beat Phase 1 and be competitive with processor baseline before this
-  is promoted beyond experiment.
+- Real codec parity:
+  - `processor ms`, `owned ms`, `owned max delta`, `session max delta`.
+  - `owned max delta == 0` for `B=1, frames={25,100,300}` and
+    `B=8, frames={100,300}`.
+- Full 1088 generate-only:
+  - `completed == 1088`.
+  - `failed == 0`.
+  - compare against the same-day `remote` baseline on the same GPU.
 
-### Phase 3: Adopt SGLang linear layers where they help
+### Phase 4: move packing to device kernels
 
-Goal: use SGLang linear/loading patterns only after attention parity is stable.
+Goal: reduce the overhead still left in the workspace helper.
 
-Tasks:
+Changes in SGLang:
 
-1. Try TP=1 SGLang layer wrappers first:
-   - `ReplicatedLinear` for simple projection if useful
-   - `ColumnParallelLinear` for fused QKV
-   - `RowParallelLinear` for output projection
-2. Write explicit weight loaders from MOSS remote module names:
-   - `self_attn.in_proj.weight` -> Q/K/V shards
-   - `self_attn.out_proj.weight` -> output projection
-   - `ffn.0.weight`, `ffn.2.weight`
-3. Do not use tensor parallelism until TP=1 parity and performance are known.
-4. Keep PyTorch LayerNorm and plain GELU unless an exact SGLang or sgl-kernel
-   equivalent is found and proven.
+- Add Triton or SGL kernel helpers for:
+  - packing current Q.
+  - packing valid cached K/V plus current K/V.
+  - unpacking attention output.
+  - in-place tail cache update under `exec_mask`.
+- Keep FlashAttention as the softmax/math kernel.
 
-Exit criteria:
+Exit gate:
 
-- TP=1 parity preserved.
-- Weight loading has clear assertions for shape, dtype, and device.
-- Performance improves or this phase is reverted.
+- Same synthetic parity tests as Phase 2.
+- Same real codec parity tests as Phase 3.
+- Request profile shows reduced `ar_post_forward` or vocoder attention packing
+  time versus Phase 3.
 
-### Phase 4: Static-shape runtime optimization
+### Phase 5: guarded `flash_attn_with_kvcache` experiment
 
-Goal: reduce launch overhead and allocation churn after the math path is owned.
+Goal: test whether SGLang kvcache fusion can help without breaking MOSS
+semantics.
 
-Tasks:
+Restrictions for the first experiment:
 
-1. Bucket by batch size and frame count:
-   - batch buckets: 1, 2, 4, 8
-   - frame buckets: current decode chunk sizes, including 100 and 300 probe
-     shapes
-2. Preallocate scratch tensors for:
-   - packed buffers
-   - valid masks
-   - position ids
-   - stage outputs
-3. Consider CUDA graphs only for shapes that are stable and already parity
-   tested.
-4. Consider `torch.compile` only around owned blocks where it does not hide
-   unsupported graph breaks or increase startup cost in the benchmark.
+- `context` finite.
+- `exec_mask.all()` true.
+- RoPE already applied externally.
+- dense cache has enough capacity for `C + T`, or tail compaction is proven.
+- fallback to static varlen workspace on any unsupported shape or inactive row.
 
-Exit criteria:
+Exit gate:
 
-- No regression in cold-start behavior that invalidates the benchmark.
-- 1088 generate-only run improves over processor baseline.
-- WER run remains within expected noise.
+- Single-layer parity first.
+- Real codec parity second.
+- Only enable by explicit environment flag after full 1088 benchmark improves.
 
-### Phase 5: Production integration
+### Phase 6: optional full custom small-chunk attention kernel
 
-Goal: make the optimized path the internal non-streaming decoder path only
-after correctness and speed are proven.
+Goal: highest-risk, highest-upside path after the varlen helper is proven.
 
-Tasks:
+Scope:
 
-1. Replace the non-streaming processor decoder internals with the owned
-   decoder when capability validation succeeds.
-2. Keep a narrow fallback to the processor path for unsupported model shapes.
-3. Keep streaming decode on the existing streaming session implementation.
-4. Add structured logging once at startup:
-   - decoder path selected
-   - stage topology
-   - attention implementation
-   - graph/compile mode if enabled
-5. Remove development-only extractor/logging before PR unless it is explicitly
-   useful as a test utility.
+- One kernel computes local-causal chunked attention directly from cache and
+  current K/V.
+- Cache update may remain a separate helper unless fusion is proven safe.
+- This path is opt-in until real codec parity is exact.
 
-Exit criteria:
+Exit gate:
 
-- Full SeedTTS generate+WER run passes.
-- No extra repeated hot-path logging.
-- The code reads as a MOSS decoder implementation, not a generic experimental
-  backend framework.
+- Exact parity or explicitly rejected if bit equality is impossible due to
+  accumulation-order differences.
 
-## Validation Plan
+## Validation Commands
 
-### Unit and parity checks
+Local unit checks in `sglang-omni`:
 
-Minimum local/unit checks:
+```bash
+python3 -m pytest tests/unit_test/moss_tts_local/test_vocoder_decoder.py -q
+python3 -m pytest tests/unit_test/moss_tts_local/test_streaming_vocoder.py -q
+python3 -m pytest tests/unit_test/moss_tts_local/test_vocoder_introspection.py -q
+```
 
-- Existing `tests/unit_test/moss_tts_local/test_streaming_vocoder.py`
-- Shape validation for the 12-stage decoder topology
-- Patch transform encode/decode shape and length behavior
-- Weight-loading shape assertions for every projected transformer stage
+Remote parity/introspection on H100:
 
-H100 parity checks:
+```bash
+python -m benchmarks.eval.inspect_moss_tts_local_vocoder \
+  --model OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+  --device cuda:0 \
+  --output-dir /data/moss_vocoder_sglang_workspace_parity \
+  --probe batch=1,frames=25 \
+  --probe batch=1,frames=100 \
+  --probe batch=1,frames=300 \
+  --probe batch=8,frames=100 \
+  --probe batch=8,frames=300
+```
 
-- Synthetic code rows:
-  - batch 1, frames 25
-  - batch 1, frames 100
-  - batch 1, frames 300
-  - batch 8, frames 100
-  - batch 8, frames 300
-- Real SeedTTS code rows sampled from the 1088 run.
-- Compare:
-  - waveform shape
-  - `max_abs_delta`
-  - `mean_abs_delta`
-  - SNR
-  - audio length
+Full generate-only benchmark:
 
-### Performance checks
+```bash
+python -m benchmarks.eval.benchmark_tts_seedtts \
+  --meta zhaochenyang20/seed-tts-eval-arrow \
+  --model OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+  --ref-format references \
+  --token-count auto \
+  --max-concurrency 8 \
+  --max-samples 1088 \
+  --output-dir /data/moss_vocoder_sglang_workspace_full_c8 \
+  --lang en \
+  --seed 42 \
+  --warmup 1 \
+  --allowed-local-media-path /tmp \
+  --generate-only
+```
 
-Run generate-only first:
+If using an existing server, the server must include the same env and allowed
+media path used in the benchmark. Do not compare runs where one server was
+already warmed with a different branch or a different vocoder backend.
 
-- model: `OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5`
-- dataset: `zhaochenyang20/seed-tts-eval-arrow`
-- language: `en`
-- samples: 1088
-- concurrency: 8
-- warmup: 1
-- non-streaming
+## Performance Readout
 
-Then run full generate+WER:
+Every performance report must include:
 
-- same generation settings
-- ASR: `Qwen/Qwen3-ASR-1.7B`
-- preserve WER within expected run-to-run noise
+- `completed`, `failed`
+- `throughput_qps`
+- `rtf_mean`, `rtf_p95`, `rtf_p99`
+- `latency_mean`, `latency_p95`, `latency_p99`
+- `output_throughput`
+- request-profile stage breakdown when available
+- which backend was active: `remote`, `sglang-varlen`, `sglang-workspace`,
+  `sglang-kvcache-experimental`, or custom kernel
 
-Required comparison table for any PR:
+The relevant win signal is not only total RTF. The first internal win signal is
+lower per-layer packing/cache overhead in the MOSS attention path.
 
-| branch | completed | failed | qps | rtf mean | rtf median | p95 latency | p99 latency | WER |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| upstream/main | | | | | | | | |
-| optimized branch | | | | | | | | |
+## Risks And Guards
 
-## Risk Register
+| risk | guard |
+|---|---|
+| helper computes inactive rows differently | do not filter inactive rows in parity path |
+| `flash_attn_with_kvcache` mutates inactive cache rows | keep it experimental and require `exec_mask.all()` |
+| RoPE offset mismatch | keep RoPE outside SGLang helper in Phase 1 |
+| cache tensor address changes | assert `data_ptr()` stability in tests |
+| SGLang patch cannot be tested from `sglang-omni` branch alone | develop SGLang core patch in `/Users/ratish/sglang`, then integrate via installed patched SGLang or upstream PR |
+| full custom kernel is not bit-exact | do not make it default unless real codec parity is exact |
+| benchmark noise hides small wins | require same-day branch/server/GPU comparison and request-profile breakdown |
 
-| risk | impact | mitigation |
-|---|---|---|
-| Flash attention local-window semantics differ from MOSS mask | audio drift or WER regression | stage-level parity against SDPA and processor path before integration |
-| LayerNorm/GELU replaced with non-equivalent SGLang kernels | mechanical correctness bug | do not use RMSNorm or gated activation kernels |
-| Fake SGLang `ForwardBatch` integration adds scheduler overhead | worse latency | stay inside MOSS vocoder stage until an owned decoder is proven |
-| CUDA graph capture hides shape or state mutation bugs | intermittent failures | graph only after static bucket parity |
-| Weight layout mismatch for fused QKV | severe audio corruption | explicit per-layer shape checks and output parity |
-| Existing streaming behavior changes accidentally | user-facing regression | keep streaming session path unchanged and run streaming vocoder tests |
+## Non-Goals
 
-## Immediate Next Steps
+- Do not rewrite the entire vocoder as an SGLang `ModelRunner` in this phase.
+- Do not force MOSS vocoder into `RadixAttention` or paged KV pools before the
+  small-batch helper is proven.
+- Do not optimize tokenizer, quantizer, conv, or waveform projection code in
+  this plan.
+- Do not change streaming chunk emission behavior while optimizing
+  non-streaming generation.
+- Do not accept approximate waveform parity for the default path.
 
-1. Implement Phase 0 extractor/parity harness if the existing local JSON is not
-   enough for code generation.
-2. Implement Phase 1 owned PyTorch-equivalent decoder with no performance claim.
-3. Run probe parity on H100.
-4. Only then replace attention internals with SGLang varlen attention.
+## Immediate Next Step
 
-Do not reintroduce:
-
-- direct monkeypatches of remote `flash_attn_varlen_func`
-- a public `processor/session/sglang` backend selector
-- hardcoded decoder shape files that pretend to define model semantics
-- streaming chunk semantics in the non-streaming path
-- RMSNorm or gated activation kernels for this LayerNorm/GELU model
+Start with Phase 1 in `sglang-omni`: make cache update storage-stable while
+keeping the current attention math. Then implement Phase 2 in `/Users/ratish/sglang`
+as the SGLang core patch. Only after the SGLang helper passes synthetic parity
+should `vocoder_decoder.py` call it in the real MOSS path.

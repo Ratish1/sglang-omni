@@ -326,7 +326,7 @@ class MossTTSLocalAttention(nn.Module):
         out = torch.stack(outputs, dim=0)
         out = out.transpose(1, 2).reshape(batch_size, chunk_length, self.embed_dim)
 
-        self.source._update_streaming_cache(
+        self._update_streaming_cache_in_place(
             state,
             cached_k,
             cached_v,
@@ -341,6 +341,41 @@ class MossTTSLocalAttention(nn.Module):
             state.offset,
         )
         return out
+
+    def _update_streaming_cache_in_place(
+        self,
+        state: Any,
+        cached_k: torch.Tensor,
+        cached_v: torch.Tensor,
+        cached_pos: torch.Tensor,
+        k_all: torch.Tensor,
+        v_all: torch.Tensor,
+        pos_k: torch.Tensor,
+    ) -> None:
+        if self.context is None:
+            self.source._update_streaming_cache(
+                state,
+                cached_k,
+                cached_v,
+                cached_pos,
+                k_all,
+                v_all,
+                pos_k,
+            )
+            return
+
+        context = int(self.context)
+        exec_mask = state.exec_mask.to(device=cached_k.device, dtype=torch.bool)
+        exec_mask_kv = exec_mask.view(-1, 1, 1, 1)
+        exec_mask_pos = exec_mask.to(device=cached_pos.device).view(-1, 1)
+
+        new_cached_k = k_all[:, :, -context:, :].contiguous()
+        new_cached_v = v_all[:, :, -context:, :].contiguous()
+        new_cached_pos = pos_k[:, -context:].contiguous()
+
+        cached_k.copy_(torch.where(exec_mask_kv, new_cached_k, cached_k))
+        cached_v.copy_(torch.where(exec_mask_kv, new_cached_v, cached_v))
+        cached_pos.copy_(torch.where(exec_mask_pos, new_cached_pos, cached_pos))
 
 
 class MossTTSLocalTransformerLayer(nn.Module):
