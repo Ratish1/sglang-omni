@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import queue
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -33,6 +34,7 @@ from sglang_omni.models.moss_tts_local.streaming_vocoder import (
 )
 from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.event_recorder import get_recorder
 from sglang_omni.proto import OmniRequest, StagePayload
 
 N_VQ = 4
@@ -214,6 +216,13 @@ def _drain(scheduler) -> list:
             return messages
 
 
+def _read_events(path: str) -> list[dict[str, Any]]:
+    import json
+
+    with Path(path).open("r", encoding="utf-8") as fp:
+        return [json.loads(line) for line in fp if line.strip()]
+
+
 def _run_stream(
     scheduler,
     rows: torch.Tensor,
@@ -269,6 +278,74 @@ def test_stream_metadata_builder() -> None:
         "n_vq": 12,
         INITIAL_CODEC_CHUNK_FRAMES_PARAM: 3,
     }
+
+
+def test_vocoder_decode_profile_metadata_identifies_active_backend(
+    monkeypatch,
+) -> None:
+    processor = FakeProcessor()
+    scheduler = _make_scheduler(monkeypatch, processor)
+    codes_list = [_rows(3, seed=101)[:, 1:], _rows(5, seed=102)[:, 1:]]
+
+    metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
+    assert metadata["active_vocoder_backend"] == "processor"
+    assert metadata["requested_vocoder_backend"] == "processor"
+    assert metadata["session_active"] is False
+    assert metadata["owned_decoder_active"] is False
+    assert metadata["batch_size"] == 2
+    assert metadata["total_frames"] == 8
+    assert metadata["max_frames"] == 5
+
+    scheduler._nonstream_decoder = object()  # type: ignore[assignment]
+    metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
+    assert metadata["active_vocoder_backend"] == "owned_pytorch"
+    assert metadata["requested_vocoder_backend"] == "owned_pytorch"
+    assert metadata["session_active"] is False
+    assert metadata["owned_decoder_active"] is True
+
+    scheduler._session = object()  # type: ignore[assignment]
+    metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
+    assert metadata["active_vocoder_backend"] == "session_offline"
+    assert metadata["requested_vocoder_backend"] == "owned_pytorch"
+    assert metadata["session_active"] is True
+    assert metadata["owned_decoder_active"] is True
+
+
+def test_vocoder_decode_events_include_backend_and_shape_metadata(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    processor = FakeProcessor()
+    scheduler = _make_scheduler(monkeypatch, processor)
+    scheduler._nonstream_decoder = object()  # type: ignore[assignment]
+    payloads = [
+        _terminal_payload(_rows(3, seed=201), request_id="req-a"),
+        _terminal_payload(_rows(5, seed=202), request_id="req-b"),
+    ]
+    codes_list = [_rows(3, seed=201)[:, 1:], _rows(5, seed=202)[:, 1:]]
+    recorder = get_recorder()
+    path = recorder.start(run_id="run", event_dir=str(tmp_path), stage="vocoder")
+    try:
+        scheduler._emit_vocoder_decode_events(
+            "vocoder_decode_start", payloads, codes_list
+        )
+    finally:
+        recorder.stop()
+
+    events = _read_events(path)
+    assert [event["request_id"] for event in events] == ["req-a", "req-b"]
+    for event, frames in zip(events, [3, 5]):
+        metadata = event["metadata"]
+        assert metadata["path"] == "owned_pytorch"
+        assert metadata["active_vocoder_backend"] == "owned_pytorch"
+        assert metadata["requested_vocoder_backend"] == "owned_pytorch"
+        assert metadata["batch_size"] == 2
+        assert metadata["total_frames"] == 8
+        assert metadata["max_frames"] == 5
+        assert metadata["frames"] == frames
+        assert metadata["code_shape"] == [frames, N_VQ]
+        assert metadata["code_dtype"] == "torch.int64"
+        assert metadata["code_device"] == "cpu"
 
 
 def test_stream_concatenates_to_offline_decode(monkeypatch) -> None:

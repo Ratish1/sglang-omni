@@ -45,6 +45,9 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 _SOURCE_HINT = "MOSS-TTS Local"
+_VOCODER_BACKEND_PROCESSOR = "processor"
+_VOCODER_BACKEND_OWNED_PYTORCH = "owned_pytorch"
+_VOCODER_BACKEND_SESSION_OFFLINE = "session_offline"
 
 
 def _resolve_sample_rate(processor: Any) -> int:
@@ -627,13 +630,13 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         self,
         codes_list: list[torch.Tensor],
         *,
-        profile_request_id: str | None = None,
+        profile_request_ids: list[str] | None = None,
         profile_metadata: dict[str, Any] | None = None,
     ) -> list[torch.Tensor]:
         """Decode ``[T, >=n_vq]`` row tensors to fp32 CPU waveforms."""
         with torch_profile_range("moss.vocoder.decode_codes_rows"):
             with profile_moss_tts_local_vocoder_attention(
-                profile_request_id, profile_metadata
+                profile_request_ids, profile_metadata
             ):
                 if self._session is None:
                     if self._nonstream_decoder is not None:
@@ -677,20 +680,12 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 self._emit_vocoder_decode_events(
                     "vocoder_decode_start", profiled_payloads, codes_list
                 )
-            profile_request_id = (
-                profiled_payloads[0].request_id if profiled_payloads else None
-            )
-            profile_metadata = {
-                "batch_size": len(codes_list),
-                "total_frames": sum(int(codes.shape[0]) for codes in codes_list),
-                "max_frames": max(
-                    (int(codes.shape[0]) for codes in codes_list), default=0
-                ),
-            }
+            profile_request_ids = [payload.request_id for payload in profiled_payloads]
+            profile_metadata = self._vocoder_decode_profile_metadata(codes_list)
             decoded_wavs = (
                 self._decode_codes_rows(
                     codes_list,
-                    profile_request_id=profile_request_id,
+                    profile_request_ids=profile_request_ids,
                     profile_metadata=profile_metadata,
                 )
                 if codes_list
@@ -722,23 +717,48 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         payloads: list[StagePayload],
         codes_list: list[torch.Tensor],
     ) -> None:
-        batch_size = len(codes_list)
-        total_frames = sum(int(codes.shape[0]) for codes in codes_list)
-        max_frames = max((int(codes.shape[0]) for codes in codes_list), default=0)
-        path = "processor" if self._session is None else "session"
+        metadata = self._vocoder_decode_profile_metadata(codes_list)
         for payload, codes in zip(payloads, codes_list):
+            per_request_metadata = {
+                **metadata,
+                "frames": int(codes.shape[0]),
+                "code_shape": tuple(int(dim) for dim in codes.shape),
+                "code_dtype": str(codes.dtype),
+                "code_device": str(codes.device),
+            }
             _emit_event(
                 request_id=payload.request_id,
                 stage=None,
                 event_name=event_name,
-                metadata={
-                    "path": path,
-                    "batch_size": batch_size,
-                    "frames": int(codes.shape[0]),
-                    "total_frames": total_frames,
-                    "max_frames": max_frames,
-                },
+                metadata=per_request_metadata,
             )
+
+    def _active_vocoder_backend(self) -> str:
+        if self._session is not None:
+            return _VOCODER_BACKEND_SESSION_OFFLINE
+        if self._nonstream_decoder is not None:
+            return _VOCODER_BACKEND_OWNED_PYTORCH
+        return _VOCODER_BACKEND_PROCESSOR
+
+    def _requested_vocoder_backend(self) -> str:
+        if self._nonstream_decoder is not None:
+            return _VOCODER_BACKEND_OWNED_PYTORCH
+        return _VOCODER_BACKEND_PROCESSOR
+
+    def _vocoder_decode_profile_metadata(
+        self, codes_list: list[torch.Tensor]
+    ) -> dict[str, Any]:
+        active_backend = self._active_vocoder_backend()
+        return {
+            "path": active_backend,
+            "active_vocoder_backend": active_backend,
+            "requested_vocoder_backend": self._requested_vocoder_backend(),
+            "session_active": self._session is not None,
+            "owned_decoder_active": self._nonstream_decoder is not None,
+            "batch_size": len(codes_list),
+            "total_frames": sum(int(codes.shape[0]) for codes in codes_list),
+            "max_frames": max((int(codes.shape[0]) for codes in codes_list), default=0),
+        }
 
 
 __all__ = ["MossTTSLocalStreamingVocoderScheduler"]

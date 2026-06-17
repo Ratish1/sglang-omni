@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import torch
 from torch import nn
 
@@ -10,7 +13,9 @@ from sglang_omni.models.moss_tts_local.vocoder_decoder import (
     MossTTSLocalProjectedTransformer,
     MossTTSLocalTransformerLayer,
     MossTTSLocalVocoderDecoder,
+    profile_moss_tts_local_vocoder_attention,
 )
+from sglang_omni.profiler.event_recorder import get_recorder
 
 
 class _FakeLayerScale(nn.Module):
@@ -375,6 +380,54 @@ def test_attention_streaming_flash_cache_update_preserves_storage() -> None:
         [4, 5, 6, 7],
         [0, 1, 2, 3],
     ]
+
+
+def test_attention_profile_context_attributes_every_request_in_batch(
+    tmp_path: Path,
+) -> None:
+    source = _StreamingFlashAttention(hidden_size=6)
+    wrapper = MossTTSLocalAttention(source)
+
+    def fake_flash_attn(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
+        max_q: int,
+        max_k: int,
+        *,
+        causal: bool,
+        window_size: tuple[int, int],
+    ) -> torch.Tensor:
+        return q
+
+    wrapper._attention_kernel = "sglang"
+    wrapper._sglang_flash_attn_varlen_func = fake_flash_attn
+    x = torch.randn(2, 4, 6)
+    recorder = get_recorder()
+    path = recorder.start(run_id="run", event_dir=str(tmp_path), stage="vocoder")
+    try:
+        with profile_moss_tts_local_vocoder_attention(
+            ["req-a", "req-b"],
+            {"active_vocoder_backend": "owned_pytorch", "batch_size": 2},
+        ):
+            _ = wrapper(x, input_lengths=torch.tensor([4, 4]))
+    finally:
+        recorder.stop()
+
+    with Path(path).open("r", encoding="utf-8") as fp:
+        events = [json.loads(line) for line in fp if line.strip()]
+    flash_events = [
+        event
+        for event in events
+        if event["event_name"] == "moss_vocoder_attn_flash_sglang_start"
+    ]
+    assert {event["request_id"] for event in flash_events} == {"req-a", "req-b"}
+    assert all(
+        event["metadata"]["active_vocoder_backend"] == "owned_pytorch"
+        for event in flash_events
+    )
 
 
 def test_attention_kernel_defaults_to_remote(monkeypatch) -> None:

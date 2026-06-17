@@ -14,7 +14,7 @@ import importlib
 import logging
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -35,8 +35,8 @@ _SUPPORTED_ATTENTION_KERNELS = {
     _ATTENTION_KERNEL_REMOTE,
     _ATTENTION_KERNEL_SGLANG,
 }
-_ATTN_PROFILE_REQUEST_ID: ContextVar[str | None] = ContextVar(
-    "moss_tts_local_attn_profile_request_id", default=None
+_ATTN_PROFILE_REQUEST_IDS: ContextVar[tuple[str, ...]] = ContextVar(
+    "moss_tts_local_attn_profile_request_ids", default=()
 )
 _ATTN_PROFILE_METADATA: ContextVar[dict[str, Any] | None] = ContextVar(
     "moss_tts_local_attn_profile_metadata", default=None
@@ -76,16 +76,22 @@ def _module_list(value: Any) -> list[nn.Module]:
 
 @contextmanager
 def profile_moss_tts_local_vocoder_attention(
-    request_id: str | None,
+    request_ids: str | Iterable[str] | None,
     metadata: dict[str, Any] | None = None,
 ) -> Iterator[None]:
-    token_id = _ATTN_PROFILE_REQUEST_ID.set(request_id)
+    if request_ids is None:
+        normalized_request_ids = ()
+    elif isinstance(request_ids, str):
+        normalized_request_ids = (request_ids,)
+    else:
+        normalized_request_ids = tuple(request_ids)
+    token_ids = _ATTN_PROFILE_REQUEST_IDS.set(normalized_request_ids)
     token_metadata = _ATTN_PROFILE_METADATA.set(metadata)
     try:
         yield
     finally:
         _ATTN_PROFILE_METADATA.reset(token_metadata)
-        _ATTN_PROFILE_REQUEST_ID.reset(token_id)
+        _ATTN_PROFILE_REQUEST_IDS.reset(token_ids)
 
 
 @contextmanager
@@ -95,9 +101,9 @@ def _attention_profile_interval(
     metadata: dict[str, Any] | None = None,
 ) -> Iterator[None]:
     with torch_profile_range(f"moss.vocoder.attn.{event_base}"):
-        request_id = _ATTN_PROFILE_REQUEST_ID.get()
+        request_ids = _ATTN_PROFILE_REQUEST_IDS.get()
         recorder = _get_event_recorder()
-        if request_id is None or not recorder.is_active():
+        if not request_ids or not recorder.is_active():
             yield
             return
 
@@ -105,23 +111,26 @@ def _attention_profile_interval(
         if metadata is not None:
             merged_metadata.update(metadata)
         start_ns = time.time_ns()
-        _emit_event(
-            request_id=request_id,
-            stage=None,
-            event_name=f"moss_vocoder_attn_{event_base}_start",
-            metadata=merged_metadata,
-            timestamp_ns=start_ns,
-        )
-        try:
-            yield
-        finally:
+        for request_id in request_ids:
             _emit_event(
                 request_id=request_id,
                 stage=None,
-                event_name=f"moss_vocoder_attn_{event_base}_end",
+                event_name=f"moss_vocoder_attn_{event_base}_start",
                 metadata=merged_metadata,
-                timestamp_ns=time.time_ns(),
+                timestamp_ns=start_ns,
             )
+        try:
+            yield
+        finally:
+            end_ns = time.time_ns()
+            for request_id in request_ids:
+                _emit_event(
+                    request_id=request_id,
+                    stage=None,
+                    event_name=f"moss_vocoder_attn_{event_base}_end",
+                    metadata=merged_metadata,
+                    timestamp_ns=end_ns,
+                )
 
 
 def _pack_padded_sequence(
@@ -617,7 +626,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
 
     def __init__(self, source: nn.Module) -> None:
         super().__init__()
-        self.source = source
+        object.__setattr__(self, "source", source)
         self.input_proj = getattr(source, "input_proj", None)
         self.output_proj = getattr(source, "output_proj", None)
         self.transformer = MossTTSLocalTransformer(getattr(source, "transformer"))
@@ -798,5 +807,6 @@ __all__ = [
     "MossTTSLocalVocoderDecoder",
     "build_moss_tts_local_vocoder_decoder",
     "install_moss_tts_local_vocoder_decoder",
+    "profile_moss_tts_local_vocoder_attention",
     "use_moss_tts_local_vocoder_decoder",
 ]
