@@ -306,12 +306,19 @@ def test_vocoder_decode_profile_metadata_identifies_active_backend(
 
     scheduler._nonstream_decoder = None
     scheduler._nonstream_sglang_patch_active = True
+    monkeypatch.setattr(
+        "sglang_omni.models.moss_tts_local.streaming_vocoder."
+        "get_moss_tts_local_sglang_vocoder_patch_info",
+        lambda codec: SimpleNamespace(invocation_count=17, ref_count=1),
+    )
     metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
     assert metadata["active_vocoder_backend"] == "sglang_patch"
     assert metadata["requested_vocoder_backend"] == "sglang_patch"
     assert metadata["session_active"] is False
     assert metadata["owned_decoder_active"] is False
     assert metadata["sglang_patch_active"] is True
+    assert metadata["sglang_patch_invocations"] == 17
+    assert metadata["sglang_patch_ref_count"] == 1
 
     scheduler._session = object()  # type: ignore[assignment]
     metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
@@ -320,6 +327,8 @@ def test_vocoder_decode_profile_metadata_identifies_active_backend(
     assert metadata["session_active"] is True
     assert metadata["owned_decoder_active"] is False
     assert metadata["sglang_patch_active"] is True
+    assert metadata["sglang_patch_invocations"] == 17
+    assert metadata["sglang_patch_ref_count"] == 1
 
 
 def test_vocoder_decode_events_include_backend_and_shape_metadata(

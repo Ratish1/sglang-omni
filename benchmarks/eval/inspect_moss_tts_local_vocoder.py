@@ -38,6 +38,7 @@ from sglang_omni.models.moss_tts_local.vocoder_introspection import (
     summarize_moss_tts_local_vocoder,
 )
 from sglang_omni.models.moss_tts_local.vocoder_sglang_patch import (
+    get_moss_tts_local_sglang_vocoder_patch_info,
     install_moss_tts_local_sglang_vocoder_patch,
     uninstall_moss_tts_local_sglang_vocoder_patch,
 )
@@ -186,27 +187,52 @@ def _time_call(
     }
 
 
+def _assert_codec_not_streaming(processor: Any, label: str) -> None:
+    codec = getattr(processor, "audio_tokenizer", None)
+    streaming_state = getattr(codec, "_streaming_state", None)
+    if streaming_state is not None:
+        raise RuntimeError(f"{label} left codec streaming state active")
+
+
 def _owned_decode_audio_codes(
     processor: Any,
     codes_list: list[torch.Tensor],
     owned_decoder: Any,
 ) -> list[torch.Tensor]:
     codec = processor.audio_tokenizer
+    _assert_codec_not_streaming(processor, "owned decoder")
     with use_moss_tts_local_vocoder_decoder(codec, owned_decoder):
-        return [
+        outputs = [
             torch.as_tensor(wav).detach().to("cpu", torch.float32)
             for wav in processor.decode_audio_codes(codes_list)
         ]
+    _assert_codec_not_streaming(processor, "owned decoder")
+    return outputs
 
 
 def _decode_audio_codes_cpu(
     processor: Any,
     codes_list: list[torch.Tensor],
 ) -> list[torch.Tensor]:
-    return [
+    _assert_codec_not_streaming(processor, "processor decode")
+    outputs = [
         torch.as_tensor(wav).detach().to("cpu", torch.float32)
         for wav in processor.decode_audio_codes(codes_list)
     ]
+    _assert_codec_not_streaming(processor, "processor decode")
+    return outputs
+
+
+def _patch_info_fields(prefix: str, patch_info: Any) -> dict[str, Any]:
+    return {
+        f"{prefix}_attention_modules": int(patch_info.attention_modules),
+        f"{prefix}_python_modules": int(patch_info.python_modules),
+        f"{prefix}_ref_count": int(patch_info.ref_count),
+        f"{prefix}_invocation_count": int(patch_info.invocation_count),
+        f"{prefix}_attention_implementations": dict(
+            patch_info.attention_implementations
+        ),
+    }
 
 
 def _time_sglang_patch_decode_audio_codes(
@@ -217,16 +243,21 @@ def _time_sglang_patch_decode_audio_codes(
     device: torch.device,
 ) -> tuple[list[torch.Tensor], dict[str, Any]]:
     codec = processor.audio_tokenizer
-    install_moss_tts_local_sglang_vocoder_patch(codec)
+    install_info = install_moss_tts_local_sglang_vocoder_patch(codec)
     try:
-        return _time_call(
+        outputs, timing = _time_call(
             "sglang_patch.decode_audio_codes",
             lambda: _decode_audio_codes_cpu(processor, codes_list),
             iterations=iterations,
             device=device,
         )
+        active_info = get_moss_tts_local_sglang_vocoder_patch_info(codec)
     finally:
-        uninstall_moss_tts_local_sglang_vocoder_patch(codec)
+        restored_info = uninstall_moss_tts_local_sglang_vocoder_patch(codec)
+    timing.update(_patch_info_fields("install", install_info))
+    timing.update(_patch_info_fields("active", active_info))
+    timing.update(_patch_info_fields("restored", restored_info))
+    return outputs, timing
 
 
 def _tensor_output_summary(tensor: torch.Tensor) -> dict[str, Any]:

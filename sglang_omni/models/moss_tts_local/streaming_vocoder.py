@@ -30,7 +30,9 @@ from sglang_omni.models.moss_tts_local.vocoder_decoder import (
     use_moss_tts_local_vocoder_decoder,
 )
 from sglang_omni.models.moss_tts_local.vocoder_sglang_patch import (
+    get_moss_tts_local_sglang_vocoder_patch_info,
     install_moss_tts_local_sglang_vocoder_patch,
+    uninstall_moss_tts_local_sglang_vocoder_patch,
 )
 from sglang_omni.models.tts_streaming import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
@@ -266,6 +268,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         self._processor = processor
         self._codec = codec
         self._nonstream_sglang_patch_active = False
+        self._nonstream_sglang_patch_info = None
         self._nonstream_decoder = self._build_nonstream_decoder(nonstream_decoder)
         self._stream_slots = int(stream_slots)
         self._stream_chunk_frames = int(stream_chunk_frames)
@@ -294,11 +297,15 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         if mode in {"sglang-patch", "sglang_patch"}:
             info = install_moss_tts_local_sglang_vocoder_patch(self._codec)
             self._nonstream_sglang_patch_active = True
+            self._nonstream_sglang_patch_info = info
             logger.info(
                 "MOSS-TTS Local non-streaming vocoder decoder=sglang-patch "
-                "attention_modules=%d python_modules=%d",
+                "attention_modules=%d python_modules=%d ref_count=%d "
+                "attention_implementations=%s",
                 info.attention_modules,
                 info.python_modules,
+                info.ref_count,
+                dict(info.attention_implementations),
             )
             return None
         if mode not in {"owned", "owned-pytorch"}:
@@ -319,12 +326,14 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             super().start()
         finally:
             self._close_streaming_session()
+            self._close_nonstream_sglang_patch()
 
     def stop(self) -> None:
         was_running = self._running
         super().stop()
         if not was_running:
             self._close_streaming_session()
+            self._close_nonstream_sglang_patch()
 
     def _close_streaming_session(self) -> None:
         with self._state_lock:
@@ -332,6 +341,21 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             if self._session is not None:
                 self._session.close()
                 self._session = None
+
+    def _close_nonstream_sglang_patch(self) -> None:
+        if not self._nonstream_sglang_patch_active:
+            return
+        info = uninstall_moss_tts_local_sglang_vocoder_patch(self._codec)
+        self._nonstream_sglang_patch_active = False
+        self._nonstream_sglang_patch_info = info
+        logger.info(
+            "MOSS-TTS Local non-streaming vocoder decoder=sglang-patch closed "
+            "attention_modules=%d python_modules=%d ref_count=%d invocations=%d",
+            info.attention_modules,
+            info.python_modules,
+            info.ref_count,
+            info.invocation_count,
+        )
 
     # ------------------------------------------------------------------
     # Streaming hooks
@@ -769,6 +793,11 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         self, codes_list: list[torch.Tensor]
     ) -> dict[str, Any]:
         active_backend = self._active_vocoder_backend()
+        patch_info = (
+            get_moss_tts_local_sglang_vocoder_patch_info(self._codec)
+            if self._nonstream_sglang_patch_active
+            else self._nonstream_sglang_patch_info
+        )
         return {
             "path": active_backend,
             "active_vocoder_backend": active_backend,
@@ -776,6 +805,12 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             "session_active": self._session is not None,
             "owned_decoder_active": self._nonstream_decoder is not None,
             "sglang_patch_active": self._nonstream_sglang_patch_active,
+            "sglang_patch_invocations": (
+                int(patch_info.invocation_count) if patch_info is not None else 0
+            ),
+            "sglang_patch_ref_count": (
+                int(patch_info.ref_count) if patch_info is not None else 0
+            ),
             "batch_size": len(codes_list),
             "total_frames": sum(int(codes.shape[0]) for codes in codes_list),
             "max_frames": max((int(codes.shape[0]) for codes in codes_list), default=0),
