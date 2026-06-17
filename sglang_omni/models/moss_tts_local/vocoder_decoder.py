@@ -916,8 +916,10 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         if not self.source.is_streaming and backend == "flash_attention_2":
             batch_size, max_seqlen, _ = x.shape
             if max_seqlen > 0 and batch_size == 1:
-                max_valid_seqlen = max_seqlen
-                pack_mode = "single_unpadded"
+                max_valid_seqlen = int(input_lengths[0].item())
+                pack_mode = (
+                    "single_unpadded" if max_valid_seqlen == max_seqlen else "masked"
+                )
             elif max_seqlen > 0 and bool(input_lengths.any().item()):
                 max_valid_seqlen = int(input_lengths.max().item())
                 pack_mode = "masked"

@@ -141,6 +141,20 @@ def _make_codes(
     ]
 
 
+def _make_codes_for_frames(
+    *,
+    frames_list: list[int],
+    n_vq: int,
+    vocab_size: int,
+    seed: int,
+) -> list[torch.Tensor]:
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    return [
+        torch.randint(0, vocab_size, (frames, n_vq), generator=generator)
+        for frames in frames_list
+    ]
+
+
 def _time_call(
     label: str,
     fn,
@@ -168,6 +182,19 @@ def _time_call(
     }
 
 
+def _owned_decode_audio_codes(
+    processor: Any,
+    codes_list: list[torch.Tensor],
+    owned_decoder: Any,
+) -> list[torch.Tensor]:
+    codec = processor.audio_tokenizer
+    with use_moss_tts_local_vocoder_decoder(codec, owned_decoder):
+        return [
+            torch.as_tensor(wav).detach().to("cpu", torch.float32)
+            for wav in processor.decode_audio_codes(codes_list)
+        ]
+
+
 def _tensor_output_summary(tensor: torch.Tensor) -> dict[str, Any]:
     cpu = torch.as_tensor(tensor).detach().to("cpu", torch.float32)
     return {
@@ -176,6 +203,30 @@ def _tensor_output_summary(tensor: torch.Tensor) -> dict[str, Any]:
         "device": str(cpu.device),
         "mean_abs": float(cpu.abs().mean().item()) if cpu.numel() else 0.0,
         "max_abs": float(cpu.abs().max().item()) if cpu.numel() else 0.0,
+    }
+
+
+def _summarize_comparisons(
+    reference: list[torch.Tensor],
+    candidate: list[torch.Tensor],
+) -> dict[str, Any]:
+    comparisons = [_compare_tensors(ref, out) for ref, out in zip(reference, candidate)]
+    return {
+        "outputs": [
+            {
+                **_tensor_output_summary(out),
+                "comparison": comparison,
+            }
+            for out, comparison in zip(candidate, comparisons)
+        ],
+        "max_abs_delta": max(
+            (float(comp.get("max_abs_delta", 0.0)) for comp in comparisons),
+            default=0.0,
+        ),
+        "mean_abs_delta_max": max(
+            (float(comp.get("mean_abs_delta", 0.0)) for comp in comparisons),
+            default=0.0,
+        ),
     }
 
 
@@ -206,6 +257,84 @@ def _compare_tensors(a: torch.Tensor, b: torch.Tensor) -> dict[str, Any]:
         "mean_abs_delta": float(delta.abs().mean().item()) if delta.numel() else 0.0,
         "snr_db": snr_db,
     }
+
+
+def _stress_cases() -> list[tuple[str, list[int]]]:
+    return [
+        ("single_short", [25]),
+        ("single_typical", [100]),
+        ("single_long", [300]),
+        ("mixed_8", [25, 50, 75, 100, 125, 150, 200, 300]),
+        (
+            "mixed_16",
+            [25, 50, 75, 100, 125, 150, 200, 300]
+            + [32, 64, 96, 128, 160, 224, 320, 400],
+        ),
+    ]
+
+
+def _run_stress_case(
+    processor: Any,
+    *,
+    name: str,
+    frames_list: list[int],
+    iterations: int,
+    seed: int,
+    device: torch.device,
+    compare_owned_decoder: bool,
+) -> dict[str, Any]:
+    n_vq = _num_codebooks(processor)
+    vocab_size = _audio_vocab_size(processor)
+    codes_list = _make_codes_for_frames(
+        frames_list=frames_list,
+        n_vq=n_vq,
+        vocab_size=vocab_size,
+        seed=seed,
+    )
+
+    def processor_decode() -> list[torch.Tensor]:
+        return [
+            torch.as_tensor(wav).detach().to("cpu", torch.float32)
+            for wav in processor.decode_audio_codes(codes_list)
+        ]
+
+    processor_outputs, processor_timing = _time_call(
+        "processor.decode_audio_codes",
+        processor_decode,
+        iterations=iterations,
+        device=device,
+    )
+
+    owned_timing: dict[str, Any] | None = None
+    owned_outputs: list[torch.Tensor] | None = None
+    if compare_owned_decoder:
+        owned_decoder = build_moss_tts_local_vocoder_decoder(processor.audio_tokenizer)
+        owned_outputs, owned_timing = _time_call(
+            "owned_decoder.decode_audio_codes",
+            lambda: _owned_decode_audio_codes(processor, codes_list, owned_decoder),
+            iterations=iterations,
+            device=device,
+        )
+
+    result: dict[str, Any] = {
+        "name": name,
+        "batch_size": len(frames_list),
+        "frames": frames_list,
+        "total_frames": sum(frames_list),
+        "max_frames": max(frames_list),
+        "codebooks": n_vq,
+        "vocab_size": vocab_size,
+        "processor_decode": {
+            **processor_timing,
+            "outputs": [_tensor_output_summary(out) for out in processor_outputs],
+        },
+    }
+    if owned_timing is not None and owned_outputs is not None:
+        result["owned_decoder_decode"] = {
+            **owned_timing,
+            **_summarize_comparisons(processor_outputs, owned_outputs),
+        }
+    return result
 
 
 def _run_probe(
@@ -247,17 +376,9 @@ def _run_probe(
     owned_timing: dict[str, Any] | None = None
     if compare_owned_decoder:
         owned_decoder = build_moss_tts_local_vocoder_decoder(codec)
-
-        def owned_decode() -> list[torch.Tensor]:
-            with use_moss_tts_local_vocoder_decoder(codec, owned_decoder):
-                return [
-                    torch.as_tensor(wav).detach().to("cpu", torch.float32)
-                    for wav in processor.decode_audio_codes(codes_list)
-                ]
-
         owned_outputs, owned_timing = _time_call(
             "owned_decoder.decode_audio_codes",
-            owned_decode,
+            lambda: _owned_decode_audio_codes(processor, codes_list, owned_decoder),
             iterations=iterations,
             device=device,
         )
@@ -403,6 +524,36 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                 session_max_delta=session_max_delta,
             )
         )
+    stress_cases = report.get("stress_cases", [])
+    if stress_cases:
+        lines.extend(
+            [
+                "",
+                "## Stress Cases",
+                "",
+                "| name | batch | total frames | max frames | processor ms | owned ms | owned max delta |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+    for case in stress_cases:
+        owned = case.get("owned_decoder_decode")
+        owned_ms = float("nan")
+        owned_max_delta = float("nan")
+        if owned is not None:
+            owned_ms = owned["mean_seconds"] * 1000.0
+            owned_max_delta = float(owned.get("max_abs_delta", 0.0))
+        lines.append(
+            "| {name} | {batch_size} | {total_frames} | {max_frames} | "
+            "{processor_ms:.3f} | {owned_ms:.3f} | {owned_max_delta:.6g} |".format(
+                name=case["name"],
+                batch_size=case["batch_size"],
+                total_frames=case["total_frames"],
+                max_frames=case["max_frames"],
+                processor_ms=case["processor_decode"]["mean_seconds"] * 1000.0,
+                owned_ms=owned_ms,
+                owned_max_delta=owned_max_delta,
+            )
+        )
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -435,6 +586,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="compare the experimental owned PyTorch vocoder decoder against the processor path",
     )
+    parser.add_argument(
+        "--stress-suite",
+        action="store_true",
+        help="run deterministic mixed-length codec stress cases in addition to probes",
+    )
     parser.add_argument("--skip-probes", action="store_true")
     parser.add_argument("--no-markdown", action="store_true")
     return parser
@@ -464,6 +620,7 @@ def main() -> None:
         "torch_backends": {"cuda_sdp": _cuda_sdp_settings()},
         "introspection": summarize_moss_tts_local_vocoder(processor),
         "decode_probes": [],
+        "stress_cases": [],
     }
 
     probes = args.probe or [(1, 25), (1, 100), (1, 300), (8, 100), (8, 300)]
@@ -478,6 +635,26 @@ def main() -> None:
                     iterations=args.iterations,
                     seed=args.seed + index,
                     max_step_frames=args.max_step_frames,
+                    device=device,
+                    compare_owned_decoder=args.compare_owned_decoder,
+                )
+            )
+    if args.stress_suite:
+        for index, (name, frames_list) in enumerate(_stress_cases()):
+            logger.info(
+                "Running stress case %s batch=%d max_frames=%d total_frames=%d",
+                name,
+                len(frames_list),
+                max(frames_list),
+                sum(frames_list),
+            )
+            report["stress_cases"].append(
+                _run_stress_case(
+                    processor,
+                    name=name,
+                    frames_list=frames_list,
+                    iterations=args.iterations,
+                    seed=args.seed + 1000 + index,
                     device=device,
                     compare_owned_decoder=args.compare_owned_decoder,
                 )

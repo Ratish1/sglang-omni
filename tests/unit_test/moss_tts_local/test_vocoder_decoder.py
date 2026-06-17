@@ -375,6 +375,49 @@ def test_single_unpadded_pack_metadata_cache_reuses_tensors() -> None:
     assert pos_1.tolist() == [0, 1, 2, 3]
 
 
+def test_projected_transformer_single_padded_input_uses_masked_pack() -> None:
+    source = _FallbackProjectedStage()
+    source.transformer.layers[0].self_attn.attention_implementation = (
+        "flash_attention_2"
+    )
+    wrapper = MossTTSLocalProjectedTransformer(source)
+    attn = wrapper.transformer.layers[0].self_attn
+    attn._attention_kernel = "sglang"
+    attn._supports_sglang_flash_attention = lambda _: True  # type: ignore[method-assign]
+    calls = []
+
+    def fake_flash_attn(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
+        max_q: int,
+        max_k: int,
+        *,
+        causal: bool,
+        window_size: tuple[int, int],
+    ) -> torch.Tensor:
+        calls.append((q.shape, cu_q.clone(), cu_k.clone(), max_q, max_k))
+        return q
+
+    attn._sglang_flash_attn_varlen_func = fake_flash_attn
+    x = torch.randn(1, 3, 4)
+    lengths = torch.tensor([2])
+
+    out, out_lengths = wrapper(x, lengths)
+
+    assert len(calls) == 1
+    q_shape, cu_q, cu_k, max_q, max_k = calls[0]
+    assert q_shape[0] == 2
+    assert cu_q.tolist() == [0, 2]
+    assert cu_k.tolist() == [0, 2]
+    assert max_q == 2
+    assert max_k == 2
+    assert out.shape == (1, 7, 4)
+    assert torch.equal(out_lengths, lengths)
+
+
 def test_cached_packed_rope_matches_moss_interleaved_reference() -> None:
     q = torch.randn(5, 2, 6)
     k = torch.randn(5, 2, 6)
