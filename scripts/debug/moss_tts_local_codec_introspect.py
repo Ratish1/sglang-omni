@@ -27,6 +27,15 @@ from typing import Any
 
 DEFAULT_MODEL_PATH = "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
 
+CODEC_DECODER_CONTRACT_CLASSES = (
+    "MossAudioTokenizerProjectedTransformer",
+    "MossAudioTokenizerTransformer",
+    "MossAudioTokenizerTransformerLayer",
+    "MossAudioTokenizerMultiheadAttention",
+    "MossAudioTokenizerRotaryEmbedding",
+    "MossAudioTokenizerPatchedPretransform",
+)
+
 
 @dataclass
 class DecodeProbeConfig:
@@ -306,6 +315,161 @@ def public_config_attrs(obj: Any) -> dict[str, Any]:
         if isinstance(value, (str, int, float, bool, type(None), list, tuple, dict)):
             out[name] = json_safe(value)
     return out
+
+
+def _mapping_value(mapping: Any, *names: str) -> Any:
+    for name in names:
+        if isinstance(mapping, dict):
+            if name in mapping:
+                return mapping[name]
+            continue
+        if hasattr(mapping, name):
+            return getattr(mapping, name)
+    return None
+
+
+def decoder_stage_config_summary(config: Any) -> dict[str, Any]:
+    """Summarize codec decoder stages from ``config.decoder_kwargs``."""
+    decoder_kwargs = getattr(config, "decoder_kwargs", None)
+    if decoder_kwargs is None:
+        return {"present": False, "stages": []}
+
+    stages = []
+    transformer_layer_count = 0
+    transformer_stage_count = 0
+    for index, raw_stage in enumerate(decoder_kwargs):
+        stage = (
+            raw_stage if isinstance(raw_stage, dict) else public_config_attrs(raw_stage)
+        )
+        d_model = _mapping_value(stage, "d_model", "hidden_size")
+        heads = _mapping_value(stage, "num_heads", "heads", "num_attention_heads")
+        head_dim = _mapping_value(stage, "head_dim", "attention_head_dim")
+        if head_dim is None and d_model is not None and heads:
+            try:
+                head_dim = int(d_model) // int(heads)
+            except Exception:
+                head_dim = None
+        layers = _mapping_value(stage, "num_layers", "layers", "num_hidden_layers")
+        module_type = _mapping_value(stage, "module_type")
+        if module_type == "Transformer":
+            transformer_stage_count += 1
+            transformer_layer_count += int(layers or 0)
+        stages.append(
+            {
+                "stage_index": index,
+                "module_type": module_type,
+                "d_model": d_model,
+                "heads": heads,
+                "head_dim": head_dim,
+                "layers": layers,
+                "ffn": _mapping_value(
+                    stage, "dim_feedforward", "ffn", "ffn_dim", "intermediate_size"
+                ),
+                "input_dimension": _mapping_value(stage, "input_dimension"),
+                "output_dimension": _mapping_value(stage, "output_dimension"),
+                "context_duration": _mapping_value(stage, "context_duration"),
+                "patch_size": _mapping_value(stage, "patch_size"),
+                "causal": _mapping_value(stage, "causal"),
+                "positional_embedding": _mapping_value(stage, "positional_embedding"),
+            }
+        )
+
+    return {
+        "present": True,
+        "stage_count": len(stages),
+        "transformer_stage_count": transformer_stage_count,
+        "transformer_layer_count": transformer_layer_count,
+        "stages": json_safe(stages),
+    }
+
+
+def _source_text(obj: Any) -> str:
+    try:
+        return inspect.getsource(obj)
+    except Exception:
+        return ""
+
+
+def _forward_helper_method_names(cls: type) -> list[str]:
+    forward = getattr(cls, "forward", None)
+    text = _source_text(forward)
+    if not text:
+        return []
+    names = []
+    for match in re.finditer(r"\bself\.([A-Za-z_]\w*)\s*\(", text):
+        name = match.group(1)
+        if name.startswith("__") or name == "forward" or name in names:
+            continue
+        if callable(getattr(cls, name, None)):
+            names.append(name)
+    return names
+
+
+def _method_detail(obj: Any, *, max_lines: int) -> dict[str, Any]:
+    detail = signature_record(obj)
+    if obj is not None and max_lines > 0:
+        detail["source_snippet"] = source_snippet(obj, max_lines=max_lines)
+    return detail
+
+
+def codec_decoder_forward_contracts(
+    root: Any,
+    *,
+    max_lines: int,
+    target_classes: tuple[str, ...] = CODEC_DECODER_CONTRACT_CLASSES,
+) -> dict[str, Any]:
+    """Capture signatures and source snippets for known codec decoder classes."""
+    if not hasattr(root, "named_modules"):
+        return {"present": False, "reason": "root has no named_modules", "classes": {}}
+
+    records: dict[str, dict[str, Any]] = {}
+    for module_name, module in root.named_modules():
+        cls = type(module)
+        class_name = cls.__name__
+        if class_name not in target_classes:
+            continue
+        record = records.setdefault(
+            class_name,
+            {
+                "class": class_record(cls),
+                "module_count": 0,
+                "module_examples": [],
+                "methods": {},
+                "forward_helper_methods": [],
+            },
+        )
+        record["module_count"] += 1
+        if len(record["module_examples"]) < 16:
+            record["module_examples"].append(module_name or "<root>")
+
+    for class_name, record in records.items():
+        cls_module = None
+        for _, module in root.named_modules():
+            if type(module).__name__ == class_name:
+                cls_module = module
+                break
+        if cls_module is None:
+            continue
+        cls = type(cls_module)
+        methods = record["methods"]
+        for method_name in ("__init__", "forward"):
+            methods[method_name] = _method_detail(
+                getattr(cls, method_name, None), max_lines=max_lines
+            )
+        helpers = _forward_helper_method_names(cls)
+        record["forward_helper_methods"] = helpers
+        for helper_name in helpers:
+            methods[helper_name] = _method_detail(
+                getattr(cls, helper_name, None), max_lines=max_lines
+            )
+
+    missing = [name for name in target_classes if name not in records]
+    return {
+        "present": bool(records),
+        "target_classes": list(target_classes),
+        "missing_target_classes": missing,
+        "classes": records,
+    }
 
 
 def memory_snapshot(label: str, device: str) -> dict[str, Any]:
@@ -953,6 +1117,9 @@ def build_report(cfg: IntrospectionConfig) -> tuple[Report, int]:
     report.audio_tokenizer["config"] = public_config_attrs(
         getattr(codec, "config", None)
     )
+    report.audio_tokenizer["decoder_stage_config_summary"] = (
+        decoder_stage_config_summary(getattr(codec, "config", None))
+    )
     report.methods["_decode_frame"] = signature_record(
         getattr(codec, "_decode_frame", None)
     )
@@ -993,6 +1160,13 @@ def build_report(cfg: IntrospectionConfig) -> tuple[Report, int]:
             decoder,
             max_depth=cfg.tree_max_depth,
             max_children=cfg.tree_max_children,
+        ),
+        "decoder_stage_config_summary": decoder_stage_config_summary(
+            getattr(codec, "config", None)
+        ),
+        "forward_contracts": codec_decoder_forward_contracts(
+            decoder,
+            max_lines=cfg.source_context_lines,
         ),
     }
     report.architecture_hints = infer_architecture_hints(codec, decoder)
@@ -1073,6 +1247,37 @@ def render_markdown(report: Report) -> str:
         f"(`{selected.get('module')}.{selected.get('qualname')}`)"
     )
     lines.append(f"- Source: `{selected.get('source_location')}`")
+    stage_summary = data.get("codec_decoder", {}).get(
+        "decoder_stage_config_summary", {}
+    )
+    if stage_summary.get("present"):
+        lines.extend(["", "## Decoder Stage Config", ""])
+        lines.append(
+            f"- Stages: {stage_summary.get('stage_count')}, "
+            f"transformer stages: {stage_summary.get('transformer_stage_count')}, "
+            f"transformer layers: {stage_summary.get('transformer_layer_count')}"
+        )
+        for stage in stage_summary.get("stages", []):
+            lines.append(
+                f"- stage={stage.get('stage_index')} "
+                f"type={stage.get('module_type')} d_model={stage.get('d_model')} "
+                f"heads={stage.get('heads')} head_dim={stage.get('head_dim')} "
+                f"layers={stage.get('layers')} ffn={stage.get('ffn')} "
+                f"in={stage.get('input_dimension')} out={stage.get('output_dimension')} "
+                f"context={stage.get('context_duration')} patch={stage.get('patch_size')} "
+                f"causal={stage.get('causal')} pos={stage.get('positional_embedding')}"
+            )
+    contracts = data.get("codec_decoder", {}).get("forward_contracts", {})
+    if contracts.get("present"):
+        lines.extend(["", "## Decoder Forward Contracts", ""])
+        for class_name, contract in contracts.get("classes", {}).items():
+            methods = contract.get("methods", {})
+            forward = methods.get("forward", {})
+            helpers = ", ".join(contract.get("forward_helper_methods", [])) or "none"
+            lines.append(
+                f"- `{class_name}`: count={contract.get('module_count')}, "
+                f"forward=`{forward.get('signature')}`, helpers={helpers}"
+            )
     lines.extend(["", "## State Dict Groups", ""])
     for group in data.get("state_dict", {}).get("groups", [])[:80]:
         layer_count = group.get("layer_count")
