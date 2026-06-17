@@ -8,6 +8,7 @@ from torch import nn
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
     MossTTSLocalPatchTransform,
     MossTTSLocalProjectedTransformer,
+    MossTTSLocalTransformerLayer,
     MossTTSLocalVocoderDecoder,
 )
 
@@ -16,6 +17,9 @@ class _FakeLayerScale(nn.Module):
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
         self.scale = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.scale * x
 
 
 class _FakeAttention(nn.Module):
@@ -93,6 +97,51 @@ class _PatchStage(nn.Module):
         self.module_type = "PatchedPretransform"
 
 
+class _CountingLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int) -> None:
+        super().__init__(in_features, out_features)
+        self.calls = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.calls += 1
+        return super().forward(x)
+
+
+class _CountingLayerNorm(nn.LayerNorm):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__(hidden_size)
+        self.calls = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.calls += 1
+        return super().forward(x)
+
+
+class _CountingLayerScale(_FakeLayerScale):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__(hidden_size)
+        self.calls = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.calls += 1
+        return super().forward(x)
+
+
+class _CountingLayer(_FakeLayer):
+    def __init__(self, hidden_size: int) -> None:
+        nn.Module.__init__(self)
+        self.norm1 = _CountingLayerNorm(hidden_size)
+        self.self_attn = _FakeAttention(hidden_size)
+        self.layer_scale_1 = _CountingLayerScale(hidden_size)
+        self.norm2 = _CountingLayerNorm(hidden_size)
+        self.ffn = nn.Sequential(
+            _CountingLinear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            _CountingLinear(hidden_size * 2, hidden_size),
+        )
+        self.layer_scale_2 = _CountingLayerScale(hidden_size)
+
+
 def test_patch_transform_decode_matches_moss_layout() -> None:
     stage = MossTTSLocalPatchTransform(_PatchStage(patch_size=2, is_downsample=False))
     x = torch.arange(1 * 4 * 3).reshape(1, 4, 3)
@@ -116,6 +165,21 @@ def test_projected_transformer_fallback_receives_original_layout() -> None:
     assert source.seen_input_shape == (2, 3, 4)
     assert torch.equal(out, x + 10)
     assert torch.equal(out_lengths, lengths + 1)
+
+
+def test_transformer_layer_uses_source_modules_for_primitive_ops() -> None:
+    source = _CountingLayer(hidden_size=6)
+    wrapper = MossTTSLocalTransformerLayer(source)
+    x = torch.randn(2, 4, 6)
+
+    _ = wrapper(x, input_lengths=torch.tensor([4, 4]))
+
+    assert source.norm1.calls == 1
+    assert source.norm2.calls == 1
+    assert source.layer_scale_1.calls == 1
+    assert source.layer_scale_2.calls == 1
+    assert source.ffn[0].calls == 1
+    assert source.ffn[2].calls == 1
 
 
 def test_vocoder_decoder_wraps_supported_stage_types() -> None:

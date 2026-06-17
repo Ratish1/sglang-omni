@@ -16,7 +16,6 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 logger = logging.getLogger(__name__)
@@ -39,56 +38,17 @@ def _first_attr(obj: Any, *names: str) -> Any:
     return None
 
 
-def _linear(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
-    weight = getattr(module, "weight", None)
-    if not isinstance(weight, torch.Tensor):
-        raise TypeError(f"{module.__class__.__name__} is missing a tensor weight")
-    bias = getattr(module, "bias", None)
-    return F.linear(x, weight, bias if isinstance(bias, torch.Tensor) else None)
-
-
-def _layer_norm(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
-    weight = getattr(module, "weight", None)
-    if not isinstance(weight, torch.Tensor):
-        raise TypeError(f"{module.__class__.__name__} is missing a tensor weight")
-    bias = getattr(module, "bias", None)
-    normalized_shape = getattr(module, "normalized_shape", weight.shape)
-    eps = float(getattr(module, "eps", 1e-5))
-    return F.layer_norm(
-        x,
-        tuple(normalized_shape),
-        weight,
-        bias if isinstance(bias, torch.Tensor) else None,
-        eps,
-    )
-
-
-def _layer_scale(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
-    scale = getattr(module, "scale", None)
-    if not isinstance(scale, torch.Tensor):
-        return module(x)
-    return x * scale
-
-
-def _gelu(x: torch.Tensor, module: nn.Module | None) -> torch.Tensor:
-    approximate = (
-        getattr(module, "approximate", "none") if module is not None else "none"
-    )
-    return F.gelu(x, approximate=approximate)
-
-
 def _pack_padded_sequence(
     x: torch.Tensor,
     input_lengths: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size, max_seqlen, _ = x.shape
-    positions = torch.arange(max_seqlen, device=x.device, dtype=input_lengths.dtype)
+    positions = torch.arange(max_seqlen, device=x.device, dtype=torch.long)
     valid_mask = positions.view(1, max_seqlen) < input_lengths.view(batch_size, 1)
     packed_x = x[valid_mask]
-    cu_seqlens = torch.empty(batch_size + 1, dtype=torch.int32, device=x.device)
-    cu_seqlens[0] = 0
-    cu_seqlens[1:] = input_lengths.to(torch.int32).cumsum(0)
-    position_ids = positions.expand(batch_size, max_seqlen)[valid_mask].to(torch.long)
+    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=x.device)
+    cu_seqlens[1:] = torch.cumsum(input_lengths.to(torch.int32), dim=0)
+    position_ids = positions.view(1, max_seqlen).expand(batch_size, -1)[valid_mask]
     return packed_x, valid_mask, cu_seqlens, position_ids
 
 
@@ -176,7 +136,7 @@ class MossTTSLocalAttention(nn.Module):
     def _project_qkv(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        projected = _linear(x, self.in_proj)
+        projected = self.in_proj(x)
         if x.dim() == 3:
             projected = projected.reshape(
                 x.shape[0], x.shape[1], 3, self.num_heads, self.head_dim
@@ -234,7 +194,7 @@ class MossTTSLocalAttention(nn.Module):
             causal=self.causal,
             window_size=window_size,
         )
-        return _linear(out.reshape(x.shape[0], self.embed_dim), self.out_proj)
+        return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
 
 
 class MossTTSLocalTransformerLayer(nn.Module):
@@ -260,17 +220,12 @@ class MossTTSLocalTransformerLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         residual = x
-        x = _layer_norm(x, self.norm1)
-        x = residual.to(x) + _layer_scale(
-            self.self_attn(x, **kwargs), self.layer_scale_1
-        )
+        x = self.norm1(x)
+        x = residual.to(x) + self.layer_scale_1(self.self_attn(x, **kwargs))
         residual = x
-        x = _layer_norm(x, self.norm2)
-        ffn0 = self.ffn[0]
-        ffn1 = self.ffn[1]
-        ffn2 = self.ffn[2]
-        x = _linear(_gelu(_linear(x, ffn0), ffn1), ffn2)
-        return residual.to(x) + _layer_scale(x, self.layer_scale_2)
+        x = self.norm2(x)
+        x = residual.to(x) + self.layer_scale_2(self.ffn(x))
+        return x
 
 
 class MossTTSLocalTransformer(nn.Module):
@@ -342,7 +297,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         source_x = x
-        x = _linear(x.transpose(1, 2), self.input_proj)
+        x = self.input_proj(x.transpose(1, 2))
         if (
             not self.is_streaming
             and self.transformer.resolve_attention_implementation(x)
@@ -373,7 +328,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
                 x = x.new_zeros(x.shape)
         else:
             return self.source(source_x, input_lengths, **kwargs)
-        return _linear(x, self.output_proj).transpose(1, 2), input_lengths
+        return self.output_proj(x).transpose(1, 2), input_lengths
 
 
 class MossTTSLocalPatchTransform(nn.Module):
