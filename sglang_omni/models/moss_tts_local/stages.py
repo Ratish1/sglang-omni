@@ -673,9 +673,14 @@ def create_vocoder_executor(
     stream_slots: int = 8,
     stream_chunk_frames: int = 25,
     initial_chunk_frames: int = 5,
+    nonstream_vocoder_decoder: str | None = None,
 ) -> MossTTSLocalStreamingVocoderScheduler:
     device = _resolve_codec_device(device, gpu_id)
     processor = _load_moss_tts_local_processor(model_path, device=device)
+    if nonstream_vocoder_decoder is None:
+        nonstream_vocoder_decoder = os.environ.get(
+            "SGLANG_OMNI_MOSS_LOCAL_NONSTREAM_VOCODER_DECODER"
+        )
     return MossTTSLocalStreamingVocoderScheduler(
         processor,
         stream_slots=stream_slots,
@@ -683,4 +688,5 @@ def create_vocoder_executor(
         initial_chunk_frames=initial_chunk_frames,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        nonstream_decoder=nonstream_vocoder_decoder,
     )

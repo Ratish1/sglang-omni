@@ -23,6 +23,11 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
+from sglang_omni.models.moss_tts_local.vocoder_decoder import (
+    MossTTSLocalVocoderDecoder,
+    build_moss_tts_local_vocoder_decoder,
+    use_moss_tts_local_vocoder_decoder,
+)
 from sglang_omni.models.tts_streaming import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     resolve_initial_codec_chunk_frames,
@@ -226,6 +231,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         max_step_frames: int = 100,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 2,
+        nonstream_decoder: str | None = None,
     ) -> None:
         if stream_slots < 1:
             raise ValueError(f"stream_slots must be >= 1, got {stream_slots}")
@@ -251,6 +257,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             )
         self._processor = processor
         self._codec = codec
+        self._nonstream_decoder = self._build_nonstream_decoder(nonstream_decoder)
         self._stream_slots = int(stream_slots)
         self._stream_chunk_frames = int(stream_chunk_frames)
         self._default_initial_chunk_frames = max(
@@ -268,6 +275,24 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             max_batch_size=max_batch_size,
             max_batch_wait_ms=max_batch_wait_ms,
         )
+
+    def _build_nonstream_decoder(
+        self, nonstream_decoder: str | None
+    ) -> MossTTSLocalVocoderDecoder | None:
+        mode = (nonstream_decoder or "processor").strip().lower()
+        if mode in {"", "processor", "default"}:
+            return None
+        if mode not in {"owned", "owned-pytorch"}:
+            raise ValueError(
+                f"unsupported MOSS-TTS Local non-streaming vocoder decoder "
+                f"{nonstream_decoder!r}; expected 'processor' or 'owned-pytorch'"
+            )
+        decoder = build_moss_tts_local_vocoder_decoder(self._codec)
+        logger.info(
+            "MOSS-TTS Local non-streaming vocoder decoder=owned-pytorch stages=%d",
+            len(decoder),
+        )
+        return decoder
 
     def start(self) -> None:
         try:
@@ -601,6 +626,15 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         """Decode ``[T, >=n_vq]`` row tensors to fp32 CPU waveforms."""
         with torch_profile_range("moss.vocoder.decode_codes_rows"):
             if self._session is None:
+                if self._nonstream_decoder is not None:
+                    with use_moss_tts_local_vocoder_decoder(
+                        self._codec,
+                        self._nonstream_decoder,
+                    ):
+                        return [
+                            torch.as_tensor(wav).detach().to("cpu")
+                            for wav in self._processor.decode_audio_codes(codes_list)
+                        ]
                 return [
                     torch.as_tensor(wav).detach().to("cpu")
                     for wav in self._processor.decode_audio_codes(codes_list)

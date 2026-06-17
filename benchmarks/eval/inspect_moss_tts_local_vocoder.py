@@ -30,6 +30,10 @@ import torch
 
 from sglang_omni.models.moss_tts_local.stages import _load_moss_tts_local_processor
 from sglang_omni.models.moss_tts_local.streaming_vocoder import _CodecStreamSession
+from sglang_omni.models.moss_tts_local.vocoder_decoder import (
+    build_moss_tts_local_vocoder_decoder,
+    use_moss_tts_local_vocoder_decoder,
+)
 from sglang_omni.models.moss_tts_local.vocoder_introspection import (
     summarize_moss_tts_local_vocoder,
 )
@@ -213,6 +217,7 @@ def _run_probe(
     seed: int,
     max_step_frames: int,
     device: torch.device,
+    compare_owned_decoder: bool,
 ) -> dict[str, Any]:
     n_vq = _num_codebooks(processor)
     vocab_size = _audio_vocab_size(processor)
@@ -237,9 +242,28 @@ def _run_probe(
         device=device,
     )
 
+    codec = processor.audio_tokenizer
+    owned_outputs: list[torch.Tensor] | None = None
+    owned_timing: dict[str, Any] | None = None
+    if compare_owned_decoder:
+        owned_decoder = build_moss_tts_local_vocoder_decoder(codec)
+
+        def owned_decode() -> list[torch.Tensor]:
+            with use_moss_tts_local_vocoder_decoder(codec, owned_decoder):
+                return [
+                    torch.as_tensor(wav).detach().to("cpu", torch.float32)
+                    for wav in processor.decode_audio_codes(codes_list)
+                ]
+
+        owned_outputs, owned_timing = _time_call(
+            "owned_decoder.decode_audio_codes",
+            owned_decode,
+            iterations=iterations,
+            device=device,
+        )
+
     channels_first = [codes.transpose(0, 1).contiguous() for codes in codes_list]
 
-    codec = processor.audio_tokenizer
     session = _CodecStreamSession(
         codec,
         stream_slots=0,
@@ -271,6 +295,22 @@ def _run_probe(
             **processor_timing,
             "outputs": [_tensor_output_summary(out) for out in processor_outputs],
         },
+        **(
+            {
+                "owned_decoder_decode": {
+                    **owned_timing,
+                    "outputs": [
+                        {
+                            **_tensor_output_summary(out),
+                            "comparison": _compare_tensors(ref, out),
+                        }
+                        for ref, out in zip(processor_outputs, owned_outputs or [])
+                    ],
+                }
+            }
+            if owned_timing is not None
+            else {}
+        ),
         "session_offline_decode": {
             **session_timing,
             "outputs": [
@@ -325,27 +365,42 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                 "",
                 "## Decode Probes",
                 "",
-                "| batch | frames | processor ms | session ms | max abs delta |",
-                "|---:|---:|---:|---:|---:|",
+                "| batch | frames | processor ms | owned ms | owned max delta | session ms | session max delta |",
+                "|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
     for probe in probes:
-        comparisons = [
+        session_comparisons = [
             out.get("comparison", {})
             for out in probe["session_offline_decode"].get("outputs", [])
         ]
-        max_delta = max(
-            (float(comp.get("max_abs_delta", 0.0)) for comp in comparisons),
+        session_max_delta = max(
+            (float(comp.get("max_abs_delta", 0.0)) for comp in session_comparisons),
             default=0.0,
         )
+        owned = probe.get("owned_decoder_decode")
+        owned_ms = float("nan")
+        owned_max_delta = float("nan")
+        if owned is not None:
+            owned_ms = owned["mean_seconds"] * 1000.0
+            owned_max_delta = max(
+                (
+                    float(out.get("comparison", {}).get("max_abs_delta", 0.0))
+                    for out in owned.get("outputs", [])
+                ),
+                default=0.0,
+            )
         lines.append(
             "| {batch_size} | {frames} | {processor_ms:.3f} | "
-            "{session_ms:.3f} | {max_delta:.6g} |".format(
+            "{owned_ms:.3f} | {owned_max_delta:.6g} | "
+            "{session_ms:.3f} | {session_max_delta:.6g} |".format(
                 batch_size=probe["batch_size"],
                 frames=probe["frames"],
                 processor_ms=probe["processor_decode"]["mean_seconds"] * 1000.0,
+                owned_ms=owned_ms,
+                owned_max_delta=owned_max_delta,
                 session_ms=probe["session_offline_decode"]["mean_seconds"] * 1000.0,
-                max_delta=max_delta,
+                session_max_delta=session_max_delta,
             )
         )
     path.write_text("\n".join(lines) + "\n")
@@ -374,6 +429,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--disable-cudnn-sdp",
         action="store_true",
         help="disable torch.backends.cuda cuDNN SDPA before loading/probing",
+    )
+    parser.add_argument(
+        "--compare-owned-decoder",
+        action="store_true",
+        help="compare the experimental owned PyTorch vocoder decoder against the processor path",
     )
     parser.add_argument("--skip-probes", action="store_true")
     parser.add_argument("--no-markdown", action="store_true")
@@ -419,6 +479,7 @@ def main() -> None:
                     seed=args.seed + index,
                     max_step_frames=args.max_step_frames,
                     device=device,
+                    compare_owned_decoder=args.compare_owned_decoder,
                 )
             )
 
