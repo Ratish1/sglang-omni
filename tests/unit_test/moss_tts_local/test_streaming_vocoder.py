@@ -302,13 +302,24 @@ def test_vocoder_decode_profile_metadata_identifies_active_backend(
     assert metadata["requested_vocoder_backend"] == "owned_pytorch"
     assert metadata["session_active"] is False
     assert metadata["owned_decoder_active"] is True
+    assert metadata["sglang_patch_active"] is False
+
+    scheduler._nonstream_decoder = None
+    scheduler._nonstream_sglang_patch_active = True
+    metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
+    assert metadata["active_vocoder_backend"] == "sglang_patch"
+    assert metadata["requested_vocoder_backend"] == "sglang_patch"
+    assert metadata["session_active"] is False
+    assert metadata["owned_decoder_active"] is False
+    assert metadata["sglang_patch_active"] is True
 
     scheduler._session = object()  # type: ignore[assignment]
     metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
     assert metadata["active_vocoder_backend"] == "session_offline"
-    assert metadata["requested_vocoder_backend"] == "owned_pytorch"
+    assert metadata["requested_vocoder_backend"] == "sglang_patch"
     assert metadata["session_active"] is True
-    assert metadata["owned_decoder_active"] is True
+    assert metadata["owned_decoder_active"] is False
+    assert metadata["sglang_patch_active"] is True
 
 
 def test_vocoder_decode_events_include_backend_and_shape_metadata(

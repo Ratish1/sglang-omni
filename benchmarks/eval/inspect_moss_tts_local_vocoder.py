@@ -37,6 +37,10 @@ from sglang_omni.models.moss_tts_local.vocoder_decoder import (
 from sglang_omni.models.moss_tts_local.vocoder_introspection import (
     summarize_moss_tts_local_vocoder,
 )
+from sglang_omni.models.moss_tts_local.vocoder_sglang_patch import (
+    install_moss_tts_local_sglang_vocoder_patch,
+    uninstall_moss_tts_local_sglang_vocoder_patch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +199,36 @@ def _owned_decode_audio_codes(
         ]
 
 
+def _decode_audio_codes_cpu(
+    processor: Any,
+    codes_list: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    return [
+        torch.as_tensor(wav).detach().to("cpu", torch.float32)
+        for wav in processor.decode_audio_codes(codes_list)
+    ]
+
+
+def _time_sglang_patch_decode_audio_codes(
+    processor: Any,
+    codes_list: list[torch.Tensor],
+    *,
+    iterations: int,
+    device: torch.device,
+) -> tuple[list[torch.Tensor], dict[str, Any]]:
+    codec = processor.audio_tokenizer
+    install_moss_tts_local_sglang_vocoder_patch(codec)
+    try:
+        return _time_call(
+            "sglang_patch.decode_audio_codes",
+            lambda: _decode_audio_codes_cpu(processor, codes_list),
+            iterations=iterations,
+            device=device,
+        )
+    finally:
+        uninstall_moss_tts_local_sglang_vocoder_patch(codec)
+
+
 def _tensor_output_summary(tensor: torch.Tensor) -> dict[str, Any]:
     cpu = torch.as_tensor(tensor).detach().to("cpu", torch.float32)
     return {
@@ -282,6 +316,7 @@ def _run_stress_case(
     seed: int,
     device: torch.device,
     compare_owned_decoder: bool,
+    compare_sglang_patch: bool,
 ) -> dict[str, Any]:
     n_vq = _num_codebooks(processor)
     vocab_size = _audio_vocab_size(processor)
@@ -316,6 +351,18 @@ def _run_stress_case(
             device=device,
         )
 
+    sglang_patch_timing: dict[str, Any] | None = None
+    sglang_patch_outputs: list[torch.Tensor] | None = None
+    if compare_sglang_patch:
+        sglang_patch_outputs, sglang_patch_timing = (
+            _time_sglang_patch_decode_audio_codes(
+                processor,
+                codes_list,
+                iterations=iterations,
+                device=device,
+            )
+        )
+
     result: dict[str, Any] = {
         "name": name,
         "batch_size": len(frames_list),
@@ -334,6 +381,11 @@ def _run_stress_case(
             **owned_timing,
             **_summarize_comparisons(processor_outputs, owned_outputs),
         }
+    if sglang_patch_timing is not None and sglang_patch_outputs is not None:
+        result["sglang_patch_decode"] = {
+            **sglang_patch_timing,
+            **_summarize_comparisons(processor_outputs, sglang_patch_outputs),
+        }
     return result
 
 
@@ -347,6 +399,7 @@ def _run_probe(
     max_step_frames: int,
     device: torch.device,
     compare_owned_decoder: bool,
+    compare_sglang_patch: bool,
 ) -> dict[str, Any]:
     n_vq = _num_codebooks(processor)
     vocab_size = _audio_vocab_size(processor)
@@ -381,6 +434,18 @@ def _run_probe(
             lambda: _owned_decode_audio_codes(processor, codes_list, owned_decoder),
             iterations=iterations,
             device=device,
+        )
+
+    sglang_patch_outputs: list[torch.Tensor] | None = None
+    sglang_patch_timing: dict[str, Any] | None = None
+    if compare_sglang_patch:
+        sglang_patch_outputs, sglang_patch_timing = (
+            _time_sglang_patch_decode_audio_codes(
+                processor,
+                codes_list,
+                iterations=iterations,
+                device=device,
+            )
         )
 
     channels_first = [codes.transpose(0, 1).contiguous() for codes in codes_list]
@@ -430,6 +495,18 @@ def _run_probe(
                 }
             }
             if owned_timing is not None
+            else {}
+        ),
+        **(
+            {
+                "sglang_patch_decode": {
+                    **sglang_patch_timing,
+                    **_summarize_comparisons(
+                        processor_outputs, sglang_patch_outputs or []
+                    ),
+                }
+            }
+            if sglang_patch_timing is not None
             else {}
         ),
         "session_offline_decode": {
@@ -486,8 +563,8 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                 "",
                 "## Decode Probes",
                 "",
-                "| batch | frames | processor ms | owned ms | owned max delta | session ms | session max delta |",
-                "|---:|---:|---:|---:|---:|---:|---:|",
+                "| batch | frames | processor ms | owned ms | owned max delta | sglang patch ms | sglang patch max delta | session ms | session max delta |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
     for probe in probes:
@@ -511,15 +588,24 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                 ),
                 default=0.0,
             )
+        sglang_patch = probe.get("sglang_patch_decode")
+        sglang_patch_ms = float("nan")
+        sglang_patch_max_delta = float("nan")
+        if sglang_patch is not None:
+            sglang_patch_ms = sglang_patch["mean_seconds"] * 1000.0
+            sglang_patch_max_delta = float(sglang_patch.get("max_abs_delta", 0.0))
         lines.append(
             "| {batch_size} | {frames} | {processor_ms:.3f} | "
             "{owned_ms:.3f} | {owned_max_delta:.6g} | "
+            "{sglang_patch_ms:.3f} | {sglang_patch_max_delta:.6g} | "
             "{session_ms:.3f} | {session_max_delta:.6g} |".format(
                 batch_size=probe["batch_size"],
                 frames=probe["frames"],
                 processor_ms=probe["processor_decode"]["mean_seconds"] * 1000.0,
                 owned_ms=owned_ms,
                 owned_max_delta=owned_max_delta,
+                sglang_patch_ms=sglang_patch_ms,
+                sglang_patch_max_delta=sglang_patch_max_delta,
                 session_ms=probe["session_offline_decode"]["mean_seconds"] * 1000.0,
                 session_max_delta=session_max_delta,
             )
@@ -531,8 +617,8 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                 "",
                 "## Stress Cases",
                 "",
-                "| name | batch | total frames | max frames | processor ms | owned ms | owned max delta |",
-                "|---|---:|---:|---:|---:|---:|---:|",
+                "| name | batch | total frames | max frames | processor ms | owned ms | owned max delta | sglang patch ms | sglang patch max delta |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
     for case in stress_cases:
@@ -542,9 +628,16 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         if owned is not None:
             owned_ms = owned["mean_seconds"] * 1000.0
             owned_max_delta = float(owned.get("max_abs_delta", 0.0))
+        sglang_patch = case.get("sglang_patch_decode")
+        sglang_patch_ms = float("nan")
+        sglang_patch_max_delta = float("nan")
+        if sglang_patch is not None:
+            sglang_patch_ms = sglang_patch["mean_seconds"] * 1000.0
+            sglang_patch_max_delta = float(sglang_patch.get("max_abs_delta", 0.0))
         lines.append(
             "| {name} | {batch_size} | {total_frames} | {max_frames} | "
-            "{processor_ms:.3f} | {owned_ms:.3f} | {owned_max_delta:.6g} |".format(
+            "{processor_ms:.3f} | {owned_ms:.3f} | {owned_max_delta:.6g} | "
+            "{sglang_patch_ms:.3f} | {sglang_patch_max_delta:.6g} |".format(
                 name=case["name"],
                 batch_size=case["batch_size"],
                 total_frames=case["total_frames"],
@@ -552,6 +645,8 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                 processor_ms=case["processor_decode"]["mean_seconds"] * 1000.0,
                 owned_ms=owned_ms,
                 owned_max_delta=owned_max_delta,
+                sglang_patch_ms=sglang_patch_ms,
+                sglang_patch_max_delta=sglang_patch_max_delta,
             )
         )
     path.write_text("\n".join(lines) + "\n")
@@ -585,6 +680,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--compare-owned-decoder",
         action="store_true",
         help="compare the experimental owned PyTorch vocoder decoder against the processor path",
+    )
+    parser.add_argument(
+        "--compare-sglang-patch",
+        action="store_true",
+        help="compare processor decode after installing the SGLang FlashAttention patch against the unpatched processor path",
     )
     parser.add_argument(
         "--stress-suite",
@@ -637,6 +737,7 @@ def main() -> None:
                     max_step_frames=args.max_step_frames,
                     device=device,
                     compare_owned_decoder=args.compare_owned_decoder,
+                    compare_sglang_patch=args.compare_sglang_patch,
                 )
             )
     if args.stress_suite:
@@ -657,6 +758,7 @@ def main() -> None:
                     seed=args.seed + 1000 + index,
                     device=device,
                     compare_owned_decoder=args.compare_owned_decoder,
+                    compare_sglang_patch=args.compare_sglang_patch,
                 )
             )
 
