@@ -1,89 +1,105 @@
-# gpt-5.5 pro research prompt: moss-tts local vocoder sglang backend
+# gpt-5.5 pro research prompt: best production design for moss-tts local vocoder acceleration
 
-We are optimizing MOSS-TTS Local non-streaming vocoder in SGLang-Omni. The strategic goal is to avoid a large custom vocoder reimplementation and instead patch/reuse SGLang attention or kernel internals cleanly inside the existing MOSS vocoder path. We need a production-quality design, not a brute-force or hacky implementation.
+You are acting as a senior ML systems architect reviewing how to accelerate the MOSS-TTS Local non-streaming vocoder in SGLang-Omni. Treat this as an independent research and design task. Do not assume the current implementation direction is correct. Derive the best strategy from first principles, code inspection, kernel semantics, production risk, and empirical evidence.
 
-## repositories and branches
+The primary question:
 
-- SGLang-Omni repo: `/Users/ratish/sglang-omni`
-- Current experimental worktree: `/Users/ratish/sglang-omni/.worktrees/moss-vocoder-monkey-patch`
-- Branch: `perf/moss-vocoder-monkey-patch`
-- Commit: `04573e8f Add SGLang vocoder attention patch mode`
-- Local SGLang repo: `/Users/ratish/sglang`
+> What is the best production-quality way to make the MOSS-TTS Local vocoder faster by reusing or patching SGLang internals, while preserving the correct vocoder semantics and making the implementation maintainable?
 
-## relevant files to read
+## Environment And Repositories
 
-Read these files completely, segmenting large files as needed:
+- SGLang-Omni repository: `/Users/ratish/sglang-omni`
+- Experimental SGLang-Omni worktree: `/Users/ratish/sglang-omni/.worktrees/moss-vocoder-monkey-patch`
+- Experimental branch: `perf/moss-vocoder-monkey-patch`
+- Current commit with prompt: check `git rev-parse HEAD`
+- Local SGLang repository: `/Users/ratish/sglang`
+- Target model: `OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5`
+- Target use case: non-streaming MOSS-TTS generation, concurrency around 8, H100 GPU
 
-- `sglang_omni/models/moss_tts_local/vocoder_sglang_patch.py`
+## Research Objective
+
+Investigate all reasonable acceleration strategies and recommend the best one. Do not restrict yourself to the currently attempted monkey-patch or owned-decoder approaches. Consider:
+
+- preserving the Hugging Face remote MOSS vocoder implementation and changing only backend hooks
+- adding a narrow adapter around SGLang attention or sgl-kernel functions
+- patching SGLang core with a reusable helper if that is architecturally justified
+- optimizing the exact SDPA/cuDNN path rather than forcing FlashAttention
+- owning a small amount of model-specific code in SGLang-Omni if it is the cleanest boundary
+- accepting small numerical/audio drift only if that is a defensible product decision with objective quality gates
+- rejecting an approach entirely if it creates correctness risk or poor maintainability
+
+## Files To Read Completely
+
+Read the relevant files fully. Segment large files if needed, but do not rely on small snippets only.
+
+### SGLang-Omni
+
 - `sglang_omni/models/moss_tts_local/streaming_vocoder.py`
+- `sglang_omni/models/moss_tts_local/vocoder_sglang_patch.py`
 - `sglang_omni/models/moss_tts_local/vocoder_decoder.py`
+- `sglang_omni/models/moss_tts_local/vocoder_introspection.py`
 - `benchmarks/eval/inspect_moss_tts_local_vocoder.py`
 - `tests/unit_test/moss_tts_local/test_vocoder_sglang_patch.py`
+- `tests/unit_test/moss_tts_local/test_vocoder_decoder.py`
 - `tests/unit_test/moss_tts_local/test_streaming_vocoder.py`
+- `tasks/` files related to MOSS vocoder planning if present
+
+### SGLang
+
 - `/Users/ratish/sglang/python/sglang/jit_kernel/flash_attention.py`
 - `/Users/ratish/sglang/python/sglang/jit_kernel/flash_attention_v3.py`
-- Any relevant SGLang attention/backend files that explain varlen FlashAttention semantics, FA2 vs FA3 selection, window semantics, deterministic behavior, and kernel defaults
+- `/Users/ratish/sglang/python/sglang/jit_kernel/flash_attention_v4.py` if present
+- `/Users/ratish/sglang/python/sglang/srt/layers/attention/flashattention_backend.py`
+- `/Users/ratish/sglang/python/sglang/srt/layers/attention/vision.py`
+- Any local SGLang attention, kernel, or multimodal files that clarify how production code selects FA2, FA3, FA4, FlashInfer, SDPA, cuDNN SDPA, or sgl-kernel paths
 
-Also inspect the MOSS remote tokenizer implementation if available from Hugging Face cache or local introspection JSON artifacts. Important known snippets from the remote MOSS audio tokenizer:
+### MOSS Remote Code
 
-```python
-def forward(self, x, input_lengths, **kwargs):
-    x = self.input_proj(x.transpose(1, 2))
-    if not self.is_streaming and self.transformer.resolve_attention_implementation(x) == "flash_attention_2":
-        batch_size, max_seqlen, _ = x.shape
-        if max_seqlen > 0 and bool(input_lengths.any().item()):
-            max_valid_seqlen = int(input_lengths.max().item())
-            packed_x, valid_mask, cu_seqlens, position_ids = pack_padded_sequence(x, input_lengths)
-            packed_x = self.transformer(
-                packed_x,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_valid_seqlen,
-                position_ids=position_ids,
-                input_lengths=input_lengths,
-                **kwargs,
-            )
-            x = unpack_packed_sequence(packed_x, valid_mask, batch_size, max_seqlen)
-        else:
-            x = x.new_zeros(x.shape)
-    else:
-        x = self.transformer(x, input_lengths=input_lengths, **kwargs)
-    x = self.output_proj(x).transpose(1, 2)
-    return x, input_lengths
-```
+Read the real Hugging Face remote code for `MOSS-Audio-Tokenizer-v2` if available in cache. If it is not available, use the local introspection JSON artifacts in the repository root, including any of:
 
-```python
-def _forward_non_streaming_flash(self, x, cu_seqlens, max_seqlen, position_ids):
-    q, k, v = self._project_qkv(x)
-    q, k = self._apply_packed_rope(q, k, position_ids)
-    out = self._run_flash_attention(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen)
-    return out.reshape(x.shape[0], self.embed_dim)
-```
+- `vocoder.json`
+- `vocoder_custom.json`
+- `local_codec.json`
+- `local_codec_b8.json`
+- `digest.json`
 
-```python
-def _run_flash_attention(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k):
-    if flash_attn_varlen_func is None:
-        raise RuntimeError("flash-attn is not installed.")
-    window_size = (self.context, 0) if (self.context is not None and self.causal) else (-1, -1)
-    return flash_attn_varlen_func(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        causal=self.causal,
-        window_size=window_size,
-    )
-```
+Focus on:
 
-## experiments already run
+- decoder stage structure
+- projected transformer stages
+- attention implementation selection
+- non-streaming vs streaming decode differences
+- RoPE implementation and positional semantics
+- packed sequence path
+- SDPA path
+- FlashAttention path
+- cache/state behavior
+- dtype and tensor layout contracts
 
-### owned decoder path
+## Known Empirical Observations
 
-We built a repo-owned decoder replacement using SGLang-backed attention. It reached good full benchmark speed but failed strict stress parity against `processor.decode_audio_codes`.
+Treat these as observations to explain, not conclusions to accept.
 
-Stress result:
+### Baseline and optimized benchmark context
+
+The broad serving goal is to reduce MOSS-TTS Local real-time factor for non-streaming generation, ideally below `0.3`, without changing generated audio semantics unless explicitly accepted.
+
+Representative strong full-run result from a custom owned decoder direction:
+
+| metric | value |
+|---|---:|
+| completed | 1088 |
+| failed | 0 |
+| qps | about 6.42 |
+| rtf_mean | about 0.294 |
+| latency_mean_s | about 1.24 |
+| output_throughput | about 353 tok/s |
+
+However, this path later failed strict waveform parity stress tests.
+
+### Owned decoder stress result
+
+A repo-owned decoder replacement was much faster in some cases but not waveform-exact versus `processor.decode_audio_codes`:
 
 | case | batch | total frames | max frames | processor ms | owned ms | owned max delta |
 |---|---:|---:|---:|---:|---:|---:|
@@ -93,11 +109,9 @@ Stress result:
 | mixed_8 | 8 | 1025 | 300 | 754.969 | 331.375 | 0.941406 |
 | mixed_16 | 16 | 2449 | 400 | 2005.005 | 766.758 | 1.53906 |
 
-Conclusion: fast but not correctness-safe.
+### Fused RoPE result
 
-### fused rope experiment
-
-An SGLang-style fused RoPE path was faster but not waveform-exact:
+An experimental fused RoPE path reduced time inside the attention path but produced nonzero waveform deltas:
 
 | probe | max_abs | mean_abs | snr |
 |---|---:|---:|---:|
@@ -105,18 +119,16 @@ An SGLang-style fused RoPE path was faster but not waveform-exact:
 | bs=1, frames=100 | 0.01807 | 0.000525 | 37.09 dB |
 | bs=8, frames=100 | 0.03397 | 0.000543 | 34.78 dB |
 
-Conclusion: do not use as correctness-safe default.
+### Monkey-patch result
 
-### monkey patch experiment
-
-We then created a smaller patch that preserves the Hugging Face processor/vocoder implementation and only changes the remote module globals:
+An experiment preserved the Hugging Face processor/vocoder path and patched remote module globals so the MOSS FlashAttention hook used SGLang:
 
 ```python
 module.flash_attn_varlen_func = sglang.jit_kernel.flash_attention.flash_attn_varlen_func
 module.HAS_FLASH_ATTN = True
 ```
 
-The patch installed successfully with `attention_modules=92`, but parity was still nonzero and mixed/long cases became slower:
+The patch installed successfully and found `attention_modules=92`, but waveform parity was not exact and longer/mixed stress cases slowed down:
 
 | case | processor ms | sglang patch ms | max_abs_delta |
 |---|---:|---:|---:|
@@ -131,45 +143,83 @@ The patch installed successfully with `attention_modules=92`, but parity was sti
 | mixed_8 | 758.759 | 1064.330 | 0.513184 |
 | mixed_16 | 1995.862 | 3716.965 | 0.674805 |
 
-Important local observation: `/Users/ratish/sglang/python/sglang/jit_kernel/flash_attention.py` routes `flash_attn_varlen_func` through `flash_attention_v3.py` by default (`ver=3`). On H100, `flash_attention_v3.py` reports FA3 support and calls SGLang/sgl-kernel FA3 kernels, only falling back to upstream `flash_attn` FA2 when FA3 is unsupported. Therefore the monkey patch does not merely replace missing `flash_attn` with an equivalent function; it may force a different algorithm/kernel than the unpatched processor path.
+## Key Research Questions
 
-## questions to answer
+Answer these independently from the code and from external ML systems knowledge where useful.
 
-Please answer with a production-code, ML systems perspective:
+1. What is the actual MOSS vocoder computation graph for non-streaming decode?
+   - Which parts are transformer attention?
+   - Which parts are projection, RoPE, normalization, feed-forward, upsampling, convolution, quantizer/dequantizer, or post-processing?
+   - Which parts are likely bottlenecks under batch size 1, mixed lengths, and concurrency 8?
 
-1. Did the monkey patch target the correct HF hook in principle?
-2. Are we missing additional HF globals/classes/methods required to make this exact, or is the observed drift expected from forcing SDPA/cuDNN or upstream behavior into SGLang FA3/FA2?
-3. Could the introspection benchmark itself be wrong due to processor statefulness, streaming state, global patch restore contamination, random codes, CUDA nondeterminism, or calling order?
-4. Compare SGLang `flash_attn_varlen_func` signature and defaults to upstream flash-attn. Are there semantic mismatches around:
-   - FA2 vs FA3 selection
-   - `deterministic`
-   - `return_attn_probs` vs `return_softmax_lse`
-   - `softcap`
-   - `num_splits`
-   - `window_size`
-   - bottom-right causal alignment
-   - dtype/accumulation order
-   - dropout default
-5. What is the next minimal experiment to isolate the cause:
-   - patch to upstream `flash_attn.flash_attn_varlen_func` directly
-   - patch to SGLang wrapper with `ver=4` or `ver=3`
-   - force remote attention implementation without setting `HAS_FLASH_ATTN`
-   - compare SDPA vs upstream FA2 vs SGLang FA3 using a single MOSS attention layer
-   - measure exact tensor deltas at attention output before vocoder waveform
-6. Strategically, should we pursue:
-   - clean monkey patch only
-   - upstream remote-code-compatible adapter
-   - SGLang core kernel changes
-   - optimize exact SDPA/cuDNN processor path
-   - accept approximate waveform deltas under WER/listening gates
-7. What would a top-tier production codebase do here, balancing correctness, speed, maintainability, and risk?
+2. What is the exact semantic contract of the current correct processor path?
+   - Does it use SDPA, cuDNN SDPA, upstream flash-attn, SGLang FA3/FA4, or something else in the observed environment?
+   - Are outputs expected to be bit-exact across attention backends?
+   - If bit-exactness is unrealistic, what quality gate is appropriate for TTS audio?
 
-## desired output
+3. Is a monkey patch a valid production strategy here?
+   - If yes, what must it patch exactly?
+   - Should it patch module globals, class methods, a narrow adapter, or model construction?
+   - How should lifecycle, thread safety, process-global mutation, rollback, and testability be handled?
+   - Is there a safer alternative to monkey patching while still avoiding a full decoder reimplementation?
 
-Give a findings-first answer:
+4. Is SGLang `flash_attn_varlen_func` semantically compatible with the Hugging Face remote-code expectation?
+   - Compare function signatures, defaults, accepted kwargs, and behavior with upstream `flash_attn.flash_attn_varlen_func`.
+   - Inspect FA2 vs FA3 vs FA4 selection.
+   - Inspect `window_size`, `causal`, bottom-right mask alignment, `softmax_scale`, `softcap`, dropout, deterministic behavior, `return_attn_probs`, `return_softmax_lse`, `num_splits`, `pack_gqa`, and dtype accumulation.
+   - Explain whether an adapter can make the SGLang path remote-code-compatible.
 
-- correctness findings with severity
-- whether the monkey patch is coded correctly
-- whether the result invalidates the elegant strategy or just this backend choice
-- exact next experiments and commands/code changes
-- final recommendation for the branch direction
+5. How should we isolate the source of waveform deltas?
+   - What tensor-level probes should be added?
+   - Should we compare attention outputs before waveform generation?
+   - Should we run each backend in a fresh process?
+   - Should we compare SDPA vs cuDNN SDPA vs upstream FA2 vs SGLang FA3/FA4 on the same captured `q/k/v/cu_seqlens`?
+   - What exact commands or scripts should be used?
+
+6. What is the best next implementation strategy?
+   - Continue with a cleaner monkey patch?
+   - Replace the SGLang wrapper with an upstream-compatible adapter?
+   - Add a SGLang core helper?
+   - Optimize exact SDPA/cuDNN path?
+   - Keep owned decoder but repair semantic drift?
+   - Drop strict bit-exactness and use objective audio-quality gates?
+
+7. What would a top-tier production codebase do?
+   - How would it stage experiments?
+   - What would it ship behind flags?
+   - What would it reject?
+   - What tests would block merge?
+   - What telemetry/profiling would it require?
+
+## Required Output
+
+Give a rigorous answer with the following structure:
+
+1. **Executive Recommendation**
+   - One clear recommended direction
+   - Whether the current monkey patch should be kept, modified, or discarded
+   - Whether the owned decoder direction should be kept, modified, or discarded
+
+2. **System Mechanics**
+   - Explain the MOSS vocoder path and where SGLang can realistically help
+   - Identify the exact backend semantics that matter
+
+3. **Findings**
+   - Use severity labels for correctness, performance, maintainability, and process risks
+   - Reference files and line numbers where possible
+   - Separate observed facts from hypotheses
+
+4. **Experiment Plan**
+   - Minimal experiments in priority order
+   - Exact measurements and pass/fail criteria
+   - What result would prove or disprove each strategy
+
+5. **Implementation Plan**
+   - Concrete code design
+   - File boundaries
+   - API or env flag shape
+   - Test plan
+   - Rollback behavior
+
+6. **Final Decision Matrix**
+   - Compare monkey patch, adapter, owned decoder, SGLang core helper, SDPA optimization, and approximate-quality paths across correctness, speed, maintainability, and risk
