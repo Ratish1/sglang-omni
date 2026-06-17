@@ -160,6 +160,15 @@ _STAGE_INTERVAL_EVENTS = (
     ("moss_vocoder_attn_ensure_cache_start", "moss_vocoder_attn_ensure_cache_end"),
     ("moss_vocoder_attn_build_kv_start", "moss_vocoder_attn_build_kv_end"),
     ("moss_vocoder_attn_pack_varlen_start", "moss_vocoder_attn_pack_varlen_end"),
+    (
+        "moss_vocoder_attn_packed_project_qkv_start",
+        "moss_vocoder_attn_packed_project_qkv_end",
+    ),
+    ("moss_vocoder_attn_packed_rope_start", "moss_vocoder_attn_packed_rope_end"),
+    (
+        "moss_vocoder_attn_packed_output_proj_start",
+        "moss_vocoder_attn_packed_output_proj_end",
+    ),
     ("moss_vocoder_attn_flash_remote_start", "moss_vocoder_attn_flash_remote_end"),
     ("moss_vocoder_attn_flash_sglang_start", "moss_vocoder_attn_flash_sglang_end"),
     ("moss_vocoder_attn_unpack_varlen_start", "moss_vocoder_attn_unpack_varlen_end"),

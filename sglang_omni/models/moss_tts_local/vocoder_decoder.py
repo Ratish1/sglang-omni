@@ -29,6 +29,9 @@ from sglang_omni.profiler.ranges import torch_profile_range
 logger = logging.getLogger(__name__)
 
 _ATTENTION_KERNEL_ENV = "SGLANG_OMNI_MOSS_LOCAL_VOCODER_ATTENTION_KERNEL"
+_ATTENTION_DETAIL_PROFILE_ENV = (
+    "SGLANG_OMNI_MOSS_LOCAL_VOCODER_ATTENTION_DETAIL_PROFILE"
+)
 _ATTENTION_KERNEL_REMOTE = "remote"
 _ATTENTION_KERNEL_SGLANG = "sglang"
 _SUPPORTED_ATTENTION_KERNELS = {
@@ -52,6 +55,12 @@ def _attention_kernel_preference() -> str:
             f"{sorted(_SUPPORTED_ATTENTION_KERNELS)}"
         )
     return value
+
+
+@functools.lru_cache(maxsize=1)
+def _attention_detail_profile_enabled() -> bool:
+    value = os.environ.get(_ATTENTION_DETAIL_PROFILE_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @functools.lru_cache(maxsize=1)
@@ -131,6 +140,19 @@ def _attention_profile_interval(
                     metadata=merged_metadata,
                     timestamp_ns=end_ns,
                 )
+
+
+@contextmanager
+def _attention_detail_profile_interval(
+    event_base: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> Iterator[None]:
+    if not _attention_detail_profile_enabled():
+        yield
+        return
+    with _attention_profile_interval(event_base, metadata=metadata):
+        yield
 
 
 def _pack_padded_sequence(
@@ -380,8 +402,26 @@ class MossTTSLocalAttention(nn.Module):
         max_seqlen: int,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        q, k, v = self._project_qkv(x)
-        q, k = self._apply_packed_rope(q, k, position_ids)
+        with _attention_detail_profile_interval(
+            "packed_project_qkv",
+            metadata={
+                "attention_kernel": self._attention_kernel,
+                "tokens": int(x.shape[0]),
+                "embed_dim": self.embed_dim,
+                "num_heads": self.num_heads,
+                "head_dim": self.head_dim,
+            },
+        ):
+            q, k, v = self._project_qkv(x)
+        with _attention_detail_profile_interval(
+            "packed_rope",
+            metadata={
+                "attention_kernel": self._attention_kernel,
+                "tokens": int(x.shape[0]),
+                "has_rope": self.rope is not None,
+            },
+        ):
+            q, k = self._apply_packed_rope(q, k, position_ids)
         out = self._run_flash_attention(
             q,
             k,
@@ -391,7 +431,15 @@ class MossTTSLocalAttention(nn.Module):
             max_seqlen,
             max_seqlen,
         )
-        return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
+        with _attention_detail_profile_interval(
+            "packed_output_proj",
+            metadata={
+                "attention_kernel": self._attention_kernel,
+                "tokens": int(x.shape[0]),
+                "embed_dim": self.embed_dim,
+            },
+        ):
+            return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
 
     def _run_flash_attention(
         self,
