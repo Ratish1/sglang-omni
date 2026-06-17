@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -24,7 +25,7 @@ import pytest
 import torch
 from torch import nn
 
-from sglang_omni.models.moss_tts_local import stages
+from sglang_omni.models.moss_tts_local import stages, vocoder_backends
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
 from sglang_omni.models.moss_tts_local.request_builders import (
     build_moss_tts_local_stream_metadata,
@@ -34,6 +35,7 @@ from sglang_omni.models.moss_tts_local.streaming_vocoder import (
 )
 from sglang_omni.models.moss_tts_local.vocoder_backends import (
     NONSTREAM_VOCODER_BACKEND_ENV,
+    SGLangCodecDecodeBackend,
     resolve_nonstream_vocoder_backend,
 )
 from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
@@ -722,9 +724,39 @@ def test_resolve_nonstream_backend_env(monkeypatch) -> None:
         resolve_nonstream_vocoder_backend("bogus")
 
 
-def test_explicit_sglang_backend_fails_closed_at_decode_time(monkeypatch) -> None:
-    del monkeypatch
+def test_explicit_sglang_backend_patches_remote_attention_and_decodes(
+    monkeypatch,
+) -> None:
     processor = FakeProcessor()
+    remote_module = sys.modules[FakeCodec.__module__]
+    original_flash = object()
+    patched_flash = object()
+    load_calls = []
+    flash_seen_during_decode = []
+    monkeypatch.setattr(
+        remote_module, "flash_attn_varlen_func", original_flash, raising=False
+    )
+    monkeypatch.setattr(remote_module, "HAS_FLASH_ATTN", False, raising=False)
+
+    def load_patched_flash():
+        load_calls.append(None)
+        return patched_flash
+
+    original_decode_audio_codes = processor.decode_audio_codes
+
+    def decode_with_patch_assertion(codes_list, *, return_stereo: bool = True):
+        flash_seen_during_decode.append(
+            getattr(remote_module, "flash_attn_varlen_func")
+        )
+        assert getattr(remote_module, "HAS_FLASH_ATTN") is True
+        return original_decode_audio_codes(codes_list, return_stereo=return_stereo)
+
+    monkeypatch.setattr(processor, "decode_audio_codes", decode_with_patch_assertion)
+    monkeypatch.setattr(
+        vocoder_backends,
+        "_load_sglang_flash_attn_varlen_func",
+        load_patched_flash,
+    )
     scheduler = MossTTSLocalStreamingVocoderScheduler(
         processor,
         nonstream_vocoder_backend="sglang",
@@ -738,10 +770,42 @@ def test_explicit_sglang_backend_fails_closed_at_decode_time(monkeypatch) -> Non
     )
 
     assert scheduler._select_nonstream_backend().name == "sglang"
-    with pytest.raises(NotImplementedError, match="native SGLang codec decoder"):
-        scheduler._vocode_batch([payload])
-    assert processor.decode_calls == 0
+    result = scheduler._vocode_batch([payload])[0]
+    assert processor.decode_calls == 1
     assert scheduler._session is None
+    assert flash_seen_during_decode == [patched_flash]
+    assert getattr(remote_module, "flash_attn_varlen_func") is original_flash
+    assert getattr(remote_module, "HAS_FLASH_ATTN") is False
+    assert len(load_calls) == 1
+    np.testing.assert_array_equal(
+        _decode_audio(result.data), reference_waveform(rows[:, 1:]).numpy()
+    )
+
+    state_2 = MossTTSLocalState(text="x", audio_codes=rows[:, 1:].clone())
+    payload_2 = StagePayload(
+        request_id="r2",
+        request=OmniRequest(inputs="", params={}),
+        data=state_2.to_dict(),
+    )
+
+    scheduler._vocode_batch([payload_2])
+
+    assert processor.decode_calls == 2
+    assert flash_seen_during_decode == [patched_flash, patched_flash]
+    assert getattr(remote_module, "flash_attn_varlen_func") is original_flash
+    assert getattr(remote_module, "HAS_FLASH_ATTN") is False
+    assert len(load_calls) == 1
+
+
+def test_sglang_backend_requires_patchable_remote_flash_symbol(monkeypatch) -> None:
+    processor = FakeProcessor()
+    remote_module = sys.modules[FakeCodec.__module__]
+    monkeypatch.delattr(remote_module, "flash_attn_varlen_func", raising=False)
+    backend = SGLangCodecDecodeBackend(processor)
+
+    with pytest.raises(RuntimeError, match="missing flash_attn_varlen_func"):
+        backend.decode_rows([_rows(3, seed=66)[:, 1:]])
+    assert processor.decode_calls == 0
 
 
 def test_nonstream_backend_startup_log_is_not_per_request(monkeypatch, caplog) -> None:

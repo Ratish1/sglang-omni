@@ -286,7 +286,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             n_vq=self._n_vq,
             max_step_frames=self._max_step_frames,
         )
-        self._sglang_decode_backend = SGLangCodecDecodeBackend()
+        self._sglang_decode_backend = SGLangCodecDecodeBackend(processor)
         logger.info(
             "MOSS-TTS Local non-streaming vocoder backend=%s "
             "(processor backend uses session fallback when a streaming session is "
