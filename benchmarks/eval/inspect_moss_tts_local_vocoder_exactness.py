@@ -31,6 +31,7 @@ import logging
 import math
 import sys
 from collections import OrderedDict, defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -38,6 +39,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from sglang_omni.models.moss_tts_local.stages import _load_moss_tts_local_processor
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
@@ -156,6 +158,56 @@ class _TraceCapture:
             stored=stored,
             tensor=cpu_tensor,
         )
+
+
+class _SdpaCapture:
+    """Record PyTorch SDPA inputs and outputs without changing the call.
+
+    Module hooks identify the first high-level boundary that diverges. This
+    capture narrows attention mismatches to the actual SDPA contract: q, k, v,
+    optional mask/bias tensor, and output. It patches the functional module
+    attribute used by remote code that imports ``torch.nn.functional as F``.
+    """
+
+    def __init__(self, *, max_elements_per_tensor: int) -> None:
+        self._capture = _TraceCapture(max_elements_per_tensor=max_elements_per_tensor)
+        self._original = None
+        self._call_index = 0
+
+    @property
+    def records(self) -> "OrderedDict[str, _CapturedTensor]":
+        return self._capture.records
+
+    def __enter__(self) -> "_SdpaCapture":
+        self._original = F.scaled_dot_product_attention
+        F.scaled_dot_product_attention = self._wrapped  # type: ignore[method-assign]
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        if self._original is not None:
+            F.scaled_dot_product_attention = self._original  # type: ignore[method-assign]
+            self._original = None
+
+    def _wrapped(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        call_index = self._call_index
+        self._call_index += 1
+        prefix = f"sdpa#{call_index:03d}"
+        for index, name in enumerate(("query", "key", "value", "attn_mask")):
+            if index < len(args):
+                value = args[index]
+            else:
+                value = kwargs.get(name)
+            if value is not None:
+                self._capture._capture_value(f"{prefix}.pre.{name}", value)
+        for name in ("dropout_p", "is_causal", "scale", "enable_gqa"):
+            value = kwargs.get(name)
+            if isinstance(value, torch.Tensor):
+                self._capture._capture_value(f"{prefix}.pre.kw.{name}", value)
+        if self._original is None:
+            raise RuntimeError("SDPA capture is not installed")
+        output = self._original(*args, **kwargs)
+        self._capture._capture_value(f"{prefix}.post.out", output)
+        return output
 
 
 def _parse_probe(value: str) -> tuple[int, int]:
@@ -520,21 +572,38 @@ def _run_with_trace(
     decode_fn,
     device: torch.device,
     trace_level: str,
+    trace_sdpa: bool,
     max_elements_per_tensor: int,
-) -> tuple[list[torch.Tensor], OrderedDict[str, _CapturedTensor]]:
+) -> tuple[
+    list[torch.Tensor],
+    OrderedDict[str, _CapturedTensor],
+    OrderedDict[str, _CapturedTensor],
+]:
     modules = _trace_modules(decoder, trace_level=trace_level)
     capture = _TraceCapture(max_elements_per_tensor=max_elements_per_tensor)
+    sdpa_capture = (
+        _SdpaCapture(max_elements_per_tensor=max_elements_per_tensor)
+        if trace_sdpa
+        else None
+    )
     logger.info("%s: installing %d trace hooks", label, len(modules) * 2)
     capture.install(modules)
     try:
         _synchronize(device)
-        with torch.no_grad():
+        sdpa_context = sdpa_capture if sdpa_capture is not None else nullcontext()
+        with sdpa_context, torch.no_grad():
             outputs = decode_fn()
         _synchronize(device)
     finally:
         capture.close()
-    logger.info("%s: captured %d tensor records", label, len(capture.records))
-    return outputs, capture.records
+    sdpa_records = sdpa_capture.records if sdpa_capture is not None else OrderedDict()
+    logger.info(
+        "%s: captured %d tensor records and %d SDPA records",
+        label,
+        len(capture.records),
+        len(sdpa_records),
+    )
+    return outputs, capture.records, sdpa_records
 
 
 def _attention_global_summary(codec: Any) -> dict[str, Any]:
@@ -601,6 +670,7 @@ def _run_probe(
     seed: int,
     candidates: list[str],
     trace_level: str,
+    trace_sdpa: bool,
     max_elements_per_tensor: int,
     device: torch.device,
     dump_first_mismatch: bool,
@@ -620,12 +690,13 @@ def _run_probe(
     if hasattr(owned_decoder, "eval"):
         owned_decoder.eval()
 
-    source_outputs, source_records = _run_with_trace(
+    source_outputs, source_records, source_sdpa_records = _run_with_trace(
         label="processor",
         decoder=codec.decoder,
         decode_fn=lambda: _decode_processor(processor, codes_list),
         device=device,
         trace_level=trace_level,
+        trace_sdpa=trace_sdpa,
         max_elements_per_tensor=max_elements_per_tensor,
     )
 
@@ -642,15 +713,17 @@ def _run_probe(
         else:
             raise ValueError(f"unsupported candidate {candidate!r}")
 
-        candidate_outputs, candidate_records = _run_with_trace(
+        candidate_outputs, candidate_records, candidate_sdpa_records = _run_with_trace(
             label=candidate,
             decoder=candidate_decoder,
             decode_fn=candidate_decode,
             device=device,
             trace_level=trace_level,
+            trace_sdpa=trace_sdpa,
             max_elements_per_tensor=max_elements_per_tensor,
         )
         record_comparison = _compare_records(source_records, candidate_records)
+        sdpa_comparison = _compare_records(source_sdpa_records, candidate_sdpa_records)
         output_comparison = _compare_outputs(source_outputs, candidate_outputs)
         first_mismatch = record_comparison.get("first_mismatch")
         dump_path = None
@@ -676,21 +749,54 @@ def _run_probe(
                     },
                     dump_path,
                 )
+        first_sdpa_mismatch = sdpa_comparison.get("first_mismatch")
+        sdpa_dump_path = None
+        if (
+            dump_first_mismatch
+            and first_sdpa_mismatch
+            and first_sdpa_mismatch.get("key")
+        ):
+            key = str(first_sdpa_mismatch["key"])
+            source = source_sdpa_records.get(key)
+            candidate_record = candidate_sdpa_records.get(key)
+            if (
+                source is not None
+                and candidate_record is not None
+                and source.tensor is not None
+            ):
+                sdpa_dump_path = output_dir / (
+                    f"first_sdpa_mismatch_b{batch_size}_t{frames}_{candidate}_"
+                    f"{key.replace('/', '_').replace('#', '_')}.pt"
+                )
+                torch.save(
+                    {
+                        "key": key,
+                        "source": source.tensor,
+                        "candidate": candidate_record.tensor,
+                        "comparison": first_sdpa_mismatch.get("comparison"),
+                    },
+                    sdpa_dump_path,
+                )
 
         logger.info(
             "probe b=%d t=%d candidate=%s output_equal=%s max_abs=%.6g "
-            "first_mismatch=%s",
+            "first_mismatch=%s first_sdpa_mismatch=%s",
             batch_size,
             frames,
             candidate,
             output_comparison["all_equal"],
             output_comparison["max_abs_delta"],
             first_mismatch.get("key") if first_mismatch else None,
+            first_sdpa_mismatch.get("key") if first_sdpa_mismatch else None,
         )
         candidate_reports[candidate] = {
             "output_comparison": output_comparison,
             "record_comparison": record_comparison,
+            "sdpa_comparison": sdpa_comparison,
             "first_mismatch_dump": str(dump_path) if dump_path is not None else None,
+            "first_sdpa_mismatch_dump": (
+                str(sdpa_dump_path) if sdpa_dump_path is not None else None
+            ),
         }
 
     legacy_owned = candidate_reports.get("owned")
@@ -700,6 +806,7 @@ def _run_probe(
             "output_comparison": {},
             "record_comparison": {},
             "first_mismatch_dump": None,
+            "first_sdpa_mismatch_dump": None,
         }
     return {
         "batch_size": batch_size,
@@ -708,12 +815,14 @@ def _run_probe(
         "codebooks": n_vq,
         "vocab_size": vocab_size,
         "trace_level": trace_level,
+        "trace_sdpa": trace_sdpa,
         "max_elements_per_tensor": max_elements_per_tensor,
         "candidates": candidate_reports,
         # Kept for older report consumers while this script is actively used.
         "output_comparison": legacy_owned["output_comparison"],
         "record_comparison": legacy_owned["record_comparison"],
         "first_mismatch_dump": legacy_owned["first_mismatch_dump"],
+        "first_sdpa_mismatch_dump": legacy_owned.get("first_sdpa_mismatch_dump"),
     }
 
 
@@ -725,6 +834,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         f"- model: `{report['model_path']}`",
         f"- device: `{report['device']}`",
         f"- trace level: `{report['trace_level']}`",
+        f"- trace SDPA: `{report['trace_sdpa']}`",
         f"- CUDA SDPA backend: `{report['cuda_sdp_backend']}`",
         "",
         "## Attention Globals",
@@ -735,15 +845,16 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         "",
         "## Probes",
         "",
-        "| probe | candidate | output equal | max abs | mean abs max | first traced mismatch | dump |",
-        "|---|---|---:|---:|---:|---|---|",
+        "| probe | candidate | output equal | max abs | mean abs max | first traced mismatch | first SDPA mismatch | dump | SDPA dump |",
+        "|---|---|---:|---:|---:|---|---|---|---|",
     ]
     for probe in report["probes"]:
         for candidate, candidate_report in probe["candidates"].items():
             out = candidate_report["output_comparison"]
             mismatch = candidate_report["record_comparison"].get("first_mismatch")
+            sdpa_mismatch = candidate_report["sdpa_comparison"].get("first_mismatch")
             lines.append(
-                "| {batch}x{frames} | {candidate} | {equal} | {max_abs:.6g} | {mean_abs:.6g} | {mismatch} | {dump} |".format(
+                "| {batch}x{frames} | {candidate} | {equal} | {max_abs:.6g} | {mean_abs:.6g} | {mismatch} | {sdpa_mismatch} | {dump} | {sdpa_dump} |".format(
                     batch=probe["batch_size"],
                     frames=probe["frames"],
                     candidate=candidate,
@@ -751,7 +862,9 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                     max_abs=float(out["max_abs_delta"]),
                     mean_abs=float(out["mean_abs_delta_max"]),
                     mismatch=mismatch.get("key") if mismatch else "",
+                    sdpa_mismatch=sdpa_mismatch.get("key") if sdpa_mismatch else "",
                     dump=candidate_report.get("first_mismatch_dump") or "",
+                    sdpa_dump=candidate_report.get("first_sdpa_mismatch_dump") or "",
                 )
             )
     lines.extend(
@@ -762,8 +875,8 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
             "If `first traced mismatch` is empty but output parity fails, rerun with "
             "`--trace-level module` and a higher `--max-elements-per-tensor`. If "
             "the first mismatch is in an owned wrapper boundary before any SGLang "
-            "attention call, the owned decoder semantics must be fixed before "
-            "optimizing attention.",
+            "attention call, rerun with `--trace-sdpa` to determine whether the "
+            "attention inputs, mask, or SDPA output first diverged.",
             "",
         ]
     )
@@ -810,6 +923,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="decoder boundary detail to capture",
     )
     parser.add_argument(
+        "--trace-sdpa",
+        action="store_true",
+        help="also capture torch.nn.functional.scaled_dot_product_attention tensors",
+    )
+    parser.add_argument(
         "--max-elements-per-tensor",
         type=int,
         default=10_000_000,
@@ -845,6 +963,7 @@ def main() -> None:
         "model_path": args.model,
         "device": str(device),
         "trace_level": args.trace_level,
+        "trace_sdpa": args.trace_sdpa,
         "cuda_sdp_backend": args.cuda_sdpa_backend,
         "cuda_sdp_settings": _cuda_sdp_settings(),
         "candidates": candidates,
@@ -862,6 +981,7 @@ def main() -> None:
                 seed=args.seed + index,
                 candidates=candidates,
                 trace_level=args.trace_level,
+                trace_sdpa=args.trace_sdpa,
                 max_elements_per_tensor=args.max_elements_per_tensor,
                 device=device,
                 dump_first_mismatch=args.dump_first_mismatch,
