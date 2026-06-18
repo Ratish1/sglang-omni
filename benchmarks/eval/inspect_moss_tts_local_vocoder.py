@@ -651,6 +651,7 @@ def _run_stress_case(
     frames_list: list[int],
     iterations: int,
     seed: int,
+    max_step_frames: int,
     device: torch.device,
     compare_owned_decoder: bool,
     compare_sglang_patch: bool,
@@ -676,6 +677,29 @@ def _run_stress_case(
         iterations=iterations,
         device=device,
     )
+
+    channels_first = [codes.transpose(0, 1).contiguous() for codes in codes_list]
+    session = _CodecStreamSession(
+        processor.audio_tokenizer,
+        stream_slots=0,
+        offline_slots=len(codes_list),
+    )
+    try:
+
+        def session_decode() -> list[torch.Tensor]:
+            return session.decode_offline(
+                channels_first,
+                max_step_frames=max_step_frames,
+            )
+
+        session_outputs, session_timing = _time_call(
+            "session.decode_offline",
+            session_decode,
+            iterations=iterations,
+            device=device,
+        )
+    finally:
+        session.close()
 
     owned_timing: dict[str, Any] | None = None
     owned_outputs: list[torch.Tensor] | None = None
@@ -711,6 +735,10 @@ def _run_stress_case(
         "processor_decode": {
             **processor_timing,
             "outputs": [_tensor_output_summary(out) for out in processor_outputs],
+        },
+        "session_offline_decode": {
+            **session_timing,
+            **_summarize_comparisons(processor_outputs, session_outputs),
         },
     }
     if owned_timing is not None and owned_outputs is not None:
@@ -957,11 +985,17 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                 "",
                 "## Stress Cases",
                 "",
-                "| name | batch | total frames | max frames | processor ms | owned ms | owned max delta | sglang patch ms | sglang patch max delta |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| name | batch | total frames | max frames | processor ms | session ms | session max delta | owned ms | owned max delta | sglang patch ms | sglang patch max delta |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
     for case in stress_cases:
+        session = case.get("session_offline_decode")
+        session_ms = float("nan")
+        session_max_delta = float("nan")
+        if session is not None:
+            session_ms = session["mean_seconds"] * 1000.0
+            session_max_delta = float(session.get("max_abs_delta", 0.0))
         owned = case.get("owned_decoder_decode")
         owned_ms = float("nan")
         owned_max_delta = float("nan")
@@ -976,13 +1010,16 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
             sglang_patch_max_delta = float(sglang_patch.get("max_abs_delta", 0.0))
         lines.append(
             "| {name} | {batch_size} | {total_frames} | {max_frames} | "
-            "{processor_ms:.3f} | {owned_ms:.3f} | {owned_max_delta:.6g} | "
+            "{processor_ms:.3f} | {session_ms:.3f} | {session_max_delta:.6g} | "
+            "{owned_ms:.3f} | {owned_max_delta:.6g} | "
             "{sglang_patch_ms:.3f} | {sglang_patch_max_delta:.6g} |".format(
                 name=case["name"],
                 batch_size=case["batch_size"],
                 total_frames=case["total_frames"],
                 max_frames=case["max_frames"],
                 processor_ms=case["processor_decode"]["mean_seconds"] * 1000.0,
+                session_ms=session_ms,
+                session_max_delta=session_max_delta,
                 owned_ms=owned_ms,
                 owned_max_delta=owned_max_delta,
                 sglang_patch_ms=sglang_patch_ms,
@@ -1152,6 +1189,7 @@ def main() -> None:
                         frames_list=frames_list,
                         iterations=args.iterations,
                         seed=args.seed + 1000 + index,
+                        max_step_frames=args.max_step_frames,
                         device=device,
                         compare_owned_decoder=compare_owned_decoder,
                         compare_sglang_patch=compare_sglang_patch,
