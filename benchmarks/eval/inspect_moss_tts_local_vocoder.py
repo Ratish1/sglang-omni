@@ -19,6 +19,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import inspect
 import json
@@ -57,6 +58,7 @@ from sglang_omni.models.moss_tts_local.vocoder_sglang_patch import (
 logger = logging.getLogger(__name__)
 
 _MOSS_ATTENTION_CLASS_NAME = "MossAudioTokenizerMultiheadAttention"
+_SDPA_BACKEND_CHOICES = ("default", "math", "flash", "efficient", "cudnn")
 
 
 def _parse_probe(value: str) -> tuple[int, int]:
@@ -110,6 +112,33 @@ def _cuda_sdp_settings() -> dict[str, bool | None]:
         "math_sdp": _enabled("math_sdp_enabled"),
         "mem_efficient_sdp": _enabled("mem_efficient_sdp_enabled"),
     }
+
+
+def _sdpa_backend_context(name: str):
+    if name == "default":
+        return contextlib.nullcontext()
+    attention = getattr(torch.nn, "attention", None)
+    sdpa_kernel = getattr(attention, "sdpa_kernel", None)
+    sdp_backend = getattr(attention, "SDPBackend", None)
+    if not callable(sdpa_kernel) or sdp_backend is None:
+        raise RuntimeError(
+            "this PyTorch build does not expose torch.nn.attention.sdpa_kernel"
+        )
+    backend_by_name = {
+        "math": "MATH",
+        "flash": "FLASH_ATTENTION",
+        "efficient": "EFFICIENT_ATTENTION",
+        "cudnn": "CUDNN_ATTENTION",
+    }
+    backend_attr = backend_by_name.get(name)
+    if backend_attr is None:
+        raise ValueError(f"unsupported SDPA backend {name!r}")
+    backend = getattr(sdp_backend, backend_attr, None)
+    if backend is None:
+        raise RuntimeError(
+            f"this PyTorch build does not expose SDPBackend.{backend_attr}"
+        )
+    return sdpa_kernel(backend)
 
 
 def _cuda_runtime_summary(device: torch.device) -> dict[str, Any]:
@@ -841,6 +870,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         f"- device: `{report['device']}`",
         f"- requested backend: `{report['requested_backend']}`",
         f"- backend experimental: `{report['requested_backend_experimental']}`",
+        f"- sdpa backend: `{report.get('sdpa_backend', 'default')}`",
         f"- cuda sdp: `{report['torch_backends']['cuda_sdp']}`",
         "",
         "## Decoder",
@@ -993,6 +1023,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="disable torch.backends.cuda cuDNN SDPA before loading/probing",
     )
     parser.add_argument(
+        "--sdpa-backend",
+        choices=_SDPA_BACKEND_CHOICES,
+        default="default",
+        help=(
+            "scope processor/session decode under one PyTorch SDPA backend; "
+            "use with --backend processor-sdpa for backend matrix probes"
+        ),
+    )
+    parser.add_argument(
         "--compare-owned-decoder",
         action="store_true",
         help="compare the experimental owned PyTorch vocoder decoder against the processor path",
@@ -1024,14 +1063,13 @@ def main() -> None:
     if args.iterations < 1:
         raise SystemExit("--iterations must be >= 1")
     backend = parse_moss_tts_local_vocoder_backend(args.backend)
-    if backend in {
-        MossTTSLocalVocoderBackend.PROCESSOR_SDPA,
-        MossTTSLocalVocoderBackend.PROCESSOR_FLASH2_UPSTREAM,
-    }:
+    if backend == MossTTSLocalVocoderBackend.PROCESSOR_FLASH2_UPSTREAM:
         raise SystemExit(
             f"--backend {backend.value!r} is reserved for the next SDPA/FA2 "
             "control phase; use --backend processor for the golden report"
         )
+    if args.disable_cudnn_sdp and args.sdpa_backend == "cudnn":
+        raise SystemExit("--disable-cudnn-sdp conflicts with --sdpa-backend cudnn")
     compare_owned_decoder = (
         args.compare_owned_decoder
         or backend == MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL
@@ -1045,6 +1083,11 @@ def main() -> None:
     if args.disable_cudnn_sdp:
         logger.info("Disabling torch.backends.cuda cuDNN SDPA")
         _disable_cudnn_sdp()
+    if args.sdpa_backend != "default":
+        logger.info(
+            "Scoping processor decode to PyTorch SDPA backend=%s",
+            args.sdpa_backend,
+        )
 
     logger.info("Loading MOSS-TTS Local processor for %s", args.model)
     processor = _load_moss_tts_local_processor(args.model, device=args.device)
@@ -1058,6 +1101,7 @@ def main() -> None:
             backend
         ),
         "torch_backends": {"cuda_sdp": _cuda_sdp_settings()},
+        "sdpa_backend": args.sdpa_backend,
         "introspection": summarize_moss_tts_local_vocoder(processor),
         "decode_probes": [],
         "stress_cases": [],
@@ -1075,43 +1119,44 @@ def main() -> None:
         )
 
     probes = args.probe or [(1, 25), (1, 100), (1, 300), (8, 100), (8, 300)]
-    if not args.skip_probes:
-        for index, (batch_size, frames) in enumerate(probes):
-            logger.info("Running probe batch=%d frames=%d", batch_size, frames)
-            report["decode_probes"].append(
-                _run_probe(
-                    processor,
-                    batch_size=batch_size,
-                    frames=frames,
-                    iterations=args.iterations,
-                    seed=args.seed + index,
-                    max_step_frames=args.max_step_frames,
-                    device=device,
-                    compare_owned_decoder=compare_owned_decoder,
-                    compare_sglang_patch=compare_sglang_patch,
+    with _sdpa_backend_context(args.sdpa_backend):
+        if not args.skip_probes:
+            for index, (batch_size, frames) in enumerate(probes):
+                logger.info("Running probe batch=%d frames=%d", batch_size, frames)
+                report["decode_probes"].append(
+                    _run_probe(
+                        processor,
+                        batch_size=batch_size,
+                        frames=frames,
+                        iterations=args.iterations,
+                        seed=args.seed + index,
+                        max_step_frames=args.max_step_frames,
+                        device=device,
+                        compare_owned_decoder=compare_owned_decoder,
+                        compare_sglang_patch=compare_sglang_patch,
+                    )
                 )
-            )
-    if args.stress_suite:
-        for index, (name, frames_list) in enumerate(_stress_cases()):
-            logger.info(
-                "Running stress case %s batch=%d max_frames=%d total_frames=%d",
-                name,
-                len(frames_list),
-                max(frames_list),
-                sum(frames_list),
-            )
-            report["stress_cases"].append(
-                _run_stress_case(
-                    processor,
-                    name=name,
-                    frames_list=frames_list,
-                    iterations=args.iterations,
-                    seed=args.seed + 1000 + index,
-                    device=device,
-                    compare_owned_decoder=compare_owned_decoder,
-                    compare_sglang_patch=compare_sglang_patch,
+        if args.stress_suite:
+            for index, (name, frames_list) in enumerate(_stress_cases()):
+                logger.info(
+                    "Running stress case %s batch=%d max_frames=%d total_frames=%d",
+                    name,
+                    len(frames_list),
+                    max(frames_list),
+                    sum(frames_list),
                 )
-            )
+                report["stress_cases"].append(
+                    _run_stress_case(
+                        processor,
+                        name=name,
+                        frames_list=frames_list,
+                        iterations=args.iterations,
+                        seed=args.seed + 1000 + index,
+                        device=device,
+                        compare_owned_decoder=compare_owned_decoder,
+                        compare_sglang_patch=compare_sglang_patch,
+                    )
+                )
 
     json_path = output_dir / "moss_tts_local_vocoder_introspection.json"
     json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
