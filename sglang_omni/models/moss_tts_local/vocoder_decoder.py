@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+import inspect
 import logging
 import math
 from collections.abc import Iterator
@@ -43,6 +44,19 @@ def _module_list(value: Any) -> list[nn.Module]:
     ):
         return list(value)
     return []
+
+
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == name:
+            return True
+    return False
 
 
 def _pack_padded_sequence(
@@ -244,6 +258,9 @@ class MossTTSLocalAttention(nn.Module):
         self._remote_flash_attn_varlen_func = getattr(
             self._remote_module, "flash_attn_varlen_func", None
         )
+        self._source_accepts_input_lengths = _accepts_kwarg(
+            self.source.forward, "input_lengths"
+        )
         self._sglang_flash_attn_varlen_func = _load_sglang_flash_attn_varlen_func()
         max_period = getattr(self.rope, "max_period", 10000.0)
         self._packed_rope_cache = _MossPackedRopeCache(max_period=max_period)
@@ -325,7 +342,7 @@ class MossTTSLocalAttention(nn.Module):
                     f"streaming attention expects a 3D tensor, got {tuple(query.shape)}"
                 )
             if backend == _SOURCE_ATTENTION:
-                return self.source(query, query, query)
+                return self._forward_source_attention(query, input_lengths)
             return self.out_proj(self._forward_streaming_sdpa(query, streaming_state))
         if backend == "flash_attention_2":
             if query.dim() != 2:
@@ -348,6 +365,15 @@ class MossTTSLocalAttention(nn.Module):
             raise ValueError(
                 f"dense attention expects a 3D tensor, got {tuple(query.shape)}"
             )
+        return self._forward_source_attention(query, input_lengths)
+
+    def _forward_source_attention(
+        self,
+        query: torch.Tensor,
+        input_lengths: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self._source_accepts_input_lengths:
+            return self.source(query, query, query, input_lengths=input_lengths)
         return self.source(query, query, query)
 
     def _forward_streaming_sdpa(

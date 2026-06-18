@@ -38,6 +38,7 @@ class _FakeAttention(nn.Module):
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.calls = 0
         self.last_qkv_same_object = False
+        self.last_input_lengths: torch.Tensor | None = None
 
     def resolve_attention_implementation(
         self, _: torch.Tensor, *, is_streaming: bool = False
@@ -49,9 +50,12 @@ class _FakeAttention(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        *,
+        input_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.calls += 1
         self.last_qkv_same_object = query is key and key is value
+        self.last_input_lengths = input_lengths
         return query
 
 
@@ -347,6 +351,7 @@ def test_projected_transformer_preserves_source_path_without_remote_flash() -> N
 
     assert source.transformer.layers[0].self_attn.calls == 1
     assert source.transformer.layers[0].self_attn.last_qkv_same_object
+    assert source.transformer.layers[0].self_attn.last_input_lengths is lengths
     assert source.seen_input_shape is None
     assert out.shape == (2, 7, 4)
     assert torch.equal(out_lengths, lengths)
@@ -542,6 +547,7 @@ def test_attention_streaming_flash_request_falls_back_to_source() -> None:
     assert source.cache_updates == 0
     assert source.calls == 1
     assert source.last_qkv_same_object
+    assert source.last_input_lengths is not None
     assert out.shape == x.shape
 
 
