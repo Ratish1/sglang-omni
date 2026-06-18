@@ -1,6 +1,150 @@
 # MOSS-TTS Local SGLang Vocoder Attention Plan
 
-## Objective
+## 2026-06-18 Evidence Ledger And Current Decision
+
+This section supersedes every earlier direction in this file.
+
+The active implementation target is:
+
+```text
+official MOSS vocoder stage semantics
++ repo-owned projected-transformer wrapper
++ SGLang FlashAttention varlen backend where the model's attention contract permits it
++ no HF-cache monkey patch
++ no session-offline production backend
++ no generic custom SGLang kernel until existing SGLang backend reuse is exhausted
+```
+
+The latest `session-offline` CUDA-graph run is rejected as the main direction:
+
+| metric | value |
+|---|---:|
+| completed / failed | 1088 / 0 |
+| throughput_qps | 4.311 |
+| rtf_mean | 0.4419 |
+| latency_mean_s | 1.852 |
+| latency_p95_s | 2.371 |
+| output_throughput | 237.2 tok/s |
+
+It did capture vocoder graphs (`T=[4, 5, 8, 9, 10, 11, 12, 13, 20, 22, 24, 25,
+100]`), but remained materially slower than the processor baseline and far
+slower than the owned SGLang-attention path. It is therefore a correctness
+reference and streaming-coexistence mechanism only, not the non-streaming
+optimization path.
+
+The best confirmed non-streaming direction is the owned decoder with SGLang
+attention enabled and the single-unpadded fast path:
+
+| metric | value |
+|---|---:|
+| completed / failed | 1088 / 0 |
+| qps | 6.423 |
+| rtf_mean | 0.2939 |
+| latency_mean_s | 1.243 |
+| latency_p95_s | 1.704 |
+| output_throughput | 353.4 tok/s |
+
+That path is the implementation to harden. The remaining work is not to find a
+new backend; it is to make this implementation mechanically clean, exact enough
+for the chosen gate, and easy to review.
+
+Current interpretation:
+
+- Default backend remains `processor`.
+- Experimental accelerated backend is `owned-pytorch` plus
+  `SGLANG_OMNI_MOSS_LOCAL_VOCODER_ATTENTION_KERNEL=sglang`.
+- A live streaming codec session may still service non-streaming decodes because
+  the codec forbids nested `streaming()` contexts. This is labeled
+  `codec_session` in metadata and is not a tunable optimization backend.
+- Do not resurrect `session-offline` for non-streaming throughput unless future
+  upstream code changes its real server performance.
+- Do not add another SGLang helper/kernel until profiling proves the current
+  SGLang backend call and surrounding wrapper overhead are the limiting factor.
+
+### Advice Ledger From The Three Subagents
+
+External ML-systems review:
+
+- The likely high-leverage optimization is fixed-shape CUDA graph replay or
+  static buffering around the existing codec/vocoder decode path, not another
+  attention function-pointer swap.
+- Attention may be secondary because the decoder has 6 projected-transformer
+  stages and 92 transformer layers; LayerNorm, GELU FFN, projections, RoPE, and
+  many small launches can dominate.
+- Measure per-stage and per-layer time before changing kernels: input
+  projection, packing, transformer layer attention, output projection, FFN,
+  LayerNorm, RoPE, and patch stages.
+- Treat padding/packing as a measured policy. Packing can be slower than dense
+  compute for short or nearly uniform batches.
+- Keep parity strict. Manual CUDA graph replay over identical eager operations
+  can be bit-exact; `torch.compile`, alternate SDPA backends, fused LayerNorm,
+  TensorRT, quantization, or custom attention kernels should be treated as
+  tolerance-safe only until proven otherwise.
+
+SGLang codebase review:
+
+- Best direct SGLang reuse remains
+  `sglang.jit_kernel.flash_attention.flash_attn_varlen_func`; it is the right
+  primitive only when the MOSS path actually enters packed varlen FlashAttention.
+- Do not route this vocoder through `AttentionBackend`, `RadixAttention`,
+  `ForwardBatch`, FlashInfer backends, or paged KV pools. Those are SRT LLM
+  serving abstractions, not this offline audio-tokenizer decoder path.
+- Do not use SGLang linear layers for the remote HF vocoder modules. They are
+  tensor-parallel/quant-loader layers and do not match the module API.
+- Do not blindly use SGLang activation kernels such as `gelu_and_mul` or
+  `silu_and_mul`; they are split-gated kernels and only match remote gated FFN
+  variants if explicitly supported.
+- The owned wrapper only accelerates paths it actually owns. If the runtime
+  resolves to dense/source attention, most attention work bypasses the SGLang
+  varlen switch.
+- The current packed path still has GPU-host syncs around `input_lengths.any()`
+  and `input_lengths.max()`. These preserve remote behavior but remain a
+  possible measured optimization surface after path ownership is proven.
+
+Code-design review:
+
+- Always prove path entry first. The patch in commit `1f09b07b` added
+  `active_vocoder_backend`, `requested_vocoder_backend`, `session_active`, and
+  batch-wide attention attribution; this must stay until the implementation is
+  stable.
+- Keep processor and owned-pytorch/SGLang measurements separate. If a live
+  streaming codec session forces non-streaming decode through the session
+  offline lane, label that as `codec_session`; do not treat it as the target
+  non-streaming optimization backend.
+- Avoid permanent decoder installation in serving. The scoped decoder
+  replacement is safer, but profile metadata must state that it happened.
+- Avoid duplicate module ownership. The owned projected-transformer wrapper
+  should not register the original source module and its children under multiple
+  module-tree paths.
+- Do not merge an optimization because an isolated microbenchmark improves.
+  The merge gate is end-to-end RTF/throughput plus parity on the real codec.
+
+### Immediate Implementation Plan
+
+1. Keep the implementation boundary narrow: `streaming_vocoder.py` selects
+   processor vs owned decoder; `vocoder_decoder.py` owns only the decoder-stage
+   wrapper and SGLang attention call. No HF-cache monkey patch and no
+   session-offline serving backend.
+2. Preserve official module semantics. The wrapper must reuse the source MOSS
+   modules for projections, norms, FFN, layer scales, patch stages, and final
+   codec projection. Only attention packing/backend dispatch is replaced.
+3. Harden parity for the fast path. The required gates are:
+   - path proof: `active_vocoder_backend=owned_pytorch`,
+     `attention_kernel=sglang`, `pack_mode=single_unpadded` on the intended run;
+   - direct decode parity on short/typical/long and mixed batches;
+   - server generate-only run with `failed == 0`;
+   - no unacceptable waveform/ASR drift under the agreed quality gate.
+4. Reduce implementation surface only after parity. Candidate cleanup:
+   - remove unused experimental paths;
+   - make backend names and metadata unambiguous;
+   - keep debug/detail ranges behind the existing detail-profile env;
+   - avoid generic abstractions unless a second real caller exists.
+5. Optimize only measured overhead in the active fast path. Current known
+   candidates are RoPE/cache application and residual wrapper overhead around
+   the SGLang FlashAttention call; do not add a custom kernel until the existing
+   SGLang call path is proven to be the limiting factor.
+
+## Earlier Objective (Paused After 2026-06-18 Evidence)
 
 Optimize MOSS-TTS Local non-streaming vocoder throughput by patching SGLang with
 a reusable helper for the MOSS vocoder's small-batch, chunked, local-causal
@@ -22,7 +166,7 @@ Success criteria:
 - The SGLang patch is generic enough to live in SGLang `jit_kernel` code, while
   MOSS-specific traversal and RoPE/session wiring stays in `sglang-omni`.
 
-## Current Evidence
+## Earlier Evidence Before Dense-Path Proof
 
 Decision-relevant files read:
 

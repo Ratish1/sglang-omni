@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 _SOURCE_HINT = "MOSS-TTS Local"
 _VOCODER_BACKEND_PROCESSOR = "processor"
 _VOCODER_BACKEND_OWNED_PYTORCH = "owned_pytorch"
-_VOCODER_BACKEND_SESSION_OFFLINE = "session_offline"
+_VOCODER_BACKEND_CODEC_SESSION = "codec_session"
 
 
 def _resolve_sample_rate(processor: Any) -> int:
@@ -735,7 +735,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     def _active_vocoder_backend(self) -> str:
         if self._session is not None:
-            return _VOCODER_BACKEND_SESSION_OFFLINE
+            return _VOCODER_BACKEND_CODEC_SESSION
         if self._nonstream_decoder is not None:
             return _VOCODER_BACKEND_OWNED_PYTORCH
         return _VOCODER_BACKEND_PROCESSOR

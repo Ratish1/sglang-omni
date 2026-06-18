@@ -305,7 +305,7 @@ def test_vocoder_decode_profile_metadata_identifies_active_backend(
 
     scheduler._session = object()  # type: ignore[assignment]
     metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
-    assert metadata["active_vocoder_backend"] == "session_offline"
+    assert metadata["active_vocoder_backend"] == "codec_session"
     assert metadata["requested_vocoder_backend"] == "owned_pytorch"
     assert metadata["session_active"] is True
     assert metadata["owned_decoder_active"] is True
