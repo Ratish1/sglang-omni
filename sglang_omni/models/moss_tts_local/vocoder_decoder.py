@@ -325,7 +325,7 @@ class MossTTSLocalAttention(nn.Module):
                     f"streaming attention expects a 3D tensor, got {tuple(query.shape)}"
                 )
             if backend == _SOURCE_ATTENTION:
-                return self.source(query, input_lengths=input_lengths)
+                return self.source(query, query, query)
             return self.out_proj(self._forward_streaming_sdpa(query, streaming_state))
         if backend == "flash_attention_2":
             if query.dim() != 2:
@@ -348,12 +348,7 @@ class MossTTSLocalAttention(nn.Module):
             raise ValueError(
                 f"dense attention expects a 3D tensor, got {tuple(query.shape)}"
             )
-        if input_lengths is None:
-            raise ValueError("dense attention requires input_lengths")
-        return self.source(
-            query,
-            input_lengths=input_lengths,
-        )
+        return self.source(query, query, query)
 
     def _forward_streaming_sdpa(
         self, query: torch.Tensor, streaming_state: Any
