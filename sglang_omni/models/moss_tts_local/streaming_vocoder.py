@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Streaming vocoder scheduler for MOSS-TTS Local.
 
-Streaming requests share one persistent batched ``codec.streaming()`` session.
-Pure non-streaming traffic keeps the pre-existing ``processor.decode_audio_codes``
-path even when startup CUDA-graph warmup briefly opened an idle session.
+Streaming requests share one persistent batched ``codec.streaming()`` session. By
+default, pure non-streaming traffic keeps the pre-existing
+``processor.decode_audio_codes`` path even when startup CUDA-graph warmup briefly
+opened an idle session. The opt-in session-offline backend decodes non-streaming
+traffic through an offline-only codec session so the same SGLang-managed graph
+runner can optimize the vocoder path without patching the Hugging Face module.
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -30,6 +34,16 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 _SOURCE_HINT = "MOSS-TTS Local"
+_NONSTREAM_SESSION_BACKENDS = {
+    "session-offline",
+    "session_offline",
+    "session-graphed",
+    "session_graphed",
+}
+
+
+def _is_nonstream_session_backend(value: str | None) -> bool:
+    return (value or "").strip().lower() in _NONSTREAM_SESSION_BACKENDS
 
 
 def _resolve_sample_rate(processor: Any) -> int:
@@ -125,6 +139,10 @@ class _CodecStreamSession:
     def has_cuda_graph_runner(self) -> bool:
         # True only if the runner exists AND captured at least one graph.
         return bool(self._cg_runner and self._cg_runner.captured_frames())
+
+    @property
+    def stream_slots(self) -> int:
+        return self._stream_slots
 
     def captured_frames(self) -> list[int]:
         return self._cg_runner.captured_frames() if self._cg_runner else []
@@ -309,6 +327,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         cuda_graph: bool = True,
         cuda_graph_frames: list[int] | None = None,
         cuda_graph_min_free_gb: float = 3.0,
+        nonstream_vocoder_backend: str | None = None,
     ) -> None:
         if stream_slots < 1:
             raise ValueError(f"stream_slots must be >= 1, got {stream_slots}")
@@ -350,6 +369,23 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             [int(t) for t in cuda_graph_frames] if cuda_graph_frames else None
         )
         self._cuda_graph_min_free_gb = float(cuda_graph_min_free_gb)
+        env_backend = os.environ.get("SGLANG_OMNI_MOSS_LOCAL_NONSTREAM_VOCODER_DECODER")
+        self._nonstream_vocoder_backend = (
+            nonstream_vocoder_backend
+            if nonstream_vocoder_backend is not None
+            else env_backend
+        )
+        self._use_nonstream_session = _is_nonstream_session_backend(
+            self._nonstream_vocoder_backend
+        )
+        if self._nonstream_vocoder_backend and not self._use_nonstream_session:
+            logger.warning(
+                "Unsupported MOSS-TTS Local non-streaming vocoder backend=%r; "
+                "using processor backend",
+                self._nonstream_vocoder_backend,
+            )
+        elif self._use_nonstream_session:
+            logger.info("MOSS-TTS Local non-streaming vocoder backend=session-offline")
         self._stream_states: dict[str, _LocalStreamState] = {}
         super().__init__(
             self._vocode,
@@ -485,6 +521,10 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
     # --- Streaming internals ---
 
     def _ensure_session(self) -> _CodecStreamSession:
+        if self._session is not None and self._session.stream_slots == 0:
+            self._session.close()
+            self._session = None
+            self._session_used_by_streaming = False
         if self._session is None:
             self._session = _CodecStreamSession(
                 self._codec,
@@ -494,9 +534,24 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             )
         return self._session
 
+    def _ensure_offline_session(self) -> _CodecStreamSession:
+        if self._session is not None and self._session.stream_slots != 0:
+            self._session.close()
+            self._session = None
+            self._session_used_by_streaming = False
+        if self._session is None:
+            self._session = _CodecStreamSession(
+                self._codec,
+                stream_slots=0,
+                offline_slots=self._offline_slots,
+                n_vq=self._n_vq,
+            )
+        return self._session
+
     def _close_idle_startup_session_locked(self) -> None:
         if (
             self._session is not None
+            and self._session.stream_slots > 0
             and not self._session_used_by_streaming
             and not self._stream_states
             and not self._stream_payloads
@@ -533,6 +588,8 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 self._default_initial_chunk_frames or join_floor,
                 self._stream_chunk_frames,
             ]
+        if self._use_nonstream_session:
+            frames.append(self._max_step_frames)
         return sorted({t for t in frames if 1 <= t <= self._max_step_frames})
 
     def _codec_on_cuda(self) -> bool:
@@ -568,13 +625,37 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                     )
             return session
 
+    def _ensure_offline_session_graphed(self) -> _CodecStreamSession:
+        with self._state_lock:
+            session = self._ensure_offline_session()
+            if (
+                self._cuda_graph
+                and not session.warmup_attempted
+                and self._codec_on_cuda()
+            ):
+                try:
+                    session.warmup_cuda_graph(
+                        self._cuda_graph_capture_frames(),
+                        min_free_gb=self._cuda_graph_min_free_gb,
+                    )
+                except Exception:
+                    logger.exception(
+                        "MOSS vocoder offline CUDA-graph capture failed; "
+                        "serving eager from this session"
+                    )
+            return session
+
     def warmup_now(self) -> None:
         """Capture the codec-decode graphs at factory-build time: codec loaded, GPU quiescent, and
         before the stage process is marked ready, so the serving loop never races a half-captured
         graph. No-op without a CUDA codec; best-effort, degrades to eager."""
         if not self._cuda_graph or not self._codec_on_cuda():
             return
-        session = self._ensure_session_graphed()
+        session = (
+            self._ensure_offline_session_graphed()
+            if self._use_nonstream_session
+            else self._ensure_session_graphed()
+        )
         if session.has_cuda_graph_runner():
             logger.info(
                 "MOSS vocoder CUDA graphs captured at startup: T=%s",
@@ -677,7 +758,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             for _, state in participants:
                 plan[state.slot] = torch.stack(state.pending[:step_t], dim=1)
             try:
-                decoded = self._ensure_session().step(plan)
+                decoded = self._ensure_session_graphed().step(plan)
             except Exception as exc:
                 logger.exception(
                     "MOSS-TTS Local streaming decode step failed; aborting %d "
@@ -772,13 +853,15 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         """Decode ``[T, >=n_vq]`` row tensors to fp32 CPU waveforms."""
         with self._state_lock:
             self._close_idle_startup_session_locked()
-        if self._session is None:
+        if self._session is None and not self._use_nonstream_session:
             # Processor path opens its own streaming context; illegal once a
             # session is live.
             return [
                 torch.as_tensor(wav).detach().to("cpu")
                 for wav in self._processor.decode_audio_codes(codes_list)
             ]
+        if self._use_nonstream_session and self._session is None:
+            self._ensure_offline_session_graphed()
         channels_first = [
             codes[:, : self._n_vq].transpose(0, 1).contiguous() for codes in codes_list
         ]

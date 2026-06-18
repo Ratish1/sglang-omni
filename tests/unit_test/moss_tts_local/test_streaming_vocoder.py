@@ -659,6 +659,32 @@ def test_non_streaming_path_ignores_idle_startup_session(monkeypatch) -> None:
     )
 
 
+def test_non_streaming_session_backend_uses_offline_session(monkeypatch) -> None:
+    processor = FakeProcessor()
+    scheduler = _make_scheduler(
+        monkeypatch,
+        processor,
+        nonstream_vocoder_backend="session-offline",
+        max_batch_size=3,
+    )
+
+    rows_1 = _rows(11, seed=58)
+    rows_2 = _rows(7, seed=59)
+    results = scheduler._vocode_batch(
+        [_offline_payload(rows_1, "r1"), _offline_payload(rows_2, "r2")]
+    )
+
+    assert processor.decode_calls == 0
+    assert scheduler._session is not None
+    assert scheduler._session.stream_slots == 0
+    np.testing.assert_array_equal(
+        _decode_audio(results[0].data), reference_waveform(rows_1[:, 1:]).numpy()
+    )
+    np.testing.assert_array_equal(
+        _decode_audio(results[1].data), reference_waveform(rows_2[:, 1:]).numpy()
+    )
+
+
 def test_non_streaming_path_with_and_without_live_session(monkeypatch) -> None:
     processor = FakeProcessor()
     scheduler = _make_scheduler(monkeypatch, processor)
@@ -895,6 +921,13 @@ def test_create_vocoder_executor_threads_cuda_graph_config(monkeypatch) -> None:
     assert scheduler2._cuda_graph_frames == [5, 25]
     assert scheduler2._cuda_graph_min_free_gb == 7.0
 
+    scheduler3 = _make_scheduler(
+        monkeypatch,
+        FakeProcessor(),
+        nonstream_vocoder_backend="session-offline",
+    )
+    assert scheduler3._use_nonstream_session is True
+
 
 def test_pipeline_config_injects_cuda_graph_into_vocoder_factory_args() -> None:
     from sglang_omni.models.moss_tts_local.config import (
@@ -907,17 +940,20 @@ def test_pipeline_config_injects_cuda_graph_into_vocoder_factory_args() -> None:
     assert voc.factory_args["cuda_graph"] is True
     assert voc.factory_args["cuda_graph_frames"] is None
     assert voc.factory_args["cuda_graph_min_free_gb"] == 3.0
+    assert voc.factory_args["nonstream_vocoder_backend"] is None
 
     cfg2 = MossTTSLocalPipelineConfig(
         model_path="x",
         cuda_graph=False,
         cuda_graph_frames=[5, 25],
         cuda_graph_min_free_gb=4.5,
+        nonstream_vocoder_backend="session-offline",
     )
     voc2 = next(s for s in cfg2.stages if s.factory.endswith("create_vocoder_executor"))
     assert voc2.factory_args["cuda_graph"] is False
     assert voc2.factory_args["cuda_graph_frames"] == [5, 25]
     assert voc2.factory_args["cuda_graph_min_free_gb"] == 4.5
+    assert voc2.factory_args["nonstream_vocoder_backend"] == "session-offline"
 
     # The split variant overrides `stages`; the injection must still reach its vocoder.
     split = MossTTSLocalSplitPipelineConfig(model_path="x", cuda_graph=False)
@@ -937,6 +973,51 @@ def test_factory_captures_graphs_before_returning(monkeypatch) -> None:
     assert calls, "factory must capture before returning"
     assert scheduler._session is not None
     assert scheduler._session.has_cuda_graph_runner()
+
+
+def test_nonstream_session_backend_captures_offline_session(monkeypatch) -> None:
+    calls: list = []
+    _install_fake_capture(monkeypatch, calls, seal=True)
+    scheduler = _make_scheduler(
+        monkeypatch,
+        FakeProcessor(),
+        nonstream_vocoder_backend="session-offline",
+        max_batch_size=3,
+    )
+    assert calls, "factory must capture before returning"
+    assert scheduler._session is not None
+    assert scheduler._session.stream_slots == 0
+    assert scheduler._session.has_cuda_graph_runner()
+    assert scheduler._max_step_frames in scheduler._session.captured_frames()
+
+
+def test_streaming_promotes_offline_session_backend(monkeypatch) -> None:
+    calls: list = []
+    _install_fake_capture(monkeypatch, calls, seal=True)
+    scheduler = _make_scheduler(
+        monkeypatch,
+        FakeProcessor(),
+        nonstream_vocoder_backend="session-offline",
+        stream_slots=1,
+        stream_chunk_frames=4,
+        initial_chunk_frames=2,
+    )
+    assert scheduler._session is not None
+    offline_session = scheduler._session
+    assert offline_session.stream_slots == 0
+
+    rows = _rows(5, seed=6)
+    messages = _run_stream(scheduler, rows, request_id="s")
+
+    assert scheduler._session is not offline_session
+    assert offline_session._closed
+    assert scheduler._session is not None
+    assert scheduler._session.stream_slots == 1
+    assert scheduler._session.has_cuda_graph_runner()
+    assert len(calls) == 2
+    np.testing.assert_array_equal(
+        _concat_stream_audio(messages, "s"), reference_waveform(rows[:, 1:]).numpy()
+    )
 
 
 @pytest.mark.parametrize("trigger", ["chunk", "slot_starved", "no_chunk_done"])
