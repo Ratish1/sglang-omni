@@ -129,6 +129,10 @@ class _CodecStreamSession:
         with torch.no_grad():
             self._exit_stack.enter_context(codec.streaming(self._batch_size))
 
+    @property
+    def stream_slots(self) -> int:
+        return self._stream_slots
+
     def acquire(self) -> int | None:
         if not self._free_stream_slots:
             return None
@@ -519,6 +523,22 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 stream_slots=self._stream_slots,
                 offline_slots=self._offline_slots,
             )
+        elif self._session.stream_slots == 0:
+            self._session.close()
+            self._session = _CodecStreamSession(
+                self._codec,
+                stream_slots=self._stream_slots,
+                offline_slots=self._offline_slots,
+            )
+        return self._session
+
+    def _ensure_offline_decode_session(self) -> _CodecStreamSession:
+        if self._session is None:
+            self._session = _CodecStreamSession(
+                self._codec,
+                stream_slots=0,
+                offline_slots=self._offline_slots,
+            )
         return self._session
 
     def _ensure_slot(self, state: _LocalStreamState) -> None:
@@ -734,7 +754,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                             for codes in codes_list
                         ]
                         with self._state_lock:
-                            wavs = self._ensure_session().decode_offline(
+                            wavs = self._ensure_offline_decode_session().decode_offline(
                                 channels_first,
                                 max_step_frames=self._max_step_frames,
                             )

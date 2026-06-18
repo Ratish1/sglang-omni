@@ -883,10 +883,37 @@ def test_session_offline_backend_uses_session_before_streaming(monkeypatch) -> N
 
     assert processor.decode_calls == 0
     assert scheduler._session is not None
+    assert scheduler._session.stream_slots == 0
     for rows, result in zip((rows_1, rows_2), results):
         np.testing.assert_array_equal(
             _decode_audio(result.data), reference_waveform(rows[:, 1:]).numpy()
         )
+
+
+def test_session_offline_backend_promotes_to_streaming_session(monkeypatch) -> None:
+    processor = FakeProcessor()
+    scheduler = _make_scheduler(
+        monkeypatch,
+        processor,
+        stream_slots=2,
+        nonstream_vocoder_decoder=MossTTSLocalVocoderBackend.SESSION_OFFLINE.value,
+    )
+
+    rows = _rows(4, seed=65)
+    payload = _terminal_payload(rows, request_id="offline")
+    scheduler._vocode_batch([payload])
+    assert scheduler._session is not None
+    assert scheduler._session.stream_slots == 0
+
+    stream_rows = _rows(6, seed=66)
+    messages = _run_stream(scheduler, stream_rows, request_id="stream")
+
+    assert scheduler._session is not None
+    assert scheduler._session.stream_slots == 2
+    np.testing.assert_array_equal(
+        _concat_stream_audio(messages, "stream"),
+        reference_waveform(stream_rows[:, 1:]).numpy(),
+    )
 
 
 def test_offline_lane_waves_split_across_slots(monkeypatch) -> None:
