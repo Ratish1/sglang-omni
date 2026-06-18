@@ -36,13 +36,15 @@ class _FakeAttention(nn.Module):
         self.attention_implementation = "sdpa"
         self.in_proj = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.calls = 0
 
     def resolve_attention_implementation(
         self, _: torch.Tensor, *, is_streaming: bool = False
     ) -> str:
-        return "sdpa"
+        return self.attention_implementation
 
     def forward(self, x: torch.Tensor, **_: object) -> torch.Tensor:
+        self.calls += 1
         return x
 
 
@@ -250,6 +252,14 @@ class _CountingLayer(_FakeLayer):
         self.layer_scale_2 = _CountingLayerScale(hidden_size)
 
 
+def _enable_sglang_flash_path(attn: MossTTSLocalAttention) -> None:
+    attn._remote_has_flash_attn = True
+    attn._remote_flash_attn_varlen_func = object()
+    attn._supports_sglang_flash_attention = (  # type: ignore[method-assign]
+        lambda _: True
+    )
+
+
 def test_projected_transformer_sdpa_path_does_not_reenter_source_stage() -> None:
     source = _FallbackProjectedStage()
     wrapper = MossTTSLocalProjectedTransformer(source)
@@ -270,9 +280,7 @@ def test_projected_transformer_uses_sglang_flash_fallback() -> None:
     )
     wrapper = MossTTSLocalProjectedTransformer(source)
     attn = wrapper.transformer.layers[0].self_attn
-    attn._supports_sglang_flash_attention = (  # type: ignore[method-assign]
-        lambda _: True
-    )
+    _enable_sglang_flash_path(attn)
     calls = []
 
     def fake_flash_attn(
@@ -308,6 +316,34 @@ def test_projected_transformer_uses_sglang_flash_fallback() -> None:
     assert torch.equal(out_lengths, lengths)
 
 
+def test_projected_transformer_preserves_source_path_without_remote_flash() -> None:
+    source = _FallbackProjectedStage()
+    source.transformer.layers[0].self_attn.attention_implementation = (
+        "flash_attention_2"
+    )
+    wrapper = MossTTSLocalProjectedTransformer(source)
+    attn = wrapper.transformer.layers[0].self_attn
+    attn._remote_has_flash_attn = False
+    attn._remote_flash_attn_varlen_func = None
+    attn._supports_sglang_flash_attention = (  # type: ignore[method-assign]
+        lambda _: True
+    )
+
+    def fake_flash_attn(*_: object, **__: object) -> torch.Tensor:
+        raise AssertionError("unsupported source flash path must not call SGLang")
+
+    attn._sglang_flash_attn_varlen_func = fake_flash_attn
+    x = torch.randn(2, 3, 4)
+    lengths = torch.tensor([4, 3])
+
+    out, out_lengths = wrapper(x, lengths)
+
+    assert source.transformer.layers[0].self_attn.calls == 1
+    assert source.seen_input_shape is None
+    assert out.shape == (2, 7, 4)
+    assert torch.equal(out_lengths, lengths)
+
+
 def test_projected_transformer_uses_single_unpadded_pack_fast_path(
     monkeypatch,
 ) -> None:
@@ -317,9 +353,7 @@ def test_projected_transformer_uses_single_unpadded_pack_fast_path(
     )
     wrapper = MossTTSLocalProjectedTransformer(source)
     attn = wrapper.transformer.layers[0].self_attn
-    attn._supports_sglang_flash_attention = (  # type: ignore[method-assign]
-        lambda _: True
-    )
+    _enable_sglang_flash_path(attn)
     calls = []
 
     def fail_masked_pack(_: torch.Tensor, __: torch.Tensor) -> None:
@@ -380,9 +414,7 @@ def test_projected_transformer_single_padded_input_uses_masked_pack() -> None:
     )
     wrapper = MossTTSLocalProjectedTransformer(source)
     attn = wrapper.transformer.layers[0].self_attn
-    attn._supports_sglang_flash_attention = (  # type: ignore[method-assign]
-        lambda _: True
-    )
+    _enable_sglang_flash_path(attn)
     calls = []
 
     def fake_flash_attn(
@@ -490,95 +522,18 @@ def test_attention_uses_source_streaming_state_when_active() -> None:
     assert torch.allclose(out, source.out_proj(x + 2))
 
 
-def test_attention_owns_streaming_flash_path() -> None:
+def test_attention_streaming_flash_request_falls_back_to_source() -> None:
     source = _StreamingFlashAttention(hidden_size=6)
     wrapper = MossTTSLocalAttention(source)
-    calls: list[tuple[torch.Tensor, torch.Tensor, int, int, tuple[int, int]]] = []
-
-    def fake_flash_attn(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_q: torch.Tensor,
-        cu_k: torch.Tensor,
-        max_q: int,
-        max_k: int,
-        *,
-        causal: bool,
-        window_size: tuple[int, int],
-    ) -> torch.Tensor:
-        assert causal
-        calls.append((cu_q, cu_k, max_q, max_k, window_size))
-        assert k.shape == v.shape
-        return q
-
-    wrapper._sglang_flash_attn_varlen_func = fake_flash_attn
+    _enable_sglang_flash_path(wrapper)
     x = torch.randn(2, 4, 6)
 
     out = wrapper(x, input_lengths=torch.tensor([4, 4]))
 
     assert source.streaming_flash_calls == 0
     assert source.cache_updates == 0
-    assert source._streaming_state.offset.tolist() == [4, 4]
-    assert source._streaming_state.cached_positions is not None
-    assert source._streaming_state.cached_positions.tolist() == [
-        [0, 1, 2, 3],
-        [0, 1, 2, 3],
-    ]
-    assert len(calls) == 1
-    cu_q, cu_k, max_q, max_k, window_size = calls[0]
-    assert cu_q.tolist() == [0, 4, 8]
-    assert cu_k.tolist() == [0, 4, 8]
-    assert max_q == 4
-    assert max_k == 4
-    assert window_size == (source.context, 0)
+    assert source.calls == 1
     assert out.shape == x.shape
-
-
-def test_attention_streaming_flash_cache_update_preserves_storage() -> None:
-    source = _StreamingFlashAttention(hidden_size=6)
-    wrapper = MossTTSLocalAttention(source)
-
-    def fake_flash_attn(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_q: torch.Tensor,
-        cu_k: torch.Tensor,
-        max_q: int,
-        max_k: int,
-        *,
-        causal: bool,
-        window_size: tuple[int, int],
-    ) -> torch.Tensor:
-        return q
-
-    wrapper._sglang_flash_attn_varlen_func = fake_flash_attn
-    x = torch.randn(2, 4, 6)
-
-    _ = wrapper(x, input_lengths=torch.tensor([4, 4]))
-    state = source._streaming_state
-    assert state.cached_keys is not None
-    assert state.cached_values is not None
-    assert state.cached_positions is not None
-    keys_ptr = state.cached_keys.data_ptr()
-    values_ptr = state.cached_values.data_ptr()
-    positions_ptr = state.cached_positions.data_ptr()
-
-    state.exec_mask = torch.tensor([True, False])
-    _ = wrapper(x, input_lengths=torch.tensor([4, 4]))
-
-    assert state.cached_keys is not None
-    assert state.cached_values is not None
-    assert state.cached_positions is not None
-    assert state.cached_keys.data_ptr() == keys_ptr
-    assert state.cached_values.data_ptr() == values_ptr
-    assert state.cached_positions.data_ptr() == positions_ptr
-    assert state.offset.tolist() == [8, 4]
-    assert state.cached_positions.tolist() == [
-        [4, 5, 6, 7],
-        [0, 1, 2, 3],
-    ]
 
 
 def test_transformer_layer_uses_source_modules_for_primitive_ops() -> None:
