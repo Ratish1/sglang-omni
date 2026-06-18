@@ -19,9 +19,14 @@ Example:
 from __future__ import annotations
 
 import argparse
+import importlib
+import inspect
 import json
 import logging
 import math
+import platform
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -30,6 +35,12 @@ import torch
 
 from sglang_omni.models.moss_tts_local.stages import _load_moss_tts_local_processor
 from sglang_omni.models.moss_tts_local.streaming_vocoder import _CodecStreamSession
+from sglang_omni.models.moss_tts_local.vocoder_backend import (
+    MossTTSLocalVocoderBackend,
+    is_experimental_moss_tts_local_vocoder_backend,
+    moss_tts_local_vocoder_backend_choices,
+    parse_moss_tts_local_vocoder_backend,
+)
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
     build_moss_tts_local_vocoder_decoder,
     use_moss_tts_local_vocoder_decoder,
@@ -44,6 +55,8 @@ from sglang_omni.models.moss_tts_local.vocoder_sglang_patch import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MOSS_ATTENTION_CLASS_NAME = "MossAudioTokenizerMultiheadAttention"
 
 
 def _parse_probe(value: str) -> tuple[int, int]:
@@ -96,6 +109,207 @@ def _cuda_sdp_settings() -> dict[str, bool | None]:
         "flash_sdp": _enabled("flash_sdp_enabled"),
         "math_sdp": _enabled("math_sdp_enabled"),
         "mem_efficient_sdp": _enabled("mem_efficient_sdp_enabled"),
+    }
+
+
+def _cuda_runtime_summary(device: torch.device) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "torch_version": torch.__version__,
+        "python_version": sys.version.split()[0],
+        "platform": platform.platform(),
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version(),
+        "cuda_available": torch.cuda.is_available(),
+    }
+    if device.type == "cuda" and torch.cuda.is_available():
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        properties = torch.cuda.get_device_properties(index)
+        summary.update(
+            {
+                "cuda_device_index": index,
+                "cuda_device_name": properties.name,
+                "cuda_device_capability": (
+                    list(properties.major_minor)
+                    if hasattr(properties, "major_minor")
+                    else [properties.major, properties.minor]
+                ),
+                "cuda_device_total_memory": int(properties.total_memory),
+            }
+        )
+    return summary
+
+
+def _module_import_status(module_name: str) -> dict[str, Any]:
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:
+        return {
+            "available": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+    return {
+        "available": True,
+        "file": getattr(module, "__file__", None),
+        "version": getattr(module, "__version__", None),
+    }
+
+
+def _git_commit_for_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    candidate = Path(path).resolve()
+    directory = candidate if candidate.is_dir() else candidate.parent
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    commit = result.stdout.strip()
+    return commit or None
+
+
+def _dependency_status() -> dict[str, Any]:
+    flash_attn_status = _module_import_status("flash_attn")
+    try:
+        from flash_attn import flash_attn_varlen_func
+
+        flash_attn_status["flash_attn_varlen_func"] = {
+            "available": True,
+            "signature": str(inspect.signature(flash_attn_varlen_func)),
+        }
+    except Exception as exc:
+        flash_attn_status["flash_attn_varlen_func"] = {
+            "available": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+    sglang_status = _module_import_status("sglang")
+    sglang_flash_status: dict[str, Any]
+    try:
+        from sglang.jit_kernel import flash_attention as sglang_flash_attention
+
+        sglang_flash_status = {
+            "available": True,
+            "file": getattr(sglang_flash_attention, "__file__", None),
+            "flash_attn_varlen_signature": str(
+                inspect.signature(sglang_flash_attention.flash_attn_varlen_func)
+            ),
+        }
+    except Exception as exc:
+        sglang_flash_status = {
+            "available": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+    sglang_status["git_commit"] = _git_commit_for_path(sglang_status.get("file"))
+    return {
+        "flash_attn": flash_attn_status,
+        "sglang": sglang_status,
+        "sglang_flash_attention": sglang_flash_status,
+    }
+
+
+def _is_json_scalar(value: Any) -> bool:
+    return value is None or isinstance(value, str | int | float | bool)
+
+
+def _summarize_config_object(owner: Any) -> dict[str, Any]:
+    if owner is None:
+        return {}
+    summary: dict[str, Any] = {}
+    for name in dir(owner):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(owner, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        if _is_json_scalar(value):
+            summary[name] = value
+        elif isinstance(value, (list, tuple)) and all(
+            _is_json_scalar(item) for item in value
+        ):
+            summary[name] = list(value)
+        elif isinstance(value, dict) and all(
+            isinstance(key, str) and _is_json_scalar(item)
+            for key, item in value.items()
+        ):
+            summary[name] = dict(value)
+    return summary
+
+
+def _parameter_dtype_summary(module: Any) -> dict[str, int]:
+    if module is None or not hasattr(module, "parameters"):
+        return {}
+    counts: dict[str, int] = {}
+    for parameter in module.parameters():
+        key = str(parameter.dtype)
+        counts[key] = counts.get(key, 0) + int(parameter.numel())
+    return counts
+
+
+def _model_config_summary(processor: Any) -> dict[str, Any]:
+    codec = getattr(processor, "audio_tokenizer", None)
+    return {
+        "processor_class": f"{processor.__class__.__module__}.{processor.__class__.__name__}",
+        "processor_config": _summarize_config_object(
+            getattr(processor, "model_config", None)
+        ),
+        "codec_class": (
+            f"{codec.__class__.__module__}.{codec.__class__.__name__}"
+            if codec is not None
+            else None
+        ),
+        "codec_config": _summarize_config_object(getattr(codec, "config", None)),
+        "codec_parameter_dtypes": _parameter_dtype_summary(codec),
+    }
+
+
+def _attention_implementation_summary(processor: Any) -> dict[str, Any]:
+    codec = getattr(processor, "audio_tokenizer", None)
+    decoder = getattr(codec, "decoder", None)
+    attention_modules: list[Any] = []
+    if decoder is not None and callable(getattr(decoder, "modules", None)):
+        attention_modules = [
+            module
+            for module in decoder.modules()
+            if module.__class__.__name__ == _MOSS_ATTENTION_CLASS_NAME
+        ]
+    implementation_counts: dict[str, int] = {}
+    module_counts: dict[str, int] = {}
+    module_globals: dict[str, Any] = {}
+    for attention_module in attention_modules:
+        implementation = str(
+            getattr(attention_module, "attention_implementation", "unknown")
+        )
+        implementation_counts[implementation] = (
+            implementation_counts.get(implementation, 0) + 1
+        )
+        module_name = attention_module.__class__.__module__
+        module_counts[module_name] = module_counts.get(module_name, 0) + 1
+        if module_name not in module_globals:
+            remote_module = sys.modules.get(module_name)
+            module_globals[module_name] = {
+                "file": getattr(remote_module, "__file__", None),
+                "HAS_FLASH_ATTN": getattr(remote_module, "HAS_FLASH_ATTN", None),
+                "flash_attn_varlen_func": str(
+                    getattr(remote_module, "flash_attn_varlen_func", None)
+                ),
+            }
+    return {
+        "attention_module_count": len(attention_modules),
+        "attention_implementation_counts": implementation_counts,
+        "attention_python_module_counts": module_counts,
+        "attention_module_globals": module_globals,
     }
 
 
@@ -562,6 +776,8 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         f"- schema: `{report['schema']}`",
         f"- model: `{report['model_path']}`",
         f"- device: `{report['device']}`",
+        f"- requested backend: `{report['requested_backend']}`",
+        f"- backend experimental: `{report['requested_backend_experimental']}`",
         f"- cuda sdp: `{report['torch_backends']['cuda_sdp']}`",
         "",
         "## Decoder",
@@ -693,6 +909,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
+        "--backend",
+        default=MossTTSLocalVocoderBackend.PROCESSOR.value,
+        choices=moss_tts_local_vocoder_backend_choices(),
+        help="vocoder backend to inspect; experimental backends are compared against processor",
+    )
+    parser.add_argument(
         "--probe",
         action="append",
         type=_parse_probe,
@@ -724,6 +946,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip-probes", action="store_true")
     parser.add_argument("--no-markdown", action="store_true")
+    parser.add_argument("--dump-env", action="store_true")
+    parser.add_argument("--dump-model-config", action="store_true")
+    parser.add_argument("--dump-attention-impl", action="store_true")
     return parser
 
 
@@ -735,6 +960,23 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     if args.iterations < 1:
         raise SystemExit("--iterations must be >= 1")
+    backend = parse_moss_tts_local_vocoder_backend(args.backend)
+    if backend in {
+        MossTTSLocalVocoderBackend.PROCESSOR_SDPA,
+        MossTTSLocalVocoderBackend.PROCESSOR_FLASH2_UPSTREAM,
+    }:
+        raise SystemExit(
+            f"--backend {backend.value!r} is reserved for the next SDPA/FA2 "
+            "control phase; use --backend processor for the golden report"
+        )
+    compare_owned_decoder = (
+        args.compare_owned_decoder
+        or backend == MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL
+    )
+    compare_sglang_patch = (
+        args.compare_sglang_patch
+        or backend == MossTTSLocalVocoderBackend.SGLANG_PATCH_EXPERIMENTAL
+    )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.disable_cudnn_sdp:
@@ -748,11 +990,26 @@ def main() -> None:
         "schema": "moss_tts_local_vocoder_phase0_report_v1",
         "model_path": args.model,
         "device": str(device),
+        "requested_backend": backend.value,
+        "requested_backend_experimental": is_experimental_moss_tts_local_vocoder_backend(
+            backend
+        ),
         "torch_backends": {"cuda_sdp": _cuda_sdp_settings()},
         "introspection": summarize_moss_tts_local_vocoder(processor),
         "decode_probes": [],
         "stress_cases": [],
     }
+    if args.dump_env:
+        report["environment"] = {
+            **_cuda_runtime_summary(device),
+            "dependencies": _dependency_status(),
+        }
+    if args.dump_model_config:
+        report["model_config_summary"] = _model_config_summary(processor)
+    if args.dump_attention_impl:
+        report["attention_implementation_summary"] = _attention_implementation_summary(
+            processor
+        )
 
     probes = args.probe or [(1, 25), (1, 100), (1, 300), (8, 100), (8, 300)]
     if not args.skip_probes:
@@ -767,8 +1024,8 @@ def main() -> None:
                     seed=args.seed + index,
                     max_step_frames=args.max_step_frames,
                     device=device,
-                    compare_owned_decoder=args.compare_owned_decoder,
-                    compare_sglang_patch=args.compare_sglang_patch,
+                    compare_owned_decoder=compare_owned_decoder,
+                    compare_sglang_patch=compare_sglang_patch,
                 )
             )
     if args.stress_suite:
@@ -788,8 +1045,8 @@ def main() -> None:
                     iterations=args.iterations,
                     seed=args.seed + 1000 + index,
                     device=device,
-                    compare_owned_decoder=args.compare_owned_decoder,
-                    compare_sglang_patch=args.compare_sglang_patch,
+                    compare_owned_decoder=compare_owned_decoder,
+                    compare_sglang_patch=compare_sglang_patch,
                 )
             )
 

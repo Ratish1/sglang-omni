@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 import sglang_omni.models.moss_tts_local.vocoder_decoder as vocoder_decoder
+from sglang_omni.models.moss_tts_local.vocoder_backend import MossTTSLocalVocoderBackend
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
     MossTTSLocalAttention,
     MossTTSLocalProjectedTransformer,
@@ -612,7 +613,10 @@ def test_attention_profile_context_attributes_every_request_in_batch(
     try:
         with profile_moss_tts_local_vocoder_attention(
             ["req-a", "req-b"],
-            {"active_vocoder_backend": "owned_pytorch", "batch_size": 2},
+            {
+                "active_vocoder_backend": MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL.value,
+                "batch_size": 2,
+            },
         ):
             _ = wrapper(x, input_lengths=torch.tensor([4, 4]))
     finally:
@@ -627,7 +631,8 @@ def test_attention_profile_context_attributes_every_request_in_batch(
     ]
     assert {event["request_id"] for event in flash_events} == {"req-a", "req-b"}
     assert all(
-        event["metadata"]["active_vocoder_backend"] == "owned_pytorch"
+        event["metadata"]["active_vocoder_backend"]
+        == MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL.value
         for event in flash_events
     )
 

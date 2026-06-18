@@ -32,6 +32,10 @@ from sglang_omni.models.moss_tts_local.request_builders import (
 from sglang_omni.models.moss_tts_local.streaming_vocoder import (
     MossTTSLocalStreamingVocoderScheduler,
 )
+from sglang_omni.models.moss_tts_local.vocoder_backend import (
+    MossTTSLocalVocoderBackend,
+    parse_moss_tts_local_vocoder_backend,
+)
 from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.profiler.event_recorder import get_recorder
@@ -280,6 +284,21 @@ def test_stream_metadata_builder() -> None:
     }
 
 
+def test_vocoder_backend_aliases_remain_backward_compatible() -> None:
+    assert (
+        parse_moss_tts_local_vocoder_backend("owned-pytorch")
+        == MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL
+    )
+    assert (
+        parse_moss_tts_local_vocoder_backend("sglang_patch")
+        == MossTTSLocalVocoderBackend.SGLANG_PATCH_EXPERIMENTAL
+    )
+    assert (
+        parse_moss_tts_local_vocoder_backend(None)
+        == MossTTSLocalVocoderBackend.PROCESSOR
+    )
+
+
 def test_vocoder_decode_profile_metadata_identifies_active_backend(
     monkeypatch,
 ) -> None:
@@ -298,11 +317,18 @@ def test_vocoder_decode_profile_metadata_identifies_active_backend(
 
     scheduler._nonstream_decoder = object()  # type: ignore[assignment]
     metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
-    assert metadata["active_vocoder_backend"] == "owned_pytorch"
-    assert metadata["requested_vocoder_backend"] == "owned_pytorch"
+    assert (
+        metadata["active_vocoder_backend"]
+        == MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL.value
+    )
+    assert (
+        metadata["requested_vocoder_backend"]
+        == MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL.value
+    )
     assert metadata["session_active"] is False
     assert metadata["owned_decoder_active"] is True
     assert metadata["sglang_patch_active"] is False
+    assert metadata["vocoder_backend_experimental"] is True
 
     scheduler._nonstream_decoder = None
     scheduler._nonstream_sglang_patch_active = True
@@ -312,21 +338,35 @@ def test_vocoder_decode_profile_metadata_identifies_active_backend(
         lambda codec: SimpleNamespace(invocation_count=17, ref_count=1),
     )
     metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
-    assert metadata["active_vocoder_backend"] == "sglang_patch"
-    assert metadata["requested_vocoder_backend"] == "sglang_patch"
+    assert (
+        metadata["active_vocoder_backend"]
+        == MossTTSLocalVocoderBackend.SGLANG_PATCH_EXPERIMENTAL.value
+    )
+    assert (
+        metadata["requested_vocoder_backend"]
+        == MossTTSLocalVocoderBackend.SGLANG_PATCH_EXPERIMENTAL.value
+    )
     assert metadata["session_active"] is False
     assert metadata["owned_decoder_active"] is False
     assert metadata["sglang_patch_active"] is True
+    assert metadata["vocoder_backend_experimental"] is True
     assert metadata["sglang_patch_invocations"] == 17
     assert metadata["sglang_patch_ref_count"] == 1
 
     scheduler._session = object()  # type: ignore[assignment]
     metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
-    assert metadata["active_vocoder_backend"] == "session_offline"
-    assert metadata["requested_vocoder_backend"] == "sglang_patch"
+    assert (
+        metadata["active_vocoder_backend"]
+        == MossTTSLocalVocoderBackend.SESSION_OFFLINE.value
+    )
+    assert (
+        metadata["requested_vocoder_backend"]
+        == MossTTSLocalVocoderBackend.SGLANG_PATCH_EXPERIMENTAL.value
+    )
     assert metadata["session_active"] is True
     assert metadata["owned_decoder_active"] is False
     assert metadata["sglang_patch_active"] is True
+    assert metadata["vocoder_backend_experimental"] is False
     assert metadata["sglang_patch_invocations"] == 17
     assert metadata["sglang_patch_ref_count"] == 1
 
@@ -356,9 +396,16 @@ def test_vocoder_decode_events_include_backend_and_shape_metadata(
     assert [event["request_id"] for event in events] == ["req-a", "req-b"]
     for event, frames in zip(events, [3, 5]):
         metadata = event["metadata"]
-        assert metadata["path"] == "owned_pytorch"
-        assert metadata["active_vocoder_backend"] == "owned_pytorch"
-        assert metadata["requested_vocoder_backend"] == "owned_pytorch"
+        assert metadata["path"] == MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL.value
+        assert (
+            metadata["active_vocoder_backend"]
+            == MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL.value
+        )
+        assert (
+            metadata["requested_vocoder_backend"]
+            == MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL.value
+        )
+        assert metadata["vocoder_backend_experimental"] is True
         assert metadata["batch_size"] == 2
         assert metadata["total_frames"] == 8
         assert metadata["max_frames"] == 5

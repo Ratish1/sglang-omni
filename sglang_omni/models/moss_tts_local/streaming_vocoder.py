@@ -23,6 +23,11 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
+from sglang_omni.models.moss_tts_local.vocoder_backend import (
+    MossTTSLocalVocoderBackend,
+    is_experimental_moss_tts_local_vocoder_backend,
+    parse_moss_tts_local_vocoder_backend,
+)
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
     MossTTSLocalVocoderDecoder,
     build_moss_tts_local_vocoder_decoder,
@@ -50,10 +55,6 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 _SOURCE_HINT = "MOSS-TTS Local"
-_VOCODER_BACKEND_PROCESSOR = "processor"
-_VOCODER_BACKEND_OWNED_PYTORCH = "owned_pytorch"
-_VOCODER_BACKEND_SGLANG_PATCH = "sglang_patch"
-_VOCODER_BACKEND_SESSION_OFFLINE = "session_offline"
 
 
 def _resolve_sample_rate(processor: Any) -> int:
@@ -291,32 +292,44 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
     def _build_nonstream_decoder(
         self, nonstream_decoder: str | None
     ) -> MossTTSLocalVocoderDecoder | None:
-        mode = (nonstream_decoder or "processor").strip().lower()
-        if mode in {"", "processor", "default"}:
+        backend = parse_moss_tts_local_vocoder_backend(nonstream_decoder)
+        if backend in {
+            MossTTSLocalVocoderBackend.PROCESSOR,
+            MossTTSLocalVocoderBackend.PROCESSOR_SDPA,
+            MossTTSLocalVocoderBackend.PROCESSOR_FLASH2_UPSTREAM,
+        }:
+            if backend != MossTTSLocalVocoderBackend.PROCESSOR:
+                logger.warning(
+                    "MOSS-TTS Local non-streaming vocoder backend=%s currently "
+                    "uses the processor path; backend-specific processor controls "
+                    "are implemented in the introspection harness first",
+                    backend.value,
+                )
             return None
-        if mode in {"sglang-patch", "sglang_patch"}:
+        if backend == MossTTSLocalVocoderBackend.SGLANG_PATCH_EXPERIMENTAL:
             info = install_moss_tts_local_sglang_vocoder_patch(self._codec)
             self._nonstream_sglang_patch_active = True
             self._nonstream_sglang_patch_info = info
             logger.info(
-                "MOSS-TTS Local non-streaming vocoder decoder=sglang-patch "
+                "MOSS-TTS Local non-streaming vocoder backend=%s "
                 "attention_modules=%d python_modules=%d ref_count=%d "
                 "attention_implementations=%s",
+                backend.value,
                 info.attention_modules,
                 info.python_modules,
                 info.ref_count,
                 dict(info.attention_implementations),
             )
             return None
-        if mode not in {"owned", "owned-pytorch"}:
+        if backend != MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL:
             raise ValueError(
-                f"unsupported MOSS-TTS Local non-streaming vocoder decoder "
-                f"{nonstream_decoder!r}; expected 'processor', 'sglang-patch', "
-                "or 'owned-pytorch'"
+                f"unsupported MOSS-TTS Local non-streaming vocoder backend "
+                f"{backend.value!r}"
             )
         decoder = build_moss_tts_local_vocoder_decoder(self._codec)
         logger.info(
-            "MOSS-TTS Local non-streaming vocoder decoder=owned stages=%d",
+            "MOSS-TTS Local non-streaming vocoder backend=%s stages=%d",
+            backend.value,
             len(decoder),
         )
         return decoder
@@ -775,19 +788,19 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     def _active_vocoder_backend(self) -> str:
         if self._session is not None:
-            return _VOCODER_BACKEND_SESSION_OFFLINE
+            return MossTTSLocalVocoderBackend.SESSION_OFFLINE.value
         if self._nonstream_decoder is not None:
-            return _VOCODER_BACKEND_OWNED_PYTORCH
+            return MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL.value
         if self._nonstream_sglang_patch_active:
-            return _VOCODER_BACKEND_SGLANG_PATCH
-        return _VOCODER_BACKEND_PROCESSOR
+            return MossTTSLocalVocoderBackend.SGLANG_PATCH_EXPERIMENTAL.value
+        return MossTTSLocalVocoderBackend.PROCESSOR.value
 
     def _requested_vocoder_backend(self) -> str:
         if self._nonstream_decoder is not None:
-            return _VOCODER_BACKEND_OWNED_PYTORCH
+            return MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL.value
         if self._nonstream_sglang_patch_active:
-            return _VOCODER_BACKEND_SGLANG_PATCH
-        return _VOCODER_BACKEND_PROCESSOR
+            return MossTTSLocalVocoderBackend.SGLANG_PATCH_EXPERIMENTAL.value
+        return MossTTSLocalVocoderBackend.PROCESSOR.value
 
     def _vocoder_decode_profile_metadata(
         self, codes_list: list[torch.Tensor]
@@ -802,6 +815,9 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             "path": active_backend,
             "active_vocoder_backend": active_backend,
             "requested_vocoder_backend": self._requested_vocoder_backend(),
+            "vocoder_backend_experimental": is_experimental_moss_tts_local_vocoder_backend(
+                parse_moss_tts_local_vocoder_backend(active_backend)
+            ),
             "session_active": self._session is not None,
             "owned_decoder_active": self._nonstream_decoder is not None,
             "sglang_patch_active": self._nonstream_sglang_patch_active,
