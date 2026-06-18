@@ -1,0 +1,778 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Trace exactness between upstream and owned MOSS-TTS Local vocoder decoders.
+
+This is a debugging utility for the SGLang-backed MOSS vocoder work. It does
+not change the serving path. It loads the real MOSS-TTS Local processor,
+decodes deterministic codec-token probes through:
+
+1. the upstream processor path, and
+2. the repo-owned decoder path installed with ``use_moss_tts_local_vocoder_decoder``.
+
+It captures comparable decoder-module boundaries and reports the first tensor
+that diverges. The output is intended to answer one question before further
+optimization: does the owned decoder preserve upstream vocoder semantics before
+we route any supported attention call through SGLang?
+
+Example:
+
+    python -m benchmarks.eval.inspect_moss_tts_local_vocoder_exactness \
+        --model OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+        --device cuda:0 \
+        --output-dir /data/moss_vocoder_exactness \
+        --probe 1x25 --probe 1x100 --probe 1x300 \
+        --dump-first-mismatch
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import sys
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+import torch
+from torch import nn
+
+from sglang_omni.models.moss_tts_local.stages import _load_moss_tts_local_processor
+from sglang_omni.models.moss_tts_local.vocoder_decoder import (
+    build_moss_tts_local_vocoder_decoder,
+    use_moss_tts_local_vocoder_decoder,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _CapturedTensor:
+    key: str
+    shape: list[int]
+    dtype: str
+    device: str
+    numel: int
+    stored: bool
+    tensor: torch.Tensor | None = None
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "shape": self.shape,
+            "dtype": self.dtype,
+            "device": self.device,
+            "numel": self.numel,
+            "stored": self.stored,
+        }
+
+
+class _TraceCapture:
+    """Forward-hook recorder with deterministic key names.
+
+    Hooks are intentionally read-only: tensors are detached and copied to CPU
+    after module execution. Large tensors can be summarized without storing the
+    payload, which keeps long probes usable while still showing where trace
+    coverage stopped being comparable.
+    """
+
+    def __init__(self, *, max_elements_per_tensor: int) -> None:
+        self.max_elements_per_tensor = int(max_elements_per_tensor)
+        self.records: "OrderedDict[str, _CapturedTensor]" = OrderedDict()
+        self._handles: list[Any] = []
+        self._call_counts: dict[int, int] = defaultdict(int)
+        self._active_call: dict[int, list[int]] = defaultdict(list)
+
+    def install(self, modules: list[tuple[str, nn.Module]]) -> None:
+        seen: set[int] = set()
+        for name, module in modules:
+            module_id = id(module)
+            if module_id in seen:
+                continue
+            seen.add(module_id)
+            self._handles.append(
+                module.register_forward_pre_hook(
+                    self._make_pre_hook(name), with_kwargs=True
+                )
+            )
+            self._handles.append(module.register_forward_hook(self._make_hook(name)))
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def _make_pre_hook(self, name: str):
+        def hook(
+            module: nn.Module,
+            args: tuple[Any, ...],
+            kwargs: dict[str, Any],
+        ) -> None:
+            module_id = id(module)
+            call_index = self._call_counts[module_id]
+            self._call_counts[module_id] += 1
+            self._active_call[module_id].append(call_index)
+            prefix = f"{name}#{call_index:03d}.pre"
+            self._capture_value(f"{prefix}.arg", args)
+            for key in sorted(kwargs):
+                self._capture_value(f"{prefix}.kw.{key}", kwargs[key])
+
+        return hook
+
+    def _make_hook(self, name: str):
+        def hook(module: nn.Module, _: tuple[Any, ...], output: Any) -> None:
+            module_id = id(module)
+            stack = self._active_call[module_id]
+            call_index = stack.pop() if stack else self._call_counts[module_id]
+            self._capture_value(f"{name}#{call_index:03d}.post.out", output)
+
+        return hook
+
+    def _capture_value(self, prefix: str, value: Any) -> None:
+        if isinstance(value, torch.Tensor):
+            self._capture_tensor(prefix, value)
+            return
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                self._capture_value(f"{prefix}{index}", item)
+            return
+        if isinstance(value, dict):
+            for key in sorted(value):
+                self._capture_value(f"{prefix}.{key}", value[key])
+
+    def _capture_tensor(self, key: str, tensor: torch.Tensor) -> None:
+        detached = tensor.detach()
+        numel = int(detached.numel())
+        stored = numel <= self.max_elements_per_tensor
+        cpu_tensor = detached.to("cpu") if stored else None
+        self.records[key] = _CapturedTensor(
+            key=key,
+            shape=list(detached.shape),
+            dtype=str(detached.dtype),
+            device=str(detached.device),
+            numel=numel,
+            stored=stored,
+            tensor=cpu_tensor,
+        )
+
+
+def _parse_probe(value: str) -> tuple[int, int]:
+    try:
+        batch, frames = value.lower().split("x", 1)
+        batch_size = int(batch)
+        frame_count = int(frames)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"probe must use BxT form, for example 8x100; got {value!r}"
+        ) from exc
+    if batch_size < 1 or frame_count < 1:
+        raise argparse.ArgumentTypeError(
+            f"probe batch and frames must be positive, got {value!r}"
+        )
+    return batch_size, frame_count
+
+
+def _device_of_processor(processor: Any, fallback: str) -> torch.device:
+    codec = getattr(processor, "audio_tokenizer", None)
+    if codec is not None:
+        try:
+            return next(codec.parameters()).device
+        except StopIteration:
+            pass
+    return torch.device(fallback)
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _audio_vocab_size(processor: Any) -> int:
+    for owner in (
+        getattr(processor, "model_config", None),
+        getattr(getattr(processor, "audio_tokenizer", None), "config", None),
+    ):
+        if owner is None:
+            continue
+        for attr in ("audio_vocab_size", "vocab_size", "codebook_size"):
+            value = getattr(owner, attr, None)
+            if value:
+                return int(value)
+    return 1024
+
+
+def _num_codebooks(processor: Any) -> int:
+    value = getattr(getattr(processor, "model_config", None), "n_vq", None)
+    if value is not None:
+        return int(value)
+    value = getattr(getattr(processor, "audio_tokenizer", None), "num_codebooks", None)
+    if value is not None:
+        return int(value)
+    return 12
+
+
+def _make_codes(
+    *,
+    batch_size: int,
+    frames: int,
+    n_vq: int,
+    vocab_size: int,
+    seed: int,
+) -> list[torch.Tensor]:
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    return [
+        torch.randint(0, vocab_size, (frames, n_vq), generator=generator)
+        for _ in range(batch_size)
+    ]
+
+
+def _module_list(value: Any) -> list[nn.Module]:
+    if isinstance(value, nn.ModuleList):
+        return list(value)
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, nn.Module) for item in value
+    ):
+        return list(value)
+    return []
+
+
+def _decoder_stages(decoder: Any) -> list[nn.Module]:
+    stages = getattr(decoder, "stages", None)
+    if stages is not None:
+        out = _module_list(stages)
+        if out:
+            return out
+    return _module_list(decoder)
+
+
+def _add_if_module(
+    modules: list[tuple[str, nn.Module]],
+    name: str,
+    value: Any,
+) -> None:
+    if isinstance(value, nn.Module):
+        modules.append((name, value))
+
+
+def _trace_modules(decoder: Any, *, trace_level: str) -> list[tuple[str, nn.Module]]:
+    modules: list[tuple[str, nn.Module]] = []
+    if trace_level == "none":
+        return modules
+
+    for stage_index, stage in enumerate(_decoder_stages(decoder)):
+        stage_name = f"decoder.stage_{stage_index:02d}"
+        modules.append((stage_name, stage))
+        if trace_level == "stage":
+            continue
+
+        _add_if_module(
+            modules,
+            f"{stage_name}.input_proj",
+            getattr(stage, "input_proj", None),
+        )
+        transformer = getattr(stage, "transformer", None)
+        _add_if_module(modules, f"{stage_name}.transformer", transformer)
+        _add_if_module(
+            modules,
+            f"{stage_name}.output_proj",
+            getattr(stage, "output_proj", None),
+        )
+        if trace_level == "layer" or transformer is None:
+            if transformer is not None:
+                for layer_index, layer in enumerate(
+                    _module_list(getattr(transformer, "layers", None))
+                ):
+                    modules.append(
+                        (f"{stage_name}.transformer.layer_{layer_index:02d}", layer)
+                    )
+            continue
+
+        for layer_index, layer in enumerate(
+            _module_list(getattr(transformer, "layers", None))
+        ):
+            layer_name = f"{stage_name}.transformer.layer_{layer_index:02d}"
+            modules.append((layer_name, layer))
+            _add_if_module(
+                modules,
+                f"{layer_name}.norm1",
+                getattr(layer, "norm1", None),
+            )
+            self_attn = getattr(layer, "self_attn", None)
+            _add_if_module(modules, f"{layer_name}.self_attn", self_attn)
+            if self_attn is not None:
+                _add_if_module(
+                    modules,
+                    f"{layer_name}.self_attn.in_proj",
+                    getattr(self_attn, "in_proj", None),
+                )
+                _add_if_module(
+                    modules,
+                    f"{layer_name}.self_attn.out_proj",
+                    getattr(self_attn, "out_proj", None),
+                )
+            _add_if_module(
+                modules,
+                f"{layer_name}.layer_scale_1",
+                getattr(layer, "layer_scale_1", None),
+            )
+            _add_if_module(
+                modules,
+                f"{layer_name}.norm2",
+                getattr(layer, "norm2", None),
+            )
+            ffn = getattr(layer, "ffn", None)
+            _add_if_module(modules, f"{layer_name}.ffn", ffn)
+            if isinstance(ffn, nn.Sequential):
+                for ffn_index, ffn_module in enumerate(ffn):
+                    modules.append((f"{layer_name}.ffn.{ffn_index}", ffn_module))
+            _add_if_module(
+                modules,
+                f"{layer_name}.layer_scale_2",
+                getattr(layer, "layer_scale_2", None),
+            )
+    return modules
+
+
+def _tensor_comparison(
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+) -> dict[str, Any]:
+    same_shape = tuple(reference.shape) == tuple(candidate.shape)
+    same_dtype = reference.dtype == candidate.dtype
+    if not same_shape:
+        return {
+            "same_shape": False,
+            "same_dtype": same_dtype,
+            "reference_shape": list(reference.shape),
+            "candidate_shape": list(candidate.shape),
+        }
+    equal = bool(torch.equal(reference, candidate)) if same_dtype else False
+    delta = reference.to(torch.float32) - candidate.to(torch.float32)
+    abs_delta = delta.abs()
+    signal = reference.to(torch.float32)
+    signal_energy = float((signal * signal).sum().item())
+    noise_energy = float((delta * delta).sum().item())
+    if noise_energy == 0.0:
+        snr_db: float | str = "inf"
+    elif signal_energy == 0.0:
+        snr_db = "-inf"
+    else:
+        snr_db = 10.0 * math.log10(signal_energy / noise_energy)
+    return {
+        "same_shape": True,
+        "same_dtype": same_dtype,
+        "torch_equal": equal,
+        "max_abs_delta": float(abs_delta.max().item()) if abs_delta.numel() else 0.0,
+        "mean_abs_delta": float(abs_delta.mean().item()) if abs_delta.numel() else 0.0,
+        "snr_db": snr_db,
+    }
+
+
+def _compare_records(
+    reference: OrderedDict[str, _CapturedTensor],
+    candidate: OrderedDict[str, _CapturedTensor],
+) -> dict[str, Any]:
+    common = []
+    first_mismatch: dict[str, Any] | None = None
+    first_uncompared: dict[str, Any] | None = None
+
+    for key, ref_record in reference.items():
+        cand_record = candidate.get(key)
+        if cand_record is None:
+            first_mismatch = {
+                "kind": "missing_candidate_record",
+                "key": key,
+                "reference": ref_record.summary(),
+            }
+            break
+        common.append(key)
+        if ref_record.tensor is None or cand_record.tensor is None:
+            if first_uncompared is None:
+                first_uncompared = {
+                    "kind": "tensor_not_stored",
+                    "key": key,
+                    "reference": ref_record.summary(),
+                    "candidate": cand_record.summary(),
+                }
+            continue
+        comparison = _tensor_comparison(ref_record.tensor, cand_record.tensor)
+        if not comparison.get("torch_equal", False):
+            first_mismatch = {
+                "kind": "tensor_mismatch",
+                "key": key,
+                "reference": ref_record.summary(),
+                "candidate": cand_record.summary(),
+                "comparison": comparison,
+            }
+            break
+
+    extra_candidate = [key for key in candidate if key not in reference]
+    return {
+        "reference_record_count": len(reference),
+        "candidate_record_count": len(candidate),
+        "common_record_count": len(common),
+        "missing_candidate_count": (
+            len(reference) - len(common)
+            if first_mismatch and first_mismatch["kind"] == "missing_candidate_record"
+            else 0
+        ),
+        "extra_candidate_count": len(extra_candidate),
+        "first_mismatch": first_mismatch,
+        "first_uncompared": first_uncompared,
+    }
+
+
+def _compare_outputs(
+    reference: list[torch.Tensor],
+    candidate: list[torch.Tensor],
+) -> dict[str, Any]:
+    comparisons = []
+    for index, (ref, cand) in enumerate(zip(reference, candidate)):
+        comparisons.append({"index": index, **_tensor_comparison(ref, cand)})
+    return {
+        "reference_count": len(reference),
+        "candidate_count": len(candidate),
+        "all_equal": len(reference) == len(candidate)
+        and all(item.get("torch_equal", False) for item in comparisons),
+        "max_abs_delta": max(
+            (float(item.get("max_abs_delta", 0.0)) for item in comparisons),
+            default=0.0,
+        ),
+        "mean_abs_delta_max": max(
+            (float(item.get("mean_abs_delta", 0.0)) for item in comparisons),
+            default=0.0,
+        ),
+        "comparisons": comparisons,
+    }
+
+
+def _decode_processor(
+    processor: Any, codes_list: list[torch.Tensor]
+) -> list[torch.Tensor]:
+    return [
+        torch.as_tensor(wav).detach().to("cpu")
+        for wav in processor.decode_audio_codes(codes_list)
+    ]
+
+
+def _decode_owned(
+    processor: Any,
+    codes_list: list[torch.Tensor],
+    owned_decoder: nn.Module,
+) -> list[torch.Tensor]:
+    codec = processor.audio_tokenizer
+    with use_moss_tts_local_vocoder_decoder(codec, owned_decoder):
+        return [
+            torch.as_tensor(wav).detach().to("cpu")
+            for wav in processor.decode_audio_codes(codes_list)
+        ]
+
+
+def _run_with_trace(
+    *,
+    label: str,
+    decoder: Any,
+    decode_fn,
+    device: torch.device,
+    trace_level: str,
+    max_elements_per_tensor: int,
+) -> tuple[list[torch.Tensor], OrderedDict[str, _CapturedTensor]]:
+    modules = _trace_modules(decoder, trace_level=trace_level)
+    capture = _TraceCapture(max_elements_per_tensor=max_elements_per_tensor)
+    logger.info("%s: installing %d trace hooks", label, len(modules) * 2)
+    capture.install(modules)
+    try:
+        _synchronize(device)
+        with torch.no_grad():
+            outputs = decode_fn()
+        _synchronize(device)
+    finally:
+        capture.close()
+    logger.info("%s: captured %d tensor records", label, len(capture.records))
+    return outputs, capture.records
+
+
+def _attention_global_summary(codec: Any) -> dict[str, Any]:
+    decoder = getattr(codec, "decoder", None)
+    modules = list(decoder.modules()) if hasattr(decoder, "modules") else []
+    attention_modules = [
+        module
+        for module in modules
+        if module.__class__.__name__ == "MossAudioTokenizerMultiheadAttention"
+    ]
+    python_modules: dict[str, ModuleType] = {}
+    for module in attention_modules:
+        loaded = sys.modules.get(module.__class__.__module__)
+        if loaded is not None:
+            python_modules[module.__class__.__module__] = loaded
+    globals_summary = {}
+    for name, module in python_modules.items():
+        globals_summary[name] = {
+            "HAS_FLASH_ATTN": bool(getattr(module, "HAS_FLASH_ATTN", False)),
+            "flash_attn_varlen_func": repr(
+                getattr(module, "flash_attn_varlen_func", None)
+            ),
+            "file": getattr(module, "__file__", None),
+        }
+    implementation_counts: dict[str, int] = {}
+    for module in attention_modules:
+        implementation = str(getattr(module, "attention_implementation", "unknown"))
+        implementation_counts[implementation] = (
+            implementation_counts.get(implementation, 0) + 1
+        )
+    return {
+        "attention_module_count": len(attention_modules),
+        "attention_implementation_counts": implementation_counts,
+        "python_module_globals": globals_summary,
+    }
+
+
+def _dependency_summary() -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "cuda_available": torch.cuda.is_available(),
+    }
+    try:
+        import sglang
+
+        summary["sglang"] = getattr(sglang, "__version__", "unknown")
+    except Exception as exc:
+        summary["sglang_error"] = repr(exc)
+    try:
+        from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+
+        summary["sglang_flash_attn_varlen_func"] = repr(flash_attn_varlen_func)
+    except Exception as exc:
+        summary["sglang_flash_attn_varlen_func_error"] = repr(exc)
+    return summary
+
+
+def _run_probe(
+    processor: Any,
+    *,
+    batch_size: int,
+    frames: int,
+    seed: int,
+    trace_level: str,
+    max_elements_per_tensor: int,
+    device: torch.device,
+    dump_first_mismatch: bool,
+    output_dir: Path,
+) -> dict[str, Any]:
+    n_vq = _num_codebooks(processor)
+    vocab_size = _audio_vocab_size(processor)
+    codes_list = _make_codes(
+        batch_size=batch_size,
+        frames=frames,
+        n_vq=n_vq,
+        vocab_size=vocab_size,
+        seed=seed,
+    )
+    codec = processor.audio_tokenizer
+    owned_decoder = build_moss_tts_local_vocoder_decoder(codec)
+    if hasattr(owned_decoder, "eval"):
+        owned_decoder.eval()
+
+    source_outputs, source_records = _run_with_trace(
+        label="processor",
+        decoder=codec.decoder,
+        decode_fn=lambda: _decode_processor(processor, codes_list),
+        device=device,
+        trace_level=trace_level,
+        max_elements_per_tensor=max_elements_per_tensor,
+    )
+    owned_outputs, owned_records = _run_with_trace(
+        label="owned",
+        decoder=owned_decoder,
+        decode_fn=lambda: _decode_owned(processor, codes_list, owned_decoder),
+        device=device,
+        trace_level=trace_level,
+        max_elements_per_tensor=max_elements_per_tensor,
+    )
+
+    record_comparison = _compare_records(source_records, owned_records)
+    output_comparison = _compare_outputs(source_outputs, owned_outputs)
+    first_mismatch = record_comparison.get("first_mismatch")
+    dump_path = None
+    if dump_first_mismatch and first_mismatch and first_mismatch.get("key"):
+        key = str(first_mismatch["key"])
+        source = source_records.get(key)
+        owned = owned_records.get(key)
+        if source is not None and owned is not None and source.tensor is not None:
+            dump_path = output_dir / (
+                f"first_mismatch_b{batch_size}_t{frames}_"
+                f"{key.replace('/', '_').replace('#', '_')}.pt"
+            )
+            torch.save(
+                {
+                    "key": key,
+                    "source": source.tensor,
+                    "owned": owned.tensor if owned is not None else None,
+                    "comparison": first_mismatch.get("comparison"),
+                },
+                dump_path,
+            )
+
+    logger.info(
+        "probe b=%d t=%d output_equal=%s max_abs=%.6g first_mismatch=%s",
+        batch_size,
+        frames,
+        output_comparison["all_equal"],
+        output_comparison["max_abs_delta"],
+        first_mismatch.get("key") if first_mismatch else None,
+    )
+    return {
+        "batch_size": batch_size,
+        "frames": frames,
+        "seed": seed,
+        "codebooks": n_vq,
+        "vocab_size": vocab_size,
+        "trace_level": trace_level,
+        "max_elements_per_tensor": max_elements_per_tensor,
+        "output_comparison": output_comparison,
+        "record_comparison": record_comparison,
+        "first_mismatch_dump": str(dump_path) if dump_path is not None else None,
+    }
+
+
+def _write_markdown(report: dict[str, Any], path: Path) -> None:
+    lines = [
+        "# MOSS-TTS Local Vocoder Exactness",
+        "",
+        f"- schema: `{report['schema']}`",
+        f"- model: `{report['model_path']}`",
+        f"- device: `{report['device']}`",
+        f"- trace level: `{report['trace_level']}`",
+        "",
+        "## Attention Globals",
+        "",
+        "```json",
+        json.dumps(report["attention_globals"], indent=2, sort_keys=True),
+        "```",
+        "",
+        "## Probes",
+        "",
+        "| probe | output equal | max abs | mean abs max | first traced mismatch | dump |",
+        "|---|---:|---:|---:|---|---|",
+    ]
+    for probe in report["probes"]:
+        out = probe["output_comparison"]
+        mismatch = probe["record_comparison"].get("first_mismatch")
+        lines.append(
+            "| {batch}x{frames} | {equal} | {max_abs:.6g} | {mean_abs:.6g} | {mismatch} | {dump} |".format(
+                batch=probe["batch_size"],
+                frames=probe["frames"],
+                equal=out["all_equal"],
+                max_abs=float(out["max_abs_delta"]),
+                mean_abs=float(out["mean_abs_delta_max"]),
+                mismatch=mismatch.get("key") if mismatch else "",
+                dump=probe.get("first_mismatch_dump") or "",
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "## Interpretation",
+            "",
+            "If `first traced mismatch` is empty but output parity fails, rerun with "
+            "`--trace-level module` and a higher `--max-elements-per-tensor`. If "
+            "the first mismatch is in an owned wrapper boundary before any SGLang "
+            "attention call, the owned decoder semantics must be fixed before "
+            "optimizing attention.",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model",
+        default="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5",
+        help="HF model id or local checkpoint path",
+    )
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--probe",
+        action="append",
+        type=_parse_probe,
+        default=[],
+        help="probe shape in BxT form, e.g. 8x100; repeatable",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--trace-level",
+        choices=("none", "stage", "layer", "module"),
+        default="module",
+        help="decoder boundary detail to capture",
+    )
+    parser.add_argument(
+        "--max-elements-per-tensor",
+        type=int,
+        default=10_000_000,
+        help="summarize larger hook tensors without storing payloads",
+    )
+    parser.add_argument("--dump-first-mismatch", action="store_true")
+    parser.add_argument("--no-markdown", action="store_true")
+    return parser
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    args = build_arg_parser().parse_args()
+    if args.max_elements_per_tensor < 1:
+        raise SystemExit("--max-elements-per-tensor must be positive")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Loading MOSS-TTS Local processor from %s", args.model)
+    processor = _load_moss_tts_local_processor(args.model, device=args.device)
+    device = _device_of_processor(processor, args.device)
+    codec = processor.audio_tokenizer
+
+    probes = args.probe or [(1, 25), (1, 100), (1, 300), (8, 100), (8, 300)]
+    report: dict[str, Any] = {
+        "schema": "moss_tts_local_vocoder_exactness_v1",
+        "model_path": args.model,
+        "device": str(device),
+        "trace_level": args.trace_level,
+        "dependencies": _dependency_summary(),
+        "attention_globals": _attention_global_summary(codec),
+        "probes": [],
+    }
+    for index, (batch_size, frames) in enumerate(probes):
+        logger.info("Running exactness probe %dx%d", batch_size, frames)
+        report["probes"].append(
+            _run_probe(
+                processor,
+                batch_size=batch_size,
+                frames=frames,
+                seed=args.seed + index,
+                trace_level=args.trace_level,
+                max_elements_per_tensor=args.max_elements_per_tensor,
+                device=device,
+                dump_first_mismatch=args.dump_first_mismatch,
+                output_dir=output_dir,
+            )
+        )
+
+    json_path = output_dir / "moss_tts_local_vocoder_exactness.json"
+    json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    logger.info("Wrote %s", json_path)
+    if not args.no_markdown:
+        markdown_path = output_dir / "moss_tts_local_vocoder_exactness.md"
+        _write_markdown(report, markdown_path)
+        logger.info("Wrote %s", markdown_path)
+
+
+if __name__ == "__main__":
+    main()
