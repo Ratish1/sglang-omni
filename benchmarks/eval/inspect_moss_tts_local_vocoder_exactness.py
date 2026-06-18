@@ -189,6 +189,49 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _cuda_sdp_settings() -> dict[str, bool | None]:
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    if cuda_backend is None:
+        return {
+            "cudnn_sdp": None,
+            "flash_sdp": None,
+            "math_sdp": None,
+            "mem_efficient_sdp": None,
+        }
+
+    def _enabled(name: str) -> bool | None:
+        fn = getattr(cuda_backend, name, None)
+        return bool(fn()) if callable(fn) else None
+
+    return {
+        "cudnn_sdp": _enabled("cudnn_sdp_enabled"),
+        "flash_sdp": _enabled("flash_sdp_enabled"),
+        "math_sdp": _enabled("math_sdp_enabled"),
+        "mem_efficient_sdp": _enabled("mem_efficient_sdp_enabled"),
+    }
+
+
+def _set_cuda_sdp_backend(backend: str) -> None:
+    if backend == "default":
+        return
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    if cuda_backend is None:
+        raise RuntimeError("torch.backends.cuda is unavailable")
+    setters = {
+        "cudnn": getattr(cuda_backend, "enable_cudnn_sdp", None),
+        "flash": getattr(cuda_backend, "enable_flash_sdp", None),
+        "math": getattr(cuda_backend, "enable_math_sdp", None),
+        "efficient": getattr(cuda_backend, "enable_mem_efficient_sdp", None),
+    }
+    missing = [name for name, setter in setters.items() if not callable(setter)]
+    if missing:
+        raise RuntimeError(
+            "this PyTorch build cannot select CUDA SDPA backend; missing " f"{missing}"
+        )
+    for name, setter in setters.items():
+        setter(name == backend)
+
+
 def _audio_vocab_size(processor: Any) -> int:
     for owner in (
         getattr(processor, "model_config", None),
@@ -556,6 +599,7 @@ def _run_probe(
     batch_size: int,
     frames: int,
     seed: int,
+    candidates: list[str],
     trace_level: str,
     max_elements_per_tensor: int,
     device: torch.device,
@@ -584,46 +628,79 @@ def _run_probe(
         trace_level=trace_level,
         max_elements_per_tensor=max_elements_per_tensor,
     )
-    owned_outputs, owned_records = _run_with_trace(
-        label="owned",
-        decoder=owned_decoder,
-        decode_fn=lambda: _decode_owned(processor, codes_list, owned_decoder),
-        device=device,
-        trace_level=trace_level,
-        max_elements_per_tensor=max_elements_per_tensor,
-    )
 
-    record_comparison = _compare_records(source_records, owned_records)
-    output_comparison = _compare_outputs(source_outputs, owned_outputs)
-    first_mismatch = record_comparison.get("first_mismatch")
-    dump_path = None
-    if dump_first_mismatch and first_mismatch and first_mismatch.get("key"):
-        key = str(first_mismatch["key"])
-        source = source_records.get(key)
-        owned = owned_records.get(key)
-        if source is not None and owned is not None and source.tensor is not None:
-            dump_path = output_dir / (
-                f"first_mismatch_b{batch_size}_t{frames}_"
-                f"{key.replace('/', '_').replace('#', '_')}.pt"
+    candidate_reports: dict[str, Any] = {}
+    for candidate in candidates:
+        if candidate == "owned":
+            candidate_decoder = owned_decoder
+            candidate_decode = lambda: _decode_owned(
+                processor, codes_list, owned_decoder
             )
-            torch.save(
-                {
-                    "key": key,
-                    "source": source.tensor,
-                    "owned": owned.tensor if owned is not None else None,
-                    "comparison": first_mismatch.get("comparison"),
-                },
-                dump_path,
-            )
+        elif candidate == "processor-repeat":
+            candidate_decoder = codec.decoder
+            candidate_decode = lambda: _decode_processor(processor, codes_list)
+        else:
+            raise ValueError(f"unsupported candidate {candidate!r}")
 
-    logger.info(
-        "probe b=%d t=%d output_equal=%s max_abs=%.6g first_mismatch=%s",
-        batch_size,
-        frames,
-        output_comparison["all_equal"],
-        output_comparison["max_abs_delta"],
-        first_mismatch.get("key") if first_mismatch else None,
-    )
+        candidate_outputs, candidate_records = _run_with_trace(
+            label=candidate,
+            decoder=candidate_decoder,
+            decode_fn=candidate_decode,
+            device=device,
+            trace_level=trace_level,
+            max_elements_per_tensor=max_elements_per_tensor,
+        )
+        record_comparison = _compare_records(source_records, candidate_records)
+        output_comparison = _compare_outputs(source_outputs, candidate_outputs)
+        first_mismatch = record_comparison.get("first_mismatch")
+        dump_path = None
+        if dump_first_mismatch and first_mismatch and first_mismatch.get("key"):
+            key = str(first_mismatch["key"])
+            source = source_records.get(key)
+            candidate_record = candidate_records.get(key)
+            if (
+                source is not None
+                and candidate_record is not None
+                and source.tensor is not None
+            ):
+                dump_path = output_dir / (
+                    f"first_mismatch_b{batch_size}_t{frames}_{candidate}_"
+                    f"{key.replace('/', '_').replace('#', '_')}.pt"
+                )
+                torch.save(
+                    {
+                        "key": key,
+                        "source": source.tensor,
+                        "candidate": candidate_record.tensor,
+                        "comparison": first_mismatch.get("comparison"),
+                    },
+                    dump_path,
+                )
+
+        logger.info(
+            "probe b=%d t=%d candidate=%s output_equal=%s max_abs=%.6g "
+            "first_mismatch=%s",
+            batch_size,
+            frames,
+            candidate,
+            output_comparison["all_equal"],
+            output_comparison["max_abs_delta"],
+            first_mismatch.get("key") if first_mismatch else None,
+        )
+        candidate_reports[candidate] = {
+            "output_comparison": output_comparison,
+            "record_comparison": record_comparison,
+            "first_mismatch_dump": str(dump_path) if dump_path is not None else None,
+        }
+
+    legacy_owned = candidate_reports.get("owned")
+    if legacy_owned is None:
+        first_candidate = next(iter(candidate_reports.values()), None)
+        legacy_owned = first_candidate or {
+            "output_comparison": {},
+            "record_comparison": {},
+            "first_mismatch_dump": None,
+        }
     return {
         "batch_size": batch_size,
         "frames": frames,
@@ -632,9 +709,11 @@ def _run_probe(
         "vocab_size": vocab_size,
         "trace_level": trace_level,
         "max_elements_per_tensor": max_elements_per_tensor,
-        "output_comparison": output_comparison,
-        "record_comparison": record_comparison,
-        "first_mismatch_dump": str(dump_path) if dump_path is not None else None,
+        "candidates": candidate_reports,
+        # Kept for older report consumers while this script is actively used.
+        "output_comparison": legacy_owned["output_comparison"],
+        "record_comparison": legacy_owned["record_comparison"],
+        "first_mismatch_dump": legacy_owned["first_mismatch_dump"],
     }
 
 
@@ -646,6 +725,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         f"- model: `{report['model_path']}`",
         f"- device: `{report['device']}`",
         f"- trace level: `{report['trace_level']}`",
+        f"- CUDA SDPA backend: `{report['cuda_sdp_backend']}`",
         "",
         "## Attention Globals",
         "",
@@ -655,23 +735,25 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         "",
         "## Probes",
         "",
-        "| probe | output equal | max abs | mean abs max | first traced mismatch | dump |",
-        "|---|---:|---:|---:|---|---|",
+        "| probe | candidate | output equal | max abs | mean abs max | first traced mismatch | dump |",
+        "|---|---|---:|---:|---:|---|---|",
     ]
     for probe in report["probes"]:
-        out = probe["output_comparison"]
-        mismatch = probe["record_comparison"].get("first_mismatch")
-        lines.append(
-            "| {batch}x{frames} | {equal} | {max_abs:.6g} | {mean_abs:.6g} | {mismatch} | {dump} |".format(
-                batch=probe["batch_size"],
-                frames=probe["frames"],
-                equal=out["all_equal"],
-                max_abs=float(out["max_abs_delta"]),
-                mean_abs=float(out["mean_abs_delta_max"]),
-                mismatch=mismatch.get("key") if mismatch else "",
-                dump=probe.get("first_mismatch_dump") or "",
+        for candidate, candidate_report in probe["candidates"].items():
+            out = candidate_report["output_comparison"]
+            mismatch = candidate_report["record_comparison"].get("first_mismatch")
+            lines.append(
+                "| {batch}x{frames} | {candidate} | {equal} | {max_abs:.6g} | {mean_abs:.6g} | {mismatch} | {dump} |".format(
+                    batch=probe["batch_size"],
+                    frames=probe["frames"],
+                    candidate=candidate,
+                    equal=out["all_equal"],
+                    max_abs=float(out["max_abs_delta"]),
+                    mean_abs=float(out["mean_abs_delta_max"]),
+                    mismatch=mismatch.get("key") if mismatch else "",
+                    dump=candidate_report.get("first_mismatch_dump") or "",
+                )
             )
-        )
     lines.extend(
         [
             "",
@@ -706,6 +788,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--candidate",
+        action="append",
+        choices=("owned", "processor-repeat"),
+        default=[],
+        help=(
+            "candidate path to compare against the first processor run; repeatable. "
+            "Use processor-repeat to test backend determinism."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-sdpa-backend",
+        choices=("default", "math", "flash", "efficient", "cudnn"),
+        default="default",
+        help="force a single PyTorch CUDA SDPA backend before loading the model",
+    )
+    parser.add_argument(
         "--trace-level",
         choices=("none", "stage", "layer", "module"),
         default="module",
@@ -734,17 +832,22 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    _set_cuda_sdp_backend(args.cuda_sdpa_backend)
     logger.info("Loading MOSS-TTS Local processor from %s", args.model)
     processor = _load_moss_tts_local_processor(args.model, device=args.device)
     device = _device_of_processor(processor, args.device)
     codec = processor.audio_tokenizer
 
     probes = args.probe or [(1, 25), (1, 100), (1, 300), (8, 100), (8, 300)]
+    candidates = args.candidate or ["owned"]
     report: dict[str, Any] = {
         "schema": "moss_tts_local_vocoder_exactness_v1",
         "model_path": args.model,
         "device": str(device),
         "trace_level": args.trace_level,
+        "cuda_sdp_backend": args.cuda_sdpa_backend,
+        "cuda_sdp_settings": _cuda_sdp_settings(),
+        "candidates": candidates,
         "dependencies": _dependency_summary(),
         "attention_globals": _attention_global_summary(codec),
         "probes": [],
@@ -757,6 +860,7 @@ def main() -> None:
                 batch_size=batch_size,
                 frames=frames,
                 seed=args.seed + index,
+                candidates=candidates,
                 trace_level=args.trace_level,
                 max_elements_per_tensor=args.max_elements_per_tensor,
                 device=device,
