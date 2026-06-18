@@ -167,6 +167,27 @@ def test_vocoder_introspection_summarizes_decoder_topology() -> None:
     assert patch_stage["patch_size"] == 2
     assert patch_stage["methods"]["decode"]["present"] is True
 
+    processor = summary["processor"]
+    assert processor["model_config_status"]["present"] is True
+    sources = {item["label"]: item for item in processor["config_sources"]}
+    assert sources["processor.model_config"]["values"]["n_vq"] == 12
+    assert sources["audio_tokenizer.config"]["values"]["sampling_rate"] == 48_000
+
+
+def test_vocoder_introspection_reports_missing_processor_model_config() -> None:
+    processor = _FakeProcessor()
+    del processor.model_config
+
+    summary = summarize_moss_tts_local_vocoder(processor)
+
+    processor_summary = summary["processor"]
+    assert processor_summary["model_config"] is None
+    assert processor_summary["model_config_status"]["present"] is False
+    sources = {item["label"]: item for item in processor_summary["config_sources"]}
+    assert sources["processor.model_config"]["present"] is False
+    assert sources["audio_tokenizer.config"]["present"] is True
+    assert sources["audio_tokenizer.config"]["values"]["sampling_rate"] == 48_000
+
 
 def test_vocoder_introspection_groups_decoder_state_dict_by_stage_layer() -> None:
     summary = summarize_moss_tts_local_vocoder(_FakeProcessor())

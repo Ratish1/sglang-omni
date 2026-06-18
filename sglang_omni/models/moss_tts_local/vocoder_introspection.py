@@ -368,6 +368,10 @@ def summarize_moss_tts_local_vocoder(processor: Any) -> dict[str, Any]:
         "processor": {
             "class": class_summary(processor),
             "model_config": _summarize_config(getattr(processor, "model_config", None)),
+            "model_config_status": _summarize_config_source(
+                "processor.model_config", getattr(processor, "model_config", None)
+            ),
+            "config_sources": _summarize_config_sources(processor, audio_tokenizer),
             "methods": {
                 "decode_audio_codes": method_summary(
                     processor, "decode_audio_codes", max_lines=100
@@ -377,6 +381,9 @@ def summarize_moss_tts_local_vocoder(processor: Any) -> dict[str, Any]:
         "audio_tokenizer": {
             "class": class_summary(audio_tokenizer),
             "config": _summarize_config(getattr(audio_tokenizer, "config", None)),
+            "config_status": _summarize_config_source(
+                "audio_tokenizer.config", getattr(audio_tokenizer, "config", None)
+            ),
             "methods": {
                 "_decode_frame": method_summary(
                     audio_tokenizer, "_decode_frame", max_lines=100
@@ -418,6 +425,31 @@ def _summarize_config(config: Any) -> dict[str, Any] | None:
             if isinstance(value, (str, int, float, bool)) or value is None:
                 out[name] = value
     return out
+
+
+def _summarize_config_source(label: str, config: Any) -> dict[str, Any]:
+    summary = _summarize_config(config)
+    return {
+        "label": label,
+        "present": config is not None,
+        "class": class_summary(config) if config is not None else None,
+        "values": summary or {},
+    }
+
+
+def _summarize_config_sources(
+    processor: Any, audio_tokenizer: Any
+) -> list[dict[str, Any]]:
+    candidates = (
+        ("processor.model_config", getattr(processor, "model_config", None)),
+        ("processor.config", getattr(processor, "config", None)),
+        ("audio_tokenizer.config", getattr(audio_tokenizer, "config", None)),
+        (
+            "audio_tokenizer.model_config",
+            getattr(audio_tokenizer, "model_config", None),
+        ),
+    )
+    return [_summarize_config_source(label, config) for label, config in candidates]
 
 
 __all__ = [

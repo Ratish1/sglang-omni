@@ -58,14 +58,39 @@ _SOURCE_HINT = "MOSS-TTS Local"
 
 
 def _resolve_sample_rate(processor: Any) -> int:
-    return int(
-        getattr(getattr(processor, "model_config", None), "sampling_rate", 0)
-        or getattr(
-            getattr(getattr(processor, "audio_tokenizer", None), "config", None),
-            "sampling_rate",
-            0,
-        )
-        or 48000
+    for owner in (
+        getattr(processor, "model_config", None),
+        getattr(processor, "config", None),
+        getattr(getattr(processor, "audio_tokenizer", None), "config", None),
+        getattr(getattr(processor, "audio_tokenizer", None), "model_config", None),
+    ):
+        value = getattr(owner, "sampling_rate", None) if owner is not None else None
+        if value:
+            return int(value)
+    return 48000
+
+
+def _resolve_n_vq(processor: Any) -> int:
+    codec = getattr(processor, "audio_tokenizer", None)
+    for owner in (
+        getattr(processor, "model_config", None),
+        getattr(processor, "config", None),
+        getattr(codec, "config", None),
+        getattr(codec, "model_config", None),
+    ):
+        if owner is None:
+            continue
+        for attr in ("n_vq", "num_codebooks"):
+            value = getattr(owner, attr, None)
+            if value is not None:
+                return int(value)
+    value = getattr(codec, "num_codebooks", None)
+    if value is not None:
+        return int(value)
+    raise RuntimeError(
+        "MOSS-TTS Local streaming vocoder could not resolve n_vq from "
+        "processor.model_config, processor.config, audio_tokenizer.config, "
+        "or audio_tokenizer.num_codebooks"
     )
 
 
@@ -278,7 +303,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         )
         self._max_step_frames = int(max_step_frames)
         self._offline_slots = max(int(max_batch_size), 1)
-        self._n_vq = int(processor.model_config.n_vq)
+        self._n_vq = _resolve_n_vq(processor)
         self._sample_rate = _resolve_sample_rate(processor)
         self._session: _CodecStreamSession | None = None
         self._stream_states: dict[str, _LocalStreamState] = {}

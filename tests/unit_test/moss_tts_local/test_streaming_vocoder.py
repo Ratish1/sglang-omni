@@ -31,6 +31,8 @@ from sglang_omni.models.moss_tts_local.request_builders import (
 )
 from sglang_omni.models.moss_tts_local.streaming_vocoder import (
     MossTTSLocalStreamingVocoderScheduler,
+    _resolve_n_vq,
+    _resolve_sample_rate,
 )
 from sglang_omni.models.moss_tts_local.vocoder_backend import (
     MossTTSLocalVocoderBackend,
@@ -142,6 +144,18 @@ class FakeProcessor:
                 n = int(result.audio_lengths[index])
                 wavs.append(result.audio[index, :, :n].to(torch.float32))
         return wavs
+
+
+def test_vocoder_metadata_resolves_without_processor_model_config() -> None:
+    processor = FakeProcessor()
+    del processor.model_config
+    processor.audio_tokenizer.config = SimpleNamespace(
+        num_codebooks=6,
+        sampling_rate=44_100,
+    )
+
+    assert _resolve_n_vq(processor) == 6
+    assert _resolve_sample_rate(processor) == 44_100
 
 
 def reference_waveform(rows: torch.Tensor) -> torch.Tensor:

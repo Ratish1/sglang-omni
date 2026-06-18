@@ -247,6 +247,52 @@ def _summarize_config_object(owner: Any) -> dict[str, Any]:
     return summary
 
 
+def _summarize_config_source(label: str, owner: Any) -> dict[str, Any]:
+    return {
+        "label": label,
+        "present": owner is not None,
+        "class": (
+            f"{owner.__class__.__module__}.{owner.__class__.__name__}"
+            if owner is not None
+            else None
+        ),
+        "values": _summarize_config_object(owner),
+    }
+
+
+def _config_sources(processor: Any) -> list[dict[str, Any]]:
+    codec = getattr(processor, "audio_tokenizer", None)
+    return [
+        _summarize_config_source(
+            "processor.model_config", getattr(processor, "model_config", None)
+        ),
+        _summarize_config_source(
+            "processor.config", getattr(processor, "config", None)
+        ),
+        _summarize_config_source(
+            "audio_tokenizer.config", getattr(codec, "config", None)
+        ),
+        _summarize_config_source(
+            "audio_tokenizer.model_config", getattr(codec, "model_config", None)
+        ),
+    ]
+
+
+def _resolve_sample_rate(processor: Any) -> int:
+    for owner in (
+        getattr(processor, "model_config", None),
+        getattr(processor, "config", None),
+        getattr(getattr(processor, "audio_tokenizer", None), "config", None),
+        getattr(getattr(processor, "audio_tokenizer", None), "model_config", None),
+    ):
+        if owner is None:
+            continue
+        value = getattr(owner, "sampling_rate", None)
+        if value:
+            return int(value)
+    return 48000
+
+
 def _parameter_dtype_summary(module: Any) -> dict[str, int]:
     if module is None or not hasattr(module, "parameters"):
         return {}
@@ -261,6 +307,12 @@ def _model_config_summary(processor: Any) -> dict[str, Any]:
     codec = getattr(processor, "audio_tokenizer", None)
     return {
         "processor_class": f"{processor.__class__.__module__}.{processor.__class__.__name__}",
+        "config_sources": _config_sources(processor),
+        "resolved_values": {
+            "n_vq": _num_codebooks(processor),
+            "audio_vocab_size": _audio_vocab_size(processor),
+            "sampling_rate": _resolve_sample_rate(processor),
+        },
         "processor_config": _summarize_config_object(
             getattr(processor, "model_config", None)
         ),
@@ -324,7 +376,9 @@ def _disable_cudnn_sdp() -> None:
 def _audio_vocab_size(processor: Any) -> int:
     for owner in (
         getattr(processor, "model_config", None),
+        getattr(processor, "config", None),
         getattr(getattr(processor, "audio_tokenizer", None), "config", None),
+        getattr(getattr(processor, "audio_tokenizer", None), "model_config", None),
     ):
         if owner is None:
             continue
@@ -336,9 +390,18 @@ def _audio_vocab_size(processor: Any) -> int:
 
 
 def _num_codebooks(processor: Any) -> int:
-    value = getattr(getattr(processor, "model_config", None), "n_vq", None)
-    if value is not None:
-        return int(value)
+    for owner in (
+        getattr(processor, "model_config", None),
+        getattr(processor, "config", None),
+        getattr(getattr(processor, "audio_tokenizer", None), "config", None),
+        getattr(getattr(processor, "audio_tokenizer", None), "model_config", None),
+    ):
+        if owner is None:
+            continue
+        for attr in ("n_vq", "num_codebooks"):
+            value = getattr(owner, attr, None)
+            if value is not None:
+                return int(value)
     value = getattr(getattr(processor, "audio_tokenizer", None), "num_codebooks", None)
     if value is not None:
         return int(value)
