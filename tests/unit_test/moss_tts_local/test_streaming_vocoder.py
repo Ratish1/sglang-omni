@@ -330,6 +330,7 @@ def test_vocoder_decode_profile_metadata_identifies_active_backend(
     assert metadata["max_frames"] == 5
 
     scheduler._nonstream_decoder = object()  # type: ignore[assignment]
+    scheduler._nonstream_backend = MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL
     metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
     assert (
         metadata["active_vocoder_backend"]
@@ -346,6 +347,7 @@ def test_vocoder_decode_profile_metadata_identifies_active_backend(
 
     scheduler._nonstream_decoder = None
     scheduler._nonstream_sglang_patch_active = True
+    scheduler._nonstream_backend = MossTTSLocalVocoderBackend.SGLANG_PATCH_EXPERIMENTAL
     monkeypatch.setattr(
         "sglang_omni.models.moss_tts_local.streaming_vocoder."
         "get_moss_tts_local_sglang_vocoder_patch_info",
@@ -385,6 +387,29 @@ def test_vocoder_decode_profile_metadata_identifies_active_backend(
     assert metadata["sglang_patch_ref_count"] == 1
 
 
+def test_session_offline_backend_reports_requested_backend(monkeypatch) -> None:
+    processor = FakeProcessor()
+    scheduler = _make_scheduler(
+        monkeypatch,
+        processor,
+        nonstream_vocoder_decoder=MossTTSLocalVocoderBackend.SESSION_OFFLINE.value,
+    )
+    codes_list = [_rows(3, seed=111)[:, 1:], _rows(5, seed=112)[:, 1:]]
+
+    metadata = scheduler._vocoder_decode_profile_metadata(codes_list)
+
+    assert (
+        metadata["active_vocoder_backend"]
+        == MossTTSLocalVocoderBackend.SESSION_OFFLINE.value
+    )
+    assert (
+        metadata["requested_vocoder_backend"]
+        == MossTTSLocalVocoderBackend.SESSION_OFFLINE.value
+    )
+    assert metadata["session_active"] is False
+    assert metadata["vocoder_backend_experimental"] is False
+
+
 def test_vocoder_decode_events_include_backend_and_shape_metadata(
     monkeypatch,
     tmp_path: Path,
@@ -392,6 +417,7 @@ def test_vocoder_decode_events_include_backend_and_shape_metadata(
     processor = FakeProcessor()
     scheduler = _make_scheduler(monkeypatch, processor)
     scheduler._nonstream_decoder = object()  # type: ignore[assignment]
+    scheduler._nonstream_backend = MossTTSLocalVocoderBackend.OWNED_EXPERIMENTAL
     payloads = [
         _terminal_payload(_rows(3, seed=201), request_id="req-a"),
         _terminal_payload(_rows(5, seed=202), request_id="req-b"),
@@ -830,6 +856,37 @@ def test_non_streaming_path_with_and_without_live_session(monkeypatch) -> None:
     np.testing.assert_array_equal(
         waves_after[0], reference_waveform(rows_1[:, 1:]).numpy()
     )
+
+
+def test_session_offline_backend_uses_session_before_streaming(monkeypatch) -> None:
+    processor = FakeProcessor()
+    scheduler = _make_scheduler(
+        monkeypatch,
+        processor,
+        nonstream_vocoder_decoder=MossTTSLocalVocoderBackend.SESSION_OFFLINE.value,
+    )
+
+    rows_1 = _rows(11, seed=63)
+    rows_2 = _rows(4, seed=64)
+    payloads = []
+    for request_id, rows in (("r1", rows_1), ("r2", rows_2)):
+        state = MossTTSLocalState(text="x", audio_codes=rows[:, 1:].clone())
+        payloads.append(
+            StagePayload(
+                request_id=request_id,
+                request=OmniRequest(inputs="", params={}),
+                data=state.to_dict(),
+            )
+        )
+
+    results = scheduler._vocode_batch(payloads)
+
+    assert processor.decode_calls == 0
+    assert scheduler._session is not None
+    for rows, result in zip((rows_1, rows_2), results):
+        np.testing.assert_array_equal(
+            _decode_audio(result.data), reference_waveform(rows[:, 1:]).numpy()
+        )
 
 
 def test_offline_lane_waves_split_across_slots(monkeypatch) -> None:
