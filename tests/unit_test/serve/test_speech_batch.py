@@ -146,7 +146,9 @@ def test_batch_speech_preserves_order_and_item_errors() -> None:
     assert body["failed"] == 3
     assert [item["index"] for item in body["results"]] == [0, 1, 2, 3, 4]
     assert body["results"][0]["status"] == "success"
+    assert "success" not in body["results"][0]
     assert body["results"][1]["status"] == "error"
+    assert "success" not in body["results"][1]
     assert body["results"][1]["error"]["param"] == "items.1.input"
     assert body["results"][2]["media_type"] == "audio/pcm"
     assert body["results"][3]["error"]["param"] == "items.3.input"
@@ -336,6 +338,7 @@ def test_batch_speech_isolates_runtime_failures_and_preserves_order() -> None:
     results = response.json()["results"]
     assert [item["index"] for item in results] == [0, 1, 2]
     assert [item["status"] for item in results] == ["success", "error", "success"]
+    assert all("success" not in item for item in results)
     assert results[1]["error"]["type"] == "server_error"
     assert set(client_impl.requests) == {"slow", "fail", "fast"}
 

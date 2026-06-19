@@ -314,7 +314,7 @@ def test_speech_websocket_rejects_missing_initial_config() -> None:
         event = websocket.receive_json()
 
     assert event["type"] == "error"
-    assert event["error"]["param"] == "type"
+    assert event["param"] == "type"
 
 
 def test_speech_websocket_rejects_binary_client_frames() -> None:
@@ -327,7 +327,7 @@ def test_speech_websocket_rejects_binary_client_frames() -> None:
         websocket.send_bytes(b"not-json-text")
         event = websocket.receive_json()
         assert event["type"] == "error"
-        assert "text frames" in event["error"]["message"]
+        assert "text frames" in event["message"]
 
         websocket.send_json({"type": "input.done"})
         assert websocket.receive_json()["type"] == "session.done"
@@ -384,7 +384,7 @@ def test_speech_websocket_unknown_message_type_is_recoverable() -> None:
         websocket.send_json({"type": "unexpected"})
         event = websocket.receive_json()
         assert event["type"] == "error"
-        assert event["error"]["param"] == "type"
+        assert event["param"] == "type"
         websocket.send_json({"type": "input.done"})
         assert websocket.receive_json()["type"] == "session.done"
 
@@ -415,7 +415,7 @@ def test_speech_websocket_rejects_stringified_config_types(
         event = websocket.receive_json()
 
     assert event["type"] == "error"
-    assert event["error"]["param"] == field_name
+    assert event["param"] == field_name
 
 
 @pytest.mark.parametrize(
@@ -443,7 +443,7 @@ def test_speech_websocket_rejects_non_positive_duration_fields(
         event = websocket.receive_json()
 
     assert event["type"] == "error"
-    assert event["error"]["param"] == field_name
+    assert event["param"] == field_name
 
 
 def test_speech_websocket_streaming_accepts_speed() -> None:
@@ -546,7 +546,7 @@ def test_speech_websocket_rejects_oversized_sentence_before_generation() -> None
         done = websocket.receive_json()
 
     assert error["type"] == "error"
-    assert error["error"]["param"] == "input"
+    assert error["param"] == "input"
     assert done["type"] == "audio.done"
     assert done["error"] is True
     assert client_impl.generated_prompts == []

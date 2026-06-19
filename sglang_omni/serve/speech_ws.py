@@ -23,12 +23,7 @@ from sglang_omni.client.audio import (
     select_audio_delta,
 )
 from sglang_omni.serve.protocol import CreateSpeechRequest, SpeechStreamSessionConfig
-from sglang_omni.serve.speech_errors import (
-    SpeechAPIError,
-    bad_request,
-    internal_error,
-    openai_error_payload,
-)
+from sglang_omni.serve.speech_errors import SpeechAPIError, bad_request, internal_error
 from sglang_omni.serve.speech_service import (
     MAX_REFERENCE_AUDIO_BYTES,
     PreparedSpeechRequest,
@@ -456,6 +451,10 @@ class SpeechWebSocketSession:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if generation_task in done:
+                # control frames can arrive while generation owns the receive loop
+                await asyncio.sleep(0)
+                if disconnect_task.done():
+                    disconnect_task.result()
                 await _cancel_tasks(disconnect_task)
                 return generation_task.result()
 
@@ -547,17 +546,14 @@ class SpeechWebSocketSession:
         await self.websocket.send_text(json.dumps(payload))
 
     async def _send_error(self, error: SpeechAPIError) -> None:
-        await self._send_json(
-            {
-                "type": "error",
-                **openai_error_payload(
-                    error.message,
-                    error_type=error.error_type,
-                    param=error.param,
-                    code=error.code,
-                ),
-            }
-        )
+        payload: dict[str, Any] = {"type": "error", "message": error.message}
+        if error.error_type is not None:
+            payload["error_type"] = error.error_type
+        if error.param is not None:
+            payload["param"] = error.param
+        if error.code is not None:
+            payload["code"] = error.code
+        await self._send_json(payload)
 
     async def _send_audio_start(
         self,

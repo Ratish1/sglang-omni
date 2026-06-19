@@ -365,7 +365,7 @@ class SpeechRequestValidator:
                     )
 
         final_results = [result for result in results if result is not None]
-        succeeded = sum(1 for result in final_results if result.success)
+        succeeded = sum(1 for result in final_results if result.status == "success")
         failed = len(final_results) - succeeded
         return SpeechBatchResponse(
             id=request_id,
@@ -411,7 +411,6 @@ class SpeechRequestValidator:
         return SpeechBatchResult(
             index=index,
             status="success",
-            success=True,
             audio_data=base64.b64encode(result.audio_bytes).decode("ascii"),
             format=result.format,
             media_type=result.mime_type,
@@ -859,7 +858,6 @@ def _batch_error_result(index: int, error: SpeechAPIError) -> SpeechBatchResult:
     return SpeechBatchResult(
         index=index,
         status="error",
-        success=False,
         error=openai_error_payload(
             error.message,
             error_type=error.error_type,

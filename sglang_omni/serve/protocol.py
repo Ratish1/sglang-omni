@@ -386,7 +386,6 @@ class SpeechBatchResult(BaseModel):
 
     index: int
     status: str
-    success: bool
     audio_data: str | None = None
     format: str | None = None
     media_type: str | None = None
