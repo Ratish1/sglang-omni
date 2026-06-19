@@ -48,6 +48,7 @@ from fastapi.responses import (
 from sglang_omni.client import (
     Client,
     ClientError,
+    CompletionResult,
     GenerateRequest,
     Message,
     SamplingParams,
@@ -56,7 +57,7 @@ from sglang_omni.client.audio import (
     DEFAULT_SAMPLE_RATE,
     apply_speed,
     encode_pcm,
-    to_numpy,
+    select_audio_delta,
 )
 from sglang_omni.http.admin_auth import (
     make_admin_auth_dependency,
@@ -75,12 +76,21 @@ from sglang_omni.serve.protocol import (
     ChatCompletionStreamResponse,
     ContinueGenerationRequest,
     CreateSpeechBatchRequest,
+    DestroyWeightsUpdateGroupRequest,
+    GenerateAudio,
+    GenerateFinishReason,
+    GenerateMetaInfo,
+    GenerateResponse,
+    InitWeightsUpdateGroupRequest,
     ModelCard,
     ModelList,
     PauseGenerationRequest,
+    RolloutGenerateRequest,
+    RolloutSamplingParams,
     SpeechBatchResponse,
     TranscriptionResponse,
     UpdateWeightFromDiskRequest,
+    UpdateWeightsFromDistributedRequest,
     UsageResponse,
     VoiceListResponse,
     WeightsCheckerRequest,
@@ -232,6 +242,7 @@ def create_app(
     _register_admin(app, resolved_key)
     _register_chat_completions(app)
     _register_voices(app)
+    _register_generate(app)
     _register_speech(app)
     _register_speech_batch(app)
     _register_speech_ws(app)
@@ -394,7 +405,7 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
         return _model_info_response(
             await client.model_info(
                 stages=req.stages,
-                timeout_s=req.timeout_s or 30.0,
+                timeout_s=_timeout_or_default(req.timeout_s, 30.0),
             )
         )
 
@@ -406,7 +417,7 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
             await client.pause_generation(
                 payload,
                 stages=req.stages,
-                timeout_s=req.timeout_s or 60.0,
+                timeout_s=_timeout_or_default(req.timeout_s, 60.0),
             )
         )
 
@@ -418,7 +429,7 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
             await client.continue_generation(
                 payload,
                 stages=req.stages,
-                timeout_s=req.timeout_s or 60.0,
+                timeout_s=_timeout_or_default(req.timeout_s, 60.0),
             )
         )
 
@@ -432,7 +443,7 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
             await client.update_weights_from_disk(
                 payload,
                 stages=req.stages,
-                timeout_s=req.timeout_s or 120.0,
+                timeout_s=_timeout_or_default(req.timeout_s, 120.0),
             )
         )
 
@@ -453,21 +464,46 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
             },
         )
 
+    @app.post("/init_weights_update_group", dependencies=[Depends(_auth)])
+    async def init_weights_update_group(
+        req: InitWeightsUpdateGroupRequest,
+    ) -> JSONResponse:
+        client: Client = app.state.client
+        payload = _request_payload(req)
+        return _admin_response(
+            await client.init_weights_update_group(
+                payload,
+                stages=req.stages,
+                timeout_s=_timeout_or_default(req.timeout_s, 300.0),
+            )
+        )
+
+    @app.post("/destroy_weights_update_group", dependencies=[Depends(_auth)])
+    async def destroy_weights_update_group(
+        req: DestroyWeightsUpdateGroupRequest,
+    ) -> JSONResponse:
+        client: Client = app.state.client
+        payload = _request_payload(req)
+        return _admin_response(
+            await client.destroy_weights_update_group(
+                payload,
+                stages=req.stages,
+                timeout_s=_timeout_or_default(req.timeout_s, 300.0),
+            )
+        )
+
     @app.post("/update_weights_from_distributed", dependencies=[Depends(_auth)])
     async def update_weights_from_distributed(
-        request: Request,
+        req: UpdateWeightsFromDistributedRequest,
     ) -> JSONResponse:
-        return JSONResponse(
-            status_code=501,
-            content={
-                "error": {
-                    "message": (
-                        "update_weights_from_distributed is not yet implemented. "
-                        "Use update_weights_from_disk for the disk-based weight update path."
-                    ),
-                    "code": "not_implemented",
-                }
-            },
+        client: Client = app.state.client
+        payload = _request_payload(req)
+        return _admin_response(
+            await client.update_weights_from_distributed(
+                payload,
+                stages=req.stages,
+                timeout_s=_timeout_or_default(req.timeout_s, 300.0),
+            )
         )
 
     @app.get("/weights_checker", dependencies=[Depends(_auth)])
@@ -483,9 +519,13 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
             await client.weights_checker(
                 payload,
                 stages=req.stages,
-                timeout_s=req.timeout_s or 120.0,
+                timeout_s=_timeout_or_default(req.timeout_s, 120.0),
             )
         )
+
+
+def _timeout_or_default(timeout_s: float | None, default: float) -> float:
+    return default if timeout_s is None else timeout_s
 
 
 def _request_payload(req: AdminRequestBase) -> dict[str, Any]:
@@ -892,6 +932,182 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
     )
 
 
+def _register_generate(app: FastAPI) -> None:
+    @app.post("/generate")
+    async def generate(req: RolloutGenerateRequest) -> Response:
+        client: Client = app.state.client
+
+        provided = [
+            value is not None for value in (req.input_ids, req.prompt, req.messages)
+        ]
+        if sum(provided) != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="exactly one of input_ids, prompt, or messages is required",
+            )
+        if req.stream:
+            raise HTTPException(
+                status_code=400,
+                detail="stream=true is not supported by /generate yet",
+            )
+
+        request_id = str(uuid.uuid4())
+        audio_format = "wav"
+
+        try:
+            gen_req = _build_rollout_generate_request(req)
+            result = await client.completion(
+                gen_req,
+                request_id=request_id,
+                audio_format=audio_format,
+            )
+        except ClientError as exc:
+            if _is_bad_request_error(exc):
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Error generating rollout for request %s", request_id)
+            if _is_bad_request_error(exc):
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        response = _build_generate_response(req, result, audio_format)
+        return JSONResponse(content=response.model_dump())
+
+
+def _rollout_sampling_to_client(params: RolloutSamplingParams) -> SamplingParams:
+    kwargs: dict[str, Any] = {
+        key: value
+        for key, value in (
+            ("temperature", params.temperature),
+            ("top_p", params.top_p),
+            ("top_k", params.top_k),
+            ("min_p", params.min_p),
+            ("repetition_penalty", params.repetition_penalty),
+            ("stop_token_ids", params.stop_token_ids),
+            ("seed", params.seed),
+            ("max_new_tokens", params.max_new_tokens),
+        )
+        if value is not None
+    }
+    if params.stop is not None:
+        kwargs["stop"] = (
+            [params.stop] if isinstance(params.stop, str) else list(params.stop)
+        )
+    if "max_new_tokens" not in kwargs and params.max_tokens is not None:
+        kwargs["max_new_tokens"] = params.max_tokens
+    return SamplingParams(**kwargs)
+
+
+def _build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateRequest:
+    """Convert a rollout GenerateRequest into a client GenerateRequest."""
+    sampling = _rollout_sampling_to_client(req.sampling_params)
+
+    messages: list[Message] | None = None
+    if req.messages is not None:
+        messages = [Message(role=m.role, content=m.content) for m in req.messages]
+
+    stage_sampling: dict[str, SamplingParams] | None = None
+    if req.stage_sampling:
+        stage_sampling = {
+            name: _rollout_sampling_to_client(params)
+            for name, params in req.stage_sampling.items()
+        }
+
+    extra_params: dict[str, Any] = {
+        "return_logprob": req.return_logprob,
+        "return_omni_rollout": req.return_omni_rollout,
+        "return_routed_experts": req.return_routed_experts,
+        "return_indexer_topk": req.return_indexer_topk,
+    }
+
+    return GenerateRequest(
+        model=req.model,
+        prompt=req.prompt,
+        prompt_token_ids=req.input_ids,
+        messages=messages,
+        sampling=sampling,
+        stage_sampling=stage_sampling,
+        stage_params=req.stage_params,
+        extra_params=extra_params,
+        stream=req.stream,
+        max_tokens=sampling.max_new_tokens,
+        output_modalities=(
+            req.output_modalities if req.output_modalities is not None else ["text"]
+        ),
+        metadata=dict(req.metadata) if req.metadata else {},
+    )
+
+
+def _build_generate_response(
+    req: RolloutGenerateRequest,
+    result: CompletionResult,
+    audio_format: str,
+) -> GenerateResponse:
+    usage = result.usage
+    completion_tokens = (
+        usage.completion_tokens
+        if usage is not None and usage.completion_tokens is not None
+        else 0
+    )
+    prompt_tokens = (
+        usage.prompt_tokens
+        if usage is not None and usage.prompt_tokens is not None
+        else 0
+    )
+
+    finish_type = result.finish_reason or "stop"
+    finish_reason = GenerateFinishReason(
+        type=finish_type,
+        length=completion_tokens if finish_type == "length" else None,
+    )
+    if req.return_logprob and result.output_token_logprobs is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "backend did not return output_token_logprobs "
+                "for return_logprob=true"
+            ),
+        )
+    if (
+        req.return_logprob
+        and result.output_token_logprobs is not None
+        and len(result.output_token_logprobs) != completion_tokens
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "backend returned output_token_logprobs length "
+                f"{len(result.output_token_logprobs)} for "
+                f"completion_tokens={completion_tokens}"
+            ),
+        )
+    if req.return_omni_rollout and result.omni_rollout is None:
+        raise HTTPException(
+            status_code=501,
+            detail="backend did not return omni_rollout for return_omni_rollout=true",
+        )
+
+    audio: GenerateAudio | None = None
+    if result.audio is not None:
+        audio = GenerateAudio(data=result.audio.data, format=audio_format)
+
+    meta_info = GenerateMetaInfo(
+        finish_reason=finish_reason,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        weight_version=result.weight_version,
+        request_metadata=req.metadata,
+        output_token_logprobs=(
+            result.output_token_logprobs if req.return_logprob else None
+        ),
+        omni_rollout=result.omni_rollout if req.return_omni_rollout else None,
+    )
+    return GenerateResponse(text=result.text, audio=audio, meta_info=meta_info)
+
+
 def _register_realtime(app: FastAPI) -> None:
     """Mount the OpenAI-compatible WebSocket Realtime endpoint."""
     from sglang_omni.serve.realtime import RealtimeSessionManager
@@ -1070,7 +1286,7 @@ def _speech_pcm_chunk_bytes(
     speed: float,
 ) -> tuple[bytes | None, int, int]:
     sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
-    audio_data, emitted_samples = _select_speech_audio_delta(
+    audio_data, emitted_samples = select_audio_delta(
         chunk.audio_data,
         emitted_samples=emitted_samples,
         is_terminal=chunk.finish_reason is not None,
@@ -1261,9 +1477,11 @@ async def _wait_for_request_disconnect(request: Request) -> None:
 
 
 async def _close_async_iterator_if_supported(stream: AsyncIterator[Any]) -> None:
-    close = getattr(stream, "aclose", None)
-    if close is not None:
-        await close()
+    try:
+        close = stream.aclose
+    except AttributeError:
+        return
+    await close()
 
 
 async def _abort_and_close_speech_stream(
@@ -1275,30 +1493,6 @@ async def _abort_and_close_speech_stream(
         await client.abort(request_id)
     finally:
         await _close_async_iterator_if_supported(stream)
-
-
-def _select_speech_audio_delta(
-    audio_data: Any,
-    *,
-    emitted_samples: int,
-    is_terminal: bool,
-) -> tuple[Any | None, int]:
-    audio = to_numpy(audio_data)
-    if audio.ndim > 1:
-        audio = audio.squeeze()
-    if audio.ndim > 1:
-        # Streaming chunks are mono; downmix multi-channel payloads
-        # (e.g. the 48 kHz stereo MOSS-TTS Local codec) instead of
-        # silently dropping channels.
-        channel_axis = 0 if audio.shape[0] < audio.shape[-1] else -1
-        audio = audio.mean(axis=channel_axis).astype("float32")
-
-    total_samples = int(audio.shape[-1]) if audio.ndim else 0
-    if not is_terminal:
-        return audio, emitted_samples + total_samples
-    if total_samples <= emitted_samples:
-        return None, emitted_samples
-    return audio[emitted_samples:], total_samples
 
 
 def _register_transcriptions(app: FastAPI) -> None:

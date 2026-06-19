@@ -684,6 +684,27 @@ def test_speech_websocket_stream_exception_aborts_active_request() -> None:
     asyncio.run(run())
 
 
+def test_speech_websocket_client_disconnect_skips_error_and_done_sends() -> None:
+    async def run() -> None:
+        client_impl = InvalidAudioStreamingSpeechClient()
+        websocket = RecordingWebSocket()
+        websocket.client_state = WebSocketState.DISCONNECTED
+        session = SpeechWebSocketSession(
+            websocket,
+            client=client_impl,
+            speech_service=SpeechRequestValidator(default_model="tts"),
+        )
+        session.config = SpeechStreamSessionConfig(stream_audio=True)
+
+        await session._generate_sentence("Hello.")
+
+        assert client_impl.aborted == [f"{session.session_id}-0"]
+        assert websocket.sent_text == []
+        assert session.active_request_id is None
+
+    asyncio.run(run())
+
+
 def test_speech_websocket_completed_send_failure_does_not_abort() -> None:
     async def run() -> None:
         client_impl = CompletedSpeechClient()

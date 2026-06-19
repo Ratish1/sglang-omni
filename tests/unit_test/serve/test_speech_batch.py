@@ -292,7 +292,7 @@ def test_batch_speech_rejects_streaming_items() -> None:
     assert client_impl.requests == []
 
 
-def test_batch_speech_rejects_unknown_item_fields() -> None:
+def test_batch_speech_accepts_item_model_override() -> None:
     client_impl = RecordingBatchSpeechClient()
     client = TestClient(create_app(client_impl, model_name="tts"))
 
@@ -301,7 +301,11 @@ def test_batch_speech_rejects_unknown_item_fields() -> None:
         json={
             "items": [
                 {"input": "first"},
-                {"input": "wrong model", "model": "other-tts"},
+                {
+                    "input": "wrong model",
+                    "model": "other-tts",
+                    "unknown_field": "ignored",
+                },
                 {"input": "third"},
             ]
         },
@@ -309,11 +313,14 @@ def test_batch_speech_rejects_unknown_item_fields() -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["succeeded"] == 2
-    assert body["failed"] == 1
-    assert body["results"][1]["status"] == "error"
-    assert body["results"][1]["error"]["param"] == "items.1.model"
-    assert [request.prompt for request in client_impl.requests] == ["first", "third"]
+    assert body["succeeded"] == 3
+    assert body["failed"] == 0
+    assert [request.prompt for request in client_impl.requests] == [
+        "first",
+        "wrong model",
+        "third",
+    ]
+    assert client_impl.requests[1].model == "other-tts"
 
 
 def test_batch_speech_isolates_runtime_failures_and_preserves_order() -> None:

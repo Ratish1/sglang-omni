@@ -20,7 +20,7 @@ from sglang_omni.client.audio import (
     DEFAULT_SAMPLE_RATE,
     apply_speed,
     encode_pcm,
-    to_numpy,
+    select_audio_delta,
 )
 from sglang_omni.serve.protocol import CreateSpeechRequest, SpeechStreamSessionConfig
 from sglang_omni.serve.speech_errors import (
@@ -288,16 +288,15 @@ class SpeechWebSocketSession:
         finally:
             if self.active_request_id == request_id:
                 self.active_request_id = None
-            if self.websocket.application_state == WebSocketState.CONNECTED:
-                await self._send_json(
-                    {
-                        "type": "audio.done",
-                        "id": request_id,
-                        "sentence_index": sentence_index,
-                        "total_bytes": total_bytes,
-                        "error": failed,
-                    }
-                )
+            await self._send_json(
+                {
+                    "type": "audio.done",
+                    "id": request_id,
+                    "sentence_index": sentence_index,
+                    "total_bytes": total_bytes,
+                    "error": failed,
+                }
+            )
 
     async def _stream_sentence_audio(
         self,
@@ -322,7 +321,7 @@ class SpeechWebSocketSession:
             if chunk.audio_data is None:
                 continue
             sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
-            audio_data, emitted_samples = _speech_audio_delta(
+            audio_data, emitted_samples = select_audio_delta(
                 chunk.audio_data,
                 emitted_samples=emitted_samples,
                 is_terminal=chunk.finish_reason is not None,
@@ -543,9 +542,7 @@ class SpeechWebSocketSession:
             )
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
-        if self.closed:
-            return
-        if self.websocket.application_state != WebSocketState.CONNECTED:
+        if not self._can_send():
             return
         await self.websocket.send_text(json.dumps(payload))
 
@@ -606,6 +603,13 @@ class SpeechWebSocketSession:
         if self.active_request_id is not None:
             await self._abort_request(self.active_request_id)
 
+    def _can_send(self) -> bool:
+        return (
+            not self.closed
+            and self.websocket.application_state == WebSocketState.CONNECTED
+            and self.websocket.client_state == WebSocketState.CONNECTED
+        )
+
     async def teardown(self) -> None:
         self.closed = True
         await self._abort_active_request()
@@ -622,27 +626,6 @@ def _speech_error_from_exception(exc: Exception) -> SpeechAPIError:
         location = ".".join(str(item) for item in first_error.get("loc", ()))
         return bad_request(f"{location}: {message}" if location else str(message))
     return bad_request(str(exc))
-
-
-def _speech_audio_delta(
-    audio_data: Any,
-    *,
-    emitted_samples: int,
-    is_terminal: bool,
-) -> tuple[Any | None, int]:
-    audio = to_numpy(audio_data)
-    if audio.ndim > 1:
-        audio = audio.squeeze()
-    if audio.ndim > 1:
-        channel_axis = 0 if audio.shape[0] < audio.shape[-1] else -1
-        audio = audio.mean(axis=channel_axis).astype("float32")
-
-    total_samples = int(audio.shape[-1]) if audio.ndim else 0
-    if not is_terminal:
-        return audio, emitted_samples + total_samples
-    if total_samples <= emitted_samples:
-        return None, emitted_samples
-    return audio[emitted_samples:], total_samples
 
 
 def _validate_raw_session_fields(payload: dict[str, Any]) -> None:

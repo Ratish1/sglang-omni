@@ -106,7 +106,7 @@ class SpeechRequestValidator:
         self.reference_connector = MultiModalResourceConnector(
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
-            allow_remote_media_without_domains=False,
+            allow_remote_media_without_domains=True,
             reject_unsafe_remote_addresses=True,
         )
         self.tts_batch_max_items = int(tts_batch_max_items)
@@ -470,13 +470,6 @@ class SpeechRequestValidator:
         *,
         index: int,
     ) -> CreateSpeechRequest:
-        extra_fields = sorted((item.model_extra or {}).keys())
-        if extra_fields:
-            field_name = extra_fields[0]
-            raise bad_request(
-                f"unsupported batch item field: {field_name}",
-                param=f"items.{index}.{field_name}",
-            )
         payload = batch.model_dump(exclude={"items"}, exclude_none=True)
         item_payload = item.model_dump(exclude_none=True)
         payload.update(item_payload)
@@ -655,7 +648,7 @@ class SpeechRequestValidator:
                     f"{param} must be an http, https, data, file:// URL, or local path",
                     param=param,
                 )
-            value = Path(value).expanduser().resolve().as_uri()
+            return {"audio_path": str(Path(value).expanduser().resolve())}
         try:
             return self.reference_connector.load_resource(
                 value,
