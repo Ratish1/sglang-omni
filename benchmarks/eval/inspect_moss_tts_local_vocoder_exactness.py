@@ -1040,7 +1040,11 @@ def _run_probe(
         seed=seed,
     )
     codec = processor.audio_tokenizer
-    owned_decoder = build_moss_tts_local_vocoder_decoder(codec)
+    owned_decoder = build_moss_tts_local_vocoder_decoder(
+        codec,
+        max_batch_size=batch_size,
+        max_chunk_frames=frames,
+    )
     if hasattr(owned_decoder, "eval"):
         owned_decoder.eval()
 

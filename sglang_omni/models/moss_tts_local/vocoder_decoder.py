@@ -270,16 +270,20 @@ class MossTTSLocalAttention(nn.Module):
     def _workspace_for(self, x: torch.Tensor) -> Any:
         if self.context is None:
             raise RuntimeError("SGLang streaming attention requires finite context")
+        batch_size = int(x.shape[0])
+        chunk_frames = int(x.shape[2])
         workspace = self._workspace
         if (
             workspace is not None
             and workspace.q_pack.device == x.device
             and workspace.q_pack.dtype == x.dtype
+            and workspace.max_batch_size >= batch_size
+            and workspace.max_chunk_len >= chunk_frames
         ):
             return workspace
         workspace = self._workspace_cls.create(
-            max_batch_size=self._max_batch_size,
-            max_chunk_len=self._max_chunk_frames,
+            max_batch_size=max(self._max_batch_size, batch_size),
+            max_chunk_len=max(self._max_chunk_frames, chunk_frames),
             context=int(self.context),
             num_heads=self.num_heads,
             head_dim=self.head_dim,
