@@ -401,9 +401,18 @@ def test_projected_transformer_uses_sglang_without_remote_flash() -> None:
     assert cu_k.tolist() == [0, 4, 7]
     assert max_q == 4
     assert max_k == 4
-    assert window_size == (source.transformer.layers[0].self_attn.context, 0)
+    assert window_size == (source.transformer.layers[0].self_attn.context - 1, 0)
     assert out.shape == (2, 7, 4)
     assert torch.equal(out_lengths, lengths)
+
+
+def test_attention_uses_remote_flash_window_when_remote_flash_exists() -> None:
+    source = _FakeAttention(hidden_size=6)
+    source.attention_implementation = "flash_attention_2"
+    wrapper = MossTTSLocalAttention(source)
+    _enable_sglang_flash_path(wrapper)
+
+    assert wrapper._flash_window_size() == (source.context, 0)
 
 
 def test_attention_supports_length_only_source_signature() -> None:

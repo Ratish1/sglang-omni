@@ -599,11 +599,7 @@ class MossTTSLocalAttention(nn.Module):
             raise RuntimeError(
                 "SGLang flash attention is not available for MOSS vocoder"
             )
-        window_size = (
-            (int(self.context), 0)
-            if self.context is not None and self.causal
-            else (-1, -1)
-        )
+        window_size = self._flash_window_size()
         return flash_attn_varlen_func(
             q.contiguous(),
             k.contiguous(),
@@ -615,6 +611,17 @@ class MossTTSLocalAttention(nn.Module):
             causal=self.causal,
             window_size=window_size,
         )
+
+    def _flash_window_size(self) -> tuple[int, int]:
+        if self.context is None or not self.causal:
+            return (-1, -1)
+        context = int(self.context)
+        if (
+            self._remote_has_flash_attn
+            and self._remote_flash_attn_varlen_func is not None
+        ):
+            return (context, 0)
+        return (max(context - 1, 0), 0)
 
 
 class MossTTSLocalTransformerLayer(nn.Module):

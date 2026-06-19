@@ -254,6 +254,7 @@ def _sdpa_reference_from_varlen(
     max_seqlen_q: int,
     causal: bool,
     window_size: tuple[int, int],
+    source_context: int | None,
 ) -> torch.Tensor:
     outputs: list[torch.Tensor] = []
     cu_q = [int(item) for item in cu_seqlens_q.detach().to("cpu").tolist()]
@@ -277,7 +278,7 @@ def _sdpa_reference_from_varlen(
         v_sdpa = v_i.transpose(0, 1).unsqueeze(0)
 
         attn_mask = None
-        if causal or window_size != (-1, -1):
+        if causal or source_context is not None or window_size != (-1, -1):
             q_positions = torch.arange(query_len, device=q.device, dtype=torch.long)
             k_positions = torch.arange(key_len, device=q.device, dtype=torch.long)
             delta = (key_len - query_len + q_positions).view(
@@ -286,9 +287,11 @@ def _sdpa_reference_from_varlen(
             mask = torch.ones((query_len, key_len), device=q.device, dtype=torch.bool)
             if causal:
                 mask = mask & (delta >= 0)
-            if window_size[0] >= 0:
-                mask = mask & (delta < int(window_size[0]))
-            if window_size[1] >= 0:
+            if source_context is not None:
+                mask = mask & (delta < int(source_context))
+            elif window_size[0] >= 0:
+                mask = mask & (delta <= int(window_size[0]))
+            if source_context is None and window_size[1] >= 0:
                 mask = mask & (delta >= -int(window_size[1]))
             attn_mask = mask.view(1, 1, query_len, key_len)
 
@@ -357,10 +360,11 @@ class _FlashAttentionOracleCapture:
                 max_seqlen_k,
             )
             if len(capture.calls) < capture.max_calls:
-                window_size = (
-                    (int(attn_self.context), 0)
+                window_size = attn_self._flash_window_size()
+                source_context = (
+                    int(attn_self.context)
                     if attn_self.context is not None and attn_self.causal
-                    else (-1, -1)
+                    else None
                 )
                 try:
                     ref = _sdpa_reference_from_varlen(
@@ -372,6 +376,7 @@ class _FlashAttentionOracleCapture:
                         max_seqlen_q=int(max_seqlen_q),
                         causal=bool(attn_self.causal),
                         window_size=window_size,
+                        source_context=source_context,
                     )
                     comparison = _tensor_comparison(
                         ref.detach().to("cpu"), out.detach().to("cpu")
@@ -394,6 +399,7 @@ class _FlashAttentionOracleCapture:
                         "max_seqlen_k": int(max_seqlen_k),
                         "causal": bool(attn_self.causal),
                         "window_size": list(window_size),
+                        "source_context": source_context,
                         "comparison_to_sdpa": comparison,
                         "error": error,
                     }
