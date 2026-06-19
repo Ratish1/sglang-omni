@@ -31,7 +31,7 @@ import logging
 import math
 import sys
 from collections import Counter, OrderedDict, defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -49,6 +49,7 @@ from sglang_omni.models.moss_tts_local.vocoder_decoder import (
 )
 
 logger = logging.getLogger(__name__)
+_SUPPRESS_SDPA_CAPTURE = 0
 
 
 @dataclass
@@ -190,6 +191,10 @@ class _SdpaCapture:
             self._original = None
 
     def _wrapped(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if _SUPPRESS_SDPA_CAPTURE:
+            if self._original is None:
+                raise RuntimeError("SDPA capture is not installed")
+            return self._original(*args, **kwargs)
         call_index = self._call_index
         self._call_index += 1
         prefix = f"sdpa#{call_index:03d}"
@@ -209,6 +214,208 @@ class _SdpaCapture:
         output = self._original(*args, **kwargs)
         self._capture._capture_value(f"{prefix}.post.out", output)
         return output
+
+
+@contextmanager
+def _suppress_sdpa_capture():
+    global _SUPPRESS_SDPA_CAPTURE
+    _SUPPRESS_SDPA_CAPTURE += 1
+    try:
+        yield
+    finally:
+        _SUPPRESS_SDPA_CAPTURE -= 1
+
+
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, torch.Size):
+        return list(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() <= 32:
+            return value.detach().to("cpu").reshape(-1).tolist()
+        return {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+        }
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
+    return value
+
+
+def _sdpa_reference_from_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    causal: bool,
+    window_size: tuple[int, int],
+) -> torch.Tensor:
+    outputs: list[torch.Tensor] = []
+    cu_q = [int(item) for item in cu_seqlens_q.detach().to("cpu").tolist()]
+    cu_k = [int(item) for item in cu_seqlens_k.detach().to("cpu").tolist()]
+    if len(cu_q) != len(cu_k):
+        raise ValueError(
+            f"cu_seqlens_q and cu_seqlens_k must have equal length, got "
+            f"{len(cu_q)} and {len(cu_k)}"
+        )
+
+    for index in range(len(cu_q) - 1):
+        q_start, q_end = cu_q[index], cu_q[index + 1]
+        k_start, k_end = cu_k[index], cu_k[index + 1]
+        q_i = q[q_start:q_end]
+        k_i = k[k_start:k_end]
+        v_i = v[k_start:k_end]
+        query_len = q_i.shape[0]
+        key_len = k_i.shape[0]
+        q_sdpa = q_i.transpose(0, 1).unsqueeze(0)
+        k_sdpa = k_i.transpose(0, 1).unsqueeze(0)
+        v_sdpa = v_i.transpose(0, 1).unsqueeze(0)
+
+        attn_mask = None
+        if causal or window_size != (-1, -1):
+            q_positions = torch.arange(query_len, device=q.device, dtype=torch.long)
+            k_positions = torch.arange(key_len, device=q.device, dtype=torch.long)
+            delta = (key_len - query_len + q_positions).view(
+                query_len, 1
+            ) - k_positions.view(1, key_len)
+            mask = torch.ones((query_len, key_len), device=q.device, dtype=torch.bool)
+            if causal:
+                mask = mask & (delta >= 0)
+            if window_size[0] >= 0:
+                mask = mask & (delta < int(window_size[0]))
+            if window_size[1] >= 0:
+                mask = mask & (delta >= -int(window_size[1]))
+            attn_mask = mask.view(1, 1, query_len, key_len)
+
+        with _suppress_sdpa_capture():
+            out_i = F.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
+                attn_mask,
+                dropout_p=0.0,
+            )
+        outputs.append(out_i.squeeze(0).transpose(0, 1).contiguous())
+
+    if not outputs:
+        return q.new_empty((0, q.shape[1], q.shape[2]))
+    total_q = cu_q[-1]
+    if total_q != sum(item.shape[0] for item in outputs):
+        raise RuntimeError(
+            f"reconstructed SDPA produced unexpected token count for max_q="
+            f"{max_seqlen_q}"
+        )
+    return torch.cat(outputs, dim=0)
+
+
+class _FlashAttentionOracleCapture:
+    """Compare owned SGLang varlen attention output to an SDPA oracle.
+
+    This wraps the repo-owned MOSS attention adapter, records the exact packed
+    tensors passed to SGLang, runs a segment-wise PyTorch SDPA reference over
+    the same valid packed K/V rows, and leaves the production output unchanged.
+    """
+
+    def __init__(self, *, max_calls: int) -> None:
+        self.max_calls = int(max_calls)
+        self.calls: list[dict[str, Any]] = []
+        self._original = None
+        self._call_index = 0
+
+    def __enter__(self) -> "_FlashAttentionOracleCapture":
+        attention_cls = vocoder_decoder_module.MossTTSLocalAttention
+        self._original = attention_cls._run_flash_attention
+        capture = self
+
+        def wrapped(
+            attn_self,
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max_seqlen_q,
+            max_seqlen_k,
+        ):
+            if capture._original is None:
+                raise RuntimeError("Flash oracle capture is not installed")
+            call_index = capture._call_index
+            capture._call_index += 1
+            out = capture._original(
+                attn_self,
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                max_seqlen_q,
+                max_seqlen_k,
+            )
+            if len(capture.calls) < capture.max_calls:
+                window_size = (
+                    (int(attn_self.context), 0)
+                    if attn_self.context is not None and attn_self.causal
+                    else (-1, -1)
+                )
+                try:
+                    ref = _sdpa_reference_from_varlen(
+                        q,
+                        k,
+                        v,
+                        cu_q,
+                        cu_k,
+                        max_seqlen_q=int(max_seqlen_q),
+                        causal=bool(attn_self.causal),
+                        window_size=window_size,
+                    )
+                    comparison = _tensor_comparison(
+                        ref.detach().to("cpu"), out.detach().to("cpu")
+                    )
+                    error: str | None = None
+                except Exception as exc:
+                    comparison = None
+                    error = repr(exc)
+                capture.calls.append(
+                    {
+                        "call_index": call_index,
+                        "attention_class": attn_self.source.__class__.__name__,
+                        "q_shape": list(q.shape),
+                        "k_shape": list(k.shape),
+                        "v_shape": list(v.shape),
+                        "out_shape": list(out.shape),
+                        "cu_q": _to_jsonable(cu_q),
+                        "cu_k": _to_jsonable(cu_k),
+                        "max_seqlen_q": int(max_seqlen_q),
+                        "max_seqlen_k": int(max_seqlen_k),
+                        "causal": bool(attn_self.causal),
+                        "window_size": list(window_size),
+                        "comparison_to_sdpa": comparison,
+                        "error": error,
+                    }
+                )
+            return out
+
+        attention_cls._run_flash_attention = wrapped
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        if self._original is not None:
+            vocoder_decoder_module.MossTTSLocalAttention._run_flash_attention = (
+                self._original
+            )
+            self._original = None
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "captured_call_count": len(self.calls),
+            "observed_call_count": self._call_index,
+            "calls": self.calls,
+        }
 
 
 class _OwnedRouteCapture:
@@ -688,11 +895,14 @@ def _run_with_trace(
     trace_level: str,
     trace_sdpa: bool,
     trace_owned_routes: bool,
+    trace_flash_oracle: bool,
+    flash_oracle_max_calls: int,
     max_elements_per_tensor: int,
 ) -> tuple[
     list[torch.Tensor],
     OrderedDict[str, _CapturedTensor],
     OrderedDict[str, _CapturedTensor],
+    dict[str, Any] | None,
     dict[str, Any] | None,
 ]:
     modules = _trace_modules(decoder, trace_level=trace_level)
@@ -703,26 +913,42 @@ def _run_with_trace(
         else None
     )
     route_capture = _OwnedRouteCapture() if trace_owned_routes else None
+    flash_oracle_capture = (
+        _FlashAttentionOracleCapture(max_calls=flash_oracle_max_calls)
+        if trace_flash_oracle
+        else None
+    )
     logger.info("%s: installing %d trace hooks", label, len(modules) * 2)
     capture.install(modules)
     try:
         _synchronize(device)
         sdpa_context = sdpa_capture if sdpa_capture is not None else nullcontext()
         route_context = route_capture if route_capture is not None else nullcontext()
-        with route_context, sdpa_context, torch.no_grad():
+        flash_oracle_context = (
+            flash_oracle_capture if flash_oracle_capture is not None else nullcontext()
+        )
+        with route_context, sdpa_context, flash_oracle_context, torch.no_grad():
             outputs = decode_fn()
         _synchronize(device)
     finally:
         capture.close()
     sdpa_records = sdpa_capture.records if sdpa_capture is not None else OrderedDict()
     route_summary = route_capture.summary() if route_capture is not None else None
+    flash_oracle_summary = (
+        flash_oracle_capture.summary() if flash_oracle_capture is not None else None
+    )
     logger.info(
-        "%s: captured %d tensor records and %d SDPA records",
+        "%s: captured %d tensor records, %d SDPA records, and %d flash oracle calls",
         label,
         len(capture.records),
         len(sdpa_records),
+        (
+            int(flash_oracle_summary["captured_call_count"])
+            if flash_oracle_summary is not None
+            else 0
+        ),
     )
-    return outputs, capture.records, sdpa_records, route_summary
+    return outputs, capture.records, sdpa_records, route_summary, flash_oracle_summary
 
 
 def _attention_global_summary(codec: Any) -> dict[str, Any]:
@@ -791,6 +1017,8 @@ def _run_probe(
     trace_level: str,
     trace_sdpa: bool,
     trace_owned_routes: bool,
+    trace_flash_oracle: bool,
+    flash_oracle_max_calls: int,
     max_elements_per_tensor: int,
     device: torch.device,
     dump_first_mismatch: bool,
@@ -810,7 +1038,7 @@ def _run_probe(
     if hasattr(owned_decoder, "eval"):
         owned_decoder.eval()
 
-    source_outputs, source_records, source_sdpa_records, _ = _run_with_trace(
+    source_outputs, source_records, source_sdpa_records, _, _ = _run_with_trace(
         label="processor",
         decoder=codec.decoder,
         decode_fn=lambda: _decode_processor(processor, codes_list),
@@ -818,6 +1046,8 @@ def _run_probe(
         trace_level=trace_level,
         trace_sdpa=trace_sdpa,
         trace_owned_routes=False,
+        trace_flash_oracle=False,
+        flash_oracle_max_calls=0,
         max_elements_per_tensor=max_elements_per_tensor,
     )
 
@@ -839,6 +1069,7 @@ def _run_probe(
             candidate_records,
             candidate_sdpa_records,
             route_summary,
+            flash_oracle_summary,
         ) = _run_with_trace(
             label=candidate,
             decoder=candidate_decoder,
@@ -847,6 +1078,8 @@ def _run_probe(
             trace_level=trace_level,
             trace_sdpa=trace_sdpa,
             trace_owned_routes=trace_owned_routes and candidate == "owned",
+            trace_flash_oracle=trace_flash_oracle and candidate == "owned",
+            flash_oracle_max_calls=flash_oracle_max_calls,
             max_elements_per_tensor=max_elements_per_tensor,
         )
         record_comparison = _compare_records(source_records, candidate_records)
@@ -920,6 +1153,7 @@ def _run_probe(
             "output_comparison": output_comparison,
             "record_comparison": record_comparison,
             "sdpa_comparison": sdpa_comparison,
+            "flash_oracle": flash_oracle_summary,
             "owned_route_summary": route_summary,
             "first_mismatch_dump": str(dump_path) if dump_path is not None else None,
             "first_sdpa_mismatch_dump": (
@@ -946,6 +1180,8 @@ def _run_probe(
         "trace_level": trace_level,
         "trace_sdpa": trace_sdpa,
         "trace_owned_routes": trace_owned_routes,
+        "trace_flash_oracle": trace_flash_oracle,
+        "flash_oracle_max_calls": flash_oracle_max_calls,
         "max_elements_per_tensor": max_elements_per_tensor,
         "candidates": candidate_reports,
         # Kept for older report consumers while this script is actively used.
@@ -966,6 +1202,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         f"- trace level: `{report['trace_level']}`",
         f"- trace SDPA: `{report['trace_sdpa']}`",
         f"- trace owned routes: `{report['trace_owned_routes']}`",
+        f"- trace flash oracle: `{report['trace_flash_oracle']}`",
         f"- CUDA SDPA backend: `{report['cuda_sdp_backend']}`",
         "",
         "## Attention Globals",
@@ -1010,6 +1247,43 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                         "```",
                     ]
                 )
+            flash_oracle = candidate_report.get("flash_oracle")
+            if flash_oracle:
+                calls = flash_oracle.get("calls") or []
+                lines.extend(
+                    [
+                        "",
+                        f"### Flash Oracle {probe['batch_size']}x{probe['frames']} {candidate}",
+                        "",
+                        f"- observed calls: `{flash_oracle.get('observed_call_count')}`",
+                        f"- captured calls: `{flash_oracle.get('captured_call_count')}`",
+                        "",
+                    ]
+                )
+                if calls:
+                    lines.extend(
+                        [
+                            "| call | q | k | max_q | max_k | window | equal | max abs | mean abs | SNR | error |",
+                            "|---:|---|---|---:|---:|---|---:|---:|---:|---:|---|",
+                        ]
+                    )
+                    for call in calls:
+                        comparison = call.get("comparison_to_sdpa") or {}
+                        lines.append(
+                            "| {call} | {q} | {k} | {max_q} | {max_k} | {window} | {equal} | {max_abs:.6g} | {mean_abs:.6g} | {snr} | {error} |".format(
+                                call=call.get("call_index"),
+                                q=call.get("q_shape"),
+                                k=call.get("k_shape"),
+                                max_q=call.get("max_seqlen_q"),
+                                max_k=call.get("max_seqlen_k"),
+                                window=call.get("window_size"),
+                                equal=comparison.get("torch_equal", False),
+                                max_abs=float(comparison.get("max_abs_delta", 0.0)),
+                                mean_abs=float(comparison.get("mean_abs_delta", 0.0)),
+                                snr=comparison.get("snr_db", ""),
+                                error=call.get("error") or "",
+                            )
+                        )
     lines.extend(
         [
             "",
@@ -1076,6 +1350,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="record owned vocoder stage and attention routing decisions",
     )
     parser.add_argument(
+        "--trace-flash-oracle",
+        action="store_true",
+        help=(
+            "wrap owned SGLang FlashAttention calls and compare them against "
+            "a segment-wise PyTorch SDPA oracle built from the same packed Q/K/V"
+        ),
+    )
+    parser.add_argument(
+        "--flash-oracle-max-calls",
+        type=int,
+        default=1,
+        help="maximum owned FlashAttention calls to compare per candidate/probe",
+    )
+    parser.add_argument(
         "--max-elements-per-tensor",
         type=int,
         default=10_000_000,
@@ -1094,6 +1382,8 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     if args.max_elements_per_tensor < 1:
         raise SystemExit("--max-elements-per-tensor must be positive")
+    if args.flash_oracle_max_calls < 1:
+        raise SystemExit("--flash-oracle-max-calls must be positive")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1113,6 +1403,8 @@ def main() -> None:
         "trace_level": args.trace_level,
         "trace_sdpa": args.trace_sdpa,
         "trace_owned_routes": args.trace_owned_routes,
+        "trace_flash_oracle": args.trace_flash_oracle,
+        "flash_oracle_max_calls": args.flash_oracle_max_calls,
         "cuda_sdp_backend": args.cuda_sdpa_backend,
         "cuda_sdp_settings": _cuda_sdp_settings(),
         "candidates": candidates,
@@ -1132,6 +1424,8 @@ def main() -> None:
                 trace_level=args.trace_level,
                 trace_sdpa=args.trace_sdpa,
                 trace_owned_routes=args.trace_owned_routes,
+                trace_flash_oracle=args.trace_flash_oracle,
+                flash_oracle_max_calls=args.flash_oracle_max_calls,
                 max_elements_per_tensor=args.max_elements_per_tensor,
                 device=device,
                 dump_first_mismatch=args.dump_first_mismatch,
