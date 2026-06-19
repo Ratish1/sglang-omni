@@ -59,6 +59,14 @@ def _accepts_kwarg(fn: Any, name: str) -> bool:
     return False
 
 
+def _has_parameters(fn: Any, names: set[str]) -> bool:
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return names.issubset(signature.parameters)
+
+
 def _pack_padded_sequence(
     x: torch.Tensor,
     input_lengths: torch.Tensor,
@@ -261,6 +269,9 @@ class MossTTSLocalAttention(nn.Module):
         self._source_accepts_input_lengths = _accepts_kwarg(
             self.source.forward, "input_lengths"
         )
+        self._source_accepts_qkv = _has_parameters(
+            self.source.forward, {"key", "value"}
+        )
         self._sglang_flash_attn_varlen_func = _load_sglang_flash_attn_varlen_func()
         max_period = getattr(self.rope, "max_period", 10000.0)
         self._packed_rope_cache = _MossPackedRopeCache(max_period=max_period)
@@ -372,8 +383,12 @@ class MossTTSLocalAttention(nn.Module):
         query: torch.Tensor,
         input_lengths: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self._source_accepts_input_lengths:
+        if self._source_accepts_qkv and self._source_accepts_input_lengths:
             return self.source(query, query, query, input_lengths=input_lengths)
+        if self._source_accepts_qkv:
+            return self.source(query, query, query)
+        if self._source_accepts_input_lengths:
+            return self.source(query, input_lengths=input_lengths)
         return self.source(query, query, query)
 
     def _forward_streaming_sdpa(
@@ -659,6 +674,7 @@ class MossTTSLocalVocoderDecoder(nn.Module):
 
     def __init__(self, source: nn.Module) -> None:
         super().__init__()
+        self.source = source
         source_stages = _module_list(source)
         if not source_stages:
             raise ValueError("MOSS vocoder decoder must be a non-empty stage list")

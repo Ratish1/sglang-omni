@@ -59,6 +59,19 @@ class _FakeAttention(nn.Module):
         return query
 
 
+class _LengthOnlyAttention(_FakeAttention):
+    def forward(
+        self,
+        query: torch.Tensor,
+        *,
+        input_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        self.calls += 1
+        self.last_qkv_same_object = False
+        self.last_input_lengths = input_lengths
+        return query
+
+
 class _FakeStreamingState:
     def __init__(self, batch_size: int = 2) -> None:
         self.offset = torch.zeros(batch_size, dtype=torch.long)
@@ -200,6 +213,24 @@ class _FallbackProjectedStage(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self.seen_input_shape = tuple(x.shape)
         return x + 10, input_lengths + 1
+
+
+class _LengthOnlyLayer(_FakeLayer):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__(hidden_size)
+        self.self_attn = _LengthOnlyAttention(hidden_size)
+
+
+class _LengthOnlyTransformer(_FallbackTransformer):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__(hidden_size)
+        self.layers = nn.ModuleList([_LengthOnlyLayer(hidden_size)])
+
+
+class _LengthOnlyProjectedStage(_FallbackProjectedStage):
+    def __init__(self) -> None:
+        super().__init__()
+        self.transformer = _LengthOnlyTransformer(6)
 
 
 class _PatchStage(nn.Module):
@@ -353,6 +384,20 @@ def test_projected_transformer_delegates_source_path_without_remote_flash() -> N
     assert source.seen_input_shape == tuple(x.shape)
     assert torch.equal(out, x + 10)
     assert torch.equal(out_lengths, lengths + 1)
+
+
+def test_attention_supports_length_only_source_signature() -> None:
+    source = _LengthOnlyAttention(hidden_size=6)
+    wrapper = MossTTSLocalAttention(source)
+    x = torch.randn(2, 4, 6)
+    lengths = torch.tensor([4, 3])
+
+    out = wrapper(x, input_lengths=lengths)
+
+    assert source.calls == 1
+    assert not source.last_qkv_same_object
+    assert source.last_input_lengths is lengths
+    assert torch.equal(out, x)
 
 
 def test_projected_transformer_uses_single_unpadded_pack_fast_path(
@@ -570,5 +615,6 @@ def test_vocoder_decoder_wraps_supported_stage_types() -> None:
     wrapped = MossTTSLocalVocoderDecoder(decoder)
 
     assert len(wrapped) == 2
+    assert dict(wrapped.named_children())["source"] is decoder
     assert isinstance(wrapped[0], MossTTSLocalProjectedTransformer)
     assert wrapped[1] is patch_stage
