@@ -271,7 +271,7 @@ def _enable_sglang_flash_path(attn: MossTTSLocalAttention) -> None:
     )
 
 
-def test_projected_transformer_sdpa_path_does_not_reenter_source_stage() -> None:
+def test_projected_transformer_sdpa_path_delegates_to_source_stage() -> None:
     source = _FallbackProjectedStage()
     wrapper = MossTTSLocalProjectedTransformer(source)
     x = torch.randn(2, 3, 4)
@@ -279,9 +279,9 @@ def test_projected_transformer_sdpa_path_does_not_reenter_source_stage() -> None
 
     out, out_lengths = wrapper(x, lengths)
 
-    assert source.seen_input_shape is None
-    assert out.shape == (2, 7, 4)
-    assert torch.equal(out_lengths, lengths)
+    assert source.seen_input_shape == tuple(x.shape)
+    assert torch.equal(out, x + 10)
+    assert torch.equal(out_lengths, lengths + 1)
 
 
 def test_projected_transformer_uses_sglang_flash_fallback() -> None:
@@ -327,7 +327,7 @@ def test_projected_transformer_uses_sglang_flash_fallback() -> None:
     assert torch.equal(out_lengths, lengths)
 
 
-def test_projected_transformer_preserves_source_path_without_remote_flash() -> None:
+def test_projected_transformer_delegates_source_path_without_remote_flash() -> None:
     source = _FallbackProjectedStage()
     source.transformer.layers[0].self_attn.attention_implementation = (
         "flash_attention_2"
@@ -349,12 +349,10 @@ def test_projected_transformer_preserves_source_path_without_remote_flash() -> N
 
     out, out_lengths = wrapper(x, lengths)
 
-    assert source.transformer.layers[0].self_attn.calls == 1
-    assert source.transformer.layers[0].self_attn.last_qkv_same_object
-    assert source.transformer.layers[0].self_attn.last_input_lengths is lengths
-    assert source.seen_input_shape is None
-    assert out.shape == (2, 7, 4)
-    assert torch.equal(out_lengths, lengths)
+    assert source.transformer.layers[0].self_attn.calls == 0
+    assert source.seen_input_shape == tuple(x.shape)
+    assert torch.equal(out, x + 10)
+    assert torch.equal(out_lengths, lengths + 1)
 
 
 def test_projected_transformer_uses_single_unpadded_pack_fast_path(

@@ -595,8 +595,11 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         input_lengths: torch.Tensor,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        backend = self.transformer.resolve_attention_implementation(x.transpose(1, 2))
+        if not self.source.is_streaming and backend != "flash_attention_2":
+            return self.source(x, input_lengths, **kwargs)
+
         x = self.input_proj(x.transpose(1, 2))
-        backend = self.transformer.resolve_attention_implementation(x)
         if not self.source.is_streaming and backend == "flash_attention_2":
             batch_size, max_seqlen, _ = x.shape
             if max_seqlen > 0 and batch_size == 1:
