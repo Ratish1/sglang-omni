@@ -358,7 +358,7 @@ def test_projected_transformer_uses_sglang_flash_fallback() -> None:
     assert torch.equal(out_lengths, lengths)
 
 
-def test_projected_transformer_delegates_source_path_without_remote_flash() -> None:
+def test_projected_transformer_uses_sglang_without_remote_flash() -> None:
     source = _FallbackProjectedStage()
     source.transformer.layers[0].self_attn.attention_implementation = (
         "flash_attention_2"
@@ -371,8 +371,22 @@ def test_projected_transformer_delegates_source_path_without_remote_flash() -> N
         lambda _: True
     )
 
-    def fake_flash_attn(*_: object, **__: object) -> torch.Tensor:
-        raise AssertionError("unsupported source flash path must not call SGLang")
+    calls = []
+
+    def fake_flash_attn(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
+        max_q: int,
+        max_k: int,
+        *,
+        causal: bool,
+        window_size: tuple[int, int],
+    ) -> torch.Tensor:
+        calls.append((cu_q.clone(), cu_k.clone(), max_q, max_k, window_size))
+        return q
 
     attn._sglang_flash_attn_varlen_func = fake_flash_attn
     x = torch.randn(2, 3, 4)
@@ -380,10 +394,16 @@ def test_projected_transformer_delegates_source_path_without_remote_flash() -> N
 
     out, out_lengths = wrapper(x, lengths)
 
-    assert source.transformer.layers[0].self_attn.calls == 0
-    assert source.seen_input_shape == tuple(x.shape)
-    assert torch.equal(out, x + 10)
-    assert torch.equal(out_lengths, lengths + 1)
+    assert source.seen_input_shape is None
+    assert len(calls) == 1
+    cu_q, cu_k, max_q, max_k, window_size = calls[0]
+    assert cu_q.tolist() == [0, 4, 7]
+    assert cu_k.tolist() == [0, 4, 7]
+    assert max_q == 4
+    assert max_k == 4
+    assert window_size == (source.transformer.layers[0].self_attn.context, 0)
+    assert out.shape == (2, 7, 4)
+    assert torch.equal(out_lengths, lengths)
 
 
 def test_attention_supports_length_only_source_signature() -> None:
@@ -578,19 +598,48 @@ def test_attention_uses_source_streaming_state_when_active() -> None:
     assert torch.allclose(out, source.out_proj(x + 2))
 
 
-def test_attention_streaming_flash_request_falls_back_to_source() -> None:
+def test_attention_streaming_flash_request_uses_sglang_varlen() -> None:
     source = _StreamingFlashAttention(hidden_size=6)
     wrapper = MossTTSLocalAttention(source)
     _enable_sglang_flash_path(wrapper)
+    source._streaming_state.exec_mask = torch.tensor([True, False])
+    calls = []
+
+    def fake_flash_attn(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
+        max_q: int,
+        max_k: int,
+        *,
+        causal: bool,
+        window_size: tuple[int, int],
+    ) -> torch.Tensor:
+        calls.append((q.shape, k.shape, cu_q.clone(), cu_k.clone(), max_q, max_k))
+        return q
+
+    wrapper._sglang_flash_attn_varlen_func = fake_flash_attn
     x = torch.randn(2, 4, 6)
 
     out = wrapper(x, input_lengths=torch.tensor([4, 4]))
 
     assert source.streaming_flash_calls == 0
     assert source.cache_updates == 0
-    assert source.calls == 1
-    assert source.last_qkv_same_object
-    assert source.last_input_lengths is not None
+    assert source.calls == 0
+    assert len(calls) == 1
+    q_shape, k_shape, cu_q, cu_k, max_q, max_k = calls[0]
+    assert q_shape == (8, source.num_heads, source.head_dim)
+    assert k_shape == (8, source.num_heads, source.head_dim)
+    assert cu_q.tolist() == [0, 4, 8]
+    assert cu_k.tolist() == [0, 4, 8]
+    assert max_q == 4
+    assert max_k == 4
+    assert source._streaming_state.offset.tolist() == [4, 0]
+    assert source._streaming_state.cached_positions is not None
+    assert source._streaming_state.cached_positions[0].tolist() == [0, 1, 2, 3]
+    assert source._streaming_state.cached_positions[1].tolist() == [-1, -1, -1, -1]
     assert out.shape == x.shape
 
 

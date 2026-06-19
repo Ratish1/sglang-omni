@@ -265,11 +265,12 @@ class _OwnedRouteCapture:
                 is_streaming=streaming_state is not None,
             )
             if streaming_state is not None:
-                route = (
-                    "streaming_source_attention"
-                    if backend == vocoder_decoder_module._SOURCE_ATTENTION
-                    else "streaming_owned_attention"
-                )
+                if backend == vocoder_decoder_module._SOURCE_ATTENTION:
+                    route = "streaming_source_attention"
+                elif backend == "flash_attention_2":
+                    route = "streaming_flash_attention"
+                else:
+                    route = "streaming_owned_attention"
             elif backend == "flash_attention_2":
                 route = "packed_flash_attention"
             else:
