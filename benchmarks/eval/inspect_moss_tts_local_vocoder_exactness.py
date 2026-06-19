@@ -30,7 +30,7 @@ import json
 import logging
 import math
 import sys
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +41,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+import sglang_omni.models.moss_tts_local.vocoder_decoder as vocoder_decoder_module
 from sglang_omni.models.moss_tts_local.stages import _load_moss_tts_local_processor
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
     build_moss_tts_local_vocoder_decoder,
@@ -208,6 +209,118 @@ class _SdpaCapture:
         output = self._original(*args, **kwargs)
         self._capture._capture_value(f"{prefix}.post.out", output)
         return output
+
+
+class _OwnedRouteCapture:
+    """Record owned decoder routing decisions without changing execution."""
+
+    def __init__(self) -> None:
+        self.stage_routes: Counter[str] = Counter()
+        self.attention_routes: Counter[str] = Counter()
+        self.examples: dict[str, list[dict[str, Any]]] = {
+            "stage": [],
+            "attention": [],
+        }
+        self._original_stage_forward = None
+        self._original_attention_forward = None
+
+    def __enter__(self) -> "_OwnedRouteCapture":
+        stage_cls = vocoder_decoder_module.MossTTSLocalProjectedTransformer
+        attention_cls = vocoder_decoder_module.MossTTSLocalAttention
+        self._original_stage_forward = stage_cls.forward
+        self._original_attention_forward = attention_cls.forward
+        capture = self
+
+        def stage_forward(stage_self, x, input_lengths, **kwargs):
+            source_streaming = bool(getattr(stage_self.source, "is_streaming", False))
+            backend = stage_self.transformer.resolve_attention_implementation(
+                x.transpose(1, 2)
+            )
+            if not source_streaming and backend != "flash_attention_2":
+                route = "source_stage_delegate"
+            elif not source_streaming and backend == "flash_attention_2":
+                route = "owned_packed_stage"
+            else:
+                route = "owned_streaming_stage"
+            capture.stage_routes[route] += 1
+            capture._append_example(
+                "stage",
+                {
+                    "route": route,
+                    "source_class": stage_self.source.__class__.__name__,
+                    "source_streaming": source_streaming,
+                    "backend": backend,
+                    "input_shape": list(x.shape),
+                    "input_lengths": _small_tensor_list(input_lengths),
+                },
+            )
+            return capture._original_stage_forward(
+                stage_self, x, input_lengths, **kwargs
+            )
+
+        def attention_forward(attn_self, query, **kwargs):
+            streaming_state = getattr(attn_self.source, "_streaming_state", None)
+            backend = attn_self.resolve_attention_implementation(
+                query,
+                is_streaming=streaming_state is not None,
+            )
+            if streaming_state is not None:
+                route = (
+                    "streaming_source_attention"
+                    if backend == vocoder_decoder_module._SOURCE_ATTENTION
+                    else "streaming_owned_attention"
+                )
+            elif backend == "flash_attention_2":
+                route = "packed_flash_attention"
+            else:
+                route = "dense_source_attention"
+            capture.attention_routes[route] += 1
+            capture._append_example(
+                "attention",
+                {
+                    "route": route,
+                    "source_class": attn_self.source.__class__.__name__,
+                    "source_streaming_state": streaming_state is not None,
+                    "backend": backend,
+                    "query_shape": list(query.shape),
+                    "input_lengths": _small_tensor_list(kwargs.get("input_lengths")),
+                },
+            )
+            return capture._original_attention_forward(attn_self, query, **kwargs)
+
+        stage_cls.forward = stage_forward
+        attention_cls.forward = attention_forward
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        stage_cls = vocoder_decoder_module.MossTTSLocalProjectedTransformer
+        attention_cls = vocoder_decoder_module.MossTTSLocalAttention
+        if self._original_stage_forward is not None:
+            stage_cls.forward = self._original_stage_forward
+            self._original_stage_forward = None
+        if self._original_attention_forward is not None:
+            attention_cls.forward = self._original_attention_forward
+            self._original_attention_forward = None
+
+    def _append_example(self, kind: str, value: dict[str, Any]) -> None:
+        examples = self.examples[kind]
+        if len(examples) < 12:
+            examples.append(value)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "stage_routes": dict(self.stage_routes),
+            "attention_routes": dict(self.attention_routes),
+            "examples": self.examples,
+        }
+
+
+def _small_tensor_list(value: Any) -> list[int] | None:
+    if not isinstance(value, torch.Tensor):
+        return None
+    if value.numel() > 32:
+        return None
+    return [int(item) for item in value.detach().to("cpu").reshape(-1).tolist()]
 
 
 def _parse_probe(value: str) -> tuple[int, int]:
@@ -573,11 +686,13 @@ def _run_with_trace(
     device: torch.device,
     trace_level: str,
     trace_sdpa: bool,
+    trace_owned_routes: bool,
     max_elements_per_tensor: int,
 ) -> tuple[
     list[torch.Tensor],
     OrderedDict[str, _CapturedTensor],
     OrderedDict[str, _CapturedTensor],
+    dict[str, Any] | None,
 ]:
     modules = _trace_modules(decoder, trace_level=trace_level)
     capture = _TraceCapture(max_elements_per_tensor=max_elements_per_tensor)
@@ -586,24 +701,27 @@ def _run_with_trace(
         if trace_sdpa
         else None
     )
+    route_capture = _OwnedRouteCapture() if trace_owned_routes else None
     logger.info("%s: installing %d trace hooks", label, len(modules) * 2)
     capture.install(modules)
     try:
         _synchronize(device)
         sdpa_context = sdpa_capture if sdpa_capture is not None else nullcontext()
-        with sdpa_context, torch.no_grad():
+        route_context = route_capture if route_capture is not None else nullcontext()
+        with route_context, sdpa_context, torch.no_grad():
             outputs = decode_fn()
         _synchronize(device)
     finally:
         capture.close()
     sdpa_records = sdpa_capture.records if sdpa_capture is not None else OrderedDict()
+    route_summary = route_capture.summary() if route_capture is not None else None
     logger.info(
         "%s: captured %d tensor records and %d SDPA records",
         label,
         len(capture.records),
         len(sdpa_records),
     )
-    return outputs, capture.records, sdpa_records
+    return outputs, capture.records, sdpa_records, route_summary
 
 
 def _attention_global_summary(codec: Any) -> dict[str, Any]:
@@ -671,6 +789,7 @@ def _run_probe(
     candidates: list[str],
     trace_level: str,
     trace_sdpa: bool,
+    trace_owned_routes: bool,
     max_elements_per_tensor: int,
     device: torch.device,
     dump_first_mismatch: bool,
@@ -690,13 +809,14 @@ def _run_probe(
     if hasattr(owned_decoder, "eval"):
         owned_decoder.eval()
 
-    source_outputs, source_records, source_sdpa_records = _run_with_trace(
+    source_outputs, source_records, source_sdpa_records, _ = _run_with_trace(
         label="processor",
         decoder=codec.decoder,
         decode_fn=lambda: _decode_processor(processor, codes_list),
         device=device,
         trace_level=trace_level,
         trace_sdpa=trace_sdpa,
+        trace_owned_routes=False,
         max_elements_per_tensor=max_elements_per_tensor,
     )
 
@@ -713,13 +833,19 @@ def _run_probe(
         else:
             raise ValueError(f"unsupported candidate {candidate!r}")
 
-        candidate_outputs, candidate_records, candidate_sdpa_records = _run_with_trace(
+        (
+            candidate_outputs,
+            candidate_records,
+            candidate_sdpa_records,
+            route_summary,
+        ) = _run_with_trace(
             label=candidate,
             decoder=candidate_decoder,
             decode_fn=candidate_decode,
             device=device,
             trace_level=trace_level,
             trace_sdpa=trace_sdpa,
+            trace_owned_routes=trace_owned_routes and candidate == "owned",
             max_elements_per_tensor=max_elements_per_tensor,
         )
         record_comparison = _compare_records(source_records, candidate_records)
@@ -793,6 +919,7 @@ def _run_probe(
             "output_comparison": output_comparison,
             "record_comparison": record_comparison,
             "sdpa_comparison": sdpa_comparison,
+            "owned_route_summary": route_summary,
             "first_mismatch_dump": str(dump_path) if dump_path is not None else None,
             "first_sdpa_mismatch_dump": (
                 str(sdpa_dump_path) if sdpa_dump_path is not None else None
@@ -807,6 +934,7 @@ def _run_probe(
             "record_comparison": {},
             "first_mismatch_dump": None,
             "first_sdpa_mismatch_dump": None,
+            "owned_route_summary": None,
         }
     return {
         "batch_size": batch_size,
@@ -816,6 +944,7 @@ def _run_probe(
         "vocab_size": vocab_size,
         "trace_level": trace_level,
         "trace_sdpa": trace_sdpa,
+        "trace_owned_routes": trace_owned_routes,
         "max_elements_per_tensor": max_elements_per_tensor,
         "candidates": candidate_reports,
         # Kept for older report consumers while this script is actively used.
@@ -835,6 +964,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         f"- device: `{report['device']}`",
         f"- trace level: `{report['trace_level']}`",
         f"- trace SDPA: `{report['trace_sdpa']}`",
+        f"- trace owned routes: `{report['trace_owned_routes']}`",
         f"- CUDA SDPA backend: `{report['cuda_sdp_backend']}`",
         "",
         "## Attention Globals",
@@ -867,6 +997,18 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                     sdpa_dump=candidate_report.get("first_sdpa_mismatch_dump") or "",
                 )
             )
+            route_summary = candidate_report.get("owned_route_summary")
+            if route_summary:
+                lines.extend(
+                    [
+                        "",
+                        f"### Routes {probe['batch_size']}x{probe['frames']} {candidate}",
+                        "",
+                        "```json",
+                        json.dumps(route_summary, indent=2, sort_keys=True),
+                        "```",
+                    ]
+                )
     lines.extend(
         [
             "",
@@ -928,6 +1070,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="also capture torch.nn.functional.scaled_dot_product_attention tensors",
     )
     parser.add_argument(
+        "--trace-owned-routes",
+        action="store_true",
+        help="record owned vocoder stage and attention routing decisions",
+    )
+    parser.add_argument(
         "--max-elements-per-tensor",
         type=int,
         default=10_000_000,
@@ -964,6 +1111,7 @@ def main() -> None:
         "device": str(device),
         "trace_level": args.trace_level,
         "trace_sdpa": args.trace_sdpa,
+        "trace_owned_routes": args.trace_owned_routes,
         "cuda_sdp_backend": args.cuda_sdpa_backend,
         "cuda_sdp_settings": _cuda_sdp_settings(),
         "candidates": candidates,
@@ -982,6 +1130,7 @@ def main() -> None:
                 candidates=candidates,
                 trace_level=args.trace_level,
                 trace_sdpa=args.trace_sdpa,
+                trace_owned_routes=args.trace_owned_routes,
                 max_elements_per_tensor=args.max_elements_per_tensor,
                 device=device,
                 dump_first_mismatch=args.dump_first_mismatch,
