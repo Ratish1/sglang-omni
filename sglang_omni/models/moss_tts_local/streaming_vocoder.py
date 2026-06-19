@@ -344,7 +344,6 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             )
         self._processor = processor
         self._codec = codec
-        self._nonstream_decoder = self._build_nonstream_decoder(nonstream_decoder)
         self._stream_slots = int(stream_slots)
         self._stream_chunk_frames = int(stream_chunk_frames)
         self._default_initial_chunk_frames = max(
@@ -354,6 +353,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         self._offline_slots = max(int(max_batch_size), 1)
         self._n_vq = int(processor.model_config.n_vq)
         self._sample_rate = _resolve_sample_rate(processor)
+        self._nonstream_decoder = self._build_nonstream_decoder(nonstream_decoder)
         self._session: _CodecStreamSession | None = None
         self._session_used_by_streaming = False
         self._cuda_graph = bool(cuda_graph)
@@ -394,7 +394,11 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 f"unsupported MOSS-TTS Local non-streaming vocoder decoder "
                 f"{nonstream_decoder!r}; expected 'processor' or 'owned-pytorch'"
             )
-        decoder = build_moss_tts_local_vocoder_decoder(self._codec)
+        decoder = build_moss_tts_local_vocoder_decoder(
+            self._codec,
+            max_batch_size=max(self._offline_slots, self._stream_slots),
+            max_chunk_frames=self._max_step_frames,
+        )
         logger.info(
             "MOSS-TTS Local non-streaming vocoder decoder=owned stages=%d",
             len(decoder),
