@@ -2,15 +2,14 @@
 """Streaming vocoder scheduler for MOSS-TTS Local.
 
 Streaming requests share one persistent batched ``codec.streaming()`` session.
-Pure non-streaming traffic keeps the pre-existing ``processor.decode_audio_codes``
-path even when startup CUDA-graph warmup briefly opened an idle session.
+Pure non-streaming traffic uses the MOSS decoder with packed SGLang FlashAttention
+when no live streaming session owns the codec state.
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
-import os
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -36,7 +35,6 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 _SOURCE_HINT = "MOSS-TTS Local"
-_NONSTREAM_DECODER_ENV = "SGLANG_OMNI_MOSS_LOCAL_NONSTREAM_VOCODER_DECODER"
 
 
 def _resolve_sample_rate(processor: Any) -> int:
@@ -318,7 +316,6 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         cuda_graph: bool = True,
         cuda_graph_frames: list[int] | None = None,
         cuda_graph_min_free_gb: float = 3.0,
-        nonstream_decoder: str | None = None,
     ) -> None:
         if stream_slots < 1:
             raise ValueError(f"stream_slots must be >= 1, got {stream_slots}")
@@ -344,7 +341,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             )
         self._processor = processor
         self._codec = codec
-        self._nonstream_decoder = self._build_nonstream_decoder(nonstream_decoder)
+        self._nonstream_decoder = self._build_nonstream_decoder()
         self._stream_slots = int(stream_slots)
         self._stream_chunk_frames = int(stream_chunk_frames)
         self._default_initial_chunk_frames = max(
@@ -378,25 +375,10 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             max_batch_wait_ms=max_batch_wait_ms,
         )
 
-    def _build_nonstream_decoder(
-        self, nonstream_decoder: str | None
-    ) -> MossTTSLocalVocoderDecoder | None:
-        mode = (
-            nonstream_decoder
-            if nonstream_decoder is not None
-            else os.environ.get(_NONSTREAM_DECODER_ENV, "processor")
-        )
-        mode = mode.strip().lower()
-        if mode in {"", "processor", "default"}:
-            return None
-        if mode not in {"owned", "owned-pytorch"}:
-            raise ValueError(
-                f"unsupported MOSS-TTS Local non-streaming vocoder decoder "
-                f"{nonstream_decoder!r}; expected 'processor' or 'owned-pytorch'"
-            )
+    def _build_nonstream_decoder(self) -> MossTTSLocalVocoderDecoder:
         decoder = build_moss_tts_local_vocoder_decoder(self._codec)
         logger.info(
-            "MOSS-TTS Local non-streaming vocoder decoder=owned stages=%d",
+            "MOSS-TTS Local non-streaming vocoder uses packed SGLang attention stages=%d",
             len(decoder),
         )
         return decoder
@@ -818,21 +800,18 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         with self._state_lock:
             self._close_idle_startup_session_locked()
         if self._session is None:
-            # Processor path opens its own streaming context; illegal once a
-            # session is live.
-            if self._nonstream_decoder is not None:
-                with use_moss_tts_local_vocoder_decoder(
-                    self._codec,
-                    self._nonstream_decoder,
-                ):
-                    return [
-                        torch.as_tensor(wav).detach().to("cpu")
-                        for wav in self._processor.decode_audio_codes(codes_list)
-                    ]
-            return [
-                torch.as_tensor(wav).detach().to("cpu")
-                for wav in self._processor.decode_audio_codes(codes_list)
-            ]
+            # decode_audio_codes opens its own streaming context; illegal once a
+            # session is live. The scoped decoder replacement keeps the processor
+            # contract while routing non-streaming transformer attention through
+            # SGLang's packed varlen FlashAttention.
+            with use_moss_tts_local_vocoder_decoder(
+                self._codec,
+                self._nonstream_decoder,
+            ):
+                return [
+                    torch.as_tensor(wav).detach().to("cpu")
+                    for wav in self._processor.decode_audio_codes(codes_list)
+                ]
         channels_first = [
             codes[:, : self._n_vq].transpose(0, 1).contiguous() for codes in codes_list
         ]

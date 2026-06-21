@@ -298,11 +298,7 @@ class MossTTSLocalAttention(nn.Module):
                 raise ValueError(
                     f"streaming attention expects a 3D tensor, got {tuple(query.shape)}"
                 )
-            out = (
-                self._forward_streaming_flash(query, streaming_state)
-                if backend == "flash_attention_2"
-                else self._forward_streaming_sdpa(query, streaming_state)
-            )
+            out = self._forward_streaming_sdpa(query, streaming_state)
             return self.out_proj(out)
         if backend == "flash_attention_2":
             if query.dim() != 2:
@@ -426,131 +422,6 @@ class MossTTSLocalAttention(nn.Module):
             causal=self.causal,
             window_size=window_size,
         )
-
-    def _forward_streaming_flash(
-        self,
-        x: torch.Tensor,
-        state: Any,
-    ) -> torch.Tensor:
-        batch_size, chunk_length, _ = x.shape
-        q, k_cur, v_cur = self._project_qkv(x)
-        if self.rope is not None:
-            q, k_cur = self.rope(q, k_cur, state.offset, time_before_heads=False)
-        pos_q = state.offset.view(-1, 1) + torch.arange(
-            chunk_length,
-            device=x.device,
-            dtype=torch.long,
-        ).view(1, -1)
-        cached_k, cached_v, cached_pos = self.source._ensure_streaming_cache(
-            state,
-            batch_size,
-            k_cur.device,
-            k_cur.dtype,
-        )
-
-        k_all, v_all, pos_k = self.source._build_streaming_kv(
-            cached_k,
-            cached_v,
-            cached_pos,
-            k_cur,
-            v_cur,
-            pos_q,
-        )
-
-        q_chunks = []
-        k_chunks = []
-        v_chunks = []
-        cu_q = [0]
-        cu_k = [0]
-        max_kv_len = 0
-
-        for batch_idx in range(batch_size):
-            valid_k = pos_k[batch_idx] >= 0
-            q_i = q[batch_idx].transpose(0, 1).contiguous()
-            k_i = k_all[batch_idx, :, valid_k, :].transpose(0, 1).contiguous()
-            v_i = v_all[batch_idx, :, valid_k, :].transpose(0, 1).contiguous()
-            q_chunks.append(q_i)
-            k_chunks.append(k_i)
-            v_chunks.append(v_i)
-            cu_q.append(cu_q[-1] + q_i.shape[0])
-            cu_k.append(cu_k[-1] + k_i.shape[0])
-            max_kv_len = max(max_kv_len, int(k_i.shape[0]))
-        q_pack = torch.cat(q_chunks, dim=0)
-        k_pack = torch.cat(k_chunks, dim=0)
-        v_pack = torch.cat(v_chunks, dim=0)
-        cu_q_tensor = torch.tensor(cu_q, device=x.device, dtype=torch.int32)
-        cu_k_tensor = torch.tensor(cu_k, device=x.device, dtype=torch.int32)
-
-        out_flat = self._run_flash_attention(
-            q_pack,
-            k_pack,
-            v_pack,
-            cu_q_tensor,
-            cu_k_tensor,
-            max_seqlen_q=chunk_length,
-            max_seqlen_k=max_kv_len,
-        )
-
-        outputs = []
-        start = 0
-        for _ in range(batch_size):
-            outputs.append(
-                out_flat[start : start + chunk_length].transpose(0, 1).contiguous()
-            )
-            start += chunk_length
-        out = torch.stack(outputs, dim=0)
-        out = out.transpose(1, 2).reshape(batch_size, chunk_length, self.embed_dim)
-
-        self._update_streaming_cache_in_place(
-            state,
-            cached_k,
-            cached_v,
-            cached_pos,
-            k_all,
-            v_all,
-            pos_k,
-        )
-        state.offset[:] = torch.where(
-            state.exec_mask,
-            state.offset + chunk_length,
-            state.offset,
-        )
-        return out
-
-    def _update_streaming_cache_in_place(
-        self,
-        state: Any,
-        cached_k: torch.Tensor,
-        cached_v: torch.Tensor,
-        cached_pos: torch.Tensor,
-        k_all: torch.Tensor,
-        v_all: torch.Tensor,
-        pos_k: torch.Tensor,
-    ) -> None:
-        if self.context is None:
-            self.source._update_streaming_cache(
-                state,
-                cached_k,
-                cached_v,
-                cached_pos,
-                k_all,
-                v_all,
-                pos_k,
-            )
-            return
-
-        context = int(self.context)
-        exec_mask = state.exec_mask.to(device=cached_k.device, dtype=torch.bool)
-        exec_mask_kv = exec_mask.view(-1, 1, 1, 1)
-        exec_mask_pos = exec_mask.to(device=cached_pos.device).view(-1, 1)
-
-        new_cached_k = k_all[:, :, -context:, :].contiguous()
-        new_cached_v = v_all[:, :, -context:, :].contiguous()
-        new_cached_pos = pos_k[:, -context:].contiguous()
-
-        cached_k.copy_(torch.where(exec_mask_kv, new_cached_k, cached_k))
-        cached_v.copy_(torch.where(exec_mask_kv, new_cached_v, cached_v))
-        cached_pos.copy_(torch.where(exec_mask_pos, new_cached_pos, cached_pos))
 
 
 class MossTTSLocalTransformerLayer(nn.Module):

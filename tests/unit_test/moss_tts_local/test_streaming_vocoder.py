@@ -55,6 +55,17 @@ class _FakeStreamingState:
         self.exec_mask[reset_mask] = True
 
 
+class _FakeDecoderStage(nn.Module):
+    patch_size = 1
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return x, input_lengths
+
+
 class FakeCodec(nn.Module):
     """Stateful fake of the MOSS-Audio-Tokenizer-v2 decode surface.
 
@@ -69,6 +80,7 @@ class FakeCodec(nn.Module):
         self.dummy = nn.Parameter(torch.zeros(1))
         self._streaming_state: _FakeStreamingState | None = None
         self.config = SimpleNamespace(sampling_rate=SAMPLE_RATE)
+        self.decoder = nn.ModuleList([_FakeDecoderStage()])
         self.frame_calls = 0
 
     @contextmanager

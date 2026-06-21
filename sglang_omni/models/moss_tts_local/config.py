@@ -102,7 +102,6 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
     cuda_graph: bool = True
     cuda_graph_frames: list[int] | None = None
     cuda_graph_min_free_gb: float = 3.0
-    nonstream_decoder: str | None = None
 
     def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
@@ -130,9 +129,6 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
                 )
                 stage.factory_args.setdefault(
                     "cuda_graph_min_free_gb", self.cuda_graph_min_free_gb
-                )
-                stage.factory_args.setdefault(
-                    "nonstream_decoder", self.nonstream_decoder
                 )
 
     def supports_uploaded_voice_references(self) -> bool:
