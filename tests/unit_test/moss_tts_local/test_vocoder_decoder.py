@@ -169,7 +169,7 @@ def test_projected_transformer_sdpa_path_does_not_reenter_source_stage() -> None
     assert torch.equal(out_lengths, lengths)
 
 
-def test_projected_transformer_uses_sglang_flash_fallback() -> None:
+def test_projected_transformer_uses_sglang_packed_flash_path() -> None:
     source = _FallbackProjectedStage()
     source.transformer.layers[0].self_attn.attention_implementation = (
         "flash_attention_2"
@@ -239,7 +239,7 @@ def test_projected_transformer_uses_single_unpadded_pack_fast_path(
         causal: bool,
         window_size: tuple[int, int],
     ) -> torch.Tensor:
-        calls.append((q.shape, cu_q.data_ptr(), cu_k.data_ptr(), max_q, max_k))
+        calls.append((q.shape, cu_q.clone(), cu_k.clone(), max_q, max_k))
         return q
 
     monkeypatch.setattr(vocoder_decoder, "_pack_padded_sequence", fail_masked_pack)
@@ -251,11 +251,12 @@ def test_projected_transformer_uses_single_unpadded_pack_fast_path(
     _ = wrapper(x, lengths)
 
     assert len(calls) == 2
-    q_shape, cu_q_ptr, cu_k_ptr, max_q, max_k = calls[0]
+    q_shape, cu_q, cu_k, max_q, max_k = calls[0]
     assert q_shape[0] == 4
-    assert cu_q_ptr == cu_k_ptr
-    assert calls[1][1] == cu_q_ptr
-    assert calls[1][2] == cu_k_ptr
+    assert cu_q.tolist() == [0, 4]
+    assert cu_k.tolist() == [0, 4]
+    assert calls[1][1].tolist() == [0, 4]
+    assert calls[1][2].tolist() == [0, 4]
     assert max_q == 4
     assert max_k == 4
     assert out.shape == (1, 7, 4)

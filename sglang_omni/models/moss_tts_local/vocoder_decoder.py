@@ -422,7 +422,6 @@ class MossTTSLocalProjectedTransformer(nn.Module):
             if max_seqlen == 0 or not bool(input_lengths.any().item()):
                 x = x.new_zeros(x.shape)
             else:
-                max_valid_seqlen = int(input_lengths.max().item())
                 is_unpadded_single = (
                     batch_size == 1 and int(input_lengths[0].item()) == max_seqlen
                 )
@@ -439,7 +438,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
                 packed_x = self.transformer(
                     packed_x,
                     cu_seqlens=cu_seqlens,
-                    max_seqlen=max_valid_seqlen,
+                    max_seqlen=max_seqlen,
                     position_ids=position_ids,
                     input_lengths=input_lengths,
                     **kwargs,
