@@ -208,16 +208,12 @@ class MossTTSLocalAttention(nn.Module):
         self._packed_rope_cache = _MossPackedRopeCache(max_period=max_period)
 
     def resolve_attention_implementation(self, x: torch.Tensor) -> str:
-        backend = self.source.resolve_attention_implementation(
-            x,
-            is_streaming=False,
-        )
         if (
             self.source.attention_implementation == "flash_attention_2"
             and self._can_run_packed_flash(x)
         ):
             return "flash_attention_2"
-        return backend
+        return self.source.resolve_attention_implementation(x, is_streaming=False)
 
     def _can_run_packed_flash(self, x: torch.Tensor) -> bool:
         if x.device.type != "cuda":
@@ -419,12 +415,11 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         backend = self.transformer.resolve_attention_implementation(x)
         if backend == "flash_attention_2":
             batch_size, max_seqlen, _ = x.shape
-            if max_seqlen == 0 or not bool(input_lengths.any().item()):
+            max_valid_seqlen = int(input_lengths.max().item()) if max_seqlen else 0
+            if max_valid_seqlen == 0:
                 x = x.new_zeros(x.shape)
             else:
-                is_unpadded_single = (
-                    batch_size == 1 and int(input_lengths[0].item()) == max_seqlen
-                )
+                is_unpadded_single = batch_size == 1 and max_valid_seqlen == max_seqlen
                 if is_unpadded_single:
                     packed_x, cu_seqlens, position_ids = _pack_unpadded_sequence(
                         x,
@@ -438,7 +433,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
                 packed_x = self.transformer(
                     packed_x,
                     cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
+                    max_seqlen=max_valid_seqlen,
                     position_ids=position_ids,
                     input_lengths=input_lengths,
                     **kwargs,
