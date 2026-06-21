@@ -42,6 +42,9 @@ class _FakeAttention(nn.Module):
     ) -> str:
         return "sdpa"
 
+    def _get_backend_check_dtype(self, x: torch.Tensor) -> torch.dtype:
+        return x.dtype
+
     def forward(self, x: torch.Tensor, **_: object) -> torch.Tensor:
         return x
 
@@ -134,6 +137,7 @@ class _FallbackProjectedStage(nn.Module):
         self.transformer = _FallbackTransformer(6)
         self.output_proj = nn.Linear(6, 7)
         self.is_streaming = False
+        self.module_type = "Transformer"
         self.seen_input_shape: tuple[int, ...] | None = None
 
     def forward(

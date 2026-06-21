@@ -12,7 +12,6 @@ from __future__ import annotations
 import importlib
 import math
 from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -221,29 +220,17 @@ class MossTTSLocalAttention(nn.Module):
             x,
             is_streaming=is_streaming,
         )
-        if backend == "flash_attention_2" and self._can_run_packed_flash(x):
-            return backend
-        if getattr(
-            self.source, "attention_implementation", None
-        ) == "flash_attention_2" and self._can_run_packed_flash(x):
+        if self._can_run_packed_flash(x) and (
+            backend == "flash_attention_2"
+            or self.source.attention_implementation == "flash_attention_2"
+        ):
             return "flash_attention_2"
         return backend
 
     def _can_run_packed_flash(self, x: torch.Tensor) -> bool:
         if x.device.type != "cuda":
             return False
-        return self._effective_dtype(x) == torch.bfloat16
-
-    def _effective_dtype(self, x: torch.Tensor) -> torch.dtype:
-        get_backend_check_dtype = getattr(self.source, "_get_backend_check_dtype", None)
-        if callable(get_backend_check_dtype):
-            return get_backend_check_dtype(x)
-        if x.device.type != "cuda":
-            return x.dtype
-        autocast_enabled = torch.is_autocast_enabled("cuda")
-        if not autocast_enabled:
-            return x.dtype
-        return torch.get_autocast_dtype("cuda")
+        return self.source._get_backend_check_dtype(x) == torch.bfloat16
 
     def forward(
         self,
@@ -264,7 +251,7 @@ class MossTTSLocalAttention(nn.Module):
                 raise ValueError(
                     f"streaming attention expects a 3D tensor, got {tuple(query.shape)}"
                 )
-            out = self._forward_streaming_sdpa(query, streaming_state)
+            out = self.source._forward_streaming_sdpa(query, streaming_state)
             return self.out_proj(out)
         if backend == "flash_attention_2":
             if query.dim() != 2:
@@ -293,11 +280,6 @@ class MossTTSLocalAttention(nn.Module):
             query,
             input_lengths=input_lengths,
         )
-
-    def _forward_streaming_sdpa(
-        self, query: torch.Tensor, streaming_state: Any
-    ) -> torch.Tensor:
-        return self.source._forward_streaming_sdpa(query, streaming_state)
 
     def _project_qkv(
         self, x: torch.Tensor
@@ -346,39 +328,18 @@ class MossTTSLocalAttention(nn.Module):
             position_ids,
             max_positions=max_seqlen,
         )
-        out = self._run_flash_attention(
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-        )
-        return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
-
-    def _run_flash_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
-    ) -> torch.Tensor:
-        window_size = self._flash_window_size()
-        return self._flash_attn_varlen(
+        out = self._flash_attn_varlen(
             q.contiguous(),
             k.contiguous(),
             v.contiguous(),
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
             causal=self.causal,
-            window_size=window_size,
+            window_size=self._flash_window_size(),
         )
+        return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
 
     def _flash_window_size(self) -> tuple[int, int]:
         if self.context is None or not self.causal:
@@ -432,12 +393,8 @@ class MossTTSLocalTransformer(nn.Module):
         )
 
     def resolve_attention_implementation(self, x: torch.Tensor) -> str:
-        if len(self.layers) == 0:
-            return "sdpa"
-        first_layer = self.layers[0]
-        if not isinstance(first_layer, MossTTSLocalTransformerLayer):
-            return self.source.resolve_attention_implementation(x)
-        return first_layer.self_attn.resolve_attention_implementation(
+        assert len(self.layers) > 0, "MOSS vocoder transformer must have layers"
+        return self.layers[0].self_attn.resolve_attention_implementation(
             x,
             is_streaming=getattr(self.source, "_streaming_state", None) is not None,
         )
@@ -558,12 +515,14 @@ class MossTTSLocalVocoderDecoder(nn.Module):
 
     @staticmethod
     def _wrap_stage(stage: nn.Module) -> nn.Module:
-        if hasattr(stage, "transformer"):
+        module_type = stage.module_type
+        if module_type == "Transformer":
             return MossTTSLocalProjectedTransformer(stage)
-        if hasattr(stage, "patch_size"):
+        if module_type == "PatchedPretransform":
             return stage
         raise ValueError(
-            f"unsupported MOSS vocoder decoder stage {stage.__class__.__name__}"
+            f"unsupported MOSS vocoder decoder stage {stage.__class__.__name__} "
+            f"with module_type={module_type!r}"
         )
 
     def __iter__(self) -> Iterator[nn.Module]:
@@ -583,36 +542,3 @@ class MossTTSLocalVocoderDecoder(nn.Module):
         for stage in self.stages:
             x, input_lengths = stage(x, input_lengths)
         return x, input_lengths
-
-
-def build_moss_tts_local_vocoder_decoder(codec: Any) -> MossTTSLocalVocoderDecoder:
-    decoder = getattr(codec, "decoder", None)
-    if decoder is None:
-        raise RuntimeError("MOSS vocoder codec is missing decoder")
-    return MossTTSLocalVocoderDecoder(decoder)
-
-
-@contextmanager
-def use_moss_tts_local_vocoder_decoder(
-    codec: Any,
-    decoder: MossTTSLocalVocoderDecoder,
-):
-    original_decoder = getattr(codec, "decoder", None)
-    if original_decoder is None:
-        raise RuntimeError("MOSS vocoder codec is missing decoder")
-    codec.decoder = decoder
-    try:
-        yield
-    finally:
-        codec.decoder = original_decoder
-
-
-__all__ = [
-    "MossTTSLocalAttention",
-    "MossTTSLocalProjectedTransformer",
-    "MossTTSLocalTransformer",
-    "MossTTSLocalTransformerLayer",
-    "MossTTSLocalVocoderDecoder",
-    "build_moss_tts_local_vocoder_decoder",
-    "use_moss_tts_local_vocoder_decoder",
-]

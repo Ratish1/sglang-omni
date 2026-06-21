@@ -17,10 +17,7 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
-from sglang_omni.models.moss_tts_local.vocoder_decoder import (
-    build_moss_tts_local_vocoder_decoder,
-    use_moss_tts_local_vocoder_decoder,
-)
+from sglang_omni.models.moss_tts_local.vocoder_decoder import MossTTSLocalVocoderDecoder
 from sglang_omni.models.tts_streaming import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     resolve_initial_codec_chunk_frames,
@@ -338,10 +335,10 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 f"MOSS-TTS Local streaming vocoder: codec is missing {missing}; "
                 "the installed MOSS-Audio-Tokenizer-v2 version is incompatible"
             )
-        nonstream_decoder = build_moss_tts_local_vocoder_decoder(codec)
+        nonstream_decoder = MossTTSLocalVocoderDecoder(codec.decoder)
         logger.info(
-            "MOSS-TTS Local non-streaming vocoder uses packed SGLang attention stages=%d",
-            len(nonstream_decoder),
+            f"MOSS-TTS Local non-streaming vocoder uses packed SGLang attention "
+            f"stages={len(nonstream_decoder)}"
         )
         self._processor = processor
         self._codec = codec
@@ -800,14 +797,15 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             # decoder module so non-streaming transformer attention uses packed
             # SGLang FlashAttention. A live streaming session owns codec state, so
             # it stays on the stateful session path below.
-            with use_moss_tts_local_vocoder_decoder(
-                self._codec,
-                self._nonstream_decoder,
-            ):
+            original_decoder = self._codec.decoder
+            self._codec.decoder = self._nonstream_decoder
+            try:
                 return [
                     torch.as_tensor(wav).detach().to("cpu")
                     for wav in self._processor.decode_audio_codes(codes_list)
                 ]
+            finally:
+                self._codec.decoder = original_decoder
         channels_first = [
             codes[:, : self._n_vq].transpose(0, 1).contiguous() for codes in codes_list
         ]
