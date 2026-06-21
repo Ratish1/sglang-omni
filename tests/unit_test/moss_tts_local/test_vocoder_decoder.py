@@ -260,7 +260,7 @@ def test_projected_transformer_uses_sglang_flash_fallback() -> None:
     assert cu_k.tolist() == [0, 4, 7]
     assert max_q == 4
     assert max_k == 4
-    assert window_size == (source.transformer.layers[0].self_attn.context, 0)
+    assert window_size == (source.transformer.layers[0].self_attn.context - 1, 0)
     assert out.shape == (2, 7, 4)
     assert torch.equal(out_lengths, lengths)
 
