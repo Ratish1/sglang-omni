@@ -18,7 +18,6 @@ import torch
 
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
-    MossTTSLocalVocoderDecoder,
     build_moss_tts_local_vocoder_decoder,
     use_moss_tts_local_vocoder_decoder,
 )
@@ -339,9 +338,14 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 f"MOSS-TTS Local streaming vocoder: codec is missing {missing}; "
                 "the installed MOSS-Audio-Tokenizer-v2 version is incompatible"
             )
+        nonstream_decoder = build_moss_tts_local_vocoder_decoder(codec)
+        logger.info(
+            "MOSS-TTS Local non-streaming vocoder uses packed SGLang attention stages=%d",
+            len(nonstream_decoder),
+        )
         self._processor = processor
         self._codec = codec
-        self._nonstream_decoder = self._build_nonstream_decoder()
+        self._nonstream_decoder = nonstream_decoder
         self._stream_slots = int(stream_slots)
         self._stream_chunk_frames = int(stream_chunk_frames)
         self._default_initial_chunk_frames = max(
@@ -374,14 +378,6 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             max_batch_size=max_batch_size,
             max_batch_wait_ms=max_batch_wait_ms,
         )
-
-    def _build_nonstream_decoder(self) -> MossTTSLocalVocoderDecoder:
-        decoder = build_moss_tts_local_vocoder_decoder(self._codec)
-        logger.info(
-            "MOSS-TTS Local non-streaming vocoder uses packed SGLang attention stages=%d",
-            len(decoder),
-        )
-        return decoder
 
     def start(self) -> None:
         # Graphs are captured in the factory (warmup_now) before this serving loop runs.
@@ -800,10 +796,10 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         with self._state_lock:
             self._close_idle_startup_session_locked()
         if self._session is None:
-            # decode_audio_codes opens its own streaming context; illegal once a
-            # session is live. The scoped decoder replacement keeps the processor
-            # contract while routing non-streaming transformer attention through
-            # SGLang's packed varlen FlashAttention.
+            # Keep decode_audio_codes as the public codec path, but swap only the
+            # decoder module so non-streaming transformer attention uses packed
+            # SGLang FlashAttention. A live streaming session owns codec state, so
+            # it stays on the stateful session path below.
             with use_moss_tts_local_vocoder_decoder(
                 self._codec,
                 self._nonstream_decoder,

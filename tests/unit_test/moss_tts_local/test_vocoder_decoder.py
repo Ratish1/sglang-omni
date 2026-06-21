@@ -227,9 +227,7 @@ def test_projected_transformer_uses_sglang_flash_fallback() -> None:
     )
     wrapper = MossTTSLocalProjectedTransformer(source)
     attn = wrapper.transformer.layers[0].self_attn
-    attn._supports_sglang_flash_attention = (  # type: ignore[method-assign]
-        lambda _: True
-    )
+    attn._can_run_packed_flash = lambda _: True  # type: ignore[method-assign]
     calls = []
 
     def fake_flash_attn(
@@ -247,7 +245,7 @@ def test_projected_transformer_uses_sglang_flash_fallback() -> None:
         calls.append((cu_q.clone(), cu_k.clone(), max_q, max_k, window_size))
         return q
 
-    attn._sglang_flash_attn_varlen_func = fake_flash_attn
+    attn._flash_attn_varlen = fake_flash_attn
     x = torch.randn(2, 3, 4)
     lengths = torch.tensor([4, 3])
 
@@ -274,9 +272,7 @@ def test_projected_transformer_uses_single_unpadded_pack_fast_path(
     )
     wrapper = MossTTSLocalProjectedTransformer(source)
     attn = wrapper.transformer.layers[0].self_attn
-    attn._supports_sglang_flash_attention = (  # type: ignore[method-assign]
-        lambda _: True
-    )
+    attn._can_run_packed_flash = lambda _: True  # type: ignore[method-assign]
     calls = []
 
     def fail_masked_pack(_: torch.Tensor, __: torch.Tensor) -> None:
@@ -298,7 +294,7 @@ def test_projected_transformer_uses_single_unpadded_pack_fast_path(
         return q
 
     monkeypatch.setattr(vocoder_decoder, "_pack_padded_sequence", fail_masked_pack)
-    attn._sglang_flash_attn_varlen_func = fake_flash_attn
+    attn._flash_attn_varlen = fake_flash_attn
     x = torch.randn(1, 3, 4)
     lengths = torch.tensor([4])
 
@@ -318,11 +314,11 @@ def test_projected_transformer_uses_single_unpadded_pack_fast_path(
 
 
 def test_single_unpadded_pack_metadata_cache_reuses_tensors() -> None:
-    cache = vocoder_decoder._SingleUnpaddedMetadataCache()
+    cache = vocoder_decoder._UnpaddedMetadataCache()
     x = torch.randn(1, 4, 6)
 
-    _, cu_1, pos_1 = vocoder_decoder._pack_single_unpadded_sequence(x, cache)
-    _, cu_2, pos_2 = vocoder_decoder._pack_single_unpadded_sequence(x, cache)
+    _, cu_1, pos_1 = vocoder_decoder._pack_unpadded_sequence(x, cache)
+    _, cu_2, pos_2 = vocoder_decoder._pack_unpadded_sequence(x, cache)
 
     assert cu_1.data_ptr() == cu_2.data_ptr()
     assert pos_1.data_ptr() == pos_2.data_ptr()
@@ -337,9 +333,7 @@ def test_projected_transformer_single_padded_input_uses_masked_pack() -> None:
     )
     wrapper = MossTTSLocalProjectedTransformer(source)
     attn = wrapper.transformer.layers[0].self_attn
-    attn._supports_sglang_flash_attention = (  # type: ignore[method-assign]
-        lambda _: True
-    )
+    attn._can_run_packed_flash = lambda _: True  # type: ignore[method-assign]
     calls = []
 
     def fake_flash_attn(
@@ -357,7 +351,7 @@ def test_projected_transformer_single_padded_input_uses_masked_pack() -> None:
         calls.append((q.shape, cu_q.clone(), cu_k.clone(), max_q, max_k))
         return q
 
-    attn._sglang_flash_attn_varlen_func = fake_flash_attn
+    attn._flash_attn_varlen = fake_flash_attn
     x = torch.randn(1, 3, 4)
     lengths = torch.tensor([2])
 
@@ -465,7 +459,7 @@ def test_attention_keeps_streaming_flash_on_source_path() -> None:
     ) -> torch.Tensor:
         raise AssertionError("streaming path must not call SGLang flash attention")
 
-    wrapper._sglang_flash_attn_varlen_func = fake_flash_attn
+    wrapper._flash_attn_varlen = fake_flash_attn
     x = torch.randn(2, 4, 6)
 
     out = wrapper(x, input_lengths=torch.tensor([4, 4]))
