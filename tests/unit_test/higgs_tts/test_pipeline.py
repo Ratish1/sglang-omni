@@ -27,6 +27,7 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
     stages_by_name = {stage.name: stage for stage in config.stages}
 
     assert stages_by_name["tts_engine"].stream_to == ["vocoder"]
+    assert "server_args_overrides" not in stages_by_name["tts_engine"].factory_args
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
 
@@ -103,10 +104,8 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     assert captured["context_length"] == 4096
     assert captured["gpu_id"] == 0
     assert captured["overrides"]["disable_cuda_graph"] is False
-    assert captured["overrides"]["cuda_graph_max_bs"] == stages.DEFAULT_MAX_CONCURRENCY
-    assert (
-        captured["overrides"]["max_running_requests"] == stages.DEFAULT_MAX_CONCURRENCY
-    )
+    assert captured["overrides"]["cuda_graph_max_bs"] == 64
+    assert captured["overrides"]["max_running_requests"] == 64
     assert captured["server_args"].disable_overlap_schedule is True
     assert captured["adapter_kwargs"] == {"max_new_tokens_cap": 2048}
     assert (
@@ -565,6 +564,7 @@ def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
         _cg_active_eoc_countdown=torch.tensor([0], dtype=torch.int32),
         _cg_active_generation_done=torch.tensor([True]),
         _cg_active_last_codes=torch.tensor([[1, 2, 3]]),
+        _cg_active_step_count=torch.zeros(1, dtype=torch.long),
         _cg_was_done=torch.tensor([False]),
         _cg_codes_BN=torch.tensor([[EOC_ID, 1, 2]]),
         _cg_collect_staging=torch.zeros((1, 3 + 2), dtype=torch.long),
@@ -573,6 +573,7 @@ def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
             eoc_countdown=torch.zeros(1, dtype=torch.int32),
             generation_done=torch.zeros(1, dtype=torch.bool),
             last_codes=torch.zeros((1, 3), dtype=torch.long),
+            step_count=torch.zeros(1, dtype=torch.long),
         ),
     )
     req = SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False)
@@ -609,6 +610,7 @@ def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
         # row1's True must NOT leak into the was-done (skipped) request.
         _cg_active_generation_done=torch.tensor([False, True, False, True]),
         _cg_active_last_codes=torch.zeros((n, k), dtype=torch.long),
+        _cg_active_step_count=torch.zeros(n, dtype=torch.long),
         _cg_was_done=torch.tensor([False, True, False, False]),
         _cg_codes_BN=torch.tensor([[1, 1, 1], [7, 8, 9], [20, 1, 2], [EOC_ID, 3, 4]]),
         _cg_collect_staging=torch.zeros((n, k + 2), dtype=torch.long),
@@ -616,6 +618,7 @@ def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
             delay_count=torch.zeros(n, dtype=torch.int32),
             eoc_countdown=torch.zeros(n, dtype=torch.int32),
             generation_done=torch.zeros(n, dtype=torch.bool),
+            step_count=torch.zeros(n, dtype=torch.long),
             last_codes=torch.zeros((n, k), dtype=torch.long),
         ),
     )
@@ -713,7 +716,7 @@ def test_higgs_tts_vocoder_batches_decode_requests(
     decode_batch_sizes = _fake_codec_fixtures(monkeypatch)
 
     scheduler = stages.create_vocoder_executor(
-        "fake-model", max_batch_size=4, max_batch_wait_ms=2
+        "fake-model", vocoder_decode_batch_size=4, max_batch_wait_ms=2
     )
 
     p1 = _make_payload(
@@ -748,7 +751,9 @@ def test_higgs_tts_vocoder_batch_handles_empty_items(
     """Items with empty/too-short codes get empty waveform payloads, not a crash."""
     decode_batch_sizes = _fake_codec_fixtures(monkeypatch)
 
-    scheduler = stages.create_vocoder_executor("fake-model", max_batch_size=4)
+    scheduler = stages.create_vocoder_executor(
+        "fake-model", vocoder_decode_batch_size=4
+    )
 
     payloads = [
         _make_payload("r-empty", HiggsTtsState(output_codes_delayed=None)),
