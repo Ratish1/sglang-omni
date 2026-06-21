@@ -56,6 +56,7 @@ class _FakeStreamingState:
 
 
 class _FakeDecoderStage(nn.Module):
+    module_type = "PatchedPretransform"
     patch_size = 1
 
     def forward(

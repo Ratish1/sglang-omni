@@ -19,11 +19,9 @@ from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from torch import nn
 
 
-class _UnpaddedMetadataCache:
+class _PositionIdsCache:
     def __init__(self) -> None:
-        self._items: dict[
-            tuple[str, int | None, int], tuple[torch.Tensor, torch.Tensor]
-        ] = {}
+        self._items: dict[tuple[str, int | None], torch.Tensor] = {}
 
     def get(
         self,
@@ -33,14 +31,13 @@ class _UnpaddedMetadataCache:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if max_seqlen <= 0:
             raise ValueError(f"max_seqlen must be positive, got {max_seqlen}")
-        key = (device.type, device.index, max_seqlen)
-        cached = self._items.get(key)
-        if cached is not None:
-            return cached
+        key = (device.type, device.index)
+        position_ids = self._items.get(key)
+        if position_ids is None or position_ids.shape[0] < max_seqlen:
+            position_ids = torch.arange(max_seqlen, device=device, dtype=torch.long)
+            self._items[key] = position_ids
         cu_seqlens = torch.tensor([0, max_seqlen], dtype=torch.int32, device=device)
-        position_ids = torch.arange(max_seqlen, device=device, dtype=torch.long)
-        self._items[key] = (cu_seqlens, position_ids)
-        return cu_seqlens, position_ids
+        return cu_seqlens, position_ids[:max_seqlen]
 
 
 def _pack_padded_sequence(
@@ -59,12 +56,12 @@ def _pack_padded_sequence(
 
 def _pack_unpadded_sequence(
     x: torch.Tensor,
-    metadata_cache: "_UnpaddedMetadataCache",
+    position_ids_cache: "_PositionIdsCache",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert x.shape[0] == 1, f"expected a single unpadded sequence, got {x.shape[0]}"
     _, max_seqlen, _ = x.shape
     packed_x = x.reshape(max_seqlen, x.shape[-1])
-    cu_seqlens, position_ids = metadata_cache.get(
+    cu_seqlens, position_ids = position_ids_cache.get(
         device=x.device,
         max_seqlen=max_seqlen,
     )
@@ -203,11 +200,11 @@ class MossTTSLocalAttention(nn.Module):
                 f"invalid attention shape: embed_dim={self.embed_dim}, "
                 f"num_heads={self.num_heads}, head_dim={self.head_dim}"
             )
-        self.causal = bool(getattr(source, "causal", True))
-        self.context = getattr(source, "context", None)
-        self.rope = getattr(source, "rope", None)
+        self.causal = bool(source.causal)
+        self.context = source.context
+        self.rope = source.rope
         self._flash_attn_varlen = flash_attn_varlen_func
-        max_period = getattr(self.rope, "max_period", 10000.0)
+        max_period = self.rope.max_period if self.rope is not None else 10000.0
         self._packed_rope_cache = _MossPackedRopeCache(max_period=max_period)
 
     def resolve_attention_implementation(
@@ -220,9 +217,11 @@ class MossTTSLocalAttention(nn.Module):
             x,
             is_streaming=is_streaming,
         )
-        if self._can_run_packed_flash(x) and (
-            backend == "flash_attention_2"
-            or self.source.attention_implementation == "flash_attention_2"
+        if is_streaming:
+            return backend
+        if (
+            self.source.attention_implementation == "flash_attention_2"
+            and self._can_run_packed_flash(x)
         ):
             return "flash_attention_2"
         return backend
@@ -241,18 +240,7 @@ class MossTTSLocalAttention(nn.Module):
         position_ids: torch.Tensor | None = None,
         input_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        streaming_state = getattr(self.source, "_streaming_state", None)
-        backend = self.resolve_attention_implementation(
-            query,
-            is_streaming=streaming_state is not None,
-        )
-        if streaming_state is not None:
-            if query.dim() != 3:
-                raise ValueError(
-                    f"streaming attention expects a 3D tensor, got {tuple(query.shape)}"
-                )
-            out = self.source._forward_streaming_sdpa(query, streaming_state)
-            return self.out_proj(out)
+        backend = self.resolve_attention_implementation(query)
         if backend == "flash_attention_2":
             if query.dim() != 2:
                 raise ValueError(
@@ -384,34 +372,23 @@ class MossTTSLocalTransformer(nn.Module):
         self.layers = nn.ModuleList(
             [MossTTSLocalTransformerLayer(layer) for layer in source.layers]
         )
-        self.positional_embedding = getattr(source, "positional_embedding", None)
-        self.positional_scale = float(getattr(source, "positional_scale", 1.0))
-        self.max_period = getattr(source, "max_period", None)
+        self.positional_embedding = source.positional_embedding
+        self.positional_scale = float(source.positional_scale)
+        self.max_period = source.max_period
         self._remote_module = importlib.import_module(source.__class__.__module__)
-        self._create_sin_embedding = getattr(
-            self._remote_module, "create_sin_embedding", None
-        )
+        self._create_sin_embedding = self._remote_module.create_sin_embedding
 
     def resolve_attention_implementation(self, x: torch.Tensor) -> str:
         assert len(self.layers) > 0, "MOSS vocoder transformer must have layers"
         return self.layers[0].self_attn.resolve_attention_implementation(
             x,
-            is_streaming=getattr(self.source, "_streaming_state", None) is not None,
+            is_streaming=False,
         )
 
     def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        streaming_state = getattr(self.source, "_streaming_state", None)
         if self.positional_embedding in {"sin", "sin_rope"}:
-            if self._create_sin_embedding is None:
-                raise RuntimeError(
-                    "MOSS vocoder transformer cannot create sin embeddings"
-                )
             if x.dim() == 3:
-                offsets = (
-                    streaming_state.offsets
-                    if streaming_state is not None
-                    else torch.zeros(1, dtype=torch.long, device=x.device)
-                )
+                offsets = torch.zeros(1, dtype=torch.long, device=x.device)
                 positions = torch.arange(x.shape[1], device=x.device).view(
                     1, -1
                 ) + offsets.view(-1, 1)
@@ -431,12 +408,6 @@ class MossTTSLocalTransformer(nn.Module):
             x = x + self.positional_scale * pos_emb
         for layer in self.layers:
             x = layer(x, **kwargs)
-        if streaming_state is not None and x.dim() == 3:
-            streaming_state.offsets[:] = torch.where(
-                streaming_state.exec_mask,
-                streaming_state.offsets + x.shape[1],
-                streaming_state.offsets,
-            )
         return x
 
 
@@ -449,8 +420,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         self.input_proj = source.input_proj
         self.output_proj = source.output_proj
         self.transformer = MossTTSLocalTransformer(source.transformer)
-        self.is_streaming = bool(source.is_streaming)
-        self._unpadded_metadata_cache = _UnpaddedMetadataCache()
+        self._position_ids_cache = _PositionIdsCache()
 
     def forward(
         self,
@@ -460,7 +430,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.input_proj(x.transpose(1, 2))
         backend = self.transformer.resolve_attention_implementation(x)
-        if not self.is_streaming and backend == "flash_attention_2":
+        if backend == "flash_attention_2":
             batch_size, max_seqlen, _ = x.shape
             if max_seqlen == 0 or not bool(input_lengths.any().item()):
                 x = x.new_zeros(x.shape)
@@ -472,7 +442,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
                 if is_unpadded_single:
                     packed_x, cu_seqlens, position_ids = _pack_unpadded_sequence(
                         x,
-                        self._unpadded_metadata_cache,
+                        self._position_ids_cache,
                     )
                     valid_mask = None
                 else:

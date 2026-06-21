@@ -9,7 +9,6 @@ from torch import nn
 
 import sglang_omni.models.moss_tts_local.vocoder_decoder as vocoder_decoder
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
-    MossTTSLocalAttention,
     MossTTSLocalProjectedTransformer,
     MossTTSLocalTransformerLayer,
     MossTTSLocalVocoderDecoder,
@@ -47,60 +46,6 @@ class _FakeAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, **_: object) -> torch.Tensor:
         return x
-
-
-class _FakeStreamingState:
-    def __init__(self, batch_size: int = 2) -> None:
-        self.offset = torch.zeros(batch_size, dtype=torch.long)
-        self.exec_mask = torch.ones(batch_size, dtype=torch.bool)
-        self.cached_keys: torch.Tensor | None = None
-        self.cached_values: torch.Tensor | None = None
-        self.cached_positions: torch.Tensor | None = None
-
-
-class _StreamingAttention(_FakeAttention):
-    def __init__(self, hidden_size: int) -> None:
-        super().__init__(hidden_size)
-        self._streaming_state = _FakeStreamingState()
-        self.streaming_sdpa_calls = 0
-
-    def _forward_streaming_sdpa(
-        self,
-        x: torch.Tensor,
-        state: _FakeStreamingState,
-    ) -> torch.Tensor:
-        assert state is self._streaming_state
-        self.streaming_sdpa_calls += 1
-        return x + 2
-
-
-class _StreamingFlashAttention(_FakeAttention):
-    def __init__(self, hidden_size: int) -> None:
-        super().__init__(hidden_size)
-        self._streaming_state = _FakeStreamingState()
-        self.streaming_flash_calls = 0
-
-    def resolve_attention_implementation(
-        self, _: torch.Tensor, *, is_streaming: bool = False
-    ) -> str:
-        assert is_streaming
-        return "flash_attention_2"
-
-    def _forward_streaming_flash(
-        self,
-        _: torch.Tensor,
-        __: _FakeStreamingState,
-    ) -> torch.Tensor:
-        self.streaming_flash_calls += 1
-        raise AssertionError("wrapper should own streaming flash attention")
-
-    def _forward_streaming_sdpa(
-        self,
-        x: torch.Tensor,
-        state: _FakeStreamingState,
-    ) -> torch.Tensor:
-        assert state is self._streaming_state
-        return x + 3
 
 
 class _FakeLayer(nn.Module):
@@ -317,17 +262,22 @@ def test_projected_transformer_uses_single_unpadded_pack_fast_path(
     assert torch.equal(out_lengths, lengths)
 
 
-def test_single_unpadded_pack_metadata_cache_reuses_tensors() -> None:
-    cache = vocoder_decoder._UnpaddedMetadataCache()
-    x = torch.randn(1, 4, 6)
+def test_single_unpadded_pack_position_cache_grows_and_slices() -> None:
+    cache = vocoder_decoder._PositionIdsCache()
+    x_short = torch.randn(1, 4, 6)
+    x_long = torch.randn(1, 6, 6)
 
-    _, cu_1, pos_1 = vocoder_decoder._pack_unpadded_sequence(x, cache)
-    _, cu_2, pos_2 = vocoder_decoder._pack_unpadded_sequence(x, cache)
+    _, cu_short_1, pos_short_1 = vocoder_decoder._pack_unpadded_sequence(x_short, cache)
+    _, cu_long, pos_long = vocoder_decoder._pack_unpadded_sequence(x_long, cache)
+    _, cu_short_2, pos_short_2 = vocoder_decoder._pack_unpadded_sequence(x_short, cache)
 
-    assert cu_1.data_ptr() == cu_2.data_ptr()
-    assert pos_1.data_ptr() == pos_2.data_ptr()
-    assert cu_1.tolist() == [0, 4]
-    assert pos_1.tolist() == [0, 1, 2, 3]
+    assert cu_short_1.tolist() == [0, 4]
+    assert cu_long.tolist() == [0, 6]
+    assert cu_short_2.tolist() == [0, 4]
+    assert pos_short_1.tolist() == [0, 1, 2, 3]
+    assert pos_long.tolist() == [0, 1, 2, 3, 4, 5]
+    assert pos_short_2.tolist() == [0, 1, 2, 3]
+    assert pos_short_2.data_ptr() == pos_long.data_ptr()
 
 
 def test_projected_transformer_single_padded_input_uses_masked_pack() -> None:
@@ -418,59 +368,6 @@ def test_cached_packed_rope_matches_moss_interleaved_reference() -> None:
     cos_ptr = cache._cos.data_ptr()
     _ = cache.get(device=q.device, head_dim=q.shape[-1], max_positions=3)
     assert cache._cos.data_ptr() == cos_ptr
-
-
-def test_projected_transformer_streaming_path_does_not_reenter_source_stage() -> None:
-    source = _FallbackProjectedStage()
-    source.is_streaming = True
-    wrapper = MossTTSLocalProjectedTransformer(source)
-    x = torch.randn(2, 3, 4)
-    lengths = torch.tensor([4, 3])
-
-    out, out_lengths = wrapper(x, lengths)
-
-    assert source.seen_input_shape is None
-    assert out.shape == (2, 7, 4)
-    assert torch.equal(out_lengths, lengths)
-
-
-def test_attention_uses_source_streaming_state_when_active() -> None:
-    source = _StreamingAttention(hidden_size=6)
-    wrapper = MossTTSLocalAttention(source)
-    x = torch.randn(2, 4, 6)
-
-    out = wrapper(x, input_lengths=torch.tensor([4, 4]))
-
-    assert source.streaming_sdpa_calls == 1
-    assert torch.allclose(out, source.out_proj(x + 2))
-
-
-def test_attention_keeps_streaming_flash_on_source_path() -> None:
-    source = _StreamingFlashAttention(hidden_size=6)
-    wrapper = MossTTSLocalAttention(source)
-
-    def fake_flash_attn(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_q: torch.Tensor,
-        cu_k: torch.Tensor,
-        max_q: int,
-        max_k: int,
-        *,
-        causal: bool,
-        window_size: tuple[int, int],
-    ) -> torch.Tensor:
-        raise AssertionError("streaming path must not call SGLang flash attention")
-
-    wrapper._flash_attn_varlen = fake_flash_attn
-    x = torch.randn(2, 4, 6)
-
-    out = wrapper(x, input_lengths=torch.tensor([4, 4]))
-
-    assert source.streaming_flash_calls == 0
-    assert torch.allclose(out, source.out_proj(x + 3))
-    assert out.shape == x.shape
 
 
 def test_transformer_layer_uses_source_modules_for_primitive_ops() -> None:
