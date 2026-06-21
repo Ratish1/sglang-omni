@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """MOSS-TTS Local non-streaming vocoder decoder with packed attention.
 
-The wrapper keeps the upstream codec embeddings, pretransform stages, streaming
-state, and waveform projection. It replaces only the non-streaming projected
-transformer attention path so decoder frames can run through SGLang's packed
-varlen FlashAttention.
+The wrapper keeps the upstream codec embeddings, pretransform stages, and
+waveform projection. It replaces only the non-streaming projected transformer
+attention path so decoder frames can run through SGLang's packed varlen
+FlashAttention.
 """
 
 from __future__ import annotations
@@ -207,18 +207,11 @@ class MossTTSLocalAttention(nn.Module):
         max_period = self.rope.max_period if self.rope is not None else 10000.0
         self._packed_rope_cache = _MossPackedRopeCache(max_period=max_period)
 
-    def resolve_attention_implementation(
-        self,
-        x: torch.Tensor,
-        *,
-        is_streaming: bool = False,
-    ) -> str:
+    def resolve_attention_implementation(self, x: torch.Tensor) -> str:
         backend = self.source.resolve_attention_implementation(
             x,
-            is_streaming=is_streaming,
+            is_streaming=False,
         )
-        if is_streaming:
-            return backend
         if (
             self.source.attention_implementation == "flash_attention_2"
             and self._can_run_packed_flash(x)
@@ -380,18 +373,12 @@ class MossTTSLocalTransformer(nn.Module):
 
     def resolve_attention_implementation(self, x: torch.Tensor) -> str:
         assert len(self.layers) > 0, "MOSS vocoder transformer must have layers"
-        return self.layers[0].self_attn.resolve_attention_implementation(
-            x,
-            is_streaming=False,
-        )
+        return self.layers[0].self_attn.resolve_attention_implementation(x)
 
     def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         if self.positional_embedding in {"sin", "sin_rope"}:
             if x.dim() == 3:
-                offsets = torch.zeros(1, dtype=torch.long, device=x.device)
-                positions = torch.arange(x.shape[1], device=x.device).view(
-                    1, -1
-                ) + offsets.view(-1, 1)
+                positions = torch.arange(x.shape[1], device=x.device).view(1, -1)
             else:
                 positions = kwargs.get("position_ids")
                 if positions is None:
