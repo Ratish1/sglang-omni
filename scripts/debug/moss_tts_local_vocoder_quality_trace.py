@@ -14,6 +14,7 @@ import argparse
 import json
 import math
 import sys
+import types
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -295,6 +296,18 @@ def _patch_attention_oracles(
 def _restore_attention_oracles(originals: list[tuple[Any, Any]]) -> None:
     for attn, original in originals:
         attn._flash_attn_varlen = original
+
+
+def _delegate_layer_forwards(decoder: torch.nn.Module) -> None:
+    for stage in decoder.stages:
+        if not hasattr(stage, "transformer"):
+            continue
+        for layer in stage.transformer.layers:
+
+            def forward(self: torch.nn.Module, x: torch.Tensor, **kwargs: Any) -> Any:
+                return self.source(x, **kwargs)
+
+            layer.forward = types.MethodType(forward, layer)
 
 
 def _make_oracle_flash_attn(
@@ -596,6 +609,8 @@ def run(args: argparse.Namespace) -> None:
         for module in candidate_decoder.modules():
             if isinstance(module, MossTTSLocalAttention):
                 module._can_run_packed_flash = lambda _: False  # type: ignore[method-assign]
+    if args.layer_body == "source":
+        _delegate_layer_forwards(candidate_decoder)
 
     dependencies = {
         "torch": torch.__version__,
@@ -603,6 +618,7 @@ def run(args: argparse.Namespace) -> None:
         "device": str(device),
         "model_path": args.model_path,
         "candidate_attention": args.candidate_attention,
+        "layer_body": args.layer_body,
     }
     results = []
     probe_inputs = []
@@ -728,6 +744,16 @@ def parse_args() -> argparse.Namespace:
         default="packed",
     )
     parser.add_argument(
+        "--layer-body",
+        choices=("owned", "source"),
+        default="owned",
+        help=(
+            "Debug-only isolation control. 'source' delegates transformer "
+            "layer bodies back to the upstream MOSS layer and requires "
+            "--candidate-attention sdpa."
+        ),
+    )
+    parser.add_argument(
         "--max-store-elements",
         type=int,
         default=2_000_000,
@@ -739,6 +765,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.skip_synthetic and not args.codes_pt:
         parser.error("--skip-synthetic requires at least one --codes-pt file")
+    if args.layer_body == "source" and args.candidate_attention != "sdpa":
+        parser.error("--layer-body source requires --candidate-attention sdpa")
     if args.probes is None:
         args.probes = [
             (1, 25),
