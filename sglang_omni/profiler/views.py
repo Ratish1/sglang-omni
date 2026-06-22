@@ -150,6 +150,7 @@ _STAGE_INTERVAL_EVENTS = (
     ("moss_vocoder_self_attn_start", "moss_vocoder_self_attn_end"),
     ("moss_vocoder_project_qkv_start", "moss_vocoder_project_qkv_end"),
     ("moss_vocoder_rope_start", "moss_vocoder_rope_end"),
+    ("moss_vocoder_qkv_contiguous_start", "moss_vocoder_qkv_contiguous_end"),
     ("moss_vocoder_flash_attn_start", "moss_vocoder_flash_attn_end"),
     ("moss_vocoder_attn_output_proj_start", "moss_vocoder_attn_output_proj_end"),
     ("moss_vocoder_attn_residual_start", "moss_vocoder_attn_residual_end"),

@@ -80,11 +80,12 @@ def _profile_interval(
     if not _PROFILE_ENABLED:
         yield
         return
-    _profile_event(f"{name}_start", metadata)
-    try:
-        yield
-    finally:
-        _profile_event(f"{name}_end", metadata)
+    with torch.profiler.record_function(name):
+        _profile_event(f"{name}_start", metadata)
+        try:
+            yield
+        finally:
+            _profile_event(f"{name}_end", metadata)
 
 
 class _SingleSequenceMetadataCache:
@@ -396,11 +397,15 @@ class MossTTSLocalAttention(nn.Module):
                 max_positions=max_seqlen,
             )
         assert self._flash_attn_varlen is not None
+        with _profile_interval("moss_vocoder_qkv_contiguous", metadata):
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
         with _profile_interval("moss_vocoder_flash_attn", metadata):
             out = self._flash_attn_varlen(
-                q.contiguous(),
-                k.contiguous(),
-                v.contiguous(),
+                q,
+                k,
+                v,
                 cu_seqlens,
                 cu_seqlens,
                 max_seqlen,
