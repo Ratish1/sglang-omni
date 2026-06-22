@@ -87,9 +87,10 @@ def _profile_interval(
         _profile_event(f"{name}_end", metadata)
 
 
-class _PositionIdsCache:
+class _SingleSequenceMetadataCache:
     def __init__(self) -> None:
-        self._items: dict[tuple[str, int | None], torch.Tensor] = {}
+        self._position_ids: dict[tuple[str, int | None], torch.Tensor] = {}
+        self._cu_seqlens: dict[tuple[str, int | None, int], torch.Tensor] = {}
 
     def get(
         self,
@@ -99,12 +100,16 @@ class _PositionIdsCache:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if max_seqlen <= 0:
             raise ValueError(f"max_seqlen must be positive, got {max_seqlen}")
-        key = (device.type, device.index)
-        position_ids = self._items.get(key)
+        device_key = (device.type, device.index)
+        position_ids = self._position_ids.get(device_key)
         if position_ids is None or position_ids.shape[0] < max_seqlen:
             position_ids = torch.arange(max_seqlen, device=device, dtype=torch.long)
-            self._items[key] = position_ids
-        cu_seqlens = torch.tensor([0, max_seqlen], dtype=torch.int32, device=device)
+            self._position_ids[device_key] = position_ids
+        cu_key = (*device_key, max_seqlen)
+        cu_seqlens = self._cu_seqlens.get(cu_key)
+        if cu_seqlens is None:
+            cu_seqlens = torch.tensor([0, max_seqlen], dtype=torch.int32, device=device)
+            self._cu_seqlens[cu_key] = cu_seqlens
         return cu_seqlens, position_ids[:max_seqlen]
 
 
@@ -124,12 +129,12 @@ def _pack_padded_sequence(
 
 def _pack_unpadded_sequence(
     x: torch.Tensor,
-    position_ids_cache: "_PositionIdsCache",
+    metadata_cache: "_SingleSequenceMetadataCache",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert x.shape[0] == 1, f"expected a single unpadded sequence, got {x.shape[0]}"
     _, max_seqlen, _ = x.shape
     packed_x = x.reshape(max_seqlen, x.shape[-1])
-    cu_seqlens, position_ids = position_ids_cache.get(
+    cu_seqlens, position_ids = metadata_cache.get(
         device=x.device,
         max_seqlen=max_seqlen,
     )
@@ -533,7 +538,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
             source.transformer,
             stage_index=self.stage_index,
         )
-        self._position_ids_cache = _PositionIdsCache()
+        self._metadata_cache = _SingleSequenceMetadataCache()
 
     def forward(
         self,
@@ -575,7 +580,7 @@ class MossTTSLocalProjectedTransformer(nn.Module):
                             packed_x, cu_seqlens, position_ids = (
                                 _pack_unpadded_sequence(
                                     x,
-                                    self._position_ids_cache,
+                                    self._metadata_cache,
                                 )
                             )
                             valid_mask = None
