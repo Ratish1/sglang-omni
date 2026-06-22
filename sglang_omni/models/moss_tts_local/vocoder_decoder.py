@@ -208,6 +208,7 @@ def _apply_cached_packed_rope(
     *,
     max_positions: int,
     cache: _MossPackedRopeCache,
+    metadata: Mapping[str, Any],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k.shape != q.shape:
         raise ValueError(
@@ -220,39 +221,45 @@ def _apply_cached_packed_rope(
     _, _, head_dim = q.shape
     if head_dim <= 0 or head_dim % 2 != 0:
         raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
-    cos_cache, sin_cache = cache.get(
-        device=q.device,
-        head_dim=head_dim,
-        max_positions=max_positions,
-    )
-    if position_ids.numel() == max_positions:
-        cos = cos_cache.view(max_positions, 1, head_dim // 2)
-        sin = sin_cache.view(max_positions, 1, head_dim // 2)
-    else:
-        cos = cos_cache.index_select(0, position_ids).view(
-            position_ids.numel(), 1, head_dim // 2
+    with _profile_interval("moss_vocoder_rope_cache", metadata):
+        cos_cache, sin_cache = cache.get(
+            device=q.device,
+            head_dim=head_dim,
+            max_positions=max_positions,
         )
-        sin = sin_cache.index_select(0, position_ids).view(
-            position_ids.numel(), 1, head_dim // 2
-        )
+    with _profile_interval("moss_vocoder_rope_select", metadata):
+        if position_ids.numel() == max_positions:
+            cos = cos_cache.view(max_positions, 1, head_dim // 2)
+            sin = sin_cache.view(max_positions, 1, head_dim // 2)
+        else:
+            cos = cos_cache.index_select(0, position_ids).view(
+                position_ids.numel(), 1, head_dim // 2
+            )
+            sin = sin_cache.index_select(0, position_ids).view(
+                position_ids.numel(), 1, head_dim // 2
+            )
 
     dims = q.shape[:-1]
-    q_pair = q.view(*dims, head_dim // 2, 2)
-    k_pair = k.view(*dims, head_dim // 2, 2)
-    qr, qi = q_pair[..., 0].float(), q_pair[..., 1].float()
-    kr, ki = k_pair[..., 0].float(), k_pair[..., 1].float()
+    with _profile_interval("moss_vocoder_rope_view", metadata):
+        q_pair = q.view(*dims, head_dim // 2, 2)
+        k_pair = k.view(*dims, head_dim // 2, 2)
+    with _profile_interval("moss_vocoder_rope_float", metadata):
+        qr, qi = q_pair[..., 0].float(), q_pair[..., 1].float()
+        kr, ki = k_pair[..., 0].float(), k_pair[..., 1].float()
 
-    qor = qr * cos - qi * sin
-    qoi = qr * sin + qi * cos
-    kor = kr * cos - ki * sin
-    koi = kr * sin + ki * cos
+    with _profile_interval("moss_vocoder_rope_rotate", metadata):
+        qor = qr * cos - qi * sin
+        qoi = qr * sin + qi * cos
+        kor = kr * cos - ki * sin
+        koi = kr * sin + ki * cos
 
-    q_out = torch.stack([qor.to(q.dtype), qoi.to(q.dtype)], dim=-1).view(
-        *dims, head_dim
-    )
-    k_out = torch.stack([kor.to(k.dtype), koi.to(k.dtype)], dim=-1).view(
-        *dims, head_dim
-    )
+    with _profile_interval("moss_vocoder_rope_stack", metadata):
+        q_out = torch.stack([qor.to(q.dtype), qoi.to(q.dtype)], dim=-1).view(
+            *dims, head_dim
+        )
+        k_out = torch.stack([kor.to(k.dtype), koi.to(k.dtype)], dim=-1).view(
+            *dims, head_dim
+        )
     return q_out, k_out
 
 
@@ -309,7 +316,16 @@ class MossTTSLocalAttention(nn.Module):
         position_ids: torch.Tensor | None = None,
         input_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        backend = self.resolve_attention_implementation(query)
+        metadata = {
+            "stage_index": self.stage_index,
+            "layer_index": self.layer_index,
+            "tokens": int(
+                query.shape[0] if query.dim() == 2 else query.shape[0] * query.shape[1]
+            ),
+            "hidden_size": int(query.shape[-1]),
+        }
+        with _profile_interval("moss_vocoder_attn_resolve_backend", metadata):
+            backend = self.resolve_attention_implementation(query)
         if backend == "flash_attention_2":
             if query.dim() != 2:
                 raise ValueError(
@@ -359,6 +375,7 @@ class MossTTSLocalAttention(nn.Module):
         position_ids: torch.Tensor,
         *,
         max_positions: int,
+        metadata: Mapping[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.rope is None:
             return q, k
@@ -368,6 +385,7 @@ class MossTTSLocalAttention(nn.Module):
             position_ids,
             max_positions=max_positions,
             cache=self._packed_rope_cache,
+            metadata=metadata,
         )
 
     def _forward_packed_flash(
@@ -395,12 +413,15 @@ class MossTTSLocalAttention(nn.Module):
                 k,
                 position_ids,
                 max_positions=max_seqlen,
+                metadata=metadata,
             )
         assert self._flash_attn_varlen is not None
         with _profile_interval("moss_vocoder_qkv_contiguous", metadata):
             q = q.contiguous()
             k = k.contiguous()
             v = v.contiguous()
+        with _profile_interval("moss_vocoder_flash_window", metadata):
+            window_size = self._flash_window_size()
         with _profile_interval("moss_vocoder_flash_attn", metadata):
             out = self._flash_attn_varlen(
                 q,
@@ -411,10 +432,12 @@ class MossTTSLocalAttention(nn.Module):
                 max_seqlen,
                 max_seqlen,
                 causal=self.causal,
-                window_size=self._flash_window_size(),
+                window_size=window_size,
             )
+        with _profile_interval("moss_vocoder_attn_output_reshape", metadata):
+            out = out.reshape(x.shape[0], self.embed_dim)
         with _profile_interval("moss_vocoder_attn_output_proj", metadata):
-            return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
+            return self.out_proj(out)
 
     def _flash_window_size(self) -> tuple[int, int]:
         if self.context is None or not self.causal:
@@ -467,7 +490,18 @@ class MossTTSLocalTransformerLayer(nn.Module):
             with _profile_interval("moss_vocoder_norm2", metadata):
                 x = self.norm2(x)
             with _profile_interval("moss_vocoder_ffn", metadata):
-                ffn_out = self.ffn(x)
+                if not _PROFILE_ENABLED:
+                    ffn_out = self.ffn(x)
+                else:
+                    with _profile_interval("moss_vocoder_ffn_linear_in", metadata):
+                        ffn_out = self.ffn[0](x)
+                    with _profile_interval("moss_vocoder_ffn_activation", metadata):
+                        ffn_out = self.ffn[1](ffn_out)
+                    with _profile_interval("moss_vocoder_ffn_linear_out", metadata):
+                        ffn_out = self.ffn[2](ffn_out)
+                    for extra_layer in self.ffn[3:]:
+                        with _profile_interval("moss_vocoder_ffn_extra", metadata):
+                            ffn_out = extra_layer(ffn_out)
             with _profile_interval("moss_vocoder_ffn_residual", metadata):
                 x = residual.to(x) + self.layer_scale_2(ffn_out)
             return x
