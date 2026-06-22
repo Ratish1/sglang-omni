@@ -447,11 +447,19 @@ class MossTTSLocalTransformerLayer(nn.Module):
         }
         with _profile_interval("moss_vocoder_layer", metadata):
             residual = x
-            x = self.norm1(x)
-            x = residual.to(x) + self.layer_scale_1(self.self_attn(x, **kwargs))
+            with _profile_interval("moss_vocoder_norm1", metadata):
+                x = self.norm1(x)
+            with _profile_interval("moss_vocoder_self_attn", metadata):
+                attn_out = self.self_attn(x, **kwargs)
+            with _profile_interval("moss_vocoder_attn_residual", metadata):
+                x = residual.to(x) + self.layer_scale_1(attn_out)
             residual = x
-            x = self.norm2(x)
-            x = residual.to(x) + self.layer_scale_2(self.ffn(x))
+            with _profile_interval("moss_vocoder_norm2", metadata):
+                x = self.norm2(x)
+            with _profile_interval("moss_vocoder_ffn", metadata):
+                ffn_out = self.ffn(x)
+            with _profile_interval("moss_vocoder_ffn_residual", metadata):
+                x = residual.to(x) + self.layer_scale_2(ffn_out)
             return x
 
 
