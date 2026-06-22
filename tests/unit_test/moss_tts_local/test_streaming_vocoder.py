@@ -716,7 +716,7 @@ def test_non_streaming_empty_audio_codes_skip_decode(monkeypatch) -> None:
 
     assert processor.decode_calls == 0
     assert processor.audio_tokenizer.decode_calls == 0
-    assert result.data["audio_codes"] is None
+    assert "audio_codes" not in result.data
     assert "audio_waveform" not in result.data
 
 

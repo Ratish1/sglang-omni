@@ -18,6 +18,17 @@ from sglang_omni.models.moss_tts_local.vocoder_decoder import (
 )
 
 
+def create_sin_embedding(
+    positions: torch.Tensor,
+    dim: int,
+    *,
+    max_period: float,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    del max_period
+    return torch.zeros(*positions.shape, dim, device=positions.device, dtype=dtype)
+
+
 class _FakeLayerScale(nn.Module):
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
