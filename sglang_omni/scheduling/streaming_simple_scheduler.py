@@ -18,7 +18,7 @@ import logging
 import queue as _queue_mod
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
@@ -29,6 +29,9 @@ _ABORTED_REQUEST_ID_LIMIT = 10000
 _ABORTED_REQUEST_ID_RETAINED = 5000
 _COMPLETED_NON_STREAMING_REQUEST_ID_LIMIT = 10000
 _COMPLETED_NON_STREAMING_REQUEST_ID_RETAINED = 5000
+_PROFILER_REQUEST_ID = "__profiler__"
+_PROFILER_CONTROL_TIMEOUT_S = 300.0
+_ProfilerCommand = Literal["profiler_start", "profiler_stop"]
 
 
 class StreamingSimpleScheduler:
@@ -99,6 +102,34 @@ class StreamingSimpleScheduler:
     def clear_stream_state(self, request_id: str) -> None:
         del request_id
 
+    def start_torch_profiler(self, trace_path_template: str, run_id: str) -> None:
+        self._enqueue_profiler_command(
+            "profiler_start",
+            {"trace_path_template": trace_path_template, "run_id": run_id},
+        )
+
+    def stop_torch_profiler(self, run_id: str | None = None) -> None:
+        self._enqueue_profiler_command("profiler_stop", {"run_id": run_id})
+
+    def _enqueue_profiler_command(
+        self, command: _ProfilerCommand, data: dict[str, Any]
+    ) -> None:
+        done = threading.Event()
+        payload = dict(data)
+        payload["done"] = done
+        payload["error"] = None
+        self.inbox.put(
+            IncomingMessage(
+                request_id=_PROFILER_REQUEST_ID,
+                type=command,
+                data=payload,
+            )
+        )
+        if not done.wait(timeout=_PROFILER_CONTROL_TIMEOUT_S):
+            raise TimeoutError(f"{self.__class__.__name__} {command} timed out")
+        if payload["error"] is not None:
+            raise payload["error"]
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -137,6 +168,12 @@ class StreamingSimpleScheduler:
     def _handle_message(
         self, msg: IncomingMessage, loop: asyncio.AbstractEventLoop
     ) -> None:
+        if msg.type == "profiler_start":
+            self._handle_profiler_start(msg.data)
+            return
+        if msg.type == "profiler_stop":
+            self._handle_profiler_stop(msg.data)
+            return
         if msg.type == "new_request":
             self._handle_new_request_batch(self._collect_new_request_batch(msg), loop)
             return
@@ -147,6 +184,36 @@ class StreamingSimpleScheduler:
             self._on_done(msg.request_id)
             return
         raise ValueError(f"Unsupported streaming scheduler message type: {msg.type}")
+
+    @staticmethod
+    def _handle_profiler_start(data: dict[str, Any]) -> None:
+        done = data["done"]
+        try:
+            from sglang_omni.profiler.torch_profiler import TorchProfiler
+
+            run_id = data["run_id"]
+            if not TorchProfiler.is_active():
+                TorchProfiler.start(data["trace_path_template"], run_id=run_id)
+        except BaseException as exc:
+            data["error"] = exc
+        finally:
+            done.set()
+
+    @staticmethod
+    def _handle_profiler_stop(data: dict[str, Any]) -> None:
+        done = data["done"]
+        try:
+            from sglang_omni.profiler.torch_profiler import TorchProfiler
+
+            run_id = data.get("run_id")
+            if TorchProfiler.is_active() and (
+                run_id is None or TorchProfiler.get_active_run_id() == run_id
+            ):
+                TorchProfiler.stop(run_id=run_id)
+        except BaseException as exc:
+            data["error"] = exc
+        finally:
+            done.set()
 
     def _next_message(self) -> IncomingMessage | None:
         if self._pending_messages:

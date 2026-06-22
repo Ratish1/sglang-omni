@@ -1328,13 +1328,17 @@ class Stage:
 
     def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id
-        if msg.enable_torch and not TorchProfiler.is_active():
+        if msg.enable_torch:
             base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
             template = f"{base_tpl}_pid{os.getpid()}"
             prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
             if prof_dir and not os.path.isabs(template):
                 template = os.path.join(prof_dir, template)
-            TorchProfiler.start(template, run_id=run_id)
+            scheduler_start = getattr(self.scheduler, "start_torch_profiler", None)
+            if callable(scheduler_start):
+                scheduler_start(template, run_id)
+            elif not TorchProfiler.is_active():
+                TorchProfiler.start(template, run_id=run_id)
         if msg.event_dir is not None:
             try:
                 _get_recorder().start(
@@ -1349,7 +1353,10 @@ class Stage:
 
     def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
         # run_id=None is a wildcard (stop whatever's active).
-        if TorchProfiler.is_active() and (
+        scheduler_stop = getattr(self.scheduler, "stop_torch_profiler", None)
+        if callable(scheduler_stop):
+            scheduler_stop(run_id=msg.run_id)
+        elif TorchProfiler.is_active() and (
             msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
         ):
             TorchProfiler.stop(run_id=msg.run_id)
