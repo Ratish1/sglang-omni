@@ -50,6 +50,18 @@ GPU_CATEGORIES = {
 }
 
 
+def _resolve_trace_paths(path: Path) -> list[Path]:
+    if path.is_dir():
+        return sorted(
+            [
+                *path.rglob("*.trace.json"),
+                *path.rglob("*.trace.json.gz"),
+            ]
+        )
+    matches = sorted(path.parent.glob(path.name))
+    return [match for match in matches if match.is_file()]
+
+
 def _load_trace(path: Path) -> list[dict[str, Any]]:
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8") as fp:
@@ -236,6 +248,7 @@ def format_markdown(summary: dict[str, Any]) -> str:
         )
     return (
         "# MOSS Vocoder Torch Trace Summary\n\n"
+        f"- trace files: `{len(summary.get('trace_files', []))}`\n"
         f"- trace events: `{summary['event_count']}`\n"
         f"- gpu/runtime events: `{summary['gpu_event_count']}`\n\n"
         f"- cpu op events: `{summary['cpu_op_event_count']}`\n\n"
@@ -277,8 +290,14 @@ def main() -> int:
     args = parse_args()
     scope_names = set(DEFAULT_SCOPES)
     scope_names.update(args.scope)
-    events = _load_trace(args.trace)
+    trace_paths = _resolve_trace_paths(args.trace)
+    if not trace_paths:
+        raise FileNotFoundError(f"no trace files matched {args.trace}")
+    events: list[dict[str, Any]] = []
+    for trace_path in trace_paths:
+        events.extend(_load_trace(trace_path))
     summary = build_summary(events, scope_names)
+    summary["trace_files"] = [str(path) for path in trace_paths]
     markdown = format_markdown(summary)
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)

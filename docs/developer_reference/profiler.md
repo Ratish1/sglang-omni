@@ -219,10 +219,15 @@ correlation.
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/start_profile` | `{"run_id": ?, "trace_path_template": ?, "event_dir": ?, "enable_torch": true \| false, "config": ?}` | Starts torch trace + event recorder. `run_id` auto-generated if omitted. |
-| POST | `/stop_profile` | `{"run_id": ?}` | Stops torch trace + event recorder. Omitting `run_id` is a wildcard ("stop whatever's active"). |
-| POST | `/start_request_profile` | `{"run_id": ?, "event_dir": ?}` | Event recorder only — no torch trace. Lower overhead; safer to leave on. |
-| POST | `/stop_request_profile` | `{"run_id": ?}` | Same wildcard semantics as `/stop_profile`. |
+| POST | `/start_profile` | `{"run_id": ?, "trace_path_template": ?, "event_dir": ?, "enable_torch": true \| false, "config": ?, "stages": ?}` | Starts torch trace + event recorder. `run_id` auto-generated if omitted. |
+| POST | `/stop_profile` | `{"run_id": ?, "stages": ?}` | Stops torch trace + event recorder. Omitting `run_id` is a wildcard ("stop whatever's active"). |
+| POST | `/start_request_profile` | `{"run_id": ?, "event_dir": ?, "stages": ?}` | Event recorder only — no torch trace. Lower overhead; safer to leave on. |
+| POST | `/stop_request_profile` | `{"run_id": ?, "stages": ?}` | Same wildcard semantics as `/stop_profile`. |
+
+`stages` is optional on profile start/stop requests. When set, only those
+pipeline stages receive the profiler control message. This is useful for
+torch traces, where tracing every process can produce large files and make it
+easy to inspect the wrong stage.
 
 Example: record cheap events on every request without a kernel trace:
 
