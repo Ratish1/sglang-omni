@@ -327,7 +327,12 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             )
         missing = [
             name
-            for name in ("streaming", "_set_streaming_exec_mask", "_decode_frame")
+            for name in (
+                "streaming",
+                "_set_streaming_exec_mask",
+                "_decode_frame",
+                "decode",
+            )
             if not hasattr(codec, name)
         ]
         if missing:
@@ -340,7 +345,6 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             f"MOSS-TTS Local non-streaming vocoder uses packed SGLang attention "
             f"stages={len(nonstream_decoder)}"
         )
-        self._processor = processor
         self._codec = codec
         self._nonstream_decoder = nonstream_decoder
         self._stream_slots = int(stream_slots)
@@ -788,22 +792,67 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             payload.data["usage"] = usage
         return payload
 
+    def _decode_codes_rows_nonstream(
+        self, codes_list: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        n_vq = self._n_vq
+        device = next(self._codec.parameters()).device
+        codes_channels_first = [
+            codes[:, :n_vq]
+            .transpose(0, 1)
+            .contiguous()
+            .to(device=device, dtype=torch.long)
+            for codes in codes_list
+        ]
+        max_len = max(int(codes.shape[1]) for codes in codes_channels_first)
+        audio_codes = torch.zeros(
+            n_vq,
+            len(codes_channels_first),
+            max_len,
+            device=device,
+            dtype=torch.long,
+        )
+        padding_mask = torch.zeros(
+            len(codes_channels_first), max_len, device=device, dtype=torch.bool
+        )
+        for index, codes in enumerate(codes_channels_first):
+            length = int(codes.shape[1])
+            audio_codes[:, index, :length] = codes
+            padding_mask[index, :length] = True
+
+        decoded = self._codec.decode(
+            audio_codes,
+            padding_mask=padding_mask,
+            num_quantizers=n_vq,
+            return_dict=True,
+            chunk_duration=None,
+        )
+        audio = decoded.audio
+        audio_lengths = decoded.audio_lengths
+        if audio is None or audio_lengths is None:
+            raise RuntimeError(
+                "audio_tokenizer.decode did not return audio/audio_lengths."
+            )
+        wavs = []
+        for index in range(int(audio.shape[0])):
+            length = int(audio_lengths[index].item())
+            wavs.append(
+                audio[index, :, :length].detach().to("cpu", torch.float32).contiguous()
+            )
+        return wavs
+
     def _decode_codes_rows(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """Decode ``[T, >=n_vq]`` row tensors to fp32 CPU waveforms."""
         with self._state_lock:
             self._close_idle_startup_session_locked()
         if self._session is None:
-            # Keep decode_audio_codes as the public codec path, but swap only the
-            # decoder module so non-streaming transformer attention uses packed
-            # SGLang FlashAttention. A live streaming session owns codec state, so
-            # it stays on the stateful session path below.
+            # The processor helper forces chunk_duration=8 and enters the
+            # tokenizer streaming loop. This decoder is non-streaming, so it must
+            # run through the tokenizer's full-sequence decode path.
             original_decoder = self._codec.decoder
             self._codec.decoder = self._nonstream_decoder
             try:
-                return [
-                    torch.as_tensor(wav).detach().to("cpu")
-                    for wav in self._processor.decode_audio_codes(codes_list)
-                ]
+                return self._decode_codes_rows_nonstream(codes_list)
             finally:
                 self._codec.decoder = original_decoder
         channels_first = [

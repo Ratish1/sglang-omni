@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 import sglang_omni.models.moss_tts_local.vocoder_decoder as vocoder_decoder
 from sglang_omni.models.moss_tts_local.vocoder_decoder import (
+    MossTTSLocalAttention,
     MossTTSLocalProjectedTransformer,
     MossTTSLocalTransformerLayer,
     MossTTSLocalVocoderDecoder,
@@ -25,13 +28,14 @@ class _FakeLayerScale(nn.Module):
 
 
 class _FakeAttention(nn.Module):
-    def __init__(self, hidden_size: int) -> None:
+    def __init__(self, hidden_size: int, *, num_heads: int = 2) -> None:
         super().__init__()
         self.embed_dim = hidden_size
-        self.num_heads = 2
+        self.num_heads = num_heads
         self.head_dim = hidden_size // self.num_heads
         self.causal = True
         self.context = 4
+        self.rope = None
         self.attention_implementation = "sdpa"
         self.in_proj = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -46,6 +50,29 @@ class _FakeAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, **_: object) -> torch.Tensor:
         return x
+
+
+class _ReferenceAttention(_FakeAttention):
+    def forward(self, x: torch.Tensor, *, input_lengths: torch.Tensor) -> torch.Tensor:
+        batch_size, max_seqlen, _ = x.shape
+        projected = self.in_proj(x).reshape(
+            batch_size, max_seqlen, 3, self.num_heads, self.head_dim
+        )
+        q, k, v = projected.permute(2, 0, 3, 1, 4)
+        positions = torch.arange(max_seqlen, device=x.device, dtype=torch.long)
+        valid_k = positions.view(1, 1, max_seqlen) < input_lengths.view(-1, 1, 1)
+        delta = positions.view(1, max_seqlen, 1) - positions.view(1, 1, max_seqlen)
+        attn_bias = (delta >= 0) & (delta < int(self.context))
+        attn_bias = (attn_bias & valid_k)[:, None, :, :]
+        out = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
+        valid_q = positions.view(1, max_seqlen) < input_lengths.view(-1, 1)
+        out = torch.where(
+            valid_q.view(batch_size, 1, max_seqlen, 1),
+            out,
+            torch.zeros((), device=x.device, dtype=x.dtype),
+        )
+        out = out.transpose(1, 2).reshape(batch_size, max_seqlen, self.embed_dim)
+        return self.out_proj(out)
 
 
 class _FakeLayer(nn.Module):
@@ -212,6 +239,91 @@ def test_projected_transformer_uses_sglang_packed_flash_path() -> None:
     assert torch.equal(out_lengths, lengths)
 
 
+def test_packed_flash_unavailable_uses_source_attention(monkeypatch) -> None:
+    monkeypatch.setattr(vocoder_decoder, "flash_attn_varlen_func", None)
+    source = _FallbackProjectedStage()
+    source.transformer.layers[0].self_attn.attention_implementation = (
+        "flash_attention_2"
+    )
+    wrapper = MossTTSLocalProjectedTransformer(source)
+    x = torch.randn(2, 3, 4)
+    lengths = torch.tensor([4, 3])
+
+    out, out_lengths = wrapper(x, lengths)
+
+    assert wrapper.transformer.layers[0].self_attn._flash_attn_varlen is None
+    assert source.seen_input_shape is None
+    assert out.shape == (2, 7, 4)
+    assert torch.equal(out_lengths, lengths)
+
+
+def test_projected_transformer_skips_flash_for_zero_valid_length(monkeypatch) -> None:
+    source = _FallbackProjectedStage()
+    source.transformer.layers[0].self_attn.attention_implementation = (
+        "flash_attention_2"
+    )
+    wrapper = MossTTSLocalProjectedTransformer(source)
+    attn = wrapper.transformer.layers[0].self_attn
+    attn._can_run_packed_flash = lambda _: True  # type: ignore[method-assign]
+
+    def fail_flash(*_: object, **__: object) -> None:
+        raise AssertionError("zero-length input must not call flash attention")
+
+    def fail_pack(*_: object) -> None:
+        raise AssertionError("zero-length input must not pack padded frames")
+
+    attn._flash_attn_varlen = fail_flash
+    monkeypatch.setattr(vocoder_decoder, "_pack_padded_sequence", fail_pack)
+    x = torch.randn(2, 3, 4)
+    lengths = torch.tensor([0, 0])
+
+    out, out_lengths = wrapper(x, lengths)
+
+    assert out.shape == (2, 7, 4)
+    assert torch.equal(out_lengths, lengths)
+
+
+@pytest.mark.parametrize(
+    ("context", "causal", "expected"),
+    [
+        (None, True, (-1, -1)),
+        (None, False, (-1, -1)),
+        (1, True, (0, 0)),
+        (4, True, (3, 0)),
+        (4, False, (-1, -1)),
+    ],
+)
+def test_flash_window_size_matches_moss_local_mask(
+    context: int | None, causal: bool, expected: tuple[int, int]
+) -> None:
+    source = _FakeAttention(hidden_size=6)
+    source.context = context
+    source.causal = causal
+    attn = MossTTSLocalAttention(source)
+
+    assert attn._flash_window_size() == expected
+
+
+def test_flash_window_size_keeps_same_keys_as_moss_mask() -> None:
+    context = 4
+    seqlen = 7
+    source = _FakeAttention(hidden_size=6)
+    source.context = context
+    attn = MossTTSLocalAttention(source)
+    left_window, right_window = attn._flash_window_size()
+    positions = torch.arange(seqlen)
+    moss_mask = (positions.view(seqlen, 1) - positions.view(1, seqlen) >= 0) & (
+        positions.view(seqlen, 1) - positions.view(1, seqlen) < context
+    )
+    flash_mask = torch.zeros_like(moss_mask)
+    for query_position in range(seqlen):
+        first_key = max(0, query_position - left_window)
+        last_key = min(seqlen - 1, query_position + right_window)
+        flash_mask[query_position, first_key : last_key + 1] = True
+
+    assert torch.equal(flash_mask, moss_mask)
+
+
 def test_projected_transformer_uses_single_unpadded_pack_fast_path(
     monkeypatch,
 ) -> None:
@@ -321,6 +433,39 @@ def test_projected_transformer_single_padded_input_uses_masked_pack() -> None:
     assert max_k == 2
     assert out.shape == (1, 7, 4)
     assert torch.equal(out_lengths, lengths)
+
+
+def test_sglang_packed_flash_matches_sdpa_reference_cuda() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if vocoder_decoder.flash_attn_varlen_func is None:
+        pytest.skip("requires SGLang flash_attn_varlen_func")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    source = _ReferenceAttention(hidden_size=128, num_heads=2).to(
+        device=device, dtype=torch.bfloat16
+    )
+    source.attention_implementation = "flash_attention_2"
+    wrapper = MossTTSLocalAttention(source)
+    x = torch.randn(2, 6, 128, device=device, dtype=torch.bfloat16)
+    input_lengths = torch.tensor([6, 4], device=device)
+
+    packed_x, valid_mask, cu_seqlens, position_ids = (
+        vocoder_decoder._pack_padded_sequence(x, input_lengths)
+    )
+    packed_out = wrapper(
+        packed_x,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=6,
+        position_ids=position_ids,
+    )
+    flash_out = vocoder_decoder._unpack_packed_sequence(
+        packed_out, valid_mask, batch_size=2, max_seqlen=6
+    )
+    sdpa_out = source(x, input_lengths=input_lengths)
+
+    torch.testing.assert_close(flash_out, sdpa_out, atol=4e-2, rtol=3e-2)
 
 
 def test_cached_packed_rope_matches_moss_interleaved_reference() -> None:

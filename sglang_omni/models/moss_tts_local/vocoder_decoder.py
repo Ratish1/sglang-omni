@@ -15,8 +15,12 @@ from collections.abc import Iterator
 from typing import Any
 
 import torch
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from torch import nn
+
+try:
+    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+except ImportError:
+    flash_attn_varlen_func = None
 
 
 class _PositionIdsCache:
@@ -216,6 +220,8 @@ class MossTTSLocalAttention(nn.Module):
         return self.source.resolve_attention_implementation(x, is_streaming=False)
 
     def _can_run_packed_flash(self, x: torch.Tensor) -> bool:
+        if self._flash_attn_varlen is None:
+            return False
         if x.device.type != "cuda":
             return False
         return self.source._get_backend_check_dtype(x) == torch.bfloat16
@@ -305,6 +311,7 @@ class MossTTSLocalAttention(nn.Module):
             position_ids,
             max_positions=max_seqlen,
         )
+        assert self._flash_attn_varlen is not None
         out = self._flash_attn_varlen(
             q.contiguous(),
             k.contiguous(),
