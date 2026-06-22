@@ -197,6 +197,24 @@ With all four off (the default), a typical 10-sample MMMU run produces a
 trace in the tens of MB. With all four on, the same workload can produce a
 multi-GB trace — only opt in when you need that specific information.
 
+### MOSS vocoder trace summary
+
+For MOSS-TTS Local vocoder work, the request profiler can identify hot
+`moss_vocoder_*` ranges while the torch trace shows the CUDA kernels inside
+those ranges. After stopping a torch profile, summarize the exported trace with:
+
+```bash
+scripts/debug/moss_vocoder_trace_summary.py \
+  /path/to/profile_rank0.trace.json.gz \
+  --md-out /path/to/moss_vocoder_trace_summary.md \
+  --json-out /path/to/moss_vocoder_trace_summary.json
+```
+
+The summary is a debug aid for deciding whether a range is compute-bound,
+memory/copy-bound, or launch/dispatch-heavy. Use Perfetto or Nsight when the
+timestamp-window summary points to a suspicious range that needs exact
+correlation.
+
 ## HTTP surface
 
 | Method | Path | Body | Notes |
