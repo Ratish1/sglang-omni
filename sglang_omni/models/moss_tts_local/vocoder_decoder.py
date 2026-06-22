@@ -18,15 +18,14 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 import torch
-from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
 from torch import nn
+
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 
 try:
     from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 except ImportError:
     flash_attn_varlen_func = None
-
-from sglang_omni.profiler.event_recorder import emit as _emit_event
 
 _PROFILE_ENABLED = os.environ.get("SGLANG_OMNI_MOSS_LOCAL_VOCODER_PROFILE") == "1"
 _PROFILE_REQUEST_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -159,7 +158,8 @@ class _MossPackedRopeCache:
         self.max_period = float(max_period)
         self._device: torch.device | None = None
         self._head_dim = 0
-        self._cos_sin: torch.Tensor | None = None
+        self._cos: torch.Tensor | None = None
+        self._sin: torch.Tensor | None = None
 
     def get(
         self,
@@ -167,18 +167,19 @@ class _MossPackedRopeCache:
         device: torch.device,
         head_dim: int,
         max_positions: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if max_positions <= 0:
             raise ValueError(f"max_positions must be positive, got {max_positions}")
         if head_dim <= 0 or head_dim % 2 != 0:
             raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
         if (
-            self._cos_sin is not None
+            self._cos is not None
+            and self._sin is not None
             and self._device == device
             and self._head_dim == head_dim
-            and self._cos_sin.shape[0] >= max_positions
+            and self._cos.shape[0] >= max_positions
         ):
-            return self._cos_sin[:max_positions]
+            return self._cos[:max_positions], self._sin[:max_positions]
 
         half_dim = head_dim // 2
         ds = torch.arange(half_dim, device=device, dtype=torch.float32)
@@ -189,8 +190,9 @@ class _MossPackedRopeCache:
         phase = positions * freqs.view(1, -1)
         self._device = device
         self._head_dim = head_dim
-        self._cos_sin = torch.cat((torch.cos(phase), torch.sin(phase)), dim=-1)
-        return self._cos_sin
+        self._cos = torch.cos(phase)
+        self._sin = torch.sin(phase)
+        return self._cos, self._sin
 
 
 def _apply_cached_packed_rope(
@@ -212,20 +214,40 @@ def _apply_cached_packed_rope(
     _, _, head_dim = q.shape
     if head_dim <= 0 or head_dim % 2 != 0:
         raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
-    cos_sin_cache = cache.get(
+    cos_cache, sin_cache = cache.get(
         device=q.device,
         head_dim=head_dim,
         max_positions=max_positions,
     )
-    apply_rope_with_cos_sin_cache_inplace(
-        q=q,
-        k=k,
-        cos_sin_cache=cos_sin_cache,
-        positions=position_ids,
-        is_neox=False,
-        rope_dim=head_dim,
+    if position_ids.numel() == max_positions:
+        cos = cos_cache.view(max_positions, 1, head_dim // 2)
+        sin = sin_cache.view(max_positions, 1, head_dim // 2)
+    else:
+        cos = cos_cache.index_select(0, position_ids).view(
+            position_ids.numel(), 1, head_dim // 2
+        )
+        sin = sin_cache.index_select(0, position_ids).view(
+            position_ids.numel(), 1, head_dim // 2
+        )
+
+    dims = q.shape[:-1]
+    q_pair = q.view(*dims, head_dim // 2, 2)
+    k_pair = k.view(*dims, head_dim // 2, 2)
+    qr, qi = q_pair[..., 0].float(), q_pair[..., 1].float()
+    kr, ki = k_pair[..., 0].float(), k_pair[..., 1].float()
+
+    qor = qr * cos - qi * sin
+    qoi = qr * sin + qi * cos
+    kor = kr * cos - ki * sin
+    koi = kr * sin + ki * cos
+
+    q_out = torch.stack([qor.to(q.dtype), qoi.to(q.dtype)], dim=-1).view(
+        *dims, head_dim
     )
-    return q, k
+    k_out = torch.stack([kor.to(k.dtype), koi.to(k.dtype)], dim=-1).view(
+        *dims, head_dim
+    )
+    return q_out, k_out
 
 
 class MossTTSLocalAttention(nn.Module):
