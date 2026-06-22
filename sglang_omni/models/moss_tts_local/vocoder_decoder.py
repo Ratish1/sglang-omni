@@ -18,6 +18,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 import torch
+from sglang.srt.utils import get_compiler_backend
 from torch import nn
 
 from sglang_omni.profiler.event_recorder import emit as _emit_event
@@ -159,6 +160,37 @@ def _unpack_unpadded_sequence(
     return packed_x.reshape(1, packed_x.shape[0], packed_x.shape[-1])
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def _apply_packed_rope_native_compiled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q_dtype = q.dtype
+    k_dtype = k.dtype
+    head_dim = q.shape[-1]
+    dims = q.shape[:-1]
+
+    q_pair = q.view(*dims, head_dim // 2, 2)
+    k_pair = k.view(*dims, head_dim // 2, 2)
+    qr, qi = q_pair[..., 0].float(), q_pair[..., 1].float()
+    kr, ki = k_pair[..., 0].float(), k_pair[..., 1].float()
+
+    qor = qr * cos - qi * sin
+    qoi = qr * sin + qi * cos
+    kor = kr * cos - ki * sin
+    koi = kr * sin + ki * cos
+
+    q_out = torch.stack([qor.to(q_dtype), qoi.to(q_dtype)], dim=-1).view(
+        *dims, head_dim
+    )
+    k_out = torch.stack([kor.to(k_dtype), koi.to(k_dtype)], dim=-1).view(
+        *dims, head_dim
+    )
+    return q_out, k_out
+
+
 class _MossPackedRopeCache:
     def __init__(self, *, max_period: float) -> None:
         self.max_period = float(max_period)
@@ -239,28 +271,8 @@ def _apply_cached_packed_rope(
                 position_ids.numel(), 1, head_dim // 2
             )
 
-    dims = q.shape[:-1]
-    with _profile_interval("moss_vocoder_rope_view", metadata):
-        q_pair = q.view(*dims, head_dim // 2, 2)
-        k_pair = k.view(*dims, head_dim // 2, 2)
-    with _profile_interval("moss_vocoder_rope_float", metadata):
-        qr, qi = q_pair[..., 0].float(), q_pair[..., 1].float()
-        kr, ki = k_pair[..., 0].float(), k_pair[..., 1].float()
-
-    with _profile_interval("moss_vocoder_rope_rotate", metadata):
-        qor = qr * cos - qi * sin
-        qoi = qr * sin + qi * cos
-        kor = kr * cos - ki * sin
-        koi = kr * sin + ki * cos
-
-    with _profile_interval("moss_vocoder_rope_stack", metadata):
-        q_out = torch.stack([qor.to(q.dtype), qoi.to(q.dtype)], dim=-1).view(
-            *dims, head_dim
-        )
-        k_out = torch.stack([kor.to(k.dtype), koi.to(k.dtype)], dim=-1).view(
-            *dims, head_dim
-        )
-    return q_out, k_out
+    with _profile_interval("moss_vocoder_rope_native_compiled", metadata):
+        return _apply_packed_rope_native_compiled(q, k, cos, sin)
 
 
 class MossTTSLocalAttention(nn.Module):

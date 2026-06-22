@@ -29,6 +29,7 @@ DEFAULT_SCOPES = (
     "moss_vocoder_rope_float",
     "moss_vocoder_rope_rotate",
     "moss_vocoder_rope_stack",
+    "moss_vocoder_rope_native_compiled",
     "moss_vocoder_qkv_contiguous",
     "moss_vocoder_flash_window",
     "moss_vocoder_flash_attn",
