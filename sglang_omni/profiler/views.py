@@ -140,6 +140,18 @@ _STAGE_INTERVAL_EVENTS = (
     ("scheduler_request_build_start", "scheduler_request_build_end"),
     ("scheduler_prefill_start", "stage_first_stream_chunk_sent"),
     ("scheduler_prefill_start", "scheduler_first_emit"),
+    ("moss_vocoder_decode_start", "moss_vocoder_decode_end"),
+    ("moss_vocoder_projected_stage_start", "moss_vocoder_projected_stage_end"),
+    ("moss_vocoder_stage_input_proj_start", "moss_vocoder_stage_input_proj_end"),
+    ("moss_vocoder_pack_start", "moss_vocoder_pack_end"),
+    ("moss_vocoder_transformer_start", "moss_vocoder_transformer_end"),
+    ("moss_vocoder_layer_start", "moss_vocoder_layer_end"),
+    ("moss_vocoder_project_qkv_start", "moss_vocoder_project_qkv_end"),
+    ("moss_vocoder_rope_start", "moss_vocoder_rope_end"),
+    ("moss_vocoder_flash_attn_start", "moss_vocoder_flash_attn_end"),
+    ("moss_vocoder_attn_output_proj_start", "moss_vocoder_attn_output_proj_end"),
+    ("moss_vocoder_unpack_start", "moss_vocoder_unpack_end"),
+    ("moss_vocoder_stage_output_proj_start", "moss_vocoder_stage_output_proj_end"),
 )
 
 

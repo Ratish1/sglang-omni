@@ -9,18 +9,82 @@ FlashAttention.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import importlib
 import math
-from collections.abc import Iterator
+import os
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import torch
 from torch import nn
 
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+
 try:
     from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 except ImportError:
     flash_attn_varlen_func = None
+
+_PROFILE_ENABLED = os.environ.get("SGLANG_OMNI_MOSS_LOCAL_VOCODER_PROFILE") == "1"
+_PROFILE_REQUEST_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "moss_vocoder_profile_request_id", default=None
+)
+_PROFILE_METADATA: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar("moss_vocoder_profile_metadata", default=None)
+)
+
+
+@contextlib.contextmanager
+def moss_vocoder_profile_scope(
+    request_id: str,
+    metadata: Mapping[str, Any] | None = None,
+) -> Iterator[None]:
+    if not _PROFILE_ENABLED:
+        yield
+        return
+    request_token = _PROFILE_REQUEST_ID.set(request_id)
+    metadata_token = _PROFILE_METADATA.set(dict(metadata) if metadata else {})
+    _profile_event("moss_vocoder_decode_start")
+    try:
+        yield
+    finally:
+        _profile_event("moss_vocoder_decode_end")
+        _PROFILE_METADATA.reset(metadata_token)
+        _PROFILE_REQUEST_ID.reset(request_token)
+
+
+def _profile_event(event_name: str, metadata: Mapping[str, Any] | None = None) -> None:
+    if not _PROFILE_ENABLED:
+        return
+    request_id = _PROFILE_REQUEST_ID.get()
+    if request_id is None:
+        return
+    merged = dict(_PROFILE_METADATA.get() or {})
+    if metadata:
+        merged.update(metadata)
+    _emit_event(
+        request_id=request_id,
+        stage=None,
+        event_name=event_name,
+        metadata=merged,
+    )
+
+
+@contextlib.contextmanager
+def _profile_interval(
+    name: str,
+    metadata: Mapping[str, Any] | None = None,
+) -> Iterator[None]:
+    if not _PROFILE_ENABLED:
+        yield
+        return
+    _profile_event(f"{name}_start", metadata)
+    try:
+        yield
+    finally:
+        _profile_event(f"{name}_end", metadata)
 
 
 class _PositionIdsCache:
@@ -189,9 +253,13 @@ def _apply_cached_packed_rope(
 class MossTTSLocalAttention(nn.Module):
     """MOSS local-causal self attention over dense or packed decoder frames."""
 
-    def __init__(self, source: nn.Module) -> None:
+    def __init__(
+        self, source: nn.Module, *, stage_index: int = -1, layer_index: int = -1
+    ) -> None:
         super().__init__()
         object.__setattr__(self, "source", source)
+        self.stage_index = int(stage_index)
+        self.layer_index = int(layer_index)
         self.in_proj = source.in_proj
         self.out_proj = source.out_proj
         self.embed_dim = int(source.embed_dim)
@@ -304,26 +372,39 @@ class MossTTSLocalAttention(nn.Module):
         max_seqlen: int,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        q, k, v = self._project_qkv(x)
-        q, k = self._apply_packed_rope(
-            q,
-            k,
-            position_ids,
-            max_positions=max_seqlen,
-        )
+        metadata = {
+            "stage_index": self.stage_index,
+            "layer_index": self.layer_index,
+            "tokens": int(x.shape[0]),
+            "heads": self.num_heads,
+            "head_dim": self.head_dim,
+            "max_seqlen": int(max_seqlen),
+            "context": self.context,
+        }
+        with _profile_interval("moss_vocoder_project_qkv", metadata):
+            q, k, v = self._project_qkv(x)
+        with _profile_interval("moss_vocoder_rope", metadata):
+            q, k = self._apply_packed_rope(
+                q,
+                k,
+                position_ids,
+                max_positions=max_seqlen,
+            )
         assert self._flash_attn_varlen is not None
-        out = self._flash_attn_varlen(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            causal=self.causal,
-            window_size=self._flash_window_size(),
-        )
-        return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
+        with _profile_interval("moss_vocoder_flash_attn", metadata):
+            out = self._flash_attn_varlen(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                causal=self.causal,
+                window_size=self._flash_window_size(),
+            )
+        with _profile_interval("moss_vocoder_attn_output_proj", metadata):
+            return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
 
     def _flash_window_size(self) -> tuple[int, int]:
         if self.context is None or not self.causal:
@@ -336,37 +417,60 @@ class MossTTSLocalAttention(nn.Module):
 class MossTTSLocalTransformerLayer(nn.Module):
     """One MOSS vocoder transformer layer."""
 
-    def __init__(self, source: nn.Module) -> None:
+    def __init__(
+        self, source: nn.Module, *, stage_index: int = -1, layer_index: int = -1
+    ) -> None:
         super().__init__()
         object.__setattr__(self, "source", source)
+        self.stage_index = int(stage_index)
+        self.layer_index = int(layer_index)
         self.norm1 = source.norm1
         self.norm2 = source.norm2
         self.layer_scale_1 = source.layer_scale_1
         self.layer_scale_2 = source.layer_scale_2
         self.ffn = source.ffn
-        self.self_attn = MossTTSLocalAttention(source.self_attn)
+        self.self_attn = MossTTSLocalAttention(
+            source.self_attn,
+            stage_index=self.stage_index,
+            layer_index=self.layer_index,
+        )
         assert (
             isinstance(self.ffn, nn.Sequential) and len(self.ffn) >= 3
         ), "MOSS vocoder transformer layer requires Linear-GELU-Linear FFN"
 
     def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        residual = x
-        x = self.norm1(x)
-        x = residual.to(x) + self.layer_scale_1(self.self_attn(x, **kwargs))
-        residual = x
-        x = self.norm2(x)
-        x = residual.to(x) + self.layer_scale_2(self.ffn(x))
-        return x
+        metadata = {
+            "stage_index": self.stage_index,
+            "layer_index": self.layer_index,
+            "tokens": int(x.shape[0] if x.dim() == 2 else x.shape[0] * x.shape[1]),
+            "hidden_size": int(x.shape[-1]),
+        }
+        with _profile_interval("moss_vocoder_layer", metadata):
+            residual = x
+            x = self.norm1(x)
+            x = residual.to(x) + self.layer_scale_1(self.self_attn(x, **kwargs))
+            residual = x
+            x = self.norm2(x)
+            x = residual.to(x) + self.layer_scale_2(self.ffn(x))
+            return x
 
 
 class MossTTSLocalTransformer(nn.Module):
     """MOSS vocoder transformer body."""
 
-    def __init__(self, source: nn.Module) -> None:
+    def __init__(self, source: nn.Module, *, stage_index: int = -1) -> None:
         super().__init__()
         object.__setattr__(self, "source", source)
+        self.stage_index = int(stage_index)
         self.layers = nn.ModuleList(
-            [MossTTSLocalTransformerLayer(layer) for layer in source.layers]
+            [
+                MossTTSLocalTransformerLayer(
+                    layer,
+                    stage_index=self.stage_index,
+                    layer_index=layer_index,
+                )
+                for layer_index, layer in enumerate(source.layers)
+            ]
         )
         self.positional_embedding = source.positional_embedding
         self.positional_scale = float(source.positional_scale)
@@ -379,37 +483,48 @@ class MossTTSLocalTransformer(nn.Module):
         return self.layers[0].self_attn.resolve_attention_implementation(x)
 
     def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        if self.positional_embedding in {"sin", "sin_rope"}:
-            if x.dim() == 3:
-                positions = torch.arange(x.shape[1], device=x.device).view(1, -1)
-            else:
-                positions = kwargs.get("position_ids")
-                if positions is None:
-                    raise ValueError(
-                        "packed transformer inputs require position_ids for "
-                        "sinusoidal embeddings"
-                    )
-            pos_emb = self._create_sin_embedding(
-                positions,
-                x.shape[-1],
-                max_period=self.max_period,
-                dtype=x.dtype,
-            )
-            x = x + self.positional_scale * pos_emb
-        for layer in self.layers:
-            x = layer(x, **kwargs)
-        return x
+        metadata = {
+            "stage_index": self.stage_index,
+            "tokens": int(x.shape[0] if x.dim() == 2 else x.shape[0] * x.shape[1]),
+            "hidden_size": int(x.shape[-1]),
+            "layers": len(self.layers),
+        }
+        with _profile_interval("moss_vocoder_transformer", metadata):
+            if self.positional_embedding in {"sin", "sin_rope"}:
+                if x.dim() == 3:
+                    positions = torch.arange(x.shape[1], device=x.device).view(1, -1)
+                else:
+                    positions = kwargs.get("position_ids")
+                    if positions is None:
+                        raise ValueError(
+                            "packed transformer inputs require position_ids for "
+                            "sinusoidal embeddings"
+                        )
+                pos_emb = self._create_sin_embedding(
+                    positions,
+                    x.shape[-1],
+                    max_period=self.max_period,
+                    dtype=x.dtype,
+                )
+                x = x + self.positional_scale * pos_emb
+            for layer in self.layers:
+                x = layer(x, **kwargs)
+            return x
 
 
 class MossTTSLocalProjectedTransformer(nn.Module):
     """Projected transformer decoder stage with the MOSS input/output layout."""
 
-    def __init__(self, source: nn.Module) -> None:
+    def __init__(self, source: nn.Module, *, stage_index: int = -1) -> None:
         super().__init__()
         object.__setattr__(self, "source", source)
+        self.stage_index = int(stage_index)
         self.input_proj = source.input_proj
         self.output_proj = source.output_proj
-        self.transformer = MossTTSLocalTransformer(source.transformer)
+        self.transformer = MossTTSLocalTransformer(
+            source.transformer,
+            stage_index=self.stage_index,
+        )
         self._position_ids_cache = _PositionIdsCache()
 
     def forward(
@@ -418,46 +533,71 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         input_lengths: torch.Tensor,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.input_proj(x.transpose(1, 2))
-        backend = self.transformer.resolve_attention_implementation(x)
-        if backend == "flash_attention_2":
-            batch_size, max_seqlen, _ = x.shape
-            max_valid_seqlen = int(input_lengths.max().item()) if max_seqlen else 0
-            if max_valid_seqlen == 0:
-                x = x.new_zeros(x.shape)
-            else:
-                is_unpadded_single = batch_size == 1 and max_valid_seqlen == max_seqlen
-                if is_unpadded_single:
-                    packed_x, cu_seqlens, position_ids = _pack_unpadded_sequence(
-                        x,
-                        self._position_ids_cache,
-                    )
-                    valid_mask = None
+        metadata = {
+            "stage_index": self.stage_index,
+            "batch_size": int(x.shape[0]),
+            "input_channels": int(x.shape[1]),
+            "max_frames": int(x.shape[2]),
+        }
+        with _profile_interval("moss_vocoder_projected_stage", metadata):
+            with _profile_interval("moss_vocoder_stage_input_proj", metadata):
+                x = self.input_proj(x.transpose(1, 2))
+            backend = self.transformer.resolve_attention_implementation(x)
+            if backend == "flash_attention_2":
+                batch_size, max_seqlen, _ = x.shape
+                max_valid_seqlen = int(input_lengths.max().item()) if max_seqlen else 0
+                pack_metadata = {
+                    **metadata,
+                    "max_seqlen": int(max_seqlen),
+                    "max_valid_seqlen": int(max_valid_seqlen),
+                    "pack_mode": (
+                        "single_unpadded"
+                        if batch_size == 1 and max_valid_seqlen == max_seqlen
+                        else "padded"
+                    ),
+                }
+                if max_valid_seqlen == 0:
+                    x = x.new_zeros(x.shape)
                 else:
-                    packed_x, valid_mask, cu_seqlens, position_ids = (
-                        _pack_padded_sequence(x, input_lengths)
+                    is_unpadded_single = (
+                        batch_size == 1 and max_valid_seqlen == max_seqlen
                     )
-                packed_x = self.transformer(
-                    packed_x,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_valid_seqlen,
-                    position_ids=position_ids,
-                    input_lengths=input_lengths,
-                    **kwargs,
-                )
-                x = (
-                    _unpack_unpadded_sequence(packed_x)
-                    if valid_mask is None
-                    else _unpack_packed_sequence(
+                    with _profile_interval("moss_vocoder_pack", pack_metadata):
+                        if is_unpadded_single:
+                            packed_x, cu_seqlens, position_ids = (
+                                _pack_unpadded_sequence(
+                                    x,
+                                    self._position_ids_cache,
+                                )
+                            )
+                            valid_mask = None
+                        else:
+                            packed_x, valid_mask, cu_seqlens, position_ids = (
+                                _pack_padded_sequence(x, input_lengths)
+                            )
+                    packed_x = self.transformer(
                         packed_x,
-                        valid_mask,
-                        batch_size,
-                        max_seqlen,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_valid_seqlen,
+                        position_ids=position_ids,
+                        input_lengths=input_lengths,
+                        **kwargs,
                     )
-                )
-        else:
-            x = self.transformer(x, input_lengths=input_lengths, **kwargs)
-        return self.output_proj(x).transpose(1, 2), input_lengths
+                    with _profile_interval("moss_vocoder_unpack", pack_metadata):
+                        x = (
+                            _unpack_unpadded_sequence(packed_x)
+                            if valid_mask is None
+                            else _unpack_packed_sequence(
+                                packed_x,
+                                valid_mask,
+                                batch_size,
+                                max_seqlen,
+                            )
+                        )
+            else:
+                x = self.transformer(x, input_lengths=input_lengths, **kwargs)
+            with _profile_interval("moss_vocoder_stage_output_proj", metadata):
+                return self.output_proj(x).transpose(1, 2), input_lengths
 
 
 class MossTTSLocalVocoderDecoder(nn.Module):
@@ -468,14 +608,17 @@ class MossTTSLocalVocoderDecoder(nn.Module):
         source_stages = list(source)
         assert source_stages, "MOSS vocoder decoder must be a non-empty stage list"
         self.stages = nn.ModuleList(
-            [self._wrap_stage(stage) for stage in source_stages]
+            [
+                self._wrap_stage(stage, stage_index=stage_index)
+                for stage_index, stage in enumerate(source_stages)
+            ]
         )
 
     @staticmethod
-    def _wrap_stage(stage: nn.Module) -> nn.Module:
+    def _wrap_stage(stage: nn.Module, *, stage_index: int) -> nn.Module:
         module_type = stage.module_type
         if module_type == "Transformer":
-            return MossTTSLocalProjectedTransformer(stage)
+            return MossTTSLocalProjectedTransformer(stage, stage_index=stage_index)
         if module_type == "PatchedPretransform":
             return stage
         raise ValueError(

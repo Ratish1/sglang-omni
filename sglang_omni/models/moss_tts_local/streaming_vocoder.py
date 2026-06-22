@@ -17,7 +17,10 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
-from sglang_omni.models.moss_tts_local.vocoder_decoder import MossTTSLocalVocoderDecoder
+from sglang_omni.models.moss_tts_local.vocoder_decoder import (
+    MossTTSLocalVocoderDecoder,
+    moss_vocoder_profile_scope,
+)
 from sglang_omni.models.tts_streaming import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     resolve_initial_codec_chunk_frames,
@@ -869,7 +872,23 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
     def _vocode_batch(self, payloads: list[StagePayload]) -> list[StagePayload]:
         prepared = [self._prepare_codes(payload) for payload in payloads]
         codes_list = [codes for _, codes in prepared if codes is not None]
-        decoded = iter(self._decode_codes_rows(codes_list)) if codes_list else iter(())
+        if codes_list:
+            request_ids = [
+                payload.request_id
+                for payload, (_, codes) in zip(payloads, prepared)
+                if codes is not None
+            ]
+            frame_counts = [int(codes.shape[0]) for codes in codes_list]
+            metadata = {
+                "request_count": len(request_ids),
+                "total_frames": sum(frame_counts),
+                "max_frames": max(frame_counts),
+                "min_frames": min(frame_counts),
+            }
+            with moss_vocoder_profile_scope(request_ids[0], metadata):
+                decoded = iter(self._decode_codes_rows(codes_list))
+        else:
+            decoded = iter(())
         results = []
         for payload, (state, codes) in zip(payloads, prepared):
             if codes is None:
