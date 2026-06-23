@@ -146,3 +146,27 @@ python tmp/moss_local_codec_debug/trace_batch_encode_first_mismatch.py \
 
 If cuDNN SDPA fails on the host, use the same in-process
 `torch.backends.cuda.enable_cudnn_sdp(False)` wrapper as above.
+
+Then run the fp32 precision-control variant:
+
+```bash
+python tmp/moss_local_codec_debug/trace_batch_encode_first_mismatch.py \
+  --sample-ids \
+    common_voice_en_628642-common_voice_en_628644 \
+    common_voice_en_25748530-common_voice_en_25748532 \
+    common_voice_en_20005340-common_voice_en_20005341 \
+    common_voice_en_19599129-common_voice_en_19599130 \
+  --trace-sample-id common_voice_en_25748530-common_voice_en_25748532 \
+  --codec-weight-dtype fp32 \
+  --compute-dtype fp32 \
+  --disable-tf32 \
+  --out /data/moss_local_codec_batch_sensitivity_trace_fp32
+```
+
+Decision:
+
+- If the default trace diverges at a linear projection but the fp32 trace
+  collapses or greatly shrinks, the mechanism is batch-shape-dependent BF16 GEMM
+  variance amplified by hard quantization.
+- If the fp32 trace still diverges at comparable scale, continue into padding
+  mask, transformer, or quantizer semantics.

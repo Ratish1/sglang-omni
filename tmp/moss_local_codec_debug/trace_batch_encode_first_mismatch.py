@@ -39,15 +39,26 @@ class TensorRecord:
     tensor: torch.Tensor
 
 
-def _load_processor_with_codec(model_path: str, device: str) -> Any:
+def _load_processor_with_codec(
+    model_path: str,
+    device: str,
+    *,
+    codec_weight_dtype: str | None,
+    compute_dtype: str | None,
+) -> Any:
     checkpoint_dir = resolve_moss_checkpoint(model_path)
     with moss_transformers_processor_compat():
         processor_cls = load_moss_processor_class(checkpoint_dir)
+        kwargs: dict[str, Any] = {"trust_remote_code": True}
+        if codec_weight_dtype is not None:
+            kwargs["codec_weight_dtype"] = codec_weight_dtype
         processor = processor_cls.from_pretrained(
             checkpoint_dir,
-            trust_remote_code=True,
+            **kwargs,
         )
     _normalize_processor_config(processor)
+    if compute_dtype is not None:
+        processor.audio_tokenizer.set_compute_dtype(compute_dtype)
     processor.audio_tokenizer.eval()
     processor.audio_tokenizer.to(device)
     return processor
@@ -356,13 +367,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--n-vq", type=int, default=None)
     parser.add_argument("--max-records", type=int, default=20000)
+    parser.add_argument(
+        "--codec-weight-dtype",
+        choices=["bf16", "fp32"],
+        default=None,
+        help="Override the upstream processor codec load dtype for debug only.",
+    )
+    parser.add_argument(
+        "--compute-dtype",
+        choices=["bf16", "fp32"],
+        default=None,
+        help="Override codec autocast compute dtype for debug only.",
+    )
+    parser.add_argument(
+        "--disable-tf32",
+        action="store_true",
+        help="Disable TF32 matmul/cudnn for fp32 precision-control runs.",
+    )
     parser.add_argument("--out", required=True)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    processor = _load_processor_with_codec(args.model, args.device)
+    if args.disable_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+    processor = _load_processor_with_codec(
+        args.model,
+        args.device,
+        codec_weight_dtype=args.codec_weight_dtype,
+        compute_dtype=args.compute_dtype,
+    )
     n_vq = int(args.n_vq or processor.model_config.n_vq)
     cases = _cases_from_meta(args.meta, args.sample_ids, args.max_samples, args.lang)
     sample_ids = [case.sample_id for case in cases]
@@ -414,6 +451,8 @@ def main() -> None:
         "model": args.model,
         "device": args.device,
         "n_vq": n_vq,
+        "codec_dtype_summary": processor.audio_tokenizer.get_codec_dtype_summary(),
+        "disable_tf32": bool(args.disable_tf32),
         "trace_sample_id": args.trace_sample_id,
         "cases": [case.__dict__ for case in cases],
         "prepared_comparisons": prepared_comparisons,
