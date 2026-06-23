@@ -131,6 +131,7 @@ class MossTTSLocalAudioTokenizer:
 
     @staticmethod
     def _loudness_normalize(wav: torch.Tensor) -> torch.Tensor:
+        wav = wav.to(torch.float32)
         if wav.numel() == 0:
             return wav
         current_dbfs = 10.0 * torch.log10(torch.mean(wav**2) + 1e-9)

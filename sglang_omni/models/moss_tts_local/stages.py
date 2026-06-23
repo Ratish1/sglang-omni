@@ -212,6 +212,22 @@ def _load_moss_tts_local_processor(model_path: str) -> Any:
     return processor
 
 
+def _resolve_audio_tokenizer_model_path(
+    processor: Any,
+    codec_model_path: str | None,
+) -> str:
+    if codec_model_path is not None:
+        return codec_model_path
+    return str(
+        getattr(
+            processor.model_config,
+            "audio_tokenizer_name_or_path",
+            DEFAULT_MOSS_TTS_LOCAL_AUDIO_TOKENIZER,
+        )
+        or DEFAULT_MOSS_TTS_LOCAL_AUDIO_TOKENIZER
+    )
+
+
 class _BatchedReferenceEncoder:
     """Coalesces concurrent reference-audio encodes into batched codec calls.
 
@@ -544,7 +560,7 @@ def create_preprocessing_executor(
     *,
     device: str | None = None,
     gpu_id: int | None = None,
-    codec_model_path: str = DEFAULT_MOSS_TTS_LOCAL_AUDIO_TOKENIZER,
+    codec_model_path: str | None = None,
     max_concurrency: int = 16,
     encode_batch_size: int = 8,
     encode_batch_wait_ms: int = 4,
@@ -566,7 +582,7 @@ def create_preprocessing_executor(
     device = _resolve_codec_device(device, gpu_id)
     processor = _load_moss_tts_local_processor(model_path)
     audio_tokenizer = load_moss_tts_local_audio_tokenizer(
-        codec_model_path,
+        _resolve_audio_tokenizer_model_path(processor, codec_model_path),
         device=device,
     )
     reference_encoder: Any = _BatchedReferenceEncoder(
@@ -760,7 +776,7 @@ def create_vocoder_executor(
     *,
     device: str | None = None,
     gpu_id: int | None = None,
-    codec_model_path: str = DEFAULT_MOSS_TTS_LOCAL_AUDIO_TOKENIZER,
+    codec_model_path: str | None = None,
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
     stream_slots: int = 8,
@@ -773,7 +789,7 @@ def create_vocoder_executor(
     device = _resolve_codec_device(device, gpu_id)
     processor = _load_moss_tts_local_processor(model_path)
     audio_tokenizer = load_moss_tts_local_audio_tokenizer(
-        codec_model_path,
+        _resolve_audio_tokenizer_model_path(processor, codec_model_path),
         device=device,
     )
     scheduler = MossTTSLocalStreamingVocoderScheduler(

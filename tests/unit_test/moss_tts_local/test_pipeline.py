@@ -675,6 +675,38 @@ def test_create_preprocessing_executor_env_toggle(monkeypatch):
     assert rb._PREPROCESSING_CONTEXT.reference_encoder._cache.max_size == 8192
 
 
+def test_create_preprocessing_executor_uses_model_config_codec_path(monkeypatch):
+    from sglang_omni.models.moss_tts_local import stages
+
+    class _FakeAudioTokenizer:
+        def encode_paths(self, paths, *, num_quantizers):
+            return []
+
+    processor = _FakeProcessor()
+    processor.model_config = types.SimpleNamespace(
+        n_vq=N_VQ,
+        audio_tokenizer_name_or_path="codec-from-model-config",
+    )
+    loaded_codec_paths = []
+
+    def fake_load_audio_tokenizer(model_path, *, device):
+        loaded_codec_paths.append(model_path)
+        return _FakeAudioTokenizer()
+
+    monkeypatch.setattr(
+        stages, "_load_moss_tts_local_processor", lambda model_path: processor
+    )
+    monkeypatch.setattr(
+        stages,
+        "load_moss_tts_local_audio_tokenizer",
+        fake_load_audio_tokenizer,
+    )
+
+    stages.create_preprocessing_executor("model", device="cpu")
+
+    assert loaded_codec_paths == ["codec-from-model-config"]
+
+
 def test_preprocess_and_result_adapter():
     set_moss_tts_local_preprocessing_context(processor=_FakeProcessor())
     try:

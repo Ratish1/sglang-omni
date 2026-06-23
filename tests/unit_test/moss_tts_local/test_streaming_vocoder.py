@@ -1004,6 +1004,32 @@ def test_create_vocoder_executor_uses_separate_codec(monkeypatch) -> None:
     )
 
 
+def test_create_vocoder_executor_uses_model_config_codec_path(monkeypatch) -> None:
+    processor = FakeProcessor()
+    processor.model_config.audio_tokenizer_name_or_path = "codec-from-model-config"
+    codec = FakeCodec()
+    loaded_codec_paths = []
+
+    def fake_load_audio_tokenizer(model_path, *, device):
+        loaded_codec_paths.append(model_path)
+        return SimpleNamespace(model=codec, sample_rate=SAMPLE_RATE)
+
+    monkeypatch.setattr(
+        stages,
+        "_load_moss_tts_local_processor",
+        lambda model_path: processor,
+    )
+    monkeypatch.setattr(
+        stages,
+        "load_moss_tts_local_audio_tokenizer",
+        fake_load_audio_tokenizer,
+    )
+
+    stages.create_vocoder_executor("fake-model", device="cpu")
+
+    assert loaded_codec_paths == ["codec-from-model-config"]
+
+
 def test_pipeline_config_injects_cuda_graph_into_vocoder_factory_args() -> None:
     from sglang_omni.models.moss_tts_local.config import (
         MossTTSLocalPipelineConfig,
