@@ -176,6 +176,17 @@ def test_dots_tts_legacy_latent_scheduler_is_not_exported() -> None:
     assert "DotsTTSLatentScheduler" not in stages.__all__
 
 
+def test_dots_tts_full_runtime_engine_is_not_exported() -> None:
+    from sglang_omni.models.dots_tts import stages
+
+    assert not hasattr(stages, "DotsTTSEngine")
+    assert not hasattr(stages, "create_tts_engine_executor")
+    assert not hasattr(stages, "create_dots_tts_engine_executor")
+    assert "DotsTTSEngine" not in stages.__all__
+    assert "create_tts_engine_executor" not in stages.__all__
+    assert "create_dots_tts_engine_executor" not in stages.__all__
+
+
 def test_dots_tts_vocoder_scheduler_streams_audio_chunks_and_finalizes() -> None:
     from sglang_omni.models.dots_tts.stages import DotsTTSVocoderScheduler
 
@@ -233,127 +244,6 @@ def test_dots_tts_vocoder_scheduler_streams_audio_chunks_and_finalizes() -> None
     assert messages[2].data.data == {"modality": "audio", "sample_rate": 48000}
     assert calls[0][0] == "step"
     assert calls[1][0] == "flush"
-
-
-def test_dots_tts_engine_invokes_runtime_and_returns_audio_payload() -> None:
-    from sglang_omni.models.dots_tts.stages import DotsTTSEngine
-
-    calls = []
-
-    class FakeRuntime:
-        sample_rate = 48000
-
-        def __init__(self) -> None:
-            self.max_generate_length = 500
-
-        def generate(self, **kwargs):
-            calls.append(kwargs)
-            return {
-                "audio": np.asarray([0.0, 0.25, -0.5], dtype=np.float32),
-                "sample_rate": 48000,
-                "time_used": 0.5,
-                "rtf": 0.25,
-                "profiling": None,
-            }
-
-    engine = DotsTTSEngine(
-        runtime=FakeRuntime(),
-        lock_runtime_max_generate_length=True,
-    )
-    payload = make_payload(
-        inputs="hello",
-        params={"temperature": 0.7},
-        tts_params={
-            "ref_audio": "ref.wav",
-            "ref_text": "hi",
-            "language": "auto_detect",
-        },
-    )
-    payload.data = {
-        "text": "hello",
-        "prompt_audio_path": "ref.wav",
-        "prompt_text": "hi",
-        "language": "auto_detect",
-        "template_name": "tts",
-        "speaker_scale": 1.5,
-        "ode_method": "euler",
-        "num_steps": 10,
-        "guidance_scale": 1.2,
-        "normalize_text": False,
-        "profile_inference": False,
-        "max_generate_length": 64,
-        "seed": None,
-        "stream": False,
-    }
-
-    result = engine(payload)
-
-    assert calls == [
-        {
-            "text": "hello",
-            "prompt_audio_path": "ref.wav",
-            "prompt_text": "hi",
-            "template_name": "tts",
-            "language": "auto_detect",
-            "speaker_scale": 1.5,
-            "ode_method": "euler",
-            "num_steps": 10,
-            "guidance_scale": 1.2,
-            "normalize_text": False,
-            "profile_inference": False,
-        }
-    ]
-    assert result.data["modality"] == "audio"
-    assert result.data["sample_rate"] == 48000
-    assert result.data["usage"]["engine_time_s"] == 0.5
-    assert result.data["usage"]["rtf"] == 0.25
-    assert np.frombuffer(result.data["audio_waveform"], dtype=np.float32).tolist() == [
-        0.0,
-        0.25,
-        -0.5,
-    ]
-    assert result.data["state"]["max_generate_length"] == 64
-
-
-def test_dots_tts_stage_factory_loads_runtime(monkeypatch) -> None:
-    from sglang_omni.models.dots_tts import stages
-
-    loaded = {}
-
-    class FakeRuntimeClass:
-        @classmethod
-        def from_pretrained(cls, model_path, **kwargs):
-            loaded["model_path"] = model_path
-            loaded["kwargs"] = kwargs
-            return SimpleNamespace(max_generate_length=kwargs["max_generate_length"])
-
-    monkeypatch.setattr(stages, "_load_dots_tts_runtime_class", lambda: FakeRuntimeClass)
-
-    scheduler = stages.create_tts_engine_executor(
-        "rednote-hilab/dots.tts-base",
-        precision="float32",
-        optimize=True,
-        max_generate_length=32,
-    )
-
-    assert scheduler is not None
-    assert loaded == {
-        "model_path": "rednote-hilab/dots.tts-base",
-        "kwargs": {
-            "precision": "float32",
-            "optimize": True,
-            "max_generate_length": 32,
-        },
-    }
-
-
-def test_dots_tts_runtime_loader_is_native() -> None:
-    pytest.importorskip("torchdiffeq")
-    from sglang_omni.models.dots_tts import stages
-
-    runtime_cls = stages._load_dots_tts_runtime_class()
-
-    assert runtime_cls.__module__.startswith("sglang_omni.models.dots_tts.native")
 
 
 def test_dots_tts_sglang_native_interfaces_import() -> None:
@@ -467,13 +357,6 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
     )
     monkeypatch.setattr(
         stages,
-        "_get_or_load_runtime",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("SGLang latent engine must not load full dots runtime")
-        ),
-    )
-    monkeypatch.setattr(
-        stages,
         "_get_or_load_side_runtime",
         lambda *args, **kwargs: (fake_side_runtime, object()),
         raising=False,
@@ -499,7 +382,18 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
     assert fake_model.attached_model is fake_side_runtime.model
     assert fake_model.attached_precision == "bfloat16"
     assert fake_model.native_adapter.runtime is fake_side_runtime
+    assert captured["server_args_call"][2]["max_running_requests"] == 1
     assert captured["scheduler_kwargs"]["model_runner"]._outbox is scheduler.outbox
+
+
+def test_create_sglang_latent_engine_rejects_concurrent_requests() -> None:
+    from sglang_omni.models.dots_tts import stages
+
+    with pytest.raises(ValueError, match="max_running_requests=1"):
+        stages.create_sglang_latent_engine_executor(
+            "dots-model",
+            server_args_overrides={"max_running_requests": 2},
+        )
 
 
 def test_dots_tts_model_runner_runs_model_audio_step() -> None:
@@ -566,7 +460,6 @@ def test_dots_tts_sglang_model_has_no_runtime_latent_stepper(monkeypatch) -> Non
 def test_dots_tts_native_stage_factories_cache_by_stage(monkeypatch) -> None:
     from sglang_omni.models.dots_tts import stages
 
-    stages._RUNTIME_CACHE.clear()
     stages._VOCODER_RUNTIME_CACHE.clear()
     vocoder_loads = []
 

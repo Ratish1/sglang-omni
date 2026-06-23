@@ -6,10 +6,8 @@ from __future__ import annotations
 import logging
 import hashlib
 import threading
-import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import torch
 
@@ -36,7 +34,7 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 _DOTS_TTS_INSTALL_HINT = (
-    "dots.tts native support requires the optional dots inference dependencies "
+    "dots.tts native support requires the dots inference dependencies "
     "to be installed in the serving environment."
 )
 _RUNTIME_TEMPLATE_NAMES = {
@@ -45,21 +43,11 @@ _RUNTIME_TEMPLATE_NAMES = {
     "text_to_audio",
     "tts_interleave",
 }
-_RUNTIME_CACHE: dict[tuple[Any, ...], tuple[Any, threading.RLock]] = {}
-_RUNTIME_CACHE_LOCK = threading.Lock()
 _SIDE_RUNTIME_CACHE: dict[tuple[Any, ...], tuple[Any, threading.RLock]] = {}
 _SIDE_RUNTIME_CACHE_LOCK = threading.Lock()
 _VOCODER_RUNTIME_CACHE: dict[tuple[Any, ...], tuple[Any, threading.RLock]] = {}
 _VOCODER_RUNTIME_CACHE_LOCK = threading.Lock()
 _SGLANG_VIEW_ROOT = Path("/tmp/sglang_omni_dots_tts_llm_views")
-
-
-def _load_dots_tts_runtime_class():
-    try:
-        from sglang_omni.models.dots_tts.native.runtime import DotsTtsRuntime
-    except ImportError as exc:
-        raise RuntimeError(_DOTS_TTS_INSTALL_HINT) from exc
-    return DotsTtsRuntime
 
 
 def _ensure_sglang_llm_checkpoint_view(model_path: str) -> str:
@@ -101,51 +89,6 @@ def _runtime_cache_key(
         cache_dir,
         revision,
     )
-
-
-def _get_or_load_runtime(
-    model_path: str,
-    *,
-    precision: str,
-    optimize: bool,
-    max_generate_length: int,
-    cache_dir: str | None = None,
-    revision: str | None = None,
-) -> tuple[Any, threading.RLock]:
-    """Load one dots.tts runtime per process/config.
-
-    The default dots.tts pipeline colocates latent generation and AudioVAE in a
-    single process. Caching prevents those two stages from each loading a full
-    copy of the model. The paired lock serializes access because upstream
-    ``DotsTtsModel`` keeps mutable per-request decode workspaces and caches.
-    """
-
-    key = _runtime_cache_key(
-        model_path,
-        precision=precision,
-        optimize=optimize,
-        max_generate_length=max_generate_length,
-        cache_dir=cache_dir,
-        revision=revision,
-    )
-    with _RUNTIME_CACHE_LOCK:
-        cached = _RUNTIME_CACHE.get(key)
-        if cached is not None:
-            return cached
-
-        runtime_cls = _load_dots_tts_runtime_class()
-        runtime_kwargs: dict[str, Any] = {
-            "precision": precision,
-            "optimize": bool(optimize),
-            "max_generate_length": int(max_generate_length),
-        }
-        if cache_dir is not None:
-            runtime_kwargs["cache_dir"] = cache_dir
-        if revision is not None:
-            runtime_kwargs["revision"] = revision
-        runtime = runtime_cls.from_pretrained(model_path, **runtime_kwargs)
-        cached = (runtime, threading.RLock())
-        return _RUNTIME_CACHE.setdefault(key, cached)
 
 
 def _get_or_load_side_runtime(
@@ -394,114 +337,6 @@ def preprocess_dots_tts_payload(payload: StagePayload) -> StagePayload:
     return payload
 
 
-@contextmanager
-def _temporary_runtime_max_generate_length(
-    runtime: Any, max_generate_length: int | None, *, enabled: bool
-) -> Iterator[None]:
-    if (
-        not enabled
-        or max_generate_length is None
-        or not hasattr(runtime, "max_generate_length")
-    ):
-        yield
-        return
-    old_value = runtime.max_generate_length
-    runtime.max_generate_length = int(max_generate_length)
-    try:
-        yield
-    finally:
-        runtime.max_generate_length = old_value
-
-
-class DotsTTSEngine:
-    """Callable terminal stage around upstream ``DotsTtsRuntime``."""
-
-    def __init__(
-        self,
-        *,
-        runtime: Any,
-        runtime_lock: threading.RLock | None = None,
-        lock_runtime_max_generate_length: bool = True,
-    ) -> None:
-        self.runtime = runtime
-        self.runtime_lock = runtime_lock or threading.RLock()
-        self._max_generate_length_lock = threading.Lock()
-        self._lock_runtime_max_generate_length = bool(lock_runtime_max_generate_length)
-
-    def __call__(self, payload: StagePayload) -> StagePayload:
-        state = DotsTTSState.from_dict(payload.data)
-        if state.stream:
-            logger.info(
-                "dots.tts wrapper received stream=True for %s; returning one terminal audio payload",
-                payload.request_id,
-            )
-        generate_kwargs = {
-            "text": state.text,
-            "prompt_audio_path": state.prompt_audio_path,
-            "prompt_text": state.prompt_text,
-            "template_name": state.template_name,
-            "language": state.language,
-            "speaker_scale": state.speaker_scale,
-            "ode_method": state.ode_method,
-            "num_steps": state.num_steps,
-            "guidance_scale": state.guidance_scale,
-            "normalize_text": state.normalize_text,
-            "profile_inference": state.profile_inference,
-        }
-        lock = (
-            self._max_generate_length_lock
-            if self._lock_runtime_max_generate_length
-            else _NullLock()
-        )
-        with self.runtime_lock:
-            # Preserve the historical per-request max_generate_length override
-            # while serializing access to upstream runtime's mutable workspaces.
-            with lock:
-                with _temporary_runtime_max_generate_length(
-                    self.runtime,
-                    state.max_generate_length,
-                    enabled=self._lock_runtime_max_generate_length,
-                ):
-                    if state.seed is None:
-                        result = self.runtime.generate(**generate_kwargs)
-                    else:
-                        devices = []
-                        if torch.cuda.is_available():
-                            devices.append(torch.device("cuda"))
-                        with torch.random.fork_rng(devices=devices):
-                            torch.manual_seed(int(state.seed))
-                            result = self.runtime.generate(**generate_kwargs)
-
-        audio = result.get("audio") if isinstance(result, dict) else result
-        sample_rate = (
-            int(result.get("sample_rate"))
-            if isinstance(result, dict) and result.get("sample_rate") is not None
-            else int(getattr(self.runtime, "sample_rate", 48000))
-        )
-        state.sample_rate = sample_rate
-        if isinstance(result, dict):
-            state.engine_time_s = float(result.get("time_used", 0.0) or 0.0)
-            state.rtf = (
-                float(result["rtf"]) if result.get("rtf") is not None else None
-            )
-
-        payload.data = audio_waveform_payload(
-            audio,
-            sample_rate=sample_rate,
-            modality="audio",
-            source_hint="dots.tts",
-        )
-        payload.data["state"] = state.to_dict()
-        usage: dict[str, Any] = {}
-        if state.engine_time_s:
-            usage["engine_time_s"] = state.engine_time_s
-        if state.rtf is not None:
-            usage["rtf"] = state.rtf
-        if usage:
-            payload.data["usage"] = usage
-        return payload
-
-
 def _to_latent_tensor(latent: Any) -> torch.Tensor:
     if isinstance(latent, torch.Tensor):
         return latent.detach()
@@ -733,14 +568,6 @@ class DotsTTSVocoderScheduler(StreamingSimpleScheduler):
         ]
 
 
-class _NullLock:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-
 def create_preprocessing_executor(
     model_path: str,
     *,
@@ -750,36 +577,6 @@ def create_preprocessing_executor(
     return SimpleScheduler(
         preprocess_dots_tts_payload,
         max_concurrency=max_concurrency,
-    )
-
-
-def create_tts_engine_executor(
-    model_path: str,
-    *,
-    precision: str = "bfloat16",
-    optimize: bool = False,
-    max_generate_length: int = 500,
-    device: str | None = None,
-    gpu_id: int | None = None,
-    cache_dir: str | None = None,
-    revision: str | None = None,
-    lock_runtime_max_generate_length: bool = True,
-) -> SimpleScheduler:
-    del device, gpu_id
-    runtime, runtime_lock = _get_or_load_runtime(
-        model_path,
-        precision=precision,
-        optimize=optimize,
-        max_generate_length=max_generate_length,
-        cache_dir=cache_dir,
-        revision=revision,
-    )
-    return SimpleScheduler(
-        DotsTTSEngine(
-            runtime=runtime,
-            runtime_lock=runtime_lock,
-            lock_runtime_max_generate_length=lock_runtime_max_generate_length,
-        )
     )
 
 
@@ -828,12 +625,16 @@ def create_sglang_latent_engine_executor(
     overrides: dict[str, Any] = {
         "disable_cuda_graph": True,
         "mem_fraction_static": 0.85,
-        "max_running_requests": 8,
+        "max_running_requests": 1,
         "chunked_prefill_size": 4096,
         "dtype": precision,
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    if int(overrides.get("max_running_requests", 1)) != 1:
+        raise ValueError(
+            "Dots TTS native latent engine v1 requires max_running_requests=1"
+        )
     if int(overrides.get("tp_size", 1)) != 1:
         raise ValueError("Dots TTS native latent engine v1 supports only tp_size=1")
 
@@ -934,19 +735,12 @@ def create_vocoder_executor(
     )
 
 
-def create_dots_tts_engine_executor(*args, **kwargs) -> SimpleScheduler:
-    return create_tts_engine_executor(*args, **kwargs)
-
-
 __all__ = [
-    "DotsTTSEngine",
     "DotsTTSVocoder",
     "DotsTTSVocoderScheduler",
-    "create_dots_tts_engine_executor",
     "create_latent_engine_executor",
     "create_preprocessing_executor",
     "create_sglang_latent_engine_executor",
-    "create_tts_engine_executor",
     "create_vocoder_executor",
     "preprocess_dots_tts_payload",
 ]

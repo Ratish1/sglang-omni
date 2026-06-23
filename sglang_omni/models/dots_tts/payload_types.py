@@ -9,7 +9,7 @@ from typing import Any
 
 @dataclass
 class DotsTTSState:
-    """Normalized per-request inputs for ``DotsTtsRuntime.generate``."""
+    """Normalized per-request inputs for the native dots TTS pipeline."""
 
     text: str = ""
     prompt_audio_path: str | None = None

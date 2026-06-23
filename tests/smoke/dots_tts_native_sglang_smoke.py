@@ -5,18 +5,10 @@ from __future__ import annotations
 
 import argparse
 import queue
-import sys
 import threading
 import time
-from pathlib import Path
 
 import torch
-
-_DOTS_RUNTIME_SITE_PACKAGES = Path(
-    "/home/kps_spark/workspace/sglang-omni/.conda-dots-tts-py310/lib/python3.10/site-packages"
-)
-if _DOTS_RUNTIME_SITE_PACKAGES.exists():
-    sys.path.append(str(_DOTS_RUNTIME_SITE_PACKAGES))
 
 from sglang_omni.models.dots_tts.stages import (
     create_sglang_latent_engine_executor,

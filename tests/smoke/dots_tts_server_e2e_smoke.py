@@ -19,11 +19,6 @@ from pathlib import Path
 import torch
 
 
-_DOTS_RUNTIME_SITE_PACKAGES = Path(
-    "/home/kps_spark/workspace/sglang-omni/.conda-dots-tts-py310/lib/python3.10/site-packages"
-)
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -76,18 +71,10 @@ def _post_json(url: str, payload: dict, *, timeout: float) -> tuple[bytes, str]:
 
 
 def _write_server_bootstrap(path: Path) -> None:
-    bootstrap = f"""
-from pathlib import Path
-import sys
-
-dots_site_packages = Path({str(_DOTS_RUNTIME_SITE_PACKAGES)!r})
-
-
+    bootstrap = """
 def main():
     from sglang_omni.cli import app
 
-    if dots_site_packages.exists():
-        sys.path.append(str(dots_site_packages))
     app()
 
 
