@@ -130,3 +130,19 @@ If code comparisons confirm upstream batch sensitivity and we need root cause:
 
 The first invalid transition, not the final generated-audio symptom, determines
 the fix boundary.
+
+Run the first-mismatch trace for one mismatching sample:
+
+```bash
+python tmp/moss_local_codec_debug/trace_batch_encode_first_mismatch.py \
+  --sample-ids \
+    common_voice_en_628642-common_voice_en_628644 \
+    common_voice_en_25748530-common_voice_en_25748532 \
+    common_voice_en_20005340-common_voice_en_20005341 \
+    common_voice_en_19599129-common_voice_en_19599130 \
+  --trace-sample-id common_voice_en_25748530-common_voice_en_25748532 \
+  --out /data/moss_local_codec_batch_sensitivity_trace
+```
+
+If cuDNN SDPA fails on the host, use the same in-process
+`torch.backends.cuda.enable_cudnn_sdp(False)` wrapper as above.
