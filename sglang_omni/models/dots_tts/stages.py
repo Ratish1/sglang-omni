@@ -625,16 +625,12 @@ def create_sglang_latent_engine_executor(
     overrides: dict[str, Any] = {
         "disable_cuda_graph": True,
         "mem_fraction_static": 0.85,
-        "max_running_requests": 1,
+        "max_running_requests": 8,
         "chunked_prefill_size": 4096,
         "dtype": precision,
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)
-    if int(overrides.get("max_running_requests", 1)) != 1:
-        raise ValueError(
-            "Dots TTS native latent engine v1 requires max_running_requests=1"
-        )
     if int(overrides.get("tp_size", 1)) != 1:
         raise ValueError("Dots TTS native latent engine v1 supports only tp_size=1")
 

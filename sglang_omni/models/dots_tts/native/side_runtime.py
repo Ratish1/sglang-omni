@@ -187,6 +187,7 @@ class DotsTtsSideModel(nn.Module):
     _get_compiled_model = DotsTtsModel._get_compiled_model
     _get_compiled_method = DotsTtsModel._get_compiled_method
     _allocate_generate_state = DotsTtsModel._allocate_generate_state
+    _allocate_fm_state_buffers = DotsTtsModel._allocate_fm_state_buffers
     _prepare_prompt_audio_for_conditioning = (
         DotsTtsModel._prepare_prompt_audio_for_conditioning
     )
@@ -261,7 +262,6 @@ class DotsTtsSideModel(nn.Module):
         self._prompt_feature_cache: OrderedDict[
             str, _PromptFeatureCacheEntry
         ] = OrderedDict()
-        self._static_generate_workspaces: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._fm_decode_workspaces: dict[tuple[Any, ...], dict[str, torch.Tensor]] = {}
         self._token_embedding: nn.Module | None = None
 

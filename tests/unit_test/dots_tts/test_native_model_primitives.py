@@ -12,6 +12,54 @@ pytest.importorskip("torchdiffeq")
 from sglang_omni.models.dots_tts.native.models.dots_tts.model import DotsTtsModel
 
 
+def test_allocate_generate_state_uses_request_owned_fm_buffers() -> None:
+    class FakeModel:
+        _optimize_enabled = True
+        _allocate_fm_state_buffers = DotsTtsModel._allocate_fm_state_buffers
+
+        def __init__(self) -> None:
+            self.core = type(
+                "FakeCore",
+                (),
+                {
+                    "hidden_patch_size": 1,
+                    "latent_patch_size": 4,
+                    "fm_hidden_size": 8,
+                    "patch_encoder": None,
+                },
+            )()
+
+        def _resolve_state_audio_patch_count(self, max_audio_patch_count: int) -> int:
+            return 32
+
+    model = FakeModel()
+
+    first = DotsTtsModel._allocate_generate_state(
+        model,
+        max_audio_patch_count=12,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    second = DotsTtsModel._allocate_generate_state(
+        model,
+        max_audio_patch_count=12,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert first.fm_sequence is not second.fm_sequence
+    assert first.fm_cfg_sequence is not second.fm_cfg_sequence
+    assert first.fm_null_g_cond is not second.fm_null_g_cond
+    assert first.fm_sequence.data_ptr() != second.fm_sequence.data_ptr()
+    assert first.fm_cfg_sequence.data_ptr() != second.fm_cfg_sequence.data_ptr()
+
+    first.fm_sequence.fill_(7.0)
+    second.fm_sequence.zero_()
+
+    assert torch.all(first.fm_sequence == 7.0)
+    assert torch.all(second.fm_sequence == 0.0)
+
+
 def test_encode_audio_patch_feedback_does_not_call_llm() -> None:
     model = DotsTtsModel.__new__(DotsTtsModel)
     state = SimpleNamespace(

@@ -175,6 +175,54 @@ def test_post_decode_generates_latent_patch_from_hidden_state() -> None:
     assert data.position == 4
 
 
+def test_post_decode_generates_latents_for_multiple_requests() -> None:
+    runner = make_runner()
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def step_audio_latent(self, data, hidden_state):
+            self.calls.append((data.control_token_id, hidden_state.clone()))
+            token = float(data.control_token_id)
+            return SimpleNamespace(
+                latent_patch=torch.full((1, 4, 2), token),
+                feedback_embedding=torch.full((1, 1, 3), token / 10.0),
+                eos_score=torch.tensor([0.0]),
+            )
+
+    fake_model = FakeModel()
+    runner.model = fake_model
+
+    first = DotsTTSSGLangRequestData(control_token_id=101)
+    first.latest_hidden_state = torch.ones(1, 1, 4)
+    first.fm_state = {"rid": "first"}
+    second = DotsTTSSGLangRequestData(control_token_id=202)
+    second.latest_hidden_state = torch.full((1, 1, 4), 2.0)
+    second.fm_state = {"rid": "second"}
+
+    result = SimpleNamespace(hidden_states=None, next_token_ids=None)
+
+    runner.post_decode(
+        result,
+        None,
+        None,
+        [
+            SimpleNamespace(data=first),
+            SimpleNamespace(data=second),
+        ],
+    )
+
+    assert result.next_token_ids.tolist() == [101, 202]
+    assert len(fake_model.calls) == 2
+    assert torch.equal(first.latest_latent_patch, torch.full((1, 4, 2), 101.0))
+    assert torch.equal(second.latest_latent_patch, torch.full((1, 4, 2), 202.0))
+    assert torch.equal(first.decode_input_embeds[0], torch.full((1, 1, 3), 10.1))
+    assert torch.equal(second.decode_input_embeds[0], torch.full((1, 1, 3), 20.2))
+    assert len(first.latent_patches) == 1
+    assert len(second.latent_patches) == 1
+
+
 def test_post_decode_does_not_use_latent_stepper_fallback() -> None:
     runner = make_runner()
 

@@ -180,7 +180,6 @@ class DotsTtsModel(nn.Module):
         self._prompt_feature_cache: OrderedDict[
             str, _PromptFeatureCacheEntry
         ] = OrderedDict()
-        self._static_generate_workspaces: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._fm_decode_workspaces: dict[tuple[Any, ...], dict[str, torch.Tensor]] = {}
 
     def set_optimize(self, optimize: bool) -> None:
@@ -423,34 +422,11 @@ class DotsTtsModel(nn.Module):
         fm_capacity = state_audio_patch_count * (
             self.core.hidden_patch_size + self.core.latent_patch_size
         )
-        workspace_key = (
-            state_audio_patch_count,
-            str(device),
-            state_dtype,
+        workspace = self._allocate_fm_state_buffers(
+            fm_capacity=fm_capacity,
+            device=device,
+            dtype=state_dtype,
         )
-        workspace = self._static_generate_workspaces.get(workspace_key)
-        if workspace is None:
-            workspace = {
-                "fm_sequence": torch.zeros(
-                    (1, fm_capacity, self.core.fm_hidden_size),
-                    dtype=state_dtype,
-                    device=device,
-                ),
-                "fm_cfg_sequence": torch.zeros(
-                    (1, fm_capacity, self.core.fm_hidden_size),
-                    dtype=state_dtype,
-                    device=device,
-                ),
-                "fm_null_g_cond": torch.zeros(
-                    (1, self.core.fm_hidden_size),
-                    dtype=state_dtype,
-                    device=device,
-                ),
-            }
-            self._static_generate_workspaces[workspace_key] = workspace
-        else:
-            workspace["fm_sequence"].zero_()
-            workspace["fm_cfg_sequence"].zero_()
 
         patch_encoder_state = None
         if not self._optimize_enabled:
@@ -469,6 +445,31 @@ class DotsTtsModel(nn.Module):
             fm_cfg_sequence=workspace["fm_cfg_sequence"],
             fm_null_g_cond=workspace["fm_null_g_cond"],
         )
+
+    def _allocate_fm_state_buffers(
+        self,
+        *,
+        fm_capacity: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        return {
+            "fm_sequence": torch.zeros(
+                (1, fm_capacity, self.core.fm_hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+            "fm_cfg_sequence": torch.zeros(
+                (1, fm_capacity, self.core.fm_hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+            "fm_null_g_cond": torch.zeros(
+                (1, self.core.fm_hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+        }
 
     @staticmethod
     def _tensor_storage_signature(tensor: torch.Tensor) -> tuple:
