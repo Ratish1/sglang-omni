@@ -43,7 +43,7 @@ _RUNTIME_TEMPLATE_NAMES = {
     "text_to_audio",
     "tts_interleave",
 }
-_SIDE_RUNTIME_CACHE: dict[tuple[Any, ...], tuple[Any, threading.RLock]] = {}
+_SIDE_RUNTIME_CACHE: dict[tuple[Any, ...], Any] = {}
 _SIDE_RUNTIME_CACHE_LOCK = threading.Lock()
 _VOCODER_RUNTIME_CACHE: dict[tuple[Any, ...], tuple[Any, threading.RLock]] = {}
 _VOCODER_RUNTIME_CACHE_LOCK = threading.Lock()
@@ -78,6 +78,7 @@ def _runtime_cache_key(
     precision: str,
     optimize: bool,
     max_generate_length: int,
+    device: str | None,
     cache_dir: str | None,
     revision: str | None,
 ) -> tuple[Any, ...]:
@@ -86,9 +87,16 @@ def _runtime_cache_key(
         str(precision),
         bool(optimize),
         int(max_generate_length),
+        device,
         cache_dir,
         revision,
     )
+
+
+def _resolve_worker_device(device: str | None, gpu_id: int) -> str:
+    if device is None or device == "cuda":
+        return f"cuda:{int(gpu_id)}"
+    return device
 
 
 def _get_or_load_side_runtime(
@@ -97,14 +105,16 @@ def _get_or_load_side_runtime(
     precision: str,
     optimize: bool,
     max_generate_length: int,
+    device: str | None = None,
     cache_dir: str | None = None,
     revision: str | None = None,
-) -> tuple[Any, threading.RLock]:
+) -> Any:
     key = _runtime_cache_key(
         model_path,
         precision=precision,
         optimize=optimize,
         max_generate_length=max_generate_length,
+        device=device,
         cache_dir=cache_dir,
         revision=revision,
     )
@@ -123,11 +133,11 @@ def _get_or_load_side_runtime(
             precision=precision,
             optimize=optimize,
             max_generate_length=max_generate_length,
+            device=device,
             cache_dir=cache_dir,
             revision=revision,
         )
-        cached = (runtime, threading.RLock())
-        return _SIDE_RUNTIME_CACHE.setdefault(key, cached)
+        return _SIDE_RUNTIME_CACHE.setdefault(key, runtime)
 
 
 def _get_or_load_vocoder_runtime(
@@ -590,7 +600,6 @@ def create_latent_engine_executor(
     gpu_id: int | None = None,
     cache_dir: str | None = None,
     revision: str | None = None,
-    lock_runtime_max_generate_length: bool = True,
     server_args_overrides: dict[str, Any] | None = None,
 ) -> OmniScheduler:
     return create_sglang_latent_engine_executor(
@@ -602,7 +611,6 @@ def create_latent_engine_executor(
         gpu_id=gpu_id,
         cache_dir=cache_dir,
         revision=revision,
-        lock_runtime_max_generate_length=lock_runtime_max_generate_length,
         server_args_overrides=server_args_overrides,
     )
 
@@ -617,7 +625,6 @@ def create_sglang_latent_engine_executor(
     gpu_id: int | None = None,
     cache_dir: str | None = None,
     revision: str | None = None,
-    lock_runtime_max_generate_length: bool = True,
     server_args_overrides: dict[str, Any] | None = None,
 ) -> OmniScheduler:
     """Create the SGLang-backed dots continuous-latent engine."""
@@ -639,6 +646,7 @@ def create_sglang_latent_engine_executor(
             gpu_id = int(device.split(":")[-1])
         else:
             gpu_id = 0
+    side_device = _resolve_worker_device(device, int(gpu_id))
 
     sglang_model_path = _ensure_sglang_llm_checkpoint_view(model_path)
     server_args = build_sglang_server_args(
@@ -662,19 +670,18 @@ def create_sglang_latent_engine_executor(
         model_arch_override="DotsTTSForConditionalGeneration",
     )
 
-    runtime, runtime_lock = _get_or_load_side_runtime(
+    runtime = _get_or_load_side_runtime(
         model_path,
         precision=precision,
         optimize=optimize,
         max_generate_length=max_generate_length,
+        device=side_device,
         cache_dir=cache_dir,
         revision=revision,
     )
-    del runtime_lock, lock_runtime_max_generate_length
 
     model = model_worker.model_runner.model
-    if hasattr(model, "attach_native_model"):
-        model.attach_native_model(runtime.model, precision=getattr(runtime, "precision", precision))
+    model.attach_native_model(runtime.model, precision=runtime.precision)
     model.native_adapter = DotsTTSNativeAdapter(runtime)
 
     output_proc = SGLangOutputProcessor(

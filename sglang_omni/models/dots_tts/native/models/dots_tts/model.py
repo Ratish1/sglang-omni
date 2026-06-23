@@ -781,6 +781,11 @@ class DotsTtsModel(nn.Module):
                 cache_key[:12],
                 prompt_sample_count,
             )
+        xvec_param = next(self.core.xvec_proj.parameters())
+        speaker_embedding = speaker_embedding.to(
+            device=xvec_param.device,
+            dtype=xvec_param.dtype,
+        )
         g_cond = self.core.xvec_proj(speaker_embedding * float(speaker_scale))
         if not use_prompt_prefill:
             self._store_prompt_feature_cache_entry(cache_key, cache_entry)

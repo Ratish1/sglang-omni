@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 pytest.importorskip("torchdiffeq")
 
@@ -125,3 +126,42 @@ def test_encode_audio_patch_feedback_does_not_call_llm() -> None:
         "decode_patch",
     ]
     assert torch.equal(calls[-1][4], torch.tensor([3, 4]))
+
+
+def test_prepare_prompt_conditioning_casts_speaker_embedding_to_projection_dtype() -> None:
+    class FakeCore(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+            self.xvec_proj = nn.Linear(4, 4).to(dtype=torch.bfloat16)
+
+    class FakeSpeakerEncoder(nn.Module):
+        sample_rate = 48000
+        max_audio_seconds = 30
+
+        def forward(self, prompt_audio):
+            assert prompt_audio.dtype == torch.float32
+            return torch.ones(1, 4, dtype=torch.float32)
+
+    model = DotsTtsModel.__new__(DotsTtsModel)
+    nn.Module.__init__(model)
+    model.core = FakeCore()
+    model.vocoder = nn.Identity()
+    model.xvector_extractor = FakeSpeakerEncoder()
+    model._prompt_feature_cache = {}
+    model._prepare_prompt_audio_for_conditioning = lambda prompt_audio: (
+        prompt_audio,
+        "cache-key",
+    )
+    model._get_prompt_feature_cache_entry = lambda cache_key: None
+    model._store_prompt_feature_cache_entry = lambda cache_key, entry: None
+    model._get_compiled_model = lambda name, module: module
+
+    conditioning = DotsTtsModel._prepare_prompt_conditioning(
+        model,
+        torch.zeros(16, dtype=torch.float32),
+        use_prompt_prefill=False,
+        speaker_scale=1.5,
+    )
+
+    assert conditioning.g_cond.dtype == torch.bfloat16

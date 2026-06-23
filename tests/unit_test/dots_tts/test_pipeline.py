@@ -358,7 +358,7 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
     monkeypatch.setattr(
         stages,
         "_get_or_load_side_runtime",
-        lambda *args, **kwargs: (fake_side_runtime, object()),
+        lambda *args, **kwargs: fake_side_runtime,
         raising=False,
     )
     monkeypatch.setattr(stages, "SGLangOutputProcessor", FakeOutputProcessor)
@@ -424,10 +424,7 @@ def test_create_sglang_latent_engine_accepts_concurrent_requests(monkeypatch) ->
     monkeypatch.setattr(
         stages,
         "_get_or_load_side_runtime",
-        lambda *args, **kwargs: (
-            SimpleNamespace(model=object(), precision="bfloat16"),
-            object(),
-        ),
+        lambda *args, **kwargs: SimpleNamespace(model=object(), precision="bfloat16"),
     )
     monkeypatch.setattr(
         stages,
@@ -454,6 +451,71 @@ def test_create_sglang_latent_engine_accepts_concurrent_requests(monkeypatch) ->
 
     assert scheduler is not None
     assert captured["overrides"]["max_running_requests"] == 2
+
+
+def test_create_sglang_latent_engine_loads_side_runtime_on_worker_device(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from sglang_omni.models.dots_tts import stages
+
+    captured: dict[str, object] = {}
+    fake_model = SimpleNamespace(
+        native_adapter=None,
+        attach_native_model=lambda native_model, *, precision=None: None,
+    )
+
+    monkeypatch.setattr(
+        stages,
+        "_ensure_sglang_llm_checkpoint_view",
+        lambda model_path: f"{model_path}-llm-view",
+    )
+    monkeypatch.setattr(
+        stages,
+        "build_sglang_server_args",
+        lambda *args, **kwargs: SimpleNamespace(disable_overlap_schedule=False, tp_size=1),
+    )
+    monkeypatch.setattr(
+        stages,
+        "create_sglang_infrastructure",
+        lambda *args, **kwargs: (
+            SimpleNamespace(model_runner=SimpleNamespace(model=fake_model)),
+            "tree",
+            "req_pool",
+            "kv_pool",
+            "prefill",
+            "decode",
+            "model_config",
+        ),
+    )
+
+    def fake_get_side_runtime(*args, **kwargs):
+        captured["side_runtime_kwargs"] = kwargs
+        return SimpleNamespace(model=object(), precision="bfloat16")
+
+    monkeypatch.setattr(stages, "_get_or_load_side_runtime", fake_get_side_runtime)
+    monkeypatch.setattr(
+        stages,
+        "SGLangOutputProcessor",
+        lambda **kwargs: SimpleNamespace(kwargs=kwargs),
+    )
+    monkeypatch.setattr(
+        stages,
+        "DotsTTSModelRunner",
+        lambda model_worker, output_proc: SimpleNamespace(
+            set_stream_outbox=lambda outbox: None
+        ),
+    )
+    monkeypatch.setattr(
+        stages,
+        "OmniScheduler",
+        lambda **kwargs: SimpleNamespace(outbox=object(), kwargs=kwargs),
+    )
+
+    stages.create_sglang_latent_engine_executor("dots-model", device="cuda", gpu_id=1)
+
+    assert captured["side_runtime_kwargs"]["device"] == "cuda:1"
 
 
 def test_dots_tts_model_runner_runs_model_audio_step() -> None:

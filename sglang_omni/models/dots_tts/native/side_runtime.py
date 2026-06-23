@@ -365,11 +365,14 @@ class DotsTtsSideRuntime:
         precision: str = "bfloat16",
         optimize: bool = False,
         max_generate_length: int = 500,
+        device: str | torch.device | None = None,
     ) -> None:
         self.model = model
         self.pretrained_path = pretrained_path
         self.precision = precision
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            device or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
         if self.device.type == "cpu":
             torch.set_num_threads(1)
         target_dtype = get_dtype(self.precision)
@@ -402,6 +405,7 @@ class DotsTtsSideRuntime:
         precision: str = "bfloat16",
         optimize: bool = False,
         max_generate_length: int = 500,
+        device: str | torch.device | None = None,
     ) -> "DotsTtsSideRuntime":
         pretrained_path = cls._resolve_pretrained_path(
             model_name_or_path,
@@ -415,6 +419,7 @@ class DotsTtsSideRuntime:
             precision=precision,
             optimize=optimize,
             max_generate_length=max_generate_length,
+            device=device,
         )
 
     @staticmethod
