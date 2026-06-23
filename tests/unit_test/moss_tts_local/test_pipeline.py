@@ -307,6 +307,66 @@ def test_audio_tokenizer_reference_encode_uses_processor_stereo_contract():
     torch.testing.assert_close(model.calls[0][0][0], mono.repeat(2, 1) * scale)
 
 
+def test_audio_tokenizer_loader_matches_processor_codec_weight_dtype(monkeypatch):
+    from contextlib import nullcontext
+
+    from sglang_omni.models.moss_tts_local import audio_tokenizer as audio_tokenizer_mod
+    from sglang_omni.models.moss_tts_local.audio_tokenizer import (
+        load_moss_tts_local_audio_tokenizer,
+    )
+
+    class _FakeLoadedCodec(_FakeAudioTokenizerModel):
+        def __init__(self):
+            super().__init__()
+            self.eval_called = False
+            self.to_device = None
+
+        def eval(self):
+            self.eval_called = True
+            return self
+
+        def to(self, device):
+            self.to_device = device
+            return self
+
+    loaded_kwargs = {}
+    loaded_model = _FakeLoadedCodec()
+
+    class _FakeAutoModel:
+        @staticmethod
+        def from_pretrained(model_path, **kwargs):
+            loaded_kwargs["model_path"] = model_path
+            loaded_kwargs.update(kwargs)
+            return loaded_model
+
+    monkeypatch.setattr(
+        audio_tokenizer_mod,
+        "resolve_moss_checkpoint",
+        lambda model_path: f"/resolved/{model_path}",
+    )
+    monkeypatch.setattr(
+        audio_tokenizer_mod,
+        "moss_transformers_processor_compat",
+        nullcontext,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        types.SimpleNamespace(AutoModel=_FakeAutoModel),
+    )
+
+    tokenizer = load_moss_tts_local_audio_tokenizer("codec", device="cuda:7")
+
+    assert tokenizer.model is loaded_model
+    assert loaded_model.eval_called
+    assert loaded_model.to_device == "cuda:7"
+    assert loaded_kwargs == {
+        "model_path": "/resolved/codec",
+        "trust_remote_code": True,
+        "codec_weight_dtype": "bf16",
+    }
+
+
 # Registry / config
 
 

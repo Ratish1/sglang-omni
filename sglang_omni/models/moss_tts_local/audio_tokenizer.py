@@ -156,6 +156,7 @@ def load_moss_tts_local_audio_tokenizer(
             model = AutoModel.from_pretrained(
                 checkpoint_dir,
                 trust_remote_code=True,
+                codec_weight_dtype="bf16",
             )
     except Exception as exc:
         raise RuntimeError(
