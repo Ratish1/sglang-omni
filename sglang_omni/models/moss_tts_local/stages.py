@@ -562,7 +562,7 @@ def create_preprocessing_executor(
     gpu_id: int | None = None,
     codec_model_path: str | None = None,
     max_concurrency: int = 16,
-    encode_batch_size: int = 8,
+    encode_batch_size: int = 1,
     encode_batch_wait_ms: int = 4,
     ref_audio_cache: bool = True,
     ref_audio_cache_max_items: int = 8192,

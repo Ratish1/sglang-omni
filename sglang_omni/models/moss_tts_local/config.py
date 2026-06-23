@@ -46,6 +46,11 @@ def _stages(*, codec_device: str, colocated: bool) -> list[StageConfig]:
             factory=f"{_PKG}.stages.create_preprocessing_executor",
             factory_args={
                 "device": codec_device,
+                # MOSS-Audio-Tokenizer-v2 reference encode is batch-shape sensitive:
+                # the same file can produce different discrete prompt codes when
+                # encoded alone versus with unrelated refs. Keep default serving
+                # deterministic; cache/single-flight still deduplicates identical refs.
+                "encode_batch_size": 1,
                 "ref_audio_cache": True,
                 "ref_audio_cache_max_items": 8192,
                 "ref_audio_cache_max_bytes": 64 * 1024 * 1024,

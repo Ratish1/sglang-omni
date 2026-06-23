@@ -395,6 +395,7 @@ def test_pipeline_stage_wiring():
     assert stages["preprocessing"].process == "pipeline"
     assert stages["preprocessing"].gpu == 0
     assert stages["preprocessing"].factory_args["device"] == "cuda:0"
+    assert stages["preprocessing"].factory_args["encode_batch_size"] == 1
     assert stages["preprocessing"].factory_args["ref_audio_cache_max_items"] == 8192
     assert config.supports_uploaded_voice_references() is True
     assert stages["tts_engine"].process == "pipeline"
@@ -417,6 +418,7 @@ def test_pipeline_stage_wiring():
     )
     colocated_stages = {stage.name: stage for stage in colocated.stages}
     assert colocated_stages["preprocessing"].factory_args["device"] == "cuda:0"
+    assert colocated_stages["preprocessing"].factory_args["encode_batch_size"] == 1
     assert (
         colocated_stages["preprocessing"].factory_args["ref_audio_cache_max_items"]
         == 8192
@@ -426,6 +428,7 @@ def test_pipeline_stage_wiring():
     split = MossTTSLocalSplitPipelineConfig(model_path="OpenMOSS-Team/moss-local-test")
     split_stages = {stage.name: stage for stage in split.stages}
     assert split_stages["preprocessing"].factory_args["device"] == "cuda:1"
+    assert split_stages["preprocessing"].factory_args["encode_batch_size"] == 1
     assert split_stages["tts_engine"].factory_args["gpu_id"] == 0
     split_runtime = split_stages["tts_engine"].runtime
     assert split_runtime.resources.total_gpu_memory_fraction is None
