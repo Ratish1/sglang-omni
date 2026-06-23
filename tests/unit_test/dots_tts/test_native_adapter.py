@@ -17,6 +17,7 @@ class FakeNativeModel:
     AUDIO_SPAN_ID = 99
 
     def __init__(self) -> None:
+        self.llm_config = SimpleNamespace(vocab_size=32000)
         self.core = SimpleNamespace(
             parameters=lambda: iter([torch.zeros(1)]),
             audio_span_token_ids=[self.AUDIO_SPAN_ID],
@@ -94,6 +95,7 @@ def test_adapter_prepares_native_state_from_state() -> None:
     assert prepared.prefill_end == 2
     assert prepared.fm_state is not None
     assert prepared.audio_placeholder_ids == {FakeNativeModel.AUDIO_SPAN_ID}
+    assert adapter.llm_vocab_size == 32000
 
 
 def test_adapter_requires_generation_schedule() -> None:
@@ -111,6 +113,7 @@ def test_adapter_requires_generation_schedule() -> None:
 class FakeDotsModel:
     def __init__(self) -> None:
         self.calls = []
+        self.llm_config = SimpleNamespace(vocab_size=32000)
 
     def _decode_next_audio(self, **kwargs):
         self.calls.append(kwargs)

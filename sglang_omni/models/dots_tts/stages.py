@@ -724,12 +724,16 @@ def create_vocoder_executor(
     cache_dir: str | None = None,
     revision: str | None = None,
 ) -> SimpleScheduler:
-    if gpu_id is not None and device is None:
-        device = f"cuda:{gpu_id}"
+    if gpu_id is None:
+        if device and ":" in device:
+            gpu_id = int(device.split(":")[-1])
+        else:
+            gpu_id = 0
+    vocoder_device = _resolve_worker_device(device, int(gpu_id))
     runtime, runtime_lock = _get_or_load_vocoder_runtime(
         model_path,
         precision=precision,
-        device=device,
+        device=vocoder_device,
     )
     del optimize, max_generate_length, cache_dir, revision
     return DotsTTSVocoderScheduler(

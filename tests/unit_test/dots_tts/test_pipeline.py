@@ -335,6 +335,8 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
             self.outbox = object()
 
     class StreamFallbackMustNotRun:
+        llm_config = SimpleNamespace(vocab_size=32000)
+
         def _generate_latents_stream(self, *args, **kwargs):
             raise AssertionError("_generate_latents_stream must not run")
 
@@ -424,7 +426,10 @@ def test_create_sglang_latent_engine_accepts_concurrent_requests(monkeypatch) ->
     monkeypatch.setattr(
         stages,
         "_get_or_load_side_runtime",
-        lambda *args, **kwargs: SimpleNamespace(model=object(), precision="bfloat16"),
+        lambda *args, **kwargs: SimpleNamespace(
+            model=SimpleNamespace(llm_config=SimpleNamespace(vocab_size=32000)),
+            precision="bfloat16",
+        ),
     )
     monkeypatch.setattr(
         stages,
@@ -492,7 +497,10 @@ def test_create_sglang_latent_engine_loads_side_runtime_on_worker_device(
 
     def fake_get_side_runtime(*args, **kwargs):
         captured["side_runtime_kwargs"] = kwargs
-        return SimpleNamespace(model=object(), precision="bfloat16")
+        return SimpleNamespace(
+            model=SimpleNamespace(llm_config=SimpleNamespace(vocab_size=32000)),
+            precision="bfloat16",
+        )
 
     monkeypatch.setattr(stages, "_get_or_load_side_runtime", fake_get_side_runtime)
     monkeypatch.setattr(
@@ -606,8 +614,11 @@ def test_dots_tts_native_stage_factories_cache_by_stage(monkeypatch) -> None:
         "model",
         precision="bfloat16",
         max_generate_length=16,
+        device="cuda",
+        gpu_id=2,
     )
 
     assert latent_scheduler == "sglang-scheduler"
     assert len(vocoder_loads) == 1
+    assert vocoder_loads[0][2] == "cuda:2"
     assert vocoder_scheduler._fn.runtime is vocoder_loads[0][3]

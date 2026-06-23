@@ -57,6 +57,7 @@ class DotsTTSNativeAdapter:
         self.runtime = runtime
         self.model = runtime.model
         self.precision = runtime.precision
+        self.llm_vocab_size = int(self.model.llm_config.vocab_size)
 
     def prepare_inputs(self, state: DotsTTSState) -> DotsTTSPreparedInputs:
         requested_max_generate_length = state.max_generate_length

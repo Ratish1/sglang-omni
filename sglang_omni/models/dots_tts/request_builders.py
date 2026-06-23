@@ -66,11 +66,8 @@ def build_sglang_dots_tts_request(
         input_ids_list = (
             input_ids_tensor.reshape(-1).detach().cpu().to(dtype=torch.long).tolist()
         )
-    cfg = adapter.model.config
     control_token_id = 0
-    vocab_size = int(
-        getattr(cfg, "vocab_size", max(input_ids_list, default=control_token_id) + 1)
-    )
+    vocab_size = int(adapter.llm_vocab_size)
     max_generate_length = _resolve_max_generate_length(state, prepared)
     sampling_params = SamplingParams(
         max_new_tokens=max_generate_length,

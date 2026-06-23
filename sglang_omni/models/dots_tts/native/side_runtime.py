@@ -234,6 +234,7 @@ class DotsTtsSideModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.llm_config = llm_config
         self.tokenizer = tokenizer
         self.latent_stats_path = Path(latent_stats_path)
         self.audio_gen_start_id = require_token_id(tokenizer, AUDIO_GEN_START_TOKEN)

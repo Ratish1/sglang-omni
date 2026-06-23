@@ -15,7 +15,8 @@ from sglang_omni.proto import OmniRequest, StagePayload
 
 
 class FakeAdapter:
-    model = type("FakeModel", (), {"config": type("FakeConfig", (), {"vocab_size": 32000, "eos_token_id": 42})()})()
+    llm_vocab_size = 32000
+    model = type("FakeModel", (), {"config": type("FakeConfig", (), {})()})()
 
     def prepare_inputs(self, state):
         assert state.text == "Hello."
