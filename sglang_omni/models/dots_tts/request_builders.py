@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
 
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
+
+if TYPE_CHECKING:
+    from sglang_omni.models.dots_tts.native_adapter import DotsTTSPreparedInputs
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
@@ -26,7 +29,6 @@ class DotsTTSSGLangRequestData(SGLangARRequestData):
     audio_placeholder_ids: set[int] = field(default_factory=set)
     prompt_conditioning: Any = None
     fm_state: Any = None
-    pending_decode_embed: torch.Tensor | None = None
     latest_latent_patch: torch.Tensor | None = None
     latent_patches: list[torch.Tensor] = field(default_factory=list)
     generation_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -64,13 +66,14 @@ def build_sglang_dots_tts_request(
         input_ids_list = (
             input_ids_tensor.reshape(-1).detach().cpu().to(dtype=torch.long).tolist()
         )
-    cfg = getattr(getattr(adapter, "model", None), "config", None)
+    cfg = adapter.model.config
     control_token_id = 0
     vocab_size = int(
         getattr(cfg, "vocab_size", max(input_ids_list, default=control_token_id) + 1)
     )
+    max_generate_length = _resolve_max_generate_length(state, prepared)
     sampling_params = SamplingParams(
-        max_new_tokens=int(state.max_generate_length or 500),
+        max_new_tokens=max_generate_length,
         temperature=0.0,
         stop_token_ids=[],
     )
@@ -103,33 +106,44 @@ def build_sglang_dots_tts_request(
         generation_kwargs=dict(prepared.generation_kwargs),
         prefill_input_embeds=prepared.prompt_patch_embeddings,
         raw_native_inputs=dict(prepared.raw_inputs),
-        max_generate_length=int(state.max_generate_length or 500),
+        max_generate_length=max_generate_length,
         stream_metadata={"modality": "audio_latents"},
         control_token_id=control_token_id,
     )
 
 
-def _resolve_prefill_end(prepared: Any) -> int:
-    prefill_end = getattr(prepared, "prefill_end", None)
-    if prefill_end is not None:
-        return int(prefill_end)
-    input_ids = getattr(prepared, "input_ids", None)
-    if input_ids is not None:
-        return int(input_ids.reshape(-1).numel())
-    generation_schedule = getattr(prepared, "generation_schedule", None)
-    if generation_schedule is not None:
-        return int(generation_schedule.reshape(-1).numel())
+def _resolve_prefill_end(prepared: DotsTTSPreparedInputs) -> int:
+    if prepared.prefill_end is not None:
+        return int(prepared.prefill_end)
+    if prepared.input_ids is not None:
+        return int(prepared.input_ids.reshape(-1).numel())
+    if prepared.generation_schedule is not None:
+        return int(prepared.generation_schedule.reshape(-1).numel())
     return 0
 
 
-def _prefill_input_ids(prepared: Any) -> torch.Tensor | None:
-    generation_schedule = getattr(prepared, "generation_schedule", None)
+def _prefill_input_ids(prepared: DotsTTSPreparedInputs) -> torch.Tensor | None:
+    generation_schedule = prepared.generation_schedule
     prefill_end = _resolve_prefill_end(prepared)
     if generation_schedule is not None and prefill_end > 0:
         if generation_schedule.ndim == 1:
             return generation_schedule[:prefill_end].unsqueeze(0)
         return generation_schedule[:, :prefill_end]
-    return getattr(prepared, "input_ids", None)
+    return prepared.input_ids
+
+
+def _resolve_max_generate_length(
+    state: DotsTTSState, prepared: DotsTTSPreparedInputs
+) -> int:
+    if state.max_generate_length is not None:
+        return int(state.max_generate_length)
+    span_positions = prepared.audio_span_positions
+    if span_positions is not None:
+        prefill_end = _resolve_prefill_end(prepared)
+        generated_spans = (span_positions >= prefill_end).sum().item()
+        if generated_spans > 0:
+            return int(generated_spans)
+    return 500
 
 
 def build_stream_output(

@@ -36,7 +36,7 @@ class DotsTTSModelRunner(ModelRunner):
         del schedule_batch, is_lookahead
         reference = None
         for sched_req in requests:
-            queue = getattr(sched_req.data, "decode_input_embeds", None)
+            queue = sched_req.data.decode_input_embeds
             if queue:
                 reference = queue[0]
                 break
@@ -47,7 +47,7 @@ class DotsTTSModelRunner(ModelRunner):
         reference = reference.reshape(-1)
         pieces = []
         for sched_req in requests:
-            queue = getattr(sched_req.data, "decode_input_embeds", None)
+            queue = sched_req.data.decode_input_embeds
             if queue:
                 embed = queue.pop(0)
                 if embed.ndim == 3:
@@ -67,7 +67,7 @@ class DotsTTSModelRunner(ModelRunner):
     ) -> GenerationBatchResult | None:
         del schedule_batch
         if not any(
-            getattr(sched_req.data, "prefill_input_embeds", None) is not None
+            sched_req.data.prefill_input_embeds is not None
             for sched_req in requests
         ):
             return None
@@ -192,27 +192,22 @@ class DotsTTSModelRunner(ModelRunner):
         control_ids: list[int] = []
         for sched_req in requests:
             data = sched_req.data
-            if getattr(data, "finish_reason", None) is not None:
-                control_ids.append(int(getattr(data, "control_token_id", 0)))
-                continue
-            hidden_state = getattr(data, "latest_hidden_state", None)
-            fm_state = getattr(data, "fm_state", None)
-            model = getattr(self, "model", None)
-            step_audio_latent = getattr(model, "step_audio_latent", None)
             if (
-                fm_state is not None
-                and hidden_state is not None
-                and step_audio_latent is not None
+                data.finish_reason is None
+                and data.fm_state is not None
+                and data.latest_hidden_state is not None
             ):
-                audio_step = step_audio_latent(data, hidden_state)
+                audio_step = self.model.step_audio_latent(
+                    data, data.latest_hidden_state
+                )
                 data.latest_latent_patch = audio_step.latent_patch
                 data.latent_patches.append(audio_step.latent_patch.detach())
                 data.decode_input_embeds.append(audio_step.feedback_embedding)
                 data.eos_score = audio_step.eos_score
-                data.position = int(getattr(data, "position", 0)) + 1
+                data.position += 1
                 if self._should_finish(data):
                     self._mark_finished(data)
-            control_ids.append(int(getattr(data, "control_token_id", 0)))
+            control_ids.append(data.control_token_id)
 
         result.next_token_ids = torch.tensor(
             control_ids,
@@ -223,19 +218,16 @@ class DotsTTSModelRunner(ModelRunner):
     @staticmethod
     def _mark_finished(data: Any) -> None:
         data.finish_reason = "stop"
-        req = getattr(data, "req", None)
-        if req is not None and getattr(req, "finished_reason", None) is None:
-            req.finished_reason = FINISH_MATCHED_TOKEN(
-                int(getattr(data, "control_token_id", 0))
-            )
+        req = data.req
+        if req is not None and req.finished_reason is None:
+            req.finished_reason = FINISH_MATCHED_TOKEN(data.control_token_id)
 
     @staticmethod
     def _should_finish(data: Any) -> bool:
-        eos_score = getattr(data, "eos_score", None)
+        eos_score = data.eos_score
         if eos_score is not None and bool((eos_score > 0.5).any()):
             return True
-        max_generate_length = int(getattr(data, "max_generate_length", 500))
-        return len(getattr(data, "latent_patches", [])) >= max_generate_length
+        return len(data.latent_patches) >= data.max_generate_length
 
 
 __all__ = ["DotsTTSModelRunner"]

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -64,9 +63,7 @@ class DotsTTSSGLangModel(nn.Module):
         self._native_model = native_model
         if precision is not None:
             self.precision = precision
-        set_token_embedding = getattr(native_model, "set_token_embedding", None)
-        if set_token_embedding is not None:
-            set_token_embedding(self.qwen2.get_input_embeddings())
+        native_model.set_token_embedding(self.qwen2.get_input_embeddings())
 
     def validate_model_path(self, model_path: str) -> None:
         validate_checkpoint_files(model_path)
@@ -77,26 +74,23 @@ class DotsTTSSGLangModel(nn.Module):
         return self.native_adapter.prepare_inputs(state)
 
     def append_hidden_chunk(self, data: Any, hidden_state: torch.Tensor) -> None:
-        append_hidden = getattr(self.native_model, "_append_hidden_chunk", None)
-        if append_hidden is not None:
-            append_hidden(data.fm_state, hidden_state)
+        self.native_model._append_hidden_chunk(data.fm_state, hidden_state)
 
     def encode_audio_patch_feedback(
         self,
         data: Any,
         latent_patch: torch.Tensor,
     ) -> torch.Tensor:
-        feedback = getattr(self.native_model, "_encode_audio_patch_feedback", None)
-        if feedback is not None:
-            return feedback(data.fm_state, audio_patch=latent_patch)
-        return self.native_model._encode_audio_patch(latent_patch)
+        return self.native_model._encode_audio_patch_feedback(
+            data.fm_state, audio_patch=latent_patch
+        )
 
     def step_audio_latent(
         self,
         data: Any,
         hidden_state: torch.Tensor,
     ) -> DotsTTSAudioStepResult:
-        generation_kwargs = getattr(data, "generation_kwargs", {})
+        generation_kwargs = data.generation_kwargs
         decode_kwargs = {
             key: value
             for key, value in generation_kwargs.items()
@@ -123,57 +117,25 @@ class DotsTTSSGLangModel(nn.Module):
             )
             feedback_embedding = self.encode_audio_patch_feedback(data, latent_patch)
 
-        io_helper = getattr(getattr(self.native_model, "core", None), "io_helper", None)
-        payload_patch = (
-            io_helper.denormalize(latent_patch)
-            if io_helper is not None
-            else latent_patch
-        )
-        eos_score = self._score_audio_eos(data, hidden_state, latent_patch)
+        payload_patch = self.native_model.core.io_helper.denormalize(latent_patch)
         return DotsTTSAudioStepResult(
             latent_patch=_as_tensor(payload_patch),
             feedback_embedding=_as_tensor(feedback_embedding),
-            eos_score=_as_tensor(eos_score) if eos_score is not None else None,
+            eos_score=self._score_audio_eos(data, latent_patch),
         )
 
     def _score_audio_eos(
         self,
         data: Any,
-        hidden_state: torch.Tensor,
         latent_patch: torch.Tensor,
-    ) -> torch.Tensor | None:
-        generation_kwargs = getattr(data, "generation_kwargs", {})
-        stop_predicate = getattr(
-            self.native_model, "_should_stop_after_current_audio", None
+    ) -> torch.Tensor:
+        eos_threshold = float(data.generation_kwargs.get("eos_threshold", 0.8))
+        stopped = self.native_model._should_stop_after_current_audio(
+            data.fm_state, eos_threshold=eos_threshold
         )
-        if stop_predicate is not None:
-            eos_threshold = float(generation_kwargs.get("eos_threshold", 0.8))
-            return torch.tensor(
-                [
-                    1.0
-                    if stop_predicate(data.fm_state, eos_threshold=eos_threshold)
-                    else 0.0
-                ],
-                device=latent_patch.device,
-            )
-        eos_predictor = getattr(self.native_model, "_predict_eos", None)
-        if eos_predictor is None:
-            return None
-        return eos_predictor(hidden_state, latent_patch)
-
-    def generate_latent_patch(
-        self,
-        *,
-        hidden_state: torch.Tensor,
-        fm_state: Any,
-        generation_kwargs: dict[str, Any],
-    ) -> Any:
-        return self.step_audio_latent(
-            SimpleNamespace(
-                fm_state=fm_state,
-                generation_kwargs=generation_kwargs,
-            ),
-            hidden_state=hidden_state,
+        return torch.tensor(
+            [1.0 if stopped else 0.0],
+            device=latent_patch.device,
         )
 
     def load_weights(self, weights) -> set[str]:

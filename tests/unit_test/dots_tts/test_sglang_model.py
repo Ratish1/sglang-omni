@@ -43,6 +43,9 @@ def test_model_owns_qwen2_backbone(monkeypatch) -> None:
 class FakeNativeDotsModel:
     def __init__(self) -> None:
         self.appended_hidden = None
+        self.core = SimpleNamespace(
+            io_helper=SimpleNamespace(denormalize=lambda audio_patch: audio_patch)
+        )
 
     def _append_hidden_chunk(self, fm_state, hidden_state):
         assert fm_state == {"history": []}
@@ -93,29 +96,13 @@ def test_model_steps_audio_latent_without_adapter(monkeypatch) -> None:
     assert torch.equal(result.eos_score, torch.tensor([0.0]))
 
 
-def test_legacy_generate_latent_patch_uses_model_step(monkeypatch) -> None:
+def test_model_does_not_expose_legacy_generate_latent_patch(monkeypatch) -> None:
     import sglang_omni.models.dots_tts.sglang_model as mod
 
     monkeypatch.setattr(mod, "Qwen2ForCausalLM", FakeQwen2)
     model = DotsTTSSGLangModel(SimpleNamespace(torch_dtype="bfloat16"))
-    native_model = FakeNativeDotsModel()
-    model._native_model = native_model
 
-    result = model.generate_latent_patch(
-        hidden_state=torch.ones(1, 1, 2048),
-        fm_state={"history": []},
-        generation_kwargs={
-            "device": torch.device("cpu"),
-            "g_cond": None,
-            "ode_method": "euler",
-            "num_steps": 2,
-            "guidance_scale": 1.2,
-            "eos_threshold": 0.8,
-        },
-    )
-
-    assert result.latent_patch.shape == (1, 4, 128)
-    assert native_model.appended_hidden.shape == (1, 1, 2048)
+    assert not hasattr(model, "generate_latent_patch")
 
 
 def test_model_load_weights_routes_llm_weights_to_qwen2(monkeypatch) -> None:

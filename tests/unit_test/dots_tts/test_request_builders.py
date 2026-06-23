@@ -93,6 +93,32 @@ def test_make_scheduler_adapters_round_trip_payload() -> None:
     assert result.data["state"]["text"] == "Hello."
 
 
+def test_build_request_uses_prepared_audio_span_count_as_default_limit() -> None:
+    class ShortScheduleAdapter(FakeAdapter):
+        def prepare_inputs(self, state):
+            del state
+            return DotsTTSPreparedInputs(
+                raw_inputs={"ok": True},
+                input_ids=torch.tensor([[11, 12]]),
+                generation_schedule=torch.tensor([[11, 12, 99, 99, 99, 99]]),
+                audio_span_positions=torch.tensor([2, 3, 4, 5]),
+                prefill_end=2,
+                audio_placeholder_ids={99},
+            )
+
+    state = DotsTTSState(text="Hello.", template_name="text_to_audio")
+    payload = StagePayload(
+        request_id="rid",
+        request=OmniRequest(inputs={"text": "Hello."}, params={}),
+        data=state.to_dict(),
+    )
+
+    data = build_sglang_dots_tts_request(payload, adapter=ShortScheduleAdapter())
+
+    assert data.req.sampling_params.max_new_tokens == 4
+    assert data.max_generate_length == 4
+
+
 def test_build_request_rejects_interleave_template() -> None:
     state = DotsTTSState(
         text="Hello.",
