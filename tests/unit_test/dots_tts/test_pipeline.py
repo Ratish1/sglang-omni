@@ -448,7 +448,7 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
         def _generate_latents_stream(self, *args, **kwargs):
             raise AssertionError("_generate_latents_stream must not run")
 
-    fake_runtime = SimpleNamespace(
+    fake_side_runtime = SimpleNamespace(
         model=StreamFallbackMustNotRun(),
         precision="bfloat16",
     )
@@ -465,7 +465,19 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
         "create_sglang_infrastructure",
         fake_create_sglang_infrastructure,
     )
-    monkeypatch.setattr(stages, "_get_or_load_runtime", lambda *args, **kwargs: (fake_runtime, object()))
+    monkeypatch.setattr(
+        stages,
+        "_get_or_load_runtime",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("SGLang latent engine must not load full dots runtime")
+        ),
+    )
+    monkeypatch.setattr(
+        stages,
+        "_get_or_load_side_runtime",
+        lambda *args, **kwargs: (fake_side_runtime, object()),
+        raising=False,
+    )
     monkeypatch.setattr(stages, "SGLangOutputProcessor", FakeOutputProcessor)
     monkeypatch.setattr(stages, "DotsTTSModelRunner", FakeRunner)
     monkeypatch.setattr(stages, "OmniScheduler", FakeScheduler)
@@ -484,9 +496,9 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
     assert captured["infra_call"][2] == "DotsTTSForConditionalGeneration"
     assert captured["output_processor_kwargs"]["capture_hidden"] is True
     assert captured["output_processor_kwargs"]["model"] is fake_model
-    assert fake_model.attached_model is fake_runtime.model
+    assert fake_model.attached_model is fake_side_runtime.model
     assert fake_model.attached_precision == "bfloat16"
-    assert fake_model.native_adapter.runtime is fake_runtime
+    assert fake_model.native_adapter.runtime is fake_side_runtime
     assert captured["scheduler_kwargs"]["model_runner"]._outbox is scheduler.outbox
 
 

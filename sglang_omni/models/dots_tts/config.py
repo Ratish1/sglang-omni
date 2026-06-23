@@ -4,8 +4,9 @@
 dots.tts generates continuous audio latents before AudioVAE turns those
 latents into waveform samples.  The pipeline keeps that boundary visible:
 ``latent_engine`` owns the autoregressive/flow latent path and ``vocoder`` owns
-AudioVAE decode.  This is still not a Qwen2/SGLang KV-cache rewrite; it is the
-native Omni stage split around dots.tts' own generation primitives.
+AudioVAE decode.  The latent engine uses SGLang's Qwen2-backed AR path while
+dots side modules provide prompt conditioning, DiT/flow latent generation, and
+audio patch feedback.
 """
 
 from __future__ import annotations

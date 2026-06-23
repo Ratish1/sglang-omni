@@ -64,6 +64,9 @@ class DotsTTSSGLangModel(nn.Module):
         self._native_model = native_model
         if precision is not None:
             self.precision = precision
+        set_token_embedding = getattr(native_model, "set_token_embedding", None)
+        if set_token_embedding is not None:
+            set_token_embedding(self.qwen2.get_input_embeddings())
 
     def validate_model_path(self, model_path: str) -> None:
         validate_checkpoint_files(model_path)

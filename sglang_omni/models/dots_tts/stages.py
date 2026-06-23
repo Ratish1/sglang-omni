@@ -47,6 +47,8 @@ _RUNTIME_TEMPLATE_NAMES = {
 }
 _RUNTIME_CACHE: dict[tuple[Any, ...], tuple[Any, threading.RLock]] = {}
 _RUNTIME_CACHE_LOCK = threading.Lock()
+_SIDE_RUNTIME_CACHE: dict[tuple[Any, ...], tuple[Any, threading.RLock]] = {}
+_SIDE_RUNTIME_CACHE_LOCK = threading.Lock()
 _VOCODER_RUNTIME_CACHE: dict[tuple[Any, ...], tuple[Any, threading.RLock]] = {}
 _VOCODER_RUNTIME_CACHE_LOCK = threading.Lock()
 _SGLANG_VIEW_ROOT = Path("/tmp/sglang_omni_dots_tts_llm_views")
@@ -144,6 +146,45 @@ def _get_or_load_runtime(
         runtime = runtime_cls.from_pretrained(model_path, **runtime_kwargs)
         cached = (runtime, threading.RLock())
         return _RUNTIME_CACHE.setdefault(key, cached)
+
+
+def _get_or_load_side_runtime(
+    model_path: str,
+    *,
+    precision: str,
+    optimize: bool,
+    max_generate_length: int,
+    cache_dir: str | None = None,
+    revision: str | None = None,
+) -> tuple[Any, threading.RLock]:
+    key = _runtime_cache_key(
+        model_path,
+        precision=precision,
+        optimize=optimize,
+        max_generate_length=max_generate_length,
+        cache_dir=cache_dir,
+        revision=revision,
+    )
+    with _SIDE_RUNTIME_CACHE_LOCK:
+        cached = _SIDE_RUNTIME_CACHE.get(key)
+        if cached is not None:
+            return cached
+        try:
+            from sglang_omni.models.dots_tts.native.side_runtime import (
+                DotsTtsSideRuntime,
+            )
+        except ImportError as exc:
+            raise RuntimeError(_DOTS_TTS_INSTALL_HINT) from exc
+        runtime = DotsTtsSideRuntime.from_pretrained(
+            model_path,
+            precision=precision,
+            optimize=optimize,
+            max_generate_length=max_generate_length,
+            cache_dir=cache_dir,
+            revision=revision,
+        )
+        cached = (runtime, threading.RLock())
+        return _SIDE_RUNTIME_CACHE.setdefault(key, cached)
 
 
 def _get_or_load_vocoder_runtime(
@@ -824,7 +865,7 @@ def create_sglang_latent_engine_executor(
         model_arch_override="DotsTTSForConditionalGeneration",
     )
 
-    runtime, runtime_lock = _get_or_load_runtime(
+    runtime, runtime_lock = _get_or_load_side_runtime(
         model_path,
         precision=precision,
         optimize=optimize,

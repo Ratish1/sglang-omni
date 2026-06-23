@@ -69,6 +69,11 @@ dependencies = [
     "torchcodec==0.11.1",     # Matches sglang==0.5.12.post1 dependency
     # Gradio playground
     "gradio>=4.0.0",
+    # Dots TTS native latent engine / text normalization
+    "torchdiffeq",
+    "langcodes[data]",
+    "lingua-language-detector",
+    "WeTextProcessing",
     # Ming-Omni
     "diffusers==0.37.0",      # Align with sglang 0.5.12.post1 hard pin (diffusers==0.37.0)
     "x-transformers",          # Ming talker rotary embeddings
