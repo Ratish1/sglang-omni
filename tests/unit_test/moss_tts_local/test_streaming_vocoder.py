@@ -982,23 +982,23 @@ def test_create_vocoder_executor_threads_cuda_graph_config(monkeypatch) -> None:
     assert scheduler2._cuda_graph_min_free_gb == 7.0
 
 
-def test_create_vocoder_executor_uses_owned_codec(monkeypatch) -> None:
+def test_create_vocoder_executor_uses_separate_codec(monkeypatch) -> None:
     processor = FakeProcessor()
-    owned_codec = FakeCodec()
-    _patch_vocoder_factory_loaders(monkeypatch, processor, owned_codec)
+    codec = FakeCodec()
+    _patch_vocoder_factory_loaders(monkeypatch, processor, codec)
 
     scheduler = stages.create_vocoder_executor("fake-model", device="cpu")
 
-    assert scheduler._codec is owned_codec
+    assert scheduler._codec is codec
     assert scheduler._codec is not processor.audio_tokenizer
 
     rows = _rows(7, seed=98)
-    (result,) = scheduler._vocode_batch([_offline_payload(rows, "owned")])
+    (result,) = scheduler._vocode_batch([_offline_payload(rows, "separate-codec")])
 
     assert processor.decode_calls == 0
     assert processor.audio_tokenizer.decode_calls == 0
-    assert owned_codec.decode_calls == 1
-    assert owned_codec.decode_decoders == [scheduler._nonstream_decoder]
+    assert codec.decode_calls == 1
+    assert codec.decode_decoders == [scheduler._nonstream_decoder]
     np.testing.assert_array_equal(
         _decode_audio(result.data), reference_waveform(rows[:, 1:]).numpy()
     )

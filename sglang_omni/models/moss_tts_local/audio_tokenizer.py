@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Owned MOSS-Audio-Tokenizer-v2 loader for MOSS-TTS Local."""
+"""MOSS-Audio-Tokenizer-v2 codec loader for MOSS-TTS Local."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from typing import Any
 
 import torch
 
-from sglang_omni.models.moss_tts.stages import (
-    _moss_transformers_processor_compat,
-    _resolve_checkpoint,
+from sglang_omni.models.moss_tts.hf_loading import (
+    moss_transformers_processor_compat,
+    resolve_moss_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ _LOUDNESS_GAIN_MAX_DB = 3.0
 
 
 class MossTTSLocalAudioTokenizer:
-    """Narrow encode API plus owned access to the upstream v2 codec model."""
+    """Encode wrapper around a separately loaded MOSS-Audio-Tokenizer-v2 model."""
 
     def __init__(
         self,
@@ -144,14 +144,14 @@ def load_moss_tts_local_audio_tokenizer(
     *,
     device: str = "cuda:0",
 ) -> MossTTSLocalAudioTokenizer:
-    checkpoint_dir = _resolve_checkpoint(model_path)
+    checkpoint_dir = resolve_moss_checkpoint(model_path)
     logger.info(
         f"Loading MOSS-TTS Local audio tokenizer from {checkpoint_dir} on {device}"
     )
     try:
         from transformers import AutoModel
 
-        with _moss_transformers_processor_compat():
+        with moss_transformers_processor_compat():
             model = AutoModel.from_pretrained(
                 checkpoint_dir,
                 trust_remote_code=True,

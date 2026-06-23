@@ -72,9 +72,7 @@ class _FakeAudioTokenizerModel:
         return _FakeEncodedAudio(audio_codes, audio_codes_lengths)
 
 
-# ---------------------------------------------------------------------------
 # Local transformer numerics
-# ---------------------------------------------------------------------------
 
 
 def _hf_rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -184,12 +182,10 @@ def test_rotate_half_interleaved_matches_upstream():
     torch.testing.assert_close(_rotate_half_interleaved(x), _hf_rotate_half(x))
 
 
-# ---------------------------------------------------------------------------
-# Owned audio tokenizer wrapper
-# ---------------------------------------------------------------------------
+# MOSS-Audio-Tokenizer-v2 wrapper
 
 
-def test_owned_audio_tokenizer_returns_row_major_trimmed_codes():
+def test_audio_tokenizer_returns_row_major_trimmed_codes():
     model = _FakeAudioTokenizerModel()
     tokenizer = MossTTSLocalAudioTokenizer(model, device="cpu")
     wavs = [
@@ -205,7 +201,7 @@ def test_owned_audio_tokenizer_returns_row_major_trimmed_codes():
     assert [tuple(codes.shape) for codes in encoded] == [(3, N_VQ), (5, N_VQ)]
 
 
-def test_owned_audio_tokenizer_batches_mixed_sample_rates(monkeypatch):
+def test_audio_tokenizer_batches_mixed_sample_rates(monkeypatch):
     model = _FakeAudioTokenizerModel()
     tokenizer = MossTTSLocalAudioTokenizer(model, device="cpu")
     resample_calls = []
@@ -239,7 +235,7 @@ def test_owned_audio_tokenizer_batches_mixed_sample_rates(monkeypatch):
     assert [tuple(codes.shape) for codes in encoded] == [(4, N_VQ), (6, N_VQ)]
 
 
-def test_owned_audio_tokenizer_path_resamples_before_channel_fold(monkeypatch):
+def test_audio_tokenizer_path_resamples_before_channel_fold(monkeypatch):
     model = _FakeAudioTokenizerModel()
     tokenizer = MossTTSLocalAudioTokenizer(model, device="cpu")
     observed_resample_shapes = []
@@ -268,7 +264,7 @@ def test_owned_audio_tokenizer_path_resamples_before_channel_fold(monkeypatch):
     torch.testing.assert_close(model.calls[0][0][0], expected)
 
 
-def test_owned_audio_tokenizer_matches_processor_waveform_prep_for_stereo():
+def test_audio_tokenizer_matches_processor_waveform_prep_for_stereo():
     model = _FakeAudioTokenizerModel()
     tokenizer = MossTTSLocalAudioTokenizer(model, device="cpu")
     stereo = torch.stack(
@@ -283,7 +279,7 @@ def test_owned_audio_tokenizer_matches_processor_waveform_prep_for_stereo():
     torch.testing.assert_close(prepared, expected)
 
 
-def test_owned_audio_tokenizer_matches_processor_waveform_prep_for_mono_and_extra_channels():
+def test_audio_tokenizer_matches_processor_waveform_prep_for_mono_and_extra_channels():
     model = _FakeAudioTokenizerModel()
     tokenizer = MossTTSLocalAudioTokenizer(model, device="cpu")
     mono = torch.full((1, 4), 2.0)
@@ -299,9 +295,7 @@ def test_owned_audio_tokenizer_matches_processor_waveform_prep_for_mono_and_extr
     torch.testing.assert_close(model.calls[0][0][1], three_channel[:2] * scale)
 
 
-# ---------------------------------------------------------------------------
 # Registry / config
-# ---------------------------------------------------------------------------
 
 
 def test_registry_resolves_local_architecture():
@@ -453,7 +447,9 @@ def _install_fake_moss_ar_factory(
         "make_moss_tts_local_scheduler_adapters",
         lambda **kwargs: (object(), object()),
     )
-    monkeypatch.setattr(stages, "_resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(
+        stages, "resolve_moss_checkpoint", lambda model_path: model_path
+    )
     monkeypatch.setattr(omni_scheduler, "OmniScheduler", FakeScheduler)
 
     def fake_get_process_gpu_memory_bytes(gpu_id):
@@ -551,9 +547,7 @@ def test_special_token_defaults_match_v15_checkpoint():
     assert defaults["audio_pad_code"] == 1024
 
 
-# ---------------------------------------------------------------------------
 # Generation kwargs / state
-# ---------------------------------------------------------------------------
 
 
 def test_build_generation_kwargs_defaults():
@@ -616,9 +610,7 @@ def test_build_state_token_count_and_language():
     assert state.language == "English"
 
 
-# ---------------------------------------------------------------------------
 # Preprocessing handoff + result adapter
-# ---------------------------------------------------------------------------
 
 
 class _FakeProcessor:
@@ -738,9 +730,7 @@ def test_result_adapter_empty_generation():
     assert codes.shape == (0, N_VQ)
 
 
-# ---------------------------------------------------------------------------
 # Repetition penalty parity
-# ---------------------------------------------------------------------------
 
 
 def test_audio_repetition_penalty_mask_matches_upstream_semantics():
@@ -1026,9 +1016,7 @@ def test_batched_reference_encoder_mixes_path_and_waveform_jobs():
     assert calls[0] == [2, 5]
 
 
-# ---------------------------------------------------------------------------
-# CachedReferenceEncoder  (T3–T9)
-# ---------------------------------------------------------------------------
+# CachedReferenceEncoder
 
 
 def test_cached_reference_encoder_on_off_hit_bit_identical(tmp_path):
@@ -1363,9 +1351,7 @@ def test_cached_reference_encoder_duration_gate(tmp_path, monkeypatch):
     assert len(enc._inflight) == 0
 
 
-# ---------------------------------------------------------------------------
-# Data-URI path (commit 4): bytes: keyspace + duration check
-# ---------------------------------------------------------------------------
+# Data-URI reference path
 
 
 def _make_wav_data_uri(
@@ -1397,7 +1383,7 @@ def _make_wav_data_uri(
 
 
 def test_cached_reference_encoder_data_uri_hit_miss(tmp_path):
-    """bytes: keyspace: same data-URI encoded twice -> one owned-codec encode."""
+    """bytes: keyspace: same data-URI encoded twice -> one codec encode."""
     from sglang_omni.models.moss_tts_local.stages import CachedReferenceEncoder
 
     pytest.importorskip("soundfile")
@@ -1423,7 +1409,7 @@ def test_cached_reference_encoder_data_uri_hit_miss(tmp_path):
     assert stats["misses"] == 1
 
 
-def test_uncached_data_uri_uses_owned_reference_encoder():
+def test_uncached_data_uri_uses_reference_encoder():
     from sglang_omni.models.moss_tts_local.request_builders import (
         _build_processor_message,
     )
@@ -1555,9 +1541,7 @@ def test_branchless_sampler_matches_eager_sampler():
     torch.testing.assert_close(eager, branchless)
 
 
-# ---------------------------------------------------------------------------
 # Stereo audio payload + encoding
-# ---------------------------------------------------------------------------
 
 
 def test_audio_waveform_payload_keeps_stereo_shape():

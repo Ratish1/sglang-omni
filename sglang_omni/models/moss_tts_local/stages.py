@@ -12,16 +12,16 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeAlias
 
 import torch
 
-from sglang_omni.models.moss_tts.request_builders import _DATA_URI_RE
-from sglang_omni.models.moss_tts.stages import (
-    _load_moss_processor_class,
-    _moss_transformers_processor_compat,
-    _resolve_checkpoint,
+from sglang_omni.models.moss_tts.hf_loading import (
+    load_moss_processor_class,
+    moss_transformers_processor_compat,
+    resolve_moss_checkpoint,
 )
+from sglang_omni.models.moss_tts.request_builders import _DATA_URI_RE
 from sglang_omni.models.moss_tts_local.audio_tokenizer import (
     DEFAULT_MOSS_TTS_LOCAL_AUDIO_TOKENIZER,
     load_moss_tts_local_audio_tokenizer,
@@ -81,7 +81,7 @@ class _WaveformReferenceJob:
     sample_rate: int
 
 
-_ReferenceEncodeJob = _PathReferenceJob | _WaveformReferenceJob
+_ReferenceEncodeJob: TypeAlias = _PathReferenceJob | _WaveformReferenceJob
 
 
 def _data_uri_audio_bytes(ref_audio: str) -> bytes:
@@ -92,18 +92,13 @@ def _data_uri_audio_bytes(ref_audio: str) -> bytes:
 
 
 def _decode_data_uri_audio(raw: bytes) -> tuple[torch.Tensor, int]:
-    try:
-        import soundfile as sf
-    except ImportError as exc:
-        raise RuntimeError(
-            "MOSS-TTS Local base64 reference audio requires soundfile"
-        ) from exc
+    import soundfile as sf
 
     audio, sample_rate = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
     duration = audio.shape[0] / max(int(sample_rate), 1)
     if duration > _MAX_REFERENCE_SECONDS:
         raise ValueError(
-            f"reference audio is {duration:.1f}s long; the limit is "
+            f"reference audio is {duration:.1f}s long, limit is "
             f"{_MAX_REFERENCE_SECONDS:.0f}s"
         )
     return torch.from_numpy(audio.T), int(sample_rate)
@@ -190,13 +185,13 @@ def _resolve_codec_device(device: str | None, gpu_id: int | None) -> str:
 
 
 def _load_moss_tts_local_processor(model_path: str) -> Any:
-    checkpoint_dir = _resolve_checkpoint(model_path)
+    checkpoint_dir = resolve_moss_checkpoint(model_path)
     logger.info(f"Loading MOSS-TTS Local processor from {checkpoint_dir} without codec")
     try:
         from transformers import AutoConfig, AutoTokenizer
 
-        with _moss_transformers_processor_compat():
-            processor_cls = _load_moss_processor_class(checkpoint_dir)
+        with moss_transformers_processor_compat():
+            processor_cls = load_moss_processor_class(checkpoint_dir)
             model_config = AutoConfig.from_pretrained(
                 checkpoint_dir,
                 trust_remote_code=True,
@@ -266,7 +261,7 @@ class _BatchedReferenceEncoder:
             return  # unreadable files fail with a clearer error in the codec
         if duration > cls.MAX_REFERENCE_SECONDS:
             raise ValueError(
-                f"reference audio is {duration:.1f}s long; the limit is "
+                f"reference audio is {duration:.1f}s long, limit is "
                 f"{cls.MAX_REFERENCE_SECONDS:.0f}s"
             )
 
@@ -619,7 +614,7 @@ def create_sglang_tts_engine_executor(
         build_sglang_server_args,
     )
 
-    checkpoint_dir = _resolve_checkpoint(model_path)
+    checkpoint_dir = resolve_moss_checkpoint(model_path)
     if gpu_id is not None:
         device = f"cuda:{gpu_id}"
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
