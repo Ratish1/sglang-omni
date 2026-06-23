@@ -16,6 +16,7 @@ from sglang_omni.models.moss_tts.hf_loading import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_MOSS_TTS_LOCAL_AUDIO_TOKENIZER = "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2"
+_REFERENCE_CHANNELS = 2
 _LOUDNESS_TARGET_DBFS = -20.0
 _LOUDNESS_GAIN_MIN_DB = -3.0
 _LOUDNESS_GAIN_MAX_DB = 3.0
@@ -34,7 +35,6 @@ class MossTTSLocalAudioTokenizer:
         self.device = str(device)
         config = model.config
         self.sample_rate = int(config.sampling_rate)
-        self.number_channels = int(config.number_channels)
 
     def encode_paths(
         self,
@@ -111,12 +111,12 @@ class MossTTSLocalAudioTokenizer:
         if wav.ndim == 1:
             wav = wav.unsqueeze(0)
         if wav.shape[0] == 1:
-            wav = wav.repeat(self.number_channels, 1)
-        elif wav.shape[0] > self.number_channels:
-            wav = wav[: self.number_channels]
-        if wav.shape[0] != self.number_channels:
+            wav = wav.repeat(_REFERENCE_CHANNELS, 1)
+        elif wav.shape[0] > _REFERENCE_CHANNELS:
+            wav = wav[:_REFERENCE_CHANNELS]
+        if wav.shape[0] != _REFERENCE_CHANNELS:
             raise ValueError(
-                f"expected {self.number_channels} audio channels, got {wav.shape[0]}"
+                f"expected {_REFERENCE_CHANNELS} audio channels, got {wav.shape[0]}"
             )
         if int(sample_rate) != self.sample_rate:
             import torchaudio

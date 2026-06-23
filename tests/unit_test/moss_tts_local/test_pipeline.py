@@ -295,6 +295,18 @@ def test_audio_tokenizer_matches_processor_waveform_prep_for_mono_and_extra_chan
     torch.testing.assert_close(model.calls[0][0][1], three_channel[:2] * scale)
 
 
+def test_audio_tokenizer_reference_encode_uses_processor_stereo_contract():
+    model = _FakeAudioTokenizerModel()
+    model.config.number_channels = 1
+    tokenizer = MossTTSLocalAudioTokenizer(model, device="cpu")
+    mono = torch.full((1, 4), 2.0)
+
+    tokenizer.encode_wavs([mono], 48000, num_quantizers=N_VQ)
+
+    scale = 10.0 ** (-3.0 / 20.0)
+    torch.testing.assert_close(model.calls[0][0][0], mono.repeat(2, 1) * scale)
+
+
 # Registry / config
 
 
