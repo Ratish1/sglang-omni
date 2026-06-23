@@ -56,9 +56,21 @@ class DotsTTSNativeAdapter:
     def __init__(self, runtime: Any) -> None:
         self.runtime = runtime
         self.model = runtime.model
-        self.precision = getattr(runtime, "precision", "bfloat16")
+        self.precision = runtime.precision
 
     def prepare_inputs(self, state: DotsTTSState) -> DotsTTSPreparedInputs:
+        requested_max_generate_length = state.max_generate_length
+        runtime_max_generate_length = int(self.runtime.max_generate_length or 0)
+        if (
+            requested_max_generate_length is not None
+            and runtime_max_generate_length > 0
+            and int(requested_max_generate_length) > runtime_max_generate_length
+        ):
+            raise ValueError(
+                "dots TTS request max_generate_length exceeds the latent engine "
+                f"limit: requested={int(requested_max_generate_length)} "
+                f"limit={runtime_max_generate_length}."
+            )
         raw_inputs = self.runtime._prepare_inputs(
             text=state.text,
             prompt_audio_path=state.prompt_audio_path,
@@ -67,53 +79,32 @@ class DotsTTSNativeAdapter:
             language=state.language,
             normalize_text=state.normalize_text,
         )
-        input_ids = raw_inputs.get("input_ids")
         generation_schedule = raw_inputs.get("generation_schedule")
-        prompt_input_embeds = raw_inputs.get("prompt_input_embeds")
-        prompt_conditioning = raw_inputs.get("prompt_conditioning")
-        fm_state = raw_inputs.get("fm_state")
-        audio_span_positions = raw_inputs.get("audio_span_positions")
-        prefill_end = raw_inputs.get("prefill_end")
-        audio_placeholder_ids = raw_inputs.get("audio_placeholder_ids") or set()
-        if input_ids is None:
-            input_ids = generation_schedule
-        if self._can_prepare_native_state(raw_inputs):
-            prepared = self._prepare_native_state(
-                state,
-                raw_inputs=raw_inputs,
-                generation_schedule=generation_schedule,
+        if generation_schedule is None:
+            raise RuntimeError(
+                "dots TTS native runtime did not produce a generation_schedule; "
+                "the SGLang-native latent path requires one."
             )
-            input_ids = prepared["input_ids"]
-            generation_schedule = prepared["generation_schedule"]
-            prompt_input_embeds = prepared["prompt_input_embeds"]
-            prompt_conditioning = prepared["prompt_conditioning"]
-            fm_state = prepared["fm_state"]
-            audio_span_positions = prepared["audio_span_positions"]
-            prefill_end = prepared["prefill_end"]
-            audio_placeholder_ids = prepared["audio_placeholder_ids"]
+        prepared = self._prepare_native_state(
+            state,
+            raw_inputs=raw_inputs,
+            generation_schedule=generation_schedule,
+        )
         return DotsTTSPreparedInputs(
             raw_inputs=raw_inputs,
-            input_ids=input_ids,
-            generation_schedule=generation_schedule,
-            audio_span_positions=audio_span_positions,
-            prefill_end=prefill_end,
-            audio_placeholder_ids=set(audio_placeholder_ids),
-            prompt_patch_embeddings=prompt_input_embeds,
-            prompt_conditioning=prompt_conditioning,
-            fm_state=fm_state,
+            input_ids=prepared["input_ids"],
+            generation_schedule=prepared["generation_schedule"],
+            audio_span_positions=prepared["audio_span_positions"],
+            prefill_end=prepared["prefill_end"],
+            audio_placeholder_ids=set(prepared["audio_placeholder_ids"]),
+            prompt_patch_embeddings=prepared["prompt_input_embeds"],
+            prompt_conditioning=prepared["prompt_conditioning"],
+            fm_state=prepared["fm_state"],
             generation_kwargs=self._generation_kwargs(
                 state,
-                prompt_conditioning=prompt_conditioning,
-                fm_state=fm_state,
+                prompt_conditioning=prepared["prompt_conditioning"],
+                fm_state=prepared["fm_state"],
             ),
-        )
-
-    def _can_prepare_native_state(self, raw_inputs: dict[str, Any]) -> bool:
-        return (
-            raw_inputs.get("generation_schedule") is not None
-            and hasattr(self.model, "_allocate_generate_state")
-            and hasattr(self.model, "_prepare_prompt_conditioning")
-            and hasattr(self.model, "_find_audio_span_positions")
         )
 
     def _prepare_native_state(
@@ -198,7 +189,7 @@ class DotsTTSNativeAdapter:
         fm_state: Any,
     ) -> dict[str, Any]:
         device = None
-        if fm_state is not None and getattr(fm_state, "fm_sequence", None) is not None:
+        if fm_state is not None and fm_state.fm_sequence is not None:
             device = fm_state.fm_sequence.device
         g_cond = getattr(prompt_conditioning, "g_cond", None)
         return {
@@ -210,70 +201,6 @@ class DotsTTSNativeAdapter:
             "speaker_scale": state.speaker_scale,
             "eos_threshold": 0.8,
         }
-
-    def generate_audio_step(
-        self,
-        *,
-        hidden_state: torch.Tensor,
-        fm_state: Any,
-        generation_kwargs: dict[str, Any],
-    ) -> DotsTTSAudioStepResult:
-        decode_kwargs = {
-            key: value
-            for key, value in generation_kwargs.items()
-            if key in {"device", "g_cond", "ode_method", "num_steps", "guidance_scale"}
-        }
-        if hidden_state is not None and hasattr(self.model, "_append_hidden_chunk"):
-            self.model._append_hidden_chunk(fm_state, hidden_state)
-        device = decode_kwargs.get("device")
-        dtype = _torch_dtype(self.precision)
-        use_amp = (
-            isinstance(device, torch.device)
-            and device.type == "cuda"
-            and dtype in {torch.float16, torch.bfloat16}
-        )
-        with torch.autocast(
-            device_type=device.type if isinstance(device, torch.device) else "cuda",
-            dtype=dtype,
-            enabled=use_amp,
-        ):
-            latent_patch = self.model._decode_next_audio(
-                state=fm_state,
-                **decode_kwargs,
-            )
-            latent_patch = _as_tensor(latent_patch)
-            feedback = getattr(self.model, "_encode_audio_patch_feedback", None)
-            if feedback is not None:
-                feedback_embedding = feedback(fm_state, audio_patch=latent_patch)
-            else:
-                feedback_embedding = self.model._encode_audio_patch(latent_patch)
-
-        io_helper = getattr(getattr(self.model, "core", None), "io_helper", None)
-        payload_patch = (
-            io_helper.denormalize(latent_patch)
-            if io_helper is not None
-            else latent_patch
-        )
-
-        stop_predicate = getattr(self.model, "_should_stop_after_current_audio", None)
-        if stop_predicate is not None:
-            eos_threshold = float(generation_kwargs.get("eos_threshold", 0.8))
-            eos_score = torch.tensor(
-                [1.0 if stop_predicate(fm_state, eos_threshold=eos_threshold) else 0.0],
-                device=latent_patch.device,
-            )
-        else:
-            eos_predictor = getattr(self.model, "_predict_eos", None)
-            eos_score = (
-                eos_predictor(hidden_state, latent_patch)
-                if eos_predictor is not None
-                else None
-            )
-        return DotsTTSAudioStepResult(
-            latent_patch=_as_tensor(payload_patch),
-            feedback_embedding=_as_tensor(feedback_embedding),
-            eos_score=_as_tensor(eos_score) if eos_score is not None else None,
-        )
 
 
 __all__ = [

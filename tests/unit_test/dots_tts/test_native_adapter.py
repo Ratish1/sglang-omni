@@ -5,28 +5,67 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from sglang_omni.models.dots_tts.native_adapter import DotsTTSNativeAdapter
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 
 
-class FakeRuntime:
-    precision = "bfloat16"
+class FakeNativeModel:
+    """Minimal model implementing the native preparation API the adapter requires."""
+
+    AUDIO_SPAN_ID = 99
 
     def __init__(self) -> None:
-        self.model = SimpleNamespace()
+        self.core = SimpleNamespace(
+            parameters=lambda: iter([torch.zeros(1)]),
+            audio_span_token_ids=[self.AUDIO_SPAN_ID],
+        )
+
+    def _prepare_prompt_conditioning(
+        self, prompt_audio, *, use_prompt_prefill, speaker_scale
+    ):
+        del prompt_audio, use_prompt_prefill, speaker_scale
+        return SimpleNamespace(prompt_patches=None, prompt_latents=None, g_cond=None)
+
+    def _find_audio_span_positions(self, schedule, *, audio_placeholder_ids):
+        flat = schedule.reshape(-1)
+        mask = torch.zeros_like(flat, dtype=torch.bool)
+        for placeholder in audio_placeholder_ids:
+            mask |= flat == placeholder
+        return mask.nonzero(as_tuple=False).reshape(-1)
+
+    def _allocate_generate_state(self, *, max_audio_patch_count, device, dtype):
+        del max_audio_patch_count, dtype
+        return SimpleNamespace(fm_sequence=torch.zeros(1, device=device))
+
+    def _prefill_prompt_latents(self, prompt_latents, *, state):
+        del prompt_latents, state
+        return None
+
+    def _locate_prefill_boundary(self, *, span_positions, prompt_patch_count):
+        # First audio span beyond the prompt patches starts generation.
+        prefill_end = int(span_positions[prompt_patch_count].item())
+        prompt_span_positions = span_positions[:prompt_patch_count]
+        return prefill_end, prompt_span_positions
+
+
+class FakeRuntime:
+    precision = "bfloat16"
+    max_generate_length = 0
+
+    def __init__(self) -> None:
+        self.model = FakeNativeModel()
         self.prepared_kwargs = None
 
     def _prepare_inputs(self, **kwargs):
         self.prepared_kwargs = kwargs
         return {
-            "input_ids": torch.tensor([[1, 2, 3]]),
-            "generation_schedule": torch.tensor([0, 1, 2]),
-            "audio_span_positions": torch.tensor([2]),
+            "generation_schedule": torch.tensor([[1, 2, 99, 99]]),
         }
 
 
-def test_adapter_prepares_inputs_from_state() -> None:
+def test_adapter_prepares_native_state_from_state() -> None:
     runtime = FakeRuntime()
     adapter = DotsTTSNativeAdapter(runtime)
     state = DotsTTSState(
@@ -48,26 +87,25 @@ def test_adapter_prepares_inputs_from_state() -> None:
         "language": "en",
         "normalize_text": False,
     }
-    assert prepared.input_ids.tolist() == [[1, 2, 3]]
-    assert prepared.generation_schedule.tolist() == [0, 1, 2]
-    assert prepared.audio_span_positions.tolist() == [2]
+    # Native prep derives input_ids from the schedule up to the first decode span.
+    assert prepared.input_ids.tolist() == [[1, 2]]
+    assert prepared.generation_schedule.tolist() == [[1, 2, 99, 99]]
+    assert prepared.audio_span_positions.tolist() == [2, 3]
+    assert prepared.prefill_end == 2
+    assert prepared.fm_state is not None
+    assert prepared.audio_placeholder_ids == {FakeNativeModel.AUDIO_SPAN_ID}
 
 
-def test_adapter_uses_generation_schedule_as_input_ids_when_missing() -> None:
-    class ScheduleOnlyRuntime(FakeRuntime):
+def test_adapter_requires_generation_schedule() -> None:
+    class ScheduleLessRuntime(FakeRuntime):
         def _prepare_inputs(self, **kwargs):
             del kwargs
-            return {
-                "generation_schedule": torch.tensor([[5, 6, 7]]),
-                "audio_span_positions": torch.tensor([2]),
-            }
+            return {}
 
-    prepared = DotsTTSNativeAdapter(ScheduleOnlyRuntime()).prepare_inputs(
-        DotsTTSState(text="Hello.")
-    )
-
-    assert prepared.input_ids.tolist() == [[5, 6, 7]]
-    assert prepared.generation_schedule.tolist() == [[5, 6, 7]]
+    with pytest.raises(RuntimeError, match="generation_schedule"):
+        DotsTTSNativeAdapter(ScheduleLessRuntime()).prepare_inputs(
+            DotsTTSState(text="Hello.")
+        )
 
 
 class FakeDotsModel:
@@ -95,25 +133,25 @@ class FakeDotsModel:
         return True
 
 
-def test_adapter_generates_patch_feedback_and_eos() -> None:
+def test_adapter_does_not_expose_legacy_audio_step() -> None:
     runtime = SimpleNamespace(model=FakeDotsModel(), precision="bfloat16")
     adapter = DotsTTSNativeAdapter(runtime)
-    hidden_state = torch.ones(1, 1, 2048)
 
-    result = adapter.generate_audio_step(
-        hidden_state=hidden_state,
-        fm_state={"history": []},
-        generation_kwargs={
-            "ode_method": "euler",
-            "num_steps": 2,
-            "guidance_scale": 1.2,
-            "speaker_scale": 1.5,
-            "device": torch.device("cpu"),
-            "g_cond": None,
-            "eos_threshold": 0.8,
-        },
-    )
+    assert not hasattr(adapter, "generate_audio_step")
 
-    assert result.latent_patch.shape == (1, 4, 128)
-    assert result.feedback_embedding.shape == (1, 1, 128)
-    assert torch.allclose(result.eos_score, torch.tensor([1.0]))
+
+def test_adapter_rejects_request_longer_than_runtime_schedule() -> None:
+    class ShortScheduleRuntime(FakeRuntime):
+        max_generate_length = 4
+
+        def _prepare_inputs(self, **kwargs):
+            del kwargs
+            return {
+                "generation_schedule": torch.tensor([[1, 2, 99, 99, 99, 99]]),
+                "audio_span_positions": torch.tensor([2, 3, 4, 5]),
+            }
+
+    adapter = DotsTTSNativeAdapter(ShortScheduleRuntime())
+
+    with pytest.raises(ValueError, match="max_generate_length"):
+        adapter.prepare_inputs(DotsTTSState(text="Hello.", max_generate_length=8))
