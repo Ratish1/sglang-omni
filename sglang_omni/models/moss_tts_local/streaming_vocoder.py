@@ -239,8 +239,8 @@ class _CodecStreamSession:
     def decode_offline(
         self, codes_list: list[torch.Tensor], *, max_step_frames: int
     ) -> list[torch.Tensor]:
-        """Decode complete utterances ``[n_vq, T]`` via the offline lane, replaying the codec's
-        chunked ``batch_decode`` so output matches ``processor.decode_audio_codes``."""
+        """Decode complete utterances ``[n_vq, T]`` through offline slots in the
+        persistent codec session."""
         wavs: list[torch.Tensor] = []
         for wave_start in range(0, len(codes_list), self._offline_slots):
             wave = codes_list[wave_start : wave_start + self._offline_slots]

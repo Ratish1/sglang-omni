@@ -84,26 +84,6 @@ class _WaveformReferenceJob:
 _ReferenceEncodeJob: TypeAlias = _PathReferenceJob | _WaveformReferenceJob
 
 
-def _data_uri_audio_bytes(ref_audio: str) -> bytes:
-    match = _DATA_URI_RE.match(ref_audio)
-    if match is None:
-        raise ValueError(f"encode_data_uri: not a data URI ({ref_audio[:40]!r}...)")
-    return base64.b64decode(match.group("data"))
-
-
-def _decode_data_uri_audio(raw: bytes) -> tuple[torch.Tensor, int]:
-    import soundfile as sf
-
-    audio, sample_rate = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
-    duration = audio.shape[0] / max(int(sample_rate), 1)
-    if duration > _MAX_REFERENCE_SECONDS:
-        raise ValueError(
-            f"reference audio is {duration:.1f}s long, limit is "
-            f"{_MAX_REFERENCE_SECONDS:.0f}s"
-        )
-    return torch.from_numpy(audio.T), int(sample_rate)
-
-
 def _apply_colocated_ar_memory_budget(
     overrides: dict[str, Any],
     *,
@@ -224,7 +204,6 @@ def _resolve_audio_tokenizer_model_path(
             "audio_tokenizer_name_or_path",
             DEFAULT_MOSS_TTS_LOCAL_AUDIO_TOKENIZER,
         )
-        or DEFAULT_MOSS_TTS_LOCAL_AUDIO_TOKENIZER
     )
 
 
@@ -281,6 +260,26 @@ class _BatchedReferenceEncoder:
                 f"{cls.MAX_REFERENCE_SECONDS:.0f}s"
             )
 
+    @staticmethod
+    def _data_uri_audio_bytes(ref_audio: str) -> bytes:
+        match = _DATA_URI_RE.match(ref_audio)
+        if match is None:
+            raise ValueError(f"encode_data_uri: not a data URI ({ref_audio[:40]!r}...)")
+        return base64.b64decode(match.group("data"))
+
+    @staticmethod
+    def _decode_data_uri_audio(raw: bytes) -> tuple[torch.Tensor, int]:
+        import soundfile as sf
+
+        audio, sample_rate = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
+        duration = audio.shape[0] / max(int(sample_rate), 1)
+        if duration > _BatchedReferenceEncoder.MAX_REFERENCE_SECONDS:
+            raise ValueError(
+                f"reference audio is {duration:.1f}s long, limit is "
+                f"{_BatchedReferenceEncoder.MAX_REFERENCE_SECONDS:.0f}s"
+            )
+        return torch.from_numpy(audio.T), int(sample_rate)
+
     def encode(self, path: str) -> torch.Tensor:
         """Encode one reference file; blocks until its batch completes."""
         path = str(path)
@@ -295,7 +294,8 @@ class _BatchedReferenceEncoder:
         return future.result(timeout=self.ENCODE_TIMEOUT_S)
 
     def encode_data_uri(self, ref_audio: str) -> torch.Tensor:
-        wav, sample_rate = _decode_data_uri_audio(_data_uri_audio_bytes(ref_audio))
+        raw = self._data_uri_audio_bytes(ref_audio)
+        wav, sample_rate = self._decode_data_uri_audio(raw)
         return self.encode_wav(wav, sample_rate)
 
     def _drain_batch(
@@ -532,14 +532,14 @@ class CachedReferenceEncoder:
         Note(Jiaxin): file: and bytes: keyspaces never collide — the two decode
         chains differ, so codes aren't guaranteed identical for the "same" audio.
         """
-        raw = _data_uri_audio_bytes(ref_audio)
+        raw = _BatchedReferenceEncoder._data_uri_audio_bytes(ref_audio)
         key = f"bytes:{_hash_bytes(raw)}"
 
         def _encode() -> torch.Tensor:
             # Note(Jiaxin): the duration check runs inside the leader (not before
             # inflight registration like the file path) so concurrent same-payload
             # requests share one sf.read of a potentially large decoded buffer.
-            wav, sample_rate = _decode_data_uri_audio(raw)
+            wav, sample_rate = _BatchedReferenceEncoder._decode_data_uri_audio(raw)
             return self._encoder.encode_wav(wav, sample_rate)
 
         return self._cached_encode(key, _encode, desc="data-URI")
