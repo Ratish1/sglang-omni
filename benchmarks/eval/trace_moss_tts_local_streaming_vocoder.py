@@ -33,9 +33,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from sglang_omni.models.moss_tts_local import (
-    streaming_vocoder as streaming_vocoder_module,
-)
 from sglang_omni.models.moss_tts_local.audio_tokenizer import (
     load_moss_tts_local_audio_tokenizer,
 )
@@ -45,6 +42,8 @@ from sglang_omni.models.moss_tts_local.stages import (
 )
 from sglang_omni.models.moss_tts_local.streaming_attention import (
     moss_local_window_size,
+    patch_codec_streaming_attention,
+    restore_codec_streaming_attention,
     streaming_local_attention,
 )
 from sglang_omni.models.moss_tts_local.streaming_vocoder import _CodecStreamSession
@@ -139,10 +138,10 @@ def _parse_args() -> argparse.Namespace:
         choices=["reference-sdpa", "sglang"],
         default="reference-sdpa",
         help=(
-            "Streaming attention backend for the trace run. reference-sdpa "
-            "disables the serving SGLang patch so SDPA calls can be captured "
-            "and compared against the SGLang oracle. sglang exercises the "
-            "serving path directly."
+            "Streaming attention backend for the trace run. reference-sdpa keeps "
+            "the codec SDPA path so SDPA calls can be captured and compared "
+            "against the SGLang oracle. sglang installs the experimental "
+            "SGLang attention path for this trace process only."
         ),
     )
     parser.add_argument(
@@ -1216,13 +1215,19 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
 
 
 @contextlib.contextmanager
-def _reference_sdpa_streaming_attention():
-    patch = streaming_vocoder_module.patch_codec_streaming_attention
-    streaming_vocoder_module.patch_codec_streaming_attention = lambda codec: 0
+def _streaming_attention_backend(codec, backend: str):
+    if backend == "reference-sdpa":
+        yield
+        return
+    patched = patch_codec_streaming_attention(codec)
+    logger.info(
+        "MOSS streaming trace installed SGLang attention modules=%d",
+        patched,
+    )
     try:
         yield
     finally:
-        streaming_vocoder_module.patch_codec_streaming_attention = patch
+        restore_codec_streaming_attention(codec)
 
 
 def main() -> None:
@@ -1266,11 +1271,7 @@ def main() -> None:
         "cases": [],
     }
 
-    patch_context = contextlib.nullcontext()
-    if args.attention_backend == "reference-sdpa":
-        patch_context = _reference_sdpa_streaming_attention()
-
-    with patch_context:
+    with _streaming_attention_backend(codec, args.attention_backend):
         session = _CodecStreamSession(
             codec,
             stream_slots=args.stream_slots,

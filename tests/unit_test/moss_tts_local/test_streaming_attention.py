@@ -14,6 +14,7 @@ from sglang_omni.models.moss_tts_local.streaming_attention import (
     moss_decoder_attention_modules,
     moss_local_window_size,
     patch_codec_streaming_attention,
+    restore_codec_streaming_attention,
 )
 
 
@@ -97,6 +98,25 @@ def test_patch_codec_streaming_attention_is_decoder_only_and_idempotent(
     assert codec.decoder_attention._forward_streaming_sdpa.__name__ == (
         streaming_attention._forward_streaming_sglang.__name__
     )
+
+
+def test_restore_codec_streaming_attention_returns_original_method(monkeypatch) -> None:
+    codec = _FakeCodec()
+    monkeypatch.setattr(streaming_attention, "flash_attn_with_kvcache", object())
+    original = codec.decoder_attention._forward_streaming_sdpa
+
+    assert patch_codec_streaming_attention(codec) == 1
+    assert restore_codec_streaming_attention(codec) == 1
+    assert restore_codec_streaming_attention(codec) == 0
+
+    x = torch.randn(1, 2, 8)
+    state = SimpleNamespace(offset=torch.zeros(1, dtype=torch.long))
+    out = codec.decoder_attention._forward_streaming_sdpa(x, state)
+    assert out[0] == "sdpa"
+    assert out[1] is x
+    assert out[2] is state
+    assert codec.decoder_attention._forward_streaming_sdpa.__func__ is original.__func__
+    assert not hasattr(codec.decoder_attention, _ORIGINAL_STREAMING_SDPA_ATTR)
 
 
 def test_patched_streaming_attention_keeps_cpu_inputs_on_original_path(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -17,15 +18,14 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
-from sglang_omni.models.moss_tts_local.streaming_attention import (
-    patch_codec_streaming_attention,
-)
 from sglang_omni.models.moss_tts_local.vocoder_decoder import MossTTSLocalVocoderDecoder
 from sglang_omni.models.tts_streaming import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     resolve_initial_codec_chunk_frames,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
@@ -34,6 +34,26 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 _SOURCE_HINT = "MOSS-TTS Local"
+
+
+def _emit_many(
+    request_ids: list[str] | None,
+    event_name: str,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    timestamp_ns: int | None = None,
+) -> None:
+    if not request_ids or not _get_event_recorder().is_active():
+        return
+    ts = time.time_ns() if timestamp_ns is None else timestamp_ns
+    for request_id in request_ids:
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name=event_name,
+            metadata=metadata,
+            timestamp_ns=ts,
+        )
 
 
 def _build_usage(state: MossTTSLocalState) -> dict[str, Any] | None:
@@ -70,12 +90,6 @@ class _CodecStreamSession:
         self._cg_graph_t: Counter = Counter()
         self._cg_eager_t: Counter = Counter()
         self._cg_total_steps = 0
-        patched_attention = patch_codec_streaming_attention(self._codec)
-        if patched_attention:
-            logger.info(
-                "MOSS-TTS Local streaming vocoder uses SGLang attention modules=%d",
-                patched_attention,
-            )
         # Retain the streaming ExitStack so per-slot causal state lives across steps (closed in close());
         # graph replay is kept bit-identical to this stateful decode by the in-place cache patch.
         self._exit_stack = contextlib.ExitStack()
@@ -178,7 +192,12 @@ class _CodecStreamSession:
         with torch.no_grad():
             self._codec.apply(_reset)
 
-    def step(self, slot_codes: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+    def step(
+        self,
+        slot_codes: dict[int, torch.Tensor],
+        *,
+        profile_request_ids: list[str] | None = None,
+    ) -> dict[int, torch.Tensor]:
         """Advance participating slots by one uniform-length step. ``slot_codes`` maps slot -> ``[n_vq, T]`` (same T); returns slot -> ``[channels, samples]`` float32 CPU audio."""
         if not slot_codes:
             return {}
@@ -188,6 +207,18 @@ class _CodecStreamSession:
                 f"streaming step requires a uniform length, got {sorted(step_lengths)}"
             )
         (step_t,) = step_lengths
+        slots = list(slot_codes)
+        metadata = {
+            "step_t": step_t,
+            "slots": slots,
+            "active_slots": len(slots),
+            "batch_size": self._batch_size,
+        }
+        _emit_many(
+            profile_request_ids,
+            "moss_streaming_step_prepare_start",
+            metadata=metadata,
+        )
         n_vq = int(next(iter(slot_codes.values())).shape[0])
         codes_step = torch.zeros(
             n_vq, self._batch_size, step_t, dtype=torch.long, device=self._device
@@ -200,27 +231,65 @@ class _CodecStreamSession:
             codes_step[:, slot, :] = codes.to(device=self._device, dtype=torch.long)
             codes_lengths[slot] = step_t
             exec_mask[slot] = True
-        slots = list(slot_codes)
+        _emit_many(
+            profile_request_ids,
+            "moss_streaming_step_prepare_end",
+            metadata=metadata,
+        )
         graphed = None
         graph_failed = False
         try:
             with torch.no_grad():
                 if self._cg_runner is not None:
+                    _emit_many(
+                        profile_request_ids,
+                        "moss_streaming_graph_decode_start",
+                        metadata=metadata,
+                    )
                     try:
                         graphed = self._cg_runner.decode_step(codes_step, exec_mask)
                     except Exception:
                         graph_failed = True
                         raise
+                    finally:
+                        _emit_many(
+                            profile_request_ids,
+                            "moss_streaming_graph_decode_end",
+                            metadata=metadata,
+                        )
                 if graphed is not None:
                     audio, audio_lengths = graphed
                 else:
+                    _emit_many(
+                        profile_request_ids,
+                        "moss_streaming_eager_decode_start",
+                        metadata=metadata,
+                    )
                     self._codec._set_streaming_exec_mask(exec_mask)
                     result = self._codec._decode_frame(codes_step, codes_lengths)
                     audio, audio_lengths = result.audio, result.audio_lengths
+                    _emit_many(
+                        profile_request_ids,
+                        "moss_streaming_eager_decode_end",
+                        metadata=metadata,
+                    )
             # One batched D2H per step. A graph replay error can surface async HERE (not in
             # decode_step), so materialization stays inside the replay guard.
+            _emit_many(
+                profile_request_ids,
+                "moss_streaming_output_d2h_start",
+                metadata=metadata,
+            )
             audio_cpu = audio[slots].detach().to("cpu", torch.float32)
             lengths_cpu = audio_lengths[slots].detach().to("cpu")
+            _emit_many(
+                profile_request_ids,
+                "moss_streaming_output_d2h_end",
+                metadata={
+                    **metadata,
+                    "graphed": graphed is not None,
+                },
+            )
         except Exception:
             # Graphed step failed (in decode_step or async on the D2H): disable the runner so future
             # steps go eager; participants abort. An eager-path error does not disable it.
@@ -416,6 +485,11 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
     def on_stream_chunk(
         self, request_id: str, item: StreamItem
     ) -> list[OutgoingMessage]:
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="moss_streaming_on_chunk_start",
+        )
         state = self._stream_states.setdefault(request_id, _LocalStreamState())
         self._latch_stream_metadata(request_id, state, item.metadata)
 
@@ -436,9 +510,24 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         state.pending.append(row[1 : 1 + n_vq])
         self._ensure_slot(state)
         self._pump_streams()
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="moss_streaming_on_chunk_end",
+            metadata={
+                "pending": len(state.pending),
+                "slot": state.slot,
+                "emitted_any": state.emitted_any,
+            },
+        )
         return []
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="moss_streaming_on_done_start",
+        )
         payload = self._stream_payloads[request_id]
         state = self._stream_states.setdefault(request_id, _LocalStreamState())
 
@@ -458,7 +547,12 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 step_t = min(len(state.pending), self._max_step_frames)
                 codes = torch.stack(state.pending[:step_t], dim=1)
                 del state.pending[:step_t]
-                audio_parts.append(session.step({state.slot: codes})[state.slot])
+                audio_parts.append(
+                    session.step(
+                        {state.slot: codes},
+                        profile_request_ids=[request_id],
+                    )[state.slot]
+                )
             session.release(state.slot)
             state.slot = None
 
@@ -490,6 +584,15 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                     data=final_data,
                 ),
             )
+        )
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="moss_streaming_on_done_end",
+            metadata={
+                "audio_parts": len(audio_parts),
+                "emitted_any": state.emitted_any,
+            },
         )
         return messages
 
@@ -694,8 +797,26 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             plan: dict[int, torch.Tensor] = {}
             for _, state in participants:
                 plan[state.slot] = torch.stack(state.pending[:step_t], dim=1)
+            request_ids = [request_id for request_id, _ in participants]
+            step_metadata = {
+                "step_t": step_t,
+                "participants": len(participants),
+            }
             try:
-                decoded = self._ensure_session().step(plan)
+                _emit_many(
+                    request_ids,
+                    "moss_streaming_pump_step_start",
+                    metadata=step_metadata,
+                )
+                decoded = self._ensure_session().step(
+                    plan,
+                    profile_request_ids=request_ids,
+                )
+                _emit_many(
+                    request_ids,
+                    "moss_streaming_pump_step_end",
+                    metadata=step_metadata,
+                )
             except Exception as exc:
                 logger.exception(
                     "MOSS-TTS Local streaming decode step failed; aborting %d "

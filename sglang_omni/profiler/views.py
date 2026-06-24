@@ -253,7 +253,15 @@ def stage_breakdown(
     source: str | Path | Iterable[str | Path] | None = None,
 ) -> list[StageBreakdownRow]:
     """Aggregate interval durations by (stage, open/close pair)."""
-    intervals = compute_stage_intervals(timelines, source=source)
+    if timelines is None:
+        if source is None:
+            raise ValueError("stage_breakdown requires timelines or source")
+        timelines = reconstruct_timelines(source)
+    interval_events = _interval_events_with_dynamic_pairs(timelines)
+    intervals = compute_stage_intervals(
+        timelines,
+        interval_events=interval_events,
+    )
     bucket: dict[tuple[str, str, str], list[float]] = defaultdict(list)
     for it in intervals:
         key = (it.stage, it.open_event, it.close_event)
@@ -275,6 +283,25 @@ def stage_breakdown(
         )
     rows.sort(key=lambda r: (-r.total_ms, r.stage))
     return rows
+
+
+def _interval_events_with_dynamic_pairs(
+    timelines: dict[str, RequestTimeline],
+) -> tuple[tuple[str, str], ...]:
+    names = {
+        ev.get("event_name")
+        for tl in timelines.values()
+        for ev in tl.events
+        if isinstance(ev.get("event_name"), str)
+    }
+    pairs = set(_STAGE_INTERVAL_EVENTS)
+    for name in names:
+        if not name.endswith("_start"):
+            continue
+        closer = f"{name[:-6]}_end"
+        if closer in names:
+            pairs.add((name, closer))
+    return tuple(sorted(pairs))
 
 
 # ---------------------------------------------------------------------------

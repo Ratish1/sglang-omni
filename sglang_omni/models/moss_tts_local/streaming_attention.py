@@ -40,7 +40,7 @@ def moss_decoder_attention_modules(codec: nn.Module) -> list[Any]:
 
 
 def patch_codec_streaming_attention(codec: nn.Module) -> int:
-    """Route MOSS decoder streaming attention through SGLang FlashAttention."""
+    """Install the experimental SGLang streaming attention path for profiling."""
     if flash_attn_with_kvcache is None:
         logger.debug(
             "MOSS-TTS Local streaming SGLang attention unavailable; using codec SDPA"
@@ -56,6 +56,19 @@ def patch_codec_streaming_attention(codec: nn.Module) -> int:
         module._forward_streaming_sdpa = MethodType(_forward_streaming_sglang, module)
         patched += 1
     return patched
+
+
+def restore_codec_streaming_attention(codec: nn.Module) -> int:
+    """Restore decoder streaming attention modules patched by the profiler."""
+    restored = 0
+    for module in moss_decoder_attention_modules(codec):
+        original = getattr(module, _ORIGINAL_STREAMING_SDPA_ATTR, None)
+        if original is None:
+            continue
+        module._forward_streaming_sdpa = original
+        delattr(module, _ORIGINAL_STREAMING_SDPA_ATTR)
+        restored += 1
+    return restored
 
 
 def streaming_local_attention(
@@ -175,5 +188,6 @@ __all__ = [
     "moss_decoder_attention_modules",
     "moss_local_window_size",
     "patch_codec_streaming_attention",
+    "restore_codec_streaming_attention",
     "streaming_local_attention",
 ]

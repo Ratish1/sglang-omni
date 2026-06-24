@@ -137,6 +137,29 @@ def test_stage_breakdown_keeps_intervals_stage_local(tmp_path: Path) -> None:
     assert encoder_rows == []
 
 
+def test_stage_breakdown_discovers_dynamic_start_end_pairs(tmp_path: Path) -> None:
+    events = [
+        _ev("r1", "vocoder", "moss_streaming_step_prepare_start", 0),
+        _ev("r1", "vocoder", "moss_streaming_step_prepare_end", 2_000_000),
+        _ev("r2", "vocoder", "moss_streaming_step_prepare_start", 10_000_000),
+        _ev("r2", "vocoder", "moss_streaming_step_prepare_end", 15_000_000),
+    ]
+    _write_events(tmp_path / "events_vocoder_1.jsonl", events)
+
+    rows = stage_breakdown(source=tmp_path)
+    dynamic_rows = [
+        r
+        for r in rows
+        if r.stage == "vocoder"
+        and r.interval_name
+        == "moss_streaming_step_prepare_start->moss_streaming_step_prepare_end"
+    ]
+
+    assert len(dynamic_rows) == 1
+    assert dynamic_rows[0].count == 2
+    assert dynamic_rows[0].avg_ms == 3.5
+
+
 # ---------------------------------------------------------------------------
 # Hop breakdown
 # ---------------------------------------------------------------------------
