@@ -10,6 +10,7 @@ from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.dots_tts.sglang_model import DotsTTSLatentBatch
 
 
 class DotsTTSModelRunner(ModelRunner):
@@ -80,11 +81,26 @@ class DotsTTSModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> GenerationBatchResult | None:
-        del schedule_batch, requests
+        del schedule_batch
         input_embeds = getattr(forward_batch, "input_embeds", None)
         if input_embeds is None:
             return None
-        return self._forward_with_input_embeds(forward_batch, input_embeds)
+        model_runner = self.tp_worker.model_runner
+        model_runner.attn_backend.init_forward_metadata(forward_batch)
+        positions = forward_batch.positions
+        if forward_batch.mrope_positions is not None:
+            positions = forward_batch.mrope_positions
+        latent_output = self.model.forward_latent_decode_step(
+            input_ids=forward_batch.input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            requests=requests,
+            input_embeds=input_embeds.to(
+                device=forward_batch.input_ids.device,
+                dtype=next(self.model.parameters()).dtype,
+            ),
+        )
+        return latent_output.batch_result
 
     def _forward_with_input_embeds(
         self,
@@ -137,13 +153,17 @@ class DotsTTSModelRunner(ModelRunner):
         self, result: Any, forward_batch: Any, schedule_batch: Any, requests: list
     ) -> None:
         self._capture_hidden_states(result, requests, packed_prefill=True)
-        self._run_audio_step(result, requests)
+        self._run_model_latent_batch(result, requests)
 
     def post_decode(
         self, result: Any, forward_batch: Any, schedule_batch: Any, requests: list
     ) -> None:
+        latent_output = getattr(result, "dots_tts_latent_output", None)
+        if latent_output is not None:
+            self._apply_latent_step_output(latent_output, result, requests)
+            return
         self._capture_hidden_states(result, requests, packed_prefill=False)
-        self._run_audio_step(result, requests)
+        self._run_model_latent_batch(result, requests)
 
     def _capture_hidden_states(
         self,
@@ -188,32 +208,47 @@ class DotsTTSModelRunner(ModelRunner):
                 offset - 1 : offset
             ].unsqueeze(0)
 
-    def _run_audio_step(self, result: Any, requests: list) -> None:
-        control_ids: list[int] = []
-        for sched_req in requests:
-            data = sched_req.data
-            if (
-                data.finish_reason is None
-                and data.fm_state is not None
-                and data.latest_hidden_state is not None
-            ):
-                audio_step = self.model.step_audio_latent(
-                    data, data.latest_hidden_state
-                )
-                data.latest_latent_patch = audio_step.latent_patch
-                data.latent_patches.append(audio_step.latent_patch.detach())
-                data.decode_input_embeds.append(audio_step.feedback_embedding)
-                data.eos_score = audio_step.eos_score
-                data.position += 1
-                if self._should_finish(data):
-                    self._mark_finished(data)
-            control_ids.append(data.control_token_id)
-
-        result.next_token_ids = torch.tensor(
-            control_ids,
-            dtype=torch.long,
-            device=self.device,
+    def _run_model_latent_batch(self, result: Any, requests: list) -> None:
+        active_indices = [
+            index
+            for index, sched_req in enumerate(requests)
+            if self._can_run_latent_step(sched_req.data)
+        ]
+        latent_output = self.model.decode_audio_batch(
+            DotsTTSLatentBatch(
+                requests=requests,
+                active_indices=active_indices,
+                hidden_states=[
+                    sched_req.data.latest_hidden_state for sched_req in requests
+                ],
+            )
         )
+        self._apply_latent_step_output(latent_output, result, requests)
+
+    def _apply_latent_step_output(
+        self,
+        latent_output: Any,
+        result: Any,
+        requests: list,
+    ) -> None:
+        for index, sched_req in enumerate(requests):
+            data = sched_req.data
+            hidden_state = latent_output.hidden_states[index]
+            latent_patch = latent_output.latent_patches[index]
+            feedback_embedding = latent_output.feedback_embeddings[index]
+            eos_score = latent_output.eos_scores[index]
+            if hidden_state is not None:
+                data.latest_hidden_state = hidden_state
+            if latent_patch is not None:
+                data.latest_latent_patch = latent_patch
+                data.latent_patches.append(latent_patch.detach())
+                data.position += 1
+            if feedback_embedding is not None:
+                data.decode_input_embeds.append(feedback_embedding)
+            data.eos_score = eos_score
+            if latent_output.finished[index]:
+                self._mark_finished(data)
+        result.next_token_ids = latent_output.next_token_ids
 
     @staticmethod
     def _mark_finished(data: Any) -> None:
@@ -223,11 +258,12 @@ class DotsTTSModelRunner(ModelRunner):
             req.finished_reason = FINISH_MATCHED_TOKEN(data.control_token_id)
 
     @staticmethod
-    def _should_finish(data: Any) -> bool:
-        eos_score = data.eos_score
-        if eos_score is not None and bool((eos_score > 0.5).any()):
-            return True
-        return len(data.latent_patches) >= data.max_generate_length
+    def _can_run_latent_step(data: Any) -> bool:
+        return (
+            data.finish_reason is None
+            and data.fm_state is not None
+            and data.latest_hidden_state is not None
+        )
 
 
 __all__ = ["DotsTTSModelRunner"]

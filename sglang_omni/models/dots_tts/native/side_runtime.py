@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -81,6 +82,16 @@ class RuntimeInputs(TypedDict, total=False):
     template_name: str
     generation_schedule: torch.Tensor
     prompt_audio: torch.Tensor
+
+
+@dataclass(frozen=True)
+class DotsTtsSideModuleBundle:
+    model: "DotsTtsSideModel"
+    core: DotsTtsCore
+    xvector_extractor: SpeakerXVectorFeatures
+    tokenizer: Any
+    config: ModelConfig
+    llm_config: Qwen2Config
 
 
 class DotsTtsSideCore(nn.Module):
@@ -382,6 +393,14 @@ class DotsTtsSideRuntime:
         self.optimize = bool(optimize)
         self.max_generate_length = int(max_generate_length)
         self.model.set_optimize(self.optimize)
+        self.module_bundle = DotsTtsSideModuleBundle(
+            model=self.model,
+            core=self.model.core,
+            xvector_extractor=self.model.xvector_extractor,
+            tokenizer=self.model.tokenizer,
+            config=self.model.config,
+            llm_config=self.model.llm_config,
+        )
         self.sample_rate = int(self.model.config.vocoder.sample_rate)
         if self.optimize:
             self.model.run_warmup(
@@ -610,4 +629,4 @@ class DotsTtsSideRuntime:
         return inputs
 
 
-__all__ = ["DotsTtsSideModel", "DotsTtsSideRuntime"]
+__all__ = ["DotsTtsSideModel", "DotsTtsSideModuleBundle", "DotsTtsSideRuntime"]

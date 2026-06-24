@@ -90,6 +90,24 @@ def test_dots_tts_preprocessing_maps_speech_request_fields() -> None:
     assert state.stream is True
 
 
+def test_dots_tts_preprocessing_reads_explicit_speech_generation_params() -> None:
+    from sglang_omni.models.dots_tts.payload_types import DotsTTSState
+    from sglang_omni.models.dots_tts.stages import preprocess_dots_tts_payload
+
+    payload = make_payload(
+        inputs={"text": "hello", "references": [{"audio_path": "ref.wav"}]},
+        tts_params={
+            "max_new_tokens": 12,
+            "explicit_generation_params": ["max_new_tokens"],
+        },
+    )
+
+    prepared = preprocess_dots_tts_payload(payload)
+    state = DotsTTSState.from_dict(prepared.data)
+
+    assert state.max_generate_length == 12
+
+
 def test_dots_tts_latent_engine_alias_uses_sglang_path(monkeypatch) -> None:
     from sglang_omni.models.dots_tts import stages
 
@@ -285,11 +303,11 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
     class FakeModel:
         def __init__(self) -> None:
             self.native_adapter = None
-            self.attached_model = None
+            self.attached_bundle = None
             self.attached_precision = None
 
-        def attach_native_model(self, native_model, *, precision=None):
-            self.attached_model = native_model
+        def attach_side_module_bundle(self, module_bundle, *, precision=None):
+            self.attached_bundle = module_bundle
             self.attached_precision = precision
 
     fake_model = FakeModel()
@@ -340,8 +358,11 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
         def _generate_latents_stream(self, *args, **kwargs):
             raise AssertionError("_generate_latents_stream must not run")
 
+    fake_runtime_model = StreamFallbackMustNotRun()
+    fake_module_bundle = SimpleNamespace(model=fake_runtime_model)
     fake_side_runtime = SimpleNamespace(
-        model=StreamFallbackMustNotRun(),
+        model=fake_runtime_model,
+        module_bundle=fake_module_bundle,
         precision="bfloat16",
     )
 
@@ -381,7 +402,7 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
     assert captured["infra_call"][2] == "DotsTTSForConditionalGeneration"
     assert captured["output_processor_kwargs"]["capture_hidden"] is True
     assert captured["output_processor_kwargs"]["model"] is fake_model
-    assert fake_model.attached_model is fake_side_runtime.model
+    assert fake_model.attached_bundle is fake_side_runtime.module_bundle
     assert fake_model.attached_precision == "bfloat16"
     assert fake_model.native_adapter.runtime is fake_side_runtime
     assert captured["server_args_call"][2]["max_running_requests"] == 8
@@ -401,8 +422,9 @@ def test_create_sglang_latent_engine_accepts_concurrent_requests(monkeypatch) ->
 
     fake_model = SimpleNamespace(
         native_adapter=None,
-        attach_native_model=lambda native_model, *, precision=None: None,
+        attach_side_module_bundle=lambda module_bundle, *, precision=None: None,
     )
+    fake_runtime_model = SimpleNamespace(llm_config=SimpleNamespace(vocab_size=32000))
 
     monkeypatch.setattr(
         stages,
@@ -427,7 +449,8 @@ def test_create_sglang_latent_engine_accepts_concurrent_requests(monkeypatch) ->
         stages,
         "_get_or_load_side_runtime",
         lambda *args, **kwargs: SimpleNamespace(
-            model=SimpleNamespace(llm_config=SimpleNamespace(vocab_size=32000)),
+            model=fake_runtime_model,
+            module_bundle=SimpleNamespace(model=fake_runtime_model),
             precision="bfloat16",
         ),
     )
@@ -458,6 +481,16 @@ def test_create_sglang_latent_engine_accepts_concurrent_requests(monkeypatch) ->
     assert captured["overrides"]["max_running_requests"] == 2
 
 
+def test_create_sglang_latent_engine_rejects_tensor_parallel() -> None:
+    from sglang_omni.models.dots_tts import stages
+
+    with pytest.raises(ValueError, match="tp_size=1"):
+        stages.create_sglang_latent_engine_executor(
+            "dots-model",
+            server_args_overrides={"tp_size": 2},
+        )
+
+
 def test_create_sglang_latent_engine_loads_side_runtime_on_worker_device(
     monkeypatch,
 ) -> None:
@@ -468,7 +501,7 @@ def test_create_sglang_latent_engine_loads_side_runtime_on_worker_device(
     captured: dict[str, object] = {}
     fake_model = SimpleNamespace(
         native_adapter=None,
-        attach_native_model=lambda native_model, *, precision=None: None,
+        attach_side_module_bundle=lambda module_bundle, *, precision=None: None,
     )
 
     monkeypatch.setattr(
@@ -497,8 +530,10 @@ def test_create_sglang_latent_engine_loads_side_runtime_on_worker_device(
 
     def fake_get_side_runtime(*args, **kwargs):
         captured["side_runtime_kwargs"] = kwargs
+        fake_runtime_model = SimpleNamespace(llm_config=SimpleNamespace(vocab_size=32000))
         return SimpleNamespace(
-            model=SimpleNamespace(llm_config=SimpleNamespace(vocab_size=32000)),
+            model=fake_runtime_model,
+            module_bundle=SimpleNamespace(model=fake_runtime_model),
             precision="bfloat16",
         )
 
@@ -530,8 +565,8 @@ def test_dots_tts_model_runner_runs_model_audio_step() -> None:
     import torch
 
     from sglang_omni.models.dots_tts.model_runner import DotsTTSModelRunner
-    from sglang_omni.models.dots_tts.native_adapter import DotsTTSAudioStepResult
     from sglang_omni.models.dots_tts.request_builders import DotsTTSSGLangRequestData
+    from sglang_omni.models.dots_tts.sglang_model import DotsTTSLatentStepOutput
 
     runner = DotsTTSModelRunner.__new__(DotsTTSModelRunner)
     runner.device = torch.device("cpu")
@@ -540,12 +575,16 @@ def test_dots_tts_model_runner_runs_model_audio_step() -> None:
         def __init__(self) -> None:
             self.seen = []
 
-        def step_audio_latent(self, data, hidden_state):
-            self.seen.append((data, hidden_state))
-            return DotsTTSAudioStepResult(
-                latent_patch=torch.tensor([[[5.0, 6.0]]]),
-                feedback_embedding=torch.tensor([[[0.5, 0.6]]]),
-                eos_score=torch.tensor([0.0]),
+        def decode_audio_batch(self, batch):
+            self.seen.append(batch)
+            return DotsTTSLatentStepOutput(
+                batch_result=None,
+                next_token_ids=torch.tensor([321]),
+                latent_patches=[torch.tensor([[[5.0, 6.0]]])],
+                feedback_embeddings=[torch.tensor([[[0.5, 0.6]]])],
+                eos_scores=[torch.tensor([0.0])],
+                finished=[False],
+                hidden_states=batch.hidden_states,
             )
 
     fake_model = FakeModel()
@@ -561,9 +600,10 @@ def test_dots_tts_model_runner_runs_model_audio_step() -> None:
     sched_req = SimpleNamespace(request_id="rid", data=data)
     result = SimpleNamespace(next_token_ids=None)
 
-    runner._run_audio_step(result, [sched_req])
+    runner._run_model_latent_batch(result, [sched_req])
 
-    assert fake_model.seen == [(data, hidden)]
+    assert fake_model.seen[0].active_indices == [0]
+    assert fake_model.seen[0].hidden_states == [hidden]
     assert result.next_token_ids.tolist() == [321]
     assert torch.equal(data.latest_latent_patch, torch.tensor([[[5.0, 6.0]]]))
     assert len(data.latent_patches) == 1

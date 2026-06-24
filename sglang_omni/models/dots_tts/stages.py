@@ -278,6 +278,10 @@ def preprocess_dots_tts_payload(payload: StagePayload) -> StagePayload:
             tts_params.get("max_generate_length"), field_name="max_generate_length"
         )
         or _optional_positive_int(
+            tts_params.get("max_new_tokens"),
+            field_name="max_new_tokens",
+        )
+        or _optional_positive_int(
             params.get("max_generate_length"),
             field_name="max_generate_length",
         )
@@ -681,7 +685,7 @@ def create_sglang_latent_engine_executor(
     )
 
     model = model_worker.model_runner.model
-    model.attach_native_model(runtime.model, precision=runtime.precision)
+    model.attach_side_module_bundle(runtime.module_bundle, precision=runtime.precision)
     model.native_adapter = DotsTTSNativeAdapter(runtime)
 
     output_proc = SGLangOutputProcessor(

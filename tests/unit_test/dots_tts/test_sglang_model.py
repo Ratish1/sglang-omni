@@ -96,6 +96,110 @@ def test_model_steps_audio_latent_without_adapter(monkeypatch) -> None:
     assert torch.equal(result.eos_score, torch.tensor([0.0]))
 
 
+def test_forward_latent_decode_step_returns_control_ids_and_latents(monkeypatch) -> None:
+    import sglang_omni.models.dots_tts.sglang_model as mod
+
+    class HiddenQwen2(nn.Module):
+        def __init__(self, config, quant_config=None, prefix="") -> None:
+            super().__init__()
+            self.embed = nn.Embedding(8, 4)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def forward(self, **kwargs):
+            return SimpleNamespace(
+                hidden_states=torch.ones((kwargs["input_ids"].numel(), 1, 4))
+            )
+
+    monkeypatch.setattr(mod, "Qwen2ForCausalLM", HiddenQwen2)
+    model = DotsTTSSGLangModel(SimpleNamespace(torch_dtype="bfloat16"))
+    calls = []
+
+    def fake_latent_step(data, hidden_state):
+        calls.append((data, hidden_state.shape))
+        return mod.DotsTTSAudioStepResult(
+            latent_patch=torch.ones((1, 4, 128)),
+            feedback_embedding=torch.ones((1, 1, 4)),
+            eos_score=torch.zeros(1),
+        )
+
+    model.step_audio_latent = fake_latent_step
+    data = SimpleNamespace(
+        finish_reason=None,
+        fm_state=object(),
+        latest_hidden_state=None,
+        latest_latent_patch=None,
+        latent_patches=[],
+        decode_input_embeds=[],
+        eos_score=None,
+        control_token_id=0,
+        max_generate_length=2,
+    )
+    req = SimpleNamespace(data=data)
+
+    output = model.forward_latent_decode_step(
+        input_ids=torch.tensor([0]),
+        positions=torch.tensor([0]),
+        forward_batch=SimpleNamespace(mrope_positions=None),
+        requests=[req],
+    )
+
+    assert output.next_token_ids.tolist() == [0]
+    assert len(output.latent_patches) == 1
+    assert output.latent_patches[0].shape == (1, 4, 128)
+    assert output.feedback_embeddings[0].shape == (1, 1, 4)
+    assert calls == [(data, torch.Size([1, 1, 4]))]
+
+
+def test_decode_audio_batch_skips_finished_requests(monkeypatch) -> None:
+    import sglang_omni.models.dots_tts.sglang_model as mod
+
+    monkeypatch.setattr(mod, "Qwen2ForCausalLM", FakeQwen2)
+    model = DotsTTSSGLangModel(SimpleNamespace(torch_dtype="bfloat16"))
+    calls = []
+
+    def fake_latent_step(data, hidden_state):
+        calls.append((data.control_token_id, hidden_state.clone()))
+        return mod.DotsTTSAudioStepResult(
+            latent_patch=torch.full((1, 4, 2), float(data.control_token_id)),
+            feedback_embedding=torch.full((1, 1, 3), float(data.control_token_id)),
+            eos_score=torch.zeros(1),
+        )
+
+    model.step_audio_latent = fake_latent_step
+    active = SimpleNamespace(
+        finish_reason=None,
+        fm_state=object(),
+        control_token_id=101,
+        latent_patches=[],
+        max_generate_length=4,
+    )
+    finished = SimpleNamespace(
+        finish_reason="stop",
+        fm_state=object(),
+        control_token_id=202,
+        latent_patches=[],
+        max_generate_length=4,
+    )
+    batch = mod.DotsTTSLatentBatch(
+        requests=[SimpleNamespace(data=active), SimpleNamespace(data=finished)],
+        active_indices=[0],
+        hidden_states=[
+            torch.ones((1, 1, 4)),
+            torch.full((1, 1, 4), 2.0),
+        ],
+    )
+
+    output = model.decode_audio_batch(batch)
+
+    assert [token for token, _ in calls] == [101]
+    assert output.latent_patches[0].shape == (1, 4, 2)
+    assert output.latent_patches[1] is None
+    assert output.feedback_embeddings[0].shape == (1, 1, 3)
+    assert output.feedback_embeddings[1] is None
+
+
 def test_model_does_not_expose_legacy_generate_latent_patch(monkeypatch) -> None:
     import sglang_omni.models.dots_tts.sglang_model as mod
 

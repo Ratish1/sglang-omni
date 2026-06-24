@@ -8,6 +8,7 @@ import torch
 
 from sglang_omni.models.dots_tts.model_runner import DotsTTSModelRunner
 from sglang_omni.models.dots_tts.request_builders import DotsTTSSGLangRequestData
+from sglang_omni.models.dots_tts.sglang_model import DotsTTSLatentStepOutput
 
 
 def make_runner() -> DotsTTSModelRunner:
@@ -142,18 +143,74 @@ def test_before_prefill_does_not_create_latent_stepper() -> None:
     assert not hasattr(data, "latent_stepper")
 
 
+def test_runner_uses_model_latent_decode_step() -> None:
+    calls = []
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.param = torch.nn.Parameter(torch.ones(()))
+
+        def forward(self, *args, **kwargs):
+            raise AssertionError("runner should use forward_latent_decode_step")
+
+        def forward_latent_decode_step(self, **kwargs):
+            calls.append(kwargs)
+            batch_result = SimpleNamespace(
+                next_token_ids=torch.tensor([0]),
+                logits_output=SimpleNamespace(hidden_states=None),
+                can_run_cuda_graph=False,
+            )
+            return DotsTTSLatentStepOutput(
+                batch_result=batch_result,
+                next_token_ids=batch_result.next_token_ids,
+                latent_patches=[torch.ones((1, 4, 128))],
+                feedback_embeddings=[torch.ones((1, 1, 4))],
+                eos_scores=[torch.zeros(1)],
+                finished=[False],
+                hidden_states=[torch.ones((1, 1, 4))],
+            )
+
+    runner = make_runner()
+    runner.model = FakeModel()
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda fb: None)
+        )
+    )
+    data = DotsTTSSGLangRequestData(control_token_id=0)
+    data.fm_state = object()
+    sched_req = SimpleNamespace(data=data)
+    forward_batch = SimpleNamespace(
+        input_ids=torch.tensor([0]),
+        positions=torch.tensor([0]),
+        mrope_positions=None,
+        input_embeds=torch.ones((1, 4)),
+    )
+
+    result = runner.custom_decode_forward(forward_batch, None, [sched_req])
+
+    assert calls
+    assert calls[0]["requests"] == [sched_req]
+    assert result.next_token_ids.tolist() == [0]
+
+
 def test_post_decode_generates_latent_patch_from_hidden_state() -> None:
     runner = make_runner()
 
     class FakeModel:
-        def step_audio_latent(self, data, hidden_state):
-            assert hidden_state.shape == (1, 1, 2048)
-            assert data.fm_state == {"history": []}
-            assert data.generation_kwargs == {"num_steps": 2}
-            return SimpleNamespace(
-                latent_patch=torch.ones(1, 4, 128),
-                feedback_embedding=torch.full((1, 1, 128), 2.0),
-                eos_score=torch.tensor([0.1]),
+        def decode_audio_batch(self, batch):
+            assert batch.active_indices == [0]
+            assert batch.hidden_states[0].shape == (1, 1, 2048)
+            assert batch.requests[0].data.fm_state == {"history": []}
+            return DotsTTSLatentStepOutput(
+                batch_result=None,
+                next_token_ids=torch.tensor([777]),
+                latent_patches=[torch.ones(1, 4, 128)],
+                feedback_embeddings=[torch.full((1, 1, 128), 2.0)],
+                eos_scores=[torch.tensor([0.1])],
+                finished=[False],
+                hidden_states=batch.hidden_states,
             )
 
     runner.model = FakeModel()
@@ -182,13 +239,22 @@ def test_post_decode_generates_latents_for_multiple_requests() -> None:
         def __init__(self) -> None:
             self.calls = []
 
-        def step_audio_latent(self, data, hidden_state):
-            self.calls.append((data.control_token_id, hidden_state.clone()))
-            token = float(data.control_token_id)
-            return SimpleNamespace(
-                latent_patch=torch.full((1, 4, 2), token),
-                feedback_embedding=torch.full((1, 1, 3), token / 10.0),
-                eos_score=torch.tensor([0.0]),
+        def decode_audio_batch(self, batch):
+            self.calls.append(batch)
+            return DotsTTSLatentStepOutput(
+                batch_result=None,
+                next_token_ids=torch.tensor([101, 202]),
+                latent_patches=[
+                    torch.full((1, 4, 2), 101.0),
+                    torch.full((1, 4, 2), 202.0),
+                ],
+                feedback_embeddings=[
+                    torch.full((1, 1, 3), 10.1),
+                    torch.full((1, 1, 3), 20.2),
+                ],
+                eos_scores=[torch.tensor([0.0]), torch.tensor([0.0])],
+                finished=[False, False],
+                hidden_states=batch.hidden_states,
             )
 
     fake_model = FakeModel()
@@ -214,7 +280,8 @@ def test_post_decode_generates_latents_for_multiple_requests() -> None:
     )
 
     assert result.next_token_ids.tolist() == [101, 202]
-    assert len(fake_model.calls) == 2
+    assert len(fake_model.calls) == 1
+    assert fake_model.calls[0].active_indices == [0, 1]
     assert torch.equal(first.latest_latent_patch, torch.full((1, 4, 2), 101.0))
     assert torch.equal(second.latest_latent_patch, torch.full((1, 4, 2), 202.0))
     assert torch.equal(first.decode_input_embeds[0], torch.full((1, 1, 3), 10.1))
@@ -225,6 +292,21 @@ def test_post_decode_generates_latents_for_multiple_requests() -> None:
 
 def test_post_decode_does_not_use_latent_stepper_fallback() -> None:
     runner = make_runner()
+
+    class FakeModel:
+        def decode_audio_batch(self, batch):
+            assert batch.active_indices == []
+            return DotsTTSLatentStepOutput(
+                batch_result=None,
+                next_token_ids=torch.tensor([777]),
+                latent_patches=[None],
+                feedback_embeddings=[None],
+                eos_scores=[None],
+                finished=[False],
+                hidden_states=batch.hidden_states,
+            )
+
+    runner.model = FakeModel()
 
     data = DotsTTSSGLangRequestData(
         control_token_id=777,

@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
+from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.models.dots_tts.native_adapter import (
     DotsTTSAudioStepResult,
@@ -25,6 +27,24 @@ except ImportError:
 
 if TYPE_CHECKING:
     from sglang_omni.models.dots_tts.native.models.dots_tts.model import DotsTtsModel
+
+
+@dataclass
+class DotsTTSLatentBatch:
+    requests: list[Any]
+    active_indices: list[int]
+    hidden_states: list[torch.Tensor | None]
+
+
+@dataclass
+class DotsTTSLatentStepOutput:
+    batch_result: GenerationBatchResult | None
+    next_token_ids: torch.Tensor
+    latent_patches: list[torch.Tensor | None]
+    feedback_embeddings: list[torch.Tensor | None]
+    eos_scores: list[torch.Tensor | None]
+    finished: list[bool]
+    hidden_states: list[torch.Tensor | None]
 
 
 class DotsTTSSGLangModel(nn.Module):
@@ -64,6 +84,14 @@ class DotsTTSSGLangModel(nn.Module):
         if precision is not None:
             self.precision = precision
         native_model.set_token_embedding(self.qwen2.get_input_embeddings())
+
+    def attach_side_module_bundle(self, bundle: Any, *, precision: str | None = None):
+        self.attach_native_model(bundle.model, precision=precision)
+        self.core = bundle.core
+        self.xvector_extractor = bundle.xvector_extractor
+        self.tokenizer = bundle.tokenizer
+        self.dots_config = bundle.config
+        self.llm_config = bundle.llm_config
 
     def validate_model_path(self, model_path: str) -> None:
         validate_checkpoint_files(model_path)
@@ -138,6 +166,139 @@ class DotsTTSSGLangModel(nn.Module):
             device=latent_patch.device,
         )
 
+    def forward_latent_decode_step(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: Any,
+        requests: list[Any],
+        input_embeds: torch.Tensor | None = None,
+    ) -> DotsTTSLatentStepOutput:
+        logits_output = self(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+        )
+        hidden_rows = self._extract_request_hidden_states(
+            logits_output,
+            requests=requests,
+        )
+        active_indices = [
+            index
+            for index, sched_req in enumerate(requests)
+            if self._can_run_latent_step(sched_req.data, hidden_rows[index])
+        ]
+        latent_output = self.decode_audio_batch(
+            DotsTTSLatentBatch(
+                requests=requests,
+                active_indices=active_indices,
+                hidden_states=hidden_rows,
+            )
+        )
+        next_token_ids = latent_output.next_token_ids.to(device=input_ids.device)
+        latent_output.next_token_ids = next_token_ids
+        batch_result = GenerationBatchResult(
+            logits_output=logits_output,
+            can_run_cuda_graph=False,
+        )
+        batch_result.next_token_ids = next_token_ids
+        latent_output.batch_result = batch_result
+        batch_result.dots_tts_latent_output = latent_output
+        return batch_result.dots_tts_latent_output
+
+    def decode_audio_batch(
+        self,
+        batch: DotsTTSLatentBatch,
+    ) -> DotsTTSLatentStepOutput:
+        device = self._latent_batch_output_device(batch)
+        next_token_ids = torch.tensor(
+            [int(sched_req.data.control_token_id) for sched_req in batch.requests],
+            dtype=torch.long,
+            device=device,
+        )
+        latent_patches: list[torch.Tensor | None] = [
+            None for _ in batch.requests
+        ]
+        feedback_embeddings: list[torch.Tensor | None] = [
+            None for _ in batch.requests
+        ]
+        eos_scores: list[torch.Tensor | None] = [None for _ in batch.requests]
+        finished = [False for _ in batch.requests]
+
+        for index in batch.active_indices:
+            data = batch.requests[index].data
+            hidden_state = batch.hidden_states[index]
+            if hidden_state is None:
+                continue
+            audio_step = self.step_audio_latent(data, hidden_state)
+            latent_patches[index] = audio_step.latent_patch
+            feedback_embeddings[index] = audio_step.feedback_embedding
+            eos_scores[index] = audio_step.eos_score
+            finished[index] = self._latent_step_finished(data, audio_step.eos_score)
+
+        return DotsTTSLatentStepOutput(
+            batch_result=None,
+            next_token_ids=next_token_ids,
+            latent_patches=latent_patches,
+            feedback_embeddings=feedback_embeddings,
+            eos_scores=eos_scores,
+            finished=finished,
+            hidden_states=batch.hidden_states,
+        )
+
+    @staticmethod
+    def _can_run_latent_step(data: Any, hidden_state: torch.Tensor | None) -> bool:
+        return (
+            getattr(data, "finish_reason", None) is None
+            and getattr(data, "fm_state", None) is not None
+            and hidden_state is not None
+        )
+
+    def _latent_batch_output_device(self, batch: DotsTTSLatentBatch) -> torch.device:
+        for hidden_state in batch.hidden_states:
+            if hidden_state is not None:
+                return hidden_state.device
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    @staticmethod
+    def _extract_request_hidden_states(
+        logits_output: Any,
+        *,
+        requests: list[Any],
+    ) -> list[torch.Tensor | None]:
+        hidden_states = getattr(logits_output, "hidden_states", None)
+        if hidden_states is None:
+            nested = getattr(logits_output, "logits_output", None)
+            hidden_states = getattr(nested, "hidden_states", None)
+        if hidden_states is None:
+            return [None for _ in requests]
+        if hidden_states.ndim == 3:
+            return [
+                hidden_states[index : index + 1, -1:, :]
+                for index in range(len(requests))
+            ]
+        if hidden_states.ndim == 2:
+            return [
+                hidden_states[index : index + 1].unsqueeze(0)
+                for index in range(len(requests))
+            ]
+        raise RuntimeError(
+            f"dots TTS expected 2D or 3D hidden states, got {hidden_states.ndim}D"
+        )
+
+    @staticmethod
+    def _latent_step_finished(data: Any, eos_score: torch.Tensor | None) -> bool:
+        if eos_score is not None and bool((eos_score > 0.5).any()):
+            return True
+        latent_patches = getattr(data, "latent_patches", [])
+        max_generate_length = int(getattr(data, "max_generate_length", 500))
+        return len(latent_patches) + 1 >= max_generate_length
+
     def load_weights(self, weights) -> set[str]:
         qwen2_weights = []
         for name, weight in weights:
@@ -177,4 +338,9 @@ class DotsTTSSGLangModel(nn.Module):
 EntryClass = DotsTTSSGLangModel
 
 
-__all__ = ["DotsTTSSGLangModel", "EntryClass"]
+__all__ = [
+    "DotsTTSLatentBatch",
+    "DotsTTSLatentStepOutput",
+    "DotsTTSSGLangModel",
+    "EntryClass",
+]

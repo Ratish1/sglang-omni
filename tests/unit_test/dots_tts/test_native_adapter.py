@@ -44,6 +44,21 @@ class FakeNativeModel:
         del prompt_latents, state
         return None
 
+    def _build_prefill_inputs_embeds(
+        self,
+        generation_schedule,
+        *,
+        prompt_patch_embeddings,
+        prompt_span_positions,
+    ):
+        del prompt_patch_embeddings
+        return torch.zeros(
+            generation_schedule.size(0),
+            generation_schedule.size(1),
+            4,
+            dtype=torch.bfloat16,
+        )
+
     def _locate_prefill_boundary(self, *, span_positions, prompt_patch_count):
         # First audio span beyond the prompt patches starts generation.
         prefill_end = int(span_positions[prompt_patch_count].item())
@@ -108,6 +123,45 @@ def test_adapter_requires_generation_schedule() -> None:
         DotsTTSNativeAdapter(ScheduleLessRuntime()).prepare_inputs(
             DotsTTSState(text="Hello.")
         )
+
+
+def test_adapter_casts_prompt_latents_to_generate_state_dtype() -> None:
+    class PromptPrefillModel(FakeNativeModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prefill_dtype = None
+
+        def _prepare_prompt_conditioning(
+            self, prompt_audio, *, use_prompt_prefill, speaker_scale
+        ):
+            del prompt_audio, use_prompt_prefill, speaker_scale
+            return SimpleNamespace(
+                prompt_patches=torch.zeros(1, 1, 4, dtype=torch.float32),
+                prompt_latents=torch.ones(1, 4, 128, dtype=torch.float32),
+                g_cond=None,
+            )
+
+        def _allocate_generate_state(self, *, max_audio_patch_count, device, dtype):
+            del max_audio_patch_count
+            return SimpleNamespace(fm_sequence=torch.zeros(1, device=device, dtype=dtype))
+
+        def _prefill_prompt_latents(self, prompt_latents, *, state):
+            del state
+            self.prefill_dtype = prompt_latents.dtype
+            return torch.zeros(1, 1, 4, dtype=prompt_latents.dtype)
+
+    class PromptPrefillRuntime(FakeRuntime):
+        def __init__(self) -> None:
+            self.model = PromptPrefillModel()
+            self.prepared_kwargs = None
+
+    runtime = PromptPrefillRuntime()
+
+    DotsTTSNativeAdapter(runtime).prepare_inputs(
+        DotsTTSState(text="Hello.", prompt_audio_path="ref.wav", prompt_text="Hi.")
+    )
+
+    assert runtime.model.prefill_dtype == torch.bfloat16
 
 
 class FakeDotsModel:

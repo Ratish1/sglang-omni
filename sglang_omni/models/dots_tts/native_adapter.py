@@ -149,8 +149,11 @@ class DotsTTSNativeAdapter:
             device=device,
             dtype=dtype,
         )
+        prompt_latents = prompt_conditioning.prompt_latents
+        if prompt_latents is not None:
+            prompt_latents = prompt_latents.to(dtype=fm_state.fm_sequence.dtype)
         prompt_patch_embeddings = self.model._prefill_prompt_latents(
-            prompt_conditioning.prompt_latents,
+            prompt_latents,
             state=fm_state,
         )
         prefill_end, prompt_span_positions = self.model._locate_prefill_boundary(
