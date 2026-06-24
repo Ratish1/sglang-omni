@@ -1,4 +1,4 @@
-"""Audio helpers used by the retained train/infer pipeline."""
+"""Audio helpers used by dots TTS inference."""
 
 from __future__ import annotations
 

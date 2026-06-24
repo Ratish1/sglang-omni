@@ -101,7 +101,7 @@ class _GenerateLengthBucket:
 
 
 class DotsTtsModel(nn.Module):
-    """Full train/infer model assembly around the dots.tts core network."""
+    """Inference model assembly around the dots.tts core network."""
 
     _GENERATE_LENGTH_BUCKETS = (
         _GenerateLengthBucket(32),

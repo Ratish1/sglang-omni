@@ -897,7 +897,7 @@ class IOHelper:
         noise_latents: torch.Tensor,
     ) -> dict[str, Any]:
         if hidden_patch_size != 1:
-            raise ValueError("MeanFlow training only supports hidden_patch_size=1.")
+            raise ValueError("MeanFlow generation only supports hidden_patch_size=1.")
 
         batch_size = hiddens.size(0)
         device = hiddens.device

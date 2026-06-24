@@ -7,7 +7,6 @@ from typing import Any
 from loguru import logger
 
 from sglang_omni.models.dots_tts.native.utils.tokenizer import (
-    AUDIO_GEN_END_TOKEN,
     AUDIO_GEN_SPAN_TOKEN,
     AUDIO_GEN_START_TOKEN,
     TEXT_COND_END_TOKEN,
@@ -75,95 +74,6 @@ def _iter_tokenized_template_parts(
             token_ids=tuple(tokenizer.encode(part, add_special_tokens=False)),
             raw_text=part,
         )
-
-
-def _extend_tokens_with_loss(
-    *, full_ids: list[int], loss_mask: list[float], token_ids: tuple[int, ...], loss: float
-) -> None:
-    full_ids.extend(token_ids)
-    loss_mask.extend([loss] * len(token_ids))
-
-
-def build_tokenized_example(
-    *, text: str, tokenizer, template: str, num_audio_tokens: int
-) -> dict[str, Any]:
-    if tokenizer.eos_token_id is None:
-        raise ValueError("Tokenizer eos_token_id is required for generation targets.")
-
-    parsed_template, text_tokens = _prepare_template_tokens(
-        text=text,
-        tokenizer=tokenizer,
-        template=template,
-    )
-
-    full_ids: list[int] = []
-    loss_mask: list[float] = []
-    audio_tokens: list[int] | None = None
-    if parsed_template.has_audio_placeholder:
-        audio_gen_start_id = require_token_id(tokenizer, AUDIO_GEN_START_TOKEN)
-        audio_gen_span_id = require_token_id(tokenizer, AUDIO_GEN_SPAN_TOKEN)
-        audio_gen_end_id = require_token_id(tokenizer, AUDIO_GEN_END_TOKEN)
-        audio_tokens = (
-            [audio_gen_start_id]
-            + [audio_gen_span_id] * num_audio_tokens
-            + [audio_gen_end_id]
-        )
-    elif parsed_template.has_interleave_placeholder:
-        audio_gen_span_id = require_token_id(tokenizer, AUDIO_GEN_SPAN_TOKEN)
-        audio_gen_end_id = require_token_id(tokenizer, AUDIO_GEN_END_TOKEN)
-        text_cond_end_id = require_token_id(tokenizer, TEXT_COND_END_TOKEN)
-
-    for part in _iter_tokenized_template_parts(
-        parsed_template=parsed_template,
-        tokenizer=tokenizer,
-        text_tokens=text_tokens,
-    ):
-        if part.kind == "text":
-            _extend_tokens_with_loss(
-                full_ids=full_ids,
-                loss_mask=loss_mask,
-                token_ids=part.token_ids,
-                loss=0.0,
-            )
-            continue
-
-        if part.kind == "audio":
-            if audio_tokens is None:
-                raise RuntimeError("Audio placeholder tokens were not initialized.")
-            full_ids.extend(audio_tokens)
-            loss_mask.extend([0.0])
-            loss_mask.extend([1.0] * max(0, len(audio_tokens) - 2))
-            loss_mask.append(0.0)
-            continue
-
-        if part.kind == "interleave":
-            _append_interleave_generation_tokens(
-                full_ids=full_ids,
-                loss_mask=loss_mask,
-                text_tokens=text_tokens,
-                num_audio_tokens=num_audio_tokens,
-                audio_span_id=audio_gen_span_id,
-                audio_end_id=audio_gen_end_id,
-                text_cond_end_id=text_cond_end_id,
-            )
-            continue
-
-        _extend_tokens_with_loss(
-            full_ids=full_ids,
-            loss_mask=loss_mask,
-            token_ids=part.token_ids,
-            loss=0.0,
-        )
-
-    full_ids.append(tokenizer.eos_token_id)
-    loss_mask.append(0.0)
-
-    return {
-        "input_ids": full_ids[:-1],
-        "labels": full_ids[1:],
-        "loss_mask": loss_mask[1:],
-        "text_token_count": len(text_tokens),
-    }
 
 
 def build_generation_schedule(
@@ -285,41 +195,6 @@ def build_generation_schedule(
         "schedule_ids": schedule_ids,
         "interleave": True,
     }
-
-
-def _append_interleave_generation_tokens(
-    *,
-    full_ids: list[int],
-    loss_mask: list[float],
-    text_tokens: list[int],
-    num_audio_tokens: int,
-    audio_span_id: int,
-    audio_end_id: int,
-    text_cond_end_id: int,
-) -> None:
-    audio_tokens = [audio_span_id] * num_audio_tokens + [audio_end_id]
-    text_index = 0
-    audio_index = 0
-    text_cond_end_added = False
-
-    while text_index < len(text_tokens) or audio_index < len(audio_tokens):
-        if text_index < len(text_tokens):
-            full_ids.append(text_tokens[text_index])
-            loss_mask.append(0.0)
-            text_index += 1
-        elif not text_cond_end_added:
-            full_ids.append(text_cond_end_id)
-            loss_mask.append(0.0)
-            text_cond_end_added = True
-
-        if audio_index < len(audio_tokens):
-            full_ids.append(audio_tokens[audio_index])
-            loss_mask.append(1.0 if audio_index < num_audio_tokens else 0.0)
-            audio_index += 1
-
-    if not text_cond_end_added:
-        full_ids.append(text_cond_end_id)
-        loss_mask.append(0.0)
 
 
 def _append_interleave_schedule_tokens(

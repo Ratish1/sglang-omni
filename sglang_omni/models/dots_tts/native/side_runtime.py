@@ -22,11 +22,11 @@ from transformers import AutoTokenizer, Qwen2Config
 from sglang_omni.models.dots_tts.native.data.pipelines.tokenizing import (
     build_generation_schedule,
 )
-from sglang_omni.models.dots_tts.native.data.pipelines.tts_pipeline import (
+from sglang_omni.models.dots_tts.native.data.pipelines.templates import (
     DEFAULT_INSTRUCTION_TTS_TEMPLATE,
-    DEFAULT_INTERLEAVE_TRAIN_TEMPLATE,
+    DEFAULT_INTERLEAVE_TTS_TEMPLATE,
     DEFAULT_TEXT_TO_AUDIO_TEMPLATE,
-    DEFAULT_TRAIN_TEMPLATE,
+    DEFAULT_TTS_TEMPLATE,
 )
 from sglang_omni.models.dots_tts.native.models.dots_tts.config import ModelConfig
 from sglang_omni.models.dots_tts.native.models.dots_tts.core import (
@@ -66,10 +66,10 @@ from sglang_omni.models.dots_tts.native.utils.tokenizer import (
 from sglang_omni.models.dots_tts.native.utils.util import get_dtype
 
 RUNTIME_TEMPLATE_BY_NAME = {
-    "tts": DEFAULT_TRAIN_TEMPLATE,
+    "tts": DEFAULT_TTS_TEMPLATE,
     "instruction_tts": DEFAULT_INSTRUCTION_TTS_TEMPLATE,
     "text_to_audio": DEFAULT_TEXT_TO_AUDIO_TEMPLATE,
-    "tts_interleave": DEFAULT_INTERLEAVE_TRAIN_TEMPLATE,
+    "tts_interleave": DEFAULT_INTERLEAVE_TTS_TEMPLATE,
 }
 
 
