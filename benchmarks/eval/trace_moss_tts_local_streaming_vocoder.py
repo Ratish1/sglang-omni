@@ -105,6 +105,16 @@ def _parse_args() -> argparse.Namespace:
         help="Per-step number of streaming-state modules to summarize.",
     )
     parser.add_argument(
+        "--state-sample-root",
+        default="decoder",
+        help="Streaming-state module prefix to sample per step, or 'all'.",
+    )
+    parser.add_argument(
+        "--mask-structure",
+        action="store_true",
+        help="Record compact bool-mask contiguity/range summaries for SDPA calls.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -268,12 +278,88 @@ def _compare_tensors(
     return result
 
 
-def _mask_summary(mask: Any) -> dict[str, Any] | None:
+def _bool_mask_structure(mask: torch.Tensor) -> dict[str, Any]:
+    if mask.ndim != 4:
+        return {"skipped": f"expected rank-4 bool mask, got rank {mask.ndim}"}
+
+    with torch.no_grad():
+        dense = mask.detach()
+        batch, _, query_len, key_len = dense.shape
+        mask_3d = dense[:, 0, :, :]
+        true_per_batch = mask_3d.sum(dim=(1, 2))
+        active_batches = torch.nonzero(true_per_batch > 0, as_tuple=False).flatten()
+        true_per_query = mask_3d.sum(dim=-1)
+        rows_with_true = true_per_query > 0
+
+        result: dict[str, Any] = {
+            "batch": int(batch),
+            "query_len": int(query_len),
+            "key_len": int(key_len),
+            "active_batches": active_batches.to("cpu").tolist(),
+            "true_per_batch": true_per_batch.to("cpu").tolist(),
+            "rows_with_true": int(rows_with_true.sum().item()),
+        }
+
+        populated_counts = true_per_query[rows_with_true]
+        if populated_counts.numel():
+            result["true_per_query_min"] = int(populated_counts.min().item())
+            result["true_per_query_max"] = int(populated_counts.max().item())
+
+        # Global contiguity is cheap enough for normal streaming chunks. For very
+        # large stage-10 masks, keep sampled row ranges and skip the full scan.
+        if dense.numel() <= 50_000_000:
+            transitions = (mask_3d[..., 1:] != mask_3d[..., :-1]).sum(dim=-1)
+            noncontiguous = ((transitions > 2) & rows_with_true).sum()
+            result["max_row_transitions"] = int(transitions.max().item())
+            result["noncontiguous_rows"] = int(noncontiguous.item())
+        else:
+            result["contiguity_scan_skipped"] = f"mask numel {dense.numel()}"
+
+        batch_samples = (
+            active_batches[: min(4, active_batches.numel())].to("cpu").tolist()
+        )
+        if not batch_samples and batch:
+            batch_samples = [0]
+        query_samples = sorted({0, query_len // 2, max(0, query_len - 1)})
+        rows = []
+        for batch_index in batch_samples:
+            for query_index in query_samples:
+                row = mask_3d[batch_index, query_index]
+                positions = torch.nonzero(row, as_tuple=False).flatten()
+                count = int(positions.numel())
+                if count:
+                    first = int(positions[0].item())
+                    last = int(positions[-1].item())
+                    contiguous = (last - first + 1) == count
+                else:
+                    first = None
+                    last = None
+                    contiguous = True
+                rows.append(
+                    {
+                        "batch": int(batch_index),
+                        "query": int(query_index),
+                        "count": count,
+                        "first": first,
+                        "last": last,
+                        "contiguous": bool(contiguous),
+                    }
+                )
+        result["sample_rows"] = rows
+        return result
+
+
+def _mask_summary(
+    mask: Any, *, include_structure: bool = False
+) -> dict[str, Any] | None:
     if mask is None:
         return None
     if not isinstance(mask, torch.Tensor):
         return {"type": type(mask).__name__}
-    return _tensor_summary(mask, include_values=mask.numel() <= 64)
+    summary = _tensor_summary(mask, include_values=mask.numel() <= 64)
+    if include_structure and mask.dtype == torch.bool:
+        summary["structure"] = _bool_mask_structure(mask)
+    return summary
 
 
 class _StreamingTraceRecorder:
@@ -283,10 +369,14 @@ class _StreamingTraceRecorder:
         *,
         capture_oracle: bool,
         state_sample_limit: int,
+        state_sample_root: str,
+        capture_mask_structure: bool,
     ) -> None:
         self._codec = codec
         self._capture_oracle = capture_oracle
         self._state_sample_limit = int(state_sample_limit)
+        self._state_sample_root = state_sample_root
+        self._capture_mask_structure = capture_mask_structure
         self._original_sdpa = F.scaled_dot_product_attention
         self._hooks: list[Any] = []
         self._module_stack: list[str] = []
@@ -337,6 +427,10 @@ class _StreamingTraceRecorder:
     def state_sample(self) -> list[dict[str, Any]]:
         sample = []
         for path, module in self._codec.named_modules():
+            if self._state_sample_root != "all" and not path.startswith(
+                self._state_sample_root
+            ):
+                continue
             if len(sample) >= self._state_sample_limit:
                 break
             state = getattr(module, "_streaming_state", None)
@@ -433,7 +527,10 @@ class _StreamingTraceRecorder:
             "query": _tensor_summary(query),
             "key": _tensor_summary(key),
             "value": _tensor_summary(value),
-            "attn_mask": _mask_summary(attn_mask),
+            "attn_mask": _mask_summary(
+                attn_mask,
+                include_structure=self._capture_mask_structure,
+            ),
             "dropout_p": float(dropout_p),
             "is_causal": is_causal,
             "scale": scale,
@@ -729,12 +826,25 @@ def _summarize_sdpa(records: list[dict[str, Any]]) -> dict[str, Any]:
     oracle_skipped = 0
     oracle_max_abs = 0.0
     masked = 0
+    mask_structure_records = 0
+    mask_structure_skipped = 0
+    mask_noncontiguous_rows = 0
     modules: dict[str, int] = {}
     for record in records:
         module = str(record.get("module"))
         modules[module] = modules.get(module, 0) + 1
-        if record.get("attn_mask") is not None:
+        attn_mask = record.get("attn_mask")
+        if attn_mask is not None:
             masked += 1
+            if isinstance(attn_mask, dict):
+                structure = attn_mask.get("structure")
+                if isinstance(structure, dict):
+                    mask_structure_records += 1
+                    if "contiguity_scan_skipped" in structure:
+                        mask_structure_skipped += 1
+                    mask_noncontiguous_rows += int(
+                        structure.get("noncontiguous_rows", 0)
+                    )
         oracle = record.get("oracle")
         if isinstance(oracle, dict):
             if "error" in oracle:
@@ -750,6 +860,9 @@ def _summarize_sdpa(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "count": len(records),
         "masked_calls": masked,
+        "mask_structure_records": mask_structure_records,
+        "mask_structure_skipped": mask_structure_skipped,
+        "mask_noncontiguous_rows": mask_noncontiguous_rows,
         "oracle_errors": oracle_errors,
         "oracle_skipped": oracle_skipped,
         "oracle_worst_max_abs": oracle_max_abs,
@@ -777,6 +890,8 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         f"- cuda_sdp: `{report['cuda_sdp_settings']}`",
         f"- n_vq: `{report['n_vq']}`",
         f"- vocab_size: `{report['vocab_size']}`",
+        f"- state_sample_root: `{report['state_sample_root']}`",
+        f"- mask_structure_enabled: `{report['mask_structure_enabled']}`",
         (
             f"- attention implementations: "
             f"`{report['attention_implementation_summary']['attention_implementation_counts']}`"
@@ -789,6 +904,8 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         f"| cases | {len(report['cases'])} |",
         f"| sdpa calls | {report['sdpa_summary']['count']} |",
         f"| masked sdpa calls | {report['sdpa_summary']['masked_calls']} |",
+        f"| mask structure records | {report['sdpa_summary']['mask_structure_records']} |",
+        f"| mask noncontiguous rows | {report['sdpa_summary']['mask_noncontiguous_rows']} |",
         f"| oracle skipped | {report['sdpa_summary']['oracle_skipped']} |",
         f"| oracle errors | {report['sdpa_summary']['oracle_errors']} |",
         f"| oracle worst max_abs | {report['sdpa_summary']['oracle_worst_max_abs']} |",
@@ -817,13 +934,15 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
             "",
             "## SDPA By Case",
             "",
-            "| case | calls | masked | oracle skipped | oracle errors | worst oracle max_abs |",
-            "| --- | ---: | ---: | ---: | ---: | ---: |",
+            "| case | calls | masked | mask structures | noncontig rows | oracle skipped | oracle errors | worst oracle max_abs |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for case, summary in report["sdpa_summary_by_case"].items():
         lines.append(
             f"| `{case}` | {summary['count']} | {summary['masked_calls']} | "
+            f"{summary['mask_structure_records']} | "
+            f"{summary['mask_noncontiguous_rows']} | "
             f"{summary['oracle_skipped']} | {summary['oracle_errors']} | "
             f"{summary['oracle_worst_max_abs']} |"
         )
@@ -839,6 +958,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
             "",
             "- This harness traces the real persistent streaming codec session, not the non-streaming packed decoder.",
             "- `oracle_skipped` usually means the SDPA call used an attention mask that cannot be represented by the simple varlen FlashAttention oracle.",
+            "- `mask noncontiguous rows` is only populated when `--mask-structure` is enabled and the mask is small enough for a full contiguity scan.",
             "- Large or masked SDPA records should be inspected in the JSON before deciding on `flash_attn_with_kvcache` vs packed-varlen streaming.",
         ]
     )
@@ -880,6 +1000,8 @@ def main() -> None:
         "stream_slots": int(args.stream_slots),
         "offline_slots": int(args.offline_slots),
         "max_step_frames": int(args.max_step_frames),
+        "state_sample_root": args.state_sample_root,
+        "mask_structure_enabled": bool(args.mask_structure),
         "cases": [],
     }
 
@@ -894,6 +1016,8 @@ def main() -> None:
             codec,
             capture_oracle=not args.disable_oracle,
             state_sample_limit=args.state_sample_limit,
+            state_sample_root=args.state_sample_root,
+            capture_mask_structure=bool(args.mask_structure),
         ) as recorder:
             report["streaming_state_inventory"] = recorder.state_inventory()
             for case in cases:
