@@ -993,6 +993,7 @@ def _summarize_sdpa(records: list[dict[str, Any]]) -> dict[str, Any]:
     oracle_max_abs = 0.0
     oracle_compared = 0
     oracle_modes: Counter[str] = Counter()
+    oracle_error_messages: Counter[str] = Counter()
     masked = 0
     mask_structure_records = 0
     mask_structure_skipped = 0
@@ -1017,6 +1018,7 @@ def _summarize_sdpa(records: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(oracle, dict):
             if "error" in oracle:
                 oracle_errors += 1
+                oracle_error_messages[str(oracle["error"])] += 1
             if "skipped" in oracle:
                 oracle_skipped += 1
             mode = oracle.get("mode")
@@ -1037,6 +1039,7 @@ def _summarize_sdpa(records: list[dict[str, Any]]) -> dict[str, Any]:
         "mask_noncontiguous_rows": mask_noncontiguous_rows,
         "oracle_errors": oracle_errors,
         "oracle_compared": oracle_compared,
+        "oracle_error_messages": oracle_error_messages.most_common(5),
         "oracle_modes": dict(sorted(oracle_modes.items())),
         "oracle_skipped": oracle_skipped,
         "oracle_worst_max_abs": oracle_max_abs,
@@ -1128,6 +1131,19 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
     )
     for module, count in report["sdpa_summary"]["top_modules"]:
         lines.append(f"| `{module}` | {count} |")
+    if report["sdpa_summary"]["oracle_error_messages"]:
+        lines.extend(
+            [
+                "",
+                "## Top Oracle Errors",
+                "",
+                "| count | error |",
+                "| ---: | --- |",
+            ]
+        )
+        for error, count in report["sdpa_summary"]["oracle_error_messages"]:
+            error_line = str(error).replace("\n", "<br>")
+            lines.append(f"| {count} | `{error_line}` |")
     lines.extend(
         [
             "",
