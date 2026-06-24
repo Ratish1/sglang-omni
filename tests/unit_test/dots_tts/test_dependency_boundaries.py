@@ -22,14 +22,18 @@ def test_dots_dependencies_are_grouped_with_main_model_dependencies() -> None:
     assert "optional-dependencies" not in pyproject["project"]
 
 
-def test_dots_smoke_tests_do_not_append_local_runtime_paths() -> None:
+def test_dots_pr_files_do_not_include_local_runtime_paths() -> None:
     root = Path(__file__).resolve().parents[3]
-    smoke_paths = [
-        root / "tests/smoke/dots_tts_native_sglang_smoke.py",
-        root / "tests/smoke/dots_tts_server_e2e_smoke.py",
-    ]
+    paths = list((root / "sglang_omni/models/dots_tts").rglob("*.py"))
+    paths.extend((root / "tests/unit_test/dots_tts").rglob("*.py"))
+    local_conda_env = "." + "conda-dots-tts-py310"
+    home_path_prefix = "/" + "home" + "/"
+    workspace_models = "workspace" + "/" + "models"
+    site_packages = "site" + "-packages"
 
-    for path in smoke_paths:
+    for path in paths:
         source = path.read_text(encoding="utf-8")
-        assert ".conda-dots-tts-py310" not in source
-        assert "site-packages" not in source
+        assert local_conda_env not in source
+        assert site_packages not in source
+        assert home_path_prefix not in source
+        assert workspace_models not in source
