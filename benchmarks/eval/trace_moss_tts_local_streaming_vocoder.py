@@ -5,8 +5,8 @@ This is a development harness for the streaming SGLang-vocoder work. It runs
 the real MOSS-Audio-Tokenizer-v2 codec through the same persistent
 ``codec.streaming(B)`` session contract used by serving, records attention
 module/SDPA call shapes, and optionally compares each captured SDPA call against
-SGLang varlen FlashAttention when the call can be represented without an
-arbitrary mask.
+SGLang varlen FlashAttention when the call can be represented as the MOSS
+streaming local-causal mask.
 
 Example:
 
@@ -59,6 +59,19 @@ class _StepSpec:
 class _CaseSpec:
     name: str
     steps: tuple[_StepSpec, ...]
+
+
+@dataclass(frozen=True)
+class _PackedStreamingLocalAttentionInputs:
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    cu_q: torch.Tensor
+    cu_k: torch.Tensor
+    max_q: int
+    max_k: int
+    context: int
+    history_lengths: list[int]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -362,6 +375,113 @@ def _mask_summary(
     return summary
 
 
+def _load_sglang_flash_attn_varlen_func() -> Any:
+    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+
+    return flash_attn_varlen_func
+
+
+def _derive_streaming_local_history_lengths(
+    attn_mask: torch.Tensor,
+    *,
+    batch: int,
+    query_len: int,
+    key_len: int,
+) -> tuple[int, list[int]]:
+    if attn_mask.dtype != torch.bool:
+        raise ValueError(f"expected bool attention mask, got {attn_mask.dtype}")
+    if attn_mask.shape != (batch, 1, query_len, key_len):
+        raise ValueError(
+            "expected streaming mask shape [B, 1, Q, K], "
+            f"got {tuple(attn_mask.shape)} for Q={query_len}, K={key_len}"
+        )
+    if key_len < query_len:
+        raise ValueError(f"expected K >= Q, got Q={query_len}, K={key_len}")
+
+    context = key_len - query_len
+    q0 = attn_mask[:, 0, 0, :]
+    positions = torch.arange(key_len, device=attn_mask.device).view(1, key_len)
+    first = torch.where(q0, positions, key_len).amin(dim=1)
+    if bool((first == key_len).any().item()):
+        raise ValueError("streaming local mask has an empty first query row")
+
+    history = context - first
+    if bool(((history < 0) | (history > context)).any().item()):
+        raise ValueError(
+            f"derived invalid history lengths for context={context}: "
+            f"{history.to('cpu').tolist()}"
+        )
+    return context, [int(value) for value in history.to("cpu").tolist()]
+
+
+def _pack_streaming_local_attention_inputs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor,
+) -> _PackedStreamingLocalAttentionInputs:
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("expected q/k/v rank 4 tensors")
+
+    batch, heads, query_len, head_dim = query.shape
+    if key.shape[:2] != (batch, heads) or value.shape[:2] != (batch, heads):
+        raise ValueError(
+            "q/k/v batch or head dimensions differ: "
+            f"q={tuple(query.shape)}, k={tuple(key.shape)}, v={tuple(value.shape)}"
+        )
+    key_len = int(key.shape[2])
+    if value.shape[2] != key_len or value.shape[3] != head_dim:
+        raise ValueError(
+            "k/v sequence or head dimensions differ: "
+            f"k={tuple(key.shape)}, v={tuple(value.shape)}"
+        )
+
+    context, history_lengths = _derive_streaming_local_history_lengths(
+        attn_mask,
+        batch=batch,
+        query_len=query_len,
+        key_len=key_len,
+    )
+
+    q_chunks = []
+    k_chunks = []
+    v_chunks = []
+    cu_q = [0]
+    cu_k = [0]
+    for batch_index, history in enumerate(history_lengths):
+        key_start = context - history
+        q_chunks.append(query[batch_index].transpose(0, 1).contiguous())
+        k_chunks.append(key[batch_index, :, key_start:, :].transpose(0, 1).contiguous())
+        v_chunks.append(
+            value[batch_index, :, key_start:, :].transpose(0, 1).contiguous()
+        )
+        cu_q.append(cu_q[-1] + query_len)
+        cu_k.append(cu_k[-1] + history + query_len)
+
+    return _PackedStreamingLocalAttentionInputs(
+        q=torch.cat(q_chunks, dim=0),
+        k=torch.cat(k_chunks, dim=0),
+        v=torch.cat(v_chunks, dim=0),
+        cu_q=torch.tensor(cu_q, dtype=torch.int32, device=query.device),
+        cu_k=torch.tensor(cu_k, dtype=torch.int32, device=query.device),
+        max_q=query_len,
+        max_k=max(history_lengths) + query_len if history_lengths else query_len,
+        context=context,
+        history_lengths=history_lengths,
+    )
+
+
+def _pad_streaming_local_attention_output(
+    output: torch.Tensor,
+    *,
+    batch: int,
+    heads: int,
+    query_len: int,
+    head_dim: int,
+) -> torch.Tensor:
+    return output.view(batch, query_len, heads, head_dim).transpose(1, 2)
+
+
 class _StreamingTraceRecorder:
     def __init__(
         self,
@@ -377,6 +497,13 @@ class _StreamingTraceRecorder:
         self._state_sample_limit = int(state_sample_limit)
         self._state_sample_root = state_sample_root
         self._capture_mask_structure = capture_mask_structure
+        self._flash_attn_varlen = None
+        self._flash_attn_import_error: str | None = None
+        if capture_oracle:
+            try:
+                self._flash_attn_varlen = _load_sglang_flash_attn_varlen_func()
+            except Exception as exc:
+                self._flash_attn_import_error = f"{type(exc).__name__}: {exc}"
         self._original_sdpa = F.scaled_dot_product_attention
         self._hooks: list[Any] = []
         self._module_stack: list[str] = []
@@ -561,63 +688,102 @@ class _StreamingTraceRecorder:
         is_causal: bool,
         scale: Any,
     ) -> dict[str, Any]:
-        if attn_mask is not None:
-            return {"skipped": "attn_mask is not None"}
         if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
             return {"skipped": "expected q/k/v rank 4"}
         if not query.is_cuda:
             return {"skipped": "query is not CUDA"}
-        try:
-            from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
-        except Exception as exc:
-            return {"error": f"import failed: {type(exc).__name__}: {exc}"}
+        if self._flash_attn_varlen is None:
+            return {"error": f"import failed: {self._flash_attn_import_error}"}
 
         try:
             batch_size, heads, q_len, head_dim = query.shape
             k_len = int(key.shape[2])
-            q = (
-                query.transpose(1, 2)
-                .contiguous()
-                .view(batch_size * q_len, heads, head_dim)
+            if attn_mask is None:
+                q = (
+                    query.transpose(1, 2)
+                    .contiguous()
+                    .view(batch_size * q_len, heads, head_dim)
+                )
+                k = (
+                    key.transpose(1, 2)
+                    .contiguous()
+                    .view(batch_size * k_len, heads, head_dim)
+                )
+                v = (
+                    value.transpose(1, 2)
+                    .contiguous()
+                    .view(batch_size * k_len, heads, head_dim)
+                )
+                cu_q = torch.arange(
+                    0,
+                    (batch_size + 1) * q_len,
+                    q_len,
+                    dtype=torch.int32,
+                    device=query.device,
+                )
+                cu_k = torch.arange(
+                    0,
+                    (batch_size + 1) * k_len,
+                    k_len,
+                    dtype=torch.int32,
+                    device=query.device,
+                )
+                oracle = self._flash_attn_varlen(
+                    q,
+                    k,
+                    v,
+                    cu_q,
+                    cu_k,
+                    max_seqlen_q=q_len,
+                    max_seqlen_k=k_len,
+                    softmax_scale=scale,
+                    causal=is_causal,
+                    window_size=(-1, -1),
+                )
+                oracle = oracle.view(batch_size, q_len, heads, head_dim).transpose(1, 2)
+                return {
+                    "mode": "dense_unmasked",
+                    "comparison": _compare_tensors(output, oracle),
+                }
+
+            if is_causal:
+                return {"skipped": "masked call unexpectedly set is_causal=True"}
+            if not isinstance(attn_mask, torch.Tensor):
+                return {"skipped": f"mask type {type(attn_mask).__name__}"}
+            packed = _pack_streaming_local_attention_inputs(
+                query=query,
+                key=key,
+                value=value,
+                attn_mask=attn_mask,
             )
-            k = (
-                key.transpose(1, 2)
-                .contiguous()
-                .view(batch_size * k_len, heads, head_dim)
-            )
-            v = (
-                value.transpose(1, 2)
-                .contiguous()
-                .view(batch_size * k_len, heads, head_dim)
-            )
-            cu_q = torch.arange(
-                0,
-                (batch_size + 1) * q_len,
-                q_len,
-                dtype=torch.int32,
-                device=query.device,
-            )
-            cu_k = torch.arange(
-                0,
-                (batch_size + 1) * k_len,
-                k_len,
-                dtype=torch.int32,
-                device=query.device,
-            )
-            oracle = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_q,
-                cu_k,
-                max_seqlen_q=q_len,
-                max_seqlen_k=k_len,
+            oracle = self._flash_attn_varlen(
+                packed.q,
+                packed.k,
+                packed.v,
+                packed.cu_q,
+                packed.cu_k,
+                max_seqlen_q=packed.max_q,
+                max_seqlen_k=packed.max_k,
                 softmax_scale=scale,
-                causal=is_causal,
-                window_size=(-1, -1),
+                causal=True,
+                window_size=(max(packed.context - 1, 0), 0),
             )
-            oracle = oracle.view(batch_size, q_len, heads, head_dim).transpose(1, 2)
-            return {"comparison": _compare_tensors(output, oracle)}
+            oracle = _pad_streaming_local_attention_output(
+                oracle,
+                batch=batch_size,
+                heads=heads,
+                query_len=q_len,
+                head_dim=head_dim,
+            )
+            return {
+                "mode": "streaming_local_mask",
+                "context": packed.context,
+                "history_lengths": packed.history_lengths,
+                "max_seqlen_q": packed.max_q,
+                "max_seqlen_k": packed.max_k,
+                "window_size": (max(packed.context - 1, 0), 0),
+                "comparison": _compare_tensors(output, oracle),
+            }
         except Exception as exc:
             return {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -825,6 +991,8 @@ def _summarize_sdpa(records: list[dict[str, Any]]) -> dict[str, Any]:
     oracle_errors = 0
     oracle_skipped = 0
     oracle_max_abs = 0.0
+    oracle_compared = 0
+    oracle_modes: Counter[str] = Counter()
     masked = 0
     mask_structure_records = 0
     mask_structure_skipped = 0
@@ -851,8 +1019,12 @@ def _summarize_sdpa(records: list[dict[str, Any]]) -> dict[str, Any]:
                 oracle_errors += 1
             if "skipped" in oracle:
                 oracle_skipped += 1
+            mode = oracle.get("mode")
+            if isinstance(mode, str):
+                oracle_modes[mode] += 1
             comparison = oracle.get("comparison")
             if isinstance(comparison, dict):
+                oracle_compared += 1
                 oracle_max_abs = max(
                     oracle_max_abs,
                     float(comparison.get("max_abs", 0.0)),
@@ -864,6 +1036,8 @@ def _summarize_sdpa(records: list[dict[str, Any]]) -> dict[str, Any]:
         "mask_structure_skipped": mask_structure_skipped,
         "mask_noncontiguous_rows": mask_noncontiguous_rows,
         "oracle_errors": oracle_errors,
+        "oracle_compared": oracle_compared,
+        "oracle_modes": dict(sorted(oracle_modes.items())),
         "oracle_skipped": oracle_skipped,
         "oracle_worst_max_abs": oracle_max_abs,
         "top_modules": sorted(modules.items(), key=lambda item: item[1], reverse=True)[
@@ -906,9 +1080,11 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         f"| masked sdpa calls | {report['sdpa_summary']['masked_calls']} |",
         f"| mask structure records | {report['sdpa_summary']['mask_structure_records']} |",
         f"| mask noncontiguous rows | {report['sdpa_summary']['mask_noncontiguous_rows']} |",
+        f"| oracle compared | {report['sdpa_summary']['oracle_compared']} |",
         f"| oracle skipped | {report['sdpa_summary']['oracle_skipped']} |",
         f"| oracle errors | {report['sdpa_summary']['oracle_errors']} |",
         f"| oracle worst max_abs | {report['sdpa_summary']['oracle_worst_max_abs']} |",
+        f"| oracle modes | `{report['sdpa_summary']['oracle_modes']}` |",
         "",
         "## Cases",
         "",
@@ -934,8 +1110,8 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
             "",
             "## SDPA By Case",
             "",
-            "| case | calls | masked | mask structures | noncontig rows | oracle skipped | oracle errors | worst oracle max_abs |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| case | calls | masked | mask structures | noncontig rows | oracle compared | oracle skipped | oracle errors | worst oracle max_abs |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for case, summary in report["sdpa_summary_by_case"].items():
@@ -943,6 +1119,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
             f"| `{case}` | {summary['count']} | {summary['masked_calls']} | "
             f"{summary['mask_structure_records']} | "
             f"{summary['mask_noncontiguous_rows']} | "
+            f"{summary['oracle_compared']} | "
             f"{summary['oracle_skipped']} | {summary['oracle_errors']} | "
             f"{summary['oracle_worst_max_abs']} |"
         )
