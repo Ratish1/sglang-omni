@@ -10,6 +10,10 @@ from typing import NamedTuple
 
 import torch
 
+from sglang_omni.models.moss_tts_local.streaming_attention import (
+    moss_decoder_attention_modules,
+)
+
 logger = logging.getLogger(__name__)
 
 _ATTN_ORIGINAL_UPDATE_CACHE_ATTR = "_sglang_omni_original_update_streaming_cache"
@@ -23,18 +27,6 @@ class _CapturedVocoderGraph(NamedTuple):
     static_lengths: torch.Tensor
     static_audio: torch.Tensor
     static_audio_lengths: torch.Tensor
-
-
-def _decoder_attention_modules(codec) -> list:
-    """Decoder attention modules whose streaming KV cache must be made graph-stable."""
-    modules_by_id: dict[int, object] = {}
-    decoder = getattr(codec, "decoder", ())
-    for decoder_module in decoder:
-        modules = decoder_module.modules() if hasattr(decoder_module, "modules") else ()
-        for module in modules:
-            if hasattr(module, "attention_implementation"):
-                modules_by_id.setdefault(id(module), module)
-    return list(modules_by_id.values())
 
 
 def _cuda_graph_update_streaming_cache(
@@ -70,7 +62,7 @@ def _cuda_graph_update_streaming_cache(
 def patch_codec_attention_cache_for_cuda_graph(codec) -> None:
     """Rebind the decoder streaming attention cache update to an in-place write (stable address,
     value-identical to eager) so a CUDA graph can capture it."""
-    for module in _decoder_attention_modules(codec):
+    for module in moss_decoder_attention_modules(codec):
         update_cache = getattr(module, "_update_streaming_cache", None)
         if not callable(update_cache):
             continue

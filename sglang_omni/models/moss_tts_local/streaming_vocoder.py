@@ -17,6 +17,9 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
+from sglang_omni.models.moss_tts_local.streaming_attention import (
+    patch_codec_streaming_attention,
+)
 from sglang_omni.models.moss_tts_local.vocoder_decoder import MossTTSLocalVocoderDecoder
 from sglang_omni.models.tts_streaming import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
@@ -67,6 +70,12 @@ class _CodecStreamSession:
         self._cg_graph_t: Counter = Counter()
         self._cg_eager_t: Counter = Counter()
         self._cg_total_steps = 0
+        patched_attention = patch_codec_streaming_attention(self._codec)
+        if patched_attention:
+            logger.info(
+                "MOSS-TTS Local streaming vocoder uses SGLang attention modules=%d",
+                patched_attention,
+            )
         # Retain the streaming ExitStack so per-slot causal state lives across steps (closed in close());
         # graph replay is kept bit-identical to this stateful decode by the in-place cache patch.
         self._exit_stack = contextlib.ExitStack()

@@ -5,7 +5,7 @@ This is a development harness for the streaming SGLang-vocoder work. It runs
 the real MOSS-Audio-Tokenizer-v2 codec through the same persistent
 ``codec.streaming(B)`` session contract used by serving, records attention
 module/SDPA call shapes, and optionally compares each captured SDPA call against
-SGLang varlen FlashAttention when the call can be represented as the MOSS
+SGLang local-window FlashAttention when the call can be represented as the MOSS
 streaming local-causal mask.
 
 Example:
@@ -33,12 +33,19 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from sglang_omni.models.moss_tts_local import (
+    streaming_vocoder as streaming_vocoder_module,
+)
 from sglang_omni.models.moss_tts_local.audio_tokenizer import (
     load_moss_tts_local_audio_tokenizer,
 )
 from sglang_omni.models.moss_tts_local.stages import (
     _load_moss_tts_local_processor,
     _resolve_audio_tokenizer_model_path,
+)
+from sglang_omni.models.moss_tts_local.streaming_attention import (
+    moss_local_window_size,
+    streaming_local_attention,
 )
 from sglang_omni.models.moss_tts_local.streaming_vocoder import _CodecStreamSession
 
@@ -126,6 +133,17 @@ def _parse_args() -> argparse.Namespace:
         "--mask-structure",
         action="store_true",
         help="Record compact bool-mask contiguity/range summaries for SDPA calls.",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        choices=["reference-sdpa", "sglang"],
+        default="reference-sdpa",
+        help=(
+            "Streaming attention backend for the trace run. reference-sdpa "
+            "disables the serving SGLang patch so SDPA calls can be captured "
+            "and compared against the SGLang oracle. sglang exercises the "
+            "serving path directly."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -482,6 +500,30 @@ def _pad_streaming_local_attention_output(
     return output.view(batch, query_len, heads, head_dim).transpose(1, 2)
 
 
+def _synthetic_pos_k_from_mask(attn_mask: torch.Tensor, key_len: int) -> torch.Tensor:
+    if attn_mask.dtype != torch.bool or attn_mask.ndim != 4 or attn_mask.shape[1] != 1:
+        raise ValueError(
+            f"expected bool mask [B, 1, Q, K], got {tuple(attn_mask.shape)}"
+        )
+    batch, _, query_len, mask_key_len = attn_mask.shape
+    if int(mask_key_len) != int(key_len):
+        raise ValueError(f"mask K={mask_key_len} does not match key K={key_len}")
+    context = int(key_len) - int(query_len)
+    pos_k = (
+        torch.arange(key_len, device=attn_mask.device, dtype=torch.long)
+        .view(1, key_len)
+        .expand(batch, -1)
+        .clone()
+    )
+    cache_valid = attn_mask[:, 0, 0, :context]
+    pos_k[:, :context] = torch.where(
+        cache_valid,
+        pos_k[:, :context],
+        torch.full((), -1, device=attn_mask.device, dtype=torch.long),
+    )
+    return pos_k
+
+
 class _StreamingTraceRecorder:
     def __init__(
         self,
@@ -750,6 +792,14 @@ class _StreamingTraceRecorder:
                 return {"skipped": "masked call unexpectedly set is_causal=True"}
             if not isinstance(attn_mask, torch.Tensor):
                 return {"skipped": f"mask type {type(attn_mask).__name__}"}
+            kvcache_oracle = streaming_local_attention(
+                query,
+                key,
+                value,
+                pos_k=_synthetic_pos_k_from_mask(attn_mask, key.shape[2]),
+                context=int(key.shape[2]) - int(query.shape[2]),
+                softmax_scale=scale,
+            )
             packed = _pack_streaming_local_attention_inputs(
                 query=query,
                 key=key,
@@ -766,7 +816,7 @@ class _StreamingTraceRecorder:
                 max_seqlen_k=packed.max_k,
                 softmax_scale=scale,
                 causal=True,
-                window_size=(max(packed.context - 1, 0), 0),
+                window_size=moss_local_window_size(packed.context),
             )
             oracle = _pad_streaming_local_attention_output(
                 oracle,
@@ -776,13 +826,14 @@ class _StreamingTraceRecorder:
                 head_dim=head_dim,
             )
             return {
-                "mode": "streaming_local_mask",
+                "mode": "streaming_local_kvcache_leftpad",
                 "context": packed.context,
                 "history_lengths": packed.history_lengths,
                 "max_seqlen_q": packed.max_q,
                 "max_seqlen_k": packed.max_k,
-                "window_size": (max(packed.context - 1, 0), 0),
-                "comparison": _compare_tensors(output, oracle),
+                "window_size": moss_local_window_size(packed.context),
+                "comparison": _compare_tensors(output, kvcache_oracle),
+                "varlen_comparison": _compare_tensors(output, oracle),
             }
         except Exception as exc:
             return {"error": f"{type(exc).__name__}: {exc}"}
@@ -1113,7 +1164,8 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
             "",
             "## SDPA By Case",
             "",
-            "| case | calls | masked | mask structures | noncontig rows | oracle compared | oracle skipped | oracle errors | worst oracle max_abs |",
+            "| case | calls | masked | mask structures | noncontig rows | "
+            "oracle compared | oracle skipped | oracle errors | worst oracle max_abs |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -1149,13 +1201,28 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
             "",
             "## Notes",
             "",
-            "- This harness traces the real persistent streaming codec session, not the non-streaming packed decoder.",
-            "- `oracle_skipped` usually means the SDPA call used an attention mask that cannot be represented by the simple varlen FlashAttention oracle.",
-            "- `mask noncontiguous rows` is only populated when `--mask-structure` is enabled and the mask is small enough for a full contiguity scan.",
-            "- Large or masked SDPA records should be inspected in the JSON before deciding on `flash_attn_with_kvcache` vs packed-varlen streaming.",
+            "- This harness traces the real persistent streaming codec session, "
+            "not the non-streaming packed decoder.",
+            "- Masked SDPA calls are compared against the SGLang kvcache-leftpad "
+            "local-window attention helper; the packed-varlen comparison is kept "
+            "as an additional oracle in JSON.",
+            "- `mask noncontiguous rows` is only populated when `--mask-structure` "
+            "is enabled and the mask is small enough for a full contiguity scan.",
+            "- Large or masked SDPA records should be inspected in the JSON before "
+            "deciding on `flash_attn_with_kvcache` vs packed-varlen streaming.",
         ]
     )
     path.write_text("\n".join(lines) + "\n")
+
+
+@contextlib.contextmanager
+def _reference_sdpa_streaming_attention():
+    patch = streaming_vocoder_module.patch_codec_streaming_attention
+    streaming_vocoder_module.patch_codec_streaming_attention = lambda codec: 0
+    try:
+        yield
+    finally:
+        streaming_vocoder_module.patch_codec_streaming_attention = patch
 
 
 def main() -> None:
@@ -1193,79 +1260,85 @@ def main() -> None:
         "stream_slots": int(args.stream_slots),
         "offline_slots": int(args.offline_slots),
         "max_step_frames": int(args.max_step_frames),
+        "attention_backend": args.attention_backend,
         "state_sample_root": args.state_sample_root,
         "mask_structure_enabled": bool(args.mask_structure),
         "cases": [],
     }
 
-    session = _CodecStreamSession(
-        codec,
-        stream_slots=args.stream_slots,
-        offline_slots=args.offline_slots,
-        n_vq=n_vq,
-    )
-    try:
-        with _StreamingTraceRecorder(
+    patch_context = contextlib.nullcontext()
+    if args.attention_backend == "reference-sdpa":
+        patch_context = _reference_sdpa_streaming_attention()
+
+    with patch_context:
+        session = _CodecStreamSession(
             codec,
-            capture_oracle=not args.disable_oracle,
-            state_sample_limit=args.state_sample_limit,
-            state_sample_root=args.state_sample_root,
-            capture_mask_structure=bool(args.mask_structure),
-        ) as recorder:
-            report["streaming_state_inventory"] = recorder.state_inventory()
-            for case in cases:
-                if case.name == "offline_lane_while_session_live":
-                    report["cases"].append(
-                        _run_offline_lane_case(
-                            session,
-                            recorder,
-                            n_vq=n_vq,
-                            vocab_size=vocab_size,
-                            generator=generator,
-                            max_step_frames=args.max_step_frames,
-                        )
-                    )
-                    continue
-                case_steps = []
-                slot_map: dict[int, int] = {}
-                for step_index, step in enumerate(case.steps):
-                    for logical_slot in step.slots:
-                        if logical_slot in slot_map:
-                            continue
-                        actual_slot = session.acquire()
-                        if actual_slot is None:
-                            raise RuntimeError(
-                                f"failed to acquire stream slot for "
-                                f"{case.name}:{step.name}"
+            stream_slots=args.stream_slots,
+            offline_slots=args.offline_slots,
+            n_vq=n_vq,
+        )
+        try:
+            with _StreamingTraceRecorder(
+                codec,
+                capture_oracle=not args.disable_oracle,
+                state_sample_limit=args.state_sample_limit,
+                state_sample_root=args.state_sample_root,
+                capture_mask_structure=bool(args.mask_structure),
+            ) as recorder:
+                report["streaming_state_inventory"] = recorder.state_inventory()
+                for case in cases:
+                    if case.name == "offline_lane_while_session_live":
+                        report["cases"].append(
+                            _run_offline_lane_case(
+                                session,
+                                recorder,
+                                n_vq=n_vq,
+                                vocab_size=vocab_size,
+                                generator=generator,
+                                max_step_frames=args.max_step_frames,
                             )
-                        slot_map[logical_slot] = actual_slot
-                    case_steps.append(
-                        _decode_step(
-                            session,
-                            recorder,
-                            case_name=case.name,
-                            step_index=step_index,
-                            step=step,
-                            slot_map=slot_map,
-                            n_vq=n_vq,
-                            vocab_size=vocab_size,
-                            generator=generator,
                         )
-                    )
-                    for logical_slot in step.release_after:
-                        actual_slot = slot_map.pop(logical_slot)
+                        continue
+                    case_steps = []
+                    slot_map: dict[int, int] = {}
+                    for step_index, step in enumerate(case.steps):
+                        for logical_slot in step.slots:
+                            if logical_slot in slot_map:
+                                continue
+                            actual_slot = session.acquire()
+                            if actual_slot is None:
+                                raise RuntimeError(
+                                    f"failed to acquire stream slot for "
+                                    f"{case.name}:{step.name}"
+                                )
+                            slot_map[logical_slot] = actual_slot
+                        case_steps.append(
+                            _decode_step(
+                                session,
+                                recorder,
+                                case_name=case.name,
+                                step_index=step_index,
+                                step=step,
+                                slot_map=slot_map,
+                                n_vq=n_vq,
+                                vocab_size=vocab_size,
+                                generator=generator,
+                            )
+                        )
+                        for logical_slot in step.release_after:
+                            actual_slot = slot_map.pop(logical_slot)
+                            session.release(actual_slot)
+                    for actual_slot in slot_map.values():
                         session.release(actual_slot)
-                for actual_slot in slot_map.values():
-                    session.release(actual_slot)
-                report["cases"].append({"name": case.name, "steps": case_steps})
-            report["module_records"] = recorder.module_records
-            report["sdpa_records"] = recorder.sdpa_records
-            report["sdpa_summary"] = _summarize_sdpa(recorder.sdpa_records)
-            report["sdpa_summary_by_case"] = _summarize_sdpa_by_case(
-                recorder.sdpa_records
-            )
-    finally:
-        session.close()
+                    report["cases"].append({"name": case.name, "steps": case_steps})
+                report["module_records"] = recorder.module_records
+                report["sdpa_records"] = recorder.sdpa_records
+                report["sdpa_summary"] = _summarize_sdpa(recorder.sdpa_records)
+                report["sdpa_summary_by_case"] = _summarize_sdpa_by_case(
+                    recorder.sdpa_records
+                )
+        finally:
+            session.close()
 
     json_path = output_dir / "streaming_vocoder_trace.json"
     md_path = output_dir / "streaming_vocoder_trace.md"

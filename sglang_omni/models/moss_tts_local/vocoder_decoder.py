@@ -17,6 +17,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from sglang_omni.models.moss_tts_local.streaming_attention import moss_local_window_size
+
 try:
     from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 except ImportError:
@@ -326,11 +328,7 @@ class MossTTSLocalAttention(nn.Module):
         return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
 
     def _flash_window_size(self) -> tuple[int, int]:
-        if self.context is None or not self.causal:
-            return (-1, -1)
-        # MOSS's SDPA local mask keeps `context` total tokens including the current
-        # query token. FlashAttention's left-window argument counts prior keys.
-        return (max(int(self.context) - 1, 0), 0)
+        return moss_local_window_size(self.context, causal=self.causal)
 
 
 class MossTTSLocalTransformerLayer(nn.Module):
