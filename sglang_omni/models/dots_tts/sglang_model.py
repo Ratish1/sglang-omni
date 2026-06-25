@@ -10,7 +10,7 @@ import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from torch import nn
 
-from sglang_omni.models.dots_tts.serving_types import DotsTTSAudioStepResult
+from sglang_omni.models.dots_tts.serving_types import DotsTTSFlowBatchItem
 from sglang_omni.models.dots_tts.weight_loader import (
     map_dots_qwen2_key,
     validate_checkpoint_files,
@@ -99,18 +99,6 @@ class DotsTTSSGLangModel(nn.Module):
             raise RuntimeError("DotsTTSSGLangModel.native_adapter is not initialized")
         return self.native_adapter.prepare_inputs(state)
 
-    def step_audio_latent(
-        self,
-        data: Any,
-        hidden_state: torch.Tensor,
-    ) -> DotsTTSAudioStepResult:
-        return self.native_model.decode_audio_step(
-            fm_state=data.fm_state,
-            generation_kwargs=data.generation_kwargs,
-            hidden_state=hidden_state,
-            precision=str(self.precision),
-        )
-
     def forward_latent_decode_step(
         self,
         *,
@@ -167,17 +155,40 @@ class DotsTTSSGLangModel(nn.Module):
         feedback_embeddings: list[torch.Tensor | None] = [None for _ in batch.requests]
         eos_scores: list[torch.Tensor | None] = [None for _ in batch.requests]
         finished = [False for _ in batch.requests]
-
+        grouped_items: dict[Any, list[DotsTTSFlowBatchItem]] = {}
         for index in batch.active_indices:
             data = batch.requests[index].data
             hidden_state = batch.hidden_states[index]
             if hidden_state is None:
                 continue
-            audio_step = self.step_audio_latent(data, hidden_state)
-            latent_patches[index] = audio_step.latent_patch
-            feedback_embeddings[index] = audio_step.feedback_embedding
-            eos_scores[index] = audio_step.eos_score
-            finished[index] = self._latent_step_finished(data, audio_step.eos_score)
+            key = self.native_model.prepare_flow_batch_key(
+                fm_state=data.fm_state,
+                generation_kwargs=data.generation_kwargs,
+                precision=str(self.precision),
+            )
+            grouped_items.setdefault(key, []).append(
+                DotsTTSFlowBatchItem(
+                    request_index=index,
+                    fm_state=data.fm_state,
+                    hidden_state=hidden_state,
+                    generation_kwargs=data.generation_kwargs,
+                )
+            )
+
+        for items in grouped_items.values():
+            audio_batch = self.native_model.decode_audio_batch_step(
+                items,
+                precision=str(self.precision),
+            )
+            for row, request_index in enumerate(audio_batch.request_indices):
+                data = batch.requests[request_index].data
+                eos_score = audio_batch.eos_scores[row]
+                latent_patches[request_index] = audio_batch.latent_patches[row]
+                feedback_embeddings[request_index] = (
+                    audio_batch.feedback_embeddings[row]
+                )
+                eos_scores[request_index] = eos_score
+                finished[request_index] = self._latent_step_finished(data, eos_score)
 
         return DotsTTSLatentStepOutput(
             batch_result=None,

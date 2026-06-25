@@ -13,6 +13,7 @@ pytest.importorskip("torchdiffeq")
 from sglang_omni.models.dots_tts.native.models.dots_tts.model import DotsTtsModel
 from sglang_omni.models.dots_tts.native.side_runtime import DotsTtsSideModel
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
+from sglang_omni.models.dots_tts.serving_types import DotsTTSFlowBatchItem
 
 
 def test_side_model_prepare_request_builds_serving_inputs() -> None:
@@ -111,6 +112,135 @@ def test_side_model_decode_audio_step_returns_payload_and_feedback() -> None:
     assert torch.equal(result.latent_patch, torch.full((1, 4, 8), 3.0))
     assert torch.equal(result.feedback_embedding, torch.ones(1, 1, 8))
     assert torch.equal(result.eos_score, torch.tensor([1.0]))
+
+
+def test_side_model_batched_flow_calls_core_once_for_two_rows() -> None:
+    class FakeIOHelper:
+        def denormalize(self, latent_patch):
+            return latent_patch + 10
+
+    class FakeCore(nn.Module):
+        mode = "flow_matching"
+        hidden_patch_size = 1
+        latent_patch_size = 4
+        fm_hidden_size = 6
+        latent_dim = 3
+        io_helper = FakeIOHelper()
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1))
+            self.calls = []
+
+        def step_fm(
+            self,
+            input_sequence,
+            cfg_sequence,
+            attn_mask,
+            pos_ids,
+            hidden_size,
+            patch_size,
+            g_cond,
+            ode_method,
+            num_steps,
+            guidance_scale,
+            solver_step,
+        ):
+            del cfg_sequence, g_cond, solver_step
+            self.calls.append(
+                {
+                    "input_shape": tuple(input_sequence.shape),
+                    "attn_mask_shape": tuple(attn_mask.shape),
+                    "pos_ids_shape": tuple(pos_ids.shape),
+                    "hidden_size": hidden_size,
+                    "patch_size": patch_size,
+                    "ode_method": ode_method,
+                    "num_steps": num_steps,
+                    "guidance_scale": guidance_scale,
+                }
+            )
+            values = torch.arange(
+                input_sequence.size(0),
+                dtype=input_sequence.dtype,
+                device=input_sequence.device,
+            ).view(-1, 1, 1)
+            return values.expand(-1, patch_size, self.latent_dim)
+
+        def fm_solver_step(self, *args, **kwargs):
+            raise AssertionError("fake step_fm should not call fm_solver_step")
+
+    def make_state(value: float) -> SimpleNamespace:
+        fm_sequence = torch.full((1, 8, 6), value)
+        fm_cfg_sequence = torch.full((1, 8, 6), value + 1)
+        return SimpleNamespace(
+            fm_seq_len=2,
+            fm_sequence=fm_sequence,
+            fm_cfg_sequence=fm_cfg_sequence,
+            fm_null_g_cond=torch.zeros(1, 6),
+        )
+
+    model = DotsTtsSideModel.__new__(DotsTtsSideModel)
+    nn.Module.__init__(model)
+    model.core = FakeCore()
+    model._optimize_enabled = False
+    model._fm_batch_decode_workspaces = {}
+
+    def append_hidden(state, hidden_state):
+        state.fm_sequence[:, state.fm_seq_len : state.fm_seq_len + 1].copy_(
+            hidden_state[:, -1:, :].to(state.fm_sequence.dtype)
+        )
+        state.fm_cfg_sequence[:, state.fm_seq_len : state.fm_seq_len + 1].zero_()
+        state.fm_seq_len += 1
+
+    model.append_hidden = append_hidden
+    model._encode_audio_patch_feedback = lambda state, *, audio_patch: (
+        audio_patch.mean(dim=1, keepdim=True)
+    )
+    model._should_stop_after_current_audio = lambda state, *, eos_threshold: False
+
+    kwargs = {
+        "device": torch.device("cpu"),
+        "g_cond": None,
+        "ode_method": "euler",
+        "num_steps": 2,
+        "guidance_scale": 1.2,
+        "eos_threshold": 0.8,
+    }
+    result = model.decode_audio_batch_step(
+        [
+            DotsTTSFlowBatchItem(
+                request_index=5,
+                fm_state=make_state(1.0),
+                hidden_state=torch.ones(1, 1, 6),
+                generation_kwargs=kwargs,
+            ),
+            DotsTTSFlowBatchItem(
+                request_index=2,
+                fm_state=make_state(2.0),
+                hidden_state=torch.full((1, 1, 6), 2.0),
+                generation_kwargs=kwargs,
+            ),
+        ],
+        precision="float32",
+    )
+
+    assert model.core.calls == [
+        {
+            "input_shape": (2, 7, 6),
+            "attn_mask_shape": (4, 1, 7, 7),
+            "pos_ids_shape": (4, 7),
+            "hidden_size": 1,
+            "patch_size": 4,
+            "ode_method": "euler",
+            "num_steps": 2,
+            "guidance_scale": 1.2,
+        }
+    ]
+    assert result.request_indices == [5, 2]
+    assert torch.equal(result.latent_patches[0], torch.full((1, 4, 3), 10.0))
+    assert torch.equal(result.latent_patches[1], torch.full((1, 4, 3), 11.0))
+    assert torch.equal(result.feedback_embeddings[0], torch.zeros(1, 1, 3))
+    assert torch.equal(result.feedback_embeddings[1], torch.ones(1, 1, 3))
 
 
 def test_allocate_generate_state_uses_request_owned_fm_buffers() -> None:

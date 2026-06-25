@@ -97,8 +97,9 @@ def test_sglang_model_uses_side_model_serving_api_boundary() -> None:
         "native_model._decode_next_audio",
         "native_model._encode_audio_patch_feedback",
         "native_model._should_stop_after_current_audio",
+        "native_model.decode_audio_step(",
     ]
 
-    assert "native_model.decode_audio_step(" in source
+    assert "native_model.decode_audio_batch_step(" in source
     for symbol in forbidden:
         assert symbol not in source

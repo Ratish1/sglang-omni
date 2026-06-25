@@ -48,6 +48,7 @@ from sglang_omni.models.dots_tts.native.modules.speaker.encoder import (
 )
 from sglang_omni.models.dots_tts.native.modules.vocoder.bigvgan import AudioVAE
 from sglang_omni.models.dots_tts.native.utils.audio import high_quality_resample
+from sglang_omni.models.dots_tts.native.utils.profiling import measure_inference
 from sglang_omni.models.dots_tts.native.utils.text import (
     attach_language_tag,
     detect,
@@ -65,6 +66,9 @@ from sglang_omni.models.dots_tts.native.utils.util import get_dtype
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 from sglang_omni.models.dots_tts.serving_types import (
     DotsTTSAudioStepResult,
+    DotsTTSBatchedAudioStepResult,
+    DotsTTSFlowBatchItem,
+    DotsTTSFlowBatchKey,
     DotsTTSPreparedInputs,
     as_tensor,
     torch_dtype,
@@ -317,6 +321,10 @@ class DotsTtsSideModel(nn.Module):
             OrderedDict()
         )
         self._fm_decode_workspaces: dict[tuple[Any, ...], dict[str, torch.Tensor]] = {}
+        self._fm_batch_decode_workspaces: dict[
+            tuple[DotsTTSFlowBatchKey, int],
+            dict[str, torch.Tensor],
+        ] = {}
         self._token_embedding: nn.Module | None = None
 
     @classmethod
@@ -519,6 +527,250 @@ class DotsTtsSideModel(nn.Module):
             latent_patch=as_tensor(payload_patch),
             feedback_embedding=as_tensor(feedback_embedding),
             eos_score=eos_score,
+        )
+
+    def prepare_flow_batch_key(
+        self,
+        *,
+        fm_state: Any,
+        generation_kwargs: dict[str, Any],
+        precision: str,
+    ) -> DotsTTSFlowBatchKey:
+        del precision
+        if fm_state.fm_sequence is None or fm_state.fm_cfg_sequence is None:
+            raise RuntimeError("FM static buffers are not initialized.")
+        if fm_state.fm_null_g_cond is None:
+            raise RuntimeError("FM null conditioning buffer is not initialized.")
+
+        post_hidden_seq_len = int(fm_state.fm_seq_len) + int(
+            self.core.hidden_patch_size
+        )
+        if post_hidden_seq_len <= 0:
+            raise RuntimeError(
+                "Cannot batch decode audio before any conditioning state has been prefetched."
+            )
+        history_bucket_capacity = self._resolve_fm_history_bucket_capacity(
+            post_hidden_seq_len
+        )
+        return DotsTTSFlowBatchKey(
+            device=fm_state.fm_sequence.device,
+            dtype=fm_state.fm_sequence.dtype,
+            mode=str(self.core.mode),
+            ode_method=str(generation_kwargs["ode_method"]),
+            num_steps=int(generation_kwargs["num_steps"]),
+            guidance_scale=float(generation_kwargs["guidance_scale"]),
+            history_bucket_capacity=history_bucket_capacity,
+            latent_patch_size=int(self.core.latent_patch_size),
+            hidden_patch_size=int(self.core.hidden_patch_size),
+        )
+
+    def decode_audio_batch_step(
+        self,
+        items: list[DotsTTSFlowBatchItem],
+        *,
+        precision: str,
+    ) -> DotsTTSBatchedAudioStepResult:
+        if not items:
+            return DotsTTSBatchedAudioStepResult([], [], [], [])
+
+        key = self.prepare_flow_batch_key(
+            fm_state=items[0].fm_state,
+            generation_kwargs=items[0].generation_kwargs,
+            precision=precision,
+        )
+        for item in items:
+            item_key = self.prepare_flow_batch_key(
+                fm_state=item.fm_state,
+                generation_kwargs=item.generation_kwargs,
+                precision=precision,
+            )
+            if item_key != key:
+                raise ValueError(
+                    "decode_audio_batch_step received incompatible dots flow rows."
+                )
+
+        for item in items:
+            self.append_hidden(item.fm_state, item.hidden_state)
+
+        dtype = torch_dtype(str(precision))
+        use_amp = key.device.type == "cuda" and dtype in {
+            torch.float16,
+            torch.bfloat16,
+        }
+        with torch.autocast(
+            device_type=key.device.type,
+            dtype=dtype,
+            enabled=use_amp,
+        ):
+            latent_batch = self._decode_batched_audio_latents(items, key=key)
+            feedback_batch = [
+                self._encode_audio_patch_feedback(
+                    item.fm_state,
+                    audio_patch=latent_batch[row : row + 1],
+                )
+                for row, item in enumerate(items)
+            ]
+
+        latent_patches: list[torch.Tensor] = []
+        feedback_embeddings: list[torch.Tensor] = []
+        eos_scores: list[torch.Tensor] = []
+        for row, item in enumerate(items):
+            latent_patch = latent_batch[row : row + 1]
+            payload_patch = self.core.io_helper.denormalize(latent_patch)
+            eos_threshold = float(item.generation_kwargs.get("eos_threshold", 0.8))
+            stopped = self._should_stop_after_current_audio(
+                item.fm_state,
+                eos_threshold=eos_threshold,
+            )
+            latent_patches.append(as_tensor(payload_patch))
+            feedback_embeddings.append(as_tensor(feedback_batch[row]))
+            eos_scores.append(
+                torch.tensor(
+                    [1.0 if stopped else 0.0],
+                    device=latent_patch.device,
+                )
+            )
+
+        return DotsTTSBatchedAudioStepResult(
+            request_indices=[item.request_index for item in items],
+            latent_patches=latent_patches,
+            feedback_embeddings=feedback_embeddings,
+            eos_scores=eos_scores,
+        )
+
+    def _decode_batched_audio_latents(
+        self,
+        items: list[DotsTTSFlowBatchItem],
+        *,
+        key: DotsTTSFlowBatchKey,
+    ) -> torch.Tensor:
+        workspace = self._get_fm_batch_decode_workspace(
+            key=key,
+            batch_size=len(items),
+        )
+        input_sequence = workspace["input_sequence"]
+        cfg_sequence = workspace["cfg_sequence"]
+        attn_mask = workspace["attn_mask"]
+        pos_ids = workspace["pos_ids"]
+
+        g_cond_rows = []
+        for row, item in enumerate(items):
+            state = item.fm_state
+            input_sequence[row : row + 1, : state.fm_seq_len].copy_(
+                state.fm_sequence[:, : state.fm_seq_len]
+            )
+            cfg_sequence[row : row + 1, : state.fm_seq_len].copy_(
+                state.fm_cfg_sequence[:, : state.fm_seq_len]
+            )
+            self._build_fm_attn_mask(
+                state=state,
+                attn_mask=attn_mask[row : row + 1],
+            )
+            self._build_fm_pos_ids(
+                state=state,
+                pos_ids=pos_ids[row : row + 1],
+            )
+            g_cond_rows.append(
+                self._resolve_batch_g_cond(
+                    item.generation_kwargs.get("g_cond"),
+                    state=state,
+                )
+            )
+
+        batch_g_cond = torch.cat(g_cond_rows, dim=0)
+        solver_step = None
+        compile_signature = (
+            (len(items), key.history_bucket_capacity, key.dtype)
+            if self._optimize_enabled
+            else None
+        )
+        if self.core.mode == "meanflow":
+            solver_step = self._get_compiled_method(
+                "FM.meanflow.solver_step",
+                self.core,
+                "meanflow_solver_step",
+                signature=compile_signature,
+            )
+            step_attn_mask = attn_mask.unsqueeze(1)
+            step_pos_ids = pos_ids
+        else:
+            solver_step = self._get_compiled_method(
+                "FM.flow_matching.solver_step",
+                self.core,
+                "fm_solver_step",
+                signature=compile_signature,
+            )
+            step_attn_mask = torch.cat([attn_mask, attn_mask], dim=0).unsqueeze(1)
+            step_pos_ids = torch.cat([pos_ids, pos_ids], dim=0)
+
+        with measure_inference("FM"):
+            return self.core.step_fm(
+                input_sequence=input_sequence,
+                cfg_sequence=cfg_sequence,
+                attn_mask=step_attn_mask,
+                pos_ids=step_pos_ids,
+                hidden_size=key.hidden_patch_size,
+                patch_size=key.latent_patch_size,
+                g_cond=batch_g_cond,
+                ode_method=key.ode_method,
+                num_steps=key.num_steps,
+                guidance_scale=key.guidance_scale,
+                solver_step=solver_step,
+            )
+
+    def _get_fm_batch_decode_workspace(
+        self,
+        *,
+        key: DotsTTSFlowBatchKey,
+        batch_size: int,
+    ) -> dict[str, torch.Tensor]:
+        if not hasattr(self, "_fm_batch_decode_workspaces"):
+            self._fm_batch_decode_workspaces = {}
+        workspace_key = (key, int(batch_size))
+        workspace = self._fm_batch_decode_workspaces.get(workspace_key)
+        total_len = key.history_bucket_capacity + key.latent_patch_size
+        if workspace is None:
+            workspace = {
+                "input_sequence": torch.zeros(
+                    (batch_size, total_len, self.core.fm_hidden_size),
+                    dtype=key.dtype,
+                    device=key.device,
+                ),
+                "cfg_sequence": torch.zeros(
+                    (batch_size, total_len, self.core.fm_hidden_size),
+                    dtype=key.dtype,
+                    device=key.device,
+                ),
+                "attn_mask": torch.zeros(
+                    (batch_size, total_len, total_len),
+                    dtype=torch.bool,
+                    device=key.device,
+                ),
+                "pos_ids": torch.zeros(
+                    (batch_size, total_len),
+                    dtype=torch.float32,
+                    device=key.device,
+                ),
+            }
+            self._fm_batch_decode_workspaces[workspace_key] = workspace
+        else:
+            workspace["input_sequence"].zero_()
+            workspace["cfg_sequence"].zero_()
+            workspace["attn_mask"].zero_()
+            workspace["pos_ids"].zero_()
+        return workspace
+
+    @staticmethod
+    def _resolve_batch_g_cond(
+        g_cond: torch.Tensor | None,
+        *,
+        state: Any,
+    ) -> torch.Tensor:
+        if g_cond is None:
+            return state.fm_null_g_cond
+        return g_cond.to(
+            device=state.fm_null_g_cond.device,
+            dtype=state.fm_null_g_cond.dtype,
         )
 
     @staticmethod

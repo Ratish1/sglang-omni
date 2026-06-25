@@ -34,6 +34,41 @@ class DotsTTSAudioStepResult:
     eos_score: torch.Tensor | None
 
 
+@dataclass(frozen=True)
+class DotsTTSFlowBatchKey:
+    """Compatibility key for batching dots DiT/flow latent steps."""
+
+    device: torch.device
+    dtype: torch.dtype
+    mode: str
+    ode_method: str
+    num_steps: int
+    guidance_scale: float
+    history_bucket_capacity: int
+    latent_patch_size: int
+    hidden_patch_size: int
+
+
+@dataclass
+class DotsTTSFlowBatchItem:
+    """One scheduler row to include in a batched dots DiT/flow step."""
+
+    request_index: int
+    fm_state: Any
+    hidden_state: torch.Tensor
+    generation_kwargs: dict[str, Any]
+
+
+@dataclass
+class DotsTTSBatchedAudioStepResult:
+    """Batched dots audio step outputs aligned to scheduler request indices."""
+
+    request_indices: list[int]
+    latent_patches: list[torch.Tensor]
+    feedback_embeddings: list[torch.Tensor]
+    eos_scores: list[torch.Tensor]
+
+
 def as_tensor(value: Any) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
         return value
@@ -50,6 +85,9 @@ def torch_dtype(name: str) -> torch.dtype:
 
 __all__ = [
     "DotsTTSAudioStepResult",
+    "DotsTTSBatchedAudioStepResult",
+    "DotsTTSFlowBatchItem",
+    "DotsTTSFlowBatchKey",
     "DotsTTSPreparedInputs",
     "as_tensor",
     "torch_dtype",

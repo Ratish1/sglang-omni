@@ -338,7 +338,7 @@ class DotsTtsCore(nn.Module):
             g_cond_branches.append(torch.zeros_like(g_cond_t))
 
         z_z = torch.cat(z_branches, dim=0)
-        t_t = t.reshape(1).repeat(len(z_branches))
+        t_t = t.reshape(1).repeat(z_z.size(0))
         if g_cond_branches is not None:
             g_cond_t = torch.cat(g_cond_branches, dim=0)
         vt = self.velocity_field_predictor(
