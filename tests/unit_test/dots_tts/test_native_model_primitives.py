@@ -11,6 +11,106 @@ from torch import nn
 pytest.importorskip("torchdiffeq")
 
 from sglang_omni.models.dots_tts.native.models.dots_tts.model import DotsTtsModel
+from sglang_omni.models.dots_tts.native.side_runtime import DotsTtsSideModel
+from sglang_omni.models.dots_tts.payload_types import DotsTTSState
+
+
+def test_side_model_prepare_request_builds_serving_inputs() -> None:
+    class FakeCore(nn.Module):
+        audio_span_token_ids = [99]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1))
+
+    model = DotsTtsSideModel.__new__(DotsTtsSideModel)
+    nn.Module.__init__(model)
+    model.core = FakeCore()
+    model._prepare_prompt_conditioning = lambda *args, **kwargs: SimpleNamespace(
+        prompt_patches=None,
+        prompt_latents=None,
+        g_cond=None,
+    )
+    model._find_audio_span_positions = lambda schedule, *, audio_placeholder_ids: (
+        schedule.reshape(-1).eq(next(iter(audio_placeholder_ids))).nonzero().reshape(-1)
+    )
+    model._allocate_generate_state = lambda *, max_audio_patch_count, device, dtype: (
+        SimpleNamespace(fm_sequence=torch.zeros(1, device=device, dtype=dtype))
+    )
+    model._prefill_prompt_latents = lambda prompt_latents, *, state: None
+    model._locate_prefill_boundary = (
+        lambda *, span_positions, prompt_patch_count: (
+            int(span_positions[prompt_patch_count].item()),
+            span_positions[:prompt_patch_count],
+        )
+    )
+    model._build_prefill_inputs_embeds = lambda *args, **kwargs: None
+
+    raw_inputs = {"generation_schedule": torch.tensor([[1, 2, 99, 99]])}
+    prepared = model.prepare_request(
+        raw_inputs,
+        DotsTTSState(text="Hello."),
+        generation_schedule=raw_inputs["generation_schedule"],
+        precision="bfloat16",
+    )
+
+    assert prepared.input_ids.tolist() == [[1, 2]]
+    assert prepared.generation_schedule.tolist() == [[1, 2, 99, 99]]
+    assert prepared.audio_span_positions.tolist() == [2, 3]
+    assert prepared.prefill_end == 2
+    assert prepared.audio_placeholder_ids == {99}
+    assert prepared.fm_state is raw_inputs["fm_state"]
+    assert prepared.generation_kwargs["device"] == torch.device("cpu")
+    assert prepared.generation_kwargs["ode_method"] == "euler"
+
+
+def test_side_model_decode_audio_step_returns_payload_and_feedback() -> None:
+    class FakeIOHelper:
+        def denormalize(self, latent_patch):
+            return latent_patch + 2
+
+    class FakeCore(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1))
+            self.io_helper = FakeIOHelper()
+
+    model = DotsTtsSideModel.__new__(DotsTtsSideModel)
+    nn.Module.__init__(model)
+    model.core = FakeCore()
+    fm_state = {"history": []}
+    calls = []
+    model._append_hidden_chunk = lambda state, hidden: calls.append(
+        ("append_hidden", state, hidden)
+    )
+    model._decode_next_audio = lambda **kwargs: torch.ones(1, 4, 8)
+    model._encode_audio_patch_feedback = lambda state, *, audio_patch: (
+        audio_patch.mean(dim=1, keepdim=True)
+    )
+    model._should_stop_after_current_audio = lambda state, *, eos_threshold: True
+
+    hidden_state = torch.zeros(1, 1, 4)
+    result = model.decode_audio_step(
+        fm_state=fm_state,
+        generation_kwargs={
+            "device": torch.device("cpu"),
+            "g_cond": None,
+            "ode_method": "euler",
+            "num_steps": 2,
+            "guidance_scale": 1.2,
+            "eos_threshold": 0.8,
+        },
+        hidden_state=hidden_state,
+        precision="float32",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == "append_hidden"
+    assert calls[0][1] is fm_state
+    assert calls[0][2] is hidden_state
+    assert torch.equal(result.latent_patch, torch.full((1, 4, 8), 3.0))
+    assert torch.equal(result.feedback_embedding, torch.ones(1, 1, 8))
+    assert torch.equal(result.eos_score, torch.tensor([1.0]))
 
 
 def test_allocate_generate_state_uses_request_owned_fm_buffers() -> None:
@@ -59,6 +159,35 @@ def test_allocate_generate_state_uses_request_owned_fm_buffers() -> None:
 
     assert torch.all(first.fm_sequence == 7.0)
     assert torch.all(second.fm_sequence == 0.0)
+
+
+def test_side_model_warmup_only_runs_side_compile_buckets() -> None:
+    class FakeCore(nn.Module):
+        audio_gen_span_id = 42
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1))
+
+    model = DotsTtsSideModel.__new__(DotsTtsSideModel)
+    nn.Module.__init__(model)
+    model.core = FakeCore()
+    model.audio_gen_start_id = 41
+    calls = []
+
+    model._warmup_fm_bucket = lambda **kwargs: calls.append(
+        ("fm", kwargs["max_audio_patch_count"], kwargs["precision"])
+    )
+    model._warmup_patch_encoder_bucket = lambda **kwargs: calls.append(
+        ("patch_encoder", kwargs["max_audio_patch_count"], kwargs["precision"])
+    )
+
+    model.run_warmup(max_generate_length=32, precision="float32")
+
+    assert calls == [
+        ("fm", 32, "float32"),
+        ("patch_encoder", 32, "float32"),
+    ]
 
 
 def test_encode_audio_patch_feedback_does_not_call_llm() -> None:

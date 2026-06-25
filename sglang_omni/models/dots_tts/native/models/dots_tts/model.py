@@ -1,3 +1,13 @@
+"""Vendored dots TTS full inference assembly.
+
+sglang-omni serving does not call this file's upstream full-runtime entrypoints
+(`generate_audio`, `generate_audio_stream`, `_generate_latents_stream`), upstream
+top-level prefill/decode loops, artifact save/load helpers, or upstream warmup
+orchestration. Those surfaces are carried for provenance and parity with the public
+dots TTS implementation while `DotsTtsSideModel` exposes the serving boundary used by
+the native Omni pipeline.
+"""
+
 from __future__ import annotations
 
 import hashlib

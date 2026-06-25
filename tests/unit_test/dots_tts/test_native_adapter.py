@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sglang_omni.models.dots_tts.native_adapter import DotsTTSNativeAdapter
+from sglang_omni.models.dots_tts.native.side_runtime import DotsTtsSideModel
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 
 
@@ -15,6 +16,8 @@ class FakeNativeModel:
     """Minimal model implementing the native preparation API the adapter requires."""
 
     AUDIO_SPAN_ID = 99
+    prepare_request = DotsTtsSideModel.prepare_request
+    _generation_kwargs = staticmethod(DotsTtsSideModel._generation_kwargs)
 
     def __init__(self) -> None:
         self.llm_config = SimpleNamespace(vocab_size=32000)

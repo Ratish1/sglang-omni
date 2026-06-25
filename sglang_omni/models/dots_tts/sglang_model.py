@@ -10,11 +10,7 @@ import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from torch import nn
 
-from sglang_omni.models.dots_tts.native_adapter import (
-    DotsTTSAudioStepResult,
-    _as_tensor,
-    _torch_dtype,
-)
+from sglang_omni.models.dots_tts.serving_types import DotsTTSAudioStepResult
 from sglang_omni.models.dots_tts.weight_loader import (
     map_dots_qwen2_key,
     validate_checkpoint_files,
@@ -103,69 +99,16 @@ class DotsTTSSGLangModel(nn.Module):
             raise RuntimeError("DotsTTSSGLangModel.native_adapter is not initialized")
         return self.native_adapter.prepare_inputs(state)
 
-    def append_hidden_chunk(self, data: Any, hidden_state: torch.Tensor) -> None:
-        self.native_model._append_hidden_chunk(data.fm_state, hidden_state)
-
-    def encode_audio_patch_feedback(
-        self,
-        data: Any,
-        latent_patch: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.native_model._encode_audio_patch_feedback(
-            data.fm_state, audio_patch=latent_patch
-        )
-
     def step_audio_latent(
         self,
         data: Any,
         hidden_state: torch.Tensor,
     ) -> DotsTTSAudioStepResult:
-        generation_kwargs = data.generation_kwargs
-        decode_kwargs = {
-            key: value
-            for key, value in generation_kwargs.items()
-            if key in {"device", "g_cond", "ode_method", "num_steps", "guidance_scale"}
-        }
-        self.append_hidden_chunk(data, hidden_state)
-        device = decode_kwargs.get("device")
-        dtype = _torch_dtype(str(self.precision))
-        use_amp = (
-            isinstance(device, torch.device)
-            and device.type == "cuda"
-            and dtype in {torch.float16, torch.bfloat16}
-        )
-        with torch.autocast(
-            device_type=device.type if isinstance(device, torch.device) else "cuda",
-            dtype=dtype,
-            enabled=use_amp,
-        ):
-            latent_patch = _as_tensor(
-                self.native_model._decode_next_audio(
-                    state=data.fm_state,
-                    **decode_kwargs,
-                )
-            )
-            feedback_embedding = self.encode_audio_patch_feedback(data, latent_patch)
-
-        payload_patch = self.native_model.core.io_helper.denormalize(latent_patch)
-        return DotsTTSAudioStepResult(
-            latent_patch=_as_tensor(payload_patch),
-            feedback_embedding=_as_tensor(feedback_embedding),
-            eos_score=self._score_audio_eos(data, latent_patch),
-        )
-
-    def _score_audio_eos(
-        self,
-        data: Any,
-        latent_patch: torch.Tensor,
-    ) -> torch.Tensor:
-        eos_threshold = float(data.generation_kwargs.get("eos_threshold", 0.8))
-        stopped = self.native_model._should_stop_after_current_audio(
-            data.fm_state, eos_threshold=eos_threshold
-        )
-        return torch.tensor(
-            [1.0 if stopped else 0.0],
-            device=latent_patch.device,
+        return self.native_model.decode_audio_step(
+            fm_state=data.fm_state,
+            generation_kwargs=data.generation_kwargs,
+            hidden_state=hidden_state,
+            precision=str(self.precision),
         )
 
     def forward_latent_decode_step(

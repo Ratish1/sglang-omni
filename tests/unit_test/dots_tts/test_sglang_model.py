@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from sglang_omni.models.dots_tts.serving_types import DotsTTSAudioStepResult
 from sglang_omni.models.dots_tts.sglang_model import DotsTTSSGLangModel
 
 
@@ -42,30 +43,28 @@ def test_model_owns_qwen2_backbone(monkeypatch) -> None:
 
 class FakeNativeDotsModel:
     def __init__(self) -> None:
-        self.appended_hidden = None
-        self.core = SimpleNamespace(
-            io_helper=SimpleNamespace(denormalize=lambda audio_patch: audio_patch)
+        self.decode_args = None
+
+    def decode_audio_step(
+        self,
+        *,
+        fm_state,
+        generation_kwargs,
+        hidden_state,
+        precision,
+    ):
+        assert fm_state == {"history": []}
+        assert generation_kwargs["ode_method"] == "euler"
+        assert generation_kwargs["num_steps"] == 2
+        assert generation_kwargs["guidance_scale"] == 1.2
+        assert generation_kwargs["eos_threshold"] == 0.8
+        self.decode_args = (hidden_state, precision)
+        latent_patch = torch.ones(1, 4, 128)
+        return DotsTTSAudioStepResult(
+            latent_patch=latent_patch,
+            feedback_embedding=latent_patch.mean(dim=1, keepdim=True),
+            eos_score=torch.tensor([0.0]),
         )
-
-    def _append_hidden_chunk(self, fm_state, hidden_state):
-        assert fm_state == {"history": []}
-        self.appended_hidden = hidden_state
-
-    def _decode_next_audio(self, **kwargs):
-        assert kwargs["state"] == {"history": []}
-        assert kwargs["ode_method"] == "euler"
-        assert kwargs["num_steps"] == 2
-        assert kwargs["guidance_scale"] == 1.2
-        return torch.ones(1, 4, 128)
-
-    def _encode_audio_patch_feedback(self, fm_state, *, audio_patch):
-        assert fm_state == {"history": []}
-        return audio_patch.mean(dim=1, keepdim=True)
-
-    def _should_stop_after_current_audio(self, fm_state, *, eos_threshold):
-        assert fm_state == {"history": []}
-        assert eos_threshold == 0.8
-        return False
 
 
 def test_model_steps_audio_latent_without_adapter(monkeypatch) -> None:
@@ -90,7 +89,8 @@ def test_model_steps_audio_latent_without_adapter(monkeypatch) -> None:
 
     result = model.step_audio_latent(data, hidden_state)
 
-    assert native_model.appended_hidden is hidden_state
+    assert native_model.decode_args[0] is hidden_state
+    assert native_model.decode_args[1] == "bfloat16"
     assert result.latent_patch.shape == (1, 4, 128)
     assert result.feedback_embedding.shape == (1, 1, 128)
     assert torch.equal(result.eos_score, torch.tensor([0.0]))

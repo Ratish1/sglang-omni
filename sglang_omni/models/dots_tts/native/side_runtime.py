@@ -62,6 +62,13 @@ from sglang_omni.models.dots_tts.native.utils.tokenizer import (
     require_token_id,
 )
 from sglang_omni.models.dots_tts.native.utils.util import get_dtype
+from sglang_omni.models.dots_tts.payload_types import DotsTTSState
+from sglang_omni.models.dots_tts.serving_types import (
+    DotsTTSAudioStepResult,
+    DotsTTSPreparedInputs,
+    as_tensor,
+    torch_dtype,
+)
 
 RUNTIME_TEMPLATE_BY_NAME = {
     "tts": DEFAULT_TTS_TEMPLATE,
@@ -183,7 +190,6 @@ class DotsTtsSideModel(nn.Module):
 
     set_optimize = DotsTtsModel.set_optimize
     set_cfg_droprate = DotsTtsModel.set_cfg_droprate
-    run_warmup = DotsTtsModel.run_warmup
     _resolve_generate_length_bucket = classmethod(
         DotsTtsModel._resolve_generate_length_bucket.__func__
     )
@@ -232,6 +238,46 @@ class DotsTtsSideModel(nn.Module):
     _validate_pretrained_directory = classmethod(
         DotsTtsModel._validate_pretrained_directory.__func__
     )
+
+    @torch.no_grad()
+    def run_warmup(
+        self,
+        *,
+        max_generate_length: int,
+        precision: str = "bfloat16",
+        ode_method: str = "euler",
+        num_steps: int = 10,
+        guidance_scale: float = 1.2,
+    ) -> None:
+        ceiling_bucket = self._resolve_generate_length_bucket(max_generate_length)
+        warmup_buckets = tuple(
+            bucket
+            for bucket in self._GENERATE_LENGTH_BUCKETS
+            if bucket.size <= ceiling_bucket.size
+        )
+        bucket_sizes = [bucket.size for bucket in warmup_buckets]
+        logger.info(
+            "Side inference warmup started: requested_max_generate_length={} bucket_sizes={}",
+            int(max_generate_length),
+            bucket_sizes,
+        )
+        for bucket in warmup_buckets:
+            self._warmup_fm_bucket(
+                max_audio_patch_count=bucket.size,
+                precision=precision,
+                ode_method=ode_method,
+                num_steps=num_steps,
+                guidance_scale=guidance_scale,
+            )
+            self._warmup_patch_encoder_bucket(
+                max_audio_patch_count=bucket.size,
+                precision=precision,
+            )
+        logger.info(
+            "Side inference warmup completed: requested_max_generate_length={} bucket_sizes={}",
+            int(max_generate_length),
+            bucket_sizes,
+        )
 
     def __init__(
         self,
@@ -328,6 +374,173 @@ class DotsTtsSideModel(nn.Module):
                 )
             inputs_embeds[:, prompt_span_positions, :] = patch_embeddings
         return inputs_embeds
+
+    def prepare_request(
+        self,
+        raw_inputs: dict[str, Any],
+        state: DotsTTSState,
+        *,
+        generation_schedule: torch.Tensor,
+        precision: str,
+    ) -> DotsTTSPreparedInputs:
+        device = next(self.core.parameters()).device
+        dtype = torch_dtype(precision)
+        generation_schedule = generation_schedule.to(device=device, dtype=torch.long)
+        if generation_schedule.ndim == 1:
+            generation_schedule = generation_schedule.unsqueeze(0)
+
+        use_prompt_prefill = raw_inputs.get("prompt_audio") is not None and bool(
+            raw_inputs.get("prompt_text")
+        )
+        prompt_conditioning = self._prepare_prompt_conditioning(
+            raw_inputs.get("prompt_audio"),
+            use_prompt_prefill=use_prompt_prefill,
+            speaker_scale=state.speaker_scale,
+        )
+        prompt_patches = prompt_conditioning.prompt_patches
+        prompt_patch_count = (
+            0 if prompt_patches is None else int(prompt_patches.size(1))
+        )
+        audio_placeholder_ids = set(self.core.audio_span_token_ids)
+        span_positions = self._find_audio_span_positions(
+            generation_schedule,
+            audio_placeholder_ids=audio_placeholder_ids,
+        )
+        span_count = int(span_positions.numel())
+        minimum_required_spans = prompt_patch_count + 1
+        if span_count < minimum_required_spans:
+            raise ValueError(
+                f"generation_schedule provides {span_count} audio spans, but "
+                f"prompt prefill requires {prompt_patch_count} spans and generation "
+                "requires at least one additional decode span."
+            )
+        fm_state = self._allocate_generate_state(
+            max_audio_patch_count=span_count,
+            device=device,
+            dtype=dtype,
+        )
+        prompt_latents = prompt_conditioning.prompt_latents
+        if prompt_latents is not None:
+            prompt_latents = prompt_latents.to(dtype=fm_state.fm_sequence.dtype)
+        prompt_patch_embeddings = self._prefill_prompt_latents(
+            prompt_latents,
+            state=fm_state,
+        )
+        prefill_end, prompt_span_positions = self._locate_prefill_boundary(
+            span_positions=span_positions,
+            prompt_patch_count=prompt_patch_count,
+        )
+        input_ids = generation_schedule[:, :prefill_end]
+        prompt_input_embeds = None
+        if prompt_span_positions.numel() > 0:
+            prompt_input_embeds = self._build_prefill_inputs_embeds(
+                input_ids,
+                prompt_patch_embeddings=prompt_patch_embeddings,
+                prompt_span_positions=prompt_span_positions,
+            )
+        raw_inputs["prompt_conditioning"] = prompt_conditioning
+        raw_inputs["fm_state"] = fm_state
+        raw_inputs["audio_span_positions"] = span_positions
+        raw_inputs["prefill_end"] = prefill_end
+        raw_inputs["prompt_span_positions"] = prompt_span_positions
+        raw_inputs["audio_placeholder_ids"] = audio_placeholder_ids
+        return DotsTTSPreparedInputs(
+            raw_inputs=raw_inputs,
+            input_ids=input_ids,
+            generation_schedule=generation_schedule,
+            audio_span_positions=span_positions,
+            prefill_end=prefill_end,
+            audio_placeholder_ids=audio_placeholder_ids,
+            prompt_patch_embeddings=prompt_input_embeds,
+            prompt_conditioning=prompt_conditioning,
+            fm_state=fm_state,
+            generation_kwargs=self._generation_kwargs(
+                state,
+                prompt_conditioning=prompt_conditioning,
+                fm_state=fm_state,
+            ),
+        )
+
+    def append_hidden(
+        self,
+        fm_state: Any,
+        hidden_state: torch.Tensor,
+    ) -> None:
+        self._append_hidden_chunk(fm_state, hidden_state)
+
+    def decode_audio_step(
+        self,
+        *,
+        fm_state: Any,
+        generation_kwargs: dict[str, Any],
+        hidden_state: torch.Tensor,
+        precision: str,
+    ) -> DotsTTSAudioStepResult:
+        decode_kwargs = {
+            key: value
+            for key, value in generation_kwargs.items()
+            if key in {"device", "g_cond", "ode_method", "num_steps", "guidance_scale"}
+        }
+        self.append_hidden(fm_state, hidden_state)
+        device = decode_kwargs.get("device")
+        dtype = torch_dtype(str(precision))
+        use_amp = (
+            isinstance(device, torch.device)
+            and device.type == "cuda"
+            and dtype in {torch.float16, torch.bfloat16}
+        )
+        with torch.autocast(
+            device_type=device.type if isinstance(device, torch.device) else "cuda",
+            dtype=dtype,
+            enabled=use_amp,
+        ):
+            latent_patch = as_tensor(
+                self._decode_next_audio(
+                    state=fm_state,
+                    **decode_kwargs,
+                )
+            )
+            feedback_embedding = self._encode_audio_patch_feedback(
+                fm_state,
+                audio_patch=latent_patch,
+            )
+
+        payload_patch = self.core.io_helper.denormalize(latent_patch)
+        eos_threshold = float(generation_kwargs.get("eos_threshold", 0.8))
+        stopped = self._should_stop_after_current_audio(
+            fm_state,
+            eos_threshold=eos_threshold,
+        )
+        eos_score = torch.tensor(
+            [1.0 if stopped else 0.0],
+            device=latent_patch.device,
+        )
+        return DotsTTSAudioStepResult(
+            latent_patch=as_tensor(payload_patch),
+            feedback_embedding=as_tensor(feedback_embedding),
+            eos_score=eos_score,
+        )
+
+    @staticmethod
+    def _generation_kwargs(
+        state: DotsTTSState,
+        *,
+        prompt_conditioning: Any,
+        fm_state: Any,
+    ) -> dict[str, Any]:
+        device = None
+        if fm_state is not None and fm_state.fm_sequence is not None:
+            device = fm_state.fm_sequence.device
+        g_cond = getattr(prompt_conditioning, "g_cond", None)
+        return {
+            "device": device,
+            "g_cond": g_cond,
+            "ode_method": state.ode_method,
+            "num_steps": state.num_steps,
+            "guidance_scale": state.guidance_scale,
+            "speaker_scale": state.speaker_scale,
+            "eos_threshold": 0.8,
+        }
 
     def _load_pretrained_artifacts(self, pretrained_path: Path) -> None:
         self.latent_stats_path = pretrained_path / self.LATENT_STATS_FILENAME
