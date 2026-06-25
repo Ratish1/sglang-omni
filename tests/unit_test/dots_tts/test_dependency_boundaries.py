@@ -60,9 +60,9 @@ def test_dots_runner_does_not_invoke_model_private_latent_step() -> None:
 
 def test_side_model_warmup_does_not_use_full_generation_api() -> None:
     root = Path(__file__).resolve().parents[3]
-    source = (
-        root / "sglang_omni/models/dots_tts/native/side_runtime.py"
-    ).read_text(encoding="utf-8")
+    source = (root / "sglang_omni/models/dots_tts/native/side_runtime.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "run_warmup = DotsTtsModel.run_warmup" not in source
     assert "def run_warmup(" in source
@@ -90,9 +90,9 @@ def test_vendored_model_does_not_expose_upstream_full_runtime_surfaces() -> None
 
 def test_native_adapter_uses_side_model_serving_api_boundary() -> None:
     root = Path(__file__).resolve().parents[3]
-    source = (
-        root / "sglang_omni/models/dots_tts/native_adapter.py"
-    ).read_text(encoding="utf-8")
+    source = (root / "sglang_omni/models/dots_tts/native_adapter.py").read_text(
+        encoding="utf-8"
+    )
     forbidden = [
         "_prepare_prompt_conditioning",
         "_find_audio_span_positions",
@@ -109,9 +109,9 @@ def test_native_adapter_uses_side_model_serving_api_boundary() -> None:
 
 def test_sglang_model_uses_side_model_serving_api_boundary() -> None:
     root = Path(__file__).resolve().parents[3]
-    source = (
-        root / "sglang_omni/models/dots_tts/sglang_model.py"
-    ).read_text(encoding="utf-8")
+    source = (root / "sglang_omni/models/dots_tts/sglang_model.py").read_text(
+        encoding="utf-8"
+    )
     forbidden = [
         "native_model._append_hidden_chunk",
         "native_model._decode_next_audio",

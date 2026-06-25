@@ -39,11 +39,9 @@ def test_side_model_prepare_request_builds_serving_inputs() -> None:
         SimpleNamespace(fm_sequence=torch.zeros(1, device=device, dtype=dtype))
     )
     model._prefill_prompt_latents = lambda prompt_latents, *, state: None
-    model._locate_prefill_boundary = (
-        lambda *, span_positions, prompt_patch_count: (
-            int(span_positions[prompt_patch_count].item()),
-            span_positions[:prompt_patch_count],
-        )
+    model._locate_prefill_boundary = lambda *, span_positions, prompt_patch_count: (
+        int(span_positions[prompt_patch_count].item()),
+        span_positions[:prompt_patch_count],
     )
     model._build_prefill_inputs_embeds = lambda *args, **kwargs: None
 

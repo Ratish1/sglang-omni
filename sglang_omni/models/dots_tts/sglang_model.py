@@ -184,9 +184,9 @@ class DotsTTSSGLangModel(nn.Module):
                 data = batch.requests[request_index].data
                 eos_score = audio_batch.eos_scores[row]
                 latent_patches[request_index] = audio_batch.latent_patches[row]
-                feedback_embeddings[request_index] = (
-                    audio_batch.feedback_embeddings[row]
-                )
+                feedback_embeddings[request_index] = audio_batch.feedback_embeddings[
+                    row
+                ]
                 eos_scores[request_index] = eos_score
                 finished[request_index] = self._latent_step_finished(data, eos_score)
 

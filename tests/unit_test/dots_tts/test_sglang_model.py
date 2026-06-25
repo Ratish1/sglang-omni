@@ -59,9 +59,7 @@ class FakeNativeDotsModel:
         return generation_kwargs["batch_key"]
 
     def decode_audio_batch_step(self, items, *, precision):
-        self.decode_batches.append(
-            (precision, [item.request_index for item in items])
-        )
+        self.decode_batches.append((precision, [item.request_index for item in items]))
         return DotsTTSBatchedAudioStepResult(
             request_indices=[item.request_index for item in items],
             latent_patches=[
