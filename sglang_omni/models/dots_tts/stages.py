@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import logging
 import hashlib
+import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -64,7 +64,9 @@ def _ensure_sglang_llm_checkpoint_view(model_path: str) -> str:
     config_view = view / "config.json"
     config_view.write_bytes(llm_config_path.read_bytes())
     for source in root.iterdir():
-        target_name = "dots_config.json" if source.name == "config.json" else source.name
+        target_name = (
+            "dots_config.json" if source.name == "config.json" else source.name
+        )
         target = view / target_name
         if target.exists() or target.is_symlink():
             continue
@@ -392,9 +394,11 @@ def _concat_latent_patches(
     if not latent_patches:
         raise RuntimeError("dots.tts latent engine produced no latent patches")
     tensors = [
-        _to_runtime_latent_tensor(patch, runtime)
-        if runtime is not None
-        else _to_latent_tensor(patch)
+        (
+            _to_runtime_latent_tensor(patch, runtime)
+            if runtime is not None
+            else _to_latent_tensor(patch)
+        )
         for patch in latent_patches
     ]
     try:
@@ -427,7 +431,9 @@ class DotsTTSVocoder:
         latents = _concat_latent_patches(latent_patches, runtime=self.runtime)
         with self.runtime_lock:
             audio = self.runtime.model._decode_latents(latents)
-        sample_rate = int(state.sample_rate or getattr(self.runtime, "sample_rate", 48000))
+        sample_rate = int(
+            state.sample_rate or getattr(self.runtime, "sample_rate", 48000)
+        )
         payload.data = audio_waveform_payload(
             audio,
             sample_rate=sample_rate,
@@ -505,13 +511,17 @@ class DotsTTSVocoderScheduler(StreamingSimpleScheduler):
 
         payload = self._payloads.get(request_id)
         if payload is None:
-            raise RuntimeError(f"dots.tts vocoder is missing payload for {request_id!r}")
+            raise RuntimeError(
+                f"dots.tts vocoder is missing payload for {request_id!r}"
+            )
         state = (
             DotsTTSState.from_dict(payload.data.get("state") or {})
             if isinstance(payload.data, dict)
             else DotsTTSState()
         )
-        sample_rate = int(state.sample_rate or getattr(self.runtime, "sample_rate", 48000))
+        sample_rate = int(
+            state.sample_rate or getattr(self.runtime, "sample_rate", 48000)
+        )
         if self._stream_enabled.get(request_id, True):
             final_data: dict[str, Any] = {
                 "modality": "audio",
@@ -520,7 +530,9 @@ class DotsTTSVocoderScheduler(StreamingSimpleScheduler):
         else:
             audio_parts = self._audio_chunks.get(request_id, [])
             if not audio_parts:
-                raise RuntimeError(f"dots.tts vocoder produced no audio for {request_id!r}")
+                raise RuntimeError(
+                    f"dots.tts vocoder produced no audio for {request_id!r}"
+                )
             full_audio = torch.cat(
                 [_to_latent_tensor(part).reshape(-1).cpu() for part in audio_parts],
                 dim=0,
@@ -564,7 +576,9 @@ class DotsTTSVocoderScheduler(StreamingSimpleScheduler):
         audio_tensor = _to_latent_tensor(audio_chunk).reshape(-1)
         if audio_tensor.numel() == 0:
             return []
-        self._audio_chunks.setdefault(request_id, []).append(audio_tensor.detach().cpu())
+        self._audio_chunks.setdefault(request_id, []).append(
+            audio_tensor.detach().cpu()
+        )
         sample_rate = int(getattr(self.runtime, "sample_rate", 48000))
         return [
             OutgoingMessage(

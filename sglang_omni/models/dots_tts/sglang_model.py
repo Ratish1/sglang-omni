@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
-from torch import nn
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from torch import nn
 
 from sglang_omni.models.dots_tts.native_adapter import (
     DotsTTSAudioStepResult,
@@ -59,7 +59,9 @@ class DotsTTSSGLangModel(nn.Module):
     def __init__(self, config: Any, quant_config: Any = None, prefix: str = "") -> None:
         super().__init__()
         if Qwen2ForCausalLM is None:
-            raise RuntimeError("SGLang Qwen2ForCausalLM is required for native dots TTS")
+            raise RuntimeError(
+                "SGLang Qwen2ForCausalLM is required for native dots TTS"
+            )
         self.config = config
         self.qwen2 = Qwen2ForCausalLM(
             config,
@@ -218,12 +220,8 @@ class DotsTTSSGLangModel(nn.Module):
             dtype=torch.long,
             device=device,
         )
-        latent_patches: list[torch.Tensor | None] = [
-            None for _ in batch.requests
-        ]
-        feedback_embeddings: list[torch.Tensor | None] = [
-            None for _ in batch.requests
-        ]
+        latent_patches: list[torch.Tensor | None] = [None for _ in batch.requests]
+        feedback_embeddings: list[torch.Tensor | None] = [None for _ in batch.requests]
         eos_scores: list[torch.Tensor | None] = [None for _ in batch.requests]
         finished = [False for _ in batch.requests]
 

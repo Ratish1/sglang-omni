@@ -29,7 +29,9 @@ def required_checkpoint_files(model_path: str | Path) -> list[Path]:
 
 
 def validate_checkpoint_files(model_path: str | Path) -> None:
-    missing = [path for path in required_checkpoint_files(model_path) if not path.exists()]
+    missing = [
+        path for path in required_checkpoint_files(model_path) if not path.exists()
+    ]
     if missing:
         joined = ", ".join(str(path) for path in missing)
         raise FileNotFoundError(

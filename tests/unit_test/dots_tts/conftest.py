@@ -131,9 +131,7 @@ def _install_fake_sglang() -> None:
     modules["sglang.srt.managers"].schedule_batch = modules[
         "sglang.srt.managers.schedule_batch"
     ]
-    modules["sglang.srt.managers"].scheduler = modules[
-        "sglang.srt.managers.scheduler"
-    ]
+    modules["sglang.srt.managers"].scheduler = modules["sglang.srt.managers.scheduler"]
     modules["sglang.srt.model_executor"].model_runner = modules[
         "sglang.srt.model_executor.model_runner"
     ]

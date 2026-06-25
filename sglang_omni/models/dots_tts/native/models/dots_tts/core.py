@@ -12,14 +12,19 @@ from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from sglang_omni.models.dots_tts.native.models.dots_tts.config import ModelConfig
 from sglang_omni.models.dots_tts.native.modules.backbone.dit import DiT
-from sglang_omni.models.dots_tts.native.modules.backbone.semantic_encoder import VAESemanticEncoder
+from sglang_omni.models.dots_tts.native.modules.backbone.semantic_encoder import (
+    VAESemanticEncoder,
+)
 from sglang_omni.models.dots_tts.native.utils.tokenizer import (
     AUDIO_COMP_SPAN_TOKEN,
     AUDIO_GEN_SPAN_TOKEN,
     TEXT_COND_END_TOKEN,
     require_token_id,
 )
-from sglang_omni.models.dots_tts.native.utils.util import get_mask_from_lengths, mask_data
+from sglang_omni.models.dots_tts.native.utils.util import (
+    get_mask_from_lengths,
+    mask_data,
+)
 
 
 @dataclass(frozen=True)
@@ -94,8 +99,7 @@ class DotsTtsCore(nn.Module):
         )
         dit_mode = (
             "meanflow"
-            if self.mode == "meanflow"
-            and self.meanflow_config.use_duration_embedding
+            if self.mode == "meanflow" and self.meanflow_config.use_duration_embedding
             else "flow_matching"
         )
         self.velocity_field_predictor = DiT(
@@ -120,6 +124,7 @@ class DotsTtsCore(nn.Module):
             self.audio_gen_span_id,
             self.audio_comp_span_id,
         ]
+
     # endregion Module construction
 
     # region Training forward path
@@ -288,6 +293,7 @@ class DotsTtsCore(nn.Module):
             target=target,
             eos_out=eos,
         )
+
     # endregion Training forward path
 
     # region Autoregressive and flow-matching inference steps
@@ -403,12 +409,10 @@ class DotsTtsCore(nn.Module):
         device = input_sequence.device
         dtype = input_sequence.dtype
         solver_step = self.meanflow_solver_step if solver_step is None else solver_step
-        z = (
-            torch.randn(
-                (batch_size, patch_size, self.latent_dim),
-                device=device,
-                dtype=dtype,
-            )
+        z = torch.randn(
+            (batch_size, patch_size, self.latent_dim),
+            device=device,
+            dtype=dtype,
         )
         times = torch.linspace(0.0, 1.0, nfe + 1, device=device, dtype=dtype)
 
@@ -567,6 +571,7 @@ class DotsTtsCore(nn.Module):
             guidance_scale=guidance_scale,
             solver_step=solver_step,
         )
+
     # endregion Autoregressive and flow-matching inference steps
 
 
@@ -670,7 +675,9 @@ class CausalHelper:
                 torch.arange(C_len, device=device).unsqueeze(0),
             ] = torch.arange(C_len, device=device).unsqueeze(
                 0
-            ) < patch_in_c_indices.unsqueeze(1)
+            ) < patch_in_c_indices.unsqueeze(
+                1
+            )
             # Position ids in Z parts start from current patch latents index in C parts
             z_pos = (patch_in_c_indices + j_indices % patch_size).to(torch.float32)
             pos_ids.append(torch.cat([c_pos, z_pos]))
@@ -856,14 +863,16 @@ class IOHelper:
             fm_target.append(rearrange(ut_b, "(n p) d -> n p d", p=latent_patch_size))
 
         # Construct fm_attn_mask and fm_pos_ids
-        fm_attn_mask, fm_seq_mask, fm_pos_ids = (
-            CausalHelper().create_causal_chunk_mask_and_pos(
-                batch_size=B,
-                C_lens=fm_prefix_lengths,
-                Z_lens=fm_gen_lengths,
-                span_mask=history_latent_span_mask,
-                patch_size=fm_gen_patch_size,
-            )
+        (
+            fm_attn_mask,
+            fm_seq_mask,
+            fm_pos_ids,
+        ) = CausalHelper().create_causal_chunk_mask_and_pos(
+            batch_size=B,
+            C_lens=fm_prefix_lengths,
+            Z_lens=fm_gen_lengths,
+            span_mask=history_latent_span_mask,
+            patch_size=fm_gen_patch_size,
         )
         fm_prefix_lengths = fm_prefix_lengths.unsqueeze(1)
         fm_gen_lengths = fm_gen_lengths.unsqueeze(1)
@@ -989,14 +998,16 @@ class IOHelper:
             noise_end = noise_start + int(fm_gen_lengths[batch_idx].item())
             fm_seq[batch_idx, noise_start:noise_end, :] = noise_part
 
-        fm_attn_mask, fm_seq_mask, fm_pos_ids = (
-            CausalHelper().create_causal_chunk_mask_and_pos(
-                batch_size=batch_size,
-                C_lens=fm_prefix_lengths,
-                Z_lens=fm_gen_lengths,
-                span_mask=history_latent_span_mask,
-                patch_size=fm_gen_patch_size,
-            )
+        (
+            fm_attn_mask,
+            fm_seq_mask,
+            fm_pos_ids,
+        ) = CausalHelper().create_causal_chunk_mask_and_pos(
+            batch_size=batch_size,
+            C_lens=fm_prefix_lengths,
+            Z_lens=fm_gen_lengths,
+            span_mask=history_latent_span_mask,
+            patch_size=fm_gen_patch_size,
         )
         return {
             "fm_seq": fm_seq,
@@ -1066,7 +1077,8 @@ class IOHelper:
             for p in range(P):
                 latents_b = pred_v[
                     b,
-                    p_offset + fm_prefix_lengths[b][p] : p_offset
+                    p_offset
+                    + fm_prefix_lengths[b][p] : p_offset
                     + fm_prefix_lengths[b][p]
                     + fm_gen_lengths[b][p],
                 ]

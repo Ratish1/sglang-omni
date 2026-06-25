@@ -96,7 +96,9 @@ def test_model_steps_audio_latent_without_adapter(monkeypatch) -> None:
     assert torch.equal(result.eos_score, torch.tensor([0.0]))
 
 
-def test_forward_latent_decode_step_returns_control_ids_and_latents(monkeypatch) -> None:
+def test_forward_latent_decode_step_returns_control_ids_and_latents(
+    monkeypatch,
+) -> None:
     import sglang_omni.models.dots_tts.sglang_model as mod
 
     class HiddenQwen2(nn.Module):

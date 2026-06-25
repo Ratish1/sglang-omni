@@ -12,8 +12,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import remove_weight_norm, weight_norm
 
-from sglang_omni.models.dots_tts.native.modules.backbone.layers import Conv1d, ConvTranspose1d
-from sglang_omni.models.dots_tts.native.modules.vocoder.alias_free_act import Activation1d, Snake, SnakeBeta
+from sglang_omni.models.dots_tts.native.modules.backbone.layers import (
+    Conv1d,
+    ConvTranspose1d,
+)
+from sglang_omni.models.dots_tts.native.modules.vocoder.alias_free_act import (
+    Activation1d,
+    Snake,
+    SnakeBeta,
+)
 from sglang_omni.models.dots_tts.native.modules.vocoder.config import AudioVAEConfig
 
 
@@ -29,6 +36,7 @@ class DecoderStreamState:
     chunk_size: int
     total_frames: int = 0
     emitted_frames: int = 0
+
 
 def _empty_chunk(
     ref: torch.Tensor,
@@ -49,7 +57,9 @@ def _module_state_device_dtype(module: nn.Module) -> tuple[torch.device, torch.d
             return tensor.device, tensor.dtype
     for tensor in itertools.chain(module.parameters(), module.buffers()):
         return tensor.device, tensor.dtype
-    raise RuntimeError(f"Unable to infer state dtype/device for {type(module).__name__}.")
+    raise RuntimeError(
+        f"Unable to infer state dtype/device for {type(module).__name__}."
+    )
 
 
 def _stream_state_zeros(
@@ -670,7 +680,9 @@ class Decoder(nn.Module):
 
     @staticmethod
     def _conv1d_left_context(layer) -> int:
-        dilation = layer.dilation[0] if isinstance(layer.dilation, tuple) else layer.dilation
+        dilation = (
+            layer.dilation[0] if isinstance(layer.dilation, tuple) else layer.dilation
+        )
         kernel_size = (
             layer.kernel_size[0]
             if isinstance(layer.kernel_size, tuple)
@@ -702,7 +714,9 @@ class Decoder(nn.Module):
         upsample = activation.upsample
         downsample = activation.downsample.lowpass
         if not upsample.causal or not downsample.padding or downsample.pad_right != 0:
-            raise NotImplementedError("Streaming only supports causal alias-free activations.")
+            raise NotImplementedError(
+                "Streaming only supports causal alias-free activations."
+            )
         ratio = int(upsample.ratio)
         if ratio != int(downsample.stride):
             raise ValueError(
@@ -735,10 +749,9 @@ class Decoder(nn.Module):
         if isinstance(block, AMPBlock2):
             left_context = 0
             for conv, activation in zip(block.convs, block.activations, strict=True):
-                left_context += (
-                    cls._activation_left_context(activation)
-                    + cls._conv1d_left_context(conv)
-                )
+                left_context += cls._activation_left_context(
+                    activation
+                ) + cls._conv1d_left_context(conv)
             return left_context
         raise TypeError(f"Unsupported resblock type: {type(block).__name__}.")
 
@@ -765,7 +778,9 @@ class Decoder(nn.Module):
             )
             left_context += current_scale * stage_context
 
-        left_context += current_scale * self._activation_left_context(self.activation_post)
+        left_context += current_scale * self._activation_left_context(
+            self.activation_post
+        )
         left_context += current_scale * self._conv1d_left_context(self.conv_post)
         return int(left_context.__ceil__())
 
@@ -850,15 +865,15 @@ class AudioVAE(nn.Module):
 
     def inference_from_latents(self, x, do_sample=True, noise_scale=1.0):
         if do_sample:
-            assert x.size(1) == self.h.latent_dim * 2, (
-                f"Input must be like [B, D, H], got {x.shape}"
-            )
+            assert (
+                x.size(1) == self.h.latent_dim * 2
+            ), f"Input must be like [B, D, H], got {x.shape}"
             m_q, logs_q = torch.split(x, self.h.latent_dim, dim=1)
             x = m_q + torch.randn_like(m_q) * torch.exp(logs_q) * noise_scale
         else:
-            assert x.size(1) == self.h.latent_dim, (
-                f"Input must be like [B, D, H], got {x.shape}"
-            )
+            assert (
+                x.size(1) == self.h.latent_dim
+            ), f"Input must be like [B, D, H], got {x.shape}"
         x = self.post_proj(x)
         x = x.permute(0, 2, 1)
         x = self.dec_mi_layer(x)
@@ -911,9 +926,7 @@ class AudioVAE(nn.Module):
         x = self.post_proj(latents)
         x = x.permute(0, 2, 1)
         x = self.dec_mi_layer[0](x)
-        x, lstm_hidden = self.dec_mi_layer[1].stream_step(
-            x, lstm_hidden
-        )
+        x, lstm_hidden = self.dec_mi_layer[1].stream_step(x, lstm_hidden)
         x = self.dec_mi_layer[2](x)
         decoder_dtype = self.decoder.conv_pre.weight.dtype
         return x.permute(0, 2, 1).to(dtype=decoder_dtype), lstm_hidden
@@ -949,7 +962,10 @@ class AudioVAE(nn.Module):
         )
         clipped_valid = valid_frames.clamp(min=0, max=window.size(-1))
         combined = torch.cat(
-            [window, decoder_input.new_zeros(window.size(0), window.size(1), chunk_size)],
+            [
+                window,
+                decoder_input.new_zeros(window.size(0), window.size(1), chunk_size),
+            ],
             dim=-1,
         )
         insert_index = clipped_valid + torch.arange(

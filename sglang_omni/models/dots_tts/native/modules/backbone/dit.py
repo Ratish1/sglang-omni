@@ -3,7 +3,10 @@ import math
 import torch
 import torch.nn as nn
 
-from sglang_omni.models.dots_tts.native.modules.backbone.layers import Mlp, MultiHeadAttention
+from sglang_omni.models.dots_tts.native.modules.backbone.layers import (
+    Mlp,
+    MultiHeadAttention,
+)
 
 
 def modulate(x, shift, scale, **_kwargs):
@@ -85,9 +88,9 @@ class DiTBlock(nn.Module):
 
     def forward(self, x, condition=None, mask=None, **kwargs):
         if condition is None:
-            assert not self.modulation, (
-                "Without global condition, must set modulation to False"
-            )
+            assert (
+                not self.modulation
+            ), "Without global condition, must set modulation to False"
         else:
             assert self.modulation, "With global condition, must set modulation to True"
             shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = (

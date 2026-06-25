@@ -66,8 +66,11 @@ class SpeakerXVectorFeatures(nn.Module):
             min_length=0,
         )
         if self.max_audio_seconds <= 0:
-            return audio, original_lengths, original_lengths, torch.zeros_like(
-                original_lengths
+            return (
+                audio,
+                original_lengths,
+                original_lengths,
+                torch.zeros_like(original_lengths),
             )
 
         max_input_length = round(self.sample_rate * self.max_audio_seconds)
@@ -87,15 +90,20 @@ class SpeakerXVectorFeatures(nn.Module):
             cropped_lengths.append(cropped_length)
             starts.append(start)
 
-        return pad_sequence(
-            cropped_audio,
-            batch_first=True,
-            padding_value=0.0,
-        ), original_lengths, torch.tensor(
-            cropped_lengths,
-            device=audio.device,
-            dtype=torch.long,
-        ), torch.tensor(starts, device=audio.device, dtype=torch.long)
+        return (
+            pad_sequence(
+                cropped_audio,
+                batch_first=True,
+                padding_value=0.0,
+            ),
+            original_lengths,
+            torch.tensor(
+                cropped_lengths,
+                device=audio.device,
+                dtype=torch.long,
+            ),
+            torch.tensor(starts, device=audio.device, dtype=torch.long),
+        )
 
     def _crop_fbank(
         self,
@@ -149,8 +157,7 @@ class SpeakerXVectorFeatures(nn.Module):
         if self.resample is not None:
             audio = self.resample(audio)
             audio_lengths = torch.ceil(
-                audio_lengths.float()
-                * (_SPEAKER_FBANK_SAMPLE_RATE / self.sample_rate)
+                audio_lengths.float() * (_SPEAKER_FBANK_SAMPLE_RATE / self.sample_rate)
             ).long()
 
         audio_cpu = audio.detach().cpu()

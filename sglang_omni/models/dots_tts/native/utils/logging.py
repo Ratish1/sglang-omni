@@ -18,7 +18,9 @@ def configure_logging(
     level: str | None = None,
     log_file: str | os.PathLike[str] | None = None,
 ) -> None:
-    resolved_level = (level or os.environ.get("DOTS_TTS_LOG_LEVEL") or DEFAULT_LOG_LEVEL).upper()
+    resolved_level = (
+        level or os.environ.get("DOTS_TTS_LOG_LEVEL") or DEFAULT_LOG_LEVEL
+    ).upper()
     logger.remove()
     logger.add(
         sys.stderr,

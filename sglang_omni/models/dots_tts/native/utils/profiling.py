@@ -21,9 +21,7 @@ INFERENCE_STAGE_NAMES = (
     "vocoder",
 )
 
-_INFERENCE_STAGE_NAME_MAP = {
-    name.lower(): name for name in INFERENCE_STAGE_NAMES
-}
+_INFERENCE_STAGE_NAME_MAP = {name.lower(): name for name in INFERENCE_STAGE_NAMES}
 _CURRENT_INFERENCE_PROFILER: ContextVar[InferenceProfiler | None] = ContextVar(
     "current_inference_profiler",
     default=None,
@@ -92,9 +90,7 @@ def ensure_data_profiler(profiler: DataProfiler | None) -> DataProfiler:
 class InferenceProfiler:
     def __init__(self, device: torch.device):
         self._device = device
-        self._stats = {
-            stage: InferenceStageStat() for stage in INFERENCE_STAGE_NAMES
-        }
+        self._stats = {stage: InferenceStageStat() for stage in INFERENCE_STAGE_NAMES}
 
     def _sync(self) -> None:
         if self._device.type == "cuda":
@@ -177,9 +173,7 @@ def log_inference_profile(
     duration_seconds: float,
 ) -> None:
     active_stages = [
-        stage
-        for stage in INFERENCE_STAGE_NAMES
-        if int(profiling[stage]["count"]) > 0
+        stage for stage in INFERENCE_STAGE_NAMES if int(profiling[stage]["count"]) > 0
     ]
     if not active_stages:
         logger.info(

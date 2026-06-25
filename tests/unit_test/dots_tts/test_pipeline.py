@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
+from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage
 
@@ -67,7 +67,10 @@ def test_dots_tts_preprocessing_maps_speech_request_fields() -> None:
     from sglang_omni.models.dots_tts.stages import preprocess_dots_tts_payload
 
     payload = make_payload(
-        inputs={"text": "hello", "references": [{"audio_path": "ref.wav", "text": "hi"}]},
+        inputs={
+            "text": "hello",
+            "references": [{"audio_path": "ref.wav", "text": "hi"}],
+        },
         params={"stream": True, "max_new_tokens": 128},
         tts_params={
             "language": "en",
@@ -372,7 +375,9 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
         "_ensure_sglang_llm_checkpoint_view",
         lambda model_path: f"{model_path}-llm-view",
     )
-    monkeypatch.setattr(stages, "build_sglang_server_args", fake_build_sglang_server_args)
+    monkeypatch.setattr(
+        stages, "build_sglang_server_args", fake_build_sglang_server_args
+    )
     monkeypatch.setattr(
         stages,
         "create_sglang_infrastructure",
@@ -431,7 +436,9 @@ def test_create_sglang_latent_engine_accepts_concurrent_requests(monkeypatch) ->
         "_ensure_sglang_llm_checkpoint_view",
         lambda model_path: f"{model_path}-llm-view",
     )
-    monkeypatch.setattr(stages, "build_sglang_server_args", fake_build_sglang_server_args)
+    monkeypatch.setattr(
+        stages, "build_sglang_server_args", fake_build_sglang_server_args
+    )
     monkeypatch.setattr(
         stages,
         "create_sglang_infrastructure",
@@ -512,7 +519,9 @@ def test_create_sglang_latent_engine_loads_side_runtime_on_worker_device(
     monkeypatch.setattr(
         stages,
         "build_sglang_server_args",
-        lambda *args, **kwargs: SimpleNamespace(disable_overlap_schedule=False, tp_size=1),
+        lambda *args, **kwargs: SimpleNamespace(
+            disable_overlap_schedule=False, tp_size=1
+        ),
     )
     monkeypatch.setattr(
         stages,
@@ -530,7 +539,9 @@ def test_create_sglang_latent_engine_loads_side_runtime_on_worker_device(
 
     def fake_get_side_runtime(*args, **kwargs):
         captured["side_runtime_kwargs"] = kwargs
-        fake_runtime_model = SimpleNamespace(llm_config=SimpleNamespace(vocab_size=32000))
+        fake_runtime_model = SimpleNamespace(
+            llm_config=SimpleNamespace(vocab_size=32000)
+        )
         return SimpleNamespace(
             model=fake_runtime_model,
             module_bundle=SimpleNamespace(model=fake_runtime_model),
@@ -614,8 +625,8 @@ def test_dots_tts_model_runner_runs_model_audio_step() -> None:
 def test_dots_tts_sglang_model_has_no_runtime_latent_stepper(monkeypatch) -> None:
     import torch
 
-    from sglang_omni.models.dots_tts.sglang_model import DotsTTSSGLangModel
     import sglang_omni.models.dots_tts.sglang_model as sglang_model_mod
+    from sglang_omni.models.dots_tts.sglang_model import DotsTTSSGLangModel
 
     class FakeQwen2(torch.nn.Module):
         def __init__(self, *args, **kwargs):

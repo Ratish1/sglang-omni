@@ -16,7 +16,9 @@ from sglang_omni.models.dots_tts.native.modules.speaker.campplus_layers import (
     TransitLayer,
     get_nonlinear,
 )
-from sglang_omni.models.dots_tts.native.modules.speaker.fbank import _SPEAKER_FBANK_N_MELS
+from sglang_omni.models.dots_tts.native.modules.speaker.fbank import (
+    _SPEAKER_FBANK_N_MELS,
+)
 
 
 class FCM(nn.Module):

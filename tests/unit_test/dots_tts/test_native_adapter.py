@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 
 from sglang_omni.models.dots_tts.native_adapter import DotsTTSNativeAdapter
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
@@ -143,7 +143,9 @@ def test_adapter_casts_prompt_latents_to_generate_state_dtype() -> None:
 
         def _allocate_generate_state(self, *, max_audio_patch_count, device, dtype):
             del max_audio_patch_count
-            return SimpleNamespace(fm_sequence=torch.zeros(1, device=device, dtype=dtype))
+            return SimpleNamespace(
+                fm_sequence=torch.zeros(1, device=device, dtype=dtype)
+            )
 
         def _prefill_prompt_latents(self, prompt_latents, *, state):
             del state

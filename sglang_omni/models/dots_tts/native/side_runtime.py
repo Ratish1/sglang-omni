@@ -13,21 +13,20 @@ from typing import Any, TypedDict
 
 import librosa
 import torch
-from einops import rearrange
 from huggingface_hub import snapshot_download
 from loguru import logger
 from safetensors.torch import load_file
 from torch import nn
 from transformers import AutoTokenizer, Qwen2Config
 
-from sglang_omni.models.dots_tts.native.data.pipelines.tokenizing import (
-    build_generation_schedule,
-)
 from sglang_omni.models.dots_tts.native.data.pipelines.templates import (
     DEFAULT_INSTRUCTION_TTS_TEMPLATE,
     DEFAULT_INTERLEAVE_TTS_TEMPLATE,
     DEFAULT_TEXT_TO_AUDIO_TEMPLATE,
     DEFAULT_TTS_TEMPLATE,
+)
+from sglang_omni.models.dots_tts.native.data.pipelines.tokenizing import (
+    build_generation_schedule,
 )
 from sglang_omni.models.dots_tts.native.models.dots_tts.config import ModelConfig
 from sglang_omni.models.dots_tts.native.models.dots_tts.core import (
@@ -38,7 +37,6 @@ from sglang_omni.models.dots_tts.native.models.dots_tts.core import (
 )
 from sglang_omni.models.dots_tts.native.models.dots_tts.model import (
     DotsTtsModel,
-    _GenerateLengthBucket,
     _PromptFeatureCacheEntry,
 )
 from sglang_omni.models.dots_tts.native.modules.backbone.dit import DiT
@@ -50,7 +48,6 @@ from sglang_omni.models.dots_tts.native.modules.speaker.encoder import (
 )
 from sglang_omni.models.dots_tts.native.modules.vocoder.bigvgan import AudioVAE
 from sglang_omni.models.dots_tts.native.utils.audio import high_quality_resample
-from sglang_omni.models.dots_tts.native.utils.profiling import measure_inference
 from sglang_omni.models.dots_tts.native.utils.text import (
     attach_language_tag,
     detect,
@@ -147,8 +144,7 @@ class DotsTtsSideCore(nn.Module):
         )
         dit_mode = (
             "meanflow"
-            if self.mode == "meanflow"
-            and self.meanflow_config.use_duration_embedding
+            if self.mode == "meanflow" and self.meanflow_config.use_duration_embedding
             else "flow_matching"
         )
         self.velocity_field_predictor = DiT(
@@ -209,7 +205,9 @@ class DotsTtsSideModel(nn.Module):
     _patch_encoder_compile_signature = staticmethod(
         DotsTtsModel._patch_encoder_compile_signature
     )
-    _resolve_patch_encoder_audio_bucket = DotsTtsModel._resolve_patch_encoder_audio_bucket
+    _resolve_patch_encoder_audio_bucket = (
+        DotsTtsModel._resolve_patch_encoder_audio_bucket
+    )
     _copy_patch_encoder_state = DotsTtsModel._copy_patch_encoder_state
     _ensure_patch_encoder_state_capacity = (
         DotsTtsModel._ensure_patch_encoder_state_capacity
@@ -268,12 +266,10 @@ class DotsTtsSideModel(nn.Module):
         for param in self.xvector_extractor.parameters():
             param.requires_grad = False
         self._optimize_enabled = True
-        self._compiled_models: dict[
-            tuple[str, tuple[Any, ...] | None], Any
-        ] = {}
-        self._prompt_feature_cache: OrderedDict[
-            str, _PromptFeatureCacheEntry
-        ] = OrderedDict()
+        self._compiled_models: dict[tuple[str, tuple[Any, ...] | None], Any] = {}
+        self._prompt_feature_cache: OrderedDict[str, _PromptFeatureCacheEntry] = (
+            OrderedDict()
+        )
         self._fm_decode_workspaces: dict[tuple[Any, ...], dict[str, torch.Tensor]] = {}
         self._token_embedding: nn.Module | None = None
 
@@ -339,7 +335,9 @@ class DotsTtsSideModel(nn.Module):
             latent_stats_path=self.latent_stats_path
         )
         self._load_core_side_artifact(pretrained_path / self.MODEL_FILENAME)
-        self._load_artifact_module(self.vocoder, pretrained_path / self.VOCODER_FILENAME)
+        self._load_artifact_module(
+            self.vocoder, pretrained_path / self.VOCODER_FILENAME
+        )
         self._load_artifact_module(
             self.xvector_extractor,
             pretrained_path / self.SPEAKER_ENCODER_FILENAME,

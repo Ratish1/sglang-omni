@@ -68,8 +68,7 @@ class DotsTTSModelRunner(ModelRunner):
     ) -> GenerationBatchResult | None:
         del schedule_batch
         if not any(
-            sched_req.data.prefill_input_embeds is not None
-            for sched_req in requests
+            sched_req.data.prefill_input_embeds is not None for sched_req in requests
         ):
             return None
         input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
@@ -204,9 +203,7 @@ class DotsTTSModelRunner(ModelRunner):
                     "dots TTS hidden capture requires extend_input_len > 0"
                 )
             offset += req_len
-            data.latest_hidden_state = hidden_states[
-                offset - 1 : offset
-            ].unsqueeze(0)
+            data.latest_hidden_state = hidden_states[offset - 1 : offset].unsqueeze(0)
 
     def _run_model_latent_batch(self, result: Any, requests: list) -> None:
         active_indices = [

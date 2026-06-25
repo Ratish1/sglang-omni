@@ -45,9 +45,9 @@ def test_dots_pr_files_do_not_include_local_runtime_paths() -> None:
 
 def test_dots_runner_does_not_invoke_model_private_latent_step() -> None:
     root = Path(__file__).resolve().parents[3]
-    source = (
-        root / "sglang_omni/models/dots_tts/model_runner.py"
-    ).read_text(encoding="utf-8")
+    source = (root / "sglang_omni/models/dots_tts/model_runner.py").read_text(
+        encoding="utf-8"
+    )
     forbidden = [
         "step_audio_latent",
         "_decode_next_audio",

@@ -12,7 +12,9 @@ TEXT_COND_END_TOKEN = "<|text_cond_end|>"
 def require_token_id(tokenizer, token: str) -> int:
     token_id = tokenizer.convert_tokens_to_ids(token)
     if token_id is None or token_id < 0:
-        raise ValueError(f"Artifact tokenizer is missing required special token: {token}")
+        raise ValueError(
+            f"Artifact tokenizer is missing required special token: {token}"
+        )
     return int(token_id)
 
 

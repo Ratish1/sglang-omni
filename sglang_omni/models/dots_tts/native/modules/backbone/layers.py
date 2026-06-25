@@ -89,9 +89,9 @@ class ConvTranspose1d(nn.ConvTranspose1d):
             padding = 0 if causal else (kernel_size - stride) // 2
         if causal:
             assert padding == 0, "padding is not allowed in causal ConvTranspose1d."
-            assert kernel_size == 2 * stride, (
-                "kernel_size must be equal to 2*stride in Causal ConvTranspose1d."
-            )
+            assert (
+                kernel_size == 2 * stride
+            ), "kernel_size must be equal to 2*stride in Causal ConvTranspose1d."
 
         super().__init__(
             in_channels,
@@ -200,9 +200,9 @@ class MultiHeadAttention(nn.Module):
         **_kwargs,
     ):
         super().__init__()
-        assert hidden_size % num_heads == 0, (
-            "hidden_size should be divisible by num_heads"
-        )
+        assert (
+            hidden_size % num_heads == 0
+        ), "hidden_size should be divisible by num_heads"
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.scale = self.head_dim**-0.5
@@ -275,7 +275,9 @@ class MultiHeadAttention(nn.Module):
 
     def decode_step(self, x, *, cache, positions: torch.Tensor):
         if x.size(1) <= 0:
-            raise ValueError("MultiHeadAttention.decode_step expects a non-empty input.")
+            raise ValueError(
+                "MultiHeadAttention.decode_step expects a non-empty input."
+            )
         if positions.ndim != 1 or positions.size(0) != x.size(1):
             raise ValueError(
                 "MultiHeadAttention.decode_step positions must match the decode block length."

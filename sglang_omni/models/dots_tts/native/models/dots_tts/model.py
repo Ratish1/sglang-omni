@@ -20,10 +20,15 @@ from transformers import AutoTokenizer, Qwen2Config
 
 from sglang_omni.models.dots_tts.native.models.dots_tts.config import ModelConfig
 from sglang_omni.models.dots_tts.native.models.dots_tts.core import DotsTtsCore
-from sglang_omni.models.dots_tts.native.modules.speaker.encoder import SpeakerXVectorFeatures
+from sglang_omni.models.dots_tts.native.modules.speaker.encoder import (
+    SpeakerXVectorFeatures,
+)
 from sglang_omni.models.dots_tts.native.modules.vocoder.bigvgan import AudioVAE
 from sglang_omni.models.dots_tts.native.utils.profiling import measure_inference
-from sglang_omni.models.dots_tts.native.utils.tokenizer import AUDIO_GEN_START_TOKEN, require_token_id
+from sglang_omni.models.dots_tts.native.utils.tokenizer import (
+    AUDIO_GEN_START_TOKEN,
+    require_token_id,
+)
 from sglang_omni.models.dots_tts.native.utils.util import get_dtype
 
 
@@ -177,9 +182,9 @@ class DotsTtsModel(nn.Module):
         self._compiled_models: dict[
             tuple[str, tuple[Any, ...] | None], Callable[..., Any]
         ] = {}
-        self._prompt_feature_cache: OrderedDict[
-            str, _PromptFeatureCacheEntry
-        ] = OrderedDict()
+        self._prompt_feature_cache: OrderedDict[str, _PromptFeatureCacheEntry] = (
+            OrderedDict()
+        )
         self._fm_decode_workspaces: dict[tuple[Any, ...], dict[str, torch.Tensor]] = {}
 
     def set_optimize(self, optimize: bool) -> None:
@@ -351,9 +356,7 @@ class DotsTtsModel(nn.Module):
         compiled = self._compiled_models.get(cache_key)
         if compiled is None:
             mode = (
-                "default"
-                if key == "patch_encoder.decode_patch"
-                else "reduce-overhead"
+                "default" if key == "patch_encoder.decode_patch" else "reduce-overhead"
             )
             compiled = torch.compile(
                 model,
@@ -717,25 +720,18 @@ class DotsTtsModel(nn.Module):
         cache_key: str,
         entry: _PromptFeatureCacheEntry,
     ) -> None:
-        if (
-            entry.speaker_embedding is None
-            and entry.prompt_latent_distribution is None
-        ):
+        if entry.speaker_embedding is None and entry.prompt_latent_distribution is None:
             return
         self._prompt_feature_cache[cache_key] = entry
         self._prompt_feature_cache.move_to_end(cache_key)
-        while (
-            len(self._prompt_feature_cache) > self._PROMPT_FEATURE_CACHE_MAX_ENTRIES
-        ):
+        while len(self._prompt_feature_cache) > self._PROMPT_FEATURE_CACHE_MAX_ENTRIES:
             self._prompt_feature_cache.popitem(last=False)
 
     def _can_cache_speaker_embedding(self, prompt_sample_count: int) -> bool:
         max_audio_seconds = self.xvector_extractor.max_audio_seconds
         if max_audio_seconds <= 0:
             return True
-        max_input_length = round(
-            self.xvector_extractor.sample_rate * max_audio_seconds
-        )
+        max_input_length = round(self.xvector_extractor.sample_rate * max_audio_seconds)
         return int(prompt_sample_count) <= max_input_length
 
     @torch.no_grad()
@@ -763,9 +759,7 @@ class DotsTtsModel(nn.Module):
         prompt_audio = prompt_audio.to(device=device)
 
         can_cache_speaker = self._can_cache_speaker_embedding(prompt_sample_count)
-        speaker_embedding = (
-            cache_entry.speaker_embedding if can_cache_speaker else None
-        )
+        speaker_embedding = cache_entry.speaker_embedding if can_cache_speaker else None
         if speaker_embedding is None:
             speaker_encoder = self._get_compiled_model(
                 "speaker_encoder",
@@ -979,9 +973,10 @@ class DotsTtsModel(nn.Module):
             return requested
         history_stride = self.core.hidden_patch_size + self.core.latent_patch_size
         requested_patch_count = math.ceil(requested / history_stride)
-        return self._resolve_generate_length_bucket(
-            requested_patch_count
-        ).size * history_stride
+        return (
+            self._resolve_generate_length_bucket(requested_patch_count).size
+            * history_stride
+        )
 
     def _build_fm_attn_mask(
         self,
@@ -996,11 +991,15 @@ class DotsTtsModel(nn.Module):
         attn_mask.zero_()
         block_start = state.fm_seq_len - hidden_patch_size
         if block_start > 0:
-            causal_mask = torch.ones(
-                (block_start, block_start),
-                device=attn_mask.device,
-                dtype=torch.bool,
-            ).triu(1).logical_not()
+            causal_mask = (
+                torch.ones(
+                    (block_start, block_start),
+                    device=attn_mask.device,
+                    dtype=torch.bool,
+                )
+                .triu(1)
+                .logical_not()
+            )
             attn_mask[:, :block_start, :block_start] = causal_mask
 
         attn_mask[:, block_start : state.fm_seq_len, : state.fm_seq_len] = True
@@ -1144,9 +1143,10 @@ class DotsTtsModel(nn.Module):
         prompt_patch_count: int,
     ) -> tuple[int, torch.Tensor]:
         if span_positions.numel() > prompt_patch_count:
-            return int(span_positions[prompt_patch_count].item()), span_positions[
-                :prompt_patch_count
-            ]
+            return (
+                int(span_positions[prompt_patch_count].item()),
+                span_positions[:prompt_patch_count],
+            )
         raise RuntimeError(
             "Prefill boundary discovery failed despite prior schedule validation."
         )
@@ -1178,7 +1178,9 @@ class DotsTtsModel(nn.Module):
         next_position = position + 1
         if next_position >= generation_schedule.size(1):
             return False
-        return int(generation_schedule[0, next_position].item()) in audio_placeholder_ids
+        return (
+            int(generation_schedule[0, next_position].item()) in audio_placeholder_ids
+        )
 
     def _build_prefill_inputs_embeds(
         self,
@@ -1276,9 +1278,13 @@ class DotsTtsModel(nn.Module):
             raise RuntimeError("FM static buffers are not initialized.")
         if state.fm_null_g_cond is None:
             raise RuntimeError("FM null conditioning buffer is not initialized.")
-        fm_sequence, fm_cfg_sequence, fm_attn_mask, fm_pos_ids, history_bucket_capacity = (
-            self._prepare_fm_decode_inputs(state)
-        )
+        (
+            fm_sequence,
+            fm_cfg_sequence,
+            fm_attn_mask,
+            fm_pos_ids,
+            history_bucket_capacity,
+        ) = self._prepare_fm_decode_inputs(state)
         compile_signature = (
             (history_bucket_capacity, state.fm_sequence.dtype)
             if self._optimize_enabled
@@ -1379,7 +1385,7 @@ class DotsTtsModel(nn.Module):
                 state.patch_encoder_state.conv_tail,
                 state.patch_encoder_state.layer_caches,
                 patch_positions,
-        )
+            )
         state.patch_encoder_state.conv_tail.copy_(conv_tail)
         state.patch_encoder_state.seq_len += self.core.patch_encoder.out_ds_rate
         return llm_embedding
@@ -1725,4 +1731,5 @@ class DotsTtsModel(nn.Module):
             audio.shape[-1],
         )
         return audio
+
     # endregion Public generation APIs

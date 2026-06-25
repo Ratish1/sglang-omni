@@ -84,7 +84,9 @@ class DotsTTSState:
             seed=(int(data["seed"]) if data.get("seed") is not None else None),
             stream=bool(data.get("stream", False)),
             sample_rate=(
-                int(data["sample_rate"]) if data.get("sample_rate") is not None else None
+                int(data["sample_rate"])
+                if data.get("sample_rate") is not None
+                else None
             ),
             engine_time_s=float(data.get("engine_time_s", 0.0) or 0.0),
             rtf=(float(data["rtf"]) if data.get("rtf") is not None else None),

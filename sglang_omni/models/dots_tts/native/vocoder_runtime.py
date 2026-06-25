@@ -74,7 +74,9 @@ class DotsTTSNativeVocoderRuntime:
         **_: Any,
     ) -> "DotsTTSNativeVocoderRuntime":
         model_path = Path(model_name_or_path).expanduser().resolve()
-        missing = [name for name in cls.REQUIRED_FILES if not (model_path / name).is_file()]
+        missing = [
+            name for name in cls.REQUIRED_FILES if not (model_path / name).is_file()
+        ]
         if missing:
             raise FileNotFoundError(
                 f"Dots TTS vocoder path {model_path} is missing required files: {missing}"
@@ -91,7 +93,9 @@ class DotsTTSNativeVocoderRuntime:
         if mismatch.missing_keys or mismatch.unexpected_keys:
             raise RuntimeError(f"Failed to load dots vocoder weights: {mismatch}")
 
-        target_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        target_device = torch.device(
+            device or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
         del precision
         # AudioVAE decode casts latent inputs to float32 internally; keep the
         # vocoder in fp32 to match upstream runtime behavior.

@@ -51,9 +51,9 @@ class TDNNLayer(nn.Module):
     ):
         super().__init__()
         if padding < 0:
-            assert kernel_size % 2 == 1, (
-                f"Expect equal paddings, but got even kernel size ({kernel_size})"
-            )
+            assert (
+                kernel_size % 2 == 1
+            ), f"Expect equal paddings, but got even kernel size ({kernel_size})"
             padding = (kernel_size - 1) // 2 * dilation
         self.linear = nn.Conv1d(
             in_channels,
@@ -131,9 +131,9 @@ class CAMDenseTDNNLayer(nn.Module):
         memory_efficient=False,
     ):
         super().__init__()
-        assert kernel_size % 2 == 1, (
-            f"Expect equal paddings, but got even kernel size ({kernel_size})"
-        )
+        assert (
+            kernel_size % 2 == 1
+        ), f"Expect equal paddings, but got even kernel size ({kernel_size})"
         padding = (kernel_size - 1) // 2 * dilation
         self.memory_efficient = memory_efficient
         self.nonlinear1 = get_nonlinear(config_str, in_channels)

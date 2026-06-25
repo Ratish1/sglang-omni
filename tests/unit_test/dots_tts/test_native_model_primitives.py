@@ -108,8 +108,13 @@ def test_encode_audio_patch_feedback_does_not_call_llm() -> None:
     model._ensure_patch_encoder_state_capacity = lambda *args, **kwargs: calls.append(
         ("ensure_capacity", kwargs["required_seq_len"])
     )
-    model._get_compiled_model = lambda *args, **kwargs: model.core.patch_encoder.decode_patch
-    model._patch_encoder_compile_signature = lambda patch_encoder_state: (8, torch.float32)
+    model._get_compiled_model = (
+        lambda *args, **kwargs: model.core.patch_encoder.decode_patch
+    )
+    model._patch_encoder_compile_signature = lambda patch_encoder_state: (
+        8,
+        torch.float32,
+    )
 
     feedback = model._encode_audio_patch_feedback(
         state,
@@ -128,7 +133,9 @@ def test_encode_audio_patch_feedback_does_not_call_llm() -> None:
     assert torch.equal(calls[-1][4], torch.tensor([3, 4]))
 
 
-def test_prepare_prompt_conditioning_casts_speaker_embedding_to_projection_dtype() -> None:
+def test_prepare_prompt_conditioning_casts_speaker_embedding_to_projection_dtype() -> (
+    None
+):
     class FakeCore(nn.Module):
         def __init__(self) -> None:
             super().__init__()

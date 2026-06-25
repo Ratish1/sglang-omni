@@ -130,7 +130,9 @@ class DotsTTSNativeAdapter:
             speaker_scale=state.speaker_scale,
         )
         prompt_patches = prompt_conditioning.prompt_patches
-        prompt_patch_count = 0 if prompt_patches is None else int(prompt_patches.size(1))
+        prompt_patch_count = (
+            0 if prompt_patches is None else int(prompt_patches.size(1))
+        )
         audio_placeholder_ids = set(self.model.core.audio_span_token_ids)
         span_positions = self.model._find_audio_span_positions(
             generation_schedule,
