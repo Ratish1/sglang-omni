@@ -1,11 +1,9 @@
-"""Vendored dots TTS full inference assembly.
+"""Vendored dots TTS model assembly.
 
-sglang-omni serving does not call this file's upstream full-runtime entrypoints
-(`generate_audio`, `generate_audio_stream`, `_generate_latents_stream`), upstream
-top-level prefill/decode loops, artifact save/load helpers, or upstream warmup
-orchestration. Those surfaces are carried for provenance and parity with the public
-dots TTS implementation while `DotsTtsSideModel` exposes the serving boundary used by
-the native Omni pipeline.
+sglang-omni serving uses `DotsTtsSideModel` as the boundary around this upstream model
+math. The upstream full-runtime entrypoints and top-level prefill/decode loops are
+intentionally removed so the native Omni path owns request scheduling, latent feedback,
+and vocoder staging.
 """
 
 from __future__ import annotations
@@ -18,7 +16,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -71,48 +69,6 @@ class _PromptFeatureCacheEntry:
 @dataclass(frozen=True)
 class _GenerateLengthBucket:
     size: int
-
-    def run_warmup(
-        self,
-        model: "DotsTtsModel",
-        *,
-        precision: str,
-        ode_method: str,
-        num_steps: int,
-        guidance_scale: float,
-    ) -> None:
-        model._warmup_fm_bucket(
-            max_audio_patch_count=self.size,
-            precision=precision,
-            ode_method=ode_method,
-            num_steps=num_steps,
-            guidance_scale=guidance_scale,
-        )
-        model._warmup_patch_encoder_bucket(
-            max_audio_patch_count=self.size,
-            precision=precision,
-        )
-        device = next(model.core.parameters()).device
-        generation_schedule = torch.full(
-            (1, self.size + 1),
-            fill_value=model.core.audio_gen_span_id,
-            dtype=torch.long,
-            device=device,
-        )
-        generation_schedule[0, 0] = model.audio_gen_start_id
-        warmup_inputs = {"generation_schedule": generation_schedule}
-
-        for _ in model.generate_audio_stream(
-            warmup_inputs,
-            precision=precision,
-            ode_method=ode_method,
-            num_steps=num_steps,
-            guidance_scale=guidance_scale,
-        ):
-            return
-        raise RuntimeError(
-            f"Warmup produced no audio chunk for generate bucket {self.size}."
-        )
 
 
 class DotsTtsModel(nn.Module):
@@ -232,42 +188,6 @@ class DotsTtsModel(nn.Module):
             "max_generate_length exceeds the largest supported compile bucket: "
             f"max_generate_length={requested} "
             f"max_supported={cls._GENERATE_LENGTH_BUCKETS[-1].size}."
-        )
-
-    @torch.no_grad()
-    def run_warmup(
-        self,
-        *,
-        max_generate_length: int,
-        precision: str = "bfloat16",
-        ode_method: str = "euler",
-        num_steps: int = 10,
-        guidance_scale: float = 1.2,
-    ) -> None:
-        ceiling_bucket = self._resolve_generate_length_bucket(max_generate_length)
-        warmup_buckets = tuple(
-            bucket
-            for bucket in self._GENERATE_LENGTH_BUCKETS
-            if bucket.size <= ceiling_bucket.size
-        )
-        bucket_sizes = [bucket.size for bucket in warmup_buckets]
-        logger.info(
-            "Inference warmup started: requested_max_generate_length={} bucket_sizes={}",
-            int(max_generate_length),
-            bucket_sizes,
-        )
-        for bucket in warmup_buckets:
-            bucket.run_warmup(
-                self,
-                precision=precision,
-                ode_method=ode_method,
-                num_steps=num_steps,
-                guidance_scale=guidance_scale,
-            )
-        logger.info(
-            "Inference warmup completed: requested_max_generate_length={} bucket_sizes={}",
-            int(max_generate_length),
-            bucket_sizes,
         )
 
     def _resolve_state_audio_patch_count(self, max_audio_patch_count: int) -> int:
@@ -1129,23 +1049,6 @@ class DotsTtsModel(nn.Module):
         cfg_buffer[:, state.fm_seq_len : end].copy_(history_latent.to(cfg_buffer.dtype))
         state.fm_seq_len = end
 
-    def _consume_text_schedule(
-        self,
-        generation_schedule: torch.Tensor,
-        *,
-        position: int,
-        next_audio_position: int,
-        state: _GenerateState,
-    ) -> int:
-        with measure_inference("LLM"):
-            text_chunk = generation_schedule[:, position:next_audio_position]
-            _, state.llm_hiddens, _, state.llm_cache = self.core.step_llm(
-                input_ids=text_chunk,
-                past_key_values=state.llm_cache,
-            )
-        self._append_hidden_chunk(state, state.llm_hiddens)
-        return next_audio_position
-
     def _locate_prefill_boundary(
         self,
         *,
@@ -1216,59 +1119,6 @@ class DotsTtsModel(nn.Module):
                 )
             inputs_embeds[:, prompt_span_positions, :] = patch_embeddings
         return inputs_embeds
-
-    def _prefill(
-        self,
-        generation_schedule: torch.Tensor,
-        *,
-        state: _GenerateState,
-        span_positions: torch.Tensor,
-        prompt_patches: torch.Tensor | None,
-        prompt_patch_embeddings: torch.Tensor | None,
-        audio_placeholder_ids: set[int],
-    ) -> int:
-        prompt_patch_count = (
-            0 if prompt_patches is None else int(prompt_patches.size(1))
-        )
-        prefill_end, prompt_span_positions = self._locate_prefill_boundary(
-            span_positions=span_positions,
-            prompt_patch_count=prompt_patch_count,
-        )
-        if prefill_end == 0:
-            return 0
-        inputs_embeds = self._build_prefill_inputs_embeds(
-            generation_schedule[:, :prefill_end],
-            prompt_patch_embeddings=prompt_patch_embeddings,
-            prompt_span_positions=prompt_span_positions,
-        )
-        with measure_inference("LLM"):
-            _, llm_hiddens, _, state.llm_cache = self.core.step_llm(
-                inputs_embeds=inputs_embeds,
-                past_key_values=state.llm_cache,
-            )
-        state.llm_hiddens = llm_hiddens[:, -1:, :]
-
-        cursor = 0
-        for prompt_index, span_position in enumerate(prompt_span_positions.tolist()):
-            if span_position > cursor:
-                self._append_hidden_chunk(
-                    state, llm_hiddens[:, span_position - 1 : span_position, :]
-                )
-            self._append_history_chunk(state, prompt_patches[:, prompt_index])
-            if self._next_token_is_audio_span(
-                generation_schedule,
-                position=span_position,
-                audio_placeholder_ids=audio_placeholder_ids,
-            ):
-                self._append_hidden_chunk(
-                    state, llm_hiddens[:, span_position : span_position + 1, :]
-                )
-            cursor = span_position + 1
-        if prefill_end > cursor:
-            self._append_hidden_chunk(
-                state, llm_hiddens[:, prefill_end - 1 : prefill_end, :]
-            )
-        return prefill_end
 
     def _decode_next_audio(
         self,
@@ -1400,89 +1250,6 @@ class DotsTtsModel(nn.Module):
         state.patch_encoder_state.seq_len += self.core.patch_encoder.out_ds_rate
         return llm_embedding
 
-    def _consume_audio_patch(
-        self,
-        state: _GenerateState,
-        *,
-        audio_patch: torch.Tensor,
-    ) -> None:
-        llm_embedding = self._encode_audio_patch_feedback(
-            state,
-            audio_patch=audio_patch,
-        )
-        with measure_inference("LLM"):
-            _, state.llm_hiddens, _, state.llm_cache = self.core.step_llm(
-                inputs_embeds=llm_embedding,
-                past_key_values=state.llm_cache,
-            )
-
-    def _decode(
-        self,
-        generation_schedule: torch.Tensor,
-        *,
-        position: int,
-        state: _GenerateState,
-        audio_placeholder_ids: set[int],
-        span_positions: torch.Tensor,
-        device: torch.device,
-        g_cond: torch.Tensor | None,
-        ode_method: str,
-        num_steps: int,
-        guidance_scale: float,
-        eos_threshold: float,
-    ) -> Iterator[torch.Tensor]:
-        span_cursor = torch.searchsorted(
-            span_positions,
-            torch.tensor(
-                position,
-                device=span_positions.device,
-                dtype=span_positions.dtype,
-            ),
-        ).item()
-        while position < generation_schedule.size(1):
-            token_id = int(generation_schedule[0, position].item())
-            if token_id in audio_placeholder_ids:
-                stop_after_current_audio = self._should_stop_after_current_audio(
-                    state,
-                    eos_threshold=eos_threshold,
-                )
-                audio_patch = self._decode_next_audio(
-                    state,
-                    device=device,
-                    g_cond=g_cond,
-                    ode_method=ode_method,
-                    num_steps=num_steps,
-                    guidance_scale=guidance_scale,
-                )
-                self._consume_audio_patch(
-                    state,
-                    audio_patch=audio_patch,
-                )
-                if self._next_token_is_audio_span(
-                    generation_schedule,
-                    position=position,
-                    audio_placeholder_ids=audio_placeholder_ids,
-                ):
-                    self._append_hidden_chunk(state, state.llm_hiddens)
-                position += 1
-                span_cursor += 1
-                yield audio_patch
-                if stop_after_current_audio:
-                    state.end_flag = True
-                    return
-                continue
-            next_audio_position = (
-                int(span_positions[span_cursor].item())
-                if span_cursor < span_positions.numel()
-                else generation_schedule.size(1)
-            )
-            position = self._consume_text_schedule(
-                generation_schedule,
-                position=position,
-                next_audio_position=next_audio_position,
-                state=state,
-            )
-
     def _should_stop_after_current_audio(
         self, state: _GenerateState, *, eos_threshold: float
     ) -> bool:
@@ -1495,251 +1262,3 @@ class DotsTtsModel(nn.Module):
         return state.end_flag or bool(eos.item())
 
     # endregion Prompt conditioning and decode state helpers
-
-    # region Public generation APIs
-    @torch.no_grad()
-    def _generate_latents_stream(
-        self,
-        data: dict[str, Any],
-        *,
-        precision: str,
-        ode_method: str,
-        num_steps: int,
-        guidance_scale: float,
-        speaker_scale: float = 1.5,
-        eos_threshold: float = 0.8,
-    ) -> Iterator[torch.Tensor]:
-        dtype = get_dtype(precision)
-        device = next(self.core.parameters()).device
-        use_amp = device.type == "cuda" and dtype in {torch.float16, torch.bfloat16}
-        with torch.autocast(device_type=device.type, dtype=dtype, enabled=use_amp):
-            generation_schedule: torch.Tensor = data["generation_schedule"]
-            if generation_schedule.size(0) != 1:
-                raise ValueError(
-                    "DotsTtsModel.generate expects batch size 1 for generation_schedule."
-                )
-
-            use_prompt_prefill = data.get("prompt_audio") is not None and bool(
-                data.get("prompt_text")
-            )
-            prompt_conditioning = self._prepare_prompt_conditioning(
-                data.get("prompt_audio"),
-                use_prompt_prefill=use_prompt_prefill,
-                speaker_scale=speaker_scale,
-            )
-            has_prompt_prefill = prompt_conditioning.prompt_patches is not None
-            prompt_patch_count = (
-                0
-                if not has_prompt_prefill
-                else int(prompt_conditioning.prompt_patches.size(1))
-            )
-            audio_placeholder_ids = set(self.core.audio_span_token_ids)
-            span_positions = self._find_audio_span_positions(
-                generation_schedule,
-                audio_placeholder_ids=audio_placeholder_ids,
-            )
-            span_count = int(span_positions.numel())
-            minimum_required_spans = prompt_patch_count + 1
-            if span_count < minimum_required_spans:
-                raise ValueError(
-                    f"generation_schedule provides {span_count} audio spans, but prompt prefill requires "
-                    f"{prompt_patch_count} spans and generation requires at least one additional decode span."
-                )
-            logger.info(
-                "Latent generation prepared: schedule_audio_spans={} prompt_patch_count={} "
-                "minimum_required_spans={}",
-                span_count,
-                prompt_patch_count,
-                minimum_required_spans,
-            )
-
-            state = self._allocate_generate_state(
-                max_audio_patch_count=span_count,
-                device=device,
-                dtype=dtype,
-            )
-            prompt_patch_embeddings = self._prefill_prompt_latents(
-                prompt_conditioning.prompt_latents,
-                state=state,
-            )
-            position = self._prefill(
-                generation_schedule,
-                state=state,
-                span_positions=span_positions,
-                prompt_patches=prompt_conditioning.prompt_patches,
-                prompt_patch_embeddings=prompt_patch_embeddings,
-                audio_placeholder_ids=audio_placeholder_ids,
-            )
-
-            payload_patch_count = 0
-            should_drop_regenerated_prompt_patch = has_prompt_prefill
-            for audio_patch in self._decode(
-                generation_schedule,
-                position=position,
-                state=state,
-                audio_placeholder_ids=audio_placeholder_ids,
-                span_positions=span_positions,
-                device=device,
-                g_cond=prompt_conditioning.g_cond,
-                ode_method=ode_method,
-                num_steps=num_steps,
-                guidance_scale=guidance_scale,
-                eos_threshold=eos_threshold,
-            ):
-                if should_drop_regenerated_prompt_patch:
-                    should_drop_regenerated_prompt_patch = False
-                    continue
-                payload_patch_count += 1
-                if payload_patch_count == 1 or payload_patch_count % 10 == 0:
-                    logger.info(
-                        "Latent generation progress: payload_audio_patches={}",
-                        payload_patch_count,
-                    )
-                yield self.core.io_helper.denormalize(audio_patch)
-
-            if payload_patch_count == 0:
-                if has_prompt_prefill:
-                    raise RuntimeError(
-                        "Generation produced no payload latents after discarding the regenerated prompt-tail patch. "
-                        "This usually means EOS triggered immediately after prompt continuation "
-                        "or the generation schedule did not provide an effective decode span."
-                    )
-                raise RuntimeError(
-                    "Generation produced no decodable latents. "
-                    "This usually means EOS triggered before the first decode patch "
-                    "or the generation schedule did not provide an effective decode span."
-                )
-            logger.info(
-                "Latent generation completed: payload_audio_patches={}",
-                payload_patch_count,
-            )
-
-    @torch.no_grad()
-    def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        with measure_inference("latent_decoder"):
-            return self.vocoder.inference_from_latents(
-                latents.transpose(1, 2).float(),
-                do_sample=False,
-            )
-
-    @torch.no_grad()
-    def _init_vocoder_stream_state(self) -> Any:
-        return self.vocoder.init_stream_state(
-            batch_size=1,
-            chunk_size=self.core.latent_patch_size,
-        )
-
-    @torch.no_grad()
-    def _stream_vocoder_patch(
-        self,
-        latent_patch: torch.Tensor,
-        *,
-        stream_state: Any,
-    ) -> torch.Tensor:
-        latents = latent_patch.transpose(1, 2)
-        if not self._optimize_enabled:
-            with measure_inference("vocoder"):
-                return self.vocoder.stream_step(latents, stream_state)
-
-        valid_frames = min(
-            stream_state.decoder.total_frames,
-            stream_state.decoder.window.size(-1),
-        )
-        valid_frames_tensor = stream_state.decoder.window.new_tensor(
-            valid_frames,
-            dtype=torch.int64,
-        )
-        vocoder_step = self._get_compiled_method(
-            "vocoder.step",
-            self.vocoder,
-            "compiled_stream_step",
-        )
-        with measure_inference("vocoder"):
-            audio_window, hidden_h, hidden_c, new_window = vocoder_step(
-                latents,
-                stream_state.lstm_hidden[0],
-                stream_state.lstm_hidden[1],
-                stream_state.decoder.window,
-                valid_frames_tensor,
-            )
-        stream_state.lstm_hidden = (hidden_h.clone(), hidden_c.clone())
-        stream_state.decoder.window = new_window.clone()
-        stream_state.decoder.total_frames += int(latents.size(-1))
-        audio_chunk = self.vocoder._slice_stream_audio_window(
-            audio_window,
-            stream_state,
-            final=False,
-        )
-        return audio_chunk.clone()
-
-    @torch.no_grad()
-    def _flush_vocoder_stream(self, stream_state: Any) -> torch.Tensor:
-        with measure_inference("vocoder"):
-            return self.vocoder.stream_flush(stream_state)
-
-    @torch.no_grad()
-    def generate_audio_stream(
-        self,
-        data: dict[str, Any],
-        *,
-        precision: str,
-        ode_method: str,
-        num_steps: int,
-        guidance_scale: float,
-        speaker_scale: float = 1.5,
-        eos_threshold: float = 0.8,
-    ) -> Iterator[torch.Tensor]:
-        stream_state = self._init_vocoder_stream_state()
-        for latent_patch in self._generate_latents_stream(
-            data,
-            precision=precision,
-            ode_method=ode_method,
-            num_steps=num_steps,
-            guidance_scale=guidance_scale,
-            speaker_scale=speaker_scale,
-            eos_threshold=eos_threshold,
-        ):
-            audio_chunk = self._stream_vocoder_patch(
-                latent_patch,
-                stream_state=stream_state,
-            )
-            if audio_chunk.size(-1) > 0:
-                yield audio_chunk
-
-        final_chunk = self._flush_vocoder_stream(stream_state)
-        if final_chunk.size(-1) > 0:
-            yield final_chunk
-
-    @torch.no_grad()
-    def generate_audio(
-        self,
-        data: dict[str, Any],
-        *,
-        precision: str,
-        ode_method: str,
-        num_steps: int,
-        guidance_scale: float,
-        speaker_scale: float = 1.5,
-    ) -> torch.Tensor:
-        latent_patches = list(
-            self._generate_latents_stream(
-                data,
-                precision=precision,
-                ode_method=ode_method,
-                num_steps=num_steps,
-                guidance_scale=guidance_scale,
-                speaker_scale=speaker_scale,
-            )
-        )
-        logger.info(
-            "Vocoder decode started: latent_patch_count={}",
-            len(latent_patches),
-        )
-        audio = self._decode_latents(torch.cat(latent_patches, dim=1))
-        logger.info(
-            "Vocoder decode completed: waveform_samples={}",
-            audio.shape[-1],
-        )
-        return audio
-
-    # endregion Public generation APIs

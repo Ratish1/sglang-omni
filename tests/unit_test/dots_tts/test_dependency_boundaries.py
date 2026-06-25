@@ -68,6 +68,26 @@ def test_side_model_warmup_does_not_use_full_generation_api() -> None:
     assert "def run_warmup(" in source
 
 
+def test_vendored_model_does_not_expose_upstream_full_runtime_surfaces() -> None:
+    root = Path(__file__).resolve().parents[3]
+    source = (
+        root / "sglang_omni/models/dots_tts/native/models/dots_tts/model.py"
+    ).read_text(encoding="utf-8")
+    forbidden_defs = [
+        "def run_warmup(",
+        "def generate_audio(",
+        "def generate_audio_stream(",
+        "def _generate_latents_stream(",
+        "def _prefill(",
+        "def _decode(",
+        "def _consume_text_schedule(",
+        "def _consume_audio_patch(",
+    ]
+
+    for symbol in forbidden_defs:
+        assert symbol not in source
+
+
 def test_native_adapter_uses_side_model_serving_api_boundary() -> None:
     root = Path(__file__).resolve().parents[3]
     source = (
