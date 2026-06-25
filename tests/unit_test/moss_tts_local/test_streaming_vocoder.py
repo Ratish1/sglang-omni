@@ -618,6 +618,34 @@ def test_slot_reuse_after_release(monkeypatch) -> None:
     )
 
 
+def test_stream_session_reuses_step_workspace_without_stale_slot_state() -> None:
+    codec = FakeCodec()
+    session = _CodecStreamSession(
+        codec,
+        stream_slots=2,
+        offline_slots=1,
+        n_vq=N_VQ,
+        max_step_frames=4,
+    )
+    try:
+        session.step({0: torch.ones(N_VQ, 4, dtype=torch.long)})
+        assert codec._streaming_state is not None
+        assert codec._streaming_state.offsets.tolist() == [4, 0, 0]
+
+        out = session.step({1: torch.full((N_VQ, 2), 2, dtype=torch.long)})
+        assert codec._streaming_state.offsets.tolist() == [4, 2, 0]
+        np.testing.assert_array_equal(
+            out[1].numpy(),
+            reference_waveform(torch.full((2, N_VQ), 2, dtype=torch.long)).numpy(),
+        )
+
+        out = session.step({0: torch.zeros(N_VQ, 1, dtype=torch.long)})
+        assert codec._streaming_state.offsets.tolist() == [5, 2, 0]
+        assert out[0][0, 0].item() == 4000.0
+    finally:
+        session.close()
+
+
 def test_slot_exhaustion_falls_back_to_offline_decode(monkeypatch) -> None:
     processor = FakeProcessor()
     scheduler = _make_scheduler(

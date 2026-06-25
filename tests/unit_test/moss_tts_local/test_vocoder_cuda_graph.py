@@ -55,7 +55,11 @@ def session_bundle():
     n_vq = N_VQ
     vocab = _codebook_size(codec)
     session = _CodecStreamSession(
-        codec, stream_slots=STREAM_SLOTS, offline_slots=OFFLINE_SLOTS, n_vq=n_vq
+        codec,
+        stream_slots=STREAM_SLOTS,
+        offline_slots=OFFLINE_SLOTS,
+        n_vq=n_vq,
+        max_step_frames=max(CHUNK_TS),
     )
     # Capture every length the test emits (each chunk_t and its remainder) once, sealed.
     wanted = set()

@@ -23,6 +23,8 @@ from sglang_omni.models.tts_streaming import (
     resolve_initial_codec_chunk_frames,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
@@ -31,6 +33,7 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 logger = logging.getLogger(__name__)
 
 _SOURCE_HINT = "MOSS-TTS Local"
+_REQUEST_RECORDER = _get_event_recorder()
 
 
 def _build_usage(state: MossTTSLocalState) -> dict[str, Any] | None:
@@ -50,17 +53,40 @@ class _CodecStreamSession:
     """Persistent batched ``codec.streaming()`` session with slot bookkeeping (stream slots held by live requests; offline slots for non-streaming decodes). Scheduler-loop-thread only."""
 
     def __init__(
-        self, codec: Any, *, stream_slots: int, offline_slots: int, n_vq: int
+        self,
+        codec: Any,
+        *,
+        stream_slots: int,
+        offline_slots: int,
+        n_vq: int,
+        max_step_frames: int,
     ) -> None:
         self._codec = codec
         self._stream_slots = int(stream_slots)
         self._offline_slots = int(offline_slots)
         self._batch_size = self._stream_slots + self._offline_slots
         self._n_vq = int(n_vq)
+        self._max_step_frames = int(max_step_frames)
         self._device = next(codec.parameters()).device
         self._free_stream_slots = list(range(self._stream_slots))
         self._closed = False
         self._cg_runner: Any | None = None
+        self._codes_step = torch.zeros(
+            self._n_vq,
+            self._batch_size,
+            self._max_step_frames,
+            dtype=torch.long,
+            device=self._device,
+        )
+        self._codes_lengths = torch.zeros(
+            self._batch_size, dtype=torch.long, device=self._device
+        )
+        self._exec_mask = torch.zeros(
+            self._batch_size, dtype=torch.bool, device=self._device
+        )
+        self._reset_mask = torch.zeros(
+            self._batch_size, dtype=torch.bool, device=self._device
+        )
         # Capture is attempted at most once per session; a low-VRAM skip must not re-probe per step.
         self.warmup_attempted = False
         # Per-T graph-vs-eager step counts for capture-hit-rate reporting (host-side, no GPU sync).
@@ -156,9 +182,8 @@ class _CodecStreamSession:
         )
 
     def _reset_slots(self, slots: list[int]) -> None:
-        reset_mask = torch.zeros(
-            self._batch_size, dtype=torch.bool, device=self._device
-        )
+        reset_mask = self._reset_mask
+        reset_mask.zero_()
         reset_mask[slots] = True
 
         def _reset(module: Any) -> None:
@@ -169,7 +194,31 @@ class _CodecStreamSession:
         with torch.no_grad():
             self._codec.apply(_reset)
 
-    def step(self, slot_codes: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+    def _emit_slot_events(
+        self,
+        slot_request_ids: Mapping[int, str] | None,
+        slots: list[int],
+        event_name: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not slot_request_ids or not _REQUEST_RECORDER.is_active():
+            return
+        for slot in slots:
+            request_id = slot_request_ids.get(slot)
+            if request_id is not None:
+                _emit_event(
+                    request_id=request_id,
+                    stage=None,
+                    event_name=event_name,
+                    metadata=metadata,
+                )
+
+    def step(
+        self,
+        slot_codes: dict[int, torch.Tensor],
+        *,
+        slot_request_ids: Mapping[int, str] | None = None,
+    ) -> dict[int, torch.Tensor]:
         """Advance participating slots by one uniform-length step. ``slot_codes`` maps slot -> ``[n_vq, T]`` (same T); returns slot -> ``[channels, samples]`` float32 CPU audio."""
         if not slot_codes:
             return {}
@@ -179,21 +228,49 @@ class _CodecStreamSession:
                 f"streaming step requires a uniform length, got {sorted(step_lengths)}"
             )
         (step_t,) = step_lengths
+        if step_t > self._max_step_frames:
+            raise ValueError(
+                f"streaming step length {step_t} exceeds max_step_frames="
+                f"{self._max_step_frames}"
+            )
         n_vq = int(next(iter(slot_codes.values())).shape[0])
-        codes_step = torch.zeros(
-            n_vq, self._batch_size, step_t, dtype=torch.long, device=self._device
+        if n_vq != self._n_vq:
+            raise ValueError(f"expected {self._n_vq} codebooks, got {n_vq}")
+        slots = list(slot_codes)
+        metadata = None
+        if slot_request_ids and _REQUEST_RECORDER.is_active():
+            metadata = {
+                "step_t": int(step_t),
+                "participants": len(slots),
+                "has_graph_runner": self._cg_runner is not None,
+            }
+        self._emit_slot_events(
+            slot_request_ids, slots, "moss_streaming_step_prepare_start", metadata
         )
-        codes_lengths = torch.zeros(
-            self._batch_size, dtype=torch.long, device=self._device
-        )
-        exec_mask = torch.zeros(self._batch_size, dtype=torch.bool, device=self._device)
+        codes_step = self._codes_step[:, :, :step_t]
+        codes_lengths = self._codes_lengths
+        exec_mask = self._exec_mask
+        codes_step.zero_()
+        codes_lengths.zero_()
+        exec_mask.zero_()
         for slot, codes in slot_codes.items():
             codes_step[:, slot, :] = codes.to(device=self._device, dtype=torch.long)
             codes_lengths[slot] = step_t
             exec_mask[slot] = True
-        slots = list(slot_codes)
+        self._emit_slot_events(
+            slot_request_ids, slots, "moss_streaming_step_prepare_end", metadata
+        )
         graphed = None
         graph_failed = False
+        decode_metadata = None
+        if metadata is not None:
+            decode_metadata = {
+                **metadata,
+                "mode": "graph_probe" if self._cg_runner is not None else "eager",
+            }
+        self._emit_slot_events(
+            slot_request_ids, slots, "moss_streaming_decode_start", decode_metadata
+        )
         try:
             with torch.no_grad():
                 if self._cg_runner is not None:
@@ -208,10 +285,26 @@ class _CodecStreamSession:
                     self._codec._set_streaming_exec_mask(exec_mask)
                     result = self._codec._decode_frame(codes_step, codes_lengths)
                     audio, audio_lengths = result.audio, result.audio_lengths
+            self._emit_slot_events(
+                slot_request_ids,
+                slots,
+                "moss_streaming_decode_end",
+                (
+                    {**metadata, "mode": "graph" if graphed is not None else "eager"}
+                    if metadata is not None
+                    else None
+                ),
+            )
             # One batched D2H per step. A graph replay error can surface async HERE (not in
             # decode_step), so materialization stays inside the replay guard.
+            self._emit_slot_events(
+                slot_request_ids, slots, "moss_streaming_d2h_start", metadata
+            )
             audio_cpu = audio[slots].detach().to("cpu", torch.float32)
             lengths_cpu = audio_lengths[slots].detach().to("cpu")
+            self._emit_slot_events(
+                slot_request_ids, slots, "moss_streaming_d2h_end", metadata
+            )
         except Exception:
             # Graphed step failed (in decode_step or async on the D2H): disable the runner so future
             # steps go eager; participants abort. An eager-path error does not disable it.
@@ -231,9 +324,15 @@ class _CodecStreamSession:
             if self._cg_total_steps % 2000 == 0:
                 self._log_cg_stats()
         out: dict[int, torch.Tensor] = {}
+        self._emit_slot_events(
+            slot_request_ids, slots, "moss_streaming_output_slice_start", metadata
+        )
         for index, slot in enumerate(slots):
             n_samples = int(lengths_cpu[index])
             out[slot] = audio_cpu[index, :, :n_samples]
+        self._emit_slot_events(
+            slot_request_ids, slots, "moss_streaming_output_slice_end", metadata
+        )
         return out
 
     def decode_offline(
@@ -498,6 +597,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 stream_slots=self._stream_slots,
                 offline_slots=self._offline_slots,
                 n_vq=self._n_vq,
+                max_step_frames=self._max_step_frames,
             )
         return self._session
 
@@ -658,10 +758,15 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                 self._max_step_frames,
             )
             plan: dict[int, torch.Tensor] = {}
-            for _, state in participants:
+            slot_request_ids: dict[int, str] = {}
+            for request_id, state in participants:
+                assert state.slot is not None
                 plan[state.slot] = torch.stack(state.pending[:step_t], dim=1)
+                slot_request_ids[state.slot] = request_id
             try:
-                decoded = self._ensure_session().step(plan)
+                decoded = self._ensure_session().step(
+                    plan, slot_request_ids=slot_request_ids
+                )
             except Exception as exc:
                 logger.exception(
                     "MOSS-TTS Local streaming decode step failed; aborting %d "
