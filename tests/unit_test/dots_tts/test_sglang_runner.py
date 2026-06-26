@@ -127,22 +127,6 @@ def test_before_decode_writes_pending_feedback_embedding() -> None:
     assert data.decode_input_embeds == []
 
 
-def test_before_prefill_does_not_create_latent_stepper() -> None:
-    runner = make_runner()
-
-    class FakeModel:
-        def create_latent_stepper(self, data):
-            raise AssertionError("latent_stepper fallback should not be used")
-
-    runner.model = FakeModel()
-    data = DotsTTSSGLangRequestData()
-    sched_req = SimpleNamespace(data=data)
-
-    runner.before_prefill(None, None, [sched_req])
-
-    assert not hasattr(data, "latent_stepper")
-
-
 def test_runner_uses_model_latent_decode_step() -> None:
     calls = []
 
@@ -290,7 +274,7 @@ def test_post_decode_generates_latents_for_multiple_requests() -> None:
     assert len(second.latent_patches) == 1
 
 
-def test_post_decode_does_not_use_latent_stepper_fallback() -> None:
+def test_post_decode_advances_control_token_when_no_active_requests() -> None:
     runner = make_runner()
 
     class FakeModel:

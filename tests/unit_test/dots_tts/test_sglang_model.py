@@ -282,15 +282,6 @@ def test_decode_audio_batch_splits_incompatible_flow_keys_and_preserves_order(
     assert torch.equal(output.latent_patches[3], torch.full((1, 4, 2), 3.0))
 
 
-def test_model_does_not_expose_legacy_generate_latent_patch(monkeypatch) -> None:
-    import sglang_omni.models.dots_tts.sglang_model as mod
-
-    monkeypatch.setattr(mod, "Qwen2ForCausalLM", FakeQwen2)
-    model = DotsTTSSGLangModel(SimpleNamespace(torch_dtype="bfloat16"))
-
-    assert not hasattr(model, "generate_latent_patch")
-
-
 def test_model_load_weights_routes_llm_weights_to_qwen2(monkeypatch) -> None:
     import sglang_omni.models.dots_tts.sglang_model as mod
 

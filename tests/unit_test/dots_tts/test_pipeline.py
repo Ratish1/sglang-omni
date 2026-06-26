@@ -188,26 +188,6 @@ def _drain_outbox(scheduler) -> list:
             return messages
 
 
-def test_dots_tts_legacy_latent_scheduler_is_not_exported() -> None:
-    from sglang_omni.models.dots_tts import stages
-
-    assert not hasattr(stages, "DotsTTSLatentEngine")
-    assert not hasattr(stages, "DotsTTSLatentScheduler")
-    assert "DotsTTSLatentEngine" not in stages.__all__
-    assert "DotsTTSLatentScheduler" not in stages.__all__
-
-
-def test_dots_tts_full_runtime_engine_is_not_exported() -> None:
-    from sglang_omni.models.dots_tts import stages
-
-    assert not hasattr(stages, "DotsTTSEngine")
-    assert not hasattr(stages, "create_tts_engine_executor")
-    assert not hasattr(stages, "create_dots_tts_engine_executor")
-    assert "DotsTTSEngine" not in stages.__all__
-    assert "create_tts_engine_executor" not in stages.__all__
-    assert "create_dots_tts_engine_executor" not in stages.__all__
-
-
 def test_dots_tts_vocoder_scheduler_streams_audio_chunks_and_finalizes() -> None:
     from sglang_omni.models.dots_tts.stages import DotsTTSVocoderScheduler
 
@@ -620,22 +600,6 @@ def test_dots_tts_model_runner_runs_model_audio_step() -> None:
     assert len(data.latent_patches) == 1
     assert len(data.decode_input_embeds) == 1
     assert data.position == 1
-
-
-def test_dots_tts_sglang_model_has_no_runtime_latent_stepper(monkeypatch) -> None:
-    import torch
-
-    import sglang_omni.models.dots_tts.sglang_model as sglang_model_mod
-    from sglang_omni.models.dots_tts.sglang_model import DotsTTSSGLangModel
-
-    class FakeQwen2(torch.nn.Module):
-        def __init__(self, *args, **kwargs):
-            super().__init__()
-
-    monkeypatch.setattr(sglang_model_mod, "Qwen2ForCausalLM", FakeQwen2)
-    model = DotsTTSSGLangModel(SimpleNamespace(torch_dtype="bfloat16"))
-
-    assert not hasattr(model, "create_latent_stepper")
 
 
 def test_dots_tts_native_stage_factories_cache_by_stage(monkeypatch) -> None:

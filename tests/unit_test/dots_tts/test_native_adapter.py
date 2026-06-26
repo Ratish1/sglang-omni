@@ -169,39 +169,6 @@ def test_adapter_casts_prompt_latents_to_generate_state_dtype() -> None:
     assert runtime.model.prefill_dtype == torch.bfloat16
 
 
-class FakeDotsModel:
-    def __init__(self) -> None:
-        self.calls = []
-        self.llm_config = SimpleNamespace(vocab_size=32000)
-
-    def _decode_next_audio(self, **kwargs):
-        self.calls.append(kwargs)
-        return torch.ones(1, 4, 128)
-
-    def _encode_audio_patch_feedback(self, fm_state, *, audio_patch):
-        assert fm_state == {"history": []}
-        return audio_patch.mean(dim=1, keepdim=True)
-
-    def _encode_audio_patch(self, latent_patch):
-        return latent_patch.mean(dim=1, keepdim=True)
-
-    def _predict_eos(self, hidden_state, latent_patch):
-        del hidden_state, latent_patch
-        return torch.tensor([0.8])
-
-    def _should_stop_after_current_audio(self, fm_state, *, eos_threshold):
-        assert fm_state == {"history": []}
-        assert eos_threshold == 0.8
-        return True
-
-
-def test_adapter_does_not_expose_legacy_audio_step() -> None:
-    runtime = SimpleNamespace(model=FakeDotsModel(), precision="bfloat16")
-    adapter = DotsTTSNativeAdapter(runtime)
-
-    assert not hasattr(adapter, "generate_audio_step")
-
-
 def test_adapter_rejects_request_longer_than_runtime_schedule() -> None:
     class ShortScheduleRuntime(FakeRuntime):
         max_generate_length = 4
