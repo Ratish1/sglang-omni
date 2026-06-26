@@ -80,10 +80,11 @@ After full `T=1..25` capture, eager decode should no longer dominate. The next p
 ## First Debug Branch Slice
 
 1. Add profiling markers around streaming vocoder step phases.
-2. Reuse per-session step/reset tensors to remove repeated hot-path allocations.
-3. Do not change chunking, codec math, graph capture policy, output formatting, or non-streaming math.
-4. Validate with unit tests locally, then H100 streaming profile:
+2. Emit profiling markers once per batched vocoder step, not once per participating request.
+3. Reuse per-session step/reset tensors to remove repeated hot-path allocations.
+4. Do not change chunking, codec math, graph capture policy, output formatting, or non-streaming math.
+5. Validate with unit tests locally, then H100 streaming profile:
    - graph coverage remains 100% for `T=1..25`
    - graph-vs-eager identity remains bit-exact
    - no duration runaway
-   - request profile shows whether D2H or scheduler work is now dominant
+   - request profile shows actual per-step prepare/decode/D2H/output-slice intervals
