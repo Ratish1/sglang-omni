@@ -193,7 +193,6 @@ class DotsTtsSideModel(nn.Module):
     REQUIRED_ARTIFACT_FILES = DotsTtsModel.REQUIRED_ARTIFACT_FILES
 
     set_optimize = DotsTtsModel.set_optimize
-    set_cfg_droprate = DotsTtsModel.set_cfg_droprate
     _resolve_generate_length_bucket = classmethod(
         DotsTtsModel._resolve_generate_length_bucket.__func__
     )
@@ -235,7 +234,6 @@ class DotsTtsSideModel(nn.Module):
     _append_history_chunk = DotsTtsModel._append_history_chunk
     _locate_prefill_boundary = DotsTtsModel._locate_prefill_boundary
     _find_audio_span_positions = staticmethod(DotsTtsModel._find_audio_span_positions)
-    _next_token_is_audio_span = staticmethod(DotsTtsModel._next_token_is_audio_span)
     _decode_next_audio = DotsTtsModel._decode_next_audio
     _encode_audio_patch_feedback = DotsTtsModel._encode_audio_patch_feedback
     _should_stop_after_current_audio = DotsTtsModel._should_stop_after_current_audio

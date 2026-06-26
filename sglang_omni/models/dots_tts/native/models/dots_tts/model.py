@@ -9,10 +9,7 @@ and vocoder staging.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
-import shutil
-from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -23,20 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from loguru import logger
-from safetensors.torch import load_file, save_file
-from transformers import AutoTokenizer, Qwen2Config
-
-from sglang_omni.models.dots_tts.native.models.dots_tts.config import ModelConfig
-from sglang_omni.models.dots_tts.native.models.dots_tts.core import DotsTtsCore
-from sglang_omni.models.dots_tts.native.modules.speaker.encoder import (
-    SpeakerXVectorFeatures,
-)
-from sglang_omni.models.dots_tts.native.modules.vocoder.bigvgan import AudioVAE
 from sglang_omni.models.dots_tts.native.utils.profiling import measure_inference
-from sglang_omni.models.dots_tts.native.utils.tokenizer import (
-    AUDIO_GEN_START_TOKEN,
-    require_token_id,
-)
 from sglang_omni.models.dots_tts.native.utils.util import get_dtype
 
 
@@ -109,69 +93,10 @@ class DotsTtsModel(nn.Module):
         SPEAKER_ENCODER_FILENAME,
     )
 
-    # region Module assembly and checkpoint IO
-    def __init__(
-        self,
-        config: ModelConfig,
-        tokenizer,
-        latent_stats_path: str | Path,
-        llm_config: Qwen2Config,
-    ):
-        super().__init__()
-        self.config = config
-        self.tokenizer = tokenizer
-        self.latent_stats_path = Path(latent_stats_path)
-        self.audio_gen_start_id = require_token_id(
-            self.tokenizer, AUDIO_GEN_START_TOKEN
-        )
-
-        self.core = DotsTtsCore(
-            config,
-            llm_config=llm_config,
-            tokenizer=tokenizer,
-            latent_stats_path=self.latent_stats_path,
-        )
-        self.vocoder = AudioVAE(config.vocoder).eval()
-        self.vocoder.remove_weight_norm()
-        self.hop_size = self.vocoder.hop_size
-        self.xvector_extractor = SpeakerXVectorFeatures(
-            sample_rate=self.vocoder.sample_rate,
-            campplus_embedding_size=config.campplus_embedding_size,
-            max_audio_seconds=config.xvec_max_audio_seconds,
-        ).eval()
-
-        for param in self.vocoder.parameters():
-            param.requires_grad = False
-        for param in self.xvector_extractor.parameters():
-            param.requires_grad = False
-        self._optimize_enabled = True
-        self._compiled_models: dict[
-            tuple[str, tuple[Any, ...] | None], Callable[..., Any]
-        ] = {}
-        self._prompt_feature_cache: OrderedDict[str, _PromptFeatureCacheEntry] = (
-            OrderedDict()
-        )
-        self._fm_decode_workspaces: dict[tuple[Any, ...], dict[str, torch.Tensor]] = {}
-
     def set_optimize(self, optimize: bool) -> None:
         self._optimize_enabled = bool(optimize)
         if not self._optimize_enabled:
             self._compiled_models.clear()
-
-    def set_cfg_droprate(
-        self,
-        cfg_droprate: float | None = None,
-        xvec_drop_rate: float | None = None,
-    ) -> None:
-        if cfg_droprate is not None:
-            self.config.cfg_droprate = cfg_droprate
-            self.core.config.cfg_droprate = cfg_droprate
-            self.core.cfg_droprate = cfg_droprate
-
-        if xvec_drop_rate is not None:
-            self.config.xvec_drop_rate = xvec_drop_rate
-            self.core.config.xvec_drop_rate = xvec_drop_rate
-            self.core.xvec_drop_rate = xvec_drop_rate
 
     @classmethod
     def _resolve_generate_length_bucket(
@@ -404,72 +329,6 @@ class DotsTtsModel(nn.Module):
             ),
         }
 
-    @staticmethod
-    def _tensor_storage_signature(tensor: torch.Tensor) -> tuple:
-        return (
-            tensor.untyped_storage().data_ptr(),
-            tensor.storage_offset(),
-            tuple(tensor.size()),
-            tuple(tensor.stride()),
-            tensor.dtype,
-        )
-
-    @classmethod
-    def _build_artifact_state_dict(cls, module) -> dict[str, torch.Tensor]:
-        state_dict = module.state_dict()
-        skip_keys = set()
-
-        for redundant_key, canonical_key in cls._ARTIFACT_ALIASES:
-            redundant_tensor = state_dict.get(redundant_key)
-            canonical_tensor = state_dict.get(canonical_key)
-            if (
-                redundant_tensor is not None
-                and canonical_tensor is not None
-                and cls._tensor_storage_signature(redundant_tensor)
-                == cls._tensor_storage_signature(canonical_tensor)
-            ):
-                skip_keys.add(redundant_key)
-
-        cleaned_state_dict = {}
-        seen_storage = set()
-        for key, value in state_dict.items():
-            if key in skip_keys:
-                continue
-
-            storage_signature = cls._tensor_storage_signature(value)
-            if storage_signature in seen_storage:
-                continue
-
-            seen_storage.add(storage_signature)
-            cleaned_state_dict[key] = value.detach().cpu().contiguous()
-
-        return cleaned_state_dict
-
-    @classmethod
-    def _restore_artifact_state_dict(cls, state_dict: dict, module) -> dict:
-        restored_state_dict = dict(state_dict)
-        for redundant_key, canonical_key in cls._ARTIFACT_ALIASES:
-            if (
-                canonical_key in restored_state_dict
-                and redundant_key not in restored_state_dict
-                and redundant_key in module.state_dict()
-            ):
-                restored_state_dict[redundant_key] = restored_state_dict[canonical_key]
-        return restored_state_dict
-
-    @classmethod
-    def _save_artifact_module(cls, module, path: Path) -> None:
-        save_file(cls._build_artifact_state_dict(module), path)
-
-    @classmethod
-    def _load_artifact_module(cls, module, path: Path):
-        state_dict = load_file(path, device="cpu")
-        restored_state_dict = cls._restore_artifact_state_dict(state_dict, module)
-        mismatch = module.load_state_dict(restored_state_dict, strict=False)
-        if mismatch.missing_keys or mismatch.unexpected_keys:
-            raise RuntimeError(f"Failed to load {path}: {mismatch}")
-        return module
-
     @classmethod
     def _validate_pretrained_directory(
         cls, pretrained_model_name_or_path: str | Path
@@ -485,131 +344,6 @@ class DotsTtsModel(nn.Module):
                 f"Pretrained path {pretrained_path} is missing required files: {missing_files}"
             )
         return pretrained_path
-
-    @classmethod
-    def _load_pretrained_config(cls, pretrained_path: Path) -> ModelConfig:
-        return ModelConfig.model_validate(
-            json.loads(
-                (pretrained_path / cls.CONFIG_FILENAME).read_text(encoding="utf-8")
-            )
-        )
-
-    @staticmethod
-    def _save_llm_config(llm_config: Qwen2Config, path: Path) -> None:
-        path.write_text(
-            json.dumps(llm_config.to_dict(), ensure_ascii=True, indent=2),
-            encoding="utf-8",
-        )
-
-    @staticmethod
-    def _load_llm_config(path: Path) -> Qwen2Config:
-        return Qwen2Config.from_dict(json.loads(path.read_text(encoding="utf-8")))
-
-    def _tie_llm_weights(self) -> None:
-        if hasattr(self.core.llm, "tie_weights"):
-            self.core.llm.tie_weights()
-
-    def save_pretrained(self, save_directory: str | Path) -> Path:
-        save_directory = Path(save_directory)
-        save_directory.mkdir(parents=True, exist_ok=True)
-
-        config_payload = self.config.to_declared_dict()
-        config_payload["model_type"] = self.HF_MODEL_TYPE
-        config_payload["architectures"] = list(self.HF_ARCHITECTURES)
-        (save_directory / self.CONFIG_FILENAME).write_text(
-            json.dumps(config_payload, ensure_ascii=True, indent=2),
-            encoding="utf-8",
-        )
-        self._save_llm_config(
-            self.core.llm.config,
-            save_directory / self.LLM_CONFIG_FILENAME,
-        )
-        self.tokenizer.save_pretrained(save_directory)
-        shutil.copy2(
-            self.latent_stats_path,
-            save_directory / self.LATENT_STATS_FILENAME,
-        )
-        self._save_artifact_module(self.core, save_directory / self.MODEL_FILENAME)
-        self._save_artifact_module(self.vocoder, save_directory / self.VOCODER_FILENAME)
-        self._save_artifact_module(
-            self.xvector_extractor,
-            save_directory / self.SPEAKER_ENCODER_FILENAME,
-        )
-        return save_directory
-
-    def _load_pretrained_artifacts(self, pretrained_path: Path) -> None:
-        self.latent_stats_path = pretrained_path / self.LATENT_STATS_FILENAME
-        self.core.io_helper = type(self.core.io_helper)(
-            latent_stats_path=self.latent_stats_path
-        )
-        self._load_artifact_module(self.core, pretrained_path / self.MODEL_FILENAME)
-        self._tie_llm_weights()
-        self._load_artifact_module(
-            self.vocoder, pretrained_path / self.VOCODER_FILENAME
-        )
-        self._load_artifact_module(
-            self.xvector_extractor,
-            pretrained_path / self.SPEAKER_ENCODER_FILENAME,
-        )
-        self.core.eval()
-        self.vocoder.eval()
-        self.xvector_extractor.eval()
-
-    def load_pretrained_weights(
-        self, pretrained_model_name_or_path: str | Path
-    ) -> None:
-        pretrained_path = self._validate_pretrained_directory(
-            pretrained_model_name_or_path
-        )
-        saved_config = self._load_pretrained_config(pretrained_path)
-        if saved_config.to_declared_dict() != self.config.to_declared_dict():
-            raise ValueError(
-                f"Pretrained config at {pretrained_path} does not match the current model."
-            )
-        saved_llm_config = self._load_llm_config(
-            pretrained_path / self.LLM_CONFIG_FILENAME
-        )
-        if saved_llm_config.to_dict() != self.core.llm.config.to_dict():
-            raise ValueError(
-                f"Pretrained LLM config at {pretrained_path} does not match the current model."
-            )
-        self._load_pretrained_artifacts(pretrained_path)
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str | Path):
-        logger.info(
-            "DotsTtsModel load started: pretrained_path={}",
-            pretrained_model_name_or_path,
-        )
-        pretrained_model_name_or_path = cls._validate_pretrained_directory(
-            pretrained_model_name_or_path
-        )
-        config = cls._load_pretrained_config(pretrained_model_name_or_path)
-        llm_config = cls._load_llm_config(
-            pretrained_model_name_or_path / cls.LLM_CONFIG_FILENAME
-        )
-        logger.info(
-            "DotsTtsModel config loaded: pretrained_path={} sample_rate={} patch_size={}",
-            pretrained_model_name_or_path,
-            config.vocoder.sample_rate,
-            config.patch_size,
-        )
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(pretrained_model_name_or_path),
-            local_files_only=True,
-        )
-        model = cls(
-            config,
-            tokenizer=tokenizer,
-            latent_stats_path=pretrained_model_name_or_path / cls.LATENT_STATS_FILENAME,
-            llm_config=llm_config,
-        )
-        model._load_pretrained_artifacts(pretrained_model_name_or_path)
-        logger.info(
-            "DotsTtsModel load completed: pretrained_path={}",
-            pretrained_model_name_or_path,
-        )
-        return model.eval()
 
     # endregion Module assembly and checkpoint IO
 
@@ -1080,45 +814,6 @@ class DotsTtsModel(nn.Module):
             torch.isin(schedule, placeholder_ids),
             as_tuple=False,
         ).squeeze(-1)
-
-    @staticmethod
-    def _next_token_is_audio_span(
-        generation_schedule: torch.Tensor,
-        *,
-        position: int,
-        audio_placeholder_ids: set[int],
-    ) -> bool:
-        next_position = position + 1
-        if next_position >= generation_schedule.size(1):
-            return False
-        return (
-            int(generation_schedule[0, next_position].item()) in audio_placeholder_ids
-        )
-
-    def _build_prefill_inputs_embeds(
-        self,
-        generation_schedule: torch.Tensor,
-        *,
-        prompt_patch_embeddings: torch.Tensor | None,
-        prompt_span_positions: torch.Tensor,
-    ) -> torch.Tensor:
-        inputs_embeds = self.core.llm.get_input_embeddings()(
-            generation_schedule
-        ).clone()
-        if prompt_span_positions.numel() > 0:
-            if prompt_patch_embeddings is None:
-                raise RuntimeError(
-                    "Prompt patch embeddings are required when prefill includes prompt audio spans."
-                )
-            patch_embeddings = prompt_patch_embeddings[
-                :, : prompt_span_positions.numel()
-            ].to(inputs_embeds.dtype)
-            if patch_embeddings.size(1) != prompt_span_positions.numel():
-                raise RuntimeError(
-                    f"Prompt patch embeddings ({patch_embeddings.size(1)}) do not match prompt span count ({prompt_span_positions.numel()})."
-                )
-            inputs_embeds[:, prompt_span_positions, :] = patch_embeddings
-        return inputs_embeds
 
     def _decode_next_audio(
         self,
