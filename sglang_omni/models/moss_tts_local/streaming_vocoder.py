@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -210,6 +211,15 @@ class _CodecStreamSession:
             metadata=metadata,
         )
 
+    def _profile_cuda_events_active(
+        self, slot_request_ids: Mapping[int, str] | None
+    ) -> bool:
+        return (
+            bool(slot_request_ids)
+            and _REQUEST_RECORDER.is_active()
+            and self._device.type == "cuda"
+        )
+
     def step(
         self,
         slot_codes: dict[int, torch.Tensor],
@@ -268,6 +278,17 @@ class _CodecStreamSession:
         self._emit_step_event(
             slot_request_ids, "moss_streaming_decode_start", decode_metadata
         )
+        profile_cuda = self._profile_cuda_events_active(slot_request_ids)
+        decode_start_event = decode_end_event = None
+        d2h_start_event = d2h_end_event = None
+        cuda_stream = None
+        if profile_cuda:
+            cuda_stream = torch.cuda.current_stream(self._device)
+            decode_start_event = torch.cuda.Event(enable_timing=True)
+            decode_end_event = torch.cuda.Event(enable_timing=True)
+            d2h_start_event = torch.cuda.Event(enable_timing=True)
+            d2h_end_event = torch.cuda.Event(enable_timing=True)
+            decode_start_event.record(cuda_stream)
         try:
             with torch.no_grad():
                 if self._cg_runner is not None:
@@ -282,6 +303,9 @@ class _CodecStreamSession:
                     self._codec._set_streaming_exec_mask(exec_mask)
                     result = self._codec._decode_frame(codes_step, codes_lengths)
                     audio, audio_lengths = result.audio, result.audio_lengths
+            if decode_end_event is not None:
+                assert cuda_stream is not None
+                decode_end_event.record(cuda_stream)
             self._emit_step_event(
                 slot_request_ids,
                 "moss_streaming_decode_end",
@@ -296,9 +320,42 @@ class _CodecStreamSession:
             self._emit_step_event(
                 slot_request_ids, "moss_streaming_d2h_start", metadata
             )
+            d2h_host_start_ns = time.perf_counter_ns() if profile_cuda else None
+            if d2h_start_event is not None:
+                assert cuda_stream is not None
+                d2h_start_event.record(cuda_stream)
             audio_cpu = audio[slots].detach().to("cpu", torch.float32)
             lengths_cpu = audio_lengths[slots].detach().to("cpu")
+            if d2h_end_event is not None:
+                assert cuda_stream is not None
+                d2h_end_event.record(cuda_stream)
+                d2h_end_event.synchronize()
+            d2h_host_ms = (
+                (time.perf_counter_ns() - d2h_host_start_ns) / 1e6
+                if d2h_host_start_ns is not None
+                else None
+            )
             self._emit_step_event(slot_request_ids, "moss_streaming_d2h_end", metadata)
+            if (
+                metadata is not None
+                and decode_start_event is not None
+                and decode_end_event is not None
+                and d2h_start_event is not None
+                and d2h_end_event is not None
+            ):
+                self._emit_step_event(
+                    slot_request_ids,
+                    "moss_streaming_cuda_timing",
+                    {
+                        **metadata,
+                        "mode": "graph" if graphed is not None else "eager",
+                        "decode_gpu_ms": decode_start_event.elapsed_time(
+                            decode_end_event
+                        ),
+                        "d2h_gpu_ms": d2h_start_event.elapsed_time(d2h_end_event),
+                        "d2h_host_ms": d2h_host_ms,
+                    },
+                )
         except Exception:
             # Graphed step failed (in decode_step or async on the D2H): disable the runner so future
             # steps go eager; participants abort. An eager-path error does not disable it.
