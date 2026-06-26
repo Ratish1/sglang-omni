@@ -49,11 +49,6 @@ from sglang_omni.models.dots_tts._vendored.modules.speaker.encoder import (
 from sglang_omni.models.dots_tts._vendored.modules.vocoder.bigvgan import AudioVAE
 from sglang_omni.models.dots_tts._vendored.utils.audio import high_quality_resample
 from sglang_omni.models.dots_tts._vendored.utils.profiling import measure_inference
-from sglang_omni.models.dots_tts.text_preprocessing import (
-    attach_language_tag,
-    process_prompt_text,
-    process_text,
-)
 from sglang_omni.models.dots_tts._vendored.utils.tokenizer import (
     AUDIO_COMP_SPAN_TOKEN,
     AUDIO_GEN_SPAN_TOKEN,
@@ -71,6 +66,11 @@ from sglang_omni.models.dots_tts.serving_types import (
     DotsTTSPreparedInputs,
     as_tensor,
     torch_dtype,
+)
+from sglang_omni.models.dots_tts.text_preprocessing import (
+    attach_language_tag,
+    process_prompt_text,
+    process_text,
 )
 
 RUNTIME_TEMPLATE_BY_NAME = {

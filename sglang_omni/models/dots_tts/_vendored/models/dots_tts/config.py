@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from sglang_omni.models.dots_tts._vendored.config.base import ConfigBase, StrictConfigBase
+from sglang_omni.models.dots_tts._vendored.config.base import (
+    ConfigBase,
+    StrictConfigBase,
+)
 from sglang_omni.models.dots_tts._vendored.modules.vocoder.config import AudioVAEConfig
 
 
