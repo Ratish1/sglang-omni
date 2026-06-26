@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang_omni.models.dots_tts.native.utils.audio import (
+from sglang_omni.models.dots_tts._vendored.utils.audio import (
     extract_fbank,
     high_quality_resample,
 )

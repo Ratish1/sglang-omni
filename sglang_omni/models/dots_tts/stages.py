@@ -125,7 +125,7 @@ def _get_or_load_side_runtime(
         if cached is not None:
             return cached
         try:
-            from sglang_omni.models.dots_tts.native.side_runtime import (
+            from sglang_omni.models.dots_tts._vendored.side_runtime import (
                 DotsTtsSideRuntime,
             )
         except ImportError as exc:
@@ -154,7 +154,7 @@ def _get_or_load_vocoder_runtime(
         if cached is not None:
             return cached
         try:
-            from sglang_omni.models.dots_tts.native.vocoder_runtime import (
+            from sglang_omni.models.dots_tts._vendored.vocoder_runtime import (
                 DotsTTSNativeVocoderRuntime,
             )
         except ImportError as exc:

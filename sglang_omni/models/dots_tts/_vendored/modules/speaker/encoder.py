@@ -6,8 +6,8 @@ import torch.nn as nn
 import torchaudio
 from torch.nn.utils.rnn import pad_sequence
 
-from sglang_omni.models.dots_tts.native.modules.speaker.campplus import CAMPPlus
-from sglang_omni.models.dots_tts.native.modules.speaker.fbank import (
+from sglang_omni.models.dots_tts._vendored.modules.speaker.campplus import CAMPPlus
+from sglang_omni.models.dots_tts._vendored.modules.speaker.fbank import (
     _SPEAKER_FBANK_N_MELS,
     _SPEAKER_FBANK_SAMPLE_RATE,
     extract_speaker_fbank,

@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang_omni.models.dots_tts.native.modules.speaker.campplus_layers import (
+from sglang_omni.models.dots_tts._vendored.modules.speaker.campplus_layers import (
     BasicResBlock,
     CAMDenseTDNNBlock,
     DenseLayer,
@@ -16,7 +16,7 @@ from sglang_omni.models.dots_tts.native.modules.speaker.campplus_layers import (
     TransitLayer,
     get_nonlinear,
 )
-from sglang_omni.models.dots_tts.native.modules.speaker.fbank import (
+from sglang_omni.models.dots_tts._vendored.modules.speaker.fbank import (
     _SPEAKER_FBANK_N_MELS,
 )
 

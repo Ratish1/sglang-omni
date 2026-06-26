@@ -12,16 +12,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import remove_weight_norm, weight_norm
 
-from sglang_omni.models.dots_tts.native.modules.backbone.layers import (
+from sglang_omni.models.dots_tts._vendored.modules.backbone.layers import (
     Conv1d,
     ConvTranspose1d,
 )
-from sglang_omni.models.dots_tts.native.modules.vocoder.alias_free_act import (
+from sglang_omni.models.dots_tts._vendored.modules.vocoder.alias_free_act import (
     Activation1d,
     Snake,
     SnakeBeta,
 )
-from sglang_omni.models.dots_tts.native.modules.vocoder.config import AudioVAEConfig
+from sglang_omni.models.dots_tts._vendored.modules.vocoder.config import AudioVAEConfig
 
 
 @dataclass(slots=True)

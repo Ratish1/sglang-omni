@@ -10,18 +10,18 @@ from torch.nn.utils.rnn import pad_sequence
 from torchdiffeq import odeint
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
-from sglang_omni.models.dots_tts.native.models.dots_tts.config import ModelConfig
-from sglang_omni.models.dots_tts.native.modules.backbone.dit import DiT
-from sglang_omni.models.dots_tts.native.modules.backbone.semantic_encoder import (
+from sglang_omni.models.dots_tts._vendored.models.dots_tts.config import ModelConfig
+from sglang_omni.models.dots_tts._vendored.modules.backbone.dit import DiT
+from sglang_omni.models.dots_tts._vendored.modules.backbone.semantic_encoder import (
     VAESemanticEncoder,
 )
-from sglang_omni.models.dots_tts.native.utils.tokenizer import (
+from sglang_omni.models.dots_tts._vendored.utils.tokenizer import (
     AUDIO_COMP_SPAN_TOKEN,
     AUDIO_GEN_SPAN_TOKEN,
     TEXT_COND_END_TOKEN,
     require_token_id,
 )
-from sglang_omni.models.dots_tts.native.utils.util import (
+from sglang_omni.models.dots_tts._vendored.utils.util import (
     get_mask_from_lengths,
     mask_data,
 )

@@ -10,8 +10,8 @@ from typing import Any
 import torch
 from safetensors.torch import load_file
 
-from sglang_omni.models.dots_tts.native.models.dots_tts.config import ModelConfig
-from sglang_omni.models.dots_tts.native.modules.vocoder.bigvgan import AudioVAE
+from sglang_omni.models.dots_tts._vendored.models.dots_tts.config import ModelConfig
+from sglang_omni.models.dots_tts._vendored.modules.vocoder.bigvgan import AudioVAE
 
 
 class DotsTTSNativeVocoderModel:

@@ -19,49 +19,49 @@ from safetensors.torch import load_file
 from torch import nn
 from transformers import AutoTokenizer, Qwen2Config
 
-from sglang_omni.models.dots_tts.native.data.pipelines.templates import (
+from sglang_omni.models.dots_tts._vendored.data.pipelines.templates import (
     DEFAULT_INSTRUCTION_TTS_TEMPLATE,
     DEFAULT_INTERLEAVE_TTS_TEMPLATE,
     DEFAULT_TEXT_TO_AUDIO_TEMPLATE,
     DEFAULT_TTS_TEMPLATE,
 )
-from sglang_omni.models.dots_tts.native.data.pipelines.tokenizing import (
+from sglang_omni.models.dots_tts._vendored.data.pipelines.tokenizing import (
     build_generation_schedule,
 )
-from sglang_omni.models.dots_tts.native.models.dots_tts.config import ModelConfig
-from sglang_omni.models.dots_tts.native.models.dots_tts.core import (
+from sglang_omni.models.dots_tts._vendored.models.dots_tts.config import ModelConfig
+from sglang_omni.models.dots_tts._vendored.models.dots_tts.core import (
     CausalHelper,
     DotsTtsCore,
     FlowMatchingHelper,
     IOHelper,
 )
-from sglang_omni.models.dots_tts.native.models.dots_tts.model import (
+from sglang_omni.models.dots_tts._vendored.models.dots_tts.model import (
     DotsTtsModel,
     _PromptFeatureCacheEntry,
 )
-from sglang_omni.models.dots_tts.native.modules.backbone.dit import DiT
-from sglang_omni.models.dots_tts.native.modules.backbone.semantic_encoder import (
+from sglang_omni.models.dots_tts._vendored.modules.backbone.dit import DiT
+from sglang_omni.models.dots_tts._vendored.modules.backbone.semantic_encoder import (
     VAESemanticEncoder,
 )
-from sglang_omni.models.dots_tts.native.modules.speaker.encoder import (
+from sglang_omni.models.dots_tts._vendored.modules.speaker.encoder import (
     SpeakerXVectorFeatures,
 )
-from sglang_omni.models.dots_tts.native.modules.vocoder.bigvgan import AudioVAE
-from sglang_omni.models.dots_tts.native.utils.audio import high_quality_resample
-from sglang_omni.models.dots_tts.native.utils.profiling import measure_inference
+from sglang_omni.models.dots_tts._vendored.modules.vocoder.bigvgan import AudioVAE
+from sglang_omni.models.dots_tts._vendored.utils.audio import high_quality_resample
+from sglang_omni.models.dots_tts._vendored.utils.profiling import measure_inference
 from sglang_omni.models.dots_tts.text_preprocessing import (
     attach_language_tag,
     process_prompt_text,
     process_text,
 )
-from sglang_omni.models.dots_tts.native.utils.tokenizer import (
+from sglang_omni.models.dots_tts._vendored.utils.tokenizer import (
     AUDIO_COMP_SPAN_TOKEN,
     AUDIO_GEN_SPAN_TOKEN,
     AUDIO_GEN_START_TOKEN,
     TEXT_COND_END_TOKEN,
     require_token_id,
 )
-from sglang_omni.models.dots_tts.native.utils.util import get_dtype
+from sglang_omni.models.dots_tts._vendored.utils.util import get_dtype
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 from sglang_omni.models.dots_tts.serving_types import (
     DotsTTSAudioStepResult,

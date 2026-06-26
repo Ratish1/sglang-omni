@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import Field
 
-from sglang_omni.models.dots_tts.native.config.base import ConfigBase
+from sglang_omni.models.dots_tts._vendored.config.base import ConfigBase
 
 
 class AudioVAEConfig(ConfigBase):

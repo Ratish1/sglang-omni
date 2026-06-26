@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from sglang_omni.models.dots_tts.native.config.base import ConfigBase, StrictConfigBase
-from sglang_omni.models.dots_tts.native.modules.vocoder.config import AudioVAEConfig
+from sglang_omni.models.dots_tts._vendored.config.base import ConfigBase, StrictConfigBase
+from sglang_omni.models.dots_tts._vendored.modules.vocoder.config import AudioVAEConfig
 
 
 class _EncoderConfig(ConfigBase):

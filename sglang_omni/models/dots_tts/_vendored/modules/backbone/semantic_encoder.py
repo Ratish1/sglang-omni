@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang_omni.models.dots_tts.native.modules.backbone.layers import (
+from sglang_omni.models.dots_tts._vendored.modules.backbone.layers import (
     Conv1d,
     Mlp,
     MultiHeadAttention,

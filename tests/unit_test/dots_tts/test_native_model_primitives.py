@@ -10,8 +10,8 @@ from torch import nn
 
 pytest.importorskip("torchdiffeq")
 
-from sglang_omni.models.dots_tts.native.models.dots_tts.model import DotsTtsModel
-from sglang_omni.models.dots_tts.native.side_runtime import DotsTtsSideModel
+from sglang_omni.models.dots_tts._vendored.models.dots_tts.model import DotsTtsModel
+from sglang_omni.models.dots_tts._vendored.side_runtime import DotsTtsSideModel
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 from sglang_omni.models.dots_tts.serving_types import DotsTTSFlowBatchItem
 

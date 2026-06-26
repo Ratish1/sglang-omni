@@ -22,7 +22,7 @@ except ImportError:
     Qwen2ForCausalLM = None
 
 if TYPE_CHECKING:
-    from sglang_omni.models.dots_tts.native.models.dots_tts.model import DotsTtsModel
+    from sglang_omni.models.dots_tts._vendored.models.dots_tts.model import DotsTtsModel
 
 
 @dataclass

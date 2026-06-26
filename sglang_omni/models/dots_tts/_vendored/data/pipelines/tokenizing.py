@@ -6,7 +6,7 @@ from typing import Any
 
 from loguru import logger
 
-from sglang_omni.models.dots_tts.native.utils.tokenizer import (
+from sglang_omni.models.dots_tts._vendored.utils.tokenizer import (
     AUDIO_GEN_SPAN_TOKEN,
     AUDIO_GEN_START_TOKEN,
     TEXT_COND_END_TOKEN,

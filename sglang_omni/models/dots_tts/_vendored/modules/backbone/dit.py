@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
-from sglang_omni.models.dots_tts.native.modules.backbone.layers import (
+from sglang_omni.models.dots_tts._vendored.modules.backbone.layers import (
     Mlp,
     MultiHeadAttention,
 )

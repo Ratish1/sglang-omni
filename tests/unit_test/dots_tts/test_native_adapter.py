@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang_omni.models.dots_tts.native.side_runtime import DotsTtsSideModel
+from sglang_omni.models.dots_tts._vendored.side_runtime import DotsTtsSideModel
 from sglang_omni.models.dots_tts.native_adapter import DotsTTSNativeAdapter
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 

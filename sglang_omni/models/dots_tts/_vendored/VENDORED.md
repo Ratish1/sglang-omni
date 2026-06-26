@@ -1,6 +1,6 @@
 # Vendored dots TTS
 
-This directory contains the dots TTS inference components used by the native
+This directory contains the vendored dots TTS model components used by the
 sglang-omni dots pipeline.
 
 ## Source
@@ -46,19 +46,21 @@ this tree, under the package root:
 
 - `../text_preprocessing.py` — text normalization (WeTextProcessing), language
   detection (lingua), and language-code resolution (langcodes). Previously sat
-  at `utils/text.py`; moved out so `native/` only holds dots model internals.
+  at `utils/text.py`; moved out so this tree only holds dots model internals.
 
 ## Removed Upstream Runtime
 
 `models/dots_tts/model.py` does not expose the upstream full-runtime request loop.
-The native Omni pipeline owns scheduling, latent streaming, and vocoder staging.
-The following upstream surfaces are intentionally removed:
+The Omni pipeline owns scheduling, latent streaming, and vocoder staging. The
+following upstream surfaces are intentionally removed:
 
 - `generate_audio`
 - `generate_audio_stream`
 - `_generate_latents_stream`
 - upstream top-level prefill/decode loops
+- upstream checkpoint authoring/IO (`from_pretrained`, `save_pretrained`,
+  `load_pretrained_weights`, and the artifact state-dict helpers); the serving
+  load path lives in `DotsTtsSideModel.from_pretrained`
 
-The vendored model still keeps checkpoint/model assembly helpers and the prompt
-conditioning, FM state, DiT/flow, and patch-encoder primitives used by
-`DotsTtsSideModel`.
+The vendored model keeps the prompt conditioning, FM state, DiT/flow, and
+patch-encoder primitives used by `DotsTtsSideModel`.
