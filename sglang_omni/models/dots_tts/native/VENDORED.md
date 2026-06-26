@@ -34,12 +34,19 @@ Mostly upstream inference components:
 - `modules/speaker/*`
 - `modules/vocoder/*`
 - `data/pipelines/*`
-- `utils/*`
+- `utils/*` (audio resample, tokenizer ids, profiling helpers)
 
 sglang-omni integration layers:
 
 - `side_runtime.py`
 - `vocoder_runtime.py`
+
+Generic preprocessing that is **not** vendored dots model math lives outside
+this tree, under the package root:
+
+- `../text_preprocessing.py` — text normalization (WeTextProcessing), language
+  detection (lingua), and language-code resolution (langcodes). Previously sat
+  at `utils/text.py`; moved out so `native/` only holds dots model internals.
 
 ## Removed Upstream Runtime
 

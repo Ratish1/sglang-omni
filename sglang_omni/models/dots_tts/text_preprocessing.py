@@ -1,3 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Generic text/language preprocessing for dots TTS.
+
+This module is sglang-omni integration code, not vendored dots model math. It
+wraps third-party text normalization (WeTextProcessing), language detection
+(lingua), and language-code resolution (langcodes). It deliberately lives
+outside ``native/`` so the vendored tree only holds dots model internals
+(DiT/flow, vocoder, speaker, FM state).
+"""
+
 from __future__ import annotations
 
 import re
@@ -149,3 +159,49 @@ def normalize_text(text: str) -> str:
     if language == "en":
         return _normalize_with(get_english_text_normalizer(), stripped)
     return stripped
+
+
+def resolve_language(language: str | None, *, text: str) -> str | None:
+    if language is None:
+        return None
+    stripped = language.strip()
+    if not stripped or stripped.lower() == "none":
+        return None
+    if stripped.lower() == "auto_detect":
+        return normalize_language_code(detect(text))
+    normalized_language = normalize_language_code(stripped)
+    if normalized_language is None:
+        raise ValueError(
+            f"Unsupported language={language!r}. "
+            "Expected 'none', 'auto_detect', or a valid language code/name."
+        )
+    return normalized_language
+
+
+def process_prompt_text(
+    prompt_text: str | None,
+    *,
+    language: str | None = None,
+) -> str:
+    if prompt_text is None:
+        return ""
+    prompt_text = prompt_text.strip()
+    if not prompt_text:
+        return ""
+    prompt_text += "\n"
+    if language is not None:
+        prompt_text = attach_language_tag(prompt_text, language)
+    return prompt_text
+
+
+def process_text(
+    text: str,
+    *,
+    language: str | None = None,
+    normalize: bool = False,
+) -> tuple[str, str | None]:
+    stripped = text.strip()
+    if normalize:
+        stripped = normalize_text(stripped)
+    resolved_language = resolve_language(language, text=stripped)
+    return stripped, resolved_language

@@ -49,11 +49,10 @@ from sglang_omni.models.dots_tts.native.modules.speaker.encoder import (
 from sglang_omni.models.dots_tts.native.modules.vocoder.bigvgan import AudioVAE
 from sglang_omni.models.dots_tts.native.utils.audio import high_quality_resample
 from sglang_omni.models.dots_tts.native.utils.profiling import measure_inference
-from sglang_omni.models.dots_tts.native.utils.text import (
+from sglang_omni.models.dots_tts.text_preprocessing import (
     attach_language_tag,
-    detect,
-    normalize_language_code,
-    normalize_text,
+    process_prompt_text,
+    process_text,
 )
 from sglang_omni.models.dots_tts.native.utils.tokenizer import (
     AUDIO_COMP_SPAN_TOKEN,
@@ -955,51 +954,6 @@ class DotsTtsSideRuntime:
             prompt_audio = prompt_audio.unsqueeze(0)
         return prompt_audio
 
-    def _resolve_language(self, language: str | None, *, text: str) -> str | None:
-        if language is None:
-            return None
-        stripped = language.strip()
-        if not stripped or stripped.lower() == "none":
-            return None
-        if stripped.lower() == "auto_detect":
-            return normalize_language_code(detect(text))
-        normalized_language = normalize_language_code(stripped)
-        if normalized_language is None:
-            raise ValueError(
-                f"Unsupported language={language!r}. "
-                "Expected 'none', 'auto_detect', or a valid language code/name."
-            )
-        return normalized_language
-
-    def _process_prompt_text(
-        self,
-        prompt_text: str | None,
-        *,
-        language: str | None = None,
-    ) -> str:
-        if prompt_text is None:
-            return ""
-        prompt_text = prompt_text.strip()
-        if not prompt_text:
-            return ""
-        prompt_text += "\n"
-        if language is not None:
-            prompt_text = attach_language_tag(prompt_text, language)
-        return prompt_text
-
-    def _process_text(
-        self,
-        text: str,
-        *,
-        language: str | None = None,
-        normalize: bool = False,
-    ) -> tuple[str, str | None]:
-        stripped = text.strip()
-        if normalize:
-            stripped = normalize_text(stripped)
-        resolved_language = self._resolve_language(language, text=stripped)
-        return stripped, resolved_language
-
     def _estimate_prompt_audio_patch_count(
         self,
         *,
@@ -1036,12 +990,12 @@ class DotsTtsSideRuntime:
         template = RUNTIME_TEMPLATE_BY_NAME[normalized_template_name]
         if prompt_text and not prompt_audio_path:
             raise ValueError("prompt_text requires prompt_audio_path.")
-        normalized_text, normalized_language = self._process_text(
+        normalized_text, normalized_language = process_text(
             text,
             language=language,
             normalize=normalize_text,
         )
-        normalized_prompt_text = self._process_prompt_text(
+        normalized_prompt_text = process_prompt_text(
             prompt_text,
             language=normalized_language,
         )
