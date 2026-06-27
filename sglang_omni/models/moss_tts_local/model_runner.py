@@ -14,10 +14,14 @@ from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 from sglang_omni.models.moss_tts_local.radix_hash import gpu_radix_row_hash
 from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.types import RequestOutput
 
 logger = logging.getLogger(__name__)
+_REQUEST_RECORDER = _get_event_recorder()
+_AR_PROFILE_REQUEST_ID = "__moss_ar_frame_decode__"
 
 
 class MossTTSLocalModelRunner(ModelRunner):
@@ -55,6 +59,17 @@ class MossTTSLocalModelRunner(ModelRunner):
             100.0 * graph / total,
             dict(sorted(self._frame_decode_graph_bs.items())),
             dict(sorted(self._frame_decode_eager_bs.items())),
+        )
+
+    @staticmethod
+    def _emit_ar_event(event_name: str, metadata: dict[str, Any] | None = None) -> None:
+        if not _REQUEST_RECORDER.is_active():
+            return
+        _emit_event(
+            request_id=_AR_PROFILE_REQUEST_ID,
+            stage=None,
+            event_name=event_name,
+            metadata=metadata,
         )
 
     def set_stream_outbox(self, outbox: Any) -> None:
@@ -360,6 +375,15 @@ class MossTTSLocalModelRunner(ModelRunner):
         use_graph = (
             not has_audio_repetition_penalty and batch_size <= frame_graph_max_bs
         )
+        profile_metadata = None
+        if _REQUEST_RECORDER.is_active():
+            profile_metadata = {
+                "batch_size": int(batch_size),
+                "frame_graph_max_bs": int(frame_graph_max_bs),
+                "has_audio_repetition_penalty": bool(has_audio_repetition_penalty),
+                "mode": "graph" if use_graph else "eager",
+            }
+        self._emit_ar_event("moss_ar_frame_decode_start", profile_metadata)
         if use_graph:
             with record_function("moss_ar_frame_decode_graph"):
                 stop_choice, codes, feedback = self.model.decode_frame_graphed(
@@ -387,6 +411,7 @@ class MossTTSLocalModelRunner(ModelRunner):
                 )
                 embeds = None
             self._frame_decode_eager_bs[batch_size] += 1
+        self._emit_ar_event("moss_ar_frame_decode_end", profile_metadata)
         self._frame_decode_steps += 1
         if self._frame_decode_steps % 2000 == 0:
             self._log_frame_decode_stats()
@@ -412,6 +437,7 @@ class MossTTSLocalModelRunner(ModelRunner):
                 )
         emit_indices = sorted(emit_set)
         if emit_indices:
+            self._emit_ar_event("moss_ar_pool_write_start", profile_metadata)
             with record_function("moss_ar_pool_write"):
                 emit_index_t = torch.tensor(
                     emit_indices, dtype=torch.long, device=rows.device
@@ -454,6 +480,7 @@ class MossTTSLocalModelRunner(ModelRunner):
                     pool_rows=emit_pool_rows,
                     rows=emit_rows,
                 )
+                self._emit_ar_event("moss_ar_pool_write_end", profile_metadata)
         # Always return rows so both the sync inline path and the async launch
         # publish next_token_ids; an all-chunked batch just attaches no journal.
         return rows, end_id

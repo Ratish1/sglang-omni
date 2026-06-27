@@ -156,15 +156,18 @@ class StartReq(BaseModel):
     config: dict[str, Any] | None = None
     event_dir: str | None = None
     enable_torch: bool = True
+    stages: list[str] | None = None
 
 
 class StopReq(BaseModel):
     run_id: str | None = None
+    stages: list[str] | None = None
 
 
 class StartRequestProfileReq(BaseModel):
     run_id: str | None = None
     event_dir: str | None = None
+    stages: list[str] | None = None
 
 
 def _default_event_dir(profiler_dir: str, run_id: str) -> str:
@@ -219,6 +222,7 @@ def _mount_profiler_routes(
             run_id=run_id,
             trace_path_template=tpl,
             config=req.config,
+            stages=req.stages,
             event_dir=event_dir,
             enable_torch=req.enable_torch,
         )
@@ -227,6 +231,7 @@ def _mount_profiler_routes(
             "trace_path_template": tpl,
             "event_dir": event_dir,
             "enable_torch": req.enable_torch,
+            "stages": req.stages,
         }
 
     @router.post("/start_request_profile")
@@ -257,9 +262,10 @@ def _mount_profiler_routes(
             run_id=run_id,
             trace_path_template="",
             event_dir=event_dir,
+            stages=req.stages,
             enable_torch=False,
         )
-        return {"run_id": run_id, "event_dir": event_dir}
+        return {"run_id": run_id, "event_dir": event_dir, "stages": req.stages}
 
     @router.post("/stop_profile")
     async def stop(req: StopReq):
@@ -269,7 +275,7 @@ def _mount_profiler_routes(
         active = recorder.active_run_id() if recorder.is_active() else None
         if recorder.is_active() and (run_id is None or active == run_id):
             recorder.stop(run_id=active)
-        await profiler_ctl.broadcast_stop(run_id=run_id)
+        await profiler_ctl.broadcast_stop(run_id=run_id, stages=req.stages)
         return {"run_id": run_id or active}
 
     @router.post("/stop_request_profile")
@@ -280,7 +286,7 @@ def _mount_profiler_routes(
         active = recorder.active_run_id() if recorder.is_active() else None
         if recorder.is_active() and (run_id is None or active == run_id):
             recorder.stop(run_id=active)
-        await profiler_ctl.broadcast_stop(run_id=run_id)
+        await profiler_ctl.broadcast_stop(run_id=run_id, stages=req.stages)
         return {"run_id": run_id or active}
 
     app.include_router(router)
