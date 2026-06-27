@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import logging
+from collections import Counter
 from typing import Any
 
 import torch
+from torch.profiler import record_function
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
@@ -13,6 +16,8 @@ from sglang_omni.models.moss_tts_local.radix_hash import gpu_radix_row_hash
 from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.types import RequestOutput
+
+logger = logging.getLogger(__name__)
 
 
 class MossTTSLocalModelRunner(ModelRunner):
@@ -33,6 +38,24 @@ class MossTTSLocalModelRunner(ModelRunner):
         super().__init__(tp_worker, output_processor)
         self._outbox: Any | None = None
         self._vocoder_target = "vocoder"
+        self._frame_decode_graph_bs: Counter = Counter()
+        self._frame_decode_eager_bs: Counter = Counter()
+        self._frame_decode_steps = 0
+
+    def _log_frame_decode_stats(self) -> None:
+        graph = sum(self._frame_decode_graph_bs.values())
+        eager = sum(self._frame_decode_eager_bs.values())
+        total = graph + eager
+        if not total:
+            return
+        logger.info(
+            "MOSS-TTS Local frame-decode graph stats: %d/%d steps graphed (%.1f%%); graph bs=%s eager bs=%s",
+            graph,
+            total,
+            100.0 * graph / total,
+            dict(sorted(self._frame_decode_graph_bs.items())),
+            dict(sorted(self._frame_decode_eager_bs.items())),
+        )
 
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
@@ -216,12 +239,14 @@ class MossTTSLocalModelRunner(ModelRunner):
     ) -> None:
         if not requests:
             return
-        rows, end_id = self._run_frame_decode(result, forward_batch, requests)
-        # Radix key is a capture-safe GPU hash: a device op, no host sync.
-        next_text = rows[:, 0]
-        next_token_ids = self._row_radix_token_ids(rows, next_text, end_id)
-        result.next_token_ids = next_token_ids
-        schedule_batch.output_ids = next_token_ids
+        with record_function("moss_ar_collect_frame"):
+            rows, end_id = self._run_frame_decode(result, forward_batch, requests)
+            # Radix key is a capture-safe GPU hash: a device op, no host sync.
+            next_text = rows[:, 0]
+            with record_function("moss_ar_radix_hash"):
+                next_token_ids = self._row_radix_token_ids(rows, next_text, end_id)
+            result.next_token_ids = next_token_ids
+            schedule_batch.output_ids = next_token_ids
 
     def _run_frame_decode(self, result: Any, forward_batch: Any, requests: list):
         """GPU half shared by sync ``_collect_frame`` and async
@@ -264,22 +289,23 @@ class MossTTSLocalModelRunner(ModelRunner):
                 has_audio_repetition_penalty = pool.rows_have_audio_repetition_penalty(
                     pool_rows
                 )
-        params = {
-            "text_temp": pool.text_temp[row_t],
-            "text_top_p": pool.text_top_p[row_t],
-            "text_top_k": pool.text_top_k[row_t],
-            "audio_temp": pool.audio_temp[row_t],
-            "audio_top_p": pool.audio_top_p[row_t],
-            "audio_top_k": pool.audio_top_k[row_t],
-            "seeds": pool.seeds[row_t],
-        }
-        text_temp = params["text_temp"]
-        text_top_p = params["text_top_p"]
-        text_top_k = params["text_top_k"]
-        audio_temp = params["audio_temp"]
-        audio_top_p = params["audio_top_p"]
-        audio_top_k = params["audio_top_k"]
-        sampling_seeds = params["seeds"]
+        with record_function("moss_ar_gather_sampling_params"):
+            params = {
+                "text_temp": pool.text_temp[row_t],
+                "text_top_p": pool.text_top_p[row_t],
+                "text_top_k": pool.text_top_k[row_t],
+                "audio_temp": pool.audio_temp[row_t],
+                "audio_top_p": pool.audio_top_p[row_t],
+                "audio_top_k": pool.audio_top_k[row_t],
+                "seeds": pool.seeds[row_t],
+            }
+            text_temp = params["text_temp"]
+            text_top_p = params["text_top_p"]
+            text_top_k = params["text_top_k"]
+            audio_temp = params["audio_temp"]
+            audio_top_p = params["audio_top_p"]
+            audio_top_k = params["audio_top_k"]
+            sampling_seeds = params["seeds"]
         # Advance the launch-side counter only for emitted rows; non-final
         # chunked rows take a read-only position so a mid-prefill chunk's frame
         # cannot shift the final chunk's sampling position off the no-chunk path.
@@ -335,84 +361,99 @@ class MossTTSLocalModelRunner(ModelRunner):
             not has_audio_repetition_penalty and batch_size <= frame_graph_max_bs
         )
         if use_graph:
-            stop_choice, codes, feedback = self.model.decode_frame_graphed(
-                hidden_states,
-                text_temperature=text_temp,
-                text_top_p=text_top_p,
-                text_top_k=text_top_k,
-                audio_temperature=audio_temp,
-                audio_top_p=audio_top_p,
-                audio_top_k=audio_top_k,
-                seeds=sampling_seeds,
-                base_positions=gen_steps * num_channels,
-            )
-            # The graph outputs are static buffers that the next replay (any
-            # later prefill or decode step) overwrites; snapshot what we keep.
-            codes = codes.clone()
-            embeds = feedback.clone()
+            with record_function("moss_ar_frame_decode_graph"):
+                stop_choice, codes, feedback = self.model.decode_frame_graphed(
+                    hidden_states,
+                    text_temperature=text_temp,
+                    text_top_p=text_top_p,
+                    text_top_k=text_top_k,
+                    audio_temperature=audio_temp,
+                    audio_top_p=audio_top_p,
+                    audio_top_k=audio_top_k,
+                    seeds=sampling_seeds,
+                    base_positions=gen_steps * num_channels,
+                )
+                # The graph outputs are static buffers that the next replay (any
+                # later prefill or decode step) overwrites; snapshot what we keep.
+                codes = codes.clone()
+                embeds = feedback.clone()
+            self._frame_decode_graph_bs[batch_size] += 1
         else:
-            stop_choice, codes = self.model.decode_frame(
-                hidden_states,
-                sample_text=sample_text,
-                sample_audio=sample_audio,
-            )
-            embeds = None
+            with record_function("moss_ar_frame_decode_eager"):
+                stop_choice, codes = self.model.decode_frame(
+                    hidden_states,
+                    sample_text=sample_text,
+                    sample_audio=sample_audio,
+                )
+                embeds = None
+            self._frame_decode_eager_bs[batch_size] += 1
+        self._frame_decode_steps += 1
+        if self._frame_decode_steps % 2000 == 0:
+            self._log_frame_decode_stats()
 
         slot_id = int(cfg.audio_assistant_slot_token_id)
         end_id = int(cfg.audio_end_token_id)
-        next_text = torch.where(
-            stop_choice == 0,
-            torch.full((batch_size,), slot_id, dtype=torch.long, device=device),
-            torch.full((batch_size,), end_id, dtype=torch.long, device=device),
-        )
-
-        rows = torch.empty((batch_size, num_channels), dtype=torch.long, device=device)
-        rows[:, 0] = next_text
-        rows[:, 1:] = codes
+        with record_function("moss_ar_build_rows"):
+            next_text = torch.where(
+                stop_choice == 0,
+                torch.full((batch_size,), slot_id, dtype=torch.long, device=device),
+                torch.full((batch_size,), end_id, dtype=torch.long, device=device),
+            )
+            rows = torch.empty(
+                (batch_size, num_channels), dtype=torch.long, device=device
+            )
+            rows[:, 0] = next_text
+            rows[:, 1:] = codes
 
         if embeds is None:
-            embeds = self.model._prepare_multi_modal_inputs(
-                rows.to(device=self.model.device)
-            )
+            with record_function("moss_ar_prepare_feedback_embeds"):
+                embeds = self.model._prepare_multi_modal_inputs(
+                    rows.to(device=self.model.device)
+                )
         emit_indices = sorted(emit_set)
         if emit_indices:
-            emit_index_t = torch.tensor(
-                emit_indices, dtype=torch.long, device=rows.device
-            )
-            emit_pool_rows = [pool_rows[i] for i in emit_indices]
-            emit_row_t = row_t[emit_index_t.to(device=row_t.device)]
-            emit_rows = rows.index_select(0, emit_index_t)
-            emit_steps = gen_steps.index_select(
-                0, emit_index_t.to(device=gen_steps.device)
-            )
-            pool.sampling_steps[emit_row_t] = (emit_steps + 1).to(
-                device=pool.sampling_steps.device, dtype=torch.int64
-            )
-            if has_audio_repetition_penalty:
-                keep_history = (
-                    next_text.index_select(0, emit_index_t.to(device=next_text.device))
-                    != end_id
+            with record_function("moss_ar_pool_write"):
+                emit_index_t = torch.tensor(
+                    emit_indices, dtype=torch.long, device=rows.device
                 )
-                emit_penalty_active = (
-                    pool.audio_repetition_penalty[emit_row_t]
-                    .to(device=keep_history.device)
-                    .ne(1.0)
+                emit_pool_rows = [pool_rows[i] for i in emit_indices]
+                emit_row_t = row_t[emit_index_t.to(device=row_t.device)]
+                emit_rows = rows.index_select(0, emit_index_t)
+                emit_steps = gen_steps.index_select(
+                    0, emit_index_t.to(device=gen_steps.device)
                 )
-                keep_history = keep_history & emit_penalty_active
-                pool.update_audio_history(
-                    emit_row_t[keep_history.to(device=emit_row_t.device)],
-                    emit_rows[keep_history.to(device=emit_rows.device)],
+                pool.sampling_steps[emit_row_t] = (emit_steps + 1).to(
+                    device=pool.sampling_steps.device, dtype=torch.int64
                 )
-            emit_embeds = embeds.index_select(0, emit_index_t.to(device=embeds.device))
-            pool.feedback_embeds[emit_row_t] = emit_embeds.detach().to(
-                device=pool.feedback_embeds.device,
-                dtype=pool.feedback_embeds.dtype,
-            )
-            result.moss_journal = MossTTSLocalDecodeJournal(
-                rids=[requests[i].request_id for i in emit_indices],
-                pool_rows=emit_pool_rows,
-                rows=emit_rows,
-            )
+                if has_audio_repetition_penalty:
+                    keep_history = (
+                        next_text.index_select(
+                            0, emit_index_t.to(device=next_text.device)
+                        )
+                        != end_id
+                    )
+                    emit_penalty_active = (
+                        pool.audio_repetition_penalty[emit_row_t]
+                        .to(device=keep_history.device)
+                        .ne(1.0)
+                    )
+                    keep_history = keep_history & emit_penalty_active
+                    pool.update_audio_history(
+                        emit_row_t[keep_history.to(device=emit_row_t.device)],
+                        emit_rows[keep_history.to(device=emit_rows.device)],
+                    )
+                emit_embeds = embeds.index_select(
+                    0, emit_index_t.to(device=embeds.device)
+                )
+                pool.feedback_embeds[emit_row_t] = emit_embeds.detach().to(
+                    device=pool.feedback_embeds.device,
+                    dtype=pool.feedback_embeds.dtype,
+                )
+                result.moss_journal = MossTTSLocalDecodeJournal(
+                    rids=[requests[i].request_id for i in emit_indices],
+                    pool_rows=emit_pool_rows,
+                    rows=emit_rows,
+                )
         # Always return rows so both the sync inline path and the async launch
         # publish next_token_ids; an all-chunked batch just attaches no journal.
         return rows, end_id
@@ -428,10 +469,12 @@ class MossTTSLocalModelRunner(ModelRunner):
         """
         if not requests:
             return None
-        rows, end_id = self._run_frame_decode(result, forward_batch, requests)
-        next_token_ids = self._row_radix_token_ids(rows, rows[:, 0], end_id)
-        result.next_token_ids = next_token_ids
-        return next_token_ids.clone()
+        with record_function("moss_ar_post_decode_launch"):
+            rows, end_id = self._run_frame_decode(result, forward_batch, requests)
+            with record_function("moss_ar_radix_hash"):
+                next_token_ids = self._row_radix_token_ids(rows, rows[:, 0], end_id)
+            result.next_token_ids = next_token_ids
+            return next_token_ids.clone()
 
     def post_decode_resolve(
         self,
@@ -447,8 +490,9 @@ class MossTTSLocalModelRunner(ModelRunner):
         tensor before this lagged resolve.
         """
         del forward_batch, schedule_batch, requests
-        if launch_buf is not None and result is not None:
-            result.next_token_ids = launch_buf
+        with record_function("moss_ar_post_decode_resolve"):
+            if launch_buf is not None and result is not None:
+                result.next_token_ids = launch_buf
 
     @staticmethod
     def _row_radix_token_ids(

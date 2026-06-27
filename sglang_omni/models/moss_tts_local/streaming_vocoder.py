@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import torch
+from torch.profiler import record_function
 
 from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
 from sglang_omni.models.moss_tts_local.vocoder_decoder import MossTTSLocalVocoderDecoder
@@ -254,16 +255,17 @@ class _CodecStreamSession:
         self._emit_step_event(
             slot_request_ids, "moss_streaming_step_prepare_start", metadata
         )
-        codes_step = self._codes_step[:, :, :step_t]
-        codes_lengths = self._codes_lengths
-        exec_mask = self._exec_mask
-        codes_step.zero_()
-        codes_lengths.zero_()
-        exec_mask.zero_()
-        for slot, codes in slot_codes.items():
-            codes_step[:, slot, :] = codes.to(device=self._device, dtype=torch.long)
-            codes_lengths[slot] = step_t
-            exec_mask[slot] = True
+        with record_function("moss_streaming_step_prepare"):
+            codes_step = self._codes_step[:, :, :step_t]
+            codes_lengths = self._codes_lengths
+            exec_mask = self._exec_mask
+            codes_step.zero_()
+            codes_lengths.zero_()
+            exec_mask.zero_()
+            for slot, codes in slot_codes.items():
+                codes_step[:, slot, :] = codes.to(device=self._device, dtype=torch.long)
+                codes_lengths[slot] = step_t
+                exec_mask[slot] = True
         self._emit_step_event(
             slot_request_ids, "moss_streaming_step_prepare_end", metadata
         )
@@ -293,15 +295,17 @@ class _CodecStreamSession:
             with torch.no_grad():
                 if self._cg_runner is not None:
                     try:
-                        graphed = self._cg_runner.decode_step(codes_step, exec_mask)
+                        with record_function("moss_streaming_graph_decode"):
+                            graphed = self._cg_runner.decode_step(codes_step, exec_mask)
                     except Exception:
                         graph_failed = True
                         raise
                 if graphed is not None:
                     audio, audio_lengths = graphed
                 else:
-                    self._codec._set_streaming_exec_mask(exec_mask)
-                    result = self._codec._decode_frame(codes_step, codes_lengths)
+                    with record_function("moss_streaming_eager_decode"):
+                        self._codec._set_streaming_exec_mask(exec_mask)
+                        result = self._codec._decode_frame(codes_step, codes_lengths)
                     audio, audio_lengths = result.audio, result.audio_lengths
             if decode_end_event is not None:
                 assert cuda_stream is not None
@@ -324,8 +328,9 @@ class _CodecStreamSession:
             if d2h_start_event is not None:
                 assert cuda_stream is not None
                 d2h_start_event.record(cuda_stream)
-            audio_cpu = audio[slots].detach().to("cpu", torch.float32)
-            lengths_cpu = audio_lengths[slots].detach().to("cpu")
+            with record_function("moss_streaming_output_d2h"):
+                audio_cpu = audio[slots].detach().to("cpu", torch.float32)
+                lengths_cpu = audio_lengths[slots].detach().to("cpu")
             if d2h_end_event is not None:
                 assert cuda_stream is not None
                 d2h_end_event.record(cuda_stream)
@@ -378,9 +383,10 @@ class _CodecStreamSession:
         self._emit_step_event(
             slot_request_ids, "moss_streaming_output_slice_start", metadata
         )
-        for index, slot in enumerate(slots):
-            n_samples = int(lengths_cpu[index])
-            out[slot] = audio_cpu[index, :, :n_samples]
+        with record_function("moss_streaming_output_slice"):
+            for index, slot in enumerate(slots):
+                n_samples = int(lengths_cpu[index])
+                out[slot] = audio_cpu[index, :, :n_samples]
         self._emit_step_event(
             slot_request_ids, "moss_streaming_output_slice_end", metadata
         )

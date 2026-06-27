@@ -29,6 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
+from torch.profiler import record_function
 
 from sglang_omni.models.moss_tts_local.local_transformer import (
     MossTTSLocalTransformer,
@@ -551,27 +552,30 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
         bucket = min(b for b in self._frame_graphs if b >= batch_size)
         graph, static_inputs, stop_choice, codes, feedback = self._frame_graphs[bucket]
 
-        static_inputs["hidden_states"][:batch_size].copy_(
-            hidden_states.to(dtype=self.dtype)
-        )
-        if batch_size < bucket:
-            static_inputs["hidden_states"][batch_size:].zero_()
-        for key, value in (
-            ("text_temperature", text_temperature),
-            ("text_top_p", text_top_p),
-            ("text_top_k", text_top_k),
-            ("audio_temperature", audio_temperature),
-            ("audio_top_p", audio_top_p),
-            ("audio_top_k", audio_top_k),
-            ("seeds", seeds),
-            ("base_positions", base_positions),
-        ):
-            buf = static_inputs[key]
-            buf[:batch_size].copy_(value)
+        with record_function("moss_ar_frame_graph_copy_inputs"):
+            static_inputs["hidden_states"][:batch_size].copy_(
+                hidden_states.to(dtype=self.dtype)
+            )
             if batch_size < bucket:
-                buf[batch_size:].fill_(1 if buf.dtype.is_floating_point else 1)
-        graph.replay()
-        return stop_choice[:batch_size], codes[:batch_size], feedback[:batch_size]
+                static_inputs["hidden_states"][batch_size:].zero_()
+            for key, value in (
+                ("text_temperature", text_temperature),
+                ("text_top_p", text_top_p),
+                ("text_top_k", text_top_k),
+                ("audio_temperature", audio_temperature),
+                ("audio_top_p", audio_top_p),
+                ("audio_top_k", audio_top_k),
+                ("seeds", seeds),
+                ("base_positions", base_positions),
+            ):
+                buf = static_inputs[key]
+                buf[:batch_size].copy_(value)
+                if batch_size < bucket:
+                    buf[batch_size:].fill_(1 if buf.dtype.is_floating_point else 1)
+        with record_function("moss_ar_frame_graph_replay"):
+            graph.replay()
+        with record_function("moss_ar_frame_graph_outputs"):
+            return stop_choice[:batch_size], codes[:batch_size], feedback[:batch_size]
 
     @torch.no_grad()
     def decode_frame(
@@ -596,24 +600,27 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             frames of rows that chose stop, mirroring the upstream loop which
             never emits a frame alongside ``audio_end``.
         """
-        local_hidden = self.local_transformer.step(
-            hidden_states.to(dtype=self.dtype), 0
-        )
-        text_logits = F.linear(local_hidden, self.local_text_lm_head.weight)
-        stop_choice = sample_text(text_logits.float())
+        with record_function("moss_ar_eager_local_step_0"):
+            local_hidden = self.local_transformer.step(
+                hidden_states.to(dtype=self.dtype), 0
+            )
+        with record_function("moss_ar_eager_text_sample"):
+            text_logits = F.linear(local_hidden, self.local_text_lm_head.weight)
+            stop_choice = sample_text(text_logits.float())
 
         codes = []
         current = local_hidden
-        for channel in range(self.n_vq):
-            head_weight = self._audio_embedding_weight(channel)
-            logits = F.linear(current, head_weight)
-            code = sample_audio(logits.float(), channel)
-            codes.append(code)
-            if channel + 1 < self.n_vq:
-                next_embed = F.embedding(code, head_weight)
-                current = self.local_transformer.step(
-                    next_embed.to(dtype=self.dtype), channel + 1
-                )
+        with record_function("moss_ar_eager_audio_loop"):
+            for channel in range(self.n_vq):
+                head_weight = self._audio_embedding_weight(channel)
+                logits = F.linear(current, head_weight)
+                code = sample_audio(logits.float(), channel)
+                codes.append(code)
+                if channel + 1 < self.n_vq:
+                    next_embed = F.embedding(code, head_weight)
+                    current = self.local_transformer.step(
+                        next_embed.to(dtype=self.dtype), channel + 1
+                    )
         return stop_choice, torch.stack(codes, dim=-1)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
