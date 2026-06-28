@@ -22,6 +22,15 @@ from sglang_omni.proto import DataReadyMessage, OmniRequest, StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 
 
+class _DeferredTestPayload:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def materialize_payload(self) -> dict:
+        self.calls += 1
+        return {"audio_data": [0.3], "modality": "audio"}
+
+
 class _FakeControlPlane:
     recv_endpoint = "inproc://stage"
 
@@ -188,6 +197,43 @@ def test_terminal_scheduler_stream_routes_to_coordinator() -> None:
         assert msg.chunk == {"audio_data": [0.1], "modality": "audio"}
         assert msg.modality == "audio"
         assert [msg.chunk_id for msg in control_plane.streams] == [0, 1]
+
+    asyncio.run(_run())
+
+
+def test_terminal_scheduler_stream_materializes_deferred_payload_once() -> None:
+    async def _run() -> None:
+        control_plane = _FakeControlPlane()
+        scheduler = SimpleNamespace(outbox=queue.Queue())
+        payload = _DeferredTestPayload()
+        stage = Stage(
+            name="vocoder",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={},
+            control_plane=control_plane,
+            relay=_FakeRelay(),
+            scheduler=scheduler,
+            is_terminal=True,
+        )
+        stage._active_requests.add("req")
+        scheduler.outbox.put(
+            OutgoingMessage(
+                request_id="req",
+                type="stream",
+                data=payload,
+            )
+        )
+
+        await stage._drain_outbox_external()
+
+        assert payload.calls == 1
+        assert len(control_plane.streams) == 1
+        assert control_plane.streams[0].chunk == {
+            "audio_data": [0.3],
+            "modality": "audio",
+        }
 
     asyncio.run(_run())
 

@@ -146,6 +146,7 @@ _STAGE_INTERVAL_EVENTS = (
     ("moss_streaming_decode_start", "moss_streaming_decode_end"),
     ("moss_streaming_d2h_start", "moss_streaming_d2h_end"),
     ("moss_streaming_output_slice_start", "moss_streaming_output_slice_end"),
+    ("moss_streaming_materialize_start", "moss_streaming_materialize_end"),
 )
 
 
