@@ -21,6 +21,7 @@ import time
 from typing import Any, Callable
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
@@ -225,32 +226,67 @@ class StreamingSimpleScheduler:
     def _collect_new_request_batch(
         self, first_msg: IncomingMessage
     ) -> list[IncomingMessage]:
+        started = time.monotonic()
         batch = [first_msg]
-        if (
-            self._batch_fn is None
-            or self._max_batch_size <= 1
-            or self.is_streaming_payload(first_msg.data)
-        ):
+
+        _emit_event(
+            request_id=first_msg.request_id,
+            stage=None,
+            event_name="streaming_batch_collect_start",
+            metadata={
+                "scheduler": self.__class__.__name__,
+                "max_batch_size": self._max_batch_size,
+                "max_batch_wait_ms": round(self._max_batch_wait_s * 1000.0, 6),
+                "has_batch_fn": self._batch_fn is not None,
+                "first_type": first_msg.type,
+                "inbox_qsize": self.inbox.qsize(),
+            },
+        )
+
+        def finish(reason: str) -> list[IncomingMessage]:
+            _emit_event(
+                request_id=first_msg.request_id,
+                stage=None,
+                event_name="streaming_batch_collect_end",
+                metadata={
+                    "scheduler": self.__class__.__name__,
+                    "batch_size": len(batch),
+                    "reason": reason,
+                    "wait_ms": round((time.monotonic() - started) * 1000.0, 6),
+                    "inbox_qsize": self.inbox.qsize(),
+                },
+            )
             return batch
+
+        if self._batch_fn is None:
+            return finish("no_batch_fn")
+        if self._max_batch_size <= 1:
+            return finish("max_batch_size_le_1")
+        if self.is_streaming_payload(first_msg.data):
+            return finish("first_streaming")
 
         batch_cost = self._message_cost(first_msg)
         deadline = time.monotonic() + self._max_batch_wait_s
+        reason = "max_batch_size"
         while len(batch) < self._max_batch_size:
             try:
                 msg = self.inbox.get_nowait()
             except _queue_mod.Empty:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    reason = "deadline"
                     break
                 try:
                     msg = self.inbox.get(timeout=remaining)
                 except _queue_mod.Empty:
+                    reason = "deadline"
                     break
 
             if self._is_aborted(msg.request_id):
                 continue
             if msg.type != "new_request":
                 self._pending_messages.append(msg)
+                reason = f"message_type:{msg.type}"
                 break
             try:
                 is_streaming = self.is_streaming_payload(msg.data)
@@ -260,6 +296,7 @@ class StreamingSimpleScheduler:
                 continue
             if is_streaming:
                 self._pending_messages.append(msg)
+                reason = "next_streaming"
                 break
             if self._max_batch_cost is not None:
                 try:
@@ -270,10 +307,11 @@ class StreamingSimpleScheduler:
                     continue
                 if batch and batch_cost + msg_cost > self._max_batch_cost:
                     self._pending_messages.appendleft(msg)
+                    reason = "max_batch_cost"
                     break
                 batch_cost += msg_cost
             batch.append(msg)
-        return batch
+        return finish(reason)
 
     def _handle_new_request_batch(
         self,
@@ -340,6 +378,34 @@ class StreamingSimpleScheduler:
         if not valid:
             return
 
+        batch_started = time.monotonic()
+        _emit_event(
+            request_id=valid[0].request_id,
+            stage=None,
+            event_name="streaming_nonstream_batch_start",
+            metadata={
+                "scheduler": self.__class__.__name__,
+                "active_size": len(active),
+                "valid_size": len(valid),
+                "uses_batch_fn": self._batch_fn is not None and len(valid) > 1,
+            },
+        )
+
+        def emit_batch_end(status: str) -> None:
+            _emit_event(
+                request_id=valid[0].request_id,
+                stage=None,
+                event_name="streaming_nonstream_batch_end",
+                metadata={
+                    "scheduler": self.__class__.__name__,
+                    "active_size": len(active),
+                    "valid_size": len(valid),
+                    "uses_batch_fn": self._batch_fn is not None and len(valid) > 1,
+                    "status": status,
+                    "elapsed_ms": round((time.monotonic() - batch_started) * 1000.0, 6),
+                },
+            )
+
         if self._batch_fn is None or len(valid) <= 1:
             for msg in valid:
                 if self._is_aborted(msg.request_id):
@@ -354,6 +420,7 @@ class StreamingSimpleScheduler:
                 if not self._is_aborted(msg.request_id):
                     self._emit_result(msg.request_id, result)
                     self._record_completed_non_streaming_request_id(msg.request_id)
+            emit_batch_end("single_path")
             return
 
         try:
@@ -365,6 +432,7 @@ class StreamingSimpleScheduler:
                 if not self._is_aborted(msg.request_id):
                     self._emit_error(msg.request_id, exc)
                     self._record_completed_non_streaming_request_id(msg.request_id)
+            emit_batch_end("batch_error")
             return
         if len(results) != len(valid):
             exc = ValueError(
@@ -375,11 +443,13 @@ class StreamingSimpleScheduler:
                 if not self._is_aborted(msg.request_id):
                     self._emit_error(msg.request_id, exc)
                     self._record_completed_non_streaming_request_id(msg.request_id)
+            emit_batch_end("batch_result_count_mismatch")
             return
         for msg, result in zip(valid, results):
             if not self._is_aborted(msg.request_id):
                 self._emit_result(msg.request_id, result)
                 self._record_completed_non_streaming_request_id(msg.request_id)
+        emit_batch_end("batch_path")
 
     def _run_compute(self, payload: Any, loop: asyncio.AbstractEventLoop) -> Any:
         if self._fn is None:

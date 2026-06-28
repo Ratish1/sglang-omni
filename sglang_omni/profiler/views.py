@@ -147,6 +147,8 @@ _STAGE_INTERVAL_EVENTS = (
         "moss_nonstream_cpu_materialize_start",
         "moss_nonstream_cpu_materialize_end",
     ),
+    ("streaming_batch_collect_start", "streaming_batch_collect_end"),
+    ("streaming_nonstream_batch_start", "streaming_nonstream_batch_end"),
 )
 
 
