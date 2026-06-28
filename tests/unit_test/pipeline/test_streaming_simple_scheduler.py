@@ -163,37 +163,3 @@ def test_streaming_simple_scheduler_keeps_queued_control_message_out_of_batch() 
     assert next_msg.request_id == "stream"
     assert next_msg.type == "stream_chunk"
     assert scheduler._next_message().request_id == "b"
-
-
-def test_streaming_simple_scheduler_batches_around_own_non_streaming_done() -> None:
-    scheduler = _TestStreamingScheduler(max_batch_size=3)
-    first = IncomingMessage("a", "new_request", _payload("a"))
-    scheduler.inbox.put(IncomingMessage("a", "stream_done"))
-    scheduler.inbox.put(IncomingMessage("b", "new_request", _payload("b")))
-    scheduler.inbox.put(IncomingMessage("b", "stream_done"))
-    scheduler.inbox.put(IncomingMessage("c", "new_request", _payload("c")))
-
-    batch = scheduler._collect_new_request_batch(first)
-    scheduler._handle_new_request_batch(batch)
-
-    assert [msg.request_id for msg in batch] == ["a", "b", "c"]
-    assert scheduler.batch_calls == [["a", "b", "c"]]
-    assert [msg.request_id for msg in _drain_results(scheduler)] == ["a", "b", "c"]
-    done_a = scheduler._next_message()
-    done_b = scheduler._next_message()
-    assert (done_a.request_id, done_a.type) == ("a", "stream_done")
-    assert (done_b.request_id, done_b.type) == ("b", "stream_done")
-
-
-def test_streaming_simple_scheduler_stops_on_unrelated_stream_done() -> None:
-    scheduler = _TestStreamingScheduler(max_batch_size=3)
-    first = IncomingMessage("a", "new_request", _payload("a"))
-    scheduler.inbox.put(IncomingMessage("stream", "stream_done"))
-    scheduler.inbox.put(IncomingMessage("b", "new_request", _payload("b")))
-
-    batch = scheduler._collect_new_request_batch(first)
-
-    assert [msg.request_id for msg in batch] == ["a"]
-    done = scheduler._next_message()
-    assert (done.request_id, done.type) == ("stream", "stream_done")
-    assert scheduler._next_message().request_id == "b"

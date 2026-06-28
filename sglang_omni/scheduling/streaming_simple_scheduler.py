@@ -228,7 +228,6 @@ class StreamingSimpleScheduler:
     ) -> list[IncomingMessage]:
         started = time.monotonic()
         batch = [first_msg]
-        skipped_stream_done = 0
 
         _emit_event(
             request_id=first_msg.request_id,
@@ -253,7 +252,6 @@ class StreamingSimpleScheduler:
                     "scheduler": self.__class__.__name__,
                     "batch_size": len(batch),
                     "reason": reason,
-                    "skipped_stream_done": skipped_stream_done,
                     "wait_ms": round((time.monotonic() - started) * 1000.0, 6),
                     "inbox_qsize": self.inbox.qsize(),
                 },
@@ -270,7 +268,6 @@ class StreamingSimpleScheduler:
         batch_cost = self._message_cost(first_msg)
         deadline = time.monotonic() + self._max_batch_wait_s
         reason = "max_batch_size"
-        batch_request_ids = {first_msg.request_id}
         while len(batch) < self._max_batch_size:
             try:
                 msg = self.inbox.get_nowait()
@@ -288,14 +285,6 @@ class StreamingSimpleScheduler:
             if self._is_aborted(msg.request_id):
                 continue
             if msg.type != "new_request":
-                if (
-                    msg.type == "stream_done"
-                    and msg.request_id in batch_request_ids
-                    and skipped_stream_done < self._max_batch_size
-                ):
-                    self._pending_messages.append(msg)
-                    skipped_stream_done += 1
-                    continue
                 self._pending_messages.append(msg)
                 reason = f"message_type:{msg.type}"
                 break
@@ -322,7 +311,6 @@ class StreamingSimpleScheduler:
                     break
                 batch_cost += msg_cost
             batch.append(msg)
-            batch_request_ids.add(msg.request_id)
         return finish(reason)
 
     def _handle_new_request_batch(
