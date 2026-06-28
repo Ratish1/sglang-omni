@@ -62,6 +62,9 @@ def _stages(*, codec_device: str, colocated: bool) -> list[StageConfig]:
             gpu=0,
             next="vocoder",
             stream_to=["vocoder"],
+            stream_done_to_fn=(
+                f"{_PKG}.request_builders.resolve_moss_tts_local_stream_done_targets"
+            ),
         ),
         StageConfig(
             name="vocoder",

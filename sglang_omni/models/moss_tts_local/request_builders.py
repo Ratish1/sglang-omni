@@ -355,6 +355,15 @@ def build_moss_tts_local_stream_metadata(
     return metadata
 
 
+def resolve_moss_tts_local_stream_done_targets(
+    request_id: str,
+    payload: StagePayload,
+) -> list[str]:
+    del request_id
+    params = payload.request.params if isinstance(payload.request.params, dict) else {}
+    return ["vocoder"] if params.get("stream") else []
+
+
 def build_sglang_moss_tts_local_request(
     payload: StagePayload,
     *,

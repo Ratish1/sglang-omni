@@ -33,6 +33,7 @@ from sglang_omni.models.moss_tts_local.request_builders import (
     build_moss_tts_local_state,
     clear_moss_tts_local_preprocessing_context,
     preprocess_moss_tts_local_payload,
+    resolve_moss_tts_local_stream_done_targets,
     set_moss_tts_local_preprocessing_context,
 )
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
@@ -399,6 +400,11 @@ def test_pipeline_stage_wiring():
     assert config.supports_uploaded_voice_references() is True
     assert stages["tts_engine"].process == "pipeline"
     assert stages["tts_engine"].gpu == 0
+    assert stages["tts_engine"].stream_to == ["vocoder"]
+    assert (
+        stages["tts_engine"].stream_done_to_fn
+        == "sglang_omni.models.moss_tts_local.request_builders.resolve_moss_tts_local_stream_done_targets"
+    )
     tts_engine_runtime = stages["tts_engine"].runtime
     assert tts_engine_runtime.resources.total_gpu_memory_fraction == pytest.approx(0.90)
     assert tts_engine_runtime.sglang_server_args.mem_fraction_static is None
@@ -431,6 +437,25 @@ def test_pipeline_stage_wiring():
     assert split_runtime.resources.total_gpu_memory_fraction is None
     assert split_runtime.sglang_server_args.mem_fraction_static == pytest.approx(0.85)
     assert split_stages["vocoder"].factory_args["device"] == "cuda:1"
+
+
+def test_stream_done_targets_only_real_streaming_requests() -> None:
+    def payload(params: dict[str, object] | None) -> StagePayload:
+        return StagePayload(
+            request_id="req",
+            request=OmniRequest(inputs="", params=params),
+            data={},
+        )
+
+    assert resolve_moss_tts_local_stream_done_targets("req", payload(None)) == []
+    assert resolve_moss_tts_local_stream_done_targets("req", payload({})) == []
+    assert (
+        resolve_moss_tts_local_stream_done_targets("req", payload({"stream": False}))
+        == []
+    )
+    assert resolve_moss_tts_local_stream_done_targets(
+        "req", payload({"stream": True})
+    ) == ["vocoder"]
 
 
 def _install_fake_moss_ar_factory(
