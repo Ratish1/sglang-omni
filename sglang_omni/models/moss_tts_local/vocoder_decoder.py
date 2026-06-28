@@ -16,6 +16,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.profiler import record_function
 
 try:
     from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
@@ -48,28 +49,30 @@ def _pack_padded_sequence(
     x: torch.Tensor,
     input_lengths: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch_size, max_seqlen, _ = x.shape
-    positions = torch.arange(max_seqlen, device=x.device, dtype=torch.long)
-    valid_mask = positions.view(1, max_seqlen) < input_lengths.view(batch_size, 1)
-    packed_x = x[valid_mask]
-    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=x.device)
-    cu_seqlens[1:] = torch.cumsum(input_lengths.to(torch.int32), dim=0)
-    position_ids = positions.view(1, max_seqlen).expand(batch_size, -1)[valid_mask]
-    return packed_x, valid_mask, cu_seqlens, position_ids
+    with record_function("moss_nonstream_pack_padded"):
+        batch_size, max_seqlen, _ = x.shape
+        positions = torch.arange(max_seqlen, device=x.device, dtype=torch.long)
+        valid_mask = positions.view(1, max_seqlen) < input_lengths.view(batch_size, 1)
+        packed_x = x[valid_mask]
+        cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=x.device)
+        cu_seqlens[1:] = torch.cumsum(input_lengths.to(torch.int32), dim=0)
+        position_ids = positions.view(1, max_seqlen).expand(batch_size, -1)[valid_mask]
+        return packed_x, valid_mask, cu_seqlens, position_ids
 
 
 def _pack_unpadded_sequence(
     x: torch.Tensor,
     position_ids_cache: "_PositionIdsCache",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert x.shape[0] == 1, f"expected a single unpadded sequence, got {x.shape[0]}"
-    _, max_seqlen, _ = x.shape
-    packed_x = x.reshape(max_seqlen, x.shape[-1])
-    cu_seqlens, position_ids = position_ids_cache.get(
-        device=x.device,
-        max_seqlen=max_seqlen,
-    )
-    return packed_x, cu_seqlens, position_ids
+    with record_function("moss_nonstream_pack_unpadded"):
+        assert x.shape[0] == 1, f"expected a single unpadded sequence, got {x.shape[0]}"
+        _, max_seqlen, _ = x.shape
+        packed_x = x.reshape(max_seqlen, x.shape[-1])
+        cu_seqlens, position_ids = position_ids_cache.get(
+            device=x.device,
+            max_seqlen=max_seqlen,
+        )
+        return packed_x, cu_seqlens, position_ids
 
 
 def _unpack_packed_sequence(
@@ -78,15 +81,17 @@ def _unpack_packed_sequence(
     batch_size: int,
     max_seqlen: int,
 ) -> torch.Tensor:
-    x = packed_x.new_zeros(batch_size, max_seqlen, packed_x.shape[-1])
-    x[valid_mask] = packed_x
-    return x
+    with record_function("moss_nonstream_unpack_padded"):
+        x = packed_x.new_zeros(batch_size, max_seqlen, packed_x.shape[-1])
+        x[valid_mask] = packed_x
+        return x
 
 
 def _unpack_unpadded_sequence(
     packed_x: torch.Tensor,
 ) -> torch.Tensor:
-    return packed_x.reshape(1, packed_x.shape[0], packed_x.shape[-1])
+    with record_function("moss_nonstream_unpack_unpadded"):
+        return packed_x.reshape(1, packed_x.shape[0], packed_x.shape[-1])
 
 
 class _MossPackedRopeCache:
@@ -139,51 +144,53 @@ def _apply_cached_packed_rope(
     max_positions: int,
     cache: _MossPackedRopeCache,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if k.shape != q.shape:
-        raise ValueError(
-            f"Expected k.shape == q.shape, got k={tuple(k.shape)} q={tuple(q.shape)}"
+    with record_function("moss_nonstream_rope"):
+        if k.shape != q.shape:
+            raise ValueError(
+                f"Expected k.shape == q.shape, got k={tuple(k.shape)} "
+                f"q={tuple(q.shape)}"
+            )
+        if q.dim() != 3:
+            raise ValueError(
+                f"packed RoPE expects [tokens, heads, dim], got {tuple(q.shape)}"
+            )
+        _, _, head_dim = q.shape
+        if head_dim <= 0 or head_dim % 2 != 0:
+            raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
+        cos_cache, sin_cache = cache.get(
+            device=q.device,
+            head_dim=head_dim,
+            max_positions=max_positions,
         )
-    if q.dim() != 3:
-        raise ValueError(
-            f"packed RoPE expects [tokens, heads, dim], got {tuple(q.shape)}"
-        )
-    _, _, head_dim = q.shape
-    if head_dim <= 0 or head_dim % 2 != 0:
-        raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
-    cos_cache, sin_cache = cache.get(
-        device=q.device,
-        head_dim=head_dim,
-        max_positions=max_positions,
-    )
-    if position_ids.numel() == max_positions:
-        cos = cos_cache.view(max_positions, 1, head_dim // 2)
-        sin = sin_cache.view(max_positions, 1, head_dim // 2)
-    else:
-        cos = cos_cache.index_select(0, position_ids).view(
-            position_ids.numel(), 1, head_dim // 2
-        )
-        sin = sin_cache.index_select(0, position_ids).view(
-            position_ids.numel(), 1, head_dim // 2
-        )
+        if position_ids.numel() == max_positions:
+            cos = cos_cache.view(max_positions, 1, head_dim // 2)
+            sin = sin_cache.view(max_positions, 1, head_dim // 2)
+        else:
+            cos = cos_cache.index_select(0, position_ids).view(
+                position_ids.numel(), 1, head_dim // 2
+            )
+            sin = sin_cache.index_select(0, position_ids).view(
+                position_ids.numel(), 1, head_dim // 2
+            )
 
-    dims = q.shape[:-1]
-    q_pair = q.view(*dims, head_dim // 2, 2)
-    k_pair = k.view(*dims, head_dim // 2, 2)
-    qr, qi = q_pair[..., 0].float(), q_pair[..., 1].float()
-    kr, ki = k_pair[..., 0].float(), k_pair[..., 1].float()
+        dims = q.shape[:-1]
+        q_pair = q.view(*dims, head_dim // 2, 2)
+        k_pair = k.view(*dims, head_dim // 2, 2)
+        qr, qi = q_pair[..., 0].float(), q_pair[..., 1].float()
+        kr, ki = k_pair[..., 0].float(), k_pair[..., 1].float()
 
-    qor = qr * cos - qi * sin
-    qoi = qr * sin + qi * cos
-    kor = kr * cos - ki * sin
-    koi = kr * sin + ki * cos
+        qor = qr * cos - qi * sin
+        qoi = qr * sin + qi * cos
+        kor = kr * cos - ki * sin
+        koi = kr * sin + ki * cos
 
-    q_out = torch.stack([qor.to(q.dtype), qoi.to(q.dtype)], dim=-1).view(
-        *dims, head_dim
-    )
-    k_out = torch.stack([kor.to(k.dtype), koi.to(k.dtype)], dim=-1).view(
-        *dims, head_dim
-    )
-    return q_out, k_out
+        q_out = torch.stack([qor.to(q.dtype), qoi.to(q.dtype)], dim=-1).view(
+            *dims, head_dim
+        )
+        k_out = torch.stack([kor.to(k.dtype), koi.to(k.dtype)], dim=-1).view(
+            *dims, head_dim
+        )
+        return q_out, k_out
 
 
 class MossTTSLocalAttention(nn.Module):
@@ -267,7 +274,8 @@ class MossTTSLocalAttention(nn.Module):
     def _project_qkv(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        projected = self.in_proj(x)
+        with record_function("moss_nonstream_project_qkv"):
+            projected = self.in_proj(x)
         if x.dim() == 3:
             projected = projected.reshape(
                 x.shape[0], x.shape[1], 3, self.num_heads, self.head_dim
@@ -312,18 +320,20 @@ class MossTTSLocalAttention(nn.Module):
             max_positions=max_seqlen,
         )
         assert self._flash_attn_varlen is not None
-        out = self._flash_attn_varlen(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            causal=self.causal,
-            window_size=self._flash_window_size(),
-        )
-        return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
+        with record_function("moss_nonstream_flash_attn"):
+            out = self._flash_attn_varlen(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                causal=self.causal,
+                window_size=self._flash_window_size(),
+            )
+        with record_function("moss_nonstream_attn_output_proj"):
+            return self.out_proj(out.reshape(x.shape[0], self.embed_dim))
 
     def _flash_window_size(self) -> tuple[int, int]:
         if self.context is None or not self.causal:
@@ -350,13 +360,21 @@ class MossTTSLocalTransformerLayer(nn.Module):
         ), "MOSS vocoder transformer layer requires Linear-GELU-Linear FFN"
 
     def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        residual = x
-        x = self.norm1(x)
-        x = residual.to(x) + self.layer_scale_1(self.self_attn(x, **kwargs))
-        residual = x
-        x = self.norm2(x)
-        x = residual.to(x) + self.layer_scale_2(self.ffn(x))
-        return x
+        with record_function("moss_nonstream_layer"):
+            residual = x
+            with record_function("moss_nonstream_norm1"):
+                x = self.norm1(x)
+            with record_function("moss_nonstream_self_attn"):
+                attn_out = self.self_attn(x, **kwargs)
+            with record_function("moss_nonstream_attn_residual"):
+                x = residual.to(x) + self.layer_scale_1(attn_out)
+            residual = x
+            with record_function("moss_nonstream_norm2"):
+                x = self.norm2(x)
+            with record_function("moss_nonstream_ffn"):
+                ffn_out = self.ffn(x)
+            with record_function("moss_nonstream_ffn_residual"):
+                return residual.to(x) + self.layer_scale_2(ffn_out)
 
 
 class MossTTSLocalTransformer(nn.Module):
@@ -379,26 +397,28 @@ class MossTTSLocalTransformer(nn.Module):
         return self.layers[0].self_attn.resolve_attention_implementation(x)
 
     def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        if self.positional_embedding in {"sin", "sin_rope"}:
-            if x.dim() == 3:
-                positions = torch.arange(x.shape[1], device=x.device).view(1, -1)
-            else:
-                positions = kwargs.get("position_ids")
-                if positions is None:
-                    raise ValueError(
-                        "packed transformer inputs require position_ids for "
-                        "sinusoidal embeddings"
+        with record_function("moss_nonstream_transformer"):
+            if self.positional_embedding in {"sin", "sin_rope"}:
+                if x.dim() == 3:
+                    positions = torch.arange(x.shape[1], device=x.device).view(1, -1)
+                else:
+                    positions = kwargs.get("position_ids")
+                    if positions is None:
+                        raise ValueError(
+                            "packed transformer inputs require position_ids for "
+                            "sinusoidal embeddings"
+                        )
+                with record_function("moss_nonstream_positional_embedding"):
+                    pos_emb = self._create_sin_embedding(
+                        positions,
+                        x.shape[-1],
+                        max_period=self.max_period,
+                        dtype=x.dtype,
                     )
-            pos_emb = self._create_sin_embedding(
-                positions,
-                x.shape[-1],
-                max_period=self.max_period,
-                dtype=x.dtype,
-            )
-            x = x + self.positional_scale * pos_emb
-        for layer in self.layers:
-            x = layer(x, **kwargs)
-        return x
+                    x = x + self.positional_scale * pos_emb
+            for layer in self.layers:
+                x = layer(x, **kwargs)
+            return x
 
 
 class MossTTSLocalProjectedTransformer(nn.Module):
@@ -418,46 +438,54 @@ class MossTTSLocalProjectedTransformer(nn.Module):
         input_lengths: torch.Tensor,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.input_proj(x.transpose(1, 2))
-        backend = self.transformer.resolve_attention_implementation(x)
-        if backend == "flash_attention_2":
-            batch_size, max_seqlen, _ = x.shape
-            max_valid_seqlen = int(input_lengths.max().item()) if max_seqlen else 0
-            if max_valid_seqlen == 0:
-                x = x.new_zeros(x.shape)
-            else:
-                is_unpadded_single = batch_size == 1 and max_valid_seqlen == max_seqlen
-                if is_unpadded_single:
-                    packed_x, cu_seqlens, position_ids = _pack_unpadded_sequence(
-                        x,
-                        self._position_ids_cache,
+        with record_function("moss_nonstream_projected_stage"):
+            with record_function("moss_nonstream_stage_input_proj"):
+                x = self.input_proj(x.transpose(1, 2))
+            backend = self.transformer.resolve_attention_implementation(x)
+            if backend == "flash_attention_2":
+                batch_size, max_seqlen, _ = x.shape
+                with record_function("moss_nonstream_max_len_sync"):
+                    max_valid_seqlen = (
+                        int(input_lengths.max().item()) if max_seqlen else 0
                     )
-                    valid_mask = None
+                if max_valid_seqlen == 0:
+                    x = x.new_zeros(x.shape)
                 else:
-                    packed_x, valid_mask, cu_seqlens, position_ids = (
-                        _pack_padded_sequence(x, input_lengths)
+                    is_unpadded_single = (
+                        batch_size == 1 and max_valid_seqlen == max_seqlen
                     )
-                packed_x = self.transformer(
-                    packed_x,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_valid_seqlen,
-                    position_ids=position_ids,
-                    input_lengths=input_lengths,
-                    **kwargs,
-                )
-                x = (
-                    _unpack_unpadded_sequence(packed_x)
-                    if valid_mask is None
-                    else _unpack_packed_sequence(
+                    if is_unpadded_single:
+                        packed_x, cu_seqlens, position_ids = _pack_unpadded_sequence(
+                            x,
+                            self._position_ids_cache,
+                        )
+                        valid_mask = None
+                    else:
+                        packed_x, valid_mask, cu_seqlens, position_ids = (
+                            _pack_padded_sequence(x, input_lengths)
+                        )
+                    packed_x = self.transformer(
                         packed_x,
-                        valid_mask,
-                        batch_size,
-                        max_seqlen,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_valid_seqlen,
+                        position_ids=position_ids,
+                        input_lengths=input_lengths,
+                        **kwargs,
                     )
-                )
-        else:
-            x = self.transformer(x, input_lengths=input_lengths, **kwargs)
-        return self.output_proj(x).transpose(1, 2), input_lengths
+                    x = (
+                        _unpack_unpadded_sequence(packed_x)
+                        if valid_mask is None
+                        else _unpack_packed_sequence(
+                            packed_x,
+                            valid_mask,
+                            batch_size,
+                            max_seqlen,
+                        )
+                    )
+            else:
+                x = self.transformer(x, input_lengths=input_lengths, **kwargs)
+            with record_function("moss_nonstream_stage_output_proj"):
+                return self.output_proj(x).transpose(1, 2), input_lengths
 
 
 class MossTTSLocalVocoderDecoder(nn.Module):
@@ -497,6 +525,7 @@ class MossTTSLocalVocoderDecoder(nn.Module):
         x: torch.Tensor,
         input_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        for stage in self.stages:
-            x, input_lengths = stage(x, input_lengths)
-        return x, input_lengths
+        with record_function("moss_nonstream_vocoder_decoder"):
+            for stage in self.stages:
+                x, input_lengths = stage(x, input_lengths)
+            return x, input_lengths
