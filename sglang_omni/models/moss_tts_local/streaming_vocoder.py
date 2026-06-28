@@ -23,6 +23,7 @@ from sglang_omni.models.tts_streaming import (
     resolve_initial_codec_chunk_frames,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
@@ -757,54 +758,129 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         return payload
 
     def _decode_codes_rows_nonstream(
-        self, codes_list: list[torch.Tensor]
+        self,
+        codes_list: list[torch.Tensor],
+        *,
+        profile_request_id: str,
     ) -> list[torch.Tensor]:
+        batch_size = len(codes_list)
+        _emit_event(
+            request_id=profile_request_id,
+            stage=None,
+            event_name="moss_nonstream_decode_start",
+            metadata={"batch_size": batch_size},
+        )
         n_vq = self._n_vq
         device = next(self._codec.parameters()).device
-        codes_channels_first = [
-            codes[:, :n_vq]
-            .transpose(0, 1)
-            .contiguous()
-            .to(device=device, dtype=torch.long)
-            for codes in codes_list
-        ]
-        max_len = max(int(codes.shape[1]) for codes in codes_channels_first)
-        audio_codes = torch.zeros(
-            n_vq,
-            len(codes_channels_first),
-            max_len,
-            device=device,
-            dtype=torch.long,
-        )
-        padding_mask = torch.zeros(
-            len(codes_channels_first), max_len, device=device, dtype=torch.bool
-        )
-        for index, codes in enumerate(codes_channels_first):
-            length = int(codes.shape[1])
-            audio_codes[:, index, :length] = codes
-            padding_mask[index, :length] = True
-
-        decoded = self._codec.decode(
-            audio_codes,
-            padding_mask=padding_mask,
-            num_quantizers=n_vq,
-            return_dict=True,
-            chunk_duration=None,
-        )
-        audio = decoded.audio
-        audio_lengths = decoded.audio_lengths
-        if audio is None or audio_lengths is None:
-            raise RuntimeError(
-                "audio_tokenizer.decode did not return audio/audio_lengths."
+        try:
+            _emit_event(
+                request_id=profile_request_id,
+                stage=None,
+                event_name="moss_nonstream_prepare_start",
+                metadata={"batch_size": batch_size},
             )
-        audio_cpu = audio.detach().to("cpu", torch.float32)
-        lengths_cpu = audio_lengths.detach().to("cpu")
-        return [
-            audio_cpu[index, :, : int(lengths_cpu[index])].contiguous()
-            for index in range(int(audio_cpu.shape[0]))
-        ]
+            codes_channels_first = [
+                codes[:, :n_vq]
+                .transpose(0, 1)
+                .contiguous()
+                .to(device=device, dtype=torch.long)
+                for codes in codes_list
+            ]
+            max_len = max(int(codes.shape[1]) for codes in codes_channels_first)
+            audio_codes = torch.zeros(
+                n_vq,
+                batch_size,
+                max_len,
+                device=device,
+                dtype=torch.long,
+            )
+            padding_mask = torch.zeros(
+                batch_size, max_len, device=device, dtype=torch.bool
+            )
+            total_frames = 0
+            for index, codes in enumerate(codes_channels_first):
+                length = int(codes.shape[1])
+                total_frames += length
+                audio_codes[:, index, :length] = codes
+                padding_mask[index, :length] = True
+            _emit_event(
+                request_id=profile_request_id,
+                stage=None,
+                event_name="moss_nonstream_prepare_end",
+                metadata={
+                    "batch_size": batch_size,
+                    "max_frames": max_len,
+                    "total_frames": total_frames,
+                },
+            )
 
-    def _decode_codes_rows(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
+            _emit_event(
+                request_id=profile_request_id,
+                stage=None,
+                event_name="moss_nonstream_codec_decode_start",
+                metadata={
+                    "batch_size": batch_size,
+                    "max_frames": max_len,
+                    "total_frames": total_frames,
+                },
+            )
+            decoded = self._codec.decode(
+                audio_codes,
+                padding_mask=padding_mask,
+                num_quantizers=n_vq,
+                return_dict=True,
+                chunk_duration=None,
+            )
+            _emit_event(
+                request_id=profile_request_id,
+                stage=None,
+                event_name="moss_nonstream_codec_decode_end",
+                metadata={
+                    "batch_size": batch_size,
+                    "max_frames": max_len,
+                    "total_frames": total_frames,
+                },
+            )
+
+            audio = decoded.audio
+            audio_lengths = decoded.audio_lengths
+            if audio is None or audio_lengths is None:
+                raise RuntimeError(
+                    "audio_tokenizer.decode did not return audio/audio_lengths."
+                )
+            _emit_event(
+                request_id=profile_request_id,
+                stage=None,
+                event_name="moss_nonstream_cpu_materialize_start",
+                metadata={"batch_size": batch_size},
+            )
+            audio_cpu = audio.detach().to("cpu", torch.float32)
+            lengths_cpu = audio_lengths.detach().to("cpu")
+            wavs = [
+                audio_cpu[index, :, : int(lengths_cpu[index])].contiguous()
+                for index in range(int(audio_cpu.shape[0]))
+            ]
+            _emit_event(
+                request_id=profile_request_id,
+                stage=None,
+                event_name="moss_nonstream_cpu_materialize_end",
+                metadata={"batch_size": batch_size},
+            )
+            return wavs
+        finally:
+            _emit_event(
+                request_id=profile_request_id,
+                stage=None,
+                event_name="moss_nonstream_decode_end",
+                metadata={"batch_size": batch_size},
+            )
+
+    def _decode_codes_rows(
+        self,
+        codes_list: list[torch.Tensor],
+        *,
+        profile_request_id: str,
+    ) -> list[torch.Tensor]:
         """Decode ``[T, >=n_vq]`` row tensors to fp32 CPU waveforms."""
         with self._state_lock:
             self._close_idle_startup_session_locked()
@@ -815,7 +891,10 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             original_decoder = self._codec.decoder
             self._codec.decoder = self._nonstream_decoder
             try:
-                return self._decode_codes_rows_nonstream(codes_list)
+                return self._decode_codes_rows_nonstream(
+                    codes_list,
+                    profile_request_id=profile_request_id,
+                )
             finally:
                 self._codec.decoder = original_decoder
         channels_first = [
@@ -832,7 +911,24 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
     def _vocode_batch(self, payloads: list[StagePayload]) -> list[StagePayload]:
         prepared = [self._prepare_codes(payload) for payload in payloads]
         codes_list = [codes for _, codes in prepared if codes is not None]
-        decoded = iter(self._decode_codes_rows(codes_list)) if codes_list else iter(())
+        profile_request_id = next(
+            (
+                payload.request_id
+                for payload, (_, codes) in zip(payloads, prepared)
+                if codes is not None
+            ),
+            payloads[0].request_id if payloads else "",
+        )
+        decoded = (
+            iter(
+                self._decode_codes_rows(
+                    codes_list,
+                    profile_request_id=profile_request_id,
+                )
+            )
+            if codes_list
+            else iter(())
+        )
         results = []
         for payload, (state, codes) in zip(payloads, prepared):
             if codes is None:

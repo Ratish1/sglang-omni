@@ -140,6 +140,13 @@ _STAGE_INTERVAL_EVENTS = (
     ("scheduler_request_build_start", "scheduler_request_build_end"),
     ("scheduler_prefill_start", "stage_first_stream_chunk_sent"),
     ("scheduler_prefill_start", "scheduler_first_emit"),
+    ("moss_nonstream_decode_start", "moss_nonstream_decode_end"),
+    ("moss_nonstream_prepare_start", "moss_nonstream_prepare_end"),
+    ("moss_nonstream_codec_decode_start", "moss_nonstream_codec_decode_end"),
+    (
+        "moss_nonstream_cpu_materialize_start",
+        "moss_nonstream_cpu_materialize_end",
+    ),
 )
 
 
