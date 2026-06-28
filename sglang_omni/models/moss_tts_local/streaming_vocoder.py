@@ -101,6 +101,7 @@ class _CodecStreamSession:
         self._exit_stack = contextlib.ExitStack()
         with torch.no_grad():
             self._exit_stack.enter_context(codec.streaming(self._batch_size))
+        self._streaming_state_modules = self._collect_streaming_state_modules()
 
     def warmup_cuda_graph(
         self, frames: list[int], *, min_free_gb: float = 3.0
@@ -189,13 +190,29 @@ class _CodecStreamSession:
         reset_mask.zero_()
         reset_mask[slots] = True
 
-        def _reset(module: Any) -> None:
-            state = getattr(module, "_streaming_state", None)
-            if state is not None:
+        with torch.no_grad():
+            for module in self._streaming_state_modules:
+                state = getattr(module, "_streaming_state", None)
+                if state is None:
+                    raise RuntimeError(
+                        "MOSS vocoder streaming state disappeared while the "
+                        "codec streaming session is active"
+                    )
                 state.reset(reset_mask.to(state.device))
 
-        with torch.no_grad():
-            self._codec.apply(_reset)
+    def _collect_streaming_state_modules(self) -> list[Any]:
+        modules: list[Any] = []
+
+        def _collect(module: Any) -> None:
+            if getattr(module, "_streaming_state", None) is not None:
+                modules.append(module)
+
+        self._codec.apply(_collect)
+        if not modules:
+            raise RuntimeError(
+                "MOSS vocoder streaming session did not expose any streaming state"
+            )
+        return modules
 
     def _emit_step_event(
         self,
