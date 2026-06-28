@@ -324,11 +324,11 @@ class MossTTSLocalModelRunner(ModelRunner):
         # Advance the launch-side counter only for emitted rows; non-final
         # chunked rows take a read-only position so a mid-prefill chunk's frame
         # cannot shift the final chunk's sampling position off the no-chunk path.
-        emit_set = {
+        emit_indices = [
             i
             for i, sched_req in enumerate(requests)
             if not self._is_chunked_request(sched_req)
-        }
+        ]
         gen_steps = torch.maximum(
             pool.sampling_steps[row_t].to(device=device),
             pool.generation_steps[row_t].to(device=device),
@@ -435,29 +435,37 @@ class MossTTSLocalModelRunner(ModelRunner):
                 embeds = self.model._prepare_multi_modal_inputs(
                     rows.to(device=self.model.device)
                 )
-        emit_indices = sorted(emit_set)
         if emit_indices:
             self._emit_ar_event("moss_ar_pool_write_start", profile_metadata)
             with record_function("moss_ar_pool_write"):
-                emit_index_t = torch.tensor(
-                    emit_indices, dtype=torch.long, device=rows.device
-                )
-                emit_pool_rows = [pool_rows[i] for i in emit_indices]
-                emit_row_t = row_t[emit_index_t.to(device=row_t.device)]
-                emit_rows = rows.index_select(0, emit_index_t)
-                emit_steps = gen_steps.index_select(
-                    0, emit_index_t.to(device=gen_steps.device)
-                )
+                if len(emit_indices) == batch_size:
+                    emit_pool_rows = pool_rows
+                    emit_row_t = row_t
+                    emit_rows = rows
+                    emit_steps = gen_steps
+                    emit_embeds = embeds
+                    emit_next_text = next_text
+                else:
+                    emit_index_t = torch.tensor(
+                        emit_indices, dtype=torch.long, device=rows.device
+                    )
+                    emit_pool_rows = [pool_rows[i] for i in emit_indices]
+                    emit_row_t = row_t[emit_index_t.to(device=row_t.device)]
+                    emit_rows = rows.index_select(0, emit_index_t)
+                    emit_steps = gen_steps.index_select(
+                        0, emit_index_t.to(device=gen_steps.device)
+                    )
+                    emit_embeds = embeds.index_select(
+                        0, emit_index_t.to(device=embeds.device)
+                    )
+                    emit_next_text = next_text.index_select(
+                        0, emit_index_t.to(device=next_text.device)
+                    )
                 pool.sampling_steps[emit_row_t] = (emit_steps + 1).to(
                     device=pool.sampling_steps.device, dtype=torch.int64
                 )
                 if has_audio_repetition_penalty:
-                    keep_history = (
-                        next_text.index_select(
-                            0, emit_index_t.to(device=next_text.device)
-                        )
-                        != end_id
-                    )
+                    keep_history = emit_next_text != end_id
                     emit_penalty_active = (
                         pool.audio_repetition_penalty[emit_row_t]
                         .to(device=keep_history.device)
@@ -468,9 +476,6 @@ class MossTTSLocalModelRunner(ModelRunner):
                         emit_row_t[keep_history.to(device=emit_row_t.device)],
                         emit_rows[keep_history.to(device=emit_rows.device)],
                     )
-                emit_embeds = embeds.index_select(
-                    0, emit_index_t.to(device=embeds.device)
-                )
                 pool.feedback_embeds[emit_row_t] = emit_embeds.detach().to(
                     device=pool.feedback_embeds.device,
                     dtype=pool.feedback_embeds.dtype,
