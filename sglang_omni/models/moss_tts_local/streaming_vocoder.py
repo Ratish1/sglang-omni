@@ -243,8 +243,8 @@ class _CodecStreamSession:
         slot_codes: dict[int, torch.Tensor],
         *,
         slot_request_ids: Mapping[int, str] | None = None,
-    ) -> dict[int, _StreamingAudioChunk]:
-        """Advance participating slots by one uniform-length step and return deferred CPU audio chunks."""
+    ) -> dict[int, torch.Tensor]:
+        """Advance participating slots by one uniform-length step. ``slot_codes`` maps slot -> ``[n_vq, T]`` (same T); returns slot -> ``[channels, samples]`` float32 CPU audio."""
         if not slot_codes:
             return {}
         step_lengths = {int(codes.shape[1]) for codes in slot_codes.values()}
@@ -346,11 +346,8 @@ class _CodecStreamSession:
                 assert cuda_stream is not None
                 d2h_start_event.record(cuda_stream)
             with record_function("moss_streaming_output_d2h"):
-                audio_cpu, lengths_cpu, copy_done = self._copy_audio_to_cpu(
-                    audio,
-                    audio_lengths,
-                    slots,
-                )
+                audio_cpu = audio[slots].detach().to("cpu", torch.float32)
+                lengths_cpu = audio_lengths[slots].detach().to("cpu")
             if d2h_end_event is not None:
                 assert cuda_stream is not None
                 d2h_end_event.record(cuda_stream)
@@ -399,56 +396,18 @@ class _CodecStreamSession:
             self._cg_total_steps += 1
             if self._cg_total_steps % 2000 == 0:
                 self._log_cg_stats()
-        out: dict[int, _StreamingAudioChunk] = {}
+        out: dict[int, torch.Tensor] = {}
         self._emit_step_event(
             slot_request_ids, "moss_streaming_output_slice_start", metadata
         )
         with record_function("moss_streaming_output_slice"):
             for index, slot in enumerate(slots):
-                out[slot] = _StreamingAudioChunk(
-                    audio=audio_cpu[index],
-                    length=lengths_cpu[index],
-                    copy_done=copy_done,
-                )
+                n_samples = int(lengths_cpu[index])
+                out[slot] = audio_cpu[index, :, :n_samples]
         self._emit_step_event(
             slot_request_ids, "moss_streaming_output_slice_end", metadata
         )
         return out
-
-    def _copy_audio_to_cpu(
-        self,
-        audio: torch.Tensor,
-        audio_lengths: torch.Tensor,
-        slots: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor, Any | None]:
-        audio_selected = audio[slots].detach()
-        if audio_selected.dtype != torch.float32:
-            audio_selected = audio_selected.float()
-        lengths_selected = audio_lengths[slots].detach()
-        if self._device.type != "cuda":
-            return (
-                audio_selected.to("cpu", torch.float32),
-                lengths_selected.to("cpu"),
-                None,
-            )
-
-        audio_cpu = torch.empty(
-            tuple(audio_selected.shape),
-            dtype=torch.float32,
-            device="cpu",
-            pin_memory=True,
-        )
-        lengths_cpu = torch.empty(
-            tuple(lengths_selected.shape),
-            dtype=lengths_selected.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
-        audio_cpu.copy_(audio_selected, non_blocking=True)
-        lengths_cpu.copy_(lengths_selected, non_blocking=True)
-        copy_done = torch.cuda.Event()
-        copy_done.record(torch.cuda.current_stream(self._device))
-        return audio_cpu, lengths_cpu, copy_done
 
     def decode_offline(
         self, codes_list: list[torch.Tensor], *, max_step_frames: int
@@ -481,67 +440,11 @@ class _CodecStreamSession:
                 decoded = self.step(plan)
                 for i in range(len(wave)):
                     if slots[i] in plan:
-                        chunks[i].append(decoded[slots[i]].as_tensor())
+                        chunks[i].append(decoded[slots[i]])
                         cursors[i] += step_t
             for item_chunks in chunks:
                 wavs.append(torch.cat(item_chunks, dim=-1))
         return wavs
-
-
-@dataclass
-class _StreamingAudioChunk:
-    audio: torch.Tensor
-    length: int | torch.Tensor
-    copy_done: Any | None = None
-    _materialized: torch.Tensor | None = field(default=None, init=False, repr=False)
-
-    def as_tensor(self) -> torch.Tensor:
-        if self._materialized is None:
-            if self.copy_done is not None:
-                self.copy_done.synchronize()
-            n_samples = (
-                int(self.length.item())
-                if isinstance(self.length, torch.Tensor)
-                else int(self.length)
-            )
-            self._materialized = self.audio[:, :n_samples]
-        return self._materialized
-
-
-@dataclass
-class _StreamingAudioPayload:
-    request_id: str
-    chunk: _StreamingAudioChunk
-    sample_rate: int
-    _payload: dict[str, Any] | None = field(default=None, init=False, repr=False)
-
-    def materialize_payload(self) -> dict[str, Any]:
-        if self._payload is not None:
-            return self._payload
-        if _REQUEST_RECORDER.is_active():
-            _emit_event(
-                request_id=self.request_id,
-                stage=None,
-                event_name="moss_streaming_materialize_start",
-                metadata=None,
-            )
-        with record_function("moss_streaming_materialize"):
-            data = audio_waveform_payload(
-                self.chunk.as_tensor(),
-                sample_rate=self.sample_rate,
-                modality="audio",
-                source_hint=f"{_SOURCE_HINT} streaming",
-                keep_channels=True,
-            )
-        self._payload = data
-        if _REQUEST_RECORDER.is_active():
-            _emit_event(
-                request_id=self.request_id,
-                stage=None,
-                event_name="moss_streaming_materialize_end",
-                metadata=None,
-            )
-        return data
 
 
 @dataclass
@@ -723,7 +626,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                     session.step(
                         {state.slot: codes},
                         slot_request_ids={state.slot: request_id},
-                    )[state.slot].as_tensor()
+                    )[state.slot]
                 )
             session.release(state.slot)
             state.slot = None
@@ -970,23 +873,14 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             return False
         return len(state.pending) >= floor
 
-    def _chunk_message(
-        self, request_id: str, audio: torch.Tensor | _StreamingAudioChunk
-    ) -> OutgoingMessage:
-        if isinstance(audio, _StreamingAudioChunk):
-            data: Any = _StreamingAudioPayload(
-                request_id=request_id,
-                chunk=audio,
-                sample_rate=self._sample_rate,
-            )
-        else:
-            data = audio_waveform_payload(
-                audio,
-                sample_rate=self._sample_rate,
-                modality="audio",
-                source_hint=f"{_SOURCE_HINT} streaming",
-                keep_channels=True,
-            )
+    def _chunk_message(self, request_id: str, audio: torch.Tensor) -> OutgoingMessage:
+        data = audio_waveform_payload(
+            audio.detach().to("cpu", torch.float32),
+            sample_rate=self._sample_rate,
+            modality="audio",
+            source_hint=f"{_SOURCE_HINT} streaming",
+            keep_channels=True,
+        )
         return OutgoingMessage(
             request_id=request_id,
             type="stream",

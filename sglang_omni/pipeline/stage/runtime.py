@@ -18,10 +18,6 @@ from contextlib import suppress
 from typing import Any, Callable, Literal
 
 from sglang_omni.pipeline import relay_io
-from sglang_omni.pipeline.deferred_payload import (
-    is_deferred_payload,
-    materialize_payload,
-)
 from sglang_omni.pipeline.stage.input import DirectInput, InputHandler
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
 from sglang_omni.pipeline.tp_control import TPLeaderFanout, TPWorkMessage
@@ -810,31 +806,25 @@ class Stage:
             if out.type == "result":
                 await self._route_result(out.request_id, out.data)
             elif out.type == "stream":
-                if is_deferred_payload(out.data):
-                    data = await loop.run_in_executor(
-                        None, materialize_payload, out.data
-                    )
-                else:
-                    data = out.data
                 if out.target is None:
                     if self._stream_targets:
                         for target in self._stream_targets:
                             await self._send_stream_to_target(
                                 out.request_id,
-                                data,
+                                out.data,
                                 target,
                                 out.metadata,
                             )
                     else:
                         await self._send_stream_to_coordinator(
                             out.request_id,
-                            data,
+                            out.data,
                             out.metadata,
                         )
                 else:
                     await self._send_stream_to_target(
                         out.request_id,
-                        data,
+                        out.data,
                         out.target,
                         out.metadata,
                     )

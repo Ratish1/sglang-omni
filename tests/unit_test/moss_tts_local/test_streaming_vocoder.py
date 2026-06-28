@@ -33,7 +33,6 @@ from sglang_omni.models.moss_tts_local.streaming_vocoder import (
     _CodecStreamSession,
 )
 from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
-from sglang_omni.pipeline.deferred_payload import materialize_payload
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 
@@ -310,14 +309,9 @@ def _run_stream(
 
 
 def _decode_audio(data: dict[str, Any]) -> np.ndarray:
-    data = materialize_payload(data)
     assert data["audio_waveform_dtype"] == "float32"
     array = np.frombuffer(data["audio_waveform"], dtype=np.float32)
     return array.reshape(data["audio_waveform_shape"])
-
-
-def _materialized_data(data: Any) -> dict[str, Any]:
-    return materialize_payload(data)
 
 
 def _concat_stream_audio(messages: list, request_id: str) -> np.ndarray:
@@ -369,9 +363,8 @@ def test_stream_concatenates_to_offline_decode(monkeypatch) -> None:
         _decode_audio(m.data).shape[1] // SAMPLES_PER_FRAME for m in stream_msgs
     ] == [5, 10, 8]
     for msg in stream_msgs:
-        data = _materialized_data(msg.data)
-        assert data["sample_rate"] == SAMPLE_RATE
-        assert data["modality"] == "audio"
+        assert msg.data["sample_rate"] == SAMPLE_RATE
+        assert msg.data["modality"] == "audio"
         assert msg.metadata == {"modality": "audio"}
 
     audio = _concat_stream_audio(messages, "req")
@@ -642,13 +635,13 @@ def test_stream_session_reuses_step_workspace_without_stale_slot_state() -> None
         out = session.step({1: torch.full((N_VQ, 2), 2, dtype=torch.long)})
         assert codec._streaming_state.offsets.tolist() == [4, 2, 0]
         np.testing.assert_array_equal(
-            out[1].as_tensor().numpy(),
+            out[1].numpy(),
             reference_waveform(torch.full((2, N_VQ), 2, dtype=torch.long)).numpy(),
         )
 
         out = session.step({0: torch.zeros(N_VQ, 1, dtype=torch.long)})
         assert codec._streaming_state.offsets.tolist() == [5, 2, 0]
-        assert out[0].as_tensor()[0, 0].item() == 4000.0
+        assert out[0][0, 0].item() == 4000.0
     finally:
         session.close()
 
