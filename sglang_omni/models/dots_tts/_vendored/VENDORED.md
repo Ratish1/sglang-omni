@@ -6,8 +6,13 @@ sglang-omni dots pipeline.
 ## Source
 
 - Upstream project: <https://github.com/rednote-hilab/dots.tts>
+- Pinned upstream commit: `b995bdb7de14dad008b98cfa085ecc83600e5b7a` (2026-06-16)
 - Public checkpoint family: `rednote-hilab/dots.tts-base`
 - Model card license: Apache-2.0
+
+Vendored code in this directory was copied from the upstream project at the
+pinned commit above. To refresh, re-vendor from that ref (or a newer pinned
+commit) and update this file.
 
 ## Serving Path
 
