@@ -364,11 +364,14 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
                     f"{too_large}"
                 )
         self._stream_states: dict[str, _LocalStreamState] = {}
+        # Full-sequence codec batch decode is not singleton-equivalent for
+        # distinct/ragged MOSS code rows, so scheduler-level non-stream
+        # coalescing stays disabled until a safe codec batch contract exists.
         super().__init__(
             self._vocode,
-            batch_compute_fn=self._vocode_batch,
-            max_batch_size=max_batch_size,
-            max_batch_wait_ms=max_batch_wait_ms,
+            batch_compute_fn=None,
+            max_batch_size=1,
+            max_batch_wait_ms=0,
         )
 
     def start(self) -> None:
