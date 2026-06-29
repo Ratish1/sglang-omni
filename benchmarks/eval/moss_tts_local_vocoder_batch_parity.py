@@ -43,6 +43,7 @@ DEFAULT_BATCH_SIZES = (2, 4, 8)
 SECONDS_PER_MOSS_LOCAL_FRAME = 0.08
 BACKENDS = ("packed", "hf")
 MODES = ("ragged", "same_length", "duplicate", "length_bucket")
+DECODE_APIS = ("padded", "batch_decode")
 
 
 def _parse_ints(value: str) -> list[int]:
@@ -64,6 +65,18 @@ def _parse_modes(value: str) -> list[str]:
             f"invalid modes {invalid}; expected values from {MODES}"
         )
     return modes
+
+
+def _parse_decode_apis(value: str) -> list[str]:
+    apis = [part.strip() for part in value.split(",") if part.strip()]
+    if not apis:
+        raise argparse.ArgumentTypeError("expected at least one decode API")
+    invalid = [api for api in apis if api not in DECODE_APIS]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"invalid decode APIs {invalid}; expected values from {DECODE_APIS}"
+        )
+    return apis
 
 
 def _lengths_from_generated_json(path: Path, limit: int) -> list[int]:
@@ -220,6 +233,7 @@ def _worst_case(
                 if key
                 in {
                     "mode",
+                    "decode_api",
                     "backend",
                     "comparison",
                     "batch_size",
@@ -245,30 +259,37 @@ def _write_reports(result: dict[str, Any], output: Path) -> None:
         f"- any_nan: `{result['any_nan']}`",
         f"- worst_max_abs: `{result['worst_max_abs']}`",
         f"- worst_case: `{result['worst_case']}`",
+        f"- chunk_duration: `{result['chunk_duration']}`",
         "",
         "## Mode Summary",
         "",
-        "| mode | backend | comparison | cases | worst max_abs |",
-        "|---|---|---|---:|---:|",
+        "| mode | decode API | backend | comparison | cases | worst max_abs |",
+        "|---|---|---|---|---:|---:|",
     ]
     for row in result["summary_rows"]:
         lines.append(
-            "| {mode} | {backend} | {comparison} | {cases} | {worst_max_abs} |".format(
+            "| {mode} | {decode_api} | {backend} | {comparison} | {cases} | {worst_max_abs} |".format(
                 **row
             )
         )
+    if result["skipped_modes"]:
+        lines.extend(["", "## Skipped Modes", ""])
+        for skipped in result["skipped_modes"]:
+            lines.append(
+                "- mode={mode} batch_size={batch_size}: {reason}".format(**skipped)
+            )
     lines.extend(
         [
             "",
             "## Cases",
             "",
-            "| mode | backend | comparison | batch_size | index | frames | same shape | max_abs | mean_abs |",
-            "|---|---|---|---:|---:|---:|---:|---:|---:|",
+            "| mode | decode API | backend | comparison | batch_size | index | frames | same shape | max_abs | mean_abs |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for case in result["case_results"]:
         lines.append(
-            "| {mode} | {backend} | {comparison} | {batch_size} | {index} | {frames} | {same_shape} | {max_abs} | {mean_abs} |".format(
+            "| {mode} | {decode_api} | {backend} | {comparison} | {batch_size} | {index} | {frames} | {same_shape} | {max_abs} | {mean_abs} |".format(
                 **case
             )
         )
@@ -278,6 +299,8 @@ def _write_reports(result: dict[str, Any], output: Path) -> None:
             "## Notes",
             "",
             "- `single_vs_batch` compares one-by-one decode against a batched decode on the same backend.",
+            "- `padded` matches the production non-stream path: build `[n_vq, B, T]` plus `padding_mask`, then call `codec.decode`.",
+            "- `batch_decode` calls the tokenizer `batch_decode(codes_list, ...)` API directly.",
             "- `packed_vs_hf_single` compares SGLang packed attention against the original HF decoder for single-row decode.",
             "- `packed_vs_hf_batch` compares SGLang packed attention against the original HF decoder for batched decode.",
         ]
@@ -299,11 +322,73 @@ def _set_scheduler_dtype(scheduler: Any, dtype: str) -> None:
     raise ValueError(f"unknown dtype mode {dtype!r}")
 
 
+def _decode_with_api(
+    scheduler: Any,
+    codes: list[torch.Tensor],
+    *,
+    decode_api: str,
+    chunk_duration: float | None,
+) -> list[torch.Tensor]:
+    n_vq = scheduler._n_vq
+    device = next(scheduler._codec.parameters()).device
+    codes_channels_first = [
+        row[:, :n_vq].transpose(0, 1).contiguous().to(device=device, dtype=torch.long)
+        for row in codes
+    ]
+    if decode_api == "padded":
+        max_len = max(int(row.shape[1]) for row in codes_channels_first)
+        audio_codes = torch.zeros(
+            n_vq,
+            len(codes_channels_first),
+            max_len,
+            device=device,
+            dtype=torch.long,
+        )
+        padding_mask = torch.zeros(
+            len(codes_channels_first),
+            max_len,
+            device=device,
+            dtype=torch.bool,
+        )
+        for index, row in enumerate(codes_channels_first):
+            length = int(row.shape[1])
+            audio_codes[:, index, :length] = row
+            padding_mask[index, :length] = True
+        decoded = scheduler._codec.decode(
+            audio_codes,
+            padding_mask=padding_mask,
+            num_quantizers=n_vq,
+            return_dict=True,
+            chunk_duration=chunk_duration,
+        )
+    elif decode_api == "batch_decode":
+        decoded = scheduler._codec.batch_decode(
+            codes_channels_first,
+            num_quantizers=n_vq,
+            chunk_duration=chunk_duration,
+        )
+    else:
+        raise ValueError(f"unknown decode API {decode_api!r}")
+
+    audio = decoded.audio
+    audio_lengths = decoded.audio_lengths
+    if audio is None or audio_lengths is None:
+        raise RuntimeError("codec decode did not return audio/audio_lengths")
+    audio_cpu = audio.detach().to("cpu", torch.float32)
+    lengths_cpu = audio_lengths.detach().to("cpu")
+    return [
+        audio_cpu[index, :, : int(lengths_cpu[index])].contiguous()
+        for index in range(int(audio_cpu.shape[0]))
+    ]
+
+
 def _decode_backend(
     scheduler: Any,
     codes: list[torch.Tensor],
     *,
     backend: str,
+    decode_api: str,
+    chunk_duration: float | None,
 ) -> list[torch.Tensor]:
     if backend == "packed":
         decoder = scheduler._nonstream_decoder
@@ -316,7 +401,12 @@ def _decode_backend(
     if decoder is not None:
         scheduler._codec.decoder = decoder
     try:
-        return scheduler._decode_codes_rows_nonstream(codes)
+        return _decode_with_api(
+            scheduler,
+            codes,
+            decode_api=decode_api,
+            chunk_duration=chunk_duration,
+        )
     finally:
         scheduler._codec.decoder = original_decoder
 
@@ -327,20 +417,38 @@ def _append_single_vs_batch_cases(
     scheduler: Any,
     mode: str,
     backend: str,
+    decode_api: str,
+    chunk_duration: float | None,
     codes: list[torch.Tensor],
     batch_size: int,
 ) -> None:
-    single = [_decode_backend(scheduler, [row], backend=backend)[0] for row in codes]
+    single = [
+        _decode_backend(
+            scheduler,
+            [row],
+            backend=backend,
+            decode_api=decode_api,
+            chunk_duration=chunk_duration,
+        )[0]
+        for row in codes
+    ]
     for start in range(0, len(codes), batch_size):
         chunk = codes[start : start + batch_size]
         if len(chunk) < 2:
             continue
-        decoded = _decode_backend(scheduler, chunk, backend=backend)
+        decoded = _decode_backend(
+            scheduler,
+            chunk,
+            backend=backend,
+            decode_api=decode_api,
+            chunk_duration=chunk_duration,
+        )
         for offset, candidate in enumerate(decoded):
             index = start + offset
             case_results.append(
                 {
                     "mode": mode,
+                    "decode_api": decode_api,
                     "backend": backend,
                     "comparison": "single_vs_batch",
                     "batch_size": len(chunk),
@@ -356,15 +464,30 @@ def _append_backend_cases(
     *,
     scheduler: Any,
     mode: str,
+    decode_api: str,
+    chunk_duration: float | None,
     codes: list[torch.Tensor],
     batch_size: int,
 ) -> None:
     for index, row in enumerate(codes):
-        packed = _decode_backend(scheduler, [row], backend="packed")[0]
-        hf = _decode_backend(scheduler, [row], backend="hf")[0]
+        packed = _decode_backend(
+            scheduler,
+            [row],
+            backend="packed",
+            decode_api=decode_api,
+            chunk_duration=chunk_duration,
+        )[0]
+        hf = _decode_backend(
+            scheduler,
+            [row],
+            backend="hf",
+            decode_api=decode_api,
+            chunk_duration=chunk_duration,
+        )[0]
         case_results.append(
             {
                 "mode": mode,
+                "decode_api": decode_api,
                 "backend": "packed_vs_hf",
                 "comparison": "packed_vs_hf_single",
                 "batch_size": 1,
@@ -378,13 +501,26 @@ def _append_backend_cases(
         chunk = codes[start : start + batch_size]
         if len(chunk) < 2:
             continue
-        packed_batch = _decode_backend(scheduler, chunk, backend="packed")
-        hf_batch = _decode_backend(scheduler, chunk, backend="hf")
+        packed_batch = _decode_backend(
+            scheduler,
+            chunk,
+            backend="packed",
+            decode_api=decode_api,
+            chunk_duration=chunk_duration,
+        )
+        hf_batch = _decode_backend(
+            scheduler,
+            chunk,
+            backend="hf",
+            decode_api=decode_api,
+            chunk_duration=chunk_duration,
+        )
         for offset, (hf, packed) in enumerate(zip(hf_batch, packed_batch)):
             index = start + offset
             case_results.append(
                 {
                     "mode": mode,
+                    "decode_api": decode_api,
                     "backend": "packed_vs_hf",
                     "comparison": "packed_vs_hf_batch",
                     "batch_size": len(chunk),
@@ -425,6 +561,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _set_scheduler_dtype(scheduler, args.dtype)
 
     case_results: list[dict[str, Any]] = []
+    skipped_modes: list[dict[str, Any]] = []
     modes = args.modes or list(MODES)
     for batch_size in args.batch_sizes:
         for mode in modes:
@@ -437,33 +574,47 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 seed=args.seed,
             )
             if len(codes) < 2:
+                skipped_modes.append(
+                    {
+                        "mode": mode,
+                        "batch_size": batch_size,
+                        "reason": "fewer than two code rows were available",
+                    }
+                )
                 continue
-            if args.backends in ("packed", "both"):
-                _append_single_vs_batch_cases(
-                    case_results,
-                    scheduler=scheduler,
-                    mode=mode,
-                    backend="packed",
-                    codes=codes,
-                    batch_size=batch_size,
-                )
-            if args.backends in ("hf", "both"):
-                _append_single_vs_batch_cases(
-                    case_results,
-                    scheduler=scheduler,
-                    mode=mode,
-                    backend="hf",
-                    codes=codes,
-                    batch_size=batch_size,
-                )
-            if args.compare_backends:
-                _append_backend_cases(
-                    case_results,
-                    scheduler=scheduler,
-                    mode=mode,
-                    codes=codes,
-                    batch_size=batch_size,
-                )
+            for decode_api in args.decode_apis:
+                if args.backends in ("packed", "both"):
+                    _append_single_vs_batch_cases(
+                        case_results,
+                        scheduler=scheduler,
+                        mode=mode,
+                        backend="packed",
+                        decode_api=decode_api,
+                        chunk_duration=args.chunk_duration,
+                        codes=codes,
+                        batch_size=batch_size,
+                    )
+                if args.backends in ("hf", "both"):
+                    _append_single_vs_batch_cases(
+                        case_results,
+                        scheduler=scheduler,
+                        mode=mode,
+                        backend="hf",
+                        decode_api=decode_api,
+                        chunk_duration=args.chunk_duration,
+                        codes=codes,
+                        batch_size=batch_size,
+                    )
+                if args.compare_backends:
+                    _append_backend_cases(
+                        case_results,
+                        scheduler=scheduler,
+                        mode=mode,
+                        decode_api=decode_api,
+                        chunk_duration=args.chunk_duration,
+                        codes=codes,
+                        batch_size=batch_size,
+                    )
 
     if not case_results:
         raise RuntimeError("No parity cases were produced by the selected modes")
@@ -471,19 +622,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     worst_max_abs, worst_case = _worst_case(case_results)
     summary_rows = []
     summary_keys = sorted(
-        {(case["mode"], case["backend"], case["comparison"]) for case in case_results}
+        {
+            (
+                case["mode"],
+                case["decode_api"],
+                case["backend"],
+                case["comparison"],
+            )
+            for case in case_results
+        }
     )
-    for mode, backend, comparison in summary_keys:
+    for mode, decode_api, backend, comparison in summary_keys:
         subset = [
             case
             for case in case_results
             if case["mode"] == mode
+            and case["decode_api"] == decode_api
             and case["backend"] == backend
             and case["comparison"] == comparison
         ]
         summary_rows.append(
             {
                 "mode": mode,
+                "decode_api": decode_api,
                 "backend": backend,
                 "comparison": comparison,
                 "cases": len(subset),
@@ -496,10 +657,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "codec_model": args.codec_model,
         "device": args.device,
         "dtype": args.dtype,
+        "decode_apis": args.decode_apis,
+        "chunk_duration": args.chunk_duration,
         "n_vq": args.n_vq,
         "vocab_size": args.vocab_size,
         "lengths": [int(codes.shape[0]) for codes in source_codes],
         "batch_sizes": args.batch_sizes,
+        "skipped_modes": skipped_modes,
         "cases": len(case_results),
         "all_same_shape": all(case["same_shape"] for case in case_results),
         "any_nan": any(case["has_nan"] for case in case_results),
@@ -543,6 +707,21 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_parse_modes,
         default=None,
         help=f"Comma-separated subset of {MODES}; default runs all.",
+    )
+    parser.add_argument(
+        "--decode-apis",
+        type=_parse_decode_apis,
+        default=["padded"],
+        help=f"Comma-separated subset of {DECODE_APIS}; default matches production.",
+    )
+    parser.add_argument(
+        "--chunk-duration",
+        type=float,
+        default=None,
+        help=(
+            "Optional codec chunk_duration. Omit for full-sequence decode. "
+            "Use 8 to compare against the HF processor helper."
+        ),
     )
     parser.add_argument("--lengths", type=_parse_ints, default=list(DEFAULT_LENGTHS))
     parser.add_argument(
