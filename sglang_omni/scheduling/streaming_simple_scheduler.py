@@ -21,6 +21,8 @@ import time
 from typing import Any, Callable
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
@@ -233,24 +235,41 @@ class StreamingSimpleScheduler:
         ):
             return batch
 
+        profile = _get_event_recorder().is_active()
+        if profile:
+            _emit_event(
+                request_id=first_msg.request_id,
+                stage=None,
+                event_name="streaming_batch_collect_start",
+                metadata={
+                    "max_batch_size": self._max_batch_size,
+                    "max_batch_wait_ms": self._max_batch_wait_s * 1000.0,
+                    "has_batch_fn": self._batch_fn is not None,
+                    "start_inbox_qsize": self.inbox.qsize(),
+                },
+            )
         batch_cost = self._message_cost(first_msg)
         deadline = time.monotonic() + self._max_batch_wait_s
+        end_reason = "deadline"
         while len(batch) < self._max_batch_size:
             try:
                 msg = self.inbox.get_nowait()
             except _queue_mod.Empty:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    end_reason = "deadline"
                     break
                 try:
                     msg = self.inbox.get(timeout=remaining)
                 except _queue_mod.Empty:
+                    end_reason = "deadline"
                     break
 
             if self._is_aborted(msg.request_id):
                 continue
             if msg.type != "new_request":
                 self._pending_messages.append(msg)
+                end_reason = f"message_type:{msg.type}"
                 break
             try:
                 is_streaming = self.is_streaming_payload(msg.data)
@@ -260,6 +279,7 @@ class StreamingSimpleScheduler:
                 continue
             if is_streaming:
                 self._pending_messages.append(msg)
+                end_reason = "streaming_payload"
                 break
             if self._max_batch_cost is not None:
                 try:
@@ -270,9 +290,24 @@ class StreamingSimpleScheduler:
                     continue
                 if batch and batch_cost + msg_cost > self._max_batch_cost:
                     self._pending_messages.appendleft(msg)
+                    end_reason = "max_batch_cost"
                     break
                 batch_cost += msg_cost
             batch.append(msg)
+        else:
+            end_reason = "max_batch_size"
+        if profile:
+            _emit_event(
+                request_id=first_msg.request_id,
+                stage=None,
+                event_name="streaming_batch_collect_end",
+                metadata={
+                    "end_reason": end_reason,
+                    "end_batch_size": len(batch),
+                    "end_batch_cost": batch_cost,
+                    "end_inbox_qsize": self.inbox.qsize(),
+                },
+            )
         return batch
 
     def _handle_new_request_batch(
@@ -321,65 +356,115 @@ class StreamingSimpleScheduler:
         batch: list[IncomingMessage],
         loop: asyncio.AbstractEventLoop,
     ) -> None:
-        active = [msg for msg in batch if not self._is_aborted(msg.request_id)]
-        if not active:
-            return
-        with self._state_lock:
+        profile = _get_event_recorder().is_active()
+        profile_request_id = batch[0].request_id if batch else "unknown"
+        if profile:
+            _emit_event(
+                request_id=profile_request_id,
+                stage=None,
+                event_name="streaming_nonstream_batch_start",
+                metadata={
+                    "input_size": len(batch),
+                    "max_batch_size": self._max_batch_size,
+                    "has_batch_fn": self._batch_fn is not None,
+                },
+            )
+        status = "unknown"
+        active_size = 0
+        valid_size = 0
+        uses_batch_fn = False
+        error_class: str | None = None
+        try:
+            active = [msg for msg in batch if not self._is_aborted(msg.request_id)]
+            active_size = len(active)
+            if not active:
+                status = "no_active"
+                return
+            with self._state_lock:
+                for msg in active:
+                    self._pending_done.discard(msg.request_id)
+
+            valid: list[IncomingMessage] = []
             for msg in active:
-                self._pending_done.discard(msg.request_id)
-
-        valid: list[IncomingMessage] = []
-        for msg in active:
-            try:
-                self.validate_non_streaming_payload(msg.data)
-            except Exception as exc:
-                self._emit_error(msg.request_id, exc)
-                self._record_completed_non_streaming_request_id(msg.request_id)
-                continue
-            valid.append(msg)
-        if not valid:
-            return
-
-        if self._batch_fn is None or len(valid) <= 1:
-            for msg in valid:
-                if self._is_aborted(msg.request_id):
-                    continue
                 try:
-                    result = self._run_compute(msg.data, loop)
+                    self.validate_non_streaming_payload(msg.data)
                 except Exception as exc:
+                    self._emit_error(msg.request_id, exc)
+                    self._record_completed_non_streaming_request_id(msg.request_id)
+                    continue
+                valid.append(msg)
+            valid_size = len(valid)
+            if not valid:
+                status = "no_valid"
+                return
+
+            if self._batch_fn is None or len(valid) <= 1:
+                status = "single_path"
+                for msg in valid:
+                    if self._is_aborted(msg.request_id):
+                        continue
+                    try:
+                        result = self._run_compute(msg.data, loop)
+                    except Exception as exc:
+                        if not self._is_aborted(msg.request_id):
+                            self._emit_error(msg.request_id, exc)
+                            self._record_completed_non_streaming_request_id(
+                                msg.request_id
+                            )
+                        continue
+                    if not self._is_aborted(msg.request_id):
+                        self._emit_result(msg.request_id, result)
+                        self._record_completed_non_streaming_request_id(msg.request_id)
+                return
+
+            uses_batch_fn = True
+            status = "batch_path"
+            try:
+                results = self._batch_fn([msg.data for msg in valid])
+                if asyncio.iscoroutine(results):
+                    results = loop.run_until_complete(results)
+            except Exception as exc:
+                status = "batch_error"
+                error_class = type(exc).__name__
+                for msg in valid:
                     if not self._is_aborted(msg.request_id):
                         self._emit_error(msg.request_id, exc)
                         self._record_completed_non_streaming_request_id(msg.request_id)
-                    continue
+                return
+            if len(results) != len(valid):
+                status = "batch_result_mismatch"
+                exc = ValueError(
+                    f"batch_compute_fn returned {len(results)} results for "
+                    f"{len(valid)} requests"
+                )
+                error_class = type(exc).__name__
+                for msg in valid:
+                    if not self._is_aborted(msg.request_id):
+                        self._emit_error(msg.request_id, exc)
+                        self._record_completed_non_streaming_request_id(msg.request_id)
+                return
+            for msg, result in zip(valid, results):
                 if not self._is_aborted(msg.request_id):
                     self._emit_result(msg.request_id, result)
                     self._record_completed_non_streaming_request_id(msg.request_id)
-            return
-
-        try:
-            results = self._batch_fn([msg.data for msg in valid])
-            if asyncio.iscoroutine(results):
-                results = loop.run_until_complete(results)
         except Exception as exc:
-            for msg in valid:
-                if not self._is_aborted(msg.request_id):
-                    self._emit_error(msg.request_id, exc)
-                    self._record_completed_non_streaming_request_id(msg.request_id)
-            return
-        if len(results) != len(valid):
-            exc = ValueError(
-                f"batch_compute_fn returned {len(results)} results for "
-                f"{len(valid)} requests"
-            )
-            for msg in valid:
-                if not self._is_aborted(msg.request_id):
-                    self._emit_error(msg.request_id, exc)
-                    self._record_completed_non_streaming_request_id(msg.request_id)
-            return
-        for msg, result in zip(valid, results):
-            if not self._is_aborted(msg.request_id):
-                self._emit_result(msg.request_id, result)
-                self._record_completed_non_streaming_request_id(msg.request_id)
+            status = "error"
+            error_class = type(exc).__name__
+            raise
+        finally:
+            if profile:
+                _emit_event(
+                    request_id=profile_request_id,
+                    stage=None,
+                    event_name="streaming_nonstream_batch_end",
+                    metadata={
+                        "status": status,
+                        "active_size": active_size,
+                        "valid_size": valid_size,
+                        "uses_batch_fn": uses_batch_fn,
+                        "error_class": error_class,
+                    },
+                )
 
     def _run_compute(self, payload: Any, loop: asyncio.AbstractEventLoop) -> Any:
         if self._fn is None:

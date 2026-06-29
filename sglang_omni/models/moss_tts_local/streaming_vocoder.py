@@ -23,6 +23,8 @@ from sglang_omni.models.tts_streaming import (
     resolve_initial_codec_chunk_frames,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
@@ -830,18 +832,101 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         return [wav.detach().to("cpu", torch.float32).contiguous() for wav in wavs]
 
     def _vocode_batch(self, payloads: list[StagePayload]) -> list[StagePayload]:
-        prepared = [self._prepare_codes(payload) for payload in payloads]
-        codes_list = [codes for _, codes in prepared if codes is not None]
-        decoded = iter(self._decode_codes_rows(codes_list)) if codes_list else iter(())
-        results = []
-        for payload, (state, codes) in zip(payloads, prepared):
-            if codes is None:
-                state.audio_codes = None
-                payload.data = state.to_dict()
-                results.append(payload)
-                continue
-            results.append(self._store_vocoder_result(payload, state, next(decoded)))
-        return results
+        profile = _get_event_recorder().is_active()
+        request_id = payloads[0].request_id if payloads else "unknown"
+        if profile:
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="moss_nonstream_decode_start",
+                metadata={"batch_size": len(payloads)},
+            )
+        try:
+            if profile:
+                _emit_event(
+                    request_id=request_id,
+                    stage=None,
+                    event_name="moss_nonstream_prepare_start",
+                    metadata={"batch_size": len(payloads)},
+                )
+            prepared = [self._prepare_codes(payload) for payload in payloads]
+            codes_list = [codes for _, codes in prepared if codes is not None]
+            frame_lengths = [int(codes.shape[0]) for codes in codes_list]
+            if profile:
+                _emit_event(
+                    request_id=request_id,
+                    stage=None,
+                    event_name="moss_nonstream_prepare_end",
+                    metadata={
+                        "batch_size": len(payloads),
+                        "valid_size": len(codes_list),
+                        "frame_lengths": frame_lengths,
+                    },
+                )
+
+            if codes_list:
+                if profile:
+                    _emit_event(
+                        request_id=request_id,
+                        stage=None,
+                        event_name="moss_nonstream_codec_decode_start",
+                        metadata={
+                            "batch_size": len(codes_list),
+                            "frame_lengths": frame_lengths,
+                        },
+                    )
+                try:
+                    decoded_list = self._decode_codes_rows(codes_list)
+                finally:
+                    if profile:
+                        _emit_event(
+                            request_id=request_id,
+                            stage=None,
+                            event_name="moss_nonstream_codec_decode_end",
+                            metadata={
+                                "batch_size": len(codes_list),
+                                "frame_lengths": frame_lengths,
+                            },
+                        )
+                decoded = iter(decoded_list)
+            else:
+                decoded = iter(())
+
+            if profile:
+                _emit_event(
+                    request_id=request_id,
+                    stage=None,
+                    event_name="moss_nonstream_cpu_materialize_start",
+                    metadata={"batch_size": len(payloads)},
+                )
+            results = []
+            try:
+                for payload, (state, codes) in zip(payloads, prepared):
+                    if codes is None:
+                        state.audio_codes = None
+                        payload.data = state.to_dict()
+                        results.append(payload)
+                        continue
+                    results.append(
+                        self._store_vocoder_result(payload, state, next(decoded))
+                    )
+            finally:
+                if profile:
+                    _emit_event(
+                        request_id=request_id,
+                        stage=None,
+                        event_name="moss_nonstream_cpu_materialize_end",
+                        metadata={"batch_size": len(payloads)},
+                    )
+            return results
+        finally:
+            if profile:
+                _emit_event(
+                    request_id=request_id,
+                    stage=None,
+                    event_name="moss_nonstream_decode_end",
+                    metadata={"batch_size": len(payloads)},
+                )
 
     def _vocode(self, payload: StagePayload) -> StagePayload:
         return self._vocode_batch([payload])[0]

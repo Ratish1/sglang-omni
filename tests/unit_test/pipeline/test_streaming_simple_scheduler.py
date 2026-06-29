@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import queue
+from pathlib import Path
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.event_recorder import get_recorder
+from sglang_omni.profiler.views import load_events
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
@@ -93,6 +96,34 @@ def test_streaming_simple_scheduler_batches_non_streaming_requests() -> None:
 
     assert scheduler.batch_calls == [["a", "b", "c"]]
     assert [msg.request_id for msg in _drain_results(scheduler)] == ["a", "b", "c"]
+
+
+def test_streaming_simple_scheduler_profiles_non_streaming_batch(
+    tmp_path: Path,
+) -> None:
+    recorder = get_recorder()
+    recorder.start("test", str(tmp_path), "vocoder")
+    try:
+        scheduler = _TestStreamingScheduler(max_batch_size=3)
+        first = IncomingMessage("a", "new_request", _payload("a"))
+        scheduler.inbox.put(IncomingMessage("b", "new_request", _payload("b")))
+        scheduler.inbox.put(IncomingMessage("c", "new_request", _payload("c")))
+
+        batch = scheduler._collect_new_request_batch(first)
+        scheduler._handle_new_request_batch(batch)
+    finally:
+        recorder.stop(run_id="test")
+
+    by_name = {event["event_name"]: event for event in load_events(tmp_path)}
+    collect_end = by_name["streaming_batch_collect_end"]
+    assert collect_end["metadata"]["end_reason"] == "max_batch_size"
+    assert collect_end["metadata"]["end_batch_size"] == 3
+
+    batch_end = by_name["streaming_nonstream_batch_end"]
+    assert batch_end["metadata"]["status"] == "batch_path"
+    assert batch_end["metadata"]["active_size"] == 3
+    assert batch_end["metadata"]["valid_size"] == 3
+    assert batch_end["metadata"]["uses_batch_fn"] is True
 
 
 def test_streaming_simple_scheduler_keeps_streaming_request_out_of_batch() -> None:

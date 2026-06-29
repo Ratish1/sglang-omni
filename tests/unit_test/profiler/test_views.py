@@ -137,6 +137,50 @@ def test_stage_breakdown_keeps_intervals_stage_local(tmp_path: Path) -> None:
     assert encoder_rows == []
 
 
+def test_stage_breakdown_includes_moss_nonstream_intervals(tmp_path: Path) -> None:
+    events = [
+        _ev("r1", "vocoder", "streaming_batch_collect_start", 0),
+        _ev("r1", "vocoder", "streaming_batch_collect_end", 1_000_000),
+        _ev("r1", "vocoder", "streaming_nonstream_batch_start", 2_000_000),
+        _ev("r1", "vocoder", "streaming_nonstream_batch_end", 5_000_000),
+        _ev("r1", "vocoder", "moss_nonstream_decode_start", 6_000_000),
+        _ev("r1", "vocoder", "moss_nonstream_decode_end", 16_000_000),
+        _ev("r1", "vocoder", "moss_nonstream_prepare_start", 7_000_000),
+        _ev("r1", "vocoder", "moss_nonstream_prepare_end", 8_000_000),
+        _ev("r1", "vocoder", "moss_nonstream_codec_decode_start", 8_000_000),
+        _ev("r1", "vocoder", "moss_nonstream_codec_decode_end", 14_000_000),
+        _ev("r1", "vocoder", "moss_nonstream_cpu_materialize_start", 14_000_000),
+        _ev("r1", "vocoder", "moss_nonstream_cpu_materialize_end", 16_000_000),
+    ]
+    _write_events(tmp_path / "events_vocoder_1.jsonl", events)
+
+    rows = stage_breakdown(source=tmp_path)
+    by_interval = {row.interval_name: row for row in rows}
+
+    assert (
+        by_interval[
+            "streaming_batch_collect_start->streaming_batch_collect_end"
+        ].total_ms
+        == 1.0
+    )
+    assert (
+        by_interval[
+            "streaming_nonstream_batch_start->streaming_nonstream_batch_end"
+        ].total_ms
+        == 3.0
+    )
+    assert (
+        by_interval["moss_nonstream_decode_start->moss_nonstream_decode_end"].total_ms
+        == 10.0
+    )
+    assert (
+        by_interval[
+            "moss_nonstream_codec_decode_start->moss_nonstream_codec_decode_end"
+        ].total_ms
+        == 6.0
+    )
+
+
 # ---------------------------------------------------------------------------
 # Hop breakdown
 # ---------------------------------------------------------------------------
