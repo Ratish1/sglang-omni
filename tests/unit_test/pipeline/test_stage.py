@@ -274,6 +274,42 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
     asyncio.run(_run())
 
 
+def test_relay_reads_use_uninitialized_receive_buffers(monkeypatch) -> None:
+    """Relay reads should not zero-fill buffers before a full overwrite."""
+
+    async def _run() -> None:
+        relay = FakeRelay()
+        payload = make_tensor_payload()
+        payload_metadata, payload_op = await relay_io.write_payload(
+            relay, payload.request_id, payload
+        )
+        await payload_op.wait_for_completion()
+
+        blob = torch.arange(32, dtype=torch.int16).reshape(4, 8)
+        blob_metadata, blob_op = await relay_io.write_blob(
+            relay, "req-blob", blob, request_id="req-blob"
+        )
+        await blob_op.wait_for_completion()
+
+        def _forbid_zero_fill(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("relay read path must not zero-fill receive buffers")
+
+        monkeypatch.setattr(relay_io.torch, "zeros", _forbid_zero_fill)
+
+        restored = await relay_io.read_payload(
+            relay, payload.request_id, payload_metadata
+        )
+        restored_blob = await relay_io.read_blob(
+            relay, "req-blob", blob_metadata, request_id="req-blob"
+        )
+
+        assert tensor_equal(restored.data, payload.data)
+        assert torch.equal(restored_blob, blob)
+
+    asyncio.run(_run())
+
+
 def test_stage_relay_read_failure_completes_with_error() -> None:
     """Preserves failure reporting when a stage cannot read its relay payload."""
 

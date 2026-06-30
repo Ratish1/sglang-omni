@@ -31,6 +31,16 @@ def _pad_offset(offset: int, alignment: int) -> int:
     return (-offset) % alignment
 
 
+def _allocate_receive_buffer(size: int, device: Any) -> torch.Tensor:
+    """Allocate relay receive storage without initialization.
+
+    Relay.get_async owns writing the full advertised transfer into this buffer
+    before completion. Zero-filling here only adds request-time CUDA work for
+    large payloads and does not contribute to correctness.
+    """
+    return torch.empty(size, dtype=torch.uint8, device=device)
+
+
 # ---------------------------------------------------------------------------
 # Tensor extraction / restoration (recursive, nested dicts/lists)
 # ---------------------------------------------------------------------------
@@ -193,7 +203,7 @@ async def read_payload(
     tensor_dict = {}
 
     data_size = relay_info["transfer_info"]["size"]
-    recv_tensor = torch.zeros(data_size, dtype=torch.uint8, device=device)
+    recv_tensor = _allocate_receive_buffer(data_size, device)
     get_timer = ElapsedTimer.start() if recording else None
     op = await relay.get_async(
         metadata=relay_info, dest_tensor=recv_tensor, request_id=request_id
@@ -326,7 +336,7 @@ async def read_blob(
     offset = int(metadata.get("tensor_offset", 0))
 
     data_size = relay_info["transfer_info"]["size"]
-    recv_buf = torch.zeros(data_size, dtype=torch.uint8, device=device)
+    recv_buf = _allocate_receive_buffer(data_size, device)
     get_timer = ElapsedTimer.start() if recording else None
     op = await relay.get_async(
         metadata=relay_info, dest_tensor=recv_buf, request_id=key

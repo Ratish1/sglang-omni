@@ -106,6 +106,8 @@ class Relay(ABC):
     ) -> RelayOperation:
         """
         Asynchronously retrieves data into dest_tensor using provided metadata.
+        Callers allocate dest_tensor for the exact advertised transfer size; relay
+        implementations must overwrite all advertised bytes before completion.
         Returns an operation handle to await completion.
         """
 
