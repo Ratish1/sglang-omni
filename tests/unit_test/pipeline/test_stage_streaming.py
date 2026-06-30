@@ -654,11 +654,11 @@ def test_send_stream_chunk_uses_ipc_for_detected_cuda_same_gpu_chunk(
         assert relay.puts == []
         assert len(control_plane.stage_messages) == 1
         _, _, msg = control_plane.stage_messages[0]
-        assert msg.shm_metadata == {
-            "_ipc": True,
-            "data": codes.tolist(),
-            "metadata": {"modality": "audio_codes"},
-        }
+        assert msg.shm_metadata["_ipc"] is True
+        assert msg.shm_metadata["data"] == codes.tolist()
+        assert msg.shm_metadata["metadata"] == {"modality": "audio_codes"}
+        assert msg.shm_metadata["transport"] == "cuda_ipc_stream"
+        assert "relay_info" not in msg.shm_metadata
 
     asyncio.run(_run())
 
