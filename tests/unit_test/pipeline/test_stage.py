@@ -831,7 +831,11 @@ def test_stage_sends_same_process_stream_chunk_as_local_object(monkeypatch) -> N
             "request_id": "req-stream-local",
             "stage": "talker",
             "event_name": "stage_stream_chunk_received",
-            "metadata": {"from_stage": "thinker", "chunk_id": 0},
+            "metadata": {
+                "from_stage": "thinker",
+                "chunk_id": 0,
+                "transport": "local_stream",
+            },
         }
     ]
 
