@@ -402,3 +402,21 @@ def test_build_report_returns_all_three_views(tmp_path: Path) -> None:
     assert any(
         r["src"] == "encoder" and r["dst"] == "thinker" for r in rep["hop_breakdown"]
     )
+
+
+def test_build_report_separates_admin_events_from_request_views(tmp_path: Path) -> None:
+    events = [
+        _ev(
+            "admin:run:thinker:cuda_graph_audit", "thinker", "stage_cuda_graph_audit", 0
+        ),
+        _ev("r1", "coordinator", "request_admission", 10),
+        _ev("r1", "coordinator", "terminal_response", 20),
+    ]
+    _write_events(tmp_path / "events_x.jsonl", events)
+
+    rep = build_report(tmp_path)
+
+    assert rep["request_count"] == 1
+    assert set(rep["timelines"]) == {"r1"}
+    assert len(rep["admin_events"]) == 1
+    assert rep["admin_events"][0]["event_name"] == "stage_cuda_graph_audit"

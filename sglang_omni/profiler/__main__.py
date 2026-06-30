@@ -52,7 +52,18 @@ def _main(argv: list[str] | None = None) -> int:
             + "\n## Hop breakdown\n"
             + format_table(
                 report["hop_breakdown"],
-                ["src", "dst", "kind", "count", "total_ms", "avg_ms", "p95_ms"],
+                [
+                    "src",
+                    "dst",
+                    "kind",
+                    "transport",
+                    "modality",
+                    "count",
+                    "total_ms",
+                    "avg_ms",
+                    "p95_ms",
+                    "total_bytes",
+                ],
             )
         )
 

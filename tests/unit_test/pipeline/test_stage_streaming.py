@@ -476,8 +476,8 @@ def test_stage_stream_chunk_received_after_relay_materialization(monkeypatch) ->
     """Cross-GPU chunks emit receive only after relay data and metadata are restored."""
     order: list[str] = []
 
-    async def fake_read_blob(relay, key, metadata):
-        del relay, key, metadata
+    async def fake_read_blob(relay, key, metadata, *, request_id=None):
+        del relay, key, metadata, request_id
         order.append("blob")
         return "chunk"
 

@@ -71,10 +71,19 @@ Supporting events used for finer-grained breakdown:
 | Stage | `stage_dispatch` | Scheduler inbox put |
 | Stage | `stage_complete` | Scheduler result routed onward (metadata `terminal`, `next`) |
 | Stage | `stage_hop_sent` | Payload `DataReadyMessage` sent to next stage |
-| Stage | `stage_stream_chunk_sent` | Each stream chunk (metadata `to_stage`, `chunk_id`, `modality`) |
+| Stage | `stage_stream_chunk_sent` | Each stream chunk (metadata `to_stage`, `chunk_id`, `modality`, `transport`) |
 | Stage | `stage_stream_chunk_received` | Each stream chunk materialized and ready for the receiver scheduler, including coordinator terminal chunks |
-| AR scheduler | `scheduler_queue_enter` | Built request entered the scheduler queue |
+| Relay IO | `relay_payload_write` / `relay_payload_read` | Payload pickle bytes, transfer bytes, tensor counts, transport device, async submit/wait timings |
+| Relay IO | `relay_blob_write` / `relay_blob_read` | Stream blob transfer size, tensor shape/dtype, source/transport device, async submit/wait timings |
+| Relay IO | `relay_stream_put_wait` / `relay_payload_put_wait` | Sender wait after notifying the receiver; useful for NIXL/SHM/RDMA stalls |
+| Preprocessor | `media_cache_key_start` / `_end` | Image/video/audio cache-key work, source kind, input counts |
+| Preprocessor | `media_load_start` / `_end` | Async image/video/audio load/decode boundary, video sampling knobs, extracted audio count |
+| Preprocessor | `chat_template_start` / `_end` | Chat-template latency and prompt character count |
+| Preprocessor | `hf_processor_start` / `_end` | HF processor tensor construction and output tensor summary |
+| AR scheduler | `scheduler_queue_enter` | Built request entered the scheduler queue, including queue/KV request metadata |
+| AR scheduler | `scheduler_request_memory_snapshot` | Request admission memory/KV snapshot, process GPU memory when NVML is available |
 | AR scheduler | `scheduler_first_emit` | First `stream_output_builder` emission per request |
+| Admin/startup | `stage_cuda_graph_audit` | CUDA graph coverage report emitted on profiler start for AR stages |
 
 Custom callsites can call `sglang_omni.profiler.event_recorder.emit(...)` to
 add domain-specific events. Events from inactive recorders are no-ops, so
@@ -138,6 +147,14 @@ The torch profiler and the event recorder share a `run_id`. Setting
 `enable_torch=false` on the start request records JSONL events without
 paying for a kernel trace.
 
+Start/stop HTTP responses include `profiler_targets` with
+`requested_stages`, `sent_stages`, `missing_stages`, and `known_stages`.
+This is route-level delivery metadata from the launcher process, not an ACK
+from stage compute after the message is handled.
+
+AR stage `model_info` admin results include `cuda_graph_audit`, the same
+coverage payload emitted as `stage_cuda_graph_audit` when profiling starts.
+
 ## Generating reports
 
 Use the views module directly:
@@ -156,7 +173,7 @@ python -m sglang_omni.profiler /tmp/profiles/demo-run/events --format json --out
 ```
 
 The CLI / `build_report` returns three views derived from the same event
-stream:
+stream, plus admin/startup events:
 
 1. **Timeline** — per-request event list with `t_rel_ms` anchored at
    admission.
@@ -168,8 +185,13 @@ stream:
    not consume the opener of pair B.
 3. **Hop breakdown** — `stage_hop_sent` / `stage_input_received` and
    `stage_stream_chunk_sent` / `stage_stream_chunk_received` durations per
-   (source, destination, kind). Terminal stage stream chunks are paired the
-   same way with destination `coordinator`.
+   (source, destination, kind, transport, modality), with accumulated byte
+   counts when the sender event includes payload or stream tensor sizes.
+   Terminal stage stream chunks are paired the same way with destination
+   `coordinator`.
+4. **Admin events** — non-request events with `request_id` prefixed by
+   `admin:`. These are kept in the JSON report but excluded from
+   `request_count`, stage breakdowns, and hop breakdowns.
 
 Hop pairs match across processes by `(request_id, source_stage, dest_stage,
 chunk_id?)`, so a single request's path through subprocesses can be

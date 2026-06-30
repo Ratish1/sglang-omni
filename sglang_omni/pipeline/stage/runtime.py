@@ -24,6 +24,7 @@ from sglang_omni.pipeline.tp_control import TPLeaderFanout, TPWorkMessage
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
 from sglang_omni.profiler.event_recorder import set_active_stage as _set_active_stage
+from sglang_omni.profiler.metadata import ElapsedTimer, object_summary
 from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.proto import (
     AdminMessage,
@@ -46,6 +47,12 @@ logger = logging.getLogger(__name__)
 
 GetNextFn = Callable[[str, Any], str | list[str] | None]
 GetStreamDoneTargetsFn = Callable[[str, Any], str | list[str] | None]
+
+
+def _object_summary_if_recording(value: Any, *, prefix: str) -> dict[str, Any]:
+    if not _get_recorder().is_active():
+        return {}
+    return object_summary(value, prefix=prefix)
 
 
 class Stage:
@@ -343,6 +350,8 @@ class Stage:
             request_id=request_id,
             from_stage=from_stage,
             chunk_id=chunk_id,
+            transport="local_stream",
+            data=data,
         )
         await self._route_stream_item_or_fail(request_id, item)
 
@@ -418,6 +427,8 @@ class Stage:
                 request_id=msg.request_id,
                 from_stage=msg.from_stage,
                 chunk_id=msg.chunk_id,
+                transport="cuda_ipc_stream",
+                data=item.data,
             )
             await self._route_stream_item_or_fail(request_id, item)
             return
@@ -425,7 +436,12 @@ class Stage:
         # Cross-GPU: relay
         blob_key = f"{request_id}:stream:{msg.from_stage}:{msg.to_stage}:{msg.chunk_id}"
         try:
-            data = await relay_io.read_blob(self.relay, blob_key, msg.shm_metadata)
+            data = await relay_io.read_blob(
+                self.relay,
+                blob_key,
+                msg.shm_metadata,
+                request_id=request_id,
+            )
             metadata = await self._read_chunk_metadata(msg.shm_metadata, blob_key)
         except Exception as exc:
             logger.error(
@@ -450,6 +466,12 @@ class Stage:
             request_id=msg.request_id,
             from_stage=msg.from_stage,
             chunk_id=msg.chunk_id,
+            transport=(
+                msg.shm_metadata.get("transport")
+                if isinstance(msg.shm_metadata, dict)
+                else "relay_stream"
+            ),
+            data=data,
         )
         await self._route_stream_item_or_fail(request_id, item)
 
@@ -459,12 +481,22 @@ class Stage:
         request_id: str,
         from_stage: str,
         chunk_id: int | None,
+        transport: str | None = None,
+        data: Any | None = None,
     ) -> None:
+        metadata: dict[str, Any] = {
+            "from_stage": from_stage,
+            "chunk_id": chunk_id,
+        }
+        if transport is not None:
+            metadata["transport"] = transport
+        if data is not None:
+            metadata.update(_object_summary_if_recording(data, prefix="data_"))
         _emit_event(
             request_id=request_id,
             stage=self.name,
             event_name="stage_stream_chunk_received",
-            metadata={"from_stage": from_stage, "chunk_id": chunk_id},
+            metadata=metadata,
         )
 
     async def _route_stream_item_or_fail(
@@ -528,7 +560,10 @@ class Stage:
                 meta_metadata = info.get("relay_metadata")
                 if isinstance(meta_blob_key, str) and isinstance(meta_metadata, dict):
                     tensor_dict[path] = await relay_io.read_blob(
-                        self.relay, meta_blob_key, meta_metadata
+                        self.relay,
+                        meta_blob_key,
+                        meta_metadata,
+                        request_id=blob_key.split(":", 1)[0],
                     )
             if tensor_dict:
                 metadata = relay_io.restore_tensors(metadata, tensor_dict)
@@ -556,7 +591,12 @@ class Stage:
             f"{msg.request_id}:stream:{msg.from_stage}:{msg.to_stage}:{msg.chunk_id}"
         )
         try:
-            await relay_io.read_blob(self.relay, blob_key, msg.shm_metadata)
+            await relay_io.read_blob(
+                self.relay,
+                blob_key,
+                msg.shm_metadata,
+                request_id=msg.request_id,
+            )
             await self._read_chunk_metadata(msg.shm_metadata, blob_key)
         except Exception:
             logger.debug(
@@ -965,7 +1005,14 @@ class Stage:
                 request_id=request_id,
                 stage=self.name,
                 event_name="stage_hop_sent",
-                metadata={"to_stage": target, "transport": "local_object"},
+                metadata={
+                    "to_stage": target,
+                    "transport": "local_object",
+                    **_object_summary_if_recording(
+                        getattr(projected_payload, "data", projected_payload),
+                        prefix="payload_",
+                    ),
+                },
             )
             await self._local_dispatcher.send_payload(
                 from_stage=self.name,
@@ -988,10 +1035,32 @@ class Stage:
             request_id=request_id,
             stage=self.name,
             event_name="stage_hop_sent",
-            metadata={"to_stage": target},
+            metadata={
+                "to_stage": target,
+                "transport": "relay_payload",
+                **_object_summary_if_recording(
+                    getattr(projected_payload, "data", projected_payload),
+                    prefix="payload_",
+                ),
+            },
         )
         await self.control_plane.send_to_stage(target, endpoint, msg)
-        await op.wait_for_completion()
+        if _get_recorder().is_active():
+            wait_timer = ElapsedTimer.start()
+            await op.wait_for_completion()
+            wait_timer.stop()
+            _emit_event(
+                request_id=request_id,
+                stage=self.name,
+                event_name="relay_payload_put_wait",
+                metadata={
+                    "to_stage": target,
+                    "transport": "relay_payload",
+                    "wait_ms": round(wait_timer.elapsed_ms, 3),
+                },
+            )
+        else:
+            await op.wait_for_completion()
 
     @staticmethod
     def _is_isolated_projected_payload(
@@ -1107,13 +1176,27 @@ class Stage:
         chunk_modality = (
             metadata.get("modality") if isinstance(metadata, dict) else None
         )
+        transport = (
+            "local_stream"
+            if target in self._same_process_targets
+            else relay_io.stream_chunk_transport(
+                data=data,
+                metadata=metadata,
+                target_stage=target,
+                same_gpu_targets=self._same_gpu_targets,
+            )
+        )
         if request_id not in self._first_stream_chunk_seen:
             self._first_stream_chunk_seen.add(request_id)
             _emit_event(
                 request_id=request_id,
                 stage=self.name,
                 event_name="stage_first_stream_chunk_sent",
-                metadata={"to_stage": target, "modality": chunk_modality},
+                metadata={
+                    "to_stage": target,
+                    "modality": chunk_modality,
+                    "transport": transport,
+                },
             )
         _emit_event(
             request_id=request_id,
@@ -1123,6 +1206,8 @@ class Stage:
                 "to_stage": target,
                 "chunk_id": chunk_id,
                 "modality": chunk_modality,
+                "transport": transport,
+                **_object_summary_if_recording(data, prefix="data_"),
             },
         )
         if target in self._same_process_targets:
@@ -1235,6 +1320,7 @@ class Stage:
                     "to_stage": "coordinator",
                     "chunk_id": chunk_id,
                     "modality": modality,
+                    "transport": "coordinator_stream",
                 },
             )
         _emit_event(
@@ -1245,6 +1331,8 @@ class Stage:
                 "to_stage": "coordinator",
                 "chunk_id": chunk_id,
                 "modality": modality,
+                "transport": "coordinator_stream",
+                **_object_summary_if_recording(data, prefix="data_"),
             },
         )
         await self.control_plane.send_stream(msg)
@@ -1340,6 +1428,7 @@ class Stage:
                 _get_recorder().start(
                     run_id=run_id, event_dir=msg.event_dir, stage=self.name
                 )
+                self._emit_cuda_graph_audit(run_id)
             except Exception:
                 logger.warning(
                     "Stage %s failed to start request event recorder",
@@ -1358,6 +1447,26 @@ class Stage:
             msg.run_id is None or recorder.active_run_id() == msg.run_id
         ):
             recorder.stop(run_id=msg.run_id)
+
+    def _emit_cuda_graph_audit(self, run_id: str) -> None:
+        audit_fn = getattr(self.scheduler, "cuda_graph_audit", None)
+        if not callable(audit_fn):
+            return
+        try:
+            audit = audit_fn(self.name)
+        except Exception:
+            logger.debug(
+                "Stage %s failed to build CUDA graph audit metadata",
+                self.name,
+                exc_info=True,
+            )
+            return
+        _emit_event(
+            request_id=f"admin:{run_id}:{self.name}:cuda_graph_audit",
+            stage=self.name,
+            event_name="stage_cuda_graph_audit",
+            metadata=audit,
+        )
 
     def _on_background_task_done(self, task: asyncio.Task, label: str) -> None:
         if task.cancelled():

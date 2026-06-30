@@ -20,6 +20,7 @@ import time
 import types
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict
 from typing import Any, Callable
 
 import torch
@@ -33,6 +34,7 @@ from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
@@ -45,6 +47,13 @@ from sglang_omni.proto.admin import (
     ADMIN_WEIGHTS_CHECKER,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.utils.cuda_graph_batch_validator import (
+    validate_stage as validate_cuda_graph_stage,
+)
+from sglang_omni.utils.gpu_memory import (
+    get_gpu_device_info,
+    get_process_gpu_memory_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -700,8 +709,18 @@ class OmniScheduler:
                 self._emit_request_error(req_id, ValueError(error_msg))
                 self.abort(req_id)
                 return
+        self._emit_request_memory_snapshot(
+            req_id,
+            req,
+            phase="admission_before_kv_check",
+        )
         kv_error = self._request_kv_capacity_error(req)
         if kv_error is not None:
+            self._emit_request_memory_snapshot(
+                req_id,
+                req,
+                phase="admission_kv_reject",
+            )
             logger.warning(f"Rejecting request {req_id} before scheduling: {kv_error}")
             self._emit_request_error(req_id, ValueError(kv_error))
             self.abort(req_id)
@@ -720,6 +739,11 @@ class OmniScheduler:
                 request_id=req_id,
                 stage=None,
                 event_name="scheduler_queue_enter",
+                metadata=(
+                    self._scheduler_queue_metadata(req)
+                    if _get_event_recorder().is_active()
+                    else None
+                ),
             )
             self.waiting_queue.append(req)
 
@@ -742,6 +766,100 @@ class OmniScheduler:
         if hasattr(req_data, "max_new_tokens"):
             req_data.max_new_tokens = int(req.sampling_params.max_new_tokens)
         return None
+
+    def _emit_request_memory_snapshot(
+        self,
+        request_id: str,
+        req: Any,
+        *,
+        phase: str,
+    ) -> None:
+        if not getattr(self, "is_entry_rank", True):
+            return
+        if not _get_event_recorder().is_active():
+            return
+        metadata = self._scheduler_queue_metadata(req)
+        metadata["phase"] = phase
+
+        try:
+            process_gpu_memory_bytes = get_process_gpu_memory_bytes(self.gpu_id)
+        except RuntimeError as exc:
+            process_gpu_memory_bytes = None
+            metadata["process_gpu_memory_error"] = str(exc)
+        metadata["process_gpu_memory_bytes"] = process_gpu_memory_bytes
+
+        device_info = get_gpu_device_info(self.gpu_id)
+        metadata.update(
+            {
+                "gpu_logical_id": device_info.logical_gpu_id,
+                "gpu_device_id": device_info.device_id,
+                "gpu_name": device_info.name,
+                "gpu_total_memory_bytes": device_info.total_memory_bytes,
+            }
+        )
+        if (
+            process_gpu_memory_bytes is not None
+            and device_info.total_memory_bytes is not None
+            and device_info.total_memory_bytes > 0
+        ):
+            metadata["process_gpu_memory_fraction"] = (
+                process_gpu_memory_bytes / device_info.total_memory_bytes
+            )
+
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="scheduler_request_memory_snapshot",
+            metadata=metadata,
+        )
+
+    def _scheduler_queue_metadata(self, req: Any) -> dict[str, Any]:
+        metadata = self._request_token_metadata(req)
+        metadata.update(
+            {
+                "kv_capacity": int(self.max_req_len),
+                "max_total_num_tokens": int(self.max_total_num_tokens),
+                "max_prefill_tokens": int(self.max_prefill_tokens),
+                "max_running_requests": int(self.max_running_requests),
+                "max_queued_requests": int(self.max_queued_requests or 0),
+                "max_req_len": int(self.max_req_len),
+                "waiting_queue_size": len(self.waiting_queue),
+                "running_batch_size": len(
+                    getattr(self.running_batch, "reqs", []) or []
+                ),
+                "pending_request_builds": len(self._pending_request_builds),
+                "request_build_backlog_size": len(
+                    self._backlogged_request_build_payloads
+                ),
+                "mem_fraction_static": self.server_args.mem_fraction_static,
+                "kv_available_tokens": self._kv_available_tokens(),
+            }
+        )
+        return metadata
+
+    def _request_token_metadata(self, req: Any) -> dict[str, int]:
+        input_len = len(getattr(req, "origin_input_ids", []) or [])
+        sampling_params = getattr(req, "sampling_params", None)
+        max_new_tokens = int(getattr(sampling_params, "max_new_tokens", 0) or 0)
+        return {
+            "input_tokens": input_len,
+            "max_new_tokens": max_new_tokens,
+            "required_tokens": input_len + max_new_tokens,
+        }
+
+    def _kv_available_tokens(self) -> int | None:
+        available_size = getattr(
+            self.token_to_kv_pool_allocator,
+            "available_size",
+            None,
+        )
+        if not callable(available_size):
+            return None
+        try:
+            return int(available_size())
+        except Exception:
+            logger.debug("Failed to query KV allocator available_size", exc_info=True)
+            return None
 
     def _take_deferred_request_payloads(self) -> list[Any]:
         if not self._dirty_deferred_request_ids:
@@ -1202,9 +1320,29 @@ class OmniScheduler:
                 "model_path": getattr(self.server_args, "model_path", None),
                 "load_format": getattr(self.server_args, "load_format", None),
                 "weight_version": getattr(self.server_args, "weight_version", None),
+                "cuda_graph_audit": self.cuda_graph_audit(),
             }
         )
         return {"success": True, "message": "ok", "data": info}
+
+    def cuda_graph_audit(self, stage_name: str | None = None) -> dict[str, Any]:
+        stage = stage_name or _get_active_stage() or "unknown"
+        model_runner = getattr(self.model_worker, "model_runner", None)
+        if model_runner is None:
+            model_runner = self._model_runner
+        if model_runner is None:
+            return {
+                "stage": stage,
+                "is_valid": True,
+                "findings": ["no model_runner attached; CUDA graph audit skipped."],
+            }
+        report = validate_cuda_graph_stage(
+            stage,
+            model_runner,
+        )
+        data = asdict(report)
+        data["max_captured_bs"] = report.max_captured_bs
+        return data
 
     def _admin_pause_generation(self, payload: dict[str, Any]) -> dict[str, Any]:
         mode = str(payload.get("mode") or "abort")

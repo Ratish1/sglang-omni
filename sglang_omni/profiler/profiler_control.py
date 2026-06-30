@@ -46,10 +46,12 @@ class ProfilerControlClient:
         stages: list[str] | None = None,
         event_dir: str | None = None,
         enable_torch: bool = True,
-    ) -> None:
+    ) -> dict[str, Any]:
         await self.start()
         assert self._socks is not None
         targets = stages or list(self._socks.keys())
+        sent: list[str] = []
+        missing: list[str] = []
         msg = ProfilerStartMessage(
             run_id=run_id,
             trace_path_template=trace_path_template,
@@ -59,8 +61,10 @@ class ProfilerControlClient:
         for s in targets:
             sock = self._socks.get(s)
             if sock is None:
+                missing.append(s)
                 continue
             await sock.send(msg)
+            sent.append(s)
         logger.info(
             "Broadcast profiler_start run_id=%s event_dir=%s torch=%s to stages=%s",
             run_id,
@@ -68,20 +72,36 @@ class ProfilerControlClient:
             enable_torch,
             targets,
         )
+        return {
+            "requested_stages": targets,
+            "sent_stages": sent,
+            "missing_stages": missing,
+            "known_stages": list(self._socks.keys()),
+        }
 
     async def broadcast_stop(
         self,
         run_id: str | None = None,
         stages: list[str] | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Broadcast stop. ``run_id=None`` is a wildcard."""
         await self.start()
         assert self._socks is not None
         targets = stages or list(self._socks.keys())
+        sent: list[str] = []
+        missing: list[str] = []
         msg = ProfilerStopMessage(run_id=run_id)
         for s in targets:
             sock = self._socks.get(s)
             if sock is None:
+                missing.append(s)
                 continue
             await sock.send(msg)
+            sent.append(s)
         logger.info("Broadcast profiler_stop run_id=%s to stages=%s", run_id, targets)
+        return {
+            "requested_stages": targets,
+            "sent_stages": sent,
+            "missing_stages": missing,
+            "known_stages": list(self._socks.keys()),
+        }

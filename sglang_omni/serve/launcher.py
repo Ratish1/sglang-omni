@@ -215,7 +215,7 @@ def _mount_profiler_routes(
                     "Failed to start coordinator request event recorder",
                     exc_info=True,
                 )
-        await profiler_ctl.broadcast_start(
+        profiler_targets = await profiler_ctl.broadcast_start(
             run_id=run_id,
             trace_path_template=tpl,
             config=req.config,
@@ -227,6 +227,7 @@ def _mount_profiler_routes(
             "trace_path_template": tpl,
             "event_dir": event_dir,
             "enable_torch": req.enable_torch,
+            "profiler_targets": profiler_targets,
         }
 
     @router.post("/start_request_profile")
@@ -253,13 +254,17 @@ def _mount_profiler_routes(
                 "Failed to start coordinator request event recorder",
                 exc_info=True,
             )
-        await profiler_ctl.broadcast_start(
+        profiler_targets = await profiler_ctl.broadcast_start(
             run_id=run_id,
             trace_path_template="",
             event_dir=event_dir,
             enable_torch=False,
         )
-        return {"run_id": run_id, "event_dir": event_dir}
+        return {
+            "run_id": run_id,
+            "event_dir": event_dir,
+            "profiler_targets": profiler_targets,
+        }
 
     @router.post("/stop_profile")
     async def stop(req: StopReq):
@@ -269,8 +274,8 @@ def _mount_profiler_routes(
         active = recorder.active_run_id() if recorder.is_active() else None
         if recorder.is_active() and (run_id is None or active == run_id):
             recorder.stop(run_id=active)
-        await profiler_ctl.broadcast_stop(run_id=run_id)
-        return {"run_id": run_id or active}
+        profiler_targets = await profiler_ctl.broadcast_stop(run_id=run_id)
+        return {"run_id": run_id or active, "profiler_targets": profiler_targets}
 
     @router.post("/stop_request_profile")
     async def stop_request(req: StopReq):
@@ -280,8 +285,8 @@ def _mount_profiler_routes(
         active = recorder.active_run_id() if recorder.is_active() else None
         if recorder.is_active() and (run_id is None or active == run_id):
             recorder.stop(run_id=active)
-        await profiler_ctl.broadcast_stop(run_id=run_id)
-        return {"run_id": run_id or active}
+        profiler_targets = await profiler_ctl.broadcast_stop(run_id=run_id)
+        return {"run_id": run_id or active, "profiler_targets": profiler_targets}
 
     app.include_router(router)
 

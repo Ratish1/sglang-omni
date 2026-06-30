@@ -287,24 +287,30 @@ class HopBreakdownRow:
     src_stage: str
     dst_stage: str
     kind: str  # "payload" or "stream_chunk"
+    transport: str
+    modality: str | None
     count: int
     total_ms: float
     avg_ms: float
     p50_ms: float
     p95_ms: float
     max_ms: float
+    total_bytes: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "src": self.src_stage,
             "dst": self.dst_stage,
             "kind": self.kind,
+            "transport": self.transport,
+            "modality": self.modality,
             "count": self.count,
             "total_ms": round(self.total_ms, 3),
             "avg_ms": round(self.avg_ms, 3),
             "p50_ms": round(self.p50_ms, 3),
             "p95_ms": round(self.p95_ms, 3),
             "max_ms": round(self.max_ms, 3),
+            "total_bytes": self.total_bytes,
         }
 
 
@@ -323,9 +329,14 @@ def hop_breakdown(
             raise ValueError("hop_breakdown requires timelines or source")
         timelines = reconstruct_timelines(source)
 
-    # Pending sends keyed by (rid, src, dst, kind, chunk_id_or_None) -> list of ts.
-    pending: dict[tuple[str, str, str, str, int | None], list[int]] = defaultdict(list)
-    durations: dict[tuple[str, str, str], list[float]] = defaultdict(list)
+    # Pending sends keyed by (rid, src, dst, kind, chunk_id_or_None) -> send records.
+    pending: dict[tuple[str, str, str, str, int | None], list[dict[str, Any]]] = (
+        defaultdict(list)
+    )
+    durations: dict[tuple[str, str, str, str, str | None], list[float]] = defaultdict(
+        list
+    )
+    bytes_by_key: dict[tuple[str, str, str, str, str | None], int] = defaultdict(int)
 
     for rid, tl in timelines.items():
         for ev in tl.events:
@@ -335,11 +346,26 @@ def hop_breakdown(
             stage = ev.get("stage", "unknown")
             if name == "stage_hop_sent":
                 dst = md.get("to_stage", "?")
-                pending[(rid, stage, dst, "payload", None)].append(ts)
+                pending[(rid, stage, dst, "payload", None)].append(
+                    {
+                        "timestamp_ns": ts,
+                        "transport": md.get("transport", "unknown"),
+                        "modality": md.get("modality"),
+                        "bytes": md.get("payload_bytes")
+                        or md.get("payload_tensor_bytes"),
+                    }
+                )
             elif name == "stage_stream_chunk_sent":
                 dst = md.get("to_stage", "?")
                 chunk_id = md.get("chunk_id")
-                pending[(rid, stage, dst, "stream_chunk", chunk_id)].append(ts)
+                pending[(rid, stage, dst, "stream_chunk", chunk_id)].append(
+                    {
+                        "timestamp_ns": ts,
+                        "transport": md.get("transport", "unknown"),
+                        "modality": md.get("modality"),
+                        "bytes": md.get("data_bytes") or md.get("data_tensor_bytes"),
+                    }
+                )
             elif name == "stage_input_received":
                 src = md.get("from_stage")
                 if not src or src == "coordinator":
@@ -347,8 +373,17 @@ def hop_breakdown(
                 key = (rid, src, stage, "payload", None)
                 stack = pending.get(key)
                 if stack:
-                    open_ns = stack.pop(0)
-                    durations[(src, stage, "payload")].append((ts - open_ns) / 1e6)
+                    record = stack.pop(0)
+                    open_ns = int(record["timestamp_ns"])
+                    group_key = (
+                        src,
+                        stage,
+                        "payload",
+                        str(record.get("transport") or "unknown"),
+                        record.get("modality"),
+                    )
+                    durations[group_key].append((ts - open_ns) / 1e6)
+                    _add_bytes(bytes_by_key, group_key, record.get("bytes"))
             elif name == "stage_stream_chunk_received":
                 src = md.get("from_stage")
                 chunk_id = md.get("chunk_id")
@@ -357,27 +392,54 @@ def hop_breakdown(
                 key = (rid, src, stage, "stream_chunk", chunk_id)
                 stack = pending.get(key)
                 if stack:
-                    open_ns = stack.pop(0)
-                    durations[(src, stage, "stream_chunk")].append((ts - open_ns) / 1e6)
+                    record = stack.pop(0)
+                    open_ns = int(record["timestamp_ns"])
+                    group_key = (
+                        src,
+                        stage,
+                        "stream_chunk",
+                        str(record.get("transport") or "unknown"),
+                        record.get("modality"),
+                    )
+                    durations[group_key].append((ts - open_ns) / 1e6)
+                    _add_bytes(bytes_by_key, group_key, record.get("bytes"))
 
     rows: list[HopBreakdownRow] = []
-    for (src, dst, kind), values in durations.items():
+    for (src, dst, kind, transport, modality), values in durations.items():
         values.sort()
+        total_bytes = bytes_by_key.get((src, dst, kind, transport, modality))
         rows.append(
             HopBreakdownRow(
                 src_stage=src,
                 dst_stage=dst,
                 kind=kind,
+                transport=transport,
+                modality=modality,
                 count=len(values),
                 total_ms=sum(values),
                 avg_ms=sum(values) / len(values),
                 p50_ms=_percentile(values, 0.50),
                 p95_ms=_percentile(values, 0.95),
                 max_ms=values[-1],
+                total_bytes=total_bytes if total_bytes else None,
             )
         )
-    rows.sort(key=lambda r: (-r.total_ms, r.src_stage, r.dst_stage))
+    rows.sort(
+        key=lambda r: (-r.total_ms, r.src_stage, r.dst_stage, r.kind, r.transport)
+    )
     return rows
+
+
+def _add_bytes(
+    totals: dict[tuple[str, str, str, str, str | None], int],
+    key: tuple[str, str, str, str, str | None],
+    value: Any,
+) -> None:
+    try:
+        if value is not None:
+            totals[key] += int(value)
+    except (TypeError, ValueError):
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -388,12 +450,28 @@ def hop_breakdown(
 def build_report(source: str | Path | Iterable[str | Path]) -> dict[str, Any]:
     """Return all three views as a single dict for JSON serialization."""
     timelines = reconstruct_timelines(source)
-    return {
-        "timelines": {rid: tl.to_relative() for rid, tl in timelines.items()},
-        "stage_breakdown": [row.to_dict() for row in stage_breakdown(timelines)],
-        "hop_breakdown": [row.to_dict() for row in hop_breakdown(timelines)],
-        "request_count": len(timelines),
+    request_timelines = {
+        rid: tl for rid, tl in timelines.items() if not _is_admin_request_id(rid)
     }
+    admin_events = [
+        event
+        for rid, timeline in timelines.items()
+        if _is_admin_request_id(rid)
+        for event in timeline.to_relative()
+    ]
+    return {
+        "timelines": {rid: tl.to_relative() for rid, tl in request_timelines.items()},
+        "admin_events": admin_events,
+        "stage_breakdown": [
+            row.to_dict() for row in stage_breakdown(request_timelines)
+        ],
+        "hop_breakdown": [row.to_dict() for row in hop_breakdown(request_timelines)],
+        "request_count": len(request_timelines),
+    }
+
+
+def _is_admin_request_id(request_id: Any) -> bool:
+    return isinstance(request_id, str) and request_id.startswith("admin:")
 
 
 def format_table(rows: list[dict[str, Any]], columns: list[str]) -> str:

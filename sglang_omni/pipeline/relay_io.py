@@ -16,6 +16,9 @@ from typing import Any
 
 import torch
 
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
+from sglang_omni.profiler.metadata import ElapsedTimer, object_summary, tensor_stats
 from sglang_omni.proto import DataReadyMessage, StagePayload
 from sglang_omni.relay.base import Relay
 
@@ -96,6 +99,8 @@ async def write_payload(
     payload: StagePayload,
 ) -> tuple[dict[str, Any], Any]:
     """Write a StagePayload to relay. Returns (control_plane_metadata, relay_op)."""
+    recording = _is_event_recording()
+    timer = ElapsedTimer.start() if recording else None
     device = getattr(relay, "device", "cpu")
     transport_device = torch.device(device)
 
@@ -106,6 +111,12 @@ async def write_payload(
         data=modified_data,
     )
     metadata_bytes = pickle.dumps(payload_no_tensors)
+    stats_metadata = tensor_stats(payload.data).to_metadata() if recording else {}
+    copy_count = (
+        _count_transport_device_copies(tensor_dict.values(), transport_device)
+        if recording
+        else 0
+    )
 
     if tensor_dict:
         tensor_buffers = []
@@ -137,7 +148,25 @@ async def write_payload(
         all_tensors = torch.zeros(1, dtype=torch.uint8, device=device)
         tensor_info = []
 
+    put_timer = ElapsedTimer.start() if recording else None
     op = await relay.put_async(all_tensors, request_id=request_id)
+    if recording and put_timer is not None and timer is not None:
+        put_timer.stop()
+        timer.stop()
+        _emit_relay_event(
+            request_id=request_id,
+            event_name="relay_payload_write",
+            metadata={
+                "relay_backend": type(relay).__name__,
+                "transport_device": str(transport_device),
+                "payload_pickle_bytes": len(metadata_bytes),
+                "transfer_bytes": int(all_tensors.numel()),
+                "transport_copy_count": copy_count,
+                "put_async_ms": round(put_timer.elapsed_ms, 3),
+                "duration_ms": round(timer.elapsed_ms, 3),
+                **stats_metadata,
+            },
+        )
 
     return {
         "relay_info": op.metadata,
@@ -152,6 +181,8 @@ async def read_payload(
     metadata: dict[str, Any],
 ) -> StagePayload:
     """Read a StagePayload from relay using control_plane metadata."""
+    recording = _is_event_recording()
+    timer = ElapsedTimer.start() if recording else None
     device = getattr(relay, "device", "cpu")
 
     payload_bytes = base64.b64decode(metadata["payload_pickle"])
@@ -163,10 +194,16 @@ async def read_payload(
 
     data_size = relay_info["transfer_info"]["size"]
     recv_tensor = torch.zeros(data_size, dtype=torch.uint8, device=device)
+    get_timer = ElapsedTimer.start() if recording else None
     op = await relay.get_async(
         metadata=relay_info, dest_tensor=recv_tensor, request_id=request_id
     )
+    if get_timer is not None:
+        get_timer.stop()
+    wait_timer = ElapsedTimer.start() if recording else None
     await op.wait_for_completion()
+    if wait_timer is not None:
+        wait_timer.stop()
 
     if tensor_info:
         for info in tensor_info:
@@ -187,6 +224,28 @@ async def read_payload(
         data=restored_data,
     )
     relay.cleanup(request_id)
+    if (
+        recording
+        and timer is not None
+        and get_timer is not None
+        and wait_timer is not None
+    ):
+        timer.stop()
+        _emit_relay_event(
+            request_id=request_id,
+            event_name="relay_payload_read",
+            metadata={
+                "relay_backend": type(relay).__name__,
+                "transport_device": str(device),
+                "payload_pickle_bytes": len(payload_bytes),
+                "transfer_bytes": int(data_size),
+                "tensor_count": len(tensor_info),
+                "get_async_ms": round(get_timer.elapsed_ms, 3),
+                "wait_ms": round(wait_timer.elapsed_ms, 3),
+                "duration_ms": round(timer.elapsed_ms, 3),
+                **tensor_stats(restored_data).to_metadata(prefix="restored_"),
+            },
+        )
     return payload
 
 
@@ -199,10 +258,15 @@ async def write_blob(
     relay: Relay,
     key: str,
     tensor: torch.Tensor,
+    *,
+    request_id: str | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """Write a raw tensor to relay. Returns (metadata, relay_op)."""
+    recording = _is_event_recording()
+    timer = ElapsedTimer.start() if recording else None
     flat = tensor.contiguous().view(torch.uint8).reshape(-1)
     transport_device = torch.device(getattr(relay, "device", "cpu"))
+    copied_to_transport = flat.device != transport_device
     if flat.device != transport_device:
         flat = flat.to(device=transport_device)
     padding = _pad_offset(0, _dtype_alignment(tensor.dtype))
@@ -213,13 +277,35 @@ async def write_blob(
                 flat,
             ]
         )
+    put_timer = ElapsedTimer.start() if recording else None
     op = await relay.put_async(flat, request_id=key)
+    if put_timer is not None:
+        put_timer.stop()
+    if timer is not None:
+        timer.stop()
     metadata = {
         "relay_info": op.metadata,
         "tensor_shape": list(tensor.shape),
         "tensor_dtype": str(tensor.dtype),
         "tensor_offset": padding,
     }
+    if recording and put_timer is not None and timer is not None:
+        _emit_relay_event(
+            request_id=request_id or _request_id_from_blob_key(key),
+            event_name="relay_blob_write",
+            metadata={
+                "relay_backend": type(relay).__name__,
+                "blob_key_kind": _blob_key_kind(key),
+                "transport_device": str(transport_device),
+                "source_device": str(tensor.device),
+                "source_dtype": str(tensor.dtype),
+                "source_shape": list(tensor.shape),
+                "transfer_bytes": int(flat.numel()),
+                "transport_copy_count": int(copied_to_transport),
+                "put_async_ms": round(put_timer.elapsed_ms, 3),
+                "duration_ms": round(timer.elapsed_ms, 3),
+            },
+        )
     return metadata, op
 
 
@@ -227,8 +313,12 @@ async def read_blob(
     relay: Relay,
     key: str,
     metadata: dict[str, Any],
+    *,
+    request_id: str | None = None,
 ) -> torch.Tensor:
     """Read a raw tensor from relay."""
+    recording = _is_event_recording()
+    timer = ElapsedTimer.start() if recording else None
     device = getattr(relay, "device", "cpu")
     relay_info = metadata["relay_info"]
     shape = metadata["tensor_shape"]
@@ -237,13 +327,42 @@ async def read_blob(
 
     data_size = relay_info["transfer_info"]["size"]
     recv_buf = torch.zeros(data_size, dtype=torch.uint8, device=device)
+    get_timer = ElapsedTimer.start() if recording else None
     op = await relay.get_async(
         metadata=relay_info, dest_tensor=recv_buf, request_id=key
     )
+    if get_timer is not None:
+        get_timer.stop()
+    wait_timer = ElapsedTimer.start() if recording else None
     await op.wait_for_completion()
+    if wait_timer is not None:
+        wait_timer.stop()
 
     dtype = getattr(torch, dtype_str.replace("torch.", ""))
-    return recv_buf[offset:].view(dtype).reshape(shape)
+    tensor = recv_buf[offset:].view(dtype).reshape(shape)
+    if (
+        recording
+        and timer is not None
+        and get_timer is not None
+        and wait_timer is not None
+    ):
+        timer.stop()
+        _emit_relay_event(
+            request_id=request_id or _request_id_from_blob_key(key),
+            event_name="relay_blob_read",
+            metadata={
+                "relay_backend": type(relay).__name__,
+                "blob_key_kind": _blob_key_kind(key),
+                "transport_device": str(device),
+                "transfer_bytes": int(data_size),
+                "tensor_shape": list(shape),
+                "tensor_dtype": dtype_str,
+                "get_async_ms": round(get_timer.elapsed_ms, 3),
+                "wait_ms": round(wait_timer.elapsed_ms, 3),
+                "duration_ms": round(timer.elapsed_ms, 3),
+            },
+        )
+    return tensor
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +486,22 @@ def deserialize_ipc_metadata(value: Any) -> Any:
     return value
 
 
+def stream_chunk_transport(
+    *,
+    data: Any,
+    metadata: dict | None,
+    target_stage: str,
+    same_gpu_targets: set[str] | None = None,
+) -> str:
+    if (
+        same_gpu_targets
+        and target_stage in same_gpu_targets
+        and _should_use_cuda_ipc_stream_chunk(data, metadata)
+    ):
+        return "cuda_ipc_stream"
+    return "relay_stream"
+
+
 async def send_stream_chunk(
     relay: Relay,
     control_plane: Any,
@@ -379,25 +514,35 @@ async def send_stream_chunk(
     chunk_id: int,
     metadata: dict | None = None,
     same_gpu_targets: set[str] | None = None,
-) -> None:
+) -> str:
     """Send a streaming chunk to a downstream stage."""
     # Keep CUDA IPC limited to CUDA-dominant chunks with no CPU tensors and only
     # small inline Python metadata; otherwise the relay path keeps CPU-heavy
     # pieces out of the IPC control-plane pickle.
-    if (
-        same_gpu_targets
-        and target_stage in same_gpu_targets
-        and _should_use_cuda_ipc_stream_chunk(data, metadata)
-    ):
+    transport = stream_chunk_transport(
+        data=data,
+        metadata=metadata,
+        target_stage=target_stage,
+        same_gpu_targets=same_gpu_targets,
+    )
+    if transport == "cuda_ipc_stream":
         msg = DataReadyMessage(
             request_id=request_id,
             from_stage=from_stage,
             to_stage=target_stage,
-            shm_metadata=serialize_ipc_chunk(data, metadata),
+            shm_metadata={
+                **serialize_ipc_chunk(data, metadata),
+                "transport": transport,
+                **(
+                    {"data_summary": object_summary(data, prefix="data_")}
+                    if _is_event_recording()
+                    else {}
+                ),
+            },
             chunk_id=chunk_id,
         )
         await control_plane.send_to_stage(target_stage, target_endpoint, msg)
-        return
+        return transport
 
     if (
         same_gpu_targets
@@ -414,7 +559,7 @@ async def send_stream_chunk(
     blob_key = f"{request_id}:stream:{from_stage}:{target_stage}:{chunk_id}"
 
     pending_ops = []
-    relay_metadata, op = await write_blob(relay, blob_key, data)
+    relay_metadata, op = await write_blob(relay, blob_key, data, request_id=request_id)
     pending_ops.append(op)
 
     if metadata:
@@ -425,7 +570,7 @@ async def send_stream_chunk(
             for meta_idx, (tkey, tensor) in enumerate(tensor_dict.items()):
                 meta_blob_key = f"{blob_key}:meta:{meta_idx}"
                 meta_relay_info, meta_op = await write_blob(
-                    relay, meta_blob_key, tensor
+                    relay, meta_blob_key, tensor, request_id=request_id
                 )
                 pending_ops.append(meta_op)
                 metadata_refs[tkey] = {
@@ -433,6 +578,10 @@ async def send_stream_chunk(
                     "relay_metadata": meta_relay_info,
                 }
             relay_metadata["chunk_metadata_tensors"] = metadata_refs
+
+    relay_metadata["transport"] = "relay_stream"
+    if _is_event_recording():
+        relay_metadata["data_summary"] = object_summary(data, prefix="data_")
 
     # Send control message FIRST — receiver starts reading immediately.
     # NIXL credit deadlock avoidance: if we wait_for_completion before notifying,
@@ -446,8 +595,25 @@ async def send_stream_chunk(
     )
     await control_plane.send_to_stage(target_stage, target_endpoint, msg)
 
+    recording = _is_event_recording()
+    wait_timer = ElapsedTimer.start() if recording else None
     for pending_op in pending_ops:
         await pending_op.wait_for_completion()
+    if recording and wait_timer is not None:
+        wait_timer.stop()
+        _emit_relay_event(
+            request_id=request_id,
+            event_name="relay_stream_put_wait",
+            metadata={
+                "from_stage": from_stage,
+                "to_stage": target_stage,
+                "chunk_id": chunk_id,
+                "transport": transport,
+                "pending_ops": len(pending_ops),
+                "wait_ms": round(wait_timer.elapsed_ms, 3),
+            },
+        )
+    return transport
 
 
 async def send_stream_signal(
@@ -470,3 +636,50 @@ async def send_stream_signal(
         error=error,
     )
     await control_plane.send_to_stage(target_stage, target_endpoint, msg)
+
+
+def _emit_relay_event(
+    *,
+    request_id: str | None,
+    event_name: str,
+    metadata: dict[str, Any],
+) -> None:
+    if not request_id:
+        return
+    if not _is_event_recording():
+        return
+    _emit_event(
+        request_id=request_id,
+        stage=None,
+        event_name=event_name,
+        metadata=metadata,
+    )
+
+
+def _is_event_recording() -> bool:
+    return _get_event_recorder().is_active()
+
+
+def _count_transport_device_copies(
+    tensors: Any,
+    transport_device: torch.device,
+) -> int:
+    count = 0
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor) and tensor.device != transport_device:
+            count += 1
+    return count
+
+
+def _request_id_from_blob_key(key: str) -> str | None:
+    if not key:
+        return None
+    return key.split(":", 1)[0]
+
+
+def _blob_key_kind(key: str) -> str:
+    if ":stream:" in key and ":meta:" in key:
+        return "stream_metadata"
+    if ":stream:" in key:
+        return "stream_data"
+    return "blob"

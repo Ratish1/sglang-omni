@@ -431,11 +431,13 @@ async def _run_launcher_with_fake_runner(
         def __init__(self, stage_control_endpoints: dict[str, str]) -> None:
             del stage_control_endpoints
 
-        async def broadcast_start(self, **kwargs) -> None:
+        async def broadcast_start(self, **kwargs) -> dict:
             profiler_calls.starts.append(kwargs)
+            return {"sent_stages": ["preprocess"], "missing_stages": []}
 
-        async def broadcast_stop(self, **kwargs) -> None:
+        async def broadcast_stop(self, **kwargs) -> dict:
             profiler_calls.stops.append(kwargs)
+            return {"sent_stages": ["preprocess"], "missing_stages": []}
 
     monkeypatch.setattr(launcher, "_find_available_port", lambda host, port: port)
     monkeypatch.setattr(launcher, "MultiProcessPipelineRunner", FakeRunner)
@@ -496,8 +498,9 @@ def test_start_profile_request_only_mode_does_not_require_trace_template(
         def __init__(self) -> None:
             self.starts: list[dict] = []
 
-        async def broadcast_start(self, **kwargs) -> None:
+        async def broadcast_start(self, **kwargs) -> dict:
             self.starts.append(kwargs)
+            return {"sent_stages": ["preprocess"], "missing_stages": []}
 
     app = FastAPI()
     ctl = FakeProfilerControl()
@@ -529,7 +532,7 @@ def test_start_profile_torch_mode_still_requires_trace_template() -> None:
     from sglang_omni.serve import launcher
 
     class FakeProfilerControl:
-        async def broadcast_start(self, **kwargs) -> None:
+        async def broadcast_start(self, **kwargs) -> dict:
             raise AssertionError("start_profile should fail before broadcasting")
 
     app = FastAPI()

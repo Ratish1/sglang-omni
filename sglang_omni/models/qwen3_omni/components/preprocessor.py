@@ -30,6 +30,8 @@ from sglang_omni.preprocessing import (
     normalize_messages,
 )
 from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
+from sglang_omni.profiler.metadata import ElapsedTimer, object_summary
 from sglang_omni.proto import StagePayload
 
 logger = logging.getLogger(__name__)
@@ -67,6 +69,33 @@ def _contextualize_cache_key(base_key: str | None, **context: Any) -> str | None
         if value is not None:
             parts.append(f"{key}={value}")
     return "|".join(parts)
+
+
+def _input_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, list):
+        return len(value)
+    return 1
+
+
+def _source_kind(value: Any) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, list):
+        if not value:
+            return "empty_list"
+        return f"list[{','.join(sorted({_source_kind(item) for item in value}))}]"
+    if isinstance(value, (str, Path)):
+        text = str(value)
+        if text.startswith(("http://", "https://")):
+            return "url"
+        if text.startswith("data:"):
+            return "data_uri"
+        return "path_or_text"
+    if isinstance(value, dict):
+        return "dict"
+    return type(value).__name__
 
 
 DEFAULT_THINKER_MAX_NEW_TOKENS = 2048
@@ -287,6 +316,12 @@ class Qwen3OmniPreprocessor:
     async def _call_impl(self, payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs
         if _is_pretokenized_prompt(inputs):
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="preprocess_pretokenized_prompt",
+                metadata={"input_tokens": len(inputs)},
+            )
             return self._preprocess_pretokenized(payload, inputs)
         if isinstance(inputs, dict):
             messages = inputs.get("messages", [])
@@ -341,9 +376,35 @@ class Qwen3OmniPreprocessor:
             )
 
             # Compute cache keys BEFORE conversion (paths are cheap to hash)
+            cache_timer = ElapsedTimer.start()
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="media_cache_key_start",
+                metadata={
+                    "image_count": _input_count(raw_images),
+                    "video_count": _input_count(raw_videos),
+                    "audio_count": _input_count(raw_audios),
+                    "image_source_kind": _source_kind(raw_images),
+                    "video_source_kind": _source_kind(raw_videos),
+                    "audio_source_kind": _source_kind(raw_audios),
+                },
+            )
             image_cache_key = compute_image_cache_key(raw_images)
             raw_audio_cache_key = compute_audio_cache_key(raw_audios)
             video_cache_key = compute_video_cache_key(raw_videos)
+            cache_timer.stop()
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="media_cache_key_end",
+                metadata={
+                    "duration_ms": round(cache_timer.elapsed_ms, 3),
+                    "has_image_cache_key": image_cache_key is not None,
+                    "has_video_cache_key": video_cache_key is not None,
+                    "has_audio_cache_key": raw_audio_cache_key is not None,
+                },
+            )
 
             # Count explicit audio inputs (for placeholder insertion)
             if raw_audios:
@@ -355,6 +416,24 @@ class Qwen3OmniPreprocessor:
             # If we need audio from video, extract it during video loading to avoid duplicate downloads
             extract_audio_from_video_flag = bool(use_audio_in_video and raw_videos)
 
+            media_timer = ElapsedTimer.start()
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="media_load_start",
+                metadata={
+                    "image_count": _input_count(raw_images),
+                    "video_count": _input_count(raw_videos),
+                    "audio_count": _input_count(raw_audios),
+                    "extract_audio_from_video": extract_audio_from_video_flag,
+                    "audio_target_sr": audio_target_sr,
+                    "video_fps": resolved_video_fps,
+                    "video_max_frames": resolved_video_max_frames,
+                    "video_min_pixels": resolved_video_min_pixels,
+                    "video_max_pixels": resolved_video_max_pixels,
+                    "video_total_pixels": resolved_video_total_pixels,
+                },
+            )
             images, videos_result, audios_result = await asyncio.gather(
                 ensure_image_list_async(raw_images),
                 ensure_video_list_async(
@@ -369,7 +448,15 @@ class Qwen3OmniPreprocessor:
                 ),
                 ensure_audio_list_async(raw_audios, target_sr=audio_target_sr),
             )
+            media_timer.stop()
             videos, sampled_video_fps, extracted_audio_from_video = videos_result
+            extracted_audio_count = len(
+                [
+                    audio
+                    for audio in extracted_audio_from_video or []
+                    if audio is not None
+                ]
+            )
 
             # Merge extracted audio from videos with explicit audio (if any)
             if extracted_audio_from_video:
@@ -391,6 +478,21 @@ class Qwen3OmniPreprocessor:
                     audios = audios_result
             else:
                 audios = audios_result
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="media_load_end",
+                metadata={
+                    "duration_ms": round(media_timer.elapsed_ms, 3),
+                    "image_count": len(images or []),
+                    "video_count": len(videos or []),
+                    "explicit_audio_count": num_explicit_audios,
+                    "extracted_audio_count": extracted_audio_count,
+                    "audio_count": len(audios or []),
+                    "audio_from_video": audio_from_video,
+                    "sampled_video_fps": sampled_video_fps,
+                },
+            )
         else:
             messages = inputs
             images = []
@@ -430,10 +532,32 @@ class Qwen3OmniPreprocessor:
             num_audios=num_audios_for_placeholder,
             num_videos=len(videos),
         )
+        template_timer = ElapsedTimer.start()
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="chat_template_start",
+            metadata={
+                "message_count": len(messages_norm),
+                "image_count": len(images or []),
+                "video_count": len(videos or []),
+                "audio_count": len(audios or []),
+            },
+        )
         prompt_text = self.processor.apply_chat_template(
             messages_mm,
             add_generation_prompt=True,
             tokenize=False,
+        )
+        template_timer.stop()
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="chat_template_end",
+            metadata={
+                "duration_ms": round(template_timer.elapsed_ms, 3),
+                "prompt_chars": len(prompt_text),
+            },
         )
 
         videos_kwargs: dict[str, Any] = {}
@@ -468,14 +592,42 @@ class Qwen3OmniPreprocessor:
         if videos_kwargs:
             processor_kwargs["videos_kwargs"] = videos_kwargs
 
-        hf_inputs = self.processor(
-            text=prompt_text,
-            images=images or None,
-            videos=videos or None,
-            audio=audios or None,
-            add_special_tokens=False,
-            return_tensors="pt",
-            **processor_kwargs,
+        processor_timer = ElapsedTimer.start()
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="hf_processor_start",
+            metadata={
+                "image_count": len(images or []),
+                "video_count": len(videos or []),
+                "audio_count": len(audios or []),
+                "has_videos_kwargs": bool(videos_kwargs),
+            },
+        )
+        try:
+            hf_inputs = self.processor(
+                text=prompt_text,
+                images=images or None,
+                videos=videos or None,
+                audio=audios or None,
+                add_special_tokens=False,
+                return_tensors="pt",
+                **processor_kwargs,
+            )
+        finally:
+            processor_timer.stop()
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="hf_processor_end",
+            metadata={
+                "duration_ms": round(processor_timer.elapsed_ms, 3),
+                **(
+                    object_summary(hf_inputs, prefix="hf_")
+                    if _get_event_recorder().is_active()
+                    else {}
+                ),
+            },
         )
 
         input_ids = hf_inputs["input_ids"][0]
