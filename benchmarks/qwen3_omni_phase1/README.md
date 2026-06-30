@@ -43,6 +43,25 @@ python -m sglang_omni.cli serve \
   --port 8000
 ```
 
+For the Phase 2A payload-locality A/B, use the same video-context profile with
+`mm_aggregate` fused into the thinker process. This should turn the large
+`mm_aggregate -> thinker` video handoff into `transport=local_object`; compare
+stage/hop rows against the unfused video config before changing code.
+
+```bash
+export SGLANG_TORCH_PROFILER_DIR=/tmp/qwen3_phase1_profiles
+export SGLANG_TORCH_PROFILER_RECORD_SHAPES=0
+export SGLANG_TORCH_PROFILER_PROFILE_MEMORY=0
+export SGLANG_TORCH_PROFILER_WITH_STACK=0
+export SGLANG_TORCH_PROFILER_WITH_FLOPS=0
+
+python -m sglang_omni.cli serve \
+  --model-path marksverdhei/Qwen3-Omni-30B-A3B-FP8 \
+  --config examples/configs/qwen3_omni_colocated_h100_fp8_video_locality.yaml \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
 ## Matrix Runs
 
 For each case, start request profiling, run the benchmark, stop profiling, and
