@@ -35,25 +35,48 @@ run_profiled() {
   local root="/tmp/qwen3_phase1_profiles/${run_id}"
   local event_dir="${root}/events"
   local status=0
+  local profile_status=0
+  local report_status=0
 
   mkdir -p "${root}/summary"
 
-  curl -sS -X POST http://localhost:8000/start_request_profile \
+  if ! curl -sS -X POST http://localhost:8000/start_request_profile \
     -H 'Content-Type: application/json' \
-    -d "{\"run_id\":\"${run_id}\",\"event_dir\":\"${event_dir}\"}" | tee "${root}/start_profile.json"
+    -d "{\"run_id\":\"${run_id}\",\"event_dir\":\"${event_dir}\"}" \
+    -o "${root}/start_profile.json"; then
+    echo "start_request_profile failed for ${run_id}" >&2
+    return 1
+  fi
+  cat "${root}/start_profile.json"
 
   "$@" || status=$?
 
-  curl -sS -X POST http://localhost:8000/stop_request_profile \
+  if ! curl -sS -X POST http://localhost:8000/stop_request_profile \
     -H 'Content-Type: application/json' \
-    -d "{\"run_id\":\"${run_id}\"}" | tee "${root}/stop_profile.json"
+    -d "{\"run_id\":\"${run_id}\"}" \
+    -o "${root}/stop_profile.json"; then
+    profile_status=1
+    echo "stop_request_profile failed for ${run_id}" >&2
+  else
+    cat "${root}/stop_profile.json"
+  fi
 
-  python -m sglang_omni.profiler "${event_dir}" --format json \
-    --out "${root}/summary/report.json"
-  python -m sglang_omni.profiler "${event_dir}" --format table \
-    > "${root}/summary/report.txt"
+  if ! python -m sglang_omni.profiler "${event_dir}" --format json \
+    --out "${root}/summary/report.json"; then
+    report_status=1
+  fi
+  if ! python -m sglang_omni.profiler "${event_dir}" --format table \
+    > "${root}/summary/report.txt"; then
+    report_status=1
+  fi
   echo "${root}"
-  return "${status}"
+  if [ "${status}" -ne 0 ]; then
+    return "${status}"
+  fi
+  if [ "${profile_status}" -ne 0 ]; then
+    return "${profile_status}"
+  fi
+  return "${report_status}"
 }
 ```
 
