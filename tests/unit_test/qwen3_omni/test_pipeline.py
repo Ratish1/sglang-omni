@@ -27,6 +27,9 @@ from sglang_omni.models.ming_omni.config import (
     MingOmniSpeechPipelineConfig,
     MingOmniStreamingSpeechPipelineConfig,
 )
+from sglang_omni.models.qwen3_omni.components.thinker_model import (
+    Qwen3OmniMoeThinkerTextModel,
+)
 from sglang_omni.models.qwen3_omni.config import (
     Qwen3OmniPipelineConfig,
     Qwen3OmniSpeechColocatedPipelineConfig,
@@ -66,6 +69,39 @@ def _server_args_overrides(config: PipelineConfig, name: str) -> dict[str, objec
 
 def _runtime_mem_fraction_static(config, name: str) -> float | None:
     return _stage(config, name).runtime.sglang_server_args.mem_fraction_static
+
+
+@pytest.mark.parametrize(
+    "mask",
+    [
+        torch.tensor([True, False, True, False, False, True]),
+        torch.tensor(
+            [
+                [True, False],
+                [False, False],
+                [True, False],
+                [False, False],
+                [False, False],
+                [True, False],
+            ]
+        ),
+    ],
+)
+def test_qwen_thinker_deepstack_update_preserves_clone_equivalence(mask) -> None:
+    hidden = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    visual = torch.full((3, 4), 0.25, dtype=torch.float32)
+    effective_mask = mask if mask.dim() == 1 else mask[..., 0]
+
+    expected = hidden.clone()
+    expected[effective_mask, :] = expected[effective_mask, :].clone() + visual
+
+    actual = hidden.clone()
+    result = Qwen3OmniMoeThinkerTextModel._deepstack_process(
+        object(), actual, mask, visual
+    )
+
+    assert result is actual
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_qwen_pipeline_config_and_state_contracts() -> None:
