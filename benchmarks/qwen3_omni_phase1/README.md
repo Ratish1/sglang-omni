@@ -6,7 +6,8 @@ each modality path, then rank bottlenecks across the matrix.
 
 ## Server
 
-Use the FP8 colocated H100 config under test:
+Use the FP8 colocated H100 config under test for text, audio, image, and
+text-to-audio runs:
 
 ```bash
 export SGLANG_TORCH_PROFILER_DIR=/tmp/qwen3_phase1_profiles
@@ -18,6 +19,26 @@ export SGLANG_TORCH_PROFILER_WITH_FLOPS=0
 python -m sglang_omni.cli serve \
   --model-path marksverdhei/Qwen3-Omni-30B-A3B-FP8 \
   --config examples/configs/qwen3_omni_colocated_h100_fp8.yaml \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+For Video-MME and Video-AMME, use the video-context variant. Those benchmarks
+produce prompts above 8k tokens with the standard `--video-fps 2
+--video-max-frames 128 --video-max-pixels 401408` settings; the video config
+raises preprocessing and thinker context to 32k so requests reach scheduler
+admission.
+
+```bash
+export SGLANG_TORCH_PROFILER_DIR=/tmp/qwen3_phase1_profiles
+export SGLANG_TORCH_PROFILER_RECORD_SHAPES=0
+export SGLANG_TORCH_PROFILER_PROFILE_MEMORY=0
+export SGLANG_TORCH_PROFILER_WITH_STACK=0
+export SGLANG_TORCH_PROFILER_WITH_FLOPS=0
+
+python -m sglang_omni.cli serve \
+  --model-path marksverdhei/Qwen3-Omni-30B-A3B-FP8 \
+  --config examples/configs/qwen3_omni_colocated_h100_fp8_video.yaml \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -103,7 +124,12 @@ run_profiled image_text \
     --model qwen3-omni --port 8000 \
     --max-samples 8 --max-concurrency 1 \
     --output-dir results/qwen3_phase1_image_text
+```
 
+Restart with `examples/configs/qwen3_omni_colocated_h100_fp8_video.yaml` before
+running the video cases:
+
+```bash
 # video + text -> text
 run_profiled video_text \
   python -m benchmarks.eval.benchmark_omni_videomme \
@@ -120,8 +146,12 @@ run_profiled video_audio_text \
     --output-dir results/qwen3_phase1_video_audio_text \
     --max-samples 8 --max-concurrency 1 \
     --video-fps 2 --video-max-frames 128 --video-max-pixels 401408
+```
 
-# text -> text + audio
+Restart with `examples/configs/qwen3_omni_colocated_h100_fp8.yaml` before
+running the text-to-audio case:
+
+```bash
 run_profiled text_audio_out \
   python -m benchmarks.eval.benchmark_omni_seedtts \
     --generate-only \

@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# FP8 colocated H100 profile for Qwen3-Omni video benchmarks.
+#
+# Video-MME and Video-AMME prompts commonly exceed 8k thinker tokens with the
+# benchmark defaults. Keep the same colocated memory split as the smoke profile,
+# but raise preprocessing/thinker context to 32k so video requests reach
+# scheduler admission instead of being rejected during preprocessing.
+
+config_cls: Qwen3OmniSpeechColocatedPipelineConfig
+name: qwen3-omni-colocated-h100-fp8-video
+model_path: marksverdhei/Qwen3-Omni-30B-A3B-FP8
+relay_backend: shm
+
+stage_overrides:
+  preprocessing:
+    runtime:
+      max_seq_len: 32768
+
+  image_encoder:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.025
+
+  audio_encoder:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.025
+
+  thinker:
+    runtime:
+      max_seq_len: 32768
+      resources:
+        total_gpu_memory_fraction: 0.55  # Qwen3-Omni subtracts default encoder_mem_reserve=0.05, so effective SGLang/KV budget is 0.50.
+
+  talker_ar:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.12
+
+  code2wav:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.02
