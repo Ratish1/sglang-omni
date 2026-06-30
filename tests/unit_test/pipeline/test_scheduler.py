@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import threading
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from types import SimpleNamespace
 
@@ -22,9 +25,85 @@ def _init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler._request_admission_lock = threading.RLock()
     scheduler._request_build_executor = None
     scheduler.request_build_max_pending = 0
+    scheduler._request_build_completed_limit = 0
     scheduler._pending_request_builds = {}
+    scheduler._completed_request_builds = {}
+    scheduler._request_build_order = deque()
     scheduler._backlogged_request_build_payloads = []
     scheduler._request_build_max_pending_observed = 0
+
+
+def _make_tiny_req(request_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        rid=request_id,
+        origin_input_ids=[1],
+        sampling_params=SimpleNamespace(max_new_tokens=1),
+        output_ids=[],
+    )
+
+
+def _make_tiny_req_data(request_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        req=_make_tiny_req(request_id),
+        enforce_request_limits=False,
+    )
+
+
+def _make_async_request_build_scheduler(
+    request_builder,
+    *,
+    max_pending: int = 2,
+    backlog_limit: int = 4,
+) -> OmniScheduler:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.outbox = Queue()
+    scheduler.inbox = Queue()
+    scheduler.waiting_queue = []
+    scheduler._pending_stream_chunks = {}
+    scheduler._pending_stream_done = set()
+    scheduler._deferred_request_payloads = {}
+    scheduler._dirty_deferred_request_ids = set()
+    scheduler._aborted_request_ids = set()
+    scheduler._abort_callback = None
+    scheduler._first_emit_done = set()
+    scheduler._prefill_start_done = set()
+    scheduler.running_batch = SimpleNamespace(reqs=[], batch_is_full=False)
+    scheduler.cur_batch = None
+    scheduler.last_batch = None
+    scheduler.tree_cache = None
+    scheduler.is_entry_rank = True
+    scheduler.max_req_len = 16
+    scheduler.max_req_input_len = 16
+    scheduler.max_total_num_tokens = 128
+    scheduler.page_size = 1
+    scheduler.server_args = SimpleNamespace(mem_fraction_static=None)
+    scheduler._request_builder = request_builder
+    scheduler._request_admission_lock = threading.RLock()
+    scheduler._request_build_executor = ThreadPoolExecutor(max_workers=max_pending)
+    scheduler.request_build_max_pending = max_pending
+    scheduler._request_build_completed_limit = max_pending
+    scheduler._request_build_backlog_limit = backlog_limit
+    scheduler._pending_request_builds = {}
+    scheduler._completed_request_builds = {}
+    scheduler._request_build_order = deque()
+    scheduler._backlogged_request_build_payloads = deque()
+    scheduler._request_build_max_pending_observed = 0
+    return scheduler
+
+
+def _drain_until(
+    scheduler: OmniScheduler,
+    predicate,
+    *,
+    timeout_s: float = 2.0,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        scheduler.process_input_requests([])
+        if predicate():
+            return
+        time.sleep(0.01)
+    scheduler.process_input_requests([])
 
 
 def test_simple_scheduler_batch_and_error_contracts() -> None:
@@ -521,7 +600,10 @@ def test_omni_scheduler_distinguishes_queue_enter_from_prefill_start(
         sampling_params=SimpleNamespace(max_new_tokens=1),
         output_ids=[],
     )
-    scheduler._request_builder = lambda payload: SimpleNamespace(req=req)
+    scheduler._request_builder = lambda payload: SimpleNamespace(
+        req=req,
+        enforce_request_limits=False,
+    )
 
     scheduler.process_input_requests([SimpleNamespace(request_id="req-delayed")])
 
@@ -692,6 +774,270 @@ def test_omni_scheduler_follower_request_builder_errors_do_not_emit() -> None:
     assert scheduler._deferred_request_payloads == {}
 
 
+def test_omni_scheduler_async_build_drains_completed_without_reordering() -> None:
+    slow_started = threading.Event()
+    slow_finished = threading.Event()
+    slow_release = threading.Event()
+    fast_built = threading.Event()
+    third_built = threading.Event()
+    fourth_built = threading.Event()
+
+    def request_builder(payload: SimpleNamespace) -> SimpleNamespace:
+        if payload.request_id == "req-slow":
+            slow_started.set()
+            assert slow_release.wait(timeout=2.0)
+            slow_finished.set()
+        elif payload.request_id == "req-fast":
+            fast_built.set()
+        elif payload.request_id == "req-third":
+            third_built.set()
+        elif payload.request_id == "req-fourth":
+            fourth_built.set()
+        return _make_tiny_req_data(payload.request_id)
+
+    scheduler = _make_async_request_build_scheduler(
+        request_builder,
+        max_pending=2,
+        backlog_limit=2,
+    )
+    try:
+        scheduler.process_input_requests(
+            [
+                SimpleNamespace(request_id="req-slow"),
+                SimpleNamespace(request_id="req-fast"),
+                SimpleNamespace(request_id="req-third"),
+                SimpleNamespace(request_id="req-fourth"),
+            ]
+        )
+        assert slow_started.wait(timeout=2.0)
+        assert fast_built.wait(timeout=2.0)
+
+        scheduler.process_input_requests([])
+
+        assert "req-fast" not in scheduler._pending_request_builds
+        completed_request_ids = {
+            build.payload.request_id
+            for build in scheduler._completed_request_builds.values()
+        }
+        assert "req-fast" in completed_request_ids
+        assert [
+            payload.request_id
+            for payload in scheduler._backlogged_request_build_payloads
+        ] == ["req-fourth"]
+        assert scheduler.waiting_queue == []
+        assert third_built.wait(timeout=2.0)
+        scheduler.process_input_requests([])
+        assert "req-fourth" not in scheduler._pending_request_builds
+        assert not fourth_built.is_set()
+
+        slow_release.set()
+        assert slow_finished.wait(timeout=2.0)
+        _drain_until(scheduler, lambda: len(scheduler.waiting_queue) == 4)
+
+        assert [req.rid for req in scheduler.waiting_queue] == [
+            "req-slow",
+            "req-fast",
+            "req-third",
+            "req-fourth",
+        ]
+    finally:
+        slow_release.set()
+        scheduler._shutdown_request_build_executor()
+
+
+def test_omni_scheduler_abort_keeps_running_build_counted_until_done() -> None:
+    slow_started = threading.Event()
+    slow_release = threading.Event()
+    fast_built = threading.Event()
+    third_built = threading.Event()
+    fourth_built = threading.Event()
+
+    def request_builder(payload: SimpleNamespace) -> SimpleNamespace:
+        if payload.request_id == "req-slow":
+            slow_started.set()
+            assert slow_release.wait(timeout=2.0)
+        elif payload.request_id == "req-fast":
+            fast_built.set()
+        elif payload.request_id == "req-third":
+            third_built.set()
+        elif payload.request_id == "req-fourth":
+            fourth_built.set()
+        return _make_tiny_req_data(payload.request_id)
+
+    scheduler = _make_async_request_build_scheduler(
+        request_builder,
+        max_pending=2,
+        backlog_limit=2,
+    )
+    try:
+        scheduler.process_input_requests(
+            [
+                SimpleNamespace(request_id="req-slow"),
+                SimpleNamespace(request_id="req-fast"),
+            ]
+        )
+        assert slow_started.wait(timeout=2.0)
+        assert fast_built.wait(timeout=2.0)
+
+        scheduler.process_input_requests([])
+        assert scheduler.waiting_queue == []
+        assert len(scheduler._completed_request_builds) == 1
+
+        scheduler.abort("req-slow")
+        scheduler.process_input_requests([])
+
+        assert [req.rid for req in scheduler.waiting_queue] == ["req-fast"]
+        assert scheduler._completed_request_builds == {}
+        scheduler.process_input_requests(
+            [
+                SimpleNamespace(request_id="req-third"),
+                SimpleNamespace(request_id="req-fourth"),
+            ]
+        )
+        assert third_built.wait(timeout=2.0)
+        assert not fourth_built.is_set()
+        assert [
+            payload.request_id
+            for payload in scheduler._backlogged_request_build_payloads
+        ] == ["req-fourth"]
+    finally:
+        slow_release.set()
+        scheduler._shutdown_request_build_executor()
+
+
+def test_omni_scheduler_async_builder_failure_is_not_blocked_by_fifo_head() -> None:
+    slow_started = threading.Event()
+    slow_release = threading.Event()
+
+    def request_builder(payload: SimpleNamespace) -> SimpleNamespace:
+        if payload.request_id == "req-slow":
+            slow_started.set()
+            assert slow_release.wait(timeout=2.0)
+            return _make_tiny_req_data(payload.request_id)
+        if payload.request_id == "req-fail":
+            raise ValueError("builder failed")
+        raise AssertionError(payload.request_id)
+
+    scheduler = _make_async_request_build_scheduler(
+        request_builder,
+        max_pending=2,
+        backlog_limit=2,
+    )
+    try:
+        scheduler.process_input_requests(
+            [
+                SimpleNamespace(request_id="req-slow"),
+                SimpleNamespace(request_id="req-fail"),
+            ]
+        )
+        assert slow_started.wait(timeout=2.0)
+
+        _drain_until(scheduler, lambda: not scheduler.outbox.empty())
+
+        output = scheduler.outbox.get_nowait()
+        assert output.request_id == "req-fail"
+        assert output.type == "error"
+        assert isinstance(output.data, ValueError)
+        assert scheduler.waiting_queue == []
+        assert "req-fail" not in scheduler._completed_request_builds
+
+        slow_release.set()
+        _drain_until(scheduler, lambda: bool(scheduler.waiting_queue))
+        assert [req.rid for req in scheduler.waiting_queue] == ["req-slow"]
+    finally:
+        slow_release.set()
+        scheduler._shutdown_request_build_executor()
+
+
+def test_omni_scheduler_async_validation_failure_is_not_blocked_by_fifo_head() -> None:
+    slow_started = threading.Event()
+    slow_release = threading.Event()
+
+    def request_builder(payload: SimpleNamespace) -> SimpleNamespace:
+        if payload.request_id == "req-slow":
+            slow_started.set()
+            assert slow_release.wait(timeout=2.0)
+            return _make_tiny_req_data(payload.request_id)
+        if payload.request_id == "req-long":
+            req = SimpleNamespace(
+                rid="req-long",
+                origin_input_ids=[1, 2, 3],
+                sampling_params=SimpleNamespace(max_new_tokens=1),
+                output_ids=[],
+            )
+            return SimpleNamespace(req=req, enforce_request_limits=True)
+        raise AssertionError(payload.request_id)
+
+    scheduler = _make_async_request_build_scheduler(
+        request_builder,
+        max_pending=2,
+        backlog_limit=2,
+    )
+    scheduler.max_req_len = 4
+    scheduler.max_req_input_len = 2
+    try:
+        scheduler.process_input_requests(
+            [
+                SimpleNamespace(request_id="req-slow"),
+                SimpleNamespace(request_id="req-long"),
+            ]
+        )
+        assert slow_started.wait(timeout=2.0)
+
+        _drain_until(scheduler, lambda: not scheduler.outbox.empty())
+
+        output = scheduler.outbox.get_nowait()
+        assert output.request_id == "req-long"
+        assert output.type == "error"
+        assert isinstance(output.data, ValueError)
+        assert "Input length (3 tokens) exceeds" in str(output.data)
+        assert scheduler.waiting_queue == []
+        assert scheduler._completed_request_builds == {}
+
+        slow_release.set()
+        _drain_until(scheduler, lambda: bool(scheduler.waiting_queue))
+        assert [req.rid for req in scheduler.waiting_queue] == ["req-slow"]
+    finally:
+        slow_release.set()
+        scheduler._shutdown_request_build_executor()
+
+
+def test_omni_scheduler_request_build_shutdown_does_not_wait_for_running_build() -> (
+    None
+):
+    slow_started = threading.Event()
+    slow_release = threading.Event()
+    slow_finished = threading.Event()
+
+    def request_builder(payload: SimpleNamespace) -> SimpleNamespace:
+        slow_started.set()
+        assert slow_release.wait(timeout=2.0)
+        slow_finished.set()
+        return _make_tiny_req_data(payload.request_id)
+
+    scheduler = _make_async_request_build_scheduler(
+        request_builder,
+        max_pending=1,
+        backlog_limit=1,
+    )
+    try:
+        scheduler.process_input_requests([SimpleNamespace(request_id="req-slow")])
+        assert slow_started.wait(timeout=2.0)
+
+        start_time = time.monotonic()
+        scheduler._shutdown_request_build_executor()
+        elapsed = time.monotonic() - start_time
+
+        assert scheduler._request_build_executor is None
+        assert scheduler._pending_request_builds == {}
+        assert scheduler._completed_request_builds == {}
+        assert elapsed < 0.5
+        assert not slow_finished.is_set()
+    finally:
+        slow_release.set()
+        scheduler._shutdown_request_build_executor()
+
+
 def test_omni_scheduler_prepares_custom_request_token_budget() -> None:
     """Preserves upstream max_new_tokens clamping for custom request builders."""
     scheduler = object.__new__(OmniScheduler)
@@ -853,7 +1199,7 @@ def test_omni_scheduler_leaves_request_budget_unchanged_without_opt_in() -> None
         sampling_params=sampling_params,
         output_ids=[],
     )
-    req_data = SimpleNamespace(req=req, max_new_tokens=3)
+    req_data = SimpleNamespace(req=req, max_new_tokens=3, enforce_request_limits=False)
     scheduler._request_builder = lambda payload: req_data
 
     scheduler.process_input_requests([SimpleNamespace(request_id="req-original")])

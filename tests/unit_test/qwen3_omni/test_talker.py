@@ -833,10 +833,15 @@ def _build_state_machine_scheduler(
     scheduler._request_admission_lock = threading.RLock()
     scheduler._request_build_executor = None
     scheduler.request_build_max_pending = 0
+    scheduler._request_build_completed_limit = 0
     scheduler._pending_request_builds = {}
+    scheduler._completed_request_builds = {}
+    scheduler._request_build_order = deque()
     scheduler._backlogged_request_build_payloads = deque()
     scheduler._request_build_max_pending_observed = 0
     scheduler.max_req_len = 8192
+    scheduler.max_req_input_len = 8191
+    scheduler.server_args = SimpleNamespace(mem_fraction_static=None)
     return scheduler
 
 
@@ -857,6 +862,7 @@ def test_process_input_requests_partial_build_state_machine() -> None:
             thinker_chunks_done=captured_done,
             pending_text_queue=deque(),
             _captured_thinker_done=captured_done,
+            enforce_request_limits=False,
         )
 
     scheduler = _build_state_machine_scheduler(
