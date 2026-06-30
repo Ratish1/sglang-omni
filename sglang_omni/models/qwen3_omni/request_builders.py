@@ -258,21 +258,6 @@ def project_encoder_to_mm_aggregate(payload: StagePayload) -> StagePayload:
     return _payload_with_state(payload, projected)
 
 
-def project_mm_aggregate_to_thinker(payload: StagePayload) -> StagePayload:
-    """Ship only thinker-owned state after aggregation.
-
-    Fan-out local-object dispatch requires each target to receive isolated
-    Python containers. Tensor leaves are intentionally shared so same-process
-    locality avoids serializing large multimodal embeddings.
-    """
-    state = Qwen3OmniPipelineState.from_dict(payload.data)
-    projected = Qwen3OmniPipelineState(
-        prompt=_copy_mutable_containers(state.prompt),
-        thinker_inputs=_copy_mutable_containers(state.thinker_inputs),
-    )
-    return _payload_with_state(payload, projected)
-
-
 def project_mm_aggregate_to_talker_ar(payload: StagePayload) -> StagePayload:
     """Early-submit projection: ship prompt + thinker_inputs to the talker."""
     state = Qwen3OmniPipelineState.from_dict(payload.data)

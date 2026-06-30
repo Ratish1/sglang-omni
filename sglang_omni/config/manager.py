@@ -147,7 +147,7 @@ def _apply_stage_overrides(
     config: PipelineConfig,
     stage_overrides: dict[str, Any],
 ) -> PipelineConfig:
-    """Apply compact file-level stage overrides by stage name."""
+    """Apply compact file-level runtime overrides by stage name."""
 
     if not isinstance(stage_overrides, dict):
         raise ValueError(
@@ -164,27 +164,19 @@ def _apply_stage_overrides(
         if not isinstance(override, dict):
             raise ValueError(f"stage_overrides.{stage_name} must be a mapping")
 
-        unsupported = sorted(set(override) - {"process", "runtime"})
+        unsupported = sorted(set(override) - {"runtime"})
         if unsupported:
             raise ValueError(
-                f"stage_overrides.{stage_name} supports only process/runtime "
-                f"overrides; got unsupported keys {unsupported}"
+                f"stage_overrides.{stage_name} supports only runtime overrides; "
+                f"got unsupported keys {unsupported}"
             )
-
-        stage = stage_by_name[stage_name]
-        if "process" in override:
-            process = override["process"]
-            if process is not None and not isinstance(process, str):
-                raise ValueError(
-                    f"stage_overrides.{stage_name}.process must be a string"
-                )
-            stage["process"] = process
 
         if "runtime" not in override:
             continue
         runtime_override = override["runtime"]
         if not isinstance(runtime_override, dict):
             raise ValueError(f"stage_overrides.{stage_name}.runtime must be a mapping")
+        stage = stage_by_name[stage_name]
         stage["runtime"] = _deep_merge_dict(
             stage.get("runtime", {}),
             runtime_override,

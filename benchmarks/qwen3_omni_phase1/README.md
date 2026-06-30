@@ -44,10 +44,9 @@ python -m sglang_omni.cli serve \
 ```
 
 For the Phase 2A payload-locality A/B, use the same video-context profile with
-`mm_aggregate` placed in the thinker process. This should turn the large
-`mm_aggregate -> thinker` video handoff into `transport=local_object` for both
-single-target video text and audio-output fan-out paths; compare stage/hop rows
-against the baseline video config before deeper model changes.
+`mm_aggregate` fused into the thinker process. This should turn the large
+`mm_aggregate -> thinker` video handoff into `transport=local_object`; compare
+stage/hop rows against the unfused video config before changing code.
 
 ```bash
 export SGLANG_TORCH_PROFILER_DIR=/tmp/qwen3_phase1_profiles

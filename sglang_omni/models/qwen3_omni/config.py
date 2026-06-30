@@ -90,7 +90,6 @@ def _aggregate_stage(*, process: str, speech_enabled: bool = False) -> StageConf
             next=["thinker", "talker_ar"],
             route_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_next_stages",
             project_payload={
-                "thinker": f"{_PKG}.request_builders.project_mm_aggregate_to_thinker",
                 "talker_ar": (
                     f"{_PKG}.request_builders.project_mm_aggregate_to_talker_ar"
                 ),

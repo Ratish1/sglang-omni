@@ -37,7 +37,6 @@ from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
 from sglang_omni.models.qwen3_omni.request_builders import (
     apply_thinker_result,
     build_sglang_thinker_request,
-    project_mm_aggregate_to_thinker,
     project_preprocessing_to_mm_aggregate,
     project_talker_to_code2wav,
     project_thinker_to_decode,
@@ -108,9 +107,6 @@ def test_qwen_pipeline_config_and_state_contracts() -> None:
     )
     assert aggregate.route_fn == (
         f"{request_builders_path}.resolve_mm_aggregate_next_stages"
-    )
-    assert aggregate.project_payload["thinker"] == (
-        f"{request_builders_path}.project_mm_aggregate_to_thinker"
     )
     assert speech_thinker.stream_to == ["talker_ar", "decode"]
     assert speech_thinker.route_fn == (
@@ -222,42 +218,6 @@ def test_qwen_thinker_to_decode_projection_isolates_stream_state() -> None:
     assert projected.data["stream_state"] == stream_state
     assert projected.data["stream_state"] is not stream_state
     assert projected.data["stream_state"]["token_ids"] is not stream_state["token_ids"]
-
-
-def test_qwen_mm_aggregate_to_thinker_projection_isolates_containers() -> None:
-    video_embeds = torch.ones((2, 4))
-    state = Qwen3OmniPipelineState(
-        prompt={"input_ids": torch.tensor([1, 2]), "nested": {"ids": [1, 2]}},
-        mm_inputs={"video": {"unused": True}},
-        encoder_outs={"image_encoder": {"unused": torch.ones((1,))}},
-        thinker_inputs={
-            "model_inputs": {
-                "video_embeds": video_embeds,
-                "deepstack_visual_embeds": [video_embeds],
-            }
-        },
-    )
-
-    projected = project_mm_aggregate_to_thinker(make_qwen_payload(state))
-    projected_state = Qwen3OmniPipelineState.from_dict(projected.data)
-
-    assert projected_state.mm_inputs == {}
-    assert projected_state.encoder_outs == {}
-    assert projected_state.prompt is not state.prompt
-    assert projected_state.prompt["input_ids"] is state.prompt["input_ids"]
-    assert projected_state.prompt["nested"] == state.prompt["nested"]
-    assert projected_state.prompt["nested"] is not state.prompt["nested"]
-    assert projected_state.thinker_inputs is not state.thinker_inputs
-    assert projected_state.thinker_inputs["model_inputs"] is not (
-        state.thinker_inputs["model_inputs"]
-    )
-    assert (
-        projected_state.thinker_inputs["model_inputs"]["video_embeds"] is video_embeds
-    )
-    assert (
-        projected_state.thinker_inputs["model_inputs"]["deepstack_visual_embeds"][0]
-        is video_embeds
-    )
 
 
 def test_qwen_apply_thinker_result_preserves_empty_logprob_list() -> None:

@@ -231,47 +231,7 @@ stage_overrides:
 """
     )
 
-    with pytest.raises(ValueError, match="supports only process/runtime"):
-        ConfigManager.from_file(str(config_path))
-
-
-def test_config_manager_applies_stage_process_override(tmp_path: Path) -> None:
-    config_path = tmp_path / "colocated_process_override.yaml"
-    config_path.write_text(
-        """
-config_cls: Qwen3OmniSpeechColocatedPipelineConfig
-model_path: dummy
-stage_overrides:
-  mm_aggregate:
-    process: thinker
-"""
-    )
-
-    config = ConfigManager.from_file(str(config_path)).config
-    plan = build_stage_placement_plan(config)
-    topology = build_process_topology_plan(config, plan)
-
-    assert _stage(config, "mm_aggregate").process == "thinker"
-    assert topology.stage_to_process["mm_aggregate"] == (
-        topology.stage_to_process["thinker"]
-    )
-
-
-def test_config_manager_validates_stage_process_override_type(
-    tmp_path: Path,
-) -> None:
-    config_path = tmp_path / "bad_colocated.yaml"
-    config_path.write_text(
-        """
-config_cls: Qwen3OmniSpeechColocatedPipelineConfig
-model_path: dummy
-stage_overrides:
-  mm_aggregate:
-    process: 1
-"""
-    )
-
-    with pytest.raises(ValueError, match="process must be a string"):
+    with pytest.raises(ValueError, match="supports only runtime"):
         ConfigManager.from_file(str(config_path))
 
 
