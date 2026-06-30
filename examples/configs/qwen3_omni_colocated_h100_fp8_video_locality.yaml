@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # FP8 colocated H100 video profile for Phase 2 payload-locality experiments.
 #
-# This keeps the 32k video-context profile unchanged, but runs mm_aggregate in
-# the same OS process as thinker. The expected effect is that the large
-# mm_aggregate -> thinker visual embedding/deepstack handoff uses local_object
-# dispatch instead of relaying ~1.8 GiB through shm for 8 Video-MME requests.
+# This keeps the 32k video-context profile unchanged, but places mm_aggregate
+# in the same OS process as thinker. The expected effect is that the large
+# request-dependent mm_aggregate -> thinker visual embedding/deepstack handoff
+# uses local_object dispatch instead of relaying ~1.8 GiB through shm for 8
+# Video-MME requests.
 
 config_cls: Qwen3OmniSpeechColocatedPipelineConfig
 name: qwen3-omni-colocated-h100-fp8-video-locality
 model_path: marksverdhei/Qwen3-Omni-30B-A3B-FP8
 relay_backend: shm
-fused_stages:
-  - [mm_aggregate, thinker]
 
 stage_overrides:
   preprocessing:
@@ -27,6 +26,9 @@ stage_overrides:
     runtime:
       resources:
         total_gpu_memory_fraction: 0.025
+
+  mm_aggregate:
+    process: thinker
 
   thinker:
     runtime:

@@ -125,6 +125,13 @@ Derived from stages:
 | `terminal_stages_fn` | `str` or `None` | `None` | Dotted function path for request-aware terminal-stage resolution. The function receives the normalized `OmniRequest` and returns terminal stage names for that request, or `None` to use static terminals. |
 | `config_cls` | `str` or `None` | class name | Stored automatically and used when loading a saved config file. |
 
+File configs can also use `stage_overrides` as a compact overlay for default
+model configs. `stage_overrides.<stage>.runtime` deep-merges typed runtime
+settings, while `stage_overrides.<stage>.process` changes only that logical
+stage's runtime process group. Process overrides are useful for same-process
+local-object dispatch when a graph is dynamic or fan-in/fan-out and therefore
+does not satisfy the stricter linear `fused_stages` contract.
+
 Derived values are computed from stages, not manually maintained:
 
 - `resolved_entry_stage`: `entry_stage` if set, otherwise the first stage name
