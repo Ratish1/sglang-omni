@@ -262,7 +262,7 @@ def create_sglang_tts_engine_executor(
         **overrides,
     )
     server_args.disable_overlap_schedule = True
-    if server_args.attention_backend is None:
+    if getattr(server_args, "attention_backend", None) is None:
         server_args.attention_backend = "fa3"
 
     want_cuda_graph, (
@@ -299,7 +299,7 @@ def create_sglang_tts_engine_executor(
         model_buffer_bs=_resolve_s2pro_model_buffer_bs(model_worker.model_runner.model),
     )
 
-    if bool(server_args.enable_torch_compile):
+    if bool(getattr(server_args, "enable_torch_compile", False)):
         _compile_s2pro_codebook_decoder(
             model_worker.model_runner.model,
             max_batch_size=server_args.torch_compile_max_bs,

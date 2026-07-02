@@ -222,7 +222,7 @@ def create_generation_executor(
         **overrides,
     )
 
-    if server_args.enable_torch_compile:
+    if getattr(server_args, "enable_torch_compile", False):
         _enable_inductor_gemm_autotune()
 
     want_cuda_graph, (

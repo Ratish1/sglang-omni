@@ -259,7 +259,7 @@ class MingTalkerExecutor:
 
     @staticmethod
     def _output_modalities(payload: StagePayload) -> set[str] | None:
-        metadata = payload.request.metadata
+        metadata = getattr(payload.request, "metadata", None)
         if not isinstance(metadata, dict):
             return None
         modalities = metadata.get("output_modalities")
