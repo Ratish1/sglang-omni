@@ -7,6 +7,7 @@ import argparse
 import copy
 import logging
 import logging.config
+import os
 import shlex
 from collections.abc import Sequence
 from typing import Any, get_args
@@ -31,6 +32,8 @@ from sglang_omni_router.launcher import (
 )
 
 logger = logging.getLogger("sglang_omni_router.serve")
+_APP_FACTORY_CONFIG_ENV = "SGLANG_OMNI_ROUTER_CONFIG_JSON"
+_APP_FACTORY_ADMIN_KEY_ENV = "SGLANG_OMNI_ROUTER_ADMIN_KEY"
 
 
 def normalize_log_level(log_level: str) -> str:
@@ -64,6 +67,16 @@ def build_log_config(log_level: str) -> dict[str, Any]:
     return log_config
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Serve the SGLang-Omni Router")
     parser.add_argument("--host", default="0.0.0.0")
@@ -80,6 +93,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-timeout-secs", type=int, default=1800)
     parser.add_argument("--max-payload-size", type=int, default=512 * 1024 * 1024)
     parser.add_argument("--max-connections", type=int, default=100)
+    parser.add_argument(
+        "--uvicorn-workers",
+        type=positive_int,
+        default=1,
+        help=(
+            "Number of uvicorn worker processes for the router. Values greater "
+            "than one use an import-string app factory so uvicorn can spawn "
+            "multiple router processes on one port."
+        ),
+    )
+    parser.add_argument(
+        "--no-access-log",
+        dest="access_log",
+        action="store_false",
+        help="Disable uvicorn per-request access logs.",
+    )
+    parser.set_defaults(access_log=True)
     parser.add_argument("--health-failure-threshold", type=int, default=3)
     parser.add_argument("--health-success-threshold", type=int, default=2)
     parser.add_argument("--health-check-timeout-secs", type=int, default=5)
@@ -97,6 +127,52 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def create_app_from_env():
+    """Uvicorn app factory for multi-process router workers."""
+    raw_config = os.environ.get(_APP_FACTORY_CONFIG_ENV)
+    if not raw_config:
+        raise RuntimeError(f"{_APP_FACTORY_CONFIG_ENV} is required")
+    config = RouterConfig.model_validate_json(raw_config)
+    admin_api_key = os.environ.get(_APP_FACTORY_ADMIN_KEY_ENV)
+    return create_app(config, admin_api_key=admin_api_key)
+
+
+def _run_uvicorn(
+    *,
+    config: RouterConfig,
+    args: argparse.Namespace,
+    log_level: str,
+    log_config: dict[str, Any],
+) -> None:
+    if args.uvicorn_workers == 1:
+        uvicorn.run(
+            create_app(config, admin_api_key=getattr(args, "admin_api_key", None)),
+            host=config.host,
+            port=config.port,
+            log_level=log_level.lower(),
+            log_config=log_config,
+            access_log=args.access_log,
+        )
+        return
+
+    os.environ[_APP_FACTORY_CONFIG_ENV] = config.model_dump_json()
+    admin_api_key = getattr(args, "admin_api_key", None)
+    if admin_api_key is None:
+        os.environ.pop(_APP_FACTORY_ADMIN_KEY_ENV, None)
+    else:
+        os.environ[_APP_FACTORY_ADMIN_KEY_ENV] = admin_api_key
+    uvicorn.run(
+        "sglang_omni_router.serve:create_app_from_env",
+        host=config.host,
+        port=config.port,
+        log_level=log_level.lower(),
+        log_config=log_config,
+        access_log=args.access_log,
+        workers=args.uvicorn_workers,
+        factory=True,
+    )
 
 
 def validate_worker_source_args(args: argparse.Namespace) -> None:
@@ -206,11 +282,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"health_check_timeout_secs={config.health_check_timeout_secs} | "
             f"readiness_requires_routable_worker=true"
         )
-        uvicorn.run(
-            create_app(config, admin_api_key=getattr(args, "admin_api_key", None)),
-            host=config.host,
-            port=config.port,
-            log_level=log_level.lower(),
+        _run_uvicorn(
+            config=config,
+            args=args,
+            log_level=log_level,
             log_config=log_config,
         )
     except (ValueError, ValidationError) as exc:

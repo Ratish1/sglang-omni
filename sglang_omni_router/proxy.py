@@ -45,12 +45,10 @@ REQUEST_HEADERS_TO_STRIP = (
     | ROUTE_HEADER_NAMES
 )
 RESPONSE_HEADERS_TO_STRIP = HOP_BY_HOP_HEADERS | {
+    "content-encoding",
     "content-length",
     "date",
     "server",
-}
-BUFFERED_RESPONSE_HEADERS_TO_STRIP = RESPONSE_HEADERS_TO_STRIP | {
-    "content-encoding",
 }
 WORKER_REQUEST_FAILURE_STATUS_CODES = {
     HTTPStatus.REQUEST_TIMEOUT.value,
@@ -79,13 +77,10 @@ def filter_response_headers(
     *,
     buffered: bool = False,
 ) -> dict[str, str]:
-    headers_to_strip = (
-        BUFFERED_RESPONSE_HEADERS_TO_STRIP if buffered else RESPONSE_HEADERS_TO_STRIP
-    )
     return {
         key: value
         for key, value in headers.items()
-        if key.lower() not in headers_to_strip
+        if key.lower() not in RESPONSE_HEADERS_TO_STRIP
     }
 
 
@@ -199,62 +194,100 @@ class ProxyHandler:
         body: bytes,
         metadata: RouteMetadata,
         worker: Worker,
-    ) -> Response:
-        with worker.request_guard():
-            start_time = time.perf_counter()
-            upstream_url = build_upstream_url(worker, path, request)
-            request_headers = filter_request_headers(request)
-            try:
-                response = await self._client.request(
-                    request.method,
-                    upstream_url,
-                    content=body,
-                    headers=request_headers,
-                )
-            except httpx.HTTPError as exc:
-                worker.record_routed_request()
-                self._record_worker_request_failure(
-                    worker,
-                    error=type(exc).__name__,
-                )
-                self._log_route_completion(
-                    worker=worker,
-                    path=path,
-                    metadata=metadata,
-                    status_code=502,
-                    outcome="upstream_error",
-                    start_time=start_time,
-                )
-                return JSONResponse(
-                    status_code=502,
-                    content={"error": {"message": "upstream request failed"}},
-                    headers=self._diagnostic_headers(worker, metadata),
-                )
-
-            if response.status_code in WORKER_REQUEST_FAILURE_STATUS_CODES:
-                self._record_worker_request_failure(
-                    worker,
-                    status_code=response.status_code,
-                    error=_response_error(response),
-                )
-            worker.record_routed_request(status_code=response.status_code)
-            outcome = _response_outcome(response.status_code)
+    ) -> StreamingResponse | JSONResponse:
+        start_time = time.perf_counter()
+        upstream_request = self._client.build_request(
+            request.method,
+            build_upstream_url(worker, path, request),
+            content=body,
+            headers=filter_request_headers(request),
+        )
+        worker.increment_active()
+        try:
+            upstream = await self._client.send(upstream_request, stream=True)
+        except httpx.HTTPError as exc:
+            worker.decrement_active()
+            worker.record_routed_request()
+            self._record_worker_request_failure(
+                worker,
+                error=type(exc).__name__,
+            )
             self._log_route_completion(
                 worker=worker,
                 path=path,
                 metadata=metadata,
-                status_code=response.status_code,
-                outcome=outcome,
+                status_code=502,
+                outcome="upstream_error",
                 start_time=start_time,
             )
-            headers = filter_response_headers(response.headers, buffered=True)
-            headers.update(self._diagnostic_headers(worker, metadata))
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                headers=headers,
-                media_type=response.headers.get("content-type"),
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"message": "upstream request failed"}},
+                headers=self._diagnostic_headers(worker, metadata),
             )
+
+        worker_failure_recorded = False
+
+        def record_worker_failure_once(
+            *,
+            status_code: int | None = None,
+            error: str | None = None,
+        ) -> None:
+            nonlocal worker_failure_recorded
+            if worker_failure_recorded:
+                return
+            worker_failure_recorded = True
+            self._record_worker_request_failure(
+                worker,
+                status_code=status_code,
+                error=error,
+            )
+
+        if upstream.status_code in WORKER_REQUEST_FAILURE_STATUS_CODES:
+            record_worker_failure_once(
+                status_code=upstream.status_code,
+                error=f"status={upstream.status_code}",
+            )
+
+        async def iter_bytes():
+            outcome = _response_outcome(upstream.status_code)
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            except asyncio.CancelledError:
+                outcome = "response_cancelled"
+                raise
+            except httpx.HTTPError as exc:
+                outcome = "response_error"
+                record_worker_failure_once(error=type(exc).__name__)
+                raise
+            finally:
+                await upstream.aclose()
+                worker.decrement_active()
+                status_code = upstream.status_code if outcome == "completed" else None
+                worker.record_routed_request(status_code=status_code)
+                self._log_route_completion(
+                    worker=worker,
+                    path=path,
+                    metadata=metadata,
+                    status_code=upstream.status_code,
+                    outcome=outcome,
+                    start_time=start_time,
+                )
+
+        try:
+            headers = filter_response_headers(upstream.headers)
+            headers.update(self._diagnostic_headers(worker, metadata))
+        except Exception:
+            await upstream.aclose()
+            worker.decrement_active()
+            raise
+        return StreamingResponse(
+            iter_bytes(),
+            status_code=upstream.status_code,
+            headers=headers,
+            media_type=upstream.headers.get("content-type"),
+        )
 
     async def _forward_streaming(
         self,
@@ -445,11 +478,6 @@ async def _read_body_with_limit(request: Request, max_size: int) -> bytes:
             raise PayloadTooLargeError
         chunks.append(chunk)
     return b"".join(chunks)
-
-
-def _response_error(response: httpx.Response) -> str:
-    content = response.content[:512].decode("utf-8", errors="replace")
-    return content or f"status={response.status_code}"
 
 
 def _response_outcome(status_code: int) -> str:
