@@ -530,7 +530,7 @@ def test_omni_scheduler_distinguishes_queue_enter_from_prefill_start(
     assert "scheduler_prefill_start" not in names
     assert scheduler.waiting_queue == [req]
 
-    batch = SimpleNamespace(reqs=[req], is_prefill_only=True)
+    batch = SimpleNamespace(reqs=[req], is_prefill_only=True, is_extend_in_batch=False)
     scheduler._emit_prefill_start_for_batch(batch)
     scheduler._emit_prefill_start_for_batch(batch)
 
@@ -573,7 +573,9 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
         enable_mixed_chunk=False,
         schedule_policy="fcfs",
         enable_hierarchical_cache=False,
+        enable_hisparse=False,
         enable_priority_scheduling=False,
+        disable_priority_preemption=False,
         schedule_low_priority_values_first=False,
         priority_scheduling_preemption_threshold=0,
         schedule_conservativeness=1.0,
