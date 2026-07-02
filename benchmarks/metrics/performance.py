@@ -358,4 +358,6 @@ def _request_result_to_dict(output: RequestResult) -> dict:
         "inter_chunk_s": [round(d, 4) for d in inter] if inter else None,
         "audio_chunk_count": output.audio_chunk_count or None,
         "first_audio_payload_bytes": output.first_audio_payload_bytes or None,
+        "router_worker": output.router_worker or None,
+        "router_pid": output.router_pid or None,
     }

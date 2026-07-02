@@ -25,3 +25,5 @@ class RequestResult:
     text_ttft_s: float | None = None
     audio_chunk_count: int = 0
     first_audio_payload_bytes: int = 0
+    router_worker: str = ""
+    router_pid: str = ""

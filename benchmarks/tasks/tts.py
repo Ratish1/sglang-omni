@@ -1469,12 +1469,18 @@ def _parse_response_headers(result: RequestResult, headers: dict) -> None:
     prompt_tok = headers.get("X-Prompt-Tokens")
     comp_tok = headers.get("X-Completion-Tokens")
     eng_time = headers.get("X-Engine-Time")
+    router_worker = headers.get("X-SGLang-Omni-Worker")
+    router_pid = headers.get("X-SGLang-Omni-Router-PID")
     if prompt_tok is not None:
         result.prompt_tokens = int(prompt_tok)
     if comp_tok is not None:
         result.completion_tokens = int(comp_tok)
     if eng_time is not None:
         result.engine_time_s = float(eng_time)
+    if router_worker is not None:
+        result.router_worker = str(router_worker)
+    if router_pid is not None:
+        result.router_pid = str(router_pid)
     if result.completion_tokens > 0 and result.engine_time_s > 0:
         result.tok_per_s = result.completion_tokens / result.engine_time_s
 
@@ -1755,6 +1761,10 @@ def _request_result_to_generated_entry(
         "latency_s": round(output.latency_s, 4),
         "audio_duration_s": round(output.audio_duration_s, 4),
     }
+    if output.router_worker:
+        entry["router_worker"] = output.router_worker
+    if output.router_pid:
+        entry["router_pid"] = output.router_pid
     if output.error:
         entry["error"] = output.error
     return entry
@@ -1785,6 +1795,8 @@ def save_speed_results(
                 "audio_ttfp_s",
                 "audio_chunk_count",
                 "first_audio_payload_bytes",
+                "router_worker",
+                "router_pid",
                 "is_success",
                 "error",
             ]
@@ -1803,6 +1815,8 @@ def save_speed_results(
                     (f"{o.audio_ttfp_s:.4f}" if o.audio_ttfp_s is not None else ""),
                     o.audio_chunk_count or "",
                     o.first_audio_payload_bytes or "",
+                    o.router_worker or "",
+                    o.router_pid or "",
                     o.is_success,
                     o.error or "",
                 ]

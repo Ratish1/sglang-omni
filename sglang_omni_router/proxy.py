@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from http import HTTPStatus
 
@@ -398,6 +399,7 @@ class ProxyHandler:
     ) -> dict[str, str]:
         return {
             "X-SGLang-Omni-Worker": worker.worker_id,
+            "X-SGLang-Omni-Router-PID": str(os.getpid()),
             "X-SGLang-Omni-Request-ID": metadata.request_id,
             "X-SGLang-Omni-Route-Attempt": "1",
         }
