@@ -224,6 +224,8 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
             ),
         ],
         batch_is_full=True,
+        is_prefill_only=True,
+        is_extend_in_batch=False,
     )
     scheduler.running_batch = batch
     scheduler.cur_batch = batch
@@ -267,6 +269,8 @@ def test_omni_scheduler_custom_runner_updates_next_input_ids() -> None:
             SimpleNamespace(rid="req-2", _omni_data=SimpleNamespace()),
         ],
         output_ids=None,
+        is_prefill_only=False,
+        is_extend_in_batch=False,
     )
 
     result = scheduler._run_batch(batch)
@@ -301,6 +305,8 @@ def test_omni_scheduler_custom_runner_advances_forward_ct() -> None:
         return SimpleNamespace(
             reqs=[SimpleNamespace(rid="r", _omni_data=SimpleNamespace())],
             output_ids=None,
+            is_prefill_only=False,
+            is_extend_in_batch=False,
         )
 
     scheduler._run_batch(_batch())
