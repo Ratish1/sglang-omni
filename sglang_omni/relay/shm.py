@@ -134,7 +134,7 @@ class ShmGetOperation(ShmOperation):
                 try:
                     existing_shm.unlink()
                 except FileNotFoundError:
-                    pass
+                    logger.debug("SHM block %s was already unlinked", shm_name)
 
         finally:
             self._completed = True

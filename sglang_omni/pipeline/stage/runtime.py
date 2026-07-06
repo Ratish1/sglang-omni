@@ -194,7 +194,7 @@ class Stage:
             task.cancel()
         for task in receive_tasks:
             with suppress(asyncio.CancelledError):
-                await task
+                _ = await task
         if self.scheduler is not None:
             self.scheduler.stop()
         self.control_plane.close()

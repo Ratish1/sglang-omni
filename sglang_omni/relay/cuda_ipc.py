@@ -295,7 +295,7 @@ class CudaIpcRelay(Relay):
         try:
             self.close()
         except Exception:
-            pass
+            logger.debug("CudaIpcRelay finalizer cleanup failed", exc_info=True)
 
     def _ensure_local_pool(self) -> None:
         if self._pool_tensor is not None:

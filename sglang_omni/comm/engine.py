@@ -187,7 +187,7 @@ class CommEngine:
                 ready=ready,
             )
         )
-        await ready
+        _ = await ready
 
     async def read_stream_chunk(
         self,

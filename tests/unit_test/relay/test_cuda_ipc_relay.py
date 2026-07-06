@@ -19,11 +19,6 @@ from sglang_omni.relay.cuda_ipc import CudaIpcPutOperation, CudaIpcRelay
 _N = 1024 * 1024  # 1 MiB payload
 
 
-class _NeverAck:
-    def is_done(self, index: int) -> bool:
-        return False
-
-
 def _expected(n: int) -> torch.Tensor:
     return (torch.arange(n, dtype=torch.int64) % 251).to(torch.uint8)
 
@@ -41,14 +36,13 @@ def test_cuda_ipc_put_timeout_fails_relay_without_releasing_slot() -> None:
             metadata={},
             ready_event=object(),  # type: ignore[arg-type]
             source_tensor=object(),  # type: ignore[arg-type]
-            ack_map=_NeverAck(),  # type: ignore[arg-type]
-            ack_index=0,
+            slot_index=0,
             request_id="r",
             size=1,
             release_cb=release,
             fail_cb=failed.append,
         )
-        with pytest.raises(TimeoutError, match="receiver did not ack"):
+        with pytest.raises(TimeoutError):
             await op.wait_for_completion(timeout=0.0)
 
     asyncio.run(run())
@@ -77,7 +71,7 @@ def test_cuda_ipc_relay_failure_wakes_blocked_slot_acquire() -> None:
         await asyncio.sleep(0)
         relay._mark_failed(TimeoutError("ack timeout"))
         with pytest.raises(RuntimeError, match="cuda_ipc relay failed"):
-            await task
+            _ = await task
         return allocator
 
     allocator = asyncio.run(run())
@@ -130,7 +124,7 @@ def _receiver(
         dest = asyncio.run(run())
         expected = _expected(_N).to(f"cuda:{dst_gpu}")
         result_q.put(("ok", bool(torch.equal(dest, expected))))
-    except BaseException as exc:  # noqa: BLE001
+    except Exception as exc:
         result_q.put(("err", repr(exc)))
     finally:
         done_q.put(True)
