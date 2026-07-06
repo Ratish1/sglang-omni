@@ -210,3 +210,29 @@ def test_data_messages_reject_missing_data_ref() -> None:
             is_done=True,
             error="boom",
         ).to_dict()
+
+
+def test_data_ref_rejects_bool_int_fields() -> None:
+    data_ref = {
+        "_type": "DataRef",
+        "version": 1,
+        "kind": "stream_chunk",
+        "object_id": "obj",
+        "transport": "shm",
+        "layout": "raw_tensor",
+        "buffer": {"transport": "shm", "info": {}, "length": 1},
+        "tensors": [],
+        "metadata_tensors": [],
+        "shape": [1],
+        "dtype": "torch.uint8",
+        "offset": 0,
+    }
+
+    data_ref["version"] = True
+    with pytest.raises(TypeError, match="version must be int"):
+        DataRef.from_dict(data_ref)
+
+    data_ref["version"] = 1
+    data_ref["shape"] = [True]
+    with pytest.raises(TypeError, match="shape must be list\\[int\\]"):
+        DataRef.from_dict(data_ref)

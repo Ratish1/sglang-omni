@@ -51,11 +51,11 @@ class TensorMeta:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "TensorMeta":
         return cls(
-            path=_str(value, "path"),
-            shape=_ints(value, "shape"),
-            dtype=_str(value, "dtype"),
-            offset=_int(value, "offset"),
-            size=_int(value, "size"),
+            path=_required(value, "path", str),
+            shape=_int_tuple(value, "shape"),
+            dtype=_required(value, "dtype", str),
+            offset=_required(value, "offset", int),
+            size=_required(value, "size", int),
         )
 
 
@@ -69,9 +69,11 @@ class BackendRef:
     def from_relay_info(
         cls, *, transport: TransportKind, relay_info: dict[str, Any]
     ) -> "BackendRef":
-        transfer_info = _dict(relay_info, "transfer_info")
+        transfer_info = _required(relay_info, "transfer_info", dict)
         return cls(
-            transport=transport, info=relay_info, length=_int(transfer_info, "size")
+            transport=transport,
+            info=relay_info,
+            length=_required(transfer_info, "size", int),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -84,9 +86,9 @@ class BackendRef:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "BackendRef":
         return cls(
-            transport=TransportKind(_str(value, "transport")),
-            info=_dict(value, "info"),
-            length=_int(value, "length"),
+            transport=TransportKind(_required(value, "transport", str)),
+            info=_required(value, "info", dict),
+            length=_required(value, "length", int),
         )
 
 
@@ -100,7 +102,10 @@ class MetadataTensorRef:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "MetadataTensorRef":
-        return cls(path=_str(value, "path"), ref=DataRef.from_dict(_dict(value, "ref")))
+        return cls(
+            path=_required(value, "path", str),
+            ref=DataRef.from_dict(_required(value, "ref", dict)),
+        )
 
 
 @dataclass(frozen=True)
@@ -149,72 +154,55 @@ class DataRef:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "DataRef":
-        if _str(value, "_type") != "DataRef":
+        if _required(value, "_type", str) != "DataRef":
             raise ValueError("data_ref must have _type='DataRef'")
-        version = _int(value, "version")
+        version = _required(value, "version", int)
         if version != 1:
             raise ValueError(f"unsupported DataRef version {version}")
         return cls(
             version=version,
-            kind=DataKind(_str(value, "kind")),
-            object_id=_str(value, "object_id"),
-            transport=TransportKind(_str(value, "transport")),
-            layout=DataLayout(_str(value, "layout")),
-            buffer=BackendRef.from_dict(_dict(value, "buffer")),
-            header=_optional_str(value, "header"),
+            kind=DataKind(_required(value, "kind", str)),
+            object_id=_required(value, "object_id", str),
+            transport=TransportKind(_required(value, "transport", str)),
+            layout=DataLayout(_required(value, "layout", str)),
+            buffer=BackendRef.from_dict(_required(value, "buffer", dict)),
+            header=_optional(value, "header", str),
             tensors=tuple(
-                TensorMeta.from_dict(item) for item in _list(value, "tensors")
+                TensorMeta.from_dict(item) for item in _required(value, "tensors", list)
             ),
-            shape=_ints(value, "shape") if "shape" in value else None,
-            dtype=_optional_str(value, "dtype"),
-            offset=_int(value, "offset") if "offset" in value else None,
-            metadata=_dict(value, "metadata") if "metadata" in value else None,
+            shape=_int_tuple(value, "shape") if "shape" in value else None,
+            dtype=_optional(value, "dtype", str),
+            offset=_required(value, "offset", int) if "offset" in value else None,
+            metadata=(
+                _required(value, "metadata", dict) if "metadata" in value else None
+            ),
             metadata_tensors=tuple(
                 MetadataTensorRef.from_dict(item)
-                for item in _list(value, "metadata_tensors")
+                for item in _required(value, "metadata_tensors", list)
             ),
         )
 
 
-def _dict(value: dict[str, Any], key: str) -> dict[str, Any]:
+def _required(value: dict[str, Any], key: str, expected: type) -> Any:
     item = value[key]
-    if not isinstance(item, dict):
-        raise TypeError(f"{key} must be dict, got {type(item).__name__}")
+    if type(item) is not expected:
+        raise TypeError(f"{key} must be {expected.__name__}, got {type(item).__name__}")
     return item
 
 
-def _list(value: dict[str, Any], key: str) -> list[Any]:
-    item = value[key]
-    if not isinstance(item, list):
-        raise TypeError(f"{key} must be list, got {type(item).__name__}")
-    return item
-
-
-def _str(value: dict[str, Any], key: str) -> str:
-    item = value[key]
-    if not isinstance(item, str):
-        raise TypeError(f"{key} must be str, got {type(item).__name__}")
-    return item
-
-
-def _optional_str(value: dict[str, Any], key: str) -> str | None:
+def _optional(value: dict[str, Any], key: str, expected: type) -> Any | None:
     item = value.get(key)
     if item is None:
         return None
-    if not isinstance(item, str):
-        raise TypeError(f"{key} must be str or None, got {type(item).__name__}")
+    if type(item) is not expected:
+        raise TypeError(
+            f"{key} must be {expected.__name__} or None, " f"got {type(item).__name__}"
+        )
     return item
 
 
-def _int(value: dict[str, Any], key: str) -> int:
-    item = value[key]
-    if not isinstance(item, int):
-        raise TypeError(f"{key} must be int, got {type(item).__name__}")
-    return item
-
-
-def _ints(value: dict[str, Any], key: str) -> tuple[int, ...]:
-    items = _list(value, key)
-    if not all(isinstance(item, int) for item in items):
+def _int_tuple(value: dict[str, Any], key: str) -> tuple[int, ...]:
+    items = _required(value, key, list)
+    if not all(type(item) is int for item in items):
         raise TypeError(f"{key} must be list[int]")
     return tuple(items)
