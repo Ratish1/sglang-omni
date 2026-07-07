@@ -133,13 +133,10 @@ class CommRouter:
         devices = _tensor_devices(getattr(payload, "data", payload))
         if not devices or devices == {"cpu"}:
             return TransportKind.SHM
-        if devices == {"cuda"}:
+        if "cuda" in devices and devices <= {"cpu", "cuda"}:
             if self.self_is_gpu and target in self.gpu_stage_names:
                 return TransportKind.CUDA_IPC
-            raise ValueError(
-                f"cuda payload cannot be sent from {self.stage_name!r} to "
-                f"non-GPU target {target!r}"
-            )
+            return TransportKind.SHM
         raise ValueError(f"mixed or unsupported tensor devices in payload: {devices}")
 
     def relay_for_stream(

@@ -96,6 +96,7 @@ class Stage:
         same_process_targets: set[str] | None = None,
         local_dispatcher: Any | None = None,
         can_accept_stream_before_payload: bool = False,
+        disable_direct_cuda_ipc_payload: bool = False,
         tp_fanout: TPLeaderFanout | None = None,
         is_terminal: bool = False,
     ):
@@ -113,6 +114,7 @@ class Stage:
         self._same_process_targets = same_process_targets or set()
         self._local_dispatcher = local_dispatcher
         self._can_accept_stream_before_payload = can_accept_stream_before_payload
+        self._disable_direct_cuda_ipc_payload = disable_direct_cuda_ipc_payload
         self._tp_fanout = tp_fanout
         self._is_terminal = is_terminal
         self._owns_external_io = role in {"single", "leader"}
@@ -316,6 +318,22 @@ class Stage:
         self._active_requests.add(request_id)
         if self._stream_queue is not None and not self._stream_queue.has(request_id):
             self._stream_queue.open(request_id)
+
+        if stage_io.is_direct_cuda_ipc_payload_ref(msg.data_ref):
+            try:
+                payload = stage_io.deserialize_direct_cuda_ipc_payload(msg.data_ref)
+            except Exception as exc:
+                logger.exception(
+                    "Stage %s: direct IPC payload deserialize failed for %s",
+                    self.name,
+                    request_id,
+                )
+                await self._send_failure(
+                    request_id, f"direct IPC payload deserialize failed: {exc}"
+                )
+                return
+            await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
+            return
 
         data_ref = self._data_ref_from_message(msg)
         relay = self._comm.relay(data_ref.transport)
@@ -574,6 +592,8 @@ class Stage:
         )
 
     async def _discard_payload_data(self, msg: DataReadyMessage) -> None:
+        if stage_io.is_direct_cuda_ipc_payload_ref(msg.data_ref):
+            return
         request_id = msg.request_id
         data_ref = self._data_ref_from_message(msg)
         relay = self._comm.relay(data_ref.transport)
@@ -1015,6 +1035,38 @@ class Stage:
                 payload=projected_payload,
             )
             return
+
+        same_gpu_target = self._comm.router.is_same_gpu_target(target)
+        if (
+            not self._disable_direct_cuda_ipc_payload
+            and same_gpu_target
+            and stage_io.payload_has_cuda_tensor(projected_payload)
+        ):
+            try:
+                direct_ref = stage_io.serialize_direct_cuda_ipc_payload(
+                    projected_payload
+                )
+            except RuntimeError as exc:
+                if "received from another process" not in str(exc):
+                    raise
+            else:
+                await self.control_plane.send_to_stage(
+                    target,
+                    endpoint,
+                    DataReadyMessage(
+                        request_id=request_id,
+                        from_stage=self.name,
+                        to_stage=target,
+                        data_ref=direct_ref,
+                    ),
+                )
+                _emit_event(
+                    request_id=request_id,
+                    stage=self.name,
+                    event_name="stage_hop_sent",
+                    metadata={"to_stage": target, "transport": "torch_cuda_ipc"},
+                )
+                return
 
         transport_kind, relay = self._comm.router.relay_for_payload(
             target, projected_payload

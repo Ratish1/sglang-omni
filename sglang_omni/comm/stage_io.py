@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import pickle
+from dataclasses import fields, is_dataclass
 from multiprocessing.reduction import ForkingPickler
 from typing import Any
 
@@ -38,6 +39,7 @@ _TORCH_DTYPES: dict[str, torch.dtype] = {
 }
 
 _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE = "TorchCudaIpcStreamChunk"
+_DIRECT_CUDA_IPC_PAYLOAD_TYPE = "TorchCudaIpcPayload"
 _IPC_INLINE_CPU_BYTES_LIMIT = 64 * 1024
 
 
@@ -76,6 +78,35 @@ def extract_tensors(obj: Any, path: str = "") -> tuple[Any, dict[str, torch.Tens
     return obj, {}
 
 
+def extract_cuda_tensors(
+    obj: Any, path: str = ""
+) -> tuple[Any, dict[str, torch.Tensor]]:
+    if isinstance(obj, torch.Tensor):
+        if obj.is_cuda:
+            return {
+                "_tensor_placeholder": path,
+                "shape": list(obj.shape),
+                "dtype": str(obj.dtype),
+                "device": str(obj.device),
+            }, {path: obj}
+        return obj, {}
+    if isinstance(obj, dict):
+        out, tensors = {}, {}
+        for key, value in obj.items():
+            child_path = f"{path}.{key}" if path else key
+            out[key], child_tensors = extract_cuda_tensors(value, child_path)
+            tensors.update(child_tensors)
+        return out, tensors
+    if isinstance(obj, (list, tuple)):
+        out, tensors = [], {}
+        for idx, value in enumerate(obj):
+            child, child_tensors = extract_cuda_tensors(value, f"{path}[{idx}]")
+            out.append(child)
+            tensors.update(child_tensors)
+        return type(obj)(out), tensors
+    return obj, {}
+
+
 def restore_tensors(obj: Any, tensors: dict[str, torch.Tensor]) -> Any:
     if isinstance(obj, dict):
         if "_tensor_placeholder" in obj:
@@ -98,6 +129,111 @@ def should_use_direct_cuda_ipc_stream_chunk(
         return False
     inline_size = _inline_cpu_pickle_size(data) + _inline_cpu_pickle_size(metadata)
     return inline_size <= _IPC_INLINE_CPU_BYTES_LIMIT
+
+
+def payload_has_cuda_tensor(payload: Any) -> bool:
+    return _contains_cuda_tensor(payload)
+
+
+def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
+    if not isinstance(payload, StagePayload):
+        raise TypeError(
+            f"direct CUDA IPC payload requires StagePayload, got "
+            f"{type(payload).__name__}"
+        )
+    if _contains_cuda_tensor(payload.request) or _contains_cpu_tensor(payload.request):
+        raise ValueError("direct CUDA IPC payload does not support request tensors")
+    data_without_tensors, tensors = extract_cuda_tensors(payload.data)
+    if not tensors:
+        raise ValueError("direct CUDA IPC payload requires at least one CUDA tensor")
+    header = StagePayload(
+        request_id=payload.request_id,
+        request=payload.request,
+        data=data_without_tensors,
+    )
+    header_bytes = pickle.dumps(header)
+    if len(header_bytes) > _IPC_INLINE_CPU_BYTES_LIMIT:
+        raise ValueError(
+            "direct CUDA IPC payload header exceeds inline limit: "
+            f"{len(header_bytes)} > {_IPC_INLINE_CPU_BYTES_LIMIT} bytes"
+        )
+    return {
+        "_type": _DIRECT_CUDA_IPC_PAYLOAD_TYPE,
+        "version": 1,
+        "header": header_bytes,
+        "tensors": [
+            {"path": path, "tensor_bytes": _ipc_pickle(tensor)}
+            for path, tensor in tensors.items()
+        ],
+    }
+
+
+def is_direct_cuda_ipc_payload_ref(value: Any) -> bool:
+    return (
+        isinstance(value, dict) and value.get("_type") == _DIRECT_CUDA_IPC_PAYLOAD_TYPE
+    )
+
+
+def deserialize_direct_cuda_ipc_payload(data_ref: dict[str, Any]) -> StagePayload:
+    if data_ref.get("_type") != _DIRECT_CUDA_IPC_PAYLOAD_TYPE:
+        raise ValueError("data_ref is not a direct CUDA IPC payload")
+    if data_ref.get("version") != 1:
+        raise ValueError(
+            f"unsupported direct CUDA IPC payload version {data_ref.get('version')!r}"
+        )
+    header_bytes = data_ref.get("header")
+    if not isinstance(header_bytes, bytes):
+        raise TypeError(
+            "direct CUDA IPC payload header must be bytes, got "
+            f"{type(header_bytes).__name__}"
+        )
+    header = pickle.loads(header_bytes)
+    if not isinstance(header, StagePayload):
+        raise TypeError(
+            "direct CUDA IPC payload header must decode to StagePayload, got "
+            f"{type(header).__name__}"
+        )
+    raw_tensors = data_ref.get("tensors")
+    if not isinstance(raw_tensors, list):
+        raise TypeError(
+            "direct CUDA IPC payload tensors must be list, got "
+            f"{type(raw_tensors).__name__}"
+        )
+    tensors: dict[str, torch.Tensor] = {}
+    for item in raw_tensors:
+        if not isinstance(item, dict):
+            raise TypeError(
+                "direct CUDA IPC payload tensor entry must be dict, got "
+                f"{type(item).__name__}"
+            )
+        path = item.get("path")
+        if not isinstance(path, str):
+            raise TypeError(
+                "direct CUDA IPC payload tensor path must be str, got "
+                f"{type(path).__name__}"
+            )
+        tensor_bytes = item.get("tensor_bytes")
+        if not isinstance(tensor_bytes, bytes):
+            raise TypeError(
+                "direct CUDA IPC payload tensor_bytes must be bytes, got "
+                f"{type(tensor_bytes).__name__}"
+            )
+        tensor = pickle.loads(tensor_bytes)
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                "direct CUDA IPC payload tensor entry must decode to Tensor, got "
+                f"{type(tensor).__name__}"
+            )
+        if not tensor.is_cuda:
+            raise ValueError("direct CUDA IPC payload tensor decoded as non-CUDA")
+        if path in tensors:
+            raise ValueError(f"duplicate direct CUDA IPC tensor path {path!r}")
+        tensors[path] = tensor
+    return StagePayload(
+        request_id=header.request_id,
+        request=header.request,
+        data=restore_tensors(header.data, tensors),
+    )
 
 
 def serialize_direct_cuda_ipc_stream_chunk(
@@ -461,6 +597,11 @@ def _contains_cuda_tensor(obj: Any, seen: set[int] | None = None) -> bool:
         return any(_contains_cuda_tensor(value, seen) for value in obj.values())
     if isinstance(obj, (list, tuple, set, frozenset)):
         return any(_contains_cuda_tensor(value, seen) for value in obj)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return any(
+            _contains_cuda_tensor(getattr(obj, field.name), seen)
+            for field in fields(obj)
+        )
     return False
 
 
@@ -478,6 +619,11 @@ def _contains_cpu_tensor(obj: Any, seen: set[int] | None = None) -> bool:
         return any(_contains_cpu_tensor(value, seen) for value in obj.values())
     if isinstance(obj, (list, tuple, set, frozenset)):
         return any(_contains_cpu_tensor(value, seen) for value in obj)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return any(
+            _contains_cpu_tensor(getattr(obj, field.name), seen)
+            for field in fields(obj)
+        )
     return False
 
 
@@ -498,6 +644,11 @@ def _inline_cpu_pickle_size(obj: Any, seen: set[int] | None = None) -> int:
         )
     if isinstance(obj, (list, tuple, set, frozenset)):
         return sum(_inline_cpu_pickle_size(value, seen) for value in obj)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return sum(
+            _inline_cpu_pickle_size(getattr(obj, field.name), seen)
+            for field in fields(obj)
+        )
     try:
         return len(pickle.dumps(obj))
     except Exception:

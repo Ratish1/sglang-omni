@@ -40,6 +40,37 @@ def test_comm_router_uses_mooncake_only_for_remote_edges() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_comm_router_uses_cuda_ipc_for_mixed_gpu_payloads() -> None:
+    router = CommRouter(
+        stage_name="mm_aggregate",
+        gpu_id=0,
+        same_process_targets=set(),
+        gpu_stage_names={"thinker"},
+        comm_config={},
+    )
+    payload = {
+        "hidden": torch.empty(1, device="cuda:0"),
+        "lengths": torch.empty(1),
+    }
+
+    assert router.outbound_payload("thinker", payload) is TransportKind.CUDA_IPC
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_comm_router_uses_shm_for_cuda_payloads_to_cpu_targets() -> None:
+    router = CommRouter(
+        stage_name="thinker",
+        gpu_id=0,
+        same_process_targets=set(),
+        gpu_stage_names=set(),
+        comm_config={},
+    )
+    payload = {"token_ids": torch.empty(1, device="cuda:0")}
+
+    assert router.outbound_payload("decode", payload) is TransportKind.SHM
+
+
 def test_comm_router_identifies_same_gpu_targets() -> None:
     router = CommRouter(
         stage_name="talker_ar",

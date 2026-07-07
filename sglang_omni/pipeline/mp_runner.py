@@ -121,6 +121,7 @@ def _build_stage_groups(
             same_process_targets=same_process_targets,
             is_stream_receiver=stage_cfg.name in stream_receivers,
             can_accept_stream_before_payload=stage_cfg.can_accept_stream_before_payload,
+            disable_direct_cuda_ipc_payload=stage_cfg.disable_direct_cuda_ipc_payload,
             name_map=name_map,
         )
         if tp_size == 1:

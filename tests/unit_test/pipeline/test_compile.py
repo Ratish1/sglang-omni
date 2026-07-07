@@ -239,6 +239,34 @@ def test_runner_specs_wire_same_process_stream_targets() -> None:
     assert specs["thinker"].same_process_targets == {"decode"}
 
 
+def test_runner_specs_wire_direct_cuda_ipc_payload_disable_flag() -> None:
+    config = PipelineConfig(
+        model_path="model",
+        stages=[
+            stage(
+                "mm_aggregate",
+                next="thinker",
+                disable_direct_cuda_ipc_payload=True,
+            ),
+            stage("thinker", terminal=True, gpu=0),
+        ],
+    )
+    prep = prepare_pipeline_runtime(config)
+    groups = _build_stage_groups(
+        config,
+        ctx=FakeMpContext(),
+        stages_cfg=prep.stages_cfg,
+        name_map=prep.name_map,
+        endpoints=prep.endpoints,
+        placement_plan=prep.placement_plan,
+        process_plan=prep.process_plan,
+    )
+    specs = {spec.stage_name: spec for group in groups for spec in group.specs}
+
+    assert specs["mm_aggregate"].disable_direct_cuda_ipc_payload is True
+    assert specs["thinker"].disable_direct_cuda_ipc_payload is False
+
+
 def test_runner_specs_do_not_wire_same_process_targets_to_tp_stages() -> None:
     config = PipelineConfig(
         model_path="model",

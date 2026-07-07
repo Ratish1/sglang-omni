@@ -92,6 +92,7 @@ def _aggregate_stage(
             merge_fn=f"{_PKG}.merge.merge_for_thinker",
             next=["thinker", "talker_ar"],
             route_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_next_stages",
+            disable_direct_cuda_ipc_payload=True,
             project_payload={
                 "talker_ar": (
                     f"{_PKG}.request_builders.project_mm_aggregate_to_talker_ar"
@@ -107,6 +108,7 @@ def _aggregate_stage(
         wait_for_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_wait_sources",
         merge_fn=f"{_PKG}.merge.merge_for_thinker",
         next="thinker",
+        disable_direct_cuda_ipc_payload=True,
     )
 
 
