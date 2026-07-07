@@ -14,7 +14,11 @@ import multiprocessing as mp
 import pytest
 import torch
 
-from sglang_omni.relay.cuda_ipc import CudaIpcPutOperation, CudaIpcRelay
+from sglang_omni.relay.cuda_ipc import (
+    CudaIpcPutOperation,
+    CudaIpcRelay,
+    _ContiguousSlotAllocator,
+)
 
 _N = 1024 * 1024  # 1 MiB payload
 
@@ -55,19 +59,21 @@ def test_cuda_ipc_put_timeout_fails_relay_without_releasing_slot() -> None:
 def test_cuda_ipc_relay_failure_wakes_blocked_slot_acquire() -> None:
     class BlockingAllocator:
         def __init__(self) -> None:
-            self.released: list[int] = []
+            self.released: list[tuple[int, int]] = []
 
-        async def acquire_async(self) -> int:
+        async def acquire_async(
+            self, num_slots: int, *, capture_layout: bool = False
+        ) -> int:
             await asyncio.Event().wait()
             return 0
 
-        def release(self, credit_id: int) -> None:
-            self.released.append(credit_id)
+        def release(self, offset: int, num_slots: int) -> None:
+            self.released.append((offset, num_slots))
 
     async def run() -> BlockingAllocator:
         relay = CudaIpcRelay(engine_id="sender", device="cuda:0")
         allocator = BlockingAllocator()
-        task = asyncio.create_task(relay._acquire_slot(allocator))
+        task = asyncio.create_task(relay._acquire_slots(allocator, 2))
         await asyncio.sleep(0)
         relay._mark_failed(TimeoutError("ack timeout"))
         with pytest.raises(RuntimeError, match="cuda_ipc relay failed"):
@@ -84,6 +90,61 @@ def test_cuda_ipc_put_fails_fast_after_relay_failure() -> None:
         relay._mark_failed(TimeoutError("ack timeout"))
         with pytest.raises(RuntimeError, match="cuda_ipc relay failed"):
             await relay.put_async(torch.zeros(1, dtype=torch.uint8))
+
+    asyncio.run(run())
+
+
+def test_cuda_ipc_default_pool_uses_small_slots() -> None:
+    relay = CudaIpcRelay(engine_id="sender", device="cuda:0")
+    assert relay.slot_size == 64 * 1024
+    assert relay.pool_size == 1024 * 1024 * 1024
+    assert relay.slot_count == 16 * 1024
+
+
+def test_cuda_ipc_pool_size_and_slot_size_are_configurable() -> None:
+    relay = CudaIpcRelay(
+        engine_id="sender",
+        device="cuda:0",
+        pool_size_mb=1,
+        slot_size_kb=256,
+    )
+    assert relay.slot_size == 256 * 1024
+    assert relay.pool_size == 1024 * 1024
+    assert relay.slot_count == 4
+
+
+def test_contiguous_slot_allocator_waits_for_contiguous_range() -> None:
+    async def run() -> None:
+        allocator = _ContiguousSlotAllocator(slot_count=4, slot_size=8)
+        first = (await allocator.acquire_async(1)).offset
+        middle = (await allocator.acquire_async(1)).offset
+        tail = (await allocator.acquire_async(1)).offset
+        assert (first, middle, tail) == (0, 8, 16)
+
+        allocator.release(middle, 1)
+        blocked = asyncio.create_task(allocator.acquire_async(2, capture_layout=True))
+        await asyncio.sleep(0)
+        assert blocked.done() is False
+
+        allocator.release(tail, 1)
+        allocation = await asyncio.wait_for(blocked, timeout=1.0)
+        assert allocation.offset == 8
+        assert allocation.wait_rounds == 1
+        assert allocation.last_failed_free_slots == 2
+        assert allocation.last_failed_largest_free_run == 1
+        allocator.release(first, 1)
+        allocator.release(8, 2)
+
+    asyncio.run(run())
+
+
+def test_contiguous_slot_allocator_rejects_double_release() -> None:
+    async def run() -> None:
+        allocator = _ContiguousSlotAllocator(slot_count=2, slot_size=8)
+        offset = (await allocator.acquire_async(2)).offset
+        allocator.release(offset, 2)
+        with pytest.raises(RuntimeError, match="released twice"):
+            allocator.release(offset, 2)
 
     asyncio.run(run())
 

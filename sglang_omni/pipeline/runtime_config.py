@@ -139,6 +139,8 @@ def build_comm_config(
         return {
             "slot_size_mb": comm_cfg.slot_size_mb,
             "credits": comm_cfg.credits,
+            "cuda_ipc_slot_size_kb": comm_cfg.cuda_ipc_slot_size_kb,
+            "cuda_ipc_pool_size_mb": comm_cfg.cuda_ipc_pool_size_mb,
             "mooncake_protocol": comm_cfg.mooncake_protocol,
             "mooncake_hostname": comm_cfg.mooncake_hostname,
             "mooncake_device_name": comm_cfg.mooncake_device_name,
@@ -147,6 +149,8 @@ def build_comm_config(
     return {
         "slot_size_mb": 512,
         "credits": 2,
+        "cuda_ipc_slot_size_kb": 64,
+        "cuda_ipc_pool_size_mb": None,
         "mooncake_protocol": "rdma",
         "mooncake_hostname": None,
         "mooncake_device_name": "",

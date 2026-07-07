@@ -13,6 +13,9 @@ import torch
 from sglang_omni.comm import stage_io
 from sglang_omni.comm.data_ref import DataRef, TransportKind
 from sglang_omni.comm.router import CommRouter
+from sglang_omni.profiler.comm_trace import elapsed_ms as _comm_elapsed_ms
+from sglang_omni.profiler.comm_trace import emit as _comm_trace
+from sglang_omni.profiler.comm_trace import now_ns as _comm_now_ns
 from sglang_omni.proto import DataAckMessage, DataReadyMessage, StagePayload
 from sglang_omni.relay.base import Relay
 
@@ -37,6 +40,7 @@ class _PayloadSendJob:
     to_stage: str
     target_endpoint: str
     ready: asyncio.Future[DataRef]
+    enqueued_ns: int
 
 
 @dataclass
@@ -52,6 +56,7 @@ class _StreamSendJob:
     metadata: dict[str, Any] | None
     transport: TransportKind
     ready: asyncio.Future[DataRef]
+    enqueued_ns: int
 
 
 class CommEngine:
@@ -73,10 +78,11 @@ class CommEngine:
         self._ack_timeout_s = (
             float(cfg["ack_timeout_s"]) if "ack_timeout_s" in cfg else 30.0
         )
-        self._send_queue: asyncio.Queue[_PayloadSendJob | _StreamSendJob] = (
-            asyncio.Queue(maxsize=queue_size)
-        )
-        self._send_worker: asyncio.Task | None = None
+        self._send_queue_size = queue_size
+        self._send_queues: dict[
+            str, asyncio.Queue[_PayloadSendJob | _StreamSendJob]
+        ] = {}
+        self._send_workers: dict[str, asyncio.Task] = {}
         self._pending: dict[str, _PendingTransfer] = {}
         self._task_done_callback = task_done_callback
         self._closed = False
@@ -128,10 +134,11 @@ class CommEngine:
             raise TypeError(
                 f"send_payload expects StagePayload, got {type(payload).__name__}"
             )
-        self._ensure_send_worker()
+        queue = self._send_queue_for(to_stage)
         loop = asyncio.get_running_loop()
         ready: asyncio.Future[DataRef] = loop.create_future()
-        await self._send_queue.put(
+        enqueue_start = _comm_now_ns()
+        await queue.put(
             _PayloadSendJob(
                 relay=relay,
                 control_plane=control_plane,
@@ -142,7 +149,18 @@ class CommEngine:
                 to_stage=to_stage,
                 target_endpoint=target_endpoint,
                 ready=ready,
+                enqueued_ns=enqueue_start,
             )
+        )
+        _comm_trace(
+            "comm_send_enqueue",
+            kind="payload",
+            request_id=request_id,
+            from_stage=from_stage,
+            to_stage=to_stage,
+            transport=transport.value,
+            queue_key=to_stage,
+            elapsed_ms=round(_comm_elapsed_ms(enqueue_start), 6),
         )
         return await ready
 
@@ -169,10 +187,11 @@ class CommEngine:
         metadata: dict[str, Any] | None,
         transport: TransportKind,
     ) -> None:
-        self._ensure_send_worker()
+        queue = self._send_queue_for(target_stage)
         loop = asyncio.get_running_loop()
         ready: asyncio.Future[DataRef] = loop.create_future()
-        await self._send_queue.put(
+        enqueue_start = _comm_now_ns()
+        await queue.put(
             _StreamSendJob(
                 relay=relay,
                 control_plane=control_plane,
@@ -185,7 +204,19 @@ class CommEngine:
                 metadata=metadata,
                 transport=transport,
                 ready=ready,
+                enqueued_ns=enqueue_start,
             )
+        )
+        _comm_trace(
+            "comm_send_enqueue",
+            kind="stream_chunk",
+            request_id=request_id,
+            from_stage=from_stage,
+            to_stage=target_stage,
+            chunk_id=chunk_id,
+            transport=transport.value,
+            queue_key=target_stage,
+            elapsed_ms=round(_comm_elapsed_ms(enqueue_start), 6),
         )
         _ = await ready
 
@@ -202,9 +233,10 @@ class CommEngine:
 
     def close(self) -> None:
         self._closed = True
-        if self._send_worker is not None:
-            self._send_worker.cancel()
-            self._send_worker = None
+        for task in self._send_workers.values():
+            task.cancel()
+        self._send_workers.clear()
+        self._send_queues.clear()
         for object_id in list(self._pending):
             self._fail_pending(object_id, RuntimeError("comm engine closed"))
         self.router.close()
@@ -227,27 +259,44 @@ class CommEngine:
         if not pending.ack.done():
             pending.ack.set_exception(RuntimeError(error))
 
-    def _ensure_send_worker(self) -> None:
+    def _send_queue_for(
+        self, queue_key: str
+    ) -> asyncio.Queue[_PayloadSendJob | _StreamSendJob]:
         if self._closed:
             raise RuntimeError("comm engine is closed")
-        if self._send_worker is None or self._send_worker.done():
-            self._send_worker = asyncio.create_task(self._run_send_worker())
-            self._track_task(self._send_worker, "comm sender")
+        queue = self._send_queues.get(queue_key)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=self._send_queue_size)
+            self._send_queues[queue_key] = queue
+        task = self._send_workers.get(queue_key)
+        if task is None or task.done():
+            task = asyncio.create_task(self._run_send_worker(queue_key, queue))
+            self._send_workers[queue_key] = task
+            self._track_task(task, f"comm sender {queue_key}")
+        return queue
 
-    async def _run_send_worker(self) -> None:
+    async def _run_send_worker(
+        self,
+        queue_key: str,
+        queue: asyncio.Queue[_PayloadSendJob | _StreamSendJob],
+    ) -> None:
         while not self._closed:
-            job = await self._send_queue.get()
+            job = await queue.get()
             try:
                 if isinstance(job, _PayloadSendJob):
-                    await self._run_payload_send(job)
+                    await self._run_payload_send(job, queue_key)
                 else:
-                    await self._run_stream_send(job)
+                    await self._run_stream_send(job, queue_key)
             finally:
-                self._send_queue.task_done()
+                queue.task_done()
 
-    async def _run_payload_send(self, job: _PayloadSendJob) -> None:
+    async def _run_payload_send(self, job: _PayloadSendJob, queue_key: str) -> None:
         object_id: str | None = None
+        send_start = _comm_now_ns()
+        write_ms = -1.0
+        control_ms = -1.0
         try:
+            write_start = _comm_now_ns()
             data_ref, op = await stage_io.write_payload(
                 job.relay,
                 job.request_id,
@@ -256,9 +305,11 @@ class CommEngine:
                 from_stage=job.from_stage,
                 to_stage=job.to_stage,
             )
+            write_ms = _comm_elapsed_ms(write_start)
             object_id = data_ref.object_id
             self._register_pending(object_id, [op])
             self._arm_pending(object_id)
+            control_start = _comm_now_ns()
             await job.control_plane.send_to_stage(
                 job.to_stage,
                 job.target_endpoint,
@@ -269,6 +320,19 @@ class CommEngine:
                     data_ref=data_ref.to_dict(),
                 ),
             )
+            control_ms = _comm_elapsed_ms(control_start)
+            _comm_trace(
+                "comm_payload_send",
+                request_id=job.request_id,
+                from_stage=job.from_stage,
+                to_stage=job.to_stage,
+                transport=job.transport.value,
+                queue_key=queue_key,
+                queue_wait_ms=round((send_start - job.enqueued_ns) / 1_000_000.0, 6),
+                write_ms=round(write_ms, 6),
+                control_send_ms=round(control_ms, 6),
+                elapsed_ms=round(_comm_elapsed_ms(send_start), 6),
+            )
             job.ready.set_result(data_ref)
         except Exception as exc:
             if object_id is not None:
@@ -276,9 +340,13 @@ class CommEngine:
             if not job.ready.done():
                 job.ready.set_exception(exc)
 
-    async def _run_stream_send(self, job: _StreamSendJob) -> None:
+    async def _run_stream_send(self, job: _StreamSendJob, queue_key: str) -> None:
         object_id: str | None = None
+        send_start = _comm_now_ns()
+        write_ms = -1.0
+        control_ms = -1.0
         try:
+            write_start = _comm_now_ns()
             data_ref, ops = await stage_io.write_stream_chunk(
                 job.relay,
                 request_id=job.request_id,
@@ -289,9 +357,12 @@ class CommEngine:
                 metadata=job.metadata,
                 transport=job.transport,
             )
+            write_ms = _comm_elapsed_ms(write_start)
             object_id = data_ref.object_id
-            self._register_pending(object_id, ops)
-            self._arm_pending(object_id)
+            if ops:
+                self._register_pending(object_id, ops)
+                self._arm_pending(object_id)
+            control_start = _comm_now_ns()
             await job.control_plane.send_to_stage(
                 job.target_stage,
                 job.target_endpoint,
@@ -302,6 +373,20 @@ class CommEngine:
                     data_ref=data_ref.to_dict(),
                     chunk_id=job.chunk_id,
                 ),
+            )
+            control_ms = _comm_elapsed_ms(control_start)
+            _comm_trace(
+                "comm_stream_send",
+                request_id=job.request_id,
+                from_stage=job.from_stage,
+                to_stage=job.target_stage,
+                chunk_id=job.chunk_id,
+                transport=job.transport.value,
+                queue_key=queue_key,
+                queue_wait_ms=round((send_start - job.enqueued_ns) / 1_000_000.0, 6),
+                write_ms=round(write_ms, 6),
+                control_send_ms=round(control_ms, 6),
+                elapsed_ms=round(_comm_elapsed_ms(send_start), 6),
             )
             job.ready.set_result(data_ref)
         except Exception as exc:

@@ -138,6 +138,8 @@ def test_runner_specs_wire_routes_overrides_aggregation_and_streams(tmp_path) ->
     assert specs["aggregate"].merge_fn == fake_factory_path("merge_payloads")
     assert specs["talker"].is_stream_receiver
     assert specs["thinker"].gpu_stage_names == {"thinker", "talker"}
+    assert specs["thinker"].stage_gpu_ids["thinker"] == (0,)
+    assert specs["thinker"].stage_gpu_ids["talker"] == (0,)
     assert specs["preprocess"].same_process_targets == {"thinker", "aggregate"}
     assert specs["thinker"].same_process_targets == {"aggregate", "talker"}
     assert specs["thinker"].factory_args["model_path"] == "runtime-model"

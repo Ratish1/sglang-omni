@@ -74,6 +74,12 @@ def _build_stage_groups(
     for raw_name, canonical_name in name_map.items():
         if canonical_name in gpu_canonical:
             gpu_stage_names.add(raw_name)
+    stage_gpu_ids = {
+        name: placement.gpu_ids for name, placement in placement_plan.stages.items()
+    }
+    for raw_name, canonical_name in name_map.items():
+        if canonical_name in stage_gpu_ids:
+            stage_gpu_ids[raw_name] = stage_gpu_ids[canonical_name]
 
     single_stage_specs: dict[str, StageLaunchConfig] = {}
     tp_groups: list[StageGroup] = []
@@ -88,7 +94,6 @@ def _build_stage_groups(
             name_map,
             process_plan,
         )
-
         # Pre-resolve factory args (inject model_path, gpu_id)
         base_factory_args = resolve_stage_factory_args(stage_cfg, config)
 
@@ -112,6 +117,7 @@ def _build_stage_groups(
             stream_targets=list(stage_cfg.stream_to),
             stream_done_to_fn=stage_cfg.stream_done_to_fn,
             gpu_stage_names=gpu_stage_names,
+            stage_gpu_ids=stage_gpu_ids,
             same_process_targets=same_process_targets,
             is_stream_receiver=stage_cfg.name in stream_receivers,
             can_accept_stream_before_payload=stage_cfg.can_accept_stream_before_payload,

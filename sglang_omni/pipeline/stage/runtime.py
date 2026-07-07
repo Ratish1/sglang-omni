@@ -91,6 +91,7 @@ class Stage:
         stream_targets: list[str] | None = None,
         get_stream_done_targets: GetStreamDoneTargetsFn | None = None,
         gpu_stage_names: set[str] | None = None,
+        stage_gpu_ids: dict[str, tuple[int, ...]] | None = None,
         remote_stage_names: set[str] | None = None,
         same_process_targets: set[str] | None = None,
         local_dispatcher: Any | None = None,
@@ -122,6 +123,7 @@ class Stage:
                 gpu_id=self.gpu_id,
                 same_process_targets=self._same_process_targets,
                 gpu_stage_names=gpu_stage_names or set(),
+                stage_gpu_ids=stage_gpu_ids,
                 remote_stage_names=remote_stage_names or set(),
                 comm_config=comm_config or {},
                 injected_relay=relay,
@@ -422,6 +424,36 @@ class Stage:
             return
         self._active_requests.add(request_id)
 
+        if stage_io.is_direct_cuda_ipc_stream_chunk_ref(msg.data_ref):
+            try:
+                data, metadata = stage_io.deserialize_direct_cuda_ipc_stream_chunk(
+                    msg.data_ref
+                )
+            except Exception as exc:
+                logger.error(
+                    "Stage %s: direct IPC deserialize failed for %s: %s",
+                    self.name,
+                    request_id,
+                    exc,
+                )
+                await self._queue_stream_error(request_id, msg.from_stage, exc)
+                return
+            if request_id in self._aborted:
+                return
+            item = StreamItem(
+                chunk_id=msg.chunk_id,
+                data=data,
+                from_stage=msg.from_stage,
+                metadata=metadata,
+            )
+            self._emit_stream_chunk_received(
+                request_id=msg.request_id,
+                from_stage=msg.from_stage,
+                chunk_id=msg.chunk_id,
+            )
+            await self._route_stream_item_or_fail(request_id, item)
+            return
+
         data_ref = self._data_ref_from_message(msg)
         relay = self._comm.relay(data_ref.transport)
         try:
@@ -566,6 +598,8 @@ class Stage:
         await self._send_data_ack(msg, data_ref, success=True)
 
     async def _discard_stream_chunk_data(self, msg: DataReadyMessage) -> None:
+        if stage_io.is_direct_cuda_ipc_stream_chunk_ref(msg.data_ref):
+            return
         if msg.chunk_id is None:
             raise ValueError("stream chunk discard requires chunk_id")
         data_ref = self._data_ref_from_message(msg)
@@ -810,13 +844,17 @@ class Stage:
             elif out.type == "stream":
                 if out.target is None:
                     if self._stream_targets:
-                        for target in self._stream_targets:
-                            await self._send_stream_to_target(
-                                out.request_id,
-                                out.data,
-                                target,
-                                out.metadata,
+                        await asyncio.gather(
+                            *(
+                                self._send_stream_to_target(
+                                    out.request_id,
+                                    out.data,
+                                    target,
+                                    out.metadata,
+                                )
+                                for target in self._stream_targets
                             )
+                        )
                     else:
                         await self._send_stream_to_coordinator(
                             out.request_id,
@@ -1153,6 +1191,31 @@ class Stage:
                 "relay-backed stream chunks must be torch.Tensor, got "
                 f"{type(data).__name__}"
             )
+        if data.is_cuda and self._comm.router.is_same_gpu_target(target):
+            direct_ref = stage_io.serialize_direct_cuda_ipc_stream_chunk(data, metadata)
+            _emit_event(
+                request_id=request_id,
+                stage=self.name,
+                event_name="stage_stream_chunk_sent",
+                metadata={
+                    "to_stage": target,
+                    "chunk_id": chunk_id,
+                    "modality": chunk_modality,
+                    "transport": "torch_cuda_ipc",
+                },
+            )
+            await self.control_plane.send_to_stage(
+                target,
+                endpoint,
+                DataReadyMessage(
+                    request_id=request_id,
+                    from_stage=self.name,
+                    to_stage=target,
+                    data_ref=direct_ref,
+                    chunk_id=chunk_id,
+                ),
+            )
+            return
         transport_kind, relay = self._comm.router.relay_for_stream(target, data)
         _emit_event(
             request_id=request_id,

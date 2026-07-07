@@ -80,6 +80,7 @@ class StageLaunchConfig:
     stream_done_to_fn: str | None = None
     # GPU-resident stage names (for the transport router to pick GPU vs host transport).
     gpu_stage_names: set[str] = field(default_factory=set)
+    stage_gpu_ids: dict[str, tuple[int, ...]] = field(default_factory=dict)
     # Explicit cross-node stage names. These edges use Mooncake when present.
     remote_stage_names: set[str] = field(default_factory=set)
     is_stream_receiver: bool = False
@@ -617,6 +618,7 @@ def _construct_stage(
         stream_targets=spec.stream_targets or None,
         get_stream_done_targets=get_stream_done_targets,
         gpu_stage_names=spec.gpu_stage_names or None,
+        stage_gpu_ids=spec.stage_gpu_ids or None,
         remote_stage_names=spec.remote_stage_names or None,
         same_process_targets=spec.same_process_targets or None,
         local_dispatcher=local_dispatcher,
