@@ -27,7 +27,13 @@ from .messages import (
     SubmitMessage,
     parse_message,
 )
-from .request import OmniRequest, RequestInfo, RequestState, StagePayload
+from .request import (
+    EXPLICIT_GENERATION_PARAMS_KEY,
+    OmniRequest,
+    RequestInfo,
+    RequestState,
+    StagePayload,
+)
 from .stage import StageInfo
 
 __all__ = [
@@ -57,6 +63,7 @@ __all__ = [
     "parse_message",
     "RequestState",
     "RequestInfo",
+    "EXPLICIT_GENERATION_PARAMS_KEY",
     "OmniRequest",
     "StagePayload",
     "StageInfo",

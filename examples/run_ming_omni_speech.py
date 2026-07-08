@@ -149,7 +149,7 @@ async def main_async(args: argparse.Namespace) -> None:
             timeout=args.timeout,
         )
         duration = time.time() - t0
-        logger.info("Pipeline completed in %.2fs", duration)
+        logger.info(f"Pipeline completed in {duration:.2f}s")
 
         if args.output and isinstance(result, dict):
             _save_audio(result, args.output)
@@ -170,7 +170,7 @@ def _save_audio(result: dict, output_path: str) -> None:
         if isinstance(payload, dict):
             data = payload
         else:
-            data = getattr(payload, "data", None)
+            data = payload.data
         if not isinstance(data, dict):
             continue
         waveform = data.get("audio_waveform")

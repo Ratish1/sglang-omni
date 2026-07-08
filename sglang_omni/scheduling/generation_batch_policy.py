@@ -3,21 +3,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
 from typing import Any
 
-
-@dataclass(frozen=True)
-class GenerationBatchPolicyReport:
-    model_name: str
-    max_running_requests: int
-    cuda_graph_enabled: bool
-    cuda_graph_max_bs: int | None
-    cuda_graph_bs: tuple[int, ...] | None
-    torch_compile_enabled: bool
-    torch_compile_max_bs: int | None
-    model_buffer_bs: int | None
+_MISSING = object()
 
 
 def build_default_cuda_graph_bs(max_bs: int) -> list[int]:
@@ -35,19 +24,48 @@ def build_default_cuda_graph_bs(max_bs: int) -> list[int]:
     return values
 
 
-def sync_cuda_graph_bs_with_max_bs(
-    overrides: dict[str, Any],
-    server_args_overrides: dict[str, Any] | None,
-) -> None:
-    if not server_args_overrides:
-        return
-    if (
-        "cuda_graph_max_bs" in server_args_overrides
-        and "cuda_graph_bs" not in server_args_overrides
-    ):
-        overrides["cuda_graph_bs"] = build_default_cuda_graph_bs(
-            int(overrides["cuda_graph_max_bs"])
-        )
+def build_generation_batch_overrides(
+    *,
+    max_running_requests: int,
+    cuda_graph_max_bs: int | None = None,
+    torch_compile_max_bs: int | None = None,
+    server_args_overrides: Mapping[str, Any] | None = None,
+    **stage_defaults: Any,
+) -> dict[str, Any]:
+    incoming = dict(server_args_overrides or {})
+    max_running_requests = _normalize_positive_int(
+        "max_running_requests",
+        incoming.pop("max_running_requests", max_running_requests),
+    )
+    cuda_graph_max_bs = (
+        max_running_requests if cuda_graph_max_bs is None else cuda_graph_max_bs
+    )
+    cuda_graph_max_bs = _normalize_positive_int(
+        "cuda_graph_max_bs",
+        incoming.pop("cuda_graph_max_bs", cuda_graph_max_bs),
+    )
+    torch_compile_max_bs = (
+        max_running_requests if torch_compile_max_bs is None else torch_compile_max_bs
+    )
+    torch_compile_max_bs = _normalize_positive_int(
+        "torch_compile_max_bs",
+        incoming.pop("torch_compile_max_bs", torch_compile_max_bs),
+    )
+    cuda_graph_bs = incoming.pop("cuda_graph_bs", _MISSING)
+
+    overrides = {
+        **stage_defaults,
+        **incoming,
+        "max_running_requests": max_running_requests,
+        "cuda_graph_max_bs": cuda_graph_max_bs,
+        "torch_compile_max_bs": torch_compile_max_bs,
+    }
+    if cuda_graph_bs is _MISSING:
+        overrides["cuda_graph_bs"] = build_default_cuda_graph_bs(cuda_graph_max_bs)
+    else:
+        overrides["cuda_graph_bs"] = cuda_graph_bs
+
+    return overrides
 
 
 def validate_generation_batch_policy(
@@ -55,26 +73,26 @@ def validate_generation_batch_policy(
     model_name: str,
     server_args: Any,
     model_buffer_bs: int | None = None,
-) -> GenerationBatchPolicyReport:
+) -> None:
     errors: list[str] = []
 
-    max_running_requests = _read_positive_int(
-        server_args,
+    max_running_requests = _validate_positive_int(
         "max_running_requests",
+        server_args.max_running_requests,
         errors,
     )
-    cuda_graph_enabled = not bool(getattr(server_args, "disable_cuda_graph", False))
+    cuda_graph_enabled = not bool(server_args.disable_cuda_graph)
 
     cuda_graph_max_bs: int | None = None
     cuda_graph_bs: tuple[int, ...] | None = None
     if cuda_graph_enabled:
-        cuda_graph_max_bs = _read_positive_int(
-            server_args,
+        cuda_graph_max_bs = _validate_positive_int(
             "cuda_graph_max_bs",
+            server_args.cuda_graph_max_bs,
             errors,
             required=True,
         )
-        cuda_graph_bs_value = getattr(server_args, "cuda_graph_bs", None)
+        cuda_graph_bs_value = server_args.cuda_graph_bs
         if cuda_graph_bs_value is None:
             errors.append("cuda_graph_bs must be explicit when CUDA graph is enabled")
         else:
@@ -97,10 +115,10 @@ def validate_generation_batch_policy(
                 f"({cuda_graph_max_bs} < {max_running_requests})"
             )
 
-    torch_compile_enabled = bool(getattr(server_args, "enable_torch_compile", False))
-    torch_compile_max_bs = _read_positive_int(
-        server_args,
+    torch_compile_enabled = bool(server_args.enable_torch_compile)
+    torch_compile_max_bs = _validate_positive_int(
         "torch_compile_max_bs",
+        server_args.torch_compile_max_bs,
         errors,
         required=torch_compile_enabled,
     )
@@ -134,27 +152,14 @@ def validate_generation_batch_policy(
             f"{model_name} invalid generation batch policy: " + "; ".join(errors)
         )
 
-    assert max_running_requests is not None
-    return GenerationBatchPolicyReport(
-        model_name=model_name,
-        max_running_requests=max_running_requests,
-        cuda_graph_enabled=cuda_graph_enabled,
-        cuda_graph_max_bs=cuda_graph_max_bs,
-        cuda_graph_bs=cuda_graph_bs,
-        torch_compile_enabled=torch_compile_enabled,
-        torch_compile_max_bs=torch_compile_max_bs,
-        model_buffer_bs=normalized_model_buffer_bs,
-    )
 
-
-def _read_positive_int(
-    obj: Any,
+def _validate_positive_int(
     field: str,
+    value: Any,
     errors: list[str],
     *,
     required: bool = True,
 ) -> int | None:
-    value = getattr(obj, field, None)
     if value is None:
         if required:
             errors.append(f"{field} must be explicit")
@@ -167,6 +172,16 @@ def _read_positive_int(
     if normalized < 1:
         errors.append(f"{field} must be >= 1")
         return None
+    return normalized
+
+
+def _normalize_positive_int(field: str, value: Any) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be an integer") from exc
+    if normalized < 1:
+        raise ValueError(f"{field} must be >= 1")
     return normalized
 
 

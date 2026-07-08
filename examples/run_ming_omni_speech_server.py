@@ -195,7 +195,7 @@ def _launch_speech_server(args: argparse.Namespace) -> None:
         server_arg_updates["disable_custom_all_reduce"] = True
     if args.mem_fraction_static is not None:
         server_arg_updates["mem_fraction_static"] = args.mem_fraction_static
-    if getattr(args, "cpu_offload_gb", None) is not None:
+    if args.cpu_offload_gb is not None:
         server_arg_updates["cpu_offload_gb"] = args.cpu_offload_gb
     if server_arg_updates:
         _apply_stage_factory_updates(

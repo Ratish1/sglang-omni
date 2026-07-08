@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3-ASR correctness CI for SGLang Omni.
+"""SeedTTS ASR correctness CI for Qwen3-ASR.
 
 The test uses the full English SeedTTS set as the speech corpus. It compares
 normalized transcriptions from the SGLang Omni Qwen3-ASR router against the
-dataset reference text. Transcription, WER, and speed metrics are computed by
-the shared benchmark path imported from
-``benchmarks.eval.benchmark_qwen3_asr_concurrency`` (``run_asr_transcription`` /
-``build_asr_eval_results``); this gate only launches the router, runs one pass,
-and applies thresholds.
+dataset reference text.
+
+Author:
+chenyang zhao: https://github.com/zhaochenyang20
 """
 
 from __future__ import annotations
@@ -19,12 +18,11 @@ import pytest
 
 from benchmarks.dataset.prepare import DATASETS
 from benchmarks.dataset.seedtts import SampleInput, load_seedtts_samples
-from benchmarks.eval.benchmark_qwen3_asr_concurrency import (
-    build_asr_eval_results,
-    run_asr_transcription,
+from benchmarks.eval.benchmark_asr_seedtts import (
+    QWEN3_ASR_MODEL_PATH,
+    run_asr_seedtts_once,
 )
 from benchmarks.metrics.wer import print_asr_speed_summary, print_asr_wer_summary
-from benchmarks.tasks.tts import QWEN3_ASR_MODEL_PATH
 from tests.test_model.omni_router_utils import (
     ManagedRouterHandle,
     launch_managed_router,
@@ -38,13 +36,13 @@ QWEN3_ASR_WARMUP_REQUESTS = QWEN3_ASR_CONCURRENCY * 2
 SEEDTTS_ASR_CORRECTNESS_SAMPLES = 1088
 
 # P95 reference values calibrated by tune.py (worst-of-N).
-SEEDTTS_ASR_CORPUS_WER_MAX = 0.014
+SEEDTTS_ASR_CORPUS_WER_MAX = 0.0138
 SEEDTTS_ASR_SAMPLE_WER_MAX = 0.2858
-QWEN3_ASR_THROUGHPUT_MIN = 49.781955608635656
-QWEN3_ASR_LATENCY_MEAN_MAX_S = 0.639
-QWEN3_ASR_LATENCY_P95_MAX_S = 0.8901181474560871
-QWEN3_ASR_RTF_MEAN_MAX = 0.1382
-QWEN3_ASR_RTF_P95_MAX = 0.1976
+QWEN3_ASR_THROUGHPUT_MIN = 93.506
+QWEN3_ASR_LATENCY_MEAN_MAX_S = 0.34028885086916166
+QWEN3_ASR_LATENCY_P95_MAX_S = 0.455045491317287
+QWEN3_ASR_RTF_MEAN_MAX = 0.0737
+QWEN3_ASR_RTF_P95_MAX = 0.1018
 
 THRESHOLD_SLACK_HIGHER = 0.9
 THRESHOLD_SLACK_LOWER = 1.1
@@ -73,7 +71,7 @@ def _require_cuda() -> None:
     import torch
 
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for Qwen3-ASR correctness CI")
+        pytest.skip("CUDA is required for ASR correctness CI")
 
 
 @pytest.fixture(scope="module")
@@ -86,7 +84,7 @@ def seedtts_en_samples() -> list[SampleInput]:
 
 
 @pytest.fixture(scope="module")
-def qwen3_asr_router_server(
+def asr_router_server(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> ManagedRouterHandle:
     with launch_managed_router(
@@ -114,9 +112,9 @@ def _format_high_wer_sample(sample: dict) -> str:
 
 
 @pytest.mark.benchmark
-def test_qwen3_asr_matches_seedtts_reference_text(
+def test_asr_matches_seedtts_reference_text(
     seedtts_en_samples: list[SampleInput],
-    qwen3_asr_router_server: ManagedRouterHandle,
+    asr_router_server: ManagedRouterHandle,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
     _require_cuda()
@@ -130,28 +128,21 @@ def test_qwen3_asr_matches_seedtts_reference_text(
         checks.assert_all()
 
     with router_worker_traffic_guard(
-        qwen3_asr_router_server,
+        asr_router_server,
         label="Qwen3-ASR SeedTTS",
     ) as router_guard:
-        outputs, wall_clock_s = asyncio.run(
-            run_asr_transcription(
+        results = asyncio.run(
+            run_asr_seedtts_once(
                 seedtts_en_samples,
-                port=qwen3_asr_router_server.port,
+                host="127.0.0.1",
+                port=asr_router_server.port,
                 model_path=QWEN3_ASR_CI_MODEL_PATH,
                 lang="en",
                 concurrency=QWEN3_ASR_CONCURRENCY,
                 warmup=QWEN3_ASR_WARMUP_REQUESTS,
+                disable_tqdm=False,
             )
         )
-
-    results = build_asr_eval_results(
-        seedtts_en_samples,
-        outputs,
-        wall_clock_s,
-        "en",
-        model_path=QWEN3_ASR_CI_MODEL_PATH,
-        concurrency=QWEN3_ASR_CONCURRENCY,
-    )
     summary = results["summary"]
     speed = results["speed"]
 
@@ -167,7 +158,16 @@ def test_qwen3_asr_matches_seedtts_reference_text(
     print_asr_speed_summary(speed, QWEN3_ASR_CI_MODEL_PATH)
 
     results_path = tmp_path_factory.getbasetemp() / "qwen3_asr_results.json"
-    results_path.write_text(json.dumps({"summary": summary, "speed": speed}, indent=2))
+    results_path.write_text(
+        json.dumps(
+            {
+                "summary": summary,
+                "speed": speed,
+                "router_ready_s": asr_router_server.router_ready_s,
+            },
+            indent=2,
+        )
+    )
 
     corpus_wer = summary["corpus_wer"]
     throughput_samples_per_s = speed["throughput_samples_per_s"]

@@ -30,8 +30,7 @@ from sglang_omni.models.qwen3_omni.request_builders import (
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.generation_batch_policy import (
-    build_default_cuda_graph_bs,
-    sync_cuda_graph_bs_with_max_bs,
+    build_generation_batch_overrides,
     validate_generation_batch_policy,
 )
 from sglang_omni.scheduling.sglang_backend import (
@@ -945,6 +944,8 @@ def create_sglang_thinker_executor_from_config(
     encoder_mem_reserve: float = 0.05,
     speech_enabled: bool = False,
     total_gpu_memory_fraction: float | None = None,
+    enable_async_decode: bool = True,
+    async_decode_min_batch_size: int = 2,
 ):
     """Returns OmniScheduler for thinker."""
     # note (luojiaxuan):
@@ -1027,6 +1028,8 @@ def create_sglang_thinker_executor_from_config(
         tp_rank=tp_rank,
         nccl_port=nccl_port,
         total_gpu_memory_fraction=effective_total_gpu_memory_fraction,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
     )
     post_load_process_mem = get_process_gpu_memory_bytes(gpu_id)
     logger.info(
@@ -1071,17 +1074,12 @@ def create_talker_ar_executor_from_config(
     # Sampler.forward doesn't forward seed to flashinfer, so
     # under cuda graph the captured RNG is boot-dependent and ~5% of prompts
     # trigger degenerate AR loops (see #408). Revert once upstream lands.
-    overrides: dict[str, Any] = {
-        "cuda_graph_bs": build_default_cuda_graph_bs(16),
-        "cuda_graph_max_bs": 16,
-        "disable_cuda_graph": False,
-        "max_running_requests": 16,
-        "sampling_backend": "pytorch",
-        "torch_compile_max_bs": 16,
-    }
-    if server_args_overrides:
-        overrides.update(server_args_overrides)
-        sync_cuda_graph_bs_with_max_bs(overrides, server_args_overrides)
+    overrides = build_generation_batch_overrides(
+        max_running_requests=32,
+        server_args_overrides=server_args_overrides,
+        disable_cuda_graph=False,
+        sampling_backend="pytorch",
+    )
     overrides["tp_size"] = tp_size
     _apply_colocated_ar_memory_contract(
         overrides,
