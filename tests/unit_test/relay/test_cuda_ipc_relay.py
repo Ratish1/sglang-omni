@@ -6,10 +6,14 @@ opens it and copies into its own buffer (a peer/NVLink copy when the GPUs
 differ). These run two real processes because a process cannot open its own CUDA
 IPC handle.
 """
+
 from __future__ import annotations
 
 import asyncio
 import multiprocessing as mp
+import queue
+import time
+import traceback
 
 import pytest
 import torch
@@ -21,10 +25,14 @@ from sglang_omni.relay.cuda_ipc import (
 )
 
 _N = 1024 * 1024  # 1 MiB payload
+_REUSE_COUNT = 3
+_PROCESS_TIMEOUT_S = 120.0
 
 
-def _expected(n: int) -> torch.Tensor:
-    return (torch.arange(n, dtype=torch.int64) % 251).to(torch.uint8)
+def _expected(n: int, transfer_index: int = 0) -> torch.Tensor:
+    return ((torch.arange(n, dtype=torch.int64) + transfer_index * 17) % 251).to(
+        torch.uint8
+    )
 
 
 def test_cuda_ipc_put_timeout_fails_relay_without_releasing_slot() -> None:
@@ -149,65 +157,131 @@ def test_contiguous_slot_allocator_rejects_double_release() -> None:
     asyncio.run(run())
 
 
-def _sender(src_gpu: int, meta_q: mp.Queue, done_q: mp.Queue) -> None:
-    torch.cuda.set_device(src_gpu)
-    relay = CudaIpcRelay(
-        engine_id="sender",
-        device=f"cuda:{src_gpu}",
-        slot_size_mb=2,
-    )
-    buf = _expected(_N).to(f"cuda:{src_gpu}")
+def _sender(
+    src_gpu: int,
+    meta_q: mp.Queue,
+    ack_q: mp.Queue,
+    result_q: mp.Queue,
+) -> None:
+    relay = None
+    try:
+        torch.cuda.set_device(src_gpu)
+        relay = CudaIpcRelay(
+            engine_id="sender",
+            device=f"cuda:{src_gpu}",
+            pool_size_mb=1,
+        )
 
-    async def run() -> None:
-        op = await relay.put_async(buf, request_id="r")
-        meta_q.put(op.metadata)
-        await op.wait_for_completion()
+        async def run() -> None:
+            for index in range(_REUSE_COUNT):
+                request_id = f"r-{index}"
+                buf = _expected(_N, index).to(f"cuda:{src_gpu}")
+                op = await relay.put_async(buf, request_id=request_id)
+                meta_q.put((request_id, op.metadata))
 
-    asyncio.run(run())
-    done_q.get(timeout=60)  # keep the source buffer alive until the receiver copies
+                ack_request_id, ack_error = ack_q.get(timeout=60)
+                if ack_request_id != request_id:
+                    raise RuntimeError(
+                        f"received ack for {ack_request_id!r}, expected {request_id!r}"
+                    )
+                if ack_error is None:
+                    op.mark_receiver_done()
+                else:
+                    op.mark_receiver_failed(RuntimeError(ack_error))
+                await op.wait_for_completion(timeout=60)
+
+        asyncio.run(run())
+        result_q.put(("sender", "ok", None))
+    except BaseException:
+        result_q.put(("sender", "err", traceback.format_exc()))
+        raise
+    finally:
+        if relay is not None:
+            relay.close()
 
 
 def _receiver(
-    dst_gpu: int, meta_q: mp.Queue, done_q: mp.Queue, result_q: mp.Queue
+    dst_gpu: int,
+    meta_q: mp.Queue,
+    ack_q: mp.Queue,
+    result_q: mp.Queue,
 ) -> None:
+    relay = None
+    request_id = None
     try:
         torch.cuda.set_device(dst_gpu)
         relay = CudaIpcRelay(engine_id="receiver", device=f"cuda:{dst_gpu}")
-        metadata = meta_q.get(timeout=60)
+        for index in range(_REUSE_COUNT):
+            request_id, metadata = meta_q.get(timeout=60)
+            assert request_id == f"r-{index}"
 
-        async def run() -> torch.Tensor:
-            size = metadata["transfer_info"]["size"]
-            dest = torch.zeros(size, dtype=torch.uint8, device=f"cuda:{dst_gpu}")
-            op = await relay.get_async(metadata, dest, request_id="r")
-            await op.wait_for_completion()
-            return dest
+            async def run() -> torch.Tensor:
+                size = metadata["transfer_info"]["size"]
+                dest = torch.empty(size, dtype=torch.uint8, device=f"cuda:{dst_gpu}")
+                op = await relay.get_async(metadata, dest, request_id=request_id)
+                await op.wait_for_completion(timeout=60)
+                return dest
 
-        dest = asyncio.run(run())
-        expected = _expected(_N).to(f"cuda:{dst_gpu}")
-        result_q.put(("ok", bool(torch.equal(dest, expected))))
-    except Exception as exc:
-        result_q.put(("err", repr(exc)))
+            dest = asyncio.run(run())
+            expected = _expected(_N, index).to(f"cuda:{dst_gpu}")
+            assert torch.equal(dest, expected), f"payload mismatch for {request_id}"
+
+            # Drop the imported pool before the final ACK permits the exporter to
+            # release its pool and exit. Earlier ACKs intentionally exercise slot
+            # reuse through the receiver's cached IPC mapping.
+            if index == _REUSE_COUNT - 1:
+                relay.close()
+                relay = None
+            ack_q.put((request_id, None))
+
+        result_q.put(("receiver", "ok", None))
+    except BaseException:
+        error = traceback.format_exc()
+        if relay is not None:
+            relay.close()
+            relay = None
+        ack_q.put((request_id, error))
+        result_q.put(("receiver", "err", error))
+        raise
     finally:
-        done_q.put(True)
+        if relay is not None:
+            relay.close()
 
 
 def _run_case(src_gpu: int, dst_gpu: int) -> None:
     ctx = mp.get_context("spawn")
-    meta_q, done_q, result_q = ctx.Queue(), ctx.Queue(), ctx.Queue()
-    sender = ctx.Process(target=_sender, args=(src_gpu, meta_q, done_q))
-    receiver = ctx.Process(target=_receiver, args=(dst_gpu, meta_q, done_q, result_q))
+    meta_q, ack_q, result_q = ctx.Queue(), ctx.Queue(), ctx.Queue()
+    sender = ctx.Process(target=_sender, args=(src_gpu, meta_q, ack_q, result_q))
+    receiver = ctx.Process(target=_receiver, args=(dst_gpu, meta_q, ack_q, result_q))
     sender.start()
     receiver.start()
-    try:
-        status, value = result_q.get(timeout=120)
-    finally:
-        sender.join(timeout=30)
-        receiver.join(timeout=30)
-        for proc in (sender, receiver):
-            if proc.is_alive():
-                proc.terminate()
-    assert status == "ok", value
-    assert value is True
+
+    deadline = time.monotonic() + _PROCESS_TIMEOUT_S
+    results: dict[str, tuple[str, str | None]] = {}
+    while len(results) < 2 and time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        try:
+            role, status, detail = result_q.get(timeout=min(0.25, remaining))
+            results[role] = (status, detail)
+        except queue.Empty:
+            if not sender.is_alive() and not receiver.is_alive():
+                break
+
+    for proc in (sender, receiver):
+        proc.join(timeout=max(0.0, deadline - time.monotonic()))
+    for proc in (sender, receiver):
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
+
+    details = "\n".join(
+        f"{role}: {status}\n{detail or ''}".rstrip()
+        for role, (status, detail) in sorted(results.items())
+    )
+    assert sender.exitcode == 0, details
+    assert receiver.exitcode == 0, details
+    assert results.keys() == {"sender", "receiver"}, details
+    assert all(status == "ok" for status, _ in results.values()), details
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
