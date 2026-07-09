@@ -143,6 +143,20 @@ def test_qwen3_omni_h20_colocated_example_config_loads_and_plans() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "qwen3_omni_mmmu_h100.yaml",
+        "qwen3_omni_colocated_h100_bf16.yaml",
+        "qwen3_omni_colocated_h100_fp8.yaml",
+    ],
+)
+def test_qwen3_omni_h100_example_config_loads(config_name: str) -> None:
+    config_path = _REPO_ROOT / "examples" / "configs" / config_name
+
+    ConfigManager.from_file(str(config_path))
+
+
 def test_qwen3_omni_mmsu_example_config_uses_text_pipeline() -> None:
     config_path = _REPO_ROOT / "examples" / "configs" / "qwen3_omni_mmsu.yaml"
 
