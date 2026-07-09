@@ -36,6 +36,7 @@ class TensorMeta(msgspec.Struct, frozen=True):
     path: str
     shape: tuple[int, ...]
     dtype: str
+    device: str
     offset: int
     size: int
 
@@ -44,6 +45,7 @@ class TensorMeta(msgspec.Struct, frozen=True):
             "path": self.path,
             "shape": list(self.shape),
             "dtype": self.dtype,
+            "device": self.device,
             "offset": self.offset,
             "size": self.size,
         }
@@ -54,6 +56,7 @@ class TensorMeta(msgspec.Struct, frozen=True):
             path=_required(value, "path", str),
             shape=_int_tuple(value, "shape"),
             dtype=_required(value, "dtype", str),
+            device=_required(value, "device", str),
             offset=_required(value, "offset", int),
             size=_required(value, "size", int),
         )

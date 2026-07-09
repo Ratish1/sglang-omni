@@ -337,9 +337,12 @@ async def read_payload(
     header = pickle.loads(base64.b64decode(data_ref.header))
     transfer_buf = await _read_transfer_buffer(relay, request_id, data_ref)
     tensors = {
-        entry.path: transfer_buf[entry.offset : entry.offset + entry.size]
-        .view(_torch_dtype(entry.dtype))
-        .reshape(entry.shape)
+        entry.path: _restore_tensor_device(
+            transfer_buf[entry.offset : entry.offset + entry.size]
+            .view(_torch_dtype(entry.dtype))
+            .reshape(entry.shape),
+            entry.device,
+        )
         for entry in data_ref.tensors
     }
     relay.cleanup(request_id)
@@ -539,6 +542,7 @@ def _pack_tensors(
                 path=path,
                 shape=tuple(int(dim) for dim in tensor.shape),
                 dtype=str(tensor.dtype),
+                device=str(tensor.device),
                 offset=offset,
                 size=int(flat.numel()),
             )
@@ -581,6 +585,12 @@ def _torch_dtype(dtype_str: str) -> torch.dtype:
     if dtype is None:
         raise ValueError(f"unsupported tensor dtype metadata: {dtype_str!r}")
     return dtype
+
+
+def _restore_tensor_device(tensor: torch.Tensor, device: str) -> torch.Tensor:
+    if torch.device(device).type == "cpu":
+        return tensor.cpu()
+    return tensor
 
 
 def _contains_cuda_tensor(obj: Any, seen: set[int] | None = None) -> bool:

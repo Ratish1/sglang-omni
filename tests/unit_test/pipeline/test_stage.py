@@ -298,6 +298,33 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
     asyncio.run(_run())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_payload_round_trip_preserves_cpu_tensor_devices() -> None:
+    async def _run() -> None:
+        relay = FakeRelay(device="cuda:0")
+        payload = make_stage_payload(
+            request_id="req-mixed-devices",
+            data={
+                "embeds": torch.arange(4, device="cuda:0"),
+                "grid": torch.ones(1, dtype=torch.long),
+            },
+        )
+
+        data_ref, _ = await stage_io.write_payload(
+            relay,
+            payload.request_id,
+            payload,
+            transport=TransportKind.CUDA_IPC,
+        )
+        restored = await stage_io.read_payload(relay, payload.request_id, data_ref)
+
+        assert restored.data["embeds"].device.type == "cuda"
+        assert restored.data["grid"].device.type == "cpu"
+        assert torch.equal(restored.data["grid"], torch.ones(1, dtype=torch.long))
+
+    asyncio.run(_run())
+
+
 def test_stage_relay_read_failure_completes_with_error() -> None:
     """Preserves failure reporting when a stage cannot read its relay payload."""
 
