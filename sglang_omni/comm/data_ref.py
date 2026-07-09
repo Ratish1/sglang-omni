@@ -2,9 +2,10 @@
 """Typed references to data-plane buffers carried by control messages."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+import msgspec
 
 
 class TransportKind(str, Enum):
@@ -31,8 +32,7 @@ class DataLayout(str, Enum):
     SCATTER = "scatter"
 
 
-@dataclass(frozen=True)
-class TensorMeta:
+class TensorMeta(msgspec.Struct, frozen=True):
     path: str
     shape: tuple[int, ...]
     dtype: str
@@ -59,8 +59,7 @@ class TensorMeta:
         )
 
 
-@dataclass(frozen=True)
-class BackendRef:
+class BackendRef(msgspec.Struct, frozen=True):
     transport: TransportKind
     info: dict[str, Any]
     length: int
@@ -92,8 +91,7 @@ class BackendRef:
         )
 
 
-@dataclass(frozen=True)
-class MetadataTensorRef:
+class MetadataTensorRef(msgspec.Struct, frozen=True):
     path: str
     ref: "DataRef"
 
@@ -108,8 +106,7 @@ class MetadataTensorRef:
         )
 
 
-@dataclass(frozen=True)
-class DataRef:
+class DataRef(msgspec.Struct, frozen=True):
     """Control-plane pointer to one data-plane object."""
 
     version: int

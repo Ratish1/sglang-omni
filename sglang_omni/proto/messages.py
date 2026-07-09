@@ -4,6 +4,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+import msgspec
+
 from sglang_omni.proto.admin import AdminOperation, AdminResult
 from sglang_omni.proto.request import StagePayload
 
@@ -93,8 +95,7 @@ class DataReadyMessage:
         )
 
 
-@dataclass
-class DataAckMessage:
+class DataAckMessage(msgspec.Struct):
     """Receiver completion for one data-plane object."""
 
     request_id: str

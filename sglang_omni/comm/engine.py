@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
-from dataclasses import dataclass
 from typing import Any, Callable
 
+import msgspec
 import torch
 
 from sglang_omni.comm import stage_io
@@ -22,15 +22,13 @@ from sglang_omni.relay.base import Relay
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class _PendingTransfer:
+class _PendingTransfer(msgspec.Struct):
     ops: list[Any]
     ack: asyncio.Future[None]
     task: asyncio.Task | None = None
 
 
-@dataclass
-class _PayloadSendJob:
+class _PayloadSendJob(msgspec.Struct, frozen=True):
     relay: Relay
     control_plane: Any
     request_id: str
@@ -43,8 +41,7 @@ class _PayloadSendJob:
     enqueued_ns: int
 
 
-@dataclass
-class _StreamSendJob:
+class _StreamSendJob(msgspec.Struct, frozen=True):
     relay: Relay
     control_plane: Any
     request_id: str
