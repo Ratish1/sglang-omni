@@ -50,14 +50,17 @@ class _AckedRelay:
     def __init__(self) -> None:
         self.storage: dict[str, torch.Tensor] = {}
         self.ops: list[_AckedOp] = []
+        self.receiver_ids: list[str | None] = []
 
     async def put_async(
         self,
         tensor: torch.Tensor,
         request_id: str | None = None,
         dst_rank: int | None = None,
+        receiver_id: str | None = None,
     ) -> _AckedOp:
         del dst_rank
+        self.receiver_ids.append(receiver_id)
         key = str(request_id)
         self.storage[key] = tensor.detach().clone()
         op = _AckedOp({"transfer_info": {"size": int(tensor.numel())}, "key": key})
@@ -121,6 +124,7 @@ def test_comm_engine_releases_sender_op_after_data_ack() -> None:
         assert not op.waited
         target, _, msg = control_plane.sent_to_stage[0]
         assert target == "receiver"
+        assert relay.receiver_ids == ["inproc://receiver"]
         assert DataRef.from_dict(msg.data_ref).object_id == data_ref.object_id
 
         engine.ack_transfer(
@@ -133,6 +137,54 @@ def test_comm_engine_releases_sender_op_after_data_ack() -> None:
         )
         await _wait_until(lambda: op.waited)
         assert op.acked
+
+    asyncio.run(_run())
+
+
+def test_comm_engine_threads_endpoint_identity_to_stream_metadata_ops() -> None:
+    async def _run() -> None:
+        relay = _AckedRelay()
+        control_plane = RecordingStageControlPlane()
+        engine = CommEngine(
+            CommRouter(
+                stage_name="sender",
+                gpu_id=None,
+                same_process_targets=set(),
+                gpu_stage_names=set(),
+                comm_config={"ack_timeout_s": 1.0},
+                injected_relay=relay,
+            )
+        )
+
+        await engine.send_stream_chunk(
+            relay=relay,
+            control_plane=control_plane,
+            request_id="req-1",
+            data=torch.ones(2),
+            target_stage="receiver",
+            target_endpoint="inproc://receiver",
+            from_stage="sender",
+            chunk_id=0,
+            metadata={"hidden": torch.ones(1)},
+            transport=TransportKind.SHM,
+        )
+
+        assert relay.receiver_ids == ["inproc://receiver", "inproc://receiver"]
+        _, _, msg = control_plane.sent_to_stage[0]
+        data_ref = DataRef.from_dict(msg.data_ref)
+        completion_task = engine._pending[data_ref.object_id].task
+        assert completion_task is not None
+
+        engine.ack_transfer(
+            DataAckMessage(
+                request_id="req-1",
+                from_stage="receiver",
+                to_stage="sender",
+                object_id=data_ref.object_id,
+            )
+        )
+        await completion_task
+        assert all(op.acked and op.waited for op in relay.ops)
 
     asyncio.run(_run())
 

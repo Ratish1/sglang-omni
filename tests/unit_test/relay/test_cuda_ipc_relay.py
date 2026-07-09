@@ -14,10 +14,12 @@ import multiprocessing as mp
 import queue
 import time
 import traceback
+from contextlib import nullcontext
 
 import pytest
 import torch
 
+import sglang_omni.relay.cuda_ipc as cuda_ipc_module
 from sglang_omni.relay.cuda_ipc import (
     CudaIpcPutOperation,
     CudaIpcRelay,
@@ -102,6 +104,23 @@ def test_cuda_ipc_put_fails_fast_after_relay_failure() -> None:
     asyncio.run(run())
 
 
+def test_cuda_ipc_put_requires_receiver_identity_before_pool_allocation() -> None:
+    class FakeCudaTensor:
+        is_cuda = True
+        device = torch.device("cuda:0")
+
+    async def run() -> None:
+        relay = CudaIpcRelay(engine_id="sender", device="cuda:0")
+        try:
+            with pytest.raises(ValueError, match="stable receiver_id"):
+                await relay.put_async(FakeCudaTensor())  # type: ignore[arg-type]
+            assert relay._pool_tensor is None
+        finally:
+            relay.close()
+
+    asyncio.run(run())
+
+
 def test_cuda_ipc_default_pool_uses_small_slots() -> None:
     relay = CudaIpcRelay(engine_id="sender", device="cuda:0")
     assert relay.slot_size == 64 * 1024
@@ -157,6 +176,151 @@ def test_contiguous_slot_allocator_rejects_double_release() -> None:
     asyncio.run(run())
 
 
+def test_cuda_ipc_pool_token_is_cached_per_receiver_without_reallocating(
+    monkeypatch,
+) -> None:
+    class FakeTensor:
+        is_cuda = True
+
+        def contiguous(self):
+            return self
+
+        def view(self, *args):
+            del args
+            return self
+
+        def reshape(self, *args):
+            del args
+            return self
+
+        def numel(self) -> int:
+            return 1
+
+        def __getitem__(self, key):
+            del key
+            return self
+
+        def copy_(self, source, *, non_blocking: bool = False):
+            del source, non_blocking
+            return self
+
+    class FakeEvent:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def record(self, stream) -> None:
+            del stream
+
+        def ipc_handle(self) -> bytes:
+            return b"ready-event"
+
+    async def run() -> tuple[int, list[dict], list[dict]]:
+        relay = CudaIpcRelay(
+            engine_id="sender",
+            device="cuda:0",
+            pool_size_mb=1,
+        )
+        pool = FakeTensor()
+        allocator = _ContiguousSlotAllocator(
+            slot_count=1,
+            slot_size=relay.slot_size,
+        )
+        allocations = 0
+        descriptors: list[dict] = []
+
+        def ensure_local_pool() -> None:
+            nonlocal allocations
+            if relay._pool_tensor is not None:
+                return
+            allocations += 1
+            relay._pool_tensor = pool  # type: ignore[assignment]
+            relay._pool_id = "pool"
+            relay._allocator = allocator
+
+        def dump_pool(tensor) -> dict:
+            assert tensor is pool
+            descriptor = {
+                "storage_handle": b"same-allocation",
+                "ref_counter_offset": len(descriptors),
+            }
+            descriptors.append(descriptor)
+            return descriptor
+
+        relay._ensure_local_pool = ensure_local_pool  # type: ignore[method-assign]
+        monkeypatch.setattr(cuda_ipc_module, "_dump_cuda_storage_handle", dump_pool)
+        monkeypatch.setattr(cuda_ipc_module, "_comm_trace_enabled", lambda: False)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda device: object())
+        monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+        monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+        monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+
+        try:
+            published = []
+            publications = (
+                ("first", "receiver-a"),
+                ("second", "receiver-a"),
+                ("third", "receiver-b"),
+            )
+            for request_id, receiver_id in publications:
+                op = await relay.put_async(
+                    FakeTensor(),
+                    request_id=request_id,
+                    receiver_id=receiver_id,
+                )
+                published.append(op.metadata["cuda_ipc"]["pool_storage"])
+                op.mark_receiver_done()
+                await op.wait_for_completion()
+            return allocations, descriptors, published
+        finally:
+            relay.close()
+
+    allocations, descriptors, published = asyncio.run(run())
+
+    assert allocations == 1
+    assert len(descriptors) == 2
+    assert published[0] is published[1]
+    assert published[0]["storage_handle"] == published[2]["storage_handle"]
+    assert published[0]["ref_counter_offset"] != published[2]["ref_counter_offset"]
+
+
+def test_cuda_ipc_remote_pool_rejects_descriptor_change_after_import(
+    monkeypatch,
+) -> None:
+    relay = CudaIpcRelay(engine_id="receiver", device="cuda:0")
+    pool = object()
+    loads: list[dict] = []
+
+    def load_pool(storage_meta, *, device):
+        assert device == torch.device("cuda:0")
+        loads.append(storage_meta)
+        return pool
+
+    monkeypatch.setattr(cuda_ipc_module, "_load_cuda_storage_handle", load_pool)
+
+    def metadata(ref_counter_offset: int) -> dict:
+        return {
+            "cuda_ipc": {
+                "pool_id": "sender-pool",
+                "pool_storage": {
+                    "storage_handle": b"allocation",
+                    "ref_counter_handle": b"receiver-token",
+                    "ref_counter_offset": ref_counter_offset,
+                },
+            }
+        }
+
+    first = metadata(1)
+    try:
+        assert relay._get_remote_pool(first, device=torch.device("cuda:0")) is pool
+        assert relay._get_remote_pool(first, device=torch.device("cuda:0")) is pool
+        with pytest.raises(ValueError, match="descriptor changed"):
+            relay._get_remote_pool(metadata(2), device=torch.device("cuda:0"))
+    finally:
+        relay.close()
+
+    assert loads == [first["cuda_ipc"]["pool_storage"]]
+
+
 def _sender(
     src_gpu: int,
     meta_q: mp.Queue,
@@ -176,7 +340,11 @@ def _sender(
             for index in range(_REUSE_COUNT):
                 request_id = f"r-{index}"
                 buf = _expected(_N, index).to(f"cuda:{src_gpu}")
-                op = await relay.put_async(buf, request_id=request_id)
+                op = await relay.put_async(
+                    buf,
+                    request_id=request_id,
+                    receiver_id="receiver",
+                )
                 meta_q.put((request_id, op.metadata))
 
                 ack_request_id, ack_error = ack_q.get(timeout=60)
@@ -248,6 +416,133 @@ def _receiver(
             relay.close()
 
 
+def _fanout_sender(
+    src_gpu: int,
+    meta_queues: list[mp.Queue],
+    ack_q: mp.Queue,
+    result_q: mp.Queue,
+) -> None:
+    relay = None
+    try:
+        torch.cuda.set_device(src_gpu)
+        relay = CudaIpcRelay(
+            engine_id="fanout-sender",
+            device=f"cuda:{src_gpu}",
+            pool_size_mb=2,
+        )
+
+        async def run() -> None:
+            operations = {}
+            descriptors = []
+            for index, meta_q in enumerate(meta_queues):
+                request_id = f"fanout-{index}"
+                op = await relay.put_async(
+                    _expected(_N, index).to(f"cuda:{src_gpu}"),
+                    request_id=request_id,
+                    receiver_id=f"receiver-{index}",
+                )
+                operations[request_id] = op
+                descriptors.append(op.metadata["cuda_ipc"]["pool_storage"])
+                meta_q.put((request_id, index, op.metadata))
+
+            assert len({item["storage_handle"] for item in descriptors}) == 1
+            assert len(
+                {
+                    (item["ref_counter_handle"], item["ref_counter_offset"])
+                    for item in descriptors
+                }
+            ) == len(meta_queues)
+
+            for _ in meta_queues:
+                request_id, error = ack_q.get(timeout=60)
+                op = operations[request_id]
+                if error is None:
+                    op.mark_receiver_done()
+                else:
+                    op.mark_receiver_failed(RuntimeError(error))
+                await op.wait_for_completion(timeout=60)
+
+        asyncio.run(run())
+        result_q.put(("sender", "ok", None))
+    except BaseException:
+        result_q.put(("sender", "err", traceback.format_exc()))
+        raise
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+def _fanout_receiver(
+    dst_gpu: int,
+    role: str,
+    meta_q: mp.Queue,
+    ack_q: mp.Queue,
+    result_q: mp.Queue,
+) -> None:
+    relay = None
+    request_id = None
+    try:
+        torch.cuda.set_device(dst_gpu)
+        relay = CudaIpcRelay(engine_id=role, device=f"cuda:{dst_gpu}")
+        request_id, index, metadata = meta_q.get(timeout=60)
+
+        async def run() -> torch.Tensor:
+            size = metadata["transfer_info"]["size"]
+            dest = torch.empty(size, dtype=torch.uint8, device=f"cuda:{dst_gpu}")
+            op = await relay.get_async(metadata, dest, request_id=request_id)
+            await op.wait_for_completion(timeout=60)
+            return dest
+
+        dest = asyncio.run(run())
+        expected = _expected(_N, index).to(f"cuda:{dst_gpu}")
+        assert torch.equal(dest, expected), f"payload mismatch for {request_id}"
+        relay.close()
+        relay = None
+        ack_q.put((request_id, None))
+        result_q.put((role, "ok", None))
+    except BaseException:
+        error = traceback.format_exc()
+        if relay is not None:
+            relay.close()
+            relay = None
+        ack_q.put((request_id, error))
+        result_q.put((role, "err", error))
+        raise
+
+
+def _assert_processes_succeed(
+    processes: list[mp.Process],
+    result_q: mp.Queue,
+    expected_roles: set[str],
+) -> None:
+    deadline = time.monotonic() + _PROCESS_TIMEOUT_S
+    results: dict[str, tuple[str, str | None]] = {}
+    while len(results) < len(expected_roles) and time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        try:
+            role, status, detail = result_q.get(timeout=min(0.25, remaining))
+            results[role] = (status, detail)
+        except queue.Empty:
+            if not any(process.is_alive() for process in processes):
+                break
+
+    for process in processes:
+        process.join(timeout=max(0.0, deadline - time.monotonic()))
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+            process.join()
+
+    details = "\n".join(
+        f"{role}: {status}\n{detail or ''}".rstrip()
+        for role, (status, detail) in sorted(results.items())
+    )
+    for process in processes:
+        assert process.exitcode == 0, details
+    assert results.keys() == expected_roles, details
+    assert all(status == "ok" for status, _ in results.values()), details
+
+
 def _run_case(src_gpu: int, dst_gpu: int) -> None:
     ctx = mp.get_context("spawn")
     meta_q, ack_q, result_q = ctx.Queue(), ctx.Queue(), ctx.Queue()
@@ -256,37 +551,43 @@ def _run_case(src_gpu: int, dst_gpu: int) -> None:
     sender.start()
     receiver.start()
 
-    deadline = time.monotonic() + _PROCESS_TIMEOUT_S
-    results: dict[str, tuple[str, str | None]] = {}
-    while len(results) < 2 and time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        try:
-            role, status, detail = result_q.get(timeout=min(0.25, remaining))
-            results[role] = (status, detail)
-        except queue.Empty:
-            if not sender.is_alive() and not receiver.is_alive():
-                break
+    _assert_processes_succeed([sender, receiver], result_q, {"sender", "receiver"})
 
-    for proc in (sender, receiver):
-        proc.join(timeout=max(0.0, deadline - time.monotonic()))
-    for proc in (sender, receiver):
-        if proc.is_alive():
-            proc.terminate()
-            proc.join()
 
-    details = "\n".join(
-        f"{role}: {status}\n{detail or ''}".rstrip()
-        for role, (status, detail) in sorted(results.items())
+def _run_fanout_case(gpu: int) -> None:
+    ctx = mp.get_context("spawn")
+    meta_queues = [ctx.Queue(), ctx.Queue()]
+    ack_q, result_q = ctx.Queue(), ctx.Queue()
+    sender = ctx.Process(
+        target=_fanout_sender,
+        args=(gpu, meta_queues, ack_q, result_q),
     )
-    assert sender.exitcode == 0, details
-    assert receiver.exitcode == 0, details
-    assert results.keys() == {"sender", "receiver"}, details
-    assert all(status == "ok" for status, _ in results.values()), details
+    receivers = [
+        ctx.Process(
+            target=_fanout_receiver,
+            args=(gpu, f"receiver-{index}", meta_q, ack_q, result_q),
+        )
+        for index, meta_q in enumerate(meta_queues)
+    ]
+    processes = [sender, *receivers]
+    for process in processes:
+        process.start()
+
+    _assert_processes_succeed(
+        processes,
+        result_q,
+        {"sender", "receiver-0", "receiver-1"},
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_ipc_same_gpu_round_trip() -> None:
     _run_case(0, 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_ipc_same_gpu_fanout_uses_one_token_per_receiver() -> None:
+    _run_fanout_case(0)
 
 
 @pytest.mark.skipif(

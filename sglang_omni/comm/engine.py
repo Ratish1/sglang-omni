@@ -113,6 +113,7 @@ class CommEngine:
             transport=transport,
             from_stage=from_stage,
             to_stage=to_stage,
+            receiver_id=to_stage,
         )
 
     async def send_payload(
@@ -307,6 +308,7 @@ class CommEngine:
                 transport=job.transport,
                 from_stage=job.from_stage,
                 to_stage=job.to_stage,
+                receiver_id=job.target_endpoint,
             )
             write_ms = _comm_elapsed_ms(write_start)
             object_id = data_ref.object_id
@@ -359,6 +361,7 @@ class CommEngine:
                 chunk_id=job.chunk_id,
                 metadata=job.metadata,
                 transport=job.transport,
+                receiver_id=job.target_endpoint,
             )
             write_ms = _comm_elapsed_ms(write_start)
             object_id = data_ref.object_id

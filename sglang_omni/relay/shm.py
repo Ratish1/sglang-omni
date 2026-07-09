@@ -157,7 +157,11 @@ class ShmRelay(Relay):
         self._slot_size_bytes = slot_size_mb * 1024 * 1024
 
     async def put_async(
-        self, tensor: torch.Tensor, request_id: str = None, dst_rank: int = None
+        self,
+        tensor: torch.Tensor,
+        request_id: str = None,
+        dst_rank: int = None,
+        receiver_id: str = None,
     ) -> RelayOperation:
         if request_id is None:
             request_id = str(uuid.uuid4())

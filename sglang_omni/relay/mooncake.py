@@ -483,7 +483,11 @@ class MooncakeRelay(Relay):
         )
 
     async def put_async(
-        self, tensor: torch.Tensor, request_id: str = None, dst_rank: int = None
+        self,
+        tensor: torch.Tensor,
+        request_id: str = None,
+        dst_rank: int = None,
+        receiver_id: str = None,
     ) -> PutOperation:
         """
         Asynchronously send tensor via Mooncake using memory pool.
@@ -493,6 +497,7 @@ class MooncakeRelay(Relay):
             tensor: Tensor to send
             request_id: Optional request identifier
             dst_rank: Destination rank (not used in P2P mode)
+            receiver_id: Stable destination identity (unused by Mooncake)
 
         Returns:
             PutOperation handle with metadata

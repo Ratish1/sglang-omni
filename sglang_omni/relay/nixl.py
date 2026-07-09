@@ -217,7 +217,11 @@ class NixlRelay(Relay):
             self.pool_handle = 1
 
     async def put_async(
-        self, tensor: torch.Tensor, request_id: str = None, dst_rank: int = None
+        self,
+        tensor: torch.Tensor,
+        request_id: str = None,
+        dst_rank: int = None,
+        receiver_id: str = None,
     ) -> PutOperation:
         """
         Asynchronously put tensor. Returns a PutOperation.

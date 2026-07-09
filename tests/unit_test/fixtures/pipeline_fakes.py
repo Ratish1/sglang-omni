@@ -66,8 +66,9 @@ class FakeRelay:
         tensor: torch.Tensor,
         request_id: str | None = None,
         dst_rank: int | None = None,
+        receiver_id: str | None = None,
     ) -> FakeOp:
-        del dst_rank
+        del dst_rank, receiver_id
         key = str(request_id)
         stored = tensor.detach().clone()
         self.storage[key] = stored

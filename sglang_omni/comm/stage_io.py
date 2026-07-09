@@ -300,6 +300,7 @@ async def write_payload(
     transport: TransportKind,
     from_stage: str | None = None,
     to_stage: str | None = None,
+    receiver_id: str | None = None,
 ) -> tuple[DataRef, Any]:
     data_without_tensors, tensors = extract_tensors(payload.data)
     packed, entries = _pack_tensors(tensors, device=relay_device(relay))
@@ -308,7 +309,11 @@ async def write_payload(
         request=payload.request,
         data=data_without_tensors,
     )
-    op = await relay.put_async(packed, request_id=request_id)
+    op = await relay.put_async(
+        packed,
+        request_id=request_id,
+        receiver_id=receiver_id or to_stage,
+    )
     data_ref = DataRef(
         version=1,
         object_id=f"{request_id}:payload:{from_stage or ''}:{to_stage or ''}",
@@ -363,6 +368,7 @@ async def write_tensor(
     request_id: str | None = None,
     from_stage: str | None = None,
     to_stage: str | None = None,
+    receiver_id: str | None = None,
 ) -> tuple[DataRef, Any]:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(
@@ -377,7 +383,11 @@ async def write_tensor(
         packed = torch.cat(
             [torch.zeros(offset, dtype=torch.uint8, device=target_device), packed]
         )
-    op = await relay.put_async(packed, request_id=object_id)
+    op = await relay.put_async(
+        packed,
+        request_id=object_id,
+        receiver_id=receiver_id or to_stage,
+    )
     return (
         DataRef(
             version=1,
@@ -427,6 +437,7 @@ async def write_stream_chunk(
     chunk_id: int,
     metadata: dict | None = None,
     transport: TransportKind,
+    receiver_id: str | None = None,
 ) -> tuple[DataRef, list[Any]]:
     object_id = f"{request_id}:stream:{from_stage}:{target_stage}:{chunk_id}"
     data_ref, op = await write_tensor(
@@ -438,10 +449,16 @@ async def write_stream_chunk(
         request_id=request_id,
         from_stage=from_stage,
         to_stage=target_stage,
+        receiver_id=receiver_id or target_stage,
     )
     pending_ops = [op]
     data_ref = await _with_stream_metadata(
-        relay, data_ref, metadata, transport, pending_ops
+        relay,
+        data_ref,
+        metadata,
+        transport,
+        pending_ops,
+        receiver_id=receiver_id or target_stage,
     )
     return data_ref, pending_ops
 
@@ -491,6 +508,8 @@ async def _with_stream_metadata(
     metadata: dict | None,
     transport: TransportKind,
     pending_ops: list[Any],
+    *,
+    receiver_id: str | None = None,
 ) -> DataRef:
     if metadata is None:
         return data_ref
@@ -503,6 +522,7 @@ async def _with_stream_metadata(
             tensor,
             transport=transport,
             kind=DataKind.STREAM_METADATA_TENSOR,
+            receiver_id=receiver_id,
         )
         tensor_refs.append(MetadataTensorRef(path=path, ref=ref))
         pending_ops.append(op)

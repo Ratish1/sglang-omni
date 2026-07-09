@@ -530,10 +530,11 @@ class CudaIpcRelay(Relay):
 
         self._pool_tensor: torch.Tensor | None = None
         self._pool_id: str | None = None
-        self._pool_storage_handle: dict[str, Any] | None = None
+        self._pool_storage_handles: dict[str, dict[str, Any]] = {}
         self._allocator: _ContiguousSlotAllocator | None = None
 
         self._remote_pools: dict[str, torch.Tensor] = {}
+        self._remote_pool_fingerprints: dict[str, tuple[tuple[str, Any], ...]] = {}
         self._failed_error: BaseException | None = None
         self._failed_event = asyncio.Event()
         self._wait_executor = ThreadPoolExecutor(
@@ -566,7 +567,6 @@ class CudaIpcRelay(Relay):
                 total_pool_bytes, dtype=torch.uint8, device=device
             )
         self._pool_id = f"{self.engine_id}:{os.getpid()}:{uuid.uuid4().hex}"
-        self._pool_storage_handle = _dump_cuda_storage_handle(self._pool_tensor)
         self._allocator = _ContiguousSlotAllocator(
             slot_count=self.slot_count,
             slot_size=self.slot_size,
@@ -584,21 +584,18 @@ class CudaIpcRelay(Relay):
 
     def _local_pool_state(
         self,
-    ) -> tuple[torch.Tensor, str, dict[str, Any], _ContiguousSlotAllocator]:
+    ) -> tuple[torch.Tensor, str, _ContiguousSlotAllocator]:
         self._ensure_local_pool()
         pool_tensor = self._pool_tensor
         pool_id = self._pool_id
-        pool_storage_handle = self._pool_storage_handle
         allocator = self._allocator
         if pool_tensor is None:
             raise RuntimeError("cuda_ipc local pool tensor was not initialized")
         if pool_id is None:
             raise RuntimeError("cuda_ipc local pool id was not initialized")
-        if pool_storage_handle is None:
-            raise RuntimeError("cuda_ipc local pool storage handle was not initialized")
         if allocator is None:
             raise RuntimeError("cuda_ipc local credit allocator was not initialized")
-        return pool_tensor, pool_id, pool_storage_handle, allocator
+        return pool_tensor, pool_id, allocator
 
     def _mark_failed(self, exc: BaseException) -> None:
         if self._failed_error is None:
@@ -648,16 +645,22 @@ class CudaIpcRelay(Relay):
     ) -> torch.Tensor:
         ipc_meta = metadata["cuda_ipc"]
         pool_id = ipc_meta["pool_id"]
+        storage_meta = ipc_meta["pool_storage"]
+        if not isinstance(storage_meta, dict):
+            raise TypeError(
+                "cuda_ipc pool_storage metadata must be a dict, got "
+                f"{type(storage_meta).__name__}"
+            )
+        fingerprint = tuple(sorted(storage_meta.items()))
         pool = self._remote_pools.get(pool_id)
         if pool is None:
-            storage_meta = ipc_meta["pool_storage"]
-            if not isinstance(storage_meta, dict):
-                raise TypeError(
-                    "cuda_ipc pool_storage metadata must be a dict, got "
-                    f"{type(storage_meta).__name__}"
-                )
             pool = _load_cuda_storage_handle(storage_meta, device=device)
             self._remote_pools[pool_id] = pool
+            self._remote_pool_fingerprints[pool_id] = fingerprint
+        elif self._remote_pool_fingerprints[pool_id] != fingerprint:
+            raise ValueError(
+                f"cuda_ipc pool descriptor changed for cached pool_id {pool_id!r}"
+            )
         return pool
 
     async def put_async(
@@ -665,6 +668,7 @@ class CudaIpcRelay(Relay):
         tensor: torch.Tensor,
         request_id: str | None = None,
         dst_rank: int | None = None,
+        receiver_id: str | None = None,
     ) -> CudaIpcPutOperation:
         self._raise_if_failed()
         if not tensor.is_cuda:
@@ -672,12 +676,9 @@ class CudaIpcRelay(Relay):
                 "cuda_ipc relay can only transfer CUDA tensors; "
                 f"got tensor on {tensor.device}"
             )
-        (
-            pool_tensor,
-            pool_id,
-            pool_storage_handle,
-            allocator,
-        ) = self._local_pool_state()
+        if not receiver_id:
+            raise ValueError("cuda_ipc put requires a stable receiver_id")
+        pool_tensor, pool_id, allocator = self._local_pool_state()
 
         flat = tensor.contiguous().view(torch.uint8).reshape(-1)
         size = int(flat.numel())
@@ -718,6 +719,17 @@ class CudaIpcRelay(Relay):
             handle_start = _comm_now_ns()
             ready_handle = ready_event.ipc_handle()
             handle_ms = _comm_elapsed_ms(handle_start)
+            pool_export_start = _comm_now_ns()
+            pool_storage_handle = self._pool_storage_handles.get(receiver_id)
+            pool_exported = pool_storage_handle is None
+            if pool_storage_handle is None:
+                # PyTorch initializes each _share_cuda_ refcounter token to one.
+                # One stable receiver import owns one token for the lifetime of
+                # its cached mapping; distinct receiver processes must not share
+                # that token.
+                pool_storage_handle = _dump_cuda_storage_handle(pool_tensor)
+                self._pool_storage_handles[receiver_id] = pool_storage_handle
+            pool_export_ms = _comm_elapsed_ms(pool_export_start)
         except Exception:
             allocator.release(offset, num_slots)
             raise
@@ -739,6 +751,8 @@ class CudaIpcRelay(Relay):
             acquire_ms=round(acquire_ms, 6),
             copy_enqueue_ms=round(copy_enqueue_ms, 6),
             event_handle_ms=round(handle_ms, 6),
+            pool_exported=pool_exported,
+            pool_export_ms=round(pool_export_ms, 6),
         )
 
         metadata = {
@@ -891,7 +905,8 @@ class CudaIpcRelay(Relay):
 
     def close(self) -> None:
         self._remote_pools.clear()
+        self._remote_pool_fingerprints.clear()
+        self._pool_storage_handles.clear()
         self._pool_tensor = None
-        self._pool_storage_handle = None
         self._allocator = None
         self._wait_executor.shutdown(wait=False, cancel_futures=True)

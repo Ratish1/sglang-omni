@@ -50,7 +50,8 @@ class _FakeRelay:
         self.device = "cpu"
         self.puts = []
 
-    async def put_async(self, tensor, request_id):
+    async def put_async(self, tensor, request_id, receiver_id=None):
+        del receiver_id
         self.puts.append((request_id, tensor))
         return _DoneOp(tensor.numel())
 
