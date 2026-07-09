@@ -138,6 +138,7 @@ class Stage:
         self._local_stream_targets: dict[str, set[str]] = {}
         self._nonlocal_stream_targets: dict[str, set[str]] = {}
         self._receive_tasks: set[asyncio.Task] = set()
+        self._receive_tails: dict[tuple[str, str], asyncio.Task] = {}
         self._scheduler_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduler_crash_error: BaseException | None = None
@@ -206,9 +207,10 @@ class Stage:
         receive_tasks = list(self._receive_tasks)
         for task in receive_tasks:
             task.cancel()
-        for task in receive_tasks:
-            with suppress(asyncio.CancelledError):
-                _ = await task
+        if receive_tasks:
+            await asyncio.gather(*receive_tasks, return_exceptions=True)
+        self._receive_tasks.clear()
+        self._receive_tails.clear()
         if self.scheduler is not None:
             try:
                 self.scheduler.stop()
@@ -292,18 +294,7 @@ class Stage:
         elif isinstance(msg, DataAckMessage):
             self._comm.ack_transfer(msg)
         elif isinstance(msg, DataReadyMessage):
-            if msg.is_done or msg.error:
-                await self._on_stream_signal(msg)
-            elif msg.chunk_id is not None:
-                self._schedule_receive_task(
-                    self._on_stream_chunk(msg),
-                    f"stream chunk {msg.request_id}:{msg.from_stage}:{msg.chunk_id}",
-                )
-            else:
-                self._schedule_receive_task(
-                    self._on_data_ready(msg),
-                    f"payload {msg.request_id}:{msg.from_stage}",
-                )
+            self._schedule_receive_message(msg)
         elif isinstance(msg, ProfilerStartMessage):
             self._on_profiler_start(msg)
         elif isinstance(msg, ProfilerStopMessage):
@@ -311,11 +302,52 @@ class Stage:
         elif isinstance(msg, AdminMessage):
             await self._on_admin(msg)
 
-    def _schedule_receive_task(self, coro: Any, label: str) -> None:
-        task = asyncio.create_task(coro)
+    def _schedule_receive_message(self, msg: DataReadyMessage) -> None:
+        key = (msg.request_id, msg.from_stage)
+        predecessor = self._receive_tails.get(key)
+        if msg.is_done:
+            label = f"stream done {msg.request_id}:{msg.from_stage}"
+        elif msg.error is not None:
+            label = f"stream error {msg.request_id}:{msg.from_stage}"
+        elif msg.chunk_id is not None:
+            label = f"stream chunk {msg.request_id}:{msg.from_stage}:{msg.chunk_id}"
+        else:
+            label = f"payload {msg.request_id}:{msg.from_stage}"
+
+        task = asyncio.create_task(self._receive_message_after(predecessor, msg))
+        self._receive_tails[key] = task
         self._receive_tasks.add(task)
-        task.add_done_callback(self._receive_tasks.discard)
-        task.add_done_callback(lambda done: self._on_background_task_done(done, label))
+        task.add_done_callback(
+            lambda done, key=key, label=label: self._on_receive_task_done(
+                done, key, label
+            )
+        )
+
+    async def _receive_message_after(
+        self,
+        predecessor: asyncio.Task | None,
+        msg: DataReadyMessage,
+    ) -> None:
+        if predecessor is not None:
+            await asyncio.shield(predecessor)
+
+        if msg.is_done or msg.error is not None:
+            await self._on_stream_signal(msg)
+        elif msg.chunk_id is not None:
+            await self._on_stream_chunk(msg)
+        else:
+            await self._on_data_ready(msg)
+
+    def _on_receive_task_done(
+        self,
+        task: asyncio.Task,
+        key: tuple[str, str],
+        label: str,
+    ) -> None:
+        self._receive_tasks.discard(task)
+        if self._receive_tails.get(key) is task:
+            self._receive_tails.pop(key, None)
+        self._on_background_task_done(task, label)
 
     async def _on_submit(self, msg: SubmitMessage) -> None:
         request_id = msg.request_id

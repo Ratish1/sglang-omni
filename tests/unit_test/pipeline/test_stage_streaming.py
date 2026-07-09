@@ -16,7 +16,12 @@ from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
-from sglang_omni.proto import DataReadyMessage, OmniRequest, StagePayload
+from sglang_omni.proto import (
+    DataAckMessage,
+    DataReadyMessage,
+    OmniRequest,
+    StagePayload,
+)
 from sglang_omni.relay.shm import ShmRelay
 from sglang_omni.scheduling.messages import OutgoingMessage
 
@@ -165,6 +170,257 @@ async def _make_relay_payload(
         to_stage=to_stage,
         data_ref=data_ref.to_dict(),
     )
+
+
+def _make_receive_stage() -> Stage:
+    scheduler = SimpleNamespace(
+        inbox=queue.Queue(),
+        outbox=queue.Queue(),
+        abort=lambda request_id: None,
+        stop=lambda: None,
+    )
+    return Stage(
+        name="receiver",
+        role="single",
+        get_next=lambda request_id, output: None,
+        gpu_id=None,
+        endpoints={"upstream": "inproc://upstream"},
+        control_plane=_FakeControlPlane(),
+        relay=_FakeRelay(),
+        scheduler=scheduler,
+    )
+
+
+def _receive_message(
+    *,
+    request_id: str = "req",
+    from_stage: str = "upstream",
+    chunk_id: int | None = None,
+    is_done: bool = False,
+    error: str | None = None,
+) -> DataReadyMessage:
+    is_signal = is_done or error is not None
+    return DataReadyMessage(
+        request_id=request_id,
+        from_stage=from_stage,
+        to_stage="receiver",
+        data_ref=None if is_signal else {"test": True},
+        chunk_id=chunk_id,
+        is_done=is_done,
+        error=error,
+    )
+
+
+def test_stage_preserves_receive_order_per_source(monkeypatch) -> None:
+    async def _run() -> None:
+        stage = _make_receive_stage()
+        payload_started = asyncio.Event()
+        release_payload = asyncio.Event()
+        chunk_zero_started = asyncio.Event()
+        release_chunk_zero = asyncio.Event()
+        committed: list[str] = []
+
+        async def receive_payload(msg) -> None:
+            del msg
+            payload_started.set()
+            await release_payload.wait()
+            committed.append("payload")
+
+        async def receive_chunk(msg) -> None:
+            if msg.chunk_id == 0:
+                chunk_zero_started.set()
+                await release_chunk_zero.wait()
+            committed.append(f"chunk-{msg.chunk_id}")
+
+        async def receive_signal(msg) -> None:
+            assert msg.is_done
+            committed.append("done")
+
+        monkeypatch.setattr(stage, "_on_data_ready", receive_payload)
+        monkeypatch.setattr(stage, "_on_stream_chunk", receive_chunk)
+        monkeypatch.setattr(stage, "_on_stream_signal", receive_signal)
+
+        await stage._handle_message(_receive_message())
+        await stage._handle_message(_receive_message(chunk_id=0))
+        await stage._handle_message(_receive_message(chunk_id=1))
+        await stage._handle_message(_receive_message(is_done=True))
+        tail = stage._receive_tails[("req", "upstream")]
+
+        await asyncio.wait_for(payload_started.wait(), timeout=1.0)
+        assert not chunk_zero_started.is_set()
+        assert committed == []
+
+        release_payload.set()
+        await asyncio.wait_for(chunk_zero_started.wait(), timeout=1.0)
+        assert committed == ["payload"]
+
+        release_chunk_zero.set()
+        await asyncio.wait_for(asyncio.shield(tail), timeout=1.0)
+        await asyncio.sleep(0)
+
+        assert committed == ["payload", "chunk-0", "chunk-1", "done"]
+        assert stage._receive_tasks == set()
+        assert stage._receive_tails == {}
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize(
+    ("blocked_key", "independent_key"),
+    [
+        (("req", "source-a"), ("req", "source-b")),
+        (("req-a", "source"), ("req-b", "source")),
+    ],
+)
+def test_stage_receive_order_isolated_per_request_and_source(
+    monkeypatch,
+    blocked_key,
+    independent_key,
+) -> None:
+    async def _run() -> None:
+        stage = _make_receive_stage()
+        blocked_started = asyncio.Event()
+        release_blocked = asyncio.Event()
+        independent_done = asyncio.Event()
+
+        async def receive_payload(msg) -> None:
+            key = (msg.request_id, msg.from_stage)
+            if key == blocked_key:
+                blocked_started.set()
+                await release_blocked.wait()
+            if key == independent_key:
+                independent_done.set()
+
+        monkeypatch.setattr(stage, "_on_data_ready", receive_payload)
+
+        await stage._handle_message(
+            _receive_message(
+                request_id=blocked_key[0],
+                from_stage=blocked_key[1],
+            )
+        )
+        blocked_task = stage._receive_tails[blocked_key]
+        await asyncio.wait_for(blocked_started.wait(), timeout=1.0)
+
+        await stage._handle_message(
+            _receive_message(
+                request_id=independent_key[0],
+                from_stage=independent_key[1],
+            )
+        )
+        independent_task = stage._receive_tails[independent_key]
+        await asyncio.wait_for(independent_done.wait(), timeout=1.0)
+        assert not blocked_task.done()
+
+        release_blocked.set()
+        await asyncio.wait_for(
+            asyncio.gather(blocked_task, independent_task), timeout=1.0
+        )
+
+    asyncio.run(_run())
+
+
+def test_stage_data_ack_bypasses_blocked_receive_order(monkeypatch) -> None:
+    async def _run() -> None:
+        stage = _make_receive_stage()
+        receive_started = asyncio.Event()
+        release_receive = asyncio.Event()
+        acknowledgements = []
+
+        async def receive_payload(msg) -> None:
+            del msg
+            receive_started.set()
+            await release_receive.wait()
+
+        monkeypatch.setattr(stage, "_on_data_ready", receive_payload)
+        monkeypatch.setattr(
+            stage._comm,
+            "ack_transfer",
+            lambda ack: acknowledgements.append(ack),
+        )
+
+        await stage._handle_message(_receive_message())
+        receive_task = stage._receive_tails[("req", "upstream")]
+        await asyncio.wait_for(receive_started.wait(), timeout=1.0)
+
+        ack = DataAckMessage(
+            request_id="req",
+            from_stage="downstream",
+            to_stage="receiver",
+            object_id="object-0",
+        )
+        await stage._handle_message(ack)
+        assert acknowledgements == [ack]
+        assert not receive_task.done()
+
+        release_receive.set()
+        await asyncio.wait_for(receive_task, timeout=1.0)
+
+    asyncio.run(_run())
+
+
+def test_stage_receive_tail_cleanup_keeps_newest_task(monkeypatch) -> None:
+    async def _run() -> None:
+        stage = _make_receive_stage()
+        second_started = asyncio.Event()
+        release_second = asyncio.Event()
+        call_count = 0
+
+        async def receive_payload(msg) -> None:
+            nonlocal call_count
+            del msg
+            call_count += 1
+            if call_count == 2:
+                second_started.set()
+                await release_second.wait()
+
+        monkeypatch.setattr(stage, "_on_data_ready", receive_payload)
+
+        await stage._handle_message(_receive_message())
+        first_task = stage._receive_tails[("req", "upstream")]
+        await stage._handle_message(_receive_message())
+        second_task = stage._receive_tails[("req", "upstream")]
+
+        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert first_task.done()
+        assert stage._receive_tails[("req", "upstream")] is second_task
+
+        release_second.set()
+        await asyncio.wait_for(second_task, timeout=1.0)
+        await asyncio.sleep(0)
+        assert stage._receive_tails == {}
+
+    asyncio.run(_run())
+
+
+def test_stage_stop_cancels_and_clears_receive_order(monkeypatch) -> None:
+    async def _run() -> None:
+        stage = _make_receive_stage()
+        first_started = asyncio.Event()
+        never_release = asyncio.Event()
+
+        async def receive_payload(msg) -> None:
+            del msg
+            first_started.set()
+            await never_release.wait()
+
+        monkeypatch.setattr(stage, "_on_data_ready", receive_payload)
+
+        await stage._handle_message(_receive_message())
+        first_task = stage._receive_tails[("req", "upstream")]
+        await stage._handle_message(_receive_message())
+        second_task = stage._receive_tails[("req", "upstream")]
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+
+        await asyncio.wait_for(stage.stop(), timeout=1.0)
+
+        assert first_task.cancelled()
+        assert second_task.cancelled()
+        assert stage._receive_tasks == set()
+        assert stage._receive_tails == {}
+
+    asyncio.run(_run())
 
 
 def test_terminal_scheduler_stream_routes_to_coordinator() -> None:
