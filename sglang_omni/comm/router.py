@@ -25,7 +25,6 @@ class CommRouter:
         gpu_id: int | None,
         same_process_targets: set[str] | None,
         gpu_stage_names: set[str] | None,
-        stage_gpu_ids: dict[str, tuple[int, ...]] | None = None,
         remote_stage_names: set[str] | None = None,
         comm_config: dict[str, Any] | None = None,
         injected_relay: Relay | None = None,
@@ -34,10 +33,6 @@ class CommRouter:
         self.gpu_id = gpu_id
         self.same_process_targets = set(same_process_targets or ())
         self.gpu_stage_names = set(gpu_stage_names or ())
-        self.stage_gpu_ids = {
-            name: tuple(int(gpu_id) for gpu_id in gpu_ids)
-            for name, gpu_ids in (stage_gpu_ids or {}).items()
-        }
         self.remote_stage_names = set(remote_stage_names or ())
         self.comm_config = dict(comm_config or {})
         self.injected_relay = injected_relay
@@ -49,14 +44,6 @@ class CommRouter:
 
     def is_local_object(self, target: str) -> bool:
         return target in self.same_process_targets
-
-    def is_same_gpu_target(self, target: str) -> bool:
-        if self.gpu_id is None or target in self.same_process_targets:
-            return False
-        target_gpu_ids = self.stage_gpu_ids.get(target)
-        if target_gpu_ids is None:
-            return False
-        return len(target_gpu_ids) == 1 and target_gpu_ids[0] == self.gpu_id
 
     def outbound(self, target: str) -> TransportKind:
         if target in self.same_process_targets:
