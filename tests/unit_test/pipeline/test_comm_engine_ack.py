@@ -137,7 +137,7 @@ def test_comm_engine_releases_sender_op_after_data_ack() -> None:
     asyncio.run(_run())
 
 
-def test_comm_engine_rejects_unknown_data_ack() -> None:
+def test_comm_engine_ignores_unknown_data_ack() -> None:
     engine = CommEngine(
         CommRouter(
             stage_name="sender",
@@ -147,15 +147,54 @@ def test_comm_engine_rejects_unknown_data_ack() -> None:
         )
     )
 
-    with pytest.raises(RuntimeError, match="unexpected data ack"):
-        engine.ack_transfer(
-            DataAckMessage(
-                request_id="req-1",
-                from_stage="receiver",
-                to_stage="sender",
-                object_id="missing",
+    engine.ack_transfer(
+        DataAckMessage(
+            request_id="req-1",
+            from_stage="receiver",
+            to_stage="sender",
+            object_id="missing",
+        )
+    )
+
+
+def test_comm_engine_ignores_duplicate_data_ack() -> None:
+    async def _run() -> None:
+        relay = _AckedRelay()
+        control_plane = RecordingStageControlPlane()
+        engine = CommEngine(
+            CommRouter(
+                stage_name="sender",
+                gpu_id=None,
+                same_process_targets=set(),
+                gpu_stage_names=set(),
+                comm_config={"ack_timeout_s": 1.0},
+                injected_relay=relay,
             )
         )
+        payload = make_stage_payload(request_id="req-1", data={"x": torch.ones(2)})
+        data_ref = await engine.send_payload(
+            relay=relay,
+            control_plane=control_plane,
+            request_id="req-1",
+            payload=payload,
+            transport=TransportKind.SHM,
+            from_stage="sender",
+            to_stage="receiver",
+            target_endpoint="inproc://receiver",
+        )
+        ack = DataAckMessage(
+            request_id="req-1",
+            from_stage="receiver",
+            to_stage="sender",
+            object_id=data_ref.object_id,
+        )
+
+        engine.ack_transfer(ack)
+        await _wait_until(lambda: relay.ops[0].waited)
+
+        engine.ack_transfer(ack)
+
+    asyncio.run(_run())
 
 
 def test_data_messages_reject_missing_data_ref() -> None:

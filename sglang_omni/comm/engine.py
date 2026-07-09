@@ -245,7 +245,13 @@ class CommEngine:
             )
         pending = self._pending.get(ack.object_id)
         if pending is None:
-            raise RuntimeError(f"unexpected data ack for {ack.object_id!r}")
+            logger.debug(
+                "Ignoring stale data_ack for %s from %s to %s",
+                ack.object_id,
+                ack.from_stage,
+                ack.to_stage,
+            )
+            return
         if ack.success:
             if not pending.ack.done():
                 pending.ack.set_result(None)
