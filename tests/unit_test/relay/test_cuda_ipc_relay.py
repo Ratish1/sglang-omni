@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing as mp
+import os
 import queue
 import time
 import traceback
@@ -27,8 +28,10 @@ from sglang_omni.relay.cuda_ipc import (
 )
 
 _N = 1024 * 1024  # 1 MiB payload
-_REUSE_COUNT = 3
+_REUSE_COUNT = int(os.getenv("SGLANG_OMNI_CUDA_IPC_TEST_TRANSFERS", "3"))
 _PROCESS_TIMEOUT_S = 120.0
+if _REUSE_COUNT < 1:
+    raise ValueError("SGLANG_OMNI_CUDA_IPC_TEST_TRANSFERS must be positive")
 
 
 def _expected(n: int, transfer_index: int = 0) -> torch.Tensor:
