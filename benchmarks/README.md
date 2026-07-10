@@ -195,7 +195,8 @@ benchmark design, harness contract, scenario matrix, and Docker usage.
 See [same_gpu_dp/README.md](same_gpu_dp/README.md) for the H200-ready,
 UUID-scoped DP 1–4 × MPS validation matrix. It uses the canonical
 `benchmark_tts_seedtts` endpoint and metrics, validates fixed CPU budgets, owns
-MPS/replica teardown, and provides a no-GPU dry-run mode.
+MPS/replica teardown, calibrates exact KV caps, and supports a versioned YAML
+study definition plus a no-GPU dry-run mode.
 
 The two `*_seedtts.py` scripts merge the previous `benchmark_*_tts_speed.py`
 and `voice_clone_*_wer.py` pairs into a single two-phase pipeline: phase 1

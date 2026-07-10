@@ -33,6 +33,7 @@ fi
 : "${CONCURRENCY_PER_WORKER:=16}"
 : "${MAX_RUNNING_REQUESTS:=64}"
 : "${CUDA_GRAPH_MAX_BS:=64}"
+: "${MAX_TOTAL_TOKENS:=}"
 : "${MAX_NEW_TOKENS:=2048}"
 : "${MAX_SAMPLES:=}"
 : "${SEED:=1}"
@@ -42,12 +43,15 @@ fi
 : "${ALLOWED_LOCAL_MEDIA_PATH:=/}"
 : "${STREAM:=0}"
 : "${SERVER_READY_TIMEOUT:=1200}"
+: "${MPS_READY_TIMEOUT:=30}"
 : "${SHUTDOWN_TIMEOUT:=90}"
 : "${KV_EQUALITY:=warn}"
+: "${CAPACITY_ONLY:=0}"
 : "${REQUIRE_IDLE_GPU:=1}"
 : "${MPS_THREAD_PERCENTAGES:=}"
 : "${MPS_PINNED_MEM_LIMITS:=}"
 : "${OUT_ROOT:=$REPO/benchmarks/results/same_gpu_dp}"
+: "${MPS_TMP_ROOT:=/tmp/sglang-omni-mps-${UID:-$(id -u)}}"
 : "${LABEL:=dp${DP}_mps${USE_MPS}_${MODE}_$(date -u +%Y%m%dT%H%M%SZ)}"
 
 [[ "$DP" =~ ^[1-4]$ ]] || { echo "DP must be 1, 2, 3, or 4" >&2; exit 2; }
@@ -55,6 +59,10 @@ fi
 [[ "$STREAM" =~ ^[01]$ ]] || { echo "STREAM must be 0 or 1" >&2; exit 2; }
 [[ "$REQUIRE_IDLE_GPU" =~ ^[01]$ ]] || {
   echo "REQUIRE_IDLE_GPU must be 0 or 1" >&2
+  exit 2
+}
+[[ "$CAPACITY_ONLY" =~ ^[01]$ ]] || {
+  echo "CAPACITY_ONLY must be 0 or 1" >&2
   exit 2
 }
 [[ "$NUMA_NODE" =~ ^[0-9]+$ ]] || { echo "NUMA_NODE must be non-negative" >&2; exit 2; }
@@ -78,6 +86,14 @@ for numeric_name in BASE_PORT ROUTER_PORT CONCURRENCY_PER_WORKER MAX_RUNNING_REQ
     exit 2
   }
 done
+[[ "$MPS_READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+  echo "MPS_READY_TIMEOUT must be a positive integer" >&2
+  exit 2
+}
+if [[ -n "$MAX_TOTAL_TOKENS" && ! "$MAX_TOTAL_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_TOTAL_TOKENS must be empty or a positive integer" >&2
+  exit 2
+fi
 [[ "$WARMUP" =~ ^[0-9]+$ ]] || { echo "WARMUP must be a non-negative integer" >&2; exit 2; }
 if [[ -n "$MAX_SAMPLES" && ! "$MAX_SAMPLES" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_SAMPLES must be empty or a positive integer" >&2
@@ -101,6 +117,10 @@ fi
 }
 if [[ "$MODE" == router && -z "$ROUTER_CORES" ]]; then
   echo "ROUTER_CORES is required in router mode" >&2
+  exit 2
+fi
+if [[ "$CAPACITY_ONLY" -eq 1 && "$MODE" != direct ]]; then
+  echo "CAPACITY_ONLY=1 requires MODE=direct" >&2
   exit 2
 fi
 
@@ -233,10 +253,17 @@ SERVER_PGIDS=()
 CLIENT_PGIDS=()
 ROUTER_PGID=""
 MPS_OWNED=0
-MPS_ROOT="$OUT/mps"
+MPS_DIR_OWNED=0
+MPS_CONTROL_PID=""
+MPS_ROOT="$MPS_TMP_ROOT/$LABEL"
 MPS_PIPE="$MPS_ROOT/pipe"
 MPS_LOG="$MPS_ROOT/log"
 NO_MPS_PIPE="$OUT/no-mps-pipe-does-not-exist"
+if [[ "$USE_MPS" -eq 1 && ${#MPS_PIPE} -gt 80 ]]; then
+  echo "MPS pipe path is too long (${#MPS_PIPE} chars): $MPS_PIPE" >&2
+  echo "shorten MPS_TMP_ROOT or LABEL; CUDA MPS uses Unix-domain sockets" >&2
+  exit 2
+fi
 
 mps_control() {
   env CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE" nvidia-cuda-mps-control
@@ -310,7 +337,26 @@ cleanup() {
   done
   if [[ "$MPS_OWNED" -eq 1 ]]; then
     printf 'quit\n' | mps_control >/dev/null 2>&1 || true
+    if [[ -n "$MPS_CONTROL_PID" ]]; then
+      mps_stop_deadline=$((SECONDS + 10))
+      while kill -0 "$MPS_CONTROL_PID" 2>/dev/null && \
+        ((SECONDS < mps_stop_deadline)); do
+        sleep 1
+      done
+    fi
     MPS_OWNED=0
+  fi
+  if [[ -d "$MPS_LOG" ]]; then
+    mkdir -p "$OUT/mps_logs"
+    cp -R "$MPS_LOG/." "$OUT/mps_logs/" 2>/dev/null || true
+  fi
+  if [[ "$MPS_DIR_OWNED" -eq 1 && -d "$MPS_ROOT" ]]; then
+    if [[ -z "$MPS_CONTROL_PID" ]] || ! kill -0 "$MPS_CONTROL_PID" 2>/dev/null; then
+      rm -rf "$MPS_ROOT"
+      MPS_DIR_OWNED=0
+    else
+      echo "MPS control PID $MPS_CONTROL_PID is still alive; preserving $MPS_ROOT" >&2
+    fi
   fi
   exit "$status"
 }
@@ -323,15 +369,38 @@ if [[ "$USE_MPS" -eq 1 ]]; then
       CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE" CUDA_MPS_LOG_DIRECTORY="$MPS_LOG" \
       nvidia-cuda-mps-control -d
   else
+    if [[ -e "$MPS_ROOT" ]]; then
+      echo "refusing to reuse existing MPS runtime directory: $MPS_ROOT" >&2
+      exit 2
+    fi
     mkdir -p "$MPS_PIPE" "$MPS_LOG"
+    chmod 700 "$MPS_TMP_ROOT" "$MPS_ROOT" "$MPS_PIPE" "$MPS_LOG"
+    MPS_DIR_OWNED=1
+    mps_launch_status=0
     env -u CUDA_MPS_ACTIVE_THREAD_PERCENTAGE -u CUDA_MPS_PINNED_DEVICE_MEM_LIMIT \
       CUDA_VISIBLE_DEVICES="$GPU_UUID" CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE" \
-      CUDA_MPS_LOG_DIRECTORY="$MPS_LOG" nvidia-cuda-mps-control -d
+      CUDA_MPS_LOG_DIRECTORY="$MPS_LOG" nvidia-cuda-mps-control -d || \
+      mps_launch_status=$?
     MPS_OWNED=1
-    printf 'get_default_active_thread_percentage\n' | mps_control \
-      > "$OUT/mps_control_check.txt"
-    [[ -s "$OUT/mps_control_check.txt" ]] || {
-      echo "MPS control daemon did not respond" >&2
+    mps_ready=0
+    mps_deadline=$((SECONDS + MPS_READY_TIMEOUT))
+    while ((SECONDS < mps_deadline)); do
+      if printf 'get_default_active_thread_percentage\n' | mps_control \
+        > "$OUT/mps_control_check.txt" 2> "$OUT/mps_control_check.err" && \
+        [[ -s "$OUT/mps_control_check.txt" ]] && \
+        [[ -s "$MPS_PIPE/nvidia-cuda-mps-control.pid" ]]; then
+        mps_ready=1
+        break
+      fi
+      sleep 1
+    done
+    [[ "$mps_ready" -eq 1 ]] || {
+      echo "MPS control daemon did not respond within ${MPS_READY_TIMEOUT}s (launch status $mps_launch_status)" >&2
+      exit 1
+    }
+    MPS_CONTROL_PID=$(<"$MPS_PIPE/nvidia-cuda-mps-control.pid")
+    [[ "$MPS_CONTROL_PID" =~ ^[1-9][0-9]*$ ]] || {
+      echo "invalid MPS control PID: $MPS_CONTROL_PID" >&2
       exit 1
     }
   fi
@@ -372,6 +441,7 @@ for ((i = 0; i < DP; i++)); do
     --mem-fraction-static "${MEM_FRAC[$i]}"
     --max-running-requests "$MAX_RUNNING_REQUESTS"
     --cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS")
+  [[ -n "$MAX_TOTAL_TOKENS" ]] && command+=(--max-total-tokens "$MAX_TOTAL_TOKENS")
   print_command "${command[@]}"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     SERVER_PGIDS+=("dry-$i")
@@ -401,7 +471,7 @@ if [[ "$USE_MPS" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
   done
 fi
 
-if [[ "$DRY_RUN" -eq 0 && "$KV_EQUALITY" != off ]]; then
+if [[ "$DRY_RUN" -eq 0 && ("$KV_EQUALITY" != off || "$CAPACITY_ONLY" -eq 1) ]]; then
   logs=()
   for ((i = 0; i < DP; i++)); do logs+=("$OUT/workers/worker_${i}.server.log"); done
   python3 "$HERE/summarize.py" extract-kv "${logs[@]}" > "$OUT/kv_capacity.json"
@@ -470,6 +540,7 @@ write_manifest() {
     echo "concurrency_per_worker=$CONCURRENCY_PER_WORKER"
     echo "max_running_requests=$MAX_RUNNING_REQUESTS"
     echo "cuda_graph_max_bs=$CUDA_GRAPH_MAX_BS"
+    echo "max_total_tokens=$MAX_TOTAL_TOKENS"
     echo "max_new_tokens=$MAX_NEW_TOKENS"
     echo "max_samples=$MAX_SAMPLES"
     echo "seed=$SEED"
@@ -479,6 +550,10 @@ write_manifest() {
     echo "allowed_local_media_path=$ALLOWED_LOCAL_MEDIA_PATH"
     echo "stream=$STREAM"
     echo "require_idle_gpu=$REQUIRE_IDLE_GPU"
+    echo "capacity_only=$CAPACITY_ONLY"
+    echo "mps_tmp_root=$MPS_TMP_ROOT"
+    echo "mps_runtime_root=$MPS_ROOT"
+    echo "mps_control_pid=$MPS_CONTROL_PID"
     if [[ "$DRY_RUN" -eq 0 ]]; then
       echo "uname=$(uname -a)"
       echo "python=$(python --version 2>&1)"
@@ -491,6 +566,11 @@ write_manifest() {
   } > "$OUT/manifest.txt"
 }
 write_manifest
+
+if [[ "$DRY_RUN" -eq 0 && "$CAPACITY_ONLY" -eq 1 ]]; then
+  echo "capacity-only condition complete: $OUT"
+  exit 0
+fi
 
 BENCH_COMMON=(python -m benchmarks.eval.benchmark_tts_seedtts
   --use-existing-server --generate-only --model "$MODEL_NAME" --meta "$META"

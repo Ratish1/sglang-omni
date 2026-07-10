@@ -61,9 +61,13 @@ Consequently:
 - a point that fits on one driver/CUDA/checkpoint combination may OOM on another.
 
 Record the resolved KV token capacity for every replica. Publication-quality
-comparisons should pin an equal capacity when the backend exposes a stable
-setting, or fail the run when the resolved values differ. The validation harness
-warns when it cannot extract this value from the installed SGLang log format.
+comparisons should first discover the minimum capacity across launch order and
+MPS mode, then pass that per-DP cap through `--max-total-tokens`. SGLang applies
+this as an upper bound after profiling and before allocating the KV pool. The
+validation harness fails if any replica still resolves smaller or if it cannot
+extract the installed SGLang log format. Keep DP1 uncapped: the cap removes
+within-condition launch-order bias, rather than forcing every DP count to have
+the same aggregate KV capacity.
 
 ## CPU and traffic placement
 
@@ -96,7 +100,11 @@ pipeline correctly addresses the selected GPU as `cuda:0`, without depending on
 host ordinal remapping.
 
 Each benchmark condition should use unique `CUDA_MPS_PIPE_DIRECTORY` and
-`CUDA_MPS_LOG_DIRECTORY` paths. A valid lifecycle is:
+`CUDA_MPS_LOG_DIRECTORY` paths. Keep the runtime path short because MPS creates
+Unix-domain sockets below it; long artifact-directory paths can prevent the
+control socket from being created. Poll the control interface after daemon
+launch rather than assuming the daemonized command's immediate exit status is
+the readiness signal. A valid lifecycle is:
 
 1. Confirm the selected GPU is otherwise idle and in compute mode `Default`.
 2. Start a per-user MPS daemon with only that GPU UUID visible.
@@ -133,6 +141,10 @@ Use the same-GPU DP benchmark harness in
 placement, owns MPS and child lifecycles, and aggregates the existing
 `speed_results.json` schema. Run its dry-run mode and inspect every command before
 using the H200.
+
+Before the primary matrix, run its capacity-only calibration across MPS off/on
+and source the generated `DPn_MAX_TOTAL_TOKENS` values. A publication matrix
+with `KV_EQUALITY=require` refuses DP2–4 when these calibrated caps are absent.
 
 First tune DP1 across at least:
 

@@ -100,6 +100,16 @@ def test_extract_kv_tokens_uses_last_startup_value() -> None:
     assert extract_kv_tokens(text) == 2048
 
 
+def test_extract_kv_tokens_supports_sglang_allocated_log_format() -> None:
+    text = "KV Cache is allocated. #tokens: 84,328"
+    assert extract_kv_tokens(text) == 84328
+
+
+def test_extract_kv_tokens_uses_textually_last_supported_format() -> None:
+    text = "KV Cache is allocated. #tokens: 84,328\nmax_total_num_tokens=84000"
+    assert extract_kv_tokens(text) == 84000
+
+
 def test_summarize_matrix_reports_repetitions_ci_and_failures(tmp_path: Path) -> None:
     rows = []
     for repetition, qps in ((1, 10.0), (2, 14.0)):

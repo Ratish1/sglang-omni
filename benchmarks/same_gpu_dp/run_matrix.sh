@@ -59,10 +59,15 @@ for condition in "${CONDITIONS[@]}"; do
   server_var="DP${dp}_SERVER_CORE_SETS"
   client_var="DP${dp}_CLIENT_CORE_SETS"
   mem_var="DP${dp}_MEM_FRACTIONS"
+  token_var="DP${dp}_MAX_TOTAL_TOKENS"
   [[ -n "${!server_var:-}" && -n "${!client_var:-}" && -n "${!mem_var:-}" ]] || {
     echo "set $server_var, $client_var, and $mem_var" >&2
     exit 2
   }
+  if [[ "${KV_EQUALITY:-warn}" == require && "$dp" -gt 1 && -z "${!token_var:-}" ]]; then
+    echo "KV_EQUALITY=require needs $token_var for DP$dp; run a capacity-only calibration first" >&2
+    exit 2
+  fi
   layout=$(python3 "$HERE/summarize.py" validate-layout --dp "$dp" \
     --server-core-sets "${!server_var}" --client-core-sets "${!client_var}")
   counts=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["server_cpu_count"], d["client_cpu_count"])' <<< "$layout")
@@ -88,7 +93,7 @@ printf 'repetition\torder_index\tdp\tmps\tconcurrency\tstatus\texit_code\toutput
   echo "shuffle_seed=$SHUFFLE_SEED"
   echo "server_cpu_budget=$server_budget"
   echo "client_cpu_budget=$client_budget"
-  env | LC_ALL=C sort | grep -E '^DP[1-4]_(SERVER_CORE_SETS|CLIENT_CORE_SETS|MEM_FRACTIONS|MPS_THREAD_PERCENTAGES|MPS_PINNED_MEM_LIMITS)=' || true
+  env | LC_ALL=C sort | grep -E '^DP[1-4]_(SERVER_CORE_SETS|CLIENT_CORE_SETS|MEM_FRACTIONS|MAX_TOTAL_TOKENS|MPS_THREAD_PERCENTAGES|MPS_PINNED_MEM_LIMITS)=' || true
 } > "$OUT_ROOT/matrix_manifest.txt"
 
 failures=0
@@ -118,6 +123,7 @@ PY
     server_var="DP${dp}_SERVER_CORE_SETS"
     client_var="DP${dp}_CLIENT_CORE_SETS"
     mem_var="DP${dp}_MEM_FRACTIONS"
+    token_var="DP${dp}_MAX_TOTAL_TOKENS"
     thread_var="DP${dp}_MPS_THREAD_PERCENTAGES"
     pinned_var="DP${dp}_MPS_PINNED_MEM_LIMITS"
     label="rep${rep}_ord${order_index}_dp${dp}_mps${mps}_c${concurrency}_direct"
@@ -131,6 +137,7 @@ PY
     if LABEL="$label" DP="$dp" USE_MPS="$mps" MODE=direct \
       SERVER_CORE_SETS="${!server_var}" CLIENT_CORE_SETS="${!client_var}" \
       MEM_FRACTIONS="${!mem_var}" CONCURRENCY_PER_WORKER="$concurrency" \
+      MAX_TOTAL_TOKENS="${!token_var:-${MAX_TOTAL_TOKENS:-}}" \
       MPS_THREAD_PERCENTAGES="$thread_value" \
       MPS_PINNED_MEM_LIMITS="$pinned_value" \
       OUT_ROOT="$OUT_ROOT" "$HERE/run_condition.sh" "${DRY_RUN_ARG[@]}"; then

@@ -18,6 +18,7 @@ CPU_ITEM_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 KV_PATTERNS = (
     re.compile(r"max_total_num_tokens(?:=|: )\s*(\d+)", re.IGNORECASE),
     re.compile(r"(?:KV cache|KV Cache).*?(\d+)\s+tokens", re.IGNORECASE),
+    re.compile(r"KV Cache is allocated\.\s*#tokens:\s*([\d,]+)", re.IGNORECASE),
 )
 
 
@@ -112,10 +113,13 @@ def percentile(values: list[float], q: float) -> float | None:
 
 
 def extract_kv_tokens(text: str) -> int | None:
-    values: list[int] = []
+    values: list[tuple[int, int]] = []
     for pattern in KV_PATTERNS:
-        values.extend(int(match.group(1)) for match in pattern.finditer(text))
-    return values[-1] if values else None
+        values.extend(
+            (match.start(), int(match.group(1).replace(",", "")))
+            for match in pattern.finditer(text)
+        )
+    return max(values)[1] if values else None
 
 
 def summarize_results(result_paths: Iterable[Path]) -> dict[str, object]:

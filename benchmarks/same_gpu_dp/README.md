@@ -33,8 +33,10 @@ per-worker values and reject visibly skewed or sequential windows.
 - starts replicas sequentially and applies a bounded readiness timeout;
 - creates one process group per replica, records its ID, and signals only those
   owned groups;
-- starts MPS with condition-unique pipe/log directories, verifies every replica
-  has a CUDA client listed by MPS `ps`, and quits only the daemon it started;
+- starts MPS with short condition-unique pipe/log directories under
+  `MPS_TMP_ROOT`, polls through asynchronous daemon startup, verifies every
+  replica has a CUDA client listed by MPS `ps`, and quits only the daemon it
+  started;
 - asks MPS `terminate_client` to detach a stuck owned CUDA client before a final
   process-group `SIGKILL`; it never uses `pkill`;
 - records commands, placement, software/hardware identity, topology, generation
@@ -66,6 +68,7 @@ settings are:
 | `CONCURRENCY_PER_WORKER` | canonical client concurrency per direct worker |
 | `MAX_RUNNING_REQUESTS` | server generation batching limit |
 | `CUDA_GRAPH_MAX_BS` | server CUDA graph maximum batch size |
+| `MAX_TOTAL_TOKENS` | exact upper bound for each replica's SGLang KV-token pool |
 | `MODEL` / `MODEL_NAME` | checkpoint and served/request model name |
 | `BENCH_LANG` | SeedTTS language split (`en` or `zh`) |
 | `ALLOWED_LOCAL_MEDIA_PATH` | server allowlist for SeedTTS reference paths; defaults to `/` for an isolated benchmark container |
@@ -73,6 +76,22 @@ settings are:
 | `LABEL` / `OUT_ROOT` | stable condition name and artifact root |
 | `KV_EQUALITY` | `warn` (default), `require`, or `off` |
 | `REQUIRE_IDLE_GPU` | refuse pre-existing compute clients (default `1`) |
+| `CAPACITY_ONLY` | initialize replicas, record KV capacity, and exit before load |
+| `MPS_TMP_ROOT` | short local MPS runtime root; defaults to per-user `/tmp/sglang-omni-mps-$UID` |
+
+For a complete study, prefer the versioned YAML interface. Copy
+`configs/h200_higgs.yaml`, adapt its NUMA-local CPU IDs, and export only the
+host-specific GPU UUID:
+
+```bash
+export GPU_UUID=GPU-...
+python benchmarks/same_gpu_dp/run_study.py \
+  benchmarks/same_gpu_dp/configs/h200_higgs.yaml --mode calibrate
+```
+
+The loader is strict: unknown keys and unresolved `${ENVIRONMENT_VARIABLES}`
+fail before launch. Scalar environment values not specified by YAML remain
+available as advanced overrides.
 
 Example dry-run (does not call NVIDIA tools or launch a model):
 
@@ -100,13 +119,48 @@ startup. Later replicas see memory already consumed by earlier complete Higgs
 pipelines. Equal fractions therefore do **not** imply equal
 `max_total_num_tokens`, and replica launch order can change batching headroom.
 
-There is not currently a stable SGLang Omni CLI contract for pinning an exact KV
-token count through every supported TTS backend. This harness extracts the
-resolved capacity from server logs into `kv_capacity.json` when the installed
-SGLang log format exposes it. Use `KV_EQUALITY=require` for publication runs; it
-fails if a capacity is missing or unequal. If extraction returns `null`, inspect
-the SGLang startup logs and record the displayed capacity manually rather than
-claiming a fair memory comparison.
+SGLang's `max_total_tokens` is an upper bound applied after memory profiling and
+before the KV pool is allocated. This branch exposes it as
+`sgl-omni serve --max-total-tokens` and as typed pipeline YAML under
+`runtime.sglang_server_args.max_total_tokens`. `MAX_TOTAL_TOKENS` passes the cap
+to every replica in one harness condition. A replica whose profiled capacity is
+smaller still resolves smaller, and `KV_EQUALITY=require` rejects the condition.
+
+The harness recognizes both `max_total_num_tokens=...` and SGLang's
+`KV Cache is allocated. #tokens: ...` startup formats. If extraction returns
+`null`, treat that as a failed gate rather than claiming a fair comparison.
+
+### Calibrate an exact per-DP cap
+
+Do not derive a publication cap from one launch order or MPS mode. After setting
+the `DP2_*`, `DP3_*`, and `DP4_*` layouts shown below, run:
+
+```bash
+CALIBRATION_DPS=2,3,4 \
+bash benchmarks/same_gpu_dp/calibrate_capacity.sh
+```
+
+This performs two real capacity-only repetitions with MPS off and on by default,
+runs no benchmark traffic, and writes the minimum observed capacity per DP to
+`capacity.env`. Review `capacity_summary.tsv`, then source the generated file:
+
+```bash
+source benchmarks/results/same_gpu_dp/<printed-calibration-label>/capacity.env
+```
+
+With the YAML interface, use the same file after sourcing the generated caps:
+
+```bash
+source benchmarks/results/same_gpu_dp/<printed-calibration-label>/capacity.env
+python benchmarks/same_gpu_dp/run_study.py \
+  benchmarks/same_gpu_dp/configs/h200_higgs.yaml --mode matrix
+```
+
+For example, an H200 DP3 observation of `216719, 140294, 84328` produces
+`DP3_MAX_TOTAL_TOKENS=84328`. The subsequent capped run must report `84328` for
+all replicas or fail before load. Keep DP1 uncapped for the fair aggregate-GPU
+comparison: the cap controls launch-order imbalance within a DP condition, not
+an equal per-replica memory allocation across different DP counts.
 
 ## Tune DP1 first
 
@@ -153,14 +207,19 @@ export DP3_MEM_FRACTIONS='0.27,0.27,0.27'
 export DP4_SERVER_CORE_SETS='0-7;8-15;16-23;24-31'
 export DP4_CLIENT_CORE_SETS='48-51;52-55;56-59;60-63'
 export DP4_MEM_FRACTIONS='0.21,0.21,0.21,0.21'
+# Source the calibration's capacity.env here. It exports
+# DP2_MAX_TOTAL_TOKENS, DP3_MAX_TOTAL_TOKENS, and DP4_MAX_TOTAL_TOKENS.
 export MATRIX_ORDER='3:1,1:0,4:0,2:1,3:0,1:1,4:1,2:0'
 export CONCURRENCY_VALUES='32,48,64,96'
 export REPETITIONS=5
 export SHUFFLE_SEED=986
+export KV_EQUALITY=require
 bash benchmarks/same_gpu_dp/run_matrix.sh
 ```
 
 Add `--dry-run` to validate and print the entire matrix without touching CUDA.
+When `KV_EQUALITY=require`, `run_matrix.sh` refuses DP2–4 before any expensive
+launch unless the corresponding `DPn_MAX_TOTAL_TOKENS` is set.
 
 The fractions above are illustrative starting points, not H200 guarantees. Each
 matrix condition is run at every `CONCURRENCY_VALUES` point; compare the peak
@@ -187,6 +246,12 @@ these values.
 Validate the exact pinned-memory syntax against the CUDA version in the H200
 container; support has changed across CUDA releases. Treat active-thread
 percentage as a provisioning experiment, not as guaranteed SM isolation.
+
+Do not prepend a host `/lib/x86_64-linux-gnu` directory blindly to
+`LD_LIBRARY_PATH`. In a CUDA 13 container this can select an older CUDA 12.8
+driver library and make PyTorch report that the NVIDIA driver is too old. Keep
+the container's working inherited library path unless its own CUDA probe proves
+otherwise.
 
 ## Measure router overhead separately
 
