@@ -341,7 +341,8 @@ class CommEngine:
                 control_send_ms=round(control_ms, 6),
                 elapsed_ms=round(_comm_elapsed_ms(send_start), 6),
             )
-            job.ready.set_result(data_ref)
+            if not job.ready.done():
+                job.ready.set_result(data_ref)
         except Exception as exc:
             if pending_registered and object_id is not None:
                 self._fail_pending(object_id, exc)
@@ -400,7 +401,8 @@ class CommEngine:
                 control_send_ms=round(control_ms, 6),
                 elapsed_ms=round(_comm_elapsed_ms(send_start), 6),
             )
-            job.ready.set_result(data_ref)
+            if not job.ready.done():
+                job.ready.set_result(data_ref)
         except Exception as exc:
             if pending_registered and object_id is not None:
                 self._fail_pending(object_id, exc)

@@ -344,6 +344,94 @@ def test_comm_engine_accepts_ack_during_control_publication() -> None:
 
 
 @pytest.mark.parametrize("kind", ["payload", "stream"])
+def test_comm_engine_preserves_published_send_after_caller_cancellation(
+    kind: str,
+) -> None:
+    async def _run() -> None:
+        class _BlockedControlPlane:
+            def __init__(self) -> None:
+                self.send_started = asyncio.Event()
+                self.release_send = asyncio.Event()
+                self.send_returned = asyncio.Event()
+                self.message: DataReadyMessage | None = None
+
+            async def send_to_stage(self, target, endpoint, msg) -> None:
+                del target, endpoint
+                self.message = msg
+                self.send_started.set()
+                await self.release_send.wait()
+                self.send_returned.set()
+
+        relay = _AckedRelay()
+        control_plane = _BlockedControlPlane()
+        engine = CommEngine(
+            CommRouter(
+                stage_name="sender",
+                gpu_id=None,
+                same_process_targets=set(),
+                gpu_stage_names=set(),
+                comm_config={"ack_timeout_s": 1.0},
+                injected_relay=relay,
+            )
+        )
+
+        try:
+            if kind == "payload":
+                send_coro = engine.send_payload(
+                    relay=relay,
+                    control_plane=control_plane,
+                    request_id="req-1",
+                    payload=make_stage_payload(
+                        request_id="req-1", data={"x": torch.ones(2)}
+                    ),
+                    transport=TransportKind.SHM,
+                    from_stage="sender",
+                    to_stage="receiver",
+                    target_endpoint="inproc://receiver",
+                )
+            else:
+                send_coro = engine.send_stream_chunk(
+                    relay=relay,
+                    control_plane=control_plane,
+                    request_id="req-1",
+                    data=torch.ones(2),
+                    target_stage="receiver",
+                    target_endpoint="inproc://receiver",
+                    from_stage="sender",
+                    chunk_id=0,
+                    metadata=None,
+                    transport=TransportKind.SHM,
+                )
+            caller = asyncio.create_task(send_coro)
+            await control_plane.send_started.wait()
+
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+
+            control_plane.release_send.set()
+            await control_plane.send_returned.wait()
+            assert control_plane.message is not None
+            data_ref = DataRef.from_dict(control_plane.message.data_ref)
+            engine.ack_transfer(
+                DataAckMessage(
+                    request_id="req-1",
+                    from_stage="receiver",
+                    to_stage="sender",
+                    object_id=data_ref.object_id,
+                )
+            )
+            await _wait_until(lambda: relay.ops[0].waited)
+
+            assert relay.ops[0].acked
+            assert relay.ops[0].failed is None
+        finally:
+            engine.close()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("kind", ["payload", "stream"])
 def test_comm_engine_settles_operations_when_control_publication_fails(
     kind: str,
 ) -> None:
