@@ -653,6 +653,16 @@ class Stage:
 
     async def _discard_payload_data(self, msg: DataReadyMessage) -> None:
         if stage_io.is_direct_cuda_ipc_payload_ref(msg.data_ref):
+            try:
+                discarded = stage_io.deserialize_direct_cuda_ipc_payload(msg.data_ref)
+                del discarded
+            except Exception:
+                logger.warning(
+                    "Stage %s: failed to drain aborted direct IPC payload for %s",
+                    self.name,
+                    msg.request_id,
+                    exc_info=True,
+                )
             return
         request_id = msg.request_id
         data_ref = self._data_ref_from_message(msg)
@@ -679,6 +689,18 @@ class Stage:
 
     async def _discard_stream_chunk_data(self, msg: DataReadyMessage) -> None:
         if stage_io.is_direct_cuda_ipc_stream_chunk_ref(msg.data_ref):
+            try:
+                discarded = stage_io.deserialize_direct_cuda_ipc_stream_chunk(
+                    msg.data_ref
+                )
+                del discarded
+            except Exception:
+                logger.warning(
+                    "Stage %s: failed to drain aborted direct IPC stream chunk for %s",
+                    self.name,
+                    msg.request_id,
+                    exc_info=True,
+                )
             return
         if msg.chunk_id is None:
             raise ValueError("stream chunk discard requires chunk_id")

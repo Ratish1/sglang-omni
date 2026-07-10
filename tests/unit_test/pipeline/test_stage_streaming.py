@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import logging
 import queue
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -933,6 +936,116 @@ def test_stage_drains_relay_payload_for_already_aborted_request() -> None:
         assert relay.gets == 1
 
     asyncio.run(_run())
+
+
+@pytest.mark.parametrize("kind", ["payload", "stream"])
+def test_stage_drains_direct_ipc_for_already_aborted_request(
+    monkeypatch,
+    kind,
+) -> None:
+    class _ImportedStorage:
+        pass
+
+    async def _run() -> tuple[list[dict], list[weakref.ReferenceType]]:
+        stage = _make_receive_stage()
+        stage._aborted.add("req")
+        deserialized: list[dict] = []
+        released: list[weakref.ReferenceType] = []
+
+        def deserialize(data_ref):
+            imported = _ImportedStorage()
+            deserialized.append(data_ref)
+            released.append(weakref.ref(imported))
+            return imported if kind == "payload" else (imported, None)
+
+        if kind == "payload":
+            monkeypatch.setattr(
+                stage_io,
+                "deserialize_direct_cuda_ipc_payload",
+                deserialize,
+            )
+            msg = DataReadyMessage(
+                request_id="req",
+                from_stage="upstream",
+                to_stage="receiver",
+                data_ref={"_type": "TorchCudaIpcPayload", "version": 1},
+            )
+            await stage._on_data_ready(msg)
+        else:
+            monkeypatch.setattr(
+                stage_io,
+                "deserialize_direct_cuda_ipc_stream_chunk",
+                deserialize,
+            )
+            msg = DataReadyMessage(
+                request_id="req",
+                from_stage="upstream",
+                to_stage="receiver",
+                data_ref={"_type": "TorchCudaIpcStreamChunk", "version": 1},
+                chunk_id=0,
+            )
+            await stage._on_stream_chunk(msg)
+
+        assert stage.scheduler.inbox.empty()
+        assert stage.control_plane.stage_messages == []
+        return deserialized, released
+
+    deserialized, released = asyncio.run(_run())
+    gc.collect()
+
+    assert len(deserialized) == 1
+    assert len(released) == 1
+    assert released[0]() is None
+
+
+@pytest.mark.parametrize("kind", ["payload", "stream"])
+def test_stage_contains_direct_ipc_abort_drain_failure(
+    monkeypatch,
+    caplog,
+    kind,
+) -> None:
+    def fail_deserialize(data_ref):
+        del data_ref
+        raise RuntimeError("cannot import direct IPC storage")
+
+    async def _run() -> Stage:
+        stage = _make_receive_stage()
+        stage._aborted.add("req")
+        if kind == "payload":
+            monkeypatch.setattr(
+                stage_io,
+                "deserialize_direct_cuda_ipc_payload",
+                fail_deserialize,
+            )
+            msg = DataReadyMessage(
+                request_id="req",
+                from_stage="upstream",
+                to_stage="receiver",
+                data_ref={"_type": "TorchCudaIpcPayload", "version": 1},
+            )
+            await stage._on_data_ready(msg)
+        else:
+            monkeypatch.setattr(
+                stage_io,
+                "deserialize_direct_cuda_ipc_stream_chunk",
+                fail_deserialize,
+            )
+            msg = DataReadyMessage(
+                request_id="req",
+                from_stage="upstream",
+                to_stage="receiver",
+                data_ref={"_type": "TorchCudaIpcStreamChunk", "version": 1},
+                chunk_id=0,
+            )
+            await stage._on_stream_chunk(msg)
+        return stage
+
+    with caplog.at_level(logging.WARNING):
+        stage = asyncio.run(_run())
+
+    assert "failed to drain aborted direct IPC" in caplog.text
+    assert stage.scheduler.inbox.empty()
+    assert stage.control_plane.stage_messages == []
 
 
 def test_stage_routes_relay_stream_chunk_to_scheduler() -> None:
