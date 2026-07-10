@@ -16,7 +16,7 @@ from sglang_omni.pipeline.stage.input import AggregatedInput
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.pipeline.stage_workers import StageLaunchConfig, _construct_stage
-from sglang_omni.proto import DataReadyMessage
+from sglang_omni.proto import DataAckMessage, DataReadyMessage
 from tests.unit_test.fixtures.pipeline_fakes import (
     EventLog,
     FakeRelay,
@@ -900,7 +900,7 @@ def test_stage_sends_same_process_stream_chunk_as_local_object(monkeypatch) -> N
 def test_stage_sends_same_gpu_stream_chunk_as_direct_cuda_ipc(monkeypatch) -> None:
     monkeypatch.setattr(
         stage_io,
-        "serialize_direct_cuda_ipc_stream_chunk",
+        "try_serialize_direct_cuda_ipc_stream_chunk",
         lambda data, metadata: {
             "_type": "TorchCudaIpcStreamChunk",
             "version": 1,
@@ -939,6 +939,142 @@ def test_stage_sends_same_gpu_stream_chunk_as_direct_cuda_ipc(monkeypatch) -> No
         assert endpoint == "inproc://code2wav"
         assert msg.data_ref["_type"] == "TorchCudaIpcStreamChunk"
         assert msg.chunk_id == 0
+
+    asyncio.run(_run())
+
+
+def test_stage_falls_back_for_ineligible_same_gpu_stream_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(
+        stage_io,
+        "try_serialize_direct_cuda_ipc_stream_chunk",
+        lambda data, metadata: None,
+    )
+
+    async def _run() -> None:
+        relay = FakeRelay()
+        control_plane = RecordingStageControlPlane()
+        sender = Stage(
+            name="talker_ar",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=0,
+            endpoints={"code2wav": "inproc://code2wav"},
+            control_plane=control_plane,
+            relay=relay,
+            scheduler=FakeScheduler(),
+            gpu_stage_names={"code2wav"},
+            stage_gpu_ids={"code2wav": (0,)},
+        )
+
+        await sender._send_stream_to_target(
+            "req-fallback",
+            torch.arange(4),
+            "code2wav",
+            {"stats": torch.ones(1)},
+        )
+
+        assert relay.storage
+        target, endpoint, msg = control_plane.sent_to_stage[0]
+        assert target == "code2wav"
+        assert endpoint == "inproc://code2wav"
+        data_ref = DataRef.from_dict(msg.data_ref)
+        assert data_ref.transport is TransportKind.SHM
+        assert data_ref.object_id in sender._comm._pending
+
+        completion_task = sender._comm._pending[data_ref.object_id].task
+        assert completion_task is not None
+        sender._comm.ack_transfer(
+            DataAckMessage(
+                request_id="req-fallback",
+                from_stage="code2wav",
+                to_stage="talker_ar",
+                object_id=data_ref.object_id,
+            )
+        )
+        await completion_task
+        sender._comm.close()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"stats": torch.ones(1)},
+        {"transcript": "x" * (128 * 1024)},
+    ],
+)
+def test_ineligible_direct_stream_falls_back_before_cuda_export(
+    monkeypatch,
+    metadata,
+) -> None:
+    data = object()
+    monkeypatch.setattr(
+        stage_io,
+        "_contains_cuda_tensor",
+        lambda value, seen=None: value is data,
+    )
+    monkeypatch.setattr(
+        stage_io,
+        "_ipc_pickle",
+        lambda value: pytest.fail(f"ineligible value was exported: {value!r}"),
+    )
+
+    assert stage_io.try_serialize_direct_cuda_ipc_stream_chunk(data, metadata) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("metadata_kind", ["cpu_tensor", "large_inline"])
+def test_same_gpu_cuda_stream_falls_back_for_real_ineligible_metadata(
+    metadata_kind,
+) -> None:
+    async def _run() -> None:
+        relay = FakeRelay(device="cuda:0")
+        control_plane = RecordingStageControlPlane()
+        sender = Stage(
+            name="talker_ar",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=0,
+            endpoints={"code2wav": "inproc://code2wav"},
+            control_plane=control_plane,
+            relay=relay,
+            scheduler=FakeScheduler(),
+            gpu_stage_names={"code2wav"},
+            stage_gpu_ids={"code2wav": (0,)},
+        )
+        metadata = (
+            {"stats": torch.ones(1)}
+            if metadata_kind == "cpu_tensor"
+            else {"transcript": "x" * (128 * 1024)}
+        )
+
+        await sender._send_stream_to_target(
+            f"req-{metadata_kind}",
+            torch.arange(4, device="cuda:0"),
+            "code2wav",
+            metadata,
+        )
+
+        target, endpoint, msg = control_plane.sent_to_stage[0]
+        assert target == "code2wav"
+        assert endpoint == "inproc://code2wav"
+        data_ref = DataRef.from_dict(msg.data_ref)
+        assert data_ref.transport is TransportKind.CUDA_IPC
+        assert data_ref.object_id in sender._comm._pending
+
+        completion_task = sender._comm._pending[data_ref.object_id].task
+        assert completion_task is not None
+        sender._comm.ack_transfer(
+            DataAckMessage(
+                request_id=f"req-{metadata_kind}",
+                from_stage="code2wav",
+                to_stage="talker_ar",
+                object_id=data_ref.object_id,
+            )
+        )
+        await completion_task
+        sender._comm.close()
 
     asyncio.run(_run())
 

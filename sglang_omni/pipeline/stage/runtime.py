@@ -1303,8 +1303,12 @@ class Stage:
                 "relay-backed stream chunks must be torch.Tensor, got "
                 f"{type(data).__name__}"
             )
-        if data.is_cuda and self._comm.router.is_same_gpu_target(target):
-            direct_ref = stage_io.serialize_direct_cuda_ipc_stream_chunk(data, metadata)
+        direct_ref = None
+        if self._comm.router.is_same_gpu_target(target):
+            direct_ref = stage_io.try_serialize_direct_cuda_ipc_stream_chunk(
+                data, metadata
+            )
+        if direct_ref is not None:
             _emit_event(
                 request_id=request_id,
                 stage=self.name,
