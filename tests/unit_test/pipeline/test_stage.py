@@ -325,6 +325,35 @@ def test_cuda_payload_round_trip_preserves_cpu_tensor_devices() -> None:
     asyncio.run(_run())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_stream_round_trip_preserves_cpu_metadata_devices() -> None:
+    async def _run() -> None:
+        relay = FakeRelay(device="cuda:0")
+        data_ref, ops = await stage_io.write_stream_chunk(
+            relay,
+            request_id="req-mixed-metadata",
+            data=torch.arange(4, device="cuda:0"),
+            target_stage="receiver",
+            from_stage="sender",
+            chunk_id=0,
+            metadata={"stats": torch.ones(2)},
+            transport=TransportKind.CUDA_IPC,
+        )
+
+        data, metadata = await stage_io.read_stream_chunk(relay, data_ref)
+        for op in ops:
+            op.mark_receiver_done()
+            await op.wait_for_completion()
+
+        assert data.device.type == "cuda"
+        assert metadata is not None
+        assert metadata["stats"].device.type == "cpu"
+        assert torch.equal(metadata["stats"], torch.ones(2))
+        assert data_ref.metadata_tensors[0].ref.device == "cpu"
+
+    asyncio.run(_run())
+
+
 def test_stage_relay_read_failure_completes_with_error() -> None:
     """Preserves failure reporting when a stage cannot read its relay payload."""
 
