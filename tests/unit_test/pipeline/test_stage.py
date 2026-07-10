@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
+import multiprocessing as mp
 import pickle
+import traceback
 
 import pytest
 import torch
@@ -40,6 +43,105 @@ class _CloseAwareControlPlane(RecordingStageControlPlane):
         while not self.closed:
             await asyncio.sleep(0)
         raise RuntimeError("control plane closed")
+
+
+_DIRECT_IPC_PROCESS_TIMEOUT_S = 60.0
+
+
+def _receive_direct_ipc_stream_chunk(
+    data_ref: dict,
+    metadata_kind: str,
+    result_conn,
+) -> None:
+    try:
+        torch.cuda.set_device(0)
+        data, metadata = stage_io.deserialize_direct_cuda_ipc_stream_chunk(data_ref)
+
+        assert data.is_cuda
+        assert torch.equal(data, torch.arange(4, device=data.device))
+        assert metadata is not None
+        if metadata_kind == "cpu_tensor":
+            assert metadata["stats"].device.type == "cpu"
+            assert torch.equal(metadata["stats"], torch.ones(1))
+        else:
+            assert metadata == {"transcript": "x" * (128 * 1024)}
+
+        torch.cuda.synchronize(data.device)
+        del data, metadata
+        gc.collect()
+        torch.cuda.ipc_collect()
+        result_conn.send(("ok", None))
+    except BaseException:
+        result_conn.send(("error", traceback.format_exc()))
+        raise
+    finally:
+        result_conn.close()
+
+
+def _receive_direct_ipc_payload(
+    data_ref: dict,
+    payload_kind: str,
+    result_conn,
+) -> None:
+    try:
+        torch.cuda.set_device(0)
+        payload = stage_io.deserialize_direct_cuda_ipc_payload(data_ref)
+
+        if payload_kind == "large_header":
+            assert payload.request.inputs == "x" * (128 * 1024)
+            gpu_tensor = payload.data["encoder_out"]
+            assert torch.equal(
+                gpu_tensor,
+                torch.arange(4, device=gpu_tensor.device),
+            )
+        else:
+            gpu_tensor = payload.data["gpu"]
+            assert torch.equal(
+                gpu_tensor,
+                torch.arange(2, device=gpu_tensor.device),
+            )
+            assert payload.data["cpu"].device.type == "cpu"
+            assert torch.equal(payload.data["cpu"], torch.ones(1))
+
+        torch.cuda.synchronize(gpu_tensor.device)
+        del gpu_tensor, payload
+        gc.collect()
+        torch.cuda.ipc_collect()
+        result_conn.send(("ok", None))
+    except BaseException:
+        result_conn.send(("error", traceback.format_exc()))
+        raise
+    finally:
+        result_conn.close()
+
+
+def _run_direct_ipc_receiver(target, *args) -> None:
+    ctx = mp.get_context("spawn")
+    result_conn, child_result_conn = ctx.Pipe(duplex=False)
+    process = ctx.Process(target=target, args=(*args, child_result_conn))
+    try:
+        process.start()
+        child_result_conn.close()
+        process.join(timeout=_DIRECT_IPC_PROCESS_TIMEOUT_S)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            raise AssertionError("direct CUDA IPC receiver timed out")
+
+        status, detail = (
+            result_conn.recv()
+            if result_conn.poll()
+            else ("error", "direct CUDA IPC receiver returned no result")
+        )
+        assert process.exitcode == 0, detail
+        assert status == "ok", detail
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        result_conn.close()
+        child_result_conn.close()
+        process.close()
 
 
 def test_aggregated_input_waits_per_request_without_cross_talk() -> None:
@@ -1291,16 +1393,11 @@ def test_same_gpu_cuda_stream_keeps_direct_for_inline_metadata(
         assert endpoint == "inproc://code2wav"
         assert msg.data_ref["_type"] == "TorchCudaIpcStreamChunk"
         assert relay.storage == {}
-        restored_data, restored_metadata = (
-            stage_io.deserialize_direct_cuda_ipc_stream_chunk(msg.data_ref)
+        _run_direct_ipc_receiver(
+            _receive_direct_ipc_stream_chunk,
+            msg.data_ref,
+            metadata_kind,
         )
-        assert torch.equal(restored_data, source)
-        assert restored_metadata is not None
-        if metadata_kind == "cpu_tensor":
-            assert restored_metadata["stats"].device.type == "cpu"
-            assert torch.equal(restored_metadata["stats"], metadata["stats"])
-        else:
-            assert restored_metadata == metadata
         sender._comm.close()
 
     asyncio.run(_run())
@@ -1529,9 +1626,11 @@ def test_same_gpu_cuda_payload_keeps_direct_for_large_header() -> None:
         assert endpoint == "inproc://mm"
         assert msg.data_ref["_type"] == "TorchCudaIpcPayload"
         assert relay.storage == {}
-        restored = stage_io.deserialize_direct_cuda_ipc_payload(msg.data_ref)
-        assert restored.request.inputs == payload.request.inputs
-        assert torch.equal(restored.data["encoder_out"], payload.data["encoder_out"])
+        _run_direct_ipc_receiver(
+            _receive_direct_ipc_payload,
+            msg.data_ref,
+            "large_header",
+        )
         sender._comm.close()
 
     asyncio.run(_run())
@@ -1587,15 +1686,16 @@ def test_direct_cuda_ipc_payload_preserves_inline_cpu_tensors() -> None:
 
     ref = stage_io.serialize_direct_cuda_ipc_payload(payload)
     header = pickle.loads(ref["header"])
-    restored = stage_io.deserialize_direct_cuda_ipc_payload(ref)
 
     assert header.data["gpu"]["_tensor_placeholder"] == "gpu"
     assert not header.data["cpu"].is_cuda
     assert torch.equal(header.data["cpu"], torch.ones(1))
     assert [entry["path"] for entry in ref["tensors"]] == ["gpu"]
-    assert torch.equal(restored.data["gpu"], payload.data["gpu"])
-    assert restored.data["cpu"].device.type == "cpu"
-    assert torch.equal(restored.data["cpu"], payload.data["cpu"])
+    _run_direct_ipc_receiver(
+        _receive_direct_ipc_payload,
+        ref,
+        "cpu_tensor",
+    )
 
 
 def test_direct_cuda_ipc_payload_rejects_cpu_only_payloads() -> None:
