@@ -287,6 +287,40 @@ def test_qwen_preprocess_pretokenized_builds_thinker_state_from_ids() -> None:
     assert out.request.metadata == {"trace": "keep"}
 
 
+def test_qwen_finalize_state_releases_multimodal_raw_inputs() -> None:
+    from sglang_omni.models.qwen3_omni.components.preprocessor import (
+        Qwen3OmniPreprocessor,
+    )
+
+    pre = object.__new__(Qwen3OmniPreprocessor)
+    payload = SimpleNamespace(
+        request=SimpleNamespace(
+            inputs={"images": [bytearray(128 * 1024)], "audio": [bytearray(4096)]},
+            params={"stream": True},
+            metadata={"trace": "keep"},
+        ),
+        request_id="r-mm",
+        data={"raw_inputs": "must be replaced"},
+    )
+
+    out = pre._finalize_state(
+        payload,
+        input_ids=torch.tensor([1, 2]),
+        attention_mask=torch.ones(2, dtype=torch.long),
+        prompt_text="hello",
+        full_mm_inputs={},
+        encoder_inputs={"image_encoder": {"pixel_values": torch.ones(1)}},
+    )
+
+    state = Qwen3OmniPipelineState.from_dict(out.data)
+    assert out.request.inputs is None
+    assert out.request.params == {"stream": True}
+    assert out.request.metadata == {"trace": "keep"}
+    assert state.prompt["prompt_text"] == "hello"
+    assert state.encoder_inputs["image_encoder"]["pixel_values"].shape == (1,)
+    assert "raw_inputs" not in out.data
+
+
 def test_qwen_talker_to_code2wav_projection_keeps_only_request_latch() -> None:
     payload = StagePayload(
         request_id="req-1",
