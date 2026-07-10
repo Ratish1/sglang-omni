@@ -1076,6 +1076,7 @@ class Stage:
             )
         projector = self._project_payload.get(target)
         projected_payload = projector(payload) if projector is not None else payload
+        stage_io.validate_payload_request(projected_payload)
         use_local_object = allow_local_object or (
             allow_projected_local_object
             and self._is_isolated_projected_payload(

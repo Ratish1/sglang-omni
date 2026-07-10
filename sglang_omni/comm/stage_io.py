@@ -76,8 +76,12 @@ def extract_tensors(obj: Any, path: str = "") -> tuple[Any, dict[str, torch.Tens
 
 
 def extract_cuda_tensors(
-    obj: Any, path: str = ""
+    obj: Any,
+    path: str = "",
+    _cpu_tensor_memo: dict[int, torch.Tensor] | None = None,
 ) -> tuple[Any, dict[str, torch.Tensor]]:
+    if _cpu_tensor_memo is None:
+        _cpu_tensor_memo = {}
     if isinstance(obj, torch.Tensor):
         if obj.is_cuda:
             return {
@@ -86,18 +90,31 @@ def extract_cuda_tensors(
                 "dtype": str(obj.dtype),
                 "device": str(obj.device),
             }, {path: obj}
-        return obj, {}
+        tensor_id = id(obj)
+        compact = _cpu_tensor_memo.get(tensor_id)
+        if compact is None:
+            compact = _compact_cpu_tensor_for_pickle(obj)
+            _cpu_tensor_memo[tensor_id] = compact
+        return compact, {}
     if isinstance(obj, dict):
         out, tensors = {}, {}
         for key, value in obj.items():
             child_path = f"{path}.{key}" if path else key
-            out[key], child_tensors = extract_cuda_tensors(value, child_path)
+            out[key], child_tensors = extract_cuda_tensors(
+                value,
+                child_path,
+                _cpu_tensor_memo,
+            )
             tensors.update(child_tensors)
         return out, tensors
     if isinstance(obj, (list, tuple)):
         out, tensors = [], {}
         for idx, value in enumerate(obj):
-            child, child_tensors = extract_cuda_tensors(value, f"{path}[{idx}]")
+            child, child_tensors = extract_cuda_tensors(
+                value,
+                f"{path}[{idx}]",
+                _cpu_tensor_memo,
+            )
             out.append(child)
             tensors.update(child_tensors)
         return type(obj)(out), tensors
@@ -130,7 +147,6 @@ def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
             f"direct CUDA IPC payload requires StagePayload, got "
             f"{type(payload).__name__}"
         )
-    _validate_payload_request(payload)
     data_without_tensors, tensors = extract_cuda_tensors(payload.data)
     if not tensors:
         raise _DirectCudaIpcPayloadIneligibleError(
@@ -306,7 +322,6 @@ async def write_payload(
     to_stage: str | None = None,
     receiver_id: str | None = None,
 ) -> tuple[DataRef, Any]:
-    _validate_payload_request(payload)
     data_without_tensors, tensors = extract_tensors(payload.data)
     packed, entries = _pack_tensors(tensors, device=relay_device(relay))
     header = StagePayload(
@@ -697,7 +712,9 @@ def _contains_tensor(obj: Any, seen: set[int] | None = None) -> bool:
     return False
 
 
-def _validate_payload_request(payload: StagePayload) -> None:
+def validate_payload_request(payload: Any) -> None:
+    if not isinstance(payload, StagePayload):
+        return
     if _contains_tensor(payload.request):
         raise ValueError(
             "StagePayload request control metadata must not contain tensors; "
@@ -705,8 +722,19 @@ def _validate_payload_request(payload: StagePayload) -> None:
         )
 
 
+def _compact_cpu_tensor_for_pickle(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.layout is not torch.strided:
+        return tensor
+    logical_bytes = tensor.numel() * tensor.element_size()
+    if tensor.untyped_storage().nbytes() <= logical_bytes:
+        return tensor
+    return tensor.detach().clone(memory_format=torch.contiguous_format)
+
+
 def _ipc_pickle(obj: Any) -> bytes:
     if not _contains_cuda_tensor(obj):
+        if isinstance(obj, torch.Tensor) and not obj.is_cuda:
+            obj = _compact_cpu_tensor_for_pickle(obj)
         return pickle.dumps(obj)
     buf = io.BytesIO()
     ForkingPickler(buf, 2).dump(obj)
