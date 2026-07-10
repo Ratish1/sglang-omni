@@ -298,6 +298,148 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
     asyncio.run(_run())
 
 
+_EXTENDED_TRANSFER_DTYPES = [
+    getattr(torch, name)
+    for name in (
+        "float8_e4m3fn",
+        "float8_e5m2",
+        "float8_e4m3fnuz",
+        "float8_e5m2fnuz",
+        "float8_e8m0fnu",
+        "uint16",
+        "uint32",
+        "uint64",
+    )
+    if isinstance(getattr(torch, name, None), torch.dtype)
+]
+
+
+@pytest.mark.parametrize("dtype", _EXTENDED_TRANSFER_DTYPES, ids=str)
+def test_raw_tensor_codec_round_trips_extended_dtypes(dtype) -> None:
+    async def _run() -> None:
+        relay = FakeRelay()
+        source = torch.empty((), dtype=dtype)
+        source.reshape(-1).view(torch.uint8).reshape(-1).copy_(
+            torch.arange(source.numel() * source.element_size(), dtype=torch.uint8)
+        )
+
+        data_ref, op = await stage_io.write_tensor(
+            relay,
+            "extended-dtype",
+            source,
+            transport=TransportKind.SHM,
+        )
+        restored = await stage_io.read_tensor(relay, data_ref)
+        op.mark_receiver_done()
+        await op.wait_for_completion()
+
+        assert restored.dtype is dtype
+        assert restored.shape == source.shape
+        assert torch.equal(
+            restored.reshape(-1).view(torch.uint8),
+            source.reshape(-1).view(torch.uint8),
+        )
+
+    asyncio.run(_run())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "dtype",
+    [dtype for dtype in _EXTENDED_TRANSFER_DTYPES if "float8" in str(dtype)],
+    ids=str,
+)
+def test_cuda_raw_tensor_codec_round_trips_fp8(dtype) -> None:
+    async def _run() -> None:
+        relay = FakeRelay(device="cuda:0")
+        source = torch.empty(8, dtype=dtype, device="cuda:0")
+        source.view(torch.uint8).copy_(
+            torch.arange(8, dtype=torch.uint8, device="cuda:0")
+        )
+
+        data_ref, op = await stage_io.write_tensor(
+            relay,
+            "cuda-fp8",
+            source,
+            transport=TransportKind.CUDA_IPC,
+        )
+        restored = await stage_io.read_tensor(relay, data_ref)
+        op.mark_receiver_done()
+        await op.wait_for_completion()
+
+        assert restored.dtype is dtype
+        assert torch.equal(restored.view(torch.uint8), source.view(torch.uint8))
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("tensor_kind", ["quantized", "sparse"])
+def test_raw_tensor_codec_rejects_unreconstructable_layouts(tensor_kind) -> None:
+    async def _run() -> None:
+        relay = FakeRelay()
+        tensor = (
+            torch.quantize_per_tensor(
+                torch.tensor([1.0, 2.0]),
+                scale=0.1,
+                zero_point=10,
+                dtype=torch.qint8,
+            )
+            if tensor_kind == "quantized"
+            else torch.eye(2).to_sparse()
+        )
+
+        with pytest.raises(ValueError, match="tensor byte transport"):
+            await stage_io.write_tensor(
+                relay,
+                "unsupported-tensor",
+                tensor,
+                transport=TransportKind.SHM,
+            )
+        assert relay.storage == {}
+
+    asyncio.run(_run())
+
+
+def test_packed_tensor_codec_preserves_mixed_dtype_alignment() -> None:
+    async def _run() -> None:
+        relay = FakeRelay()
+        byte_dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
+        byte_tensor = torch.empty(1, dtype=byte_dtype)
+        byte_tensor.view(torch.uint8).fill_(7)
+        wide_tensor = torch.empty(3, dtype=torch.uint64)
+        wide_tensor.view(torch.uint8).copy_(torch.arange(24, dtype=torch.uint8))
+        payload = make_stage_payload(data={"byte": byte_tensor, "wide": wide_tensor})
+
+        data_ref, op = await stage_io.write_payload(
+            relay,
+            payload.request_id,
+            payload,
+            transport=TransportKind.SHM,
+        )
+        restored = await stage_io.read_payload(relay, payload.request_id, data_ref)
+        op.mark_receiver_done()
+        await op.wait_for_completion()
+
+        entries = {entry.path: entry for entry in data_ref.tensors}
+        assert entries["wide"].offset % wide_tensor.element_size() == 0
+        assert torch.equal(
+            restored.data["byte"].view(torch.uint8),
+            byte_tensor.view(torch.uint8),
+        )
+        assert torch.equal(
+            restored.data["wide"].view(torch.uint8),
+            wide_tensor.view(torch.uint8),
+        )
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("dtype_name", sorted(stage_io._UNSUPPORTED_QUANTIZED_DTYPES))
+def test_tensor_dtype_codec_rejects_quantized_metadata(dtype_name) -> None:
+    with pytest.raises(ValueError, match="unsupported tensor dtype metadata"):
+        stage_io._torch_dtype(dtype_name)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_payload_round_trip_preserves_cpu_tensor_devices() -> None:
     async def _run() -> None:

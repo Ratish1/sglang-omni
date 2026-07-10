@@ -23,24 +23,18 @@ from sglang_omni.comm.data_ref import (
 from sglang_omni.proto import DataReadyMessage, StagePayload
 from sglang_omni.relay.base import Relay
 
-_TORCH_DTYPES: dict[str, torch.dtype] = {
-    "torch.bool": torch.bool,
-    "torch.uint8": torch.uint8,
-    "torch.int8": torch.int8,
-    "torch.int16": torch.int16,
-    "torch.int32": torch.int32,
-    "torch.int64": torch.int64,
-    "torch.float16": torch.float16,
-    "torch.bfloat16": torch.bfloat16,
-    "torch.float32": torch.float32,
-    "torch.float64": torch.float64,
-    "torch.complex64": torch.complex64,
-    "torch.complex128": torch.complex128,
-}
-
 _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE = "TorchCudaIpcStreamChunk"
 _DIRECT_CUDA_IPC_PAYLOAD_TYPE = "TorchCudaIpcPayload"
 _IPC_INLINE_CPU_BYTES_LIMIT = 64 * 1024
+_UNSUPPORTED_QUANTIZED_DTYPES = frozenset(
+    {
+        "torch.qint8",
+        "torch.quint8",
+        "torch.qint32",
+        "torch.quint4x2",
+        "torch.quint2x4",
+    }
+)
 
 
 class _DirectCudaIpcPayloadIneligibleError(ValueError):
@@ -367,11 +361,12 @@ async def read_payload(
     if data_ref.header is None:
         raise ValueError("stage_payload data_ref is missing header")
     header = pickle.loads(base64.b64decode(data_ref.header))
+    dtypes = {entry.path: _torch_dtype(entry.dtype) for entry in data_ref.tensors}
     transfer_buf = await _read_transfer_buffer(relay, request_id, data_ref)
     tensors = {
         entry.path: _restore_tensor_device(
             transfer_buf[entry.offset : entry.offset + entry.size]
-            .view(_torch_dtype(entry.dtype))
+            .view(dtypes[entry.path])
             .reshape(entry.shape),
             entry.device,
         )
@@ -401,7 +396,7 @@ async def write_tensor(
         raise TypeError(
             f"write_tensor requires torch.Tensor, got {type(tensor).__name__}"
         )
-    packed = tensor.contiguous().view(torch.uint8).reshape(-1)
+    packed = _tensor_byte_view(tensor)
     target_device = torch.device(relay_device(relay))
     if packed.device != target_device:
         packed = packed.to(device=target_device)
@@ -447,12 +442,9 @@ async def read_tensor(
         raise ValueError("raw tensor data_ref is missing dtype")
     if data_ref.offset is None:
         raise ValueError("raw tensor data_ref is missing offset")
+    dtype = _torch_dtype(data_ref.dtype)
     transfer_buf = await _read_transfer_buffer(relay, data_ref.object_id, data_ref)
-    tensor = (
-        transfer_buf[data_ref.offset :]
-        .view(_torch_dtype(data_ref.dtype))
-        .reshape(data_ref.shape)
-    )
+    tensor = transfer_buf[data_ref.offset :].view(dtype).reshape(data_ref.shape)
     if data_ref.device is not None:
         tensor = _restore_tensor_device(tensor, data_ref.device)
     return tensor
@@ -581,7 +573,7 @@ def _pack_tensors(
     target_device = torch.device(device)
     entries, chunks, offset = [], [], 0
     for path, tensor in tensors.items():
-        flat = tensor.contiguous().view(torch.uint8).reshape(-1)
+        flat = _tensor_byte_view(tensor)
         if flat.device != target_device:
             flat = flat.to(device=target_device)
         padding = _pad_offset(offset, _dtype_alignment(tensor.dtype))
@@ -633,10 +625,43 @@ def _pad_offset(offset: int, alignment: int) -> int:
 
 
 def _torch_dtype(dtype_str: str) -> torch.dtype:
-    dtype = _TORCH_DTYPES.get(dtype_str)
-    if dtype is None:
+    prefix = "torch."
+    if not dtype_str.startswith(prefix) or dtype_str in _UNSUPPORTED_QUANTIZED_DTYPES:
+        raise ValueError(f"unsupported tensor dtype metadata: {dtype_str!r}")
+    dtype = getattr(torch, dtype_str[len(prefix) :], None)
+    if not isinstance(dtype, torch.dtype) or str(dtype) != dtype_str:
         raise ValueError(f"unsupported tensor dtype metadata: {dtype_str!r}")
     return dtype
+
+
+def _tensor_byte_view(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.layout is not torch.strided:
+        raise ValueError(
+            "tensor byte transport requires dense strided layout, got "
+            f"{tensor.layout}"
+        )
+    try:
+        _torch_dtype(str(tensor.dtype))
+    except ValueError as exc:
+        raise ValueError(
+            f"tensor byte transport does not support dtype {tensor.dtype}"
+        ) from exc
+    if tensor.is_quantized:
+        raise ValueError(
+            "tensor byte transport does not preserve quantization parameters"
+        )
+    try:
+        flat = tensor.contiguous().reshape(-1).view(torch.uint8).reshape(-1)
+    except (RuntimeError, TypeError) as exc:
+        raise ValueError(
+            f"tensor dtype {tensor.dtype} cannot be represented as raw bytes"
+        ) from exc
+    expected_size = tensor.numel() * tensor.element_size()
+    if flat.numel() != expected_size:
+        raise ValueError(
+            f"tensor byte view has {flat.numel()} bytes, expected {expected_size}"
+        )
+    return flat
 
 
 def _restore_tensor_device(tensor: torch.Tensor, device: str) -> torch.Tensor:
