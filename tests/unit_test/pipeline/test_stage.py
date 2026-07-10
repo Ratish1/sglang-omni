@@ -1277,10 +1277,11 @@ def test_same_gpu_cuda_stream_keeps_direct_for_inline_metadata(
             if metadata_kind == "cpu_tensor"
             else {"transcript": "x" * (128 * 1024)}
         )
+        source = torch.arange(4, device="cuda:0")
 
         await sender._send_stream_to_target(
             f"req-{metadata_kind}",
-            torch.arange(4, device="cuda:0"),
+            source,
             "code2wav",
             metadata,
         )
@@ -1290,6 +1291,16 @@ def test_same_gpu_cuda_stream_keeps_direct_for_inline_metadata(
         assert endpoint == "inproc://code2wav"
         assert msg.data_ref["_type"] == "TorchCudaIpcStreamChunk"
         assert relay.storage == {}
+        restored_data, restored_metadata = (
+            stage_io.deserialize_direct_cuda_ipc_stream_chunk(msg.data_ref)
+        )
+        assert torch.equal(restored_data, source)
+        assert restored_metadata is not None
+        if metadata_kind == "cpu_tensor":
+            assert restored_metadata["stats"].device.type == "cpu"
+            assert torch.equal(restored_metadata["stats"], metadata["stats"])
+        else:
+            assert restored_metadata == metadata
         sender._comm.close()
 
     asyncio.run(_run())
@@ -1518,6 +1529,9 @@ def test_same_gpu_cuda_payload_keeps_direct_for_large_header() -> None:
         assert endpoint == "inproc://mm"
         assert msg.data_ref["_type"] == "TorchCudaIpcPayload"
         assert relay.storage == {}
+        restored = stage_io.deserialize_direct_cuda_ipc_payload(msg.data_ref)
+        assert restored.request.inputs == payload.request.inputs
+        assert torch.equal(restored.data["encoder_out"], payload.data["encoder_out"])
         sender._comm.close()
 
     asyncio.run(_run())
@@ -1573,11 +1587,15 @@ def test_direct_cuda_ipc_payload_preserves_inline_cpu_tensors() -> None:
 
     ref = stage_io.serialize_direct_cuda_ipc_payload(payload)
     header = pickle.loads(ref["header"])
+    restored = stage_io.deserialize_direct_cuda_ipc_payload(ref)
 
     assert header.data["gpu"]["_tensor_placeholder"] == "gpu"
     assert not header.data["cpu"].is_cuda
     assert torch.equal(header.data["cpu"], torch.ones(1))
     assert [entry["path"] for entry in ref["tensors"]] == ["gpu"]
+    assert torch.equal(restored.data["gpu"], payload.data["gpu"])
+    assert restored.data["cpu"].device.type == "cpu"
+    assert torch.equal(restored.data["cpu"], payload.data["cpu"])
 
 
 def test_direct_cuda_ipc_payload_rejects_cpu_only_payloads() -> None:
