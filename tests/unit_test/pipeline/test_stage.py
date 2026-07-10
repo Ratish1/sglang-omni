@@ -1080,10 +1080,9 @@ def test_same_gpu_cuda_stream_falls_back_for_real_ineligible_metadata(
 
 
 def test_stage_sends_same_gpu_cuda_payload_as_direct_cuda_ipc(monkeypatch) -> None:
-    monkeypatch.setattr(stage_io, "payload_has_cuda_tensor", lambda payload: True)
     monkeypatch.setattr(
         stage_io,
-        "serialize_direct_cuda_ipc_payload",
+        "try_serialize_direct_cuda_ipc_payload",
         lambda payload: {
             "_type": "TorchCudaIpcPayload",
             "version": 1,
@@ -1122,14 +1121,12 @@ def test_stage_sends_same_gpu_cuda_payload_as_direct_cuda_ipc(monkeypatch) -> No
 
 
 def test_stage_can_disable_same_gpu_direct_cuda_payload(monkeypatch) -> None:
-    monkeypatch.setattr(stage_io, "payload_has_cuda_tensor", lambda payload: True)
-
     def _unexpected_direct_payload(payload):
         raise AssertionError("direct payload serializer should not be called")
 
     monkeypatch.setattr(
         stage_io,
-        "serialize_direct_cuda_ipc_payload",
+        "try_serialize_direct_cuda_ipc_payload",
         _unexpected_direct_payload,
     )
 
@@ -1163,14 +1160,16 @@ def test_stage_can_disable_same_gpu_direct_cuda_payload(monkeypatch) -> None:
 
 
 def test_stage_uses_relay_when_direct_cuda_payload_is_reexported(monkeypatch) -> None:
-    monkeypatch.setattr(stage_io, "payload_has_cuda_tensor", lambda payload: True)
-
     def _raise_reexport(payload):
         raise RuntimeError(
             "Attempted to send CUDA tensor received from another process"
         )
 
-    monkeypatch.setattr(stage_io, "serialize_direct_cuda_ipc_payload", _raise_reexport)
+    monkeypatch.setattr(
+        stage_io,
+        "try_serialize_direct_cuda_ipc_payload",
+        _raise_reexport,
+    )
 
     async def _run() -> None:
         relay = FakeRelay()
@@ -1196,6 +1195,89 @@ def test_stage_uses_relay_when_direct_cuda_payload_is_reexported(monkeypatch) ->
         assert endpoint == "inproc://talker"
         assert msg.data_ref["_type"] == "DataRef"
         assert relay.storage
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("ineligible_kind", ["request_tensor", "large_header"])
+def test_ineligible_direct_payload_falls_back_before_cuda_export(
+    monkeypatch,
+    ineligible_kind,
+) -> None:
+    payload = make_stage_payload(
+        data={"blob": "x" * (128 * 1024)},
+        inputs=(
+            {"tensor": torch.ones(1)}
+            if ineligible_kind == "request_tensor"
+            else "request"
+        ),
+    )
+    if ineligible_kind == "large_header":
+        monkeypatch.setattr(
+            stage_io,
+            "extract_cuda_tensors",
+            lambda data: (data, {"gpu": object()}),
+        )
+    monkeypatch.setattr(
+        stage_io,
+        "_ipc_pickle",
+        lambda value: pytest.fail(f"ineligible value was exported: {value!r}"),
+    )
+
+    assert stage_io.try_serialize_direct_cuda_ipc_payload(payload) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("ineligible_kind", ["request_tensor", "large_header"])
+def test_same_gpu_cuda_payload_falls_back_for_real_ineligible_header(
+    ineligible_kind,
+) -> None:
+    async def _run() -> None:
+        relay = FakeRelay(device="cuda:0")
+        control_plane = RecordingStageControlPlane()
+        sender = Stage(
+            name="encoder",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=0,
+            endpoints={"mm_aggregate": "inproc://mm"},
+            control_plane=control_plane,
+            relay=relay,
+            scheduler=FakeScheduler(),
+            gpu_stage_names={"mm_aggregate"},
+            stage_gpu_ids={"mm_aggregate": (0,)},
+        )
+        payload = make_stage_payload(
+            request_id=f"req-{ineligible_kind}",
+            data={"encoder_out": torch.arange(4, device="cuda:0")},
+            inputs=(
+                {"tensor": torch.ones(1)}
+                if ineligible_kind == "request_tensor"
+                else "x" * (128 * 1024)
+            ),
+        )
+
+        await sender._send_to_stage(payload.request_id, "mm_aggregate", payload)
+
+        target, endpoint, msg = control_plane.sent_to_stage[0]
+        assert target == "mm_aggregate"
+        assert endpoint == "inproc://mm"
+        data_ref = DataRef.from_dict(msg.data_ref)
+        assert data_ref.transport is TransportKind.CUDA_IPC
+        assert data_ref.object_id in sender._comm._pending
+
+        completion_task = sender._comm._pending[data_ref.object_id].task
+        assert completion_task is not None
+        sender._comm.ack_transfer(
+            DataAckMessage(
+                request_id=payload.request_id,
+                from_stage="mm_aggregate",
+                to_stage="encoder",
+                object_id=data_ref.object_id,
+            )
+        )
+        await completion_task
+        sender._comm.close()
 
     asyncio.run(_run())
 

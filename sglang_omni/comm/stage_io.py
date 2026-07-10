@@ -43,6 +43,10 @@ _DIRECT_CUDA_IPC_PAYLOAD_TYPE = "TorchCudaIpcPayload"
 _IPC_INLINE_CPU_BYTES_LIMIT = 64 * 1024
 
 
+class _DirectCudaIpcPayloadIneligibleError(ValueError):
+    pass
+
+
 def relay_device(relay: Relay) -> str:
     device = relay.device
     if not isinstance(device, str):
@@ -142,10 +146,14 @@ def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
             f"{type(payload).__name__}"
         )
     if _contains_cuda_tensor(payload.request) or _contains_cpu_tensor(payload.request):
-        raise ValueError("direct CUDA IPC payload does not support request tensors")
+        raise _DirectCudaIpcPayloadIneligibleError(
+            "direct CUDA IPC payload does not support request tensors"
+        )
     data_without_tensors, tensors = extract_cuda_tensors(payload.data)
     if not tensors:
-        raise ValueError("direct CUDA IPC payload requires at least one CUDA tensor")
+        raise _DirectCudaIpcPayloadIneligibleError(
+            "direct CUDA IPC payload requires at least one CUDA tensor"
+        )
     header = StagePayload(
         request_id=payload.request_id,
         request=payload.request,
@@ -153,7 +161,7 @@ def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
     )
     header_bytes = pickle.dumps(header)
     if len(header_bytes) > _IPC_INLINE_CPU_BYTES_LIMIT:
-        raise ValueError(
+        raise _DirectCudaIpcPayloadIneligibleError(
             "direct CUDA IPC payload header exceeds inline limit: "
             f"{len(header_bytes)} > {_IPC_INLINE_CPU_BYTES_LIMIT} bytes"
         )
@@ -166,6 +174,15 @@ def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
             for path, tensor in tensors.items()
         ],
     }
+
+
+def try_serialize_direct_cuda_ipc_payload(
+    payload: StagePayload,
+) -> dict[str, Any] | None:
+    try:
+        return serialize_direct_cuda_ipc_payload(payload)
+    except _DirectCudaIpcPayloadIneligibleError:
+        return None
 
 
 def is_direct_cuda_ipc_payload_ref(value: Any) -> bool:
