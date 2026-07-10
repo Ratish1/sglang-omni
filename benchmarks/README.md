@@ -13,6 +13,7 @@ benchmarks/
 ├── dataset/        # Dataset loaders + download helpers
 ├── benchmarker/    # Framework: runner, data structures, utilities
 ├── eval/           # Entry-point scripts (one per task × model)
+├── same_gpu_dp/    # Experimental same-GPU DP + CUDA MPS validation harness
 ├── tts_serving/    # TTS serving harness and Docker contract
 ├── cache/          # (gitignored) dataset caches
 └── results/        # (gitignored) evaluation outputs
@@ -190,6 +191,11 @@ python -m benchmarks.eval.benchmark_omni_seedtts \
 
 See [tts_serving/README.md](tts_serving/README.md) for the TTS serving
 benchmark design, harness contract, scenario matrix, and Docker usage.
+
+See [same_gpu_dp/README.md](same_gpu_dp/README.md) for the H200-ready,
+UUID-scoped DP 1–4 × MPS validation matrix. It uses the canonical
+`benchmark_tts_seedtts` endpoint and metrics, validates fixed CPU budgets, owns
+MPS/replica teardown, and provides a no-GPU dry-run mode.
 
 The two `*_seedtts.py` scripts merge the previous `benchmark_*_tts_speed.py`
 and `voice_clone_*_wer.py` pairs into a single two-phase pipeline: phase 1
