@@ -24,11 +24,12 @@ logger = logging.getLogger(__name__)
 
 def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
     t_np = tensor.numpy().reshape(-1)
-    size = t_np.nbytes
+    logical_size = t_np.nbytes
 
-    shm = _shm.SharedMemory(create=True, size=size)
-    shm_view = np.ndarray(t_np.shape, dtype=t_np.dtype, buffer=shm.buf)
-    shm_view[:] = t_np[:]
+    shm = _shm.SharedMemory(create=True, size=max(1, logical_size))
+    if logical_size:
+        shm_view = np.ndarray(t_np.shape, dtype=t_np.dtype, buffer=shm.buf)
+        shm_view[:] = t_np[:]
 
     return shm
 
@@ -170,12 +171,12 @@ class ShmRelay(Relay):
 
         try:
             shm = shm_create_from_tensor(tensor)
-            size_bytes = shm.size
+            logical_size = tensor.numel() * tensor.element_size()
             metadata = {
                 "engine_id": self.engine_id,
                 "transfer_info": {
                     "shm_name": shm.name,
-                    "size": size_bytes,
+                    "size": logical_size,
                     "req_id": request_id,
                 },
             }
