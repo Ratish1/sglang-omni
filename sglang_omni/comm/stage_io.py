@@ -25,7 +25,6 @@ from sglang_omni.relay.base import Relay
 
 _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE = "TorchCudaIpcStreamChunk"
 _DIRECT_CUDA_IPC_PAYLOAD_TYPE = "TorchCudaIpcPayload"
-_IPC_INLINE_CPU_BYTES_LIMIT = 64 * 1024
 _UNSUPPORTED_QUANTIZED_DTYPES = frozenset(
     {
         "torch.qint8",
@@ -121,12 +120,8 @@ def restore_tensors(obj: Any, tensors: dict[str, torch.Tensor]) -> Any:
 def should_use_direct_cuda_ipc_stream_chunk(
     data: Any, metadata: dict[str, Any] | None
 ) -> bool:
-    if not _contains_cuda_tensor(data):
-        return False
-    if _contains_cpu_tensor(data) or _contains_cpu_tensor(metadata):
-        return False
-    inline_size = _inline_cpu_pickle_size(data) + _inline_cpu_pickle_size(metadata)
-    return inline_size <= _IPC_INLINE_CPU_BYTES_LIMIT
+    del metadata
+    return _contains_cuda_tensor(data)
 
 
 def payload_has_cuda_tensor(payload: Any) -> bool:
@@ -154,11 +149,6 @@ def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
         data=data_without_tensors,
     )
     header_bytes = pickle.dumps(header)
-    if len(header_bytes) > _IPC_INLINE_CPU_BYTES_LIMIT:
-        raise _DirectCudaIpcPayloadIneligibleError(
-            "direct CUDA IPC payload header exceeds inline limit: "
-            f"{len(header_bytes)} > {_IPC_INLINE_CPU_BYTES_LIMIT} bytes"
-        )
     return {
         "_type": _DIRECT_CUDA_IPC_PAYLOAD_TYPE,
         "version": 1,
@@ -712,34 +702,6 @@ def _contains_cpu_tensor(obj: Any, seen: set[int] | None = None) -> bool:
             for field in fields(obj)
         )
     return False
-
-
-def _inline_cpu_pickle_size(obj: Any, seen: set[int] | None = None) -> int:
-    if obj is None:
-        return 0
-    seen = set() if seen is None else seen
-    obj_id = id(obj)
-    if obj_id in seen:
-        return 0
-    seen.add(obj_id)
-    if isinstance(obj, torch.Tensor):
-        return 0 if obj.is_cuda else _IPC_INLINE_CPU_BYTES_LIMIT + 1
-    if isinstance(obj, dict):
-        return sum(
-            _inline_cpu_pickle_size(key, seen) + _inline_cpu_pickle_size(value, seen)
-            for key, value in obj.items()
-        )
-    if isinstance(obj, (list, tuple, set, frozenset)):
-        return sum(_inline_cpu_pickle_size(value, seen) for value in obj)
-    if is_dataclass(obj) and not isinstance(obj, type):
-        return sum(
-            _inline_cpu_pickle_size(getattr(obj, field.name), seen)
-            for field in fields(obj)
-        )
-    try:
-        return len(pickle.dumps(obj))
-    except Exception:
-        return _IPC_INLINE_CPU_BYTES_LIMIT + 1
 
 
 def _ipc_pickle(obj: Any) -> bytes:
