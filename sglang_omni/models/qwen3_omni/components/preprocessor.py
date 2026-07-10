@@ -250,6 +250,10 @@ class Qwen3OmniPreprocessor:
             encoder_inputs=encoder_inputs,
             stream_state={"token_ids": [], "text": ""},
         )
+        # Downstream stages consume the canonicalized state and request policy,
+        # not the raw image/audio/video inputs. Release those bytes before the
+        # payload fans out and crosses process boundaries.
+        payload.request.inputs = None
         payload.data = state.to_dict()
         return payload
 

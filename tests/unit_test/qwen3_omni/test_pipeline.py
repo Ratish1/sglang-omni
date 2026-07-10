@@ -266,7 +266,11 @@ def test_qwen_preprocess_pretokenized_builds_thinker_state_from_ids() -> None:
     pre = object.__new__(Qwen3OmniPreprocessor)
     pre.max_seq_len = None
     payload = SimpleNamespace(
-        request=SimpleNamespace(params={"max_new_tokens": 16}),
+        request=SimpleNamespace(
+            inputs=[5, 6, 7],
+            params={"max_new_tokens": 16},
+            metadata={"trace": "keep"},
+        ),
         request_id="r1",
         data=None,
     )
@@ -278,6 +282,9 @@ def test_qwen_preprocess_pretokenized_builds_thinker_state_from_ids() -> None:
     assert state.prompt["attention_mask"].tolist() == [1, 1, 1]
     assert state.encoder_inputs["image_encoder"]["_skip"] is True
     assert state.encoder_inputs["audio_encoder"]["_skip"] is True
+    assert out.request.inputs is None
+    assert out.request.params == {"max_new_tokens": 16}
+    assert out.request.metadata == {"trace": "keep"}
 
 
 def test_qwen_talker_to_code2wav_projection_keeps_only_request_latch() -> None:
