@@ -71,6 +71,27 @@ def test_comm_router_uses_shm_for_cuda_payloads_to_cpu_targets() -> None:
     assert router.outbound_payload("decode", payload) is TransportKind.SHM
 
 
+def test_comm_router_identifies_same_gpu_targets() -> None:
+    router = CommRouter(
+        stage_name="talker_ar",
+        gpu_id=1,
+        same_process_targets={"local_code2wav"},
+        gpu_stage_names={"same_code2wav", "cross_code2wav", "tp_decode"},
+        stage_gpu_ids={
+            "same_code2wav": (1,),
+            "cross_code2wav": (0,),
+            "tp_decode": (0, 1),
+            "local_code2wav": (1,),
+        },
+        comm_config={},
+    )
+
+    assert router.is_same_gpu_target("same_code2wav")
+    assert not router.is_same_gpu_target("cross_code2wav")
+    assert not router.is_same_gpu_target("tp_decode")
+    assert not router.is_same_gpu_target("local_code2wav")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_comm_router_uses_cuda_ipc_for_cuda_stream_chunks_only() -> None:
     router = CommRouter(

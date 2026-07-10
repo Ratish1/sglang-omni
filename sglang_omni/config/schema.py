@@ -176,6 +176,9 @@ class StageConfig(BaseModel):
     stream_done_to_fn: str | None = None
     can_accept_stream_before_payload: bool = False
 
+    # --- Payload transport ---
+    disable_direct_cuda_ipc_payload: bool = False
+
     # --- Route-specific payload projection ---
     project_payload: dict[str, str] = Field(default_factory=dict)
 
