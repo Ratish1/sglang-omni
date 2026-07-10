@@ -298,6 +298,27 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
     asyncio.run(_run())
 
 
+def test_relay_payload_rejects_request_tensor_before_write() -> None:
+    async def _run() -> None:
+        relay = FakeRelay()
+        payload = make_stage_payload(
+            data={"value": torch.ones(1)},
+            inputs={"tensor": torch.ones(1)},
+        )
+
+        with pytest.raises(ValueError, match="request control metadata"):
+            await stage_io.write_payload(
+                relay,
+                payload.request_id,
+                payload,
+                transport=TransportKind.SHM,
+            )
+
+        assert relay.storage == {}
+
+    asyncio.run(_run())
+
+
 _EXTENDED_TRANSFER_DTYPES = [
     getattr(torch, name)
     for name in (
@@ -1360,7 +1381,7 @@ def test_stage_uses_relay_when_direct_cuda_payload_is_reexported(monkeypatch) ->
     asyncio.run(_run())
 
 
-def test_request_tensor_payload_falls_back_before_cuda_export(monkeypatch) -> None:
+def test_direct_payload_rejects_request_tensor_before_cuda_export(monkeypatch) -> None:
     payload = make_stage_payload(
         data={"blob": "x" * (128 * 1024)},
         inputs={"tensor": torch.ones(1)},
@@ -1371,7 +1392,8 @@ def test_request_tensor_payload_falls_back_before_cuda_export(monkeypatch) -> No
         lambda value: pytest.fail(f"ineligible value was exported: {value!r}"),
     )
 
-    assert stage_io.try_serialize_direct_cuda_ipc_payload(payload) is None
+    with pytest.raises(ValueError, match="request control metadata"):
+        stage_io.try_serialize_direct_cuda_ipc_payload(payload)
 
 
 def test_large_direct_payload_header_is_not_rerouted(monkeypatch) -> None:
@@ -1393,10 +1415,9 @@ def test_large_direct_payload_header_is_not_rerouted(monkeypatch) -> None:
     assert len(data_ref["header"]) > 128 * 1024
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_same_gpu_cuda_payload_falls_back_for_request_tensor() -> None:
+def test_stage_rejects_tensor_in_request_control_metadata() -> None:
     async def _run() -> None:
-        relay = FakeRelay(device="cuda:0")
+        relay = FakeRelay()
         control_plane = RecordingStageControlPlane()
         sender = Stage(
             name="encoder",
@@ -1412,30 +1433,15 @@ def test_same_gpu_cuda_payload_falls_back_for_request_tensor() -> None:
         )
         payload = make_stage_payload(
             request_id="req-request-tensor",
-            data={"encoder_out": torch.arange(4, device="cuda:0")},
+            data={"encoder_out": "value"},
             inputs={"tensor": torch.ones(1)},
         )
 
-        await sender._send_to_stage(payload.request_id, "mm_aggregate", payload)
+        with pytest.raises(ValueError, match="request control metadata"):
+            await sender._send_to_stage(payload.request_id, "mm_aggregate", payload)
 
-        target, endpoint, msg = control_plane.sent_to_stage[0]
-        assert target == "mm_aggregate"
-        assert endpoint == "inproc://mm"
-        data_ref = DataRef.from_dict(msg.data_ref)
-        assert data_ref.transport is TransportKind.CUDA_IPC
-        assert data_ref.object_id in sender._comm._pending
-
-        completion_task = sender._comm._pending[data_ref.object_id].task
-        assert completion_task is not None
-        sender._comm.ack_transfer(
-            DataAckMessage(
-                request_id=payload.request_id,
-                from_stage="mm_aggregate",
-                to_stage="encoder",
-                object_id=data_ref.object_id,
-            )
-        )
-        await completion_task
+        assert control_plane.sent_to_stage == []
+        assert relay.storage == {}
         sender._comm.close()
 
     asyncio.run(_run())
@@ -1543,7 +1549,7 @@ def test_direct_cuda_ipc_payload_rejects_cpu_only_payloads() -> None:
 def test_direct_cuda_ipc_payload_rejects_request_tensors() -> None:
     payload = make_stage_payload(data={"x": "ok"}, inputs={"tensor": torch.ones(1)})
 
-    with pytest.raises(ValueError, match="request tensors"):
+    with pytest.raises(ValueError, match="request control metadata"):
         stage_io.serialize_direct_cuda_ipc_payload(payload)
 
 

@@ -124,20 +124,13 @@ def should_use_direct_cuda_ipc_stream_chunk(
     return _contains_cuda_tensor(data)
 
 
-def payload_has_cuda_tensor(payload: Any) -> bool:
-    return _contains_cuda_tensor(payload)
-
-
 def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
     if not isinstance(payload, StagePayload):
         raise TypeError(
             f"direct CUDA IPC payload requires StagePayload, got "
             f"{type(payload).__name__}"
         )
-    if _contains_cuda_tensor(payload.request) or _contains_cpu_tensor(payload.request):
-        raise _DirectCudaIpcPayloadIneligibleError(
-            "direct CUDA IPC payload does not support request tensors"
-        )
+    _validate_payload_request(payload)
     data_without_tensors, tensors = extract_cuda_tensors(payload.data)
     if not tensors:
         raise _DirectCudaIpcPayloadIneligibleError(
@@ -313,6 +306,7 @@ async def write_payload(
     to_stage: str | None = None,
     receiver_id: str | None = None,
 ) -> tuple[DataRef, Any]:
+    _validate_payload_request(payload)
     data_without_tensors, tensors = extract_tensors(payload.data)
     packed, entries = _pack_tensors(tensors, device=relay_device(relay))
     header = StagePayload(
@@ -682,7 +676,7 @@ def _contains_cuda_tensor(obj: Any, seen: set[int] | None = None) -> bool:
     return False
 
 
-def _contains_cpu_tensor(obj: Any, seen: set[int] | None = None) -> bool:
+def _contains_tensor(obj: Any, seen: set[int] | None = None) -> bool:
     if obj is None:
         return False
     seen = set() if seen is None else seen
@@ -691,17 +685,24 @@ def _contains_cpu_tensor(obj: Any, seen: set[int] | None = None) -> bool:
         return False
     seen.add(obj_id)
     if isinstance(obj, torch.Tensor):
-        return not obj.is_cuda
+        return True
     if isinstance(obj, dict):
-        return any(_contains_cpu_tensor(value, seen) for value in obj.values())
+        return any(_contains_tensor(value, seen) for value in obj.values())
     if isinstance(obj, (list, tuple, set, frozenset)):
-        return any(_contains_cpu_tensor(value, seen) for value in obj)
+        return any(_contains_tensor(value, seen) for value in obj)
     if is_dataclass(obj) and not isinstance(obj, type):
         return any(
-            _contains_cpu_tensor(getattr(obj, field.name), seen)
-            for field in fields(obj)
+            _contains_tensor(getattr(obj, field.name), seen) for field in fields(obj)
         )
     return False
+
+
+def _validate_payload_request(payload: StagePayload) -> None:
+    if _contains_tensor(payload.request):
+        raise ValueError(
+            "StagePayload request control metadata must not contain tensors; "
+            "move tensor values to StagePayload.data"
+        )
 
 
 def _ipc_pickle(obj: Any) -> bytes:
