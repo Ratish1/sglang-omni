@@ -145,6 +145,7 @@ class Stage:
         self._local_stream_targets: dict[str, set[str]] = {}
         self._nonlocal_stream_targets: dict[str, set[str]] = {}
         self._receive_tasks: set[asyncio.Task] = set()
+        self._receive_lane_tails: dict[tuple[str, str], asyncio.Future[None]] = {}
         self._scheduler_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduler_crash_error: BaseException | None = None
@@ -300,17 +301,19 @@ class Stage:
             self._comm.ack_transfer(msg)
         elif isinstance(msg, DataReadyMessage):
             if msg.is_done or msg.error:
-                await self._on_stream_signal(msg)
+                handler = self._on_stream_signal
+                label = f"stream signal {msg.request_id}:{msg.from_stage}"
             elif msg.chunk_id is not None:
-                self._schedule_receive_task(
-                    self._on_stream_chunk(msg),
-                    f"stream chunk {msg.request_id}:{msg.from_stage}:{msg.chunk_id}",
-                )
+                handler = self._on_stream_chunk
+                label = f"stream chunk {msg.request_id}:{msg.from_stage}:{msg.chunk_id}"
             else:
-                self._schedule_receive_task(
-                    self._on_data_ready(msg),
-                    f"payload {msg.request_id}:{msg.from_stage}",
-                )
+                handler = self._on_data_ready
+                label = f"payload {msg.request_id}:{msg.from_stage}"
+            self._schedule_receive_task(
+                msg,
+                handler,
+                label,
+            )
         elif isinstance(msg, ProfilerStartMessage):
             self._on_profiler_start(msg)
         elif isinstance(msg, ProfilerStopMessage):
@@ -318,11 +321,54 @@ class Stage:
         elif isinstance(msg, AdminMessage):
             await self._on_admin(msg)
 
-    def _schedule_receive_task(self, coro: Any, label: str) -> None:
-        task = asyncio.create_task(coro)
+    def _schedule_receive_task(
+        self,
+        msg: DataReadyMessage,
+        handler: Callable[
+            [DataReadyMessage, asyncio.Future[None] | None],
+            Any,
+        ],
+        label: str,
+    ) -> None:
+        lane = (msg.request_id, msg.from_stage)
+        predecessor = self._receive_lane_tails.get(lane)
+        completion = asyncio.get_running_loop().create_future()
+        self._receive_lane_tails[lane] = completion
+        task = asyncio.create_task(
+            self._run_receive_task(
+                handler(msg, predecessor),
+                lane,
+                predecessor,
+                completion,
+            )
+        )
         self._receive_tasks.add(task)
         task.add_done_callback(self._receive_tasks.discard)
         task.add_done_callback(lambda done: self._on_background_task_done(done, label))
+
+    async def _run_receive_task(
+        self,
+        coro: Any,
+        lane: tuple[str, str],
+        predecessor: asyncio.Future[None] | None,
+        completion: asyncio.Future[None],
+    ) -> None:
+        try:
+            await coro
+        finally:
+            if predecessor is not None:
+                await predecessor
+            if not completion.done():
+                completion.set_result(None)
+            if self._receive_lane_tails.get(lane) is completion:
+                self._receive_lane_tails.pop(lane, None)
+
+    @staticmethod
+    async def _wait_for_receive_predecessor(
+        predecessor: asyncio.Future[None] | None,
+    ) -> None:
+        if predecessor is not None:
+            await predecessor
 
     async def _on_submit(self, msg: SubmitMessage) -> None:
         request_id = msg.request_id
@@ -341,7 +387,11 @@ class Stage:
         payload = msg.data  # StagePayload from coordinator
         await self._execute(payload)
 
-    async def _on_data_ready(self, msg: DataReadyMessage) -> None:
+    async def _on_data_ready(
+        self,
+        msg: DataReadyMessage,
+        predecessor: asyncio.Future[None] | None = None,
+    ) -> None:
         request_id = msg.request_id
         if request_id in self._aborted:
             await self._discard_payload_data(msg)
@@ -359,10 +409,12 @@ class Stage:
                     self.name,
                     request_id,
                 )
+                await self._wait_for_receive_predecessor(predecessor)
                 await self._send_failure(
                     request_id, f"direct IPC payload deserialize failed: {exc}"
                 )
                 return
+            await self._wait_for_receive_predecessor(predecessor)
             await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
             return
 
@@ -382,10 +434,12 @@ class Stage:
                 msg, data_ref, success=False, error=_error_text(exc)
             )
             relay.cleanup(request_id)
+            await self._wait_for_receive_predecessor(predecessor)
             await self._send_failure(request_id, f"relay read failed: {exc}")
             return
         await self._send_data_ack(msg, data_ref, success=True)
 
+        await self._wait_for_receive_predecessor(predecessor)
         await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
 
     async def receive_local_payload(
@@ -466,7 +520,11 @@ class Stage:
             )
             await self._execute(merged)
 
-    async def _on_stream_chunk(self, msg: DataReadyMessage) -> None:
+    async def _on_stream_chunk(
+        self,
+        msg: DataReadyMessage,
+        predecessor: asyncio.Future[None] | None = None,
+    ) -> None:
         request_id = msg.request_id
         if request_id in self._aborted:
             await self._discard_stream_chunk_data(msg)
@@ -485,8 +543,10 @@ class Stage:
                     request_id,
                     exc,
                 )
+                await self._wait_for_receive_predecessor(predecessor)
                 await self._queue_stream_error(request_id, msg.from_stage, exc)
                 return
+            await self._wait_for_receive_predecessor(predecessor)
             if request_id in self._aborted:
                 return
             item = StreamItem(
@@ -520,10 +580,12 @@ class Stage:
             await self._send_data_ack(
                 msg, data_ref, success=False, error=_error_text(exc)
             )
+            await self._wait_for_receive_predecessor(predecessor)
             await self._queue_stream_error(request_id, msg.from_stage, exc)
             return
         await self._send_data_ack(msg, data_ref, success=True)
 
+        await self._wait_for_receive_predecessor(predecessor)
         if request_id in self._aborted:
             return
 
@@ -674,7 +736,12 @@ class Stage:
             return
         await self._send_data_ack(msg, data_ref, success=True)
 
-    async def _on_stream_signal(self, msg: DataReadyMessage) -> None:
+    async def _on_stream_signal(
+        self,
+        msg: DataReadyMessage,
+        predecessor: asyncio.Future[None] | None = None,
+    ) -> None:
+        await self._wait_for_receive_predecessor(predecessor)
         await self._receive_stream_signal(
             msg.request_id,
             msg.from_stage,

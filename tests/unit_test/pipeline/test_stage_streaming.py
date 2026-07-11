@@ -495,6 +495,92 @@ def test_stage_stream_chunk_received_after_relay_materialization(monkeypatch) ->
     assert order == ["stream_chunk_read", "stage_stream_chunk_received", "routed"]
 
 
+def test_stage_commits_stream_messages_in_wire_order(monkeypatch) -> None:
+    async def _run() -> None:
+        chunk_zero_started = asyncio.Event()
+        chunk_one_started = asyncio.Event()
+        release_chunk_zero = asyncio.Event()
+
+        async def fake_read_stream_chunk(self, *, relay, data_ref):
+            del self, relay
+            chunk_id = int(data_ref.object_id.rsplit(":", 1)[1])
+            if chunk_id == 0:
+                chunk_zero_started.set()
+                await release_chunk_zero.wait()
+            else:
+                chunk_one_started.set()
+            return torch.tensor([chunk_id]), {"chunk_id": chunk_id}
+
+        monkeypatch.setattr(CommEngine, "read_stream_chunk", fake_read_stream_chunk)
+        control_plane = _FakeControlPlane()
+        scheduler = SimpleNamespace(
+            outbox=queue.Queue(),
+            inbox=queue.Queue(),
+            abort=lambda request_id: None,
+        )
+        relay = _FakeRelay()
+        stage = Stage(
+            name="receiver",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={"sender": "inproc://sender"},
+            control_plane=control_plane,
+            relay=relay,
+            scheduler=scheduler,
+            can_accept_stream_before_payload=True,
+        )
+        stage._stream_queue = StreamQueue(max_pending=16)
+        messages = []
+        for chunk_id in (0, 1):
+            data_ref, _ = await stage_io.write_stream_chunk(
+                relay,
+                request_id="req",
+                data=torch.tensor([chunk_id]),
+                target_stage="receiver",
+                from_stage="sender",
+                chunk_id=chunk_id,
+                transport=TransportKind.SHM,
+            )
+            messages.append(
+                DataReadyMessage(
+                    request_id="req",
+                    from_stage="sender",
+                    to_stage="receiver",
+                    data_ref=data_ref.to_dict(),
+                    chunk_id=chunk_id,
+                )
+            )
+        messages.append(
+            DataReadyMessage(
+                request_id="req",
+                from_stage="sender",
+                to_stage="receiver",
+                data_ref=None,
+                is_done=True,
+            )
+        )
+
+        for message in messages:
+            await stage._handle_message(message)
+        await chunk_zero_started.wait()
+        await chunk_one_started.wait()
+        assert scheduler.inbox.empty()
+
+        release_chunk_zero.set()
+        await asyncio.gather(*list(stage._receive_tasks))
+
+        received = [scheduler.inbox.get_nowait() for _ in range(3)]
+        assert [item.type for item in received] == [
+            "stream_chunk",
+            "stream_chunk",
+            "stream_done",
+        ]
+        assert [item.data.chunk_id for item in received[:2]] == [0, 1]
+
+    asyncio.run(_run())
+
+
 def test_stage_stream_error_fails_request_even_with_stream_queue() -> None:
     async def _run() -> None:
         control_plane = _FakeControlPlane()
