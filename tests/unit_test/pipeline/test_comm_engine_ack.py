@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import weakref
 from typing import Any
 
 import pytest
@@ -306,6 +308,53 @@ def test_comm_engine_caller_cancellation_does_not_cancel_owned_send() -> None:
 
         assert all(op.waited for op in relay.ops)
         assert not engine._pending
+        assert not engine._send_workers["receiver"].done()
+
+    asyncio.run(_run())
+
+
+def test_comm_engine_idle_worker_releases_completed_send_job() -> None:
+    async def _run() -> None:
+        relay = _AckedRelay()
+        control_plane = RecordingStageControlPlane()
+        engine = CommEngine(
+            CommRouter(
+                stage_name="sender",
+                gpu_id=None,
+                same_process_targets=set(),
+                gpu_stage_names=set(),
+                comm_config={"ack_timeout_s": 1.0},
+                injected_relay=relay,
+            )
+        )
+        tensor = torch.ones(2)
+        tensor_ref = weakref.ref(tensor)
+        payload = make_stage_payload(request_id="req", data={"x": tensor})
+        data_ref = await engine.send_payload(
+            relay=relay,
+            control_plane=control_plane,
+            request_id="req",
+            payload=payload,
+            transport=TransportKind.SHM,
+            from_stage="sender",
+            to_stage="receiver",
+            target_endpoint="inproc://receiver",
+        )
+        engine.ack_transfer(
+            DataAckMessage(
+                request_id="req",
+                from_stage="receiver",
+                to_stage="sender",
+                object_id=data_ref.object_id,
+            )
+        )
+        await _wait_until(lambda: data_ref.object_id not in engine._pending)
+
+        del tensor
+        del payload
+        gc.collect()
+
+        assert tensor_ref() is None
         assert not engine._send_workers["receiver"].done()
 
     asyncio.run(_run())

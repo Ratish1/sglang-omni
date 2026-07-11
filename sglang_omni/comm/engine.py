@@ -293,6 +293,7 @@ class CommEngine:
                     await self._run_stream_send(job, queue_key)
             finally:
                 queue.task_done()
+                del job
 
     async def _run_payload_send(self, job: _PayloadSendJob, queue_key: str) -> None:
         object_id: str | None = None
