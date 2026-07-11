@@ -43,6 +43,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from sglang_omni.comm import stage_io
 from sglang_omni.comm.data_ref import DataRef
 from sglang_omni.pipeline.control_plane import (
     ControlPlaneContext,
@@ -92,8 +93,22 @@ class CaseConfig:
         return "abort" in self.case
 
     @property
+    def is_dtype_suite(self) -> bool:
+        return self.case == "pooled-dtypes"
+
+    @property
+    def dtype_names(self) -> tuple[str, ...]:
+        return tuple(stage_io._BYTE_VIEW_DTYPES)
+
+    @property
+    def warmup_transfers_per_target(self) -> int:
+        multiplier = len(self.dtype_names) if self.is_dtype_suite else 1
+        return self.warmups * multiplier
+
+    @property
     def transfers_per_target(self) -> int:
-        return self.warmups + self.count
+        multiplier = len(self.dtype_names) if self.is_dtype_suite else 1
+        return (self.warmups + self.count) * multiplier
 
 
 @dataclass(frozen=True)
@@ -168,6 +183,18 @@ def _make_tensor(numel: int, device: torch.device, offset: int = 0) -> torch.Ten
     if offset:
         values.add_(offset)
     return values.remainder_(251).to(torch.uint8)
+
+
+def _make_dtype_tensor(
+    num_bytes: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if num_bytes % dtype.itemsize:
+        raise ValueError(
+            f"{num_bytes} bytes cannot represent a whole number of {dtype} values"
+        )
+    return _make_tensor(num_bytes, device).view(dtype)
 
 
 def _memory_snapshot(device: torch.device) -> dict[str, int]:
@@ -307,7 +334,9 @@ async def _sender_run(
         stage_gpu_ids=stage_gpu_ids,
     )
 
-    primary = _make_tensor(config.tensor_bytes, device)
+    primary = (
+        None if config.is_dtype_suite else _make_tensor(config.tensor_bytes, device)
+    )
     layer_hidden = (
         _make_tensor(config.metadata_bytes, device, offset=17)
         if config.is_stream
@@ -329,6 +358,7 @@ async def _sender_run(
     publication_ms: list[float] = []
     completed: set[tuple[str, int]] = set()
     payload = None
+    primary_for_send = None
     metadata = None
     sends: list[asyncio.Task] = []
     acks_received = 0
@@ -343,6 +373,14 @@ async def _sender_run(
             sends = []
             send_started: dict[tuple[str, int], int] = {}
             for sequence in range(batch_start, batch_stop):
+                primary_for_send = primary
+                if config.is_dtype_suite:
+                    dtype_name = config.dtype_names[sequence % len(config.dtype_names)]
+                    primary_for_send = _make_dtype_tensor(
+                        config.tensor_bytes,
+                        stage_io._BYTE_VIEW_DTYPES[dtype_name],
+                        device,
+                    )
                 for target in endpoints.receivers:
                     request_id = f"h200-{target}-{sequence}"
                     sent_ns = time.perf_counter_ns()
@@ -361,7 +399,7 @@ async def _sender_run(
                             asyncio.create_task(
                                 stage._send_stream_to_target(
                                     request_id,
-                                    primary,
+                                    primary_for_send,
                                     target,
                                     metadata,
                                 )
@@ -379,7 +417,7 @@ async def _sender_run(
                                 metadata={"sequence": sequence, "sent_ns": sent_ns},
                             ),
                             data={
-                                "primary": primary,
+                                "primary": primary_for_send,
                                 **(
                                     {"cpu_view": cpu_view}
                                     if cpu_view is not None
@@ -416,7 +454,9 @@ async def _sender_run(
             "role": "sender",
             "completed": len(completed),
             "publication": _latency_summary(
-                publication_ms[config.warmups * len(endpoints.receivers) :]
+                publication_ms[
+                    config.warmup_transfers_per_target * len(endpoints.receivers) :
+                ]
             ),
             "memory_before": before,
             "memory_peak": _memory_snapshot(device),
@@ -437,6 +477,7 @@ async def _sender_run(
         metadata = None
         sends.clear()
         primary = None
+        primary_for_send = None
         layer_hidden = None
         cpu_view = None
         cpu_base = None
@@ -524,6 +565,7 @@ async def _receiver_run(
     expected_layer = _sequence_checksum(config.metadata_bytes, offset=17)
     latencies_ms: list[float] = []
     wire_types: set[str] = set()
+    received_dtypes: set[str] = set()
     pool_refcounter_offsets: set[int] = set()
     control_bytes_sample = 0
     incoming = None
@@ -609,9 +651,19 @@ async def _receiver_run(
                 raise AssertionError(
                     f"{receiver_name} primary is on {primary.device}, expected {device}"
                 )
+            if config.is_dtype_suite:
+                expected_dtype = config.dtype_names[sequence % len(config.dtype_names)]
+                if str(primary.dtype) != expected_dtype:
+                    raise AssertionError(
+                        f"{receiver_name} got dtype {primary.dtype}, "
+                        f"expected {expected_dtype}"
+                    )
+                received_dtypes.add(str(primary.dtype))
             _nvtx_push(config.profile, "harness_checksum")
             try:
-                checksum = int(primary.sum(dtype=torch.int64).item())
+                checksum = int(
+                    primary.contiguous().view(torch.uint8).sum(dtype=torch.int64).item()
+                )
                 if layer_hidden is not None:
                     if layer_hidden.device != device:
                         raise AssertionError(
@@ -641,9 +693,9 @@ async def _receiver_run(
                     )
 
             received_ns = time.perf_counter_ns()
-            if sequence >= config.warmups:
+            if sequence >= config.warmup_transfers_per_target:
                 latencies_ms.append((received_ns - sent_ns) / 1_000_000.0)
-            if sequence == config.warmups:
+            if sequence == config.warmup_transfers_per_target:
                 # One post-latency sample records envelope size without adding a
                 # second msgpack pass to every measured transfer.
                 control_bytes_sample = len(serialize_message(msg))
@@ -663,6 +715,7 @@ async def _receiver_run(
         result = {
             "role": receiver_name,
             "wire_types": sorted(wire_types),
+            "dtypes": sorted(received_dtypes),
             "pool_refcounter_offsets": sorted(pool_refcounter_offsets),
             "control_bytes_sample": control_bytes_sample,
             "logical_bytes": logical_bytes,
@@ -994,6 +1047,7 @@ def parse_args() -> argparse.Namespace:
             "direct-stream-metadata",
             "direct-abort-payload",
             "direct-abort-stream",
+            "pooled-dtypes",
             "pooled-payload",
             "pooled-stream",
             "fanout",

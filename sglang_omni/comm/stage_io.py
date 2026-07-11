@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+import math
 import pickle
 from dataclasses import fields, is_dataclass
 from multiprocessing.reduction import ForkingPickler
@@ -23,20 +24,47 @@ from sglang_omni.comm.data_ref import (
 from sglang_omni.proto import DataReadyMessage, StagePayload
 from sglang_omni.relay.base import Relay
 
-_TORCH_DTYPES: dict[str, torch.dtype] = {
-    "torch.bool": torch.bool,
-    "torch.uint8": torch.uint8,
-    "torch.int8": torch.int8,
-    "torch.int16": torch.int16,
-    "torch.int32": torch.int32,
-    "torch.int64": torch.int64,
-    "torch.float16": torch.float16,
-    "torch.bfloat16": torch.bfloat16,
-    "torch.float32": torch.float32,
-    "torch.float64": torch.float64,
-    "torch.complex64": torch.complex64,
-    "torch.complex128": torch.complex128,
-}
+_BYTE_VIEW_DTYPE_NAMES = (
+    "bool",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "float8_e4m3fn",
+    "float8_e4m3fnuz",
+    "float8_e5m2",
+    "float8_e5m2fnuz",
+    "float8_e8m0fnu",
+    "float16",
+    "bfloat16",
+    "float32",
+    "float64",
+    "complex64",
+    "complex128",
+)
+
+
+def _build_byte_view_dtypes() -> dict[str, torch.dtype]:
+    supported: dict[str, torch.dtype] = {}
+    for name in _BYTE_VIEW_DTYPE_NAMES:
+        dtype = getattr(torch, name, None)
+        if not isinstance(dtype, torch.dtype):
+            continue
+        try:
+            sample = torch.empty(1, dtype=dtype)
+            restored = sample.view(torch.uint8).view(dtype)
+        except (RuntimeError, TypeError):
+            continue
+        if restored.shape == sample.shape:
+            supported[str(dtype)] = dtype
+    return supported
+
+
+_BYTE_VIEW_DTYPES = _build_byte_view_dtypes()
 
 _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE = "TorchCudaIpcStreamChunk"
 _DIRECT_CUDA_IPC_PAYLOAD_TYPE = "TorchCudaIpcPayload"
@@ -347,16 +375,25 @@ async def read_payload(
     if data_ref.header is None:
         raise ValueError("stage_payload data_ref is missing header")
     header = pickle.loads(base64.b64decode(data_ref.header))
+    tensor_specs = []
+    for entry in data_ref.tensors:
+        dtype = _validate_tensor_region(
+            shape=entry.shape,
+            dtype_str=entry.dtype,
+            offset=entry.offset,
+            size=entry.size,
+            buffer_length=data_ref.buffer.length,
+            label=f"payload tensor {entry.path!r}",
+        )
+        tensor_specs.append((entry, dtype))
     transfer_buf = await _read_transfer_buffer(relay, request_id, data_ref)
-    tensors = {
-        entry.path: _restore_tensor_device(
-            transfer_buf[entry.offset : entry.offset + entry.size]
-            .view(_torch_dtype(entry.dtype))
-            .reshape(entry.shape),
+    tensors = {}
+    for entry, dtype in tensor_specs:
+        tensor = transfer_buf[entry.offset : entry.offset + entry.size]
+        tensors[entry.path] = _restore_tensor_device(
+            tensor.view(dtype).reshape(entry.shape),
             entry.device,
         )
-        for entry in data_ref.tensors
-    }
     relay.cleanup(request_id)
     return StagePayload(
         request_id=header.request_id,
@@ -381,11 +418,19 @@ async def write_tensor(
         raise TypeError(
             f"write_tensor requires torch.Tensor, got {type(tensor).__name__}"
         )
+    shape, dtype_str, _, logical_bytes, alignment = _tensor_byte_spec(
+        tensor,
+        label="tensor",
+    )
     packed = tensor.contiguous().view(torch.uint8).reshape(-1)
+    if packed.numel() != logical_bytes:
+        raise ValueError(
+            f"tensor byte view has {packed.numel()} bytes, expected {logical_bytes}"
+        )
     target_device = torch.device(relay_device(relay))
     if packed.device != target_device:
         packed = packed.to(device=target_device)
-    offset = _pad_offset(0, _dtype_alignment(tensor.dtype))
+    offset = _pad_offset(0, alignment)
     if offset:
         packed = torch.cat(
             [torch.zeros(offset, dtype=torch.uint8, device=target_device), packed]
@@ -406,8 +451,8 @@ async def write_tensor(
                 transport=transport,
                 relay_info=op.metadata,
             ),
-            shape=tuple(int(dim) for dim in tensor.shape),
-            dtype=str(tensor.dtype),
+            shape=shape,
+            dtype=dtype_str,
             offset=offset,
         ),
         op,
@@ -426,12 +471,16 @@ async def read_tensor(
         raise ValueError("raw tensor data_ref is missing dtype")
     if data_ref.offset is None:
         raise ValueError("raw tensor data_ref is missing offset")
-    transfer_buf = await _read_transfer_buffer(relay, data_ref.object_id, data_ref)
-    return (
-        transfer_buf[data_ref.offset :]
-        .view(_torch_dtype(data_ref.dtype))
-        .reshape(data_ref.shape)
+    dtype = _validate_tensor_region(
+        shape=data_ref.shape,
+        dtype_str=data_ref.dtype,
+        offset=data_ref.offset,
+        size=data_ref.buffer.length - data_ref.offset,
+        buffer_length=data_ref.buffer.length,
+        label="raw tensor",
     )
+    transfer_buf = await _read_transfer_buffer(relay, data_ref.object_id, data_ref)
+    return transfer_buf[data_ref.offset :].view(dtype).reshape(data_ref.shape)
 
 
 async def write_stream_chunk(
@@ -554,12 +603,22 @@ def _pack_tensors(
     device: str,
 ) -> tuple[torch.Tensor, list[TensorMeta]]:
     target_device = torch.device(device)
+    specs = {
+        path: _tensor_byte_spec(tensor, label=f"tensor {path!r}")
+        for path, tensor in tensors.items()
+    }
     entries, chunks, offset = [], [], 0
     for path, tensor in tensors.items():
+        shape, dtype_str, source_device, logical_bytes, alignment = specs[path]
         flat = tensor.contiguous().view(torch.uint8).reshape(-1)
+        if flat.numel() != logical_bytes:
+            raise ValueError(
+                f"tensor {path!r} byte view has {flat.numel()} bytes, "
+                f"expected {logical_bytes}"
+            )
         if flat.device != target_device:
             flat = flat.to(device=target_device)
-        padding = _pad_offset(offset, _dtype_alignment(tensor.dtype))
+        padding = _pad_offset(offset, alignment)
         if padding:
             chunks.append(torch.zeros(padding, dtype=torch.uint8, device=target_device))
             offset += padding
@@ -567,11 +626,11 @@ def _pack_tensors(
         entries.append(
             TensorMeta(
                 path=path,
-                shape=tuple(int(dim) for dim in tensor.shape),
-                dtype=str(tensor.dtype),
-                device=str(tensor.device),
+                shape=shape,
+                dtype=dtype_str,
+                device=source_device,
                 offset=offset,
-                size=int(flat.numel()),
+                size=logical_bytes,
             )
         )
         offset += int(flat.numel())
@@ -599,8 +658,46 @@ async def _read_transfer_buffer(
     return buf
 
 
-def _dtype_alignment(dtype: torch.dtype) -> int:
-    return max(torch.empty((), dtype=dtype).element_size(), 1)
+def _tensor_byte_spec(
+    tensor: torch.Tensor,
+    *,
+    label: str,
+) -> tuple[tuple[int, ...], str, str, int, int]:
+    if tensor.layout is not torch.strided:
+        raise ValueError(f"{label} must have strided layout, got {tensor.layout}")
+    dtype_str = str(tensor.dtype)
+    dtype = _torch_dtype(dtype_str)
+    shape = tuple(int(dim) for dim in tensor.shape)
+    numel = int(tensor.numel())
+    if numel != math.prod(shape):
+        raise ValueError(f"{label} numel {numel} does not match shape {shape}")
+    alignment = max(dtype.itemsize, 1)
+    logical_bytes = numel * alignment
+    return shape, dtype_str, str(tensor.device), logical_bytes, alignment
+
+
+def _validate_tensor_region(
+    *,
+    shape: tuple[int, ...],
+    dtype_str: str,
+    offset: int,
+    size: int,
+    buffer_length: int,
+    label: str,
+) -> torch.dtype:
+    dtype = _torch_dtype(dtype_str)
+    alignment = max(dtype.itemsize, 1)
+    expected_size = math.prod(shape) * alignment
+    if size != expected_size:
+        raise ValueError(f"{label} has {size} bytes, expected {expected_size}")
+    if offset < 0 or offset % alignment:
+        raise ValueError(f"{label} offset {offset} is not aligned to {alignment} bytes")
+    if offset + size > buffer_length:
+        raise ValueError(
+            f"{label} byte range [{offset}, {offset + size}) exceeds "
+            f"buffer length {buffer_length}"
+        )
+    return dtype
 
 
 def _pad_offset(offset: int, alignment: int) -> int:
@@ -608,7 +705,7 @@ def _pad_offset(offset: int, alignment: int) -> int:
 
 
 def _torch_dtype(dtype_str: str) -> torch.dtype:
-    dtype = _TORCH_DTYPES.get(dtype_str)
+    dtype = _BYTE_VIEW_DTYPES.get(dtype_str)
     if dtype is None:
         raise ValueError(f"unsupported tensor dtype metadata: {dtype_str!r}")
     return dtype

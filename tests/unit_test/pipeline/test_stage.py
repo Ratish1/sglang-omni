@@ -298,6 +298,40 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
     asyncio.run(_run())
 
 
+def test_byte_transport_validates_dense_dtypes_before_publication() -> None:
+    async def _run() -> None:
+        relay = FakeRelay()
+
+        for index, dtype in enumerate(stage_io._BYTE_VIEW_DTYPES.values()):
+            source_bytes = torch.arange(3 * dtype.itemsize, dtype=torch.uint8)
+            source = source_bytes.view(dtype)
+            data_ref, _ = await stage_io.write_tensor(
+                relay,
+                f"dtype-{index}",
+                source,
+                transport=TransportKind.SHM,
+            )
+            restored = await stage_io.read_tensor(relay, data_ref)
+
+            assert restored.shape == source.shape
+            assert restored.dtype == dtype
+            assert restored.device.type == "cpu"
+            assert torch.equal(restored.view(torch.uint8), source_bytes)
+
+        published = len(relay.storage)
+        sparse = torch.tensor([1.0]).to_sparse()
+        with pytest.raises(ValueError, match="must have strided layout"):
+            await stage_io.write_tensor(
+                relay,
+                "unsupported-sparse",
+                sparse,
+                transport=TransportKind.SHM,
+            )
+        assert len(relay.storage) == published
+
+    asyncio.run(_run())
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_payload_round_trip_preserves_cpu_tensor_devices() -> None:
     async def _run() -> None:

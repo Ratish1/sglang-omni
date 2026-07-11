@@ -54,6 +54,7 @@ case "${MODE}" in
             --header-bytes 131072 --cpu-view-backing-bytes 4000000 || failures=1
         run_case direct-abort-payload 0 1 100 || failures=1
         run_case direct-abort-stream 0 1 100 || failures=1
+        run_case pooled-dtypes 1 1 1 --warmups 0 || failures=1
         run_case pooled-payload 1 1 20 || failures=1
         run_case pooled-stream 1 1 20 || failures=1
         run_case fanout 1,1 1 20 || failures=1
