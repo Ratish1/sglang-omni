@@ -40,7 +40,6 @@ _TORCH_DTYPES: dict[str, torch.dtype] = {
 
 _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE = "TorchCudaIpcStreamChunk"
 _DIRECT_CUDA_IPC_PAYLOAD_TYPE = "TorchCudaIpcPayload"
-_IPC_INLINE_CPU_BYTES_LIMIT = 64 * 1024
 
 
 def relay_device(relay: Relay) -> str:
@@ -79,8 +78,12 @@ def extract_tensors(obj: Any, path: str = "") -> tuple[Any, dict[str, torch.Tens
 
 
 def extract_cuda_tensors(
-    obj: Any, path: str = ""
+    obj: Any,
+    path: str = "",
+    _cpu_tensor_memo: dict[int, torch.Tensor] | None = None,
 ) -> tuple[Any, dict[str, torch.Tensor]]:
+    if _cpu_tensor_memo is None:
+        _cpu_tensor_memo = {}
     if isinstance(obj, torch.Tensor):
         if obj.is_cuda:
             return {
@@ -89,18 +92,31 @@ def extract_cuda_tensors(
                 "dtype": str(obj.dtype),
                 "device": str(obj.device),
             }, {path: obj}
-        return obj, {}
+        tensor_id = id(obj)
+        compact = _cpu_tensor_memo.get(tensor_id)
+        if compact is None:
+            compact = _compact_cpu_tensor_for_pickle(obj)
+            _cpu_tensor_memo[tensor_id] = compact
+        return compact, {}
     if isinstance(obj, dict):
         out, tensors = {}, {}
         for key, value in obj.items():
             child_path = f"{path}.{key}" if path else key
-            out[key], child_tensors = extract_cuda_tensors(value, child_path)
+            out[key], child_tensors = extract_cuda_tensors(
+                value,
+                child_path,
+                _cpu_tensor_memo,
+            )
             tensors.update(child_tensors)
         return out, tensors
     if isinstance(obj, (list, tuple)):
         out, tensors = [], {}
         for idx, value in enumerate(obj):
-            child, child_tensors = extract_cuda_tensors(value, f"{path}[{idx}]")
+            child, child_tensors = extract_cuda_tensors(
+                value,
+                f"{path}[{idx}]",
+                _cpu_tensor_memo,
+            )
             out.append(child)
             tensors.update(child_tensors)
         return type(obj)(out), tensors
@@ -123,12 +139,8 @@ def restore_tensors(obj: Any, tensors: dict[str, torch.Tensor]) -> Any:
 def should_use_direct_cuda_ipc_stream_chunk(
     data: Any, metadata: dict[str, Any] | None
 ) -> bool:
-    if not _contains_cuda_tensor(data):
-        return False
-    if _contains_cpu_tensor(data) or _contains_cpu_tensor(metadata):
-        return False
-    inline_size = _inline_cpu_pickle_size(data) + _inline_cpu_pickle_size(metadata)
-    return inline_size <= _IPC_INLINE_CPU_BYTES_LIMIT
+    del metadata
+    return _contains_cuda_tensor(data)
 
 
 def payload_has_cuda_tensor(payload: Any) -> bool:
@@ -141,7 +153,7 @@ def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
             f"direct CUDA IPC payload requires StagePayload, got "
             f"{type(payload).__name__}"
         )
-    if _contains_cuda_tensor(payload.request) or _contains_cpu_tensor(payload.request):
+    if _contains_tensor(payload.request):
         raise ValueError("direct CUDA IPC payload does not support request tensors")
     data_without_tensors, tensors = extract_cuda_tensors(payload.data)
     if not tensors:
@@ -152,11 +164,6 @@ def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
         data=data_without_tensors,
     )
     header_bytes = pickle.dumps(header)
-    if len(header_bytes) > _IPC_INLINE_CPU_BYTES_LIMIT:
-        raise ValueError(
-            "direct CUDA IPC payload header exceeds inline limit: "
-            f"{len(header_bytes)} > {_IPC_INLINE_CPU_BYTES_LIMIT} bytes"
-        )
     return {
         "_type": _DIRECT_CUDA_IPC_PAYLOAD_TYPE,
         "version": 1,
@@ -635,7 +642,7 @@ def _contains_cuda_tensor(obj: Any, seen: set[int] | None = None) -> bool:
     return False
 
 
-def _contains_cpu_tensor(obj: Any, seen: set[int] | None = None) -> bool:
+def _contains_tensor(obj: Any, seen: set[int] | None = None) -> bool:
     if obj is None:
         return False
     seen = set() if seen is None else seen
@@ -644,49 +651,31 @@ def _contains_cpu_tensor(obj: Any, seen: set[int] | None = None) -> bool:
         return False
     seen.add(obj_id)
     if isinstance(obj, torch.Tensor):
-        return not obj.is_cuda
+        return True
     if isinstance(obj, dict):
-        return any(_contains_cpu_tensor(value, seen) for value in obj.values())
+        return any(_contains_tensor(value, seen) for value in obj.values())
     if isinstance(obj, (list, tuple, set, frozenset)):
-        return any(_contains_cpu_tensor(value, seen) for value in obj)
+        return any(_contains_tensor(value, seen) for value in obj)
     if is_dataclass(obj) and not isinstance(obj, type):
         return any(
-            _contains_cpu_tensor(getattr(obj, field.name), seen)
-            for field in fields(obj)
+            _contains_tensor(getattr(obj, field.name), seen) for field in fields(obj)
         )
     return False
 
 
-def _inline_cpu_pickle_size(obj: Any, seen: set[int] | None = None) -> int:
-    if obj is None:
-        return 0
-    seen = set() if seen is None else seen
-    obj_id = id(obj)
-    if obj_id in seen:
-        return 0
-    seen.add(obj_id)
-    if isinstance(obj, torch.Tensor):
-        return 0 if obj.is_cuda else _IPC_INLINE_CPU_BYTES_LIMIT + 1
-    if isinstance(obj, dict):
-        return sum(
-            _inline_cpu_pickle_size(key, seen) + _inline_cpu_pickle_size(value, seen)
-            for key, value in obj.items()
-        )
-    if isinstance(obj, (list, tuple, set, frozenset)):
-        return sum(_inline_cpu_pickle_size(value, seen) for value in obj)
-    if is_dataclass(obj) and not isinstance(obj, type):
-        return sum(
-            _inline_cpu_pickle_size(getattr(obj, field.name), seen)
-            for field in fields(obj)
-        )
-    try:
-        return len(pickle.dumps(obj))
-    except Exception:
-        return _IPC_INLINE_CPU_BYTES_LIMIT + 1
+def _compact_cpu_tensor_for_pickle(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.layout is not torch.strided:
+        return tensor
+    logical_bytes = tensor.numel() * tensor.element_size()
+    if tensor.untyped_storage().nbytes() <= logical_bytes:
+        return tensor
+    return tensor.detach().clone(memory_format=torch.contiguous_format)
 
 
 def _ipc_pickle(obj: Any) -> bytes:
     if not _contains_cuda_tensor(obj):
+        if isinstance(obj, torch.Tensor) and not obj.is_cuda:
+            obj = _compact_cpu_tensor_for_pickle(obj)
         return pickle.dumps(obj)
     buf = io.BytesIO()
     ForkingPickler(buf, 2).dump(obj)

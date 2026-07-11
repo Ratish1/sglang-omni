@@ -1121,6 +1121,35 @@ def test_direct_cuda_ipc_payload_preserves_inline_cpu_tensors() -> None:
     assert [entry["path"] for entry in ref["tensors"]] == ["gpu"]
 
 
+def test_direct_inline_cpu_metadata_is_compact_and_unbounded(monkeypatch) -> None:
+    data = object()
+    base = torch.arange(1_000_000, dtype=torch.float32)
+    view = base[:1]
+    transcript = "x" * (128 * 1024)
+    monkeypatch.setattr(
+        stage_io,
+        "_contains_cuda_tensor",
+        lambda value, seen=None: value is data,
+    )
+
+    ref = stage_io.serialize_direct_cuda_ipc_stream_chunk(
+        data,
+        {"view": view, "transcript": transcript},
+    )
+    _, metadata = stage_io.deserialize_direct_cuda_ipc_stream_chunk(ref)
+    payload_header, tensors = stage_io.extract_cuda_tensors(
+        {"first": view, "again": view}
+    )
+
+    assert metadata is not None
+    assert metadata["transcript"] == transcript
+    assert torch.equal(metadata["view"], view)
+    assert metadata["view"].untyped_storage().nbytes() == view.element_size()
+    assert tensors == {}
+    assert payload_header["first"] is payload_header["again"]
+    assert payload_header["first"].untyped_storage().nbytes() == view.element_size()
+
+
 def test_direct_cuda_ipc_payload_rejects_cpu_only_payloads() -> None:
     payload = make_stage_payload(data={"x": torch.ones(1)})
 

@@ -70,6 +70,8 @@ class CaseConfig:
     dst_gpus: tuple[int, ...]
     tensor_bytes: int
     metadata_bytes: int
+    header_bytes: int
+    cpu_view_backing_bytes: int
     warmups: int
     count: int
     window: int
@@ -79,7 +81,7 @@ class CaseConfig:
 
     @property
     def is_stream(self) -> bool:
-        return self.case.endswith("stream")
+        return "stream" in self.case
 
     @property
     def is_direct(self) -> bool:
@@ -307,6 +309,12 @@ async def _sender_run(
         if config.is_stream
         else None
     )
+    cpu_base = (
+        torch.arange(config.cpu_view_backing_bytes, dtype=torch.uint8)
+        if config.cpu_view_backing_bytes
+        else None
+    )
+    cpu_view = cpu_base[:1] if cpu_base is not None else None
     total_messages = config.transfers_per_target * len(endpoints.receivers)
     ack_task = None
     if not config.is_direct:
@@ -341,6 +349,10 @@ async def _sender_run(
                             "sent_ns": sent_ns,
                             "layer_hidden": layer_hidden,
                         }
+                        if config.header_bytes:
+                            metadata["transcript"] = "x" * config.header_bytes
+                        if cpu_view is not None:
+                            metadata["cpu_view"] = cpu_view
                         sends.append(
                             asyncio.create_task(
                                 stage._send_stream_to_target(
@@ -355,10 +367,21 @@ async def _sender_run(
                         payload = StagePayload(
                             request_id=request_id,
                             request=OmniRequest(
-                                inputs="h200-stage-transport",
+                                inputs=(
+                                    "x" * config.header_bytes
+                                    if config.header_bytes
+                                    else "h200-stage-transport"
+                                ),
                                 metadata={"sequence": sequence, "sent_ns": sent_ns},
                             ),
-                            data={"primary": primary},
+                            data={
+                                "primary": primary,
+                                **(
+                                    {"cpu_view": cpu_view}
+                                    if cpu_view is not None
+                                    else {}
+                                ),
+                            },
                         )
                         sends.append(
                             asyncio.create_task(
@@ -411,6 +434,8 @@ async def _sender_run(
         sends.clear()
         primary = None
         layer_hidden = None
+        cpu_view = None
+        cpu_base = None
         stage = None
         relay = None
         gc.collect()
@@ -504,6 +529,7 @@ async def _receiver_run(
     payload = None
     primary = None
     stream_item = None
+    cpu_view = None
     result: dict[str, Any] | None = None
     _nvtx_push(config.profile, f"comm_case:{config.case}:{receiver_name}")
     try:
@@ -535,6 +561,12 @@ async def _receiver_run(
                 received_sequence = int(metadata["token_id"])
                 sent_ns = int(metadata["sent_ns"])
                 layer_hidden = metadata["layer_hidden"]
+                cpu_view = metadata.get("cpu_view")
+                if (
+                    config.header_bytes
+                    and len(metadata["transcript"]) != config.header_bytes
+                ):
+                    raise AssertionError("stream transcript length changed in transit")
             else:
                 await stage._on_data_ready(msg)
                 incoming = scheduler.inbox.get(timeout=config.timeout_s)
@@ -543,6 +575,14 @@ async def _receiver_run(
                 received_sequence = int(payload.request.metadata["sequence"])
                 sent_ns = int(payload.request.metadata["sent_ns"])
                 layer_hidden = None
+                cpu_view = payload.data.get("cpu_view")
+                expected_input_bytes = (
+                    config.header_bytes
+                    if config.header_bytes
+                    else len("h200-stage-transport")
+                )
+                if len(payload.request.inputs) != expected_input_bytes:
+                    raise AssertionError("payload header length changed in transit")
 
             if received_sequence != sequence:
                 raise AssertionError(
@@ -571,6 +611,17 @@ async def _receiver_run(
                 raise AssertionError(
                     f"{receiver_name} checksum {checksum} != expected {expected}"
                 )
+            if cpu_view is not None:
+                if cpu_view.device.type != "cpu":
+                    raise AssertionError(
+                        f"{receiver_name} CPU view reconstructed on {cpu_view.device}"
+                    )
+                if int(cpu_view.item()) != 0:
+                    raise AssertionError("CPU view value changed in transit")
+                if cpu_view.untyped_storage().nbytes() != cpu_view.element_size():
+                    raise AssertionError(
+                        "CPU view retained a larger-than-logical backing storage"
+                    )
 
             received_ns = time.perf_counter_ns()
             if sequence >= config.warmups:
@@ -585,6 +636,7 @@ async def _receiver_run(
             metadata = None
             payload = None
             stream_item = None
+            cpu_view = None
             msg = None
             completion_q.put((receiver_name, sequence))
         latency = _latency_summary(latencies_ms)
@@ -617,6 +669,7 @@ async def _receiver_run(
         payload = None
         primary = None
         stream_item = None
+        cpu_view = None
         stage = None
         relay = None
         gc.collect()
@@ -754,10 +807,11 @@ def _validate_transport_contract(
 
     transfers_per_target = config.transfers_per_target
     total_transfers = transfers_per_target * len(config.dst_gpus)
-    expected_wire = {
-        "direct-payload": "TorchCudaIpcPayload",
-        "direct-stream": "TorchCudaIpcStreamChunk",
-    }.get(config.case)
+    expected_wire = None
+    if config.is_direct:
+        expected_wire = (
+            "TorchCudaIpcStreamChunk" if config.is_stream else "TorchCudaIpcPayload"
+        )
     expected_relay_calls = 0 if config.is_direct else total_transfers
     if sender["relay_put_calls"] != expected_relay_calls:
         errors.append(
@@ -919,6 +973,8 @@ def parse_args() -> argparse.Namespace:
         choices=(
             "direct-payload",
             "direct-stream",
+            "direct-payload-metadata",
+            "direct-stream-metadata",
             "pooled-payload",
             "pooled-stream",
             "fanout",
@@ -928,6 +984,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dst-gpus", type=_parse_gpu_list, default=(0,))
     parser.add_argument("--tensor-bytes", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--metadata-bytes", type=int, default=16 * 1024)
+    parser.add_argument("--header-bytes", type=int, default=0)
+    parser.add_argument("--cpu-view-backing-bytes", type=int, default=0)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--count", type=int, default=10)
     parser.add_argument("--window", type=int, default=1)
@@ -945,6 +1003,8 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.warmups < 0:
         parser.error("--warmups must be non-negative")
+    if args.header_bytes < 0 or args.cpu_view_backing_bytes < 0:
+        parser.error("metadata boundary sizes must be non-negative")
     return args
 
 
@@ -956,6 +1016,8 @@ def main() -> int:
         dst_gpus=args.dst_gpus,
         tensor_bytes=args.tensor_bytes,
         metadata_bytes=args.metadata_bytes,
+        header_bytes=args.header_bytes,
+        cpu_view_backing_bytes=args.cpu_view_backing_bytes,
         warmups=args.warmups,
         count=args.count,
         window=args.window,

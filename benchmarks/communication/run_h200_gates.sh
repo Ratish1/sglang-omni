@@ -48,6 +48,10 @@ case "${MODE}" in
         failures=0
         run_case direct-payload 0 1 20 || failures=1
         run_case direct-stream 0 1 20 || failures=1
+        run_case direct-payload-metadata 0 1 20 \
+            --header-bytes 131072 --cpu-view-backing-bytes 4000000 || failures=1
+        run_case direct-stream-metadata 0 1 20 \
+            --header-bytes 131072 --cpu-view-backing-bytes 4000000 || failures=1
         run_case pooled-payload 1 1 20 || failures=1
         run_case pooled-stream 1 1 20 || failures=1
         run_case fanout 1,1 1 20 || failures=1
