@@ -160,7 +160,7 @@ class CommEngine:
             queue_key=to_stage,
             elapsed_ms=round(_comm_elapsed_ms(enqueue_start), 6),
         )
-        return await ready
+        return await asyncio.shield(ready)
 
     async def read_payload(
         self,
@@ -216,7 +216,7 @@ class CommEngine:
             queue_key=target_stage,
             elapsed_ms=round(_comm_elapsed_ms(enqueue_start), 6),
         )
-        _ = await ready
+        _ = await asyncio.shield(ready)
 
     async def read_stream_chunk(
         self,
@@ -338,7 +338,8 @@ class CommEngine:
                 control_send_ms=round(control_ms, 6),
                 elapsed_ms=round(_comm_elapsed_ms(send_start), 6),
             )
-            job.ready.set_result(data_ref)
+            if not job.ready.done():
+                job.ready.set_result(data_ref)
         except Exception as exc:
             if object_id is not None:
                 self._fail_pending(object_id, exc)
@@ -395,7 +396,8 @@ class CommEngine:
                 control_send_ms=round(control_ms, 6),
                 elapsed_ms=round(_comm_elapsed_ms(send_start), 6),
             )
-            job.ready.set_result(data_ref)
+            if not job.ready.done():
+                job.ready.set_result(data_ref)
         except Exception as exc:
             if object_id is not None:
                 self._fail_pending(object_id, exc)

@@ -225,6 +225,92 @@ def test_comm_engine_starts_ack_timeout_after_publication() -> None:
     asyncio.run(_run())
 
 
+def test_comm_engine_caller_cancellation_does_not_cancel_owned_send() -> None:
+    async def _run() -> None:
+        relay = _AckedRelay()
+        engine = CommEngine(
+            CommRouter(
+                stage_name="sender",
+                gpu_id=None,
+                same_process_targets=set(),
+                gpu_stage_names=set(),
+                comm_config={"ack_timeout_s": 1.0},
+                injected_relay=relay,
+            )
+        )
+
+        payload_control = _BlockedControlPlane()
+        payload_send = asyncio.create_task(
+            engine.send_payload(
+                relay=relay,
+                control_plane=payload_control,
+                request_id="payload",
+                payload=make_stage_payload(
+                    request_id="payload",
+                    data={"x": torch.ones(2)},
+                ),
+                transport=TransportKind.SHM,
+                from_stage="sender",
+                to_stage="receiver",
+                target_endpoint="inproc://receiver",
+            )
+        )
+        await payload_control.entered.wait()
+        payload_send.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await payload_send
+        payload_control.release.set()
+        await _wait_until(lambda: bool(payload_control.sent_to_stage))
+        payload_ref = DataRef.from_dict(payload_control.sent_to_stage[0][2].data_ref)
+        engine.ack_transfer(
+            DataAckMessage(
+                request_id="payload",
+                from_stage="receiver",
+                to_stage="sender",
+                object_id=payload_ref.object_id,
+            )
+        )
+        await _wait_until(lambda: payload_ref.object_id not in engine._pending)
+
+        stream_control = _BlockedControlPlane()
+        stream_send = asyncio.create_task(
+            engine.send_stream_chunk(
+                relay=relay,
+                control_plane=stream_control,
+                request_id="stream",
+                data=torch.arange(4),
+                target_stage="receiver",
+                target_endpoint="inproc://receiver",
+                from_stage="sender",
+                chunk_id=0,
+                metadata={"token_id": 1},
+                transport=TransportKind.SHM,
+            )
+        )
+        await stream_control.entered.wait()
+        stream_send.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stream_send
+        stream_control.release.set()
+        await _wait_until(lambda: bool(stream_control.sent_to_stage))
+        stream_ref = DataRef.from_dict(stream_control.sent_to_stage[0][2].data_ref)
+        engine.ack_transfer(
+            DataAckMessage(
+                request_id="stream",
+                from_stage="receiver",
+                to_stage="sender",
+                object_id=stream_ref.object_id,
+            )
+        )
+        await _wait_until(lambda: stream_ref.object_id not in engine._pending)
+
+        assert all(op.waited for op in relay.ops)
+        assert not engine._pending
+        assert not engine._send_workers["receiver"].done()
+
+    asyncio.run(_run())
+
+
 def test_comm_engine_ignores_unknown_data_ack() -> None:
     engine = CommEngine(
         CommRouter(
