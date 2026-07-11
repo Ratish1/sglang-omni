@@ -149,27 +149,45 @@ def test_contiguous_slot_allocator_rejects_double_release() -> None:
     asyncio.run(run())
 
 
-def _sender(src_gpu: int, meta_q: mp.Queue, done_q: mp.Queue) -> None:
-    torch.cuda.set_device(src_gpu)
-    relay = CudaIpcRelay(
-        engine_id="sender",
-        device=f"cuda:{src_gpu}",
-        slot_size_mb=2,
-    )
-    buf = _expected(_N).to(f"cuda:{src_gpu}")
+def _sender(
+    src_gpu: int,
+    meta_q: mp.Queue,
+    ack_q: mp.Queue,
+    result_q: mp.Queue,
+) -> None:
+    relay = None
+    try:
+        torch.cuda.set_device(src_gpu)
+        relay = CudaIpcRelay(
+            engine_id="sender",
+            device=f"cuda:{src_gpu}",
+            slot_size_mb=2,
+        )
+        buf = _expected(_N).to(f"cuda:{src_gpu}")
 
-    async def run() -> None:
-        op = await relay.put_async(buf, request_id="r")
-        meta_q.put(op.metadata)
-        await op.wait_for_completion()
+        async def run() -> None:
+            op = await relay.put_async(buf, request_id="r")
+            meta_q.put(op.metadata)
+            ack_status, ack_value = ack_q.get(timeout=60)
+            if ack_status == "ok":
+                op.mark_receiver_done()
+            else:
+                op.mark_receiver_failed(RuntimeError(ack_value))
+            await op.wait_for_completion()
 
-    asyncio.run(run())
-    done_q.get(timeout=60)  # keep the source buffer alive until the receiver copies
+        asyncio.run(run())
+        result_q.put(("sender", "ok", True))
+    except Exception as exc:
+        result_q.put(("sender", "err", repr(exc)))
+    finally:
+        if relay is not None:
+            relay.close()
 
 
 def _receiver(
-    dst_gpu: int, meta_q: mp.Queue, done_q: mp.Queue, result_q: mp.Queue
+    dst_gpu: int, meta_q: mp.Queue, ack_q: mp.Queue, result_q: mp.Queue
 ) -> None:
+    relay = None
     try:
         torch.cuda.set_device(dst_gpu)
         relay = CudaIpcRelay(engine_id="receiver", device=f"cuda:{dst_gpu}")
@@ -184,30 +202,47 @@ def _receiver(
 
         dest = asyncio.run(run())
         expected = _expected(_N).to(f"cuda:{dst_gpu}")
-        result_q.put(("ok", bool(torch.equal(dest, expected))))
+        matches = bool(torch.equal(dest, expected))
+        if not matches:
+            raise AssertionError("received CUDA IPC bytes do not match the source")
+        ack_q.put(("ok", None))
+        result_q.put(("receiver", "ok", True))
     except Exception as exc:
-        result_q.put(("err", repr(exc)))
+        error = repr(exc)
+        ack_q.put(("err", error))
+        result_q.put(("receiver", "err", error))
     finally:
-        done_q.put(True)
+        if relay is not None:
+            relay.close()
 
 
 def _run_case(src_gpu: int, dst_gpu: int) -> None:
     ctx = mp.get_context("spawn")
-    meta_q, done_q, result_q = ctx.Queue(), ctx.Queue(), ctx.Queue()
-    sender = ctx.Process(target=_sender, args=(src_gpu, meta_q, done_q))
-    receiver = ctx.Process(target=_receiver, args=(dst_gpu, meta_q, done_q, result_q))
+    meta_q, ack_q, result_q = ctx.Queue(), ctx.Queue(), ctx.Queue()
+    sender = ctx.Process(target=_sender, args=(src_gpu, meta_q, ack_q, result_q))
+    receiver = ctx.Process(target=_receiver, args=(dst_gpu, meta_q, ack_q, result_q))
     sender.start()
     receiver.start()
+    results = {}
     try:
-        status, value = result_q.get(timeout=120)
+        for _ in range(2):
+            process, status, value = result_q.get(timeout=120)
+            results[process] = (status, value)
     finally:
         sender.join(timeout=30)
         receiver.join(timeout=30)
         for proc in (sender, receiver):
             if proc.is_alive():
                 proc.terminate()
-    assert status == "ok", value
-    assert value is True
+                proc.join(timeout=30)
+
+    assert sender.exitcode == 0
+    assert receiver.exitcode == 0
+    assert results.keys() == {"sender", "receiver"}
+    for process in ("sender", "receiver"):
+        status, value = results[process]
+        assert status == "ok", value
+        assert value is True
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
