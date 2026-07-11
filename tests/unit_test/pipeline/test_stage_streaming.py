@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -683,6 +684,84 @@ def test_stage_drains_relay_payload_for_already_aborted_request() -> None:
         assert relay.gets == 1
 
     asyncio.run(_run())
+
+
+def test_stage_consumes_delivered_direct_ipc_for_aborted_request(monkeypatch) -> None:
+    class _ImportedStorage:
+        pass
+
+    async def _run() -> tuple[list[str], list[weakref.ReferenceType]]:
+        control_plane = _FakeControlPlane()
+        scheduler = SimpleNamespace(
+            outbox=queue.Queue(),
+            inbox=queue.Queue(),
+            abort=lambda request_id: None,
+        )
+        stage = Stage(
+            name="receiver",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={"sender": "inproc://sender"},
+            control_plane=control_plane,
+            relay=_FakeRelay(),
+            scheduler=scheduler,
+        )
+        stage._aborted.add("req")
+        calls: list[str] = []
+        released: list[weakref.ReferenceType] = []
+
+        def deserialize_payload(data_ref):
+            del data_ref
+            imported = _ImportedStorage()
+            calls.append("payload")
+            released.append(weakref.ref(imported))
+            return imported
+
+        def deserialize_stream(data_ref):
+            del data_ref
+            imported = _ImportedStorage()
+            calls.append("stream")
+            released.append(weakref.ref(imported))
+            return imported, None
+
+        monkeypatch.setattr(
+            stage_io,
+            "deserialize_direct_cuda_ipc_payload",
+            deserialize_payload,
+        )
+        monkeypatch.setattr(
+            stage_io,
+            "deserialize_direct_cuda_ipc_stream_chunk",
+            deserialize_stream,
+        )
+
+        await stage._on_data_ready(
+            DataReadyMessage(
+                request_id="req",
+                from_stage="sender",
+                to_stage="receiver",
+                data_ref={"_type": "TorchCudaIpcPayload", "version": 1},
+            )
+        )
+        await stage._on_stream_chunk(
+            DataReadyMessage(
+                request_id="req",
+                from_stage="sender",
+                to_stage="receiver",
+                data_ref={"_type": "TorchCudaIpcStreamChunk", "version": 1},
+                chunk_id=0,
+            )
+        )
+
+        assert scheduler.inbox.empty()
+        assert control_plane.stage_messages == []
+        return calls, released
+
+    calls, released = asyncio.run(_run())
+
+    assert calls == ["payload", "stream"]
+    assert all(reference() is None for reference in released)
 
 
 def test_stage_routes_relay_stream_chunk_to_scheduler() -> None:

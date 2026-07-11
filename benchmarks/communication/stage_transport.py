@@ -88,6 +88,10 @@ class CaseConfig:
         return self.case.startswith("direct")
 
     @property
+    def is_abort(self) -> bool:
+        return "abort" in self.case
+
+    @property
     def transfers_per_target(self) -> int:
         return self.warmups + self.count
 
@@ -552,6 +556,19 @@ async def _receiver_run(
                 offset = pool_storage.get("ref_counter_offset")
                 if offset is not None:
                     pool_refcounter_offsets.add(int(offset))
+            if config.is_abort:
+                stage._aborted.add(msg.request_id)
+                if config.is_stream:
+                    await stage._on_stream_chunk(msg)
+                else:
+                    await stage._on_data_ready(msg)
+                if not scheduler.inbox.empty():
+                    raise AssertionError("aborted direct value reached the scheduler")
+                if sequence == config.warmups:
+                    control_bytes_sample = len(serialize_message(msg))
+                msg = None
+                completion_q.put((receiver_name, sequence))
+                continue
             if config.is_stream:
                 await stage._on_stream_chunk(msg)
                 incoming = scheduler.inbox.get(timeout=config.timeout_s)
@@ -975,6 +992,8 @@ def parse_args() -> argparse.Namespace:
             "direct-stream",
             "direct-payload-metadata",
             "direct-stream-metadata",
+            "direct-abort-payload",
+            "direct-abort-stream",
             "pooled-payload",
             "pooled-stream",
             "fanout",
