@@ -74,7 +74,8 @@ def test_comm_router_uses_shm_for_cuda_payloads_to_cpu_targets() -> None:
 def test_comm_router_identifies_same_gpu_targets() -> None:
     router = CommRouter(
         stage_name="talker_ar",
-        gpu_id=1,
+        gpu_id=0,
+        placement_gpu_id=1,
         same_process_targets={"local_code2wav"},
         gpu_stage_names={"same_code2wav", "cross_code2wav", "tp_decode"},
         stage_gpu_ids={
