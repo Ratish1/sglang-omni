@@ -313,7 +313,6 @@ class CommEngine:
             write_ms = _comm_elapsed_ms(write_start)
             object_id = data_ref.object_id
             self._register_pending(object_id, [op])
-            self._arm_pending(object_id)
             control_start = _comm_now_ns()
             await job.control_plane.send_to_stage(
                 job.to_stage,
@@ -326,6 +325,7 @@ class CommEngine:
                 ),
             )
             control_ms = _comm_elapsed_ms(control_start)
+            self._arm_pending(object_id)
             _comm_trace(
                 "comm_payload_send",
                 request_id=job.request_id,
@@ -367,7 +367,6 @@ class CommEngine:
             object_id = data_ref.object_id
             if ops:
                 self._register_pending(object_id, ops)
-                self._arm_pending(object_id)
             control_start = _comm_now_ns()
             await job.control_plane.send_to_stage(
                 job.target_stage,
@@ -381,6 +380,8 @@ class CommEngine:
                 ),
             )
             control_ms = _comm_elapsed_ms(control_start)
+            if ops:
+                self._arm_pending(object_id)
             _comm_trace(
                 "comm_stream_send",
                 request_id=job.request_id,
@@ -411,6 +412,8 @@ class CommEngine:
 
     def _arm_pending(self, object_id: str) -> None:
         pending = self._pending[object_id]
+        if pending.task is not None:
+            return
         pending.task = asyncio.create_task(self._watch_pending(object_id, pending))
         self._track_task(pending.task, f"comm ack {object_id}")
 
@@ -438,6 +441,7 @@ class CommEngine:
             return
         if not pending.ack.done():
             pending.ack.set_exception(exc)
+        self._arm_pending(object_id)
 
     def _track_task(self, task: asyncio.Task, label: str) -> None:
         if self._task_done_callback is not None:

@@ -85,6 +85,21 @@ class _AckedRelay:
         pass
 
 
+class _BlockedControlPlane(RecordingStageControlPlane):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.failure: BaseException | None = None
+
+    async def send_to_stage(self, target: str, endpoint: str, msg: Any) -> None:
+        self.entered.set()
+        await self.release.wait()
+        if self.failure is not None:
+            raise self.failure
+        await super().send_to_stage(target, endpoint, msg)
+
+
 async def _wait_until(predicate, timeout: float = 1.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
@@ -137,6 +152,75 @@ def test_comm_engine_releases_sender_op_after_data_ack() -> None:
         )
         await _wait_until(lambda: op.waited)
         assert op.acked
+
+    asyncio.run(_run())
+
+
+def test_comm_engine_starts_ack_timeout_after_publication() -> None:
+    async def _run() -> None:
+        relay = _AckedRelay()
+        control_plane = _BlockedControlPlane()
+        engine = CommEngine(
+            CommRouter(
+                stage_name="sender",
+                gpu_id=None,
+                same_process_targets=set(),
+                gpu_stage_names=set(),
+                comm_config={"ack_timeout_s": 1.0},
+                injected_relay=relay,
+            )
+        )
+        payload = make_stage_payload(request_id="req-1", data={"x": torch.ones(2)})
+        send = asyncio.create_task(
+            engine.send_payload(
+                relay=relay,
+                control_plane=control_plane,
+                request_id="req-1",
+                payload=payload,
+                transport=TransportKind.SHM,
+                from_stage="sender",
+                to_stage="receiver",
+                target_endpoint="inproc://receiver",
+            )
+        )
+
+        await control_plane.entered.wait()
+        pending = next(iter(engine._pending.values()))
+        assert pending.task is None
+
+        control_plane.release.set()
+        data_ref = await send
+        assert engine._pending[data_ref.object_id].task is not None
+        engine.ack_transfer(
+            DataAckMessage(
+                request_id="req-1",
+                from_stage="receiver",
+                to_stage="sender",
+                object_id=data_ref.object_id,
+            )
+        )
+        await _wait_until(lambda: data_ref.object_id not in engine._pending)
+
+        failed_control_plane = _BlockedControlPlane()
+        failed_control_plane.failure = RuntimeError("publication failed")
+        failed_control_plane.release.set()
+        with pytest.raises(RuntimeError, match="publication failed"):
+            await engine.send_payload(
+                relay=relay,
+                control_plane=failed_control_plane,
+                request_id="req-2",
+                payload=make_stage_payload(
+                    request_id="req-2",
+                    data={"x": torch.ones(2)},
+                ),
+                transport=TransportKind.SHM,
+                from_stage="sender",
+                to_stage="receiver",
+                target_endpoint="inproc://receiver",
+            )
+        await _wait_until(lambda: not engine._pending)
+        assert relay.ops[-1].waited
+        assert isinstance(relay.ops[-1].failed, RuntimeError)
 
     asyncio.run(_run())
 
