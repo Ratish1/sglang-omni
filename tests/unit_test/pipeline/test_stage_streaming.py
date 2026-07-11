@@ -11,7 +11,7 @@ import torch
 from pydantic import ValidationError
 
 from sglang_omni.comm import stage_io
-from sglang_omni.comm.data_ref import DataKind, DataRef, TransportKind
+from sglang_omni.comm.data_ref import DataLayout, DataRef, TransportKind
 from sglang_omni.comm.engine import CommEngine
 from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
@@ -61,6 +61,16 @@ class _FakeRelay:
         del dst_rank, receiver_id
         self.puts.append((request_id, tensor))
         return _DoneOp(tensor.numel())
+
+    async def get_async(self, metadata, dest_tensor, request_id):
+        del metadata
+        source = next(
+            tensor
+            for source_request_id, tensor in reversed(self.puts)
+            if source_request_id == request_id
+        )
+        dest_tensor.copy_(source)
+        return _DoneOp(source.numel())
 
     def close(self) -> None:
         pass
@@ -125,24 +135,15 @@ async def _make_relay_chunk(
     data,
     metadata: dict | None = None,
 ) -> DataReadyMessage:
-    object_id = f"{request_id}:stream:{from_stage}:{to_stage}:{chunk_id}"
-    data_ref, op = await stage_io.write_tensor(
+    data_ref, _ = await stage_io.write_stream_chunk(
         relay,
-        object_id,
-        data,
-        transport=TransportKind.SHM,
-        kind=DataKind.STREAM_CHUNK,
         request_id=request_id,
+        data=data,
+        target_stage=to_stage,
         from_stage=from_stage,
-        to_stage=to_stage,
-    )
-    pending_ops = [op]
-    data_ref = await stage_io._with_stream_metadata(
-        relay,
-        data_ref,
-        metadata,
-        TransportKind.SHM,
-        pending_ops,
+        chunk_id=chunk_id,
+        metadata=metadata,
+        transport=TransportKind.SHM,
     )
     return DataReadyMessage(
         request_id=request_id,
@@ -537,7 +538,8 @@ def test_write_stream_chunk_uses_relay() -> None:
     async def _run() -> None:
         control_plane = _FakeControlPlane()
         relay = _FakeRelay()
-        codes = torch.empty(11, 1, dtype=torch.long)
+        codes = torch.arange(11, dtype=torch.long).reshape(11, 1)
+        layer_hidden = torch.arange(12, dtype=torch.float32).reshape(3, 4)
 
         data_ref, ops = await stage_io.write_stream_chunk(
             relay,
@@ -546,6 +548,7 @@ def test_write_stream_chunk_uses_relay() -> None:
             target_stage="vocoder",
             from_stage="tts_engine",
             chunk_id=0,
+            metadata={"token_id": 7, "layer_hidden": layer_hidden},
             transport=TransportKind.SHM,
         )
         await control_plane.send_to_stage(
@@ -564,12 +567,23 @@ def test_write_stream_chunk_uses_relay() -> None:
             await op.wait_for_completion()
 
         assert len(relay.puts) == 1
+        assert len(ops) == 1
         assert relay.puts[0][0] == "req:stream:tts_engine:vocoder:0"
         assert len(control_plane.stage_messages) == 1
         _, _, msg = control_plane.stage_messages[0]
-        expected_size = codes.contiguous().view(torch.uint8).numel()
         data_ref = DataRef.from_dict(msg.data_ref)
-        assert data_ref.buffer.info == {"transfer_info": {"size": expected_size}}
+        assert data_ref.layout is DataLayout.PACKED_TENSORS
+        assert [entry.path for entry in data_ref.tensors] == [
+            "data",
+            "metadata.layer_hidden",
+        ]
+        for entry in data_ref.tensors:
+            assert entry.offset % stage_io._torch_dtype(entry.dtype).itemsize == 0
+
+        restored, metadata = await stage_io.read_stream_chunk(relay, data_ref)
+        assert torch.equal(restored, codes)
+        assert metadata["token_id"] == 7
+        assert torch.equal(metadata["layer_hidden"], layer_hidden)
 
     asyncio.run(_run())
 
@@ -647,7 +661,7 @@ def test_stage_drains_relay_stream_chunk_for_already_aborted_request() -> None:
         )
 
         assert scheduler.inbox.empty()
-        assert relay.gets == 2
+        assert relay.gets == 1
 
     asyncio.run(_run())
 

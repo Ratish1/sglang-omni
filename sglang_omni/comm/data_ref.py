@@ -94,21 +94,6 @@ class BackendRef(msgspec.Struct, frozen=True):
         )
 
 
-class MetadataTensorRef(msgspec.Struct, frozen=True):
-    path: str
-    ref: "DataRef"
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"path": self.path, "ref": self.ref.to_dict()}
-
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "MetadataTensorRef":
-        return cls(
-            path=_required(value, "path", str),
-            ref=DataRef.from_dict(_required(value, "ref", dict)),
-        )
-
-
 class DataRef(msgspec.Struct, frozen=True):
     """Control-plane pointer to one data-plane object."""
 
@@ -124,7 +109,6 @@ class DataRef(msgspec.Struct, frozen=True):
     dtype: str | None = None
     offset: int | None = None
     metadata: dict[str, Any] | None = None
-    metadata_tensors: tuple[MetadataTensorRef, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -136,9 +120,6 @@ class DataRef(msgspec.Struct, frozen=True):
             "layout": self.layout.value,
             "buffer": self.buffer.to_dict(),
             "tensors": [tensor.to_dict() for tensor in self.tensors],
-            "metadata_tensors": [
-                tensor_ref.to_dict() for tensor_ref in self.metadata_tensors
-            ],
         }
         if self.header is not None:
             value["header"] = self.header
@@ -175,10 +156,6 @@ class DataRef(msgspec.Struct, frozen=True):
             offset=_required(value, "offset", int) if "offset" in value else None,
             metadata=(
                 _required(value, "metadata", dict) if "metadata" in value else None
-            ),
-            metadata_tensors=tuple(
-                MetadataTensorRef.from_dict(item)
-                for item in _required(value, "metadata_tensors", list)
             ),
         )
 

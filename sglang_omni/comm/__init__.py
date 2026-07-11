@@ -6,7 +6,6 @@ from sglang_omni.comm.data_ref import (
     DataKind,
     DataLayout,
     DataRef,
-    MetadataTensorRef,
     TensorMeta,
     TransportKind,
 )
@@ -17,7 +16,6 @@ __all__ = [
     "BackendRef",
     "CommEngine",
     "CommRouter",
-    "MetadataTensorRef",
     "TensorMeta",
     "DataRef",
     "DataLayout",

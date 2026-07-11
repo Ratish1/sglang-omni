@@ -17,7 +17,6 @@ from sglang_omni.comm.data_ref import (
     DataKind,
     DataLayout,
     DataRef,
-    MetadataTensorRef,
     TensorMeta,
     TransportKind,
 )
@@ -68,6 +67,8 @@ _BYTE_VIEW_DTYPES = _build_byte_view_dtypes()
 
 _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE = "TorchCudaIpcStreamChunk"
 _DIRECT_CUDA_IPC_PAYLOAD_TYPE = "TorchCudaIpcPayload"
+_STREAM_DATA_PATH = "data"
+_STREAM_METADATA_PATH = "metadata"
 
 
 def relay_device(relay: Relay) -> str:
@@ -375,26 +376,7 @@ async def read_payload(
     if data_ref.header is None:
         raise ValueError("stage_payload data_ref is missing header")
     header = pickle.loads(base64.b64decode(data_ref.header))
-    tensor_specs = []
-    for entry in data_ref.tensors:
-        dtype = _validate_tensor_region(
-            shape=entry.shape,
-            dtype_str=entry.dtype,
-            offset=entry.offset,
-            size=entry.size,
-            buffer_length=data_ref.buffer.length,
-            label=f"payload tensor {entry.path!r}",
-        )
-        tensor_specs.append((entry, dtype))
-    transfer_buf = await _read_transfer_buffer(relay, request_id, data_ref)
-    tensors = {}
-    for entry, dtype in tensor_specs:
-        tensor = transfer_buf[entry.offset : entry.offset + entry.size]
-        tensors[entry.path] = _restore_tensor_device(
-            tensor.view(dtype).reshape(entry.shape),
-            entry.device,
-        )
-    relay.cleanup(request_id)
+    tensors = await _read_packed_tensors(relay, request_id, data_ref)
     return StagePayload(
         request_id=header.request_id,
         request=header.request,
@@ -496,6 +478,37 @@ async def write_stream_chunk(
     receiver_id: str | None = None,
 ) -> tuple[DataRef, list[Any]]:
     object_id = f"{request_id}:stream:{from_stage}:{target_stage}:{chunk_id}"
+    metadata_without_tensors, metadata_tensors = extract_tensors(
+        metadata,
+        path=_STREAM_METADATA_PATH,
+    )
+    if metadata_tensors:
+        packed, entries = _pack_tensors(
+            {_STREAM_DATA_PATH: data, **metadata_tensors},
+            device=relay_device(relay),
+        )
+        op = await relay.put_async(
+            packed,
+            request_id=object_id,
+            receiver_id=receiver_id or target_stage,
+        )
+        return (
+            DataRef(
+                version=1,
+                object_id=object_id,
+                kind=DataKind.STREAM_CHUNK,
+                transport=transport,
+                layout=DataLayout.PACKED_TENSORS,
+                buffer=BackendRef.from_relay_info(
+                    transport=transport,
+                    relay_info=op.metadata,
+                ),
+                tensors=tuple(entries),
+                metadata=metadata_without_tensors,
+            ),
+            [op],
+        )
+
     data_ref, op = await write_tensor(
         relay,
         object_id,
@@ -507,30 +520,41 @@ async def write_stream_chunk(
         to_stage=target_stage,
         receiver_id=receiver_id or target_stage,
     )
-    pending_ops = [op]
-    data_ref = await _with_stream_metadata(
-        relay,
-        data_ref,
-        metadata,
-        transport,
-        pending_ops,
-        receiver_id=receiver_id or target_stage,
+    return (
+        DataRef(
+            version=data_ref.version,
+            object_id=data_ref.object_id,
+            kind=data_ref.kind,
+            transport=data_ref.transport,
+            layout=data_ref.layout,
+            buffer=data_ref.buffer,
+            shape=data_ref.shape,
+            dtype=data_ref.dtype,
+            offset=data_ref.offset,
+            metadata=metadata_without_tensors,
+        ),
+        [op],
     )
-    return data_ref, pending_ops
 
 
 async def read_stream_chunk(
     relay: Relay,
     data_ref: DataRef,
 ) -> tuple[torch.Tensor, dict[str, Any] | None]:
+    if data_ref.layout is DataLayout.PACKED_TENSORS:
+        tensors = await _read_packed_tensors(relay, data_ref.object_id, data_ref)
+        try:
+            data = tensors.pop(_STREAM_DATA_PATH)
+        except KeyError as exc:
+            raise ValueError(
+                "packed stream chunk is missing its primary tensor"
+            ) from exc
+        metadata = restore_tensors(dict(data_ref.metadata or {}), tensors)
+        return data, metadata or None
+    if data_ref.layout is not DataLayout.RAW_TENSOR:
+        raise ValueError(f"unsupported stream layout {data_ref.layout.value}")
     data = await read_tensor(relay, data_ref)
     metadata = dict(data_ref.metadata or {})
-    if data_ref.metadata_tensors:
-        tensors = {
-            ref.path: await read_tensor(relay, ref.ref)
-            for ref in data_ref.metadata_tensors
-        }
-        metadata = restore_tensors(metadata, tensors)
     return data, metadata or None
 
 
@@ -555,45 +579,6 @@ async def send_stream_signal(
             is_done=is_done,
             error=error,
         ),
-    )
-
-
-async def _with_stream_metadata(
-    relay: Relay,
-    data_ref: DataRef,
-    metadata: dict | None,
-    transport: TransportKind,
-    pending_ops: list[Any],
-    *,
-    receiver_id: str | None = None,
-) -> DataRef:
-    if metadata is None:
-        return data_ref
-    metadata_without_tensors, tensors = extract_tensors(metadata)
-    tensor_refs = []
-    for idx, (path, tensor) in enumerate(tensors.items()):
-        ref, op = await write_tensor(
-            relay,
-            f"{data_ref.object_id}:meta:{idx}",
-            tensor,
-            transport=transport,
-            kind=DataKind.STREAM_METADATA_TENSOR,
-            receiver_id=receiver_id,
-        )
-        tensor_refs.append(MetadataTensorRef(path=path, ref=ref))
-        pending_ops.append(op)
-    return DataRef(
-        version=data_ref.version,
-        object_id=data_ref.object_id,
-        kind=data_ref.kind,
-        transport=data_ref.transport,
-        layout=data_ref.layout,
-        buffer=data_ref.buffer,
-        shape=data_ref.shape,
-        dtype=data_ref.dtype,
-        offset=data_ref.offset,
-        metadata=metadata_without_tensors,
-        metadata_tensors=tuple(tensor_refs),
     )
 
 
@@ -637,6 +622,34 @@ def _pack_tensors(
     if not chunks:
         chunks.append(torch.zeros(1, dtype=torch.uint8, device=target_device))
     return torch.cat(chunks), entries
+
+
+async def _read_packed_tensors(
+    relay: Relay,
+    request_id: str,
+    data_ref: DataRef,
+) -> dict[str, torch.Tensor]:
+    tensor_specs = []
+    for entry in data_ref.tensors:
+        dtype = _validate_tensor_region(
+            shape=entry.shape,
+            dtype_str=entry.dtype,
+            offset=entry.offset,
+            size=entry.size,
+            buffer_length=data_ref.buffer.length,
+            label=f"packed tensor {entry.path!r}",
+        )
+        tensor_specs.append((entry, dtype))
+    transfer_buf = await _read_transfer_buffer(relay, request_id, data_ref)
+    tensors = {}
+    for entry, dtype in tensor_specs:
+        tensor = transfer_buf[entry.offset : entry.offset + entry.size]
+        tensors[entry.path] = _restore_tensor_device(
+            tensor.view(dtype).reshape(entry.shape),
+            entry.device,
+        )
+    relay.cleanup(request_id)
+    return tensors
 
 
 async def _read_transfer_buffer(

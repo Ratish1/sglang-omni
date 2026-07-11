@@ -265,7 +265,6 @@ def test_data_ref_rejects_bool_int_fields() -> None:
         "layout": "raw_tensor",
         "buffer": {"transport": "shm", "info": {}, "length": 1},
         "tensors": [],
-        "metadata_tensors": [],
         "shape": [1],
         "dtype": "torch.uint8",
         "offset": 0,
