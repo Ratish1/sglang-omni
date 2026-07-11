@@ -23,47 +23,18 @@ from sglang_omni.comm.data_ref import (
 from sglang_omni.proto import DataReadyMessage, StagePayload
 from sglang_omni.relay.base import Relay
 
-_BYTE_VIEW_DTYPE_NAMES = (
-    "bool",
-    "uint8",
-    "uint16",
-    "uint32",
-    "uint64",
-    "int8",
-    "int16",
-    "int32",
-    "int64",
-    "float8_e4m3fn",
-    "float8_e4m3fnuz",
-    "float8_e5m2",
-    "float8_e5m2fnuz",
-    "float8_e8m0fnu",
-    "float16",
-    "bfloat16",
-    "float32",
-    "float64",
-    "complex64",
-    "complex128",
-)
-
-
-def _build_byte_view_dtypes() -> dict[str, torch.dtype]:
-    supported: dict[str, torch.dtype] = {}
-    for name in _BYTE_VIEW_DTYPE_NAMES:
-        dtype = getattr(torch, name, None)
-        if not isinstance(dtype, torch.dtype):
-            continue
-        try:
-            sample = torch.empty(1, dtype=dtype)
-            restored = sample.view(torch.uint8).view(dtype)
-        except (RuntimeError, TypeError):
-            continue
-        if restored.shape == sample.shape:
-            supported[str(dtype)] = dtype
-    return supported
-
-
-_BYTE_VIEW_DTYPES = _build_byte_view_dtypes()
+_BYTE_VIEW_DTYPES: dict[str, torch.dtype] = {
+    "torch.bool": torch.bool,
+    "torch.uint8": torch.uint8,
+    "torch.int8": torch.int8,
+    "torch.int16": torch.int16,
+    "torch.int32": torch.int32,
+    "torch.int64": torch.int64,
+    "torch.float16": torch.float16,
+    "torch.bfloat16": torch.bfloat16,
+    "torch.float32": torch.float32,
+    "torch.float64": torch.float64,
+}
 
 _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE = "TorchCudaIpcStreamChunk"
 _DIRECT_CUDA_IPC_PAYLOAD_TYPE = "TorchCudaIpcPayload"
