@@ -105,10 +105,16 @@ class Relay(ABC):
 
     @abstractmethod
     async def put_async(
-        self, tensor: torch.Tensor, request_id: str = None, dst_rank: int = None
+        self,
+        tensor: torch.Tensor,
+        request_id: str = None,
+        dst_rank: int = None,
+        receiver_id: str = None,
     ) -> RelayOperation:
         """
         Asynchronously sends a tensor.
+        ``receiver_id`` names a stable destination process when backend
+        resources have one-consumer ownership.
         Returns an operation handle containing metadata for the receiver.
         """
 

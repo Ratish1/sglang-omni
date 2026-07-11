@@ -50,14 +50,17 @@ class _AckedRelay:
     def __init__(self) -> None:
         self.storage: dict[str, torch.Tensor] = {}
         self.ops: list[_AckedOp] = []
+        self.receiver_ids: list[str | None] = []
 
     async def put_async(
         self,
         tensor: torch.Tensor,
         request_id: str | None = None,
         dst_rank: int | None = None,
+        receiver_id: str | None = None,
     ) -> _AckedOp:
         del dst_rank
+        self.receiver_ids.append(receiver_id)
         key = str(request_id)
         self.storage[key] = tensor.detach().clone()
         op = _AckedOp({"transfer_info": {"size": int(tensor.numel())}, "key": key})
@@ -121,6 +124,7 @@ def test_comm_engine_releases_sender_op_after_data_ack() -> None:
         assert not op.waited
         target, _, msg = control_plane.sent_to_stage[0]
         assert target == "receiver"
+        assert relay.receiver_ids == ["inproc://receiver"]
         assert DataRef.from_dict(msg.data_ref).object_id == data_ref.object_id
 
         engine.ack_transfer(

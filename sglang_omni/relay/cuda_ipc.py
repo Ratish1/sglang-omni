@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _PEER_ENABLED: set[tuple[int, int]] = set()
 _PEER_VISIBILITY_WARNED: set[tuple[int, int, int]] = set()
 _DEFAULT_WAIT_THREADS = 8
+_DEFAULT_RECEIVER_ID = "__single_receiver__"
 
 
 class _CudaEventWaitResult(NamedTuple):
@@ -530,7 +531,7 @@ class CudaIpcRelay(Relay):
 
         self._pool_tensor: torch.Tensor | None = None
         self._pool_id: str | None = None
-        self._pool_storage_handle: dict[str, Any] | None = None
+        self._pool_storage_handles: dict[str, dict[str, Any]] = {}
         self._allocator: _ContiguousSlotAllocator | None = None
 
         self._remote_pools: dict[str, torch.Tensor] = {}
@@ -566,7 +567,6 @@ class CudaIpcRelay(Relay):
                 total_pool_bytes, dtype=torch.uint8, device=device
             )
         self._pool_id = f"{self.engine_id}:{os.getpid()}:{uuid.uuid4().hex}"
-        self._pool_storage_handle = _dump_cuda_storage_handle(self._pool_tensor)
         self._allocator = _ContiguousSlotAllocator(
             slot_count=self.slot_count,
             slot_size=self.slot_size,
@@ -584,21 +584,34 @@ class CudaIpcRelay(Relay):
 
     def _local_pool_state(
         self,
-    ) -> tuple[torch.Tensor, str, dict[str, Any], _ContiguousSlotAllocator]:
+    ) -> tuple[torch.Tensor, str, _ContiguousSlotAllocator]:
         self._ensure_local_pool()
         pool_tensor = self._pool_tensor
         pool_id = self._pool_id
-        pool_storage_handle = self._pool_storage_handle
         allocator = self._allocator
         if pool_tensor is None:
             raise RuntimeError("cuda_ipc local pool tensor was not initialized")
         if pool_id is None:
             raise RuntimeError("cuda_ipc local pool id was not initialized")
-        if pool_storage_handle is None:
-            raise RuntimeError("cuda_ipc local pool storage handle was not initialized")
         if allocator is None:
             raise RuntimeError("cuda_ipc local credit allocator was not initialized")
-        return pool_tensor, pool_id, pool_storage_handle, allocator
+        return pool_tensor, pool_id, allocator
+
+    def _pool_storage_handle_for(
+        self,
+        pool_tensor: torch.Tensor,
+        receiver_id: str | None,
+    ) -> tuple[dict[str, Any], bool]:
+        key = receiver_id or _DEFAULT_RECEIVER_ID
+        storage_handle = self._pool_storage_handles.get(key)
+        if storage_handle is not None:
+            return storage_handle, False
+
+        # PyTorch gives each _share_cuda_ export one consumer refcounter token.
+        # Reuse that token only for the receiver process that caches its mapping.
+        storage_handle = _dump_cuda_storage_handle(pool_tensor)
+        self._pool_storage_handles[key] = storage_handle
+        return storage_handle, True
 
     def _mark_failed(self, exc: BaseException) -> None:
         if self._failed_error is None:
@@ -665,6 +678,7 @@ class CudaIpcRelay(Relay):
         tensor: torch.Tensor,
         request_id: str | None = None,
         dst_rank: int | None = None,
+        receiver_id: str | None = None,
     ) -> CudaIpcPutOperation:
         self._raise_if_failed()
         if not tensor.is_cuda:
@@ -672,12 +686,13 @@ class CudaIpcRelay(Relay):
                 "cuda_ipc relay can only transfer CUDA tensors; "
                 f"got tensor on {tensor.device}"
             )
-        (
+        pool_tensor, pool_id, allocator = self._local_pool_state()
+        pool_export_start = _comm_now_ns()
+        pool_storage_handle, pool_exported = self._pool_storage_handle_for(
             pool_tensor,
-            pool_id,
-            pool_storage_handle,
-            allocator,
-        ) = self._local_pool_state()
+            receiver_id,
+        )
+        pool_export_ms = _comm_elapsed_ms(pool_export_start)
 
         flat = tensor.contiguous().view(torch.uint8).reshape(-1)
         size = int(flat.numel())
@@ -739,6 +754,8 @@ class CudaIpcRelay(Relay):
             acquire_ms=round(acquire_ms, 6),
             copy_enqueue_ms=round(copy_enqueue_ms, 6),
             event_handle_ms=round(handle_ms, 6),
+            pool_exported=pool_exported,
+            pool_export_ms=round(pool_export_ms, 6),
         )
 
         metadata = {
@@ -891,7 +908,7 @@ class CudaIpcRelay(Relay):
 
     def close(self) -> None:
         self._remote_pools.clear()
+        self._pool_storage_handles.clear()
         self._pool_tensor = None
-        self._pool_storage_handle = None
         self._allocator = None
         self._wait_executor.shutdown(wait=False, cancel_futures=True)
