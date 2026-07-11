@@ -58,6 +58,10 @@ case "${MODE}" in
         run_case pooled-payload 1 1 20 || failures=1
         run_case pooled-stream 1 1 20 || failures=1
         run_case fanout 1,1 1 20 || failures=1
+        "${PYTHON}" -m pytest -q \
+            --basetemp=/tmp/sgo-h200-shm \
+            "${ROOT}/tests/unit_test/relay/test_shm_relay.py::test_shm_round_trip_preserves_logical_transfer_length" \
+            2>&1 | tee "${OUTPUT_DIR}/shm-logical-length.log" || failures=1
         ;;
     stress)
         failures=0
