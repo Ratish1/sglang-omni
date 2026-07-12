@@ -18,6 +18,10 @@ COMMON_KEYS = {
     "model": "MODEL",
     "model_name": "MODEL_NAME",
     "meta": "META",
+    "client_driver": "CLIENT_DRIVER",
+    "tts_manifest": "TTS_MANIFEST",
+    "router_cores": "ROUTER_CORES",
+    "router_policy": "ROUTER_POLICY",
     "bench_lang": "BENCH_LANG",
     "ref_format": "REF_FORMAT",
     "allowed_local_media_path": "ALLOWED_LOCAL_MEDIA_PATH",
@@ -45,6 +49,8 @@ MATRIX_KEYS = {
 CALIBRATION_KEYS = {
     "dps": "CALIBRATION_DPS",
     "repetitions": "CALIBRATION_REPETITIONS",
+    "mps_modes": "CALIBRATION_MPS_MODES",
+    "margin_basis_points": "CALIBRATION_MARGIN_BPS",
     "label": "CALIBRATION_LABEL",
     "root": "CALIBRATION_ROOT",
 }

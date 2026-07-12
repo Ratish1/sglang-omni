@@ -1,0 +1,51 @@
+# H200 141GB full-SeedTTS screening matrix. Source calibrated DP caps first.
+version: 1
+
+common:
+  gpu_uuid: ${GPU_UUID}
+  numa_node: 0
+  model: bosonai/higgs-tts-3-4b
+  model_name: higgs
+  client_driver: seedtts
+  meta: zhaochenyang20/seed-tts-eval-arrow
+  bench_lang: en
+  ref_format: references
+  allowed_local_media_path: /
+  router_cores: 48-49
+  router_policy: least_request
+  max_running_requests: 64
+  cuda_graph_max_bs: 64
+  max_new_tokens: 2048
+  max_samples: ""
+  warmup: 1
+  seed: 1
+  kv_equality: require
+  require_idle_gpu: true
+  mps_ready_timeout: 30
+
+matrix:
+  order: ["1:0", "2:0", "2:1", "3:0", "3:1", "4:0", "4:1"]
+  concurrency_values: [16, 32, 48, 64, 96]
+  repetitions: 2
+  shuffle_seed: 986
+
+layouts:
+  1:
+    server_core_sets: [0-31]
+    client_core_sets: [32-47]
+    mem_fractions: [0.85]
+  2:
+    server_core_sets: [0-15, 16-31]
+    client_core_sets: [32-39, 40-47]
+    mem_fractions: [0.42, 0.42]
+    max_total_tokens: ${DP2_MAX_TOTAL_TOKENS}
+  3:
+    server_core_sets: [0-9, 10-19, 20-31]
+    client_core_sets: [32-36, 37-41, 42-47]
+    mem_fractions: [0.27, 0.27, 0.27]
+    max_total_tokens: ${DP3_MAX_TOTAL_TOKENS}
+  4:
+    server_core_sets: [0-7, 8-15, 16-23, 24-31]
+    client_core_sets: [32-35, 36-39, 40-43, 44-47]
+    mem_fractions: [0.21, 0.21, 0.21, 0.21]
+    max_total_tokens: ${DP4_MAX_TOTAL_TOKENS}

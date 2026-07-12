@@ -272,6 +272,30 @@ def summarize_matrix(matrix_tsv: Path) -> dict[str, object]:
     return {"conditions": conditions, "failed_or_incomplete_runs": failures}
 
 
+def summarize_router_snapshot(snapshot_path: Path) -> dict[str, object]:
+    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    workers = payload.get("workers")
+    if not isinstance(workers, list) or not workers:
+        raise ValueError(f"{snapshot_path} contains no router workers")
+    routed = [int(worker.get("routed_requests") or 0) for worker in workers]
+    successful = [int(worker.get("successful_requests") or 0) for worker in workers]
+    failed = [int(worker.get("failed_requests") or 0) for worker in workers]
+    routed_mean = statistics.fmean(routed)
+    return {
+        "workers": workers,
+        "routed_requests_total": sum(routed),
+        "successful_requests_total": sum(successful),
+        "failed_requests_total": sum(failed),
+        "routed_requests_min": min(routed),
+        "routed_requests_max": max(routed),
+        "routed_requests_cv": (
+            round(statistics.pstdev(routed) / routed_mean, 4)
+            if len(routed) > 1 and routed_mean > 0
+            else 0.0
+        ),
+    }
+
+
 def _rounded(value: float | None, digits: int) -> float | None:
     return round(value, digits) if value is not None else None
 
@@ -299,6 +323,10 @@ def _build_parser() -> argparse.ArgumentParser:
     matrix = sub.add_parser("summarize-matrix")
     matrix.add_argument("--output", required=True, type=Path)
     matrix.add_argument("matrix_tsv", type=Path)
+
+    router = sub.add_parser("summarize-router")
+    router.add_argument("--output", required=True, type=Path)
+    router.add_argument("snapshot", type=Path)
     return parser
 
 
@@ -324,6 +352,11 @@ def main() -> None:
         return
     if args.command == "summarize-matrix":
         result = summarize_matrix(args.matrix_tsv)
+        args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(result, indent=2))
+        return
+    if args.command == "summarize-router":
+        result = summarize_router_snapshot(args.snapshot)
         args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(result, indent=2))
         return

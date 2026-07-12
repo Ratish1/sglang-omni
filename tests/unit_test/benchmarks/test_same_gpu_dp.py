@@ -11,6 +11,7 @@ from benchmarks.same_gpu_dp.summarize import (
     parse_cpu_set,
     summarize_matrix,
     summarize_results,
+    summarize_router_snapshot,
     validate_layout,
 )
 
@@ -93,6 +94,40 @@ def test_summarize_results_combines_concurrent_worker_artifacts(tmp_path: Path) 
     assert result["output_tokens_mean"] == 15.0
     assert result["audio_duration_total_s"] == 4.0
     assert result["worker_qps_cv"] == 0.2
+
+
+def test_summarize_router_snapshot_uses_actual_worker_counters(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "workers.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "worker-0",
+                        "routed_requests": 60,
+                        "successful_requests": 60,
+                        "failed_requests": 0,
+                    },
+                    {
+                        "worker_id": "worker-1",
+                        "routed_requests": 40,
+                        "successful_requests": 39,
+                        "failed_requests": 1,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = summarize_router_snapshot(snapshot)
+
+    assert result["routed_requests_total"] == 100
+    assert result["successful_requests_total"] == 99
+    assert result["failed_requests_total"] == 1
+    assert result["routed_requests_cv"] == 0.2
 
 
 def test_extract_kv_tokens_uses_last_startup_value() -> None:

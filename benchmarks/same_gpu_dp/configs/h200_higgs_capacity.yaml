@@ -1,0 +1,35 @@
+# H200 141GB capacity-only calibration. No benchmark traffic is generated.
+version: 1
+
+common:
+  gpu_uuid: ${GPU_UUID}
+  numa_node: 0
+  model: bosonai/higgs-tts-3-4b
+  model_name: higgs
+  client_driver: seedtts
+  max_running_requests: 64
+  cuda_graph_max_bs: 64
+  max_new_tokens: 2048
+  kv_equality: warn
+  require_idle_gpu: true
+  mps_ready_timeout: 30
+
+calibration:
+  dps: [2, 3, 4]
+  repetitions: 30
+  mps_modes: [1]
+  margin_basis_points: 0
+
+layouts:
+  2:
+    server_core_sets: [0-15, 16-31]
+    client_core_sets: [32-39, 40-47]
+    mem_fractions: [0.42, 0.42]
+  3:
+    server_core_sets: [0-9, 10-19, 20-31]
+    client_core_sets: [32-36, 37-41, 42-47]
+    mem_fractions: [0.27, 0.27, 0.27]
+  4:
+    server_core_sets: [0-7, 8-15, 16-23, 24-31]
+    client_core_sets: [32-35, 36-39, 40-43, 44-47]
+    mem_fractions: [0.21, 0.21, 0.21, 0.21]

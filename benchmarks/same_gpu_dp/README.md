@@ -64,12 +64,16 @@ settings are:
 | `SERVER_CORE_SETS` | semicolon-separated, dedicated set per replica |
 | `CLIENT_CORE_SETS` | semicolon-separated, dedicated set per direct client |
 | `NUMA_NODE` | memory node local to the GPU |
+| `ROUTER_CORES` | dedicated physical cores for router mode |
+| `ROUTER_POLICY` | router policy; defaults to `least_request` |
 | `MEM_FRACTIONS` | one value (broadcast) or comma-separated value per replica |
 | `CONCURRENCY_PER_WORKER` | canonical client concurrency per direct worker |
 | `MAX_RUNNING_REQUESTS` | server generation batching limit |
 | `CUDA_GRAPH_MAX_BS` | server CUDA graph maximum batch size |
 | `MAX_TOTAL_TOKENS` | exact upper bound for each replica's SGLang KV-token pool |
 | `MODEL` / `MODEL_NAME` | checkpoint and served/request model name |
+| `CLIENT_DRIVER` | `seedtts` (default) or deterministic `manifest` replay |
+| `TTS_MANIFEST` | JSONL request manifest required by `CLIENT_DRIVER=manifest` |
 | `BENCH_LANG` | SeedTTS language split (`en` or `zh`) |
 | `ALLOWED_LOCAL_MEDIA_PATH` | server allowlist for SeedTTS reference paths; defaults to `/` for an isolated benchmark container |
 | `MAX_SAMPLES` | optional SeedTTS subset; unset means the full language split |
@@ -79,14 +83,13 @@ settings are:
 | `CAPACITY_ONLY` | initialize replicas, record KV capacity, and exit before load |
 | `MPS_TMP_ROOT` | short local MPS runtime root; defaults to per-user `/tmp/sglang-omni-mps-$UID` |
 
-For a complete study, prefer the versioned YAML interface. Copy
-`configs/h200_higgs.yaml`, adapt its NUMA-local CPU IDs, and export only the
-host-specific GPU UUID:
+For capacity calibration, use the hardware-specific YAML after verifying its
+NUMA-local CPU IDs. These profiles start models only; they do not send SeedTTS or
+other request traffic:
 
 ```bash
-export GPU_UUID=GPU-...
-python benchmarks/same_gpu_dp/run_study.py \
-  benchmarks/same_gpu_dp/configs/h200_higgs.yaml --mode calibrate
+GPU_UUID=GPU-... python benchmarks/same_gpu_dp/run_study.py benchmarks/same_gpu_dp/configs/h100_higgs_capacity.yaml --mode calibrate
+GPU_UUID=GPU-... python benchmarks/same_gpu_dp/run_study.py benchmarks/same_gpu_dp/configs/h200_higgs_capacity.yaml --mode calibrate
 ```
 
 The loader is strict: unknown keys and unresolved `${ENVIRONMENT_VARIABLES}`
@@ -105,6 +108,32 @@ bash benchmarks/same_gpu_dp/run_condition.sh --dry-run
 
 Inspect `commands.sh` and `manifest.txt` before removing `--dry-run`. A real
 direct run uses the same variables with the actual UUID.
+
+### Production manifest traffic
+
+Use `CLIENT_DRIVER=manifest` for the workload-driven cap search. Each JSONL row has
+exactly three fields:
+
+```json
+{"id":"interactive-0001","arrival_offset_s":0.0,"payload":{"input":"Approved production text.","references":[{"audio_path":"/data/voices/reference.wav","text":"Reference transcript."}],"stream":false,"response_format":"wav","max_new_tokens":512}}
+```
+
+`id` must be unique and filesystem-safe. Arrival offsets must be non-negative and
+non-decreasing. Use offset `0` for every row in a closed-loop concurrency test; use
+recorded or explicitly spaced offsets for an open-loop replay. Non-streaming requests
+must use WAV and streaming requests must use PCM so audio duration and correctness are
+measured consistently.
+
+The driver hashes the manifest, preserves the exact payload for every cap, validates
+each request's `max_new_tokens` against the fixed server ceiling, saves generated
+audio, and emits canonical `speed_results.json` for the existing aggregate summarizer.
+One identical client process is launched per replica:
+
+```bash
+CLIENT_DRIVER=manifest TTS_MANIFEST=/absolute/path/to/tune.jsonl \
+DP=2 USE_MPS=1 CONCURRENCY_PER_WORKER=32 ... \
+bash benchmarks/same_gpu_dp/run_condition.sh
+```
 
 `--ref-format references` sends local reference-audio paths to the server.
 `ALLOWED_LOCAL_MEDIA_PATH=/` is convenient only inside a trusted, isolated
@@ -132,23 +161,37 @@ The harness recognizes both `max_total_num_tokens=...` and SGLang's
 
 ### Calibrate an exact per-DP cap
 
-Do not derive a publication cap from one launch order or MPS mode. After setting
-the `DP2_*`, `DP3_*`, and `DP4_*` layouts shown below, run:
+Do not derive a production cap from one launch. The capacity profiles run 30 fresh
+MPS launches and rotate launch positions across the configured CPU blocks. To run a
+custom layout without YAML, set the `DP2_*`, `DP3_*`, and `DP4_*` variables and run:
 
 ```bash
 CALIBRATION_DPS=2,3,4 \
+CALIBRATION_REPETITIONS=30 \
+CALIBRATION_MPS_MODES=1 \
+CALIBRATION_MARGIN_BPS=0 \
 bash benchmarks/same_gpu_dp/calibrate_capacity.sh
 ```
 
-This performs two real capacity-only repetitions with MPS off and on by default,
-runs no benchmark traffic, and writes the minimum observed capacity per DP to
-`capacity.env`. Review `capacity_summary.tsv`, then source the generated file:
+The raw minimum and safety-margin calculation are written to
+`capacity_selection.tsv`. `capacity.env` exports both values:
+
+```text
+DPn_PROFILED_MIN_TOKENS  minimum observed capacity
+DPn_MAX_TOTAL_TOKENS     floor(raw minimum × (1 - margin))
+```
+
+The default margin is zero: the repeated observed minimum is the first candidate.
+Set a nonzero basis-point margin only when repeated capped confirmations demonstrate
+allocator drift that justifies it. Review `capacity_summary.tsv` and
+`capacity_selection.tsv`, then source the generated file:
 
 ```bash
 source benchmarks/results/same_gpu_dp/<printed-calibration-label>/capacity.env
 ```
 
-With the YAML interface, use the same file after sourcing the generated caps:
+The older `h200_higgs.yaml` is the SeedTTS matrix interface and is not used to choose
+a production cap. It remains available only for reproducing the earlier study:
 
 ```bash
 source benchmarks/results/same_gpu_dp/<printed-calibration-label>/capacity.env
@@ -156,11 +199,26 @@ python benchmarks/same_gpu_dp/run_study.py \
   benchmarks/same_gpu_dp/configs/h200_higgs.yaml --mode matrix
 ```
 
-For example, an H200 DP3 observation of `216719, 140294, 84328` produces
-`DP3_MAX_TOTAL_TOKENS=84328`. The subsequent capped run must report `84328` for
-all replicas or fail before load. Keep DP1 uncapped for the fair aggregate-GPU
-comparison: the cap controls launch-order imbalance within a DP condition, not
-an equal per-replica memory allocation across different DP counts.
+For example, an H200 DP3 launch resolving `216719, 140294, 84328` contributes a
+raw condition minimum of `84328`; it is not automatically the production cap. The
+repeated minimum and configured safety margin determine the candidate. A subsequent
+capped confirmation must report that candidate exactly for all replicas or fail
+before load. Keep DP1 uncapped for aggregate-GPU comparisons: the cap removes
+launch-order imbalance within one DP layout, not across different DP degrees.
+
+After calibration, the hardware-specific screening YAMLs run the full SeedTTS EN
+split with fixed physical-core budgets and exact per-DP caps:
+
+```bash
+source benchmarks/results/same_gpu_dp/<printed-calibration-label>/capacity.env
+GPU_UUID=GPU-... python benchmarks/same_gpu_dp/run_study.py benchmarks/same_gpu_dp/configs/h100_higgs_seedtts_screen.yaml --mode matrix
+GPU_UUID=GPU-... python benchmarks/same_gpu_dp/run_study.py benchmarks/same_gpu_dp/configs/h200_higgs_seedtts_screen.yaml --mode matrix
+```
+
+The screening matrix is direct-to-worker by design. Validate only the selected recipe
+with `MODE=router`. Router mode explicitly uses `least_request` by default and writes
+`router_workers_after.json` plus `router_summary.json` from the router's actual
+per-worker counters.
 
 ## Tune DP1 first
 

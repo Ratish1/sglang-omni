@@ -19,6 +19,8 @@ fi
 : "${MODEL:=boson-sglang/higgs-audio-v3-tts-4b-base}"
 : "${MODEL_NAME:=higgs}"
 : "${META:=zhaochenyang20/seed-tts-eval-arrow}"
+: "${CLIENT_DRIVER:=seedtts}"
+: "${TTS_MANIFEST:=}"
 : "${DP:=1}"
 : "${USE_MPS:=0}"
 : "${MODE:=direct}"
@@ -27,6 +29,7 @@ fi
 : "${SERVER_CORE_SETS:=0-15}"
 : "${CLIENT_CORE_SETS:=16-23}"
 : "${ROUTER_CORES:=}"
+: "${ROUTER_POLICY:=least_request}"
 : "${BASE_PORT:=8801}"
 : "${ROUTER_PORT:=8799}"
 : "${MEM_FRACTIONS:=0.85}"
@@ -111,6 +114,22 @@ fi
   echo "MODE must be direct or router" >&2
   exit 2
 }
+[[ "$ROUTER_POLICY" == round_robin || "$ROUTER_POLICY" == least_request || \
+  "$ROUTER_POLICY" == random ]] || {
+  echo "ROUTER_POLICY must be round_robin, least_request, or random" >&2
+  exit 2
+}
+[[ "$CLIENT_DRIVER" == seedtts || "$CLIENT_DRIVER" == manifest ]] || {
+  echo "CLIENT_DRIVER must be seedtts or manifest" >&2
+  exit 2
+}
+if [[ "$CLIENT_DRIVER" == manifest ]]; then
+  [[ -n "$TTS_MANIFEST" && -f "$TTS_MANIFEST" ]] || {
+    echo "TTS_MANIFEST must name a readable JSONL file for CLIENT_DRIVER=manifest" >&2
+    exit 2
+  }
+  TTS_MANIFEST=$(cd "$(dirname "$TTS_MANIFEST")" && pwd)/$(basename "$TTS_MANIFEST")
+fi
 [[ "$KV_EQUALITY" == off || "$KV_EQUALITY" == warn || "$KV_EQUALITY" == require ]] || {
   echo "KV_EQUALITY must be off, warn, or require" >&2
   exit 2
@@ -505,7 +524,7 @@ if [[ "$MODE" == router ]]; then
   for port in "${TARGET_PORTS[@]}"; do worker_urls+=("http://127.0.0.1:$port"); done
   router_command=(setsid numactl --physcpubind="$ROUTER_CORES" --membind="$NUMA_NODE"
     python -m sglang_omni_router.serve --host 127.0.0.1 --port "$ROUTER_PORT"
-    --worker-urls "${worker_urls[@]}" --model "$MODEL_NAME")
+    --worker-urls "${worker_urls[@]}" --model "$MODEL_NAME" --policy "$ROUTER_POLICY")
   print_command "${router_command[@]}"
   if [[ "$DRY_RUN" -eq 0 ]]; then
     "${router_command[@]}" > "$OUT/router.log" 2>&1 &
@@ -526,6 +545,11 @@ write_manifest() {
     echo "model=$MODEL"
     echo "model_name=$MODEL_NAME"
     echo "meta=$META"
+    echo "client_driver=$CLIENT_DRIVER"
+    echo "tts_manifest=$TTS_MANIFEST"
+    if [[ -n "$TTS_MANIFEST" ]]; then
+      echo "tts_manifest_sha256=$(sha256sum "$TTS_MANIFEST" | awk '{print $1}')"
+    fi
     echo "gpu_uuid=$GPU_UUID"
     echo "numa_node=$NUMA_NODE"
     echo "dp=$DP"
@@ -534,6 +558,7 @@ write_manifest() {
     echo "server_core_sets=$SERVER_CORE_SETS"
     echo "client_core_sets=$CLIENT_CORE_SETS"
     echo "router_cores=$ROUTER_CORES"
+    echo "router_policy=$ROUTER_POLICY"
     echo "mem_fractions=$MEM_FRACTIONS"
     echo "mps_thread_percentages=$MPS_THREAD_PERCENTAGES"
     echo "mps_pinned_mem_limits=$MPS_PINNED_MEM_LIMITS"
@@ -572,12 +597,18 @@ if [[ "$DRY_RUN" -eq 0 && "$CAPACITY_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
-BENCH_COMMON=(python -m benchmarks.eval.benchmark_tts_seedtts
-  --use-existing-server --generate-only --model "$MODEL_NAME" --meta "$META"
-  --ref-format "$REF_FORMAT" --lang "$BENCH_LANG" --max-new-tokens "$MAX_NEW_TOKENS"
-  --seed "$SEED" --warmup "$WARMUP" --disable-tqdm)
-[[ -n "$MAX_SAMPLES" ]] && BENCH_COMMON+=(--max-samples "$MAX_SAMPLES")
-[[ "$STREAM" -eq 1 ]] && BENCH_COMMON+=(--stream)
+if [[ "$CLIENT_DRIVER" == seedtts ]]; then
+  BENCH_COMMON=(python -m benchmarks.eval.benchmark_tts_seedtts
+    --use-existing-server --generate-only --model "$MODEL_NAME" --meta "$META"
+    --ref-format "$REF_FORMAT" --lang "$BENCH_LANG" --max-new-tokens "$MAX_NEW_TOKENS"
+    --seed "$SEED" --warmup "$WARMUP" --disable-tqdm)
+  [[ -n "$MAX_SAMPLES" ]] && BENCH_COMMON+=(--max-samples "$MAX_SAMPLES")
+  [[ "$STREAM" -eq 1 ]] && BENCH_COMMON+=(--stream)
+else
+  BENCH_COMMON=(python -m benchmarks.same_gpu_dp.benchmark_tts_manifest
+    --manifest "$TTS_MANIFEST" --model "$MODEL_NAME"
+    --server-max-new-tokens "$MAX_NEW_TOKENS" --warmup "$WARMUP")
+fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   for ((i = 0; i < DP; i++)); do
@@ -623,6 +654,13 @@ fi
 client_failed=0
 for pgid in "${CLIENT_PGIDS[@]}"; do wait "$pgid" || client_failed=1; done
 [[ "$client_failed" -eq 0 ]] || { echo "one or more benchmark clients failed" >&2; exit 1; }
+
+if [[ "$MODE" == router ]]; then
+  curl --silent --show-error --fail "http://127.0.0.1:${ROUTER_PORT}/workers" \
+    > "$OUT/router_workers_after.json"
+  python3 "$HERE/summarize.py" summarize-router \
+    --output "$OUT/router_summary.json" "$OUT/router_workers_after.json"
+fi
 
 if [[ "$MODE" == direct ]]; then
   result_paths=()
