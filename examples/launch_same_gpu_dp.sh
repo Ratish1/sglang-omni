@@ -4,19 +4,20 @@
 # This is a tested example, not a production process supervisor.
 #
 # Usage:
-#   MODEL=bosonai/higgs-tts-3-4b GPU_ID=0 N=2 CORE_BLOCKS="0-15 16-31" \
+#   MODEL=bosonai/higgs-tts-3-4b GPU_ID=0 N=3 MAX_TOTAL_TOKENS=100000 \
+#     CORE_BLOCKS="0-9 10-19 20-29" \
 #     bash examples/launch_same_gpu_dp.sh up
 #   bash examples/launch_same_gpu_dp.sh list
 #   bash examples/launch_same_gpu_dp.sh verify [RUN_ID]
 #   bash examples/launch_same_gpu_dp.sh down [RUN_ID]
 #
 # Environment for `up` (defaults in parentheses):
-#   MODEL (bosonai/higgs-tts-3-4b), MODEL_NAME (higgs), GPU_ID (0), N (2),
-#   MF (0.42 for N=2, 0.27 for N=3), BASE_PORT (8801),
+#   MODEL (bosonai/higgs-tts-3-4b), MODEL_NAME (higgs), GPU_ID (0), N (3),
+#   BASE_PORT (8801),
 #   CORE_BLOCKS: N non-overlapping CPU blocks on the GPU's NUMA node, required.
 #   NUMA_NODE: explicit override when the PCI-derived NUMA node is unavailable.
-#   MAX_TOTAL_TOKENS: optional positive integer; when set, every replica is launched
-#     with the same --max-total-tokens cap (unset = engine auto/profiled).
+#   MAX_TOTAL_TOKENS: common positive --max-total-tokens cap; required for N > 1.
+#   MF: optional explicit --mem-fraction-static override (unset = Higgs default).
 set -euo pipefail
 
 STATE_ROOT=${STATE_ROOT:-/tmp/sglang-omni-same-gpu-dp/$USER}
@@ -242,10 +243,8 @@ teardown_state() {
 
 up() {
   local model=${MODEL:-bosonai/higgs-tts-3-4b} model_name=${MODEL_NAME:-higgs}
-  local gpu=${GPU_ID:-0} n=${N:-2} base_port=${BASE_PORT:-8801} mf=${MF:-}
-  if [ -z "$mf" ]; then
-    case "$n" in 2) mf=0.42 ;; 3) mf=0.27 ;; *) die "set MF explicitly for N=$n" ;; esac
-  fi
+  local gpu=${GPU_ID:-0} n=${N:-3} base_port=${BASE_PORT:-8801} mf=${MF:-}
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "N must be a positive integer, got '$n'"
   [ -n "${CORE_BLOCKS:-}" ] || {
     echo "CORE_BLOCKS is required: N non-overlapping blocks on the GPU's NUMA node." >&2
     echo "Cores on that node: numactl -H" >&2
@@ -254,11 +253,17 @@ up() {
   local blocks=($CORE_BLOCKS)
   [ "${#blocks[@]}" = "$n" ] || die "CORE_BLOCKS must contain exactly $n blocks"
 
-  local extra_args=()
+  local extra_args=() mem_args=()
+  if [ "$n" -gt 1 ] && [ -z "${MAX_TOTAL_TOKENS:-}" ]; then
+    die "MAX_TOTAL_TOKENS is required for N=$n so every replica has the same KV capacity"
+  fi
   if [ -n "${MAX_TOTAL_TOKENS:-}" ]; then
     [[ "$MAX_TOTAL_TOKENS" =~ ^[1-9][0-9]*$ ]] \
       || die "MAX_TOTAL_TOKENS must be a positive integer, got '$MAX_TOTAL_TOKENS'"
     extra_args+=(--max-total-tokens "$MAX_TOTAL_TOKENS")
+  fi
+  if [ -n "$mf" ]; then
+    mem_args+=(--mem-fraction-static "$mf")
   fi
 
   local d
@@ -286,7 +291,8 @@ up() {
   mkdir -p "$state/logs" "$state/mps/pipe" "$state/mps/log"
   {
     echo "run_id=$run"; echo "gpu_id=$gpu"; echo "gpu_uuid=$uuid"; echo "numa_node=$node"
-    echo "model=$model"; echo "model_name=$model_name"; echo "n=$n"; echo "mf=$mf"
+    echo "model=$model"; echo "model_name=$model_name"; echo "n=$n"
+    echo "mem_fraction_static=${mf:-default}"
     echo "base_port=$base_port"; echo "core_blocks=$CORE_BLOCKS"
     echo "max_total_tokens=${MAX_TOTAL_TOKENS:-auto/profiled}"
   } > "$state/manifest"
@@ -312,7 +318,7 @@ up() {
     CUDA_VISIBLE_DEVICES=$gpu \
     setsid numactl --cpunodebind="$node" --membind="$node" -C "${blocks[$i]}" \
       sgl-omni serve --model-path "$model" --model-name "$model_name" \
-        --mem-fraction-static "$mf" "${extra_args[@]}" \
+        "${mem_args[@]}" "${extra_args[@]}" \
         --host 127.0.0.1 --port "$port" > "$log" 2>&1 < /dev/null &
     pid=$!
     printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$pid" "$pid" "$port" "$log" >> "$state/replicas.tsv"
@@ -332,10 +338,17 @@ up() {
       tail -n 8 "$log" >&2
       exit 1
     fi
-    echo "replica $i healthy on port $port (cores ${blocks[$i]}, mf $mf)"
-    # Note (jiaxin): per-replica KV pools are not additive shares of the device;
-    # later replicas can receive much smaller pools, so surface each allocation.
-    grep -m1 -oE '#tokens: [0-9]+' "$log" | sed "s/^/replica $i KV /" || true
+    echo "replica $i healthy on port $port (cores ${blocks[$i]}, mem fraction ${mf:-default})"
+    local resolved_tokens
+    resolved_tokens=$(grep -m1 -oE '#tokens:[[:space:]]*[0-9]+' "$log" \
+      | grep -oE '[0-9]+$' || true)
+    if [ "$n" -gt 1 ]; then
+      [ -n "$resolved_tokens" ] \
+        || die "replica $i is healthy but its resolved KV capacity is missing from $log"
+      [ "$resolved_tokens" = "$MAX_TOTAL_TOKENS" ] \
+        || die "replica $i resolved $resolved_tokens KV tokens; expected $MAX_TOTAL_TOKENS"
+    fi
+    echo "replica $i KV #tokens: ${resolved_tokens:-not found}"
   done
 
   verify_attach "$state" || exit 1

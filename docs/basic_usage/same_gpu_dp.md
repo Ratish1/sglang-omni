@@ -41,44 +41,40 @@ On a multi-GPU node, the right MPS topology depends on your deployment and shoul
 
 ```bash
 GPU_ID=0; NODE=0
-CORE_BLOCKS=("0-15" "16-31")            # one block per replica, non-overlapping
-MF=0.42
+CORE_BLOCKS=("0-9" "10-19" "20-29")     # one block per replica, non-overlapping
+MAX_TOTAL_TOKENS=100000
 i=0
-for PORT in 8801 8802; do
+for PORT in 8801 8802 8803; do
   CUDA_VISIBLE_DEVICES=$GPU_ID \
   numactl --cpunodebind=$NODE --membind=$NODE -C "${CORE_BLOCKS[$i]}" \
     sgl-omni serve \
       --model-path bosonai/higgs-tts-3-4b \
-      --mem-fraction-static $MF \
+      --max-total-tokens $MAX_TOTAL_TOKENS \
       --host 127.0.0.1 --port $PORT --model-name higgs > "replica_$i.log" 2>&1 &
   until [ "$(curl -s -o /dev/null -w '%{http_code}' -m 3 127.0.0.1:$PORT/health)" = 200 ]; do sleep 6; done
   i=$((i+1))
 done
 ```
 
-The example above uses the **same** `--mem-fraction-static` for every replica. Launch one at a time, wait for `/health`, and confirm each replica's `KV Cache is allocated. #tokens: ...` line is workable. Tested starting points on the 80 GB H100 Higgs configuration are 2 replicas at `mf=0.42` with 16 cores each, or 3 at `mf=0.27` with 10 cores each.
+The example leaves `--mem-fraction-static` unset and uses the model's existing default. Launch one replica at a time and wait for `/health` before starting the next.
 
 Identical `--mem-fraction-static` flags do **not** mean identical KV capacity. `--mem-fraction-static` is evaluated at each replica's init time against **remaining** GPU memory, roughly `mem_fraction × free_memory` after weights and other fixed overheads. It is a per-replica request against whatever is left, not an additive share of the card. Because replicas start sequentially, earlier ones have already reserved memory, so later ones see a smaller free pool and allocate fewer KV tokens even when every flag is the same (in one run, three sequential `mf=0.27` replicas received 97,503 / 53,149 / 20,961 KV tokens).
 
-To control KV size more precisely, set an explicit common token cap with `--max-total-tokens`, at or below the smallest capacity any replica can actually satisfy:
-
-```bash
-sgl-omni serve \
-  --mem-fraction-static 0.42 \
-  --max-total-tokens <COMMON_FEASIBLE_TOKEN_CAP> \
-  ...
-```
-
-The launcher passes the same cap to every replica when `MAX_TOTAL_TOKENS` is set:
+Memory profiling does not coordinate these independent processes. The launcher therefore requires a common cap for `N > 1`, passes it to every replica, and checks that every replica reports the requested capacity:
 
 ```bash
 MAX_TOTAL_TOKENS=<COMMON_FEASIBLE_TOKEN_CAP> \
   bash examples/launch_same_gpu_dp.sh up
 ```
 
-Leave `MAX_TOTAL_TOKENS` unset to retain the engine's auto-profiled behavior. Still read each replica's `KV Cache is allocated. #tokens: ...` line; if a replica cannot meet the cap, lower the common cap or reduce the replica count.
+The H100 Higgs runs used the following caps:
 
-Intuition suggests that equal KV capacity across colocated replicas is a prerequisite for peak efficiency. We do not yet have a mechanism that starts several servers on one GPU and guarantees identical KV pools without an explicit common cap, and we have not validated that equal allocation is optimal under all loads. **Upcoming experiments will measure how uneven per-replica memory budgets on the same GPU affect aggregate throughput.**
+| Replicas | `MAX_TOTAL_TOKENS` |
+|---:|---:|
+| 2 | 180000 |
+| 3 | 100000 |
+
+The larger caps support a larger active KV working set, but did not change throughput once the smaller pool was sufficient for the benchmark. Recalibrate the common cap for other models or hardware.
 
 4. **Drive every replica to saturation.**
 
@@ -114,7 +110,7 @@ Setting up and tearing down MPS is more involved than running a single replica, 
 | DP2 + MPS, 2 x c64 | 31.5 to 37.7 qps | 1.4 to 1.7x |
 | DP3 + MPS, 3 x c64 | 39.9 to 46.9 qps | 1.8 to 2.1x |
 
-These commands and `--mem-fraction-static` starting points are from an 80 GB H100 with Higgs and are not fixed recommendations for other GPUs. On an H200 you would re-determine the replica count, a common feasible token cap, `--mem-fraction-static`, CPU allocation, and saturation concurrency for that card. H200 may fit a larger KV budget or additional replicas, but this guide does not prescribe unverified values: repeat the sizing and saturation procedure and inspect every replica's actual allocation.
+These commands and token caps are from an 80 GB H100 with Higgs and are not fixed recommendations for other GPUs. On an H200 you would re-determine the replica count, common feasible token cap, CPU allocation, and saturation concurrency for that card. H200 may fit a larger KV budget or additional replicas, but this guide does not prescribe unverified values: repeat the sizing and saturation procedure and inspect every replica's actual allocation.
 
 
 ## How We Found This
@@ -141,7 +137,7 @@ The single-replica baseline decides whether same-GPU DP is worth it, and an unde
 * **Sweep concurrency to the plateau.** Raise client concurrency until throughput stops climbing, and read the scheduler log lines (`#running-req`, `#queue-req`) at each step rather than assuming a good operating point.
 * **Know the admission limit.** Higgs serves with `max_running_requests=64` and `cuda_graph_max_bs=64` by default; both can be raised via `sgl-omni serve --max_running_requests N --cuda_graph_max_bs N` (the CUDA-graph capture range must cover the admission limit, and raising it costs capture memory). Whether the default cap binds depends on the runtime, so check the queue, do not assume.
 * **Separate client from server.** Client concurrency is not the active generation batch: requests beyond the admission limit wait in the scheduler queue, and requests also spend time in the other pipeline stages.
-* **Prerequisites.** NVIDIA CUDA MPS available with GPU compute mode `Default`, so a per-user daemon needs no root; enough GPU memory for every replica, each sized with `--mem-fraction-static` plus a roughly fixed per-replica overhead (weights, codec, MPS context); non-overlapping CPU core blocks, one per replica, on the GPU's NUMA node (on SMT machines logical CPUs `N` and `N + ncores` are often the same physical core, so check `lscpu -e=CPU,CORE,NODE`); and enough offered concurrency to saturate each replica, not just the pool.
+* **Prerequisites.** NVIDIA CUDA MPS available with GPU compute mode `Default`, so a per-user daemon needs no root; enough GPU memory for every replica's common KV cap plus roughly fixed per-replica overhead (weights, codec, MPS context); non-overlapping CPU core blocks, one per replica, on the GPU's NUMA node (on SMT machines logical CPUs `N` and `N + ncores` are often the same physical core, so check `lscpu -e=CPU,CORE,NODE`); and enough offered concurrency to saturate each replica, not just the pool.
 
 
 ### Evaluate
@@ -189,7 +185,7 @@ Low SM activity at the tuned single replica's peak may indicate reclaimable head
 
 1. **Generality is not fully validated.** Beyond the pinned H100 Higgs case study, we also ran related experiments on H200 and used SGLang to serve Qwen3-4B directly; both lines of work largely confirmed the same-GPU DP gains. Space and time limit how completely we can present those results here, and the measurements are not yet as polished as we would like. We believe same-GPU DP is a promising direction for smaller models on GPUs with ample memory and compute headroom, but the experimental coverage is still incomplete.
 
-2. **Strictly equal per-replica KV size.** Sequential starts with the same `--mem-fraction-static` do not yield the same KV pool. Set each replica's KV size directly (e.g. a common `--max-total-tokens`) so capacities are strictly identical; intuition favors that for peak efficiency, but equal-versus-asymmetric budgets still need dedicated experiments and a sizing procedure that generalizes across cards.
+2. **KV sizing is hardware- and workload-specific.** The launcher enforces a strictly equal per-replica KV size through a common `--max-total-tokens`. A sizing procedure that generalizes across cards and workloads still needs further study.
 
 3. **Router and scheduler still need a deeper dive.** Both the router and the SGLang Omni scheduler need further optimization. On the router side, better routing strategies for a colocated pool are clearly required. On the scheduler side, a more ambitious question is whether we can borrow the spirit of LLM prefill–decode (PD) disaggregation: keep one large shared KV cache and let multiple replicas share it. That direction is extremely challenging, and we believe the potential payoff is correspondingly large.
 
