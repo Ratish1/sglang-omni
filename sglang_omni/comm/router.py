@@ -23,6 +23,7 @@ class CommRouter:
         *,
         stage_name: str,
         gpu_id: int | None,
+        placement_gpu_id: int | None = None,
         same_process_targets: set[str] | None,
         gpu_stage_names: set[str] | None,
         stage_gpu_ids: dict[str, tuple[int, ...]] | None = None,
@@ -32,6 +33,7 @@ class CommRouter:
     ) -> None:
         self.stage_name = stage_name
         self.gpu_id = gpu_id
+        self.placement_gpu_id = gpu_id if placement_gpu_id is None else placement_gpu_id
         self.same_process_targets = set(same_process_targets or ())
         self.gpu_stage_names = set(gpu_stage_names or ())
         self.stage_gpu_ids = {
@@ -51,12 +53,12 @@ class CommRouter:
         return target in self.same_process_targets
 
     def is_same_gpu_target(self, target: str) -> bool:
-        if self.gpu_id is None or target in self.same_process_targets:
+        if self.placement_gpu_id is None or target in self.same_process_targets:
             return False
         target_gpu_ids = self.stage_gpu_ids.get(target)
         if target_gpu_ids is None:
             return False
-        return len(target_gpu_ids) == 1 and target_gpu_ids[0] == self.gpu_id
+        return len(target_gpu_ids) == 1 and target_gpu_ids[0] == self.placement_gpu_id
 
     def outbound(self, target: str) -> TransportKind:
         if target in self.same_process_targets:

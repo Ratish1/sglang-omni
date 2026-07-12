@@ -49,6 +49,7 @@ class StageLaunchConfig:
     role: Literal["single", "leader", "follower"] = "single"
     tp_rank: int = 0
     tp_size: int = 1
+    placement_gpu_id: int | None = None
     gpu_id: int | None = None
     nccl_port: int | None = None
 
@@ -742,6 +743,7 @@ def _construct_stage(
         role=spec.role,
         get_next=get_next,
         gpu_id=spec.gpu_id,
+        placement_gpu_id=spec.placement_gpu_id,
         endpoints=spec.stage_endpoints,
         control_plane=control_plane,
         input_handler=input_handler,
@@ -852,6 +854,8 @@ def _prepare_cuda_environment(
 
 
 def _normalize_spec_gpu_id_to_local_device(spec: StageLaunchConfig) -> None:
+    if spec.placement_gpu_id is None:
+        spec.placement_gpu_id = spec.gpu_id
     spec.gpu_id = 0
     if "gpu_id" in spec.factory_arg_defaults:
         spec.factory_arg_defaults["gpu_id"] = 0

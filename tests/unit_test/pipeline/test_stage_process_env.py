@@ -68,6 +68,7 @@ def test_tp_child_keeps_parent_mapped_visible_device(monkeypatch) -> None:
     stage_workers._prepare_cuda_environment(spec, _RecordingLog())
 
     assert spec.gpu_id == 0
+    assert spec.placement_gpu_id == 1
     assert spec.factory_arg_defaults["gpu_id"] == 0
     assert spec.comm_config["gpu_id"] == 0
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "4"

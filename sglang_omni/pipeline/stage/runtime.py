@@ -83,6 +83,7 @@ class Stage:
         gpu_id: int | None,
         endpoints: dict[str, str],
         control_plane: Any,
+        placement_gpu_id: int | None = None,
         input_handler: InputHandler | None = None,
         relay: Relay | None = None,
         comm_config: dict[str, Any] | None = None,
@@ -123,6 +124,7 @@ class Stage:
             CommRouter(
                 stage_name=name,
                 gpu_id=self.gpu_id,
+                placement_gpu_id=placement_gpu_id,
                 same_process_targets=self._same_process_targets,
                 gpu_stage_names=gpu_stage_names or set(),
                 stage_gpu_ids=stage_gpu_ids,
