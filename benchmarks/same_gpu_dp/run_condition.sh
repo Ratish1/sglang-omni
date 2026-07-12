@@ -50,6 +50,7 @@ fi
 : "${SHUTDOWN_TIMEOUT:=90}"
 : "${KV_EQUALITY:=warn}"
 : "${CAPACITY_ONLY:=0}"
+: "${KEEP_AUDIO:=0}"
 : "${REQUIRE_IDLE_GPU:=1}"
 : "${MPS_THREAD_PERCENTAGES:=}"
 : "${MPS_PINNED_MEM_LIMITS:=}"
@@ -66,6 +67,10 @@ fi
 }
 [[ "$CAPACITY_ONLY" =~ ^[01]$ ]] || {
   echo "CAPACITY_ONLY must be 0 or 1" >&2
+  exit 2
+}
+[[ "$KEEP_AUDIO" =~ ^[01]$ ]] || {
+  echo "KEEP_AUDIO must be 0 or 1" >&2
   exit 2
 }
 [[ "$NUMA_NODE" =~ ^[0-9]+$ ]] || { echo "NUMA_NODE must be non-negative" >&2; exit 2; }
@@ -377,6 +382,9 @@ cleanup() {
       echo "MPS control PID $MPS_CONTROL_PID is still alive; preserving $MPS_ROOT" >&2
     fi
   fi
+  if [[ "$KEEP_AUDIO" -eq 0 && -d "$OUT" ]]; then
+    find "$OUT" -type f -path '*/audio/*.wav' -delete
+  fi
   exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -565,6 +573,7 @@ write_manifest() {
     echo "stream=$STREAM"
     echo "require_idle_gpu=$REQUIRE_IDLE_GPU"
     echo "capacity_only=$CAPACITY_ONLY"
+    echo "keep_audio=$KEEP_AUDIO"
     echo "mps_tmp_root=$MPS_TMP_ROOT"
     echo "mps_runtime_root=$MPS_ROOT"
     echo "mps_control_pid=$MPS_CONTROL_PID"
