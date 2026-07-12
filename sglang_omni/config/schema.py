@@ -68,17 +68,12 @@ class SGLangServerArgsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mem_fraction_static: float | None = None
-    max_total_tokens: int | None = None
 
     def model_post_init(self, __context: Any = None) -> None:
         value = self.mem_fraction_static
         if value is not None and not 0.0 < value < 1.0:
             raise ValueError(
                 "runtime.sglang_server_args.mem_fraction_static must be in (0, 1)"
-            )
-        if self.max_total_tokens is not None and self.max_total_tokens <= 0:
-            raise ValueError(
-                "runtime.sglang_server_args.max_total_tokens must be positive"
             )
 
 

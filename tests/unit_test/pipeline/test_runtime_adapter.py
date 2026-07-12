@@ -38,10 +38,7 @@ def test_typed_runtime_maps_to_factory_args_and_sglang_overrides() -> None:
             resources=StageResourceConfig(total_gpu_memory_fraction=0.25),
             max_seq_len=32768,
             video_fps=2.0,
-            sglang_server_args=SGLangServerArgsConfig(
-                mem_fraction_static=0.72,
-                max_total_tokens=84328,
-            ),
+            sglang_server_args=SGLangServerArgsConfig(mem_fraction_static=0.72),
         ),
         runtime_arg_map={
             "max_seq_len": "thinker_max_seq_len",
@@ -65,7 +62,6 @@ def test_typed_runtime_maps_to_factory_args_and_sglang_overrides() -> None:
     assert args["server_args_overrides"] == {
         "disable_cuda_graph": True,
         "mem_fraction_static": 0.72,
-        "max_total_tokens": 84328,
     }
     assert args["total_gpu_memory_fraction"] == 0.25
 
@@ -119,19 +115,6 @@ def test_typed_sglang_runtime_rejects_factory_mem_fraction_duplicate() -> None:
     config = PipelineConfig(model_path="dummy-model", stages=[stage])
 
     with pytest.raises(ValueError, match="mem_fraction_static"):
-        resolve_stage_factory_args(stage, config)
-
-
-def test_typed_sglang_runtime_rejects_max_total_tokens_duplicate() -> None:
-    stage = _stage(
-        factory_args={"server_args_overrides": {"max_total_tokens": 100000}},
-        runtime=StageRuntimeConfig(
-            sglang_server_args=SGLangServerArgsConfig(max_total_tokens=84328)
-        ),
-    )
-    config = PipelineConfig(model_path="dummy-model", stages=[stage])
-
-    with pytest.raises(ValueError, match="max_total_tokens"):
         resolve_stage_factory_args(stage, config)
 
 

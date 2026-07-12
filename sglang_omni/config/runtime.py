@@ -134,17 +134,6 @@ def _validate_runtime_sources(
             "server_args_overrides and typed "
             "runtime.sglang_server_args.mem_fraction_static"
         )
-    typed_max_total_tokens = stage_cfg.runtime.sglang_server_args.max_total_tokens
-    if typed_max_total_tokens is not None and _server_args_value_is_set(
-        "max_total_tokens",
-        factory_args,
-        runtime_overrides,
-    ):
-        raise ValueError(
-            f"Stage {stage_cfg.name!r} sets max_total_tokens through both "
-            "server_args_overrides and typed "
-            "runtime.sglang_server_args.max_total_tokens"
-        )
 
     reject_untyped_total_gpu_memory_fraction(
         stage_cfg.name,
@@ -173,19 +162,12 @@ def _server_args_mem_fraction_static_is_set(
     factory_args: dict[str, Any],
     runtime_overrides: dict[str, Any],
 ) -> bool:
-    return _server_args_value_is_set(
-        "mem_fraction_static", factory_args, runtime_overrides
-    )
-
-
-def _server_args_value_is_set(
-    key: str,
-    factory_args: dict[str, Any],
-    runtime_overrides: dict[str, Any],
-) -> bool:
     for source in (factory_args, runtime_overrides):
         server_args = source.get("server_args_overrides")
-        if isinstance(server_args, dict) and server_args.get(key) is not None:
+        if (
+            isinstance(server_args, dict)
+            and server_args.get("mem_fraction_static") is not None
+        ):
             return True
     return False
 
@@ -222,13 +204,9 @@ def _apply_typed_runtime_args(args: dict[str, Any], stage_cfg: StageConfig) -> N
         args[target_arg] = value
 
     mem_fraction_static = runtime.sglang_server_args.mem_fraction_static
-    max_total_tokens = runtime.sglang_server_args.max_total_tokens
-    if mem_fraction_static is not None or max_total_tokens is not None:
+    if mem_fraction_static is not None:
         overrides = dict(args.get("server_args_overrides") or {})
-        if mem_fraction_static is not None:
-            overrides["mem_fraction_static"] = mem_fraction_static
-        if max_total_tokens is not None:
-            overrides["max_total_tokens"] = max_total_tokens
+        overrides["mem_fraction_static"] = mem_fraction_static
         args["server_args_overrides"] = overrides
 
 

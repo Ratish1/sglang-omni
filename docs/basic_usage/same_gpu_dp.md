@@ -1,208 +1,196 @@
-# Experimental same-GPU data parallelism with CUDA MPS
+# Same-GPU Data Parallelism with CUDA MPS
 
-Same-GPU data parallelism runs several complete SGLang Omni replicas on one
-physical GPU. CUDA Multi-Process Service (MPS) can let kernels from those CUDA
-processes execute concurrently, filling gaps left by host dispatch or small GPU
-workloads.
+> TL;DR: Same-GPU DP with CUDA MPS can substantially increase throughput. In the pinned TTS tests below, saturated DP2 and DP3 configurations reached 1.4 to 2.1x the tuned single-replica throughput.
 
-This is an **experimental deployment technique**. It is useful only when it
-beats a tuned single replica under the latency, output, quality, and reliability
-requirements of the workload. It is not the default DP placement strategy.
+A common data-parallel deployment assigns one GPU to each replica. When a tuned replica still leaves substantial GPU headroom, colocating multiple replicas on the same GPU can improve per-GPU throughput.
 
-Historical Higgs TTS experiments in [issue
-#907](https://github.com/sgl-project/sglang-omni/issues/907), [PR
-#912](https://github.com/sgl-project/sglang-omni/pull/912), and [PR
-#986](https://github.com/sgl-project/sglang-omni/pull/986) found substantial
-MPS scaling over particular same-GPU configurations. The first independent
-review briefly found tuned DP1 faster, but that DP run used concurrency 16 per
-replica and under-filled a 64-request generation cap. Its corrected sweep found
-DP2 and DP3 wins for host-bound Higgs, while compute-bound MOSS-TTS-Local showed
-almost no peak gain. These results establish the mechanism and its sensitivity,
-not portable performance ratios: checkpoint, generation length, CPU placement,
-batching, and client behavior all matter.
+Same-GPU data parallelism runs several complete serving replicas on one GPU and lets [CUDA MPS](https://docs.nvidia.com/deploy/mps/index.html) share the GPU between them. This is a conditional and ongoing optimization. We are excited to share it and call for the community to join the exploration.
 
-## What is replicated
+## Deploy
 
-The Higgs V1 configuration is one fused pipeline process containing
-preprocessing, reference audio encoding, autoregressive generation, and the
-vocoder. Same-GPU DP launches that complete process more than once. Each replica
-has its own Python interpreter and CUDA context, which can reduce Python/GIL and
-host-dispatch serialization.
+The steps below are one continuous flow. We provide a script `examples/launch_same_gpu_dp.sh` to wrap them behind a per-run state directory (`up/verify/down/list`). It records replica PIDs, process groups, ports, and logs, refuses to start when ports are taken or another run is recorded on the same GPU, health-gates sequential startup, surfaces each replica's logged KV allocation, compares expected replica processes against the MPS client list, and tears down only the processes it recorded. The manual steps below explain each mechanism, checkpoint, and failure mode; the launcher is a convenience wrapper around them, not a production supervisor, and it does not remove your responsibility to check actual KV capacity, MPS attachment, and saturation. Detailed instructions are as follows:
 
-It also duplicates the AR weights and CUDA graphs, codec/vocoder state, KV and
-request pools, reference caches, scheduler, and HTTP state. Memory cost and
-startup time therefore grow with the replica count. MPS schedules CUDA work
-between processes; it does not share model weights or turn the replicas into one
-engine.
+1. **Choose the GPU and NUMA node.**
 
-Without MPS, independent CUDA contexts normally time-slice. With MPS, kernels
-from different clients may overlap on the same SMs. Scaling stops when GPU
-compute, memory bandwidth, VRAM, host dispatch, the client, or a router becomes
-the next bottleneck. NVIDIA's [MPS deployment
-guide](https://docs.nvidia.com/deploy/mps/) describes its scheduling and control
-interfaces.
+```bash
+nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
+GPU_ID=0
+BUS=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i $GPU_ID)
+BUS=${BUS,,}; BUS=${BUS:4}
+NODE=$(cat /sys/bus/pci/devices/$BUS/numa_node)   # if -1, set the node explicitly
+numactl -H | grep "node $NODE cpus"
+```
 
-MPS provides concurrency, not strong isolation. On Volta and newer GPUs, a
-fatal GPU fault is reported to all MPS clients sharing the affected GPU, and the
-MPS server remains unavailable to affected clients until they exit. Test this
-blast radius and restart behavior before production use.
+Pick a GPU that is idle, then find its NUMA node from the PCI bus id (drm card ordinals do not always match nvidia-smi ordinals), and pin replicas and memory to that node.
 
-## Memory is a measured contract
+2. **Start a private MPS daemon.**
 
-`--mem-fraction-static` is an SGLang memory-planning input, not a fraction that
-can safely be multiplied by the replica count. Higgs loads other GPU components
-before the AR engine profiles its KV headroom. The second and later replicas see
-less free memory because complete earlier replicas are already resident.
-Consequently:
+```bash
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps-$USER-gpu$GPU_ID/pipe
+export CUDA_MPS_LOG_DIRECTORY=/tmp/mps-$USER-gpu$GPU_ID/log
+mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+nvidia-cuda-mps-control -d
+echo get_default_active_thread_percentage | nvidia-cuda-mps-control   # sanity: responds
+```
 
-- equal fractions do not guarantee equal `max_total_num_tokens`;
-- launch order may change per-replica KV capacity and batching headroom;
-- sequential startup makes the order reproducible, but not the capacities equal;
-- a point that fits on one driver/CUDA/checkpoint combination may OOM on another.
+Isolate this experiment behind a private MPS pipe directory. Every colocated replica in the experiment must use the same directory, or it may fall back to ordinary CUDA context time-slicing.
 
-Record the resolved KV token capacity for every replica. Publication-quality
-comparisons should first discover the minimum capacity across launch order and
-MPS mode, then pass that per-DP cap through `--max-total-tokens`. SGLang applies
-this as an upper bound after profiling and before allocating the KV pool. The
-validation harness fails if any replica still resolves smaller or if it cannot
-extract the installed SGLang log format. Keep DP1 uncapped: the cap removes
-within-condition launch-order bias, rather than forcing every DP count to have
-the same aggregate KV capacity.
+On a multi-GPU node, the right MPS topology depends on your deployment and should be validated there: NVIDIA's control daemon is often run once per node, and this guide's performance case study below covers only a single H100. Before relying on any cross-GPU result, confirm how the daemon, its pipe and log directories, and each replica's `CUDA_VISIBLE_DEVICES` map to physical GPUs in your setup.
 
-## CPU and traffic placement
+3. **Launch replicas sequentially, and check each KV pool.**
 
-Give every replica a dedicated subset of one fixed, NUMA-local server CPU
-budget. Give every direct benchmark client a separate dedicated subset, disjoint
-from all server cores. DP1 receives the union of the server cores used by DP2–4;
-DP does not receive additional host resources merely because it has more
-processes.
+```bash
+GPU_ID=0; NODE=0
+CORE_BLOCKS=("0-15" "16-31")            # one block per replica, non-overlapping
+MF=0.42
+i=0
+for PORT in 8801 8802; do
+  CUDA_VISIBLE_DEVICES=$GPU_ID \
+  numactl --cpunodebind=$NODE --membind=$NODE -C "${CORE_BLOCKS[$i]}" \
+    sgl-omni serve \
+      --model-path bosonai/higgs-tts-3-4b \
+      --mem-fraction-static $MF \
+      --host 127.0.0.1 --port $PORT --model-name higgs > "replica_$i.log" 2>&1 &
+  until [ "$(curl -s -o /dev/null -w '%{http_code}' -m 3 127.0.0.1:$PORT/health)" = 200 ]; do sleep 6; done
+  i=$((i+1))
+done
+```
 
-Shared affinity such as assigning `0-31` to every replica does not isolate CPU
-dispatch and can hide severe scheduling contention. Record `nvidia-smi topo -m`,
-CPU sets, memory binding, and client placement with every result.
+The example above uses the **same** `--mem-fraction-static` for every replica. Launch one at a time, wait for `/health`, and confirm each replica's `KV Cache is allocated. #tokens: ...` line is workable. Tested starting points on the 80 GB H100 Higgs configuration are 2 replicas at `mf=0.42` with 16 cores each, or 3 at `mf=0.27` with 10 cores each.
 
-Measure direct traffic first: one concurrent canonical benchmark client per
-worker. This establishes the replica pool ceiling and per-worker balance. Add
-the [Omni Router](omni_router.md) in a separate, otherwise identical condition.
-Router throughput is a different result because its connection limits, request
-selection, event loop, and CPU placement can become bottlenecks.
+Identical `--mem-fraction-static` flags do **not** mean identical KV capacity. `--mem-fraction-static` is evaluated at each replica's init time against **remaining** GPU memory, roughly `mem_fraction × free_memory` after weights and other fixed overheads. It is a per-replica request against whatever is left, not an additive share of the card. Because replicas start sequentially, earlier ones have already reserved memory, so later ones see a smaller free pool and allocate fewer KV tokens even when every flag is the same (in one run, three sequential `mf=0.27` replicas received 97,503 / 53,149 / 20,961 KV tokens).
 
-Saturate every replica before comparing peaks. Sweep per-worker client
-concurrency through and beyond the effective generation batch cap; concurrency
-16 can substantially under-drive a replica configured for 64 running requests.
-Use the best point under the same latency/RTF SLO for DP1 and each DPk condition.
+To control KV size more precisely, set an explicit common token cap with `--max-total-tokens`, at or below the smallest capacity any replica can actually satisfy:
 
-## Safe MPS lifecycle
+```bash
+sgl-omni serve \
+  --mem-fraction-static 0.42 \
+  --max-total-tokens <COMMON_FEASIBLE_TOKEN_CAP> \
+  ...
+```
 
-Use a GPU UUID rather than a physical ordinal when scoping `CUDA_VISIBLE_DEVICES`
-for the MPS daemon and every replica. Inside that visibility boundary the
-pipeline correctly addresses the selected GPU as `cuda:0`, without depending on
-host ordinal remapping.
+The launcher passes the same cap to every replica when `MAX_TOTAL_TOKENS` is set:
 
-Each benchmark condition should use unique `CUDA_MPS_PIPE_DIRECTORY` and
-`CUDA_MPS_LOG_DIRECTORY` paths. Keep the runtime path short because MPS creates
-Unix-domain sockets below it; long artifact-directory paths can prevent the
-control socket from being created. Poll the control interface after daemon
-launch rather than assuming the daemonized command's immediate exit status is
-the readiness signal. A valid lifecycle is:
+```bash
+MAX_TOTAL_TOKENS=<COMMON_FEASIBLE_TOKEN_CAP> \
+  bash examples/launch_same_gpu_dp.sh up
+```
 
-1. Confirm the selected GPU is otherwise idle and in compute mode `Default`.
-2. Start a per-user MPS daemon with only that GPU UUID visible.
-3. Launch one tracked replica process group and wait for bounded `/health`
-   readiness before launching the next.
-4. Run MPS `ps` (or enumerate server/client lists) and prove that a CUDA client
-   belonging to every tracked replica is attached. A live control daemon or the
-   absence of `MpsRpc` errors is not proof of attachment.
-5. On teardown, send `SIGTERM` only to tracked replica groups and wait.
-6. For a stuck CUDA client, use MPS `terminate_client` with the enumerated server
-   and client PIDs before any final process-group kill.
-7. Send `quit` only to the MPS daemon owned by this condition.
+Leave `MAX_TOTAL_TOKENS` unset to retain the engine's auto-profiled behavior. Still read each replica's `KV Cache is allocated. #tokens: ...` line; if a replica cannot meet the cap, lower the common cap or reduce the replica count.
 
-Do not use broad `pkill` patterns. Do not reuse or stop another service's MPS
-daemon. An interrupted launch, readiness failure, client failure, and normal
-completion must all follow the same owned cleanup path.
+Intuition suggests that equal KV capacity across colocated replicas is a prerequisite for peak efficiency. We do not yet have a mechanism that starts several servers on one GPU and guarantees identical KV pools without an explicit common cap, and we have not validated that equal allocation is optimal under all loads. **Upcoming experiments will measure how uneven per-replica memory budgets on the same GPU affect aggregate throughput.**
 
-For an MPS-off control, explicitly set `CUDA_MPS_PIPE_DIRECTORY` to a unique
-nonexistent path. NVIDIA documents this as the MPS bypass; merely omitting the
-variable can attach a client to a daemon at the default pipe and invalidate the
-comparison. Use one UUID-scoped MPS control/server pair per GPU for multi-GPU
-experiments, with a distinct pipe directory for each pair.
+4. **Drive every replica to saturation.**
 
-MPS active-thread percentage and pinned device-memory limits are useful
-experiments for provisioning or containing a noisy replica. They are not strong
-SM, bandwidth, or fault isolation. Validate their exact CUDA-version syntax and
-measure both unconstrained and approximately `100 / DP` active-thread settings.
+To reach maximum throughput, feed replicas one by one: keep sending to a replica until it is saturated (`#queue-req > 0`), then move to the next. Aggregate concurrency alone can leave some replicas under-driven. SGLang Omni's router does not yet support this fill-one-then-next behavior; that is planned for later work. Additionally, as mentioned in the previous section, once every colocated replica can be given a stable, equal KV pool, sequential filling should no longer be needed: with fully equivalent workers, random routing is the most efficient way to keep the pool saturated.
 
-## H200 validation procedure
+5. **Verify MPS attachment.**
 
-Use the same-GPU DP benchmark harness in
-`benchmarks/same_gpu_dp/README.md`. It drives the canonical
-`benchmark_tts_seedtts` `/v1/audio/speech` path, records manifests, validates CPU
-placement, owns MPS and child lifecycles, and aggregates the existing
-`speed_results.json` schema. Run its dry-run mode and inspect every command before
-using the H200.
+MPS should be verified carefully. Four things are easy to conflate: env vars set, daemon running, an MPS server exists, and the replica processes you launched are actually attached as clients. Only the last makes the comparison valid, and a replica that missed the pipe directory falls back to time-slicing without any error. The launcher writes the server-to-client PID mapping to `mps_attach.txt` and fails if any replica has no attached client; to check manually:
 
-Before the primary matrix, run its capacity-only calibration across MPS off/on
-and source the generated `DPn_MAX_TOTAL_TOKENS` values. A publication matrix
-with `KV_EQUALITY=require` refuses DP2–4 when these calibrated caps are absent.
+```bash
+echo get_server_list | nvidia-cuda-mps-control
+for SRV in $(echo get_server_list | nvidia-cuda-mps-control); do
+  echo "server $SRV clients:"; echo "get_client_list $SRV" | nvidia-cuda-mps-control
+done
+ps -o pid,pgid,cmd -p <client pids>     # confirm they are your replica processes
+grep -c MpsRpc <your replica logs>      # must total 0
+```
 
-First tune DP1 across at least:
+6. **Route traffic.**
 
-- client concurrency `8, 16, 32, 48, 64, 96, 128`;
-- `max_running_requests` and CUDA graph batch size `64/64` and `128/128`;
-- viable memory fractions;
-- the complete NUMA-local server CPU budget not reserved for clients.
+For easy deployment, you can register each replica endpoint with the [Omni Router](omni_router.md). Keep the router's `--max-connections` at least as large as the total offered concurrency. However, as we said, the current router does not support sequential filling, i.e., the fill-one-then-next scheduling strategy. To reach maximum throughput, you can manually route traffic to the replicas one by one.
 
-Choose the Pareto-best DP1 point under a declared p95 latency/RTF SLO. Then run:
+7. **Tear down safely.**
 
-| Variable | Required points |
+On a shared host, only touch processes you launched, and never treat "the GPU is empty" as the success condition. Stop new traffic, then SIGTERM each tracked replica process group (`kill -TERM -- -<pgid>`, which also reaps the `multiprocessing-fork` stage workers) and wait until they exit. Confirm the MPS client list is empty (`get_client_list <server>`): the pipe is private to your run, so any remaining client is outstanding work even when its PID no longer matches a tracked group, and live clients must be gone before the daemon quits, or the MPS server can enter an RPC-failure state that outlasts your run. Only then quit the daemon (`echo quit | nvidia-cuda-mps-control`), and SIGKILL surviving tracked groups only as a last resort. `examples/launch_same_gpu_dp.sh down` follows this order and keeps the state directory whenever cleanup cannot be confirmed.
+
+Setting up and tearing down MPS is more involved than running a single replica, but in the pinned H100 Higgs tests the throughput gain was substantial. The table below shows the nominal completed-run ranges; the full accounting, including the failed and degraded runs, is in the case study.
+
+
+| Configuration | Nominal throughput | Relative to single |
+|---|---:|---:|
+| Single c96 | 21.7 to 22.1 qps | 1.0x |
+| DP2 + MPS, 2 x c64 | 31.5 to 37.7 qps | 1.4 to 1.7x |
+| DP3 + MPS, 3 x c64 | 39.9 to 46.9 qps | 1.8 to 2.1x |
+
+These commands and `--mem-fraction-static` starting points are from an 80 GB H100 with Higgs and are not fixed recommendations for other GPUs. On an H200 you would re-determine the replica count, a common feasible token cap, `--mem-fraction-static`, CPU allocation, and saturation concurrency for that card. H200 may fit a larger KV budget or additional replicas, but this guide does not prescribe unverified values: repeat the sizing and saturation procedure and inspect every replica's actual allocation.
+
+
+## How We Found This
+
+This recipe grew out of the serving profiling in [#907](https://github.com/sgl-project/sglang-omni/issues/907). Our profiling found substantial unused GPU capacity across several omni serving workloads, with strong host-dispatch-bound evidence in the tested ASR setup. From there we ran same-GPU DP experiments on [Higgs](https://sgl-project.github.io/sglang-omni/cookbook/higgs_tts.html) and [Moss](https://sgl-project.github.io/sglang-omni/cookbook/moss_tts_local.html) TTS models.
+
+| Experiment | GPU signal | Controlled observation | Result | Interpretation |
+|---|---|---|---|---|
+| ASR single replica | GPU timeline 94.3% idle | throughput 0.90x at SM clock 0.455x; 0.31x at host CPU near 0.25x | sensitive to CPU, not to GPU compute | strong host-dispatch-bound causal evidence in this ASR setup |
+| Higgs tuned single | SM Active about 29%, GPU idle about 71% | throughput plateaued, worker fully driven | 1.00x normalized | clear reclaimable GPU headroom, but not the full ASR causal closure |
+| Higgs DP2 without MPS | SM Active about 37 to 38%, GPU idle about 62 to 63% | added a second same-card server process | about 1.24x normalized | the second process reclaims part of the idle gap; host scheduling and long-tail batching can both contribute |
+| Higgs DP with MPS | see the pinned case study in Evaluate | each replica saturated, MPS attachment confirmed | 1.4 to 2.1x nominal, repeated | MPS-enabled saturated runs produced the largest gains observed in the later pinned tests. |
+
+ASR is the strongest host-bound evidence. Higgs started as a gray zone but clearly leaves GPU headroom at a tuned single replica. Running several replicas as separate processes changes host execution, scheduling, and long-tail behavior, and it is not the same as enlarging one replica's batch. Without MPS the CUDA contexts mostly time-slice and recover only part of the idle; MPS lets kernels from different processes run concurrently when resources permit, and the later MPS-enabled saturated runs produced the largest gains observed in the pinned tests.
+
+## Reproduce the results
+
+We release our early results and the guidance to reproduce them below.
+
+### Prepare the baseline
+
+The single-replica baseline decides whether same-GPU DP is worth it, and an under-driven baseline makes DP look better than it is. Tune and measure one replica first, then treat its throughput, latency, and GPU utilization as the number every DP configuration has to beat.
+
+* **Sweep concurrency to the plateau.** Raise client concurrency until throughput stops climbing, and read the scheduler log lines (`#running-req`, `#queue-req`) at each step rather than assuming a good operating point.
+* **Know the admission limit.** Higgs serves with `max_running_requests=64` and `cuda_graph_max_bs=64` by default; both can be raised via `sgl-omni serve --max_running_requests N --cuda_graph_max_bs N` (the CUDA-graph capture range must cover the admission limit, and raising it costs capture memory). Whether the default cap binds depends on the runtime, so check the queue, do not assume.
+* **Separate client from server.** Client concurrency is not the active generation batch: requests beyond the admission limit wait in the scheduler queue, and requests also spend time in the other pipeline stages.
+* **Prerequisites.** NVIDIA CUDA MPS available with GPU compute mode `Default`, so a per-user daemon needs no root; enough GPU memory for every replica, each sized with `--mem-fraction-static` plus a roughly fixed per-replica overhead (weights, codec, MPS context); non-overlapping CPU core blocks, one per replica, on the GPU's NUMA node (on SMT machines logical CPUs `N` and `N + ncores` are often the same physical core, so check `lscpu -e=CPU,CORE,NODE`); and enough offered concurrency to saturate each replica, not just the pool.
+
+
+### Evaluate
+
+Whether same-GPU DP helps is easy to measure incorrectly, so hold the comparison to the same discipline for every configuration:
+
+| Control | Why it matters |
 |---|---|
-| Replicas | DP1, DP2, DP3, DP4 (record OOM/not-fit points) |
-| MPS | off and on |
-| MPS provisioning | unconstrained and approximately `100 / DP` active threads |
-| Traffic | direct first, router separately |
-| Workload | short/long text, warm/cold reference, streaming/non-streaming |
-| Load | per-worker concurrency sweep through the generation batch cap |
-| Repetitions | at least five, with randomized condition order |
-| CPU | one fixed total server and client budget, dedicated subdivisions |
-| Memory | equal recorded KV-token capacity or an explicit failed fairness gate |
+| tune the single replica to its throughput plateau | keeps the baseline from being artificially weak |
+| hold total GPU and CPU resources fixed | separates replica splitting from simply adding resources |
+| give each replica dedicated CPU cores | keeps replicas from contending for host dispatch |
+| saturate each replica separately | keeps the DP pool from being under-fed |
+| pin software and runtime settings | makes the comparison reproducible |
+| report latency and unsuccessful runs | avoids showing only the best throughput |
 
-Do not report request QPS alone. Preserve and compare:
+## Case Study on H100 with Higgs TTS Model
 
-- p50, p95, and p99 latency;
-- mean and tail real-time factor (RTF);
-- generated audio seconds per wall second;
-- output codec tokens per second and total/mean output tokens;
-- generated duration and sample success/failure distribution;
-- per-worker throughput and balance;
-- WER plus the relevant similarity/naturalness checks after generation.
+One H100 80 GB (driver 580.126.20 / CUDA 13), sglang-omni `a78de4cb`, sglang `0.5.12.post1`, `bosonai/higgs-tts-3-4b` (snapshot `7556c17e`), `/v1/audio/speech`, seed-tts-eval EN, 300 samples per client, default `max_running_requests=64` / `cuda_graph_max_bs=64`, 32 server cores of the GPU's NUMA node split per replica, one client per replica on the SMT-sibling cores, fresh servers per run, interleaved on a shared host. Every attempted run is reported.
 
-Use a separate ASR phase so quality measurement does not contend with the TTS
-servers. Device-level Nsight Systems SM/DRAM/Tensor metrics can explain idle
-headroom, but they do not replace end-to-end metrics.
+| Configuration | Nominal throughput | Relative to single | Run outcome |
+|---|---:|---:|---|
+| Single c96 | 21.7 to 22.1 qps | 1.0x | 4/4 completed |
+| DP2 + MPS, 2 x c64 | 31.5 to 37.7 qps | 1.4 to 1.7x | 3 nominal of 5 attempts |
+| DP3 + MPS, 3 x c64 | 39.9 to 46.9 qps | 1.8 to 2.1x | 2 nominal and 1 degraded of 4 attempts |
 
-A reasonable acceptance gate is:
+The failures: one DP2 benchmark run hit `cudaErrorMpsRpcFailure`, and one DP2 and one DP3 replica failed to start, all coinciding with host-load spikes. One DP3 run completed every request but at 13.3 qps, so it is marked degraded rather than excluded. The core-pinned single stayed within a few percent across all runs, and DP3 was not clearly repeatably better than DP2.
 
-- more than 10% throughput over tuned DP1 with non-overlapping 95% confidence
-  intervals;
-- comparable p95/p99 latency and RTF under the declared SLO;
-- no additional failures or material output-duration/token/quality drift;
-- controlled/equal KV capacity and balanced direct-worker traffic;
-- a 30–60 minute soak and repeated clean start/stop cycles;
-- router throughput close to direct aggregate throughput, or an explicit claim
-  that excludes router deployment.
+Note: the `--max-total-tokens` option makes per-replica KV sizing more explicit and comparable. It is not a direct fix for `cudaErrorMpsRpcFailure`, and the launch and runtime failure rate has not been re-measured with it in place; the failures in the table reflect the runs as recorded.
 
-## MIG alternative
+The #907 profiling, this repeated case study, and the reviewer verification below are three separate measurement series. They ran on different dates and load, and in some cases different software, so they should not be compared by absolute QPS; the differences between roughly 61, 21, and 29.9 qps are not attributed to a single cause.
 
-NVIDIA Multi-Instance GPU (MIG) is an alternative when stronger hardware
-partitioning and fault isolation matter more than flexible pooling. H200 offers
-several MIG profiles; available combinations depend on the exact H200 product
-and driver. Confirm them with NVIDIA's [supported MIG profile
-table](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/supported-mig-profiles.html)
-and the target host.
+> A separate reviewer verification on the same pinned software revision measured 29.9, 59.7, and 64.5 qps for single, DP2, and DP3. Absolute throughput differed between the two runtime environments, including different observed admission behavior, so the two series should not be combined. Both nevertheless showed a clear DP gain once every configuration was saturated.
 
-MIG gives each instance dedicated resources but may strand capacity when
-replicas have uneven demand. MPS shares the GPU more flexibly but shares the
-failure domain. MPS may also be used within a MIG instance. Benchmark MIG as a
-separate placement condition; do not compare a differently sized MIG workload
-to full-GPU MPS and call the difference a scheduling result.
+To measure your own setup, check whether one tuned replica is below GPU saturation under your real workload before adopting DP:
+
+```bash
+nvidia-smi dmon -i $GPU_ID -s um -d 5                        # coarse utilization
+nsys profile --gpu-metrics-devices $GPU_ID --gpu-metrics-set gh100 \
+  -d 60 -o one_replica -f true sleep 63                      # device-level SM-active
+```
+
+Low SM activity at the tuned single replica's peak may indicate reclaimable headroom; confirm it with a controlled DP comparison before relying on it. If SM activity is already near the ceiling, stop here.
+
+## Limits and next steps
+
+1. **Generality is not fully validated.** Beyond the pinned H100 Higgs case study, we also ran related experiments on H200 and used SGLang to serve Qwen3-4B directly; both lines of work largely confirmed the same-GPU DP gains. Space and time limit how completely we can present those results here, and the measurements are not yet as polished as we would like. We believe same-GPU DP is a promising direction for smaller models on GPUs with ample memory and compute headroom, but the experimental coverage is still incomplete.
+
+2. **Strictly equal per-replica KV size.** Sequential starts with the same `--mem-fraction-static` do not yield the same KV pool. Set each replica's KV size directly (e.g. a common `--max-total-tokens`) so capacities are strictly identical; intuition favors that for peak efficiency, but equal-versus-asymmetric budgets still need dedicated experiments and a sizing procedure that generalizes across cards.
+
+3. **Router and scheduler still need a deeper dive.** Both the router and the SGLang Omni scheduler need further optimization. On the router side, better routing strategies for a colocated pool are clearly required. On the scheduler side, a more ambitious question is whether we can borrow the spirit of LLM prefill–decode (PD) disaggregation: keep one large shared KV cache and let multiple replicas share it. That direction is extremely challenging, and we believe the potential payoff is correspondingly large.
+
+Same-GPU DP with MPS can recover idle GPU time on host- or dispatch-bound serving today, but broader validation and the work above are still unfinished. If this direction interests you, or you have results from other models, GPUs, or workloads that confirm or challenge these findings, we would like to work with you.

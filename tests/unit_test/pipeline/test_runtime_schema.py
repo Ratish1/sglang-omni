@@ -33,17 +33,13 @@ def test_stage_runtime_schema_accepts_typed_runtime_values() -> None:
             resources=StageResourceConfig(total_gpu_memory_fraction=0.25),
             max_seq_len=8192,
             video_fps=2.0,
-            sglang_server_args=SGLangServerArgsConfig(
-                mem_fraction_static=0.7,
-                max_total_tokens=84328,
-            ),
+            sglang_server_args=SGLangServerArgsConfig(mem_fraction_static=0.7),
         ),
         runtime_arg_map={"max_seq_len": "thinker_max_seq_len"},
     )
 
     assert stage.runtime.resources.total_gpu_memory_fraction == 0.25
     assert stage.runtime.sglang_server_args.mem_fraction_static == 0.7
-    assert stage.runtime.sglang_server_args.max_total_tokens == 84328
     assert stage.runtime_arg_map["max_seq_len"] == "thinker_max_seq_len"
 
 
@@ -55,11 +51,6 @@ def test_invalid_total_gpu_memory_fraction_raises() -> None:
 def test_invalid_sglang_mem_fraction_static_raises() -> None:
     with pytest.raises(ValueError, match="mem_fraction_static"):
         SGLangServerArgsConfig(mem_fraction_static=1.0)
-
-
-def test_invalid_sglang_max_total_tokens_raises() -> None:
-    with pytest.raises(ValueError, match="max_total_tokens"):
-        SGLangServerArgsConfig(max_total_tokens=0)
 
 
 def test_invalid_stage_runtime_values_raise() -> None:
