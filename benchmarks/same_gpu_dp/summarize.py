@@ -122,6 +122,19 @@ def extract_kv_tokens(text: str) -> int | None:
     return max(values)[1] if values else None
 
 
+def classify_kv_capacity(
+    token_counts: dict[str, int | None], expected_tokens: int | None = None
+) -> str:
+    known = [value for value in token_counts.values() if value is not None]
+    if len(known) != len(token_counts):
+        return "missing"
+    if len(set(known)) != 1:
+        return "unequal"
+    if expected_tokens is not None and known[0] != expected_tokens:
+        return "configured_mismatch"
+    return "exact" if expected_tokens is not None else "equal"
+
+
 def summarize_results(result_paths: Iterable[Path]) -> dict[str, object]:
     workers: list[dict[str, object]] = []
     successful_rows: list[dict] = []
@@ -320,6 +333,10 @@ def _build_parser() -> argparse.ArgumentParser:
     kv.add_argument("logs", nargs="+", type=Path)
     kv.add_argument("--require-equal", action="store_true")
 
+    classify_kv = sub.add_parser("classify-kv")
+    classify_kv.add_argument("capacity_json", type=Path)
+    classify_kv.add_argument("--expected", type=int)
+
     matrix = sub.add_parser("summarize-matrix")
     matrix.add_argument("--output", required=True, type=Path)
     matrix.add_argument("matrix_tsv", type=Path)
@@ -359,6 +376,11 @@ def main() -> None:
         result = summarize_router_snapshot(args.snapshot)
         args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(result, indent=2))
+        return
+    if args.command == "classify-kv":
+        token_counts = json.loads(args.capacity_json.read_text(encoding="utf-8"))
+        state = classify_kv_capacity(token_counts, args.expected)
+        print(state)
         return
 
     token_counts: dict[str, int | None] = {}

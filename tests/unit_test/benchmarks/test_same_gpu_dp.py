@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from benchmarks.same_gpu_dp.summarize import (
+    classify_kv_capacity,
     extract_kv_tokens,
     parse_cpu_set,
     summarize_matrix,
@@ -14,6 +15,13 @@ from benchmarks.same_gpu_dp.summarize import (
     summarize_router_snapshot,
     validate_layout,
 )
+
+
+def test_classify_kv_capacity_requires_the_configured_cap() -> None:
+    token_counts = {"worker_0": 78015, "worker_1": 78015}
+
+    assert classify_kv_capacity(token_counts, 78015) == "exact"
+    assert classify_kv_capacity(token_counts, 78021) == "configured_mismatch"
 
 
 def test_parse_cpu_set_expands_linux_syntax() -> None:

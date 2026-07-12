@@ -494,21 +494,10 @@ if [[ "$DRY_RUN" -eq 0 && ("$KV_EQUALITY" != off || "$CAPACITY_ONLY" -eq 1) ]]; 
   logs=()
   for ((i = 0; i < DP; i++)); do logs+=("$OUT/workers/worker_${i}.server.log"); done
   python3 "$HERE/summarize.py" extract-kv "${logs[@]}" > "$OUT/kv_capacity.json"
-  kv_state=$(python3 - "$OUT/kv_capacity.json" <<'PY'
-import json
-import sys
-
-values = list(json.load(open(sys.argv[1], encoding="utf-8")).values())
-known = [value for value in values if value is not None]
-if len(known) != len(values):
-    print("missing")
-elif len(set(known)) != 1:
-    print("unequal")
-else:
-    print("equal")
-PY
-)
-  if [[ "$kv_state" != equal ]]; then
+  kv_check=(python3 "$HERE/summarize.py" classify-kv "$OUT/kv_capacity.json")
+  [[ -n "$MAX_TOTAL_TOKENS" ]] && kv_check+=(--expected "$MAX_TOTAL_TOKENS")
+  kv_state=$("${kv_check[@]}")
+  if [[ "$kv_state" != equal && "$kv_state" != exact ]]; then
     if [[ "$KV_EQUALITY" == require ]]; then
       echo "KV capacity gate failed before load: $kv_state; see $OUT/kv_capacity.json" >&2
       exit 1
