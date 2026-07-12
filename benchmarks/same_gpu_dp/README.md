@@ -162,30 +162,40 @@ The harness recognizes both `max_total_num_tokens=...` and SGLang's
 
 ### Calibrate an exact per-DP cap
 
-Do not derive a production cap from one launch. The capacity profiles run 30 fresh
-MPS launches and rotate launch positions across the configured CPU blocks. To run a
-custom layout without YAML, set the `DP2_*`, `DP3_*`, and `DP4_*` variables and run:
+Do not use the smallest pool from an uncapped sequential launch as the final cap.
+Earlier replicas over-allocate in that experiment; capping them releases memory and
+changes what later replicas can fit. The calibrator instead applies one candidate to
+every replica, doubles a known-safe seed until it finds a failing bound, binary-searches
+the boundary, and confirms the selected cap with fresh launches.
+
+With an explicit cap, `mem_fraction_static` is a profiling ceiling rather than the KV
+allocation target: SGLang allocates the smaller of the profiled capacity and the cap.
+The capacity YAMLs therefore use a hardware-specific ceiling with explicit runtime
+headroom (`0.85` on the H100 profile and `0.90` on H200); the searched cap remains the
+actual KV-memory control. To run a custom layout without YAML, set the `DPn_*` layout
+variables, including `DPn_INITIAL_CAP_TOKENS`, and run:
 
 ```bash
 CALIBRATION_DPS=2,3,4 \
-CALIBRATION_REPETITIONS=30 \
 CALIBRATION_MPS_MODES=1 \
+CALIBRATION_CONFIRMATIONS=3 \
+CALIBRATION_TOKEN_TOLERANCE=256 \
 CALIBRATION_MARGIN_BPS=0 \
 bash benchmarks/same_gpu_dp/calibrate_capacity.sh
 ```
 
-The raw minimum and safety-margin calculation are written to
-`capacity_selection.tsv`. `capacity.env` exports both values:
+Every attempted bound is recorded in `capacity_trials.tsv`. The final bracket and
+safety-margin calculation are written to `capacity_selection.tsv`. `capacity.env`
+exports:
 
 ```text
-DPn_PROFILED_MIN_TOKENS  minimum observed capacity
-DPn_MAX_TOTAL_TOKENS     floor(raw minimum × (1 - margin))
+DPn_HIGHEST_PASS_TOKENS  highest candidate proven feasible during the search
+DPn_MAX_TOTAL_TOKENS     floor(highest passing candidate × (1 - margin))
 ```
 
-The default margin is zero: the repeated observed minimum is the first candidate.
-Set a nonzero basis-point margin only when repeated capped confirmations demonstrate
-allocator drift that justifies it. Review `capacity_summary.tsv` and
-`capacity_selection.tsv`, then source the generated file:
+The first failing candidate is at most `CALIBRATION_TOKEN_TOLERANCE` above the highest
+passing candidate. Set a nonzero basis-point margin only when repeated confirmations
+show allocator drift that justifies it. Review the trials and selection, then source:
 
 ```bash
 source benchmarks/results/same_gpu_dp/<printed-calibration-label>/capacity.env
@@ -200,12 +210,10 @@ python benchmarks/same_gpu_dp/run_study.py \
   benchmarks/same_gpu_dp/configs/h200_higgs.yaml --mode matrix
 ```
 
-For example, an H200 DP3 launch resolving `216719, 140294, 84328` contributes a
-raw condition minimum of `84328`; it is not automatically the production cap. The
-repeated minimum and configured safety margin determine the candidate. A subsequent
-capped confirmation must report that candidate exactly for all replicas or fail
-before load. Keep DP1 uncapped for aggregate-GPU comparisons: the cap removes
-launch-order imbalance within one DP layout, not across different DP degrees.
+For example, an uncapped H200 DP3 launch resolving `216719, 140294, 84328` establishes
+that `84328` is a safe search seed, not the maximum equal cap. Keep DP1 uncapped for
+aggregate-GPU comparisons: the cap removes launch-order imbalance within one DP
+layout, not across different DP degrees.
 
 After calibration, the hardware-specific screening YAMLs run the full SeedTTS EN
 split with fixed physical-core budgets and exact per-DP caps:
@@ -259,13 +267,13 @@ export DP1_CLIENT_CORE_SETS='48-63'
 export DP1_MEM_FRACTIONS='0.85'
 export DP2_SERVER_CORE_SETS='0-15;16-31'
 export DP2_CLIENT_CORE_SETS='48-55;56-63'
-export DP2_MEM_FRACTIONS='0.42,0.42'
+export DP2_MEM_FRACTIONS='0.90,0.90'
 export DP3_SERVER_CORE_SETS='0-9;10-19;20-31'
 export DP3_CLIENT_CORE_SETS='48-52;53-57;58-63'
-export DP3_MEM_FRACTIONS='0.27,0.27,0.27'
+export DP3_MEM_FRACTIONS='0.90,0.90,0.90'
 export DP4_SERVER_CORE_SETS='0-7;8-15;16-23;24-31'
 export DP4_CLIENT_CORE_SETS='48-51;52-55;56-59;60-63'
-export DP4_MEM_FRACTIONS='0.21,0.21,0.21,0.21'
+export DP4_MEM_FRACTIONS='0.90,0.90,0.90,0.90'
 # Source the calibration's capacity.env here. It exports
 # DP2_MAX_TOTAL_TOKENS, DP3_MAX_TOTAL_TOKENS, and DP4_MAX_TOTAL_TOKENS.
 export MATRIX_ORDER='3:1,1:0,4:0,2:1,3:0,1:1,4:1,2:0'
@@ -280,8 +288,9 @@ Add `--dry-run` to validate and print the entire matrix without touching CUDA.
 When `KV_EQUALITY=require`, `run_matrix.sh` refuses DP2–4 before any expensive
 launch unless the corresponding `DPn_MAX_TOTAL_TOKENS` is set.
 
-The fractions above are illustrative starting points, not H200 guarantees. Each
-matrix condition is run at every `CONCURRENCY_VALUES` point; compare the peak
+The `0.90` fractions above are safe only because the exact searched caps are set;
+do not use them for uncapped same-GPU replicas. Each matrix condition is run at
+every `CONCURRENCY_VALUES` point; compare the peak
 that satisfies the same SLO, rather than choosing one concurrency for DP1 and a
 different unreported search for DPk. Use a different randomized `MATRIX_ORDER`
 per study or set a recorded `SHUFFLE_SEED` (the default is `1`) to shuffle every

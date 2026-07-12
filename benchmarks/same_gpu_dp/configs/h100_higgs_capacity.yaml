@@ -16,16 +16,22 @@ common:
 
 calibration:
   dps: [2, 3]
-  repetitions: 30
   mps_modes: [1]
+  confirmations: 3
+  token_tolerance: 256
+  growth_factor: 2
+  max_search_trials: 20
   margin_basis_points: 0
 
 layouts:
   2:
     server_core_sets: [0-15, 16-31]
     client_core_sets: [64-71, 72-79]
-    mem_fractions: [0.42, 0.42]
+    # max_total_tokens owns allocation; this preserves the tuned H100 headroom.
+    mem_fractions: [0.85, 0.85]
+    initial_cap_tokens: 78015
   3:
     server_core_sets: [0-9, 10-19, 20-31]
     client_core_sets: [64-68, 69-73, 74-79]
-    mem_fractions: [0.27, 0.27, 0.27]
+    mem_fractions: [0.85, 0.85, 0.85]
+    initial_cap_tokens: 20969

@@ -19,12 +19,17 @@ def test_build_environment_translates_strict_study(monkeypatch) -> None:
             "order": ["1:0", "2:1"],
             "concurrency_values": [32, 64],
         },
-        "calibration": {"dps": [2, 3], "repetitions": 2},
+        "calibration": {
+            "dps": [2, 3],
+            "confirmations": 3,
+            "token_tolerance": 256,
+        },
         "layouts": {
             2: {
                 "server_core_sets": ["0-7", "8-15"],
                 "client_core_sets": ["32-35", "36-39"],
                 "mem_fractions": [0.42, 0.42],
+                "initial_cap_tokens": 78015,
                 "max_total_tokens": 84328,
             }
         },
@@ -37,8 +42,10 @@ def test_build_environment_translates_strict_study(monkeypatch) -> None:
     assert env["MATRIX_ORDER"] == "1:0,2:1"
     assert env["CONCURRENCY_VALUES"] == "32,64"
     assert env["CALIBRATION_DPS"] == "2,3"
-    assert env["CALIBRATION_REPETITIONS"] == "2"
+    assert env["CALIBRATION_CONFIRMATIONS"] == "3"
+    assert env["CALIBRATION_TOKEN_TOLERANCE"] == "256"
     assert env["DP2_SERVER_CORE_SETS"] == "0-7;8-15"
+    assert env["DP2_INITIAL_CAP_TOKENS"] == "78015"
     assert env["DP2_MAX_TOTAL_TOKENS"] == "84328"
 
 

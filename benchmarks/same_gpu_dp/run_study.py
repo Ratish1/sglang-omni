@@ -48,8 +48,11 @@ MATRIX_KEYS = {
 }
 CALIBRATION_KEYS = {
     "dps": "CALIBRATION_DPS",
-    "repetitions": "CALIBRATION_REPETITIONS",
     "mps_modes": "CALIBRATION_MPS_MODES",
+    "confirmations": "CALIBRATION_CONFIRMATIONS",
+    "token_tolerance": "CALIBRATION_TOKEN_TOLERANCE",
+    "growth_factor": "CALIBRATION_GROWTH_FACTOR",
+    "max_search_trials": "CALIBRATION_MAX_SEARCH_TRIALS",
     "margin_basis_points": "CALIBRATION_MARGIN_BPS",
     "label": "CALIBRATION_LABEL",
     "root": "CALIBRATION_ROOT",
@@ -58,6 +61,7 @@ LAYOUT_KEYS = {
     "server_core_sets": ("SERVER_CORE_SETS", ";"),
     "client_core_sets": ("CLIENT_CORE_SETS", ";"),
     "mem_fractions": ("MEM_FRACTIONS", ","),
+    "initial_cap_tokens": ("INITIAL_CAP_TOKENS", None),
     "max_total_tokens": ("MAX_TOTAL_TOKENS", None),
     "mps_thread_percentages": ("MPS_THREAD_PERCENTAGES", ","),
     "mps_pinned_mem_limits": ("MPS_PINNED_MEM_LIMITS", ";"),

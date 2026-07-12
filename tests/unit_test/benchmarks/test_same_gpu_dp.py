@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,55 @@ def test_classify_kv_capacity_requires_the_configured_cap() -> None:
 
     assert classify_kv_capacity(token_counts, 78015) == "exact"
     assert classify_kv_capacity(token_counts, 78021) == "configured_mismatch"
+
+
+def test_capacity_search_finds_highest_equal_cap(tmp_path: Path) -> None:
+    runner = tmp_path / "fake_condition.sh"
+    runner.write_text(
+        """#!/usr/bin/env bash
+set -eu
+out="$OUT_ROOT/$LABEL"
+mkdir -p "$out"
+if ((MAX_TOTAL_TOKENS <= 100)); then
+  resolved=$MAX_TOTAL_TOKENS
+  status=0
+else
+  resolved=100
+  status=1
+fi
+printf '{"worker_0": %s, "worker_1": %s}\n' "$resolved" "$resolved" \
+  > "$out/kv_capacity.json"
+exit "$status"
+""",
+        encoding="utf-8",
+    )
+    runner.chmod(0o755)
+    root = tmp_path / "capacity"
+    script = Path("benchmarks/same_gpu_dp/calibrate_capacity.sh").resolve()
+    env = {
+        **os.environ,
+        "CONDITION_RUNNER": str(runner),
+        "CALIBRATION_DPS": "2",
+        "CALIBRATION_MPS_MODES": "1",
+        "CALIBRATION_CONFIRMATIONS": "2",
+        "CALIBRATION_TOKEN_TOLERANCE": "1",
+        "CALIBRATION_ROOT": str(root),
+        "DP2_SERVER_CORE_SETS": "0;1",
+        "DP2_CLIENT_CORE_SETS": "2;3",
+        "DP2_MEM_FRACTIONS": "0.90,0.90",
+        "DP2_INITIAL_CAP_TOKENS": "20",
+    }
+
+    subprocess.run(["bash", str(script)], env=env, check=True)
+
+    selection = (root / "capacity_selection.tsv").read_text(encoding="utf-8")
+    assert "2\t0.90,0.90\t100\t101\t1\t0\t100" in selection
+    assert "DP2_MAX_TOTAL_TOKENS=100" in (root / "capacity.env").read_text(
+        encoding="utf-8"
+    )
+    assert "capacity-limit" in (root / "capacity_trials.tsv").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_parse_cpu_set_expands_linux_syntax() -> None:
