@@ -33,19 +33,19 @@ layouts:
   1:
     server_core_sets: [0-31]
     client_core_sets: [32-47]
-    mem_fractions: [0.85]
+    mem_fractions: [auto]
   2:
     server_core_sets: [0-15, 16-31]
     client_core_sets: [32-39, 40-47]
-    mem_fractions: [0.90, 0.90]
+    mem_fractions: [auto, auto]
     max_total_tokens: ${DP2_MAX_TOTAL_TOKENS}
   3:
     server_core_sets: [0-9, 10-19, 20-31]
     client_core_sets: [32-36, 37-41, 42-47]
-    mem_fractions: [0.90, 0.90, 0.90]
+    mem_fractions: [auto, auto, auto]
     max_total_tokens: ${DP3_MAX_TOTAL_TOKENS}
   4:
     server_core_sets: [0-7, 8-15, 16-23, 24-31]
     client_core_sets: [32-35, 36-39, 40-43, 44-47]
-    mem_fractions: [0.90, 0.90, 0.90, 0.90]
+    mem_fractions: [auto, auto, auto, auto]
     max_total_tokens: ${DP4_MAX_TOTAL_TOKENS}

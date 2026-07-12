@@ -49,7 +49,6 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
             "max_running_requests": self.max_running_requests,
             "cuda_graph_max_bs": self.cuda_graph_max_bs,
             "disable_cuda_graph": False,
-            "mem_fraction_static": 0.85,
             "chunked_prefill_size": 8192,
             "dtype": "bfloat16",
         }

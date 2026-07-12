@@ -32,7 +32,7 @@ fi
 : "${ROUTER_POLICY:=least_request}"
 : "${BASE_PORT:=8801}"
 : "${ROUTER_PORT:=8799}"
-: "${MEM_FRACTIONS:=0.85}"
+: "${MEM_FRACTIONS:=auto}"
 : "${CONCURRENCY_PER_WORKER:=16}"
 : "${MAX_RUNNING_REQUESTS:=64}"
 : "${CUDA_GRAPH_MAX_BS:=64}"
@@ -189,6 +189,8 @@ python3 - "$MEM_FRACTIONS" "$MPS_THREAD_PERCENTAGES" <<'PY'
 import sys
 
 for raw in sys.argv[1].split(","):
+    if raw == "auto":
+        continue
     try:
         value = float(raw)
     except ValueError as exc:
@@ -465,9 +467,9 @@ for ((i = 0; i < DP; i++)); do
     --membind="$NUMA_NODE" python -m sglang_omni.cli serve
     --model-path "$MODEL" --model-name "$MODEL_NAME" --host 127.0.0.1 --port "$port"
     --allowed-local-media-path "$ALLOWED_LOCAL_MEDIA_PATH"
-    --mem-fraction-static "${MEM_FRAC[$i]}"
     --max-running-requests "$MAX_RUNNING_REQUESTS"
     --cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS")
+  [[ "${MEM_FRAC[$i]}" != auto ]] && command+=(--mem-fraction-static "${MEM_FRAC[$i]}")
   [[ -n "$MAX_TOTAL_TOKENS" ]] && command+=(--max-total-tokens "$MAX_TOTAL_TOKENS")
   print_command "${command[@]}"
   if [[ "$DRY_RUN" -eq 1 ]]; then

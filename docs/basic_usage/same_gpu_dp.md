@@ -42,29 +42,32 @@ On a multi-GPU node, the right MPS topology depends on your deployment and shoul
 ```bash
 GPU_ID=0; NODE=0
 CORE_BLOCKS=("0-15" "16-31")            # one block per replica, non-overlapping
-MF=0.42
+MAX_TOTAL_TOKENS=<COMMON_FEASIBLE_TOKEN_CAP>
 i=0
 for PORT in 8801 8802; do
   CUDA_VISIBLE_DEVICES=$GPU_ID \
   numactl --cpunodebind=$NODE --membind=$NODE -C "${CORE_BLOCKS[$i]}" \
     sgl-omni serve \
       --model-path bosonai/higgs-tts-3-4b \
-      --mem-fraction-static $MF \
+      --max-total-tokens $MAX_TOTAL_TOKENS \
       --host 127.0.0.1 --port $PORT --model-name higgs > "replica_$i.log" 2>&1 &
   until [ "$(curl -s -o /dev/null -w '%{http_code}' -m 3 127.0.0.1:$PORT/health)" = 200 ]; do sleep 6; done
   i=$((i+1))
 done
 ```
 
-The example above uses the **same** `--mem-fraction-static` for every replica. Launch one at a time, wait for `/health`, and confirm each replica's `KV Cache is allocated. #tokens: ...` line is workable. Tested starting points on the 80 GB H100 Higgs configuration are 2 replicas at `mf=0.42` with 16 cores each, or 3 at `mf=0.27` with 10 cores each.
+The example leaves `mem_fraction_static` unset, allowing SGLang to select its existing
+hardware-aware value. The explicit common token cap prevents earlier replicas from
+consuming that entire automatic budget. Launch one at a time, wait for `/health`, and
+confirm every replica reports the configured `KV Cache is allocated. #tokens: ...`.
 
 Identical `--mem-fraction-static` flags do **not** mean identical KV capacity. `--mem-fraction-static` is evaluated at each replica's init time against **remaining** GPU memory, roughly `mem_fraction × free_memory` after weights and other fixed overheads. It is a per-replica request against whatever is left, not an additive share of the card. Because replicas start sequentially, earlier ones have already reserved memory, so later ones see a smaller free pool and allocate fewer KV tokens even when every flag is the same (in one run, three sequential `mf=0.27` replicas received 97,503 / 53,149 / 20,961 KV tokens).
 
-To control KV size more precisely, set an explicit common token cap with `--max-total-tokens`, at or below the smallest capacity any replica can actually satisfy:
+Set the common token cap at or below the largest value every capped replica can
+actually satisfy:
 
 ```bash
 sgl-omni serve \
-  --mem-fraction-static 0.42 \
   --max-total-tokens <COMMON_FEASIBLE_TOKEN_CAP> \
   ...
 ```
@@ -76,9 +79,12 @@ MAX_TOTAL_TOKENS=<COMMON_FEASIBLE_TOKEN_CAP> \
   bash examples/launch_same_gpu_dp.sh up
 ```
 
-Leave `MAX_TOTAL_TOKENS` unset to retain the engine's auto-profiled behavior. Still read each replica's `KV Cache is allocated. #tokens: ...` line; if a replica cannot meet the cap, lower the common cap or reduce the replica count.
+Leave `MAX_TOTAL_TOKENS` unset only when unequal auto-profiled pools are acceptable.
+For a controlled DP pool, search and pin one cap that every replica resolves exactly.
 
-Intuition suggests that equal KV capacity across colocated replicas is a prerequisite for peak efficiency. We do not yet have a mechanism that starts several servers on one GPU and guarantees identical KV pools without an explicit common cap, and we have not validated that equal allocation is optimal under all loads. **Upcoming experiments will measure how uneven per-replica memory budgets on the same GPU affect aggregate throughput.**
+The common cap controls KV allocation; SGLang's automatic memory fraction supplies the
+hardware-aware profiling ceiling. CUDA MPS remains responsible only for concurrent GPU
+execution.
 
 4. **Drive every replica to saturation.**
 
@@ -114,7 +120,10 @@ Setting up and tearing down MPS is more involved than running a single replica, 
 | DP2 + MPS, 2 x c64 | 31.5 to 37.7 qps | 1.4 to 1.7x |
 | DP3 + MPS, 3 x c64 | 39.9 to 46.9 qps | 1.8 to 2.1x |
 
-These commands and `--mem-fraction-static` starting points are from an 80 GB H100 with Higgs and are not fixed recommendations for other GPUs. On an H200 you would re-determine the replica count, a common feasible token cap, `--mem-fraction-static`, CPU allocation, and saturation concurrency for that card. H200 may fit a larger KV budget or additional replicas, but this guide does not prescribe unverified values: repeat the sizing and saturation procedure and inspect every replica's actual allocation.
+The case-study commands are from an 80 GB H100 with Higgs and are not fixed
+recommendations for other GPUs. On an H200, re-determine the replica count, common
+feasible token cap, CPU allocation, and saturation concurrency while leaving SGLang's
+hardware-aware memory fraction automatic unless a measured override is required.
 
 
 ## How We Found This

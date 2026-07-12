@@ -66,7 +66,7 @@ settings are:
 | `NUMA_NODE` | memory node local to the GPU |
 | `ROUTER_CORES` | dedicated physical cores for router mode |
 | `ROUTER_POLICY` | router policy; defaults to `least_request` |
-| `MEM_FRACTIONS` | one value (broadcast) or comma-separated value per replica |
+| `MEM_FRACTIONS` | `auto` or one explicit value per replica; one value broadcasts |
 | `CONCURRENCY_PER_WORKER` | canonical client concurrency per direct worker |
 | `MAX_RUNNING_REQUESTS` | server generation batching limit |
 | `CUDA_GRAPH_MAX_BS` | server CUDA graph maximum batch size |
@@ -168,12 +168,11 @@ changes what later replicas can fit. The calibrator instead applies one candidat
 every replica, doubles a known-safe seed until it finds a failing bound, binary-searches
 the boundary, and confirms the selected cap with fresh launches.
 
-With an explicit cap, `mem_fraction_static` is a profiling ceiling rather than the KV
-allocation target: SGLang allocates the smaller of the profiled capacity and the cap.
-The capacity YAMLs therefore use a hardware-specific ceiling with explicit runtime
-headroom (`0.85` on the H100 profile and `0.90` on H200); the searched cap remains the
-actual KV-memory control. To run a custom layout without YAML, set the `DPn_*` layout
-variables, including `DPn_INITIAL_CAP_TOKENS`, and run:
+The capacity profiles omit `mem_fraction_static` (`MEM_FRACTIONS=auto`) so SGLang
+selects its existing hardware-aware value. The common candidate cap prevents earlier
+replicas from consuming that entire automatic budget; the search proves the largest
+candidate every replica can resolve. To run a custom layout without YAML, set the
+`DPn_*` layout variables, including `DPn_INITIAL_CAP_TOKENS`, and run:
 
 ```bash
 CALIBRATION_DPS=2,3,4 \
@@ -240,7 +239,7 @@ for c in 8 16 32 48 64 96 128; do
   for b in 64 128; do
     GPU_UUID=GPU-... DP=1 USE_MPS=0 \
     SERVER_CORE_SETS='0-31' CLIENT_CORE_SETS='48-63' \
-    MEM_FRACTIONS=0.85 CONCURRENCY_PER_WORKER=$c \
+    MEM_FRACTIONS=auto CONCURRENCY_PER_WORKER=$c \
     MAX_RUNNING_REQUESTS=$b CUDA_GRAPH_MAX_BS=$b \
     LABEL="dp1_c${c}_b${b}" \
     bash benchmarks/same_gpu_dp/run_condition.sh
@@ -264,16 +263,16 @@ This example uses 32 server CPUs and 16 client CPUs for every point:
 export GPU_UUID=GPU-...
 export DP1_SERVER_CORE_SETS='0-31'
 export DP1_CLIENT_CORE_SETS='48-63'
-export DP1_MEM_FRACTIONS='0.85'
+export DP1_MEM_FRACTIONS='auto'
 export DP2_SERVER_CORE_SETS='0-15;16-31'
 export DP2_CLIENT_CORE_SETS='48-55;56-63'
-export DP2_MEM_FRACTIONS='0.90,0.90'
+export DP2_MEM_FRACTIONS='auto,auto'
 export DP3_SERVER_CORE_SETS='0-9;10-19;20-31'
 export DP3_CLIENT_CORE_SETS='48-52;53-57;58-63'
-export DP3_MEM_FRACTIONS='0.90,0.90,0.90'
+export DP3_MEM_FRACTIONS='auto,auto,auto'
 export DP4_SERVER_CORE_SETS='0-7;8-15;16-23;24-31'
 export DP4_CLIENT_CORE_SETS='48-51;52-55;56-59;60-63'
-export DP4_MEM_FRACTIONS='0.90,0.90,0.90,0.90'
+export DP4_MEM_FRACTIONS='auto,auto,auto,auto'
 # Source the calibration's capacity.env here. It exports
 # DP2_MAX_TOTAL_TOKENS, DP3_MAX_TOTAL_TOKENS, and DP4_MAX_TOTAL_TOKENS.
 export MATRIX_ORDER='3:1,1:0,4:0,2:1,3:0,1:1,4:1,2:0'
@@ -288,9 +287,9 @@ Add `--dry-run` to validate and print the entire matrix without touching CUDA.
 When `KV_EQUALITY=require`, `run_matrix.sh` refuses DP2–4 before any expensive
 launch unless the corresponding `DPn_MAX_TOTAL_TOKENS` is set.
 
-The `0.90` fractions above are safe only because the exact searched caps are set;
-do not use them for uncapped same-GPU replicas. Each matrix condition is run at
-every `CONCURRENCY_VALUES` point; compare the peak
+`auto` is safe here because DP2–4 also receive the exact searched caps. Do not run
+uncapped same-GPU replicas and assume their automatic pools will be equal. Each matrix
+condition is run at every `CONCURRENCY_VALUES` point; compare the peak
 that satisfies the same SLO, rather than choosing one concurrency for DP1 and a
 different unreported search for DPk. Use a different randomized `MATRIX_ORDER`
 per study or set a recorded `SHUFFLE_SEED` (the default is `1`) to shuffle every

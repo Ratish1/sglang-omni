@@ -4,15 +4,15 @@
 # This is a tested example, not a production process supervisor.
 #
 # Usage:
-#   MODEL=bosonai/higgs-tts-3-4b GPU_ID=0 N=2 CORE_BLOCKS="0-15 16-31" \
-#     bash examples/launch_same_gpu_dp.sh up
+#   MODEL=bosonai/higgs-tts-3-4b GPU_ID=0 N=2 MAX_TOTAL_TOKENS=<cap> \
+#     CORE_BLOCKS="0-15 16-31" bash examples/launch_same_gpu_dp.sh up
 #   bash examples/launch_same_gpu_dp.sh list
 #   bash examples/launch_same_gpu_dp.sh verify [RUN_ID]
 #   bash examples/launch_same_gpu_dp.sh down [RUN_ID]
 #
 # Environment for `up` (defaults in parentheses):
 #   MODEL (bosonai/higgs-tts-3-4b), MODEL_NAME (higgs), GPU_ID (0), N (2),
-#   MF (0.42 for N=2, 0.27 for N=3), BASE_PORT (8801),
+#   BASE_PORT (8801),
 #   CORE_BLOCKS: N non-overlapping CPU blocks on the GPU's NUMA node, required.
 #   NUMA_NODE: explicit override when the PCI-derived NUMA node is unavailable.
 #   MAX_TOTAL_TOKENS: optional positive integer; when set, every replica is launched
@@ -242,10 +242,8 @@ teardown_state() {
 
 up() {
   local model=${MODEL:-bosonai/higgs-tts-3-4b} model_name=${MODEL_NAME:-higgs}
-  local gpu=${GPU_ID:-0} n=${N:-2} base_port=${BASE_PORT:-8801} mf=${MF:-}
-  if [ -z "$mf" ]; then
-    case "$n" in 2) mf=0.42 ;; 3) mf=0.27 ;; *) die "set MF explicitly for N=$n" ;; esac
-  fi
+  local gpu=${GPU_ID:-0} n=${N:-2} base_port=${BASE_PORT:-8801}
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "N must be a positive integer"
   [ -n "${CORE_BLOCKS:-}" ] || {
     echo "CORE_BLOCKS is required: N non-overlapping blocks on the GPU's NUMA node." >&2
     echo "Cores on that node: numactl -H" >&2
@@ -286,7 +284,7 @@ up() {
   mkdir -p "$state/logs" "$state/mps/pipe" "$state/mps/log"
   {
     echo "run_id=$run"; echo "gpu_id=$gpu"; echo "gpu_uuid=$uuid"; echo "numa_node=$node"
-    echo "model=$model"; echo "model_name=$model_name"; echo "n=$n"; echo "mf=$mf"
+    echo "model=$model"; echo "model_name=$model_name"; echo "n=$n"
     echo "base_port=$base_port"; echo "core_blocks=$CORE_BLOCKS"
     echo "max_total_tokens=${MAX_TOTAL_TOKENS:-auto/profiled}"
   } > "$state/manifest"
@@ -312,7 +310,7 @@ up() {
     CUDA_VISIBLE_DEVICES=$gpu \
     setsid numactl --cpunodebind="$node" --membind="$node" -C "${blocks[$i]}" \
       sgl-omni serve --model-path "$model" --model-name "$model_name" \
-        --mem-fraction-static "$mf" "${extra_args[@]}" \
+        "${extra_args[@]}" \
         --host 127.0.0.1 --port "$port" > "$log" 2>&1 < /dev/null &
     pid=$!
     printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$pid" "$pid" "$port" "$log" >> "$state/replicas.tsv"
@@ -332,7 +330,7 @@ up() {
       tail -n 8 "$log" >&2
       exit 1
     fi
-    echo "replica $i healthy on port $port (cores ${blocks[$i]}, mf $mf)"
+    echo "replica $i healthy on port $port (cores ${blocks[$i]})"
     # Note (jiaxin): per-replica KV pools are not additive shares of the device;
     # later replicas can receive much smaller pools, so surface each allocation.
     grep -m1 -oE '#tokens: [0-9]+' "$log" | sed "s/^/replica $i KV /" || true
