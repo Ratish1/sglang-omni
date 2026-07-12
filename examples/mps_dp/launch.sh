@@ -1,15 +1,15 @@
 #!/bin/bash
 # Launch N serving replicas on ONE GPU behind a private CUDA MPS daemon.
-# Companion to docs/basic_usage/same_gpu_dp.md.
+# Companion to docs/basic_usage/mps_dp.md.
 # This is a tested example, not a production process supervisor.
 #
 # Usage:
 #   MODEL=bosonai/higgs-tts-3-4b GPU_ID=0 N=3 MAX_TOTAL_TOKENS=100000 \
 #     CORE_BLOCKS="0-9 10-19 20-29" \
-#     bash examples/launch_same_gpu_dp.sh up
-#   bash examples/launch_same_gpu_dp.sh list
-#   bash examples/launch_same_gpu_dp.sh verify [RUN_ID]
-#   bash examples/launch_same_gpu_dp.sh down [RUN_ID]
+#     bash examples/mps_dp/launch.sh up
+#   bash examples/mps_dp/launch.sh list
+#   bash examples/mps_dp/launch.sh verify [RUN_ID]
+#   bash examples/mps_dp/launch.sh down [RUN_ID]
 #
 # Environment for `up` (defaults in parentheses):
 #   MODEL (bosonai/higgs-tts-3-4b), MODEL_NAME (higgs), GPU_ID (0), N (3),
@@ -367,5 +367,5 @@ case "$CMD" in
   down) st=$(resolve_state "$RUN_ARG") || exit 1; teardown_state "$st" ;;
   verify) st=$(resolve_state "$RUN_ARG") || exit 1; verify_attach "$st" ;;
   list) find_runs ;;
-  *) die "usage: launch_same_gpu_dp.sh up|down [RUN_ID]|verify [RUN_ID]|list" ;;
+  *) die "usage: launch.sh up|down [RUN_ID]|verify [RUN_ID]|list" ;;
 esac

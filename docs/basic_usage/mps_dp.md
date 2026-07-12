@@ -8,7 +8,7 @@ Same-GPU data parallelism runs several complete serving replicas on one GPU and 
 
 ## Deploy
 
-The steps below are one continuous flow. We provide a script `examples/launch_same_gpu_dp.sh` to wrap them behind a per-run state directory (`up/verify/down/list`). It records replica PIDs, process groups, ports, and logs, refuses to start when ports are taken or another run is recorded on the same GPU, health-gates sequential startup, surfaces each replica's logged KV allocation, compares expected replica processes against the MPS client list, and tears down only the processes it recorded. The manual steps below explain each mechanism, checkpoint, and failure mode; the launcher is a convenience wrapper around them, not a production supervisor, and it does not remove your responsibility to check actual KV capacity, MPS attachment, and saturation. Detailed instructions are as follows:
+The steps below are one continuous flow. We provide a script `examples/mps_dp/launch.sh` to wrap them behind a per-run state directory (`up/verify/down/list`). It records replica PIDs, process groups, ports, and logs, refuses to start when ports are taken or another run is recorded on the same GPU, health-gates sequential startup, surfaces each replica's logged KV allocation, compares expected replica processes against the MPS client list, and tears down only the processes it recorded. The manual steps below explain each mechanism, checkpoint, and failure mode; the launcher is a convenience wrapper around them, not a production supervisor, and it does not remove your responsibility to check actual KV capacity, MPS attachment, and saturation. Detailed instructions are as follows:
 
 1. **Choose the GPU and NUMA node.**
 
@@ -64,7 +64,7 @@ Memory profiling does not coordinate these independent processes. The launcher t
 
 ```bash
 MAX_TOTAL_TOKENS=<COMMON_FEASIBLE_TOKEN_CAP> \
-  bash examples/launch_same_gpu_dp.sh up
+  bash examples/mps_dp/launch.sh up
 ```
 
 The H100 Higgs runs used the following caps:
@@ -99,7 +99,7 @@ For easy deployment, you can register each replica endpoint with the [Omni Route
 
 7. **Tear down safely.**
 
-On a shared host, only touch processes you launched, and never treat "the GPU is empty" as the success condition. Stop new traffic, then SIGTERM each tracked replica process group (`kill -TERM -- -<pgid>`, which also reaps the `multiprocessing-fork` stage workers) and wait until they exit. Confirm the MPS client list is empty (`get_client_list <server>`): the pipe is private to your run, so any remaining client is outstanding work even when its PID no longer matches a tracked group, and live clients must be gone before the daemon quits, or the MPS server can enter an RPC-failure state that outlasts your run. Only then quit the daemon (`echo quit | nvidia-cuda-mps-control`), and SIGKILL surviving tracked groups only as a last resort. `examples/launch_same_gpu_dp.sh down` follows this order and keeps the state directory whenever cleanup cannot be confirmed.
+On a shared host, only touch processes you launched, and never treat "the GPU is empty" as the success condition. Stop new traffic, then SIGTERM each tracked replica process group (`kill -TERM -- -<pgid>`, which also reaps the `multiprocessing-fork` stage workers) and wait until they exit. Confirm the MPS client list is empty (`get_client_list <server>`): the pipe is private to your run, so any remaining client is outstanding work even when its PID no longer matches a tracked group, and live clients must be gone before the daemon quits, or the MPS server can enter an RPC-failure state that outlasts your run. Only then quit the daemon (`echo quit | nvidia-cuda-mps-control`), and SIGKILL surviving tracked groups only as a last resort. `examples/mps_dp/launch.sh down` follows this order and keeps the state directory whenever cleanup cannot be confirmed.
 
 Setting up and tearing down MPS is more involved than running a single replica, but in the pinned H100 Higgs tests the throughput gain was substantial. The table below shows the nominal completed-run ranges; the full accounting, including the failed and degraded runs, is in the case study.
 
