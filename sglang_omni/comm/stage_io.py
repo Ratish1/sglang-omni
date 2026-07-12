@@ -628,7 +628,7 @@ async def _read_transfer_buffer(
     request_id: str,
     data_ref: DataRef,
 ) -> torch.Tensor:
-    buf = torch.empty(
+    buf = torch.zeros(
         data_ref.buffer.length,
         dtype=torch.uint8,
         device=relay_device(relay),
