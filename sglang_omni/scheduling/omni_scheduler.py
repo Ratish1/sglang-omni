@@ -44,7 +44,11 @@ from sglang_omni.proto.admin import (
     ADMIN_UPDATE_WEIGHTS_FROM_TENSOR,
     ADMIN_WEIGHTS_CHECKER,
 )
-from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.messages import (
+    IncomingMessage,
+    OutgoingMessage,
+    SchedulerOutputQueue,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +123,7 @@ class OmniScheduler:
         request_build_max_pending: int | None = None,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
-        self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
+        self.outbox: _queue_mod.Queue[OutgoingMessage] = SchedulerOutputQueue()
         self.requires_tp_work_fanout: bool = False
 
         # --- Request builder: StagePayload → SGLangARRequestData ----------

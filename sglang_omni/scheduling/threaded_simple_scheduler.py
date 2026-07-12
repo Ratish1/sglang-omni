@@ -12,7 +12,11 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable
 
-from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.messages import (
+    IncomingMessage,
+    OutgoingMessage,
+    SchedulerOutputQueue,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +31,7 @@ class ThreadedSimpleScheduler:
 
     def __init__(self, compute_fn: Callable, *, max_concurrency: int = 8):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
-        self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
+        self.outbox: _queue_mod.Queue[OutgoingMessage] = SchedulerOutputQueue()
         self.requires_tp_work_fanout: bool = True
         self._fn = compute_fn
         self._max_concurrency = max(int(max_concurrency), 1)

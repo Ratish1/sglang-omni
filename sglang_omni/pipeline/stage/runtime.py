@@ -961,6 +961,10 @@ class Stage:
             if out.request_id not in self._active_requests:
                 continue
 
+            # A Python queue transfers tensor ownership, but it does not order
+            # the scheduler's CUDA stream with this stage's transport stream.
+            out.wait_cuda_ready()
+
             if out.type == "result":
                 await self._route_result(out.request_id, out.data)
             elif out.type == "stream":

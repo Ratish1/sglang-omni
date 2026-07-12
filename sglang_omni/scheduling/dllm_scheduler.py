@@ -19,7 +19,11 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.messages import (
+    IncomingMessage,
+    OutgoingMessage,
+    SchedulerOutputQueue,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +49,7 @@ class DllmScheduler:
         result_adapter: Callable,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
-        self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
+        self.outbox: _queue_mod.Queue[OutgoingMessage] = SchedulerOutputQueue()
 
         self._request_builder = request_builder
         self._result_adapter = result_adapter

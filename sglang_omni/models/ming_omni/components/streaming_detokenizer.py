@@ -32,7 +32,11 @@ from sglang_omni.models.ming_omni.pipeline.next_stage import THINKER_STAGE
 from sglang_omni.models.ming_omni.pipeline.state_io import load_state
 from sglang_omni.models.ming_omni.pipeline.usage import build_text_usage
 from sglang_omni.proto import OmniRequest, StagePayload
-from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.messages import (
+    IncomingMessage,
+    OutgoingMessage,
+    SchedulerOutputQueue,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +78,7 @@ class MingStreamingDetokenizeScheduler:
         stage_name: str = "decode",
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
-        self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
+        self.outbox: _queue_mod.Queue[OutgoingMessage] = SchedulerOutputQueue()
         self._tokenizer = tokenizer
         self._eos_token_id = eos_token_id
         self.stage_name = stage_name

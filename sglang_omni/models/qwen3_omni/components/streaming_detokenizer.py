@@ -25,7 +25,11 @@ from sglang_omni.models.qwen3_omni.payload_types import (
     Qwen3OmniPipelineState,
 )
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.messages import (
+    IncomingMessage,
+    OutgoingMessage,
+    SchedulerOutputQueue,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +68,7 @@ class StreamingDetokenizeScheduler:
         stage_name: str = "decode",
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
-        self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
+        self.outbox: _queue_mod.Queue[OutgoingMessage] = SchedulerOutputQueue()
         self._tokenizer = tokenizer
         self._eos_token_id = eos_token_id
         self.stage_name = stage_name

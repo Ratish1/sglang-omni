@@ -16,7 +16,11 @@ from typing import Any
 
 from sglang.srt.mem_cache.common import release_kv_cache
 
-from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.messages import (
+    IncomingMessage,
+    OutgoingMessage,
+    SchedulerOutputQueue,
+)
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
     SchedulerOutput,
@@ -309,7 +313,7 @@ class FishScheduler:
         max_new_tokens: int,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
-        self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
+        self.outbox: _queue_mod.Queue[OutgoingMessage] = SchedulerOutputQueue()
 
         self._request_builder = request_builder
         self._result_adapter = result_adapter
