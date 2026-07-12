@@ -308,7 +308,11 @@ async def write_payload(
         request=payload.request,
         data=data_without_tensors,
     )
-    op = await relay.put_async(packed, request_id=request_id)
+    op = await relay.put_async(
+        packed,
+        request_id=request_id,
+        receiver_id=to_stage,
+    )
     data_ref = DataRef(
         version=1,
         object_id=f"{request_id}:payload:{from_stage or ''}:{to_stage or ''}",
@@ -377,7 +381,11 @@ async def write_tensor(
         packed = torch.cat(
             [torch.zeros(offset, dtype=torch.uint8, device=target_device), packed]
         )
-    op = await relay.put_async(packed, request_id=object_id)
+    op = await relay.put_async(
+        packed,
+        request_id=object_id,
+        receiver_id=to_stage,
+    )
     return (
         DataRef(
             version=1,
@@ -441,7 +449,12 @@ async def write_stream_chunk(
     )
     pending_ops = [op]
     data_ref = await _with_stream_metadata(
-        relay, data_ref, metadata, transport, pending_ops
+        relay,
+        data_ref,
+        metadata,
+        transport,
+        pending_ops,
+        receiver_id=target_stage,
     )
     return data_ref, pending_ops
 
@@ -491,6 +504,8 @@ async def _with_stream_metadata(
     metadata: dict | None,
     transport: TransportKind,
     pending_ops: list[Any],
+    *,
+    receiver_id: str | None = None,
 ) -> DataRef:
     if metadata is None:
         return data_ref
@@ -503,6 +518,7 @@ async def _with_stream_metadata(
             tensor,
             transport=transport,
             kind=DataKind.STREAM_METADATA_TENSOR,
+            receiver_id=receiver_id,
         )
         tensor_refs.append(MetadataTensorRef(path=path, ref=ref))
         pending_ops.append(op)

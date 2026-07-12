@@ -166,7 +166,11 @@ def _sender(
         buf = _expected(_N).to(f"cuda:{src_gpu}")
 
         async def run() -> None:
-            op = await relay.put_async(buf, request_id="r")
+            op = await relay.put_async(
+                buf,
+                request_id="r",
+                receiver_id="receiver",
+            )
             meta_q.put(op.metadata)
             ack_status, ack_value = ack_q.get(timeout=60)
             if ack_status == "ok":
