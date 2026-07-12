@@ -518,7 +518,7 @@ async def _with_stream_metadata(
             tensor,
             transport=transport,
             kind=DataKind.STREAM_METADATA_TENSOR,
-            receiver_id=receiver_id,
+            to_stage=receiver_id,
         )
         tensor_refs.append(MetadataTensorRef(path=path, ref=ref))
         pending_ops.append(op)
