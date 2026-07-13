@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
 from benchmarks.same_gpu_dp.summarize import (
     classify_kv_capacity,
     extract_kv_tokens,
@@ -17,6 +19,28 @@ from benchmarks.same_gpu_dp.summarize import (
     summarize_router_snapshot,
     validate_layout,
 )
+
+
+def test_benchmark_start_barrier_waits_for_release(tmp_path: Path) -> None:
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    runner = BenchmarkRunner(
+        RunConfig(
+            barrier_ready_file=str(ready),
+            barrier_release_file=str(release),
+            barrier_timeout_s=1,
+        )
+    )
+
+    async def exercise() -> None:
+        waiting = asyncio.create_task(runner._wait_for_barrier())
+        while not ready.exists():
+            await asyncio.sleep(0.01)
+        assert not waiting.done()
+        release.touch()
+        await waiting
+
+    asyncio.run(exercise())
 
 
 def test_classify_kv_capacity_requires_the_configured_cap() -> None:
@@ -153,6 +177,19 @@ def test_summarize_results_combines_concurrent_worker_artifacts(tmp_path: Path) 
     assert result["output_tokens_mean"] == 15.0
     assert result["audio_duration_total_s"] == 4.0
     assert result["worker_qps_cv"] == 0.2
+
+
+def test_summarize_results_uses_shared_wall_clock(tmp_path: Path) -> None:
+    first = _write_result(tmp_path / "worker_0", 2.0, 1.0, 10)
+    second = _write_result(tmp_path / "worker_1", 3.0, 3.0, 20)
+
+    result = summarize_results([first, second], wall_clock_s=2.0)["aggregate"]
+
+    assert result["throughput_qps"] == 1.0
+    assert result["worker_qps_sum"] == 5.0
+    assert result["measurement_wall_clock_s"] == 2.0
+    assert result["audio_throughput_s_per_s"] == 2.0
+    assert result["output_throughput_tok_s"] == 15.0
 
 
 def test_summarize_router_snapshot_uses_actual_worker_counters(

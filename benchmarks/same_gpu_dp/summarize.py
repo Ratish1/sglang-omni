@@ -135,7 +135,9 @@ def classify_kv_capacity(
     return "exact" if expected_tokens is not None else "equal"
 
 
-def summarize_results(result_paths: Iterable[Path]) -> dict[str, object]:
+def summarize_results(
+    result_paths: Iterable[Path], wall_clock_s: float | None = None
+) -> dict[str, object]:
     workers: list[dict[str, object]] = []
     successful_rows: list[dict] = []
     for path in result_paths:
@@ -165,14 +167,24 @@ def summarize_results(result_paths: Iterable[Path]) -> dict[str, object]:
         if row.get("completion_tokens") is not None
     ]
     qps = [float(worker.get("throughput_qps") or 0) for worker in workers]
+    completed_requests = sum(
+        int(worker.get("completed_requests") or 0) for worker in workers
+    )
+    throughput_qps = (
+        completed_requests / wall_clock_s if wall_clock_s is not None else sum(qps)
+    )
+    audio_duration_total = sum(audio_durations)
+    output_tokens_total = sum(output_tokens)
     aggregate = {
         "workers": len(workers),
         "total_requests": sum(int(w.get("total_requests") or 0) for w in workers),
-        "completed_requests": sum(
-            int(w.get("completed_requests") or 0) for w in workers
-        ),
+        "completed_requests": completed_requests,
         "failed_requests": sum(int(w.get("failed_requests") or 0) for w in workers),
-        "throughput_qps": round(sum(qps), 3),
+        "throughput_qps": round(throughput_qps, 3),
+        "measurement_wall_clock_s": (
+            round(wall_clock_s, 6) if wall_clock_s is not None else None
+        ),
+        "worker_qps_sum": round(sum(qps), 3),
         "latency_p50_s": _rounded(percentile(latencies, 0.50), 4),
         "latency_p95_s": _rounded(percentile(latencies, 0.95), 4),
         "latency_p99_s": _rounded(percentile(latencies, 0.99), 4),
@@ -182,16 +194,24 @@ def summarize_results(result_paths: Iterable[Path]) -> dict[str, object]:
         "audio_duration_mean_s": _rounded(
             statistics.fmean(audio_durations) if audio_durations else None, 4
         ),
-        "audio_duration_total_s": round(sum(audio_durations), 3),
+        "audio_duration_total_s": round(audio_duration_total, 3),
         "audio_throughput_s_per_s": round(
-            sum(float(w.get("audio_throughput_s_per_s") or 0) for w in workers), 3
+            (
+                audio_duration_total / wall_clock_s
+                if wall_clock_s is not None
+                else sum(float(w.get("audio_throughput_s_per_s") or 0) for w in workers)
+            ),
+            3,
         ),
         "output_throughput_tok_s": round(
-            sum(float(w.get("output_throughput") or 0) for w in workers), 1
+            (
+                output_tokens_total / wall_clock_s
+                if wall_clock_s is not None
+                else sum(float(w.get("output_throughput") or 0) for w in workers)
+            ),
+            1,
         ),
-        "output_tokens_total": sum(
-            int(w.get("output_tokens_total") or 0) for w in workers
-        ),
+        "output_tokens_total": output_tokens_total,
         "output_tokens_mean": _rounded(
             statistics.fmean(output_tokens) if output_tokens else None, 1
         ),
@@ -327,6 +347,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     summarize = sub.add_parser("summarize")
     summarize.add_argument("--output", required=True, type=Path)
+    summarize.add_argument("--wall-clock-s", type=float)
     summarize.add_argument("results", nargs="+", type=Path)
 
     kv = sub.add_parser("extract-kv")
@@ -363,7 +384,9 @@ def main() -> None:
         print(json.dumps(result, indent=2, sort_keys=True))
         return
     if args.command == "summarize":
-        result = summarize_results(args.results)
+        if args.wall_clock_s is not None and args.wall_clock_s <= 0:
+            raise SystemExit("--wall-clock-s must be positive")
+        result = summarize_results(args.results, args.wall_clock_s)
         args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(result["aggregate"], indent=2))
         return

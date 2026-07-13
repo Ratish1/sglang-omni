@@ -247,6 +247,10 @@ class TtsSeedttsBenchmarkConfig:
     stream: bool = False
     initial_codec_chunk_frames: int | None = None
     disable_tqdm: bool = False
+    sample_rotation_index: int = 0
+    sample_rotation_count: int = 1
+    barrier_ready_file: str | None = None
+    barrier_release_file: str | None = None
     max_running_requests: int = 64
     cuda_graph_max_bs: int = 64
     # Transcribe phase
@@ -299,6 +303,8 @@ def _build_results_config(
         "warmup": config.warmup,
         "concurrency": config.concurrency,
         "request_rate": config.request_rate,
+        "sample_rotation_index": config.sample_rotation_index,
+        "sample_rotation_count": config.sample_rotation_count,
         "initial_codec_chunk_frames": config.initial_codec_chunk_frames,
         "max_running_requests": config.max_running_requests,
         "cuda_graph_max_bs": config.cuda_graph_max_bs,
@@ -316,6 +322,8 @@ async def run_tts_seedtts_benchmark(
     api_url = f"{base_url}/v1/audio/speech"
 
     samples = load_seedtts_samples(config.meta, config.max_samples, split=config.lang)
+    offset = len(samples) * config.sample_rotation_index // config.sample_rotation_count
+    samples = samples[offset:] + samples[:offset]
     logger.info(f"Prepared {len(samples)} requests")
 
     save_audio_dir = os.path.abspath(os.path.join(config.output_dir, "audio"))
@@ -343,6 +351,8 @@ async def run_tts_seedtts_benchmark(
             request_rate=config.request_rate,
             warmup=config.warmup,
             disable_tqdm=config.disable_tqdm,
+            barrier_ready_file=config.barrier_ready_file,
+            barrier_release_file=config.barrier_release_file,
         )
     )
     outputs = await runner.run(samples, send_fn)
@@ -427,6 +437,10 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         stream=args.stream,
         initial_codec_chunk_frames=args.initial_codec_chunk_frames,
         disable_tqdm=args.disable_tqdm,
+        sample_rotation_index=args.sample_rotation_index,
+        sample_rotation_count=args.sample_rotation_count,
+        barrier_ready_file=args.barrier_ready_file,
+        barrier_release_file=args.barrier_release_file,
         max_running_requests=args.max_running_requests,
         cuda_graph_max_bs=args.cuda_graph_max_bs,
         lang=args.lang,
@@ -556,6 +570,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Per-request sampler seed for reproducible generation.",
     )
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--sample-rotation-index", type=int, default=0, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--sample-rotation-count", type=int, default=1, help=argparse.SUPPRESS
+    )
+    parser.add_argument("--barrier-ready-file", help=argparse.SUPPRESS)
+    parser.add_argument("--barrier-release-file", help=argparse.SUPPRESS)
     parser.add_argument(
         "--concurrency",
         "--max-concurrency",
@@ -707,6 +729,12 @@ def main() -> None:
         parser.error("--max-running-requests must be positive")
     if args.cuda_graph_max_bs <= 0:
         parser.error("--cuda-graph-max-bs must be positive")
+    if not 0 <= args.sample_rotation_index < args.sample_rotation_count:
+        parser.error("--sample-rotation-index must be in [0, --sample-rotation-count)")
+    if bool(args.barrier_ready_file) != bool(args.barrier_release_file):
+        parser.error(
+            "--barrier-ready-file and --barrier-release-file must be set together"
+        )
     if args.use_existing_server and not (args.generate_only or args.transcribe_only):
         parser.error(
             "--use-existing-server currently requires --generate-only or "

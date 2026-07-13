@@ -44,3 +44,21 @@ def test_seedtts_benchmark_batch_args_are_independent() -> None:
     )
     assert results_config["max_running_requests"] == 32
     assert results_config["cuda_graph_max_bs"] == 128
+
+
+def test_seedtts_benchmark_accepts_internal_pool_coordination_args() -> None:
+    config = _config_from_cli(
+        "--sample-rotation-index",
+        "1",
+        "--sample-rotation-count",
+        "3",
+        "--barrier-ready-file",
+        "/tmp/ready-1",
+        "--barrier-release-file",
+        "/tmp/start",
+    )
+
+    assert config.sample_rotation_index == 1
+    assert config.sample_rotation_count == 3
+    assert config.barrier_ready_file == "/tmp/ready-1"
+    assert config.barrier_release_file == "/tmp/start"

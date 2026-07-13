@@ -7,6 +7,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Coroutine
 
 import aiohttp
@@ -27,6 +28,9 @@ class RunConfig:
     warmup: int = 1
     disable_tqdm: bool = False
     timeout_s: int = 300
+    barrier_ready_file: str | None = None
+    barrier_release_file: str | None = None
+    barrier_timeout_s: int = 600
 
 
 class BenchmarkRunner:
@@ -42,6 +46,10 @@ class BenchmarkRunner:
     """
 
     def __init__(self, config: RunConfig) -> None:
+        if bool(config.barrier_ready_file) != bool(config.barrier_release_file):
+            raise ValueError(
+                "barrier_ready_file and barrier_release_file must be set together"
+            )
         self.config = config
         self.wall_clock_s: float = 0.0
 
@@ -50,6 +58,7 @@ class BenchmarkRunner:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             if self.config.warmup > 0:
                 await self._warmup(session, samples, send_fn)
+            await self._wait_for_barrier()
 
             logger.info(
                 "Benchmarking %d requests (max_concurrency=%s)...",
@@ -60,6 +69,20 @@ class BenchmarkRunner:
             results = await self._dispatch(session, samples, send_fn)
             self.wall_clock_s = time.perf_counter() - t0
         return results
+
+    async def _wait_for_barrier(self) -> None:
+        if self.config.barrier_ready_file is None:
+            return
+
+        ready = Path(self.config.barrier_ready_file)
+        release = Path(self.config.barrier_release_file)
+        ready.parent.mkdir(parents=True, exist_ok=True)
+        ready.touch()
+        deadline = time.monotonic() + self.config.barrier_timeout_s
+        while not release.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"benchmark start barrier timed out: {release}")
+            await asyncio.sleep(0.05)
 
     async def _warmup(
         self,

@@ -48,6 +48,7 @@ fi
 : "${SERVER_READY_TIMEOUT:=1200}"
 : "${MPS_READY_TIMEOUT:=30}"
 : "${SHUTDOWN_TIMEOUT:=90}"
+: "${CLIENT_READY_TIMEOUT:=600}"
 : "${KV_EQUALITY:=warn}"
 : "${CAPACITY_ONLY:=0}"
 : "${KEEP_AUDIO:=0}"
@@ -87,7 +88,8 @@ fi
   exit 2
 }
 for numeric_name in BASE_PORT ROUTER_PORT CONCURRENCY_PER_WORKER MAX_RUNNING_REQUESTS \
-  CUDA_GRAPH_MAX_BS MAX_NEW_TOKENS SERVER_READY_TIMEOUT SHUTDOWN_TIMEOUT; do
+  CUDA_GRAPH_MAX_BS MAX_NEW_TOKENS SERVER_READY_TIMEOUT SHUTDOWN_TIMEOUT \
+  CLIENT_READY_TIMEOUT; do
   numeric_value=${!numeric_name}
   [[ "$numeric_value" =~ ^[1-9][0-9]*$ ]] || {
     echo "$numeric_name must be a positive integer" >&2
@@ -610,6 +612,10 @@ else
     --server-max-new-tokens "$MAX_NEW_TOKENS" --warmup "$WARMUP")
 fi
 
+CLIENT_BARRIER="$OUT/client_barrier"
+RELEASE_FILE="$CLIENT_BARRIER/start"
+[[ "$CLIENT_DRIVER" == seedtts ]] && mkdir -p "$CLIENT_BARRIER"
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
   for ((i = 0; i < DP; i++)); do
     if [[ "$MODE" == direct ]]; then
@@ -619,9 +625,15 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
       target_port=$ROUTER_PORT
       output="$OUT/router_clients/client_${i}.benchmark"
     fi
-    print_command setsid numactl --physcpubind="${CLIENT_CORES[$i]}" \
+    command=(setsid numactl --physcpubind="${CLIENT_CORES[$i]}" \
       --membind="$NUMA_NODE" "${BENCH_COMMON[@]}" --port "$target_port" \
-      --concurrency "$CONCURRENCY_PER_WORKER" --output-dir "$output"
+      --concurrency "$CONCURRENCY_PER_WORKER" --output-dir "$output")
+    if [[ "$CLIENT_DRIVER" == seedtts ]]; then
+      command+=(--sample-rotation-index "$i" --sample-rotation-count "$DP"
+        --barrier-ready-file "$CLIENT_BARRIER/ready-$i"
+        --barrier-release-file "$RELEASE_FILE")
+    fi
+    print_command "${command[@]}"
   done
   echo "dry run complete: commands and manifest are in $OUT"
   trap - EXIT INT TERM
@@ -634,6 +646,11 @@ if [[ "$MODE" == direct ]]; then
     command=(setsid numactl --physcpubind="${CLIENT_CORES[$i]}" --membind="$NUMA_NODE"
       "${BENCH_COMMON[@]}" --port "${TARGET_PORTS[$i]}"
       --concurrency "$CONCURRENCY_PER_WORKER" --output-dir "$output")
+    if [[ "$CLIENT_DRIVER" == seedtts ]]; then
+      command+=(--sample-rotation-index "$i" --sample-rotation-count "$DP"
+        --barrier-ready-file "$CLIENT_BARRIER/ready-$i"
+        --barrier-release-file "$RELEASE_FILE")
+    fi
     print_command "${command[@]}"
     "${command[@]}" > "$OUT/workers/worker_${i}.benchmark.log" 2>&1 &
     CLIENT_PGIDS+=("$!")
@@ -645,14 +662,49 @@ else
     command=(setsid numactl --physcpubind="${CLIENT_CORES[$i]}" --membind="$NUMA_NODE"
       "${BENCH_COMMON[@]}" --port "$ROUTER_PORT"
       --concurrency "$CONCURRENCY_PER_WORKER" --output-dir "$output")
+    if [[ "$CLIENT_DRIVER" == seedtts ]]; then
+      command+=(--sample-rotation-index "$i" --sample-rotation-count "$DP"
+        --barrier-ready-file "$CLIENT_BARRIER/ready-$i"
+        --barrier-release-file "$RELEASE_FILE")
+    fi
     print_command "${command[@]}"
     "${command[@]}" > "$OUT/router_clients/client_${i}.benchmark.log" 2>&1 &
     CLIENT_PGIDS+=("$!")
   done
 fi
 
+condition_wall_clock_s=""
+if [[ "$CLIENT_DRIVER" == seedtts ]]; then
+  deadline=$((SECONDS + CLIENT_READY_TIMEOUT))
+  while :; do
+    ready=0
+    for ((i = 0; i < DP; i++)); do
+      [[ -e "$CLIENT_BARRIER/ready-$i" ]] && ready=$((ready + 1))
+    done
+    [[ "$ready" -eq "$DP" ]] && break
+    for pgid in "${CLIENT_PGIDS[@]}"; do
+      kill -0 -- "-$pgid" 2>/dev/null \
+        || { echo "benchmark client exited before the start barrier" >&2; exit 1; }
+    done
+    ((SECONDS < deadline)) \
+      || { echo "benchmark clients did not reach the start barrier" >&2; exit 1; }
+    sleep 1
+  done
+  condition_start_ns=$(python3 -c 'import time; print(time.monotonic_ns())')
+  : > "$RELEASE_FILE"
+fi
 client_failed=0
 for pgid in "${CLIENT_PGIDS[@]}"; do wait "$pgid" || client_failed=1; done
+if [[ "$CLIENT_DRIVER" == seedtts ]]; then
+  condition_end_ns=$(python3 -c 'import time; print(time.monotonic_ns())')
+  condition_wall_clock_s=$(python3 - "$condition_start_ns" "$condition_end_ns" <<'PY'
+import sys
+
+print((int(sys.argv[2]) - int(sys.argv[1])) / 1_000_000_000)
+PY
+  )
+  printf '%s\n' "$condition_wall_clock_s" > "$OUT/condition_wall_clock_s.txt"
+fi
 [[ "$client_failed" -eq 0 ]] || { echo "one or more benchmark clients failed" >&2; exit 1; }
 
 if [[ "$MODE" == router ]]; then
@@ -669,13 +721,16 @@ if [[ "$MODE" == direct ]]; then
     result_paths+=("$OUT/workers/worker_${i}.benchmark/speed_results.json")
     logs+=("$OUT/workers/worker_${i}.server.log")
   done
-  python3 "$HERE/summarize.py" summarize --output "$OUT/summary.json" "${result_paths[@]}"
 else
   result_paths=()
   for ((i = 0; i < DP; i++)); do
     result_paths+=("$OUT/router_clients/client_${i}.benchmark/speed_results.json")
   done
-  python3 "$HERE/summarize.py" summarize --output "$OUT/summary.json" "${result_paths[@]}"
 fi
+summary_command=(python3 "$HERE/summarize.py" summarize --output "$OUT/summary.json")
+[[ -n "$condition_wall_clock_s" ]] \
+  && summary_command+=(--wall-clock-s "$condition_wall_clock_s")
+summary_command+=("${result_paths[@]}")
+"${summary_command[@]}"
 
 echo "condition complete: $OUT"
