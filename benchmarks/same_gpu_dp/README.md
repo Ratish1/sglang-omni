@@ -66,7 +66,7 @@ settings are:
 | `NUMA_NODE` | memory node local to the GPU |
 | `ROUTER_CORES` | dedicated physical cores for router mode |
 | `ROUTER_POLICY` | router policy; defaults to `least_request` |
-| `MEM_FRACTIONS` | `auto` or one explicit value per replica; one value broadcasts |
+| `MEM_FRACTIONS` | `auto` to omit the CLI override, or one explicit value per replica; one value broadcasts |
 | `CONCURRENCY_PER_WORKER` | canonical client concurrency per direct worker |
 | `MAX_RUNNING_REQUESTS` | server generation batching limit |
 | `CUDA_GRAPH_MAX_BS` | server CUDA graph maximum batch size |
@@ -168,11 +168,12 @@ changes what later replicas can fit. The calibrator instead applies one candidat
 every replica, doubles a known-safe seed until it finds a failing bound, binary-searches
 the boundary, and confirms the selected cap with fresh launches.
 
-The capacity profiles omit `mem_fraction_static` (`MEM_FRACTIONS=auto`) so SGLang
-selects its existing hardware-aware value. The common candidate cap prevents earlier
-replicas from consuming that entire automatic budget; the search proves the largest
-candidate every replica can resolve. To run a custom layout without YAML, set the
-`DPn_*` layout variables, including `DPn_INITIAL_CAP_TOKENS`, and run:
+The capacity profiles omit the CLI override (`MEM_FRACTIONS=auto`), so the model's
+existing memory-fraction default applies. For Higgs this is `0.85`. The common
+candidate cap prevents earlier replicas from consuming that entire budget; the
+search proves the largest candidate every replica can resolve. To run a custom
+layout without YAML, set the `DPn_*` layout variables, including
+`DPn_INITIAL_CAP_TOKENS`, and run:
 
 ```bash
 CALIBRATION_DPS=2,3,4 \
@@ -287,9 +288,10 @@ Add `--dry-run` to validate and print the entire matrix without touching CUDA.
 When `KV_EQUALITY=require`, `run_matrix.sh` refuses DP2–4 before any expensive
 launch unless the corresponding `DPn_MAX_TOTAL_TOKENS` is set.
 
-`auto` is safe here because DP2–4 also receive the exact searched caps. Do not run
-uncapped same-GPU replicas and assume their automatic pools will be equal. Each matrix
-condition is run at every `CONCURRENCY_VALUES` point; compare the peak
+`auto` is safe here because it only omits the CLI fraction override and DP2–4 also
+receive the exact searched caps. Do not run uncapped same-GPU replicas and assume
+their profiled pools will be equal. Each matrix condition is run at every
+`CONCURRENCY_VALUES` point; compare the peak
 that satisfies the same SLO, rather than choosing one concurrency for DP1 and a
 different unreported search for DPk. Use a different randomized `MATRIX_ORDER`
 per study or set a recorded `SHUFFLE_SEED` (the default is `1`) to shuffle every

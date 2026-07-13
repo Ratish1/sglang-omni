@@ -144,7 +144,6 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     ]
     assert captured["overrides"]["cuda_graph_max_bs"] == 64
     assert captured["overrides"]["max_running_requests"] == 64
-    assert "mem_fraction_static" not in captured["overrides"]
     assert captured["server_args"].disable_overlap_schedule is True
     assert captured["server_args"].enable_torch_compile is False
     assert captured["server_args"].torch_compile_max_bs == 32
