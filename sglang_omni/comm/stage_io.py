@@ -399,6 +399,7 @@ async def write_tensor(
             ),
             shape=tuple(int(dim) for dim in tensor.shape),
             dtype=str(tensor.dtype),
+            device=str(tensor.device),
             offset=offset,
         ),
         op,
@@ -415,14 +416,17 @@ async def read_tensor(
         raise ValueError("raw tensor data_ref is missing shape")
     if data_ref.dtype is None:
         raise ValueError("raw tensor data_ref is missing dtype")
+    if data_ref.device is None:
+        raise ValueError("raw tensor data_ref is missing device")
     if data_ref.offset is None:
         raise ValueError("raw tensor data_ref is missing offset")
     transfer_buf = await _read_transfer_buffer(relay, data_ref.object_id, data_ref)
-    return (
+    tensor = (
         transfer_buf[data_ref.offset :]
         .view(_torch_dtype(data_ref.dtype))
         .reshape(data_ref.shape)
     )
+    return _restore_tensor_device(tensor, data_ref.device)
 
 
 async def write_stream_chunk(
@@ -531,6 +535,7 @@ async def _with_stream_metadata(
         buffer=data_ref.buffer,
         shape=data_ref.shape,
         dtype=data_ref.dtype,
+        device=data_ref.device,
         offset=data_ref.offset,
         metadata=metadata_without_tensors,
         metadata_tensors=tuple(tensor_refs),
