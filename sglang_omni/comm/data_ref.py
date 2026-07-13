@@ -19,17 +19,11 @@ class DataKind(str, Enum):
     STAGE_PAYLOAD = "stage_payload"
     STREAM_CHUNK = "stream_chunk"
     STREAM_METADATA_TENSOR = "stream_metadata_tensor"
-    KV_PAGES = "kv_pages"
-    WEIGHT_BUCKET = "weight_bucket"
-    MOE_EXPERT_PAYLOAD = "moe_expert_payload"
 
 
 class DataLayout(str, Enum):
     PACKED_TENSORS = "packed_tensors"
     RAW_TENSOR = "raw_tensor"
-    PAGED = "paged"
-    BUCKETED = "bucketed"
-    SCATTER = "scatter"
 
 
 class TensorMeta(msgspec.Struct, frozen=True):
