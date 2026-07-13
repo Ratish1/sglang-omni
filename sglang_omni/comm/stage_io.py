@@ -236,12 +236,12 @@ def deserialize_direct_cuda_ipc_payload(data_ref: dict[str, Any]) -> StagePayloa
     )
 
 
-def serialize_direct_cuda_ipc_stream_chunk(
+def try_serialize_direct_cuda_ipc_stream_chunk(
     data: Any,
     metadata: dict[str, Any] | None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     if not should_use_direct_cuda_ipc_stream_chunk(data, metadata):
-        raise ValueError("same-GPU CUDA stream chunk is not direct-IPC eligible")
+        return None
     ref: dict[str, Any] = {
         "_type": _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE,
         "version": 1,

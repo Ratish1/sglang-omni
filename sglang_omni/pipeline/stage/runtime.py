@@ -1337,30 +1337,33 @@ class Stage:
                 f"{type(data).__name__}"
             )
         if data.is_cuda and self._comm.router.is_same_gpu_target(target):
-            direct_ref = stage_io.serialize_direct_cuda_ipc_stream_chunk(data, metadata)
-            _emit_event(
-                request_id=request_id,
-                stage=self.name,
-                event_name="stage_stream_chunk_sent",
-                metadata={
-                    "to_stage": target,
-                    "chunk_id": chunk_id,
-                    "modality": chunk_modality,
-                    "transport": "torch_cuda_ipc",
-                },
+            direct_ref = stage_io.try_serialize_direct_cuda_ipc_stream_chunk(
+                data, metadata
             )
-            await self.control_plane.send_to_stage(
-                target,
-                endpoint,
-                DataReadyMessage(
+            if direct_ref is not None:
+                _emit_event(
                     request_id=request_id,
-                    from_stage=self.name,
-                    to_stage=target,
-                    data_ref=direct_ref,
-                    chunk_id=chunk_id,
-                ),
-            )
-            return
+                    stage=self.name,
+                    event_name="stage_stream_chunk_sent",
+                    metadata={
+                        "to_stage": target,
+                        "chunk_id": chunk_id,
+                        "modality": chunk_modality,
+                        "transport": "torch_cuda_ipc",
+                    },
+                )
+                await self.control_plane.send_to_stage(
+                    target,
+                    endpoint,
+                    DataReadyMessage(
+                        request_id=request_id,
+                        from_stage=self.name,
+                        to_stage=target,
+                        data_ref=direct_ref,
+                        chunk_id=chunk_id,
+                    ),
+                )
+                return
         transport_kind, relay = self._comm.router.relay_for_stream(target, data)
         _emit_event(
             request_id=request_id,

@@ -900,7 +900,7 @@ def test_stage_sends_same_process_stream_chunk_as_local_object(monkeypatch) -> N
 def test_stage_sends_same_gpu_stream_chunk_as_direct_cuda_ipc(monkeypatch) -> None:
     monkeypatch.setattr(
         stage_io,
-        "serialize_direct_cuda_ipc_stream_chunk",
+        "try_serialize_direct_cuda_ipc_stream_chunk",
         lambda data, metadata: {
             "_type": "TorchCudaIpcStreamChunk",
             "version": 1,
