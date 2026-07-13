@@ -245,13 +245,18 @@ def try_serialize_direct_cuda_ipc_stream_chunk(
 ) -> dict[str, Any] | None:
     if not should_use_direct_cuda_ipc_stream_chunk(data, metadata):
         return None
-    ref: dict[str, Any] = {
-        "_type": _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE,
-        "version": 1,
-        "tensor_bytes": _ipc_pickle(data),
-    }
-    if metadata is not None:
-        ref["metadata"] = _serialize_direct_ipc_metadata_value(metadata)
+    try:
+        ref: dict[str, Any] = {
+            "_type": _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE,
+            "version": 1,
+            "tensor_bytes": _ipc_pickle(data),
+        }
+        if metadata is not None:
+            ref["metadata"] = _serialize_direct_ipc_metadata_value(metadata)
+    except RuntimeError as exc:
+        if "received from another process" not in str(exc):
+            raise
+        return None
     return ref
 
 
