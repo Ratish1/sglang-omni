@@ -20,7 +20,7 @@
 #   MF: optional explicit --mem-fraction-static override (unset = Higgs default).
 set -euo pipefail
 
-STATE_ROOT=${STATE_ROOT:-/tmp/sglang-omni-same-gpu-dp/$USER}
+STATE_ROOT=${STATE_ROOT:-/tmp/sglang-omni-same-gpu-dp/$UID}
 CMD=${1:-}
 RUN_ARG=${2:-}
 HEALTH_TRIES=${HEALTH_TRIES:-50}

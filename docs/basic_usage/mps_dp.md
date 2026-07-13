@@ -26,8 +26,8 @@ Pick a GPU that is idle, then find its NUMA node from the PCI bus id (drm card o
 2. **Start a private MPS daemon.**
 
 ```bash
-export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps-$USER-gpu$GPU_ID/pipe
-export CUDA_MPS_LOG_DIRECTORY=/tmp/mps-$USER-gpu$GPU_ID/log
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps-$UID-gpu$GPU_ID/pipe
+export CUDA_MPS_LOG_DIRECTORY=/tmp/mps-$UID-gpu$GPU_ID/log
 mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
 nvidia-cuda-mps-control -d
 echo get_default_active_thread_percentage | nvidia-cuda-mps-control   # sanity: responds
