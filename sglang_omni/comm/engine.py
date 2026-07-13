@@ -84,36 +84,8 @@ class CommEngine:
         self._task_done_callback = task_done_callback
         self._closed = False
 
-    def outbound(self, target: str) -> TransportKind:
-        return self.router.outbound(target)
-
-    def outbound_stream(self, target: str, data: torch.Tensor) -> TransportKind:
-        return self.router.outbound_stream(target, data)
-
     def relay(self, kind: TransportKind) -> Relay:
         return self.router.relay(kind)
-
-    def inbound_relay(self, from_stage: str) -> Relay:
-        return self.router.inbound_relay(from_stage)
-
-    async def write_payload(
-        self,
-        *,
-        relay: Relay,
-        request_id: str,
-        payload: StagePayload,
-        transport: TransportKind,
-        from_stage: str,
-        to_stage: str,
-    ) -> tuple[DataRef, Any]:
-        return await stage_io.write_payload(
-            relay,
-            request_id,
-            payload,
-            transport=transport,
-            from_stage=from_stage,
-            to_stage=to_stage,
-        )
 
     async def send_payload(
         self,
