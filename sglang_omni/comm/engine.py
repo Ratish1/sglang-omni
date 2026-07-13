@@ -84,8 +84,36 @@ class CommEngine:
         self._task_done_callback = task_done_callback
         self._closed = False
 
+    def outbound(self, target: str) -> TransportKind:
+        return self.router.outbound(target)
+
+    def outbound_stream(self, target: str, data: torch.Tensor) -> TransportKind:
+        return self.router.outbound_stream(target, data)
+
     def relay(self, kind: TransportKind) -> Relay:
         return self.router.relay(kind)
+
+    def inbound_relay(self, from_stage: str) -> Relay:
+        return self.router.inbound_relay(from_stage)
+
+    async def write_payload(
+        self,
+        *,
+        relay: Relay,
+        request_id: str,
+        payload: StagePayload,
+        transport: TransportKind,
+        from_stage: str,
+        to_stage: str,
+    ) -> tuple[DataRef, Any]:
+        return await stage_io.write_payload(
+            relay,
+            request_id,
+            payload,
+            transport=transport,
+            from_stage=from_stage,
+            to_stage=to_stage,
+        )
 
     async def send_payload(
         self,
@@ -187,7 +215,7 @@ class CommEngine:
             queue_key=target_stage,
             elapsed_ms=round(_comm_elapsed_ms(enqueue_start), 6),
         )
-        await ready
+        _ = await ready
 
     async def read_stream_chunk(
         self,
@@ -269,6 +297,8 @@ class CommEngine:
     async def _run_payload_send(self, job: _PayloadSendJob, queue_key: str) -> None:
         object_id: str | None = None
         send_start = _comm_now_ns()
+        write_ms = -1.0
+        control_ms = -1.0
         try:
             write_start = _comm_now_ns()
             data_ref, op = await stage_io.write_payload(
@@ -317,6 +347,8 @@ class CommEngine:
     async def _run_stream_send(self, job: _StreamSendJob, queue_key: str) -> None:
         object_id: str | None = None
         send_start = _comm_now_ns()
+        write_ms = -1.0
+        control_ms = -1.0
         try:
             write_start = _comm_now_ns()
             data_ref, ops = await stage_io.write_stream_chunk(

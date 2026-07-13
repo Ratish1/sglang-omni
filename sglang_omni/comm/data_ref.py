@@ -19,11 +19,17 @@ class DataKind(str, Enum):
     STAGE_PAYLOAD = "stage_payload"
     STREAM_CHUNK = "stream_chunk"
     STREAM_METADATA_TENSOR = "stream_metadata_tensor"
+    KV_PAGES = "kv_pages"
+    WEIGHT_BUCKET = "weight_bucket"
+    MOE_EXPERT_PAYLOAD = "moe_expert_payload"
 
 
 class DataLayout(str, Enum):
     PACKED_TENSORS = "packed_tensors"
     RAW_TENSOR = "raw_tensor"
+    PAGED = "paged"
+    BUCKETED = "bucketed"
+    SCATTER = "scatter"
 
 
 class TensorMeta(msgspec.Struct, frozen=True):
@@ -116,7 +122,6 @@ class DataRef(msgspec.Struct, frozen=True):
     tensors: tuple[TensorMeta, ...] = ()
     shape: tuple[int, ...] | None = None
     dtype: str | None = None
-    device: str | None = None
     offset: int | None = None
     metadata: dict[str, Any] | None = None
     metadata_tensors: tuple[MetadataTensorRef, ...] = ()
@@ -141,8 +146,6 @@ class DataRef(msgspec.Struct, frozen=True):
             value["shape"] = list(self.shape)
         if self.dtype is not None:
             value["dtype"] = self.dtype
-        if self.device is not None:
-            value["device"] = self.device
         if self.offset is not None:
             value["offset"] = self.offset
         if self.metadata is not None:
@@ -169,7 +172,6 @@ class DataRef(msgspec.Struct, frozen=True):
             ),
             shape=_int_tuple(value, "shape") if "shape" in value else None,
             dtype=_optional(value, "dtype", str),
-            device=_optional(value, "device", str),
             offset=_required(value, "offset", int) if "offset" in value else None,
             metadata=(
                 _required(value, "metadata", dict) if "metadata" in value else None

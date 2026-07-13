@@ -131,21 +131,21 @@ def should_use_direct_cuda_ipc_stream_chunk(
     return inline_size <= _IPC_INLINE_CPU_BYTES_LIMIT
 
 
-def try_serialize_direct_cuda_ipc_payload(
-    payload: StagePayload,
-) -> dict[str, Any] | None:
+def payload_has_cuda_tensor(payload: Any) -> bool:
+    return _contains_cuda_tensor(payload)
+
+
+def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
     if not isinstance(payload, StagePayload):
         raise TypeError(
             f"direct CUDA IPC payload requires StagePayload, got "
             f"{type(payload).__name__}"
         )
-    if _contains_cuda_tensor(payload.request):
-        raise ValueError("stage payload requests cannot contain CUDA tensors")
-    if _contains_cpu_tensor(payload.request):
-        return None
+    if _contains_cuda_tensor(payload.request) or _contains_cpu_tensor(payload.request):
+        raise ValueError("direct CUDA IPC payload does not support request tensors")
     data_without_tensors, tensors = extract_cuda_tensors(payload.data)
     if not tensors:
-        return None
+        raise ValueError("direct CUDA IPC payload requires at least one CUDA tensor")
     header = StagePayload(
         request_id=payload.request_id,
         request=payload.request,
@@ -153,21 +153,18 @@ def try_serialize_direct_cuda_ipc_payload(
     )
     header_bytes = pickle.dumps(header)
     if len(header_bytes) > _IPC_INLINE_CPU_BYTES_LIMIT:
-        return None
-    serialized_tensors = []
-    for path, tensor in tensors.items():
-        try:
-            tensor_bytes = _ipc_pickle(tensor)
-        except RuntimeError as exc:
-            if "received from another process" not in str(exc):
-                raise
-            return None
-        serialized_tensors.append({"path": path, "tensor_bytes": tensor_bytes})
+        raise ValueError(
+            "direct CUDA IPC payload header exceeds inline limit: "
+            f"{len(header_bytes)} > {_IPC_INLINE_CPU_BYTES_LIMIT} bytes"
+        )
     return {
         "_type": _DIRECT_CUDA_IPC_PAYLOAD_TYPE,
         "version": 1,
         "header": header_bytes,
-        "tensors": serialized_tensors,
+        "tensors": [
+            {"path": path, "tensor_bytes": _ipc_pickle(tensor)}
+            for path, tensor in tensors.items()
+        ],
     }
 
 
@@ -239,24 +236,19 @@ def deserialize_direct_cuda_ipc_payload(data_ref: dict[str, Any]) -> StagePayloa
     )
 
 
-def try_serialize_direct_cuda_ipc_stream_chunk(
+def serialize_direct_cuda_ipc_stream_chunk(
     data: Any,
     metadata: dict[str, Any] | None,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     if not should_use_direct_cuda_ipc_stream_chunk(data, metadata):
-        return None
-    try:
-        ref: dict[str, Any] = {
-            "_type": _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE,
-            "version": 1,
-            "tensor_bytes": _ipc_pickle(data),
-        }
-        if metadata is not None:
-            ref["metadata"] = _serialize_direct_ipc_metadata_value(metadata)
-    except RuntimeError as exc:
-        if "received from another process" not in str(exc):
-            raise
-        return None
+        raise ValueError("same-GPU CUDA stream chunk is not direct-IPC eligible")
+    ref: dict[str, Any] = {
+        "_type": _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE,
+        "version": 1,
+        "tensor_bytes": _ipc_pickle(data),
+    }
+    if metadata is not None:
+        ref["metadata"] = _serialize_direct_ipc_metadata_value(metadata)
     return ref
 
 
@@ -407,7 +399,6 @@ async def write_tensor(
             ),
             shape=tuple(int(dim) for dim in tensor.shape),
             dtype=str(tensor.dtype),
-            device=str(tensor.device),
             offset=offset,
         ),
         op,
@@ -424,17 +415,14 @@ async def read_tensor(
         raise ValueError("raw tensor data_ref is missing shape")
     if data_ref.dtype is None:
         raise ValueError("raw tensor data_ref is missing dtype")
-    if data_ref.device is None:
-        raise ValueError("raw tensor data_ref is missing device")
     if data_ref.offset is None:
         raise ValueError("raw tensor data_ref is missing offset")
     transfer_buf = await _read_transfer_buffer(relay, data_ref.object_id, data_ref)
-    tensor = (
+    return (
         transfer_buf[data_ref.offset :]
         .view(_torch_dtype(data_ref.dtype))
         .reshape(data_ref.shape)
     )
-    return _restore_tensor_device(tensor, data_ref.device)
 
 
 async def write_stream_chunk(
@@ -543,7 +531,6 @@ async def _with_stream_metadata(
         buffer=data_ref.buffer,
         shape=data_ref.shape,
         dtype=data_ref.dtype,
-        device=data_ref.device,
         offset=data_ref.offset,
         metadata=metadata_without_tensors,
         metadata_tensors=tuple(tensor_refs),

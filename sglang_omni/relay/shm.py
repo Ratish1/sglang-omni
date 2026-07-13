@@ -154,6 +154,7 @@ class ShmRelay(Relay):
         self.engine_id = engine_id
         self.device = device
         self._sem = asyncio.Semaphore(credits)
+        self._slot_size_bytes = slot_size_mb * 1024 * 1024
 
     async def put_async(
         self,
@@ -199,4 +200,8 @@ class ShmRelay(Relay):
         pass
 
     def close(self) -> None:
+        pass
+
+    # Optional hook for tests
+    def reset_pool(self):
         pass
