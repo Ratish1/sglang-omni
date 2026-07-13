@@ -43,6 +43,30 @@ def test_benchmark_start_barrier_waits_for_release(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_condition_launches_barrier_clients_as_direct_children(tmp_path: Path) -> None:
+    script = Path("benchmarks/same_gpu_dp/run_condition.sh").resolve()
+    env = {
+        **os.environ,
+        "OUT_ROOT": str(tmp_path),
+        "LABEL": "client-pid-dry-run",
+        "DP": "2",
+        "SERVER_CORE_SETS": "0;1",
+        "CLIENT_CORE_SETS": "2;3",
+        "MEM_FRACTIONS": "auto,auto",
+    }
+
+    subprocess.run(["bash", str(script), "--dry-run"], env=env, check=True)
+
+    commands = (tmp_path / "client-pid-dry-run" / "commands.sh").read_text(
+        encoding="utf-8"
+    )
+    clients = [
+        line for line in commands.splitlines() if "benchmark_tts_seedtts" in line
+    ]
+    assert len(clients) == 2
+    assert all(line.startswith("numactl ") for line in clients)
+
+
 def test_classify_kv_capacity_requires_the_configured_cap() -> None:
     token_counts = {"worker_0": 78015, "worker_1": 78015}
 

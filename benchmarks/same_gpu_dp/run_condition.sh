@@ -278,7 +278,7 @@ print_command() {
 }
 
 SERVER_PGIDS=()
-CLIENT_PGIDS=()
+CLIENT_PIDS=()
 ROUTER_PGID=""
 MPS_OWNED=0
 MPS_DIR_OWNED=0
@@ -312,6 +312,13 @@ stop_group() {
   kill -TERM -- "-$pgid" 2>/dev/null || true
 }
 
+pid_is_live() {
+  local pid=$1 status
+  kill -0 "$pid" 2>/dev/null || return 1
+  status=$(ps -o stat= -p "$pid" 2>/dev/null || true)
+  [[ -n "$status" && "$status" != Z* ]]
+}
+
 wait_group_exit() {
   local pgid=$1 timeout=$2
   local deadline=$((SECONDS + timeout))
@@ -337,16 +344,17 @@ terminate_mps_clients_for_group() {
 }
 
 cleanup() {
-  local status=$?
+  local status=$? client_stop_deadline pid
   trap - EXIT INT TERM
-  for pgid in "${CLIENT_PGIDS[@]}"; do stop_group "$pgid"; done
+  for pid in "${CLIENT_PIDS[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
   [[ -n "$ROUTER_PGID" ]] && stop_group "$ROUTER_PGID"
   for pgid in "${SERVER_PGIDS[@]}"; do stop_group "$pgid"; done
 
-  for pgid in "${CLIENT_PGIDS[@]}"; do
-    if ! wait_group_exit "$pgid" 10; then
-      kill -KILL -- "-$pgid" 2>/dev/null || true
-    fi
+  client_stop_deadline=$((SECONDS + 10))
+  for pid in "${CLIENT_PIDS[@]}"; do
+    while pid_is_live "$pid" && ((SECONDS < client_stop_deadline)); do sleep 1; done
+    pid_is_live "$pid" && kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
   done
   if [[ -n "$ROUTER_PGID" ]] && ! wait_group_exit "$ROUTER_PGID" 10; then
     kill -KILL -- "-$ROUTER_PGID" 2>/dev/null || true
@@ -625,7 +633,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
       target_port=$ROUTER_PORT
       output="$OUT/router_clients/client_${i}.benchmark"
     fi
-    command=(setsid numactl --physcpubind="${CLIENT_CORES[$i]}" \
+    command=(numactl --physcpubind="${CLIENT_CORES[$i]}" \
       --membind="$NUMA_NODE" "${BENCH_COMMON[@]}" --port "$target_port" \
       --concurrency "$CONCURRENCY_PER_WORKER" --output-dir "$output")
     if [[ "$CLIENT_DRIVER" == seedtts ]]; then
@@ -643,7 +651,7 @@ fi
 if [[ "$MODE" == direct ]]; then
   for ((i = 0; i < DP; i++)); do
     output="$OUT/workers/worker_${i}.benchmark"
-    command=(setsid numactl --physcpubind="${CLIENT_CORES[$i]}" --membind="$NUMA_NODE"
+    command=(numactl --physcpubind="${CLIENT_CORES[$i]}" --membind="$NUMA_NODE"
       "${BENCH_COMMON[@]}" --port "${TARGET_PORTS[$i]}"
       --concurrency "$CONCURRENCY_PER_WORKER" --output-dir "$output")
     if [[ "$CLIENT_DRIVER" == seedtts ]]; then
@@ -653,13 +661,13 @@ if [[ "$MODE" == direct ]]; then
     fi
     print_command "${command[@]}"
     "${command[@]}" > "$OUT/workers/worker_${i}.benchmark.log" 2>&1 &
-    CLIENT_PGIDS+=("$!")
+    CLIENT_PIDS+=("$!")
   done
 else
   for ((i = 0; i < DP; i++)); do
     output="$OUT/router_clients/client_${i}.benchmark"
     mkdir -p "$OUT/router_clients"
-    command=(setsid numactl --physcpubind="${CLIENT_CORES[$i]}" --membind="$NUMA_NODE"
+    command=(numactl --physcpubind="${CLIENT_CORES[$i]}" --membind="$NUMA_NODE"
       "${BENCH_COMMON[@]}" --port "$ROUTER_PORT"
       --concurrency "$CONCURRENCY_PER_WORKER" --output-dir "$output")
     if [[ "$CLIENT_DRIVER" == seedtts ]]; then
@@ -669,7 +677,7 @@ else
     fi
     print_command "${command[@]}"
     "${command[@]}" > "$OUT/router_clients/client_${i}.benchmark.log" 2>&1 &
-    CLIENT_PGIDS+=("$!")
+    CLIENT_PIDS+=("$!")
   done
 fi
 
@@ -682,9 +690,12 @@ if [[ "$CLIENT_DRIVER" == seedtts ]]; then
       [[ -e "$CLIENT_BARRIER/ready-$i" ]] && ready=$((ready + 1))
     done
     [[ "$ready" -eq "$DP" ]] && break
-    for pgid in "${CLIENT_PGIDS[@]}"; do
-      kill -0 -- "-$pgid" 2>/dev/null \
-        || { echo "benchmark client exited before the start barrier" >&2; exit 1; }
+    for ((i = 0; i < DP; i++)); do
+      pid=${CLIENT_PIDS[$i]}
+      if ! pid_is_live "$pid"; then
+        echo "benchmark client $i exited before the start barrier; inspect its benchmark log" >&2
+        exit 1
+      fi
     done
     ((SECONDS < deadline)) \
       || { echo "benchmark clients did not reach the start barrier" >&2; exit 1; }
@@ -694,7 +705,7 @@ if [[ "$CLIENT_DRIVER" == seedtts ]]; then
   : > "$RELEASE_FILE"
 fi
 client_failed=0
-for pgid in "${CLIENT_PGIDS[@]}"; do wait "$pgid" || client_failed=1; done
+for pid in "${CLIENT_PIDS[@]}"; do wait "$pid" || client_failed=1; done
 if [[ "$CLIENT_DRIVER" == seedtts ]]; then
   condition_end_ns=$(python3 -c 'import time; print(time.monotonic_ns())')
   condition_wall_clock_s=$(python3 - "$condition_start_ns" "$condition_end_ns" <<'PY'
