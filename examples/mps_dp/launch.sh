@@ -27,30 +27,60 @@ HEALTH_TRIES=${HEALTH_TRIES:-50}
 HEALTH_INTERVAL=${HEALTH_INTERVAL:-6}
 DRAIN_TRIES=${DRAIN_TRIES:-40}
 DRAIN_INTERVAL=${DRAIN_INTERVAL:-3}
+readonly MPS_STARTUP_TIMEOUT_SECONDS=5
+readonly MPS_STARTUP_QUERY_TIMEOUT_SECONDS=1
+readonly MPS_STARTUP_POLL_INTERVAL_SECONDS=0.2
+readonly MPS_QUERY_TIMEOUT_SECONDS=10
+readonly MPS_SHUTDOWN_TIMEOUT_SECONDS=10
+readonly MPS_SHUTDOWN_POLL_INTERVAL_SECONDS=1
+startup_state=""
 
 die() { echo "error: $*" >&2; exit 1; }
 
-mps_query() {
-  local state=$1 cmd=$2
-  CUDA_MPS_PIPE_DIRECTORY=$state/mps/pipe CUDA_MPS_LOG_DIRECTORY=$state/mps/log \
-    timeout 10 nvidia-cuda-mps-control <<< "$cmd" 2>> "$state/mps_ctl.err"
+cleanup_failed_startup() {
+  echo "startup failed; stopping this run only" >&2
+  teardown_state "$startup_state" --keep-state || true
 }
 
-mps_alive() { mps_query "$1" get_default_active_thread_percentage > /dev/null 2>&1; }
+pid_is_live() {
+  local pid=$1 status
+  kill -0 "$pid" 2>/dev/null || return 1
+  status=$(ps -o stat= -p "$pid" 2>/dev/null || true)
+  case "$status" in Z*|"") return 1;; esac
+}
+
+mps_query() {
+  local state=$1 cmd=$2 query_timeout=${3:-$MPS_QUERY_TIMEOUT_SECONDS}
+  CUDA_MPS_PIPE_DIRECTORY=$state/mps/pipe CUDA_MPS_LOG_DIRECTORY=$state/mps/log \
+    timeout "$query_timeout" nvidia-cuda-mps-control <<< "$cmd" 2>> "$state/mps_ctl.err"
+}
+
+mps_alive() {
+  mps_query "$1" get_default_active_thread_percentage "${2:-$MPS_QUERY_TIMEOUT_SECONDS}" > /dev/null 2>&1
+}
+
+mps_control_pid() {
+  local pid_file=$1/mps/pipe/nvidia-cuda-mps-control.pid pid
+  [ -r "$pid_file" ] || return 1
+  read -r pid < "$pid_file"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$pid"
+}
 
 mps_quit() {
-  local state=$1
-  if ! mps_alive "$state"; then
-    return 0
-  fi
-  mps_query "$state" quit > /dev/null || true
-  local t
-  for ((t=1; t<=5; t++)); do
-    mps_alive "$state" || return 0
-    sleep 2
+  local state=$1 control_pid=$2
+  mps_query "$state" quit > /dev/null || {
+    echo "error: failed to send quit to the MPS control daemon" >&2
+    return 1
+  }
+  local deadline=$((SECONDS + MPS_SHUTDOWN_TIMEOUT_SECONDS))
+  while pid_is_live "$control_pid"; do
+    if ((SECONDS >= deadline)); then
+      echo "error: MPS control daemon PID $control_pid is still alive after quit" >&2
+      return 1
+    fi
+    sleep "$MPS_SHUTDOWN_POLL_INTERVAL_SECONDS"
   done
-  echo "error: MPS control daemon still responding after quit ($state/mps/pipe)" >&2
-  return 1
 }
 
 resolve_numa() {
@@ -71,7 +101,6 @@ find_runs() { ls -d "$STATE_ROOT"/gpu-*/run-* 2>/dev/null || true; }
 resolve_state() {
   local arg=$1 matches="" d
   if [ -n "$arg" ]; then
-    if [ -d "$arg" ] && [ -f "$arg/replicas.tsv" ]; then echo "$arg"; return 0; fi
     for d in $(find_runs); do
       [ "$(basename "$d")" = "$arg" ] && matches+="$d"$'\n'
     done
@@ -98,11 +127,10 @@ resolve_state() {
 tracked_pids() {
   # Note (jiaxin): zombies hold no resources and can never be reaped by this
   # script in init-less containers, so they do not count as live.
-  local pgid out="" p st
+  local pgid out="" p
   while IFS=$'\t' read -r _ _ pgid _ _; do
     for p in $(pgrep -g "$pgid" 2>/dev/null || true); do
-      st=$(ps -o stat= -p "$p" 2>/dev/null || true)
-      case "$st" in Z*|"") ;; *) out+=" $p" ;; esac
+      pid_is_live "$p" && out+=" $p"
     done
   done < "$1/replicas.tsv"
   echo "$out"
@@ -182,8 +210,9 @@ teardown_state() {
   # Note (jiaxin): these GPUs are shared; teardown only signals processes recorded
   # in this run's state, never scans the whole GPU, and keeps the state directory
   # whenever cleanup cannot be confirmed, so nothing is hidden from inspection.
-  local state=$1 keep=${2:-} pgid t live raw
+  local state=$1 keep=${2:-} pgid t live raw control_pid=""
   [ -n "$state" ] && [ -f "$state/replicas.tsv" ] || die "invalid or missing run state '$state'"
+  control_pid=$(mps_control_pid "$state" || true)
   while IFS=$'\t' read -r _ _ pgid _ _; do
     kill -TERM -- "-$pgid" 2>/dev/null || true
   done < "$state/replicas.tsv"
@@ -195,8 +224,11 @@ teardown_state() {
   # Note (jiaxin): the pipe is private to this run, so ANY client the daemon still
   # reports is outstanding even if its PID left the tracked groups; quitting around
   # live clients can wedge the MPS server with RPC failures that outlast this run.
-  if mps_alive "$state"; then
-    raw=$(mps_clients "$state") || { echo "error: MPS client query failed; state kept at $state" >&2; return 1; }
+  if raw=$(mps_clients "$state"); then
+    if [ -z "$control_pid" ]; then
+      echo "error: MPS is responding but its control PID is missing or invalid; state kept at $state" >&2
+      return 1
+    fi
     local entry cl clients="" tracked blocked="" unowned=""
     for entry in $raw; do
       clients+=" $(echo "${entry#*:}" | tr ',' ' ')"
@@ -218,7 +250,11 @@ teardown_state() {
       echo "state kept at $state — inspect (ps -o pid,pgid,cmd -p $unowned), then re-run down" >&2
       return 1
     fi
-    mps_quit "$state" || { echo "state kept at $state" >&2; return 1; }
+    mps_quit "$state" "$control_pid" || { echo "state kept at $state" >&2; return 1; }
+  elif [ -n "$control_pid" ] && pid_is_live "$control_pid"; then
+    echo "error: MPS control PID $control_pid is alive but its control interface is unavailable" >&2
+    echo "state kept at $state — inspect $state/mps_ctl.err and retry down" >&2
+    return 1
   fi
   live=$(tracked_pids "$state")
   if [ -n "${live// /}" ]; then
@@ -236,7 +272,7 @@ teardown_state() {
   if [ "$keep" = "--keep-state" ]; then
     echo "processes cleaned; state kept for diagnostics at $state"
   else
-    rm -rf "$state"
+    rm -rf -- "$state"
     echo "down: run state $state cleaned; only this run's processes were touched"
   fi
 }
@@ -244,13 +280,19 @@ teardown_state() {
 up() {
   local model=${MODEL:-bosonai/higgs-tts-3-4b} model_name=${MODEL_NAME:-higgs}
   local gpu=${GPU_ID:-0} n=${N:-3} base_port=${BASE_PORT:-8801} mf=${MF:-}
+  [[ "$gpu" =~ ^[0-9]+$ ]] || die "GPU_ID must be a non-negative integer, got '$gpu'"
   [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "N must be a positive integer, got '$n'"
+  [[ "$base_port" =~ ^[1-9][0-9]*$ ]] \
+    || die "BASE_PORT must be a positive integer, got '$base_port'"
+  ((base_port + n - 1 <= 65535)) \
+    || die "ports $base_port through $((base_port+n-1)) exceed 65535"
   [ -n "${CORE_BLOCKS:-}" ] || {
     echo "CORE_BLOCKS is required: N non-overlapping blocks on the GPU's NUMA node." >&2
     echo "Cores on that node: numactl -H" >&2
     exit 1
   }
-  local blocks=($CORE_BLOCKS)
+  local blocks=()
+  read -r -a blocks <<< "$CORE_BLOCKS"
   [ "${#blocks[@]}" = "$n" ] || die "CORE_BLOCKS must contain exactly $n blocks"
 
   local extra_args=() mem_args=()
@@ -289,6 +331,13 @@ up() {
   run="run-$(date +%Y%m%d-%H%M%S)-$$"
   state=$STATE_ROOT/gpu-$gpu/$run
   mkdir -p "$state/logs" "$state/mps/pipe" "$state/mps/log"
+  : > "$state/replicas.tsv"
+
+  # On startup failure, stop only this run and keep its state for diagnosis.
+  startup_state=$state
+  trap cleanup_failed_startup EXIT
+
+  chmod 700 "$state/mps" "$state/mps/pipe" "$state/mps/log"
   {
     echo "run_id=$run"; echo "gpu_id=$gpu"; echo "gpu_uuid=$uuid"; echo "numa_node=$node"
     echo "model=$model"; echo "model_name=$model_name"; echo "n=$n"
@@ -296,18 +345,32 @@ up() {
     echo "base_port=$base_port"; echo "core_blocks=$CORE_BLOCKS"
     echo "max_total_tokens=${MAX_TOTAL_TOKENS:-auto/profiled}"
   } > "$state/manifest"
-  : > "$state/replicas.tsv"
-
-  local up_done=0
-  # Note (jiaxin): on startup failure only this run's processes are stopped, and
-  # the state directory is kept so the failure can be diagnosed from its logs.
-  trap '[ "$up_done" = 1 ] || { echo "startup failed; stopping this run only" >&2; teardown_state "'"$state"'" --keep-state || true; }' EXIT
 
   export CUDA_MPS_PIPE_DIRECTORY=$state/mps/pipe CUDA_MPS_LOG_DIRECTORY=$state/mps/log
-  nvidia-cuda-mps-control -d 2>> "$state/mps_ctl.err" || true
-  mps_alive "$state" || die "MPS control daemon did not start (pipe $state/mps/pipe; see $state/mps_ctl.err)"
+  local mps_launch_status=0
+  env -u CUDA_MPS_ACTIVE_THREAD_PERCENTAGE -u CUDA_MPS_PINNED_DEVICE_MEM_LIMIT \
+    CUDA_VISIBLE_DEVICES="$uuid" nvidia-cuda-mps-control -d \
+    2>> "$state/mps_ctl.err" || mps_launch_status=$?
+  # Daemonization can complete before the control socket responds. Keep each
+  # query short and stop retrying promptly so a real launch failure returns.
+  local mps_ready=0
+  local mps_deadline=$((SECONDS + MPS_STARTUP_TIMEOUT_SECONDS))
+  while ((SECONDS < mps_deadline)); do
+    if mps_alive "$state" "$MPS_STARTUP_QUERY_TIMEOUT_SECONDS"; then
+      mps_ready=1
+      break
+    fi
+    sleep "$MPS_STARTUP_POLL_INTERVAL_SECONDS"
+  done
+  [ "$mps_ready" = 1 ] \
+    || die "MPS control daemon did not become ready (launch status $mps_launch_status; see $state/mps_ctl.err)"
+  local control_pid
+  control_pid=$(mps_control_pid "$state") \
+    || die "MPS control daemon is ready but its PID file is missing or invalid"
+  pid_is_live "$control_pid" \
+    || die "MPS control daemon PID $control_pid exited during startup"
 
-  local pid log
+  local pid log resolved_tokens
   for ((i=0; i<n; i++)); do
     port=$((base_port+i))
     log=$state/logs/replica_$i.log
@@ -315,7 +378,7 @@ up() {
     # memory profiling in testing, so replicas start sequentially behind a health
     # gate; setsid gives each replica its own process group so teardown can signal
     # exactly this run's process trees.
-    CUDA_VISIBLE_DEVICES=$gpu \
+    CUDA_VISIBLE_DEVICES="$uuid" \
     setsid numactl --cpunodebind="$node" --membind="$node" -C "${blocks[$i]}" \
       sgl-omni serve --model-path "$model" --model-name "$model_name" \
         "${mem_args[@]}" "${extra_args[@]}" \
@@ -324,7 +387,7 @@ up() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$pid" "$pid" "$port" "$log" >> "$state/replicas.tsv"
     local healthy=0 t code
     for ((t=1; t<=HEALTH_TRIES; t++)); do
-      if ! kill -0 "$pid" 2>/dev/null; then
+      if ! pid_is_live "$pid"; then
         echo "replica $i exited during startup; last log lines:" >&2
         tail -n 8 "$log" >&2
         exit 1
@@ -339,7 +402,7 @@ up() {
       exit 1
     fi
     echo "replica $i healthy on port $port (cores ${blocks[$i]}, mem fraction ${mf:-default})"
-    local resolved_tokens
+    resolved_tokens=""
     resolved_tokens=$(grep -m1 -oE '#tokens:[[:space:]]*[0-9]+' "$log" \
       | grep -oE '[0-9]+$' || true)
     if [ "$n" -gt 1 ]; then
@@ -356,7 +419,6 @@ up() {
     echo "warning: MpsRpc errors present in replica logs; bring the run down and restart" >&2
     exit 1
   fi
-  up_done=1
   trap - EXIT
   echo "up: $n replicas on GPU $gpu; token cap ${MAX_TOTAL_TOKENS:-auto/profiled}; state: $state"
   echo "tear down with: bash $0 down $run"
