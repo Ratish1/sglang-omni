@@ -187,7 +187,7 @@ class CommEngine:
             queue_key=target_stage,
             elapsed_ms=round(_comm_elapsed_ms(enqueue_start), 6),
         )
-        _ = await ready
+        await ready
 
     async def read_stream_chunk(
         self,
@@ -269,8 +269,6 @@ class CommEngine:
     async def _run_payload_send(self, job: _PayloadSendJob, queue_key: str) -> None:
         object_id: str | None = None
         send_start = _comm_now_ns()
-        write_ms = -1.0
-        control_ms = -1.0
         try:
             write_start = _comm_now_ns()
             data_ref, op = await stage_io.write_payload(
@@ -319,8 +317,6 @@ class CommEngine:
     async def _run_stream_send(self, job: _StreamSendJob, queue_key: str) -> None:
         object_id: str | None = None
         send_start = _comm_now_ns()
-        write_ms = -1.0
-        control_ms = -1.0
         try:
             write_start = _comm_now_ns()
             data_ref, ops = await stage_io.write_stream_chunk(
