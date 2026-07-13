@@ -41,7 +41,7 @@ The validated H100 Higgs DP3 cap is `100000` tokens per replica. This value is a
 
 3. **Drive every replica to saturation.**
 
-To reach maximum throughput, feed replicas one by one: keep sending to a replica until it is saturated (`#queue-req > 0`), then move to the next. Aggregate concurrency alone can leave some replicas under-driven. SGLang Omni's router does not yet support this fill-one-then-next behavior; that is planned for later work. Equal KV capacity makes the replicas comparable, but it does not by itself balance their queues. Validate the routing policy and per-replica saturation under your workload.
+The case study used one dedicated client per replica and drove all replicas in parallel. The measured goal is to keep every replica saturated. With equivalent replicas, random or round-robin routing can distribute a shared ingress across the pool; fill-one-then-next is another possible strategy, but the study did not compare them. Equal KV capacity makes the replicas comparable, but it does not by itself balance their queues. Validate the routing policy and per-replica saturation under your workload.
 
 4. **Verify MPS attachment.**
 
@@ -49,7 +49,7 @@ MPS should be verified carefully. Four things are easy to conflate: environment 
 
 5. **Route traffic.**
 
-For easy deployment, you can register each replica endpoint with the [Omni Router](omni_router.md). Keep the router's `--max-connections` at least as large as the total offered concurrency. However, as we said, the current router does not support sequential filling, i.e., the fill-one-then-next scheduling strategy. To reach maximum throughput, you can manually route traffic to the replicas one by one.
+For easy deployment, you can register each replica endpoint with the [Omni Router](omni_router.md). Keep the router's `--max-connections` at least as large as the total offered concurrency. The case study did not benchmark router scheduling policies, so confirm that the selected policy keeps every replica driven and meets your workload's latency and throughput requirements.
 
 6. **Tear down safely.**
 
