@@ -333,7 +333,8 @@ up() {
   mkdir -p "$state/logs" "$state/mps/pipe" "$state/mps/log"
   : > "$state/replicas.tsv"
 
-  # On startup failure, stop only this run and keep its state for diagnosis.
+  # Without this trap, a later replica failure leaves earlier replicas and the
+  # private MPS daemon running; keep the state so the failure stays diagnosable.
   startup_state=$state
   trap cleanup_failed_startup EXIT
 
@@ -351,8 +352,7 @@ up() {
   env -u CUDA_MPS_ACTIVE_THREAD_PERCENTAGE -u CUDA_MPS_PINNED_DEVICE_MEM_LIMIT \
     CUDA_VISIBLE_DEVICES="$uuid" nvidia-cuda-mps-control -d \
     2>> "$state/mps_ctl.err" || mps_launch_status=$?
-  # Daemonization can complete before the control socket responds. Keep each
-  # query short and stop retrying promptly so a real launch failure returns.
+  # Daemonization can return before the control socket is ready to accept commands.
   local mps_ready=0
   local mps_deadline=$((SECONDS + MPS_STARTUP_TIMEOUT_SECONDS))
   while ((SECONDS < mps_deadline)); do

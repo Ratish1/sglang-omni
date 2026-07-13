@@ -8,98 +8,58 @@ Same-GPU data parallelism runs several complete serving replicas on one GPU and 
 
 ## Deploy
 
-The steps below are one continuous flow. We provide a script `examples/mps_dp/launch.sh` to wrap them behind a per-run state directory (`up/verify/down/list`). It records replica PIDs, process groups, ports, and logs, refuses to start when ports are taken or another run is recorded on the same GPU, health-gates sequential startup, surfaces each replica's logged KV allocation, compares expected replica processes against the MPS client list, and tears down only the processes it recorded. The manual steps below explain each mechanism, checkpoint, and failure mode; the launcher is a convenience wrapper around them, not a production supervisor, and it does not remove your responsibility to check actual KV capacity, MPS attachment, and saturation. Detailed instructions are as follows:
+The steps below are one continuous flow. We provide `examples/mps_dp/launch.sh` to manage the private MPS daemon and serving replicas for one run. It records replica processes, ports, and logs, starts replicas sequentially, verifies their KV capacity and MPS attachment, and tears down only the run it recorded. Detailed instructions are as follows:
 
 1. **Choose the GPU and NUMA node.**
 
 ```bash
 nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
-GPU_ID=0
+export GPU_ID=0
 BUS=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i $GPU_ID)
 BUS=${BUS,,}; BUS=${BUS:4}
 NODE=$(cat /sys/bus/pci/devices/$BUS/numa_node)   # if -1, set the node explicitly
 numactl -H | grep "node $NODE cpus"
 ```
 
-Pick a GPU that is idle, then find its NUMA node from the PCI bus id (drm card ordinals do not always match nvidia-smi ordinals), and pin replicas and memory to that node.
+Pick a GPU that is idle, then find its NUMA node from the PCI bus id (drm card ordinals do not always match nvidia-smi ordinals). Choose non-overlapping physical CPU-core blocks from that node, one block per replica.
 
-2. **Start a private MPS daemon.**
-
-```bash
-export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps-$UID-gpu$GPU_ID/pipe
-export CUDA_MPS_LOG_DIRECTORY=/tmp/mps-$UID-gpu$GPU_ID/log
-mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
-nvidia-cuda-mps-control -d
-echo get_default_active_thread_percentage | nvidia-cuda-mps-control   # sanity: responds
-```
-
-Isolate this experiment behind a private MPS pipe directory. Every colocated replica in the experiment must use the same directory, or it may fall back to ordinary CUDA context time-slicing.
-
-On a multi-GPU node, the right MPS topology depends on your deployment and should be validated there: NVIDIA's control daemon is often run once per node, and this guide's performance case study below covers only a single H100. Before relying on any cross-GPU result, confirm how the daemon, its pipe and log directories, and each replica's `CUDA_VISIBLE_DEVICES` map to physical GPUs in your setup.
-
-3. **Launch replicas sequentially, and check each KV pool.**
+2. **Launch the replicas.**
 
 ```bash
-GPU_ID=0; NODE=0
-CORE_BLOCKS=("0-9" "10-19" "20-29")     # one block per replica, non-overlapping
-MAX_TOTAL_TOKENS=100000
-i=0
-for PORT in 8801 8802 8803; do
-  CUDA_VISIBLE_DEVICES=$GPU_ID \
-  numactl --cpunodebind=$NODE --membind=$NODE -C "${CORE_BLOCKS[$i]}" \
-    sgl-omni serve \
-      --model-path bosonai/higgs-tts-3-4b \
-      --max-total-tokens $MAX_TOTAL_TOKENS \
-      --host 127.0.0.1 --port $PORT --model-name higgs > "replica_$i.log" 2>&1 &
-  until [ "$(curl -s -o /dev/null -w '%{http_code}' -m 3 127.0.0.1:$PORT/health)" = 200 ]; do sleep 6; done
-  i=$((i+1))
-done
+CORE_BLOCKS="0-9 10-19 20-29" MAX_TOTAL_TOKENS=100000 bash examples/mps_dp/launch.sh up
 ```
 
-The example leaves `--mem-fraction-static` unset and uses the model's existing default. Launch one replica at a time and wait for `/health` before starting the next.
+The command above is the validated H100 Higgs DP3 recipe. The launcher uses three replicas by default, resolves the GPU's NUMA node, assigns one local port per replica, starts a private MPS daemon, waits for each replica's health check before starting the next, and verifies MPS attachment. The CPU blocks are specific to the tested host; derive the correct blocks for your own CPU topology.
 
-Identical `--mem-fraction-static` flags do **not** mean identical KV capacity. `--mem-fraction-static` is evaluated at each replica's init time against **remaining** GPU memory, roughly `mem_fraction × free_memory` after weights and other fixed overheads. It is a per-replica request against whatever is left, not an additive share of the card. Because replicas start sequentially, earlier ones have already reserved memory, so later ones see a smaller free pool and allocate fewer KV tokens even when every flag is the same (in one run, three sequential `mf=0.27` replicas received 97,503 / 53,149 / 20,961 KV tokens).
+The example leaves `--mem-fraction-static` unset and uses the model's existing default. Launching replicas sequentially avoids overlapping memory profiling and CUDA-graph capture during startup.
 
-Memory profiling does not coordinate these independent processes. The launcher therefore requires a common cap for `N > 1`, passes it to every replica, and checks that every replica reports the requested capacity:
+Identical `--mem-fraction-static` flags do **not** mean identical KV capacity. `--mem-fraction-static` budgets model weights and the KV pool against the GPU memory available when each replica starts. Roughly, the profiled KV memory is the requested fraction of free memory measured before model loading, minus model and fixed runtime allocations. It is a per-replica budget, not an additive share of the card. Because replicas start sequentially, earlier ones have already reserved memory, so later ones see a smaller free pool and allocate fewer KV tokens even when every flag is the same (in one run, three sequential `mf=0.27` replicas received 97,503 / 53,149 / 20,961 KV tokens).
 
-```bash
-MAX_TOTAL_TOKENS=<COMMON_FEASIBLE_TOKEN_CAP> \
-  bash examples/mps_dp/launch.sh up
-```
+Memory profiling does not coordinate KV allocation across independent replica processes. For `N > 1`, the launcher therefore requires one common `MAX_TOTAL_TOKENS` value and passes it to every replica as `--max-total-tokens`. SGLang treats this value as an upper bound; the launcher rejects startup unless every replica resolves exactly that capacity. The cap is independent of the request-level `max_new_tokens` limit and does not distribute requests between replicas.
 
-The H100 Higgs runs used the following caps:
+The validated H100 Higgs DP3 cap is `100000` tokens per replica. This value is a starting point for the tested configuration, not a universal hardware default. Recalculate the cap after changing the model, GPU, runtime, replica count, memory settings, or CUDA-graph settings. If a replica cannot allocate the common cap, lower it or reduce the replica count.
 
-| Replicas | `MAX_TOTAL_TOKENS` |
-|---:|---:|
-| 2 | 180000 |
-| 3 | 100000 |
+3. **Drive every replica to saturation.**
 
-The larger caps support a larger active KV working set, but did not change throughput once the smaller pool was sufficient for the benchmark. Recalibrate the common cap for other models or hardware.
+To reach maximum throughput, feed replicas one by one: keep sending to a replica until it is saturated (`#queue-req > 0`), then move to the next. Aggregate concurrency alone can leave some replicas under-driven. SGLang Omni's router does not yet support this fill-one-then-next behavior; that is planned for later work. Equal KV capacity makes the replicas comparable, but it does not by itself balance their queues. Validate the routing policy and per-replica saturation under your workload.
 
-4. **Drive every replica to saturation.**
+4. **Verify MPS attachment.**
 
-To reach maximum throughput, feed replicas one by one: keep sending to a replica until it is saturated (`#queue-req > 0`), then move to the next. Aggregate concurrency alone can leave some replicas under-driven. SGLang Omni's router does not yet support this fill-one-then-next behavior; that is planned for later work. Additionally, as mentioned in the previous section, once every colocated replica can be given a stable, equal KV pool, sequential filling should no longer be needed: with fully equivalent workers, random routing is the most efficient way to keep the pool saturated.
+MPS should be verified carefully. Four things are easy to conflate: environment variables set, daemon running, an MPS server exists, and the replica processes you launched are actually attached as clients. Only the last makes the comparison valid, and a replica that missed the pipe directory falls back to time-slicing without any error. The launcher verifies every replica against the MPS client list, writes the server-to-client PID mapping to `mps_attach.txt`, and fails startup if any replica is not attached.
 
-5. **Verify MPS attachment.**
-
-MPS should be verified carefully. Four things are easy to conflate: env vars set, daemon running, an MPS server exists, and the replica processes you launched are actually attached as clients. Only the last makes the comparison valid, and a replica that missed the pipe directory falls back to time-slicing without any error. The launcher writes the server-to-client PID mapping to `mps_attach.txt` and fails if any replica has no attached client; to check manually:
-
-```bash
-echo get_server_list | nvidia-cuda-mps-control
-for SRV in $(echo get_server_list | nvidia-cuda-mps-control); do
-  echo "server $SRV clients:"; echo "get_client_list $SRV" | nvidia-cuda-mps-control
-done
-ps -o pid,pgid,cmd -p <client pids>     # confirm they are your replica processes
-grep -c MpsRpc <your replica logs>      # must total 0
-```
-
-6. **Route traffic.**
+5. **Route traffic.**
 
 For easy deployment, you can register each replica endpoint with the [Omni Router](omni_router.md). Keep the router's `--max-connections` at least as large as the total offered concurrency. However, as we said, the current router does not support sequential filling, i.e., the fill-one-then-next scheduling strategy. To reach maximum throughput, you can manually route traffic to the replicas one by one.
 
-7. **Tear down safely.**
+6. **Tear down safely.**
 
-On a shared host, only touch processes you launched, and never treat "the GPU is empty" as the success condition. Stop new traffic, then SIGTERM each tracked replica process group (`kill -TERM -- -<pgid>`, which also reaps the `multiprocessing-fork` stage workers) and wait until they exit. Confirm the MPS client list is empty (`get_client_list <server>`): the pipe is private to your run, so any remaining client is outstanding work even when its PID no longer matches a tracked group, and live clients must be gone before the daemon quits, or the MPS server can enter an RPC-failure state that outlasts your run. Only then quit the daemon (`echo quit | nvidia-cuda-mps-control`), and SIGKILL surviving tracked groups only as a last resort. `examples/mps_dp/launch.sh down` follows this order and keeps the state directory whenever cleanup cannot be confirmed.
+Stop new traffic, then run the teardown command printed by the launcher:
+
+```bash
+bash examples/mps_dp/launch.sh down <RUN_ID>
+```
+
+On a shared host, only touch processes you launched, and never treat "the GPU is empty" as the success condition. The launcher stops only the replica processes recorded for the selected run, waits for their MPS clients to detach, and then stops the private MPS daemon. It keeps the run state whenever cleanup cannot be confirmed.
 
 Setting up and tearing down MPS is more involved than running a single replica, but in the pinned H100 Higgs tests the throughput gain was substantial. The table below shows the nominal completed-run ranges; the full accounting, including the failed and degraded runs, is in the case study.
 
@@ -110,7 +70,7 @@ Setting up and tearing down MPS is more involved than running a single replica, 
 | DP2 + MPS, 2 x c64 | 31.5 to 37.7 qps | 1.4 to 1.7x |
 | DP3 + MPS, 3 x c64 | 39.9 to 46.9 qps | 1.8 to 2.1x |
 
-These commands and token caps are from an 80 GB H100 with Higgs and are not fixed recommendations for other GPUs. On an H200 you would re-determine the replica count, common feasible token cap, CPU allocation, and saturation concurrency for that card. H200 may fit a larger KV budget or additional replicas, but this guide does not prescribe unverified values: repeat the sizing and saturation procedure and inspect every replica's actual allocation.
+These commands and the token cap are from an 80 GB H100 with Higgs and are not fixed recommendations for other GPUs. On an H200 you would re-determine the replica count, common feasible token cap, CPU allocation, and saturation concurrency for that card. H200 may fit a larger KV budget or additional replicas, but this guide does not prescribe unverified values: repeat the sizing and saturation procedure and inspect every replica's actual allocation.
 
 
 ## How We Found This
@@ -185,7 +145,7 @@ Low SM activity at the tuned single replica's peak may indicate reclaimable head
 
 1. **Generality is not fully validated.** Beyond the pinned H100 Higgs case study, we also ran related experiments on H200 and used SGLang to serve Qwen3-4B directly; both lines of work largely confirmed the same-GPU DP gains. Space and time limit how completely we can present those results here, and the measurements are not yet as polished as we would like. We believe same-GPU DP is a promising direction for smaller models on GPUs with ample memory and compute headroom, but the experimental coverage is still incomplete.
 
-2. **KV sizing is hardware- and workload-specific.** The launcher enforces a strictly equal per-replica KV size through a common `--max-total-tokens`. A sizing procedure that generalizes across cards and workloads still needs further study.
+2. **KV sizing is hardware- and workload-specific.** The launcher enforces equal per-replica KV capacity through a common `--max-total-tokens`. A sizing procedure that generalizes across models, runtimes, and GPU configurations still requires further study.
 
 3. **Router and scheduler still need a deeper dive.** Both the router and the SGLang Omni scheduler need further optimization. On the router side, better routing strategies for a colocated pool are clearly required. On the scheduler side, a more ambitious question is whether we can borrow the spirit of LLM prefill–decode (PD) disaggregation: keep one large shared KV cache and let multiple replicas share it. That direction is extremely challenging, and we believe the potential payoff is correspondingly large.
 
