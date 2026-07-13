@@ -944,10 +944,9 @@ def test_stage_sends_same_gpu_stream_chunk_as_direct_cuda_ipc(monkeypatch) -> No
 
 
 def test_stage_sends_same_gpu_cuda_payload_as_direct_cuda_ipc(monkeypatch) -> None:
-    monkeypatch.setattr(stage_io, "payload_has_cuda_tensor", lambda payload: True)
     monkeypatch.setattr(
         stage_io,
-        "serialize_direct_cuda_ipc_payload",
+        "try_serialize_direct_cuda_ipc_payload",
         lambda payload: {
             "_type": "TorchCudaIpcPayload",
             "version": 1,
@@ -986,14 +985,12 @@ def test_stage_sends_same_gpu_cuda_payload_as_direct_cuda_ipc(monkeypatch) -> No
 
 
 def test_stage_can_disable_same_gpu_direct_cuda_payload(monkeypatch) -> None:
-    monkeypatch.setattr(stage_io, "payload_has_cuda_tensor", lambda payload: True)
-
     def _unexpected_direct_payload(payload):
         raise AssertionError("direct payload serializer should not be called")
 
     monkeypatch.setattr(
         stage_io,
-        "serialize_direct_cuda_ipc_payload",
+        "try_serialize_direct_cuda_ipc_payload",
         _unexpected_direct_payload,
     )
 
@@ -1026,15 +1023,10 @@ def test_stage_can_disable_same_gpu_direct_cuda_payload(monkeypatch) -> None:
     asyncio.run(_run())
 
 
-def test_stage_uses_relay_when_direct_cuda_payload_is_reexported(monkeypatch) -> None:
-    monkeypatch.setattr(stage_io, "payload_has_cuda_tensor", lambda payload: True)
-
-    def _raise_reexport(payload):
-        raise RuntimeError(
-            "Attempted to send CUDA tensor received from another process"
-        )
-
-    monkeypatch.setattr(stage_io, "serialize_direct_cuda_ipc_payload", _raise_reexport)
+def test_stage_uses_relay_when_direct_cuda_payload_is_ineligible(monkeypatch) -> None:
+    monkeypatch.setattr(
+        stage_io, "try_serialize_direct_cuda_ipc_payload", lambda payload: None
+    )
 
     async def _run() -> None:
         relay = FakeRelay()
@@ -1112,7 +1104,8 @@ def test_direct_cuda_ipc_payload_preserves_inline_cpu_tensors() -> None:
         }
     )
 
-    ref = stage_io.serialize_direct_cuda_ipc_payload(payload)
+    ref = stage_io.try_serialize_direct_cuda_ipc_payload(payload)
+    assert ref is not None
     header = pickle.loads(ref["header"])
 
     assert header.data["gpu"]["_tensor_placeholder"] == "gpu"
@@ -1121,18 +1114,16 @@ def test_direct_cuda_ipc_payload_preserves_inline_cpu_tensors() -> None:
     assert [entry["path"] for entry in ref["tensors"]] == ["gpu"]
 
 
-def test_direct_cuda_ipc_payload_rejects_cpu_only_payloads() -> None:
+def test_direct_cuda_ipc_payload_skips_cpu_only_payloads() -> None:
     payload = make_stage_payload(data={"x": torch.ones(1)})
 
-    with pytest.raises(ValueError, match="at least one CUDA tensor"):
-        stage_io.serialize_direct_cuda_ipc_payload(payload)
+    assert stage_io.try_serialize_direct_cuda_ipc_payload(payload) is None
 
 
-def test_direct_cuda_ipc_payload_rejects_request_tensors() -> None:
+def test_direct_cuda_ipc_payload_skips_cpu_request_tensors() -> None:
     payload = make_stage_payload(data={"x": "ok"}, inputs={"tensor": torch.ones(1)})
 
-    with pytest.raises(ValueError, match="request tensors"):
-        stage_io.serialize_direct_cuda_ipc_payload(payload)
+    assert stage_io.try_serialize_direct_cuda_ipc_payload(payload) is None
 
 
 def test_stage_sends_same_process_stream_done_and_final_payload_locally() -> None:

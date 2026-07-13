@@ -131,21 +131,21 @@ def should_use_direct_cuda_ipc_stream_chunk(
     return inline_size <= _IPC_INLINE_CPU_BYTES_LIMIT
 
 
-def payload_has_cuda_tensor(payload: Any) -> bool:
-    return _contains_cuda_tensor(payload)
-
-
-def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
+def try_serialize_direct_cuda_ipc_payload(
+    payload: StagePayload,
+) -> dict[str, Any] | None:
     if not isinstance(payload, StagePayload):
         raise TypeError(
             f"direct CUDA IPC payload requires StagePayload, got "
             f"{type(payload).__name__}"
         )
-    if _contains_cuda_tensor(payload.request) or _contains_cpu_tensor(payload.request):
-        raise ValueError("direct CUDA IPC payload does not support request tensors")
+    if _contains_cuda_tensor(payload.request):
+        raise ValueError("stage payload requests cannot contain CUDA tensors")
+    if _contains_cpu_tensor(payload.request):
+        return None
     data_without_tensors, tensors = extract_cuda_tensors(payload.data)
     if not tensors:
-        raise ValueError("direct CUDA IPC payload requires at least one CUDA tensor")
+        return None
     header = StagePayload(
         request_id=payload.request_id,
         request=payload.request,
@@ -153,18 +153,21 @@ def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
     )
     header_bytes = pickle.dumps(header)
     if len(header_bytes) > _IPC_INLINE_CPU_BYTES_LIMIT:
-        raise ValueError(
-            "direct CUDA IPC payload header exceeds inline limit: "
-            f"{len(header_bytes)} > {_IPC_INLINE_CPU_BYTES_LIMIT} bytes"
-        )
+        return None
+    serialized_tensors = []
+    for path, tensor in tensors.items():
+        try:
+            tensor_bytes = _ipc_pickle(tensor)
+        except RuntimeError as exc:
+            if "received from another process" not in str(exc):
+                raise
+            return None
+        serialized_tensors.append({"path": path, "tensor_bytes": tensor_bytes})
     return {
         "_type": _DIRECT_CUDA_IPC_PAYLOAD_TYPE,
         "version": 1,
         "header": header_bytes,
-        "tensors": [
-            {"path": path, "tensor_bytes": _ipc_pickle(tensor)}
-            for path, tensor in tensors.items()
-        ],
+        "tensors": serialized_tensors,
     }
 
 

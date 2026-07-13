@@ -1130,19 +1130,11 @@ class Stage:
             return
 
         same_gpu_target = self._comm.router.is_same_gpu_target(target)
-        if (
-            not self._disable_direct_cuda_ipc_payload
-            and same_gpu_target
-            and stage_io.payload_has_cuda_tensor(projected_payload)
-        ):
-            try:
-                direct_ref = stage_io.serialize_direct_cuda_ipc_payload(
-                    projected_payload
-                )
-            except RuntimeError as exc:
-                if "received from another process" not in str(exc):
-                    raise
-            else:
+        if not self._disable_direct_cuda_ipc_payload and same_gpu_target:
+            direct_ref = stage_io.try_serialize_direct_cuda_ipc_payload(
+                projected_payload
+            )
+            if direct_ref is not None:
                 await self.control_plane.send_to_stage(
                     target,
                     endpoint,
