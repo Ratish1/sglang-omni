@@ -49,6 +49,21 @@ pid_is_live() {
   case "$status" in Z*|"") return 1;; esac
 }
 
+pid_start_time() {
+  # A live PID alone does not prove that retained state still owns the process.
+  local start_time
+  start_time=$(LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || return 1
+  [ -n "${start_time// /}" ] || return 1
+  printf '%s\n' "$start_time"
+}
+
+leader_identity_matches() {
+  local pid=$1 expected_start=$2 actual_start
+  pid_is_live "$pid" || return 1
+  actual_start=$(pid_start_time "$pid") || return 1
+  [ "$actual_start" = "$expected_start" ]
+}
+
 mps_query() {
   local state=$1 cmd=$2 query_timeout=${3:-$MPS_QUERY_TIMEOUT_SECONDS}
   CUDA_MPS_PIPE_DIRECTORY=$state/mps/pipe CUDA_MPS_LOG_DIRECTORY=$state/mps/log \
@@ -210,10 +225,11 @@ teardown_state() {
   # Note (jiaxin): these GPUs are shared; teardown only signals processes recorded
   # in this run's state, never scans the whole GPU, and keeps the state directory
   # whenever cleanup cannot be confirmed, so nothing is hidden from inspection.
-  local state=$1 keep=${2:-} pgid t live raw control_pid=""
+  local state=$1 keep=${2:-} leader_pid pgid leader_start t live raw control_pid=""
   [ -n "$state" ] && [ -f "$state/replicas.tsv" ] || die "invalid or missing run state '$state'"
   control_pid=$(mps_control_pid "$state" || true)
-  while IFS=$'\t' read -r _ _ pgid _ _; do
+  while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
+    leader_identity_matches "$leader_pid" "$leader_start" || continue
     kill -TERM -- "-$pgid" 2>/dev/null || true
   done < "$state/replicas.tsv"
   for ((t=1; t<=DRAIN_TRIES; t++)); do
@@ -259,7 +275,8 @@ teardown_state() {
   live=$(tracked_pids "$state")
   if [ -n "${live// /}" ]; then
     echo "warning: tracked non-client processes survived TERM; last-resort SIGKILL on tracked groups only" >&2
-    while IFS=$'\t' read -r _ _ pgid _ _; do
+    while IFS=$'\t' read -r _ leader_pid pgid _ _ leader_start; do
+      leader_identity_matches "$leader_pid" "$leader_start" || continue
       kill -KILL -- "-$pgid" 2>/dev/null || true
     done < "$state/replicas.tsv"
     sleep 2
@@ -370,7 +387,7 @@ up() {
   pid_is_live "$control_pid" \
     || die "MPS control daemon PID $control_pid exited during startup"
 
-  local pid log resolved_tokens
+  local pid leader_start log resolved_tokens
   for ((i=0; i<n; i++)); do
     port=$((base_port+i))
     log=$state/logs/replica_$i.log
@@ -384,7 +401,10 @@ up() {
         "${mem_args[@]}" "${extra_args[@]}" \
         --host 127.0.0.1 --port "$port" > "$log" 2>&1 < /dev/null &
     pid=$!
-    printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$pid" "$pid" "$port" "$log" >> "$state/replicas.tsv"
+    leader_start=$(pid_start_time "$pid") \
+      || die "replica $i exited before its process identity could be recorded"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$i" "$pid" "$pid" "$port" "$log" "$leader_start" >> "$state/replicas.tsv"
     local healthy=0 t code
     for ((t=1; t<=HEALTH_TRIES; t++)); do
       if ! pid_is_live "$pid"; then
