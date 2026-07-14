@@ -37,7 +37,7 @@ __all__ = [
     "is_fp8_block_quant",
     "convert_fp8_weight_scale_inv",
     "get_weight_preprocessor",
-    "auto_round_quantizes_model_layers",
+    "auto_round_excludes_local_model_layers",
     "needs_quant_config_normalization",
     "normalize_quant_config",
 ]
@@ -96,7 +96,7 @@ def quant_method_name(quant_dict: dict[str, Any] | None) -> str | None:
     method = quant_dict.get("quant_method")
     if method is None:
         return None
-    return str(method).lower()
+    return str(method).lower().replace("_", "-")
 
 
 def is_fp8_block_quant(quant_dict: dict[str, Any] | None) -> bool:
@@ -147,47 +147,6 @@ def needs_quant_config_normalization(quant_dict: dict[str, Any] | None) -> bool:
     """True when the checkpoint's method uses stage-local per-block quant names."""
     method = quant_method_name(quant_dict)
     return method == "auto-round"
-
-
-def _resolve_stage_prefix(hf_config: Any) -> str | None:
-    """Return the checkpoint prefix for the active stage architecture."""
-    architectures = getattr(hf_config, "architectures", None) or []
-    if not architectures:
-        return None
-    return _STAGE_PREFIX_BY_ARCH.get(architectures[0])
-
-
-def auto_round_quantizes_model_layers(hf_config: Any) -> bool:
-    """Return whether AutoRound targets the active stage's main model layers."""
-    quant_config = resolve_quant_config(hf_config)
-    if quant_method_name(quant_config) != "auto-round":
-        return False
-    assert quant_config is not None
-
-    blocks = quant_config.get("block_name_to_quantize")
-    if blocks is None:
-        return True
-    if isinstance(blocks, str):
-        block_names = [name.strip() for name in blocks.split(",") if name.strip()]
-    elif isinstance(blocks, list):
-        block_names = blocks
-    else:
-        raise TypeError("block_name_to_quantize must be a string or list")
-    if not block_names:
-        return True
-
-    stage_prefix = _resolve_stage_prefix(hf_config)
-    if stage_prefix is None:
-        return True
-
-    layer_namespaces = ("model.layers", f"{stage_prefix}model.layers")
-    return any(
-        name == namespace
-        or name.startswith(f"{namespace}.")
-        or namespace.startswith(f"{name}.")
-        for name in block_names
-        for namespace in layer_namespaces
-    )
 
 
 def _strip_stage_prefix(pattern: str, plain_prefix: str, escaped_prefix: str) -> str:
@@ -287,6 +246,41 @@ def _load_writable_quant_config(
         return None
 
     return _search(hf_config)
+
+
+def _resolve_stage_prefix(hf_config: Any) -> str | None:
+    """Return the checkpoint prefix for the active stage architecture."""
+    architectures = getattr(hf_config, "architectures", None) or []
+    if not architectures:
+        return None
+    return _STAGE_PREFIX_BY_ARCH.get(architectures[0])
+
+
+def auto_round_excludes_local_model_layers(hf_config: Any) -> bool:
+    """Return whether AutoRound explicitly excludes stage-local model layers."""
+    quant_config = resolve_quant_config(hf_config)
+    if quant_method_name(quant_config) != "auto-round":
+        return False
+    assert quant_config is not None
+
+    blocks = quant_config.get("block_name_to_quantize")
+    if blocks is None:
+        return False
+    if isinstance(blocks, str):
+        block_names = blocks.split(",")
+    elif isinstance(blocks, list):
+        block_names = blocks
+    else:
+        raise TypeError("block_name_to_quantize must be a string or list")
+    if not block_names:
+        return False
+
+    return not any(
+        name == "model.layers"
+        or name.startswith("model.layers.")
+        or "model.layers".startswith(f"{name}.")
+        for name in block_names
+    )
 
 
 def normalize_quant_config(model_config: Any) -> None:

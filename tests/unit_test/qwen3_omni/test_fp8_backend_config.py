@@ -370,43 +370,82 @@ def test_model_worker_backend_policy_precedence(
 
 
 @pytest.mark.parametrize(
-    ("is_h20", "expected_backend"),
-    [(False, "flashinfer_cutlass"), (True, "triton")],
+    (
+        "architecture",
+        "block_name",
+        "server_quantization",
+        "expected_quantization",
+        "expected_moe_backend",
+    ),
+    [
+        (
+            "Qwen3OmniThinkerForCausalLM",
+            "thinker.model.layers",
+            None,
+            "auto-round",
+            "auto",
+        ),
+        (
+            "Qwen3OmniTalker",
+            "thinker.model.layers",
+            None,
+            None,
+            "flashinfer_cutlass",
+        ),
+        (
+            "Qwen3OmniTalker",
+            "thinker.model.layers",
+            "auto-round",
+            "auto-round",
+            "auto",
+        ),
+        (
+            "Qwen3OmniTalker",
+            None,
+            None,
+            "auto-round",
+            "auto",
+        ),
+    ],
+    ids=(
+        "quantized_thinker",
+        "unquantized_talker",
+        "explicit_server_override",
+        "all_layers_quantized",
+    ),
 )
-def test_mixed_autoround_talker_uses_bf16_backend_policy(
+def test_autoround_stage_scope_controls_backend_policy(
     monkeypatch: pytest.MonkeyPatch,
-    is_h20: bool,
-    expected_backend: str,
+    architecture: str,
+    block_name: str | None,
+    server_quantization: str | None,
+    expected_quantization: str | None,
+    expected_moe_backend: str,
 ) -> None:
+    monkeypatch.setattr(model_worker, "_is_h20_device", lambda: False)
     quantization_config = {
         "quant_method": "auto-round",
-        "block_name_to_quantize": "thinker.model.layers",
+        "block_name_to_quantize": block_name,
     }
-    worker = object.__new__(model_worker.ModelWorker)
-    worker.server_args = _server_args(quantization=None)
-    worker.model_arch_override = "Qwen3OmniTalker"
-    worker.model_config = SimpleNamespace(
+    server_args = _server_args(quantization=server_quantization)
+    model_config = SimpleNamespace(
         quantization="auto-round",
-        hf_text_config=SimpleNamespace(num_experts_per_tok=6),
+        hf_text_config=SimpleNamespace(num_experts_per_tok=8),
         hf_config=SimpleNamespace(
-            architectures=["Qwen3OmniTalker"],
+            architectures=[architecture],
             quantization_config=quantization_config,
         ),
     )
-    effective_quantization: list[str | None] = []
-    monkeypatch.setattr(model_worker, "_is_h20_device", lambda: is_h20)
-    monkeypatch.setattr(
-        model_worker,
-        "_initialize_model_worker_backend_globals",
-        lambda server_args, model_config, quantization: effective_quantization.append(
-            quantization
-        ),
+
+    model_worker._apply_omni_quantization_adapters(model_config)
+    effective_quantization = model_worker._apply_model_worker_backend_policy(
+        server_args,
+        model_config,
+        architecture,
     )
 
-    worker._configure_backend_policy()
-
-    assert effective_quantization == [None]
-    assert worker.server_args.moe_runner_backend == expected_backend
+    assert effective_quantization == expected_quantization
+    assert server_args.moe_runner_backend == expected_moe_backend
 
 
 def test_model_config_has_moe_prefers_effective_text_config() -> None:

@@ -32,18 +32,6 @@ def _normalize_rope_scaling(
     return normalized
 
 
-def _resolve_rope_config(
-    rope_theta: float,
-    rope_scaling: dict[str, Any] | None,
-    rope_parameters: dict[str, Any] | None,
-) -> tuple[float, dict[str, Any] | None]:
-    rope_config = rope_parameters if rope_parameters is not None else rope_scaling
-    rope_config = _normalize_rope_scaling(rope_config)
-    if rope_config is not None:
-        rope_theta = rope_config.get("rope_theta", rope_theta)
-    return rope_theta, rope_config
-
-
 class Qwen3OmniMoeAudioEncoderConfig(PretrainedConfig):
     def __init__(
         self,
@@ -145,7 +133,6 @@ class Qwen3OmniMoeTextConfig(PretrainedConfig):
         tie_word_embeddings=False,
         rope_theta=1000000.0,
         rope_scaling=None,
-        rope_parameters=None,
         partial_rotary_factor=1.0,
         attention_bias=False,
         sliding_window=None,
@@ -181,9 +168,8 @@ class Qwen3OmniMoeTextConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
-        self.rope_theta, self.rope_scaling = _resolve_rope_config(
-            rope_theta, rope_scaling, rope_parameters
-        )
+        self.rope_theta = rope_theta
+        self.rope_scaling = _normalize_rope_scaling(rope_scaling)
         self.partial_rotary_factor = partial_rotary_factor
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
@@ -275,7 +261,6 @@ class Qwen3OmniMoeTalkerTextConfig(Qwen3OmniMoeTextConfig):
         tie_word_embeddings=False,
         rope_theta=1000000.0,
         rope_scaling=None,
-        rope_parameters=None,
         attention_bias=False,
         sliding_window=None,
         attention_dropout=0,
@@ -306,7 +291,6 @@ class Qwen3OmniMoeTalkerTextConfig(Qwen3OmniMoeTextConfig):
             tie_word_embeddings=tie_word_embeddings,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
-            rope_parameters=rope_parameters,
             attention_bias=attention_bias,
             sliding_window=sliding_window,
             attention_dropout=attention_dropout,
@@ -348,7 +332,6 @@ class Qwen3OmniMoeTalkerCodePredictorConfig(PretrainedConfig):
         tie_word_embeddings=False,
         rope_theta=1000000.0,
         rope_scaling=None,
-        rope_parameters=None,
         attention_bias=False,
         sliding_window=None,
         attention_dropout=0,
@@ -368,9 +351,8 @@ class Qwen3OmniMoeTalkerCodePredictorConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
-        self.rope_theta, self.rope_scaling = _resolve_rope_config(
-            rope_theta, rope_scaling, rope_parameters
-        )
+        self.rope_theta = rope_theta
+        self.rope_scaling = _normalize_rope_scaling(rope_scaling)
         self.attention_bias = attention_bias
         self.sliding_window = sliding_window
         self.attention_dropout = attention_dropout

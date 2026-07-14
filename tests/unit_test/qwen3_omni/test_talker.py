@@ -1657,46 +1657,6 @@ def test_qwen_talker_activation_dtype_comes_from_codec_embedding() -> None:
     assert talker.activation_dtype is torch.bfloat16
 
 
-def test_qwen_talker_forwards_mrope_positions_to_mrope_backbone() -> None:
-    class RecordingModel(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.positions: torch.Tensor | None = None
-
-        def forward(self, **kwargs):
-            self.positions = kwargs["positions"]
-            return torch.zeros((1, 4))
-
-    class ForwardMode:
-        @staticmethod
-        def is_extend() -> bool:
-            return False
-
-        @staticmethod
-        def is_decode() -> bool:
-            return False
-
-    talker = object.__new__(Qwen3OmniTalker)
-    nn.Module.__init__(talker)
-    talker.model = RecordingModel()
-    talker._uses_mrope = True
-    talker._manual_decode_logits = lambda hidden_states: hidden_states
-    mrope_positions = torch.tensor([[0, 1], [2, 3], [4, 5]])
-    forward_batch = SimpleNamespace(
-        positions=torch.tensor([0, 1]),
-        mrope_positions=mrope_positions,
-        forward_mode=ForwardMode(),
-    )
-
-    talker.forward(
-        input_ids=torch.tensor([1, 2]),
-        positions=forward_batch.positions,
-        forward_batch=forward_batch,
-    )
-
-    assert torch.equal(talker.model.positions, mrope_positions)
-
-
 def test_qwen_talker_load_weights_converts_fp8_scales_after_name_mapping() -> None:
     """Converts reciprocal scales for stacked, expert, and direct talker params."""
 
