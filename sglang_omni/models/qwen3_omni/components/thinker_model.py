@@ -10,7 +10,7 @@ from transformers import PretrainedConfig
 
 from sglang_omni.models.qwen3_omni.hf_config import Qwen3OmniMoeTextConfig
 from sglang_omni.models.weight_loader import default_weight_loader
-from sglang_omni.quantization import get_weight_preprocessor
+from sglang_omni.quantization import convert_fp8_weight_scale_inv
 from sglang_omni.utils import add_prefix
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.distributed import (
@@ -721,9 +721,7 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):
         """
         params_dict = self._cached_params_dict
 
-        preprocess_weight = get_weight_preprocessor(
-            self.config, fp8_scale_inverted=True
-        )
+        preprocess_weight = convert_fp8_weight_scale_inv
 
         for name, loaded_weight in weights:
             if maybe_update_fused_qkv_proj(

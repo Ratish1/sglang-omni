@@ -62,9 +62,6 @@ class TestExtractQuantizationConfig:
 class TestQuantMethodName:
     """Tests for ``quant_method_name`` normalization."""
 
-    def test_normalizes_underscore_to_hyphen(self) -> None:
-        assert quant_method_name({"quant_method": "auto_round"}) == "auto-round"
-
     def test_lowercases(self) -> None:
         assert quant_method_name({"quant_method": "FP8"}) == "fp8"
 

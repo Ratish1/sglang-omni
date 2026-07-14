@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from sglang_omni.quantization import (
+    auto_round_quantizes_model_layers,
     needs_quant_config_normalization,
     normalize_quant_config,
     resolve_quant_config,
@@ -413,6 +414,11 @@ def _apply_model_worker_backend_policy(
     server_quantization = _normalize_quantization(server_args.quantization)
     if server_quantization is not None:
         effective_quantization = server_quantization
+    if (
+        effective_quantization == "auto-round"
+        and not auto_round_quantizes_model_layers(model_config.hf_config)
+    ):
+        effective_quantization = None
 
     moe_runner_backend = server_args.moe_runner_backend
     is_qwen3_omni_arch = model_arch_override in (

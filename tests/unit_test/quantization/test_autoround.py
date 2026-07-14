@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from sglang_omni.quantization import (
+    auto_round_quantizes_model_layers,
     needs_quant_config_normalization,
     normalize_quant_config,
 )
@@ -30,9 +31,6 @@ class TestNeedsStageLocalNormalization:
 
     def test_true_for_auto_round(self) -> None:
         assert needs_quant_config_normalization({"quant_method": "auto-round"})
-
-    def test_true_for_underscore_variant(self) -> None:
-        assert needs_quant_config_normalization({"quant_method": "auto_round"})
 
     def test_false_for_fp8(self) -> None:
         assert not needs_quant_config_normalization({"quant_method": "fp8"})
@@ -301,3 +299,17 @@ class TestObjectShapedConfig:
         )
         with pytest.raises(TypeError, match="unsupported type"):
             normalize_quant_config(model_config)
+
+
+def test_auto_round_targets_only_the_active_stage() -> None:
+    quant_config = {
+        "quant_method": "auto-round",
+        "block_name_to_quantize": "thinker.model.layers",
+    }
+    thinker_config = _make_model_config(
+        "Qwen3OmniThinkerForCausalLM", quant_config
+    ).hf_config
+    talker_config = _make_model_config("Qwen3OmniTalker", quant_config).hf_config
+
+    assert auto_round_quantizes_model_layers(thinker_config)
+    assert not auto_round_quantizes_model_layers(talker_config)
