@@ -52,7 +52,7 @@ client_budget=""
 IFS=',' read -r -a CONDITIONS <<< "$MATRIX_ORDER"
 for condition in "${CONDITIONS[@]}"; do
   IFS=':' read -r dp mps extra <<< "$condition"
-  [[ -z "${extra:-}" && "$dp" =~ ^[1-4]$ && "$mps" =~ ^[01]$ ]] || {
+  [[ -z "${extra:-}" && "$dp" =~ ^[1-6]$ && "$mps" =~ ^[01]$ ]] || {
     echo "invalid MATRIX_ORDER item '$condition' (expected DP:MPS)" >&2
     exit 2
   }
@@ -93,7 +93,7 @@ printf 'repetition\torder_index\tdp\tmps\tconcurrency\tstatus\texit_code\toutput
   echo "shuffle_seed=$SHUFFLE_SEED"
   echo "server_cpu_budget=$server_budget"
   echo "client_cpu_budget=$client_budget"
-  env | LC_ALL=C sort | grep -E '^DP[1-4]_(SERVER_CORE_SETS|CLIENT_CORE_SETS|MEM_FRACTIONS|MAX_TOTAL_TOKENS|MPS_THREAD_PERCENTAGES|MPS_PINNED_MEM_LIMITS)=' || true
+  env | LC_ALL=C sort | grep -E '^DP[1-6]_(SERVER_CORE_SETS|CLIENT_CORE_SETS|MEM_FRACTIONS|MAX_TOTAL_TOKENS|MPS_THREAD_PERCENTAGES|MPS_PINNED_MEM_LIMITS)=' || true
 } > "$OUT_ROOT/matrix_manifest.txt"
 
 failures=0

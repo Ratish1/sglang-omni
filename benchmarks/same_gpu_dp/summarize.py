@@ -56,8 +56,8 @@ def validate_layout(
     extra_core_sets: Iterable[tuple[str, str]] = (),
 ) -> dict[str, object]:
     """Validate dedicated, non-overlapping server/client CPU assignments."""
-    if dp not in {1, 2, 3, 4}:
-        raise ValueError("DP must be one of 1, 2, 3, or 4")
+    if dp not in range(1, 7):
+        raise ValueError("DP must be between 1 and 6")
     server_raw = list(server_core_sets)
     client_raw = list(client_core_sets)
     if len(server_raw) != dp:

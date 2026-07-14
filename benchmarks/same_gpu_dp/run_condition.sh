@@ -59,7 +59,7 @@ fi
 : "${MPS_TMP_ROOT:=/tmp/sglang-omni-mps-${UID:-$(id -u)}}"
 : "${LABEL:=dp${DP}_mps${USE_MPS}_${MODE}_$(date -u +%Y%m%dT%H%M%SZ)}"
 
-[[ "$DP" =~ ^[1-4]$ ]] || { echo "DP must be 1, 2, 3, or 4" >&2; exit 2; }
+[[ "$DP" =~ ^[1-6]$ ]] || { echo "DP must be between 1 and 6" >&2; exit 2; }
 [[ "$USE_MPS" =~ ^[01]$ ]] || { echo "USE_MPS must be 0 or 1" >&2; exit 2; }
 [[ "$STREAM" =~ ^[01]$ ]] || { echo "STREAM must be 0 or 1" >&2; exit 2; }
 [[ "$REQUIRE_IDLE_GPU" =~ ^[01]$ ]] || {

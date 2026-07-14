@@ -139,8 +139,10 @@ def build_environment(payload: dict[str, Any]) -> dict[str, str]:
     layouts = _require_mapping(payload.get("layouts"), "layouts")
     for raw_dp, raw_layout in layouts.items():
         dp = int(raw_dp)
-        if dp not in {1, 2, 3, 4}:
-            raise ValueError(f"layout key must be DP 1, 2, 3, or 4; got {raw_dp!r}")
+        if dp not in range(1, 7):
+            raise ValueError(
+                f"layout key must be between DP 1 and DP 6; got {raw_dp!r}"
+            )
         layout = _require_mapping(raw_layout, f"layouts.{dp}")
         unknown_layout = sorted(set(layout) - set(LAYOUT_KEYS))
         if unknown_layout:
