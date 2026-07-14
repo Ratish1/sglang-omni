@@ -37,7 +37,6 @@ __all__ = [
     "is_fp8_block_quant",
     "convert_fp8_weight_scale_inv",
     "get_weight_preprocessor",
-    "auto_round_excludes_local_model_layers",
     "needs_quant_config_normalization",
     "normalize_quant_config",
 ]
@@ -116,12 +115,18 @@ def convert_fp8_weight_scale_inv(
     if not target_name.endswith("weight_scale_inv"):
         return loaded_weight
 
-    if not loaded_weight.is_floating_point():
+    import torch
+
+    if not torch.is_floating_point(loaded_weight):
         raise TypeError(f"FP8 scale tensor for {target_name} must be floating point")
     if loaded_weight.numel() == 0:
         raise ValueError(f"Invalid empty FP8 scale tensor for {target_name}")
+    if not bool(torch.isfinite(loaded_weight).all().item()):
+        raise ValueError(f"Invalid non-finite FP8 scale tensor for {target_name}")
+    if bool(torch.any(loaded_weight == 0).item()):
+        raise ValueError(f"Invalid zero FP8 scale tensor for {target_name}")
 
-    return loaded_weight.reciprocal()
+    return torch.reciprocal(loaded_weight)
 
 
 def _identity_preprocessor(
@@ -254,33 +259,6 @@ def _resolve_stage_prefix(hf_config: Any) -> str | None:
     if not architectures:
         return None
     return _STAGE_PREFIX_BY_ARCH.get(architectures[0])
-
-
-def auto_round_excludes_local_model_layers(hf_config: Any) -> bool:
-    """Return whether AutoRound explicitly excludes stage-local model layers."""
-    quant_config = resolve_quant_config(hf_config)
-    if quant_method_name(quant_config) != "auto-round":
-        return False
-    assert quant_config is not None
-
-    blocks = quant_config.get("block_name_to_quantize")
-    if blocks is None:
-        return False
-    if isinstance(blocks, str):
-        block_names = blocks.split(",")
-    elif isinstance(blocks, list):
-        block_names = blocks
-    else:
-        raise TypeError("block_name_to_quantize must be a string or list")
-    if not block_names:
-        return False
-
-    return not any(
-        name == "model.layers"
-        or name.startswith("model.layers.")
-        or "model.layers".startswith(f"{name}.")
-        for name in block_names
-    )
 
 
 def normalize_quant_config(model_config: Any) -> None:

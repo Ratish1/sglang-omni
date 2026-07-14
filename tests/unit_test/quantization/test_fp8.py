@@ -57,6 +57,21 @@ class TestConvertFp8WeightScaleInv:
         with pytest.raises(ValueError, match="Invalid empty FP8 scale tensor"):
             convert_fp8_weight_scale_inv("layer.weight_scale_inv", scale_inv)
 
+    def test_zero_scale_raises(self) -> None:
+        scale_inv = torch.tensor([2.0, 0.0], dtype=torch.float32)
+        with pytest.raises(ValueError, match="Invalid zero FP8 scale tensor"):
+            convert_fp8_weight_scale_inv("layer.weight_scale_inv", scale_inv)
+
+    def test_inf_scale_raises(self) -> None:
+        scale_inv = torch.tensor([2.0, float("inf")], dtype=torch.float32)
+        with pytest.raises(ValueError, match="Invalid non-finite FP8 scale tensor"):
+            convert_fp8_weight_scale_inv("layer.weight_scale_inv", scale_inv)
+
+    def test_nan_scale_raises(self) -> None:
+        scale_inv = torch.tensor([2.0, float("nan")], dtype=torch.float32)
+        with pytest.raises(ValueError, match="Invalid non-finite FP8 scale tensor"):
+            convert_fp8_weight_scale_inv("layer.weight_scale_inv", scale_inv)
+
     def test_non_float_scale_raises(self) -> None:
         scale_inv = torch.tensor([1, 2, 3], dtype=torch.int32)
         with pytest.raises(TypeError, match="must be floating point"):
