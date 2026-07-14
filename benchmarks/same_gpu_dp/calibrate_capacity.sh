@@ -93,6 +93,18 @@ raise SystemExit(0 if all(value == expected for value in resolved) else 10)
 PY
 }
 
+startup_oom_log() {
+  local out=$1 log
+  for log in "$out"/workers/*.server.log; do
+    [[ -f "$log" ]] || continue
+    if grep -Fq "torch.OutOfMemoryError: CUDA out of memory." "$log"; then
+      printf '%s\n' "$log"
+      return 0
+    fi
+  done
+  return 1
+}
+
 IFS=',' read -r -a MPS_MODES <<< "$CALIBRATION_MPS_MODES"
 for mps in "${MPS_MODES[@]}"; do
   [[ "$mps" == 0 || "$mps" == 1 ]] || {
@@ -108,7 +120,7 @@ run_candidate() {
   local client_var="DP${dp}_CLIENT_CORE_SETS"
   local mem_var="DP${dp}_MEM_FRACTIONS"
   local server_sets client_sets mem_fractions label out kv_path
-  local run_status classify_status resolved status
+  local run_status classify_status resolved status oom_log
 
   trial_id=$((trial_id + 1))
   server_sets=$(rotate_list "${!server_var}" ";" "$rotation")
@@ -132,6 +144,13 @@ run_candidate() {
 
   kv_path="$out/kv_capacity.json"
   if [[ ! -f "$kv_path" ]]; then
+    if [[ "$run_status" -ne 0 ]] && oom_log=$(startup_oom_log "$out"); then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\tcapacity-limit\tstartup-oom\t%s\n' \
+        "$dp" "$phase" "$trial_id" "$mps" "$rotation" "$cap" "$out" \
+        >> "$TRIALS_FILE"
+      echo "candidate $cap exceeded startup memory capacity; see $oom_log" >&2
+      return 1
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\tinfrastructure-failure\tmissing\t%s\n' \
       "$dp" "$phase" "$trial_id" "$mps" "$rotation" "$cap" "$out" \
       >> "$TRIALS_FILE"

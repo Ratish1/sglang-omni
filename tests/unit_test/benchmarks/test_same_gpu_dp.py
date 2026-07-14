@@ -74,9 +74,43 @@ def test_classify_kv_capacity_requires_the_configured_cap() -> None:
     assert classify_kv_capacity(token_counts, 78021) == "configured_mismatch"
 
 
-def test_capacity_search_finds_highest_equal_cap(tmp_path: Path) -> None:
+def _run_fake_capacity_search(
+    tmp_path: Path,
+    runner_source: str,
+    *,
+    mem_fractions: str = "auto,auto",
+    check: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
     runner = tmp_path / "fake_condition.sh"
-    runner.write_text(
+    runner.write_text(runner_source, encoding="utf-8")
+    runner.chmod(0o755)
+    root = tmp_path / "capacity"
+    script = Path("benchmarks/same_gpu_dp/calibrate_capacity.sh").resolve()
+    env = {
+        **os.environ,
+        "CONDITION_RUNNER": str(runner),
+        "CALIBRATION_DPS": "2",
+        "CALIBRATION_MPS_MODES": "1",
+        "CALIBRATION_CONFIRMATIONS": "2",
+        "CALIBRATION_TOKEN_TOLERANCE": "1",
+        "CALIBRATION_ROOT": str(root),
+        "DP2_SERVER_CORE_SETS": "0;1",
+        "DP2_CLIENT_CORE_SETS": "2;3",
+        "DP2_MEM_FRACTIONS": mem_fractions,
+        "DP2_INITIAL_CAP_TOKENS": "20",
+    }
+    result = subprocess.run(
+        ["bash", str(script)],
+        env=env,
+        check=check,
+        text=True,
+    )
+    return result, root
+
+
+def test_capacity_search_finds_highest_equal_cap(tmp_path: Path) -> None:
+    _, root = _run_fake_capacity_search(
+        tmp_path,
         """#!/usr/bin/env bash
 set -eu
 out="$OUT_ROOT/$LABEL"
@@ -92,26 +126,8 @@ printf '{"worker_0": %s, "worker_1": %s}\n' "$resolved" "$resolved" \
   > "$out/kv_capacity.json"
 exit "$status"
 """,
-        encoding="utf-8",
+        mem_fractions="0.90,0.90",
     )
-    runner.chmod(0o755)
-    root = tmp_path / "capacity"
-    script = Path("benchmarks/same_gpu_dp/calibrate_capacity.sh").resolve()
-    env = {
-        **os.environ,
-        "CONDITION_RUNNER": str(runner),
-        "CALIBRATION_DPS": "2",
-        "CALIBRATION_MPS_MODES": "1",
-        "CALIBRATION_CONFIRMATIONS": "2",
-        "CALIBRATION_TOKEN_TOLERANCE": "1",
-        "CALIBRATION_ROOT": str(root),
-        "DP2_SERVER_CORE_SETS": "0;1",
-        "DP2_CLIENT_CORE_SETS": "2;3",
-        "DP2_MEM_FRACTIONS": "0.90,0.90",
-        "DP2_INITIAL_CAP_TOKENS": "20",
-    }
-
-    subprocess.run(["bash", str(script)], env=env, check=True)
 
     selection = (root / "capacity_selection.tsv").read_text(encoding="utf-8")
     assert "2\t0.90,0.90\t100\t101\t1\t0\t100" in selection
@@ -121,6 +137,50 @@ exit "$status"
     assert "capacity-limit" in (root / "capacity_trials.tsv").read_text(
         encoding="utf-8"
     )
+
+
+def test_capacity_search_uses_startup_oom_as_failing_bound(tmp_path: Path) -> None:
+    _, root = _run_fake_capacity_search(
+        tmp_path,
+        """#!/usr/bin/env bash
+set -eu
+out="$OUT_ROOT/$LABEL"
+mkdir -p "$out/workers"
+if ((MAX_TOTAL_TOKENS <= 100)); then
+  printf '{"worker_0": %s, "worker_1": %s}\n' \
+    "$MAX_TOTAL_TOKENS" "$MAX_TOTAL_TOKENS" > "$out/kv_capacity.json"
+  exit 0
+fi
+printf 'torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 30.00 MiB.\n' \
+  > "$out/workers/worker_1.server.log"
+exit 1
+""",
+    )
+
+    selection = (root / "capacity_selection.tsv").read_text(encoding="utf-8")
+    assert "2\tauto,auto\t100\t101\t1\t0\t100" in selection
+    trials = (root / "capacity_trials.tsv").read_text(encoding="utf-8")
+    assert "capacity-limit\tstartup-oom" in trials
+
+
+def test_capacity_search_keeps_non_oom_startup_failure_distinct(
+    tmp_path: Path,
+) -> None:
+    result, root = _run_fake_capacity_search(
+        tmp_path,
+        """#!/usr/bin/env bash
+set -eu
+out="$OUT_ROOT/$LABEL"
+mkdir -p "$out/workers"
+printf 'worker exited before readiness\n' > "$out/workers/worker_1.server.log"
+exit 1
+""",
+        check=False,
+    )
+
+    assert result.returncode != 0
+    trials = (root / "capacity_trials.tsv").read_text(encoding="utf-8")
+    assert "infrastructure-failure\tmissing" in trials
 
 
 def test_parse_cpu_set_expands_linux_syntax() -> None:
