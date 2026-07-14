@@ -16,7 +16,7 @@ import aiohttp
 
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.benchmarker.runner import SendFn
-from benchmarks.dataset.mmmu import MMMUSample, image_to_data_uri
+from benchmarks.dataset.mmmu import MMMUSample, images_to_data_uris
 
 logger = logging.getLogger(__name__)
 
@@ -248,11 +248,12 @@ def make_mmmu_send_fn(
             request_id=sample.sample_id,
             text=sample.prompt[:60],
         )
+        images = await asyncio.to_thread(images_to_data_uris, sample.images)
 
         payload: dict = {
             "model": model_name,
             "messages": [{"role": "user", "content": sample.prompt}],
-            "images": [image_to_data_uri(img) for img in sample.images],
+            "images": images,
             "modalities": modalities,
             "max_tokens": max_tokens,
             "temperature": temperature,
