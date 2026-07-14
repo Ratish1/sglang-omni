@@ -221,7 +221,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             port=config.port,
             log_level=log_level.lower(),
             log_config=log_config,
-            timeout_keep_alive=120,
         )
     except (ValueError, ValidationError) as exc:
         parser.error(str(exc))

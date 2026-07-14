@@ -67,7 +67,7 @@ class TestApplyOmniQuantizationAdapters:
         thinker = SimpleNamespace(quantization_config=quant_config)
         hf_config = SimpleNamespace(
             architectures=["Qwen3OmniThinkerForCausalLM"],
-            quantization_config=None,
+            quantization_config=quant_config,
             thinker_config=thinker,
         )
         model_config = SimpleNamespace(hf_config=hf_config)

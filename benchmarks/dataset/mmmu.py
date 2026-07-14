@@ -12,7 +12,6 @@ import base64
 import io
 import logging
 import re
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from datasets import concatenate_datasets, load_dataset
@@ -71,10 +70,6 @@ def image_to_data_uri(image: Image.Image) -> str:
     image.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{b64}"
-
-
-def images_to_data_uris(images: Sequence[Image.Image]) -> list[str]:
-    return [image_to_data_uri(image) for image in images]
 
 
 def _strip_image_tags(text: str) -> str:

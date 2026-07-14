@@ -39,7 +39,7 @@ import aiohttp
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
 from benchmarks.benchmarker.utils import save_json_results, wait_for_service
-from benchmarks.dataset.mmmu import MMMUSample, images_to_data_uris, load_mmmu_samples
+from benchmarks.dataset.mmmu import MMMUSample, image_to_data_uri, load_mmmu_samples
 from benchmarks.metrics.performance import compute_speed_metrics, print_speed_summary
 
 logger = logging.getLogger(__name__)
@@ -86,12 +86,11 @@ def _make_rollout_send_fn(
             request_id=sample.sample_id,
             text=sample.prompt[:60],
         )
-        images = await asyncio.to_thread(images_to_data_uris, sample.images)
         payload: dict[str, Any] = {
             "model": model_name,
             "request_id": sample.sample_id,
             "messages": [{"role": "user", "content": sample.prompt}],
-            "images": images,
+            "images": [image_to_data_uri(image) for image in sample.images],
             "modalities": modalities,
             "max_tokens": max_tokens,
             "temperature": temperature,

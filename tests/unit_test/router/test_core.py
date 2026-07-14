@@ -633,21 +633,6 @@ def test_router_console_script_entrypoint_resolves() -> None:
     assert callable(entrypoint)
 
 
-def test_router_main_matches_pipeline_server_keep_alive(monkeypatch) -> None:
-    run_kwargs = {}
-    monkeypatch.setattr(serve_module, "create_app", lambda *args, **kwargs: object())
-    monkeypatch.setattr(
-        serve_module.uvicorn,
-        "run",
-        lambda app, **kwargs: run_kwargs.update(kwargs),
-    )
-    monkeypatch.setattr(serve_module.logging.config, "dictConfig", lambda config: None)
-
-    serve_module.main(["--worker-urls", "http://127.0.0.1:8101"])
-
-    assert run_kwargs["timeout_keep_alive"] == 120
-
-
 def test_router_main_shuts_down_managed_workers_on_startup_interrupt(
     monkeypatch, tmp_path: Path
 ) -> None:
