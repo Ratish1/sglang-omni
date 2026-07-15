@@ -39,6 +39,8 @@ fi
 : "${MAX_TOTAL_TOKENS:=}"
 : "${MAX_NEW_TOKENS:=2048}"
 : "${MAX_SAMPLES:=}"
+: "${SAMPLE_ID:=}"
+: "${SAMPLE_REPETITIONS:=1}"
 : "${SEED:=1}"
 : "${WARMUP:=1}"
 : "${BENCH_LANG:=en}"
@@ -115,6 +117,18 @@ fi
 }
 if [[ -n "$MAX_SAMPLES" && ! "$MAX_SAMPLES" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_SAMPLES must be empty or a positive integer" >&2
+  exit 2
+fi
+[[ "$SAMPLE_REPETITIONS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "SAMPLE_REPETITIONS must be a positive integer" >&2
+  exit 2
+}
+if [[ -n "$SAMPLE_ID" && -n "$MAX_SAMPLES" ]]; then
+  echo "SAMPLE_ID and MAX_SAMPLES cannot be used together" >&2
+  exit 2
+fi
+if [[ -z "$SAMPLE_ID" && "$SAMPLE_REPETITIONS" -ne 1 ]]; then
+  echo "SAMPLE_REPETITIONS requires SAMPLE_ID" >&2
   exit 2
 fi
 ((BASE_PORT + DP - 1 <= 65535 && ROUTER_PORT <= 65535)) || {
@@ -604,6 +618,8 @@ write_manifest() {
     echo "max_total_tokens=$MAX_TOTAL_TOKENS"
     echo "max_new_tokens=$MAX_NEW_TOKENS"
     echo "max_samples=$MAX_SAMPLES"
+    echo "sample_id=$SAMPLE_ID"
+    echo "sample_repetitions=$SAMPLE_REPETITIONS"
     echo "seed=$SEED"
     echo "warmup=$WARMUP"
     echo "lang=$BENCH_LANG"
@@ -641,6 +657,9 @@ if [[ "$CLIENT_DRIVER" == seedtts ]]; then
     --ref-format "$REF_FORMAT" --lang "$BENCH_LANG" --max-new-tokens "$MAX_NEW_TOKENS"
     --seed "$SEED" --warmup "$WARMUP" --disable-tqdm)
   [[ -n "$MAX_SAMPLES" ]] && BENCH_COMMON+=(--max-samples "$MAX_SAMPLES")
+  if [[ -n "$SAMPLE_ID" ]]; then
+    BENCH_COMMON+=(--sample-id "$SAMPLE_ID" --sample-repetitions "$SAMPLE_REPETITIONS")
+  fi
   [[ "$STREAM" -eq 1 ]] && BENCH_COMMON+=(--stream)
 else
   BENCH_COMMON=(python -m benchmarks.same_gpu_dp.benchmark_tts_manifest

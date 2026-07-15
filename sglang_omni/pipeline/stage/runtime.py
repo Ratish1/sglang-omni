@@ -885,7 +885,58 @@ class Stage:
                         out.metadata,
                     )
             elif out.type == "error":
-                await self._send_failure(out.request_id, str(out.data))
+                error = self._log_scheduler_error(out.request_id, out.data)
+                await self._send_failure(out.request_id, error)
+
+    def _log_scheduler_error(self, request_id: str, error: Any) -> str:
+        """Log a scheduler exception before its traceback is serialized away."""
+        error_text = str(error)
+        exc_info = None
+        if isinstance(error, BaseException):
+            exc_info = (type(error), error, error.__traceback__)
+        logger.error(
+            "Stage %s scheduler failed for request %s",
+            self.name,
+            request_id,
+            exc_info=exc_info,
+        )
+        if self.gpu_id is not None and (
+            "CUDA out of memory" in error_text
+            or type(error).__name__ == "OutOfMemoryError"
+        ):
+            self._log_cuda_allocator_state(request_id)
+        return error_text
+
+    def _log_cuda_allocator_state(self, request_id: str) -> None:
+        """Record compact allocator counters for a failed CUDA allocation."""
+        try:
+            import torch
+
+            device = torch.device("cuda", int(self.gpu_id))
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            logger.error(
+                "CUDA allocator state for stage %s request %s: "
+                "pid=%s device=%s allocated_bytes=%s reserved_bytes=%s "
+                "max_allocated_bytes=%s max_reserved_bytes=%s "
+                "device_free_bytes=%s device_total_bytes=%s",
+                self.name,
+                request_id,
+                os.getpid(),
+                self.gpu_id,
+                torch.cuda.memory_allocated(device),
+                torch.cuda.memory_reserved(device),
+                torch.cuda.max_memory_allocated(device),
+                torch.cuda.max_memory_reserved(device),
+                free_bytes,
+                total_bytes,
+            )
+        except Exception:
+            logger.warning(
+                "Could not read CUDA allocator state for stage %s request %s",
+                self.name,
+                request_id,
+                exc_info=True,
+            )
 
     async def _drain_outbox_follower(self) -> None:
         """Drain follower outbox without emitting external stage traffic."""

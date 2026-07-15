@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from benchmarks.dataset.seedtts import SampleInput
 from benchmarks.eval.benchmark_tts_seedtts import (
     TtsSeedttsBenchmarkConfig,
     _build_arg_parser,
     _build_results_config,
     _config_from_args,
+    _select_generation_samples,
 )
 
 
@@ -62,3 +64,30 @@ def test_seedtts_benchmark_accepts_internal_pool_coordination_args() -> None:
     assert config.sample_rotation_count == 3
     assert config.barrier_ready_file == "/tmp/ready-1"
     assert config.barrier_release_file == "/tmp/start"
+
+
+def test_seedtts_benchmark_repeats_one_exact_sample_with_unique_ids() -> None:
+    config = _config_from_cli(
+        "--sample-id",
+        "target-sample",
+        "--sample-repetitions",
+        "3",
+    )
+    samples = [
+        SampleInput("other", "other ref", "/tmp/other.wav", "other target"),
+        SampleInput("target-sample", "ref", "/tmp/target.wav", "target"),
+    ]
+
+    selected = _select_generation_samples(
+        samples,
+        sample_id=config.sample_id,
+        repetitions=config.sample_repetitions,
+    )
+
+    assert [sample.sample_id for sample in selected] == [
+        "target-sample__repeat_0000",
+        "target-sample__repeat_0001",
+        "target-sample__repeat_0002",
+    ]
+    assert all(sample.ref_audio == "/tmp/target.wav" for sample in selected)
+    assert all(sample.target_text == "target" for sample in selected)

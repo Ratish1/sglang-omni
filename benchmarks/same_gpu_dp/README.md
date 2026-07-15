@@ -77,6 +77,7 @@ settings are:
 | `BENCH_LANG` | SeedTTS language split (`en` or `zh`) |
 | `ALLOWED_LOCAL_MEDIA_PATH` | server allowlist for SeedTTS reference paths; defaults to `/` for an isolated benchmark container |
 | `MAX_SAMPLES` | optional SeedTTS subset; unset means the full language split |
+| `SAMPLE_ID` / `SAMPLE_REPETITIONS` | replay one exact SeedTTS sample for targeted diagnosis |
 | `LABEL` / `OUT_ROOT` | stable condition name and artifact root |
 | `KV_EQUALITY` | `warn` (default), `require`, or `off` |
 | `REQUIRE_IDLE_GPU` | refuse pre-existing compute clients (default `1`) |

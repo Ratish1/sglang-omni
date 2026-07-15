@@ -175,12 +175,12 @@ import argparse
 import asyncio
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
 from benchmarks.benchmarker.utils import managed_omni_server
-from benchmarks.dataset.seedtts import load_seedtts_samples
+from benchmarks.dataset.seedtts import SampleInput, load_seedtts_samples
 from benchmarks.metrics.performance import (
     build_speed_results,
     compute_speed_metrics,
@@ -234,6 +234,8 @@ class TtsSeedttsBenchmarkConfig:
     response_format: str = "wav"
     output_dir: str = "results/tts_seedtts"
     max_samples: int | None = None
+    sample_id: str | None = None
+    sample_repetitions: int = 1
     max_new_tokens: int | None = 2048
     token_count: int | str | None = None
     temperature: float | None = None
@@ -297,6 +299,8 @@ def _build_results_config(
         "instructions": config.instructions,
         "stream": config.stream,
         "max_samples": config.max_samples,
+        "sample_id": config.sample_id,
+        "sample_repetitions": config.sample_repetitions,
         "max_new_tokens": config.max_new_tokens,
         "seed": config.seed,
         "token_count": config.token_count,
@@ -311,6 +315,24 @@ def _build_results_config(
     }
 
 
+def _select_generation_samples(
+    samples: list[SampleInput],
+    *,
+    sample_id: str | None,
+    repetitions: int,
+) -> list[SampleInput]:
+    if sample_id is None:
+        return samples
+
+    match = next((sample for sample in samples if sample.sample_id == sample_id), None)
+    if match is None:
+        raise ValueError(f"SeedTTS sample not found: {sample_id}")
+    return [
+        replace(match, sample_id=f"{match.sample_id}__repeat_{index:04d}")
+        for index in range(repetitions)
+    ]
+
+
 async def run_tts_seedtts_benchmark(
     config: TtsSeedttsBenchmarkConfig,
 ) -> dict:
@@ -321,7 +343,13 @@ async def run_tts_seedtts_benchmark(
     base_url = build_base_url(config)
     api_url = f"{base_url}/v1/audio/speech"
 
-    samples = load_seedtts_samples(config.meta, config.max_samples, split=config.lang)
+    load_limit = None if config.sample_id is not None else config.max_samples
+    samples = load_seedtts_samples(config.meta, load_limit, split=config.lang)
+    samples = _select_generation_samples(
+        samples,
+        sample_id=config.sample_id,
+        repetitions=config.sample_repetitions,
+    )
     offset = len(samples) * config.sample_rotation_index // config.sample_rotation_count
     samples = samples[offset:] + samples[:offset]
     logger.info(f"Prepared {len(samples)} requests")
@@ -424,6 +452,8 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         response_format=response_format,
         output_dir=args.output_dir,
         max_samples=args.max_samples,
+        sample_id=args.sample_id,
+        sample_repetitions=args.sample_repetitions,
         max_new_tokens=args.max_new_tokens,
         token_count=args.token_count,
         temperature=args.temperature,
@@ -549,6 +579,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", type=str, default="results/tts_seedtts")
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--sample-id",
+        type=str,
+        default=None,
+        help="Run one exact SeedTTS sample instead of the selected split.",
+    )
+    parser.add_argument(
+        "--sample-repetitions",
+        type=int,
+        default=1,
+        help="Number of requests made from --sample-id (default: 1).",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument(
         "--token-count",
@@ -729,6 +771,14 @@ def main() -> None:
         parser.error("--max-running-requests must be positive")
     if args.cuda_graph_max_bs <= 0:
         parser.error("--cuda-graph-max-bs must be positive")
+    if args.sample_repetitions <= 0:
+        parser.error("--sample-repetitions must be positive")
+    if args.sample_repetitions != 1 and args.sample_id is None:
+        parser.error("--sample-repetitions requires --sample-id")
+    if args.sample_id is not None and not args.sample_id:
+        parser.error("--sample-id must not be empty")
+    if args.sample_id is not None and args.max_samples is not None:
+        parser.error("--sample-id and --max-samples cannot be used together")
     if not 0 <= args.sample_rotation_index < args.sample_rotation_count:
         parser.error("--sample-rotation-index must be in [0, --sample-rotation-count)")
     if bool(args.barrier_ready_file) != bool(args.barrier_release_file):

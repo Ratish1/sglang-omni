@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import multiprocessing
 import pickle
 import queue
@@ -67,6 +68,64 @@ class _DoneOp:
 
     async def wait_for_completion(self) -> None:
         pass
+
+
+def test_stage_logs_scheduler_exception_before_sending_failure(caplog) -> None:
+    async def _run() -> None:
+        control_plane = _FakeControlPlane()
+        scheduler = SimpleNamespace(outbox=queue.Queue())
+        stage = Stage(
+            name="vocoder",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={},
+            control_plane=control_plane,
+            relay=_FakeRelay(),
+            scheduler=scheduler,
+        )
+        stage._active_requests.add("req")
+        try:
+            raise RuntimeError("decode failed")
+        except RuntimeError as error:
+            scheduler.outbox.put(
+                OutgoingMessage(request_id="req", type="error", data=error)
+            )
+
+        with caplog.at_level(logging.ERROR):
+            await stage._drain_outbox_external()
+
+        assert control_plane.completions[0].error == "decode failed"
+        record = next(
+            record
+            for record in caplog.records
+            if record.message == "Stage vocoder scheduler failed for request req"
+        )
+        assert record.exc_info is not None
+        assert record.exc_info[2] is not None
+
+    asyncio.run(_run())
+
+
+def test_stage_captures_allocator_state_only_for_cuda_oom(monkeypatch) -> None:
+    control_plane = _FakeControlPlane()
+    stage = Stage(
+        name="tts_engine",
+        role="single",
+        get_next=lambda request_id, output: None,
+        gpu_id=0,
+        endpoints={},
+        control_plane=control_plane,
+        relay=_FakeRelay(),
+        scheduler=SimpleNamespace(outbox=queue.Queue()),
+    )
+    captured: list[str] = []
+    monkeypatch.setattr(stage, "_log_cuda_allocator_state", captured.append)
+
+    stage._log_scheduler_error("ordinary", RuntimeError("decode failed"))
+    stage._log_scheduler_error("oom", RuntimeError("CUDA out of memory"))
+
+    assert captured == ["oom"]
 
 
 class _AbortOnReadRelay(_FakeRelay):
