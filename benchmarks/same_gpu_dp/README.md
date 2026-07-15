@@ -82,6 +82,7 @@ settings are:
 | `REQUIRE_IDLE_GPU` | refuse pre-existing compute clients (default `1`) |
 | `CAPACITY_ONLY` | initialize replicas, record KV capacity, and exit before load |
 | `KEEP_AUDIO` | retain generated WAV files (`0` by default; metrics are retained) |
+| `GPU_TELEMETRY_INTERVAL_MS` | opt-in per-condition NVML sampling interval; `0` disables it (default) |
 | `MPS_TMP_ROOT` | short local MPS runtime root; defaults to per-user `/tmp/sglang-omni-mps-$UID` |
 
 For capacity calibration, use the hardware-specific YAML after verifying its

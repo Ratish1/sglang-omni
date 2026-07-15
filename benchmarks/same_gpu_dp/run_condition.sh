@@ -53,6 +53,7 @@ fi
 : "${CAPACITY_ONLY:=0}"
 : "${KEEP_AUDIO:=0}"
 : "${REQUIRE_IDLE_GPU:=1}"
+: "${GPU_TELEMETRY_INTERVAL_MS:=0}"
 : "${MPS_THREAD_PERCENTAGES:=}"
 : "${MPS_PINNED_MEM_LIMITS:=}"
 : "${OUT_ROOT:=$REPO/benchmarks/results/same_gpu_dp}"
@@ -108,6 +109,10 @@ if [[ -n "$MAX_TOTAL_TOKENS" && ! "$MAX_TOTAL_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 [[ "$WARMUP" =~ ^[0-9]+$ ]] || { echo "WARMUP must be a non-negative integer" >&2; exit 2; }
+[[ "$GPU_TELEMETRY_INTERVAL_MS" =~ ^[0-9]+$ ]] || {
+  echo "GPU_TELEMETRY_INTERVAL_MS must be a non-negative integer" >&2
+  exit 2
+}
 if [[ -n "$MAX_SAMPLES" && ! "$MAX_SAMPLES" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_SAMPLES must be empty or a positive integer" >&2
   exit 2
@@ -286,6 +291,7 @@ ROUTER_PGID=""
 MPS_OWNED=0
 MPS_DIR_OWNED=0
 MPS_CONTROL_PID=""
+GPU_TELEMETRY_PID=""
 MPS_ROOT="$MPS_TMP_ROOT/$LABEL"
 MPS_PIPE="$MPS_ROOT/pipe"
 MPS_LOG="$MPS_ROOT/log"
@@ -346,6 +352,13 @@ terminate_mps_clients_for_group() {
   done < <(group_pids "$pgid")
 }
 
+stop_gpu_telemetry() {
+  [[ -n "$GPU_TELEMETRY_PID" ]] || return 0
+  kill -TERM "$GPU_TELEMETRY_PID" 2>/dev/null || true
+  wait "$GPU_TELEMETRY_PID" 2>/dev/null || true
+  GPU_TELEMETRY_PID=""
+}
+
 cleanup() {
   local status=$? client_stop_deadline pid
   trap - EXIT INT TERM
@@ -400,9 +413,20 @@ cleanup() {
   if [[ "$KEEP_AUDIO" -eq 0 && -d "$OUT" ]]; then
     find "$OUT" -type f -path '*/audio/*.wav' -delete
   fi
+  stop_gpu_telemetry
   exit "$status"
 }
 trap cleanup EXIT INT TERM
+
+if [[ "$DRY_RUN" -eq 0 && "$GPU_TELEMETRY_INTERVAL_MS" -gt 0 ]]; then
+  printf 'timestamp,memory_used_mib,gpu_utilization_percent,power_draw_w\n' \
+    > "$OUT/gpu_telemetry.csv"
+  nvidia-smi -i "$GPU_UUID" \
+    --query-gpu=timestamp,memory.used,utilization.gpu,power.draw \
+    --format=csv,noheader,nounits --loop-ms="$GPU_TELEMETRY_INTERVAL_MS" \
+    >> "$OUT/gpu_telemetry.csv" 2> "$OUT/gpu_telemetry.stderr.log" &
+  GPU_TELEMETRY_PID=$!
+fi
 
 if [[ "$USE_MPS" -eq 1 ]]; then
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -589,6 +613,7 @@ write_manifest() {
     echo "require_idle_gpu=$REQUIRE_IDLE_GPU"
     echo "capacity_only=$CAPACITY_ONLY"
     echo "keep_audio=$KEEP_AUDIO"
+    echo "gpu_telemetry_interval_ms=$GPU_TELEMETRY_INTERVAL_MS"
     echo "mps_tmp_root=$MPS_TMP_ROOT"
     echo "mps_runtime_root=$MPS_ROOT"
     echo "mps_control_pid=$MPS_CONTROL_PID"
