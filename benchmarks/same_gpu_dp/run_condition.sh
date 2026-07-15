@@ -741,7 +741,8 @@ else
     result_paths+=("$OUT/router_clients/client_${i}.benchmark/speed_results.json")
   done
 fi
-summary_command=(python3 "$HERE/summarize.py" summarize --output "$OUT/summary.json")
+summary_command=(python3 "$HERE/summarize.py" summarize --require-all-successful \
+  --output "$OUT/summary.json")
 [[ -n "$condition_wall_clock_s" ]] \
   && summary_command+=(--wall-clock-s "$condition_wall_clock_s")
 summary_command+=("${result_paths[@]}")

@@ -226,6 +226,19 @@ def summarize_results(
     return {"aggregate": aggregate, "per_worker": workers}
 
 
+def validate_all_requests_succeeded(result: dict[str, object]) -> None:
+    aggregate = result["aggregate"]
+    assert isinstance(aggregate, dict)
+    total = int(aggregate["total_requests"])
+    completed = int(aggregate["completed_requests"])
+    failed = int(aggregate["failed_requests"])
+    if completed != total or failed != 0:
+        raise ValueError(
+            "request success gate failed: "
+            f"completed {completed}/{total} requests; failed requests: {failed}"
+        )
+
+
 # Two-sided Student-t 97.5th percentiles for df=1..30. For larger samples the
 # normal approximation is adequate for this experimental report.
 T_975 = (
@@ -348,6 +361,7 @@ def _build_parser() -> argparse.ArgumentParser:
     summarize = sub.add_parser("summarize")
     summarize.add_argument("--output", required=True, type=Path)
     summarize.add_argument("--wall-clock-s", type=float)
+    summarize.add_argument("--require-all-successful", action="store_true")
     summarize.add_argument("results", nargs="+", type=Path)
 
     kv = sub.add_parser("extract-kv")
@@ -389,6 +403,11 @@ def main() -> None:
         result = summarize_results(args.results, args.wall_clock_s)
         args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(result["aggregate"], indent=2))
+        if args.require_all_successful:
+            try:
+                validate_all_requests_succeeded(result)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from None
         return
     if args.command == "summarize-matrix":
         result = summarize_matrix(args.matrix_tsv)

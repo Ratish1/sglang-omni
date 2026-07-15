@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from benchmarks.same_gpu_dp.summarize import (
     summarize_matrix,
     summarize_results,
     summarize_router_snapshot,
+    validate_all_requests_succeeded,
     validate_layout,
 )
 
@@ -285,6 +287,57 @@ def test_summarize_results_uses_shared_wall_clock(tmp_path: Path) -> None:
     assert result["measurement_wall_clock_s"] == 2.0
     assert result["audio_throughput_s_per_s"] == 2.0
     assert result["output_throughput_tok_s"] == 15.0
+
+
+def test_request_success_gate_rejects_failed_requests() -> None:
+    result = {
+        "aggregate": {
+            "total_requests": 10,
+            "completed_requests": 9,
+            "failed_requests": 1,
+        }
+    }
+
+    with pytest.raises(ValueError, match="completed 9/10 requests; failed requests: 1"):
+        validate_all_requests_succeeded(result)
+
+
+def test_summarize_cli_retains_summary_when_request_gate_fails(
+    tmp_path: Path,
+) -> None:
+    result_path = _write_result(tmp_path / "worker_0", 1.0, 1.0, 10)
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload["summary"].update(
+        total_requests=2,
+        completed_requests=1,
+        failed_requests=1,
+    )
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+    summary_path = tmp_path / "summary.json"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "benchmarks/same_gpu_dp/summarize.py",
+            "summarize",
+            "--require-all-successful",
+            "--output",
+            str(summary_path),
+            str(result_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "completed 1/2 requests; failed requests: 1" in completed.stderr
+    assert (
+        json.loads(summary_path.read_text(encoding="utf-8"))["aggregate"][
+            "failed_requests"
+        ]
+        == 1
+    )
 
 
 def test_summarize_router_snapshot_uses_actual_worker_counters(
