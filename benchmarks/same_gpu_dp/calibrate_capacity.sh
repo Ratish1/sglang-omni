@@ -194,10 +194,10 @@ evaluate_candidate() {
 
 IFS=',' read -r -a DPS <<< "$CALIBRATION_DPS"
 for dp in "${DPS[@]}"; do
-  [[ "$dp" =~ ^[2-6]$ ]] || {
-    echo "CALIBRATION_DPS entries must be between 2 and 6; got '$dp'" >&2
+  if [[ ! "$dp" =~ ^[1-9][0-9]*$ ]] || ((dp < 2 || dp > 10)); then
+    echo "CALIBRATION_DPS entries must be between 2 and 10; got '$dp'" >&2
     exit 2
-  }
+  fi
   server_var="DP${dp}_SERVER_CORE_SETS"
   client_var="DP${dp}_CLIENT_CORE_SETS"
   mem_var="DP${dp}_MEM_FRACTIONS"

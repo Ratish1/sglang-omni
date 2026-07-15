@@ -27,7 +27,7 @@ per-worker values and reject visibly skewed or sequential windows.
 - accepts only a GPU UUID (`GPU-...`) and exports it as
   `CUDA_VISIBLE_DEVICES`, so pipeline-local `cuda:0` consistently means that
   UUID and not a remapped physical ordinal;
-- validates DP 1–6 CPU lists, online CPUs, and overlap among every server,
+- validates DP 1–10 CPU lists, online CPUs, and overlap among every server,
   client, and optional router set, and requires all of them to belong to the
   selected NUMA node when Linux exposes its CPU list;
 - starts replicas sequentially and applies a bounded readiness timeout;
@@ -256,7 +256,7 @@ that concurrency 16 materially under-drove replicas whose generation cap was
 
 ## Run the fair DP × MPS matrix
 
-`run_matrix.sh` runs caller-selected DP 1–6 conditions and refuses layouts whose total
+`run_matrix.sh` runs caller-selected DP 1–10 conditions and refuses layouts whose total
 server or client CPU counts differ. Define dedicated subdivisions for each DP.
 This example uses 32 server CPUs and 16 client CPUs for every point:
 

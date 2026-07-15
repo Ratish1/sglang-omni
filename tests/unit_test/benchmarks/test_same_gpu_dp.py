@@ -210,6 +210,17 @@ def test_validate_layout_counts_fixed_budgets_and_router() -> None:
     assert result["client_cpu_count"] == 4
 
 
+def test_validate_layout_accepts_dp10() -> None:
+    result = validate_layout(
+        10,
+        [str(cpu) for cpu in range(10)],
+        [str(cpu) for cpu in range(10, 20)],
+    )
+
+    assert result["server_cpu_count"] == 10
+    assert result["client_cpu_count"] == 10
+
+
 def test_validate_layout_rejects_cpu_outside_numa_node() -> None:
     with pytest.raises(ValueError, match="outside the selected NUMA node"):
         validate_layout(

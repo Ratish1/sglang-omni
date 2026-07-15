@@ -57,3 +57,22 @@ def test_build_environment_rejects_unknown_key() -> None:
 def test_build_environment_rejects_unresolved_variable() -> None:
     with pytest.raises(ValueError, match="unresolved environment variable"):
         build_environment({"version": 1, "common": {"gpu_uuid": "${NOT_SET_FOR_TEST}"}})
+
+
+def test_build_environment_accepts_dp10_layout() -> None:
+    payload = {
+        "version": 1,
+        "layouts": {
+            10: {
+                "server_core_sets": [str(cpu) for cpu in range(10)],
+                "client_core_sets": [str(cpu) for cpu in range(10, 20)],
+                "mem_fractions": ["auto"] * 10,
+                "initial_cap_tokens": 30000,
+            }
+        },
+    }
+
+    env = build_environment(payload)
+
+    assert env["DP10_SERVER_CORE_SETS"] == ";".join(str(cpu) for cpu in range(10))
+    assert env["DP10_INITIAL_CAP_TOKENS"] == "30000"
