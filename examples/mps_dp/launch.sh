@@ -4,8 +4,8 @@
 # This is a tested example, not a production process supervisor.
 #
 # Usage:
-#   CONFIG=examples/mps_dp/configs/higgs_h100_dp3.yaml GPU_ID=0 N=3 \
-#     CORE_BLOCKS="0-9 10-19 20-29" \
+#   CONFIG=examples/mps_dp/configs/higgs_h100_dp4.yaml GPU_ID=0 N=4 \
+#     CORE_BLOCKS="0-5 6-11 12-17 18-23" \
 #     bash examples/mps_dp/launch.sh up
 #   MODEL=bosonai/higgs-tts-3-4b GPU_ID=0 N=3 MAX_TOTAL_TOKENS=100000 \
 #     CORE_BLOCKS="0-9 10-19 20-29" \

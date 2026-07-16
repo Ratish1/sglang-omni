@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Validated on one 80 GB H100 with three same-GPU Higgs replicas.
+# Candidate profile for validating four same-GPU Higgs replicas on one 80 GB H100.
 
 config_cls: HiggsTtsPipelineConfig
 name: higgs
@@ -14,6 +14,6 @@ stage_overrides:
 runtime_overrides:
   tts_engine:
     server_args_overrides:
-      max_total_tokens: 100000
+      max_total_tokens: 70000
       max_running_requests: 64
       cuda_graph_max_bs: 64
