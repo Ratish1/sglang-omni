@@ -31,7 +31,11 @@ from benchmarks.tts_serving.scenarios import (
     Scenario,
     scenario_set_hash,
 )
-from benchmarks.tts_serving.spec import BenchmarkSpec, redact_sensitive_metadata
+from benchmarks.tts_serving.spec import (
+    BenchmarkSpec,
+    redact_sensitive_metadata,
+    workload_spec_hash,
+)
 
 
 def build_results_report(
@@ -93,6 +97,7 @@ def build_results_report(
         "schema_version": 3,
         "scenario_schema_version": SCENARIO_SCHEMA_VERSION,
         "scenario_set_hash": scenario_set_hash(scenarios) if scenarios else None,
+        "workload_spec_hash": workload_spec_hash(spec),
         "harness_status": harness_status,
         "harness_error": harness_error,
         "overall": {
