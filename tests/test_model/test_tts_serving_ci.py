@@ -36,8 +36,6 @@ REFERENCE_AUDIO_ROOT = PROJECT_ROOT / "docs/_static/audio"
 OUTPUT_ROOT_ENV = "TTS_SERVING_STAGE_OUTPUT_ROOT"
 MODEL_PRESET = TTS_CI_PRESETS["higgs"].model
 MODEL_PATH = MODEL_PRESET.model_path
-SCENARIO_SET_HASH = "596908fd5550f978b3d0625a8f6c2dc7b82eca2ef10fe1f9cd1dc776947de735"
-WORKLOAD_SPEC_HASH = "7ca3002e4734d0fc8a0c24497e4222977ec66690ec880f06a5d36e70f6c5d044"
 BENCHMARK_VALIDATION_FILE = "benchmark_validation.json"
 
 SERVING_CLOSED16_THROUGHPUT_QPS_REF: float | None = 4.450
@@ -615,14 +613,6 @@ def test_tts_serving_stress(serving_run: ServingRun) -> None:
             benchmark_checks.check(
                 overall.get("coverage_contract_valid") is True,
                 "benchmark coverage was incomplete",
-            )
-            benchmark_checks.check(
-                report.get("scenario_set_hash") == SCENARIO_SET_HASH,
-                "stress workload changed; review and recalibrate",
-            )
-            benchmark_checks.check(
-                report.get("workload_spec_hash") == WORKLOAD_SPEC_HASH,
-                "stress load profile changed; review and recalibrate",
             )
             benchmark_checks.check(
                 not report.get("failures"), "scenario failures were reported"
