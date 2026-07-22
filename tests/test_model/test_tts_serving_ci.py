@@ -397,14 +397,11 @@ def serving_run(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ServingRun
     base_url = f"http://127.0.0.1:{port}"
     spec_path = _materialize_spec(run_dir, base_url)
     request_timeout_s = load_spec(spec_path).params.timeout_s
-    server_env = no_proxy_env()
-    server_env.update(
-        {
-            "PYTHONPATH": str(PROJECT_ROOT),
-            "SPEAKER_SAMPLES_DIR": str(speaker_dir),
-            "SPEAKER_MAX_UPLOADED": "1000",
-        }
-    )
+    server_env = {
+        "PYTHONPATH": str(PROJECT_ROOT),
+        "SPEAKER_SAMPLES_DIR": str(speaker_dir),
+        "SPEAKER_MAX_UPLOADED": "1000",
+    }
     command = [
         sys.executable,
         "-m",
@@ -426,6 +423,7 @@ def serving_run(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ServingRun
         timeout=MODEL_PRESET.startup_timeout,
         env=server_env,
         tee=True,
+        strip_proxy=True,
     )
     try:
         yield ServingRun(
