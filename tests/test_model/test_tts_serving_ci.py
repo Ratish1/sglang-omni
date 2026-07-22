@@ -37,6 +37,8 @@ OUTPUT_ROOT_ENV = "TTS_SERVING_STAGE_OUTPUT_ROOT"
 MODEL_PRESET = TTS_CI_PRESETS["higgs"].model
 MODEL_PATH = MODEL_PRESET.model_path
 BENCHMARK_VALIDATION_FILE = "benchmark_validation.json"
+BENCHMARK_TIMEOUT_S = 1800
+BENCHMARK_TIMEOUT_RETURNCODE = 124
 
 SERVING_CLOSED16_THROUGHPUT_QPS_REF: float | None = 4.450
 SERVING_CLOSED16_LATENCY_P95_S_REF: float | None = 12.446
@@ -449,15 +451,22 @@ def _run_benchmark(run: ServingRun) -> subprocess.CompletedProcess:
     ]
     started = time.perf_counter()
     with (run.run_dir / "benchmark.stdout.log").open("w", encoding="utf-8") as stdout:
-        completed = subprocess.run(
-            command,
-            cwd=PROJECT_ROOT,
-            env={**no_proxy_env(), "PYTHONPATH": str(PROJECT_ROOT)},
-            stdout=stdout,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=PROJECT_ROOT,
+                env={**no_proxy_env(), "PYTHONPATH": str(PROJECT_ROOT)},
+                stdout=stdout,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                timeout=BENCHMARK_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            stdout.write(f"\nbenchmark killed after {BENCHMARK_TIMEOUT_S}s timeout\n")
+            completed = subprocess.CompletedProcess(
+                command, returncode=BENCHMARK_TIMEOUT_RETURNCODE
+            )
     (run.run_dir / "benchmark.wall_time.json").write_text(
         json.dumps(
             {
