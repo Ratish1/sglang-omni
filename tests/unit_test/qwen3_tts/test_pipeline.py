@@ -1942,11 +1942,13 @@ def test_qwen3_tts_compile_backbone_compiles_every_layer(
 
     set_config_calls = []
     compiled = []
-    cuda_graph_runner = types.ModuleType("sglang.srt.model_executor.cuda_graph_runner")
+    cuda_graph_runner = types.ModuleType(
+        "sglang.srt.compilation.torch_compile_decoration"
+    )
     cuda_graph_runner.set_torch_compile_config = lambda: set_config_calls.append(True)
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.model_executor.cuda_graph_runner",
+        "sglang.srt.compilation.torch_compile_decoration",
         cuda_graph_runner,
     )
 
@@ -2013,7 +2015,7 @@ def test_qwen3_tts_engine_applies_compat_overrides_and_reenables_cuda_graph(
             self.server_args = server_args
             self.model = FakeModel()
 
-        def init_device_graphs(self) -> None:
+        def init_cuda_graphs(self) -> None:
             assert self.server_args.enable_torch_compile is False
             assert self.server_args.torch_compile_max_bs == 32
             init_graph_calls.append(True)

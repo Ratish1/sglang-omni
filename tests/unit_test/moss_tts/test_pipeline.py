@@ -170,13 +170,15 @@ def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
         gpu_id,
         *,
         model_arch_override=None,
+        defer_cuda_graph_capture=False,
     ):
         captured["gpu_id"] = gpu_id
         captured["model_arch_override"] = model_arch_override
+        captured["defer_cuda_graph_capture"] = defer_cuda_graph_capture
         model = object()
         model_runner = SimpleNamespace(
             model=model,
-            init_device_graphs=lambda: captured.setdefault("graph_inits", 0) or None,
+            init_cuda_graphs=lambda: captured.setdefault("graph_inits", 0) or None,
         )
         model_worker = SimpleNamespace(model_runner=model_runner)
         return (

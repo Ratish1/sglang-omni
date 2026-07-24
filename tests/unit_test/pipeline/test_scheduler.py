@@ -711,12 +711,13 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     monkeypatch.setattr(
         OmniScheduler, "_init_parallel_state", lambda self, _tp_worker: None
     )
-    monkeypatch.setattr(
-        OmniScheduler,
-        "init_metrics",
-        lambda self, *_args, **_kwargs: None,
-        raising=False,
-    )
+    for method_name in ("init_metrics_collector", "init_metrics_reporter"):
+        monkeypatch.setattr(
+            OmniScheduler,
+            method_name,
+            lambda self, *_args, **_kwargs: None,
+            raising=False,
+        )
     monkeypatch.setattr(
         "sglang.srt.server_args.get_global_server_args",
         lambda: SimpleNamespace(pp_max_micro_batch_size=None),

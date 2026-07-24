@@ -135,10 +135,10 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
         )
         model_runner = SimpleNamespace(model=model)
 
-        def init_device_graphs() -> None:
+        def init_cuda_graphs() -> None:
             init_graph_calls.append(True)
 
-        model_runner.init_device_graphs = init_device_graphs
+        model_runner.init_cuda_graphs = init_cuda_graphs
         return (
             SimpleNamespace(model_runner=model_runner),
             object(),

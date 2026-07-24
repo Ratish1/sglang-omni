@@ -83,7 +83,7 @@ def test_tts_engine_builder_phase_order_and_override_contract(monkeypatch) -> No
             self.server_args = server_args
             self.model = FakeModel()
 
-        def init_device_graphs(self) -> None:
+        def init_cuda_graphs(self) -> None:
             events.append("init_graphs")
             init_graph_calls.append(True)
 
@@ -118,7 +118,10 @@ def test_tts_engine_builder_phase_order_and_override_contract(monkeypatch) -> No
     ) -> tuple[Any, ...]:
         events.append("infrastructure")
         assert gpu_id == 2
-        assert kwargs == {"model_arch_override": "TestArch"}
+        assert kwargs == {
+            "defer_cuda_graph_capture": True,
+            "model_arch_override": "TestArch",
+        }
         infrastructure_saw_graph_disabled.append(bool(server_args.disable_cuda_graph))
         return (
             FakeWorker(server_args),

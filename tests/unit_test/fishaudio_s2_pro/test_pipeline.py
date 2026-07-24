@@ -534,10 +534,12 @@ def test_s2pro_compile_helper_targets_forward_kvcached(
     monkeypatch.setenv("HOME", "/tmp")
     stages = importlib.import_module("sglang_omni.models.fishaudio_s2_pro.stages")
 
-    fake_runner = ModuleType("sglang.srt.model_executor.cuda_graph_runner")
+    fake_runner = ModuleType("sglang.srt.compilation.torch_compile_decoration")
     fake_runner.set_torch_compile_config = lambda: None
     monkeypatch.setitem(
-        sys.modules, "sglang.srt.model_executor.cuda_graph_runner", fake_runner
+        sys.modules,
+        "sglang.srt.compilation.torch_compile_decoration",
+        fake_runner,
     )
 
     compile_calls: list[tuple[object, str | None, dict[str, object]]] = []
@@ -611,7 +613,7 @@ def _run_s2pro_engine_with_fake_buffers(
             self.server_args = server_args
             self.model = SimpleNamespace()
 
-        def init_device_graphs(self) -> None:
+        def init_cuda_graphs(self) -> None:
             assert self.server_args.enable_torch_compile is False
             assert self.server_args.torch_compile_max_bs == 64
             init_graph_calls.append(True)

@@ -1500,16 +1500,16 @@ def test_rollback_decode_prep_after_skip_is_noop_for_prefill_batches() -> None:
     assert freed == []
 
 
-def test_rollback_decode_prep_after_skip_rejects_seq_lens_sum_type_change() -> None:
+def test_rollback_decode_prep_after_skip_rejects_unknown_seq_lens_sum_type() -> None:
     class FakeForwardMode:
         @staticmethod
         def is_decode() -> bool:
             return True
 
-    batch = SimpleNamespace(forward_mode=FakeForwardMode(), seq_lens_sum=None)
+    batch = SimpleNamespace(forward_mode=FakeForwardMode(), seq_lens_sum=object())
     scheduler = object.__new__(QwenTalkerScheduler)
 
-    with pytest.raises(TypeError, match="seq_lens_sum is NoneType"):
+    with pytest.raises(TypeError, match="seq_lens_sum is object"):
         scheduler._rollback_decode_prep_after_skip(batch)
 
 
@@ -1564,7 +1564,7 @@ def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) ->
     )
 
     ScheduleBatch.prepare_for_decode(batch)
-    assert isinstance(batch.seq_lens_sum, int)
+    assert batch.seq_lens_sum is None
     assert int(req_to_token[2, 10]) == 123
 
     allocated = batch.out_cache_loc
@@ -1573,7 +1573,7 @@ def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) ->
     scheduler.token_to_kv_pool_allocator = SimpleNamespace(free=freed.append)
     scheduler._rollback_decode_prep_after_skip(batch)
 
-    assert batch.seq_lens_sum == 10
+    assert batch.seq_lens_sum is None
     assert torch.equal(batch.seq_lens, torch.tensor([10], dtype=torch.long))
     assert batch.out_cache_loc is None
     assert len(freed) == 1

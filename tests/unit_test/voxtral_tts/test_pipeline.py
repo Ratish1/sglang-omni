@@ -466,7 +466,7 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
             self.server_args = server_args
             self.model = FakeModel()
 
-        def init_device_graphs(self) -> None:
+        def init_cuda_graphs(self) -> None:
             assert self.server_args.enable_torch_compile is True
             assert self.server_args.torch_compile_max_bs == 16
             init_graph_calls.append(True)

@@ -135,7 +135,7 @@ def _stub_factory_env(monkeypatch: pytest.MonkeyPatch, *, want_cuda_graph: bool)
     from sglang_omni.models.moss_transcribe_diarize import stages
 
     calls = {
-        "init_device_graphs": 0,
+        "init_cuda_graphs": 0,
         "compile_encoder": [],
         "init_encoder_graphs": [],
     }
@@ -149,12 +149,10 @@ def _stub_factory_env(monkeypatch: pytest.MonkeyPatch, *, want_cuda_graph: bool)
         init_encoder_cache=lambda n: None,
     )
 
-    def _bump_init_device_graphs() -> None:
-        calls["init_device_graphs"] += 1
+    def _bump_init_cuda_graphs() -> None:
+        calls["init_cuda_graphs"] += 1
 
-    model_runner = SimpleNamespace(
-        model=model, init_device_graphs=_bump_init_device_graphs
-    )
+    model_runner = SimpleNamespace(model=model, init_cuda_graphs=_bump_init_cuda_graphs)
     model_worker = SimpleNamespace(model_runner=model_runner)
     infra = (want_cuda_graph, (model_worker, None, None, None, None, None, None))
 
@@ -205,7 +203,7 @@ def test_factory_compiles_encoder_and_skips_cuda_graph_when_flag_on(
 
     assert len(calls["compile_encoder"]) == 1
     assert calls["init_encoder_graphs"] == []
-    assert calls["init_device_graphs"] == 1
+    assert calls["init_cuda_graphs"] == 1
 
 
 def _repo_not_found(url: str) -> RepositoryNotFoundError:

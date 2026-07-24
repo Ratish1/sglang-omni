@@ -621,6 +621,7 @@ def test_qwen_builder_omits_mem_fraction_static_by_default() -> None:
     assert server_args.context_length == 8192
     assert server_args.tp_size == 2
     assert server_args.random_seed == 777
+    assert server_args.cuda_graph_backend_prefill == "disabled"
 
 
 def test_qwen_builder_forwards_explicit_mem_fraction_static() -> None:
@@ -786,7 +787,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     class FakeModelRunner:
         model = object()
 
-        def init_device_graphs(self) -> None:
+        def init_cuda_graphs(self) -> None:
             nonlocal init_graph_calls
             init_graph_calls += 1
             assert server_args.disable_cuda_graph is False
