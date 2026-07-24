@@ -6,6 +6,25 @@ from typing import Any
 
 from sglang.srt.server_args import ServerArgs
 
+_DECODE_CUDA_GRAPH_ALIASES = {
+    "cuda_graph_max_bs": "cuda_graph_max_bs_decode",
+    "cuda_graph_bs": "cuda_graph_bs_decode",
+}
+
+
+def _normalize_decode_cuda_graph_overrides(kwargs: dict[str, Any]) -> None:
+    """Translate Omni's legacy public knobs to SGLang 0.5.15 decode fields."""
+    for legacy_name, decode_name in _DECODE_CUDA_GRAPH_ALIASES.items():
+        if legacy_name not in kwargs:
+            continue
+        legacy_value = kwargs.pop(legacy_name)
+        if decode_name in kwargs and kwargs[decode_name] != legacy_value:
+            raise ValueError(
+                f"Conflicting {legacy_name} and {decode_name} values: "
+                f"{legacy_value!r} != {kwargs[decode_name]!r}"
+            )
+        kwargs[decode_name] = legacy_value
+
 
 def build_sglang_server_args(
     model_path: str,
@@ -32,6 +51,7 @@ def build_sglang_server_args(
     if mem_fraction_static is not None:
         kwargs["mem_fraction_static"] = mem_fraction_static
     kwargs.update(overrides)
+    _normalize_decode_cuda_graph_overrides(kwargs)
     # SGLang 0.5.15 enables a phase-specific prefill CUDA graph by default.
     # Omni models only support the existing decode graph path for now.
     kwargs["cuda_graph_backend_prefill"] = "disabled"

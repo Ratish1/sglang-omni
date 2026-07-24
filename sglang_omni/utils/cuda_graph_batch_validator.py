@@ -8,6 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from sglang_omni.scheduling.generation_batch_policy import get_decode_cuda_graph_max_bs
+
 logger = logging.getLogger(__name__)
 
 
@@ -273,7 +275,7 @@ def validate_stage(
     try:
         server_args = model_runner.server_args
         max_running_requests = server_args.max_running_requests
-        cuda_graph_max_bs = server_args.cuda_graph_max_bs
+        cuda_graph_max_bs = get_decode_cuda_graph_max_bs(server_args)
     except AttributeError:
         server_args = None
         max_running_requests = None

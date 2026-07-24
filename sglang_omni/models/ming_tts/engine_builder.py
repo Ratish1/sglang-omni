@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+from sglang_omni.scheduling.generation_batch_policy import get_decode_cuda_graph_bs
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
             self.tp_size,
             self.total_gpu_memory_fraction,
             bool(getattr(server_args, "disable_cuda_graph", False)),
-            getattr(server_args, "cuda_graph_bs", None),
+            get_decode_cuda_graph_bs(server_args),
             not bool(getattr(server_args, "disable_radix_cache", True)),
             self.nccl_port,
         )

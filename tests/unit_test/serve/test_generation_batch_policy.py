@@ -10,6 +10,8 @@ import pytest
 from sglang_omni.scheduling.generation_batch_policy import (
     build_default_cuda_graph_bs,
     build_generation_batch_overrides,
+    get_decode_cuda_graph_bs,
+    get_decode_cuda_graph_max_bs,
     validate_generation_batch_policy,
 )
 
@@ -45,6 +47,31 @@ def test_default_cuda_graph_bs_matches_sglang_normal_buckets() -> None:
         56,
         64,
     ]
+
+
+def test_decode_cuda_graph_accessors_prefer_resolved_phase_config() -> None:
+    server_args = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(
+            decode=SimpleNamespace(max_bs=32, bs=[1, 4, 32])
+        ),
+        cuda_graph_max_bs_decode=16,
+        cuda_graph_bs_decode=[1, 16],
+        cuda_graph_max_bs=8,
+        cuda_graph_bs=[1, 8],
+    )
+
+    assert get_decode_cuda_graph_max_bs(server_args) == 32
+    assert get_decode_cuda_graph_bs(server_args) == [1, 4, 32]
+
+
+def test_decode_cuda_graph_accessors_read_unresolved_0515_fields() -> None:
+    server_args = SimpleNamespace(
+        cuda_graph_max_bs_decode=16,
+        cuda_graph_bs_decode=[1, 2, 4, 8, 12, 16],
+    )
+
+    assert get_decode_cuda_graph_max_bs(server_args) == 16
+    assert get_decode_cuda_graph_bs(server_args) == [1, 2, 4, 8, 12, 16]
 
 
 def test_build_generation_batch_overrides_tie_batch_knobs() -> None:

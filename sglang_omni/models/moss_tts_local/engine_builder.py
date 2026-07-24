@@ -109,11 +109,15 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
         self.model = model_worker.model_runner.model
 
     def post_cuda_graph_setup(self, model: Any, server_args: Any) -> None:
+        from sglang_omni.scheduling.generation_batch_policy import (
+            get_decode_cuda_graph_bs,
+        )
+
         # note (luojiaxuan): Also graph the per-frame local-transformer decode
         # (1 + n_vq micro-steps and 13 seeded sampling passes per frame):
         # eager it is kernel-launch-bound at ~22 ms/frame independent of batch
         # size.
-        model.init_frame_decode_graphs(list(server_args.cuda_graph_bs))
+        model.init_frame_decode_graphs(list(get_decode_cuda_graph_bs(server_args)))
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         model_runner_mod = importlib.import_module(

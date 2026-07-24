@@ -778,11 +778,15 @@ class MingTTSSGLangModel(nn.Module):
         except (AssertionError, RuntimeError):
             server_args = None
         if server_args is not None:
+            from sglang_omni.scheduling.generation_batch_policy import (
+                get_decode_cuda_graph_max_bs,
+            )
+
             max_batch_size = int(server_args.max_running_requests)
             if not bool(getattr(server_args, "disable_cuda_graph", True)):
                 max_batch_size = max(
                     max_batch_size,
-                    int(getattr(server_args, "cuda_graph_max_bs", 1) or 1),
+                    int(get_decode_cuda_graph_max_bs(server_args) or 1),
                 )
         tail_attn_backend = MING_TTS_TAIL_ATTN_BACKEND
 

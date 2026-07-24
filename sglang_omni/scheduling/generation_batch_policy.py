@@ -9,6 +9,32 @@ from typing import Any
 _MISSING = object()
 
 
+def get_decode_cuda_graph_max_bs(server_args: Any) -> Any:
+    """Read the resolved SGLang 0.5.15 decode CUDA Graph batch cap."""
+    config = getattr(server_args, "cuda_graph_config", None)
+    decode = getattr(config, "decode", None)
+    value = getattr(decode, "max_bs", None)
+    if value is not None:
+        return value
+    value = getattr(server_args, "cuda_graph_max_bs_decode", None)
+    if value is not None:
+        return value
+    return getattr(server_args, "cuda_graph_max_bs", None)
+
+
+def get_decode_cuda_graph_bs(server_args: Any) -> Any:
+    """Read the resolved SGLang 0.5.15 decode CUDA Graph batch buckets."""
+    config = getattr(server_args, "cuda_graph_config", None)
+    decode = getattr(config, "decode", None)
+    value = getattr(decode, "bs", None)
+    if value is not None:
+        return value
+    value = getattr(server_args, "cuda_graph_bs_decode", None)
+    if value is not None:
+        return value
+    return getattr(server_args, "cuda_graph_bs", None)
+
+
 def build_default_cuda_graph_bs(max_bs: int) -> list[int]:
     max_bs = int(max_bs)
     if max_bs < 1:
@@ -88,11 +114,11 @@ def validate_generation_batch_policy(
     if cuda_graph_enabled:
         cuda_graph_max_bs = _validate_positive_int(
             "cuda_graph_max_bs",
-            server_args.cuda_graph_max_bs,
+            get_decode_cuda_graph_max_bs(server_args),
             errors,
             required=True,
         )
-        cuda_graph_bs_value = server_args.cuda_graph_bs
+        cuda_graph_bs_value = get_decode_cuda_graph_bs(server_args)
         if cuda_graph_bs_value is None:
             errors.append("cuda_graph_bs must be explicit when CUDA graph is enabled")
         else:

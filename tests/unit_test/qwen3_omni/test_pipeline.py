@@ -624,6 +624,29 @@ def test_qwen_builder_omits_mem_fraction_static_by_default() -> None:
     assert server_args.cuda_graph_backend_prefill == "disabled"
 
 
+def test_qwen_builder_maps_legacy_cuda_graph_knobs_to_decode() -> None:
+    server_args = build_sglang_server_args(
+        "dummy",
+        context_length=8192,
+        cuda_graph_max_bs=16,
+        cuda_graph_bs=[1, 2, 4, 8, 12, 16],
+    )
+
+    assert server_args.cuda_graph_max_bs_decode == 16
+    assert server_args.cuda_graph_bs_decode == [1, 2, 4, 8, 12, 16]
+    assert server_args.cuda_graph_backend_prefill == "disabled"
+
+
+def test_qwen_builder_rejects_conflicting_decode_cuda_graph_knobs() -> None:
+    with pytest.raises(ValueError, match="Conflicting cuda_graph_max_bs"):
+        build_sglang_server_args(
+            "dummy",
+            context_length=8192,
+            cuda_graph_max_bs=16,
+            cuda_graph_max_bs_decode=32,
+        )
+
+
 def test_qwen_builder_forwards_explicit_mem_fraction_static() -> None:
     server_args = build_sglang_server_args(
         "dummy",
