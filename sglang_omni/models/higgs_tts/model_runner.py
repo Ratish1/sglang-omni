@@ -124,10 +124,26 @@ class HiggsTTSModelRunner(ModelRunner):
         # this only feeds the upstream bookkeeping. clamp>=0 keeps STOP_CODE(-1)
         # rows in embed_tokens range; the host collect later overwrites with the
         # skip-aware cb0 for output reporting.
-        result.next_token_ids = (
-            self.model._cg_codes_BN[:n_real, 0].clamp_min(0).to(torch.long).clone()
+        result.next_token_ids = self.next_input_token_ids(
+            result, forward_batch, requests
         )
         return host_buf, logprob_host
+
+    def next_input_token_ids(self, result, forward_batch, requests):
+        """Return Higgs' device-native cb0 rail for the next decode step.
+
+        Reporting tokens are reconstructed from the combined CPU collect, but
+        the autoregressive input already exists in the CUDA-graph output. Keep
+        those two contracts separate so sync execution does not perform an
+        H2D followed by two D2H copies for the same eight integers.
+        """
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        if forward_mode is not None and not forward_mode.is_decode():
+            return super().next_input_token_ids(result, forward_batch, requests)
+        n_real = len(requests)
+        if n_real == 0:
+            return None
+        return self.model._cg_codes_BN[:n_real, 0].clamp_min(0).to(torch.long)
 
     def post_decode_resolve(
         self, host_buf, result, forward_batch, schedule_batch, requests
@@ -259,9 +275,7 @@ class HiggsTTSModelRunner(ModelRunner):
             top_ps.append(float(getattr(params, "top_p", 1.0)))
             top_k = getattr(params, "top_k", None)
             top_ks.append(
-                int(top_k)
-                if top_k is not None and 0 < int(top_k) < K_MAX
-                else None
+                int(top_k) if top_k is not None and 0 < int(top_k) < K_MAX else None
             )
         return temps, top_ps, top_ks
 
@@ -292,7 +306,7 @@ class HiggsTTSModelRunner(ModelRunner):
             logprobs_cpu,
             result,
             requests,
-            next_token_device=result.logits_output.next_token_logits.device,
+            next_token_device=None,
         )
 
     def _decode_pack_gpu(self, n_real: int) -> torch.Tensor:

@@ -21,6 +21,7 @@ import types
 from array import array
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
@@ -362,6 +363,23 @@ class OmniScheduler:
         self.dllm_config = None
         self.dllm_staging_reqs = DllmStagingReqs(dllm_config=None)
         self.draft_worker = None
+        self._execution_bridge = None
+        if model_runner is not None:
+            from sglang_omni.model_runner.sglang_execution import (
+                SGLangExecutionBridge,
+            )
+
+            self._execution_bridge = SGLangExecutionBridge(
+                device=torch.device(self.device),
+                worker=tp_worker,
+                req_to_token_pool=req_to_token_pool,
+                spec_algorithm=self.spec_algorithm,
+                enable_stream_overlap=(enable_async_decode or enable_overlap),
+            )
+            # Keep the upstream attribute available to delegated scheduler
+            # methods, but make the custom ModelRunner the sole owner of relay.
+            self.future_map = self._execution_bridge.future_map
+            model_runner.bind_execution_bridge(self._execution_bridge)
 
         # Subsystem stubs
         self.watchdog = None
@@ -1135,13 +1153,17 @@ class OmniScheduler:
 
     @staticmethod
     def _make_batch_result(batch, mr_output):
-        # process_batch_result reads .next_token_ids / .logits_output; the
-        # model runner already set batch.output_ids during execute/resolve.
+        # process_batch_result reads reporting tokens. The next-forward GPU
+        # token rail is independently published through FutureMap.
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
-        next_token_ids = batch.output_ids
-        if isinstance(next_token_ids, torch.Tensor):
-            batch.input_ids = next_token_ids.to(torch.int64)
+        next_token_ids = getattr(mr_output, "next_token_ids", None)
+        if next_token_ids is None:
+            # Compatibility for third-party custom runners which still publish
+            # the pre-0.5.15 ScheduleBatch side channel.
+            next_token_ids = getattr(batch, "output_ids", None)
+            if isinstance(next_token_ids, torch.Tensor):
+                batch.input_ids = next_token_ids.to(torch.int64)
         return GenerationBatchResult(
             logits_output=None,
             next_token_ids=next_token_ids,
@@ -1178,7 +1200,7 @@ class OmniScheduler:
         self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
         return GenerationBatchResult(
             logits_output=None,
-            next_token_ids=pending_step.batch_result.next_token_ids,
+            next_token_ids=mr_output.next_token_ids,
             can_run_cuda_graph=mr_output.can_run_cuda_graph,
         )
 
@@ -1301,12 +1323,17 @@ class OmniScheduler:
         self._scheduler_thread_id = threading.get_ident()
         self._running = True
         try:
-            if getattr(self, "enable_async_decode", False):
-                self._event_loop_async_decode()
-            elif self.enable_overlap:
-                self._event_loop_overlap()
-            else:
-                self._event_loop_normal()
+            bridge = self.__dict__.get("_execution_bridge")
+            loop_context = (
+                bridge.loop_context() if bridge is not None else nullcontext()
+            )
+            with loop_context:
+                if getattr(self, "enable_async_decode", False):
+                    self._event_loop_async_decode()
+                elif self.enable_overlap:
+                    self._event_loop_overlap()
+                else:
+                    self._event_loop_normal()
         finally:
             self._scheduler_thread_id = None
             try:
@@ -1911,6 +1938,9 @@ class OmniScheduler:
                 time.sleep(0.001)
                 continue
 
+            bridge = self.__dict__.get("_execution_bridge")
+            if bridge is not None:
+                bridge.before_schedule()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
@@ -2091,6 +2121,9 @@ class OmniScheduler:
             ):
                 self._resolve_pending_async()
 
+            bridge = self.__dict__.get("_execution_bridge")
+            if bridge is not None:
+                bridge.before_schedule()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 

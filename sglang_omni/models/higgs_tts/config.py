@@ -64,6 +64,8 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                 "device": "cuda",
                 "max_new_tokens": 2048,
                 "enable_async_decode": True,
+                "prefill_coalesce_requests": 2,
+                "prefill_coalesce_wait_ms": 10.0,
             },
             gpu=0,
             runtime=StageRuntimeConfig(
@@ -74,9 +76,12 @@ class HiggsTtsPipelineConfig(PipelineConfig):
         ),
         StageConfig(
             name="vocoder",
-            process="vocoder",
+            # Keep the LM and vocoder in one CUDA context by default.  Splitting
+            # them into same-GPU processes time-slices the H100 at ordinary
+            # serving concurrency and prevents decode/vocoder overlap.
+            process="pipeline",
             factory=f"{_PKG}.stages.create_vocoder_executor",
-            factory_args={"device": "cuda", "compile_decode": True},
+            factory_args={"device": "cuda", "compile_decode": False},
             gpu=0,
             runtime=StageRuntimeConfig(
                 resources=StageResourceConfig(total_gpu_memory_fraction=0.10)
