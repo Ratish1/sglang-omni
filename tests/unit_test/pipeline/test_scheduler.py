@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from array import array
 from collections import deque
 from queue import Queue
 from types import SimpleNamespace
@@ -116,6 +117,24 @@ def test_threaded_simple_scheduler_reports_worker_errors() -> None:
     assert outputs[0].request_id == "req-err"
     assert outputs[0].type == "error"
     assert isinstance(outputs[0].data, RuntimeError)
+
+
+def test_sched_output_restores_legacy_req_extend_input_len() -> None:
+    reqs = [
+        SimpleNamespace(rid="a", _omni_data=object(), extend_input_len=99),
+        SimpleNamespace(rid="b", _omni_data=object()),
+    ]
+    batch = SimpleNamespace(
+        reqs=reqs,
+        extend_lens=[3, 7],
+        forward_mode=SimpleNamespace(is_extend=lambda: True),
+    )
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+
+    output = scheduler._build_sched_output(batch)
+
+    assert output.batch_data is batch
+    assert [req.extend_input_len for req in reqs] == [3, 7]
 
 
 def test_omni_scheduler_default_stream_chunk_buffers_raw_chunks() -> None:
@@ -706,6 +725,24 @@ def test_omni_scheduler_distinguishes_queue_enter_from_prefill_start(
     assert names.index("scheduler_queue_enter") < names.index("scheduler_prefill_start")
 
 
+def test_omni_scheduler_normalizes_req_token_arrays_for_sglang_0515() -> None:
+    origin = [1, 2, 3]
+    req = SimpleNamespace(
+        origin_input_ids=origin,
+        origin_input_ids_unpadded=origin,
+    )
+
+    OmniScheduler._normalize_req_token_arrays(req)
+
+    assert isinstance(req.origin_input_ids, array)
+    assert req.origin_input_ids.tolist() == origin
+    assert req.origin_input_ids_unpadded is req.origin_input_ids
+    assert req.is_chunked == 0
+
+    OmniScheduler._normalize_req_token_arrays(req)
+    assert req.origin_input_ids.tolist() == origin
+
+
 def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     """Upstream requeue helpers read max_queued_requests on OmniScheduler."""
     monkeypatch.setattr(
@@ -760,6 +797,12 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
         model_config=SimpleNamespace(),
     )
 
+    assert scheduler._pending_chunked_abort_req is None
+    assert scheduler.new_token_ratio_tracker.current == scheduler.new_token_ratio
+    assert scheduler.dp_attn_adapter is not None
+    assert scheduler.pool_stats_observer is not None
+    assert scheduler.load_inquirer is not None
+    assert scheduler.min_free_slots_delayer is None
     assert scheduler.max_queued_requests == 7
     assert scheduler._abort_on_queued_limit(object()) is False
 

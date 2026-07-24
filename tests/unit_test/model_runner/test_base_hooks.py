@@ -54,12 +54,14 @@ class _ForwardMode:
 
 
 def _scheduler_output(*, is_prefill: bool):
-    model_worker_batch = SimpleNamespace(marker="worker-batch")
     schedule_batch = SimpleNamespace(
         forward_mode=_ForwardMode(is_prefill=is_prefill),
         is_prefill_only=False,
         output_ids=None,
-        get_model_worker_batch=lambda: model_worker_batch,
+        capture_hidden_mode=None,
+        marker="worker-batch",
+        prefill_input_ids_cpu=None,
+        mix_running_indices=None,
     )
     request_data = SimpleNamespace(generation_steps=0, extra_model_outputs={})
     request = SimpleNamespace(request_id="req-1", data=request_data)
@@ -124,6 +126,24 @@ def _runner(calls: list[str], *, custom_result):
         forward_batch_generation=standard_forward,
     )
     return runner
+
+
+def test_build_forward_batch_materializes_deferred_prefill_input_ids(monkeypatch):
+    _install_fake_forward_batch_module(monkeypatch)
+    runner = _runner([], custom_result=None)
+    scheduler_output = _scheduler_output(is_prefill=True)
+    staged = torch.tensor([11, 12], dtype=torch.long)
+    scheduler_output.batch_data.input_ids = None
+    scheduler_output.batch_data.prefill_input_ids_cpu = staged
+
+    built = runner._build_forward_batch(scheduler_output)
+
+    assert built is not None
+    forward_batch, schedule_batch, _, is_prefill = built
+    assert is_prefill is True
+    assert schedule_batch.prefill_input_ids_cpu is None
+    assert torch.equal(schedule_batch.input_ids, staged)
+    assert forward_batch.marker == "worker-batch"
 
 
 @pytest.mark.parametrize(

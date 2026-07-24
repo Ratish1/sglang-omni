@@ -42,7 +42,10 @@ class _StubRunner(ModelRunner):
         self.last_skip_rids = None
 
     def _build_forward_batch(self, scheduler_output):
-        sb = types.SimpleNamespace(is_prefill_only=False, output_ids=None)
+        sb = types.SimpleNamespace(
+            is_prefill_only=False, output_ids=None, input_ids=None
+        )
+        self.last_schedule_batch = sb
         return types.SimpleNamespace(), sb, types.SimpleNamespace(), False  # decode
 
     def _prepare_and_forward(
@@ -56,7 +59,7 @@ class _StubRunner(ModelRunner):
     ):
         self.last_prepare_is_lookahead = is_lookahead
         return types.SimpleNamespace(
-            next_token_ids=object(),
+            next_token_ids=torch.tensor([17], dtype=torch.long),
             logits_output=types.SimpleNamespace(next_token_logits=None),
             can_run_cuda_graph=False,
         )
@@ -128,6 +131,8 @@ def test_launch_returns_handle_resolve_consumes_it():
     assert (r.launch_calls, r.resolve_calls, r.finalize_calls) == (1, 1, 1)
     assert (r._async_query_hit, r._async_query_miss) == (1, 0)
     assert r.last_prepare_is_lookahead is True
+    assert torch.equal(r.last_schedule_batch.input_ids, torch.tensor([17]))
+    assert r.last_schedule_batch.input_ids is r.last_schedule_batch.output_ids
     # resolve must NOT re-publish output_ids: under launch-first it runs one
     # step behind on the LIVE running batch, whose output_ids the current launch
     # already set at the right length. Re-stamping the lagged step's tokens

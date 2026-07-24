@@ -41,6 +41,28 @@ def _rank_shared_unseeded_sampling_seed(request: SchedulerRequest, row_idx: int)
     return derive_sampling_seed("sglang-omni-unseeded-row", request_id)
 
 
+def resolve_deferred_prefill_inputs(schedule_batch: Any, device: torch.device) -> None:
+    """Materialize the pinned prefill token staging introduced by SGLang 0.5.15.
+
+    ``ScheduleBatch.prepare_for_extend`` now leaves ``input_ids`` unset and
+    stores the flattened tokens in ``prefill_input_ids_cpu``. Upstream's
+    Scheduler resolves that staging immediately before the worker forward; Omni
+    uses its own model-runner bridge, so it must perform the same boundary step.
+    """
+    staged_input_ids = getattr(schedule_batch, "prefill_input_ids_cpu", None)
+    if staged_input_ids is None:
+        return
+
+    if getattr(schedule_batch, "mix_running_indices", None) is not None:
+        raise RuntimeError(
+            "Omni does not support SGLang mixed chunked-prefill batches with "
+            "deferred decode tokens"
+        )
+
+    schedule_batch.input_ids = staged_input_ids.to(device, non_blocking=True)
+    schedule_batch.prefill_input_ids_cpu = None
+
+
 @dataclass
 class _PendingStep:
     """One decode step launched on the GPU but not yet consumed on the host.
@@ -198,6 +220,11 @@ class ModelRunner:
         # under lookahead the host collect (resolve) lags by one step.
         if batch_result.next_token_ids is not None:
             schedule_batch.output_ids = batch_result.next_token_ids
+            # SGLang 0.5.15's prepare_for_decode no longer rebuilds input_ids
+            # from output_ids; run_batch must publish both. Without this the
+            # lookahead path repeatedly feeds the previous token.
+            if isinstance(batch_result.next_token_ids, torch.Tensor):
+                schedule_batch.input_ids = batch_result.next_token_ids.to(torch.int64)
         event = torch.cuda.Event()
         # Recorded after post_decode_launch publishes this step, so
         # event.query()==True means the launched step's GPU work is done and
@@ -270,7 +297,7 @@ class ModelRunner:
         if schedule_batch is None:
             return None
 
-        model_worker_batch = schedule_batch.get_model_worker_batch()
+        model_worker_batch = schedule_batch
         is_prefill = bool(schedule_batch.forward_mode.is_extend())
 
         capture_hidden_mode = (
@@ -287,8 +314,9 @@ class ModelRunner:
         elif self.output_processor._capture_hidden:
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
+        resolve_deferred_prefill_inputs(schedule_batch, self.device)
         forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.tp_worker.model_runner
+            schedule_batch, self.tp_worker.model_runner
         )
         return forward_batch, schedule_batch, model_worker_batch, is_prefill
 
