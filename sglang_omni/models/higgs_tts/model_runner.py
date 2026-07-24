@@ -88,10 +88,9 @@ class HiggsTTSModelRunner(ModelRunner):
         prefill_runner = getattr(
             self.tp_worker.model_runner, "prefill_cuda_graph_runner", None
         )
-        if (
-            isinstance(prefill_runner, PrefillCudaGraphRunner)
-            and prefill_runner.can_run_graph(forward_batch)
-        ):
+        if isinstance(
+            prefill_runner, PrefillCudaGraphRunner
+        ) and prefill_runner.can_run_graph(forward_batch):
             raw_num_tokens = input_embeds.shape[0]
             capture_num_tokens = tuple(
                 sorted(int(size) for size in prefill_runner.capture_num_tokens)

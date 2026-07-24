@@ -365,9 +365,7 @@ class OmniScheduler:
         self.draft_worker = None
         self._execution_bridge = None
         if model_runner is not None:
-            from sglang_omni.model_runner.sglang_execution import (
-                SGLangExecutionBridge,
-            )
+            from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
 
             self._execution_bridge = SGLangExecutionBridge(
                 device=torch.device(self.device),

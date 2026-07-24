@@ -379,9 +379,8 @@ class HiggsAudioCodec:
             audio = self.model.decode(
                 codes_BNT.to(device=self.device, dtype=torch.long)
             ).audio_values
-        total_graph_lookups = (
-            getattr(self, "_decode_cuda_graph_hits", 0)
-            + getattr(self, "_decode_cuda_graph_misses", 0)
+        total_graph_lookups = getattr(self, "_decode_cuda_graph_hits", 0) + getattr(
+            self, "_decode_cuda_graph_misses", 0
         )
         if decode_graphs and total_graph_lookups % 1024 == 0:
             logger.info(

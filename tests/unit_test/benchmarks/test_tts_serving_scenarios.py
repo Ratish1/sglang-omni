@@ -23,9 +23,7 @@ def test_batch_performance_scenario_seeds_every_item() -> None:
     )
 
     scenario = next(
-        item
-        for item in build_scenarios(spec)
-        if item.workload == "batch_32_all_valid"
+        item for item in build_scenarios(spec) if item.workload == "batch_32_all_valid"
     )
     seeds = [item["seed"] for item in scenario.payload["items"]]
 

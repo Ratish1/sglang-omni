@@ -90,9 +90,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
                     "backend": "full",
                     "max_bs": 512,
                     "bs": list(range(64, 513, 64)),
-                    "full_prefill_max_req": max(
-                        int(self.prefill_coalesce_requests), 1
-                    ),
+                    "full_prefill_max_req": max(int(self.prefill_coalesce_requests), 1),
                 }
             },
             "mem_fraction_static": (
@@ -167,7 +165,9 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
             return
         runner = self._prefill_graph_model_runner
         prefill_runner = (
-            None if runner is None else getattr(runner, "prefill_cuda_graph_runner", None)
+            None
+            if runner is None
+            else getattr(runner, "prefill_cuda_graph_runner", None)
         )
         if not isinstance(prefill_runner, PrefillCudaGraphRunner):
             raise RuntimeError(

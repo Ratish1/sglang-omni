@@ -13,8 +13,8 @@ import typer
 
 from sglang_omni.cli.serve import apply_mem_fraction_cli_overrides
 from sglang_omni.config.runtime import resolve_stage_static_factory_args
-from sglang_omni.models.higgs_tts import stages
 from sglang_omni.models.higgs_tts import model as higgs_model
+from sglang_omni.models.higgs_tts import stages
 from sglang_omni.models.higgs_tts import utils as higgs_utils
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 from sglang_omni.models.higgs_tts.model import HiggsTTSModel
@@ -117,15 +117,11 @@ def test_higgs_prefill_embeddings_follow_graph_padding_contract(
         model_runner=SimpleNamespace(prefill_cuda_graph_runner=prefill_runner)
     )
     raw_embeds = torch.arange(134 * 4, dtype=torch.float32).view(134, 4)
-    runner._build_prefill_input_embeds = (
-        lambda _forward_batch, _requests: raw_embeds
-    )
+    runner._build_prefill_input_embeds = lambda _forward_batch, _requests: raw_embeds
     request = SimpleNamespace(
         request_id="request",
         data=SimpleNamespace(
-            req=SimpleNamespace(
-                sampling_params=SimpleNamespace(sampling_seed=17)
-            )
+            req=SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=17))
         ),
     )
     forward_batch = SimpleNamespace(input_embeds=raw_embeds)
@@ -245,9 +241,7 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
 
         def init_cuda_graphs() -> None:
             init_graph_calls.append(True)
-            prefill_runner = object.__new__(
-                engine_builder_mod.PrefillCudaGraphRunner
-            )
+            prefill_runner = object.__new__(engine_builder_mod.PrefillCudaGraphRunner)
             prefill_runner._is_full_backend = True
             prefill_runner.capture_num_tokens = list(range(64, 513, 64))
             model_runner.prefill_cuda_graph_runner = prefill_runner
