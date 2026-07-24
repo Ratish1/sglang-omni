@@ -91,7 +91,7 @@ class TtsEngineBuilder(ABC):
         self.compile_model(model, server_args)
 
         if want_cuda_graph:
-            model_worker.model_runner.init_device_graphs()
+            model_worker.model_runner.init_cuda_graphs()
             self.post_cuda_graph_setup(model, server_args)
 
         output_proc = sglang_backend.SGLangOutputProcessor(

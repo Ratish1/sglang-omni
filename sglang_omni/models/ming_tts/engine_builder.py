@@ -161,7 +161,7 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
         if self.tp_rank != 0:
             return
         model.init_tail_graphs(
-            list(self._model_worker.model_runner.graph_runner.capture_bs)
+            list(self._model_worker.model_runner.decode_cuda_graph_runner.capture_bs)
         )
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:

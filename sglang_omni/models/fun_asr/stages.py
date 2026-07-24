@@ -122,7 +122,7 @@ def create_sglang_fun_asr_executor(
     )
 
     if want_cuda_graph:
-        model_worker.model_runner.init_device_graphs()
+        model_worker.model_runner.init_cuda_graphs()
 
     init_mm_embedding_cache(mm_embedding_cache_size_bytes)
 

@@ -230,7 +230,7 @@ class DllmScheduler:
         for req, req_token_ids in zip(batch.reqs, token_ids_per_req):
             for token_id in req_token_ids:
                 req.output_ids.append(int(token_id))
-                req.check_finished()
+                req.update_finish_state()
                 if req.finished():
                     break
 

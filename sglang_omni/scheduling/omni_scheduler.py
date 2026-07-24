@@ -181,9 +181,13 @@ class OmniScheduler:
         self.pp_rank = 0
         self.pp_size = server_args.pp_size
         self.dp_rank = None
-        self.dp_size = 1
+        self.dp_size = getattr(server_args, "dp_size", 1)
         self.moe_ep_rank = 0
         self.moe_ep_size = 1
+        self.moe_dp_rank = None
+        self.moe_dp_size = getattr(server_args, "moe_dp_size", 1)
+        self.attn_cp_rank = 0
+        self.attn_cp_size = getattr(server_args, "attn_cp_size", 1)
         self.page_size = server_args.page_size
         self.enable_overlap = enable_overlap
         # One-step-lookahead async decode (single stream + CUDA event). Only
@@ -387,7 +391,8 @@ class OmniScheduler:
         self.send_to_detokenizer = _NoOpSender()
 
         self._init_parallel_state(tp_worker)
-        self.init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
+        self.init_metrics_collector(self.tp_rank, self.pp_rank, self.dp_rank)
+        self.init_metrics_reporter(self.tp_rank, self.pp_rank, self.dp_rank)
 
         self._running = False
         self._aborted_request_ids: set[str] = set()
@@ -417,6 +422,15 @@ class OmniScheduler:
         # feature, so a stub with an empty sessions dict is sufficient.
         from types import SimpleNamespace
 
+        # SGLang 0.5.15 moved rank fields used by delegated scheduler methods
+        # behind ``self.ps``. Install a minimal value immediately; the real
+        # scheduler construction path replaces it after computing attention
+        # parallel ranks in _init_parallel_state().
+        self.ps = SimpleNamespace(pp_size=getattr(self, "pp_size", 1))
+        self.metrics_reporter = SimpleNamespace(
+            reset_metrics=lambda: getattr(self, "reset_metrics", lambda: None)(),
+            is_stats_logging_rank=False,
+        )
         self.session_controller = SimpleNamespace(sessions={})
         self.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
         device = getattr(self, "device", None)
@@ -467,13 +481,17 @@ class OmniScheduler:
 
     def _init_parallel_state(self, tp_worker: Any) -> None:
         enable_dp_attention = self.server_args.enable_dp_attention
-        self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
-            compute_dp_attention_world_info(
-                enable_dp_attention,
-                self.tp_rank,
-                self.tp_size,
-                self.dp_size,
-            )
+        (
+            self.attn_tp_rank,
+            self.attn_tp_size,
+            self.attn_dp_rank,
+            self.attn_dp_size,
+        ) = compute_dp_attention_world_info(
+            enable_dp_attention,
+            self.tp_rank,
+            self.tp_size,
+            self.dp_size,
+            self.attn_cp_size,
         )
 
         self.tp_group = tp_worker.get_tp_group()
@@ -494,6 +512,31 @@ class OmniScheduler:
 
         self.current_scheduler_metrics_enabled = (
             self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+        )
+        self._refresh_upstream_parallel_state()
+
+    def _refresh_upstream_parallel_state(self) -> None:
+        """Build the rank container expected by SGLang 0.5.15 methods."""
+        from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+
+        self.ps = ParallelState(
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            dp_rank=self.dp_rank,
+            dp_size=self.dp_size,
+            attn_tp_rank=self.attn_tp_rank,
+            attn_tp_size=self.attn_tp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
+            attn_dp_rank=self.attn_dp_rank,
+            attn_dp_size=self.attn_dp_size,
+            moe_ep_rank=self.moe_ep_rank,
+            moe_ep_size=self.moe_ep_size,
+            moe_dp_rank=self.moe_dp_rank,
+            moe_dp_size=self.moe_dp_size,
+            gpu_id=self.gpu_id,
         )
 
     def recv_requests(self):

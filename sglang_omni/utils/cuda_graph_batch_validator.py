@@ -199,11 +199,12 @@ def evaluate_cuda_graph_batch_sizing(
 def read_captured_bs(model_runner: object) -> list[int] | None:
     """Read the actually-captured CUDA graph batch sizes, or None if absent."""
     try:
-        captured = model_runner.graph_runner.capture_bs
+        captured = model_runner.decode_cuda_graph_runner.capture_bs
     except AttributeError:
         logger.debug(
-            "cuda_graph_batch_validator: model_runner.graph_runner.capture_bs "
-            "missing (CUDA graphs disabled)."
+            "cuda_graph_batch_validator: "
+            "model_runner.decode_cuda_graph_runner.capture_bs missing "
+            "(decode CUDA graphs disabled)."
         )
         return None
     try:

@@ -54,11 +54,12 @@ def create_thinker_scheduler(
         model_arch_override="Qwen3OmniThinkerForCausalLM",
         capture_hidden_layers=capture_hidden_layers,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
+        defer_cuda_graph_capture=defer_cuda_graph_capture,
     )
 
     if defer_cuda_graph_capture:
         server_args.disable_cuda_graph = False
-        model_worker.model_runner.init_device_graphs()
+        model_worker.model_runner.init_cuda_graphs()
 
     def _should_generate_qwen_audio_output(request: Any) -> bool:
         return should_generate_audio_output(request.data.stage_payload)
@@ -155,6 +156,7 @@ def create_talker_scheduler(
         model_arch_override="Qwen3OmniTalker",
         weight_prefix=weight_prefix,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
+        defer_cuda_graph_capture=want_cuda_graph,
     )
     # Note:(Chenchen Hong) align the talker vocab to the codec vocab: post1 sizes
     # the repetition-penalty orchestrator from model_config.vocab_size (the
@@ -168,7 +170,7 @@ def create_talker_scheduler(
         model_worker.model_runner.model._sampler = model_worker.model_runner.sampler
     if want_cuda_graph:
         server_args.disable_cuda_graph = False
-        model_worker.model_runner.init_device_graphs()
+        model_worker.model_runner.init_cuda_graphs()
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,
