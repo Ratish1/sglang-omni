@@ -1324,6 +1324,10 @@ def _batch_request(
         item: dict[str, Any] = {
             "input": BASE_TEXTS[item_index % len(BASE_TEXTS)],
             "response_format": "pcm" if item_index % 2 else "wav",
+            # Performance gates must not depend on an unseeded generation
+            # outlier. Use a distinct deterministic seed per batch item so the
+            # configured benchmark seed controls both traffic and model output.
+            "seed": spec.seed + index * BATCH_OVERSIZED_SIZE + item_index,
         }
         if inject_item_error and item_index == batch_size - 1 and batch_size >= 32:
             item = {"input": "", "response_format": "bogus"}
