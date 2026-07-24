@@ -17,7 +17,6 @@ import torch
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 
 from sglang_omni.model_runner.base import ModelRunner
-from sglang_omni.models.higgs_tts.model import _flat_sampling_attr
 from sglang_omni.models.higgs_tts.sampler import K_MAX, selected_token_logprobs
 from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.utils import EOC_ID
@@ -43,6 +42,7 @@ class HiggsTTSModelRunner(ModelRunner):
         # Ping-pong pinned host buffers for the async-decode rollout-logprob D2H.
         self._logprob_host_buffers: list[torch.Tensor] | None = None
         self._logprob_slot = 0
+        self._cg_layout_signature: tuple[int, tuple[str, ...]] | None = None
 
     def _next_logprob_host_staging(self, device_buf: torch.Tensor) -> torch.Tensor:
         if self._logprob_host_buffers is None:
@@ -167,10 +167,30 @@ class HiggsTTSModelRunner(ModelRunner):
                 f"forward_batch.batch_size ({bs}) < len(requests) ({n_real})"
             )
 
-        model._sampler_pool.reset_row(model._padding_row)
+        layout_signature = (bs, tuple(req.request_id for req in requests))
+        if layout_signature == self._cg_layout_signature:
+            if self._async_enabled and is_lookahead and n_real > 0:
+                # A stable layout already has all state and sampling controls in
+                # the active graph buffers. Only redirect a row that completed
+                # in the preceding lookahead step; its pool row was committed
+                # by _decode_pack_gpu before this launch.
+                rows_t_real = model._cg_row_indices[:n_real]
+                done = model._cg_active_generation_done[:n_real]
+                model._cg_row_indices[:n_real] = torch.where(
+                    done,
+                    torch.full_like(rows_t_real, model._padding_row),
+                    rows_t_real,
+                )
+            return
 
         rows_py: list[int] = [model.acquire_row(req.request_id) for req in requests]
-        rows_py.extend([model._padding_row] * (bs - n_real))
+        padding = bs - n_real
+        if padding:
+            # Reset the reserved row only when this batch actually uses it.
+            # Scalar CUDA assignments in reset_row otherwise add six launches
+            # to every decode token on the common unpadded path.
+            model._sampler_pool.reset_row(model._padding_row)
+            rows_py.extend([model._padding_row] * padding)
         model._cg_row_indices[:bs] = torch.tensor(
             rows_py, dtype=torch.long, device=model._cg_row_indices.device
         )
@@ -194,9 +214,7 @@ class HiggsTTSModelRunner(ModelRunner):
                 done, torch.full_like(rows_t_real, model._padding_row), rows_t_real
             )
 
-        temps, top_ps, top_ks = self._extract_decode_sampling_params(
-            forward_batch, n_real
-        )
+        temps, top_ps, top_ks = self._extract_decode_sampling_params(requests)
         temps.extend([1.0] * (bs - n_real))
         top_ps.extend([1.0] * (bs - n_real))
         model._cg_temperature[:bs] = torch.tensor(
@@ -220,32 +238,31 @@ class HiggsTTSModelRunner(ModelRunner):
         model._cg_active_last_codes[:bs] = pool.last_codes[rows_t]
         model._cg_active_seeds[:bs] = pool.seeds[rows_t]
         model._cg_active_step_count[:bs] = pool.step_count[rows_t]
+        self._cg_layout_signature = layout_signature
 
     @staticmethod
-    def _extract_decode_sampling_params(forward_batch, n_real: int):
-        """Pull per-row temperature / top_p / top_k off sglang's
-        ``sampling_info`` with safe defaults. ``top_k`` values outside
-        ``(0, K_MAX)`` (including sglang's ``TOP_K_ALL`` sentinel for
-        unspecified top_k) are normalized to ``None`` — the downstream
-        buffer maps that to ``K_MAX`` = no-op filter.
+    def _extract_decode_sampling_params(requests):
+        """Read per-row sampling parameters from request-side host state.
+
+        SGLang's ``sampling_info`` stores these values on CUDA. Copying its
+        three tensors back to Python on every decode step forces three stream
+        synchronizations even though the values are immutable for a request.
+        ``top_k`` values outside ``(0, K_MAX)`` are normalized to ``None``;
+        the downstream buffer maps that to ``K_MAX`` = no-op filtering.
         """
-        sampling_info = getattr(forward_batch, "sampling_info", None)
-        if sampling_info is None or n_real == 0:
-            return ([1.0] * n_real, [1.0] * n_real, [None] * n_real)
-
-        temps_raw = _flat_sampling_attr(sampling_info, "temperatures") or [1.0] * n_real
-        top_ps_raw = _flat_sampling_attr(sampling_info, "top_ps") or [1.0] * n_real
-        top_ks_raw = _flat_sampling_attr(sampling_info, "top_ks")
-
-        temps = [float(t) for t in temps_raw[:n_real]]
-        top_ps = [float(t) for t in top_ps_raw[:n_real]]
-        if top_ks_raw is None:
-            top_ks: list[int | None] = [None] * n_real
-        else:
-            top_ks = [
-                int(t) if (t is not None and 0 < int(t) < K_MAX) else None
-                for t in top_ks_raw[:n_real]
-            ]
+        temps: list[float] = []
+        top_ps: list[float] = []
+        top_ks: list[int | None] = []
+        for request in requests:
+            params = request.data.req.sampling_params
+            temps.append(float(getattr(params, "temperature", 1.0)))
+            top_ps.append(float(getattr(params, "top_p", 1.0)))
+            top_k = getattr(params, "top_k", None)
+            top_ks.append(
+                int(top_k)
+                if top_k is not None and 0 < int(top_k) < K_MAX
+                else None
+            )
         return temps, top_ps, top_ks
 
     def _collect_step_outputs_cg(
