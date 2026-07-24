@@ -46,26 +46,19 @@ SEEDTTS_ASR_DATASET_LABEL = format_benchmark_dataset_label(
     repo_id=DATASETS["seedtts"],
 )
 
-# note (db-ol): references are the strict worst-of-5 from the official
-# tune-ci-thresholds calibration run 20260719T2302Z_asr_fun_g25 on idle
-# GPUs of the CI host (2x H100 80GB, DP=2 managed router, concurrency 32).
-# EN WER was identical across all five repeats and speed CV stayed under
-# 7 percent with no outliers. Two caveats the numbers alone do not show:
-# heavily contended CI runs have measured 16 to 20 percent below the idle
-# speed references, beyond the 10 percent slack, so a loaded runner leans
-# on the flaky-pytest retry wrapper. The ZH per-sample bound keeps the more
-# conservative worst of the two strict calibrations because that single
-# utterance metric drifted between runs (0.75 in this run, 0.8333 in the
-# previous strict worst-of-5 on the same topology).
+# SGLang 0.5.15 uses the phase-split runner and Transformers 5.12 frontend.
+# References below are the worse of two local 2x H100 DP=2 runs after restoring
+# real masked tensor batching in the pre-LM encoder; the existing 10% slack is
+# applied below. Accuracy stayed identical to the 0.5.12 calibration.
 FUN_ASR_EN_CORPUS_WER_MAX = 0.0172
 FUN_ASR_EN_SAMPLE_WER_MAX = 0.2858
 FUN_ASR_ZH_CORPUS_WER_MAX = 0.0136
 FUN_ASR_ZH_SAMPLE_WER_MAX = 0.8334
-FUN_ASR_THROUGHPUT_MIN = 64.27181519213258
-FUN_ASR_LATENCY_MEAN_MAX_S = 0.49501860166257006
-FUN_ASR_LATENCY_P95_MAX_S = 0.715
-FUN_ASR_RTF_MEAN_MAX = 0.1076
-FUN_ASR_RTF_P95_MAX = 0.1597
+FUN_ASR_THROUGHPUT_MIN = 35.09560126692783
+FUN_ASR_LATENCY_MEAN_MAX_S = 0.9049211094928015
+FUN_ASR_LATENCY_P95_MAX_S = 1.212313563283532
+FUN_ASR_RTF_MEAN_MAX = 0.19830908567035116
+FUN_ASR_RTF_P95_MAX = 0.2929
 
 THRESHOLD_SLACK_HIGHER = 0.9
 THRESHOLD_SLACK_LOWER = 1.1
