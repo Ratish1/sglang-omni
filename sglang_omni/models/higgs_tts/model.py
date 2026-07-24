@@ -497,7 +497,13 @@ class HiggsTTSModel(nn.Module):
     def _extract_batch_metadata(
         self, forward_batch
     ) -> tuple[list[str], list[HiggsGenParams]]:
-        req_ids_raw = getattr(forward_batch, "req_ids", None)
+        # ``rids`` is part of SGLang's ForwardBatch contract and survives the
+        # 0.5.15 EagerRunner static-buffer copy. ``req_ids`` was an Omni-added
+        # dynamic attribute; dataclasses.replace drops it, silently routing
+        # prefill sampling into fallback rows such as "req-0".
+        req_ids_raw = getattr(forward_batch, "rids", None)
+        if req_ids_raw is None:
+            req_ids_raw = getattr(forward_batch, "req_ids", None)
         batch_size = self._infer_batch_size(forward_batch)
         if req_ids_raw is None:
             req_ids = [f"req-{i}" for i in range(batch_size)]

@@ -16,6 +16,7 @@ from sglang_omni.config.runtime import resolve_stage_static_factory_args
 from sglang_omni.models.higgs_tts import stages
 from sglang_omni.models.higgs_tts import utils as higgs_utils
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
+from sglang_omni.models.higgs_tts.model import HiggsTTSModel
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import build_higgs_stream_metadata
@@ -42,6 +43,21 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
     assert stages_by_name["vocoder"].process == "pipeline"
     assert stages_by_name["vocoder"].factory_args["compile_decode"] is False
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
+
+
+def test_higgs_batch_metadata_prefers_sglang_rids() -> None:
+    model = object.__new__(HiggsTTSModel)
+    forward_batch = SimpleNamespace(
+        rids=["stable-a", "stable-b"],
+        req_ids=["dropped-dynamic-attribute"],
+        seq_lens=torch.tensor([1, 1]),
+        sampling_info=None,
+    )
+
+    req_ids, params = model._extract_batch_metadata(forward_batch)
+
+    assert req_ids == ["stable-a", "stable-b"]
+    assert len(params) == 2
 
 
 def test_higgs_streaming_pipeline_shares_vocoder_stride_with_tts_engine() -> None:
