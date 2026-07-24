@@ -13,6 +13,11 @@ from typing import Any
 
 import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    has_forward_context,
+)
 
 from sglang_omni.model_runner.base import ModelRunner
 
@@ -305,20 +310,26 @@ class ThinkerModelRunner(ModelRunner):
             full_ds[visual_pos_masks] = ds_input
             ds_input = full_ds
 
-        hidden_states = outer.model(
-            input_ids=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds,
-            input_deepstack_embeds=ds_input,
+        ctx_mgr = (
+            contextlib.nullcontext()
+            if has_forward_context()
+            else forward_context(ForwardContext(attn_backend=model_runner.attn_backend))
         )
+        with ctx_mgr:
+            hidden_states = outer.model(
+                input_ids=None,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                input_deepstack_embeds=ds_input,
+            )
 
-        logits_output = outer.logits_processor(
-            forward_batch.input_ids,
-            hidden_states,
-            outer.lm_head,
-            forward_batch,
-        )
+            logits_output = outer.logits_processor(
+                forward_batch.input_ids,
+                hidden_states,
+                outer.lm_head,
+                forward_batch,
+            )
 
         return GenerationBatchResult(
             logits_output=logits_output, can_run_cuda_graph=False

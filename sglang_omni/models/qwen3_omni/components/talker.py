@@ -132,7 +132,7 @@ class _PredictorDecodeGraph:
         if self.result_codes is None or self.summed_embeddings is None:
             raise RuntimeError("Qwen3-Omni predictor CUDA graph captured no outputs")
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def replay(
         self,
         layer0_codes: torch.Tensor,
@@ -1482,7 +1482,11 @@ class Qwen3OmniTalker(nn.Module):
         *,
         max_batch_size: int,
     ) -> tuple[int, ...]:
-        raw_batch_sizes = getattr(server_args, "cuda_graph_bs", None)
+        from sglang_omni.scheduling.generation_batch_policy import (
+            get_decode_cuda_graph_bs,
+        )
+
+        raw_batch_sizes = get_decode_cuda_graph_bs(server_args)
         if raw_batch_sizes is None:
             raw_batch_sizes = (max_batch_size,)
 
