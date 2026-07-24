@@ -14,6 +14,7 @@ import typer
 from sglang_omni.cli.serve import apply_mem_fraction_cli_overrides
 from sglang_omni.config.runtime import resolve_stage_static_factory_args
 from sglang_omni.models.higgs_tts import stages
+from sglang_omni.models.higgs_tts import model as higgs_model
 from sglang_omni.models.higgs_tts import utils as higgs_utils
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 from sglang_omni.models.higgs_tts.model import HiggsTTSModel
@@ -42,6 +43,9 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
     assert "server_args_overrides" not in stages_by_name["tts_engine"].factory_args
     assert stages_by_name["vocoder"].process == "pipeline"
     assert stages_by_name["vocoder"].factory_args["compile_decode"] is False
+    assert stages_by_name["vocoder"].factory_args[
+        "decode_cuda_graph_frame_counts"
+    ] == tuple(range(1, 151))
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
 
@@ -58,6 +62,84 @@ def test_higgs_batch_metadata_prefers_sglang_rids() -> None:
 
     assert req_ids == ["stable-a", "stable-b"]
     assert len(params) == 2
+
+
+@pytest.mark.parametrize(
+    ("public_seed", "resolved_seed"),
+    [(None, 731), (42, 42)],
+)
+def test_higgs_active_request_always_gets_concrete_row_seed(
+    monkeypatch, public_seed, resolved_seed
+) -> None:
+    model = object.__new__(HiggsTTSModel)
+    model._rid_to_row = {}
+    model._free_rows = [0]
+    model._sampler_pool = SimpleNamespace(
+        seeds=torch.full((1,), -1, dtype=torch.long),
+        reset_row=lambda row: None,
+    )
+    monkeypatch.setattr(
+        higgs_model,
+        "resolve_row_seed",
+        lambda seed: resolved_seed,
+    )
+
+    model.set_request_seed("request", public_seed)
+
+    assert model._rid_to_row == {"request": 0}
+    assert model._sampler_pool.seeds[0].item() == resolved_seed
+
+
+@pytest.mark.parametrize(
+    ("graph_eligible", "expected_tokens"),
+    [(True, 256), (False, 134)],
+)
+def test_higgs_prefill_embeddings_follow_graph_padding_contract(
+    graph_eligible: bool,
+    expected_tokens: int,
+) -> None:
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+        PrefillCudaGraphRunner,
+    )
+
+    prefill_runner = object.__new__(PrefillCudaGraphRunner)
+    prefill_runner.capture_num_tokens = [128, 256]
+    prefill_runner.can_run_graph = lambda _forward_batch: graph_eligible
+
+    seeds: list[tuple[str, int | None]] = []
+    model = SimpleNamespace(
+        _pending_prefill_input_embeds=None,
+        set_request_seed=lambda request_id, seed: seeds.append((request_id, seed)),
+    )
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner.model = model
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(prefill_cuda_graph_runner=prefill_runner)
+    )
+    raw_embeds = torch.arange(134 * 4, dtype=torch.float32).view(134, 4)
+    runner._build_prefill_input_embeds = (
+        lambda _forward_batch, _requests: raw_embeds
+    )
+    request = SimpleNamespace(
+        request_id="request",
+        data=SimpleNamespace(
+            req=SimpleNamespace(
+                sampling_params=SimpleNamespace(sampling_seed=17)
+            )
+        ),
+    )
+    forward_batch = SimpleNamespace(input_embeds=raw_embeds)
+
+    runner.before_prefill(forward_batch, None, [request])
+
+    pending = model._pending_prefill_input_embeds
+    assert pending.shape == (expected_tokens, 4)
+    torch.testing.assert_close(pending[:134], raw_embeds)
+    if graph_eligible:
+        assert torch.count_nonzero(pending[134:]).item() == 0
+    assert forward_batch.input_embeds is None
+    assert forward_batch.req_ids == ["request"]
+    assert seeds == [("request", 17)]
 
 
 def test_higgs_streaming_pipeline_shares_vocoder_stride_with_tts_engine() -> None:
@@ -114,6 +196,7 @@ def test_higgs_streaming_pipeline_rejects_conflicting_runtime_stride() -> None:
 
 
 def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
+    from sglang_omni.models.higgs_tts import engine_builder as engine_builder_mod
     from sglang_omni.models.higgs_tts import model_runner as model_runner_mod
     from sglang_omni.models.higgs_tts import request_builders
     from sglang_omni.scheduling import (
@@ -135,6 +218,12 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
             max_running_requests=overrides["max_running_requests"],
             cuda_graph_max_bs=overrides["cuda_graph_max_bs"],
             cuda_graph_bs=overrides["cuda_graph_bs"],
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(
+                    backend=overrides["cuda_graph_config"]["prefill"]["backend"],
+                    bs=overrides["cuda_graph_config"]["prefill"]["bs"],
+                )
+            ),
             torch_compile_max_bs=32,
         )
         captured["checkpoint_dir"] = checkpoint_dir
@@ -148,6 +237,7 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
         captured["gpu_id"] = gpu_id
         infrastructure_saw_graph_disabled.append(bool(server_args.disable_cuda_graph))
         model = SimpleNamespace(
+            backbone=SimpleNamespace(),
             sampler_pool_max_running_requests=64,
             reset_request=lambda _request_id: None,
         )
@@ -155,6 +245,12 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
 
         def init_cuda_graphs() -> None:
             init_graph_calls.append(True)
+            prefill_runner = object.__new__(
+                engine_builder_mod.PrefillCudaGraphRunner
+            )
+            prefill_runner._is_full_backend = True
+            prefill_runner.capture_num_tokens = list(range(64, 513, 64))
+            model_runner.prefill_cuda_graph_runner = prefill_runner
 
         model_runner.init_cuda_graphs = init_cuda_graphs
         return (
@@ -228,6 +324,14 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     ]
     assert captured["overrides"]["cuda_graph_max_bs"] == 64
     assert captured["overrides"]["max_running_requests"] == 64
+    assert captured["overrides"]["cuda_graph_config"] == {
+        "prefill": {
+            "backend": "full",
+            "max_bs": 512,
+            "bs": list(range(64, 513, 64)),
+            "full_prefill_max_req": 1,
+        }
+    }
     assert captured["server_args"].disable_overlap_schedule is True
     assert captured["server_args"].enable_torch_compile is False
     assert captured["server_args"].torch_compile_max_bs == 32
@@ -1136,6 +1240,27 @@ def _fake_codec_fixtures(monkeypatch):
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda p: p)
     monkeypatch.setattr(stages, "get_or_load_codec", lambda *a, **kw: FakeCodec())
     return decode_batch_sizes
+
+
+def test_higgs_vocoder_fails_startup_when_cuda_graph_capture_fails(
+    monkeypatch,
+) -> None:
+    class FailingCodec:
+        def capture_decode_cuda_graphs(self, _frame_counts) -> None:
+            raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda path: path)
+    monkeypatch.setattr(
+        stages,
+        "get_or_load_codec",
+        lambda *_args, **_kwargs: FailingCodec(),
+    )
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        stages.create_vocoder_executor(
+            "fake-model",
+            decode_cuda_graph_frame_counts=(1, 2),
+        )
 
 
 def test_higgs_tts_vocoder_batches_decode_requests(

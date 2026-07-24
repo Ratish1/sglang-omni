@@ -52,9 +52,10 @@ def build_sglang_server_args(
         kwargs["mem_fraction_static"] = mem_fraction_static
     kwargs.update(overrides)
     _normalize_decode_cuda_graph_overrides(kwargs)
-    # SGLang 0.5.15 enables a phase-specific prefill CUDA graph by default.
-    # Omni models only support the existing decode graph path for now.
-    kwargs["cuda_graph_backend_prefill"] = "disabled"
+    # Existing Omni models remain eager-prefill by default. Models that have
+    # adapted SGLang's phase-specific prefill contract opt in explicitly
+    # through their generation defaults / server overrides.
+    kwargs.setdefault("cuda_graph_backend_prefill", "disabled")
     if kwargs.get("mem_fraction_static") is None:
         kwargs.pop("mem_fraction_static", None)
     return ServerArgs(**kwargs)

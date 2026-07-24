@@ -5,7 +5,12 @@ from __future__ import annotations
 
 import importlib
 import logging
+from types import SimpleNamespace
 from typing import Any
+
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
+)
 
 from sglang_omni.models.higgs_tts import request_builders
 from sglang_omni.models.higgs_tts import utils as higgs_utils
@@ -54,6 +59,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
         self.total_gpu_memory_fraction = total_gpu_memory_fraction
         self.model: Any | None = None
+        self._prefill_graph_model_runner: Any | None = None
 
     def generation_defaults(
         self,
@@ -69,6 +75,26 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
             "max_running_requests": self.max_running_requests,
             "cuda_graph_max_bs": self.cuda_graph_max_bs,
             "disable_cuda_graph": False,
+            # Higgs composes request-specific multi-codebook embeddings before
+            # the backbone. Full prefill CG captures only the transformer body
+            # and leaves that composition plus sampling in the eager tail.
+            # The CI prompt domain is <=512 tokens. Larger prefills fall back
+            # to eager. Use 64-token buckets: 128-token buckets add about 43%
+            # padding work on the Higgs CI prompt distribution, while this
+            # halves that waste without making graph startup or memory scale
+            # excessively. The captured request-slot count follows the
+            # scheduler's prefill-coalescing bound, so the two contracts cannot
+            # drift.
+            "cuda_graph_config": {
+                "prefill": {
+                    "backend": "full",
+                    "max_bs": 512,
+                    "bs": list(range(64, 513, 64)),
+                    "full_prefill_max_req": max(
+                        int(self.prefill_coalesce_requests), 1
+                    ),
+                }
+            },
             "mem_fraction_static": (
                 self.total_gpu_memory_fraction
                 if self.total_gpu_memory_fraction is not None
@@ -106,9 +132,66 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         gpu_id: int,
         server_args: Any,
     ) -> None:
-        del checkpoint_dir, device, gpu_id, server_args
-        self.model = model_worker.model_runner.model
+        del checkpoint_dir, device, gpu_id
+        model_runner = model_worker.model_runner
+        self.model = model_runner.model
         higgs_utils.truncate_rope_to_bf16(self.model)
+        prefill_backend = server_args.cuda_graph_config.prefill.backend
+        if prefill_backend == "disabled":
+            return
+        if prefill_backend != "full":
+            raise RuntimeError(
+                "Higgs prefill CUDA graph adapter only supports SGLang's "
+                f"full backend, got {prefill_backend!r}"
+            )
+
+        # SGLang 0.5.15's prefill graph discovery requires an outer ``.model``
+        # attribute before it consults the more general ``.language_model``
+        # contract. Higgs is a composition wrapper around Qwen3ForCausalLM and
+        # intentionally exposes neither name. Install non-module discovery
+        # views only for graph construction; post_cuda_graph_setup removes
+        # them, while PrefillCudaGraphRunner retains the resolved layer model.
+        if hasattr(self.model, "model") or hasattr(self.model, "language_model"):
+            raise RuntimeError(
+                "Higgs prefill CUDA graph discovery contract changed; "
+                "refusing to capture against ambiguous model aliases"
+            )
+        object.__setattr__(self.model, "model", SimpleNamespace())
+        object.__setattr__(self.model, "language_model", self.model.backbone)
+        self._prefill_graph_model_runner = model_runner
+
+    def post_cuda_graph_setup(self, model: Any, server_args: Any) -> None:
+        model.__dict__.pop("model", None)
+        model.__dict__.pop("language_model", None)
+        if server_args.cuda_graph_config.prefill.backend == "disabled":
+            return
+        runner = self._prefill_graph_model_runner
+        prefill_runner = (
+            None if runner is None else getattr(runner, "prefill_cuda_graph_runner", None)
+        )
+        if not isinstance(prefill_runner, PrefillCudaGraphRunner):
+            raise RuntimeError(
+                "Higgs explicitly enabled prefill CUDA graph, but SGLang did "
+                "not construct PrefillCudaGraphRunner"
+            )
+        if not prefill_runner._is_full_backend:
+            raise RuntimeError(
+                "Higgs prefill CUDA graph requires the full backend's padded "
+                "body-replay contract"
+            )
+        configured_shapes = tuple(server_args.cuda_graph_config.prefill.bs)
+        captured_shapes = tuple(prefill_runner.capture_num_tokens)
+        if captured_shapes != tuple(sorted(configured_shapes)):
+            raise RuntimeError(
+                "Higgs prefill CUDA graph capture shapes differ from the "
+                f"configured contract: configured={configured_shapes}, "
+                f"captured={captured_shapes}"
+            )
+        logger.info(
+            "Higgs prefill CUDA graph active: backend=%s shapes=%s",
+            server_args.cuda_graph_config.prefill.backend,
+            server_args.cuda_graph_config.prefill.bs,
+        )
 
     def get_model_buffer_bs(self, model: Any) -> int | None:
         return model.sampler_pool_max_running_requests

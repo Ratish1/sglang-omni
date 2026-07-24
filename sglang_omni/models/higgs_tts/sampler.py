@@ -19,8 +19,8 @@ from sglang.srt.layers.sampler import multinomial_with_seed
 
 from sglang_omni.models.higgs_tts.utils import BOC_ID, EOC_ID
 
-# Sentinel seed for rows with no user seed: keeps the legacy unseeded
-# torch.multinomial path, so unseeded decode is byte-identical to before.
+# Sentinel for an unallocated/reset sampler row. Active requests always receive
+# a concrete per-request seed, including requests without a user-provided seed.
 NO_SEED = -1
 
 # Sentinel returned by ``step`` after ``generation_done``; engine treats as stop.
@@ -79,8 +79,8 @@ class HiggsBatchedSamplerState:
             dtype=torch.long,
             device=self.device,
         )
-        # Per-request seed (``NO_SEED`` = unseeded) and monotonic AR step, used
-        # to seed each ``(step, codebook)`` draw reproducibly.
+        # Per-request seed (``NO_SEED`` = unallocated/reset) and monotonic AR
+        # step, used to seed each ``(step, codebook)`` draw reproducibly.
         self.seeds = torch.full(
             (self.max_batch_size,), NO_SEED, dtype=torch.long, device=self.device
         )
@@ -270,18 +270,22 @@ def _sample_independent_batched(
         tp = top_p.view(B, 1).expand(B, N).reshape(B * N).to(torch.float32).contiguous()
         probs = _fused_top_p_renorm(probs, tp)
 
-    codes_flat = probs.multinomial(num_samples=1).squeeze(-1)
-    if seeds_B is not None:
-        # Seeded rows draw deterministically from (seed, step*N + codebook);
-        # unseeded rows (seed == NO_SEED) keep the torch.multinomial draw above.
+    if seeds_B is None:
+        # Reference/tests may omit row seeds. Production resolves every active
+        # request to a concrete seed before its first prefill.
+        codes_flat = probs.multinomial(num_samples=1).squeeze(-1)
+    else:
+        if step_B is None:
+            raise ValueError("step_B is required when seeds_B is provided")
+        # Draw once from (seed, step*N + codebook). Negative values can occur
+        # only in inactive CUDA-graph padding rows during capture; map those
+        # ignored rows to zero without introducing data-dependent host control.
         cb = torch.arange(N, device=logits_BNV.device).view(1, N).expand(B, N)
         positions = (step_B.view(B, 1) * N + cb).reshape(B * N)
         seeds_flat = seeds_B.clamp_min(0).view(B, 1).expand(B, N).reshape(B * N)
-        seeded_flat = multinomial_with_seed(
+        codes_flat = multinomial_with_seed(
             torch.log(probs), seeds_flat, positions
         ).squeeze(-1)
-        has_seed = (seeds_B >= 0).view(B, 1).expand(B, N).reshape(B * N)
-        codes_flat = torch.where(has_seed, seeded_flat, codes_flat)
     sampled_BN = codes_flat.view(B, N)
 
     return torch.where(greedy_B1, argmax_BN, sampled_BN).to(torch.long)

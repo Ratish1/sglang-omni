@@ -11,8 +11,12 @@ engine and the codec.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import types
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -23,6 +27,7 @@ from safetensors import safe_open
 from transformers import HiggsAudioV2TokenizerConfig, HiggsAudioV2TokenizerModel
 
 WaveformInput = torch.Tensor | np.ndarray
+logger = logging.getLogger(__name__)
 
 # Codec weights live under this prefix inside the TTS checkpoint.
 _CODEC_IN_TTS_CKPT_PREFIX = "tied.embedding.modality_embeddings.0.model."
@@ -34,6 +39,30 @@ _BUNDLED_CODEC_CONFIG_PATH = os.path.join(
     "configs",
     "higgs_audio_v2_tokenizer.json",
 )
+
+
+@dataclass
+class _DecodeCudaGraph:
+    graph: torch.cuda.CUDAGraph
+    input_codes: torch.Tensor
+    output_audio: torch.Tensor
+
+
+def _capture_safe_quantizer_decode(quantizer: Any, codes: torch.Tensor) -> torch.Tensor:
+    """Equivalent RVQ decode without a pageable CPU-to-GPU scalar copy.
+
+    Transformers 5.6 initializes the accumulator with
+    ``torch.tensor(0.0, device=codes.device)``.  During raw CUDA graph capture
+    that construction is a pageable host-to-device copy and invalidates the
+    capture.  Starting from the first quantizer output is numerically
+    equivalent and entirely device-side.
+    """
+    if int(codes.shape[0]) == 0:
+        raise ValueError("Higgs codec decode requires at least one quantizer")
+    quantized_out = quantizer.quantizers[0].decode(codes[0])
+    for i, indices in enumerate(codes[1:], start=1):
+        quantized_out = quantized_out + quantizer.quantizers[i].decode(indices)
+    return quantized_out
 
 
 def _to_mono_3d(waveform: WaveformInput) -> torch.Tensor:
@@ -108,6 +137,10 @@ class HiggsAudioCodec:
         self.model = model
         self.device = device
         self._dtype = next(model.parameters()).dtype
+        self._decode_cuda_graphs: dict[int, _DecodeCudaGraph] = {}
+        self._decode_cuda_graph_hits = 0
+        self._decode_cuda_graph_misses = 0
+        self._decode_cuda_graph_missed_shapes: set[int] = set()
 
     @classmethod
     def from_pretrained(
@@ -153,6 +186,74 @@ class HiggsAudioCodec:
         for p in model.parameters():
             p.requires_grad_(False)
         return cls(model, device=device)
+
+    @torch.no_grad()
+    def capture_decode_cuda_graphs(self, frame_counts: tuple[int, ...]) -> None:
+        """Capture fixed-shape single-item codec decode graphs at startup.
+
+        Higgs' streaming cursor has a finite set of single-item decode-window
+        shapes. Capturing the configured domain removes hundreds of eager
+        kernel launches from both steady and final chunks. Unlisted shapes
+        still use eager decode. Capture finishes before the stage becomes
+        ready, so it cannot race SGLang's independently owned AR graphs.
+        """
+        if self.device.type != "cuda":
+            raise RuntimeError("Higgs codec CUDA graphs require a CUDA device")
+        frames = tuple(dict.fromkeys(int(value) for value in frame_counts))
+        if not frames or any(value <= 0 for value in frames):
+            raise ValueError("decode CUDA graph frame counts must be positive")
+
+        num_quantizers = int(self.model.config.num_quantizers)
+        current_stream = torch.cuda.current_stream(self.device)
+        capture_stream = torch.cuda.Stream(device=self.device)
+        capture_stream.wait_stream(current_stream)
+        original_quantizer_decode = self.model.quantizer.decode
+        self.model.quantizer.decode = types.MethodType(
+            _capture_safe_quantizer_decode,
+            self.model.quantizer,
+        )
+        captured: dict[int, _DecodeCudaGraph] = {}
+        try:
+            # Initialize shape-specialized CUDA-library state outside capture.
+            # One eager pass per shape is sufficient after model startup; doing
+            # three passes made comprehensive tail-shape capture needlessly
+            # expensive.
+            with torch.cuda.stream(capture_stream):
+                for frame_count in frames:
+                    warm_codes = torch.zeros(
+                        (1, num_quantizers, frame_count),
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    self.model.decode(warm_codes).audio_values
+            capture_stream.synchronize()
+
+            for frame_count in frames:
+                input_codes = torch.zeros(
+                    (1, num_quantizers, frame_count),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=capture_stream):
+                    output_audio = self.model.decode(input_codes).audio_values
+                captured[frame_count] = _DecodeCudaGraph(
+                    graph=graph,
+                    input_codes=input_codes,
+                    output_audio=output_audio,
+                )
+        finally:
+            self.model.quantizer.decode = original_quantizer_decode
+
+        current_stream.wait_stream(capture_stream)
+        torch.cuda.synchronize(self.device)
+        self._decode_cuda_graphs = captured
+        logger.info(
+            "Captured %d Higgs codec decode CUDA graphs for frame counts %d..%d",
+            len(captured),
+            min(captured),
+            max(captured),
+        )
 
     @torch.no_grad()
     def encode_reference(
@@ -243,12 +344,52 @@ class HiggsAudioCodec:
             raise ValueError(
                 f"codes must be 2-D [T, num_codebooks], got {tuple(codes_TN.shape)}"
             )
-        codes_BNT = (
-            codes_TN.transpose(0, 1)
-            .unsqueeze(0)
-            .to(device=self.device, dtype=torch.long)
+        frame_count = int(codes_TN.shape[0])
+        decode_graphs = getattr(self, "_decode_cuda_graphs", {})
+        decode_graph = decode_graphs.get(frame_count)
+        codes_BNT = codes_TN.transpose(0, 1).unsqueeze(0)
+        if decode_graph is not None:
+            self._decode_cuda_graph_hits = (
+                getattr(self, "_decode_cuda_graph_hits", 0) + 1
+            )
+            if int(codes_BNT.shape[1]) != int(decode_graph.input_codes.shape[1]):
+                raise ValueError(
+                    f"codes have {int(codes_BNT.shape[1])} quantizers, expected "
+                    f"{int(decode_graph.input_codes.shape[1])}"
+                )
+            decode_graph.input_codes.copy_(
+                codes_BNT.to(dtype=torch.long), non_blocking=True
+            )
+            decode_graph.graph.replay()
+            audio = decode_graph.output_audio
+        else:
+            if decode_graphs:
+                self._decode_cuda_graph_misses = (
+                    getattr(self, "_decode_cuda_graph_misses", 0) + 1
+                )
+                if not hasattr(self, "_decode_cuda_graph_missed_shapes"):
+                    self._decode_cuda_graph_missed_shapes = set()
+                if frame_count not in self._decode_cuda_graph_missed_shapes:
+                    self._decode_cuda_graph_missed_shapes.add(frame_count)
+                    logger.warning(
+                        "Higgs codec decode CUDA graph miss for frame count %d; "
+                        "using eager decode",
+                        frame_count,
+                    )
+            audio = self.model.decode(
+                codes_BNT.to(device=self.device, dtype=torch.long)
+            ).audio_values
+        total_graph_lookups = (
+            getattr(self, "_decode_cuda_graph_hits", 0)
+            + getattr(self, "_decode_cuda_graph_misses", 0)
         )
-        return self.model.decode(codes_BNT).audio_values.squeeze(0).squeeze(0).cpu()
+        if decode_graphs and total_graph_lookups % 1024 == 0:
+            logger.info(
+                "Higgs codec decode CUDA graph stats: hits=%d misses=%d",
+                self._decode_cuda_graph_hits,
+                self._decode_cuda_graph_misses,
+            )
+        return audio.squeeze(0).squeeze(0).cpu()
 
     @torch.no_grad()
     def decode_batch(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:

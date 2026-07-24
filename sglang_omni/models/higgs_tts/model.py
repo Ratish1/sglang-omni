@@ -19,7 +19,6 @@ from sglang_omni.models.higgs_tts.modeling import (
 )
 from sglang_omni.models.higgs_tts.sampler import (
     K_MAX,
-    NO_SEED,
     HiggsBatchedSamplerState,
     batched_step,
     batched_step_direct,
@@ -204,8 +203,10 @@ class HiggsTTSModel(nn.Module):
         self._cg_active_last_codes = torch.zeros(
             pool_size, num_codebooks, dtype=torch.long, device=cg_device
         )
-        self._cg_active_seeds = torch.full(
-            (pool_size,), NO_SEED, dtype=torch.long, device=cg_device
+        # Capture/padding rows use seed zero. Real rows are overwritten from the
+        # sampler pool, where set_request_seed installs a concrete row seed.
+        self._cg_active_seeds = torch.zeros(
+            pool_size, dtype=torch.long, device=cg_device
         )
         self._cg_active_step_count = torch.zeros(
             pool_size, dtype=torch.long, device=cg_device
@@ -250,12 +251,14 @@ class HiggsTTSModel(nn.Module):
         return row
 
     def set_request_seed(self, req_id: str, seed: int | None) -> None:
-        """Pin ``req_id``'s sampler seed (``None`` -> unseeded/random). Constant
-        across the request's AR steps; consumed by ``multinomial_with_seed``."""
+        """Pin ``req_id``'s concrete sampler seed for all of its AR steps.
+
+        Requests without a public seed receive one fresh random row seed. This
+        keeps them stochastic while allowing the CUDA-graph path to use the
+        same single seeded sampler kernel for every active request.
+        """
         row = self.acquire_row(req_id)
-        self._sampler_pool.seeds[row] = (
-            NO_SEED if seed is None else resolve_row_seed(seed)
-        )
+        self._sampler_pool.seeds[row] = resolve_row_seed(seed)
 
     def release_row(self, req_id: str) -> None:
         """Return ``req_id``'s row to the free pool and drop its output codes."""
@@ -434,6 +437,13 @@ class HiggsTTSModel(nn.Module):
                 input_ids, batch_size=input_ids.shape[0]
             )
         else:
+            if input_embeds is None:
+                input_embeds = getattr(self, "_pending_prefill_input_embeds", None)
+                self._pending_prefill_input_embeds = None
+            if input_embeds is None:
+                raise RuntimeError(
+                    "Higgs prefill requires composed multi-codebook input embeddings"
+                )
             req_ids, gen_params = self._extract_batch_metadata(forward_batch)
 
         hidden_states = self.backbone.model(

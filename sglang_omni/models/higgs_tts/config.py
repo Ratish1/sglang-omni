@@ -81,10 +81,18 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             # serving concurrency and prevents decode/vocoder overlap.
             process="pipeline",
             factory=f"{_PKG}.stages.create_vocoder_executor",
-            factory_args={"device": "cuda", "compile_decode": False},
+            factory_args={
+                "device": "cuda",
+                "compile_decode": False,
+                # Before the steady cursor is established, a decode window is
+                # bounded by the default 75-row stride plus its 75-row
+                # follow-up. Capture that complete finite domain so terminal
+                # flushes cannot silently fall back to eager execution.
+                "decode_cuda_graph_frame_counts": tuple(range(1, 151)),
+            },
             gpu=0,
             runtime=StageRuntimeConfig(
-                resources=StageResourceConfig(total_gpu_memory_fraction=0.10)
+                resources=StageResourceConfig(total_gpu_memory_fraction=0.10),
             ),
             terminal=True,
             can_accept_stream_before_payload=True,

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 from transformers import HiggsAudioV2TokenizerConfig, HiggsAudioV2TokenizerModel
 
@@ -36,3 +39,72 @@ def test_higgs_codec_uses_upstream_transformers_architecture() -> None:
     }
     assert config.frame_rate == 25
     assert config.num_quantizers == 8
+
+
+class _FakeQuantizerLayer:
+    def __init__(self, offset: float) -> None:
+        self.offset = offset
+
+    def decode(self, indices: torch.Tensor) -> torch.Tensor:
+        return indices.to(torch.float32).unsqueeze(-1) + self.offset
+
+
+def test_capture_safe_quantizer_decode_matches_additive_rvq() -> None:
+    quantizer = SimpleNamespace(
+        quantizers=[
+            _FakeQuantizerLayer(0.25),
+            _FakeQuantizerLayer(0.5),
+            _FakeQuantizerLayer(0.75),
+        ]
+    )
+    codes = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.long)
+
+    actual = audio_codec._capture_safe_quantizer_decode(quantizer, codes)
+    expected = sum(
+        layer.decode(indices) for layer, indices in zip(quantizer.quantizers, codes)
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_capture_safe_quantizer_decode_rejects_empty_codes() -> None:
+    quantizer = SimpleNamespace(quantizers=[])
+
+    with pytest.raises(ValueError, match="at least one quantizer"):
+        audio_codec._capture_safe_quantizer_decode(
+            quantizer,
+            torch.empty((0, 2), dtype=torch.long),
+        )
+
+
+def test_codec_decode_replays_matching_shape_graph() -> None:
+    graph_input = torch.zeros((1, 2, 3), dtype=torch.long)
+    graph_output = torch.zeros((1, 1, 1), dtype=torch.float32)
+
+    class _FakeGraph:
+        def __init__(self) -> None:
+            self.replays = 0
+
+        def replay(self) -> None:
+            self.replays += 1
+            graph_output.fill_(float(graph_input.sum()))
+
+    graph = _FakeGraph()
+    codec = object.__new__(audio_codec.HiggsAudioCodec)
+    codec._decode_cuda_graphs = {
+        3: audio_codec._DecodeCudaGraph(
+            graph=graph,
+            input_codes=graph_input,
+            output_audio=graph_output,
+        )
+    }
+    codec._decode_cuda_graph_hits = 0
+    codec._decode_cuda_graph_misses = 0
+    codec._decode_cuda_graph_missed_shapes = set()
+
+    output = codec.decode(torch.tensor([[1, 2], [3, 4], [5, 6]]))
+
+    assert graph.replays == 1
+    assert codec._decode_cuda_graph_hits == 1
+    assert codec._decode_cuda_graph_misses == 0
+    torch.testing.assert_close(output, torch.tensor([21.0]), rtol=0, atol=0)
