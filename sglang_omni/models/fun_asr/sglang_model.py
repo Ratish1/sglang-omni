@@ -64,7 +64,9 @@ class MultiHeadedAttentionSANM(nn.Module):
         self.out_proj = nn.Linear(n_feat, n_feat)
         self.dropout = nn.Dropout(p=dropout_rate)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, valid_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         b, t, _ = x.size()
         q = self.q_proj(x)
         k = self.k_proj(x)
@@ -75,6 +77,8 @@ class MultiHeadedAttentionSANM(nn.Module):
 
         q_h = q_h * (self.d_k**-0.5)
         scores = torch.matmul(q_h, k_h.transpose(-2, -1))  # (b, h, t, t)
+        if valid_mask is not None:
+            scores = scores.masked_fill(~valid_mask[:, None, None, :], float("-inf"))
         attn = torch.softmax(scores, dim=-1)
         p_attn = self.dropout(attn)
         x = torch.matmul(p_attn, v_h)  # (b, h, t, dk)
@@ -135,11 +139,15 @@ class EncoderLayerSANM(nn.Module):
         self.in_size = in_size
         self.size = size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, valid_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         residual = x
         x = self.self_attn_layer_norm(x)
         value_states = self.self_attn.v_proj(x)
-        x = self.dropout(self.self_attn(x) + self.fsmn(value_states))
+        if valid_mask is not None:
+            value_states = value_states * valid_mask.unsqueeze(-1)
+        x = self.dropout(self.self_attn(x, valid_mask) + self.fsmn(value_states))
         if self.in_size == self.size:
             x = residual + x
         residual = x
@@ -149,6 +157,8 @@ class EncoderLayerSANM(nn.Module):
         if x.dtype == torch.float16:
             clamp_value = torch.finfo(x.dtype).max - 1000
             x = torch.clamp(x, min=-clamp_value, max=clamp_value)
+        if valid_mask is not None:
+            x = x * valid_mask.unsqueeze(-1)
         return x
 
 
@@ -198,16 +208,22 @@ class FunAsrNanoAudioEncoder(nn.Module):
     def output_size(self) -> int:
         return self._output_size
 
-    def forward(self, xs: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, xs: torch.Tensor, valid_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         xs = xs * (self._output_size**0.5)
         xs = self.embed(xs)
-        xs = self.stem(xs)
+        if valid_mask is not None:
+            xs = xs * valid_mask.unsqueeze(-1)
+        xs = self.stem(xs, valid_mask)
         for layer in self.layers:
-            xs = layer(xs)
+            xs = layer(xs, valid_mask)
         xs = self.layer_norm(xs)
         for layer in self.timestamp_prediction_layers:
-            xs = layer(xs)
+            xs = layer(xs, valid_mask)
         xs = self.timestamp_prediction_layer_norm(xs)
+        if valid_mask is not None:
+            xs = xs * valid_mask.unsqueeze(-1)
         return xs
 
 
@@ -229,13 +245,17 @@ class MultiHeadedAttention(nn.Module):
         self.out_proj = nn.Linear(n_feat, n_feat)
         self.dropout = nn.Dropout(p=dropout_rate)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, valid_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         b, t, d = x.size()
         q_h = self.q_proj(x).view(b, t, self.h, self.d_k).transpose(1, 2)
         k_h = self.k_proj(x).view(b, t, self.h, self.d_k).transpose(1, 2)
         v_h = self.v_proj(x).view(b, t, self.h, self.d_k).transpose(1, 2)
         q_h = q_h * (self.d_k**-0.5)
         scores = torch.matmul(q_h, k_h.transpose(-2, -1))
+        if valid_mask is not None:
+            scores = scores.masked_fill(~valid_mask[:, None, None, :], float("-inf"))
         attn = torch.softmax(scores, dim=-1)
         p_attn = self.dropout(attn)
         x = torch.matmul(p_attn, v_h)
@@ -262,13 +282,17 @@ class AdaptorEncoderLayer(nn.Module):
         self.activation = ACT2FN[activation_function]
         self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, valid_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         residual = x
         x = self.self_attn_layer_norm(x)
-        x = residual + self.dropout(self.self_attn(x))
+        x = residual + self.dropout(self.self_attn(x, valid_mask))
         residual = x
         x = self.final_layer_norm(x)
         x = residual + self.dropout(self.fc2(self.activation(self.fc1(x))))
+        if valid_mask is not None:
+            x = x * valid_mask.unsqueeze(-1)
         return x
 
 
@@ -305,12 +329,14 @@ class FunAsrNanoAdaptor(nn.Module):
             ]
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, valid_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         x = self.linear_1(x)
         x = self.act(x)
         x = self.linear_2(x)
         for block in self.blocks:
-            x = block(x)
+            x = block(x, valid_mask)
         return x
 
 
@@ -379,25 +405,27 @@ class FunAsrNanoForConditionalGeneration(nn.Module):
         device = next(self.audio_tower.parameters()).device
         dtype = next(self.audio_tower.parameters()).dtype
 
-        embeddings: List[torch.Tensor] = []
+        sequences: List[torch.Tensor] = []
+        lengths: List[int] = []
         for item in items:
             feature = item.feature.to(device=device, dtype=dtype)
-            # feature: [1, input_size=560, T_padded] (LFR-stacked).
             mask = getattr(item, "feature_attention_mask", None)
-            if mask is not None:
-                mask = mask.to(device=device)
-                valid = int(mask.sum().item())
-                # Single audio per item; take the first row's valid frames.
-                feature = feature[:, :, :valid]
-            # [1, 560, T] → [1, T, 560] (encoder expects [B, T, D]).
-            xs = feature.permute(0, 2, 1).contiguous()
-            enc_out = self.audio_tower(xs)  # [1, T, 512]
-            adp_out = self.multi_modal_projector(enc_out)  # [1, T, 1024]
-            t_lfr = adp_out.shape[1]
-            num_tokens = int(fun_asr_low_frame_rate_length(t_lfr))
-            num_tokens = max(num_tokens, 1)
-            embeddings.append(adp_out[0, :num_tokens, :])  # [num_tokens, 1024]
+            valid = int(mask.sum().item()) if mask is not None else feature.shape[-1]
+            sequences.append(feature[0, :, :valid].transpose(0, 1))
+            lengths.append(valid)
 
+        xs = nn.utils.rnn.pad_sequence(sequences, batch_first=True)
+        length_tensor = torch.tensor(lengths, device=device)
+        valid_mask = (
+            torch.arange(xs.shape[1], device=device)[None, :] < length_tensor[:, None]
+        )
+        enc_out = self.audio_tower(xs, valid_mask)
+        adp_out = self.multi_modal_projector(enc_out, valid_mask)
+
+        embeddings: List[torch.Tensor] = []
+        for index, length in enumerate(lengths):
+            num_tokens = max(int(fun_asr_low_frame_rate_length(length)), 1)
+            embeddings.append(adp_out[index, :num_tokens, :])
         return torch.cat(embeddings, dim=0)
 
     def forward(

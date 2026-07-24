@@ -113,8 +113,8 @@ def create_sglang_fun_asr_executor(
     enable_pre_lm_encoder: bool = True,
     pre_lm_cache_max_entries: int = 4096,
     pre_lm_cache_size_bytes: int = 2 * 1024**3,
-    request_build_max_workers: int = 8,
-    request_build_max_pending: int | None = 16,
+    request_build_max_workers: int = 16,
+    request_build_max_pending: int | None = 32,
     server_args_overrides: dict[str, Any] | None = None,
 ):
 

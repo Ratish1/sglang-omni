@@ -93,7 +93,9 @@ def test_fun_asr_audio_feature_shape() -> None:
             super().__init__()
             self.anchor = nn.Parameter(torch.zeros(1))
 
-        def forward(self, value: torch.Tensor) -> torch.Tensor:
+        def forward(
+            self, value: torch.Tensor, valid_mask: torch.Tensor | None = None
+        ) -> torch.Tensor:
             return value
 
     model = FunAsrNanoForConditionalGeneration.__new__(
@@ -101,7 +103,14 @@ def test_fun_asr_audio_feature_shape() -> None:
     )
     nn.Module.__init__(model)
     model.audio_tower = _IdentityTower()
-    model.multi_modal_projector = nn.Identity()
+
+    class _IdentityProjector(nn.Module):
+        def forward(
+            self, value: torch.Tensor, valid_mask: torch.Tensor | None = None
+        ) -> torch.Tensor:
+            return value
+
+    model.multi_modal_projector = _IdentityProjector()
     item = SimpleNamespace(
         feature=torch.arange(68, dtype=torch.float32).reshape(1, 4, 17),
         feature_attention_mask=torch.ones(1, 17, dtype=torch.long),
@@ -110,3 +119,35 @@ def test_fun_asr_audio_feature_shape() -> None:
     embedding = model.get_audio_feature([item])
 
     assert embedding.shape == (3, 4)
+
+
+def test_fun_asr_masked_batch_matches_individual_encoder_outputs() -> None:
+    torch.manual_seed(0)
+    encoder = FunAsrNanoAudioEncoder(
+        input_size=8,
+        output_size=8,
+        attention_heads=2,
+        linear_units=16,
+        num_blocks=2,
+        tp_blocks=1,
+        kernel_size=3,
+    ).eval()
+    projector = FunAsrNanoAdaptor(
+        encoder_dim=8,
+        llm_dim=8,
+        ffn_dim=16,
+        num_layers=1,
+        attention_heads=2,
+    ).eval()
+    short = torch.randn(1, 5, 8)
+    long = torch.randn(1, 8, 8)
+
+    expected_short = projector(encoder(short))
+    expected_long = projector(encoder(long))
+    padded = nn.utils.rnn.pad_sequence([short[0], long[0]], batch_first=True)
+    valid_mask = torch.arange(8)[None, :] < torch.tensor([5, 8])[:, None]
+    actual = projector(encoder(padded, valid_mask), valid_mask)
+
+    torch.testing.assert_close(actual[0, :5], expected_short[0], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(actual[1], expected_long[0], atol=1e-5, rtol=1e-5)
+    assert torch.count_nonzero(actual[0, 5:]) == 0
