@@ -128,7 +128,9 @@ class ModelRunner:
         self._staging_slot ^= 1
         return buf
 
-    def execute(self, scheduler_output: Any) -> ModelRunnerOutput:
+    def execute(
+        self, scheduler_output: Any, skip_rids: set[str] | None = None
+    ) -> ModelRunnerOutput:
         """Full synchronous pipeline: build → prepare → forward → post →
         sample → output.
 
@@ -137,6 +139,14 @@ class ModelRunner:
         sub-steps (``_build_forward_batch`` / ``_prepare_and_forward`` /
         ``_finalize``) that ``execute_launch`` + ``execute_resolve`` also use,
         in the same order. Async decode splits this at the post-decode boundary.
+
+        ``skip_rids`` are rows whose request finished in an EARLIER step (the
+        async fast path's stale overrun): forwarded to fill their already
+        committed KV slot, but not counted as a generation step. The caller
+        snapshots it, because only the caller knows which finishes predate this
+        step — a request that finishes *during* this step's post hooks (an EOC
+        finish, which ``_mark_sampler_finished`` sets) must still be counted.
+        Same reason ``execute_resolve`` snapshots before its collect.
         """
         built = self._build_forward_batch(scheduler_output)
         if built is None:
@@ -159,6 +169,7 @@ class ModelRunner:
             schedule_batch,
             model_worker_batch,
             scheduler_output,
+            skip_rids=skip_rids or set(),
         )
 
     def execute_launch(self, scheduler_output: Any) -> "_PendingStep | None":
