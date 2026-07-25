@@ -16,21 +16,29 @@ from sglang_omni.config import (
 )
 
 _PKG = "sglang_omni.models.moss_tts_local"
-# Note (Ratish): in the default single-process topology preprocessing loads before AR, so its
-# codec memory is included by process-scoped SGLang accounting
-# the reserve is for the later vocoder codec instance and runtime headroom
-_COLOCATED_TOTAL_GPU_MEMORY_FRACTION = 0.90
-_COLOCATED_CODEC_MEM_RESERVE = 0.15
+# Keep reference encoding with AR so process-scoped SGLang accounting includes
+# its codec allocation. The vocoder is isolated: its Python-heavy packed decode
+# otherwise stalls the AR scheduler thread under ordinary serving concurrency.
+_COLOCATED_PREPROCESSING_GPU_MEMORY_FRACTION = 0.15
+_COLOCATED_AR_GPU_MEMORY_FRACTION = 0.67
+_COLOCATED_VOCODER_GPU_MEMORY_FRACTION = 0.18
 _AR_MEM_FRACTION_STATIC = 0.85
 _REF_AUDIO_CACHE_MAX_ITEMS = 8192
 _REF_AUDIO_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 
 def _stages(*, codec_device: str, colocated: bool) -> list[StageConfig]:
+    preprocessing_runtime = StageRuntimeConfig(
+        resources=StageResourceConfig(
+            total_gpu_memory_fraction=(
+                _COLOCATED_PREPROCESSING_GPU_MEMORY_FRACTION if colocated else None
+            )
+        )
+    )
     tts_engine_runtime = StageRuntimeConfig(
         resources=StageResourceConfig(
             total_gpu_memory_fraction=(
-                _COLOCATED_TOTAL_GPU_MEMORY_FRACTION if colocated else None
+                _COLOCATED_AR_GPU_MEMORY_FRACTION if colocated else None
             )
         ),
         sglang_server_args=SGLangServerArgsConfig(
@@ -39,7 +47,14 @@ def _stages(*, codec_device: str, colocated: bool) -> list[StageConfig]:
     )
     tts_engine_args: dict[str, Any] = {"dtype": "bfloat16"}
     if colocated:
-        tts_engine_args["codec_mem_reserve"] = _COLOCATED_CODEC_MEM_RESERVE
+        tts_engine_args["codec_mem_reserve"] = 0.0
+    vocoder_runtime = StageRuntimeConfig(
+        resources=StageResourceConfig(
+            total_gpu_memory_fraction=(
+                _COLOCATED_VOCODER_GPU_MEMORY_FRACTION if colocated else None
+            )
+        )
+    )
 
     return [
         StageConfig(
@@ -47,6 +62,7 @@ def _stages(*, codec_device: str, colocated: bool) -> list[StageConfig]:
             process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
             factory_args={"device": codec_device},
+            runtime=preprocessing_runtime,
             gpu=0,
             next="tts_engine",
         ),
@@ -62,9 +78,10 @@ def _stages(*, codec_device: str, colocated: bool) -> list[StageConfig]:
         ),
         StageConfig(
             name="vocoder",
-            process="pipeline",
+            process="vocoder" if colocated else "pipeline",
             factory=f"{_PKG}.stages.create_vocoder_executor",
             factory_args={"device": codec_device},
+            runtime=vocoder_runtime,
             gpu=0,
             terminal=True,
             can_accept_stream_before_payload=True,

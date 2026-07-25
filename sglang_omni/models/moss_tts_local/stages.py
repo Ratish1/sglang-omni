@@ -54,6 +54,7 @@ _MOSS_TTS_LOCAL_INSTALL_HINT = (
     "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2."
 )
 _MAX_REFERENCE_SECONDS = 100.0
+_MAX_PIPELINE_INTRAOP_THREADS = 8
 
 # NOTE: preprocessing and vocoder stages each load their own codec instance:
 # `model.streaming()` flips codec state, so a decode on a shared instance would
@@ -78,6 +79,27 @@ class _WaveformReferenceJob:
 
 
 _ReferenceEncodeJob: TypeAlias = _PathReferenceJob | _WaveformReferenceJob
+
+
+def _configure_pipeline_threads(worker_count: int) -> int:
+    """Bound the shared Torch CPU pool used by the colocated pipeline process."""
+    override = os.environ.get("OMP_NUM_THREADS", "").strip()
+    if override.isdigit() and int(override) >= 1:
+        requested = int(override)
+        torch.set_num_threads(requested)
+        return requested
+
+    cpu_count = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else (os.cpu_count() or 1)
+    )
+    intraop_threads = min(
+        max(cpu_count // max(int(worker_count), 1), 1),
+        _MAX_PIPELINE_INTRAOP_THREADS,
+    )
+    torch.set_num_threads(intraop_threads)
+    return intraop_threads
 
 
 def _apply_colocated_ar_memory_budget(
@@ -492,6 +514,14 @@ def create_preprocessing_executor(
     ref_audio_cache_max_items: int = 8192,
     ref_audio_cache_max_bytes: int = 64 * 1024 * 1024,
 ) -> SimpleScheduler:
+    worker_count = max(int(max_concurrency), 1)
+    intraop_threads = _configure_pipeline_threads(worker_count)
+    logger.info(
+        "MOSS-TTS Local pipeline uses %d preprocessing workers, "
+        "%d shared intra-op threads",
+        worker_count,
+        intraop_threads,
+    )
     # MOSS_REF_AUDIO_CACHE=0 disables the cache at startup (ops kill switch / A-B
     # toggle) without a config edit; unset => kwarg/config default.
     env_toggle = os.environ.get("MOSS_REF_AUDIO_CACHE")
