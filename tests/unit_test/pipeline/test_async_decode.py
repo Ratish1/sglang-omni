@@ -1070,9 +1070,10 @@ def _result(n):
 
 def test_drop_stale_overrun_mixed_leaves_per_token_fields_alone():
     # The drop runs AFTER the forward, so the per-token fields (out_cache_loc,
-    # input_ids, extend_lens) never have to be resliced — reslicing them was
-    # #1023. Only the req-level state that the merge back into running_batch
-    # reads has to be filtered, which filter_batch does.
+    # input_ids, extend_lens) never have to be resliced — a reslice is where a
+    # request-index-vs-token-index corruption once shipped. Only the req-level
+    # state that the merge back into running_batch reads has to be filtered,
+    # which filter_batch does.
     freed = []
     s = _drop_stale_scheduler(freed)
     batch = _MixedBatch(lens=[3, 1, 1], done=[False, True, False])

@@ -213,11 +213,14 @@ def _aggregate(repeats: list[dict]) -> dict:
         # report (statistics.mean cannot take None), and say so.
         values = [r[key] for r in repeats if r[key] is not None]
         if not values:
-            return {"mean": None, "min": None, "max": None}
+            return {"mean": None, "min": None, "max": None, "n": 0}
         return {
             "mean": statistics.mean(values),
             "min": min(values),
             "max": max(values),
+            # how many repeats actually contributed — a survivor mean over
+            # fewer repeats than were run must not read as a clean result
+            "n": len(values),
         }
 
     return {

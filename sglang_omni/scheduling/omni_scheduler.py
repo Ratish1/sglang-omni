@@ -1877,7 +1877,8 @@ class OmniScheduler:
           mix_with_running built it, so the per-token fields (out_cache_loc,
           input_ids, extend_lens) of an extend/mixed batch need no reslicing —
           dropping a row before the forward would require reslicing every one
-          of them, and #1023 was that reslice going wrong;
+          of them, a repair that has already shipped a request-index-vs-token-
+          index corruption once;
         * the overrun row's KV slot is written by this forward. The drain's
           cache_finished_req already handed that slot to the radix cache
           (kv_committed_len counts the step prepare_for_decode allocated), so
