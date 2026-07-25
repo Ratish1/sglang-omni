@@ -185,7 +185,11 @@ def test_qwen3_omni_mmsu_example_config_uses_text_pipeline() -> None:
         "thinker",
         "decode",
     ]
-    assert {stage.process for stage in config.stages} == {"pipeline"}
+    assert {stage.process for stage in config.stages} == {
+        "pipeline",
+        "preprocessing",
+        "audio_encoder",
+    }
     assert "talker_ar" not in {stage.name for stage in config.stages}
     assert "code2wav" not in {stage.name for stage in config.stages}
     assert plan.gpus[0].total_gpu_memory_fraction == pytest.approx(0.8)
