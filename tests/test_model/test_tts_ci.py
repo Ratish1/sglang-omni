@@ -167,7 +167,6 @@ def _run_benchmark(
         stream=stream,
         ref_format=_PRESET.ref_format,
         token_count=_PRESET.token_count,
-        seed=_PRESET.seed,
     )
     speed_results = asyncio.run(run_tts_seedtts_benchmark(benchmark_config))
     _validate_speed_results_keys(speed_results)
