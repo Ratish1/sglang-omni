@@ -13,13 +13,9 @@ from typing import Any
 
 import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
-from sglang.srt.model_executor.forward_context import (
-    ForwardContext,
-    forward_context,
-    has_forward_context,
-)
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.model_runner.sglang_execution import attn_forward_context
 
 logger = logging.getLogger(__name__)
 
@@ -318,12 +314,7 @@ class ThinkerModelRunner(ModelRunner):
             full_ds[visual_pos_masks] = ds_input
             ds_input = full_ds
 
-        ctx_mgr = (
-            contextlib.nullcontext()
-            if has_forward_context()
-            else forward_context(ForwardContext(attn_backend=model_runner.attn_backend))
-        )
-        with ctx_mgr:
+        with attn_forward_context(model_runner.attn_backend):
             hidden_states = outer.model(
                 input_ids=None,
                 positions=positions,

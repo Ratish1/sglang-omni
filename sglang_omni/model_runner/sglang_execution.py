@@ -3,10 +3,7 @@
 
 SGLang 0.5.15 made the scheduler/worker boundary an explicit protocol:
 
-* decode tokens cross iterations through ``FutureMap``;
-* scheduler writes and model forwards use separate CUDA streams;
-* the decode CUDA-graph runner publishes a read-done event which gates the
-  next scheduler mutation; and
+* decode tokens cross iterations through ``FutureMap``; and
 * a mutable ``ScheduleBatch`` is isolated while ``ForwardBatch.init_new``
   consumes its one-shot fields.
 
@@ -14,6 +11,12 @@ Omni owns its scheduler loop and model-runner wrapper, so it cannot rely on
 ``sglang.srt.managers.scheduler.Scheduler.run_batch`` to provide that protocol.
 This adapter is the single compatibility boundary used by both synchronous and
 lookahead execution.
+
+Upstream's protocol also splits scheduler writes and model forwards onto
+separate CUDA streams, fenced by the decode CUDA-graph read-done event. That
+two-stream contract belongs to the upstream-style overlap loop, which Omni
+refuses to run (``OmniScheduler._event_loop_overlap`` raises), so this bridge
+is deliberately single-stream: launch-current/resolve-previous on one stream.
 """
 
 from __future__ import annotations
@@ -26,6 +29,24 @@ from typing import Any
 import torch
 
 
+def attn_forward_context(attn_backend: Any):
+    """Enter SGLang's ambient ``ForwardContext`` unless one is already active.
+
+    0.5.15 attention backends read the context that ``Scheduler.run_batch``
+    installs; Omni's wrapped forwards run outside that loop, so each wrapper
+    enters the context itself when no caller has.
+    """
+    from sglang.srt.model_executor.forward_context import (
+        ForwardContext,
+        forward_context,
+        has_forward_context,
+    )
+
+    if has_forward_context():
+        return contextlib.nullcontext()
+    return forward_context(ForwardContext(attn_backend=attn_backend))
+
+
 class SGLangExecutionBridge:
     """Adapt Omni's custom runner to SGLang's 0.5.15 execution contract."""
 
@@ -36,7 +57,6 @@ class SGLangExecutionBridge:
         worker: Any,
         req_to_token_pool: Any,
         spec_algorithm: Any,
-        enable_stream_overlap: bool,
     ) -> None:
         from sglang.srt.managers.overlap_utils import RelayPayload
 
@@ -44,9 +64,6 @@ class SGLangExecutionBridge:
         self.worker = worker
         self.runner = worker.model_runner
         self.device_module = torch.get_device_module(device)
-        self.enable_stream_overlap = bool(
-            enable_stream_overlap and device.type == "cuda"
-        )
         self.future_map = spec_algorithm.create_future_map(
             device,
             req_to_token_pool,
@@ -54,69 +71,33 @@ class SGLangExecutionBridge:
         )
         self._relay_payload_type = RelayPayload
 
-        self.schedule_stream = None
-        self.forward_stream = (
-            self.runner.forward_stream if self.enable_stream_overlap else None
-        )
-        self._batch_record_buf: list[Any | None] = [None, None]
-        self._batch_record_slot = 0
-
-    def loop_context(self):
-        """Return the scheduling-stream context for an overlap event loop."""
-        if not self.enable_stream_overlap:
-            return contextlib.nullcontext()
-        if self.schedule_stream is None:
-            self.schedule_stream = self.device_module.Stream(priority=0)
-        return self.device_module.stream(self.schedule_stream)
-
-    def before_schedule(self) -> None:
-        """Fence scheduler writes on the preceding forward's last shared read."""
-        if not self.enable_stream_overlap:
-            return
-        assert self.schedule_stream is not None
-        read_done = self.runner.war_fastpath_read_done_event
-        if read_done is not None:
-            self.schedule_stream.wait_event(read_done)
-            self.runner.war_fastpath_read_done_event = None
-        else:
-            self.schedule_stream.wait_stream(self.forward_stream)
-
     @contextlib.contextmanager
     def forward_context(self, batch: Any) -> Iterator[None]:
         """Resolve inputs and isolate ``ScheduleBatch`` for one forward."""
         from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 
-        stream_ctx = contextlib.nullcontext()
-        if self.enable_stream_overlap:
-            assert self.schedule_stream is not None
-            self.forward_stream.wait_stream(self.schedule_stream)
-            stream_ctx = self.device_module.stream(self.forward_stream)
+        resolve_forward_inputs(batch, self.future_map)
 
-        with stream_ctx:
-            resolve_forward_inputs(batch, self.future_map)
-
-            snapshot_full = not batch.spec_algorithm.is_none()
-            scheduler_snapshot = (
-                {
-                    field.name: getattr(batch, field.name)
-                    for field in dataclasses.fields(batch)
-                }
-                if snapshot_full
-                else None
-            )
-            scheduler_sampling_info = batch.sampling_info
-            if scheduler_sampling_info is not None:
-                batch.sampling_info = scheduler_sampling_info.copy_for_forward()
-            if self.enable_stream_overlap:
-                self._record_batch_tensors(batch)
-            try:
-                yield
-            finally:
-                if snapshot_full:
-                    for name, value in scheduler_snapshot.items():
-                        setattr(batch, name, value)
-                else:
-                    batch.sampling_info = scheduler_sampling_info
+        snapshot_full = not batch.spec_algorithm.is_none()
+        scheduler_snapshot = (
+            {
+                field.name: getattr(batch, field.name)
+                for field in dataclasses.fields(batch)
+            }
+            if snapshot_full
+            else None
+        )
+        scheduler_sampling_info = batch.sampling_info
+        if scheduler_sampling_info is not None:
+            batch.sampling_info = scheduler_sampling_info.copy_for_forward()
+        try:
+            yield
+        finally:
+            if snapshot_full:
+                for name, value in scheduler_snapshot.items():
+                    setattr(batch, name, value)
+            else:
+                batch.sampling_info = scheduler_sampling_info
 
     def publish_next_tokens(
         self,
@@ -146,10 +127,3 @@ class SGLangExecutionBridge:
         event.record()
         return event
 
-    def _record_batch_tensors(self, batch: Any) -> None:
-        """Keep every ScheduleBatch field alive for the two-iteration window."""
-        snapshot = [
-            getattr(batch, field.name, None) for field in dataclasses.fields(batch)
-        ]
-        self._batch_record_slot ^= 1
-        self._batch_record_buf[self._batch_record_slot] = [batch, snapshot]

@@ -21,7 +21,6 @@ import types
 from array import array
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
@@ -445,12 +444,6 @@ class OmniScheduler:
             worker=self.tp_worker,
             req_to_token_pool=self.req_to_token_pool,
             spec_algorithm=self.spec_algorithm,
-            # Omni async decode is deliberately a single-stream
-            # launch-current/resolve-previous loop. SGLang's independent
-            # schedule/forward streams have a different WAR and sampling
-            # publication contract; only the upstream-style overlap loop owns
-            # that two-stream contract.
-            enable_stream_overlap=self.enable_overlap,
         )
         model_runner._async_enabled = self.enable_async_decode
         model_runner.bind_execution_bridge(bridge)
@@ -1380,17 +1373,12 @@ class OmniScheduler:
         self._scheduler_thread_id = threading.get_ident()
         self._running = True
         try:
-            bridge = self.__dict__.get("_execution_bridge")
-            loop_context = (
-                bridge.loop_context() if bridge is not None else nullcontext()
-            )
-            with loop_context:
-                if getattr(self, "enable_async_decode", False):
-                    self._event_loop_async_decode()
-                elif self.enable_overlap:
-                    self._event_loop_overlap()
-                else:
-                    self._event_loop_normal()
+            if getattr(self, "enable_async_decode", False):
+                self._event_loop_async_decode()
+            elif self.enable_overlap:
+                self._event_loop_overlap()
+            else:
+                self._event_loop_normal()
         finally:
             self._scheduler_thread_id = None
             try:
@@ -2136,9 +2124,6 @@ class OmniScheduler:
             ):
                 self._resolve_pending_async()
 
-            bridge = self.__dict__.get("_execution_bridge")
-            if bridge is not None:
-                bridge.before_schedule()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
