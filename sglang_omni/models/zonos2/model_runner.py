@@ -319,6 +319,21 @@ class Zonos2ModelRunner(ModelRunner):
         pool = self.model._decode_state_pool
         for i, sr in enumerate(requests):
             data = sr.data
+            # Overrun guard: a request finished or retracted in a PRIOR step is
+            # still a row of this lagged resolve (launch ran before that finish
+            # was known). Its frame must not reach output_codes — the terminal
+            # frame already shipped — and its pool row was already released at
+            # its own finishing step. finished_cpu below is THIS step's sampler
+            # EOS, not the prior-step lifecycle; it cannot cover this case.
+            # Mirrors moss_tts_local/model_runner.py's resolve-side skip.
+            req = getattr(data, "req", None)
+            if req is not None:
+                try:
+                    prior_finished = req.finished()
+                except AttributeError:
+                    prior_finished = False
+                if prior_finished or bool(getattr(req, "is_retracted", False)):
+                    continue
             data.output_codes.append(codes_cpu[i].clone())
             data.eos_frame = int(eos_val_cpu[i]) if bool(eos_set_cpu[i]) else None
             if bool(finished_cpu[i]):
