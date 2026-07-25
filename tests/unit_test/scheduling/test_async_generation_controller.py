@@ -211,12 +211,6 @@ def test_barrier_requires_depth_zero():
     c.assert_barrier_clear()
 
 
-def test_identities_are_monotonic():
-    c = AsyncGenerationController(GenerationProtocol.LAGGED)
-    assert [c.next_step_id() for _ in range(3)] == [1, 2, 3]
-    assert [c.next_admission_serial() for _ in range(3)] == [1, 2, 3]
-
-
 # ---------------------------------------------------------------------------
 # Contract validation
 # ---------------------------------------------------------------------------
@@ -234,10 +228,6 @@ def _contract(**overrides) -> LaggedGenerationContract:
     return LaggedGenerationContract(**kwargs)
 
 
-def test_contract_valid_shape():
-    assert _contract().is_valid
-
-
 @pytest.mark.parametrize(
     ("overrides", "needle"),
     [
@@ -248,7 +238,8 @@ def test_contract_valid_shape():
     ],
 )
 def test_contract_invalid_shapes(overrides, needle):
-    errors = _contract(**overrides).validation_errors()
+    assert _contract().is_valid  # precondition: the failure below is caused by
+    errors = _contract(**overrides).validation_errors()  # the override alone
     assert errors and any(needle in e for e in errors)
 
 

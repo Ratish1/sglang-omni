@@ -326,14 +326,9 @@ class Zonos2ModelRunner(ModelRunner):
             # its own finishing step. finished_cpu below is THIS step's sampler
             # EOS, not the prior-step lifecycle; it cannot cover this case.
             # Mirrors moss_tts_local/model_runner.py's resolve-side skip.
-            req = getattr(data, "req", None)
-            if req is not None:
-                try:
-                    prior_finished = req.finished()
-                except AttributeError:
-                    prior_finished = False
-                if prior_finished or bool(getattr(req, "is_retracted", False)):
-                    continue
+            req = data.req
+            if req is not None and (req.finished() or req.is_retracted):
+                continue
             data.output_codes.append(codes_cpu[i].clone())
             data.eos_frame = int(eos_val_cpu[i]) if bool(eos_set_cpu[i]) else None
             if bool(finished_cpu[i]):

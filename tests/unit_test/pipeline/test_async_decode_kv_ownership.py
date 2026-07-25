@@ -267,3 +267,80 @@ def test_compensating_free_of_the_overrun_slot_aliases_it(server_args):
     tree.evict(EvictParams(num_tokens=len(_tree_slots(tree))))
     free = _free_slots(alloc)
     assert free.count(overrun) == 2, "the same slot is now free twice over"
+
+
+def test_release_with_skip_radix_cache_insert_frees_instead_of_caching(server_args):
+    """The failure-path contract: a batch whose forward raised holds allocated,
+    possibly-unwritten slots. Marking ``skip_radix_cache_insert`` before the
+    abort's release must route every slot to the allocator, never the tree —
+    upstream honors the flag in release_kv_cache and maybe_cache_unfinished_req."""
+    from sglang.srt.managers.scheduler import Scheduler as Upstream
+    from sglang.srt.mem_cache.common import release_kv_cache
+
+    req_to_token, alloc, tree = _pools()
+    sched = _scheduler(req_to_token, alloc, tree, server_args)
+    r0 = _req("r0", [1, 2, 3, 4], tree)
+    batch = _batch([r0], req_to_token, alloc, tree)
+    batch.prepare_for_extend()
+    Upstream.process_batch_result_prefill(sched, batch, _Result(1))
+    batch.output_ids = torch.tensor([21], dtype=torch.int64)
+    batch.prepare_for_decode()  # the step whose forward will "raise"
+    unwritten = int(batch.out_cache_loc[0])
+
+    tree_before = set(_tree_slots(tree))
+    r0.skip_radix_cache_insert = True
+    release_kv_cache(r0, tree)
+
+    # The prompt prefix stays tree-owned — it was validly cached by the
+    # SUCCESSFUL prefill's cache_unfinished_req and is lock-protected. The
+    # contract is about the failed step: nothing new enters the tree, and the
+    # unwritten slot goes back to the allocator.
+    assert set(_tree_slots(tree)) == tree_before, "no failed-batch slot may be cached"
+    assert unwritten in set(_free_slots(alloc)), "the unwritten slot must be freed"
+
+
+def test_release_without_the_flag_caches_the_unwritten_tail(server_args):
+    """The hazard the flag exists for: the default release inserts the request's
+    committed range — including the slot the raised forward never wrote — into
+    the prefix cache, where a later exact-prefix match would read it."""
+    from sglang.srt.managers.scheduler import Scheduler as Upstream
+    from sglang.srt.mem_cache.common import release_kv_cache
+
+    req_to_token, alloc, tree = _pools()
+    sched = _scheduler(req_to_token, alloc, tree, server_args)
+    r0 = _req("r0", [1, 2, 3, 4], tree)
+    batch = _batch([r0], req_to_token, alloc, tree)
+    batch.prepare_for_extend()
+    Upstream.process_batch_result_prefill(sched, batch, _Result(1))
+    batch.output_ids = torch.tensor([21], dtype=torch.int64)
+    batch.prepare_for_decode()
+    unwritten = int(batch.out_cache_loc[0])
+
+    release_kv_cache(r0, tree)
+
+    assert unwritten in _tree_slots(tree), (
+        "expected the documented hazard: the unwritten slot lands in the tree "
+        "(if this fails, upstream changed release semantics — re-audit the guard)"
+    )
+
+
+def test_batch_failure_flags_every_req_before_aborting(server_args):
+    """_handle_batch_failure's ordering contract: the flag must be set on each
+    request BEFORE abort runs its release, or the release caches the failed
+    batch's KV anyway. Catches a reorder or a dropped flag in that handler."""
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    s = OmniScheduler.__new__(OmniScheduler)
+    flagged_at_abort: dict[str, bool] = {}
+    reqs = [_req("a", [1], _pools()[2]), _req("b", [2], _pools()[2])]
+    by_rid = {r.rid: r for r in reqs}
+    s._emit_request_error = lambda rid, err: None
+    s.abort = lambda rid, **kw: flagged_at_abort.__setitem__(
+        rid, bool(getattr(by_rid[rid], "skip_radix_cache_insert", False))
+    )
+
+    s._handle_batch_failure(
+        types.SimpleNamespace(reqs=reqs), RuntimeError("forward boom")
+    )
+
+    assert flagged_at_abort == {"a": True, "b": True}
