@@ -325,9 +325,11 @@ class Zonos2ModelRunner(ModelRunner):
             # frame already shipped — and its pool row was already released at
             # its own finishing step. finished_cpu below is THIS step's sampler
             # EOS, not the prior-step lifecycle; it cannot cover this case.
-            # Mirrors moss_tts_local/model_runner.py's resolve-side skip.
+            # data.req is set at request build, before scheduling — a None here
+            # is an invariant violation and must fail loudly (via
+            # _handle_batch_failure), not silently append a frame.
             req = data.req
-            if req is not None and (req.finished() or req.is_retracted):
+            if req.finished() or req.is_retracted:
                 continue
             data.output_codes.append(codes_cpu[i].clone())
             data.eos_frame = int(eos_val_cpu[i]) if bool(eos_set_cpu[i]) else None
