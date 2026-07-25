@@ -57,9 +57,25 @@ class GenerationProtocol(enum.Enum):
 class PendingStepState(enum.Enum):
     """Lifecycle of one launched generation step (the scheduler transaction).
 
-    ``PLANNED -> LAUNCHED -> DEVICE_READY -> COMMITTING -> COMMITTED`` is the
-    success path; ``ROLLED_BACK`` and ``FATAL`` are terminal failure states.
-    See ``_LEGAL_TRANSITIONS`` for which failures are reachable from where.
+    The success path is a straight line — ``PLANNED -> LAUNCHED ->
+    DEVICE_READY -> COMMITTING -> COMMITTED`` — and the extra states are not
+    granularity for its own sake: each boundary is where the CONSEQUENCE of a
+    failure changes, which is what the pre-v2 failure handling got wrong:
+
+    ================  =============================  ======================
+    failure during    what is still true             legal exit
+    ================  =============================  ======================
+    PLANNED           device untouched               exact claim rollback
+    LAUNCHED          device state may be mutated    wait event, then FATAL
+                                                     (or contract ROLLBACK)
+    DEVICE_READY      host state not yet mutated     abandon cleanly
+    COMMITTING        host mutation started          FATAL only — a partial
+                                                     commit retried is not
+                                                     exactly-once
+    ================  =============================  ======================
+
+    The deliberately ABSENT edge ``COMMITTING -> ROLLED_BACK`` is the
+    exactly-once guarantee. See ``_LEGAL_TRANSITIONS``.
     """
 
     PLANNED = "planned"
