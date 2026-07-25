@@ -39,6 +39,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         stream_followup_stride: int = DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
         prefill_coalesce_requests: int = 0,
         prefill_coalesce_wait_ms: float = 60.0,
+        prefill_graph_max_req: int | None = None,
         total_gpu_memory_fraction: float | None = None,
     ) -> None:
         if total_gpu_memory_fraction is not None and not (
@@ -57,6 +58,12 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         self.stream_followup_stride = stream_followup_stride
         self.prefill_coalesce_requests = prefill_coalesce_requests
         self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
+        self._prefill_graph_max_req_explicit = prefill_graph_max_req is not None
+        self.prefill_graph_max_req = (
+            max(int(prefill_graph_max_req), 1)
+            if prefill_graph_max_req is not None
+            else max(int(max_running_requests), 1)
+        )
         self.total_gpu_memory_fraction = total_gpu_memory_fraction
         self.model: Any | None = None
         self._prefill_graph_model_runner: Any | None = None
@@ -82,15 +89,22 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
             # to eager. Use 64-token buckets: 128-token buckets add about 43%
             # padding work on the Higgs CI prompt distribution, while this
             # halves that waste without making graph startup or memory scale
-            # excessively. The captured request-slot count follows the
-            # scheduler's prefill-coalescing bound, so the two contracts cannot
-            # drift.
+            # excessively. The captured request-slot count is sized to
+            # max_running_requests, NOT to prefill_coalesce_requests: coalescing
+            # is a release floor (the gate holds until K requests wait, then
+            # admits every one of them through the unbounded upstream adder),
+            # so it never bounds the extend batch size. Sizing slots by K made
+            # can_run_graph reject any batch wider than K, i.e. the graph
+            # missed exactly under the concurrency it was captured for. Slots
+            # only widen the attention plan and the zero-length sentinel count,
+            # not the token-axis buffers, so covering the full request cap is
+            # cheap.
             "cuda_graph_config": {
                 "prefill": {
                     "backend": "full",
                     "max_bs": 512,
                     "bs": list(range(64, 513, 64)),
-                    "full_prefill_max_req": max(int(self.prefill_coalesce_requests), 1),
+                    "full_prefill_max_req": self.prefill_graph_max_req,
                 }
             },
             "mem_fraction_static": (
@@ -103,6 +117,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         }
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
+        self._resolve_prefill_graph_max_req(overrides)
         # Note: (Jiaxin Deng) an explicit mem_fraction_static override (e.g.
         # --talker-mem-fraction-static) wins, but never silently.
         expected = self.total_gpu_memory_fraction
@@ -117,6 +132,25 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
             actual,
             expected,
         )
+
+    def _resolve_prefill_graph_max_req(self, overrides: dict[str, Any]) -> None:
+        """Re-derive the prefill graph request slots from the resolved cap.
+
+        generation_defaults() is evaluated before build_generation_batch_overrides
+        applies server_args_overrides, so a --max-running-requests override would
+        otherwise leave the slot count at the constructor default and reintroduce
+        the can_run_graph rejection this knob exists to remove. An explicit
+        prefill_graph_max_req still wins, as does an explicit cuda_graph_config
+        that drops the key.
+        """
+        if self._prefill_graph_max_req_explicit:
+            return
+        prefill = (overrides.get("cuda_graph_config") or {}).get("prefill")
+        if not isinstance(prefill, dict) or "full_prefill_max_req" not in prefill:
+            return
+        resolved = max(int(overrides.get("max_running_requests") or 1), 1)
+        self.prefill_graph_max_req = resolved
+        prefill["full_prefill_max_req"] = resolved
 
     def customize_server_args(self, server_args: Any) -> None:
         server_args.disable_overlap_schedule = True

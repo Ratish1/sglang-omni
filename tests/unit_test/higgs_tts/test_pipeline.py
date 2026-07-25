@@ -318,12 +318,15 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     ]
     assert captured["overrides"]["cuda_graph_max_bs"] == 64
     assert captured["overrides"]["max_running_requests"] == 64
+    # Request slots follow max_running_requests, not prefill_coalesce_requests:
+    # coalescing only sets a release floor, so it never bounds the extend batch
+    # size that can_run_graph checks against.
     assert captured["overrides"]["cuda_graph_config"] == {
         "prefill": {
             "backend": "full",
             "max_bs": 512,
             "bs": list(range(64, 513, 64)),
-            "full_prefill_max_req": 1,
+            "full_prefill_max_req": 64,
         }
     }
     assert captured["server_args"].disable_overlap_schedule is True
@@ -374,6 +377,52 @@ def _make_higgs_builder(**kwargs):
         enable_async_decode=False,
         async_decode_min_batch_size=2,
         **kwargs,
+    )
+
+
+def _higgs_prefill_graph_slots(
+    *, server_args_overrides: dict[str, Any] | None = None, **builder_kwargs: Any
+) -> int:
+    """Resolve full_prefill_max_req the way engine_factory.build() does."""
+    from sglang_omni.scheduling.generation_batch_policy import (
+        build_generation_batch_overrides,
+    )
+
+    builder = _make_higgs_builder(**builder_kwargs)
+    overrides = build_generation_batch_overrides(
+        server_args_overrides=server_args_overrides,
+        **builder.generation_defaults(dtype="bfloat16"),
+    )
+    builder.adjust_overrides(overrides)
+    return overrides["cuda_graph_config"]["prefill"]["full_prefill_max_req"]
+
+
+def test_higgs_prefill_graph_slots_follow_resolved_max_running_requests() -> None:
+    """generation_defaults() is evaluated before server_args_overrides are
+    applied, so the slot count must be re-derived from the resolved cap.
+    Otherwise --max-running-requests leaves can_run_graph rejecting every
+    extend batch wider than the constructor default."""
+    assert (
+        _higgs_prefill_graph_slots(
+            server_args_overrides={
+                "max_running_requests": 128,
+                "cuda_graph_max_bs": 128,
+            }
+        )
+        == 128
+    )
+
+
+def test_higgs_explicit_prefill_graph_max_req_wins_over_resolved_cap() -> None:
+    assert (
+        _higgs_prefill_graph_slots(
+            prefill_graph_max_req=8,
+            server_args_overrides={
+                "max_running_requests": 128,
+                "cuda_graph_max_bs": 128,
+            },
+        )
+        == 8
     )
 
 
