@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from sglang_omni.config import PipelineConfig, StageConfig
 from sglang_omni.models.moss_transcribe_diarize import (  # noqa: F401
     hf_config as _hf_config,
 )
+from sglang_omni.utils.cpu import bounded_intraop_threads
 
 _PKG = "sglang_omni.models.moss_transcribe_diarize"
+_REQUEST_BUILD_MAX_WORKERS = 2
+_MAX_PIPELINE_INTRAOP_THREADS = 8
 
 
 class MossTranscribeDiarizePipelineConfig(PipelineConfig):
@@ -37,13 +40,31 @@ class MossTranscribeDiarizePipelineConfig(PipelineConfig):
                 "device": "cuda:0",
                 "max_running_requests": 16,
                 "encoder_cache_size_bytes": 4 * 1024**3,
-                "request_build_max_workers": 8,
+                "request_build_max_workers": _REQUEST_BUILD_MAX_WORKERS,
                 "request_build_max_pending": 16,
             },
             gpu=0,
             terminal=True,
         )
     ]
+
+    def model_post_init(self, __context: Any = None) -> None:
+        super().model_post_init(__context)
+        # Request builders run torch/OpenMP-backed fbank extraction on CPU
+        # threads inside the asr stage process. Without a bound, each of the
+        # eight concurrent builders spawns a machine-sized OMP team; under a
+        # cgroup CPU quota the oversubscription starves the scheduler thread
+        # mid-prefill (50-300ms host stalls that gate streaming decode). The
+        # env must be in place before the spawned stage process imports Torch.
+        self.env_defaults.setdefault(
+            "OMP_NUM_THREADS",
+            str(
+                bounded_intraop_threads(
+                    worker_count=_REQUEST_BUILD_MAX_WORKERS,
+                    max_threads=_MAX_PIPELINE_INTRAOP_THREADS,
+                )
+            ),
+        )
 
 
 EntryClass = MossTranscribeDiarizePipelineConfig
