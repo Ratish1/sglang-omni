@@ -11,6 +11,7 @@ the graph itself only ever does ``_cg_active_*[:bs]`` slicing — no
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -35,6 +36,18 @@ from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_
 logger = logging.getLogger(__name__)
 
 
+def _syncfree_launch_enabled() -> bool:
+    """Parse SGLANG_OMNI_SYNCFREE_LAUNCH (default ON; 0/false/no disable)."""
+    value = os.environ.get("SGLANG_OMNI_SYNCFREE_LAUNCH", "1").lower()
+    if value in ("1", "true", "yes"):
+        return True
+    if value in ("0", "false", "no"):
+        return False
+    raise ValueError(
+        f'"{value}" is not a valid SGLANG_OMNI_SYNCFREE_LAUNCH boolean value'
+    )
+
+
 class HiggsTTSModelRunner(ModelRunner):
     """ModelRunner for :class:`HiggsTTSModel`."""
 
@@ -45,7 +58,11 @@ class HiggsTTSModelRunner(ModelRunner):
         # Ping-pong pinned host buffers for the async-decode rollout-logprob D2H.
         self._logprob_host_buffers: list[torch.Tensor] | None = None
         self._logprob_slot = 0
-        self._cg_layout_signature: tuple[int, tuple[str, ...]] | None = None
+        # Note (Yueying Li): sync-free decode launch (see _populate_cg_buffers): skip the
+        # composition-invariant sampling-param extraction/upload when the batch
+        # composition is unchanged since the previous decode step.
+        self._syncfree_launch: bool = _syncfree_launch_enabled()
+        self._cg_launch_key: tuple | None = None
 
     def _next_logprob_host_staging(self, device_buf: torch.Tensor) -> torch.Tensor:
         if self._logprob_host_buffers is None:
@@ -227,37 +244,54 @@ class HiggsTTSModelRunner(ModelRunner):
                 f"forward_batch.batch_size ({bs}) < len(requests) ({n_real})"
             )
 
-        layout_signature = (bs, tuple(req.request_id for req in requests))
-        # Fast path: pool state is gathered into the CG buffers only on the
-        # slow path below, and a padded slow path always resets the padding
-        # row first. Under a stable layout nothing re-reads the padding row's
-        # pool state, so skipping its per-step reset here is safe.
-        if layout_signature == self._cg_layout_signature:
-            if self._async_enabled and is_lookahead and n_real > 0:
-                # A stable layout already has all state and sampling controls in
-                # the active graph buffers. Only redirect a row that completed
-                # in the preceding lookahead step; its pool row was committed
-                # by _decode_pack_gpu before this launch.
-                rows_t_real = model._cg_row_indices[:n_real]
-                done = model._cg_active_generation_done[:n_real]
-                model._cg_row_indices[:n_real] = torch.where(
-                    done,
-                    torch.full_like(rows_t_real, model._padding_row),
-                    rows_t_real,
-                )
-            return
+        model._sampler_pool.reset_row(model._padding_row)
+
+        # Note (Yueying Li): a rid absent from the pool map is a fresh acquisition: the rid may be
+        # a client-supplied reuse of a finished request's id, and LIFO row
+        # recycling makes (rid, row, bs) collide with the stale key — force a
+        # rebuild so the new request cannot inherit cached params/redirects.
+        if any(req.request_id not in model._rid_to_row for req in requests):
+            self._cg_launch_key = None
 
         rows_py: list[int] = [model.acquire_row(req.request_id) for req in requests]
-        padding = bs - n_real
-        if padding:
-            # Reset the reserved row only when this batch actually uses it.
-            # Scalar CUDA assignments in reset_row otherwise add six launches
-            # to every decode token on the common unpadded path.
-            model._sampler_pool.reset_row(model._padding_row)
-            rows_py.extend([model._padding_row] * padding)
-        model._cg_row_indices[:bs] = torch.tensor(
-            rows_py, dtype=torch.long, device=model._cg_row_indices.device
-        )
+        # Note (Yueying Li): sync-free launch cache: temperature/top_p/top_k/row-index are
+        # per-request constants, so the four H2D uploads below need to
+        # rerun only when the batch composition changes (the extract itself is
+        # host-side in the 0.5.15 adaptation). The key is
+        # order-sensitive and includes the pool rows (recomputed from
+        # acquire_row every step), so admission / finish / retract / abort /
+        # reorder / row re-allocation all miss; bs covers the padding-row
+        # count. On a hit the buffers still hold last step's values: the only
+        # other in-place writer is the lookahead done-row guard below, whose
+        # padding redirect must persist exactly as long as the finished
+        # request stays in the batch — i.e. until the key changes.
+        launch_key = (tuple(req.request_id for req in requests), tuple(rows_py), bs)
+        if not (self._syncfree_launch and launch_key == self._cg_launch_key):
+            # Note (Yueying Li): a failed rebuild must not leave a valid key
+            self._cg_launch_key = None
+            rows_full = rows_py + [model._padding_row] * (bs - n_real)
+            model._cg_row_indices[:bs] = torch.tensor(
+                rows_full, dtype=torch.long, device=model._cg_row_indices.device
+            )
+
+            temps, top_ps, top_ks = self._extract_decode_sampling_params(requests)
+            temps.extend([1.0] * (bs - n_real))
+            top_ps.extend([1.0] * (bs - n_real))
+            model._cg_temperature[:bs] = torch.tensor(
+                temps, dtype=torch.float32, device=model._cg_temperature.device
+            )
+            model._cg_top_p[:bs] = torch.tensor(
+                top_ps, dtype=torch.float32, device=model._cg_top_p.device
+            )
+
+            top_k_vals = [
+                (tk if (tk is not None and tk > 0) else K_MAX) for tk in top_ks
+            ]
+            top_k_vals.extend([K_MAX] * (bs - n_real))
+            model._cg_top_k_buf[:bs] = torch.tensor(
+                top_k_vals, dtype=torch.long, device=model._cg_top_k_buf.device
+            )
+            self._cg_launch_key = launch_key
 
         if self._async_enabled and is_lookahead and n_real > 0:
             # Async-lookahead overrun guard (GPU-side, no host sync): a request
@@ -278,22 +312,6 @@ class HiggsTTSModelRunner(ModelRunner):
                 done, torch.full_like(rows_t_real, model._padding_row), rows_t_real
             )
 
-        temps, top_ps, top_ks = self._extract_decode_sampling_params(requests)
-        temps.extend([1.0] * (bs - n_real))
-        top_ps.extend([1.0] * (bs - n_real))
-        model._cg_temperature[:bs] = torch.tensor(
-            temps, dtype=torch.float32, device=model._cg_temperature.device
-        )
-        model._cg_top_p[:bs] = torch.tensor(
-            top_ps, dtype=torch.float32, device=model._cg_top_p.device
-        )
-
-        top_k_vals = [(tk if (tk is not None and tk > 0) else K_MAX) for tk in top_ks]
-        top_k_vals.extend([K_MAX] * (bs - n_real))
-        model._cg_top_k_buf[:bs] = torch.tensor(
-            top_k_vals, dtype=torch.long, device=model._cg_top_k_buf.device
-        )
-
         rows_t = model._cg_row_indices[:bs]
         pool = model._sampler_pool
         model._cg_active_delay_count[:bs] = pool.delay_count[rows_t]
@@ -302,7 +320,6 @@ class HiggsTTSModelRunner(ModelRunner):
         model._cg_active_last_codes[:bs] = pool.last_codes[rows_t]
         model._cg_active_seeds[:bs] = pool.seeds[rows_t]
         model._cg_active_step_count[:bs] = pool.step_count[rows_t]
-        self._cg_layout_signature = layout_signature
 
     @staticmethod
     def _extract_decode_sampling_params(requests):
