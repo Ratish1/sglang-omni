@@ -208,11 +208,19 @@ def _aggregate(repeats: list[dict]) -> dict:
     """Mean/best/worst across repeats for the headline metrics."""
 
     def _stat(key: str) -> dict:
-        values = [r[key] for r in repeats]
+        # A repeat whose server died mid-run reports None for its speed
+        # metrics; aggregate over the survivors instead of crashing the whole
+        # report (statistics.mean cannot take None), and say so.
+        values = [r[key] for r in repeats if r[key] is not None]
+        if not values:
+            return {"mean": None, "min": None, "max": None, "n": 0}
         return {
             "mean": statistics.mean(values),
             "min": min(values),
             "max": max(values),
+            # how many repeats actually contributed — a survivor mean over
+            # fewer repeats than were run must not read as a clean result
+            "n": len(values),
         }
 
     return {
@@ -240,20 +248,25 @@ def _print_table(aggregates: list[dict]) -> None:
         "lat mean(s) | lat p95(s) | rtf mean | rtf p95 | corpus WER | max WER |"
     )
     sep = "|---:" * 11 + "|"
+
+    def _cell(value: float | None, digits: int) -> str:
+        # None = every repeat for this metric failed (server died mid-run)
+        return "n/a" if value is None else f"{value:.{digits}f}"
+
     print("\n" + header)
     print(sep)
     for agg in aggregates:
         print(
             f"| {agg['concurrency']} | {agg['repeats']} "
-            f"| {agg['wall_clock_s']['mean']:.3f} "
-            f"| {agg['throughput_samples_per_s']['mean']:.3f} "
-            f"| {agg['throughput_samples_per_s']['max']:.3f} "
-            f"| {agg['latency_mean_s']['mean']:.3f} "
-            f"| {agg['latency_p95_s']['mean']:.3f} "
-            f"| {agg['rtf_mean']['mean']:.4f} "
-            f"| {agg['rtf_p95']['mean']:.4f} "
-            f"| {agg['corpus_wer']['max']:.4f} "
-            f"| {agg['per_sample_wer_max']['max']:.4f} |"
+            f"| {_cell(agg['wall_clock_s']['mean'], 3)} "
+            f"| {_cell(agg['throughput_samples_per_s']['mean'], 3)} "
+            f"| {_cell(agg['throughput_samples_per_s']['max'], 3)} "
+            f"| {_cell(agg['latency_mean_s']['mean'], 3)} "
+            f"| {_cell(agg['latency_p95_s']['mean'], 3)} "
+            f"| {_cell(agg['rtf_mean']['mean'], 4)} "
+            f"| {_cell(agg['rtf_p95']['mean'], 4)} "
+            f"| {_cell(agg['corpus_wer']['max'], 4)} "
+            f"| {_cell(agg['per_sample_wer_max']['max'], 4)} |"
         )
 
 
