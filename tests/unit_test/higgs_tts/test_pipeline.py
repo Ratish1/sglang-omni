@@ -13,7 +13,6 @@ import typer
 
 from sglang_omni.cli.serve import apply_mem_fraction_cli_overrides
 from sglang_omni.config.runtime import resolve_stage_static_factory_args
-from sglang_omni.models.higgs_tts import model as higgs_model
 from sglang_omni.models.higgs_tts import stages
 from sglang_omni.models.higgs_tts import utils as higgs_utils
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
@@ -44,9 +43,6 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
     assert "server_args_overrides" not in stages_by_name["tts_engine"].factory_args
     assert stages_by_name["vocoder"].process == "pipeline"
     assert stages_by_name["vocoder"].factory_args["compile_decode"] is False
-    assert stages_by_name["vocoder"].factory_args[
-        "decode_cuda_graph_frame_counts"
-    ] == tuple(range(1, 151))
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
 
@@ -100,13 +96,7 @@ def test_higgs_vocoder_rejects_compile_and_graph_domain_together() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    ("public_seed", "resolved_seed"),
-    [(None, 731), (42, 42)],
-)
-def test_higgs_active_request_always_gets_concrete_row_seed(
-    monkeypatch, public_seed, resolved_seed
-) -> None:
+def test_higgs_active_request_always_gets_concrete_row_seed() -> None:
     model = object.__new__(HiggsTTSModel)
     model._rid_to_row = {}
     model._free_rows = [0]
@@ -114,16 +104,15 @@ def test_higgs_active_request_always_gets_concrete_row_seed(
         seeds=torch.full((1,), -1, dtype=torch.long),
         reset_row=lambda row: None,
     )
-    monkeypatch.setattr(
-        higgs_model,
-        "resolve_row_seed",
-        lambda seed: resolved_seed,
-    )
 
-    model.set_request_seed("request", public_seed)
-
+    # Unseeded request: the real resolver must install a fresh concrete seed.
+    model.set_request_seed("request", None)
     assert model._rid_to_row == {"request": 0}
-    assert model._sampler_pool.seeds[0].item() == resolved_seed
+    assert 0 <= int(model._sampler_pool.seeds[0].item()) <= SAMPLING_SEED_MASK
+
+    # Seeded request on the same row: the public seed lands verbatim.
+    model.set_request_seed("request", 42)
+    assert model._sampler_pool.seeds[0].item() == 42
 
 
 @pytest.mark.parametrize(

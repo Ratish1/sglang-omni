@@ -1596,7 +1596,6 @@ class OmniScheduler:
             self._engine_paused = True
             self._last_pause_mode = mode
             self._resolve_pending_async()
-            self._resolve_pending_overlap_results()
             num_paused = 0
             if mode == "abort":
                 num_paused = self._abort_all_requests()
@@ -1658,7 +1657,6 @@ class OmniScheduler:
             self._engine_paused = True
             try:
                 self._resolve_pending_async()
-                self._resolve_pending_overlap_results()
                 num_paused = 0
                 abort_all_requests = bool(payload.get("abort_all_requests", False))
                 if abort_all_requests:
@@ -1891,14 +1889,6 @@ class OmniScheduler:
         except Exception:
             logger.exception("flush_cache after weight update failed")
             return False
-
-    def _resolve_pending_overlap_results(self) -> None:
-        result_queue = getattr(self, "result_queue", None)
-        if result_queue is None:
-            return
-        while result_queue:
-            batch, result = result_queue.popleft()
-            self.process_batch_result(batch, result)
 
     @staticmethod
     def _empty_torch_cache() -> None:

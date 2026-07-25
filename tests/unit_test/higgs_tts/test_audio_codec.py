@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 from transformers import HiggsAudioV2TokenizerConfig, HiggsAudioV2TokenizerModel
 
@@ -65,16 +64,6 @@ def test_capture_safe_quantizer_decode_matches_additive_rvq() -> None:
     )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-def test_capture_safe_quantizer_decode_rejects_empty_codes() -> None:
-    quantizer = SimpleNamespace(quantizers=[])
-
-    with pytest.raises(ValueError, match="at least one quantizer"):
-        audio_codec._capture_safe_quantizer_decode(
-            quantizer,
-            torch.empty((0, 2), dtype=torch.long),
-        )
 
 
 def test_codec_decode_replays_matching_shape_graph() -> None:

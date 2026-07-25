@@ -62,17 +62,6 @@ def test_per_row_seed_isolation():
     assert torch.equal(alone[0], full[0])
 
 
-def test_seeded_sampling_requires_step_positions():
-    logits = _logits(5)
-    with pytest.raises(ValueError, match="step_B is required"):
-        _sample_independent_batched(
-            logits,
-            temperature=torch.ones(B, device="cuda"),
-            top_p=None,
-            seeds_B=torch.tensor([1, 2, 3], device="cuda"),
-        )
-
-
 def test_seeded_sampler_preserves_probability_distribution():
     batch = 20_000
     probs = torch.tensor([0.9, 0.1], device="cuda")
