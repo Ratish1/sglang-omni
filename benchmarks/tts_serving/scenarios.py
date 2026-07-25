@@ -863,6 +863,8 @@ def _speech_length(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scenari
     expect_success = bool(text.strip()) and len(text) <= MAX_SPEECH_INPUT_CHARS
     payload = _base_payload(spec, text)
     payload["response_format"] = "wav"
+    if expect_success:
+        payload["seed"] = spec.seed + index
     return Scenario(
         id=_scenario_id(stage, "speech_length", index),
         endpoint="speech",
@@ -939,6 +941,7 @@ def _speech_reference_success(
     payload["ref_audio"] = _reference_audio(spec)
     payload["ref_text"] = _reference_text(spec)
     payload["response_format"] = "wav"
+    payload["seed"] = spec.seed + index
     return Scenario(
         id=_scenario_id(stage, "speech_reference", index),
         endpoint="speech",
@@ -961,6 +964,7 @@ def _speech_reference_base64_success(
     payload["ref_audio"] = _valid_reference_wav_data_uri()
     payload["ref_text"] = "A valid inline reference audio sample for voice cloning."
     payload["response_format"] = "wav"
+    payload["seed"] = spec.seed + index
     return Scenario(
         id=_scenario_id(stage, "speech_reference_base64", index),
         endpoint="speech",
@@ -986,6 +990,7 @@ def _speech_reference_structured_success(
             "text": "A valid structured reference audio sample for voice cloning.",
         }
     ]
+    payload["seed"] = spec.seed + index
     return Scenario(
         id=_scenario_id(stage, "speech_reference_structured", index),
         endpoint="speech",
@@ -1006,6 +1011,7 @@ def _speech_reference_file_success(
     payload["ref_audio"] = spec.params.file_ref_audio
     payload["ref_text"] = spec.params.file_ref_text or _reference_text(spec)
     payload["response_format"] = "wav"
+    payload["seed"] = spec.seed + index
     return Scenario(
         id=_scenario_id(stage, "speech_reference_file", index),
         endpoint="speech",
@@ -1029,6 +1035,7 @@ def _speech_reference_xvector_only(
     payload["ref_text"] = _reference_text(spec)
     payload["x_vector_only_mode"] = True
     payload["response_format"] = "wav"
+    payload["seed"] = spec.seed + index
     return Scenario(
         id=_scenario_id(stage, "speech_reference_xvector_only", index),
         endpoint="speech",
@@ -1291,6 +1298,8 @@ def _speech_malformed(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
         raise RuntimeError("malformed scenario names drifted from coverage contract")
     malformed_case, payload = candidates[index % len(candidates)]
     expect_success = payload.get("input") in ADVERSARIAL_TEXTS
+    if expect_success:
+        payload["seed"] = spec.seed + index
     return Scenario(
         id=_scenario_id(stage, "speech_malformed", index),
         endpoint="speech",
@@ -1412,6 +1421,10 @@ def _batch_item_overrides(
         },
         {"input": "", "response_format": "bogus"},
     ]
+    expected_item_failures = [len(items) - 2, len(items) - 1]
+    for item_index, item in enumerate(items):
+        if item_index not in expected_item_failures:
+            item["seed"] = spec.seed + index * BATCH_OVERSIZED_SIZE + item_index
     payload = {
         "model": spec.model_name,
         "voice": "default",
@@ -1431,7 +1444,7 @@ def _batch_item_overrides(
         planned_metadata={
             "batch_size": len(items),
             "batch_case": "item_overrides",
-            "expected_item_failures": [len(items) - 2, len(items) - 1],
+            "expected_item_failures": expected_item_failures,
         },
     )
 
@@ -2013,6 +2026,7 @@ def _websocket_normal(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
                     "response_format": "pcm",
                     "stream_audio": False,
                     "split_granularity": "sentence",
+                    "seed": spec.seed + index,
                 },
             },
             {
@@ -2049,6 +2063,7 @@ def _websocket_multi_sentence(
                     "response_format": "pcm",
                     "stream_audio": False,
                     "split_granularity": "sentence",
+                    "seed": spec.seed + index,
                 },
             },
             {
@@ -2091,6 +2106,7 @@ def _websocket_stream_audio(
                     "response_format": "pcm",
                     "stream_audio": True,
                     "split_granularity": "sentence",
+                    "seed": spec.seed + index,
                 },
             },
             {
@@ -2134,6 +2150,7 @@ def _websocket_clause_split(
                     "response_format": "pcm",
                     "stream_audio": False,
                     "split_granularity": "clause",
+                    "seed": spec.seed + index,
                 },
             },
             {
@@ -2233,6 +2250,7 @@ def _websocket_disconnect(
                     "response_format": "pcm",
                     "stream_audio": False,
                     "split_granularity": "sentence",
+                    "seed": spec.seed + index,
                 },
             },
             {
