@@ -17,6 +17,7 @@ step in flight (is_mixed_chunk, i.e. the Qwen3-Omni thinker):
               running.prepare_for_decode                     <- overrun slot
               new.mix_with_running(running)                  <- MIXED batch
               drain: resolve step K, a folded req finishes
+              _drop_stale_overrun -> forward -> process_batch_result
 """
 
 from __future__ import annotations
@@ -144,8 +145,6 @@ class _Result:
 
 
 def _scheduler(req_to_token, alloc, tree, server_args):
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
     s = OmniScheduler.__new__(OmniScheduler)
     s.page_size = 1
     s.server_args = server_args
@@ -163,6 +162,8 @@ def _scheduler(req_to_token, alloc, tree, server_args):
     s.forward_ct_decode = 0
     s.decode_offload_manager = None
     s.is_stats_logging_rank = False
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
     s.spec_algorithm = SpeculativeAlgorithm.NONE
     for name in (
         "stream_output",
@@ -196,6 +197,18 @@ def _free_slots(alloc):
     ]
 
 
+def _live_slots(req_to_token, reqs):
+    out = []
+    for r in reqs:
+        if r.req_pool_idx is None:
+            continue
+        out.extend(
+            int(v)
+            for v in req_to_token.req_to_token[r.req_pool_idx, : r.kv_committed_len]
+        )
+    return out
+
+
 def _build_mixed(server_args):
     """Run the real prefill -> decode -> mixed-fold sequence; return the state
     just before the drain, with the pending (in-flight) step's batch."""
@@ -225,10 +238,9 @@ def _build_mixed(server_args):
 
 
 def test_drain_leaves_the_overrun_step_slot_owned_by_the_radix_tree(server_args):
-    """prepare_for_decode counts the step it allocates in kv_committed_len, so at
-    drain-release kv_committed_len == len(origin) + len(output) and
-    cache_finished_req INSERTS that slot into the radix tree — it does not
-    truncate below it. Nothing may hand that slot back to the allocator."""
+    """Why the fast path must not free the overrun slot: prepare_for_decode
+    counts it in kv_committed_len, so the drain's cache_finished_req covers it —
+    RadixCache inserts it rather than truncating below it."""
     from sglang.srt.managers.scheduler import Scheduler as Upstream
 
     sched, mixed, pending, (r2t, alloc, tree), (r0, _r1, _p0) = _build_mixed(
@@ -244,13 +256,51 @@ def test_drain_leaves_the_overrun_step_slot_owned_by_the_radix_tree(server_args)
     assert overrun not in _free_slots(alloc)
 
 
-def test_compensating_free_of_the_overrun_slot_aliases_it(server_args):
-    """Characterization of the hazard above.
+def test_fast_path_keeps_every_kv_slot_singly_owned(server_args):
+    from sglang.srt.managers.scheduler import Scheduler as Upstream
 
-    Freeing the overrun slot after the drain — on the assumption that
-    cache_finished_req truncated below it — leaves the slot owned by the radix
-    tree AND queued in the allocator. Evicting that node queues it a second
-    time, so two requests decode into the same KV slot.
+    sched, mixed, pending, (r2t, alloc, tree), (r0, r1, p0) = _build_mixed(server_args)
+    overrun = int(mixed.out_cache_loc[mixed.extend_lens[0]])
+
+    Upstream.process_batch_result_decode(sched, pending, _Result(2))  # the drain
+    stale = sched._stale_overrun_rids(mixed)
+    assert stale == {"r0"}
+
+    # the forward covers every row of the batch as built, including the stale one
+    forwarded = {int(v) for v in mixed.out_cache_loc.tolist()}
+    assert overrun in forwarded, "the committed overrun slot must still be filled"
+    assert mixed.out_cache_loc.numel() == sum(mixed.extend_lens)
+    assert mixed.input_ids.numel() == sum(mixed.extend_lens)
+
+    result = _Result(len(mixed.reqs))
+    batch = sched._drop_stale_overrun(mixed, result, stale)
+    assert [r.rid for r in batch.reqs] == ["p0", "r1"]
+    assert result.next_token_ids.numel() == 2  # r0's row trimmed in lockstep
+    assert batch.decoding_reqs == [r1]
+
+    Upstream.process_batch_result_prefill(sched, batch, result)
+
+    tree_owned, free, live = (
+        set(_tree_slots(tree)),
+        _free_slots(alloc),
+        set(_live_slots(r2t, batch.reqs)),
+    )
+    assert not (
+        tree_owned & set(free)
+    ), "slot owned by both the radix tree and the allocator"
+    assert not (live & set(free)), "live request's slot handed back to the allocator"
+    assert len(free) == len(set(free)), "duplicate slot in the allocator free list"
+    assert len(tree_owned | set(free) | live) == POOL_SIZE, "unowned (leaked) slots"
+
+
+def test_compensating_free_of_the_overrun_slot_aliases_it(server_args):
+    """Characterization of the hazard the invariant above guards against.
+
+    The fast path used to "reclaim" the overrun step slot on the assumption that
+    cache_finished_req truncates below it. It does not — it inserts it — so the
+    free leaves the slot owned by the radix tree AND queued in the allocator,
+    and evicting that node queues it a second time. Two requests then decode
+    into the same KV slot.
     """
     from sglang.srt.managers.scheduler import Scheduler as Upstream
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -261,12 +311,32 @@ def test_compensating_free_of_the_overrun_slot_aliases_it(server_args):
     overrun = int(mixed.out_cache_loc[mixed.extend_lens[0]])
     Upstream.process_batch_result_decode(sched, pending, _Result(2))
 
-    alloc.free(torch.tensor([overrun], dtype=torch.int64))
+    alloc.free(torch.tensor([overrun], dtype=torch.int64))  # the old behaviour
 
     assert overrun in _tree_slots(tree) and overrun in _free_slots(alloc)
     tree.evict(EvictParams(num_tokens=len(_tree_slots(tree))))
     free = _free_slots(alloc)
     assert free.count(overrun) == 2, "the same slot is now free twice over"
+
+
+def test_fast_path_batch_survives_the_merge_back_into_running(server_args):
+    """last_batch feeds the next get_next_batch_to_run: filter_batch must leave
+    every req-level field consistent for merge_batch + prepare_for_decode."""
+    from sglang.srt.managers.scheduler import Scheduler as Upstream
+
+    sched, mixed, pending, (r2t, alloc, tree), (r0, r1, p0) = _build_mixed(server_args)
+    Upstream.process_batch_result_decode(sched, pending, _Result(2))
+    stale = sched._stale_overrun_rids(mixed)
+    result = _Result(len(mixed.reqs))
+    batch = sched._drop_stale_overrun(mixed, result, stale)
+    Upstream.process_batch_result_prefill(sched, batch, result)
+    batch.output_ids = torch.tensor([77] * len(batch.reqs), dtype=torch.int64)
+
+    batch.filter_batch(chunked_req_to_exclude=[])
+    assert [r.rid for r in batch.reqs] == ["p0", "r1"]
+    batch.prepare_for_decode()
+    assert batch.out_cache_loc.numel() == len(batch.reqs)
+    assert batch.seq_lens.numel() == len(batch.reqs)
 
 
 def test_release_with_skip_radix_cache_insert_frees_instead_of_caching(server_args):

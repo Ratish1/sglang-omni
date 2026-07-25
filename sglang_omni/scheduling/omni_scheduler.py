@@ -855,14 +855,14 @@ class OmniScheduler:
             return _Upstream.get_new_batch_prefill(self)
         return None
 
-    def run_batch(self, batch, pp_proxy_tensors=None):
+    def run_batch(self, batch, pp_proxy_tensors=None, skip_rids=()):
         try:
-            return self._run_batch(batch, pp_proxy_tensors)
+            return self._run_batch(batch, pp_proxy_tensors, skip_rids=skip_rids)
         except Exception as exc:
-            self._handle_batch_failure(batch, exc)
+            self._handle_batch_failure(batch, exc, skip_rids=skip_rids)
             return _FAILED_BATCH_RESULT
 
-    def _run_batch(self, batch, pp_proxy_tensors=None):
+    def _run_batch(self, batch, pp_proxy_tensors=None, skip_rids=()):
         """Run a batch through the model runner.
 
         The custom model runner (for example ThinkerModelRunner or a
@@ -870,6 +870,11 @@ class OmniScheduler:
         accepts a ``SchedulerOutput`` wrapper and returns a
         ``ModelRunnerOutput``.  The upstream ``process_batch_result`` expects
         a ``GenerationBatchResult``.  We bridge the two formats here.
+
+        ``skip_rids`` are rows the forward must still cover (their KV slot is
+        allocated and committed) but whose request already finished in an
+        earlier step — the async fast path's stale overrun. Emitting their
+        chunk would ship one frame past the end of the stream.
         """
         self._emit_prefill_start_for_batch(batch)
         if self._model_runner is not None:
@@ -879,8 +884,8 @@ class OmniScheduler:
             # needs it (the fallback reaches upstream run_batch, which counts).
             self.forward_ct = getattr(self, "forward_ct", 0) + 1
             sched_output = self._build_sched_output(batch)
-            mr_output = self._model_runner.execute(sched_output)
-            self._emit_stream_output(sched_output, mr_output)
+            mr_output = self._model_runner.execute(sched_output, skip_rids=skip_rids)
+            self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
             return self._make_batch_result(batch, mr_output)
         # Fallback: call upstream's run_batch (uses tp_worker directly)
         return _Upstream.run_batch(self, batch, pp_proxy_tensors)
@@ -972,8 +977,11 @@ class OmniScheduler:
             can_run_cuda_graph=mr_output.can_run_cuda_graph,
         )
 
-    def _handle_batch_failure(self, batch: Any, error: Exception) -> None:
-        reqs = list(batch.reqs)
+    def _handle_batch_failure(self, batch: Any, error: Exception, skip_rids=()) -> None:
+        # skip_rids already completed in an earlier step (stale overrun rows):
+        # their result has shipped, so an error for them would resurrect a
+        # finished request downstream.
+        reqs = [req for req in batch.reqs if req.rid not in skip_rids]
         request_ids = [req.rid for req in reqs]
         logger.exception("OmniScheduler batch failed for requests=%s", request_ids)
         for req in reqs:
@@ -1806,114 +1814,81 @@ class OmniScheduler:
             return
         batch, sched_output, pending_step = self._async_pending
         self._async_pending = None
+        # Snapshot BEFORE the resolve, like _resolve_and_process's own pre_finished:
+        # rows already finished here shipped their terminal result in an earlier
+        # step, so a failure must not emit an error that resurrects them. Rows that
+        # finish DURING this resolve are not in the set and do get the error.
+        skip_rids = self._stale_overrun_rids(batch)
         try:
             self._resolve_and_process(batch, sched_output, pending_step)
         except Exception as exc:
-            self._handle_batch_failure(batch, exc)
+            self._handle_batch_failure(batch, exc, skip_rids=skip_rids)
 
-    def _free_overrun_step_slots(self, out_cache_loc, drop_indices) -> None:
-        """Free the per-step decode KV slot for rows whose request finished or
-        retracted in a prior step (the lookahead overrun): ``prepare_for_decode``
-        allocated it but ``cache_finished_req`` truncates below it, so it leaks.
+    @staticmethod
+    def _stale_overrun_rids(batch) -> set:
+        """rids in ``batch`` that the just-completed drain finished or retracted.
 
-        Only under RadixCache + page_size=1; ChunkCache/paged already free the slot
-        with the request, so compensating here would double-free — hence the gate.
-        """
-        if not drop_indices:
-            return
-        if self.page_size != 1 or self.server_args.disable_radix_cache:
-            return
-        if out_cache_loc is None:
-            logger.warning("overrun step-slot free skipped: out_cache_loc is None")
-            return
-        assert max(drop_indices) < out_cache_loc.numel(), (
-            f"overrun drop index {max(drop_indices)} out of range "
-            f"({out_cache_loc.numel()} step slots)"
-        )
-        idx = torch.tensor(drop_indices, dtype=torch.long, device=out_cache_loc.device)
-        self.token_to_kv_pool_allocator.free(out_cache_loc[idx])
-
-    def _drop_stale_overrun(self, batch):
-        """Drop reqs finished OR retracted by the just-completed drain from the
-        stale fast-path batch, so run_batch does not forward/finalize them again
-        (double-free of already-freed KV). Returns the filtered batch, or None if
-        it empties. Mirrors the finished/is_retracted pre-drop in
-        _resolve_and_process; the fast path previously dropped only finished.
+        The batch was built by get_next_batch_to_run BEFORE the drain, so these
+        rows are the fast-path analogue of the lookahead overrun handled in
+        _resolve_and_process.
         """
         if batch is None or not batch.reqs:
+            return set()
+        return {
+            r.rid
+            for r in batch.reqs
+            if r.finished() or bool(getattr(r, "is_retracted", False))
+        }
+
+    def _drop_stale_overrun(self, batch, result, stale_rids):
+        """Drop the drain's overrun rows from a just-FORWARDED fast-path batch,
+        so process_batch_result does not finalize them a second time (double
+        release of already-freed KV — ``pop_committed_kv_cache`` asserts).
+        Returns the filtered batch, or None if it empties.
+
+        Runs after the forward, not before it, which is what keeps this simple
+        and correct:
+
+        * the forward sees the batch exactly as prepare_for_extend /
+          mix_with_running built it, so the per-token fields (out_cache_loc,
+          input_ids, extend_lens) of an extend/mixed batch need no reslicing —
+          dropping a row before the forward would require reslicing every one
+          of them, and #1023 was that reslice going wrong;
+        * the overrun row's KV slot is written by this forward. The drain's
+          cache_finished_req already handed that slot to the radix cache
+          (kv_committed_len counts the step prepare_for_decode allocated), so
+          skipping the write would cache a slot no forward ever filled — and
+          freeing it, as the pre-forward drop did, would leave it owned by both
+          the radix tree and the allocator;
+        * filter_batch then fixes every req-level field, which is all the merge
+          back into running_batch reads (merge_batch ignores the per-token
+          ones, and prepare_for_decode rebuilds them).
+
+        The emit half is suppressed inside run_batch via ``skip_rids``; this is
+        only the result-processing half. Mirrors _resolve_and_process, which
+        trims reqs + next_token_ids after its own (lagged) step.
+        """
+        if batch is None or not batch.reqs or not stale_rids:
             return batch
-        drop = [
-            r.finished() or bool(getattr(r, "is_retracted", False)) for r in batch.reqs
-        ]
-        if not any(drop):
+        keep = [i for i, r in enumerate(batch.reqs) if r.rid not in stale_rids]
+        if len(keep) == len(batch.reqs):
             return batch
-        keep = [i for i, d in enumerate(drop) if not d]
-        out_cache_loc = batch.out_cache_loc
-        forward_mode = getattr(batch, "forward_mode", None)
-        if forward_mode is not None and forward_mode.is_extend():
-            # Note:(Wenyao Gao) extend/mixed batches carry per-token fields
-            # (req i owns extend_lens[i] slots) that filter_batch leaves
-            # stale; reslice them here. The asserted fields are never
-            # populated on omni extend batches; trip instead of misslicing.
-            assert (
-                getattr(batch, "input_embeds", None) is None
-                and getattr(batch, "replace_embeds", None) is None
-                and getattr(batch, "token_type_ids", None) is None
-            ), "unhandled per-token field on drop-stale extend batch"
-            lens = batch.extend_lens
-            starts = [0] * len(lens)
-            for i in range(1, len(lens)):
-                starts[i] = starts[i - 1] + lens[i - 1]
-            drop_tokens = [
-                t
-                for i, d in enumerate(drop)
-                if d
-                for t in range(starts[i], starts[i] + lens[i])
-            ]
-            keep_tokens = [
-                t for i in keep for t in range(starts[i], starts[i] + lens[i])
-            ]
-            input_ids = batch.input_ids
-            prefix_lens = batch.prefix_lens
-            extend_logprob_start_lens = batch.extend_logprob_start_lens
-            lp_token_ids = getattr(batch, "extend_input_logprob_token_ids", None)
-            self._free_overrun_step_slots(out_cache_loc, drop_tokens)
-            batch.filter_batch(keep_indices=keep)
-            batch.input_ids = input_ids[keep_tokens]
-            if out_cache_loc is not None:
-                batch.out_cache_loc = out_cache_loc[keep_tokens]
-            batch.extend_lens = [lens[i] for i in keep]
-            batch.extend_num_tokens = sum(batch.extend_lens)
-            batch.prefix_lens = [prefix_lens[i] for i in keep]
-            batch.extend_logprob_start_lens = [
-                extend_logprob_start_lens[i] for i in keep
-            ]
-            if lp_token_ids is not None:
-                # Note:(Wenyao Gao) every req contributes a segment of
-                # lens[i] - start_lens[i] ids; not aligned with the token
-                # slices above.
-                if not batch.return_logprob:
-                    batch.extend_input_logprob_token_ids = None
-                else:
-                    lp_lens = [
-                        lens[i] - extend_logprob_start_lens[i] for i in range(len(lens))
-                    ]
-                    lp_starts = [0] * len(lp_lens)
-                    for i in range(1, len(lp_lens)):
-                        lp_starts[i] = lp_starts[i - 1] + lp_lens[i - 1]
-                    keep_lp_tokens = [
-                        t
-                        for i in keep
-                        for t in range(lp_starts[i], lp_starts[i] + lp_lens[i])
-                    ]
-                    batch.extend_input_logprob_token_ids = lp_token_ids[keep_lp_tokens]
-        else:
-            self._free_overrun_step_slots(
-                out_cache_loc, [i for i, d in enumerate(drop) if d]
-            )
-            batch.filter_batch(keep_indices=keep)
-            if out_cache_loc is not None:
-                batch.out_cache_loc = out_cache_loc[keep]
+        next_token_ids = getattr(result, "next_token_ids", None)
+        if keep and next_token_ids is not None:
+            # process_batch_result_* zips these rows with batch.reqs; a shape
+            # this code cannot trim would misalign every kept row, so refuse
+            # rather than silently skipping the trim.
+            if isinstance(next_token_ids, torch.Tensor):
+                idx = torch.tensor(keep, device=next_token_ids.device)
+                result.next_token_ids = next_token_ids[idx]
+            elif isinstance(next_token_ids, list):
+                result.next_token_ids = [next_token_ids[i] for i in keep]
+            else:
+                raise TypeError(
+                    "cannot trim overrun rows from next_token_ids of type "
+                    f"{type(next_token_ids).__name__}"
+                )
+        batch.filter_batch(keep_indices=keep)
         if batch.decoding_reqs:
             kept_ids = {id(r) for r in batch.reqs}
             batch.decoding_reqs = [r for r in batch.decoding_reqs if id(r) in kept_ids]
@@ -1986,19 +1961,25 @@ class OmniScheduler:
                 # at low concurrency has no overlap payoff (the bs=1 regression).
                 # Skip the drain call entirely in the common no-pending case (the
                 # bs=1 steady state) — _resolve_pending_async would just no-op.
+                stale_rids: set = set()
                 if self._async_pending is not None:
                     self._resolve_pending_async()
                     # Stale-batch overrun: `batch` was built (get_next_batch_to_run,
                     # top of loop) BEFORE this drain, which can finish OR retract reqs
-                    # still present in it. Drop them before run_batch so they are not
-                    # forwarded/finalized a second time (double-free of already-freed
-                    # KV). Fast-path analogue of the _resolve_and_process drop.
-                    batch = self._drop_stale_overrun(batch)
-                    self.cur_batch = batch
+                    # still present in it. They stay in the forward (their KV slot is
+                    # already committed to the radix cache and needs filling, and an
+                    # extend/mixed batch cannot be resliced row-wise) but are kept out
+                    # of the emit and the result processing, so they are not finalized
+                    # a second time. Fast-path analogue of the _resolve_and_process
+                    # post-forward drop.
+                    stale_rids = self._stale_overrun_rids(batch)
                 if batch:
-                    result = self.run_batch(batch)
+                    result = self.run_batch(batch, skip_rids=stale_rids)
                     if result is not _FAILED_BATCH_RESULT:
-                        self.process_batch_result(batch, result)
+                        batch = self._drop_stale_overrun(batch, result, stale_rids)
+                        self.cur_batch = batch
+                        if batch is not None:
+                            self.process_batch_result(batch, result)
                 else:
                     self.self_check_during_idle()
                     time.sleep(0.001)

@@ -184,7 +184,7 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
     )
 
     class BoomModelRunner:
-        def execute(self, sched_output):
+        def execute(self, sched_output, skip_rids=None):
             assert [req.request_id for req in sched_output.requests] == [
                 "req-1",
                 "req-2",
@@ -256,7 +256,7 @@ def test_omni_scheduler_custom_runner_updates_next_input_ids() -> None:
     next_token_ids = torch.tensor([11, 12], dtype=torch.int32)
 
     class FakeModelRunner:
-        def execute(self, sched_output):
+        def execute(self, sched_output, skip_rids=None):
             sched_output.batch_data.output_ids = next_token_ids
             return SimpleNamespace(outputs={}, can_run_cuda_graph=False)
 
@@ -290,7 +290,7 @@ def test_omni_scheduler_custom_runner_advances_forward_ct() -> None:
     """
 
     class FakeModelRunner:
-        def execute(self, sched_output):
+        def execute(self, sched_output, skip_rids=None):
             sched_output.batch_data.output_ids = torch.tensor([1], dtype=torch.int32)
             return SimpleNamespace(outputs={}, can_run_cuda_graph=False)
 
@@ -352,9 +352,9 @@ def test_omni_scheduler_resolve_drops_retracted_req() -> None:
 
 def test_omni_scheduler_fast_path_drops_retracted_req() -> None:
     """The synchronous fast path runs after _resolve_pending_async, whose drain can
-    retract a req still present in the stale batch. The fast path must drop finished
-    AND retracted reqs (not only finished) before run_batch, or a retracted req is
-    forwarded/finalized again and re-frees its already-freed KV.
+    finish OR retract a req still present in the stale batch. Those rows must be
+    kept out of process_batch_result (finalizing one a second time re-frees its
+    already-freed KV), and out of the result rows fed to it.
     """
     captured: dict = {}
     freed: list[int] = []
@@ -378,25 +378,41 @@ def test_omni_scheduler_fast_path_drops_retracted_req() -> None:
     )
     keep = SimpleNamespace(rid="keep", finished=lambda: False, is_retracted=False)
     retr = SimpleNamespace(rid="retr", finished=lambda: False, is_retracted=True)
+    fin = SimpleNamespace(rid="fin", finished=lambda: True, is_retracted=False)
 
-    # retracted (not finished) must be dropped from the stale batch
-    out = scheduler._drop_stale_overrun(FakeBatch([keep, retr]))
+    # retracted (not finished) is stale too
+    batch = FakeBatch([keep, retr])
+    stale = scheduler._stale_overrun_rids(batch)
+    assert stale == {"retr"}
+    result = SimpleNamespace(next_token_ids=torch.tensor([10, 11]))
+    out = scheduler._drop_stale_overrun(batch, result, stale)
     assert captured["keep_indices"] == [0]
     assert [r.rid for r in out.reqs] == ["keep"]
-    assert out.out_cache_loc.tolist() == [100]
-    assert freed == [101]
+    assert result.next_token_ids.tolist() == [10]
+    # the drain's cache_finished_req already accounted for those KV slots; the
+    # fast path must not hand any back to the allocator
+    assert freed == []
 
-    # all dropped -> None so run_batch is skipped
-    freed.clear()
-    fin = SimpleNamespace(rid="fin", finished=lambda: True, is_retracted=False)
-    assert scheduler._drop_stale_overrun(FakeBatch([retr, fin])) is None
-    assert freed == [100, 101]
+    # all dropped -> None so process_batch_result is skipped
+    batch = FakeBatch([retr, fin])
+    stale = scheduler._stale_overrun_rids(batch)
+    assert stale == {"retr", "fin"}
+    out = scheduler._drop_stale_overrun(
+        batch, SimpleNamespace(next_token_ids=torch.tensor([10, 11])), stale
+    )
+    assert out is None
+    assert freed == []
 
     # nothing stale -> batch returned unchanged, filter_batch never called
     captured.clear()
-    freed.clear()
     clean = FakeBatch([keep])
-    assert scheduler._drop_stale_overrun(clean) is clean
+    assert scheduler._stale_overrun_rids(clean) == set()
+    assert (
+        scheduler._drop_stale_overrun(
+            clean, SimpleNamespace(next_token_ids=None), set()
+        )
+        is clean
+    )
     assert "keep_indices" not in captured
     assert freed == []
 
