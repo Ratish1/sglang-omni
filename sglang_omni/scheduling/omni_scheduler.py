@@ -122,6 +122,7 @@ class OmniScheduler:
         async_decode_min_batch_size: int = 2,
         prefill_coalesce_requests: int = 0,
         prefill_coalesce_wait_ms: float = 60.0,
+        prefill_coalesce_when_idle: bool = False,
         request_build_max_workers: int = 1,
         request_build_max_pending: int | None = None,
         shutdown_callback: Callable[[], None] | None = None,
@@ -214,6 +215,7 @@ class OmniScheduler:
             prefill_coalesce_requests = 0
         self.prefill_coalesce_requests = int(prefill_coalesce_requests)
         self.prefill_coalesce_wait_s = float(prefill_coalesce_wait_ms) / 1e3
+        self.prefill_coalesce_when_idle = bool(prefill_coalesce_when_idle)
 
         # Token / memory info (upstream reads from tp_worker.get_worker_info)
         mr = tp_worker.model_runner
@@ -1073,7 +1075,10 @@ class OmniScheduler:
         # cost; the oldest-request deadline survives partial admission and aborts.
         if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
             return _Upstream.get_new_batch_prefill(self)
-        if self.running_batch is None or self.running_batch.is_empty():
+        if (
+            not self.prefill_coalesce_when_idle
+            and (self.running_batch is None or self.running_batch.is_empty())
+        ):
             return _Upstream.get_new_batch_prefill(self)
         waiting = self.waiting_queue
         if not waiting or len(waiting) >= self.prefill_coalesce_requests:

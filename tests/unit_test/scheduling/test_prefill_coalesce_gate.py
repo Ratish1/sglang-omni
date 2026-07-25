@@ -34,9 +34,16 @@ def _req(enqueue_t: float | None):
 class _StubScheduler:
     """The attribute surface get_new_batch_prefill touches."""
 
-    def __init__(self, *, coalesce_requests: int, wait_ms: float = 60.0) -> None:
+    def __init__(
+        self,
+        *,
+        coalesce_requests: int,
+        wait_ms: float = 60.0,
+        coalesce_when_idle: bool = False,
+    ) -> None:
         self.prefill_coalesce_requests = coalesce_requests
         self.prefill_coalesce_wait_s = wait_ms / 1e3
+        self.prefill_coalesce_when_idle = coalesce_when_idle
         self.chunked_req = None
         self.waiting_queue: list = []
         self.running_batch = SimpleNamespace(is_empty=lambda: False)
@@ -134,6 +141,22 @@ def test_idle_loop_bypasses_gate(upstream):
     assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
 
     sched.running_batch = SimpleNamespace(is_empty=lambda: True)
+    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+
+
+def test_idle_loop_can_coalesce_when_explicitly_enabled(upstream, clock):
+    sched = _StubScheduler(
+        coalesce_requests=8,
+        wait_ms=10.0,
+        coalesce_when_idle=True,
+    )
+    sched.running_batch = None
+    sched.waiting_queue = [_req(100.0)]
+
+    clock.return_value = 100.005
+    assert sched.get_new_batch_prefill() is None
+
+    clock.return_value = 100.011
     assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
 
 

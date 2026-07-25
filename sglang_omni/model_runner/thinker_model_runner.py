@@ -88,6 +88,14 @@ class ThinkerModelRunner(ModelRunner):
         omni_result = self._inject_multimodal_embeds(forward_batch, schedule_batch)
         if omni_result is not None and omni_result[0] is not None:
             input_embeds, ds_embeds, vis_masks = omni_result
+            # Publish ordinary multimodal embeddings through SGLang's
+            # ForwardBatch contract so its runner remains the sole owner of
+            # attention metadata and eager/CUDA-graph dispatch. Visual
+            # deepstack still needs the model-specific forward below because
+            # ForwardBatch has no field for those residual embeddings.
+            if ds_embeds is None:
+                forward_batch.input_embeds = input_embeds
+                return None
             return self._forward_with_omni_embeds(
                 forward_batch, input_embeds, ds_embeds, vis_masks
             )
