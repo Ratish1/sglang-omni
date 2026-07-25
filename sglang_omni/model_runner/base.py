@@ -391,40 +391,49 @@ class ModelRunner:
     ):
         """Prepare hook → standard forward (if not custom) → sample-before-post
         block. Returns ``batch_result``."""
-        if is_prefill:
-            self.before_prefill(forward_batch, schedule_batch, requests)
-            batch_result = self.custom_prefill_forward(
-                forward_batch, schedule_batch, requests
-            )
-        else:
-            self.before_decode(
-                forward_batch,
-                schedule_batch,
-                requests,
-                is_lookahead=is_lookahead,
-            )
-            batch_result = self.custom_decode_forward(
-                forward_batch, schedule_batch, requests
-            )
-        if batch_result is None:
-            batch_result = self.tp_worker.forward_batch_generation(forward_batch)
-
-        if (
-            not schedule_batch.is_prefill_only
-            and batch_result.next_token_ids is None
-            and (
-                self.sample_before_post_prefill(forward_batch, schedule_batch, requests)
-                if is_prefill
-                else self.sample_before_post_decode(
+        try:
+            if is_prefill:
+                self.before_prefill(forward_batch, schedule_batch, requests)
+                batch_result = self.custom_prefill_forward(
                     forward_batch, schedule_batch, requests
                 )
-            )
-        ):
-            batch_result.next_token_ids = self._sample_next_token_ids(
-                batch_result.logits_output, forward_batch, schedule_batch, requests
-            )
-            schedule_batch.output_ids = batch_result.next_token_ids
-        return batch_result
+            else:
+                self.before_decode(
+                    forward_batch,
+                    schedule_batch,
+                    requests,
+                    is_lookahead=is_lookahead,
+                )
+                batch_result = self.custom_decode_forward(
+                    forward_batch, schedule_batch, requests
+                )
+            if batch_result is None:
+                batch_result = self.tp_worker.forward_batch_generation(forward_batch)
+
+            if (
+                not schedule_batch.is_prefill_only
+                and batch_result.next_token_ids is None
+                and (
+                    self.sample_before_post_prefill(
+                        forward_batch, schedule_batch, requests
+                    )
+                    if is_prefill
+                    else self.sample_before_post_decode(
+                        forward_batch, schedule_batch, requests
+                    )
+                )
+            ):
+                batch_result.next_token_ids = self._sample_next_token_ids(
+                    batch_result.logits_output,
+                    forward_batch,
+                    schedule_batch,
+                    requests,
+                )
+                schedule_batch.output_ids = batch_result.next_token_ids
+            return batch_result
+        finally:
+            if is_prefill:
+                self.cleanup_prefill(forward_batch, schedule_batch, requests)
 
     def finalize_skip_rids(self, scheduler_output) -> set[str]:
         """Request ids whose ``generation_steps`` must NOT advance this step.
@@ -568,6 +577,11 @@ class ModelRunner:
         self, forward_batch: Any, schedule_batch: Any, requests: list
     ) -> None:
         """Mutate state before the standard or custom prefill forward."""
+
+    def cleanup_prefill(
+        self, forward_batch: Any, schedule_batch: Any, requests: list
+    ) -> None:
+        """Release one-forward prefill state on success or failure."""
 
     def before_decode(
         self,

@@ -138,6 +138,58 @@ def test_higgs_prefill_embeddings_follow_graph_padding_contract(
     assert seeds == [("request", 17)]
 
 
+def test_higgs_prefill_forward_failure_clears_pending_embeddings() -> None:
+    model = SimpleNamespace(
+        _pending_prefill_input_embeds=None,
+        set_request_seed=lambda _request_id, _seed: None,
+    )
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner.model = model
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(prefill_cuda_graph_runner=None)
+    )
+    input_embeds = torch.arange(12, dtype=torch.float32).view(3, 4)
+    runner._build_prefill_input_embeds = lambda _forward_batch, _requests: input_embeds
+    request = SimpleNamespace(
+        request_id="request",
+        data=SimpleNamespace(
+            req=SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=None))
+        ),
+    )
+    schedule_batch = SimpleNamespace(is_prefill_only=True)
+
+    def fail_before_model_forward(_forward_batch):
+        raise RuntimeError("forward setup failed")
+
+    runner.tp_worker.forward_batch_generation = fail_before_model_forward
+    with pytest.raises(RuntimeError, match="forward setup failed"):
+        runner._prepare_and_forward(
+            SimpleNamespace(input_embeds=input_embeds),
+            schedule_batch,
+            [request],
+            True,
+        )
+
+    assert model._pending_prefill_input_embeds is None
+
+    observed_pending: list[torch.Tensor] = []
+
+    def successful_forward(_forward_batch):
+        observed_pending.append(model._pending_prefill_input_embeds)
+        return SimpleNamespace()
+
+    runner.tp_worker.forward_batch_generation = successful_forward
+    runner._prepare_and_forward(
+        SimpleNamespace(input_embeds=input_embeds),
+        schedule_batch,
+        [request],
+        True,
+    )
+
+    assert observed_pending == [input_embeds]
+    assert model._pending_prefill_input_embeds is None
+
+
 def test_higgs_streaming_pipeline_shares_vocoder_stride_with_tts_engine() -> None:
     raw_config = HiggsTtsPipelineConfig(model_path="fake-model").model_dump()
     vocoder = next(

@@ -113,6 +113,10 @@ class HiggsTTSModelRunner(ModelRunner):
         self.model._pending_prefill_input_embeds = input_embeds
         forward_batch.input_embeds = None
 
+    def cleanup_prefill(self, forward_batch, schedule_batch, requests):
+        del forward_batch, schedule_batch, requests
+        self.model._pending_prefill_input_embeds = None
+
     def post_prefill(self, result, forward_batch, schedule_batch, requests):
         del schedule_batch
         self._collect_step_outputs(result, requests, forward_batch)
