@@ -189,6 +189,31 @@ def test_resolve_recomputes_finished_overrun_skip_rids():
     assert r.last_skip_rids == {"skip"}
 
 
+def test_execute_uses_the_callers_skip_rids_not_its_own_snapshot():
+    """The sync path must NOT re-derive skip_rids from finished() after the post
+    hooks: a request that finishes *during* this step (an EOC finish, which
+    _mark_sampler_finished sets in post_decode) has to be counted, exactly as
+    _resolve_and_process keeps a during-the-collect finish. Only the caller,
+    which snapshots before the forward, knows which finishes predate the step.
+    """
+    r = _StubRunner()
+    finished_this_step = types.SimpleNamespace(finished=lambda: True)
+    sched_output = types.SimpleNamespace(
+        requests=[
+            types.SimpleNamespace(
+                request_id="eoc",
+                data=types.SimpleNamespace(req=finished_this_step),
+            )
+        ],
+        batch_data=object(),
+    )
+    r.execute(sched_output)
+    assert r.last_skip_rids == set()  # finished now -> still counted
+
+    r.execute(sched_output, skip_rids={"eoc"})
+    assert r.last_skip_rids == {"eoc"}  # caller says it finished earlier
+
+
 def test_resolve_skips_retracted_row():
     """A request retracted (KV freed, returned to waiting) while its lagged step
     was in flight must be skipped at resolve, exactly like a prior-step finish.
@@ -412,9 +437,13 @@ def test_default_launch_staging_grows_then_slices_to_smaller_batch():
 
 
 # ---------------------------------------------------------------------------
-# Lookahead-overrun step-slot reclamation: allocator balance and the
-# cache-implementation gate (RadixCache + page_size=1 only; see
-# OmniScheduler._free_overrun_step_slots).
+# Lookahead-overrun step slots: the fast path must NOT hand them back to the
+# allocator. prepare_for_decode counts the step it allocates in
+# kv_committed_len, so the drain's cache_finished_req already accounts for that
+# slot (RadixCache inserts it, ChunkCache frees it). Freeing it here again
+# leaves it owned by both the radix tree and the allocator, which duplicates it
+# in the free list once that tree node is evicted.
+# test_async_decode_kv_ownership.py pins this against the real pools.
 # ---------------------------------------------------------------------------
 
 
@@ -429,45 +458,28 @@ def _scheduler_with_allocator(page_size=1, disable_radix_cache=False):
     return s, freed
 
 
-def test_free_overrun_step_slots_frees_exactly_the_dropped_rows():
+def test_drop_stale_overrun_frees_no_kv_slots():
     s, freed = _scheduler_with_allocator()
-    s._free_overrun_step_slots(torch.tensor([100, 101, 102]), [0, 2])
-    assert freed == [100, 102]
-    s._free_overrun_step_slots(torch.tensor([100, 101, 102]), [])
-    assert freed == [100, 102]
-
-
-def test_free_overrun_step_slots_skips_under_chunk_cache():
-    # ChunkCache's cache_finished_req frees [:kv_committed_len] — the overrun
-    # slot included — so the compensating free would double-free the slot and
-    # let two requests share it.
-    s, freed = _scheduler_with_allocator(disable_radix_cache=True)
-    s._free_overrun_step_slots(torch.tensor([100, 101]), [1])
+    batch = _MixedBatch(lens=[3, 1, 1], done=[False, True, False])
+    s._drop_stale_overrun(
+        batch,
+        types.SimpleNamespace(next_token_ids=torch.tensor([1, 2, 3])),
+        {batch.reqs[1].rid},
+    )
     assert freed == []
 
 
-def test_free_overrun_step_slots_skips_under_paged_allocator():
-    # Paged allocators free whole pages; the overrun slot's page was already
-    # freed with the request's tail tokens.
-    s, freed = _scheduler_with_allocator(page_size=16)
-    s._free_overrun_step_slots(torch.tensor([100, 101]), [1])
-    assert freed == []
-
-
-def test_free_overrun_step_slots_asserts_on_out_of_range_drop_index():
-    # A decode batch carries exactly one slot per row; a drop index beyond
-    # numel means the batch is not decode-shaped — fail loudly instead of
-    # freeing the wrong slot or silently reintroducing the leak.
-    s, freed = _scheduler_with_allocator()
-    with pytest.raises(AssertionError, match="out of range"):
-        s._free_overrun_step_slots(torch.tensor([100]), [1])
-    assert freed == []
-
-
-def test_free_overrun_step_slots_skips_none_out_cache_loc():
-    s, freed = _scheduler_with_allocator()
-    s._free_overrun_step_slots(None, [0])
-    assert freed == []
+def test_stale_overrun_rids_covers_finished_and_retracted():
+    s, _ = _scheduler_with_allocator()
+    reqs = [
+        types.SimpleNamespace(rid="live", finished=lambda: False, is_retracted=False),
+        types.SimpleNamespace(rid="fin", finished=lambda: True, is_retracted=False),
+        types.SimpleNamespace(rid="retr", finished=lambda: False, is_retracted=True),
+    ]
+    batch = types.SimpleNamespace(reqs=reqs)
+    assert s._stale_overrun_rids(batch) == {"fin", "retr"}
+    assert s._stale_overrun_rids(types.SimpleNamespace(reqs=[])) == set()
+    assert s._stale_overrun_rids(None) == set()
 
 
 def test_batch_is_decode():
@@ -510,7 +522,10 @@ def test_async_pending_batch_getattr_safe():
 class _FakeBatch:
     def __init__(self, n):
         # real ScheduleBatch.reqs are Reqs with .finished(); none finish here
-        self.reqs = [types.SimpleNamespace(finished=lambda: False) for _ in range(n)]
+        self.reqs = [
+            types.SimpleNamespace(finished=lambda: False, is_retracted=False)
+            for _ in range(n)
+        ]
         self.out_cache_loc = torch.arange(n)
 
     def copy(self):
@@ -523,6 +538,7 @@ class _FakeBatch:
 
 def _new_scheduler_for_async_loop():
     s = OmniScheduler.__new__(OmniScheduler)
+    s._model_runner = None  # matches __init__: always set, may be None
     s._admin_lock = threading.Lock()
     s._admin_queue = queue.Queue()
     s.chunked_req = None
@@ -562,7 +578,7 @@ def _drive_loop(seq, min_bs=2):
     # use the REAL drain helper so the bs>=2 -> bs=1 transition is exercised
     s._resolve_pending_async = OmniScheduler._resolve_pending_async.__get__(s)
 
-    def run_batch(b):
+    def run_batch(b, skip_rids=()):
         events.append("sync")
         return object()  # not _FAILED_BATCH_RESULT
 
@@ -647,7 +663,7 @@ def test_pending_decode_drain_order_for_prefill(
     s._resolve_and_process = lambda *args: events.append("resolve")
     s.process_batch_result = lambda batch, result: None
 
-    def run_batch(batch):
+    def run_batch(batch, skip_rids=()):
         events.append("prefill")
         return object()
 
@@ -713,6 +729,8 @@ def test_full_running_batch_keeps_lookahead_with_waiting_requests():
 class _DFReq:
     def __init__(self, name):
         self.name = name
+        self.rid = name
+        self.is_retracted = False
         self._done = False
 
     def finished(self):
@@ -728,6 +746,7 @@ class _DFBatch:
         self.reqs = list(reqs)
         self.out_cache_loc = torch.arange(100, 100 + len(reqs))
         self.decoding_reqs = None
+        self.forward_mode = None  # decode-shaped, like the real prepared batch
 
     def copy(self):
         return _DFBatch(self.reqs)
@@ -786,7 +805,8 @@ def test_fast_path_does_not_double_free_req_finished_by_drain():
 
     s._resolve_and_process = resolve_and_process
 
-    s.run_batch = lambda b: object()  # not _FAILED_BATCH_RESULT
+    # a real GenerationBatchResult always defines next_token_ids
+    s.run_batch = lambda b, skip_rids=(): types.SimpleNamespace(next_token_ids=None)
 
     def process_batch_result(b, r):
         # process_batch_result_decode frees any req that is finished() at this
@@ -811,6 +831,78 @@ def test_fast_path_does_not_double_free_req_finished_by_drain():
     s._event_loop_async_decode()
 
     assert not double_freed, f"KV double-freed (stale fast-path batch): {double_freed}"
+
+
+def test_stateful_runner_drops_stale_rows_before_the_forward():
+    """Codec runners (holds_per_request_decode_state=True) reset a request's
+    decode-state pool row when the drain ships its terminal result. Forwarding
+    the stale row would re-acquire a RESET row (wrong KV under the cached key)
+    and leak it, so the loop must drop it BEFORE run_batch — with skip_rids
+    left empty, and WITHOUT freeing the step slot the drain already committed
+    to the radix cache."""
+    reqs = [_DFReq(f"r{i}") for i in range(4)]
+    running = list(reqs)
+    finish_order = [reqs[0], reqs[1]]
+    forwarded: list[tuple[list, tuple]] = []
+    freed: list = []
+
+    s = _new_scheduler_for_async_loop()
+    s._model_runner = types.SimpleNamespace(
+        holds_per_request_decode_state=True,
+        lookahead_eligible=lambda b: True,
+    )
+    s.token_to_kv_pool_allocator = types.SimpleNamespace(
+        free=lambda t: freed.extend(t.tolist())
+    )
+    s._running = True
+    s._engine_paused = False
+    s._async_pending = None
+    s.async_decode_min_batch_size = 4  # bs3 takes the fast path WITH a pending
+    s.cur_batch = None
+    s.last_batch = None
+    s.recv_requests = lambda: []
+    s._take_deferred_request_payloads = lambda: []
+    s.process_input_requests = lambda r: None
+    s._batch_is_decode = lambda b: True
+    s.self_check_during_idle = lambda: None
+    s.self_check_during_busy = lambda: None
+    s._run_batch_launch = lambda b: ("sched_output", "pending_step")
+    s._resolve_pending_async = OmniScheduler._resolve_pending_async.__get__(s)
+
+    def resolve_and_process(pb, ps, pstep):
+        if finish_order:
+            r = finish_order.pop(0)
+            r._done = True
+            if r in running:
+                running.remove(r)
+
+    s._resolve_and_process = resolve_and_process
+
+    def run_batch(b, skip_rids=()):
+        forwarded.append(([r.name for r in b.reqs], tuple(skip_rids)))
+        return object()
+
+    s.run_batch = run_batch
+    s.process_batch_result = lambda b, r: None
+
+    state = {"i": 0}
+
+    def gnb():
+        state["i"] += 1
+        if state["i"] >= 4:
+            s._running = False
+            return None
+        return _DFBatch(list(running))
+
+    s.get_next_batch_to_run = gnb
+    s._event_loop_async_decode()
+
+    # i3: batch [r1, r2, r3] built, drain finishes r1 -> dropped pre-forward
+    assert forwarded == [(["r2", "r3"], ())], (
+        "the stale row must be dropped before the forward, with empty skip_rids: "
+        f"{forwarded}"
+    )
+    assert freed == [], "the drain-committed step slot must never be freed"
 
 
 def _scaffold_async_loop(*, async_pending=None):
@@ -840,7 +932,9 @@ def test_async_path_launch_failure_calls_handle_batch_failure():
 
     s._run_batch_launch = launch
     s._resolve_and_process = lambda *a, **kw: None
-    s._handle_batch_failure = lambda b, exc: failures.append((b, type(exc), str(exc)))
+    s._handle_batch_failure = lambda b, exc, skip_rids=(): failures.append(
+        (b, type(exc), str(exc))
+    )
 
     batch = _FakeBatch(2)
     batches = [batch]
@@ -874,7 +968,9 @@ def test_async_path_resolve_failure_calls_handle_batch_failure():
         raise RuntimeError("resolve boom")
 
     s._resolve_and_process = resolve
-    s._handle_batch_failure = lambda b, exc: failures.append((b, type(exc), str(exc)))
+    s._handle_batch_failure = lambda b, exc, skip_rids=(): failures.append(
+        (b, type(exc), str(exc))
+    )
 
     new_batch = _FakeBatch(2)
     batches = [new_batch]
@@ -906,7 +1002,9 @@ def test_drain_resolve_failure_calls_handle_batch_failure():
         raise RuntimeError("drain boom")
 
     s._resolve_and_process = resolve
-    s._handle_batch_failure = lambda b, exc: failures.append((b, type(exc), str(exc)))
+    s._handle_batch_failure = lambda b, exc, skip_rids=(): failures.append(
+        (b, type(exc), str(exc))
+    )
 
     OmniScheduler._resolve_pending_async(s)
 
@@ -921,8 +1019,13 @@ class _MixedBatch:
         )
         logprob = logprob or [False] * len(lens)
         self.reqs = [
-            types.SimpleNamespace(finished=lambda d=d: d, return_logprob=lp)
-            for d, lp in zip(done, logprob)
+            types.SimpleNamespace(
+                rid=f"r{i}",
+                finished=lambda d=d: d,
+                is_retracted=False,
+                return_logprob=lp,
+            )
+            for i, (d, lp) in enumerate(zip(done, logprob))
         ]
         self.extend_lens = list(lens)
         self.extend_num_tokens = sum(lens)
@@ -966,57 +1069,58 @@ def _drop_stale_scheduler(freed):
     return s
 
 
-def test_drop_stale_overrun_mixed_reslices_per_token():
+def _result(n):
+    return types.SimpleNamespace(next_token_ids=torch.arange(n))
+
+
+def test_drop_stale_overrun_mixed_leaves_per_token_fields_alone():
+    # The drop runs AFTER the forward, so the per-token fields (out_cache_loc,
+    # input_ids, extend_lens) never have to be resliced — a reslice is where a
+    # request-index-vs-token-index corruption once shipped. Only the req-level
+    # state that the merge back into running_batch reads has to be filtered,
+    # which filter_batch does.
     freed = []
     s = _drop_stale_scheduler(freed)
     batch = _MixedBatch(lens=[3, 1, 1], done=[False, True, False])
-    out = s._drop_stale_overrun(batch)
+    before_input_ids = batch.input_ids.tolist()
+    result = _result(3)
+    out = s._drop_stale_overrun(batch, result, {"r1"})
     assert out is batch
-    assert freed == [103]
-    assert out.out_cache_loc.tolist() == [100, 101, 102, 104]
-    assert out.input_ids.tolist() == [0, 1, 2, 4]
-    assert out.extend_lens == [3, 1]
-    assert out.extend_num_tokens == 4
-    assert out.prefix_lens == [10, 30]
-    assert out.extend_input_logprob_token_ids is None
+    assert [r.rid for r in out.reqs] == ["r0", "r2"]
+    assert result.next_token_ids.tolist() == [0, 2]  # dropped row trimmed
+    assert out.input_ids.tolist() == before_input_ids  # untouched
+    assert out.extend_lens == [3, 1, 1]  # untouched
+    assert freed == []  # the drain's cache_finished_req owns those slots
 
 
 def test_drop_stale_overrun_extend_multitoken_drop():
     freed = []
     s = _drop_stale_scheduler(freed)
     batch = _MixedBatch(lens=[2, 3], done=[True, False])
-    out = s._drop_stale_overrun(batch)
-    assert freed == [100, 101]
-    assert out.out_cache_loc.tolist() == [102, 103, 104]
-    assert out.input_ids.tolist() == [2, 3, 4]
-    assert out.extend_lens == [3]
-    assert out.extend_num_tokens == 3
-    assert out.prefix_lens == [20]
+    result = _result(2)
+    out = s._drop_stale_overrun(batch, result, {"r0"})
+    assert [r.rid for r in out.reqs] == ["r1"]
+    assert result.next_token_ids.tolist() == [1]
+    assert freed == []
 
 
-def test_drop_stale_overrun_reslices_logprob_token_ids():
+def test_drop_stale_overrun_all_rows_stale_returns_none():
     freed = []
     s = _drop_stale_scheduler(freed)
-    batch = _MixedBatch(
-        lens=[3, 2, 2],
-        done=[False, True, False],
-        lp_start_lens=[1, 0, 2],
-        logprob=[True, True, True],
-    )
-    assert batch.extend_input_logprob_token_ids.tolist() == [100, 101, 200, 201]
-    out = s._drop_stale_overrun(batch)
-    assert out.extend_input_logprob_token_ids.tolist() == [100, 101]
-    assert out.extend_lens == [3, 2]
-    assert out.extend_logprob_start_lens == [1, 2]
+    batch = _MixedBatch(lens=[2, 3], done=[True, True])
+    assert s._drop_stale_overrun(batch, _result(2), {"r0", "r1"}) is None
+    assert freed == []
 
 
-def test_drop_stale_overrun_drops_last_logprob_req():
+def test_drop_stale_overrun_noop_without_stale_rids():
     freed = []
     s = _drop_stale_scheduler(freed)
-    batch = _MixedBatch(lens=[2, 2], done=[True, False], logprob=[True, False])
-    out = s._drop_stale_overrun(batch)
-    assert out.return_logprob is False
-    assert out.extend_input_logprob_token_ids is None
+    batch = _MixedBatch(lens=[2, 3], done=[False, False])
+    result = _result(2)
+    out = s._drop_stale_overrun(batch, result, set())
+    assert out is batch
+    assert [r.rid for r in out.reqs] == ["r0", "r1"]
+    assert result.next_token_ids.tolist() == [0, 1]
 
 
 def test_drop_stale_overrun_filters_decoding_reqs():
@@ -1026,5 +1130,5 @@ def test_drop_stale_overrun_filters_decoding_reqs():
     batch = _MixedBatch(lens=[3, 1, 1], done=[False, True, False])
     batch.decoding_reqs = [batch.reqs[1], batch.reqs[2]]
     live_decode = batch.reqs[2]
-    out = s._drop_stale_overrun(batch)
+    out = s._drop_stale_overrun(batch, _result(3), {"r1"})
     assert out.decoding_reqs == [live_decode]

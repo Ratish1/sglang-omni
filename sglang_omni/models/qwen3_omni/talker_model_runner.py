@@ -28,8 +28,8 @@ class QwenTalkerModelRunner(ModelRunner):
         self._code2wav_target = code2wav_target
         self._feedback_enabled = bool(feedback_enabled)
 
-    def execute(self, scheduler_output: Any):
-        return super().execute(scheduler_output)
+    def execute(self, scheduler_output: Any, skip_rids: set[str] | None = None):
+        return super().execute(scheduler_output, skip_rids=skip_rids)
 
     def custom_prefill_forward(
         self,

@@ -59,9 +59,9 @@ class ThinkerModelRunner(ModelRunner):
         finally:
             self._text_model.layers_to_capture = saved_capture_layers
 
-    def execute(self, scheduler_output: Any):
+    def execute(self, scheduler_output: Any, skip_rids: set[str] | None = None):
         with self._text_only_capture_guard(scheduler_output.requests):
-            return super().execute(scheduler_output)
+            return super().execute(scheduler_output, skip_rids=skip_rids)
 
     def execute_launch(self, scheduler_output: Any):
         with self._text_only_capture_guard(scheduler_output.requests):

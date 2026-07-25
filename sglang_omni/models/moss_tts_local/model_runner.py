@@ -16,6 +16,10 @@ from sglang_omni.scheduling.types import RequestOutput
 
 
 class MossTTSLocalModelRunner(ModelRunner):
+    # reset_request at the terminal result recycles the decode-state pool row;
+    # a stale overrun row must be dropped pre-forward, never forwarded.
+    holds_per_request_decode_state = True
+
     """Drives the per-frame local-transformer decode and feedback embeddings.
 
     Per step: the backbone (radix-cached, CUDA-graphed) produces one hidden

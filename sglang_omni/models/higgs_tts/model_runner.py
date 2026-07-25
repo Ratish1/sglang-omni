@@ -49,6 +49,10 @@ def _syncfree_launch_enabled() -> bool:
 class HiggsTTSModelRunner(ModelRunner):
     """ModelRunner for :class:`HiggsTTSModel`."""
 
+    # reset_request at the terminal result releases the sampler-pool row;
+    # a stale overrun row must be dropped pre-forward, never forwarded.
+    holds_per_request_decode_state = True
+
     def __init__(self, tp_worker: Any, output_processor: Any) -> None:
         super().__init__(tp_worker, output_processor)
         self._outbox: Any | None = None
