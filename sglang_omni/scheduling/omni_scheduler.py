@@ -372,7 +372,14 @@ class OmniScheduler:
                 worker=tp_worker,
                 req_to_token_pool=req_to_token_pool,
                 spec_algorithm=self.spec_algorithm,
-                enable_stream_overlap=(enable_async_decode or enable_overlap),
+                # Omni async decode is deliberately a single-stream
+                # launch-current/resolve-previous loop.  SGLang's independent
+                # schedule/forward streams have a different WAR and sampling
+                # publication contract; opting into them here races decode
+                # CUDA-graph buffers even though eager decode appears correct.
+                # Only the upstream-style overlap loop owns that two-stream
+                # contract.
+                enable_stream_overlap=enable_overlap,
             )
             # Keep the upstream attribute available to delegated scheduler
             # methods, but make the custom ModelRunner the sole owner of relay.

@@ -807,6 +807,96 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     assert scheduler._abort_on_queued_limit(object()) is False
 
 
+@pytest.mark.parametrize(
+    ("enable_overlap", "enable_async_decode", "expected_stream_overlap"),
+    [
+        (False, True, False),
+        (True, False, True),
+        (True, True, True),
+    ],
+)
+def test_omni_scheduler_keeps_async_decode_on_single_stream(
+    monkeypatch,
+    enable_overlap,
+    enable_async_decode,
+    expected_stream_overlap,
+) -> None:
+    """Async lookahead must not opt into SGLang's independent two-stream loop."""
+    monkeypatch.setattr(
+        OmniScheduler, "_init_parallel_state", lambda self, _tp_worker: None
+    )
+    for method_name in ("init_metrics_collector", "init_metrics_reporter"):
+        monkeypatch.setattr(
+            OmniScheduler,
+            method_name,
+            lambda self, *_args, **_kwargs: None,
+            raising=False,
+        )
+    monkeypatch.setattr(
+        "sglang.srt.server_args.get_global_server_args",
+        lambda: SimpleNamespace(pp_max_micro_batch_size=None),
+    )
+
+    observed = []
+
+    class _ExecutionBridge:
+        def __init__(self, **kwargs):
+            observed.append(kwargs["enable_stream_overlap"])
+            self.future_map = object()
+
+    monkeypatch.setattr(
+        "sglang_omni.model_runner.sglang_execution.SGLangExecutionBridge",
+        _ExecutionBridge,
+    )
+    model_runner = SimpleNamespace(
+        bind_execution_bridge=lambda bridge: observed.append(bridge)
+    )
+    tp_worker = SimpleNamespace(
+        gpu_id=0,
+        tp_rank=0,
+        model_runner=SimpleNamespace(max_total_num_tokens=128),
+        random_seed=0,
+        device=torch.device("cpu"),
+    )
+    server_args = SimpleNamespace(
+        tp_size=1,
+        pp_size=1,
+        page_size=1,
+        max_prefill_tokens=32,
+        max_running_requests=2,
+        max_queued_requests=7,
+        context_length=128,
+        chunked_prefill_size=0,
+        enable_mixed_chunk=False,
+        schedule_policy="fcfs",
+        enable_hierarchical_cache=False,
+        enable_hisparse=False,
+        enable_priority_scheduling=False,
+        disable_priority_preemption=False,
+        schedule_low_priority_values_first=False,
+        priority_scheduling_preemption_threshold=0,
+        schedule_conservativeness=1.0,
+        enable_metrics=False,
+        enable_metrics_for_all_schedulers=False,
+    )
+
+    scheduler = OmniScheduler(
+        tp_worker=tp_worker,
+        tree_cache=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+        server_args=server_args,
+        model_config=SimpleNamespace(),
+        model_runner=model_runner,
+        enable_overlap=enable_overlap,
+        enable_async_decode=enable_async_decode,
+    )
+
+    assert observed[0] is expected_stream_overlap
+    assert observed[1] is scheduler._execution_bridge
+    assert model_runner._async_enabled is enable_async_decode
+
+
 def test_stage_output_cache_eviction_uses_lru_order() -> None:
     cache = StageOutputCache(max_size=2)
 
