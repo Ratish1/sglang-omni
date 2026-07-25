@@ -10,6 +10,9 @@ import torch
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 from sglang_omni.models.moss_tts_local.radix_hash import gpu_radix_row_hash
+from sglang_omni.models.moss_tts_local.request_builders import (
+    MOSS_STREAM_TRANSPORT_BATCH_FRAMES,
+)
 from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.types import RequestOutput
@@ -36,6 +39,39 @@ class MossTTSLocalModelRunner(ModelRunner):
 
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
+
+    def _flush_stream_rows(
+        self,
+        request_id: str,
+        data: Any,
+        *,
+        force: bool,
+    ) -> None:
+        metadata = getattr(data, "stream_metadata", None)
+        if metadata is None or self._outbox is None:
+            return
+        pending = getattr(data, "stream_pending_rows", None)
+        if pending is None:
+            pending = []
+            data.stream_pending_rows = pending
+        if not pending:
+            return
+        first_sent = bool(getattr(data, "stream_first_batch_sent", False))
+        threshold = 1 if not first_sent else MOSS_STREAM_TRANSPORT_BATCH_FRAMES
+        if not force and len(pending) < threshold:
+            return
+        rows = pending[0] if len(pending) == 1 else torch.stack(pending)
+        pending.clear()
+        data.stream_first_batch_sent = True
+        self._outbox.put(
+            OutgoingMessage(
+                request_id=request_id,
+                type="stream",
+                target=self._vocoder_target,
+                data=rows,
+                metadata=metadata,
+            )
+        )
 
     def custom_prefill_forward(
         self,
@@ -619,7 +655,6 @@ class MossTTSLocalModelRunner(ModelRunner):
                 "MOSS-TTS Local journal/batch alignment broken: "
                 f"{journal.rids} != {expected_rids}"
             )
-        rows_cpu: torch.Tensor | None = None
         for i, sched_req in enumerate(expected_reqs):
             # Overrun: a request finished or retracted in a PRIOR step is still
             # in this lagged resolve batch; its wasted frame must not reach
@@ -638,22 +673,28 @@ class MossTTSLocalModelRunner(ModelRunner):
                     continue
             req_output = outputs[sched_req.request_id]
             if req_output.data is None or int(req_output.data) == end_id:
+                self._flush_stream_rows(
+                    sched_req.request_id,
+                    sched_req.data,
+                    force=True,
+                )
                 continue
             sched_req.data.output_rows.append(journal.rows[i])
             stream_metadata = getattr(sched_req.data, "stream_metadata", None)
-            if stream_metadata is None:
+            if stream_metadata is None or self._outbox is None:
                 continue
-            if self._outbox is None:
-                continue
-            if rows_cpu is None:
-                # One D2H per step regardless of how many requests stream.
-                rows_cpu = journal.rows.detach().to("cpu", torch.long)
-            self._outbox.put(
-                OutgoingMessage(
-                    request_id=sched_req.request_id,
-                    type="stream",
-                    target=self._vocoder_target,
-                    data=rows_cpu[i].clone(),
-                    metadata=stream_metadata,
-                )
+            # Keep the step-private journal row on its producing device. The
+            # pipeline runtime selects local-object, direct CUDA IPC, or relay
+            # transport for the actual topology. Forcing every streaming decode
+            # step through CPU here serializes the AR CUDA stream and bypasses
+            # the same-GPU zero-copy transport.
+            pending = getattr(sched_req.data, "stream_pending_rows", None)
+            if pending is None:
+                pending = []
+                sched_req.data.stream_pending_rows = pending
+            pending.append(journal.rows[i])
+            self._flush_stream_rows(
+                sched_req.request_id,
+                sched_req.data,
+                force=False,
             )

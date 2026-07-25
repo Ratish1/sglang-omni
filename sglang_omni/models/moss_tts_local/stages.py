@@ -45,6 +45,7 @@ from sglang_omni.scheduling.reference_encoder import (
     TensorReferenceEncodeHook,
 )
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+from sglang_omni.utils.cpu import bounded_intraop_threads
 
 logger = logging.getLogger(__name__)
 
@@ -89,14 +90,9 @@ def _configure_pipeline_threads(worker_count: int) -> int:
         torch.set_num_threads(requested)
         return requested
 
-    cpu_count = (
-        len(os.sched_getaffinity(0))
-        if hasattr(os, "sched_getaffinity")
-        else (os.cpu_count() or 1)
-    )
-    intraop_threads = min(
-        max(cpu_count // max(int(worker_count), 1), 1),
-        _MAX_PIPELINE_INTRAOP_THREADS,
+    intraop_threads = bounded_intraop_threads(
+        worker_count=max(int(worker_count), 1),
+        max_threads=_MAX_PIPELINE_INTRAOP_THREADS,
     )
     torch.set_num_threads(intraop_threads)
     return intraop_threads

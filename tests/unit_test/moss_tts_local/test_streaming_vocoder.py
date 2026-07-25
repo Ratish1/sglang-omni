@@ -1320,6 +1320,18 @@ def test_stream_chunk_requires_metadata_contract(monkeypatch) -> None:
     assert scheduler._stream_states == {}
 
 
+def test_stream_chunk_accepts_batched_ar_rows(monkeypatch) -> None:
+    scheduler = _make_scheduler(monkeypatch, FakeProcessor())
+    state = scheduler.create_stream_state("req")
+    rows = _rows(3, seed=81)
+
+    codes = scheduler.validate_chunk("req", state, rows)
+    scheduler.ingest("req", state, codes)
+
+    assert len(state.pending) == 3
+    assert torch.equal(torch.stack(state.pending), rows[:, 1:])
+
+
 # --- CUDA-graph config + recapture / factory-capture / anti-storm lifecycle (CPU fakes) ---
 
 

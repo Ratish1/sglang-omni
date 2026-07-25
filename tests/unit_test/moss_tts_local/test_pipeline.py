@@ -57,10 +57,11 @@ def test_moss_pipeline_uses_bounded_cpu_threads(
 
     monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
     monkeypatch.setattr(
-        stages.os,
-        "sched_getaffinity",
-        lambda _pid: set(range(cpu_count)),
-        raising=False,
+        stages,
+        "bounded_intraop_threads",
+        lambda *, worker_count, max_threads: min(
+            max(cpu_count // worker_count, 1), max_threads
+        ),
     )
     configured_threads: list[int] = []
     monkeypatch.setattr(stages.torch, "set_num_threads", configured_threads.append)
@@ -434,6 +435,7 @@ def test_pipeline_stage_wiring():
     assert stages["preprocessing"].process == "pipeline"
     assert stages["preprocessing"].gpu == 0
     assert stages["preprocessing"].factory_args["device"] == "cuda:0"
+    assert stages["preprocessing"].factory_args["max_concurrency"] == 16
     assert stages["preprocessing"].factory_args["ref_audio_cache"] is True
     assert stages["preprocessing"].factory_args["ref_audio_cache_max_items"] == 8192
     assert stages[
@@ -483,6 +485,39 @@ def test_pipeline_stage_wiring():
     assert split_runtime.resources.total_gpu_memory_fraction is None
     assert split_runtime.sglang_server_args.mem_fraction_static == pytest.approx(0.85)
     assert split_stages["vocoder"].factory_args["device"] == "cuda:1"
+
+
+@pytest.mark.parametrize(
+    "effective_cpus,expected_threads",
+    [(4, 1), (16, 1), (32, 2), (224, 8)],
+)
+def test_pipeline_sets_spawn_time_omp_default(
+    monkeypatch: pytest.MonkeyPatch,
+    effective_cpus: int,
+    expected_threads: int,
+) -> None:
+    from sglang_omni.models.moss_tts_local import config as config_module
+
+    monkeypatch.setattr(
+        config_module,
+        "bounded_intraop_threads",
+        lambda *, worker_count, max_threads: min(
+            max(effective_cpus // worker_count, 1), max_threads
+        ),
+    )
+
+    config = config_module.MossTTSLocalPipelineConfig(model_path="dummy")
+
+    assert config.env_defaults["OMP_NUM_THREADS"] == str(expected_threads)
+
+
+def test_pipeline_preserves_explicit_omp_default() -> None:
+    config = MossTTSLocalPipelineConfig(
+        model_path="dummy",
+        env_defaults={"OMP_NUM_THREADS": "3"},
+    )
+
+    assert config.env_defaults["OMP_NUM_THREADS"] == "3"
 
 
 def test_pipeline_config_injects_reference_cache_factory_args():
@@ -1715,6 +1750,144 @@ def test_post_process_outputs_skips_chunked_rows():
 
     assert req_a.data.output_rows == [], "chunked row must not be appended"
     assert len(req_b.data.output_rows) == 1, "normal row must be appended"
+
+
+def test_post_process_outputs_keeps_stream_rows_device_native():
+    """Streaming transport, not the model runner, owns device placement."""
+    from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
+    from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
+
+    runner = MossTTSLocalModelRunner.__new__(MossTTSLocalModelRunner)
+    runner.model = types.SimpleNamespace(
+        config=types.SimpleNamespace(audio_end_token_id=151670)
+    )
+    messages = []
+    runner._outbox = types.SimpleNamespace(put=messages.append)
+
+    row = torch.arange(N_VQ + 1, dtype=torch.long).reshape(1, N_VQ + 1)
+    data = types.SimpleNamespace(
+        req=None,
+        output_rows=[],
+        stream_metadata={"modality": "audio"},
+    )
+    sched_output = types.SimpleNamespace(
+        requests=[types.SimpleNamespace(request_id="r0", data=data)]
+    )
+    result = types.SimpleNamespace(
+        moss_journal=MossTTSLocalDecodeJournal(
+            rids=["r0"],
+            pool_rows=[0],
+            rows=row,
+        )
+    )
+
+    runner.post_process_outputs(
+        result,
+        sched_output,
+        {"r0": types.SimpleNamespace(data=1000)},
+    )
+
+    assert len(messages) == 1
+    assert messages[0].data.device == row.device
+    assert (
+        messages[0].data.untyped_storage().data_ptr()
+        == row.untyped_storage().data_ptr()
+    )
+
+
+def test_post_process_outputs_does_not_buffer_without_stream_outbox():
+    from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
+    from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
+
+    runner = MossTTSLocalModelRunner.__new__(MossTTSLocalModelRunner)
+    runner.model = types.SimpleNamespace(
+        config=types.SimpleNamespace(audio_end_token_id=151670)
+    )
+    runner._outbox = None
+    data = types.SimpleNamespace(
+        req=None,
+        output_rows=[],
+        stream_metadata={"modality": "audio"},
+    )
+    row = torch.arange(N_VQ + 1, dtype=torch.long).reshape(1, N_VQ + 1)
+
+    runner.post_process_outputs(
+        types.SimpleNamespace(
+            moss_journal=MossTTSLocalDecodeJournal(
+                rids=["r0"],
+                pool_rows=[0],
+                rows=row,
+            )
+        ),
+        types.SimpleNamespace(
+            requests=[types.SimpleNamespace(request_id="r0", data=data)]
+        ),
+        {"r0": types.SimpleNamespace(data=1000)},
+    )
+
+    assert len(data.output_rows) == 1
+    assert not hasattr(data, "stream_pending_rows")
+
+
+def test_post_process_outputs_batches_stream_transport_rows():
+    from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
+    from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
+
+    runner = MossTTSLocalModelRunner.__new__(MossTTSLocalModelRunner)
+    runner.model = types.SimpleNamespace(
+        config=types.SimpleNamespace(audio_end_token_id=151670)
+    )
+    messages = []
+    runner._outbox = types.SimpleNamespace(put=messages.append)
+    data = types.SimpleNamespace(
+        req=None,
+        output_rows=[],
+        stream_metadata={"stream": True, "modality": "audio_codes", "n_vq": N_VQ},
+    )
+    sched_output = types.SimpleNamespace(
+        requests=[types.SimpleNamespace(request_id="r0", data=data)]
+    )
+    rows = torch.arange(7 * (N_VQ + 1), dtype=torch.long).reshape(7, N_VQ + 1)
+
+    for row in rows:
+        result = types.SimpleNamespace(
+            moss_journal=MossTTSLocalDecodeJournal(
+                rids=["r0"],
+                pool_rows=[0],
+                rows=row.unsqueeze(0),
+            )
+        )
+        runner.post_process_outputs(
+            result,
+            sched_output,
+            {"r0": types.SimpleNamespace(data=1000)},
+        )
+    runner.post_process_outputs(
+        types.SimpleNamespace(
+            moss_journal=MossTTSLocalDecodeJournal(
+                rids=["r0"],
+                pool_rows=[0],
+                rows=torch.zeros(1, N_VQ + 1, dtype=torch.long),
+            )
+        ),
+        sched_output,
+        {"r0": types.SimpleNamespace(data=151670)},
+    )
+
+    assert [tuple(message.data.shape) for message in messages] == [
+        (N_VQ + 1,),
+        (5, N_VQ + 1),
+        (N_VQ + 1,),
+    ]
+    reconstructed = torch.cat(
+        [
+            message.data.unsqueeze(0)
+            if message.data.ndim == 1
+            else message.data
+            for message in messages
+        ]
+    )
+    assert torch.equal(reconstructed, rows)
 
 
 def test_finalize_skip_rids_selects_chunked_rows():

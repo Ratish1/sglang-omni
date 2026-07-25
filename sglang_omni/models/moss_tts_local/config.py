@@ -14,6 +14,7 @@ from sglang_omni.config import (
     StageResourceConfig,
     StageRuntimeConfig,
 )
+from sglang_omni.utils.cpu import bounded_intraop_threads
 
 _PKG = "sglang_omni.models.moss_tts_local"
 # Keep reference encoding with AR so process-scoped SGLang accounting includes
@@ -25,6 +26,8 @@ _COLOCATED_VOCODER_GPU_MEMORY_FRACTION = 0.18
 _AR_MEM_FRACTION_STATIC = 0.85
 _REF_AUDIO_CACHE_MAX_ITEMS = 8192
 _REF_AUDIO_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_PREPROCESSING_MAX_CONCURRENCY = 16
+_MAX_PIPELINE_INTRAOP_THREADS = 8
 
 
 def _stages(*, codec_device: str, colocated: bool) -> list[StageConfig]:
@@ -61,7 +64,10 @@ def _stages(*, codec_device: str, colocated: bool) -> list[StageConfig]:
             name="preprocessing",
             process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
-            factory_args={"device": codec_device},
+            factory_args={
+                "device": codec_device,
+                "max_concurrency": _PREPROCESSING_MAX_CONCURRENCY,
+            },
             runtime=preprocessing_runtime,
             gpu=0,
             next="tts_engine",
@@ -127,6 +133,18 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
 
     def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
+        # Stage processes must inherit this before importing Torch/OpenMP-backed
+        # libraries. Calling torch.set_num_threads() inside preprocessing is too
+        # late for the separately spawned AR and vocoder processes.
+        self.env_defaults.setdefault(
+            "OMP_NUM_THREADS",
+            str(
+                bounded_intraop_threads(
+                    worker_count=_PREPROCESSING_MAX_CONCURRENCY,
+                    max_threads=_MAX_PIPELINE_INTRAOP_THREADS,
+                )
+            ),
+        )
         if self.ref_audio_cache_max_items < 1:
             raise ValueError(
                 "ref_audio_cache_max_items must be >= 1; got "
