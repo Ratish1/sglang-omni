@@ -126,4 +126,3 @@ class SGLangExecutionBridge:
         event = self.device_module.Event()
         event.record()
         return event
-

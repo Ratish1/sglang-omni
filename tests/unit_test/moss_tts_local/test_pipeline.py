@@ -1578,9 +1578,9 @@ def test_cached_reference_encoder_file_bytes_keyspaces_do_not_collide(tmp_path):
     enc.encode(str(ref_file))  # populates file: key
     enc.encode_data_uri(data_uri)  # must NOT hit file: entry
 
-    assert enc.stats()["misses"] == 2, (
-        "file: and bytes: are independent keyspaces; data-URI must be a fresh miss"
-    )
+    assert (
+        enc.stats()["misses"] == 2
+    ), "file: and bytes: are independent keyspaces; data-URI must be a fresh miss"
 
 
 def test_cached_reference_encoder_data_uri_duration_gate():
@@ -1881,9 +1881,7 @@ def test_post_process_outputs_batches_stream_transport_rows():
     ]
     reconstructed = torch.cat(
         [
-            message.data.unsqueeze(0)
-            if message.data.ndim == 1
-            else message.data
+            message.data.unsqueeze(0) if message.data.ndim == 1 else message.data
             for message in messages
         ]
     )

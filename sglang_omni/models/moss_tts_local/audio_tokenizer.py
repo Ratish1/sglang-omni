@@ -8,9 +8,7 @@ from typing import Any
 
 import torch
 
-from sglang_omni.models.moss_tts.hf_loading import (
-    moss_transformers_processor_compat,
-)
+from sglang_omni.models.moss_tts.hf_loading import moss_transformers_processor_compat
 
 logger = logging.getLogger(__name__)
 
@@ -144,9 +142,7 @@ def load_moss_tts_local_audio_tokenizer(
     *,
     device: str = "cuda:0",
 ) -> MossTTSLocalAudioTokenizer:
-    logger.info(
-        f"Loading MOSS-TTS Local audio tokenizer from {model_path} on {device}"
-    )
+    logger.info(f"Loading MOSS-TTS Local audio tokenizer from {model_path} on {device}")
     try:
         from transformers import AutoModel
 
