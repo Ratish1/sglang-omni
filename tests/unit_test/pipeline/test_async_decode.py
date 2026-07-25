@@ -522,7 +522,10 @@ def test_async_pending_batch_getattr_safe():
 class _FakeBatch:
     def __init__(self, n):
         # real ScheduleBatch.reqs are Reqs with .finished(); none finish here
-        self.reqs = [types.SimpleNamespace(finished=lambda: False) for _ in range(n)]
+        self.reqs = [
+            types.SimpleNamespace(finished=lambda: False, is_retracted=False)
+            for _ in range(n)
+        ]
         self.out_cache_loc = torch.arange(n)
 
     def copy(self):
@@ -743,6 +746,7 @@ class _DFBatch:
         self.reqs = list(reqs)
         self.out_cache_loc = torch.arange(100, 100 + len(reqs))
         self.decoding_reqs = None
+        self.forward_mode = None  # decode-shaped, like the real prepared batch
 
     def copy(self):
         return _DFBatch(self.reqs)
@@ -801,7 +805,8 @@ def test_fast_path_does_not_double_free_req_finished_by_drain():
 
     s._resolve_and_process = resolve_and_process
 
-    s.run_batch = lambda b, skip_rids=(): object()  # not _FAILED_BATCH_RESULT
+    # a real GenerationBatchResult always defines next_token_ids
+    s.run_batch = lambda b, skip_rids=(): types.SimpleNamespace(next_token_ids=None)
 
     def process_batch_result(b, r):
         # process_batch_result_decode frees any req that is finished() at this

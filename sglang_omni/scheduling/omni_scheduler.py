@@ -1834,11 +1834,7 @@ class OmniScheduler:
         """
         if batch is None or not batch.reqs:
             return set()
-        return {
-            r.rid
-            for r in batch.reqs
-            if r.finished() or bool(getattr(r, "is_retracted", False))
-        }
+        return {r.rid for r in batch.reqs if r.finished() or r.is_retracted}
 
     @staticmethod
     def _drop_stale_rows_before_forward(batch, stale_rids):
@@ -1850,7 +1846,7 @@ class OmniScheduler:
         the drain's release committed it to the radix cache, and freeing a
         tree-owned slot is the tree/free-list alias this fix exists to end.
         Returns the filtered batch, or None if it empties."""
-        forward_mode = getattr(batch, "forward_mode", None)
+        forward_mode = batch.forward_mode
         assert forward_mode is None or not forward_mode.is_extend(), (
             "stale overrun rows in an extend batch on a stateful codec runner; "
             "per-request dropping would misslice its per-token fields"
@@ -1898,7 +1894,7 @@ class OmniScheduler:
         keep = [i for i, r in enumerate(batch.reqs) if r.rid not in stale_rids]
         if len(keep) == len(batch.reqs):
             return batch
-        next_token_ids = getattr(result, "next_token_ids", None)
+        next_token_ids = result.next_token_ids
         if keep and next_token_ids is not None:
             # process_batch_result_* zips these rows with batch.reqs; a shape
             # this code cannot trim would misalign every kept row, so refuse
