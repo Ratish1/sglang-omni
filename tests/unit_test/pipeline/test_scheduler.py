@@ -121,8 +121,13 @@ def test_threaded_simple_scheduler_reports_worker_errors() -> None:
 
 def test_sched_output_restores_legacy_req_extend_input_len() -> None:
     reqs = [
-        SimpleNamespace(rid="a", _omni_data=object(), extend_input_len=99),
-        SimpleNamespace(rid="b", _omni_data=object()),
+        SimpleNamespace(
+            rid="a",
+            _omni_data=object(),
+            extend_input_len=99,
+            inflight_middle_chunks=0,
+        ),
+        SimpleNamespace(rid="b", _omni_data=object(), inflight_middle_chunks=0),
     ]
     batch = SimpleNamespace(
         reqs=reqs,
@@ -135,6 +140,30 @@ def test_sched_output_restores_legacy_req_extend_input_len() -> None:
 
     assert output.batch_data is batch
     assert [req.extend_input_len for req in reqs] == [3, 7]
+
+
+def test_sched_output_publishes_legacy_is_chunked_from_inflight_middle_chunks() -> None:
+    """SGLang 0.5.15 renamed Req.is_chunked to Req.inflight_middle_chunks.
+
+    Omni model runners still branch on is_chunked to suppress non-final prefill
+    chunks, and nothing on the live path writes it (the upstream-delegated
+    get_new_batch_prefill owns the counter). Without the republish every chunk
+    reads as 0, i.e. a middle chunk is mistaken for the last one.
+    """
+    reqs = [
+        SimpleNamespace(rid="mid", _omni_data=object(), inflight_middle_chunks=1),
+        SimpleNamespace(rid="last", _omni_data=object(), inflight_middle_chunks=0),
+    ]
+    batch = SimpleNamespace(
+        reqs=reqs,
+        extend_lens=[5, 5],
+        forward_mode=SimpleNamespace(is_extend=lambda: True),
+    )
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+
+    scheduler._build_sched_output(batch)
+
+    assert [req.is_chunked for req in reqs] == [1, 0]
 
 
 def test_omni_scheduler_default_stream_chunk_buffers_raw_chunks() -> None:
@@ -236,12 +265,14 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
                 _omni_data=SimpleNamespace(),
                 req_pool_idx=1,
                 mamba_pool_idx=None,
+                inflight_middle_chunks=0,
             ),
             SimpleNamespace(
                 rid="req-2",
                 _omni_data=SimpleNamespace(),
                 req_pool_idx=2,
                 mamba_pool_idx=None,
+                inflight_middle_chunks=0,
             ),
         ],
         batch_is_full=True,
@@ -286,8 +317,12 @@ def test_omni_scheduler_custom_runner_updates_next_input_ids() -> None:
 
     batch = SimpleNamespace(
         reqs=[
-            SimpleNamespace(rid="req-1", _omni_data=SimpleNamespace()),
-            SimpleNamespace(rid="req-2", _omni_data=SimpleNamespace()),
+            SimpleNamespace(
+                rid="req-1", _omni_data=SimpleNamespace(), inflight_middle_chunks=0
+            ),
+            SimpleNamespace(
+                rid="req-2", _omni_data=SimpleNamespace(), inflight_middle_chunks=0
+            ),
         ],
         output_ids=None,
         is_prefill_only=False,
@@ -324,7 +359,11 @@ def test_omni_scheduler_custom_runner_advances_forward_ct() -> None:
 
     def _batch():
         return SimpleNamespace(
-            reqs=[SimpleNamespace(rid="r", _omni_data=SimpleNamespace())],
+            reqs=[
+                SimpleNamespace(
+                    rid="r", _omni_data=SimpleNamespace(), inflight_middle_chunks=0
+                )
+            ],
             output_ids=None,
             is_prefill_only=False,
             is_extend_in_batch=False,

@@ -948,9 +948,11 @@ class OmniScheduler:
     @staticmethod
     def _normalize_req_token_arrays(req: Any) -> None:
         """Install the Req compatibility state used by Omni model runners."""
-        # SGLang 0.5.15 removed this counter in favor of ScheduleBatch's
-        # chunked-request lifecycle. Omni model runners still use it to suppress
-        # intermediate chunk outputs, so keep it as an Omni-owned sidecar.
+        # SGLang 0.5.15 renamed this counter to Req.inflight_middle_chunks.
+        # Omni model runners still read the old name to suppress intermediate
+        # chunk outputs; _sync_legacy_is_chunked republishes it per forward.
+        # This seed only covers readers that run before the first forward
+        # (request builders) and the _Upstream.run_batch fallback.
         if not hasattr(req, "is_chunked"):
             req.is_chunked = 0
         if not hasattr(req, "extend_input_len"):
@@ -1107,11 +1109,40 @@ class OmniScheduler:
         from sglang_omni.scheduling.types import SchedulerOutput, SchedulerRequest
 
         self._sync_legacy_extend_input_lens(batch)
+        self._sync_legacy_is_chunked(batch)
         sched_reqs = [
             SchedulerRequest(request_id=req.rid, data=req._omni_data)
             for req in batch.reqs
         ]
         return SchedulerOutput(requests=sched_reqs, batch_data=batch)
+
+    @staticmethod
+    def _sync_legacy_is_chunked(batch: Any) -> None:
+        """Publish 0.5.12's Req.is_chunked for Omni model runners.
+
+        SGLang 0.5.15 renamed the counter to ``Req.inflight_middle_chunks``:
+        ``get_new_batch_prefill`` increments it for the in-flight chunk and
+        ``SchedulerBatchResultProcessor.process_batch_result_prefill``
+        decrements it once that chunk's result is consumed. Omni delegates both
+        methods upstream, so at forward time the counter already carries
+        0.5.12's meaning — greater than zero means this row is a non-final
+        prefill chunk. Republish it here rather than only seeding the sidecar at
+        admission: nothing on the live path writes ``is_chunked`` (Omni's own
+        PrefillManager is bypassed by the upstream delegation), so without this
+        every chunk reads as 0 and the model runners treat middle chunks as the
+        last one. Unconditional because the flag is also read on decode batches,
+        where the counter is legitimately 0.
+
+        The ordering holds on ``_event_loop_normal`` and
+        ``_event_loop_async_decode``, which run ``process_batch_result`` in the
+        same iteration as the forward. It does NOT hold on
+        ``_event_loop_overlap``, where the decrement lags one iteration and a
+        final chunk would still read as a middle one; that loop is unreachable
+        today (``enable_overlap`` defaults False and no construction site sets
+        it) and would need its own drain before this publish.
+        """
+        for req in batch.reqs:
+            req.is_chunked = int(req.inflight_middle_chunks)
 
     @staticmethod
     def _sync_legacy_extend_input_lens(batch: Any) -> None:
