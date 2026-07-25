@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Role plumbing tests for SGLANG_OMNI_WEIGHT_SHARE in SGLModelRunner.
 
-Runs the real SGLModelRunner.load_model / init_device_graphs overrides with the
+Runs the real SGLModelRunner.load_model / init_cuda_graphs overrides with the
 upstream ModelRunner methods mocked out, on CPU tensors. Verifies role dispatch,
 the dummy load-format toggle (set for the super() call, restored after),
 attach-before-capture ordering, and the weight-update guards.
@@ -143,7 +143,9 @@ def test_follower_verifies_attachment_before_graph_capture(tmp_path, monkeypatch
     runner._weight_ipc_leader_monitor.stop()  # don't leak the poller thread
     with (
         mock.patch.object(
-            ModelRunner, "init_device_graphs", lambda self: calls.append("capture")
+            ModelRunner,
+            "init_cuda_graphs",
+            lambda self, capture_decode_cuda_graph=True: calls.append("capture"),
         ),
         mock.patch.object(
             ipc_weights,
@@ -151,7 +153,7 @@ def test_follower_verifies_attachment_before_graph_capture(tmp_path, monkeypatch
             side_effect=lambda *a, **k: calls.append("verify"),
         ),
     ):
-        runner.init_device_graphs()
+        runner.init_cuda_graphs()
     assert calls == ["verify", "capture"]  # attach guard precedes capture
 
 

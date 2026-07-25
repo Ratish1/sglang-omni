@@ -165,7 +165,7 @@ class SGLModelRunner(ModelRunner):
         # driver so KV-pool profiling and later replicas see the freed memory.
         torch.cuda.empty_cache()
 
-    def init_device_graphs(self):
+    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Re-verify shared-storage identity right before any graph capture.
 
         Followers: catches any load-path step that re-created a parameter
@@ -177,7 +177,7 @@ class SGLModelRunner(ModelRunner):
             from sglang_omni.utils import ipc_weights
 
             ipc_weights.verify_attachment(self.model, record)
-        return super().init_device_graphs()
+        return super().init_cuda_graphs(capture_decode_cuda_graph)
 
     def _weight_update_blocked_reason(self) -> str | None:
         ws = self._weight_share_config
