@@ -21,6 +21,10 @@ from sglang_omni.models.zonos2.sampler import sample_tts
 
 
 class Zonos2ModelRunner(ModelRunner):
+    # release_row at the terminal result frees the decode-state pool row;
+    # a stale overrun row must be dropped pre-forward, never forwarded.
+    holds_per_request_decode_state = True
+
     def __init__(
         self,
         tp_worker: Any,
@@ -319,6 +323,18 @@ class Zonos2ModelRunner(ModelRunner):
         pool = self.model._decode_state_pool
         for i, sr in enumerate(requests):
             data = sr.data
+            # Overrun guard: a request finished or retracted in a PRIOR step is
+            # still a row of this lagged resolve (launch ran before that finish
+            # was known). Its frame must not reach output_codes — the terminal
+            # frame already shipped — and its pool row was already released at
+            # its own finishing step. finished_cpu below is THIS step's sampler
+            # EOS, not the prior-step lifecycle; it cannot cover this case.
+            # data.req is set at request build, before scheduling — a None here
+            # is an invariant violation and must fail loudly (via
+            # _handle_batch_failure), not silently append a frame.
+            req = data.req
+            if req.finished() or req.is_retracted:
+                continue
             data.output_codes.append(codes_cpu[i].clone())
             data.eos_frame = int(eos_val_cpu[i]) if bool(eos_set_cpu[i]) else None
             if bool(finished_cpu[i]):
