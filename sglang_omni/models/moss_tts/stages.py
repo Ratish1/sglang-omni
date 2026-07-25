@@ -12,7 +12,6 @@ from sglang_omni.models.moss_tts.codec import split_moss_audio_segments
 from sglang_omni.models.moss_tts.hf_loading import (
     load_moss_processor_class,
     moss_transformers_processor_compat,
-    resolve_moss_checkpoint,
 )
 from sglang_omni.models.moss_tts.payload_types import (
     MossTTSState,
@@ -68,13 +67,12 @@ def _load_moss_processor(
     device: str = "cpu",
     dtype: str | torch.dtype = "float32",
 ) -> Any:
-    checkpoint_dir = resolve_moss_checkpoint(model_path)
-    logger.info(f"Loading MOSS-TTS processor from {checkpoint_dir} on {device}")
+    logger.info(f"Loading MOSS-TTS processor from {model_path} on {device}")
     try:
         with moss_transformers_processor_compat():
-            processor_cls = load_moss_processor_class(checkpoint_dir)
+            processor_cls = load_moss_processor_class(model_path)
             processor = processor_cls.from_pretrained(
-                checkpoint_dir,
+                model_path,
                 trust_remote_code=True,
             )
     except Exception as exc:

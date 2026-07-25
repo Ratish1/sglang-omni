@@ -341,11 +341,6 @@ def test_audio_tokenizer_loader_matches_processor_codec_weight_dtype(monkeypatch
 
     monkeypatch.setattr(
         audio_tokenizer_mod,
-        "resolve_moss_checkpoint",
-        lambda model_path: f"/resolved/{model_path}",
-    )
-    monkeypatch.setattr(
-        audio_tokenizer_mod,
         "moss_transformers_processor_compat",
         nullcontext,
     )
@@ -361,7 +356,7 @@ def test_audio_tokenizer_loader_matches_processor_codec_weight_dtype(monkeypatch
     assert loaded_model.eval_called
     assert loaded_model.to_device == "cuda:7"
     assert loaded_kwargs == {
-        "model_path": "/resolved/codec",
+        "model_path": "codec",
         "trust_remote_code": True,
         "codec_weight_dtype": "bf16",
     }

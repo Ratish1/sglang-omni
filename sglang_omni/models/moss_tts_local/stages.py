@@ -18,7 +18,6 @@ import torch
 from sglang_omni.models.moss_tts.hf_loading import (
     load_moss_processor_class,
     moss_transformers_processor_compat,
-    resolve_moss_checkpoint,
 )
 from sglang_omni.models.moss_tts.request_builders import _DATA_URI_RE
 from sglang_omni.models.moss_tts_local.audio_tokenizer import (
@@ -162,19 +161,18 @@ def _resolve_codec_device(device: str | None, gpu_id: int | None) -> str:
 
 
 def _load_moss_tts_local_processor(model_path: str) -> Any:
-    checkpoint_dir = resolve_moss_checkpoint(model_path)
-    logger.info(f"Loading MOSS-TTS Local processor from {checkpoint_dir} without codec")
+    logger.info(f"Loading MOSS-TTS Local processor from {model_path} without codec")
     try:
         from transformers import AutoConfig, AutoTokenizer
 
         with moss_transformers_processor_compat():
-            processor_cls = load_moss_processor_class(checkpoint_dir)
+            processor_cls = load_moss_processor_class(model_path)
             model_config = AutoConfig.from_pretrained(
-                checkpoint_dir,
+                model_path,
                 trust_remote_code=True,
             )
             tokenizer = AutoTokenizer.from_pretrained(
-                checkpoint_dir,
+                model_path,
                 trust_remote_code=True,
             )
             processor = processor_cls(
