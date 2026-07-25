@@ -1931,6 +1931,39 @@ def test_projected_prefill_prefers_request_data_over_forward_embeds() -> None:
     assert torch.equal(result._embeds, embeds)
 
 
+def test_projected_prefill_activates_sglang_forward_context() -> None:
+    from sglang.srt.model_executor.forward_context import get_forward_context
+
+    attn_backend = SimpleNamespace(init_forward_metadata=lambda _batch: None)
+    observed_backends: list[object] = []
+
+    class _Model:
+        activation_dtype = torch.float32
+
+        def __call__(self, **_kwargs):
+            observed_backends.append(get_forward_context().attn_backend)
+            return SimpleNamespace()
+
+    runner = object.__new__(QwenTalkerModelRunner)
+    runner.model = _Model()
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(attn_backend=attn_backend)
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.zeros(2, dtype=torch.long),
+        positions=torch.arange(2),
+        mrope_positions=None,
+    )
+
+    runner._forward_with_input_embeds(
+        forward_batch,
+        input_embeds=torch.zeros(2, 4),
+        input_embeds_are_projected=True,
+    )
+
+    assert observed_backends == [attn_backend]
+
+
 def test_projected_prefill_rejects_mixed_projected_and_list_batch() -> None:
     """The model forward has one projection mode, so mixed batches are invalid."""
     projected_req = _sched_req(

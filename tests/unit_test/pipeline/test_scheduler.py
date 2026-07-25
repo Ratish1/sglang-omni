@@ -847,11 +847,17 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("enable_overlap", "enable_async_decode", "expected_stream_overlap"),
+    (
+        "enable_overlap",
+        "enable_async_decode",
+        "expected_stream_overlap",
+        "bind_late",
+    ),
     [
-        (False, True, False),
-        (True, False, True),
-        (True, True, True),
+        (False, True, False, False),
+        (True, False, True, False),
+        (True, True, True, False),
+        (False, True, False, True),
     ],
 )
 def test_omni_scheduler_keeps_async_decode_on_single_stream(
@@ -859,8 +865,9 @@ def test_omni_scheduler_keeps_async_decode_on_single_stream(
     enable_overlap,
     enable_async_decode,
     expected_stream_overlap,
+    bind_late,
 ) -> None:
-    """Async lookahead must not opt into SGLang's independent two-stream loop."""
+    """Initial and late runners receive the same execution bridge contract."""
     monkeypatch.setattr(
         OmniScheduler, "_init_parallel_state", lambda self, _tp_worker: None
     )
@@ -926,10 +933,12 @@ def test_omni_scheduler_keeps_async_decode_on_single_stream(
         token_to_kv_pool_allocator=None,
         server_args=server_args,
         model_config=SimpleNamespace(),
-        model_runner=model_runner,
+        model_runner=None if bind_late else model_runner,
         enable_overlap=enable_overlap,
         enable_async_decode=enable_async_decode,
     )
+    if bind_late:
+        scheduler.bind_model_runner(model_runner)
 
     assert observed[0] is expected_stream_overlap
     assert observed[1] is scheduler._execution_bridge

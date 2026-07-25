@@ -133,7 +133,7 @@ class OmniScheduler:
         # --- Request builder: StagePayload → SGLangARRequestData ----------
         self._request_builder = request_builder
         self._result_adapter = result_adapter
-        self._model_runner = model_runner
+        self._model_runner = None
         self._stream_output_builder = stream_output_builder
         self._stream_chunk_handler = stream_chunk_handler
         self._stream_done_handler = stream_done_handler
@@ -201,8 +201,6 @@ class OmniScheduler:
         # regression — see benchmark_results.md / stall_analysis.md). Default 2
         # = only bs=1 takes the fast path.
         self.async_decode_min_batch_size = int(async_decode_min_batch_size)
-        if model_runner is not None:
-            model_runner._async_enabled = enable_async_decode
 
         # Note: (maydomine) coalescing gate: hold prefill until K requests wait
         # or the oldest has waited T ms; 0 disables.
@@ -365,26 +363,7 @@ class OmniScheduler:
         self.draft_worker = None
         self._execution_bridge = None
         if model_runner is not None:
-            from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
-
-            self._execution_bridge = SGLangExecutionBridge(
-                device=torch.device(self.device),
-                worker=tp_worker,
-                req_to_token_pool=req_to_token_pool,
-                spec_algorithm=self.spec_algorithm,
-                # Omni async decode is deliberately a single-stream
-                # launch-current/resolve-previous loop.  SGLang's independent
-                # schedule/forward streams have a different WAR and sampling
-                # publication contract; opting into them here races decode
-                # CUDA-graph buffers even though eager decode appears correct.
-                # Only the upstream-style overlap loop owns that two-stream
-                # contract.
-                enable_stream_overlap=enable_overlap,
-            )
-            # Keep the upstream attribute available to delegated scheduler
-            # methods, but make the custom ModelRunner the sole owner of relay.
-            self.future_map = self._execution_bridge.future_map
-            model_runner.bind_execution_bridge(self._execution_bridge)
+            self.bind_model_runner(model_runner)
 
         # Subsystem stubs
         self.watchdog = None
@@ -441,6 +420,43 @@ class OmniScheduler:
         self._dirty_deferred_request_ids: set[str] = set()
         self._first_emit_done: set[str] = set()
         self._prefill_start_done: set[str] = set()
+
+    def bind_model_runner(self, model_runner: Any) -> None:
+        """Attach a custom runner and its SGLang execution-contract bridge.
+
+        Some pipelines need the scheduler-owned outbox before they can build
+        their model runner. They must use this method instead of assigning
+        ``_model_runner`` so late-bound runners receive the same execution
+        bridge and FutureMap contract as runners supplied to ``__init__``.
+        """
+        if model_runner is None:
+            raise ValueError("model_runner must not be None")
+        if self._model_runner is model_runner and self._execution_bridge is not None:
+            return
+        if self._model_runner is not None:
+            raise RuntimeError("OmniScheduler model runner is already bound")
+
+        from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
+
+        bridge = SGLangExecutionBridge(
+            device=torch.device(self.device),
+            worker=self.tp_worker,
+            req_to_token_pool=self.req_to_token_pool,
+            spec_algorithm=self.spec_algorithm,
+            # Omni async decode is deliberately a single-stream
+            # launch-current/resolve-previous loop. SGLang's independent
+            # schedule/forward streams have a different WAR and sampling
+            # publication contract; only the upstream-style overlap loop owns
+            # that two-stream contract.
+            enable_stream_overlap=self.enable_overlap,
+        )
+        model_runner._async_enabled = self.enable_async_decode
+        model_runner.bind_execution_bridge(bridge)
+        # Keep the upstream attribute available to delegated scheduler methods,
+        # but make the custom ModelRunner the sole owner of relay.
+        self._model_runner = model_runner
+        self._execution_bridge = bridge
+        self.future_map = bridge.future_map
 
     def _init_upstream_compat_flags(self, server_args: Any) -> None:
         self.enable_hisparse = bool(server_args.enable_hisparse)

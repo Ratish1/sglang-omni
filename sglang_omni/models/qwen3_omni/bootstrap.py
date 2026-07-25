@@ -236,10 +236,11 @@ def create_talker_scheduler(
         im_end_token_id=root_config.im_end_token_id,
     )
 
-    scheduler._model_runner = QwenTalkerModelRunner(
+    model_runner = QwenTalkerModelRunner(
         model_worker,
         output_proc,
         scheduler.outbox,
         feedback_enabled=feedback_enabled,
     )
+    scheduler.bind_model_runner(model_runner)
     return scheduler
