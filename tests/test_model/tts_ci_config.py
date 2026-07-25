@@ -15,6 +15,7 @@ class TtsCiModelPreset:
     model_path: str
     ref_format: Literal["flat", "references"] = "flat"
     token_count: int | Literal["auto"] | None = None
+    seed: int | None = None
     worker_extra_args: str = ""
     startup_timeout: int = 180
     gate_thresholds: bool = True
@@ -135,6 +136,9 @@ TTS_CI_PRESETS: dict[str, TtsCiPreset] = {
             model_path="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5",
             ref_format="references",
             token_count="auto",
+            # Production remains stochastic. CI uses a stable sequence because
+            # the 50-sample similarity mean otherwise varies by multiple points.
+            seed=12345,
             gate_thresholds=True,
         ),
         thresholds=TtsCiThresholdPreset(
