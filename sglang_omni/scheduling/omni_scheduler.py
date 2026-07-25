@@ -977,6 +977,13 @@ class OmniScheduler:
         request_ids = [req.rid for req in reqs]
         logger.exception("OmniScheduler batch failed for requests=%s", request_ids)
         for req in reqs:
+            # The forward raised, so this batch's KV slots hold nothing or half
+            # a step. The abort below releases each request, and upstream's
+            # release inserts its committed range into the radix cache by
+            # default — where a later prefix match would read those slots back.
+            # Opt out per request (upstream honours this in both
+            # release_kv_cache and maybe_cache_unfinished_req).
+            req.skip_radix_cache_insert = True
             self._emit_request_error(req.rid, error)
             self.abort(req.rid, defer_running_cleanup=False)
 
