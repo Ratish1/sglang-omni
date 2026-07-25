@@ -21,7 +21,7 @@ from sglang_omni.models.higgs_tts.model import HiggsTTSModel
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import build_higgs_stream_metadata
-from sglang_omni.models.higgs_tts.sampler import K_MAX
+from sglang_omni.models.higgs_tts.sampler import K_MAX, HiggsBatchedSamplerState
 from sglang_omni.models.higgs_tts.utils import EOC_ID, apply_delay_pattern
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
@@ -32,6 +32,7 @@ from sglang_omni.models.higgs_tts.vocoder_scheduler import (
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.sampling.seed import SAMPLING_SEED_MASK
 from sglang_omni.scheduling.speaker_cache import get_speaker_artifact_cache
 
 
@@ -62,6 +63,41 @@ def test_higgs_batch_metadata_prefers_sglang_rids() -> None:
 
     assert req_ids == ["stable-a", "stable-b"]
     assert len(params) == 2
+
+
+def test_higgs_batch_metadata_refuses_missing_request_ids() -> None:
+    model = object.__new__(HiggsTTSModel)
+    forward_batch = SimpleNamespace(
+        rids=None,
+        seq_lens=torch.tensor([1, 1]),
+        sampling_info=None,
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to fabricate"):
+        model._extract_batch_metadata(forward_batch)
+
+
+def test_higgs_sampler_pool_rows_always_hold_concrete_seeds() -> None:
+    pool = HiggsBatchedSamplerState(max_batch_size=4, num_codebooks=2, device="cpu")
+
+    assert bool((pool.seeds >= 0).all())
+    assert bool((pool.seeds <= SAMPLING_SEED_MASK).all())
+
+    pool.seeds[1] = -1  # a stale sentinel must not survive a row reset
+    pool.reset_row(1)
+
+    assert 0 <= int(pool.seeds[1].item()) <= SAMPLING_SEED_MASK
+
+
+def test_higgs_vocoder_rejects_compile_and_graph_domain_together() -> None:
+    # Pure-argument contract check, so it must fail before any checkpoint
+    # access rather than after weights have already been loaded.
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        stages.create_vocoder_executor(
+            "unused-model-path",
+            compile_decode=True,
+            decode_cuda_graph_frame_counts=(1, 2),
+        )
 
 
 @pytest.mark.parametrize(

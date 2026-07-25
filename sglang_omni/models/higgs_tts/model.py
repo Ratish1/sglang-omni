@@ -203,8 +203,10 @@ class HiggsTTSModel(nn.Module):
         self._cg_active_last_codes = torch.zeros(
             pool_size, num_codebooks, dtype=torch.long, device=cg_device
         )
-        # Capture/padding rows use seed zero. Real rows are overwritten from the
-        # sampler pool, where set_request_seed installs a concrete row seed.
+        # Zero-seeded only until the first _populate_cg_buffers gather: real
+        # rows then carry the seed set_request_seed installed in the pool, and
+        # padding rows carry the reserved row's fresh random seed from
+        # reset_row. Either way every gathered seed is concrete/non-negative.
         self._cg_active_seeds = torch.zeros(
             pool_size, dtype=torch.long, device=cg_device
         )
@@ -516,9 +518,16 @@ class HiggsTTSModel(nn.Module):
             req_ids_raw = getattr(forward_batch, "req_ids", None)
         batch_size = self._infer_batch_size(forward_batch)
         if req_ids_raw is None:
-            req_ids = [f"req-{i}" for i in range(batch_size)]
-        else:
-            req_ids = [str(r) for r in req_ids_raw]
+            # No fabricated fallback identities: sampler rows keyed on made-up
+            # ids silently decouple output routing and seeding from the real
+            # requests. Full-backend prefill capture never reaches this eager
+            # tail (it replays only the transformer body), so a batch without
+            # ``rids`` here means the runner contract changed — fail loudly.
+            raise RuntimeError(
+                "Higgs prefill batch carries neither ForwardBatch.rids nor "
+                "req_ids; refusing to fabricate request identities"
+            )
+        req_ids = [str(r) for r in req_ids_raw]
 
         sampling_info = getattr(forward_batch, "sampling_info", None)
         gen_params = self._gen_params_for_batch(sampling_info, batch_size)

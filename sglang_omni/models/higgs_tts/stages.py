@@ -487,12 +487,23 @@ def create_vocoder_executor(
 
     Codec weights are extracted from the TTS checkpoint itself.
     """
-    checkpoint_dir = resolve_checkpoint(model_path)
-    codec = get_or_load_codec(checkpoint_dir, device, dtype)
     if compile_decode and decode_cuda_graph_frame_counts:
         raise ValueError(
             "compile_decode and decode_cuda_graph_frame_counts are mutually exclusive"
         )
+    # decode_cuda_graph_frame_counts must cover every window size the streaming
+    # scheduler can submit, or those windows fall back to eager decode (warned
+    # only once per distinct missed frame count, so easy to miss in serving
+    # logs). The reachable set is a joint function of
+    # stream_stride/stream_followup_stride/stream_overlap_tokens/
+    # stream_holdback_tokens, the codec's codebook count, and the engine
+    # stage's flush cadence (HiggsTTSModelRunner._initial/_next_stream_flush
+    # rows) — no sound closed form exists from this stage's arguments alone,
+    # so there is deliberately no startup validation here. The default
+    # tuple(range(1, 151)) in config.py covers the default 75+75 strides with
+    # margin; when overriding strides, re-derive the domain empirically.
+    checkpoint_dir = resolve_checkpoint(model_path)
+    codec = get_or_load_codec(checkpoint_dir, device, dtype)
     if compile_decode:
         eager_decode = codec.model.decode
         try:

@@ -228,6 +228,10 @@ class HiggsTTSModelRunner(ModelRunner):
             )
 
         layout_signature = (bs, tuple(req.request_id for req in requests))
+        # Fast path: pool state is gathered into the CG buffers only on the
+        # slow path below, and a padded slow path always resets the padding
+        # row first. Under a stable layout nothing re-reads the padding row's
+        # pool state, so skipping its per-step reset here is safe.
         if layout_signature == self._cg_layout_signature:
             if self._async_enabled and is_lookahead and n_real > 0:
                 # A stable layout already has all state and sampling controls in
