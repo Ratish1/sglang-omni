@@ -77,6 +77,16 @@ class ModelRunner:
       - decode hooks for single-step autoregressive decode processing
     """
 
+    #: True for runners whose result adapter releases a per-request
+    #: decode-state pool row when the terminal result ships (Higgs, ZONOS2,
+    #: MOSS-TTS-Local). The async fast path must not forward a stale overrun
+    #: row through such a runner — the forward would re-acquire a RESET row and
+    #: leak it — so the scheduler drops the row pre-forward instead (see
+    #: OmniScheduler._drop_stale_rows_before_forward). Plain token runners
+    #: keep False: their stale rows are forwarded to fill the cache-committed
+    #: slot and suppressed from emit/result processing.
+    holds_per_request_decode_state: bool = False
+
     def __init__(self, tp_worker: Any, output_processor: Any):
         self.tp_worker = tp_worker
         self.output_processor = output_processor

@@ -1840,6 +1840,30 @@ class OmniScheduler:
             if r.finished() or bool(getattr(r, "is_retracted", False))
         }
 
+    @staticmethod
+    def _drop_stale_rows_before_forward(batch, stale_rids):
+        """Drop the drain's overrun rows BEFORE the forward, for runners whose
+        per-request decode state the drain already reset (Higgs / ZONOS2 /
+        MOSS-TTS-Local). Per-request only: these runners never run mixed
+        chunking, so a stale row can only sit in a pure decode batch — assert
+        rather than misslice if that ever changes. The step slot is NOT freed:
+        the drain's release committed it to the radix cache, and freeing a
+        tree-owned slot is the tree/free-list alias this fix exists to end.
+        Returns the filtered batch, or None if it empties."""
+        forward_mode = getattr(batch, "forward_mode", None)
+        assert forward_mode is None or not forward_mode.is_extend(), (
+            "stale overrun rows in an extend batch on a stateful codec runner; "
+            "per-request dropping would misslice its per-token fields"
+        )
+        keep = [i for i, r in enumerate(batch.reqs) if r.rid not in stale_rids]
+        if len(keep) == len(batch.reqs):
+            return batch
+        out_cache_loc = batch.out_cache_loc
+        batch.filter_batch(keep_indices=keep)
+        if out_cache_loc is not None:
+            batch.out_cache_loc = out_cache_loc[keep]
+        return batch if batch.reqs else None
+
     def _drop_stale_overrun(self, batch, result, stale_rids):
         """Drop the drain's overrun rows from a just-FORWARDED fast-path batch,
         so process_batch_result does not finalize them a second time (double
@@ -1930,7 +1954,7 @@ class OmniScheduler:
 
             # Route through sync when the runner's collect has a sync-only
             # fallback (default True for runners not overriding lookahead_eligible).
-            runner = getattr(self, "_model_runner", None)
+            runner = self._model_runner
             use_lookahead = (
                 batch is not None
                 and len(batch.reqs) >= self.async_decode_min_batch_size
@@ -1973,6 +1997,24 @@ class OmniScheduler:
                     # a second time. Fast-path analogue of the _resolve_and_process
                     # post-forward drop.
                     stale_rids = self._stale_overrun_rids(batch)
+                    if (
+                        stale_rids
+                        and runner is not None
+                        and runner.holds_per_request_decode_state
+                    ):
+                        # Codec runners (Higgs/ZONOS2/MOSS-TTS-Local) reset a
+                        # request's decode-state pool row when the drain ships
+                        # its terminal result. Forwarding the stale row would
+                        # re-acquire a RESET row — wrong KV under the cached
+                        # key — and leak it (nothing releases it again). Drop
+                        # the row before the forward instead, WITHOUT freeing
+                        # its step slot: the drain's release committed that
+                        # slot to the radix cache, and freeing it is the
+                        # tree/free-list alias. These runners never run mixed
+                        # chunking, so the drop is per-request.
+                        batch = self._drop_stale_rows_before_forward(batch, stale_rids)
+                        self.cur_batch = batch
+                        stale_rids = set()
                 if batch:
                     result = self.run_batch(batch, skip_rids=stale_rids)
                     if result is not _FAILED_BATCH_RESULT:

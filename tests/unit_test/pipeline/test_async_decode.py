@@ -535,6 +535,7 @@ class _FakeBatch:
 
 def _new_scheduler_for_async_loop():
     s = OmniScheduler.__new__(OmniScheduler)
+    s._model_runner = None  # matches __init__: always set, may be None
     s._admin_lock = threading.Lock()
     s._admin_queue = queue.Queue()
     s.chunked_req = None
@@ -825,6 +826,78 @@ def test_fast_path_does_not_double_free_req_finished_by_drain():
     s._event_loop_async_decode()
 
     assert not double_freed, f"KV double-freed (stale fast-path batch): {double_freed}"
+
+
+def test_stateful_runner_drops_stale_rows_before_the_forward():
+    """Codec runners (holds_per_request_decode_state=True) reset a request's
+    decode-state pool row when the drain ships its terminal result. Forwarding
+    the stale row would re-acquire a RESET row (wrong KV under the cached key)
+    and leak it, so the loop must drop it BEFORE run_batch — with skip_rids
+    left empty, and WITHOUT freeing the step slot the drain already committed
+    to the radix cache."""
+    reqs = [_DFReq(f"r{i}") for i in range(4)]
+    running = list(reqs)
+    finish_order = [reqs[0], reqs[1]]
+    forwarded: list[tuple[list, tuple]] = []
+    freed: list = []
+
+    s = _new_scheduler_for_async_loop()
+    s._model_runner = types.SimpleNamespace(
+        holds_per_request_decode_state=True,
+        lookahead_eligible=lambda b: True,
+    )
+    s.token_to_kv_pool_allocator = types.SimpleNamespace(
+        free=lambda t: freed.extend(t.tolist())
+    )
+    s._running = True
+    s._engine_paused = False
+    s._async_pending = None
+    s.async_decode_min_batch_size = 4  # bs3 takes the fast path WITH a pending
+    s.cur_batch = None
+    s.last_batch = None
+    s.recv_requests = lambda: []
+    s._take_deferred_request_payloads = lambda: []
+    s.process_input_requests = lambda r: None
+    s._batch_is_decode = lambda b: True
+    s.self_check_during_idle = lambda: None
+    s.self_check_during_busy = lambda: None
+    s._run_batch_launch = lambda b: ("sched_output", "pending_step")
+    s._resolve_pending_async = OmniScheduler._resolve_pending_async.__get__(s)
+
+    def resolve_and_process(pb, ps, pstep):
+        if finish_order:
+            r = finish_order.pop(0)
+            r._done = True
+            if r in running:
+                running.remove(r)
+
+    s._resolve_and_process = resolve_and_process
+
+    def run_batch(b, skip_rids=()):
+        forwarded.append(([r.name for r in b.reqs], tuple(skip_rids)))
+        return object()
+
+    s.run_batch = run_batch
+    s.process_batch_result = lambda b, r: None
+
+    state = {"i": 0}
+
+    def gnb():
+        state["i"] += 1
+        if state["i"] >= 4:
+            s._running = False
+            return None
+        return _DFBatch(list(running))
+
+    s.get_next_batch_to_run = gnb
+    s._event_loop_async_decode()
+
+    # i3: batch [r1, r2, r3] built, drain finishes r1 -> dropped pre-forward
+    assert forwarded == [(["r2", "r3"], ())], (
+        "the stale row must be dropped before the forward, with empty skip_rids: "
+        f"{forwarded}"
+    )
+    assert freed == [], "the drain-committed step slot must never be freed"
 
 
 def _scaffold_async_loop(*, async_pending=None):

@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 
 class HiggsTTSModelRunner(ModelRunner):
+    # reset_request at the terminal result releases the sampler-pool row;
+    # a stale overrun row must be dropped pre-forward, never forwarded.
+    holds_per_request_decode_state = True
+
     """ModelRunner for :class:`HiggsTTSModel`."""
 
     def __init__(self, tp_worker: Any, output_processor: Any) -> None:

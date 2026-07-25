@@ -21,6 +21,10 @@ from sglang_omni.models.zonos2.sampler import sample_tts
 
 
 class Zonos2ModelRunner(ModelRunner):
+    # release_row at the terminal result frees the decode-state pool row;
+    # a stale overrun row must be dropped pre-forward, never forwarded.
+    holds_per_request_decode_state = True
+
     def __init__(
         self,
         tp_worker: Any,
