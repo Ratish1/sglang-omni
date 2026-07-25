@@ -1068,9 +1068,8 @@ class OmniScheduler:
         # cost; the oldest-request deadline survives partial admission and aborts.
         if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
             return _Upstream.get_new_batch_prefill(self)
-        if (
-            not self.prefill_coalesce_when_idle
-            and (self.running_batch is None or self.running_batch.is_empty())
+        if not self.prefill_coalesce_when_idle and (
+            self.running_batch is None or self.running_batch.is_empty()
         ):
             return _Upstream.get_new_batch_prefill(self)
         waiting = self.waiting_queue
