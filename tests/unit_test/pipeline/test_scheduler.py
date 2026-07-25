@@ -1271,3 +1271,14 @@ def test_omni_scheduler_result_adapter_failure_emits_error_without_raise() -> No
     assert scheduler._prefill_start_done == set()
     assert request_data.prefill_input_embeds is None
     assert request_data.decode_input_embeds is None
+
+
+def test_omni_scheduler_overlap_event_loop_refuses_to_run() -> None:
+    # The overlap loop would republish legacy Req.is_chunked one iteration
+    # late (see _sync_legacy_is_chunked): a final prefill chunk still reads
+    # as a middle one at forward time. Until that loop gets its own drain it
+    # must fail loudly instead of silently corrupting chunk boundaries.
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+
+    with pytest.raises(NotImplementedError, match="overlap event loop"):
+        scheduler._event_loop_overlap()

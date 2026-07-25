@@ -1153,9 +1153,9 @@ class OmniScheduler:
         ``_event_loop_async_decode``, which run ``process_batch_result`` in the
         same iteration as the forward. It does NOT hold on
         ``_event_loop_overlap``, where the decrement lags one iteration and a
-        final chunk would still read as a middle one; that loop is unreachable
-        today (``enable_overlap`` defaults False and no construction site sets
-        it) and would need its own drain before this publish.
+        final chunk would still read as a middle one; that loop therefore
+        refuses to run (NotImplementedError at entry) and would need its own
+        result-queue drain before this publish if ever enabled.
         """
         for req in batch.reqs:
             req.is_chunked = int(req.inflight_middle_chunks)
@@ -1974,54 +1974,22 @@ class OmniScheduler:
                 self.self_check_during_busy()
 
     def _event_loop_overlap(self) -> None:
-        self.result_queue = deque()
-
-        def pop_and_process():
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-
-        while self._running:
-            self._process_admin_requests()
-            recv_reqs = self.recv_requests()
-            recv_reqs.extend(self._take_deferred_request_payloads())
-            self.process_input_requests(recv_reqs)
-            if self._engine_paused:
-                self._process_admin_requests()
-                time.sleep(0.001)
-                continue
-
-            bridge = self.__dict__.get("_execution_bridge")
-            if bridge is not None:
-                bridge.before_schedule()
-            batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
-
-            if disable_overlap_for_batch and self.result_queue:
-                pop_and_process()
-
-            if batch:
-                batch_result = self.run_batch(batch)
-                if batch_result is not _FAILED_BATCH_RESULT:
-                    self.result_queue.append((batch.copy(), batch_result))
-                else:
-                    batch_result = None
-            else:
-                batch_result = None
-
-            if self.last_batch:
-                if not disable_overlap_for_batch and self.result_queue:
-                    pop_and_process()
-            elif batch is None:
-                self.self_check_during_idle()
-                time.sleep(0.001)
-
-            if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result)
-
-            self.last_batch = batch
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.self_check_during_busy()
+        # ``_sync_legacy_is_chunked`` republishes ``inflight_middle_chunks``
+        # under a same-iteration ``process_batch_result`` contract. On this
+        # loop the decrement lags one iteration, so a final prefill chunk
+        # still reads as a middle chunk at forward time and the TTS model
+        # runners emit wrong chunk boundaries — silently. No construction
+        # site enables overlap today; refuse to run rather than corrupt
+        # chunked prefill if one ever does.
+        # The pre-guard loop body lives in git history ("Refuse the
+        # OmniScheduler overlap event loop"); reviving it needs that drain,
+        # not just deleting this raise.
+        raise NotImplementedError(
+            "OmniScheduler's overlap event loop is unsupported: the legacy "
+            "Req.is_chunked republish lags one iteration on this loop (see "
+            "_sync_legacy_is_chunked). Drain the result queue before the "
+            "forward, then remove this guard."
+        )
 
     @staticmethod
     def _batch_is_decode(batch: ScheduleBatch) -> bool:
