@@ -106,9 +106,12 @@ sgl-omni serve \
   --model-path OpenMOSS-Team/MOSS-Transcribe-Diarize \
   --port 8000 \
   --max-running-requests 16 \
-  --cuda-graph-max-bs 16 \
-  --mem-fraction-static 0.80
+  --cuda-graph-max-bs 16
 ```
+
+The model default leaves enough GPU memory for long-audio encoder workspaces.
+Only override `--mem-fraction-static` after validating the longest expected
+inputs on the target GPU.
 
 ### Sending Requests
 
@@ -182,7 +185,6 @@ python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --concurrency 16 \
   --max-running-requests 16 \
   --cuda-graph-max-bs 16 \
-  --mem-fraction-static 0.80 \
   --output-dir results/moss_transcribe_diarize_movies800times
 
 # Long-sequence ASR / diarization
@@ -191,7 +193,6 @@ python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --concurrency 16 \
   --max-running-requests 16 \
   --cuda-graph-max-bs 16 \
-  --mem-fraction-static 0.80 \
   --max-new-tokens 65536 \
   --request-timeout-s 1800 \
   --output-dir results/moss_transcribe_diarize_aishell4_long
@@ -202,7 +203,6 @@ python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --concurrency 16 \
   --max-running-requests 16 \
   --cuda-graph-max-bs 16 \
-  --mem-fraction-static 0.80 \
   --max-new-tokens 65536 \
   --request-timeout-s 1800 \
   --output-dir results/moss_transcribe_diarize_googletime
