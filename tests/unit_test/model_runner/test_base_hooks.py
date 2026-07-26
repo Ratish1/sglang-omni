@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import types
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -192,6 +193,37 @@ def test_execute_falls_back_to_standard_forward_after_before_hook(
     ]
     assert output.can_run_cuda_graph is False
     assert not hasattr(ModelRunner, "prepare_prefill")
+
+
+def test_execute_isolates_scheduler_sampling_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_forward_batch_module(monkeypatch)
+    isolate_sampling_values = []
+
+    @contextmanager
+    def forward_context(_batch, *, isolate_sampling=False):
+        isolate_sampling_values.append(isolate_sampling)
+        yield
+
+    runner = _runner(
+        [],
+        custom_result=SimpleNamespace(
+            logits_output=None,
+            next_token_ids=torch.tensor([7]),
+            can_run_cuda_graph=True,
+        ),
+    )
+    runner.bind_execution_bridge(
+        SimpleNamespace(
+            forward_context=forward_context,
+            publish_next_tokens=lambda *_args: None,
+        )
+    )
+
+    runner.execute(_scheduler_output(is_prefill=False))
+
+    assert isolate_sampling_values == [True]
 
 
 def test_finalize_default_batch_generation_hook_calls_single_hook() -> None:

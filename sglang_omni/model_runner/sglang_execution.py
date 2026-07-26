@@ -84,11 +84,6 @@ class SGLangExecutionBridge:
         """Resolve inputs and optionally isolate lookahead sampling state."""
         from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 
-        if getattr(batch, "mix_running_indices", None) is not None:
-            raise RuntimeError(
-                "Omni does not support SGLang mixed chunked-prefill batches with "
-                "deferred decode tokens"
-            )
         resolve_forward_inputs(batch, self.future_map)
 
         scheduler_sampling_info = batch.sampling_info

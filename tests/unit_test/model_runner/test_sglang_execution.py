@@ -115,7 +115,7 @@ def test_forward_context_isolates_sampling_info_for_lookahead(monkeypatch) -> No
     assert batch.sampling_info is original_sampling_info
 
 
-def test_forward_context_rejects_mixed_prefill_before_resolve(monkeypatch) -> None:
+def test_forward_context_resolves_mixed_prefill(monkeypatch) -> None:
     bridge, _ = _make_bridge()
     batch = SimpleNamespace(
         sampling_info=None,
@@ -127,11 +127,10 @@ def test_forward_context_rejects_mixed_prefill_before_resolve(monkeypatch) -> No
         lambda *_args: resolved.append(True),
     )
 
-    with pytest.raises(RuntimeError, match="mixed chunked-prefill"):
-        with bridge.forward_context(batch):
-            pass
+    with bridge.forward_context(batch):
+        pass
 
-    assert resolved == []
+    assert resolved == [True]
 
 
 def test_execution_bridge_rejects_speculative_decoding() -> None:

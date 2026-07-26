@@ -183,7 +183,7 @@ class ModelRunner:
         schedule_batch = scheduler_output.batch_data
         if schedule_batch is None:
             return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
-        with self._execution_context(schedule_batch):
+        with self._execution_context(schedule_batch, isolate_sampling=True):
             built = self._build_forward_batch(scheduler_output)
             if built is None:
                 return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
