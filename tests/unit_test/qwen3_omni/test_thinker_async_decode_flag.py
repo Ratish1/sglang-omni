@@ -20,6 +20,7 @@ def test_thinker_sync_on_by_default():
 
 def test_decode_mode_sync_disables_thinker_async():
     cfg = Qwen3OmniPipelineConfig(model_path="dummy")
+    _thinker_factory_args(cfg)["enable_async_decode"] = True
     apply_decode_mode_cli_overrides(
         cfg, decode_mode="sync", async_lookahead_min_batch_size=None
     )

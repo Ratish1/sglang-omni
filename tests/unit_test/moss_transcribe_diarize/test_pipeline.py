@@ -111,7 +111,7 @@ def test_moss_transcribe_diarize_stage_reserves_encoder_headroom() -> None:
     signature = inspect.signature(create_sglang_moss_transcribe_diarize_executor)
 
     assert signature.parameters["max_running_requests"].default == 16
-    assert signature.parameters["mem_fraction_static"].default == 0.80
+    assert signature.parameters["mem_fraction_static"].default == 0.70
     assert signature.parameters["request_build_max_workers"].default == 8
     assert signature.parameters["request_build_max_pending"].default == 16
     assert signature.parameters["encoder_max_batch_size"].default == 2

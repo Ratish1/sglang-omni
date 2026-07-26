@@ -49,11 +49,6 @@ MOSS_TD_CI_SAMPLES = 800
 MOSS_TD_AISHELL4_LONG_CI_SAMPLES = 20
 MOSS_TD_GOOGLETIME_CI_SAMPLES = 25
 MOSS_TD_STARTUP_TIMEOUT = 600
-# SGLang 0.5.15 keeps the phase-split runner's model state and long-audio
-# prefill workspace alongside the static KV cache. At 0.80, concurrent
-# AISHELL4-long requests can exhaust an H100 before a 440 MiB workspace
-# allocation. Leave enough headroom for the long-audio encoder/prefill peak.
-MOSS_TD_MEM_FRACTION_STATIC = 0.70
 MOSS_TD_LONG_MAX_NEW_TOKENS = 65536
 
 
@@ -378,8 +373,6 @@ def moss_td_router_server(
             str(MOSS_TD_CONCURRENCY),
             "--cuda-graph-max-bs",
             str(MOSS_TD_CONCURRENCY),
-            "--mem-fraction-static",
-            str(MOSS_TD_MEM_FRACTION_STATIC),
         ]
     )
     with launch_managed_router(

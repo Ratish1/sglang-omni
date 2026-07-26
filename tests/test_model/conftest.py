@@ -264,7 +264,7 @@ def _start_qwen3_omni_tp2(
         thinker_max_seq_len=thinker_max_seq_len,
         # SGLang 0.5.15 may cold-JIT the FlashInfer fused-MoE kernels on the
         # first H100 startup; keep this within the workflow's 20-minute budget.
-        timeout=1200,
+        timeout=900,
         log_prefix="server_logs_tp2_ci",
         force_log=True,
     )

@@ -14,6 +14,7 @@ from sglang_omni.config import (
     StageResourceConfig,
     StageRuntimeConfig,
 )
+from sglang_omni.config.runtime import resolve_stage_static_factory_args
 from sglang_omni.utils.cpu import bounded_intraop_threads
 
 _PKG = "sglang_omni.models.moss_tts_local"
@@ -158,6 +159,14 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
 
     def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
+        preprocessing = next(
+            stage for stage in self.stages if stage.name == "preprocessing"
+        )
+        factory_args = resolve_stage_static_factory_args(preprocessing, self)
+        preprocessing_workers = max(
+            int(factory_args.get("max_concurrency", _PREPROCESSING_MAX_CONCURRENCY)),
+            1,
+        )
         # Stage processes must inherit this before importing Torch/OpenMP-backed
         # libraries. Calling torch.set_num_threads() inside preprocessing is too
         # late for the separately spawned AR and vocoder processes.
@@ -165,7 +174,7 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
             "OMP_NUM_THREADS",
             str(
                 bounded_intraop_threads(
-                    worker_count=_PREPROCESSING_MAX_CONCURRENCY,
+                    worker_count=preprocessing_workers,
                     max_threads=_MAX_PIPELINE_INTRAOP_THREADS,
                 )
             ),

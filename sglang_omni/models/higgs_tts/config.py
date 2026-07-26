@@ -69,8 +69,6 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                 "device": "cuda",
                 "max_new_tokens": 2048,
                 "enable_async_decode": True,
-                "prefill_coalesce_requests": 2,
-                "prefill_coalesce_wait_ms": 10.0,
             },
             gpu=0,
             runtime=StageRuntimeConfig(

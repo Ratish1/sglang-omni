@@ -520,6 +520,32 @@ def test_pipeline_preserves_explicit_omp_default() -> None:
     assert config.env_defaults["OMP_NUM_THREADS"] == "3"
 
 
+def test_pipeline_omp_default_uses_overridden_preprocessing_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.moss_tts_local import config as config_module
+
+    seen_worker_counts: list[int] = []
+
+    def _bounded_threads(*, worker_count: int, max_threads: int) -> int:
+        seen_worker_counts.append(worker_count)
+        return min(worker_count, max_threads)
+
+    monkeypatch.setattr(
+        config_module,
+        "bounded_intraop_threads",
+        _bounded_threads,
+    )
+
+    config = config_module.MossTTSLocalPipelineConfig(
+        model_path="dummy",
+        runtime_overrides={"preprocessing": {"max_concurrency": 4}},
+    )
+
+    assert seen_worker_counts == [4]
+    assert config.env_defaults["OMP_NUM_THREADS"] == "4"
+
+
 def test_pipeline_config_injects_reference_cache_factory_args():
     config = MossTTSLocalPipelineConfig(
         model_path="OpenMOSS-Team/moss-local-test",

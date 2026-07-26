@@ -27,7 +27,7 @@ MIN_PARTIAL_START_CHUNKS = 3
 # policy once that exists outside import-time environment globals.
 _DEEPGEMM_PRECOMPILE_ENV_DEFAULTS = {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}
 
-# A colocated worker launches multiple stage processes. Letting every PyTorch
+# A colocated worker launches eight stage processes. Letting every PyTorch
 # process size its OpenMP pool to the full host oversubscribes launch-side CPU
 # work when multiple workers share a node. Preprocessing handles one prompt per
 # scheduler call, so a host-wide tokenizer Rayon pool only adds contention.
@@ -221,9 +221,9 @@ def _code2wav_stage(*, gpu: int, process: str) -> StageConfig:
 
 def _text_stages() -> list[StageConfig]:
     return [
-        _preprocessing_stage(process="preprocessing"),
+        _preprocessing_stage(process="pipeline"),
         _image_encoder_stage(gpu=0, process="pipeline"),
-        _audio_encoder_stage(gpu=0, process="audio_encoder"),
+        _audio_encoder_stage(gpu=0, process="pipeline"),
         _aggregate_stage(process="pipeline", gpu=0, speech_enabled=False),
         _thinker_stage(gpu=0, speech_enabled=False, process="pipeline"),
         _decode_stage(process="pipeline"),
@@ -295,10 +295,6 @@ class _Qwen3OmniBasePipelineConfig(PipelineConfig):
 
 class Qwen3OmniPipelineConfig(_Qwen3OmniBasePipelineConfig):
     """6-stage text-only pipeline."""
-
-    env_defaults: dict[str, str] = Field(
-        default_factory=lambda: dict(_COLOCATED_STAGE_ENV_DEFAULTS)
-    )
 
     @classmethod
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:

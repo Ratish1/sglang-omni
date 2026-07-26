@@ -1109,6 +1109,7 @@ class OmniScheduler:
             # SGLANG_TEST_RETRACT fires every step. Only the custom-runner path
             # needs it (the fallback reaches upstream run_batch, which counts).
             self.forward_ct = getattr(self, "forward_ct", 0) + 1
+            batch.forward_iter = self.forward_ct
             sched_output = self._build_sched_output(batch)
             mr_output = self._model_runner.execute(sched_output)
             self._emit_stream_output(sched_output, mr_output)
@@ -1228,6 +1229,7 @@ class OmniScheduler:
         # One forward per launch; mirror upstream run_batch's per-forward
         # counter (the matching resolve does no forward, so it must not count).
         self.forward_ct = getattr(self, "forward_ct", 0) + 1
+        batch.forward_iter = self.forward_ct
         sched_output = self._build_sched_output(batch)
         pending_step = self._model_runner.execute_launch(sched_output)
         return sched_output, pending_step
@@ -2086,6 +2088,11 @@ class OmniScheduler:
         out_cache_loc = batch.out_cache_loc
         forward_mode = getattr(batch, "forward_mode", None)
         if forward_mode is not None and forward_mode.is_extend():
+            if getattr(batch, "mix_running_indices", None) is not None:
+                raise RuntimeError(
+                    "Omni does not support stale-row filtering for SGLang mixed "
+                    "chunked-prefill batches"
+                )
             # Note:(Wenyao Gao) extend/mixed batches carry per-token fields
             # (req i owns extend_lens[i] slots) that filter_batch leaves
             # stale; reslice them here. The asserted fields are never
@@ -2109,12 +2116,21 @@ class OmniScheduler:
                 t for i in keep for t in range(starts[i], starts[i] + lens[i])
             ]
             input_ids = batch.input_ids
+            prefill_input_ids_cpu = getattr(batch, "prefill_input_ids_cpu", None)
+            if input_ids is None and prefill_input_ids_cpu is None:
+                raise RuntimeError(
+                    "extend batch carries neither input_ids nor "
+                    "prefill_input_ids_cpu"
+                )
             prefix_lens = batch.prefix_lens
             extend_logprob_start_lens = batch.extend_logprob_start_lens
             lp_token_ids = getattr(batch, "extend_input_logprob_token_ids", None)
             self._free_overrun_step_slots(out_cache_loc, drop_tokens)
             batch.filter_batch(keep_indices=keep)
-            batch.input_ids = input_ids[keep_tokens]
+            if input_ids is not None:
+                batch.input_ids = input_ids[keep_tokens]
+            else:
+                batch.prefill_input_ids_cpu = prefill_input_ids_cpu[keep_tokens]
             if out_cache_loc is not None:
                 batch.out_cache_loc = out_cache_loc[keep_tokens]
             batch.extend_lens = [lens[i] for i in keep]

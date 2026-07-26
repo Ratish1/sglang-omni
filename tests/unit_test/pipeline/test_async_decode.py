@@ -999,6 +999,29 @@ def test_drop_stale_overrun_extend_multitoken_drop():
     assert out.prefix_lens == [20]
 
 
+def test_drop_stale_overrun_reslices_deferred_prefill_tokens():
+    freed = []
+    s = _drop_stale_scheduler(freed)
+    batch = _MixedBatch(lens=[2, 3], done=[True, False])
+    batch.prefill_input_ids_cpu = batch.input_ids
+    batch.input_ids = None
+
+    out = s._drop_stale_overrun(batch)
+
+    assert freed == [100, 101]
+    assert out.input_ids is None
+    assert out.prefill_input_ids_cpu.tolist() == [2, 3, 4]
+
+
+def test_drop_stale_overrun_rejects_mixed_deferred_prefill():
+    s = _drop_stale_scheduler([])
+    batch = _MixedBatch(lens=[2, 3], done=[True, False])
+    batch.mix_running_indices = torch.tensor([1])
+
+    with pytest.raises(RuntimeError, match="mixed chunked-prefill"):
+        s._drop_stale_overrun(batch)
+
+
 def test_drop_stale_overrun_reslices_logprob_token_ids():
     freed = []
     s = _drop_stale_scheduler(freed)

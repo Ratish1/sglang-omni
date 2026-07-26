@@ -44,12 +44,10 @@ def _rank_shared_unseeded_sampling_seed(request: SchedulerRequest, row_idx: int)
 
 
 def resolve_deferred_prefill_inputs(schedule_batch: Any, device: torch.device) -> None:
-    """Materialize the pinned prefill token staging introduced by SGLang 0.5.15.
+    """Materialize 0.5.15 prefill staging for standalone runner callers.
 
-    ``ScheduleBatch.prepare_for_extend`` now leaves ``input_ids`` unset and
-    stores the flattened tokens in ``prefill_input_ids_cpu``. Upstream's
-    Scheduler resolves that staging immediately before the worker forward; Omni
-    uses its own model-runner bridge, so it must perform the same boundary step.
+    Scheduler-owned execution resolves this through ``SGLangExecutionBridge``.
+    This fallback remains for model runners invoked without an OmniScheduler.
     """
     staged_input_ids = getattr(schedule_batch, "prefill_input_ids_cpu", None)
     if staged_input_ids is None:
@@ -89,7 +87,6 @@ class _PendingStep:
     scheduler_output: Any  # this step's SchedulerOutput (routing + output proc)
     forward_batch: Any  # for resolve-time finalize sampling
     schedule_batch: Any  # to set .output_ids during resolve
-    model_worker_batch: Any  # for the prefill-only finalize branch (unused in decode)
     batch_result: Any  # carries logits_output (device of next_token_ids)
 
 
@@ -124,10 +121,18 @@ class ModelRunner:
         """Bind the scheduler-owned SGLang execution-contract adapter."""
         self._execution_bridge = bridge
 
-    def _execution_context(self, schedule_batch: Any):
+    def _execution_context(
+        self,
+        schedule_batch: Any,
+        *,
+        isolate_sampling: bool = False,
+    ):
         bridge = getattr(self, "_execution_bridge", None)
         return (
-            bridge.forward_context(schedule_batch)
+            bridge.forward_context(
+                schedule_batch,
+                isolate_sampling=isolate_sampling,
+            )
             if bridge is not None
             else nullcontext()
         )
@@ -241,7 +246,7 @@ class ModelRunner:
         schedule_batch = scheduler_output.batch_data
         if schedule_batch is None:
             return None
-        with self._execution_context(schedule_batch):
+        with self._execution_context(schedule_batch, isolate_sampling=True):
             built = self._build_forward_batch(scheduler_output)
             if built is None:
                 return None
@@ -296,7 +301,6 @@ class ModelRunner:
             scheduler_output=resolve_scheduler_output,
             forward_batch=forward_batch,
             schedule_batch=resolve_batch,
-            model_worker_batch=resolve_batch,
             batch_result=batch_result,
         )
 
@@ -335,7 +339,7 @@ class ModelRunner:
             pending.batch_result,
             pending.forward_batch,
             pending.schedule_batch,
-            pending.model_worker_batch,
+            pending.schedule_batch,
             pending.scheduler_output,
             set_output_ids=False,
             skip_rids=skip_rids,
@@ -374,7 +378,8 @@ class ModelRunner:
         elif self.output_processor._capture_hidden:
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
-        resolve_deferred_prefill_inputs(schedule_batch, self.device)
+        if getattr(self, "_execution_bridge", None) is None:
+            resolve_deferred_prefill_inputs(schedule_batch, self.device)
         forward_batch = ForwardBatch.init_new(
             schedule_batch, self.tp_worker.model_runner
         )

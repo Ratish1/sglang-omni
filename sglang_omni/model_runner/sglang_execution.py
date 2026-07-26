@@ -4,8 +4,8 @@
 SGLang 0.5.15 made the scheduler/worker boundary an explicit protocol:
 
 * decode tokens cross iterations through ``FutureMap``; and
-* a mutable ``ScheduleBatch`` is isolated while ``ForwardBatch.init_new``
-  consumes its one-shot fields.
+* decode lookahead isolates forward-only sampling state while
+  ``ForwardBatch.init_new`` consumes one-shot fields.
 
 Omni owns its scheduler loop and model-runner wrapper, so it cannot rely on
 ``sglang.srt.managers.scheduler.Scheduler.run_batch`` to provide that protocol.
@@ -22,7 +22,6 @@ is deliberately single-stream: launch-current/resolve-previous on one stream.
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 from collections.abc import Iterator
 from typing import Any
 
@@ -60,6 +59,10 @@ class SGLangExecutionBridge:
     ) -> None:
         from sglang.srt.managers.overlap_utils import RelayPayload
 
+        if not spec_algorithm.is_none():
+            raise NotImplementedError(
+                "Omni's SGLang execution bridge does not support speculative decoding"
+            )
         self.device = device
         self.worker = worker
         self.runner = worker.model_runner
@@ -72,31 +75,29 @@ class SGLangExecutionBridge:
         self._relay_payload_type = RelayPayload
 
     @contextlib.contextmanager
-    def forward_context(self, batch: Any) -> Iterator[None]:
-        """Resolve inputs and isolate ``ScheduleBatch`` for one forward."""
+    def forward_context(
+        self,
+        batch: Any,
+        *,
+        isolate_sampling: bool = False,
+    ) -> Iterator[None]:
+        """Resolve inputs and optionally isolate lookahead sampling state."""
         from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 
+        if getattr(batch, "mix_running_indices", None) is not None:
+            raise RuntimeError(
+                "Omni does not support SGLang mixed chunked-prefill batches with "
+                "deferred decode tokens"
+            )
         resolve_forward_inputs(batch, self.future_map)
 
-        snapshot_full = not batch.spec_algorithm.is_none()
-        scheduler_snapshot = (
-            {
-                field.name: getattr(batch, field.name)
-                for field in dataclasses.fields(batch)
-            }
-            if snapshot_full
-            else None
-        )
         scheduler_sampling_info = batch.sampling_info
-        if scheduler_sampling_info is not None:
+        if isolate_sampling and scheduler_sampling_info is not None:
             batch.sampling_info = scheduler_sampling_info.copy_for_forward()
         try:
             yield
         finally:
-            if snapshot_full:
-                for name, value in scheduler_snapshot.items():
-                    setattr(batch, name, value)
-            else:
+            if isolate_sampling:
                 batch.sampling_info = scheduler_sampling_info
 
     def publish_next_tokens(

@@ -41,7 +41,7 @@ class FunASRPipelineConfig(PipelineConfig):
                 "pre_lm_cache_max_entries": 4096,
                 "pre_lm_cache_size_bytes": 2 * 1024**3,
                 "request_build_max_workers": 16,
-                "request_build_max_pending": 32,
+                "request_build_max_pending": 16,
             },
             gpu=0,
             terminal=True,

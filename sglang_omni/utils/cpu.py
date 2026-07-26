@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 from pathlib import Path
 
@@ -49,7 +48,7 @@ def _read_v2_quota(path: Path) -> int | None:
         return None
     if quota <= 0 or period <= 0:
         return None
-    return max(math.ceil(quota / period), 1)
+    return max(quota // period, 1)
 
 
 def _read_v1_quota(directory: Path) -> int | None:
@@ -64,7 +63,7 @@ def _read_v1_quota(directory: Path) -> int | None:
         return None
     if quota <= 0 or period <= 0:
         return None
-    return max(math.ceil(quota / period), 1)
+    return max(quota // period, 1)
 
 
 def cgroup_cpu_quota_count(
