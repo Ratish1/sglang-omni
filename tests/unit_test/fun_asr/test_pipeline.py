@@ -27,7 +27,7 @@ def test_fun_asr_config_uses_batched_stage_with_32_running_requests() -> None:
     assert config.stages[0].factory_args["pre_lm_cache_max_entries"] == 4096
     assert config.stages[0].factory_args["pre_lm_cache_size_bytes"] == 2 * 1024**3
     assert config.stages[0].factory_args["request_build_max_workers"] == 16
-    assert config.stages[0].factory_args["request_build_max_pending"] == 16
+    assert config.stages[0].factory_args["request_build_max_pending"] == 32
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("FunAsrNanoForConditionalGeneration")
         is FunASRPipelineConfig
@@ -43,7 +43,7 @@ def test_fun_asr_stage_default_allows_32_running_requests() -> None:
     assert signature.parameters["pre_lm_cache_max_entries"].default == 4096
     assert signature.parameters["pre_lm_cache_size_bytes"].default == 2 * 1024**3
     assert signature.parameters["request_build_max_workers"].default == 16
-    assert signature.parameters["request_build_max_pending"].default == 16
+    assert signature.parameters["request_build_max_pending"].default == 32
 
 
 def test_fun_asr_stage_default_uses_auto_static_kv_budget() -> None:
@@ -186,7 +186,7 @@ def test_fun_asr_threads_generation_batch_and_request_build_policy(monkeypatch) 
     ]
     assert adapter_kwargs["audio_encoder_service"] is encoder_services[0]
     assert scheduler.request_build_max_workers == 16
-    assert scheduler.request_build_max_pending == 16
+    assert scheduler.request_build_max_pending == 32
     assert scheduler.enable_async_decode is True
     assert scheduler.async_decode_min_batch_size == 2
     scheduler.shutdown_callback()

@@ -79,7 +79,7 @@ MODEL_PATH: Final[str] = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 RESULTS_FILE: Final[str] = "transcribe_diarize_results.json"
 ASR_RESULTS_FILE: Final[str] = "transcribe_diarize_asr_results.json"
 SPEED_RESULTS_FILE: Final[str] = "transcribe_diarize_speed_results.json"
-DEFAULT_SERVER_MEM_FRACTION_STATIC: Final[float] = 0.80
+DEFAULT_SERVER_MEM_FRACTION_STATIC: Final[float | None] = None
 DEFAULT_MAX_NEW_TOKENS: Final[int] = 65536
 MOVIES800TIMES_EXPECTED_SAMPLE_COUNT: Final[int] = 800
 AISHELL4_LONG_EXPECTED_SAMPLE_COUNT: Final[int] = 20
@@ -570,8 +570,7 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_SERVER_MEM_FRACTION_STATIC,
         help=(
             "SGLang static KV-cache memory fraction for the managed server. "
-            "MOSS-Transcribe-Diarize keeps headroom for the audio encoder by "
-            f"default ({DEFAULT_SERVER_MEM_FRACTION_STATIC})."
+            "When omitted, use the model-specific server default."
         ),
     )
     parser.add_argument(
