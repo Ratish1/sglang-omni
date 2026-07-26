@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from sglang_omni.client.audio import encode_audio, encode_wav
+from sglang_omni.config import StageConfig
 from sglang_omni.config.placement import build_stage_placement_plan
 from sglang_omni.config.topology import build_process_topology_plan
 from sglang_omni.models.moss_tts_local.audio_tokenizer import MossTTSLocalAudioTokenizer
@@ -544,6 +545,30 @@ def test_pipeline_omp_default_uses_overridden_preprocessing_concurrency(
 
     assert seen_worker_counts == [4]
     assert config.env_defaults["OMP_NUM_THREADS"] == "4"
+
+
+def test_pipeline_rejects_none_preprocessing_concurrency() -> None:
+    with pytest.raises(ValueError, match="max_concurrency must be an integer"):
+        MossTTSLocalPipelineConfig(
+            model_path="dummy",
+            runtime_overrides={"preprocessing": {"max_concurrency": None}},
+        )
+
+
+def test_pipeline_without_preprocessing_does_not_set_omp_default() -> None:
+    config = MossTTSLocalPipelineConfig(
+        model_path="dummy",
+        stages=[
+            StageConfig(
+                name="custom",
+                process="pipeline",
+                factory="tests.unit_test.fixtures.pipeline_fakes.dummy_factory",
+                terminal=True,
+            )
+        ],
+    )
+
+    assert "OMP_NUM_THREADS" not in config.env_defaults
 
 
 def test_pipeline_config_injects_reference_cache_factory_args():

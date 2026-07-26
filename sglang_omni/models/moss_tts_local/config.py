@@ -160,25 +160,30 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
     def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
         preprocessing = next(
-            stage for stage in self.stages if stage.name == "preprocessing"
+            (stage for stage in self.stages if stage.name == "preprocessing"),
+            None,
         )
-        factory_args = resolve_stage_static_factory_args(preprocessing, self)
-        preprocessing_workers = max(
-            int(factory_args.get("max_concurrency", _PREPROCESSING_MAX_CONCURRENCY)),
-            1,
-        )
-        # Stage processes must inherit this before importing Torch/OpenMP-backed
-        # libraries. Calling torch.set_num_threads() inside preprocessing is too
-        # late for the separately spawned AR and vocoder processes.
-        self.env_defaults.setdefault(
-            "OMP_NUM_THREADS",
-            str(
-                bounded_intraop_threads(
-                    worker_count=preprocessing_workers,
-                    max_threads=_MAX_PIPELINE_INTRAOP_THREADS,
-                )
-            ),
-        )
+        if preprocessing is not None:
+            factory_args = resolve_stage_static_factory_args(preprocessing, self)
+            configured_workers = factory_args.get("max_concurrency")
+            if configured_workers is None:
+                raise ValueError("preprocessing max_concurrency must be an integer")
+            preprocessing_workers = max(
+                int(configured_workers),
+                1,
+            )
+            # Stage processes must inherit this before importing Torch/OpenMP-backed
+            # libraries. Calling torch.set_num_threads() inside preprocessing is too
+            # late for the separately spawned AR and vocoder processes.
+            self.env_defaults.setdefault(
+                "OMP_NUM_THREADS",
+                str(
+                    bounded_intraop_threads(
+                        worker_count=preprocessing_workers,
+                        max_threads=_MAX_PIPELINE_INTRAOP_THREADS,
+                    )
+                ),
+            )
         if self.ref_audio_cache_max_items < 1:
             raise ValueError(
                 "ref_audio_cache_max_items must be >= 1; got "

@@ -46,9 +46,7 @@ def test_cgroup_v2_inherits_tighter_parent_quota(tmp_path: Path) -> None:
     )
 
 
-def test_cgroup_v1_cpu_quota_does_not_exceed_fractional_capacity(
-    tmp_path: Path,
-) -> None:
+def test_cgroup_v1_cpu_quota_rounds_partial_cpu_up(tmp_path: Path) -> None:
     cgroup_root = tmp_path / "cgroup"
     proc_self_cgroup = tmp_path / "self.cgroup"
     _write(proc_self_cgroup, "2:cpu,cpuacct:/pod/container\n")
@@ -61,7 +59,7 @@ def test_cgroup_v1_cpu_quota_does_not_exceed_fractional_capacity(
             cgroup_root=cgroup_root,
             proc_self_cgroup=proc_self_cgroup,
         )
-        == 1
+        == 2
     )
 
 
