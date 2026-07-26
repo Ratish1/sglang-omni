@@ -199,7 +199,10 @@ class HiggsAudioCodec:
         """
         if self.device.type != "cuda":
             raise RuntimeError("Higgs codec CUDA graphs require a CUDA device")
-        frames = tuple(dict.fromkeys(int(value) for value in frame_counts))
+        # Descending so the shared mempool is sized once from the largest shape
+        # rather than grown across captures: 130 vs 146 MiB reserved on the
+        # default 1..150 domain.
+        frames = tuple(sorted({int(value) for value in frame_counts}, reverse=True))
         if not frames or any(value <= 0 for value in frames):
             raise ValueError("decode CUDA graph frame counts must be positive")
 
@@ -214,34 +217,47 @@ class HiggsAudioCodec:
         )
         captured: dict[int, _DecodeCudaGraph] = {}
         try:
-            # Initialize shape-specialized CUDA-library state outside capture.
-            # One eager pass per shape is sufficient after model startup; doing
-            # three passes made comprehensive tail-shape capture needlessly
-            # expensive.
-            with torch.cuda.stream(capture_stream):
+            # Bind the device: CUDAGraph and graph_pool_handle act on the
+            # current device, which need not be the codec's.
+            with torch.cuda.device(self.device):
+                # Initialize shape-specialized CUDA-library state outside
+                # capture. One eager pass per shape is sufficient after model
+                # startup; doing three passes made comprehensive tail-shape
+                # capture needlessly expensive.
+                with torch.cuda.stream(capture_stream):
+                    for frame_count in frames:
+                        warm_codes = torch.zeros(
+                            (1, num_quantizers, frame_count),
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                        self.model.decode(warm_codes).audio_values
+                capture_stream.synchronize()
+
+                # One mempool for all shapes: a private pool per graph reserves
+                # the sum of every shape's peak instead of the largest, 6558 vs
+                # 130 MiB on the default 1..150 domain. Aliasing across shapes
+                # is safe because decode() replays one graph at a time and
+                # copies the output to host before returning.
+                graph_pool = torch.cuda.graph_pool_handle()
                 for frame_count in frames:
-                    warm_codes = torch.zeros(
+                    # Outside the capture, so the static input is not drawn from
+                    # the shared pool.
+                    input_codes = torch.zeros(
                         (1, num_quantizers, frame_count),
                         dtype=torch.long,
                         device=self.device,
                     )
-                    self.model.decode(warm_codes).audio_values
-            capture_stream.synchronize()
-
-            for frame_count in frames:
-                input_codes = torch.zeros(
-                    (1, num_quantizers, frame_count),
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, stream=capture_stream):
-                    output_audio = self.model.decode(input_codes).audio_values
-                captured[frame_count] = _DecodeCudaGraph(
-                    graph=graph,
-                    input_codes=input_codes,
-                    output_audio=output_audio,
-                )
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(
+                        graph, pool=graph_pool, stream=capture_stream
+                    ):
+                        output_audio = self.model.decode(input_codes).audio_values
+                    captured[frame_count] = _DecodeCudaGraph(
+                        graph=graph,
+                        input_codes=input_codes,
+                        output_audio=output_audio,
+                    )
         finally:
             self.model.quantizer.decode = original_quantizer_decode
 
