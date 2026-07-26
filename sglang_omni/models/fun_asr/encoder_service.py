@@ -82,7 +82,7 @@ class FunASRPreLMEncoderService:
         cache_max_entries: int = _CACHE_MAX_ENTRIES,
         cache_max_bytes: int = _CACHE_MAX_BYTES,
         max_batch_size: int = 8,
-        max_batch_wait_ms: int = 4,
+        max_batch_wait_ms: int = 20,
     ) -> None:
         self._model = model
         reference = next(model.audio_tower.parameters())
