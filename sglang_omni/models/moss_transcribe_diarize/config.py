@@ -13,7 +13,8 @@ from sglang_omni.models.moss_transcribe_diarize import (  # noqa: F401
 from sglang_omni.utils.cpu import bounded_intraop_threads
 
 _PKG = "sglang_omni.models.moss_transcribe_diarize"
-_REQUEST_BUILD_MAX_WORKERS = 2
+_REQUEST_BUILD_MAX_WORKERS = 8
+_ENCODER_MAX_BATCH_SIZE = 2
 _MAX_PIPELINE_INTRAOP_THREADS = 8
 
 
@@ -41,6 +42,7 @@ class MossTranscribeDiarizePipelineConfig(PipelineConfig):
                 "device": "cuda:0",
                 "max_running_requests": 16,
                 "encoder_cache_size_bytes": 4 * 1024**3,
+                "encoder_max_batch_size": _ENCODER_MAX_BATCH_SIZE,
                 "request_build_max_workers": _REQUEST_BUILD_MAX_WORKERS,
                 "request_build_max_pending": 16,
             },
