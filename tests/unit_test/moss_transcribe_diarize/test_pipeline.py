@@ -33,7 +33,7 @@ def test_moss_transcribe_diarize_config_uses_single_batched_stage() -> None:
     )
     assert config.stages[0].factory_args["device"] == "cuda:0"
     assert config.stages[0].factory_args["max_running_requests"] == 16
-    assert config.stages[0].factory_args["request_build_max_workers"] == 8
+    assert config.stages[0].factory_args["request_build_max_workers"] == 2
     assert config.stages[0].factory_args["request_build_max_pending"] == 16
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config(
@@ -47,6 +47,63 @@ def test_moss_transcribe_diarize_config_uses_single_batched_stage() -> None:
     assert MossTranscribeDiarizePipelineConfig.generation_sglang_role_to_stage() == {
         "generation": "asr"
     }
+
+
+@pytest.mark.parametrize(
+    ("runtime_overrides", "expected_workers"),
+    [
+        ({}, 2),
+        ({"asr": {"request_build_max_workers": 4}}, 4),
+    ],
+)
+def test_moss_transcribe_diarize_omp_default_tracks_request_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_overrides: dict[str, dict[str, int]],
+    expected_workers: int,
+) -> None:
+    from sglang_omni.models.moss_transcribe_diarize import config as config_module
+
+    calls: list[tuple[int, int]] = []
+
+    def _bounded_threads(*, worker_count: int, max_threads: int) -> int:
+        calls.append((worker_count, max_threads))
+        return 3
+
+    monkeypatch.setattr(
+        config_module,
+        "bounded_intraop_threads",
+        _bounded_threads,
+    )
+
+    config = config_module.MossTranscribeDiarizePipelineConfig(
+        model_path="dummy",
+        runtime_overrides=runtime_overrides,
+    )
+
+    assert config.env_defaults["OMP_NUM_THREADS"] == "3"
+    assert calls == [(expected_workers, 8)]
+
+
+def test_moss_transcribe_diarize_preserves_explicit_omp_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.moss_transcribe_diarize import config as config_module
+
+    def _unexpected_call(**_kwargs) -> int:
+        raise AssertionError("explicit OMP_NUM_THREADS must bypass auto sizing")
+
+    monkeypatch.setattr(
+        config_module,
+        "bounded_intraop_threads",
+        _unexpected_call,
+    )
+
+    config = config_module.MossTranscribeDiarizePipelineConfig(
+        model_path="dummy",
+        env_defaults={"OMP_NUM_THREADS": "3"},
+    )
+
+    assert config.env_defaults["OMP_NUM_THREADS"] == "3"
 
 
 def test_moss_transcribe_diarize_stage_reserves_encoder_headroom() -> None:
