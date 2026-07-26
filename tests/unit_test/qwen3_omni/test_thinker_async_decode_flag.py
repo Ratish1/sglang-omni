@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The thinker stage defaults to async decode, and --decode-mode overrides it.
+"""The thinker stage defaults to sync decode, and --decode-mode overrides it.
 
-Async decode is on by default (parity with Higgs); --decode-mode sync must route
-the override to the thinker stage (resolved by factory) and turn it off.
+Qwen's async mode remains available as an explicit high-concurrency option.
 """
 from __future__ import annotations
 
@@ -14,9 +13,9 @@ def _thinker_factory_args(cfg):
     return next(s for s in cfg.stages if s.name == "thinker").factory_args
 
 
-def test_thinker_async_on_by_default():
+def test_thinker_sync_on_by_default():
     cfg = Qwen3OmniPipelineConfig(model_path="dummy")
-    assert _thinker_factory_args(cfg)["enable_async_decode"] is True
+    assert _thinker_factory_args(cfg)["enable_async_decode"] is False
 
 
 def test_decode_mode_sync_disables_thinker_async():

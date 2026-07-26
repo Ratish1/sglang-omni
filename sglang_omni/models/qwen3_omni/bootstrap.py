@@ -14,7 +14,7 @@ def create_thinker_scheduler(
     tp_rank: int = 0,
     nccl_port: int | None = None,
     total_gpu_memory_fraction: float | None = None,
-    enable_async_decode: bool = True,
+    enable_async_decode: bool = False,
     async_decode_min_batch_size: int = 2,
     prefill_coalesce_requests: int = 0,
     prefill_coalesce_wait_ms: float = 60.0,

@@ -123,8 +123,9 @@ def _aggregate_stage(
 
 
 def _thinker_stage(*, gpu: int, speech_enabled: bool, process: str) -> StageConfig:
-    # note (jiaxin deng): async decode defaults on; --decode-mode sync overrides it.
-    factory_args = {"thinker_max_seq_len": 8192, "enable_async_decode": True}
+    # Omni's single-stream lookahead adds overhead to the Qwen profiles tested
+    # here. Keep it opt-in through --decode-mode async.
+    factory_args = {"thinker_max_seq_len": 8192, "enable_async_decode": False}
     if speech_enabled:
         factory_args["speech_enabled"] = True
     return StageConfig(
