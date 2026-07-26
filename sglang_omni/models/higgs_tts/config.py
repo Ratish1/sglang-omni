@@ -11,8 +11,12 @@ from sglang_omni.config import (
     StageResourceConfig,
     StageRuntimeConfig,
 )
+from sglang_omni.config.runtime import resolve_stage_static_factory_args
+from sglang_omni.utils.cpu import bounded_intraop_threads
 
 _PKG = "sglang_omni.models.higgs_tts"
+_PREPROCESS_MAX_WORKERS = 2
+_MAX_PIPELINE_INTRAOP_THREADS = 8
 
 
 class HiggsTtsPipelineConfig(PipelineConfig):
@@ -43,6 +47,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             name="preprocessing",
             process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
+            factory_args={"max_concurrency": _PREPROCESS_MAX_WORKERS},
             next="audio_encoder",
         ),
         StageConfig(
@@ -101,6 +106,28 @@ class HiggsTtsPipelineConfig(PipelineConfig):
 
     def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
+        if "OMP_NUM_THREADS" not in self.env_defaults:
+            preprocessing = next(
+                stage for stage in self.stages if stage.name == "preprocessing"
+            )
+            factory_args = resolve_stage_static_factory_args(preprocessing, self)
+            preprocess_workers = max(
+                int(factory_args.get("max_concurrency", _PREPROCESS_MAX_WORKERS)),
+                1,
+            )
+            # All four stages share one pipeline process, so the preprocessing
+            # pool's tokenize/resample/delay-pattern work competes with the
+            # tts_engine scheduler thread for the GIL, and any CPU torch op
+            # otherwise spawns a machine-sized OMP team under the cgroup CPU
+            # quota. Unbounded, arrival bursts stall the scheduler mid-prefill
+            # and inflate the streaming TTFC tail. The env must be in place
+            # before the spawned stage process imports Torch.
+            self.env_defaults["OMP_NUM_THREADS"] = str(
+                bounded_intraop_threads(
+                    worker_count=preprocess_workers,
+                    max_threads=_MAX_PIPELINE_INTRAOP_THREADS,
+                )
+            )
         stages = {stage.name: stage for stage in self.stages}
         vocoder = stages["vocoder"]
         tts_engine = stages["tts_engine"]
