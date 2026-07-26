@@ -224,7 +224,6 @@ class HiggsTTSModelRunner(ModelRunner):
             logprobs_cpu,
             result,
             requests,
-            next_token_device=None,
         )
 
     def _populate_cg_buffers(
@@ -371,7 +370,6 @@ class HiggsTTSModelRunner(ModelRunner):
             logprobs_cpu,
             result,
             requests,
-            next_token_device=None,
         )
 
     def _decode_pack_gpu(self, n_real: int) -> torch.Tensor:
@@ -402,18 +400,15 @@ class HiggsTTSModelRunner(ModelRunner):
         logprobs_cpu: torch.Tensor | None,
         result: Any,
         requests: list,
-        *,
-        next_token_device: torch.device | None,
     ) -> None:
         """Host-side collect loop over an already-D2H'd staging snapshot:
         append per-request codes, mark finishes, build ``result.next_token_ids``.
         Skips chunked and already-done rows (the latter is what makes the
         one-step-lookahead overrun harmless — see r1_idempotency_check.md).
 
-        ``next_token_device`` is set for synchronous decode because those ids
-        feed the next step. Async resolve passes ``None``: launch already
-        published GPU codebook-0, and resolve only needs a CPU tensor for
-        output processing.
+        These are reporting tokens for CPU-side output processing. The next
+        forward's GPU token rail is published separately by
+        :meth:`next_input_token_ids`.
         """
         model = self.model
         num_codebooks = model._cg_codes_BN.shape[1]
@@ -453,14 +448,7 @@ class HiggsTTSModelRunner(ModelRunner):
             self._mark_sampler_finished(req, data.generation_done)
             cb0_per_row.append(int(codes_N[0].item()))
 
-        if next_token_device is None:
-            result.next_token_ids = torch.tensor(cb0_per_row, dtype=torch.long)
-        else:
-            result.next_token_ids = torch.tensor(
-                cb0_per_row,
-                dtype=torch.long,
-                device=next_token_device,
-            )
+        result.next_token_ids = torch.tensor(cb0_per_row, dtype=torch.long)
 
     def _build_prefill_input_embeds(
         self,
