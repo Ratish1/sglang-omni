@@ -658,6 +658,14 @@ class ModelRunner:
     ) -> None:
         """Called after output tokens are materialized into RequestOutput."""
 
+    def on_request_finished(self, request_id: str, req_data: Any) -> None:
+        """Drain per-request state on any non-abort finish.
+
+        Called from ``OmniScheduler.stream_output`` before the terminal payload
+        is enqueued on the same outbox, so runners that buffer stream chunks
+        across decode steps can flush them ahead of stream completion.
+        """
+
     def post_decode_launch(
         self, result: Any, forward_batch: Any, requests: list
     ) -> Any:

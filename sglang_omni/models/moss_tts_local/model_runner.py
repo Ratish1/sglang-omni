@@ -73,6 +73,13 @@ class MossTTSLocalModelRunner(ModelRunner):
             )
         )
 
+    def on_request_finished(self, request_id: str, req_data: Any) -> None:
+        # post_process_outputs only force-flushes on the audio end token; any
+        # other stop (max_new_tokens, scheduler stop) would strand up to
+        # MOSS_STREAM_TRANSPORT_BATCH_FRAMES - 1 frames, and the terminal
+        # payload carries no audio to recover them from.
+        self._flush_stream_rows(request_id, req_data, force=True)
+
     def custom_prefill_forward(
         self,
         forward_batch: Any,

@@ -684,6 +684,59 @@ def test_omni_scheduler_fish_abort_during_step_suppresses_chunk_and_result() -> 
     assert scheduler.outbox.empty()
 
 
+def test_stream_output_drains_runner_before_terminal_payload() -> None:
+    """The runner hook must fire on a non-abort finish, and strictly before the
+    terminal payload lands on the shared outbox."""
+    calls: list[tuple[str, object, int]] = []
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.outbox = Queue()
+    scheduler._aborted_request_ids = set()
+    scheduler._first_emit_done = set()
+    scheduler._prefill_start_done = set()
+    scheduler._result_adapter = lambda data: {"ok": True}
+    scheduler.server_args = SimpleNamespace(weight_version=None)
+
+    data = SimpleNamespace(prefill_input_embeds=None, decode_input_embeds=None)
+    scheduler._model_runner = SimpleNamespace(
+        on_request_finished=lambda rid, req_data: calls.append(
+            (rid, req_data, scheduler.outbox.qsize())
+        )
+    )
+    req = SimpleNamespace(
+        rid="req-1",
+        finished=lambda: True,
+        finished_reason=None,
+        output_ids=[7],
+        _omni_data=data,
+    )
+
+    scheduler.stream_output([req])
+
+    # qsize 0 at call time proves the flush is ordered ahead of the result.
+    assert calls == [("req-1", data, 0)]
+    assert scheduler.outbox.qsize() == 1
+    assert scheduler.outbox.get().type == "result"
+
+
+def test_stream_output_skips_runner_hook_for_aborted_requests() -> None:
+    calls: list[str] = []
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.outbox = Queue()
+    scheduler._aborted_request_ids = {"req-1"}
+    scheduler._abort_callback = None
+    scheduler._first_emit_done = set()
+    scheduler._prefill_start_done = set()
+    scheduler._model_runner = SimpleNamespace(
+        on_request_finished=lambda rid, _data: calls.append(rid)
+    )
+    req = SimpleNamespace(rid="req-1", finished=lambda: True, _omni_data=object())
+
+    scheduler.stream_output([req])
+
+    assert calls == []
+    assert scheduler.outbox.empty()
+
+
 def test_omni_scheduler_abort_caps_aborted_id_set() -> None:
     """The aborted-id set is trimmed instead of growing without bound."""
     scheduler = object.__new__(OmniScheduler)

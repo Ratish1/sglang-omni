@@ -1313,6 +1313,11 @@ class OmniScheduler:
 
             # Build result payload from the Req
             data = req._omni_data
+            # Drain runner stream buffers before the terminal payload; both use
+            # this outbox, so the remaining chunks stay ahead of stream done.
+            model_runner = getattr(self, "_model_runner", None)
+            if model_runner is not None:
+                model_runner.on_request_finished(rid, data)
             data.output_ids = list(req.output_ids)
             data.weight_version = self.server_args.weight_version
             finished_reason = req.finished_reason

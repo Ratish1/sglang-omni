@@ -1942,6 +1942,63 @@ def test_post_process_outputs_batches_stream_transport_rows():
     assert torch.equal(reconstructed, rows)
 
 
+def test_on_request_finished_flushes_stream_tail_without_end_token():
+    """post_process_outputs only force-flushes on the end token, so a request
+    stopping for any other reason would strand its transport-batched tail."""
+    from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
+    from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
+
+    runner = MossTTSLocalModelRunner.__new__(MossTTSLocalModelRunner)
+    runner.model = types.SimpleNamespace(
+        config=types.SimpleNamespace(audio_end_token_id=151670)
+    )
+    messages = []
+    runner._outbox = types.SimpleNamespace(put=messages.append)
+    runner._vocoder_target = "vocoder"
+    data = types.SimpleNamespace(
+        req=None,
+        output_rows=[],
+        stream_metadata={"stream": True, "modality": "audio_codes", "n_vq": N_VQ},
+    )
+    sched_output = types.SimpleNamespace(
+        requests=[types.SimpleNamespace(request_id="r0", data=data)]
+    )
+    rows = torch.arange(3 * (N_VQ + 1), dtype=torch.long).reshape(3, N_VQ + 1)
+
+    for row in rows:
+        runner.post_process_outputs(
+            types.SimpleNamespace(
+                moss_journal=MossTTSLocalDecodeJournal(
+                    rids=["r0"], pool_rows=[0], rows=row.unsqueeze(0)
+                )
+            ),
+            sched_output,
+            # An ordinary token every step: the request never emits end_id, so
+            # nothing on this path force-flushes.
+            {"r0": types.SimpleNamespace(data=1000)},
+        )
+
+    # Frame 1 ships immediately to keep TTFP low; frames 2-3 stay buffered
+    # below MOSS_STREAM_TRANSPORT_BATCH_FRAMES.
+    assert [tuple(message.data.shape) for message in messages] == [(N_VQ + 1,)]
+    assert len(data.stream_pending_rows) == 2
+
+    runner.on_request_finished("r0", data)
+
+    assert [tuple(message.data.shape) for message in messages] == [
+        (N_VQ + 1,),
+        (2, N_VQ + 1),
+    ]
+    assert data.stream_pending_rows == []
+    reconstructed = torch.cat(
+        [
+            message.data.unsqueeze(0) if message.data.ndim == 1 else message.data
+            for message in messages
+        ]
+    )
+    assert torch.equal(reconstructed, rows)
+
+
 def test_finalize_skip_rids_selects_chunked_rows():
     pytest.importorskip("sglang")
     import types
