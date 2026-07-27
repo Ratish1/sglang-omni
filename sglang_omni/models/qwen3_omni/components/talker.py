@@ -1400,19 +1400,10 @@ class Qwen3OmniTalker(nn.Module):
         if extend_seq_lens is None:
             return torch.tensor([forward_batch.input_ids.shape[0] - 1], device=device)
 
-        if (
-            forward_batch.padded_static_len is not None
-            and forward_batch.padded_static_len >= 0
-        ):
-            idx = torch.arange(
-                len(extend_seq_lens), device=device, dtype=extend_seq_lens.dtype
-            )
-            return (
-                idx * forward_batch.padded_static_len
-                + extend_seq_lens.to(device=device)
-                - 1
-            )
-
+        # The static-padded variant that used ForwardBatch.padded_static_len is
+        # gone: only the EAGLE draft-extend graph runners ever set that field,
+        # and the talker refuses speculative decoding, so it was always -1 here.
+        # sglang 0.5.16 removed the field and the matching upstream branch.
         seq_lens = extend_seq_lens.to(device=device)
         return torch.cumsum(seq_lens, dim=0) - 1
 

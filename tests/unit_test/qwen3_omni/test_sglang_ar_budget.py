@@ -5,28 +5,27 @@ import logging
 from types import SimpleNamespace
 
 import pytest
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-    ModelRunnerKVCacheMixin,
-)
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 import sglang_omni.model_runner.sglang_model_runner as runner_mod
 import sglang_omni.models.qwen3_omni.bootstrap as qwen_bootstrap
 import sglang_omni.models.qwen3_omni.stages as qwen_stages
 
 
-class _BudgetTestRunner(runner_mod.SGLModelRunner):
-    @property
-    def mambaish_config(self) -> None:
-        return None
+def _configurator(*, total_gpu_memory_fraction: float | None):
+    """Build the profiling surface without upstream's full field set.
 
-
-def _runner(*, total_gpu_memory_fraction: float | None):
-    runner = _BudgetTestRunner.__new__(_BudgetTestRunner)
-    runner.gpu_id = 0
-    runner.mem_fraction_static = 0.9
-    runner._total_gpu_memory_fraction = total_gpu_memory_fraction
-    runner.is_draft_worker = False
-    return runner
+    ``_OmniKVCacheConfigurator`` is a slots dataclass with ~25 required fields,
+    so populate only the attributes ``_profile_available_bytes`` reads.
+    """
+    configurator = runner_mod._OmniKVCacheConfigurator.__new__(
+        runner_mod._OmniKVCacheConfigurator
+    )
+    configurator.gpu_id = 0
+    configurator.device = "cuda"
+    configurator.server_args = SimpleNamespace(mem_fraction_static=0.9)
+    configurator.total_gpu_memory_fraction = total_gpu_memory_fraction
+    return configurator
 
 
 def _patch_thinker_startup(monkeypatch) -> list[dict[str, object]]:
@@ -78,7 +77,7 @@ def _patch_thinker_startup(monkeypatch) -> list[dict[str, object]]:
 
 
 def test_colocated_ar_budget_uses_stage_total_fraction(monkeypatch) -> None:
-    runner = _runner(total_gpu_memory_fraction=0.4)
+    configurator = _configurator(total_gpu_memory_fraction=0.4)
     monkeypatch.setattr(
         runner_mod,
         "get_process_gpu_memory_bytes",
@@ -90,7 +89,7 @@ def test_colocated_ar_budget_uses_stage_total_fraction(monkeypatch) -> None:
         lambda gpu_id: SimpleNamespace(total_memory_bytes=100 * 1024**3),
     )
 
-    available = runner_mod.SGLModelRunner._profile_available_bytes(runner, 0)
+    available = configurator._profile_available_bytes(0)
 
     assert available == 10 * 1024**3
 
@@ -100,7 +99,7 @@ def test_colocated_ar_budget_uses_stage_load_delta_when_process_memory_unavailab
     monkeypatch,
     process_memory,
 ) -> None:
-    runner = _runner(total_gpu_memory_fraction=0.4)
+    configurator = _configurator(total_gpu_memory_fraction=0.4)
     monkeypatch.setattr(
         runner_mod,
         "get_process_gpu_memory_bytes",
@@ -118,32 +117,30 @@ def test_colocated_ar_budget_uses_stage_load_delta_when_process_memory_unavailab
         return 7 * 1024**3
 
     monkeypatch.setattr(
-        runner_mod.SGLModelRunner,
+        runner_mod._OmniKVCacheConfigurator,
         "_profile_available_bytes_from_stage_load_delta",
         _fake_stage_load_delta,
     )
 
-    assert runner_mod.SGLModelRunner._profile_available_bytes(runner, 95.0) == (
-        7 * 1024**3
-    )
+    assert configurator._profile_available_bytes(95.0) == 7 * 1024**3
 
 
 def test_non_colocated_ar_delegates_to_upstream_available_bytes(
     monkeypatch,
 ) -> None:
-    runner = _runner(total_gpu_memory_fraction=None)
+    configurator = _configurator(total_gpu_memory_fraction=None)
 
     def _fake_upstream_profile(self, pre_model_load_memory):
         assert pre_model_load_memory == 123
         return 456
 
     monkeypatch.setattr(
-        ModelRunnerKVCacheMixin,
+        KVCacheConfigurator,
         "_profile_available_bytes",
         _fake_upstream_profile,
     )
 
-    assert runner_mod.SGLModelRunner._profile_available_bytes(runner, 123) == 456
+    assert configurator._profile_available_bytes(123) == 456
 
 
 def test_qwen_ar_factory_derives_mem_fraction_from_total_budget() -> None:

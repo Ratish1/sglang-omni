@@ -93,7 +93,11 @@ class DllmScheduler:
                 continue
 
             resolve_deferred_prefill_inputs(batch, self.tp_worker.model_runner.device)
-            forward_batch = ForwardBatch.init_new(batch, self.tp_worker.model_runner)
+            forward_batch = ForwardBatch.init_new(
+                batch,
+                self.tp_worker.model_runner,
+                return_hidden_states_before_norm=False,
+            )
             batch_result = self.tp_worker.forward_batch_generation(forward_batch)
 
             batch.output_ids = batch_result.next_token_ids

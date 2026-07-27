@@ -27,11 +27,20 @@ def _install_fake_forward_batch_module(monkeypatch: pytest.MonkeyPatch) -> None:
 
     class ForwardBatch:
         @staticmethod
-        def init_new(model_worker_batch, model_runner):
-            del model_runner
+        def init_new(
+            model_worker_batch,
+            model_runner,
+            *,
+            capture_hidden_mode=None,
+            return_hidden_states_before_norm,
+        ):
+            # Mirrors the sglang 0.5.16 signature: both overrides are
+            # keyword-only and return_hidden_states_before_norm is required.
+            del model_runner, return_hidden_states_before_norm
             return SimpleNamespace(
                 input_ids=torch.tensor([1]),
                 marker=model_worker_batch.marker,
+                capture_hidden_mode=capture_hidden_mode,
             )
 
     forward_batch_info = types.ModuleType(
@@ -59,7 +68,6 @@ def _scheduler_output(*, is_prefill: bool):
         forward_mode=_ForwardMode(is_prefill=is_prefill),
         is_prefill_only=False,
         output_ids=None,
-        capture_hidden_mode=None,
         marker="worker-batch",
         prefill_input_ids_cpu=None,
         mix_running_indices=None,

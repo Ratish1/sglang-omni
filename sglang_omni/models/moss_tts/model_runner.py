@@ -6,8 +6,8 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.layers.sampler import multinomial_with_seed
-from sglang.srt.layers.utils.hash import murmur_hash32
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.request_builders import _INF_DELAY

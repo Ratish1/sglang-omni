@@ -5,7 +5,9 @@ SGLang 0.5.15 made the scheduler/worker boundary an explicit protocol:
 
 * decode tokens cross iterations through ``FutureMap``; and
 * decode lookahead isolates forward-only sampling state while
-  ``ForwardBatch.init_new`` consumes one-shot fields.
+  ``ForwardBatch.init_new`` applies per-forward overrides. (0.5.15 consumed
+  one-shot fields off the ScheduleBatch; 0.5.16 made them explicit keyword
+  arguments and forbids ``init_new`` from mutating the batch.)
 
 Omni owns its scheduler loop and model-runner wrapper, so it cannot rely on
 ``sglang.srt.managers.scheduler.Scheduler.run_batch`` to provide that protocol.

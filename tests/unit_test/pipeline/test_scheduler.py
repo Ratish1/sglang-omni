@@ -797,7 +797,7 @@ def test_omni_scheduler_distinguishes_queue_enter_from_prefill_start(
     req = SimpleNamespace(
         rid="req-delayed",
         origin_input_ids=[1, 2, 3],
-        sampling_params=SimpleNamespace(max_new_tokens=1),
+        sampling_params=SimpleNamespace(max_new_tokens=1, min_new_tokens=0),
         output_ids=[],
     )
     scheduler._request_builder = lambda payload: SimpleNamespace(req=req)
@@ -872,6 +872,8 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
         schedule_policy="fcfs",
         enable_hierarchical_cache=False,
         enable_hisparse=False,
+        enable_dp_attention=False,
+        enable_unified_memory=False,
         enable_priority_scheduling=False,
         disable_priority_preemption=False,
         schedule_low_priority_values_first=False,
@@ -965,6 +967,8 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
         schedule_policy="fcfs",
         enable_hierarchical_cache=False,
         enable_hisparse=False,
+        enable_dp_attention=False,
+        enable_unified_memory=False,
         enable_priority_scheduling=False,
         disable_priority_preemption=False,
         schedule_low_priority_values_first=False,
@@ -1119,11 +1123,12 @@ def test_omni_scheduler_prepares_custom_request_token_budget() -> None:
     scheduler._aborted_request_id_order = deque()
     scheduler.max_req_len = 6
     scheduler.max_req_input_len = 5
+    scheduler.max_new_tokens_limit = None
     scheduler.page_size = 1
     scheduler.max_total_num_tokens = 128
     _init_sync_request_build_state(scheduler)
 
-    sampling_params = SimpleNamespace(max_new_tokens=10)
+    sampling_params = SimpleNamespace(max_new_tokens=10, min_new_tokens=0)
     req = SimpleNamespace(
         rid="req-ok",
         origin_input_ids=[1, 2, 3],
@@ -1154,6 +1159,7 @@ def test_omni_scheduler_rejects_custom_request_over_context() -> None:
     scheduler._aborted_request_id_order = deque()
     scheduler.max_req_len = 6
     scheduler.max_req_input_len = 5
+    scheduler.max_new_tokens_limit = None
     scheduler.page_size = 1
     scheduler.max_total_num_tokens = 128
     scheduler.running_batch = SimpleNamespace(reqs=[], batch_is_full=False)
@@ -1169,7 +1175,7 @@ def test_omni_scheduler_rejects_custom_request_over_context() -> None:
     req = SimpleNamespace(
         rid="req-long",
         origin_input_ids=[1, 2, 3, 4, 5],
-        sampling_params=SimpleNamespace(max_new_tokens=10),
+        sampling_params=SimpleNamespace(max_new_tokens=10, min_new_tokens=0),
         output_ids=[],
     )
     scheduler._request_builder = lambda payload: SimpleNamespace(
@@ -1209,6 +1215,7 @@ def test_omni_scheduler_follower_rejections_do_not_emit_errors() -> None:
     scheduler.tree_cache = None
     scheduler.max_req_len = 6
     scheduler.max_req_input_len = 5
+    scheduler.max_new_tokens_limit = None
     scheduler.page_size = 1
     scheduler.max_total_num_tokens = 128
     scheduler.server_args = SimpleNamespace(mem_fraction_static=0.85)
@@ -1217,7 +1224,7 @@ def test_omni_scheduler_follower_rejections_do_not_emit_errors() -> None:
     over_context_req = SimpleNamespace(
         rid="req-long",
         origin_input_ids=[1, 2, 3, 4, 5],
-        sampling_params=SimpleNamespace(max_new_tokens=10),
+        sampling_params=SimpleNamespace(max_new_tokens=10, min_new_tokens=0),
         output_ids=[],
     )
     scheduler._request_builder = lambda payload: SimpleNamespace(
@@ -1233,7 +1240,7 @@ def test_omni_scheduler_follower_rejections_do_not_emit_errors() -> None:
     over_kv_req = SimpleNamespace(
         rid="req-kv",
         origin_input_ids=[1, 2, 3],
-        sampling_params=SimpleNamespace(max_new_tokens=4),
+        sampling_params=SimpleNamespace(max_new_tokens=4, min_new_tokens=0),
         output_ids=[],
     )
     scheduler._request_builder = lambda payload: SimpleNamespace(
@@ -1260,11 +1267,12 @@ def test_omni_scheduler_leaves_request_budget_unchanged_without_opt_in() -> None
     scheduler._aborted_request_id_order = deque()
     scheduler.max_req_len = 6
     scheduler.max_req_input_len = 5
+    scheduler.max_new_tokens_limit = None
     scheduler.page_size = 1
     scheduler.max_total_num_tokens = 128
     _init_sync_request_build_state(scheduler)
 
-    sampling_params = SimpleNamespace(max_new_tokens=3)
+    sampling_params = SimpleNamespace(max_new_tokens=3, min_new_tokens=0)
     req = SimpleNamespace(
         rid="req-original",
         origin_input_ids=[1, 2, 3],

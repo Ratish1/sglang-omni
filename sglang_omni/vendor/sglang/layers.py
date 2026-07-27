@@ -16,7 +16,15 @@ from typing import Optional, Tuple, Union
 import torch
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+# sglang 0.5.16 dropped the dp_attention.get_attention_tp_{rank,size} aliases.
+# Re-alias the parallel_state functions they forwarded to, so callers keep the
+# zero-arg spelling and the pre-0.5.16 semantics.
+from sglang.srt.distributed.parallel_state import (
+    get_attn_tensor_model_parallel_rank as get_attention_tp_rank,
+)
+from sglang.srt.distributed.parallel_state import (
+    get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,

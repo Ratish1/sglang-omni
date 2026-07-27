@@ -373,15 +373,19 @@ class ModelRunner:
                 schedule_batch, scheduler_output.requests
             )
         )
-        if capture_hidden_mode is not None:
-            model_worker_batch.capture_hidden_mode = capture_hidden_mode
-        elif self.output_processor._capture_hidden:
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        if capture_hidden_mode is None and self.output_processor._capture_hidden:
+            capture_hidden_mode = CaptureHiddenMode.LAST
 
         if getattr(self, "_execution_bridge", None) is None:
             resolve_deferred_prefill_inputs(schedule_batch, self.device)
+        # sglang 0.5.16 dropped ScheduleBatch.capture_hidden_mode: init_new no
+        # longer reads it off the batch, so setting it there is a dead write.
+        # Pass the per-forward override explicitly (None lets upstream derive it).
         forward_batch = ForwardBatch.init_new(
-            schedule_batch, self.tp_worker.model_runner
+            schedule_batch,
+            self.tp_worker.model_runner,
+            capture_hidden_mode=capture_hidden_mode,
+            return_hidden_states_before_norm=False,
         )
         return forward_batch, schedule_batch, model_worker_batch, is_prefill
 

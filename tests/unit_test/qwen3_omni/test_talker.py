@@ -1566,7 +1566,7 @@ def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) ->
     )
     monkeypatch.setattr(
         schedule_batch_mod,
-        "get_global_server_args",
+        "get_server_args",
         lambda: SimpleNamespace(enable_mamba_extra_buffer=lambda: False),
     )
 

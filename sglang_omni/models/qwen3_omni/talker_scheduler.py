@@ -7,8 +7,6 @@ import logging
 from collections import deque
 from typing import Any
 
-from sglang.srt.managers.scheduler import Scheduler as _Upstream
-
 from sglang_omni.models.qwen3_omni.config import MIN_PARTIAL_START_CHUNKS
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 
@@ -108,7 +106,9 @@ class QwenTalkerScheduler(OmniScheduler):
         return True
 
     def get_next_batch_to_run(self) -> Any | None:
-        batch = _Upstream.get_next_batch_to_run(self)
+        # Via OmniScheduler, which supplies running_batch/last_batch and unpacks
+        # the 0.5.16 NextBatchPlan.
+        batch = super().get_next_batch_to_run()
         if batch is not None and not self._is_batch_ready_to_run(batch):
             self._rollback_decode_prep_after_skip(batch)
             return None

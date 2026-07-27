@@ -26,7 +26,12 @@ from typing import Any, Callable
 import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    NextBatchPlan,
+    ScheduleBatch,
+    retract_all,
+)
 from sglang.srt.managers.scheduler import Scheduler as _Upstream
 from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -465,6 +470,30 @@ class OmniScheduler:
         self.use_ngram_embedding = False
         self.return_health_check_ipcs = []
         self.enable_overlap_mlx = False
+
+        # Instance state introduced by SGLang 0.5.16's Scheduler.__init__. We
+        # borrow upstream methods rather than inheriting, so anything they read
+        # off ``self`` has to be mirrored here or __getattr__ raises.
+        # init_req_max_new_tokens() clamps against this one.
+        self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
+        self.enable_dp_attention = bool(server_args.enable_dp_attention)
+        self.enable_unified_memory = bool(server_args.enable_unified_memory)
+        self.cur_batch_for_debug = None
+        self._last_logged_elastic_radix_namespace = None
+        # Speculative decoding is refused by this scheduler, so the confidence
+        # relay stays at its upstream "disabled" value.
+        self._confidence_budget_prepare = None
+        # get_next_batch_to_run() calls prepare_for_forward() on this
+        # unconditionally, so it must be a real manager, not None. Upstream
+        # takes it from the model runner; no Omni model uses ngram embedding
+        # (see use_ngram_embedding above), so a disabled passthrough is correct.
+        from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (  # noqa: E501
+            NgramEmbeddingManager,
+        )
+
+        self.ngram_embedding_manager = NgramEmbeddingManager(
+            enabled=False, table=None, n=0, k=0
+        )
         # Upstream scheduler_runtime_checker_mixin._streaming_session_count
         # iterates ``self.session_controller.sessions.values()`` during
         # report_decode_stats. We don't host SGLang's interactive-session
@@ -1063,18 +1092,35 @@ class OmniScheduler:
             )
         )
 
-    def get_new_batch_prefill(self):
+    def get_next_batch_to_run(self):
+        """Bridge Omni's batch-owning loops to the 0.5.16 scheduler contract.
+
+        0.5.16 stopped reading ``running_batch``/``last_batch`` off ``self`` and
+        now returns a ``NextBatchPlan`` instead of the batch. Omni's event loops
+        own that state, so feed it in and write the (possibly rebuilt) running
+        batch back before handing the runnable batch to the caller.
+        """
+        plan = _Upstream.get_next_batch_to_run(
+            self, self.running_batch, self.last_batch
+        )
+        self.running_batch = plan.running_batch
+        return plan.batch_to_run
+
+    def get_new_batch_prefill(self, running_batch):
         # Note: (maydomine) batch prefill admissions to amortize the fixed step
         # cost; the oldest-request deadline survives partial admission and aborts.
+        #
+        # 0.5.16 passes ``running_batch`` in and expects a ``NextBatchPlan`` back,
+        # so the coalesce hold-off returns an empty plan rather than None.
         if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
-            return _Upstream.get_new_batch_prefill(self)
+            return _Upstream.get_new_batch_prefill(self, running_batch)
         if not self.prefill_coalesce_when_idle and (
-            self.running_batch is None or self.running_batch.is_empty()
+            running_batch is None or running_batch.is_empty()
         ):
-            return _Upstream.get_new_batch_prefill(self)
+            return _Upstream.get_new_batch_prefill(self, running_batch)
         waiting = self.waiting_queue
         if not waiting or len(waiting) >= self.prefill_coalesce_requests:
-            return _Upstream.get_new_batch_prefill(self)
+            return _Upstream.get_new_batch_prefill(self, running_batch)
         now = time.perf_counter()
         oldest = now
         for req in waiting:
@@ -1083,8 +1129,8 @@ class OmniScheduler:
                 t = req._coalesce_enqueue_t = now
             oldest = min(oldest, t)
         if now - oldest >= self.prefill_coalesce_wait_s:
-            return _Upstream.get_new_batch_prefill(self)
-        return None
+            return _Upstream.get_new_batch_prefill(self, running_batch)
+        return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
     def run_batch(self, batch, pp_proxy_tensors=None):
         try:
@@ -1866,7 +1912,19 @@ class OmniScheduler:
         batch.filter_batch(v1_spec_info_filtered=True)
         if len(batch.reqs) == 0:
             return 0
-        retracted_reqs = batch.retract_all(self.server_args)
+        # sglang 0.5.16 dropped ScheduleBatch.retract_all; the module-level
+        # function returns None and leaves batch.reqs in place, so snapshot the
+        # requests and clear the batch here (what the old method did for us).
+        retracted_reqs = list(batch.reqs)
+        retract_all(
+            reqs=batch.reqs,
+            server_args=self.server_args,
+            req_to_token_pool=batch.req_to_token_pool,
+            token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+            tree_cache=batch.tree_cache,
+            hisparse_coordinator=batch.hisparse_coordinator,
+        )
+        batch.reqs = []
         add_to_queue = getattr(self, "_add_request_to_queue", None)
         for req in retracted_reqs:
             if callable(add_to_queue):
