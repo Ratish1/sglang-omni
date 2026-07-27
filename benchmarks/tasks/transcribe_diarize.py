@@ -49,6 +49,8 @@ class PerSampleRecord(TypedDict):
     result_normalized: str
     is_exact_match: bool
     latency_s: float | None
+    text_ttft_s: float | None
+    n_text_chunks: int | None
     audio_duration_s: float | None
     error: str | None
     cer_no_spk: float | None
@@ -230,6 +232,21 @@ def build_evaluation_payload(
                 "result_normalized": actual_norm,
                 "is_exact_match": is_exact_match,
                 "latency_s": result.latency_s if result else None,
+                # Diagnostic: streaming deltas are throttled to a fixed
+                # interval, so inter_chunk_* measures the throttle, not the
+                # model. The chunk count is what separates "generation got
+                # slower" (more chunks) from "the tail got slower" (same
+                # count). Export-only; no timing or control flow changes.
+                "text_ttft_s": (
+                    result.text_ttft_s
+                    if result and getattr(result, "text_ttft_s", None) is not None
+                    else None
+                ),
+                "n_text_chunks": (
+                    len(result.inter_chunk_s) + 1
+                    if result and getattr(result, "text_ttft_s", None) is not None
+                    else None
+                ),
                 "audio_duration_s": result.audio_duration_s if result else None,
                 "error": result.error if result and result.error else None,
                 "cer_no_spk": (
