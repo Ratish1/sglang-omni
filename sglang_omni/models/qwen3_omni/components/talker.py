@@ -1372,6 +1372,13 @@ class Qwen3OmniTalker(nn.Module):
             # Keep sampler control flow static during graph capture while
             # preserving SGLang's actual sampling kernel semantics.
             is_all_greedy=False,
+            # Added by 0.5.16 as a required field. Only the dspark speculative
+            # verify path reads it (the regular sampler branches on
+            # is_all_greedy alone), and this scheduler refuses speculative
+            # decoding, so False is inert here -- it also matches what upstream
+            # itself passes for the equivalent static, capture-time info in
+            # eagle_draft_cuda_graph_runner.
+            is_any_greedy=False,
             need_top_p_sampling=True,
             need_top_k_sampling=True,
             need_min_p_sampling=False,
