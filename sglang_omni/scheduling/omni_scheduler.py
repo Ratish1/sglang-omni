@@ -724,6 +724,8 @@ class OmniScheduler:
             moe_ep_size=self.moe_ep_size,
             moe_dp_rank=self.moe_dp_rank,
             moe_dp_size=self.moe_dp_size,
+            # Added by 0.5.16; upstream sources it from server_args.
+            dcp_size=self.server_args.dcp_size,
             gpu_id=self.gpu_id,
         )
 

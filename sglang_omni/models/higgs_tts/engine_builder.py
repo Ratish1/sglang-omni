@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-from types import SimpleNamespace
 from typing import Any
 
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
@@ -177,18 +176,23 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
                 f"full backend, got {prefill_backend!r}"
             )
 
-        # SGLang 0.5.15's prefill graph discovery requires an outer ``.model``
-        # attribute before it consults the more general ``.language_model``
-        # contract. Higgs is a composition wrapper around Qwen3ForCausalLM and
-        # intentionally exposes neither name. Install non-module discovery
-        # views only for graph construction; post_cuda_graph_setup removes
-        # them, while PrefillCudaGraphRunner retains the resolved layer model.
+        # Higgs is a composition wrapper around Qwen3ForCausalLM and exposes
+        # neither name SGLang's prefill graph discovery looks for, so install a
+        # ``language_model`` view just for graph construction;
+        # post_cuda_graph_setup removes it, while PrefillCudaGraphRunner retains
+        # the resolved layer model.
+        #
+        # Only ``language_model``: 0.5.15 read that attribute independently of
+        # resolve_language_model(), so a placeholder ``.model`` was also needed
+        # to keep that helper from raising. 0.5.16 instead *uses* the helper's
+        # return value, and it checks ``.model`` before ``.language_model`` —
+        # a placeholder there would win and dead-end discovery on an object
+        # with no ``layers``, silently disabling the prefill graph.
         if hasattr(self.model, "model") or hasattr(self.model, "language_model"):
             raise RuntimeError(
                 "Higgs prefill CUDA graph discovery contract changed; "
                 "refusing to capture against ambiguous model aliases"
             )
-        object.__setattr__(self.model, "model", SimpleNamespace())
         object.__setattr__(self.model, "language_model", self.model.backbone)
         self._prefill_graph_model_runner = model_runner
 
