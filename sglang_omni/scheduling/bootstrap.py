@@ -47,6 +47,7 @@ def create_sglang_infrastructure(
         install_hidden_capture_hooks(model, capture_hidden_layers)
 
     # SGLang 0.5.15 split model loading, KV-pool allocation, attention-backend
+    # (order re-verified against 0.5.16 Scheduler.init_model_worker)
     # initialization, and CUDA-graph initialization into explicit phases. Keep
     # the same order as upstream's Scheduler.init_model_worker(), while
     # preserving Omni's pre-backend hidden-capture hook installation above.
@@ -55,8 +56,8 @@ def create_sglang_infrastructure(
     model_runner.init_attention_backends()
 
     if not defer_cuda_graph_capture:
-        # This is required even when graphs are disabled: 0.5.15 installs the
-        # eager phase runner from init_cuda_graphs().
+        # This is required even when graphs are disabled: SGLang installs
+        # the eager phase runner from init_cuda_graphs().
         model_runner.init_cuda_graphs()
 
     req_to_token_pool, token_to_kv_pool_allocator = model_worker.get_memory_pool()

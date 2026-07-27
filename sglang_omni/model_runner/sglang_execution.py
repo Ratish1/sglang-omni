@@ -49,7 +49,7 @@ def attn_forward_context(attn_backend: Any):
 
 
 class SGLangExecutionBridge:
-    """Adapt Omni's custom runner to SGLang's 0.5.15 execution contract."""
+    """Adapt Omni's custom runner to SGLang's 0.5.16 execution contract."""
 
     def __init__(
         self,
