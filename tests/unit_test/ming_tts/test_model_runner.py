@@ -6,6 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from sglang.srt.model_executor.forward_context import (
+    get_forward_context,
+    has_forward_context,
+)
 
 from sglang_omni.models.ming_tts.engine_builder import MingTtsEngineBuilder
 from sglang_omni.models.ming_tts.model_runner import (
@@ -228,3 +232,33 @@ def test_ming_decoder_scopes_mlp_collective_flags(
     assert getattr(output, "_sglang_needs_allreduce_fusion", False) is (
         fuse_mlp_allreduce
     )
+
+
+def test_prefill_forward_publishes_sglang_forward_context() -> None:
+    runner = MingTTSModelRunner.__new__(MingTTSModelRunner)
+    attn_backend = SimpleNamespace(init_forward_metadata=lambda _batch: None)
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(attn_backend=attn_backend)
+    )
+
+    seen = []
+
+    def model(**kwargs):
+        seen.append(get_forward_context().attn_backend)
+        return "logits"
+
+    model._decode_input_embedding = SimpleNamespace(
+        weight=torch.zeros(1, dtype=torch.float32)
+    )
+    runner.model = model
+    forward_batch = SimpleNamespace(
+        positions=torch.tensor([0]),
+        mrope_positions=None,
+        input_ids=torch.tensor([1]),
+    )
+
+    assert not has_forward_context()
+    result = runner._forward_with_input_embeds(forward_batch, torch.ones(1, 2))
+
+    assert seen == [attn_backend]
+    assert result.logits_output == "logits"

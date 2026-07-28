@@ -2259,3 +2259,38 @@ def test_qwen3_tts_cli_rejects_unsupported_thinker_mem_fraction() -> None:
             thinker_mem_fraction_static=0.5,
             talker_mem_fraction_static=None,
         )
+
+
+def test_qwen3_tts_prefill_publishes_sglang_forward_context() -> None:
+    from sglang.srt.model_executor.forward_context import (
+        get_forward_context,
+        has_forward_context,
+    )
+
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    attn_backend = SimpleNamespace(init_forward_metadata=lambda _batch: None)
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(attn_backend=attn_backend)
+    )
+
+    seen = []
+
+    def model(**kwargs):
+        seen.append(get_forward_context().attn_backend)
+        return "logits"
+
+    model.parameters = lambda: iter([torch.zeros(1, dtype=torch.float32)])
+    runner.model = model
+    forward_batch = SimpleNamespace(
+        positions=torch.tensor([0]),
+        mrope_positions=None,
+        input_ids=torch.tensor([1]),
+    )
+
+    assert not has_forward_context()
+    result = runner._forward_with_input_embeds(forward_batch, torch.ones(1, 2))
+
+    assert seen == [attn_backend]
+    assert result.logits_output == "logits"
