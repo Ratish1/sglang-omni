@@ -18,6 +18,7 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from sglang_omni.scheduling.types import ModelRunnerOutput
+from tests.unit_test.fakes import FakeServerArgs
 from tests.unit_test.pipeline.helpers import run_scheduler
 
 
@@ -920,7 +921,6 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     [
         (False, True, False),
         (True, False, False),
-        (True, True, False),
         (False, True, True),
     ],
 )
@@ -957,7 +957,7 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
     )
     monkeypatch.setattr(
         "sglang.srt.server_args.get_global_server_args",
-        lambda: SimpleNamespace(pp_max_micro_batch_size=None),
+        lambda: FakeServerArgs(pp_max_micro_batch_size=None),
     )
 
     observed = []
@@ -977,7 +977,11 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
     tp_worker = SimpleNamespace(
         gpu_id=0,
         tp_rank=0,
-        model_runner=SimpleNamespace(max_total_num_tokens=128),
+        model_runner=SimpleNamespace(
+            max_total_num_tokens=128,
+            effective_max_total_num_tokens=64,
+            max_running_requests=1,
+        ),
         random_seed=0,
         device=torch.device("cpu"),
     )
@@ -1024,6 +1028,65 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
 
     assert observed == [scheduler._execution_bridge]
     assert model_runner._async_enabled is enable_async_decode
+
+
+def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
+    """The async loop reuses the overlap batch-result contract; enabling both
+    would leak KV for finished requests, so construction must refuse."""
+    monkeypatch.setattr(
+        OmniScheduler,
+        "_init_parallel_state",
+        lambda self, _tp_worker: setattr(self, "ps", SimpleNamespace(pp_size=1)),
+    )
+    tp_worker = SimpleNamespace(
+        gpu_id=0,
+        tp_rank=0,
+        model_runner=SimpleNamespace(
+            max_total_num_tokens=128,
+            effective_max_total_num_tokens=64,
+            max_running_requests=1,
+        ),
+        random_seed=0,
+        device=torch.device("cpu"),
+    )
+    server_args = SimpleNamespace(
+        tp_size=1,
+        pp_size=1,
+        dp_size=1,
+        moe_dp_size=1,
+        attn_cp_size=1,
+        dcp_size=1,
+        page_size=1,
+        max_prefill_tokens=32,
+        max_running_requests=2,
+        max_queued_requests=7,
+        context_length=128,
+        chunked_prefill_size=0,
+        enable_mixed_chunk=False,
+        schedule_policy="fcfs",
+        enable_hierarchical_cache=False,
+        enable_hisparse=False,
+        enable_dp_attention=False,
+        enable_priority_scheduling=False,
+        disable_priority_preemption=False,
+        schedule_low_priority_values_first=False,
+        priority_scheduling_preemption_threshold=0,
+        schedule_conservativeness=1.0,
+        enable_metrics=False,
+        enable_metrics_for_all_schedulers=False,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        OmniScheduler(
+            tp_worker=tp_worker,
+            tree_cache=None,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            server_args=server_args,
+            model_config=SimpleNamespace(),
+            enable_overlap=True,
+            enable_async_decode=True,
+        )
 
 
 def test_stage_output_cache_eviction_uses_lru_order() -> None:
