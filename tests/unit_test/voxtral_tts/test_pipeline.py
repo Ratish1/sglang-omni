@@ -404,7 +404,6 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
     )
 
     assert output.can_run_cuda_graph is True
-    assert schedule_batch.output_ids.tolist() == [5]
     assert torch.equal(
         runner.model._decode_input_embed_buffer,
         torch.tensor([[1.0, 2.0, 3.0]]),

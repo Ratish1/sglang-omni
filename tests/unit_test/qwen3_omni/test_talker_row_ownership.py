@@ -246,7 +246,7 @@ def test_row_ownership_tracks_current_batch_order_across_steps() -> None:
 
 
 def test_make_batch_result_requires_declared_host_token_ids() -> None:
-    malformed_output = SimpleNamespace(can_run_cuda_graph=False)
+    malformed_output = SimpleNamespace(next_token_ids=None, can_run_cuda_graph=False)
 
     with pytest.raises(AttributeError, match="host_token_ids"):
         OmniScheduler._make_batch_result(malformed_output)

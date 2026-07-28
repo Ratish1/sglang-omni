@@ -176,8 +176,8 @@ def test_query_miss_falls_back_to_synchronize():
 
 def test_resolve_recomputes_finished_overrun_skip_rids():
     r = _StubRunner()
-    keep_req = types.SimpleNamespace(finished=lambda: False)
-    skip_req = types.SimpleNamespace(finished=lambda: True)
+    keep_req = types.SimpleNamespace(finished=lambda: False, is_retracted=False)
+    skip_req = types.SimpleNamespace(finished=lambda: True, is_retracted=False)
     sched_output = SchedulerOutput(
         requests=[
             types.SimpleNamespace(
