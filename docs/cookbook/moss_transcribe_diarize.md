@@ -239,7 +239,7 @@ Here we provide the benchmark results of movies800times and aishell4_long on a s
 - **RTF mean** — Average ratio of processing time to input audio duration per request. `<1` is faster than real time.
 - **audio_s/s** — Total seconds of input audio processed divided by total benchmark wall-clock time.
 
-To reproduce the results, follow the commands above or the entry point in [`benchmark_asr_transcribe_diarize.py`](https://github.com/sgl-project/sglang-omni/blob/main/benchmarks/eval/benchmark_asr_transcribe_diarize.py).
+These results were measured with `mem_fraction_static=0.80`; the launch commands above now default to `0.70`, so set the memory fraction back to `0.80` when reproducing these exact numbers. Otherwise follow the commands above or the entry point in [`benchmark_asr_transcribe_diarize.py`](https://github.com/sgl-project/sglang-omni/blob/main/benchmarks/eval/benchmark_asr_transcribe_diarize.py).
 
 ## Acknowledgments
 

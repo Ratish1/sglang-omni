@@ -75,13 +75,11 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         features = [item.feature for item in items]
         masks = [getattr(item, "feature_attention_mask", None) for item in items]
 
-        # SGLang 0.5.16 batches the per-item cache misses into a single
-        # data_embedding_func call (_batch_encode_per_image_misses); 0.5.12
-        # called this once per item, so the cat below always saw one tensor
-        # and never had to agree on a frame count. Mel frames are padded
-        # per-request, so a mixed-length batch now raises. Pad to the batch
-        # max: every frame added here is masked out before the audio tower
-        # runs, so it sees exactly the frames it saw one-at-a-time.
+        # SGLang batches every cache miss in the forward batch into a single
+        # data_embedding_func call (_batch_encode_per_image_misses), so
+        # mixed-length mel features must agree on a frame count. Pad to the
+        # batch max: every frame added here is masked out before the audio
+        # tower runs, so it sees exactly the frames it saw one-at-a-time.
         frame_lens = [feature.shape[-1] for feature in features]
         max_frames = max(frame_lens)
         has_mask = any(mask is not None for mask in masks)
@@ -101,8 +99,8 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                         f"{(feature.shape[0], length)}"
                     )
                 else:
-                    # SGLang 0.5.16 moves the feature tensor to the model
-                    # device but can leave the item's attention mask on CPU.
+                    # Item masks can arrive on CPU while features are already
+                    # on the model device; move for the cat below.
                     mask = mask.to(device=device)
                 normalized_masks.append(
                     nn.functional.pad(mask, (0, max_frames - length))

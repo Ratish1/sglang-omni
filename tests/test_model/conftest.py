@@ -233,8 +233,9 @@ def _start_qwen3_omni_tp2(
 
     model_path = QWEN3_OMNI_TEST_MODEL_PATH
     is_short_thinker_context = thinker_max_seq_len != QWEN3_OMNI_TP2_THINKER_MAX_SEQ_LEN
-    # Shortening the context reduces KV-cache use, but SGLang 0.5.15 also
-    # requires this fraction to cover the BF16 model weights themselves.
+    # Shortening the context reduces KV-cache use, but SGLang 0.5.16 errors
+    # out at startup unless this fraction also covers the BF16 model weights
+    # themselves (KVCacheConfigurator refuses negative KV headroom).
     thinker_mem_fraction = QWEN3_OMNI_TP2_THINKER_MEM_FRACTION
     extra_args = [
         "--thinker-tp-size",
@@ -262,7 +263,7 @@ def _start_qwen3_omni_tp2(
         model_path=model_path,
         extra_args=extra_args,
         thinker_max_seq_len=thinker_max_seq_len,
-        # SGLang 0.5.15 may cold-JIT the FlashInfer fused-MoE kernels on the
+        # SGLang 0.5.16 may cold-JIT the FlashInfer fused-MoE kernels on the
         # first H100 startup; keep this within the workflow's 20-minute budget.
         timeout=1200,
         log_prefix="server_logs_tp2_ci",

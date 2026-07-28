@@ -129,7 +129,7 @@ def _aggregate_stage(
 
 
 def _thinker_stage(*, gpu: int, speech_enabled: bool, process: str) -> StageConfig:
-    # Async decode is the upstream default; --decode-mode sync overrides it.
+    # note (jiaxin deng): async decode defaults on; --decode-mode sync overrides it.
     factory_args = {"thinker_max_seq_len": 8192, "enable_async_decode": True}
     if speech_enabled:
         factory_args["speech_enabled"] = True

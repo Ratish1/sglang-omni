@@ -3,21 +3,21 @@
 
 SGLang 0.5.15 made the scheduler/worker boundary an explicit protocol:
 
-* decode tokens cross iterations through ``FutureMap``; and
+* decode tokens cross iterations through FutureMap; and
 * decode lookahead isolates forward-only sampling state while
-  ``ForwardBatch.init_new`` applies per-forward overrides. (0.5.15 consumed
+  ForwardBatch.init_new applies per-forward overrides. (0.5.15 consumed
   one-shot fields off the ScheduleBatch; 0.5.16 made them explicit keyword
-  arguments and forbids ``init_new`` from mutating the batch.)
+  arguments and forbids init_new from mutating the batch.)
 
 Omni owns its scheduler loop and model-runner wrapper, so it cannot rely on
-``sglang.srt.managers.scheduler.Scheduler.run_batch`` to provide that protocol.
+sglang.srt.managers.scheduler.Scheduler.run_batch to provide that protocol.
 This adapter is the single compatibility boundary used by both synchronous and
 lookahead execution.
 
 Upstream's protocol also splits scheduler writes and model forwards onto
 separate CUDA streams, fenced by the decode CUDA-graph read-done event. That
 two-stream contract belongs to the upstream-style overlap loop, which Omni
-refuses to run (``OmniScheduler._event_loop_overlap`` raises), so this bridge
+refuses to run (OmniScheduler._event_loop_overlap raises), so this bridge
 is deliberately single-stream: launch-current/resolve-previous on one stream.
 """
 
@@ -31,11 +31,12 @@ import torch
 
 
 def attn_forward_context(attn_backend: Any):
-    """Enter SGLang's ambient ``ForwardContext`` unless one is already active.
+    """Enter SGLang's ambient ForwardContext unless one is already active.
 
-    0.5.15 attention backends read the context that ``Scheduler.run_batch``
-    installs; Omni's wrapped forwards run outside that loop, so each wrapper
-    enters the context itself when no caller has.
+    Attention backends read the context that ModelRunner._forward_raw
+    installs; Omni's wrapped forwards call the model directly, outside
+    _forward_raw, so each wrapper enters the context itself when no
+    caller has.
     """
     from sglang.srt.model_executor.forward_context import (
         ForwardContext,
@@ -102,7 +103,7 @@ class SGLangExecutionBridge:
         batch: Any,
         next_token_ids: torch.Tensor | None,
     ) -> None:
-        """Publish one forward's GPU token relay and retire live ``input_ids``."""
+        """Publish one forward's GPU token relay and retire live input_ids."""
         if next_token_ids is None:
             return
         if next_token_ids.device != self.device:

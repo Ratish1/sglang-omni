@@ -27,12 +27,10 @@ _PATCHED_FLAG = "_sglang_omni_hf_parity_patched"
 # half-patched class.
 _APPLY_LOCK = threading.Lock()
 
-# Released sglang versions whose Qwen3VLMoeVisionModel layout and dependency
+# Released sglang version whose Qwen3VLMoeVisionModel layout and dependency
 # pins match the patch. Dev builds (``0.0.0.dev1+...``) are accepted with a
 # warning since they are unversioned snapshots that may or may not match.
-_SUPPORTED_SGLANG_VERSIONS: frozenset[str] = frozenset(
-    {"0.5.12.post1", "0.5.15.post1", "0.5.16"}
-)
+_SUPPORTED_SGLANG_VERSIONS: frozenset[str] = frozenset({"0.5.16"})
 
 # Instance attributes the patch reads; preflight checks each is present
 # either as a class-level descriptor or as a self.<name> = assignment in
@@ -173,8 +171,8 @@ def _check_sglang_version() -> None:
             "sglang import failed; cannot apply HF-parity patches."
         ) from exc
 
-    version = getattr(sglang, "__version__", None)
-    if version is None or _is_dev_version(version):
+    version = sglang.__version__
+    if _is_dev_version(version):
         logger.warning(
             "sglang version %r is a dev build; assuming layout is "
             "compatible with %s. Pin to a supported release if you see "
