@@ -251,7 +251,7 @@ class ThinkerModelRunner(ModelRunner):
                     deepstack_visual_embeds_list.append(ds_embeds)
                     visual_pos_masks_list.append(global_mask)
 
-            if req.is_chunked == 0:
+            if req.inflight_middle_chunks == 0:
                 req.omni_model_inputs = None
                 req._omni_consumed = None
 

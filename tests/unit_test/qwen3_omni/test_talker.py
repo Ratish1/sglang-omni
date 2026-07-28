@@ -1641,7 +1641,7 @@ def test_qwen_model_runner_and_code_predictor_tensor_contracts() -> None:
             "pad_values": {"audio": 999},
         },
         _omni_consumed=None,
-        is_chunked=0,
+        inflight_middle_chunks=0,
     )
     input_embeds, _, _ = runner._inject_multimodal_embeds(
         SimpleNamespace(input_ids=torch.tensor([1, 999, 2]), extend_seq_lens_cpu=[3]),
@@ -1807,7 +1807,11 @@ def test_projected_prefill_reads_tensor_from_data() -> None:
     sched_req = _sched_req(
         input_embeds_are_projected=True,
         prefill_input_embeds=embeds,
-        req=SimpleNamespace(input_embeds=None, prefix_indices=[], extend_input_len=10),
+        req=SimpleNamespace(
+            input_embeds=None,
+            prefix_indices=[],
+            extend_range=SimpleNamespace(length=10),
+        ),
     )
     forward_batch = SimpleNamespace(
         input_embeds=None,
@@ -1838,7 +1842,7 @@ def test_projected_prefill_slices_tensor_by_prefix_indices() -> None:
         req=SimpleNamespace(
             input_embeds=None,
             prefix_indices=list(range(prefix_len)),
-            extend_input_len=7,
+            extend_range=SimpleNamespace(length=7),
         ),
     )
     forward_batch = SimpleNamespace(
@@ -1862,7 +1866,7 @@ def test_projected_prefill_slices_tensor_by_prefix_indices() -> None:
     assert torch.equal(result._embeds, expected)
 
 
-def test_projected_prefill_slices_tensor_by_extend_input_len() -> None:
+def test_projected_prefill_slices_tensor_by_extend_range() -> None:
     """Tensor path slices by prefix and extend length, matching SGLang prefill."""
     full_embeds = torch.randn(10, 64)
     prefix_len = 3
@@ -1873,7 +1877,7 @@ def test_projected_prefill_slices_tensor_by_extend_input_len() -> None:
         req=SimpleNamespace(
             input_embeds=None,
             prefix_indices=list(range(prefix_len)),
-            extend_input_len=extend_len,
+            extend_range=SimpleNamespace(length=extend_len),
         ),
     )
     forward_batch = SimpleNamespace(
@@ -1897,7 +1901,7 @@ def test_projected_prefill_slices_tensor_by_extend_input_len() -> None:
     assert torch.equal(result._embeds, expected)
 
 
-def test_projected_prefill_list_fallback_slices_by_extend_input_len() -> None:
+def test_projected_prefill_list_fallback_slices_by_extend_range() -> None:
     """List fallback keeps the same prefill slice contract as the tensor path."""
     full_embeds = torch.randn(10, 64)
     prefix_len = 2
@@ -1908,7 +1912,7 @@ def test_projected_prefill_list_fallback_slices_by_extend_input_len() -> None:
         req=SimpleNamespace(
             input_embeds=full_embeds.tolist(),
             prefix_indices=list(range(prefix_len)),
-            extend_input_len=extend_len,
+            extend_range=SimpleNamespace(length=extend_len),
         ),
     )
     forward_batch = SimpleNamespace(
@@ -1939,7 +1943,9 @@ def test_projected_prefill_prefers_request_data_over_forward_embeds() -> None:
     sched_req = _sched_req(
         input_embeds_are_projected=True,
         prefill_input_embeds=embeds,
-        req=SimpleNamespace(input_embeds=None, prefix_indices=[], extend_input_len=4),
+        req=SimpleNamespace(
+            input_embeds=None, prefix_indices=[], extend_range=SimpleNamespace(length=4)
+        ),
     )
     forward_batch = SimpleNamespace(
         input_embeds=stale_forward_embeds,
@@ -1998,7 +2004,9 @@ def test_projected_prefill_rejects_mixed_projected_and_list_batch() -> None:
     projected_req = _sched_req(
         input_embeds_are_projected=True,
         prefill_input_embeds=torch.randn(2, 8),
-        req=SimpleNamespace(input_embeds=None, prefix_indices=[], extend_input_len=2),
+        req=SimpleNamespace(
+            input_embeds=None, prefix_indices=[], extend_range=SimpleNamespace(length=2)
+        ),
     )
     list_req = _sched_req(
         input_embeds_are_projected=False,
@@ -2006,7 +2014,7 @@ def test_projected_prefill_rejects_mixed_projected_and_list_batch() -> None:
         req=SimpleNamespace(
             input_embeds=torch.randn(2, 8).tolist(),
             prefix_indices=[],
-            extend_input_len=2,
+            extend_range=SimpleNamespace(length=2),
         ),
     )
     forward_batch = SimpleNamespace(
@@ -2029,7 +2037,9 @@ def test_projected_prefill_full_prefix_hit_returns_none() -> None:
         input_embeds_are_projected=True,
         prefill_input_embeds=embeds,
         req=SimpleNamespace(
-            input_embeds=None, prefix_indices=list(range(5)), extend_input_len=0
+            input_embeds=None,
+            prefix_indices=list(range(5)),
+            extend_range=SimpleNamespace(length=0),
         ),
     )
     forward_batch = SimpleNamespace(
@@ -2078,7 +2088,7 @@ def test_projected_prefill_survives_decode_retract() -> None:
         req=SimpleNamespace(
             input_embeds=None,
             prefix_indices=[],
-            extend_input_len=10,
+            extend_range=SimpleNamespace(length=10),
         ),
         pending_feedback_queue=deque(),
         pending_text_queue=deque(),
@@ -2111,7 +2121,7 @@ def test_projected_prefill_survives_decode_retract() -> None:
     )
 
     sched_req.data.req.prefix_indices = []
-    sched_req.data.req.extend_input_len = 10
+    sched_req.data.req.extend_range = SimpleNamespace(length=10)
 
     second = runner._run_projected_prefill_forward(
         forward_batch, schedule_batch=None, requests=[sched_req]
@@ -2163,7 +2173,7 @@ def test_projected_prefill_retract_replays_generated_decode_inputs() -> None:
         req=SimpleNamespace(
             input_embeds=None,
             prefix_indices=list(range(8)),
-            extend_input_len=5,
+            extend_range=SimpleNamespace(length=5),
             output_ids=[11, 12, 13],
         ),
     )

@@ -169,7 +169,7 @@ class MossTTSLocalModelRunner(ModelRunner):
             rows = data.prompt_rows
             if rows is None:
                 raise RuntimeError("MOSS-TTS Local prefill requires prompt_rows")
-            req_len = int(req.extend_input_len)
+            req_len = int(req.extend_range.length)
             prefix_len = len(req.prefix_indices)
             pool = self.model._state_pool
             if data.output_rows:
@@ -559,10 +559,10 @@ class MossTTSLocalModelRunner(ModelRunner):
         if req is None:
             return False
         try:
-            is_chunked = req.is_chunked
+            middle_chunks = req.inflight_middle_chunks
         except AttributeError:
             return False
-        return int(is_chunked) > 0
+        return int(middle_chunks) > 0
 
     def finalize_skip_rids(self, scheduler_output) -> set[str]:
         """Non-final chunked-prefill rows must not advance ``generation_steps``.

@@ -167,7 +167,7 @@ def test_dllm_staging_admission_uses_dllm_config(
     scheduler._waiting_queue = []
     req = SimpleNamespace(
         rid="req",
-        is_chunked=0,
+        inflight_middle_chunks=0,
         init_next_round_input=lambda: None,
     )
     scheduler._staging_queue = [req]

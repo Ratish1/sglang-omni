@@ -483,7 +483,7 @@ def test_collect_frame_reads_generation_steps_from_pool():
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
     data = SimpleNamespace(
-        req=SimpleNamespace(is_chunked=0),
+        req=SimpleNamespace(inflight_middle_chunks=0),
         text_temperature=1.0,
         text_top_p=1.0,
         text_top_k=50,
@@ -542,7 +542,7 @@ def test_pool_sampling_position_leads_unresolved_lookahead_launches():
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
     data = SimpleNamespace(
-        req=SimpleNamespace(is_chunked=0),
+        req=SimpleNamespace(inflight_middle_chunks=0),
         text_temperature=1.0,
         text_top_p=1.0,
         text_top_k=50,
@@ -631,7 +631,7 @@ def test_collect_frame_uses_eager_path_when_audio_repetition_penalty_active(
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
     data = SimpleNamespace(
-        req=SimpleNamespace(is_chunked=0),
+        req=SimpleNamespace(inflight_middle_chunks=0),
         text_temperature=1.0,
         text_top_p=1.0,
         text_top_k=50,
@@ -692,7 +692,7 @@ def test_cached_pool_rows_drive_collect_and_batched_step_commit():
 
     def data(step, seed):
         return SimpleNamespace(
-            req=SimpleNamespace(is_chunked=0),
+            req=SimpleNamespace(inflight_middle_chunks=0),
             text_temperature=1.0,
             text_top_p=1.0,
             text_top_k=50,
@@ -790,7 +790,7 @@ def test_finalize_commits_generation_steps_to_pool():
         }
     )
     data = SimpleNamespace(
-        req=SimpleNamespace(is_chunked=0),
+        req=SimpleNamespace(inflight_middle_chunks=0),
         generation_steps=0,
         extra_model_outputs={},
         output_rows=[],
@@ -837,7 +837,7 @@ def test_resume_reprefill_overwrites_stranded_feedback():
     pool.audio_token_presence[row, 0, 99] = True
 
     # prompt_rows (2 frames) + already-generated output_rows (3 frames); the
-    # resume re-prefills the whole span, so extend_input_len = 2 + 3.
+    # resume re-prefills the whole span, so extend_range.length = 2 + 3.
     width = 13
     prompt_rows = torch.zeros((2, width), dtype=torch.long)
     generated = []
@@ -846,7 +846,9 @@ def test_resume_reprefill_overwrites_stranded_feedback():
         row_t[1:] = token
         generated.append(row_t)
     data = SimpleNamespace(
-        req=SimpleNamespace(extend_input_len=5, prefix_indices=[], rid="a"),
+        req=SimpleNamespace(
+            extend_range=SimpleNamespace(length=5), prefix_indices=[], rid="a"
+        ),
         prompt_rows=prompt_rows,
         output_rows=generated,
         generation_steps=3,
@@ -908,9 +910,9 @@ def test_collect_frame_skips_chunked_feedback_and_journal():
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
 
-    def data(is_chunked):
+    def data(inflight_middle_chunks):
         return SimpleNamespace(
-            req=SimpleNamespace(is_chunked=is_chunked),
+            req=SimpleNamespace(inflight_middle_chunks=inflight_middle_chunks),
             text_temperature=1.0,
             text_top_p=1.0,
             text_top_k=50,
@@ -924,8 +926,8 @@ def test_collect_frame_skips_chunked_feedback_and_journal():
         )
 
     requests = [
-        SimpleNamespace(request_id="chunked", data=data(is_chunked=1)),
-        SimpleNamespace(request_id="normal", data=data(is_chunked=0)),
+        SimpleNamespace(request_id="chunked", data=data(inflight_middle_chunks=1)),
+        SimpleNamespace(request_id="normal", data=data(inflight_middle_chunks=0)),
     ]
     result = SimpleNamespace(
         logits_output=SimpleNamespace(hidden_states=torch.zeros(2, hidden_size))
@@ -1001,7 +1003,9 @@ def test_resume_resets_sampling_steps_to_generation_steps():
 
     width = 13
     data = SimpleNamespace(
-        req=SimpleNamespace(extend_input_len=5, prefix_indices=[], rid="a"),
+        req=SimpleNamespace(
+            extend_range=SimpleNamespace(length=5), prefix_indices=[], rid="a"
+        ),
         prompt_rows=torch.zeros((2, width), dtype=torch.long),
         output_rows=[torch.zeros(width, dtype=torch.long) for _ in range(3)],
         generation_steps=3,
@@ -1040,7 +1044,9 @@ def test_resume_with_empty_output_rows_still_resets_sampling_steps():
 
     width = 13
     data = SimpleNamespace(
-        req=SimpleNamespace(extend_input_len=2, prefix_indices=[], rid="a"),
+        req=SimpleNamespace(
+            extend_range=SimpleNamespace(length=2), prefix_indices=[], rid="a"
+        ),
         prompt_rows=torch.zeros((2, width), dtype=torch.long),
         output_rows=[],  # retracted before emitting any frame
         generation_steps=0,

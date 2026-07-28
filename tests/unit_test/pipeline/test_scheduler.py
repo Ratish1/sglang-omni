@@ -120,53 +120,6 @@ def test_threaded_simple_scheduler_reports_worker_errors() -> None:
     assert isinstance(outputs[0].data, RuntimeError)
 
 
-def test_sched_output_restores_legacy_req_extend_input_len() -> None:
-    reqs = [
-        SimpleNamespace(
-            rid="a",
-            _omni_data=object(),
-            extend_input_len=99,
-            inflight_middle_chunks=0,
-        ),
-        SimpleNamespace(rid="b", _omni_data=object(), inflight_middle_chunks=0),
-    ]
-    batch = SimpleNamespace(
-        reqs=reqs,
-        extend_lens=[3, 7],
-        forward_mode=SimpleNamespace(is_extend=lambda: True),
-    )
-    scheduler = OmniScheduler.__new__(OmniScheduler)
-
-    output = scheduler._build_sched_output(batch)
-
-    assert output.batch_data is batch
-    assert [req.extend_input_len for req in reqs] == [3, 7]
-
-
-def test_sched_output_publishes_legacy_is_chunked_from_inflight_middle_chunks() -> None:
-    """SGLang 0.5.15 renamed Req.is_chunked to Req.inflight_middle_chunks.
-
-    Omni model runners still branch on is_chunked to suppress non-final prefill
-    chunks, and nothing on the live path writes it (the upstream-delegated
-    get_new_batch_prefill owns the counter). Without the republish every chunk
-    reads as 0, i.e. a middle chunk is mistaken for the last one.
-    """
-    reqs = [
-        SimpleNamespace(rid="mid", _omni_data=object(), inflight_middle_chunks=1),
-        SimpleNamespace(rid="last", _omni_data=object(), inflight_middle_chunks=0),
-    ]
-    batch = SimpleNamespace(
-        reqs=reqs,
-        extend_lens=[5, 5],
-        forward_mode=SimpleNamespace(is_extend=lambda: True),
-    )
-    scheduler = OmniScheduler.__new__(OmniScheduler)
-
-    scheduler._build_sched_output(batch)
-
-    assert [req.is_chunked for req in reqs] == [1, 0]
-
-
 def test_omni_scheduler_default_stream_chunk_buffers_raw_chunks() -> None:
     """Preserves generic stream chunk buffering when no custom handler exists."""
     req_data = SimpleNamespace()
@@ -845,7 +798,7 @@ def test_omni_scheduler_normalizes_req_token_arrays_for_sglang_0515() -> None:
     assert isinstance(req.origin_input_ids, array)
     assert req.origin_input_ids.tolist() == origin
     assert req.origin_input_ids_unpadded is req.origin_input_ids
-    assert req.is_chunked == 0
+    assert req.inflight_middle_chunks == 0
 
     OmniScheduler._normalize_req_token_arrays(req)
     assert req.origin_input_ids.tolist() == origin

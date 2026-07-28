@@ -231,7 +231,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         for sched_req in requests:
             data = sched_req.data
             req = data.req
-            req_len = int(req.extend_input_len)
+            req_len = int(req.extend_range.length)
             prefix_len = len(req.prefix_indices)
             prompt_embeds = data.prompt_input_embeds
             if prompt_embeds is None:

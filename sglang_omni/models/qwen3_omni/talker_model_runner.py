@@ -192,7 +192,7 @@ class QwenTalkerModelRunner(ModelRunner):
             for sched_req in requests:
                 req = sched_req.data.req
                 prefix_len = len(req.prefix_indices)
-                extend_len = int(req.extend_input_len)
+                extend_len = int(req.extend_range.length)
                 part = self._projected_prefill_slice(
                     sched_req=sched_req,
                     prefix_len=prefix_len,

@@ -95,7 +95,7 @@ class Zonos2ModelRunner(ModelRunner):
             data = sr.data
             req = data.req
             prefix_len = len(req.prefix_indices)
-            req_len = int(req.extend_input_len)
+            req_len = int(req.extend_range.length)
             rows = data.prompt_rows[prefix_len : prefix_len + req_len].to(model.device)
             emb = model.embed_frames(rows)
             if data.speaker_emb is not None:

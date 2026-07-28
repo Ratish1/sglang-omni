@@ -959,20 +959,7 @@ class OmniScheduler:
 
     @staticmethod
     def _normalize_req_token_arrays(req: Any) -> None:
-        """Install the Req compatibility state used by Omni model runners."""
-        # SGLang 0.5.15 renamed this counter to Req.inflight_middle_chunks.
-        # Omni model runners still read the old name to suppress intermediate
-        # chunk outputs; _sync_legacy_is_chunked republishes it per forward.
-        # This seed only covers readers that run before the first forward
-        # (request builders).
-        if not hasattr(req, "is_chunked"):
-            req.is_chunked = 0
-        if not hasattr(req, "extend_input_len"):
-            extend_range = getattr(req, "extend_range", None)
-            req.extend_input_len = (
-                int(extend_range.length) if extend_range is not None else 0
-            )
-
+        """Normalize builder-produced token containers to the 0.5.16 Req shape."""
         origin_input_ids = req.origin_input_ids
         if not isinstance(origin_input_ids, array):
             req.origin_input_ids = array("q", origin_input_ids)
@@ -1137,57 +1124,11 @@ class OmniScheduler:
         expects. Shared by the sync and async (launch) paths."""
         from sglang_omni.scheduling.types import SchedulerOutput, SchedulerRequest
 
-        self._sync_legacy_extend_input_lens(batch)
-        self._sync_legacy_is_chunked(batch)
         sched_reqs = [
             SchedulerRequest(request_id=req.rid, data=req._omni_data)
             for req in batch.reqs
         ]
         return SchedulerOutput(requests=sched_reqs, batch_data=batch)
-
-    @staticmethod
-    def _sync_legacy_is_chunked(batch: Any) -> None:
-        """Publish 0.5.12's Req.is_chunked for Omni model runners.
-
-        SGLang 0.5.15 renamed the counter to ``Req.inflight_middle_chunks``:
-        ``get_new_batch_prefill`` increments it for the in-flight chunk and
-        ``SchedulerBatchResultProcessor.process_batch_result_prefill``
-        decrements it once that chunk's result is consumed. Omni delegates both
-        methods upstream, so at forward time the counter already carries
-        0.5.12's meaning — greater than zero means this row is a non-final
-        prefill chunk. Republish it here rather than only seeding the sidecar at
-        admission: nothing on the live path writes ``is_chunked`` (Omni's own
-        PrefillManager is bypassed by the upstream delegation), so without this
-        every chunk reads as 0 and the model runners treat middle chunks as the
-        last one. Unconditional because the flag is also read on decode batches,
-        where the counter is legitimately 0.
-
-        The ordering holds on ``_event_loop_normal`` and
-        ``_event_loop_async_decode``, which run ``process_batch_result`` in the
-        same iteration as the forward. It does NOT hold on
-        ``_event_loop_overlap``, where the decrement lags one iteration and a
-        final chunk would still read as a middle one; that loop therefore
-        refuses to run (NotImplementedError at entry) and would need its own
-        result-queue drain before this publish if ever enabled.
-        """
-        for req in batch.reqs:
-            req.is_chunked = int(req.inflight_middle_chunks)
-
-    @staticmethod
-    def _sync_legacy_extend_input_lens(batch: Any) -> None:
-        """Publish 0.5.12's Req.extend_input_len for Omni model runners."""
-        forward_mode = getattr(batch, "forward_mode", None)
-        if forward_mode is None or not forward_mode.is_extend():
-            return
-        extend_lens = getattr(batch, "extend_lens", None)
-        if extend_lens is None:
-            extend_lens = [req.extend_range.length for req in batch.reqs]
-        if len(extend_lens) != len(batch.reqs):
-            raise RuntimeError(
-                "ScheduleBatch extend_lens does not match its request count"
-            )
-        for req, extend_len in zip(batch.reqs, extend_lens):
-            req.extend_input_len = int(extend_len)
 
     def _emit_stream_output(self, sched_output, mr_output, skip_rids=()) -> None:
         """Emit per-request stream chunks from a ModelRunnerOutput. Shared by
@@ -2006,21 +1947,21 @@ class OmniScheduler:
                 self.self_check_during_busy()
 
     def _event_loop_overlap(self) -> None:
-        # ``_sync_legacy_is_chunked`` republishes ``inflight_middle_chunks``
-        # under a same-iteration ``process_batch_result`` contract. On this
-        # loop the decrement lags one iteration, so a final prefill chunk
-        # still reads as a middle chunk at forward time and the TTS model
-        # runners emit wrong chunk boundaries — silently. No construction
-        # site enables overlap today; refuse to run rather than corrupt
-        # chunked prefill if one ever does.
+        # Model runners read Req.inflight_middle_chunks at forward time under
+        # a same-iteration process_batch_result contract. On this loop the
+        # decrement lags one iteration, so a final prefill chunk still reads
+        # as a middle chunk at forward time and the TTS model runners emit
+        # wrong chunk boundaries — silently. No construction site enables
+        # overlap today; refuse to run rather than corrupt chunked prefill if
+        # one ever does.
         # The pre-guard loop body lives in git history ("Refuse the
         # OmniScheduler overlap event loop"); reviving it needs that drain,
         # not just deleting this raise.
         raise NotImplementedError(
-            "OmniScheduler's overlap event loop is unsupported: the legacy "
-            "Req.is_chunked republish lags one iteration on this loop (see "
-            "_sync_legacy_is_chunked). Drain the result queue before the "
-            "forward, then remove this guard."
+            "OmniScheduler's overlap event loop is unsupported: "
+            "Req.inflight_middle_chunks lags one iteration on this loop. "
+            "Drain the result queue before the forward, then remove this "
+            "guard."
         )
 
     @staticmethod

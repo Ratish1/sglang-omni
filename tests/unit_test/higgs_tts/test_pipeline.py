@@ -909,7 +909,7 @@ def test_higgs_model_runner_marks_sampler_finish() -> None:
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
     )
     req = SimpleNamespace(
-        is_chunked=0,
+        inflight_middle_chunks=0,
         finished_reason=None,
         finished=lambda: False,
     )
@@ -945,7 +945,7 @@ def test_higgs_model_runner_emits_latched_stream_metadata() -> None:
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
     )
     req = SimpleNamespace(
-        is_chunked=0,
+        inflight_middle_chunks=0,
         finished_reason=None,
         finished=lambda: False,
     )
@@ -1061,7 +1061,7 @@ def test_higgs_model_runner_collect_streaming_uses_preallocated_buffer() -> None
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([False])),
     )
     req = SimpleNamespace(
-        is_chunked=0,
+        inflight_middle_chunks=0,
         finished_reason=None,
         finished=lambda: False,
     )
@@ -1153,7 +1153,9 @@ def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
             step_count=torch.zeros(1, dtype=torch.long),
         ),
     )
-    req = SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False)
+    req = SimpleNamespace(
+        inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+    )
     data = SimpleNamespace(
         req=req,
         output_codes=[],
@@ -1208,10 +1210,18 @@ def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
     )
     # row0 chunked, row1 was-done, row2 active (not done), row3 active (EOC done).
     reqs = [
-        SimpleNamespace(is_chunked=1, finished_reason=None, finished=lambda: False),
-        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
-        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
-        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
+        SimpleNamespace(
+            inflight_middle_chunks=1, finished_reason=None, finished=lambda: False
+        ),
+        SimpleNamespace(
+            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+        ),
+        SimpleNamespace(
+            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+        ),
+        SimpleNamespace(
+            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+        ),
     ]
     datas = [
         SimpleNamespace(
@@ -1277,7 +1287,9 @@ def test_higgs_model_runner_collects_rollout_logprobs_only_when_requested() -> N
             last_codes=torch.zeros((n, k), dtype=torch.long),
         ),
     )
-    req = SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False)
+    req = SimpleNamespace(
+        inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+    )
     data = SimpleNamespace(
         req=req,
         output_codes=[],
@@ -1316,7 +1328,7 @@ def test_higgs_model_runner_skips_already_finished_eager_request() -> None:
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
     )
     req = SimpleNamespace(
-        is_chunked=0,
+        inflight_middle_chunks=0,
         finished_reason=object(),
         finished=lambda: True,
     )

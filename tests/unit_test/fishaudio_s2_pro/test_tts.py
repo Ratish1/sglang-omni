@@ -42,7 +42,7 @@ def test_fish_model_runner_vq_injection_and_code_collection_contracts() -> None:
     prefill_request = SchedulerRequest(
         request_id="prefill",
         data=SimpleNamespace(
-            req=FakeFishReq(extend_input_len=3),
+            req=FakeFishReq(extend_len=3),
             vq_mask_tokens=torch.tensor([True, False, True]),
             vq_parts=[torch.tensor([[7, 8], [9, 10]], dtype=torch.long)],
         ),
@@ -57,7 +57,7 @@ def test_fish_model_runner_vq_injection_and_code_collection_contracts() -> None:
     active = SchedulerRequest(
         request_id="active",
         data=SimpleNamespace(
-            req=FakeFishReq(is_chunked=0),
+            req=FakeFishReq(inflight_middle_chunks=0),
             output_codes=[],
             previous_semantic_tokens=[],
             semantic_history_tokens=None,
@@ -81,8 +81,10 @@ def test_fish_model_runner_vq_injection_and_code_collection_contracts() -> None:
     )
 
 
-def _make_s2pro_request(request_id: str, *, is_chunked: int = 0) -> SchedulerRequest:
-    req = FakeFishReq(is_chunked=is_chunked)
+def _make_s2pro_request(
+    request_id: str, *, inflight_middle_chunks: int = 0
+) -> SchedulerRequest:
+    req = FakeFishReq(inflight_middle_chunks=inflight_middle_chunks)
     return SchedulerRequest(
         request_id=request_id,
         data=SimpleNamespace(
@@ -207,7 +209,7 @@ def test_fish_s2pro_before_decode_uses_gpu_history_buffer() -> None:
 def test_fish_s2pro_before_prefill_syncs_decode_state() -> None:
     first = S2ProSGLangRequestData(
         input_ids=torch.tensor([], dtype=torch.long),
-        req=FakeFishReq(extend_input_len=1),
+        req=FakeFishReq(extend_len=1),
     )
     first.temperature = 0.55
     first.top_p = 0.65
@@ -218,7 +220,7 @@ def test_fish_s2pro_before_prefill_syncs_decode_state() -> None:
 
     second = S2ProSGLangRequestData(
         input_ids=torch.tensor([], dtype=torch.long),
-        req=FakeFishReq(extend_input_len=1),
+        req=FakeFishReq(extend_len=1),
     )
     second.temperature = 0.75
     second.top_p = 0.85
@@ -546,7 +548,7 @@ def test_fish_s2pro_mixed_batch_keeps_terminal_and_audio_state_separate() -> Non
 
 
 def test_fish_s2pro_chunked_step_does_not_mutate_decode_state() -> None:
-    request = _make_s2pro_request("req-chunked", is_chunked=1)
+    request = _make_s2pro_request("req-chunked", inflight_middle_chunks=1)
 
     _collect_s2pro_step([request], [[SEMANTIC_TOKEN_ID, 11, 22]])
 

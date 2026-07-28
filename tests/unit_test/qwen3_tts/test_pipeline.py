@@ -71,7 +71,7 @@ def install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
             self.vocab_size = vocab_size
             self.output_ids = []
             self.prefix_indices = []
-            self.extend_input_len = len(origin_input_ids)
+            self.extend_range = SimpleNamespace(length=len(origin_input_ids))
 
     class FakeSamplingParams:
         def __init__(self, **kwargs) -> None:

@@ -303,7 +303,7 @@ def make_text_stream_output_builder(*, text_decode_stage: str = "decode"):
         req = getattr(req_data, "req", None)
         if req is None or req_output.data is None:
             return []
-        if int(getattr(req, "is_chunked", 0) or 0) > 0:
+        if req.inflight_middle_chunks > 0:
             return []
         try:
             token_id = int(req_output.data)
@@ -361,7 +361,7 @@ def make_thinker_stream_output_builder(
         # Suppress while chunked prefill is still consuming prompt tokens —
         # prompt-side states could otherwise masquerade as the first
         # assistant token and leak prompt content into TTS.
-        if req is not None and int(getattr(req, "is_chunked", 0) or 0) > 0:
+        if req is not None and req.inflight_middle_chunks > 0:
             return []
         if req_output.data is None or req is None:
             return []
