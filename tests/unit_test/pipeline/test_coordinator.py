@@ -12,6 +12,54 @@ from sglang_omni.proto import CompleteMessage, OmniRequest, StreamMessage
 from tests.unit_test.fixtures.pipeline_fakes import RecordingCoordinatorControlPlane
 
 
+class SignallingCoordinatorControlPlane(RecordingCoordinatorControlPlane):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submitted_event = asyncio.Event()
+        self.fail_abort = False
+
+    async def submit_to_stage(self, stage: str, endpoint: str, msg: object) -> None:
+        await super().submit_to_stage(stage, endpoint, msg)
+        self.submitted_event.set()
+
+    async def broadcast_abort(self, msg: object) -> None:
+        await super().broadcast_abort(msg)
+        if self.fail_abort:
+            raise RuntimeError("abort transport failed")
+
+
+class FailingSubmissionControlPlane(RecordingCoordinatorControlPlane):
+    async def submit_to_stage(self, stage: str, endpoint: str, msg: object) -> None:
+        del stage, endpoint, msg
+        raise RuntimeError("submit transport failed")
+
+
+class BlockingAbortControlPlane(SignallingCoordinatorControlPlane):
+    def __init__(self) -> None:
+        super().__init__()
+        self.abort_started = asyncio.Event()
+        self.release_abort = asyncio.Event()
+
+    async def broadcast_abort(self, msg: object) -> None:
+        self.aborts.append(msg)
+        self.abort_started.set()
+        await self.release_abort.wait()
+
+
+def _coordinator_with_control_plane(
+    control_plane: RecordingCoordinatorControlPlane,
+) -> Coordinator:
+    coordinator = Coordinator(
+        "inproc://complete",
+        "inproc://abort",
+        entry_stage="preprocess",
+        terminal_stages=["decode"],
+    )
+    coordinator.control_plane = control_plane
+    coordinator.register_stage("preprocess", "inproc://preprocess")
+    return coordinator
+
+
 def test_coordinator_multi_terminal_completion_and_abort_contracts() -> None:
     """Preserves multi-terminal completion and abort cancellation semantics."""
 
@@ -445,3 +493,194 @@ def test_coordinator_stream_stage_failure_cancels_future() -> None:
         assert "req-1" not in coordinator._completion_futures
 
     asyncio.run(_run())
+
+
+def test_duplicate_submit_does_not_clean_up_existing_request() -> None:
+    async def _run() -> None:
+        control_plane = RecordingCoordinatorControlPlane()
+        coordinator = _coordinator_with_control_plane(control_plane)
+        await coordinator._submit_request("shared", "winner")
+        winner_future = coordinator._completion_futures["shared"]
+
+        with pytest.raises(ValueError, match="already exists"):
+            await coordinator.submit("shared", "loser")
+
+        assert coordinator._completion_futures["shared"] is winner_future
+        assert "shared" in coordinator._requests
+        assert control_plane.aborts == []
+
+        assert await coordinator.abort("shared") is True
+        with pytest.raises(asyncio.CancelledError):
+            await winner_future
+
+    asyncio.run(_run())
+
+
+def test_submit_cancellation_aborts_once_and_cleans_owned_state() -> None:
+    async def _run() -> None:
+        control_plane = SignallingCoordinatorControlPlane()
+        coordinator = _coordinator_with_control_plane(control_plane)
+        task = asyncio.create_task(coordinator.submit("req-1", "hello"))
+
+        await control_plane.submitted_event.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert [msg.request_id for msg in control_plane.aborts] == ["req-1"]
+        assert "req-1" not in coordinator._requests
+        assert "req-1" not in coordinator._completion_futures
+
+    asyncio.run(_run())
+
+
+def test_submit_transport_failure_cleans_owned_state() -> None:
+    async def _run() -> None:
+        control_plane = FailingSubmissionControlPlane()
+        coordinator = _coordinator_with_control_plane(control_plane)
+
+        with pytest.raises(RuntimeError, match="submit transport failed"):
+            await coordinator.submit("req-1", "hello")
+
+        assert [msg.request_id for msg in control_plane.aborts] == ["req-1"]
+        assert "req-1" not in coordinator._requests
+        assert "req-1" not in coordinator._completion_futures
+
+    asyncio.run(_run())
+
+
+def test_completion_future_reserves_request_id_until_waiter_cleanup() -> None:
+    async def _run() -> None:
+        control_plane = SignallingCoordinatorControlPlane()
+        coordinator = _coordinator_with_control_plane(control_plane)
+        task = asyncio.create_task(coordinator.submit("req-1", "first"))
+
+        await control_plane.submitted_event.wait()
+        await coordinator._handle_completion(
+            CompleteMessage("req-1", "decode", True, result="done")
+        )
+        assert "req-1" not in coordinator._requests
+        assert "req-1" in coordinator._completion_futures
+
+        with pytest.raises(ValueError, match="already exists"):
+            await coordinator._submit_request("req-1", "too early")
+
+        assert await task == "done"
+        await coordinator._submit_request("req-1", "reused")
+        assert await coordinator.abort("req-1") is True
+
+    asyncio.run(_run())
+
+
+def test_completion_future_reserves_id_until_abort_publication_finishes() -> None:
+    async def _run() -> None:
+        control_plane = BlockingAbortControlPlane()
+        coordinator = _coordinator_with_control_plane(control_plane)
+        task = asyncio.create_task(coordinator.submit("req-1", "first"))
+
+        await control_plane.submitted_event.wait()
+        task.cancel()
+        await control_plane.abort_started.wait()
+
+        future = coordinator._completion_futures["req-1"]
+        assert future.cancelled()
+        await coordinator._handle_completion(
+            CompleteMessage("req-1", "decode", True, result="late")
+        )
+        assert "req-1" not in coordinator._requests
+        with pytest.raises(ValueError, match="already exists"):
+            await coordinator._submit_request("req-1", "too early")
+
+        control_plane.release_abort.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert "req-1" not in coordinator._completion_futures
+
+        await coordinator._submit_request("req-1", "safe reuse")
+        assert await coordinator.abort("req-1") is True
+
+    asyncio.run(_run())
+
+
+def test_stream_close_aborts_once_but_natural_completion_does_not() -> None:
+    async def _run() -> None:
+        close_control_plane = SignallingCoordinatorControlPlane()
+        close_coordinator = _coordinator_with_control_plane(close_control_plane)
+        stream = close_coordinator.stream("early", "hello")
+        next_event = asyncio.create_task(anext(stream))
+
+        await close_control_plane.submitted_event.wait()
+        await close_coordinator._handle_stream(
+            StreamMessage(
+                request_id="early",
+                from_stage="decode",
+                chunk={"text": "partial"},
+                modality="text",
+                chunk_id=0,
+            )
+        )
+        assert (await next_event).chunk == {"text": "partial"}
+        await stream.aclose()
+
+        assert [msg.request_id for msg in close_control_plane.aborts] == ["early"]
+        assert "early" not in close_coordinator._requests
+        assert "early" not in close_coordinator._stream_queues
+        assert "early" not in close_coordinator._completion_futures
+
+        complete_control_plane = SignallingCoordinatorControlPlane()
+        complete_coordinator = _coordinator_with_control_plane(complete_control_plane)
+        events: list[CompleteMessage | StreamMessage] = []
+
+        async def _consume() -> None:
+            async for event in complete_coordinator.stream("natural", "hello"):
+                events.append(event)
+
+        consume_task = asyncio.create_task(_consume())
+        await complete_control_plane.submitted_event.wait()
+        await complete_coordinator._handle_completion(
+            CompleteMessage("natural", "decode", True, result="done")
+        )
+        await consume_task
+
+        assert len(events) == 1
+        assert isinstance(events[0], CompleteMessage)
+        assert events[0].result == "done"
+        assert complete_control_plane.aborts == []
+        assert "natural" not in complete_coordinator._requests
+        assert "natural" not in complete_coordinator._stream_queues
+        assert "natural" not in complete_coordinator._completion_futures
+
+    asyncio.run(_run())
+
+
+def test_abort_transport_failure_preserves_cancellation_and_id_ownership(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def _run() -> None:
+        control_plane = SignallingCoordinatorControlPlane()
+        control_plane.fail_abort = True
+        coordinator = _coordinator_with_control_plane(control_plane)
+        task = asyncio.create_task(coordinator.submit("req-1", "hello"))
+
+        await control_plane.submitted_event.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert [msg.request_id for msg in control_plane.aborts] == ["req-1"]
+        assert "req-1" in coordinator._requests
+        assert "req-1" not in coordinator._completion_futures
+        with pytest.raises(ValueError, match="already exists"):
+            await coordinator._submit_request("req-1", "unsafe reuse")
+
+        control_plane.fail_abort = False
+        await coordinator._handle_completion(
+            CompleteMessage("req-1", "decode", True, result="late")
+        )
+        await coordinator._submit_request("req-1", "safe reuse")
+        assert await coordinator.abort("req-1") is True
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(_run())
+
+    assert "Failed to abort request req-1 after waiter interruption" in caplog.text

@@ -25,9 +25,9 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import Awaitable, Callable
-from contextlib import suppress
-from typing import Any, AsyncIterator
+from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import aclosing
+from typing import Any, AsyncIterator, TypeVar
 
 from fastapi import (
     Depends,
@@ -46,6 +46,7 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
+from starlette.types import Receive, Scope, Send
 
 from sglang_omni.client import (
     Client,
@@ -114,9 +115,8 @@ from sglang_omni.serve.speech_ws import SpeechWebSocketSession
 from sglang_omni.serve.transcription_adapters import resolve_adapter
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 STREAM_DONE_SENTINEL = "[DONE]"
-HTTP_DISCONNECT_POLL_INTERVAL_S = 0.05
-HTTP_DISCONNECT_CANCEL_TIMEOUT_S = 0.1
 VOICE_UPLOAD_MULTIPART_OVERHEAD_BYTES = 64 * 1024
 MAX_VOICE_UPLOAD_BODY_BYTES = (
     MAX_VOICE_UPLOAD_BYTES + VOICE_UPLOAD_MULTIPART_OVERHEAD_BYTES
@@ -138,6 +138,26 @@ def _is_bad_request_error(exc: Exception) -> bool:
 
 class _RequestBodyTooLarge(Exception):
     pass
+
+
+class _ClosableStreamingResponse(StreamingResponse):
+    """Close the body iterator when response delivery terminates."""
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        except BaseException:
+            await _close_streaming_response_body(
+                self.body_iterator,
+                preserve_active_error=True,
+            )
+            raise
+        await _close_streaming_response_body(self.body_iterator)
 
 
 class VoiceUploadBodyLimitMiddleware:
@@ -633,7 +653,9 @@ def _common_model_info_value(
 
 def _register_chat_completions(app: FastAPI) -> None:
     @app.post("/v1/chat/completions")
-    async def chat_completions(req: ChatCompletionRequest) -> Response:
+    async def chat_completions(
+        request: Request, req: ChatCompletionRequest
+    ) -> Response:
         client: Client = app.state.client
         default_model: str = app.state.model_name
 
@@ -650,7 +672,7 @@ def _register_chat_completions(app: FastAPI) -> None:
             audio_format = req.audio.get("format", "wav")
 
         if req.stream:
-            return StreamingResponse(
+            return _ClosableStreamingResponse(
                 _chat_stream(
                     client,
                     gen_req,
@@ -664,15 +686,18 @@ def _register_chat_completions(app: FastAPI) -> None:
                 media_type="text/event-stream",
             )
 
-        return await _chat_non_stream(
-            client,
-            gen_req,
-            request_id,
-            response_id,
-            created,
-            model,
-            req,
-            audio_format,
+        return await _await_until_disconnect(
+            request,
+            _chat_non_stream(
+                client,
+                gen_req,
+                request_id,
+                response_id,
+                created,
+                model,
+                req,
+                audio_format,
+            ),
         )
 
 
@@ -756,87 +781,93 @@ async def _chat_stream(
     model: str,
     req: ChatCompletionRequest,
     audio_format: str,
-):
+) -> AsyncIterator[str]:
     """Streaming chat completion generator (yields SSE events)."""
     role_sent = False
     requested_modalities = req.modalities or ["text"]
     finish_reason: str | None = None
     final_usage: UsageResponse | None = None
 
-    async for chunk in client.completion_stream(
+    chunk_stream = client.completion_stream(
         gen_req,
         request_id=request_id,
         audio_format=audio_format,
-    ):
-        # Capture finish info for the dedicated finish chunk after the loop.
-        # Some pipelines only emit a final aggregate chunk; do not drop its
-        # text/audio just because it already carries a finish reason.
-        if chunk.finish_reason is not None:
-            finish_reason = chunk.finish_reason
-            if chunk.usage is not None:
-                final_usage = UsageResponse(
-                    prompt_tokens=chunk.usage.prompt_tokens or 0,
-                    completion_tokens=chunk.usage.completion_tokens or 0,
-                    total_tokens=chunk.usage.total_tokens or 0,
+    )
+    async with aclosing(chunk_stream):
+        async for chunk in chunk_stream:
+            # Capture finish info for the dedicated finish chunk after the loop.
+            # Some pipelines only emit a final aggregate chunk; do not drop its
+            # text/audio just because it already carries a finish reason.
+            if chunk.finish_reason is not None:
+                finish_reason = chunk.finish_reason
+                if chunk.usage is not None:
+                    final_usage = UsageResponse(
+                        prompt_tokens=chunk.usage.prompt_tokens or 0,
+                        completion_tokens=chunk.usage.completion_tokens or 0,
+                        total_tokens=chunk.usage.total_tokens or 0,
+                    )
+                has_payload = (
+                    chunk.modality == "text"
+                    and bool(chunk.text)
+                    and "text" in requested_modalities
+                ) or (
+                    chunk.modality == "audio"
+                    and chunk.audio_b64 is not None
+                    and "audio" in requested_modalities
                 )
-            has_payload = (
+                if not has_payload:
+                    continue
+
+            delta = ChatCompletionStreamDelta()
+            emit = False
+
+            # Send role on first chunk
+            if not role_sent:
+                delta.role = "assistant"
+                role_sent = True
+                emit = True
+
+            # Text chunk
+            if (
                 chunk.modality == "text"
-                and bool(chunk.text)
+                and chunk.text
                 and "text" in requested_modalities
-            ) or (
+            ):
+                delta.content = chunk.text
+                emit = True
+
+            # Audio chunk
+            if (
                 chunk.modality == "audio"
                 and chunk.audio_b64 is not None
                 and "audio" in requested_modalities
-            )
-            if not has_payload:
+            ):
+                delta.audio = ChatCompletionAudio(
+                    id=f"audio-{request_id}",
+                    data=chunk.audio_b64,
+                )
+                emit = True
+
+            if not emit:
                 continue
 
-        delta = ChatCompletionStreamDelta()
-        emit = False
-
-        # Send role on first chunk
-        if not role_sent:
-            delta.role = "assistant"
-            role_sent = True
-            emit = True
-
-        # Text chunk
-        if chunk.modality == "text" and chunk.text and "text" in requested_modalities:
-            delta.content = chunk.text
-            emit = True
-
-        # Audio chunk
-        if (
-            chunk.modality == "audio"
-            and chunk.audio_b64 is not None
-            and "audio" in requested_modalities
-        ):
-            delta.audio = ChatCompletionAudio(
-                id=f"audio-{request_id}",
-                data=chunk.audio_b64,
+            stream_resp = ChatCompletionStreamResponse(
+                id=response_id,
+                created=created,
+                model=model,
+                choices=[
+                    ChatCompletionStreamChoice(
+                        index=0,
+                        delta=delta,
+                        finish_reason=None,
+                    )
+                ],
             )
-            emit = True
 
-        if not emit:
-            continue
-
-        stream_resp = ChatCompletionStreamResponse(
-            id=response_id,
-            created=created,
-            model=model,
-            choices=[
-                ChatCompletionStreamChoice(
-                    index=0,
-                    delta=delta,
-                    finish_reason=None,
-                )
-            ],
-        )
-
-        data = stream_resp.model_dump(exclude_none=True)
-        for choice in data.get("choices", []):
-            choice.setdefault("finish_reason", None)
-        yield f"data: {json.dumps(data)}\n\n"
+            data = stream_resp.model_dump(exclude_none=True)
+            for choice in data.get("choices", []):
+                choice.setdefault("finish_reason", None)
+            yield f"data: {json.dumps(data)}\n\n"
 
     # Finish chunk: empty delta + finish_reason.
     finish_resp = ChatCompletionStreamResponse(
@@ -1301,29 +1332,14 @@ async def _create_speech_batch_with_disconnect_watch(
     batch: CreateSpeechBatchRequest,
     request_id: str,
 ) -> Any:
-    batch_task = asyncio.create_task(
+    return await _await_until_disconnect(
+        request,
         speech_service.create_speech_batch(
             client,
             batch,
             request_id=request_id,
-        )
+        ),
     )
-    disconnect_task = asyncio.create_task(_wait_for_request_disconnect(request))
-    try:
-        done, _ = await asyncio.wait(
-            {batch_task, disconnect_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if batch_task in done:
-            return await batch_task
-
-        batch_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await batch_task
-        raise asyncio.CancelledError
-    finally:
-        if not disconnect_task.done():
-            await _cancel_task_bounded(disconnect_task)
 
 
 def _register_speech_ws(app: FastAPI) -> None:
@@ -1371,67 +1387,45 @@ async def _speech_audio_response(
     """Build a raw PCM stream after deriving headers from the first audio chunk."""
     emitted_samples = 0
     chunk_stream = client.generate(gen_req, request_id=request_id)
-    first_audio_bytes: bytes | None = None
-    stream_sample_rate: int | None = None
-    stream_completed = False
-    stream_closed = False
-    disconnect_task = asyncio.create_task(_wait_for_request_disconnect(request))
-    next_chunk_task: asyncio.Task[Any] | None = None
 
-    try:
+    async def first_audio_chunk() -> tuple[bytes, int]:
+        nonlocal emitted_samples
         while True:
-            next_chunk_task = asyncio.create_task(anext(chunk_stream))
-            done, _ = await asyncio.wait(
-                {next_chunk_task, disconnect_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if disconnect_task in done:
-                if not next_chunk_task.done():
-                    await _cancel_task_bounded(next_chunk_task)
-                await _abort_and_close_speech_stream(client, request_id, chunk_stream)
-                stream_closed = True
-                raise asyncio.CancelledError
-
             try:
-                chunk = next_chunk_task.result()
+                chunk = await anext(chunk_stream)
             except StopAsyncIteration:
-                stream_completed = True
-                break
+                raise RuntimeError(
+                    "No audio output generated from the pipeline."
+                ) from None
             if chunk.audio_data is None:
                 continue
 
-            first_audio_bytes, emitted_samples, stream_sample_rate = (
-                _speech_pcm_chunk_bytes(
-                    chunk,
-                    emitted_samples=emitted_samples,
-                    speed=speed,
-                )
+            audio_bytes, emitted_samples, sample_rate = _speech_pcm_chunk_bytes(
+                chunk,
+                emitted_samples=emitted_samples,
+                speed=speed,
             )
-            if first_audio_bytes is not None:
-                break
+            if audio_bytes is not None:
+                return audio_bytes, sample_rate
 
-        if first_audio_bytes is None or stream_sample_rate is None:
-            raise RuntimeError("No audio output generated from the pipeline.")
-    except asyncio.CancelledError:
-        if not stream_closed:
-            await _abort_and_close_speech_stream(client, request_id, chunk_stream)
-        raise
-    except Exception:
-        if not stream_completed:
-            await _abort_and_close_speech_stream(client, request_id, chunk_stream)
-        else:
-            await _close_async_iterator_if_supported(chunk_stream)
-        raise
-    finally:
-        if next_chunk_task is not None and not next_chunk_task.done():
-            await _cancel_task_bounded(next_chunk_task)
-        if not disconnect_task.done():
-            await _cancel_task_bounded(disconnect_task)
-
-    async def _body():
-        nonlocal emitted_samples
-        active_request = True
+    try:
+        first_audio_bytes, stream_sample_rate = await _await_until_disconnect(
+            request,
+            first_audio_chunk(),
+        )
+    except BaseException:
         try:
+            await _close_async_iterator_if_supported(chunk_stream)
+        except BaseException:
+            logger.warning(
+                "Failed to close raw PCM stream during setup",
+                exc_info=True,
+            )
+        raise
+
+    async def _body() -> AsyncIterator[bytes]:
+        nonlocal emitted_samples
+        async with aclosing(chunk_stream):
             yield first_audio_bytes
 
             async for chunk in chunk_stream:
@@ -1451,14 +1445,8 @@ async def _speech_audio_response(
                         f"{stream_sample_rate} to {sample_rate}"
                     )
                 yield audio_bytes
-            active_request = False
-        finally:
-            if active_request:
-                await _abort_and_close_speech_stream(client, request_id, chunk_stream)
-            else:
-                await _close_async_iterator_if_supported(chunk_stream)
 
-    return StreamingResponse(
+    return _ClosableStreamingResponse(
         _body(),
         media_type="audio/pcm",
         headers={
@@ -1478,61 +1466,62 @@ async def _await_speech_response(
     response_format: str,
     speed: float,
 ):
-    speech_task = asyncio.create_task(
+    return await _await_until_disconnect(
+        request,
         client.speech(
             gen_req,
             request_id=request_id,
             response_format=response_format,
             speed=speed,
             allow_format_fallback=False,
-        )
+        ),
     )
+
+
+async def _await_until_disconnect(
+    request: Request,
+    operation: Coroutine[Any, Any, _T],
+) -> _T:
+    operation_task = asyncio.create_task(operation)
     disconnect_task = asyncio.create_task(_wait_for_request_disconnect(request))
-    aborted = False
     try:
         done, _ = await asyncio.wait(
-            {speech_task, disconnect_task},
+            {operation_task, disconnect_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
-        if speech_task in done:
-            return speech_task.result()
-
-        await client.abort(request_id)
-        aborted = True
-        speech_task.cancel()
+        if operation_task in done:
+            return await operation_task
         raise asyncio.CancelledError
-    except asyncio.CancelledError:
-        if not aborted:
-            await client.abort(request_id)
-        raise
     finally:
-        if not speech_task.done():
-            await _cancel_task_bounded(speech_task)
-        if not disconnect_task.done():
-            await _cancel_task_bounded(disconnect_task)
+        for task in (operation_task, disconnect_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            operation_task,
+            disconnect_task,
+            return_exceptions=True,
+        )
 
 
-async def _cancel_task_bounded(task: asyncio.Task[Any]) -> None:
-    task.cancel()
-    done, _ = await asyncio.wait({task}, timeout=HTTP_DISCONNECT_CANCEL_TIMEOUT_S)
-    if done:
-        await asyncio.gather(*done, return_exceptions=True)
-    else:
-        task.add_done_callback(_discard_cancelled_task_result)
-
-
-def _discard_cancelled_task_result(task: asyncio.Task[Any]) -> None:
+async def _close_streaming_response_body(
+    stream: AsyncIterator[Any],
+    *,
+    preserve_active_error: bool = False,
+) -> None:
     try:
-        task.result()
+        await _close_async_iterator_if_supported(stream)
     except asyncio.CancelledError:
-        pass
+        if not preserve_active_error:
+            raise
     except Exception:
-        logger.debug("Cancelled request task finished with an error", exc_info=True)
+        logger.warning("Failed to close streaming response body", exc_info=True)
 
 
 async def _wait_for_request_disconnect(request: Request) -> None:
-    while not await request.is_disconnected():
-        await asyncio.sleep(HTTP_DISCONNECT_POLL_INTERVAL_S)
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
 
 
 async def _close_async_iterator_if_supported(stream: AsyncIterator[Any]) -> None:
@@ -1543,20 +1532,10 @@ async def _close_async_iterator_if_supported(stream: AsyncIterator[Any]) -> None
     await close()
 
 
-async def _abort_and_close_speech_stream(
-    client: Client,
-    request_id: str,
-    stream: AsyncIterator[Any],
-) -> None:
-    try:
-        await client.abort(request_id)
-    finally:
-        await _close_async_iterator_if_supported(stream)
-
-
 def _register_transcriptions(app: FastAPI) -> None:
     @app.post("/v1/audio/transcriptions")
     async def create_transcription(
+        request: Request,
         file: UploadFile = File(...),
         model: str | None = Form(default=None),
         language: str | None = Form(default=None),
@@ -1599,7 +1578,7 @@ def _register_transcriptions(app: FastAPI) -> None:
             )
             adapter = resolve_adapter(getattr(app.state, "architectures", None))
             duration_s = _probe_audio_duration(audio_bytes)
-            return StreamingResponse(
+            return _ClosableStreamingResponse(
                 _transcription_stream(
                     client,
                     gen_req,
@@ -1623,7 +1602,10 @@ def _register_transcriptions(app: FastAPI) -> None:
         )
 
         try:
-            result = await client.completion(gen_req, request_id=request_id)
+            result = await _await_until_disconnect(
+                request,
+                client.completion(gen_req, request_id=request_id),
+            )
         except ClientError as exc:
             if _is_bad_request_error(exc):
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1684,15 +1666,17 @@ async def _transcription_stream(
     post-processed transcript.
     """
     final_text: str | None = None
+    chunk_stream = client.generate(gen_req, request_id=request_id)
     try:
-        async for chunk in client.generate(gen_req, request_id=request_id):
-            if chunk.finish_reason is not None:
-                if isinstance(chunk.text, str) and chunk.text:
-                    final_text = chunk.text
-                continue
-            if chunk.modality == "text" and chunk.text:
-                event = TranscriptionTextDeltaEvent(delta=chunk.text)
-                yield f"data: {event.model_dump_json(exclude_none=True)}\n\n"
+        async with aclosing(chunk_stream):
+            async for chunk in chunk_stream:
+                if chunk.finish_reason is not None:
+                    if isinstance(chunk.text, str) and chunk.text:
+                        final_text = chunk.text
+                    continue
+                if chunk.modality == "text" and chunk.text:
+                    event = TranscriptionTextDeltaEvent(delta=chunk.text)
+                    yield f"data: {event.model_dump_json(exclude_none=True)}\n\n"
     except Exception as exc:
         logger.exception("Error streaming transcription for request %s", request_id)
         payload = {"type": "error", "error": {"message": str(exc)}}

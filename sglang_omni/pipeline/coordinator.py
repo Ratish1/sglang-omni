@@ -315,21 +315,35 @@ class Coordinator:
 
     async def submit(self, request_id: str, request: OmniRequest | Any) -> Any:
         """Submit a request to the pipeline and wait for completion."""
-        await self._submit_request(request_id, request)
-
-        future = self._completion_futures[request_id]
+        owns_request = (
+            request_id not in self._requests
+            and request_id not in self._completion_futures
+        )
         try:
+            await self._submit_request(request_id, request)
+            future = self._completion_futures[request_id]
             result = await future
             return result
         finally:
-            self._completion_futures.pop(request_id, None)
+            if owns_request:
+                future = self._completion_futures.get(request_id)
+                if future is not None and not future.done():
+                    future.cancel()
+                try:
+                    await self._abort_if_active(request_id, "waiter interruption")
+                finally:
+                    self._completion_futures.pop(request_id, None)
 
     async def stream(
         self, request_id: str, request: OmniRequest | Any
     ) -> AsyncIterator[CompleteMessage | StreamMessage]:
         """Submit a request and yield stream events until completion."""
-        if request_id in self._stream_queues:
-            raise ValueError(f"Request {request_id} already streaming")
+        if (
+            request_id in self._stream_queues
+            or request_id in self._requests
+            or request_id in self._completion_futures
+        ):
+            raise ValueError(f"Request {request_id} already exists")
 
         queue: asyncio.Queue[CompleteMessage | StreamMessage] = asyncio.Queue()
         self._stream_queues[request_id] = queue
@@ -355,7 +369,26 @@ class Coordinator:
                     yield msg
         finally:
             self._stream_queues.pop(request_id, None)
-            self._completion_futures.pop(request_id, None)
+            future = self._completion_futures.get(request_id)
+            if future is not None and not future.done():
+                future.cancel()
+            try:
+                await self._abort_if_active(request_id, "stream interruption")
+            finally:
+                self._completion_futures.pop(request_id, None)
+
+    async def _abort_if_active(self, request_id: str, reason: str) -> None:
+        if request_id not in self._requests:
+            return
+        try:
+            await self.abort(request_id)
+        except Exception:
+            logger.warning(
+                "Failed to abort request %s after %s",
+                request_id,
+                reason,
+                exc_info=True,
+            )
 
     async def _submit_request(
         self, request_id: str, request: OmniRequest | Any
@@ -363,7 +396,7 @@ class Coordinator:
         """Submit a request without waiting for completion."""
         if self._fatal_error is not None:
             raise RuntimeError(self._fatal_error)
-        if request_id in self._requests:
+        if request_id in self._requests or request_id in self._completion_futures:
             raise ValueError(f"Request {request_id} already exists")
 
         if self.entry_stage not in self._stages:

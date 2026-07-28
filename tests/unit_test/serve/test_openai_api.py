@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.responses import StreamingResponse
 
 from sglang_omni.client import Client, GenerateChunk
 from sglang_omni.client.audio import encode_pcm
@@ -24,6 +25,7 @@ from sglang_omni.serve.openai_api import (
     _await_speech_response,
     _build_chat_generate_request,
     _chat_stream,
+    _ClosableStreamingResponse,
     _speech_audio_response,
     build_transcription_generate_request,
 )
@@ -37,6 +39,23 @@ MODEL_FAMILIES = {
     "s2-pro": "vocoder",
     "voxtral": "vocoder",
 }
+
+
+class ClosableBody:
+    def __init__(self, close_error: BaseException | None = None) -> None:
+        self.close_error = close_error
+        self.close_count = 0
+
+    def __aiter__(self) -> ClosableBody:
+        return self
+
+    async def __anext__(self) -> bytes:
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class FaultInjectingCoordinator(Coordinator):
@@ -175,45 +194,45 @@ class EmptyDeltaStreamingSpeechClient:
 
 class PrefetchedBlockingStreamingSpeechClient:
     def __init__(self) -> None:
-        self.aborted: list[str] = []
+        self.closed = asyncio.Event()
 
     def health(self) -> dict[str, Any]:
         return {"running": True}
 
     async def generate(self, request: Any, request_id: str | None = None):
         del request
-        yield GenerateChunk(
-            request_id=request_id or "speech-1",
-            modality="audio",
-            audio_data=[0.0, 0.1, -0.1, 0.0],
-            sample_rate=24000,
-            finish_reason=None,
-        )
-        await asyncio.Future()
-
-    async def abort(self, request_id: str) -> None:
-        self.aborted.append(request_id)
+        try:
+            yield GenerateChunk(
+                request_id=request_id or "speech-1",
+                modality="audio",
+                audio_data=[0.0, 0.1, -0.1, 0.0],
+                sample_rate=24000,
+                finish_reason=None,
+            )
+            await asyncio.Future()
+        finally:
+            self.closed.set()
 
 
 class BlockingFirstAudioStreamingSpeechClient:
     def __init__(self) -> None:
         self.started = asyncio.Event()
-        self.aborted: list[str] = []
+        self.closed = asyncio.Event()
 
     async def generate(self, request: Any, request_id: str | None = None):
         del request, request_id
-        self.started.set()
-        await asyncio.Future()
-        yield GenerateChunk(request_id="speech-1")
-
-    async def abort(self, request_id: str) -> None:
-        self.aborted.append(request_id)
+        try:
+            self.started.set()
+            await asyncio.Future()
+            yield GenerateChunk(request_id="speech-1")
+        finally:
+            self.closed.set()
 
 
 class BlockingNonStreamingSpeechClient:
     def __init__(self) -> None:
         self.started = asyncio.Event()
-        self.aborted: list[str] = []
+        self.cancelled = asyncio.Event()
 
     def health(self) -> dict[str, Any]:
         return {"running": True}
@@ -228,24 +247,26 @@ class BlockingNonStreamingSpeechClient:
         allow_format_fallback: bool = True,
     ):
         del request, request_id, response_format, speed, allow_format_fallback
-        self.started.set()
-        await asyncio.Future()
-
-    async def abort(self, request_id: str) -> None:
-        self.aborted.append(request_id)
+        try:
+            self.started.set()
+            await asyncio.Future()
+        finally:
+            self.cancelled.set()
 
 
 class DisconnectingRequest:
     def __init__(self) -> None:
         self.disconnected = asyncio.Event()
 
-    async def is_disconnected(self) -> bool:
-        return self.disconnected.is_set()
+    async def receive(self) -> dict[str, str]:
+        await self.disconnected.wait()
+        return {"type": "http.disconnect"}
 
 
 class ConnectedRequest:
-    async def is_disconnected(self) -> bool:
-        return False
+    async def receive(self) -> dict[str, str]:
+        await asyncio.Future()
+        raise AssertionError("unreachable")
 
 
 class SuccessfulTranscriptionClient:
@@ -747,7 +768,7 @@ def test_speech_stream_headers_use_chunk_sample_rate() -> None:
     assert response.content == expected
 
 
-def test_raw_pcm_response_close_aborts_inner_speech_stream() -> None:
+def test_raw_pcm_response_close_closes_inner_speech_stream() -> None:
     async def _drive() -> None:
         client = PrefetchedBlockingStreamingSpeechClient()
         response = await _speech_audio_response(
@@ -760,12 +781,49 @@ def test_raw_pcm_response_close_aborts_inner_speech_stream() -> None:
         body = response.body_iterator
         assert await anext(body) == encode_pcm([0.0, 0.1, -0.1, 0.0], 24000)
         await body.aclose()
-        assert client.aborted == ["req-1"]
+        assert client.closed.is_set()
 
     asyncio.run(_drive())
 
 
-def test_raw_pcm_response_disconnect_before_first_chunk_aborts_request() -> None:
+def test_closable_streaming_response_preserves_delivery_and_close_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def _drive() -> None:
+        delivery_error = RuntimeError("send failed")
+
+        async def _fail_delivery(*_args: Any, **_kwargs: Any) -> None:
+            raise delivery_error
+
+        monkeypatch.setattr(StreamingResponse, "__call__", _fail_delivery)
+        failed_body = ClosableBody(RuntimeError("close failed"))
+        failed_response = _ClosableStreamingResponse(failed_body)
+        with pytest.raises(RuntimeError) as raised:
+            await failed_response({}, None, None)
+        assert raised.value is delivery_error
+        assert failed_body.close_count == 1
+
+        async def _complete_delivery(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(StreamingResponse, "__call__", _complete_delivery)
+        close_failed_body = ClosableBody(RuntimeError("close failed"))
+        await _ClosableStreamingResponse(close_failed_body)({}, None, None)
+        assert close_failed_body.close_count == 1
+
+        cancelled_body = ClosableBody(asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await _ClosableStreamingResponse(cancelled_body)({}, None, None)
+        assert cancelled_body.close_count == 1
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(_drive())
+
+    assert caplog.text.count("Failed to close streaming response body") == 2
+
+
+def test_raw_pcm_response_disconnect_before_first_chunk_closes_stream() -> None:
     async def _drive() -> None:
         client = BlockingFirstAudioStreamingSpeechClient()
         request = DisconnectingRequest()
@@ -782,7 +840,7 @@ def test_raw_pcm_response_disconnect_before_first_chunk_aborts_request() -> None
         request.disconnected.set()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert client.aborted == ["req-1"]
+        assert client.closed.is_set()
 
     asyncio.run(_drive())
 
@@ -852,7 +910,7 @@ def test_raw_pcm_speech_request_respects_explicit_initial_zero() -> None:
     assert gen_req.extra_params["initial_codec_chunk_frames"] == 0
 
 
-def test_speech_response_disconnect_aborts_active_request() -> None:
+def test_speech_response_disconnect_cancels_operation() -> None:
     async def _drive() -> None:
         client = BlockingNonStreamingSpeechClient()
         request = DisconnectingRequest()
@@ -870,7 +928,7 @@ def test_speech_response_disconnect_aborts_active_request() -> None:
         request.disconnected.set()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert client.aborted == ["req-1"]
+        assert client.cancelled.is_set()
 
     asyncio.run(_drive())
 
