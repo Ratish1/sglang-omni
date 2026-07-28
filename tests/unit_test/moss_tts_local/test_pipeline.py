@@ -1833,6 +1833,7 @@ def test_post_process_outputs_keeps_stream_rows_device_native():
         req=None,
         output_rows=[],
         stream_metadata={"modality": "audio"},
+        stream_first_batch_sent=False,
     )
     sched_output = types.SimpleNamespace(
         requests=[types.SimpleNamespace(request_id="r0", data=data)]
@@ -1909,6 +1910,7 @@ def test_post_process_outputs_batches_stream_transport_rows():
         req=None,
         output_rows=[],
         stream_metadata={"stream": True, "modality": "audio_codes", "n_vq": N_VQ},
+        stream_first_batch_sent=False,
     )
     sched_output = types.SimpleNamespace(
         requests=[types.SimpleNamespace(request_id="r0", data=data)]
@@ -1971,6 +1973,7 @@ def test_on_request_finished_flushes_stream_tail_without_end_token():
         req=None,
         output_rows=[],
         stream_metadata={"stream": True, "modality": "audio_codes", "n_vq": N_VQ},
+        stream_first_batch_sent=False,
     )
     sched_output = types.SimpleNamespace(
         requests=[types.SimpleNamespace(request_id="r0", data=data)]
@@ -2211,7 +2214,6 @@ def test_async_launch_resolve_matches_sync_collect():
 
     # Resolve restored the snapshot, so async and sync yield identical ids.
     assert torch.equal(res_s.next_token_ids, res_a.next_token_ids)
-    assert torch.equal(sb_s.output_ids, res_s.next_token_ids)  # sync still publishes
 
     # output_rows append parity through the shared post_process_outputs tail.
     rs.post_process_outputs(

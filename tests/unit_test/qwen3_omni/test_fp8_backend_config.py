@@ -708,6 +708,7 @@ def test_configure_backend_policy_fp8_gemm_ordering(
         "sglang.srt.utils",
         is_sm90_supported=lambda: True,
         is_sm100_supported=lambda: False,
+        is_sm120_supported=lambda: False,
     )
 
     # Patch _is_h20_device so we get deterministic BF16 policy.

@@ -22,6 +22,7 @@ from sglang_omni.models.zonos2.engine_builder import Zonos2EngineBuilder
 from sglang_omni.models.zonos2.request_builders import build_zonos2_state
 from sglang_omni.proto import StagePayload
 from sglang_omni.serve.speech_service import SpeechRequestValidator
+from tests.unit_test.fakes import FakeServerArgs
 
 
 def test_zonos2_decode_buffers_pad_async_lookahead_rows() -> None:
@@ -161,7 +162,7 @@ def test_speech_seed_is_rejected_until_request_rng_is_supported() -> None:
 def test_zonos2_engine_builder_disables_chunked_prefill() -> None:
     """The per-frame feedback/EOS state machine has no rollback, so the builder
     must disable chunked prefill regardless of the ServerArgs default."""
-    server_args = SimpleNamespace(chunked_prefill_size=8192)
+    server_args = FakeServerArgs(chunked_prefill_size=8192)
     Zonos2EngineBuilder().customize_server_args(server_args)
     assert server_args.chunked_prefill_size == 0
 

@@ -209,6 +209,7 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
     scheduler.tree_cache = tree_cache
     scheduler.waiting_queue = []
     scheduler.last_batch = None
+    scheduler.forward_ct = 0
     scheduler._first_emit_done = set()
     scheduler._prefill_start_done = set()
 
@@ -786,7 +787,7 @@ def test_omni_scheduler_distinguishes_queue_enter_from_prefill_start(
     assert names.index("scheduler_queue_enter") < names.index("scheduler_prefill_start")
 
 
-def test_omni_scheduler_normalizes_req_token_arrays_for_sglang_0515() -> None:
+def test_omni_scheduler_normalizes_req_token_arrays() -> None:
     origin = [1, 2, 3]
     req = SimpleNamespace(
         origin_input_ids=origin,
@@ -798,7 +799,6 @@ def test_omni_scheduler_normalizes_req_token_arrays_for_sglang_0515() -> None:
     assert isinstance(req.origin_input_ids, array)
     assert req.origin_input_ids.tolist() == origin
     assert req.origin_input_ids_unpadded is req.origin_input_ids
-    assert req.inflight_middle_chunks == 0
 
     OmniScheduler._normalize_req_token_arrays(req)
     assert req.origin_input_ids.tolist() == origin
@@ -863,6 +863,7 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     server_args = SimpleNamespace(
         tp_size=1,
         pp_size=1,
+        dp_size=1,
         page_size=1,
         max_prefill_tokens=32,
         max_running_requests=2,
@@ -980,6 +981,7 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
     server_args = SimpleNamespace(
         tp_size=1,
         pp_size=1,
+        dp_size=1,
         page_size=1,
         max_prefill_tokens=32,
         max_running_requests=2,

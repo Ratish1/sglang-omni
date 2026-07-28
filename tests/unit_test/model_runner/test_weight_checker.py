@@ -306,13 +306,13 @@ def test_model_worker_update_weights_from_distributed_passes_positional_args() -
         calls.append((names, dtypes, shapes, group_name, load_format))
         return True, "ok"
 
-    runner_args = SimpleNamespace(weight_version="old")
+    runner_args = FakeServerArgs(weight_version="old")
     runner = SimpleNamespace(
         server_args=runner_args,
         update_weights_from_distributed=update_weights_from_distributed,
     )
     worker = object.__new__(ModelWorker)
-    worker.server_args = SimpleNamespace(weight_version="old")
+    worker.server_args = FakeServerArgs(weight_version="old")
     worker.model_runner = runner
 
     success, message = ModelWorker.update_weights_from_distributed(

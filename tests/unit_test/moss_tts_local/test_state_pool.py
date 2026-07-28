@@ -1126,7 +1126,7 @@ def test_stop_row_not_appended_via_journal():
             rows=row.reshape(1, 13),
         )
     )
-    data = SimpleNamespace(req=None, output_rows=[])
+    data = SimpleNamespace(req=None, output_rows=[], stream_metadata=None)
     sched_req = SimpleNamespace(request_id="rid", data=data)
     scheduler_output = SimpleNamespace(requests=[sched_req])
     outputs = {"rid": SimpleNamespace(data=1001)}

@@ -19,6 +19,8 @@ import pytest
 import torch
 from torch import nn
 
+from tests.unit_test.fakes import FakeServerArgs
+
 sglang_model_runner = pytest.importorskip(
     "sglang_omni.model_runner.sglang_model_runner",
     reason="sglang (and its sgl_kernel dependency) not importable here",
@@ -41,13 +43,14 @@ class SmallModel(nn.Module):
 
 def _bare_runner(load_format="auto"):
     runner = SGLModelRunner.__new__(SGLModelRunner)
-    runner.server_args = SimpleNamespace(
+    runner.server_args = FakeServerArgs(
         load_format=load_format,
         max_total_tokens=1000,
         tp_size=1,
         pp_size=1,
         model_path="m",
         revision="r",
+        enable_torch_compile=False,
     )
     # Note (Jiaxin Deng): role-plumbing tests use a stand-in model; the gate
     # itself is covered in test_ipc_weights.py.

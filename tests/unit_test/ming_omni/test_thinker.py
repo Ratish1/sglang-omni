@@ -104,7 +104,7 @@ def test_vendored_sglang_layers_do_not_import_removed_sampling_symbol() -> None:
     assert "top_k_top_p_sampling_from_probs" not in source
 
 
-def test_ming_vision_block_kwargs_pass_head_size_only_when_supported(
+def test_ming_vision_block_kwargs_include_head_size(
     monkeypatch,
 ) -> None:
     weight_loader_module = ModuleType("sglang_omni.models.weight_loader")
@@ -119,15 +119,18 @@ def test_ming_vision_block_kwargs_pass_head_size_only_when_supported(
         _build_qwen3_vision_block_kwargs,
     )
 
-    class LegacyVisionBlock:
-        def __init__(self, dim, num_heads, intermediate_dim, prefix=""):
-            pass
+    kwargs = _build_qwen3_vision_block_kwargs(
+        dim=1152,
+        num_heads=16,
+        head_size=72,
+        intermediate_dim=4304,
+        hidden_act="gelu_pytorch_tanh",
+        norm_layer=None,
+        quant_config=None,
+        prefix="visual.blocks.0",
+    )
 
-    class NewVisionBlock:
-        def __init__(self, dim, num_heads, head_size, intermediate_dim, prefix=""):
-            pass
-
-    common = {
+    assert kwargs == {
         "dim": 1152,
         "num_heads": 16,
         "head_size": 72,
@@ -137,15 +140,6 @@ def test_ming_vision_block_kwargs_pass_head_size_only_when_supported(
         "quant_config": None,
         "prefix": "visual.blocks.0",
     }
-
-    legacy_kwargs = _build_qwen3_vision_block_kwargs(
-        LegacyVisionBlock,
-        **common,
-    )
-    new_kwargs = _build_qwen3_vision_block_kwargs(NewVisionBlock, **common)
-
-    assert "head_size" not in legacy_kwargs
-    assert new_kwargs["head_size"] == 72
 
 
 def _load_preprocessor_with_fake_deps(monkeypatch, *, config=None, tokenizer=None):

@@ -133,13 +133,15 @@ def test_launch_returns_handle_resolve_consumes_it():
     assert (r.launch_calls, r.resolve_calls, r.finalize_calls) == (1, 1, 1)
     assert (r._async_query_hit, r._async_query_miss) == (1, 0)
     assert r.last_prepare_is_lookahead is True
-    assert torch.equal(r.last_schedule_batch.input_ids, torch.tensor([17]))
-    assert r.last_schedule_batch.input_ids is r.last_schedule_batch.output_ids
-    # resolve must NOT re-publish output_ids: under launch-first it runs one
-    # step behind on the LIVE running batch, whose output_ids the current launch
-    # already set at the right length. Re-stamping the lagged step's tokens
-    # leaves a stale-length output_ids -> input_ids/seq_lens mismatch once a req
-    # finishes mid-batch (the bs>1 replay crash). The launch publishes it.
+    assert len(r._execution_bridge.published) == 1
+    published_batch, published_ids = r._execution_bridge.published[0]
+    assert published_batch is r.last_schedule_batch
+    assert torch.equal(published_ids, torch.tensor([17]))
+    # resolve must NOT re-publish the token rail: under launch-first it runs
+    # one step behind on the LIVE running batch, whose rail the current launch
+    # already published at the right length. Re-stamping the lagged step's
+    # tokens leaves a stale-length rail -> input_ids/seq_lens mismatch once a
+    # req finishes mid-batch (the bs>1 replay crash). The launch publishes it.
 
 
 def test_two_launches_return_distinct_handles():
@@ -176,7 +178,7 @@ def test_resolve_recomputes_finished_overrun_skip_rids():
     r = _StubRunner()
     keep_req = types.SimpleNamespace(finished=lambda: False)
     skip_req = types.SimpleNamespace(finished=lambda: True)
-    sched_output = types.SimpleNamespace(
+    sched_output = SchedulerOutput(
         requests=[
             types.SimpleNamespace(
                 request_id="keep",
@@ -208,7 +210,7 @@ def test_resolve_skips_retracted_row():
     r = _StubRunner()
     keep_req = types.SimpleNamespace(finished=lambda: False, is_retracted=False)
     retracted_req = types.SimpleNamespace(finished=lambda: False, is_retracted=True)
-    sched_output = types.SimpleNamespace(
+    sched_output = SchedulerOutput(
         requests=[
             types.SimpleNamespace(
                 request_id="keep",
@@ -342,7 +344,6 @@ def test_finalize_unions_finalize_skip_rids_hook():
         batch_result,
         types.SimpleNamespace(),
         schedule_batch,
-        types.SimpleNamespace(),
         scheduler_output,
     )
 

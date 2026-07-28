@@ -51,6 +51,7 @@ from sglang_omni.scheduling.sglang_backend.server_args_builder import (
     build_sglang_server_args,
 )
 from sglang_omni.utils.imports import import_string
+from tests.unit_test.fakes import FakeServerArgs
 from tests.unit_test.fixtures.qwen_fakes import (
     FakeQwenTokenizer,
     make_qwen_payload,
@@ -660,7 +661,7 @@ def test_qwen_builder_forwards_explicit_mem_fraction_static() -> None:
 
 
 def test_qwen_encoder_mem_reserve_applies_only_to_valid_auto_values() -> None:
-    server_args = SimpleNamespace(mem_fraction_static=0.929)
+    server_args = FakeServerArgs(mem_fraction_static=0.929)
 
     apply_encoder_mem_reserve(server_args, 0.05)
 
@@ -800,7 +801,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
     from sglang_omni.scheduling import omni_scheduler, sglang_backend
 
-    server_args = SimpleNamespace(
+    server_args = FakeServerArgs(
         disable_cuda_graph=False, enable_return_hidden_states=False
     )
     infrastructure_saw_graph_disabled: list[bool] = []
@@ -1204,7 +1205,7 @@ def test_qwen_cli_serve_enables_custom_all_reduce_on_p2p_mesh(monkeypatch) -> No
 
 
 def test_qwen_thinker_auto_path_applies_encoder_reserve() -> None:
-    server_args = SimpleNamespace(mem_fraction_static=0.929)
+    server_args = FakeServerArgs(mem_fraction_static=0.929)
 
     applied = qwen_stages._apply_qwen_thinker_encoder_reserve(
         server_args,

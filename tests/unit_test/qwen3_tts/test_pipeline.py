@@ -37,7 +37,7 @@ from sglang_omni.scheduling.speaker_cache import (
     get_speaker_artifact_cache,
 )
 from sglang_omni.scheduling.types import RequestOutput
-from tests.unit_test.fakes import FakeServerArgs
+from tests.unit_test.fakes import FakeExecutionBridge, FakeServerArgs
 
 
 def install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1525,7 +1525,6 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
 
     runner._collect_codes(result, forward_batch, schedule_batch, requests)
 
-    assert schedule_batch.output_ids.tolist() == [7, 42]
     assert requests[0].data.output_codes == []
     assert requests[1].data.output_codes == []
 
@@ -1629,6 +1628,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     runner.output_processor = FakeOutputProcessor()
     runner.device = torch.device("cpu")
     runner.model = runner.tp_worker.model_runner.model
+    runner.bind_execution_bridge(FakeExecutionBridge())
 
     data = SimpleNamespace(
         req=SimpleNamespace(sampling_params=SimpleNamespace(repetition_penalty=1.0)),

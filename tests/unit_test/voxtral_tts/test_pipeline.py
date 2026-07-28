@@ -18,7 +18,7 @@ from sglang_omni.models.voxtral_tts.request_builders import build_sglang_voxtral
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.types import RequestOutput
 from sglang_omni.utils.audio_payload import audio_waveform_payload
-from tests.unit_test.fakes import FakeServerArgs
+from tests.unit_test.fakes import FakeExecutionBridge, FakeServerArgs
 
 
 def test_voxtral_tts_config_uses_current_stage_schema() -> None:
@@ -254,7 +254,6 @@ def test_voxtral_collect_audio_step_reuses_output_tokens_for_eos_filter() -> Non
     runner._collect_audio_step(result, schedule_batch, requests)
 
     assert result.next_token_ids.tolist() == [11, eos_id]
-    assert schedule_batch.output_ids.tolist() == [11, eos_id]
     assert requests[0].data.output_codes == []
     assert requests[1].data.output_codes == []
 
@@ -386,6 +385,7 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
     runner.output_processor = FakeOutputProcessor()
     runner.device = torch.device("cpu")
     runner.model = runner.tp_worker.model_runner.model
+    runner.bind_execution_bridge(FakeExecutionBridge())
 
     data = SimpleNamespace(
         pending_feedback_queue=collections.deque([torch.tensor([1.0, 2.0, 3.0])]),
