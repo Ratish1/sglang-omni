@@ -76,7 +76,7 @@ class MossTTSModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        if bool(getattr(schedule_batch, "is_prefill_only", False)):
+        if schedule_batch.is_prefill_only:
             return
         self._collect_moss_step(result, forward_batch, schedule_batch, requests)
 
@@ -203,7 +203,7 @@ class MossTTSModelRunner(ModelRunner):
         is_audio: bool = False,
     ) -> list[torch.Tensor]:
         logits_output = result.logits_output
-        customized = getattr(logits_output, "customized_info", None)
+        customized = logits_output.customized_info
         if isinstance(customized, dict):
             values = customized.get("moss_tts_channel_logits")
             if isinstance(values, list) and values:
@@ -213,7 +213,7 @@ class MossTTSModelRunner(ModelRunner):
                     )
                     return [values[0].index_select(-1, token_ids), *values[1:]]
                 return values
-        hidden_states = getattr(logits_output, "hidden_states", None)
+        hidden_states = logits_output.hidden_states
         if isinstance(hidden_states, torch.Tensor):
             if hidden_states.ndim == 3:
                 hidden_states = hidden_states[:, -1, :]

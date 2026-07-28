@@ -47,16 +47,13 @@ class MossTTSLocalModelRunner(ModelRunner):
         *,
         force: bool,
     ) -> None:
-        metadata = getattr(data, "stream_metadata", None)
+        metadata = data.stream_metadata
         if metadata is None or self._outbox is None:
             return
-        pending = getattr(data, "stream_pending_rows", None)
-        if pending is None:
-            pending = []
-            data.stream_pending_rows = pending
+        pending = data.stream_pending_rows
         if not pending:
             return
-        first_sent = bool(getattr(data, "stream_first_batch_sent", False))
+        first_sent = data.stream_first_batch_sent
         threshold = 1 if not first_sent else MOSS_STREAM_TRANSPORT_BATCH_FRAMES
         if not force and len(pending) < threshold:
             return

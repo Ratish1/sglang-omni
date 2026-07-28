@@ -361,13 +361,11 @@ class HiggsAudioCodec:
                 f"codes must be 2-D [T, num_codebooks], got {tuple(codes_TN.shape)}"
             )
         frame_count = int(codes_TN.shape[0])
-        decode_graphs = getattr(self, "_decode_cuda_graphs", {})
+        decode_graphs = self._decode_cuda_graphs
         decode_graph = decode_graphs.get(frame_count)
         codes_BNT = codes_TN.transpose(0, 1).unsqueeze(0)
         if decode_graph is not None:
-            self._decode_cuda_graph_hits = (
-                getattr(self, "_decode_cuda_graph_hits", 0) + 1
-            )
+            self._decode_cuda_graph_hits += 1
             if int(codes_BNT.shape[1]) != int(decode_graph.input_codes.shape[1]):
                 raise ValueError(
                     f"codes have {int(codes_BNT.shape[1])} quantizers, expected "
@@ -380,11 +378,7 @@ class HiggsAudioCodec:
             audio = decode_graph.output_audio
         else:
             if decode_graphs:
-                self._decode_cuda_graph_misses = (
-                    getattr(self, "_decode_cuda_graph_misses", 0) + 1
-                )
-                if not hasattr(self, "_decode_cuda_graph_missed_shapes"):
-                    self._decode_cuda_graph_missed_shapes = set()
+                self._decode_cuda_graph_misses += 1
                 if frame_count not in self._decode_cuda_graph_missed_shapes:
                     self._decode_cuda_graph_missed_shapes.add(frame_count)
                     logger.warning(
@@ -395,8 +389,8 @@ class HiggsAudioCodec:
             audio = self.model.decode(
                 codes_BNT.to(device=self.device, dtype=torch.long)
             ).audio_values
-        total_graph_lookups = getattr(self, "_decode_cuda_graph_hits", 0) + getattr(
-            self, "_decode_cuda_graph_misses", 0
+        total_graph_lookups = (
+            self._decode_cuda_graph_hits + self._decode_cuda_graph_misses
         )
         if decode_graphs and total_graph_lookups % 1024 == 0:
             logger.info(

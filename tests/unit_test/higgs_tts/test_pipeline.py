@@ -1914,6 +1914,10 @@ def _make_fake_codec(call_log: list[tuple[int, int]]):
     codec.model = FakeModel()
     codec.device = torch.device("cpu")
     codec._dtype = torch.float32
+    codec._decode_cuda_graphs = {}
+    codec._decode_cuda_graph_hits = 0
+    codec._decode_cuda_graph_misses = 0
+    codec._decode_cuda_graph_missed_shapes = set()
     return codec
 
 
@@ -1986,6 +1990,10 @@ def _make_fake_encoder_codec(encode_calls: list):
     codec.model = FakeModel()
     codec.device = torch.device("cpu")
     codec._dtype = torch.float32
+    codec._decode_cuda_graphs = {}
+    codec._decode_cuda_graph_hits = 0
+    codec._decode_cuda_graph_misses = 0
+    codec._decode_cuda_graph_missed_shapes = set()
     return codec
 
 

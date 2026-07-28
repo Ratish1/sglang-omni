@@ -766,7 +766,7 @@ class MingTTSSGLangModel(nn.Module):
         max_batch_size = 1
         try:
             server_args = get_global_server_args()
-        except (AssertionError, RuntimeError):
+        except ValueError:
             server_args = None
         if server_args is not None:
             from sglang_omni.scheduling.generation_batch_policy import (

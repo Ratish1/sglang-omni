@@ -1442,7 +1442,6 @@ def test_rollback_decode_prep_after_skip_is_idempotent_across_repeated_stalls() 
     pre_seq_lens = torch.tensor([12, 12])
     pre_seq_lens_cpu = torch.tensor([12, 12])
     pre_orig_seq_lens = torch.tensor([10, 11])
-    pre_seq_lens_sum = 24
 
     reqs = [
         SimpleNamespace(
@@ -1464,13 +1463,11 @@ def test_rollback_decode_prep_after_skip_is_idempotent_across_repeated_stalls() 
     batch = SimpleNamespace(
         forward_mode=FakeForwardMode(),
         out_cache_loc=object(),
-        output_ids=None,
-        input_ids=torch.tensor([99, 100]),
         reqs=reqs,
         seq_lens=pre_seq_lens.clone() + 1,
         seq_lens_cpu=pre_seq_lens_cpu.clone() + 1,
         orig_seq_lens=pre_orig_seq_lens.clone() + 1,
-        seq_lens_sum=pre_seq_lens_sum + len(reqs),
+        seq_lens_sum=None,
         req_pool_indices=req_pool_indices,
         req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
     )
@@ -1482,7 +1479,6 @@ def test_rollback_decode_prep_after_skip_is_idempotent_across_repeated_stalls() 
     # an out_cache_loc allocation handed in. One stall -> one rollback.
     scheduler._rollback_decode_prep_after_skip(batch)
     assert batch.out_cache_loc is None
-    assert batch.output_ids is batch.input_ids
     for req in reqs:
         assert req.decode_batch_idx == [5, 7][reqs.index(req)] - 1
         assert req.kv_committed_len == 11
@@ -1490,7 +1486,7 @@ def test_rollback_decode_prep_after_skip_is_idempotent_across_repeated_stalls() 
     assert torch.equal(batch.seq_lens, pre_seq_lens)
     assert torch.equal(batch.seq_lens_cpu, pre_seq_lens_cpu)
     assert torch.equal(batch.orig_seq_lens, pre_orig_seq_lens)
-    assert batch.seq_lens_sum == pre_seq_lens_sum
+    assert batch.seq_lens_sum is None
     assert len(freed) == 1
     assert torch.equal(
         req_to_token[req_pool_indices, pre_seq_lens],
@@ -1509,7 +1505,6 @@ def test_rollback_decode_prep_after_skip_is_idempotent_across_repeated_stalls() 
     batch.seq_lens.add_(1)
     batch.seq_lens_cpu.add_(1)
     batch.orig_seq_lens.add_(1)
-    batch.seq_lens_sum += len(reqs)
     req_to_token[req_pool_indices, pre_seq_lens] = torch.tensor(
         [333, 444], dtype=torch.int32
     )
@@ -1520,7 +1515,7 @@ def test_rollback_decode_prep_after_skip_is_idempotent_across_repeated_stalls() 
         assert req.decode_batch_idx == [5, 7][reqs.index(req)] - 1
         assert req.kv_committed_len == 11
         assert req.kv.kv_allocated_len == 12
-    assert batch.seq_lens_sum == pre_seq_lens_sum
+    assert batch.seq_lens_sum is None
     assert len(freed) == 2
     assert torch.equal(req_to_token, torch.zeros_like(req_to_token))
 
@@ -1546,81 +1541,6 @@ def test_rollback_decode_prep_after_skip_is_noop_for_prefill_batches() -> None:
     assert batch.out_cache_loc is not None
     assert batch.seq_lens_sum == 99
     assert freed == []
-
-
-def test_rollback_decode_prep_after_skip_rejects_unknown_seq_lens_sum_type() -> None:
-    class FakeForwardMode:
-        @staticmethod
-        def is_decode() -> bool:
-            return True
-
-    batch = SimpleNamespace(forward_mode=FakeForwardMode(), seq_lens_sum=object())
-    scheduler = object.__new__(QwenTalkerScheduler)
-
-    with pytest.raises(TypeError, match="seq_lens_sum is object"):
-        scheduler._rollback_decode_prep_after_skip(batch)
-
-
-def test_rollback_decode_prep_shape_error_is_atomic() -> None:
-    class FakeForwardMode:
-        @staticmethod
-        def is_decode() -> bool:
-            return True
-
-    freed: list[Any] = []
-    allocation = object()
-    reqs = [
-        SimpleNamespace(
-            decode_batch_idx=3,
-            kv_committed_len=8,
-            kv=SimpleNamespace(kv_allocated_len=9),
-        ),
-        SimpleNamespace(
-            decode_batch_idx=4,
-            kv_committed_len=8,
-            kv=SimpleNamespace(),
-        ),
-    ]
-    req_pool_indices = torch.tensor([1, 2])
-    seq_lens = torch.tensor([8, 8])
-    req_to_token = torch.zeros((4, 12), dtype=torch.int32)
-    req_to_token[req_pool_indices, seq_lens - 1] = torch.tensor(
-        [41, 42],
-        dtype=torch.int32,
-    )
-    batch = SimpleNamespace(
-        forward_mode=FakeForwardMode(),
-        out_cache_loc=allocation,
-        output_ids=None,
-        input_ids=torch.tensor([7, 8]),
-        reqs=reqs,
-        seq_lens=seq_lens,
-        seq_lens_cpu=seq_lens.clone(),
-        orig_seq_lens=torch.tensor([7, 7]),
-        seq_lens_sum=16,
-        req_pool_indices=req_pool_indices,
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
-    )
-    original_req_to_token = req_to_token.clone()
-    scheduler = object.__new__(QwenTalkerScheduler)
-    scheduler.token_to_kv_pool_allocator = SimpleNamespace(free=freed.append)
-
-    with pytest.raises(AttributeError, match=r"req\.kv\.kv_allocated_len"):
-        scheduler._rollback_decode_prep_after_skip(batch)
-
-    assert freed == []
-    assert batch.out_cache_loc is allocation
-    assert batch.output_ids is None
-    assert [(req.decode_batch_idx, req.kv_committed_len) for req in reqs] == [
-        (3, 8),
-        (4, 8),
-    ]
-    assert reqs[0].kv.kv_allocated_len == 9
-    assert torch.equal(batch.seq_lens, torch.tensor([8, 8]))
-    assert torch.equal(batch.seq_lens_cpu, torch.tensor([8, 8]))
-    assert torch.equal(batch.orig_seq_lens, torch.tensor([7, 7]))
-    assert batch.seq_lens_sum == 16
-    assert torch.equal(req_to_token, original_req_to_token)
 
 
 def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) -> None:

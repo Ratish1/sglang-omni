@@ -122,48 +122,22 @@ class QwenTalkerScheduler(OmniScheduler):
         # Note(Chenchen Hong, Xuesong): This is talker-only. It does not fully
         # invert prepare_for_decode; talker disables overlap/spec/Mamba/hisparse,
         # and the penalizer's cumulate scatter_ is idempotent under the talker's
-        # own SamplingBatchInfo. Also zero the req_to_token_pool cell that
-        # alloc_for_decode wrote at (req_pool_indices, pre-increment seq_lens).
+        # own SamplingBatchInfo. Zero the req_to_token_pool cell that
+        # alloc_for_decode wrote at (req_pool_indices, pre-increment seq_lens);
+        # seq_lens_sum stays untouched (always None after prepare_for_decode,
+        # recomputed at the next forward).
         if not batch.forward_mode.is_decode():
             return
-        if batch.seq_lens_sum is not None and not isinstance(batch.seq_lens_sum, int):
-            raise TypeError(
-                f"seq_lens_sum is {type(batch.seq_lens_sum).__name__}, expected int; "
-                "sglang upstream prepare_for_decode changed; update rollback."
-            )
-
-        # Resolve every 0.5.16 request field before releasing the allocation or
-        # changing any counters.  That keeps an upstream shape mismatch from
-        # leaving a half-rolled-back batch.
-        req_kv_states = []
-        for req in batch.reqs:
-            try:
-                req.decode_batch_idx
-                req.kv_committed_len
-                req_kv = req.kv
-                req_kv.kv_allocated_len
-            except AttributeError as exc:
-                raise AttributeError(
-                    "decode rollback expects SGLang 0.5.16 request state "
-                    "(req.decode_batch_idx, req.kv_committed_len, and "
-                    "req.kv.kv_allocated_len)"
-                ) from exc
-            req_kv_states.append(req_kv)
-
         if batch.out_cache_loc is not None:
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc)
             batch.out_cache_loc = None
-        if batch.output_ids is None:
-            batch.output_ids = batch.input_ids
-        for req, req_kv in zip(batch.reqs, req_kv_states, strict=True):
+        for req in batch.reqs:
             req.decode_batch_idx -= 1
             req.kv_committed_len -= 1
-            req_kv.kv_allocated_len -= 1
+            req.kv.kv_allocated_len -= 1
         batch.seq_lens.sub_(1)
         batch.seq_lens_cpu.sub_(1)
         batch.orig_seq_lens.sub_(1)
-        if batch.seq_lens_sum is not None:
-            batch.seq_lens_sum -= len(batch.reqs)
         batch.req_to_token_pool.req_to_token[batch.req_pool_indices, batch.seq_lens] = 0
 
     def self_check_during_idle(self) -> None:

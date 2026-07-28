@@ -96,15 +96,13 @@ class HiggsTTSModelRunner(ModelRunner):
         # runner rebuilds ForwardBatch and therefore drops ad-hoc batch fields,
         # so keep this one-forward value on the model instead. Prefill is
         # serialized by OmniScheduler; model.forward consumes and clears it.
-        if getattr(self.model, "_pending_prefill_input_embeds", None) is not None:
+        if self.model._pending_prefill_input_embeds is not None:
             raise RuntimeError(
                 "Higgs prefill input embeddings were not consumed by the "
                 "previous forward"
             )
         input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
-        prefill_runner = getattr(
-            self.tp_worker.model_runner, "prefill_cuda_graph_runner", None
-        )
+        prefill_runner = self.tp_worker.model_runner.prefill_cuda_graph_runner
         if isinstance(
             prefill_runner, PrefillCudaGraphRunner
         ) and prefill_runner.can_run_graph(forward_batch):
@@ -335,9 +333,9 @@ class HiggsTTSModelRunner(ModelRunner):
         top_ks: list[int | None] = []
         for request in requests:
             params = request.data.req.sampling_params
-            temps.append(float(getattr(params, "temperature", 1.0)))
-            top_ps.append(float(getattr(params, "top_p", 1.0)))
-            top_k = getattr(params, "top_k", None)
+            temps.append(float(params.temperature))
+            top_ps.append(float(params.top_p))
+            top_k = params.top_k
             top_ks.append(
                 int(top_k) if top_k is not None and 0 < int(top_k) < K_MAX else None
             )

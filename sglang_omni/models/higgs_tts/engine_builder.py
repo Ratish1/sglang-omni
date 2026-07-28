@@ -207,11 +207,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         if server_args.cuda_graph_config.prefill.backend == "disabled":
             return
         runner = self._prefill_graph_model_runner
-        prefill_runner = (
-            None
-            if runner is None
-            else getattr(runner, "prefill_cuda_graph_runner", None)
-        )
+        prefill_runner = None if runner is None else runner.prefill_cuda_graph_runner
         if not isinstance(prefill_runner, PrefillCudaGraphRunner):
             raise RuntimeError(
                 "Higgs explicitly enabled prefill CUDA graph, but SGLang did "

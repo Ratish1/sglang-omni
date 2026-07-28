@@ -241,7 +241,7 @@ def create_sglang_fun_asr_executor(
                 model,
                 model_path=model_path,
                 feature_extractor=feature_extractor,
-                mm_attention_backend=getattr(server_args, "mm_attention_backend", None),
+                mm_attention_backend=server_args.mm_attention_backend,
             ),
             cache_max_entries=pre_lm_cache_max_entries,
             cache_max_bytes=pre_lm_cache_size_bytes,

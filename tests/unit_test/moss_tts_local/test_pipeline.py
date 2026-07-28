@@ -1870,6 +1870,8 @@ def test_post_process_outputs_does_not_buffer_without_stream_outbox():
         req=None,
         output_rows=[],
         stream_metadata={"modality": "audio"},
+        stream_pending_rows=[],
+        stream_first_batch_sent=False,
     )
     row = torch.arange(N_VQ + 1, dtype=torch.long).reshape(1, N_VQ + 1)
 
@@ -1888,7 +1890,7 @@ def test_post_process_outputs_does_not_buffer_without_stream_outbox():
     )
 
     assert len(data.output_rows) == 1
-    assert not hasattr(data, "stream_pending_rows")
+    assert data.stream_pending_rows == []
 
 
 def test_post_process_outputs_batches_stream_transport_rows():

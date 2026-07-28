@@ -125,8 +125,6 @@ class DllmScheduler:
             if msg.type == "new_request":
                 req_data = self._request_builder(msg.data)
                 req = req_data.req
-                if not hasattr(req, "is_chunked"):
-                    req.is_chunked = 0
                 self._rid_to_req_data[req.rid] = req_data
                 self._waiting_queue.append(req)
             else:
@@ -200,9 +198,6 @@ class DllmScheduler:
         self._waiting_queue = [
             r for r in self._waiting_queue if r.rid not in staging_rids
         ]
-
-        for req in self._staging_queue:
-            req.is_chunked += 1
 
         new_batch = ScheduleBatch.init_new(
             reqs=adder.can_run_list,

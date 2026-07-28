@@ -179,11 +179,10 @@ def create_talker_scheduler(
     # thinker text vocab), which mismatches the talker's codec-vocab logits.
     _codec_vocab_size = model_config.hf_config.talker_config.text_config.vocab_size
     model_config.vocab_size = _codec_vocab_size
-    _runner_cfg = getattr(model_worker.model_runner, "model_config", None)
-    if _runner_cfg is not None and _runner_cfg is not model_config:
+    _runner_cfg = model_worker.model_runner.model_config
+    if _runner_cfg is not model_config:
         _runner_cfg.vocab_size = _codec_vocab_size
-    if hasattr(model_worker.model_runner, "sampler"):
-        model_worker.model_runner.model._sampler = model_worker.model_runner.sampler
+    model_worker.model_runner.model._sampler = model_worker.model_runner.sampler
     if want_cuda_graph:
         override_server_args(
             server_args,
