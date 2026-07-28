@@ -1565,11 +1565,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
         forward_batch_info.ForwardBatch,
         "init_new",
         staticmethod(
-            lambda model_worker_batch,
-            model_runner,
-            *,
-            capture_hidden_mode=None,
-            return_hidden_states_before_norm: fake_forward_batch
+            lambda model_worker_batch, model_runner, *, capture_hidden_mode=None, return_hidden_states_before_norm: fake_forward_batch
         ),
     )
     monkeypatch.setattr(

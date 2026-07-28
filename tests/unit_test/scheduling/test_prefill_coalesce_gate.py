@@ -62,9 +62,7 @@ def upstream():
     with mock.patch.object(
         omni_scheduler._Upstream,
         "get_new_batch_prefill",
-        return_value=NextBatchPlan(
-            batch_to_run=_UPSTREAM_BATCH, running_batch=None
-        ),
+        return_value=NextBatchPlan(batch_to_run=_UPSTREAM_BATCH, running_batch=None),
     ) as patched:
         yield patched
 
@@ -172,9 +170,7 @@ def test_real_partial_admission_cycle_releases_leftovers_immediately(clock):
     # expired wave; the leftover keeps its stamp and releases on the next pass.
     def _admit_head(self, running_batch):
         self.waiting_queue.pop(0)
-        return NextBatchPlan(
-            batch_to_run=_UPSTREAM_BATCH, running_batch=running_batch
-        )
+        return NextBatchPlan(batch_to_run=_UPSTREAM_BATCH, running_batch=running_batch)
 
     sched = _StubScheduler(coalesce_requests=8, wait_ms=60.0)
     clock.return_value = 100.07
