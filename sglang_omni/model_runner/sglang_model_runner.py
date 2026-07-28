@@ -20,6 +20,7 @@ from sglang_omni.utils.gpu_memory import (
     get_gpu_device_info,
     get_process_gpu_memory_bytes,
 )
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -294,11 +295,19 @@ class SGLModelRunner(ModelRunner):
 
         ipc_weights.wait_for_any_export(ws.dir_path, timeout_s=ws.attach_timeout_s)
         original_load_format = self.server_args.load_format
-        self.server_args.load_format = "dummy"
+        override_server_args(
+            self.server_args,
+            "sglang_omni.weight_share.follower_dummy_load",
+            load_format="dummy",
+        )
         try:
             super().load_model()
         finally:
-            self.server_args.load_format = original_load_format
+            override_server_args(
+                self.server_args,
+                "sglang_omni.weight_share.restore_load_format",
+                load_format=original_load_format,
+            )
         self._weight_share_record, self._weight_ipc_leader_monitor = (
             ipc_weights.follower_attach(
                 self.model,
@@ -315,18 +324,28 @@ class SGLModelRunner(ModelRunner):
         torch.cuda.empty_cache()
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
-        """Re-verify shared-storage identity right before any graph capture.
+        """Re-verify shared weights and finish post-capture KV sizing.
 
         Followers: catches any load-path step that re-created a parameter
         after attach (would silently serve dummy weights). Leader: catches a
         post-export .data rebind (would silently orphan the followers).
+
+        SGLang 0.5.16 optionally reserves the KV pool as virtual memory and
+        backs its serving span only after CUDA graph capture. Omni has several
+        deferred graph-capture call sites, so finalize here at the common
+        capture boundary instead of relying on every stage to mirror the
+        scheduler's post-capture hook.
         """
         record = self._weight_share_record
         if record is not None:
             from sglang_omni.utils import ipc_weights
 
             ipc_weights.verify_attachment(self.model, record)
-        return super().init_cuda_graphs(capture_decode_cuda_graph)
+        result = super().init_cuda_graphs(capture_decode_cuda_graph)
+        token_to_kv_pool = getattr(self, "token_to_kv_pool", None)
+        if bool(getattr(token_to_kv_pool, "post_capture_active", False)):
+            self.post_capture_resize_kv_pool()
+        return result
 
     def _weight_update_blocked_reason(self) -> str | None:
         ws = self._weight_share_config

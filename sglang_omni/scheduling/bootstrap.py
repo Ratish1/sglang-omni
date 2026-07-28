@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sglang_omni.vendor.sglang.server_args import override_server_args
+
 
 def create_sglang_infrastructure(
     server_args: Any,
@@ -129,7 +131,11 @@ def create_sglang_infrastructure_defer_cuda_graph(
     """
     want_cuda_graph = not bool(server_args.disable_cuda_graph)
     if want_cuda_graph:
-        server_args.disable_cuda_graph = True
+        override_server_args(
+            server_args,
+            "sglang_omni.defer_cuda_graph_capture",
+            disable_cuda_graph=True,
+        )
     try:
         infrastructure = create_sglang_infrastructure(
             server_args,
@@ -139,5 +145,9 @@ def create_sglang_infrastructure_defer_cuda_graph(
         )
     finally:
         if want_cuda_graph:
-            server_args.disable_cuda_graph = False
+            override_server_args(
+                server_args,
+                "sglang_omni.restore_cuda_graph_capture",
+                disable_cuda_graph=False,
+            )
     return want_cuda_graph, infrastructure

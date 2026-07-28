@@ -6,6 +6,7 @@ import logging
 from typing import Any, Callable
 
 from sglang_omni.models.ming_omni.pipeline.sampling import build_ming_sampling_params
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,11 @@ def create_thinker_scheduler(
     if tp_size < 1:
         raise ValueError(f"tp_size must be >= 1, got {tp_size}")
     if server_args.tp_size != tp_size:
-        server_args.tp_size = tp_size
+        override_server_args(
+            server_args,
+            "sglang_omni.ming_omni.tensor_parallel_size",
+            tp_size=tp_size,
+        )
 
     from sglang_omni.model_runner.ming_thinker_model_runner import (
         MingThinkerModelRunner,

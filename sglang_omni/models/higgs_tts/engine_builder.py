@@ -18,6 +18,7 @@ from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     DEFAULT_HIGGS_STREAM_STRIDE,
 )
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,11 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         prefill["full_prefill_max_req"] = resolved
 
     def customize_server_args(self, server_args: Any) -> None:
-        server_args.disable_overlap_schedule = True
+        override_server_args(
+            server_args,
+            "sglang_omni.higgs_tts.disable_overlap_schedule",
+            disable_overlap_schedule=True,
+        )
 
     def setup_model(
         self,

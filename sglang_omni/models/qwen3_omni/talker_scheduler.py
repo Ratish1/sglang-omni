@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang_omni.models.qwen3_omni.config import MIN_PARTIAL_START_CHUNKS
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +26,15 @@ def configure_talker_server_args(
     """
 
     want_cuda_graph = not bool(server_args.disable_cuda_graph)
+    overrides = {
+        "disable_radix_cache": True,
+        "chunked_prefill_size": 0,
+    }
     if feedback_enabled:
-        server_args.disable_overlap_schedule = True
+        overrides["disable_overlap_schedule"] = True
         if want_cuda_graph:
-            server_args.disable_cuda_graph = True
-    server_args.disable_radix_cache = True
-    server_args.chunked_prefill_size = 0
+            overrides["disable_cuda_graph"] = True
+    override_server_args(server_args, "qwen3_omni.talker", **overrides)
     return want_cuda_graph
 
 
@@ -127,15 +131,34 @@ class QwenTalkerScheduler(OmniScheduler):
                 f"seq_lens_sum is {type(batch.seq_lens_sum).__name__}, expected int; "
                 "sglang upstream prepare_for_decode changed; update rollback."
             )
+
+        # Resolve every 0.5.16 request field before releasing the allocation or
+        # changing any counters.  That keeps an upstream shape mismatch from
+        # leaving a half-rolled-back batch.
+        req_kv_states = []
+        for req in batch.reqs:
+            try:
+                req.decode_batch_idx
+                req.kv_committed_len
+                req_kv = req.kv
+                req_kv.kv_allocated_len
+            except AttributeError as exc:
+                raise AttributeError(
+                    "decode rollback expects SGLang 0.5.16 request state "
+                    "(req.decode_batch_idx, req.kv_committed_len, and "
+                    "req.kv.kv_allocated_len)"
+                ) from exc
+            req_kv_states.append(req_kv)
+
         if batch.out_cache_loc is not None:
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc)
             batch.out_cache_loc = None
         if batch.output_ids is None:
             batch.output_ids = batch.input_ids
-        for req in batch.reqs:
+        for req, req_kv in zip(batch.reqs, req_kv_states, strict=True):
             req.decode_batch_idx -= 1
             req.kv_committed_len -= 1
-            req.kv_allocated_len -= 1
+            req_kv.kv_allocated_len -= 1
         batch.seq_lens.sub_(1)
         batch.seq_lens_cpu.sub_(1)
         batch.orig_seq_lens.sub_(1)

@@ -6,6 +6,8 @@ from typing import Any
 
 from sglang.srt.server_args import ServerArgs
 
+from sglang_omni.vendor.sglang.server_args import override_server_args
+
 _DECODE_CUDA_GRAPH_ALIASES = {
     "cuda_graph_max_bs": "cuda_graph_max_bs_decode",
     "cuda_graph_bs": "cuda_graph_bs_decode",
@@ -83,4 +85,8 @@ def apply_encoder_mem_reserve(
             "floor 0.1; lower encoder_mem_reserve or pin mem_fraction_static "
             "explicitly."
         )
-    server_args.mem_fraction_static = round(reserved, 3)
+    override_server_args(
+        server_args,
+        "sglang_omni.encoder_mem_reserve",
+        mem_fraction_static=round(reserved, 3),
+    )

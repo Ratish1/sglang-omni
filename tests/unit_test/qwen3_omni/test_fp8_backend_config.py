@@ -11,6 +11,27 @@ import pytest
 from sglang_omni.model_runner import model_worker
 
 
+class _StrictServerArgsDouble:
+    """Reject bare writes while allowing the audited ServerArgs override API."""
+
+    def __init__(self, **fields: object) -> None:
+        object.__setattr__(self, "_locked", False)
+        object.__setattr__(self, "override_calls", [])
+        for name, value in fields.items():
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_locked", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if self._locked and not name.startswith("_"):
+            raise AttributeError(f"bare mutation of {name}")
+        object.__setattr__(self, name, value)
+
+    def override(self, source: str, **fields: object) -> None:
+        self.override_calls.append((source, dict(fields)))
+        for name, value in fields.items():
+            object.__setattr__(self, name, value)
+
+
 @dataclass(frozen=True)
 class BackendPolicyCase:
     name: str
@@ -367,6 +388,48 @@ def test_model_worker_backend_policy_precedence(
     assert server_args.quantization == case.server_quantization
     assert server_args.moe_runner_backend == case.expected_moe_backend
     assert server_args.fp8_gemm_runner_backend == case.expected_fp8_gemm_backend
+
+
+def test_model_worker_backend_policy_uses_strict_server_args_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        model_worker,
+        "_is_fp8_cutlass_moe_supported",
+        lambda: True,
+    )
+    server_args = _StrictServerArgsDouble(
+        quantization="fp8",
+        moe_runner_backend="auto",
+        fp8_gemm_runner_backend="auto",
+        fp4_gemm_runner_backend="auto",
+        ep_size=1,
+    )
+    model_config = _model_config(
+        quantization="fp8",
+        native_fp8_block_quant=True,
+        has_moe=True,
+    )
+
+    effective_quantization = model_worker._apply_model_worker_backend_policy(
+        server_args,
+        model_config,
+        "Qwen3OmniTalker",
+    )
+
+    assert effective_quantization == "fp8"
+    assert server_args.moe_runner_backend == "cutlass"
+    assert server_args.fp8_gemm_runner_backend == "triton"
+    assert server_args.override_calls == [
+        (
+            "sglang-omni-qwen3-backend-policy",
+            {"moe_runner_backend": "cutlass"},
+        ),
+        (
+            "sglang-omni-qwen3-backend-policy",
+            {"fp8_gemm_runner_backend": "triton"},
+        ),
+    ]
 
 
 def test_model_config_has_moe_prefers_effective_text_config() -> None:

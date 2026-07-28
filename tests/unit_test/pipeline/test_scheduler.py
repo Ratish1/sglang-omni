@@ -848,14 +848,33 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
             lambda self, *_args, **_kwargs: None,
             raising=False,
         )
+
+    class StrictGlobalServerArgs:
+        def __init__(self) -> None:
+            object.__setattr__(self, "pp_max_micro_batch_size", None)
+            object.__setattr__(self, "override_calls", [])
+
+        def __setattr__(self, name, value) -> None:
+            raise AttributeError(f"bare mutation of {name}")
+
+        def override(self, source, **fields) -> None:
+            self.override_calls.append((source, dict(fields)))
+            for name, value in fields.items():
+                object.__setattr__(self, name, value)
+
+    global_server_args = StrictGlobalServerArgs()
     monkeypatch.setattr(
         "sglang.srt.server_args.get_global_server_args",
-        lambda: SimpleNamespace(pp_max_micro_batch_size=None),
+        lambda: global_server_args,
     )
     tp_worker = SimpleNamespace(
         gpu_id=0,
         tp_rank=0,
-        model_runner=SimpleNamespace(max_total_num_tokens=128),
+        model_runner=SimpleNamespace(
+            max_total_num_tokens=128,
+            effective_max_total_num_tokens=64,
+            max_running_requests=1,
+        ),
         random_seed=0,
         device=torch.device("cpu"),
     )
@@ -899,6 +918,15 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     assert scheduler.load_inquirer is not None
     assert scheduler.min_free_slots_delayer is None
     assert scheduler.max_queued_requests == 7
+    assert scheduler.max_running_requests == 1
+    assert scheduler.max_req_len == 63
+    assert global_server_args.pp_max_micro_batch_size == 1
+    assert global_server_args.override_calls == [
+        (
+            "sglang_omni.scheduler.pp_max_micro_batch_size_default",
+            {"pp_max_micro_batch_size": 1},
+        )
+    ]
     assert scheduler._abort_on_queued_limit(object()) is False
 
 

@@ -17,6 +17,7 @@ from sglang_omni.models.zonos2.hf_config import (
 )
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 from sglang_omni.utils.checkpoint import resolve_checkpoint
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +175,11 @@ class Zonos2EngineBuilder(TtsEngineBuilder):
         # note (Chenchen Hong): per-frame feedback/EOS state has no rollback, so a
         # non-final chunked-prefill chunk would queue a spurious frame; disable
         # chunking (mirrors the Qwen3-Omni talker).
-        server_args.chunked_prefill_size = 0
+        override_server_args(
+            server_args,
+            "sglang_omni.zonos2.disable_chunked_prefill",
+            chunked_prefill_size=0,
+        )
 
     def setup_model(
         self,

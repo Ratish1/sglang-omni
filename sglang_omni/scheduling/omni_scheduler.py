@@ -51,6 +51,7 @@ from sglang_omni.proto.admin import (
     ADMIN_WEIGHTS_CHECKER,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -225,11 +226,20 @@ class OmniScheduler:
         mr = tp_worker.model_runner
         self.max_total_num_tokens = mr.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
-        self.max_running_requests = server_args.max_running_requests
+        self.max_running_requests = getattr(
+            mr,
+            "max_running_requests",
+            server_args.max_running_requests,
+        )
         self.max_queued_requests = server_args.max_queued_requests
+        effective_max_total_num_tokens = getattr(
+            mr,
+            "effective_max_total_num_tokens",
+            self.max_total_num_tokens,
+        )
         self.max_req_len = min(
             server_args.context_length - 1,
-            self.max_total_num_tokens - 1,
+            effective_max_total_num_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 1
         self.random_seed = tp_worker.random_seed
@@ -244,9 +254,13 @@ class OmniScheduler:
 
         gsa = get_global_server_args()
         if gsa is not None and gsa.pp_max_micro_batch_size is None:
-            gsa.pp_max_micro_batch_size = max(
-                self.max_running_requests // self.pp_size,
-                1,
+            override_server_args(
+                gsa,
+                "sglang_omni.scheduler.pp_max_micro_batch_size_default",
+                pp_max_micro_batch_size=max(
+                    self.max_running_requests // self.pp_size,
+                    1,
+                ),
             )
 
         # Workers

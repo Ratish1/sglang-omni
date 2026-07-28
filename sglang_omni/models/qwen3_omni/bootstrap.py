@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sglang_omni.vendor.sglang.server_args import override_server_args
+
 
 def create_thinker_scheduler(
     server_args: Any,
@@ -38,8 +40,12 @@ def create_thinker_scheduler(
     want_cuda_graph = not bool(server_args.disable_cuda_graph)
     defer_cuda_graph_capture = want_cuda_graph and capture_hidden
     if defer_cuda_graph_capture:
-        server_args.enable_return_hidden_states = True
-        server_args.disable_cuda_graph = True
+        override_server_args(
+            server_args,
+            "sglang_omni.qwen3_omni.defer_cuda_graph_capture",
+            enable_return_hidden_states=True,
+            disable_cuda_graph=True,
+        )
 
     (
         model_worker,
@@ -61,7 +67,11 @@ def create_thinker_scheduler(
     )
 
     if defer_cuda_graph_capture:
-        server_args.disable_cuda_graph = False
+        override_server_args(
+            server_args,
+            "sglang_omni.qwen3_omni.restore_cuda_graph_capture",
+            disable_cuda_graph=False,
+        )
         model_worker.model_runner.init_cuda_graphs()
 
     def _should_generate_qwen_audio_output(request: Any) -> bool:
@@ -175,7 +185,11 @@ def create_talker_scheduler(
     if hasattr(model_worker.model_runner, "sampler"):
         model_worker.model_runner.model._sampler = model_worker.model_runner.sampler
     if want_cuda_graph:
-        server_args.disable_cuda_graph = False
+        override_server_args(
+            server_args,
+            "sglang_omni.qwen3_omni.talker_restore_cuda_graph_capture",
+            disable_cuda_graph=False,
+        )
         model_worker.model_runner.init_cuda_graphs()
 
     output_proc = SGLangOutputProcessor(
