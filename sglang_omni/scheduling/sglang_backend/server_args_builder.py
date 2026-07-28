@@ -60,7 +60,12 @@ def build_sglang_server_args(
     kwargs.setdefault("cuda_graph_backend_prefill", "disabled")
     if kwargs.get("mem_fraction_static") is None:
         kwargs.pop("mem_fraction_static", None)
-    return ServerArgs(**kwargs)
+    server_args = ServerArgs(**kwargs)
+    # DP attention is unsupported; reject at configuration time. Mixed
+    # chunked prefill stays allowed (the bridge handles it natively).
+    if server_args.enable_dp_attention:
+        raise ValueError("sglang-omni does not support enable_dp_attention")
+    return server_args
 
 
 def apply_encoder_mem_reserve(

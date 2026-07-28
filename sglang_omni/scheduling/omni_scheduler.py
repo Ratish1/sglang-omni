@@ -207,6 +207,13 @@ class OmniScheduler:
         # regression — see benchmark_results.md / stall_analysis.md). Default 2
         # = only bs=1 takes the fast path.
         self.async_decode_min_batch_size = int(async_decode_min_batch_size)
+        if self.enable_overlap and self.enable_async_decode:
+            raise ValueError(
+                "enable_overlap and enable_async_decode are mutually "
+                "exclusive: the async loop would run a batch-result processor "
+                "built for the overlap contract and leak KV for finished "
+                "requests"
+            )
 
         # Note: (maydomine) coalescing gate: hold prefill until K requests wait
         # or the oldest has waited T ms; 0 disables.

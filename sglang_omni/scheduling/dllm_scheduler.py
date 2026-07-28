@@ -166,23 +166,29 @@ class DllmScheduler:
         # Re-submit existing staging requests through the dLLM-specific budget
         # path. In FDFO mode an unresolved block must fit in full so its carried
         # algorithm state and resident KV describe the same block next round.
+        staging_no_token = False
         for req in self._staging_queue:
             req.init_next_round_input()
             if adder.add_dllm_staging_req(req) == AddReqResult.NO_TOKEN:
+                # A staging request that cannot fit stops all admission this
+                # round (upstream parity); admitting waiting requests would
+                # strand it without a slot.
+                staging_no_token = True
                 break
 
         # Add new waiting requests.
-        for req in self._waiting_queue:
-            req.init_next_round_input(self.tree_cache)
-            if (
-                adder.add_one_req(
-                    req,
-                    has_chunked_req=bool(self._staging_queue),
-                    truncation_align_size=None,
-                )
-                != AddReqResult.CONTINUE
-            ):
-                break
+        if not staging_no_token:
+            for req in self._waiting_queue:
+                req.init_next_round_input(self.tree_cache)
+                if (
+                    adder.add_one_req(
+                        req,
+                        has_chunked_req=bool(self._staging_queue),
+                        truncation_align_size=None,
+                    )
+                    != AddReqResult.CONTINUE
+                ):
+                    break
 
         if not adder.can_run_list:
             return None

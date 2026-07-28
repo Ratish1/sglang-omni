@@ -447,28 +447,32 @@ def test_model_config_has_moe_prefers_effective_text_config() -> None:
         "cutlass_supported",
         "sm90_supported",
         "sm100_supported",
+        "sm120_supported",
         "expected_supported",
     ),
     [
-        pytest.param(True, True, False, True, id="h100_h200_h20_supported"),
-        pytest.param(True, False, True, True, id="sm100_supported"),
-        pytest.param(True, False, False, False, id="unsupported_gpu_rejected"),
-        pytest.param(False, True, False, False, id="cutlass_runtime_rejected"),
+        pytest.param(True, True, False, False, True, id="h100_h200_h20_supported"),
+        pytest.param(True, False, True, False, True, id="sm100_supported"),
+        pytest.param(True, False, False, True, True, id="sm120_supported"),
+        pytest.param(True, False, False, False, False, id="unsupported_gpu_rejected"),
+        pytest.param(False, True, False, False, False, id="cutlass_runtime_rejected"),
     ],
 )
-def test_fp8_cutlass_moe_support_matches_sglang_0_5_12_post1_contract(
+def test_fp8_cutlass_moe_support_matches_sglang_0_5_16_contract(
     monkeypatch: pytest.MonkeyPatch,
     cutlass_supported: bool,
     sm90_supported: bool,
     sm100_supported: bool,
+    sm120_supported: bool,
     expected_supported: bool,
 ) -> None:
-    """Mirrors the CUTLASS FP8 MoE assertions in pinned SGLang 0.5.12.post1."""
+    """Mirrors the CUTLASS FP8 MoE assertions in SGLang 0.5.16."""
     _install_fake_cutlass_support_modules(
         monkeypatch,
         cutlass_supported=cutlass_supported,
         sm90_supported=sm90_supported,
         sm100_supported=sm100_supported,
+        sm120_supported=sm120_supported,
     )
 
     assert model_worker._is_fp8_cutlass_moe_supported() is expected_supported
@@ -640,6 +644,7 @@ def _install_fake_cutlass_support_modules(
     cutlass_supported: bool,
     sm90_supported: bool,
     sm100_supported: bool,
+    sm120_supported: bool = False,
 ) -> None:
     _install_fake_module(monkeypatch, "sglang")
     _install_fake_module(monkeypatch, "sglang.srt")
@@ -655,6 +660,7 @@ def _install_fake_cutlass_support_modules(
         "sglang.srt.utils",
         is_sm90_supported=lambda: sm90_supported,
         is_sm100_supported=lambda: sm100_supported,
+        is_sm120_supported=lambda: sm120_supported,
     )
 
 
