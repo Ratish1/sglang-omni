@@ -19,6 +19,7 @@ from sglang_omni.models.higgs_tts.modeling import (
 )
 from sglang_omni.models.higgs_tts.sampler import (
     K_MAX,
+    NO_SEED,
     HiggsBatchedSamplerState,
     batched_step,
     batched_step_direct,
@@ -205,12 +206,8 @@ class HiggsTTSModel(nn.Module):
         self._cg_active_last_codes = torch.zeros(
             pool_size, num_codebooks, dtype=torch.long, device=cg_device
         )
-        # Zero-seeded only until the first _populate_cg_buffers gather: real
-        # rows then carry the seed set_request_seed installed in the pool, and
-        # padding rows carry the reserved row's fresh random seed from
-        # reset_row. Either way every gathered seed is concrete/non-negative.
-        self._cg_active_seeds = torch.zeros(
-            pool_size, dtype=torch.long, device=cg_device
+        self._cg_active_seeds = torch.full(
+            (pool_size,), NO_SEED, dtype=torch.long, device=cg_device
         )
         self._cg_active_step_count = torch.zeros(
             pool_size, dtype=torch.long, device=cg_device
@@ -255,14 +252,15 @@ class HiggsTTSModel(nn.Module):
         return row
 
     def set_request_seed(self, req_id: str, seed: int | None) -> None:
-        """Pin ``req_id``'s concrete sampler seed for all of its AR steps.
+        """Pin req_id's sampler seed (None -> unseeded torch.multinomial).
 
-        Requests without a public seed receive one fresh random row seed. This
-        keeps them stochastic while allowing the CUDA-graph path to use the
-        same single seeded sampler kernel for every active request.
+        Constant across the request's AR steps; consumed by
+        multinomial_with_seed for seeded rows.
         """
         row = self.acquire_row(req_id)
-        self._sampler_pool.seeds[row] = resolve_row_seed(seed)
+        self._sampler_pool.seeds[row] = (
+            NO_SEED if seed is None else resolve_row_seed(seed)
+        )
 
     def release_row(self, req_id: str) -> None:
         """Return ``req_id``'s row to the free pool and drop its output codes."""

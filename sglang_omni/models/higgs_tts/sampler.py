@@ -18,7 +18,10 @@ from sgl_kernel import top_p_renorm_prob as _fused_top_p_renorm
 from sglang.srt.layers.sampler import multinomial_with_seed
 
 from sglang_omni.models.higgs_tts.utils import BOC_ID, EOC_ID
-from sglang_omni.sampling.seed import SAMPLING_SEED_MASK, new_random_sampling_seed
+
+# Sentinel seed for rows with no user seed: keeps the legacy unseeded
+# torch.multinomial path, so unseeded decode is byte-identical to before.
+NO_SEED = -1
 
 # Sentinel returned by ``step`` after ``generation_done``; engine treats as stop.
 STOP_CODE = -1
@@ -76,18 +79,10 @@ class HiggsBatchedSamplerState:
             dtype=torch.long,
             device=self.device,
         )
-        # Per-request seed and monotonic AR step, used to seed each
-        # ``(step, codebook)`` draw reproducibly. Every row always holds a
-        # concrete non-negative seed — random at construction and on reset —
-        # so a row that misses ``set_request_seed`` degrades to independent
-        # random sampling instead of silently sharing one sentinel-derived
-        # seed with every other missed row.
-        self.seeds = torch.randint(
-            0,
-            SAMPLING_SEED_MASK + 1,
-            (self.max_batch_size,),
-            dtype=torch.long,
-            device=self.device,
+        # Per-request seed (``NO_SEED`` = unseeded) and monotonic AR step, used
+        # to seed each ``(step, codebook)`` draw reproducibly.
+        self.seeds = torch.full(
+            (self.max_batch_size,), NO_SEED, dtype=torch.long, device=self.device
         )
         self.step_count = torch.zeros(
             self.max_batch_size, dtype=torch.long, device=self.device
@@ -99,7 +94,7 @@ class HiggsBatchedSamplerState:
         self.eoc_countdown[row] = -1
         self.generation_done[row] = False
         self.last_codes[row].zero_()
-        self.seeds[row] = new_random_sampling_seed()
+        self.seeds[row] = NO_SEED
         self.step_count[row] = 0
 
     def view_row(self, row: int) -> HiggsSamplerState:
@@ -275,25 +270,18 @@ def _sample_independent_batched(
         tp = top_p.view(B, 1).expand(B, N).reshape(B * N).to(torch.float32).contiguous()
         probs = _fused_top_p_renorm(probs, tp)
 
-    if seeds_B is None:
-        # Reference/tests may omit row seeds. Production resolves every active
-        # request to a concrete seed before its first prefill.
-        codes_flat = probs.multinomial(num_samples=1).squeeze(-1)
-    else:
-        if step_B is None:
-            raise ValueError("step_B is required when seeds_B is provided")
-        # Draw once from (seed, step*N + codebook). Seeds are non-negative by
-        # construction everywhere they originate: pool rows (including the
-        # reserved padding row) hold fresh random seeds from init/reset_row,
-        # and the CUDA-graph seed buffer starts zeroed until its first pool
-        # gather — so no sanitizing clamp that could silently collapse
-        # distinct rows onto one shared seed.
+    codes_flat = probs.multinomial(num_samples=1).squeeze(-1)
+    if seeds_B is not None:
+        # Seeded rows draw deterministically from (seed, step*N + codebook);
+        # unseeded rows (seed == NO_SEED) keep the torch.multinomial draw above.
         cb = torch.arange(N, device=logits_BNV.device).view(1, N).expand(B, N)
         positions = (step_B.view(B, 1) * N + cb).reshape(B * N)
-        seeds_flat = seeds_B.view(B, 1).expand(B, N).reshape(B * N)
-        codes_flat = multinomial_with_seed(
+        seeds_flat = seeds_B.clamp_min(0).view(B, 1).expand(B, N).reshape(B * N)
+        seeded_flat = multinomial_with_seed(
             torch.log(probs), seeds_flat, positions
         ).squeeze(-1)
+        has_seed = (seeds_B >= 0).view(B, 1).expand(B, N).reshape(B * N)
+        codes_flat = torch.where(has_seed, seeded_flat, codes_flat)
     sampled_BN = codes_flat.view(B, N)
 
     return torch.where(greedy_B1, argmax_BN, sampled_BN).to(torch.long)

@@ -20,7 +20,11 @@ from sglang_omni.models.higgs_tts.model import HiggsTTSModel
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import build_higgs_stream_metadata
-from sglang_omni.models.higgs_tts.sampler import K_MAX, HiggsBatchedSamplerState
+from sglang_omni.models.higgs_tts.sampler import (
+    K_MAX,
+    NO_SEED,
+    HiggsBatchedSamplerState,
+)
 from sglang_omni.models.higgs_tts.utils import EOC_ID, apply_delay_pattern
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
@@ -31,7 +35,6 @@ from sglang_omni.models.higgs_tts.vocoder_scheduler import (
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
-from sglang_omni.sampling.seed import SAMPLING_SEED_MASK
 from sglang_omni.scheduling.speaker_cache import get_speaker_artifact_cache
 from tests.unit_test.fakes import FakeServerArgs
 
@@ -74,16 +77,15 @@ def test_higgs_batch_metadata_refuses_missing_request_ids() -> None:
         model._extract_batch_metadata(forward_batch)
 
 
-def test_higgs_sampler_pool_rows_always_hold_concrete_seeds() -> None:
+def test_higgs_sampler_pool_rows_default_to_unseeded() -> None:
     pool = HiggsBatchedSamplerState(max_batch_size=4, num_codebooks=2, device="cpu")
 
-    assert bool((pool.seeds >= 0).all())
-    assert bool((pool.seeds <= SAMPLING_SEED_MASK).all())
+    assert bool((pool.seeds == NO_SEED).all())
 
-    pool.seeds[1] = -1  # a stale sentinel must not survive a row reset
+    pool.seeds[1] = 42  # a stale concrete seed must not survive a row reset
     pool.reset_row(1)
 
-    assert 0 <= int(pool.seeds[1].item()) <= SAMPLING_SEED_MASK
+    assert int(pool.seeds[1].item()) == NO_SEED
 
 
 def test_higgs_vocoder_rejects_compile_and_graph_domain_together() -> None:
@@ -97,21 +99,22 @@ def test_higgs_vocoder_rejects_compile_and_graph_domain_together() -> None:
         )
 
 
-def test_higgs_active_request_always_gets_concrete_row_seed() -> None:
+def test_higgs_request_row_seed_tracks_request_seed() -> None:
     model = object.__new__(HiggsTTSModel)
     model._rid_to_row = {}
     model._free_rows = [0]
     model._sampler_pool = SimpleNamespace(
-        seeds=torch.full((1,), -1, dtype=torch.long),
+        seeds=torch.full((1,), 7, dtype=torch.long),
         reset_row=lambda row: None,
     )
 
-    # Unseeded request: the real resolver must install a fresh concrete seed.
+    # Unseeded request: the row keeps the unseeded sentinel and stays on
+    # the true torch.multinomial path.
     model.set_request_seed("request", None)
     assert model._rid_to_row == {"request": 0}
-    assert 0 <= int(model._sampler_pool.seeds[0].item()) <= SAMPLING_SEED_MASK
+    assert int(model._sampler_pool.seeds[0].item()) == NO_SEED
 
-    # Seeded request on the same row: the public seed lands verbatim.
+    # Seeded request on the same row: the masked public seed lands.
     model.set_request_seed("request", 42)
     assert model._sampler_pool.seeds[0].item() == 42
 
