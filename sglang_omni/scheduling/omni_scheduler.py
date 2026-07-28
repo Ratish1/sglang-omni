@@ -1948,7 +1948,7 @@ class OmniScheduler:
         batch = self.running_batch
         if batch is None or batch.is_empty():
             return 0
-        batch.filter_batch(v1_spec_info_filtered=True)
+        batch.filter_batch()
         if len(batch.reqs) == 0:
             return 0
         # sglang 0.5.16 dropped ScheduleBatch.retract_all; the module-level
