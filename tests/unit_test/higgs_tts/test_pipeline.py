@@ -292,10 +292,14 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
             cuda_graph_max_bs=overrides["cuda_graph_max_bs"],
             cuda_graph_bs=overrides["cuda_graph_bs"],
             cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(
+                    max_bs=overrides["cuda_graph_max_bs"],
+                    bs=overrides["cuda_graph_bs"],
+                ),
                 prefill=SimpleNamespace(
                     backend=overrides["cuda_graph_config"]["prefill"]["backend"],
                     bs=overrides["cuda_graph_config"]["prefill"]["bs"],
-                )
+                ),
             ),
             torch_compile_max_bs=32,
         )

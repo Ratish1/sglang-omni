@@ -37,7 +37,9 @@ def _fake_runner(
     return SimpleNamespace(
         server_args=SimpleNamespace(
             max_running_requests=max_running_requests,
-            cuda_graph_max_bs=cuda_graph_max_bs,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(max_bs=cuda_graph_max_bs)
+            ),
             disable_cuda_graph=disable_cuda_graph,
         ),
         req_to_token_pool=SimpleNamespace(size=request_slots),

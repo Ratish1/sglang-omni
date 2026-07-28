@@ -620,11 +620,18 @@ def _install_fake_moss_ar_factory(
     process_memory_queries = []
 
     def fake_build_sglang_server_args(model_path, context_length, **kwargs):
-        return types.SimpleNamespace(
+        server_args = types.SimpleNamespace(
             model_path=model_path,
             context_length=context_length,
             **kwargs,
         )
+        server_args.cuda_graph_config = types.SimpleNamespace(
+            decode=types.SimpleNamespace(
+                max_bs=kwargs["cuda_graph_max_bs"],
+                bs=kwargs["cuda_graph_bs"],
+            )
+        )
+        return server_args
 
     class FakeModelRunner:
         model = object()

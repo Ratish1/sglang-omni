@@ -11,28 +11,12 @@ _MISSING = object()
 
 def get_decode_cuda_graph_max_bs(server_args: Any) -> Any:
     """Read the resolved SGLang decode CUDA Graph batch cap."""
-    config = getattr(server_args, "cuda_graph_config", None)
-    decode = getattr(config, "decode", None)
-    value = getattr(decode, "max_bs", None)
-    if value is not None:
-        return value
-    value = getattr(server_args, "cuda_graph_max_bs_decode", None)
-    if value is not None:
-        return value
-    return getattr(server_args, "cuda_graph_max_bs", None)
+    return server_args.cuda_graph_config.decode.max_bs
 
 
 def get_decode_cuda_graph_bs(server_args: Any) -> Any:
     """Read the resolved SGLang decode CUDA Graph batch buckets."""
-    config = getattr(server_args, "cuda_graph_config", None)
-    decode = getattr(config, "decode", None)
-    value = getattr(decode, "bs", None)
-    if value is not None:
-        return value
-    value = getattr(server_args, "cuda_graph_bs_decode", None)
-    if value is not None:
-        return value
-    return getattr(server_args, "cuda_graph_bs", None)
+    return server_args.cuda_graph_config.decode.bs
 
 
 def build_default_cuda_graph_bs(max_bs: int) -> list[int]:

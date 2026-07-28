@@ -99,7 +99,14 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
 
     def _fake_server_args_builder(model_path, context_length, **overrides):
         build_kwargs.update(overrides)
-        return SimpleNamespace(**overrides)
+        server_args = SimpleNamespace(**overrides)
+        server_args.cuda_graph_config = SimpleNamespace(
+            decode=SimpleNamespace(
+                max_bs=overrides["cuda_graph_max_bs"],
+                bs=overrides["cuda_graph_bs"],
+            )
+        )
+        return server_args
 
     def _fake_create_infrastructure(server_args, gpu_id, **kwargs):
         model_worker = SimpleNamespace(model_runner=SimpleNamespace(model=object()))

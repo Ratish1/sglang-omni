@@ -41,6 +41,12 @@ def _patch_thinker_startup(monkeypatch) -> list[dict[str, object]]:
             max_running_requests=overrides["max_running_requests"],
             cuda_graph_max_bs=overrides["cuda_graph_max_bs"],
             cuda_graph_bs=overrides["cuda_graph_bs"],
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(
+                    max_bs=overrides["cuda_graph_max_bs"],
+                    bs=overrides["cuda_graph_bs"],
+                )
+            ),
             disable_cuda_graph=overrides["disable_cuda_graph"],
             enable_torch_compile=overrides.get("enable_torch_compile", False),
             torch_compile_max_bs=overrides["torch_compile_max_bs"],
@@ -271,6 +277,12 @@ def test_qwen_thinker_threads_explicit_generation_batch_policy(
             max_running_requests=overrides["max_running_requests"],
             cuda_graph_max_bs=overrides["cuda_graph_max_bs"],
             cuda_graph_bs=overrides["cuda_graph_bs"],
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(
+                    max_bs=overrides["cuda_graph_max_bs"],
+                    bs=overrides["cuda_graph_bs"],
+                )
+            ),
             disable_cuda_graph=overrides["disable_cuda_graph"],
             enable_torch_compile=overrides.get("enable_torch_compile", False),
             torch_compile_max_bs=overrides["torch_compile_max_bs"],
@@ -332,6 +344,12 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
             max_running_requests=overrides["max_running_requests"],
             cuda_graph_max_bs=overrides["cuda_graph_max_bs"],
             cuda_graph_bs=overrides["cuda_graph_bs"],
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(
+                    max_bs=overrides["cuda_graph_max_bs"],
+                    bs=overrides["cuda_graph_bs"],
+                )
+            ),
             disable_cuda_graph=overrides["disable_cuda_graph"],
             enable_torch_compile=overrides.get("enable_torch_compile", False),
             torch_compile_max_bs=overrides["torch_compile_max_bs"],
@@ -405,6 +423,12 @@ def test_talker_ar_default_running_batch_width_is_32(monkeypatch) -> None:
             max_running_requests=overrides["max_running_requests"],
             cuda_graph_max_bs=overrides["cuda_graph_max_bs"],
             cuda_graph_bs=overrides["cuda_graph_bs"],
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(
+                    max_bs=overrides["cuda_graph_max_bs"],
+                    bs=overrides["cuda_graph_bs"],
+                )
+            ),
             disable_cuda_graph=overrides["disable_cuda_graph"],
             enable_torch_compile=overrides.get("enable_torch_compile", False),
             torch_compile_max_bs=overrides["torch_compile_max_bs"],
