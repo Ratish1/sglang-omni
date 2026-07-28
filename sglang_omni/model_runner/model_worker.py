@@ -160,10 +160,8 @@ class ModelWorker:
 
     def get_worker_info(self):
         max_total_num_tokens = self.model_runner.max_total_num_tokens
-        effective_max_total_num_tokens = getattr(
-            self.model_runner,
-            "effective_max_total_num_tokens",
-            max_total_num_tokens,
+        effective_max_total_num_tokens = (
+            self.model_runner.effective_max_total_num_tokens
         )
         max_req_len = min(
             self.server_args.context_length - 1,
@@ -172,11 +170,7 @@ class ModelWorker:
         max_req_input_len = max_req_len - 1
         req_pool = self.model_runner.req_to_token_pool
         kv_pool = self.model_runner.token_to_kv_pool_allocator
-        max_running_requests = getattr(
-            self.model_runner,
-            "max_running_requests",
-            self.server_args.max_running_requests,
-        )
+        max_running_requests = self.model_runner.max_running_requests
         return (
             max_total_num_tokens,
             self.server_args.max_prefill_tokens,
@@ -292,9 +286,7 @@ class ModelWorker:
         model_path = payload.get("model_path")
         if not model_path:
             return False, "model_path is required"
-        update = getattr(self.model_runner, "update_weights_from_disk", None)
-        if update is None:
-            return False, "model runner does not support update_weights_from_disk"
+        update = self.model_runner.update_weights_from_disk
         load_format = payload.get("load_format") or self.server_args.load_format
         success, message = update(
             model_path,
@@ -302,7 +294,7 @@ class ModelWorker:
             recapture_cuda_graph=bool(payload.get("recapture_cuda_graph", False)),
         )
         if success:
-            runner_args = getattr(self.model_runner, "server_args", None)
+            runner_args = self.model_runner.server_args
             updated_fields = {
                 "model_path": model_path,
                 "load_format": load_format,
@@ -316,16 +308,14 @@ class ModelWorker:
                 "sglang-omni-weight-update-disk",
                 **updated_fields,
             )
-            if runner_args is not None and runner_args is not self.server_args:
+            if runner_args is not self.server_args:
                 override_server_args(
                     runner_args,
                     "sglang-omni-weight-update-disk",
                     **updated_fields,
                 )
 
-            model_config = getattr(self.model_runner, "model_config", None)
-            if model_config is not None:
-                setattr(model_config, "model_path", model_path)
+            self.model_runner.model_config.model_path = model_path
         return bool(success), str(message)
 
     def update_weights_from_tensor(self, payload: dict[str, Any]) -> tuple[bool, str]:
@@ -338,9 +328,7 @@ class ModelWorker:
         return self._call_optional_weight_method("update_weights_from_tensor", payload)
 
     def init_weights_update_group(self, payload: dict[str, Any]) -> tuple[bool, str]:
-        init = getattr(self.model_runner, "init_weights_update_group", None)
-        if init is None:
-            return False, "model runner does not support init_weights_update_group"
+        init = self.model_runner.init_weights_update_group
         master_address = payload.get("master_address")
         master_port = payload.get("master_port")
         world_size = payload.get("world_size")
@@ -363,21 +351,14 @@ class ModelWorker:
         return bool(success), str(message)
 
     def destroy_weights_update_group(self, payload: dict[str, Any]) -> tuple[bool, str]:
-        destroy = getattr(self.model_runner, "destroy_weights_update_group", None)
-        if destroy is None:
-            return False, "model runner does not support destroy_weights_update_group"
+        destroy = self.model_runner.destroy_weights_update_group
         success, message = destroy(payload.get("group_name") or "weight_update_group")
         return bool(success), str(message)
 
     def update_weights_from_distributed(
         self, payload: dict[str, Any]
     ) -> tuple[bool, str]:
-        update = getattr(self.model_runner, "update_weights_from_distributed", None)
-        if update is None:
-            return (
-                False,
-                "model runner does not support update_weights_from_distributed",
-            )
+        update = self.model_runner.update_weights_from_distributed
         names = payload.get("names")
         dtypes = payload.get("dtypes")
         shapes = payload.get("shapes")
@@ -408,8 +389,8 @@ class ModelWorker:
                     "sglang-omni-weight-update-distributed",
                     weight_version=weight_version,
                 )
-                runner_args = getattr(self.model_runner, "server_args", None)
-                if runner_args is not None and runner_args is not self.server_args:
+                runner_args = self.model_runner.server_args
+                if runner_args is not self.server_args:
                     override_server_args(
                         runner_args,
                         "sglang-omni-weight-update-distributed",
@@ -431,9 +412,7 @@ class ModelWorker:
         method_name: str,
         payload: dict[str, Any],
     ) -> tuple[bool, str]:
-        method = getattr(self.model_runner, method_name, None)
-        if method is None:
-            return False, f"model runner does not support {method_name}"
+        method = getattr(self.model_runner, method_name)
         recv_req = SimpleNamespace(**payload)
         success, message = method(recv_req)
         return bool(success), str(message)

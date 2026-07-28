@@ -888,15 +888,29 @@ def test_omni_scheduler_normalizes_req_token_arrays_for_sglang_0515() -> None:
 def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     """Upstream requeue helpers read max_queued_requests on OmniScheduler."""
     monkeypatch.setattr(
-        OmniScheduler, "_init_parallel_state", lambda self, _tp_worker: None
+        OmniScheduler,
+        "_init_parallel_state",
+        lambda self, _tp_worker: setattr(self, "ps", SimpleNamespace(pp_size=1)),
     )
-    for method_name in ("init_metrics_collector", "init_metrics_reporter"):
-        monkeypatch.setattr(
-            OmniScheduler,
-            method_name,
-            lambda self, *_args, **_kwargs: None,
-            raising=False,
-        )
+    monkeypatch.setattr(
+        OmniScheduler,
+        "init_metrics_collector",
+        lambda self, *_args, **_kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        OmniScheduler,
+        "init_metrics_reporter",
+        lambda self, *_args, **_kwargs: setattr(
+            self,
+            "metrics_reporter",
+            SimpleNamespace(
+                reset_metrics=lambda: None,
+                is_stats_logging_rank=False,
+            ),
+        ),
+        raising=False,
+    )
 
     class StrictGlobalServerArgs:
         def __init__(self) -> None:
@@ -961,7 +975,7 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     )
 
     assert scheduler._pending_chunked_abort_req is None
-    assert scheduler.new_token_ratio_tracker.current == scheduler.new_token_ratio
+    assert scheduler.new_token_ratio_tracker is not None
     assert scheduler.dp_attn_adapter is not None
     assert scheduler.pool_stats_observer is not None
     assert scheduler.load_inquirer is not None
@@ -996,15 +1010,29 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
 ) -> None:
     """Initial and late runners receive the same execution bridge contract."""
     monkeypatch.setattr(
-        OmniScheduler, "_init_parallel_state", lambda self, _tp_worker: None
+        OmniScheduler,
+        "_init_parallel_state",
+        lambda self, _tp_worker: setattr(self, "ps", SimpleNamespace(pp_size=1)),
     )
-    for method_name in ("init_metrics_collector", "init_metrics_reporter"):
-        monkeypatch.setattr(
-            OmniScheduler,
-            method_name,
-            lambda self, *_args, **_kwargs: None,
-            raising=False,
-        )
+    monkeypatch.setattr(
+        OmniScheduler,
+        "init_metrics_collector",
+        lambda self, *_args, **_kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        OmniScheduler,
+        "init_metrics_reporter",
+        lambda self, *_args, **_kwargs: setattr(
+            self,
+            "metrics_reporter",
+            SimpleNamespace(
+                reset_metrics=lambda: None,
+                is_stats_logging_rank=False,
+            ),
+        ),
+        raising=False,
+    )
     monkeypatch.setattr(
         "sglang.srt.server_args.get_global_server_args",
         lambda: SimpleNamespace(pp_max_micro_batch_size=None),

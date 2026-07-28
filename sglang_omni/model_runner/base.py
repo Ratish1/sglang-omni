@@ -49,11 +49,11 @@ def resolve_deferred_prefill_inputs(schedule_batch: Any, device: torch.device) -
     Scheduler-owned execution resolves this through ``SGLangExecutionBridge``.
     This fallback remains for model runners invoked without an OmniScheduler.
     """
-    staged_input_ids = getattr(schedule_batch, "prefill_input_ids_cpu", None)
+    staged_input_ids = schedule_batch.prefill_input_ids_cpu
     if staged_input_ids is None:
         return
 
-    if getattr(schedule_batch, "mix_running_indices", None) is not None:
+    if schedule_batch.mix_running_indices is not None:
         raise RuntimeError(
             "Omni does not support SGLang mixed chunked-prefill batches with "
             "deferred decode tokens"
@@ -197,7 +197,7 @@ class ModelRunner:
         *,
         isolate_sampling: bool = False,
     ):
-        bridge = getattr(self, "_execution_bridge", None)
+        bridge = self._execution_bridge
         return (
             bridge.forward_context(
                 schedule_batch,
@@ -286,7 +286,7 @@ class ModelRunner:
             schedule_batch,
             model_worker_batch,
             scheduler_output,
-            set_output_ids=getattr(self, "_execution_bridge", None) is None,
+            set_output_ids=self._execution_bridge is None,
         )
 
     def execute_launch(self, scheduler_output: Any) -> "_PendingStep | None":
@@ -337,7 +337,7 @@ class ModelRunner:
                 schedule_batch,
                 scheduler_output.requests,
             )
-            bridge = getattr(self, "_execution_bridge", None)
+            bridge = self._execution_bridge
             if bridge is None:
                 # Compatibility path for runners not owned by OmniScheduler.
                 schedule_batch.output_ids = batch_result.next_token_ids
@@ -438,7 +438,7 @@ class ModelRunner:
         if capture_hidden_mode is None and self.output_processor._capture_hidden:
             capture_hidden_mode = CaptureHiddenMode.LAST
 
-        if getattr(self, "_execution_bridge", None) is None:
+        if self._execution_bridge is None:
             resolve_deferred_prefill_inputs(schedule_batch, self.device)
         # sglang 0.5.16 dropped ScheduleBatch.capture_hidden_mode: init_new no
         # longer reads it off the batch, so setting it there is a dead write.
@@ -639,7 +639,7 @@ class ModelRunner:
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        bridge = getattr(self, "_execution_bridge", None)
+        bridge = self._execution_bridge
         if bridge is None or schedule_batch.is_prefill_only:
             return
         bridge.publish_next_tokens(
@@ -894,17 +894,9 @@ class ModelRunner:
     @staticmethod
     def _enable_sampler_logprobs(forward_batch: Any, batch_size: int) -> None:
         forward_batch.return_logprob = True
-        try:
-            top_logprobs_nums = forward_batch.top_logprobs_nums
-        except AttributeError:
-            top_logprobs_nums = None
-        if top_logprobs_nums is None:
+        if forward_batch.top_logprobs_nums is None:
             forward_batch.top_logprobs_nums = [0] * batch_size
-        try:
-            token_ids_logprobs = forward_batch.token_ids_logprobs
-        except AttributeError:
-            token_ids_logprobs = None
-        if token_ids_logprobs is None:
+        if forward_batch.token_ids_logprobs is None:
             forward_batch.token_ids_logprobs = [None] * batch_size
 
     def _record_rollout_logprobs(
@@ -943,10 +935,7 @@ class ModelRunner:
 
     @staticmethod
     def _req_is_retracted(req: Any) -> bool:
-        try:
-            return bool(req.is_retracted)
-        except AttributeError:
-            return False
+        return bool(req.is_retracted)
 
     def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
         logits = logits_output.next_token_logits

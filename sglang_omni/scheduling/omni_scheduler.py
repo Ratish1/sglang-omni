@@ -189,13 +189,13 @@ class OmniScheduler:
         self.pp_rank = 0
         self.pp_size = server_args.pp_size
         self.dp_rank = None
-        self.dp_size = getattr(server_args, "dp_size", 1)
+        self.dp_size = server_args.dp_size
         self.moe_ep_rank = 0
         self.moe_ep_size = 1
         self.moe_dp_rank = None
-        self.moe_dp_size = getattr(server_args, "moe_dp_size", 1)
+        self.moe_dp_size = server_args.moe_dp_size
         self.attn_cp_rank = 0
-        self.attn_cp_size = getattr(server_args, "attn_cp_size", 1)
+        self.attn_cp_size = server_args.attn_cp_size
         self.page_size = server_args.page_size
         self.enable_overlap = enable_overlap
         # One-step-lookahead async decode (single stream + CUDA event). Only
@@ -226,17 +226,9 @@ class OmniScheduler:
         mr = tp_worker.model_runner
         self.max_total_num_tokens = mr.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
-        self.max_running_requests = getattr(
-            mr,
-            "max_running_requests",
-            server_args.max_running_requests,
-        )
+        self.max_running_requests = mr.max_running_requests
         self.max_queued_requests = server_args.max_queued_requests
-        effective_max_total_num_tokens = getattr(
-            mr,
-            "effective_max_total_num_tokens",
-            self.max_total_num_tokens,
-        )
+        effective_max_total_num_tokens = mr.effective_max_total_num_tokens
         self.max_req_len = min(
             server_args.context_length - 1,
             effective_max_total_num_tokens - 1,
@@ -244,8 +236,10 @@ class OmniScheduler:
         self.max_req_input_len = self.max_req_len - 1
         self.random_seed = tp_worker.random_seed
         self.device = tp_worker.device
-        self.full_tokens_per_layer = getattr(mr, "full_tokens_per_layer", None)
-        self.swa_tokens_per_layer = getattr(mr, "swa_tokens_per_layer", None)
+        # Hybrid-SWA per-layer capacities: upstream sources these from its
+        # kv_cache_builder; no Omni model serves hybrid-SWA, so they stay None.
+        self.full_tokens_per_layer = None
+        self.swa_tokens_per_layer = None
         self.min_free_slots_delayer = None
         self.enable_fpm = False
 
@@ -332,19 +326,6 @@ class OmniScheduler:
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_server_args(
             server_args
         )
-        self.init_new_token_ratio = min(
-            envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
-            * server_args.schedule_conservativeness,
-            1.0,
-        )
-        self.min_new_token_ratio = min(
-            self.init_new_token_ratio * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR.get(),
-            1.0,
-        )
-        self.new_token_ratio_decay = (
-            self.init_new_token_ratio - self.min_new_token_ratio
-        ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
-        self.new_token_ratio = self.init_new_token_ratio
         self.prefill_delayer = None
         self.lora_drainer = None
 
@@ -367,19 +348,10 @@ class OmniScheduler:
         self.current_scheduler_metrics_enabled = False
 
         # Speculative decoding (disabled)
-        try:
-            from sglang.srt.managers.scheduler import DllmStagingReqs
-        except ImportError:
-
-            class DllmStagingReqs:  # type: ignore[no-redef]
-                def __init__(self, dllm_config=None):
-                    self.dllm_config = dllm_config
-
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.dllm_config = None
-        self.dllm_staging_reqs = DllmStagingReqs(dllm_config=None)
         self.draft_worker = None
         self._execution_bridge = None
         if model_runner is not None:
@@ -508,21 +480,12 @@ class OmniScheduler:
         self.ngram_embedding_manager = NgramEmbeddingManager(
             enabled=False, table=None, n=0, k=0
         )
-        # Upstream scheduler_runtime_checker_mixin._streaming_session_count
-        # iterates ``self.session_controller.sessions.values()`` during
-        # report_decode_stats. We don't host SGLang's interactive-session
-        # feature, so a stub with an empty sessions dict is sufficient.
+        # Upstream pool_stats_observer.streaming_session_count iterates
+        # self.session_controller.sessions.values() during decode stats
+        # reporting. We don't host SGLang's interactive-session feature, so a
+        # stub with an empty sessions dict is sufficient.
         from types import SimpleNamespace
 
-        # SGLang 0.5.15 moved rank fields used by delegated scheduler methods
-        # behind ``self.ps``. Install a minimal value immediately; the real
-        # scheduler construction path replaces it after computing attention
-        # parallel ranks in _init_parallel_state().
-        self.ps = SimpleNamespace(pp_size=getattr(self, "pp_size", 1))
-        self.metrics_reporter = SimpleNamespace(
-            reset_metrics=lambda: getattr(self, "reset_metrics", lambda: None)(),
-            is_stats_logging_rank=False,
-        )
         self.session_controller = SimpleNamespace(sessions={})
         self.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
         self.load_snapshot_writer = None
@@ -580,7 +543,7 @@ class OmniScheduler:
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             max_total_num_tokens=(
-                self.max_total_num_tokens * getattr(self.server_args, "dcp_size", 1)
+                self.max_total_num_tokens * self.server_args.dcp_size
             ),
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
@@ -643,7 +606,6 @@ class OmniScheduler:
 
     def self_check_during_idle(self) -> None:
         self.new_token_ratio_tracker.reset()
-        self.new_token_ratio = self.new_token_ratio_tracker.current
         idle_sleeper = self.__dict__.get("idle_sleeper")
         if idle_sleeper is not None:
             idle_sleeper.maybe_sleep()
