@@ -1119,7 +1119,7 @@ class OmniScheduler:
         # Mirror upstream run_batch's per-forward counter: OmniScheduler
         # overrides run_batch, so without this forward_ct stays 0 and
         # SGLANG_TEST_RETRACT fires every step.
-        self.forward_ct = getattr(self, "forward_ct", 0) + 1
+        self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         sched_output = self._build_sched_output(batch)
         mr_output = self._model_runner.execute(sched_output)
@@ -1205,7 +1205,7 @@ class OmniScheduler:
         self._emit_prefill_start_for_batch(batch)
         # One forward per launch; mirror upstream run_batch's per-forward
         # counter (the matching resolve does no forward, so it must not count).
-        self.forward_ct = getattr(self, "forward_ct", 0) + 1
+        self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         sched_output = self._build_sched_output(batch)
         pending_step = self._model_runner.execute_launch(sched_output)
