@@ -134,7 +134,6 @@ class Qwen3TTSModelRunner(ModelRunner):
             hidden,
             semantic_positions=semantic_positions,
         )
-        schedule_batch.output_ids = result.next_token_ids
         self._has_pending_code_step = True
 
     def post_process_outputs(

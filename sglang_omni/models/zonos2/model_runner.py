@@ -269,8 +269,6 @@ class Zonos2ModelRunner(ModelRunner):
         pool.generation_step[row_t] = gstep + 1
         next_ids = torch.where(finished, torch.full_like(keys, EOS_SENTINEL), keys)
         result.next_token_ids = next_ids
-        if schedule_batch is not None:  # async launch publishes output_ids itself
-            schedule_batch.output_ids = next_ids
 
         # launch_buf snapshots what the (lagged) resolve reads. Pack codes +
         # per-row EOS metadata into one fresh int64 tensor (advanced indexing

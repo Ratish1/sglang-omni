@@ -8,7 +8,6 @@ pass, sampling, logit post-processing, and output extraction.
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -44,10 +43,10 @@ def _rank_shared_unseeded_sampling_seed(request: SchedulerRequest, row_idx: int)
 
 
 def resolve_deferred_prefill_inputs(schedule_batch: Any, device: torch.device) -> None:
-    """Materialize 0.5.15 prefill staging for standalone runner callers.
+    """Materialize staged CPU prefill inputs before a direct worker forward.
 
-    Scheduler-owned execution resolves this through ``SGLangExecutionBridge``.
-    This fallback remains for model runners invoked without an OmniScheduler.
+    Scheduler-owned execution resolves staging through SGLangExecutionBridge;
+    DllmScheduler calls this before invoking the worker directly.
     """
     staged_input_ids = schedule_batch.prefill_input_ids_cpu
     if staged_input_ids is None:
@@ -86,7 +85,7 @@ class _PendingStep:
     launch_buf: Any  # post_decode_launch return: device snapshot or host staging
     scheduler_output: Any  # this step's SchedulerOutput (routing + output proc)
     forward_batch: Any  # for resolve-time finalize sampling
-    schedule_batch: Any  # to set .output_ids during resolve
+    schedule_batch: Any  # resolve-time snapshot (copy of the live batch)
     batch_result: Any  # carries logits_output (device of next_token_ids)
 
 
@@ -197,14 +196,9 @@ class ModelRunner:
         *,
         isolate_sampling: bool = False,
     ):
-        bridge = self._execution_bridge
-        return (
-            bridge.forward_context(
-                schedule_batch,
-                isolate_sampling=isolate_sampling,
-            )
-            if bridge is not None
-            else nullcontext()
+        return self._execution_bridge.forward_context(
+            schedule_batch,
+            isolate_sampling=isolate_sampling,
         )
 
     def _next_host_staging(
@@ -249,7 +243,7 @@ class ModelRunner:
             built = self._build_forward_batch(scheduler_output)
             if built is None:
                 return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
-            forward_batch, schedule_batch, model_worker_batch, is_prefill = built
+            forward_batch, schedule_batch, is_prefill = built
             batch_result = self._prepare_and_forward(
                 forward_batch, schedule_batch, scheduler_output.requests, is_prefill
             )
@@ -271,7 +265,6 @@ class ModelRunner:
                 batch_result,
                 forward_batch,
                 schedule_batch,
-                model_worker_batch,
                 scheduler_output,
             )
             self._publish_next_tokens(
@@ -284,9 +277,7 @@ class ModelRunner:
             batch_result,
             forward_batch,
             schedule_batch,
-            model_worker_batch,
             scheduler_output,
-            set_output_ids=self._execution_bridge is None,
         )
 
     def execute_launch(self, scheduler_output: Any) -> "_PendingStep | None":
@@ -312,7 +303,7 @@ class ModelRunner:
             built = self._build_forward_batch(scheduler_output)
             if built is None:
                 return None
-            forward_batch, schedule_batch, model_worker_batch, is_prefill = built
+            forward_batch, schedule_batch, is_prefill = built
             assert not is_prefill, "async lookahead launch is decode-only"
             batch_result = self._prepare_and_forward(
                 forward_batch,
@@ -328,7 +319,6 @@ class ModelRunner:
                 batch_result,
                 forward_batch,
                 schedule_batch,
-                model_worker_batch,
                 scheduler_output,
             )
             self._publish_next_tokens(
@@ -337,26 +327,13 @@ class ModelRunner:
                 schedule_batch,
                 scheduler_output.requests,
             )
-            bridge = self._execution_bridge
-            if bridge is None:
-                # Compatibility path for runners not owned by OmniScheduler.
-                schedule_batch.output_ids = batch_result.next_token_ids
-                if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    schedule_batch.input_ids = batch_result.next_token_ids.to(
-                        torch.int64
-                    )
-                event = torch.cuda.Event()
-                event.record()
-                resolve_batch = schedule_batch
-                resolve_scheduler_output = scheduler_output
-            else:
-                event = bridge.record_completion()
-                # Never retain the mutable live ScheduleBatch across a lookahead
-                # iteration. The upstream overlap loop likewise queues batch.copy().
-                resolve_batch = schedule_batch.copy()
-                resolve_scheduler_output = replace(
-                    scheduler_output, batch_data=resolve_batch
-                )
+            event = self._execution_bridge.record_completion()
+            # Never retain the mutable live ScheduleBatch across a lookahead
+            # iteration. The upstream overlap loop likewise queues batch.copy().
+            resolve_batch = schedule_batch.copy()
+            resolve_scheduler_output = replace(
+                scheduler_output, batch_data=resolve_batch
+            )
         return _PendingStep(
             event=event,
             launch_buf=launch_buf,
@@ -401,15 +378,13 @@ class ModelRunner:
             pending.batch_result,
             pending.forward_batch,
             pending.schedule_batch,
-            pending.schedule_batch,
             pending.scheduler_output,
-            set_output_ids=False,
             skip_rids=skip_rids,
         )
 
     def _build_forward_batch(self, scheduler_output: Any):
         """Build the ForwardBatch + capture-hidden mode. Returns
-        ``(forward_batch, schedule_batch, model_worker_batch, is_prefill)``, or
+        ``(forward_batch, schedule_batch, is_prefill)``, or
         None when there is no batch to run."""
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -423,7 +398,6 @@ class ModelRunner:
         if schedule_batch is None:
             return None
 
-        model_worker_batch = schedule_batch
         is_prefill = bool(schedule_batch.forward_mode.is_extend())
 
         capture_hidden_mode = (
@@ -438,8 +412,6 @@ class ModelRunner:
         if capture_hidden_mode is None and self.output_processor._capture_hidden:
             capture_hidden_mode = CaptureHiddenMode.LAST
 
-        if self._execution_bridge is None:
-            resolve_deferred_prefill_inputs(schedule_batch, self.device)
         # sglang 0.5.16 dropped ScheduleBatch.capture_hidden_mode: init_new no
         # longer reads it off the batch, so setting it there is a dead write.
         # Pass the per-forward override explicitly (None lets upstream derive it).
@@ -449,7 +421,7 @@ class ModelRunner:
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=False,
         )
-        return forward_batch, schedule_batch, model_worker_batch, is_prefill
+        return forward_batch, schedule_batch, is_prefill
 
     def _prepare_and_forward(
         self,
@@ -500,7 +472,6 @@ class ModelRunner:
                     schedule_batch,
                     requests,
                 )
-                schedule_batch.output_ids = batch_result.next_token_ids
             return batch_result
         finally:
             if is_prefill:
@@ -538,28 +509,14 @@ class ModelRunner:
         batch_result,
         forward_batch,
         schedule_batch,
-        model_worker_batch,
         scheduler_output,
-        set_output_ids: bool = True,
         skip_rids: set[str] | None = None,
     ) -> ModelRunnerOutput:
-        """Final sampling (if still needed) + output extraction + per-request
-        bookkeeping. Shared tail of both the sync and async paths.
-
-        ``set_output_ids`` only serves the standalone compatibility path used
-        by older third-party wrappers. Scheduler-owned execution publishes the
-        next-forward GPU token rail through ``SGLangExecutionBridge`` instead;
+        """Output extraction + per-request bookkeeping. Shared tail of both
+        the sync and async paths; callers materialize reporting tokens via
+        _ensure_next_token_ids before the launch is considered complete. The
+        next-forward GPU token rail is published through SGLangExecutionBridge;
         async resolve must never stamp its lagged result onto a live batch."""
-        self._ensure_next_token_ids(
-            batch_result,
-            forward_batch,
-            schedule_batch,
-            model_worker_batch,
-            scheduler_output,
-        )
-        if set_output_ids:
-            schedule_batch.output_ids = batch_result.next_token_ids
-
         host_token_ids = self._resolve_host_token_ids(batch_result)
         if host_token_ids is None:
             outputs = self.output_processor.process(batch_result, scheduler_output)
@@ -599,16 +556,15 @@ class ModelRunner:
         batch_result: Any,
         forward_batch: Any,
         schedule_batch: Any,
-        model_worker_batch: Any,
         scheduler_output: Any,
     ) -> None:
         """Materialize this step's reporting tokens while still on its stream."""
         if schedule_batch.is_prefill_only:
             if batch_result.next_token_ids is None:
                 batch_result.next_token_ids = torch.zeros(
-                    len(model_worker_batch.seq_lens),
+                    len(schedule_batch.seq_lens),
                     dtype=torch.long,
-                    device=model_worker_batch.input_ids.device,
+                    device=schedule_batch.input_ids.device,
                 )
         elif batch_result.next_token_ids is None:
             batch_result.next_token_ids = self._sample_next_token_ids(
@@ -639,10 +595,9 @@ class ModelRunner:
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        bridge = self._execution_bridge
-        if bridge is None or schedule_batch.is_prefill_only:
+        if schedule_batch.is_prefill_only:
             return
-        bridge.publish_next_tokens(
+        self._execution_bridge.publish_next_tokens(
             schedule_batch,
             self.next_input_token_ids(result, forward_batch, requests),
         )

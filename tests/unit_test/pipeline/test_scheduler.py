@@ -301,42 +301,6 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
     assert scheduler._dirty_deferred_request_ids == set()
 
 
-def test_omni_scheduler_custom_runner_updates_next_input_ids() -> None:
-    """Custom AR runners must preserve SGLang's decode handoff contract."""
-
-    next_token_ids = torch.tensor([11, 12], dtype=torch.int32)
-
-    class FakeModelRunner:
-        def execute(self, sched_output):
-            sched_output.batch_data.output_ids = next_token_ids
-            return ModelRunnerOutput(outputs={}, can_run_cuda_graph=False)
-
-    scheduler = object.__new__(OmniScheduler)
-    scheduler._model_runner = FakeModelRunner()
-    scheduler._stream_output_builder = None
-    scheduler._prefill_start_done = set()
-
-    batch = SimpleNamespace(
-        reqs=[
-            SimpleNamespace(
-                rid="req-1", _omni_data=SimpleNamespace(), inflight_middle_chunks=0
-            ),
-            SimpleNamespace(
-                rid="req-2", _omni_data=SimpleNamespace(), inflight_middle_chunks=0
-            ),
-        ],
-        output_ids=None,
-        is_prefill_only=False,
-        is_extend_in_batch=False,
-    )
-
-    result = scheduler._run_batch(batch)
-
-    assert result.next_token_ids is next_token_ids
-    assert batch.input_ids.dtype == torch.int64
-    assert batch.input_ids.tolist() == [11, 12]
-
-
 def test_omni_scheduler_custom_runner_advances_forward_ct() -> None:
     """OmniScheduler overrides upstream run_batch, so it must count forwards
     itself; otherwise forward_ct stays 0 and the SGLANG_TEST_RETRACT_INTERVAL
@@ -346,8 +310,11 @@ def test_omni_scheduler_custom_runner_advances_forward_ct() -> None:
 
     class FakeModelRunner:
         def execute(self, sched_output):
-            sched_output.batch_data.output_ids = torch.tensor([1], dtype=torch.int32)
-            return ModelRunnerOutput(outputs={}, can_run_cuda_graph=False)
+            return ModelRunnerOutput(
+                outputs={},
+                can_run_cuda_graph=False,
+                next_token_ids=torch.tensor([1], dtype=torch.int32),
+            )
 
         def execute_launch(self, sched_output):
             return SimpleNamespace()
@@ -365,7 +332,6 @@ def test_omni_scheduler_custom_runner_advances_forward_ct() -> None:
                     rid="r", _omni_data=SimpleNamespace(), inflight_middle_chunks=0
                 )
             ],
-            output_ids=None,
             is_prefill_only=False,
             is_extend_in_batch=False,
         )
@@ -955,7 +921,6 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
         enable_hierarchical_cache=False,
         enable_hisparse=False,
         enable_dp_attention=False,
-        enable_unified_memory=False,
         enable_priority_scheduling=False,
         disable_priority_preemption=False,
         schedule_low_priority_values_first=False,
@@ -1073,7 +1038,6 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
         enable_hierarchical_cache=False,
         enable_hisparse=False,
         enable_dp_attention=False,
-        enable_unified_memory=False,
         enable_priority_scheduling=False,
         disable_priority_preemption=False,
         schedule_low_priority_values_first=False,

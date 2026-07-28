@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from sglang_omni.model_runner.base import ModelRunner
+from tests.unit_test.fakes import FakeExecutionBridge
 
 
 def _install_fake_forward_batch_module(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -114,6 +115,7 @@ def _runner(calls: list[str], *, custom_result):
 
     runner = object.__new__(RecordingRunner)
     runner.device = torch.device("cpu")
+    runner._execution_bridge = FakeExecutionBridge()
     runner.output_processor = SimpleNamespace(
         _capture_hidden=False,
         process=lambda result, scheduler_output: {
@@ -137,22 +139,20 @@ def _runner(calls: list[str], *, custom_result):
     return runner
 
 
-def test_build_forward_batch_materializes_deferred_prefill_input_ids(monkeypatch):
-    _install_fake_forward_batch_module(monkeypatch)
-    runner = _runner([], custom_result=None)
-    scheduler_output = _scheduler_output(is_prefill=True)
+def test_resolve_deferred_prefill_inputs_materializes_staged_ids():
+    from sglang_omni.model_runner.base import resolve_deferred_prefill_inputs
+
     staged = torch.tensor([11, 12], dtype=torch.long)
-    scheduler_output.batch_data.input_ids = None
-    scheduler_output.batch_data.prefill_input_ids_cpu = staged
+    batch = SimpleNamespace(
+        input_ids=None,
+        prefill_input_ids_cpu=staged,
+        mix_running_indices=None,
+    )
 
-    built = runner._build_forward_batch(scheduler_output)
+    resolve_deferred_prefill_inputs(batch, torch.device("cpu"))
 
-    assert built is not None
-    forward_batch, schedule_batch, _, is_prefill = built
-    assert is_prefill is True
-    assert schedule_batch.prefill_input_ids_cpu is None
-    assert torch.equal(schedule_batch.input_ids, staged)
-    assert forward_batch.marker == "worker-batch"
+    assert batch.prefill_input_ids_cpu is None
+    assert torch.equal(batch.input_ids, staged)
 
 
 @pytest.mark.parametrize(
@@ -266,8 +266,7 @@ def test_finalize_default_batch_generation_hook_calls_single_hook() -> None:
             can_run_cuda_graph=False,
         ),
         SimpleNamespace(),
-        SimpleNamespace(is_prefill_only=False, output_ids=None),
-        SimpleNamespace(seq_lens=[1, 1], input_ids=torch.zeros(2, dtype=torch.long)),
+        SimpleNamespace(is_prefill_only=False),
         SimpleNamespace(requests=requests),
     )
 

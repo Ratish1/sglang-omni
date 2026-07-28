@@ -188,7 +188,6 @@ class MossTTSModelRunner(ModelRunner):
 
         next_token_ids = rows[:, 0].contiguous()
         result.next_token_ids = next_token_ids
-        schedule_batch.output_ids = next_token_ids
         embeds = self.model._prepare_multi_modal_inputs(
             rows.to(device=self.model.device)
         )

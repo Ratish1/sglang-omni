@@ -462,13 +462,7 @@ class OmniScheduler:
         # off ``self`` has to be mirrored here or __getattr__ raises.
         # init_req_max_new_tokens() clamps against this one.
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
-        self.enable_dp_attention = bool(server_args.enable_dp_attention)
-        self.enable_unified_memory = bool(server_args.enable_unified_memory)
         self.cur_batch_for_debug = None
-        self._last_logged_elastic_radix_namespace = None
-        # Speculative decoding is refused by this scheduler, so the confidence
-        # relay stays at its upstream "disabled" value.
-        self._confidence_budget_prepare = None
         # get_next_batch_to_run() calls prepare_for_forward() on this
         # unconditionally, so it must be a real manager, not None. Upstream
         # takes it from the model runner; no Omni model uses ngram embedding
@@ -970,7 +964,7 @@ class OmniScheduler:
         # Omni model runners still read the old name to suppress intermediate
         # chunk outputs; _sync_legacy_is_chunked republishes it per forward.
         # This seed only covers readers that run before the first forward
-        # (request builders) and the _Upstream.run_batch fallback.
+        # (request builders).
         if not hasattr(req, "is_chunked"):
             req.is_chunked = 0
         if not hasattr(req, "extend_input_len"):
@@ -1126,20 +1120,17 @@ class OmniScheduler:
         ``ModelRunnerOutput``.  The upstream ``process_batch_result`` expects
         a ``GenerationBatchResult``.  We bridge the two formats here.
         """
+        del pp_proxy_tensors
         self._emit_prefill_start_for_batch(batch)
-        if self._model_runner is not None:
-            # Mirror upstream run_batch's per-forward counter: OmniScheduler
-            # overrides run_batch, so without this forward_ct stays 0 and
-            # SGLANG_TEST_RETRACT fires every step. Only the custom-runner path
-            # needs it (the fallback reaches upstream run_batch, which counts).
-            self.forward_ct = getattr(self, "forward_ct", 0) + 1
-            batch.forward_iter = self.forward_ct
-            sched_output = self._build_sched_output(batch)
-            mr_output = self._model_runner.execute(sched_output)
-            self._emit_stream_output(sched_output, mr_output)
-            return self._make_batch_result(batch, mr_output)
-        # Fallback: call upstream's run_batch (uses tp_worker directly)
-        return _Upstream.run_batch(self, batch, pp_proxy_tensors)
+        # Mirror upstream run_batch's per-forward counter: OmniScheduler
+        # overrides run_batch, so without this forward_ct stays 0 and
+        # SGLANG_TEST_RETRACT fires every step.
+        self.forward_ct = getattr(self, "forward_ct", 0) + 1
+        batch.forward_iter = self.forward_ct
+        sched_output = self._build_sched_output(batch)
+        mr_output = self._model_runner.execute(sched_output)
+        self._emit_stream_output(sched_output, mr_output)
+        return self._make_batch_result(mr_output)
 
     def _build_sched_output(self, batch):
         """Wrap a ScheduleBatch into the SchedulerOutput the model runner
@@ -1241,24 +1232,17 @@ class OmniScheduler:
         self._put_stream_messages(request_id, flush(request_id, req_data))
 
     @staticmethod
-    def _make_batch_result(batch, mr_output):
+    def _make_batch_result(mr_output):
         # process_batch_result reads reporting tokens. The next-forward GPU
         # token rail is independently published through FutureMap.
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
-        next_token_ids = getattr(mr_output, "next_token_ids", None)
-        if next_token_ids is None:
-            # Compatibility for third-party custom runners which still publish
-            # the pre-0.5.15 ScheduleBatch side channel.
-            next_token_ids = getattr(batch, "output_ids", None)
-            if isinstance(next_token_ids, torch.Tensor):
-                batch.input_ids = next_token_ids.to(torch.int64)
         # Note (wenyao): reuse the runner-staged pinned host copy so the mixin's
         # .tolist() is host-only. The GPU FutureMap relay independently drives
         # the next-forward input chain under the 0.5.16 execution contract.
-        host_token_ids = mr_output.host_token_ids
-        if host_token_ids is not None:
-            next_token_ids = host_token_ids
+        next_token_ids = mr_output.next_token_ids
+        if mr_output.host_token_ids is not None:
+            next_token_ids = mr_output.host_token_ids
         return GenerationBatchResult(
             logits_output=None,
             next_token_ids=next_token_ids,
@@ -1284,9 +1268,9 @@ class OmniScheduler:
         emit its stream chunks (except overrun reqs in ``skip_rids``), and
         return its GenerationBatchResult.
 
-        next_token_ids comes from the resolved step's own batch_result, not
-        ``batch.output_ids`` — the running batch's output_ids was already
-        consumed (reset to None) by the next step's prepare_for_decode.
+        next_token_ids comes from the resolved step's own batch_result; the
+        live batch carries no token side channel under the 0.5.16 FutureMap
+        contract.
         """
         from sglang.srt.managers.scheduler import GenerationBatchResult
 

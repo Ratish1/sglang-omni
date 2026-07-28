@@ -360,7 +360,6 @@ class MingTTSModelRunner(ModelRunner):
 
         next_token_ids = step_update.next_token_ids
         result.next_token_ids = next_token_ids
-        schedule_batch.output_ids = next_token_ids
 
     def _run_entry_tail_step(
         self,

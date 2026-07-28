@@ -767,7 +767,6 @@ def test_cached_pool_rows_drive_collect_and_batched_step_commit():
         result,
         forward_batch,
         schedule_batch,
-        SimpleNamespace(seq_lens=[1, 1], input_ids=torch.zeros(2, dtype=torch.long)),
         scheduler_output,
     )
 
@@ -807,8 +806,7 @@ def test_finalize_commits_generation_steps_to_pool():
             moss_journal=None,
         ),
         SimpleNamespace(),
-        SimpleNamespace(is_prefill_only=False, output_ids=None),
-        SimpleNamespace(seq_lens=[1], input_ids=torch.zeros(1, dtype=torch.long)),
+        SimpleNamespace(is_prefill_only=False),
         SimpleNamespace(requests=[sched_req]),
     )
 

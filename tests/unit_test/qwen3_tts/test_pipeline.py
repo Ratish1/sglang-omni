@@ -1641,8 +1641,6 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     schedule_batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_extend=lambda: False),
         is_prefill_only=False,
-        output_ids=None,
-        get_model_worker_batch=lambda: SimpleNamespace(),
     )
 
     output = runner.execute(

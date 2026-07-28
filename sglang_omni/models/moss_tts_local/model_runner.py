@@ -261,7 +261,6 @@ class MossTTSLocalModelRunner(ModelRunner):
         next_text = rows[:, 0]
         next_token_ids = self._row_radix_token_ids(rows, next_text, end_id)
         result.next_token_ids = next_token_ids
-        schedule_batch.output_ids = next_token_ids
 
     def _run_frame_decode(self, result: Any, forward_batch: Any, requests: list):
         """GPU half shared by sync ``_collect_frame`` and async

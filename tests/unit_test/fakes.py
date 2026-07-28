@@ -3,7 +3,30 @@
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
+
+
+class FakeExecutionBridge:
+    """SGLangExecutionBridge double for scheduler-owned ModelRunner tests."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[object, object]] = []
+        self.isolate_sampling_calls: list[bool] = []
+
+    @contextlib.contextmanager
+    def forward_context(self, batch: object, *, isolate_sampling: bool = False):
+        del batch
+        self.isolate_sampling_calls.append(isolate_sampling)
+        yield
+
+    def publish_next_tokens(self, batch: object, next_token_ids: object) -> None:
+        self.published.append((batch, next_token_ids))
+
+    def record_completion(self):
+        import torch
+
+        return torch.cuda.Event()
 
 
 class FakeServerArgs(SimpleNamespace):

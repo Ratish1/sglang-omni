@@ -85,7 +85,6 @@ class QwenTalkerModelRunner(ModelRunner):
         if isinstance(talker_hidden, torch.Tensor) and talker_hidden.ndim == 2:
             talker_hidden = talker_hidden.unsqueeze(1)
         self.model.code_predictor_forward(layer0_codes, talker_hidden)
-        schedule_batch.output_ids = result.next_token_ids
         self._stage_token_ids(result, result.next_token_ids)
         self._emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,
@@ -104,7 +103,6 @@ class QwenTalkerModelRunner(ModelRunner):
 
         batch_size = len(requests)
         result.next_token_ids = self.model._sampled_token_ids[:batch_size].clone()
-        schedule_batch.output_ids = result.next_token_ids
         self._stage_token_ids(result, result.next_token_ids)
         self._emit_code_chunks_and_feedback(
             schedule_batch=schedule_batch,

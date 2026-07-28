@@ -131,7 +131,6 @@ class VoxtralTTSModelRunner(ModelRunner):
         codes = self.model.acoustic_transformer(hidden)
         semantic_ids = codes[:, 0].to(dtype=torch.long)
         result.next_token_ids = semantic_ids
-        schedule_batch.output_ids = semantic_ids
 
         self._pending_audio_codes = codes
         self._pending_audio_embeds = self.model.audio_token_embedding(

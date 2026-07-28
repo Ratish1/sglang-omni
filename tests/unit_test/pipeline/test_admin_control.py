@@ -127,7 +127,6 @@ def test_omni_scheduler_update_weights_rejects_active_requests_by_default() -> N
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler._async_pending = None
-    scheduler.result_queue = None
     scheduler._resolve_pending_async = lambda: None
     scheduler._active_request_ids = lambda: ["req-1"]
 
@@ -194,7 +193,6 @@ def test_omni_scheduler_update_weights_flushes_cache_without_kwargs() -> None:
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler._async_pending = None
-    scheduler.result_queue = None
     scheduler._resolve_pending_async = lambda: None
     scheduler._active_request_ids = lambda: []
     scheduler.flush_cache = flush_cache
@@ -234,8 +232,6 @@ def test_omni_scheduler_flush_cache_has_upstream_idle_compat_fields() -> None:
             enable_hisparse=False,
             enable_priority_scheduling=False,
             disable_priority_preemption=False,
-            enable_dp_attention=False,
-            enable_unified_memory=False,
         ),
     )
     scheduler.running_batch = EmptyBatch()
@@ -288,7 +284,6 @@ def test_omni_scheduler_distributed_update_rejects_active_requests_by_default() 
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler._async_pending = None
-    scheduler.result_queue = None
     scheduler._resolve_pending_async = lambda: None
     scheduler._active_request_ids = lambda: ["req-1"]
 
@@ -345,7 +340,6 @@ def test_omni_scheduler_distributed_update_aborts_and_flushes_cache() -> None:
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler._async_pending = None
-    scheduler.result_queue = None
     scheduler._resolve_pending_async = lambda: None
     scheduler._active_request_ids = lambda: ["req-1"]
     scheduler._abort_all_requests = abort_all_requests
@@ -391,7 +385,6 @@ def test_omni_scheduler_distributed_update_failure_keeps_engine_paused() -> None
     scheduler._engine_paused = False
     scheduler._last_pause_mode = None
     scheduler._async_pending = None
-    scheduler.result_queue = None
     scheduler._resolve_pending_async = lambda: None
     scheduler._active_request_ids = lambda: []
 

@@ -104,7 +104,6 @@ class DllmScheduler:
                 batch=batch,
             )
 
-            batch.output_ids = batch_result.next_token_ids
             self._apply_results(batch, batch_result)
             self._post_step(batch)
 

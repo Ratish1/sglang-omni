@@ -22,7 +22,12 @@ import torch
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
-from sglang_omni.scheduling.types import ModelRunnerOutput, RequestOutput
+from sglang_omni.scheduling.types import (
+    ModelRunnerOutput,
+    RequestOutput,
+    SchedulerOutput,
+)
+from tests.unit_test.fakes import FakeExecutionBridge
 
 
 class _StubRunner(ModelRunner):
@@ -30,6 +35,7 @@ class _StubRunner(ModelRunner):
 
     def __init__(self):
         self._async_enabled = True
+        self._execution_bridge = FakeExecutionBridge()
         self._staging_slot = 0
         self._host_staging_buffers = []
         self._async_query_hit = 0
@@ -42,11 +48,10 @@ class _StubRunner(ModelRunner):
         self.last_skip_rids = None
 
     def _build_forward_batch(self, scheduler_output):
-        sb = types.SimpleNamespace(
-            is_prefill_only=False, output_ids=None, input_ids=None
-        )
+        sb = types.SimpleNamespace(is_prefill_only=False, input_ids=None)
+        sb.copy = lambda: sb
         self.last_schedule_batch = sb
-        return types.SimpleNamespace(), sb, types.SimpleNamespace(), False  # decode
+        return types.SimpleNamespace(), sb, False  # decode
 
     def _prepare_and_forward(
         self,
@@ -79,13 +84,10 @@ class _StubRunner(ModelRunner):
         batch_result,
         forward_batch,
         schedule_batch,
-        model_worker_batch,
         scheduler_output,
-        set_output_ids=True,
         skip_rids=None,
     ):
         self.finalize_calls += 1
-        self.last_set_output_ids = set_output_ids
         self.last_skip_rids = skip_rids or set()
         return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
 
@@ -108,8 +110,8 @@ def _patch_event(ready: bool):
 
 
 def _sched_output(n):
-    req_stub = types.SimpleNamespace(finished=lambda: False)
-    return types.SimpleNamespace(
+    req_stub = types.SimpleNamespace(finished=lambda: False, is_retracted=False)
+    return SchedulerOutput(
         requests=[
             types.SimpleNamespace(
                 request_id=f"r{i}",
@@ -138,7 +140,6 @@ def test_launch_returns_handle_resolve_consumes_it():
     # already set at the right length. Re-stamping the lagged step's tokens
     # leaves a stale-length output_ids -> input_ids/seq_lens mismatch once a req
     # finishes mid-batch (the bs>1 replay crash). The launch publishes it.
-    assert r.last_set_output_ids is False
 
 
 def test_two_launches_return_distinct_handles():
@@ -283,7 +284,6 @@ def test_finalize_skips_overrun_bookkeeping_and_extras():
         can_run_cuda_graph=False,
     )
     schedule_batch = types.SimpleNamespace(is_prefill_only=False, output_ids=None)
-    model_worker_batch = types.SimpleNamespace()
     keep_data = types.SimpleNamespace(generation_steps=0, extra_model_outputs={})
     skip_data = types.SimpleNamespace(generation_steps=0, extra_model_outputs={})
     scheduler_output = types.SimpleNamespace(
@@ -297,7 +297,6 @@ def test_finalize_skips_overrun_bookkeeping_and_extras():
         batch_result,
         types.SimpleNamespace(),
         schedule_batch,
-        model_worker_batch,
         scheduler_output,
         skip_rids={"skip"},
     )
