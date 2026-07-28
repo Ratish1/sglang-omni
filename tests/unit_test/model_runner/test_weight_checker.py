@@ -9,6 +9,7 @@ import torch
 
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.weight_checker import StrictWeightChecker, _tensor_bytes
+from tests.unit_test.fakes import FakeServerArgs
 
 
 class _StrictServerArgsDouble:
@@ -104,12 +105,12 @@ def test_model_worker_update_weights_from_disk_updates_visible_model_info() -> N
         calls.append((model_path, load_format, recapture_cuda_graph))
         return True, "ok"
 
-    worker_args = SimpleNamespace(
+    worker_args = FakeServerArgs(
         model_path="/tmp/old-model",
         load_format="auto",
         weight_version="old",
     )
-    runner_args = SimpleNamespace(
+    runner_args = FakeServerArgs(
         model_path="/tmp/old-model",
         load_format="auto",
         weight_version="old",

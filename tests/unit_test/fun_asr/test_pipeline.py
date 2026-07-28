@@ -10,6 +10,7 @@ import pytest
 import sglang_omni.models.fun_asr.stages as fun_asr_stages
 from sglang_omni.models.fun_asr.config import FunASRPipelineConfig
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
+from tests.unit_test.fakes import FakeServerArgs
 
 
 def test_fun_asr_config_uses_batched_stage_with_32_running_requests() -> None:
@@ -172,7 +173,7 @@ def test_fun_asr_threads_generation_batch_and_request_build_policy(monkeypatch) 
 
     def _fake_server_args_builder(model_path, context_length, **overrides):
         build_kwargs.update(overrides)
-        return SimpleNamespace(**overrides)
+        return FakeServerArgs(**overrides)
 
     model_worker = SimpleNamespace(model_runner=SimpleNamespace(model=object()))
     infrastructure = (

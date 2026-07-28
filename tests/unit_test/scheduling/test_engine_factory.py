@@ -7,6 +7,8 @@ import inspect
 from types import SimpleNamespace
 from typing import Any
 
+from tests.unit_test.fakes import FakeServerArgs
+
 TEST_MAX_TOTAL_TOKENS = 82000
 
 
@@ -99,7 +101,7 @@ def test_tts_engine_builder_phase_order_and_override_contract(monkeypatch) -> No
     ) -> Any:
         events.append("build_server_args")
         build_kwargs.update(kwargs)
-        return SimpleNamespace(
+        return FakeServerArgs(
             checkpoint_dir=checkpoint_dir,
             context_length=context_length,
             cuda_graph_bs=kwargs["cuda_graph_bs"],

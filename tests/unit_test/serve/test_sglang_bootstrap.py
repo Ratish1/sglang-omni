@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from sglang_omni.model_runner import model_worker as model_worker_module
 from sglang_omni.scheduling import bootstrap, sglang_backend
+from tests.unit_test.fakes import FakeServerArgs
 
 
 def test_create_sglang_infrastructure_runs_0515_initialization_phases(
@@ -75,7 +76,7 @@ def test_create_sglang_infrastructure_runs_0515_initialization_phases(
 
 
 def test_defer_cuda_graph_restores_requested_graph_capture(monkeypatch) -> None:
-    server_args = SimpleNamespace(disable_cuda_graph=False)
+    server_args = FakeServerArgs(disable_cuda_graph=False)
     seen: list[bool] = []
 
     def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):
@@ -110,7 +111,7 @@ def test_defer_cuda_graph_restores_requested_graph_capture(monkeypatch) -> None:
 
 
 def test_defer_cuda_graph_leaves_disabled_graph_capture_disabled(monkeypatch) -> None:
-    server_args = SimpleNamespace(disable_cuda_graph=True)
+    server_args = FakeServerArgs(disable_cuda_graph=True)
     seen: list[bool] = []
 
     def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):

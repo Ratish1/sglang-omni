@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from sglang_omni.model_runner import model_worker
+from tests.unit_test.fakes import FakeServerArgs
 
 
 class _StrictServerArgsDouble:
@@ -56,8 +57,8 @@ def _server_args(
     moe_runner_backend: str = "auto",
     fp8_gemm_runner_backend: str | None = "auto",
     ep_size: int = 1,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> FakeServerArgs:
+    return FakeServerArgs(
         quantization=quantization,
         moe_runner_backend=moe_runner_backend,
         fp8_gemm_runner_backend=fp8_gemm_runner_backend,
@@ -731,7 +732,7 @@ def test_configure_backend_policy_fp8_gemm_ordering(
     )
 
     # Build server_args.
-    server_args = SimpleNamespace(
+    server_args = FakeServerArgs(
         quantization=case.server_quantization,
         moe_runner_backend=case.initial_moe_backend,
         fp8_gemm_runner_backend=case.initial_fp8_gemm_backend,
