@@ -4,14 +4,14 @@ Centralize third-party imports and apply monkey patches here.
 
 Patches applied to RMSNorm.forward_cuda:
   - Empty tensor early return (avoids CUDA kernel launch on zero-element tensors)
-  - cast_x_before_out_mul fallback to forward_native (HF-compatible RMSNorm cast order)
   - dtype mismatch fallback when residual or post_residual_addition differ from x.dtype
 
-sglang 0.5.16 handles cast_x_before_out_mul in both of its own JIT paths
-(_jit_rmsnorm_hf for residual=None, _jit_fused_add_rmsnorm otherwise), so the
-second patch above is now a pessimization rather than a correctness fix.
-Removing it swaps eager PyTorch for a fused kernel, which is a numerics change,
-so it stays until a greedy token-id equivalence run confirms the swap.
+The cast_x_before_out_mul fallback to forward_native is gone: sglang 0.5.16
+handles that cast order in both of its own JIT paths (_jit_rmsnorm_hf when
+residual is None, _jit_fused_add_rmsnorm(cast_x_before_out_mul=True) otherwise,
+each with its own dtype/hidden-size guard falling back to forward_native). The
+fallback therefore forced every such RMSNorm onto the eager path on every
+forward. Upstream's own guards preserve the HF cast semantics.
 """
 
 from __future__ import annotations
@@ -75,13 +75,6 @@ def _patched_forward_cuda(
                 residual = residual + post_residual_addition
             return x, residual
         return x
-    if self.cast_x_before_out_mul:
-        return self.forward_native(
-            x,
-            residual,
-            post_residual_addition=post_residual_addition,
-            **kwargs,
-        )
     if residual is not None and residual.dtype != x.dtype:
         return self.forward_native(
             x,
