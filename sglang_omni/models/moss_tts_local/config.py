@@ -21,9 +21,12 @@ _PKG = "sglang_omni.models.moss_tts_local"
 # Keep reference encoding with AR so process-scoped SGLang accounting includes
 # its codec allocation. The vocoder is isolated: its Python-heavy packed decode
 # otherwise stalls the AR scheduler thread under ordinary serving concurrency.
-_COLOCATED_PREPROCESSING_GPU_MEMORY_FRACTION = 0.15
+# Budgets sum to 0.95: the remaining card share stays free for the two CUDA
+# contexts (pipeline + vocoder processes), allocator fragmentation, and load
+# transients, which are fixed byte costs rather than card-proportional ones.
+_COLOCATED_PREPROCESSING_GPU_MEMORY_FRACTION = 0.13
 _COLOCATED_AR_GPU_MEMORY_FRACTION = 0.67
-_COLOCATED_VOCODER_GPU_MEMORY_FRACTION = 0.18
+_COLOCATED_VOCODER_GPU_MEMORY_FRACTION = 0.15
 _AR_MEM_FRACTION_STATIC = 0.85
 _REF_AUDIO_CACHE_MAX_ITEMS = 8192
 _REF_AUDIO_CACHE_MAX_BYTES = 64 * 1024 * 1024
