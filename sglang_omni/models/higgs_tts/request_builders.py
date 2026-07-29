@@ -207,9 +207,8 @@ def make_higgs_scheduler_adapters(
     """Build (request_builder, result_adapter) closures bound to a
     :class:`HiggsTTSModel` instance.
 
-    The result adapter drops the model's per-request slot (sampler state +
-    accumulated codes) once a result is emitted so a long-running server
-    doesn't accumulate dead slots.
+    Terminal conversion always drops the model's per-request sampler state and
+    accumulated codes, including when result materialization fails.
     """
 
     def request_builder(payload: StagePayload) -> HiggsSGLangRequestData:
@@ -232,16 +231,18 @@ def make_higgs_scheduler_adapters(
 
     def result_adapter(data: HiggsSGLangRequestData) -> StagePayload:
         payload = data.stage_payload
-        state = HiggsTtsState.from_dict(payload.data)
-        apply_higgs_result(state, data)
-        if data.engine_start_s:
-            state.engine_time_s = _perf_counter() - data.engine_start_s
-        model.reset_request(payload.request_id)
-        return StagePayload(
-            request_id=payload.request_id,
-            request=payload.request,
-            data=state.to_dict(),
-        )
+        try:
+            state = HiggsTtsState.from_dict(payload.data)
+            apply_higgs_result(state, data)
+            if data.engine_start_s:
+                state.engine_time_s = _perf_counter() - data.engine_start_s
+            return StagePayload(
+                request_id=payload.request_id,
+                request=payload.request,
+                data=state.to_dict(),
+            )
+        finally:
+            model.reset_request(payload.request_id)
 
     return request_builder, result_adapter
 
