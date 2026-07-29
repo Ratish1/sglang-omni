@@ -269,6 +269,29 @@ def _pick_free_cuda_device(min_free_mib: int = 512) -> str | None:
     return None
 
 
+def test_rollout_logprob_host_staging_grows_with_async_batch(
+    monkeypatch,
+) -> None:
+    original_empty = torch.empty
+
+    def cpu_empty(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", cpu_empty)
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._logprob_host_buffers = None
+    runner._logprob_slot = 0
+
+    first = runner._next_logprob_host_staging(torch.empty((1, 8)))
+    grown = runner._next_logprob_host_staging(torch.empty((2, 8)))
+    smaller = runner._next_logprob_host_staging(torch.empty((1, 8)))
+
+    assert first.shape == (1, 8)
+    assert grown.shape == (2, 8)
+    assert smaller.shape == (2, 8)
+
+
 def test_async_real_pinned_path_matches_sync():
     """CUDA-guarded: run the async path through the REAL _next_host_staging
     (pinned host buffer + non-blocking copy on a CUDA model) and confirm it

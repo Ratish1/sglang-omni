@@ -65,19 +65,13 @@ class HiggsTTSModelRunner(ModelRunner):
         self._cg_launch_key: tuple | None = None
 
     def _next_logprob_host_staging(self, device_buf: torch.Tensor) -> torch.Tensor:
-        if self._logprob_host_buffers is None:
-            self._logprob_host_buffers = [
-                torch.empty(
-                    device_buf.shape,
-                    dtype=device_buf.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                for _ in range(2)
-            ]
-        buf = self._logprob_host_buffers[self._logprob_slot]
-        self._logprob_slot ^= 1
-        return buf
+        return self._pinned_pingpong(
+            "_logprob_host_buffers",
+            "_logprob_slot",
+            device_buf.shape,
+            device_buf.dtype,
+            realloc_on_grow=True,
+        )
 
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
