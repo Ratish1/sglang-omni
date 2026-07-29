@@ -106,12 +106,9 @@ sgl-omni serve \
   --model-path OpenMOSS-Team/MOSS-Transcribe-Diarize \
   --port 8000 \
   --max-running-requests 16 \
-  --cuda-graph-max-bs 16
+  --cuda-graph-max-bs 16 \
+  --mem-fraction-static 0.80
 ```
-
-The model default leaves enough GPU memory for long-audio encoder workspaces.
-Only override `--mem-fraction-static` after validating the longest expected
-inputs on the target GPU.
 
 ### Sending Requests
 
@@ -185,6 +182,7 @@ python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --concurrency 16 \
   --max-running-requests 16 \
   --cuda-graph-max-bs 16 \
+  --mem-fraction-static 0.80 \
   --output-dir results/moss_transcribe_diarize_movies800times
 
 # Long-sequence ASR / diarization
@@ -193,6 +191,7 @@ python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --concurrency 16 \
   --max-running-requests 16 \
   --cuda-graph-max-bs 16 \
+  --mem-fraction-static 0.80 \
   --max-new-tokens 65536 \
   --request-timeout-s 1800 \
   --output-dir results/moss_transcribe_diarize_aishell4_long
@@ -203,6 +202,7 @@ python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --concurrency 16 \
   --max-running-requests 16 \
   --cuda-graph-max-bs 16 \
+  --mem-fraction-static 0.80 \
   --max-new-tokens 65536 \
   --request-timeout-s 1800 \
   --output-dir results/moss_transcribe_diarize_googletime
@@ -239,7 +239,7 @@ Here we provide the benchmark results of movies800times and aishell4_long on a s
 - **RTF mean** — Average ratio of processing time to input audio duration per request. `<1` is faster than real time.
 - **audio_s/s** — Total seconds of input audio processed divided by total benchmark wall-clock time.
 
-These results were measured with `mem_fraction_static=0.80`; the launch commands above now default to `0.70`, so set the memory fraction back to `0.80` when reproducing these exact numbers. Otherwise follow the commands above or the entry point in [`benchmark_asr_transcribe_diarize.py`](https://github.com/sgl-project/sglang-omni/blob/main/benchmarks/eval/benchmark_asr_transcribe_diarize.py).
+To reproduce the results, follow the commands above or the entry point in [`benchmark_asr_transcribe_diarize.py`](https://github.com/sgl-project/sglang-omni/blob/main/benchmarks/eval/benchmark_asr_transcribe_diarize.py).
 
 ## Acknowledgments
 
