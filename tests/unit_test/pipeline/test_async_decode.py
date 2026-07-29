@@ -494,10 +494,9 @@ def test_batch_is_decode():
     )
 
 
-def test_async_pending_batch_getattr_safe():
-    # OmniScheduler.__getattr__ raises for unset attrs; _async_pending_batch
-    # must tolerate that (test fixtures may bypass __init__).
+def test_async_pending_batch_uses_initialized_state():
     s = OmniScheduler.__new__(OmniScheduler)
+    s._async_pending = None
     assert s._async_pending_batch() is None
     s._async_pending = ("batchX", "sched_out", "pending_step")
     assert s._async_pending_batch() == "batchX"
@@ -515,7 +514,10 @@ def test_async_pending_batch_getattr_safe():
 class _FakeBatch:
     def __init__(self, n):
         # real ScheduleBatch.reqs are Reqs with .finished(); none finish here
-        self.reqs = [types.SimpleNamespace(finished=lambda: False) for _ in range(n)]
+        self.reqs = [
+            types.SimpleNamespace(finished=lambda: False, is_retracted=False)
+            for _ in range(n)
+        ]
         self.out_cache_loc = torch.arange(n)
 
     def copy(self):
@@ -530,6 +532,7 @@ def _new_scheduler_for_async_loop():
     s = OmniScheduler.__new__(OmniScheduler)
     s._admin_lock = threading.Lock()
     s._admin_queue = queue.Queue()
+    s._model_runner = None
     s.chunked_req = None
     s.is_mixed_chunk = False
     s.page_size = 1
@@ -719,6 +722,7 @@ class _DFReq:
     def __init__(self, name):
         self.name = name
         self._done = False
+        self.is_retracted = False
 
     def finished(self):
         return self._done
@@ -731,6 +735,9 @@ class _DFBatch:
 
     def __init__(self, reqs):
         self.reqs = list(reqs)
+        self.forward_mode = types.SimpleNamespace(
+            is_decode=lambda: True, is_extend=lambda: False
+        )
         self.out_cache_loc = torch.arange(100, 100 + len(reqs))
         self.decoding_reqs = None
 
@@ -926,7 +933,11 @@ class _MixedBatch:
         )
         logprob = logprob or [False] * len(lens)
         self.reqs = [
-            types.SimpleNamespace(finished=lambda d=d: d, return_logprob=lp)
+            types.SimpleNamespace(
+                finished=lambda d=d: d,
+                return_logprob=lp,
+                is_retracted=False,
+            )
             for d, lp in zip(done, logprob)
         ]
         self.extend_lens = list(lens)
@@ -939,7 +950,8 @@ class _MixedBatch:
         self.input_ids = torch.arange(sum(lens))
         self.input_embeds = None
         self.replace_embeds = None
-        self.token_type_ids = None
+        self.mix_running_indices = None
+        self.prefill_input_ids_cpu = None
         self.decoding_reqs = None
         self.return_logprob = any(logprob)
         if self.return_logprob:
