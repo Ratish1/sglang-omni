@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers import HiggsAudioV2TokenizerConfig, HiggsAudioV2TokenizerModel
 
@@ -90,6 +92,7 @@ def test_codec_decode_replays_matching_shape_graph() -> None:
     codec._decode_cuda_graph_hits = 0
     codec._decode_cuda_graph_misses = 0
     codec._decode_cuda_graph_missed_shapes = set()
+    codec._decode_single_flight_lock = threading.Lock()
 
     output = codec.decode(torch.tensor([[1, 2], [3, 4], [5, 6]]))
 
@@ -97,3 +100,46 @@ def test_codec_decode_replays_matching_shape_graph() -> None:
     assert codec._decode_cuda_graph_hits == 1
     assert codec._decode_cuda_graph_misses == 0
     torch.testing.assert_close(output, torch.tensor([21.0]), rtol=0, atol=0)
+
+
+def test_codec_decode_rejects_concurrent_graph_pool_use() -> None:
+    replay_started = threading.Event()
+    release_replay = threading.Event()
+    failures: list[BaseException] = []
+
+    class _BlockingGraph:
+        def replay(self) -> None:
+            replay_started.set()
+            assert release_replay.wait(timeout=1)
+
+    codec = object.__new__(audio_codec.HiggsAudioCodec)
+    codec._decode_cuda_graphs = {
+        1: audio_codec._DecodeCudaGraph(
+            graph=_BlockingGraph(),
+            input_codes=torch.zeros((1, 2, 1), dtype=torch.long),
+            output_audio=torch.zeros((1, 1, 1), dtype=torch.float32),
+        )
+    }
+    codec._decode_cuda_graph_hits = 0
+    codec._decode_cuda_graph_misses = 0
+    codec._decode_cuda_graph_missed_shapes = set()
+    codec._decode_single_flight_lock = threading.Lock()
+
+    def replay_graph() -> None:
+        try:
+            codec.decode(torch.tensor([[1, 2]], dtype=torch.long))
+        except BaseException as exc:
+            failures.append(exc)
+
+    replay_thread = threading.Thread(target=replay_graph)
+    replay_thread.start()
+    assert replay_started.wait(timeout=1)
+    try:
+        with pytest.raises(RuntimeError, match="single-flight"):
+            codec.decode_batch([torch.tensor([[3, 4]], dtype=torch.long)])
+    finally:
+        release_replay.set()
+        replay_thread.join(timeout=1)
+
+    assert not replay_thread.is_alive()
+    assert failures == []

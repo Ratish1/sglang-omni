@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,6 +142,10 @@ class HiggsAudioCodec:
         self._decode_cuda_graph_hits = 0
         self._decode_cuda_graph_misses = 0
         self._decode_cuda_graph_missed_shapes: set[int] = set()
+        # Graphs for different frame counts share one private CUDA memory pool.
+        # Their temporary/output storage may therefore alias and decode must
+        # remain single-flight until the selected output has reached the host.
+        self._decode_single_flight_lock = threading.Lock()
 
     @classmethod
     def from_pretrained(
@@ -356,6 +361,13 @@ class HiggsAudioCodec:
     @torch.no_grad()
     def decode(self, codes_TN: torch.Tensor) -> torch.Tensor:
         """``[T, num_codebooks]`` → mono waveform ``[L]``."""
+        self._acquire_decode_single_flight()
+        try:
+            return self._decode_one(codes_TN)
+        finally:
+            self._decode_single_flight_lock.release()
+
+    def _decode_one(self, codes_TN: torch.Tensor) -> torch.Tensor:
         if codes_TN.ndim != 2:
             raise ValueError(
                 f"codes must be 2-D [T, num_codebooks], got {tuple(codes_TN.shape)}"
@@ -400,9 +412,19 @@ class HiggsAudioCodec:
             )
         return audio.squeeze(0).squeeze(0).cpu()
 
+    def _acquire_decode_single_flight(self) -> None:
+        if not self._decode_single_flight_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "Higgs codec decode is single-flight because its CUDA graphs "
+                "share a memory pool"
+            )
+
     @torch.no_grad()
     def decode_batch(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """Batch-decode variable-length ``[T_i, N]`` tensors into ``[L_i]`` waveforms."""
+        if not codes_list:
+            return []
+        self._acquire_decode_single_flight()
 
         def _batch_fn(batch_items: list[torch.Tensor]) -> list[torch.Tensor]:
             stacked = torch.stack(batch_items)
@@ -410,13 +432,16 @@ class HiggsAudioCodec:
             audio = self.model.decode(codes_BNT).audio_values.cpu()
             return [audio[j, 0] for j in range(len(batch_items))]
 
-        return self._bucketed_batch(
-            codes_list,
-            bucket_key_fn=lambda c: c.shape[0],
-            single_fn=self.decode,
-            batch_fn=_batch_fn,
-            error_label="decode_batch",
-        )
+        try:
+            return self._bucketed_batch(
+                codes_list,
+                bucket_key_fn=lambda c: c.shape[0],
+                single_fn=self._decode_one,
+                batch_fn=_batch_fn,
+                error_label="decode_batch",
+            )
+        finally:
+            self._decode_single_flight_lock.release()
 
 
 __all__ = ["HiggsAudioCodec"]
