@@ -52,30 +52,32 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
 
-def test_higgs_batch_metadata_reads_sglang_rids() -> None:
+def test_higgs_batch_metadata_uses_pending_request_ids_for_bcg() -> None:
     model = object.__new__(HiggsTTSModel)
     forward_batch = SimpleNamespace(
-        rids=["stable-a", "stable-b"],
-        batch_size=2,
-        sampling_info=None,
-    )
-
-    req_ids, params = model._extract_batch_metadata(forward_batch)
-
-    assert req_ids == ["stable-a", "stable-b"]
-    assert len(params) == 2
-
-
-def test_higgs_batch_metadata_refuses_missing_request_ids() -> None:
-    model = object.__new__(HiggsTTSModel)
-    forward_batch = SimpleNamespace(
+        # SGLang's BCG static ForwardBatch does not preserve rids.
         rids=None,
         batch_size=2,
         sampling_info=None,
     )
 
-    with pytest.raises(RuntimeError, match="refusing to fabricate"):
-        model._extract_batch_metadata(forward_batch)
+    req_ids, params = model._extract_batch_metadata(
+        forward_batch, ("stable-a", "stable-b")
+    )
+
+    assert req_ids == ["stable-a", "stable-b"]
+    assert len(params) == 2
+
+
+def test_higgs_batch_metadata_refuses_request_count_mismatch() -> None:
+    model = object.__new__(HiggsTTSModel)
+    forward_batch = SimpleNamespace(
+        batch_size=2,
+        sampling_info=None,
+    )
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        model._extract_batch_metadata(forward_batch, ("only-one",))
 
 
 def test_higgs_sampler_pool_rows_default_to_unseeded() -> None:
@@ -122,9 +124,12 @@ def test_higgs_request_row_seed_tracks_request_seed() -> None:
 
 def test_higgs_prefill_embeddings_leave_graph_dispatch_to_sglang() -> None:
     seeds: list[tuple[str, int | None]] = []
+    pending: list[tuple[torch.Tensor, tuple[str, ...]]] = []
     model = SimpleNamespace(
-        _pending_prefill_input_embeds=None,
         set_request_seed=lambda request_id, seed: seeds.append((request_id, seed)),
+        set_pending_prefill_input=lambda embeds, request_ids: pending.append(
+            (embeds, request_ids)
+        ),
     )
     runner = object.__new__(HiggsTTSModelRunner)
     runner.model = model
@@ -140,10 +145,63 @@ def test_higgs_prefill_embeddings_leave_graph_dispatch_to_sglang() -> None:
 
     runner.before_prefill(forward_batch, None, [request])
 
-    pending = model._pending_prefill_input_embeds
-    assert pending is raw_embeds
+    assert len(pending) == 1
+    assert pending[0][0] is raw_embeds
+    assert pending[0][1] == ("request",)
     assert forward_batch.input_embeds is None
     assert seeds == [("request", 17)]
+
+
+def test_higgs_pending_prefill_input_is_single_use() -> None:
+    model = object.__new__(HiggsTTSModel)
+    model._pending_prefill_input = None
+    input_embeds = torch.zeros((2, 4))
+
+    model.set_pending_prefill_input(input_embeds, ("request",))
+
+    with pytest.raises(RuntimeError, match="previous forward"):
+        model.set_pending_prefill_input(input_embeds, ("other",))
+
+    model.clear_pending_prefill_input()
+    assert model._pending_prefill_input is None
+
+
+def test_higgs_prefill_forward_does_not_require_bcg_static_rids() -> None:
+    model = object.__new__(HiggsTTSModel)
+    torch.nn.Module.__init__(model)
+    input_embeds = torch.arange(8, dtype=torch.float32).view(2, 4)
+    model._pending_prefill_input = None
+    model.set_pending_prefill_input(input_embeds, ("request",))
+    model.backbone = SimpleNamespace(
+        model=lambda _ids, _positions, _batch, embeds: embeds
+    )
+    observed_request_ids: list[list[str]] = []
+
+    def decode(hidden_states, request_ids, _params):
+        observed_request_ids.append(request_ids)
+        return torch.zeros((hidden_states.shape[0], 3))
+
+    model.decode_codebooks_batch = decode
+    forward_batch = SimpleNamespace(
+        rids=None,
+        batch_size=1,
+        sampling_info=None,
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: False,
+            is_extend=lambda: True,
+        ),
+        extend_seq_lens=torch.tensor([2]),
+    )
+
+    result = model.forward(
+        torch.tensor([1, 2]),
+        torch.tensor([0, 1]),
+        forward_batch,
+    )
+
+    assert result.hidden_states.equal(input_embeds[1:])
+    assert observed_request_ids == [["request"]]
+    assert model._pending_prefill_input is None
 
 
 def test_higgs_prefill_embeddings_follow_radix_prefix_position() -> None:
@@ -188,9 +246,13 @@ def test_higgs_prefill_embeddings_follow_radix_prefix_position() -> None:
 
 
 def test_higgs_prefill_forward_failure_clears_pending_embeddings() -> None:
+    pending: list[tuple[torch.Tensor, tuple[str, ...]]] = []
     model = SimpleNamespace(
-        _pending_prefill_input_embeds=None,
         set_request_seed=lambda _request_id, _seed: None,
+        set_pending_prefill_input=lambda embeds, request_ids: pending.append(
+            (embeds, request_ids)
+        ),
+        clear_pending_prefill_input=lambda: pending.clear(),
     )
     runner = object.__new__(HiggsTTSModelRunner)
     runner.model = model
@@ -219,12 +281,12 @@ def test_higgs_prefill_forward_failure_clears_pending_embeddings() -> None:
             True,
         )
 
-    assert model._pending_prefill_input_embeds is None
+    assert pending == []
 
-    observed_pending: list[torch.Tensor] = []
+    observed_pending: list[tuple[torch.Tensor, tuple[str, ...]]] = []
 
     def successful_forward(_forward_batch):
-        observed_pending.append(model._pending_prefill_input_embeds)
+        observed_pending.extend(pending)
         return SimpleNamespace()
 
     runner.tp_worker.forward_batch_generation = successful_forward
@@ -235,8 +297,10 @@ def test_higgs_prefill_forward_failure_clears_pending_embeddings() -> None:
         True,
     )
 
-    assert observed_pending == [input_embeds]
-    assert model._pending_prefill_input_embeds is None
+    assert len(observed_pending) == 1
+    assert observed_pending[0][0] is input_embeds
+    assert observed_pending[0][1] == ("request",)
+    assert pending == []
 
 
 def test_higgs_streaming_pipeline_shares_vocoder_stride_with_tts_engine() -> None:
@@ -292,7 +356,9 @@ def test_higgs_streaming_pipeline_rejects_conflicting_runtime_stride() -> None:
         )
 
 
-def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
+def test_higgs_tts_engine_enables_breakable_prefill_graph_by_default(
+    monkeypatch,
+) -> None:
     from sglang_omni.models.higgs_tts import engine_builder as engine_builder_mod
     from sglang_omni.models.higgs_tts import model_runner as model_runner_mod
     from sglang_omni.models.higgs_tts import request_builders
@@ -342,12 +408,15 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
             sampler_pool_max_running_requests=64,
             reset_request=lambda _request_id: None,
         )
-        model_runner = SimpleNamespace(model=model)
+        model_runner = SimpleNamespace(
+            model=model,
+            model_config=SimpleNamespace(is_multimodal=True),
+        )
 
         def init_cuda_graphs() -> None:
             init_graph_calls.append(True)
             prefill_runner = object.__new__(engine_builder_mod.PrefillCudaGraphRunner)
-            prefill_runner._is_full_backend = True
+            prefill_runner.prefill_backend_name = "breakable"
             prefill_runner.capture_num_tokens = list(range(64, 513, 64))
             model_runner.prefill_cuda_graph_runner = prefill_runner
 
@@ -423,15 +492,11 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     ]
     assert captured["overrides"]["cuda_graph_max_bs"] == 64
     assert captured["overrides"]["max_running_requests"] == 64
-    # Request slots follow max_running_requests, not prefill_coalesce_requests:
-    # coalescing only sets a release floor, so it never bounds the extend batch
-    # size that can_run_graph checks against.
     assert captured["overrides"]["cuda_graph_config"] == {
         "prefill": {
-            "backend": "full",
+            "backend": "breakable",
             "max_bs": 512,
             "bs": list(range(64, 513, 64)),
-            "full_prefill_max_req": 64,
         }
     }
     assert captured["server_args"].disable_overlap_schedule is True
@@ -486,6 +551,32 @@ def test_higgs_disabled_prefill_graph_preserves_model_attributes() -> None:
     assert model.__dict__ == original_attributes
 
 
+def test_higgs_prefill_graph_requires_multimodal_input_buffers(monkeypatch) -> None:
+    builder = _make_higgs_builder()
+    model = SimpleNamespace(backbone=object())
+    model_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            model=model,
+            model_config=SimpleNamespace(is_multimodal=False),
+        )
+    )
+    server_args = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(backend="breakable"))
+    )
+    monkeypatch.setattr(higgs_utils, "truncate_rope_to_bf16", lambda _model: None)
+
+    with pytest.raises(RuntimeError, match="multimodal input buffers"):
+        builder.setup_model(
+            model_worker=model_worker,
+            checkpoint_dir="unused",
+            device="cuda",
+            gpu_id=0,
+            server_args=server_args,
+        )
+
+    assert "language_model" not in model.__dict__
+
+
 def test_higgs_prefill_graph_validation_removes_only_installed_alias() -> None:
     builder = _make_higgs_builder()
     builder._prefill_graph_alias_installed = True
@@ -493,7 +584,7 @@ def test_higgs_prefill_graph_validation_removes_only_installed_alias() -> None:
     model_attribute = object()
     model = SimpleNamespace(model=model_attribute, language_model=object())
     server_args = SimpleNamespace(
-        cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(backend="full"))
+        cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(backend="breakable"))
     )
 
     with pytest.raises(RuntimeError, match="did not construct"):
@@ -514,52 +605,6 @@ def _make_higgs_builder(**kwargs):
         enable_async_decode=False,
         async_decode_min_batch_size=2,
         **kwargs,
-    )
-
-
-def _higgs_prefill_graph_slots(
-    *, server_args_overrides: dict[str, Any] | None = None, **builder_kwargs: Any
-) -> int:
-    """Resolve full_prefill_max_req the way engine_factory.build() does."""
-    from sglang_omni.scheduling.generation_batch_policy import (
-        build_generation_batch_overrides,
-    )
-
-    builder = _make_higgs_builder(**builder_kwargs)
-    overrides = build_generation_batch_overrides(
-        server_args_overrides=server_args_overrides,
-        **builder.generation_defaults(dtype="bfloat16"),
-    )
-    builder.adjust_overrides(overrides)
-    return overrides["cuda_graph_config"]["prefill"]["full_prefill_max_req"]
-
-
-def test_higgs_prefill_graph_slots_follow_resolved_max_running_requests() -> None:
-    """generation_defaults() is evaluated before server_args_overrides are
-    applied, so the slot count must be re-derived from the resolved cap.
-    Otherwise --max-running-requests leaves can_run_graph rejecting every
-    extend batch wider than the constructor default."""
-    assert (
-        _higgs_prefill_graph_slots(
-            server_args_overrides={
-                "max_running_requests": 128,
-                "cuda_graph_max_bs": 128,
-            }
-        )
-        == 128
-    )
-
-
-def test_higgs_explicit_prefill_graph_max_req_wins_over_resolved_cap() -> None:
-    assert (
-        _higgs_prefill_graph_slots(
-            prefill_graph_max_req=8,
-            server_args_overrides={
-                "max_running_requests": 128,
-                "cuda_graph_max_bs": 128,
-            },
-        )
-        == 8
     )
 
 

@@ -79,23 +79,18 @@ class HiggsTTSModelRunner(ModelRunner):
             self.model.set_request_seed(
                 req.request_id, req.data.req.sampling_params.sampling_seed
             )
-        # The eager runner rebuilds ForwardBatch and drops ad-hoc batch fields,
-        # so keep the composed embeddings on the model for one forward.
-        # SGLang alone decides eager versus graph dispatch and, for the full
-        # prefill backend, copies the raw embeddings into its padded graph slot.
-        if self.model._pending_prefill_input_embeds is not None:
-            raise RuntimeError(
-                "Higgs prefill input embeddings were not consumed by the "
-                "previous forward"
-            )
-        self.model._pending_prefill_input_embeds = self._build_prefill_input_embeds(
-            forward_batch, requests
+        # SGLang BCG rebuilds the ForwardBatch without rids. Keep the composed
+        # embeddings and their ordered request identities together for exactly
+        # one eager or graph-backed outer forward.
+        self.model.set_pending_prefill_input(
+            self._build_prefill_input_embeds(forward_batch, requests),
+            tuple(req.request_id for req in requests),
         )
         forward_batch.input_embeds = None
 
     def cleanup_prefill(self, forward_batch, schedule_batch, requests):
         del forward_batch, schedule_batch, requests
-        self.model._pending_prefill_input_embeds = None
+        self.model.clear_pending_prefill_input()
 
     def post_prefill(self, result, forward_batch, schedule_batch, requests):
         del schedule_batch
