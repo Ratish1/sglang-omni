@@ -291,7 +291,7 @@ All schedulers share the same interface: `inbox`, `outbox`, `start()`, `stop()`,
 
 ### OmniScheduler — Composition with SGLang
 
-For AR stages. Subset of SGLang Scheduler — reuses `get_next_batch_to_run()`, `run_batch()`, `process_batch_result()`, `event_loop_normal()`. (Overlap scheduling ended up unsupported: the legacy `Req.is_chunked` republish lags one iteration on that loop, so `_event_loop_overlap` refuses to run.)
+For AR stages. Subset of SGLang Scheduler — reuses `get_next_batch_to_run()`, `run_batch()`, `process_batch_result()`, `event_loop_normal()`. (Overlap scheduling ended up unsupported: the `Req.inflight_middle_chunks` decrement lags one iteration on that loop, so `_event_loop_overlap` refuses to run.)
 
 - **Reused from SGLang:** `get_next_batch_to_run()`, `process_batch_result()`, `self_check_during_idle()` — KV cache management, prefill/decode scheduling, tree cache, dLLM support
 - **Overridden:** `init` (skip ZMQ/tokenizer/metrics), `recv_requests()` (drain inbox, route stream chunks to per-request state), `process_input_requests()` (`request_builder` conversion), `run_batch()` (delegate to ModelRunner), `send_to_tokenizer()` (no-op)
@@ -999,7 +999,7 @@ _State: MERGED 2026-06-19. Strict no-op when no request in the batch supplies a 
 Makes a request `seed` honored uniformly across every AR sampling model via a reusable seed hook in the base `ModelRunner`, a prerequisite for reproducible RL rollouts.
 
 - **Base runner seed hook:** `ModelRunner._install_sampling_seeds` builds per-row seeds and installs them onto `forward_batch.sampling_info` before sampling, so the standard SGLang path honors `seed` instead of dropping it; mixed batches give unseeded rows a request-id-derived fallback so TP ranks stay in sync
-- **Per-model wiring:** discrete-TTS custom samplers (Higgs, Fish S2-Pro) move to `multinomial_with_seed`, and the Qwen3-Omni talker unifies onto the shared `resolve_row_seed` scheme. Fish S2-Pro keeps a `-1` sentinel so unseeded draws stay on the legacy `torch.multinomial` path byte-identically; Higgs rows instead always carry a concrete random seed (installed at admission, refreshed on row reset) so there is no sentinel state to mishandle
+- **Per-model wiring:** discrete-TTS custom samplers (Higgs, Fish S2-Pro) move to `multinomial_with_seed` with a `-1` sentinel keeping unseeded draws byte-identical, and the Qwen3-Omni talker unifies onto the shared `resolve_row_seed` scheme
 
 **Why it matters:** Touches the shared sampling/runner contract across all models so seed handling is one framework concern rather than fragmented per-model code, making a full Qwen3-Omni omni rollout end-to-end reproducible.
 

@@ -94,8 +94,8 @@ upstream scheduler. The goal is to reuse SGLang's
 batch selection, KV cache management, prefill/decode scheduling, and tree cache
 while keeping SGLang-Omni's transport, request objects, and streaming behavior
 outside the upstream scheduler. (Overlap scheduling is explicitly unsupported:
-`OmniScheduler._event_loop_overlap` refuses to run because the legacy
-`Req.is_chunked` republish would lag one iteration on that loop.)
+`OmniScheduler._event_loop_overlap` refuses to run because the
+`Req.inflight_middle_chunks` decrement would lag one iteration on that loop.)
 
 #### SimpleScheduler
 
