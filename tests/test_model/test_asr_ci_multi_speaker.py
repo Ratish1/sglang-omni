@@ -49,7 +49,6 @@ MOSS_TD_CI_SAMPLES = 800
 MOSS_TD_AISHELL4_LONG_CI_SAMPLES = 20
 MOSS_TD_GOOGLETIME_CI_SAMPLES = 25
 MOSS_TD_STARTUP_TIMEOUT = 600
-MOSS_TD_MEM_FRACTION_STATIC = 0.80
 MOSS_TD_LONG_MAX_NEW_TOKENS = 65536
 
 
@@ -374,8 +373,6 @@ def moss_td_router_server(
             str(MOSS_TD_CONCURRENCY),
             "--cuda-graph-max-bs",
             str(MOSS_TD_CONCURRENCY),
-            "--mem-fraction-static",
-            str(MOSS_TD_MEM_FRACTION_STATIC),
         ]
     )
     with launch_managed_router(
