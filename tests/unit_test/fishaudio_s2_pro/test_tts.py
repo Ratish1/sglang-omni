@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from queue import Queue
 from types import SimpleNamespace
 
@@ -648,6 +649,7 @@ def test_fish_req_hits_max_new_tokens_and_scheduler_reports_length() -> None:
     assert req.finished()
 
     scheduler = object.__new__(OmniScheduler)
+    scheduler._request_admission_lock = threading.RLock()
     scheduler.outbox = Queue()
     scheduler._aborted_request_ids = set()
     scheduler._first_emit_done = set()

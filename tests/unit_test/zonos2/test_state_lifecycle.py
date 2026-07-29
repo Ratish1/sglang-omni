@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import threading
 import time
 from queue import Queue
 from types import SimpleNamespace
@@ -115,6 +116,7 @@ def test_length_terminal_releases_pool_row_through_scheduler_result_path() -> No
     assert req.finished_reason.to_json()["type"] == "length"
 
     scheduler = object.__new__(OmniScheduler)
+    scheduler._request_admission_lock = threading.RLock()
     scheduler.outbox = Queue()
     scheduler._aborted_request_ids = set()
     scheduler._first_emit_done = {request_id}

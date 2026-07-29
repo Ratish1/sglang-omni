@@ -61,6 +61,11 @@ _ABORTED_REQUEST_ID_LIMIT = 10000
 _ABORTED_REQUEST_ID_RETAINED = 5000
 
 
+def _detach_request_data(req: Any) -> None:
+    """Break Req -> data; async snapshots retain the one-way data -> Req edge."""
+    req._omni_data = None
+
+
 class _NoOpSender:
     """Stub for send_to_detokenizer — stream_output handles emission."""
 
@@ -925,7 +930,6 @@ class OmniScheduler:
         self._deferred_request_payloads.pop(req_id, None)
         req = req_data.req
         self._normalize_req_token_arrays(req)
-        req._omni_data = req_data
         req_id = req.rid
         if bool(getattr(req_data, "enforce_request_limits", False)):
             error_msg = self._prepare_request_limits(req_data)
@@ -956,6 +960,7 @@ class OmniScheduler:
             )
             if not hasattr(req, "_coalesce_enqueue_t"):
                 req._coalesce_enqueue_t = time.perf_counter()
+            req._omni_data = req_data
             self.waiting_queue.append(req)
 
         if request_admission_lock_held:
@@ -1272,7 +1277,18 @@ class OmniScheduler:
                 continue
 
             rid = req.rid
-            if rid in self._aborted_request_ids:
+            data = None
+            with self._request_admission_lock:
+                is_aborted = rid in self._aborted_request_ids
+                if not is_aborted:
+                    data = req._omni_data
+                    if data is None:
+                        raise RuntimeError(
+                            f"Terminal request {rid!r} has no scheduler request data"
+                        )
+                    _detach_request_data(req)
+
+            if is_aborted:
                 # note (Gaokai): an abort landing mid-step finishes here via
                 # FINISH_ABORT; run the cleanup abort() deferred (callbacks are
                 # idempotent) and drop the stale terminal result so it cannot
@@ -1286,10 +1302,10 @@ class OmniScheduler:
                         )
                 self._first_emit_done.discard(rid)
                 self._prefill_start_done.discard(rid)
+                _detach_request_data(req)
                 continue
 
             # Build result payload from the Req
-            data = req._omni_data
             # Drain runner stream buffers before the terminal payload; both use
             # this outbox, so the remaining chunks stay ahead of stream done.
             model_runner = getattr(self, "_model_runner", None)
@@ -1422,9 +1438,13 @@ class OmniScheduler:
                 ]
                 self._backlogged_request_build_payloads.clear()
                 self._backlogged_request_build_payloads.extend(retained)
-            self.waiting_queue = [
-                req for req in self.waiting_queue if req.rid != request_id
-            ]
+            waiting_queue = []
+            for req in self.waiting_queue:
+                if req.rid == request_id:
+                    _detach_request_data(req)
+                else:
+                    waiting_queue.append(req)
+            self.waiting_queue = waiting_queue
         if self._abort_callback is not None and not running_abort:
             try:
                 self._abort_callback(request_id)
@@ -1894,7 +1914,7 @@ class OmniScheduler:
                 continue
             seen.add(id(batch))
             for req in batch.reqs:
-                if req.rid != request_id or req.finished():
+                if req.rid != request_id or req.finished() or req.is_retracted:
                     continue
                 req.to_finish = FINISH_ABORT()
                 marked = True
@@ -2303,6 +2323,12 @@ class OmniScheduler:
 def _remove_from_batch(batch: Any, request_id: str) -> None:
     if batch is None:
         return
-    batch.reqs = [req for req in batch.reqs if req.rid != request_id]
+    remaining_reqs = []
+    for req in batch.reqs:
+        if req.rid == request_id:
+            _detach_request_data(req)
+        else:
+            remaining_reqs.append(req)
+    batch.reqs = remaining_reqs
     if not batch.reqs:
         batch.batch_is_full = False
