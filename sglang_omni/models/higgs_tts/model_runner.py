@@ -16,9 +16,6 @@ from typing import Any
 
 import torch
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
-from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
-    PrefillCudaGraphRunner,
-)
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.higgs_tts.sampler import K_MAX, selected_token_logprobs
@@ -65,67 +62,35 @@ class HiggsTTSModelRunner(ModelRunner):
         self._cg_launch_key: tuple | None = None
 
     def _next_logprob_host_staging(self, device_buf: torch.Tensor) -> torch.Tensor:
-        if self._logprob_host_buffers is None:
-            self._logprob_host_buffers = [
-                torch.empty(
-                    device_buf.shape,
-                    dtype=device_buf.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                for _ in range(2)
-            ]
-        buf = self._logprob_host_buffers[self._logprob_slot]
-        self._logprob_slot ^= 1
-        return buf
+        return self._pinned_pingpong(
+            "_logprob_host_buffers",
+            "_logprob_slot",
+            device_buf.shape,
+            device_buf.dtype,
+            realloc_on_grow=True,
+        )
 
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
 
     def before_prefill(self, forward_batch, schedule_batch, requests):
         del schedule_batch
-        forward_batch.req_ids = [req.request_id for req in requests]
         for req in requests:
             self.model.set_request_seed(
                 req.request_id, req.data.req.sampling_params.sampling_seed
             )
-        # PrefillCudaGraphRunner conservatively rejects its public
-        # ``input_embeds`` field, but its Full backend intentionally captures
-        # only the transformer body and copies the live embeddings supplied by
-        # the eager outer-model tail into capture-stable storage. The eager
-        # runner rebuilds ForwardBatch and therefore drops ad-hoc batch fields,
-        # so keep this one-forward value on the model instead. Prefill is
-        # serialized by OmniScheduler; model.forward consumes and clears it.
+        # The eager runner rebuilds ForwardBatch and drops ad-hoc batch fields,
+        # so keep the composed embeddings on the model for one forward.
+        # SGLang alone decides eager versus graph dispatch and, for the full
+        # prefill backend, copies the raw embeddings into its padded graph slot.
         if self.model._pending_prefill_input_embeds is not None:
             raise RuntimeError(
                 "Higgs prefill input embeddings were not consumed by the "
                 "previous forward"
             )
-        input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
-        prefill_runner = self.tp_worker.model_runner.prefill_cuda_graph_runner
-        if isinstance(
-            prefill_runner, PrefillCudaGraphRunner
-        ) and prefill_runner.can_run_graph(forward_batch):
-            raw_num_tokens = input_embeds.shape[0]
-            capture_num_tokens = tuple(
-                sorted(int(size) for size in prefill_runner.capture_num_tokens)
-            )
-            static_num_tokens = next(
-                (size for size in capture_num_tokens if size >= raw_num_tokens), None
-            )
-            if static_num_tokens is None:
-                raise RuntimeError(
-                    "Higgs prefill CUDA graph accepted a batch outside its "
-                    f"capture buckets: tokens={raw_num_tokens}, "
-                    f"buckets={capture_num_tokens}"
-                )
-            if static_num_tokens > raw_num_tokens:
-                padded = input_embeds.new_zeros(
-                    (static_num_tokens, input_embeds.shape[1])
-                )
-                padded[:raw_num_tokens].copy_(input_embeds)
-                input_embeds = padded
-        self.model._pending_prefill_input_embeds = input_embeds
+        self.model._pending_prefill_input_embeds = self._build_prefill_input_embeds(
+            forward_batch, requests
+        )
         forward_batch.input_embeds = None
 
     def cleanup_prefill(self, forward_batch, schedule_batch, requests):
@@ -145,7 +110,6 @@ class HiggsTTSModelRunner(ModelRunner):
         is_lookahead: bool = False,
     ):
         del schedule_batch
-        forward_batch.req_ids = [req.request_id for req in requests]
         self._populate_cg_buffers(forward_batch, requests, is_lookahead=is_lookahead)
 
     def post_decode(self, result, forward_batch, schedule_batch, requests):
@@ -478,12 +442,23 @@ class HiggsTTSModelRunner(ModelRunner):
                 continue
 
             codes = torch.tensor(codes_rows, dtype=torch.long, device=device)
-            consumed = data.num_ref_codes_consumed
+            # Radix reuse can begin this request's live extension after a
+            # cached reference-audio prefix. Derive the code row from the
+            # absolute prompt position instead of request-local progress.
+            consumed = sum(
+                token == AUDIO_PLACEHOLDER_ID
+                for token in data.req.origin_input_ids[: data.req.extend_range.start]
+            )
+            if consumed + n_placeholders > len(codes_rows):
+                raise RuntimeError(
+                    "Higgs reference-code rows do not cover the live audio "
+                    f"placeholders: consumed={consumed}, "
+                    f"live={n_placeholders}, available={len(codes_rows)}"
+                )
             with torch.no_grad():
                 embed = fused_embed(codes[consumed : consumed + n_placeholders])
             mask_idx = full_mask.nonzero(as_tuple=True)[0] + offset
             text_embeds[mask_idx] = embed.to(text_embeds.dtype)
-            data.num_ref_codes_consumed = consumed + n_placeholders
             offset = end
 
         return text_embeds

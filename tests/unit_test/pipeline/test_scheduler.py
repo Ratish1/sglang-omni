@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling import omni_scheduler as omni_scheduler_module
 from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
@@ -31,10 +32,21 @@ def _init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler._pending_request_builds = {}
     scheduler._backlogged_request_build_payloads = []
     scheduler._request_build_max_pending_observed = 0
+    scheduler._async_pending = None
 
 
 def _init_terminal_output_state(scheduler: OmniScheduler) -> None:
     scheduler._request_admission_lock = threading.RLock()
+    scheduler._model_runner = None
+    scheduler._stream_output_builder = None
+
+
+def _new_stage_payload(request_id: str) -> StagePayload:
+    return StagePayload(
+        request_id=request_id,
+        request=OmniRequest(inputs={}),
+        data=None,
+    )
 
 
 def test_simple_scheduler_batch_and_error_contracts() -> None:
@@ -354,6 +366,7 @@ def test_omni_scheduler_fast_path_drops_retracted_req() -> None:
             self.reqs = reqs
             self.out_cache_loc = torch.arange(100, 100 + len(reqs))
             self.decoding_reqs = None
+            self.forward_mode = None
 
         def filter_batch(self, keep_indices=None):
             captured["keep_indices"] = keep_indices
@@ -861,6 +874,8 @@ def test_stream_output_atomically_claims_request_data_against_abort() -> None:
     scheduler._prefill_start_done = set()
     scheduler._abort_callback = None
     scheduler._result_adapter = lambda _data: {"ok": True}
+    scheduler._model_runner = None
+    scheduler._stream_output_builder = None
     scheduler.tree_cache = None
     scheduler.waiting_queue = []
     _init_sync_request_build_state(scheduler)
@@ -893,6 +908,106 @@ def test_stream_output_atomically_claims_request_data_against_abort() -> None:
     assert req._data is None
     assert data.req is req
     assert scheduler.outbox.get_nowait().type == "result"
+
+
+def test_abort_publishes_request_id_before_marking_terminal_finish() -> None:
+    class ObservedRLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._owner: int | None = None
+            self.contender_waiting = threading.Event()
+
+        def __enter__(self):
+            thread_id = threading.get_ident()
+            if self._owner is not None and self._owner != thread_id:
+                self.contender_waiting.set()
+            self._lock.acquire()
+            self._owner = thread_id
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self._owner = None
+            self._lock.release()
+
+    scheduler = object.__new__(OmniScheduler)
+    _init_sync_request_build_state(scheduler)
+    scheduler._request_admission_lock = ObservedRLock()
+    scheduler.outbox = Queue()
+    scheduler.inbox = Queue()
+    scheduler._aborted_request_ids = set()
+    scheduler._aborted_request_id_order = deque()
+    scheduler._pending_stream_chunks = {}
+    scheduler._pending_stream_done = set()
+    scheduler._deferred_request_payloads = {}
+    scheduler._dirty_deferred_request_ids = set()
+    scheduler._first_emit_done = set()
+    scheduler._prefill_start_done = set()
+    cleaned: list[str] = []
+    scheduler._abort_callback = cleaned.append
+    scheduler._result_adapter = lambda _data: pytest.fail(
+        "an abort-winning terminal request must not be adapted"
+    )
+    scheduler.tree_cache = None
+    scheduler.waiting_queue = []
+
+    data = SimpleNamespace(prefill_input_embeds=None, decode_input_embeds=None)
+    req = SimpleNamespace(
+        rid="req-abort-wins",
+        output_ids=[],
+        finished_reason=None,
+        is_retracted=False,
+        to_finish=None,
+        req_pool_idx=None,
+        mamba_pool_idx=None,
+        _omni_data=data,
+    )
+    req.finished = lambda: req.to_finish is not None
+    data.req = req
+    batch = SimpleNamespace(reqs=[req], batch_is_full=True)
+    scheduler.running_batch = batch
+    scheduler.cur_batch = batch
+    scheduler.last_batch = None
+
+    mark_started = threading.Event()
+
+    def controlled_mark(request_id: str) -> bool:
+        assert request_id in scheduler._aborted_request_ids
+        req.to_finish = object()
+        mark_started.set()
+        assert scheduler._request_admission_lock.contender_waiting.wait(timeout=1)
+        return True
+
+    scheduler._mark_running_request_aborted = controlled_mark
+    thread_errors: list[BaseException] = []
+
+    def run_in_thread(fn) -> None:
+        try:
+            fn()
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    abort_thread = threading.Thread(
+        target=run_in_thread,
+        args=(lambda: scheduler.abort(req.rid),),
+    )
+    abort_thread.start()
+    assert mark_started.wait(timeout=1)
+
+    terminal_thread = threading.Thread(
+        target=run_in_thread,
+        args=(lambda: scheduler.stream_output([req]),),
+    )
+    terminal_thread.start()
+    abort_thread.join(timeout=1)
+    terminal_thread.join(timeout=1)
+
+    assert not abort_thread.is_alive()
+    assert not terminal_thread.is_alive()
+    assert thread_errors == []
+    assert scheduler._aborted_request_ids == {req.rid}
+    assert req._omni_data is None
+    assert cleaned == [req.rid]
+    assert scheduler.outbox.empty()
 
 
 def test_terminal_request_data_is_collectable_without_cyclic_gc() -> None:
@@ -1022,12 +1137,17 @@ def test_omni_scheduler_distinguishes_queue_enter_from_prefill_start(
     req = SimpleNamespace(
         rid="req-delayed",
         origin_input_ids=[1, 2, 3],
+        origin_input_ids_unpadded=[1, 2, 3],
         sampling_params=SimpleNamespace(max_new_tokens=1, min_new_tokens=0),
         output_ids=[],
     )
-    scheduler._request_builder = lambda payload: SimpleNamespace(req=req)
+    scheduler._request_builder = lambda payload: SimpleNamespace(
+        req=req,
+        enforce_request_limits=False,
+        max_new_tokens=1,
+    )
 
-    scheduler.process_input_requests([SimpleNamespace(request_id="req-delayed")])
+    scheduler.process_input_requests([_new_stage_payload("req-delayed")])
 
     names = [event["event_name"] for event in events]
     assert "scheduler_queue_enter" in names
@@ -1414,7 +1534,8 @@ def test_omni_scheduler_request_builder_errors_do_not_stop_loop() -> None:
 
     scheduler._request_builder = request_builder
 
-    scheduler.process_input_requests([SimpleNamespace(request_id="req-err")])
+    scheduler.is_entry_rank = True
+    scheduler.process_input_requests([_new_stage_payload("req-err")])
 
     output = scheduler.outbox.get_nowait()
     assert output.request_id == "req-err"
@@ -1450,7 +1571,7 @@ def test_omni_scheduler_follower_request_builder_errors_do_not_emit() -> None:
 
     scheduler._request_builder = request_builder
 
-    scheduler.process_input_requests([SimpleNamespace(request_id="req-err")])
+    scheduler.process_input_requests([_new_stage_payload("req-err")])
 
     assert scheduler.outbox.empty()
     assert scheduler.waiting_queue == []
@@ -1480,13 +1601,14 @@ def test_omni_scheduler_prepares_custom_request_token_budget() -> None:
     req = SimpleNamespace(
         rid="req-ok",
         origin_input_ids=[1, 2, 3],
+        origin_input_ids_unpadded=[1, 2, 3],
         sampling_params=sampling_params,
         output_ids=[],
     )
     req_data = SimpleNamespace(req=req, max_new_tokens=10, enforce_request_limits=True)
     scheduler._request_builder = lambda payload: req_data
 
-    scheduler.process_input_requests([SimpleNamespace(request_id="req-ok")])
+    scheduler.process_input_requests([_new_stage_payload("req-ok")])
 
     assert scheduler.waiting_queue == [req]
     assert req._omni_data is req_data
@@ -1524,16 +1646,19 @@ def test_omni_scheduler_rejects_custom_request_over_context() -> None:
     req = SimpleNamespace(
         rid="req-long",
         origin_input_ids=[1, 2, 3, 4, 5],
+        origin_input_ids_unpadded=[1, 2, 3, 4, 5],
         sampling_params=SimpleNamespace(max_new_tokens=10, min_new_tokens=0),
         output_ids=[],
     )
     request_data = SimpleNamespace(
         req=req,
         enforce_request_limits=True,
+        max_new_tokens=10,
     )
     scheduler._request_builder = lambda payload: request_data
 
-    scheduler.process_input_requests([SimpleNamespace(request_id="req-long")])
+    scheduler.is_entry_rank = True
+    scheduler.process_input_requests([_new_stage_payload("req-long")])
 
     output = scheduler.outbox.get_nowait()
     assert output.request_id == "req-long"
@@ -1576,15 +1701,17 @@ def test_omni_scheduler_follower_rejections_do_not_emit_errors() -> None:
     over_context_req = SimpleNamespace(
         rid="req-long",
         origin_input_ids=[1, 2, 3, 4, 5],
+        origin_input_ids_unpadded=[1, 2, 3, 4, 5],
         sampling_params=SimpleNamespace(max_new_tokens=10, min_new_tokens=0),
         output_ids=[],
     )
     scheduler._request_builder = lambda payload: SimpleNamespace(
         req=over_context_req,
         enforce_request_limits=True,
+        max_new_tokens=10,
     )
 
-    scheduler.process_input_requests([SimpleNamespace(request_id="req-long")])
+    scheduler.process_input_requests([_new_stage_payload("req-long")])
 
     assert scheduler.outbox.empty()
     assert scheduler.waiting_queue == []
@@ -1592,15 +1719,17 @@ def test_omni_scheduler_follower_rejections_do_not_emit_errors() -> None:
     over_kv_req = SimpleNamespace(
         rid="req-kv",
         origin_input_ids=[1, 2, 3],
+        origin_input_ids_unpadded=[1, 2, 3],
         sampling_params=SimpleNamespace(max_new_tokens=4, min_new_tokens=0),
         output_ids=[],
     )
     scheduler._request_builder = lambda payload: SimpleNamespace(
         req=over_kv_req,
         enforce_request_limits=False,
+        max_new_tokens=4,
     )
 
-    scheduler.process_input_requests([SimpleNamespace(request_id="req-kv")])
+    scheduler.process_input_requests([_new_stage_payload("req-kv")])
 
     assert scheduler.outbox.empty()
     assert scheduler.waiting_queue == []
@@ -1628,13 +1757,18 @@ def test_omni_scheduler_leaves_request_budget_unchanged_without_opt_in() -> None
     req = SimpleNamespace(
         rid="req-original",
         origin_input_ids=[1, 2, 3],
+        origin_input_ids_unpadded=[1, 2, 3],
         sampling_params=sampling_params,
         output_ids=[],
     )
-    req_data = SimpleNamespace(req=req, max_new_tokens=3)
+    req_data = SimpleNamespace(
+        req=req,
+        max_new_tokens=3,
+        enforce_request_limits=False,
+    )
     scheduler._request_builder = lambda payload: req_data
 
-    scheduler.process_input_requests([SimpleNamespace(request_id="req-original")])
+    scheduler.process_input_requests([_new_stage_payload("req-original")])
 
     assert scheduler.waiting_queue == [req]
     assert req.sampling_params.max_new_tokens == 3

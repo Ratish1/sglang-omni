@@ -67,6 +67,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         self.total_gpu_memory_fraction = total_gpu_memory_fraction
         self.model: Any | None = None
         self._prefill_graph_model_runner: Any | None = None
+        self._prefill_graph_alias_installed = False
 
     def generation_defaults(
         self,
@@ -199,38 +200,45 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
                 "refusing to capture against ambiguous model aliases"
             )
         object.__setattr__(self.model, "language_model", self.model.backbone)
+        self._prefill_graph_alias_installed = True
         self._prefill_graph_model_runner = model_runner
 
     def post_cuda_graph_setup(self, model: Any, server_args: Any) -> None:
-        model.__dict__.pop("model", None)
-        model.__dict__.pop("language_model", None)
         if server_args.cuda_graph_config.prefill.backend == "disabled":
             return
-        runner = self._prefill_graph_model_runner
-        prefill_runner = None if runner is None else runner.prefill_cuda_graph_runner
-        if not isinstance(prefill_runner, PrefillCudaGraphRunner):
-            raise RuntimeError(
-                "Higgs explicitly enabled prefill CUDA graph, but SGLang did "
-                "not construct PrefillCudaGraphRunner"
+        if not self._prefill_graph_alias_installed:
+            raise RuntimeError("Higgs prefill CUDA graph alias was not installed")
+        try:
+            runner = self._prefill_graph_model_runner
+            prefill_runner = (
+                None if runner is None else runner.prefill_cuda_graph_runner
             )
-        if not prefill_runner._is_full_backend:
-            raise RuntimeError(
-                "Higgs prefill CUDA graph requires the full backend's padded "
-                "body-replay contract"
+            if not isinstance(prefill_runner, PrefillCudaGraphRunner):
+                raise RuntimeError(
+                    "Higgs explicitly enabled prefill CUDA graph, but SGLang did "
+                    "not construct PrefillCudaGraphRunner"
+                )
+            if not prefill_runner._is_full_backend:
+                raise RuntimeError(
+                    "Higgs prefill CUDA graph requires the full backend's padded "
+                    "body-replay contract"
+                )
+            configured_shapes = tuple(server_args.cuda_graph_config.prefill.bs)
+            captured_shapes = tuple(prefill_runner.capture_num_tokens)
+            if captured_shapes != tuple(sorted(configured_shapes)):
+                raise RuntimeError(
+                    "Higgs prefill CUDA graph capture shapes differ from the "
+                    f"configured contract: configured={configured_shapes}, "
+                    f"captured={captured_shapes}"
+                )
+            logger.info(
+                "Higgs prefill CUDA graph active: backend=%s shapes=%s",
+                server_args.cuda_graph_config.prefill.backend,
+                server_args.cuda_graph_config.prefill.bs,
             )
-        configured_shapes = tuple(server_args.cuda_graph_config.prefill.bs)
-        captured_shapes = tuple(prefill_runner.capture_num_tokens)
-        if captured_shapes != tuple(sorted(configured_shapes)):
-            raise RuntimeError(
-                "Higgs prefill CUDA graph capture shapes differ from the "
-                f"configured contract: configured={configured_shapes}, "
-                f"captured={captured_shapes}"
-            )
-        logger.info(
-            "Higgs prefill CUDA graph active: backend=%s shapes=%s",
-            server_args.cuda_graph_config.prefill.backend,
-            server_args.cuda_graph_config.prefill.bs,
-        )
+        finally:
+            model.__dict__.pop("language_model", None)
+            self._prefill_graph_alias_installed = False
 
     def get_model_buffer_bs(self, model: Any) -> int | None:
         return model.sampler_pool_max_running_requests

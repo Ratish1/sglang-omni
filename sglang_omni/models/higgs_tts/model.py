@@ -509,28 +509,21 @@ class HiggsTTSModel(nn.Module):
     def _extract_batch_metadata(
         self, forward_batch
     ) -> tuple[list[str], list[HiggsGenParams]]:
-        # ``rids`` is part of SGLang's ForwardBatch contract and survives the
-        # 0.5.15 EagerRunner static-buffer copy. ``req_ids`` was an Omni-added
-        # dynamic attribute; dataclasses.replace drops it, silently routing
-        # prefill sampling into fallback rows such as "req-0".
-        req_ids_raw = getattr(forward_batch, "rids", None)
+        req_ids_raw = forward_batch.rids
+        batch_size = int(forward_batch.batch_size)
         if req_ids_raw is None:
-            req_ids_raw = getattr(forward_batch, "req_ids", None)
-        batch_size = self._infer_batch_size(forward_batch)
-        if req_ids_raw is None:
-            # No fabricated fallback identities: sampler rows keyed on made-up
-            # ids silently decouple output routing and seeding from the real
-            # requests. Full-backend prefill capture never reaches this eager
-            # tail (it replays only the transformer body), so a batch without
-            # ``rids`` here means the runner contract changed — fail loudly.
             raise RuntimeError(
-                "Higgs prefill batch carries neither ForwardBatch.rids nor "
-                "req_ids; refusing to fabricate request identities"
+                "Higgs prefill batch has no ForwardBatch.rids; refusing to "
+                "fabricate request identities"
             )
         req_ids = [str(r) for r in req_ids_raw]
+        if len(req_ids) != batch_size:
+            raise RuntimeError(
+                "Higgs prefill request metadata does not match the batch size: "
+                f"rids={len(req_ids)} batch_size={batch_size}"
+            )
 
-        sampling_info = getattr(forward_batch, "sampling_info", None)
-        gen_params = self._gen_params_for_batch(sampling_info, batch_size)
+        gen_params = self._gen_params_for_batch(forward_batch.sampling_info, batch_size)
         return req_ids, gen_params
 
     @staticmethod
@@ -556,13 +549,6 @@ class HiggsTTSModel(nn.Module):
                 )
             )
         return params
-
-    @staticmethod
-    def _infer_batch_size(forward_batch) -> int:
-        seq_lens = getattr(forward_batch, "seq_lens", None)
-        if seq_lens is not None and hasattr(seq_lens, "shape"):
-            return int(seq_lens.shape[0])
-        return int(getattr(forward_batch, "batch_size", 1))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
         """Remap Higgs ckpt names then split between backbone and own modules.

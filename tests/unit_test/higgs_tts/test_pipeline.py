@@ -3,6 +3,7 @@
 import base64
 import logging
 import queue
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,6 +26,7 @@ from sglang_omni.models.higgs_tts.sampler import (
     NO_SEED,
     HiggsBatchedSamplerState,
 )
+from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.utils import EOC_ID, apply_delay_pattern
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
@@ -50,12 +52,11 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
 
-def test_higgs_batch_metadata_prefers_sglang_rids() -> None:
+def test_higgs_batch_metadata_reads_sglang_rids() -> None:
     model = object.__new__(HiggsTTSModel)
     forward_batch = SimpleNamespace(
         rids=["stable-a", "stable-b"],
-        req_ids=["dropped-dynamic-attribute"],
-        seq_lens=torch.tensor([1, 1]),
+        batch_size=2,
         sampling_info=None,
     )
 
@@ -69,7 +70,7 @@ def test_higgs_batch_metadata_refuses_missing_request_ids() -> None:
     model = object.__new__(HiggsTTSModel)
     forward_batch = SimpleNamespace(
         rids=None,
-        seq_lens=torch.tensor([1, 1]),
+        batch_size=2,
         sampling_info=None,
     )
 
@@ -119,22 +120,7 @@ def test_higgs_request_row_seed_tracks_request_seed() -> None:
     assert model._sampler_pool.seeds[0].item() == 42
 
 
-@pytest.mark.parametrize(
-    ("graph_eligible", "expected_tokens"),
-    [(True, 256), (False, 134)],
-)
-def test_higgs_prefill_embeddings_follow_graph_padding_contract(
-    graph_eligible: bool,
-    expected_tokens: int,
-) -> None:
-    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
-        PrefillCudaGraphRunner,
-    )
-
-    prefill_runner = object.__new__(PrefillCudaGraphRunner)
-    prefill_runner.capture_num_tokens = [128, 256]
-    prefill_runner.can_run_graph = lambda _forward_batch: graph_eligible
-
+def test_higgs_prefill_embeddings_leave_graph_dispatch_to_sglang() -> None:
     seeds: list[tuple[str, int | None]] = []
     model = SimpleNamespace(
         _pending_prefill_input_embeds=None,
@@ -142,9 +128,6 @@ def test_higgs_prefill_embeddings_follow_graph_padding_contract(
     )
     runner = object.__new__(HiggsTTSModelRunner)
     runner.model = model
-    runner.tp_worker = SimpleNamespace(
-        model_runner=SimpleNamespace(prefill_cuda_graph_runner=prefill_runner)
-    )
     raw_embeds = torch.arange(134 * 4, dtype=torch.float32).view(134, 4)
     runner._build_prefill_input_embeds = lambda _forward_batch, _requests: raw_embeds
     request = SimpleNamespace(
@@ -158,13 +141,50 @@ def test_higgs_prefill_embeddings_follow_graph_padding_contract(
     runner.before_prefill(forward_batch, None, [request])
 
     pending = model._pending_prefill_input_embeds
-    assert pending.shape == (expected_tokens, 4)
-    torch.testing.assert_close(pending[:134], raw_embeds)
-    if graph_eligible:
-        assert torch.count_nonzero(pending[134:]).item() == 0
+    assert pending is raw_embeds
     assert forward_batch.input_embeds is None
-    assert forward_batch.req_ids == ["request"]
     assert seeds == [("request", 17)]
+
+
+def test_higgs_prefill_embeddings_follow_radix_prefix_position() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner.model = SimpleNamespace(
+        backbone=SimpleNamespace(
+            model=SimpleNamespace(
+                embed_tokens=lambda ids: torch.stack(
+                    (ids.to(torch.float32), ids.to(torch.float32)), dim=-1
+                )
+            )
+        ),
+        multimodal_embedding=SimpleNamespace(
+            modality_embedding_0=lambda codes: codes.to(torch.float32)
+        ),
+    )
+    origin_input_ids = [
+        7,
+        AUDIO_PLACEHOLDER_ID,
+        AUDIO_PLACEHOLDER_ID,
+        AUDIO_PLACEHOLDER_ID,
+        8,
+    ]
+    request = SimpleNamespace(
+        data=SimpleNamespace(
+            req=SimpleNamespace(
+                origin_input_ids=origin_input_ids,
+                extend_range=SimpleNamespace(start=2, length=2),
+            ),
+            reference_codes_delayed=[[10, 11], [20, 21], [30, 31]],
+        )
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.tensor(
+            [AUDIO_PLACEHOLDER_ID, AUDIO_PLACEHOLDER_ID], dtype=torch.long
+        )
+    )
+
+    embeds = runner._build_prefill_input_embeds(forward_batch, [request])
+
+    assert embeds.tolist() == [[20.0, 21.0], [30.0, 31.0]]
 
 
 def test_higgs_prefill_forward_failure_clears_pending_embeddings() -> None:
@@ -450,6 +470,38 @@ def test_higgs_tts_engine_abort_callback_requires_model() -> None:
     abort_callback("req-1")
 
     assert reset_calls == ["req-1"]
+
+
+def test_higgs_disabled_prefill_graph_preserves_model_attributes() -> None:
+    builder = _make_higgs_builder()
+    builder._prefill_graph_alias_installed = False
+    model = SimpleNamespace(model=object(), language_model=object())
+    original_attributes = dict(model.__dict__)
+    server_args = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(backend="disabled"))
+    )
+
+    builder.post_cuda_graph_setup(model, server_args)
+
+    assert model.__dict__ == original_attributes
+
+
+def test_higgs_prefill_graph_validation_removes_only_installed_alias() -> None:
+    builder = _make_higgs_builder()
+    builder._prefill_graph_alias_installed = True
+    builder._prefill_graph_model_runner = None
+    model_attribute = object()
+    model = SimpleNamespace(model=model_attribute, language_model=object())
+    server_args = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(backend="full"))
+    )
+
+    with pytest.raises(RuntimeError, match="did not construct"):
+        builder.post_cuda_graph_setup(model, server_args)
+
+    assert model.model is model_attribute
+    assert "language_model" not in model.__dict__
+    assert builder._prefill_graph_alias_installed is False
 
 
 def _make_higgs_builder(**kwargs):
@@ -1933,6 +1985,7 @@ def _make_fake_codec(call_log: list[tuple[int, int]]):
     codec._decode_cuda_graph_hits = 0
     codec._decode_cuda_graph_misses = 0
     codec._decode_cuda_graph_missed_shapes = set()
+    codec._decode_single_flight_lock = threading.Lock()
     return codec
 
 
@@ -2009,6 +2062,7 @@ def _make_fake_encoder_codec(encode_calls: list):
     codec._decode_cuda_graph_hits = 0
     codec._decode_cuda_graph_misses = 0
     codec._decode_cuda_graph_missed_shapes = set()
+    codec._decode_single_flight_lock = threading.Lock()
     return codec
 
 

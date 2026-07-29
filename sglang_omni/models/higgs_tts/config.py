@@ -22,12 +22,10 @@ _MAX_PIPELINE_INTRAOP_THREADS = 8
 class HiggsTtsPipelineConfig(PipelineConfig):
     """4-stage TTS pipeline: preprocessing → audio_encoder → tts_engine → vocoder.
 
-    Mirrors the V0 layout: preprocessing tokenises text + delay-pattern-encodes
-    the reference audio codes; audio_encoder runs the fused multi-codebook
-    embedding once on the delayed ref codes (CPU- or GPU-side); tts_engine
-    drives the AR loop on the sglang backbone with the precomputed embed
-    pasted at ``-100`` placeholder positions; vocoder reverses the delay
-    pattern and decodes to waveform via the higgs-audio-v2-tokenizer codec.
+    Preprocessing normalizes text/reference inputs; audio_encoder codec-encodes
+    raw reference audio and builds the prompt; tts_engine composes the delayed
+    reference-code embeddings at ``-100`` placeholder positions and drives the
+    SGLang AR loop; vocoder reverses the delay pattern and decodes the waveform.
     """
 
     architecture: ClassVar[str] = "HiggsMultimodalQwen3ForConditionalGeneration"
