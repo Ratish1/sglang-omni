@@ -1241,7 +1241,7 @@ class Qwen3TTSTalker(nn.Module):
             return False
         # Note: (Jiaxin Deng) capture under TP would record collectives; the
         # graphed chain is only validated single-rank, so TP stays eager.
-        return int(getattr(server_args, "tp_size", 1) or 1) == 1
+        return int(server_args.tp_size) == 1
 
     def _predictor_forward_graphed(
         self,

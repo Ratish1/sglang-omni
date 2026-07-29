@@ -146,9 +146,9 @@ class MingTtsEngineBuilder(TtsEngineBuilder):
             self.tp_rank,
             self.tp_size,
             self.total_gpu_memory_fraction,
-            bool(getattr(server_args, "disable_cuda_graph", False)),
+            bool(server_args.disable_cuda_graph),
             get_decode_cuda_graph_bs(server_args),
-            not bool(getattr(server_args, "disable_radix_cache", True)),
+            not bool(server_args.disable_radix_cache),
             self.nccl_port,
         )
 

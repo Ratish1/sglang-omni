@@ -774,7 +774,7 @@ class MingTTSSGLangModel(nn.Module):
             )
 
             max_batch_size = int(server_args.max_running_requests)
-            if not bool(getattr(server_args, "disable_cuda_graph", True)):
+            if not bool(server_args.disable_cuda_graph):
                 max_batch_size = max(
                     max_batch_size,
                     int(get_decode_cuda_graph_max_bs(server_args) or 1),

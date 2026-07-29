@@ -52,7 +52,7 @@ class FishS2ProEngineBuilder(TtsEngineBuilder):
 
     def customize_server_args(self, server_args: Any) -> None:
         updates: dict[str, Any] = {"disable_overlap_schedule": True}
-        if getattr(server_args, "attention_backend", None) is None:
+        if server_args.attention_backend is None:
             updates["attention_backend"] = "fa3"
         override_server_args(
             server_args,
@@ -99,7 +99,7 @@ class FishS2ProEngineBuilder(TtsEngineBuilder):
         return fish_stages._resolve_s2pro_model_buffer_bs(model)
 
     def compile_model(self, model: Any, server_args: Any) -> None:
-        if bool(getattr(server_args, "enable_torch_compile", False)):
+        if bool(server_args.enable_torch_compile):
             fish_stages._compile_s2pro_codebook_decoder(
                 model,
                 max_batch_size=server_args.torch_compile_max_bs,

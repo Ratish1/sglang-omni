@@ -91,7 +91,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         )
 
     def compile_model(self, model: Any, server_args: Any) -> None:
-        if bool(getattr(server_args, "enable_torch_compile", False)):
+        if bool(server_args.enable_torch_compile):
             qwen3_stages._compile_qwen3_tts_backbone(model)
             override_server_args(
                 server_args,

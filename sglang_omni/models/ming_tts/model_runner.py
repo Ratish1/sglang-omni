@@ -79,9 +79,8 @@ class MingTTSModelRunner(ModelRunner):
 
     def __init__(self, tp_worker: Any, output_processor: Any):
         super().__init__(tp_worker, output_processor)
-        server_args = getattr(tp_worker, "server_args", None)
-        self._tp_rank = int(getattr(tp_worker, "tp_rank", 0) or 0)
-        self._tp_size = int(getattr(server_args, "tp_size", 1) or 1)
+        self._tp_rank = int(tp_worker.tp_rank)
+        self._tp_size = int(tp_worker.server_args.tp_size)
         self._request_states: dict[str, _MingTTSRequestState] = {}
 
     def reset_request(self, request_id: str) -> None:

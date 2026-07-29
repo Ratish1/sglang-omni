@@ -445,9 +445,7 @@ def _apply_model_worker_backend_policy(
 ) -> str | None:
     """Apply Omni backend policy after checkpoint quantization is known."""
 
-    effective_quantization = _normalize_quantization(
-        getattr(model_config, "quantization", None)
-    )
+    effective_quantization = _normalize_quantization(model_config.quantization)
     server_quantization = _normalize_quantization(server_args.quantization)
     if server_quantization is not None:
         effective_quantization = server_quantization
@@ -551,15 +549,11 @@ def _normalize_quantization(value: object) -> str | None:
 
 
 def _model_config_has_moe(model_config: ModelConfig) -> bool:
-    config_to_check = getattr(model_config, "hf_text_config", None)
-    if config_to_check is None:
-        hf_config = getattr(model_config, "hf_config", None)
-        config_to_check = getattr(hf_config, "text_config", hf_config)
-    return hasattr(config_to_check, "num_experts_per_tok")
+    return hasattr(model_config.hf_text_config, "num_experts_per_tok")
 
 
 def _model_config_has_native_fp8_block_quant(model_config: ModelConfig) -> bool:
-    quant_dict = resolve_quant_config(getattr(model_config, "hf_config", None))
+    quant_dict = resolve_quant_config(model_config.hf_config)
     if quant_dict is None:
         return False
     return (
@@ -605,7 +599,7 @@ def _apply_omni_quantization_adapters(model_config: ModelConfig) -> None:
     name normalization for methods whose per-block quant names are matched
     against runtime module names, currently AutoRound.
     """
-    quant_dict = resolve_quant_config(getattr(model_config, "hf_config", None))
+    quant_dict = resolve_quant_config(model_config.hf_config)
     if quant_dict is None:
         return
 

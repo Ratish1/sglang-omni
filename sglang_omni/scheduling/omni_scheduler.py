@@ -184,7 +184,7 @@ class OmniScheduler:
         self.server_args = server_args
         self.model_config = model_config
         self.gpu_id = tp_worker.gpu_id
-        self.tp_rank = getattr(tp_worker, "tp_rank", 0)
+        self.tp_rank = tp_worker.tp_rank
         self.tp_size = server_args.tp_size
         self.pp_rank = 0
         self.pp_size = server_args.pp_size
@@ -1358,7 +1358,7 @@ class OmniScheduler:
         self._scheduler_thread_id = threading.get_ident()
         self._running = True
         try:
-            if getattr(self, "enable_async_decode", False):
+            if self.enable_async_decode:
                 self._event_loop_async_decode()
             elif self.enable_overlap:
                 self._event_loop_overlap()
