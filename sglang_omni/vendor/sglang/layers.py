@@ -6,7 +6,12 @@ Patches applied to RMSNorm.forward_cuda:
   - Empty tensor early return (avoids CUDA kernel launch on zero-element tensors)
   - cast_x_before_out_mul fallback to forward_native (HF-compatible RMSNorm cast order)
   - dtype mismatch fallback when residual or post_residual_addition differ from x.dtype
-These patches can be removed once upstream SGLang merges equivalent changes.
+
+sglang 0.5.16 handles cast_x_before_out_mul in both of its own JIT paths
+(_jit_rmsnorm_hf for residual=None, _jit_fused_add_rmsnorm otherwise), so the
+second patch above is now a pessimization rather than a correctness fix.
+Removing it swaps eager PyTorch for a fused kernel, which is a numerics change,
+so it stays until a greedy token-id equivalence run confirms the swap.
 """
 
 from __future__ import annotations
@@ -62,6 +67,13 @@ def _patched_forward_cuda(
     **kwargs,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if x.numel() == 0:
+        # Mirror upstream's zero-token contract exactly: callers unpack a
+        # 2-tuple whenever they passed a residual, and post_residual_addition
+        # is folded into it.
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            return x, residual
         return x
     if self.cast_x_before_out_mul:
         return self.forward_native(
@@ -94,56 +106,6 @@ def _patched_forward_cuda(
 
 
 RMSNorm.forward_cuda = _patched_forward_cuda
-
-# ---------------------------------------------------------------------------
-# RMSNorm.forward_with_allreduce_fusion monkey-patch
-# ---------------------------------------------------------------------------
-_orig_forward_with_allreduce_fusion = RMSNorm.forward_with_allreduce_fusion
-
-
-def _patched_forward_with_allreduce_fusion(
-    self,
-    x: torch.Tensor,
-    residual: Optional[torch.Tensor] = None,
-    post_residual_addition: Optional[torch.Tensor] = None,
-    **kwargs,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    if residual is not None:
-        from sglang.srt.distributed import (
-            get_tensor_model_parallel_world_size,
-            tensor_model_parallel_all_reduce,
-        )
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            flashinfer_allreduce_residual_rmsnorm,
-        )
-
-        if get_tensor_model_parallel_world_size() > 1:
-            fused_result = flashinfer_allreduce_residual_rmsnorm(
-                input_tensor=x,
-                residual=residual,
-                weight=self.weight,
-                eps=self.variance_epsilon,
-            )
-            if fused_result[0] is not None:
-                return fused_result
-
-            x = tensor_model_parallel_all_reduce(x)
-            return self.forward(
-                x,
-                residual,
-                post_residual_addition=post_residual_addition,
-                **kwargs,
-            )
-
-    return self.forward(
-        x,
-        residual,
-        post_residual_addition=post_residual_addition,
-        **kwargs,
-    )
-
-
-RMSNorm.forward_with_allreduce_fusion = _patched_forward_with_allreduce_fusion
 
 __all__ = [
     "AttentionType",
