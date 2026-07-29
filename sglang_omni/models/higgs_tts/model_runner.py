@@ -472,12 +472,23 @@ class HiggsTTSModelRunner(ModelRunner):
                 continue
 
             codes = torch.tensor(codes_rows, dtype=torch.long, device=device)
-            consumed = data.num_ref_codes_consumed
+            # Radix reuse can begin this request's live extension after a
+            # cached reference-audio prefix. Derive the code row from the
+            # absolute prompt position instead of request-local progress.
+            consumed = sum(
+                token == AUDIO_PLACEHOLDER_ID
+                for token in data.req.origin_input_ids[: data.req.extend_range.start]
+            )
+            if consumed + n_placeholders > len(codes_rows):
+                raise RuntimeError(
+                    "Higgs reference-code rows do not cover the live audio "
+                    f"placeholders: consumed={consumed}, "
+                    f"live={n_placeholders}, available={len(codes_rows)}"
+                )
             with torch.no_grad():
                 embed = fused_embed(codes[consumed : consumed + n_placeholders])
             mask_idx = full_mask.nonzero(as_tuple=True)[0] + offset
             text_embeds[mask_idx] = embed.to(text_embeds.dtype)
-            data.num_ref_codes_consumed = consumed + n_placeholders
             offset = end
 
         return text_embeds

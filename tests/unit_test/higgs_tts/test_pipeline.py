@@ -25,6 +25,7 @@ from sglang_omni.models.higgs_tts.sampler import (
     NO_SEED,
     HiggsBatchedSamplerState,
 )
+from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.utils import EOC_ID, apply_delay_pattern
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
@@ -165,6 +166,47 @@ def test_higgs_prefill_embeddings_follow_graph_padding_contract(
     assert forward_batch.input_embeds is None
     assert forward_batch.req_ids == ["request"]
     assert seeds == [("request", 17)]
+
+
+def test_higgs_prefill_embeddings_follow_radix_prefix_position() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner.model = SimpleNamespace(
+        backbone=SimpleNamespace(
+            model=SimpleNamespace(
+                embed_tokens=lambda ids: torch.stack(
+                    (ids.to(torch.float32), ids.to(torch.float32)), dim=-1
+                )
+            )
+        ),
+        multimodal_embedding=SimpleNamespace(
+            modality_embedding_0=lambda codes: codes.to(torch.float32)
+        ),
+    )
+    origin_input_ids = [
+        7,
+        AUDIO_PLACEHOLDER_ID,
+        AUDIO_PLACEHOLDER_ID,
+        AUDIO_PLACEHOLDER_ID,
+        8,
+    ]
+    request = SimpleNamespace(
+        data=SimpleNamespace(
+            req=SimpleNamespace(
+                origin_input_ids=origin_input_ids,
+                extend_range=SimpleNamespace(start=2, length=2),
+            ),
+            reference_codes_delayed=[[10, 11], [20, 21], [30, 31]],
+        )
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.tensor(
+            [AUDIO_PLACEHOLDER_ID, AUDIO_PLACEHOLDER_ID], dtype=torch.long
+        )
+    )
+
+    embeds = runner._build_prefill_input_embeds(forward_batch, [request])
+
+    assert embeds.tolist() == [[20.0, 21.0], [30.0, 31.0]]
 
 
 def test_higgs_prefill_forward_failure_clears_pending_embeddings() -> None:
