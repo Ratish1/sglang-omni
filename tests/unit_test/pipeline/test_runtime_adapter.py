@@ -191,7 +191,7 @@ def test_process_total_memory_fraction_factory_arg_is_rejected() -> None:
     stage = _stage(factory_args={"process_total_gpu_memory_fraction": 0.82})
     config = PipelineConfig(model_path="dummy-model", stages=[stage])
 
-    with pytest.raises(ValueError, match="derived from process topology"):
+    with pytest.raises(ValueError, match="derived from process construction order"):
         resolve_stage_static_factory_args(stage, config)
 
 
@@ -203,7 +203,7 @@ def test_process_total_memory_fraction_runtime_override_is_rejected() -> None:
         runtime_overrides={"thinker": {"process_total_gpu_memory_fraction": 0.82}},
     )
 
-    with pytest.raises(ValueError, match="derived from process topology"):
+    with pytest.raises(ValueError, match="derived from process construction order"):
         resolve_stage_static_factory_args(stage, config)
 
 
