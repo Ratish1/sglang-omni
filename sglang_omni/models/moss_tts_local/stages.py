@@ -171,10 +171,8 @@ def _validate_loaded_process_memory_budget(
     total_bytes = get_gpu_device_info(gpu_id).total_memory_bytes
     if process_bytes is None or total_bytes is None:
         logger.warning(
-            "%s GPU memory budget cannot be verified: gpu_id=%d fraction=%.3f",
-            stage_name,
-            gpu_id,
-            total_gpu_memory_fraction,
+            f"{stage_name} GPU memory budget cannot be verified: "
+            f"gpu_id={gpu_id} fraction={total_gpu_memory_fraction:.3f}"
         )
         return
 
@@ -187,11 +185,10 @@ def _validate_loaded_process_memory_budget(
             f"fraction={total_gpu_memory_fraction:.3f}"
         )
     logger.info(
-        "%s process GPU memory: used=%s budget=%s fraction=%.3f",
-        stage_name,
-        format_bytes_gib(process_bytes),
-        format_bytes_gib(budget_bytes),
-        total_gpu_memory_fraction,
+        f"{stage_name} process GPU memory: "
+        f"used={format_bytes_gib(process_bytes)} "
+        f"budget={format_bytes_gib(budget_bytes)} "
+        f"fraction={total_gpu_memory_fraction:.3f}"
     )
 
 
@@ -556,10 +553,8 @@ def create_preprocessing_executor(
     worker_count = max(int(max_concurrency), 1)
     intraop_threads = _configure_pipeline_threads(worker_count)
     logger.info(
-        "MOSS-TTS Local pipeline uses %d preprocessing workers, "
-        "%d shared intra-op threads",
-        worker_count,
-        intraop_threads,
+        f"MOSS-TTS Local pipeline uses {worker_count} preprocessing workers, "
+        f"{intraop_threads} shared intra-op threads"
     )
     # MOSS_REF_AUDIO_CACHE=0 disables the cache at startup (ops kill switch / A-B
     # toggle) without a config edit; unset => kwarg/config default.

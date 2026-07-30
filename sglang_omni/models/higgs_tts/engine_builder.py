@@ -230,9 +230,9 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
                 f"captured={captured_shapes}"
             )
         logger.info(
-            "Higgs prefill CUDA graph active: backend=%s shapes=%s",
-            server_args.cuda_graph_config.prefill.backend,
-            server_args.cuda_graph_config.prefill.bs,
+            f"Higgs prefill CUDA graph active: "
+            f"backend={server_args.cuda_graph_config.prefill.backend} "
+            f"shapes={server_args.cuda_graph_config.prefill.bs}"
         )
 
     def get_model_buffer_bs(self, model: Any) -> int | None:

@@ -555,6 +555,21 @@ def test_terminal_request_cannot_reopen_stage_stream_ingress() -> None:
         stage._active_requests.add("req")
 
         stage._clear_request_state("req")
+        await stage.receive_local_payload(
+            "req",
+            "tts_engine",
+            object(),
+        )
+        assert len(stage.control_plane.completions) == 1
+        assert stage.control_plane.completions[0].success is False
+        assert "must be unique" in stage.control_plane.completions[0].error
+        await stage.receive_local_payload(
+            "req",
+            "tts_engine",
+            object(),
+        )
+        assert len(stage.control_plane.completions) == 1
+
         await stage.receive_local_stream_chunk(
             "req",
             "tts_engine",
@@ -571,6 +586,7 @@ def test_terminal_request_cannot_reopen_stage_stream_ingress() -> None:
         assert "req" not in stage._active_requests
         assert not stage._stream_queue.has("req")
         assert scheduler.inbox.empty()
+        assert len(stage.control_plane.completions) == 1
 
     asyncio.run(_run())
 

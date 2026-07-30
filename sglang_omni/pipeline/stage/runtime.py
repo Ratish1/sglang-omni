@@ -370,6 +370,7 @@ class Stage:
     async def _on_submit(self, msg: SubmitMessage) -> None:
         request_id = msg.request_id
         if self._is_request_closed(request_id):
+            await self._reject_reused_request_id(request_id)
             return
         self._active_requests.add(request_id)
         if self._stream_queue is not None and not self._stream_queue.has(request_id):
@@ -392,6 +393,8 @@ class Stage:
         request_id = msg.request_id
         if self._is_request_closed(request_id):
             await self._discard_payload_data(msg)
+            await self._wait_for_receive_predecessor(predecessor)
+            await self._reject_reused_request_id(request_id)
             return
         self._active_requests.add(request_id)
         if self._stream_queue is not None and not self._stream_queue.has(request_id):
@@ -493,6 +496,7 @@ class Stage:
         payload: Any,
     ) -> None:
         if self._is_request_closed(request_id):
+            await self._reject_reused_request_id(request_id)
             return
         self._active_requests.add(request_id)
         if self._stream_queue is not None and not self._stream_queue.has(request_id):
@@ -1528,6 +1532,16 @@ class Stage:
         if len(self._terminal_request_ids) >= _TERMINAL_REQUEST_ID_LIMIT:
             del self._terminal_request_ids[next(iter(self._terminal_request_ids))]
         self._terminal_request_ids[request_id] = None
+
+    async def _reject_reused_request_id(self, request_id: str) -> None:
+        if request_id in self._aborted:
+            return
+        error = (
+            f"Stage {self.name}: request ID {request_id!r} is still reserved "
+            "after terminal cleanup; request IDs must be unique"
+        )
+        logger.error(error)
+        await self._send_failure(request_id, error)
 
     async def _handle_scheduler_crash(self, exc: BaseException) -> None:
         if self._scheduler_crash_error is not None:

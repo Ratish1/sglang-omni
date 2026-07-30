@@ -1184,6 +1184,8 @@ def test_stream_output_closes_late_stream_ingress() -> None:
 def test_completed_request_id_cannot_be_reopened() -> None:
     scheduler = object.__new__(OmniScheduler)
     scheduler.tp_size = 1
+    scheduler.is_entry_rank = True
+    scheduler.outbox = Queue()
     scheduler._aborted_request_ids = set()
     scheduler._completed_request_ids = {"req-complete": None}
     scheduler._pending_stream_chunks = {}
@@ -1201,6 +1203,10 @@ def test_completed_request_id_cannot_be_reopened() -> None:
 
     assert new_reqs == []
     assert "req-complete" in scheduler._completed_request_ids
+    error = scheduler.outbox.get_nowait()
+    assert error.request_id == "req-complete"
+    assert error.type == "error"
+    assert "must be unique" in str(error.data)
 
 
 def test_completed_request_tombstones_evict_oldest(monkeypatch) -> None:

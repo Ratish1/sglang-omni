@@ -275,10 +275,8 @@ class HiggsAudioCodec:
         torch.cuda.synchronize(self.device)
         self._decode_cuda_graphs = captured
         logger.info(
-            "Captured %d Higgs codec decode CUDA graphs for frame counts %d..%d",
-            len(captured),
-            min(captured),
-            max(captured),
+            f"Captured {len(captured)} Higgs codec decode CUDA graphs for "
+            f"frame counts {min(captured)}..{max(captured)}"
         )
 
     @torch.no_grad()
@@ -396,9 +394,8 @@ class HiggsAudioCodec:
                 if frame_count not in self._decode_cuda_graph_missed_shapes:
                     self._decode_cuda_graph_missed_shapes.add(frame_count)
                     logger.warning(
-                        "Higgs codec decode CUDA graph miss for frame count %d; "
-                        "using eager decode",
-                        frame_count,
+                        f"Higgs codec decode CUDA graph miss for frame count "
+                        f"{frame_count}; using eager decode"
                     )
             audio = self.model.decode(
                 codes_BNT.to(device=self.device, dtype=torch.long)
@@ -408,9 +405,9 @@ class HiggsAudioCodec:
         )
         if decode_graphs and total_graph_lookups % 1024 == 0:
             logger.info(
-                "Higgs codec decode CUDA graph stats: hits=%d misses=%d",
-                self._decode_cuda_graph_hits,
-                self._decode_cuda_graph_misses,
+                f"Higgs codec decode CUDA graph stats: "
+                f"hits={self._decode_cuda_graph_hits} "
+                f"misses={self._decode_cuda_graph_misses}"
             )
         return audio.squeeze(0).squeeze(0).cpu()
 

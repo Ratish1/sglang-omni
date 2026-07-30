@@ -268,10 +268,11 @@ def test_lookahead_guard_redirect_persists_and_matches_baseline():
 
 
 def test_rid_reuse_on_same_row_misses():
-    # Note (Yueying Li): client-supplied rids may be reused after a request finishes; LIFO row
-    # recycling then reproduces the exact (rid, row, bs) key of the finished
-    # request. A fresh acquisition must force a rebuild or the new request
-    # inherits the old params and a stale padding-row redirect.
+    # Defensive model-level contract: a direct caller can recycle a rid after
+    # release even though the Coordinator reserves recently terminal IDs.
+    # LIFO row recycling then reproduces the exact (rid, row, bs) key of the
+    # finished request. A fresh acquisition must force a rebuild or the new
+    # request inherits the old params and a stale padding-row redirect.
     model = _FakeModel()
     runner, calls = _make_runner(model, async_enabled=True)
     fb_old = _fb(1)

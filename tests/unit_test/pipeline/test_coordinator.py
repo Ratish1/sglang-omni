@@ -513,6 +513,9 @@ def test_completed_stream_keeps_request_id_reserved_until_owner_closes() -> None
         await stream.aclose()
         assert "req-1" not in coordinator._completion_futures
         assert "req-1" not in coordinator._stream_queues
+        assert "req-1" in coordinator._terminal_request_ids
+        with pytest.raises(ValueError, match="already exists"):
+            await coordinator._submit_request("req-1", "replacement")
 
     asyncio.run(_run())
 

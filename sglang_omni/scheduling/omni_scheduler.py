@@ -723,9 +723,15 @@ class OmniScheduler:
 
             if msg.type == "new_request":
                 if msg.request_id in self._completed_request_ids:
-                    logger.error(
-                        "OmniScheduler: rejecting reused terminal request ID %r",
+                    error_text = (
+                        f"OmniScheduler: request ID "
+                        f"{msg.request_id!r} is still reserved after terminal "
+                        "cleanup; request IDs must be unique"
+                    )
+                    logger.error(error_text)
+                    self._emit_request_error(
                         msg.request_id,
+                        RuntimeError(error_text),
                     )
                     continue
                 new_reqs.append(msg.data)
@@ -1295,9 +1301,8 @@ class OmniScheduler:
                     data = req._omni_data
                     if data is None:
                         logger.error(
-                            "OmniScheduler: terminal request %r has no request data; "
-                            "dropping a stale terminal alias",
-                            rid,
+                            f"OmniScheduler: terminal request {rid!r} has no "
+                            "request data; dropping a stale terminal alias"
                         )
                         self._close_completed_request(req)
                         continue
@@ -1317,7 +1322,7 @@ class OmniScheduler:
                         self._abort_callback(rid)
                     except Exception:
                         logger.exception(
-                            "OmniScheduler: abort cleanup failed for %s", rid
+                            f"OmniScheduler: abort cleanup failed for {rid}"
                         )
                 self._first_emit_done.discard(rid)
                 self._prefill_start_done.discard(rid)
@@ -1345,8 +1350,8 @@ class OmniScheduler:
             except Exception as exc:
                 terminal_error = exc
                 logger.exception(
-                    "OmniScheduler terminal output handling failed for request %s",
-                    rid,
+                    f"OmniScheduler terminal output handling failed for "
+                    f"request {rid}"
                 )
             finally:
                 callback = self._request_finished_callback
@@ -1355,7 +1360,7 @@ class OmniScheduler:
                         callback(rid)
                     except Exception as exc:
                         logger.exception(
-                            "OmniScheduler: terminal cleanup failed for %s", rid
+                            f"OmniScheduler: terminal cleanup failed for {rid}"
                         )
                         if terminal_error is None:
                             terminal_error = exc
