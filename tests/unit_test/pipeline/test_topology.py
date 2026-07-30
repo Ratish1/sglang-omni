@@ -339,7 +339,7 @@ def test_process_override_rejects_fused_stage_component() -> None:
         apply_stage_process_overrides(config, isolate_stages=["b"])
 
 
-def test_moss_tts_local_preserves_default_and_can_isolate_vocoder() -> None:
+def test_moss_tts_local_default_already_isolates_vocoder() -> None:
     from sglang_omni.models.moss_tts_local.config import MossTTSLocalPipelineConfig
 
     config = MossTTSLocalPipelineConfig(model_path="dummy")
@@ -348,45 +348,44 @@ def test_moss_tts_local_preserves_default_and_can_isolate_vocoder() -> None:
         for stage in config.stages
         if stage.gpu is not None
     } == {
-        "preprocessing": None,
-        "tts_engine": 0.90,
-        "vocoder": None,
+        "preprocessing": 0.15,
+        "tts_engine": 0.67,
+        "vocoder": 0.18,
     }
     assert [stage.process for stage in config.stages] == [
         "pipeline",
         "pipeline",
-        "pipeline",
-    ]
-    assert _topology(config).groups[0].stage_names == (
-        "preprocessing",
-        "tts_engine",
         "vocoder",
-    )
+    ]
+    expected_groups = [
+        ("pipeline", ("preprocessing", "tts_engine")),
+        ("vocoder", ("vocoder",)),
+    ]
+    assert [
+        (group.name, group.stage_names) for group in _topology(config).groups
+    ] == expected_groups
 
     isolated = apply_stage_process_overrides(config, isolate_stages=["vocoder"])
 
     assert [stage.process for stage in config.stages] == [
         "pipeline",
         "pipeline",
-        "pipeline",
+        "vocoder",
     ]
     assert [
         (group.name, group.stage_names) for group in _topology(isolated).groups
-    ] == [
-        ("pipeline", ("preprocessing", "tts_engine")),
-        ("vocoder", ("vocoder",)),
-    ]
+    ] == expected_groups
     assert build_stage_placement_plan(config).gpus[
         0
-    ].total_gpu_memory_fraction == pytest.approx(0.90)
+    ].total_gpu_memory_fraction == pytest.approx(1.0)
     assert {
         stage.name: stage.runtime.resources.total_gpu_memory_fraction
         for stage in isolated.stages
         if stage.gpu is not None
     } == {
-        "preprocessing": 0.05,
-        "tts_engine": 0.90,
-        "vocoder": 0.05,
+        "preprocessing": 0.15,
+        "tts_engine": 0.67,
+        "vocoder": 0.18,
     }
     assert build_stage_placement_plan(isolated).gpus[
         0
@@ -632,20 +631,26 @@ def test_qwen_tts_engine_assignment_rejects_unsafe_preprocessing_edge() -> None:
         )
 
 
-def test_higgs_vocoder_isolation_is_an_unchanged_no_op() -> None:
-    """The model already places the vocoder alone, so the flag must not mutate it."""
+def test_higgs_can_isolate_vocoder_from_declared_fractions() -> None:
+    """The process-safe vocoder boundary can be split without mutating the source."""
     from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 
     config = HiggsTtsPipelineConfig(model_path="dummy")
-    before = [(group.name, group.stage_names) for group in _topology(config).groups]
 
     isolated = apply_stage_process_overrides(config, isolate_stages=["vocoder"])
 
     assert [
         (group.name, group.stage_names) for group in _topology(isolated).groups
-    ] == before
-    assert [stage.process for stage in isolated.stages] == [
-        stage.process for stage in config.stages
+    ] == [
+        ("tts_frontend", ("preprocessing", "audio_encoder")),
+        ("pipeline", ("tts_engine",)),
+        ("vocoder", ("vocoder",)),
+    ]
+    assert [stage.process for stage in config.stages] == [
+        "tts_frontend",
+        "tts_frontend",
+        "pipeline",
+        "pipeline",
     ]
     assert [
         stage.runtime.resources.total_gpu_memory_fraction for stage in isolated.stages
@@ -666,8 +671,7 @@ def test_higgs_can_isolate_audio_encoder_from_declared_fractions() -> None:
     ] == [
         ("tts_frontend", ("preprocessing",)),
         ("audio_encoder", ("audio_encoder",)),
-        ("pipeline", ("tts_engine",)),
-        ("vocoder", ("vocoder",)),
+        ("pipeline", ("tts_engine", "vocoder")),
     ]
     assert build_stage_placement_plan(isolated).gpus[
         0
@@ -834,8 +838,7 @@ def test_higgs_can_isolate_preprocessing_and_audio_encoder_separately() -> None:
     ] == [
         ("preprocessing", ("preprocessing",)),
         ("audio_encoder", ("audio_encoder",)),
-        ("pipeline", ("tts_engine",)),
-        ("vocoder", ("vocoder",)),
+        ("pipeline", ("tts_engine", "vocoder")),
     ]
     assert build_stage_placement_plan(isolated).gpus[
         0
@@ -849,8 +852,7 @@ def test_higgs_groups_preprocessing_and_audio_encoder_by_default() -> None:
 
     assert [(group.name, group.stage_names) for group in _topology(config).groups] == [
         ("tts_frontend", ("preprocessing", "audio_encoder")),
-        ("pipeline", ("tts_engine",)),
-        ("vocoder", ("vocoder",)),
+        ("pipeline", ("tts_engine", "vocoder")),
     ]
     assert build_stage_placement_plan(config).gpus[
         0
@@ -874,12 +876,11 @@ def test_higgs_can_rename_grouped_frontend() -> None:
         "tts_frontend",
         "tts_frontend",
         "pipeline",
-        "vocoder",
+        "pipeline",
     ]
     assert [(group.name, group.stage_names) for group in _topology(grouped).groups] == [
         ("frontend", ("preprocessing", "audio_encoder")),
-        ("pipeline", ("tts_engine",)),
-        ("vocoder", ("vocoder",)),
+        ("pipeline", ("tts_engine", "vocoder")),
     ]
     assert build_stage_placement_plan(grouped).gpus[
         0

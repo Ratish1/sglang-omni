@@ -34,6 +34,7 @@ from sglang_omni.models.qwen3_omni.talker_scheduler import (
 )
 from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from tests.unit_test.fixtures.qwen_fakes import FakeQwenTokenizer
 
 
@@ -1253,17 +1254,20 @@ def test_process_input_requests_partial_build_state_machine() -> None:
 
     def stub_request_builder(payload: Any) -> Any:
         captured_done = bool(payload.prefetched_stream_done)
-        return SimpleNamespace(
+        origin_input_ids: list[int] = []
+        req_data = SGLangARRequestData(
             req=SimpleNamespace(
                 rid=payload.request_id,
                 _omni_data=None,
-                origin_input_ids=[],
+                origin_input_ids=origin_input_ids,
+                origin_input_ids_unpadded=origin_input_ids,
                 sampling_params=SimpleNamespace(max_new_tokens=0),
             ),
             thinker_chunks_done=captured_done,
             pending_text_queue=deque(),
-            _captured_thinker_done=captured_done,
         )
+        req_data._captured_thinker_done = captured_done
+        return req_data
 
     scheduler = _build_state_machine_scheduler(
         enable_partial_start=True,
