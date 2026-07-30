@@ -16,9 +16,6 @@ from typing import Any
 
 import torch
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
-from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
-    PrefillCudaGraphRunner,
-)
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.higgs_tts.sampler import K_MAX, selected_token_logprobs
@@ -83,48 +80,9 @@ class HiggsTTSModelRunner(ModelRunner):
             self.model.set_request_seed(
                 req.request_id, req.data.req.sampling_params.sampling_seed
             )
-        # PrefillCudaGraphRunner conservatively rejects its public
-        # ``input_embeds`` field, but its Full backend intentionally captures
-        # only the transformer body and copies the live embeddings supplied by
-        # the eager outer-model tail into capture-stable storage. The eager
-        # runner rebuilds ForwardBatch and therefore drops ad-hoc batch fields,
-        # so keep this one-forward value on the model instead. Prefill is
-        # serialized by OmniScheduler; model.forward consumes and clears it.
-        if self.model._pending_prefill_input_embeds is not None:
-            raise RuntimeError(
-                "Higgs prefill input embeddings were not consumed by the "
-                "previous forward"
-            )
-        input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
-        prefill_runner = self.tp_worker.model_runner.prefill_cuda_graph_runner
-        if isinstance(
-            prefill_runner, PrefillCudaGraphRunner
-        ) and prefill_runner.can_run_graph(forward_batch):
-            raw_num_tokens = input_embeds.shape[0]
-            capture_num_tokens = tuple(
-                sorted(int(size) for size in prefill_runner.capture_num_tokens)
-            )
-            static_num_tokens = next(
-                (size for size in capture_num_tokens if size >= raw_num_tokens), None
-            )
-            if static_num_tokens is None:
-                raise RuntimeError(
-                    "Higgs prefill CUDA graph accepted a batch outside its "
-                    f"capture buckets: tokens={raw_num_tokens}, "
-                    f"buckets={capture_num_tokens}"
-                )
-            if static_num_tokens > raw_num_tokens:
-                padded = input_embeds.new_zeros(
-                    (static_num_tokens, input_embeds.shape[1])
-                )
-                padded[:raw_num_tokens].copy_(input_embeds)
-                input_embeds = padded
-        self.model._pending_prefill_input_embeds = input_embeds
-        forward_batch.input_embeds = None
-
-    def cleanup_prefill(self, forward_batch, schedule_batch, requests):
-        del forward_batch, schedule_batch, requests
-        self.model._pending_prefill_input_embeds = None
+        forward_batch.input_embeds = self._build_prefill_input_embeds(
+            forward_batch, requests
+        )
 
     def post_prefill(self, result, forward_batch, schedule_batch, requests):
         del schedule_batch

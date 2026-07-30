@@ -113,8 +113,6 @@ class HiggsTTSModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        # One-forward prefill embedding stash; see HiggsTTSModelRunner.
-        self._pending_prefill_input_embeds: torch.Tensor | None = None
 
         text_config = config.get_text_config()
         self.backbone = Qwen3ForCausalLM(
@@ -439,9 +437,6 @@ class HiggsTTSModel(nn.Module):
                 input_ids, batch_size=input_ids.shape[0]
             )
         else:
-            if input_embeds is None:
-                input_embeds = self._pending_prefill_input_embeds
-                self._pending_prefill_input_embeds = None
             if input_embeds is None:
                 raise RuntimeError(
                     "Higgs prefill requires composed multi-codebook input embeddings"

@@ -122,32 +122,13 @@ def test_higgs_request_row_seed_tracks_request_seed() -> None:
     assert model._sampler_pool.seeds[0].item() == 42
 
 
-@pytest.mark.parametrize(
-    ("graph_eligible", "expected_tokens"),
-    [(True, 256), (False, 134)],
-)
-def test_higgs_prefill_embeddings_follow_graph_padding_contract(
-    graph_eligible: bool,
-    expected_tokens: int,
-) -> None:
-    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
-        PrefillCudaGraphRunner,
-    )
-
-    prefill_runner = object.__new__(PrefillCudaGraphRunner)
-    prefill_runner.capture_num_tokens = [128, 256]
-    prefill_runner.can_run_graph = lambda _forward_batch: graph_eligible
-
+def test_higgs_prefill_embeddings_use_exact_eager_shape() -> None:
     seeds: list[tuple[str, int | None]] = []
     model = SimpleNamespace(
-        _pending_prefill_input_embeds=None,
         set_request_seed=lambda request_id, seed: seeds.append((request_id, seed)),
     )
     runner = object.__new__(HiggsTTSModelRunner)
     runner.model = model
-    runner.tp_worker = SimpleNamespace(
-        model_runner=SimpleNamespace(prefill_cuda_graph_runner=prefill_runner)
-    )
     raw_embeds = torch.arange(134 * 4, dtype=torch.float32).view(134, 4)
     runner._build_prefill_input_embeds = lambda _forward_batch, _requests: raw_embeds
     request = SimpleNamespace(
@@ -160,12 +141,8 @@ def test_higgs_prefill_embeddings_follow_graph_padding_contract(
 
     runner.before_prefill(forward_batch, None, [request])
 
-    pending = model._pending_prefill_input_embeds
-    assert pending.shape == (expected_tokens, 4)
-    torch.testing.assert_close(pending[:134], raw_embeds)
-    if graph_eligible:
-        assert torch.count_nonzero(pending[134:]).item() == 0
-    assert forward_batch.input_embeds is None
+    assert forward_batch.input_embeds.shape == (134, 4)
+    torch.testing.assert_close(forward_batch.input_embeds, raw_embeds)
     assert forward_batch.req_ids == ["request"]
     assert seeds == [("request", 17)]
 
@@ -209,58 +186,6 @@ def test_higgs_prefill_embeddings_follow_radix_prefix_position() -> None:
     embeds = runner._build_prefill_input_embeds(forward_batch, [request])
 
     assert embeds.tolist() == [[20.0, 21.0], [30.0, 31.0]]
-
-
-def test_higgs_prefill_forward_failure_clears_pending_embeddings() -> None:
-    model = SimpleNamespace(
-        _pending_prefill_input_embeds=None,
-        set_request_seed=lambda _request_id, _seed: None,
-    )
-    runner = object.__new__(HiggsTTSModelRunner)
-    runner.model = model
-    runner.tp_worker = SimpleNamespace(
-        model_runner=SimpleNamespace(prefill_cuda_graph_runner=None)
-    )
-    input_embeds = torch.arange(12, dtype=torch.float32).view(3, 4)
-    runner._build_prefill_input_embeds = lambda _forward_batch, _requests: input_embeds
-    request = SimpleNamespace(
-        request_id="request",
-        data=SimpleNamespace(
-            req=SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=None))
-        ),
-    )
-    schedule_batch = SimpleNamespace(is_prefill_only=True)
-
-    def fail_before_model_forward(_forward_batch):
-        raise RuntimeError("forward setup failed")
-
-    runner.tp_worker.forward_batch_generation = fail_before_model_forward
-    with pytest.raises(RuntimeError, match="forward setup failed"):
-        runner._prepare_and_forward(
-            SimpleNamespace(input_embeds=input_embeds),
-            schedule_batch,
-            [request],
-            True,
-        )
-
-    assert model._pending_prefill_input_embeds is None
-
-    observed_pending: list[torch.Tensor] = []
-
-    def successful_forward(_forward_batch):
-        observed_pending.append(model._pending_prefill_input_embeds)
-        return SimpleNamespace()
-
-    runner.tp_worker.forward_batch_generation = successful_forward
-    runner._prepare_and_forward(
-        SimpleNamespace(input_embeds=input_embeds),
-        schedule_batch,
-        [request],
-        True,
-    )
-
-    assert observed_pending == [input_embeds]
-    assert model._pending_prefill_input_embeds is None
 
 
 def test_higgs_streaming_pipeline_shares_vocoder_stride_with_tts_engine() -> None:
@@ -324,8 +249,7 @@ def test_higgs_streaming_pipeline_rejects_conflicting_runtime_stride() -> None:
         )
 
 
-def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
-    from sglang_omni.models.higgs_tts import engine_builder as engine_builder_mod
+def test_higgs_tts_engine_enables_decode_graphs_with_eager_prefill(monkeypatch) -> None:
     from sglang_omni.models.higgs_tts import model_runner as model_runner_mod
     from sglang_omni.models.higgs_tts import request_builders
     from sglang_omni.scheduling import (
@@ -352,10 +276,7 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
                     max_bs=overrides["cuda_graph_max_bs"],
                     bs=overrides["cuda_graph_bs"],
                 ),
-                prefill=SimpleNamespace(
-                    backend=overrides["cuda_graph_config"]["prefill"]["backend"],
-                    bs=overrides["cuda_graph_config"]["prefill"]["bs"],
-                ),
+                prefill=SimpleNamespace(backend="disabled", bs=[]),
             ),
             torch_compile_max_bs=32,
         )
@@ -378,10 +299,6 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
 
         def init_cuda_graphs() -> None:
             init_graph_calls.append(True)
-            prefill_runner = object.__new__(engine_builder_mod.PrefillCudaGraphRunner)
-            prefill_runner._is_full_backend = True
-            prefill_runner.capture_num_tokens = list(range(64, 513, 64))
-            model_runner.prefill_cuda_graph_runner = prefill_runner
 
         model_runner.init_cuda_graphs = init_cuda_graphs
         return (
@@ -455,17 +372,8 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     ]
     assert captured["overrides"]["cuda_graph_max_bs"] == 64
     assert captured["overrides"]["max_running_requests"] == 64
-    # Request slots follow max_running_requests, not prefill_coalesce_requests:
-    # coalescing only sets a release floor, so it never bounds the extend batch
-    # size that can_run_graph checks against.
-    assert captured["overrides"]["cuda_graph_config"] == {
-        "prefill": {
-            "backend": "full",
-            "max_bs": 512,
-            "bs": list(range(64, 513, 64)),
-            "full_prefill_max_req": 64,
-        }
-    }
+    assert "cuda_graph_config" not in captured["overrides"]
+    assert captured["server_args"].cuda_graph_config.prefill.backend == "disabled"
     assert captured["server_args"].disable_overlap_schedule is True
     assert captured["server_args"].enable_torch_compile is False
     assert captured["server_args"].torch_compile_max_bs == 32
@@ -527,50 +435,17 @@ def _make_higgs_builder(**kwargs):
     )
 
 
-def _higgs_prefill_graph_slots(
-    *, server_args_overrides: dict[str, Any] | None = None, **builder_kwargs: Any
-) -> int:
-    """Resolve full_prefill_max_req the way engine_factory.build() does."""
-    from sglang_omni.scheduling.generation_batch_policy import (
-        build_generation_batch_overrides,
-    )
+def test_higgs_tts_engine_rejects_prefill_graph_override() -> None:
+    builder = _make_higgs_builder()
 
-    builder = _make_higgs_builder(**builder_kwargs)
-    overrides = build_generation_batch_overrides(
-        server_args_overrides=server_args_overrides,
-        **builder.generation_defaults(dtype="bfloat16"),
-    )
-    builder.adjust_overrides(overrides)
-    return overrides["cuda_graph_config"]["prefill"]["full_prefill_max_req"]
-
-
-def test_higgs_prefill_graph_slots_follow_resolved_max_running_requests() -> None:
-    """generation_defaults() is evaluated before server_args_overrides are
-    applied, so the slot count must be re-derived from the resolved cap.
-    Otherwise --max-running-requests leaves can_run_graph rejecting every
-    extend batch wider than the constructor default."""
-    assert (
-        _higgs_prefill_graph_slots(
-            server_args_overrides={
-                "max_running_requests": 128,
-                "cuda_graph_max_bs": 128,
-            }
+    with pytest.raises(RuntimeError, match="padded prefill changes model outputs"):
+        builder.customize_server_args(
+            SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(backend="full")
+                )
+            )
         )
-        == 128
-    )
-
-
-def test_higgs_explicit_prefill_graph_max_req_wins_over_resolved_cap() -> None:
-    assert (
-        _higgs_prefill_graph_slots(
-            prefill_graph_max_req=8,
-            server_args_overrides={
-                "max_running_requests": 128,
-                "cuda_graph_max_bs": 128,
-            },
-        )
-        == 8
-    )
 
 
 @pytest.mark.parametrize("fraction", [0.0, 1.0, 1.2, -0.1])
