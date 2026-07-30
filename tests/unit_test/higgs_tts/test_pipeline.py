@@ -2261,58 +2261,11 @@ def test_higgs_cli_rejects_unsupported_thinker_mem_fraction() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    ("runtime_overrides", "expected_workers"),
-    [
-        ({}, 2),
-        ({"preprocessing": {"max_concurrency": 4}}, 4),
-    ],
-)
-def test_higgs_omp_default_tracks_preprocess_workers(
-    monkeypatch: pytest.MonkeyPatch,
-    runtime_overrides: dict[str, dict[str, int]],
-    expected_workers: int,
-) -> None:
-    from sglang_omni.models.higgs_tts import config as config_module
-
-    calls: list[tuple[int, int]] = []
-
-    def _bounded_threads(*, worker_count: int, max_threads: int) -> int:
-        calls.append((worker_count, max_threads))
-        return 3
-
-    monkeypatch.setattr(
-        config_module,
-        "bounded_intraop_threads",
-        _bounded_threads,
+def test_higgs_bounds_preprocessing_without_global_omp_default() -> None:
+    config = HiggsTtsPipelineConfig(model_path="dummy")
+    preprocessing = next(
+        stage for stage in config.stages if stage.name == "preprocessing"
     )
 
-    config = config_module.HiggsTtsPipelineConfig(
-        model_path="dummy",
-        runtime_overrides=runtime_overrides,
-    )
-
-    assert config.env_defaults["OMP_NUM_THREADS"] == "3"
-    assert calls == [(expected_workers, 8)]
-
-
-def test_higgs_preserves_explicit_omp_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from sglang_omni.models.higgs_tts import config as config_module
-
-    def _unexpected_call(**_kwargs) -> int:
-        raise AssertionError("explicit OMP_NUM_THREADS must bypass auto sizing")
-
-    monkeypatch.setattr(
-        config_module,
-        "bounded_intraop_threads",
-        _unexpected_call,
-    )
-
-    config = config_module.HiggsTtsPipelineConfig(
-        model_path="dummy",
-        env_defaults={"OMP_NUM_THREADS": "3"},
-    )
-
-    assert config.env_defaults["OMP_NUM_THREADS"] == "3"
+    assert preprocessing.factory_args["max_concurrency"] == 2
+    assert "OMP_NUM_THREADS" not in config.env_defaults
