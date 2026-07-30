@@ -28,7 +28,6 @@ from sglang_omni.proto import (
 )
 
 logger = logging.getLogger(__name__)
-_TERMINAL_REQUEST_ID_LIMIT = 10000
 
 
 @dataclass
@@ -91,10 +90,6 @@ class Coordinator:
         self._stream_queues: dict[
             str, asyncio.Queue[CompleteMessage | StreamMessage]
         ] = {}
-        # Request IDs have no wire generation. Reserve recently terminal IDs so
-        # a new request cannot be confused with in-flight messages from the old
-        # request at downstream stages.
-        self._terminal_request_ids: dict[str, None] = {}
         # Abort messages carry only the request ID. A strongly held task keeps
         # local admission closed and lets the broadcast survive caller cancellation.
         self._abort_tasks: dict[str, asyncio.Task[bool]] = {}
@@ -446,15 +441,7 @@ class Coordinator:
             or request_id in self._completion_futures
             or request_id in self._stream_queues
             or request_id in self._abort_tasks
-            or request_id in self._terminal_request_ids
         )
-
-    def _remember_terminal_request_id(self, request_id: str) -> None:
-        if request_id in self._terminal_request_ids:
-            return
-        if len(self._terminal_request_ids) >= _TERMINAL_REQUEST_ID_LIMIT:
-            del self._terminal_request_ids[next(iter(self._terminal_request_ids))]
-        self._terminal_request_ids[request_id] = None
 
     def _reject_completion_future(
         self,
@@ -532,7 +519,6 @@ class Coordinator:
                 )
             )
 
-        self._remember_terminal_request_id(request_id)
         self._requests.pop(request_id, None)
         self._partial_results.pop(request_id, None)
 
@@ -617,7 +603,6 @@ class Coordinator:
             )
             if request_id in self._stream_queues:
                 await self._stream_queues[request_id].put(msg)
-            self._remember_terminal_request_id(request_id)
             self._requests.pop(request_id, None)
             return
 
@@ -642,7 +627,6 @@ class Coordinator:
                     future.set_result(msg.result)
             if request_id in self._stream_queues:
                 await self._stream_queues[request_id].put(msg)
-            self._remember_terminal_request_id(request_id)
             self._requests.pop(request_id, None)
             return
 
@@ -667,7 +651,6 @@ class Coordinator:
             future = self._completion_futures[request_id]
             if not future.done():
                 future.set_result(merged)
-        self._remember_terminal_request_id(request_id)
         self._requests.pop(request_id, None)
 
     async def _handle_stream(self, msg: StreamMessage) -> None:

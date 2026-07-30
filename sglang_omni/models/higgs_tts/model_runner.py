@@ -73,6 +73,10 @@ class HiggsTTSModelRunner(ModelRunner):
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
 
+    def on_request_finished(self, request_id: str, req_data: Any) -> None:
+        """Flush a partial streaming-code window before terminal output."""
+        self._flush_code_chunks(request_id, req_data, force=True)
+
     def before_prefill(self, forward_batch, schedule_batch, requests):
         del schedule_batch
         forward_batch.req_ids = [req.request_id for req in requests]
@@ -353,8 +357,8 @@ class HiggsTTSModelRunner(ModelRunner):
     ) -> None:
         """Host-side collect loop over an already-D2H'd staging snapshot:
         append per-request codes, mark finishes, build ``result.next_token_ids``.
-        Skips chunked and already-done rows (the latter is what makes the
-        one-step-lookahead overrun harmless — see r1_idempotency_check.md).
+        Skips chunked and already-done rows, making the one-step-lookahead
+        overrun harmless.
 
         These are reporting tokens for CPU-side output processing. The next
         forward's GPU token rail is published separately by
@@ -643,7 +647,11 @@ class HiggsTTSModelRunner(ModelRunner):
         if int(data.stream_code_next_flush_rows) <= 0:
             data.stream_code_next_flush_rows = self._initial_stream_flush_rows(data)
         if force or data.stream_code_seen_rows >= data.stream_code_next_flush_rows:
-            self._flush_code_chunks(sched_req, force=force)
+            self._flush_code_chunks(
+                sched_req.request_id,
+                data,
+                force=force,
+            )
 
     @staticmethod
     def _stream_params(data: Any) -> tuple[int, int, int, int]:
@@ -701,8 +709,13 @@ class HiggsTTSModelRunner(ModelRunner):
             return max(num_codebooks, stride) + followup
         return int(flushed_rows) + followup
 
-    def _flush_code_chunks(self, sched_req: Any, *, force: bool = False) -> None:
-        data = sched_req.data
+    def _flush_code_chunks(
+        self,
+        request_id: str,
+        data: Any,
+        *,
+        force: bool = False,
+    ) -> None:
         rows = data.stream_code_buffer
         if not rows:
             return
@@ -717,17 +730,22 @@ class HiggsTTSModelRunner(ModelRunner):
             )
         data.stream_code_buffer = []
         data.stream_code_first_flush_done = True
-        self._emit_code_chunk(sched_req, payload)
+        self._emit_code_chunk(request_id, data, payload)
 
-    def _emit_code_chunk(self, sched_req: Any, codes_N: torch.Tensor) -> None:
+    def _emit_code_chunk(
+        self,
+        request_id: str,
+        data: Any,
+        codes_N: torch.Tensor,
+    ) -> None:
         if self._outbox is None:
             return
-        metadata = sched_req.data.stream_metadata
+        metadata = data.stream_metadata
         if metadata is None:
             return
         self._outbox.put(
             OutgoingMessage(
-                request_id=sched_req.request_id,
+                request_id=request_id,
                 type="stream",
                 target=self._vocoder_target,
                 data=codes_N,

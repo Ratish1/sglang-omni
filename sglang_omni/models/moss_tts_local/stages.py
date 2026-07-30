@@ -640,6 +640,7 @@ def create_vocoder_executor(
     device: str | None = None,
     gpu_id: int | None = None,
     total_gpu_memory_fraction: float | None = None,
+    process_total_gpu_memory_fraction: float | None = None,
     codec_model_path: str | None = None,
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
@@ -675,6 +676,7 @@ def create_vocoder_executor(
     # races a half-captured graph. Same-process guarantee (each colocate/split stage warms its own).
     scheduler.warmup_now()
     device_index = torch.device(device).index
+    # Direct factory calls have no process aggregate; preserve their standalone stage budget.
     _validate_loaded_process_memory_budget(
         stage_name="MOSS-TTS Local vocoder",
         gpu_id=(
@@ -682,6 +684,10 @@ def create_vocoder_executor(
             if device_index is not None
             else (0 if gpu_id is None else int(gpu_id))
         ),
-        total_gpu_memory_fraction=total_gpu_memory_fraction,
+        total_gpu_memory_fraction=(
+            process_total_gpu_memory_fraction
+            if process_total_gpu_memory_fraction is not None
+            else total_gpu_memory_fraction
+        ),
     )
     return scheduler

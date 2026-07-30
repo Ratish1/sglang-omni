@@ -1442,13 +1442,14 @@ def test_create_vocoder_executor_validates_process_memory_after_warmup(
         device="cpu",
         gpu_id=3,
         total_gpu_memory_fraction=0.18,
+        process_total_gpu_memory_fraction=0.95,
     )
 
     assert validations == [
         {
             "stage_name": "MOSS-TTS Local vocoder",
             "gpu_id": 3,
-            "total_gpu_memory_fraction": 0.18,
+            "total_gpu_memory_fraction": 0.95,
         }
     ]
 

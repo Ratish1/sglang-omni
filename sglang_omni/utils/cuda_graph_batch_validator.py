@@ -272,14 +272,9 @@ def validate_stage(
     buffer_capacity: int | None = None,
 ) -> CudaGraphBatchReport:
     """Validate one SGLang-backed stage's batch sizing from its live runner."""
-    try:
-        server_args = model_runner.server_args
-        max_running_requests = server_args.max_running_requests
-        cuda_graph_max_bs = get_decode_cuda_graph_max_bs(server_args)
-    except AttributeError:
-        server_args = None
-        max_running_requests = None
-        cuda_graph_max_bs = None
+    server_args = model_runner.server_args
+    max_running_requests = server_args.max_running_requests
+    cuda_graph_max_bs = get_decode_cuda_graph_max_bs(server_args)
 
     try:
         model = model_runner.model

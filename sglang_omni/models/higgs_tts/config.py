@@ -11,6 +11,7 @@ from sglang_omni.config import (
     StageResourceConfig,
     StageRuntimeConfig,
 )
+from sglang_omni.utils.cpu import bounded_intraop_threads
 
 _PKG = "sglang_omni.models.higgs_tts"
 _PREPROCESS_MAX_WORKERS = 2
@@ -113,6 +114,17 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
         stages = {stage.name: stage for stage in self.stages}
+        preprocessing = stages["preprocessing"]
+        if "OMP_NUM_THREADS" not in self.env_defaults:
+            preprocessing.env.setdefault(
+                "OMP_NUM_THREADS",
+                str(
+                    bounded_intraop_threads(
+                        worker_count=_PREPROCESS_MAX_WORKERS,
+                        max_threads=8,
+                    )
+                ),
+            )
         vocoder = stages["vocoder"]
         tts_engine = stages["tts_engine"]
         vocoder_overrides = self.runtime_overrides.get("vocoder", {})

@@ -1028,6 +1028,30 @@ def test_higgs_model_runner_emits_latched_stream_metadata() -> None:
     }
 
 
+def test_higgs_request_finish_flushes_partial_stream_window() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._outbox = queue.Queue()
+    runner._vocoder_target = "vocoder"
+    data = SimpleNamespace(
+        stream_code_buffer=[
+            torch.tensor([1, 2, 3]),
+            torch.tensor([4, 5, 6]),
+        ],
+        stream_code_seen_rows=2,
+        stream_code_first_flush_done=False,
+        stream_metadata={"modality": "audio_codes", "stream": True},
+    )
+
+    runner.on_request_finished("req-tail", data)
+
+    output = runner._outbox.get_nowait()
+    assert output.request_id == "req-tail"
+    assert output.type == "stream"
+    assert output.data.tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert data.stream_code_buffer == []
+    assert data.stream_code_first_flush_done is True
+
+
 def test_higgs_model_runner_batches_stream_code_rows_on_decode_boundaries() -> None:
     runner = object.__new__(HiggsTTSModelRunner)
     runner._outbox = queue.Queue()
@@ -2269,3 +2293,18 @@ def test_higgs_bounds_preprocessing_without_global_omp_default() -> None:
 
     assert preprocessing.factory_args["max_concurrency"] == 2
     assert "OMP_NUM_THREADS" not in config.env_defaults
+    assert int(preprocessing.env["OMP_NUM_THREADS"]) >= 1
+    assert int(preprocessing.env["OMP_NUM_THREADS"]) <= 8
+
+
+def test_higgs_preserves_pipeline_omp_override() -> None:
+    config = HiggsTtsPipelineConfig(
+        model_path="dummy",
+        env_defaults={"OMP_NUM_THREADS": "3"},
+    )
+    preprocessing = next(
+        stage for stage in config.stages if stage.name == "preprocessing"
+    )
+
+    assert config.env_defaults["OMP_NUM_THREADS"] == "3"
+    assert "OMP_NUM_THREADS" not in preprocessing.env

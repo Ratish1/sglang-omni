@@ -1453,7 +1453,14 @@ def test_qwen3_tts_sampling_installs_semantic_seed_tensor(
         _semantic_sampling_seed_tensor=torch.tensor([101, 202], dtype=torch.long)
     )
     runner.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(sample=sample))
-    forward_batch = SimpleNamespace(sampling_info=SimpleNamespace(sampling_seed=None))
+    forward_batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(
+            sampling_seed=None,
+            need_min_p_sampling=False,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+        )
+    )
     logits_output = SimpleNamespace(next_token_logits=torch.zeros((2, 4)))
     requests = [
         SimpleNamespace(

@@ -388,7 +388,7 @@ class QwenTalkerModelRunner(ModelRunner):
         if pending_text_queue:
             return True
         return bool(
-            getattr(data, "thinker_chunks_done", False)
+            data.thinker_chunks_done
             and getattr(data, "tts_pad_embed", None) is not None
         )
 
