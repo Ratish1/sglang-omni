@@ -130,7 +130,7 @@ def reject_process_total_gpu_memory_fraction(
     raise ValueError(
         f"Stage {stage_name!r} sets process_total_gpu_memory_fraction through "
         "factory_args/runtime_overrides; this value is derived from process "
-        "topology and stage resource budgets"
+        "construction order and stage resource budgets"
     )
 
 

@@ -184,11 +184,12 @@ def _build_stage_groups(
 
 
 def _attach_process_memory_fraction_defaults(groups: list[StageGroup]) -> None:
-    """Expose each process's per-GPU budget to factories that declare it.
+    """Expose the per-GPU process budget loaded through each stage.
 
     Stage resource fractions remain component budgets for placement. A process
-    containing multiple stages needs their sum when it profiles process-scoped
-    memory, so compute that value only after topology has formed OS processes.
+    constructs its stages in ``stage_specs`` order, so a stage that profiles
+    process-scoped memory must include earlier stages but not reserve memory
+    assigned to stages that have not been constructed yet.
     """
 
     for group in groups:
@@ -205,11 +206,12 @@ def _attach_process_memory_fraction_defaults(groups: list[StageGroup]) -> None:
                 ]
                 if any(fraction is None for fraction in fractions):
                     continue
-                process_fraction = sum(float(fraction) for fraction in fractions)
-                for stage_spec in stage_specs:
+                process_loaded_fraction = 0.0
+                for stage_spec, fraction in zip(stage_specs, fractions, strict=True):
+                    process_loaded_fraction += float(fraction)
                     stage_spec.factory_arg_defaults[
                         "process_total_gpu_memory_fraction"
-                    ] = process_fraction
+                    ] = process_loaded_fraction
 
 
 def _resolve_same_process_targets(
