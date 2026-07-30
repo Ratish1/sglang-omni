@@ -79,14 +79,21 @@ class HiggsTTSModelRunner(ModelRunner):
 
     def before_prefill(self, forward_batch, schedule_batch, requests):
         del schedule_batch
-        forward_batch.req_ids = [req.request_id for req in requests]
         for req in requests:
             self.model.set_request_seed(
                 req.request_id, req.data.req.sampling_params.sampling_seed
             )
-        forward_batch.input_embeds = self._build_prefill_input_embeds(
-            forward_batch, requests
+        self.model.set_pending_prefill_input(
+            self._build_prefill_input_embeds(forward_batch, requests),
+            tuple(req.request_id for req in requests),
         )
+        # SGLang admits composed embeddings through the static multimodal slot
+        # only after the outer model calls its captured backbone.
+        forward_batch.input_embeds = None
+
+    def cleanup_prefill(self, forward_batch, schedule_batch, requests):
+        del forward_batch, schedule_batch, requests
+        self.model.clear_pending_prefill_input()
 
     def post_prefill(self, result, forward_batch, schedule_batch, requests):
         del schedule_batch

@@ -47,6 +47,14 @@ class HiggsGenParams:
     top_k: int | None = None
 
 
+@dataclass(frozen=True)
+class _HiggsPrefillInput:
+    """Request-specific inputs omitted from SGLang's BCG static batch."""
+
+    input_embeds: torch.Tensor
+    request_ids: tuple[str, ...]
+
+
 def _resolve_max_running_requests() -> int:
     try:
         from sglang.srt.server_args import get_global_server_args
@@ -113,6 +121,7 @@ class HiggsTTSModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self._pending_prefill_input: _HiggsPrefillInput | None = None
 
         text_config = config.get_text_config()
         self.backbone = Qwen3ForCausalLM(
@@ -231,6 +240,23 @@ class HiggsTTSModel(nn.Module):
     @property
     def sampler_pool_max_running_requests(self) -> int:
         return self._sampler_pool_max_running_requests
+
+    def set_pending_prefill_input(
+        self,
+        input_embeds: torch.Tensor,
+        request_ids: tuple[str, ...],
+    ) -> None:
+        if self._pending_prefill_input is not None:
+            raise RuntimeError(
+                "Higgs prefill input was not consumed by the previous forward"
+            )
+        self._pending_prefill_input = _HiggsPrefillInput(
+            input_embeds=input_embeds,
+            request_ids=request_ids,
+        )
+
+    def clear_pending_prefill_input(self) -> None:
+        self._pending_prefill_input = None
 
     def acquire_row(self, req_id: str) -> int:
         """Allocate or look up the sampler-pool row for ``req_id``. Idempotent."""
@@ -437,11 +463,16 @@ class HiggsTTSModel(nn.Module):
                 input_ids, batch_size=input_ids.shape[0]
             )
         else:
+            pending_prefill = self._pending_prefill_input
+            self._pending_prefill_input = None
+            if pending_prefill is None:
+                raise RuntimeError("Higgs prefill input was not prepared by the runner")
             if input_embeds is None:
-                raise RuntimeError(
-                    "Higgs prefill requires composed multi-codebook input embeddings"
-                )
-            req_ids, gen_params = self._extract_batch_metadata(forward_batch)
+                input_embeds = pending_prefill.input_embeds
+            req_ids, gen_params = self._extract_batch_metadata(
+                forward_batch,
+                pending_prefill.request_ids,
+            )
 
         hidden_states = self.backbone.model(
             input_ids,
@@ -502,27 +533,29 @@ class HiggsTTSModel(nn.Module):
         return bool(is_decode()) if callable(is_decode) else False
 
     def _extract_batch_metadata(
-        self, forward_batch
+        self,
+        forward_batch,
+        request_ids: tuple[str, ...] | None = None,
     ) -> tuple[list[str], list[HiggsGenParams]]:
-        # ``rids`` is part of SGLang's ForwardBatch contract and survives the
-        # 0.5.15 EagerRunner static-buffer copy. ``req_ids`` was an Omni-added
-        # dynamic attribute; dataclasses.replace drops it, silently routing
-        # prefill sampling into fallback rows such as "req-0".
-        req_ids_raw = getattr(forward_batch, "rids", None)
+        req_ids_raw = request_ids
         if req_ids_raw is None:
-            req_ids_raw = getattr(forward_batch, "req_ids", None)
+            # Eager batches retain SGLang's ``rids``. ``req_ids`` is the
+            # Omni-owned compatibility field used by the current outer batch.
+            req_ids_raw = getattr(forward_batch, "rids", None)
+            if req_ids_raw is None:
+                req_ids_raw = getattr(forward_batch, "req_ids", None)
         batch_size = self._infer_batch_size(forward_batch)
         if req_ids_raw is None:
-            # No fabricated fallback identities: sampler rows keyed on made-up
-            # ids silently decouple output routing and seeding from the real
-            # requests. Full-backend prefill capture never reaches this eager
-            # tail (it replays only the transformer body), so a batch without
-            # ``rids`` here means the runner contract changed — fail loudly.
             raise RuntimeError(
                 "Higgs prefill batch carries neither ForwardBatch.rids nor "
                 "req_ids; refusing to fabricate request identities"
             )
         req_ids = [str(r) for r in req_ids_raw]
+        if len(req_ids) != batch_size:
+            raise RuntimeError(
+                "Higgs prefill request metadata does not match the batch size: "
+                f"request_ids={len(req_ids)} batch_size={batch_size}"
+            )
 
         sampling_info = getattr(forward_batch, "sampling_info", None)
         gen_params = self._gen_params_for_batch(sampling_info, batch_size)

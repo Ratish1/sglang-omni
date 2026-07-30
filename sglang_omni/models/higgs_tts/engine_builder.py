@@ -7,6 +7,11 @@ import importlib
 import logging
 from typing import Any
 
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
+)
+
 from sglang_omni.models.higgs_tts import request_builders
 from sglang_omni.models.higgs_tts import utils as higgs_utils
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
@@ -18,6 +23,30 @@ from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_prefill_cuda_graph_config(prefill_config: Any) -> None:
+    """Require shape-exact Breakable prefill replay for Higgs."""
+    if prefill_config.backend == Backend.DISABLED:
+        return
+    if prefill_config.backend != Backend.BREAKABLE:
+        raise RuntimeError(
+            "Higgs prefill CUDA graphs require SGLang's breakable backend, "
+            f"got {prefill_config.backend!r}"
+        )
+
+    max_bs = prefill_config.max_bs
+    if not isinstance(max_bs, int) or max_bs < 1:
+        raise RuntimeError(
+            "Higgs breakable prefill CUDA graphs require max_bs to be a "
+            f"positive integer, got {max_bs!r}"
+        )
+    expected_shapes = list(range(1, max_bs + 1))
+    if prefill_config.bs != expected_shapes:
+        raise RuntimeError(
+            "Higgs breakable prefill CUDA graphs require every token shape "
+            f"from 1 through max_bs={max_bs}; got bs={prefill_config.bs!r}"
+        )
 
 
 class HiggsTtsEngineBuilder(TtsEngineBuilder):
@@ -58,6 +87,8 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
         self.total_gpu_memory_fraction = total_gpu_memory_fraction
         self.model: Any | None = None
+        self._prefill_graph_model_runner: Any | None = None
+        self._prefill_graph_alias_installed = False
 
     def generation_defaults(
         self,
@@ -99,13 +130,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         )
 
     def customize_server_args(self, server_args: Any) -> None:
-        prefill_backend = server_args.cuda_graph_config.prefill.backend
-        if prefill_backend != "disabled":
-            raise RuntimeError(
-                "Higgs prefill CUDA graphs are disabled because padded prefill "
-                "changes model outputs; keep cuda_graph_config.prefill.backend="
-                f"'disabled', got {prefill_backend!r}"
-            )
+        _validate_prefill_cuda_graph_config(server_args.cuda_graph_config.prefill)
         override_server_args(
             server_args,
             "sglang_omni.higgs_tts.disable_overlap_schedule",
@@ -121,9 +146,69 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         gpu_id: int,
         server_args: Any,
     ) -> None:
-        del checkpoint_dir, device, gpu_id, server_args
-        self.model = model_worker.model_runner.model
+        del checkpoint_dir, device, gpu_id
+        model_runner = model_worker.model_runner
+        self.model = model_runner.model
         higgs_utils.truncate_rope_to_bf16(self.model)
+        prefill_backend = server_args.cuda_graph_config.prefill.backend
+        if prefill_backend == Backend.DISABLED:
+            return
+
+        if not model_runner.model_config.is_multimodal:
+            raise RuntimeError(
+                "Higgs prefill CUDA graphs require SGLang multimodal input "
+                "buffers for request-specific audio embeddings"
+            )
+
+        # Higgs wraps Qwen3ForCausalLM under ``backbone``. SGLang's prefill
+        # graph discovery does not inspect that name, so expose the backbone
+        # through its supported ``language_model`` view only during capture.
+        if hasattr(self.model, "model") or hasattr(self.model, "language_model"):
+            raise RuntimeError(
+                "Higgs prefill CUDA graph discovery found an ambiguous model "
+                "alias; refusing to capture"
+            )
+        object.__setattr__(self.model, "language_model", self.model.backbone)
+        self._prefill_graph_alias_installed = True
+        self._prefill_graph_model_runner = model_runner
+
+    def post_cuda_graph_setup(self, model: Any, server_args: Any) -> None:
+        if server_args.cuda_graph_config.prefill.backend == Backend.DISABLED:
+            return
+        if not self._prefill_graph_alias_installed:
+            raise RuntimeError("Higgs prefill CUDA graph alias was not installed")
+
+        try:
+            model_runner = self._prefill_graph_model_runner
+            prefill_runner = (
+                None if model_runner is None else model_runner.prefill_cuda_graph_runner
+            )
+            if not isinstance(prefill_runner, PrefillCudaGraphRunner):
+                raise RuntimeError(
+                    "Higgs enabled prefill CUDA graphs, but SGLang did not "
+                    "construct PrefillCudaGraphRunner"
+                )
+            if prefill_runner.prefill_backend_name != Backend.BREAKABLE:
+                raise RuntimeError(
+                    "Higgs prefill CUDA graphs require the breakable backend"
+                )
+
+            configured_shapes = server_args.cuda_graph_config.prefill.bs
+            if prefill_runner.capture_num_tokens != configured_shapes:
+                raise RuntimeError(
+                    "Higgs prefill CUDA graph capture shapes differ from the "
+                    f"validated configuration: configured={configured_shapes}, "
+                    f"captured={prefill_runner.capture_num_tokens}"
+                )
+            logger.info(
+                "Higgs prefill CUDA graph active: backend=%s shapes=1..%s",
+                prefill_runner.prefill_backend_name,
+                configured_shapes[-1],
+            )
+        finally:
+            model.__dict__.pop("language_model", None)
+            self._prefill_graph_alias_installed = False
+            self._prefill_graph_model_runner = None
 
     def get_model_buffer_bs(self, model: Any) -> int | None:
         return model.sampler_pool_max_running_requests

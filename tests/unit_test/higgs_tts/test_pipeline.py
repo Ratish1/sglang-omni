@@ -80,6 +80,34 @@ def test_higgs_batch_metadata_refuses_missing_request_ids() -> None:
         model._extract_batch_metadata(forward_batch)
 
 
+def test_higgs_batch_metadata_uses_pending_request_ids_for_bcg() -> None:
+    model = object.__new__(HiggsTTSModel)
+    forward_batch = SimpleNamespace(
+        rids=None,
+        seq_lens=torch.tensor([1, 1]),
+        sampling_info=None,
+    )
+
+    req_ids, params = model._extract_batch_metadata(
+        forward_batch,
+        ("stable-a", "stable-b"),
+    )
+
+    assert req_ids == ["stable-a", "stable-b"]
+    assert len(params) == 2
+
+
+def test_higgs_batch_metadata_refuses_request_count_mismatch() -> None:
+    model = object.__new__(HiggsTTSModel)
+    forward_batch = SimpleNamespace(
+        seq_lens=torch.tensor([1, 1]),
+        sampling_info=None,
+    )
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        model._extract_batch_metadata(forward_batch, ("only-one",))
+
+
 def test_higgs_sampler_pool_rows_default_to_unseeded() -> None:
     pool = HiggsBatchedSamplerState(max_batch_size=4, num_codebooks=2, device="cpu")
 
@@ -122,10 +150,14 @@ def test_higgs_request_row_seed_tracks_request_seed() -> None:
     assert model._sampler_pool.seeds[0].item() == 42
 
 
-def test_higgs_prefill_embeddings_use_exact_eager_shape() -> None:
+def test_higgs_prefill_embeddings_leave_graph_dispatch_to_sglang() -> None:
     seeds: list[tuple[str, int | None]] = []
+    pending: list[tuple[torch.Tensor, tuple[str, ...]]] = []
     model = SimpleNamespace(
         set_request_seed=lambda request_id, seed: seeds.append((request_id, seed)),
+        set_pending_prefill_input=lambda embeds, request_ids: pending.append(
+            (embeds, request_ids)
+        ),
     )
     runner = object.__new__(HiggsTTSModelRunner)
     runner.model = model
@@ -141,10 +173,63 @@ def test_higgs_prefill_embeddings_use_exact_eager_shape() -> None:
 
     runner.before_prefill(forward_batch, None, [request])
 
-    assert forward_batch.input_embeds.shape == (134, 4)
-    torch.testing.assert_close(forward_batch.input_embeds, raw_embeds)
-    assert forward_batch.req_ids == ["request"]
+    assert len(pending) == 1
+    assert pending[0][0] is raw_embeds
+    assert pending[0][1] == ("request",)
+    assert forward_batch.input_embeds is None
     assert seeds == [("request", 17)]
+
+
+def test_higgs_pending_prefill_input_is_single_use() -> None:
+    model = object.__new__(HiggsTTSModel)
+    model._pending_prefill_input = None
+    input_embeds = torch.zeros((2, 4))
+
+    model.set_pending_prefill_input(input_embeds, ("request",))
+
+    with pytest.raises(RuntimeError, match="previous forward"):
+        model.set_pending_prefill_input(input_embeds, ("other",))
+
+    model.clear_pending_prefill_input()
+    assert model._pending_prefill_input is None
+
+
+def test_higgs_prefill_forward_uses_pending_request_metadata() -> None:
+    model = object.__new__(HiggsTTSModel)
+    torch.nn.Module.__init__(model)
+    input_embeds = torch.arange(8, dtype=torch.float32).view(2, 4)
+    model._pending_prefill_input = None
+    model.set_pending_prefill_input(input_embeds, ("request",))
+    model.backbone = SimpleNamespace(
+        model=lambda _ids, _positions, _batch, embeds: embeds
+    )
+    observed_request_ids: list[list[str]] = []
+
+    def decode(hidden_states, request_ids, _params):
+        observed_request_ids.append(request_ids)
+        return torch.zeros((hidden_states.shape[0], 3))
+
+    model.decode_codebooks_batch = decode
+    forward_batch = SimpleNamespace(
+        rids=None,
+        batch_size=1,
+        sampling_info=None,
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: False,
+            is_extend=lambda: True,
+        ),
+        extend_seq_lens=torch.tensor([2]),
+    )
+
+    result = model.forward(
+        torch.tensor([1, 2]),
+        torch.tensor([0, 1]),
+        forward_batch,
+    )
+
+    assert result.hidden_states.equal(input_embeds[1:])
+    assert observed_request_ids == [["request"]]
+    assert model._pending_prefill_input is None
 
 
 def test_higgs_prefill_embeddings_follow_radix_prefix_position() -> None:
@@ -186,6 +271,63 @@ def test_higgs_prefill_embeddings_follow_radix_prefix_position() -> None:
     embeds = runner._build_prefill_input_embeds(forward_batch, [request])
 
     assert embeds.tolist() == [[20.0, 21.0], [30.0, 31.0]]
+
+
+def test_higgs_prefill_cleanup_releases_pending_input() -> None:
+    pending: list[tuple[torch.Tensor, tuple[str, ...]]] = []
+    model = SimpleNamespace(
+        set_request_seed=lambda _request_id, _seed: None,
+        set_pending_prefill_input=lambda embeds, request_ids: pending.append(
+            (embeds, request_ids)
+        ),
+        clear_pending_prefill_input=lambda: pending.clear(),
+    )
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner.model = model
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(prefill_cuda_graph_runner=None)
+    )
+    input_embeds = torch.arange(12, dtype=torch.float32).view(3, 4)
+    runner._build_prefill_input_embeds = lambda _forward_batch, _requests: input_embeds
+    request = SimpleNamespace(
+        request_id="request",
+        data=SimpleNamespace(
+            req=SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=None))
+        ),
+    )
+    schedule_batch = SimpleNamespace(is_prefill_only=True)
+
+    def fail_before_model_forward(_forward_batch):
+        raise RuntimeError("forward setup failed")
+
+    runner.tp_worker.forward_batch_generation = fail_before_model_forward
+    with pytest.raises(RuntimeError, match="forward setup failed"):
+        runner._prepare_and_forward(
+            SimpleNamespace(input_embeds=input_embeds),
+            schedule_batch,
+            [request],
+            True,
+        )
+    assert pending == []
+
+    observed_pending: list[tuple[torch.Tensor, tuple[str, ...]]] = []
+
+    def successful_forward(_forward_batch):
+        observed_pending.extend(pending)
+        return SimpleNamespace()
+
+    runner.tp_worker.forward_batch_generation = successful_forward
+    runner._prepare_and_forward(
+        SimpleNamespace(input_embeds=input_embeds),
+        schedule_batch,
+        [request],
+        True,
+    )
+
+    assert len(observed_pending) == 1
+    assert observed_pending[0][0] is input_embeds
+    assert observed_pending[0][1] == ("request",)
+    assert pending == []
 
 
 def test_higgs_streaming_pipeline_shares_vocoder_stride_with_tts_engine() -> None:
@@ -435,17 +577,171 @@ def _make_higgs_builder(**kwargs):
     )
 
 
-def test_higgs_tts_engine_rejects_prefill_graph_override() -> None:
+def _make_higgs_prefill_server_args(max_bs: int) -> FakeServerArgs:
+    return FakeServerArgs(
+        disable_overlap_schedule=False,
+        cuda_graph_config=SimpleNamespace(
+            prefill=SimpleNamespace(
+                backend="breakable",
+                max_bs=max_bs,
+                bs=list(range(1, max_bs + 1)),
+            )
+        ),
+    )
+
+
+def _setup_higgs_prefill_graph_builder(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    max_bs: int,
+) -> tuple[Any, Any, Any, FakeServerArgs]:
+    builder = _make_higgs_builder()
+    model = SimpleNamespace(backbone=object())
+    model_runner = SimpleNamespace(
+        model=model,
+        model_config=SimpleNamespace(is_multimodal=True),
+        prefill_cuda_graph_runner=None,
+    )
+    server_args = _make_higgs_prefill_server_args(max_bs)
+    monkeypatch.setattr(higgs_utils, "truncate_rope_to_bf16", lambda _model: None)
+    builder.setup_model(
+        model_worker=SimpleNamespace(model_runner=model_runner),
+        checkpoint_dir="unused",
+        device="cuda",
+        gpu_id=0,
+        server_args=server_args,
+    )
+    return builder, model, model_runner, server_args
+
+
+@pytest.mark.parametrize("max_bs", [1, 4, 64])
+def test_higgs_tts_engine_accepts_dense_breakable_prefill_shapes(max_bs: int) -> None:
+    builder = _make_higgs_builder()
+    server_args = _make_higgs_prefill_server_args(max_bs)
+
+    builder.customize_server_args(server_args)
+
+    assert server_args.disable_overlap_schedule is True
+
+
+@pytest.mark.parametrize(
+    ("prefill_config", "message"),
+    [
+        (
+            SimpleNamespace(backend="full", max_bs=4, bs=[1, 2, 3, 4]),
+            "breakable backend",
+        ),
+        (
+            SimpleNamespace(backend="tc_piecewise", max_bs=4, bs=[1, 2, 3, 4]),
+            "breakable backend",
+        ),
+        (
+            SimpleNamespace(backend="breakable", max_bs=None, bs=[]),
+            "positive integer",
+        ),
+        (
+            SimpleNamespace(backend="breakable", max_bs=4, bs=[1, 2, 4]),
+            "every token shape",
+        ),
+        (
+            SimpleNamespace(backend="breakable", max_bs=4, bs=[2, 3, 4]),
+            "every token shape",
+        ),
+    ],
+)
+def test_higgs_tts_engine_rejects_non_exact_prefill_graph_config(
+    prefill_config: SimpleNamespace,
+    message: str,
+) -> None:
     builder = _make_higgs_builder()
 
-    with pytest.raises(RuntimeError, match="padded prefill changes model outputs"):
+    with pytest.raises(RuntimeError, match=message):
         builder.customize_server_args(
-            SimpleNamespace(
-                cuda_graph_config=SimpleNamespace(
-                    prefill=SimpleNamespace(backend="full")
-                )
+            FakeServerArgs(
+                disable_overlap_schedule=False,
+                cuda_graph_config=SimpleNamespace(prefill=prefill_config),
             )
         )
+
+
+def test_higgs_tts_engine_keeps_prefill_graph_disabled_by_default() -> None:
+    builder = _make_higgs_builder()
+
+    assert "cuda_graph_config" not in builder.generation_defaults(dtype="bfloat16")
+
+
+def test_higgs_prefill_graph_setup_and_attestation(monkeypatch) -> None:
+    from sglang_omni.models.higgs_tts import engine_builder as engine_builder_mod
+
+    builder, model, model_runner, server_args = _setup_higgs_prefill_graph_builder(
+        monkeypatch, max_bs=4
+    )
+
+    assert model.language_model is model.backbone
+
+    prefill_runner = object.__new__(engine_builder_mod.PrefillCudaGraphRunner)
+    prefill_runner.prefill_backend_name = "breakable"
+    prefill_runner.capture_num_tokens = [1, 2, 3, 4]
+    model_runner.prefill_cuda_graph_runner = prefill_runner
+
+    builder.post_cuda_graph_setup(model, server_args)
+
+    assert "language_model" not in model.__dict__
+    assert builder._prefill_graph_alias_installed is False
+    assert builder._prefill_graph_model_runner is None
+
+
+def test_higgs_prefill_graph_attestation_failure_removes_alias(monkeypatch) -> None:
+    builder, model, _, server_args = _setup_higgs_prefill_graph_builder(
+        monkeypatch,
+        max_bs=2,
+    )
+
+    with pytest.raises(RuntimeError, match="did not construct"):
+        builder.post_cuda_graph_setup(model, server_args)
+
+    assert "language_model" not in model.__dict__
+    assert builder._prefill_graph_alias_installed is False
+    assert builder._prefill_graph_model_runner is None
+
+
+def test_higgs_prefill_graph_rejects_captured_shape_mismatch(monkeypatch) -> None:
+    from sglang_omni.models.higgs_tts import engine_builder as engine_builder_mod
+
+    builder, model, model_runner, server_args = _setup_higgs_prefill_graph_builder(
+        monkeypatch, max_bs=3
+    )
+    prefill_runner = object.__new__(engine_builder_mod.PrefillCudaGraphRunner)
+    prefill_runner.prefill_backend_name = "breakable"
+    prefill_runner.capture_num_tokens = [1, 2]
+    model_runner.prefill_cuda_graph_runner = prefill_runner
+
+    with pytest.raises(RuntimeError, match="capture shapes differ"):
+        builder.post_cuda_graph_setup(model, server_args)
+
+    assert "language_model" not in model.__dict__
+
+
+def test_higgs_prefill_graph_requires_multimodal_input_buffers(monkeypatch) -> None:
+    builder = _make_higgs_builder()
+    model = SimpleNamespace(backbone=object())
+    model_runner = SimpleNamespace(
+        model=model,
+        model_config=SimpleNamespace(is_multimodal=False),
+    )
+    server_args = _make_higgs_prefill_server_args(2)
+    monkeypatch.setattr(higgs_utils, "truncate_rope_to_bf16", lambda _model: None)
+
+    with pytest.raises(RuntimeError, match="multimodal input buffers"):
+        builder.setup_model(
+            model_worker=SimpleNamespace(model_runner=model_runner),
+            checkpoint_dir="unused",
+            device="cuda",
+            gpu_id=0,
+            server_args=server_args,
+        )
+
+    assert "language_model" not in model.__dict__
 
 
 @pytest.mark.parametrize("fraction", [0.0, 1.0, 1.2, -0.1])
