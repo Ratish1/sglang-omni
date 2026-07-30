@@ -1229,6 +1229,7 @@ def _build_state_machine_scheduler(
     scheduler._im_end_token_id = None
     scheduler._pending_stream_chunks = {}
     scheduler._pending_stream_done = set()
+    scheduler._completed_request_ids = {}
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._aborted_request_ids = set()

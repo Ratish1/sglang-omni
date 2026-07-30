@@ -178,8 +178,38 @@ def _build_stage_groups(
             )
         )
     groups.extend(tp_groups)
+    _attach_process_memory_fraction_defaults(groups)
 
     return groups
+
+
+def _attach_process_memory_fraction_defaults(groups: list[StageGroup]) -> None:
+    """Expose each process's per-GPU budget to factories that declare it.
+
+    Stage resource fractions remain component budgets for placement. A process
+    containing multiple stages needs their sum when it profiles process-scoped
+    memory, so compute that value only after topology has formed OS processes.
+    """
+
+    for group in groups:
+        for process_spec in group.process_specs:
+            by_gpu: dict[int, list[StageLaunchConfig]] = {}
+            for stage_spec in process_spec.stage_specs:
+                if stage_spec.gpu_id is not None:
+                    by_gpu.setdefault(int(stage_spec.gpu_id), []).append(stage_spec)
+
+            for stage_specs in by_gpu.values():
+                fractions = [
+                    stage.factory_arg_defaults.get("total_gpu_memory_fraction")
+                    for stage in stage_specs
+                ]
+                if any(fraction is None for fraction in fractions):
+                    continue
+                process_fraction = sum(float(fraction) for fraction in fractions)
+                for stage_spec in stage_specs:
+                    stage_spec.factory_arg_defaults[
+                        "process_total_gpu_memory_fraction"
+                    ] = process_fraction
 
 
 def _resolve_same_process_targets(

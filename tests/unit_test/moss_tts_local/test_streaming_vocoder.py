@@ -1428,6 +1428,35 @@ def test_create_vocoder_executor_uses_separate_codec(monkeypatch) -> None:
     )
 
 
+def test_create_vocoder_executor_validates_process_memory_after_warmup(
+    monkeypatch,
+) -> None:
+    processor = FakeProcessor()
+    codec = FakeCodec()
+    _patch_vocoder_factory_loaders(monkeypatch, processor, codec)
+    validations: list[dict] = []
+    monkeypatch.setattr(
+        stages,
+        "_validate_loaded_process_memory_budget",
+        lambda **kwargs: validations.append(kwargs),
+    )
+
+    stages.create_vocoder_executor(
+        "fake-model",
+        device="cpu",
+        gpu_id=3,
+        total_gpu_memory_fraction=0.18,
+    )
+
+    assert validations == [
+        {
+            "stage_name": "MOSS-TTS Local vocoder",
+            "gpu_id": 3,
+            "total_gpu_memory_fraction": 0.18,
+        }
+    ]
+
+
 def test_create_vocoder_executor_uses_model_config_codec_path(monkeypatch) -> None:
     processor = FakeProcessor()
     processor.model_config.audio_tokenizer_name_or_path = "codec-from-model-config"

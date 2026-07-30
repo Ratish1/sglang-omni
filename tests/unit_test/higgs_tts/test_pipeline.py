@@ -3,6 +3,7 @@
 import base64
 import logging
 import queue
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -414,7 +415,7 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     monkeypatch.setattr(sglang_backend, "SGLangOutputProcessor", FakeOutputProcessor)
     monkeypatch.setattr(model_runner_mod, "HiggsTTSModelRunner", FakeModelRunner)
 
-    def fake_make_adapters(model, **kwargs):
+    def fake_make_adapters(**kwargs):
         captured["adapter_kwargs"] = kwargs
         return None, None
 
@@ -466,13 +467,18 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
         "stream_stride": DEFAULT_HIGGS_STREAM_STRIDE,
         "stream_followup_stride": DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
     }
+    scheduler_kwargs = captured["scheduler_kwargs"]
+    assert (
+        scheduler_kwargs["abort_callback"]
+        == scheduler_kwargs["request_finished_callback"]
+    )
     assert (
         captured["stream_outbox"]
         is captured["scheduler_kwargs"]["model_runner"]._outbox
     )
 
 
-def test_higgs_tts_engine_abort_callback_requires_model() -> None:
+def test_higgs_tts_engine_lifecycle_callbacks_require_model() -> None:
     from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
 
     builder = HiggsTtsEngineBuilder(
@@ -485,13 +491,17 @@ def test_higgs_tts_engine_abort_callback_requires_model() -> None:
 
     with pytest.raises(AssertionError):
         builder.make_abort_callback()
+    with pytest.raises(AssertionError):
+        builder.make_request_finished_callback()
 
     reset_calls: list[str] = []
     builder.model = SimpleNamespace(reset_request=reset_calls.append)
     abort_callback = builder.make_abort_callback()
+    request_finished_callback = builder.make_request_finished_callback()
     abort_callback("req-1")
+    request_finished_callback("req-2")
 
-    assert reset_calls == ["req-1"]
+    assert reset_calls == ["req-1", "req-2"]
 
 
 def _make_higgs_builder(**kwargs):
@@ -1975,6 +1985,7 @@ def _make_fake_codec(call_log: list[tuple[int, int]]):
     codec._decode_cuda_graph_hits = 0
     codec._decode_cuda_graph_misses = 0
     codec._decode_cuda_graph_missed_shapes = set()
+    codec._decode_single_flight_lock = threading.Lock()
     return codec
 
 

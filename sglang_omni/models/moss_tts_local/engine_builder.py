@@ -23,10 +23,12 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
         async_decode_min_batch_size: int,
         total_gpu_memory_fraction: float | None,
         codec_mem_reserve: float,
+        process_total_gpu_memory_fraction: float | None = None,
     ) -> None:
         self.enable_async_decode = enable_async_decode
         self.async_decode_min_batch_size = async_decode_min_batch_size
         self.total_gpu_memory_fraction = total_gpu_memory_fraction
+        self.process_total_gpu_memory_fraction = process_total_gpu_memory_fraction
         self.codec_mem_reserve = codec_mem_reserve
         self.memory_budget = moss_local_stages._ArMemoryBudget(
             effective_total_gpu_memory_fraction=None,
@@ -62,9 +64,14 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
             total_gpu_memory_fraction=self.total_gpu_memory_fraction,
             codec_mem_reserve=self.codec_mem_reserve,
         )
-        self.profile_total_gpu_memory_fraction = (
-            self.memory_budget.effective_total_gpu_memory_fraction
-        )
+        self.profile_total_gpu_memory_fraction = self.process_total_gpu_memory_fraction
+        if (
+            self.profile_total_gpu_memory_fraction is None
+            and self.memory_budget.effective_total_gpu_memory_fraction is not None
+        ):
+            self.profile_total_gpu_memory_fraction = (
+                self.memory_budget.effective_total_gpu_memory_fraction
+            )
         if self.profile_total_gpu_memory_fraction is None:
             return
 
@@ -85,6 +92,8 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
             f"total_gpu_memory_fraction={self.total_gpu_memory_fraction} "
             f"effective_total_gpu_memory_fraction="
             f"{self.memory_budget.effective_total_gpu_memory_fraction} "
+            f"process_total_gpu_memory_fraction="
+            f"{self.process_total_gpu_memory_fraction} "
             f"codec_mem_reserve={self.memory_budget.applied_codec_mem_reserve:.3f} "
             f"mem_fraction_static={server_args.mem_fraction_static} "
             f"profile_total_gpu_memory_fraction="

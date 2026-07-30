@@ -174,6 +174,9 @@ class TtsEngineBuilder(ABC):
     def make_abort_callback(self) -> Any | None:
         return None
 
+    def make_request_finished_callback(self) -> Any | None:
+        return None
+
     def extra_scheduler_kwargs(self) -> dict[str, Any]:
         return {}
 
@@ -207,6 +210,7 @@ class TtsEngineBuilder(ABC):
             request_builder=request_builder,
             result_adapter=result_adapter,
             abort_callback=self.make_abort_callback(),
+            request_finished_callback=self.make_request_finished_callback(),
             **self.extra_scheduler_kwargs(),
         )
 

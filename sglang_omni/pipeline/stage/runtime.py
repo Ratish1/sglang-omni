@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 GetNextFn = Callable[[str, Any], str | list[str] | None]
 GetStreamDoneTargetsFn = Callable[[str, Any], str | list[str] | None]
+_TERMINAL_REQUEST_ID_LIMIT = 10000
 
 
 def _error_text(exc: BaseException) -> str:
@@ -137,6 +138,11 @@ class Stage:
 
         self._running = False
         self._aborted: set[str] = set()
+        # The stage transport owns stream ingress. Retain recently terminal
+        # request IDs so in-flight chunks cannot reopen a closed stream queue.
+        # Request IDs are expected to be unique; safe reuse would require a
+        # generation on every payload and stream message.
+        self._terminal_request_ids: dict[str, None] = {}
         self._active_requests: set[str] = set()
         self._stream_queue: StreamQueue | None = None
         self._stream_chunk_counters: dict[tuple[str, str], int] = {}
@@ -363,7 +369,7 @@ class Stage:
 
     async def _on_submit(self, msg: SubmitMessage) -> None:
         request_id = msg.request_id
-        if request_id in self._aborted:
+        if self._is_request_closed(request_id):
             return
         self._active_requests.add(request_id)
         if self._stream_queue is not None and not self._stream_queue.has(request_id):
@@ -384,7 +390,7 @@ class Stage:
         predecessor: asyncio.Future[None] | None = None,
     ) -> None:
         request_id = msg.request_id
-        if request_id in self._aborted:
+        if self._is_request_closed(request_id):
             await self._discard_payload_data(msg)
             return
         self._active_requests.add(request_id)
@@ -449,7 +455,7 @@ class Stage:
         data: Any,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        if request_id in self._aborted:
+        if self._is_request_closed(request_id):
             return
         self._active_requests.add(request_id)
         item = StreamItem(
@@ -486,7 +492,7 @@ class Stage:
         from_stage: str,
         payload: Any,
     ) -> None:
-        if request_id in self._aborted:
+        if self._is_request_closed(request_id):
             return
         self._active_requests.add(request_id)
         if self._stream_queue is not None and not self._stream_queue.has(request_id):
@@ -517,7 +523,7 @@ class Stage:
         predecessor: asyncio.Future[None] | None = None,
     ) -> None:
         request_id = msg.request_id
-        if request_id in self._aborted:
+        if self._is_request_closed(request_id):
             await self._discard_stream_chunk_data(msg)
             return
         self._active_requests.add(request_id)
@@ -538,7 +544,7 @@ class Stage:
                 await self._queue_stream_error(request_id, msg.from_stage, exc)
                 return
             await self._wait_for_receive_predecessor(predecessor)
-            if request_id in self._aborted:
+            if self._is_request_closed(request_id):
                 return
             item = StreamItem(
                 chunk_id=msg.chunk_id,
@@ -577,7 +583,7 @@ class Stage:
         await self._send_data_ack(msg, data_ref, success=True)
 
         await self._wait_for_receive_predecessor(predecessor)
-        if request_id in self._aborted:
+        if self._is_request_closed(request_id):
             return
 
         item = StreamItem(
@@ -630,7 +636,7 @@ class Stage:
         from_stage: str | None,
         error: BaseException,
     ) -> None:
-        if request_id in self._aborted:
+        if self._is_request_closed(request_id):
             return
         logger.error(
             "Stage %s: stream error from %s for %s: %s",
@@ -748,7 +754,7 @@ class Stage:
         is_done: bool = False,
         error: str | None = None,
     ) -> None:
-        if request_id in self._aborted:
+        if self._is_request_closed(request_id):
             return
         self._active_requests.add(request_id)
         if error:
@@ -1499,6 +1505,7 @@ class Stage:
         self._clear_request_state(request_id)
 
     def _clear_request_state(self, request_id: str) -> None:
+        self._remember_terminal_request(request_id)
         self._active_requests.discard(request_id)
         self.input_handler.cancel(request_id)
         if self._stream_queue is not None:
@@ -1511,6 +1518,16 @@ class Stage:
         self._first_stream_chunk_seen.discard(request_id)
         self._local_stream_targets.pop(request_id, None)
         self._nonlocal_stream_targets.pop(request_id, None)
+
+    def _is_request_closed(self, request_id: str) -> bool:
+        return request_id in self._aborted or request_id in self._terminal_request_ids
+
+    def _remember_terminal_request(self, request_id: str) -> None:
+        if request_id in self._terminal_request_ids:
+            return
+        if len(self._terminal_request_ids) >= _TERMINAL_REQUEST_ID_LIMIT:
+            del self._terminal_request_ids[next(iter(self._terminal_request_ids))]
+        self._terminal_request_ids[request_id] = None
 
     async def _handle_scheduler_crash(self, exc: BaseException) -> None:
         if self._scheduler_crash_error is not None:

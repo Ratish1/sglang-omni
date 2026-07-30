@@ -111,6 +111,7 @@ def test_length_terminal_releases_pool_row_through_scheduler_result_path() -> No
         vocab_size=2,
     )
     req._omni_data = data
+    req._omni_terminal_claimed = False
     req.output_ids.append(1)
     req.update_finish_state()
     assert req.finished_reason.to_json()["type"] == "length"
@@ -119,6 +120,10 @@ def test_length_terminal_releases_pool_row_through_scheduler_result_path() -> No
     scheduler._request_admission_lock = threading.RLock()
     scheduler.outbox = Queue()
     scheduler._aborted_request_ids = set()
+    scheduler._completed_request_ids = {}
+    scheduler._pending_stream_chunks = {}
+    scheduler._pending_stream_done = set()
+    scheduler._request_finished_callback = None
     scheduler._first_emit_done = {request_id}
     scheduler._prefill_start_done = {request_id}
     scheduler._result_adapter = result_adapter

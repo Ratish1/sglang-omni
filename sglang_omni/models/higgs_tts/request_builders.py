@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Any, Callable
 
 import torch
 from sglang.srt.managers.schedule_batch import Req
@@ -44,10 +44,6 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     stream_code_first_flush_done: bool = False
     stream_code_seen_rows: int = 0
     stream_code_next_flush_rows: int = 0
-
-
-class _ResettableHiggsModel(Protocol):
-    def reset_request(self, req_id: str) -> None: ...
 
 
 _HiggsRequestBuilder = Callable[[StagePayload], HiggsSGLangRequestData]
@@ -197,18 +193,12 @@ def apply_higgs_result(state: HiggsTtsState, data: HiggsSGLangRequestData) -> No
 
 
 def make_higgs_scheduler_adapters(
-    model: _ResettableHiggsModel,
     *,
     max_new_tokens_cap: int | None = None,
     stream_stride: int = DEFAULT_HIGGS_STREAM_STRIDE,
     stream_followup_stride: int = DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
 ) -> tuple[_HiggsRequestBuilder, _HiggsResultAdapter]:
-    """Build (request_builder, result_adapter) closures bound to a
-    :class:`HiggsTTSModel` instance.
-
-    Terminal conversion always drops the model's per-request sampler state and
-    accumulated codes, including when result materialization fails.
-    """
+    """Build scheduler request/result adapters for :class:`HiggsTTSModel`."""
 
     def request_builder(payload: StagePayload) -> HiggsSGLangRequestData:
         state = HiggsTtsState.from_dict(payload.data)
@@ -230,18 +220,15 @@ def make_higgs_scheduler_adapters(
 
     def result_adapter(data: HiggsSGLangRequestData) -> StagePayload:
         payload = data.stage_payload
-        try:
-            state = HiggsTtsState.from_dict(payload.data)
-            apply_higgs_result(state, data)
-            if data.engine_start_s:
-                state.engine_time_s = _perf_counter() - data.engine_start_s
-            return StagePayload(
-                request_id=payload.request_id,
-                request=payload.request,
-                data=state.to_dict(),
-            )
-        finally:
-            model.reset_request(payload.request_id)
+        state = HiggsTtsState.from_dict(payload.data)
+        apply_higgs_result(state, data)
+        if data.engine_start_s:
+            state.engine_time_s = _perf_counter() - data.engine_start_s
+        return StagePayload(
+            request_id=payload.request_id,
+            request=payload.request,
+            data=state.to_dict(),
+        )
 
     return request_builder, result_adapter
 

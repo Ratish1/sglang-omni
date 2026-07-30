@@ -532,6 +532,49 @@ def test_stage_stream_error_fails_request_even_with_stream_queue() -> None:
     asyncio.run(_run())
 
 
+def test_terminal_request_cannot_reopen_stage_stream_ingress() -> None:
+    async def _run() -> None:
+        scheduler = SimpleNamespace(
+            outbox=queue.Queue(),
+            inbox=queue.Queue(),
+            abort=lambda request_id: None,
+        )
+        stage = Stage(
+            name="vocoder",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={},
+            control_plane=_FakeControlPlane(),
+            relay=_FakeRelay(),
+            scheduler=scheduler,
+            can_accept_stream_before_payload=True,
+        )
+        stage._stream_queue = StreamQueue(max_pending=4096)
+        stage._stream_queue.open("req")
+        stage._active_requests.add("req")
+
+        stage._clear_request_state("req")
+        await stage.receive_local_stream_chunk(
+            "req",
+            "tts_engine",
+            0,
+            torch.arange(4),
+        )
+        await stage.receive_local_stream_signal(
+            "req",
+            "tts_engine",
+            is_done=True,
+        )
+
+        assert "req" in stage._terminal_request_ids
+        assert "req" not in stage._active_requests
+        assert not stage._stream_queue.has("req")
+        assert scheduler.inbox.empty()
+
+    asyncio.run(_run())
+
+
 def test_write_stream_chunk_uses_relay() -> None:
     async def _run() -> None:
         control_plane = _FakeControlPlane()

@@ -152,6 +152,49 @@ def _apply_colocated_ar_memory_budget(
     )
 
 
+def _validate_loaded_process_memory_budget(
+    *,
+    stage_name: str,
+    gpu_id: int,
+    total_gpu_memory_fraction: float | None,
+) -> None:
+    if total_gpu_memory_fraction is None:
+        return
+
+    from sglang_omni.utils.gpu_memory import (
+        format_bytes_gib,
+        get_gpu_device_info,
+        get_process_gpu_memory_bytes,
+    )
+
+    process_bytes = get_process_gpu_memory_bytes(gpu_id)
+    total_bytes = get_gpu_device_info(gpu_id).total_memory_bytes
+    if process_bytes is None or total_bytes is None:
+        logger.warning(
+            "%s GPU memory budget cannot be verified: gpu_id=%d fraction=%.3f",
+            stage_name,
+            gpu_id,
+            total_gpu_memory_fraction,
+        )
+        return
+
+    budget_bytes = int(total_bytes * total_gpu_memory_fraction)
+    if process_bytes > budget_bytes:
+        raise RuntimeError(
+            f"{stage_name} process GPU memory exceeds its configured budget: "
+            f"used={format_bytes_gib(process_bytes)}, "
+            f"budget={format_bytes_gib(budget_bytes)}, "
+            f"fraction={total_gpu_memory_fraction:.3f}"
+        )
+    logger.info(
+        "%s process GPU memory: used=%s budget=%s fraction=%.3f",
+        stage_name,
+        format_bytes_gib(process_bytes),
+        format_bytes_gib(budget_bytes),
+        total_gpu_memory_fraction,
+    )
+
+
 def _normalize_processor_config(processor: Any) -> None:
     model_config = getattr(processor, "model_config", None)
     if model_config is None:
@@ -571,6 +614,7 @@ def create_sglang_tts_engine_executor(
     enable_async_decode: bool = False,
     async_decode_min_batch_size: int = 2,
     total_gpu_memory_fraction: float | None = None,
+    process_total_gpu_memory_fraction: float | None = None,
     codec_mem_reserve: float = 0.0,
 ) -> Any:
     from sglang_omni.models.moss_tts_local.engine_builder import (
@@ -581,6 +625,7 @@ def create_sglang_tts_engine_executor(
         enable_async_decode=enable_async_decode,
         async_decode_min_batch_size=async_decode_min_batch_size,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
+        process_total_gpu_memory_fraction=process_total_gpu_memory_fraction,
         codec_mem_reserve=codec_mem_reserve,
     ).build(
         model_path,
@@ -599,6 +644,7 @@ def create_vocoder_executor(
     *,
     device: str | None = None,
     gpu_id: int | None = None,
+    total_gpu_memory_fraction: float | None = None,
     codec_model_path: str | None = None,
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
@@ -635,4 +681,14 @@ def create_vocoder_executor(
     # Capture graphs in the factory: it runs before the process is marked ready, so serving never
     # races a half-captured graph. Same-process guarantee (each colocate/split stage warms its own).
     scheduler.warmup_now()
+    device_index = torch.device(device).index
+    _validate_loaded_process_memory_budget(
+        stage_name="MOSS-TTS Local vocoder",
+        gpu_id=(
+            int(device_index)
+            if device_index is not None
+            else (0 if gpu_id is None else int(gpu_id))
+        ),
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+    )
     return scheduler

@@ -5,7 +5,6 @@ from __future__ import annotations
 import threading
 from types import SimpleNamespace
 
-import pytest
 import torch
 from transformers import HiggsAudioV2TokenizerConfig, HiggsAudioV2TokenizerModel
 
@@ -102,10 +101,12 @@ def test_codec_decode_replays_matching_shape_graph() -> None:
     torch.testing.assert_close(output, torch.tensor([21.0]), rtol=0, atol=0)
 
 
-def test_codec_decode_rejects_concurrent_graph_pool_use() -> None:
+def test_codec_decode_serializes_concurrent_graph_pool_use() -> None:
     replay_started = threading.Event()
     release_replay = threading.Event()
+    batch_started = threading.Event()
     failures: list[BaseException] = []
+    completions: list[str] = []
 
     class _BlockingGraph:
         def replay(self) -> None:
@@ -128,18 +129,56 @@ def test_codec_decode_rejects_concurrent_graph_pool_use() -> None:
     def replay_graph() -> None:
         try:
             codec.decode(torch.tensor([[1, 2]], dtype=torch.long))
+            completions.append("decode")
+        except BaseException as exc:
+            failures.append(exc)
+
+    def replay_batch() -> None:
+        try:
+            batch_started.set()
+            codec.decode_batch([torch.tensor([[3, 4]], dtype=torch.long)])
+            completions.append("batch")
         except BaseException as exc:
             failures.append(exc)
 
     replay_thread = threading.Thread(target=replay_graph)
     replay_thread.start()
     assert replay_started.wait(timeout=1)
+    batch_thread = threading.Thread(target=replay_batch)
+    batch_thread.start()
     try:
-        with pytest.raises(RuntimeError, match="single-flight"):
-            codec.decode_batch([torch.tensor([[3, 4]], dtype=torch.long)])
+        assert batch_started.wait(timeout=1)
+        batch_thread.join(timeout=0.05)
+        assert batch_thread.is_alive()
     finally:
         release_replay.set()
         replay_thread.join(timeout=1)
+        batch_thread.join(timeout=1)
 
     assert not replay_thread.is_alive()
+    assert not batch_thread.is_alive()
     assert failures == []
+    assert completions == ["decode", "batch"]
+
+
+def test_codec_capture_serializes_with_decode() -> None:
+    capture_entered = threading.Event()
+    codec = object.__new__(audio_codec.HiggsAudioCodec)
+    codec._decode_single_flight_lock = threading.Lock()
+    codec._capture_decode_cuda_graphs_locked = (
+        lambda _frame_counts: capture_entered.set()
+    )
+
+    codec._decode_single_flight_lock.acquire()
+    capture_thread = threading.Thread(
+        target=lambda: codec.capture_decode_cuda_graphs((1,))
+    )
+    capture_thread.start()
+    try:
+        assert not capture_entered.wait(timeout=0.05)
+    finally:
+        codec._decode_single_flight_lock.release()
+        capture_thread.join(timeout=1)
+
+    assert not capture_thread.is_alive()
+    assert capture_entered.is_set()

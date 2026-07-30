@@ -640,6 +640,7 @@ def test_fish_req_hits_max_new_tokens_and_scheduler_reports_length() -> None:
     )
     req = data.req
     req._omni_data = data
+    req._omni_terminal_claimed = False
 
     for value in (200, 201):
         assert not req.finished()
@@ -652,6 +653,10 @@ def test_fish_req_hits_max_new_tokens_and_scheduler_reports_length() -> None:
     scheduler._request_admission_lock = threading.RLock()
     scheduler.outbox = Queue()
     scheduler._aborted_request_ids = set()
+    scheduler._completed_request_ids = {}
+    scheduler._pending_stream_chunks = {}
+    scheduler._pending_stream_done = set()
+    scheduler._request_finished_callback = None
     scheduler._first_emit_done = set()
     scheduler._prefill_start_done = set()
     scheduler._result_adapter = result_adapter

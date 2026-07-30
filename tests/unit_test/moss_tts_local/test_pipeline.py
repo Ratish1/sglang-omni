@@ -728,6 +728,7 @@ def test_colocated_moss_ar_factory_threads_effective_budget(monkeypatch):
         "dummy",
         server_args_overrides={"disable_cuda_graph": True},
         total_gpu_memory_fraction=0.90,
+        process_total_gpu_memory_fraction=0.95,
         codec_mem_reserve=0.05,
     )
 
@@ -735,7 +736,7 @@ def test_colocated_moss_ar_factory_threads_effective_budget(monkeypatch):
         {
             "mem_fraction_static": pytest.approx(0.85),
             "gpu_id": 0,
-            "total_gpu_memory_fraction": pytest.approx(0.85),
+            "total_gpu_memory_fraction": pytest.approx(0.95),
         }
     ]
     assert process_memory_queries == [0]
@@ -755,6 +756,7 @@ def test_colocated_moss_ar_factory_uses_upstream_profile_without_process_account
         "dummy",
         server_args_overrides={"disable_cuda_graph": True},
         total_gpu_memory_fraction=0.90,
+        process_total_gpu_memory_fraction=0.95,
         codec_mem_reserve=0.05,
     )
 
@@ -766,6 +768,34 @@ def test_colocated_moss_ar_factory_uses_upstream_profile_without_process_account
         }
     ]
     assert process_memory_queries == [0]
+
+
+def test_moss_vocoder_process_budget_rejects_loaded_overage(monkeypatch) -> None:
+    from sglang_omni.models.moss_tts_local import stages
+    from sglang_omni.utils import gpu_memory
+
+    monkeypatch.setattr(
+        gpu_memory,
+        "get_process_gpu_memory_bytes",
+        lambda _gpu_id: 19,
+    )
+    monkeypatch.setattr(
+        gpu_memory,
+        "get_gpu_device_info",
+        lambda gpu_id: gpu_memory.GpuDeviceInfo(
+            logical_gpu_id=gpu_id,
+            device_id=gpu_id,
+            name="fake",
+            total_memory_bytes=100,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="exceeds its configured budget"):
+        stages._validate_loaded_process_memory_budget(
+            stage_name="vocoder",
+            gpu_id=0,
+            total_gpu_memory_fraction=0.18,
+        )
 
 
 def test_colocated_moss_ar_abort_callback_requires_model(monkeypatch):
