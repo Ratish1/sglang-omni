@@ -15,6 +15,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.rollout_trace import build_omni_rollout_trace
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
+    DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
     DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
     DEFAULT_HIGGS_STREAM_STRIDE,
     HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA,
@@ -22,7 +23,10 @@ from sglang_omni.models.higgs_tts.vocoder_scheduler import (
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
-from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
+from sglang_omni.scheduling.streaming_vocoder import (
+    INITIAL_CODEC_CHUNK_FRAMES_PARAM,
+    resolve_initial_codec_chunk_frames,
+)
 
 
 @dataclass
@@ -132,6 +136,7 @@ def build_higgs_stream_metadata(
     *,
     stream_stride: int = DEFAULT_HIGGS_STREAM_STRIDE,
     stream_followup_stride: int = DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
+    initial_chunk_frames: int = DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
 ) -> dict[str, Any] | None:
     params = payload.request.params
     if not isinstance(params, dict):
@@ -155,11 +160,12 @@ def build_higgs_stream_metadata(
         "codebook_size": codebook_size,
         HIGGS_STREAM_STRIDE_METADATA: stream_stride,
         HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA: stream_followup_stride,
+        INITIAL_CODEC_CHUNK_FRAMES_PARAM: resolve_initial_codec_chunk_frames(
+            params,
+            steady_chunk_frames=max(1, stream_stride - num_codebooks + 1),
+            default_frames=initial_chunk_frames,
+        ),
     }
-    if params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM) is not None:
-        metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = params[
-            INITIAL_CODEC_CHUNK_FRAMES_PARAM
-        ]
     return metadata
 
 
@@ -197,6 +203,7 @@ def make_higgs_scheduler_adapters(
     max_new_tokens_cap: int | None = None,
     stream_stride: int = DEFAULT_HIGGS_STREAM_STRIDE,
     stream_followup_stride: int = DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
+    initial_chunk_frames: int = DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
 ) -> tuple[_HiggsRequestBuilder, _HiggsResultAdapter]:
     """Build scheduler request/result adapters for :class:`HiggsTTSModel`."""
 
@@ -215,6 +222,7 @@ def make_higgs_scheduler_adapters(
             data,
             stream_stride=stream_stride,
             stream_followup_stride=stream_followup_stride,
+            initial_chunk_frames=initial_chunk_frames,
         )
         return data
 

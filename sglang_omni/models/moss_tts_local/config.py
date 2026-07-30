@@ -143,6 +143,26 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
     def generation_sglang_role_to_stage(cls) -> dict[str, str]:
         return {"generation": "tts_engine"}
 
+    @classmethod
+    def process_safe_edges(cls) -> frozenset[tuple[str, str]]:
+        # Note (Akazaakane): preprocessing -> tts_engine is excluded because
+        # preprocessing publishes prepared requests into a module-level
+        # PreparedRequestQueue that the AR stage pops in-process; the vocoder only
+        # reads codes carried in the payload.
+        return frozenset({("tts_engine", "vocoder")})
+
+    @classmethod
+    def process_edge_resources(
+        cls,
+    ) -> dict[tuple[str, str], dict[str, float]]:
+        return {
+            ("tts_engine", "vocoder"): {
+                "preprocessing": _COLOCATED_PREPROCESSING_GPU_MEMORY_FRACTION,
+                "tts_engine": _COLOCATED_AR_GPU_MEMORY_FRACTION,
+                "vocoder": _COLOCATED_VOCODER_GPU_MEMORY_FRACTION,
+            }
+        }
+
     model_path: str
     stages: list[StageConfig] = Field(
         default_factory=lambda: _stages(codec_device="cuda:0", colocated=True)
@@ -242,6 +262,19 @@ class MossTTSLocalColocatedPipelineConfig(MossTTSLocalPipelineConfig):
 
 class MossTTSLocalSplitPipelineConfig(MossTTSLocalPipelineConfig):
     """Two-GPU variant that places codec work on the second visible GPU."""
+
+    @classmethod
+    def process_safe_edges(cls) -> frozenset[tuple[str, str]]:
+        # Note (Akazaakane): split mode declares gpu=0 for placement while running the
+        # codec on cuda:1, so the colocated fractions do not describe this topology.
+        # Splitting stays unsupported here until the split variant declares its own.
+        return frozenset()
+
+    @classmethod
+    def process_edge_resources(
+        cls,
+    ) -> dict[tuple[str, str], dict[str, float]]:
+        return {}
 
     stages: list[StageConfig] = Field(
         default_factory=lambda: _stages(codec_device="cuda:1", colocated=False)

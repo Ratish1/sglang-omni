@@ -14,6 +14,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
 from sglang_omni.models.higgs_tts import request_builders
 from sglang_omni.models.higgs_tts import utils as higgs_utils
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
+    DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
     DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
     DEFAULT_HIGGS_STREAM_STRIDE,
 )
@@ -37,6 +38,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         async_decode_min_batch_size: int,
         stream_stride: int = DEFAULT_HIGGS_STREAM_STRIDE,
         stream_followup_stride: int = DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
+        initial_chunk_frames: int = DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
         prefill_coalesce_requests: int = 0,
         prefill_coalesce_wait_ms: float = 60.0,
         prefill_graph_max_req: int | None = None,
@@ -56,6 +58,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         self.async_decode_min_batch_size = async_decode_min_batch_size
         self.stream_stride = stream_stride
         self.stream_followup_stride = stream_followup_stride
+        self.initial_chunk_frames = initial_chunk_frames
         self.prefill_coalesce_requests = prefill_coalesce_requests
         self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
         self._prefill_graph_max_req_explicit = prefill_graph_max_req is not None
@@ -248,6 +251,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
             max_new_tokens_cap=self.max_new_tokens,
             stream_stride=self.stream_stride,
             stream_followup_stride=self.stream_followup_stride,
+            initial_chunk_frames=self.initial_chunk_frames,
         )
 
     def make_abort_callback(self) -> Any | None:

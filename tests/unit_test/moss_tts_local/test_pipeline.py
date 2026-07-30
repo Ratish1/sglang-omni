@@ -467,6 +467,11 @@ def test_pipeline_stage_wiring():
     assert topology.stage_to_process["preprocessing"] == "pipeline"
     assert topology.stage_to_process["tts_engine"] == "pipeline"
     assert topology.stage_to_process["vocoder"] == "vocoder"
+    assert config.process_safe_edges() == frozenset({("tts_engine", "vocoder")})
+    edge_resources = config.process_edge_resources()[("tts_engine", "vocoder")]
+    assert edge_resources["preprocessing"] == pytest.approx(0.15)
+    assert edge_resources["tts_engine"] == pytest.approx(0.67)
+    assert edge_resources["vocoder"] == pytest.approx(0.18)
 
     colocated = MossTTSLocalColocatedPipelineConfig(
         model_path="OpenMOSS-Team/moss-local-test"
@@ -486,7 +491,21 @@ def test_pipeline_stage_wiring():
     split_runtime = split_stages["tts_engine"].runtime
     assert split_runtime.resources.total_gpu_memory_fraction is None
     assert split_runtime.sglang_server_args.mem_fraction_static == pytest.approx(0.85)
+    assert (
+        split_stages["preprocessing"].runtime.resources.total_gpu_memory_fraction
+        is None
+    )
+    assert split_stages["vocoder"].runtime.resources.total_gpu_memory_fraction is None
     assert split_stages["vocoder"].factory_args["device"] == "cuda:1"
+    # The split variant carries no per-stage GPU budgets, so its vocoder stays in
+    # the shared pipeline process; its declared topology must still validate.
+    assert split_stages["vocoder"].process == "pipeline"
+    split_topology = build_process_topology_plan(
+        split, build_stage_placement_plan(split)
+    )
+    assert [(group.name, group.stage_names) for group in split_topology.groups] == [
+        ("pipeline", ("preprocessing", "tts_engine", "vocoder"))
+    ]
 
 
 @pytest.mark.parametrize(
