@@ -1147,6 +1147,26 @@ def test_same_gpu_multiple_processes_accepts_explicit_budgets() -> None:
     ]
 
 
+def test_same_gpu_multiple_processes_accepts_one_budget_per_process() -> None:
+    config = PipelineConfig(
+        model_path="dummy",
+        stages=[
+            _stage("a", gpu=0, process="p0", next_stage="b"),
+            _stage("b", gpu=0, fraction=0.30, process="p0", next_stage="c"),
+            _stage("c", gpu=0, fraction=0.40, process="p1", terminal=True),
+        ],
+    )
+
+    topology = _topology(config)
+
+    assert [
+        (group.name, group.stage_names, group.gpu_id) for group in topology.groups
+    ] == [
+        ("p0", ("a", "b"), 0),
+        ("p1", ("c",), 0),
+    ]
+
+
 def test_same_gpu_multiple_processes_rejects_missing_budget() -> None:
     config = PipelineConfig(
         model_path="dummy",
