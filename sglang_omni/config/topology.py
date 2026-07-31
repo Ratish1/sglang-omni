@@ -234,8 +234,6 @@ def _validate_gpu_process_colocation(
 ) -> None:
     stage_by_name = {stage.name: stage for stage in stages}
     gpu_processes: dict[int, set[str]] = defaultdict(set)
-    process_stages: dict[tuple[int, str], set[str]] = defaultdict(set)
-    processes_with_fraction: set[tuple[int, str]] = set()
     missing_fraction: dict[int, set[str]] = defaultdict(set)
 
     for group in topology_plan.groups:
@@ -245,10 +243,8 @@ def _validate_gpu_process_colocation(
                 if gpu_id is None:
                     continue
                 gpu_processes[gpu_id].add(group.name)
-                process_key = (gpu_id, group.name)
-                process_stages[process_key].add(stage.name)
-                if stage.runtime.resources.total_gpu_memory_fraction is not None:
-                    processes_with_fraction.add(process_key)
+                if stage.runtime.resources.total_gpu_memory_fraction is None:
+                    missing_fraction[gpu_id].add(stage.name)
 
     for stage in stages:
         if stage.tp_size <= 1:
@@ -256,16 +252,11 @@ def _validate_gpu_process_colocation(
         for rank, gpu_id in enumerate(_stage_gpu_ids(gpu_placement, stage)):
             if gpu_id is None:
                 continue
-            process_name = topology_plan.tp_stage_to_processes[stage.name][rank]
-            gpu_processes[gpu_id].add(process_name)
-            process_key = (gpu_id, process_name)
-            process_stages[process_key].add(stage.name)
-            if stage.runtime.resources.total_gpu_memory_fraction is not None:
-                processes_with_fraction.add(process_key)
-
-    for (gpu_id, process_name), stage_names in process_stages.items():
-        if (gpu_id, process_name) not in processes_with_fraction:
-            missing_fraction[gpu_id].update(stage_names)
+            gpu_processes[gpu_id].add(
+                topology_plan.tp_stage_to_processes[stage.name][rank]
+            )
+            if stage.runtime.resources.total_gpu_memory_fraction is None:
+                missing_fraction[gpu_id].add(stage.name)
 
     require = config.placement.require_memory_fraction_for_colocation
     limit = config.placement.max_total_gpu_memory_fraction_per_gpu

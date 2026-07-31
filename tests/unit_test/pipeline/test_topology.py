@@ -553,14 +553,15 @@ def test_moss_split_rejects_vocoder_isolation_as_not_process_safe() -> None:
 
 
 @pytest.mark.parametrize(
-    "config_path",
+    ("config_path", "expected_memory_fraction"),
     [
-        "sglang_omni.models.qwen3_tts.config.Qwen3TTSPipelineConfig",
-        "sglang_omni.models.moss_tts.config.MossTTSPipelineConfig",
+        ("sglang_omni.models.qwen3_tts.config.Qwen3TTSPipelineConfig", 0.95),
+        ("sglang_omni.models.moss_tts.config.MossTTSPipelineConfig", 1.0),
     ],
 )
 def test_ar_to_vocoder_boundary_isolates_with_declared_contract(
     config_path: str,
+    expected_memory_fraction: float,
 ) -> None:
     """Preprocessing is process-local for these models but the vocoder is not."""
     from sglang_omni.utils.imports import import_string
@@ -578,7 +579,7 @@ def test_ar_to_vocoder_boundary_isolates_with_declared_contract(
     ]
     assert build_stage_placement_plan(isolated).gpus[
         0
-    ].total_gpu_memory_fraction == pytest.approx(0.95)
+    ].total_gpu_memory_fraction == pytest.approx(expected_memory_fraction)
 
 
 def test_stage_process_singleton_matches_isolate_stage_resources() -> None:
@@ -1132,26 +1133,6 @@ def test_same_gpu_multiple_processes_accepts_explicit_budgets() -> None:
         model_path="dummy",
         stages=[
             _stage("a", gpu=0, fraction=0.20, process="p0", next_stage="b"),
-            _stage("b", gpu=0, fraction=0.30, process="p0", next_stage="c"),
-            _stage("c", gpu=0, fraction=0.40, process="p1", terminal=True),
-        ],
-    )
-
-    topology = _topology(config)
-
-    assert [
-        (group.name, group.stage_names, group.gpu_id) for group in topology.groups
-    ] == [
-        ("p0", ("a", "b"), 0),
-        ("p1", ("c",), 0),
-    ]
-
-
-def test_same_gpu_multiple_processes_accepts_one_budget_per_process() -> None:
-    config = PipelineConfig(
-        model_path="dummy",
-        stages=[
-            _stage("a", gpu=0, process="p0", next_stage="b"),
             _stage("b", gpu=0, fraction=0.30, process="p0", next_stage="c"),
             _stage("c", gpu=0, fraction=0.40, process="p1", terminal=True),
         ],
