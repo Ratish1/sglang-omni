@@ -1,5 +1,13 @@
 # CPU Saturation and Host-Dispatch Profiling Plan
 
+> Implementation status (`debug/problem`): phases 1-3 are implemented. The
+> executable H100 protocol is in `benchmarks/profiling/README.md`, the direct
+> server harness is `benchmarks/profiling/profile_cpu_saturation.py`, and
+> artifact validation is `sglang_omni/profiler/integrity.py`. Local static and
+> CPU-only tests pass; CUDA/Kineto/Nsight execution and the causal experiment
+> matrix remain explicit H100 gates. No runtime “fix” is selected by this
+> implementation.
+
 Status: **Conditional — execution-ready instrumentation plan; root cause unverified**
 
 Revision: 1

@@ -20,6 +20,7 @@ from sglang_omni.proto import (
     AbortMessage,
     AdminMessage,
     AdminResultMessage,
+    ProfilerResultMessage,
     ProfilerStartMessage,
     ProfilerStopMessage,
     ShutdownMessage,
@@ -105,6 +106,37 @@ class TPLeaderFanout:
             results.append(msg)
         return results
 
+    async def collect_profiler_results(
+        self,
+        op_id: str,
+        *,
+        timeout_s: float = 120.0,
+    ) -> list[ProfilerResultMessage]:
+        """Collect one profiler result from every TP follower."""
+        if not self._follower_admin_result_queues:
+            return []
+        loop = asyncio.get_running_loop()
+        tasks = [
+            loop.run_in_executor(
+                None,
+                lambda q=q: q.get(timeout=timeout_s),
+            )
+            for q in self._follower_admin_result_queues
+        ]
+        raw_results = await asyncio.gather(*tasks)
+        results: list[ProfilerResultMessage] = []
+        for msg in raw_results:
+            if not isinstance(msg, ProfilerResultMessage):
+                raise ValueError(
+                    f"Unexpected TP follower profiler result: {type(msg).__name__}"
+                )
+            if msg.op_id != op_id:
+                raise ValueError(
+                    "Unexpected TP follower profiler op id: " f"{msg.op_id} != {op_id}"
+                )
+            results.append(msg)
+        return results
+
     def close(self) -> None:
         self._follower_work_queues.clear()
         self._follower_abort_queues.clear()
@@ -166,6 +198,18 @@ class TPFollowerControlPlane:
         if self._admin_result_queue is None:
             raise RuntimeError(
                 f"TP follower stage {self.stage_name} has no admin result queue"
+            )
+        self._admin_result_queue.put_nowait(msg)
+
+    async def send_profiler_result(
+        self,
+        msg: ProfilerResultMessage,
+        reply_endpoint: str,
+    ) -> None:
+        del reply_endpoint
+        if self._admin_result_queue is None:
+            raise RuntimeError(
+                f"TP follower stage {self.stage_name} has no result queue"
             )
         self._admin_result_queue.put_nowait(msg)
 

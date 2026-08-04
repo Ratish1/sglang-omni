@@ -37,6 +37,7 @@ from sglang_omni.proto import (
     CompleteMessage,
     DataAckMessage,
     DataReadyMessage,
+    ProfilerResultMessage,
     ProfilerStartMessage,
     ProfilerStopMessage,
     ShutdownMessage,
@@ -47,6 +48,7 @@ from sglang_omni.proto import (
 )
 from sglang_omni.relay.base import Relay
 from sglang_omni.scheduling.messages import IncomingMessage
+from sglang_omni.scheduling.profiler_control import make_profiler_command
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +153,7 @@ class Stage:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduler_crash_error: BaseException | None = None
         self._background_task_error: BaseException | None = None
+        self._profiler_event_paths: dict[str, str] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -327,9 +330,9 @@ class Stage:
         elif isinstance(msg, DataReadyMessage):
             self._schedule_receive_task(msg)
         elif isinstance(msg, ProfilerStartMessage):
-            self._on_profiler_start(msg)
+            await self._on_profiler_start(msg)
         elif isinstance(msg, ProfilerStopMessage):
-            self._on_profiler_stop(msg)
+            await self._on_profiler_stop(msg)
         elif isinstance(msg, AdminMessage):
             await self._on_admin(msg)
 
@@ -1583,38 +1586,264 @@ class Stage:
         self._clear_request_state(request_id)
         self.scheduler.abort(request_id)
 
-    def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
-        run_id = msg.run_id
-        if msg.enable_torch and not TorchProfiler.is_active():
-            base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
+    async def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
+        targets: list[dict[str, Any]] = []
+        error: str | None = None
+        try:
+            target = await self._start_local_profiler(msg)
+            targets.append(target)
+        except Exception as exc:
+            error = _error_text(exc)
+            targets.append(self._failed_profiler_target("start", error))
+
+        try:
+            targets.extend(
+                await self._collect_follower_profiler_targets(
+                    msg.op_id,
+                    timeout_s=msg.timeout_s,
+                )
+            )
+        except Exception as exc:
+            error = _error_text(exc)
+            targets.append(self._failed_profiler_target("start", error))
+        success = bool(targets) and all(
+            bool(target.get("success")) for target in targets
+        )
+        result = ProfilerResultMessage(
+            op_id=msg.op_id,
+            run_id=msg.run_id,
+            stage=self.name,
+            action="start",
+            success=success,
+            targets=targets,
+            error=error if not success else None,
+        )
+        await self.control_plane.send_profiler_result(result, msg.reply_endpoint)
+
+    async def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
+        targets: list[dict[str, Any]] = []
+        error: str | None = None
+        try:
+            target = await self._stop_local_profiler(msg)
+            targets.append(target)
+        except Exception as exc:
+            error = _error_text(exc)
+            targets.append(self._failed_profiler_target("stop", error))
+
+        try:
+            targets.extend(
+                await self._collect_follower_profiler_targets(
+                    msg.op_id,
+                    timeout_s=msg.timeout_s,
+                )
+            )
+        except Exception as exc:
+            error = _error_text(exc)
+            targets.append(self._failed_profiler_target("stop", error))
+        success = bool(targets) and all(
+            bool(target.get("success")) for target in targets
+        )
+        result = ProfilerResultMessage(
+            op_id=msg.op_id,
+            run_id=msg.run_id,
+            stage=self.name,
+            action="stop",
+            success=success,
+            targets=targets,
+            error=error if not success else None,
+        )
+        await self.control_plane.send_profiler_result(result, msg.reply_endpoint)
+
+    async def _start_local_profiler(self, msg: ProfilerStartMessage) -> dict[str, Any]:
+        target = self._base_profiler_target("start")
+        recorder = _get_recorder()
+        if (
+            msg.event_dir is not None
+            and recorder.is_active()
+            and recorder.active_run_id() != msg.run_id
+        ):
+            raise RuntimeError(
+                f"stage {self.name} event recorder is already active for "
+                f"run_id={recorder.active_run_id()}"
+            )
+        if msg.enable_torch or msg.enable_nvtx:
+            if msg.torch_owner != "scheduler":
+                raise ValueError(
+                    f"unsupported torch_owner={msg.torch_owner!r}; "
+                    "only 'scheduler' is implemented"
+                )
+            base_tpl = msg.trace_path_template.format(
+                run_id=msg.run_id,
+                stage=self.name,
+            )
             template = f"{base_tpl}_pid{os.getpid()}"
             prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
             if prof_dir and not os.path.isabs(template):
                 template = os.path.join(prof_dir, template)
-            TorchProfiler.start(template, run_id=run_id)
+            torch_result = await self._run_scheduler_profiler_command(
+                action="profiler_start",
+                op_id=msg.op_id,
+                run_id=msg.run_id,
+                trace_path_template=template,
+                torch_config=msg.torch_config,
+                enable_torch=msg.enable_torch,
+                enable_nvtx=msg.enable_nvtx,
+                timeout_s=msg.timeout_s,
+            )
+            target.update(torch_result)
+            if not torch_result.get("success"):
+                return target
+
         if msg.event_dir is not None:
             try:
-                _get_recorder().start(
-                    run_id=run_id, event_dir=msg.event_dir, stage=self.name
+                event_path = recorder.start(
+                    run_id=msg.run_id,
+                    event_dir=msg.event_dir,
+                    stage=self.name,
                 )
+                target["events"] = {
+                    "active": True,
+                    "path": event_path,
+                }
+                self._profiler_event_paths[msg.run_id] = event_path
             except Exception:
-                logger.warning(
-                    "Stage %s failed to start request event recorder",
-                    self.name,
-                    exc_info=True,
-                )
+                if msg.enable_torch or msg.enable_nvtx:
+                    await self._run_scheduler_profiler_command(
+                        action="profiler_stop",
+                        op_id=f"{msg.op_id}-rollback",
+                        run_id=msg.run_id,
+                        timeout_s=msg.timeout_s,
+                    )
+                raise
+        target["success"] = True
+        target["status"] = "active"
+        return target
 
-    def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
-        # run_id=None is a wildcard (stop whatever's active).
-        if TorchProfiler.is_active() and (
-            msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
-        ):
-            TorchProfiler.stop(run_id=msg.run_id)
+    async def _stop_local_profiler(self, msg: ProfilerStopMessage) -> dict[str, Any]:
+        target = self._base_profiler_target("stop")
+        torch_result = await self._run_scheduler_profiler_command(
+            action="profiler_stop",
+            op_id=msg.op_id,
+            run_id=msg.run_id,
+            timeout_s=msg.timeout_s,
+        )
+        target.update(torch_result)
+
         recorder = _get_recorder()
-        if recorder.is_active() and (
-            msg.run_id is None or recorder.active_run_id() == msg.run_id
+        event_status = recorder.snapshot()
+        event_path = event_status["path"]
+        event_run_id = recorder.active_run_id()
+        requested_run_id = msg.run_id or event_run_id
+        if event_path is None and requested_run_id is not None:
+            event_path = self._profiler_event_paths.get(requested_run_id)
+        stopped_path = None
+        if recorder.is_active() and (msg.run_id is None or event_run_id == msg.run_id):
+            stopped_path = recorder.stop(run_id=msg.run_id)
+        target["events"] = {
+            **event_status,
+            "active": recorder.is_active(),
+            "path": stopped_path or event_path,
+            "run_id": event_run_id,
+            "flushed": stopped_path is not None or not event_status["active"],
+        }
+        if requested_run_id is not None:
+            self._profiler_event_paths.pop(requested_run_id, None)
+        target["success"] = bool(torch_result.get("success"))
+        target["status"] = (
+            "exported" if target["success"] else torch_result.get("status", "failed")
+        )
+        return target
+
+    async def _run_scheduler_profiler_command(
+        self,
+        *,
+        action: str,
+        op_id: str,
+        run_id: str | None,
+        trace_path_template: str | None = None,
+        torch_config: dict[str, Any] | None = None,
+        enable_torch: bool = True,
+        enable_nvtx: bool = False,
+        timeout_s: float = 120.0,
+    ) -> dict[str, Any]:
+        scheduler = self.scheduler
+        if scheduler is None or not getattr(
+            scheduler, "supports_profiler_control", False
         ):
-            recorder.stop(run_id=msg.run_id)
+            if action == "profiler_stop" and not TorchProfiler.is_active():
+                return {
+                    **self._base_profiler_target("stop"),
+                    "success": True,
+                    "status": "inactive",
+                    "torch": None,
+                }
+            raise RuntimeError(
+                f"stage {self.name} scheduler does not support owner-thread profiling"
+            )
+        command, result_queue = make_profiler_command(
+            action=action,
+            op_id=op_id,
+            run_id=run_id,
+            stage=self.name,
+            role=self.role,
+            trace_path_template=trace_path_template,
+            torch_config=torch_config,
+            enable_torch=enable_torch,
+            enable_nvtx=enable_nvtx,
+        )
+        scheduler.inbox.put(command)
+
+        def _wait() -> dict[str, Any]:
+            try:
+                return result_queue.get(timeout=timeout_s)
+            except _queue_mod.Empty as exc:
+                raise TimeoutError(
+                    f"stage {self.name} scheduler profiler {action} timed out "
+                    f"after {timeout_s}s"
+                ) from exc
+
+        return await asyncio.to_thread(_wait)
+
+    async def _collect_follower_profiler_targets(
+        self,
+        op_id: str,
+        *,
+        timeout_s: float,
+    ) -> list[dict[str, Any]]:
+        if self.role != "leader" or self._tp_fanout is None:
+            return []
+        results = await self._tp_fanout.collect_profiler_results(
+            op_id,
+            timeout_s=timeout_s,
+        )
+        targets: list[dict[str, Any]] = []
+        for result in results:
+            targets.extend(result.targets)
+        return targets
+
+    def _base_profiler_target(self, action: str) -> dict[str, Any]:
+        rank = None
+        try:
+            rank = int(os.environ.get("RANK", "0"))
+        except ValueError:
+            pass
+        return {
+            "stage": self.name,
+            "role": self.role,
+            "rank": rank,
+            "pid": os.getpid(),
+            "owner_tid": threading.get_native_id(),
+            "owner_thread": threading.current_thread().name,
+            "action": action,
+            "success": False,
+        }
+
+    def _failed_profiler_target(self, action: str, error: str) -> dict[str, Any]:
+        return {
+            **self._base_profiler_target(action),
+            "status": "failed",
+            "error": error,
+        }
 
     def _on_background_task_done(self, task: asyncio.Task, label: str) -> None:
         if task.cancelled():

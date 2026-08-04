@@ -153,6 +153,8 @@ async def run_asr_seedtts_once(
     warmup: int = 0,
     disable_tqdm: bool = True,
     stream: bool = False,
+    request_rate: float = float("inf"),
+    request_rate_seed: int | None = None,
 ) -> dict:
     """Run one SeedTTS ASR benchmark pass and return WER/speed/worker metrics."""
     before = _fetch_worker_snapshot(host, port)
@@ -163,6 +165,8 @@ async def run_asr_seedtts_once(
         model_path=model_path,
         lang=lang,
         concurrency=concurrency,
+        request_rate=request_rate,
+        request_rate_seed=request_rate_seed,
         warmup=warmup,
         disable_tqdm=disable_tqdm,
         stream=stream,

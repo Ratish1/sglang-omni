@@ -35,7 +35,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from sglang_omni.client import Client
 from sglang_omni.config import PipelineConfig
@@ -199,15 +199,23 @@ class StartReq(BaseModel):
     config: dict[str, Any] | None = None
     event_dir: str | None = None
     enable_torch: bool = True
+    enable_nvtx: bool = False
+    stages: list[str] | None = None
+    torch_owner: str = "scheduler"
+    timeout_s: float = Field(default=120.0, gt=0)
 
 
 class StopReq(BaseModel):
     run_id: str | None = None
+    stages: list[str] | None = None
+    timeout_s: float = Field(default=120.0, gt=0)
 
 
 class StartRequestProfileReq(BaseModel):
     run_id: str | None = None
     event_dir: str | None = None
+    stages: list[str] | None = None
+    timeout_s: float = Field(default=120.0, gt=0)
 
 
 def _default_event_dir(profiler_dir: str, run_id: str) -> str:
@@ -223,8 +231,21 @@ def _mount_profiler_routes(
     async def start(req: StartReq):
         run_id = req.run_id or _default_run_id()
         event_dir = req.event_dir
+        coordinator_recorder = _get_event_recorder()
         if event_dir is None and profiler_dir is not None:
             event_dir = _default_event_dir(profiler_dir, run_id)
+        if (
+            event_dir is not None
+            and coordinator_recorder.is_active()
+            and coordinator_recorder.active_run_id() != run_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "coordinator event recorder is already active for "
+                    f"run_id={coordinator_recorder.active_run_id()}"
+                ),
+            )
         if req.enable_torch:
             if req.trace_path_template is not None:
                 tpl = req.trace_path_template
@@ -248,28 +269,58 @@ def _mount_profiler_routes(
                     ),
                 )
             tpl = req.trace_path_template or ""
-        if event_dir is not None:
-            try:
-                _get_event_recorder().start(
-                    run_id=run_id, event_dir=event_dir, stage="coordinator"
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to start coordinator request event recorder",
-                    exc_info=True,
-                )
-        await profiler_ctl.broadcast_start(
+        manifest = await profiler_ctl.broadcast_start(
             run_id=run_id,
             trace_path_template=tpl,
             config=req.config,
+            stages=req.stages,
             event_dir=event_dir,
             enable_torch=req.enable_torch,
+            enable_nvtx=req.enable_nvtx,
+            torch_owner=req.torch_owner,
+            timeout_s=req.timeout_s,
         )
+        if not manifest["success"]:
+            # Best-effort rollback of targets that did arm.  The failed
+            # manifest remains in the HTTP detail for diagnosis.
+            try:
+                await profiler_ctl.broadcast_stop(
+                    run_id=run_id,
+                    stages=req.stages,
+                    timeout_s=req.timeout_s,
+                )
+            except Exception:
+                logger.warning("Profiler start rollback failed", exc_info=True)
+            raise HTTPException(status_code=503, detail=manifest)
+        coordinator_event_path = None
+        if event_dir is not None:
+            try:
+                coordinator_event_path = coordinator_recorder.start(
+                    run_id=run_id,
+                    event_dir=event_dir,
+                    stage="coordinator",
+                )
+            except Exception:
+                try:
+                    await profiler_ctl.broadcast_stop(
+                        run_id=run_id,
+                        stages=req.stages,
+                        timeout_s=req.timeout_s,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Profiler coordinator-start rollback failed",
+                        exc_info=True,
+                    )
+                raise
         return {
             "run_id": run_id,
             "trace_path_template": tpl,
             "event_dir": event_dir,
             "enable_torch": req.enable_torch,
+            "enable_nvtx": req.enable_nvtx,
+            "coordinator_event_path": coordinator_event_path,
+            "manifest": manifest,
         }
 
     @router.post("/start_request_profile")
@@ -277,6 +328,18 @@ def _mount_profiler_routes(
         """Start request-level (JSONL) event profiling only (no torch trace)."""
         run_id = req.run_id or _default_run_id()
         event_dir = req.event_dir
+        coordinator_recorder = _get_event_recorder()
+        if (
+            coordinator_recorder.is_active()
+            and coordinator_recorder.active_run_id() != run_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "coordinator event recorder is already active for "
+                    f"run_id={coordinator_recorder.active_run_id()}"
+                ),
+            )
         if event_dir is None:
             if profiler_dir is None:
                 raise HTTPException(
@@ -287,22 +350,41 @@ def _mount_profiler_routes(
                     ),
                 )
             event_dir = _default_event_dir(profiler_dir, run_id)
-        try:
-            _get_event_recorder().start(
-                run_id=run_id, event_dir=event_dir, stage="coordinator"
-            )
-        except Exception:
-            logger.warning(
-                "Failed to start coordinator request event recorder",
-                exc_info=True,
-            )
-        await profiler_ctl.broadcast_start(
+        manifest = await profiler_ctl.broadcast_start(
             run_id=run_id,
             trace_path_template="",
+            stages=req.stages,
             event_dir=event_dir,
             enable_torch=False,
+            timeout_s=req.timeout_s,
         )
-        return {"run_id": run_id, "event_dir": event_dir}
+        if not manifest["success"]:
+            raise HTTPException(status_code=503, detail=manifest)
+        try:
+            coordinator_event_path = coordinator_recorder.start(
+                run_id=run_id,
+                event_dir=event_dir,
+                stage="coordinator",
+            )
+        except Exception:
+            try:
+                await profiler_ctl.broadcast_stop(
+                    run_id=run_id,
+                    stages=req.stages,
+                    timeout_s=req.timeout_s,
+                )
+            except Exception:
+                logger.warning(
+                    "Request-profiler coordinator-start rollback failed",
+                    exc_info=True,
+                )
+            raise
+        return {
+            "run_id": run_id,
+            "event_dir": event_dir,
+            "coordinator_event_path": coordinator_event_path,
+            "manifest": manifest,
+        }
 
     @router.post("/stop_profile")
     async def stop(req: StopReq):
@@ -310,10 +392,22 @@ def _mount_profiler_routes(
         run_id = req.run_id
         recorder = _get_event_recorder()
         active = recorder.active_run_id() if recorder.is_active() else None
+        manifest = await profiler_ctl.broadcast_stop(
+            run_id=run_id,
+            stages=req.stages,
+            timeout_s=req.timeout_s,
+        )
+        coordinator_event_path = None
         if recorder.is_active() and (run_id is None or active == run_id):
-            recorder.stop(run_id=active)
-        await profiler_ctl.broadcast_stop(run_id=run_id)
-        return {"run_id": run_id or active}
+            coordinator_event_path = recorder.stop(run_id=active)
+        response = {
+            "run_id": run_id or active,
+            "coordinator_event_path": coordinator_event_path,
+            "manifest": manifest,
+        }
+        if not manifest["success"]:
+            raise HTTPException(status_code=503, detail=response)
+        return response
 
     @router.post("/stop_request_profile")
     async def stop_request(req: StopReq):
@@ -321,10 +415,22 @@ def _mount_profiler_routes(
         run_id = req.run_id
         recorder = _get_event_recorder()
         active = recorder.active_run_id() if recorder.is_active() else None
+        manifest = await profiler_ctl.broadcast_stop(
+            run_id=run_id,
+            stages=req.stages,
+            timeout_s=req.timeout_s,
+        )
+        coordinator_event_path = None
         if recorder.is_active() and (run_id is None or active == run_id):
-            recorder.stop(run_id=active)
-        await profiler_ctl.broadcast_stop(run_id=run_id)
-        return {"run_id": run_id or active}
+            coordinator_event_path = recorder.stop(run_id=active)
+        response = {
+            "run_id": run_id or active,
+            "coordinator_event_path": coordinator_event_path,
+            "manifest": manifest,
+        }
+        if not manifest["success"]:
+            raise HTTPException(status_code=503, detail=response)
+        return response
 
     app.include_router(router)
 
@@ -375,6 +481,7 @@ async def _run_server(
         len(gpu_ids),
     )
 
+    profiler_ctl: ProfilerControlClient | None = None
     try:
         cl_kwargs = client_kwargs or {}
         client = Client(coordinator, **cl_kwargs)
@@ -415,6 +522,8 @@ async def _run_server(
         await _serve_with_failure_watch(server, [mp_runner.wait_failed()])
     finally:
         logger.info("Shutting down pipeline …")
+        if profiler_ctl is not None:
+            await profiler_ctl.close()
         await mp_runner.stop()
         logger.info("Pipeline stopped.")
 

@@ -6,12 +6,14 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import logging
+import os
 import queue
 import threading
 import time
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from itertools import count
 from typing import Any, Generic, TypeVar
 
 ItemT = TypeVar("ItemT")
@@ -26,6 +28,10 @@ class QueueEntry(Generic[ItemT]):
     item: ItemT
     future: concurrent.futures.Future[Any]
     enqueued_at: float | None = None
+    request_id: str | None = None
+    stage: str | None = None
+    entry_id: str | None = None
+    batch_id: str | None = None
 
 
 class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
@@ -33,6 +39,7 @@ class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
 
     def __init__(self, *, worker_name: str) -> None:
         self._queue: queue.Queue[Any] = queue.Queue()
+        self._entry_ids = count(1)
         self._worker_state_lock = threading.Lock()
         self._worker_error: Exception | None = None
         self._thread = threading.Thread(
@@ -47,7 +54,26 @@ class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
         item: ItemT,
         future: concurrent.futures.Future[Any],
     ) -> None:
-        self._queue.put(QueueEntry(item=item, future=future))
+        self._queue.put(self._new_entry(item, future))
+
+    def _new_entry(
+        self,
+        item: ItemT,
+        future: concurrent.futures.Future[Any],
+    ) -> QueueEntry[ItemT]:
+        model_data = getattr(item, "model_specific_data", None)
+        model_data = model_data if isinstance(model_data, dict) else {}
+        return QueueEntry(
+            item=item,
+            future=future,
+            enqueued_at=time.perf_counter(),
+            request_id=(
+                getattr(item, "_omni_request_id", None)
+                or model_data.get("_omni_request_id")
+            ),
+            stage=(getattr(item, "_omni_stage", None) or model_data.get("_omni_stage")),
+            entry_id=f"{os.getpid()}:{next(self._entry_ids)}",
+        )
 
     def _submit(
         self,

@@ -27,6 +27,7 @@ class RunConfig:
     warmup: int = 1
     disable_tqdm: bool = False
     timeout_s: int = 300
+    request_rate_seed: int | None = None
 
 
 class BenchmarkRunner:
@@ -98,9 +99,10 @@ class BenchmarkRunner:
 
         try:
             tasks: list[asyncio.Task] = []
+            rng = np.random.default_rng(self.config.request_rate_seed)
             for sample in samples:
                 if self.config.request_rate != float("inf"):
-                    interval = np.random.exponential(1.0 / self.config.request_rate)
+                    interval = rng.exponential(1.0 / self.config.request_rate)
                     await asyncio.sleep(interval)
                 tasks.append(asyncio.create_task(_limited(sample)))
 

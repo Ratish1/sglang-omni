@@ -19,6 +19,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+from sglang_omni.profiler.event_recorder import get_active_stage
+from sglang_omni.profiler.trace_ranges import profile_span
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
@@ -201,8 +203,24 @@ def make_fun_asr_scheduler_adapters(
 
     def request_builder(payload: StagePayload) -> FunASRRequestData:
         params = payload.request.params or {}
-        audio = _load_audio(_audio_source_from_payload(payload))
-        audio_duration_s = float(len(audio) / _SAMPLE_RATE)
+        request_id = payload.request_id
+        stage = get_active_stage()
+        audio_metadata: dict[str, Any] = {}
+        with profile_span(
+            request_id=request_id,
+            stage=stage,
+            name="request_build.audio_load",
+            metadata=audio_metadata,
+        ):
+            audio = _load_audio(_audio_source_from_payload(payload))
+            audio_duration_s = float(len(audio) / _SAMPLE_RATE)
+            audio_metadata.update(
+                {
+                    "samples": len(audio),
+                    "duration_s": audio_duration_s,
+                    "sample_rate": _SAMPLE_RATE,
+                }
+            )
         if audio_duration_s > _MAX_AUDIO_DURATION_S:
             raise ValueError(
                 "Fun-ASR accepts audio up to 30.0 seconds because its official "
@@ -210,21 +228,35 @@ def make_fun_asr_scheduler_adapters(
             )
         fingerprint = audio_fingerprint(audio)
 
-        extracted = feature_extractor(
-            audio,
-            sampling_rate=_SAMPLE_RATE,
-            return_tensors="pt",
-            return_attention_mask=True,
-            padding="longest",
-        )
-        features = extracted["input_features"]  # [1, 560, T_lfr]
-        feature_attention_mask = extracted.get("attention_mask")
-        if feature_attention_mask is None:
-            feature_attention_mask = torch.ones(
-                (features.shape[0], features.shape[-1]), dtype=torch.long
+        feature_metadata: dict[str, Any] = {}
+        with profile_span(
+            request_id=request_id,
+            stage=stage,
+            name="request_build.feature_extract",
+            metadata=feature_metadata,
+        ):
+            extracted = feature_extractor(
+                audio,
+                sampling_rate=_SAMPLE_RATE,
+                return_tensors="pt",
+                return_attention_mask=True,
+                padding="longest",
             )
-        num_lfr_frames = int(feature_attention_mask.sum().item())
-        num_audio_tokens = int(fun_asr_low_frame_rate_length(num_lfr_frames))
+            features = extracted["input_features"]  # [1, 560, T_lfr]
+            feature_attention_mask = extracted.get("attention_mask")
+            if feature_attention_mask is None:
+                feature_attention_mask = torch.ones(
+                    (features.shape[0], features.shape[-1]), dtype=torch.long
+                )
+            num_lfr_frames = int(feature_attention_mask.sum().item())
+            num_audio_tokens = int(fun_asr_low_frame_rate_length(num_lfr_frames))
+            feature_metadata.update(
+                {
+                    "lfr_frames": num_lfr_frames,
+                    "audio_tokens": num_audio_tokens,
+                    "feature_shape": list(features.shape),
+                }
+            )
         logger.debug(
             f"[fun-asr] lfr_frames={num_lfr_frames} "
             f"num_audio_tokens={num_audio_tokens} feat_shape={tuple(features.shape)}"
@@ -240,8 +272,19 @@ def make_fun_asr_scheduler_adapters(
             hotwords = [hotwords_raw]
         else:
             hotwords = list(hotwords_raw)
-        prompt_text = _build_prompt_text(language, itn, hotwords)
-        input_ids = _build_prompt_ids(num_audio_tokens, prompt_text)
+        tokenize_metadata: dict[str, Any] = {
+            "audio_tokens": num_audio_tokens,
+            "hotwords": len(hotwords),
+        }
+        with profile_span(
+            request_id=request_id,
+            stage=stage,
+            name="request_build.tokenize_and_pack",
+            metadata=tokenize_metadata,
+        ):
+            prompt_text = _build_prompt_text(language, itn, hotwords)
+            input_ids = _build_prompt_ids(num_audio_tokens, prompt_text)
+            tokenize_metadata["prompt_tokens"] = len(input_ids)
 
         audio_item = MultimodalDataItem(
             modality=Modality.AUDIO,
@@ -251,6 +294,8 @@ def make_fun_asr_scheduler_adapters(
                 "feature_attention_mask": feature_attention_mask,
                 "audio_fingerprint": fingerprint,
                 "num_audio_tokens": num_audio_tokens,
+                "_omni_request_id": request_id,
+                "_omni_stage": stage,
             },
         )
 
@@ -305,7 +350,16 @@ def make_fun_asr_scheduler_adapters(
         sampling_params.normalize(tokenizer=None)
 
         if audio_encoder_service is not None:
-            audio_encoder_service.encode_item(audio_item)
+            with profile_span(
+                request_id=request_id,
+                stage=stage,
+                name="request_build.pre_lm_wait",
+                metadata={
+                    "audio_tokens": num_audio_tokens,
+                    "duration_s": audio_duration_s,
+                },
+            ):
+                audio_encoder_service.encode_item(audio_item)
 
         req = Req(
             rid=payload.request_id,

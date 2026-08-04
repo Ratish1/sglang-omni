@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +17,7 @@ from sglang_omni.models.fun_asr.encoder_service import (
     _expected_audio_tokens,
     build_cache_namespace,
 )
+from sglang_omni.profiler.event_recorder import get_recorder
 
 _HIDDEN_SIZE = 4
 _NAMESPACE = "testns"
@@ -115,6 +118,39 @@ def test_encode_attaches_lm_ready_embedding_and_clears_feature() -> None:
     assert model.encode_calls == 1
     assert model.grad_enabled_during_encode is False
     assert service.stats()["misses"] == 1
+
+
+def test_encode_emits_correlated_queue_and_batch_events(tmp_path: Path) -> None:
+    recorder = get_recorder()
+    path = recorder.start(run_id="run", event_dir=str(tmp_path), stage="asr")
+    service = _make_service()
+    item = _item(7, 3)
+    item._omni_request_id = "request-7"
+    item._omni_stage = "asr"
+    try:
+        service.encode_item(item)
+    finally:
+        recorder.stop(run_id="run")
+
+    events = [
+        json.loads(line)
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    names = {event["event_name"] for event in events}
+    assert {
+        "pre_lm_cache_miss",
+        "pre_lm_enqueue",
+        "pre_lm_dequeue",
+        "pre_lm_batch_start",
+        "pre_lm_batch_end",
+    } <= names
+    assert {event["request_id"] for event in events} == {"request-7"}
+    batch_events = [
+        event for event in events if event["event_name"] == "pre_lm_batch_end"
+    ]
+    assert batch_events[0]["metadata"]["batch_id"]
+    assert batch_events[0]["metadata"]["status"] == "ok"
 
 
 def test_close_stops_worker() -> None:

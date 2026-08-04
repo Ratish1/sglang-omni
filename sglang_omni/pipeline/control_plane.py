@@ -15,6 +15,7 @@ from sglang_omni.proto import (
     CompleteMessage,
     DataAckMessage,
     DataReadyMessage,
+    ProfilerResultMessage,
     ProfilerStartMessage,
     ProfilerStopMessage,
     ShutdownMessage,
@@ -37,6 +38,7 @@ ControlMessage = (
     | SubmitMessage
     | ProfilerStartMessage
     | ProfilerStopMessage
+    | ProfilerResultMessage
 )
 
 
@@ -320,6 +322,21 @@ class StageControlPlane:
         if self._coordinator_socket is None:
             raise RuntimeError("Control plane not started")
         await self._coordinator_socket.send(msg)
+
+    async def send_profiler_result(
+        self,
+        msg: ProfilerResultMessage,
+        reply_endpoint: str,
+    ) -> None:
+        """Send an acknowledged profiler result to its operation owner."""
+        if not reply_endpoint:
+            raise ValueError("profiler reply_endpoint is required")
+        sock = PushSocket(reply_endpoint)
+        await sock.connect()
+        try:
+            await sock.send(msg)
+        finally:
+            sock.close()
 
     async def recv_abort(self) -> AbortMessage:
         """Receive abort broadcast (blocking).

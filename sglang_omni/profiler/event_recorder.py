@@ -68,6 +68,9 @@ class RequestEvent:
     timestamp_ns: int
     run_id: str | None = None
     pid: int | None = None
+    native_tid: int | None = None
+    thread_name: str | None = None
+    monotonic_ns: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -97,6 +100,18 @@ class RequestEventRecorder:
 
     def active_path(self) -> str | None:
         return None if self._path is None else str(self._path)
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return lifecycle and drop state for profiler acknowledgements."""
+        with self._lock:
+            return {
+                "active": self._fp is not None,
+                "run_id": self._run_id,
+                "path": None if self._path is None else str(self._path),
+                "pid": self._pid,
+                "stages": sorted(self._stages),
+                "dropped_events": self._dropped,
+            }
 
     def start(self, run_id: str, event_dir: str, stage: str) -> str:
         """Open (or join) the per-process JSONL file for ``run_id``.
@@ -188,6 +203,9 @@ class RequestEventRecorder:
         if self._fp is None:
             return
         ts = timestamp_ns if timestamp_ns is not None else time.time_ns()
+        monotonic_ns = time.monotonic_ns()
+        native_tid = threading.get_native_id()
+        thread_name = threading.current_thread().name
         with self._lock:
             fp = self._fp
             if fp is None:
@@ -203,6 +221,9 @@ class RequestEventRecorder:
                 timestamp_ns=ts,
                 run_id=self._run_id,
                 pid=self._pid,
+                native_tid=native_tid,
+                thread_name=thread_name,
+                monotonic_ns=monotonic_ns,
                 metadata=dict(metadata) if metadata else {},
             )
             try:

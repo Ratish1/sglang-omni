@@ -26,8 +26,11 @@ JSONL file. The shape:
   "stage": "thinker",
   "event_name": "scheduler_first_emit",
   "timestamp_ns": 1717000000123456789,
+  "monotonic_ns": 123456789,
   "run_id": "demo-run",
   "pid": 42,
+  "native_tid": 314,
+  "thread_name": "scheduler-thinker",
   "metadata": {"chunk_id": 0}
 }
 ```
@@ -117,20 +120,26 @@ clears both the thread-local slot and the contextvar.
 
 ## Lifecycle
 
-The recorder is process-local. It is started on every stage and on the
-coordinator when `POST /start_profile` (or `POST /start_request_profile`)
-is hit:
+The recorder is process-local. Profiler lifecycle operations are
+acknowledged: an HTTP start does not return success until every selected
+stage and TP rank has started, and stop does not return success until every
+selected target has stopped and finalized its artifacts.
 
 1. Launcher receives the HTTP request.
-2. Coordinator starts its local recorder pointed at `<event_dir>`.
-3. Launcher broadcasts `ProfilerStartMessage` over ZMQ to every stage,
-   carrying both the torch trace template and the `event_dir`.
-4. Each stage joins the per-process recorder. In a shared-process topology
+2. Launcher sends an operation ID, reply endpoint, selected stages, trace
+   configuration, and `event_dir` to those stages.
+3. Every stage and TP rank queues the torch/NVTX lifecycle command onto its
+   scheduler inbox. Start, semantic `step()`, and stop therefore execute on
+   the same scheduler thread.
+4. After scheduler-owned profiling is armed, each stage joins the
+   per-process recorder. In a shared-process topology
    the first stage to call `start()` wins the filename; every subsequent
    stage in the same process writes to the same file and the per-event
    `stage` field disambiguates.
-5. On `POST /stop_profile`, the recorder is closed everywhere; files
-   remain on disk under `<event_dir>`.
+5. The coordinator recorder starts only after all selected stage
+   acknowledgements succeed. A partial start is rolled back.
+6. Stop first flushes any pending asynchronous model step, finalizes trace
+   export/compression, closes event files, and returns a per-rank manifest.
 
 `POST /stop_profile` and `POST /stop_request_profile` accept an optional
 `run_id` field. When **omitted**, the request is a wildcard: every stage
@@ -182,33 +191,48 @@ reconstructed even when each stage runs in its own process.
 ## Torch profiler
 
 The torch profiler runs alongside the event recorder when
-`enable_torch=true` (the default for `/start_profile`). It records
-continuously between `start()` and `stop()` — no `schedule(...)`, no
-`step()` requirement — and exports a Chrome trace `*.trace.json.gz` on stop.
+`enable_torch=true` (the default for `/start_profile`). It uses a bounded
+Kineto schedule advanced exactly once per non-empty scheduler batch. Defaults
+are one wait step, one warmup step, and twenty active steps. Every semantic
+step emits a scheduler-owner canary into the trace. Stop reports actual and
+expected step counts, schedule completion, owner TID, export errors, and the
+final trace path.
 
-The expensive introspection flags are opt-in via env vars so the default
-trace stays small enough to load in `chrome://tracing` or
-[`ui.perfetto.dev`](https://ui.perfetto.dev):
+Configuration is supplied in the start request:
 
-| Env var | Effect |
-|---|---|
-| `SGLANG_TORCH_PROFILER_RECORD_SHAPES=1` | Record input tensor shapes per op |
-| `SGLANG_TORCH_PROFILER_PROFILE_MEMORY=1` | Track every CUDA caching-allocator alloc / free |
-| `SGLANG_TORCH_PROFILER_WITH_STACK=1` | Record the Python (and C++) call stack per op |
-| `SGLANG_TORCH_PROFILER_WITH_FLOPS=1` | Estimate FLOPs per op |
+```json
+{
+  "wait_steps": 1,
+  "warmup_steps": 1,
+  "active_steps": 20,
+  "repeat": 1,
+  "include_cuda": true,
+  "record_shapes": false,
+  "profile_memory": false,
+  "with_stack": false,
+  "with_flops": false,
+  "compress": true
+}
+```
 
-With all four off (the default), a typical 10-sample MMMU run produces a
-trace in the tens of MB. With all four on, the same workload can produce a
-multi-GB trace — only opt in when you need that specific information.
+Shape, memory, stack, and FLOP collection remain off by default because they
+can materially alter runtime and trace size. Chrome JSON export can occur
+when the active window completes; gzip compression is deferred to
+acknowledged stop so compression cannot consume scheduler CPU during the
+following serving window.
+
+Only one process-global Kineto owner is permitted at a time. Select one stage
+per process for torch or NVTX capture. Event-only profiling can cover all
+stages.
 
 ## HTTP surface
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/start_profile` | `{"run_id": ?, "trace_path_template": ?, "event_dir": ?, "enable_torch": true \| false, "config": ?}` | Starts torch trace + event recorder. `run_id` auto-generated if omitted. |
-| POST | `/stop_profile` | `{"run_id": ?}` | Stops torch trace + event recorder. Omitting `run_id` is a wildcard ("stop whatever's active"). |
-| POST | `/start_request_profile` | `{"run_id": ?, "event_dir": ?}` | Event recorder only — no torch trace. Lower overhead; safer to leave on. |
-| POST | `/stop_request_profile` | `{"run_id": ?}` | Same wildcard semantics as `/stop_profile`. |
+| POST | `/start_profile` | `{"run_id": ?, "stages": ["thinker"], "trace_path_template": ?, "event_dir": ?, "enable_torch": true, "enable_nvtx": false, "torch_owner": "scheduler", "config": ?, "timeout_s": 120}` | Starts an acknowledged bounded trace and event recorder. `run_id` auto-generated if omitted. |
+| POST | `/stop_profile` | `{"run_id": ?, "stages": ["thinker"], "timeout_s": 120}` | Flushes, stops, finalizes, and returns a per-stage/per-rank manifest. Omitting `run_id` is a wildcard. |
+| POST | `/start_request_profile` | `{"run_id": ?, "event_dir": ?, "stages": ?, "timeout_s": 120}` | Acknowledged event-only recording. |
+| POST | `/stop_request_profile` | `{"run_id": ?, "stages": ?, "timeout_s": 120}` | Same wildcard and acknowledgement semantics. |
 
 Example: record cheap events on every request without a kernel trace:
 
@@ -219,6 +243,10 @@ curl -X POST http://localhost:8000/start_request_profile \
 curl -X POST http://localhost:8000/stop_request_profile -d '{}'
 python -m sglang_omni.profiler /tmp/profiles/demo/events --format table
 ```
+
+For the Fun-ASR CPU-saturation experiment, use the reproducible harness and
+artifact gates in `benchmarks/profiling/README.md` rather than hand-timing
+these endpoints.
 
 ## Discipline
 

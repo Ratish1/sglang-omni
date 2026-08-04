@@ -90,6 +90,9 @@ def test_start_writes_jsonl_per_pid_stage(tmp_path: Path) -> None:
     assert events[0]["event_name"] == "encoder_start"
     assert events[0]["run_id"] == "r0"
     assert events[0]["pid"] is not None
+    assert events[0]["native_tid"] is not None
+    assert events[0]["thread_name"] == threading.current_thread().name
+    assert events[0]["monotonic_ns"] is not None
     assert events[1]["metadata"] == {"items": 3}
 
 

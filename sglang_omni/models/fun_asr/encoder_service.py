@@ -8,15 +8,19 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import queue
 import threading
 import time
 from collections.abc import Iterator
+from itertools import count
 from typing import Any, cast
 
 import torch
 from sglang.srt.managers.schedule_batch import MultimodalInputFormat
 
+from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.trace_ranges import trace_range
 from sglang_omni.scheduling.pre_lm_encoder import PreLMEncoderService, QueueEntry
 from sglang_omni.scheduling.stage_cache import StageOutputCache
 
@@ -118,6 +122,7 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
         self._queue_wait_total_s = 0.0
         self._queue_wait_max_s = 0.0
         self._encoder_time_s = 0.0
+        self._profile_batch_ids = count(1)
         super().__init__(worker_name="fun-asr-audio-encode")
 
     def close(self) -> None:
@@ -137,12 +142,16 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("Fun-ASR pre-LM encoder service is closed")
-            self._queue.put(
-                QueueEntry(
-                    item=item,
-                    future=future,
-                    enqueued_at=time.perf_counter(),
-                )
+            entry = self._new_entry(item, future)
+            self._queue.put(entry)
+            _emit_event(
+                request_id=entry.request_id or "__pre_lm__",
+                stage=entry.stage,
+                event_name="pre_lm_enqueue",
+                metadata={
+                    "entry_id": entry.entry_id,
+                    "queue_depth": self._queue.qsize(),
+                },
             )
 
     def encode_item(self, item: Any) -> None:
@@ -158,8 +167,15 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                 "Fun-ASR pre-LM encode requires the item's num_audio_tokens"
             )
         key = self._cache_key(item)
+        request_id, stage = self._profile_identity(item)
 
         if key is None:
+            _emit_event(
+                request_id=request_id,
+                stage=stage,
+                event_name="pre_lm_cache_miss",
+                metadata={"cacheable": False},
+            )
             future = self._submit(item)
             future.result(timeout=self.ENCODE_TIMEOUT_S)
             return
@@ -169,6 +185,11 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
             if self._is_valid(cached, expected_tokens):
                 with self._lock:
                     self._hits += 1
+                _emit_event(
+                    request_id=request_id,
+                    stage=stage,
+                    event_name="pre_lm_cache_hit",
+                )
                 self.attach_embedding(item, cached)
                 return
             logger.warning(
@@ -194,6 +215,12 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                     self._inflight[key] = future
                     leader = True
                     self._misses += 1
+                    _emit_event(
+                        request_id=request_id,
+                        stage=stage,
+                        event_name="pre_lm_cache_miss",
+                        metadata={"cacheable": True},
+                    )
                     try:
                         self._submit(item, future)
                     except Exception:
@@ -201,7 +228,18 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                         raise
             else:
                 self._merged += 1
+                _emit_event(
+                    request_id=request_id,
+                    stage=stage,
+                    event_name="pre_lm_singleflight_merged",
+                )
         if cached is not None:
+            _emit_event(
+                request_id=request_id,
+                stage=stage,
+                event_name="pre_lm_cache_hit",
+                metadata={"rechecked_under_lock": True},
+            )
             self.attach_embedding(item, cached)
             return
         try:
@@ -258,6 +296,18 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
             return None
         return f"{self._namespace}:{item_hash}"
 
+    @staticmethod
+    def _profile_identity(item: Any) -> tuple[str, str | None]:
+        model_data = getattr(item, "model_specific_data", None)
+        model_data = model_data if isinstance(model_data, dict) else {}
+        request_id = (
+            getattr(item, "_omni_request_id", None)
+            or model_data.get("_omni_request_id")
+            or "__pre_lm__"
+        )
+        stage = getattr(item, "_omni_stage", None) or model_data.get("_omni_stage")
+        return str(request_id), stage
+
     def _is_valid(self, embedding: Any, expected_tokens: int) -> bool:
         return (
             isinstance(embedding, torch.Tensor)
@@ -310,7 +360,8 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                     yield
 
     def encode_batch(self, items: list[Any]) -> torch.Tensor:
-        return self._model.get_audio_feature(items)
+        with trace_range("pre_lm.encode"):
+            return self._model.get_audio_feature(items)
 
     def split_embeddings(
         self,
@@ -336,12 +387,14 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                 f"({embedding.dtype}) != expected rows "
                 f"{sum(token_counts)}x{self._hidden_size} ({self._dtype})"
             )
-        parts = torch.split(embedding, token_counts, dim=0)
-        return [part.clone() for part in parts]
+        with trace_range("pre_lm.split_embeddings"):
+            parts = torch.split(embedding, token_counts, dim=0)
+            return [part.clone() for part in parts]
 
     def synchronize_batch(self) -> None:
         if self._stream is not None:
-            self._stream.synchronize()
+            with trace_range("pre_lm.synchronize"):
+                self._stream.synchronize()
 
     def cache_embedding(self, item: Any, embedding: torch.Tensor) -> None:
         key = self._cache_key(item)
@@ -359,6 +412,9 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
 
     def _on_batch_start(self, batch: list[QueueEntry[Any]]) -> None:
         dequeue_time = time.perf_counter()
+        batch_id = f"{os.getpid()}:{next(self._profile_batch_ids)}"
+        for entry in batch:
+            entry.batch_id = batch_id
         queue_waits = [
             dequeue_time - entry.enqueued_at
             for entry in batch
@@ -371,6 +427,31 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                 self._queue_wait_max_s,
                 max(queue_waits, default=0.0),
             )
+        for entry in batch:
+            queue_wait_s = (
+                dequeue_time - entry.enqueued_at
+                if entry.enqueued_at is not None
+                else None
+            )
+            metadata = {
+                "entry_id": entry.entry_id,
+                "batch_id": batch_id,
+                "batch_size": len(batch),
+                "queue_wait_s": queue_wait_s,
+                "queue_depth": self._queue.qsize(),
+            }
+            _emit_event(
+                request_id=entry.request_id or "__pre_lm__",
+                stage=entry.stage,
+                event_name="pre_lm_dequeue",
+                metadata=metadata,
+            )
+            _emit_event(
+                request_id=entry.request_id or "__pre_lm__",
+                stage=entry.stage,
+                event_name="pre_lm_batch_start",
+                metadata=metadata,
+            )
 
     def _on_batch_finished(
         self,
@@ -379,6 +460,20 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
         retry_recovered: int | None,
         elapsed_s: float,
     ) -> None:
+        for entry in batch:
+            _emit_event(
+                request_id=entry.request_id or "__pre_lm__",
+                stage=entry.stage,
+                event_name="pre_lm_batch_end",
+                metadata={
+                    "entry_id": entry.entry_id,
+                    "batch_id": entry.batch_id,
+                    "batch_size": len(batch),
+                    "duration_s": elapsed_s,
+                    "status": "error" if batch_exc is not None else "ok",
+                    "retry_recovered": retry_recovered,
+                },
+            )
         with self._lock:
             self._encoder_time_s += elapsed_s
             if batch_exc is not None:

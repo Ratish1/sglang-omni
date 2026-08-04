@@ -434,6 +434,8 @@ async def run_asr_transcription(
     request_timeout_s: int = QWEN3_ASR_REQUEST_TIMEOUT_S,
     disable_tqdm: bool = True,
     stream: bool = False,
+    request_rate: float = float("inf"),
+    request_rate_seed: int | None = None,
 ) -> tuple[list[RequestResult], float]:
     """Transcribe samples against a running ASR router at one concurrency.
 
@@ -444,6 +446,8 @@ async def run_asr_transcription(
     runner = BenchmarkRunner(
         RunConfig(
             max_concurrency=concurrency,
+            request_rate=request_rate,
+            request_rate_seed=request_rate_seed,
             warmup=warmup,
             disable_tqdm=disable_tqdm,
             timeout_s=request_timeout_s,

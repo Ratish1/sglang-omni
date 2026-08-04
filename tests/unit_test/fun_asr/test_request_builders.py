@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,6 +14,7 @@ import sglang_omni.models.fun_asr.request_builders as request_builders
 from sglang_omni.models.fun_asr.tool_funcs.audio_lengths import (
     fun_asr_low_frame_rate_length,
 )
+from sglang_omni.profiler.event_recorder import get_recorder
 from sglang_omni.proto import OmniRequest, StagePayload
 
 _AUDIO_PAD = "<|object_ref_start|>"
@@ -134,6 +137,48 @@ def test_fun_asr_request_builder_records_inclusive_audio_offsets(monkeypatch) ->
         data.req.multimodal_inputs.mrope_positions[0],
         torch.arange(seq_len, dtype=torch.long),
     )
+
+
+def test_fun_asr_request_builder_emits_phase_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        request_builders,
+        "_load_audio",
+        lambda _source: np.zeros(1600, dtype=np.float32),
+    )
+    request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
+        tokenizer=_FakeTokenizer(),
+        max_new_tokens=16,
+        feature_extractor=_feature_extractor(17),
+    )
+    payload = StagePayload(
+        request_id="profiled-request",
+        request=OmniRequest(inputs={"audio_bytes": b"wav"}),
+        data={},
+    )
+    recorder = get_recorder()
+    path = recorder.start(run_id="run", event_dir=str(tmp_path), stage="asr")
+    try:
+        request_builder(payload)
+    finally:
+        recorder.stop(run_id="run")
+
+    events = [
+        json.loads(line)
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    names = {event["event_name"] for event in events}
+    for phase in (
+        "request_build.audio_load",
+        "request_build.feature_extract",
+        "request_build.tokenize_and_pack",
+    ):
+        assert f"{phase}_start" in names
+        assert f"{phase}_end" in names
+    assert {event["request_id"] for event in events} == {"profiled-request"}
 
 
 def test_fun_asr_request_builder_encodes_after_offsets_are_final(monkeypatch) -> None:

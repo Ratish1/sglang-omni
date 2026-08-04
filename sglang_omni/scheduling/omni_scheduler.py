@@ -14,6 +14,7 @@ inheriting from ``SGLangScheduler``.
 from __future__ import annotations
 
 import logging
+import os
 import queue as _queue_mod
 import threading
 import time
@@ -21,6 +22,7 @@ import types
 from array import array
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from itertools import islice
 from typing import Any, Callable
 
@@ -47,6 +49,12 @@ from sglang_omni.profiler.event_recorder import (
     emit_model_path_start as _emit_model_path_start,
 )
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
+from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
+from sglang_omni.profiler.event_recorder import (
+    reset_active_stage as _reset_active_stage,
+)
+from sglang_omni.profiler.event_recorder import set_active_stage as _set_active_stage
+from sglang_omni.profiler.trace_ranges import trace_range
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
@@ -59,6 +67,10 @@ from sglang_omni.proto.admin import (
     ADMIN_WEIGHTS_CHECKER,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.profiler_control import (
+    handle_profiler_message,
+    profiler_step,
+)
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
@@ -166,6 +178,8 @@ class OmniScheduler:
         are defined directly on this class and take precedence.
     """
 
+    supports_profiler_control = True
+
     def __init__(
         self,
         tp_worker: Any,
@@ -243,6 +257,7 @@ class OmniScheduler:
         self._pending_request_builds: dict[str, tuple[Any, bool, Future]] = {}
         self._backlogged_request_build_payloads: deque[Any] = deque()
         self._request_build_max_pending_observed = 0
+        self._profile_last_hol_emit_ns = 0
 
         # --- Core scheduling state (read/written by upstream methods) -----
         self.server_args = server_args
@@ -790,10 +805,23 @@ class OmniScheduler:
         return new_reqs
 
     def _recv_scheduler_messages(self) -> list[IncomingMessage]:
-        if self.tp_size == 1:
-            return self._drain_local_inbox()
+        # Profiler lifecycle is rank-local and thread-sensitive.  Consume the
+        # process-local command on every scheduler rank before broadcasting
+        # request messages from the TP entry rank.
+        local_msgs = self._drain_local_inbox()
+        recv_msgs: list[IncomingMessage] = []
+        for msg in local_msgs:
+            if handle_profiler_message(
+                msg,
+                before_stop=self._resolve_pending_async,
+            ):
+                continue
+            recv_msgs.append(msg)
 
-        recv_msgs = self._drain_local_inbox() if self.is_entry_rank else []
+        if self.tp_size == 1:
+            return recv_msgs
+
+        recv_msgs = recv_msgs if self.is_entry_rank else []
         return broadcast_pyobj(
             recv_msgs,
             self.tp_group.rank,
@@ -880,18 +908,22 @@ class OmniScheduler:
 
     def _run_request_builder(self, payload: Any, active_stage: str | None) -> Any:
         req_id = payload.request_id
-        _emit_event(
-            request_id=req_id,
-            stage=active_stage,
-            event_name="scheduler_request_build_start",
-        )
-        req_data = self._request_builder(payload)
-        _emit_event(
-            request_id=req_id,
-            stage=active_stage,
-            event_name="scheduler_request_build_end",
-        )
-        return req_data
+        token = _set_active_stage(active_stage)
+        try:
+            _emit_event(
+                request_id=req_id,
+                stage=active_stage,
+                event_name="scheduler_request_build_start",
+            )
+            req_data = self._request_builder(payload)
+            _emit_event(
+                request_id=req_id,
+                stage=active_stage,
+                event_name="scheduler_request_build_end",
+            )
+            return req_data
+        finally:
+            _reset_active_stage(token)
 
     def _stage_request_build_payloads(
         self, recv_reqs: list[Any]
@@ -960,6 +992,29 @@ class OmniScheduler:
                     iter(self._pending_request_builds.items())
                 )
                 if not future.done():
+                    now_ns = time.monotonic_ns()
+                    if (
+                        _get_recorder().is_active()
+                        and now_ns - self._profile_last_hol_emit_ns >= 10_000_000
+                    ):
+                        later_ready = sum(
+                            1
+                            for _, _, later_future in tuple(
+                                self._pending_request_builds.values()
+                            )[1:]
+                            if later_future.done()
+                        )
+                        if later_ready:
+                            self._profile_last_hol_emit_ns = now_ns
+                            _emit_event(
+                                request_id=req_id,
+                                stage=None,
+                                event_name=("scheduler_request_build_hol_blocked"),
+                                metadata={
+                                    "pending_builds": len(self._pending_request_builds),
+                                    "later_ready": later_ready,
+                                },
+                            )
                     return
                 self._pending_request_builds.pop(req_id, None)
                 if req_id in self._aborted_request_ids:
@@ -1193,7 +1248,8 @@ class OmniScheduler:
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         sched_output = self._build_sched_output(batch)
-        mr_output = self._model_runner.execute(sched_output)
+        with self._profile_batch_phase(batch, "scheduler.model_execute"):
+            mr_output = self._model_runner.execute(sched_output)
         self._emit_stream_output(sched_output, mr_output)
         return self._make_batch_result(mr_output)
 
@@ -1279,7 +1335,8 @@ class OmniScheduler:
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         sched_output = self._build_sched_output(batch)
-        pending_step = self._model_runner.execute_launch(sched_output)
+        with self._profile_batch_phase(batch, "scheduler.model_launch"):
+            pending_step = self._model_runner.execute_launch(sched_output)
         return sched_output, pending_step
 
     def _run_batch_resolve(self, batch, sched_output, pending_step, skip_rids=()):
@@ -1293,7 +1350,8 @@ class OmniScheduler:
         """
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
-        mr_output = self._model_runner.execute_resolve(pending_step)
+        with self._profile_batch_phase(batch, "scheduler.model_resolve"):
+            mr_output = self._model_runner.execute_resolve(pending_step)
         if mr_output is None:
             return _FAILED_BATCH_RESULT
         self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
@@ -1302,6 +1360,98 @@ class OmniScheduler:
             next_token_ids=mr_output.next_token_ids,
             can_run_cuda_graph=mr_output.can_run_cuda_graph,
         )
+
+    def _batch_profile_metadata(self, batch: Any) -> dict[str, Any]:
+        forward_mode = getattr(batch, "forward_mode", None)
+        return {
+            "batch_id": f"{os.getpid()}:{getattr(batch, 'forward_iter', 0)}",
+            "batch_size": len(getattr(batch, "reqs", ()) or ()),
+            "forward_iter": getattr(batch, "forward_iter", None),
+            "forward_mode": str(forward_mode),
+            "is_prefill_only": bool(getattr(batch, "is_prefill_only", False)),
+            "is_extend_in_batch": bool(getattr(batch, "is_extend_in_batch", False)),
+            "waiting_queue": len(self.waiting_queue),
+            "running_batch": len(getattr(self.running_batch, "reqs", ()) or ()),
+            "pending_request_builds": len(self._pending_request_builds),
+            "request_build_backlog": len(self._backlogged_request_build_payloads),
+        }
+
+    def _scheduler_profile_metadata(self) -> dict[str, Any]:
+        return {
+            "waiting_queue": len(self.waiting_queue),
+            "running_batch": len(getattr(self.running_batch, "reqs", ()) or ()),
+            "pending_request_builds": len(self._pending_request_builds),
+            "request_build_backlog": len(self._backlogged_request_build_payloads),
+            "inbox_depth": self.inbox.qsize(),
+        }
+
+    @contextmanager
+    def _profile_scheduler_phase(self, name: str):
+        events_active = _get_recorder().is_active()
+        start_ns = time.monotonic_ns()
+        if events_active:
+            _emit_event(
+                request_id="__scheduler__",
+                stage=None,
+                event_name=f"{name}_start",
+                metadata=self._scheduler_profile_metadata(),
+            )
+        status = "ok"
+        try:
+            with trace_range(name):
+                yield
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            if events_active:
+                _emit_event(
+                    request_id="__scheduler__",
+                    stage=None,
+                    event_name=f"{name}_end",
+                    metadata={
+                        **self._scheduler_profile_metadata(),
+                        "duration_ns": time.monotonic_ns() - start_ns,
+                        "status": status,
+                    },
+                )
+
+    @contextmanager
+    def _profile_batch_phase(self, batch: Any, name: str):
+        metadata = self._batch_profile_metadata(batch)
+        reqs = list(getattr(batch, "reqs", ()) or ())
+        start_ns = time.monotonic_ns()
+        for req in reqs:
+            _emit_event(
+                request_id=req.rid,
+                stage=None,
+                event_name=f"{name}_start",
+                metadata=metadata,
+            )
+        status = "ok"
+        try:
+            with trace_range(name):
+                yield
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            end_metadata = {
+                **metadata,
+                "duration_ns": time.monotonic_ns() - start_ns,
+                "status": status,
+            }
+            for req in reqs:
+                _emit_event(
+                    request_id=req.rid,
+                    stage=None,
+                    event_name=f"{name}_end",
+                    metadata=end_metadata,
+                )
+
+    def _process_batch_result_profiled(self, batch: Any, result: Any) -> None:
+        with self._profile_batch_phase(batch, "scheduler.result_process"):
+            self.process_batch_result(batch, result)
 
     def _handle_batch_failure(self, batch: Any, error: Exception) -> None:
         reqs = list(batch.reqs)
@@ -2074,26 +2224,30 @@ class OmniScheduler:
         # slows ~600x, dropping audio QPS from >10 to <0.5.
         while self._running:
             self._process_admin_requests()
-            recv_reqs = self.recv_requests()
-            recv_reqs.extend(self._take_deferred_request_payloads())
-            self.process_input_requests(recv_reqs)
+            with self._profile_scheduler_phase("scheduler.recv_and_admit"):
+                recv_reqs = self.recv_requests()
+                recv_reqs.extend(self._take_deferred_request_payloads())
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 self._process_admin_requests()
                 time.sleep(0.001)
                 continue
 
-            batch = self.get_next_batch_to_run()
+            with self._profile_scheduler_phase("scheduler.select_batch"):
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             if batch:
                 result = self.run_batch(batch)
                 if result is not _FAILED_BATCH_RESULT:
-                    self.process_batch_result(batch, result)
+                    self._process_batch_result_profiled(batch, result)
             else:
                 self.self_check_during_idle()
                 time.sleep(0.001)
 
             self.last_batch = batch
+            if batch:
+                profiler_step()
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
@@ -2169,7 +2323,7 @@ class OmniScheduler:
             # positional batch tensors), so trimming reqs in lockstep suffices.
             batch.reqs = [batch.reqs[i] for i in keep]
         if batch.reqs:
-            self.process_batch_result(batch, result)
+            self._process_batch_result_profiled(batch, result)
 
     def _resolve_pending_async(self) -> None:
         """Resolve + process the in-flight decode step, if any. Used to flush
@@ -2314,9 +2468,10 @@ class OmniScheduler:
         """
         while self._running:
             self._process_admin_requests()
-            recv_reqs = self.recv_requests()
-            recv_reqs.extend(self._take_deferred_request_payloads())
-            self.process_input_requests(recv_reqs)
+            with self._profile_scheduler_phase("scheduler.recv_and_admit"):
+                recv_reqs = self.recv_requests()
+                recv_reqs.extend(self._take_deferred_request_payloads())
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 self._process_admin_requests()
                 self._resolve_pending_async()
@@ -2333,7 +2488,8 @@ class OmniScheduler:
             ):
                 self._resolve_pending_async()
 
-            batch = self.get_next_batch_to_run()
+            with self._profile_scheduler_phase("scheduler.select_batch"):
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             # Route through sync when the runner's collect has a sync-only
@@ -2381,12 +2537,14 @@ class OmniScheduler:
                 if batch:
                     result = self.run_batch(batch)
                     if result is not _FAILED_BATCH_RESULT:
-                        self.process_batch_result(batch, result)
+                        self._process_batch_result_profiled(batch, result)
                 else:
                     self.self_check_during_idle()
                     time.sleep(0.001)
 
             self.last_batch = batch
+            if batch:
+                profiler_step()
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 

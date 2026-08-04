@@ -271,27 +271,47 @@ class ShutdownMessage:
 class ProfilerStartMessage:
     """Profiler start for a stage."""
 
+    op_id: str
     run_id: str
     trace_path_template: str  # e.g. "/tmp/profiles/{run_id}/{stage}/trace"
+    reply_endpoint: str
     event_dir: str | None = None  # Per-stage JSONL event sink dir for request profiling
     enable_torch: bool = True  # When False, only request-level events are captured
+    enable_nvtx: bool = False
+    torch_owner: str = "scheduler"
+    torch_config: dict[str, Any] | None = None
+    timeout_s: float = 120.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": "profiler_start",
+            "op_id": self.op_id,
             "run_id": self.run_id,
             "trace_path_template": self.trace_path_template,
+            "reply_endpoint": self.reply_endpoint,
             "event_dir": self.event_dir,
             "enable_torch": self.enable_torch,
+            "enable_nvtx": self.enable_nvtx,
+            "torch_owner": self.torch_owner,
+            "torch_config": self.torch_config,
+            "timeout_s": self.timeout_s,
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ProfilerStartMessage":
         return cls(
+            op_id=d.get("op_id", ""),
             run_id=d["run_id"],
             trace_path_template=d["trace_path_template"],
+            reply_endpoint=d.get("reply_endpoint", ""),
             event_dir=d.get("event_dir"),
             enable_torch=bool(d.get("enable_torch", True)),
+            enable_nvtx=bool(d.get("enable_nvtx", False)),
+            torch_owner=str(d.get("torch_owner", "scheduler")),
+            torch_config=(
+                dict(d["torch_config"]) if d.get("torch_config") is not None else None
+            ),
+            timeout_s=float(d.get("timeout_s", 120.0)),
         )
 
 
@@ -299,14 +319,71 @@ class ProfilerStartMessage:
 class ProfilerStopMessage:
     """Profiler stop. ``run_id=None`` is a wildcard (stop active session)."""
 
+    op_id: str = ""
     run_id: str | None = None
+    reply_endpoint: str = ""
+    timeout_s: float = 120.0
 
     def to_dict(self) -> dict[str, Any]:
-        return {"type": "profiler_stop", "run_id": self.run_id}
+        data = {"type": "profiler_stop", "run_id": self.run_id}
+        if self.op_id:
+            data["op_id"] = self.op_id
+        if self.reply_endpoint:
+            data["reply_endpoint"] = self.reply_endpoint
+        if self.timeout_s != 120.0:
+            data["timeout_s"] = self.timeout_s
+        return data
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ProfilerStopMessage":
-        return cls(run_id=d.get("run_id"))
+        return cls(
+            op_id=d.get("op_id", ""),
+            run_id=d.get("run_id"),
+            reply_endpoint=d.get("reply_endpoint", ""),
+            timeout_s=float(d.get("timeout_s", 120.0)),
+        )
+
+
+@dataclass
+class ProfilerResultMessage:
+    """Acknowledged result for one stage-level profiler operation.
+
+    ``targets`` contains one entry per local/TP rank.  TP leaders aggregate
+    follower results so the coordinator waits for one reply per selected
+    stage endpoint without losing rank-level failure information.
+    """
+
+    op_id: str
+    run_id: str | None
+    stage: str
+    action: str
+    success: bool
+    targets: list[dict[str, Any]]
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "profiler_result",
+            "op_id": self.op_id,
+            "run_id": self.run_id,
+            "stage": self.stage,
+            "action": self.action,
+            "success": self.success,
+            "targets": self.targets,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ProfilerResultMessage":
+        return cls(
+            op_id=str(d["op_id"]),
+            run_id=d.get("run_id"),
+            stage=str(d["stage"]),
+            action=str(d["action"]),
+            success=bool(d["success"]),
+            targets=[dict(item) for item in d.get("targets", [])],
+            error=d.get("error"),
+        )
 
 
 @dataclass
@@ -351,6 +428,7 @@ def parse_message(
     | ShutdownMessage
     | ProfilerStartMessage
     | ProfilerStopMessage
+    | ProfilerResultMessage
 ):
     """Parse a dict into the appropriate message type."""
     msg_type = d.get("type")
@@ -372,6 +450,8 @@ def parse_message(
         return ProfilerStartMessage.from_dict(d)
     elif msg_type == "profiler_stop":
         return ProfilerStopMessage.from_dict(d)
+    elif msg_type == "profiler_result":
+        return ProfilerResultMessage.from_dict(d)
     elif msg_type == "admin":
         return AdminMessage.from_dict(d)
     elif msg_type == "admin_result":
