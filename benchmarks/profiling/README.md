@@ -403,20 +403,43 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --record-shapes
 ```
 
-## 6. Nsight Systems joint CPU/CUDA trace
+## 6. Nsight Systems joint CPU/CUDA/Python trace
 
 Nsight must launch the server so it follows the worker process tree. The
 server emits one scheduler-owned NVTX range named
 `sglang_omni.capture_window`; the harness opens it only after stability
 warmup and closes it after the measured requests complete.
 
+For the Fun-ASR CPU-interference investigation, CUDA/NVTX/OS-runtime tracing
+alone is insufficient. Require all of the following in the same short
+capture:
+
+- process-tree CPU sampling, to locate native and Python CPU hotspots;
+- process-tree context switches, to distinguish running, runnable, and
+  blocked intervals for the named critical threads;
+- Python sampling, to attribute work inside the request builder, scheduler,
+  and pre-LM service;
+- Python GIL tracing, to distinguish GIL ownership/waiting from CFS delay;
+- CUDA API and GPU activity, to join host stalls to launch gaps and kernels.
+
+Nsight Systems 2024.2 or newer provides the Python sampling and GIL switches
+used below. Check the installed CLI before starting the server; do not silently
+drop an unsupported signal and later treat the trace as complete:
+
 ```bash
 export SGLANG_OMNI_NVTX_RANGES=1
 export NSYS_NVTX_PROFILER_REGISTER_ONLY=0
 
+nsys --version
+nsys profile --help | grep -E \
+  -- '--cpuctxsw|--python-sampling|--python-sampling-frequency|python-gil'
+
 nsys profile \
-  --trace=cuda,nvtx,osrt \
+  --trace=cuda,nvtx,osrt,python-gil \
   --sample=process-tree \
+  --cpuctxsw=process-tree \
+  --python-sampling=true \
+  --python-sampling-frequency=250 \
   --capture-range=nvtx \
   --nvtx-capture=sglang_omni.capture_window \
   --capture-range-end=stop \
@@ -446,9 +469,50 @@ python -m benchmarks.profiling.profile_cpu_saturation \
     "$PWD/artifacts/cpu-saturation/nsys-quiet-r1.nsys-rep"
 ```
 
-Inspect CPU scheduling, CUDA API launches, kernels, streams, and GPU feed gaps
-inside the capture range. A CPU/NVTX range represents host enqueue time; do not
-infer device completion from visual nesting.
+Run one fresh-server quiet capture and one fresh-server unbound-CPU64 capture
+with identical requests and launch flags. These are diagnostic traces, not
+throughput baselines; retain the unprofiled matched pair for performance
+numbers. Keep the active window narrow (normally 128-256 requests) because
+Python sampling, GIL tracing, CUDA tracing, and context-switch collection are
+deliberately more invasive than the stability campaign.
+
+The trace must contain all of these semantic ranges:
+
+- `request_build.total`, plus `request_build.audio_load`,
+  `request_build.feature_extract`, `request_build.tokenize_and_pack`, and
+  `request_build.pre_lm_wait`, on `omni-request-bu`;
+- `pre_lm.encode`, `pre_lm.synchronize`, and
+  `pre_lm.split_embeddings`, on `fun-asr-audio-e`;
+- `scheduler.recv_and_admit`, `scheduler.select_batch`,
+  `scheduler.model_launch`/`scheduler.model_execute`,
+  `scheduler.model_resolve`, and `scheduler.result_process`, on `sched-asr`;
+- `request_build.head_of_line` whenever later-ready request-builder futures
+  are held behind the oldest incomplete future;
+- `sglang_omni.capture_window`, CUDA API calls, GPU kernels, Python samples,
+  Python GIL states, and scheduling/context-switch records.
+
+Inspect the two captures in this order:
+
+1. Compare `request_build.total` and its child ranges. Time outside the child
+   ranges is request construction/bookkeeping; time in `pre_lm_wait` is a
+   dependency stall, not request-builder CPU.
+2. Split `pre_lm_wait` into encoder queueing, `pre_lm.encode`, CUDA launch,
+   `pre_lm.synchronize`, and split/clone time. A long synchronize with busy GPU
+   is device work; a delayed encode launch with idle GPU is host starvation.
+3. Check whether `request_build.head_of_line` overlaps later-ready workers and
+   GPU feed gaps. Its presence alone is not a bug; it must be material on the
+   critical path.
+4. On each semantic thread, distinguish CFS runnable delay, GIL wait, blocked
+   futex/condition wait, and on-CPU Python/native samples. These mechanisms
+   require different fixes.
+5. Join the last scheduler/pre-LM CUDA API call before each GPU idle interval.
+   The CPU range containing that launch gap identifies the first host phase
+   that stopped feeding the H100.
+
+A CPU/NVTX range represents host enqueue or wall time; do not infer device
+completion from visual nesting. Do not enable the JSONL event recorder or
+Torch profiler in this capture. Their signals are already represented by NVTX,
+and stacking profilers would make scheduler/GIL attribution uninterpretable.
 
 ## 7. Scheduler-delay run
 
@@ -540,6 +604,7 @@ python -m pytest -q \
   tests/unit_test/profiler/test_profiler_control_client.py \
   tests/unit_test/profiler/test_profiler_protocol.py \
   tests/unit_test/profiler/test_scheduler_profiler_control.py \
+  tests/unit_test/profiler/test_trace_ranges.py \
   tests/unit_test/profiler/test_torch_profiler_schedule.py \
   tests/unit_test/benchmarks/test_benchmark_runner_rate.py \
   tests/unit_test/benchmarks/test_cpu_saturation_campaign.py \

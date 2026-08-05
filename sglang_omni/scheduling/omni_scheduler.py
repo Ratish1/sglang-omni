@@ -55,7 +55,12 @@ from sglang_omni.profiler.event_recorder import (
     reset_active_stage as _reset_active_stage,
 )
 from sglang_omni.profiler.event_recorder import set_active_stage as _set_active_stage
-from sglang_omni.profiler.trace_ranges import trace_range
+from sglang_omni.profiler.trace_ranges import (
+    end_async_trace_range,
+    nvtx_enabled,
+    start_async_trace_range,
+    trace_range,
+)
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
@@ -260,7 +265,7 @@ class OmniScheduler:
         self._pending_request_builds: dict[str, tuple[Any, bool, Future]] = {}
         self._backlogged_request_build_payloads: deque[Any] = deque()
         self._request_build_max_pending_observed = 0
-        self._profile_hol_head: tuple[str, int, int] | None = None
+        self._profile_hol_head: tuple[str, int, int, int | None] | None = None
         self._profiler_owners: dict[str, Any] = {}
 
         # --- Core scheduling state (read/written by upstream methods) -----
@@ -960,7 +965,8 @@ class OmniScheduler:
                 stage=active_stage,
                 event_name="scheduler_request_build_start",
             )
-            req_data = self._request_builder(payload)
+            with trace_range("request_build.total"):
+                req_data = self._request_builder(payload)
             status = "success"
             return req_data
         finally:
@@ -1110,7 +1116,7 @@ class OmniScheduler:
                 )
                 if not future.done():
                     now_ns = time.monotonic_ns()
-                    if _get_recorder().is_active():
+                    if _get_recorder().is_active() or nvtx_enabled():
                         later_ready = sum(
                             1
                             for _, _, later_future in tuple(
@@ -1130,6 +1136,9 @@ class OmniScheduler:
                                     req_id,
                                     now_ns,
                                     later_ready,
+                                    start_async_trace_range(
+                                        "request_build.head_of_line"
+                                    ),
                                 )
                                 _emit_event(
                                     request_id=req_id,
@@ -1147,6 +1156,7 @@ class OmniScheduler:
                                     active_hol[0],
                                     active_hol[1],
                                     later_ready,
+                                    active_hol[3],
                                 )
                     return
                 self._end_request_build_hol_unlocked(
@@ -1207,7 +1217,8 @@ class OmniScheduler:
         active = self._profile_hol_head
         if active is None:
             return
-        request_id, start_ns, max_later_ready = active
+        request_id, start_ns, max_later_ready, range_id = active
+        end_async_trace_range(range_id)
         _emit_event(
             request_id=request_id,
             stage=None,

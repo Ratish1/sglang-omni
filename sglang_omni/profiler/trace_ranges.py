@@ -43,6 +43,27 @@ def trace_range(name: str):
     return _combined_range(name)
 
 
+def start_async_trace_range(name: str) -> int | None:
+    """Start an NVTX range whose end is not lexically scoped.
+
+    Async ranges are only for Nsight captures.  Unlike ``range_push`` /
+    ``range_pop``, NVTX start/end ranges may span scheduler iterations or
+    threads.  Returning ``None`` keeps the disabled path allocation-free and
+    gives callers an explicit token to pass to ``end_async_trace_range``.
+    """
+
+    if not _NVTX_ENABLED or not torch.cuda.is_available():
+        return None
+    return int(torch.cuda.nvtx.range_start(name))
+
+
+def end_async_trace_range(range_id: int | None) -> None:
+    """End a range returned by ``start_async_trace_range``."""
+
+    if range_id is not None:
+        torch.cuda.nvtx.range_end(range_id)
+
+
 @contextlib.contextmanager
 def profile_span(
     *,
@@ -160,9 +181,11 @@ def nvtx_window_snapshot() -> dict[str, Any]:
 
 
 __all__ = [
+    "end_async_trace_range",
     "nvtx_enabled",
     "nvtx_window_snapshot",
     "profile_span",
+    "start_async_trace_range",
     "start_nvtx_window",
     "stop_nvtx_window",
     "trace_range",
