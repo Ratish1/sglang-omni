@@ -204,7 +204,7 @@ def test_stability_request_integrity_rejects_incomplete_window() -> None:
     assert "completed 2/3" in integrity["errors"][0]
 
 
-def test_thread_accounting_rejects_missing_lifecycle_and_large_gap() -> None:
+def test_thread_accounting_accepts_attributable_birth_but_rejects_large_gap() -> None:
     accounting = profile._thread_accounting(
         process_cpu_ms=100.0,
         thread_delta={
@@ -217,7 +217,7 @@ def test_thread_accounting_rejects_missing_lifecycle_and_large_gap() -> None:
     )
     assert accounting["valid"] is False
     assert accounting["relative_error"] == pytest.approx(0.2)
-    assert any("threads started" in error for error in accounting["errors"])
+    assert not any("threads started" in error for error in accounting["errors"])
     assert any("relative error" in error for error in accounting["errors"])
 
 
@@ -247,7 +247,13 @@ def test_stability_system_integrity_rejects_empty_requested_evidence(
                 "pressure": {},
                 "thread_accounting": {"errors": ["CPU accounting is incomplete"]},
                 "continuous_telemetry": {
-                    "cpu_frequency": {"samples": 1},
+                    "cpu_frequency": {
+                        "samples": 1,
+                        "coverage": {
+                            "brackets_start": False,
+                            "brackets_stop": False,
+                        },
+                    },
                 },
             }
         ],
@@ -259,7 +265,7 @@ def test_stability_system_integrity_rejects_empty_requested_evidence(
     assert "stability window 1 has no global CPU PSI" in errors
     assert "stability window 1 has no cgroup CPU PSI" in errors
     assert "stability window 1: CPU accounting is incomplete" in errors
-    assert "stability window 1 has fewer than two CPU frequency samples" in errors
+    assert "stability window 1 lacks bracketing CPU frequency samples" in errors
 
 
 def test_summary_preserves_offered_dispatched_rejected_and_client_queue() -> None:

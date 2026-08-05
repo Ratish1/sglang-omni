@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from benchmarks.profiling.system_collectors import (
+    CpuFrequencyCollector,
     parse_cpu_frequency,
     parse_gpu_dmon,
     parse_perf_stat,
@@ -133,6 +134,7 @@ def test_thread_snapshot_delta_includes_migrations_and_thread_lifecycle() -> Non
             {
                 "tid": 10,
                 "comm": "scheduler-asr",
+                "starttime_ticks": 1,
                 "utime_ticks": 100,
                 "stime_ticks": 20,
                 "runtime_ns": 800_000_000,
@@ -141,7 +143,18 @@ def test_thread_snapshot_delta_includes_migrations_and_thread_lifecycle() -> Non
                 "migrations": 3,
                 "processor": 2,
             },
-            {"tid": 11},
+            {
+                "tid": 11,
+                "comm": "exiting-worker",
+                "starttime_ticks": 2,
+                "utime_ticks": 1,
+                "stime_ticks": 1,
+                "runtime_ns": 1,
+                "runqueue_delay_ns": 1,
+                "timeslices": 1,
+                "migrations": 0,
+                "processor": 1,
+            },
         ],
     }
     after = {
@@ -150,6 +163,7 @@ def test_thread_snapshot_delta_includes_migrations_and_thread_lifecycle() -> Non
             {
                 "tid": 10,
                 "comm": "scheduler-asr",
+                "starttime_ticks": 1,
                 "utime_ticks": 150,
                 "stime_ticks": 30,
                 "runtime_ns": 1_300_000_000,
@@ -158,16 +172,34 @@ def test_thread_snapshot_delta_includes_migrations_and_thread_lifecycle() -> Non
                 "migrations": 8,
                 "processor": 4,
             },
-            {"tid": 12},
+            {
+                "tid": 12,
+                "comm": "new-worker",
+                "starttime_ticks": 3,
+                "utime_ticks": 5,
+                "stime_ticks": 1,
+                "runtime_ns": 40_000_000,
+                "runqueue_delay_ns": 10_000_000,
+                "timeslices": 4,
+                "migrations": 2,
+                "processor": 6,
+            },
         ],
     }
     parsed = summarize_thread_snapshot_delta(before, after)
     assert parsed["threads_started"] == [12]
     assert parsed["threads_exited"] == [11]
-    assert parsed["migrations"] == 5
+    assert parsed["threads_persistent"] == 1
+    assert parsed["migrations"] == 7
     assert parsed["threads"][0]["runqueue_delay_ms"] == 200.0
     assert parsed["threads"][0]["first_processor"] == 2
     assert parsed["threads"][0]["last_processor"] == 4
+    started = next(row for row in parsed["threads"] if row["tid"] == 12)
+    assert started["lifecycle"] == "started"
+    assert started["cpu_ms"] == 60.0
+    assert started["runtime_ms"] == 40.0
+    assert started["runqueue_delay_ms"] == 10.0
+    assert started["first_processor"] is None
 
 
 def test_gpu_dmon_parser_reports_idle_fraction(tmp_path: Path) -> None:
@@ -218,6 +250,7 @@ def test_cpu_frequency_parser_reports_busy_weighted_frequency(tmp_path: Path) ->
     )
     parsed = parse_cpu_frequency(output)
     assert parsed["samples"] == 2
+    assert parsed["interior_samples"] == 2
     assert parsed["scope"] == {
         "kind": "selected_cpus",
         "requested_cpus": [0],
@@ -226,6 +259,30 @@ def test_cpu_frequency_parser_reports_busy_weighted_frequency(tmp_path: Path) ->
     assert parsed["sampled_scaling_frequency_mhz"]["mean"] == 2500.0
     assert parsed["busy_weighted_sampled_scaling_frequency_mhz"] == 3000.0
     assert parsed["busy_ticks"] == 75
+    assert parsed["coverage"] == {
+        "first_sample_monotonic_ns": 1,
+        "last_sample_monotonic_ns": 2,
+        "brackets_start": True,
+        "brackets_stop": True,
+    }
+
+
+def test_cpu_frequency_collector_finalizes_with_trailing_sample(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "cpu_frequency.jsonl"
+    collector = CpuFrequencyCollector(output_path=output, interval_ms=10_000)
+    collector.start()
+    result = collector.stop()
+    samples = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert result["returncode"] == 0
+    assert result["samples"] >= 2
+    assert len(samples) == result["samples"]
+    assert samples[0]["monotonic_ns"] <= samples[-1]["monotonic_ns"]
 
 
 def test_cpu_frequency_parser_filters_to_monotonic_window(tmp_path: Path) -> None:
@@ -262,6 +319,47 @@ def test_cpu_frequency_parser_filters_to_monotonic_window(tmp_path: Path) -> Non
         stop_monotonic_ns=300,
     )
     assert parsed["samples"] == 2
+    assert parsed["interior_samples"] == 2
     assert parsed["total_file_samples"] == 4
     assert parsed["sampled_scaling_frequency_mhz"]["mean"] == 2500.0
     assert parsed["busy_weighted_sampled_scaling_frequency_mhz"] == 3000.0
+
+
+def test_cpu_frequency_parser_includes_bracketing_samples(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "cpu_frequency.jsonl"
+    output.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "monotonic_ns": timestamp,
+                    "requested_cpus": [0],
+                    "cpus": [
+                        {
+                            "cpu": 0,
+                            "frequency_khz": timestamp * 10_000,
+                            "total_ticks": timestamp,
+                            "idle_ticks": 0,
+                        }
+                    ],
+                }
+            )
+            for timestamp in (100, 200, 300, 400)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    parsed = parse_cpu_frequency(
+        output,
+        start_monotonic_ns=150,
+        stop_monotonic_ns=350,
+    )
+    assert parsed["samples"] == 4
+    assert parsed["interior_samples"] == 2
+    assert parsed["coverage"] == {
+        "first_sample_monotonic_ns": 100,
+        "last_sample_monotonic_ns": 400,
+        "brackets_start": True,
+        "brackets_stop": True,
+    }

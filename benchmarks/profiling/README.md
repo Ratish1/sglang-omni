@@ -136,10 +136,14 @@ occupancy lines; event recording stays off. Add `perf-stat` or `turbostat`
 only when matching kernel tools are actually available.
 
 Each workload window records monotonic and wall-clock boundaries. Its
-persistent native-thread CPU total must reconcile with stage process CPU time
-within `--max-thread-cpu-accounting-error`; thread birth or exit makes exact
-per-thread attribution invalid. The campaign records the server, stage, and
-interferer process trees with per-thread affinity and cgroup membership.
+observable native-thread CPU total must reconcile with stage process CPU time
+within `--max-thread-cpu-accounting-error`. A thread born during the window is
+included from its lifetime counters when it remains observable at the ending
+boundary. A thread that exits before that boundary makes exact per-thread
+attribution invalid. Per-window frequency summaries include the nearest sample
+on each side of the workload interval and require that both boundaries are
+bracketed. The campaign records the server, stage, and interferer process trees
+with per-thread affinity and cgroup membership.
 Incomplete requests, missing requested collector samples, incomplete pressure
 windows, or failed CPU reconciliation preserve the artifacts but set
 `accepted=false`; rejected trials never enter campaign comparisons.

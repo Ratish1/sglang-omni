@@ -367,6 +367,7 @@ def read_thread_snapshot(pid: int) -> dict[str, Any]:
                     "state": fields[0],
                     "utime_ticks": int(fields[11]),
                     "stime_ticks": int(fields[12]),
+                    "starttime_ticks": int(fields[19]),
                     "processor": int(fields[36]),
                     "runtime_ns": int(schedstat[0]),
                     "runqueue_delay_ns": int(schedstat[1]),
@@ -391,41 +392,64 @@ def summarize_thread_snapshot_delta(
     after: dict[str, Any],
 ) -> dict[str, Any]:
     """Summarize native-thread deltas across one workload window."""
-    first = {int(row["tid"]): row for row in before.get("threads", [])}
-    last = {int(row["tid"]): row for row in after.get("threads", [])}
+
+    def identity(row: dict[str, Any]) -> tuple[int, int | None]:
+        starttime = row.get("starttime_ticks")
+        return (
+            int(row["tid"]),
+            int(starttime) if starttime is not None else None,
+        )
+
+    first = {identity(row): row for row in before.get("threads", [])}
+    last = {identity(row): row for row in after.get("threads", [])}
     clock_ticks = float(os.sysconf("SC_CLK_TCK"))
     window_ns = max(
         0,
         int(after["monotonic_ns"]) - int(before["monotonic_ns"]),
     )
     rows: list[dict[str, Any]] = []
-    for tid in sorted(first.keys() & last.keys()):
-        start = first[tid]
-        end = last[tid]
-        runtime_ns = max(0, int(end["runtime_ns"]) - int(start["runtime_ns"]))
+    persistent = first.keys() & last.keys()
+    started = last.keys() - first.keys()
+    exited = first.keys() - last.keys()
+    for thread_identity in sorted(
+        persistent | started,
+        key=lambda value: (
+            value[0],
+            value[1] if value[1] is not None else -1,
+        ),
+    ):
+        end = last[thread_identity]
+        start = first.get(thread_identity)
+        lifecycle = "persistent" if start is not None else "started"
+        runtime_ns = max(
+            0,
+            int(end["runtime_ns"]) - (int(start["runtime_ns"]) if start else 0),
+        )
         delay_ns = max(
             0,
-            int(end["runqueue_delay_ns"]) - int(start["runqueue_delay_ns"]),
+            int(end["runqueue_delay_ns"])
+            - (int(start["runqueue_delay_ns"]) if start else 0),
         )
         cpu_ticks = max(
             0,
             int(end["utime_ticks"])
             + int(end["stime_ticks"])
-            - int(start["utime_ticks"])
-            - int(start["stime_ticks"]),
+            - (int(start["utime_ticks"]) + int(start["stime_ticks"]) if start else 0),
         )
-        start_migrations = start.get("migrations")
+        start_migrations = start.get("migrations") if start else 0
         end_migrations = end.get("migrations")
         rows.append(
             {
-                "tid": tid,
+                "tid": int(end["tid"]),
+                "starttime_ticks": end.get("starttime_ticks"),
                 "comm": end.get("comm"),
+                "lifecycle": lifecycle,
                 "cpu_ms": cpu_ticks * 1000.0 / clock_ticks,
                 "runtime_ms": runtime_ns / 1e6,
                 "runqueue_delay_ms": delay_ns / 1e6,
                 "timeslices": max(
                     0,
-                    int(end["timeslices"]) - int(start["timeslices"]),
+                    int(end["timeslices"]) - (int(start["timeslices"]) if start else 0),
                 ),
                 "migrations": (
                     max(0, int(end_migrations) - int(start_migrations))
@@ -436,18 +460,25 @@ def summarize_thread_snapshot_delta(
                 "runqueue_delay_fraction": (
                     delay_ns / (runtime_ns + delay_ns) if runtime_ns + delay_ns else 0.0
                 ),
-                "first_processor": start.get("processor"),
+                "first_processor": start.get("processor") if start else None,
                 "last_processor": end.get("processor"),
             }
         )
-    rows.sort(key=lambda row: (-float(row["cpu_ms"]), int(row["tid"])))
+    rows.sort(
+        key=lambda row: (
+            -float(row["cpu_ms"]),
+            int(row["tid"]),
+            int(row["starttime_ticks"] or -1),
+        )
+    )
     return {
         "window_ns": window_ns,
         "threads_before": len(first),
         "threads_after": len(last),
         "threads_observed": len(rows),
-        "threads_started": sorted(last.keys() - first.keys()),
-        "threads_exited": sorted(first.keys() - last.keys()),
+        "threads_persistent": len(persistent),
+        "threads_started": sorted(tid for tid, _starttime in started),
+        "threads_exited": sorted(tid for tid, _starttime in exited),
         "cpu_ms": sum(float(row["cpu_ms"]) for row in rows),
         "runtime_ms": sum(float(row["runtime_ms"]) for row in rows),
         "runqueue_delay_ms": sum(float(row["runqueue_delay_ms"]) for row in rows),
@@ -703,10 +734,17 @@ class CpuFrequencyCollector:
     def _run(self) -> None:
         try:
             with self.partial_path.open("x", encoding="utf-8") as handle:
-                while not self._stop_event.is_set():
+                # Capture explicit leading and trailing boundaries. Periodic
+                # samples fill the interval between them.
+                handle.write(json.dumps(self._read_sample(), sort_keys=True) + "\n")
+                self._samples += 1
+                while not self._stop_event.wait(self.interval_s):
                     handle.write(json.dumps(self._read_sample(), sort_keys=True) + "\n")
                     self._samples += 1
-                    self._stop_event.wait(self.interval_s)
+                # Finalize with an explicit trailing boundary sample so the
+                # final workload window can be bracketed.
+                handle.write(json.dumps(self._read_sample(), sort_keys=True) + "\n")
+                self._samples += 1
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(self.partial_path, self.output_path)
@@ -900,8 +938,9 @@ def parse_thread_snapshots(path: str | Path) -> dict[str, Any]:
     source = Path(path)
     if not source.is_file():
         return {"threads": [], "error": "file is missing"}
-    first: dict[int, tuple[int, dict[str, Any]]] = {}
-    last: dict[int, tuple[int, dict[str, Any]]] = {}
+    ThreadIdentity = tuple[int, int | None]
+    first: dict[ThreadIdentity, tuple[int, dict[str, Any]]] = {}
+    last: dict[ThreadIdentity, tuple[int, dict[str, Any]]] = {}
     sample_count = 0
     for line in source.read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -911,13 +950,24 @@ def parse_thread_snapshots(path: str | Path) -> dict[str, Any]:
         sample_count += 1
         for row in sample.get("threads", []):
             tid = int(row["tid"])
-            first.setdefault(tid, (timestamp, row))
-            last[tid] = (timestamp, row)
+            starttime = row.get("starttime_ticks")
+            identity = (
+                tid,
+                int(starttime) if starttime is not None else None,
+            )
+            first.setdefault(identity, (timestamp, row))
+            last[identity] = (timestamp, row)
     clock_ticks = float(os.sysconf("SC_CLK_TCK"))
     rows: list[dict[str, Any]] = []
-    for tid in sorted(last):
-        start_timestamp, start = first[tid]
-        end_timestamp, end = last[tid]
+    for identity in sorted(
+        last,
+        key=lambda value: (
+            value[0],
+            value[1] if value[1] is not None else -1,
+        ),
+    ):
+        start_timestamp, start = first[identity]
+        end_timestamp, end = last[identity]
         window_ns = max(0, end_timestamp - start_timestamp)
         runtime_ns = max(0, int(end["runtime_ns"]) - int(start["runtime_ns"]))
         delay_ns = max(
@@ -933,7 +983,8 @@ def parse_thread_snapshots(path: str | Path) -> dict[str, Any]:
         )
         rows.append(
             {
-                "tid": tid,
+                "tid": identity[0],
+                "starttime_ticks": identity[1],
                 "comm": end.get("comm"),
                 "window_ms": window_ns / 1e6,
                 "cpu_ms": cpu_ticks * 1000.0 / clock_ticks,
@@ -950,7 +1001,13 @@ def parse_thread_snapshots(path: str | Path) -> dict[str, Any]:
                 "last_processor": end.get("processor"),
             }
         )
-    rows.sort(key=lambda row: (-float(row["cpu_ms"]), int(row["tid"])))
+    rows.sort(
+        key=lambda row: (
+            -float(row["cpu_ms"]),
+            int(row["tid"]),
+            int(row["starttime_ticks"] or -1),
+        )
+    )
     return {"samples": sample_count, "threads": rows}
 
 
@@ -1008,18 +1065,31 @@ def parse_cpu_frequency(
         for line in source.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    samples = [
-        sample
-        for sample in all_samples
-        if (
-            start_monotonic_ns is None
-            or int(sample["monotonic_ns"]) >= start_monotonic_ns
+    all_samples.sort(key=lambda sample: int(sample["monotonic_ns"]))
+    if start_monotonic_ns is None and stop_monotonic_ns is None:
+        samples = all_samples
+    else:
+        first_index = 0
+        if start_monotonic_ns is not None:
+            preceding = [
+                index
+                for index, sample in enumerate(all_samples)
+                if int(sample["monotonic_ns"]) <= start_monotonic_ns
+            ]
+            first_index = preceding[-1] if preceding else 0
+        last_index = len(all_samples) - 1
+        if stop_monotonic_ns is not None:
+            following = [
+                index
+                for index, sample in enumerate(all_samples)
+                if int(sample["monotonic_ns"]) >= stop_monotonic_ns
+            ]
+            last_index = following[0] if following else len(all_samples) - 1
+        samples = (
+            all_samples[first_index : last_index + 1]
+            if all_samples and first_index <= last_index
+            else []
         )
-        and (
-            stop_monotonic_ns is None
-            or int(sample["monotonic_ns"]) <= stop_monotonic_ns
-        )
-    ]
     frequencies_mhz: list[float] = []
     busy_frequency_sum = 0.0
     busy_ticks_sum = 0
@@ -1056,8 +1126,24 @@ def parse_cpu_frequency(
         "max": max(frequencies_mhz) if frequencies_mhz else None,
     }
     busy_weighted = busy_frequency_sum / busy_ticks_sum if busy_ticks_sum else None
+    sample_timestamps = [int(sample["monotonic_ns"]) for sample in samples]
+    first_timestamp = sample_timestamps[0] if sample_timestamps else None
+    last_timestamp = sample_timestamps[-1] if sample_timestamps else None
+    brackets_start = start_monotonic_ns is None or (
+        first_timestamp is not None and first_timestamp <= start_monotonic_ns
+    )
+    brackets_stop = stop_monotonic_ns is None or (
+        last_timestamp is not None and last_timestamp >= stop_monotonic_ns
+    )
+    interior_samples = sum(
+        1
+        for timestamp in sample_timestamps
+        if (start_monotonic_ns is None or timestamp >= start_monotonic_ns)
+        and (stop_monotonic_ns is None or timestamp <= stop_monotonic_ns)
+    )
     return {
         "samples": len(samples),
+        "interior_samples": interior_samples,
         "total_file_samples": len(all_samples),
         "cpu_samples": len(frequencies_mhz),
         "scope": {
@@ -1076,6 +1162,12 @@ def parse_cpu_frequency(
         "busy_ticks": busy_ticks_sum,
         "start_monotonic_ns": start_monotonic_ns,
         "stop_monotonic_ns": stop_monotonic_ns,
+        "coverage": {
+            "first_sample_monotonic_ns": first_timestamp,
+            "last_sample_monotonic_ns": last_timestamp,
+            "brackets_start": brackets_start,
+            "brackets_stop": brackets_stop,
+        },
     }
 
 

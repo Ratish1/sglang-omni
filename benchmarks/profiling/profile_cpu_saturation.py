@@ -510,11 +510,7 @@ def _thread_accounting(
     if process_cpu_ms is None:
         errors.append("stage process CPU delta is unavailable")
     if not thread_delta.get("threads_observed"):
-        errors.append("no native threads were observed at both window boundaries")
-    if thread_delta.get("threads_started"):
-        errors.append(
-            f"threads started during window: {thread_delta['threads_started']}"
-        )
+        errors.append("no attributable native threads were observed")
     if thread_delta.get("threads_exited"):
         errors.append(f"threads exited during window: {thread_delta['threads_exited']}")
     if relative_error is None:
@@ -648,9 +644,14 @@ def _stability_system_integrity_errors(
         if "cpu-frequency" in requested:
             telemetry = window.get("continuous_telemetry") or {}
             frequency = telemetry.get("cpu_frequency") or {}
-            if int(frequency.get("samples", 0)) < 2:
+            coverage = frequency.get("coverage") or {}
+            if (
+                int(frequency.get("samples", 0)) < 2
+                or not coverage.get("brackets_start")
+                or not coverage.get("brackets_stop")
+            ):
                 errors.append(
-                    f"stability window {window_index} has fewer than two "
+                    f"stability window {window_index} lacks bracketing "
                     "CPU frequency samples"
                 )
     return errors
