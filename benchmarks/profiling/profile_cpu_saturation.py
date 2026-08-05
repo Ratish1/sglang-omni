@@ -27,6 +27,7 @@ import aiohttp
 from benchmarks.dataset.prepare import DATASETS
 from benchmarks.dataset.seedtts import load_seedtts_samples
 from benchmarks.eval.benchmark_asr_seedtts import run_asr_seedtts_once
+from benchmarks.profiling.cpu_interferer import parse_cpu_list
 from benchmarks.profiling.system_collectors import (
     CpuFrequencyCollector,
     ThreadSnapshotCollector,
@@ -449,6 +450,90 @@ def _metric_distribution(values: list[float]) -> dict[str, Any]:
     }
 
 
+def _request_integrity(
+    shape_passes: list[dict[str, Any]],
+    windows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    errors: list[str] = []
+    offered = 0
+    completed = 0
+    failed = 0
+    rejected = 0
+    timed_out = 0
+    for label, summary in (
+        *[(f"shape pass {row['pass']}", row["summary"]) for row in shape_passes],
+        *[(f"stability window {row['window']}", row["summary"]) for row in windows],
+    ):
+        accounting = summary.get("request_accounting") or {}
+        row_offered = int(accounting.get("offered", summary.get("total", 0)))
+        row_completed = int(accounting.get("completed", summary.get("evaluated", 0)))
+        row_failed = int(accounting.get("failed", summary.get("skipped", 0)))
+        row_rejected = int(accounting.get("http_rejected", 0))
+        row_timed_out = int(accounting.get("timed_out", 0))
+        offered += row_offered
+        completed += row_completed
+        failed += row_failed
+        rejected += row_rejected
+        timed_out += row_timed_out
+        if row_completed != row_offered or row_failed or row_rejected or row_timed_out:
+            errors.append(
+                f"{label} completed {row_completed}/{row_offered}, "
+                f"failed={row_failed}, rejected={row_rejected}, "
+                f"timed_out={row_timed_out}"
+            )
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "offered": offered,
+        "completed": completed,
+        "failed": failed,
+        "http_rejected": rejected,
+        "timed_out": timed_out,
+    }
+
+
+def _thread_accounting(
+    *,
+    process_cpu_ms: float | None,
+    thread_delta: dict[str, Any],
+    max_relative_error: float,
+) -> dict[str, Any]:
+    thread_cpu_ms = thread_delta.get("cpu_ms")
+    relative_error = (
+        abs(float(process_cpu_ms) - float(thread_cpu_ms)) / float(process_cpu_ms)
+        if isinstance(process_cpu_ms, (int, float))
+        and process_cpu_ms > 0
+        and isinstance(thread_cpu_ms, (int, float))
+        else None
+    )
+    errors: list[str] = []
+    if process_cpu_ms is None:
+        errors.append("stage process CPU delta is unavailable")
+    if not thread_delta.get("threads_observed"):
+        errors.append("no native threads were observed at both window boundaries")
+    if thread_delta.get("threads_started"):
+        errors.append(
+            f"threads started during window: {thread_delta['threads_started']}"
+        )
+    if thread_delta.get("threads_exited"):
+        errors.append(f"threads exited during window: {thread_delta['threads_exited']}")
+    if relative_error is None:
+        errors.append("process/thread CPU accounting cannot be reconciled")
+    elif relative_error > max_relative_error:
+        errors.append(
+            "process/thread CPU accounting relative error "
+            f"{relative_error:.4f} exceeds {max_relative_error:.4f}"
+        )
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "process_cpu_ms": process_cpu_ms,
+        "thread_cpu_ms": thread_cpu_ms,
+        "relative_error": relative_error,
+        "max_relative_error": max_relative_error,
+    }
+
+
 def _parse_continuous_system_artifacts(
     artifact_dir: Path,
     *,
@@ -493,6 +578,84 @@ def _parse_continuous_system_artifacts(
     return parsed
 
 
+def _stability_system_integrity_errors(
+    args: argparse.Namespace,
+    artifact_dir: Path,
+    system_result: dict[str, Any],
+    windows: list[dict[str, Any]],
+) -> list[str]:
+    requested = _requested_collectors(args)
+    errors: list[str] = []
+    if "perf-stat" in requested and not (
+        system_result.get("perf_stat", {}).get("counters")
+    ):
+        errors.append("perf-stat produced no parseable counters")
+    if "perf-sched" in requested:
+        path = artifact_dir / "perf_sched.data"
+        if not path.is_file() or path.stat().st_size == 0:
+            errors.append("perf sched did not finalize a non-empty data file")
+    if "turbostat" in requested and not (
+        (
+            system_result.get("turbostat", {}).get("columns", {}).get("Bzy_MHz") or {}
+        ).get("samples")
+    ):
+        errors.append("turbostat produced no parseable Bzy_MHz samples")
+    if "thread-snapshot" in requested:
+        thread_summary = system_result.get("thread_summary") or {}
+        if int(thread_summary.get("samples", 0)) < 2:
+            errors.append("thread snapshot collector produced fewer than two samples")
+        if not thread_summary.get("threads"):
+            errors.append("thread snapshot collector observed no native threads")
+    if "gpu-dmon" in requested:
+        gpu = system_result.get("gpu_dmon") or {}
+        if not gpu.get("samples") or not (
+            (gpu.get("columns", {}).get("sm") or {}).get("samples")
+        ):
+            errors.append("nvidia-smi dmon produced no parseable SM samples")
+    if "cpu-frequency" in requested:
+        frequency = system_result.get("cpu_frequency") or {}
+        if int(frequency.get("samples", 0)) < 2:
+            errors.append("CPU frequency collector produced fewer than two samples")
+        if not frequency.get("cpu_samples"):
+            errors.append("CPU frequency collector produced no usable frequencies")
+        if frequency.get("busy_weighted_sampled_scaling_frequency_mhz") is None:
+            errors.append("CPU frequency collector produced no busy-weighted value")
+        expected_cpus = (
+            parse_cpu_list(args.cpu_frequency_cpus) if args.cpu_frequency_cpus else []
+        )
+        observed_cpus = set((frequency.get("scope") or {}).get("observed_cpus") or [])
+        missing_cpus = sorted(set(expected_cpus) - observed_cpus)
+        if missing_cpus:
+            errors.append(
+                f"CPU frequency collector did not observe selected CPUs {missing_cpus}"
+            )
+    for window in windows:
+        window_index = int(window["window"])
+        pressure = window.get("pressure") or {}
+        if "psi" in requested and pressure.get("cpu_psi_some_fraction") is None:
+            errors.append(f"stability window {window_index} has no global CPU PSI")
+        if (
+            "cgroup-psi" in requested
+            and pressure.get("cgroup_cpu_psi_some_fraction") is None
+        ):
+            errors.append(f"stability window {window_index} has no cgroup CPU PSI")
+        if "thread-snapshot" in requested:
+            accounting = window.get("thread_accounting") or {}
+            errors.extend(
+                f"stability window {window_index}: {error}"
+                for error in accounting.get("errors", [])
+            )
+        if "cpu-frequency" in requested:
+            telemetry = window.get("continuous_telemetry") or {}
+            frequency = telemetry.get("cpu_frequency") or {}
+            if int(frequency.get("samples", 0)) < 2:
+                errors.append(
+                    f"stability window {window_index} has fewer than two "
+                    "CPU frequency samples"
+                )
+    return errors
+
+
 async def _run_stability_characterization(
     args: argparse.Namespace,
     samples: list[Any],
@@ -506,7 +669,6 @@ async def _run_stability_characterization(
             "not enable the event recorder"
         )
 
-    requested = _requested_collectors(args)
     collectors = _build_collectors(
         args,
         artifact_dir,
@@ -560,22 +722,29 @@ async def _run_stability_characterization(
                 args,
                 target_pid=args.server_pid,
             )
-            threads_before = read_thread_snapshot(args.server_pid)
+            started_monotonic_ns = time.monotonic_ns()
             cpu_before = _process_cpu_seconds(args.server_pid)
+            threads_before = read_thread_snapshot(args.server_pid)
             started_wall_ns = time.time_ns()
             result = await _run_pass(args, window_samples)
             stopped_wall_ns = time.time_ns()
-            cpu_after = _process_cpu_seconds(args.server_pid)
             threads_after = read_thread_snapshot(args.server_pid)
+            cpu_after = _process_cpu_seconds(args.server_pid)
+            stopped_monotonic_ns = time.monotonic_ns()
             pressure_after = _read_pressure_snapshot(
                 args,
                 target_pid=args.server_pid,
             )
 
             evaluated = int(result["summary"]["evaluated"])
+            process_cpu_ms = (
+                (cpu_after - cpu_before) * 1000.0
+                if cpu_before is not None and cpu_after is not None
+                else None
+            )
             cpu_ms_per_request = (
-                (cpu_after - cpu_before) * 1000.0 / evaluated
-                if cpu_before is not None and cpu_after is not None and evaluated
+                process_cpu_ms / evaluated
+                if process_cpu_ms is not None and evaluated
                 else None
             )
             result["profile_harness"] = {
@@ -591,6 +760,11 @@ async def _run_stability_characterization(
                 threads_before,
                 threads_after,
             )
+            thread_accounting = _thread_accounting(
+                process_cpu_ms=process_cpu_ms,
+                thread_delta=thread_delta,
+                max_relative_error=args.max_thread_cpu_accounting_error,
+            )
             for row in thread_delta["threads"]:
                 row["cpu_ms_per_completed_request"] = (
                     float(row["cpu_ms"]) / evaluated if evaluated else None
@@ -600,12 +774,16 @@ async def _run_stability_characterization(
                 )
             system_window = {
                 "window": window_index,
+                "started_monotonic_ns": started_monotonic_ns,
+                "stopped_monotonic_ns": stopped_monotonic_ns,
                 "started_wall_ns": started_wall_ns,
                 "stopped_wall_ns": stopped_wall_ns,
                 "pressure": _pressure_window(pressure_before, pressure_after),
                 "thread_delta": thread_delta,
+                "thread_accounting": thread_accounting,
                 "process_cpu_s_before": cpu_before,
                 "process_cpu_s_after": cpu_after,
+                "process_cpu_ms": process_cpu_ms,
                 "cpu_ms_per_completed_request": cpu_ms_per_request,
             }
             system_path = (
@@ -639,6 +817,7 @@ async def _run_stability_characterization(
                         "threads_observed",
                     )
                 },
+                "thread_accounting": thread_accounting,
             }
             windows.append(window_record)
             write_json(
@@ -676,6 +855,31 @@ async def _run_stability_characterization(
         target_pid=args.server_pid,
     )
     completed_requests = sum(int(window["summary"]["evaluated"]) for window in windows)
+    for window in windows:
+        continuous_telemetry: dict[str, Any] = {}
+        cpu_frequency_path = artifact_dir / "cpu_frequency.jsonl"
+        if cpu_frequency_path.is_file():
+            continuous_telemetry["cpu_frequency"] = parse_cpu_frequency(
+                cpu_frequency_path,
+                start_monotonic_ns=int(window["started_monotonic_ns"]),
+                stop_monotonic_ns=int(window["stopped_monotonic_ns"]),
+            )
+        window["continuous_telemetry"] = continuous_telemetry
+        telemetry_path = (
+            artifact_dir
+            / "stability_windows"
+            / f"window_{int(window['window']):02d}_continuous.json"
+        )
+        write_json(telemetry_path, continuous_telemetry)
+        window["continuous_system_artifact"] = str(telemetry_path)
+    write_json(
+        artifact_dir / "stability_progress.json",
+        {
+            "requested_windows": args.characterization_windows,
+            "completed_windows": len(windows),
+            "windows": windows,
+        },
+    )
     system_result = {
         "target_pid": args.server_pid,
         "collector_start_errors": collector_start_errors,
@@ -689,6 +893,28 @@ async def _run_stability_characterization(
             completed_requests=completed_requests,
         ),
     }
+    system_integrity_errors = [
+        *[f"{row['name']}: {row['error']}" for row in collector_start_errors],
+        *[
+            (
+                f"{row['name']}: {row.get('error')}"
+                if row.get("error")
+                else f"{row['name']}: returncode={row.get('returncode')}"
+            )
+            for row in collector_results
+            if row.get("returncode") != 0 or row.get("error")
+        ],
+    ]
+    system_integrity_errors.extend(
+        _stability_system_integrity_errors(
+            args,
+            artifact_dir,
+            system_result,
+            windows,
+        )
+    )
+    system_result["integrity_errors"] = system_integrity_errors
+    system_result["valid"] = not system_integrity_errors
     write_json(artifact_dir / "system.json", system_result)
 
     rolling_stability: list[dict[str, Any]] = []
@@ -730,14 +956,25 @@ async def _run_stability_characterization(
         )
         for name in metric_names
     }
+    request_integrity = _request_integrity(shape_passes, windows)
+    capture_complete = (
+        run_error is None and len(windows) == args.characterization_windows
+    )
+    integrity_errors = [
+        *(
+            []
+            if capture_complete
+            else ["stability capture did not complete every requested window"]
+        ),
+        *request_integrity["errors"],
+        *system_integrity_errors,
+    ]
     result_payload = {
         "run_id": args.run_id,
         "mode": args.mode,
         "artifact_dir": str(artifact_dir),
         "workload_contract": args.workload_contract,
-        "capture_complete": (
-            run_error is None and len(windows) == args.characterization_windows
-        ),
+        "capture_complete": capture_complete,
         "run_error": (
             f"{type(run_error).__name__}: {run_error}"
             if run_error is not None
@@ -759,25 +996,13 @@ async def _run_stability_characterization(
         },
         # Preserve the campaign aggregator's existing metric input contract.
         "measured": [window["summary"] for window in windows],
+        "request_integrity": request_integrity,
         "system_integrity": {
-            "valid": not collector_start_errors
-            and all(
-                result.get("returncode") == 0 and not result.get("error")
-                for result in collector_results
-            ),
-            "errors": [
-                *[f"{row['name']}: {row['error']}" for row in collector_start_errors],
-                *[
-                    (
-                        f"{row['name']}: {row.get('error')}"
-                        if row.get("error")
-                        else f"{row['name']}: returncode={row.get('returncode')}"
-                    )
-                    for row in collector_results
-                    if row.get("returncode") != 0 or row.get("error")
-                ],
-            ],
+            "valid": not system_integrity_errors,
+            "errors": system_integrity_errors,
         },
+        "accepted": not integrity_errors,
+        "integrity_errors": integrity_errors,
     }
     write_json(artifact_dir / "result.json", result_payload)
     write_json(artifact_dir / "artifact_index.json", _artifact_index(artifact_dir))
@@ -864,6 +1089,11 @@ def _build_collectors(
         collectors.append(
             CpuFrequencyCollector(
                 output_path=artifact_dir / "cpu_frequency.jsonl",
+                cpus=(
+                    parse_cpu_list(args.cpu_frequency_cpus)
+                    if args.cpu_frequency_cpus
+                    else None
+                ),
             )
         )
     unknown = requested - {
@@ -1008,6 +1238,12 @@ def _system_integrity_errors(
         gpu_path = artifact_dir / "gpu_dmon.txt"
         if not gpu_path.is_file() or gpu_path.stat().st_size == 0:
             errors.append("nvidia-smi dmon produced no samples")
+    if "cpu-frequency" in requested:
+        frequency = system_result.get("cpu_frequency") or {}
+        if int(frequency.get("samples", 0)) < 2:
+            errors.append("CPU frequency collector produced fewer than two samples")
+        if frequency.get("busy_weighted_sampled_scaling_frequency_mhz") is None:
+            errors.append("CPU frequency collector produced no busy-weighted value")
     return errors
 
 
@@ -1475,6 +1711,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         gpu_path = artifact_dir / "gpu_dmon.txt"
         if gpu_path.is_file():
             system_result["gpu_dmon"] = parse_gpu_dmon(gpu_path)
+        cpu_frequency_path = artifact_dir / "cpu_frequency.jsonl"
+        if cpu_frequency_path.is_file():
+            system_result["cpu_frequency"] = parse_cpu_frequency(cpu_frequency_path)
         system_result["integrity_errors"] = _system_integrity_errors(
             args,
             artifact_dir,
@@ -1814,6 +2053,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gpu-index", type=int)
     parser.add_argument("--thread-sample-interval-ms", type=int, default=100)
+    parser.add_argument(
+        "--cpu-frequency-cpus",
+        default="",
+        help=(
+            "Optional CPU list for sampled scaling frequency (for example "
+            "0-15,64-79). Omit only for explicitly host-wide evidence."
+        ),
+    )
     parser.add_argument("--max-cpu-psi-some-fraction", type=float)
     parser.add_argument("--max-cgroup-cpu-psi-some-fraction", type=float)
     parser.add_argument(
@@ -1848,6 +2095,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stability-windows", type=int, default=3)
     parser.add_argument("--stability-tolerance", type=float, default=0.05)
     parser.add_argument("--max-warmup-windows", type=int, default=8)
+    parser.add_argument(
+        "--max-thread-cpu-accounting-error",
+        type=float,
+        default=0.05,
+        help=(
+            "Maximum relative difference between process CPU time and the "
+            "sum of persistent native-thread CPU time in stability windows."
+        ),
+    )
     parser.add_argument(
         "--characterization-windows",
         type=int,
@@ -1917,6 +2173,10 @@ def main() -> None:
         raise ValueError("--nsys-report is required in nsys mode")
     if not 0 < args.stability_tolerance < 1:
         raise ValueError("--stability-tolerance must be between 0 and 1")
+    if not 0 <= args.max_thread_cpu_accounting_error <= 1:
+        raise ValueError("--max-thread-cpu-accounting-error must be between 0 and 1")
+    if args.cpu_frequency_cpus:
+        parse_cpu_list(args.cpu_frequency_cpus)
     for name in (
         "max_cpu_psi_some_fraction",
         "max_cgroup_cpu_psi_some_fraction",

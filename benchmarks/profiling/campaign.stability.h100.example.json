@@ -48,6 +48,8 @@
     "3",
     "--stability-tolerance",
     "0.05",
+    "--max-thread-cpu-accounting-error",
+    "0.05",
     "--collectors",
     "psi,cgroup-psi,thread-snapshot,gpu-dmon,cpu-frequency",
     "--gpu-index",

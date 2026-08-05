@@ -189,6 +189,7 @@ def test_cpu_frequency_parser_reports_busy_weighted_frequency(tmp_path: Path) ->
     samples = [
         {
             "monotonic_ns": 1,
+            "requested_cpus": [0],
             "cpus": [
                 {
                     "cpu": 0,
@@ -200,6 +201,7 @@ def test_cpu_frequency_parser_reports_busy_weighted_frequency(tmp_path: Path) ->
         },
         {
             "monotonic_ns": 2,
+            "requested_cpus": [0],
             "cpus": [
                 {
                     "cpu": 0,
@@ -216,6 +218,50 @@ def test_cpu_frequency_parser_reports_busy_weighted_frequency(tmp_path: Path) ->
     )
     parsed = parse_cpu_frequency(output)
     assert parsed["samples"] == 2
-    assert parsed["frequency_mhz"]["mean"] == 2500.0
-    assert parsed["busy_weighted_frequency_mhz"] == 3000.0
+    assert parsed["scope"] == {
+        "kind": "selected_cpus",
+        "requested_cpus": [0],
+        "observed_cpus": [0],
+    }
+    assert parsed["sampled_scaling_frequency_mhz"]["mean"] == 2500.0
+    assert parsed["busy_weighted_sampled_scaling_frequency_mhz"] == 3000.0
     assert parsed["busy_ticks"] == 75
+
+
+def test_cpu_frequency_parser_filters_to_monotonic_window(tmp_path: Path) -> None:
+    output = tmp_path / "cpu_frequency.jsonl"
+    output.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "monotonic_ns": timestamp,
+                    "requested_cpus": [0],
+                    "cpus": [
+                        {
+                            "cpu": 0,
+                            "frequency_khz": frequency,
+                            "total_ticks": ticks,
+                            "idle_ticks": 0,
+                        }
+                    ],
+                }
+            )
+            for timestamp, frequency, ticks in (
+                (100, 1_000_000, 10),
+                (200, 2_000_000, 20),
+                (300, 3_000_000, 30),
+                (400, 4_000_000, 40),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    parsed = parse_cpu_frequency(
+        output,
+        start_monotonic_ns=200,
+        stop_monotonic_ns=300,
+    )
+    assert parsed["samples"] == 2
+    assert parsed["total_file_samples"] == 4
+    assert parsed["sampled_scaling_frequency_mhz"]["mean"] == 2500.0
+    assert parsed["busy_weighted_sampled_scaling_frequency_mhz"] == 3000.0

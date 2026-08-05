@@ -614,13 +614,14 @@ class ThreadSnapshotCollector:
 
 
 class CpuFrequencyCollector:
-    """Sample per-CPU frequency and utilization counters without linux-tools."""
+    """Sample scaling frequency and utilization counters without linux-tools."""
 
     def __init__(
         self,
         *,
         output_path: str | Path,
         interval_ms: int = 1000,
+        cpus: Sequence[int] | None = None,
     ) -> None:
         self.name = "cpu_frequency"
         self.output_path = Path(output_path).resolve()
@@ -628,6 +629,11 @@ class CpuFrequencyCollector:
             self.output_path.suffix + ".partial"
         )
         self.interval_s = max(int(interval_ms), 100) / 1000.0
+        self.cpus = (
+            tuple(sorted({int(cpu) for cpu in cpus})) if cpus is not None else None
+        )
+        if self.cpus is not None and any(cpu < 0 for cpu in self.cpus):
+            raise ValueError("CPU frequency sample CPUs must be non-negative")
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: str | None = None
@@ -649,8 +655,7 @@ class CpuFrequencyCollector:
         )
         self._thread.start()
 
-    @staticmethod
-    def _read_sample() -> dict[str, Any]:
+    def _read_sample(self) -> dict[str, Any]:
         counters: dict[int, tuple[int, int]] = {}
         try:
             lines = Path("/proc/stat").read_text(encoding="utf-8").splitlines()
@@ -665,7 +670,10 @@ class CpuFrequencyCollector:
                 ticks = [int(value) for value in fields[1:]]
             except ValueError:
                 continue
-            total = sum(ticks)
+            if self.cpus is not None and cpu not in self.cpus:
+                continue
+            # guest and guest_nice are already included in user and nice.
+            total = sum(ticks[:8])
             idle = sum(ticks[index] for index in (3, 4) if index < len(ticks))
             counters[cpu] = (total, idle)
 
@@ -688,6 +696,7 @@ class CpuFrequencyCollector:
             )
         return {
             "monotonic_ns": time.monotonic_ns(),
+            "requested_cpus": list(self.cpus) if self.cpus is not None else None,
             "cpus": rows,
         }
 
@@ -716,6 +725,7 @@ class CpuFrequencyCollector:
         result = {
             "name": self.name,
             "interval_ms": int(self.interval_s * 1000),
+            "requested_cpus": list(self.cpus) if self.cpus is not None else None,
             "samples": self._samples,
             "returncode": 0 if self._error is None else 1,
             "error": self._error,
@@ -984,14 +994,31 @@ def parse_gpu_dmon(path: str | Path) -> dict[str, Any]:
     }
 
 
-def parse_cpu_frequency(path: str | Path) -> dict[str, Any]:
+def parse_cpu_frequency(
+    path: str | Path,
+    *,
+    start_monotonic_ns: int | None = None,
+    stop_monotonic_ns: int | None = None,
+) -> dict[str, Any]:
     source = Path(path)
     if not source.is_file():
         return {"samples": 0, "error": "file is missing"}
-    samples = [
+    all_samples = [
         json.loads(line)
         for line in source.read_text(encoding="utf-8").splitlines()
         if line.strip()
+    ]
+    samples = [
+        sample
+        for sample in all_samples
+        if (
+            start_monotonic_ns is None
+            or int(sample["monotonic_ns"]) >= start_monotonic_ns
+        )
+        and (
+            stop_monotonic_ns is None
+            or int(sample["monotonic_ns"]) <= stop_monotonic_ns
+        )
     ]
     frequencies_mhz: list[float] = []
     busy_frequency_sum = 0.0
@@ -1012,18 +1039,43 @@ def parse_cpu_frequency(path: str | Path) -> dict[str, Any]:
             if busy and isinstance(frequency, (int, float)):
                 busy_ticks_sum += busy
                 busy_frequency_sum += busy * float(frequency) / 1000.0
+    observed_cpus = sorted(
+        {int(row["cpu"]) for sample in samples for row in sample.get("cpus", [])}
+    )
+    requested_cpus = next(
+        (
+            sample.get("requested_cpus")
+            for sample in samples
+            if "requested_cpus" in sample
+        ),
+        None,
+    )
+    sampled_frequency = {
+        "mean": statistics.mean(frequencies_mhz) if frequencies_mhz else None,
+        "min": min(frequencies_mhz) if frequencies_mhz else None,
+        "max": max(frequencies_mhz) if frequencies_mhz else None,
+    }
+    busy_weighted = busy_frequency_sum / busy_ticks_sum if busy_ticks_sum else None
     return {
         "samples": len(samples),
+        "total_file_samples": len(all_samples),
         "cpu_samples": len(frequencies_mhz),
-        "frequency_mhz": {
-            "mean": statistics.mean(frequencies_mhz) if frequencies_mhz else None,
-            "min": min(frequencies_mhz) if frequencies_mhz else None,
-            "max": max(frequencies_mhz) if frequencies_mhz else None,
+        "scope": {
+            "kind": (
+                "selected_cpus" if requested_cpus is not None else "all_online_cpus"
+            ),
+            "requested_cpus": requested_cpus,
+            "observed_cpus": observed_cpus,
         },
-        "busy_weighted_frequency_mhz": (
-            busy_frequency_sum / busy_ticks_sum if busy_ticks_sum else None
-        ),
+        "sampled_scaling_frequency_mhz": sampled_frequency,
+        "busy_weighted_sampled_scaling_frequency_mhz": busy_weighted,
+        # Compatibility aliases. These values are sampled scaling_cur_freq,
+        # never APERF/MPERF-derived effective frequency.
+        "frequency_mhz": sampled_frequency,
+        "busy_weighted_frequency_mhz": busy_weighted,
         "busy_ticks": busy_ticks_sum,
+        "start_monotonic_ns": start_monotonic_ns,
+        "stop_monotonic_ns": stop_monotonic_ns,
     }
 
 

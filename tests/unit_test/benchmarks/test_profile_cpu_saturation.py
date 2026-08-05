@@ -135,6 +135,8 @@ async def test_stability_characterization_preserves_all_unstable_windows(
         characterization_windows=4,
         stability_windows=3,
         stability_tolerance=0.05,
+        max_thread_cpu_accounting_error=0.05,
+        cpu_frequency_cpus="",
         run_id="unstable",
         mode="stability",
     )
@@ -147,11 +149,91 @@ async def test_stability_characterization_preserves_all_unstable_windows(
     )
     characterization = result["stability_characterization"]
     assert result["capture_complete"] is True
+    assert result["accepted"] is True
+    assert result["request_integrity"]["valid"] is True
     assert characterization["completed_windows"] == 4
     assert characterization["ever_stable"] is False
     assert len(list((artifact_dir / "stability_windows").glob("window_??.json"))) == 4
     assert (artifact_dir / "result.json").is_file()
     assert (artifact_dir / "artifact_index.json").is_file()
+
+
+def test_stability_request_integrity_rejects_incomplete_window() -> None:
+    incomplete = profile._summarize_pass(_result(3))
+    incomplete["evaluated"] = 2
+    incomplete["skipped"] = 1
+    incomplete["request_accounting"].update(
+        {
+            "completed": 2,
+            "failed": 1,
+            "http_rejected": 1,
+        }
+    )
+    integrity = profile._request_integrity(
+        [],
+        [{"window": 1, "summary": incomplete}],
+    )
+    assert integrity["valid"] is False
+    assert integrity["completed"] == 2
+    assert "completed 2/3" in integrity["errors"][0]
+
+
+def test_thread_accounting_rejects_missing_lifecycle_and_large_gap() -> None:
+    accounting = profile._thread_accounting(
+        process_cpu_ms=100.0,
+        thread_delta={
+            "cpu_ms": 80.0,
+            "threads_observed": 2,
+            "threads_started": [13],
+            "threads_exited": [],
+        },
+        max_relative_error=0.05,
+    )
+    assert accounting["valid"] is False
+    assert accounting["relative_error"] == pytest.approx(0.2)
+    assert any("threads started" in error for error in accounting["errors"])
+    assert any("relative error" in error for error in accounting["errors"])
+
+
+def test_stability_system_integrity_rejects_empty_requested_evidence(
+    tmp_path: Path,
+) -> None:
+    args = SimpleNamespace(
+        collectors="thread-snapshot,gpu-dmon,cpu-frequency,psi,cgroup-psi",
+        cpu_frequency_cpus="2-3",
+    )
+    errors = profile._stability_system_integrity_errors(
+        args,
+        tmp_path,
+        {
+            "thread_summary": {"samples": 1, "threads": []},
+            "gpu_dmon": {"samples": 0, "columns": {}},
+            "cpu_frequency": {
+                "samples": 1,
+                "cpu_samples": 0,
+                "scope": {"observed_cpus": [2]},
+                "busy_weighted_sampled_scaling_frequency_mhz": None,
+            },
+        },
+        [
+            {
+                "window": 1,
+                "pressure": {},
+                "thread_accounting": {"errors": ["CPU accounting is incomplete"]},
+                "continuous_telemetry": {
+                    "cpu_frequency": {"samples": 1},
+                },
+            }
+        ],
+    )
+    assert "thread snapshot collector produced fewer than two samples" in errors
+    assert "nvidia-smi dmon produced no parseable SM samples" in errors
+    assert "CPU frequency collector produced no usable frequencies" in errors
+    assert "CPU frequency collector did not observe selected CPUs [3]" in errors
+    assert "stability window 1 has no global CPU PSI" in errors
+    assert "stability window 1 has no cgroup CPU PSI" in errors
+    assert "stability window 1: CPU accounting is incomplete" in errors
+    assert "stability window 1 has fewer than two CPU frequency samples" in errors
 
 
 def test_summary_preserves_offered_dispatched_rejected_and_client_queue() -> None:

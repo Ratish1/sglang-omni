@@ -13,8 +13,10 @@ from benchmarks.profiling.run_cpu_saturation_campaign import (
     _bootstrap_median_ci,
     _causal_run_metrics,
     _cpu_psi_fraction_between,
+    _finalized_result_errors,
     _harness_argv,
     _metric,
+    _process_placement_snapshot,
     _resolve_stage_pid_from_server_log,
     _wait_for_ambient_cpu_psi,
     build_trial_plan,
@@ -119,6 +121,13 @@ def test_stability_campaign_is_unprofiled_and_retains_twenty_windows() -> None:
     )
     assert _arg_value(config["harness_args"], "--mode") == "stability"
     assert _arg_value(config["harness_args"], "--characterization-windows") == "20"
+    assert (
+        _arg_value(
+            config["harness_args"],
+            "--max-thread-cpu-accounting-error",
+        )
+        == "0.05"
+    )
     assert "events" not in config["harness_args"]
     assert config["protocol"]["continue_on_failure"] is True
 
@@ -145,6 +154,28 @@ def test_stability_campaign_uses_window_median() -> None:
         "measured": [{"throughput_samples_per_s": 100.0}],
     }
     assert _metric(result, "throughput_samples_per_s") == 30.0
+
+
+def test_rejected_stability_result_is_not_eligible_for_aggregation() -> None:
+    assert _finalized_result_errors(
+        {
+            "mode": "stability",
+            "accepted": False,
+            "integrity_errors": ["window 3 had a rejected request"],
+        }
+    ) == ["window 3 had a rejected request"]
+    assert _finalized_result_errors({"mode": "stability", "accepted": True}) == []
+
+
+def test_process_placement_snapshot_records_affinity_and_cgroup() -> None:
+    if not Path("/proc/self/status").is_file():
+        pytest.skip("requires Linux procfs")
+    snapshot = _process_placement_snapshot(os.getpid())
+    assert snapshot is not None
+    root = next(row for row in snapshot["processes"] if row["pid"] == os.getpid())
+    assert root["cpus_allowed_list"]
+    assert root["task_affinities"]
+    assert root["cgroup"] is not None
 
 
 def _psi_snapshot(monotonic_ns: int, total_us: int) -> dict:

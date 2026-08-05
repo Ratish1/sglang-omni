@@ -126,11 +126,23 @@ atomically preserves its request result and a matched system record containing
 host/cgroup PSI, stage CPU time, native-thread CPU and runnable-delay deltas,
 migrations, and request accounting. Continuous thread snapshots,
 `nvidia-smi dmon`, and the built-in sysfs/procfs `cpu-frequency` collector
-provide process scheduling, GPU utilization/clock, current CPU frequency, and
-busy-time-weighted effective MHz evidence. The server log remains the source
-for ordinary scheduler batching and occupancy lines; event recording stays
-off. Add `perf-stat` or `turbostat` only when matching kernel tools are
-actually available.
+provide process scheduling, GPU utilization/clock, and sampled
+`scaling_cur_freq`. The frequency result is explicitly labeled as sampled
+scaling frequency, not APERF/MPERF-derived effective MHz. Without
+`--cpu-frequency-cpus`, it is host-wide and CPU interferers contribute to its
+busy weighting. Placement experiments must pass the exact server CPU list.
+The server log remains the source for ordinary scheduler batching and
+occupancy lines; event recording stays off. Add `perf-stat` or `turbostat`
+only when matching kernel tools are actually available.
+
+Each workload window records monotonic and wall-clock boundaries. Its
+persistent native-thread CPU total must reconcile with stage process CPU time
+within `--max-thread-cpu-accounting-error`; thread birth or exit makes exact
+per-thread attribution invalid. The campaign records the server, stage, and
+interferer process trees with per-thread affinity and cgroup membership.
+Incomplete requests, missing requested collector samples, incomplete pressure
+windows, or failed CPU reconciliation preserve the artifacts but set
+`accepted=false`; rejected trials never enter campaign comparisons.
 
 Run one fresh server for `quiet` and one for `unbound-cpu64` first. Inspect the
 window distributions and telemetry before increasing restart count. Loaded

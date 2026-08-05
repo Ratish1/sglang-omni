@@ -287,6 +287,78 @@ def _resolve_stage_pid_from_server_log(
     return target_pid
 
 
+def _process_placement_snapshot(pid: int | None) -> dict[str, Any] | None:
+    """Capture process-tree cgroup and CPU placement without changing it."""
+    if pid is None:
+        return None
+    parent_by_pid: dict[int, int] = {}
+    status_by_pid: dict[int, dict[str, str]] = {}
+    for status_path in Path("/proc").glob("[0-9]*/status"):
+        try:
+            fields: dict[str, str] = {}
+            for line in status_path.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition(":")
+                if separator:
+                    fields[key] = value.strip()
+            process_pid = int(fields["Pid"])
+            parent_by_pid[process_pid] = int(fields["PPid"])
+            status_by_pid[process_pid] = fields
+        except (OSError, KeyError, ValueError):
+            continue
+    descendants = {int(pid)}
+    changed = True
+    while changed:
+        changed = False
+        for process_pid, parent_pid in parent_by_pid.items():
+            if parent_pid in descendants and process_pid not in descendants:
+                descendants.add(process_pid)
+                changed = True
+    processes: list[dict[str, Any]] = []
+    for process_pid in sorted(descendants):
+        fields = status_by_pid.get(process_pid) or {}
+        try:
+            cgroup = (
+                Path(f"/proc/{process_pid}/cgroup").read_text(encoding="utf-8").strip()
+            )
+        except OSError:
+            cgroup = None
+        task_affinities: dict[str, list[int]] = {}
+        for task_path in Path(f"/proc/{process_pid}/task").glob("[0-9]*"):
+            try:
+                task_affinities[task_path.name] = sorted(
+                    os.sched_getaffinity(int(task_path.name))
+                )
+            except (OSError, ValueError):
+                continue
+        processes.append(
+            {
+                "pid": process_pid,
+                "ppid": parent_by_pid.get(process_pid),
+                "name": fields.get("Name"),
+                "cgroup": cgroup,
+                "cpus_allowed_list": fields.get("Cpus_allowed_list"),
+                "mems_allowed_list": fields.get("Mems_allowed_list"),
+                "task_affinities": task_affinities,
+            }
+        )
+    return {
+        "root_pid": int(pid),
+        "captured_monotonic_ns": time.monotonic_ns(),
+        "processes": processes,
+    }
+
+
+def _root_cgroup(snapshot: dict[str, Any] | None) -> str | None:
+    if not snapshot:
+        return None
+    root_pid = snapshot.get("root_pid")
+    for process in snapshot.get("processes", []):
+        if process.get("pid") == root_pid:
+            value = process.get("cgroup")
+            return str(value) if value is not None else None
+    return None
+
+
 def _metric(result: dict[str, Any], key: str) -> float | None:
     if result.get("mode") == "stability":
         distribution = (
@@ -304,6 +376,20 @@ def _metric(result: dict[str, Any], key: str) -> float | None:
         float(item[key]) for item in measured if isinstance(item.get(key), (int, float))
     ]
     return statistics.mean(values) if values else None
+
+
+def _finalized_result_errors(result: dict[str, Any]) -> list[str]:
+    if result.get("mode") == "stability" and not result.get("accepted", False):
+        return [
+            str(error)
+            for error in (
+                result.get("integrity_errors")
+                or ["unknown stability integrity failure"]
+            )
+        ]
+    if result.get("accepted") is False:
+        return ["profiling result was rejected by its integrity contract"]
+    return []
 
 
 def _cpu_psi_fraction_between(
@@ -513,12 +599,12 @@ def _causal_run_metrics(result: dict[str, Any]) -> dict[str, float]:
         cpu_frequency = system.get("cpu_frequency") or {}
         for name, value in (
             (
-                "frequency_mhz_mean",
-                (cpu_frequency.get("frequency_mhz") or {}).get("mean"),
+                "sampled_scaling_frequency_mhz_mean",
+                (cpu_frequency.get("sampled_scaling_frequency_mhz") or {}).get("mean"),
             ),
             (
-                "busy_weighted_frequency_mhz",
-                cpu_frequency.get("busy_weighted_frequency_mhz"),
+                "busy_weighted_sampled_scaling_frequency_mhz",
+                cpu_frequency.get("busy_weighted_sampled_scaling_frequency_mhz"),
             ),
         ):
             if isinstance(value, (int, float)):
@@ -579,6 +665,25 @@ def _causal_run_metrics(result: dict[str, Any]) -> dict[str, float]:
                         f"window|threads|{name}_per_request",
                         [],
                     ).append(float(value) / completed)
+            window_frequency = (window.get("continuous_telemetry") or {}).get(
+                "cpu_frequency"
+            ) or {}
+            for name, value in (
+                (
+                    "sampled_scaling_frequency_mhz_mean",
+                    (window_frequency.get("sampled_scaling_frequency_mhz") or {}).get(
+                        "mean"
+                    ),
+                ),
+                (
+                    "busy_weighted_sampled_scaling_frequency_mhz",
+                    window_frequency.get("busy_weighted_sampled_scaling_frequency_mhz"),
+                ),
+            ):
+                if isinstance(value, (int, float)):
+                    window_metrics.setdefault(f"window|cpu|{name}", []).append(
+                        float(value)
+                    )
             by_name: dict[str, dict[str, float]] = {}
             for thread in thread_delta.get("threads", []):
                 name = str(thread.get("comm") or "unknown")
@@ -745,6 +850,7 @@ def run_campaign(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
         server_log = None
         interferer: subprocess.Popen[str] | None = None
         interferer_log = None
+        target_stage_pid: int | None = None
         record: dict[str, Any] = {
             **trial.__dict__,
             "run_id": run_id,
@@ -800,7 +906,6 @@ def run_campaign(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
                 run_id=run_id,
                 output_dir=output_dir / "artifacts",
             )
-            target_stage_pid = None
             if (
                 _argv_value(harness_argv, "--mode") == "stability"
                 and "--server-pid" not in harness_argv
@@ -811,6 +916,20 @@ def run_campaign(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
                     stage=str(_argv_value(harness_argv, "--stage", "asr")),
                 )
                 harness_argv.extend(["--server-pid", str(target_stage_pid)])
+            placement = {
+                "server": _process_placement_snapshot(server.pid),
+                "stage": _process_placement_snapshot(target_stage_pid),
+                "interferer": _process_placement_snapshot(
+                    interferer.pid if interferer else None
+                ),
+            }
+            stage_cgroup = _root_cgroup(placement["stage"])
+            interferer_cgroup = _root_cgroup(placement["interferer"])
+            placement["stage_and_interferer_same_root_cgroup"] = (
+                stage_cgroup == interferer_cgroup
+                if stage_cgroup is not None and interferer_cgroup is not None
+                else None
+            )
             write_json(
                 trial_dir / "launch.json",
                 {
@@ -819,6 +938,7 @@ def run_campaign(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
                     "interferer_argv": interferer_argv,
                     "interferer_pid": interferer.pid if interferer else None,
                     "target_stage_pid": target_stage_pid,
+                    "placement": placement,
                     "harness_argv": harness_argv,
                 },
             )
@@ -832,17 +952,25 @@ def run_campaign(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
                     stderr=subprocess.STDOUT,
                     check=False,
                 )
+            result_path = output_dir / "artifacts" / run_id / "result.json"
+            if result_path.is_file():
+                record["result_path"] = str(result_path)
             if completed.returncode != 0:
                 raise RuntimeError(
                     f"profiling harness failed rc={completed.returncode}"
                 )
-            result_path = output_dir / "artifacts" / run_id / "result.json"
             if not result_path.is_file():
                 raise RuntimeError(f"harness did not finalize {result_path}")
+            with result_path.open("r", encoding="utf-8") as handle:
+                finalized_result = json.load(handle)
+            finalized_errors = _finalized_result_errors(finalized_result)
+            if finalized_errors:
+                raise RuntimeError(
+                    "capture was preserved but rejected: " + "; ".join(finalized_errors)
+                )
             record.update(
                 {
                     "status": "completed",
-                    "result_path": str(result_path),
                 }
             )
         except Exception as exc:  # noqa: BLE001 - persist and isolate trial failure
@@ -853,6 +981,13 @@ def run_campaign(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
                 }
             )
         finally:
+            record["placement_before_stop"] = {
+                "server": _process_placement_snapshot(server.pid if server else None),
+                "stage": _process_placement_snapshot(target_stage_pid),
+                "interferer": _process_placement_snapshot(
+                    interferer.pid if interferer else None
+                ),
+            }
             record["interferer_stop"] = _stop_process(
                 interferer,
                 interferer_log,
