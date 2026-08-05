@@ -24,7 +24,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from benchmarks.profiling.system_collectors import write_json
+from benchmarks.profiling.system_collectors import (
+    psi_delta,
+    read_process_cgroup_psi,
+    read_psi,
+    write_json,
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,33 @@ def _load_config(path: Path) -> dict[str, Any]:
         raise ValueError("every condition requires a non-empty name")
     if len(set(names)) != len(names):
         raise ValueError("condition names must be unique")
+    host_preflight = config.get("host_preflight")
+    if host_preflight is not None:
+        if not isinstance(host_preflight, dict):
+            raise TypeError("host_preflight must be an object")
+        limits = (
+            host_preflight.get("max_cpu_psi_some_fraction"),
+            host_preflight.get("max_cgroup_cpu_psi_some_fraction"),
+        )
+        if all(value is None for value in limits):
+            raise ValueError("host_preflight requires at least one CPU PSI limit")
+        for key, value in zip(
+            (
+                "max_cpu_psi_some_fraction",
+                "max_cgroup_cpu_psi_some_fraction",
+            ),
+            limits,
+            strict=True,
+        ):
+            if value is not None and not 0 <= float(value) <= 1:
+                raise ValueError(f"host_preflight.{key} must be between 0 and 1")
+        for key, default in (
+            ("window_s", 5.0),
+            ("required_consecutive_windows", 2),
+            ("timeout_s", 300.0),
+        ):
+            if float(host_preflight.get(key, default)) <= 0:
+                raise ValueError(f"host_preflight.{key} must be positive")
     return config
 
 
@@ -196,11 +228,136 @@ def _harness_argv(
 
 
 def _metric(result: dict[str, Any], key: str) -> float | None:
+    reference = (result.get("adjacent_baselines") or {}).get("reference") or {}
+    if isinstance(reference.get(key), (int, float)):
+        return float(reference[key])
     measured = result.get("measured") or []
     values = [
         float(item[key]) for item in measured if isinstance(item.get(key), (int, float))
     ]
     return statistics.mean(values) if values else None
+
+
+def _cpu_psi_fraction_between(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> float | None:
+    delta = psi_delta(before, after)
+    stall_us = ((delta.get("cpu") or {}).get("some") or {}).get("total_us")
+    window_ns = delta.get("window_ns")
+    if (
+        not isinstance(stall_us, (int, float))
+        or not isinstance(window_ns, (int, float))
+        or window_ns <= 0
+    ):
+        return None
+    return float(stall_us) * 1000.0 / float(window_ns)
+
+
+def _read_ambient_pressure() -> dict[str, Any]:
+    return {
+        "global": read_psi(),
+        "cgroup": read_process_cgroup_psi(os.getpid()),
+    }
+
+
+def _wait_for_ambient_cpu_psi(
+    config: dict[str, Any] | None,
+    *,
+    output_path: Path,
+    snapshot_reader: Any = None,
+    sleep_fn: Any = None,
+    monotonic_fn: Any = None,
+) -> dict[str, Any]:
+    """Require quiet execution windows before starting trial processes."""
+    if not config:
+        report = {"enabled": False, "accepted": True, "observations": []}
+        write_json(output_path, report)
+        return report
+
+    snapshot_reader = snapshot_reader or _read_ambient_pressure
+    sleep_fn = sleep_fn or time.sleep
+    monotonic_fn = monotonic_fn or time.monotonic
+    global_limit = config.get("max_cpu_psi_some_fraction")
+    cgroup_limit = config.get("max_cgroup_cpu_psi_some_fraction")
+    limits = {
+        "global": float(global_limit) if global_limit is not None else None,
+        "cgroup": float(cgroup_limit) if cgroup_limit is not None else None,
+    }
+    window_s = float(config.get("window_s", 5.0))
+    required = int(config.get("required_consecutive_windows", 2))
+    timeout_s = float(config.get("timeout_s", 300.0))
+    if all(limit is None for limit in limits.values()):
+        raise ValueError("host_preflight requires at least one CPU PSI limit")
+    if any(limit is not None and not 0 <= limit <= 1 for limit in limits.values()):
+        raise ValueError("host preflight CPU PSI limits must be between 0 and 1")
+    if window_s <= 0 or required <= 0 or timeout_s <= 0:
+        raise ValueError("host preflight durations and window count must be positive")
+
+    started = monotonic_fn()
+    consecutive = 0
+    observations: list[dict[str, Any]] = []
+    report: dict[str, Any] = {
+        "enabled": True,
+        "accepted": False,
+        "max_cpu_psi_some_fraction": limits["global"],
+        "max_cgroup_cpu_psi_some_fraction": limits["cgroup"],
+        "window_s": window_s,
+        "required_consecutive_windows": required,
+        "timeout_s": timeout_s,
+        "observations": observations,
+    }
+    while monotonic_fn() - started + window_s <= timeout_s:
+        before = snapshot_reader()
+        sleep_fn(window_s)
+        after = snapshot_reader()
+        fractions = {
+            scope: (
+                _cpu_psi_fraction_between(before[scope], after[scope])
+                if isinstance(before.get(scope), dict)
+                and isinstance(after.get(scope), dict)
+                and "error" not in before[scope]
+                and "error" not in after[scope]
+                else None
+            )
+            for scope in ("global", "cgroup")
+        }
+        accepted_window = all(
+            limit is None
+            or (fractions[scope] is not None and fractions[scope] <= limit)
+            for scope, limit in limits.items()
+        )
+        consecutive = consecutive + 1 if accepted_window else 0
+        observations.append(
+            {
+                "window": len(observations) + 1,
+                "cpu_psi_some_fraction": fractions["global"],
+                "cgroup_cpu_psi_some_fraction": fractions["cgroup"],
+                "within_limit": accepted_window,
+                "consecutive_within_limit": consecutive,
+                "before": before,
+                "after": after,
+            }
+        )
+        report["elapsed_s"] = monotonic_fn() - started
+        report["last_cpu_psi_some_fraction"] = fractions["global"]
+        report["last_cgroup_cpu_psi_some_fraction"] = fractions["cgroup"]
+        report["accepted"] = consecutive >= required
+        write_json(output_path, report)
+        if report["accepted"]:
+            return report
+
+    report["elapsed_s"] = monotonic_fn() - started
+    write_json(output_path, report)
+    last_global = report.get("last_cpu_psi_some_fraction")
+    last_cgroup = report.get("last_cgroup_cpu_psi_some_fraction")
+    global_text = "unavailable" if last_global is None else f"{float(last_global):.4f}"
+    cgroup_text = "unavailable" if last_cgroup is None else f"{float(last_cgroup):.4f}"
+    raise RuntimeError(
+        "ambient CPU PSI preflight timed out: "
+        f"last global={global_text}, last cgroup={cgroup_text}, "
+        f"required consecutive windows={required}"
+    )
 
 
 def _bootstrap_median_ci(
@@ -388,6 +545,7 @@ def _aggregate(
             comparisons[f"{condition_name}_vs_{reference_name}"] = deltas
     summary = {
         "campaign_dir": str(campaign_dir),
+        "performance_source": "bracketed_unprofiled_reference",
         "reference_condition": reference_name,
         "conditions": conditions,
         "comparisons": comparisons,
@@ -444,6 +602,10 @@ def run_campaign(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
         }
         write_json(trial_dir / "condition.json", condition)
         try:
+            record["host_preflight"] = _wait_for_ambient_cpu_psi(
+                config.get("host_preflight"),
+                output_path=trial_dir / "host_preflight.json",
+            )
             server_argv = [
                 *[str(value) for value in condition.get("server_prefix_argv", [])],
                 *[str(value) for value in server_cfg["argv"]],

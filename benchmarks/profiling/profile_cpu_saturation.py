@@ -658,6 +658,170 @@ def _cpu_psi_some_fraction(delta: dict[str, Any] | None) -> float | None:
     return float(stall_us) * 1000.0 / float(window_ns)
 
 
+def _read_pressure_snapshot(
+    args: argparse.Namespace,
+    *,
+    target_pid: int | None,
+) -> dict[str, Any]:
+    requested = _requested_collectors(args)
+    return {
+        "psi": read_psi() if "psi" in requested else None,
+        "cgroup_psi": (
+            read_process_cgroup_psi(target_pid)
+            if target_pid is not None and "cgroup-psi" in requested
+            else None
+        ),
+    }
+
+
+def _pressure_window(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    global_before = before.get("psi")
+    global_after = after.get("psi")
+    cgroup_before = before.get("cgroup_psi")
+    cgroup_after = after.get("cgroup_psi")
+    global_delta = (
+        psi_delta(global_before, global_after)
+        if global_before is not None and global_after is not None
+        else None
+    )
+    cgroup_delta = (
+        psi_delta(cgroup_before, cgroup_after)
+        if cgroup_before is not None
+        and cgroup_after is not None
+        and "error" not in cgroup_before
+        and "error" not in cgroup_after
+        else None
+    )
+    return {
+        "before": before,
+        "after": after,
+        "psi_delta": global_delta,
+        "cgroup_psi_delta": cgroup_delta,
+        "cpu_psi_some_fraction": _cpu_psi_some_fraction(global_delta),
+        "cgroup_cpu_psi_some_fraction": _cpu_psi_some_fraction(cgroup_delta),
+    }
+
+
+def _pressure_limit_errors(
+    args: argparse.Namespace,
+    *,
+    label: str,
+    window: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    requested = _requested_collectors(args)
+    if "psi" in requested and window.get("psi_delta") is None:
+        errors.append(f"{label}: global PSI snapshots were not completed")
+    if "cgroup-psi" in requested and window.get("cgroup_psi_delta") is None:
+        errors.append(f"{label}: cgroup PSI snapshots were not completed")
+    for pressure_name, observed, limit in (
+        (
+            "global CPU PSI some",
+            window.get("cpu_psi_some_fraction"),
+            args.max_cpu_psi_some_fraction,
+        ),
+        (
+            "stage cgroup CPU PSI some",
+            window.get("cgroup_cpu_psi_some_fraction"),
+            args.max_cgroup_cpu_psi_some_fraction,
+        ),
+    ):
+        if limit is not None and observed is not None and observed > limit:
+            errors.append(
+                f"{label}: {pressure_name} fraction {observed:.4f} "
+                f"exceeds {limit:.4f}"
+            )
+    return errors
+
+
+def _midpoint_summary(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, float]:
+    """Build the unprofiled reference at the profiled window's time position."""
+    reference: dict[str, float] = {}
+    for key in (
+        "throughput_samples_per_s",
+        "latency_mean_s",
+        "latency_p50_s",
+        "latency_p95_s",
+        "latency_p99_s",
+        "rtf_mean",
+        "rtfx",
+        "cpu_ms_per_request",
+    ):
+        before_value = before.get(key)
+        after_value = after.get(key)
+        if isinstance(before_value, (int, float)) and isinstance(
+            after_value, (int, float)
+        ):
+            reference[key] = (float(before_value) + float(after_value)) / 2.0
+    return reference
+
+
+def _build_profile_perturbation(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    measured: list[dict[str, Any]],
+) -> dict[str, Any]:
+    reference = _midpoint_summary(before, after)
+    before_qps = float(before["throughput_samples_per_s"])
+    after_qps = float(after["throughput_samples_per_s"])
+    reference_qps = float(reference["throughput_samples_per_s"])
+    profiled_qps = statistics.mean(
+        float(result["throughput_samples_per_s"]) for result in measured
+    )
+    return {
+        "baseline_before_qps": before_qps,
+        "baseline_after_qps": after_qps,
+        "baseline_qps": reference_qps,
+        "baseline_relative_drift": (
+            (after_qps - before_qps) / reference_qps if reference_qps else None
+        ),
+        "profiled_qps": profiled_qps,
+        "relative_qps_change": (
+            (profiled_qps - reference_qps) / reference_qps if reference_qps else None
+        ),
+        "within_5_percent": (
+            abs(profiled_qps - reference_qps) / reference_qps <= 0.05
+            if reference_qps
+            else False
+        ),
+    }
+
+
+def _perturbation_integrity_errors(
+    args: argparse.Namespace,
+    perturbation: dict[str, Any] | None,
+) -> list[str]:
+    if perturbation is None:
+        return []
+    drift = perturbation.get("baseline_relative_drift")
+    if drift is None or abs(float(drift)) > args.max_adjacent_baseline_drift:
+        observed = "unavailable" if drift is None else f"{float(drift):+.2%}"
+        return [
+            "adjacent unprofiled baseline drift "
+            f"{observed} exceeds {args.max_adjacent_baseline_drift:.2%}; "
+            "profiler perturbation is inconclusive"
+        ]
+    relative_change = perturbation.get("relative_qps_change")
+    if (
+        args.mode == "events"
+        and relative_change is not None
+        and abs(float(relative_change)) > args.max_event_overhead
+        and not args.allow_event_overhead
+    ):
+        return [
+            "event-enabled QPS change "
+            f"{float(relative_change):+.2%} exceeds {args.max_event_overhead:.2%}; "
+            "the trace may have a material probe effect"
+        ]
+    return []
+
+
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     artifact_dir = Path(args.output_dir).expanduser().resolve() / args.run_id
     artifact_dir.mkdir(parents=True, exist_ok=False)
@@ -705,12 +869,30 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     write_json(artifact_dir / "warmup.json", warmup)
 
     adjacent_baseline = None
+    adjacent_baseline_after = None
+    adjacent_baseline_pressure: dict[str, Any] = {}
     if args.mode != "baseline" and not args.skip_adjacent_baseline:
+        pressure_before = _read_pressure_snapshot(
+            args,
+            target_pid=args.server_pid,
+        )
         adjacent_baseline = await _run_pass(args, measurement_samples)
         _require_complete(adjacent_baseline, allow_failures=args.allow_failures)
+        pressure_after = _read_pressure_snapshot(
+            args,
+            target_pid=args.server_pid,
+        )
+        adjacent_baseline_pressure["before"] = _pressure_window(
+            pressure_before,
+            pressure_after,
+        )
         write_json(
             artifact_dir / "adjacent_baseline.json",
             adjacent_baseline,
+        )
+        write_json(
+            artifact_dir / "adjacent_baseline_system.json",
+            adjacent_baseline_pressure,
         )
 
     base_url = f"http://{args.host}:{args.port}"
@@ -952,15 +1134,73 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         if stop_error is not None:
             raise stop_error
 
+    if adjacent_baseline is not None:
+        pressure_before = _read_pressure_snapshot(
+            args,
+            target_pid=target_pid,
+        )
+        adjacent_baseline_after = await _run_pass(args, measurement_samples)
+        _require_complete(
+            adjacent_baseline_after,
+            allow_failures=args.allow_failures,
+        )
+        pressure_after = _read_pressure_snapshot(
+            args,
+            target_pid=target_pid,
+        )
+        adjacent_baseline_pressure["after"] = _pressure_window(
+            pressure_before,
+            pressure_after,
+        )
+        write_json(
+            artifact_dir / "adjacent_baseline_after.json",
+            adjacent_baseline_after,
+        )
+        write_json(
+            artifact_dir / "adjacent_baseline_system.json",
+            adjacent_baseline_pressure,
+        )
+
+    adjacent_before_summary = (
+        _summarize_pass(adjacent_baseline) if adjacent_baseline is not None else None
+    )
+    adjacent_after_summary = (
+        _summarize_pass(adjacent_baseline_after)
+        if adjacent_baseline_after is not None
+        else None
+    )
+    adjacent_reference = (
+        _midpoint_summary(adjacent_before_summary, adjacent_after_summary)
+        if adjacent_before_summary is not None and adjacent_after_summary is not None
+        else None
+    )
+    control_integrity_errors: list[str] = []
+    for label, window in adjacent_baseline_pressure.items():
+        control_integrity_errors.extend(
+            _pressure_limit_errors(
+                args,
+                label=f"adjacent baseline {label}",
+                window=window,
+            )
+        )
+    system_integrity_errors = [
+        *system_result["integrity_errors"],
+        *control_integrity_errors,
+    ]
     result_payload: dict[str, Any] = {
         "run_id": args.run_id,
         "mode": args.mode,
         "artifact_dir": str(artifact_dir),
         "workload_contract": args.workload_contract,
         "warmup": warmup,
-        "adjacent_baseline": (
-            _summarize_pass(adjacent_baseline)
-            if adjacent_baseline is not None
+        "adjacent_baseline": adjacent_before_summary,
+        "adjacent_baselines": (
+            {
+                "before": adjacent_before_summary,
+                "after": adjacent_after_summary,
+                "reference": adjacent_reference,
+            }
+            if adjacent_before_summary is not None
             else None
         ),
         "measured": [_summarize_pass(result) for result in measured],
@@ -971,42 +1211,27 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "profile_start": start_response,
         "profile_stop": stop_response,
         "system_integrity": {
-            "valid": not system_result["integrity_errors"],
-            "errors": system_result["integrity_errors"],
+            "valid": not system_integrity_errors,
+            "errors": system_integrity_errors,
         },
     }
-    if adjacent_baseline is not None and measured:
-        baseline_qps = float(adjacent_baseline["speed"]["throughput_samples_per_s"])
-        measured_qps = statistics.mean(
-            float(result["speed"]["throughput_samples_per_s"]) for result in measured
-        )
-        result_payload["profile_perturbation"] = {
-            "baseline_qps": baseline_qps,
-            "profiled_qps": measured_qps,
-            "relative_qps_change": (
-                (measured_qps - baseline_qps) / baseline_qps if baseline_qps else None
-            ),
-            "within_5_percent": (
-                abs(measured_qps - baseline_qps) / baseline_qps <= 0.05
-                if baseline_qps
-                else False
-            ),
-        }
-
-    integrity_errors = list(system_result["integrity_errors"])
-    perturbation = result_payload.get("profile_perturbation")
     if (
-        args.mode == "events"
-        and perturbation is not None
-        and perturbation["relative_qps_change"] is not None
-        and abs(float(perturbation["relative_qps_change"])) > args.max_event_overhead
-        and not args.allow_event_overhead
+        adjacent_before_summary is not None
+        and adjacent_after_summary is not None
+        and measured
     ):
-        integrity_errors.append(
-            "event recorder perturbation "
-            f"{float(perturbation['relative_qps_change']):+.2%} exceeds "
-            f"{args.max_event_overhead:.2%}; attribution is not accepted"
+        result_payload["profile_perturbation"] = _build_profile_perturbation(
+            adjacent_before_summary,
+            adjacent_after_summary,
+            [_summarize_pass(result) for result in measured],
         )
+        result_payload["adjacent_baselines"]["baseline_relative_drift"] = (
+            result_payload["profile_perturbation"]["baseline_relative_drift"]
+        )
+
+    integrity_errors = list(system_integrity_errors)
+    perturbation = result_payload.get("profile_perturbation")
+    integrity_errors.extend(_perturbation_integrity_errors(args, perturbation))
     if stop_response is not None:
         integrity = validate_stop_response(
             stop_response,
@@ -1247,6 +1472,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measure-repeats", type=int, default=1)
     parser.add_argument("--skip-adjacent-baseline", action="store_true")
     parser.add_argument("--allow-failures", action="store_true")
+    parser.add_argument("--max-adjacent-baseline-drift", type=float, default=0.02)
     parser.add_argument("--max-event-overhead", type=float, default=0.02)
     parser.add_argument("--allow-event-overhead", action="store_true")
     parser.add_argument(
@@ -1306,6 +1532,8 @@ def main() -> None:
     for name in (
         "max_cpu_psi_some_fraction",
         "max_cgroup_cpu_psi_some_fraction",
+        "max_adjacent_baseline_drift",
+        "max_event_overhead",
     ):
         value = getattr(args, name)
         if value is not None and not 0 <= value <= 1:

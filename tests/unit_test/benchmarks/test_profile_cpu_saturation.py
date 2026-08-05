@@ -120,3 +120,62 @@ def test_summary_preserves_offered_dispatched_rejected_and_client_queue() -> Non
         "timed_out": 0,
         "max_client_queue_s": 0.25,
     }
+
+
+def test_profile_perturbation_uses_midpoint_of_bracketed_controls() -> None:
+    before = profile._summarize_pass(_result(3))
+    after = profile._summarize_pass(_result(3))
+    measured = profile._summarize_pass(_result(3))
+    before["throughput_samples_per_s"] = 30.0
+    after["throughput_samples_per_s"] = 32.0
+    measured["throughput_samples_per_s"] = 34.0
+
+    perturbation = profile._build_profile_perturbation(
+        before,
+        after,
+        [measured],
+    )
+
+    assert perturbation["baseline_qps"] == 31.0
+    assert perturbation["baseline_relative_drift"] == pytest.approx(2.0 / 31.0)
+    assert perturbation["relative_qps_change"] == pytest.approx(3.0 / 31.0)
+
+
+def test_unstable_controls_make_probe_effect_inconclusive() -> None:
+    args = SimpleNamespace(
+        mode="events",
+        max_adjacent_baseline_drift=0.02,
+        max_event_overhead=0.02,
+        allow_event_overhead=False,
+    )
+    errors = profile._perturbation_integrity_errors(
+        args,
+        {
+            "baseline_relative_drift": 0.08,
+            "relative_qps_change": 0.12,
+        },
+    )
+    assert len(errors) == 1
+    assert "baseline drift" in errors[0]
+    assert "inconclusive" in errors[0]
+    assert "event-enabled" not in errors[0]
+
+
+def test_stable_controls_expose_material_event_probe_effect() -> None:
+    args = SimpleNamespace(
+        mode="events",
+        max_adjacent_baseline_drift=0.02,
+        max_event_overhead=0.02,
+        allow_event_overhead=False,
+    )
+    errors = profile._perturbation_integrity_errors(
+        args,
+        {
+            "baseline_relative_drift": 0.01,
+            "relative_qps_change": 0.12,
+        },
+    )
+    assert errors == [
+        "event-enabled QPS change +12.00% exceeds 2.00%; "
+        "the trace may have a material probe effect"
+    ]

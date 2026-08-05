@@ -13,13 +13,24 @@ The harness performs a full corpus/shape warmup followed by independent
 stability windows, discovers the ASR stage PID through an acknowledged
 start/stop handshake, rejects incomplete ASR work, records request identities
 and immutable inputs, and validates the event state machine and finalized
-artifacts. An exited command is not automatically an accepted capture.
+artifacts. Every profiled pass is bracketed by matched unprofiled passes, and
+CPU PSI is captured around all three windows. An exited command is not
+automatically an accepted capture.
 
 ## One-shot H100 campaign
 
 This is the first command to run after the code gate. It owns every server
 restart, alternates quiet and 64-process CPU-stress trials in A/B/B/A order,
 and executes exactly five fresh-server trials per condition.
+
+Before each server starts, the campaign requires two consecutive five-second
+execution-cgroup CPU PSI windows at or below 2%. It waits for up to five
+minutes and persists both cgroup and host-wide PSI in `host_preflight.json`.
+The cgroup is the acceptance signal because the server inherits it; host-wide
+PSI is evidence but is not a hard gate on a shared machine where unrelated
+tenants may keep it elevated. This preflight runs before the campaign's own
+server or CPU interferer exists, so local stress is not mistaken for ambient
+contamination.
 
 The checked campaign uses client concurrency 32 independently of the 64 CPU
 interferer processes. Fun-ASR has 16 pending request-build slots plus a
@@ -75,9 +86,14 @@ that deviation and use the same level for every condition.
 The campaign is accepted only when all ten trials complete, every
 `result.json` has `accepted=true`, `integrity.valid=true`,
 `request_lifecycle_integrity.valid=true`, and
-`system_integrity.valid=true`, and the event perturbation is within 2%.
-`summary.json` reports per-condition values, medians, MAD, and seeded bootstrap
-95% intervals. Preserve the entire campaign directory.
+`system_integrity.valid=true`, the two unprofiled controls drift by no more
+than 2%, and the profiled QPS differs from their midpoint by no more than 2%.
+If control drift exceeds 2%, the run is classified as inconclusive rather
+than blaming the event recorder. Campaign throughput and latency are taken
+from the midpoint of the unprofiled controls; event-enabled results are used
+only for causal phase metrics. `summary.json` reports per-condition values,
+medians, MAD, and seeded bootstrap 95% intervals. Preserve the entire campaign
+directory.
 
 ## 1. Prepare the checkout and dataset
 
@@ -236,7 +252,9 @@ The output directory contains:
 - `manifest.json`: software, topology, cgroup, policy, corpus, and command;
 - `warmup/`: every raw shape and stability pass;
 - `warmup.json`: the accepted stability-window index;
-- `adjacent_baseline.json`: unprofiled comparison immediately before capture;
+- `adjacent_baseline.json`: matched unprofiled control immediately before;
+- `adjacent_baseline_after.json`: matched unprofiled control after finalization;
+- `adjacent_baseline_system.json`: PSI windows around both controls;
 - `events/*.jsonl`: request/build/encoder/scheduler phase events with PID/TID;
 - `measurement/`: every raw measured request result;
 - `thread_snapshots.jsonl`, `gpu_dmon.txt`, and `system.json`;
@@ -247,8 +265,13 @@ The output directory contains:
 
 Reject a run with failed requests, dropped events, missing stage
 acknowledgements, unstable warmup, or unexpected encoder-cache hits. The
-profiled and adjacent passes use the same duration-stratified sample subset;
-`--profile-samples 0` opts into the full corpus.
+profiled and both adjacent passes use the same duration-stratified sample
+subset and request concurrency; `--profile-samples 0` opts into the full
+corpus. Pressure limits apply independently to both controls and the profiled
+window when explicitly configured. The checked attribution campaign does not
+set a loaded-window PSI ceiling: PSI is a measured outcome and forcing it low
+would censor a possible CPU-saturation mechanism. It gates only ambient
+cgroup PSI before startup and records host-wide and cgroup pressure throughout.
 
 ## 5. Two bounded PyTorch operator traces
 
@@ -294,8 +317,10 @@ selected owner canary, CUDA launch-to-kernel correlation, scheduled steps,
 rank identity, event files, or finalization acknowledgement.
 
 Do not use the profiled run as the throughput baseline. `result.json` reports
-the adjacent-baseline perturbation. If the QPS loss exceeds 5%, use the trace
-only for operator attribution.
+the profiled change from the midpoint of the two unprofiled controls and their
+temporal drift. If the controls drift by more than 2%, the probe-effect
+comparison is inconclusive. Campaign performance always comes from the
+unprofiled controls.
 
 Enable expensive flags only in a second short run:
 

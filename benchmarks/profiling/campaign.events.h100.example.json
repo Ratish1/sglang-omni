@@ -46,16 +46,22 @@
     "256",
     "--collectors",
     "psi,cgroup-psi,thread-snapshot,gpu-dmon",
+    "--max-adjacent-baseline-drift",
+    "0.02",
+    "--max-event-overhead",
+    "0.02",
     "--gpu-index",
     "0"
   ],
+  "host_preflight": {
+    "max_cgroup_cpu_psi_some_fraction": 0.02,
+    "window_s": 5,
+    "required_consecutive_windows": 2,
+    "timeout_s": 300
+  },
   "conditions": [
     {
-      "name": "quiet",
-      "harness_args": [
-        "--max-cpu-psi-some-fraction",
-        "0.02"
-      ]
+      "name": "quiet"
     },
     {
       "name": "unbound-cpu64",
