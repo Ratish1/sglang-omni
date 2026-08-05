@@ -11,9 +11,10 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -134,10 +135,42 @@ def reconstruct_timelines(
 # appear in multiple pairs (e.g. prefill_start closes against both
 # first_emit and first_stream_chunk_sent → thinker TTFT / talker TTFCC).
 _STAGE_INTERVAL_EVENTS = (
+    ("http_request_received", "http_response_ready"),
+    ("http_request_received", "http_request_parsed"),
+    ("http_request_parsed", "coordinator_request_submitted"),
+    ("coordinator_request_submitted", "http_response_ready"),
+    ("stage_input_received", "scheduler_inbox_publish"),
+    ("scheduler_inbox_publish", "scheduler_inbox_receive"),
+    ("scheduler_inbox_receive", "request_builder_submitted"),
+    ("request_builder_submitted", "scheduler_request_build_start"),
+    ("request_builder_submitted", "request_builder_future_ready"),
     ("stage_input_received", "stage_complete"),
     ("encoder_start", "encoder_end"),
     ("preprocess_start", "preprocess_end"),
     ("scheduler_request_build_start", "scheduler_request_build_end"),
+    ("request_build.audio_load_start", "request_build.audio_load_end"),
+    (
+        "request_build.feature_extract_start",
+        "request_build.feature_extract_end",
+    ),
+    (
+        "request_build.tokenize_and_pack_start",
+        "request_build.tokenize_and_pack_end",
+    ),
+    ("request_build.pre_lm_wait_start", "request_build.pre_lm_wait_end"),
+    ("pre_lm_enqueue", "pre_lm_dequeue"),
+    ("pre_lm_enqueue", "pre_lm_future_publish"),
+    ("pre_lm_dequeue", "pre_lm_future_publish"),
+    ("pre_lm_batch_start", "pre_lm_batch_end"),
+    ("pre_lm_encode_start", "pre_lm_encode_submitted"),
+    ("pre_lm_encode_submitted", "pre_lm_gpu_complete"),
+    ("pre_lm_split_start", "pre_lm_split_end"),
+    ("pre_lm_gpu_wait_start", "pre_lm_gpu_complete"),
+    ("pre_lm_future_publish", "pre_lm_waiter_resumed"),
+    ("request_builder_future_ready", "request_builder_ready_drained"),
+    ("request_builder_ready_drained", "scheduler_queue_enter"),
+    ("scheduler_queue_enter", "scheduler_prefill_start"),
+    ("scheduler_request_build_hol_start", "scheduler_request_build_hol_end"),
     ("scheduler_prefill_start", "stage_first_stream_chunk_sent"),
     ("scheduler_prefill_start", "scheduler_first_emit"),
 )
@@ -388,11 +421,57 @@ def hop_breakdown(
 def build_report(source: str | Path | Iterable[str | Path]) -> dict[str, Any]:
     """Return all three views as a single dict for JSON serialization."""
     timelines = reconstruct_timelines(source)
+    all_events = [event for timeline in timelines.values() for event in timeline.events]
+    event_counts: dict[str, int] = defaultdict(int)
+    maxima: dict[str, float] = {}
+    batch_members: dict[str, set[str]] = defaultdict(set)
+    batch_sizes: dict[str, int] = {}
+    queue_waits_ms: list[float] = []
+    for event in all_events:
+        name = str(event.get("event_name"))
+        event_counts[name] += 1
+        metadata = event.get("metadata") or {}
+        for key in (
+            "backlog_depth",
+            "pending_builds",
+            "later_ready",
+            "queue_depth",
+            "waiting_queue_before",
+        ):
+            value = metadata.get(key)
+            if isinstance(value, (int, float)):
+                maxima[key] = max(maxima.get(key, float("-inf")), float(value))
+        batch_id = metadata.get("batch_id")
+        if batch_id and name == "pre_lm_batch_start":
+            batch_members[str(batch_id)].add(str(event.get("request_id")))
+            if isinstance(metadata.get("batch_size"), int):
+                batch_sizes[str(batch_id)] = int(metadata["batch_size"])
+            if isinstance(metadata.get("queue_wait_s"), (int, float)):
+                queue_waits_ms.append(float(metadata["queue_wait_s"]) * 1000.0)
+    observed_batch_sizes = [len(members) for members in batch_members.values()]
+    queue_waits_ms.sort()
     return {
         "timelines": {rid: tl.to_relative() for rid, tl in timelines.items()},
         "stage_breakdown": [row.to_dict() for row in stage_breakdown(timelines)],
         "hop_breakdown": [row.to_dict() for row in hop_breakdown(timelines)],
         "request_count": len(timelines),
+        "event_counts": dict(sorted(event_counts.items())),
+        "causal_state": {
+            "maxima": maxima,
+            "pre_lm_batches": len(batch_members),
+            "pre_lm_batch_size_mean": (
+                sum(observed_batch_sizes) / len(observed_batch_sizes)
+                if observed_batch_sizes
+                else None
+            ),
+            "pre_lm_batch_size_reported": batch_sizes,
+            "pre_lm_queue_wait_ms": {
+                "count": len(queue_waits_ms),
+                "p50": _percentile(queue_waits_ms, 0.50),
+                "p95": _percentile(queue_waits_ms, 0.95),
+                "max": queue_waits_ms[-1] if queue_waits_ms else None,
+            },
+        },
     }
 
 

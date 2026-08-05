@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from benchmarks.profiling.system_collectors import (
+    parse_gpu_dmon,
     parse_perf_stat,
+    parse_thread_snapshots,
     parse_turbostat,
     psi_delta,
     read_psi,
@@ -68,3 +71,68 @@ def test_turbostat_parser_uses_measured_busy_frequency(tmp_path: Path) -> None:
     parsed = parse_turbostat(output)
     assert parsed["columns"]["Bzy_MHz"]["mean"] == 2450.0
     assert parsed["columns"]["Busy%"]["min"] == 80.0
+
+
+def test_thread_snapshot_parser_attributes_cpu_and_runnable_delay(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "threads.jsonl"
+    samples = [
+        {
+            "monotonic_ns": 1_000_000_000,
+            "pid": 1,
+            "threads": [
+                {
+                    "tid": 10,
+                    "comm": "omni-request-build",
+                    "utime_ticks": 100,
+                    "stime_ticks": 20,
+                    "runtime_ns": 800_000_000,
+                    "runqueue_delay_ns": 100_000_000,
+                    "timeslices": 50,
+                    "processor": 2,
+                }
+            ],
+        },
+        {
+            "monotonic_ns": 2_000_000_000,
+            "pid": 1,
+            "threads": [
+                {
+                    "tid": 10,
+                    "comm": "omni-request-build",
+                    "utime_ticks": 150,
+                    "stime_ticks": 30,
+                    "runtime_ns": 1_300_000_000,
+                    "runqueue_delay_ns": 300_000_000,
+                    "timeslices": 80,
+                    "processor": 4,
+                }
+            ],
+        },
+    ]
+    output.write_text(
+        "".join(json.dumps(sample) + "\n" for sample in samples),
+        encoding="utf-8",
+    )
+    parsed = parse_thread_snapshots(output)
+    thread = parsed["threads"][0]
+    assert thread["tid"] == 10
+    assert thread["runtime_ms"] == 500.0
+    assert thread["runqueue_delay_ms"] == 200.0
+    assert thread["timeslices"] == 30
+    assert thread["runtime_fraction"] == 0.5
+
+
+def test_gpu_dmon_parser_reports_idle_fraction(tmp_path: Path) -> None:
+    output = tmp_path / "gpu_dmon.txt"
+    output.write_text(
+        "# gpu pwr gtemp mtemp sm mem enc dec jpg ofa mclk pclk\n"
+        "0 250 60 45 0 10 0 0 0 0 1200 1500\n"
+        "0 300 62 46 80 20 0 0 0 0 1200 1500\n",
+        encoding="utf-8",
+    )
+    parsed = parse_gpu_dmon(output)
+    assert parsed["samples"] == 2
+    assert parsed["columns"]["sm"]["mean"] == 40.0
+    assert parsed["columns"]["sm"]["zero_fraction"] == 0.5

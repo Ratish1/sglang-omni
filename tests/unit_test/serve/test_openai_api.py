@@ -1393,11 +1393,16 @@ def test_transcription_endpoint_returns_text_json() -> None:
 
     response = client.post(
         "/v1/audio/transcriptions",
-        data={"model": "openai/whisper-large-v3", "language": "en"},
+        data={
+            "model": "openai/whisper-large-v3",
+            "language": "en",
+            "request_id": "profile-request-1",
+        },
         files={"file": ("sample.wav", b"RIFF", "audio/wav")},
     )
 
     assert response.status_code == 200
+    assert response.headers["X-Request-Id"] == "profile-request-1"
     assert response.json() == {"text": "hello world"}
     assert transcription_client.requests
     request = transcription_client.requests[0]

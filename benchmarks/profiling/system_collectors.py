@@ -8,11 +8,15 @@ import os
 import platform
 import shutil
 import signal
+import statistics
 import subprocess
+import threading
 import time
+from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 _PERF_BASE_EVENTS = (
     "task-clock",
@@ -48,8 +52,7 @@ def capture_command(argv: Sequence[str], *, timeout_s: float = 20.0) -> CommandC
         [executable, *argv[1:]],
         check=False,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         timeout=timeout_s,
     )
     return CommandCapture(
@@ -65,6 +68,87 @@ def _read_text(path: str) -> str | None:
         return Path(path).read_text(encoding="utf-8").strip()
     except OSError:
         return None
+
+
+def _read_process_environ(pid: int) -> dict[str, str]:
+    """Read a bounded, profiling-relevant subset of a process environment."""
+    wanted_prefixes = (
+        "CUDA",
+        "NCCL",
+        "OMP",
+        "MKL",
+        "OPENBLAS",
+        "NUMEXPR",
+        "TORCH",
+        "SGLANG",
+        "HF_",
+        "PYTORCH",
+    )
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    result: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if b"=" not in item:
+            continue
+        key_raw, value_raw = item.split(b"=", 1)
+        key = key_raw.decode(errors="replace")
+        if key.startswith(wanted_prefixes):
+            result[key] = value_raw.decode(errors="replace")
+    return result
+
+
+def _process_tree(root_pid: int) -> list[dict[str, Any]]:
+    """Snapshot the root process and all visible descendants from procfs."""
+    parent_by_pid: dict[int, int] = {}
+    for status_path in Path("/proc").glob("[0-9]*/status"):
+        try:
+            fields = {}
+            for line in status_path.read_text(encoding="utf-8").splitlines():
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    fields[key] = value.strip()
+            pid = int(fields["Pid"])
+            parent_by_pid[pid] = int(fields["PPid"])
+        except (OSError, KeyError, ValueError):
+            continue
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid in parent_by_pid.items():
+            if ppid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    result: list[dict[str, Any]] = []
+    for pid in sorted(descendants):
+        cmdline = _read_text(f"/proc/{pid}/cmdline")
+        result.append(
+            {
+                "pid": pid,
+                "ppid": parent_by_pid.get(pid),
+                "cmdline": cmdline.replace("\0", " ") if cmdline else None,
+                "comm": _read_text(f"/proc/{pid}/comm"),
+                "cgroup": _read_text(f"/proc/{pid}/cgroup"),
+                "cpus_allowed_list": _status_value(pid, "Cpus_allowed_list"),
+                "mems_allowed_list": _status_value(pid, "Mems_allowed_list"),
+                "thread_count": len(list(Path(f"/proc/{pid}/task").glob("[0-9]*"))),
+            }
+        )
+    return result
+
+
+def _status_value(pid: int, key: str) -> str | None:
+    try:
+        for line in (
+            Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines()
+        ):
+            if line.startswith(f"{key}:"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return None
 
 
 def collect_static_manifest(
@@ -93,8 +177,10 @@ def collect_static_manifest(
         "nvidia_topology": ["nvidia-smi", "topo", "-m"],
         "nvidia_smi": [
             "nvidia-smi",
-            "--query-gpu=index,name,uuid,pci.bus_id,driver_version,"
-            "temperature.gpu,power.limit",
+            (
+                "--query-gpu=index,name,uuid,pci.bus_id,driver_version,"
+                "temperature.gpu,power.limit"
+            ),
             "--format=csv,noheader",
         ],
         "python": ["python3", "--version"],
@@ -118,7 +204,7 @@ def collect_static_manifest(
             }
         )
     captures = {name: asdict(capture_command(argv)) for name, argv in commands.items()}
-    return {
+    manifest = {
         "captured_at_ns": time.time_ns(),
         "platform": platform.platform(),
         "machine": platform.machine(),
@@ -138,7 +224,7 @@ def collect_static_manifest(
                 "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
             ),
             "energy_performance_preference": _read_text(
-                "/sys/devices/system/cpu/cpu0/cpufreq/" "energy_performance_preference"
+                "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
             ),
         },
         "cgroup": {
@@ -159,12 +245,26 @@ def collect_static_manifest(
             )
         },
     }
+    if server_pid is not None:
+        manifest["server_process"] = {
+            "cmdline": (
+                (_read_text(f"/proc/{server_pid}/cmdline") or "").replace("\0", " ")
+                or None
+            ),
+            "environment": _read_process_environ(server_pid),
+            "tree": _process_tree(server_pid),
+        }
+    return manifest
 
 
-def read_psi(root: str | Path = "/proc/pressure") -> dict[str, Any]:
+def read_psi(
+    root: str | Path = "/proc/pressure",
+    *,
+    cgroup_layout: bool = False,
+) -> dict[str, Any]:
     snapshot: dict[str, Any] = {"captured_monotonic_ns": time.monotonic_ns()}
     for resource in ("cpu", "memory", "io"):
-        path = Path(root) / resource
+        path = Path(root) / (f"{resource}.pressure" if cgroup_layout else resource)
         lines: dict[str, dict[str, float | int]] = {}
         try:
             content = path.read_text(encoding="utf-8")
@@ -210,6 +310,31 @@ def psi_delta(
             }
         delta[resource] = resource_delta
     return delta
+
+
+def _process_cgroup_root(pid: int) -> Path | None:
+    try:
+        lines = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        fields = line.split(":", 2)
+        if len(fields) == 3 and fields[0] == "0":
+            relative = fields[2].lstrip("/")
+            return Path("/sys/fs/cgroup") / relative
+    return None
+
+
+def read_process_cgroup_psi(pid: int) -> dict[str, Any]:
+    root = _process_cgroup_root(pid)
+    if root is None:
+        return {
+            "captured_monotonic_ns": time.monotonic_ns(),
+            "error": f"cannot resolve cgroup v2 root for pid {pid}",
+        }
+    snapshot = read_psi(root, cgroup_layout=True)
+    snapshot["root"] = str(root)
+    return snapshot
 
 
 class ManagedCollector:
@@ -281,17 +406,128 @@ class ManagedCollector:
         return result
 
 
+class ThreadSnapshotCollector:
+    """Low-overhead procfs CPU/runnable-delay sampler for every native TID."""
+
+    def __init__(
+        self,
+        *,
+        pid: int,
+        output_path: str | Path,
+        interval_ms: int = 100,
+    ) -> None:
+        self.name = "thread_snapshots"
+        self.pid = int(pid)
+        self.output_path = Path(output_path).resolve()
+        self.partial_path = self.output_path.with_suffix(
+            self.output_path.suffix + ".partial"
+        )
+        self.interval_s = max(int(interval_ms), 20) / 1000.0
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._error: str | None = None
+        self._samples = 0
+        self.started_monotonic_ns: int | None = None
+        self.stopped_monotonic_ns: int | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("thread snapshot collector is already running")
+        if not Path(f"/proc/{self.pid}/task").is_dir():
+            raise RuntimeError(f"process {self.pid} does not exist")
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.output_path.exists() or self.partial_path.exists():
+            raise FileExistsError(f"collector artifact exists: {self.output_path}")
+        self.started_monotonic_ns = time.monotonic_ns()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"thread-snapshot-{self.pid}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            with self.partial_path.open("x", encoding="utf-8") as handle:
+                while not self._stop_event.is_set():
+                    sample = {
+                        "monotonic_ns": time.monotonic_ns(),
+                        "pid": self.pid,
+                        "threads": self._read_threads(),
+                    }
+                    handle.write(json.dumps(sample, sort_keys=True) + "\n")
+                    self._samples += 1
+                    self._stop_event.wait(self.interval_s)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(self.partial_path, self.output_path)
+        except Exception as exc:  # noqa: BLE001 - preserve collector failure artifact
+            self._error = f"{type(exc).__name__}: {exc}"
+
+    def _read_threads(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for task_dir in sorted(Path(f"/proc/{self.pid}/task").glob("[0-9]*")):
+            try:
+                tid = int(task_dir.name)
+                raw_stat = (task_dir / "stat").read_text(encoding="utf-8")
+                close = raw_stat.rfind(")")
+                comm = raw_stat[raw_stat.find("(") + 1 : close]
+                fields = raw_stat[close + 2 :].split()
+                schedstat = (task_dir / "schedstat").read_text(encoding="utf-8").split()
+                rows.append(
+                    {
+                        "tid": tid,
+                        "comm": comm,
+                        "state": fields[0],
+                        "utime_ticks": int(fields[11]),
+                        "stime_ticks": int(fields[12]),
+                        "processor": int(fields[36]),
+                        "runtime_ns": int(schedstat[0]),
+                        "runqueue_delay_ns": int(schedstat[1]),
+                        "timeslices": int(schedstat[2]),
+                    }
+                )
+            except (OSError, ValueError, IndexError):
+                continue
+        return rows
+
+    def stop(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        thread = self._thread
+        if thread is None:
+            raise RuntimeError("thread snapshot collector was not started")
+        self._stop_event.set()
+        thread.join(timeout=timeout_s)
+        self.stopped_monotonic_ns = time.monotonic_ns()
+        if thread.is_alive():
+            self._error = f"collector did not stop within {timeout_s}s"
+        result = {
+            "name": self.name,
+            "pid": self.pid,
+            "interval_ms": int(self.interval_s * 1000),
+            "samples": self._samples,
+            "returncode": 0 if self._error is None else 1,
+            "error": self._error,
+            "started_monotonic_ns": self.started_monotonic_ns,
+            "stopped_monotonic_ns": self.stopped_monotonic_ns,
+            "output": str(self.output_path),
+            "finalized": self.output_path.is_file(),
+        }
+        self._thread = None
+        return result
+
+
 def perf_stat_collector(
     *,
     pid: int,
     output_path: str | Path,
     events: Sequence[str] = _PERF_BASE_EVENTS,
     interval_ms: int = 1000,
+    executable: str = "perf",
 ) -> ManagedCollector:
     return ManagedCollector(
         name="perf_stat",
         argv=[
-            "perf",
+            executable,
             "stat",
             "-x",
             ",",
@@ -310,11 +546,12 @@ def perf_sched_collector(
     *,
     pid: int,
     output_path: str | Path,
+    executable: str = "perf",
 ) -> ManagedCollector:
     return ManagedCollector(
         name="perf_sched",
         argv=[
-            "perf",
+            executable,
             "sched",
             "record",
             "-o",
@@ -336,6 +573,28 @@ def turbostat_collector(
     return ManagedCollector(
         name="turbostat",
         argv=argv,
+        stdout_path=output_path,
+    )
+
+
+def gpu_dmon_collector(
+    *,
+    gpu_index: int,
+    output_path: str | Path,
+    interval_s: int = 1,
+) -> ManagedCollector:
+    return ManagedCollector(
+        name="gpu_dmon",
+        argv=[
+            "nvidia-smi",
+            "dmon",
+            "-i",
+            str(gpu_index),
+            "-s",
+            "pucmt",
+            "-d",
+            str(max(interval_s, 1)),
+        ],
         stdout_path=output_path,
     )
 
@@ -395,9 +654,9 @@ def parse_turbostat(path: str | Path) -> dict[str, Any]:
             continue
         if header is None or len(fields) != len(header):
             continue
-        for column in values:
+        for column, samples in values.items():
             try:
-                values[column].append(float(fields[header.index(column)]))
+                samples.append(float(fields[header.index(column)]))
             except ValueError:
                 pass
     columns = {
@@ -415,23 +674,132 @@ def parse_turbostat(path: str | Path) -> dict[str, Any]:
     }
 
 
+def parse_thread_snapshots(path: str | Path) -> dict[str, Any]:
+    source = Path(path)
+    if not source.is_file():
+        return {"threads": [], "error": "file is missing"}
+    first: dict[int, tuple[int, dict[str, Any]]] = {}
+    last: dict[int, tuple[int, dict[str, Any]]] = {}
+    sample_count = 0
+    for line in source.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        sample = json.loads(line)
+        timestamp = int(sample["monotonic_ns"])
+        sample_count += 1
+        for row in sample.get("threads", []):
+            tid = int(row["tid"])
+            first.setdefault(tid, (timestamp, row))
+            last[tid] = (timestamp, row)
+    clock_ticks = float(os.sysconf("SC_CLK_TCK"))
+    rows: list[dict[str, Any]] = []
+    for tid in sorted(last):
+        start_timestamp, start = first[tid]
+        end_timestamp, end = last[tid]
+        window_ns = max(0, end_timestamp - start_timestamp)
+        runtime_ns = max(0, int(end["runtime_ns"]) - int(start["runtime_ns"]))
+        delay_ns = max(
+            0,
+            int(end["runqueue_delay_ns"]) - int(start["runqueue_delay_ns"]),
+        )
+        cpu_ticks = max(
+            0,
+            int(end["utime_ticks"])
+            + int(end["stime_ticks"])
+            - int(start["utime_ticks"])
+            - int(start["stime_ticks"]),
+        )
+        rows.append(
+            {
+                "tid": tid,
+                "comm": end.get("comm"),
+                "window_ms": window_ns / 1e6,
+                "cpu_ms": cpu_ticks * 1000.0 / clock_ticks,
+                "runtime_ms": runtime_ns / 1e6,
+                "runqueue_delay_ms": delay_ns / 1e6,
+                "timeslices": max(
+                    0,
+                    int(end["timeslices"]) - int(start["timeslices"]),
+                ),
+                "runtime_fraction": runtime_ns / window_ns if window_ns else None,
+                "runqueue_delay_fraction": (
+                    delay_ns / (runtime_ns + delay_ns) if runtime_ns + delay_ns else 0.0
+                ),
+                "last_processor": end.get("processor"),
+            }
+        )
+    rows.sort(key=lambda row: (-float(row["cpu_ms"]), int(row["tid"])))
+    return {"samples": sample_count, "threads": rows}
+
+
+def parse_gpu_dmon(path: str | Path) -> dict[str, Any]:
+    source = Path(path)
+    if not source.is_file():
+        return {"samples": 0, "columns": {}, "error": "file is missing"}
+    header: list[str] | None = None
+    values: dict[str, list[float]] = defaultdict(list)
+    for raw_line in source.read_text(encoding="utf-8", errors="replace").splitlines():
+        fields = raw_line.split()
+        if not fields:
+            continue
+        if fields[0] == "#" and len(fields) > 2 and fields[1] == "gpu":
+            header = fields[1:]
+            continue
+        if fields[0].startswith("#") or header is None or len(fields) != len(header):
+            continue
+        for index, name in enumerate(header):
+            if name == "gpu":
+                continue
+            try:
+                values[name].append(float(fields[index]))
+            except ValueError:
+                continue
+    columns = {
+        name: {
+            "samples": len(samples),
+            "mean": statistics.mean(samples) if samples else None,
+            "min": min(samples) if samples else None,
+            "max": max(samples) if samples else None,
+            "zero_fraction": (
+                sum(value == 0 for value in samples) / len(samples) if samples else None
+            ),
+        }
+        for name, samples in values.items()
+    }
+    return {
+        "samples": max((entry["samples"] for entry in columns.values()), default=0),
+        "columns": columns,
+    }
+
+
 def write_json(path: str | Path, data: Any) -> str:
     destination = Path(path).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("w", encoding="utf-8") as handle:
+    partial = destination.with_suffix(destination.suffix + ".partial")
+    if partial.exists():
+        raise FileExistsError(f"partial JSON artifact exists: {partial}")
+    with partial.open("x", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(partial, destination)
     return str(destination)
 
 
 __all__ = [
     "ManagedCollector",
+    "ThreadSnapshotCollector",
     "capture_command",
     "collect_static_manifest",
+    "gpu_dmon_collector",
+    "parse_gpu_dmon",
+    "parse_perf_stat",
+    "parse_thread_snapshots",
+    "parse_turbostat",
     "perf_sched_collector",
     "perf_stat_collector",
-    "parse_perf_stat",
-    "parse_turbostat",
     "psi_delta",
+    "read_process_cgroup_psi",
     "read_psi",
     "turbostat_collector",
     "write_json",

@@ -18,8 +18,13 @@ def test_scheduler_command_runs_lifecycle_on_consuming_thread(
 ) -> None:
     calls: list[tuple[str, str]] = []
 
-    def start(template, run_id=None, config=None):  # noqa: ANN001, ANN202
-        calls.append(("start", threading.current_thread().name))
+    def start(
+        template,
+        run_id=None,
+        config=None,
+        owner_label=None,
+    ):
+        calls.append((owner_label, threading.current_thread().name))
         return f"{template}.json.gz"
 
     monkeypatch.setattr(control.TorchProfiler, "start", start)
@@ -49,7 +54,7 @@ def test_scheduler_command_runs_lifecycle_on_consuming_thread(
 
     assert result["success"]
     assert result["owner_thread"] == "scheduler-asr"
-    assert calls == [("start", "scheduler-asr")]
+    assert calls == [("scheduler", "scheduler-asr")]
 
 
 def test_stop_flushes_async_work_before_export(

@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from itertools import count
 from typing import Any, Generic, TypeVar
 
+from sglang_omni.profiler.event_recorder import emit as _emit_profile_event
+from sglang_omni.profiler.torch_profiler import TorchProfiler, TorchProfilerConfig
+
 ItemT = TypeVar("ItemT")
 EncodedT = TypeVar("EncodedT")
 EmbeddingT = TypeVar("EmbeddingT")
@@ -32,6 +35,15 @@ class QueueEntry(Generic[ItemT]):
     stage: str | None = None
     entry_id: str | None = None
     batch_id: str | None = None
+
+
+@dataclass(slots=True)
+class PreLMProfilerCommand:
+    action: str
+    run_id: str | None
+    trace_path_template: str | None
+    config: dict[str, Any] | None
+    result_queue: queue.Queue[dict[str, Any]]
 
 
 class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
@@ -89,6 +101,106 @@ class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
                 ) from self._worker_error
             self._enqueue(item, future)
         return future
+
+    def run_profiler_command(
+        self,
+        *,
+        action: str,
+        run_id: str | None,
+        trace_path_template: str | None = None,
+        config: dict[str, Any] | None = None,
+        timeout_s: float = 120.0,
+    ) -> dict[str, Any]:
+        """Execute Torch profiler lifecycle on the encoder owner thread."""
+        if action not in {"start", "stop"}:
+            raise ValueError(f"unsupported pre-LM profiler action: {action}")
+        result_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        self._queue.put(
+            PreLMProfilerCommand(
+                action=action,
+                run_id=run_id,
+                trace_path_template=trace_path_template,
+                config=config,
+                result_queue=result_queue,
+            )
+        )
+        try:
+            return result_queue.get(timeout=timeout_s)
+        except queue.Empty as exc:
+            raise TimeoutError(
+                f"pre-LM encoder profiler {action} timed out after {timeout_s}s"
+            ) from exc
+
+    def _handle_profiler_command(self, item: Any) -> bool:
+        if not isinstance(item, PreLMProfilerCommand):
+            return False
+        result: dict[str, Any] = {
+            "action": item.action,
+            "run_id": item.run_id,
+            "pid": os.getpid(),
+            "owner_tid": threading.get_native_id(),
+            "owner_thread": threading.current_thread().name,
+            "owner_label": "pre_lm_encoder",
+            "success": False,
+        }
+        try:
+            if item.action == "start":
+                if not item.trace_path_template:
+                    raise ValueError("trace_path_template is required")
+                expected = TorchProfiler.start(
+                    item.trace_path_template,
+                    run_id=item.run_id,
+                    config=TorchProfilerConfig.from_dict(item.config),
+                    owner_label="pre_lm_encoder",
+                )
+                result.update(
+                    {
+                        "success": True,
+                        "status": "active",
+                        "trace": expected,
+                        "torch": TorchProfiler.snapshot(),
+                    }
+                )
+            else:
+                stopped = TorchProfiler.stop(run_id=item.run_id)
+                result.update(
+                    {
+                        "success": (stopped is None or not stopped.get("export_error")),
+                        "status": "exported" if stopped is not None else "inactive",
+                        "trace": (
+                            stopped.get("trace") if stopped is not None else None
+                        ),
+                        "torch": stopped,
+                    }
+                )
+                if stopped is not None and stopped.get("export_error"):
+                    result["error"] = stopped["export_error"]
+        except Exception as exc:
+            result.update(
+                {
+                    "status": "failed",
+                    "error": str(exc) or type(exc).__name__,
+                }
+            )
+        item.result_queue.put_nowait(result)
+        return True
+
+    def _get_queue_item(self) -> Any:
+        while True:
+            item = self._queue.get()
+            if not self._handle_profiler_command(item):
+                return item
+
+    def _get_queue_item_nowait(self) -> Any:
+        while True:
+            item = self._queue.get_nowait()
+            if not self._handle_profiler_command(item):
+                return item
+
+    @staticmethod
+    def _profiler_step() -> None:
+        if TorchProfiler.is_active() and TorchProfiler.is_owner_thread():
+            TorchProfiler.step()
 
     @abstractmethod
     def _next_batch(self) -> tuple[list[QueueEntry[ItemT]], bool]:
@@ -184,6 +296,17 @@ class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
         if entry.future.done():
             return
         try:
+            _emit_profile_event(
+                request_id=entry.request_id or "__pre_lm__",
+                stage=entry.stage,
+                event_name="pre_lm_future_publish",
+                metadata={
+                    "entry_id": entry.entry_id,
+                    "batch_id": entry.batch_id,
+                    "outcome": "error",
+                    "error_type": type(exc).__name__,
+                },
+            )
             entry.future.set_exception(exc)
         except concurrent.futures.InvalidStateError:
             logger.warning("pre-LM encoder future completed before exception dispatch")
@@ -193,6 +316,16 @@ class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
             return
         try:
             result = self._future_result(embedding)
+            _emit_profile_event(
+                request_id=entry.request_id or "__pre_lm__",
+                stage=entry.stage,
+                event_name="pre_lm_future_publish",
+                metadata={
+                    "entry_id": entry.entry_id,
+                    "batch_id": entry.batch_id,
+                    "outcome": "success",
+                },
+            )
             entry.future.set_result(result)
         except concurrent.futures.InvalidStateError:
             logger.warning("pre-LM encoder future completed before result dispatch")
@@ -263,6 +396,7 @@ class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
                             None,
                             time.perf_counter() - encode_start,
                         )
+                        self._profiler_step()
                         if shutdown:
                             return
                         batch = []
@@ -282,6 +416,7 @@ class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
                         recovered,
                         time.perf_counter() - encode_start,
                     )
+                    self._profiler_step()
                     if shutdown:
                         return
                     batch = []
@@ -294,6 +429,7 @@ class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
                     None,
                     time.perf_counter() - encode_start,
                 )
+                self._profiler_step()
                 if shutdown:
                     return
                 batch = []
@@ -302,4 +438,4 @@ class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
             self._fail_worker(worker_exc, batch)
 
 
-__all__ = ["PreLMEncoderService", "QueueEntry"]
+__all__ = ["PreLMEncoderService", "PreLMProfilerCommand", "QueueEntry"]

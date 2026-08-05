@@ -155,6 +155,7 @@ async def run_asr_seedtts_once(
     stream: bool = False,
     request_rate: float = float("inf"),
     request_rate_seed: int | None = None,
+    request_id_prefix: str = "",
 ) -> dict:
     """Run one SeedTTS ASR benchmark pass and return WER/speed/worker metrics."""
     before = _fetch_worker_snapshot(host, port)
@@ -167,6 +168,7 @@ async def run_asr_seedtts_once(
         concurrency=concurrency,
         request_rate=request_rate,
         request_rate_seed=request_rate_seed,
+        request_id_prefix=request_id_prefix,
         warmup=warmup,
         disable_tqdm=disable_tqdm,
         stream=stream,
@@ -418,8 +420,7 @@ async def _sweep(args, samples, concurrencies: list[int]) -> list[dict]:
             )
             if "text_ttft_mean_s" in result:
                 line += (
-                    f"ttft_mean="
-                    f"{_format_metric(result['text_ttft_mean_s'], 4, 's')} "
+                    f"ttft_mean={_format_metric(result['text_ttft_mean_s'], 4, 's')} "
                 )
             line += (
                 f"corpus_wer={_format_metric(result['corpus_wer'], 4)} "

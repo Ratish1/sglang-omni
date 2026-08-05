@@ -6,6 +6,7 @@ stream chunk routing, abort tracking, profiling.
 
 Dispatches all compute to scheduler (OmniScheduler or SimpleScheduler).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -14,8 +15,9 @@ import logging
 import os
 import queue as _queue_mod
 import threading
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Literal
 
 import torch
 
@@ -154,6 +156,7 @@ class Stage:
         self._scheduler_crash_error: BaseException | None = None
         self._background_task_error: BaseException | None = None
         self._profiler_event_paths: dict[str, str] = {}
+        self._profiler_owner_by_run: dict[str, str] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -835,8 +838,24 @@ class Stage:
             and getattr(self.scheduler, "requires_tp_work_fanout", False)
         ):
             self._tp_fanout.fanout_work(payload)
-        self.scheduler.inbox.put(
+        inbox = self.scheduler.inbox
+        try:
+            queue_depth_before = inbox.qsize()
+        except (AttributeError, NotImplementedError):
+            queue_depth_before = None
+        inbox.put(
             IncomingMessage(request_id=request_id, type="new_request", data=payload)
+        )
+        _emit_event(
+            request_id=request_id,
+            stage=self.name,
+            event_name="scheduler_inbox_publish",
+            metadata={
+                "queue_depth_before": queue_depth_before,
+                "queue_depth_after": (
+                    queue_depth_before + 1 if queue_depth_before is not None else None
+                ),
+            },
         )
 
     async def _on_admin(self, msg: AdminMessage) -> None:
@@ -1511,6 +1530,16 @@ class Stage:
 
     async def _send_failure(self, request_id: str, error: str) -> None:
         self._record_aborted_request_id(request_id)
+        _emit_event(
+            request_id=request_id,
+            stage=self.name,
+            event_name="stage_complete",
+            metadata={
+                "terminal": self._is_terminal,
+                "outcome": "error",
+                "error": str(error)[:512],
+            },
+        )
         if not self._owns_external_io:
             self._clear_request_state(request_id)
             raise RuntimeError(f"Follower stage {self.name} failed: {error}")
@@ -1667,10 +1696,15 @@ class Stage:
                 f"run_id={recorder.active_run_id()}"
             )
         if msg.enable_torch or msg.enable_nvtx:
-            if msg.torch_owner != "scheduler":
+            if msg.torch_owner not in {"scheduler", "pre_lm_encoder"}:
                 raise ValueError(
                     f"unsupported torch_owner={msg.torch_owner!r}; "
-                    "only 'scheduler' is implemented"
+                    "expected 'scheduler' or 'pre_lm_encoder'"
+                )
+            if msg.torch_owner == "pre_lm_encoder" and msg.enable_nvtx:
+                raise ValueError(
+                    "NVTX capture-window ownership remains scheduler-owned; "
+                    "use pre_lm_encoder only for a separate Torch capture"
                 )
             base_tpl = msg.trace_path_template.format(
                 run_id=msg.run_id,
@@ -1680,19 +1714,29 @@ class Stage:
             prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
             if prof_dir and not os.path.isabs(template):
                 template = os.path.join(prof_dir, template)
-            torch_result = await self._run_scheduler_profiler_command(
-                action="profiler_start",
-                op_id=msg.op_id,
-                run_id=msg.run_id,
-                trace_path_template=template,
-                torch_config=msg.torch_config,
-                enable_torch=msg.enable_torch,
-                enable_nvtx=msg.enable_nvtx,
-                timeout_s=msg.timeout_s,
-            )
+            if msg.torch_owner == "scheduler":
+                torch_result = await self._run_scheduler_profiler_command(
+                    action="profiler_start",
+                    op_id=msg.op_id,
+                    run_id=msg.run_id,
+                    trace_path_template=template,
+                    torch_config=msg.torch_config,
+                    enable_torch=msg.enable_torch,
+                    enable_nvtx=msg.enable_nvtx,
+                    timeout_s=msg.timeout_s,
+                )
+            else:
+                torch_result = await self._run_pre_lm_profiler_command(
+                    action="start",
+                    run_id=msg.run_id,
+                    trace_path_template=template,
+                    torch_config=msg.torch_config,
+                    timeout_s=msg.timeout_s,
+                )
             target.update(torch_result)
             if not torch_result.get("success"):
                 return target
+            self._profiler_owner_by_run[msg.run_id] = msg.torch_owner
 
         if msg.event_dir is not None:
             try:
@@ -1708,12 +1752,20 @@ class Stage:
                 self._profiler_event_paths[msg.run_id] = event_path
             except Exception:
                 if msg.enable_torch or msg.enable_nvtx:
-                    await self._run_scheduler_profiler_command(
-                        action="profiler_stop",
-                        op_id=f"{msg.op_id}-rollback",
-                        run_id=msg.run_id,
-                        timeout_s=msg.timeout_s,
-                    )
+                    if msg.torch_owner == "scheduler":
+                        await self._run_scheduler_profiler_command(
+                            action="profiler_stop",
+                            op_id=f"{msg.op_id}-rollback",
+                            run_id=msg.run_id,
+                            timeout_s=msg.timeout_s,
+                        )
+                    else:
+                        await self._run_pre_lm_profiler_command(
+                            action="stop",
+                            run_id=msg.run_id,
+                            timeout_s=msg.timeout_s,
+                        )
+                    self._profiler_owner_by_run.pop(msg.run_id, None)
                 raise
         target["success"] = True
         target["status"] = "active"
@@ -1721,13 +1773,30 @@ class Stage:
 
     async def _stop_local_profiler(self, msg: ProfilerStopMessage) -> dict[str, Any]:
         target = self._base_profiler_target("stop")
-        torch_result = await self._run_scheduler_profiler_command(
-            action="profiler_stop",
-            op_id=msg.op_id,
-            run_id=msg.run_id,
-            timeout_s=msg.timeout_s,
-        )
+        owner_run_id = msg.run_id or _get_recorder().active_run_id()
+        if owner_run_id is None and len(self._profiler_owner_by_run) == 1:
+            owner_run_id = next(iter(self._profiler_owner_by_run))
+        torch_owner = (
+            self._profiler_owner_by_run.get(owner_run_id)
+            if owner_run_id is not None
+            else None
+        ) or "scheduler"
+        if torch_owner == "pre_lm_encoder":
+            torch_result = await self._run_pre_lm_profiler_command(
+                action="stop",
+                run_id=msg.run_id,
+                timeout_s=msg.timeout_s,
+            )
+        else:
+            torch_result = await self._run_scheduler_profiler_command(
+                action="profiler_stop",
+                op_id=msg.op_id,
+                run_id=msg.run_id,
+                timeout_s=msg.timeout_s,
+            )
         target.update(torch_result)
+        if owner_run_id is not None:
+            self._profiler_owner_by_run.pop(owner_run_id, None)
 
         recorder = _get_recorder()
         event_status = recorder.snapshot()
@@ -1739,16 +1808,27 @@ class Stage:
         stopped_path = None
         if recorder.is_active() and (msg.run_id is None or event_run_id == msg.run_id):
             stopped_path = recorder.stop(run_id=msg.run_id)
+        finalized_status = recorder.snapshot()
         target["events"] = {
-            **event_status,
+            **finalized_status,
             "active": recorder.is_active(),
             "path": stopped_path or event_path,
             "run_id": event_run_id,
-            "flushed": stopped_path is not None or not event_status["active"],
+            "flushed": bool(finalized_status.get("finalized")),
         }
         if requested_run_id is not None:
             self._profiler_event_paths.pop(requested_run_id, None)
-        target["success"] = bool(torch_result.get("success"))
+        event_success = not event_status["active"] or (
+            bool(finalized_status.get("finalized"))
+            and not finalized_status.get("writer_error")
+            and not finalized_status.get("dropped_events")
+        )
+        target["success"] = bool(torch_result.get("success")) and event_success
+        if not event_success:
+            target["error"] = (
+                finalized_status.get("writer_error")
+                or "event recorder did not finalize without drops"
+            )
         target["status"] = (
             "exported" if target["success"] else torch_result.get("status", "failed")
         )
@@ -1803,6 +1883,34 @@ class Stage:
                 ) from exc
 
         return await asyncio.to_thread(_wait)
+
+    async def _run_pre_lm_profiler_command(
+        self,
+        *,
+        action: str,
+        run_id: str | None,
+        trace_path_template: str | None = None,
+        torch_config: dict[str, Any] | None = None,
+        timeout_s: float = 120.0,
+    ) -> dict[str, Any]:
+        scheduler = self.scheduler
+        owner = (
+            scheduler.get_profiler_owner("pre_lm_encoder")
+            if scheduler is not None and hasattr(scheduler, "get_profiler_owner")
+            else None
+        )
+        if owner is None or not hasattr(owner, "run_profiler_command"):
+            raise RuntimeError(
+                f"stage {self.name} has no pre-LM encoder profiler owner"
+            )
+        return await asyncio.to_thread(
+            owner.run_profiler_command,
+            action=action,
+            run_id=run_id,
+            trace_path_template=trace_path_template,
+            config=torch_config,
+            timeout_s=timeout_s,
+        )
 
     async def _collect_follower_profiler_targets(
         self,

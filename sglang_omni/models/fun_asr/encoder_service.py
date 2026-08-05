@@ -123,6 +123,7 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
         self._queue_wait_max_s = 0.0
         self._encoder_time_s = 0.0
         self._profile_batch_ids = count(1)
+        self._profile_active_batch: list[tuple[str, str | None, str | None]] = []
         super().__init__(worker_name="fun-asr-audio-encode")
 
     def close(self) -> None:
@@ -178,6 +179,12 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
             )
             future = self._submit(item)
             future.result(timeout=self.ENCODE_TIMEOUT_S)
+            _emit_event(
+                request_id=request_id,
+                stage=stage,
+                event_name="pre_lm_waiter_resumed",
+                metadata={"role": "leader", "cacheable": False},
+            )
             return
 
         cached = self._cache.get(key)
@@ -244,6 +251,15 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
             return
         try:
             embedding = future.result(timeout=self.ENCODE_TIMEOUT_S)
+            _emit_event(
+                request_id=request_id,
+                stage=stage,
+                event_name="pre_lm_waiter_resumed",
+                metadata={
+                    "role": "leader" if leader else "follower",
+                    "cacheable": True,
+                },
+            )
         except Exception:
             with self._lock:
                 self._failed += 1
@@ -259,8 +275,7 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
             with self._lock:
                 self._failed += 1
             raise RuntimeError(
-                f"Fun-ASR pre-LM encode leader for {key} returned an invalid "
-                f"embedding"
+                f"Fun-ASR pre-LM encode leader for {key} returned an invalid embedding"
             )
         self.attach_embedding(item, embedding)
 
@@ -325,7 +340,7 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
     def _drain_batch(
         self,
     ) -> tuple[list[QueueEntry[Any]], bool]:
-        first = self._queue.get()
+        first = self._get_queue_item()
         if first is _SHUTDOWN:
             return [], True
         batch = [cast(QueueEntry[Any], first)]
@@ -337,10 +352,12 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                 queued = (
                     self._queue.get(timeout=remaining)
                     if remaining > 0
-                    else self._queue.get_nowait()
+                    else self._get_queue_item_nowait()
                 )
             except queue.Empty:
                 break
+            if self._handle_profiler_command(queued):
+                continue
             if queued is _SHUTDOWN:
                 shutdown = True
                 break
@@ -360,8 +377,15 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                     yield
 
     def encode_batch(self, items: list[Any]) -> torch.Tensor:
+        self._emit_batch_phase(items, "pre_lm_encode_start")
         with trace_range("pre_lm.encode"):
-            return self._model.get_audio_feature(items)
+            encoded = self._model.get_audio_feature(items)
+        self._emit_batch_phase(
+            items,
+            "pre_lm_encode_submitted",
+            metadata={"device": str(self._device)},
+        )
+        return encoded
 
     def split_embeddings(
         self,
@@ -387,14 +411,69 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                 f"({embedding.dtype}) != expected rows "
                 f"{sum(token_counts)}x{self._hidden_size} ({self._dtype})"
             )
+        self._emit_batch_phase(items, "pre_lm_split_start")
         with trace_range("pre_lm.split_embeddings"):
             parts = torch.split(embedding, token_counts, dim=0)
-            return [part.clone() for part in parts]
+            result = [part.clone() for part in parts]
+        self._emit_batch_phase(items, "pre_lm_split_end")
+        return result
 
     def synchronize_batch(self) -> None:
         if self._stream is not None:
+            self._emit_active_batch_phase(
+                "pre_lm_gpu_wait_start",
+                metadata={"device": str(self._device)},
+            )
             with trace_range("pre_lm.synchronize"):
                 self._stream.synchronize()
+            self._emit_active_batch_phase(
+                "pre_lm_gpu_complete",
+                metadata={"device": str(self._device)},
+            )
+
+    @staticmethod
+    def _item_profile_identity(item: Any) -> tuple[str, str | None, str | None]:
+        model_data = getattr(item, "model_specific_data", None)
+        model_data = model_data if isinstance(model_data, dict) else {}
+        return (
+            str(
+                getattr(item, "_omni_request_id", None)
+                or model_data.get("_omni_request_id")
+                or "__pre_lm__"
+            ),
+            getattr(item, "_omni_stage", None) or model_data.get("_omni_stage"),
+            getattr(item, "_omni_pre_lm_batch_id", None),
+        )
+
+    def _emit_batch_phase(
+        self,
+        items: list[Any],
+        event_name: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        for item in items:
+            request_id, stage, batch_id = self._item_profile_identity(item)
+            _emit_event(
+                request_id=request_id,
+                stage=stage,
+                event_name=event_name,
+                metadata={"batch_id": batch_id, **(metadata or {})},
+            )
+
+    def _emit_active_batch_phase(
+        self,
+        event_name: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        for request_id, stage, batch_id in self._profile_active_batch:
+            _emit_event(
+                request_id=request_id,
+                stage=stage,
+                event_name=event_name,
+                metadata={"batch_id": batch_id, **(metadata or {})},
+            )
 
     def cache_embedding(self, item: Any, embedding: torch.Tensor) -> None:
         key = self._cache_key(item)
@@ -415,6 +494,10 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
         batch_id = f"{os.getpid()}:{next(self._profile_batch_ids)}"
         for entry in batch:
             entry.batch_id = batch_id
+            entry.item._omni_pre_lm_batch_id = batch_id
+        self._profile_active_batch = [
+            (entry.request_id or "__pre_lm__", entry.stage, batch_id) for entry in batch
+        ]
         queue_waits = [
             dequeue_time - entry.enqueued_at
             for entry in batch
@@ -474,6 +557,7 @@ class FunASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                     "retry_recovered": retry_recovered,
                 },
             )
+        self._profile_active_batch = []
         with self._lock:
             self._encoder_time_s += elapsed_s
             if batch_exc is not None:

@@ -21,10 +21,11 @@ import time
 import types
 from array import array
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from itertools import islice
-from typing import Any, Callable
+from typing import Any
 
 import torch
 from sglang.srt.environ import envs
@@ -257,7 +258,8 @@ class OmniScheduler:
         self._pending_request_builds: dict[str, tuple[Any, bool, Future]] = {}
         self._backlogged_request_build_payloads: deque[Any] = deque()
         self._request_build_max_pending_observed = 0
-        self._profile_last_hol_emit_ns = 0
+        self._profile_hol_head: tuple[str, int, int] | None = None
+        self._profiler_owners: dict[str, Any] = {}
 
         # --- Core scheduling state (read/written by upstream methods) -----
         self.server_args = server_args
@@ -536,6 +538,16 @@ class OmniScheduler:
         self._execution_bridge = bridge
         self.future_map = bridge.future_map
 
+    def register_profiler_owner(self, name: str, owner: Any) -> None:
+        if not name:
+            raise ValueError("profiler owner name must be non-empty")
+        if name in self._profiler_owners and self._profiler_owners[name] is not owner:
+            raise RuntimeError(f"profiler owner {name!r} is already registered")
+        self._profiler_owners[name] = owner
+
+    def get_profiler_owner(self, name: str) -> Any | None:
+        return self._profiler_owners.get(name)
+
     def _init_upstream_compat_flags(self, server_args: Any) -> None:
         self.enable_hisparse = bool(server_args.enable_hisparse)
         self.hisparse_coordinator = None
@@ -559,7 +571,7 @@ class OmniScheduler:
         # unconditionally, so it must be a real manager, not None. Upstream
         # takes it from the model runner; no Omni model uses ngram embedding
         # (see use_ngram_embedding above), so a disabled passthrough is correct.
-        from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (  # noqa: E501
+        from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
             NgramEmbeddingManager,
         )
 
@@ -645,7 +657,7 @@ class OmniScheduler:
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
             get_disagg_prefill_bootstrap_queue=lambda: empty_queue,
-            get_disagg_prefill_inflight_queue=lambda: [],
+            get_disagg_prefill_inflight_queue=list,
             get_disagg_decode_prealloc_queue=lambda: empty_queue,
             get_disagg_decode_transfer_queue=lambda: empty_queue,
             get_spec_total_num_accept_tokens=lambda: (
@@ -657,8 +669,8 @@ class OmniScheduler:
         )
         self.output_streamer = types.SimpleNamespace(
             stream_output=self.stream_output,
-            _stream_output_generation=lambda reqs, return_logprob, **_kwargs: self.stream_output(
-                reqs, return_logprob
+            _stream_output_generation=lambda reqs, return_logprob, **_kwargs: (
+                self.stream_output(reqs, return_logprob)
             ),
         )
         self.batch_result_processor = SchedulerBatchResultProcessor(
@@ -796,6 +808,12 @@ class OmniScheduler:
 
             if msg.type == "new_request":
                 self._completed_request_ids.pop(msg.request_id, None)
+                _emit_event(
+                    request_id=msg.request_id,
+                    stage=None,
+                    event_name="scheduler_inbox_receive",
+                    metadata={"message_type": msg.type},
+                )
                 new_reqs.append(msg.data)
             elif msg.type == "stream_chunk":
                 self._on_stream_chunk(msg.request_id, msg.data)
@@ -883,9 +901,11 @@ class OmniScheduler:
                         or req_id in self._pending_request_builds
                     ):
                         continue
+                    submitted_ns = time.monotonic_ns()
                     future = request_build_executor.submit(
                         self._run_request_builder, payload, active_stage
                     )
+                    future._omni_profile_submitted_ns = submitted_ns
                     self._pending_request_builds[req_id] = (
                         payload,
                         pending_stream_done,
@@ -894,6 +914,27 @@ class OmniScheduler:
                     self._request_build_max_pending_observed = max(
                         self._request_build_max_pending_observed,
                         len(self._pending_request_builds),
+                    )
+                    _emit_event(
+                        request_id=req_id,
+                        stage=active_stage,
+                        event_name="request_builder_submitted",
+                        metadata={
+                            "pending_builds": len(self._pending_request_builds),
+                            "backlog_depth": len(
+                                self._backlogged_request_build_payloads
+                            ),
+                            "max_workers": self.request_build_max_workers,
+                        },
+                    )
+                    future.add_done_callback(
+                        lambda completed, request_id=req_id, stage=active_stage: (
+                            self._on_request_builder_future_done(
+                                request_id,
+                                stage,
+                                completed,
+                            )
+                        )
                     )
                 continue
             try:
@@ -909,6 +950,8 @@ class OmniScheduler:
     def _run_request_builder(self, payload: Any, active_stage: str | None) -> Any:
         req_id = payload.request_id
         token = _set_active_stage(active_stage)
+        started_ns = time.monotonic_ns()
+        status = "error"
         try:
             _emit_event(
                 request_id=req_id,
@@ -916,14 +959,44 @@ class OmniScheduler:
                 event_name="scheduler_request_build_start",
             )
             req_data = self._request_builder(payload)
+            status = "success"
+            return req_data
+        finally:
             _emit_event(
                 request_id=req_id,
                 stage=active_stage,
                 event_name="scheduler_request_build_end",
+                metadata={
+                    "status": status,
+                    "duration_ns": time.monotonic_ns() - started_ns,
+                },
             )
-            return req_data
-        finally:
             _reset_active_stage(token)
+
+    def _on_request_builder_future_done(
+        self,
+        request_id: str,
+        stage: str | None,
+        future: Future,
+    ) -> None:
+        done_ns = time.monotonic_ns()
+        future._omni_profile_done_ns = done_ns
+        submitted_ns = getattr(future, "_omni_profile_submitted_ns", None)
+        _emit_event(
+            request_id=request_id,
+            stage=stage,
+            event_name="request_builder_future_ready",
+            metadata={
+                "status": (
+                    "cancelled"
+                    if future.cancelled()
+                    else "error" if future.exception() is not None else "success"
+                ),
+                "submit_to_ready_ns": (
+                    done_ns - submitted_ns if submitted_ns is not None else None
+                ),
+            },
+        )
 
     def _stage_request_build_payloads(
         self, recv_reqs: list[Any]
@@ -951,6 +1024,16 @@ class OmniScheduler:
                 selected.append(payload)
                 selected_ids.add(req_id)
                 capacity -= 1
+                _emit_event(
+                    request_id=req_id,
+                    stage=None,
+                    event_name="request_build_backlog_pop",
+                    metadata={
+                        "backlog_depth": len(backlog),
+                        "pending_builds": len(pending_builds),
+                        "available_capacity": capacity,
+                    },
+                )
 
             for payload in recv_reqs:
                 req_id = payload.request_id
@@ -965,12 +1048,44 @@ class OmniScheduler:
                     selected.append(payload)
                     selected_ids.add(req_id)
                     capacity -= 1
+                    _emit_event(
+                        request_id=req_id,
+                        stage=None,
+                        event_name="request_build_admission_selected",
+                        metadata={
+                            "source": "new_request",
+                            "backlog_depth": len(backlog),
+                            "pending_builds": len(pending_builds),
+                            "available_capacity": capacity,
+                        },
+                    )
                     continue
                 if len(backlog) >= self._request_build_backlog_limit:
+                    _emit_event(
+                        request_id=req_id,
+                        stage=None,
+                        event_name="request_build_admission_rejected",
+                        metadata={
+                            "reason": "backlog_full",
+                            "backlog_depth": len(backlog),
+                            "backlog_limit": self._request_build_backlog_limit,
+                            "pending_builds": len(pending_builds),
+                        },
+                    )
                     rejected.append(payload)
                     continue
                 backlog.append(payload)
                 backlog_ids.add(req_id)
+                _emit_event(
+                    request_id=req_id,
+                    stage=None,
+                    event_name="request_build_backlog_append",
+                    metadata={
+                        "backlog_depth": len(backlog),
+                        "backlog_limit": self._request_build_backlog_limit,
+                        "pending_builds": len(pending_builds),
+                    },
+                )
             return selected, rejected
 
     def _reject_request_build_backlog_overflow(self, payload: Any) -> None:
@@ -993,10 +1108,7 @@ class OmniScheduler:
                 )
                 if not future.done():
                     now_ns = time.monotonic_ns()
-                    if (
-                        _get_recorder().is_active()
-                        and now_ns - self._profile_last_hol_emit_ns >= 10_000_000
-                    ):
+                    if _get_recorder().is_active():
                         later_ready = sum(
                             1
                             for _, _, later_future in tuple(
@@ -1005,18 +1117,54 @@ class OmniScheduler:
                             if later_future.done()
                         )
                         if later_ready:
-                            self._profile_last_hol_emit_ns = now_ns
-                            _emit_event(
-                                request_id=req_id,
-                                stage=None,
-                                event_name=("scheduler_request_build_hol_blocked"),
-                                metadata={
-                                    "pending_builds": len(self._pending_request_builds),
-                                    "later_ready": later_ready,
-                                },
-                            )
+                            active_hol = self._profile_hol_head
+                            if active_hol is None or active_hol[0] != req_id:
+                                if active_hol is not None:
+                                    self._end_request_build_hol_unlocked(
+                                        now_ns,
+                                        reason="head_changed",
+                                    )
+                                self._profile_hol_head = (
+                                    req_id,
+                                    now_ns,
+                                    later_ready,
+                                )
+                                _emit_event(
+                                    request_id=req_id,
+                                    stage=None,
+                                    event_name="scheduler_request_build_hol_start",
+                                    metadata={
+                                        "pending_builds": len(
+                                            self._pending_request_builds
+                                        ),
+                                        "later_ready": later_ready,
+                                    },
+                                )
+                            elif later_ready > active_hol[2]:
+                                self._profile_hol_head = (
+                                    active_hol[0],
+                                    active_hol[1],
+                                    later_ready,
+                                )
                     return
+                self._end_request_build_hol_unlocked(
+                    time.monotonic_ns(),
+                    reason="head_ready",
+                )
                 self._pending_request_builds.pop(req_id, None)
+                _emit_event(
+                    request_id=req_id,
+                    stage=None,
+                    event_name="request_build_capacity_release",
+                    metadata={
+                        "reason": (
+                            "aborted"
+                            if req_id in self._aborted_request_ids
+                            else "drained"
+                        ),
+                        "pending_builds_after": len(self._pending_request_builds),
+                    },
+                )
                 if req_id in self._aborted_request_ids:
                     continue
             try:
@@ -1032,12 +1180,43 @@ class OmniScheduler:
             with self._request_admission_lock:
                 if req_id in self._aborted_request_ids:
                     continue
+                done_ns = getattr(future, "_omni_profile_done_ns", None)
+                observed_ns = time.monotonic_ns()
+                _emit_event(
+                    request_id=req_id,
+                    stage=None,
+                    event_name="request_builder_ready_drained",
+                    metadata={
+                        "ready_to_drain_ns": (
+                            observed_ns - done_ns if done_ns is not None else None
+                        ),
+                        "pending_builds_after": len(self._pending_request_builds),
+                        "backlog_depth": len(self._backlogged_request_build_payloads),
+                    },
+                )
                 self._enqueue_built_request(
                     payload,
                     pending_stream_done,
                     req_data,
                     request_admission_lock_held=True,
                 )
+
+    def _end_request_build_hol_unlocked(self, now_ns: int, *, reason: str) -> None:
+        active = self._profile_hol_head
+        if active is None:
+            return
+        request_id, start_ns, max_later_ready = active
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="scheduler_request_build_hol_end",
+            metadata={
+                "duration_ns": max(0, now_ns - start_ns),
+                "max_later_ready": max_later_ready,
+                "reason": reason,
+            },
+        )
+        self._profile_hol_head = None
 
     def _enqueue_built_request(
         self,
@@ -1079,6 +1258,11 @@ class OmniScheduler:
                 request_id=req_id,
                 stage=None,
                 event_name="scheduler_queue_enter",
+                metadata={
+                    "waiting_queue_before": len(self.waiting_queue),
+                    "pending_builds": len(self._pending_request_builds),
+                    "backlog_depth": len(self._backlogged_request_build_payloads),
+                },
             )
             req._coalesce_enqueue_t = time.perf_counter()
             req._omni_terminal_claimed = False
@@ -1176,6 +1360,16 @@ class OmniScheduler:
     def _emit_request_error(self, request_id: str, error: Exception) -> None:
         if not self.is_entry_rank:
             return
+        _emit_event(
+            request_id=request_id,
+            stage=None,
+            event_name="scheduler_request_terminal",
+            metadata={
+                "outcome": "error",
+                "error_type": type(error).__name__,
+                "error": str(error)[:512],
+            },
+        )
         self.outbox.put(
             OutgoingMessage(
                 request_id=request_id,
@@ -1601,6 +1795,12 @@ class OmniScheduler:
                     data=result,
                 )
             )
+            _emit_event(
+                request_id=rid,
+                stage=None,
+                event_name="scheduler_request_terminal",
+                metadata={"outcome": "success"},
+            )
 
     def _on_stream_chunk(self, request_id: str, chunk: Any) -> None:
         if request_id in self._completed_request_ids:
@@ -1693,9 +1893,26 @@ class OmniScheduler:
                 if defer_running_cleanup
                 else False
             )
+            if (
+                self._profile_hol_head is not None
+                and self._profile_hol_head[0] == request_id
+            ):
+                self._end_request_build_hol_unlocked(
+                    time.monotonic_ns(),
+                    reason="head_aborted",
+                )
             pending = self._pending_request_builds.pop(request_id, None)
             if pending is not None:
                 pending[2].cancel()
+                _emit_event(
+                    request_id=request_id,
+                    stage=None,
+                    event_name="request_build_capacity_release",
+                    metadata={
+                        "reason": "abort",
+                        "pending_builds_after": len(self._pending_request_builds),
+                    },
+                )
             if self._backlogged_request_build_payloads:
                 retained = [
                     payload
@@ -2405,8 +2622,7 @@ class OmniScheduler:
             prefill_input_ids_cpu = batch.prefill_input_ids_cpu
             if input_ids is None and prefill_input_ids_cpu is None:
                 raise RuntimeError(
-                    "extend batch carries neither input_ids nor "
-                    "prefill_input_ids_cpu"
+                    "extend batch carries neither input_ids nor prefill_input_ids_cpu"
                 )
             prefix_lens = batch.prefix_lens
             extend_logprob_start_lens = batch.extend_logprob_start_lens

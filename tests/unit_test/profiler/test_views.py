@@ -352,7 +352,7 @@ def test_stage_breakdown_emits_both_intervals_sharing_opener(
     assert by_key[first_chunk_key].total_ms == 7.0
 
 
-def test_stage_breakdown_uses_prefill_start_not_queue_enter(
+def test_stage_breakdown_separates_queue_wait_from_prefill_execution(
     tmp_path: Path,
 ) -> None:
     events = [
@@ -375,7 +375,10 @@ def test_stage_breakdown_uses_prefill_start_not_queue_enter(
         ].total_ms
         == 5.0
     )
-    assert all("scheduler_queue_enter->" not in r.interval_name for r in rows)
+    assert (
+        by_key[("thinker", "scheduler_queue_enter->scheduler_prefill_start")].total_ms
+        == 5.0
+    )
 
 
 def test_build_report_returns_all_three_views(tmp_path: Path) -> None:

@@ -373,4 +373,17 @@ def _request_result_to_dict(output: RequestResult) -> dict:
         "inter_chunk_s": [round(d, 4) for d in inter] if inter else None,
         "audio_chunk_count": output.audio_chunk_count or None,
         "first_audio_payload_bytes": output.first_audio_payload_bytes or None,
+        "http_status": output.http_status,
+        "server_request_id": output.server_request_id,
+        "client_timing": {
+            "clock": "time.perf_counter_ns",
+            "scheduled_arrival_ns": output.client_scheduled_arrival_ns,
+            "task_created_ns": output.client_task_created_ns,
+            "permit_wait_start_ns": output.client_permit_wait_start_ns,
+            "permit_acquired_ns": output.client_permit_acquired_ns,
+            "send_invoked_ns": output.client_send_invoked_ns,
+            "http_start_ns": output.client_http_start_ns,
+            "http_response_start_ns": output.client_http_response_start_ns,
+            "response_complete_ns": output.client_response_complete_ns,
+        },
     }

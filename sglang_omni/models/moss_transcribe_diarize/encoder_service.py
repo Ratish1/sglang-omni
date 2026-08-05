@@ -64,10 +64,10 @@ class BatchedAudioEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Te
 
     def _drain_batch(self) -> list[QueueEntry[Any]]:
         # note (yichi): never wait — a window costs 8~16ms at low concurrency, buys <=5ms at high.
-        batch = [self._queue.get()]
+        batch = [self._get_queue_item()]
         for _ in range(self._max_batch_size - 1):
             try:
-                batch.append(self._queue.get_nowait())
+                batch.append(self._get_queue_item_nowait())
             except queue.Empty:
                 break
         return batch
@@ -86,9 +86,7 @@ class BatchedAudioEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Te
         items: list[Any],
         embedding: torch.Tensor,
     ) -> list[torch.Tensor]:
-        token_counts = [
-            int(getattr(item, "audio_feature_lengths").sum()) for item in items
-        ]
+        token_counts = [int(item.audio_feature_lengths.sum()) for item in items]
         if embedding.shape[0] != sum(token_counts):
             raise RuntimeError(
                 f"encoder output rows {embedding.shape[0]} != expected "

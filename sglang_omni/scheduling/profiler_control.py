@@ -10,7 +10,8 @@ from __future__ import annotations
 import os
 import queue
 import threading
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from sglang_omni.profiler.torch_profiler import TorchProfiler, TorchProfilerConfig
 from sglang_omni.profiler.trace_ranges import (
@@ -98,6 +99,7 @@ def handle_profiler_message(
                     template,
                     run_id=data.get("run_id"),
                     config=config,
+                    owner_label="scheduler",
                 )
                 torch_state = TorchProfiler.snapshot()
             nvtx_state = None
@@ -176,6 +178,8 @@ def handle_profiler_message(
 def profiler_step() -> dict[str, Any] | None:
     """Advance a live owner-thread profiler by one scheduler step."""
 
+    if TorchProfiler.is_active() and not TorchProfiler.is_owner_thread():
+        return None
     return TorchProfiler.step()
 
 

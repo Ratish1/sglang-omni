@@ -25,9 +25,9 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing, suppress
-from typing import Any, AsyncIterator
+from typing import Any
 
 from fastapi import (
     Depends,
@@ -68,6 +68,7 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
+from sglang_omni.profiler.event_recorder import emit as _emit_profile_event
 from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -1626,20 +1627,45 @@ def _register_transcriptions(app: FastAPI) -> None:
         temperature: float | None = Form(default=None),
         max_new_tokens: int | None = Form(default=None, ge=1),
         stream: bool = Form(default=False),
+        request_id: str | None = Form(default=None, min_length=1, max_length=256),
     ) -> Response:
         client: Client = app.state.client
         default_model: str = app.state.model_name
-        request_id = f"transcription-{uuid.uuid4()}"
+        request_id = request_id or f"transcription-{uuid.uuid4()}"
+        _emit_profile_event(
+            request_id=request_id,
+            stage="coordinator",
+            event_name="http_request_received",
+            metadata={"endpoint": "/v1/audio/transcriptions", "stream": stream},
+        )
 
         # TODO(Ratish): add the same pre-parser body limit used by voice uploads
         # once transcription upload limits are defined.
         audio_bytes = await file.read()
         if not audio_bytes:
+            _emit_profile_event(
+                request_id=request_id,
+                stage="coordinator",
+                event_name="http_response_ready",
+                metadata={"status": 400, "outcome": "rejected_empty_audio"},
+            )
             raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
+        _emit_profile_event(
+            request_id=request_id,
+            stage="coordinator",
+            event_name="http_request_parsed",
+            metadata={"audio_bytes": len(audio_bytes)},
+        )
 
         normalized_response_format = response_format.strip().lower()
         if stream:
             if normalized_response_format not in {"json", "text"}:
+                _emit_profile_event(
+                    request_id=request_id,
+                    stage="coordinator",
+                    event_name="http_response_ready",
+                    metadata={"status": 400, "outcome": "unsupported_stream_format"},
+                )
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -1661,6 +1687,12 @@ def _register_transcriptions(app: FastAPI) -> None:
             adapter = resolve_adapter(getattr(app.state, "architectures", None))
             duration_s = _probe_audio_duration(audio_bytes)
             chunk_stream = client.generate(gen_req, request_id=request_id)
+            _emit_profile_event(
+                request_id=request_id,
+                stage="coordinator",
+                event_name="coordinator_request_submitted",
+                metadata={"stream": True},
+            )
             # note (db-ol): pull the first chunk before sending response
             # headers. Admission rejections such as audio past the context
             # limit arrive as the first stream event, and once headers go out
@@ -1673,19 +1705,39 @@ def _register_transcriptions(app: FastAPI) -> None:
                     request, client, chunk_stream, request_id
                 )
             except ClientError as exc:
+                status = 400 if _is_bad_request_error(exc) else 500
+                _emit_profile_event(
+                    request_id=request_id,
+                    stage="coordinator",
+                    event_name="http_response_ready",
+                    metadata={"status": status, "outcome": "client_error"},
+                )
                 await _close_async_iterator_if_supported(chunk_stream)
-                if _is_bad_request_error(exc):
+                if status == 400:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
                 raise HTTPException(status_code=500, detail=str(exc)) from exc
             except Exception as exc:
                 await _close_async_iterator_if_supported(chunk_stream)
-                if _is_bad_request_error(exc):
+                status = 400 if _is_bad_request_error(exc) else 500
+                _emit_profile_event(
+                    request_id=request_id,
+                    stage="coordinator",
+                    event_name="http_response_ready",
+                    metadata={"status": status, "outcome": "error"},
+                )
+                if status == 400:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
                 logger.exception(
                     "Error starting transcription stream for request %s",
                     request_id,
                 )
                 raise HTTPException(status_code=500, detail=str(exc)) from exc
+            _emit_profile_event(
+                request_id=request_id,
+                stage="coordinator",
+                event_name="http_response_ready",
+                metadata={"status": 200, "outcome": "stream_started"},
+            )
             return _ClosableStreamingResponse(
                 _transcription_stream(
                     chunk_stream,
@@ -1710,21 +1762,56 @@ def _register_transcriptions(app: FastAPI) -> None:
         )
 
         try:
+            _emit_profile_event(
+                request_id=request_id,
+                stage="coordinator",
+                event_name="coordinator_request_submitted",
+                metadata={"stream": False},
+            )
             result = await client.completion(gen_req, request_id=request_id)
         except ClientError as exc:
-            if _is_bad_request_error(exc):
+            status = 400 if _is_bad_request_error(exc) else 500
+            _emit_profile_event(
+                request_id=request_id,
+                stage="coordinator",
+                event_name="http_response_ready",
+                metadata={"status": status, "outcome": "client_error"},
+            )
+            if status == 400:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except Exception as exc:
-            if _is_bad_request_error(exc):
+            status = 400 if _is_bad_request_error(exc) else 500
+            _emit_profile_event(
+                request_id=request_id,
+                stage="coordinator",
+                event_name="http_response_ready",
+                metadata={"status": status, "outcome": "error"},
+            )
+            if status == 400:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             logger.exception("Error transcribing audio for request %s", request_id)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         text = result.text
         if normalized_response_format == "text":
-            return PlainTextResponse(text)
+            _emit_profile_event(
+                request_id=request_id,
+                stage="coordinator",
+                event_name="http_response_ready",
+                metadata={"status": 200, "outcome": "success"},
+            )
+            return PlainTextResponse(
+                text,
+                headers={"X-Request-Id": request_id},
+            )
         if normalized_response_format not in {"json", "verbose_json"}:
+            _emit_profile_event(
+                request_id=request_id,
+                stage="coordinator",
+                event_name="http_response_ready",
+                metadata={"status": 400, "outcome": "unsupported_format"},
+            )
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -1748,11 +1835,27 @@ def _register_transcriptions(app: FastAPI) -> None:
                 audio_duration_s=duration_s,
             )
             response.usage = usage
-            return JSONResponse(content=response.model_dump(exclude_none=True))
+            _emit_profile_event(
+                request_id=request_id,
+                stage="coordinator",
+                event_name="http_response_ready",
+                metadata={"status": 200, "outcome": "success"},
+            )
+            return JSONResponse(
+                content=response.model_dump(exclude_none=True),
+                headers={"X-Request-Id": request_id},
+            )
+        _emit_profile_event(
+            request_id=request_id,
+            stage="coordinator",
+            event_name="http_response_ready",
+            metadata={"status": 200, "outcome": "success"},
+        )
         return JSONResponse(
             content=TranscriptionResponse(text=text, usage=usage).model_dump(
                 exclude_none=True
-            )
+            ),
+            headers={"X-Request-Id": request_id},
         )
 
 

@@ -25,3 +25,13 @@ class RequestResult:
     text_ttft_s: float | None = None
     audio_chunk_count: int = 0
     first_audio_payload_bytes: int = 0
+    http_status: int | None = None
+    server_request_id: str | None = None
+    client_scheduled_arrival_ns: int | None = None
+    client_task_created_ns: int | None = None
+    client_permit_wait_start_ns: int | None = None
+    client_permit_acquired_ns: int | None = None
+    client_send_invoked_ns: int | None = None
+    client_http_start_ns: int | None = None
+    client_http_response_start_ns: int | None = None
+    client_response_complete_ns: int | None = None

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sglang_omni.scheduling.pre_lm_encoder as pre_lm_module
 from sglang_omni.models.fun_asr.encoder_service import (
     FunASRPreLMEncoderService,
     _expected_audio_tokens,
@@ -48,7 +49,7 @@ class _StubModel(torch.nn.Module):
         self.encode_delay_s = 0.0
         self.grad_enabled_during_encode: bool | None = None
 
-    def get_audio_feature(self, items):  # noqa: ANN001
+    def get_audio_feature(self, items):
         self.grad_enabled_during_encode = torch.is_grad_enabled()
         self.encode_calls += 1
         gate = self.encode_gate
@@ -143,7 +144,13 @@ def test_encode_emits_correlated_queue_and_batch_events(tmp_path: Path) -> None:
         "pre_lm_enqueue",
         "pre_lm_dequeue",
         "pre_lm_batch_start",
+        "pre_lm_encode_start",
+        "pre_lm_encode_submitted",
+        "pre_lm_split_start",
+        "pre_lm_split_end",
+        "pre_lm_future_publish",
         "pre_lm_batch_end",
+        "pre_lm_waiter_resumed",
     } <= names
     assert {event["request_id"] for event in events} == {"request-7"}
     batch_events = [
@@ -151,6 +158,49 @@ def test_encode_emits_correlated_queue_and_batch_events(tmp_path: Path) -> None:
     ]
     assert batch_events[0]["metadata"]["batch_id"]
     assert batch_events[0]["metadata"]["status"] == "ok"
+
+
+def test_torch_profiler_lifecycle_is_owned_by_encoder_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service()
+    calls: list[tuple[str, str, str | None]] = []
+
+    def start(
+        _template,
+        *,
+        run_id=None,
+        config=None,
+        owner_label=None,
+    ):
+        calls.append(("start", threading.current_thread().name, owner_label))
+        return "/tmp/pre-lm-trace.json.gz"
+
+    def stop(*, run_id=None):
+        calls.append(("stop", threading.current_thread().name, run_id))
+        return {"trace": "/tmp/pre-lm-trace.json.gz", "export_error": None}
+
+    monkeypatch.setattr(pre_lm_module.TorchProfiler, "start", start)
+    monkeypatch.setattr(pre_lm_module.TorchProfiler, "stop", stop)
+    monkeypatch.setattr(
+        pre_lm_module.TorchProfiler,
+        "snapshot",
+        lambda: {"active": True, "owner_label": "pre_lm_encoder"},
+    )
+
+    started = service.run_profiler_command(
+        action="start",
+        run_id="run",
+        trace_path_template="/tmp/pre-lm-trace",
+    )
+    stopped = service.run_profiler_command(action="stop", run_id="run")
+
+    assert started["success"]
+    assert stopped["success"]
+    assert calls == [
+        ("start", "fun-asr-audio-encode", "pre_lm_encoder"),
+        ("stop", "fun-asr-audio-encode", "run"),
+    ]
 
 
 def test_close_stops_worker() -> None:
@@ -167,7 +217,7 @@ def test_batch_context_unwinds_inference_mode_when_stream_context_fails(
     service = object.__new__(FunASRPreLMEncoderService)
     service._stream = object()
 
-    def fail_stream(_stream):  # noqa: ANN001, ANN202
+    def fail_stream(_stream):
         raise RuntimeError("stream context failed")
 
     monkeypatch.setattr(torch.cuda, "stream", fail_stream)
@@ -239,7 +289,7 @@ def test_concurrent_identical_requests_encode_once() -> None:
         try:
             barrier.wait(timeout=10)
             service.encode_item(item)
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(item,)) for item in items]
@@ -266,7 +316,7 @@ def test_stale_cache_miss_rechecks_before_starting_duplicate_encode(
     release_stale_reader = threading.Event()
     original_get = service._cache.get
 
-    def controlled_get(key: str | None):  # noqa: ANN202
+    def controlled_get(key: str | None):
         cached = original_get(key)
         if (
             threading.current_thread().name == "stale-cache-reader"
@@ -284,7 +334,7 @@ def test_stale_cache_miss_rechecks_before_starting_duplicate_encode(
     def follower() -> None:
         try:
             service.encode_item(follower_item)
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     thread = threading.Thread(target=follower, name="stale-cache-reader")
@@ -318,7 +368,7 @@ def test_concurrent_identical_requests_deduplicate_without_cache() -> None:
         try:
             barrier.wait(timeout=10)
             service.encode_item(item)
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(item,)) for item in items]
@@ -345,7 +395,7 @@ def test_encode_failure_propagates_without_poisoning_cache() -> None:
         try:
             barrier.wait(timeout=10)
             service.encode_item(_item(55, 3))
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=worker) for _ in range(2)]
@@ -376,7 +426,7 @@ def test_merged_follower_token_mismatch_raises_and_counts_failed() -> None:
     def leader() -> None:
         try:
             service.encode_item(leader_item)
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     thread = threading.Thread(target=leader)
@@ -410,7 +460,7 @@ def test_multi_item_batch_failure_retries_per_item_and_counts_stats() -> None:
     def worker(item: SimpleNamespace) -> None:
         try:
             service.encode_item(item)
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(item,)) for item in items]
@@ -488,7 +538,7 @@ def test_invalid_cache_reader_preserves_a_valid_replacement(
     release_reader = threading.Event()
     original_remove = service._cache.remove_if_same
 
-    def controlled_remove(key, expected):  # noqa: ANN001, ANN202
+    def controlled_remove(key, expected):
         stale_reader.set()
         assert release_reader.wait(timeout=10)
         return original_remove(key, expected)
@@ -499,7 +549,7 @@ def test_invalid_cache_reader_preserves_a_valid_replacement(
     def encode() -> None:
         try:
             service.encode_item(item)
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             errors.append(exc)
 
     thread = threading.Thread(target=encode)

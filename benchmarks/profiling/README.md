@@ -4,9 +4,64 @@ This runbook collects causal evidence for the Fun-ASR throughput collapse
 without using the router. Run every condition on the same H100 host, model
 revision, corpus, server arguments, CPU policy, and dependency environment.
 
-The harness performs target-concurrency warmup until throughput and mean
-latency are stable, rejects incomplete ASR work by default, records the
-environment, and validates acknowledged profiler artifacts.
+The direct server is intentional: it isolates the model-serving critical path.
+It cannot reproduce router overhead or prove that the router is innocent.
+Only add a router replay after the direct path is localized; do not use router
+traffic as the first trace.
+
+The harness performs a full corpus/shape warmup followed by independent
+stability windows, discovers the ASR stage PID through an acknowledged
+start/stop handshake, rejects incomplete ASR work, records request identities
+and immutable inputs, and validates the event state machine and finalized
+artifacts. An exited command is not automatically an accepted capture.
+
+## One-shot H100 campaign
+
+This is the first command to run after the code gate. It owns every server
+restart, alternates quiet and 64-process CPU-stress trials in A/B/B/A order,
+and executes exactly five fresh-server trials per condition.
+
+```bash
+MODEL_REVISION="$(
+  python - <<'PY'
+from huggingface_hub import model_info
+print(model_info("FunAudioLLM/Fun-ASR-Nano-2512-hf").sha)
+PY
+)"
+test -n "$MODEL_REVISION"
+
+cp benchmarks/profiling/campaign.events.h100.example.json \
+  /tmp/campaign.events.h100.json
+python - "$MODEL_REVISION" /tmp/campaign.events.h100.json <<'PY'
+import json
+import sys
+from pathlib import Path
+
+revision, raw_path = sys.argv[1:]
+path = Path(raw_path)
+config = json.loads(path.read_text())
+index = config["harness_args"].index("REPLACE_WITH_IMMUTABLE_HF_COMMIT_SHA")
+config["harness_args"][index] = revision
+path.write_text(json.dumps(config, indent=2) + "\n")
+PY
+
+python -m benchmarks.profiling.run_cpu_saturation_campaign \
+  --config /tmp/campaign.events.h100.json \
+  --output-dir "$PWD/artifacts/cpu-saturation/events-ab-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Before running it, inspect the JSON and change only machine facts that are
+actually different (GPU index, port, corpus size, or server flags). Do not
+insert CPU binding into this first campaign: its purpose is to reproduce and
+localize the unbound quiet-versus-64-loop delta. The harness resolves the ASR
+worker PID; never substitute the coordinator PID.
+
+The campaign is accepted only when all ten trials complete, every
+`result.json` has `accepted=true`, `integrity.valid=true`,
+`request_lifecycle_integrity.valid=true`, and
+`system_integrity.valid=true`, and the event perturbation is within 2%.
+`summary.json` reports per-condition values, medians, MAD, and seeded bootstrap
+95% intervals. Preserve the entire campaign directory.
 
 ## 1. Prepare the checkout and dataset
 
@@ -44,6 +99,9 @@ export SGLANG_TORCH_PROFILER_DIR="$PWD/artifacts/cpu-saturation/server"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
+export SGLANG_OMNI_EVENT_DEFER_WRITES=1
+export SGLANG_OMNI_EVENT_QUEUE_CAPACITY=131072
+export SGLANG_OMNI_EVENT_FINALIZE_TIMEOUT_S=180
 
 sgl-omni serve \
   --model-path FunAudioLLM/Fun-ASR-Nano-2512-hf \
@@ -62,17 +120,25 @@ silently turn the captured pass into a cache-hit workload. Profiled modes
 reject `pre_lm_cache_hit` events unless `--allow-cache-hits` is explicitly
 set.
 
-For baseline `perf` runs, identify the `asr` stage process rather than the HTTP
+Deferred event writes are also part of the bounded 256-request attribution
+contract. Producers enqueue timestamped records during measurement; JSON
+serialization, filesystem writes, fsync, rename, and checksumming occur at
+stop. If 131,072 records are insufficient, the run is rejected for drops
+rather than silently switching to a partial trace. Do not use deferred mode
+for an unbounded production capture.
+
+For manual inspection, distinguish the `asr` stage process from the HTTP
 coordinator:
 
 ```bash
 ps -eLo pid,ppid,tid,psr,comm,args | grep -E 'sgl|scheduler-asr|fun-asr'
 ```
 
-Torch/event/Nsight runs can obtain the stage PID from the acknowledged start
-manifest for measured collectors. Still pass `--server-pid ASR_STAGE_PID` in
-every mode so warmup stability also includes stage CPU-ms/request, not only
-QPS and p50 latency.
+When `--server-pid` is omitted, every mode performs a short acknowledged
+event-recorder start/stop before warmup and requires exactly one target PID for
+the requested stage. That discovered PID is used for warmup CPU-ms/request and
+all measured collectors. You may pass `--server-pid` manually, but profiled
+modes reject it if it disagrees with the later stage acknowledgement.
 
 ## 3. Quiet unprofiled baseline
 
@@ -86,7 +152,7 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --port 8000 \
   --concurrency 32 \
   --max-samples 1088 \
-  --server-pid ASR_STAGE_PID \
+  --model-revision "$MODEL_REVISION" \
   --collectors psi,perf-stat,turbostat \
   --turbostat-cpus SERVER_CPU_LIST
 ```
@@ -103,7 +169,7 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --concurrency 64 \
   --request-rate 120 \
   --max-samples 1088 \
-  --server-pid ASR_STAGE_PID \
+  --model-revision "$MODEL_REVISION" \
   --collectors psi,perf-stat,turbostat
 ```
 
@@ -120,7 +186,7 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --run-id pmu-r1 \
   --concurrency 32 \
   --max-samples 1088 \
-  --server-pid ASR_STAGE_PID \
+  --model-revision "$MODEL_REVISION" \
   --collectors psi,perf-stat \
   --perf-events \
     cycles,instructions,cache-references,cache-misses,branches,branch-misses,stalled-cycles-frontend,stalled-cycles-backend
@@ -128,7 +194,10 @@ python -m benchmarks.profiling.profile_cpu_saturation \
 
 Check `perf_stat.csv` and its ignored rows: unsupported or heavily multiplexed
 events are not evidence. Use model-specific raw events only after recording
-the CPU model and `perf list` output.
+the CPU model and `perf list` output. If the default `perf` wrapper does not
+match the host kernel, pass the working executable explicitly, for example
+`--perf-binary /usr/lib/linux-tools/$(uname -r)/perf`; the exact path is
+recorded in the manifest and collector result.
 
 ## 4. Event-only semantic timeline
 
@@ -141,18 +210,23 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --concurrency 32 \
   --max-samples 1088 \
   --profile-samples 256 \
-  --server-pid ASR_STAGE_PID \
-  --collectors psi,perf-stat,turbostat
+  --model-revision "$MODEL_REVISION" \
+  --collectors psi,cgroup-psi,thread-snapshot,gpu-dmon \
+  --gpu-index 0
 ```
 
 The output directory contains:
 
 - `manifest.json`: software, topology, cgroup, policy, corpus, and command;
-- `warmup.json`: stability windows;
+- `warmup/`: every raw shape and stability pass;
+- `warmup.json`: the accepted stability-window index;
 - `adjacent_baseline.json`: unprofiled comparison immediately before capture;
 - `events/*.jsonl`: request/build/encoder/scheduler phase events with PID/TID;
-- `perf_stat.csv`, `turbostat.txt`, and `system.json`;
+- `measurement/`: every raw measured request result;
+- `thread_snapshots.jsonl`, `gpu_dmon.txt`, and `system.json`;
 - `profile_start.json` and `profile_stop.json`: acknowledgements;
+- `event_report.json`: joined high-level phase and batching summary;
+- `artifact_index.json`: byte size and SHA-256 of every artifact;
 - `result.json`: performance, perturbation, and integrity result.
 
 Reject a run with failed requests, dropped events, missing stage
@@ -160,7 +234,7 @@ acknowledgements, unstable warmup, or unexpected encoder-cache hits. The
 profiled and adjacent passes use the same duration-stratified sample subset;
 `--profile-samples 0` opts into the full corpus.
 
-## 5. Bounded PyTorch operator trace
+## 5. Two bounded PyTorch operator traces
 
 Run torch profiling separately from Nsight and detailed PMU passes:
 
@@ -171,17 +245,37 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --concurrency 32 \
   --max-samples 1088 \
   --profile-samples 256 \
-  --server-pid ASR_STAGE_PID \
+  --model-revision "$MODEL_REVISION" \
   --collectors psi \
   --torch-wait-steps 1 \
   --torch-warmup-steps 1 \
   --torch-active-steps 20
 ```
 
-The profiler starts, steps, and stops on `scheduler-asr`. The stop endpoint
-flushes an in-flight async decode step before export. The harness rejects a
-trace missing the scheduler-owner canary, required CUDA activity, scheduled
-steps, rank identity, event files, or finalization acknowledgement.
+This scheduler-owned trace answers whether Python request construction,
+scheduler execution, or CUDA launch dispatch dominates. Run a separate
+encoder-owned trace to see the preprocessing thread and encoder submission
+path that the scheduler-owned trace cannot faithfully observe:
+
+```bash
+python -m benchmarks.profiling.profile_cpu_saturation \
+  --mode torch \
+  --run-id torch-encoder-r1 \
+  --concurrency 32 \
+  --max-samples 1088 \
+  --profile-samples 256 \
+  --model-revision "$MODEL_REVISION" \
+  --collectors psi \
+  --torch-owner pre_lm_encoder \
+  --torch-wait-steps 1 \
+  --torch-warmup-steps 1 \
+  --torch-active-steps 20
+```
+
+The two owners are deliberately mutually exclusive. The stop endpoint flushes
+in-flight async work before export. The harness rejects a trace missing the
+selected owner canary, CUDA launch-to-kernel correlation, scheduled steps,
+rank identity, event files, or finalization acknowledgement.
 
 Do not use the profiled run as the throughput baseline. `result.json` reports
 the adjacent-baseline perturbation. If the QPS loss exceeds 5%, use the trace
@@ -195,6 +289,7 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --run-id torch-stacks-r1 \
   --concurrency 32 \
   --max-samples 256 \
+  --model-revision "$MODEL_REVISION" \
   --collectors psi \
   --torch-active-steps 8 \
   --with-stack \
@@ -237,8 +332,9 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --concurrency 32 \
   --max-samples 1088 \
   --profile-samples 256 \
-  --server-pid ASR_STAGE_PID \
+  --model-revision "$MODEL_REVISION" \
   --collectors psi \
+  --profile-timeout-s 600 \
   --nsys-report \
     "$PWD/artifacts/cpu-saturation/nsys-quiet-r1.nsys-rep"
 ```
@@ -257,7 +353,7 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --run-id sched-load-r1 \
   --concurrency 32 \
   --max-samples 1088 \
-  --server-pid ASR_STAGE_PID \
+  --model-revision "$MODEL_REVISION" \
   --collectors psi,perf-sched
 
 perf sched timehist \
@@ -312,9 +408,14 @@ the interferer's command, affinity, start/stop timestamps, and counters.
   GPU feed gaps even after isolation and frequency control.
 - **Queueing:** offered rate exceeds completion and queue wait grows while
   in-service phase cost remains stable.
-- **Request-build head-of-line blocking:** the
-  `scheduler_request_build_hol_blocked` event shows completed later futures
-  held behind the first incomplete future for material time.
+- **Request-build head-of-line blocking:** matched
+  `scheduler_request_build_hol_start/end` intervals show completed later
+  futures held behind the first incomplete future for material time.
+- **Admission leak or abort race:** each `request_builder_submitted` has exactly
+  one `request_build_capacity_release`; the lifecycle gate rejects imbalance.
+- **Client-side artifact:** `client_queue_ns` or scheduled-arrival lag rises
+  while server receive-to-terminal phases do not. The load generator reads
+  warmed audio from cache and performs any first load outside its event loop.
 
 Only after one mechanism has positive evidence and alternatives have rejection
 evidence should a runtime change be implemented. CPU isolation remains a valid
@@ -334,7 +435,10 @@ python -m pytest -q \
   tests/unit_test/profiler/test_scheduler_profiler_control.py \
   tests/unit_test/profiler/test_torch_profiler_schedule.py \
   tests/unit_test/benchmarks/test_benchmark_runner_rate.py \
+  tests/unit_test/benchmarks/test_cpu_saturation_campaign.py \
+  tests/unit_test/benchmarks/test_profile_cpu_saturation.py \
   tests/unit_test/benchmarks/test_system_collectors.py \
+  tests/unit_test/serve/test_openai_api.py \
   tests/unit_test/fun_asr/test_encoder_service.py \
   tests/unit_test/fun_asr/test_request_builders.py
 ```
@@ -342,3 +446,25 @@ python -m pytest -q \
 Then run one 32-request torch smoke capture (`--profile-samples 32`,
 `--torch-active-steps 4`) and require a passing `result.json` integrity gate
 before starting the multi-restart matrix.
+
+## 11. Decision sequence after the campaign
+
+Do not collect every expensive profiler at once.
+
+1. Use the event campaign to identify the first phase whose per-request
+   service time or wait time diverges between quiet and stress.
+2. If runnable delay diverges, run `perf-sched` alone and join by the native
+   TIDs in the events. If busy MHz diverges without runnable delay, run
+   `turbostat` plus the low-overhead default `perf-stat`.
+3. If request build or pre-LM CPU work diverges, run the matching bounded Torch
+   owner (`scheduler` or `pre_lm_encoder`).
+4. If CPU phase duration predicts GPU idle/feed gaps, run the one Nsight joint
+   trace. Require the NVTX capture token, CUDA API rows, kernels, OS-runtime
+   rows, and the copied `.nsys-rep`.
+5. Only then repeat the relevant narrow capture with server-core pinning,
+   sibling isolation, and a matched stress placement. This is a causal
+   intervention, not the default fix.
+6. Use the router only as a final boundary test. If direct serving reproduces
+   the mechanism, the root cause is below the router. If direct serving is
+   clean but router serving fails under the same offered-load contract, add
+   router ingress/egress timing and profile that separate boundary.

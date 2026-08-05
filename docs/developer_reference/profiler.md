@@ -17,8 +17,9 @@ deeper kernel investigation.
 
 ## Event model
 
-Every instrumentation point appends a single line of JSON to a per-process
-JSONL file. The shape:
+Every instrumentation point timestamps and enqueues one bounded record to a
+per-process writer thread. The serving thread never performs JSON encoding,
+filesystem writes, flush, or fsync. The shape:
 
 ```jsonc
 {
@@ -27,6 +28,10 @@ JSONL file. The shape:
   "event_name": "scheduler_first_emit",
   "timestamp_ns": 1717000000123456789,
   "monotonic_ns": 123456789,
+  "source_sequence": 17,
+  "schema_version": 2,
+  "clock_domain": "CLOCK_MONOTONIC",
+  "host_boot_id": "...",
   "run_id": "demo-run",
   "pid": 42,
   "native_tid": 314,
@@ -35,11 +40,21 @@ JSONL file. The shape:
 }
 ```
 
-Files are written under `<event_dir>/events_<stage>_<pid>.jsonl`. Multiple
+Files are written first as
+`<event_dir>/events_<stage>_<pid>.jsonl.partial`; acknowledged stop flushes
+and fsyncs the file, atomically renames it to `.jsonl`, and returns its SHA-256,
+byte count, enqueued/written totals, drop count, and writer error. Multiple
 co-located stages in the same OS process share **one** JSONL file — the
 filename uses the first stage to start, and the per-event `stage` field
 identifies the owner. The views layer merges files from every process by
 `request_id`.
+
+For short, explicitly bounded experiments,
+`SGLANG_OMNI_EVENT_DEFER_WRITES=1` parks the writer until stop so serialization
+cannot contend with the measured window. The bounded queue remains the memory
+limit; overflow rejects the capture. Configure its capacity with
+`SGLANG_OMNI_EVENT_QUEUE_CAPACITY` and finalization wait with
+`SGLANG_OMNI_EVENT_FINALIZE_TIMEOUT_S`.
 
 ### Standard event names
 
@@ -77,6 +92,11 @@ Supporting events used for finer-grained breakdown:
 | Stage | `stage_stream_chunk_sent` | Each stream chunk (metadata `to_stage`, `chunk_id`, `modality`) |
 | Stage | `stage_stream_chunk_received` | Each stream chunk materialized and ready for the receiver scheduler, including coordinator terminal chunks |
 | AR scheduler | `scheduler_queue_enter` | Built request entered the scheduler queue |
+| Request builder | `request_builder_submitted` / `request_builder_future_ready` / `request_builder_ready_drained` | Exact submit, completion, and ordered-drain boundaries |
+| Request builder | `scheduler_request_build_hol_start` / `_end` | A ready later future is held behind an incomplete head |
+| Request builder | `request_build_capacity_release` | One-for-one release for every submitted asynchronous build, including abort |
+| Pre-LM | `pre_lm_enqueue` / `pre_lm_dequeue` / `pre_lm_future_publish` / `pre_lm_waiter_resumed` | Cross-thread causal handoff |
+| Pre-LM | `pre_lm_encode_start` / `_submitted`, `pre_lm_gpu_wait_start` / `_complete`, `pre_lm_split_start` / `_end` | Encoder CPU submission, device wait, and result split |
 | AR scheduler | `scheduler_first_emit` | First `stream_output_builder` emission per request |
 | Code2Wav | `code2wav_decode_start` | Serial decode start: trigger, start/end/new/context/window frames, active and threshold-ready requests, inbox depth |
 | Code2Wav | `code2wav_decode_end` | Repeats the start metadata and adds audio samples plus execution metadata |
@@ -129,8 +149,9 @@ selected target has stopped and finalized its artifacts.
 2. Launcher sends an operation ID, reply endpoint, selected stages, trace
    configuration, and `event_dir` to those stages.
 3. Every stage and TP rank queues the torch/NVTX lifecycle command onto its
-   scheduler inbox. Start, semantic `step()`, and stop therefore execute on
-   the same scheduler thread.
+   selected owner. `torch_owner=scheduler` executes start, semantic `step()`,
+   and stop on the scheduler thread. `torch_owner=pre_lm_encoder` executes all
+   three on the dedicated encoder thread. Owners are never mixed in one trace.
 4. After scheduler-owned profiling is armed, each stage joins the
    per-process recorder. In a shared-process topology
    the first stage to call `start()` wins the filename; every subsequent
@@ -194,9 +215,9 @@ The torch profiler runs alongside the event recorder when
 `enable_torch=true` (the default for `/start_profile`). It uses a bounded
 Kineto schedule advanced exactly once per non-empty scheduler batch. Defaults
 are one wait step, one warmup step, and twenty active steps. Every semantic
-step emits a scheduler-owner canary into the trace. Stop reports actual and
-expected step counts, schedule completion, owner TID, export errors, and the
-final trace path.
+step emits an owner-specific canary into the trace. Stop reports the owner
+label, actual and expected step counts, schedule completion, owner TID, export
+errors, and the final trace path.
 
 Configuration is supplied in the start request:
 
@@ -222,8 +243,9 @@ acknowledged stop so compression cannot consume scheduler CPU during the
 following serving window.
 
 Only one process-global Kineto owner is permitted at a time. Select one stage
-per process for torch or NVTX capture. Event-only profiling can cover all
-stages.
+and one owner (`scheduler` or `pre_lm_encoder`) per process for torch capture.
+NVTX remains scheduler-owned. Event-only profiling can cover all stages and
+threads.
 
 ## HTTP surface
 
@@ -250,8 +272,10 @@ these endpoints.
 
 ## Discipline
 
-- **Profiling must never break serving.** The emitter swallows write
-  errors and counts drops; the first failure is logged once.
+- **Profiling must never block serving.** The producer uses a bounded
+  non-blocking queue. Queue overflow or a writer failure is counted and logged,
+  and the capture is rejected at acknowledged stop; it is never silently
+  accepted as complete.
 - **Tensors and large blobs stay out of event metadata.** Keep metadata
   to small scalars (ids, counts, durations, modality, error strings). The
   recorder enforces this defensively: if a tensor / numpy array ends up

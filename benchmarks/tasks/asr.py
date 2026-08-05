@@ -19,6 +19,7 @@ import os
 import string
 import time
 import wave
+from pathlib import Path
 
 import aiohttp
 import requests
@@ -54,6 +55,13 @@ FUN_ASR_MODEL_PATH = "FunAudioLLM/Fun-ASR-Nano-2512-hf"
 DEFAULT_ASR_TRANSCRIBE_CONCURRENCY = 32
 # note (aaron): warmup requests sent before the timed window, per unit of concurrency.
 ASR_WARMUP_MULTIPLIER = 2
+
+
+@functools.cache
+def _read_audio_payload(path: str) -> tuple[bytes, float]:
+    """Load and characterize a benchmark clip once, outside the event loop."""
+    audio_bytes = Path(path).read_bytes()
+    return audio_bytes, get_wav_duration(audio_bytes)
 
 
 @functools.lru_cache(maxsize=1)
@@ -308,7 +316,7 @@ def transcribe_and_compute_wer(
     """Transcribe audio and compute per-sample WER metrics."""
     try:
         hyp_text = transcribe(asr, wav_path, lang, device)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - one bad sample must not abort evaluation
         output.error = f"Transcription failed: {exc}"
         logger.error(f"[{output.sample_id}] {output.error}")
         return output
@@ -321,6 +329,7 @@ def make_asr_send_fn(
     lang: str = "en",
     *,
     stream: bool = False,
+    request_id_prefix: str = "",
 ) -> SendFn:
     """Return a send_fn(session, sample) -> RequestResult that transcribes one
     SeedTTS reference clip via the Omni /v1/audio/transcriptions endpoint.
@@ -333,19 +342,30 @@ def make_asr_send_fn(
     async def send_fn(
         session: aiohttp.ClientSession, sample: SampleInput
     ) -> RequestResult:
-        result = RequestResult(request_id=sample.sample_id)
+        server_request_id = f"{request_id_prefix}{sample.sample_id}"
+        if len(server_request_id) > 256:
+            raise ValueError(
+                f"profile request identity exceeds 256 characters: "
+                f"{server_request_id!r}"
+            )
+        result = RequestResult(
+            request_id=sample.sample_id,
+            server_request_id=server_request_id,
+        )
         try:
-            with open(sample.ref_audio, "rb") as audio_file:
-                audio_bytes = audio_file.read()
+            audio_bytes, audio_duration_s = await asyncio.to_thread(
+                _read_audio_payload, sample.ref_audio
+            )
         except OSError as exc:
             result.error = str(exc)
             return result
-        result.audio_duration_s = get_wav_duration(audio_bytes)
+        result.audio_duration_s = audio_duration_s
 
         form = aiohttp.FormData()
         form.add_field("model", model_name)
         form.add_field("language", "en" if lang == "en" else lang)
         form.add_field("response_format", "json")
+        form.add_field("request_id", server_request_id)
         if stream:
             form.add_field("stream", "true")
         form.add_field(
@@ -358,7 +378,13 @@ def make_asr_send_fn(
         headers = {"x-sglang-omni-route-stream": "true"} if stream else None
         start_time = time.perf_counter()
         try:
+            result.client_http_start_ns = time.perf_counter_ns()
             async with session.post(api_url, data=form, headers=headers) as response:
+                result.client_http_response_start_ns = time.perf_counter_ns()
+                result.http_status = response.status
+                result.server_request_id = (
+                    response.headers.get("X-Request-Id") or server_request_id
+                )
                 if response.status != 200:
                     result.error = f"HTTP {response.status}: {await response.text()}"
                 elif stream:
@@ -416,7 +442,7 @@ async def _consume_transcription_stream(
         elif event_type == "error":
             raise ValueError("Stream error event: {}".format(event.get("error")))
     if not isinstance(final_text, str):
-        raise ValueError("Stream ended without a transcript.text.done event")
+        raise TypeError("Stream ended without a transcript.text.done event")
     if not seen_done:
         raise ValueError("Stream ended without a [DONE] event")
     return final_text.strip()
@@ -436,13 +462,20 @@ async def run_asr_transcription(
     stream: bool = False,
     request_rate: float = float("inf"),
     request_rate_seed: int | None = None,
+    request_id_prefix: str = "",
 ) -> tuple[list[RequestResult], float]:
     """Transcribe samples against a running ASR router at one concurrency.
 
     Returns (outputs, wall_clock_s) via the shared BenchmarkRunner.
     """
     api_url = f"http://{host}:{port}/v1/audio/transcriptions"
-    send_fn = make_asr_send_fn(model_path, api_url, lang=lang, stream=stream)
+    send_fn = make_asr_send_fn(
+        model_path,
+        api_url,
+        lang=lang,
+        stream=stream,
+        request_id_prefix=request_id_prefix,
+    )
     runner = BenchmarkRunner(
         RunConfig(
             max_concurrency=concurrency,
@@ -503,6 +536,45 @@ def build_asr_eval_results(
                 "text_ttft_s": result.text_ttft_s if result else None,
                 "inter_chunk_s": result.inter_chunk_s if result else [],
                 "error": output.error,
+                "http_status": result.http_status if result else None,
+                "server_request_id": result.server_request_id if result else None,
+                "client_timing": (
+                    {
+                        "clock": "time.perf_counter_ns",
+                        "scheduled_arrival_ns": result.client_scheduled_arrival_ns,
+                        "task_created_ns": result.client_task_created_ns,
+                        "permit_wait_start_ns": result.client_permit_wait_start_ns,
+                        "permit_acquired_ns": result.client_permit_acquired_ns,
+                        "send_invoked_ns": result.client_send_invoked_ns,
+                        "http_start_ns": result.client_http_start_ns,
+                        "http_response_start_ns": (
+                            result.client_http_response_start_ns
+                        ),
+                        "response_complete_ns": result.client_response_complete_ns,
+                        "arrival_lag_s": (
+                            (
+                                result.client_task_created_ns
+                                - result.client_scheduled_arrival_ns
+                            )
+                            / 1e9
+                            if result.client_task_created_ns is not None
+                            and result.client_scheduled_arrival_ns is not None
+                            else None
+                        ),
+                        "client_queue_s": (
+                            (
+                                result.client_permit_acquired_ns
+                                - result.client_permit_wait_start_ns
+                            )
+                            / 1e9
+                            if result.client_permit_acquired_ns is not None
+                            and result.client_permit_wait_start_ns is not None
+                            else None
+                        ),
+                    }
+                    if result
+                    else None
+                ),
             }
         )
 

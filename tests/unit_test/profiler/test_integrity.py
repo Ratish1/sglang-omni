@@ -8,6 +8,7 @@ from pathlib import Path
 
 from sglang_omni.profiler.integrity import (
     validate_event_file,
+    validate_request_lifecycle,
     validate_stop_response,
     validate_torch_trace,
 )
@@ -132,3 +133,100 @@ def test_event_integrity_can_reject_cache_hit_workloads(tmp_path: Path) -> None:
     )
     assert not report.valid
     assert any("forbidden" in error for error in report.errors)
+
+
+def test_request_lifecycle_accepts_complete_cpu_bottleneck_chain(
+    tmp_path: Path,
+) -> None:
+    names = [
+        "http_request_received",
+        "scheduler_inbox_receive",
+        "request_builder_submitted",
+        "scheduler_request_build_start",
+        "request_build.pre_lm_wait_start",
+        "pre_lm_enqueue",
+        "pre_lm_dequeue",
+        "pre_lm_batch_start",
+        "pre_lm_encode_start",
+        "pre_lm_encode_submitted",
+        "pre_lm_gpu_wait_start",
+        "pre_lm_gpu_complete",
+        "pre_lm_split_start",
+        "pre_lm_split_end",
+        "pre_lm_future_publish",
+        "pre_lm_batch_end",
+        "pre_lm_waiter_resumed",
+        "request_build.pre_lm_wait_end",
+        "scheduler_request_build_end",
+        "request_builder_future_ready",
+        "request_build_capacity_release",
+        "request_builder_ready_drained",
+        "scheduler_queue_enter",
+        "scheduler_prefill_start",
+        "scheduler_request_terminal",
+        "http_response_ready",
+    ]
+    events = []
+    for sequence, name in enumerate(names, 1):
+        metadata = {}
+        if name.startswith("pre_lm_"):
+            metadata = {"batch_id": "b1", "batch_size": 1}
+        events.append(
+            {
+                "request_id": "r1",
+                "stage": "asr",
+                "event_name": name,
+                "timestamp_ns": sequence,
+                "monotonic_ns": sequence,
+                "source_sequence": sequence,
+                "run_id": "run",
+                "pid": 1,
+                "native_tid": 2,
+                "metadata": metadata,
+            }
+        )
+    path = tmp_path / "events_asr_1.jsonl"
+    path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    report = validate_request_lifecycle(
+        [str(path)],
+        expected_request_ids={"r1"},
+    )
+    assert report.valid, report.errors
+
+
+def test_request_lifecycle_rejects_ready_future_never_drained(
+    tmp_path: Path,
+) -> None:
+    events = [
+        {
+            "request_id": "r1",
+            "stage": "asr",
+            "event_name": name,
+            "timestamp_ns": index,
+            "monotonic_ns": index,
+            "run_id": "run",
+            "pid": 1,
+            "native_tid": 2,
+            "metadata": {},
+        }
+        for index, name in enumerate(
+            (
+                "request_builder_submitted",
+                "scheduler_request_build_start",
+                "scheduler_request_build_end",
+                "request_builder_future_ready",
+            ),
+            1,
+        )
+    ]
+    path = tmp_path / "events_asr_1.jsonl"
+    path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    report = validate_request_lifecycle([str(path)])
+    assert not report.valid
+    assert any("never drained" in error for error in report.errors)

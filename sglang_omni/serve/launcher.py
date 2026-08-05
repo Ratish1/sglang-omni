@@ -400,12 +400,19 @@ def _mount_profiler_routes(
         coordinator_event_path = None
         if recorder.is_active() and (run_id is None or active == run_id):
             coordinator_event_path = recorder.stop(run_id=active)
+        coordinator_events = recorder.snapshot()
         response = {
             "run_id": run_id or active,
             "coordinator_event_path": coordinator_event_path,
+            "coordinator_events": coordinator_events,
             "manifest": manifest,
         }
-        if not manifest["success"]:
+        coordinator_valid = coordinator_event_path is None or (
+            coordinator_events.get("finalized")
+            and not coordinator_events.get("writer_error")
+            and not coordinator_events.get("dropped_events")
+        )
+        if not manifest["success"] or not coordinator_valid:
             raise HTTPException(status_code=503, detail=response)
         return response
 
@@ -423,12 +430,19 @@ def _mount_profiler_routes(
         coordinator_event_path = None
         if recorder.is_active() and (run_id is None or active == run_id):
             coordinator_event_path = recorder.stop(run_id=active)
+        coordinator_events = recorder.snapshot()
         response = {
             "run_id": run_id or active,
             "coordinator_event_path": coordinator_event_path,
+            "coordinator_events": coordinator_events,
             "manifest": manifest,
         }
-        if not manifest["success"]:
+        coordinator_valid = coordinator_event_path is None or (
+            coordinator_events.get("finalized")
+            and not coordinator_events.get("writer_error")
+            and not coordinator_events.get("dropped_events")
+        )
+        if not manifest["success"] or not coordinator_valid:
             raise HTTPException(status_code=503, detail=response)
         return response
 

@@ -151,6 +151,50 @@ def test_concurrent_emits_are_safe(tmp_path: Path) -> None:
         assert ev["run_id"] == "r0"
 
 
+def test_async_recorder_finalizes_atomically_with_checksum(tmp_path: Path) -> None:
+    rec = RequestEventRecorder(queue_capacity=32)
+    path = Path(rec.start(run_id="r0", event_dir=str(tmp_path), stage="asr"))
+    partial = path.with_suffix(path.suffix + ".partial")
+    assert not path.exists()
+    assert partial.exists()
+
+    rec.emit(request_id="r1", stage="asr", event_name="one")
+    rec.emit(request_id="r1", stage="asr", event_name="two")
+    rec.stop(run_id="r0")
+
+    snapshot = rec.snapshot()
+    assert path.is_file()
+    assert not partial.exists()
+    assert snapshot["schema_version"] == 2
+    assert snapshot["finalized"] is True
+    assert snapshot["enqueued_events"] == 2
+    assert snapshot["written_events"] == 2
+    assert snapshot["dropped_events"] == 0
+    assert len(snapshot["sha256"]) == 64
+
+    events = _read_events(str(path))
+    assert [event["source_sequence"] for event in events] == [1, 2]
+    assert all("host_boot_id" in event for event in events)
+
+
+def test_deferred_recorder_does_no_serialization_until_stop(tmp_path: Path) -> None:
+    rec = RequestEventRecorder(queue_capacity=32, defer_writes=True)
+    path = Path(rec.start(run_id="r0", event_dir=str(tmp_path), stage="asr"))
+    rec.emit(request_id="r1", stage="asr", event_name="one")
+    rec.emit(request_id="r1", stage="asr", event_name="two")
+
+    active = rec.snapshot()
+    assert active["deferred_writes"] is True
+    assert active["enqueued_events"] == 2
+    assert active["written_events"] == 0
+    assert not path.exists()
+
+    rec.stop(run_id="r0")
+    finalized = rec.snapshot()
+    assert finalized["finalized"] is True
+    assert finalized["written_events"] == 2
+
+
 def test_module_level_emit_uses_singleton(tmp_path: Path) -> None:
     rec = get_recorder()
     path = rec.start(run_id="r0", event_dir=str(tmp_path), stage="coord")

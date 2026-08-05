@@ -6,8 +6,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 import aiohttp
 import numpy as np
@@ -88,23 +89,56 @@ class BenchmarkRunner:
         )
         pbar = tqdm(total=len(samples), disable=self.config.disable_tqdm)
 
-        async def _limited(sample: Any) -> RequestResult:
+        async def _limited(
+            sample: Any,
+            *,
+            scheduled_arrival_ns: int,
+            task_created_ns: int,
+        ) -> RequestResult:
+            permit_wait_start_ns = time.perf_counter_ns()
             if semaphore:
                 async with semaphore:
+                    permit_acquired_ns = time.perf_counter_ns()
+                    send_invoked_ns = time.perf_counter_ns()
                     result = await send_fn(session, sample)
             else:
+                permit_acquired_ns = time.perf_counter_ns()
+                send_invoked_ns = time.perf_counter_ns()
                 result = await send_fn(session, sample)
+            response_complete_ns = time.perf_counter_ns()
+            result.client_scheduled_arrival_ns = scheduled_arrival_ns
+            result.client_task_created_ns = task_created_ns
+            result.client_permit_wait_start_ns = permit_wait_start_ns
+            result.client_permit_acquired_ns = permit_acquired_ns
+            result.client_send_invoked_ns = send_invoked_ns
+            result.client_response_complete_ns = response_complete_ns
             pbar.update(1)
             return result
 
         try:
             tasks: list[asyncio.Task] = []
             rng = np.random.default_rng(self.config.request_rate_seed)
+            dispatch_origin_ns = time.perf_counter_ns()
+            scheduled_arrival_ns = dispatch_origin_ns
             for sample in samples:
                 if self.config.request_rate != float("inf"):
                     interval = rng.exponential(1.0 / self.config.request_rate)
-                    await asyncio.sleep(interval)
-                tasks.append(asyncio.create_task(_limited(sample)))
+                    scheduled_arrival_ns += int(interval * 1e9)
+                    delay_s = max(
+                        0.0,
+                        (scheduled_arrival_ns - time.perf_counter_ns()) / 1e9,
+                    )
+                    await asyncio.sleep(delay_s)
+                task_created_ns = time.perf_counter_ns()
+                tasks.append(
+                    asyncio.create_task(
+                        _limited(
+                            sample,
+                            scheduled_arrival_ns=scheduled_arrival_ns,
+                            task_created_ns=task_created_ns,
+                        )
+                    )
+                )
 
             results: list[RequestResult] = list(await asyncio.gather(*tasks))
         finally:

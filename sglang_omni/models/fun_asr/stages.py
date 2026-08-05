@@ -201,14 +201,17 @@ def create_sglang_fun_asr_executor(
         server_args=server_args,
     )
 
-    want_cuda_graph, (
-        model_worker,
-        tree_cache,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-        prefill_mgr,
-        decode_mgr,
-        model_config,
+    (
+        want_cuda_graph,
+        (
+            model_worker,
+            tree_cache,
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            prefill_mgr,
+            decode_mgr,
+            model_config,
+        ),
     ) = create_sglang_infrastructure_defer_cuda_graph(
         server_args,
         gpu_id,
@@ -262,7 +265,7 @@ def create_sglang_fun_asr_executor(
             min_emit_interval_s=stream_emit_interval_s,
         )
 
-        return OmniScheduler(
+        scheduler = OmniScheduler(
             tp_worker=model_worker,
             tree_cache=tree_cache,
             req_to_token_pool=req_to_token_pool,
@@ -285,6 +288,12 @@ def create_sglang_fun_asr_executor(
                 else None
             ),
         )
+        if audio_encoder_service is not None:
+            scheduler.register_profiler_owner(
+                "pre_lm_encoder",
+                audio_encoder_service,
+            )
+        return scheduler
     except Exception:
         if audio_encoder_service is not None:
             audio_encoder_service.close()
@@ -295,4 +304,4 @@ def create_fun_asr_executor(*args, **kwargs):
     return create_sglang_fun_asr_executor(*args, **kwargs)
 
 
-__all__ = ["create_sglang_fun_asr_executor", "create_fun_asr_executor"]
+__all__ = ["create_fun_asr_executor", "create_sglang_fun_asr_executor"]

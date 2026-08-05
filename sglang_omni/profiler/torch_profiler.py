@@ -58,8 +58,7 @@ class TorchProfilerConfig:
         total = self.total_steps
         if total > _MAX_PROFILE_STEPS:
             raise ValueError(
-                f"profiler schedule has {total} steps; maximum is "
-                f"{_MAX_PROFILE_STEPS}"
+                f"profiler schedule has {total} steps; maximum is {_MAX_PROFILE_STEPS}"
             )
 
     @property
@@ -70,7 +69,7 @@ class TorchProfilerConfig:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "TorchProfilerConfig":
+    def from_dict(cls, data: dict[str, Any] | None) -> TorchProfilerConfig:
         if not data:
             return cls()
         known = {field.name for field in cls.__dataclass_fields__.values()}
@@ -101,6 +100,7 @@ class TorchProfiler(ProfilerBase):
     _owner_thread_id: int | None = None
     _owner_native_tid: int | None = None
     _owner_thread_name: str | None = None
+    _owner_label: str = "scheduler"
     _config: TorchProfilerConfig | None = None
     _step_count: int = 0
     _trace_path: str | None = None
@@ -136,6 +136,7 @@ class TorchProfiler(ProfilerBase):
         run_id: str | None = None,
         *,
         config: TorchProfilerConfig | None = None,
+        owner_label: str = "scheduler",
     ) -> str:
         """Start a bounded trace on the calling thread.
 
@@ -171,6 +172,7 @@ class TorchProfiler(ProfilerBase):
             cls._owner_thread_id = threading.get_ident()
             cls._owner_native_tid = threading.get_native_id()
             cls._owner_thread_name = threading.current_thread().name
+            cls._owner_label = owner_label
             cls._config = config
             cls._step_count = 0
             cls._trace_path = None
@@ -244,7 +246,7 @@ class TorchProfiler(ProfilerBase):
             # the scheduled active window (the immediate post-start period may
             # be WAIT/WARMUP and is intentionally discarded).
             with record_function(
-                "sglang_omni.profiler.scheduler_owner."
+                f"sglang_omni.profiler.{cls._owner_label}_owner."
                 f"{cls._owner_thread_name or 'unknown'}"
             ):
                 pass
@@ -308,6 +310,7 @@ class TorchProfiler(ProfilerBase):
             "owner_tid": cls._owner_native_tid,
             "owner_ident": cls._owner_thread_id,
             "owner_thread": cls._owner_thread_name,
+            "owner_label": cls._owner_label,
             "step_count": cls._step_count,
             "expected_steps": config.total_steps if config is not None else None,
             "schedule_complete": (
@@ -339,6 +342,7 @@ class TorchProfiler(ProfilerBase):
         cls._owner_thread_id = None
         cls._owner_native_tid = None
         cls._owner_thread_name = None
+        cls._owner_label = "scheduler"
         cls._config = None
         cls._step_count = 0
         cls._trace_path = None
