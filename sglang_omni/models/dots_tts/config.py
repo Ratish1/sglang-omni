@@ -1,17 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pipeline configuration for dots.tts.
-
-dots.tts generates continuous audio latents before AudioVAE turns those
-latents into waveform samples.  The pipeline keeps that boundary visible:
-``latent_engine`` owns the autoregressive/flow latent path and ``vocoder`` owns
-AudioVAE decode.  The latent engine uses SGLang's Qwen2-backed AR path while
-dots side modules provide prompt conditioning, DiT/flow latent generation, and
-audio patch feedback.
-"""
+"""Pipeline configuration for dots.tts."""
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from sglang_omni.config import PipelineConfig, StageConfig
 
@@ -19,7 +11,7 @@ _PKG = "sglang_omni.models.dots_tts"
 
 
 class DotsTTSPipelineConfig(PipelineConfig):
-    """3-stage dots.tts pipeline: preprocessing -> latent_engine -> vocoder."""
+    """preprocess -> reference encode -> SGLang latent AR -> AudioVAE."""
 
     architecture: ClassVar[str] = "DotsTTSForConditionalGeneration"
     requires_model_capabilities: ClassVar[bool] = True
@@ -34,6 +26,14 @@ class DotsTTSPipelineConfig(PipelineConfig):
             name="preprocessing",
             process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
+            next="reference_encode",
+        ),
+        StageConfig(
+            name="reference_encode",
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_reference_encode_executor",
+            factory_args={"device": "cuda"},
+            gpu=0,
             next="latent_engine",
         ),
         StageConfig(
@@ -56,7 +56,7 @@ class DotsTTSPipelineConfig(PipelineConfig):
         ),
     ]
 
-    def model_post_init(self, __context: object = None) -> None:
+    def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
         if any(stage.tp_size != 1 for stage in self.stages):
             raise ValueError("dots.tts currently supports tp_size=1 only")

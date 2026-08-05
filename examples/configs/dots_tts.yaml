@@ -1,8 +1,13 @@
 config_cls: DotsTTSPipelineConfig
 model_path: dots-studio/dots.tts-mf
 runtime_overrides:
+  preprocessing:
+    default_num_steps: 4
   latent_engine:
+    optimize: true
     max_generate_length: 500
     server_args_overrides:
-      mem_fraction_static: 0.55
-      max_running_requests: 8
+      mem_fraction_static: 0.20
+      max_running_requests: 1
+  vocoder:
+    optimize: true

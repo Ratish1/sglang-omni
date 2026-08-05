@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang request helpers for the native dots TTS latent engine."""
+"""Map dots.tts pipeline state onto SGLang's native request lifecycle."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import Any
 
 import torch
 
-from sglang_omni.models.dots_tts.payload_types import DotsTTSState
-
-if TYPE_CHECKING:
-    from sglang_omni.models.dots_tts.native_adapter import DotsTTSPreparedInputs
+from sglang_omni.models.dots_tts.payload_types import (
+    DotsTTSState,
+    load_dots_tts_state,
+    store_dots_tts_state,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
@@ -19,70 +21,70 @@ from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
 @dataclass
 class DotsTTSSGLangRequestData(SGLangARRequestData):
-    """Per-request state for SGLang-backed dots latent generation."""
-
     state: DotsTTSState = field(default_factory=DotsTTSState)
     generation_schedule: torch.Tensor | None = None
-    position: int = 0
     span_positions: torch.Tensor | None = None
+    prompt_span_positions: torch.Tensor | None = None
     prefill_end: int = 0
-    audio_placeholder_ids: set[int] = field(default_factory=set)
-    prompt_conditioning: Any = None
-    fm_state: Any = None
+    flow_state: Any = None
     latest_latent_patch: torch.Tensor | None = None
     latent_patches: list[torch.Tensor] = field(default_factory=list)
-    generation_kwargs: dict[str, Any] = field(default_factory=dict)
     stream_metadata: dict[str, Any] | None = None
     chunk_id: int = 0
     control_token_id: int = 0
-    max_generate_length: int = 500
-    input_ids: torch.Tensor | None = None
-    raw_native_inputs: dict[str, Any] = field(default_factory=dict)
-    latest_hidden_state: torch.Tensor | None = None
-    eos_score: torch.Tensor | None = None
-    finish_reason: str | None = None
 
 
 def build_sglang_dots_tts_request(
     payload: StagePayload,
-    *,
-    adapter: Any,
 ) -> DotsTTSSGLangRequestData:
-    """Build per-request dots data before constructing the SGLang Req."""
-
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.sampling.sampling_params import SamplingParams
 
-    state = DotsTTSState.from_dict(payload.data)
-    if state.template_name == "tts_interleave":
-        raise NotImplementedError(
-            "dots TTS SGLang-native v1 does not support text/audio interleave"
+    state = load_dots_tts_state(payload)
+    schedule = state.generation_schedule
+    if schedule is None:
+        raise RuntimeError("dots.tts preprocessing did not build a generation schedule")
+    if schedule.ndim == 1:
+        schedule = schedule.unsqueeze(0)
+    audio_ids = {int(value) for value in state.audio_span_token_ids}
+    if not audio_ids:
+        raise RuntimeError("dots.tts preprocessing did not resolve audio span ids")
+    schedule_row = schedule[0]
+    span_positions = torch.nonzero(
+        torch.isin(schedule_row, torch.tensor(sorted(audio_ids))), as_tuple=False
+    ).squeeze(-1)
+    prompt_frames = 0 if state.prompt_latents is None else state.prompt_latents.shape[1]
+    prompt_patch_count = 0
+    if state.prompt_latents is not None:
+        configured_patch_size = int(state.latent_patch_size)
+        if configured_patch_size <= 0:
+            raise RuntimeError("dots.tts state is missing latent_patch_size")
+        if prompt_frames % configured_patch_size:
+            raise ValueError("dots.tts prompt latents are not patch aligned")
+        prompt_patch_count = prompt_frames // configured_patch_size
+    if span_positions.numel() <= prompt_patch_count:
+        raise ValueError(
+            "dots.tts generation schedule has no audio span after prompt prefill"
         )
-    prepared = adapter.prepare_inputs(state)
-    input_ids_tensor = _prefill_input_ids(prepared)
-    if input_ids_tensor is None:
-        input_ids_list: list[int] = []
-    else:
-        input_ids_list = (
-            input_ids_tensor.reshape(-1).detach().cpu().to(dtype=torch.long).tolist()
-        )
-    control_token_id = 0
-    vocab_size = int(adapter.llm_vocab_size)
-    max_generate_length = _resolve_max_generate_length(state, prepared)
+    prefill_end = int(span_positions[prompt_patch_count].item())
+    remaining_spans = int(span_positions.numel()) - prompt_patch_count
+    input_ids = schedule[0, :prefill_end].to(dtype=torch.long).tolist()
+    control_token_id = int(schedule[0, span_positions[prompt_patch_count]])
+
     sampling_params = SamplingParams(
-        max_new_tokens=max_generate_length,
+        max_new_tokens=remaining_spans,
         temperature=0.0,
         stop_token_ids=[],
     )
     sampling_params.normalize(None)
-    sampling_params.verify(vocab_size)
+    sampling_params.verify(int(state.vocab_size))
     req = Req(
         rid=payload.request_id,
         origin_input_text="",
-        origin_input_ids=input_ids_list,
+        origin_input_ids=input_ids,
         sampling_params=sampling_params,
         eos_token_ids=set(),
-        vocab_size=vocab_size,
+        vocab_size=int(state.vocab_size),
     )
     req.tokenizer = None
     req._input_embeds_are_projected = True
@@ -92,55 +94,19 @@ def build_sglang_dots_tts_request(
         stage_payload=payload,
         req=req,
         output_ids=req.output_ids,
-        input_ids=prepared.input_ids,
-        generation_schedule=prepared.generation_schedule,
-        span_positions=prepared.audio_span_positions,
-        prefill_end=_resolve_prefill_end(prepared),
-        position=_resolve_prefill_end(prepared),
-        audio_placeholder_ids=set(prepared.audio_placeholder_ids),
-        prompt_conditioning=prepared.prompt_conditioning,
-        fm_state=prepared.fm_state,
-        generation_kwargs=dict(prepared.generation_kwargs),
-        prefill_input_embeds=prepared.prompt_patch_embeddings,
-        raw_native_inputs=dict(prepared.raw_inputs),
-        max_generate_length=max_generate_length,
-        stream_metadata={"modality": "audio_latents"},
+        input_ids=schedule[:, :prefill_end],
+        generation_schedule=schedule,
+        span_positions=span_positions,
+        prompt_span_positions=span_positions[:prompt_patch_count],
+        prefill_end=prefill_end,
+        max_new_tokens=remaining_spans,
+        input_embeds_are_projected=True,
         control_token_id=control_token_id,
+        stream_metadata={
+            "modality": "audio_latents",
+            "stream": bool(state.stream),
+        },
     )
-
-
-def _resolve_prefill_end(prepared: DotsTTSPreparedInputs) -> int:
-    if prepared.prefill_end is not None:
-        return int(prepared.prefill_end)
-    if prepared.input_ids is not None:
-        return int(prepared.input_ids.reshape(-1).numel())
-    if prepared.generation_schedule is not None:
-        return int(prepared.generation_schedule.reshape(-1).numel())
-    return 0
-
-
-def _prefill_input_ids(prepared: DotsTTSPreparedInputs) -> torch.Tensor | None:
-    generation_schedule = prepared.generation_schedule
-    prefill_end = _resolve_prefill_end(prepared)
-    if generation_schedule is not None and prefill_end > 0:
-        if generation_schedule.ndim == 1:
-            return generation_schedule[:prefill_end].unsqueeze(0)
-        return generation_schedule[:, :prefill_end]
-    return prepared.input_ids
-
-
-def _resolve_max_generate_length(
-    state: DotsTTSState, prepared: DotsTTSPreparedInputs
-) -> int:
-    if state.max_generate_length is not None:
-        return int(state.max_generate_length)
-    span_positions = prepared.audio_span_positions
-    if span_positions is not None:
-        prefill_end = _resolve_prefill_end(prepared)
-        generated_spans = (span_positions >= prefill_end).sum().item()
-        if generated_spans > 0:
-            return int(generated_spans)
-    return 500
 
 
 def build_stream_output(
@@ -148,51 +114,31 @@ def build_stream_output(
     data: DotsTTSSGLangRequestData,
     req_output: Any,
 ) -> Iterator[OutgoingMessage]:
-    """Emit the latest latent patch through Omni's stream side channel."""
-
     del req_output
-    latent_patch = data.latest_latent_patch
-    if latent_patch is None:
+    latent = data.latest_latent_patch
+    data.latest_latent_patch = None
+    if latent is None or not data.state.stream:
         return
     metadata = dict(data.stream_metadata or {})
-    metadata.setdefault("modality", "audio_latents")
-    metadata.setdefault("chunk_id", data.chunk_id)
+    metadata["chunk_id"] = data.chunk_id
     data.chunk_id += 1
-    data.latest_latent_patch = None
     yield OutgoingMessage(
         request_id=request_id,
         type="stream",
         target="vocoder",
-        data=latent_patch,
+        data=latent,
         metadata=metadata,
     )
 
 
-def apply_latent_result(
-    payload: StagePayload,
-    data: DotsTTSSGLangRequestData,
-) -> StagePayload:
-    """Store collected latent patches back into the StagePayload."""
-
+def apply_latent_result(data: DotsTTSSGLangRequestData) -> StagePayload:
     state = data.state
-    payload.data = {
-        "modality": "audio_latents",
-        "latent_patches": list(data.latent_patches),
-        "state": state.to_dict(),
-    }
-    return payload
-
-
-def make_dots_tts_scheduler_adapters(*, adapter: Any):
-    """Build request/result adapter closures for ``OmniScheduler``."""
-
-    def request_builder(payload: StagePayload) -> DotsTTSSGLangRequestData:
-        return build_sglang_dots_tts_request(payload, adapter=adapter)
-
-    def result_adapter(data: DotsTTSSGLangRequestData) -> StagePayload:
-        return apply_latent_result(data.stage_payload, data)
-
-    return request_builder, result_adapter
+    if not data.latent_patches:
+        raise RuntimeError("dots.tts generated no payload latent patches")
+    state.generated_latents = torch.cat(data.latent_patches, dim=1)
+    state.completion_tokens = len(data.latent_patches)
+    state.finish_reason = data.finish_reason
+    return store_dots_tts_state(data.stage_payload, state)
 
 
 __all__ = [
@@ -200,5 +146,4 @@ __all__ = [
     "apply_latent_result",
     "build_sglang_dots_tts_request",
     "build_stream_output",
-    "make_dots_tts_scheduler_adapters",
 ]

@@ -18,7 +18,7 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 EXPECTED_TTS_CAPABILITIES = {
     "DotsTTSForConditionalGeneration": ModelCapabilities(
         supports_reference_audio=True,
-        supports_batch_vocoder=False,
+        supports_batch_vocoder=True,
         supports_streaming_vocoder=True,
         supports_cuda_graph=False,
         supports_torch_compile=True,

@@ -1,30 +1,47 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Payload state for the dots.tts wrapper pipeline."""
+"""Per-request state carried by the dots.tts Omni pipeline."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
+from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import DeclarativeStateBase, wire
 
 
 @dataclass
 class DotsTTSState(DeclarativeStateBase):
-    """Normalized per-request inputs for the native dots TTS pipeline."""
+    """Only cross-stage state; scheduler/runner state stays in Omni."""
 
     sample_rate: int = wire(48000, codec="int")
-    text: str = wire("", codec="str")
     prompt_audio_path: str | None = None
-    prompt_text: str | None = None
-    template_name: str | None = None
-    language: str | None = None
+    use_prompt_prefill: bool = wire(False, codec="bool")
     speaker_scale: float = wire(1.5, codec="float")
     ode_method: str = wire("euler", codec="str_or")
     num_steps: int = wire(10, codec="int_or")
     guidance_scale: float = wire(1.2, codec="float")
-    normalize_text: bool = wire(False, codec="bool")
-    profile_inference: bool = wire(False, codec="bool")
-    max_generate_length: int | None = wire(None, codec="opt_int")
     seed: int | None = wire(None, codec="opt_int")
     stream: bool = wire(False, codec="bool")
-    rtf: float | None = wire(None, codec="float")
+    eos_threshold: float = wire(0.8, codec="float")
+    generation_schedule: torch.Tensor | None = wire(None, codec="typed_tensor")
+    audio_span_token_ids: list[int] = wire(default_factory=list, codec="list")
+    latent_patch_size: int = wire(4, codec="int_or")
+    vocab_size: int = wire(0, codec="int")
+    prompt_latents: torch.Tensor | None = wire(None, codec="typed_tensor")
+    speaker_embedding: torch.Tensor | None = wire(None, codec="typed_tensor")
+    generated_latents: torch.Tensor | None = wire(None, codec="typed_tensor")
+    finish_reason: str | None = None
+
+
+def load_dots_tts_state(payload: StagePayload) -> DotsTTSState:
+    return DotsTTSState.from_dict(payload.data)
+
+
+def store_dots_tts_state(payload: StagePayload, state: DotsTTSState) -> StagePayload:
+    payload.data = state.to_dict()
+    return payload
+
+
+__all__ = ["DotsTTSState", "load_dots_tts_state", "store_dots_tts_state"]
