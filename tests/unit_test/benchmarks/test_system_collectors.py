@@ -6,12 +6,14 @@ import json
 from pathlib import Path
 
 from benchmarks.profiling.system_collectors import (
+    parse_cpu_frequency,
     parse_gpu_dmon,
     parse_perf_stat,
     parse_thread_snapshots,
     parse_turbostat,
     psi_delta,
     read_psi,
+    summarize_thread_snapshot_delta,
 )
 
 
@@ -124,6 +126,50 @@ def test_thread_snapshot_parser_attributes_cpu_and_runnable_delay(
     assert thread["runtime_fraction"] == 0.5
 
 
+def test_thread_snapshot_delta_includes_migrations_and_thread_lifecycle() -> None:
+    before = {
+        "monotonic_ns": 1_000_000_000,
+        "threads": [
+            {
+                "tid": 10,
+                "comm": "scheduler-asr",
+                "utime_ticks": 100,
+                "stime_ticks": 20,
+                "runtime_ns": 800_000_000,
+                "runqueue_delay_ns": 100_000_000,
+                "timeslices": 50,
+                "migrations": 3,
+                "processor": 2,
+            },
+            {"tid": 11},
+        ],
+    }
+    after = {
+        "monotonic_ns": 2_000_000_000,
+        "threads": [
+            {
+                "tid": 10,
+                "comm": "scheduler-asr",
+                "utime_ticks": 150,
+                "stime_ticks": 30,
+                "runtime_ns": 1_300_000_000,
+                "runqueue_delay_ns": 300_000_000,
+                "timeslices": 80,
+                "migrations": 8,
+                "processor": 4,
+            },
+            {"tid": 12},
+        ],
+    }
+    parsed = summarize_thread_snapshot_delta(before, after)
+    assert parsed["threads_started"] == [12]
+    assert parsed["threads_exited"] == [11]
+    assert parsed["migrations"] == 5
+    assert parsed["threads"][0]["runqueue_delay_ms"] == 200.0
+    assert parsed["threads"][0]["first_processor"] == 2
+    assert parsed["threads"][0]["last_processor"] == 4
+
+
 def test_gpu_dmon_parser_reports_idle_fraction(tmp_path: Path) -> None:
     output = tmp_path / "gpu_dmon.txt"
     output.write_text(
@@ -136,3 +182,40 @@ def test_gpu_dmon_parser_reports_idle_fraction(tmp_path: Path) -> None:
     assert parsed["samples"] == 2
     assert parsed["columns"]["sm"]["mean"] == 40.0
     assert parsed["columns"]["sm"]["zero_fraction"] == 0.5
+
+
+def test_cpu_frequency_parser_reports_busy_weighted_frequency(tmp_path: Path) -> None:
+    output = tmp_path / "cpu_frequency.jsonl"
+    samples = [
+        {
+            "monotonic_ns": 1,
+            "cpus": [
+                {
+                    "cpu": 0,
+                    "frequency_khz": 2_000_000,
+                    "total_ticks": 100,
+                    "idle_ticks": 50,
+                }
+            ],
+        },
+        {
+            "monotonic_ns": 2,
+            "cpus": [
+                {
+                    "cpu": 0,
+                    "frequency_khz": 3_000_000,
+                    "total_ticks": 200,
+                    "idle_ticks": 75,
+                }
+            ],
+        },
+    ]
+    output.write_text(
+        "".join(json.dumps(sample) + "\n" for sample in samples),
+        encoding="utf-8",
+    )
+    parsed = parse_cpu_frequency(output)
+    assert parsed["samples"] == 2
+    assert parsed["frequency_mhz"]["mean"] == 2500.0
+    assert parsed["busy_weighted_frequency_mhz"] == 3000.0
+    assert parsed["busy_ticks"] == 75

@@ -95,6 +95,48 @@ only for causal phase metrics. `summary.json` reports per-condition values,
 medians, MAD, and seeded bootstrap 95% intervals. Preserve the entire campaign
 directory.
 
+### Unprofiled stability characterization
+
+If either condition cannot pass warmup stability, stop repeating the event
+campaign. Use the dedicated stability configuration instead:
+
+```bash
+cp benchmarks/profiling/campaign.stability.h100.example.json \
+  /tmp/campaign.stability.h100.json
+```
+
+Replace only the immutable model revision and machine-specific GPU index, then
+run:
+
+```bash
+python -m benchmarks.profiling.run_cpu_saturation_campaign \
+  --config /tmp/campaign.stability.h100.json \
+  --output-dir \
+  "$PWD/artifacts/cpu-saturation/stability-ab-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+This is an unprofiled workload experiment: it never starts the request event
+recorder, Torch profiler, or Nsight. The campaign resolves the real stage PID
+from the authoritative stage-spawn startup line and verifies that it belongs
+to the launched server process tree.
+
+Collectors start before the corpus-shape pass and remain active across 20
+fixed 256-request windows. Instability does not stop the run. Every window
+atomically preserves its request result and a matched system record containing
+host/cgroup PSI, stage CPU time, native-thread CPU and runnable-delay deltas,
+migrations, and request accounting. Continuous thread snapshots,
+`nvidia-smi dmon`, and the built-in sysfs/procfs `cpu-frequency` collector
+provide process scheduling, GPU utilization/clock, current CPU frequency, and
+busy-time-weighted effective MHz evidence. The server log remains the source
+for ordinary scheduler batching and occupancy lines; event recording stays
+off. Add `perf-stat` or `turbostat` only when matching kernel tools are
+actually available.
+
+Run one fresh server for `quiet` and one for `unbound-cpu64` first. Inspect the
+window distributions and telemetry before increasing restart count. Loaded
+PSI is evidence, not an acceptance gate. Preserve results even when none of
+the rolling three-window groups meets the 5% stability criterion.
+
 ## 1. Prepare the checkout and dataset
 
 ```bash

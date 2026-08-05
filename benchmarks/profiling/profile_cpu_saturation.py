@@ -28,10 +28,12 @@ from benchmarks.dataset.prepare import DATASETS
 from benchmarks.dataset.seedtts import load_seedtts_samples
 from benchmarks.eval.benchmark_asr_seedtts import run_asr_seedtts_once
 from benchmarks.profiling.system_collectors import (
+    CpuFrequencyCollector,
     ThreadSnapshotCollector,
     capture_command,
     collect_static_manifest,
     gpu_dmon_collector,
+    parse_cpu_frequency,
     parse_gpu_dmon,
     parse_perf_stat,
     parse_thread_snapshots,
@@ -41,6 +43,8 @@ from benchmarks.profiling.system_collectors import (
     psi_delta,
     read_process_cgroup_psi,
     read_psi,
+    read_thread_snapshot,
+    summarize_thread_snapshot_delta,
     turbostat_collector,
     write_json,
 )
@@ -426,6 +430,362 @@ async def _warm_to_stability(
     )
 
 
+def _metric_distribution(values: list[float]) -> dict[str, Any]:
+    ordered = sorted(values)
+
+    def percentile(fraction: float) -> float | None:
+        if not ordered:
+            return None
+        return ordered[min(round((len(ordered) - 1) * fraction), len(ordered) - 1)]
+
+    return {
+        "n": len(values),
+        "mean": statistics.mean(values) if values else None,
+        "median": statistics.median(values) if values else None,
+        "min": min(values) if values else None,
+        "max": max(values) if values else None,
+        "p95": percentile(0.95),
+        "p99": percentile(0.99),
+    }
+
+
+def _parse_continuous_system_artifacts(
+    artifact_dir: Path,
+    *,
+    completed_requests: int,
+) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    perf_path = artifact_dir / "perf_stat.csv"
+    if perf_path.is_file():
+        perf_summary = parse_perf_stat(perf_path)
+        perf_summary["completed_requests"] = completed_requests
+        for event, counter in perf_summary["counters"].items():
+            counter["per_completed_request"] = (
+                counter["value"] / completed_requests if completed_requests else None
+            )
+            if event == "task-clock" and counter["unit"] == "msec":
+                perf_summary["cpu_ms_per_request"] = counter["per_completed_request"]
+        counters = perf_summary["counters"]
+        cycles = (counters.get("cycles") or {}).get("value")
+        ref_cycles = (counters.get("ref-cycles") or {}).get("value")
+        instructions = (counters.get("instructions") or {}).get("value")
+        perf_summary["derived"] = {
+            "instructions_per_cycle": (
+                instructions / cycles if instructions and cycles else None
+            ),
+            "cycles_per_ref_cycle": (
+                cycles / ref_cycles if cycles and ref_cycles else None
+            ),
+        }
+        parsed["perf_stat"] = perf_summary
+    turbostat_path = artifact_dir / "turbostat.txt"
+    if turbostat_path.is_file():
+        parsed["turbostat"] = parse_turbostat(turbostat_path)
+    thread_path = artifact_dir / "thread_snapshots.jsonl"
+    if thread_path.is_file():
+        parsed["thread_summary"] = parse_thread_snapshots(thread_path)
+    gpu_path = artifact_dir / "gpu_dmon.txt"
+    if gpu_path.is_file():
+        parsed["gpu_dmon"] = parse_gpu_dmon(gpu_path)
+    cpu_frequency_path = artifact_dir / "cpu_frequency.jsonl"
+    if cpu_frequency_path.is_file():
+        parsed["cpu_frequency"] = parse_cpu_frequency(cpu_frequency_path)
+    return parsed
+
+
+async def _run_stability_characterization(
+    args: argparse.Namespace,
+    samples: list[Any],
+    *,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    """Collect fixed unprofiled windows without rejecting unstable behavior."""
+    if args.server_pid is None:
+        raise ValueError(
+            "--server-pid is required in stability mode; stage discovery must "
+            "not enable the event recorder"
+        )
+
+    requested = _requested_collectors(args)
+    collectors = _build_collectors(
+        args,
+        artifact_dir,
+        server_pid=args.server_pid,
+    )
+    started: list[Any] = []
+    collector_results: list[dict[str, Any]] = []
+    collector_start_errors: list[dict[str, Any]] = []
+    windows: list[dict[str, Any]] = []
+    shape_passes: list[dict[str, Any]] = []
+    run_error: BaseException | None = None
+    overall_pressure_before = _read_pressure_snapshot(
+        args,
+        target_pid=args.server_pid,
+    )
+
+    try:
+        for collector in collectors:
+            try:
+                collector.start()
+                started.append(collector)
+            except Exception as exc:  # noqa: BLE001 - preserve partial evidence
+                collector_start_errors.append(
+                    {
+                        "name": collector.name,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+
+        if args.workload_contract == "direct-steady-miss":
+            shape_samples = _duration_stratified_subset(
+                samples,
+                args.shape_warmup_samples,
+            )
+            for pass_index in range(1, args.shape_warmup_passes + 1):
+                result = await _run_pass(args, shape_samples)
+                path = artifact_dir / "shape_warmup" / f"pass_{pass_index}.json"
+                write_json(path, result)
+                shape_passes.append(
+                    {
+                        "pass": pass_index,
+                        "samples": len(shape_samples),
+                        "artifact": str(path),
+                        "summary": _summarize_pass(result),
+                    }
+                )
+
+        window_samples = _duration_stratified_subset(samples, args.warmup_samples)
+        for window_index in range(1, args.characterization_windows + 1):
+            pressure_before = _read_pressure_snapshot(
+                args,
+                target_pid=args.server_pid,
+            )
+            threads_before = read_thread_snapshot(args.server_pid)
+            cpu_before = _process_cpu_seconds(args.server_pid)
+            started_wall_ns = time.time_ns()
+            result = await _run_pass(args, window_samples)
+            stopped_wall_ns = time.time_ns()
+            cpu_after = _process_cpu_seconds(args.server_pid)
+            threads_after = read_thread_snapshot(args.server_pid)
+            pressure_after = _read_pressure_snapshot(
+                args,
+                target_pid=args.server_pid,
+            )
+
+            evaluated = int(result["summary"]["evaluated"])
+            cpu_ms_per_request = (
+                (cpu_after - cpu_before) * 1000.0 / evaluated
+                if cpu_before is not None and cpu_after is not None and evaluated
+                else None
+            )
+            result["profile_harness"] = {
+                "cpu_ms_per_request": cpu_ms_per_request,
+                "cpu_pid": args.server_pid,
+            }
+            result_path = (
+                artifact_dir / "stability_windows" / f"window_{window_index:02d}.json"
+            )
+            write_json(result_path, result)
+
+            thread_delta = summarize_thread_snapshot_delta(
+                threads_before,
+                threads_after,
+            )
+            for row in thread_delta["threads"]:
+                row["cpu_ms_per_completed_request"] = (
+                    float(row["cpu_ms"]) / evaluated if evaluated else None
+                )
+                row["runqueue_delay_ms_per_completed_request"] = (
+                    float(row["runqueue_delay_ms"]) / evaluated if evaluated else None
+                )
+            system_window = {
+                "window": window_index,
+                "started_wall_ns": started_wall_ns,
+                "stopped_wall_ns": stopped_wall_ns,
+                "pressure": _pressure_window(pressure_before, pressure_after),
+                "thread_delta": thread_delta,
+                "process_cpu_s_before": cpu_before,
+                "process_cpu_s_after": cpu_after,
+                "cpu_ms_per_completed_request": cpu_ms_per_request,
+            }
+            system_path = (
+                artifact_dir
+                / "stability_windows"
+                / f"window_{window_index:02d}_system.json"
+            )
+            write_json(system_path, system_window)
+
+            summary = _summarize_pass(result)
+            window_record = {
+                "window": window_index,
+                "artifact": str(result_path),
+                "system_artifact": str(system_path),
+                "summary": summary,
+                "pressure": {
+                    "cpu_psi_some_fraction": system_window["pressure"].get(
+                        "cpu_psi_some_fraction"
+                    ),
+                    "cgroup_cpu_psi_some_fraction": system_window["pressure"].get(
+                        "cgroup_cpu_psi_some_fraction"
+                    ),
+                },
+                "thread_totals": {
+                    key: thread_delta.get(key)
+                    for key in (
+                        "cpu_ms",
+                        "runtime_ms",
+                        "runqueue_delay_ms",
+                        "migrations",
+                        "threads_observed",
+                    )
+                },
+            }
+            windows.append(window_record)
+            write_json(
+                artifact_dir / "stability_progress.json",
+                {
+                    "requested_windows": args.characterization_windows,
+                    "completed_windows": len(windows),
+                    "windows": windows,
+                },
+            )
+            print(
+                f"stability[{window_index}] "
+                f"qps={summary['throughput_samples_per_s']:.3f} "
+                f"p50={summary['latency_p50_s']:.4f}s "
+                f"cpu_ms/req={cpu_ms_per_request:.3f} "
+                f"evaluated={summary['evaluated']}/{summary['total']}"
+            )
+    except BaseException as exc:  # noqa: BLE001 - finalize all evidence
+        run_error = exc
+    finally:
+        for collector in reversed(started):
+            try:
+                collector_results.append(collector.stop())
+            except Exception as exc:  # noqa: BLE001 - retain collector failures
+                collector_results.append(
+                    {
+                        "name": collector.name,
+                        "returncode": None,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+
+    overall_pressure_after = _read_pressure_snapshot(
+        args,
+        target_pid=args.server_pid,
+    )
+    completed_requests = sum(int(window["summary"]["evaluated"]) for window in windows)
+    system_result = {
+        "target_pid": args.server_pid,
+        "collector_start_errors": collector_start_errors,
+        "collectors": collector_results,
+        "overall_pressure": _pressure_window(
+            overall_pressure_before,
+            overall_pressure_after,
+        ),
+        **_parse_continuous_system_artifacts(
+            artifact_dir,
+            completed_requests=completed_requests,
+        ),
+    }
+    write_json(artifact_dir / "system.json", system_result)
+
+    rolling_stability: list[dict[str, Any]] = []
+    raw_results = [
+        json.loads(Path(window["artifact"]).read_text(encoding="utf-8"))
+        for window in windows
+    ]
+    for end in range(args.stability_windows, len(raw_results) + 1):
+        recent = raw_results[:end]
+        rolling_stability.append(
+            {
+                "ending_window": end,
+                "stable": _is_stable(
+                    recent,
+                    required_windows=args.stability_windows,
+                    tolerance=args.stability_tolerance,
+                ),
+            }
+        )
+
+    metric_names = (
+        "throughput_samples_per_s",
+        "latency_mean_s",
+        "latency_p50_s",
+        "latency_p95_s",
+        "latency_p99_s",
+        "cpu_ms_per_request",
+    )
+    distributions = {
+        name: _metric_distribution(
+            [
+                float(value)
+                for window in windows
+                if isinstance(
+                    value := window["summary"].get(name),
+                    (int, float),
+                )
+            ]
+        )
+        for name in metric_names
+    }
+    result_payload = {
+        "run_id": args.run_id,
+        "mode": args.mode,
+        "artifact_dir": str(artifact_dir),
+        "workload_contract": args.workload_contract,
+        "capture_complete": (
+            run_error is None and len(windows) == args.characterization_windows
+        ),
+        "run_error": (
+            f"{type(run_error).__name__}: {run_error}"
+            if run_error is not None
+            else None
+        ),
+        "shape_passes": shape_passes,
+        "stability_characterization": {
+            "requested_windows": args.characterization_windows,
+            "completed_windows": len(windows),
+            "stability_windows": args.stability_windows,
+            "stability_tolerance": args.stability_tolerance,
+            "ever_stable": any(item["stable"] for item in rolling_stability),
+            "stable_endings": [
+                item["ending_window"] for item in rolling_stability if item["stable"]
+            ],
+            "rolling_stability": rolling_stability,
+            "distributions": distributions,
+            "windows": windows,
+        },
+        # Preserve the campaign aggregator's existing metric input contract.
+        "measured": [window["summary"] for window in windows],
+        "system_integrity": {
+            "valid": not collector_start_errors
+            and all(
+                result.get("returncode") == 0 and not result.get("error")
+                for result in collector_results
+            ),
+            "errors": [
+                *[f"{row['name']}: {row['error']}" for row in collector_start_errors],
+                *[
+                    (
+                        f"{row['name']}: {row.get('error')}"
+                        if row.get("error")
+                        else f"{row['name']}: returncode={row.get('returncode')}"
+                    )
+                    for row in collector_results
+                    if row.get("returncode") != 0 or row.get("error")
+                ],
+            ],
+        },
+    }
+    write_json(artifact_dir / "result.json", result_payload)
+    write_json(artifact_dir / "artifact_index.json", _artifact_index(artifact_dir))
+    if run_error is not None:
+        raise run_error
+    return result_payload
+
+
 def _build_collectors(
     args: argparse.Namespace,
     artifact_dir: Path,
@@ -500,6 +860,12 @@ def _build_collectors(
                 output_path=artifact_dir / "gpu_dmon.txt",
             )
         )
+    if "cpu-frequency" in requested:
+        collectors.append(
+            CpuFrequencyCollector(
+                output_path=artifact_dir / "cpu_frequency.jsonl",
+            )
+        )
     unknown = requested - {
         "perf-stat",
         "perf-sched",
@@ -508,6 +874,7 @@ def _build_collectors(
         "cgroup-psi",
         "thread-snapshot",
         "gpu-dmon",
+        "cpu-frequency",
     }
     if unknown:
         raise ValueError(f"unknown collectors: {sorted(unknown)}")
@@ -839,6 +1206,11 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     if len(measurement_samples) < args.concurrency:
         raise ValueError("measurement sample count must be at least target concurrency")
 
+    if args.mode == "stability" and args.server_pid is None:
+        raise ValueError(
+            "--server-pid is required in stability mode; stage discovery must "
+            "not enable the event recorder"
+        )
     if args.server_pid is None:
         args.server_pid = await _discover_stage_pid(args, artifact_dir)
 
@@ -860,6 +1232,13 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         split=args.lang,
     )
     write_json(artifact_dir / "manifest.json", static_manifest)
+
+    if args.mode == "stability":
+        return await _run_stability_characterization(
+            args,
+            samples,
+            artifact_dir=artifact_dir,
+        )
 
     warmup = await _warm_to_stability(
         args,
@@ -1419,7 +1798,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["baseline", "events", "torch", "nsys"],
+        choices=["baseline", "events", "torch", "nsys", "stability"],
         required=True,
     )
     parser.add_argument("--run-id", required=True)
@@ -1430,7 +1809,7 @@ def parse_args() -> argparse.Namespace:
         default="psi",
         help=(
             "Comma-separated: psi,cgroup-psi,thread-snapshot,gpu-dmon,"
-            "perf-stat,perf-sched,turbostat"
+            "cpu-frequency,perf-stat,perf-sched,turbostat"
         ),
     )
     parser.add_argument("--gpu-index", type=int)
@@ -1469,6 +1848,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stability-windows", type=int, default=3)
     parser.add_argument("--stability-tolerance", type=float, default=0.05)
     parser.add_argument("--max-warmup-windows", type=int, default=8)
+    parser.add_argument(
+        "--characterization-windows",
+        type=int,
+        default=20,
+        help=(
+            "Fixed unprofiled windows retained in stability mode; instability "
+            "is reported rather than treated as a run failure."
+        ),
+    )
     parser.add_argument("--measure-repeats", type=int, default=1)
     parser.add_argument("--skip-adjacent-baseline", action="store_true")
     parser.add_argument("--allow-failures", action="store_true")
@@ -1543,6 +1931,7 @@ def main() -> None:
         "shape_warmup_passes",
         "stability_windows",
         "max_warmup_windows",
+        "characterization_windows",
         "profile_timeout_s",
         "nsys_finalize_timeout_s",
         "nsys_stats_timeout_s",
@@ -1558,6 +1947,7 @@ def main() -> None:
         "cgroup-psi",
         "thread-snapshot",
         "gpu-dmon",
+        "cpu-frequency",
     }
     if unknown_collectors:
         raise ValueError(f"unknown collectors: {sorted(unknown_collectors)}")

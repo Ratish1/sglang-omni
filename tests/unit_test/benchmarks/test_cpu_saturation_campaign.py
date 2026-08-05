@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from benchmarks.profiling.run_cpu_saturation_campaign import (
     _cpu_psi_fraction_between,
     _harness_argv,
     _metric,
+    _resolve_stage_pid_from_server_log,
     _wait_for_ambient_cpu_psi,
     build_trial_plan,
 )
@@ -67,6 +69,24 @@ def test_campaign_does_not_misidentify_coordinator_as_stage_pid(tmp_path) -> Non
     assert argv[-4:] == ["--run-id", "trial-1", "--output-dir", str(tmp_path)]
 
 
+def test_stability_campaign_resolves_stage_pid_without_profiler_control(
+    tmp_path: Path,
+) -> None:
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "StageGroup asr: spawned 1 process(es) " f"(pids=[{os.getpid()}])\n",
+        encoding="utf-8",
+    )
+    assert (
+        _resolve_stage_pid_from_server_log(
+            server_pid=os.getpid(),
+            server_log_path=server_log,
+            stage="asr",
+        )
+        == os.getpid()
+    )
+
+
 def test_h100_campaign_separates_request_concurrency_from_cpu_stress() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     config = json.loads(
@@ -90,10 +110,39 @@ def test_h100_campaign_separates_request_concurrency_from_cpu_stress() -> None:
     }
 
 
+def test_stability_campaign_is_unprofiled_and_retains_twenty_windows() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    config = json.loads(
+        (
+            repo_root / "benchmarks/profiling/campaign.stability.h100.example.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert _arg_value(config["harness_args"], "--mode") == "stability"
+    assert _arg_value(config["harness_args"], "--characterization-windows") == "20"
+    assert "events" not in config["harness_args"]
+    assert config["protocol"]["continue_on_failure"] is True
+
+
 def test_campaign_performance_uses_bracketed_unprofiled_reference() -> None:
     result = {
         "adjacent_baselines": {"reference": {"throughput_samples_per_s": 30.0}},
         "measured": [{"throughput_samples_per_s": 34.0}],
+    }
+    assert _metric(result, "throughput_samples_per_s") == 30.0
+
+
+def test_stability_campaign_uses_window_median() -> None:
+    result = {
+        "mode": "stability",
+        "stability_characterization": {
+            "distributions": {
+                "throughput_samples_per_s": {
+                    "mean": 35.0,
+                    "median": 30.0,
+                }
+            }
+        },
+        "measured": [{"throughput_samples_per_s": 100.0}],
     }
     assert _metric(result, "throughput_samples_per_s") == 30.0
 

@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import re
 import signal
 import statistics
 import subprocess
@@ -227,7 +228,74 @@ def _harness_argv(
     ]
 
 
+def _argv_value(argv: list[str], name: str, default: str | None = None) -> str | None:
+    try:
+        return argv[argv.index(name) + 1]
+    except (ValueError, IndexError):
+        return default
+
+
+def _is_descendant(pid: int, root_pid: int) -> bool:
+    current = int(pid)
+    seen: set[int] = set()
+    while current > 1 and current not in seen:
+        if current == root_pid:
+            return True
+        seen.add(current)
+        try:
+            for line in (
+                Path(f"/proc/{current}/status").read_text(encoding="utf-8").splitlines()
+            ):
+                if line.startswith("PPid:"):
+                    current = int(line.split(":", 1)[1])
+                    break
+            else:
+                return False
+        except (OSError, ValueError):
+            return False
+    return False
+
+
+def _resolve_stage_pid_from_server_log(
+    *,
+    server_pid: int,
+    server_log_path: Path,
+    stage: str,
+) -> int:
+    """Resolve and ancestry-check one stage process without profiler control."""
+    pattern = re.compile(
+        rf"StageGroup {re.escape(stage)}: spawned \d+ process\(es\) "
+        r"\(pids=\[([^]]+)\]\)"
+    )
+    content = server_log_path.read_text(encoding="utf-8", errors="replace")
+    matches = pattern.findall(content)
+    if not matches:
+        raise RuntimeError(
+            f"server log does not contain a spawned PID for stage {stage!r}"
+        )
+    pids = [int(value.strip()) for value in matches[-1].split(",") if value.strip()]
+    if len(pids) != 1:
+        raise RuntimeError(
+            f"stability mode requires exactly one {stage!r} stage PID; got {pids}"
+        )
+    target_pid = pids[0]
+    if not _is_descendant(target_pid, server_pid):
+        raise RuntimeError(
+            f"resolved stage PID {target_pid} is not a descendant of server "
+            f"PID {server_pid}"
+        )
+    return target_pid
+
+
 def _metric(result: dict[str, Any], key: str) -> float | None:
+    if result.get("mode") == "stability":
+        distribution = (
+            (result.get("stability_characterization") or {})
+            .get("distributions", {})
+            .get(key, {})
+        )
+        if isinstance(distribution.get("median"), (int, float)):
+            return float(distribution["median"])
     reference = (result.get("adjacent_baselines") or {}).get("reference") or {}
     if isinstance(reference.get(key), (int, float)):
         return float(reference[key])
@@ -442,22 +510,36 @@ def _causal_run_metrics(result: dict[str, Any]) -> dict[str, float]:
                 value = (gpu_columns.get(column) or {}).get(statistic)
                 if isinstance(value, (int, float)):
                     metrics[f"gpu|{column}|{statistic}"] = float(value)
-        by_thread_name: dict[str, dict[str, float]] = {}
-        for thread in (system.get("thread_summary") or {}).get("threads", []):
-            name = str(thread.get("comm") or "unknown")
-            row = by_thread_name.setdefault(
-                name,
-                {"cpu_ms_per_request": 0.0, "runqueue_ms_per_request": 0.0},
-            )
-            cpu = thread.get("cpu_ms_per_completed_request")
-            delay = thread.get("runqueue_delay_ms_per_completed_request")
-            if isinstance(cpu, (int, float)):
-                row["cpu_ms_per_request"] += float(cpu)
-            if isinstance(delay, (int, float)):
-                row["runqueue_ms_per_request"] += float(delay)
-        for name, row in by_thread_name.items():
-            for statistic, value in row.items():
-                metrics[f"threads|{name}|{statistic}"] = value
+        cpu_frequency = system.get("cpu_frequency") or {}
+        for name, value in (
+            (
+                "frequency_mhz_mean",
+                (cpu_frequency.get("frequency_mhz") or {}).get("mean"),
+            ),
+            (
+                "busy_weighted_frequency_mhz",
+                cpu_frequency.get("busy_weighted_frequency_mhz"),
+            ),
+        ):
+            if isinstance(value, (int, float)):
+                metrics[f"cpu|{name}"] = float(value)
+        if result.get("mode") != "stability":
+            by_thread_name: dict[str, dict[str, float]] = {}
+            for thread in (system.get("thread_summary") or {}).get("threads", []):
+                name = str(thread.get("comm") or "unknown")
+                row = by_thread_name.setdefault(
+                    name,
+                    {"cpu_ms_per_request": 0.0, "runqueue_ms_per_request": 0.0},
+                )
+                cpu = thread.get("cpu_ms_per_completed_request")
+                delay = thread.get("runqueue_delay_ms_per_completed_request")
+                if isinstance(cpu, (int, float)):
+                    row["cpu_ms_per_request"] += float(cpu)
+                if isinstance(delay, (int, float)):
+                    row["runqueue_ms_per_request"] += float(delay)
+            for name, row in by_thread_name.items():
+                for statistic, value in row.items():
+                    metrics[f"threads|{name}|{statistic}"] = value
         cpu_psi = ((system.get("psi_delta") or {}).get("cpu") or {}).get("some") or {}
         stall_us = cpu_psi.get("total_us")
         window_ns = (system.get("psi_delta") or {}).get("window_ns")
@@ -471,6 +553,52 @@ def _causal_run_metrics(result: dict[str, Any]) -> dict[str, float]:
             metrics["psi|cpu_some_stall_fraction"] = (
                 float(stall_us) * 1000.0 / float(window_ns)
             )
+    if result.get("mode") == "stability":
+        window_metrics: dict[str, list[float]] = {}
+        for window in result.get("stability_characterization", {}).get("windows") or []:
+            system_artifact = Path(window["system_artifact"])
+            with system_artifact.open("r", encoding="utf-8") as handle:
+                window_system = json.load(handle)
+            summary = window.get("summary") or {}
+            completed = int(
+                (summary.get("request_accounting") or {}).get("completed", 0)
+            )
+            pressure = window_system.get("pressure") or {}
+            for name in (
+                "cpu_psi_some_fraction",
+                "cgroup_cpu_psi_some_fraction",
+            ):
+                value = pressure.get(name)
+                if isinstance(value, (int, float)):
+                    window_metrics.setdefault(f"window|{name}", []).append(float(value))
+            thread_delta = window_system.get("thread_delta") or {}
+            for name in ("cpu_ms", "runqueue_delay_ms", "migrations"):
+                value = thread_delta.get(name)
+                if isinstance(value, (int, float)) and completed:
+                    window_metrics.setdefault(
+                        f"window|threads|{name}_per_request",
+                        [],
+                    ).append(float(value) / completed)
+            by_name: dict[str, dict[str, float]] = {}
+            for thread in thread_delta.get("threads", []):
+                name = str(thread.get("comm") or "unknown")
+                row = by_name.setdefault(
+                    name, {"cpu_ms": 0.0, "runqueue_delay_ms": 0.0}
+                )
+                for metric_name in row:
+                    value = thread.get(metric_name)
+                    if isinstance(value, (int, float)):
+                        row[metric_name] += float(value)
+            for name, row in by_name.items():
+                if completed:
+                    for metric_name, value in row.items():
+                        window_metrics.setdefault(
+                            f"window|thread|{name}|{metric_name}_per_request",
+                            [],
+                        ).append(value / completed)
+        for name, values in window_metrics.items():
+            if values:
+                metrics[name] = statistics.median(values)
     return metrics
 
 
@@ -501,6 +629,7 @@ def _aggregate(
             "runs": len(results),
             "metrics": {},
             "causal_metrics": {},
+            "window_metrics": {},
         }
         for metric in metrics:
             values = [
@@ -509,6 +638,20 @@ def _aggregate(
                 if (value := _metric(result, metric)) is not None
             ]
             condition_result["metrics"][metric] = _distribution(values, seed=seed)
+            window_values = [
+                float(window["summary"][metric])
+                for result in results
+                if result.get("mode") == "stability"
+                for window in (
+                    result.get("stability_characterization", {}).get("windows") or []
+                )
+                if isinstance(window.get("summary", {}).get(metric), (int, float))
+            ]
+            if window_values:
+                condition_result["window_metrics"][metric] = _distribution(
+                    window_values,
+                    seed=seed,
+                )
         causal_runs = [_causal_run_metrics(result) for result in results]
         causal_keys = sorted({key for run in causal_runs for key in run})
         for key in causal_keys:
@@ -518,7 +661,7 @@ def _aggregate(
             )
         conditions[condition] = condition_result
 
-    reference_name = next(iter(conditions), None)
+    reference_name = "quiet" if "quiet" in conditions else next(iter(conditions), None)
     comparisons: dict[str, Any] = {}
     if reference_name is not None:
         reference = conditions[reference_name]
@@ -545,7 +688,15 @@ def _aggregate(
             comparisons[f"{condition_name}_vs_{reference_name}"] = deltas
     summary = {
         "campaign_dir": str(campaign_dir),
-        "performance_source": "bracketed_unprofiled_reference",
+        "performance_source": (
+            "unprofiled_stability_windows"
+            if any(
+                result.get("mode") == "stability"
+                for results in grouped.values()
+                for result in results
+            )
+            else "bracketed_unprofiled_reference"
+        ),
         "reference_condition": reference_name,
         "conditions": conditions,
         "comparisons": comparisons,
@@ -649,6 +800,17 @@ def run_campaign(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
                 run_id=run_id,
                 output_dir=output_dir / "artifacts",
             )
+            target_stage_pid = None
+            if (
+                _argv_value(harness_argv, "--mode") == "stability"
+                and "--server-pid" not in harness_argv
+            ):
+                target_stage_pid = _resolve_stage_pid_from_server_log(
+                    server_pid=server.pid,
+                    server_log_path=trial_dir / "server.log",
+                    stage=str(_argv_value(harness_argv, "--stage", "asr")),
+                )
+                harness_argv.extend(["--server-pid", str(target_stage_pid)])
             write_json(
                 trial_dir / "launch.json",
                 {
@@ -656,6 +818,7 @@ def run_campaign(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
                     "server_pid": server.pid,
                     "interferer_argv": interferer_argv,
                     "interferer_pid": interferer.pid if interferer else None,
+                    "target_stage_pid": target_stage_pid,
                     "harness_argv": harness_argv,
                 },
             )

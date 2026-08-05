@@ -22,7 +22,7 @@ def _write_wav(path: Path, frames: int) -> None:
         handle.writeframes(b"\0\0" * frames)
 
 
-def _result(sample_count: int) -> dict:
+def _result(sample_count: int, *, qps: float = 10.0) -> dict:
     return {
         "summary": {
             "evaluated": sample_count,
@@ -31,7 +31,7 @@ def _result(sample_count: int) -> dict:
             "corpus_wer": 0.0,
         },
         "speed": {
-            "throughput_samples_per_s": 10.0,
+            "throughput_samples_per_s": qps,
             "latency_mean_s": 0.1,
             "latency_median_s": 0.1,
             "latency_p95_s": 0.1,
@@ -100,6 +100,58 @@ async def test_steady_contract_warms_full_shape_population_before_windows(
     assert calls == [4, 2, 2]
     assert result["shape_passes"][0]["samples"] == 4
     assert len(result["stability_windows"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_stability_characterization_preserves_all_unstable_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    samples = [SimpleNamespace(sample_id=str(index)) for index in range(2)]
+    qps = iter([10.0, 14.0, 9.0, 13.0])
+    cpu = iter([0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0])
+
+    async def fake_run(_args, selected, **_kwargs):
+        return _result(len(selected), qps=next(qps))
+
+    def fake_pressure(_args, *, target_pid):
+        return {"psi": None, "cgroup_psi": None}
+
+    def fake_threads(pid):
+        return {"monotonic_ns": 1, "pid": pid, "threads": []}
+
+    monkeypatch.setattr(profile, "_run_pass", fake_run)
+    monkeypatch.setattr(profile, "_build_collectors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(profile, "_read_pressure_snapshot", fake_pressure)
+    monkeypatch.setattr(profile, "read_thread_snapshot", fake_threads)
+    monkeypatch.setattr(profile, "_process_cpu_seconds", lambda _pid: next(cpu))
+    args = SimpleNamespace(
+        server_pid=123,
+        collectors="",
+        workload_contract="direct-cold",
+        shape_warmup_samples=0,
+        shape_warmup_passes=1,
+        warmup_samples=2,
+        characterization_windows=4,
+        stability_windows=3,
+        stability_tolerance=0.05,
+        run_id="unstable",
+        mode="stability",
+    )
+    artifact_dir = tmp_path / "unstable"
+    artifact_dir.mkdir()
+    result = await profile._run_stability_characterization(
+        args,
+        samples,
+        artifact_dir=artifact_dir,
+    )
+    characterization = result["stability_characterization"]
+    assert result["capture_complete"] is True
+    assert characterization["completed_windows"] == 4
+    assert characterization["ever_stable"] is False
+    assert len(list((artifact_dir / "stability_windows").glob("window_??.json"))) == 4
+    assert (artifact_dir / "result.json").is_file()
+    assert (artifact_dir / "artifact_index.json").is_file()
 
 
 def test_summary_preserves_offered_dispatched_rejected_and_client_queue() -> None:

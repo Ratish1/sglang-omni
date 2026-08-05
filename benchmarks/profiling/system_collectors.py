@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import statistics
@@ -337,6 +338,126 @@ def read_process_cgroup_psi(pid: int) -> dict[str, Any]:
     return snapshot
 
 
+def _sched_counter(path: Path, name: str) -> int | None:
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip() == name:
+                return int(float(value.strip()))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def read_thread_snapshot(pid: int) -> dict[str, Any]:
+    """Read one process-wide native-thread CPU and scheduler snapshot."""
+    rows: list[dict[str, Any]] = []
+    for task_dir in sorted(Path(f"/proc/{pid}/task").glob("[0-9]*")):
+        try:
+            tid = int(task_dir.name)
+            raw_stat = (task_dir / "stat").read_text(encoding="utf-8")
+            close = raw_stat.rfind(")")
+            comm = raw_stat[raw_stat.find("(") + 1 : close]
+            fields = raw_stat[close + 2 :].split()
+            schedstat = (task_dir / "schedstat").read_text(encoding="utf-8").split()
+            rows.append(
+                {
+                    "tid": tid,
+                    "comm": comm,
+                    "state": fields[0],
+                    "utime_ticks": int(fields[11]),
+                    "stime_ticks": int(fields[12]),
+                    "processor": int(fields[36]),
+                    "runtime_ns": int(schedstat[0]),
+                    "runqueue_delay_ns": int(schedstat[1]),
+                    "timeslices": int(schedstat[2]),
+                    "migrations": _sched_counter(
+                        task_dir / "sched",
+                        "se.nr_migrations",
+                    ),
+                }
+            )
+        except (OSError, ValueError, IndexError):
+            continue
+    return {
+        "monotonic_ns": time.monotonic_ns(),
+        "pid": int(pid),
+        "threads": rows,
+    }
+
+
+def summarize_thread_snapshot_delta(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    """Summarize native-thread deltas across one workload window."""
+    first = {int(row["tid"]): row for row in before.get("threads", [])}
+    last = {int(row["tid"]): row for row in after.get("threads", [])}
+    clock_ticks = float(os.sysconf("SC_CLK_TCK"))
+    window_ns = max(
+        0,
+        int(after["monotonic_ns"]) - int(before["monotonic_ns"]),
+    )
+    rows: list[dict[str, Any]] = []
+    for tid in sorted(first.keys() & last.keys()):
+        start = first[tid]
+        end = last[tid]
+        runtime_ns = max(0, int(end["runtime_ns"]) - int(start["runtime_ns"]))
+        delay_ns = max(
+            0,
+            int(end["runqueue_delay_ns"]) - int(start["runqueue_delay_ns"]),
+        )
+        cpu_ticks = max(
+            0,
+            int(end["utime_ticks"])
+            + int(end["stime_ticks"])
+            - int(start["utime_ticks"])
+            - int(start["stime_ticks"]),
+        )
+        start_migrations = start.get("migrations")
+        end_migrations = end.get("migrations")
+        rows.append(
+            {
+                "tid": tid,
+                "comm": end.get("comm"),
+                "cpu_ms": cpu_ticks * 1000.0 / clock_ticks,
+                "runtime_ms": runtime_ns / 1e6,
+                "runqueue_delay_ms": delay_ns / 1e6,
+                "timeslices": max(
+                    0,
+                    int(end["timeslices"]) - int(start["timeslices"]),
+                ),
+                "migrations": (
+                    max(0, int(end_migrations) - int(start_migrations))
+                    if start_migrations is not None and end_migrations is not None
+                    else None
+                ),
+                "runtime_fraction": runtime_ns / window_ns if window_ns else None,
+                "runqueue_delay_fraction": (
+                    delay_ns / (runtime_ns + delay_ns) if runtime_ns + delay_ns else 0.0
+                ),
+                "first_processor": start.get("processor"),
+                "last_processor": end.get("processor"),
+            }
+        )
+    rows.sort(key=lambda row: (-float(row["cpu_ms"]), int(row["tid"])))
+    return {
+        "window_ns": window_ns,
+        "threads_before": len(first),
+        "threads_after": len(last),
+        "threads_observed": len(rows),
+        "threads_started": sorted(last.keys() - first.keys()),
+        "threads_exited": sorted(first.keys() - last.keys()),
+        "cpu_ms": sum(float(row["cpu_ms"]) for row in rows),
+        "runtime_ms": sum(float(row["runtime_ms"]) for row in rows),
+        "runqueue_delay_ms": sum(float(row["runqueue_delay_ms"]) for row in rows),
+        "migrations": sum(
+            int(row["migrations"]) for row in rows if row.get("migrations") is not None
+        ),
+        "threads": rows,
+    }
+
+
 class ManagedCollector:
     """A signal-terminated collector with explicit startup and finalization."""
 
@@ -465,31 +586,7 @@ class ThreadSnapshotCollector:
             self._error = f"{type(exc).__name__}: {exc}"
 
     def _read_threads(self) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for task_dir in sorted(Path(f"/proc/{self.pid}/task").glob("[0-9]*")):
-            try:
-                tid = int(task_dir.name)
-                raw_stat = (task_dir / "stat").read_text(encoding="utf-8")
-                close = raw_stat.rfind(")")
-                comm = raw_stat[raw_stat.find("(") + 1 : close]
-                fields = raw_stat[close + 2 :].split()
-                schedstat = (task_dir / "schedstat").read_text(encoding="utf-8").split()
-                rows.append(
-                    {
-                        "tid": tid,
-                        "comm": comm,
-                        "state": fields[0],
-                        "utime_ticks": int(fields[11]),
-                        "stime_ticks": int(fields[12]),
-                        "processor": int(fields[36]),
-                        "runtime_ns": int(schedstat[0]),
-                        "runqueue_delay_ns": int(schedstat[1]),
-                        "timeslices": int(schedstat[2]),
-                    }
-                )
-            except (OSError, ValueError, IndexError):
-                continue
-        return rows
+        return read_thread_snapshot(self.pid)["threads"]
 
     def stop(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
         thread = self._thread
@@ -503,6 +600,121 @@ class ThreadSnapshotCollector:
         result = {
             "name": self.name,
             "pid": self.pid,
+            "interval_ms": int(self.interval_s * 1000),
+            "samples": self._samples,
+            "returncode": 0 if self._error is None else 1,
+            "error": self._error,
+            "started_monotonic_ns": self.started_monotonic_ns,
+            "stopped_monotonic_ns": self.stopped_monotonic_ns,
+            "output": str(self.output_path),
+            "finalized": self.output_path.is_file(),
+        }
+        self._thread = None
+        return result
+
+
+class CpuFrequencyCollector:
+    """Sample per-CPU frequency and utilization counters without linux-tools."""
+
+    def __init__(
+        self,
+        *,
+        output_path: str | Path,
+        interval_ms: int = 1000,
+    ) -> None:
+        self.name = "cpu_frequency"
+        self.output_path = Path(output_path).resolve()
+        self.partial_path = self.output_path.with_suffix(
+            self.output_path.suffix + ".partial"
+        )
+        self.interval_s = max(int(interval_ms), 100) / 1000.0
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._error: str | None = None
+        self._samples = 0
+        self.started_monotonic_ns: int | None = None
+        self.stopped_monotonic_ns: int | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("CPU frequency collector is already running")
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.output_path.exists() or self.partial_path.exists():
+            raise FileExistsError(f"collector artifact exists: {self.output_path}")
+        self.started_monotonic_ns = time.monotonic_ns()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="cpu-frequency-snapshot",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @staticmethod
+    def _read_sample() -> dict[str, Any]:
+        counters: dict[int, tuple[int, int]] = {}
+        try:
+            lines = Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            fields = line.split()
+            if not fields or not re.fullmatch(r"cpu\d+", fields[0]):
+                continue
+            try:
+                cpu = int(fields[0][3:])
+                ticks = [int(value) for value in fields[1:]]
+            except ValueError:
+                continue
+            total = sum(ticks)
+            idle = sum(ticks[index] for index in (3, 4) if index < len(ticks))
+            counters[cpu] = (total, idle)
+
+        rows: list[dict[str, Any]] = []
+        for cpu, (total, idle) in sorted(counters.items()):
+            raw_frequency = _read_text(
+                f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq"
+            )
+            try:
+                frequency_khz = int(raw_frequency) if raw_frequency else None
+            except ValueError:
+                frequency_khz = None
+            rows.append(
+                {
+                    "cpu": cpu,
+                    "frequency_khz": frequency_khz,
+                    "total_ticks": total,
+                    "idle_ticks": idle,
+                }
+            )
+        return {
+            "monotonic_ns": time.monotonic_ns(),
+            "cpus": rows,
+        }
+
+    def _run(self) -> None:
+        try:
+            with self.partial_path.open("x", encoding="utf-8") as handle:
+                while not self._stop_event.is_set():
+                    handle.write(json.dumps(self._read_sample(), sort_keys=True) + "\n")
+                    self._samples += 1
+                    self._stop_event.wait(self.interval_s)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(self.partial_path, self.output_path)
+        except Exception as exc:  # noqa: BLE001 - preserve collector failure artifact
+            self._error = f"{type(exc).__name__}: {exc}"
+
+    def stop(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        thread = self._thread
+        if thread is None:
+            raise RuntimeError("CPU frequency collector was not started")
+        self._stop_event.set()
+        thread.join(timeout=timeout_s)
+        self.stopped_monotonic_ns = time.monotonic_ns()
+        if thread.is_alive():
+            self._error = f"collector did not stop within {timeout_s}s"
+        result = {
+            "name": self.name,
             "interval_ms": int(self.interval_s * 1000),
             "samples": self._samples,
             "returncode": 0 if self._error is None else 1,
@@ -772,6 +984,49 @@ def parse_gpu_dmon(path: str | Path) -> dict[str, Any]:
     }
 
 
+def parse_cpu_frequency(path: str | Path) -> dict[str, Any]:
+    source = Path(path)
+    if not source.is_file():
+        return {"samples": 0, "error": "file is missing"}
+    samples = [
+        json.loads(line)
+        for line in source.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    frequencies_mhz: list[float] = []
+    busy_frequency_sum = 0.0
+    busy_ticks_sum = 0
+    for sample in samples:
+        for row in sample.get("cpus", []):
+            frequency = row.get("frequency_khz")
+            if isinstance(frequency, (int, float)):
+                frequencies_mhz.append(float(frequency) / 1000.0)
+    for before, after in zip(samples, samples[1:], strict=False):
+        first = {int(row["cpu"]): row for row in before.get("cpus", [])}
+        last = {int(row["cpu"]): row for row in after.get("cpus", [])}
+        for cpu in first.keys() & last.keys():
+            total = int(last[cpu]["total_ticks"]) - int(first[cpu]["total_ticks"])
+            idle = int(last[cpu]["idle_ticks"]) - int(first[cpu]["idle_ticks"])
+            busy = max(0, total - idle)
+            frequency = last[cpu].get("frequency_khz")
+            if busy and isinstance(frequency, (int, float)):
+                busy_ticks_sum += busy
+                busy_frequency_sum += busy * float(frequency) / 1000.0
+    return {
+        "samples": len(samples),
+        "cpu_samples": len(frequencies_mhz),
+        "frequency_mhz": {
+            "mean": statistics.mean(frequencies_mhz) if frequencies_mhz else None,
+            "min": min(frequencies_mhz) if frequencies_mhz else None,
+            "max": max(frequencies_mhz) if frequencies_mhz else None,
+        },
+        "busy_weighted_frequency_mhz": (
+            busy_frequency_sum / busy_ticks_sum if busy_ticks_sum else None
+        ),
+        "busy_ticks": busy_ticks_sum,
+    }
+
+
 def write_json(path: str | Path, data: Any) -> str:
     destination = Path(path).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -787,12 +1042,14 @@ def write_json(path: str | Path, data: Any) -> str:
 
 
 __all__ = [
+    "CpuFrequencyCollector",
     "ManagedCollector",
     "ThreadSnapshotCollector",
     "capture_command",
     "collect_static_manifest",
     "gpu_dmon_collector",
     "parse_gpu_dmon",
+    "parse_cpu_frequency",
     "parse_perf_stat",
     "parse_thread_snapshots",
     "parse_turbostat",
@@ -801,6 +1058,8 @@ __all__ = [
     "psi_delta",
     "read_process_cgroup_psi",
     "read_psi",
+    "read_thread_snapshot",
+    "summarize_thread_snapshot_delta",
     "turbostat_collector",
     "write_json",
 ]
