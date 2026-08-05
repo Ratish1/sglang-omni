@@ -227,6 +227,7 @@ def test_stability_system_integrity_rejects_empty_requested_evidence(
     args = SimpleNamespace(
         collectors="thread-snapshot,gpu-dmon,cpu-frequency,psi,cgroup-psi",
         cpu_frequency_cpus="2-3",
+        required_thread_comms="sched-asr,fun-asr-audio-e",
     )
     errors = profile._stability_system_integrity_errors(
         args,
@@ -259,6 +260,7 @@ def test_stability_system_integrity_rejects_empty_requested_evidence(
         ],
     )
     assert "thread snapshot collector produced fewer than two samples" in errors
+    assert any("required comms" in error for error in errors)
     assert "nvidia-smi dmon produced no parseable SM samples" in errors
     assert "CPU frequency collector produced no usable frequencies" in errors
     assert "CPU frequency collector did not observe selected CPUs [3]" in errors

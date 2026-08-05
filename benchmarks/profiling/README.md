@@ -135,6 +135,14 @@ The server log remains the source for ordinary scheduler batching and
 occupancy lines; event recording stays off. Add `perf-stat` or `turbostat`
 only when matching kernel tools are actually available.
 
+On Python versions that do not propagate `threading.Thread.name` to Linux
+`comm`, the scheduler, request-build executor, and pre-LM encoder set bounded
+native names when their worker threads start. Procfs captures therefore expose
+`sched-<stage>`, `omni-request-bu` (the Linux 15-byte truncation), and the
+model-specific pre-LM worker prefix without enabling request events. The
+Fun-ASR example requires these labels with `--required-thread-comms`, so a
+capture cannot be accepted if native naming silently fails.
+
 Each workload window records monotonic and wall-clock boundaries. Its
 observable native-thread CPU total must reconcile with stage process CPU time
 within `--max-thread-cpu-accounting-error`. A thread born during the window is

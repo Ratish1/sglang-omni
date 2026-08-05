@@ -18,6 +18,7 @@ from typing import Any, Generic, TypeVar
 
 from sglang_omni.profiler.event_recorder import emit as _emit_profile_event
 from sglang_omni.profiler.torch_profiler import TorchProfiler, TorchProfilerConfig
+from sglang_omni.utils.native_thread import set_native_thread_name
 
 ItemT = TypeVar("ItemT")
 EncodedT = TypeVar("EncodedT")
@@ -374,6 +375,7 @@ class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
             self._set_exception(entry, exc)
 
     def _worker(self) -> None:
+        set_native_thread_name()
         batch: list[QueueEntry[ItemT]] = []
         try:
             while True:

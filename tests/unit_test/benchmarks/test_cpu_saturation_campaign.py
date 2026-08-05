@@ -128,6 +128,10 @@ def test_stability_campaign_is_unprofiled_and_retains_twenty_windows() -> None:
         )
         == "0.05"
     )
+    assert (
+        _arg_value(config["harness_args"], "--required-thread-comms")
+        == "sched-asr,omni-request-bu,fun-asr-audio-e"
+    )
     assert "events" not in config["harness_args"]
     assert config["protocol"]["continue_on_failure"] is True
 

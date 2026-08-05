@@ -72,6 +72,7 @@ from sglang_omni.scheduling.profiler_control import (
     handle_profiler_message,
     profiler_step,
 )
+from sglang_omni.utils.native_thread import set_native_thread_name
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,7 @@ class OmniScheduler:
                 ThreadPoolExecutor(
                     max_workers=self.request_build_max_workers,
                     thread_name_prefix="omni-request-build",
+                    initializer=set_native_thread_name,
                 )
             )
         else:

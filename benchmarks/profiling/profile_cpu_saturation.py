@@ -602,6 +602,22 @@ def _stability_system_integrity_errors(
             errors.append("thread snapshot collector produced fewer than two samples")
         if not thread_summary.get("threads"):
             errors.append("thread snapshot collector observed no native threads")
+        required_comms = {
+            item.strip()
+            for item in getattr(args, "required_thread_comms", "").split(",")
+            if item.strip()
+        }
+        observed_comms = {
+            str(thread.get("comm"))
+            for thread in thread_summary.get("threads", [])
+            if thread.get("comm")
+        }
+        missing_comms = sorted(required_comms - observed_comms)
+        if missing_comms:
+            errors.append(
+                f"thread snapshot collector did not observe required comms "
+                f"{missing_comms}; observed={sorted(observed_comms)}"
+            )
     if "gpu-dmon" in requested:
         gpu = system_result.get("gpu_dmon") or {}
         if not gpu.get("samples") or not (
@@ -2059,6 +2075,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-index", type=int)
     parser.add_argument("--thread-sample-interval-ms", type=int, default=100)
     parser.add_argument(
+        "--required-thread-comms",
+        default="",
+        help=(
+            "Comma-separated Linux comm labels that a stability capture must "
+            "observe, after the kernel's 15-byte truncation."
+        ),
+    )
+    parser.add_argument(
         "--cpu-frequency-cpus",
         default="",
         help=(
@@ -2216,6 +2240,12 @@ def main() -> None:
     }
     if unknown_collectors:
         raise ValueError(f"unknown collectors: {sorted(unknown_collectors)}")
+    if args.required_thread_comms and "thread-snapshot" not in _requested_collectors(
+        args
+    ):
+        raise ValueError(
+            "--required-thread-comms requires the thread-snapshot collector"
+        )
     if (
         args.mode == "baseline"
         and _requested_collectors(args) & {"perf-stat", "perf-sched"}

@@ -51,6 +51,7 @@ from sglang_omni.proto import (
 from sglang_omni.relay.base import Relay
 from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.profiler_control import make_profiler_command
+from sglang_omni.utils.native_thread import set_native_thread_name
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +170,7 @@ class Stage:
         if self.scheduler is not None:
 
             def _run_scheduler():
+                set_native_thread_name(f"sched-{self.name}")
                 # Active-stage binding so ``emit(stage=None)`` from
                 # scheduler-thread descendants resolves to this stage.
                 _set_active_stage(self.name)

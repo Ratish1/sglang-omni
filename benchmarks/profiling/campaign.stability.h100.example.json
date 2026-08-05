@@ -52,6 +52,8 @@
     "0.05",
     "--collectors",
     "psi,cgroup-psi,thread-snapshot,gpu-dmon,cpu-frequency",
+    "--required-thread-comms",
+    "sched-asr,omni-request-bu,fun-asr-audio-e",
     "--gpu-index",
     "0"
   ],
