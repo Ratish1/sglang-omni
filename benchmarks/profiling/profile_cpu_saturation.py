@@ -30,9 +30,11 @@ from benchmarks.eval.benchmark_asr_seedtts import run_asr_seedtts_once
 from benchmarks.profiling.cpu_interferer import parse_cpu_list
 from benchmarks.profiling.system_collectors import (
     CpuFrequencyCollector,
+    NsysSystemWideCpuCollector,
     ThreadSnapshotCollector,
     capture_command,
     collect_static_manifest,
+    find_processes_with_thread_comms,
     gpu_dmon_collector,
     parse_cpu_frequency,
     parse_gpu_dmon,
@@ -1155,6 +1157,26 @@ def _build_collectors(
                 ),
             )
         )
+    if args.mode == "nsys-system-wide":
+        if server_pid is None:
+            raise ValueError("--server-pid is required in nsys-system-wide mode")
+        required_comms = tuple(
+            item.strip()
+            for item in args.nsys_required_thread_comms.split(",")
+            if item.strip()
+        )
+        session_fragment = re.sub(r"[^A-Za-z0-9_-]", "_", args.run_id)[:48]
+        collectors.append(
+            NsysSystemWideCpuCollector(
+                target_pid=server_pid,
+                artifact_dir=artifact_dir / "nsight-system-wide",
+                session_name=f"omni_{session_fragment}_{os.getpid()}",
+                required_thread_comms=required_comms,
+                executable=args.nsys_binary,
+                command_timeout_s=args.nsys_command_timeout_s,
+                finalize_timeout_s=args.nsys_finalize_timeout_s,
+            )
+        )
     unknown = requested - {
         "perf-stat",
         "perf-sched",
@@ -1303,6 +1325,15 @@ def _system_integrity_errors(
             errors.append("CPU frequency collector produced fewer than two samples")
         if frequency.get("busy_weighted_sampled_scaling_frequency_mhz") is None:
             errors.append("CPU frequency collector produced no busy-weighted value")
+    if args.mode == "nsys-system-wide":
+        nsys_result = system_result.get("nsys_system_wide_cpu")
+        if not isinstance(nsys_result, dict):
+            errors.append("non-injected Nsight collector produced no result")
+        elif not nsys_result.get("valid"):
+            errors.append(
+                "non-injected Nsight CPU evidence is invalid: "
+                + str(nsys_result.get("error") or "unknown collector failure")
+            )
     return errors
 
 
@@ -1506,6 +1537,24 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             "--server-pid is required in stability mode; stage discovery must "
             "not enable the event recorder"
         )
+    if args.mode == "nsys-system-wide" and args.server_pid is None:
+        target_comm = args.nsys_target_thread_comm.strip()
+        candidates = find_processes_with_thread_comms([target_comm])
+        write_json(
+            artifact_dir / "target_discovery" / "native_thread_candidates.json",
+            {
+                "method": "procfs-required-native-thread-comms",
+                "required_thread_comms": [target_comm],
+                "candidates": candidates,
+            },
+        )
+        if len(candidates) != 1:
+            raise RuntimeError(
+                "non-injected target discovery requires exactly one process "
+                f"containing native thread {target_comm!r}; "
+                f"candidates={candidates}"
+            )
+        args.server_pid = int(candidates[0]["pid"])
     if args.server_pid is None:
         args.server_pid = await _discover_stage_pid(args, artifact_dir)
 
@@ -1650,10 +1699,16 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         collector_results: list[dict[str, Any]] = []
         measured: list[dict[str, Any]] = []
         measurement_error: BaseException | None = None
+        measurement_started_monotonic_ns: int | None = None
+        measurement_started_wall_ns: int | None = None
+        measurement_stopped_monotonic_ns: int | None = None
+        measurement_stopped_wall_ns: int | None = None
         try:
             for collector in collectors:
                 collector.start()
                 started.append(collector)
+            measurement_started_monotonic_ns = time.monotonic_ns()
+            measurement_started_wall_ns = time.time_ns()
             for repeat in range(1, args.measure_repeats + 1):
                 result = await _run_pass(args, measurement_samples)
                 _require_complete(result, allow_failures=args.allow_failures)
@@ -1672,6 +1727,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         except BaseException as exc:  # noqa: BLE001 - stop profilers on cancellation
             measurement_error = exc
         finally:
+            measurement_stopped_monotonic_ns = time.monotonic_ns()
+            measurement_stopped_wall_ns = time.time_ns()
             for collector in reversed(started):
                 try:
                     collector_results.append(collector.stop())
@@ -1708,6 +1765,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         system_result = {
             "target_pid": target_pid,
             "collectors": collector_results,
+            "measurement_window": {
+                "started_monotonic_ns": measurement_started_monotonic_ns,
+                "started_wall_ns": measurement_started_wall_ns,
+                "stopped_monotonic_ns": measurement_stopped_monotonic_ns,
+                "stopped_wall_ns": measurement_stopped_wall_ns,
+            },
             "psi_before": psi_before,
             "psi_after": psi_after,
             "psi_delta": (
@@ -1726,6 +1789,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 else None
             ),
         }
+        for collector_result in collector_results:
+            if collector_result.get("name") == "nsys_system_wide_cpu":
+                system_result["nsys_system_wide_cpu"] = collector_result
+                break
         perf_path = artifact_dir / "perf_stat.csv"
         if perf_path.is_file():
             perf_summary = parse_perf_stat(perf_path)
@@ -1892,6 +1959,21 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             "errors": system_integrity_errors,
         },
     }
+    profiled_request_integrity: dict[str, Any] | None = None
+    if args.mode == "nsys-system-wide":
+        profiled_request_integrity = _request_integrity(
+            [],
+            [
+                {"window": index, "summary": _summarize_pass(result)}
+                for index, result in enumerate(measured, 1)
+            ],
+        )
+        result_payload["capture_complete"] = len(
+            measured
+        ) == args.measure_repeats and bool(
+            system_result.get("nsys_system_wide_cpu", {}).get("finalized")
+        )
+        result_payload["request_integrity"] = profiled_request_integrity
     if (
         adjacent_before_summary is not None
         and adjacent_after_summary is not None
@@ -1907,6 +1989,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     integrity_errors = list(system_integrity_errors)
+    if args.mode == "nsys-system-wide":
+        if not result_payload["capture_complete"]:
+            integrity_errors.append(
+                "non-injected Nsight capture did not complete every measured "
+                "repeat and finalize its report"
+            )
+        assert profiled_request_integrity is not None
+        integrity_errors.extend(profiled_request_integrity["errors"])
     perturbation = result_payload.get("profile_perturbation")
     integrity_errors.extend(_perturbation_integrity_errors(args, perturbation))
     if stop_response is not None:
@@ -2093,7 +2183,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["baseline", "events", "torch", "nsys", "stability"],
+        choices=[
+            "baseline",
+            "events",
+            "torch",
+            "nsys",
+            "nsys-system-wide",
+            "stability",
+        ],
         required=True,
     )
     parser.add_argument("--run-id", required=True)
@@ -2204,6 +2301,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-cuda", action="store_true")
     parser.add_argument("--nsys-report")
     parser.add_argument(
+        "--nsys-binary",
+        default="nsys",
+        help="Exact Nsight Systems CLI path or name resolved through PATH.",
+    )
+    parser.add_argument(
+        "--nsys-command-timeout-s",
+        type=float,
+        default=30.0,
+        help="Timeout for Nsight environment/start/status control commands.",
+    )
+    parser.add_argument(
+        "--nsys-required-thread-comms",
+        default="sched-asr,omni-request-bu,fun-asr-audio-e",
+        help=(
+            "Comma-separated, kernel-truncated Linux comm labels that must "
+            "have scheduling events and cpuCycles=1 samples in a non-injected "
+            "system-wide Nsight capture."
+        ),
+    )
+    parser.add_argument(
+        "--nsys-target-thread-comm",
+        default="sched-asr",
+        help=(
+            "Read-only /proc target-discovery comm used when --server-pid is "
+            "omitted. Use a thread created at server startup, not a lazy pool "
+            "worker."
+        ),
+    )
+    parser.add_argument(
         "--nsys-cpu-only",
         action="store_true",
         help=(
@@ -2261,6 +2387,41 @@ def main() -> None:
         raise ValueError("--nsys-nvtx-only is valid only in nsys mode")
     if args.nsys_cpu_only and args.nsys_nvtx_only:
         raise ValueError("--nsys-cpu-only and --nsys-nvtx-only are mutually exclusive")
+    if args.mode == "nsys-system-wide" and not args.nsys_required_thread_comms.strip():
+        raise ValueError(
+            "--nsys-required-thread-comms must be non-empty in " "nsys-system-wide mode"
+        )
+    if args.mode == "nsys-system-wide" and not args.nsys_target_thread_comm.strip():
+        raise ValueError(
+            "--nsys-target-thread-comm must be non-empty in " "nsys-system-wide mode"
+        )
+    if args.mode == "nsys-system-wide":
+        required_system_collectors = {
+            "psi",
+            "cgroup-psi",
+            "thread-snapshot",
+            "gpu-dmon",
+            "cpu-frequency",
+        }
+        missing_system_collectors = required_system_collectors - _requested_collectors(
+            args
+        )
+        if missing_system_collectors:
+            raise ValueError(
+                "nsys-system-wide requires independent host/GPU evidence "
+                f"collectors {sorted(missing_system_collectors)}"
+            )
+        if args.skip_adjacent_baseline:
+            raise ValueError("nsys-system-wide requires adjacent unprofiled controls")
+        if args.nsys_report:
+            raise ValueError(
+                "--nsys-report is not valid in nsys-system-wide mode; the "
+                "harness owns report creation and finalization"
+            )
+        if args.allow_failures:
+            raise ValueError(
+                "nsys-system-wide does not permit failed/rejected requests"
+            )
     if (
         args.nsys_cpu_only or args.nsys_nvtx_only
     ) and "gpu-dmon" not in _requested_collectors(args):
@@ -2292,6 +2453,7 @@ def main() -> None:
         "profile_timeout_s",
         "nsys_finalize_timeout_s",
         "nsys_stats_timeout_s",
+        "nsys_command_timeout_s",
         "thread_sample_interval_ms",
     ):
         if getattr(args, name) <= 0:

@@ -9,6 +9,7 @@ import platform
 import re
 import shutil
 import signal
+import sqlite3
 import statistics
 import subprocess
 import threading
@@ -49,13 +50,30 @@ def capture_command(argv: Sequence[str], *, timeout_s: float = 20.0) -> CommandC
             stderr=f"{argv[0]} is not installed",
             available=False,
         )
-    completed = subprocess.run(
-        [executable, *argv[1:]],
-        check=False,
-        text=True,
-        capture_output=True,
-        timeout=timeout_s,
-    )
+    try:
+        completed = subprocess.run(
+            [executable, *argv[1:]],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return CommandCapture(
+            argv=list(argv),
+            returncode=124,
+            stdout=(
+                exc.stdout.decode(errors="replace")
+                if isinstance(exc.stdout, bytes)
+                else (exc.stdout or "")
+            ),
+            stderr=(
+                exc.stderr.decode(errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else (exc.stderr or "")
+            )
+            + f"\ncommand timed out after {timeout_s}s",
+        )
     return CommandCapture(
         argv=list(argv),
         returncode=completed.returncode,
@@ -387,6 +405,49 @@ def read_thread_snapshot(pid: int) -> dict[str, Any]:
     }
 
 
+def find_processes_with_thread_comms(
+    required_comms: Sequence[str],
+    *,
+    proc_root: str | Path = "/proc",
+) -> list[dict[str, Any]]:
+    """Find processes containing every required Linux native-thread name."""
+    required = {str(comm) for comm in required_comms if str(comm)}
+    if not required:
+        raise ValueError("at least one native-thread comm is required")
+    root = Path(proc_root)
+    candidates: list[dict[str, Any]] = []
+    for process_dir in sorted(root.glob("[0-9]*")):
+        try:
+            pid = int(process_dir.name)
+        except ValueError:
+            continue
+        observed: dict[str, list[int]] = defaultdict(list)
+        for comm_path in (process_dir / "task").glob("[0-9]*/comm"):
+            try:
+                comm = comm_path.read_text(encoding="utf-8").strip()
+                tid = int(comm_path.parent.name)
+            except (OSError, ValueError):
+                continue
+            if comm in required:
+                observed[comm].append(tid)
+        if required <= observed.keys():
+            candidates.append(
+                {
+                    "pid": pid,
+                    "required_thread_tids": {
+                        comm: sorted(observed[comm]) for comm in sorted(required)
+                    },
+                    "cmdline": (
+                        (_read_text(str(process_dir / "cmdline")) or "").replace(
+                            "\0", " "
+                        )
+                        or None
+                    ),
+                }
+            )
+    return candidates
+
+
 def summarize_thread_snapshot_delta(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -555,6 +616,564 @@ class ManagedCollector:
             "output": str(self.stdout_path) if self.stdout_path else None,
         }
         self._process = None
+        return result
+
+
+def _nsys_linux_ids(global_tid: int) -> tuple[int, int]:
+    """Decode Nsight's Linux PID/TID fields from a serialized globalTid."""
+    unsigned = int(global_tid) & ((1 << 64) - 1)
+    return (unsigned // 0x1000000) % 0x1000000, unsigned % 0x1000000
+
+
+def _sqlite_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        str(row[1])
+        for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+    }
+
+
+def _nsys_cpu_hotspots(
+    path: Path,
+    *,
+    global_tids: Sequence[int],
+    denominator: int,
+    leaf_only: bool,
+) -> list[dict[str, Any]]:
+    placeholders = ",".join("?" for _ in global_tids)
+    leaf_filter = "AND calls.stackDepth = 0" if leaf_only else ""
+    query = f"""
+        SELECT COALESCE(symbols.value, printf('symbol-id:%d', calls.symbol)),
+               COALESCE(modules.value, printf('module-id:%d', calls.module)),
+               COUNT(*) AS sample_count
+        FROM COMPOSITE_EVENTS AS events
+        JOIN SAMPLING_CALLCHAINS AS calls ON calls.id = events.id
+        LEFT JOIN StringIds AS symbols ON symbols.id = calls.symbol
+        LEFT JOIN StringIds AS modules ON modules.id = calls.module
+        WHERE events.cpuCycles = 1
+          AND events.globalTid IN ({placeholders})
+          {leaf_filter}
+        GROUP BY calls.symbol, calls.module
+        ORDER BY sample_count DESC, symbols.value, modules.value
+        LIMIT 25
+    """
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        rows = connection.execute(query, list(global_tids)).fetchall()
+    finally:
+        connection.close()
+    return [
+        {
+            "symbol": str(symbol),
+            "module": str(module),
+            "sample_count": int(count),
+            "occurrences_per_cpu_sample": (
+                int(count) / denominator if denominator else None
+            ),
+        }
+        for symbol, module, count in rows
+    ]
+
+
+def inspect_nsys_cpu_sqlite(
+    path: str | Path,
+    *,
+    target_pid: int,
+    thread_snapshot_before: dict[str, Any],
+    thread_snapshot_after: dict[str, Any],
+    required_thread_comms: Sequence[str],
+) -> dict[str, Any]:
+    """Validate system-wide Nsight CPU evidence for one stable target process.
+
+    Nsight's SQLite schema is versioned.  This reader intentionally relies only
+    on the documented SCHED_EVENTS and COMPOSITE_EVENTS contracts and records
+    the observed schema so an incompatible exporter fails visibly.
+    """
+    source = Path(path).resolve()
+    errors: list[str] = []
+    result: dict[str, Any] = {
+        "path": str(source),
+        "target_pid": int(target_pid),
+        "required_thread_comms": list(required_thread_comms),
+        "errors": errors,
+    }
+    if not source.is_file() or source.stat().st_size == 0:
+        errors.append(f"Nsight SQLite export is missing or empty: {source}")
+        result["valid"] = False
+        return result
+
+    before_rows = {
+        (int(row["tid"]), int(row["starttime_ticks"])): row
+        for row in thread_snapshot_before.get("threads", [])
+        if row.get("starttime_ticks") is not None
+    }
+    after_rows = {
+        (int(row["tid"]), int(row["starttime_ticks"])): row
+        for row in thread_snapshot_after.get("threads", [])
+        if row.get("starttime_ticks") is not None
+    }
+    required_identities: dict[str, list[tuple[int, int]]] = {}
+    for comm in required_thread_comms:
+        identities = sorted(
+            identity for identity, row in before_rows.items() if row.get("comm") == comm
+        )
+        required_identities[comm] = identities
+        if not identities:
+            errors.append(
+                f"required native thread comm {comm!r} was absent before capture"
+            )
+            continue
+        persistent = [identity for identity in identities if identity in after_rows]
+        if not persistent:
+            errors.append(
+                f"required native thread comm {comm!r} had no persistent identity"
+            )
+        renamed = [
+            identity
+            for identity in persistent
+            if after_rows[identity].get("comm") != comm
+        ]
+        if renamed:
+            errors.append(
+                f"required native thread comm {comm!r} changed identity/name: "
+                f"{[identity[0] for identity in renamed]}"
+            )
+
+    connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        result["tables"] = sorted(tables)
+        required_columns = {
+            "SCHED_EVENTS": {"globalTid", "start", "isSchedIn"},
+            "COMPOSITE_EVENTS": {"globalTid", "start", "cpuCycles"},
+            "SAMPLING_CALLCHAINS": {
+                "id",
+                "symbol",
+                "module",
+                "stackDepth",
+            },
+            "StringIds": {"id", "value"},
+        }
+        for table, expected in required_columns.items():
+            if table not in tables:
+                errors.append(f"Nsight SQLite export has no {table} table")
+                continue
+            columns = _sqlite_columns(connection, table)
+            result.setdefault("schema", {})[table] = sorted(columns)
+            missing = expected - columns
+            if missing:
+                errors.append(
+                    f"Nsight {table} schema is missing columns {sorted(missing)}"
+                )
+
+        if errors and any("table" in error or "schema" in error for error in errors):
+            result["valid"] = False
+            return result
+
+        sched_rows = connection.execute(
+            """
+            SELECT globalTid,
+                   COUNT(*) AS event_count,
+                   SUM(CASE WHEN isSchedIn != 0 THEN 1 ELSE 0 END) AS sched_in,
+                   SUM(CASE WHEN isSchedIn = 0 THEN 1 ELSE 0 END) AS sched_out
+            FROM SCHED_EVENTS
+            WHERE globalTid IS NOT NULL
+            GROUP BY globalTid
+            """
+        ).fetchall()
+        sample_rows = connection.execute(
+            """
+            SELECT globalTid,
+                   COUNT(*) AS composite_count,
+                   SUM(CASE WHEN cpuCycles = 1 THEN 1 ELSE 0 END) AS cpu_samples
+            FROM COMPOSITE_EVENTS
+            WHERE globalTid IS NOT NULL
+            GROUP BY globalTid
+            """
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        errors.append(f"cannot query Nsight SQLite export: {exc}")
+        result["valid"] = False
+        return result
+    finally:
+        connection.close()
+
+    sched_by_tid: dict[int, dict[str, int]] = {}
+    observed_sched_pids: set[int] = set()
+    for global_tid, event_count, sched_in, sched_out in sched_rows:
+        pid, tid = _nsys_linux_ids(int(global_tid))
+        observed_sched_pids.add(pid)
+        if pid == target_pid:
+            sched_by_tid[tid] = {
+                "events": int(event_count),
+                "sched_in": int(sched_in or 0),
+                "sched_out": int(sched_out or 0),
+            }
+
+    samples_by_tid: dict[int, dict[str, int]] = {}
+    sample_global_by_tid: dict[int, int] = {}
+    observed_sample_pids: set[int] = set()
+    for global_tid, composite_count, cpu_samples in sample_rows:
+        pid, tid = _nsys_linux_ids(int(global_tid))
+        observed_sample_pids.add(pid)
+        if pid == target_pid:
+            sample_global_by_tid[tid] = int(global_tid)
+            samples_by_tid[tid] = {
+                "composite_events": int(composite_count),
+                "cpu_samples": int(cpu_samples or 0),
+            }
+
+    table_counts = {
+        "SCHED_EVENTS": sum(int(row[1]) for row in sched_rows),
+        "COMPOSITE_EVENTS": sum(int(row[1]) for row in sample_rows),
+        "CPU_CYCLE_SAMPLES": sum(int(row[2] or 0) for row in sample_rows),
+    }
+    result["table_counts"] = table_counts
+    result["observed_pids"] = {
+        "SCHED_EVENTS": sorted(observed_sched_pids),
+        "COMPOSITE_EVENTS": sorted(observed_sample_pids),
+    }
+    if table_counts["SCHED_EVENTS"] == 0:
+        errors.append("Nsight SCHED_EVENTS contains no scheduling events")
+    if table_counts["COMPOSITE_EVENTS"] == 0:
+        errors.append("Nsight COMPOSITE_EVENTS contains no rows")
+    if table_counts["CPU_CYCLE_SAMPLES"] == 0:
+        errors.append("Nsight COMPOSITE_EVENTS contains no cpuCycles=1 CPU samples")
+    if target_pid not in observed_sched_pids:
+        errors.append(f"target PID {target_pid} has no Nsight scheduling events")
+    if target_pid not in observed_sample_pids:
+        errors.append(f"target PID {target_pid} has no Nsight composite events")
+
+    comm_summaries: dict[str, Any] = {}
+    target_cpu_samples = sum(row["cpu_samples"] for row in samples_by_tid.values())
+    for comm, identities in required_identities.items():
+        tids = [identity[0] for identity in identities]
+        per_thread = []
+        for tid in tids:
+            per_thread.append(
+                {
+                    "tid": tid,
+                    **sched_by_tid.get(
+                        tid,
+                        {"events": 0, "sched_in": 0, "sched_out": 0},
+                    ),
+                    **samples_by_tid.get(
+                        tid,
+                        {"composite_events": 0, "cpu_samples": 0},
+                    ),
+                }
+            )
+        aggregate: dict[str, Any] = {
+            key: sum(int(row[key]) for row in per_thread)
+            for key in (
+                "events",
+                "sched_in",
+                "sched_out",
+                "composite_events",
+                "cpu_samples",
+            )
+        }
+        aggregate["cpu_sample_fraction_of_target"] = (
+            aggregate["cpu_samples"] / target_cpu_samples
+            if target_cpu_samples
+            else None
+        )
+        persistent_tids = [
+            identity[0] for identity in identities if identity in after_rows
+        ]
+        comm_summaries[comm] = {
+            "tids": tids,
+            "persistent_tids": persistent_tids,
+            "aggregate": aggregate,
+            "threads": per_thread,
+        }
+        global_tids = [
+            sample_global_by_tid[tid] for tid in tids if tid in sample_global_by_tid
+        ]
+        if global_tids:
+            try:
+                comm_summaries[comm]["hotspots"] = {
+                    "leaf": _nsys_cpu_hotspots(
+                        source,
+                        global_tids=global_tids,
+                        denominator=aggregate["cpu_samples"],
+                        leaf_only=True,
+                    ),
+                    "inclusive": _nsys_cpu_hotspots(
+                        source,
+                        global_tids=global_tids,
+                        denominator=aggregate["cpu_samples"],
+                        leaf_only=False,
+                    ),
+                }
+            except sqlite3.DatabaseError as exc:
+                errors.append(
+                    f"cannot query sampled symbols for native thread comm "
+                    f"{comm!r}: {exc}"
+                )
+                comm_summaries[comm]["hotspots"] = {
+                    "leaf": [],
+                    "inclusive": [],
+                }
+        else:
+            comm_summaries[comm]["hotspots"] = {
+                "leaf": [],
+                "inclusive": [],
+            }
+        if identities and aggregate["events"] == 0:
+            errors.append(
+                f"required native thread comm {comm!r} has no scheduling events"
+            )
+        if identities and aggregate["cpu_samples"] == 0:
+            errors.append(
+                f"required native thread comm {comm!r} has no cpuCycles=1 samples"
+            )
+        if identities and not comm_summaries[comm]["hotspots"]["leaf"]:
+            errors.append(
+                f"required native thread comm {comm!r} has no sampled leaf symbols"
+            )
+    result["required_thread_coverage"] = comm_summaries
+    result["target_totals"] = {
+        "sched_events": sum(row["events"] for row in sched_by_tid.values()),
+        "sched_in": sum(row["sched_in"] for row in sched_by_tid.values()),
+        "sched_out": sum(row["sched_out"] for row in sched_by_tid.values()),
+        "composite_events": sum(
+            row["composite_events"] for row in samples_by_tid.values()
+        ),
+        "cpu_samples": target_cpu_samples,
+    }
+    result["valid"] = not errors
+    return result
+
+
+class NsysSystemWideCpuCollector:
+    """Bounded, non-injected Nsight CPU sampling and scheduling collection."""
+
+    def __init__(
+        self,
+        *,
+        target_pid: int,
+        artifact_dir: str | Path,
+        session_name: str,
+        required_thread_comms: Sequence[str],
+        executable: str = "nsys",
+        command_timeout_s: float = 30.0,
+        finalize_timeout_s: float = 180.0,
+    ) -> None:
+        self.name = "nsys_system_wide_cpu"
+        self.target_pid = int(target_pid)
+        self.artifact_dir = Path(artifact_dir).resolve()
+        self.session_name = session_name
+        self.required_thread_comms = tuple(required_thread_comms)
+        self.executable = executable
+        self.command_timeout_s = float(command_timeout_s)
+        self.finalize_timeout_s = float(finalize_timeout_s)
+        self.output_prefix = self.artifact_dir / "system-wide-cpu"
+        self.report_path = self.output_prefix.with_suffix(".nsys-rep")
+        self.sqlite_path = self.output_prefix.with_suffix(".sqlite")
+        self.started_monotonic_ns: int | None = None
+        self.started_wall_ns: int | None = None
+        self.stopped_monotonic_ns: int | None = None
+        self.stopped_wall_ns: int | None = None
+        self._before: dict[str, Any] | None = None
+        self._active = False
+        self._commands: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _capture_dict(capture: CommandCapture) -> dict[str, Any]:
+        return asdict(capture)
+
+    def _run(self, label: str, argv: Sequence[str], timeout_s: float) -> CommandCapture:
+        capture = capture_command(argv, timeout_s=timeout_s)
+        self._commands[label] = self._capture_dict(capture)
+        return capture
+
+    def start(self) -> None:
+        if self._active:
+            raise RuntimeError("Nsight system-wide collector is already running")
+        if not Path(f"/proc/{self.target_pid}/task").is_dir():
+            raise RuntimeError(f"target process {self.target_pid} does not exist")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", self.session_name):
+            raise ValueError(f"invalid Nsight session name: {self.session_name!r}")
+        self.artifact_dir.mkdir(parents=True, exist_ok=False)
+        collisions = [
+            path for path in (self.report_path, self.sqlite_path) if path.exists()
+        ]
+        if collisions:
+            raise FileExistsError(f"Nsight artifacts already exist: {collisions}")
+
+        environment = self._run(
+            "environment",
+            [self.executable, "status", "--environment"],
+            self.command_timeout_s,
+        )
+        if not environment.available or environment.returncode != 0:
+            write_json(self.artifact_dir / "lifecycle.json", self._lifecycle())
+            raise RuntimeError(
+                "Nsight CPU profiling environment check failed: "
+                f"{environment.stderr[-1000:] or environment.stdout[-1000:]}"
+            )
+
+        self._before = read_thread_snapshot(self.target_pid)
+        start_capture = self._run(
+            "start",
+            [
+                self.executable,
+                "start",
+                f"--session-new={self.session_name}",
+                "--stop-on-exit=false",
+                "--trace=none",
+                "--sample=system-wide",
+                "--cpuctxsw=system-wide",
+                "--resolve-symbols=false",
+                "--force-overwrite=true",
+                f"--output={self.output_prefix}",
+            ],
+            self.command_timeout_s,
+        )
+        if not start_capture.available or start_capture.returncode != 0:
+            self._run(
+                "start_failure_cleanup",
+                [self.executable, "stop", f"--session={self.session_name}"],
+                self.command_timeout_s,
+            )
+            write_json(self.artifact_dir / "lifecycle.json", self._lifecycle())
+            raise RuntimeError(
+                "could not start non-injected Nsight system-wide CPU session: "
+                f"{start_capture.stderr[-1000:] or start_capture.stdout[-1000:]}"
+            )
+        self.started_monotonic_ns = time.monotonic_ns()
+        self.started_wall_ns = time.time_ns()
+        self._active = True
+
+        status_capture = self._run(
+            "status",
+            [self.executable, "status", f"--session={self.session_name}"],
+            self.command_timeout_s,
+        )
+        if status_capture.returncode != 0:
+            self.stop()
+            raise RuntimeError(
+                "Nsight session did not become queryable: "
+                f"{status_capture.stderr[-1000:] or status_capture.stdout[-1000:]}"
+            )
+        write_json(self.artifact_dir / "lifecycle_started.json", self._lifecycle())
+
+    def _wait_for_finalized_report(self) -> tuple[bool, str | None]:
+        deadline = time.monotonic() + self.finalize_timeout_s
+        prior_signature: tuple[int, int] | None = None
+        stable_observations = 0
+        while time.monotonic() < deadline:
+            if self.report_path.is_file():
+                stat = self.report_path.stat()
+                signature = (stat.st_size, stat.st_mtime_ns)
+                if signature == prior_signature and stat.st_size > 0:
+                    stable_observations += 1
+                    if stable_observations >= 2:
+                        return True, None
+                else:
+                    stable_observations = 0
+                    prior_signature = signature
+            time.sleep(0.5)
+        return (
+            False,
+            f"Nsight report did not finalize within {self.finalize_timeout_s}s",
+        )
+
+    def _lifecycle(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "target_pid": self.target_pid,
+            "session_name": self.session_name,
+            "capture_contract": "non-injected-system-wide-cpu",
+            "trace_domains": [],
+            "sample_scope": "system-wide",
+            "context_switch_scope": "system-wide",
+            "required_thread_comms": list(self.required_thread_comms),
+            "started_monotonic_ns": self.started_monotonic_ns,
+            "started_wall_ns": self.started_wall_ns,
+            "stopped_monotonic_ns": self.stopped_monotonic_ns,
+            "stopped_wall_ns": self.stopped_wall_ns,
+            "report_path": str(self.report_path),
+            "sqlite_path": str(self.sqlite_path),
+            "commands": self._commands,
+        }
+
+    def stop(self, *, timeout_s: float | None = None) -> dict[str, Any]:
+        if not self._active or self._before is None:
+            raise RuntimeError("Nsight system-wide collector was not started")
+        # Snapshot identity at the workload boundary, before report generation.
+        self.stopped_monotonic_ns = time.monotonic_ns()
+        self.stopped_wall_ns = time.time_ns()
+        after = read_thread_snapshot(self.target_pid)
+        stop_capture = self._run(
+            "stop",
+            [self.executable, "stop", f"--session={self.session_name}"],
+            timeout_s or self.finalize_timeout_s,
+        )
+        self._active = False
+        errors: list[str] = []
+        if stop_capture.returncode != 0:
+            errors.append(
+                "nsys stop failed: "
+                f"{stop_capture.stderr[-1000:] or stop_capture.stdout[-1000:]}"
+            )
+
+        finalized, finalize_error = self._wait_for_finalized_report()
+        if finalize_error:
+            errors.append(finalize_error)
+        export_capture: CommandCapture | None = None
+        evidence: dict[str, Any] | None = None
+        if finalized:
+            export_capture = self._run(
+                "export",
+                [
+                    self.executable,
+                    "export",
+                    "--type=sqlite",
+                    "--force-overwrite=true",
+                    "--lazy=false",
+                    f"--output={self.sqlite_path}",
+                    str(self.report_path),
+                ],
+                self.finalize_timeout_s,
+            )
+            if export_capture.returncode != 0:
+                errors.append(
+                    "Nsight SQLite export failed: "
+                    f"{export_capture.stderr[-1000:] or export_capture.stdout[-1000:]}"
+                )
+            else:
+                evidence = inspect_nsys_cpu_sqlite(
+                    self.sqlite_path,
+                    target_pid=self.target_pid,
+                    thread_snapshot_before=self._before,
+                    thread_snapshot_after=after,
+                    required_thread_comms=self.required_thread_comms,
+                )
+                errors.extend(str(error) for error in evidence.get("errors", []))
+
+        result = {
+            **self._lifecycle(),
+            "returncode": 0 if not errors else 1,
+            "error": "; ".join(errors) if errors else None,
+            "finalized": finalized,
+            "report_bytes": (
+                self.report_path.stat().st_size if self.report_path.is_file() else 0
+            ),
+            "sqlite_bytes": (
+                self.sqlite_path.stat().st_size if self.sqlite_path.is_file() else 0
+            ),
+            "thread_snapshot_before": self._before,
+            "thread_snapshot_after": after,
+            "evidence": evidence,
+            "valid": not errors,
+        }
+        write_json(self.artifact_dir / "lifecycle.json", result)
         return result
 
 
@@ -1188,9 +1807,11 @@ def write_json(path: str | Path, data: Any) -> str:
 __all__ = [
     "CpuFrequencyCollector",
     "ManagedCollector",
+    "NsysSystemWideCpuCollector",
     "ThreadSnapshotCollector",
     "capture_command",
     "collect_static_manifest",
+    "find_processes_with_thread_comms",
     "gpu_dmon_collector",
     "parse_gpu_dmon",
     "parse_cpu_frequency",
@@ -1199,6 +1820,7 @@ __all__ = [
     "parse_turbostat",
     "perf_sched_collector",
     "perf_stat_collector",
+    "inspect_nsys_cpu_sqlite",
     "psi_delta",
     "read_process_cgroup_psi",
     "read_psi",

@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 from pathlib import Path
 
 from benchmarks.profiling.system_collectors import (
+    CommandCapture,
     CpuFrequencyCollector,
+    NsysSystemWideCpuCollector,
+    find_processes_with_thread_comms,
+    inspect_nsys_cpu_sqlite,
     parse_cpu_frequency,
     parse_gpu_dmon,
     parse_perf_stat,
@@ -16,6 +22,247 @@ from benchmarks.profiling.system_collectors import (
     read_psi,
     summarize_thread_snapshot_delta,
 )
+
+
+def _global_tid(pid: int, tid: int) -> int:
+    return (pid << 24) | tid
+
+
+def _thread_snapshot(
+    pid: int,
+    rows: list[tuple[int, str, int]],
+) -> dict[str, object]:
+    return {
+        "pid": pid,
+        "monotonic_ns": 1,
+        "threads": [
+            {"tid": tid, "comm": comm, "starttime_ticks": starttime}
+            for tid, comm, starttime in rows
+        ],
+    }
+
+
+def _write_nsys_cpu_sqlite(
+    path: Path,
+    *,
+    pid: int,
+    tids: list[int],
+    sampled_tids: list[int] | None = None,
+) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE SCHED_EVENTS "
+            "(start INTEGER, globalTid INTEGER, isSchedIn INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE COMPOSITE_EVENTS "
+            "(id INTEGER PRIMARY KEY, start INTEGER, "
+            "globalTid INTEGER, cpuCycles INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE SAMPLING_CALLCHAINS "
+            "(id INTEGER, symbol INTEGER, module INTEGER, stackDepth INTEGER)"
+        )
+        connection.execute("CREATE TABLE StringIds (id INTEGER, value TEXT)")
+        connection.executemany(
+            "INSERT INTO StringIds VALUES (?, ?)",
+            [(1, "leaf"), (2, "parent"), (3, "libpython.so")],
+        )
+        for index, tid in enumerate(tids):
+            connection.executemany(
+                "INSERT INTO SCHED_EVENTS VALUES (?, ?, ?)",
+                [
+                    (index * 10 + 1, _global_tid(pid, tid), 1),
+                    (index * 10 + 2, _global_tid(pid, tid), 0),
+                ],
+            )
+            connection.execute(
+                "INSERT INTO COMPOSITE_EVENTS VALUES (?, ?, ?, ?)",
+                (
+                    index + 1,
+                    index * 10 + 1,
+                    _global_tid(pid, tid),
+                    int(tid in (sampled_tids if sampled_tids is not None else tids)),
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO SAMPLING_CALLCHAINS VALUES (?, ?, ?, ?)",
+                [
+                    (index + 1, 1, 3, 0),
+                    (index + 1, 2, 3, 1),
+                ],
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_nsys_sqlite_requires_sched_and_true_cpu_samples_per_semantic_comm(
+    tmp_path: Path,
+) -> None:
+    pid = 123
+    semantic_threads = [
+        (201, "sched-asr", 11),
+        (202, "omni-request-bu", 12),
+        (203, "fun-asr-audio-e", 13),
+    ]
+    database = tmp_path / "capture.sqlite"
+    _write_nsys_cpu_sqlite(
+        database,
+        pid=pid,
+        tids=[row[0] for row in semantic_threads],
+    )
+
+    result = inspect_nsys_cpu_sqlite(
+        database,
+        target_pid=pid,
+        thread_snapshot_before=_thread_snapshot(pid, semantic_threads),
+        thread_snapshot_after=_thread_snapshot(pid, semantic_threads),
+        required_thread_comms=[row[1] for row in semantic_threads],
+    )
+
+    assert result["valid"] is True
+    assert result["table_counts"] == {
+        "SCHED_EVENTS": 6,
+        "COMPOSITE_EVENTS": 3,
+        "CPU_CYCLE_SAMPLES": 3,
+    }
+    assert result["target_totals"]["cpu_samples"] == 3
+    assert result["required_thread_coverage"]["sched-asr"]["aggregate"]["sched_in"] == 1
+
+
+def test_nsys_sqlite_rejects_non_sample_callstacks_and_thread_replacement(
+    tmp_path: Path,
+) -> None:
+    pid = 123
+    semantic_threads = [
+        (201, "sched-asr", 11),
+        (202, "omni-request-bu", 12),
+    ]
+    database = tmp_path / "capture.sqlite"
+    _write_nsys_cpu_sqlite(
+        database,
+        pid=pid,
+        tids=[201, 202],
+        sampled_tids=[201],
+    )
+    after = _thread_snapshot(
+        pid,
+        [
+            (201, "sched-asr", 11),
+            # Reused TID with a different /proc starttime is a new thread.
+            (202, "omni-request-bu", 99),
+        ],
+    )
+
+    result = inspect_nsys_cpu_sqlite(
+        database,
+        target_pid=pid,
+        thread_snapshot_before=_thread_snapshot(pid, semantic_threads),
+        thread_snapshot_after=after,
+        required_thread_comms=["sched-asr", "omni-request-bu"],
+    )
+
+    assert result["valid"] is False
+    assert any("no persistent identity" in error for error in result["errors"])
+    assert any("no cpuCycles=1 samples" in error for error in result["errors"])
+
+
+def test_nsys_system_wide_start_has_no_application_or_trace_domain(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+    pid = os.getpid()
+    semantic_threads = [
+        (pid, "sched-asr", 11),
+        (pid + 1, "omni-request-bu", 12),
+        (pid + 2, "fun-asr-audio-e", 13),
+    ]
+    collector = NsysSystemWideCpuCollector(
+        target_pid=pid,
+        artifact_dir=tmp_path / "nsight",
+        session_name="omni_test_123",
+        required_thread_comms=[row[1] for row in semantic_threads],
+    )
+
+    def fake_capture(argv, *, timeout_s):
+        commands.append(list(argv))
+        if argv[1] == "stop":
+            collector.report_path.write_bytes(b"finalized report")
+        if argv[1] == "export":
+            _write_nsys_cpu_sqlite(
+                collector.sqlite_path,
+                pid=pid,
+                tids=[row[0] for row in semantic_threads],
+            )
+        return CommandCapture(
+            argv=list(argv),
+            returncode=0,
+            stdout="OK",
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        "benchmarks.profiling.system_collectors.capture_command",
+        fake_capture,
+    )
+    monkeypatch.setattr(
+        "benchmarks.profiling.system_collectors.read_thread_snapshot",
+        lambda target_pid: _thread_snapshot(target_pid, semantic_threads),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_wait_for_finalized_report",
+        lambda: (True, None),
+    )
+    original_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda path: (
+            True if str(path) == f"/proc/{pid}/task" else original_is_dir(path)
+        ),
+    )
+
+    collector.start()
+    result = collector.stop()
+
+    start = next(command for command in commands if command[1] == "start")
+    assert "--trace=none" in start
+    assert "--sample=system-wide" in start
+    assert "--cpuctxsw=system-wide" in start
+    assert all("python" not in argument for argument in start)
+    assert all("cuda" not in argument.lower() for argument in start)
+    assert result["valid"] is True
+    assert result["finalized"] is True
+    assert result["evidence"]["target_totals"]["cpu_samples"] == 3
+    assert (collector.artifact_dir / "lifecycle.json").is_file()
+
+
+def test_native_thread_target_discovery_requires_all_semantic_comms(
+    tmp_path: Path,
+) -> None:
+    for pid, comms in (
+        (100, ["sched-asr", "omni-request-bu", "fun-asr-audio-e"]),
+        (200, ["sched-asr", "omni-request-bu"]),
+    ):
+        process = tmp_path / str(pid)
+        process.mkdir()
+        (process / "cmdline").write_bytes(b"python3\0server.py\0")
+        for offset, comm in enumerate(comms):
+            task = process / "task" / str(pid + offset)
+            task.mkdir(parents=True)
+            (task / "comm").write_text(comm + "\n", encoding="utf-8")
+
+    candidates = find_processes_with_thread_comms(
+        ["sched-asr", "omni-request-bu", "fun-asr-audio-e"],
+        proc_root=tmp_path,
+    )
+
+    assert [candidate["pid"] for candidate in candidates] == [100]
+    assert candidates[0]["required_thread_tids"]["sched-asr"] == [100]
 
 
 def _write_psi(root: Path, *, cpu_total: int, memory_total: int) -> None:

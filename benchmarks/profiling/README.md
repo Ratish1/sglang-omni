@@ -403,7 +403,140 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --record-shapes
 ```
 
-## 6. Nsight Systems joint CPU/CUDA/Python trace
+## 6. Non-injected Nsight CPU attribution
+
+Use this path when `nsys profile ... sgl-omni serve` kills a CUDA worker before
+weight loading. It does not launch, attach to, preload, or inject a library
+into the server. The server starts normally and the harness creates a separate,
+named, system-wide Nsight session around only the measured request window:
+
+```text
+normal server -> shape/stability warmup -> unprofiled control
+              -> system-wide CPU sample + context-switch window
+              -> unprofiled control -> finalize/export/validate
+```
+
+This mode deliberately uses `--trace=none`. It collects CPU IP/backtrace
+samples and scheduler context switches, not CUDA, NVTX, OS-runtime
+interposition, Python sampling, or GIL tracing. Independent `gpu-dmon`,
+procfs thread snapshots, CPU frequency, and PSI collectors remain active. This
+is the correct next experiment on a host where every injected Nsight launch
+destabilizes the worker.
+
+Run the existing focused unit gate, then confirm the installed Nsight CPU
+environment:
+
+```bash
+pytest -q \
+  tests/unit_test/benchmarks/test_system_collectors.py \
+  tests/unit_test/benchmarks/test_profile_cpu_saturation.py
+
+nsys --version
+nsys status --environment
+nsys sessions list
+```
+
+Start a fresh Fun-ASR server normally, using the exact server command in
+section 2. Do not prefix it with `nsys`, and do not set an Nsight injection or
+`LD_PRELOAD` variable. After the server is healthy, run the quiet arm:
+
+```bash
+export GPU=1
+export MODEL_REVISION=e296c62e32a328b1d649a8f02701ac54c2fac9f0
+
+python -m benchmarks.profiling.profile_cpu_saturation \
+  --mode nsys-system-wide \
+  --run-id nsys-system-wide-quiet-r1 \
+  --concurrency 32 \
+  --max-samples 1088 \
+  --profile-samples 256 \
+  --model-revision "$MODEL_REVISION" \
+  --collectors psi,cgroup-psi,thread-snapshot,gpu-dmon,cpu-frequency \
+  --required-thread-comms sched-asr,omni-request-bu,fun-asr-audio-e \
+  --nsys-required-thread-comms sched-asr,omni-request-bu,fun-asr-audio-e \
+  --gpu-index "$GPU" \
+  --profile-timeout-s 600 \
+  --nsys-finalize-timeout-s 600
+```
+
+The harness discovers the target process read-only from `/proc` using the
+startup-created `sched-asr` thread. The full three-thread evidence contract is
+checked after warmup, when lazy request-builder workers have been created. If
+more than one matching server exists, stop the unrelated server or pass the
+exact ASR stage `--server-pid`. This mode never uses the event-recorder control
+plane for PID discovery.
+
+For the CPU64 arm, stop the quiet server and start another fresh server with
+identical flags. In a separate shell, start the same unbound interferer used by
+the stability experiment:
+
+```bash
+python -m benchmarks.profiling.cpu_interferer --workers 64 \
+  |& tee /tmp/nsys-system-wide-cpu64-interferer.log
+```
+
+Then rerun the harness with only the run ID changed:
+
+```bash
+python -m benchmarks.profiling.profile_cpu_saturation \
+  --mode nsys-system-wide \
+  --run-id nsys-system-wide-cpu64-r1 \
+  --concurrency 32 \
+  --max-samples 1088 \
+  --profile-samples 256 \
+  --model-revision "$MODEL_REVISION" \
+  --collectors psi,cgroup-psi,thread-snapshot,gpu-dmon,cpu-frequency \
+  --required-thread-comms sched-asr,omni-request-bu,fun-asr-audio-e \
+  --nsys-required-thread-comms sched-asr,omni-request-bu,fun-asr-audio-e \
+  --gpu-index "$GPU" \
+  --profile-timeout-s 600 \
+  --nsys-finalize-timeout-s 600
+```
+
+Stop the interferer with `Ctrl-C` after the harness exits. Do not compare an
+arm from this pair with an earlier campaign: the useful comparison is this
+fresh, adjacent quiet/CPU64 pair with identical workload and server settings.
+
+An accepted result requires all of the following:
+
+- `result.json`: `capture_complete=true`, `accepted=true`,
+  `request_integrity.valid=true`, and `system_integrity.valid=true`;
+- `system.json`: complete request-window monotonic and wall-clock boundaries;
+- `nsight-system-wide/system-wide-cpu.nsys-rep`: finalized and nonempty;
+- `nsight-system-wide/system-wide-cpu.sqlite`: successful non-lazy export;
+- nonempty `SCHED_EVENTS`, `COMPOSITE_EVENTS`, and `cpuCycles=1` samples;
+- stable `/proc` TID/start-time identities across the measured window;
+- scheduling events, real CPU samples, and sampled leaf symbols for
+  `sched-asr`, `omni-request-bu`, and `fun-asr-audio-e`.
+
+The filtered evidence is in
+`system.json["nsys_system_wide_cpu"]["evidence"]`. For each semantic thread
+class it reports TIDs, scheduling counts, true CPU-sample counts, and the top
+leaf and inclusive native symbols. The raw `.nsys-rep` and SQLite database are
+retained for GUI or follow-up SQL analysis. `cpuCycles=0` call stacks are
+excluded from hotspot attribution because those are context-switch stacks,
+not periodic CPU samples.
+
+Interpret the pair in this order:
+
+1. Find which semantic thread's CPU-sample share and native leaf symbols grow
+   under CPU64. This locates real additional execution, such as audio feature
+   extraction, allocation/copying, Python runtime work, or synchronization.
+2. Compare that with its procfs CPU time, runqueue delay, migrations, and
+   context-switch count. More wall delay with unchanged samples is scheduler
+   starvation; more samples and CPU time is additional service cost or cache/
+   SMT interference.
+3. Align the same arm with `gpu-dmon`. Falling SM utilization while one or
+   more host critical threads are delayed confirms host dispatch starvation.
+4. Only after a specific thread and native stack family is selected should a
+   narrow in-process Torch or Python profiler be applied to that owner.
+
+This capture cannot prove GIL ownership or map interpreter samples to Python
+lines, and it cannot join CUDA launch calls to kernels. Those are intentional
+limitations of avoiding injection. It can select the exact owner and native
+hotspot family without risking another model startup under Nsight injection.
+
+### Injected joint CPU/CUDA/Python trace
 
 Nsight must launch the server so it follows the worker process tree. The
 server emits one scheduler-owned NVTX range named
