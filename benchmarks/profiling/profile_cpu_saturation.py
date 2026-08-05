@@ -796,6 +796,10 @@ async def _run_stability_characterization(
             summary = _summarize_pass(result)
             window_record = {
                 "window": window_index,
+                "started_monotonic_ns": system_window["started_monotonic_ns"],
+                "stopped_monotonic_ns": system_window["stopped_monotonic_ns"],
+                "started_wall_ns": system_window["started_wall_ns"],
+                "stopped_wall_ns": system_window["stopped_wall_ns"],
                 "artifact": str(result_path),
                 "system_artifact": str(system_path),
                 "summary": summary,

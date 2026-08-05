@@ -120,11 +120,24 @@ async def test_stability_characterization_preserves_all_unstable_windows(
     def fake_threads(pid):
         return {"monotonic_ns": 1, "pid": pid, "threads": []}
 
+    frequency_windows: list[tuple[int, int]] = []
+
+    def fake_frequency(
+        _path,
+        *,
+        start_monotonic_ns=None,
+        stop_monotonic_ns=None,
+    ):
+        if start_monotonic_ns is not None and stop_monotonic_ns is not None:
+            frequency_windows.append((start_monotonic_ns, stop_monotonic_ns))
+        return {"samples": 2}
+
     monkeypatch.setattr(profile, "_run_pass", fake_run)
     monkeypatch.setattr(profile, "_build_collectors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(profile, "_read_pressure_snapshot", fake_pressure)
     monkeypatch.setattr(profile, "read_thread_snapshot", fake_threads)
     monkeypatch.setattr(profile, "_process_cpu_seconds", lambda _pid: next(cpu))
+    monkeypatch.setattr(profile, "parse_cpu_frequency", fake_frequency)
     args = SimpleNamespace(
         server_pid=123,
         collectors="",
@@ -142,6 +155,7 @@ async def test_stability_characterization_preserves_all_unstable_windows(
     )
     artifact_dir = tmp_path / "unstable"
     artifact_dir.mkdir()
+    (artifact_dir / "cpu_frequency.jsonl").write_text("{}\n", encoding="utf-8")
     result = await profile._run_stability_characterization(
         args,
         samples,
@@ -153,6 +167,18 @@ async def test_stability_characterization_preserves_all_unstable_windows(
     assert result["request_integrity"]["valid"] is True
     assert characterization["completed_windows"] == 4
     assert characterization["ever_stable"] is False
+    assert len(frequency_windows) == 4
+    assert all(start <= stop for start, stop in frequency_windows)
+    assert all(
+        {
+            "started_monotonic_ns",
+            "stopped_monotonic_ns",
+            "started_wall_ns",
+            "stopped_wall_ns",
+        }
+        <= window.keys()
+        for window in characterization["windows"]
+    )
     assert len(list((artifact_dir / "stability_windows").glob("window_??.json"))) == 4
     assert (artifact_dir / "result.json").is_file()
     assert (artifact_dir / "artifact_index.json").is_file()
