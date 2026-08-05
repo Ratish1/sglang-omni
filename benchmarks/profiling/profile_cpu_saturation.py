@@ -104,9 +104,9 @@ def _artifact_index(root: Path) -> dict[str, Any]:
 
 
 def _nsys_stats_contract(
-    *, cpu_only: bool
+    *, cpu_only: bool, nvtx_only: bool = False
 ) -> tuple[list[str], dict[str, tuple[str, ...]]]:
-    reports = ["nvtx_sum", "osrt_sum"]
+    reports = ["nvtx_sum"]
     required_coverage = {
         "NVTX capture window": ("sglang_omni.capture_window",),
         "request-build total": ("request_build.total",),
@@ -125,16 +125,19 @@ def _nsys_stats_contract(
         ),
         "scheduler model resolution": ("scheduler.model_resolve",),
         "scheduler result processing": ("scheduler.result_process",),
-        "OS runtime": ("os runtime", "poll", "pthread"),
     }
+    if not nvtx_only:
+        reports.append("osrt_sum")
+        required_coverage["OS runtime"] = ("os runtime", "poll", "pthread")
     if not cpu_only:
-        reports[1:1] = ["cuda_api_sum", "cuda_gpu_kern_sum"]
-        required_coverage.update(
-            {
-                "CUDA API": ("cuda",),
-                "CUDA kernel": ("kernel", "gpu"),
-            }
-        )
+        if not nvtx_only:
+            reports[1:1] = ["cuda_api_sum", "cuda_gpu_kern_sum"]
+            required_coverage.update(
+                {
+                    "CUDA API": ("cuda",),
+                    "CUDA kernel": ("kernel", "gpu"),
+                }
+            )
     return reports, required_coverage
 
 
@@ -1975,7 +1978,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             retained_report.parent.mkdir(parents=True, exist_ok=False)
             shutil.copy2(report_path, retained_report)
             stats_reports, required_coverage = _nsys_stats_contract(
-                cpu_only=args.nsys_cpu_only
+                cpu_only=args.nsys_cpu_only,
+                nvtx_only=args.nsys_nvtx_only,
             )
             stats_argv = ["nsys", "stats"]
             for report in stats_reports:
@@ -2015,9 +2019,11 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "mtime_ns": retained_report.stat().st_mtime_ns,
                 "stats_path": str(artifact_dir / "nsight" / "stats.json"),
                 "capture_contract": (
-                    "cpu-only" if args.nsys_cpu_only else "joint-cpu-cuda"
+                    "nvtx-only"
+                    if args.nsys_nvtx_only
+                    else ("cpu-only" if args.nsys_cpu_only else "joint-cpu-cuda")
                 ),
-                "cuda_required": not args.nsys_cpu_only,
+                "cuda_required": not (args.nsys_cpu_only or args.nsys_nvtx_only),
             }
 
     result_payload["accepted"] = not integrity_errors
@@ -2207,6 +2213,16 @@ def parse_args() -> argparse.Namespace:
             "telemetry independently."
         ),
     )
+    parser.add_argument(
+        "--nsys-nvtx-only",
+        action="store_true",
+        help=(
+            "Accept a minimal Nsight report containing only the semantic NVTX "
+            "capture. This excludes CUDA, OS-runtime, Python/GIL, CPU "
+            "sampling, and context-switch evidence and therefore requires "
+            "independent GPU and scheduling evidence."
+        ),
+    )
     parser.add_argument("--nsys-finalize-timeout-s", type=float, default=180.0)
     parser.add_argument("--nsys-stats-timeout-s", type=float, default=180.0)
     parser.add_argument("--stream", action="store_true")
@@ -2241,10 +2257,16 @@ def main() -> None:
         raise ValueError("--nsys-report is required in nsys mode")
     if args.nsys_cpu_only and args.mode != "nsys":
         raise ValueError("--nsys-cpu-only is valid only in nsys mode")
-    if args.nsys_cpu_only and "gpu-dmon" not in _requested_collectors(args):
+    if args.nsys_nvtx_only and args.mode != "nsys":
+        raise ValueError("--nsys-nvtx-only is valid only in nsys mode")
+    if args.nsys_cpu_only and args.nsys_nvtx_only:
+        raise ValueError("--nsys-cpu-only and --nsys-nvtx-only are mutually exclusive")
+    if (
+        args.nsys_cpu_only or args.nsys_nvtx_only
+    ) and "gpu-dmon" not in _requested_collectors(args):
         raise ValueError(
-            "--nsys-cpu-only requires the gpu-dmon collector because CUDA "
-            "tracing is intentionally disabled"
+            "reduced Nsight contracts require the gpu-dmon collector because "
+            "CUDA tracing is intentionally disabled"
         )
     if not 0 < args.stability_tolerance < 1:
         raise ValueError("--stability-tolerance must be between 0 and 1")

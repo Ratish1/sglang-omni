@@ -86,6 +86,23 @@ def test_nsys_cpu_only_contract_does_not_request_cuda_reports() -> None:
     assert coverage["scheduler result processing"] == ("scheduler.result_process",)
 
 
+def test_nsys_nvtx_only_contract_requests_no_injected_runtime_reports() -> None:
+    reports, coverage = profile._nsys_stats_contract(
+        cpu_only=False,
+        nvtx_only=True,
+    )
+
+    assert reports == ["nvtx_sum"]
+    assert "CUDA API" not in coverage
+    assert "CUDA kernel" not in coverage
+    assert "OS runtime" not in coverage
+    assert coverage["request-build total"] == ("request_build.total",)
+    assert coverage["scheduler model execution"] == (
+        "scheduler.model_launch",
+        "scheduler.model_execute",
+    )
+
+
 @pytest.mark.asyncio
 async def test_steady_contract_warms_full_shape_population_before_windows(
     tmp_path: Path,

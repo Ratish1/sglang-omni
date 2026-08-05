@@ -565,6 +565,63 @@ Scheduling lanes for `sched-asr`, `omni-request-bu`, and
 encodings are not exposed by a stable cross-version `nsys stats` report, so
 the harness does not pretend to validate them from incidental report text.
 
+If that CPU-only bundle still kills a worker before the capture window, the
+failure has not implicated the NVTX annotations. That command also enables
+OS-runtime interception, Python/GIL instrumentation, CPU sampling, and
+process-tree context-switch collection during worker startup. Do not repeat
+the same bundle. Reduce the experiment to NVTX alone:
+
+```bash
+export SGLANG_OMNI_NVTX_RANGES=1
+export NSYS_NVTX_PROFILER_REGISTER_ONLY=0
+
+nsys profile \
+  --trace=nvtx \
+  --sample=none \
+  --cpuctxsw=none \
+  --python-sampling=false \
+  --resolve-symbols=false \
+  --capture-range=nvtx \
+  --nvtx-capture=sglang_omni.capture_window \
+  --capture-range-end=stop \
+  --force-overwrite=true \
+  --output="$PWD/artifacts/cpu-saturation/nsys-nvtx-quiet-r1" \
+  sgl-omni serve \
+    --model-path FunAudioLLM/Fun-ASR-Nano-2512-hf \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --stages.asr.factory_args.pre_lm_cache_max_entries=0 \
+    --stages.asr.factory_args.pre_lm_cache_size_bytes=0
+```
+
+Run the same stable workload from another shell:
+
+```bash
+python -m benchmarks.profiling.profile_cpu_saturation \
+  --mode nsys \
+  --nsys-nvtx-only \
+  --run-id nsys-nvtx-quiet-r1 \
+  --concurrency 32 \
+  --max-samples 1088 \
+  --profile-samples 256 \
+  --model-revision "$MODEL_REVISION" \
+  --collectors psi,thread-snapshot,gpu-dmon \
+  --gpu-index "$GPU" \
+  --profile-timeout-s 600 \
+  --nsys-report \
+    "$PWD/artifacts/cpu-saturation/nsys-nvtx-quiet-r1.nsys-rep"
+```
+
+This is a semantic phase trace, not a CPU stack or scheduler trace. Acceptance
+requires the capture window and all request-build, pre-LM, and scheduler ranges,
+plus complete requests and independent GPU telemetry. Interpret it together
+with the already-qualified native-thread `schedstat`/migration evidence; do
+not infer GIL ownership, native hotspots, CUDA launch correlation, or kernel
+timing from this report. Run the CPU64 arm only after the quiet NVTX-only arm
+is accepted. If the worker also dies under this exact minimal command, the
+remaining failure is NVTX/Nsight injection itself and this host cannot produce
+a valid Nsight semantic trace.
+
 From another shell:
 
 ```bash
