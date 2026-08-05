@@ -72,6 +72,11 @@ dependencies = [
     "torchcodec==0.11.1",     # Matches torch 2.11.x / sglang 0.5.16
     # Gradio playground
     "gradio>=4.0.0",
+    # Dots TTS native latent engine / text normalization
+    "torchdiffeq",
+    "langcodes[data]",
+    "lingua-language-detector",
+    "WeTextProcessing",
     # Ming-Omni
     "diffusers==0.37.0",      # Omni's own Ming-Omni pin; not an sglang core dependency
     "x-transformers",          # Ming talker rotary embeddings
