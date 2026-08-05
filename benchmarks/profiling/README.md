@@ -497,6 +497,74 @@ on it. Check for profiler processes owned by the same user and use a
 toolkit-bundled Nsight version compatible with the installed driver; a driver
 reset or host reboot is an operator action, not part of this benchmark.
 
+### CPU-only fallback when CUDA tracing destabilizes the driver
+
+If either hardware or software CUDA tracing emits an NVRM reference-state
+error, do not launch the model under any CUDA-enabled Nsight trace. Use the
+CPU-only evidence contract instead. It still captures the evidence needed to
+decide between scheduler/GIL starvation, request-preprocessing work, pre-LM
+dependency waits, CFS scheduling delay, and request-build head-of-line
+blocking. GPU SM utilization, power, and clocks come from the independent
+`gpu-dmon` collector rather than CUPTI, so this mode cannot correlate an
+individual CUDA API call to a kernel.
+
+Launch each fresh server with no CUDA trace domain or CUDA-specific Nsight
+switches:
+
+```bash
+export SGLANG_OMNI_NVTX_RANGES=1
+export NSYS_NVTX_PROFILER_REGISTER_ONLY=0
+
+nsys profile \
+  --trace=nvtx,osrt,python-gil \
+  --sample=process-tree \
+  --cpuctxsw=process-tree \
+  --python-sampling=true \
+  --python-sampling-frequency=250 \
+  --resolve-symbols=false \
+  --capture-range=nvtx \
+  --nvtx-capture=sglang_omni.capture_window \
+  --capture-range-end=stop \
+  --force-overwrite=true \
+  --output="$PWD/artifacts/cpu-saturation/nsys-cpu-quiet-r1" \
+  sgl-omni serve \
+    --model-path FunAudioLLM/Fun-ASR-Nano-2512-hf \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --stages.asr.factory_args.pre_lm_cache_max_entries=0 \
+    --stages.asr.factory_args.pre_lm_cache_size_bytes=0
+```
+
+From another shell:
+
+```bash
+python -m benchmarks.profiling.profile_cpu_saturation \
+  --mode nsys \
+  --nsys-cpu-only \
+  --run-id nsys-cpu-quiet-r1 \
+  --concurrency 32 \
+  --max-samples 1088 \
+  --profile-samples 256 \
+  --model-revision "$MODEL_REVISION" \
+  --collectors psi,gpu-dmon \
+  --gpu-index "$GPU" \
+  --profile-timeout-s 600 \
+  --nsys-report \
+    "$PWD/artifacts/cpu-saturation/nsys-cpu-quiet-r1.nsys-rep"
+```
+
+Repeat once under the same unbound-CPU64 condition, changing only the run ID
+and output paths. An accepted CPU-only result explicitly records
+`nsys_report.capture_contract="cpu-only"` and `cuda_required=false`. It must
+still pass the automated gates for the capture window, every required semantic
+NVTX range, OS-runtime activity, a finalized report, complete requests, and
+valid independent GPU telemetry. Before interpreting an accepted report, open
+it in Nsight and require non-empty Python Samples, Python GIL, and thread
+Scheduling lanes for `sched-asr`, `omni-request-bu`, and
+`fun-asr-audio-e`. Reject the capture if any lane is absent. Those lane
+encodings are not exposed by a stable cross-version `nsys stats` report, so
+the harness does not pretend to validate them from incidental report text.
+
 From another shell:
 
 ```bash
@@ -532,8 +600,10 @@ The trace must contain all of these semantic ranges:
   `scheduler.model_resolve`, and `scheduler.result_process`, on `sched-asr`;
 - `request_build.head_of_line` whenever later-ready request-builder futures
   are held behind the oldest incomplete future;
-- `sglang_omni.capture_window`, CUDA API calls, GPU kernels, Python samples,
-  Python GIL states, and scheduling/context-switch records.
+- `sglang_omni.capture_window`, Python samples, Python GIL states, and
+  scheduling/context-switch records;
+- CUDA API calls and GPU kernels for the joint contract only. CPU-only
+  captures instead require complete independent `gpu-dmon` telemetry.
 
 Inspect the two captures in this order:
 

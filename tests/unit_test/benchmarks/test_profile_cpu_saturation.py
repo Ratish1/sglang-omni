@@ -57,6 +57,35 @@ def _result(sample_count: int, *, qps: float = 10.0) -> dict:
     }
 
 
+def test_nsys_joint_contract_requires_cuda_coverage() -> None:
+    reports, coverage = profile._nsys_stats_contract(cpu_only=False)
+
+    assert reports == [
+        "nvtx_sum",
+        "cuda_api_sum",
+        "cuda_gpu_kern_sum",
+        "osrt_sum",
+    ]
+    assert "CUDA API" in coverage
+    assert "CUDA kernel" in coverage
+    assert coverage["scheduler model execution"] == (
+        "scheduler.model_launch",
+        "scheduler.model_execute",
+    )
+    assert coverage["request feature extraction"] == ("request_build.feature_extract",)
+
+
+def test_nsys_cpu_only_contract_does_not_request_cuda_reports() -> None:
+    reports, coverage = profile._nsys_stats_contract(cpu_only=True)
+
+    assert reports == ["nvtx_sum", "osrt_sum"]
+    assert "CUDA API" not in coverage
+    assert "CUDA kernel" not in coverage
+    assert coverage["NVTX capture window"] == ("sglang_omni.capture_window",)
+    assert coverage["pre-LM synchronize"] == ("pre_lm.synchronize",)
+    assert coverage["scheduler result processing"] == ("scheduler.result_process",)
+
+
 @pytest.mark.asyncio
 async def test_steady_contract_warms_full_shape_population_before_windows(
     tmp_path: Path,

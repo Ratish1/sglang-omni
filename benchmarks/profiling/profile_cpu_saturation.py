@@ -103,6 +103,41 @@ def _artifact_index(root: Path) -> dict[str, Any]:
     }
 
 
+def _nsys_stats_contract(
+    *, cpu_only: bool
+) -> tuple[list[str], dict[str, tuple[str, ...]]]:
+    reports = ["nvtx_sum", "osrt_sum"]
+    required_coverage = {
+        "NVTX capture window": ("sglang_omni.capture_window",),
+        "request-build total": ("request_build.total",),
+        "request audio load": ("request_build.audio_load",),
+        "request feature extraction": ("request_build.feature_extract",),
+        "request tokenize/pack": ("request_build.tokenize_and_pack",),
+        "request pre-LM wait": ("request_build.pre_lm_wait",),
+        "pre-LM encode": ("pre_lm.encode",),
+        "pre-LM synchronize": ("pre_lm.synchronize",),
+        "pre-LM split embeddings": ("pre_lm.split_embeddings",),
+        "scheduler receive/admit": ("scheduler.recv_and_admit",),
+        "scheduler batch selection": ("scheduler.select_batch",),
+        "scheduler model execution": (
+            "scheduler.model_launch",
+            "scheduler.model_execute",
+        ),
+        "scheduler model resolution": ("scheduler.model_resolve",),
+        "scheduler result processing": ("scheduler.result_process",),
+        "OS runtime": ("os runtime", "poll", "pthread"),
+    }
+    if not cpu_only:
+        reports[1:1] = ["cuda_api_sum", "cuda_gpu_kern_sum"]
+        required_coverage.update(
+            {
+                "CUDA API": ("cuda",),
+                "CUDA kernel": ("kernel", "gpu"),
+            }
+        )
+    return reports, required_coverage
+
+
 def _dataset_manifest(
     samples: list[Any],
     measurement_samples: list[Any],
@@ -1939,20 +1974,15 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             retained_report = artifact_dir / "nsight" / report_path.name
             retained_report.parent.mkdir(parents=True, exist_ok=False)
             shutil.copy2(report_path, retained_report)
+            stats_reports, required_coverage = _nsys_stats_contract(
+                cpu_only=args.nsys_cpu_only
+            )
+            stats_argv = ["nsys", "stats"]
+            for report in stats_reports:
+                stats_argv.extend(["--report", report])
+            stats_argv.append(str(retained_report))
             stats_capture = capture_command(
-                [
-                    "nsys",
-                    "stats",
-                    "--report",
-                    "nvtx_sum",
-                    "--report",
-                    "cuda_api_sum",
-                    "--report",
-                    "cuda_gpu_kern_sum",
-                    "--report",
-                    "osrt_sum",
-                    str(retained_report),
-                ],
+                stats_argv,
                 timeout_s=args.nsys_stats_timeout_s,
             )
             write_json(
@@ -1971,12 +2001,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                     "nsys stats failed: "
                     f"{stats_capture.stderr[-1000:] or stats_capture.stdout[-1000:]}"
                 )
-            for label, tokens in {
-                "NVTX capture window": ("sglang_omni.capture_window",),
-                "CUDA API": ("cuda",),
-                "CUDA kernel": ("kernel", "gpu"),
-                "OS runtime": ("os runtime", "poll", "pthread"),
-            }.items():
+            for label, tokens in required_coverage.items():
                 lowered = stats_text.lower()
                 if not any(token.lower() in lowered for token in tokens):
                     integrity_errors.append(
@@ -1989,6 +2014,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "sha256": _file_sha256(retained_report),
                 "mtime_ns": retained_report.stat().st_mtime_ns,
                 "stats_path": str(artifact_dir / "nsight" / "stats.json"),
+                "capture_contract": (
+                    "cpu-only" if args.nsys_cpu_only else "joint-cpu-cuda"
+                ),
+                "cuda_required": not args.nsys_cpu_only,
             }
 
     result_payload["accepted"] = not integrity_errors
@@ -2168,6 +2197,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--with-flops", action="store_true")
     parser.add_argument("--no-cuda", action="store_true")
     parser.add_argument("--nsys-report")
+    parser.add_argument(
+        "--nsys-cpu-only",
+        action="store_true",
+        help=(
+            "Accept an Nsight report with NVTX/OS/Python/thread scheduling "
+            "coverage but no CUDA activity. Use only when the host's "
+            "Nsight/CUPTI/driver path cannot safely trace CUDA; collect GPU "
+            "telemetry independently."
+        ),
+    )
     parser.add_argument("--nsys-finalize-timeout-s", type=float, default=180.0)
     parser.add_argument("--nsys-stats-timeout-s", type=float, default=180.0)
     parser.add_argument("--stream", action="store_true")
@@ -2200,6 +2239,13 @@ def main() -> None:
         )
     if args.mode == "nsys" and not args.nsys_report:
         raise ValueError("--nsys-report is required in nsys mode")
+    if args.nsys_cpu_only and args.mode != "nsys":
+        raise ValueError("--nsys-cpu-only is valid only in nsys mode")
+    if args.nsys_cpu_only and "gpu-dmon" not in _requested_collectors(args):
+        raise ValueError(
+            "--nsys-cpu-only requires the gpu-dmon collector because CUDA "
+            "tracing is intentionally disabled"
+        )
     if not 0 < args.stability_tolerance < 1:
         raise ValueError("--stability-tolerance must be between 0 and 1")
     if not 0 <= args.max_thread_cpu_accounting_error <= 1:
