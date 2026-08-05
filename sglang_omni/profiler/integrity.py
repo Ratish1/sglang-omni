@@ -301,10 +301,10 @@ def validate_request_lifecycle(
         ("pre_lm_split_start", "pre_lm_split_end"),
         ("pre_lm_gpu_wait_start", "pre_lm_gpu_complete"),
     )
-    batch_members: dict[str, dict[str, set[str]]] = defaultdict(
+    pre_lm_batch_members: dict[str, dict[str, set[str]]] = defaultdict(
         lambda: defaultdict(set)
     )
-    batch_sizes: dict[str, set[int]] = defaultdict(set)
+    pre_lm_batch_sizes: dict[str, set[int]] = defaultdict(set)
     for request_id, request_events in by_request.items():
         names = [str(event.get("event_name")) for event in request_events]
         counts = Counter(names)
@@ -392,18 +392,20 @@ def validate_request_lifecycle(
                 )
 
         for event in request_events:
+            name = str(event.get("event_name"))
+            if not name.startswith("pre_lm_"):
+                continue
             metadata = event.get("metadata") or {}
             batch_id = metadata.get("batch_id")
             if not batch_id:
                 continue
-            name = str(event.get("event_name"))
-            batch_members[str(batch_id)][name].add(request_id)
+            pre_lm_batch_members[str(batch_id)][name].add(request_id)
             batch_size = metadata.get("batch_size")
             if isinstance(batch_size, int):
-                batch_sizes[str(batch_id)].add(batch_size)
+                pre_lm_batch_sizes[str(batch_id)].add(batch_size)
 
-    for batch_id, by_name in batch_members.items():
-        if len(batch_sizes[batch_id]) > 1:
+    for batch_id, by_name in pre_lm_batch_members.items():
+        if len(pre_lm_batch_sizes[batch_id]) > 1:
             report.fail(f"pre-LM batch {batch_id} reports conflicting batch sizes")
         starts = by_name.get("pre_lm_batch_start", set())
         ends = by_name.get("pre_lm_batch_end", set())
@@ -412,8 +414,8 @@ def validate_request_lifecycle(
                 f"pre-LM batch {batch_id} start/end membership differs "
                 f"({len(starts)} vs {len(ends)})"
             )
-        if batch_sizes[batch_id]:
-            expected_size = next(iter(batch_sizes[batch_id]))
+        if pre_lm_batch_sizes[batch_id]:
+            expected_size = next(iter(pre_lm_batch_sizes[batch_id]))
             if starts and len(starts) != expected_size:
                 report.fail(
                     f"pre-LM batch {batch_id} membership {len(starts)} "
@@ -426,7 +428,7 @@ def validate_request_lifecycle(
             "paths": paths,
             "requests": len(by_request),
             "events": len(events),
-            "batches": len(batch_members),
+            "batches": len(pre_lm_batch_members),
         }
     )
     return report

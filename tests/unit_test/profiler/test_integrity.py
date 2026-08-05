@@ -197,6 +197,90 @@ def test_request_lifecycle_accepts_complete_cpu_bottleneck_chain(
     assert report.valid, report.errors
 
 
+def test_request_lifecycle_ignores_scheduler_batch_size_changes(
+    tmp_path: Path,
+) -> None:
+    events = [
+        {
+            "request_id": "r1",
+            "stage": "asr",
+            "event_name": name,
+            "timestamp_ns": sequence,
+            "monotonic_ns": sequence,
+            "source_sequence": sequence,
+            "run_id": "run",
+            "pid": 1,
+            "native_tid": 2,
+            "metadata": {
+                "batch_id": "1:7",
+                "batch_size": batch_size,
+            },
+        }
+        for sequence, (name, batch_size) in enumerate(
+            (
+                ("scheduler.model_launch_start", 9),
+                ("scheduler.model_launch_end", 9),
+                ("scheduler.model_resolve_start", 8),
+                ("scheduler.model_resolve_end", 8),
+            ),
+            1,
+        )
+    ]
+    path = tmp_path / "events_asr_1.jsonl"
+    path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    report = validate_request_lifecycle(
+        [str(path)],
+        expected_request_ids={"r1"},
+    )
+
+    assert report.valid, report.errors
+    assert report.artifacts[0]["batches"] == 0
+
+
+def test_request_lifecycle_rejects_conflicting_pre_lm_batch_sizes(
+    tmp_path: Path,
+) -> None:
+    events = [
+        {
+            "request_id": "r1",
+            "stage": "asr",
+            "event_name": name,
+            "timestamp_ns": sequence,
+            "monotonic_ns": sequence,
+            "source_sequence": sequence,
+            "run_id": "run",
+            "pid": 1,
+            "native_tid": 2,
+            "metadata": {
+                "batch_id": "pre-lm-1",
+                "batch_size": batch_size,
+            },
+        }
+        for sequence, (name, batch_size) in enumerate(
+            (
+                ("pre_lm_batch_start", 1),
+                ("pre_lm_future_publish", 2),
+                ("pre_lm_batch_end", 1),
+            ),
+            1,
+        )
+    ]
+    path = tmp_path / "events_asr_1.jsonl"
+    path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    report = validate_request_lifecycle([str(path)])
+
+    assert not report.valid
+    assert any("conflicting batch sizes" in error for error in report.errors)
+
+
 def test_request_lifecycle_rejects_ready_future_never_drained(
     tmp_path: Path,
 ) -> None:
