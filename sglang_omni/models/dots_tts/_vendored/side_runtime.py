@@ -180,6 +180,9 @@ class DotsTtsSideCore(nn.Module):
 class DotsTtsSideModel(nn.Module):
     """Dots inference side modules without an owned Qwen2 backbone."""
 
+    # SGLang executes side modules from a scheduler thread; Inductor CUDA Graph
+    # state used by reduce-overhead mode is thread-local.
+    _compile_mode_override = "default"
     _GENERATE_LENGTH_BUCKETS = DotsTtsModel._GENERATE_LENGTH_BUCKETS
     _COMPILE_TARGETS = DotsTtsModel._COMPILE_TARGETS
     _PROMPT_FEATURE_CACHE_MAX_ENTRIES = DotsTtsModel._PROMPT_FEATURE_CACHE_MAX_ENTRIES
@@ -471,6 +474,7 @@ class DotsTtsSideModel(nn.Module):
         fm_state: Any,
         hidden_state: torch.Tensor,
     ) -> None:
+        fm_state.llm_hiddens = hidden_state
         self._append_hidden_chunk(fm_state, hidden_state)
 
     def decode_audio_step(

@@ -77,7 +77,7 @@ def test_side_model_decode_audio_step_returns_payload_and_feedback() -> None:
     model = DotsTtsSideModel.__new__(DotsTtsSideModel)
     nn.Module.__init__(model)
     model.core = FakeCore()
-    fm_state = {"history": []}
+    fm_state = SimpleNamespace(llm_hiddens=None)
     calls = []
     model._append_hidden_chunk = lambda state, hidden: calls.append(
         ("append_hidden", state, hidden)
@@ -86,9 +86,13 @@ def test_side_model_decode_audio_step_returns_payload_and_feedback() -> None:
     model._encode_audio_patch_feedback = lambda state, *, audio_patch: (
         audio_patch.mean(dim=1, keepdim=True)
     )
-    model._should_stop_after_current_audio = lambda state, *, eos_threshold: True
-
     hidden_state = torch.zeros(1, 1, 4)
+
+    def should_stop(state, *, eos_threshold):
+        assert state.llm_hiddens is hidden_state
+        return True
+
+    model._should_stop_after_current_audio = should_stop
     result = model.decode_audio_step(
         fm_state=fm_state,
         generation_kwargs={
@@ -239,6 +243,22 @@ def test_side_model_batched_flow_calls_core_once_for_two_rows() -> None:
     assert torch.equal(result.latent_patches[1], torch.full((1, 4, 3), 11.0))
     assert torch.equal(result.feedback_embeddings[0], torch.zeros(1, 1, 3))
     assert torch.equal(result.feedback_embeddings[1], torch.ones(1, 1, 3))
+
+
+def test_side_model_compile_avoids_cross_thread_cudagraph_mode(monkeypatch) -> None:
+    model = DotsTtsSideModel.__new__(DotsTtsSideModel)
+    nn.Module.__init__(model)
+    model._compiled_models = {}
+    compile_kwargs = {}
+
+    def fake_compile(fn, **kwargs):
+        compile_kwargs.update(kwargs)
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    model._compile_callable("FM.meanflow.solver_step", lambda: None)
+
+    assert compile_kwargs["mode"] == "default"
 
 
 def test_allocate_generate_state_uses_request_owned_fm_buffers() -> None:

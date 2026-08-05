@@ -211,7 +211,7 @@ class DotsTtsModel(nn.Module):
         cache_key = (key, signature)
         compiled = self._compiled_models.get(cache_key)
         if compiled is None:
-            mode = (
+            mode = getattr(self, "_compile_mode_override", None) or (
                 "default" if key == "patch_encoder.decode_patch" else "reduce-overhead"
             )
             compiled = torch.compile(
