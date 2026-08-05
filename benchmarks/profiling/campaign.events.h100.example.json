@@ -39,7 +39,7 @@
     "--workload-contract",
     "direct-steady-miss",
     "--concurrency",
-    "64",
+    "32",
     "--max-samples",
     "1088",
     "--profile-samples",

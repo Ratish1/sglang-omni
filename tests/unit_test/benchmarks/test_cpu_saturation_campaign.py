@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,10 @@ from benchmarks.profiling.run_cpu_saturation_campaign import (
     _harness_argv,
     build_trial_plan,
 )
+
+
+def _arg_value(argv: list[str], name: str) -> str:
+    return argv[argv.index(name) + 1]
 
 
 def test_two_condition_plan_forms_abba_and_balances_restarts() -> None:
@@ -57,6 +62,22 @@ def test_campaign_does_not_misidentify_coordinator_as_stage_pid(tmp_path) -> Non
     )
     assert "--server-pid" not in argv
     assert argv[-4:] == ["--run-id", "trial-1", "--output-dir", str(tmp_path)]
+
+
+def test_h100_campaign_separates_request_concurrency_from_cpu_stress() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    config = json.loads(
+        (
+            repo_root / "benchmarks/profiling/campaign.events.h100.example.json"
+        ).read_text(encoding="utf-8")
+    )
+    conditions = {item["name"]: item for item in config["conditions"]}
+
+    assert _arg_value(config["harness_args"], "--concurrency") == "32"
+    assert "--max-queued-requests" not in config["server"]["argv"]
+    assert (
+        _arg_value(conditions["unbound-cpu64"]["interferer_argv"], "--workers") == "64"
+    )
 
 
 def test_interferer_cpu_list_parser_rejects_ambiguous_placement() -> None:

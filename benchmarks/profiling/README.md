@@ -21,6 +21,16 @@ This is the first command to run after the code gate. It owns every server
 restart, alternates quiet and 64-process CPU-stress trials in A/B/B/A order,
 and executes exactly five fresh-server trials per condition.
 
+The checked campaign uses client concurrency 32 independently of the 64 CPU
+interferer processes. Fun-ASR has 16 pending request-build slots plus a
+16-request backlog under its default server configuration, and its documented
+single-worker results complete without shedding through concurrency 32.
+Concurrency 64 can overflow that admission boundary—especially under the
+stressed condition—and turns the comparison into a rejection experiment.
+Do not raise `max_queued_requests` in this primary campaign: a queue-lifted
+concurrency-64 run is a separate admission/queueing experiment and must not
+replace the matched zero-failure attribution matrix.
+
 ```bash
 MODEL_REVISION="$(
   python - <<'PY'
@@ -55,6 +65,12 @@ actually different (GPU index, port, corpus size, or server flags). Do not
 insert CPU binding into this first campaign: its purpose is to reproduce and
 localize the unbound quiet-versus-64-loop delta. The harness resolves the ASR
 worker PID; never substitute the coordinator PID.
+
+Here, “64-loop” means the 64-process CPU interferer, not client concurrency.
+If concurrency 32 does not complete 100% on a different model or server
+configuration, first run an unprofiled concurrency sweep and use the highest
+shared zero-rejection level that still reaches the throughput plateau. Record
+that deviation and use the same level for every condition.
 
 The campaign is accepted only when all ten trials complete, every
 `result.json` has `accepted=true`, `integrity.valid=true`,
