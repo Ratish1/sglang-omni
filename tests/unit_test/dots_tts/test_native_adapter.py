@@ -2,14 +2,43 @@
 
 from __future__ import annotations
 
+import base64
+import io
+import wave
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
-from sglang_omni.models.dots_tts._vendored.side_runtime import DotsTtsSideModel
+from sglang_omni.models.dots_tts._vendored.side_runtime import (
+    DotsTtsSideModel,
+    DotsTtsSideRuntime,
+)
 from sglang_omni.models.dots_tts.native_adapter import DotsTTSNativeAdapter
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
+
+
+def test_side_runtime_loads_speech_data_uri() -> None:
+    samples = (
+        np.sin(np.linspace(0, 20 * np.pi, 4000)) * np.iinfo(np.int16).max
+    ).astype("<i2")
+    wav = io.BytesIO()
+    with wave.open(wav, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(8000)
+        writer.writeframes(samples.tobytes())
+    uri = "data:audio/wav;base64," + base64.b64encode(wav.getvalue()).decode()
+    runtime = DotsTtsSideRuntime.__new__(DotsTtsSideRuntime)
+    runtime.sample_rate = 8000
+
+    audio = runtime._load_prompt_audio(uri)
+
+    assert audio.ndim == 2
+    assert audio.shape[0] == 1
+    assert audio.dtype == torch.float32
+    assert audio.numel() > 0
 
 
 class FakeNativeModel:

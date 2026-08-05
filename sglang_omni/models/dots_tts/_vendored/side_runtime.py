@@ -47,7 +47,6 @@ from sglang_omni.models.dots_tts._vendored.modules.speaker.encoder import (
     SpeakerXVectorFeatures,
 )
 from sglang_omni.models.dots_tts._vendored.modules.vocoder.bigvgan import AudioVAE
-from sglang_omni.models.dots_tts._vendored.utils.audio import high_quality_resample
 from sglang_omni.models.dots_tts._vendored.utils.profiling import measure_inference
 from sglang_omni.models.dots_tts._vendored.utils.tokenizer import (
     AUDIO_COMP_SPAN_TOKEN,
@@ -72,6 +71,7 @@ from sglang_omni.models.dots_tts.text_preprocessing import (
     process_prompt_text,
     process_text,
 )
+from sglang_omni.utils.audio import load_audio
 
 RUNTIME_TEMPLATE_BY_NAME = {
     "tts": DEFAULT_TTS_TEMPLATE,
@@ -942,14 +942,14 @@ class DotsTtsSideRuntime:
         return digest[:16]
 
     def _load_prompt_audio(self, prompt_audio_path: str) -> torch.Tensor:
-        prompt_audio, sample_rate = librosa.load(prompt_audio_path, sr=None, mono=True)
+        prompt_audio = load_audio(
+            prompt_audio_path,
+            source_name="dots.tts prompt",
+            target_sample_rate=self.sample_rate,
+            mono=True,
+        )
         prompt_audio = librosa.effects.trim(prompt_audio, top_db=30)[0]
         prompt_audio = torch.from_numpy(prompt_audio).unsqueeze(0)
-        prompt_audio = high_quality_resample(
-            prompt_audio,
-            orig_sr=sample_rate,
-            target_sr=self.sample_rate,
-        )
         if prompt_audio.ndim == 1:
             prompt_audio = prompt_audio.unsqueeze(0)
         return prompt_audio

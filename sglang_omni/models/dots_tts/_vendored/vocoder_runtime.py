@@ -12,6 +12,7 @@ from safetensors.torch import load_file
 
 from sglang_omni.models.dots_tts._vendored.models.dots_tts.config import ModelConfig
 from sglang_omni.models.dots_tts._vendored.modules.vocoder.bigvgan import AudioVAE
+from sglang_omni.utils.checkpoint import resolve_checkpoint
 
 
 class DotsTTSNativeVocoderModel:
@@ -73,7 +74,7 @@ class DotsTTSNativeVocoderRuntime:
         device: str | None = None,
         **_: Any,
     ) -> "DotsTTSNativeVocoderRuntime":
-        model_path = Path(model_name_or_path).expanduser().resolve()
+        model_path = Path(resolve_checkpoint(model_name_or_path)).expanduser().resolve()
         missing = [
             name for name in cls.REQUIRED_FILES if not (model_path / name).is_file()
         ]

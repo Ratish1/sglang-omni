@@ -52,6 +52,7 @@ def test_dots_tts_config_and_registry_contracts() -> None:
     )
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
     assert {stage.process for stage in config.stages} == {"pipeline"}
+    assert config.supports_uploaded_voice_references() is True
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("DotsTTSForConditionalGeneration")
         is DotsTTSPipelineConfig
@@ -59,6 +60,46 @@ def test_dots_tts_config_and_registry_contracts() -> None:
     assert (
         architecture_from_hf_config(SimpleNamespace(model_type="dots_tts"))
         == "DotsTTSForConditionalGeneration"
+    )
+
+
+def test_dots_tts_rejects_tensor_parallel_config() -> None:
+    from sglang_omni.models.dots_tts.config import DotsTTSPipelineConfig
+
+    config_data = DotsTTSPipelineConfig(model_path="model").model_dump()
+    latent_stage = next(
+        stage for stage in config_data["stages"] if stage["name"] == "latent_engine"
+    )
+    latent_stage["tp_size"] = 2
+    latent_stage["parallelism"] = {"tp": 2}
+    latent_stage["gpu"] = [0, 1]
+
+    with pytest.raises(ValueError, match="tp_size=1"):
+        DotsTTSPipelineConfig(**config_data)
+
+
+def test_dots_tts_checkpoint_view_resolves_huggingface_model_id(
+    monkeypatch, tmp_path
+) -> None:
+    from sglang_omni.models.dots_tts import stages
+
+    (tmp_path / "llm_config.json").write_text('{"model_type": "qwen2"}')
+    (tmp_path / "config.json").write_text('{"model_type": "dots_tts"}')
+    monkeypatch.setattr(
+        stages,
+        "resolve_checkpoint",
+        lambda model_path: str(tmp_path),
+        raising=False,
+    )
+    monkeypatch.setattr(stages, "_SGLANG_VIEW_ROOT", tmp_path / "views")
+
+    view = stages._ensure_sglang_llm_checkpoint_view("dots-studio/dots.tts-mf")
+
+    assert (stages.Path(view) / "config.json").read_text() == (
+        tmp_path / "llm_config.json"
+    ).read_text()
+    assert (stages.Path(view) / "dots_config.json").resolve() == (
+        tmp_path / "config.json"
     )
 
 
@@ -109,6 +150,32 @@ def test_dots_tts_preprocessing_reads_explicit_speech_generation_params() -> Non
     state = DotsTTSState.from_dict(prepared.data)
 
     assert state.max_generate_length == 12
+
+
+def test_dots_tts_preprocessing_reads_latent_stage_params() -> None:
+    from sglang_omni.models.dots_tts.payload_types import DotsTTSState
+    from sglang_omni.models.dots_tts.stages import preprocess_dots_tts_payload
+
+    payload = make_payload(
+        inputs="hello",
+        params={
+            "stage_params": {
+                "latent_engine": {
+                    "num_steps": 4,
+                    "guidance_scale": 1.1,
+                    "speaker_scale": 1.25,
+                    "ode_method": "midpoint",
+                }
+            }
+        },
+    )
+
+    state = DotsTTSState.from_dict(preprocess_dots_tts_payload(payload).data)
+
+    assert state.num_steps == 4
+    assert state.guidance_scale == 1.1
+    assert state.speaker_scale == 1.25
+    assert state.ode_method == "midpoint"
 
 
 def test_dots_tts_latent_engine_alias_uses_sglang_path(monkeypatch) -> None:
@@ -383,6 +450,7 @@ def test_create_sglang_latent_engine_executor_uses_sglang_factory(monkeypatch) -
     assert captured["server_args_call"][0] == "dots-model-llm-view"
     assert captured["server_args_call"][1] == 4096
     assert captured["server_args_call"][2]["disable_cuda_graph"] is True
+    assert captured["server_args_call"][2]["disable_radix_cache"] is True
     assert captured["server_args_call"][2]["dtype"] == "bfloat16"
     assert captured["infra_call"][2] == "DotsTTSForConditionalGeneration"
     assert captured["output_processor_kwargs"]["capture_hidden"] is True
@@ -461,11 +529,15 @@ def test_create_sglang_latent_engine_accepts_concurrent_requests(monkeypatch) ->
 
     scheduler = stages.create_sglang_latent_engine_executor(
         "dots-model",
-        server_args_overrides={"max_running_requests": 2},
+        server_args_overrides={
+            "max_running_requests": 2,
+            "disable_radix_cache": False,
+        },
     )
 
     assert scheduler is not None
     assert captured["overrides"]["max_running_requests"] == 2
+    assert captured["overrides"]["disable_radix_cache"] is True
 
 
 def test_create_sglang_latent_engine_rejects_tensor_parallel() -> None:

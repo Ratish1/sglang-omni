@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+from sglang.srt.model_executor.forward_context import has_forward_context
 
 from sglang_omni.models.dots_tts.model_runner import DotsTTSModelRunner
 from sglang_omni.models.dots_tts.request_builders import DotsTTSSGLangRequestData
@@ -47,7 +48,7 @@ def test_post_prefill_reads_hidden_state_from_logits_output() -> None:
 def test_post_prefill_reshapes_2d_hidden_state() -> None:
     runner = make_runner()
     data = DotsTTSSGLangRequestData()
-    data.req = SimpleNamespace(extend_input_len=3)
+    data.req = SimpleNamespace(extend_range=SimpleNamespace(length=3))
     sched_req = SimpleNamespace(data=data)
     hidden = torch.arange(3 * 4, dtype=torch.float32).reshape(3, 4)
     result = SimpleNamespace(
@@ -63,9 +64,9 @@ def test_post_prefill_reshapes_2d_hidden_state() -> None:
 def test_post_prefill_slices_packed_hidden_by_extend_lengths() -> None:
     runner = make_runner()
     first = DotsTTSSGLangRequestData()
-    first.req = SimpleNamespace(extend_input_len=2)
+    first.req = SimpleNamespace(extend_range=SimpleNamespace(length=2))
     second = DotsTTSSGLangRequestData()
-    second.req = SimpleNamespace(extend_input_len=3)
+    second.req = SimpleNamespace(extend_range=SimpleNamespace(length=3))
     requests = [SimpleNamespace(data=first), SimpleNamespace(data=second)]
     hidden = torch.arange(5 * 4, dtype=torch.float32).reshape(5, 4)
     result = SimpleNamespace(
@@ -82,7 +83,7 @@ def test_post_prefill_slices_packed_hidden_by_extend_lengths() -> None:
 def test_post_prefill_reads_2d_batch_hidden_state() -> None:
     runner = make_runner()
     data = DotsTTSSGLangRequestData()
-    data.req = SimpleNamespace(extend_input_len=23)
+    data.req = SimpleNamespace(extend_range=SimpleNamespace(length=23))
     sched_req = SimpleNamespace(data=data)
     hidden = torch.arange(4, dtype=torch.float32).reshape(1, 4)
     result = SimpleNamespace(
@@ -98,9 +99,9 @@ def test_post_prefill_reads_2d_batch_hidden_state() -> None:
 def test_post_decode_reads_2d_hidden_state_by_batch_row() -> None:
     runner = make_runner()
     first = DotsTTSSGLangRequestData()
-    first.req = SimpleNamespace(extend_input_len=2)
+    first.req = SimpleNamespace(extend_range=SimpleNamespace(length=2))
     second = DotsTTSSGLangRequestData()
-    second.req = SimpleNamespace(extend_input_len=3)
+    second.req = SimpleNamespace(extend_range=SimpleNamespace(length=3))
     requests = [SimpleNamespace(data=first), SimpleNamespace(data=second)]
     hidden = torch.arange(2 * 4, dtype=torch.float32).reshape(2, 4)
     result = SimpleNamespace(
@@ -112,6 +113,54 @@ def test_post_decode_reads_2d_hidden_state_by_batch_row() -> None:
 
     assert torch.equal(first.latest_hidden_state, hidden[0:1].unsqueeze(0))
     assert torch.equal(second.latest_hidden_state, hidden[1:2].unsqueeze(0))
+
+
+def test_prefill_input_embeds_follow_live_extend_range() -> None:
+    runner = make_runner()
+    data = DotsTTSSGLangRequestData(
+        prefill_input_embeds=torch.arange(5 * 4, dtype=torch.float32).reshape(5, 4)
+    )
+    data.req = SimpleNamespace(
+        extend_range=SimpleNamespace(length=2),
+        prefix_indices=[0, 1, 2],
+    )
+    forward_batch = SimpleNamespace(input_ids=torch.tensor([10, 11]))
+
+    actual = runner._build_prefill_input_embeds(
+        forward_batch, [SimpleNamespace(data=data)]
+    )
+
+    assert torch.equal(actual, data.prefill_input_embeds[3:5])
+
+
+def test_custom_prefill_forward_enters_attention_context() -> None:
+    class FakeModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.param = torch.nn.Parameter(torch.ones(()))
+
+        def forward(self, **kwargs):
+            assert has_forward_context()
+            return SimpleNamespace(hidden_states=torch.ones(1, 1, 4))
+
+    runner = make_runner()
+    runner.model = FakeModel()
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda fb: None)
+        )
+    )
+    data = DotsTTSSGLangRequestData(prefill_input_embeds=torch.ones(2, 4))
+    data.req = SimpleNamespace(
+        extend_range=SimpleNamespace(length=2), prefix_indices=[]
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.tensor([0, 1]),
+        positions=torch.tensor([0, 1]),
+        mrope_positions=None,
+    )
+
+    runner.custom_prefill_forward(forward_batch, None, [SimpleNamespace(data=data)])
 
 
 def test_before_decode_writes_pending_feedback_embedding() -> None:
@@ -139,6 +188,7 @@ def test_runner_uses_model_latent_decode_step() -> None:
             raise AssertionError("runner should use forward_latent_decode_step")
 
         def forward_latent_decode_step(self, **kwargs):
+            assert has_forward_context()
             calls.append(kwargs)
             batch_result = SimpleNamespace(
                 next_token_ids=torch.tensor([0]),

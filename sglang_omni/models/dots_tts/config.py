@@ -22,6 +22,7 @@ class DotsTTSPipelineConfig(PipelineConfig):
     """3-stage dots.tts pipeline: preprocessing -> latent_engine -> vocoder."""
 
     architecture: ClassVar[str] = "DotsTTSForConditionalGeneration"
+    requires_model_capabilities: ClassVar[bool] = True
     architecture_aliases: ClassVar[tuple[str, ...]] = (
         "dots_tts",
         "DotsTtsModel",
@@ -54,6 +55,18 @@ class DotsTTSPipelineConfig(PipelineConfig):
             can_accept_stream_before_payload=True,
         ),
     ]
+
+    def model_post_init(self, __context: object = None) -> None:
+        super().model_post_init(__context)
+        if any(stage.tp_size != 1 for stage in self.stages):
+            raise ValueError("dots.tts currently supports tp_size=1 only")
+
+    @classmethod
+    def generation_sglang_role_to_stage(cls) -> dict[str, str]:
+        return {"generation": "latent_engine"}
+
+    def supports_uploaded_voice_references(self) -> bool:
+        return True
 
 
 EntryClass = DotsTTSPipelineConfig

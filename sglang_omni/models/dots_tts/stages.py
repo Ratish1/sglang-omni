@@ -30,6 +30,7 @@ from sglang_omni.scheduling.sglang_backend import (
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
+from sglang_omni.utils.checkpoint import resolve_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ _SGLANG_VIEW_ROOT = Path("/tmp/sglang_omni_dots_tts_llm_views")
 def _ensure_sglang_llm_checkpoint_view(model_path: str) -> str:
     """Create a local checkpoint view whose config.json is dots llm_config.json."""
 
-    root = Path(model_path).expanduser().resolve()
+    root = Path(resolve_checkpoint(model_path)).expanduser().resolve()
     llm_config_path = root / "llm_config.json"
     if not llm_config_path.exists():
         raise FileNotFoundError(f"dots TTS checkpoint is missing {llm_config_path}")
@@ -253,6 +254,12 @@ def preprocess_dots_tts_payload(payload: StagePayload) -> StagePayload:
         raise TypeError("dots.tts request params must be a dict")
     if not isinstance(tts_params, dict):
         raise TypeError("dots.tts metadata['tts_params'] must be a dict")
+    stage_params = params.get("stage_params") or {}
+    if not isinstance(stage_params, dict):
+        raise TypeError("dots.tts stage_params must be a dict")
+    latent_params = stage_params.get("latent_engine") or {}
+    if not isinstance(latent_params, dict):
+        raise TypeError("dots.tts latent_engine stage_params must be a dict")
 
     ref = _first_reference(inputs)
     text = inputs.get("input") or inputs.get("text") or ""
@@ -284,6 +291,10 @@ def preprocess_dots_tts_payload(payload: StagePayload) -> StagePayload:
             field_name="max_new_tokens",
         )
         or _optional_positive_int(
+            latent_params.get("max_generate_length"),
+            field_name="max_generate_length",
+        )
+        or _optional_positive_int(
             params.get("max_generate_length"),
             field_name="max_generate_length",
         )
@@ -308,24 +319,28 @@ def preprocess_dots_tts_payload(payload: StagePayload) -> StagePayload:
         speaker_scale=float(
             inputs.get("speaker_scale")
             or tts_params.get("speaker_scale")
+            or latent_params.get("speaker_scale")
             or params.get("speaker_scale")
             or 1.5
         ),
         ode_method=str(
             inputs.get("ode_method")
             or tts_params.get("ode_method")
+            or latent_params.get("ode_method")
             or params.get("ode_method")
             or "euler"
         ),
         num_steps=int(
             inputs.get("num_steps")
             or tts_params.get("num_steps")
+            or latent_params.get("num_steps")
             or params.get("num_steps")
             or 10
         ),
         guidance_scale=float(
             inputs.get("guidance_scale")
             or tts_params.get("guidance_scale")
+            or latent_params.get("guidance_scale")
             or params.get("guidance_scale")
             or 1.2
         ),
@@ -343,7 +358,10 @@ def preprocess_dots_tts_payload(payload: StagePayload) -> StagePayload:
         ),
         max_generate_length=max_generate_length,
         seed=_optional_seed(
-            inputs.get("seed") or tts_params.get("seed") or params.get("seed")
+            inputs.get("seed")
+            or tts_params.get("seed")
+            or latent_params.get("seed")
+            or params.get("seed")
         ),
         stream=bool(params.get("stream", False)),
     )
@@ -656,6 +674,8 @@ def create_sglang_latent_engine_executor(
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    # Prompt audio is carried by continuous embeddings, not token cache keys.
+    overrides["disable_radix_cache"] = True
     if int(overrides.get("tp_size", 1)) != 1:
         raise ValueError("Dots TTS native latent engine v1 supports only tp_size=1")
 

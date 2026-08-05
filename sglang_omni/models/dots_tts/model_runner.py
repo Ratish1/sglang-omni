@@ -10,6 +10,7 @@ from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.model_runner.sglang_execution import attn_forward_context
 from sglang_omni.models.dots_tts.sglang_model import DotsTTSLatentBatch
 
 
@@ -89,16 +90,17 @@ class DotsTTSModelRunner(ModelRunner):
         positions = forward_batch.positions
         if forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
-        latent_output = self.model.forward_latent_decode_step(
-            input_ids=forward_batch.input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            requests=requests,
-            input_embeds=input_embeds.to(
-                device=forward_batch.input_ids.device,
-                dtype=next(self.model.parameters()).dtype,
-            ),
-        )
+        with attn_forward_context(model_runner.attn_backend):
+            latent_output = self.model.forward_latent_decode_step(
+                input_ids=forward_batch.input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                requests=requests,
+                input_embeds=input_embeds.to(
+                    device=forward_batch.input_ids.device,
+                    dtype=next(self.model.parameters()).dtype,
+                ),
+            )
         return latent_output.batch_result
 
     def _forward_with_input_embeds(
@@ -112,15 +114,16 @@ class DotsTTSModelRunner(ModelRunner):
         positions = forward_batch.positions
         if forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
-        logits_output = self.model(
-            input_ids=forward_batch.input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds.to(
-                device=forward_batch.input_ids.device,
-                dtype=model_dtype,
-            ),
-        )
+        with attn_forward_context(model_runner.attn_backend):
+            logits_output = self.model(
+                input_ids=forward_batch.input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds.to(
+                    device=forward_batch.input_ids.device,
+                    dtype=model_dtype,
+                ),
+            )
         return GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=False,
@@ -143,7 +146,7 @@ class DotsTTSModelRunner(ModelRunner):
                 )
             if embeds.ndim == 3:
                 embeds = embeds.squeeze(0)
-            req_len = int(req.extend_input_len)
+            req_len = int(req.extend_range.length)
             prefix_len = len(req.prefix_indices)
             pieces.append(embeds[prefix_len : prefix_len + req_len])
         return torch.cat(pieces, dim=0).to(device=forward_batch.input_ids.device)
@@ -197,10 +200,10 @@ class DotsTTSModelRunner(ModelRunner):
         for sched_req in requests:
             data = sched_req.data
             req = data.req
-            req_len = int(req.extend_input_len)
+            req_len = int(req.extend_range.length)
             if req_len <= 0:
                 raise RuntimeError(
-                    "dots TTS hidden capture requires extend_input_len > 0"
+                    "dots TTS hidden capture requires extend range length > 0"
                 )
             offset += req_len
             data.latest_hidden_state = hidden_states[offset - 1 : offset].unsqueeze(0)
