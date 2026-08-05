@@ -432,14 +432,17 @@ export NSYS_NVTX_PROFILER_REGISTER_ONLY=0
 
 nsys --version
 nsys profile --help | grep -E \
-  -- '--cpuctxsw|--python-sampling|--python-sampling-frequency|python-gil'
+  -- '--cpuctxsw|--python-sampling|--python-sampling-frequency|cuda-sw|python-gil'
 
 nsys profile \
-  --trace=cuda,nvtx,osrt,python-gil \
+  --trace=cuda-sw,nvtx,osrt,python-gil \
+  --cuda-trace-scope=process-tree \
+  --cuda-event-trace=false \
   --sample=process-tree \
   --cpuctxsw=process-tree \
   --python-sampling=true \
   --python-sampling-frequency=250 \
+  --resolve-symbols=false \
   --capture-range=nvtx \
   --nvtx-capture=sglang_omni.capture_window \
   --capture-range-end=stop \
@@ -452,6 +455,47 @@ nsys profile \
     --stages.asr.factory_args.pre_lm_cache_max_entries=0 \
     --stages.asr.factory_args.pre_lm_cache_size_bytes=0
 ```
+
+Use `cuda-sw` deliberately on H100. Recent Nsight releases prefer CUDA's
+hardware event trace when they consider it available, but NVIDIA documents
+that path as beginning with Blackwell and recommends the legacy software trace
+for unsupported GPUs or incompatible driver/CUPTI combinations. Forcing the
+software path also avoids treating an automatic hardware-trace fallback as an
+accepted capture. `--resolve-symbols=false` prevents report finalization from
+blocking on remote debug-symbol downloads; the Python samples, native thread
+names, NVTX ranges, CUDA API names, and kernel names required by this
+investigation remain in the report.
+
+Before loading model weights, validate the exact selected GPU and driver path
+with a disposable CUDA-context capture:
+
+```bash
+CUDA_VISIBLE_DEVICES="$GPU" nsys profile \
+  --trace=cuda-sw \
+  --cuda-trace-scope=process-tree \
+  --cuda-event-trace=false \
+  --sample=none \
+  --cpuctxsw=none \
+  --resolve-symbols=false \
+  --force-overwrite=true \
+  --output="/tmp/nsys-cuda-sw-smoke-gpu${GPU}" \
+  python - <<'PY'
+import torch
+
+assert torch.cuda.is_available()
+value = torch.ones(1, device="cuda")
+torch.cuda.synchronize()
+assert value.item() == 1.0
+PY
+```
+
+Require a finalized `.nsys-rep` and exit status zero. If this minimal
+`cuda-sw` capture produces the same NVRM reference-state error, stop: the
+remaining blocker is the installed Nsight/CUPTI/driver combination or a stale
+external profiler session, not SGLang-Omni. Do not spend another model startup
+on it. Check for profiler processes owned by the same user and use a
+toolkit-bundled Nsight version compatible with the installed driver; a driver
+reset or host reboot is an operator action, not part of this benchmark.
 
 From another shell:
 
