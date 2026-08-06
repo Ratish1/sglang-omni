@@ -52,7 +52,6 @@ class DotsTTSBatchVocoder(BatchVocoderBase):
             modality="audio",
             source_hint="dots.tts",
         )
-        payload.data["state"] = state.to_dict()
         usage = build_usage(state)
         if usage is not None:
             payload.data["usage"] = usage
@@ -171,7 +170,6 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
         result: dict[str, Any] = {
             "modality": "audio",
             "sample_rate": self.codec.sample_rate,
-            "state": tts_state.to_dict(),
         }
         usage = build_usage(tts_state)
         if usage is not None:

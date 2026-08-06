@@ -16,7 +16,10 @@ from sglang_omni.models.dots_tts.payload_types import (
     load_dots_tts_state,
     store_dots_tts_state,
 )
-from sglang_omni.preprocessing.cache_key import reference_path_cache_key
+from sglang_omni.preprocessing.cache_key import (
+    hash_media_item,
+    reference_path_cache_key,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.reference_encoder import (
     KeyedReferenceEncodeHook,
@@ -132,7 +135,7 @@ class _DotsReferenceHook(KeyedReferenceEncodeHook[str, dict, dict]):
         )
 
     def input_key(self, item: str) -> str | None:
-        return reference_path_cache_key(item, trust_stat=False)
+        return reference_path_cache_key(item, trust_stat=False) or hash_media_item(item)
 
     def encode_one(self, item: str) -> dict:
         return self.codec.encode_reference(item)
