@@ -498,10 +498,26 @@ class DotsTtsAcousticTail:
         self._generators[slot] = None
         self._free_slots.append(slot)
 
-    def set_slot_seed(self, slot: int, seed: int) -> None:
+    def initialize_slot_rng(
+        self,
+        slot: int,
+        *,
+        seed: int | None,
+        rng_state: torch.Tensor | None = None,
+    ) -> None:
         generator = torch.Generator(device=self.device)
-        generator.manual_seed(int(seed))
+        if rng_state is not None:
+            generator.set_state(rng_state.detach().cpu())
+        elif seed is None:
+            generator.seed()
+        else:
+            generator.manual_seed(int(seed))
         self._generators[int(slot)] = generator
+
+    def slot_rng_state(self, slot: int) -> torch.Tensor:
+        generator = self._generators[int(slot)]
+        assert generator is not None
+        return generator.get_state().clone()
 
     def fm_seq_len(self, slot: int) -> int:
         return self._fm_seq_len[int(slot)]
@@ -740,10 +756,7 @@ class DotsTtsAcousticTail:
     def _sample_noise(self, slots: list[int]) -> torch.Tensor:
         shape = (self.spec.latent_patch_size, self.spec.latent_dim)
         generators = [self._generators[slot] for slot in slots]
-        if all(generator is None for generator in generators):
-            return torch.randn(
-                (len(slots), *shape), device=self.device, dtype=self.dtype
-            )
+        assert all(generator is not None for generator in generators)
         return torch.cat(
             [
                 torch.randn(

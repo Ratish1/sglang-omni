@@ -29,6 +29,9 @@ class DotsTTSSGLangRequestData(SGLangARRequestData):
     flow_state: Any = None
     latest_latent_patch: torch.Tensor | None = None
     latent_patches: list[torch.Tensor] = field(default_factory=list)
+    decoded_latent_patches: list[torch.Tensor] = field(default_factory=list)
+    feedback_embeddings: list[torch.Tensor] = field(default_factory=list)
+    flow_rng_state: torch.Tensor | None = None
     stream_metadata: dict[str, Any] | None = None
     chunk_id: int = 0
     control_token_id: int = 0

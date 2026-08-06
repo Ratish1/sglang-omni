@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import torch
@@ -155,6 +156,7 @@ def test_kv_cached_tail_matches_full_recompute() -> None:
     )
     prompt_rows = torch.randn(3 * unit, FM_HIDDEN)
     slot = acoustic_tail.acquire_slot()
+    acoustic_tail.initialize_slot_rng(slot, seed=9)
     acoustic_tail.seed_fm_history(slot, fm_rows=prompt_rows, all_mods=mods)
     sequence = torch.zeros(1, acoustic_tail.spec.dit_cache_tokens + unit, FM_HIDDEN)
     sequence[0, : prompt_rows.size(0)] = prompt_rows
@@ -171,12 +173,130 @@ def test_kv_cached_tail_matches_full_recompute() -> None:
         sequence_len,
         g_cond,
     )
-    torch.manual_seed(9)
     actual = acoustic_tail.sample_patches(
         [slot], fm_hidden_rows=hidden, latent_proj=model.latent_proj
     )
 
     torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+
+
+def test_multi_slot_tail_matches_isolated_reordered_recurrence() -> None:
+    torch.manual_seed(2026)
+    model = _TailModel().eval()
+    batched = _build_tail(model, slots=2)
+    isolated = copy.deepcopy(batched)
+    batched_slots = [batched.acquire_slot(), batched.acquire_slot()]
+    isolated_slots = [isolated.acquire_slot(), isolated.acquire_slot()]
+    unit = batched.spec.unit_len
+    prompt_rows = [
+        torch.randn(2 * unit, FM_HIDDEN),
+        torch.randn(4 * unit, FM_HIDDEN),
+    ]
+    conditions = [torch.randn(1, FM_HIDDEN), torch.randn(1, FM_HIDDEN)]
+    grid = torch.linspace(0.0, 1.0, NFE + 1)
+
+    for row in range(2):
+        mods = batched.dit.build_mods(
+            grid[:-1],
+            duration=grid[1:] - grid[:-1],
+            g_cond=conditions[row],
+        )
+        batched.initialize_slot_rng(batched_slots[row], seed=100 + row)
+        isolated.initialize_slot_rng(isolated_slots[row], seed=100 + row)
+        batched.seed_fm_history(
+            batched_slots[row],
+            fm_rows=prompt_rows[row],
+            all_mods=mods,
+        )
+        isolated.seed_fm_history(
+            isolated_slots[row],
+            fm_rows=prompt_rows[row],
+            all_mods=mods,
+        )
+
+    first_hidden = torch.randn(2, FM_HIDDEN)
+    batched_first = batched.sample_patches(
+        batched_slots,
+        fm_hidden_rows=first_hidden,
+        latent_proj=model.latent_proj,
+    )
+    isolated_first = torch.cat(
+        [
+            isolated.sample_patches(
+                [isolated_slots[row]],
+                fm_hidden_rows=first_hidden[row : row + 1],
+                latent_proj=model.latent_proj,
+            )
+            for row in range(2)
+        ]
+    )
+    torch.testing.assert_close(
+        batched_first,
+        isolated_first,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+
+    batched_feedback = batched.encode_feedback(batched_slots, batched_first)
+    isolated_feedback = torch.cat(
+        [
+            isolated.encode_feedback(
+                [isolated_slots[row]],
+                isolated_first[row : row + 1],
+            )
+            for row in range(2)
+        ]
+    )
+    torch.testing.assert_close(
+        batched_feedback,
+        isolated_feedback,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+
+    second_hidden = torch.randn(2, FM_HIDDEN)
+    reordered = [1, 0]
+    batched_second = batched.sample_patches(
+        [batched_slots[row] for row in reordered],
+        fm_hidden_rows=second_hidden[reordered],
+        latent_proj=model.latent_proj,
+    )
+    isolated_second = torch.cat(
+        [
+            isolated.sample_patches(
+                [isolated_slots[row]],
+                fm_hidden_rows=second_hidden[row : row + 1],
+                latent_proj=model.latent_proj,
+            )
+            for row in reordered
+        ]
+    )
+    torch.testing.assert_close(
+        batched_second,
+        isolated_second,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+
+
+def test_slot_rng_resumes_exactly_after_release_and_reacquire() -> None:
+    acoustic_tail = _build_tail(_TailModel().eval(), slots=1)
+    slot = acoustic_tail.acquire_slot()
+    acoustic_tail.initialize_slot_rng(slot, seed=314)
+    acoustic_tail._sample_noise([slot])
+    saved_state = acoustic_tail.slot_rng_state(slot)
+    expected_next = acoustic_tail._sample_noise([slot])
+
+    acoustic_tail.release_slot(slot)
+    resumed_slot = acoustic_tail.acquire_slot()
+    acoustic_tail.initialize_slot_rng(
+        resumed_slot,
+        seed=None,
+        rng_state=saved_state,
+    )
+    resumed_next = acoustic_tail._sample_noise([resumed_slot])
+
+    torch.testing.assert_close(resumed_next, expected_next, rtol=0, atol=0)
 
 
 def test_tail_slots_are_bounded_and_reusable() -> None:

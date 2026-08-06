@@ -24,6 +24,7 @@ class DotsTTSModelRunner(ModelRunner):
         del schedule_batch
         if not requests:
             return
+        self._release_retracted_flow_states()
         rows = []
         materialized = []
         try:
@@ -35,8 +36,7 @@ class DotsTTSModelRunner(ModelRunner):
                         "dots.tts request is missing its generation schedule"
                     )
                 if data.flow_state is not None:
-                    self.model.flow.release_request(data.flow_state)
-                    data.flow_state = None
+                    self._snapshot_and_release_flow_state(data)
                 self._request_data.pop(request.request_id, None)
                 flow_state, prompt_embeddings = self.model.flow.new_request(
                     max_audio_patch_count=int(data.span_positions.numel()),
@@ -44,6 +44,7 @@ class DotsTTSModelRunner(ModelRunner):
                     speaker_embedding=data.state.speaker_embedding,
                     speaker_scale=data.state.speaker_scale,
                     seed=data.state.seed,
+                    rng_state=data.flow_rng_state,
                 )
                 data.flow_state = flow_state
                 self._request_data[request.request_id] = data
@@ -62,9 +63,21 @@ class DotsTTSModelRunner(ModelRunner):
                     )
                 prefix_len = len(data.req.prefix_indices)
                 req_len = int(data.req.extend_range.length)
-                if prefix_len:
-                    raise RuntimeError("dots.tts radix prefix reuse is unsupported")
-                rows.append(embeddings[0, :req_len])
+                assert prefix_len == 0, "dots.tts radix prefix reuse is disabled"
+                prompt_len = embeddings.size(1)
+                assert req_len >= prompt_len
+                generated_count = req_len - prompt_len
+                assert generated_count == len(data.req.output_ids)
+                assert len(data.feedback_embeddings) >= generated_count
+                request_rows = [embeddings[0]]
+                if generated_count:
+                    request_rows.append(
+                        torch.stack(
+                            data.feedback_embeddings[:generated_count],
+                            dim=0,
+                        ).to(device=device, dtype=embeddings.dtype)
+                    )
+                rows.append(torch.cat(request_rows, dim=0))
             forward_batch.input_embeds = torch.cat(rows, dim=0)
         except BaseException:
             for request_id, data in materialized:
@@ -143,6 +156,7 @@ class DotsTTSModelRunner(ModelRunner):
                 audio_span_token_ids=set(data.state.audio_span_token_ids),
                 generation_schedule=data.generation_schedule.to(hidden.device),
                 prefill_end=data.prefill_end,
+                decoded_latent_patches=data.decoded_latent_patches,
             )
             last_hidden.append(request_hidden[0, -1])
             offset += length
@@ -190,11 +204,14 @@ class DotsTTSModelRunner(ModelRunner):
         )
         next_token_ids = []
         for data, step in zip(data_rows, steps, strict=True):
-            data.pending_feedback_queue.append(step.feedback_embedding.detach())
+            feedback = step.feedback_embedding.detach().clone()
+            data.feedback_embeddings.append(feedback)
+            data.pending_feedback_queue.append(feedback)
+            decoded_latent = step.latent_patch.detach().clone()
+            data.decoded_latent_patches.append(decoded_latent)
             if step.emit:
-                latent = step.latent_patch.detach()
-                data.latest_latent_patch = latent
-                data.latent_patches.append(latent)
+                data.latest_latent_patch = decoded_latent
+                data.latent_patches.append(decoded_latent)
             next_token_ids.append(data.control_token_id)
             if step.finished:
                 data.req.finished_reason = FINISH_MATCHED_TOKEN(data.control_token_id)
@@ -222,6 +239,19 @@ class DotsTTSModelRunner(ModelRunner):
         req_data = self._request_data.pop(request_id, None)
         if req_data is not None:
             self._clear_request_data(req_data)
+
+    def _release_retracted_flow_states(self) -> None:
+        for req_data in self._request_data.values():
+            if req_data.flow_state is not None and req_data.req.is_retracted:
+                self._snapshot_and_release_flow_state(req_data)
+
+    def _snapshot_and_release_flow_state(self, req_data: Any) -> None:
+        flow_state = req_data.flow_state
+        assert flow_state is not None
+        req_data.flow_rng_state = self.model.flow.export_request_rng_state(flow_state)
+        self.model.flow.release_request(flow_state)
+        req_data.pending_feedback_queue.clear()
+        req_data.flow_state = None
 
     def _clear_request_data(self, req_data: Any) -> None:
         self.model.flow.release_request(req_data.flow_state)

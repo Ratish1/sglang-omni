@@ -112,6 +112,42 @@ def test_single_stream_decode_preserves_batch_and_sequence_axes() -> None:
     assert observed == [("append", (1, 1, 8)), ("decode", (1, 1, 8))]
 
 
+def test_single_stream_rng_is_request_local_under_interleaving() -> None:
+    flow = object.__new__(DotsTTSFlowHead)
+    nn.Module.__init__(flow)
+
+    def _state() -> DotsFlowState:
+        return DotsFlowState(
+            fm_sequence=torch.empty(0),
+            fm_cfg_sequence=torch.empty(0),
+            fm_null_g_cond=torch.empty(0),
+            fm_capacity=0,
+            g_cond=None,
+            rng_state=flow._new_rng_state(device=torch.device("cpu"), seed=1234),
+        )
+
+    first = _state()
+    second = _state()
+    global_rng_before = torch.get_rng_state().clone()
+    with flow._request_rng(first):
+        first_draw_1 = torch.randn(16)
+    with flow._request_rng(second):
+        second_draw_1 = torch.randn(16)
+    with flow._request_rng(first):
+        first_draw_2 = torch.randn(16)
+    with flow._request_rng(second):
+        second_draw_2 = torch.randn(16)
+
+    torch.testing.assert_close(first_draw_1, second_draw_1, rtol=0, atol=0)
+    torch.testing.assert_close(first_draw_2, second_draw_2, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.get_rng_state(),
+        global_rng_before,
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_dots_prefill_batches_request_embeddings_in_scheduler_order() -> None:
     old_flow_state = object()
     released = []
@@ -122,6 +158,10 @@ def test_dots_prefill_batches_request_embeddings_in_scheduler_order() -> None:
             return object(), prompt
 
         release_request = released.append
+
+        @staticmethod
+        def export_request_rng_state(_state):
+            return torch.tensor([1], dtype=torch.uint8)
 
     model = SimpleNamespace(
         flow=_Flow(),
@@ -136,12 +176,18 @@ def test_dots_prefill_batches_request_embeddings_in_scheduler_order() -> None:
     def _request(request_id: str, speaker_scale: float):
         data = SimpleNamespace(
             flow_state=old_flow_state if request_id == "a" else None,
+            flow_rng_state=None,
+            feedback_embeddings=[],
+            pending_feedback_queue=deque(),
             generation_schedule=torch.tensor([[1, 2, 3]]),
             span_positions=torch.tensor([1, 2]),
             prompt_span_positions=torch.tensor([1]),
             prefill_end=3,
             req=SimpleNamespace(
-                prefix_indices=[], extend_range=SimpleNamespace(length=3)
+                prefix_indices=[],
+                extend_range=SimpleNamespace(length=3),
+                output_ids=[],
+                is_retracted=False,
             ),
             state=SimpleNamespace(
                 prompt_latents=torch.zeros(1, 4, 2),
@@ -180,6 +226,10 @@ def test_dots_prefill_failure_releases_materialized_slots() -> None:
 
         release_request = released.append
 
+        @staticmethod
+        def export_request_rng_state(_state):
+            return torch.tensor([1], dtype=torch.uint8)
+
     runner = object.__new__(DotsTTSModelRunner)
     runner.model = SimpleNamespace(
         flow=_Flow(),
@@ -190,13 +240,18 @@ def test_dots_prefill_failure_releases_materialized_slots() -> None:
     def _request(request_id: str):
         data = SimpleNamespace(
             flow_state=None,
+            flow_rng_state=None,
+            feedback_embeddings=[],
             generation_schedule=torch.tensor([[1, 2, 3]]),
             span_positions=torch.tensor([1]),
             prompt_span_positions=None,
             prefill_end=3,
             pending_feedback_queue=deque(),
             req=SimpleNamespace(
-                prefix_indices=[], extend_range=SimpleNamespace(length=3)
+                prefix_indices=[],
+                extend_range=SimpleNamespace(length=3),
+                output_ids=[],
+                is_retracted=False,
             ),
             state=SimpleNamespace(
                 prompt_latents=None,
@@ -218,3 +273,188 @@ def test_dots_prefill_failure_releases_materialized_slots() -> None:
     assert released == [flow_state]
     assert runner._request_data == {}
     assert requests[0].data.flow_state is None
+
+
+def test_retracted_prefill_replays_feedback_latents_and_rng_position() -> None:
+    old_flow_state = object()
+    new_flow_state = object()
+    saved_rng_state = torch.tensor([3, 1, 4], dtype=torch.uint8)
+    released = []
+    observed: dict[str, object] = {}
+
+    class _Flow:
+        def export_request_rng_state(self, state):
+            assert state is old_flow_state
+            return saved_rng_state
+
+        def release_request(self, state):
+            released.append(state)
+
+        def new_request(self, *, rng_state, **_kwargs):
+            observed["restored_rng_state"] = rng_state
+            return new_flow_state, torch.full((1, 1, 4), 50.0)
+
+        def initialize_history(self, _state, **kwargs):
+            observed["decoded_latent_patches"] = kwargs["decoded_latent_patches"]
+
+        def decode_batch(self, _states, *, hidden_states, **_kwargs):
+            observed["next_hidden"] = hidden_states
+            return [
+                DotsFlowStep(
+                    latent_patch=torch.full((1, 2, 2), 9.0),
+                    feedback_embedding=torch.full((4,), 10.0),
+                    finished=False,
+                    emit=True,
+                )
+            ]
+
+    model = SimpleNamespace(
+        flow=_Flow(),
+        get_input_embeddings=lambda: nn.Embedding.from_pretrained(
+            torch.arange(40, dtype=torch.float32).reshape(10, 4)
+        ),
+    )
+    runner = object.__new__(DotsTTSModelRunner)
+    runner.model = model
+    runner._request_data = {}
+    feedback_history = [
+        torch.full((4,), 60.0),
+        torch.full((4,), 70.0),
+    ]
+    decoded_history = [
+        torch.full((1, 2, 2), 1.0),
+        torch.full((1, 2, 2), 2.0),
+    ]
+    data = SimpleNamespace(
+        flow_state=old_flow_state,
+        flow_rng_state=None,
+        feedback_embeddings=list(feedback_history),
+        decoded_latent_patches=list(decoded_history),
+        latent_patches=[decoded_history[1]],
+        latest_latent_patch=None,
+        pending_feedback_queue=deque([feedback_history[-1]]),
+        generation_schedule=torch.tensor([[1, 2, 3, 3, 3]]),
+        span_positions=torch.tensor([1, 2, 3, 4]),
+        prompt_span_positions=torch.tensor([1]),
+        prefill_end=3,
+        control_token_id=3,
+        req=SimpleNamespace(
+            prefix_indices=[],
+            extend_range=SimpleNamespace(length=5),
+            output_ids=[3, 3],
+            is_retracted=False,
+            finished_reason=None,
+        ),
+        state=SimpleNamespace(
+            prompt_latents=torch.zeros(1, 2, 2),
+            speaker_embedding=torch.zeros(1, 8),
+            speaker_scale=1.0,
+            seed=42,
+            audio_span_token_ids=[3],
+            num_steps=4,
+            ode_method="euler",
+            guidance_scale=1.2,
+            eos_threshold=0.8,
+        ),
+    )
+    request = SimpleNamespace(request_id="rid", data=data)
+    forward_batch = SimpleNamespace(
+        input_ids=torch.arange(5),
+        input_embeds=None,
+    )
+
+    runner.before_prefill(forward_batch, object(), [request])
+
+    assert released == [old_flow_state]
+    assert observed["restored_rng_state"] is saved_rng_state
+    torch.testing.assert_close(
+        forward_batch.input_embeds[-2:],
+        torch.stack(feedback_history),
+    )
+    assert not data.pending_feedback_queue
+
+    hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    runner.post_prefill(
+        SimpleNamespace(
+            logits_output=SimpleNamespace(hidden_states=hidden),
+            next_token_ids=None,
+        ),
+        forward_batch,
+        SimpleNamespace(is_prefill_only=False),
+        [request],
+    )
+
+    replayed = observed["decoded_latent_patches"]
+    assert isinstance(replayed, list)
+    assert len(replayed) == len(decoded_history)
+    assert all(
+        actual is expected for actual, expected in zip(replayed, decoded_history)
+    )
+    torch.testing.assert_close(observed["next_hidden"], hidden[-1:])
+    assert len(data.feedback_embeddings) == 3
+    assert len(data.decoded_latent_patches) == 3
+    assert len(data.latent_patches) == 2
+
+
+def test_new_prefill_reclaims_slots_held_by_waiting_retractions() -> None:
+    events = []
+    stale_flow_state = object()
+
+    class _Flow:
+        def export_request_rng_state(self, state):
+            assert state is stale_flow_state
+            events.append("snapshot-stale")
+            return torch.tensor([8], dtype=torch.uint8)
+
+        def release_request(self, state):
+            assert state is stale_flow_state
+            events.append("release-stale")
+
+        def new_request(self, **_kwargs):
+            events.append("allocate-new")
+            return object(), None
+
+    runner = object.__new__(DotsTTSModelRunner)
+    runner.model = SimpleNamespace(
+        flow=_Flow(),
+        get_input_embeddings=lambda: nn.Embedding(10, 4),
+    )
+    stale_data = SimpleNamespace(
+        flow_state=stale_flow_state,
+        flow_rng_state=None,
+        pending_feedback_queue=deque([torch.zeros(4)]),
+        req=SimpleNamespace(is_retracted=True),
+    )
+    runner._request_data = {"stale": stale_data}
+    new_data = SimpleNamespace(
+        flow_state=None,
+        flow_rng_state=None,
+        feedback_embeddings=[],
+        generation_schedule=torch.tensor([[1, 2, 3]]),
+        span_positions=torch.tensor([1]),
+        prompt_span_positions=None,
+        prefill_end=3,
+        pending_feedback_queue=deque(),
+        req=SimpleNamespace(
+            prefix_indices=[],
+            extend_range=SimpleNamespace(length=3),
+            output_ids=[],
+            is_retracted=False,
+        ),
+        state=SimpleNamespace(
+            prompt_latents=None,
+            speaker_embedding=None,
+            speaker_scale=1.0,
+            seed=None,
+        ),
+    )
+
+    runner.before_prefill(
+        SimpleNamespace(input_ids=torch.arange(3), input_embeds=None),
+        object(),
+        [SimpleNamespace(request_id="new", data=new_data)],
+    )
+
+    assert events == ["snapshot-stale", "release-stale", "allocate-new"]
+    assert stale_data.flow_state is None
+    assert not stale_data.pending_feedback_queue
