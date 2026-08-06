@@ -126,6 +126,7 @@ sgl-omni serve \
   --config examples/configs/dots_tts.yaml \
   --allowed-media-domain huggingface.co \
   --allowed-media-domain cas-bridge.xethub.hf.co \
+  --allowed-media-domain us.aws.cdn.hf.co \
   --port 8000
 ```
 
