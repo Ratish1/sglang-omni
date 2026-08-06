@@ -8,9 +8,28 @@ from typing import Any
 
 from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
+    get_prefill_cuda_graph_backend,
     validate_generation_batch_policy,
 )
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
+
+
+def _validate_prefill_graph_prereqs(server_args: Any, device: str) -> None:
+    """Reject breakable prefill graphs outside their validated envelope.
+
+    An explicit prefill backend locks sglang's own compatibility cascade off,
+    so the omni-relevant subset is re-checked here before capture.
+    """
+    if not device.startswith("cuda"):
+        raise RuntimeError(
+            "breakable prefill CUDA graphs require a CUDA device, " f"got {device!r}"
+        )
+    tp_size = int(server_args.tp_size)
+    if tp_size != 1:
+        raise RuntimeError(
+            "breakable prefill CUDA graphs are validated for tp_size == 1, "
+            f"got tp_size={tp_size}"
+        )
 
 
 class TtsEngineBuilder(ABC):
@@ -19,6 +38,11 @@ class TtsEngineBuilder(ABC):
     model_name: str
     context_length: int
     model_arch_override: str | None = None
+    # Set True only by builders whose model satisfies the breakable prefill
+    # CUDA graph contract (discoverable decoder, OmniPrefillInputs payload,
+    # eager-tail-safe head). A deployment override cannot enable prefill
+    # graphs on a model that has not adopted the contract.
+    supports_breakable_prefill_cuda_graph: bool = False
 
     def build(
         self,
@@ -59,6 +83,19 @@ class TtsEngineBuilder(ABC):
         infra_kwargs = dict(self.infra_kwargs())
         if self.model_arch_override is not None:
             infra_kwargs.setdefault("model_arch_override", self.model_arch_override)
+        prefill_graph_backend = get_prefill_cuda_graph_backend(server_args)
+        if prefill_graph_backend == "breakable":
+            if not self.supports_breakable_prefill_cuda_graph:
+                raise RuntimeError(
+                    f"{self.model_name} has not adopted the breakable prefill "
+                    "CUDA graph contract "
+                    "(supports_breakable_prefill_cuda_graph=False); refusing "
+                    "cuda_graph_backend_prefill='breakable'"
+                )
+            _validate_prefill_graph_prereqs(server_args, device)
+            # SGLang registers the prefill input_embeds slot only for
+            # multimodal model configs; the payload channel needs it.
+            infra_kwargs.setdefault("enable_prefill_input_embeds", True)
         want_cuda_graph, (
             model_worker,
             tree_cache,
@@ -93,6 +130,12 @@ class TtsEngineBuilder(ABC):
         if want_cuda_graph:
             model_worker.model_runner.init_cuda_graphs()
             self.post_cuda_graph_setup(model, server_args)
+            if prefill_graph_backend != "disabled":
+                from sglang_omni.utils import cuda_graph_batch_validator
+
+                cuda_graph_batch_validator.attest_prefill_cuda_graphs(
+                    model_worker.model_runner, server_args
+                )
 
         output_proc = sglang_backend.SGLangOutputProcessor(
             capture_hidden=False,
