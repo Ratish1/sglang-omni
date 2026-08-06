@@ -9,6 +9,7 @@ import torch
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.dots_tts.request_builders import DotsFlowResume
 
 
 class DotsTTSModelRunner(ModelRunner):
@@ -24,6 +25,7 @@ class DotsTTSModelRunner(ModelRunner):
         del schedule_batch
         if not requests:
             return
+        self._release_retracted_flow_states()
         rows = []
         materialized = []
         try:
@@ -34,16 +36,22 @@ class DotsTTSModelRunner(ModelRunner):
                     raise RuntimeError(
                         "dots.tts request is missing its generation schedule"
                     )
-                if data.flow_state is not None:
-                    self.model.flow.release_request(data.flow_state)
-                    data.flow_state = None
+                if data.flow_state is not None and not isinstance(
+                    data.flow_state, DotsFlowResume
+                ):
+                    self._suspend_request_data(data)
                 self._request_data.pop(request.request_id, None)
+                resume = data.flow_state
                 flow_state, prompt_embeddings = self.model.flow.new_request(
                     max_audio_patch_count=int(data.span_positions.numel()),
                     prompt_latents=data.state.prompt_latents,
                     speaker_embedding=data.state.speaker_embedding,
                     speaker_scale=data.state.speaker_scale,
-                    seed=data.state.seed,
+                    rng=(
+                        resume.rng_state
+                        if isinstance(resume, DotsFlowResume)
+                        else data.state.seed
+                    ),
                 )
                 data.flow_state = flow_state
                 self._request_data[request.request_id] = data
@@ -62,9 +70,23 @@ class DotsTTSModelRunner(ModelRunner):
                     )
                 prefix_len = len(data.req.prefix_indices)
                 req_len = int(data.req.extend_range.length)
-                if prefix_len:
-                    raise RuntimeError("dots.tts radix prefix reuse is unsupported")
-                rows.append(embeddings[0, :req_len])
+                assert prefix_len == 0, "dots.tts radix prefix reuse is disabled"
+                prompt_len = embeddings.size(1)
+                generated_count = req_len - prompt_len
+                assert (
+                    generated_count
+                    == len(data.req.output_ids)
+                    == len(data.decoded_latent_patches)
+                ), "dots.tts re-prefill history must match generated tokens"
+                request_rows = [embeddings[0]]
+                if generated_count:
+                    request_rows.append(
+                        self.model.flow.replay_feedback(
+                            flow_state,
+                            data.decoded_latent_patches,
+                        ).to(device=device, dtype=embeddings.dtype)
+                    )
+                rows.append(torch.cat(request_rows, dim=0))
             forward_batch.input_embeds = torch.cat(rows, dim=0)
         except BaseException:
             for request_id, data in materialized:
@@ -143,6 +165,7 @@ class DotsTTSModelRunner(ModelRunner):
                 audio_span_token_ids=set(data.state.audio_span_token_ids),
                 generation_schedule=data.generation_schedule.to(hidden.device),
                 prefill_end=data.prefill_end,
+                decoded_latent_patches=data.decoded_latent_patches,
             )
             last_hidden.append(request_hidden[0, -1])
             offset += length
@@ -191,10 +214,11 @@ class DotsTTSModelRunner(ModelRunner):
         next_token_ids = []
         for data, step in zip(data_rows, steps, strict=True):
             data.pending_feedback_queue.append(step.feedback_embedding.detach())
+            decoded_latent = step.latent_patch.detach()
+            data.decoded_latent_patches.append(decoded_latent)
             if step.emit:
-                latent = step.latent_patch.detach()
-                data.latest_latent_patch = latent
-                data.latent_patches.append(latent)
+                data.latest_latent_patch = decoded_latent
+                data.latent_patches.append(decoded_latent)
             next_token_ids.append(data.control_token_id)
             if step.finished:
                 data.req.finished_reason = FINISH_MATCHED_TOKEN(data.control_token_id)
@@ -223,8 +247,27 @@ class DotsTTSModelRunner(ModelRunner):
         if req_data is not None:
             self._clear_request_data(req_data)
 
+    def _release_retracted_flow_states(self) -> None:
+        for req_data in self._request_data.values():
+            if (
+                req_data.flow_state is not None
+                and not isinstance(req_data.flow_state, DotsFlowResume)
+                and req_data.req.is_retracted
+            ):
+                self._suspend_request_data(req_data)
+
+    def _suspend_request_data(self, req_data: Any) -> None:
+        flow_state = req_data.flow_state
+        assert flow_state is not None and not isinstance(flow_state, DotsFlowResume)
+        req_data.flow_state = DotsFlowResume(
+            self.model.flow.suspend_request(flow_state)
+        )
+        req_data.pending_feedback_queue.clear()
+
     def _clear_request_data(self, req_data: Any) -> None:
-        self.model.flow.release_request(req_data.flow_state)
+        flow_state = req_data.flow_state
+        if flow_state is not None and not isinstance(flow_state, DotsFlowResume):
+            self.model.flow.release_request(flow_state)
         req_data.pending_feedback_queue.clear()
         req_data.flow_state = None
 

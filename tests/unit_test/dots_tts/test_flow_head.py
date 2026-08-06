@@ -63,6 +63,7 @@ def test_single_stream_decode_batch_accepts_2d_hidden(tmp_path) -> None:
         prompt_latents=None,
         speaker_embedding=torch.randn(1, 512),
         speaker_scale=1.5,
+        rng=None,
     )
     assert prompt_embeddings is None
     flow.append_hidden(state, torch.randn(1, 1, LLM_HIDDEN))
@@ -88,6 +89,118 @@ def test_single_stream_decode_batch_accepts_2d_hidden(tmp_path) -> None:
         assert step.emit
         assert not step.finished
     assert state.decoded_patches == 2
+
+
+def test_flow_rematerialization_matches_uninterrupted_next_step(tmp_path) -> None:
+    torch.manual_seed(1618)
+    flow = _flow_head(tmp_path)
+    flow.init_batched_tail(num_slots=2, nfe=NFE, max_audio_patches=8)
+    prompt_latents = torch.randn(1, 2 * PATCH_SIZE, LATENT_DIM)
+    prefill_hidden = torch.randn(1, 3, LLM_HIDDEN)
+    prompt_positions = torch.tensor([1, 2])
+    schedule = torch.tensor([[0, 1, 1, 1]])
+
+    uninterrupted, _ = flow.new_request(
+        max_audio_patch_count=6,
+        prompt_latents=prompt_latents,
+        speaker_embedding=None,
+        speaker_scale=1.0,
+        rng=41,
+    )
+    retracted, _ = flow.new_request(
+        max_audio_patch_count=6,
+        prompt_latents=prompt_latents,
+        speaker_embedding=None,
+        speaker_scale=1.0,
+        rng=41,
+    )
+    for state in (uninterrupted, retracted):
+        flow.initialize_history(
+            state,
+            hidden_states=prefill_hidden,
+            prompt_span_positions=prompt_positions,
+            audio_span_token_ids={1},
+            generation_schedule=schedule,
+            prefill_end=3,
+            decoded_latent_patches=[],
+        )
+
+    first_steps = flow.decode_batch(
+        [uninterrupted, retracted],
+        hidden_states=prefill_hidden[:, -1].expand(2, -1),
+        num_steps=[NFE, NFE],
+        ode_methods=["euler", "euler"],
+        guidance_scales=[1.0, 1.0],
+        eos_thresholds=[2.0, 2.0],
+        append_hidden=False,
+    )
+    torch.testing.assert_close(
+        first_steps[0].latent_patch,
+        first_steps[1].latent_patch,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+
+    rng_state = flow.suspend_request(retracted)
+    rematerialized, _ = flow.new_request(
+        max_audio_patch_count=6,
+        prompt_latents=prompt_latents,
+        speaker_embedding=None,
+        speaker_scale=1.0,
+        rng=rng_state,
+    )
+    replayed_feedback = flow.replay_feedback(
+        rematerialized,
+        [first_steps[1].latent_patch],
+    )
+    torch.testing.assert_close(
+        replayed_feedback[0],
+        first_steps[1].feedback_embedding,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+
+    next_hidden = torch.randn(1, LLM_HIDDEN)
+    flow.initialize_history(
+        rematerialized,
+        hidden_states=torch.cat([prefill_hidden, next_hidden.unsqueeze(1)], dim=1),
+        prompt_span_positions=prompt_positions,
+        audio_span_token_ids={1},
+        generation_schedule=schedule,
+        prefill_end=3,
+        decoded_latent_patches=[first_steps[1].latent_patch],
+    )
+    [expected] = flow.decode_batch(
+        [uninterrupted],
+        hidden_states=next_hidden,
+        num_steps=[NFE],
+        ode_methods=["euler"],
+        guidance_scales=[1.0],
+        eos_thresholds=[2.0],
+        append_hidden=True,
+    )
+    [actual] = flow.decode_batch(
+        [rematerialized],
+        hidden_states=next_hidden,
+        num_steps=[NFE],
+        ode_methods=["euler"],
+        guidance_scales=[1.0],
+        eos_thresholds=[2.0],
+        append_hidden=False,
+    )
+
+    torch.testing.assert_close(
+        actual.latent_patch,
+        expected.latent_patch,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+    torch.testing.assert_close(
+        actual.feedback_embedding,
+        expected.feedback_embedding,
+        rtol=3e-4,
+        atol=3e-4,
+    )
 
 
 def test_validate_request_batched_gates_prompt_and_span_budget() -> None:

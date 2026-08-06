@@ -216,7 +216,7 @@ class DotsTTSFlowHead(nn.Module):
         prompt_latents: torch.Tensor | None,
         speaker_embedding: torch.Tensor | None,
         speaker_scale: float,
-        seed: int | None = None,
+        rng: int | torch.Tensor | None,
     ) -> tuple[DotsFlowState, torch.Tensor | None]:
         parameter = next(self.parameters())
         device, dtype = parameter.device, parameter.dtype
@@ -227,8 +227,7 @@ class DotsTTSFlowHead(nn.Module):
                 )
             slot = self._tail.acquire_slot()
             try:
-                if seed is not None:
-                    self._tail.set_slot_seed(slot, int(seed))
+                self._tail.initialize_slot_rng(slot, rng)
                 g_cond = None
                 if speaker_embedding is not None:
                     speaker_embedding = speaker_embedding.to(device=device, dtype=dtype)
@@ -323,6 +322,41 @@ class DotsTTSFlowHead(nn.Module):
         return state, prompt_embeddings
 
     @torch.inference_mode()
+    def replay_feedback(
+        self,
+        state: DotsFlowState,
+        decoded_latent_patches: list[torch.Tensor],
+    ) -> torch.Tensor:
+        assert decoded_latent_patches
+        rows = []
+        for patch in decoded_latent_patches:
+            normalized = self.io.normalize(
+                patch.to(
+                    device=state.fm_sequence.device,
+                    dtype=state.fm_sequence.dtype,
+                )
+            )
+            patch_input = self._patch_encoder_input(
+                normalized,
+                already_normalized=True,
+            )
+            if state.slot is None:
+                (
+                    feedback,
+                    state.patch_encoder_state,
+                ) = self._patch_encoder_inference().decode_patch_with_state(
+                    patch_input,
+                    state.patch_encoder_state,
+                    optimize=self.optimize,
+                    bucket_resolver=self._bucket,
+                    dtype=state.fm_sequence.dtype,
+                )
+            else:
+                feedback = self._tail.encode_feedback([state.slot], patch_input)
+            rows.append(feedback.reshape(-1, feedback.shape[-1])[-1])
+        return torch.stack(rows)
+
+    @torch.inference_mode()
     def initialize_history(
         self,
         state: DotsFlowState,
@@ -332,9 +366,12 @@ class DotsTTSFlowHead(nn.Module):
         audio_span_token_ids: set[int],
         generation_schedule: torch.Tensor,
         prefill_end: int,
+        decoded_latent_patches: list[torch.Tensor],
     ) -> None:
         if hidden_states.ndim == 2:
             hidden_states = hidden_states.unsqueeze(0)
+        decoded_count = len(decoded_latent_patches)
+        assert hidden_states.shape[:2] == (1, int(prefill_end) + decoded_count)
         if state.slot is not None:
             prompt_patches = state.prompt_patches
             if prompt_patches is None or state.all_mods is None:
@@ -348,12 +385,54 @@ class DotsTTSFlowHead(nn.Module):
                 raise RuntimeError("dots.tts prompt spans do not match prompt latents")
             hidden_rows = self.hidden_proj(hidden_states[0, positions - 1])
             latent_rows = self.latent_proj(prompt_patches[0])
-            fm_rows = torch.cat([hidden_rows[:, None], latent_rows], dim=1).reshape(
-                -1, self.fm_hidden_size
+            prompt_fm_rows = torch.cat(
+                [hidden_rows[:, None], latent_rows], dim=1
+            ).reshape(-1, self.fm_hidden_size)
+            if not decoded_count:
+                self._tail.seed_fm_history(
+                    state.slot,
+                    fm_rows=prompt_fm_rows,
+                    all_mods=state.all_mods,
+                )
+                return
+            fm_parts = [prompt_fm_rows]
+            conditioning_hidden = hidden_states[
+                0,
+                prefill_end - 1 : prefill_end - 1 + decoded_count,
+            ]
+            normalized = self.io.normalize(
+                torch.cat(
+                    [
+                        patch.to(
+                            device=hidden_states.device,
+                            dtype=hidden_states.dtype,
+                        )
+                        for patch in decoded_latent_patches
+                    ],
+                    dim=1,
+                )
+            )
+            decoded_patches = normalized.reshape(
+                decoded_count,
+                self.latent_patch_size,
+                self.latent_dim,
+            )
+            decoded_hidden_rows = self.hidden_proj(conditioning_hidden)
+            decoded_latent_rows = self.latent_proj(decoded_patches)
+            fm_parts.append(
+                torch.cat(
+                    [decoded_hidden_rows[:, None], decoded_latent_rows],
+                    dim=1,
+                ).reshape(-1, self.fm_hidden_size)
             )
             self._tail.seed_fm_history(
-                state.slot, fm_rows=fm_rows, all_mods=state.all_mods
+                state.slot,
+                fm_rows=torch.cat(fm_parts, dim=0),
+                all_mods=state.all_mods,
             )
+            state.drop_regenerated_prompt_patch = False
+            state.suppress_first_eos_check = False
+            state.decoded_patches = decoded_count
             return
         prompt_patches = state.prompt_patches
         cursor = 0
@@ -378,6 +457,28 @@ class DotsTTSFlowHead(nn.Module):
             cursor = next_position
         if prefill_end > cursor:
             self.append_hidden(state, hidden_states[:, prefill_end - 1 : prefill_end])
+        for patch_index, patch in enumerate(decoded_latent_patches):
+            self._append_history(
+                state,
+                self.io.normalize(
+                    patch.to(
+                        device=hidden_states.device,
+                        dtype=hidden_states.dtype,
+                    )
+                ),
+            )
+            next_hidden_position = prefill_end + patch_index
+            self.append_hidden(
+                state,
+                hidden_states[
+                    :,
+                    next_hidden_position : next_hidden_position + 1,
+                ],
+            )
+        if decoded_count:
+            state.drop_regenerated_prompt_patch = False
+            state.suppress_first_eos_check = False
+            state.decoded_patches = decoded_count
 
     @torch.inference_mode()
     def append_hidden(self, state: DotsFlowState, hidden_states: torch.Tensor) -> None:
@@ -531,6 +632,13 @@ class DotsTTSFlowHead(nn.Module):
         if state is not None and state.slot is not None and self._tail is not None:
             slot, state.slot = state.slot, None
             self._tail.release_slot(slot)
+
+    def suspend_request(self, state: DotsFlowState) -> torch.Tensor | None:
+        if state.slot is not None:
+            rng_state = self._tail.slot_rng_state(state.slot)
+            self.release_request(state)
+            return rng_state
+        return None
 
     def _patch_encoder_input(
         self, latents: torch.Tensor, *, already_normalized: bool = False

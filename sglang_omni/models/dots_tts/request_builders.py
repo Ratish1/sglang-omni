@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -18,6 +18,14 @@ from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
+if TYPE_CHECKING:
+    from sglang_omni.models.dots_tts.flow_head import DotsFlowState
+
+
+@dataclass(frozen=True)
+class DotsFlowResume:
+    rng_state: torch.Tensor | None
+
 
 @dataclass
 class DotsTTSSGLangRequestData(SGLangARRequestData):
@@ -26,9 +34,10 @@ class DotsTTSSGLangRequestData(SGLangARRequestData):
     span_positions: torch.Tensor | None = None
     prompt_span_positions: torch.Tensor | None = None
     prefill_end: int = 0
-    flow_state: Any = None
+    flow_state: DotsFlowState | DotsFlowResume | None = None
     latest_latent_patch: torch.Tensor | None = None
     latent_patches: list[torch.Tensor] = field(default_factory=list)
+    decoded_latent_patches: list[torch.Tensor] = field(default_factory=list)
     stream_metadata: dict[str, Any] | None = None
     chunk_id: int = 0
     control_token_id: int = 0

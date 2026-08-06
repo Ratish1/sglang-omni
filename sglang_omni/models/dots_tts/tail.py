@@ -352,10 +352,19 @@ class DotsTtsAcousticTail:
         self._generators[slot] = None
         self._free_slots.append(slot)
 
-    def set_slot_seed(self, slot: int, seed: int) -> None:
+    def initialize_slot_rng(self, slot: int, rng: int | torch.Tensor | None) -> None:
+        if rng is None:
+            return
         generator = torch.Generator(device=self.device)
-        generator.manual_seed(int(seed))
+        if isinstance(rng, torch.Tensor):
+            generator.set_state(rng.detach().cpu())
+        else:
+            generator.manual_seed(int(rng))
         self._generators[int(slot)] = generator
+
+    def slot_rng_state(self, slot: int) -> torch.Tensor | None:
+        generator = self._generators[int(slot)]
+        return None if generator is None else generator.get_state().clone()
 
     def fm_seq_len(self, slot: int) -> int:
         return self._fm_seq_len[int(slot)]

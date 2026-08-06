@@ -67,14 +67,21 @@ def test_dots_post_prefill_skips_prefill_only_batch() -> None:
 
 def test_dots_prefill_batches_request_embeddings_in_scheduler_order() -> None:
     old_flow_state = object()
-    released = []
+    suspended = []
+    restored_rng = []
 
     class _Flow:
-        def new_request(self, *, speaker_scale: float, **_kwargs):
+        def suspend_request(self, state):
+            suspended.append(state)
+            return torch.tensor([7], dtype=torch.uint8)
+
+        def new_request(self, *, speaker_scale: float, rng, **_kwargs):
+            restored_rng.append(rng)
             prompt = torch.full((1, 1, 4), speaker_scale)
             return object(), prompt
 
-        release_request = released.append
+        def replay_feedback(self, _state, decoded_latent_patches):
+            return torch.full((len(decoded_latent_patches), 4), 33.0)
 
     model = SimpleNamespace(
         flow=_Flow(),
@@ -84,17 +91,22 @@ def test_dots_prefill_batches_request_embeddings_in_scheduler_order() -> None:
     )
     runner = object.__new__(DotsTTSModelRunner)
     runner.model = model
-    runner._request_data = {}
 
     def _request(request_id: str, speaker_scale: float):
+        retracted = request_id == "a"
         data = SimpleNamespace(
-            flow_state=old_flow_state if request_id == "a" else None,
+            flow_state=old_flow_state if retracted else None,
             generation_schedule=torch.tensor([[1, 2, 3]]),
             span_positions=torch.tensor([1, 2]),
             prompt_span_positions=torch.tensor([1]),
             prefill_end=3,
+            pending_feedback_queue=deque(),
+            decoded_latent_patches=([torch.full((1, 2, 2), 5.0)] if retracted else []),
             req=SimpleNamespace(
-                prefix_indices=[], extend_range=SimpleNamespace(length=3)
+                prefix_indices=[],
+                extend_range=SimpleNamespace(length=4 if retracted else 3),
+                output_ids=[3] if retracted else [],
+                is_retracted=retracted,
             ),
             state=SimpleNamespace(
                 prompt_latents=torch.zeros(1, 4, 2),
@@ -106,16 +118,20 @@ def test_dots_prefill_batches_request_embeddings_in_scheduler_order() -> None:
         return SimpleNamespace(request_id=request_id, data=data)
 
     requests = [_request("a", 11.0), _request("b", 22.0)]
+    runner._request_data = {"a": requests[0].data}
     forward_batch = SimpleNamespace(
         input_ids=torch.tensor([1, 2, 3, 1, 2, 3]), input_embeds=None
     )
 
     runner.before_prefill(forward_batch, object(), requests)
 
-    assert forward_batch.input_embeds.shape == (6, 4)
+    assert forward_batch.input_embeds.shape == (7, 4)
     torch.testing.assert_close(forward_batch.input_embeds[1], torch.full((4,), 11.0))
-    torch.testing.assert_close(forward_batch.input_embeds[4], torch.full((4,), 22.0))
-    assert released == [old_flow_state]
+    torch.testing.assert_close(forward_batch.input_embeds[3], torch.full((4,), 33.0))
+    torch.testing.assert_close(forward_batch.input_embeds[5], torch.full((4,), 22.0))
+    assert suspended == [old_flow_state]
+    torch.testing.assert_close(restored_rng[0], torch.tensor([7], dtype=torch.uint8))
+    assert restored_rng[1] == 42
 
 
 def test_dots_prefill_failure_releases_materialized_slots() -> None:
@@ -148,8 +164,12 @@ def test_dots_prefill_failure_releases_materialized_slots() -> None:
             prompt_span_positions=None,
             prefill_end=3,
             pending_feedback_queue=deque(),
+            decoded_latent_patches=[],
             req=SimpleNamespace(
-                prefix_indices=[], extend_range=SimpleNamespace(length=3)
+                prefix_indices=[],
+                extend_range=SimpleNamespace(length=3),
+                output_ids=[],
+                is_retracted=False,
             ),
             state=SimpleNamespace(
                 prompt_latents=None,
