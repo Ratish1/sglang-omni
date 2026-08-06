@@ -232,7 +232,6 @@ def test_speech_service_normalizes_tts_extension_fields_into_tts_params() -> Non
     assert tts_params["initial_codec_chunk_frames"] == 8
     assert gen_req.extra_params == {"initial_codec_chunk_frames": 8}
     assert gen_req.sampling.max_new_tokens == 128
-    assert tts_params["max_new_tokens"] == 128
     assert tts_params["explicit_generation_params"] == ["max_new_tokens"]
 
 

@@ -769,8 +769,6 @@ def _build_tts_params(
         tts_params[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = (
             request.initial_codec_chunk_frames
         )
-    if request.max_new_tokens is not None:
-        tts_params["max_new_tokens"] = request.max_new_tokens
     if request.token_count is not None:
         tts_params["token_count"] = request.token_count
     if request.duration_tokens is not None:
