@@ -132,9 +132,7 @@ def test_terminal_vocoder_results_exclude_internal_pipeline_state() -> None:
     }
 
 
-def test_non_streaming_scheduler_batches_equal_length_latents_and_restores_order() -> (
-    None
-):
+def test_nonstream_vocoder_batches_equal_lengths_in_request_order() -> None:
     class _Inference:
         def __init__(self) -> None:
             self.decode_shapes: list[tuple[int, ...]] = []
@@ -183,9 +181,7 @@ def test_non_streaming_scheduler_batches_equal_length_latents_and_restores_order
         )
 
 
-def test_optimized_streaming_lifecycle_preserves_all_latents_across_boundaries() -> (
-    None
-):
+def test_streaming_vocoder_preserves_latents_across_boundaries() -> None:
     class _Inference:
         def __init__(self) -> None:
             self.init_chunk_sizes: list[int] = []
