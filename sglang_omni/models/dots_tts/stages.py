@@ -151,20 +151,31 @@ def preprocess_dots_tts_payload(
     if prompt_text and not prompt_audio:
         raise ValueError("dots.tts prompt_text requires prompt audio")
 
-    template_name = str(
-        _first_not_none(
-            inputs.get("template_name"),
-            tts_params.get("template_name"),
-            params.get("template_name"),
-            tts_params.get("task_type"),
-            params.get("task_type"),
-            default=(
-                "instruction_tts"
-                if _first_not_none(
-                    tts_params.get("instructions"), inputs.get("instructions")
-                )
-                else "tts"
-            ),
+    task_type = _first_not_none(
+        inputs.get("task_type"),
+        tts_params.get("task_type"),
+        params.get("task_type"),
+    )
+    if task_type is not None:
+        normalized_task_type = (
+            str(task_type).strip().replace("_", "").replace("-", "").lower()
+        )
+        if normalized_task_type != "base":
+            raise ValueError("dots.tts supports only task_type='Base'")
+    template_name_value = _first_not_none(
+        inputs.get("template_name"),
+        tts_params.get("template_name"),
+        params.get("template_name"),
+    )
+    template_name = (
+        str(template_name_value)
+        if template_name_value is not None
+        else (
+            "instruction_tts"
+            if _first_not_none(
+                tts_params.get("instructions"), inputs.get("instructions")
+            )
+            else "tts"
         )
     )
     templates = {
@@ -190,9 +201,10 @@ def preprocess_dots_tts_payload(
     language = None
     if language_value is not None:
         raw_language = str(language_value).strip()
+        automatic = raw_language.lower() in {"auto", "auto_detect"}
         language = (
             normalize_language_code(detect(text))
-            if raw_language == "auto_detect"
+            if automatic
             else normalize_language_code(raw_language)
         )
         if raw_language and raw_language.lower() != "none" and language is None:
@@ -220,6 +232,20 @@ def preprocess_dots_tts_payload(
         raise ValueError(
             f"dots.tts max_generate_length must be in [1, {max_generate_length}]"
         )
+    public_max_new_tokens_value = _first_not_none(
+        inputs.get("max_new_tokens"),
+        tts_params.get("max_new_tokens"),
+        params.get("max_new_tokens"),
+    )
+    public_max_new_tokens = (
+        None
+        if public_max_new_tokens_value is None
+        else int(public_max_new_tokens_value)
+    )
+    if public_max_new_tokens is not None:
+        if public_max_new_tokens <= 0:
+            raise ValueError("dots.tts max_new_tokens must be positive")
+        public_max_new_tokens = min(public_max_new_tokens, request_limit)
     schedule_spec = build_generation_schedule(
         text=f"{normalized_prompt_text}{text}",
         tokenizer=tokenizer,
@@ -294,6 +320,7 @@ def preprocess_dots_tts_payload(
             is None
             else int(seed)
         ),
+        max_new_tokens=public_max_new_tokens,
         stream=bool(params.get("stream", False)),
         generation_schedule=schedule,
         audio_span_token_ids=[

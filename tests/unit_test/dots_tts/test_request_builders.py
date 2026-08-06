@@ -36,6 +36,41 @@ def test_request_budget_is_remaining_schedule_spans() -> None:
     assert data.control_token_id == 99
 
 
+def test_public_budget_counts_payload_patches_not_regenerated_prompt() -> None:
+    state = DotsTTSState(
+        generation_schedule=torch.tensor([[1, 2, 99, 99, 99, 99, 99, 99, 99]]),
+        audio_span_token_ids=[99],
+        latent_patch_size=4,
+        vocab_size=128,
+        prompt_latents=torch.zeros(1, 8, 3),
+        max_new_tokens=3,
+    )
+
+    data = build_sglang_dots_tts_request(_payload(state))
+
+    assert data.prompt_span_positions.tolist() == [2, 3]
+    assert data.req.sampling_params.max_new_tokens == 4
+    assert data.max_new_tokens == 4
+
+
+def test_prompt_schedule_must_leave_one_payload_patch() -> None:
+    state = DotsTTSState(
+        generation_schedule=torch.tensor([[1, 99, 99, 99]]),
+        audio_span_token_ids=[99],
+        latent_patch_size=4,
+        vocab_size=128,
+        prompt_latents=torch.zeros(1, 8, 3),
+        max_new_tokens=1,
+    )
+
+    try:
+        build_sglang_dots_tts_request(_payload(state))
+    except ValueError as error:
+        assert "at least one payload patch" in str(error)
+    else:
+        raise AssertionError("prompt continuation without a payload patch must fail")
+
+
 def test_result_and_stream_use_pipeline_state() -> None:
     state = DotsTTSState(
         stream=True,

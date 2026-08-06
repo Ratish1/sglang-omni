@@ -29,7 +29,7 @@ uv pip install --no-deps qwen-tts==0.1.1
 | [Qwen3-TTS VoiceDesign](../cookbook/qwen3_tts.md) | `examples/configs/qwen3_tts_1_7b_voicedesign.yaml` | Requires `task_type="VoiceDesign"` and non-empty `instructions`. No reference audio is required |
 | [Ming-Omni-TTS](../cookbook/ming_tts.md) | `examples/configs/ming_omni_tts.yaml` | Text-only synthesis or one local reference clip with its transcript; TP1 is supported and the provided config uses TP2 |
 | [MOSS-TTS](../cookbook/moss_tts.md) | `examples/configs/moss_tts.yaml` | Voice cloning via `ref_audio` or `references[0].audio_path` (+ `text`). Duration via `${token:N}` or `token_count`. Benchmark at `--max-concurrency 8` |
-| [dots.tts](https://github.com/studio-dots-ai/dots.tts) | `examples/configs/dots_tts.yaml` | 48 kHz continuous-latent TTS with reference audio and continuous batching (`max_running_requests=16` by default). The MF batch path uses engine-wide `num_steps=4` and Euler. TP1 only |
+| [dots.tts](https://github.com/studio-dots-ai/dots.tts) | `examples/configs/dots_tts.yaml` | 48 kHz transcript-aligned voice cloning with continuous batching (`max_running_requests=16` by default). Exactly one reference audio item with its transcript is required. The MF batch path uses engine-wide `num_steps=4` and Euler. TP1 only |
 
 ## Launch the Server
 
@@ -184,8 +184,9 @@ curl -X POST http://localhost:8000/v1/audio/speech \
     --output output.wav
 ```
 
-dots.tts accepts the same reference fields. The MeanFlow checkpoint is tuned
-for four flow steps:
+dots.tts accepts the same reference fields and currently requires exactly one
+reference audio item with its transcript. The MeanFlow checkpoint is tuned for
+four flow steps:
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
