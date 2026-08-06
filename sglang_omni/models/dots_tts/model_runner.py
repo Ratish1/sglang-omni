@@ -14,6 +14,10 @@ from sglang_omni.model_runner.base import ModelRunner
 class DotsTTSModelRunner(ModelRunner):
     """Use the shared SGLang forward path and own only latent recurrence."""
 
+    def __init__(self, tp_worker: Any, output_processor: Any) -> None:
+        super().__init__(tp_worker, output_processor)
+        self._request_data: dict[str, Any] = {}
+
     def _require_single_request(self, requests: list) -> None:
         # ponytail: per-request DiT/patch KV is single-row for the base PR;
         # add a row pool when continuous batching is implemented.
@@ -28,6 +32,7 @@ class DotsTTSModelRunner(ModelRunner):
         if not requests:
             return
         data = requests[0].data
+        self._request_data[requests[0].request_id] = data
         schedule = data.generation_schedule
         if schedule is None or data.span_positions is None:
             raise RuntimeError("dots.tts request is missing its generation schedule")
@@ -94,7 +99,9 @@ class DotsTTSModelRunner(ModelRunner):
     def post_prefill(
         self, result: Any, forward_batch: Any, schedule_batch: Any, requests: list
     ) -> None:
-        del forward_batch, schedule_batch
+        del forward_batch
+        if bool(getattr(schedule_batch, "is_prefill_only", False)):
+            return
         if not requests:
             return
         data = requests[0].data
@@ -168,7 +175,16 @@ class DotsTTSModelRunner(ModelRunner):
         return hidden
 
     def on_request_finished(self, request_id: str, req_data: Any) -> None:
-        del request_id
+        self._request_data.pop(request_id, None)
+        self._clear_request_data(req_data)
+
+    def reset_request(self, request_id: str) -> None:
+        req_data = self._request_data.pop(request_id, None)
+        if req_data is not None:
+            self._clear_request_data(req_data)
+
+    @staticmethod
+    def _clear_request_data(req_data: Any) -> None:
         req_data.pending_feedback_queue.clear()
         req_data.flow_state = None
 

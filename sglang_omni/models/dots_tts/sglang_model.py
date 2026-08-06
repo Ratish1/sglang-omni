@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -20,22 +21,23 @@ class DotsTTSSGLangModel(nn.Module):
     def __init__(self, config: Any, quant_config: Any = None, prefix: str = "") -> None:
         super().__init__()
         self.config = config
+        llm_config = getattr(config, "llm_config", None)
+        dots_config = getattr(config, "dots_tts_config", None)
+        checkpoint = str(getattr(config, "name_or_path", ""))
+        if llm_config is None or not isinstance(dots_config, dict) or not checkpoint:
+            raise ValueError(
+                "dots.tts requires its top-level config and checkpoint path"
+            )
         self.qwen2 = Qwen2ForCausalLM(
-            config,
+            llm_config,
             quant_config=quant_config,
             prefix=f"{prefix}.qwen2" if prefix else "qwen2",
         )
-        dots_config = getattr(config, "dots_tts_config", None)
-        checkpoint = getattr(config, "dots_tts_checkpoint", None)
-        if not isinstance(dots_config, dict) or not checkpoint:
-            raise ValueError(
-                "dots.tts SGLang config is missing dots_tts_config/checkpoint"
-            )
         self.flow = DotsTTSFlowHead(
             dots_config,
-            llm_hidden_size=int(config.hidden_size),
-            latent_stats_path=f"{checkpoint}/latent_stats.pt",
-            optimize=bool(getattr(config, "dots_tts_optimize", False)),
+            llm_hidden_size=int(llm_config.hidden_size),
+            latent_stats_path=str(Path(checkpoint) / "latent_stats.pt"),
+            optimize=False,
         )
 
     def get_input_embeddings(self):
@@ -48,6 +50,19 @@ class DotsTTSSGLangModel(nn.Module):
         for name, tensor in weights:
             if name.startswith("llm."):
                 qwen_weights.append((name.removeprefix("llm."), tensor))
+                continue
+            if name.startswith(
+                (
+                    "audio_encoder.",
+                    "dec_mi_layer.",
+                    "decoder.",
+                    "enc_mi_layer.",
+                    "model.",
+                    "post_proj.",
+                    "pre_proj.",
+                    "resample.",
+                )
+            ):
                 continue
             parameter = flow_params.get(name)
             if parameter is None:

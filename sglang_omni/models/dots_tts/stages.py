@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -16,26 +15,14 @@ from sglang_omni.models.dots_tts.codec import (
     DotsReferenceEncoder,
     load_dots_audio_codec,
 )
-from sglang_omni.models.dots_tts.model_runner import DotsTTSModelRunner
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
-from sglang_omni.models.dots_tts.request_builders import (
-    apply_latent_result,
-    build_sglang_dots_tts_request,
-    build_stream_output,
-)
 from sglang_omni.models.dots_tts.vocoder import DotsTTSStreamingVocoder
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
-from sglang_omni.scheduling.sglang_backend import (
-    SGLangOutputProcessor,
-    build_sglang_server_args,
-)
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 from sglang_omni.utils.checkpoint import resolve_checkpoint
 
-_VIEW_ROOT = Path("/tmp/sglang_omni_dots_tts_views")
 _DEFAULT_CONTEXT_LENGTH = 2048
 
 
@@ -46,6 +33,11 @@ def _device(device: str | None, gpu_id: int | None) -> str:
 
 
 def _configure_optimized_kernels() -> None:
+    """Configure the process-global dots DiT compile hook.
+
+    This temporary upstream monkey patch is restored once dots.tts supports
+    shared-module FX for its one-shot prefill and recurrent decode modules.
+    """
     from dots_tts.modules.backbone import dit_inference, inference_utils
     from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 
@@ -341,33 +333,6 @@ def _load_model_metadata(model_path: str) -> tuple[str, Any, Any, int]:
     return root, dots_config, tokenizer, context_length
 
 
-def _ensure_sglang_checkpoint_view(model_path: str, *, optimize: bool) -> str:
-    root, dots_config, tokenizer, _context_length = _load_model_metadata(model_path)
-    digest = hashlib.sha256(f"2:{root}:{int(optimize)}".encode()).hexdigest()[:16]
-    view = _VIEW_ROOT / digest
-    view.mkdir(parents=True, exist_ok=True)
-    llm_config = json.loads((Path(root) / "llm_config.json").read_text())
-    llm_config.update(
-        architectures=["DotsTTSForConditionalGeneration"],
-        vocab_size=len(tokenizer),
-        dots_tts_config=dots_config.to_declared_dict(),
-        dots_tts_checkpoint=root,
-        dots_tts_optimize=bool(optimize),
-    )
-    (view / "config.json").write_text(json.dumps(llm_config), encoding="utf-8")
-    for source in Path(root).iterdir():
-        if source.name in {
-            "config.json",
-            "speaker_encoder.safetensors",
-            "vocoder.safetensors",
-        }:
-            continue
-        target = view / source.name
-        if not target.exists():
-            target.symlink_to(source)
-    return str(view)
-
-
 def create_preprocessing_executor(
     model_path: str,
     *,
@@ -414,62 +379,14 @@ def create_sglang_latent_engine_executor(
     server_args_overrides: dict[str, Any] | None = None,
 ) -> OmniScheduler:
     del max_generate_length
-    if optimize:
-        _configure_optimized_kernels()
-    if gpu_id is None:
-        gpu_id = int(device.rsplit(":", 1)[1]) if device and ":" in device else 0
-    overrides: dict[str, Any] = {
-        "disable_cuda_graph": True,
-        "disable_radix_cache": True,
-        "max_running_requests": 1,
-        "chunked_prefill_size": -1,
-        "mem_fraction_static": 0.20,
-        "dtype": precision,
-    }
-    overrides.update(server_args_overrides or {})
-    if int(overrides.get("tp_size", 1)) != 1:
-        raise ValueError("dots.tts base support does not implement TP")
-    if int(overrides.get("max_running_requests", 1)) != 1:
-        raise ValueError("dots.tts base support allows max_running_requests=1")
+    from sglang_omni.models.dots_tts.engine_builder import DotsTTSEngineBuilder
 
-    _root, _config, _tokenizer, context_length = _load_model_metadata(model_path)
-    server_args = build_sglang_server_args(
-        _ensure_sglang_checkpoint_view(model_path, optimize=optimize),
-        context_length=context_length,
-        **overrides,
-    )
-    server_args.disable_overlap_schedule = True
-    (
-        worker,
-        tree_cache,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-        prefill_manager,
-        decode_manager,
-        model_config,
-    ) = create_sglang_infrastructure(
-        server_args,
-        int(gpu_id),
-        model_arch_override="DotsTTSForConditionalGeneration",
-    )
-    runner = DotsTTSModelRunner(
-        worker,
-        SGLangOutputProcessor(capture_hidden=False),
-    )
-    return OmniScheduler(
-        tp_worker=worker,
-        tree_cache=tree_cache,
-        req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        server_args=server_args,
-        model_config=model_config,
-        prefill_manager=prefill_manager,
-        decode_manager=decode_manager,
-        model_runner=runner,
-        request_builder=build_sglang_dots_tts_request,
-        result_adapter=apply_latent_result,
-        stream_output_builder=build_stream_output,
-        enable_async_decode=False,
+    return DotsTTSEngineBuilder(optimize=optimize).build(
+        model_path,
+        device=device or "cuda",
+        gpu_id=gpu_id,
+        dtype=precision,
+        server_args_overrides=server_args_overrides,
     )
 
 
