@@ -299,6 +299,86 @@ def test_slot_rng_resumes_exactly_after_release_and_reacquire() -> None:
     torch.testing.assert_close(resumed_next, expected_next, rtol=0, atol=0)
 
 
+def test_reused_slot_matches_fresh_tail_after_longer_request_history() -> None:
+    torch.manual_seed(2718)
+    model = _TailModel().eval()
+    reused = _build_tail(model, slots=1)
+    fresh = copy.deepcopy(reused)
+    unit = reused.spec.unit_len
+    grid = torch.linspace(0.0, 1.0, NFE + 1)
+
+    old_slot = reused.acquire_slot()
+    old_condition = torch.randn(1, FM_HIDDEN)
+    old_mods = reused.dit.build_mods(
+        grid[:-1],
+        duration=grid[1:] - grid[:-1],
+        g_cond=old_condition,
+    )
+    reused.initialize_slot_rng(old_slot, seed=17)
+    reused.seed_fm_history(
+        old_slot,
+        fm_rows=torch.randn(5 * unit, FM_HIDDEN),
+        all_mods=old_mods,
+    )
+    reused.encode_prompt_patches(old_slot, torch.randn(1, 8, LATENT_DIM))
+    old_patch = reused.sample_patches(
+        [old_slot],
+        fm_hidden_rows=torch.randn(1, FM_HIDDEN),
+        latent_proj=model.latent_proj,
+    )
+    reused.encode_feedback([old_slot], old_patch)
+    reused.release_slot(old_slot)
+
+    reused_slot = reused.acquire_slot()
+    fresh_slot = fresh.acquire_slot()
+    new_condition = torch.randn(1, FM_HIDDEN)
+    new_mods = reused.dit.build_mods(
+        grid[:-1],
+        duration=grid[1:] - grid[:-1],
+        g_cond=new_condition,
+    )
+    new_prompt_rows = torch.randn(2 * unit, FM_HIDDEN)
+    new_prompt_latents = torch.randn(1, 4, LATENT_DIM)
+    new_hidden = torch.randn(1, FM_HIDDEN)
+    for acoustic_tail, slot in ((reused, reused_slot), (fresh, fresh_slot)):
+        acoustic_tail.initialize_slot_rng(slot, seed=23)
+        acoustic_tail.seed_fm_history(
+            slot,
+            fm_rows=new_prompt_rows,
+            all_mods=new_mods,
+        )
+
+    reused_prompt = reused.encode_prompt_patches(
+        reused_slot,
+        new_prompt_latents,
+    )
+    fresh_prompt = fresh.encode_prompt_patches(
+        fresh_slot,
+        new_prompt_latents,
+    )
+    reused_patch = reused.sample_patches(
+        [reused_slot],
+        fm_hidden_rows=new_hidden,
+        latent_proj=model.latent_proj,
+    )
+    fresh_patch = fresh.sample_patches(
+        [fresh_slot],
+        fm_hidden_rows=new_hidden,
+        latent_proj=model.latent_proj,
+    )
+    reused_feedback = reused.encode_feedback([reused_slot], reused_patch)
+    fresh_feedback = fresh.encode_feedback([fresh_slot], fresh_patch)
+
+    torch.testing.assert_close(reused_prompt, fresh_prompt, rtol=0, atol=0)
+    torch.testing.assert_close(reused_patch, fresh_patch, rtol=3e-4, atol=3e-4)
+    torch.testing.assert_close(
+        reused_feedback,
+        fresh_feedback,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+
+
 def test_tail_slots_are_bounded_and_reusable() -> None:
     acoustic_tail = _build_tail(_TailModel().eval(), slots=2)
     first = acoustic_tail.acquire_slot()
