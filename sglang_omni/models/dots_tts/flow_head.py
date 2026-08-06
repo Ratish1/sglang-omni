@@ -489,14 +489,7 @@ class DotsTTSFlowHead(nn.Module):
             self.validate_request(num_steps=steps, ode_method=method)
         hidden = hidden_states[:, -1] if hidden_states.ndim == 3 else hidden_states
         probabilities = self.eos_proj(hidden).softmax(dim=-1)[:, 1]
-        finished = [
-            (
-                False
-                if state.suppress_first_eos_check and state.decoded_patches == 0
-                else bool(probabilities[row].gt(float(eos_thresholds[row])).item())
-            )
-            for row, state in enumerate(states)
-        ]
+        eos_hits = probabilities.gt(probabilities.new_tensor(eos_thresholds))
         slots = [state.slot for state in states]
         if any(slot is None for slot in slots):
             raise RuntimeError("dots.tts batched request is missing its tail slot")
@@ -509,6 +502,16 @@ class DotsTTSFlowHead(nn.Module):
             slots,
             self._patch_encoder_input(normalized, already_normalized=True),
         )
+        # Single readback after the tail work is queued so the sync overlaps it.
+        eos_flags = eos_hits.tolist()
+        finished = [
+            (
+                False
+                if state.suppress_first_eos_check and state.decoded_patches == 0
+                else bool(eos_flags[row])
+            )
+            for row, state in enumerate(states)
+        ]
         results = []
         for row, state in enumerate(states):
             emit = not state.drop_regenerated_prompt_patch
