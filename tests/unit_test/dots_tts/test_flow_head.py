@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from sglang_omni.models.dots_tts.flow_head import DotsTTSFlowHead
@@ -85,3 +88,42 @@ def test_single_stream_decode_batch_accepts_2d_hidden(tmp_path) -> None:
         assert step.emit
         assert not step.finished
     assert state.decoded_patches == 2
+
+
+def test_validate_request_batched_gates_prompt_and_span_budget() -> None:
+    flow = SimpleNamespace(
+        is_batched=True,
+        _batched_nfe=4,
+        _tail=SimpleNamespace(spec=SimpleNamespace(patch_capacity=9)),
+    )
+    validate = DotsTTSFlowHead.validate_request
+
+    validate(
+        flow, num_steps=4, ode_method="euler", prompt_patch_count=3, total_span_count=9
+    )
+
+    with pytest.raises(ValueError, match="reference audio"):
+        validate(
+            flow,
+            num_steps=4,
+            ode_method="euler",
+            prompt_patch_count=0,
+            total_span_count=9,
+        )
+    with pytest.raises(ValueError, match="audio spans"):
+        validate(
+            flow,
+            num_steps=4,
+            ode_method="euler",
+            prompt_patch_count=3,
+            total_span_count=10,
+        )
+
+    single = SimpleNamespace(is_batched=False)
+    validate(
+        single,
+        num_steps=8,
+        ode_method="rk4",
+        prompt_patch_count=0,
+        total_span_count=10**6,
+    )

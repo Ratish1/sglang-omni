@@ -176,7 +176,14 @@ class DotsTTSFlowHead(nn.Module):
         )
         self._batched_nfe = int(nfe)
 
-    def validate_request(self, *, num_steps: int, ode_method: str) -> None:
+    def validate_request(
+        self,
+        *,
+        num_steps: int,
+        ode_method: str,
+        prompt_patch_count: int | None = None,
+        total_span_count: int | None = None,
+    ) -> None:
         if not self.is_batched:
             return
         if int(num_steps) != self._batched_nfe:
@@ -186,6 +193,20 @@ class DotsTTSFlowHead(nn.Module):
             )
         if str(ode_method) != "euler":
             raise ValueError("dots.tts continuous batching currently requires euler")
+        if prompt_patch_count is not None and int(prompt_patch_count) <= 0:
+            raise ValueError(
+                "dots.tts continuous batching requires reference audio with its "
+                "transcript; use max_running_requests=1 for x-vector-only synthesis"
+            )
+        # The patch-encoder KV pool is the binding pool: it holds one row per
+        # audio span, so prompt + generated spans must fit patch_capacity.
+        max_spans = int(self._tail.spec.patch_capacity)
+        if total_span_count is not None and int(total_span_count) > max_spans:
+            raise ValueError(
+                f"dots.tts request needs {total_span_count} audio spans but the "
+                f"engine tail fits {max_spans}; raise the latent_engine "
+                "max_generate_length or lower the request limit"
+            )
 
     @torch.inference_mode()
     def new_request(

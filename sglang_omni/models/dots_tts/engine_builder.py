@@ -110,6 +110,8 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
             model.flow.validate_request(
                 num_steps=data.state.num_steps,
                 ode_method=data.state.ode_method,
+                prompt_patch_count=int(data.prompt_span_positions.numel()),
+                total_span_count=int(data.span_positions.numel()),
             )
             return data
 
