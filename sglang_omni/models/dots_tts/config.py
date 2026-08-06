@@ -15,6 +15,8 @@ class DotsTTSPipelineConfig(PipelineConfig):
 
     architecture: ClassVar[str] = "DotsTTSForConditionalGeneration"
     requires_model_capabilities: ClassVar[bool] = True
+    required_speech_reference_count: ClassVar[int | None] = 1
+    speech_reference_text_required: ClassVar[bool] = True
     architecture_aliases: ClassVar[tuple[str, ...]] = (
         "dots_tts",
         "DotsTtsModel",
