@@ -98,3 +98,44 @@ def test_preprocessing_rejects_non_base_public_task_before_schedule_build() -> N
         _preprocess(_payload(task_type="VoiceDesign"), tokenizer)
 
     assert tokenizer.encoded_text == []
+
+
+@pytest.mark.parametrize(
+    ("references", "message"),
+    [
+        ([], "exactly one reference audio"),
+        (
+            [
+                {"audio_path": "first.wav", "text": "first"},
+                {"audio_path": "second.wav", "text": "second"},
+            ],
+            "exactly one reference audio",
+        ),
+        ([{"audio_path": "reference.wav"}], "reference transcript is required"),
+    ],
+)
+def test_preprocessing_enforces_supported_reference_conditioning(
+    references: list[dict[str, str]],
+    message: str,
+) -> None:
+    payload = _payload()
+    payload.request.inputs["references"] = references
+
+    with pytest.raises(ValueError, match=message):
+        _preprocess(payload, _RecordingTokenizer())
+
+
+def test_preprocessing_accepts_one_reference_through_direct_fields() -> None:
+    payload = StagePayload(
+        request_id="rid",
+        request=OmniRequest(
+            inputs={"input": "hello", "prompt_audio_path": "reference.wav"},
+            params={},
+            metadata={"tts_params": {"ref_text": "reference"}},
+        ),
+    )
+
+    state = _preprocess(payload, _RecordingTokenizer())
+
+    assert state.prompt_audio_path == "reference.wav"
+    assert state.use_prompt_prefill is True

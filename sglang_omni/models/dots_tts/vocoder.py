@@ -35,10 +35,8 @@ class DotsTTSBatchVocoder(BatchVocoderBase):
             return []
         groups: dict[int, list[int]] = defaultdict(list)
         for item_index, (_state, latents) in enumerate(items):
-            assert latents.ndim == 3 and latents.size(0) == 1
-            assert latents.size(2) == self.codec.latent_dim
             groups[int(latents.size(1))].append(item_index)
-        outputs: list[tuple[torch.Tensor, int] | None] = [None] * len(items)
+        outputs: dict[int, tuple[torch.Tensor, int]] = {}
         with self.codec.lock:
             for indices in groups.values():
                 batch_latents = torch.cat(
@@ -46,19 +44,16 @@ class DotsTTSBatchVocoder(BatchVocoderBase):
                     dim=0,
                 ).to(self.codec.device)
                 waveforms = self.codec.inference.decode_latents(batch_latents)
-                assert waveforms.size(0) == len(indices)
                 for row, item_index in enumerate(indices):
                     outputs[item_index] = (
                         waveforms[row : row + 1],
                         self.codec.sample_rate,
                     )
-        assert all(output is not None for output in outputs)
-        return [output for output in outputs if output is not None]
+        return [outputs[index] for index in range(len(items))]
 
     async def decode_payloads(self, payloads: list[StagePayload]) -> list[StagePayload]:
         items = [self.prepare_item(payload) for payload in payloads]
         results = await self.decode_batch(items)
-        assert len(results) == len(items)
         return [
             self.store_result(payload, state, waveform, sample_rate)
             for payload, (state, _latents), (waveform, sample_rate) in zip(

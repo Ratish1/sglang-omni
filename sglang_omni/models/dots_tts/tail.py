@@ -753,19 +753,20 @@ class DotsTtsAcousticTail:
 
     def _sample_noise(self, slots: list[int]) -> torch.Tensor:
         shape = (self.spec.latent_patch_size, self.spec.latent_dim)
-        generators = [self._generators[slot] for slot in slots]
-        assert all(generator is not None for generator in generators)
-        return torch.cat(
-            [
+        noise = []
+        for slot in slots:
+            generator = self._generators[slot]
+            if generator is None:
+                raise RuntimeError("dots.tts tail slot has no request RNG")
+            noise.append(
                 torch.randn(
                     (1, *shape),
                     generator=generator,
                     device=self.device,
                     dtype=self.dtype,
                 )
-                for generator in generators
-            ]
-        )
+            )
+        return torch.cat(noise)
 
     @torch.no_grad()
     def encode_feedback(

@@ -544,7 +544,8 @@ class DotsTTSFlowHead(nn.Module):
         append_hidden: bool,
     ) -> list[DotsFlowStep]:
         batch_size = len(states)
-        assert batch_size > 0
+        if not batch_size:
+            return []
         assert hidden_states.ndim in {2, 3}
         assert hidden_states.size(0) == batch_size
         assert all(

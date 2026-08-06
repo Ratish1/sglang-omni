@@ -73,10 +73,12 @@ class DotsTTSModelRunner(ModelRunner):
                 req_len = int(data.req.extend_range.length)
                 assert prefix_len == 0, "dots.tts radix prefix reuse is disabled"
                 prompt_len = embeddings.size(1)
-                assert req_len >= prompt_len
                 generated_count = req_len - prompt_len
-                assert generated_count == len(data.req.output_ids)
-                assert generated_count == len(data.decoded_latent_patches)
+                assert (
+                    generated_count
+                    == len(data.req.output_ids)
+                    == len(data.decoded_latent_patches)
+                ), "dots.tts re-prefill history must match generated tokens"
                 request_rows = [embeddings[0]]
                 if generated_count:
                     request_rows.append(
@@ -255,8 +257,7 @@ class DotsTTSModelRunner(ModelRunner):
 
     def _suspend_request_data(self, req_data: Any) -> None:
         flow_state = req_data.flow_state
-        assert flow_state is not None
-        assert not isinstance(flow_state, DotsFlowResume)
+        assert flow_state is not None and not isinstance(flow_state, DotsFlowResume)
         req_data.flow_state = DotsFlowResume(
             self.model.flow.suspend_request(flow_state)
         )

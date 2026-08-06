@@ -123,13 +123,16 @@ def preprocess_dots_tts_payload(
     stage_params = _dict(params.get("stage_params"))
     engine_params = _dict(stage_params.get("latent_engine"))
     references = inputs.get("references")
-    reference = (
-        references[0]
-        if isinstance(references, list)
-        and references
-        and isinstance(references[0], dict)
-        else {}
-    )
+    if references is None:
+        reference = {}
+    elif not isinstance(references, list):
+        raise TypeError("dots.tts references must be a list")
+    elif len(references) != 1:
+        raise ValueError("dots.tts requires exactly one reference audio")
+    elif not isinstance(references[0], dict):
+        raise TypeError("dots.tts reference must be an object")
+    else:
+        reference = references[0]
 
     text = str(_first_not_none(inputs.get("input"), inputs.get("text"), default=""))
     if not text.strip():
@@ -147,9 +150,11 @@ def preprocess_dots_tts_payload(
         tts_params.get("ref_text"),
         reference.get("text"),
     )
-    prompt_text = None if prompt_text_value is None else str(prompt_text_value)
-    if prompt_text and not prompt_audio:
-        raise ValueError("dots.tts prompt_text requires prompt audio")
+    if not prompt_audio:
+        raise ValueError("dots.tts requires exactly one reference audio")
+    if prompt_text_value is None or not str(prompt_text_value).strip():
+        raise ValueError("dots.tts reference transcript is required")
+    prompt_text = str(prompt_text_value)
 
     task_type = _first_not_none(
         inputs.get("task_type"),
