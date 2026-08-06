@@ -107,6 +107,16 @@ def build_generation_batch_overrides(
     else:
         overrides["cuda_graph_bs"] = cuda_graph_bs
 
+    # sglang resolves an explicit prefill backend after the disable flags;
+    # without this, a stage-default backend overrides a deployment's disable.
+    disables_prefill = bool(incoming.get("disable_cuda_graph")) or bool(
+        incoming.get("disable_prefill_cuda_graph")
+    )
+    if disables_prefill and "cuda_graph_backend_prefill" not in incoming:
+        overrides["cuda_graph_backend_prefill"] = "disabled"
+        overrides.pop("cuda_graph_bs_prefill", None)
+        overrides.pop("cuda_graph_max_bs_prefill", None)
+
     # Derive the prefill cap when only the bucket list is given so the
     # resolved config stays coherent (max(bs) == max_bs).
     prefill_bs = overrides.get("cuda_graph_bs_prefill")

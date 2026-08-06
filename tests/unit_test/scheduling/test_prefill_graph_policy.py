@@ -245,6 +245,40 @@ def test_overrides_derive_prefill_max_bs_from_buckets() -> None:
     assert explicit["cuda_graph_max_bs_prefill"] == 256
 
 
+def test_disable_overrides_win_over_default_prefill_backend() -> None:
+    stage_defaults = {
+        "cuda_graph_backend_prefill": "breakable",
+        "cuda_graph_bs_prefill": [128, 256],
+    }
+
+    for disable_key in ("disable_cuda_graph", "disable_prefill_cuda_graph"):
+        overrides = build_generation_batch_overrides(
+            max_running_requests=4,
+            server_args_overrides={disable_key: True},
+            **stage_defaults,
+        )
+        assert overrides["cuda_graph_backend_prefill"] == "disabled"
+        assert "cuda_graph_bs_prefill" not in overrides
+        assert "cuda_graph_max_bs_prefill" not in overrides
+
+    explicit_disable = build_generation_batch_overrides(
+        max_running_requests=4,
+        server_args_overrides={"cuda_graph_backend_prefill": "disabled"},
+        **stage_defaults,
+    )
+    assert explicit_disable["cuda_graph_backend_prefill"] == "disabled"
+
+    explicit_conflict = build_generation_batch_overrides(
+        max_running_requests=4,
+        server_args_overrides={
+            "disable_cuda_graph": True,
+            "cuda_graph_backend_prefill": "breakable",
+        },
+        **stage_defaults,
+    )
+    assert explicit_conflict["cuda_graph_backend_prefill"] == "breakable"
+
+
 def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
     from sglang_omni.scheduling import bootstrap, sglang_backend
     from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
