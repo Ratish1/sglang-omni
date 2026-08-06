@@ -14,20 +14,6 @@ from sglang_omni.scheduling.generation_batch_policy import (
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 
-def _validate_prefill_graph_prereqs(server_args: Any, device: str) -> None:
-    """Reject breakable prefill graphs outside their validated envelope."""
-    if not device.startswith("cuda"):
-        raise RuntimeError(
-            "breakable prefill CUDA graphs require a CUDA device, " f"got {device!r}"
-        )
-    tp_size = int(server_args.tp_size)
-    if tp_size != 1:
-        raise RuntimeError(
-            "breakable prefill CUDA graphs are validated for tp_size == 1, "
-            f"got tp_size={tp_size}"
-        )
-
-
 class SGLangGenerationEngineBuilder(ABC):
     """Build the model-neutral parts of a SGLang AR engine stage.
 
@@ -93,7 +79,6 @@ class SGLangGenerationEngineBuilder(ABC):
                     "(supports_breakable_prefill_cuda_graph=False); refusing "
                     "cuda_graph_backend_prefill='breakable'"
                 )
-            _validate_prefill_graph_prereqs(server_args, device)
             infra_kwargs.setdefault("enable_prefill_input_embeds", True)
         want_cuda_graph, (
             model_worker,

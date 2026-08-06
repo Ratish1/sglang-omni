@@ -245,18 +245,6 @@ def test_overrides_derive_prefill_max_bs_from_buckets() -> None:
     assert explicit["cuda_graph_max_bs_prefill"] == 256
 
 
-def test_prefill_graph_prereqs_reject_non_cuda_and_tp() -> None:
-    from sglang_omni.scheduling.engine_factory import _validate_prefill_graph_prereqs
-
-    with pytest.raises(RuntimeError, match="CUDA device"):
-        _validate_prefill_graph_prereqs(_server_args(), "mps")
-    with pytest.raises(RuntimeError, match="tp_size == 1"):
-        tp2 = _server_args()
-        tp2.tp_size = 2
-        _validate_prefill_graph_prereqs(tp2, "cuda:0")
-    _validate_prefill_graph_prereqs(_server_args(), "cuda:0")
-
-
 def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
     from sglang_omni.scheduling import bootstrap, sglang_backend
     from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
