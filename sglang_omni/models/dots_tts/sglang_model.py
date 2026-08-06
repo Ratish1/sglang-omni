@@ -65,14 +65,14 @@ class DotsTTSSGLangModel(nn.Module):
             ):
                 continue
             parameter = flow_params.get(name)
-            if parameter is None:
-                continue
+            assert parameter is not None, (
+                f"Unexpected dots.tts checkpoint weight {name!r}; expected an "
+                "llm weight, a separately loaded codec weight, or a flow parameter"
+            )
             loader = getattr(parameter, "weight_loader", default_weight_loader)
             loader(parameter, tensor)
             loaded.add(f"flow.{name}")
-        qwen_loaded = self.qwen2.load_weights(qwen_weights)
-        if qwen_loaded:
-            loaded.update(f"qwen2.{name}" for name in qwen_loaded)
+        self.qwen2.load_weights(qwen_weights)
         return loaded
 
     def forward(
