@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+
+logger = logging.getLogger(__name__)
 
 
 class DotsTTSEngineBuilder(TtsEngineBuilder):
@@ -36,9 +39,13 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
         from sglang_omni.models.dots_tts.hf_config import register_dots_tts_hf_config
 
         register_dots_tts_hf_config()
-        if self.optimize:
-            # The process-global compile policy must exist before SGLang builds
-            # the model; applying it in setup_model nests Dynamo under FX.
+
+    def customize_server_args(self, server_args: Any) -> None:
+        # The compiled DiT path only serves max_running_requests=1; the batched
+        # tail is eager, so skip the process-global compile policy otherwise.
+        # The policy must exist before SGLang builds the model; applying it in
+        # setup_model nests Dynamo under FX.
+        if self.optimize and int(server_args.max_running_requests) == 1:
             from sglang_omni.models.dots_tts.stages import _configure_optimized_kernels
 
             _configure_optimized_kernels()
@@ -85,6 +92,13 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
         model = model_worker.model_runner.model
         max_running_requests = int(server_args.max_running_requests)
         model.flow.optimize = self.optimize and max_running_requests == 1
+        if self.optimize and max_running_requests > 1:
+            logger.info(
+                "dots.tts optimize with max_running_requests=%d runs the eager "
+                "fused batched tail; the compiled DiT path requires "
+                "max_running_requests=1",
+                max_running_requests,
+            )
         if max_running_requests > 1:
             model.flow.init_batched_tail(
                 num_slots=max_running_requests,
