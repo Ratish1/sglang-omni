@@ -10,6 +10,7 @@ from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
     get_prefill_cuda_graph_backend,
     validate_generation_batch_policy,
+    validate_prefill_graph_policy,
 )
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
@@ -96,6 +97,12 @@ class TtsEngineBuilder(ABC):
             # SGLang registers the prefill input_embeds slot only for
             # multimodal model configs; the payload channel needs it.
             infra_kwargs.setdefault("enable_prefill_input_embeds", True)
+        if prefill_graph_backend != "disabled":
+            # Fail a misdeclared policy here, before weights and KV cache are
+            # loaded; validate_generation_batch_policy re-checks it later.
+            validate_prefill_graph_policy(
+                model_name=self.model_name, server_args=server_args
+            )
         want_cuda_graph, (
             model_worker,
             tree_cache,

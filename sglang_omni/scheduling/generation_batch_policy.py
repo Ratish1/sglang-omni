@@ -185,6 +185,23 @@ def validate_generation_batch_policy(
         )
 
 
+def validate_prefill_graph_policy(*, model_name: str, server_args: Any) -> None:
+    """Validate only the prefill graph policy, before any model load.
+
+    Same rules as the prefill section of validate_generation_batch_policy
+    (which re-runs them later); this early entry point lets a misdeclared
+    policy fail startup before weights and KV cache are allocated.
+    """
+    errors: list[str] = []
+    _validate_prefill_graph_policy(
+        server_args, not bool(server_args.disable_cuda_graph), errors
+    )
+    if errors:
+        raise ValueError(
+            f"{model_name} invalid prefill CUDA graph policy: " + "; ".join(errors)
+        )
+
+
 def _validate_prefill_graph_policy(
     server_args: Any,
     cuda_graph_enabled: bool,

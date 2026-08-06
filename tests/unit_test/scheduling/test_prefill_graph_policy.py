@@ -389,3 +389,65 @@ def test_builder_rejects_breakable_without_model_opt_in(monkeypatch) -> None:
                 "cuda_graph_bs_prefill": [128, 256],
             },
         )
+
+
+def test_builder_fails_misdeclared_policy_before_infrastructure(monkeypatch) -> None:
+    """A breakable policy without declared buckets must fail before model
+    weights and KV cache are allocated, not after (operator feedback loop)."""
+    from sglang_omni.scheduling import bootstrap, sglang_backend
+    from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+
+    infra_calls: list[Any] = []
+
+    def fake_build_sglang_server_args(checkpoint_dir, *, context_length, **overrides):
+        del checkpoint_dir, context_length, overrides
+        # Breakable declared but no bucket lock: sglang would auto-generate a
+        # ladder; the omni policy must refuse it up front.
+        return _server_args(
+            prefill_backend="breakable",
+            prefill_bs=(4, 8, 16),
+            locked=frozenset(),
+        )
+
+    def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):
+        del server_args, gpu_id, kwargs
+        infra_calls.append(True)
+        raise AssertionError("infrastructure must not be constructed")
+
+    monkeypatch.setattr(
+        sglang_backend, "build_sglang_server_args", fake_build_sglang_server_args
+    )
+    monkeypatch.setattr(
+        bootstrap, "create_sglang_infrastructure", fake_create_sglang_infrastructure
+    )
+
+    class AdoptingBuilder(TtsEngineBuilder):
+        model_name = "Test TTS"
+        context_length = 123
+        supports_breakable_prefill_cuda_graph = True
+
+        def resolve_checkpoint(self, model_path: str) -> str:
+            return model_path
+
+        def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
+            del dtype
+            return {"max_running_requests": 4}
+
+        def setup_model(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
+            del output_proc
+            return model_worker
+
+        def make_adapters(self, model: Any) -> tuple[Any, Any]:
+            del model
+            return object(), object()
+
+    with pytest.raises(ValueError, match="explicit cuda_graph_bs_prefill"):
+        AdoptingBuilder().build(
+            "model",
+            server_args_overrides={"cuda_graph_backend_prefill": "breakable"},
+        )
+
+    assert infra_calls == []
