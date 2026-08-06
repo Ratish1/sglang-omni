@@ -17,7 +17,14 @@ def test_dots_engine_uses_shared_tts_builder() -> None:
 
 
 def test_dots_engine_accepts_continuous_batching() -> None:
-    DotsTTSEngineBuilder().adjust_overrides({"tp_size": 1, "max_running_requests": 16})
+    builder = DotsTTSEngineBuilder()
+    overrides = {"tp_size": 1, "max_running_requests": 7}
+
+    builder.adjust_overrides(overrides)
+
+    assert builder.max_running_requests == 7
+    assert overrides["disable_radix_cache"] is True
+    assert overrides["chunked_prefill_size"] == 0
 
 
 @pytest.mark.parametrize(
