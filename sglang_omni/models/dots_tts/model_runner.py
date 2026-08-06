@@ -9,6 +9,7 @@ import torch
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.dots_tts.request_builders import DotsFlowResume
 
 
 class DotsTTSModelRunner(ModelRunner):
@@ -35,16 +36,23 @@ class DotsTTSModelRunner(ModelRunner):
                     raise RuntimeError(
                         "dots.tts request is missing its generation schedule"
                     )
-                if data.flow_state is not None:
-                    self._snapshot_and_release_flow_state(data)
+                if (
+                    data.flow_state is not None
+                    and not isinstance(data.flow_state, DotsFlowResume)
+                ):
+                    self._suspend_request_data(data)
                 self._request_data.pop(request.request_id, None)
+                resume = data.flow_state
                 flow_state, prompt_embeddings = self.model.flow.new_request(
                     max_audio_patch_count=int(data.span_positions.numel()),
                     prompt_latents=data.state.prompt_latents,
                     speaker_embedding=data.state.speaker_embedding,
                     speaker_scale=data.state.speaker_scale,
-                    seed=data.state.seed,
-                    rng_state=data.flow_rng_state,
+                    rng=(
+                        resume.rng_state
+                        if isinstance(resume, DotsFlowResume)
+                        else data.state.seed
+                    ),
                 )
                 data.flow_state = flow_state
                 self._request_data[request.request_id] = data
@@ -68,13 +76,13 @@ class DotsTTSModelRunner(ModelRunner):
                 assert req_len >= prompt_len
                 generated_count = req_len - prompt_len
                 assert generated_count == len(data.req.output_ids)
-                assert len(data.feedback_embeddings) >= generated_count
+                assert generated_count == len(data.decoded_latent_patches)
                 request_rows = [embeddings[0]]
                 if generated_count:
                     request_rows.append(
-                        torch.stack(
-                            data.feedback_embeddings[:generated_count],
-                            dim=0,
+                        self.model.flow.replay_feedback(
+                            flow_state,
+                            data.decoded_latent_patches,
                         ).to(device=device, dtype=embeddings.dtype)
                     )
                 rows.append(torch.cat(request_rows, dim=0))
@@ -101,10 +109,7 @@ class DotsTTSModelRunner(ModelRunner):
             queue = request.data.pending_feedback_queue
             if not queue:
                 raise RuntimeError("dots.tts decode is missing its latent feedback")
-            feedback = queue.popleft()
-            if feedback.ndim > 1:
-                feedback = feedback.reshape(-1, feedback.shape[-1])[-1]
-            rows.append(feedback)
+            rows.append(queue.popleft())
         forward_batch.input_embeds = torch.stack(rows).to(
             device=forward_batch.input_ids.device,
             dtype=next(self.model.parameters()).dtype,
@@ -149,7 +154,7 @@ class DotsTTSModelRunner(ModelRunner):
             request_hidden = hidden[offset : offset + length].unsqueeze(0)
             if request_hidden.size(1) != length:
                 raise RuntimeError("dots.tts prefill hidden rows are incomplete")
-            self.model.flow.initialize_history(
+            self.model.flow.initialize_flow_history(
                 data.flow_state,
                 hidden_states=request_hidden,
                 prompt_span_positions=data.prompt_span_positions,
@@ -205,7 +210,6 @@ class DotsTTSModelRunner(ModelRunner):
         next_token_ids = []
         for data, step in zip(data_rows, steps, strict=True):
             feedback = step.feedback_embedding.detach().clone()
-            data.feedback_embeddings.append(feedback)
             data.pending_feedback_queue.append(feedback)
             decoded_latent = step.latent_patch.detach().clone()
             data.decoded_latent_patches.append(decoded_latent)
@@ -242,19 +246,26 @@ class DotsTTSModelRunner(ModelRunner):
 
     def _release_retracted_flow_states(self) -> None:
         for req_data in self._request_data.values():
-            if req_data.flow_state is not None and req_data.req.is_retracted:
-                self._snapshot_and_release_flow_state(req_data)
+            if (
+                req_data.flow_state is not None
+                and not isinstance(req_data.flow_state, DotsFlowResume)
+                and req_data.req.is_retracted
+            ):
+                self._suspend_request_data(req_data)
 
-    def _snapshot_and_release_flow_state(self, req_data: Any) -> None:
+    def _suspend_request_data(self, req_data: Any) -> None:
         flow_state = req_data.flow_state
         assert flow_state is not None
-        req_data.flow_rng_state = self.model.flow.export_request_rng_state(flow_state)
-        self.model.flow.release_request(flow_state)
+        assert not isinstance(flow_state, DotsFlowResume)
+        req_data.flow_state = DotsFlowResume(
+            self.model.flow.suspend_request(flow_state)
+        )
         req_data.pending_feedback_queue.clear()
-        req_data.flow_state = None
 
     def _clear_request_data(self, req_data: Any) -> None:
-        self.model.flow.release_request(req_data.flow_state)
+        flow_state = req_data.flow_state
+        if flow_state is not None and not isinstance(flow_state, DotsFlowResume):
+            self.model.flow.release_request(flow_state)
         req_data.pending_feedback_queue.clear()
         req_data.flow_state = None
 

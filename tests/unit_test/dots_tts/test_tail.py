@@ -11,6 +11,7 @@ from dots_tts.modules.backbone.dit import DiT
 from dots_tts.modules.backbone.encoder import VAESemanticEncoder
 
 from sglang_omni.models.dots_tts import tail
+from sglang_omni.models.dots_tts.flow_head import DotsTTSFlowHead
 
 FM_HIDDEN = 32
 LATENT_DIM = 6
@@ -83,8 +84,13 @@ def _patch_encoder() -> VAESemanticEncoder:
     return VAESemanticEncoder(in_dim=LATENT_DIM, out_dim=FM_HIDDEN, config=config)
 
 
-def _build_tail(model: _TailModel, *, slots: int):
-    encoder = _patch_encoder()
+def _build_tail(
+    model: _TailModel,
+    *,
+    slots: int,
+    encoder: VAESemanticEncoder | None = None,
+):
+    encoder = _patch_encoder() if encoder is None else encoder
     with torch.no_grad():
         for parameter in encoder.parameters():
             parameter.normal_(0.0, 0.2)
@@ -104,6 +110,38 @@ def _build_tail(model: _TailModel, *, slots: int):
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
+
+
+class _IdentityIO:
+    @staticmethod
+    def normalize(value: torch.Tensor) -> torch.Tensor:
+        return value
+
+    @staticmethod
+    def denormalize(value: torch.Tensor) -> torch.Tensor:
+        return value
+
+
+def _build_flow_head(model: _TailModel, *, slots: int) -> DotsTTSFlowHead:
+    flow = object.__new__(DotsTTSFlowHead)
+    torch.nn.Module.__init__(flow)
+    flow.fm_hidden_size = FM_HIDDEN
+    flow.hidden_patch_size = 1
+    flow.latent_patch_size = PATCH_SIZE
+    flow.latent_dim = LATENT_DIM
+    flow.optimize = False
+    flow.mode = "meanflow"
+    flow.patch_encoder = _patch_encoder()
+    flow.hidden_proj = torch.nn.Linear(FM_HIDDEN, FM_HIDDEN)
+    flow.latent_proj = model.latent_proj
+    flow.coordinate_proj = model.coordinate_proj
+    flow.eos_proj = torch.nn.Linear(FM_HIDDEN, 2)
+    flow.io = _IdentityIO()
+    flow._patch_inference = None
+    flow._dit_solver = None
+    flow._tail = _build_tail(model, slots=slots, encoder=flow.patch_encoder)
+    flow._batched_nfe = NFE
+    return flow
 
 
 def _reference_meanflow(
@@ -156,7 +194,7 @@ def test_kv_cached_tail_matches_full_recompute() -> None:
     )
     prompt_rows = torch.randn(3 * unit, FM_HIDDEN)
     slot = acoustic_tail.acquire_slot()
-    acoustic_tail.initialize_slot_rng(slot, seed=9)
+    acoustic_tail.initialize_slot_rng(slot, 9)
     acoustic_tail.seed_fm_history(slot, fm_rows=prompt_rows, all_mods=mods)
     sequence = torch.zeros(1, acoustic_tail.spec.dit_cache_tokens + unit, FM_HIDDEN)
     sequence[0, : prompt_rows.size(0)] = prompt_rows
@@ -201,8 +239,8 @@ def test_multi_slot_tail_matches_isolated_reordered_recurrence() -> None:
             duration=grid[1:] - grid[:-1],
             g_cond=conditions[row],
         )
-        batched.initialize_slot_rng(batched_slots[row], seed=100 + row)
-        isolated.initialize_slot_rng(isolated_slots[row], seed=100 + row)
+        batched.initialize_slot_rng(batched_slots[row], 100 + row)
+        isolated.initialize_slot_rng(isolated_slots[row], 100 + row)
         batched.seed_fm_history(
             batched_slots[row],
             fm_rows=prompt_rows[row],
@@ -282,21 +320,128 @@ def test_multi_slot_tail_matches_isolated_reordered_recurrence() -> None:
 def test_slot_rng_resumes_exactly_after_release_and_reacquire() -> None:
     acoustic_tail = _build_tail(_TailModel().eval(), slots=1)
     slot = acoustic_tail.acquire_slot()
-    acoustic_tail.initialize_slot_rng(slot, seed=314)
+    acoustic_tail.initialize_slot_rng(slot, 314)
     acoustic_tail._sample_noise([slot])
     saved_state = acoustic_tail.slot_rng_state(slot)
     expected_next = acoustic_tail._sample_noise([slot])
 
     acoustic_tail.release_slot(slot)
     resumed_slot = acoustic_tail.acquire_slot()
-    acoustic_tail.initialize_slot_rng(
-        resumed_slot,
-        seed=None,
-        rng_state=saved_state,
-    )
+    acoustic_tail.initialize_slot_rng(resumed_slot, saved_state)
     resumed_next = acoustic_tail._sample_noise([resumed_slot])
 
     torch.testing.assert_close(resumed_next, expected_next, rtol=0, atol=0)
+
+
+def test_flow_rematerialization_matches_uninterrupted_next_step() -> None:
+    torch.manual_seed(1618)
+    flow = _build_flow_head(_TailModel().eval(), slots=2)
+    prompt_latents = torch.randn(1, 2 * PATCH_SIZE, LATENT_DIM)
+    prefill_hidden = torch.randn(1, 3, FM_HIDDEN)
+    prompt_positions = torch.tensor([1, 2])
+    schedule = torch.tensor([[0, 1, 1, 1]])
+
+    uninterrupted, _ = flow.new_request(
+        max_audio_patch_count=6,
+        prompt_latents=prompt_latents,
+        speaker_embedding=None,
+        speaker_scale=1.0,
+        rng=41,
+    )
+    retracted, _ = flow.new_request(
+        max_audio_patch_count=6,
+        prompt_latents=prompt_latents,
+        speaker_embedding=None,
+        speaker_scale=1.0,
+        rng=41,
+    )
+    for state in (uninterrupted, retracted):
+        flow.initialize_flow_history(
+            state,
+            hidden_states=prefill_hidden,
+            prompt_span_positions=prompt_positions,
+            audio_span_token_ids={1},
+            generation_schedule=schedule,
+            prefill_end=3,
+            decoded_latent_patches=[],
+        )
+
+    first_steps = flow.decode_batch(
+        [uninterrupted, retracted],
+        hidden_states=prefill_hidden[:, -1].expand(2, -1),
+        num_steps=[NFE, NFE],
+        ode_methods=["euler", "euler"],
+        guidance_scales=[1.0, 1.0],
+        eos_thresholds=[2.0, 2.0],
+        append_hidden=False,
+    )
+    torch.testing.assert_close(
+        first_steps[0].latent_patch,
+        first_steps[1].latent_patch,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+
+    rng_state = flow.suspend_request(retracted)
+    rematerialized, _ = flow.new_request(
+        max_audio_patch_count=6,
+        prompt_latents=prompt_latents,
+        speaker_embedding=None,
+        speaker_scale=1.0,
+        rng=rng_state,
+    )
+    replayed_feedback = flow.replay_feedback(
+        rematerialized,
+        [first_steps[1].latent_patch],
+    )
+    torch.testing.assert_close(
+        replayed_feedback[0],
+        first_steps[1].feedback_embedding,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+
+    next_hidden = torch.randn(1, FM_HIDDEN)
+    flow.initialize_flow_history(
+        rematerialized,
+        hidden_states=torch.cat([prefill_hidden, next_hidden.unsqueeze(1)], dim=1),
+        prompt_span_positions=prompt_positions,
+        audio_span_token_ids={1},
+        generation_schedule=schedule,
+        prefill_end=3,
+        decoded_latent_patches=[first_steps[1].latent_patch],
+    )
+    [expected] = flow.decode_batch(
+        [uninterrupted],
+        hidden_states=next_hidden,
+        num_steps=[NFE],
+        ode_methods=["euler"],
+        guidance_scales=[1.0],
+        eos_thresholds=[2.0],
+        append_hidden=True,
+    )
+    [actual] = flow.decode_batch(
+        [rematerialized],
+        hidden_states=next_hidden,
+        num_steps=[NFE],
+        ode_methods=["euler"],
+        guidance_scales=[1.0],
+        eos_thresholds=[2.0],
+        append_hidden=False,
+    )
+
+    torch.testing.assert_close(
+        actual.latent_patch,
+        expected.latent_patch,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+    torch.testing.assert_close(
+        actual.feedback_embedding,
+        expected.feedback_embedding,
+        rtol=3e-4,
+        atol=3e-4,
+    )
 
 
 def test_reused_slot_matches_fresh_tail_after_longer_request_history() -> None:
@@ -314,7 +459,7 @@ def test_reused_slot_matches_fresh_tail_after_longer_request_history() -> None:
         duration=grid[1:] - grid[:-1],
         g_cond=old_condition,
     )
-    reused.initialize_slot_rng(old_slot, seed=17)
+    reused.initialize_slot_rng(old_slot, 17)
     reused.seed_fm_history(
         old_slot,
         fm_rows=torch.randn(5 * unit, FM_HIDDEN),
@@ -341,7 +486,7 @@ def test_reused_slot_matches_fresh_tail_after_longer_request_history() -> None:
     new_prompt_latents = torch.randn(1, 4, LATENT_DIM)
     new_hidden = torch.randn(1, FM_HIDDEN)
     for acoustic_tail, slot in ((reused, reused_slot), (fresh, fresh_slot)):
-        acoustic_tail.initialize_slot_rng(slot, seed=23)
+        acoustic_tail.initialize_slot_rng(slot, 23)
         acoustic_tail.seed_fm_history(
             slot,
             fm_rows=new_prompt_rows,

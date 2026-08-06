@@ -15,6 +15,7 @@ from sglang_omni.models.dots_tts.flow_head import (
     DotsTTSFlowHead,
 )
 from sglang_omni.models.dots_tts.model_runner import DotsTTSModelRunner
+from sglang_omni.models.dots_tts.request_builders import DotsFlowResume
 
 
 def test_dots_abort_callback_clears_flow_state() -> None:
@@ -123,7 +124,7 @@ def test_single_stream_rng_is_request_local_under_interleaving() -> None:
             fm_null_g_cond=torch.empty(0),
             fm_capacity=0,
             g_cond=None,
-            rng_state=flow._new_rng_state(device=torch.device("cpu"), seed=1234),
+            rng_state=flow._new_rng_state(device=torch.device("cpu"), rng=1234),
         )
 
     first = _state()
@@ -160,7 +161,8 @@ def test_dots_prefill_batches_request_embeddings_in_scheduler_order() -> None:
         release_request = released.append
 
         @staticmethod
-        def export_request_rng_state(_state):
+        def suspend_request(state):
+            released.append(state)
             return torch.tensor([1], dtype=torch.uint8)
 
     model = SimpleNamespace(
@@ -176,8 +178,6 @@ def test_dots_prefill_batches_request_embeddings_in_scheduler_order() -> None:
     def _request(request_id: str, speaker_scale: float):
         data = SimpleNamespace(
             flow_state=old_flow_state if request_id == "a" else None,
-            flow_rng_state=None,
-            feedback_embeddings=[],
             pending_feedback_queue=deque(),
             generation_schedule=torch.tensor([[1, 2, 3]]),
             span_positions=torch.tensor([1, 2]),
@@ -227,7 +227,8 @@ def test_dots_prefill_failure_releases_materialized_slots() -> None:
         release_request = released.append
 
         @staticmethod
-        def export_request_rng_state(_state):
+        def suspend_request(state):
+            released.append(state)
             return torch.tensor([1], dtype=torch.uint8)
 
     runner = object.__new__(DotsTTSModelRunner)
@@ -240,8 +241,6 @@ def test_dots_prefill_failure_releases_materialized_slots() -> None:
     def _request(request_id: str):
         data = SimpleNamespace(
             flow_state=None,
-            flow_rng_state=None,
-            feedback_embeddings=[],
             generation_schedule=torch.tensor([[1, 2, 3]]),
             span_positions=torch.tensor([1]),
             prompt_span_positions=None,
@@ -283,18 +282,20 @@ def test_retracted_prefill_replays_feedback_latents_and_rng_position() -> None:
     observed: dict[str, object] = {}
 
     class _Flow:
-        def export_request_rng_state(self, state):
+        def suspend_request(self, state):
             assert state is old_flow_state
+            released.append(state)
             return saved_rng_state
 
-        def release_request(self, state):
-            released.append(state)
-
-        def new_request(self, *, rng_state, **_kwargs):
-            observed["restored_rng_state"] = rng_state
+        def new_request(self, *, rng, **_kwargs):
+            observed["restored_rng_state"] = rng
             return new_flow_state, torch.full((1, 1, 4), 50.0)
 
-        def initialize_history(self, _state, **kwargs):
+        def replay_feedback(self, _state, decoded_latent_patches):
+            observed["replayed_feedback_latents"] = decoded_latent_patches
+            return torch.stack(feedback_history)
+
+        def initialize_flow_history(self, _state, **kwargs):
             observed["decoded_latent_patches"] = kwargs["decoded_latent_patches"]
 
         def decode_batch(self, _states, *, hidden_states, **_kwargs):
@@ -327,8 +328,6 @@ def test_retracted_prefill_replays_feedback_latents_and_rng_position() -> None:
     ]
     data = SimpleNamespace(
         flow_state=old_flow_state,
-        flow_rng_state=None,
-        feedback_embeddings=list(feedback_history),
         decoded_latent_patches=list(decoded_history),
         latent_patches=[decoded_history[1]],
         latest_latent_patch=None,
@@ -391,7 +390,12 @@ def test_retracted_prefill_replays_feedback_latents_and_rng_position() -> None:
         actual is expected for actual, expected in zip(replayed, decoded_history)
     )
     torch.testing.assert_close(observed["next_hidden"], hidden[-1:])
-    assert len(data.feedback_embeddings) == 3
+    replayed_feedback_latents = observed["replayed_feedback_latents"]
+    assert isinstance(replayed_feedback_latents, list)
+    assert all(
+        actual is expected
+        for actual, expected in zip(replayed_feedback_latents, decoded_history)
+    )
     assert len(data.decoded_latent_patches) == 3
     assert len(data.latent_patches) == 2
 
@@ -401,14 +405,11 @@ def test_new_prefill_reclaims_slots_held_by_waiting_retractions() -> None:
     stale_flow_state = object()
 
     class _Flow:
-        def export_request_rng_state(self, state):
+        def suspend_request(self, state):
             assert state is stale_flow_state
             events.append("snapshot-stale")
-            return torch.tensor([8], dtype=torch.uint8)
-
-        def release_request(self, state):
-            assert state is stale_flow_state
             events.append("release-stale")
+            return torch.tensor([8], dtype=torch.uint8)
 
         def new_request(self, **_kwargs):
             events.append("allocate-new")
@@ -421,15 +422,12 @@ def test_new_prefill_reclaims_slots_held_by_waiting_retractions() -> None:
     )
     stale_data = SimpleNamespace(
         flow_state=stale_flow_state,
-        flow_rng_state=None,
         pending_feedback_queue=deque([torch.zeros(4)]),
         req=SimpleNamespace(is_retracted=True),
     )
     runner._request_data = {"stale": stale_data}
     new_data = SimpleNamespace(
         flow_state=None,
-        flow_rng_state=None,
-        feedback_embeddings=[],
         generation_schedule=torch.tensor([[1, 2, 3]]),
         span_positions=torch.tensor([1]),
         prompt_span_positions=None,
@@ -456,5 +454,5 @@ def test_new_prefill_reclaims_slots_held_by_waiting_retractions() -> None:
     )
 
     assert events == ["snapshot-stale", "release-stale", "allocate-new"]
-    assert stale_data.flow_state is None
+    assert isinstance(stale_data.flow_state, DotsFlowResume)
     assert not stale_data.pending_feedback_queue

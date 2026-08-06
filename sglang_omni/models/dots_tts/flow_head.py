@@ -197,8 +197,7 @@ class DotsTTSFlowHead(nn.Module):
         prompt_latents: torch.Tensor | None,
         speaker_embedding: torch.Tensor | None,
         speaker_scale: float,
-        seed: int | None = None,
-        rng_state: torch.Tensor | None = None,
+        rng: int | torch.Tensor | None,
     ) -> tuple[DotsFlowState, torch.Tensor | None]:
         parameter = next(self.parameters())
         device, dtype = parameter.device, parameter.dtype
@@ -209,11 +208,7 @@ class DotsTTSFlowHead(nn.Module):
                 )
             slot = self._tail.acquire_slot()
             try:
-                self._tail.initialize_slot_rng(
-                    slot,
-                    seed=seed,
-                    rng_state=rng_state,
-                )
+                self._tail.initialize_slot_rng(slot, rng)
                 g_cond = None
                 if speaker_embedding is not None:
                     speaker_embedding = speaker_embedding.to(device=device, dtype=dtype)
@@ -282,11 +277,7 @@ class DotsTTSFlowHead(nn.Module):
             ),
             fm_capacity=fm_capacity,
             g_cond=g_cond,
-            rng_state=(
-                rng_state.detach().cpu().clone()
-                if rng_state is not None
-                else self._new_rng_state(device=device, seed=seed)
-            ),
+            rng_state=self._new_rng_state(device=device, rng=rng),
         )
         if prompt_latents is None or prompt_latents.numel() == 0:
             return state, None
@@ -313,7 +304,42 @@ class DotsTTSFlowHead(nn.Module):
         return state, prompt_embeddings
 
     @torch.inference_mode()
-    def initialize_history(
+    def replay_feedback(
+        self,
+        state: DotsFlowState,
+        decoded_latent_patches: list[torch.Tensor],
+    ) -> torch.Tensor:
+        assert decoded_latent_patches
+        rows = []
+        for patch in decoded_latent_patches:
+            normalized = self.io.normalize(
+                patch.to(
+                    device=state.fm_sequence.device,
+                    dtype=state.fm_sequence.dtype,
+                )
+            )
+            patch_input = self._patch_encoder_input(
+                normalized,
+                already_normalized=True,
+            )
+            if state.slot is None:
+                feedback, state.patch_encoder_state = (
+                    self._patch_encoder_inference().decode_patch_with_state(
+                        patch_input,
+                        state.patch_encoder_state,
+                        optimize=self.optimize,
+                        bucket_resolver=self._bucket,
+                        dtype=state.fm_sequence.dtype,
+                    )
+                )
+            else:
+                assert self._tail is not None
+                feedback = self._tail.encode_feedback([state.slot], patch_input)
+            rows.append(feedback.reshape(-1, feedback.shape[-1])[-1])
+        return torch.stack(rows)
+
+    @torch.inference_mode()
+    def initialize_flow_history(
         self,
         state: DotsFlowState,
         *,
@@ -380,17 +406,6 @@ class DotsTTSFlowHead(nn.Module):
             self._tail.seed_fm_history(
                 state.slot, fm_rows=fm_rows, all_mods=state.all_mods
             )
-            for patch in decoded_latent_patches:
-                normalized_patch = self.io.normalize(
-                    patch.to(device=hidden_states.device)
-                )
-                self._tail.encode_feedback(
-                    [state.slot],
-                    self._patch_encoder_input(
-                        normalized_patch,
-                        already_normalized=True,
-                    ),
-                )
             if decoded_count:
                 state.drop_regenerated_prompt_patch = False
                 state.suppress_first_eos_check = False
@@ -424,19 +439,6 @@ class DotsTTSFlowHead(nn.Module):
                 patch.to(device=hidden_states.device, dtype=hidden_states.dtype)
             )
             self._append_history(state, normalized_patch)
-            (
-                _feedback,
-                state.patch_encoder_state,
-            ) = self._patch_encoder_inference().decode_patch_with_state(
-                self._patch_encoder_input(
-                    normalized_patch,
-                    already_normalized=True,
-                ),
-                state.patch_encoder_state,
-                optimize=self.optimize,
-                bucket_resolver=self._bucket,
-                dtype=state.fm_sequence.dtype,
-            )
             next_hidden_position = prefill_end + patch_index
             self.append_hidden(
                 state,
@@ -524,7 +526,7 @@ class DotsTTSFlowHead(nn.Module):
         state.decoded_patches += 1
         return DotsFlowStep(
             latent_patch=self.io.denormalize(normalized_patch),
-            feedback_embedding=feedback,
+            feedback_embedding=feedback.reshape(-1, feedback.shape[-1])[-1],
             finished=finished,
             emit=emit,
         )
@@ -613,25 +615,33 @@ class DotsTTSFlowHead(nn.Module):
             )
         return results
 
-    def release_request(self, state: DotsFlowState | None) -> None:
-        if state is not None and state.slot is not None and self._tail is not None:
+    def release_request(self, state: DotsFlowState) -> None:
+        if state.slot is not None and self._tail is not None:
             slot, state.slot = state.slot, None
             self._tail.release_slot(slot)
 
-    def export_request_rng_state(self, state: DotsFlowState) -> torch.Tensor:
+    def suspend_request(self, state: DotsFlowState) -> torch.Tensor:
         if state.slot is not None:
             assert self._tail is not None
-            return self._tail.slot_rng_state(state.slot)
+            rng_state = self._tail.slot_rng_state(state.slot)
+            self.release_request(state)
+            return rng_state
         assert state.rng_state is not None
         return state.rng_state.clone()
 
     @staticmethod
-    def _new_rng_state(*, device: torch.device, seed: int | None) -> torch.Tensor:
+    def _new_rng_state(
+        *,
+        device: torch.device,
+        rng: int | torch.Tensor | None,
+    ) -> torch.Tensor:
         generator = torch.Generator(device=device)
-        if seed is None:
+        if isinstance(rng, torch.Tensor):
+            generator.set_state(rng.detach().cpu())
+        elif rng is None:
             generator.seed()
         else:
-            generator.manual_seed(int(seed))
+            generator.manual_seed(rng)
         return generator.get_state().clone()
 
     @contextmanager
