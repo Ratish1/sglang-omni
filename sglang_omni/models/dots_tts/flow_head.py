@@ -330,12 +330,7 @@ class DotsTTSFlowHead(nn.Module):
         assert decoded_latent_patches
         rows = []
         for patch in decoded_latent_patches:
-            normalized = self.io.normalize(
-                patch.to(
-                    device=state.fm_sequence.device,
-                    dtype=state.fm_sequence.dtype,
-                )
-            )
+            normalized = self.io.normalize(patch.to(device=state.fm_sequence.device))
             patch_input = self._patch_encoder_input(
                 normalized,
                 already_normalized=True,
@@ -403,15 +398,12 @@ class DotsTTSFlowHead(nn.Module):
             normalized = self.io.normalize(
                 torch.cat(
                     [
-                        patch.to(
-                            device=hidden_states.device,
-                            dtype=hidden_states.dtype,
-                        )
+                        patch.to(device=hidden_states.device)
                         for patch in decoded_latent_patches
                     ],
                     dim=1,
                 )
-            )
+            ).to(dtype=state.fm_sequence.dtype)
             decoded_patches = normalized.reshape(
                 decoded_count,
                 self.latent_patch_size,
@@ -460,11 +452,8 @@ class DotsTTSFlowHead(nn.Module):
         for patch_index, patch in enumerate(decoded_latent_patches):
             self._append_history(
                 state,
-                self.io.normalize(
-                    patch.to(
-                        device=hidden_states.device,
-                        dtype=hidden_states.dtype,
-                    )
+                self.io.normalize(patch.to(device=hidden_states.device)).to(
+                    dtype=state.fm_sequence.dtype
                 ),
             )
             next_hidden_position = prefill_end + patch_index

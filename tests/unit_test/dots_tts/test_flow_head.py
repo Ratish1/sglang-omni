@@ -91,14 +91,22 @@ def test_single_stream_decode_batch_accepts_2d_hidden(tmp_path) -> None:
     assert state.decoded_patches == 2
 
 
-def test_flow_rematerialization_matches_uninterrupted_next_step(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float32, torch.bfloat16],
+    ids=["float32", "bfloat16"],
+)
+def test_flow_rematerialization_matches_uninterrupted_next_step(
+    tmp_path, dtype: torch.dtype
+) -> None:
     torch.manual_seed(1618)
-    flow = _flow_head(tmp_path)
+    flow = _flow_head(tmp_path).to(dtype=dtype)
     flow.init_batched_tail(num_slots=2, nfe=NFE, max_audio_patches=8)
-    prompt_latents = torch.randn(1, 2 * PATCH_SIZE, LATENT_DIM)
-    prefill_hidden = torch.randn(1, 3, LLM_HIDDEN)
+    prompt_latents = torch.randn(1, 2 * PATCH_SIZE, LATENT_DIM, dtype=dtype)
+    prefill_hidden = torch.randn(1, 3, LLM_HIDDEN, dtype=dtype)
     prompt_positions = torch.tensor([1, 2])
     schedule = torch.tensor([[0, 1, 1, 1]])
+    tolerance = 3e-4 if dtype == torch.float32 else 2e-2
 
     uninterrupted, _ = flow.new_request(
         max_audio_patch_count=6,
@@ -137,8 +145,8 @@ def test_flow_rematerialization_matches_uninterrupted_next_step(tmp_path) -> Non
     torch.testing.assert_close(
         first_steps[0].latent_patch,
         first_steps[1].latent_patch,
-        rtol=3e-4,
-        atol=3e-4,
+        rtol=tolerance,
+        atol=tolerance,
     )
 
     rng_state = flow.suspend_request(retracted)
@@ -156,11 +164,11 @@ def test_flow_rematerialization_matches_uninterrupted_next_step(tmp_path) -> Non
     torch.testing.assert_close(
         replayed_feedback[0],
         first_steps[1].feedback_embedding,
-        rtol=3e-4,
-        atol=3e-4,
+        rtol=tolerance,
+        atol=tolerance,
     )
 
-    next_hidden = torch.randn(1, LLM_HIDDEN)
+    next_hidden = torch.randn(1, LLM_HIDDEN, dtype=dtype)
     flow.initialize_history(
         rematerialized,
         hidden_states=torch.cat([prefill_hidden, next_hidden.unsqueeze(1)], dim=1),
@@ -192,14 +200,14 @@ def test_flow_rematerialization_matches_uninterrupted_next_step(tmp_path) -> Non
     torch.testing.assert_close(
         actual.latent_patch,
         expected.latent_patch,
-        rtol=3e-4,
-        atol=3e-4,
+        rtol=tolerance,
+        atol=tolerance,
     )
     torch.testing.assert_close(
         actual.feedback_embedding,
         expected.feedback_embedding,
-        rtol=3e-4,
-        atol=3e-4,
+        rtol=tolerance,
+        atol=tolerance,
     )
 
 
