@@ -10,17 +10,12 @@ from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
     get_prefill_cuda_graph_backend,
     validate_generation_batch_policy,
-    validate_prefill_graph_policy,
 )
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 
 def _validate_prefill_graph_prereqs(server_args: Any, device: str) -> None:
-    """Reject breakable prefill graphs outside their validated envelope.
-
-    An explicit prefill backend locks sglang's own compatibility cascade off,
-    so the omni-relevant subset is re-checked here before capture.
-    """
+    """Reject breakable prefill graphs outside their validated envelope."""
     if not device.startswith("cuda"):
         raise RuntimeError(
             "breakable prefill CUDA graphs require a CUDA device, " f"got {device!r}"
@@ -45,10 +40,8 @@ class SGLangGenerationEngineBuilder(ABC):
     model_name: str
     context_length: int
     model_arch_override: str | None = None
-    # Set True only by builders whose model satisfies the breakable prefill
-    # CUDA graph contract (discoverable decoder, OmniPrefillInputs payload,
-    # eager-tail-safe head). A deployment override cannot enable prefill
-    # graphs on a model that has not adopted the contract.
+    # Set True only by builders whose model has adopted the breakable prefill
+    # CUDA graph contract; a deployment override cannot enable it otherwise.
     supports_breakable_prefill_cuda_graph: bool = False
 
     def build(
@@ -101,15 +94,7 @@ class SGLangGenerationEngineBuilder(ABC):
                     "cuda_graph_backend_prefill='breakable'"
                 )
             _validate_prefill_graph_prereqs(server_args, device)
-            # SGLang registers the prefill input_embeds slot only for
-            # multimodal model configs; the payload channel needs it.
             infra_kwargs.setdefault("enable_prefill_input_embeds", True)
-        if prefill_graph_backend != "disabled":
-            # Fail a misdeclared policy here, before weights and KV cache are
-            # loaded; validate_generation_batch_policy re-checks it later.
-            validate_prefill_graph_policy(
-                model_name=self.model_name, server_args=server_args
-            )
         want_cuda_graph, (
             model_worker,
             tree_cache,

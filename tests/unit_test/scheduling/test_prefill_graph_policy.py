@@ -59,9 +59,6 @@ def _validate(server_args: FakeServerArgs) -> None:
 
 
 def test_prefill_policy_accepts_disabled_and_declared_breakable() -> None:
-    # "disabled" must stay a silent no-op (every existing model ships with it)
-    # even though the fake declares no buckets and holds no lock; a fully
-    # declared breakable policy is the only other accepted shape.
     _validate(_server_args())
     _validate(
         _server_args(
@@ -98,8 +95,6 @@ def test_non_breakable_prefill_backend_is_rejected() -> None:
 
 
 def test_breakable_requires_explicit_buckets() -> None:
-    # sglang generates a ladder when the backend is enabled without buckets;
-    # the omni policy refuses to treat that generated list as a declaration.
     with pytest.raises(ValueError, match="explicit"):
         _validate(
             _server_args(
@@ -146,8 +141,6 @@ def test_breakable_rejects_buckets_above_chunked_prefill() -> None:
 
 
 def test_breakable_rejects_buckets_above_max_prefill_tokens() -> None:
-    # With chunking disabled (sglang normalizes that to -1), the batch
-    # prefill-token budget still caps extend tokens per forward.
     with pytest.raises(ValueError, match="max_prefill_tokens are unreachable"):
         _validate(
             _server_args(
@@ -185,9 +178,6 @@ def test_breakable_warns_on_padding_factor_gaps(caplog) -> None:
 
 
 def test_padding_gap_warning_requires_a_non_empty_eager_range(caplog) -> None:
-    # nxt = 2 * prev + 1 leaves no eager length: every t > prev satisfies
-    # nxt <= 2t and replays. The warning must not fire on an empty range;
-    # the first real valley appears at nxt = 2 * prev + 3 (single length 65).
     with caplog.at_level(logging.WARNING):
         _validate(
             _server_args(
@@ -210,23 +200,18 @@ def test_padding_gap_warning_requires_a_non_empty_eager_range(caplog) -> None:
 
 
 def test_default_prefill_ladder_matches_sglang_generated_ladder() -> None:
-    # Mirrors ServerArgs._generate_prefill_cuda_graph_batch_sizes: shape-
-    # agnostic ladder, fine-grained at the bottom, 30 shapes at cap 512.
     ladder = build_default_prefill_cuda_graph_bs(512)
     assert ladder == (
         list(range(4, 33, 4)) + list(range(48, 257, 16)) + list(range(288, 513, 32))
     )
     assert len(ladder) == 30
 
-    # An off-grid cap is appended so max(bs) matches the declared budget.
     off_grid = build_default_prefill_cuda_graph_bs(100)
     assert off_grid[-1] == 100
     assert off_grid[:-1] == [4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96]
 
-    # A cap below the grid still yields a valid single-bucket ladder.
     assert build_default_prefill_cuda_graph_bs(2) == [2]
 
-    # The generated ladder satisfies the declared-policy validator.
     _validate(
         _server_args(
             prefill_backend="breakable",
@@ -273,8 +258,6 @@ def test_prefill_graph_prereqs_reject_non_cuda_and_tp() -> None:
 
 
 def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
-    """A breakable prefill policy must reach ModelWorker (input_embeds slot)
-    and run the post-capture attestation; a disabled policy must do neither."""
     from sglang_omni.scheduling import bootstrap, sglang_backend
     from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
     from sglang_omni.utils import cuda_graph_batch_validator
@@ -370,9 +353,6 @@ def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
 
 
 def test_builder_rejects_breakable_without_model_opt_in(monkeypatch) -> None:
-    """A deployment override must not enable prefill graphs on a model whose
-    builder never adopted the contract: the flag would flip is_multimodal on
-    an unaudited model and capture graphs its forward never replays."""
     from sglang_omni.scheduling import sglang_backend
     from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 
@@ -418,65 +398,3 @@ def test_builder_rejects_breakable_without_model_opt_in(monkeypatch) -> None:
                 "cuda_graph_bs_prefill": [128, 256],
             },
         )
-
-
-def test_builder_fails_misdeclared_policy_before_infrastructure(monkeypatch) -> None:
-    """A breakable policy without declared buckets must fail before model
-    weights and KV cache are allocated, not after (operator feedback loop)."""
-    from sglang_omni.scheduling import bootstrap, sglang_backend
-    from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
-
-    infra_calls: list[Any] = []
-
-    def fake_build_sglang_server_args(checkpoint_dir, *, context_length, **overrides):
-        del checkpoint_dir, context_length, overrides
-        # Breakable declared but no bucket lock: sglang would auto-generate a
-        # ladder; the omni policy must refuse it up front.
-        return _server_args(
-            prefill_backend="breakable",
-            prefill_bs=(4, 8, 16),
-            locked=frozenset(),
-        )
-
-    def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):
-        del server_args, gpu_id, kwargs
-        infra_calls.append(True)
-        raise AssertionError("infrastructure must not be constructed")
-
-    monkeypatch.setattr(
-        sglang_backend, "build_sglang_server_args", fake_build_sglang_server_args
-    )
-    monkeypatch.setattr(
-        bootstrap, "create_sglang_infrastructure", fake_create_sglang_infrastructure
-    )
-
-    class AdoptingBuilder(TtsEngineBuilder):
-        model_name = "Test TTS"
-        context_length = 123
-        supports_breakable_prefill_cuda_graph = True
-
-        def resolve_checkpoint(self, model_path: str) -> str:
-            return model_path
-
-        def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
-            del dtype
-            return {"max_running_requests": 4}
-
-        def setup_model(self, **kwargs: Any) -> None:
-            del kwargs
-
-        def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
-            del output_proc
-            return model_worker
-
-        def make_adapters(self, model: Any) -> tuple[Any, Any]:
-            del model
-            return object(), object()
-
-    with pytest.raises(ValueError, match="explicit cuda_graph_bs_prefill"):
-        AdoptingBuilder().build(
-            "model",
-            server_args_overrides={"cuda_graph_backend_prefill": "breakable"},
-        )
-
-    assert infra_calls == []

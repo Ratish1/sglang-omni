@@ -11,9 +11,8 @@ logger = logging.getLogger(__name__)
 
 _MISSING = object()
 
-# Mirrors sglang's _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR: a prefill replay is
-# rejected (falls back to eager) when the padded bucket exceeds twice the real
-# token count, so bucket gaps beyond 2x create silent eager valleys.
+# A prefill replay falls back to eager when the padded bucket exceeds this
+# multiple of the real token count.
 _PREFILL_PADDING_FACTOR = 2
 
 
@@ -48,14 +47,9 @@ def build_default_cuda_graph_bs(max_bs: int) -> list[int]:
 
 
 def build_default_prefill_cuda_graph_bs(max_num_tokens: int) -> list[int]:
-    """Prefill token-count ladder mirroring sglang's generated default
-    (ServerArgs._generate_prefill_cuda_graph_batch_sizes).
-
-    Fine-grained at the bottom so radix-shortened extends pad minimally,
-    coarsening upward. Deployments pass the result as cuda_graph_bs_prefill:
-    the declaration stays explicit, only the arithmetic is shared. The cap is
-    appended when off-grid so max(bs) matches the declared budget.
-    """
+    """Prefill token-count ladder for a declared token budget: fine-grained
+    at the bottom so short extends pad minimally, coarsening upward. The cap
+    is appended when off-grid so max(bs) matches the budget."""
     max_num_tokens = int(max_num_tokens)
     if max_num_tokens < 1:
         raise ValueError("max_num_tokens must be >= 1")
@@ -113,9 +107,8 @@ def build_generation_batch_overrides(
     else:
         overrides["cuda_graph_bs"] = cuda_graph_bs
 
-    # Prefill graph buckets are declared explicitly (no generated default);
-    # derive the cap when only the bucket list is given so the resolved
-    # sglang config stays coherent (max(bs) == max_bs).
+    # Derive the prefill cap when only the bucket list is given so the
+    # resolved config stays coherent (max(bs) == max_bs).
     prefill_bs = overrides.get("cuda_graph_bs_prefill")
     if prefill_bs and "cuda_graph_max_bs_prefill" not in overrides:
         overrides["cuda_graph_max_bs_prefill"] = max(int(b) for b in prefill_bs)
@@ -151,7 +144,9 @@ def validate_generation_batch_policy(
         if cuda_graph_bs_value is None:
             errors.append("cuda_graph_bs must be explicit when CUDA graph is enabled")
         else:
-            cuda_graph_bs = _normalize_cuda_graph_bs(cuda_graph_bs_value, errors)
+            cuda_graph_bs = _normalize_cuda_graph_bs(
+                cuda_graph_bs_value, errors, field="cuda_graph_bs"
+            )
 
         if cuda_graph_max_bs is not None and cuda_graph_bs is not None:
             if max(cuda_graph_bs) != cuda_graph_max_bs:
@@ -210,35 +205,13 @@ def validate_generation_batch_policy(
         )
 
 
-def validate_prefill_graph_policy(*, model_name: str, server_args: Any) -> None:
-    """Validate only the prefill graph policy, before any model load.
-
-    Same rules as the prefill section of validate_generation_batch_policy
-    (which re-runs them later); this early entry point lets a misdeclared
-    policy fail startup before weights and KV cache are allocated.
-    """
-    errors: list[str] = []
-    _validate_prefill_graph_policy(
-        server_args, not bool(server_args.disable_cuda_graph), errors
-    )
-    if errors:
-        raise ValueError(
-            f"{model_name} invalid prefill CUDA graph policy: " + "; ".join(errors)
-        )
-
-
 def _validate_prefill_graph_policy(
     server_args: Any,
     cuda_graph_enabled: bool,
     errors: list[str],
 ) -> None:
-    """Validate the declared prefill CUDA graph policy (R5).
-
-    Only the breakable backend is supported: the omni prefill contract
-    (payload channel, eager tail, input_embeds slot) is validated for BCG
-    only. Buckets must be declared explicitly so the shape policy is a
-    conscious per-model decision rather than sglang's generated ladder.
-    """
+    """Validate the declared prefill CUDA graph policy: breakable backend
+    only, with explicitly declared buckets."""
     backend = get_prefill_cuda_graph_backend(server_args)
     if backend == "disabled":
         return
@@ -278,8 +251,7 @@ def _validate_prefill_graph_policy(
             f"({max(buckets)} != {max_bs})"
         )
 
-    # Extend tokens per forward are capped by both the chunk budget and the
-    # batch prefill-token budget; buckets above either cap never replay.
+    # Buckets above either per-forward token cap can never replay.
     for cap_name, cap_value in (
         ("chunked_prefill_size", server_args.chunked_prefill_size),
         ("max_prefill_tokens", server_args.max_prefill_tokens),
@@ -294,11 +266,9 @@ def _validate_prefill_graph_policy(
                 f"unreachable ({max(buckets)} > {cap_value})"
             )
 
-    # A raw token count t replays at the smallest bucket >= t and falls back
-    # to eager when that bucket exceeds t * factor, so a gap beyond the
-    # factor leaves prompt lengths that never replay a graph. The largest
-    # eager length under bucket nxt is (nxt - 1) // factor; a valley exists
-    # only when that reaches past the previous bucket.
+    # The largest eager-falling length under bucket nxt is
+    # (nxt - 1) // factor; a valley exists only when that reaches past the
+    # previous bucket.
     valleys = []
     for prev, nxt in zip(buckets, buckets[1:]):
         eager_end = (nxt - 1) // _PREFILL_PADDING_FACTOR
@@ -349,7 +319,7 @@ def _normalize_cuda_graph_bs(
     value: Iterable[Any],
     errors: list[str],
     *,
-    field: str = "cuda_graph_bs",
+    field: str,
 ) -> tuple[int, ...] | None:
     if isinstance(value, (str, bytes)):
         errors.append(f"{field} must be a sequence of positive integers")
