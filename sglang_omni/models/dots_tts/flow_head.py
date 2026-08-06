@@ -26,6 +26,8 @@ class DotsFlowState:
     drop_regenerated_prompt_patch: bool = False
     suppress_first_eos_check: bool = False
     decoded_patches: int = 0
+    slot: int | None = None
+    all_mods: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,8 @@ class DotsTTSFlowHead(nn.Module):
         self.io = IOHelper(Path(latent_stats_path))
         self._patch_inference: Any = None
         self._dit_solver: Any = None
+        self._tail: Any = None
+        self._batched_nfe: int | None = None
 
     def _bucket(self, requested: int) -> int:
         if requested <= 0:
@@ -134,6 +138,55 @@ class DotsTTSFlowHead(nn.Module):
             )
         return self._dit_solver
 
+    @property
+    def is_batched(self) -> bool:
+        return self._tail is not None
+
+    def init_batched_tail(
+        self,
+        *,
+        num_slots: int,
+        nfe: int,
+        max_audio_patches: int,
+    ) -> None:
+        if self.mode != "meanflow":
+            raise ValueError("dots.tts continuous batching currently requires MeanFlow")
+        from sglang_omni.models.dots_tts.tail import (
+            DotsTtsAcousticTail,
+            DotsTtsTailSpec,
+            fuse_dit_for_inference,
+        )
+
+        parameter = next(self.parameters())
+        self._tail = DotsTtsAcousticTail(
+            dit=fuse_dit_for_inference(self),
+            coordinate_proj=self.coordinate_proj,
+            patch_encoder=self.patch_encoder,
+            spec=DotsTtsTailSpec(
+                nfe=int(nfe),
+                patch_capacity=int(max_audio_patches) + 1,
+                num_slots=int(num_slots),
+                hidden_patch_size=self.hidden_patch_size,
+                latent_patch_size=self.latent_patch_size,
+                latent_dim=self.latent_dim,
+                fm_hidden_size=self.fm_hidden_size,
+            ),
+            device=parameter.device,
+            dtype=parameter.dtype,
+        )
+        self._batched_nfe = int(nfe)
+
+    def validate_request(self, *, num_steps: int, ode_method: str) -> None:
+        if not self.is_batched:
+            return
+        if int(num_steps) != self._batched_nfe:
+            raise ValueError(
+                "dots.tts num_steps is fixed for continuous batching: "
+                f"requested={num_steps} engine={self._batched_nfe}"
+            )
+        if str(ode_method) != "euler":
+            raise ValueError("dots.tts continuous batching currently requires euler")
+
     @torch.inference_mode()
     def new_request(
         self,
@@ -142,9 +195,63 @@ class DotsTTSFlowHead(nn.Module):
         prompt_latents: torch.Tensor | None,
         speaker_embedding: torch.Tensor | None,
         speaker_scale: float,
+        seed: int | None = None,
     ) -> tuple[DotsFlowState, torch.Tensor | None]:
         parameter = next(self.parameters())
         device, dtype = parameter.device, parameter.dtype
+        if self.is_batched:
+            if prompt_latents is None or prompt_latents.numel() == 0:
+                raise ValueError(
+                    "dots.tts continuous batching requires reference audio"
+                )
+            slot = self._tail.acquire_slot()
+            try:
+                if seed is not None:
+                    self._tail.set_slot_seed(slot, int(seed))
+                g_cond = None
+                if speaker_embedding is not None:
+                    speaker_embedding = speaker_embedding.to(device=device, dtype=dtype)
+                    g_cond = self.xvec_proj(speaker_embedding * float(speaker_scale))
+                grid = torch.linspace(
+                    0.0,
+                    1.0,
+                    int(self._batched_nfe) + 1,
+                    device=device,
+                    dtype=dtype,
+                )
+                all_mods = self._tail.dit.build_mods(
+                    grid[:-1],
+                    duration=grid[1:] - grid[:-1],
+                    g_cond=g_cond,
+                )
+                prompt_latents = prompt_latents.to(device=device, dtype=dtype)
+                prompt_embeddings = self._tail.encode_prompt_patches(
+                    slot, self._patch_encoder_input(prompt_latents)
+                )
+                prompt_patches = rearrange(
+                    self.io.normalize(prompt_latents).to(dtype=dtype),
+                    "b (s p) d -> b s p d",
+                    p=self.latent_patch_size,
+                )
+                empty = torch.empty(0, device=device, dtype=dtype)
+                return (
+                    DotsFlowState(
+                        fm_sequence=empty,
+                        fm_cfg_sequence=empty,
+                        fm_null_g_cond=empty,
+                        fm_capacity=0,
+                        g_cond=g_cond,
+                        prompt_patches=prompt_patches,
+                        drop_regenerated_prompt_patch=True,
+                        suppress_first_eos_check=True,
+                        slot=slot,
+                        all_mods=all_mods,
+                    ),
+                    prompt_embeddings.unsqueeze(0),
+                )
+            except BaseException:
+                self._tail.release_slot(slot)
+                raise
         capacity_patches = (
             self._bucket(max_audio_patch_count)
             if self.optimize
@@ -207,6 +314,26 @@ class DotsTTSFlowHead(nn.Module):
     ) -> None:
         if hidden_states.ndim == 2:
             hidden_states = hidden_states.unsqueeze(0)
+        if state.slot is not None:
+            prompt_patches = state.prompt_patches
+            if prompt_patches is None or state.all_mods is None:
+                raise RuntimeError("dots.tts batched prompt state is incomplete")
+            positions = prompt_span_positions.to(
+                device=hidden_states.device, dtype=torch.long
+            )
+            if positions.numel() != prompt_patches.size(1) or bool(
+                torch.any(positions <= 0)
+            ):
+                raise RuntimeError("dots.tts prompt spans do not match prompt latents")
+            hidden_rows = self.hidden_proj(hidden_states[0, positions - 1])
+            latent_rows = self.latent_proj(prompt_patches[0])
+            fm_rows = torch.cat([hidden_rows[:, None], latent_rows], dim=1).reshape(
+                -1, self.fm_hidden_size
+            )
+            self._tail.seed_fm_history(
+                state.slot, fm_rows=fm_rows, all_mods=state.all_mods
+            )
+            return
         prompt_patches = state.prompt_patches
         cursor = 0
         for prompt_index, span_position in enumerate(
@@ -305,6 +432,78 @@ class DotsTTSFlowHead(nn.Module):
             finished=finished,
             emit=emit,
         )
+
+    @torch.inference_mode()
+    def decode_batch(
+        self,
+        states: list[DotsFlowState],
+        *,
+        hidden_states: torch.Tensor,
+        num_steps: list[int],
+        ode_methods: list[str],
+        guidance_scales: list[float],
+        eos_thresholds: list[float],
+        append_hidden: bool,
+    ) -> list[DotsFlowStep]:
+        if not self.is_batched:
+            if len(states) != 1:
+                raise RuntimeError("dots.tts single-stream tail received a batch")
+            if append_hidden:
+                self.append_hidden(states[0], hidden_states[:1])
+            return [
+                self.decode_next(
+                    states[0],
+                    hidden_states=hidden_states[:1],
+                    num_steps=num_steps[0],
+                    ode_method=ode_methods[0],
+                    guidance_scale=guidance_scales[0],
+                    eos_threshold=eos_thresholds[0],
+                )
+            ]
+
+        for steps, method in zip(num_steps, ode_methods, strict=True):
+            self.validate_request(num_steps=steps, ode_method=method)
+        hidden = hidden_states[:, -1] if hidden_states.ndim == 3 else hidden_states
+        probabilities = self.eos_proj(hidden).softmax(dim=-1)[:, 1]
+        finished = [
+            (
+                False
+                if state.suppress_first_eos_check and state.decoded_patches == 0
+                else bool(probabilities[row].gt(float(eos_thresholds[row])).item())
+            )
+            for row, state in enumerate(states)
+        ]
+        slots = [state.slot for state in states]
+        if any(slot is None for slot in slots):
+            raise RuntimeError("dots.tts batched request is missing its tail slot")
+        normalized = self._tail.sample_patches(
+            slots,
+            fm_hidden_rows=self.hidden_proj(hidden),
+            latent_proj=self.latent_proj,
+        )
+        feedback = self._tail.encode_feedback(
+            slots,
+            self._patch_encoder_input(normalized, already_normalized=True),
+        )
+        results = []
+        for row, state in enumerate(states):
+            emit = not state.drop_regenerated_prompt_patch
+            state.drop_regenerated_prompt_patch = False
+            state.decoded_patches += 1
+            results.append(
+                DotsFlowStep(
+                    latent_patch=self.io.denormalize(normalized[row : row + 1]),
+                    feedback_embedding=feedback[row],
+                    finished=finished[row],
+                    emit=emit,
+                )
+            )
+        return results
+
+    def release_request(self, state: DotsFlowState | None) -> None:
+        if state is not None and state.slot is not None and self._tail is not None:
+            slot, state.slot = state.slot, None
+            self._tail.release_slot(slot)
 
     def _patch_encoder_input(
         self, latents: torch.Tensor, *, already_normalized: bool = False

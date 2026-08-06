@@ -97,7 +97,7 @@ def preprocess_dots_tts_payload(
     model_config: Any,
     max_generate_length: int,
     max_sequence_length: int,
-    default_num_steps: int = 10,
+    default_num_steps: int = 4,
 ) -> StagePayload:
     from dots_tts.data.pipelines.tokenizing import build_generation_schedule
     from dots_tts.data.pipelines.tts_pipeline import (
@@ -211,10 +211,8 @@ def preprocess_dots_tts_payload(
         _first_not_none(
             inputs.get("max_generate_length"),
             tts_params.get("max_generate_length"),
-            tts_params.get("max_new_tokens"),
             engine_params.get("max_generate_length"),
             params.get("max_generate_length"),
-            params.get("max_new_tokens"),
             default=max_generate_length,
         )
     )
@@ -337,7 +335,7 @@ def create_preprocessing_executor(
     model_path: str,
     *,
     max_generate_length: int = 500,
-    default_num_steps: int = 10,
+    default_num_steps: int = 4,
     max_concurrency: int = 8,
 ) -> SimpleScheduler:
     _root, config, tokenizer, context_length = _load_model_metadata(model_path)
@@ -374,14 +372,18 @@ def create_sglang_latent_engine_executor(
     precision: str = "bfloat16",
     optimize: bool = False,
     max_generate_length: int = 500,
+    num_steps: int = 4,
     device: str | None = "cuda",
     gpu_id: int | None = None,
     server_args_overrides: dict[str, Any] | None = None,
 ) -> OmniScheduler:
-    del max_generate_length
     from sglang_omni.models.dots_tts.engine_builder import DotsTTSEngineBuilder
 
-    return DotsTTSEngineBuilder(optimize=optimize).build(
+    return DotsTTSEngineBuilder(
+        optimize=optimize,
+        num_steps=num_steps,
+        max_audio_patches=max_generate_length,
+    ).build(
         model_path,
         device=device or "cuda",
         gpu_id=gpu_id,

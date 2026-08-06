@@ -5,6 +5,7 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 
 def test_dots_tts_uses_framework_stage_boundaries() -> None:
     from sglang_omni.models.dots_tts.config import DotsTTSPipelineConfig
+    from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 
     config = DotsTTSPipelineConfig(model_path="model")
 
@@ -21,6 +22,7 @@ def test_dots_tts_uses_framework_stage_boundaries() -> None:
         PIPELINE_CONFIG_REGISTRY.get_config("DotsTTSForConditionalGeneration")
         is DotsTTSPipelineConfig
     )
+    assert DotsTTSState().num_steps == 4
 
 
 def test_dots_tts_rejects_tp() -> None:

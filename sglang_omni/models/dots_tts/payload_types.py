@@ -20,7 +20,7 @@ class DotsTTSState(DeclarativeStateBase):
     use_prompt_prefill: bool = wire(False, codec="bool")
     speaker_scale: float = wire(1.5, codec="float")
     ode_method: str = wire("euler", codec="str_or")
-    num_steps: int = wire(10, codec="int_or")
+    num_steps: int = wire(4, codec="int_or")
     guidance_scale: float = wire(1.2, codec="float")
     seed: int | None = wire(None, codec="opt_int")
     stream: bool = wire(False, codec="bool")
