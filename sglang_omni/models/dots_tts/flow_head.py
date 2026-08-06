@@ -448,12 +448,15 @@ class DotsTTSFlowHead(nn.Module):
         if not self.is_batched:
             if len(states) != 1:
                 raise RuntimeError("dots.tts single-stream tail received a batch")
+            hidden = hidden_states[:1]
+            if hidden.ndim == 2:
+                hidden = hidden.unsqueeze(1)
             if append_hidden:
-                self.append_hidden(states[0], hidden_states[:1])
+                self.append_hidden(states[0], hidden)
             return [
                 self.decode_next(
                     states[0],
-                    hidden_states=hidden_states[:1],
+                    hidden_states=hidden,
                     num_steps=num_steps[0],
                     ode_method=ode_methods[0],
                     guidance_scale=guidance_scales[0],
