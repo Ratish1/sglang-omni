@@ -9,6 +9,11 @@ import pytest
 import torch
 from torch import nn
 
+from sglang_omni.models.dots_tts.flow_head import (
+    DotsFlowState,
+    DotsFlowStep,
+    DotsTTSFlowHead,
+)
 from sglang_omni.models.dots_tts.model_runner import DotsTTSModelRunner
 
 
@@ -63,6 +68,48 @@ def test_dots_post_prefill_skips_prefill_only_batch() -> None:
         schedule_batch=SimpleNamespace(is_prefill_only=True),
         requests=[object()],
     )
+
+
+def test_single_stream_decode_preserves_batch_and_sequence_axes() -> None:
+    flow = object.__new__(DotsTTSFlowHead)
+    nn.Module.__init__(flow)
+    flow._tail = None
+    observed: list[tuple[str, tuple[int, ...]]] = []
+
+    def _append_hidden(_state, hidden_states):
+        observed.append(("append", tuple(hidden_states.shape)))
+
+    def _decode_next(_state, *, hidden_states, **_kwargs):
+        observed.append(("decode", tuple(hidden_states.shape)))
+        return DotsFlowStep(
+            latent_patch=torch.zeros(1, 4, 2),
+            feedback_embedding=torch.zeros(8),
+            finished=False,
+            emit=True,
+        )
+
+    flow.append_hidden = _append_hidden
+    flow.decode_next = _decode_next
+    state = DotsFlowState(
+        fm_sequence=torch.empty(0),
+        fm_cfg_sequence=torch.empty(0),
+        fm_null_g_cond=torch.empty(0),
+        fm_capacity=0,
+        g_cond=None,
+    )
+
+    [step] = flow.decode_batch(
+        [state],
+        hidden_states=torch.zeros(1, 8),
+        num_steps=[4],
+        ode_methods=["euler"],
+        guidance_scales=[1.2],
+        eos_thresholds=[0.8],
+        append_hidden=True,
+    )
+
+    assert step.emit is True
+    assert observed == [("append", (1, 1, 8)), ("decode", (1, 1, 8))]
 
 
 def test_dots_prefill_batches_request_embeddings_in_scheduler_order() -> None:

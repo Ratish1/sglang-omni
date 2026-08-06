@@ -445,15 +445,30 @@ class DotsTTSFlowHead(nn.Module):
         eos_thresholds: list[float],
         append_hidden: bool,
     ) -> list[DotsFlowStep]:
+        batch_size = len(states)
+        assert batch_size > 0
+        assert hidden_states.ndim in {2, 3}
+        assert hidden_states.size(0) == batch_size
+        assert all(
+            len(values) == batch_size
+            for values in (
+                num_steps,
+                ode_methods,
+                guidance_scales,
+                eos_thresholds,
+            )
+        )
+        if hidden_states.ndim == 2:
+            hidden_states = hidden_states.unsqueeze(1)
         if not self.is_batched:
-            if len(states) != 1:
+            if batch_size != 1:
                 raise RuntimeError("dots.tts single-stream tail received a batch")
             if append_hidden:
-                self.append_hidden(states[0], hidden_states[:1])
+                self.append_hidden(states[0], hidden_states)
             return [
                 self.decode_next(
                     states[0],
-                    hidden_states=hidden_states[:1],
+                    hidden_states=hidden_states,
                     num_steps=num_steps[0],
                     ode_method=ode_methods[0],
                     guidance_scale=guidance_scales[0],
@@ -463,16 +478,18 @@ class DotsTTSFlowHead(nn.Module):
 
         for steps, method in zip(num_steps, ode_methods, strict=True):
             self.validate_request(num_steps=steps, ode_method=method)
-        hidden = hidden_states[:, -1] if hidden_states.ndim == 3 else hidden_states
+        hidden = hidden_states[:, -1]
         probabilities = self.eos_proj(hidden).softmax(dim=-1)[:, 1]
-        finished = [
-            (
-                False
-                if state.suppress_first_eos_check and state.decoded_patches == 0
-                else bool(probabilities[row].gt(float(eos_thresholds[row])).item())
-            )
-            for row, state in enumerate(states)
-        ]
+        thresholds = probabilities.new_tensor(eos_thresholds)
+        suppress = torch.tensor(
+            [
+                state.suppress_first_eos_check and state.decoded_patches == 0
+                for state in states
+            ],
+            device=probabilities.device,
+            dtype=torch.bool,
+        )
+        finished = ((probabilities > thresholds) & ~suppress).tolist()
         slots = [state.slot for state in states]
         if any(slot is None for slot in slots):
             raise RuntimeError("dots.tts batched request is missing its tail slot")
