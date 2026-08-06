@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -31,9 +32,8 @@ def test_weight_loader_routes_every_checkpoint_namespace() -> None:
             super().__init__()
             self.received: list[tuple[str, torch.Tensor]] = []
 
-        def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> set[str]:
+        def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
             self.received = list(weights)
-            return {name for name, _tensor in self.received}
 
     class _Flow(nn.Module):
         def __init__(self) -> None:
@@ -76,7 +76,6 @@ def test_weight_loader_routes_every_checkpoint_namespace() -> None:
             ("llm.model.embed_tokens.weight", torch.tensor([11.0])),
             *flow_weights,
             *codec_weights,
-            ("new_acoustic_block.weight", torch.ones(1, 1)),
         ]
     )
 
@@ -84,7 +83,6 @@ def test_weight_loader_routes_every_checkpoint_namespace() -> None:
         "model.embed_tokens.weight"
     ]
     assert loaded == {
-        "qwen2.model.embed_tokens.weight",
         *(f"flow.{name}" for name, _tensor in flow_weights),
     }
     for index, (_name, parameter) in enumerate(model.flow.named_parameters()):
@@ -92,3 +90,11 @@ def test_weight_loader_routes_every_checkpoint_namespace() -> None:
             parameter,
             torch.full_like(parameter, float(index + 1)),
         )
+
+    name, parameter = next(iter(model.flow.named_parameters()))
+    partial_weight = torch.full_like(parameter, 99.0)
+    assert model.load_weights([(name, partial_weight)]) == {f"flow.{name}"}
+    torch.testing.assert_close(parameter, partial_weight)
+
+    with pytest.raises(AssertionError, match="Unexpected dots.tts checkpoint weight"):
+        model.load_weights([("new_acoustic_block.weight", torch.ones(1, 1))])
