@@ -68,11 +68,23 @@ def build_sglang_dots_tts_request(
         )
     prefill_end = int(span_positions[prompt_patch_count].item())
     remaining_spans = int(span_positions.numel()) - prompt_patch_count
+    discarded_patch_count = int(prompt_patch_count > 0)
+    if remaining_spans <= discarded_patch_count:
+        raise ValueError(
+            "dots.tts prompt prefill requires one regenerated prompt patch "
+            "and at least one payload patch"
+        )
+    generation_budget = remaining_spans
+    if state.max_new_tokens is not None:
+        generation_budget = min(
+            generation_budget,
+            int(state.max_new_tokens) + discarded_patch_count,
+        )
     input_ids = schedule[0, :prefill_end].to(dtype=torch.long).tolist()
     control_token_id = int(schedule[0, span_positions[prompt_patch_count]])
 
     sampling_params = SamplingParams(
-        max_new_tokens=remaining_spans,
+        max_new_tokens=generation_budget,
         temperature=0.0,
         stop_token_ids=[],
     )
@@ -99,7 +111,7 @@ def build_sglang_dots_tts_request(
         span_positions=span_positions,
         prompt_span_positions=span_positions[:prompt_patch_count],
         prefill_end=prefill_end,
-        max_new_tokens=remaining_spans,
+        max_new_tokens=generation_budget,
         input_embeds_are_projected=True,
         control_token_id=control_token_id,
         stream_metadata={

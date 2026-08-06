@@ -123,6 +123,8 @@ def preprocess_dots_tts_payload(
     stage_params = _dict(params.get("stage_params"))
     engine_params = _dict(stage_params.get("latent_engine"))
     references = inputs.get("references")
+    if isinstance(references, list) and len(references) > 1:
+        raise ValueError("dots.tts accepts at most one reference audio")
     reference = (
         references[0]
         if isinstance(references, list)
@@ -167,6 +169,8 @@ def preprocess_dots_tts_payload(
             ),
         )
     )
+    if template_name == "Base":
+        template_name = "tts"
     templates = {
         "tts": DEFAULT_TRAIN_TEMPLATE,
         "instruction_tts": DEFAULT_INSTRUCTION_TTS_TEMPLATE,
@@ -192,7 +196,7 @@ def preprocess_dots_tts_payload(
         raw_language = str(language_value).strip()
         language = (
             normalize_language_code(detect(text))
-            if raw_language == "auto_detect"
+            if raw_language.lower() in {"auto", "auto_detect"}
             else normalize_language_code(raw_language)
         )
         if raw_language and raw_language.lower() != "none" and language is None:
@@ -293,6 +297,11 @@ def preprocess_dots_tts_payload(
             )
             is None
             else int(seed)
+        ),
+        max_new_tokens=(
+            None
+            if params.get("max_new_tokens") is None
+            else int(params["max_new_tokens"])
         ),
         stream=bool(params.get("stream", False)),
         generation_schedule=schedule,

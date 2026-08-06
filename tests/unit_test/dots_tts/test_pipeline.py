@@ -18,11 +18,28 @@ def test_dots_tts_uses_framework_stage_boundaries() -> None:
     assert {stage.process for stage in config.stages} == {"pipeline"}
     assert config.terminal_stages == ["vocoder"]
     assert config.generation_sglang_role_to_stage() == {"generation": "latent_engine"}
+    assert config.additional_speech_languages == frozenset({"auto_detect"})
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("DotsTTSForConditionalGeneration")
         is DotsTTSPipelineConfig
     )
     assert DotsTTSState().num_steps == 4
+
+
+def test_public_speech_boundary_accepts_dots_auto_detect_alias() -> None:
+    from sglang_omni.models.dots_tts.config import DotsTTSPipelineConfig
+
+    config = DotsTTSPipelineConfig(model_path="dots-studio/dots.tts-mf")
+    validator = SpeechRequestValidator(
+        default_model=config.model_path,
+        additional_speech_languages=config.additional_speech_languages,
+    )
+
+    request = validator.parse_generation_request(
+        {"input": "hello", "voice": "default", "language": "AUTO_DETECT"}
+    )
+
+    assert request.request.language == "auto_detect"
 
 
 def test_dots_tts_rejects_tp() -> None:

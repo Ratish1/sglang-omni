@@ -23,6 +23,7 @@ class DotsTTSState(DeclarativeStateBase):
     num_steps: int = wire(4, codec="int_or")
     guidance_scale: float = wire(1.2, codec="float")
     seed: int | None = wire(None, codec="opt_int")
+    max_new_tokens: int | None = wire(None, codec="opt_int")
     stream: bool = wire(False, codec="bool")
     eos_threshold: float = wire(0.8, codec="float")
     generation_schedule: torch.Tensor | None = wire(None, codec="typed_tensor")

@@ -19,6 +19,7 @@ class DotsTTSPipelineConfig(PipelineConfig):
         "dots_tts",
         "DotsTtsModel",
     )
+    additional_speech_languages: ClassVar[frozenset[str]] = frozenset({"auto_detect"})
 
     model_path: str
     stages: list[StageConfig] = [
