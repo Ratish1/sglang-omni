@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from sglang_omni.scheduling.generation_batch_policy import (
+    build_default_prefill_cuda_graph_bs,
     build_generation_batch_overrides,
     validate_generation_batch_policy,
 )
@@ -206,6 +207,34 @@ def test_padding_gap_warning_requires_a_non_empty_eager_range(caplog) -> None:
             )
         )
     assert any("[(65, 65)]" in record.getMessage() for record in caplog.records)
+
+
+def test_default_prefill_ladder_matches_sglang_generated_ladder() -> None:
+    # Mirrors ServerArgs._generate_prefill_cuda_graph_batch_sizes: shape-
+    # agnostic ladder, fine-grained at the bottom, 30 shapes at cap 512.
+    ladder = build_default_prefill_cuda_graph_bs(512)
+    assert ladder == (
+        list(range(4, 33, 4)) + list(range(48, 257, 16)) + list(range(288, 513, 32))
+    )
+    assert len(ladder) == 30
+
+    # An off-grid cap is appended so max(bs) matches the declared budget.
+    off_grid = build_default_prefill_cuda_graph_bs(100)
+    assert off_grid[-1] == 100
+    assert off_grid[:-1] == [4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96]
+
+    # A cap below the grid still yields a valid single-bucket ladder.
+    assert build_default_prefill_cuda_graph_bs(2) == [2]
+
+    # The generated ladder satisfies the declared-policy validator.
+    _validate(
+        _server_args(
+            prefill_backend="breakable",
+            prefill_bs=tuple(ladder),
+            prefill_max_bs=512,
+            locked=_PREFILL_BS_LOCKED,
+        )
+    )
 
 
 def test_overrides_derive_prefill_max_bs_from_buckets() -> None:
