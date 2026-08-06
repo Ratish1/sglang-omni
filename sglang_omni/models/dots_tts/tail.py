@@ -6,34 +6,19 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dots_tts.modules.backbone.dit_inference import FusedAdaLNDiT
+from dots_tts.modules.backbone.inference_utils import fuse_qkv_projection
 from dots_tts.modules.backbone.layers import rotate_half
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 logger = logging.getLogger(__name__)
 
 _TAIL_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
-
-
-def _build_fused_qkv(attn: nn.Module) -> nn.Linear:
-    hidden_size = int(attn.num_heads) * int(attn.head_dim)
-    projections = (attn.q_proj, attn.k_proj, attn.v_proj)
-    fused = nn.Linear(
-        hidden_size,
-        3 * hidden_size,
-        bias=attn.q_proj.bias is not None,
-        device=attn.q_proj.weight.device,
-        dtype=attn.q_proj.weight.dtype,
-    )
-    with torch.no_grad():
-        fused.weight.copy_(torch.cat([projection.weight for projection in projections]))
-        if fused.bias is not None:
-            fused.bias.copy_(torch.cat([projection.bias for projection in projections]))
-    return fused
 
 
 def _project_attention(
@@ -49,6 +34,9 @@ def _project_attention(
     attn_mask: torch.Tensor | None = None,
     is_causal: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``dots_tts.modules.backbone.inference_utils.project_attention`` variant
+    that writes K/V into a preallocated scratch buffer and attends over the
+    truncated view instead of the full-width cache."""
     batch, seq_len, _ = value.shape
     qkv = attn.qkv_proj(value).view(batch, seq_len, 3, num_heads, head_dim)
     query, key, item = qkv.permute(2, 0, 3, 1, 4)
@@ -84,97 +72,12 @@ def _project_attention(
     return attn.o_dropout(attn.o_proj(output)), key, item
 
 
-class _FusedQKVAttention(nn.Module):
-    def __init__(self, attention: nn.Module) -> None:
-        super().__init__()
-        for name in (
-            "num_heads",
-            "head_dim",
-            "rotary_bias",
-            "q_norm",
-            "k_norm",
-            "attn_drop",
-            "o_proj",
-            "o_dropout",
-        ):
-            setattr(self, name, getattr(attention, name))
-        self.qkv_proj = _build_fused_qkv(attention)
-        if self.rotary_bias:
-            self.rotary = attention.rotary
+class _AutocastFusedDiT(FusedAdaLNDiT):
+    """Upstream fused DiT plus an autocast-safe fused-modulation entry point.
 
-    def forward(
-        self,
-        value: torch.Tensor,
-        mask: torch.Tensor | None = None,
-        pos_ids: torch.Tensor | None = None,
-        **_kwargs: Any,
-    ) -> torch.Tensor:
-        cos = sin = None
-        if self.rotary_bias:
-            if pos_ids is None:
-                pos_ids = torch.arange(
-                    value.size(1), device=value.device, dtype=torch.float32
-                )
-            rotary = self.rotary(pos_ids)
-            cos, sin = rotary.cos(), rotary.sin()
-        if mask is not None and mask.ndim == 3:
-            mask = mask[:, None]
-        output, _, _ = _project_attention(
-            self,
-            value,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            rotary_cos=cos,
-            rotary_sin=sin,
-            attn_mask=mask,
-        )
-        return output
-
-
-def _modulate(value: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
-    return value * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-
-class _FusedAdaLNDiT(nn.Module):
-    """Inference-only DiT with fused QKV and precomputed adaLN projections."""
-
-    def __init__(self, dit: nn.Module) -> None:
-        super().__init__()
-        if any(not block.modulation for block in dit.blocks):
-            raise ValueError("dots.tts batched tail requires DiT modulation")
-        for block in dit.blocks:
-            block.attn = _FusedQKVAttention(block.attn)
-        self.input_layer = dit.input_layer
-        self.time_embedder = dit.time_embedder
-        self.duration_embedder = getattr(dit, "duration_embedder", None)
-        self.blocks = dit.blocks
-        self.output_layer = dit.output_layer
-
-        model_dim = int(self.input_layer.out_features)
-        linears = [block.adaLN_modulation[-1] for block in self.blocks]
-        linears.append(self.output_layer.adaLN_modulation[-1])
-        first = linears[0]
-        self.fused_adaln = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(
-                model_dim,
-                model_dim * (6 * len(self.blocks) + 2),
-                bias=first.bias is not None,
-                device=first.weight.device,
-                dtype=first.weight.dtype,
-            ),
-        )
-        with torch.no_grad():
-            self.fused_adaln[-1].weight.copy_(
-                torch.cat([linear.weight for linear in linears])
-            )
-            if self.fused_adaln[-1].bias is not None:
-                self.fused_adaln[-1].bias.copy_(
-                    torch.cat([linear.bias for linear in linears])
-                )
-        for block in self.blocks:
-            block.adaLN_modulation = nn.Identity()
-        self.output_layer.adaLN_modulation = nn.Identity()
+    ``build_mods`` runs the fp32 timestep embedding under autocast so bf16
+    weights accept it outside the solver's own autocast scope.
+    """
 
     def build_mods(
         self,
@@ -191,70 +94,15 @@ class _FusedAdaLNDiT(nn.Module):
         }
         autocast |= device_type == "cpu" and dtype == torch.bfloat16
         with torch.autocast(device_type=device_type, dtype=dtype, enabled=autocast):
-            condition = self.time_embedder(timesteps)
-            if self.duration_embedder is not None and duration is not None:
-                condition = condition + self.duration_embedder(duration)
-            if g_cond is not None:
-                condition = condition + g_cond
-            return self.fused_adaln(condition)
-
-    def _split_mods(self, all_mods: torch.Tensor):
-        model_dim = int(self.input_layer.out_features)
-        final_start = 6 * model_dim * len(self.blocks)
-        block_mods = all_mods[:, :final_start].split(6 * model_dim, dim=1)
-        final_mods = all_mods[:, final_start:].chunk(2, dim=1)
-        return block_mods, final_mods
-
-    def run_modulated_blocks(
-        self,
-        *,
-        x: torch.Tensor,
-        all_mods: torch.Tensor,
-        attention: Callable[[int, nn.Module, torch.Tensor], torch.Tensor],
-    ):
-        block_mods, final_mods = self._split_mods(all_mods)
-        x = self.input_layer(x)
-        for layer_index, (block, mods) in enumerate(
-            zip(self.blocks, block_mods, strict=True)
-        ):
-            shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = (
-                mods.chunk(6, dim=1)
+            return self.fused_adaln(
+                self.build_condition(timesteps, duration=duration, g_cond=g_cond)
             )
-            attn_in = _modulate(block.norm1(x), shift_attn, scale_attn)
-            x = x + gate_attn.unsqueeze(1) * attention(layer_index, block, attn_in)
-            ffn_in = _modulate(block.norm2(x), shift_ffn, scale_ffn)
-            x = x + gate_ffn.unsqueeze(1) * block.ffn(ffn_in)
-        return x, final_mods
-
-    def apply_final_layer(self, x: torch.Tensor, mods) -> torch.Tensor:
-        shift, scale = mods
-        return self.output_layer.linear(
-            _modulate(self.output_layer.norm(x), shift, scale)
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        timesteps: torch.Tensor,
-        duration: torch.Tensor | None = None,
-        attn_mask: torch.Tensor | None = None,
-        pos_ids: torch.Tensor | None = None,
-        g_cond: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x, final_mods = self.run_modulated_blocks(
-            x=x,
-            all_mods=self.build_mods(timesteps, duration=duration, g_cond=g_cond),
-            attention=lambda _index, block, attn_in: block.attn(
-                attn_in, mask=attn_mask, pos_ids=pos_ids
-            ),
-        )
-        return self.apply_final_layer(x, final_mods)
 
 
-def fuse_dit_for_inference(model: nn.Module) -> _FusedAdaLNDiT:
+def fuse_dit_for_inference(model: nn.Module) -> _AutocastFusedDiT:
     dit = model.velocity_field_predictor
-    if not isinstance(dit, _FusedAdaLNDiT):
-        dit = _FusedAdaLNDiT(dit)
+    if not isinstance(dit, _AutocastFusedDiT):
+        dit = _AutocastFusedDiT(dit)
         model.velocity_field_predictor = dit
     return dit
 
@@ -343,7 +191,11 @@ def batched_causal_update_mask(
     prev_len: int,
     current_len: int,
 ) -> torch.Tensor:
-    """Mask a fresh query block appended after variable-length cached rows."""
+    """Mask a fresh query block appended after variable-length cached rows.
+
+    Per-row (``valid_persistent`` tensor) form of
+    ``dots_tts.modules.backbone.inference_utils.build_causal_update_mask``.
+    """
     q_len = int(prev_len) + int(current_len)
     device = valid_persistent.device
     total_kv = int(capacity_tokens) + q_len
@@ -357,6 +209,8 @@ def batched_causal_update_mask(
 
 
 def _rotary_cos_sin(rotary: Any, starts: torch.Tensor, length: int):
+    """Per-slot-start form of
+    ``dots_tts.modules.backbone.inference_utils.build_rotary_cos_sin``."""
     offsets = torch.arange(length, device=starts.device, dtype=torch.float32)
     embedding = rotary(starts.reshape(-1, 1).float() + offsets)
     return embedding.cos(), embedding.sin()
@@ -382,7 +236,7 @@ class DotsTtsAcousticTail:
         self._coordinate_proj = coordinate_proj
         self._encoder = patch_encoder
         for layer in patch_encoder.encoder.layers:
-            layer.attn.qkv_proj = _build_fused_qkv(layer.attn)
+            fuse_qkv_projection(layer.attn)
         self._encoder_step = _SemanticEncoderDecodeStep(patch_encoder).eval()
 
         dit_attention = dit.blocks[0].attn
