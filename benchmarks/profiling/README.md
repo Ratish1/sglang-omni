@@ -504,6 +504,7 @@ An accepted result requires all of the following:
 - `system.json`: complete request-window monotonic and wall-clock boundaries;
 - `nsight-system-wide/system-wide-cpu.nsys-rep`: finalized and nonempty;
 - `nsight-system-wide/system-wide-cpu.sqlite`: successful non-lazy export;
+- `nsight-system-wide/summary.md`: generated temporal and hotspot summary;
 - nonempty `SCHED_EVENTS`, `COMPOSITE_EVENTS`, and `cpuCycles=1` samples;
 - stable `/proc` TID/start-time identities across the measured window;
 - scheduling events, real CPU samples, and sampled leaf symbols for
@@ -512,29 +513,71 @@ An accepted result requires all of the following:
 The filtered evidence is in
 `system.json["nsys_system_wide_cpu"]["evidence"]`. For each semantic thread
 class it reports TIDs, scheduling counts, true CPU-sample counts, and the top
-leaf and inclusive native symbols. The raw `.nsys-rep` and SQLite database are
-retained for GUI or follow-up SQL analysis. `cpuCycles=0` call stacks are
-excluded from hotspot attribution because those are context-switch stacks,
-not periodic CPU samples.
+leaf and inclusive native symbols. It also reconstructs the timestamped
+sched-in/sched-out intervals and reports:
+
+- total on-CPU service and class-active wall time;
+- runnable-but-off-CPU, blocked, and unknown off-CPU distributions;
+- blocking-reason time, CPU changes, and non-alternating-event warnings;
+- pairwise and all-class simultaneous on-CPU overlap;
+- trace timestamps for the longest runnable, blocked, and overlap intervals,
+  which are the exact regions to inspect if the GUI is needed.
+
+The same decision-oriented subset is written to
+`nsight-system-wide/summary.md`, so opening the GUI is not mandatory for the
+first diagnosis. The raw `.nsys-rep` and SQLite database remain available for
+visual verification or follow-up SQL. `cpuCycles=0` call stacks are excluded
+from hotspot attribution because those are context-switch stacks, not periodic
+CPU samples.
 
 Interpret the pair in this order:
 
-1. Find which semantic thread's CPU-sample share and native leaf symbols grow
-   under CPU64. This locates real additional execution, such as audio feature
-   extraction, allocation/copying, Python runtime work, or synchronization.
-2. Compare that with its procfs CPU time, runqueue delay, migrations, and
-   context-switch count. More wall delay with unchanged samples is scheduler
-   starvation; more samples and CPU time is additional service cost or cache/
-   SMT interference.
-3. Align the same arm with `gpu-dmon`. Falling SM utilization while one or
-   more host critical threads are delayed confirms host dispatch starvation.
-4. Only after a specific thread and native stack family is selected should a
-   narrow in-process Torch or Python profiler be applied to that owner.
+1. If runnable off-CPU time rises while CPU-sample share is flat, the thread is
+   being starved by the OS scheduler. Compare migrations and placement.
+2. If on-CPU time, sample share, and a native stack family grow while runnable
+   delay stays low, investigate additional service cost or cache/SMT
+   interference in that owner.
+3. If blocked time rises, use the reported block reason and owner to select the
+   dependency boundary (request builder, pre-LM encoder, or scheduler wakeup).
+4. Use overlap to decide whether one serial owner or several simultaneously
+   active stages create the critical path. Falling `gpu-dmon` SM utilization
+   while those host stages are delayed confirms GPU-feed starvation.
+5. If the scheduler remains runnable and inexpensive but ready work is still
+   admitted late, Nsight has reached its semantic boundary. Measure only
+   request-build head readiness, later-ready count, pre-LM publish, and drain
+   time; do not broaden the profiler.
+6. Only after an owner and mechanism are selected should a narrow in-process
+   Torch or Python profiler be applied.
 
 This capture cannot prove GIL ownership or map interpreter samples to Python
-lines, and it cannot join CUDA launch calls to kernels. Those are intentional
-limitations of avoiding injection. It can select the exact owner and native
-hotspot family without risking another model startup under Nsight injection.
+lines, attach scheduling intervals to request IDs, prove request-build
+head-of-line ordering, or join CUDA launches to kernels. Those are intentional
+limitations of avoiding injection. It can select the owner and mechanism class
+without risking another model startup under Nsight injection.
+
+For optional manual inspection, copy the finalized `.nsys-rep` from the remote
+container and open it with the same or a newer Nsight Systems GUI. Select the
+target PID and expand the `sched-asr`, `omni-request-bu`, and
+`fun-asr-audio-e` OS-thread rows. The useful visual check is whether a slow
+interval is runnable but not scheduled, blocked, or on CPU in a sampled native
+stack. Do not infer request ordering or CUDA causality from this CPU-only
+timeline; those lanes were intentionally not collected.
+
+### Scheduler architecture boundary
+
+Do not choose a scheduler repair merely because the scheduler thread appears
+in the distributed critical path. Fun-ASR has modality-specific work before LM
+admission: audio loading/feature construction, a request-build pool, and one
+batched pre-LM encoder service. Once a request is LM-ready, the token/KV
+scheduler's core invariants are shared with text.
+
+The design question is therefore where resource readiness and backpressure
+belong, not whether every modality needs a separate token scheduler. Evidence
+of ordered-drain head-of-line blocking or pre-LM queue amplification supports a
+speech-specific admission policy. Evidence of expensive or starved LM
+scheduling after readiness supports a core scheduler change. TTS may require a
+different stage policy for streaming cadence and downstream audio generation,
+while still sharing the LM scheduler where its token/KV invariants match.
 
 ### Injected joint CPU/CUDA/Python trace
 

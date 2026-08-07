@@ -632,6 +632,361 @@ def _sqlite_columns(connection: sqlite3.Connection, table: str) -> set[str]:
     }
 
 
+def _nearest_rank(values: Sequence[int], percentile: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(int(value) for value in values)
+    rank = max(1, min(len(ordered), int((percentile * len(ordered) + 99) // 100)))
+    return ordered[rank - 1]
+
+
+def _duration_summary_ns(values: Sequence[int]) -> dict[str, Any]:
+    durations = [int(value) for value in values if int(value) >= 0]
+
+    def milliseconds(value: int | None) -> float | None:
+        return value / 1_000_000 if value is not None else None
+
+    total_ns = sum(durations)
+    return {
+        "count": len(durations),
+        "total_ms": milliseconds(total_ns),
+        "mean_ms": milliseconds(total_ns // len(durations)) if durations else None,
+        "p50_ms": milliseconds(_nearest_rank(durations, 50)),
+        "p95_ms": milliseconds(_nearest_rank(durations, 95)),
+        "p99_ms": milliseconds(_nearest_rank(durations, 99)),
+        "max_ms": milliseconds(max(durations)) if durations else None,
+        "count_ge_1ms": sum(value >= 1_000_000 for value in durations),
+        "count_ge_5ms": sum(value >= 5_000_000 for value in durations),
+        "count_ge_10ms": sum(value >= 10_000_000 for value in durations),
+    }
+
+
+def _merge_intervals(
+    intervals: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    ordered = sorted(
+        (int(start), int(end)) for start, end in intervals if int(end) > int(start)
+    )
+    merged: list[tuple[int, int]] = []
+    for start, end in ordered:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _intersect_intervals(
+    left: Sequence[tuple[int, int]],
+    right: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    intersections: list[tuple[int, int]] = []
+    left_index = 0
+    right_index = 0
+    while left_index < len(left) and right_index < len(right):
+        start = max(left[left_index][0], right[right_index][0])
+        end = min(left[left_index][1], right[right_index][1])
+        if end > start:
+            intersections.append((start, end))
+        if left[left_index][1] <= right[right_index][1]:
+            left_index += 1
+        else:
+            right_index += 1
+    return intersections
+
+
+def _nsys_enum_map(
+    connection: sqlite3.Connection,
+    table: str,
+) -> dict[int, dict[str, str | None]]:
+    return {
+        int(identifier): {
+            "name": str(name) if name is not None else None,
+            "label": str(label) if label is not None else None,
+        }
+        for identifier, name, label in connection.execute(
+            f'SELECT id, name, label FROM "{table}"'
+        ).fetchall()
+    }
+
+
+def _classify_nsys_off_cpu_interval(
+    *,
+    thread_state: str | None,
+    thread_block: str | None,
+) -> str:
+    # NVIDIA requires interpreting the pair. Running/NonBlocked is a
+    # preempted, runnable thread. Named block reasons are dependency sleeps.
+    if thread_state == "Running" or thread_block == "NonBlocked":
+        return "runnable"
+    if thread_block not in (None, "", "Unknown", "Invalid"):
+        return "blocked"
+    return "unknown"
+
+
+def _nsys_temporal_schedule_analysis(
+    connection: sqlite3.Connection,
+    *,
+    target_pid: int,
+    required_identities: dict[str, list[tuple[int, int]]],
+) -> dict[str, Any]:
+    tids = sorted(
+        {
+            int(identity[0])
+            for identities in required_identities.values()
+            for identity in identities
+        }
+    )
+    if not tids:
+        return {
+            "trace_span_ms": 0.0,
+            "semantic_threads": {},
+            "pairwise_on_cpu_overlap": [],
+            "all_required_on_cpu_overlap_ms": 0.0,
+            "active_class_concurrency_ms": {},
+        }
+
+    global_tids = [(int(target_pid) << 24) | tid for tid in tids]
+    placeholders = ",".join("?" for _ in global_tids)
+    rows = connection.execute(
+        f"""
+        SELECT start, globalTid, isSchedIn, cpu, threadState, threadBlock
+        FROM SCHED_EVENTS
+        WHERE globalTid IN ({placeholders})
+        ORDER BY globalTid, start
+        """,
+        global_tids,
+    ).fetchall()
+    state_map = _nsys_enum_map(connection, "ENUM_SAMPLING_THREAD_STATE")
+    block_map = _nsys_enum_map(connection, "ENUM_SCHEDULING_THREAD_BLOCK")
+
+    events_by_tid: dict[int, list[tuple[Any, ...]]] = defaultdict(list)
+    for row in rows:
+        _, tid = _nsys_linux_ids(int(row[1]))
+        events_by_tid[tid].append(row)
+
+    per_tid: dict[int, dict[str, Any]] = {}
+    trace_starts: list[int] = []
+    trace_ends: list[int] = []
+    for tid in tids:
+        events = events_by_tid.get(tid, [])
+        on_cpu: list[tuple[int, int]] = []
+        off_cpu: dict[str, list[tuple[int, int, str, str]]] = {
+            "runnable": [],
+            "blocked": [],
+            "unknown": [],
+        }
+        sched_in_cpus: list[int] = []
+        malformed_transitions = 0
+        for current, following in zip(events, events[1:]):
+            start = int(current[0])
+            end = int(following[0])
+            if end <= start:
+                malformed_transitions += 1
+                continue
+            current_is_in = bool(current[2])
+            following_is_in = bool(following[2])
+            if current_is_in and not following_is_in:
+                on_cpu.append((start, end))
+                sched_in_cpus.append(int(current[3]))
+            elif not current_is_in and following_is_in:
+                state = (
+                    state_map.get(int(current[4])) if current[4] is not None else None
+                )
+                block = (
+                    block_map.get(int(current[5])) if current[5] is not None else None
+                )
+                state_name = (
+                    str(state["name"]) if state and state.get("name") else "Unknown"
+                )
+                block_name = (
+                    str(block["name"]) if block and block.get("name") else "Unknown"
+                )
+                classification = _classify_nsys_off_cpu_interval(
+                    thread_state=state_name,
+                    thread_block=block_name,
+                )
+                off_cpu[classification].append((start, end, state_name, block_name))
+            else:
+                malformed_transitions += 1
+
+        if events:
+            trace_starts.append(int(events[0][0]))
+            trace_ends.append(int(events[-1][0]))
+        per_tid[tid] = {
+            "on_cpu": on_cpu,
+            "off_cpu": off_cpu,
+            "cpus": sorted(set(sched_in_cpus)),
+            "cpu_changes": sum(
+                left != right for left, right in zip(sched_in_cpus, sched_in_cpus[1:])
+            ),
+            "malformed_transitions": malformed_transitions,
+        }
+
+    trace_start = min(trace_starts) if trace_starts else 0
+    trace_end = max(trace_ends) if trace_ends else trace_start
+
+    def longest_intervals(
+        intervals: Sequence[tuple[Any, ...]],
+        *,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        rows = []
+        for interval in sorted(
+            intervals,
+            key=lambda row: int(row[1]) - int(row[0]),
+            reverse=True,
+        )[:limit]:
+            start = int(interval[0])
+            end = int(interval[1])
+            row: dict[str, Any] = {
+                "trace_start_ms": start / 1_000_000,
+                "trace_end_ms": end / 1_000_000,
+                "relative_start_ms": (start - trace_start) / 1_000_000,
+                "duration_ms": (end - start) / 1_000_000,
+            }
+            if len(interval) >= 4:
+                row["thread_state"] = str(interval[2])
+                row["thread_block"] = str(interval[3])
+            rows.append(row)
+        return rows
+
+    semantic: dict[str, Any] = {}
+    active_intervals_by_comm: dict[str, list[tuple[int, int]]] = {}
+    for comm, identities in required_identities.items():
+        comm_tids = [int(identity[0]) for identity in identities]
+        on_cpu = [
+            interval
+            for tid in comm_tids
+            for interval in per_tid.get(tid, {}).get("on_cpu", [])
+        ]
+        active_intervals = _merge_intervals(on_cpu)
+        active_intervals_by_comm[comm] = active_intervals
+        runnable = [
+            interval
+            for tid in comm_tids
+            for interval in per_tid.get(tid, {}).get("off_cpu", {}).get("runnable", [])
+        ]
+        blocked = [
+            interval
+            for tid in comm_tids
+            for interval in per_tid.get(tid, {}).get("off_cpu", {}).get("blocked", [])
+        ]
+        unknown = [
+            interval
+            for tid in comm_tids
+            for interval in per_tid.get(tid, {}).get("off_cpu", {}).get("unknown", [])
+        ]
+        block_reasons: dict[str, list[int]] = defaultdict(list)
+        for start, end, state, block in blocked:
+            block_reasons[f"{block}/{state}"].append(end - start)
+        semantic[comm] = {
+            "tids": comm_tids,
+            "on_cpu": _duration_summary_ns([end - start for start, end in on_cpu]),
+            "class_active_wall": _duration_summary_ns(
+                [end - start for start, end in active_intervals]
+            ),
+            "runnable_off_cpu": _duration_summary_ns(
+                [end - start for start, end, _, _ in runnable]
+            ),
+            "blocked_off_cpu": _duration_summary_ns(
+                [end - start for start, end, _, _ in blocked]
+            ),
+            "unknown_off_cpu": _duration_summary_ns(
+                [end - start for start, end, _, _ in unknown]
+            ),
+            "longest_on_cpu_intervals": longest_intervals(on_cpu),
+            "longest_runnable_off_cpu_intervals": longest_intervals(runnable),
+            "longest_blocked_off_cpu_intervals": longest_intervals(blocked),
+            "blocked_reason_time": {
+                reason: _duration_summary_ns(durations)
+                for reason, durations in sorted(block_reasons.items())
+            },
+            "cpus": sorted(
+                {
+                    cpu
+                    for tid in comm_tids
+                    for cpu in per_tid.get(tid, {}).get("cpus", [])
+                }
+            ),
+            "cpu_changes": sum(
+                int(per_tid.get(tid, {}).get("cpu_changes", 0)) for tid in comm_tids
+            ),
+            "malformed_transitions": sum(
+                int(per_tid.get(tid, {}).get("malformed_transitions", 0))
+                for tid in comm_tids
+            ),
+        }
+
+    pairwise: list[dict[str, Any]] = []
+    comms = list(required_identities)
+    for index, left in enumerate(comms):
+        for right in comms[index + 1 :]:
+            overlap = _intersect_intervals(
+                active_intervals_by_comm[left],
+                active_intervals_by_comm[right],
+            )
+            overlap_ns = sum(end - start for start, end in overlap)
+            left_ns = sum(end - start for start, end in active_intervals_by_comm[left])
+            right_ns = sum(
+                end - start for start, end in active_intervals_by_comm[right]
+            )
+            pairwise.append(
+                {
+                    "left": left,
+                    "right": right,
+                    "overlap_ms": overlap_ns / 1_000_000,
+                    "fraction_of_left_active": (
+                        overlap_ns / left_ns if left_ns else None
+                    ),
+                    "fraction_of_right_active": (
+                        overlap_ns / right_ns if right_ns else None
+                    ),
+                    "longest_overlap_intervals": longest_intervals(overlap),
+                }
+            )
+
+    all_overlap: list[tuple[int, int]] = []
+    if comms:
+        all_overlap = active_intervals_by_comm[comms[0]]
+        for comm in comms[1:]:
+            all_overlap = _intersect_intervals(
+                all_overlap,
+                active_intervals_by_comm[comm],
+            )
+
+    class_events: dict[int, int] = defaultdict(int)
+    for intervals in active_intervals_by_comm.values():
+        for start, end in intervals:
+            class_events[start] += 1
+            class_events[end] -= 1
+    concurrency_ns: dict[int, int] = defaultdict(int)
+    active_classes = 0
+    points = sorted(class_events)
+    for index, point in enumerate(points[:-1]):
+        active_classes += class_events[point]
+        concurrency_ns[active_classes] += points[index + 1] - point
+
+    return {
+        "trace_span_ms": (trace_end - trace_start) / 1_000_000,
+        "semantic_threads": semantic,
+        "pairwise_on_cpu_overlap": pairwise,
+        "all_required_on_cpu_overlap_ms": (
+            sum(end - start for start, end in all_overlap) / 1_000_000
+        ),
+        "active_class_concurrency_ms": {
+            str(count): duration / 1_000_000
+            for count, duration in sorted(concurrency_ns.items())
+        },
+        "interpretation_contract": {
+            "runnable": "sched-out was NonBlocked or thread state was Running",
+            "blocked": "sched-out carried a named blocking reason",
+            "unknown": "Nsight did not provide a decisive state/reason pair",
+            "overlap": "wall time when semantic thread classes were on CPU together",
+        },
+    }
+
+
 def _nsys_cpu_hotspots(
     path: Path,
     *,
@@ -748,7 +1103,14 @@ def inspect_nsys_cpu_sqlite(
         }
         result["tables"] = sorted(tables)
         required_columns = {
-            "SCHED_EVENTS": {"globalTid", "start", "isSchedIn"},
+            "SCHED_EVENTS": {
+                "globalTid",
+                "start",
+                "isSchedIn",
+                "cpu",
+                "threadState",
+                "threadBlock",
+            },
             "COMPOSITE_EVENTS": {"globalTid", "start", "cpuCycles"},
             "SAMPLING_CALLCHAINS": {
                 "id",
@@ -757,6 +1119,8 @@ def inspect_nsys_cpu_sqlite(
                 "stackDepth",
             },
             "StringIds": {"id", "value"},
+            "ENUM_SAMPLING_THREAD_STATE": {"id", "name", "label"},
+            "ENUM_SCHEDULING_THREAD_BLOCK": {"id", "name", "label"},
         }
         for table, expected in required_columns.items():
             if table not in tables:
@@ -795,6 +1159,11 @@ def inspect_nsys_cpu_sqlite(
             GROUP BY globalTid
             """
         ).fetchall()
+        temporal_schedule = _nsys_temporal_schedule_analysis(
+            connection,
+            target_pid=target_pid,
+            required_identities=required_identities,
+        )
     except sqlite3.DatabaseError as exc:
         errors.append(f"cannot query Nsight SQLite export: {exc}")
         result["valid"] = False
@@ -937,6 +1306,15 @@ def inspect_nsys_cpu_sqlite(
                 f"required native thread comm {comm!r} has no sampled leaf symbols"
             )
     result["required_thread_coverage"] = comm_summaries
+    result["temporal_schedule"] = temporal_schedule
+    temporal_schedule["warnings"] = [
+        (
+            f"{comm!r} has {summary['malformed_transitions']} non-alternating "
+            "scheduling transitions; those intervals were excluded"
+        )
+        for comm, summary in temporal_schedule["semantic_threads"].items()
+        if summary["malformed_transitions"]
+    ]
     result["target_totals"] = {
         "sched_events": sum(row["events"] for row in sched_by_tid.values()),
         "sched_in": sum(row["sched_in"] for row in sched_by_tid.values()),
@@ -948,6 +1326,130 @@ def inspect_nsys_cpu_sqlite(
     }
     result["valid"] = not errors
     return result
+
+
+def render_nsys_cpu_summary(evidence: dict[str, Any]) -> str:
+    """Render the decision-oriented subset of a system-wide CPU capture."""
+
+    def format_ms(value: Any) -> str:
+        return "n/a" if value is None else f"{float(value):.3f} ms"
+
+    lines = [
+        "# Nsight system-wide CPU summary",
+        "",
+        f"- Evidence valid: `{str(bool(evidence.get('valid'))).lower()}`",
+        f"- Target PID: `{evidence.get('target_pid')}`",
+    ]
+    temporal = evidence.get("temporal_schedule", {})
+    lines.append(f"- Semantic trace span: `{temporal.get('trace_span_ms', 0):.3f} ms`")
+    lines.extend(
+        [
+            "",
+            "## Scheduling state by semantic thread",
+            "",
+            "| Thread class | TIDs | On-CPU total | Runnable off-CPU | Runnable p95 | Blocked off-CPU | CPU changes |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    coverage = evidence.get("required_thread_coverage", {})
+    for comm, schedule in temporal.get("semantic_threads", {}).items():
+        runnable = schedule["runnable_off_cpu"]
+        blocked = schedule["blocked_off_cpu"]
+        on_cpu = schedule["on_cpu"]
+        tids = ",".join(str(tid) for tid in schedule["tids"])
+        lines.append(
+            f"| `{comm}` | {tids} | {format_ms(on_cpu['total_ms'])} | "
+            f"{format_ms(runnable['total_ms'])} | "
+            f"{format_ms(runnable['p95_ms'])} | "
+            f"{format_ms(blocked['total_ms'])} | {schedule['cpu_changes']} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Longest off-CPU intervals to inspect",
+            "",
+            "| Thread class | State | Trace start | Duration | Reason |",
+            "|---|---|---:|---:|---|",
+        ]
+    )
+    for comm, schedule in temporal.get("semantic_threads", {}).items():
+        for state, key in (
+            ("runnable", "longest_runnable_off_cpu_intervals"),
+            ("blocked", "longest_blocked_off_cpu_intervals"),
+        ):
+            for interval in schedule.get(key, [])[:3]:
+                reason = (
+                    f"{interval.get('thread_block', 'Unknown')}/"
+                    f"{interval.get('thread_state', 'Unknown')}"
+                )
+                lines.append(
+                    f"| `{comm}` | {state} | "
+                    f"{interval['trace_start_ms']:.3f} ms | "
+                    f"{interval['duration_ms']:.3f} ms | `{reason}` |"
+                )
+
+    lines.extend(
+        [
+            "",
+            "## Simultaneous on-CPU activity",
+            "",
+            "| Thread classes | Overlap | Left active overlap | Right active overlap |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for row in temporal.get("pairwise_on_cpu_overlap", []):
+        left_fraction = row["fraction_of_left_active"]
+        right_fraction = row["fraction_of_right_active"]
+        lines.append(
+            f"| `{row['left']}` + `{row['right']}` | "
+            f"{row['overlap_ms']:.3f} ms | "
+            f"{(left_fraction or 0) * 100:.2f}% | "
+            f"{(right_fraction or 0) * 100:.2f}% |"
+        )
+    lines.append(
+        f"\nAll required classes were simultaneously on CPU for "
+        f"`{temporal.get('all_required_on_cpu_overlap_ms', 0):.3f} ms`."
+    )
+
+    lines.extend(["", "## Top sampled native leaf symbols", ""])
+    for comm, details in coverage.items():
+        lines.append(f"### `{comm}`")
+        lines.append("")
+        hotspots = details.get("hotspots", {}).get("leaf", [])[:5]
+        if not hotspots:
+            lines.append("- No true CPU-cycle samples.")
+        for hotspot in hotspots:
+            lines.append(
+                f"- `{hotspot['symbol']}` in `{hotspot['module']}`: "
+                f"{hotspot['sample_count']} samples"
+            )
+        lines.append("")
+
+    warnings = temporal.get("warnings", [])
+    if warnings:
+        lines.extend(["## Analysis warnings", ""])
+        lines.extend(f"- {warning}" for warning in warnings)
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Boundary",
+            "",
+            "This summary automatically shows which semantic threads consumed CPU, "
+            "were runnable but preempted, were blocked, migrated between CPUs, and "
+            "ran simultaneously. The raw `.nsys-rep` is optional for visually "
+            "checking a suspicious interval.",
+            "",
+            "Because this non-injected capture has no NVTX, Python, or CUDA trace "
+            "domain, it cannot attach intervals to request IDs or Python source "
+            "lines, prove request-build head-of-line ordering, or correlate a host "
+            "launch with a GPU kernel. Select one owner/mechanism here, then use "
+            "one narrow semantic measurement for that remaining question.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 class NsysSystemWideCpuCollector:
@@ -975,6 +1477,7 @@ class NsysSystemWideCpuCollector:
         self.output_prefix = self.artifact_dir / "system-wide-cpu"
         self.report_path = self.output_prefix.with_suffix(".nsys-rep")
         self.sqlite_path = self.output_prefix.with_suffix(".sqlite")
+        self.summary_path = self.artifact_dir / "summary.md"
         self.started_monotonic_ns: int | None = None
         self.started_wall_ns: int | None = None
         self.stopped_monotonic_ns: int | None = None
@@ -1100,6 +1603,7 @@ class NsysSystemWideCpuCollector:
             "stopped_wall_ns": self.stopped_wall_ns,
             "report_path": str(self.report_path),
             "sqlite_path": str(self.sqlite_path),
+            "summary_path": str(self.summary_path),
             "commands": self._commands,
         }
 
@@ -1148,14 +1652,24 @@ class NsysSystemWideCpuCollector:
                     f"{export_capture.stderr[-1000:] or export_capture.stdout[-1000:]}"
                 )
             else:
-                evidence = inspect_nsys_cpu_sqlite(
-                    self.sqlite_path,
-                    target_pid=self.target_pid,
-                    thread_snapshot_before=self._before,
-                    thread_snapshot_after=after,
-                    required_thread_comms=self.required_thread_comms,
-                )
-                errors.extend(str(error) for error in evidence.get("errors", []))
+                try:
+                    evidence = inspect_nsys_cpu_sqlite(
+                        self.sqlite_path,
+                        target_pid=self.target_pid,
+                        thread_snapshot_before=self._before,
+                        thread_snapshot_after=after,
+                        required_thread_comms=self.required_thread_comms,
+                    )
+                    self.summary_path.write_text(
+                        render_nsys_cpu_summary(evidence),
+                        encoding="utf-8",
+                    )
+                    errors.extend(str(error) for error in evidence.get("errors", []))
+                except Exception as exc:
+                    errors.append(
+                        "Nsight evidence finalization failed without losing "
+                        f"the finalized report/SQLite export: {exc!r}"
+                    )
 
         result = {
             **self._lifecycle(),
@@ -1167,6 +1681,9 @@ class NsysSystemWideCpuCollector:
             ),
             "sqlite_bytes": (
                 self.sqlite_path.stat().st_size if self.sqlite_path.is_file() else 0
+            ),
+            "summary_bytes": (
+                self.summary_path.stat().st_size if self.summary_path.is_file() else 0
             ),
             "thread_snapshot_before": self._before,
             "thread_snapshot_after": after,
@@ -1821,6 +2338,7 @@ __all__ = [
     "perf_sched_collector",
     "perf_stat_collector",
     "inspect_nsys_cpu_sqlite",
+    "render_nsys_cpu_summary",
     "psi_delta",
     "read_process_cgroup_psi",
     "read_psi",

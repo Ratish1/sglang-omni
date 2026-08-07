@@ -7,6 +7,8 @@ import os
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from benchmarks.profiling.system_collectors import (
     CommandCapture,
     CpuFrequencyCollector,
@@ -53,7 +55,8 @@ def _write_nsys_cpu_sqlite(
     try:
         connection.execute(
             "CREATE TABLE SCHED_EVENTS "
-            "(start INTEGER, globalTid INTEGER, isSchedIn INTEGER)"
+            "(start INTEGER, globalTid INTEGER, isSchedIn INTEGER, cpu INTEGER, "
+            "threadState INTEGER, threadBlock INTEGER)"
         )
         connection.execute(
             "CREATE TABLE COMPOSITE_EVENTS "
@@ -65,16 +68,58 @@ def _write_nsys_cpu_sqlite(
             "(id INTEGER, symbol INTEGER, module INTEGER, stackDepth INTEGER)"
         )
         connection.execute("CREATE TABLE StringIds (id INTEGER, value TEXT)")
+        connection.execute(
+            "CREATE TABLE ENUM_SAMPLING_THREAD_STATE "
+            "(id INTEGER, name TEXT, label TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE ENUM_SCHEDULING_THREAD_BLOCK "
+            "(id INTEGER, name TEXT, label TEXT)"
+        )
         connection.executemany(
             "INSERT INTO StringIds VALUES (?, ?)",
             [(1, "leaf"), (2, "parent"), (3, "libpython.so")],
         )
+        connection.executemany(
+            "INSERT INTO ENUM_SAMPLING_THREAD_STATE VALUES (?, ?, ?)",
+            [(1, "Running", "Running"), (2, "Sleeping", "Sleeping")],
+        )
+        connection.executemany(
+            "INSERT INTO ENUM_SCHEDULING_THREAD_BLOCK VALUES (?, ?, ?)",
+            [(1, "NonBlocked", "Not blocked"), (2, "Resource", "Resource")],
+        )
         for index, tid in enumerate(tids):
+            offset = index * 200_000
+            state = 1 if index % 2 == 0 else 2
+            block = 1 if index % 2 == 0 else 2
             connection.executemany(
-                "INSERT INTO SCHED_EVENTS VALUES (?, ?, ?)",
+                "INSERT INTO SCHED_EVENTS VALUES (?, ?, ?, ?, ?, ?)",
                 [
-                    (index * 10 + 1, _global_tid(pid, tid), 1),
-                    (index * 10 + 2, _global_tid(pid, tid), 0),
+                    (offset, _global_tid(pid, tid), 1, index, 1, 1),
+                    (
+                        4_000_000 + offset,
+                        _global_tid(pid, tid),
+                        0,
+                        index,
+                        state,
+                        block,
+                    ),
+                    (
+                        8_000_000 + offset,
+                        _global_tid(pid, tid),
+                        1,
+                        index + 1,
+                        1,
+                        1,
+                    ),
+                    (
+                        11_000_000 + offset,
+                        _global_tid(pid, tid),
+                        0,
+                        index + 1,
+                        state,
+                        block,
+                    ),
                 ],
             )
             connection.execute(
@@ -124,12 +169,29 @@ def test_nsys_sqlite_requires_sched_and_true_cpu_samples_per_semantic_comm(
 
     assert result["valid"] is True
     assert result["table_counts"] == {
-        "SCHED_EVENTS": 6,
+        "SCHED_EVENTS": 12,
         "COMPOSITE_EVENTS": 3,
         "CPU_CYCLE_SAMPLES": 3,
     }
     assert result["target_totals"]["cpu_samples"] == 3
-    assert result["required_thread_coverage"]["sched-asr"]["aggregate"]["sched_in"] == 1
+    assert result["required_thread_coverage"]["sched-asr"]["aggregate"]["sched_in"] == 2
+    temporal = result["temporal_schedule"]
+    assert temporal["semantic_threads"]["sched-asr"]["on_cpu"]["total_ms"] == 7.0
+    assert (
+        temporal["semantic_threads"]["sched-asr"]["runnable_off_cpu"]["total_ms"] == 4.0
+    )
+    assert (
+        temporal["semantic_threads"]["sched-asr"]["longest_runnable_off_cpu_intervals"][
+            0
+        ]["duration_ms"]
+        == 4.0
+    )
+    assert (
+        temporal["semantic_threads"]["omni-request-bu"]["blocked_off_cpu"]["total_ms"]
+        == 4.0
+    )
+    assert temporal["pairwise_on_cpu_overlap"][0]["overlap_ms"] > 0
+    assert temporal["pairwise_on_cpu_overlap"][0]["longest_overlap_intervals"]
 
 
 def test_nsys_sqlite_rejects_non_sample_callstacks_and_thread_replacement(
@@ -169,9 +231,41 @@ def test_nsys_sqlite_rejects_non_sample_callstacks_and_thread_replacement(
     assert any("no cpuCycles=1 samples" in error for error in result["errors"])
 
 
+def test_nsys_sqlite_excludes_non_alternating_transition_without_rejecting_capture(
+    tmp_path: Path,
+) -> None:
+    pid = 123
+    semantic_threads = [(201, "sched-asr", 11)]
+    database = tmp_path / "capture.sqlite"
+    _write_nsys_cpu_sqlite(database, pid=pid, tids=[201])
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "INSERT INTO SCHED_EVENTS VALUES (?, ?, ?, ?, ?, ?)",
+            (2_000_000, _global_tid(pid, 201), 1, 0, 1, 1),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = inspect_nsys_cpu_sqlite(
+        database,
+        target_pid=pid,
+        thread_snapshot_before=_thread_snapshot(pid, semantic_threads),
+        thread_snapshot_after=_thread_snapshot(pid, semantic_threads),
+        required_thread_comms=["sched-asr"],
+    )
+
+    assert result["valid"] is True
+    assert result["temporal_schedule"]["warnings"]
+    assert "non-alternating" in result["temporal_schedule"]["warnings"][0]
+
+
+@pytest.mark.parametrize("summary_failure", [False, True])
 def test_nsys_system_wide_start_has_no_application_or_trace_domain(
     tmp_path: Path,
     monkeypatch,
+    summary_failure: bool,
 ) -> None:
     commands: list[list[str]] = []
     pid = os.getpid()
@@ -217,6 +311,15 @@ def test_nsys_system_wide_start_has_no_application_or_trace_domain(
         "_wait_for_finalized_report",
         lambda: (True, None),
     )
+    if summary_failure:
+
+        def fail_summary(evidence):
+            raise KeyError("summary-test")
+
+        monkeypatch.setattr(
+            "benchmarks.profiling.system_collectors.render_nsys_cpu_summary",
+            fail_summary,
+        )
     original_is_dir = Path.is_dir
     monkeypatch.setattr(
         Path,
@@ -235,10 +338,14 @@ def test_nsys_system_wide_start_has_no_application_or_trace_domain(
     assert "--cpuctxsw=system-wide" in start
     assert all("python" not in argument for argument in start)
     assert all("cuda" not in argument.lower() for argument in start)
-    assert result["valid"] is True
+    assert result["valid"] is not summary_failure
     assert result["finalized"] is True
     assert result["evidence"]["target_totals"]["cpu_samples"] == 3
+    assert result["evidence"]["temporal_schedule"]["semantic_threads"]
     assert (collector.artifact_dir / "lifecycle.json").is_file()
+    assert (collector.artifact_dir / "summary.md").is_file() is not summary_failure
+    if summary_failure:
+        assert "summary-test" in result["error"]
 
 
 def test_native_thread_target_discovery_requires_all_semantic_comms(
