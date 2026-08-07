@@ -7,6 +7,8 @@ import logging
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
+
 logger = logging.getLogger(__name__)
 
 _MISSING = object()
@@ -113,7 +115,7 @@ def build_generation_batch_overrides(
         incoming.get("disable_prefill_cuda_graph")
     )
     if disables_prefill and "cuda_graph_backend_prefill" not in incoming:
-        overrides["cuda_graph_backend_prefill"] = "disabled"
+        overrides["cuda_graph_backend_prefill"] = CudaGraphBackend.DISABLED
         overrides.pop("cuda_graph_bs_prefill", None)
         overrides.pop("cuda_graph_max_bs_prefill", None)
 
@@ -223,7 +225,7 @@ def _validate_prefill_graph_policy(
     """Validate the declared prefill CUDA graph policy: breakable backend
     only, with explicitly declared buckets."""
     backend = get_prefill_cuda_graph_backend(server_args)
-    if backend == "disabled":
+    if backend == CudaGraphBackend.DISABLED:
         return
 
     if not cuda_graph_enabled:
@@ -232,7 +234,7 @@ def _validate_prefill_graph_policy(
             f"(backend={backend!r} with disable_cuda_graph)"
         )
         return
-    if backend != "breakable":
+    if backend != CudaGraphBackend.BREAKABLE:
         errors.append(
             "prefill CUDA graph backend must be 'breakable' or 'disabled', "
             f"got {backend!r}"

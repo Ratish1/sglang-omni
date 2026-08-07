@@ -16,6 +16,7 @@ from sglang_omni.models.higgs_tts.vocoder_scheduler import (
 )
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 from sglang_omni.scheduling.generation_batch_policy import (
+    CudaGraphBackend,
     build_default_prefill_cuda_graph_bs,
 )
 from sglang_omni.vendor.sglang.server_args import override_server_args
@@ -84,7 +85,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
             ),
             "chunked_prefill_size": 8192,
             # Qualified capture budget; longer prefills run eager.
-            "cuda_graph_backend_prefill": "breakable",
+            "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
             "cuda_graph_bs_prefill": build_default_prefill_cuda_graph_bs(512),
             "dtype": "bfloat16",
         }
