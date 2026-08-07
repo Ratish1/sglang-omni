@@ -17,6 +17,9 @@ screening estimates unless the row says matched.
 - The affected host path is distributed: `fun-asr-audio-e`, `sched-asr`, and
   `omni-request-bu` all gain about 5–5.6 CPU ms/request under CPU64. No single
   thread has been shown to own the whole regression.
+- Fresh quiet runs can alternate between roughly 12–18 and 42–59 QPS despite
+  completing every request. This bimodality is now evidence to capture, not a
+  precondition that must disappear before profiling.
 - At overload, the checked-in 16-entry request-build backlog is an independent
   admission boundary. It is not the cause of accepted-request slowdown below
   that boundary.

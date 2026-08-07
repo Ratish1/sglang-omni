@@ -149,6 +149,42 @@ async def test_steady_contract_warms_full_shape_population_before_windows(
 
 
 @pytest.mark.asyncio
+async def test_nsys_warmup_records_bimodal_regimes_without_blocking_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    samples = [SimpleNamespace(sample_id=str(index)) for index in range(2)]
+    qps = iter([12.0, 48.0, 15.0, 55.0])
+
+    async def fake_run(_args, selected, **_kwargs):
+        return _result(len(selected), qps=next(qps))
+
+    monkeypatch.setattr(profile, "_run_pass", fake_run)
+    args = SimpleNamespace(
+        mode="nsys-system-wide",
+        workload_contract="direct-cold",
+        shape_warmup_samples=0,
+        shape_warmup_passes=1,
+        warmup_samples=2,
+        concurrency=1,
+        max_warmup_windows=4,
+        stability_windows=2,
+        stability_tolerance=0.05,
+        server_pid=None,
+    )
+
+    result = await profile._warm_to_stability(
+        args,
+        samples,
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    assert result["reached_stability"] is False
+    assert result["qps_range"] == {"min": 12.0, "max": 55.0}
+    assert len(result["stability_windows"]) == 4
+
+
+@pytest.mark.asyncio
 async def test_stability_characterization_preserves_all_unstable_windows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

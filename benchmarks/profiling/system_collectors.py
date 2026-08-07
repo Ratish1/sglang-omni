@@ -40,7 +40,12 @@ class CommandCapture:
     available: bool = True
 
 
-def capture_command(argv: Sequence[str], *, timeout_s: float = 20.0) -> CommandCapture:
+def capture_command(
+    argv: Sequence[str],
+    *,
+    timeout_s: float = 20.0,
+    environment_overrides: dict[str, str | None] | None = None,
+) -> CommandCapture:
     executable = shutil.which(argv[0])
     if executable is None:
         return CommandCapture(
@@ -50,6 +55,14 @@ def capture_command(argv: Sequence[str], *, timeout_s: float = 20.0) -> CommandC
             stderr=f"{argv[0]} is not installed",
             available=False,
         )
+    environment = None
+    if environment_overrides:
+        environment = os.environ.copy()
+        for name, value in environment_overrides.items():
+            if value is None:
+                environment.pop(name, None)
+            else:
+                environment[name] = value
     try:
         completed = subprocess.run(
             [executable, *argv[1:]],
@@ -57,6 +70,7 @@ def capture_command(argv: Sequence[str], *, timeout_s: float = 20.0) -> CommandC
             text=True,
             capture_output=True,
             timeout=timeout_s,
+            env=environment,
         )
     except subprocess.TimeoutExpired as exc:
         return CommandCapture(
@@ -1495,7 +1509,11 @@ class NsysSystemWideCpuCollector:
         return asdict(capture)
 
     def _run(self, label: str, argv: Sequence[str], timeout_s: float) -> CommandCapture:
-        capture = capture_command(argv, timeout_s=timeout_s)
+        capture = capture_command(
+            argv,
+            timeout_s=timeout_s,
+            environment_overrides={"DEBUGINFOD_URLS": None},
+        )
         self._commands[label] = self._capture_dict(capture)
         return capture
 
@@ -1533,11 +1551,9 @@ class NsysSystemWideCpuCollector:
                 "start",
                 f"--session-new={self.session_name}",
                 "--stop-on-exit=false",
-                "--trace=none",
                 "--sample=system-wide",
                 "--cpuctxsw=system-wide",
                 f"--samples-per-backtrace={self.samples_per_backtrace}",
-                "--resolve-symbols=false",
                 "--force-overwrite=true",
                 f"--output={self.output_prefix}",
             ],
@@ -1601,6 +1617,7 @@ class NsysSystemWideCpuCollector:
             "trace_domains": [],
             "sample_scope": "system-wide",
             "context_switch_scope": "system-wide",
+            "cleared_environment": ["DEBUGINFOD_URLS"],
             "samples_per_backtrace": self.samples_per_backtrace,
             "required_thread_comms": list(self.required_thread_comms),
             "started_monotonic_ns": self.started_monotonic_ns,

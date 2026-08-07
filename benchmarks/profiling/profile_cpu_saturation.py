@@ -404,6 +404,29 @@ async def _warm_to_stability(
     if len(warmup_samples) < args.concurrency:
         raise ValueError("warmup sample count must be at least the target concurrency")
     windows: list[dict[str, Any]] = []
+
+    def warmup_result(*, reached_stability: bool) -> dict[str, Any]:
+        summaries = [_summarize_pass(window) for window in windows]
+        qps_values = [
+            float(summary["throughput_samples_per_s"]) for summary in summaries
+        ]
+        return {
+            "contract": args.workload_contract,
+            "shape_passes": shape_passes,
+            "reached_stability": reached_stability,
+            "qps_range": (
+                {"min": min(qps_values), "max": max(qps_values)} if qps_values else None
+            ),
+            "stability_windows": [
+                {
+                    "window": index,
+                    "artifact": str(warmup_dir / f"stability_window_{index}.json"),
+                    "summary": summary,
+                }
+                for index, summary in enumerate(summaries, 1)
+            ],
+        }
+
     for window_index in range(1, args.max_warmup_windows + 1):
         cpu_before = _process_cpu_seconds(args.server_pid)
         if args.server_pid is not None and cpu_before is None:
@@ -454,18 +477,9 @@ async def _warm_to_stability(
             required_windows=args.stability_windows,
             tolerance=args.stability_tolerance,
         ):
-            return {
-                "contract": args.workload_contract,
-                "shape_passes": shape_passes,
-                "stability_windows": [
-                    {
-                        "window": index,
-                        "artifact": str(warmup_dir / f"stability_window_{index}.json"),
-                        "summary": _summarize_pass(window),
-                    }
-                    for index, window in enumerate(windows, 1)
-                ],
-            }
+            return warmup_result(reached_stability=True)
+    if getattr(args, "mode", None) == "nsys-system-wide":
+        return warmup_result(reached_stability=False)
     raise RuntimeError(
         f"server did not reach warmup stability after {args.max_warmup_windows} windows"
     )
@@ -1999,7 +2013,18 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         assert profiled_request_integrity is not None
         integrity_errors.extend(profiled_request_integrity["errors"])
     perturbation = result_payload.get("profile_perturbation")
-    integrity_errors.extend(_perturbation_integrity_errors(args, perturbation))
+    perturbation_errors = _perturbation_integrity_errors(args, perturbation)
+    if args.mode == "nsys-system-wide":
+        result_payload["performance_comparison_integrity"] = {
+            "valid": not perturbation_errors,
+            "errors": perturbation_errors,
+            "scope": (
+                "Controls whether QPS/latency may be compared; does not "
+                "invalidate complete CPU scheduling attribution."
+            ),
+        }
+    else:
+        integrity_errors.extend(perturbation_errors)
     if stop_response is not None:
         integrity = validate_stop_response(
             stop_response,

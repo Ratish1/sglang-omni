@@ -13,6 +13,7 @@ from benchmarks.profiling.system_collectors import (
     CommandCapture,
     CpuFrequencyCollector,
     NsysSystemWideCpuCollector,
+    capture_command,
     find_processes_with_thread_comms,
     inspect_nsys_cpu_sqlite,
     parse_cpu_frequency,
@@ -28,6 +29,18 @@ from benchmarks.profiling.system_collectors import (
 
 def _global_tid(pid: int, tid: int) -> int:
     return (pid << 24) | tid
+
+
+def test_capture_command_can_clear_inherited_environment(monkeypatch) -> None:
+    monkeypatch.setenv("DEBUGINFOD_URLS", "https://symbols.invalid")
+
+    result = capture_command(
+        ["env"],
+        environment_overrides={"DEBUGINFOD_URLS": None},
+    )
+
+    assert result.returncode == 0
+    assert "DEBUGINFOD_URLS=" not in result.stdout
 
 
 def _thread_snapshot(
@@ -279,6 +292,7 @@ def test_nsys_system_wide_start_has_no_application_or_trace_domain(
     summary_failure: bool,
 ) -> None:
     commands: list[list[str]] = []
+    command_environments: list[dict[str, str | None] | None] = []
     pid = os.getpid()
     semantic_threads = [
         (pid, "sched-asr", 11),
@@ -292,8 +306,9 @@ def test_nsys_system_wide_start_has_no_application_or_trace_domain(
         required_thread_comms=[row[1] for row in semantic_threads],
     )
 
-    def fake_capture(argv, *, timeout_s):
+    def fake_capture(argv, *, timeout_s, environment_overrides=None):
         commands.append(list(argv))
+        command_environments.append(environment_overrides)
         if argv[1] == "stop":
             collector.report_path.write_bytes(b"finalized report")
         if argv[1] == "export":
@@ -344,12 +359,16 @@ def test_nsys_system_wide_start_has_no_application_or_trace_domain(
     result = collector.stop()
 
     start = next(command for command in commands if command[1] == "start")
-    assert "--trace=none" in start
+    assert "--trace=none" not in start
+    assert "--resolve-symbols=false" not in start
     assert "--sample=system-wide" in start
     assert "--cpuctxsw=system-wide" in start
     assert "--samples-per-backtrace=4" in start
     assert all("python" not in argument for argument in start)
     assert all("cuda" not in argument.lower() for argument in start)
+    assert all(
+        environment == {"DEBUGINFOD_URLS": None} for environment in command_environments
+    )
     assert result["valid"] is not summary_failure
     assert result["finalized"] is True
     assert result["evidence"]["target_totals"]["cpu_samples"] == 3

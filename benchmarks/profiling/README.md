@@ -416,12 +416,15 @@ normal server -> shape/stability warmup -> unprofiled control
               -> unprofiled control -> finalize/export/validate
 ```
 
-This mode deliberately uses `--trace=none`. It collects CPU IP/backtrace
-samples and scheduler context switches, not CUDA, NVTX, OS-runtime
-interposition, Python sampling, or GIL tracing. Independent `gpu-dmon`,
-procfs thread snapshots, CPU frequency, and PSI collectors remain active. This
-is the correct next experiment on a host where every injected Nsight launch
-destabilizes the worker.
+This mode deliberately configures no API trace domain. (`nsys start` does not
+accept the `--trace=none` spelling on the tested 2026.2.1 installation.) It
+collects CPU IP/backtrace samples and scheduler context switches, not CUDA,
+NVTX, OS-runtime interposition, Python sampling, or GIL tracing. Every Nsight
+control/export command runs with inherited `DEBUGINFOD_URLS` removed so
+system-wide finalization cannot stall downloading symbols for unrelated host
+processes. Independent `gpu-dmon`, procfs thread snapshots, CPU frequency, and
+PSI collectors remain active. This is the correct next experiment on a host
+where every injected Nsight launch destabilizes the worker.
 
 Run the existing focused unit gate, then confirm the installed Nsight CPU
 environment:
@@ -474,8 +477,17 @@ and one 128-request control after it. Thus only 128 requests are inside Nsight,
 and the complete arm is bounded to 576–704 requests. Four CPU samples per
 native backtrace reduces unwind and artifact cost while retaining every
 scheduling transition and periodic CPU samples. The two short controls may
-drift by at most 5%; larger temporal drift still rejects the evidence. The
-600-second values are failure timeouts; they do not extend the capture.
+drift by at most 5% for a valid QPS/latency comparison. The 600-second values
+are failure timeouts; they do not extend the capture.
+
+Warmup stability is diagnostic in this mode, not a capture gate. If the server
+oscillates between fast and slow regimes, `warmup.json` records
+`reached_stability=false` and the observed QPS range, then proceeds to the
+bounded capture. Likewise, excessive adjacent-control drift sets
+`performance_comparison_integrity.valid=false`: it forbids interpreting
+profiled-versus-control QPS, but it does not discard complete scheduling
+evidence or prevent the CPU64 arm. Stop only when `accepted=false`,
+`capture_complete=false`, or request/system integrity fails.
 
 The harness discovers the target process read-only from `/proc` using the
 startup-created `sched-asr` thread. The full three-thread evidence contract is
@@ -535,6 +547,13 @@ An accepted result requires all of the following:
 - stable `/proc` TID/start-time identities across the measured window;
 - scheduling events, real CPU samples, and sampled leaf symbols for
   `sched-asr`, `omni-request-bu`, and `fun-asr-audio-e`.
+
+`accepted` covers capture, request, and system integrity. It intentionally does
+not assert that the host remained in one throughput regime. QPS and latency may
+be compared between arms only when both results also report
+`performance_comparison_integrity.valid=true`. Thread state, blocking reasons,
+on-CPU intervals, and native stacks remain valid attribution evidence when
+that comparison field is false.
 
 The filtered evidence is in
 `system.json["nsys_system_wide_cpu"]["evidence"]`. For each semantic thread
