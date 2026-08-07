@@ -20,6 +20,12 @@ screening estimates unless the row says matched.
 - Fresh quiet runs can alternate between roughly 12–18 and 42–59 QPS despite
   completing every request. This bimodality is now evidence to capture, not a
   precondition that must disappear before profiling.
+- The first bounded non-injected Nsight pair completed with valid request,
+  system, and capture integrity, but its quiet and CPU64 control drift was
+  36.49% and 8.48%. Its exact throughput and per-owner cross-arm deltas are
+  therefore not causal effect estimates. Directionally, on-CPU service rose
+  across scheduler, request builder, and audio encoder, most strongly in the
+  request builder.
 - At overload, the checked-in 16-entry request-build backlog is an independent
   admission boundary. It is not the cause of accepted-request slowdown below
   that boundary.
@@ -44,16 +50,25 @@ reproduce the single-server mechanism.
 
 ## Remaining decision
 
-The non-injected Nsight pair must distinguish, per semantic thread:
+The bounded Nsight pair selected a distributed host path rather than one sole
+owner. Its export did not contain usable sched-out state/block metadata, so it
+cannot distinguish runnable starvation from blocked waiting. Nsight CPU
+changes are also not exact kernel migrations; procfs `se.nr_migrations` is the
+authoritative counter.
 
-- on-CPU work and native sampled stacks;
-- runnable-but-off-CPU delay versus blocked dependency time;
-- migrations and simultaneous activity among builder, encoder, and scheduler.
+The next non-redundant test is low-overhead aggregate semantic telemetry around
+the distributed pipeline:
 
-That selects one narrow follow-up. Request-level ordering, Python-line
-ownership, and CPU-to-CUDA launch correlation require targeted semantic
-telemetry after the owner is selected; they cannot be inferred from aggregate
-Nsight tables.
+- request-build submissions, completions, ordered drains, and ready-to-drain
+  delay;
+- head-of-line episode count/duration and the number of later-ready followers;
+- pre-LM enqueue, batch publish, completion, and scheduler admission delay;
+- scheduler-loop drain budget, work count, and elapsed time.
+
+Collect fixed-window counters/histograms rather than per-request event traces.
+This directly tests whether ordered drain or the single pre-LM boundary
+amplifies OS interference. Another affinity screen would only repeat the
+already-proven mitigation.
 
 No production repair is justified until a candidate removes the selected
 mechanism in an unprofiled matched A/B while preserving output, admission,

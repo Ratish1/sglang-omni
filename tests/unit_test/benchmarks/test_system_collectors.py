@@ -23,12 +23,14 @@ from benchmarks.profiling.system_collectors import (
     parse_turbostat,
     psi_delta,
     read_psi,
+    render_nsys_cpu_summary,
     summarize_thread_snapshot_delta,
 )
 
 
-def _global_tid(pid: int, tid: int) -> int:
-    return (pid << 24) | tid
+def _global_tid(pid: int, tid: int, *, upper: int = 0x1234) -> int:
+    unsigned = (upper << 48) | (pid << 24) | tid
+    return unsigned - (1 << 64) if unsigned >= 1 << 63 else unsigned
 
 
 def test_capture_command_can_clear_inherited_environment(monkeypatch) -> None:
@@ -63,6 +65,7 @@ def _write_nsys_cpu_sqlite(
     pid: int,
     tids: list[int],
     sampled_tids: list[int] | None = None,
+    global_tid_upper: int = 0x1234,
 ) -> None:
     connection = sqlite3.connect(path)
     try:
@@ -108,10 +111,17 @@ def _write_nsys_cpu_sqlite(
             connection.executemany(
                 "INSERT INTO SCHED_EVENTS VALUES (?, ?, ?, ?, ?, ?)",
                 [
-                    (offset, _global_tid(pid, tid), 1, index, 1, 1),
+                    (
+                        offset,
+                        _global_tid(pid, tid, upper=global_tid_upper),
+                        1,
+                        index,
+                        1,
+                        1,
+                    ),
                     (
                         4_000_000 + offset,
-                        _global_tid(pid, tid),
+                        _global_tid(pid, tid, upper=global_tid_upper),
                         0,
                         index,
                         state,
@@ -119,7 +129,7 @@ def _write_nsys_cpu_sqlite(
                     ),
                     (
                         8_000_000 + offset,
-                        _global_tid(pid, tid),
+                        _global_tid(pid, tid, upper=global_tid_upper),
                         1,
                         index + 1,
                         1,
@@ -127,7 +137,7 @@ def _write_nsys_cpu_sqlite(
                     ),
                     (
                         11_000_000 + offset,
-                        _global_tid(pid, tid),
+                        _global_tid(pid, tid, upper=global_tid_upper),
                         0,
                         index + 1,
                         state,
@@ -140,7 +150,7 @@ def _write_nsys_cpu_sqlite(
                 (
                     index + 1,
                     index * 10 + 1,
-                    _global_tid(pid, tid),
+                    _global_tid(pid, tid, upper=global_tid_upper),
                     int(tid in (sampled_tids if sampled_tids is not None else tids)),
                 ),
             )
@@ -189,6 +199,7 @@ def test_nsys_sqlite_requires_sched_and_true_cpu_samples_per_semantic_comm(
     assert result["target_totals"]["cpu_samples"] == 3
     assert result["required_thread_coverage"]["sched-asr"]["aggregate"]["sched_in"] == 2
     temporal = result["temporal_schedule"]
+    assert temporal["event_rows"] == 12
     assert temporal["semantic_threads"]["sched-asr"]["on_cpu"]["total_ms"] == 7.0
     assert (
         temporal["semantic_threads"]["sched-asr"]["runnable_off_cpu"]["total_ms"] == 4.0
@@ -205,6 +216,120 @@ def test_nsys_sqlite_requires_sched_and_true_cpu_samples_per_semantic_comm(
     )
     assert temporal["pairwise_on_cpu_overlap"][0]["overlap_ms"] > 0
     assert temporal["pairwise_on_cpu_overlap"][0]["longest_overlap_intervals"]
+    assert (
+        temporal["semantic_threads"]["sched-asr"]["off_cpu_state_coverage"]["fraction"]
+        == 1.0
+    )
+    assert temporal["semantic_threads"]["sched-asr"]["cpu_change_rate_per_s"] > 0
+
+
+def test_nsys_sqlite_decodes_signed_global_tid_with_upper_metadata(
+    tmp_path: Path,
+) -> None:
+    pid = 123
+    semantic_threads = [(201, "sched-asr", 11)]
+    database = tmp_path / "signed-global-tid.sqlite"
+    _write_nsys_cpu_sqlite(
+        database,
+        pid=pid,
+        tids=[201],
+        global_tid_upper=0xF234,
+    )
+
+    result = inspect_nsys_cpu_sqlite(
+        database,
+        target_pid=pid,
+        thread_snapshot_before=_thread_snapshot(pid, semantic_threads),
+        thread_snapshot_after=_thread_snapshot(pid, semantic_threads),
+        required_thread_comms=["sched-asr"],
+    )
+
+    assert result["valid"] is True
+    assert result["temporal_schedule"]["event_rows"] == 4
+    assert result["temporal_schedule"]["trace_span_ms"] == 11.0
+    assert (
+        result["temporal_schedule"]["semantic_threads"]["sched-asr"]["on_cpu"][
+            "total_ms"
+        ]
+        == 7.0
+    )
+
+
+def test_nsys_sqlite_aggregates_multiple_global_ids_for_one_linux_tid(
+    tmp_path: Path,
+) -> None:
+    pid = 123
+    semantic_threads = [(201, "sched-asr", 11)]
+    database = tmp_path / "multiple-global-ids.sqlite"
+    _write_nsys_cpu_sqlite(database, pid=pid, tids=[201])
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "INSERT INTO COMPOSITE_EVENTS VALUES (?, ?, ?, ?)",
+            (99, 99, _global_tid(pid, 201, upper=0x5678), 1),
+        )
+        connection.execute(
+            "INSERT INTO SAMPLING_CALLCHAINS VALUES (?, ?, ?, ?)",
+            (99, 1, 3, 0),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = inspect_nsys_cpu_sqlite(
+        database,
+        target_pid=pid,
+        thread_snapshot_before=_thread_snapshot(pid, semantic_threads),
+        thread_snapshot_after=_thread_snapshot(pid, semantic_threads),
+        required_thread_comms=["sched-asr"],
+    )
+
+    assert result["valid"] is True
+    coverage = result["required_thread_coverage"]["sched-asr"]
+    assert coverage["aggregate"]["composite_events"] == 2
+    assert coverage["aggregate"]["cpu_samples"] == 2
+    assert coverage["hotspots"]["leaf"][0]["sample_count"] == 2
+
+
+def test_nsys_sqlite_reports_missing_sched_state_as_unknown(
+    tmp_path: Path,
+) -> None:
+    pid = 123
+    semantic_threads = [(201, "sched-asr", 11)]
+    database = tmp_path / "unknown-state.sqlite"
+    _write_nsys_cpu_sqlite(database, pid=pid, tids=[201])
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "UPDATE SCHED_EVENTS SET threadState = NULL, threadBlock = NULL "
+            "WHERE isSchedIn = 0"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = inspect_nsys_cpu_sqlite(
+        database,
+        target_pid=pid,
+        thread_snapshot_before=_thread_snapshot(pid, semantic_threads),
+        thread_snapshot_after=_thread_snapshot(pid, semantic_threads),
+        required_thread_comms=["sched-asr"],
+    )
+
+    assert result["valid"] is True
+    schedule = result["temporal_schedule"]["semantic_threads"]["sched-asr"]
+    assert schedule["off_cpu_state_coverage"]["fraction"] == 0.0
+    assert schedule["runnable_off_cpu"]["count"] == 0
+    assert schedule["blocked_off_cpu"]["count"] == 0
+    assert schedule["unknown_off_cpu"]["count"] == 1
+    assert any(
+        "runnable versus blocked" in warning
+        for warning in result["temporal_schedule"]["warnings"]
+    )
+
+    summary = render_nsys_cpu_summary(result)
+    assert "| unavailable | unavailable |" in summary
+    assert "cannot be distinguished from blocked waiting" in summary
 
 
 def test_nsys_sqlite_rejects_non_sample_callstacks_and_thread_replacement(

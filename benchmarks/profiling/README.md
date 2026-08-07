@@ -547,13 +547,20 @@ An accepted result requires all of the following:
 - stable `/proc` TID/start-time identities across the measured window;
 - scheduling events, real CPU samples, and sampled leaf symbols for
   `sched-asr`, `omni-request-bu`, and `fun-asr-audio-e`.
+- at least one selected scheduling row and one complete on-CPU interval for
+  every required semantic thread class. Nsight's `globalTid` is decoded by its
+  PID/TID bit fields because newer exports may store unrelated metadata in its
+  upper bits.
 
 `accepted` covers capture, request, and system integrity. It intentionally does
 not assert that the host remained in one throughput regime. QPS and latency may
 be compared between arms only when both results also report
-`performance_comparison_integrity.valid=true`. Thread state, blocking reasons,
-on-CPU intervals, and native stacks remain valid attribution evidence when
-that comparison field is false.
+`performance_comparison_integrity.valid=true`. On-CPU intervals, native
+samples, overlap, and observed CPU changes remain valid attribution evidence
+when that comparison field is false. Exact cross-arm deltas are directional,
+not causal effect estimates, when either arm fails this comparison gate.
+Runnable-versus-blocked attribution is usable only when the summary reports
+nonzero sched-out state coverage.
 
 The filtered evidence is in
 `system.json["nsys_system_wide_cpu"]["evidence"]`. For each semantic thread
@@ -563,7 +570,8 @@ sched-in/sched-out intervals and reports:
 
 - total on-CPU service and class-active wall time;
 - runnable-but-off-CPU, blocked, and unknown off-CPU distributions;
-- blocking-reason time, CPU changes, and non-alternating-event warnings;
+- blocking-reason time, state-metadata coverage, observed CPU changes, and
+  non-alternating-event warnings;
 - pairwise and all-class simultaneous on-CPU overlap;
 - trace timestamps for the longest runnable, blocked, and overlap intervals,
   which are the exact regions to inspect if the GUI is needed.
@@ -573,12 +581,17 @@ The same decision-oriented subset is written to
 first diagnosis. The raw `.nsys-rep` and SQLite database remain available for
 visual verification or follow-up SQL. `cpuCycles=0` call stacks are excluded
 from hotspot attribution because those are context-switch stacks, not periodic
-CPU samples.
+CPU samples. “Observed CPU changes” means successive sched-in slices were seen
+on different logical CPUs; it is not the kernel's exact migration counter.
+Use the procfs thread snapshot's `se.nr_migrations` delta for exact migration
+counts.
 
 Interpret the pair in this order:
 
-1. If runnable off-CPU time rises while CPU-sample share is flat, the thread is
-   being starved by the OS scheduler. Compare migrations and placement.
+1. If sched-out state coverage is present and runnable off-CPU time rises while
+   CPU-sample share is flat, the thread is being starved by the OS scheduler.
+   Compare exact procfs migrations and placement. If state coverage is absent,
+   Nsight alone cannot distinguish runnable starvation from blocked waiting.
 2. If on-CPU time, sample share, and a native stack family grow while runnable
    delay stays low, investigate additional service cost or cache/SMT
    interference in that owner.

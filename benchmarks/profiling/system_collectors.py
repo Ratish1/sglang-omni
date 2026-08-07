@@ -754,22 +754,23 @@ def _nsys_temporal_schedule_analysis(
     if not tids:
         return {
             "trace_span_ms": 0.0,
+            "event_rows": 0,
             "semantic_threads": {},
             "pairwise_on_cpu_overlap": [],
             "all_required_on_cpu_overlap_ms": 0.0,
             "active_class_concurrency_ms": {},
         }
 
-    global_tids = [(int(target_pid) << 24) | tid for tid in tids]
-    placeholders = ",".join("?" for _ in global_tids)
+    placeholders = ",".join("?" for _ in tids)
     rows = connection.execute(
         f"""
         SELECT start, globalTid, isSchedIn, cpu, threadState, threadBlock
         FROM SCHED_EVENTS
-        WHERE globalTid IN ({placeholders})
-        ORDER BY globalTid, start
+        WHERE (globalTid & 0xFFFFFF) IN ({placeholders})
+          AND ((globalTid >> 24) & 0xFFFFFF) = ?
+        ORDER BY (globalTid & 0xFFFFFF), start, globalTid
         """,
-        global_tids,
+        [*tids, int(target_pid)],
     ).fetchall()
     state_map = _nsys_enum_map(connection, "ENUM_SAMPLING_THREAD_STATE")
     block_map = _nsys_enum_map(connection, "ENUM_SCHEDULING_THREAD_BLOCK")
@@ -891,6 +892,11 @@ def _nsys_temporal_schedule_analysis(
             for tid in comm_tids
             for interval in per_tid.get(tid, {}).get("off_cpu", {}).get("unknown", [])
         ]
+        off_cpu_interval_count = len(runnable) + len(blocked) + len(unknown)
+        classified_off_cpu_interval_count = len(runnable) + len(blocked)
+        cpu_changes = sum(
+            int(per_tid.get(tid, {}).get("cpu_changes", 0)) for tid in comm_tids
+        )
         block_reasons: dict[str, list[int]] = defaultdict(list)
         for start, end, state, block in blocked:
             block_reasons[f"{block}/{state}"].append(end - start)
@@ -909,9 +915,19 @@ def _nsys_temporal_schedule_analysis(
             "unknown_off_cpu": _duration_summary_ns(
                 [end - start for start, end, _, _ in unknown]
             ),
+            "off_cpu_state_coverage": {
+                "classified_intervals": classified_off_cpu_interval_count,
+                "total_intervals": off_cpu_interval_count,
+                "fraction": (
+                    classified_off_cpu_interval_count / off_cpu_interval_count
+                    if off_cpu_interval_count
+                    else None
+                ),
+            },
             "longest_on_cpu_intervals": longest_intervals(on_cpu),
             "longest_runnable_off_cpu_intervals": longest_intervals(runnable),
             "longest_blocked_off_cpu_intervals": longest_intervals(blocked),
+            "longest_unknown_off_cpu_intervals": longest_intervals(unknown),
             "blocked_reason_time": {
                 reason: _duration_summary_ns(durations)
                 for reason, durations in sorted(block_reasons.items())
@@ -923,8 +939,11 @@ def _nsys_temporal_schedule_analysis(
                     for cpu in per_tid.get(tid, {}).get("cpus", [])
                 }
             ),
-            "cpu_changes": sum(
-                int(per_tid.get(tid, {}).get("cpu_changes", 0)) for tid in comm_tids
+            "cpu_changes": cpu_changes,
+            "cpu_change_rate_per_s": (
+                cpu_changes / ((trace_end - trace_start) / 1_000_000_000)
+                if trace_end > trace_start
+                else None
             ),
             "malformed_transitions": sum(
                 int(per_tid.get(tid, {}).get("malformed_transitions", 0))
@@ -983,6 +1002,7 @@ def _nsys_temporal_schedule_analysis(
 
     return {
         "trace_span_ms": (trace_end - trace_start) / 1_000_000,
+        "event_rows": len(rows),
         "semantic_threads": semantic,
         "pairwise_on_cpu_overlap": pairwise,
         "all_required_on_cpu_overlap_ms": (
@@ -997,6 +1017,10 @@ def _nsys_temporal_schedule_analysis(
             "blocked": "sched-out carried a named blocking reason",
             "unknown": "Nsight did not provide a decisive state/reason pair",
             "overlap": "wall time when semantic thread classes were on CPU together",
+            "cpu_changes": (
+                "changes between CPUs on successive observed sched-in slices; "
+                "not the kernel's se.nr_migrations counter"
+            ),
         },
     }
 
@@ -1191,24 +1215,28 @@ def inspect_nsys_cpu_sqlite(
         pid, tid = _nsys_linux_ids(int(global_tid))
         observed_sched_pids.add(pid)
         if pid == target_pid:
-            sched_by_tid[tid] = {
-                "events": int(event_count),
-                "sched_in": int(sched_in or 0),
-                "sched_out": int(sched_out or 0),
-            }
+            summary = sched_by_tid.setdefault(
+                tid,
+                {"events": 0, "sched_in": 0, "sched_out": 0},
+            )
+            summary["events"] += int(event_count)
+            summary["sched_in"] += int(sched_in or 0)
+            summary["sched_out"] += int(sched_out or 0)
 
     samples_by_tid: dict[int, dict[str, int]] = {}
-    sample_global_by_tid: dict[int, int] = {}
+    sample_globals_by_tid: dict[int, list[int]] = defaultdict(list)
     observed_sample_pids: set[int] = set()
     for global_tid, composite_count, cpu_samples in sample_rows:
         pid, tid = _nsys_linux_ids(int(global_tid))
         observed_sample_pids.add(pid)
         if pid == target_pid:
-            sample_global_by_tid[tid] = int(global_tid)
-            samples_by_tid[tid] = {
-                "composite_events": int(composite_count),
-                "cpu_samples": int(cpu_samples or 0),
-            }
+            sample_globals_by_tid[tid].append(int(global_tid))
+            summary = samples_by_tid.setdefault(
+                tid,
+                {"composite_events": 0, "cpu_samples": 0},
+            )
+            summary["composite_events"] += int(composite_count)
+            summary["cpu_samples"] += int(cpu_samples or 0)
 
     table_counts = {
         "SCHED_EVENTS": sum(int(row[1]) for row in sched_rows),
@@ -1275,7 +1303,9 @@ def inspect_nsys_cpu_sqlite(
             "threads": per_thread,
         }
         global_tids = [
-            sample_global_by_tid[tid] for tid in tids if tid in sample_global_by_tid
+            global_tid
+            for tid in tids
+            for global_tid in sample_globals_by_tid.get(tid, [])
         ]
         if global_tids:
             try:
@@ -1321,7 +1351,7 @@ def inspect_nsys_cpu_sqlite(
             )
     result["required_thread_coverage"] = comm_summaries
     result["temporal_schedule"] = temporal_schedule
-    temporal_schedule["warnings"] = [
+    temporal_warnings = [
         (
             f"{comm!r} has {summary['malformed_transitions']} non-alternating "
             "scheduling transitions; those intervals were excluded"
@@ -1329,6 +1359,32 @@ def inspect_nsys_cpu_sqlite(
         for comm, summary in temporal_schedule["semantic_threads"].items()
         if summary["malformed_transitions"]
     ]
+    if not temporal_schedule["event_rows"]:
+        errors.append(
+            "Nsight temporal analysis selected no scheduling rows for the "
+            f"target PID {target_pid}; globalTid matching is invalid"
+        )
+    for comm, summary in temporal_schedule["semantic_threads"].items():
+        if not summary["on_cpu"]["count"]:
+            errors.append(
+                f"required native thread comm {comm!r} has no complete "
+                "on-CPU scheduling interval"
+            )
+        state_coverage = summary["off_cpu_state_coverage"]
+        if (
+            state_coverage["total_intervals"]
+            and not state_coverage["classified_intervals"]
+        ):
+            temporal_warnings.append(
+                f"{comm!r} has no usable sched-out state/block metadata; "
+                "runnable versus blocked off-CPU time is unavailable"
+            )
+        elif state_coverage["fraction"] is not None and state_coverage["fraction"] < 1:
+            temporal_warnings.append(
+                f"{comm!r} has partial sched-out state/block metadata coverage "
+                f"({state_coverage['fraction']:.2%})"
+            )
+    temporal_schedule["warnings"] = temporal_warnings
     result["target_totals"] = {
         "sched_events": sum(row["events"] for row in sched_by_tid.values()),
         "sched_in": sum(row["sched_in"] for row in sched_by_tid.values()),
@@ -1348,6 +1404,9 @@ def render_nsys_cpu_summary(evidence: dict[str, Any]) -> str:
     def format_ms(value: Any) -> str:
         return "n/a" if value is None else f"{float(value):.3f} ms"
 
+    def format_rate(value: Any) -> str:
+        return "n/a" if value is None else f"{float(value):.2f}/s"
+
     lines = [
         "# Nsight system-wide CPU summary",
         "",
@@ -1361,21 +1420,30 @@ def render_nsys_cpu_summary(evidence: dict[str, Any]) -> str:
             "",
             "## Scheduling state by semantic thread",
             "",
-            "| Thread class | TIDs | On-CPU total | Runnable off-CPU | Runnable p95 | Blocked off-CPU | CPU changes |",
-            "|---|---:|---:|---:|---:|---:|---:|",
+            "| Thread class | TIDs | On-CPU | Runnable off-CPU | Blocked off-CPU | Unknown off-CPU | State coverage | Observed CPU changes |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     coverage = evidence.get("required_thread_coverage", {})
     for comm, schedule in temporal.get("semantic_threads", {}).items():
         runnable = schedule["runnable_off_cpu"]
         blocked = schedule["blocked_off_cpu"]
+        unknown = schedule["unknown_off_cpu"]
         on_cpu = schedule["on_cpu"]
+        state_coverage = schedule["off_cpu_state_coverage"]
+        coverage_fraction = state_coverage["fraction"]
+        coverage_text = (
+            f"{coverage_fraction:.1%}" if coverage_fraction is not None else "n/a"
+        )
+        has_classified_state = bool(state_coverage["classified_intervals"])
         tids = ",".join(str(tid) for tid in schedule["tids"])
         lines.append(
             f"| `{comm}` | {tids} | {format_ms(on_cpu['total_ms'])} | "
-            f"{format_ms(runnable['total_ms'])} | "
-            f"{format_ms(runnable['p95_ms'])} | "
-            f"{format_ms(blocked['total_ms'])} | {schedule['cpu_changes']} |"
+            f"{format_ms(runnable['total_ms']) if has_classified_state else 'unavailable'} | "
+            f"{format_ms(blocked['total_ms']) if has_classified_state else 'unavailable'} | "
+            f"{format_ms(unknown['total_ms'])} | "
+            f"{coverage_text} | "
+            f"{format_rate(schedule['cpu_change_rate_per_s'])} |"
         )
 
     lines.extend(
@@ -1391,6 +1459,7 @@ def render_nsys_cpu_summary(evidence: dict[str, Any]) -> str:
         for state, key in (
             ("runnable", "longest_runnable_off_cpu_intervals"),
             ("blocked", "longest_blocked_off_cpu_intervals"),
+            ("unknown", "longest_unknown_off_cpu_intervals"),
         ):
             for interval in schedule.get(key, [])[:3]:
                 reason = (
@@ -1446,14 +1515,37 @@ def render_nsys_cpu_summary(evidence: dict[str, Any]) -> str:
         lines.extend(f"- {warning}" for warning in warnings)
         lines.append("")
 
+    state_fractions = [
+        schedule["off_cpu_state_coverage"]["fraction"]
+        for schedule in temporal.get("semantic_threads", {}).values()
+        if schedule["off_cpu_state_coverage"]["fraction"] is not None
+    ]
+    has_any_state_metadata = any(fraction > 0 for fraction in state_fractions)
+    state_boundary = (
+        "Sched-out state metadata is available, so classified runnable and "
+        "blocked intervals may be interpreted subject to the reported coverage."
+        if has_any_state_metadata
+        else (
+            "This export has no usable sched-out state/block metadata. On-CPU "
+            "time, observed CPU changes, overlap, and native samples remain "
+            "usable, but runnable starvation cannot be distinguished from "
+            "blocked waiting in Nsight."
+        )
+    )
+
     lines.extend(
         [
             "## Boundary",
             "",
-            "This summary automatically shows which semantic threads consumed CPU, "
-            "were runnable but preempted, were blocked, migrated between CPUs, and "
-            "ran simultaneously. The raw `.nsys-rep` is optional for visually "
-            "checking a suspicious interval.",
+            "This summary shows which semantic threads consumed CPU, changed "
+            "logical CPUs between observed execution slices, and ran "
+            "simultaneously. CPU changes are not the kernel's exact migration "
+            "counter; use the procfs thread summary for `se.nr_migrations`.",
+            "",
+            state_boundary,
+            "",
+            "The raw `.nsys-rep` is optional for visually checking a suspicious "
+            "interval.",
             "",
             "Because this non-injected capture has no NVTX, Python, or CUDA trace "
             "domain, it cannot attach intervals to request IDs or Python source "
