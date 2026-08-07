@@ -448,16 +448,34 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --mode nsys-system-wide \
   --run-id nsys-system-wide-quiet-r1 \
   --concurrency 32 \
-  --max-samples 1088 \
-  --profile-samples 256 \
+  --max-samples 256 \
+  --shape-warmup-samples 64 \
+  --warmup-samples 64 \
+  --stability-windows 2 \
+  --stability-tolerance 0.10 \
+  --max-warmup-windows 4 \
+  --max-adjacent-baseline-drift 0.05 \
+  --profile-samples 128 \
   --model-revision "$MODEL_REVISION" \
   --collectors psi,cgroup-psi,thread-snapshot,gpu-dmon,cpu-frequency \
+  --thread-sample-interval-ms 250 \
   --required-thread-comms sched-asr,omni-request-bu,fun-asr-audio-e \
   --nsys-required-thread-comms sched-asr,omni-request-bu,fun-asr-audio-e \
+  --nsys-samples-per-backtrace 4 \
   --gpu-index "$GPU" \
   --profile-timeout-s 600 \
   --nsys-finalize-timeout-s 600
 ```
+
+This is a narrow attribution run, not the earlier full campaign. Per arm it
+uses one 64-request shape pass, two to four 64-request stability windows, one
+128-request control before the capture, exactly one captured 128-request pass,
+and one 128-request control after it. Thus only 128 requests are inside Nsight,
+and the complete arm is bounded to 576–704 requests. Four CPU samples per
+native backtrace reduces unwind and artifact cost while retaining every
+scheduling transition and periodic CPU samples. The two short controls may
+drift by at most 5%; larger temporal drift still rejects the evidence. The
+600-second values are failure timeouts; they do not extend the capture.
 
 The harness discovers the target process read-only from `/proc` using the
 startup-created `sched-asr` thread. The full three-thread evidence contract is
@@ -482,12 +500,20 @@ python -m benchmarks.profiling.profile_cpu_saturation \
   --mode nsys-system-wide \
   --run-id nsys-system-wide-cpu64-r1 \
   --concurrency 32 \
-  --max-samples 1088 \
-  --profile-samples 256 \
+  --max-samples 256 \
+  --shape-warmup-samples 64 \
+  --warmup-samples 64 \
+  --stability-windows 2 \
+  --stability-tolerance 0.10 \
+  --max-warmup-windows 4 \
+  --max-adjacent-baseline-drift 0.05 \
+  --profile-samples 128 \
   --model-revision "$MODEL_REVISION" \
   --collectors psi,cgroup-psi,thread-snapshot,gpu-dmon,cpu-frequency \
+  --thread-sample-interval-ms 250 \
   --required-thread-comms sched-asr,omni-request-bu,fun-asr-audio-e \
   --nsys-required-thread-comms sched-asr,omni-request-bu,fun-asr-audio-e \
+  --nsys-samples-per-backtrace 4 \
   --gpu-index "$GPU" \
   --profile-timeout-s 600 \
   --nsys-finalize-timeout-s 600

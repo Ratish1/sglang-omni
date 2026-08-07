@@ -1173,6 +1173,7 @@ def _build_collectors(
                 session_name=f"omni_{session_fragment}_{os.getpid()}",
                 required_thread_comms=required_comms,
                 executable=args.nsys_binary,
+                samples_per_backtrace=args.nsys_samples_per_backtrace,
                 command_timeout_s=args.nsys_command_timeout_s,
                 finalize_timeout_s=args.nsys_finalize_timeout_s,
             )
@@ -2312,6 +2313,16 @@ def parse_args() -> argparse.Namespace:
         help="Timeout for Nsight environment/start/status control commands.",
     )
     parser.add_argument(
+        "--nsys-samples-per-backtrace",
+        type=int,
+        default=4,
+        help=(
+            "CPU samples per native backtrace in non-injected system-wide "
+            "mode. Four retains periodic CPU samples while reducing unwind "
+            "and artifact cost."
+        ),
+    )
+    parser.add_argument(
         "--nsys-required-thread-comms",
         default="sched-asr,omni-request-bu,fun-asr-audio-e",
         help=(
@@ -2396,6 +2407,8 @@ def main() -> None:
             "--nsys-target-thread-comm must be non-empty in " "nsys-system-wide mode"
         )
     if args.mode == "nsys-system-wide":
+        if not 1 <= args.nsys_samples_per_backtrace <= 32:
+            raise ValueError("--nsys-samples-per-backtrace must be between 1 and 32")
         required_system_collectors = {
             "psi",
             "cgroup-psi",

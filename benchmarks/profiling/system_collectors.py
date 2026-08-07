@@ -1463,6 +1463,7 @@ class NsysSystemWideCpuCollector:
         session_name: str,
         required_thread_comms: Sequence[str],
         executable: str = "nsys",
+        samples_per_backtrace: int = 4,
         command_timeout_s: float = 30.0,
         finalize_timeout_s: float = 180.0,
     ) -> None:
@@ -1472,6 +1473,9 @@ class NsysSystemWideCpuCollector:
         self.session_name = session_name
         self.required_thread_comms = tuple(required_thread_comms)
         self.executable = executable
+        self.samples_per_backtrace = int(samples_per_backtrace)
+        if not 1 <= self.samples_per_backtrace <= 32:
+            raise ValueError("Nsight samples per backtrace must be between 1 and 32")
         self.command_timeout_s = float(command_timeout_s)
         self.finalize_timeout_s = float(finalize_timeout_s)
         self.output_prefix = self.artifact_dir / "system-wide-cpu"
@@ -1532,6 +1536,7 @@ class NsysSystemWideCpuCollector:
                 "--trace=none",
                 "--sample=system-wide",
                 "--cpuctxsw=system-wide",
+                f"--samples-per-backtrace={self.samples_per_backtrace}",
                 "--resolve-symbols=false",
                 "--force-overwrite=true",
                 f"--output={self.output_prefix}",
@@ -1596,6 +1601,7 @@ class NsysSystemWideCpuCollector:
             "trace_domains": [],
             "sample_scope": "system-wide",
             "context_switch_scope": "system-wide",
+            "samples_per_backtrace": self.samples_per_backtrace,
             "required_thread_comms": list(self.required_thread_comms),
             "started_monotonic_ns": self.started_monotonic_ns,
             "started_wall_ns": self.started_wall_ns,

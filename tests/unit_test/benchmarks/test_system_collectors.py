@@ -261,6 +261,17 @@ def test_nsys_sqlite_excludes_non_alternating_transition_without_rejecting_captu
     assert "non-alternating" in result["temporal_schedule"]["warnings"][0]
 
 
+def test_nsys_system_wide_rejects_invalid_backtrace_density(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="between 1 and 32"):
+        NsysSystemWideCpuCollector(
+            target_pid=os.getpid(),
+            artifact_dir=tmp_path / "nsight",
+            session_name="omni_invalid_density",
+            required_thread_comms=["sched-asr"],
+            samples_per_backtrace=0,
+        )
+
+
 @pytest.mark.parametrize("summary_failure", [False, True])
 def test_nsys_system_wide_start_has_no_application_or_trace_domain(
     tmp_path: Path,
@@ -336,6 +347,7 @@ def test_nsys_system_wide_start_has_no_application_or_trace_domain(
     assert "--trace=none" in start
     assert "--sample=system-wide" in start
     assert "--cpuctxsw=system-wide" in start
+    assert "--samples-per-backtrace=4" in start
     assert all("python" not in argument for argument in start)
     assert all("cuda" not in argument.lower() for argument in start)
     assert result["valid"] is not summary_failure
