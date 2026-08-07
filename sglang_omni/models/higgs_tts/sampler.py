@@ -29,6 +29,21 @@ STOP_CODE = -1
 # CG-baked top-k upper bound = full codec vocab, so the default value is a no-op filter.
 K_MAX = 1026
 
+# Repetition-aware sampling (RAS), mirroring the reference implementation
+# defaults in boson-ai/higgs-audio (ras_win_len=7, ras_win_max_num_repeat=2).
+# A codebook whose freshly sampled code already appears RAS_MAX_REPEAT or
+# more times in its last RAS_WIN_LEN committed frames is redrawn from the
+# raw full-vocabulary distribution, restoring probability mass (including
+# EOC) that temperature/top-k/top-p filtering removed. Without it the model
+# can lock into a repeated-frame attractor it can never exit.
+RAS_WIN_LEN = 7
+RAS_MAX_REPEAT = 2
+
+# Hash-position offset for the seeded RAS redraw: primary draws use
+# positions = step * N + codebook, which stay far below this, so the redraw
+# stream is deterministic yet independent of the primary stream.
+_RAS_POSITION_OFFSET = 1 << 24
+
 
 @dataclass
 class HiggsSamplerState:
@@ -37,6 +52,8 @@ class HiggsSamplerState:
     eoc_countdown: int | None = None
     generation_done: bool = False
     last_codes: torch.Tensor | None = None
+    # ``[N, RAS_WIN_LEN]`` rolling window of committed codes; -1 = unfilled.
+    recent_codes: torch.Tensor | None = None
 
 
 class HiggsBatchedSamplerState:
@@ -87,6 +104,14 @@ class HiggsBatchedSamplerState:
         self.step_count = torch.zeros(
             self.max_batch_size, dtype=torch.long, device=self.device
         )
+        # Rolling window of the last RAS_WIN_LEN committed codes per codebook;
+        # -1 marks unfilled slots and never matches a real code.
+        self.recent_codes = torch.full(
+            (self.max_batch_size, self.num_codebooks, RAS_WIN_LEN),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
 
     def reset_row(self, row: int) -> None:
         """Wipe row ``row`` so the next owner can't read stale state."""
@@ -96,6 +121,7 @@ class HiggsBatchedSamplerState:
         self.last_codes[row].zero_()
         self.seeds[row] = NO_SEED
         self.step_count[row] = 0
+        self.recent_codes[row].fill_(-1)
 
     def view_row(self, row: int) -> HiggsSamplerState:
         """Materialise row ``row`` as a per-request :class:`HiggsSamplerState`.
@@ -109,6 +135,7 @@ class HiggsBatchedSamplerState:
             eoc_countdown=None if eoc < 0 else eoc,
             generation_done=bool(self.generation_done[row].item()),
             last_codes=None if delay == 0 else self.last_codes[row],
+            recent_codes=self.recent_codes[row],
         )
 
     def write_row(self, row: int, state: HiggsSamplerState) -> None:
@@ -120,6 +147,8 @@ class HiggsBatchedSamplerState:
         self.generation_done[row] = state.generation_done
         if state.last_codes is not None:
             self.last_codes[row].copy_(state.last_codes.to(self.last_codes.dtype))
+        if state.recent_codes is not None:
+            self.recent_codes[row].copy_(state.recent_codes.to(self.recent_codes.dtype))
 
 
 _GREEDY_TEMP_THRESHOLD = 1e-5
@@ -197,6 +226,17 @@ def step(
         top_k=top_k,
     ).to(torch.long)
 
+    # RAS: redraw repeated codes from the raw distribution. Greedy rows are
+    # exempt so explicit argmax decode stays RNG-free.
+    is_greedy = temperature <= _GREEDY_TEMP_THRESHOLD or top_k == 1
+    if not is_greedy and state.recent_codes is not None:
+        rep_num = (state.recent_codes == codes_N.unsqueeze(-1)).sum(dim=-1)
+        redraw_mask = rep_num >= RAS_MAX_REPEAT
+        if bool(redraw_mask.any()):
+            raw_probs = logits_NV.float().softmax(dim=-1)
+            redraw_N = raw_probs.multinomial(num_samples=1).squeeze(-1)
+            codes_N = torch.where(redraw_mask, redraw_N, codes_N)
+
     if state.delay_count < N:
         next_cb = state.delay_count + 1
         if next_cb < N:
@@ -214,6 +254,13 @@ def step(
 
     if not state.generation_done:
         state.last_codes = codes_N.clone()
+        if state.recent_codes is None:
+            state.recent_codes = torch.full(
+                (N, RAS_WIN_LEN), -1, dtype=torch.long, device=codes_N.device
+            )
+        state.recent_codes = torch.cat(
+            [state.recent_codes[:, 1:], codes_N.unsqueeze(-1)], dim=-1
+        )
 
     return codes_N
 
@@ -226,6 +273,7 @@ def _sample_independent_batched(
     top_k_buf: torch.Tensor | None = None,
     seeds_B: torch.Tensor | None = None,
     step_B: torch.Tensor | None = None,
+    recent_codes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Batched ``[B, N, V] → [B, N]`` sampler.
 
@@ -237,6 +285,10 @@ def _sample_independent_batched(
     making ``temperature=0`` decode non-deterministic. The selection is
     branchless (compute both, then ``torch.where``) because this runs inside the
     captured CUDA graph, where data-dependent host control flow is illegal.
+
+    ``recent_codes`` (``[B, N, RAS_WIN_LEN]``) enables RAS: a sampled code
+    already present ``RAS_MAX_REPEAT``+ times in its codebook's window is
+    redrawn from the raw full-vocabulary distribution. Greedy rows are exempt.
     """
     B, N, V = logits_BNV.shape
 
@@ -284,7 +336,29 @@ def _sample_independent_batched(
         codes_flat = torch.where(has_seed, seeded_flat, codes_flat)
     sampled_BN = codes_flat.view(B, N)
 
-    return torch.where(greedy_B1, argmax_BN, sampled_BN).to(torch.long)
+    codes_BN = torch.where(greedy_B1, argmax_BN, sampled_BN)
+
+    if recent_codes is not None:
+        # RAS: a code already appearing RAS_MAX_REPEAT times in its codebook's
+        # recent window is redrawn from the raw distribution (full support, no
+        # temperature/top-k/top-p), so the repeated-frame attractor keeps an
+        # exit even when filtering truncated it away. Branchless (compute the
+        # redraw unconditionally, select with torch.where): this runs inside
+        # the captured CUDA graph.
+        rep_num = (recent_codes == codes_BN.unsqueeze(-1)).sum(dim=-1)
+        ras_mask = (rep_num >= RAS_MAX_REPEAT) & ~greedy_B1
+        raw_probs = logits_BNV.float().softmax(dim=-1).reshape(B * N, V).contiguous()
+        redraw_flat = raw_probs.multinomial(num_samples=1).squeeze(-1)
+        if seeds_B is not None:
+            # Same hash scheme as the primary draw, at a disjoint position, so
+            # seeded rows stay deterministic and batch-invariant.
+            seeded_redraw = multinomial_with_seed(
+                torch.log(raw_probs), seeds_flat, positions + _RAS_POSITION_OFFSET
+            ).squeeze(-1)
+            redraw_flat = torch.where(has_seed, seeded_redraw, redraw_flat)
+        codes_BN = torch.where(ras_mask, redraw_flat.view(B, N), codes_BN)
+
+    return codes_BN.to(torch.long)
 
 
 def selected_token_logprobs(
@@ -333,6 +407,7 @@ def batched_step(
     last_codes = state.last_codes[row_indices]
     seeds = state.seeds[row_indices]
     step_count = state.step_count[row_indices]
+    recent_codes = state.recent_codes[row_indices]
 
     (
         out_codes,
@@ -341,6 +416,7 @@ def batched_step(
         new_generation_done,
         new_last_codes,
         new_step_count,
+        new_recent_codes,
     ) = batched_step_direct(
         logits_BNV,
         delay_count,
@@ -352,6 +428,7 @@ def batched_step(
         top_k_buf=top_k_buf,
         seeds=seeds,
         step_count=step_count,
+        recent_codes=recent_codes,
         boc_id=boc_id,
         eoc_id=eoc_id,
     )
@@ -361,6 +438,7 @@ def batched_step(
     state.generation_done[row_indices] = new_generation_done
     state.last_codes[row_indices] = new_last_codes
     state.step_count[row_indices] = new_step_count
+    state.recent_codes[row_indices] = new_recent_codes
 
     return out_codes
 
@@ -375,11 +453,13 @@ def batched_step_direct(
     temperature: torch.Tensor,
     seeds: torch.Tensor,
     step_count: torch.Tensor,
+    recent_codes: torch.Tensor,
     top_p: torch.Tensor | None = None,
     top_k_buf: torch.Tensor | None = None,
     boc_id: int = BOC_ID,
     eoc_id: int = EOC_ID,
 ) -> tuple[
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -407,6 +487,7 @@ def batched_step_direct(
         top_k_buf=top_k_buf,
         seeds_B=seeds,
         step_B=step_count,
+        recent_codes=recent_codes,
     )
     cb_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, N)
     in_delay = (delay_count < N).unsqueeze(-1)
@@ -441,6 +522,14 @@ def batched_step_direct(
     update_codes = (active & (~done_this_step)).unsqueeze(-1)
     new_last_codes = torch.where(update_codes, codes_BN, last_codes)
 
+    # Commit the final (post delay-mask) codes into the RAS window, gated
+    # exactly like last_codes so done rows keep their history frozen.
+    new_recent_codes = torch.where(
+        update_codes.unsqueeze(-1),
+        torch.cat([recent_codes[:, :, 1:], codes_BN.unsqueeze(-1)], dim=-1),
+        recent_codes,
+    )
+
     new_step_count = step_count + active.to(step_count.dtype)
 
     stop = torch.full_like(codes_BN, STOP_CODE)
@@ -452,11 +541,14 @@ def batched_step_direct(
         new_generation_done,
         new_last_codes,
         new_step_count,
+        new_recent_codes,
     )
 
 
 __all__ = [
     "K_MAX",
+    "RAS_MAX_REPEAT",
+    "RAS_WIN_LEN",
     "STOP_CODE",
     "HiggsBatchedSamplerState",
     "HiggsSamplerState",

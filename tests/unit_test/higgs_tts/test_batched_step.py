@@ -60,6 +60,7 @@ def _snapshot_pool(pool: HiggsBatchedSamplerState) -> dict:
         "eoc_countdown": pool.eoc_countdown.clone(),
         "generation_done": pool.generation_done.clone(),
         "last_codes": pool.last_codes.clone(),
+        "recent_codes": pool.recent_codes.clone(),
     }
 
 

@@ -24,6 +24,7 @@ from sglang_omni.models.higgs_tts.modeling import (
 from sglang_omni.models.higgs_tts.sampler import (
     K_MAX,
     NO_SEED,
+    RAS_WIN_LEN,
     HiggsBatchedSamplerState,
     batched_step,
     batched_step_direct,
@@ -214,6 +215,12 @@ class HiggsTTSModel(nn.Module):
         self._cg_active_step_count = torch.zeros(
             pool_size, dtype=torch.long, device=cg_device
         )
+        self._cg_active_recent_codes = torch.full(
+            (pool_size, num_codebooks, RAS_WIN_LEN),
+            -1,
+            dtype=torch.long,
+            device=cg_device,
+        )
 
     @property
     def language_model(self) -> Qwen3ForCausalLM:
@@ -386,6 +393,7 @@ class HiggsTTSModel(nn.Module):
         last_codes_BN_in = self._cg_active_last_codes[:batch_size]
         seeds_B = self._cg_active_seeds[:batch_size]
         step_count_B = self._cg_active_step_count[:batch_size]
+        recent_codes_BNW = self._cg_active_recent_codes[:batch_size]
 
         self._cg_was_done[:batch_size] = generation_done_B
 
@@ -396,6 +404,7 @@ class HiggsTTSModel(nn.Module):
             new_generation_done_B,
             new_last_codes_BN,
             new_step_count_B,
+            new_recent_codes_BNW,
         ) = batched_step_direct(
             logits_BNV,
             delay_count_B,
@@ -407,8 +416,10 @@ class HiggsTTSModel(nn.Module):
             top_k_buf=top_k_buf,
             seeds=seeds_B,
             step_count=step_count_B,
+            recent_codes=recent_codes_BNW,
         )
         self._cg_active_step_count[:batch_size] = new_step_count_B
+        self._cg_active_recent_codes[:batch_size] = new_recent_codes_BNW
         self._cg_active_delay_count[:batch_size] = new_delay_count_B.to(
             self._cg_active_delay_count.dtype
         )

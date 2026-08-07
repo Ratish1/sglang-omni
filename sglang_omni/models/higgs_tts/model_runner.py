@@ -279,6 +279,7 @@ class HiggsTTSModelRunner(ModelRunner):
         model._cg_active_last_codes[:bs] = pool.last_codes[rows_t]
         model._cg_active_seeds[:bs] = pool.seeds[rows_t]
         model._cg_active_step_count[:bs] = pool.step_count[rows_t]
+        model._cg_active_recent_codes[:bs] = pool.recent_codes[rows_t]
 
     @staticmethod
     def _extract_decode_sampling_params(requests):
@@ -345,6 +346,7 @@ class HiggsTTSModelRunner(ModelRunner):
         pool.generation_done[rows_t] = model._cg_active_generation_done[:n_real]
         pool.last_codes[rows_t] = model._cg_active_last_codes[:n_real]
         pool.step_count[rows_t] = model._cg_active_step_count[:n_real]
+        pool.recent_codes[rows_t] = model._cg_active_recent_codes[:n_real]
 
         # Note(Jiaxin): pack the 3 tensors so a single D2H pulls them all back.
         num_codebooks = model._cg_codes_BN.shape[1]

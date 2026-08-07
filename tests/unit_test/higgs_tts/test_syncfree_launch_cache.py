@@ -22,7 +22,7 @@ from sglang_omni.models.higgs_tts.model_runner import (
     HiggsTTSModelRunner,
     _syncfree_launch_enabled,
 )
-from sglang_omni.models.higgs_tts.sampler import K_MAX
+from sglang_omni.models.higgs_tts.sampler import K_MAX, RAS_WIN_LEN
 from sglang_omni.sampling.seed import SAMPLING_SEED_MASK, new_random_sampling_seed
 
 POOL = 8  # pool size incl. the reserved padding row
@@ -39,6 +39,7 @@ def _make_pool():
         # Pool rows always hold concrete non-negative seeds on this branch.
         seeds=torch.randint(0, SAMPLING_SEED_MASK + 1, (POOL,), dtype=torch.long),
         step_count=torch.zeros(POOL, dtype=torch.long),
+        recent_codes=torch.full((POOL, N_CB, RAS_WIN_LEN), -1, dtype=torch.long),
     )
 
     def reset_row(row: int) -> None:
@@ -48,6 +49,7 @@ def _make_pool():
         pool.last_codes[row].zero_()
         pool.seeds[row] = new_random_sampling_seed()
         pool.step_count[row] = 0
+        pool.recent_codes[row].fill_(-1)
 
     pool.reset_row = reset_row
     return pool
@@ -71,6 +73,9 @@ class _FakeModel:
         self._cg_active_last_codes = torch.zeros(POOL, N_CB, dtype=torch.long)
         self._cg_active_seeds = torch.zeros(POOL, dtype=torch.long)
         self._cg_active_step_count = torch.zeros(POOL, dtype=torch.long)
+        self._cg_active_recent_codes = torch.full(
+            (POOL, N_CB, RAS_WIN_LEN), -1, dtype=torch.long
+        )
 
     def acquire_row(self, rid: str) -> int:
         row = self._rid_to_row.get(rid)
