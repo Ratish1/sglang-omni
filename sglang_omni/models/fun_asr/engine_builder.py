@@ -17,12 +17,14 @@ from sglang_omni.models.fun_asr.tool_funcs.audio_lengths import (
     fun_asr_low_frame_rate_length,
 )
 from sglang_omni.scheduling.engine_factory import AsrEngineBuilder
+from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
 from sglang_omni.utils.gpu_compat import get_visible_gpu_sm_version
 
 
 class FunASREngineBuilder(AsrEngineBuilder):
     model_name = "Fun-ASR"
     model_arch_override = "FunAsrNanoForConditionalGeneration"
+    supports_breakable_prefill_cuda_graph = True
 
     def __init__(
         self,
@@ -93,6 +95,10 @@ class FunASREngineBuilder(AsrEngineBuilder):
             "mem_fraction_static": self.mem_fraction_static,
             "max_prefill_tokens": 4096,
             "chunked_prefill_size": 4096,
+            # Note (Akazaakane): These buckets cover the validated post-chunking
+            # Fun-ASR token distribution while keeping padding below the replay cap.
+            "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
+            "cuda_graph_bs_prefill": [1, 2, 4, 8, 16, 32, 40, 48],
             "sampling_backend": "pytorch",
             "dtype": dtype,
         }
