@@ -161,6 +161,62 @@ window distributions and telemetry before increasing restart count. Loaded
 PSI is evidence, not an acceptance gate. Preserve results even when none of
 the rolling three-window groups meets the 5% stability criterion.
 
+### Fun-ASR encoder CUDA graph A/B
+
+Run the CUDA graph candidate as a four-arm unprofiled experiment before doing
+more scheduler or Nsight work. The checked configuration varies only encoder
+execution and CPU interference:
+
+The backport corresponds to PR #1369 head `36ad27059bf27fc122ecdf406bd4eda52504bb42`,
+including its cross-stream output-copy lifetime fix. The profiling branch keeps
+the feature off by default; every campaign arm sets it explicitly.
+
+| Condition | Encoder | CPU64 interferer |
+|---|---|---|
+| `eager-quiet` | eager | no |
+| `graph-quiet` | bucketed CUDA graph | no |
+| `eager-cpu64` | eager | yes |
+| `graph-cpu64` | bucketed CUDA graph | yes |
+
+No pre-admission/scheduler candidate is enabled, encoder torch compilation is
+disabled, and the pre-LM embedding cache is empty in every arm. Graph
+conditions are rejected if the server does not log both graph enablement and
+at least one successful capture, or if it logs a capture, VRAM, shape-bucket,
+or feature-dimension fallback to eager execution.
+
+```bash
+cp benchmarks/profiling/campaign.encoder_cuda_graph_ab.h100.example.json \
+  /tmp/campaign.encoder_cuda_graph_ab.h100.json
+```
+
+Replace the immutable model revision and the two machine-specific GPU values
+(`server.env.CUDA_VISIBLE_DEVICES` and harness `--gpu-index`), then run:
+
+```bash
+python -m benchmarks.profiling.run_cpu_saturation_campaign \
+  --config /tmp/campaign.encoder_cuda_graph_ab.h100.json \
+  --output-dir \
+  "$PWD/artifacts/cpu-saturation/encoder-graph-ab-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+The campaign uses three fresh servers per arm and writes corpus WER plus the
+four decisive comparisons directly into `summary.json`. Treat throughput and
+latency as invalid unless completed-request accounting and corpus WER remain
+equivalent:
+
+- `graph_vs_eager_quiet`: candidate speedup without interference;
+- `cpu64_vs_quiet_eager`: reproduction of the original eager degradation;
+- `graph_vs_eager_cpu64`: candidate speedup under interference;
+- `cpu64_vs_quiet_graph`: residual CPU sensitivity after graph replay.
+
+Do not infer an admission redesign from the eager arms. If
+`cpu64_vs_quiet_graph` is small and the graph arms no longer saturate the
+request-build/pre-LM path, the encoder launch bottleneck explains the Fun-ASR
+case. If a material residual remains, run one graph-enabled event-only
+quiet/CPU64 pair to measure pending builds, pre-LM wait, ready-to-drain, and
+head-of-line delay. Only then take a short CUDA+NVTX timeline; it is a visual
+mechanism check, not another performance campaign.
+
 ## 1. Prepare the checkout and dataset
 
 ```bash

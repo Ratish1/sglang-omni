@@ -1012,6 +1012,7 @@ async def _run_stability_characterization(
 
     metric_names = (
         "throughput_samples_per_s",
+        "corpus_wer",
         "latency_mean_s",
         "latency_p50_s",
         "latency_p95_s",

@@ -24,6 +24,7 @@ def test_fun_asr_config_uses_batched_stage_with_32_running_requests() -> None:
     assert config.stages[0].factory_args["device"] == "cuda:0"
     assert config.stages[0].factory_args["max_running_requests"] == 32
     assert config.stages[0].factory_args["max_new_tokens"] == 200
+    assert config.stages[0].factory_args["enable_encoder_cuda_graph"] is False
     assert config.stages[0].factory_args["enable_pre_lm_encoder"] is True
     assert config.stages[0].factory_args["pre_lm_cache_max_entries"] == 4096
     assert config.stages[0].factory_args["pre_lm_cache_size_bytes"] == 2 * 1024**3
@@ -42,6 +43,7 @@ def test_fun_asr_stage_default_allows_32_running_requests() -> None:
 
     assert signature.parameters["max_running_requests"].default == 32
     assert signature.parameters["max_new_tokens"].default == 200
+    assert signature.parameters["enable_encoder_cuda_graph"].default is False
     assert signature.parameters["enable_pre_lm_encoder"].default is True
     assert signature.parameters["pre_lm_cache_max_entries"].default == 4096
     assert signature.parameters["pre_lm_cache_size_bytes"].default == 2 * 1024**3
@@ -177,7 +179,8 @@ def test_fun_asr_threads_generation_batch_and_request_build_policy(monkeypatch) 
         server_args.mm_attention_backend = None
         return server_args
 
-    model_worker = SimpleNamespace(model_runner=SimpleNamespace(model=object()))
+    model = SimpleNamespace(audio_tower=object(), multi_modal_projector=object())
+    model_worker = SimpleNamespace(model_runner=SimpleNamespace(model=model))
     infrastructure = (
         model_worker,
         object(),
@@ -213,8 +216,36 @@ def test_fun_asr_threads_generation_batch_and_request_build_policy(monkeypatch) 
         lambda **kwargs: validations.append(kwargs),
         raising=False,
     )
+    graph_runner_calls: list[dict[str, object]] = []
+    graph_runner = object()
 
-    scheduler = fun_asr_stages.create_sglang_fun_asr_executor("dummy")
+    def _make_graph_runner(audio_tower, multi_modal_projector, **kwargs):
+        graph_runner_calls.append(
+            {
+                "audio_tower": audio_tower,
+                "multi_modal_projector": multi_modal_projector,
+                **kwargs,
+            }
+        )
+        return graph_runner
+
+    monkeypatch.setattr(
+        "sglang_omni.models.fun_asr.encoder_cuda_graph.FunASREncoderCudaGraphRunner",
+        _make_graph_runner,
+    )
+    monkeypatch.setattr(
+        fun_asr_stages,
+        "_compile_fun_asr_audio_encoder",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("encoder compile must not run when CUDA graphs are enabled")
+        ),
+    )
+
+    scheduler = fun_asr_stages.create_sglang_fun_asr_executor(
+        "dummy",
+        enable_encoder_cuda_graph=True,
+        enable_encoder_torch_compile=True,
+    )
 
     assert build_kwargs["cuda_graph_max_bs"] == 32
     assert build_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
@@ -222,6 +253,14 @@ def test_fun_asr_threads_generation_batch_and_request_build_policy(monkeypatch) 
         {"model_name": "Fun-ASR", "server_args": scheduler.server_args}
     ]
     assert adapter_kwargs["audio_encoder_service"] is encoder_services[0]
+    assert graph_runner_calls == [
+        {
+            "audio_tower": model.audio_tower,
+            "multi_modal_projector": model.multi_modal_projector,
+            "max_batch_size": 8,
+        }
+    ]
+    assert model.encoder_cuda_graph_runner is graph_runner
     assert scheduler.request_build_max_workers == 8
     assert scheduler.request_build_max_pending == 16
     assert stream_builder_calls == [

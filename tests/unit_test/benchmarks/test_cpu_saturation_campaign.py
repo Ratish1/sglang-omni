@@ -10,14 +10,17 @@ import pytest
 
 from benchmarks.profiling.cpu_interferer import parse_cpu_list
 from benchmarks.profiling.run_cpu_saturation_campaign import (
+    _aggregate,
     _bootstrap_median_ci,
     _causal_run_metrics,
     _cpu_psi_fraction_between,
     _finalized_result_errors,
     _harness_argv,
+    _load_config,
     _metric,
     _process_placement_snapshot,
     _resolve_stage_pid_from_server_log,
+    _server_log_contract,
     _wait_for_ambient_cpu_psi,
     build_trial_plan,
 )
@@ -134,6 +137,131 @@ def test_stability_campaign_is_unprofiled_and_retains_twenty_windows() -> None:
     )
     assert "events" not in config["harness_args"]
     assert config["protocol"]["continue_on_failure"] is True
+
+
+def test_encoder_cuda_graph_campaign_is_a_four_arm_unprofiled_ab() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    config = _load_config(
+        repo_root
+        / "benchmarks/profiling/campaign.encoder_cuda_graph_ab.h100.example.json"
+    )
+    conditions = {item["name"]: item for item in config["conditions"]}
+
+    assert _arg_value(config["harness_args"], "--mode") == "stability"
+    assert config["reference_condition"] == "eager-quiet"
+    assert set(conditions) == {
+        "eager-quiet",
+        "graph-quiet",
+        "eager-cpu64",
+        "graph-cpu64",
+    }
+    for name in ("eager-quiet", "eager-cpu64"):
+        assert conditions[name]["server_argv_append"] == [
+            "--stages.asr.factory_args.enable_encoder_cuda_graph=false"
+        ]
+    for name in ("graph-quiet", "graph-cpu64"):
+        assert conditions[name]["server_argv_append"] == [
+            "--stages.asr.factory_args.enable_encoder_cuda_graph=true"
+        ]
+        assert (
+            "Captured Fun-ASR encoder CUDA graph"
+            in conditions[name]["required_server_log_substrings"]
+        )
+        assert conditions[name]["forbidden_server_log_substrings"]
+    assert {pair["name"] for pair in config["comparison_pairs"]} == {
+        "graph_vs_eager_quiet",
+        "cpu64_vs_quiet_eager",
+        "graph_vs_eager_cpu64",
+        "cpu64_vs_quiet_graph",
+    }
+
+
+def test_server_log_contract_requires_graph_capture_and_rejects_fallback(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "server.log"
+    log_path.write_text(
+        "Fun-ASR encoder CUDA graphs enabled\n"
+        "Captured Fun-ASR encoder CUDA graph batch=8 t=512\n",
+        encoding="utf-8",
+    )
+    condition = {
+        "required_server_log_substrings": [
+            "Fun-ASR encoder CUDA graphs enabled",
+            "Captured Fun-ASR encoder CUDA graph",
+        ],
+        "forbidden_server_log_substrings": ["capture failed"],
+    }
+    assert _server_log_contract(log_path, condition)["valid"] is True
+
+    log_path.write_text(
+        log_path.read_text(encoding="utf-8") + "capture failed\n",
+        encoding="utf-8",
+    )
+    report = _server_log_contract(log_path, condition)
+    assert report["valid"] is False
+    assert report["present_forbidden"] == ["capture failed"]
+
+
+def test_campaign_emits_explicit_graph_and_stress_comparisons(tmp_path: Path) -> None:
+    trials = []
+    for condition, qps in (
+        ("eager-quiet", 50.0),
+        ("graph-quiet", 100.0),
+        ("eager-cpu64", 30.0),
+        ("graph-cpu64", 80.0),
+    ):
+        result_path = tmp_path / f"{condition}.json"
+        result_path.write_text(
+            json.dumps(
+                {
+                    "artifact_dir": str(tmp_path),
+                    "adjacent_baselines": {
+                        "reference": {
+                            "throughput_samples_per_s": qps,
+                            "corpus_wer": 0.0172,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        trials.append(
+            {
+                "status": "completed",
+                "condition": condition,
+                "result_path": str(result_path),
+            }
+        )
+
+    summary = _aggregate(
+        tmp_path,
+        trials,
+        seed=1,
+        reference_condition="eager-quiet",
+        comparison_pairs=[
+            {
+                "name": "graph_vs_eager_cpu64",
+                "reference": "eager-cpu64",
+                "condition": "graph-cpu64",
+            },
+            {
+                "name": "cpu64_vs_quiet_graph",
+                "reference": "graph-quiet",
+                "condition": "graph-cpu64",
+            },
+        ],
+    )
+    qps_metric = "metrics|throughput_samples_per_s"
+    assert summary["conditions"]["graph-cpu64"]["metrics"]["corpus_wer"][
+        "median"
+    ] == pytest.approx(0.0172)
+    assert summary["comparisons"]["graph_vs_eager_cpu64"][qps_metric][
+        "relative_delta"
+    ] == pytest.approx(5 / 3)
+    assert summary["comparisons"]["cpu64_vs_quiet_graph"][qps_metric][
+        "relative_delta"
+    ] == pytest.approx(-0.2)
 
 
 def test_campaign_performance_uses_bracketed_unprofiled_reference() -> None:

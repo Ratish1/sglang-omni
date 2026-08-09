@@ -1,0 +1,165 @@
+{
+  "repo_root": ".",
+  "server": {
+    "argv": [
+      "sgl-omni",
+      "serve",
+      "--model-path",
+      "FunAudioLLM/Fun-ASR-Nano-2512-hf",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8000",
+      "--stages.asr.factory_args.enable_encoder_torch_compile=false",
+      "--stages.asr.factory_args.pre_lm_cache_max_entries=0",
+      "--stages.asr.factory_args.pre_lm_cache_size_bytes=0"
+    ],
+    "env": {
+      "CUDA_VISIBLE_DEVICES": "0",
+      "OMP_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1"
+    },
+    "ready_url": "http://127.0.0.1:8000/health",
+    "ready_timeout_s": 900,
+    "stop_timeout_s": 60
+  },
+  "harness_args": [
+    "--mode",
+    "stability",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8000",
+    "--stage",
+    "asr",
+    "--model-revision",
+    "REPLACE_WITH_IMMUTABLE_MODEL_REVISION",
+    "--workload-contract",
+    "direct-steady-miss",
+    "--concurrency",
+    "32",
+    "--max-samples",
+    "1088",
+    "--warmup-samples",
+    "256",
+    "--characterization-windows",
+    "20",
+    "--stability-windows",
+    "3",
+    "--stability-tolerance",
+    "0.05",
+    "--max-thread-cpu-accounting-error",
+    "0.05",
+    "--collectors",
+    "psi,cgroup-psi,thread-snapshot,gpu-dmon,cpu-frequency",
+    "--required-thread-comms",
+    "sched-asr,omni-request-bu,fun-asr-audio-e",
+    "--gpu-index",
+    "0"
+  ],
+  "host_preflight": {
+    "max_cgroup_cpu_psi_some_fraction": 0.02,
+    "window_s": 5,
+    "required_consecutive_windows": 2,
+    "timeout_s": 300
+  },
+  "reference_condition": "eager-quiet",
+  "conditions": [
+    {
+      "name": "eager-quiet",
+      "server_argv_append": [
+        "--stages.asr.factory_args.enable_encoder_cuda_graph=false"
+      ],
+      "forbidden_server_log_substrings": [
+        "Fun-ASR encoder CUDA graphs enabled",
+        "Captured Fun-ASR encoder CUDA graph"
+      ]
+    },
+    {
+      "name": "graph-quiet",
+      "server_argv_append": [
+        "--stages.asr.factory_args.enable_encoder_cuda_graph=true"
+      ],
+      "required_server_log_substrings": [
+        "Fun-ASR encoder CUDA graphs enabled",
+        "Captured Fun-ASR encoder CUDA graph"
+      ],
+      "forbidden_server_log_substrings": [
+        "Fun-ASR encoder CUDA graph: free VRAM",
+        "Fun-ASR encoder CUDA graph capture failed",
+        "Fun-ASR encoder CUDA graph has no bucket",
+        "Fun-ASR encoder CUDA graph feature dimension changed"
+      ]
+    },
+    {
+      "name": "eager-cpu64",
+      "server_argv_append": [
+        "--stages.asr.factory_args.enable_encoder_cuda_graph=false"
+      ],
+      "forbidden_server_log_substrings": [
+        "Fun-ASR encoder CUDA graphs enabled",
+        "Captured Fun-ASR encoder CUDA graph"
+      ],
+      "interferer_argv": [
+        "python",
+        "-m",
+        "benchmarks.profiling.cpu_interferer",
+        "--workers",
+        "64"
+      ],
+      "interferer_settle_s": 5
+    },
+    {
+      "name": "graph-cpu64",
+      "server_argv_append": [
+        "--stages.asr.factory_args.enable_encoder_cuda_graph=true"
+      ],
+      "required_server_log_substrings": [
+        "Fun-ASR encoder CUDA graphs enabled",
+        "Captured Fun-ASR encoder CUDA graph"
+      ],
+      "forbidden_server_log_substrings": [
+        "Fun-ASR encoder CUDA graph: free VRAM",
+        "Fun-ASR encoder CUDA graph capture failed",
+        "Fun-ASR encoder CUDA graph has no bucket",
+        "Fun-ASR encoder CUDA graph feature dimension changed"
+      ],
+      "interferer_argv": [
+        "python",
+        "-m",
+        "benchmarks.profiling.cpu_interferer",
+        "--workers",
+        "64"
+      ],
+      "interferer_settle_s": 5
+    }
+  ],
+  "comparison_pairs": [
+    {
+      "name": "graph_vs_eager_quiet",
+      "reference": "eager-quiet",
+      "condition": "graph-quiet"
+    },
+    {
+      "name": "cpu64_vs_quiet_eager",
+      "reference": "eager-quiet",
+      "condition": "eager-cpu64"
+    },
+    {
+      "name": "graph_vs_eager_cpu64",
+      "reference": "eager-cpu64",
+      "condition": "graph-cpu64"
+    },
+    {
+      "name": "cpu64_vs_quiet_graph",
+      "reference": "graph-quiet",
+      "condition": "graph-cpu64"
+    }
+  ],
+  "protocol": {
+    "restarts_per_condition": 3,
+    "random_seed": 20260809,
+    "continue_on_failure": false
+  }
+}

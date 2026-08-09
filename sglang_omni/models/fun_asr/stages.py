@@ -129,6 +129,7 @@ def create_sglang_fun_asr_executor(
     mm_embedding_cache_size_bytes: int = 0,
     enable_torch_compile: bool = False,
     enable_encoder_torch_compile: bool = False,
+    enable_encoder_cuda_graph: bool = False,
     enable_async_decode: bool = True,
     async_decode_min_batch_size: int = 2,
     mm_attention_backend: str | None = None,
@@ -221,9 +222,33 @@ def create_sglang_fun_asr_executor(
     if want_cuda_graph:
         model_worker.model_runner.init_cuda_graphs()
 
-    if enable_encoder_torch_compile:
+    model = model_worker.model_runner.model
+    if enable_encoder_cuda_graph:
+        # Capture needs the eager forwards; a dynamo-compiled callable cannot
+        # be captured, so the graph takes precedence over encoder compile.
+        if enable_encoder_torch_compile:
+            logger.warning(
+                "enable_encoder_cuda_graph supersedes "
+                "enable_encoder_torch_compile; the encoder runs from "
+                "captured CUDA graphs (eager capture), not dynamo"
+            )
+        from sglang_omni.models.fun_asr.encoder_cuda_graph import (
+            FunASREncoderCudaGraphRunner,
+        )
+
+        model.encoder_cuda_graph_runner = FunASREncoderCudaGraphRunner(
+            model.audio_tower,
+            model.multi_modal_projector,
+            max_batch_size=pre_lm_max_batch_size,
+        )
+        logger.info(
+            "Fun-ASR encoder CUDA graphs enabled "
+            "(lazy capture per batch/length bucket, max_batch=%d)",
+            pre_lm_max_batch_size,
+        )
+    elif enable_encoder_torch_compile:
         _compile_fun_asr_audio_encoder(
-            model_worker.model_runner.model,
+            model,
             warmup_inference_mode=enable_pre_lm_encoder,
         )
 
@@ -237,7 +262,6 @@ def create_sglang_fun_asr_executor(
 
     audio_encoder_service = None
     if enable_pre_lm_encoder:
-        model = model_worker.model_runner.model
         audio_encoder_service = FunASRPreLMEncoderService(
             model,
             cache_namespace=build_cache_namespace(

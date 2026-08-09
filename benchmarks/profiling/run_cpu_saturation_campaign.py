@@ -55,6 +55,48 @@ def _load_config(path: Path) -> dict[str, Any]:
         raise ValueError("every condition requires a non-empty name")
     if len(set(names)) != len(names):
         raise ValueError("condition names must be unique")
+    name_set = set(names)
+    reference_condition = config.get("reference_condition")
+    if reference_condition is not None:
+        if not isinstance(reference_condition, str) or not reference_condition:
+            raise TypeError("reference_condition must be a non-empty string")
+        if reference_condition not in name_set:
+            raise ValueError("reference_condition must name a configured condition")
+    for condition in conditions:
+        for key in (
+            "required_server_log_substrings",
+            "forbidden_server_log_substrings",
+        ):
+            values = condition.get(key, [])
+            if not isinstance(values, list) or any(
+                not isinstance(value, str) or not value for value in values
+            ):
+                raise TypeError(
+                    f"condition.{key} must be an array of non-empty strings"
+                )
+    comparison_pairs = config.get("comparison_pairs", [])
+    if not isinstance(comparison_pairs, list):
+        raise TypeError("comparison_pairs must be an array")
+    comparison_names: set[str] = set()
+    for pair in comparison_pairs:
+        if not isinstance(pair, dict):
+            raise TypeError("each comparison pair must be an object")
+        pair_name = pair.get("name")
+        reference = pair.get("reference")
+        condition = pair.get("condition")
+        if not isinstance(pair_name, str) or not pair_name:
+            raise ValueError("each comparison pair requires a non-empty name")
+        if pair_name in comparison_names:
+            raise ValueError("comparison pair names must be unique")
+        comparison_names.add(pair_name)
+        if reference not in name_set or condition not in name_set:
+            raise ValueError(
+                f"comparison pair {pair_name!r} names an unknown condition"
+            )
+        if reference == condition:
+            raise ValueError(
+                f"comparison pair {pair_name!r} must name different conditions"
+            )
     host_preflight = config.get("host_preflight")
     if host_preflight is not None:
         if not isinstance(host_preflight, dict):
@@ -204,6 +246,29 @@ def _wait_ready(
 
 def _condition_map(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {str(item["name"]): item for item in config["conditions"]}
+
+
+def _server_log_contract(
+    log_path: Path,
+    condition: dict[str, Any],
+) -> dict[str, Any]:
+    """Attest experiment-specific runtime behavior from durable server logs."""
+    content = log_path.read_text(encoding="utf-8", errors="replace")
+    required = [
+        str(value) for value in condition.get("required_server_log_substrings", [])
+    ]
+    forbidden = [
+        str(value) for value in condition.get("forbidden_server_log_substrings", [])
+    ]
+    missing = [value for value in required if value not in content]
+    present_forbidden = [value for value in forbidden if value in content]
+    return {
+        "valid": not missing and not present_forbidden,
+        "required": required,
+        "forbidden": forbidden,
+        "missing_required": missing,
+        "present_forbidden": present_forbidden,
+    }
 
 
 def _harness_argv(
@@ -712,6 +777,8 @@ def _aggregate(
     trials: list[dict[str, Any]],
     *,
     seed: int,
+    comparison_pairs: list[dict[str, str]] | None = None,
+    reference_condition: str | None = None,
 ) -> dict[str, Any]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for trial in trials:
@@ -724,6 +791,8 @@ def _aggregate(
 
     metrics = (
         "throughput_samples_per_s",
+        "corpus_wer",
+        "latency_mean_s",
         "latency_p50_s",
         "latency_p95_s",
         "latency_p99_s",
@@ -766,31 +835,47 @@ def _aggregate(
             )
         conditions[condition] = condition_result
 
-    reference_name = "quiet" if "quiet" in conditions else next(iter(conditions), None)
+    def _deltas(reference: dict[str, Any], observed: dict[str, Any]) -> dict[str, Any]:
+        deltas: dict[str, Any] = {}
+        for group_name in ("metrics", "causal_metrics"):
+            reference_group = reference[group_name]
+            observed_group = observed[group_name]
+            for metric_name in sorted(set(reference_group) & set(observed_group)):
+                baseline = reference_group[metric_name]["median"]
+                value = observed_group[metric_name]["median"]
+                if baseline is None or value is None:
+                    continue
+                deltas[f"{group_name}|{metric_name}"] = {
+                    "reference_median": baseline,
+                    "condition_median": value,
+                    "absolute_delta": value - baseline,
+                    "relative_delta": (
+                        (value - baseline) / baseline if baseline else None
+                    ),
+                }
+        return deltas
+
+    reference_name = (
+        reference_condition
+        if reference_condition in conditions
+        else "quiet" if "quiet" in conditions else next(iter(conditions), None)
+    )
     comparisons: dict[str, Any] = {}
     if reference_name is not None:
         reference = conditions[reference_name]
         for condition_name, condition in conditions.items():
             if condition_name == reference_name:
                 continue
-            deltas: dict[str, Any] = {}
-            for group_name in ("metrics", "causal_metrics"):
-                reference_group = reference[group_name]
-                condition_group = condition[group_name]
-                for metric_name in sorted(set(reference_group) & set(condition_group)):
-                    baseline = reference_group[metric_name]["median"]
-                    observed = condition_group[metric_name]["median"]
-                    if baseline is None or observed is None:
-                        continue
-                    deltas[f"{group_name}|{metric_name}"] = {
-                        "reference_median": baseline,
-                        "condition_median": observed,
-                        "absolute_delta": observed - baseline,
-                        "relative_delta": (
-                            (observed - baseline) / baseline if baseline else None
-                        ),
-                    }
-            comparisons[f"{condition_name}_vs_{reference_name}"] = deltas
+            comparisons[f"{condition_name}_vs_{reference_name}"] = _deltas(
+                reference,
+                condition,
+            )
+    for pair in comparison_pairs or []:
+        reference = conditions.get(pair["reference"])
+        condition = conditions.get(pair["condition"])
+        if reference is None or condition is None:
+            continue
+        comparisons[pair["name"]] = _deltas(reference, condition)
     summary = {
         "campaign_dir": str(campaign_dir),
         "performance_source": (
@@ -968,6 +1053,19 @@ def run_campaign(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
                 raise RuntimeError(
                     "capture was preserved but rejected: " + "; ".join(finalized_errors)
                 )
+            if server_log is not None:
+                server_log.flush()
+            log_contract = _server_log_contract(
+                trial_dir / "server.log",
+                condition,
+            )
+            record["server_log_contract"] = log_contract
+            if not log_contract["valid"]:
+                raise RuntimeError(
+                    "server log contract failed: "
+                    f"missing={log_contract['missing_required']}, "
+                    f"forbidden={log_contract['present_forbidden']}"
+                )
             record.update(
                 {
                     "status": "completed",
@@ -1005,7 +1103,13 @@ def run_campaign(config: dict[str, Any], *, output_dir: Path) -> dict[str, Any]:
             break
 
     write_json(output_dir / "trials.json", trial_results)
-    return _aggregate(output_dir, trial_results, seed=seed)
+    return _aggregate(
+        output_dir,
+        trial_results,
+        seed=seed,
+        comparison_pairs=config.get("comparison_pairs"),
+        reference_condition=config.get("reference_condition"),
+    )
 
 
 def parse_args() -> argparse.Namespace:
