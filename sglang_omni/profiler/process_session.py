@@ -12,6 +12,7 @@ import logging
 import multiprocessing
 import os
 import threading
+from typing import ClassVar
 
 import torch
 
@@ -27,7 +28,7 @@ class ProcessProfilerSession:
 
     _lock = threading.RLock()
     _run_id: str | None = None
-    _participants: set[str] = set()
+    _participants: ClassVar[set[str]] = set()
     _enable_torch = False
     _event_dir: str | None = None
     _cuda_capable_process = False
@@ -55,7 +56,7 @@ class ProcessProfilerSession:
         enable_torch: bool,
         cuda_capable_process: bool,
         cuda_sync_debug_mode: str,
-    ) -> None:
+    ) -> dict:
         if cuda_sync_debug_mode not in CUDA_SYNC_DEBUG_MODES:
             raise ValueError(
                 "cuda_sync_debug_mode must be one of "
@@ -71,7 +72,7 @@ class ProcessProfilerSession:
                     cuda_capable_process=cuda_capable_process,
                     cuda_sync_debug_mode=cuda_sync_debug_mode,
                 )
-                return
+                return cls._status_unlocked(joined=True)
 
             if cls._run_id is not None:
                 logger.warning(
@@ -122,6 +123,7 @@ class ProcessProfilerSession:
                 cuda_sync_debug_mode,
                 cls._cuda_sync_debug_applied,
             )
+            return cls._status_unlocked(joined=False)
 
     @classmethod
     def _join_existing_unlocked(
@@ -168,20 +170,29 @@ class ProcessProfilerSession:
         )
 
     @classmethod
-    def stop(cls, *, participant: str, run_id: str | None = None) -> None:
+    def stop(cls, *, participant: str, run_id: str | None = None) -> dict:
         """Leave a stage participant; close after the last joined stage leaves."""
         with cls._lock:
             if cls._run_id is None:
-                return
+                return {"stopped": False, "reason": "no active process session"}
             if run_id is not None and run_id != cls._run_id:
                 logger.warning(
                     "Ignoring process profiler stop for run_id=%s; active run_id=%s",
                     run_id,
                     cls._run_id,
                 )
-                return
+                return {
+                    "stopped": False,
+                    "reason": "run_id mismatch",
+                    "active_run_id": cls._run_id,
+                }
             if participant not in cls._participants:
-                return
+                return {
+                    "stopped": False,
+                    "reason": "participant is not joined",
+                    "active_run_id": cls._run_id,
+                    "participants": sorted(cls._participants),
+                }
             cls._participants.remove(participant)
             if cls._participants:
                 logger.info(
@@ -192,8 +203,11 @@ class ProcessProfilerSession:
                     participant,
                     sorted(cls._participants),
                 )
-                return
-            cls._close_unlocked(reason=f"last participant {participant} stopped")
+                return cls._status_unlocked(joined=True) | {"stopped": False}
+            return cls._close_unlocked(
+                reason=f"last participant {participant} stopped",
+                raise_on_error=True,
+            )
 
     @classmethod
     def force_stop(cls, *, reason: str) -> None:
@@ -201,6 +215,25 @@ class ProcessProfilerSession:
         with cls._lock:
             if cls._run_id is not None:
                 cls._close_unlocked(reason=reason)
+
+    @classmethod
+    def _status_unlocked(cls, *, joined: bool) -> dict:
+        recorder = get_recorder()
+        return {
+            "run_id": cls._run_id,
+            "pid": os.getpid(),
+            "rank": os.environ.get("RANK", "0"),
+            "process": multiprocessing.current_process().name,
+            "thread_id": threading.get_ident(),
+            "thread_name": threading.current_thread().name,
+            "participants": sorted(cls._participants),
+            "joined_existing": joined,
+            "torch_enabled": cls._enable_torch,
+            "torch_active": TorchProfiler.is_active(),
+            "event_path": recorder.active_path(),
+            "cuda_sync_debug_mode": cls._cuda_sync_debug_mode,
+            "cuda_sync_debug_applied": cls._cuda_sync_debug_applied,
+        }
 
     @classmethod
     def _set_cuda_sync_debug_unlocked(
@@ -233,9 +266,17 @@ class ProcessProfilerSession:
         cls._cuda_sync_debug_applied = True
 
     @classmethod
-    def _close_unlocked(cls, *, reason: str) -> None:
+    def _close_unlocked(
+        cls,
+        *,
+        reason: str,
+        raise_on_error: bool = False,
+    ) -> dict:
         run_id = cls._run_id
         participants = sorted(cls._participants)
+        trace_result: dict | None = None
+        event_path: str | None = None
+        errors: list[str] = []
 
         # Reset the process-global detector before profiler export or other
         # teardown work can create diagnostic self-hits.
@@ -243,6 +284,7 @@ class ProcessProfilerSession:
             try:
                 torch.cuda.set_sync_debug_mode("default")
             except Exception:
+                errors.append("failed to reset CUDA sync-debug")
                 logger.warning(
                     "Failed to reset CUDA sync-debug for run_id=%s pid=%d",
                     run_id,
@@ -251,9 +293,14 @@ class ProcessProfilerSession:
                 )
 
         try:
-            if cls._enable_torch and TorchProfiler.is_active():
-                TorchProfiler.stop(run_id=run_id)
-        except Exception:
+            if cls._enable_torch:
+                if not TorchProfiler.is_active():
+                    raise RuntimeError("Torch profiler is not active at session stop")
+                trace_result = TorchProfiler.stop(run_id=run_id)
+                if trace_result is None:
+                    raise RuntimeError("Torch profiler did not finalize a trace")
+        except Exception as exc:
+            errors.append(str(exc))
             logger.warning(
                 "Failed to stop Torch profiler for run_id=%s pid=%d",
                 run_id,
@@ -266,8 +313,9 @@ class ProcessProfilerSession:
             if recorder.is_active() and (
                 run_id is None or recorder.active_run_id() == run_id
             ):
-                recorder.stop(run_id=run_id)
-        except Exception:
+                event_path = recorder.stop(run_id=run_id)
+        except Exception as exc:
+            errors.append(str(exc))
             logger.warning(
                 "Failed to stop request event recorder for run_id=%s pid=%d",
                 run_id,
@@ -295,3 +343,20 @@ class ProcessProfilerSession:
             participants,
             reason,
         )
+        result = {
+            "run_id": run_id,
+            "pid": os.getpid(),
+            "rank": os.environ.get("RANK", "0"),
+            "process": multiprocessing.current_process().name,
+            "thread_id": threading.get_ident(),
+            "thread_name": threading.current_thread().name,
+            "participants": participants,
+            "stopped": True,
+            "reason": reason,
+            "trace": None if trace_result is None else trace_result.get("trace"),
+            "event_path": event_path,
+            "errors": errors,
+        }
+        if errors and raise_on_error:
+            raise RuntimeError("; ".join(errors))
+        return result

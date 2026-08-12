@@ -45,6 +45,7 @@ from sglang_omni.models.model_capabilities import get_model_capabilities
 from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
+from sglang_omni.proto.admin import ADMIN_PROFILER_START, ADMIN_PROFILER_STOP
 from sglang_omni.serve.openai_api import create_app
 from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 from sglang_omni.utils.gpu_compat import apply_gpu_compat_env_defaults
@@ -57,6 +58,8 @@ from sglang_omni.utils.gpu_memory import (
 logger = logging.getLogger(__name__)
 
 _HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+_PROFILER_START_TIMEOUT_S = 300.0
+_PROFILER_STOP_TIMEOUT_S = 600.0
 
 
 class _PipelineUvicornServer(uvicorn.Server):
@@ -231,6 +234,17 @@ class ProfilerStartConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cuda_sync_debug_mode: Literal["default", "warn", "error"] = "default"
+    target_stage: str | None = None
+
+    @field_validator("target_stage")
+    @classmethod
+    def _validate_target_stage(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("target_stage must not be empty")
+        return normalized
 
 
 class StartReq(BaseModel):
@@ -262,9 +276,40 @@ def _default_event_dir(profiler_dir: str, run_id: str) -> str:
 
 
 def _mount_profiler_routes(
-    app, profiler_ctl: ProfilerControlClient, profiler_dir: str | None
+    app,
+    profiler_ctl: ProfilerControlClient,
+    profiler_dir: str | None,
+    coordinator: Any | None = None,
 ) -> None:
     router = APIRouter()
+    targeted_runs: dict[str, str] = {}
+
+    def stop_coordinator_events(run_id: str) -> None:
+        recorder = _get_event_recorder()
+        if recorder.is_active() and recorder.active_run_id() == run_id:
+            recorder.stop(run_id=run_id)
+
+    async def rollback_targeted_start(run_id: str, target_stage: str) -> None:
+        if coordinator is None:
+            return
+        try:
+            await coordinator.admin(
+                ADMIN_PROFILER_STOP,
+                {
+                    "run_id": run_id,
+                    "participant": target_stage,
+                    "_admin_timeout_s": _PROFILER_STOP_TIMEOUT_S,
+                },
+                stages=[target_stage],
+                timeout_s=_PROFILER_STOP_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to roll back targeted profiler start run_id=%s stage=%s",
+                run_id,
+                target_stage,
+                exc_info=True,
+            )
 
     @router.post("/start_profile")
     async def start(req: StartReq):
@@ -295,6 +340,32 @@ def _mount_profiler_routes(
                     ),
                 )
             tpl = req.trace_path_template or ""
+        target_stage = req.config.target_stage
+        if targeted_runs and target_stage is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "a targeted profiler run is active; stop it before using "
+                    "broadcast profiling"
+                ),
+            )
+        if target_stage is not None:
+            if coordinator is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="target_stage profiling requires a running coordinator",
+                )
+            if targeted_runs:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "a targeted profiler run is already active: "
+                        f"{sorted(targeted_runs)}"
+                    ),
+                )
+            # Reserve before the first await so concurrent HTTP starts cannot
+            # both acquire the one process-global profiler session.
+            targeted_runs[run_id] = target_stage
         if event_dir is not None:
             try:
                 _get_event_recorder().start(
@@ -305,24 +376,66 @@ def _mount_profiler_routes(
                     "Failed to start coordinator request event recorder",
                     exc_info=True,
                 )
-        await profiler_ctl.broadcast_start(
-            run_id=run_id,
-            trace_path_template=tpl,
-            cuda_sync_debug_mode=req.config.cuda_sync_debug_mode,
-            event_dir=event_dir,
-            enable_torch=req.enable_torch,
-        )
-        return {
+        acknowledgement = None
+        if target_stage is None:
+            await profiler_ctl.broadcast_start(
+                run_id=run_id,
+                trace_path_template=tpl,
+                cuda_sync_debug_mode=req.config.cuda_sync_debug_mode,
+                event_dir=event_dir,
+                enable_torch=req.enable_torch,
+            )
+        else:
+            payload = {
+                "run_id": run_id,
+                "participant": target_stage,
+                "trace_path_template": tpl,
+                "event_dir": event_dir,
+                "enable_torch": req.enable_torch,
+                "cuda_sync_debug_mode": req.config.cuda_sync_debug_mode,
+                "_admin_timeout_s": _PROFILER_START_TIMEOUT_S,
+            }
+            try:
+                acknowledgement = await coordinator.admin(
+                    ADMIN_PROFILER_START,
+                    payload,
+                    stages=[target_stage],
+                    timeout_s=_PROFILER_START_TIMEOUT_S,
+                )
+            except ValueError as exc:
+                targeted_runs.pop(run_id, None)
+                stop_coordinator_events(run_id)
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                await rollback_targeted_start(run_id, target_stage)
+                targeted_runs.pop(run_id, None)
+                stop_coordinator_events(run_id)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            if not acknowledgement.get("success", False):
+                await rollback_targeted_start(run_id, target_stage)
+                targeted_runs.pop(run_id, None)
+                stop_coordinator_events(run_id)
+                raise HTTPException(status_code=500, detail=acknowledgement)
+
+        response = {
             "run_id": run_id,
             "trace_path_template": tpl,
             "event_dir": event_dir,
             "enable_torch": req.enable_torch,
-            "config": req.config.model_dump(),
+            "config": req.config.model_dump(exclude_none=True),
         }
+        if acknowledgement is not None:
+            response["acknowledgement"] = acknowledgement
+        return response
 
     @router.post("/start_request_profile")
     async def start_request(req: StartRequestProfileReq):
         """Start request-level (JSONL) event profiling only (no torch trace)."""
+        if targeted_runs:
+            raise HTTPException(
+                status_code=409,
+                detail="stop the targeted profiler run before request-only profiling",
+            )
         run_id = req.run_id or _default_run_id()
         event_dir = req.event_dir
         if event_dir is None:
@@ -359,6 +472,39 @@ def _mount_profiler_routes(
         run_id = req.run_id
         recorder = _get_event_recorder()
         active = recorder.active_run_id() if recorder.is_active() else None
+        resolved_run_id = run_id or active
+        if resolved_run_id is None and len(targeted_runs) == 1:
+            resolved_run_id = next(iter(targeted_runs))
+        target_stage = (
+            None if resolved_run_id is None else targeted_runs.get(resolved_run_id)
+        )
+        if target_stage is not None:
+            assert coordinator is not None
+            try:
+                acknowledgement = await coordinator.admin(
+                    ADMIN_PROFILER_STOP,
+                    {
+                        "run_id": resolved_run_id,
+                        "participant": target_stage,
+                        "_admin_timeout_s": _PROFILER_STOP_TIMEOUT_S,
+                    },
+                    stages=[target_stage],
+                    timeout_s=_PROFILER_STOP_TIMEOUT_S,
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            if not acknowledgement.get("success", False):
+                stop_coordinator_events(resolved_run_id)
+                targeted_runs.pop(resolved_run_id, None)
+                raise HTTPException(status_code=500, detail=acknowledgement)
+            targeted_runs.pop(resolved_run_id, None)
+            stop_coordinator_events(resolved_run_id)
+            return {
+                "run_id": resolved_run_id,
+                "acknowledgement": acknowledgement,
+                "artifacts_finalized": True,
+            }
+
         if recorder.is_active() and (run_id is None or active == run_id):
             recorder.stop(run_id=active)
         await profiler_ctl.broadcast_stop(run_id=run_id)
@@ -367,6 +513,11 @@ def _mount_profiler_routes(
     @router.post("/stop_request_profile")
     async def stop_request(req: StopReq):
         """Stop request-level event profiling."""
+        if targeted_runs:
+            raise HTTPException(
+                status_code=409,
+                detail="use /stop_profile to stop the targeted profiler run",
+            )
         run_id = req.run_id
         recorder = _get_event_recorder()
         active = recorder.active_run_id() if recorder.is_active() else None
@@ -455,7 +606,7 @@ async def _run_server(
         )
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
-        _mount_profiler_routes(app, profiler_ctl, profiler_dir)
+        _mount_profiler_routes(app, profiler_ctl, profiler_dir, coordinator)
 
         config = uvicorn.Config(
             app,

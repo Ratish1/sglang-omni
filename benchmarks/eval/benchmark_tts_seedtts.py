@@ -173,14 +173,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import json
 import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
 from benchmarks.benchmarker.utils import managed_omni_server
-from benchmarks.dataset.seedtts import load_seedtts_samples
+from benchmarks.dataset.seedtts import SampleInput, load_seedtts_samples
 from benchmarks.metrics.performance import (
     build_speed_results,
     compute_speed_metrics,
@@ -238,6 +241,12 @@ class TtsSeedttsBenchmarkConfig:
     # clients replay DISJOINT dataset shards (offset i*max_samples) so shared
     # radix/fingerprint caches don't inflate multi-client throughput.
     sample_offset: int = 0
+    # Reuse an exact, content-verified sample order from an earlier run.
+    sample_manifest: str | None = None
+    # Omit reference-audio identities already present in another manifest.
+    exclude_reference_manifest: str | None = None
+    # Select the first N rows whose reference-audio content hashes are unique.
+    unique_reference_audio: bool = False
     max_new_tokens: int | None = 2048
     token_count: int | str | None = None
     temperature: float | None = None
@@ -303,6 +312,9 @@ def _build_results_config(
         "stream": config.stream,
         "max_samples": config.max_samples,
         "sample_offset": config.sample_offset,
+        "sample_manifest": config.sample_manifest,
+        "exclude_reference_manifest": config.exclude_reference_manifest,
+        "unique_reference_audio": config.unique_reference_audio,
         "max_new_tokens": config.max_new_tokens,
         "seed": config.seed,
         "token_count": config.token_count,
@@ -316,6 +328,238 @@ def _build_results_config(
     }
 
 
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _sha256_text(value: str) -> str:
+    return _sha256_bytes(value.encode("utf-8"))
+
+
+def _reference_sha256(sample: SampleInput) -> str:
+    with open(sample.ref_audio, "rb") as stream:
+        return _sha256_bytes(stream.read())
+
+
+def _manifest_payload(
+    config: TtsSeedttsBenchmarkConfig,
+    samples: list[SampleInput],
+) -> dict[str, Any]:
+    entries = []
+    for order, sample in enumerate(samples):
+        entries.append(
+            {
+                "order": order,
+                "sample_id": sample.sample_id,
+                "reference_sha256": _reference_sha256(sample),
+                "ref_text_sha256": _sha256_text(sample.ref_text),
+                "target_text_sha256": _sha256_text(sample.target_text),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "source": config.meta,
+        "split": config.lang,
+        "selection": {
+            "sample_offset": config.sample_offset,
+            "max_samples": config.max_samples,
+            "unique_reference_audio": config.unique_reference_audio,
+            "replayed_manifest_sha256": _linked_manifest_sha256(config.sample_manifest),
+            "excluded_reference_manifest_sha256": _linked_manifest_sha256(
+                config.exclude_reference_manifest
+            ),
+        },
+        "entries": entries,
+    }
+
+
+def _canonical_manifest_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _linked_manifest_sha256(path: str | None) -> str | None:
+    if path is None:
+        return None
+    manifest_path = Path(path).expanduser().resolve()
+    document = _read_verified_manifest(manifest_path)
+    return str(document["manifest_sha256"])
+
+
+def _write_input_manifest(
+    config: TtsSeedttsBenchmarkConfig,
+    samples: list[SampleInput],
+) -> str:
+    payload = _manifest_payload(config, samples)
+    payload["manifest_sha256"] = _sha256_bytes(_canonical_manifest_bytes(payload))
+    output_path = Path(config.output_dir).expanduser().resolve() / "input_manifest.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return str(output_path)
+
+
+def _load_manifest_samples(
+    config: TtsSeedttsBenchmarkConfig,
+) -> list[SampleInput]:
+    if config.sample_offset:
+        raise ValueError("--sample-offset cannot be combined with --sample-manifest")
+    if config.unique_reference_audio:
+        raise ValueError(
+            "--unique-reference-audio cannot be combined with --sample-manifest"
+        )
+    if config.exclude_reference_manifest:
+        raise ValueError(
+            "--exclude-reference-manifest cannot be combined with --sample-manifest"
+        )
+
+    manifest_path = Path(config.sample_manifest or "").expanduser().resolve()
+    document = _read_verified_manifest(manifest_path)
+    if document.get("source") != config.meta or document.get("split") != config.lang:
+        raise ValueError(
+            "Sample manifest source/split does not match --meta and --lang"
+        )
+
+    entries = document.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Sample manifest must contain a non-empty entries list")
+    if config.max_samples is not None and config.max_samples != len(entries):
+        raise ValueError(
+            "--max-samples must be omitted or equal the sample manifest length"
+        )
+
+    all_samples = load_seedtts_samples(config.meta, None, split=config.lang)
+    by_id = {sample.sample_id: sample for sample in all_samples}
+    if len(by_id) != len(all_samples):
+        raise ValueError("SeedTTS source contains duplicate sample_id values")
+
+    selected = []
+    seen_ids: set[str] = set()
+    for expected_order, entry in enumerate(entries):
+        if not isinstance(entry, dict) or entry.get("order") != expected_order:
+            raise ValueError(
+                "Sample manifest entries must have contiguous order values"
+            )
+        sample_id = str(entry.get("sample_id") or "")
+        if not sample_id or sample_id in seen_ids:
+            raise ValueError("Sample manifest contains an empty or duplicate sample_id")
+        seen_ids.add(sample_id)
+        sample = by_id.get(sample_id)
+        if sample is None:
+            raise ValueError(f"Sample manifest id not found in dataset: {sample_id}")
+        observed = {
+            "reference_sha256": _reference_sha256(sample),
+            "ref_text_sha256": _sha256_text(sample.ref_text),
+            "target_text_sha256": _sha256_text(sample.target_text),
+        }
+        for key, value in observed.items():
+            if entry.get(key) != value:
+                raise ValueError(
+                    f"Sample manifest content mismatch for {sample_id}: {key}"
+                )
+        selected.append(sample)
+    return selected
+
+
+def _read_verified_manifest(manifest_path: Path) -> dict[str, Any]:
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if document.get("schema_version") != 1:
+        raise ValueError(f"Unsupported sample manifest schema: {manifest_path}")
+    expected_hash = document.get("manifest_sha256")
+    unsigned = dict(document)
+    unsigned.pop("manifest_sha256", None)
+    actual_hash = _sha256_bytes(_canonical_manifest_bytes(unsigned))
+    if expected_hash != actual_hash:
+        raise ValueError(
+            f"Sample manifest checksum mismatch: expected {expected_hash}, got {actual_hash}"
+        )
+    return document
+
+
+def _excluded_reference_hashes(config: TtsSeedttsBenchmarkConfig) -> set[str]:
+    if config.exclude_reference_manifest is None:
+        return set()
+    manifest_path = Path(config.exclude_reference_manifest).expanduser().resolve()
+    document = _read_verified_manifest(manifest_path)
+    if document.get("source") != config.meta or document.get("split") != config.lang:
+        raise ValueError(
+            "Excluded manifest source/split does not match --meta and --lang"
+        )
+    entries = document.get("entries")
+    if not isinstance(entries, list):
+        raise TypeError("Excluded manifest has no entries list")
+    return {
+        str(entry["reference_sha256"])
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("reference_sha256")
+    }
+
+
+def _select_benchmark_samples(
+    config: TtsSeedttsBenchmarkConfig,
+) -> list[SampleInput]:
+    if config.sample_offset < 0:
+        raise ValueError(
+            f"--sample-offset must be non-negative, got {config.sample_offset}"
+        )
+    if config.sample_manifest is not None:
+        return _load_manifest_samples(config)
+    excluded_references = _excluded_reference_hashes(config)
+    if config.unique_reference_audio:
+        candidates = load_seedtts_samples(config.meta, None, split=config.lang)[
+            config.sample_offset :
+        ]
+        selected = []
+        seen_references: set[str] = set()
+        for sample in candidates:
+            reference_hash = _reference_sha256(sample)
+            if (
+                reference_hash in excluded_references
+                or reference_hash in seen_references
+            ):
+                continue
+            seen_references.add(reference_hash)
+            selected.append(sample)
+            if config.max_samples is not None and len(selected) >= config.max_samples:
+                break
+        if config.max_samples is not None and len(selected) != config.max_samples:
+            raise ValueError(
+                f"Requested {config.max_samples} unique references, found {len(selected)}"
+            )
+        return selected
+    if excluded_references:
+        candidates = load_seedtts_samples(config.meta, None, split=config.lang)[
+            config.sample_offset :
+        ]
+        selected = [
+            sample
+            for sample in candidates
+            if _reference_sha256(sample) not in excluded_references
+        ]
+        if config.max_samples is not None:
+            selected = selected[: config.max_samples]
+            if len(selected) != config.max_samples:
+                raise ValueError(
+                    f"Requested {config.max_samples} samples after reference "
+                    f"exclusion, found {len(selected)}"
+                )
+        return selected
+    if config.sample_offset:
+        head = config.sample_offset + (config.max_samples or 0)
+        return load_seedtts_samples(
+            config.meta,
+            head if config.max_samples else None,
+            split=config.lang,
+        )[config.sample_offset :]
+    return load_seedtts_samples(config.meta, config.max_samples, split=config.lang)
+
+
 async def run_tts_seedtts_benchmark(
     config: TtsSeedttsBenchmarkConfig,
 ) -> dict:
@@ -326,25 +570,13 @@ async def run_tts_seedtts_benchmark(
     base_url = build_base_url(config)
     api_url = f"{base_url}/v1/audio/speech"
 
-    # Note (Jiaxin Deng): a negative offset would silently slice from the end
-    # instead of skipping the first N, contaminating the shard it claims to take.
-    if config.sample_offset < 0:
-        raise ValueError(
-            f"--sample-offset must be non-negative, got {config.sample_offset}"
-        )
-    if config.sample_offset:
-        head = config.sample_offset + (config.max_samples or 0)
-        samples = load_seedtts_samples(
-            config.meta, head if config.max_samples else None, split=config.lang
-        )[config.sample_offset :]
-    else:
-        samples = load_seedtts_samples(
-            config.meta, config.max_samples, split=config.lang
-        )
+    samples = _select_benchmark_samples(config)
     logger.info(f"Prepared {len(samples)} requests (offset {config.sample_offset})")
 
     save_audio_dir = os.path.abspath(os.path.join(config.output_dir, "audio"))
     os.makedirs(save_audio_dir, exist_ok=True)
+    manifest_path = _write_input_manifest(config, samples)
+    logger.info("Wrote exact input manifest to %s", manifest_path)
 
     generation_kwargs = _build_generation_kwargs(config)
     send_fn = make_tts_send_fn(
@@ -440,6 +672,9 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         output_dir=args.output_dir,
         max_samples=args.max_samples,
         sample_offset=args.sample_offset,
+        sample_manifest=args.sample_manifest,
+        exclude_reference_manifest=args.exclude_reference_manifest,
+        unique_reference_audio=args.unique_reference_audio,
         max_new_tokens=args.max_new_tokens,
         token_count=args.token_count,
         temperature=args.temperature,
@@ -563,6 +798,37 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=str, default="results/tts_seedtts")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--sample-offset", type=int, default=0)
+    parser.add_argument(
+        "--sample-manifest",
+        type=str,
+        default=None,
+        help=(
+            "Replay an input_manifest.json exactly, verifying sample order and "
+            "reference/text content hashes before sending requests."
+        ),
+    )
+    parser.add_argument(
+        "--unique-reference-audio",
+        action="store_true",
+        help=(
+            "Select only rows with distinct reference-audio content. Useful for "
+            "a pure reference-cache-miss workload."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-reference-manifest",
+        type=str,
+        default=None,
+        help=(
+            "Exclude reference-audio content hashes listed in another verified "
+            "input manifest. Useful for disjoint graph/allocator warmup traffic."
+        ),
+    )
+    parser.add_argument(
+        "--prepare-manifest-only",
+        action="store_true",
+        help="Resolve inputs and write input_manifest.json without sending requests.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument(
         "--token-count",
@@ -753,6 +1019,12 @@ def main() -> None:
         )
     config = _config_from_args(args)
     wait_for_gpu_release = not args.skip_gpu_cleanup
+
+    if args.prepare_manifest_only:
+        samples = _select_benchmark_samples(config)
+        manifest_path = _write_input_manifest(config, samples)
+        logger.info("Prepared %d samples in %s", len(samples), manifest_path)
+        return
 
     if args.save_audio:
         logger.info("--save-audio is a no-op: the unified benchmark always saves WAVs.")

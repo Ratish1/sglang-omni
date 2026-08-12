@@ -23,15 +23,38 @@ logger = logging.getLogger(__name__)
 class TorchProfiler(ProfilerBase):
     """
     Torch-based profiler configured for End-to-End continuous recording.
-    Uses 'on_trace_ready' to handle Trace export.
-    Compression is offloaded to a background subprocess to avoid blocking the worker loop.
+    Uses ``on_trace_ready`` to export exactly one finalized gzip artifact.
+
+    ``stop`` intentionally waits for export and compression.  The profiler
+    control response is an artifact-completion acknowledgement, so returning
+    while a background gzip still owns the JSON would be incorrect.
     """
 
     _profiler: profile | None = None
     _trace_template: str = ""
 
     _active_run_id: str | None = None
+    _export_result: dict | None = None
+    _export_error: Exception | None = None
+    _trace_handler_called: bool = False
     _lock = threading.Lock()
+
+    @classmethod
+    def _export_trace(cls, profiler: profile, json_path: str, rank: int) -> None:
+        """Export and compress one trace, recording rather than hiding errors."""
+        if cls._trace_handler_called:
+            return
+        cls._trace_handler_called = True
+        try:
+            profiler.export_chrome_trace(json_path)
+            logger.info("[Rank %s] Trace exported to %s", rank, json_path)
+            subprocess.run(["gzip", "-f", json_path], check=True)
+            gz_path = f"{json_path}.gz"
+            cls._export_result = {"trace": gz_path, "table": None}
+            logger.info("[Rank %s] Trace compression completed: %s", rank, gz_path)
+        except Exception as exc:
+            cls._export_error = exc
+            logger.warning("[Rank %s] Failed to export trace: %s", rank, exc)
 
     @classmethod
     def get_active_run_id(cls) -> str | None:
@@ -70,6 +93,9 @@ class TorchProfiler(ProfilerBase):
             trace_path_template = os.path.abspath(trace_path_template)
             cls._trace_template = trace_path_template
             cls._active_run_id = run_id
+            cls._export_result = None
+            cls._export_error = None
+            cls._trace_handler_called = False
 
             # Expected paths
             json_file = f"{trace_path_template}_rank{rank}.trace.json"
@@ -80,29 +106,10 @@ class TorchProfiler(ProfilerBase):
                 "[Rank %s] Starting End-to-End Torch profiler (run_id=%s)", rank, run_id
             )
 
-            # 3. Define the on_trace_ready handler
-            def trace_handler(p):
-                nonlocal json_file
-
-                # A. Export JSON Trace
-                try:
-                    p.export_chrome_trace(json_file)
-                    logger.info(f"[Rank {rank}] Trace exported to {json_file}")
-
-                    try:
-                        subprocess.Popen(["gzip", "-f", json_file])
-                        logger.info(
-                            f"[Rank {rank}] Triggered background compression for {json_file}"
-                        )
-                        # Update variable to point to the eventual file
-                        json_file = f"{json_file}.gz"
-                    except Exception as compress_err:
-                        logger.warning(
-                            f"[Rank {rank}] Background gzip failed to start: {compress_err}"
-                        )
-
-                except Exception as e:
-                    logger.warning(f"[Rank {rank}] Failed to export trace: {e}")
+            # 3. Define the on_trace_ready handler.  Some Torch versions invoke
+            # it from stop() even without a schedule; older versions do not.
+            def trace_handler(profiler):
+                cls._export_trace(profiler, json_file, rank)
 
             # No ``schedule``: record continuously between start/stop.
             # Expensive flags are env-var opt-in (default off keeps the
@@ -156,35 +163,33 @@ class TorchProfiler(ProfilerBase):
             try:
                 profiler.stop()
             except Exception as e:
-                logger.warning("[Rank %s] Profiler stop failed: %s", rank, e)
+                cls._export_error = e
 
-            # No schedule → on_trace_ready isn't fired on stop, so
-            # export here.
-            try:
-                os.makedirs(os.path.dirname(json_path), exist_ok=True)
-                profiler.export_chrome_trace(json_path)
-                logger.info("[Rank %s] Trace exported to %s", rank, json_path)
-                try:
-                    subprocess.Popen(["gzip", "-f", json_path])
-                    logger.info(
-                        "[Rank %s] Triggered background compression for %s",
-                        rank,
-                        json_path,
-                    )
-                except Exception as compress_err:
-                    logger.warning(
-                        "[Rank %s] Background gzip failed: %s",
-                        rank,
-                        compress_err,
-                    )
-            except Exception as e:
-                logger.warning("[Rank %s] Failed to export trace: %s", rank, e)
+            # Torch 2.11 invokes on_trace_ready from stop() even without a
+            # schedule. Older builds may not, so use the handler exactly once
+            # as a compatibility fallback instead of unconditionally exporting
+            # a second time.
+            if not cls._trace_handler_called and cls._export_error is None:
+                cls._export_trace(profiler, json_path, rank)
 
+            result = cls._export_result
+            error = cls._export_error
             cls._profiler = None
             cls._active_run_id = None
             cls._trace_template = ""
+            cls._export_result = None
+            cls._export_error = None
+            cls._trace_handler_called = False
 
-            return {"trace": gz_path, "table": None}
+            if error is not None:
+                raise RuntimeError(
+                    f"Torch profiler export failed for run_id={active}: {error}"
+                ) from error
+            if result is None or not os.path.isfile(gz_path):
+                raise RuntimeError(
+                    f"Torch profiler produced no finalized trace for run_id={active}"
+                )
+            return result
 
     @classmethod
     def step(cls):

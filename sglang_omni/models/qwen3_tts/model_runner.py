@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.sglang_execution import attn_forward_context
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
+from sglang_omni.models.qwen3_tts.request_builders import qwen3_tts_profiling_snapshot
 from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.scheduling.types import RequestOutput
 
@@ -21,6 +22,23 @@ class Qwen3TTSModelRunner(ModelRunner):
     def __init__(self, tp_worker: Any, output_processor: Any):
         super().__init__(tp_worker, output_processor)
         self._has_pending_code_step = False
+
+    def profiling_snapshot(self) -> dict[str, Any]:
+        """Return Qwen3-TTS cache and lazy predictor-graph state."""
+        model = self.model
+        snapshot = qwen3_tts_profiling_snapshot()
+        snapshot["predictor_graph"] = {
+            "enabled": model._predictor_graph_enabled,
+            "configured_batch_sizes": list(model._predictor_graph_batch_sizes),
+            "captured_keys": [
+                list(key) for key in sorted(model._predictor_graphs, key=repr)
+            ],
+            "disabled_keys": [
+                list(key) for key in sorted(model._predictor_graph_disabled, key=repr)
+            ],
+            "failure_count": int(model._predictor_graph_failure_count),
+        }
+        return snapshot
 
     def before_prefill(
         self,

@@ -97,7 +97,8 @@ current multi-process launcher path does not mount them.
   "event_dir": "/tmp/profiles/demo-run/events",            // request-event JSONL dir (optional)
   "enable_torch": true,                                    // set false to skip torch trace
   "config": {
-    "cuda_sync_debug_mode": "default"                      // default | warn | error
+    "cuda_sync_debug_mode": "default",                     // default | warn | error
+    "target_stage": "tts_engine"                           // optional acknowledged owner
   }
 }
 ```
@@ -107,6 +108,12 @@ traffic. It is applied only in CUDA-owning stage processes after startup and is
 reset before profiler export. `warn` is appropriate for discovery; `error` can
 abort a request and should be used only for localization. Unknown config keys
 or modes are rejected.
+
+With `target_stage`, start/stop use the coordinator's acknowledged stage-admin
+path. Profiling begins on the target rank's scheduler thread, and stop returns
+only after trace compression completes. The response includes per-rank session
+ownership and start/stop cache/graph snapshots. Omitting `target_stage` keeps the
+legacy asynchronous broadcast behavior.
 
 `/stop_profile` and `/stop_request_profile` both accept an optional
 `run_id`. Omitting it is a wildcard: every stage stops whatever profiler

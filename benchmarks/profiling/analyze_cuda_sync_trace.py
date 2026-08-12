@@ -26,13 +26,15 @@ import json
 import math
 import re
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, TextIO
+from typing import Any, TextIO
 
 _TRACE_EVENTS_KEY = '"traceEvents"'
 _DEFAULT_CHUNK_SIZE = 1024 * 1024
 _MAX_EVENT_JSON_SIZE = 64 * 1024 * 1024
+_API_TIMESTAMP_EPSILON_US = 1e-3
 _SEMANTIC_RANGE_PREFIX = "qwen3_tts."
 _TARGET_CPU_OPS = {
     "aten::to",
@@ -88,6 +90,40 @@ class _QueueTimeline:
         if index < 0:
             return None
         return self.prefix_max_gpu_end_us[index]
+
+
+@dataclass(frozen=True, slots=True)
+class _BusyTimeline:
+    starts_us: tuple[float, ...]
+    ends_us: tuple[float, ...]
+
+    def idle_between(self, start_us: float, end_us: float) -> float:
+        """Return time not covered by any GPU event in a bounded interval."""
+        if end_us <= start_us:
+            return 0.0
+        index = bisect.bisect_right(self.ends_us, start_us)
+        busy_us = 0.0
+        cursor = start_us
+        while index < len(self.starts_us) and self.starts_us[index] < end_us:
+            interval_start = max(start_us, self.starts_us[index])
+            interval_end = min(end_us, self.ends_us[index])
+            if interval_end > max(cursor, interval_start):
+                busy_us += interval_end - max(cursor, interval_start)
+                cursor = interval_end
+            index += 1
+        return max(0.0, end_us - start_us - busy_us)
+
+    def idle_immediately_before(self, end_us: float, *, floor_us: float) -> float:
+        """Return the final globally idle segment ending at ``end_us``."""
+        if end_us <= floor_us:
+            return 0.0
+        index = bisect.bisect_left(self.starts_us, end_us) - 1
+        if index < 0:
+            return end_us - floor_us
+        prior_end = self.ends_us[index]
+        if prior_end >= end_us:
+            return 0.0
+        return max(0.0, end_us - max(floor_us, prior_end))
 
 
 def _open_trace(path: Path) -> TextIO:
@@ -224,7 +260,7 @@ def _is_sync_api(event: TraceEvent) -> bool:
     name = event.name.lower()
     category = event.category.lower()
     return (
-        (name.startswith("cuda") or name.startswith("hip"))
+        name.startswith(("cuda", "hip"))
         and "synchronize" in name
         and ("runtime" in category or "driver" in category or not category)
     )
@@ -238,6 +274,15 @@ def _is_runtime_launch(event: TraceEvent) -> bool:
         and not _is_sync_api(event)
         and any(token in name for token in _RUNTIME_LAUNCH_TOKENS)
     )
+
+
+def _is_runtime_api(event: TraceEvent) -> bool:
+    category = event.category.lower()
+    return "runtime" in category or "driver" in category
+
+
+def _is_async_runtime_memcpy(event: TraceEvent) -> bool:
+    return "memcpyasync" in event.name.lower()
 
 
 def _is_gpu_event(event: TraceEvent) -> bool:
@@ -300,6 +345,19 @@ def _build_queue_timeline(records: Iterable[HostLaunch]) -> _QueueTimeline:
         max_end = max(max_end, record.gpu.end_us)
         prefix_max.append(max_end)
     return _QueueTimeline(tuple(times), tuple(prefix_max))
+
+
+def _build_busy_timeline(events: Iterable[TraceEvent]) -> _BusyTimeline:
+    ordered = sorted(events, key=lambda event: (event.ts_us, event.end_us))
+    starts: list[float] = []
+    ends: list[float] = []
+    for event in ordered:
+        if not starts or event.ts_us > ends[-1]:
+            starts.append(event.ts_us)
+            ends.append(event.end_us)
+        else:
+            ends[-1] = max(ends[-1], event.end_us)
+    return _BusyTimeline(tuple(starts), tuple(ends))
 
 
 def _choose_correlated_gpu(
@@ -424,13 +482,21 @@ def analyze_trace(
     *,
     max_python_depth: int = 16,
     max_transfer_gap_us: float = 10_000.0,
+    max_blocking_copy_gap_us: float = 50.0,
 ) -> list[dict[str, Any]]:
-    """Return one attribution record per host-blocking CUDA sync API event."""
+    """Return one attribution record per host-blocking CUDA sync API event.
+
+    A pageable blocking copy is represented by two CUDA runtime events in a
+    Kineto trace: ``cudaMemcpyAsync`` followed by
+    ``cudaStreamSynchronize``.  The compound interval starts at the memcpy API
+    entry, not at the synchronization API entry.
+    """
     trace_path = Path(path).expanduser().resolve()
     syncs: list[TraceEvent] = []
     gpu_events: list[TraceEvent] = []
     gpu_copies: list[TraceEvent] = []
     runtime_launches: list[TraceEvent] = []
+    runtime_calls: list[TraceEvent] = []
     gpu_by_correlation: dict[int | str, list[TraceEvent]] = defaultdict(list)
     copies_by_correlation: dict[int | str, list[TraceEvent]] = defaultdict(list)
 
@@ -440,6 +506,8 @@ def analyze_trace(
             continue
         if _is_sync_api(event):
             syncs.append(event)
+        if _is_runtime_api(event):
+            runtime_calls.append(event)
         if _is_runtime_launch(event):
             runtime_launches.append(event)
         if _is_gpu_event(event):
@@ -467,6 +535,16 @@ def analyze_trace(
             host_launches_by_thread[launch.thread_key].append(HostLaunch(launch, gpu))
     for records in host_launches_by_thread.values():
         records.sort(key=lambda record: record.host.ts_us)
+
+    runtime_calls_by_thread: dict[tuple[int | str, int | str], list[TraceEvent]] = (
+        defaultdict(list)
+    )
+    for event in runtime_calls:
+        runtime_calls_by_thread[event.thread_key].append(event)
+    runtime_starts_by_thread: dict[tuple[int | str, int | str], list[float]] = {}
+    for thread_key, events in runtime_calls_by_thread.items():
+        events.sort(key=lambda event: event.ts_us)
+        runtime_starts_by_thread[thread_key] = [event.ts_us for event in events]
 
     queue_records: dict[
         tuple[tuple[int | str, int | str], str | None], list[HostLaunch]
@@ -497,11 +575,33 @@ def analyze_trace(
         events.sort(key=lambda event: event.end_us)
         gpu_end_times_by_device[device] = [event.end_us for event in events]
     known_devices = {device for device in gpu_by_device if device is not None}
+    busy_timelines_by_device = {
+        device: _build_busy_timeline(events) for device, events in gpu_by_device.items()
+    }
 
     occurrences: list[dict[str, Any]] = []
     for index, (sync, context) in enumerate(zip(syncs, contexts, strict=True)):
         parent = _nearest_enclosing(context.cpu_ops)
         semantic_range = _nearest_enclosing(context.semantic_ranges)
+
+        preceding_memcpy = None
+        preceding_memcpy_gpu = None
+        runtime_events = runtime_calls_by_thread.get(sync.thread_key, [])
+        runtime_starts = runtime_starts_by_thread.get(sync.thread_key, [])
+        preceding_index = bisect.bisect_left(runtime_starts, sync.ts_us) - 1
+        if preceding_index >= 0 and "streamsynchronize" in sync.name.lower():
+            candidate = runtime_events[preceding_index]
+            api_gap_us = sync.ts_us - candidate.end_us
+            if (
+                _is_async_runtime_memcpy(candidate)
+                and -_API_TIMESTAMP_EPSILON_US <= api_gap_us <= max_blocking_copy_gap_us
+            ):
+                preceding_memcpy = candidate
+                preceding_memcpy_gpu = _choose_correlated_gpu(
+                    candidate,
+                    copies_by_correlation,
+                )
+
         correlation = _correlation_id(sync)
         correlated_copies = copies_by_correlation.get(correlation, [])
         transfer = min(
@@ -510,6 +610,9 @@ def analyze_trace(
             default=None,
         )
         transfer_method = "correlation" if transfer is not None else None
+        if transfer is None and preceding_memcpy_gpu is not None:
+            transfer = preceding_memcpy_gpu
+            transfer_method = "preceding_runtime_memcpy_correlation"
         if transfer is None:
             transfer, transfer_method = _fallback_transfer(
                 sync,
@@ -574,6 +677,52 @@ def analyze_trace(
             None if queued_end_us is None else max(0.0, queued_end_us - sync.ts_us)
         )
 
+        blocking_copy = None
+        if preceding_memcpy is not None:
+            blocking_copy = {
+                "mechanism": "cudaMemcpyAsync_then_cudaStreamSynchronize",
+                "runtime_memcpy": _event_dict(preceding_memcpy),
+                "runtime_memcpy_gpu": _event_dict(preceding_memcpy_gpu),
+                "api_gap_us": max(0.0, sync.ts_us - preceding_memcpy.end_us),
+                "compound_host_block_us": max(
+                    0.0,
+                    sync.end_us - preceding_memcpy.ts_us,
+                ),
+                "runtime_memcpy_call_us": preceding_memcpy.dur_us,
+                "sync_wait_us": sync.dur_us,
+            }
+
+        gpu_idle = None
+        if prior_gpu is not None and next_launch is not None:
+            device = _device_id(prior_gpu) or _device_id(next_launch.gpu)
+            if device is None and len(known_devices) <= 1:
+                device = next(iter(known_devices), None)
+            busy_timeline = busy_timelines_by_device.get(device)
+            if busy_timeline is not None:
+                interval_start = prior_gpu.end_us
+                interval_end = next_launch.gpu.ts_us
+                gpu_idle = {
+                    "device": device,
+                    "waited_gpu_end_to_next_causal_gpu_us": max(
+                        0.0,
+                        interval_end - interval_start,
+                    ),
+                    "global_idle_in_interval_us": busy_timeline.idle_between(
+                        interval_start,
+                        interval_end,
+                    ),
+                    "global_idle_after_sync_return_us": busy_timeline.idle_between(
+                        max(interval_start, sync.end_us),
+                        interval_end,
+                    ),
+                    "global_idle_immediately_before_next_causal_gpu_us": (
+                        busy_timeline.idle_immediately_before(
+                            interval_end,
+                            floor_us=interval_start,
+                        )
+                    ),
+                }
+
         occurrences.append(
             {
                 "trace_file": str(trace_path),
@@ -598,6 +747,7 @@ def analyze_trace(
                         "bytes": _byte_count(transfer),
                     }
                 ),
+                "blocking_copy": blocking_copy,
                 "prior_waited_gpu": _event_dict(prior_gpu),
                 "next_host_launch": (
                     None if next_launch is None else _event_dict(next_launch.host)
@@ -611,6 +761,7 @@ def analyze_trace(
                     "host_launch_gap_after_sync_us": host_launch_gap_us,
                     "queue_horizon_at_sync_start_us": queue_horizon_us,
                 },
+                "gpu_idle": gpu_idle,
                 "attribution": {
                     "transfer": transfer_method,
                     "prior_waited_gpu": prior_method,
@@ -641,15 +792,23 @@ def _percentile(values: list[float], percentile: float) -> float | None:
 def aggregate_occurrences(
     occurrences: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = defaultdict(
+        list
+    )
     for occurrence in occurrences:
         sync = occurrence["sync"] or {}
         transfer = occurrence["transfer"] or {}
+        blocking_copy = occurrence.get("blocking_copy")
         key = (
             str(sync.get("name") or "unknown"),
             str(occurrence.get("semantic_range") or "unscoped"),
             str(occurrence.get("parent_cpu_op") or "direct_wait"),
             str(transfer.get("direction") or "none"),
+            (
+                "direct_sync"
+                if blocking_copy is None
+                else str(blocking_copy["mechanism"])
+            ),
         )
         groups[key].append(occurrence)
 
@@ -667,13 +826,49 @@ def aggregate_occurrences(
             if row["transfer"] is not None
             and (value := row["transfer"].get("bytes")) is not None
         ]
+        transfer_durations = [
+            float(row["transfer"]["duration_us"])
+            for row in rows
+            if row["transfer"] is not None
+        ]
+        compound_blocks = [
+            float(blocking["compound_host_block_us"])
+            for row in rows
+            if (blocking := row.get("blocking_copy")) is not None
+        ]
+        runtime_memcpy_calls = [
+            float(blocking["runtime_memcpy_call_us"])
+            for row in rows
+            if (blocking := row.get("blocking_copy")) is not None
+        ]
+        global_idle = [
+            float(idle["global_idle_in_interval_us"])
+            for row in rows
+            if (idle := row.get("gpu_idle")) is not None
+        ]
+        post_sync_global_idle = [
+            float(idle["global_idle_after_sync_return_us"])
+            for row in rows
+            if (idle := row.get("gpu_idle")) is not None
+        ]
         aggregates.append(
             {
                 "sync_name": key[0],
                 "semantic_range": key[1],
                 "parent_cpu_op": key[2],
                 "transfer_direction": key[3],
+                "mechanism": key[4],
                 "count": len(rows),
+                "blocking_copy_count": len(compound_blocks),
+                "compound_host_block_total_us": sum(compound_blocks),
+                "compound_host_block_mean_us": (
+                    None
+                    if not compound_blocks
+                    else sum(compound_blocks) / len(compound_blocks)
+                ),
+                "compound_host_block_p50_us": _percentile(compound_blocks, 0.50),
+                "compound_host_block_p95_us": _percentile(compound_blocks, 0.95),
+                "runtime_memcpy_call_total_us": sum(runtime_memcpy_calls),
                 "sync_wait_total_us": sum(waits),
                 "sync_wait_mean_us": sum(waits) / len(waits),
                 "sync_wait_p50_us": _percentile(waits, 0.50),
@@ -684,6 +879,12 @@ def aggregate_occurrences(
                 "post_sync_bubble_p50_us": _percentile(bubbles, 0.50),
                 "post_sync_bubble_p95_us": _percentile(bubbles, 0.95),
                 "transfer_bytes_total": sum(byte_counts),
+                "transfer_duration_total_us": sum(transfer_durations),
+                "global_idle_measured_count": len(global_idle),
+                "global_idle_total_us": sum(global_idle),
+                "global_idle_p50_us": _percentile(global_idle, 0.50),
+                "global_idle_p95_us": _percentile(global_idle, 0.95),
+                "post_sync_global_idle_total_us": sum(post_sync_global_idle),
             }
         )
     return aggregates
@@ -698,8 +899,19 @@ def write_analysis(
     aggregates = aggregate_occurrences(occurrences)
     notes = [
         "All timestamps and causal comparisons are per trace file/process.",
-        "A post-sync bubble is emitted only when both g0 and a later "
-        "correlation-backed g1 are present.",
+        (
+            "The blocking-copy mechanism is the adjacent cudaMemcpyAsync entry "
+            "through cudaStreamSynchronize return; compound host time includes both APIs."
+        ),
+        (
+            "A post-sync bubble is emitted only when both g0 and a later "
+            "correlation-backed g1 are present."
+        ),
+        "Global-idle metrics subtract the union of all GPU events on the same device.",
+        (
+            "Per-occurrence causal intervals may overlap; aggregate bubble/idle sums "
+            "are not unique trace wall time."
+        ),
         "nearest_time_heuristic transfer attribution must be verified manually.",
         "Sync duration is host wait time, not automatically wasted GPU time.",
     ]
@@ -732,6 +944,7 @@ def write_analysis(
             "semantic_range",
             "parent_cpu_op",
             "transfer_direction",
+            "mechanism",
             "count",
         ]
     )
@@ -762,6 +975,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-python-depth", type=int, default=16)
     parser.add_argument("--max-transfer-gap-us", type=float, default=10_000.0)
+    parser.add_argument(
+        "--max-blocking-copy-gap-us",
+        type=float,
+        default=50.0,
+        help=(
+            "Maximum gap between an immediately preceding cudaMemcpyAsync "
+            "return and cudaStreamSynchronize entry for compound-copy attribution"
+        ),
+    )
     return parser
 
 
@@ -771,6 +993,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--max-python-depth must be >= 0")
     if args.max_transfer_gap_us < 0:
         raise SystemExit("--max-transfer-gap-us must be >= 0")
+    if args.max_blocking_copy_gap_us < 0:
+        raise SystemExit("--max-blocking-copy-gap-us must be >= 0")
     occurrences: list[dict[str, Any]] = []
     for trace in args.traces:
         occurrences.extend(
@@ -778,6 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
                 trace,
                 max_python_depth=args.max_python_depth,
                 max_transfer_gap_us=args.max_transfer_gap_us,
+                max_blocking_copy_gap_us=args.max_blocking_copy_gap_us,
             )
         )
     paths = write_analysis(occurrences, args.output_dir)

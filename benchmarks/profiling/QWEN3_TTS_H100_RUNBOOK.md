@@ -118,7 +118,40 @@ Before interpreting server warnings, inspect the JSONL:
 - record pageable H2D exactly as observed rather than assuming coverage;
 - if positive controls are silent, a silent server log is not absence evidence.
 
-## 4. Start a fresh server (terminal A)
+## 4. Freeze target and warmup manifests
+
+Create the target list without contacting a server. `--unique-reference-audio`
+deduplicates by file-content SHA256, not by temporary path or row ID. The output
+records order plus reference/text hashes and a checksum over the whole manifest:
+
+```bash
+export TARGET_MANIFEST_DIR="$EXP_ROOT/manifests/target-c16-64"
+python -m benchmarks.eval.benchmark_tts_seedtts \
+  --prepare-manifest-only \
+  --model "$MODEL_ID" --meta "$DATASET_ID" --ref-format references \
+  --max-samples 64 --unique-reference-audio \
+  --output-dir "$TARGET_MANIFEST_DIR"
+export TARGET_MANIFEST="$TARGET_MANIFEST_DIR/input_manifest.json"
+```
+
+Create a 64-row warmup list whose reference hashes are provably absent from the
+target list:
+
+```bash
+export WARM_MANIFEST_DIR="$EXP_ROOT/manifests/warm-c16-64"
+python -m benchmarks.eval.benchmark_tts_seedtts \
+  --prepare-manifest-only \
+  --model "$MODEL_ID" --meta "$DATASET_ID" --ref-format references \
+  --sample-offset 1000 --max-samples 64 \
+  --exclude-reference-manifest "$TARGET_MANIFEST" \
+  --output-dir "$WARM_MANIFEST_DIR"
+export WARM_MANIFEST="$WARM_MANIFEST_DIR/input_manifest.json"
+```
+
+The benchmark revalidates all hashes whenever `--sample-manifest` is used; a
+dataset or manifest mismatch fails before traffic.
+
+## 5. Start and fully warm a fresh server (terminal A)
 
 Use a fresh server for each cache condition and later for every baseline/candidate
 comparison. The detector is not armed during model loading or graph capture.
@@ -138,32 +171,53 @@ sgl-omni serve \
   --port 8000 2>&1 | tee "$SERVER_LOG"
 ```
 
-Wait for health, full readiness, and CUDA graph capture to finish. From terminal
-B:
+Wait for health and full readiness. From terminal B:
 
 ```bash
 until curl -fsS http://127.0.0.1:8000/health; do sleep 2; done
 ```
 
-Warm infrastructure using one sample outside the measured range. Do not warm the
-first 64 samples before a unique/miss capture:
+Warm batch-size 1, then concurrency 16, with only the disjoint warmup list. This
+keeps allocator/compile/lazy predictor-graph work outside the capture without
+priming any target reference:
 
 ```bash
 python -m benchmarks.eval.benchmark_tts_seedtts \
   --generate-only --use-existing-server \
   --base-url http://127.0.0.1:8000 \
-  --model "$MODEL_ID" \
-  --meta "$DATASET_ID" --ref-format references \
+  --model "$MODEL_ID" --meta "$DATASET_ID" --ref-format references \
   --sample-offset 1000 --max-samples 1 \
+  --exclude-reference-manifest "$TARGET_MANIFEST" \
   --max-new-tokens 128 --seed 20260812 \
   --warmup 0 --concurrency 1 \
-  --output-dir "$EXP_ROOT/warmup"
+  --output-dir "$EXP_ROOT/warmup-c1"
+
+python -m benchmarks.eval.benchmark_tts_seedtts \
+  --generate-only --use-existing-server \
+  --base-url http://127.0.0.1:8000 \
+  --model "$MODEL_ID" --meta "$DATASET_ID" --ref-format references \
+  --sample-manifest "$WARM_MANIFEST" \
+  --max-new-tokens 128 --seed 20260812 \
+  --warmup 0 --concurrency 16 \
+  --output-dir "$EXP_ROOT/warmup-c16"
 ```
 
-## 5. Short first pass: warning discovery
+## 6. Short first pass: warning discovery
 
-This is the cheapest useful run: no Torch Profiler, 16 unique non-streaming
-requests at concurrency 1.
+This is the cheapest useful run: no Torch Profiler, the first 16 entries of a
+separate c1 target manifest, and concurrency 1. Prepare that manifest exactly as
+in section 4 with `--max-samples 16 --unique-reference-audio`. It is a subset of
+the 64-entry target list, so the already completed disjoint warmup remains valid.
+
+```bash
+export TARGET_MANIFEST_DIR="$EXP_ROOT/manifests/target-c1-16"
+python -m benchmarks.eval.benchmark_tts_seedtts \
+  --prepare-manifest-only \
+  --model "$MODEL_ID" --meta "$DATASET_ID" --ref-format references \
+  --max-samples 16 --unique-reference-audio \
+  --output-dir "$TARGET_MANIFEST_DIR"
+export TARGET_MANIFEST="$TARGET_MANIFEST_DIR/input_manifest.json"
+```
 
 ```bash
 export BASE=http://127.0.0.1:8000
@@ -173,16 +227,24 @@ mkdir -p "$RUN_DIR/events"
 
 curl -fsS -X POST "$BASE/start_profile" \
   -H 'content-type: application/json' \
-  -d "{\"run_id\":\"$RUN\",\"event_dir\":\"$RUN_DIR/events\",\"enable_torch\":false,\"config\":{\"cuda_sync_debug_mode\":\"warn\"}}" \
+  -d "{\"run_id\":\"$RUN\",\"event_dir\":\"$RUN_DIR/events\",\"enable_torch\":false,\"config\":{\"cuda_sync_debug_mode\":\"warn\",\"target_stage\":\"tts_engine\"}}" \
   | tee "$RUN_DIR/start_response.json"
 ```
 
-The HTTP response confirms only that messages were broadcast. Before sending
-traffic, inspect terminal A or `SERVER_LOG` and require:
+Before sending traffic, require all of these from `start_response.json`:
 
-- one `Process profiler session started` line for this run in the CUDA-owning PID;
-- `cuda_sync_debug_mode=warn applied=True` in that line;
-- all expected colocated stages joining the same PID/run; no second Torch session.
+- `.acknowledgement.success == true`;
+- target session thread name `scheduler-tts_engine`;
+- `cuda_sync_debug_mode == "warn"` and `cuda_sync_debug_applied == true`;
+- `snapshot_before.model_runner.predictor_graph.captured_keys` already contains
+  the batch keys exercised by the active workload;
+- reference/speaker cache counters are recorded before traffic.
+
+For example:
+
+```bash
+jq '.acknowledgement' "$RUN_DIR/start_response.json"
+```
 
 Then run exactly the bounded target workload—no in-window warmup:
 
@@ -190,9 +252,8 @@ Then run exactly the bounded target workload—no in-window warmup:
 python -m benchmarks.eval.benchmark_tts_seedtts \
   --generate-only --use-existing-server \
   --base-url "$BASE" \
-  --model "$MODEL_ID" \
-  --meta "$DATASET_ID" --ref-format references \
-  --sample-offset 0 --max-samples 16 \
+  --model "$MODEL_ID" --meta "$DATASET_ID" --ref-format references \
+  --sample-manifest "$TARGET_MANIFEST" \
   --max-new-tokens 128 --seed 20260812 \
   --warmup 0 --concurrency 1 \
   --output-dir "$RUN_DIR/client"
@@ -206,14 +267,23 @@ python -m sglang_omni.profiler "$RUN_DIR/events" \
   --format json --out "$RUN_DIR/request_report.json"
 ```
 
-Require the matching process-session stop log and confirm that sync-debug was
-reset. Preserve the complete server log, including warning stack locations.
+Require `acknowledgement.success=true` and `artifacts_finalized=true` in the stop
+response. Compare `snapshot_before` from start with `snapshot_before_stop` from
+stop: all 16 target references must be misses for this fresh-server condition,
+and no lazy graph key may first appear inside the warning window. Preserve the
+complete server log, including warning stack locations.
 
-## 6. Low-overhead CPU+CUDA trace
+## 7. Low-overhead CPU+CUDA trace
 
-Restart the server to clear the 2 GiB CPU reference cache, perform only the
-offset-1000 infrastructure warmup, then capture 64 unique non-streaming requests
-at concurrency 16:
+Point `TARGET_MANIFEST` back to the 64-entry manifest from section 4. Restart the
+server, repeat only the disjoint c1/c16 warmup, and verify graph keys before
+capturing. The trace pass deliberately uses sync-debug `default`: warning logging
+would perturb the host timeline we are trying to measure.
+
+```bash
+export TARGET_MANIFEST="$EXP_ROOT/manifests/target-c16-64/input_manifest.json"
+export WARM_MANIFEST="$EXP_ROOT/manifests/warm-c16-64/input_manifest.json"
+```
 
 ```bash
 export RUN="q3tts-trace-c16-nonstream-miss-$(date +%s)"
@@ -222,20 +292,19 @@ mkdir -p "$RUN_DIR/events"
 
 curl -fsS -X POST "$BASE/start_profile" \
   -H 'content-type: application/json' \
-  -d "{\"run_id\":\"$RUN\",\"trace_path_template\":\"$RUN_DIR/trace\",\"event_dir\":\"$RUN_DIR/events\",\"enable_torch\":true,\"config\":{\"cuda_sync_debug_mode\":\"warn\"}}" \
+  -d "{\"run_id\":\"$RUN\",\"trace_path_template\":\"$RUN_DIR/trace\",\"event_dir\":\"$RUN_DIR/events\",\"enable_torch\":true,\"config\":{\"cuda_sync_debug_mode\":\"default\",\"target_stage\":\"tts_engine\"}}" \
   | tee "$RUN_DIR/start_response.json"
 ```
 
-Wait for the matching `Process profiler session started` log with `applied=True`
-before traffic, then:
+Require a successful acknowledgement on `scheduler-tts_engine`,
+`torch_active=true`, and the complete pre-warmed graph-key snapshot, then:
 
 ```bash
 python -m benchmarks.eval.benchmark_tts_seedtts \
   --generate-only --use-existing-server \
   --base-url "$BASE" \
-  --model "$MODEL_ID" \
-  --meta "$DATASET_ID" --ref-format references \
-  --sample-offset 0 --max-samples 64 \
+  --model "$MODEL_ID" --meta "$DATASET_ID" --ref-format references \
+  --sample-manifest "$TARGET_MANIFEST" \
   --max-new-tokens 128 --seed 20260812 \
   --warmup 0 --concurrency 16 \
   --output-dir "$RUN_DIR/client"
@@ -246,23 +315,18 @@ curl -fsS -X POST "$BASE/stop_profile" \
   | tee "$RUN_DIR/stop_response.json"
 ```
 
-Stop is also asynchronous. Wait for `Trace exported` and for every gzip to have
-the same size and mtime on two polls:
+Targeted stop is synchronous with export and gzip completion. Require
+`artifacts_finalized=true`, a non-null trace path in every rank session, and no
+errors. Then verify the returned paths exist and no raw JSON remains:
 
 ```bash
-until find "$RUN_DIR" -name '*.trace.json.gz' -print -quit | grep -q .; do sleep 2; done
-while find "$RUN_DIR" -name '*.trace.json' -print -quit | grep -q .; do sleep 2; done
-
-find "$RUN_DIR" -name '*.trace.json.gz' -type f -printf '%p %s %T@\n' \
-  | sort | tee "$RUN_DIR/trace_state_1.txt"
-sleep 5
-find "$RUN_DIR" -name '*.trace.json.gz' -type f -printf '%p %s %T@\n' \
-  | sort | tee "$RUN_DIR/trace_state_2.txt"
-diff -u "$RUN_DIR/trace_state_1.txt" "$RUN_DIR/trace_state_2.txt"
+jq -e '.artifacts_finalized == true and .acknowledgement.success == true' \
+  "$RUN_DIR/stop_response.json"
+test -z "$(find "$RUN_DIR" -name '*.trace.json' -print -quit)"
+test -n "$(find "$RUN_DIR" -name '*.trace.json.gz' -print -quit)"
 ```
 
-An empty trace list is a failure, not a successful stable state. Analyze all
-per-process traces without comparing their clocks:
+Analyze all per-process traces without comparing their clocks:
 
 ```bash
 mapfile -t TRACES < <(find "$RUN_DIR" -name '*.trace.json.gz' -type f | sort)
@@ -278,7 +342,24 @@ find "$RUN_DIR" -type f ! -name SHA256SUMS -print0 \
   | sort -z | xargs -0 sha256sum > "$RUN_DIR/SHA256SUMS"
 ```
 
-## 7. Targeted stack pass
+The first inspection is mechanical, not visual:
+
+- count `blocking_copy != null` occurrences and split them by HtoD/DtoH;
+- use `compound_host_block_*`, not only `sync_wait_*`, for the article's
+  `cudaMemcpyAsync -> cudaStreamSynchronize` mechanism;
+- inspect correlated transfer bytes/duration and
+  `gpu_idle.global_idle_in_interval_us` together;
+- remember that per-occurrence intervals can overlap, so aggregate idle/bubble
+  sums are prioritization signals, not unique wall-clock time;
+- require semantic `qwen3_tts.*` ranges and scheduler-thread ATen operators in
+  this targeted trace. If they are absent, the start acknowledgement's thread
+  ownership is wrong and the trace is not accepted.
+
+The start/stop snapshots are equally mandatory: target reference hashes are
+unique and disjoint from warmup; target-cache misses must increase as expected;
+and captured predictor-graph keys must not change inside the active window.
+
+## 8. Targeted stack pass
 
 Only after the low-overhead trace identifies a range, restart the server with:
 
@@ -297,25 +378,26 @@ profiling with this pass. `config.cuda_sync_debug_mode="error"` may be used for
 one localization request after warning discovery, but it may abort that request
 and is never performance evidence.
 
-## 8. Complete baseline matrix
+## 9. Complete baseline matrix
 
 After the short pass works, collect these conditions. Restart and infrastructure-
 warm the server between miss and hit conditions:
 
 | Condition | Active sample list | Concurrency | Extra flag | Cache preparation |
 | --- | ---: | ---: | --- | --- |
-| Non-stream miss | first 16 | 1 | none | offset-1000 warm only |
-| Non-stream miss | first 64 | 16 | none | offset-1000 warm only |
-| Stream miss | first 16 | 1 | `--stream` | offset-1000 warm only |
-| Stream miss | first 64 | 16 | `--stream` | offset-1000 warm only |
-| Exact replay/hit | fixed first 16 or 64 | matching | matching | run that exact list once before arming, then replay it |
+| Non-stream miss | verified unique-ref manifest, 16 | 1 | none | disjoint c1+c16 graph warmup |
+| Non-stream miss | verified unique-ref manifest, 64 | 16 | none | disjoint c1+c16 graph warmup |
+| Stream miss | same verified manifest, 16 | 1 | `--stream` | disjoint c1+c16 graph warmup |
+| Stream miss | same verified manifest, 64 | 16 | `--stream` | disjoint c1+c16 graph warmup |
+| Exact replay/hit | exact miss manifest | matching | matching | replay manifest once before arming, then replay it again |
 
-For a hit condition, priming uses the exact same benchmark command and output
-mode as the active capture but writes to a separate `prime` directory. Only arm
-profiling after priming finishes. Never compare a miss baseline with a hit
+For a hit condition, priming uses `--sample-manifest "$TARGET_MANIFEST"` with the
+same output mode as the active capture but writes to a separate `prime`
+directory. Only arm profiling after priming finishes. Confirm the start snapshot
+shows populated cache entries/hits. Never compare a miss baseline with a hit
 candidate.
 
-## 9. What to send back
+## 10. What to send back
 
 Please return, or make available, the following files for the first warning and
 first low-overhead trace runs:
@@ -324,6 +406,7 @@ first low-overhead trace runs:
 - complete server logs;
 - `start_response.json` and `stop_response.json`;
 - client `speed_results.json`, generated-audio metadata, and failure records;
+- every `input_manifest.json`, including disjoint warmup and target manifests;
 - request-event JSONL plus `request_report.json`;
 - every `*.trace.json.gz`;
 - the analyzer occurrence JSON and aggregate JSON/CSV;

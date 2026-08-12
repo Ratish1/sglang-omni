@@ -14,6 +14,7 @@ inheriting from ``SGLangScheduler``.
 from __future__ import annotations
 
 import logging
+import os
 import queue as _queue_mod
 import threading
 import time
@@ -47,12 +48,15 @@ from sglang_omni.profiler.event_recorder import (
     emit_model_path_start as _emit_model_path_start,
 )
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
+from sglang_omni.profiler.process_session import ProcessProfilerSession
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
     ADMIN_INIT_WEIGHTS_UPDATE_GROUP,
     ADMIN_MODEL_INFO,
     ADMIN_PAUSE_GENERATION,
+    ADMIN_PROFILER_START,
+    ADMIN_PROFILER_STOP,
     ADMIN_UPDATE_WEIGHTS_FROM_DISK,
     ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED,
     ADMIN_UPDATE_WEIGHTS_FROM_TENSOR,
@@ -1717,10 +1721,97 @@ class OmniScheduler:
             return self._admin_destroy_weights_update_group(payload)
         if action == ADMIN_WEIGHTS_CHECKER:
             return self._admin_weights_checker(payload)
+        if action == ADMIN_PROFILER_START:
+            return self._admin_profiler_start(payload)
+        if action == ADMIN_PROFILER_STOP:
+            return self._admin_profiler_stop(payload)
         return {
             "success": True,
             "message": f"unsupported admin action: {action}",
             "data": {"skipped": True, "unsupported": True},
+        }
+
+    def _profiling_snapshot(self) -> dict[str, Any]:
+        """Return JSON-serializable scheduler/model state at a profile boundary."""
+        running_batch = self.running_batch
+        snapshot: dict[str, Any] = {
+            "stage": _get_active_stage(),
+            "stage_tp_rank": int(self.tp_rank),
+            "stage_tp_size": int(self.tp_size),
+            "scheduler_thread_id": threading.get_ident(),
+            "scheduler_thread_name": threading.current_thread().name,
+            "forward_count": int(self.forward_ct),
+            "waiting_requests": len(self.waiting_queue),
+            "running_requests": (
+                0 if running_batch is None else len(running_batch.reqs)
+            ),
+            "inbox_size": self.inbox.qsize(),
+            "outbox_size": self.outbox.qsize(),
+        }
+        model_snapshot = getattr(self._model_runner, "profiling_snapshot", None)
+        if callable(model_snapshot):
+            snapshot["model_runner"] = model_snapshot()
+        return snapshot
+
+    def _admin_profiler_start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Start profiling on the scheduler thread and return a real ack."""
+        run_id = str(payload["run_id"])
+        participant = str(payload.get("participant") or _get_active_stage() or "stage")
+        enable_torch = bool(payload.get("enable_torch", True))
+        trace_path_template = str(payload.get("trace_path_template") or "")
+        if enable_torch:
+            base_template = trace_path_template.format(
+                run_id=run_id,
+                stage=participant,
+            )
+            trace_path_template = f"{base_template}_pid{os.getpid()}"
+            profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
+            if profiler_dir and not os.path.isabs(trace_path_template):
+                trace_path_template = os.path.join(
+                    profiler_dir,
+                    trace_path_template,
+                )
+
+        before = self._profiling_snapshot()
+        status = ProcessProfilerSession.start(
+            participant=participant,
+            run_id=run_id,
+            trace_path_template=trace_path_template,
+            event_dir=payload.get("event_dir"),
+            enable_torch=enable_torch,
+            cuda_capable_process=torch.device(self.device).type == "cuda",
+            cuda_sync_debug_mode=str(payload.get("cuda_sync_debug_mode") or "default"),
+        )
+        return {
+            "success": True,
+            "message": "profiler started on scheduler thread",
+            "data": {
+                "session": status,
+                "snapshot_before": before,
+            },
+        }
+
+    def _admin_profiler_stop(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Finalize profiling on its owner thread before acknowledging stop."""
+        participant = str(payload.get("participant") or _get_active_stage() or "stage")
+        before_stop = self._profiling_snapshot()
+        status = ProcessProfilerSession.stop(
+            participant=participant,
+            run_id=payload.get("run_id"),
+        )
+        stopped = bool(status.get("stopped", False))
+        return {
+            "success": stopped,
+            "message": (
+                "profiler stopped on scheduler thread"
+                if stopped
+                else str(status.get("reason") or "profiler did not stop")
+            ),
+            "data": {
+                "session": status,
+                "snapshot_before_stop": before_stop,
+            },
+            "error": None if stopped else str(status.get("reason")),
         }
 
     def _admin_model_info(self) -> dict[str, Any]:

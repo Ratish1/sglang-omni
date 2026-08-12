@@ -39,7 +39,10 @@ curl -fsS -X POST http://127.0.0.1:8000/start_profile \
     "run_id": "q3tts-warn",
     "event_dir": "/tmp/q3tts-prof/q3tts-warn/events",
     "enable_torch": false,
-    "config": {"cuda_sync_debug_mode": "warn"}
+    "config": {
+      "cuda_sync_debug_mode": "warn",
+      "target_stage": "tts_engine"
+    }
   }'
 ```
 
@@ -53,11 +56,13 @@ curl -fsS -X POST http://127.0.0.1:8000/stop_profile \
   -d '{"run_id": "q3tts-warn"}'
 ```
 
-The HTTP routes broadcast asynchronously. Before traffic, require a server log
-line showing `applied=True` for the CUDA-owning PID and all expected colocated
-stage joins. After stop, require the process-session stop log, `Trace exported`,
-and a gzip whose size and mtime are stable on two polls. Do not retry the same
-start request as an acknowledgement.
+For a targeted run, require `acknowledgement.success=true`, a session whose
+thread is `scheduler-tts_engine`, and `cuda_sync_debug_applied=true` before
+traffic. The matching stop finalizes JSONL and, when Torch Profiler is enabled,
+waits for the completed gzip before returning `artifacts_finalized=true`. Its
+snapshot records cache counters and lazy graph keys at the end of the window.
+Omitting `target_stage` uses the legacy asynchronous broadcast and still
+requires log/artifact polling.
 
 Use `SGLANG_TORCH_PROFILER_WITH_STACK=1` and
 `SGLANG_TORCH_PROFILER_RECORD_SHAPES=1` only for a separate targeted stack pass.
@@ -74,6 +79,10 @@ python benchmarks/profiling/analyze_cuda_sync_trace.py \
 The analyzer emits per-occurrence JSON plus aggregate JSON and CSV. It streams
 the Chrome trace twice: once for synchronization/GPU correlation and once for
 nested semantic, ATen, and Python attribution. It never compares timestamps
-across trace files. A reported sync wait is not automatically wasted time;
-inspect the correlation method, post-sync GPU bubble, host launch gap, and queue
-horizon together.
+across trace files. For the article's hidden blocking-copy path it reports the
+compound interval from `cudaMemcpyAsync` entry through
+`cudaStreamSynchronize` return, correlated transfer direction/bytes, and
+device-wide idle time. Per-occurrence intervals can overlap and aggregate sums
+are not unique wall time. A reported sync wait is not automatically wasted
+time; inspect correlation, global idle, host launch gap, and queue horizon
+together.

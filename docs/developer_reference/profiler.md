@@ -123,16 +123,19 @@ is hit:
 
 1. Launcher receives the HTTP request.
 2. Coordinator starts its local recorder pointed at `<event_dir>`.
-3. Launcher broadcasts `ProfilerStartMessage` over ZMQ to every stage,
-   carrying both the torch trace template and the `event_dir`.
-4. Each stage joins a locked process profiling session. In a shared-process
+3. Without `config.target_stage`, the launcher broadcasts
+   `ProfilerStartMessage` over ZMQ to every stage. With a target, the coordinator
+   sends an acknowledged admin operation to that stage and all of its TP ranks;
+   the stage queues start onto its scheduler thread.
+4. Each selected stage joins a locked process profiling session. In a shared-process
    topology, Torch Profiler, CUDA sync-debug state, and the request recorder
    are started once per PID/run ID; subsequent logical stages join the same
    session. The first stage to call `start()` wins the event filename and trace
    template; per-event `stage` fields and semantic ranges disambiguate owners.
-5. On `POST /stop_profile`, the recorder is closed everywhere; files
-   remain on disk under `<event_dir>`. Shared-process state closes after the
-   final joined logical stage stops. Failure/teardown force-resets it.
+5. On `POST /stop_profile`, recorders selected by the matching control path and
+   the coordinator recorder are closed; files remain on disk under `<event_dir>`.
+   Shared-process state closes after the final joined logical stage stops.
+   Failure/teardown force-resets it.
 
 `POST /stop_profile` and `POST /stop_request_profile` accept an optional
 `run_id` field. When **omitted**, the request is a wildcard: every stage
@@ -145,12 +148,22 @@ The torch profiler and the event recorder share a `run_id`. Setting
 paying for a kernel trace.
 
 `/start_profile` also accepts the typed config
-`{"cuda_sync_debug_mode":"default"|"warn"|"error"}`. Non-default modes call
+`{"cuda_sync_debug_mode":"default"|"warn"|"error", "target_stage": ?}`.
+Non-default modes call
 `torch.cuda.set_sync_debug_mode` only in CUDA-owning child processes, after
 model initialization and external warmup. The mode is process-global and is
 reset to `default` before trace export. This Torch API is experimental and does
 not cover every synchronizing operation; calibrate the installed build with
 `benchmarks/profiling/cuda_sync_debug_probe.py` before interpreting a clean log.
+
+When `target_stage` is set, the coordinator uses its acknowledged admin path
+instead of the legacy broadcast. Start executes on every target TP rank's actual
+scheduler thread and returns the owner PID/rank/thread plus a cache/CUDA-graph
+snapshot. Stop runs on the same scheduler thread and returns only after trace
+export and gzip compression finish when Torch Profiler is enabled (or after
+JSONL close for an event-only run). This mode is preferred when CPU operator and
+`record_function` attribution from a pre-existing scheduler thread matters.
+With no target, the backward-compatible process broadcast remains asynchronous.
 
 ## Generating reports
 
@@ -215,8 +228,8 @@ multi-GB trace — only opt in when you need that specific information.
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/start_profile` | `{"run_id": ?, "trace_path_template": ?, "event_dir": ?, "enable_torch": true \| false, "config": {"cuda_sync_debug_mode": "default" \| "warn" \| "error"}}` | Starts the process profiling session. `run_id` auto-generated if omitted. Unknown config keys are rejected. |
-| POST | `/stop_profile` | `{"run_id": ?}` | Stops torch trace + event recorder. Omitting `run_id` is a wildcard ("stop whatever's active"). |
+| POST | `/start_profile` | `{"run_id": ?, "trace_path_template": ?, "event_dir": ?, "enable_torch": true \| false, "config": {"cuda_sync_debug_mode": "default" \| "warn" \| "error", "target_stage": ?}}` | Starts the process profiling session. A target uses acknowledged scheduler-thread control; no target preserves asynchronous broadcast. `run_id` auto-generated if omitted. Unknown config keys are rejected. |
+| POST | `/stop_profile` | `{"run_id": ?}` | Stops torch trace + event recorder. A targeted run acknowledges only after finalized artifacts. Omitting `run_id` is a wildcard ("stop whatever's active"). |
 | POST | `/start_request_profile` | `{"run_id": ?, "event_dir": ?}` | Event recorder only — no torch trace. Lower overhead; safer to leave on. |
 | POST | `/stop_request_profile` | `{"run_id": ?}` | Same wildcard semantics as `/stop_profile`. |
 

@@ -40,6 +40,48 @@ Intentionally not implemented yet: any H2D/D2H or stream-publication repair. The
 next gate is the remote H100 calibration and baseline capture described below;
 that evidence selects a repair branch.
 
+### H100 artifact checkpoint — 2026-08-13
+
+The first returned archive is valid and proves the PyTorch article's compound
+blocking-copy mechanism, but it is not yet a clean optimization baseline:
+
+- 6,221 of 6,222 `cudaStreamSynchronize` events immediately follow a
+  correlation-backed `cudaMemcpyAsync` on the same host thread;
+- the corrected compound interval totals about 3.090 s, split into about 1.917 s
+  inside `cudaMemcpyAsync` and 1.171 s inside `cudaStreamSynchronize`;
+- correlated transfers split into 4,425 HtoD and 1,796 DtoH occurrences;
+- the prior analyzer counted only the synchronization API and therefore hid most
+  DtoH host blocking;
+- the trace lacks scheduler-thread ATen operators and `qwen3_tts.*` ranges because
+  profiling was started from a control thread after scheduler/worker threads
+  already existed;
+- predictor graph keys 2/4/8/12/16 were captured inside the active trace;
+- the claimed 64-request miss list contained only 40 unique reference-audio
+  contents (the 16-request list contained 9);
+- sync-debug warning logging perturbed the same trace used for timing;
+- Torch 2.11 invoked `on_trace_ready` during `stop()`, after which the old code
+  attempted a second export and logged `Trace is already saved`.
+
+The branch now corrects those evidence mechanics before any transfer rewrite:
+
+- optional `config.target_stage="tts_engine"` uses acknowledged coordinator
+  admin fanout and runs profiler start/stop on every target scheduler thread;
+- start/stop responses carry PID/rank/thread ownership, reference/speaker cache
+  counters, and Qwen3-TTS lazy predictor-graph keys;
+- targeted stop returns only after exactly-once trace export and synchronous gzip
+  completion;
+- the analyzer pairs `cudaMemcpyAsync -> cudaStreamSynchronize`, reports the full
+  compound host block, and subtracts all same-device GPU activity when reporting
+  global idle;
+- SeedTTS input manifests hash reference bytes and text, support exact replay,
+  enforce content-unique reference selection, and construct disjoint warmup lists;
+- the revised H100 trace uses sync-debug `default`, fully warms graph keys outside
+  the window, and distinguishes pure cache miss from exact replay/hit.
+
+No production synchronization rewrite is selected at this checkpoint. The clean
+target-thread rerun is the gate that maps compound copies to exact Omni-owned
+operators and ranks their non-overlapping critical-path cost.
+
 ### Decision
 
 Start with Qwen3-TTS rather than Qwen3-ASR.

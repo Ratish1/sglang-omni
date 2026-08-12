@@ -152,6 +152,19 @@ _ADHOC_REFERENCE_SERVICE_ENTRY: (
 _PREPARED_REQUESTS_LOCK = threading.Lock()
 
 
+def qwen3_tts_profiling_snapshot() -> dict[str, Any]:
+    """Expose cache state without mutating or initializing request services."""
+    with _PREPARED_REQUESTS_LOCK:
+        prepared_requests = len(_PREPARED_REQUESTS)
+        entry = _ADHOC_REFERENCE_SERVICE_ENTRY
+        service = None if entry is None else entry[1]
+    return {
+        "prepared_requests": prepared_requests,
+        "reference_cache": None if service is None else service.stats(),
+        "speaker_artifact_cache": get_speaker_artifact_cache().stats(),
+    }
+
+
 def set_qwen3_tts_preprocessing_context(*, model: Any, wrapper: Any) -> None:
     """Register model objects used by the preprocessing stage."""
 
