@@ -95,9 +95,18 @@ current multi-process launcher path does not mount them.
   "run_id": "demo-run",
   "trace_path_template": "/tmp/profiles/demo-run/trace",  // torch trace template
   "event_dir": "/tmp/profiles/demo-run/events",            // request-event JSONL dir (optional)
-  "enable_torch": true                                     // set false to skip torch trace
+  "enable_torch": true,                                    // set false to skip torch trace
+  "config": {
+    "cuda_sync_debug_mode": "default"                      // default | warn | error
+  }
 }
 ```
+
+`cuda_sync_debug_mode` is an opt-in, bounded diagnostic window around target
+traffic. It is applied only in CUDA-owning stage processes after startup and is
+reset before profiler export. `warn` is appropriate for discovery; `error` can
+abort a request and should be used only for localization. Unknown config keys
+or modes are rejected.
 
 `/stop_profile` and `/stop_request_profile` both accept an optional
 `run_id`. Omitting it is a wildcard: every stage stops whatever profiler

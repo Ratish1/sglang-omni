@@ -27,9 +27,8 @@ from sglang_omni.pipeline.stage.input import DirectInput, InputHandler
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
 from sglang_omni.pipeline.tp_control import TPLeaderFanout, TPWorkMessage
 from sglang_omni.profiler.event_recorder import emit as _emit_event
-from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
 from sglang_omni.profiler.event_recorder import set_active_stage as _set_active_stage
-from sglang_omni.profiler.torch_profiler import TorchProfiler
+from sglang_omni.profiler.process_session import ProcessProfilerSession
 from sglang_omni.proto import (
     AdminMessage,
     AdminResult,
@@ -123,6 +122,9 @@ class Stage:
         self._tp_fanout = tp_fanout
         self._is_terminal = is_terminal
         self._owns_external_io = role in {"single", "leader"}
+        # ``_run_process`` replaces this with the ownership of the complete
+        # colocated stage group before any profiler control message can arrive.
+        self._process_owns_cuda = gpu_id is not None
 
         self._comm = CommEngine(
             CommRouter(
@@ -200,6 +202,7 @@ class Stage:
 
     async def stop(self) -> None:
         self._running = False
+        ProcessProfilerSession.force_stop(reason=f"stage {self.name} teardown")
         cleanup_error: Exception | None = None
 
         def _record_cleanup_error(component: str, exc: Exception) -> None:
@@ -1622,36 +1625,33 @@ class Stage:
 
     def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id
-        if msg.enable_torch and not TorchProfiler.is_active():
+        template = ""
+        if msg.enable_torch:
             base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
             template = f"{base_tpl}_pid{os.getpid()}"
             prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
             if prof_dir and not os.path.isabs(template):
                 template = os.path.join(prof_dir, template)
-            TorchProfiler.start(template, run_id=run_id)
-        if msg.event_dir is not None:
-            try:
-                _get_recorder().start(
-                    run_id=run_id, event_dir=msg.event_dir, stage=self.name
-                )
-            except Exception:
-                logger.warning(
-                    "Stage %s failed to start request event recorder",
-                    self.name,
-                    exc_info=True,
-                )
+        try:
+            ProcessProfilerSession.start(
+                participant=self.name,
+                run_id=run_id,
+                trace_path_template=template,
+                event_dir=msg.event_dir,
+                enable_torch=msg.enable_torch,
+                cuda_capable_process=self._process_owns_cuda,
+                cuda_sync_debug_mode=msg.cuda_sync_debug_mode,
+            )
+        except Exception:
+            logger.warning(
+                "Stage %s failed to start process profiler session run_id=%s",
+                self.name,
+                run_id,
+                exc_info=True,
+            )
 
     def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
-        # run_id=None is a wildcard (stop whatever's active).
-        if TorchProfiler.is_active() and (
-            msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
-        ):
-            TorchProfiler.stop(run_id=msg.run_id)
-        recorder = _get_recorder()
-        if recorder.is_active() and (
-            msg.run_id is None or recorder.active_run_id() == msg.run_id
-        ):
-            recorder.stop(run_id=msg.run_id)
+        ProcessProfilerSession.stop(participant=self.name, run_id=msg.run_id)
 
     def _on_background_task_done(self, task: asyncio.Task, label: str) -> None:
         if task.cancelled():

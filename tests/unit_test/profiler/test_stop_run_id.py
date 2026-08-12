@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from sglang_omni.profiler.event_recorder import get_recorder, reset_active_stage
-from sglang_omni.proto.messages import ProfilerStopMessage
+from sglang_omni.proto.messages import ProfilerStartMessage, ProfilerStopMessage
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +49,37 @@ def test_profiler_stop_message_legacy_run_id_round_trip() -> None:
     d = msg.to_dict()
     round_trip = ProfilerStopMessage.from_dict(d)
     assert round_trip.run_id == "abc"
+
+
+def test_profiler_start_message_sync_debug_mode_round_trip() -> None:
+    msg = ProfilerStartMessage(
+        run_id="sync-run",
+        trace_path_template="/tmp/{run_id}/{stage}/trace",
+        cuda_sync_debug_mode="warn",
+    )
+    round_trip = ProfilerStartMessage.from_dict(msg.to_dict())
+    assert round_trip.cuda_sync_debug_mode == "warn"
+
+
+def test_profiler_start_message_defaults_sync_debug_off() -> None:
+    round_trip = ProfilerStartMessage.from_dict(
+        {
+            "run_id": "legacy-run",
+            "trace_path_template": "/tmp/trace",
+        }
+    )
+    assert round_trip.cuda_sync_debug_mode == "default"
+
+
+def test_profiler_start_message_rejects_unknown_sync_debug_mode() -> None:
+    with pytest.raises(ValueError, match="cuda_sync_debug_mode"):
+        ProfilerStartMessage.from_dict(
+            {
+                "run_id": "bad-run",
+                "trace_path_template": "/tmp/trace",
+                "cuda_sync_debug_mode": "surprise",
+            }
+        )
 
 
 def test_recorder_stop_with_none_run_id_unconditionally_stops(

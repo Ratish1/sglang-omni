@@ -33,11 +33,11 @@ import socket
 import threading
 import time
 from contextlib import contextmanager, suppress
-from typing import Any
+from typing import Any, Literal
 
 import uvicorn
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sglang_omni.client import Client
 from sglang_omni.config import PipelineConfig
@@ -227,12 +227,25 @@ def _log_model_capabilities(pipeline_config: PipelineConfig) -> None:
         logger.info("Model capabilities: %s", json.dumps(summary, sort_keys=True))
 
 
+class ProfilerStartConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cuda_sync_debug_mode: Literal["default", "warn", "error"] = "default"
+
+
 class StartReq(BaseModel):
     run_id: str | None = None
     trace_path_template: str | None = None
-    config: dict[str, Any] | None = None
+    config: ProfilerStartConfig = Field(default_factory=ProfilerStartConfig)
     event_dir: str | None = None
     enable_torch: bool = True
+
+    @field_validator("config", mode="before")
+    @classmethod
+    def _normalize_null_config(cls, value: Any) -> Any:
+        # ``config`` was historically optional, including explicit JSON null.
+        # Preserve that wire shape while validating every non-null key.
+        return {} if value is None else value
 
 
 class StopReq(BaseModel):
@@ -295,7 +308,7 @@ def _mount_profiler_routes(
         await profiler_ctl.broadcast_start(
             run_id=run_id,
             trace_path_template=tpl,
-            config=req.config,
+            cuda_sync_debug_mode=req.config.cuda_sync_debug_mode,
             event_dir=event_dir,
             enable_torch=req.enable_torch,
         )
@@ -304,6 +317,7 @@ def _mount_profiler_routes(
             "trace_path_template": tpl,
             "event_dir": event_dir,
             "enable_torch": req.enable_torch,
+            "config": req.config.model_dump(),
         }
 
     @router.post("/start_request_profile")
@@ -335,6 +349,7 @@ def _mount_profiler_routes(
             trace_path_template="",
             event_dir=event_dir,
             enable_torch=False,
+            cuda_sync_debug_mode="default",
         )
         return {"run_id": run_id, "event_dir": event_dir}
 

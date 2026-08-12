@@ -125,12 +125,14 @@ is hit:
 2. Coordinator starts its local recorder pointed at `<event_dir>`.
 3. Launcher broadcasts `ProfilerStartMessage` over ZMQ to every stage,
    carrying both the torch trace template and the `event_dir`.
-4. Each stage joins the per-process recorder. In a shared-process topology
-   the first stage to call `start()` wins the filename; every subsequent
-   stage in the same process writes to the same file and the per-event
-   `stage` field disambiguates.
+4. Each stage joins a locked process profiling session. In a shared-process
+   topology, Torch Profiler, CUDA sync-debug state, and the request recorder
+   are started once per PID/run ID; subsequent logical stages join the same
+   session. The first stage to call `start()` wins the event filename and trace
+   template; per-event `stage` fields and semantic ranges disambiguate owners.
 5. On `POST /stop_profile`, the recorder is closed everywhere; files
-   remain on disk under `<event_dir>`.
+   remain on disk under `<event_dir>`. Shared-process state closes after the
+   final joined logical stage stops. Failure/teardown force-resets it.
 
 `POST /stop_profile` and `POST /stop_request_profile` accept an optional
 `run_id` field. When **omitted**, the request is a wildcard: every stage
@@ -141,6 +143,14 @@ didn't specify a run_id on either start or stop) work without ceremony.
 The torch profiler and the event recorder share a `run_id`. Setting
 `enable_torch=false` on the start request records JSONL events without
 paying for a kernel trace.
+
+`/start_profile` also accepts the typed config
+`{"cuda_sync_debug_mode":"default"|"warn"|"error"}`. Non-default modes call
+`torch.cuda.set_sync_debug_mode` only in CUDA-owning child processes, after
+model initialization and external warmup. The mode is process-global and is
+reset to `default` before trace export. This Torch API is experimental and does
+not cover every synchronizing operation; calibrate the installed build with
+`benchmarks/profiling/cuda_sync_debug_probe.py` before interpreting a clean log.
 
 ## Generating reports
 
@@ -205,7 +215,7 @@ multi-GB trace — only opt in when you need that specific information.
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/start_profile` | `{"run_id": ?, "trace_path_template": ?, "event_dir": ?, "enable_torch": true \| false, "config": ?}` | Starts torch trace + event recorder. `run_id` auto-generated if omitted. |
+| POST | `/start_profile` | `{"run_id": ?, "trace_path_template": ?, "event_dir": ?, "enable_torch": true \| false, "config": {"cuda_sync_debug_mode": "default" \| "warn" \| "error"}}` | Starts the process profiling session. `run_id` auto-generated if omitted. Unknown config keys are rejected. |
 | POST | `/stop_profile` | `{"run_id": ?}` | Stops torch trace + event recorder. Omitting `run_id` is a wildcard ("stop whatever's active"). |
 | POST | `/start_request_profile` | `{"run_id": ?, "event_dir": ?}` | Event recorder only — no torch trace. Lower overhead; safer to leave on. |
 | POST | `/stop_request_profile` | `{"run_id": ?}` | Same wildcard semantics as `/stop_profile`. |

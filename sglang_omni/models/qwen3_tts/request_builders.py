@@ -21,6 +21,7 @@ from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
 from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
 )
+from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.proto import StagePayload
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
@@ -479,7 +480,8 @@ def build_generation_kwargs(
 
 def build_embedding_cache_key_ids(input_embeds: torch.Tensor) -> list[int]:
     """Build stable radix-cache token ids for a precomputed embedding prefix."""
-    rows = input_embeds.detach().to(dtype=torch.float32, device="cpu")
+    with TorchProfiler.record_function("qwen3_tts.preprocess.cache_key.dtoh"):
+        rows = input_embeds.detach().to(dtype=torch.float32, device="cpu")
     key_ids: list[int] = []
     for row in rows:
         digest = hashlib.blake2b(row.numpy().tobytes(), digest_size=8).digest()
@@ -552,7 +554,8 @@ def _cacheable_qwen3_tts_voice_prompt(
 
 
 def _cacheable_qwen3_tts_tensor(value: torch.Tensor) -> torch.Tensor:
-    return value.detach().to(device="cpu").clone()
+    with TorchProfiler.record_function("qwen3_tts.preprocess.cache.dtoh"):
+        return value.detach().to(device="cpu").clone()
 
 
 def _qwen3_tts_voice_prompt_from_cache(
@@ -699,7 +702,11 @@ class _Qwen3TTSRefCodeBatcher:
                 if self._encode_stream is not None
                 else contextlib.nullcontext()
             )
-            with torch.inference_mode(), encode_stream_ctx:
+            with (
+                TorchProfiler.record_function("qwen3_tts.preprocess.reference_encode"),
+                torch.inference_mode(),
+                encode_stream_ctx,
+            ):
                 for sample_rate, group in groups.items():
                     waveforms = [waveform for _, waveform in group]
                     try:
@@ -724,7 +731,10 @@ class _Qwen3TTSRefCodeBatcher:
                     else:
                         for (index, _), code in zip(group, encoded, strict=True):
                             outcomes[index] = code
-            self._synchronize_outcomes(outcomes)
+            with TorchProfiler.record_function(
+                "qwen3_tts.preprocess.reference_encode.publish_wait"
+            ):
+                self._synchronize_outcomes(outcomes)
             for index, (_, _, future) in enumerate(batch):
                 outcome = outcomes[index]
                 if isinstance(outcome, Exception):
@@ -994,7 +1004,10 @@ def _prepare_qwen3_tts_base_request(
         else None
     )
     instruct_id = _build_instruct_id(wrapper, state.instructions)
-    with torch.no_grad():
+    with (
+        torch.no_grad(),
+        TorchProfiler.record_function("qwen3_tts.prompt.device_constants"),
+    ):
         return model.build_voice_clone_inputs(
             input_id=input_id,
             ref_id=ref_id,
@@ -1013,7 +1026,10 @@ def _prepare_qwen3_tts_custom_voice_request(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
     instruct_id = _build_instruct_id(wrapper, state.instructions)
-    with torch.no_grad():
+    with (
+        torch.no_grad(),
+        TorchProfiler.record_function("qwen3_tts.prompt.device_constants"),
+    ):
         return model.build_custom_voice_inputs(
             input_id=input_id,
             voice=state.voice or QWEN3_TTS_DEFAULT_CUSTOM_VOICE,
@@ -1031,7 +1047,10 @@ def _prepare_qwen3_tts_voice_design_request(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
     instruct_id = _build_instruct_id(wrapper, state.instructions)
-    with torch.no_grad():
+    with (
+        torch.no_grad(),
+        TorchProfiler.record_function("qwen3_tts.prompt.device_constants"),
+    ):
         return model.build_voice_design_inputs(
             input_id=input_id,
             language=state.language,
@@ -1050,41 +1069,42 @@ def _prepare_qwen3_tts_request(
 
     _validate_qwen3_tts_model_task(model, state)
     gen_kwargs = wrapper._merge_generate_kwargs(**state.generation_kwargs)
-    if state.task_type == QWEN3_TTS_TASK_BASE:
-        (
-            input_embeds,
-            attention_mask,
-            trailing_text_hidden,
-            ref_code,
-        ) = _prepare_qwen3_tts_base_request(
-            state=state,
-            model=model,
-            wrapper=wrapper,
-        )
-    elif state.task_type == QWEN3_TTS_TASK_CUSTOM_VOICE:
-        (
-            input_embeds,
-            attention_mask,
-            trailing_text_hidden,
-            ref_code,
-        ) = _prepare_qwen3_tts_custom_voice_request(
-            state=state,
-            model=model,
-            wrapper=wrapper,
-        )
-    elif state.task_type == QWEN3_TTS_TASK_VOICE_DESIGN:
-        (
-            input_embeds,
-            attention_mask,
-            trailing_text_hidden,
-            ref_code,
-        ) = _prepare_qwen3_tts_voice_design_request(
-            state=state,
-            model=model,
-            wrapper=wrapper,
-        )
-    else:
-        raise AssertionError(f"unhandled Qwen3-TTS task type: {state.task_type}")
+    with TorchProfiler.record_function("qwen3_tts.preprocess.prompt_build"):
+        if state.task_type == QWEN3_TTS_TASK_BASE:
+            (
+                input_embeds,
+                attention_mask,
+                trailing_text_hidden,
+                ref_code,
+            ) = _prepare_qwen3_tts_base_request(
+                state=state,
+                model=model,
+                wrapper=wrapper,
+            )
+        elif state.task_type == QWEN3_TTS_TASK_CUSTOM_VOICE:
+            (
+                input_embeds,
+                attention_mask,
+                trailing_text_hidden,
+                ref_code,
+            ) = _prepare_qwen3_tts_custom_voice_request(
+                state=state,
+                model=model,
+                wrapper=wrapper,
+            )
+        elif state.task_type == QWEN3_TTS_TASK_VOICE_DESIGN:
+            (
+                input_embeds,
+                attention_mask,
+                trailing_text_hidden,
+                ref_code,
+            ) = _prepare_qwen3_tts_voice_design_request(
+                state=state,
+                model=model,
+                wrapper=wrapper,
+            )
+        else:
+            raise AssertionError(f"unhandled Qwen3-TTS task type: {state.task_type}")
 
     feedback_buffer = model.model._feedback_buffer
     prompt_input_embeds = (
@@ -1285,10 +1305,11 @@ def apply_sglang_qwen3_tts_result(
 
     if code_parts:
         device = code_parts[0].device
-        codes = torch.cat(
-            [part.to(device=device, dtype=torch.long) for part in code_parts],
-            dim=0,
-        ).cpu()
+        with TorchProfiler.record_function("qwen3_tts.engine.codes.dtoh"):
+            codes = torch.cat(
+                [part.to(device=device, dtype=torch.long) for part in code_parts],
+                dim=0,
+            ).cpu()
     else:
         codes = torch.empty((0, 0), dtype=torch.long)
 

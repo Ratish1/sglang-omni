@@ -472,6 +472,7 @@ async def test_launcher_uses_runner_and_mounts_profiler_routes(
                 json={
                     "enable_torch": False,
                     "event_dir": str(tmp_path / "events"),
+                    "config": {"cuda_sync_debug_mode": "warn"},
                 },
             )
             stop_resp = client.post("/stop_profile", json={})
@@ -480,6 +481,7 @@ async def test_launcher_uses_runner_and_mounts_profiler_routes(
         assert profiler_calls.starts
         assert profiler_calls.starts[0]["enable_torch"] is False
         assert profiler_calls.starts[0]["event_dir"] == str(tmp_path / "events")
+        assert profiler_calls.starts[0]["cuda_sync_debug_mode"] == "warn"
         assert profiler_calls.stops == [{"run_id": None}]
     finally:
         rec = get_recorder()
@@ -508,17 +510,23 @@ def test_start_profile_request_only_mode_does_not_require_trace_template(
         with TestClient(app) as client:
             resp = client.post(
                 "/start_profile",
-                json={"enable_torch": False, "event_dir": event_dir},
+                json={
+                    "enable_torch": False,
+                    "event_dir": event_dir,
+                    "config": None,
+                },
             )
         assert resp.status_code == 200
         body = resp.json()
         assert body["enable_torch"] is False
         assert body["trace_path_template"] == ""
         assert body["event_dir"] == event_dir
+        assert body["config"] == {"cuda_sync_debug_mode": "default"}
         assert ctl.starts
         assert ctl.starts[0]["enable_torch"] is False
         assert ctl.starts[0]["trace_path_template"] == ""
         assert ctl.starts[0]["event_dir"] == event_dir
+        assert ctl.starts[0]["cuda_sync_debug_mode"] == "default"
     finally:
         rec = get_recorder()
         if rec.is_active():
@@ -539,6 +547,38 @@ def test_start_profile_torch_mode_still_requires_trace_template() -> None:
         resp = client.post("/start_profile", json={"enable_torch": True})
     assert resp.status_code == 400
     assert "trace_path_template is required" in resp.json()["detail"]
+
+
+def test_start_profile_rejects_unknown_sync_debug_configuration() -> None:
+    from sglang_omni.serve import launcher
+
+    class FakeProfilerControl:
+        async def broadcast_start(self, **kwargs) -> None:
+            raise AssertionError("invalid config should fail before broadcasting")
+
+    app = FastAPI()
+    launcher._mount_profiler_routes(app, FakeProfilerControl(), profiler_dir=None)
+
+    with TestClient(app) as client:
+        bad_mode = client.post(
+            "/start_profile",
+            json={
+                "enable_torch": False,
+                "event_dir": "/tmp/events",
+                "config": {"cuda_sync_debug_mode": "surprise"},
+            },
+        )
+        unknown_key = client.post(
+            "/start_profile",
+            json={
+                "enable_torch": False,
+                "event_dir": "/tmp/events",
+                "config": {"unrecognized": True},
+            },
+        )
+
+    assert bad_mode.status_code == 422
+    assert unknown_key.status_code == 422
 
 
 @pytest.mark.asyncio

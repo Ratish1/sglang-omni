@@ -457,6 +457,9 @@ def _run_process(
                     local_dispatcher=local_dispatcher,
                 )
             )
+        process_owns_cuda = any(stage.gpu_id is not None for stage in stages)
+        for stage in stages:
+            stage._process_owns_cuda = process_owns_cuda
         local_dispatcher.register_many(stages)
         asyncio.run(_start_and_run())
     except BaseException:

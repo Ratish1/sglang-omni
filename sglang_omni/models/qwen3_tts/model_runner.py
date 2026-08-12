@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.sglang_execution import attn_forward_context
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
+from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.scheduling.types import RequestOutput
 
 
@@ -28,7 +29,29 @@ class Qwen3TTSModelRunner(ModelRunner):
         requests: list,
     ) -> None:
         del forward_batch, schedule_batch
-        self.model.prepare_decode_buffers(requests)
+        with TorchProfiler.record_function("qwen3_tts.sampling_metadata.h2d"):
+            self.model.prepare_decode_buffers(requests)
+
+    def _prepare_and_forward(
+        self,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+        is_prefill: bool,
+        *,
+        is_lookahead: bool = False,
+    ) -> GenerationBatchResult:
+        range_name = (
+            "qwen3_tts.engine.prefill" if is_prefill else "qwen3_tts.engine.decode"
+        )
+        with TorchProfiler.record_function(range_name):
+            return super()._prepare_and_forward(
+                forward_batch,
+                schedule_batch,
+                requests,
+                is_prefill,
+                is_lookahead=is_lookahead,
+            )
 
     def custom_prefill_forward(
         self,
@@ -53,7 +76,8 @@ class Qwen3TTSModelRunner(ModelRunner):
     ) -> None:
         del is_lookahead
         del schedule_batch
-        self.model.prepare_decode_buffers(requests)
+        with TorchProfiler.record_function("qwen3_tts.sampling_metadata.h2d"):
+            self.model.prepare_decode_buffers(requests)
         self._write_feedback_buffers(forward_batch, requests)
 
     def post_prefill(

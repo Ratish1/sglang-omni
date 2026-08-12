@@ -13,6 +13,17 @@ from sglang_omni.proto.kv_transfer import (
 )
 from sglang_omni.proto.request import StagePayload
 
+CUDA_SYNC_DEBUG_MODES = frozenset({"default", "warn", "error"})
+
+
+def _require_cuda_sync_debug_mode(value: Any) -> str:
+    if not isinstance(value, str) or value not in CUDA_SYNC_DEBUG_MODES:
+        raise ValueError(
+            "cuda_sync_debug_mode must be one of "
+            f"{sorted(CUDA_SYNC_DEBUG_MODES)}, got {value!r}"
+        )
+    return value
+
 
 @dataclass
 class DataReadyMessage:
@@ -279,6 +290,7 @@ class ProfilerStartMessage:
     trace_path_template: str  # e.g. "/tmp/profiles/{run_id}/{stage}/trace"
     event_dir: str | None = None  # Per-stage JSONL event sink dir for request profiling
     enable_torch: bool = True  # When False, only request-level events are captured
+    cuda_sync_debug_mode: str = "default"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -287,6 +299,9 @@ class ProfilerStartMessage:
             "trace_path_template": self.trace_path_template,
             "event_dir": self.event_dir,
             "enable_torch": self.enable_torch,
+            "cuda_sync_debug_mode": _require_cuda_sync_debug_mode(
+                self.cuda_sync_debug_mode
+            ),
         }
 
     @classmethod
@@ -296,6 +311,9 @@ class ProfilerStartMessage:
             trace_path_template=d["trace_path_template"],
             event_dir=d.get("event_dir"),
             enable_torch=bool(d.get("enable_torch", True)),
+            cuda_sync_debug_mode=_require_cuda_sync_debug_mode(
+                d.get("cuda_sync_debug_mode", "default")
+            ),
         )
 
 

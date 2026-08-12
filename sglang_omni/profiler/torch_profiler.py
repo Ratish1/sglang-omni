@@ -9,7 +9,7 @@ import subprocess
 import threading
 from contextlib import nullcontext
 
-from torch.profiler import ProfilerActivity, profile
+from torch.profiler import ProfilerActivity, profile, record_function
 
 from .base_profiler import ProfilerBase
 
@@ -43,6 +43,7 @@ class TorchProfiler(ProfilerBase):
         Start the profiler with the given trace path template.
         """
         with cls._lock:
+            rank = cls._get_rank()
 
             # 1. Cleanup any existing profiler
             if cls._profiler is not None:
@@ -64,8 +65,6 @@ class TorchProfiler(ProfilerBase):
                 cls._profiler = None
                 cls._active_run_id = None
                 cls._trace_template = ""
-
-            rank = cls._get_rank()
 
             # 2. Make path absolute
             trace_path_template = os.path.abspath(trace_path_template)
@@ -199,3 +198,15 @@ class TorchProfiler(ProfilerBase):
     @classmethod
     def get_step_context(cls):
         return nullcontext()
+
+    @classmethod
+    def record_function(cls, name: str):
+        """Create a semantic range only while this process is being profiled.
+
+        Qwen3-TTS invokes these scopes in request and decode hot paths. Returning
+        a null context while inactive keeps production execution free of the
+        dispatcher overhead that an unconditional ``record_function`` incurs.
+        """
+        if cls._profiler is None:
+            return nullcontext()
+        return record_function(name)

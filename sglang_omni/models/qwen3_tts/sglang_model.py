@@ -28,6 +28,7 @@ from sglang_omni.models.qwen3_tts.compat import (
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
     sample_from_sorted_logprobs_with_seed_small_k,
 )
+from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.layers import ReplicatedLinear, RMSNorm
 from sglang_omni.vendor.sglang.models import apply_qk_norm
@@ -565,14 +566,17 @@ class Qwen3TTSTalker(nn.Module):
             fmin=0,
             fmax=12000,
         ).transpose(1, 2)
-        return self.speaker_encoder(mels.to(self.device).to(self.dtype))[0]
+        with TorchProfiler.record_function("qwen3_tts.preprocess.speaker_h2d"):
+            mels = mels.to(self.device).to(self.dtype)
+        return self.speaker_encoder(mels)[0]
 
     @torch.inference_mode()
     def generate_speaker_prompt(self, voice_clone_prompt: dict[str, Any]):
-        return [
-            emb.to(self.device).to(self.dtype)
-            for emb in voice_clone_prompt["ref_spk_embedding"]
-        ]
+        with TorchProfiler.record_function("qwen3_tts.preprocess.speaker_h2d"):
+            return [
+                emb.to(self.device).to(self.dtype)
+                for emb in voice_clone_prompt["ref_spk_embedding"]
+            ]
 
     def _build_instruct_embed(
         self,

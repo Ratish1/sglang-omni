@@ -14,6 +14,7 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
@@ -417,6 +418,14 @@ class Qwen3TTSStreamingVocoderScheduler(
         state.code_chunks.append(codes)
         state.total_frames += int(codes.shape[0])
 
+    def stream_payload(
+        self,
+        request_id: str,
+        waveform: torch.Tensor,
+    ) -> dict[str, Any]:
+        with TorchProfiler.record_function("qwen3_tts.output.host_commit"):
+            return super().stream_payload(request_id, waveform)
+
     def should_decode(self, state: _Qwen3TTSStreamState, *, is_final: bool) -> bool:
         if is_final:
             return True
@@ -489,7 +498,10 @@ class Qwen3TTSStreamingVocoderScheduler(
         stream: torch.cuda.Stream | None,
     ) -> list[torch.Tensor]:
         decoder_input = torch.cat([plan.decoder_input for plan in plans], dim=0)
-        with torch.inference_mode():
+        with (
+            torch.inference_mode(),
+            TorchProfiler.record_function("qwen3_tts.vocoder.decode"),
+        ):
             if stream is None:
                 waveform = self._decoder.chunked_decode(decoder_input)
             else:
@@ -503,7 +515,8 @@ class Qwen3TTSStreamingVocoderScheduler(
                     )
                     if waveform is None:
                         waveform = self._decoder.chunked_decode(decoder_input)
-                stream.synchronize()
+                with TorchProfiler.record_function("qwen3_tts.vocoder.publish_wait"):
+                    stream.synchronize()
         if waveform.ndim == 3:
             if waveform.shape[0] != len(plans):
                 raise RuntimeError(
@@ -937,9 +950,10 @@ class Qwen3TTSStreamingVocoderScheduler(
                 )
             codes.append(torch.as_tensor(state.audio_codes, dtype=torch.long))
 
-        wavs, sample_rate = self._tokenizer.decode(
-            [{"audio_codes": item} for item in codes]
-        )
+        with TorchProfiler.record_function("qwen3_tts.vocoder.decode"):
+            wavs, sample_rate = self._tokenizer.decode(
+                [{"audio_codes": item} for item in codes]
+            )
         if len(wavs) != len(payloads):
             raise RuntimeError(
                 f"Qwen3-TTS speech tokenizer returned {len(wavs)} audios for "
@@ -964,12 +978,13 @@ class Qwen3TTSStreamingVocoderScheduler(
             cut = int(state.ref_code_len / max(total_frames, 1) * waveform.shape[0])
             waveform = waveform[cut:]
 
-        data = audio_waveform_payload(
-            waveform,
-            sample_rate=int(sample_rate),
-            modality="audio",
-            source_hint="Qwen3-TTS",
-        )
+        with TorchProfiler.record_function("qwen3_tts.output.host_commit"):
+            data = audio_waveform_payload(
+                waveform,
+                sample_rate=int(sample_rate),
+                modality="audio",
+                source_hint="Qwen3-TTS",
+            )
         usage = build_usage(state)
         if usage is not None:
             data["usage"] = usage
@@ -980,7 +995,8 @@ class Qwen3TTSStreamingVocoderScheduler(
         if state.audio_codes is None:
             return None
         codes = torch.as_tensor(state.audio_codes, dtype=torch.long)
-        wavs, _ = self._tokenizer.decode([{"audio_codes": codes}])
+        with TorchProfiler.record_function("qwen3_tts.vocoder.decode"):
+            wavs, _ = self._tokenizer.decode([{"audio_codes": codes}])
         if not wavs:
             return None
         waveform = torch.as_tensor(wavs[0], dtype=torch.float32)
