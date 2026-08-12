@@ -9,6 +9,7 @@ from numbers import Integral
 from typing import Any
 
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,17 @@ def build_default_prefill_cuda_graph_bs(max_num_tokens: int) -> list[int]:
     return values
 
 
+def nested_prefill_overrides(overrides: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Extract the prefill section of a nested cuda_graph_config override."""
+    config = overrides.get("cuda_graph_config")
+    if isinstance(config, CudaGraphConfig):
+        config = config.to_dict()
+    if not isinstance(config, Mapping):
+        return {}
+    prefill_config = config.get("prefill")
+    return prefill_config if isinstance(prefill_config, Mapping) else {}
+
+
 def build_generation_batch_overrides(
     *,
     max_running_requests: int,
@@ -78,6 +90,23 @@ def build_generation_batch_overrides(
     **stage_defaults: Any,
 ) -> dict[str, Any]:
     incoming = dict(server_args_overrides or {})
+    # The nested form wins in sglang; mirror its prefill fields into the flat keys.
+    nested_prefill = nested_prefill_overrides(incoming)
+    for nested_key, flat_key in (
+        ("backend", "cuda_graph_backend_prefill"),
+        ("bs", "cuda_graph_bs_prefill"),
+        ("max_bs", "cuda_graph_max_bs_prefill"),
+    ):
+        if nested_key not in nested_prefill:
+            continue
+        nested_value = nested_prefill[nested_key]
+        if flat_key in incoming and incoming[flat_key] != nested_value:
+            raise ValueError(
+                f"Conflicting {flat_key} and cuda_graph_config prefill "
+                f"{nested_key} values: "
+                f"{incoming[flat_key]!r} != {nested_value!r}"
+            )
+        incoming[flat_key] = nested_value
     max_running_requests = _normalize_positive_int(
         "max_running_requests",
         incoming.pop("max_running_requests", max_running_requests),
@@ -230,6 +259,19 @@ def _validate_prefill_graph_policy(
             f"got {backend!r}"
         )
         return
+
+    incompatibilities = (
+        ("context parallel (attn_cp_size > 1)", server_args.attn_cp_size > 1),
+        ("decode context parallel (dcp_size > 1)", server_args.dcp_size > 1),
+        ("LoRA", bool(server_args.lora_paths) or bool(server_args.enable_lora)),
+        ("MoE A2A", server_args.moe_a2a_backend != "none"),
+    )
+    for feature, is_active in incompatibilities:
+        if is_active:
+            errors.append(
+                f"breakable prefill CUDA graphs are incompatible with {feature}; "
+                "set cuda_graph_backend_prefill='disabled'"
+            )
 
     if ("prefill", "bs") not in server_args._cuda_graph_config_locked:
         errors.append(
