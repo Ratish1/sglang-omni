@@ -41,7 +41,7 @@ def remove_weight_norm(module: nn.Module) -> int:
     for child in module.modules():
         try:
             nn.utils.remove_weight_norm(child)
-        except (ValueError, RuntimeError):
+        except ValueError:
             continue
         removed += 1
     return removed

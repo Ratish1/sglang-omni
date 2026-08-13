@@ -80,7 +80,7 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
     ) -> None:
         conditioned = []
         for req in reqs:
-            if not self._is_cfg_uncond(req):
+            if not is_cfg_uncond_rid(req.rid):
                 conditioned.append(req)
                 continue
             if req.finished():
@@ -94,11 +94,6 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
         super().abort(
             cfg_uncond_rid(request_id), defer_running_cleanup=defer_running_cleanup
         )
-
-    @staticmethod
-    def _is_cfg_uncond(req: Any) -> bool:
-        data = getattr(req, "_omni_data", None)
-        return data is not None and data.is_cfg_uncond
 
 
 __all__ = ["MiniMaxMusic3Scheduler"]

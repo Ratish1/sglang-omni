@@ -143,7 +143,7 @@ class MiniMaxMusic3ModelRunner(ModelRunner):
         self, result: Any, forward_batch: Any, schedule_batch: Any, requests: list
     ) -> None:
         del forward_batch
-        if bool(getattr(schedule_batch, "is_prefill_only", False)) or not requests:
+        if schedule_batch.is_prefill_only or not requests:
             return
         self._advance(result, requests, emit=False)
 
@@ -180,8 +180,7 @@ class MiniMaxMusic3ModelRunner(ModelRunner):
     def on_request_finished(self, request_id: str, req_data: Any) -> None:
         ar_state = req_data.ar_state
         self._request_data.pop(request_id, None)
-        if ar_state is None:
-            return
+        assert ar_state is not None
         if ar_state.generated_frames == 0:
             raise ValueError(
                 f"MiniMax Music 3 generated zero audio frames for request {request_id}"

@@ -78,7 +78,7 @@ class RotaryEmbedding(nn.Module):
 
     def forward_from_seq_len(self, seq_len: int) -> tuple[Tensor, float]:
         t = torch.arange(seq_len, device=self.inv_freq.device, dtype=torch.float32)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq.float())
         return torch.cat((freqs, freqs), dim=-1), 1.0
 
 
@@ -227,8 +227,10 @@ class ContinuousTransformer(nn.Module):
         cached = self._rotary_cache.get(key)
         if cached is None:
             freqs = self.rotary_pos_emb.forward_from_seq_len(seq_len)[0]
-            freqs = freqs.to(dtype=dtype, device=device)
-            cached = (freqs.cos(), freqs.sin())
+            cached = (
+                freqs.cos().to(dtype=dtype, device=device),
+                freqs.sin().to(dtype=dtype, device=device),
+            )
             self._rotary_cache[key] = cached
         return cached
 

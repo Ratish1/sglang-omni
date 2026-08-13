@@ -162,9 +162,10 @@ def apply_minimax_result(data: MiniMaxMusic3SGLangRequestData) -> StagePayload:
 def _drain_pending_chunks(
     request_id: str, data: MiniMaxMusic3SGLangRequestData
 ) -> Iterator[OutgoingMessage]:
-    ar_state = data.ar_state
-    if ar_state is None:
+    if data.is_cfg_uncond:
         return
+    ar_state = data.ar_state
+    assert ar_state is not None
     pending = ar_state.pending_chunks
     while pending:
         chunk, metadata = pending.pop(0)

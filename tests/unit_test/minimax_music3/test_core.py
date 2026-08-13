@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +24,7 @@ from sglang_omni.models.minimax_music3.config import (
 from sglang_omni.models.minimax_music3.dav import remove_weight_norm
 from sglang_omni.models.minimax_music3.dit import (
     Attention,
+    ContinuousTransformer,
     MiniMaxMusic3DIT,
     RotaryEmbedding,
     _apply_rope,
@@ -33,6 +34,7 @@ from sglang_omni.models.minimax_music3.model_runner import _HiddenFrameBuffer
 from sglang_omni.models.minimax_music3.rvq_cuda_graph import RVQDepthCudaGraphRunner
 from sglang_omni.models.minimax_music3.rvq_decoder import sample_topk_seeded
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 
 
 @pytest.mark.parametrize(
@@ -255,6 +257,37 @@ def test_dav_weight_norm_folding_preserves_output() -> None:
     assert remove_weight_norm(convolution) == 0
 
 
+def test_dav_weight_norm_folding_propagates_runtime_failures(monkeypatch) -> None:
+    def fail(_module: torch.nn.Module) -> None:
+        raise RuntimeError("fold failed")
+
+    monkeypatch.setattr(torch.nn.utils, "remove_weight_norm", fail)
+
+    with pytest.raises(RuntimeError, match="fold failed"):
+        remove_weight_norm(torch.nn.Identity())
+
+
+def test_bfloat16_rotary_computes_phases_in_float32() -> None:
+    with torch.device("meta"):
+        transformer = ContinuousTransformer(
+            compute_dtype=torch.bfloat16,
+            attention_backend="torch_sdpa",
+        )
+    transformer.rotary_pos_emb = RotaryEmbedding(32)
+    rotary = transformer.rotary_pos_emb
+
+    actual_cos, actual_sin = transformer._rotary_cos_sin(
+        689, dtype=torch.bfloat16, device=torch.device("cpu")
+    )
+    positions = torch.arange(689, dtype=torch.float32)
+    frequencies = torch.outer(positions, rotary.inv_freq)
+    frequencies = torch.cat((frequencies, frequencies), dim=-1)
+
+    assert actual_cos.dtype == torch.bfloat16
+    torch.testing.assert_close(actual_cos, frequencies.cos().to(torch.bfloat16))
+    torch.testing.assert_close(actual_sin, frequencies.sin().to(torch.bfloat16))
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_native_sdpa_matches_reference_without_diffusion_server_args() -> None:
@@ -344,6 +377,8 @@ def test_rvq_cuda_graph_replays_per_bucket_and_clones_outputs() -> None:
     assert torch.equal(actual_codes, preserved_codes)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_rvq_cuda_graph_declines_a_batch_larger_than_every_bucket() -> None:
     def depth_forward(hidden, c0, seeds, positions, forced, replay):
         del c0, seeds, positions, replay
@@ -527,27 +562,83 @@ def test_acoustic_scheduler_accepts_the_relay_tensor_shape() -> None:
     assert decoder.hidden_shape == (1, 32768)
 
 
-def test_backbone_config_rewrite_does_not_write_through_a_symlink(
+def test_backbone_setup_uses_the_released_component_without_mutating_the_snapshot(
     tmp_path: Path,
 ) -> None:
-    """A Hub snapshot symlinks config.json into the shared blob store.
+    from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 
-    Writing through the link would rewrite a blob whose filename is its own
-    content hash, corrupting it for every other snapshot that shares it.
-    """
     from sglang_omni.models.minimax_music3.engine_builder import (
         MiniMaxMusic3EngineBuilder,
     )
 
-    blob = tmp_path / "blob"
-    blob.write_text(json.dumps({"model_type": "mixtral", "hidden_size": 4096}))
-    snapshot = tmp_path / "snapshot"
-    snapshot.mkdir()
-    config_path = snapshot / "config.json"
-    config_path.symlink_to(blob)
+    qwen_dir = tmp_path / "qwen_7B" / "qwen_7B"
+    qwen_dir.mkdir(parents=True)
+    language_model_dir = tmp_path / "language_model"
+    language_model_dir.mkdir()
+    blob = tmp_path / "config-blob"
+    blob.write_text('{"model_type":"mixtral"}')
+    legacy_config = qwen_dir / "config.json"
+    legacy_config.symlink_to(blob)
+    released_config = language_model_dir / "config.json"
+    released_config.write_text('{"model_type":"qwen3"}')
+    load_weights = Qwen3ForCausalLM.load_weights
 
-    MiniMaxMusic3EngineBuilder._normalize_backbone_config(config_path)
+    builder = MiniMaxMusic3EngineBuilder()
+    checkpoint_dir = builder.resolve_checkpoint(str(tmp_path))
+    builder.pre_infra_setup(checkpoint_dir)
 
-    assert json.loads(blob.read_text())["model_type"] == "mixtral"
-    assert not config_path.is_symlink()
-    assert json.loads(config_path.read_text())["model_type"] == "qwen3"
+    assert checkpoint_dir == str(language_model_dir)
+    assert legacy_config.is_symlink()
+    assert legacy_config.read_text() == '{"model_type":"mixtral"}'
+    assert released_config.read_text() == '{"model_type":"qwen3"}'
+    assert not list(tmp_path.rglob("*.bak"))
+    assert Qwen3ForCausalLM.load_weights is load_weights
+
+
+def test_engine_builder_forces_overlap_schedule_off() -> None:
+    from sglang_omni.models.minimax_music3.engine_builder import (
+        MiniMaxMusic3EngineBuilder,
+    )
+
+    overrides = {"disable_overlap_schedule": False}
+
+    MiniMaxMusic3EngineBuilder().adjust_overrides(overrides)
+
+    assert overrides["disable_overlap_schedule"] is True
+
+
+def test_ar_stage_rejects_nonpositive_concurrency(monkeypatch) -> None:
+    from sglang_omni.models.minimax_music3.engine_builder import (
+        MiniMaxMusic3EngineBuilder,
+    )
+    from sglang_omni.models.minimax_music3.stages import create_ar_executor
+
+    monkeypatch.setattr(
+        MiniMaxMusic3EngineBuilder, "build", lambda *args, **kwargs: None
+    )
+
+    with pytest.raises(ValueError, match="max_running_requests must be positive"):
+        create_ar_executor("unused", device="cuda:0", max_concurrency=0)
+
+
+def test_scheduler_identifies_the_cfg_twin_after_request_data_is_detached(
+    monkeypatch,
+) -> None:
+    from sglang_omni.models.minimax_music3.scheduler import MiniMaxMusic3Scheduler
+
+    forwarded = []
+    closed = []
+    monkeypatch.setattr(
+        OmniScheduler,
+        "stream_output",
+        lambda _self, reqs, _return_logprob, _skip_req: forwarded.extend(reqs),
+    )
+    scheduler = object.__new__(MiniMaxMusic3Scheduler)
+    scheduler._close_completed_request = closed.append
+    conditioned = SimpleNamespace(rid="request", finished=lambda: False)
+    cfg_uncond = SimpleNamespace(rid="request-cfg", finished=lambda: True)
+
+    scheduler.stream_output([conditioned, cfg_uncond])
+
+    assert forwarded == [conditioned]
+    assert closed == [cfg_uncond]

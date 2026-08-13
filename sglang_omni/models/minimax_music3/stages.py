@@ -57,9 +57,7 @@ def create_ar_executor(
     requested = overrides.get("max_running_requests")
     if requested is not None:
         max_concurrency = int(requested)
-    builder = MiniMaxMusic3EngineBuilder(
-        max_running_requests=max(int(max_concurrency), 1)
-    )
+    builder = MiniMaxMusic3EngineBuilder(max_running_requests=int(max_concurrency))
     scheduler = builder.build(
         model_path,
         device=device,

@@ -88,3 +88,24 @@ def test_request_data_asks_the_scheduler_to_enforce_limits() -> None:
     )
 
     assert MiniMaxMusic3SGLangRequestData().enforce_request_limits is True
+
+
+def test_cfg_twin_has_no_public_stream_output() -> None:
+    from sglang_omni.models.minimax_music3.sglang_request_builder import (
+        MiniMaxMusic3SGLangRequestData,
+        build_stream_output,
+    )
+
+    data = MiniMaxMusic3SGLangRequestData(is_cfg_uncond=True)
+
+    assert list(build_stream_output("request-cfg", data, None)) == []
+
+
+def test_conditioned_stream_output_requires_ar_state() -> None:
+    from sglang_omni.models.minimax_music3.sglang_request_builder import (
+        MiniMaxMusic3SGLangRequestData,
+        build_stream_output,
+    )
+
+    with pytest.raises(AssertionError):
+        list(build_stream_output("request", MiniMaxMusic3SGLangRequestData(), None))
