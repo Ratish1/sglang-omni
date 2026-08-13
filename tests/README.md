@@ -526,6 +526,13 @@ that happened to contain an older version of the test.
   - code-predictor CUDA-graph bit-identity, capture-failure fallback, top-k
     ladder masking, and enablement gating (env, `disable_cuda_graph`, TP).
 
+- `unit_test/minimax_music3/`: MiniMax Music 3 unit tests:
+  - pipeline placement, request construction, prompt normalization, CFG pairing,
+    chunk windows, result adaptation, and scheduler stream contracts
+  - DIT/DAV/RVQ equations, checkpoint loading boundaries, seeded sampling,
+    attention backends, compilation, and CUDA-graph behavior; CUDA cases carry
+    the `gpu` marker.
+
 - `unit_test/higgs_tts/`: Higgs TTS unit tests:
   - OmniScheduler-backed AR stage factory wiring
   - upstream Transformers codec binding and bundled-config state-dict structure

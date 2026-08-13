@@ -28,6 +28,7 @@ cd sglang-omni
 uv venv .venv -p 3.12
 source .venv/bin/activate
 
+uv pip uninstall flashinfer-cubin
 uv pip install -v -e .   # drop -e for a non-editable install
 ```
 
@@ -81,7 +82,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   <source src="https://github.com/user-attachments/files/30964122/song_1.wav" type="audio/wav">
 </audio>
 
-`max_new_tokens` counts audio frames at 25 frames per second, so 750 frames is **at most** 30 seconds. It is a cap, not a target: the model ends the song itself when it emits the audio-end token. The request above typically fills the cap (~30 seconds). Raise the cap when you want room for an earlier natural ending; a response that stops short of the cap is the model finishing, not a truncation.
+`max_new_tokens` counts audio frames at 25 frames per second, so 750 frames is **at most** 30 seconds. It is a cap, not a target: the model can end the song itself when it emits the audio-end token. The request above typically fills the cap (~30 seconds). The response headers distinguish an audio-end stop from a length limit through `X-Finish-Reason`.
 
 The response body is a 32 kHz stereo WAV.
 
@@ -216,7 +217,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 ### Reproducibility and variations
 
-A request is deterministic in its seed: the same lyrics, caption, seed and length return byte-identical audio. Changing only the seed gives another take of the same song — the way to explore alternatives without touching the prompt.
+A seed makes sampling repeatable for the same execution shape and schedule. Changing only the seed gives another take of the same song — the way to explore alternatives without touching the prompt. Continuous batching can change floating-point execution shapes, so byte-identical output is not promised when concurrency, admission order, or request retirement changes.
 
 ```python
 import requests
@@ -253,7 +254,7 @@ Omitting `seed` uses `0`, which is still deterministic — it is a fixed seed, n
 
 ### Reference outputs
 
-Five captions across five genres, rendered on a single H200 with the defaults this page documents and nothing else set. Each request is given in full, so pasting one back reproduces its clip.
+Five illustrative captions across five genres, rendered on a single H200 with the defaults this page documents and nothing else set. Each request is given in full so the prompt can be reused, but the linked WAV is not a hardware- or batch-shape-independent golden output.
 
 Four of the five fill the 750-frame cap at 30.0 seconds. The J-pop one stops itself at 26.2 seconds, which is `max_new_tokens` behaving as a cap rather than a target — the model ended the song.
 
@@ -449,7 +450,7 @@ That flatness is also why guidance is cheap in time and expensive in memory. The
 | `model` | string | served model | Served model identifier |
 | `input` | string | (required) | Lyrics. Non-empty. Use `[Verse]` / `[Chorus]` / `[Bridge]` / `[Outro]` on their own lines |
 | `instructions` | string | (required) | Caption describing genre, instrumentation, tempo, mood and production. Non-empty |
-| `seed` | int | `0` | Non-negative 64-bit integer. Fixes the output for a given request |
+| `seed` | int | `0` | Non-negative 64-bit integer. Keys sampling; fixed-shape runs are repeatable |
 | `max_new_tokens` | int | `9000` | Cap on audio frames, 25 per second. Maximum 9,000 (six minutes). The model may finish earlier |
 | `response_format` | string | `"wav"` | Output container |
 | `stream` | bool | `false` | Must be `false`; this model's external API is non-streaming |
@@ -472,7 +473,7 @@ The request is refused rather than silently ignored, so a mistake is visible imm
 
 **Length and cost.** Generation time scales with `max_new_tokens`. A 10-second clip is the cheapest way to iterate on a caption; render the full song once the style is right.
 
-**Prompt sensitivity.** The prompt's token ids and the position of `<|audio_start|>` seed the backbone KV cache, so whitespace and tag rewrites are not cosmetic — they change the audio. If you need a result to be reproducible, keep the lyrics and caption byte-identical.
+**Prompt sensitivity.** The prompt's token ids and the position of `<|audio_start|>` seed the backbone KV cache, so whitespace and tag rewrites are not cosmetic — they change the audio. For repeatability, keep the lyrics, caption, and execution shape unchanged.
 
 **Memory.** `mem_fraction_static` defaults to `0.50` and budgets the SGLang backbone KV cache only; the acoustic stage's DIT and DAV weights sit outside that fraction. It is a share of total device memory, so the absolute KV pool shrinks on smaller cards automatically. Lowering it does not reliably help — measured at `0.35` the pipeline is about 6% slower. Budget against rows rather than requests: guidance means the pool has to hold two sequences per concurrent request, so raising `--max-running-requests` costs KV twice as fast as the number suggests.
 
