@@ -63,6 +63,7 @@ class MiniMaxMusic3EngineBuilder(TtsEngineBuilder):
         overrides["max_running_requests"] = rows
         overrides["cuda_graph_max_bs"] = rows
         overrides["cuda_graph_bs"] = build_default_cuda_graph_bs(rows)
+        overrides["disable_overlap_schedule"] = True
         overrides["disable_radix_cache"] = True
         overrides["chunked_prefill_size"] = 0
         if not bool(overrides.get("disable_cuda_graph", False)):
