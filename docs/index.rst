@@ -141,5 +141,6 @@ Supported Models
    developer_reference/communication.md
    developer_reference/reference_encode_service.md
    developer_reference/profiler.md
+   developer_reference/minimax_music3_h100_validation.md
    developer_reference/qwen3_asr_concurrency_profile.md
    developer_reference/rl_admin_control.md
