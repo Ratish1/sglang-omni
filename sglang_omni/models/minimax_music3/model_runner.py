@@ -143,7 +143,7 @@ class MiniMaxMusic3ModelRunner(ModelRunner):
         self, result: Any, forward_batch: Any, schedule_batch: Any, requests: list
     ) -> None:
         del forward_batch
-        if bool(getattr(schedule_batch, "is_prefill_only", False)) or not requests:
+        if schedule_batch.is_prefill_only or not requests:
             return
         self._advance(result, requests, emit=False)
 
