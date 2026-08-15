@@ -84,11 +84,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     # --decode-mode sync remains the operator opt-out.
     enable_async_decode: bool = True,
     async_decode_min_batch_size: int = 1,
-    prefill_coalesce_requests: int = 4,
-    prefill_coalesce_wait_ms: float = 12.0,
-    prefill_coalesce_when_idle: bool = True,
-    prefill_coalesce_requires_pending_builds: bool = True,
-    prefill_coalesce_after_builds_during_decode: bool = True,
+    defer_prefill_during_decode: bool = True,
     encoder_chunk_buckets: list[int] | None = None,
     encoder_torch_compile: bool = False,
     encoder_max_batch_size: int = 2,
@@ -121,15 +117,7 @@ def create_sglang_moss_transcribe_diarize_executor(
         encoder_chunk_buckets=buckets,
         encoder_torch_compile=encoder_torch_compile,
         encoder_max_batch_size=encoder_max_batch_size,
-        prefill_coalesce_requests=prefill_coalesce_requests,
-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
-        prefill_coalesce_when_idle=prefill_coalesce_when_idle,
-        prefill_coalesce_requires_pending_builds=(
-            prefill_coalesce_requires_pending_builds
-        ),
-        prefill_coalesce_after_builds_during_decode=(
-            prefill_coalesce_after_builds_during_decode
-        ),
+        defer_prefill_during_decode=defer_prefill_during_decode,
         request_build_max_workers=request_build_max_workers,
         request_build_max_pending=request_build_max_pending,
         stream_emit_interval_s=stream_emit_interval_s,

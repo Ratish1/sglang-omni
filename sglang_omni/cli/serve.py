@@ -15,10 +15,6 @@ from sglang_omni.config.manager import ConfigManager
 from sglang_omni.preprocessing.resource_connector import (
     resolve_allowed_local_media_path,
 )
-from sglang_omni.scheduling.prefill_coalesce import (
-    validate_prefill_coalesce_requests,
-    validate_prefill_coalesce_wait_ms,
-)
 from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 from sglang_omni.utils.gpu_compat import should_disable_custom_all_reduce_for_gpus
 
@@ -28,6 +24,7 @@ logger = logging.getLogger(__name__)
 _STAGE_TOGGLE_MODE = Literal["default", "on", "off"]
 _QWEN_COLOCATED_CONFIG_CLASS = "Qwen3OmniSpeechColocatedPipelineConfig"
 _DECODE_MODE = Literal["async", "sync"]
+_PREFILL_ADMISSION = Literal["eager", "batched"]
 _ASYNC_DECODE_FACTORIES = frozenset(
     {
         "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor",
@@ -45,7 +42,7 @@ _ASYNC_DECODE_SUPPORTED_MODELS = (
     "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
     "Qwen3-ASR, ARK-ASR, and the Qwen3-Omni thinker"
 )
-_PREFILL_COALESCE_FACTORIES = frozenset(
+_PREFILL_ADMISSION_FACTORIES = frozenset(
     {
         "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor",
         "sglang_omni.models.moss_tts_local.stages.create_sglang_tts_engine_executor",
@@ -58,7 +55,7 @@ _PREFILL_COALESCE_FACTORIES = frozenset(
         "sglang_omni.models.whisper_asr.stages.create_sglang_whisper_asr_executor",
     }
 )
-_PREFILL_COALESCE_SUPPORTED_MODELS = (
+_PREFILL_ADMISSION_SUPPORTED_MODELS = (
     "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
     "Qwen3-ASR, Whisper ASR, and the Qwen3-Omni thinker"
 )
@@ -84,6 +81,13 @@ def _normalize_decode_mode(value: str) -> _DECODE_MODE:
     normalized = value.strip().lower()
     if normalized not in {"async", "sync"}:
         raise typer.BadParameter("--decode-mode must be one of: async, sync")
+    return normalized  # type: ignore[return-value]
+
+
+def _normalize_prefill_admission(value: str) -> _PREFILL_ADMISSION:
+    normalized = value.strip().lower()
+    if normalized not in {"eager", "batched"}:
+        raise typer.BadParameter("--prefill-admission must be one of: eager, batched")
     return normalized  # type: ignore[return-value]
 
 
@@ -902,64 +906,30 @@ def apply_decode_mode_cli_overrides(
     return pipeline_config
 
 
-def apply_prefill_coalesce_cli_overrides(
+def apply_prefill_admission_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
-    prefill_coalesce_requests: int | None,
-    prefill_coalesce_wait_ms: float | None,
+    prefill_admission: str | None,
 ) -> PipelineConfig:
-    updates: dict[str, object] = {}
-    try:
-        if prefill_coalesce_requests is not None:
-            updates["prefill_coalesce_requests"] = validate_prefill_coalesce_requests(
-                prefill_coalesce_requests
-            )
-        if prefill_coalesce_wait_ms is not None:
-            updates["prefill_coalesce_wait_ms"] = validate_prefill_coalesce_wait_ms(
-                prefill_coalesce_wait_ms
-            )
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-
-    if not updates:
+    if prefill_admission is None:
         return pipeline_config
+    mode = _normalize_prefill_admission(prefill_admission)
     matching_stages = [
         stage
         for stage in pipeline_config.stages
-        if stage.factory in _PREFILL_COALESCE_FACTORIES
+        if stage.factory in _PREFILL_ADMISSION_FACTORIES
     ]
     if not matching_stages:
         raise typer.BadParameter(
-            "--prefill-coalesce-requests/--prefill-coalesce-wait-ms currently "
-            f"support only {_PREFILL_COALESCE_SUPPORTED_MODELS}; no stage in "
-            "this pipeline uses a supported factory"
+            "--prefill-admission currently supports only "
+            f"{_PREFILL_ADMISSION_SUPPORTED_MODELS}; no stage in this pipeline "
+            "uses a supported factory"
         )
-
-    def configured_requests(stage: StageConfig) -> int:
-        raw_value = (stage.factory_args or {}).get("prefill_coalesce_requests", 0)
-        runtime_overrides = pipeline_config.runtime_overrides.get(stage.name)
-        if (
-            isinstance(runtime_overrides, dict)
-            and "prefill_coalesce_requests" in runtime_overrides
-        ):
-            raw_value = runtime_overrides["prefill_coalesce_requests"]
-        try:
-            return validate_prefill_coalesce_requests(raw_value)
-        except ValueError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-
-    if prefill_coalesce_requests is None and not any(
-        # The YAML may already enable the gate; only warn when tuning the wait
-        # would genuinely have no effect on any targeted stage.
-        configured_requests(stage) >= 2
-        for stage in matching_stages
-    ):
-        logger.warning(
-            "--prefill-coalesce-wait-ms alone does not enable coalescing; the "
-            "gate engages only when prefill_coalesce_requests is >= 2 (via "
-            "--prefill-coalesce-requests or per-stage YAML)"
-        )
-    _apply_factory_args_updates(pipeline_config, matching_stages, updates)
+    _apply_factory_args_updates(
+        pipeline_config,
+        matching_stages,
+        {"defer_prefill_during_decode": mode == "batched"},
+    )
     return pipeline_config
 
 
@@ -1318,29 +1288,20 @@ def serve(
             ),
         ),
     ] = None,
-    prefill_coalesce_requests: Annotated[
-        int | None,
+    prefill_admission: Annotated[
+        str | None,
         typer.Option(
-            "--prefill-coalesce-requests",
-            "--prefill_coalesce_requests",
+            "--prefill-admission",
+            "--prefill_admission",
             help=(
-                "Hold prefill admission until this many requests are waiting "
-                "(or the oldest has waited --prefill-coalesce-wait-ms), "
-                "amortizing the per-step host cost. The gate engages at >= 2; "
-                "0 disables (default), and 1 is likewise a no-op (logs a "
-                "warning). "
-                f"Available for {_PREFILL_COALESCE_SUPPORTED_MODELS}."
-            ),
-        ),
-    ] = None,
-    prefill_coalesce_wait_ms: Annotated[
-        float | None,
-        typer.Option(
-            "--prefill-coalesce-wait-ms",
-            "--prefill_coalesce_wait_ms",
-            help=(
-                "Upper bound on the extra time-to-first-token a queued request "
-                "pays for prefill coalescing. Default 60."
+                "Prefill admission policy for the generation stage: "
+                "eager|batched. Omit this flag to use the model-specific "
+                "default. Eager prefills each request as soon as it is built. "
+                "Batched prefills a request built while a decode step is "
+                "running, and more requests are still arriving, together with "
+                "those arrivals after that step; nothing waits when decode is "
+                "idle and there is no timed hold. "
+                f"Available for {_PREFILL_ADMISSION_SUPPORTED_MODELS}."
             ),
         ),
     ] = None,
@@ -1462,10 +1423,9 @@ def serve(
         decode_mode=decode_mode,
         async_lookahead_min_batch_size=async_lookahead_min_batch_size,
     )
-    merged_config = apply_prefill_coalesce_cli_overrides(
+    merged_config = apply_prefill_admission_cli_overrides(
         merged_config,
-        prefill_coalesce_requests=prefill_coalesce_requests,
-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+        prefill_admission=prefill_admission,
     )
     generation_server_args_overrides: dict[str, object] = {}
     if max_running_requests is not None:

@@ -36,19 +36,19 @@ runtime_overrides:
 
 The graph is captured after SGLang's generation graphs. Raise `max_prefill_tokens` before configuring larger buckets. Each request uses the smallest captured bucket that fits its batch. Requests larger than every captured bucket, with a different feature shape, or without a successful capture run eagerly. Startup and first-replay logs identify the captured and executed buckets.
 
-## Prefill Coalescing
+## Prefill Admission
 
-Whisper builds up to two requests concurrently and coalesces prefill at the serving-reachable batch size of two. A partial batch waits for at most 6 ms only while another request build is pending; a single request and a partial batch with no remaining build work are released immediately. This allows concurrent traffic to replay the encoder batch-2 graph without adding a fixed wait to the idle c=1 path.
+Whisper builds up to two requests concurrently, and prefill admission is `batched` by default: a request built while a decode step is running, and more requests are still arriving, is prefilled together with those arrivals after that step instead of interrupting decode once per request. Nothing waits when decode is idle, so the c=1 path pays no fixed wait, and there is no timed hold.
 
 `request_build_max_pending` bounds submitted request-build futures, not the request backlog. When `max_queued_requests` is unset, requests beyond that pending-build limit remain queued for later construction. Setting `max_queued_requests` retains the configured finite-queue rejection behavior.
 
-Use `prefill_coalesce_requests` and `prefill_coalesce_wait_ms` to tune the gate. Set `prefill_coalesce_requests: 0` to disable only coalescing, or also set `request_build_max_workers: 1` to restore the pre-optimization request-build path:
+Use `--prefill-admission eager` to prefill each request as soon as it is built, or also set `request_build_max_workers: 1` to restore the pre-optimization request-build path:
 
 ```yaml
 runtime_overrides:
   asr:
     request_build_max_workers: 1
-    prefill_coalesce_requests: 0
+    defer_prefill_during_decode: false
 ```
 
 ## Transcribe Audio
@@ -134,7 +134,7 @@ The following W-PR1 results used the 20-sample SeedTTS EN subset on a single H20
 
 All 480 W-PR1 measured requests completed successfully. Corpus WER was unchanged across eager and CUDA Graph modes at every concurrency.
 
-The following W-PR2 results were measured separately on the same H200 and 20-sample subset with five measured repeats plus one discarded warmup per concurrency. The baseline used one request-build worker with coalescing disabled; the attribution run used two workers with coalescing disabled; the optimized run used two workers, a batch target of two, and a pending-build-aware 6 ms deadline.
+The following W-PR2 results were measured separately on the same H200 and 20-sample subset with five measured repeats plus one discarded warmup per concurrency, on the earlier timed prefill-coalescing gate (since replaced by `defer_prefill_during_decode`). The baseline used one request-build worker with coalescing disabled; the attribution run used two workers with coalescing disabled; the optimized run used two workers, a batch target of two, and a pending-build-aware 6 ms deadline.
 
 | Concurrency | Baseline req/s | Two workers req/s | Coalesced req/s | Total gain | Gate gain | Baseline latency (s) | Coalesced latency (s) | Corpus WER |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|

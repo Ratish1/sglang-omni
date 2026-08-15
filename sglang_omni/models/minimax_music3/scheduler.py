@@ -42,7 +42,6 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
             return
         req = uncond.req
         self._normalize_req_token_arrays(req)
-        req._coalesce_enqueue_t = cond_req._coalesce_enqueue_t
         req._omni_terminal_claimed = False
         req._omni_data = uncond
         self.waiting_queue.append(req)

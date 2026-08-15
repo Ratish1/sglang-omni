@@ -470,8 +470,7 @@ def create_sglang_tts_engine_executor(
     stream_stride: int = DEFAULT_HIGGS_STREAM_STRIDE,
     stream_followup_stride: int = DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
     initial_chunk_frames: int = DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
-    prefill_coalesce_requests: int = 0,
-    prefill_coalesce_wait_ms: float = 60.0,
+    defer_prefill_during_decode: bool = False,
     total_gpu_memory_fraction: float | None = None,
 ):
     """sglang-backed AR engine for Higgs TTS."""
@@ -486,8 +485,7 @@ def create_sglang_tts_engine_executor(
         stream_stride=stream_stride,
         stream_followup_stride=stream_followup_stride,
         initial_chunk_frames=initial_chunk_frames,
-        prefill_coalesce_requests=prefill_coalesce_requests,
-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+        defer_prefill_during_decode=defer_prefill_during_decode,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
     ).build(
         model_path,

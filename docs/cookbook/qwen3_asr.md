@@ -20,11 +20,11 @@ Async decode is enabled by default for all decode batch sizes, allowing the
 shared one-step-lookahead path to overlap host-side result processing with the
 next GPU decode forward even for a single request. Use `--decode-mode sync` to
 disable it, or tune the crossover with `--async-lookahead-min-batch-size`.
-The request builders also use the shared LM prefill-admission gate: prefill
-starts when 16 built requests are ready or after the oldest ready request waits
-40 ms. Once request-build work drains, a ready prefill is released immediately
-if decode is idle; while decode is active, it continues coalescing until the
-same request target or deadline.
+Prefill admission is `batched` by default: a request built while a decode step
+is running, and more requests are still arriving, is prefilled together with
+those arrivals after that step instead of interrupting decode once per request.
+Nothing waits when decode is idle, and there is no timed hold. Use
+`--prefill-admission eager` to prefill each request as soon as it is built.
 
 ```bash
 sgl-omni serve \

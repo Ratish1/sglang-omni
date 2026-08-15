@@ -22,11 +22,7 @@ def create_sglang_qwen3_asr_executor(
     mm_attention_backend: str | None = None,
     request_build_max_workers: int = 8,
     request_build_max_pending: int | None = 32,
-    prefill_coalesce_requests: int = 16,
-    prefill_coalesce_wait_ms: float = 40.0,
-    prefill_coalesce_when_idle: bool = True,
-    prefill_coalesce_requires_pending_builds: bool = True,
-    prefill_coalesce_after_builds_during_decode: bool = True,
+    defer_prefill_during_decode: bool = True,
     enable_pre_lm_encoder: bool = True,
     pre_lm_cache_max_entries: int = 4096,
     pre_lm_cache_size_bytes: int = 2 * 1024**3,
@@ -48,15 +44,7 @@ def create_sglang_qwen3_asr_executor(
         mm_attention_backend=mm_attention_backend,
         request_build_max_workers=request_build_max_workers,
         request_build_max_pending=request_build_max_pending,
-        prefill_coalesce_requests=prefill_coalesce_requests,
-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
-        prefill_coalesce_when_idle=prefill_coalesce_when_idle,
-        prefill_coalesce_requires_pending_builds=(
-            prefill_coalesce_requires_pending_builds
-        ),
-        prefill_coalesce_after_builds_during_decode=(
-            prefill_coalesce_after_builds_during_decode
-        ),
+        defer_prefill_during_decode=defer_prefill_during_decode,
         enable_pre_lm_encoder=enable_pre_lm_encoder,
         pre_lm_cache_max_entries=pre_lm_cache_max_entries,
         pre_lm_cache_size_bytes=pre_lm_cache_size_bytes,

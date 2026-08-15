@@ -59,10 +59,6 @@ from sglang_omni.proto.admin import (
     ADMIN_WEIGHTS_CHECKER,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
-from sglang_omni.scheduling.prefill_coalesce import (
-    validate_prefill_coalesce_requests,
-    validate_prefill_coalesce_wait_ms,
-)
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
@@ -192,11 +188,7 @@ class OmniScheduler:
         enable_overlap: bool = False,
         enable_async_decode: bool = False,
         async_decode_min_batch_size: int = 2,
-        prefill_coalesce_requests: int = 0,
-        prefill_coalesce_wait_ms: float = 60.0,
-        prefill_coalesce_when_idle: bool = False,
-        prefill_coalesce_requires_pending_builds: bool = False,
-        prefill_coalesce_after_builds_during_decode: bool = False,
+        defer_prefill_during_decode: bool = False,
         request_build_max_workers: int = 1,
         request_build_max_pending: int | None = None,
         shutdown_callback: Callable[[], None] | None = None,
@@ -250,6 +242,11 @@ class OmniScheduler:
             self._request_build_executor = None
         self._pending_request_builds: dict[str, tuple[Any, bool, Future]] = {}
         self._backlogged_request_build_payloads: deque[Any] = deque()
+        # Arrival counter for work-conserving prefill admission. Written and
+        # read only on the scheduler thread (build drain and the event loop),
+        # and derived from the broadcast request stream, so TP ranks agree.
+        self._admission_arrivals_seen = 0
+        self._admission_arrivals_at_last_decision = 0
         self._request_build_max_pending_observed = 0
 
         # --- Core scheduling state (read/written by upstream methods) -----
@@ -287,27 +284,24 @@ class OmniScheduler:
                 "requests"
             )
 
-        # Note: (maydomine) Validate here as well as in the CLI because per-stage
-        # YAML reaches the scheduler through factory_args.
-        requests = validate_prefill_coalesce_requests(prefill_coalesce_requests)
-        wait_ms = validate_prefill_coalesce_wait_ms(prefill_coalesce_wait_ms)
-        if requests > 1 and int(server_args.tp_size) > 1:
-            logger.warning(
-                "Prefill admission coalescing is disabled for "
-                f"tp_size={server_args.tp_size}: the wait deadline reads each "
-                "rank's local clock, so ranks could disagree on expiry and "
-                "break lockstep scheduling"
+        # Per-stage YAML reaches here through factory_args, so reject
+        # non-bool values instead of coercing strings like "false" to True.
+        if not isinstance(defer_prefill_during_decode, bool):
+            raise ValueError(
+                "defer_prefill_during_decode must be a bool, got "
+                f"{defer_prefill_during_decode!r}"
             )
-            requests = 0
-        self.prefill_coalesce_requests = requests
-        self.prefill_coalesce_wait_s = wait_ms / 1e3
-        self.prefill_coalesce_when_idle = bool(prefill_coalesce_when_idle)
-        self.prefill_coalesce_requires_pending_builds = bool(
-            prefill_coalesce_requires_pending_builds
-        )
-        self.prefill_coalesce_after_builds_during_decode = bool(
-            prefill_coalesce_after_builds_during_decode
-        )
+        if defer_prefill_during_decode and int(server_args.tp_size) > 1:
+            logger.warning(
+                "defer_prefill_during_decode is disabled for "
+                f"tp_size={server_args.tp_size}: the policy is clock-free and "
+                "rank-deterministic, but stays off at tp>1 until validated "
+                "there"
+            )
+            defer_prefill_during_decode = False
+        self.defer_prefill_during_decode = defer_prefill_during_decode
+        if defer_prefill_during_decode:
+            logger.info("Prefill admission: defer_prefill_during_decode enabled")
 
         # Token / memory info (upstream reads from tp_worker.get_worker_info)
         mr = tp_worker.model_runner
@@ -1050,7 +1044,7 @@ class OmniScheduler:
                 stage=None,
                 event_name="scheduler_queue_enter",
             )
-            req._coalesce_enqueue_t = time.perf_counter()
+            self._admission_arrivals_seen += 1
             req._omni_terminal_claimed = False
             req._omni_data = req_data
             self.waiting_queue.append(req)
@@ -1169,38 +1163,61 @@ class OmniScheduler:
         return plan.batch_to_run
 
     def get_new_batch_prefill(self, running_batch):
-        # Note: (maydomine) batch prefill admissions to amortize the fixed step
-        # cost; the oldest-request deadline survives partial admission and aborts.
+        # Work-conserving prefill admission. Batching a wave's prefills
+        # amortizes the fixed step cost, but a batch is only worth forming
+        # when it costs no idle time, so admission defers only while a decode
+        # step runs this iteration anyway and the arrival stream is visibly
+        # still delivering (queue grew last iteration, or builds in flight).
+        # No wall-clock or count thresholds: those race arrival phase (a 6 ms
+        # arrival shift moved c16 throughput ~6% and could phase-lock into
+        # collapse) and diverge across TP ranks.
         #
-        # 0.5.16 passes ``running_batch`` in and expects a ``NextBatchPlan`` back,
-        # so the coalesce hold-off returns an empty plan rather than None.
-        if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
+        # 0.5.16 passes ``running_batch`` in and expects a ``NextBatchPlan``
+        # back; a deferral returns the empty plan and the upstream caller
+        # falls through to the decode step ("Run prefill first if possible",
+        # sglang scheduler.get_next_batch_to_run).
+        if not self.defer_prefill_during_decode or self.chunked_req is not None:
             return _Upstream.get_new_batch_prefill(self, running_batch)
-        decode_is_idle = running_batch is None or running_batch.is_empty()
-        if not self.prefill_coalesce_when_idle and decode_is_idle:
+        arrivals_seen = self._admission_arrivals_seen
+        arrived_last_iter = arrivals_seen != self._admission_arrivals_at_last_decision
+        self._admission_arrivals_at_last_decision = arrivals_seen
+        if not self.waiting_queue:
             return _Upstream.get_new_batch_prefill(self, running_batch)
-        if self.prefill_coalesce_requires_pending_builds:
-            with self._request_admission_lock:
-                build_work_pending = bool(
-                    self._pending_request_builds
-                    or self._backlogged_request_build_payloads
-                )
-            if not build_work_pending and not (
-                self.prefill_coalesce_after_builds_during_decode and not decode_is_idle
-            ):
+        decode_can_run = (
+            not running_batch.is_empty() and not running_batch.is_prefill_only
+        )
+        if not decode_can_run:
+            return _Upstream.get_new_batch_prefill(self, running_batch)
+        with self._request_admission_lock:
+            building = len(self._pending_request_builds)
+            backlogged = bool(self._backlogged_request_build_payloads)
+        if not arrived_last_iter and not building and not backlogged:
+            return _Upstream.get_new_batch_prefill(self, running_batch)
+        # Bound the hold: admit once the waiting cohort would outnumber the
+        # unfinished running requests plus the builds already submitted to
+        # the executor (queued or running; each enqueues when it completes,
+        # so they are the visible remainder of the arriving wave). Under a
+        # continuous trickle this stops the hold near the running batch size
+        # instead of piling a large cohort behind a shrinking decode.
+        running = sum(1 for req in running_batch.reqs if not req.finished())
+        if len(self.waiting_queue) >= running + building:
+            return _Upstream.get_new_batch_prefill(self, running_batch)
+        # Deferring cannot grow the admitted batch past the free running
+        # slots or the prefill token budget, so admit once the waiting cohort
+        # fills either. origin_input_ids overstates extend tokens under
+        # prefix caching, which only releases earlier, never defers longer.
+        if len(self.waiting_queue) >= self.get_num_allocatable_reqs(
+            len(running_batch.reqs)
+        ):
+            return _Upstream.get_new_batch_prefill(self, running_batch)
+        budget = int(self.max_prefill_tokens)
+        if self.chunked_prefill_size is not None:
+            budget = min(budget, int(self.chunked_prefill_size))
+        cohort_tokens = 0
+        for req in self.waiting_queue:
+            cohort_tokens += len(req.origin_input_ids)
+            if cohort_tokens >= budget:
                 return _Upstream.get_new_batch_prefill(self, running_batch)
-        waiting = self.waiting_queue
-        if not waiting or len(waiting) >= self.prefill_coalesce_requests:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
-        now = time.perf_counter()
-        oldest = now
-        for req in waiting:
-            t = getattr(req, "_coalesce_enqueue_t", None)
-            if t is None:
-                t = req._coalesce_enqueue_t = now
-            oldest = min(oldest, t)
-        if now - oldest >= self.prefill_coalesce_wait_s:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
         return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
     def run_batch(self, batch, pp_proxy_tensors=None):

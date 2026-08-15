@@ -26,16 +26,7 @@ def test_whisper_encoder_cuda_graph_is_opt_in() -> None:
     assert signature.parameters["encoder_graph_batch_buckets"].default is None
     assert signature.parameters["request_build_max_workers"].default == 2
     assert signature.parameters["request_build_max_pending"].default == 16
-    assert signature.parameters["prefill_coalesce_requests"].default == 2
-    assert signature.parameters["prefill_coalesce_wait_ms"].default == 6.0
-    assert signature.parameters["prefill_coalesce_when_idle"].default is True
-    assert (
-        signature.parameters["prefill_coalesce_requires_pending_builds"].default is True
-    )
-    assert (
-        signature.parameters["prefill_coalesce_after_builds_during_decode"].default
-        is False
-    )
+    assert signature.parameters["defer_prefill_during_decode"].default is True
 
 
 def test_whisper_encoder_cuda_graph_setup_is_ordered_after_generation_graphs() -> None:
@@ -123,7 +114,7 @@ def test_whisper_disables_chunked_prefill_for_atomic_encoder_prefix() -> None:
         builder.adjust_overrides({"chunked_prefill_size": 4096})
 
 
-def test_whisper_prefill_coalescing_defaults_are_forwarded() -> None:
+def test_whisper_prefill_admission_defaults_are_forwarded() -> None:
     from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
 
     builder = WhisperASREngineBuilder(
@@ -135,11 +126,7 @@ def test_whisper_prefill_coalescing_defaults_are_forwarded() -> None:
     assert builder.extra_scheduler_kwargs() == {
         "request_build_max_workers": 2,
         "request_build_max_pending": 16,
-        "prefill_coalesce_requests": 2,
-        "prefill_coalesce_wait_ms": 6.0,
-        "prefill_coalesce_when_idle": True,
-        "prefill_coalesce_requires_pending_builds": True,
-        "prefill_coalesce_after_builds_during_decode": False,
+        "defer_prefill_during_decode": True,
     }
 
 
@@ -155,17 +142,7 @@ def test_whisper_asr_config_uses_single_batched_stage() -> None:
     assert config.stages[0].factory_args["enable_encoder_cuda_graph"] is True
     assert config.stages[0].factory_args["request_build_max_workers"] == 2
     assert config.stages[0].factory_args["request_build_max_pending"] == 16
-    assert config.stages[0].factory_args["prefill_coalesce_requests"] == 2
-    assert config.stages[0].factory_args["prefill_coalesce_wait_ms"] == 6.0
-    assert config.stages[0].factory_args["prefill_coalesce_when_idle"] is True
-    assert (
-        config.stages[0].factory_args["prefill_coalesce_requires_pending_builds"]
-        is True
-    )
-    assert (
-        config.stages[0].factory_args["prefill_coalesce_after_builds_during_decode"]
-        is False
-    )
+    assert config.stages[0].factory_args["defer_prefill_during_decode"] is True
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("WhisperForConditionalGeneration")
         is WhisperASRPipelineConfig

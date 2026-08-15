@@ -39,8 +39,7 @@ class FunASREngineBuilder(AsrEngineBuilder):
         enable_encoder_cuda_graph: bool,
         enable_async_decode: bool,
         async_decode_min_batch_size: int,
-        prefill_coalesce_requests: int,
-        prefill_coalesce_wait_ms: float,
+        defer_prefill_during_decode: bool,
         mm_attention_backend: str | None,
         enable_pre_lm_encoder: bool,
         pre_lm_cache_max_entries: int,
@@ -60,8 +59,7 @@ class FunASREngineBuilder(AsrEngineBuilder):
         self.enable_encoder_cuda_graph = enable_encoder_cuda_graph
         self.enable_async_decode = enable_async_decode
         self.async_decode_min_batch_size = async_decode_min_batch_size
-        self.prefill_coalesce_requests = prefill_coalesce_requests
-        self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
+        self.defer_prefill_during_decode = defer_prefill_during_decode
         self.mm_attention_backend = mm_attention_backend
         self.enable_pre_lm_encoder = enable_pre_lm_encoder
         self.pre_lm_cache_max_entries = pre_lm_cache_max_entries
@@ -202,8 +200,7 @@ class FunASREngineBuilder(AsrEngineBuilder):
             ),
             "enable_async_decode": self.enable_async_decode,
             "async_decode_min_batch_size": self.async_decode_min_batch_size,
-            "prefill_coalesce_requests": self.prefill_coalesce_requests,
-            "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
+            "defer_prefill_during_decode": self.defer_prefill_during_decode,
             "request_build_max_workers": self.request_build_max_workers,
             "request_build_max_pending": self.request_build_max_pending,
         }
