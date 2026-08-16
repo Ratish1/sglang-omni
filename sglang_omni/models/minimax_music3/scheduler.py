@@ -55,11 +55,12 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
         expanded_pair_budget = False
         if len(queue) >= 2:
             assert queue[0]._omni_data.cfg_uncond is queue[1]._omni_data
+            assert queue[0].is_retracted == queue[1].is_retracted
             page_size = int(self.page_size)
-            pair_input_tokens = sum(
-                -(-len(req.origin_input_ids) // page_size) * page_size
-                for req in queue[:2]
-            )
+            pair_input_tokens = 0
+            for req in queue[:2]:
+                input_length = len(req.origin_input_ids) + len(req.output_ids)
+                pair_input_tokens += -(-input_length // page_size) * page_size
             if pair_input_tokens >= prefill_budget:
                 self.max_prefill_tokens = pair_input_tokens + 1
                 expanded_pair_budget = True
@@ -103,10 +104,10 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
             pair_input_tokens = 0
             pair_total_tokens = 0
             for req in (cond, uncond):
-                input_tokens = -(-len(req.origin_input_ids) // page_size) * page_size
+                input_length = len(req.origin_input_ids) + len(req.output_ids)
+                input_tokens = -(-input_length // page_size) * page_size
                 new_tokens = min(
-                    max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-                    CLIP_MAX_NEW_TOKENS,
+                    req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
                 )
                 pair_input_tokens += input_tokens
                 pair_total_tokens += input_tokens + new_tokens + page_size
