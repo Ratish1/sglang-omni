@@ -18,6 +18,11 @@ from sglang_omni.models.minimax_music3.checkpoint import resolve_checkpoint
 from sglang_omni.models.minimax_music3.prompt import build_prompt
 
 _CAPTION = "A minimal acoustic test song at 100 BPM"
+_AMBIENT_LYRICS = "[Intro]\n(instrumental)"
+_AMBIENT_CAPTION = (
+    "An instrumental ambient piece, no vocals: warm analog pads, slow "
+    "evolving texture, distant piano, 70 BPM"
+)
 _PAIR_ERRORS = (
     "pairs; this batch has",
     "CFG rows are not adjacent pairs",
@@ -166,13 +171,15 @@ def _run_pressure(args: argparse.Namespace) -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     offset = _log_offset(server_log)
+    tokenizer_path = resolve_checkpoint(args.model_path).tokenizer_dir
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    prompt_tokens = len(
+        tokenizer(build_prompt(_AMBIENT_CAPTION, _AMBIENT_LYRICS))["input_ids"]
+    )
     payload = {
         "model": "MiniMaxAI/MiniMax-Music3",
-        "input": "[Intro]\n(instrumental)",
-        "instructions": (
-            "An instrumental ambient piece, no vocals: warm analog pads, slow "
-            "evolving texture, distant piano, 70 BPM"
-        ),
+        "input": _AMBIENT_LYRICS,
+        "instructions": _AMBIENT_CAPTION,
         "seed": 3,
         "max_new_tokens": args.max_new_tokens,
         "response_format": "wav",
@@ -212,6 +219,7 @@ def _run_pressure(args: argparse.Namespace) -> int:
         "outcome": outcome,
         "requests": args.requests,
         "max_new_tokens": args.max_new_tokens,
+        "physical_row_prompt_tokens": prompt_tokens,
         "natural_retraction_log_count": natural_retractions,
         "injected_retraction_log_count": injected_retractions,
         "failure_marker": failure_marker,
@@ -231,11 +239,8 @@ def _run_pause_retract(args: argparse.Namespace) -> int:
     offset = _log_offset(server_log)
     payload = {
         "model": "MiniMaxAI/MiniMax-Music3",
-        "input": "[Intro]\n(instrumental)",
-        "instructions": (
-            "An instrumental ambient piece, no vocals: warm analog pads, slow "
-            "evolving texture, distant piano, 70 BPM"
-        ),
+        "input": _AMBIENT_LYRICS,
+        "instructions": _AMBIENT_CAPTION,
         "seed": 3,
         "max_new_tokens": args.max_new_tokens,
         "response_format": "wav",
@@ -320,6 +325,7 @@ def _parse_args() -> argparse.Namespace:
         "kv-pressure", help="drive real or fault-injected decode retraction"
     )
     pressure.add_argument("--base-url", default="http://localhost:8000")
+    pressure.add_argument("--model-path", required=True)
     pressure.add_argument("--server-log", required=True)
     pressure.add_argument("--output", required=True)
     pressure.add_argument("--requests", type=int, default=16)

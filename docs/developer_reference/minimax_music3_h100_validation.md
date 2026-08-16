@@ -346,6 +346,143 @@ utilization, power, clocks, CPU utilization, selected graph buckets, and eager
 fallbacks. Report every sample, median, and spread. Do not derive a regression
 threshold from a single run.
 
+## Scheduler boundary probes
+
+Run these three probes from
+`test/minimax-music3-scheduler-boundaries` on the candidate only. They exercise
+the released model through the HTTP server; they do not replace the A/B gates
+above and do not constitute a benchmark.
+
+Use two exclusive H100s and record the exact diagnostic revision:
+
+```bash
+export MINIMAX_PROBE_ROOT=/sgl-workspace/minimax-music3-scheduler-probes
+export MINIMAX_MODEL=/sgl-workspace/minimax-music3-ab/model-b
+mkdir -p "$MINIMAX_PROBE_ROOT"
+git rev-parse HEAD > "$MINIMAX_PROBE_ROOT/revision.txt"
+```
+
+### Pair admission
+
+The checked-in config sets `max_prefill_tokens=256`. The probe uses the released
+music tokenizer to construct a prompt with `128 < P < 256` tokens, so one
+physical row fits the prefill budget while its `2P`-token CFG pair does not.
+
+Start the server in terminal 1:
+
+```bash
+set -o pipefail
+CUDA_VISIBLE_DEVICES=0,1 .venv-h100/bin/sgl-omni serve \
+  --config examples/configs/minimax_music3_pair_admission.yaml \
+  --model-path "$MINIMAX_MODEL" --port 8000 \
+  2>&1 | tee "$MINIMAX_PROBE_ROOT/pair-admission-server.log"
+```
+
+After `/health` is ready, run in terminal 2:
+
+```bash
+.venv-h100/bin/python scripts/minimax_music3_scheduler_probe.py \
+  pair-admission \
+  --model-path "$MINIMAX_MODEL" \
+  --server-log "$MINIMAX_PROBE_ROOT/pair-admission-server.log" \
+  --output "$MINIMAX_PROBE_ROOT/pair-admission.json"
+```
+
+`reproduced` requires both a failed HTTP request and a server traceback saying
+the batch has an odd number of rows or non-adjacent CFG rows. `handled` requires
+a successful WAV. Any other result is `inconclusive`; preserve the JSON and log.
+
+### Decode retraction
+
+The next config targets 16 logical requests as 32 CFG rows in a 7,200-token KV
+pool. The clients use the cookbook's 250-frame ambient request, which normally
+reaches the cap. This is intended to make actual decode growth exceed SGLang's
+admission estimate. The report records the released tokenizer's exact prompt
+count; use the server log, not this target, to establish how many rows ran.
+
+Start a fresh server without `SGLANG_TEST_RETRACT`:
+
+```bash
+unset SGLANG_TEST_RETRACT
+set -o pipefail
+CUDA_VISIBLE_DEVICES=0,1 .venv-h100/bin/sgl-omni serve \
+  --config examples/configs/minimax_music3_kv_pressure.yaml \
+  --model-path "$MINIMAX_MODEL" --port 8000 \
+  2>&1 | tee "$MINIMAX_PROBE_ROOT/kv-pressure-server.log"
+```
+
+Then run:
+
+```bash
+.venv-h100/bin/python scripts/minimax_music3_scheduler_probe.py \
+  kv-pressure \
+  --model-path "$MINIMAX_MODEL" \
+  --server-log "$MINIMAX_PROBE_ROOT/kv-pressure-server.log" \
+  --output "$MINIMAX_PROBE_ROOT/kv-pressure.json"
+```
+
+Only the log prefix `KV cache pool is full. Retract requests.` proves that the
+production memory-pressure condition occurred. A subsequent CFG-pair or replay
+error is `reproduced`; 16 successful responses after that prefix is `handled`.
+`not_triggered` is inconclusive and must not be reported as a pass.
+
+As a separate control, restart the same server with
+`SGLANG_TEST_RETRACT=1`:
+
+```bash
+set -o pipefail
+SGLANG_TEST_RETRACT=1 CUDA_VISIBLE_DEVICES=0,1 \
+  .venv-h100/bin/sgl-omni serve \
+  --config examples/configs/minimax_music3_kv_pressure.yaml \
+  --model-path "$MINIMAX_MODEL" --port 8000 \
+  2>&1 | tee "$MINIMAX_PROBE_ROOT/forced-retract-server.log"
+```
+
+Run the same client against the new log and output paths:
+
+```bash
+.venv-h100/bin/python scripts/minimax_music3_scheduler_probe.py \
+  kv-pressure \
+  --model-path "$MINIMAX_MODEL" \
+  --server-log "$MINIMAX_PROBE_ROOT/forced-retract-server.log" \
+  --output "$MINIMAX_PROBE_ROOT/forced-retract.json"
+```
+
+The expected report label is `fault_injection_reproduced` when the row-wise
+path fails. This proves the mechanics of the retraction path only; it is not
+evidence that a default server reaches it.
+
+### Public retract pause
+
+Start a fresh server with the ordinary dual-GPU launch from Gate 2 and no
+retraction environment variable. The probe starts one long request, polls
+`/model_info` until the AR stage reports its two CFG rows running, calls
+`pause_generation` with `mode=retract`, continues generation, and waits for the
+original request.
+
+```bash
+unset SGLANG_TEST_RETRACT
+set -o pipefail
+CUDA_VISIBLE_DEVICES=0,1 .venv-h100/bin/sgl-omni serve \
+  --model-path "$MINIMAX_MODEL" --port 8000 \
+  2>&1 | tee "$MINIMAX_PROBE_ROOT/pause-retract-server.log"
+```
+
+After `/health` is ready, run in terminal 2:
+
+```bash
+.venv-h100/bin/python scripts/minimax_music3_scheduler_probe.py \
+  pause-retract \
+  --server-log "$MINIMAX_PROBE_ROOT/pause-retract-server.log" \
+  --output "$MINIMAX_PROBE_ROOT/pause-retract.json"
+```
+
+Pass `--admin-api-key` when the server protects admin endpoints. `reproduced`
+requires that live rows were observed, both admin calls succeeded, and the
+request then failed with MiniMax's CFG-pair or retract/replay invariant.
+`handled` requires the original request to complete successfully. A request
+that finished before live rows were observed is `not_triggered`, not a pass.
+
 ## Qualification record
 
 Return one artifact directory containing:
