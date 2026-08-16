@@ -394,11 +394,14 @@ a successful WAV. Any other result is `inconclusive`; preserve the JSON and log.
 
 ### Decode retraction
 
-The next config targets 16 logical requests as 32 CFG rows in a 7,200-token KV
+The next config targets 16 logical requests as 32 CFG rows in an 8,800-token KV
 pool. The clients use the cookbook's 250-frame ambient request, which normally
-reaches the cap. This is intended to make actual decode growth exceed SGLang's
-admission estimate. The report records the released tokenizer's exact prompt
-count; use the server log, not this target, to establish how many rows ran.
+reaches the cap. The probe submits eight requests, waits until their 16 CFG rows
+are running, and then submits eight more. This makes the second wave use
+SGLang's running-request estimate instead of placing all requests in one
+full-reservation prefill pass. The report records the released tokenizer's
+exact prompt count and the observed row count before the second wave; use the
+server log, not the target, to establish what ran.
 
 Start a fresh server without `SGLANG_TEST_RETRACT`:
 
@@ -420,6 +423,8 @@ Then run:
   --server-log "$MINIMAX_PROBE_ROOT/kv-pressure-server.log" \
   --output "$MINIMAX_PROBE_ROOT/kv-pressure.json"
 ```
+
+Pass `--admin-api-key` if `/model_info` is protected.
 
 Only the log prefix `KV cache pool is full. Retract requests.` proves that the
 production memory-pressure condition occurred. A subsequent CFG-pair or replay

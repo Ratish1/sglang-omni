@@ -41,6 +41,7 @@ def _render(
     started = time.perf_counter()
     digest = hashlib.sha256()
     body = bytearray()
+    prefix = bytearray()
     response_bytes = 0
     with httpx.stream(
         "POST",
@@ -51,13 +52,22 @@ def _render(
         for chunk in response.iter_bytes():
             response_bytes += len(chunk)
             digest.update(chunk)
+            if len(prefix) < 12:
+                prefix.extend(chunk[: 12 - len(prefix)])
             if response.status_code != 200 and len(body) < 16_384:
                 body.extend(chunk[: 16_384 - len(body)])
+        valid_wav = (
+            response.status_code == 200
+            and response_bytes >= 44
+            and prefix[:4] == b"RIFF"
+            and prefix[8:12] == b"WAVE"
+        )
         return {
             "status_code": response.status_code,
             "content_type": response.headers.get("content-type"),
             "response_bytes": response_bytes,
             "sha256": digest.hexdigest(),
+            "valid_wav": valid_wav,
             "elapsed_s": round(time.perf_counter() - started, 3),
             "error": body.decode("utf-8", errors="replace"),
         }
@@ -146,7 +156,7 @@ def _run_admission(args: argparse.Namespace) -> int:
     time.sleep(1)
     log_tail = _log_tail(server_log, offset)
     pair_error = next((value for value in _PAIR_ERRORS if value in log_tail), None)
-    if result["status_code"] == 200:
+    if result["valid_wav"]:
         outcome = "handled"
     elif pair_error is not None:
         outcome = "reproduced"
@@ -167,6 +177,7 @@ def _run_admission(args: argparse.Namespace) -> int:
 
 
 def _run_pressure(args: argparse.Namespace) -> int:
+    assert 0 < args.first_wave < args.requests
     server_log = Path(args.server_log)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -185,16 +196,34 @@ def _run_pressure(args: argparse.Namespace) -> int:
         "response_format": "wav",
     }
     with ThreadPoolExecutor(max_workers=args.requests) as pool:
-        results = list(
-            pool.map(
-                lambda _: _render(
-                    args.base_url,
-                    payload,
-                    timeout_s=args.timeout_s,
-                ),
-                range(args.requests),
+        futures = [
+            pool.submit(
+                _render,
+                args.base_url,
+                payload,
+                timeout_s=args.timeout_s,
             )
+            for _ in range(args.first_wave)
+        ]
+        deadline = time.monotonic() + args.wait_running_s
+        running_rows = 0
+        while time.monotonic() < deadline and not all(
+            future.done() for future in futures
+        ):
+            running_rows = _running_rows(args.base_url, args.admin_api_key)
+            if running_rows >= 2 * args.first_wave:
+                break
+            time.sleep(0.25)
+        futures.extend(
+            pool.submit(
+                _render,
+                args.base_url,
+                payload,
+                timeout_s=args.timeout_s,
+            )
+            for _ in range(args.requests - args.first_wave)
         )
+        results = [future.result() for future in futures]
     time.sleep(1)
     log_tail = _log_tail(server_log, offset)
     natural_retractions = log_tail.count(_NATURAL_RETRACTION)
@@ -203,7 +232,7 @@ def _run_pressure(args: argparse.Namespace) -> int:
         (value for value in (*_PAIR_ERRORS, _REPLAY_ERROR) if value in log_tail),
         None,
     )
-    failed = sum(result["status_code"] != 200 for result in results)
+    failed = sum(not result["valid_wav"] for result in results)
     if natural_retractions and failure_marker is not None:
         outcome = "reproduced"
     elif natural_retractions and failed == 0:
@@ -218,6 +247,8 @@ def _run_pressure(args: argparse.Namespace) -> int:
         "probe": "kv_pressure",
         "outcome": outcome,
         "requests": args.requests,
+        "first_wave_requests": args.first_wave,
+        "running_rows_before_second_wave": running_rows,
         "max_new_tokens": args.max_new_tokens,
         "physical_row_prompt_tokens": prompt_tokens,
         "natural_retraction_log_count": natural_retractions,
@@ -287,9 +318,9 @@ def _run_pause_retract(args: argparse.Namespace) -> int:
         outcome = "inconclusive"
     elif continued is None or continued["status_code"] != 200:
         outcome = "inconclusive"
-    elif request_result["status_code"] != 200 and failure_marker is not None:
+    elif not request_result["valid_wav"] and failure_marker is not None:
         outcome = "reproduced"
-    elif request_result["status_code"] == 200:
+    elif request_result["valid_wav"]:
         outcome = "handled"
     else:
         outcome = "inconclusive"
@@ -329,7 +360,10 @@ def _parse_args() -> argparse.Namespace:
     pressure.add_argument("--server-log", required=True)
     pressure.add_argument("--output", required=True)
     pressure.add_argument("--requests", type=int, default=16)
+    pressure.add_argument("--first-wave", type=int, default=8)
+    pressure.add_argument("--admin-api-key")
     pressure.add_argument("--max-new-tokens", type=int, default=250)
+    pressure.add_argument("--wait-running-s", type=float, default=60)
     pressure.add_argument("--timeout-s", type=float, default=1800)
     pressure.set_defaults(run=_run_pressure)
 
