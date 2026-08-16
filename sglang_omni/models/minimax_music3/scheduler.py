@@ -3,13 +3,20 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
+from sglang.srt.managers.scheduler import TEST_RETRACT, TEST_RETRACT_INTERVAL
+from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
+    NewTokenRatioTracker,
+)
 
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 
 from .sglang_request_builder import cfg_uncond_rid, is_cfg_uncond_rid
+
+logger = logging.getLogger(__name__)
 
 
 class MiniMaxMusic3Scheduler(OmniScheduler):
@@ -119,6 +126,138 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
             remaining_input_tokens -= pair_input_tokens
             remaining_total_tokens -= pair_total_tokens
         return limit
+
+    def update_running_batch(self, batch: Any) -> Any:
+        """Apply SGLang's decode update to complete CFG pairs."""
+        initial_size = len(batch.reqs)
+        batch.filter_batch()
+        if batch.is_empty():
+            batch.batch_is_full = False
+            return batch
+
+        if self.enable_hierarchical_cache:
+            self.tree_cache.flush_write_through_acks()
+
+        kv_cache_full = not batch.check_decode_mem()
+        test_retraction = TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        if kv_cache_full or test_retraction:
+            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            old_ratio = self.new_token_ratio_tracker.current
+            retracted_pairs, aborted_pair = self._retract_decode_pairs(batch)
+            retracted_reqs = [req for pair in retracted_pairs for req in pair]
+            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+
+            self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
+            if self.metrics_reporter.enable_metrics and retracted_reqs:
+                self.metrics_reporter.metrics_collector.increment_retracted_reqs(
+                    num_retracted_reqs=len(retracted_reqs),
+                    num_retracted_input_tokens=sum(
+                        len(req.origin_input_ids) for req in retracted_reqs
+                    ),
+                    num_retracted_output_tokens=sum(
+                        len(req.output_ids) for req in retracted_reqs
+                    ),
+                )
+            self.new_token_ratio_tracker.current = (
+                NewTokenRatioTracker.estimate_new_token_ratio_after_retract(batch.reqs)
+            )
+
+            message = (
+                "KV cache pool is full. Retract requests. "
+                if kv_cache_full
+                else "Testing retraction. "
+            )
+            details = (
+                f"#retracted_reqs: {len(retracted_reqs)}, "
+                f"#new_tokens_gained: {new_available_tokens - old_available_tokens}"
+            )
+            if kv_cache_full:
+                details += (
+                    f", #new_token_ratio: {old_ratio:.4f} -> "
+                    f"{self.new_token_ratio_tracker.current:.4f}"
+                )
+            logger.warning(message + details)
+
+            for cond, uncond in retracted_pairs:
+                self._add_request_to_queue(cond, is_retracted=True)
+                self._add_request_to_queue(uncond, is_retracted=True)
+
+            if aborted_pair is not None:
+                cond, uncond = aborted_pair
+                error = RuntimeError(
+                    "MiniMax Music 3 request cannot allocate its next KV-cache "
+                    "page after all other CFG pairs were retracted"
+                )
+                self._emit_request_error(cond.rid, error)
+                self.abort(cond.rid, defer_running_cleanup=False)
+                cond._omni_data = None
+                uncond._omni_data = None
+        else:
+            self.new_token_ratio_tracker.decay_step()
+
+        if len(batch.reqs) < initial_size:
+            batch.batch_is_full = False
+        if not batch.is_empty():
+            batch.prepare_for_decode()
+        return batch
+
+    def _retract_decode_pairs(
+        self, batch: Any
+    ) -> tuple[list[tuple[Any, Any]], tuple[Any, Any] | None]:
+        assert len(batch.reqs) >= 2 and len(batch.reqs) % 2 == 0
+        for cond, uncond in zip(batch.reqs[0::2], batch.reqs[1::2], strict=True):
+            assert cond._omni_data.cfg_uncond is uncond._omni_data
+            assert len(cond.output_ids) == len(uncond.output_ids)
+
+        row_order = batch._get_decode_retraction_order(
+            batch.reqs,
+            self.server_args,
+            allow_policy_sort=(
+                batch.spec_algorithm is None or batch.spec_algorithm.is_none()
+            ),
+        )
+        pair_order = []
+        seen_pairs = set()
+        for row_index in row_order:
+            pair_index = row_index // 2
+            if pair_index not in seen_pairs:
+                seen_pairs.add(pair_index)
+                pair_order.append(pair_index)
+
+        keep_indices = list(range(len(batch.reqs)))
+        retracted_pairs = []
+        first_iteration = True
+        while first_iteration or not batch.check_decode_mem(
+            selected_indices=keep_indices
+        ):
+            if len(pair_order) == 1:
+                break
+            first_iteration = False
+            pair_index = pair_order.pop()
+            row_indices = (2 * pair_index, 2 * pair_index + 1)
+            retracted_pairs.append(
+                (batch.reqs[row_indices[0]], batch.reqs[row_indices[1]])
+            )
+            keep_indices = [index for index in keep_indices if index not in row_indices]
+            for offset, row_index in enumerate(row_indices):
+                remaining_reqs = len(keep_indices) + 1 - offset
+                batch.release_req(row_index, remaining_reqs, self.server_args)
+
+        aborted_pair = None
+        if not batch.check_decode_mem(selected_indices=keep_indices):
+            assert len(pair_order) == 1
+            pair_index = pair_order.pop()
+            row_indices = (2 * pair_index, 2 * pair_index + 1)
+            aborted_pair = (
+                batch.reqs[row_indices[0]],
+                batch.reqs[row_indices[1]],
+            )
+            keep_indices = []
+            for remaining_reqs, row_index in zip((1, 0), row_indices, strict=True):
+                batch.release_req(row_index, remaining_reqs, self.server_args)
+
+        batch.filter_batch(keep_indices=keep_indices)
+        return retracted_pairs, aborted_pair
 
     def stream_output(
         self, reqs: Any, return_logprob: bool = False, skip_req: Any = None
