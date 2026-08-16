@@ -70,6 +70,43 @@ def _log_tail(path: Path, offset: int) -> str:
         return file.read()
 
 
+def _admin_headers(api_key: str | None) -> dict[str, str]:
+    if api_key is None:
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def _admin_post(
+    base_url: str,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    api_key: str | None,
+) -> dict[str, Any]:
+    response = httpx.post(
+        f"{base_url.rstrip('/')}{path}",
+        json=payload,
+        headers=_admin_headers(api_key),
+        timeout=60,
+    )
+    return {"status_code": response.status_code, "body": response.json()}
+
+
+def _running_rows(base_url: str, api_key: str | None) -> int:
+    response = _admin_post(
+        base_url,
+        "/model_info",
+        {"stages": ["minimax_music3_ar"]},
+        api_key=api_key,
+    )
+    if response["status_code"] != 200:
+        return 0
+    for result in response["body"].get("results", []):
+        if result.get("stage") == "minimax_music3_ar":
+            return int(result["data"]["running_batch_size"])
+    return 0
+
+
 def _admission_prompt(model_path: str, budget: int) -> tuple[str, int]:
     tokenizer_path = resolve_checkpoint(model_path).tokenizer_dir
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
@@ -187,6 +224,84 @@ def _run_pressure(args: argparse.Namespace) -> int:
     return 0 if outcome not in {"inconclusive", "not_triggered"} else 2
 
 
+def _run_pause_retract(args: argparse.Namespace) -> int:
+    server_log = Path(args.server_log)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    offset = _log_offset(server_log)
+    payload = {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Intro]\n(instrumental)",
+        "instructions": (
+            "An instrumental ambient piece, no vocals: warm analog pads, slow "
+            "evolving texture, distant piano, 70 BPM"
+        ),
+        "seed": 3,
+        "max_new_tokens": args.max_new_tokens,
+        "response_format": "wav",
+    }
+    running_rows = 0
+    pause = None
+    continued = None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        request = pool.submit(
+            _render,
+            args.base_url,
+            payload,
+            timeout_s=args.timeout_s,
+        )
+        deadline = time.monotonic() + args.wait_running_s
+        while time.monotonic() < deadline and not request.done():
+            running_rows = _running_rows(args.base_url, args.admin_api_key)
+            if running_rows >= 2:
+                break
+            time.sleep(0.25)
+        if running_rows >= 2:
+            pause = _admin_post(
+                args.base_url,
+                "/pause_generation",
+                {"mode": "retract", "stages": ["minimax_music3_ar"]},
+                api_key=args.admin_api_key,
+            )
+            continued = _admin_post(
+                args.base_url,
+                "/continue_generation",
+                {"torch_empty_cache": True, "stages": ["minimax_music3_ar"]},
+                api_key=args.admin_api_key,
+            )
+        request_result = request.result()
+    time.sleep(1)
+    log_tail = _log_tail(server_log, offset)
+    failure_marker = next(
+        (value for value in (*_PAIR_ERRORS, _REPLAY_ERROR) if value in log_tail),
+        None,
+    )
+    if running_rows < 2:
+        outcome = "not_triggered"
+    elif pause is None or pause["status_code"] != 200:
+        outcome = "inconclusive"
+    elif continued is None or continued["status_code"] != 200:
+        outcome = "inconclusive"
+    elif request_result["status_code"] != 200 and failure_marker is not None:
+        outcome = "reproduced"
+    elif request_result["status_code"] == 200:
+        outcome = "handled"
+    else:
+        outcome = "inconclusive"
+    report = {
+        "probe": "pause_retract",
+        "outcome": outcome,
+        "running_rows_before_pause": running_rows,
+        "failure_marker": failure_marker,
+        "pause": pause,
+        "continue": continued,
+        "request": request_result,
+    }
+    output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(report, indent=2))
+    return 0 if outcome not in {"inconclusive", "not_triggered"} else 2
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="probe", required=True)
@@ -211,6 +326,18 @@ def _parse_args() -> argparse.Namespace:
     pressure.add_argument("--max-new-tokens", type=int, default=250)
     pressure.add_argument("--timeout-s", type=float, default=1800)
     pressure.set_defaults(run=_run_pressure)
+
+    pause = subparsers.add_parser(
+        "pause-retract", help="retract and resume a live request through the admin API"
+    )
+    pause.add_argument("--base-url", default="http://localhost:8000")
+    pause.add_argument("--server-log", required=True)
+    pause.add_argument("--output", required=True)
+    pause.add_argument("--admin-api-key")
+    pause.add_argument("--max-new-tokens", type=int, default=9000)
+    pause.add_argument("--wait-running-s", type=float, default=60)
+    pause.add_argument("--timeout-s", type=float, default=1800)
+    pause.set_defaults(run=_run_pause_retract)
     return parser.parse_args()
 
 
