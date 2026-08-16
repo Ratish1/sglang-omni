@@ -1,0 +1,7 @@
+config_cls: MiniMaxMusic3DualGPUPipelineConfig
+model_path: MiniMaxAI/MiniMax-Music3
+runtime_overrides:
+  minimax_music3_ar:
+    server_args_overrides:
+      max_running_requests: 16
+      max_total_tokens: 7200
