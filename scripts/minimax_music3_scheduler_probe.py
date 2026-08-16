@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Real-model H100 probes for MiniMax Music 3 scheduler boundaries."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+import httpx
+from transformers import AutoTokenizer
+
+from sglang_omni.models.minimax_music3.checkpoint import resolve_checkpoint
+from sglang_omni.models.minimax_music3.prompt import build_prompt
+
+_CAPTION = "A minimal acoustic test song at 100 BPM"
+_PAIR_ERRORS = (
+    "pairs; this batch has",
+    "CFG rows are not adjacent pairs",
+)
+
+
+def _render(
+    base_url: str,
+    payload: dict[str, Any],
+    *,
+    timeout_s: float,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    digest = hashlib.sha256()
+    body = bytearray()
+    response_bytes = 0
+    with httpx.stream(
+        "POST",
+        f"{base_url.rstrip('/')}/v1/audio/speech",
+        json=payload,
+        timeout=timeout_s,
+    ) as response:
+        for chunk in response.iter_bytes():
+            response_bytes += len(chunk)
+            digest.update(chunk)
+            if response.status_code != 200 and len(body) < 16_384:
+                body.extend(chunk[: 16_384 - len(body)])
+        return {
+            "status_code": response.status_code,
+            "content_type": response.headers.get("content-type"),
+            "response_bytes": response_bytes,
+            "sha256": digest.hexdigest(),
+            "elapsed_s": round(time.perf_counter() - started, 3),
+            "error": body.decode("utf-8", errors="replace"),
+        }
+
+
+def _log_offset(path: Path) -> int:
+    return path.stat().st_size if path.exists() else 0
+
+
+def _log_tail(path: Path, offset: int) -> str:
+    if not path.exists():
+        return ""
+    with path.open("r", encoding="utf-8", errors="replace") as file:
+        file.seek(offset)
+        return file.read()
+
+
+def _admission_prompt(model_path: str, budget: int) -> tuple[str, int]:
+    tokenizer_path = resolve_checkpoint(model_path).tokenizer_dir
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    for repetitions in range(1, budget * 4):
+        lyrics = "[Verse]\n" + "la " * repetitions
+        prompt_tokens = len(tokenizer(build_prompt(_CAPTION, lyrics))["input_ids"])
+        if budget // 2 < prompt_tokens < budget:
+            return lyrics, prompt_tokens
+    raise RuntimeError(
+        f"could not construct a prompt between {budget // 2} and {budget} tokens"
+    )
+
+
+def _run_admission(args: argparse.Namespace) -> int:
+    server_log = Path(args.server_log)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    offset = _log_offset(server_log)
+    lyrics, prompt_tokens = _admission_prompt(args.model_path, args.max_prefill_tokens)
+    result = _render(
+        args.base_url,
+        {
+            "model": "MiniMaxAI/MiniMax-Music3",
+            "input": lyrics,
+            "instructions": _CAPTION,
+            "seed": 42,
+            "max_new_tokens": 1,
+            "response_format": "wav",
+        },
+        timeout_s=args.timeout_s,
+    )
+    time.sleep(1)
+    log_tail = _log_tail(server_log, offset)
+    pair_error = next((value for value in _PAIR_ERRORS if value in log_tail), None)
+    if result["status_code"] == 200:
+        outcome = "handled"
+    elif pair_error is not None:
+        outcome = "reproduced"
+    else:
+        outcome = "inconclusive"
+    report = {
+        "probe": "pair_admission",
+        "outcome": outcome,
+        "max_prefill_tokens": args.max_prefill_tokens,
+        "physical_row_prompt_tokens": prompt_tokens,
+        "cfg_pair_prompt_tokens": 2 * prompt_tokens,
+        "pair_error": pair_error,
+        "request": result,
+    }
+    output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(report, indent=2))
+    return 0 if outcome != "inconclusive" else 2
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="probe", required=True)
+    admission = subparsers.add_parser(
+        "pair-admission", help="exercise one-row-versus-one-CFG-pair prefill budget"
+    )
+    admission.add_argument("--base-url", default="http://localhost:8000")
+    admission.add_argument("--model-path", required=True)
+    admission.add_argument("--server-log", required=True)
+    admission.add_argument("--output", required=True)
+    admission.add_argument("--max-prefill-tokens", type=int, default=256)
+    admission.add_argument("--timeout-s", type=float, default=900)
+    admission.set_defaults(run=_run_admission)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+    return args.run(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
