@@ -58,6 +58,9 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
 
     def get_new_batch_prefill(self, running_batch: Any) -> Any:
         queue = self.waiting_queue
+        if not queue:
+            return super().get_new_batch_prefill(running_batch)
+
         prefill_budget = self.max_prefill_tokens
         expanded_pair_budget = False
         if len(queue) >= 2:
