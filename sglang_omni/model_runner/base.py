@@ -63,16 +63,19 @@ def resolve_deferred_prefill_inputs(schedule_batch: Any, device: torch.device) -
 
 @dataclass
 class _PendingStep:
-    """One decode step launched on the GPU but not yet consumed on the host.
+    """One step (decode, or an eligible extend) launched on the GPU but not
+    yet consumed on the host.
 
     Async-decode (one-step lookahead) bookkeeping: a launched step has its
     forward + on-GPU sample + collect enqueued and ``event`` recorded right
     after, so ``event.query()`` true means the launched step's GPU work is
-    published. ``launch_buf`` is whatever ``post_decode_launch`` returns for
-    resolve to consume: a device-side correctness snapshot of the published ids
+    published. ``launch_buf`` is whatever the launch hook
+    (``post_decode_launch`` or ``post_prefill_launch``) returns for resolve to
+    consume: a device-side correctness snapshot of the published ids
     (MOSS-TTS-Local, no host copy), or a pinned host staging buffer an async host
-    copy filled (Higgs); only the latter provides host-D2H overlap.
-    ``execute_resolve`` later waits on ``event`` and reads ``launch_buf``.
+    copy filled (Higgs, the plain-LM default); only the latter provides host-D2H
+    overlap. ``execute_resolve`` later waits on ``event`` and reads
+    ``launch_buf`` through the matching resolve hook.
 
     Invariant: at most one ``_PendingStep`` is live at a time (see
     ``ModelRunner._pending``). When the launch uses host staging it is pinned
@@ -80,12 +83,13 @@ class _PendingStep:
     launch(N+1) writes the other (design.md section 1.4).
     """
 
-    event: Any  # device Event, recorded after post_decode_launch publishes
-    launch_buf: Any  # post_decode_launch return: device snapshot or host staging
+    event: Any  # device Event, recorded after the launch hook publishes
+    launch_buf: Any  # launch hook return: device snapshot or host staging
     scheduler_output: Any  # this step's SchedulerOutput (routing + output proc)
     forward_batch: Any  # for resolve-time finalize sampling
     schedule_batch: Any  # resolve-time snapshot (copy of the live batch)
     batch_result: Any  # carries logits_output (device of next_token_ids)
+    is_prefill: bool = False  # selects post_prefill_resolve over post_decode_resolve
 
 
 class ModelRunner:
@@ -230,11 +234,13 @@ class ModelRunner:
         """Full synchronous pipeline: build → prepare → forward → post →
         sample → output.
 
-        Used when async decode is disabled. Behavior is byte-identical to the
-        pre-async implementation: it is a pure extraction over the same shared
-        sub-steps (``_build_forward_batch`` / ``_prepare_and_forward`` /
-        ``_finalize``) that ``execute_launch`` + ``execute_resolve`` also use,
-        in the same order. Async decode splits this at the post-decode boundary.
+        Used when async decode is disabled, and for batches the async loop
+        routes synchronously. Behavior is byte-identical to the pre-async
+        implementation: it is a pure extraction over the same shared sub-steps
+        (``_build_forward_batch`` / ``_prepare_and_forward`` / ``_finalize``)
+        that ``execute_launch`` + ``execute_resolve`` also use, in the same
+        order. The lookahead splits this at the post-decode boundary, or at
+        the post-prefill boundary for an eligible extend batch.
         """
         schedule_batch = scheduler_output.batch_data
         if schedule_batch is None:
@@ -281,14 +287,17 @@ class ModelRunner:
         )
 
     def execute_launch(self, scheduler_output: Any) -> "_PendingStep | None":
-        """Enqueue a decode step's forward + on-GPU sample, call
-        ``post_decode_launch`` to publish a model-specific resolve payload
-        (returned as launch_buf), and record a device event right after
-        publication. Does NOT wait on the GPU. Decode batches only. ``launch_buf``
-        is a device-side correctness snapshot (MOSS-TTS-Local) or pinned host
-        staging (Higgs); only the latter overlaps a host copy with the next
-        forward, and ``event.query()`` proves the launched step's GPU work is
-        done, not that any host overlap happened.
+        """Enqueue a step's forward + on-GPU sample, call the launch hook
+        (``post_decode_launch``, or ``post_prefill_launch`` for an extend batch)
+        to publish a model-specific resolve payload (returned as launch_buf),
+        and record a device event right after publication. Does NOT wait on
+        the GPU. Decode batches always; extend batches only when
+        ``prefill_lookahead_eligible`` holds (the scheduler routes the rest
+        synchronously). ``launch_buf`` is a device-side correctness snapshot
+        (MOSS-TTS-Local) or pinned host staging (Higgs, the plain-LM default);
+        only the latter overlaps a host copy with the next forward, and
+        ``event.query()`` proves the launched step's GPU work is done, not that
+        any host overlap happened.
 
         Returns the ``_PendingStep`` handle (or None if there was no batch).
         The CALLER owns the handle and passes it to ``execute_resolve`` later.
@@ -304,7 +313,11 @@ class ModelRunner:
             if built is None:
                 return None
             forward_batch, schedule_batch, is_prefill = built
-            assert not is_prefill, "async lookahead launch is decode-only"
+            if is_prefill and not self.prefill_lookahead_eligible(schedule_batch):
+                raise RuntimeError(
+                    "async lookahead launch of an extend batch requires "
+                    "prefill_lookahead_eligible; route this batch synchronously"
+                )
             batch_result = self._prepare_and_forward(
                 forward_batch,
                 schedule_batch,
@@ -312,9 +325,14 @@ class ModelRunner:
                 is_prefill,
                 is_lookahead=True,
             )
-            launch_buf = self.post_decode_launch(
-                batch_result, forward_batch, scheduler_output.requests
-            )
+            if is_prefill:
+                launch_buf = self.post_prefill_launch(
+                    batch_result, forward_batch, scheduler_output.requests
+                )
+            else:
+                launch_buf = self.post_decode_launch(
+                    batch_result, forward_batch, scheduler_output.requests
+                )
             self._ensure_next_token_ids(
                 batch_result,
                 forward_batch,
@@ -341,17 +359,19 @@ class ModelRunner:
             forward_batch=forward_batch,
             schedule_batch=resolve_batch,
             batch_result=batch_result,
+            is_prefill=is_prefill,
         )
 
     def execute_resolve(
         self, pending: "_PendingStep | None"
     ) -> ModelRunnerOutput | None:
-        """Consume a launched decode step: wait on its event (non-blocking
+        """Consume a launched step: wait on its event (non-blocking
         ``query()``, else ``synchronize()``), read its ``launch_buf`` (a device
         snapshot or pinned host staging) and run the per-request collect loop
-        (``post_decode_resolve``), then
-        finalize sampling/output. Returns that step's ``ModelRunnerOutput``,
-        or None if ``pending`` is None (first iteration / after a drain).
+        (``post_decode_resolve``, or ``post_prefill_resolve`` for a launched
+        extend batch), then finalize sampling/output. Returns that step's
+        ``ModelRunnerOutput``, or None if ``pending`` is None (first iteration /
+        after a drain).
         """
         if pending is None:
             return None
@@ -367,7 +387,12 @@ class ModelRunner:
             for req in pending.scheduler_output.requests
             if req.data.req.finished() or self._req_is_retracted(req.data.req)
         }
-        self.post_decode_resolve(
+        resolve_hook = (
+            self.post_prefill_resolve
+            if pending.is_prefill
+            else self.post_decode_resolve
+        )
+        resolve_hook(
             pending.launch_buf,
             pending.batch_result,
             pending.forward_batch,
@@ -679,6 +704,39 @@ class ModelRunner:
 
         return all(_history_free(req.sampling_params) for req in batch.reqs)
 
+    def prefill_lookahead_eligible(self, batch: Any) -> bool:
+        """Whether this extend batch may be launched into the one-step lookahead
+        (its forward enqueued behind the in-flight step, its host result read at
+        resolve) instead of running synchronously.
+
+        Base: only when every prefill hook is the base implementation, so the
+        launch and resolve halves are exactly the sync prefill split at the
+        post-prefill boundary; the batch samples a first token (the launch half
+        is a sample plus snapshot, so prefill-only batches have nothing to
+        launch); and the batch passes ``lookahead_eligible``: the rows' first
+        decode step is built before this prefill resolves, so the same
+        output-history sampling gate applies. A runner with custom prefill
+        semantics is ineligible by construction and may override to opt in once
+        it provides ``post_prefill_launch`` / ``post_prefill_resolve``.
+        """
+        return (
+            self._prefill_hooks_are_default()
+            and not batch.is_prefill_only
+            and self.lookahead_eligible(batch)
+        )
+
+    def _prefill_hooks_are_default(self) -> bool:
+        cls = type(self)
+        return (
+            cls.before_prefill is ModelRunner.before_prefill
+            and cls.cleanup_prefill is ModelRunner.cleanup_prefill
+            and cls.custom_prefill_forward is ModelRunner.custom_prefill_forward
+            and cls.post_prefill is ModelRunner.post_prefill
+            and cls.sample_before_post_prefill is ModelRunner.sample_before_post_prefill
+            and cls.requested_capture_hidden_mode_prefill
+            is ModelRunner.requested_capture_hidden_mode_prefill
+        )
+
     def post_process_outputs(
         self,
         result: Any,
@@ -707,17 +765,7 @@ class ModelRunner:
         alias step-reused buffers the next launch overwrites). Codec runners whose
         collect is more than next_token_ids override this with ``post_decode_resolve``.
         """
-        if not requests:
-            return None
-        if result.next_token_ids is None:
-            result.next_token_ids = self._sample_next_token_ids(
-                result.logits_output, forward_batch, None, requests
-            )
-        n = len(requests)
-        ids = result.next_token_ids
-        host_buf = self._next_host_staging((n,), ids.dtype)
-        host_buf[:n].copy_(ids[:n], non_blocking=True)
-        return host_buf
+        return self._snapshot_next_token_ids(result, forward_batch, requests)
 
     def post_decode_resolve(
         self,
@@ -733,6 +781,52 @@ class ModelRunner:
         reads it without a GPU sync.
         """
         del forward_batch, schedule_batch
+        self._read_next_token_ids_snapshot(launch_buf, result, requests)
+
+    def post_prefill_launch(
+        self, result: Any, forward_batch: Any, requests: list
+    ) -> Any:
+        """GPU half of ``post_prefill`` for a launched extend batch: sample now
+        and return the resolve payload; the caller publishes the ids and records
+        a device event right after. Default (plain-LM): the same sample plus
+        pinned snapshot as ``post_decode_launch``, which is what the sync path's
+        ``post_prefill`` (no-op) followed by ``_ensure_next_token_ids`` computes.
+        """
+        return self._snapshot_next_token_ids(result, forward_batch, requests)
+
+    def post_prefill_resolve(
+        self,
+        launch_buf: Any,
+        result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> None:
+        """Host half of ``post_prefill`` for a launched extend batch: read
+        ``launch_buf`` into ``result.next_token_ids`` after the caller waited on
+        the launch event."""
+        del forward_batch, schedule_batch
+        self._read_next_token_ids_snapshot(launch_buf, result, requests)
+
+    def _snapshot_next_token_ids(
+        self, result: Any, forward_batch: Any, requests: list
+    ) -> Any:
+        if not requests:
+            return None
+        if result.next_token_ids is None:
+            result.next_token_ids = self._sample_next_token_ids(
+                result.logits_output, forward_batch, None, requests
+            )
+        n = len(requests)
+        ids = result.next_token_ids
+        host_buf = self._next_host_staging((n,), ids.dtype)
+        host_buf[:n].copy_(ids[:n], non_blocking=True)
+        return host_buf
+
+    @staticmethod
+    def _read_next_token_ids_snapshot(
+        launch_buf: Any, result: Any, requests: list
+    ) -> None:
         if launch_buf is None or not requests:
             return
         result.next_token_ids = launch_buf[: len(requests)]
