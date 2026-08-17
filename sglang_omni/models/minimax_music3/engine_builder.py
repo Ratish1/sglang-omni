@@ -63,6 +63,10 @@ class MiniMaxMusic3EngineBuilder(TtsEngineBuilder):
         overrides["max_running_requests"] = rows
         overrides["cuda_graph_max_bs"] = rows
         overrides["cuda_graph_bs"] = build_default_cuda_graph_bs(rows)
+        for name in ("prefill_max_requests", "max_queued_requests"):
+            value = overrides.get(name)
+            if value is not None:
+                overrides[name] = 2 * int(value)
         overrides["disable_overlap_schedule"] = True
         overrides["disable_radix_cache"] = True
         overrides["chunked_prefill_size"] = 0
