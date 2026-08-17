@@ -966,6 +966,208 @@ def test_pending_decode_drain_order_for_prefill(
     assert pending_during_schedule[0] is expected_pending
 
 
+def _eligible_runner():
+    return types.SimpleNamespace(
+        lookahead_eligible=lambda batch: True,
+        prefill_lookahead_eligible=lambda batch: True,
+    )
+
+
+def _script_batches(s, batches):
+    state = {"i": 0}
+
+    def get_next_batch_to_run():
+        i = state["i"]
+        state["i"] += 1
+        if i >= len(batches) - 1:
+            s._running = False
+        return batches[i] if i < len(batches) else None
+
+    s.get_next_batch_to_run = get_next_batch_to_run
+
+
+def test_eligible_prefill_launches_behind_pending_decode_without_draining():
+    events = []
+    pending_batch = _FakeBatch(2)
+    pending = (pending_batch, "prev_sched", "prev_step")
+    s = _scaffold_async_loop(async_pending=pending)
+    s._model_runner = _eligible_runner()
+    prefill = _FakeBatch(1, mode="extend")
+
+    def launch(batch):
+        events.append(("launch", batch, s._async_pending))
+        return "sched_output", "pending_step"
+
+    s._run_batch_launch = launch
+    s._resolve_and_process = lambda pb, ps, pstep: events.append(("resolve", pb))
+    s.run_batch = lambda batch: events.append(("sync", batch))
+    _script_batches(s, [prefill])
+    s._event_loop_async_decode()
+
+    assert events == [("launch", prefill, pending), ("resolve", pending_batch)]
+    assert s._async_pending[0] is prefill
+
+
+@pytest.mark.parametrize(
+    "make_ineligible",
+    [
+        pytest.param(
+            lambda s, b: setattr(s, "chunked_req", object()), id="chunked-req"
+        ),
+        pytest.param(
+            lambda s, b: setattr(b.reqs[0], "inflight_middle_chunks", 1),
+            id="middle-chunk-in-flight",
+        ),
+        pytest.param(lambda s, b: setattr(b, "mix_running_indices", [0]), id="mixed"),
+        pytest.param(
+            lambda s, b: setattr(b, "is_prefill_only", True), id="prefill-only"
+        ),
+        pytest.param(
+            lambda s, b: setattr(
+                s._model_runner, "prefill_lookahead_eligible", lambda batch: False
+            ),
+            id="runner-ineligible",
+        ),
+    ],
+)
+def test_ineligible_prefill_drains_pending_then_runs_sync(make_ineligible):
+    events = []
+    pending_batch = _FakeBatch(2)
+    s = _scaffold_async_loop(async_pending=(pending_batch, "prev_sched", "prev_step"))
+    s._model_runner = _eligible_runner()
+    prefill = _FakeBatch(1, mode="extend")
+    make_ineligible(s, prefill)
+    s._run_batch_launch = lambda batch: events.append(("launch", batch))
+    s._resolve_and_process = lambda pb, ps, pstep: events.append(("resolve", pb))
+    s.run_batch = lambda batch: events.append(("sync", batch)) or object()
+    s.process_batch_result = lambda batch, result: None
+    _script_batches(s, [prefill])
+    s._event_loop_async_decode()
+
+    assert events == [("resolve", pending_batch), ("sync", prefill)]
+    assert s._async_pending is None
+
+
+def test_launched_prefill_and_following_decode_resolve_in_launch_order():
+    events = []
+    s = _scaffold_async_loop()
+    s._model_runner = _eligible_runner()
+    prefill = _FakeBatch(1, mode="extend")
+    decode = _FakeBatch(3)
+    s._run_batch_launch = lambda batch: events.append(("launch", batch)) or (
+        "sched_output",
+        "pending_step",
+    )
+    s._resolve_and_process = lambda pb, ps, pstep: events.append(("resolve", pb))
+    _script_batches(s, [prefill, decode, None])
+    s._event_loop_async_decode()
+
+    assert events == [
+        ("launch", prefill),
+        ("launch", decode),
+        ("resolve", prefill),
+        ("resolve", decode),
+    ]
+
+
+def test_row_finished_at_prefill_resolve_is_dropped_from_next_decode_resolve():
+    s = _new_scheduler_for_async_loop()
+    finished = {"first": False}
+    first = types.SimpleNamespace(
+        rid="first", finished=lambda: finished["first"], is_retracted=False
+    )
+    other = types.SimpleNamespace(
+        rid="other", finished=lambda: False, is_retracted=False
+    )
+    prefill = types.SimpleNamespace(reqs=[first])
+    decode = types.SimpleNamespace(reqs=[first, other])
+    processed = []
+
+    def run_batch_resolve(batch, sched_output, pending_step, skip_rids=()):
+        if batch is prefill:
+            finished["first"] = True
+        return types.SimpleNamespace(
+            next_token_ids=torch.arange(len(batch.reqs)), skip_rids=set(skip_rids)
+        )
+
+    s._run_batch_resolve = run_batch_resolve
+    s.process_batch_result = lambda batch, result: processed.append(
+        (
+            [req.rid for req in batch.reqs],
+            result.next_token_ids.tolist(),
+            result.skip_rids,
+        )
+    )
+
+    s._resolve_and_process(prefill, "p_sched", "p_step")
+    s._resolve_and_process(decode, "d_sched", "d_step")
+
+    assert processed == [
+        (["first"], [0], set()),
+        (["other"], [1], {"first"}),
+    ]
+
+
+def test_scheduler_prefill_end_is_emitted_once_at_resolve_for_a_launched_prefill():
+    from sglang_omni.scheduling import omni_scheduler as sched_mod
+
+    s = _new_scheduler_for_async_loop()
+    s._prefill_start_done = set()
+    s._prefill_end_done = set()
+    s._first_emit_done = set()
+    s._aborted_request_ids = set()
+    s._stream_output_builder = None
+    s.forward_ct = 0
+    s._sched_idled = False
+    req = types.SimpleNamespace(
+        rid="p0",
+        _omni_data=object(),
+        finished=lambda: False,
+        is_retracted=False,
+    )
+    prefill = types.SimpleNamespace(
+        reqs=[req], is_prefill_only=False, is_extend_in_batch=True
+    )
+    decode = types.SimpleNamespace(
+        reqs=[req], is_prefill_only=False, is_extend_in_batch=False
+    )
+    mr_output = ModelRunnerOutput(
+        outputs={},
+        req_ids=["p0"],
+        req_id_to_index={"p0": 0},
+        next_token_ids=torch.tensor([3]),
+    )
+    s._model_runner = types.SimpleNamespace(
+        execute_launch=lambda sched_output: "pending_step",
+        execute_resolve=lambda pending_step: mr_output,
+    )
+    emitted = []
+    with (
+        mock.patch.object(
+            sched_mod,
+            "_emit_event",
+            lambda **kwargs: emitted.append(
+                (kwargs["request_id"], kwargs["event_name"])
+            ),
+        ),
+        mock.patch.object(sched_mod, "_emit_model_path_start", lambda rid: None),
+    ):
+        p_sched, p_step = s._run_batch_launch(prefill)
+        assert emitted == [("p0", "scheduler_prefill_start")]
+        d_sched, d_step = s._run_batch_launch(decode)
+        assert emitted == [("p0", "scheduler_prefill_start")]
+        s._run_batch_resolve(prefill, p_sched, p_step)
+        assert emitted == [
+            ("p0", "scheduler_prefill_start"),
+            ("p0", "scheduler_prefill_end"),
+        ]
+        s._run_batch_resolve(decode, d_sched, d_step)
+    assert emitted == [
+        ("p0", "scheduler_prefill_start"),
+        ("p0", "scheduler_prefill_end"),
+    ]
+
+
 def test_full_running_batch_keeps_lookahead_with_waiting_requests():
     events = []
     pending_batch = _FakeBatch(2)

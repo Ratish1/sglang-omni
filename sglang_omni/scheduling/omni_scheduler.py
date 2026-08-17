@@ -1472,10 +1472,11 @@ class OmniScheduler:
         )
 
     def _run_batch_launch(self, batch):
-        """Async: build SchedulerOutput and launch the decode step on the GPU
-        (forward + sample, then ``post_decode_launch`` publishes the resolve
-        payload), without waiting. Returns ``(sched_output, pending_step)``; the
-        caller holds the pending step (launch-first keeps two steps in flight)."""
+        """Async: build SchedulerOutput and launch the step (decode, or an
+        eligible extend) on the GPU (forward + sample, then the runner's launch
+        hook publishes the resolve payload), without waiting. Returns
+        ``(sched_output, pending_step)``; the caller holds the pending step
+        (launch-first keeps two steps in flight)."""
         self._emit_prefill_start_for_batch(batch)
         self._stamp_batch_launch(batch)
         sched_output = self._build_sched_output(batch)
@@ -1485,7 +1486,8 @@ class OmniScheduler:
     def _run_batch_resolve(self, batch, sched_output, pending_step, skip_rids=()):
         """Async: resolve the given launched step (wait event, host collect),
         emit its stream chunks (except overrun reqs in ``skip_rids``), and
-        return its GenerationBatchResult.
+        return its GenerationBatchResult. A launched extend batch's
+        ``scheduler_prefill_end`` is emitted here, when its result is known.
 
         next_token_ids comes from the resolved step's own batch_result; the
         live batch carries no token side channel under the 0.5.16 FutureMap
@@ -1496,6 +1498,7 @@ class OmniScheduler:
         mr_output = self._model_runner.execute_resolve(pending_step)
         if mr_output is None:
             return _FAILED_BATCH_RESULT
+        self._emit_prefill_end_for_batch(batch)
         self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
         return GenerationBatchResult(
             logits_output=None,
@@ -2368,8 +2371,33 @@ class OmniScheduler:
             return True
         return not bool(mode.is_extend())
 
+    def _prefill_lookahead_eligible(self, batch: ScheduleBatch) -> bool:
+        """Whether this extend batch may be launched into the one-step
+        lookahead instead of draining the pending step and running
+        synchronously.
+
+        Middle chunks of a chunked prefill stay synchronous: they own the
+        ``inflight_middle_chunks`` contract that runners and stream builders
+        read, and a lagged decrement would misclassify the final chunk. Mixed
+        (running rows folded in) and prefill-only batches stay synchronous
+        because their result processing is not the plain first-token path. The
+        runner then decides whether its prefill semantics split into launch and
+        resolve halves (``prefill_lookahead_eligible``).
+        """
+        mode = batch.forward_mode
+        if mode is None or not mode.is_extend():
+            return False
+        if self.chunked_req is not None:
+            return False
+        if batch.mix_running_indices is not None or batch.is_prefill_only:
+            return False
+        if any(req.inflight_middle_chunks > 0 for req in batch.reqs):
+            return False
+        runner = self._model_runner
+        return runner is not None and runner.prefill_lookahead_eligible(batch)
+
     def _async_pending_batch(self):
-        """The in-flight (launched, not yet resolved) decode batch, or None.
+        """The in-flight (launched, not yet resolved) batch, or None.
 
         ``_async_pending`` is ``(batch, sched_output, pending_step)`` or None.
         """
@@ -2416,8 +2444,9 @@ class OmniScheduler:
             self.process_batch_result(batch, result)
 
     def _resolve_pending_async(self) -> None:
-        """Resolve + process the in-flight decode step, if any. Used to flush
-        before prefill / pause / shutdown so a launched step is never stranded.
+        """Resolve + process the in-flight step, if any. Used to flush before
+        a synchronous batch / pause / shutdown so a launched step is never
+        stranded.
         """
         if self._async_pending is None:
             return
@@ -2521,14 +2550,18 @@ class OmniScheduler:
         return batch if batch.reqs else None
 
     def _event_loop_async_decode(self) -> None:
-        """One-step-lookahead decode loop (single stream + CUDA event).
+        """One-step-lookahead loop (single stream + CUDA event).
 
-        Each iteration LAUNCHES the current decode step (GPU forward + on-GPU
-        sample, then ``post_decode_launch`` publishes the resolve payload, no GPU
+        Each iteration LAUNCHES the current step (GPU forward + on-GPU sample,
+        then the runner's launch hook publishes the resolve payload, no GPU
         wait) and THEN RESOLVES the previous step's host-side collect, so the
         resolve host work overlaps the current step's GPU forward (launch-first,
-        D1 in design.md section 1.3). Prefill / empty batches flush any in-flight
-        decode first and run synchronously (the in-flight step is never stranded).
+        D1 in design.md section 1.3). Decode steps at or above the min batch
+        size and eligible extend batches (``_prefill_lookahead_eligible``) both
+        take that path, so a prefill costs its GPU time rather than a drain plus
+        a synchronous round trip. Ineligible prefills, small decodes and empty
+        batches flush any in-flight step first and run synchronously (the
+        in-flight step is never stranded).
         """
         while self._running:
             self._process_admin_requests()
@@ -2556,12 +2589,17 @@ class OmniScheduler:
 
             # Route through sync when the runner's collect has a sync-only
             # fallback (default True for runners not overriding lookahead_eligible).
+            # Extend batches take the lookahead when the loop and the runner
+            # both find them eligible; no min batch size applies to them, the
+            # cost being removed is that of the small prefill itself.
             runner = self._model_runner
-            use_lookahead = (
-                batch is not None
-                and len(batch.reqs) >= self.async_decode_min_batch_size
-                and self._batch_is_decode(batch)
-                and (runner is None or runner.lookahead_eligible(batch))
+            use_lookahead = batch is not None and (
+                (
+                    len(batch.reqs) >= self.async_decode_min_batch_size
+                    and self._batch_is_decode(batch)
+                    and (runner is None or runner.lookahead_eligible(batch))
+                )
+                or self._prefill_lookahead_eligible(batch)
             )
 
             if use_lookahead:
@@ -2580,11 +2618,12 @@ class OmniScheduler:
                             self._handle_batch_failure(pb, exc)
             else:
                 # Fast path (low-concurrency decode below the threshold) +
-                # prefill + empty all land here: flush any in-flight lookahead
-                # step first (preserve ordering — this is also the bs>=2 -> bs=1
-                # drain transition), then run this batch synchronously. Bypassing
-                # the lookahead at bs=1 avoids its fixed per-step overhead, which
-                # at low concurrency has no overlap payoff (the bs=1 regression).
+                # ineligible prefill + empty all land here: flush any in-flight
+                # lookahead step first (preserve ordering — this is also the
+                # bs>=2 -> bs=1 drain transition), then run this batch
+                # synchronously. Bypassing the lookahead at bs=1 avoids its fixed
+                # per-step overhead, which at low concurrency has no overlap
+                # payoff (the bs=1 regression).
                 # Skip the drain call entirely in the common no-pending case (the
                 # bs=1 steady state) — _resolve_pending_async would just no-op.
                 if self._async_pending is not None:
