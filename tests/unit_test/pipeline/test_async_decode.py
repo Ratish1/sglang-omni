@@ -451,6 +451,165 @@ def test_default_launch_staging_grows_then_slices_to_smaller_batch():
     assert small.next_token_ids.tolist() == [7, 8]
 
 
+class _PlainPrefillRunner(ModelRunner):
+    def __init__(self):
+        self.device = _STUB_DEVICE
+        self._async_enabled = True
+        self._execution_bridge = FakeExecutionBridge(_STUB_DEVICE)
+        self._staging_slot = 0
+        self._host_staging_buffers = []
+        self._async_query_hit = 0
+        self._async_query_miss = 0
+        self.output_processor = types.SimpleNamespace(
+            process=lambda batch_result, scheduler_output: {
+                req.request_id: RequestOutput(request_id=req.request_id)
+                for req in scheduler_output.requests
+            },
+            _capture_hidden=False,
+        )
+        self.prepare_calls = []
+        self.sample_calls = 0
+
+    def _build_forward_batch(self, scheduler_output):
+        sb = types.SimpleNamespace(
+            is_prefill_only=False,
+            input_ids=None,
+            reqs=[req.data.req for req in scheduler_output.requests],
+        )
+        sb.copy = lambda: sb
+        return types.SimpleNamespace(), sb, True
+
+    def _prepare_and_forward(
+        self, forward_batch, schedule_batch, requests, is_prefill, *, is_lookahead=False
+    ):
+        self.prepare_calls.append((is_prefill, is_lookahead))
+        return types.SimpleNamespace(
+            next_token_ids=None, logits_output=object(), can_run_cuda_graph=True
+        )
+
+    def _sample_next_token_ids(
+        self, logits_output, forward_batch, schedule_batch, requests
+    ):
+        self.sample_calls += 1
+        return torch.tensor([40 + i for i in range(len(requests))], dtype=torch.long)
+
+
+_HISTORY_FREE = types.SimpleNamespace(
+    repetition_penalty=1.0,
+    frequency_penalty=0.0,
+    presence_penalty=0.0,
+    min_new_tokens=0,
+)
+
+
+def _prefill_sched_output(n):
+    return SchedulerOutput(
+        requests=[
+            types.SimpleNamespace(
+                request_id=f"p{i}",
+                data=types.SimpleNamespace(
+                    req=types.SimpleNamespace(
+                        finished=lambda: False,
+                        is_retracted=False,
+                        sampling_params=_HISTORY_FREE,
+                    ),
+                    generation_steps=0,
+                    extra_model_outputs={},
+                    return_logprob=False,
+                ),
+            )
+            for i in range(n)
+        ],
+        batch_data=object(),
+    )
+
+
+def test_extend_launch_resolve_matches_sync_execute():
+    sync_runner = _PlainPrefillRunner()
+    sync_out = sync_runner.execute(_prefill_sched_output(2))
+
+    async_runner = _PlainPrefillRunner()
+    async_output = _prefill_sched_output(2)
+    with _patch_event(ready=True):
+        pending = async_runner.execute_launch(async_output)
+        async_out = async_runner.execute_resolve(pending)
+
+    assert pending.is_prefill is True
+    assert async_runner.prepare_calls == [(True, True)]
+    assert sync_runner.prepare_calls == [(True, False)]
+    assert (sync_runner.sample_calls, async_runner.sample_calls) == (1, 1)
+    assert async_out.req_ids == sync_out.req_ids == ["p0", "p1"]
+    assert async_out.next_token_ids.tolist() == sync_out.next_token_ids.tolist()
+    assert async_out.can_run_cuda_graph is sync_out.can_run_cuda_graph is True
+    assert [req.data.generation_steps for req in async_output.requests] == [1, 1]
+    sync_published = sync_runner._execution_bridge.published[0][1].tolist()
+    async_published = async_runner._execution_bridge.published[0][1].tolist()
+    assert async_published == sync_published
+
+
+def test_consecutive_extend_launches_resolve_in_order():
+    r = _PlainPrefillRunner()
+    with _patch_event(ready=True):
+        first = r.execute_launch(_prefill_sched_output(1))
+        second = r.execute_launch(_prefill_sched_output(2))
+        assert first.launch_buf is not second.launch_buf
+        first_out = r.execute_resolve(first)
+        second_out = r.execute_resolve(second)
+    assert first_out.next_token_ids.tolist() == [40]
+    assert second_out.next_token_ids.tolist() == [40, 41]
+    assert len(r._execution_bridge.published) == 2
+
+
+_PREFILL_HOOKS = (
+    "before_prefill",
+    "cleanup_prefill",
+    "custom_prefill_forward",
+    "post_prefill",
+    "sample_before_post_prefill",
+    "requested_capture_hidden_mode_prefill",
+)
+
+
+@pytest.mark.parametrize("hook", _PREFILL_HOOKS)
+def test_runner_overriding_a_prefill_hook_is_ineligible_and_refused(hook):
+    runner_cls = type(
+        f"_Custom_{hook}",
+        (_PlainPrefillRunner,),
+        {hook: lambda self, *args, **kwargs: None},
+    )
+    r = runner_cls()
+    batch = types.SimpleNamespace(reqs=[], is_prefill_only=False)
+    assert r.prefill_lookahead_eligible(batch) is False
+    with pytest.raises(RuntimeError, match="prefill_lookahead_eligible"):
+        r.execute_launch(_prefill_sched_output(1))
+    assert r.prepare_calls == []
+
+
+def test_prefill_lookahead_eligible_gates_sampling_history_and_prefill_only():
+    r = _PlainPrefillRunner()
+    penalized = types.SimpleNamespace(
+        repetition_penalty=1.1,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        min_new_tokens=0,
+    )
+    free_batch = types.SimpleNamespace(
+        reqs=[types.SimpleNamespace(sampling_params=_HISTORY_FREE)],
+        is_prefill_only=False,
+    )
+    penalized_batch = types.SimpleNamespace(
+        reqs=[types.SimpleNamespace(sampling_params=penalized)],
+        is_prefill_only=False,
+    )
+    prefill_only_batch = types.SimpleNamespace(
+        reqs=[types.SimpleNamespace(sampling_params=_HISTORY_FREE)],
+        is_prefill_only=True,
+    )
+    assert r.prefill_lookahead_eligible(free_batch) is True
+    assert r.prefill_lookahead_eligible(penalized_batch) is False
+    assert r.prefill_lookahead_eligible(prefill_only_batch) is False
+
+
 def _real_radix_pools(size=64):
     from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -626,13 +785,20 @@ def test_async_pending_batch_uses_initialized_state():
 
 
 class _FakeBatch:
-    def __init__(self, n):
+    def __init__(self, n, mode="decode", is_prefill_only=False, mix_running=False):
         # real ScheduleBatch.reqs are Reqs with .finished(); none finish here
         self.reqs = [
-            types.SimpleNamespace(finished=lambda: False, is_retracted=False)
+            types.SimpleNamespace(
+                finished=lambda: False, is_retracted=False, inflight_middle_chunks=0
+            )
             for _ in range(n)
         ]
         self.out_cache_loc = torch.arange(n)
+        self.forward_mode = types.SimpleNamespace(
+            is_extend=lambda: mode == "extend", is_decode=lambda: mode == "decode"
+        )
+        self.is_prefill_only = is_prefill_only
+        self.mix_running_indices = [0] if mix_running else None
 
     def copy(self):
         return self
@@ -768,7 +934,10 @@ def test_pending_decode_drain_order_for_prefill(
     s.running_batch.batch_is_full = batch_is_full
     s.waiting_queue = [object()] if prefill_source == "waiting" else []
     s.chunked_req = object() if prefill_source == "chunked" else None
-    s._batch_is_decode = lambda batch: False
+    s._model_runner = types.SimpleNamespace(
+        lookahead_eligible=lambda batch: True,
+        prefill_lookahead_eligible=lambda batch: False,
+    )
     s._resolve_and_process = lambda *args: events.append("resolve")
     s.process_batch_result = lambda batch, result: None
 
@@ -782,7 +951,7 @@ def test_pending_decode_drain_order_for_prefill(
         events.append("schedule")
         pending_during_schedule.append(s._async_pending)
         s._running = False
-        return _FakeBatch(1)
+        return _FakeBatch(1, mode="extend")
 
     s.get_next_batch_to_run = get_next_batch_to_run
     s._event_loop_async_decode()
