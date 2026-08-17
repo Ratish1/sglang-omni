@@ -24,7 +24,6 @@ from sglang_omni.utils.gpu_compat import should_disable_custom_all_reduce_for_gp
 
 logger = logging.getLogger(__name__)
 
-
 _STAGE_TOGGLE_MODE = Literal["default", "on", "off"]
 _QWEN_COLOCATED_CONFIG_CLASS = "Qwen3OmniSpeechColocatedPipelineConfig"
 _DECODE_MODE = Literal["async", "sync"]
@@ -39,11 +38,12 @@ _ASYNC_DECODE_FACTORIES = frozenset(
         "sglang_omni.models.fun_asr.stages.create_sglang_fun_asr_executor",
         "sglang_omni.models.qwen3_asr.stages.create_sglang_qwen3_asr_executor",
         "sglang_omni.models.arkasr.stages.create_sglang_arkasr_executor",
+        "sglang_omni.models.whisper_asr.stages.create_sglang_whisper_asr_executor",
     }
 )
 _ASYNC_DECODE_SUPPORTED_MODELS = (
     "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
-    "Qwen3-ASR, ARK-ASR, and the Qwen3-Omni thinker"
+    "Qwen3-ASR, ARK-ASR, Whisper ASR, and the Qwen3-Omni thinker"
 )
 _PREFILL_COALESCE_FACTORIES = frozenset(
     {
@@ -970,6 +970,8 @@ def apply_torch_compile_cli_overrides(
     talker_torch_compile: str,
     thinker_torch_compile_max_bs: int | None,
     talker_torch_compile_max_bs: int | None,
+    torch_compile: str = "default",
+    torch_compile_max_bs: int | None = None,
 ) -> PipelineConfig:
     thinker_mode = _normalize_stage_toggle_mode(
         "thinker_torch_compile", thinker_torch_compile
@@ -977,6 +979,7 @@ def apply_torch_compile_cli_overrides(
     talker_mode = _normalize_stage_toggle_mode(
         "talker_torch_compile", talker_torch_compile
     )
+    generation_mode = _normalize_stage_toggle_mode("torch_compile", torch_compile)
     _apply_stage_torch_compile_override(
         pipeline_config,
         stage_name="thinker",
@@ -997,6 +1000,27 @@ def apply_torch_compile_cli_overrides(
             ),
             mode=talker_mode,
             max_bs=talker_torch_compile_max_bs,
+        )
+    # note (Jeffro): single-stage pipelines (ASR, single-stage TTS) expose no
+    # talker role, so the role-qualified flags cannot reach their SGLang stage.
+    # Route the neutral flags through the generation role the same way
+    # --max-running-requests does.
+    if generation_mode != "default" or torch_compile_max_bs is not None:
+        generation_flag = (
+            "--torch-compile"
+            if generation_mode != "default"
+            else "--torch-compile-max-bs"
+        )
+        generation_stage = (
+            type(pipeline_config).generation_sglang_role_to_stage().get("generation")
+        )
+        if generation_stage is None:
+            _raise_unsupported_flag(pipeline_config, generation_flag)
+        _apply_stage_torch_compile_override(
+            pipeline_config,
+            stage_name=generation_stage,
+            mode=generation_mode,
+            max_bs=torch_compile_max_bs,
         )
     return pipeline_config
 
@@ -1271,6 +1295,27 @@ def serve(
             help="Override torch_compile_max_bs for supported SGLang talker stage.",
         ),
     ] = None,
+    torch_compile: Annotated[
+        str,
+        typer.Option(
+            "--torch-compile",
+            "--torch_compile",
+            help=(
+                "torch.compile mode for the SGLang generation stage: "
+                "default|on|off. Use this for single-stage pipelines (ASR, "
+                "single-stage TTS) that expose no talker role."
+            ),
+        ),
+    ] = "default",
+    torch_compile_max_bs: Annotated[
+        int | None,
+        typer.Option(
+            "--torch-compile-max-bs",
+            "--torch_compile_max_bs",
+            min=1,
+            help="Override torch_compile_max_bs for the SGLang generation stage.",
+        ),
+    ] = None,
     enable_realtime: Annotated[
         bool,
         typer.Option(
@@ -1289,8 +1334,8 @@ def serve(
                 "async|sync. Omit this flag to use the model-specific pipeline "
                 "default. Async mode enables one-step lookahead, "
                 "which can overlap the previous step's host-side collect with "
-                "the next GPU forward. Available for Higgs TTS, MOSS-TTS-Local, "
-                "MOSS-Transcribe-Diarize, Fun-ASR, Qwen3-ASR, and ARK-ASR."
+                "the next GPU forward. Available for "
+                f"{_ASYNC_DECODE_SUPPORTED_MODELS}."
             ),
         ),
     ] = None,
@@ -1456,6 +1501,8 @@ def serve(
         talker_torch_compile=talker_torch_compile,
         thinker_torch_compile_max_bs=thinker_torch_compile_max_bs,
         talker_torch_compile_max_bs=talker_torch_compile_max_bs,
+        torch_compile=torch_compile,
+        torch_compile_max_bs=torch_compile_max_bs,
     )
     merged_config = apply_decode_mode_cli_overrides(
         merged_config,
