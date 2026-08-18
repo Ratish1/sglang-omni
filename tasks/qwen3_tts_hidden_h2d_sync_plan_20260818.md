@@ -2,7 +2,8 @@
 
 ## Status and scope
 
-**Status: H2D candidates implemented; acceptance pending a fresh H100 detector and trace.**
+**Status: first H100 pass found a remaining scalar-index sync and an incomplete
+trace; both corrections are implemented and awaiting one bounded rerun.**
 
 - Repository: `sglang-omni`
 - Worktree: `.worktrees/qwen3-tts-hidden-h2d-sync-v2`
@@ -36,7 +37,10 @@ The source article is:
 `torch.tensor(python_data, device="cuda")` first materializes host storage and
 then calls `.to(device, non_blocking=False)`. PyTorch's CUDA copy path performs
 `cudaMemcpyAsync` followed by `cudaStreamSynchronize`, draining the launch queue.
-Python sequence advanced indexing can hide the same construction.
+Python advanced assignment can hide the same construction even when its mask
+and indices are already CUDA tensors. In Torch 2.11, `cuda_tensor[indices] =
+python_scalar` wraps the scalar in a CPU tensor, and `index_put_` performs a
+blocking `.to(self.device())` before launching its CUDA kernel.
 
 The primary source detector is:
 
@@ -89,6 +93,12 @@ The corresponding PyTorch implementation was checked directly, not inferred:
 - `aten/src/ATen/core/CachingHostAllocator.h` with
   `aten/src/ATen/cuda/CachingHostAllocator.cpp` records an event on free and
   withholds the pinned block from reuse until that event completes.
+- `torch/csrc/autograd/python_variable_indexing.cpp` deliberately wraps a Python
+  scalar assigned into a CUDA tensor as a CPU tensor, while
+  `aten/src/ATen/native/TensorAdvancedIndexing.cpp` moves that scalar to the
+  indexed tensor's device with a blocking `.to(...)`; and
+- the `index_fill_.int_Scalar` and `scatter_.value` schemas carry a scalar into
+  their CUDA kernels without materializing that CPU-to-CUDA tensor.
 
 ### Prior warning evidence
 
@@ -107,6 +117,30 @@ ownership are still present. A fresh current-branch warning pass remains the
 qualification gate; it determines which warnings actually disappeared and
 prevents stale line numbers from being reported as current evidence.
 
+### First v2 qualification result
+
+The bounded H100 pass at tested HEAD `32d8bf30` completed every request but
+correctly rejected the candidate for two independent reasons:
+
+- sync-debug warned at the three advanced scalar assignments in
+  `qwen3_tts/model_runner.py` that populated repetition/suppression masks; and
+- the clean trace contained CUDA runtime activity but no `qwen3_tts.*` or
+  scheduler-thread `aten::*` events.
+
+The mask indices were already pinned and copied nonblocking. The remaining
+hidden H2D was the Python `True` on the right-hand side. Commit `86884103`
+replaces ragged advanced assignment with flat `index_fill_(..., True)` and the
+one-token-per-row steady update with `scatter_(..., True)`. Both use PyTorch's
+Scalar overload and preserve the existing mask bits and repetition ownership.
+
+The profiler started on the control-plane thread after Omni's scheduler and
+preprocessing threads already existed. Kineto CPU callbacks are thread-local by
+default, which explains the missing CPU parents while CUPTI CUDA activity was
+still present. Commit `167a2573` enables Torch 2.11's
+`_ExperimentalConfig(profile_all_threads=True)`. PyTorch's own profiler test
+covers both pre-existing sibling threads and threads created inside the active
+window. This is diagnostic scope only; it does not change inference execution.
+
 ### Current ownership table
 
 | Current mechanism | Producer and first consumer | Ownership result | Candidate action |
@@ -114,7 +148,7 @@ prevents stale line numbers from being reported as current evidence.
 | Speaker mel pageable H2D | CPU mel frontend; speaker encoder on the same current CUDA stream | Unsafe blocking H2D; source is immutable for the copy | Contiguous pinned one-shot source and nonblocking copy |
 | Cached speaker embedding pageable H2D | CPU cache clone; prompt construction on the same current CUDA stream | Unsafe blocking H2D in the prompt call | Pinned one-shot source and nonblocking copy |
 | Config-derived prompt token sequences | Python integers; embedding lookup on the same current CUDA stream | `torch.tensor(..., device=cuda)` hidden blocking H2D | Device `full` for repeated/scalar data; pinned one-shot source for heterogeneous rows |
-| Repetition/suppression mask rebuild | Python request history; mask scatter and logit shaping on the scheduler stream | Unsafe blocking metadata H2D, but shaping semantics must remain exactly as-is | Pinned one-shot row/token/penalty staging; no ownership change |
+| Repetition/suppression mask rebuild | Python request history; mask scatter and logit shaping on the scheduler stream | Unsafe blocking index metadata and advanced-assignment scalar H2D, but shaping semantics must remain exactly as-is | Pinned one-shot flat-index/penalty staging plus Scalar `index_fill_`/`scatter_`; no ownership change |
 | Semantic/subtalker sampling metadata | Python request metadata; persistent predictor buffers on the scheduler stream | Previously proven unsafe and already qualified mechanically | Keep the existing pinned nonblocking restaging candidate |
 | Embedding cache-key D2H | CUDA prompt embeddings; CPU BLAKE2 hash immediately afterward | Synchronization is required by the current CPU algorithm | Retain until the cache-key algorithm itself is redesigned |
 | Speaker-artifact cache D2H | CUDA embedding/codes; shared CPU cache with concurrent readers | Potentially deferrable, but no event is owned by a cache entry today | Retain; requires an event-gated cache artifact protocol |
@@ -182,14 +216,17 @@ This candidate changes transfer mechanics only. Its gate is disappearance of the
 associated synchronization warnings/blocking copies with exact metadata values
 and no replacement wait; end-to-end speedup is not assumed.
 
-The next local implementation batch applies the same proof to the remaining
-same-stream H2D mechanisms in the ownership table: speaker mel/embedding inputs,
+The same-stream H2D batch now covers speaker mel/embedding inputs,
 config-derived token rows, and Qwen3-TTS repetition/suppression mask rebuilds.
-It deliberately leaves every D2H and cross-thread handoff in the table intact.
-None of these candidates is accepted until a current-branch warning pass shows
-the exact source warnings are gone and a clean trace finds no replacement wait
-inside the selected ranges. Use `error` only to localize a selected source that
-still warns; retained D2H boundaries make a global error-mode pass abort early.
+Ragged mask entries are encoded as flat host indices, staged through pinned
+memory, and applied by the CUDA `index_fill_` Scalar overload. The steady decode
+update uses the CUDA `scatter_` Scalar overload directly on the per-row token
+index. Every D2H and cross-thread handoff in the ownership table remains intact.
+None of these candidates is accepted until the corrected warning pass shows the
+exact source warnings are gone and an all-thread clean trace finds no replacement
+wait inside the selected ranges. Use `error` only to localize a selected source
+that still warns; retained D2H boundaries make a global error-mode pass abort
+early.
 
 Semantic profiler ranges are enabled only while `TorchProfiler` is active. The
 candidate ranges are `qwen3_tts.preprocess.speaker_mel_h2d`,
@@ -220,13 +257,15 @@ without enabling stack collection for the whole server.
 
 ## Open evidence before the next production rewrite
 
-Question or missing evidence: fresh detector output against the restacked
-current-main base after PR #1462 and later Qwen3-TTS changes.
+Question or missing evidence: one corrected warning pass and one all-thread
+clean trace against commits `86884103` and `167a2573`.
 
-Why it matters; owner or authoritative source; how to resolve it: current code
-has changed several old warning sites. Run the worker-process detector and retain
-full logs; the warning source plus current owner code determines the rewrite.
+Why it matters; owner or authoritative source; how to resolve it: the detector
+must show that the three advanced-assignment warnings disappeared, and the trace
+must contain scheduler/preprocessing CPU parents before its scoped occurrence
+counts are usable. Run only the bounded cookbook windows and retain full logs and
+the stable trace.
 
-Which design, phase, or proof changes with the answer: it determines the next
-mechanism selected in execution steps 3-4, but does not change the detector
-architecture or the separation of the repetition-penalty future PR.
+Which design, phase, or proof changes with the answer: passing both gates admits
+one full-corpus A/B pair; failure returns to source attribution. It does not
+change the detector architecture or the separate repetition-penalty future PR.

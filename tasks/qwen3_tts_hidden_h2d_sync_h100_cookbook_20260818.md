@@ -1,9 +1,10 @@
 # Qwen3-TTS hidden H2D synchronization: minimal H100 qualification
 
-This cookbook qualifies commit `315ebb3d` without repeating the full SeedTTS
-corpus unnecessarily. It runs one server, one bounded warning pass, and one
-bounded clean trace. Perfetto is optional; retain the trace, but use the
-mechanical analyzer first.
+This cookbook qualifies the scalar-mask correction `86884103` and all-thread
+profiler correction `167a2573` without repeating the full SeedTTS corpus
+unnecessarily. It runs one server, one bounded warning pass, and one bounded
+clean trace. Perfetto is optional; retain the trace, but use the mechanical
+analyzer first.
 
 The commands intentionally omit `--seed`, `--temperature`, `--top-p`,
 `--top-k`, and `--repetition-penalty`. Qwen3-TTS resolves its normal generation
@@ -16,7 +17,8 @@ benchmark warm-up request.
 ```bash
 git fetch origin
 git switch --detach origin/perf/qwen3-tts-hidden-h2d-sync-v2
-git merge-base --is-ancestor 315ebb3d HEAD
+git merge-base --is-ancestor 86884103 HEAD
+git merge-base --is-ancestor 167a2573 HEAD
 git rev-parse HEAD
 
 python - <<'PY'
@@ -37,7 +39,7 @@ checkout. The previously qualified snapshot is
 
 ```bash
 export MODEL_PATH=/absolute/path/to/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base/snapshots/5d83992436eae1d760afd27aff78a71d676296fc
-export QUAL_DIR=/tmp/q3tts-hidden-sync-315ebb3d
+export QUAL_DIR=/tmp/q3tts-hidden-sync-167a2573
 export SERVER_LOG="$QUAL_DIR/server.log"
 mkdir -p "$QUAL_DIR"
 ```
@@ -80,7 +82,7 @@ Do not start either diagnostic window if warm-up reports an HTTP/CUDA error.
 ## 3. One warning-only pass
 
 ```bash
-export WARN_RUN=q3tts-315ebb3d-warn-c1
+export WARN_RUN=q3tts-167a2573-warn-c1
 mkdir -p "$QUAL_DIR/$WARN_RUN/events"
 curl -fsS -X POST http://127.0.0.1:8000/start_profile \
   -H 'content-type: application/json' \
@@ -125,6 +127,9 @@ Pass conditions:
 - No warning originates from the new pinned/nonblocking sites in
   `qwen3_tts/sglang_model.py`, `qwen3_tts/model_runner.py`, or
   `Qwen3TTSTalker.prepare_decode_buffers`.
+- In particular, there is no warning from the repetition/suppression mask
+  `index_fill_` rebuild or the steady per-row `scatter_` update. These replace
+  the three advanced assignments reported at tested HEAD `32d8bf30`.
 - Warnings at cache-key/cache D2H, final-code D2H, or an explicit publication
   wait are retained ownership boundaries, not a reason to delete their
   synchronization. Prepared-reference normalization should be a device no-op
@@ -137,7 +142,7 @@ D2H boundary and is not a useful clean-server gate.
 ## 4. One clean c16 trace
 
 ```bash
-export TRACE_RUN=q3tts-315ebb3d-trace-c16
+export TRACE_RUN=q3tts-167a2573-trace-c16
 mkdir -p "$QUAL_DIR/$TRACE_RUN/events" "$QUAL_DIR/$TRACE_RUN/analysis"
 curl -fsS -X POST http://127.0.0.1:8000/start_profile \
   -H 'content-type: application/json' \
@@ -212,8 +217,8 @@ kill "$SERVER_PID"
 wait "$SERVER_PID" || true
 find "$QUAL_DIR" -type f -print0 | sort -z | xargs -0 sha256sum \
   > "$QUAL_DIR/SHA256SUMS"
-tar -C /tmp -czf /tmp/q3tts-hidden-sync-315ebb3d.tar.gz \
-  q3tts-hidden-sync-315ebb3d
+tar -C /tmp -czf /tmp/q3tts-hidden-sync-167a2573.tar.gz \
+  q3tts-hidden-sync-167a2573
 ```
 
 Return the tarball. The required contents are the full server log, both
@@ -234,8 +239,9 @@ CUDA_VISIBLE_DEVICES=0 python -m benchmarks.eval.benchmark_tts_seedtts \
   --output-dir /tmp/q3tts-full-REVISION
 ```
 
-Baseline is `2cac60e8`; candidate is `315ebb3d`. This is the full 1,088-sample
-English set at the benchmark's canonical c16, unseeded, 2,048-token defaults.
+Baseline is `2cac60e8`; candidate must contain `86884103` and `167a2573`. This
+is the full 1,088-sample English set at the benchmark's canonical c16, unseeded,
+2,048-token defaults.
 One A/B pair is descriptive: it can rule out a large regression, but it cannot
 support a performance claim when the difference is within run-to-run variance.
 Report the count of 2,048-token length caps and both raw and outlier-excluded WER
