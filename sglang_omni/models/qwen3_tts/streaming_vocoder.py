@@ -14,6 +14,7 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
@@ -1004,6 +1005,10 @@ class Qwen3TTSStreamingVocoderScheduler(
     async def _vocode_payload(self, payload: StagePayload) -> StagePayload:
         return (await self._vocode_payloads([payload]))[0]
 
+    def _decode_with_tokenizer(self, inputs: list[dict[str, Any]]) -> Any:
+        with TorchProfiler.record_function("qwen3_tts.vocoder.tokenizer.decode"):
+            return self._tokenizer.decode(inputs)
+
     async def _vocode_payloads(
         self, payloads: list[StagePayload]
     ) -> list[StagePayload]:
@@ -1019,11 +1024,13 @@ class Qwen3TTSStreamingVocoderScheduler(
         if self._deterministic_inference:
             wavs = []
             for item in codes:
-                decoded, sample_rate = self._tokenizer.decode([{"audio_codes": item}])
+                decoded, sample_rate = self._decode_with_tokenizer(
+                    [{"audio_codes": item}]
+                )
                 (wav,) = decoded
                 wavs.append(wav)
         else:
-            wavs, sample_rate = self._tokenizer.decode(
+            wavs, sample_rate = self._decode_with_tokenizer(
                 [{"audio_codes": item} for item in codes]
             )
         if len(wavs) != len(payloads):
@@ -1066,7 +1073,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         if state.audio_codes is None:
             return None
         codes = torch.as_tensor(state.audio_codes, dtype=torch.long)
-        wavs, _ = self._tokenizer.decode([{"audio_codes": codes}])
+        wavs, _ = self._decode_with_tokenizer([{"audio_codes": codes}])
         if not wavs:
             return None
         waveform = torch.as_tensor(wavs[0], dtype=torch.float32)

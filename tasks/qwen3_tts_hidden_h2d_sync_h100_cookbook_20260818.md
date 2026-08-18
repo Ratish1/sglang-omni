@@ -12,6 +12,10 @@ defaults. `--max-samples`, `--sample-offset`, and `--warmup 0` are present only
 to make the diagnostic windows bounded, disjoint, and free of an unreported
 benchmark warm-up request.
 
+Sections 1-5 passed at `aebd777e`. Do not repeat their warning gate or the full
+corpus merely to qualify profiler annotations. Section 7 is the single bounded
+follow-up for attributing the remaining synchronization owners.
+
 ## 1. Checkout and provenance
 
 ```bash
@@ -187,9 +191,10 @@ candidate:
 
 ```bash
 git fetch origin perf/qwen3-tts-hidden-h2d-sync
+export TRACE_ANALYZER="$QUAL_DIR/analyze_cuda_sync_trace.py"
 git show origin/perf/qwen3-tts-hidden-h2d-sync:benchmarks/profiling/analyze_cuda_sync_trace.py \
-  > "$QUAL_DIR/analyze_cuda_sync_trace.py"
-python "$QUAL_DIR/analyze_cuda_sync_trace.py" \
+  > "$TRACE_ANALYZER"
+python "$TRACE_ANALYZER" \
   "$TRACE_FILE" \
   --output-dir "$QUAL_DIR/$TRACE_RUN/analysis"
 ```
@@ -246,3 +251,170 @@ One A/B pair is descriptive: it can rule out a large regression, but it cannot
 support a performance claim when the difference is within run-to-run variance.
 Report the count of 2,048-token length caps and both raw and outlier-excluded WER
 because the established unseeded baseline itself has a rare runaway tail.
+
+## 7. Remaining-sync attribution trace
+
+This is an observability-only follow-up. The added ranges do not change tensor
+construction, transfer mechanics, streams, sampling, or stage payloads. Start a
+fresh server at the range-instrumentation revision, warm it once, and collect
+one c16 trace. Do not run sync-debug or another full-corpus A/B.
+
+Use the same pinned model snapshot and server command from Sections 1-2 with a
+new output directory:
+
+```bash
+export ATTR_REV
+ATTR_REV=$(git rev-parse --short=8 HEAD)
+export QUAL_DIR=/tmp/q3tts-sync-attribution-$ATTR_REV
+export SERVER_LOG="$QUAL_DIR/server.log"
+mkdir -p "$QUAL_DIR"
+
+CUDA_VISIBLE_DEVICES=0 \
+SGLANG_TORCH_PROFILER_DIR="$QUAL_DIR/profiles" \
+sgl-omni serve \
+  --model-path "$MODEL_PATH" \
+  --config examples/configs/qwen3_tts_0_6b.yaml \
+  --port 8000 \
+  >"$SERVER_LOG" 2>&1 &
+export SERVER_PID=$!
+until curl -fsS http://127.0.0.1:8000/health >/dev/null; do sleep 2; done
+
+python -m benchmarks.eval.benchmark_tts_seedtts \
+  --generate-only \
+  --use-existing-server \
+  --model "$MODEL_PATH" \
+  --output-dir "$QUAL_DIR/warmup" \
+  --max-samples 64 \
+  --sample-offset 1024 \
+  --concurrency 16 \
+  --warmup 0
+```
+
+Capture the same disjoint 64-request population used by the accepted mechanical
+trace:
+
+```bash
+export TRACE_RUN=q3tts-$ATTR_REV-remaining-sync-c16
+mkdir -p "$QUAL_DIR/$TRACE_RUN/events" "$QUAL_DIR/$TRACE_RUN/analysis"
+curl -fsS -X POST http://127.0.0.1:8000/start_profile \
+  -H 'content-type: application/json' \
+  -d "{\"run_id\":\"$TRACE_RUN\",\"trace_path_template\":\"$QUAL_DIR/$TRACE_RUN/trace\",\"event_dir\":\"$QUAL_DIR/$TRACE_RUN/events\",\"enable_torch\":true}" \
+  | tee "$QUAL_DIR/$TRACE_RUN/start_response.json"
+
+until grep -Fq "Starting End-to-End Torch profiler (run_id=$TRACE_RUN)" "$SERVER_LOG"; do
+  sleep 1
+done
+
+python -m benchmarks.eval.benchmark_tts_seedtts \
+  --generate-only \
+  --use-existing-server \
+  --model "$MODEL_PATH" \
+  --output-dir "$QUAL_DIR/$TRACE_RUN/client" \
+  --max-samples 64 \
+  --sample-offset 128 \
+  --concurrency 16 \
+  --warmup 0
+
+curl -fsS -X POST http://127.0.0.1:8000/stop_profile \
+  -H 'content-type: application/json' \
+  -d "{\"run_id\":\"$TRACE_RUN\"}" \
+  | tee "$QUAL_DIR/$TRACE_RUN/stop_response.json"
+
+until find "$QUAL_DIR/$TRACE_RUN" -name '*.trace.json.gz' -size +0c | grep -q .; do
+  sleep 2
+done
+export TRACE_FILE
+TRACE_FILE=$(find "$QUAL_DIR/$TRACE_RUN" -name '*.trace.json.gz' -size +0c -print -quit)
+size_1=$(stat -c %s "$TRACE_FILE")
+mtime_1=$(stat -c %Y "$TRACE_FILE")
+sleep 5
+test "$size_1:$mtime_1" = "$(stat -c %s "$TRACE_FILE"):$(stat -c %Y "$TRACE_FILE")"
+
+git fetch origin perf/qwen3-tts-hidden-h2d-sync
+export TRACE_ANALYZER="$QUAL_DIR/analyze_cuda_sync_trace.py"
+git show origin/perf/qwen3-tts-hidden-h2d-sync:benchmarks/profiling/analyze_cuda_sync_trace.py \
+  > "$TRACE_ANALYZER"
+python "$TRACE_ANALYZER" \
+  "$TRACE_FILE" \
+  --output-dir "$QUAL_DIR/$TRACE_RUN/analysis"
+```
+
+Count CPU ownership ranges directly from the trace. This also proves that a
+zero synchronization count is not merely an unexercised call path:
+
+```bash
+export OWNERSHIP_COUNTS="$QUAL_DIR/$TRACE_RUN/analysis/ownership_range_counts.json"
+python - "$TRACE_FILE" "$TRACE_ANALYZER" <<'PY' | tee "$OWNERSHIP_COUNTS"
+import importlib.util
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+trace_path = Path(sys.argv[1])
+analyzer_path = Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location("q3tts_sync_analyzer", analyzer_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+expected = {
+    "qwen3_tts.preprocess.text_tokenizer",
+    "qwen3_tts.preprocess.reference_tokenizer.encode",
+    "qwen3_tts.preprocess.speaker_encoder.forward",
+    "qwen3_tts.preprocess.prompt.build",
+    "qwen3_tts.sampling.base_pipeline",
+    "qwen3_tts.vocoder.tokenizer.decode",
+}
+counts = Counter()
+for event in module.iter_trace_events(trace_path):
+    if event.get("ph") != "X" or event.get("cat") != "user_annotation":
+        continue
+    name = event.get("name")
+    if name in expected:
+        counts[name] += 1
+missing = sorted(expected - counts.keys())
+print(json.dumps({"counts": dict(sorted(counts.items())), "missing": missing}, indent=2))
+if missing:
+    raise SystemExit(f"missing ownership ranges: {missing}")
+PY
+```
+
+Print the newly scoped synchronizations and the residual unscoped mechanisms:
+
+```bash
+jq -r '
+  .aggregates[]
+  | select(.semantic_range | startswith("qwen3_tts."))
+  | [.semantic_range, .sync_name, .parent_cpu_op, .transfer_direction,
+     .count, .compound_host_block_total_us, .sync_wait_total_us,
+     .transfer_bytes_total]
+  | @tsv
+' "$QUAL_DIR/$TRACE_RUN/analysis/cuda_sync_aggregates.json" \
+  | sort > "$QUAL_DIR/$TRACE_RUN/analysis/qwen3_tts_scoped_syncs.tsv"
+
+jq -r '
+  .aggregates[]
+  | select(.semantic_range == "unscoped")
+  | [.sync_name, .parent_cpu_op, .transfer_direction, .count,
+     .compound_host_block_total_us, .sync_wait_total_us,
+     .transfer_bytes_total]
+  | @tsv
+' "$QUAL_DIR/$TRACE_RUN/analysis/cuda_sync_aggregates.json" \
+  | sort > "$QUAL_DIR/$TRACE_RUN/analysis/residual_unscoped_syncs.tsv"
+```
+
+Interpretation gate:
+
+- all six ownership ranges are present on CPU lanes;
+- the prior unscoped scalar D2H, pageable H2D, and final D2H occurrences move
+  under one of the ownership ranges when they originate in those calls;
+- the existing candidate ranges remain synchronization-free;
+- explicit async-resolution, reference-publication, cache-key/cache-publication,
+  and process-safe payload waits remain separately classified; and
+- any residual unscoped group is reported rather than guessed from proximity.
+
+This trace is for choosing the next design, not accepting a performance claim.
+Return the stable trace, analyzer outputs, ownership counts, client output, and
+server log. A stack-enabled trace is justified only if a material unscoped group
+remains after these ownership ranges.

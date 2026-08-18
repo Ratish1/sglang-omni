@@ -102,12 +102,13 @@ class Qwen3TTSModelRunner(ModelRunner):
         requests: list,
     ) -> Any:
         self._install_semantic_sampling_seeds(forward_batch, requests)
-        next_token_ids = super()._sample_next_token_ids(
-            logits_output,
-            forward_batch,
-            schedule_batch,
-            requests,
-        )
+        with TorchProfiler.record_function("qwen3_tts.sampling.base_pipeline"):
+            next_token_ids = super()._sample_next_token_ids(
+                logits_output,
+                forward_batch,
+                schedule_batch,
+                requests,
+            )
         if isinstance(next_token_ids, torch.Tensor):
             self._mask_last_sampled = next_token_ids
         else:

@@ -510,6 +510,13 @@ def _build_qwen3_tts_pad_embed(model: Any) -> torch.Tensor:
         )
 
 
+def _tokenize_qwen3_tts_text(wrapper: Any, text: str) -> torch.Tensor:
+    """Attribute the third-party tokenizer's CPU-to-device boundary."""
+
+    with TorchProfiler.record_function("qwen3_tts.preprocess.text_tokenizer"):
+        return wrapper._tokenize_texts([text])[0]
+
+
 def _build_instruct_id(wrapper: Any, instructions: str | None) -> torch.Tensor | None:
     if not instructions:
         return None
@@ -517,7 +524,7 @@ def _build_instruct_id(wrapper: Any, instructions: str | None) -> torch.Tensor |
         instruct_text = wrapper._build_instruct_text(instructions)
     else:
         instruct_text = f"<|im_start|>user\n{instructions}<|im_end|>\n"
-    return wrapper._tokenize_texts([instruct_text])[0]
+    return _tokenize_qwen3_tts_text(wrapper, instruct_text)
 
 
 def _qwen3_tts_uploaded_voice_cache_key(state: Qwen3TTSState) -> SpeakerCacheKey | None:
@@ -641,6 +648,15 @@ class _Qwen3TTSRefCodeBatcher:
         self._queue.put((waveform, int(sample_rate), future))
         return future
 
+    def _encode_audio_codes(self, audio: Any, sample_rate: int) -> Any:
+        with TorchProfiler.record_function(
+            "qwen3_tts.preprocess.reference_tokenizer.encode"
+        ):
+            return self._speech_tokenizer.encode(
+                audio,
+                sr=sample_rate,
+            ).audio_codes
+
     def _drain(self) -> tuple[list[object], bool]:
         first = self._queue.get()
         if first is _QWEN3_TTS_REF_CODE_BATCH_STOP:
@@ -707,10 +723,7 @@ class _Qwen3TTSRefCodeBatcher:
                 for sample_rate, group in groups.items():
                     waveforms = [waveform for _, waveform in group]
                     try:
-                        encoded = self._speech_tokenizer.encode(
-                            waveforms,
-                            sr=sample_rate,
-                        ).audio_codes
+                        encoded = self._encode_audio_codes(waveforms, sample_rate)
                         if len(encoded) != len(group):
                             raise ValueError(
                                 "Qwen3-TTS speech tokenizer returned "
@@ -719,10 +732,9 @@ class _Qwen3TTSRefCodeBatcher:
                     except Exception:
                         for index, waveform in group:
                             try:
-                                outcomes[index] = self._speech_tokenizer.encode(
-                                    waveform,
-                                    sr=sample_rate,
-                                ).audio_codes[0]
+                                outcomes[index] = self._encode_audio_codes(
+                                    waveform, sample_rate
+                                )[0]
                             except Exception as exc:
                                 outcomes[index] = exc
                     else:
@@ -816,10 +828,13 @@ class _Qwen3TTSAdhocReferenceHook(
                     orig_sr=int(sample_rate),
                     target_sr=speaker_sample_rate,
                 )
-            speaker_embedding = self._model.extract_speaker_embedding(
-                audio=speaker_waveform,
-                sr=speaker_sample_rate,
-            )
+            with TorchProfiler.record_function(
+                "qwen3_tts.preprocess.speaker_encoder.forward"
+            ):
+                speaker_embedding = self._model.extract_speaker_embedding(
+                    audio=speaker_waveform,
+                    sr=speaker_sample_rate,
+                )
             ref_code = _record_ref_code_consumer_stream(
                 ref_code_future.result(timeout=130.0)
             )
@@ -994,14 +1009,19 @@ def _prepare_qwen3_tts_base_request(
             ),
         )
 
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
+    input_id = _tokenize_qwen3_tts_text(
+        wrapper, wrapper._build_assistant_text(state.text)
+    )
     ref_id = (
-        wrapper._tokenize_texts([wrapper._build_ref_text(ref_text)])[0]
+        _tokenize_qwen3_tts_text(wrapper, wrapper._build_ref_text(ref_text))
         if ref_text
         else None
     )
     instruct_id = _build_instruct_id(wrapper, state.instructions)
-    with torch.no_grad():
+    with (
+        torch.no_grad(),
+        TorchProfiler.record_function("qwen3_tts.preprocess.prompt.build"),
+    ):
         return model.build_voice_clone_inputs(
             input_id=input_id,
             ref_id=ref_id,
@@ -1018,9 +1038,14 @@ def _prepare_qwen3_tts_custom_voice_request(
     model: Any,
     wrapper: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
+    input_id = _tokenize_qwen3_tts_text(
+        wrapper, wrapper._build_assistant_text(state.text)
+    )
     instruct_id = _build_instruct_id(wrapper, state.instructions)
-    with torch.no_grad():
+    with (
+        torch.no_grad(),
+        TorchProfiler.record_function("qwen3_tts.preprocess.prompt.build"),
+    ):
         return model.build_custom_voice_inputs(
             input_id=input_id,
             voice=state.voice or QWEN3_TTS_DEFAULT_CUSTOM_VOICE,
@@ -1036,9 +1061,14 @@ def _prepare_qwen3_tts_voice_design_request(
     model: Any,
     wrapper: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
+    input_id = _tokenize_qwen3_tts_text(
+        wrapper, wrapper._build_assistant_text(state.text)
+    )
     instruct_id = _build_instruct_id(wrapper, state.instructions)
-    with torch.no_grad():
+    with (
+        torch.no_grad(),
+        TorchProfiler.record_function("qwen3_tts.preprocess.prompt.build"),
+    ):
         return model.build_voice_design_inputs(
             input_id=input_id,
             language=state.language,

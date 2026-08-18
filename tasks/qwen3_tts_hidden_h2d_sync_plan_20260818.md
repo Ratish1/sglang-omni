@@ -2,8 +2,10 @@
 
 ## Status and scope
 
-**Status: first H100 pass found a remaining scalar-index sync and an incomplete
-trace; both corrections are implemented and awaiting one bounded rerun.**
+**Status: the six selected H2D mechanisms passed the bounded H100 mechanical
+gates at `aebd777e`. Profiler-only ownership ranges for the remaining runtime
+synchronizations are implemented and await one bounded attribution trace. No
+serving-speedup claim has been established.**
 
 - Repository: `sglang-omni`
 - Worktree: `.worktrees/qwen3-tts-hidden-h2d-sync-v2`
@@ -141,6 +143,62 @@ still present. Commit `167a2573` enables Torch 2.11's
 covers both pre-existing sibling threads and threads created inside the active
 window. This is diagnostic scope only; it does not change inference execution.
 
+### Corrected Sections 1-5 qualification
+
+The returned bundle `q3tts-hidden-sync-167a2573-20260818T165158Z` was captured
+from tested revision `aebd777ee5b67f354fe00b86c3239cecd6583415` on an H100
+with Torch `2.11.0+cu130`. All 177 manifest hashes verify locally.
+
+The warning-only c1 window completed 16/16 requests. It enabled and disabled the
+process-scoped detector exactly once, and emitted no warning from the six
+selected Qwen3-TTS source paths. The clean c16 window completed 64/64 requests;
+all scheduler-thread ATen parents and expected semantic ranges were present.
+Every selected range contained correlated pinned asynchronous H2D activity and
+zero stream, event, or device wait:
+
+| Selected range | CPU range calls | Correlated H2D copies | Bytes | GPU copy time |
+|---|---:|---:|---:|---:|
+| `qwen3_tts.preprocess.speaker_mel_h2d` | 44 | 44 | 9,531,392 | 392.828 us |
+| `qwen3_tts.preprocess.speaker_embedding_h2d` | 64 | 64 | 131,072 | 80.768 us |
+| `qwen3_tts.prompt.token_ids_h2d` | 192 | 192 | 4,096 | 158.434 us |
+| `qwen3_tts.prompt.ref_code_h2d` | 64 | 64 | 466,944 | 116.573 us |
+| `qwen3_tts.sampling_masks.rebuild` | 113 | 309 | 7,292,892 | 801.428 us |
+| `qwen3_tts.sampling_metadata.h2d` | 351 | 672 | 34,720 | 568.695 us |
+| **Total** | **828** | **1,345** | **17,461,116** | **2,118.726 us** |
+
+These values explain why a mechanical pass is not itself a speedup claim. The
+copies still execute before their same-stream consumers; the rewrite removes
+the host-side stream drains, not the approximately 2.12 ms of device transfer
+work. The six CPU annotation ranges contain Python construction, pinned-host
+allocation/copy, and device launches, so their summed range duration must not be
+mistaken for eliminated time.
+
+The same clean trace still contains 1,742 synchronization occurrences outside
+the six candidates. The important remaining mechanisms are:
+
+| Remaining mechanism | Count | Compound host/API time | GPU transfer time | Interpretation |
+|---|---:|---:|---:|---|
+| Unscoped scalar D2H (`aten::_local_scalar_dense`) | 854 | 479.433 ms | 2.050 ms | Highest-frequency hidden control-flow synchronization; warning locations are known, but the low-overhead trace has no Python stacks to map counts to locations. |
+| Unscoped pageable H2D (`aten::copy_`) | 234 | 91.661 ms | 1.542 ms | Remaining framework/Qwen tokenizer or preprocessing copies; source-frequency attribution is still missing. |
+| Cache artifact D2H | 88 | 191.451 ms | 0.244 ms | Immediate CPU cache publication under the current artifact contract; not removable by setting `non_blocking=True` alone. |
+| Embedding cache-key D2H | 64 | 70.689 ms | 0.426 ms | CPU BLAKE2 consumes the rows immediately; requires an algorithm/ownership redesign. |
+| Final codec-code D2H | 64 | 85.894 ms | 0.175 ms | Default placement hands the tensor locally to the vocoder, but the edge is also process-safe; any device-resident fast path must preserve the cross-process fallback. |
+| Unscoped final/output D2H | 64 | 39.435 ms | 1.327 ms | Consistent with final waveform materialization; must be scoped before redesign. |
+| Async completion event wait | 351 | 2,051.324 ms of host wait | n/a | Expected resolve boundary for one-step lookahead. The GPU has a median 5.57 ms queue horizon at wait entry, so this wait is not evidence of wasted GPU time. |
+
+Across the 5.718 s GPU-active workload span, the union of GPU events is
+3.039 s and the device is globally idle for 2.679 s in this profiler-perturbed
+capture. The 715.666 ms union of blocking-copy host intervals shows real launch
+queue drains remain, but it cannot be read as directly recoverable wall time:
+preprocessing threads overlap, D2H consumers can be immediate, and causal
+intervals from different occurrences overlap.
+
+Request event timelines locate the observed c16 latency without attributing it
+to a specific sync: preprocessing averages 197.036 ms, the TTS engine 873.453
+ms (807.612 ms after prefill), and the vocoder 235.337 ms. Same-process hop time
+is approximately 0.03 ms in either direction. These intervals overlap across
+requests and therefore are not additive throughput costs.
+
 ### Current ownership table
 
 | Current mechanism | Producer and first consumer | Ownership result | Candidate action |
@@ -203,7 +261,7 @@ Do not delete functional logic merely because its implementation warns.
    overrides. Do not claim performance from a single noisy ordering; report a
    synchronization cleanup as such when throughput and p95 remain within noise.
 
-## Implemented candidates awaiting the fresh detector pass
+## Mechanically qualified candidates
 
 `Qwen3TTSTalker.prepare_decode_buffers` stages dynamic semantic/subtalker sampling
 metadata in one-shot pinned CPU tensors, then issues nonblocking copies into
@@ -222,11 +280,11 @@ Ragged mask entries are encoded as flat host indices, staged through pinned
 memory, and applied by the CUDA `index_fill_` Scalar overload. The steady decode
 update uses the CUDA `scatter_` Scalar overload directly on the per-row token
 index. Every D2H and cross-thread handoff in the ownership table remains intact.
-None of these candidates is accepted until the corrected warning pass shows the
-exact source warnings are gone and an all-thread clean trace finds no replacement
-wait inside the selected ranges. Use `error` only to localize a selected source
-that still warns; retained D2H boundaries make a global error-mode pass abort
-early.
+The corrected warning pass shows the exact selected source warnings are gone,
+and the all-thread clean trace finds no replacement wait inside the selected
+ranges. This accepts the six rewrites as synchronization cleanups, not as a
+demonstrated serving speedup. Use `error` only to localize a selected remaining
+source; retained D2H boundaries make a global error-mode pass abort early.
 
 Semantic profiler ranges are enabled only while `TorchProfiler` is active. The
 candidate ranges are `qwen3_tts.preprocess.speaker_mel_h2d`,
@@ -238,6 +296,18 @@ ranges for cache-key/cache D2H, reference-encode publication, prepared
 reference-code normalization, and final codec-code D2H. This lets one clean
 trace separate the selected mechanisms from intentionally retained waits
 without enabling stack collection for the whole server.
+
+The follow-up attribution revision adds only coarse owner ranges around calls
+whose internals produced the remaining warnings:
+`qwen3_tts.preprocess.text_tokenizer`,
+`qwen3_tts.preprocess.reference_tokenizer.encode`,
+`qwen3_tts.preprocess.speaker_encoder.forward`,
+`qwen3_tts.preprocess.prompt.build`,
+`qwen3_tts.sampling.base_pipeline`, and
+`qwen3_tts.vocoder.tokenizer.decode`. Existing narrower ranges remain nested,
+so the analyzer can prefer the most specific Omni-owned boundary. These ranges
+do not authorize a transfer rewrite; they establish owner, frequency, host
+blocking time, and correlated bytes for the next design decision.
 
 ## Proof gates
 
@@ -257,15 +327,23 @@ without enabling stack collection for the whole server.
 
 ## Open evidence before the next production rewrite
 
-Question or missing evidence: one corrected warning pass and one all-thread
-clean trace against commits `86884103` and `167a2573`.
+Question or missing evidence: the clean low-overhead trace contains no Python
+stacks for the 854 scalar D2H and 298 unscoped pageable copies. The warning pass
+identifies unique source locations, but it does not report per-location counts
+or durations. Profiler-only ownership ranges now cover text tokenization,
+reference-tokenizer encoding, speaker-encoder execution, prompt construction,
+SGLang sampling, and vocoder-tokenizer decoding; one trace is required to
+populate them.
 
-Why it matters; owner or authoritative source; how to resolve it: the detector
-must show that the three advanced-assignment warnings disappeared, and the trace
-must contain scheduler/preprocessing CPU parents before its scoped occurrence
-counts are usable. Run only the bounded cookbook windows and retain full logs and
-the stable trace.
+Why it matters; owner or authoritative source; how to resolve it: run one
+bounded clean c16 trace and require the unscoped scalar/H2D/D2H counts to move
+into the new ownership ranges. Use a short stack-enabled trace only for any
+aggregate that remains ambiguous after coarse ranges; do not profile another
+full corpus.
 
-Which design, phase, or proof changes with the answer: passing both gates admits
-one full-corpus A/B pair; failure returns to source attribution. It does not
-change the detector architecture or the separate repetition-penalty future PR.
+Which design, phase, or proof changes with the answer: the attribution decides
+whether the next repair is a same-stream pinned H2D, a device-resident local
+stage handoff with a cross-process fallback, an event-owned delayed D2H, or an
+unavoidable immediate CPU-consumer boundary. No transfer rewrite is authorized
+until that ownership is established. The separate repetition-penalty semantic
+future work remains out of scope.
