@@ -165,16 +165,39 @@ class Qwen3TTSModelRunner(ModelRunner):
         )
         self._mask_prep_rids = None
 
+    @staticmethod
+    def _fill_mask_from_host_indices(
+        mask: torch.Tensor,
+        flat_indices: list[int],
+    ) -> None:
+        """Set host-selected entries without scalar or index H2D synchronization."""
+
+        if not flat_indices:
+            return
+        async_h2d = mask.is_cuda
+        indices_staging = torch.tensor(
+            flat_indices,
+            dtype=torch.long,
+            device="cpu",
+            pin_memory=async_h2d,
+        )
+        indices = indices_staging.to(
+            device=mask.device,
+            non_blocking=async_h2d,
+        )
+        # Python advanced assignment (mask[indices] = True) first wraps True in
+        # a CPU scalar tensor and index_put_ then copies it to CUDA synchronously.
+        # index_fill_'s Scalar overload passes True directly to the device kernel.
+        mask.view(-1).index_fill_(0, indices, True)
+
     def _rebuild_masks(self, requests: list, vocab: int, device: Any) -> None:
         rep_mask, sup_mask, pen_col = self._shape_masks
         batch_size = len(requests)
         rep_mask[:batch_size] = False
         sup_mask[:batch_size] = False
-        rep_rows: list[int] = []
-        rep_toks: list[int] = []
+        rep_flat_indices: list[int] = []
         penalties = [1.0] * batch_size
-        sup_rows: list[int] = []
-        sup_toks: list[int] = []
+        sup_flat_indices: list[int] = []
         async_h2d = torch.device(device).type == "cuda"
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
@@ -184,8 +207,7 @@ class Qwen3TTSModelRunner(ModelRunner):
             output_ids = req.output_ids
             if penalty != 1.0 and output_ids:
                 seen = ModelRunner._rep_penalty_unique_tokens(data, output_ids, vocab)
-                rep_rows.extend([row_idx] * len(seen))
-                rep_toks.extend(seen)
+                rep_flat_indices.extend(row_idx * vocab + tok for tok in seen)
             suppress_tokens = data.suppress_tokens
             if not suppress_tokens:
                 suppress_tokens = getattr(req, "_codec_suppress_tokens", None)
@@ -193,26 +215,9 @@ class Qwen3TTSModelRunner(ModelRunner):
                 for token_id in suppress_tokens:
                     tok = int(token_id)
                     if 0 <= tok < vocab:
-                        sup_rows.append(row_idx)
-                        sup_toks.append(tok)
-        if rep_rows:
-            pairs_staging = torch.tensor(
-                rep_rows + rep_toks,
-                dtype=torch.long,
-                device="cpu",
-                pin_memory=async_h2d,
-            )
-            pairs = pairs_staging.to(device=device, non_blocking=async_h2d)
-            rep_mask[pairs[: len(rep_rows)], pairs[len(rep_rows) :]] = True
-        if sup_rows:
-            pairs_staging = torch.tensor(
-                sup_rows + sup_toks,
-                dtype=torch.long,
-                device="cpu",
-                pin_memory=async_h2d,
-            )
-            pairs = pairs_staging.to(device=device, non_blocking=async_h2d)
-            sup_mask[pairs[: len(sup_rows)], pairs[len(sup_rows) :]] = True
+                        sup_flat_indices.append(row_idx * vocab + tok)
+        self._fill_mask_from_host_indices(rep_mask, rep_flat_indices)
+        self._fill_mask_from_host_indices(sup_mask, sup_flat_indices)
         penalties_staging = torch.tensor(
             penalties,
             dtype=torch.float32,
@@ -223,8 +228,10 @@ class Qwen3TTSModelRunner(ModelRunner):
             penalties_staging,
             non_blocking=async_h2d,
         )
-        self._mask_rep_active = bool(rep_rows) or any(p != 1.0 for p in penalties)
-        self._mask_sup_active = bool(sup_rows)
+        self._mask_rep_active = bool(rep_flat_indices) or any(
+            p != 1.0 for p in penalties
+        )
+        self._mask_sup_active = bool(sup_flat_indices)
 
     def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
         logits = logits_output.next_token_logits
@@ -249,8 +256,12 @@ class Qwen3TTSModelRunner(ModelRunner):
             # not grow by one (retract, restart) can need bits cleared, which the
             # scatter cannot do, so those steps rebuild.
             if self._mask_rep_active:
-                rows = torch.arange(batch_size, device=logits.device)
-                rep_mask[rows, last_sampled[:batch_size].clamp(0, vocab - 1)] = True
+                sampled_tokens = last_sampled[:batch_size].clamp(0, vocab - 1)
+                rep_mask[:batch_size].scatter_(
+                    1,
+                    sampled_tokens.unsqueeze(1),
+                    True,
+                )
                 for sched_req in requests:
                     data = sched_req.data
                     output_ids = sched_req.data.req.output_ids
