@@ -119,7 +119,7 @@ prevents stale line numbers from being reported as current evidence.
 | Embedding cache-key D2H | CUDA prompt embeddings; CPU BLAKE2 hash immediately afterward | Synchronization is required by the current CPU algorithm | Retain until the cache-key algorithm itself is redesigned |
 | Speaker-artifact cache D2H | CUDA embedding/codes; shared CPU cache with concurrent readers | Potentially deferrable, but no event is owned by a cache entry today | Retain; requires an event-gated cache artifact protocol |
 | Reference-code encoder handoff | Private CUDA encode stream; future resolved to another thread | Explicit event/stream wait is the correctness boundary | Retain |
-| Prepared reference-code H2D | Preprocessing thread; later scheduler/vocoder consumption may use another stream | Blocking copy currently establishes cross-thread readiness | Retain until the prepared request carries a CUDA event |
+| Prompt reference-code H2D | CPU cached code; ICL embedding lookup on the same preprocessing stream | Unsafe blocking H2D; the later mandatory cache-key D2H completes this stream before the prepared request crosses threads | Return the device copy after pinned nonblocking staging; keep the prepared-request range to prove its normalization is a no-op |
 | Sampled token D2H and output `.tolist()` | CUDA sampled ids; pinned ping-pong buffer; CPU output processor | Current code already gates the first CPU read on the recorded event | Retain; verify the runtime supplies `host_token_ids` |
 | Final codec-code D2H | Scheduler CUDA tensors; CPU `StagePayload` handed to vocoder | Potential overlap exists, but the payload has no completion event contract | Retain until the stage handoff owns and waits on an event |
 | Vocoder private-stream synchronization | Private decode stream; returned waveform and error verdict | Explicit completion boundary, not a hidden pageable copy | Retain |
@@ -187,8 +187,9 @@ same-stream H2D mechanisms in the ownership table: speaker mel/embedding inputs,
 config-derived token rows, and Qwen3-TTS repetition/suppression mask rebuilds.
 It deliberately leaves every D2H and cross-thread handoff in the table intact.
 None of these candidates is accepted until a current-branch warning pass shows
-the exact source warnings are gone and an `error` localization pass finds no
-replacement wait inside the selected ranges.
+the exact source warnings are gone and a clean trace finds no replacement wait
+inside the selected ranges. Use `error` only to localize a selected source that
+still warns; retained D2H boundaries make a global error-mode pass abort early.
 
 Semantic profiler ranges are enabled only while `TorchProfiler` is active. The
 candidate ranges are `qwen3_tts.preprocess.speaker_mel_h2d`,
@@ -197,9 +198,9 @@ candidate ranges are `qwen3_tts.preprocess.speaker_mel_h2d`,
 `qwen3_tts.sampling_masks.rebuild`, and
 `qwen3_tts.sampling_metadata.h2d`. Retained ownership boundaries also have
 ranges for cache-key/cache D2H, reference-encode publication, prepared
-reference-code H2D, and final codec-code D2H. This lets one clean trace separate
-the selected mechanisms from intentionally retained waits without enabling
-stack collection for the whole server.
+reference-code normalization, and final codec-code D2H. This lets one clean
+trace separate the selected mechanisms from intentionally retained waits
+without enabling stack collection for the whole server.
 
 ## Proof gates
 
