@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-**Status: Ready for instrumentation; conditional for each production rewrite.**
+**Status: H2D candidates implemented; acceptance pending a fresh H100 detector and trace.**
 
 - Repository: `sglang-omni`
 - Worktree: `.worktrees/qwen3-tts-hidden-h2d-sync-v2`
@@ -13,10 +13,6 @@
 - Numerical contract: preserve tensor values, sampling parameters, generated-token
   semantics, stopping behavior, codec frames, and public request defaults.
 - Non-goal: claim a serving speedup from synchronization counts alone.
-
-The current branch history contains an attempted repetition-penalty ownership
-change and a corrective revert. Restack that history before proposing the final
-change; do not use either commit as evidence for a hidden-sync rewrite.
 
 ## Explicit future work: repetition-penalty ownership
 
@@ -83,6 +79,17 @@ CUDA sync debug enabled run_id=... mode=... pid=... rank=... participant=...
 - SGLang PR #28076 uses the same dynamic-host-metadata pattern: construct pinned
   CPU tensors and copy them to the device with `non_blocking=True`.
 
+The corresponding PyTorch implementation was checked directly, not inferred:
+
+- `torch/csrc/utils/tensor_new.cpp` constructs Python sequence data in a CPU
+  tensor and calls `to(..., non_blocking=false)` for the requested device;
+- `aten/src/ATen/native/cuda/Copy.cu` dispatches a blocking CPU/CUDA copy to
+  `memcpy_and_sync`, while its nonblocking branch calls `cudaMemcpyAsync` and
+  records the stream on the caching host allocation; and
+- `aten/src/ATen/core/CachingHostAllocator.h` with
+  `aten/src/ATen/cuda/CachingHostAllocator.cpp` records an event on free and
+  withholds the pinned block from reuse until that event completes.
+
 ### Prior warning evidence
 
 The accepted warning artifact at `e5d2a31f` found SGLang-Omni-owned locations in:
@@ -93,10 +100,29 @@ The accepted warning artifact at `e5d2a31f` found SGLang-Omni-owned locations in
 - sampled-token/output processing; and
 - final code and waveform materialization.
 
-Those line numbers predate current main and are discovery evidence, not authority
-for new edits. Obtain one fresh warning inventory on the restacked current-base
-branch before changing any location other than the already-proven sampling
-metadata transfer.
+The artifact provenance identifies commit `64654a34`. The warning locations were
+mapped back to that exact source revision and then compared with the current
+source. They authorize candidate rewrites only where the same operation and
+ownership are still present. A fresh current-branch warning pass remains the
+qualification gate; it determines which warnings actually disappeared and
+prevents stale line numbers from being reported as current evidence.
+
+### Current ownership table
+
+| Current mechanism | Producer and first consumer | Ownership result | Candidate action |
+|---|---|---|---|
+| Speaker mel pageable H2D | CPU mel frontend; speaker encoder on the same current CUDA stream | Unsafe blocking H2D; source is immutable for the copy | Contiguous pinned one-shot source and nonblocking copy |
+| Cached speaker embedding pageable H2D | CPU cache clone; prompt construction on the same current CUDA stream | Unsafe blocking H2D in the prompt call | Pinned one-shot source and nonblocking copy |
+| Config-derived prompt token sequences | Python integers; embedding lookup on the same current CUDA stream | `torch.tensor(..., device=cuda)` hidden blocking H2D | Device `full` for repeated/scalar data; pinned one-shot source for heterogeneous rows |
+| Repetition/suppression mask rebuild | Python request history; mask scatter and logit shaping on the scheduler stream | Unsafe blocking metadata H2D, but shaping semantics must remain exactly as-is | Pinned one-shot row/token/penalty staging; no ownership change |
+| Semantic/subtalker sampling metadata | Python request metadata; persistent predictor buffers on the scheduler stream | Previously proven unsafe and already qualified mechanically | Keep the existing pinned nonblocking restaging candidate |
+| Embedding cache-key D2H | CUDA prompt embeddings; CPU BLAKE2 hash immediately afterward | Synchronization is required by the current CPU algorithm | Retain until the cache-key algorithm itself is redesigned |
+| Speaker-artifact cache D2H | CUDA embedding/codes; shared CPU cache with concurrent readers | Potentially deferrable, but no event is owned by a cache entry today | Retain; requires an event-gated cache artifact protocol |
+| Reference-code encoder handoff | Private CUDA encode stream; future resolved to another thread | Explicit event/stream wait is the correctness boundary | Retain |
+| Prepared reference-code H2D | Preprocessing thread; later scheduler/vocoder consumption may use another stream | Blocking copy currently establishes cross-thread readiness | Retain until the prepared request carries a CUDA event |
+| Sampled token D2H and output `.tolist()` | CUDA sampled ids; pinned ping-pong buffer; CPU output processor | Current code already gates the first CPU read on the recorded event | Retain; verify the runtime supplies `host_token_ids` |
+| Final codec-code D2H | Scheduler CUDA tensors; CPU `StagePayload` handed to vocoder | Potential overlap exists, but the payload has no completion event contract | Retain until the stage handoff owns and waits on an event |
+| Vocoder private-stream synchronization | Private decode stream; returned waveform and error verdict | Explicit completion boundary, not a hidden pageable copy | Retain |
 
 ## Rewrite classification
 
@@ -143,7 +169,7 @@ Do not delete functional logic merely because its implementation warns.
    overrides. Do not claim performance from a single noisy ordering; report a
    synchronization cleanup as such when throughput and p95 remain within noise.
 
-## Immediate accepted candidate
+## Implemented candidates awaiting the fresh detector pass
 
 `Qwen3TTSTalker.prepare_decode_buffers` stages dynamic semantic/subtalker sampling
 metadata in one-shot pinned CPU tensors, then issues nonblocking copies into
@@ -155,6 +181,25 @@ ordering protects both eager consumers and CUDA-graph replay.
 This candidate changes transfer mechanics only. Its gate is disappearance of the
 associated synchronization warnings/blocking copies with exact metadata values
 and no replacement wait; end-to-end speedup is not assumed.
+
+The next local implementation batch applies the same proof to the remaining
+same-stream H2D mechanisms in the ownership table: speaker mel/embedding inputs,
+config-derived token rows, and Qwen3-TTS repetition/suppression mask rebuilds.
+It deliberately leaves every D2H and cross-thread handoff in the table intact.
+None of these candidates is accepted until a current-branch warning pass shows
+the exact source warnings are gone and an `error` localization pass finds no
+replacement wait inside the selected ranges.
+
+Semantic profiler ranges are enabled only while `TorchProfiler` is active. The
+candidate ranges are `qwen3_tts.preprocess.speaker_mel_h2d`,
+`qwen3_tts.preprocess.speaker_embedding_h2d`,
+`qwen3_tts.prompt.token_ids_h2d`, `qwen3_tts.prompt.ref_code_h2d`,
+`qwen3_tts.sampling_masks.rebuild`, and
+`qwen3_tts.sampling_metadata.h2d`. Retained ownership boundaries also have
+ranges for cache-key/cache D2H, reference-encode publication, prepared
+reference-code H2D, and final codec-code D2H. This lets one clean trace separate
+the selected mechanisms from intentionally retained waits without enabling
+stack collection for the whole server.
 
 ## Proof gates
 

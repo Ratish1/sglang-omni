@@ -42,16 +42,7 @@ class CudaSyncDebug:
                 f"{sorted(CUDA_SYNC_DEBUG_MODES)}, got {mode!r}"
             )
 
-        if mode == "default" or not cuda_capable_process:
-            return False
-        if not torch.cuda.is_available():
-            logger.warning(
-                "CUDA sync debug requested but CUDA is unavailable "
-                "run_id=%s pid=%d participant=%s",
-                run_id,
-                os.getpid(),
-                participant,
-            )
+        if not cuda_capable_process:
             return False
 
         with cls._lock:
@@ -64,6 +55,17 @@ class CudaSyncDebug:
                 return True
             if cls._run_id is not None:
                 cls._reset_unlocked(reason=f"replaced by run {run_id}")
+            if mode == "default":
+                return False
+            if not torch.cuda.is_available():
+                logger.warning(
+                    "CUDA sync debug requested but CUDA is unavailable "
+                    "run_id=%s pid=%d participant=%s",
+                    run_id,
+                    os.getpid(),
+                    participant,
+                )
+                return False
 
             torch.cuda.set_sync_debug_mode(mode)
             cls._run_id = run_id

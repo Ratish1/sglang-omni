@@ -28,6 +28,7 @@ from sglang_omni.models.qwen3_tts.compat import (
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
     sample_from_sorted_logprobs_with_seed_small_k,
 )
+from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.layers import ReplicatedLinear, RMSNorm
 from sglang_omni.vendor.sglang.models import apply_qk_norm
@@ -41,6 +42,56 @@ _PREDICTOR_GRAPH_MAX_FAILURES = 8
 # Note: (Jiaxin Deng) 50 is on the ladder because it is the family checkpoint
 # default, keeping the dominant signature's kernel width exactly as before.
 _PREDICTOR_TOP_K_LADDER = (4, 8, 16, 32, 50, 64, 128, 256, 512, 1024)
+
+
+def _copy_cpu_tensor_to_cuda_consumer(
+    value: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Copy a CPU tensor for an immediate, same-stream CUDA consumer.
+
+    A pageable CPU-to-CUDA ``to`` is implemented as an async copy followed by a
+    stream synchronization.  Pinning the one-shot source and requesting a
+    nonblocking copy preserves the launch queue.  PyTorch records the copy
+    stream on its caching-host-allocator block, so the local source may go out
+    of scope without allowing its storage to be reused before the copy ends.
+
+    This helper is deliberately limited to values consumed immediately on the
+    current stream.  Cross-thread or cross-stream handoffs need an explicit
+    event ownership protocol instead.
+    """
+
+    target = torch.device(device)
+    if value.device.type == "cpu" and target.type == "cuda":
+        staging = value if value.is_contiguous() else value.contiguous()
+        if not staging.is_pinned():
+            staging = staging.pin_memory()
+        return staging.to(device=target, dtype=dtype, non_blocking=True)
+    return value.to(device=target, dtype=dtype)
+
+
+def _device_token_ids(
+    values: Iterable[int],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build one row of token ids without a pageable blocking H2D copy."""
+
+    token_ids = [int(value) for value in values]
+    target = torch.device(device)
+    if target.type != "cuda":
+        return torch.tensor([token_ids], device=target, dtype=dtype)
+    with TorchProfiler.record_function("qwen3_tts.prompt.token_ids_h2d"):
+        staging = torch.tensor(
+            [token_ids],
+            device="cpu",
+            dtype=dtype,
+            pin_memory=True,
+        )
+        return staging.to(device=target, non_blocking=True)
 
 
 def _predictor_graph_env_enabled() -> bool:
@@ -565,15 +616,28 @@ class Qwen3TTSTalker(nn.Module):
             win_size=1024,
             fmin=0,
             fmax=12000,
-        ).transpose(1, 2)
-        return self.speaker_encoder(mels.to(self.device).to(self.dtype))[0]
+        )
+        with TorchProfiler.record_function("qwen3_tts.preprocess.speaker_mel_h2d"):
+            mels = _copy_cpu_tensor_to_cuda_consumer(
+                mels,
+                device=self.device,
+                dtype=self.dtype,
+            ).transpose(1, 2)
+        return self.speaker_encoder(mels)[0]
 
     @torch.inference_mode()
     def generate_speaker_prompt(self, voice_clone_prompt: dict[str, Any]):
-        return [
-            emb.to(self.device).to(self.dtype)
-            for emb in voice_clone_prompt["ref_spk_embedding"]
-        ]
+        with TorchProfiler.record_function(
+            "qwen3_tts.preprocess.speaker_embedding_h2d"
+        ):
+            return [
+                _copy_cpu_tensor_to_cuda_consumer(
+                    emb,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                for emb in voice_clone_prompt["ref_spk_embedding"]
+            ]
 
     def _build_instruct_embed(
         self,
@@ -588,14 +652,12 @@ class Qwen3TTSTalker(nn.Module):
         *,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        ids = torch.tensor(
-            [
-                [
-                    self.root_config.tts_bos_token_id,
-                    self.root_config.tts_eos_token_id,
-                    self.root_config.tts_pad_token_id,
-                ]
-            ],
+        ids = _device_token_ids(
+            (
+                self.root_config.tts_bos_token_id,
+                self.root_config.tts_eos_token_id,
+                self.root_config.tts_pad_token_id,
+            ),
             device=self.device,
             dtype=dtype,
         )
@@ -639,7 +701,7 @@ class Qwen3TTSTalker(nn.Module):
                 self.config.codec_think_eos_id,
             ]
         return self.get_input_embeddings()(
-            torch.tensor([codec_prefill], device=self.device, dtype=dtype)
+            _device_token_ids(codec_prefill, device=self.device, dtype=dtype)
         )
 
     def _finish_text_prompt(
@@ -669,8 +731,9 @@ class Qwen3TTSTalker(nn.Module):
                     text_all + self.get_input_embeddings()(pad_ids),
                     tts_pad_embed
                     + self.get_input_embeddings()(
-                        torch.tensor(
-                            [[self.config.codec_bos_id]],
+                        torch.full(
+                            (1, 1),
+                            int(self.config.codec_bos_id),
                             device=self.device,
                             dtype=input_id.dtype,
                         )
@@ -743,8 +806,8 @@ class Qwen3TTSTalker(nn.Module):
             dtype=input_id.dtype,
         )
         codec_input_1 = self.get_input_embeddings()(
-            torch.tensor(
-                [[self.config.codec_pad_id, self.config.codec_bos_id]],
+            _device_token_ids(
+                (self.config.codec_pad_id, self.config.codec_bos_id),
                 device=self.device,
                 dtype=input_id.dtype,
             )
@@ -767,10 +830,16 @@ class Qwen3TTSTalker(nn.Module):
         if ref_code is not None and voice_clone_prompt["icl_mode"][0]:
             if ref_id is None:
                 raise ValueError("Qwen3-TTS ICL mode requires ref_text tokens")
+            with TorchProfiler.record_function("qwen3_tts.prompt.ref_code_h2d"):
+                ref_code = _copy_cpu_tensor_to_cuda_consumer(
+                    ref_code,
+                    device=self.device,
+                    dtype=ref_code.dtype,
+                )
             icl_embed, trailing_text_hidden = self.generate_icl_prompt(
                 text_id=input_id[:, 3:-5],
                 ref_id=ref_id[:, 3:-2],
-                ref_code=ref_code.to(self.device),
+                ref_code=ref_code,
                 tts_pad_embed=tts_pad_embed,
                 tts_eos_embed=tts_eos_embed,
                 non_streaming_mode=non_streaming_mode,
@@ -827,13 +896,16 @@ class Qwen3TTSTalker(nn.Module):
             voice=speaker_key,
         )
         speaker_embed = self.get_input_embeddings()(
-            torch.tensor(
-                [spk_id_map[speaker_key]], device=self.device, dtype=input_id.dtype
+            torch.full(
+                (1,),
+                int(spk_id_map[speaker_key]),
+                device=self.device,
+                dtype=input_id.dtype,
             )
         ).view(1, 1, -1)
         codec_input_1 = self.get_input_embeddings()(
-            torch.tensor(
-                [[self.config.codec_pad_id, self.config.codec_bos_id]],
+            _device_token_ids(
+                (self.config.codec_pad_id, self.config.codec_bos_id),
                 device=self.device,
                 dtype=input_id.dtype,
             )
@@ -881,8 +953,8 @@ class Qwen3TTSTalker(nn.Module):
             dtype=input_id.dtype,
         )
         codec_input_1 = self.get_input_embeddings()(
-            torch.tensor(
-                [[self.config.codec_pad_id, self.config.codec_bos_id]],
+            _device_token_ids(
+                (self.config.codec_pad_id, self.config.codec_bos_id),
                 device=self.device,
                 dtype=input_id.dtype,
             )
@@ -938,8 +1010,9 @@ class Qwen3TTSTalker(nn.Module):
         codec_embed = torch.cat(
             [
                 self.get_input_embeddings()(
-                    torch.tensor(
-                        [[self.config.codec_bos_id]],
+                    torch.full(
+                        (1, 1),
+                        int(self.config.codec_bos_id),
                         device=self.device,
                         dtype=text_id.dtype,
                     )
@@ -952,8 +1025,9 @@ class Qwen3TTSTalker(nn.Module):
         codec_lens = codec_embed.shape[1]
         if non_streaming_mode:
             icl_input_embed = text_embed + self.get_input_embeddings()(
-                torch.tensor(
-                    [[self.config.codec_pad_id] * text_lens],
+                torch.full(
+                    (1, int(text_lens)),
+                    int(self.config.codec_pad_id),
                     device=self.device,
                     dtype=text_id.dtype,
                 )
@@ -1142,7 +1216,12 @@ class Qwen3TTSTalker(nn.Module):
     ) -> torch.Tensor:
         extend_seq_lens = forward_batch.extend_seq_lens
         if extend_seq_lens is None:
-            return torch.tensor([forward_batch.input_ids.shape[0] - 1], device=device)
+            return torch.full(
+                (1,),
+                int(forward_batch.input_ids.shape[0] - 1),
+                device=device,
+                dtype=torch.long,
+            )
         return torch.cumsum(extend_seq_lens.to(device=device), dim=0) - 1
 
     @torch.no_grad()

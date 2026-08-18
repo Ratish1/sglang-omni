@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.sglang_execution import attn_forward_context
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
+from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.scheduling.types import RequestOutput
 
 
@@ -33,7 +34,8 @@ class Qwen3TTSModelRunner(ModelRunner):
         requests: list,
     ) -> None:
         del forward_batch, schedule_batch
-        self.model.prepare_decode_buffers(requests)
+        with TorchProfiler.record_function("qwen3_tts.sampling_metadata.h2d"):
+            self.model.prepare_decode_buffers(requests)
 
     def custom_prefill_forward(
         self,
@@ -58,7 +60,8 @@ class Qwen3TTSModelRunner(ModelRunner):
     ) -> None:
         del is_lookahead
         del schedule_batch
-        self.model.prepare_decode_buffers(requests)
+        with TorchProfiler.record_function("qwen3_tts.sampling_metadata.h2d"):
+            self.model.prepare_decode_buffers(requests)
         self._write_feedback_buffers(forward_batch, requests)
 
     def post_prefill(
@@ -172,6 +175,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         penalties = [1.0] * batch_size
         sup_rows: list[int] = []
         sup_toks: list[int] = []
+        async_h2d = torch.device(device).type == "cuda"
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
             req = data.req
@@ -192,13 +196,32 @@ class Qwen3TTSModelRunner(ModelRunner):
                         sup_rows.append(row_idx)
                         sup_toks.append(tok)
         if rep_rows:
-            pairs = torch.tensor(rep_rows + rep_toks, dtype=torch.long, device=device)
+            pairs_staging = torch.tensor(
+                rep_rows + rep_toks,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=async_h2d,
+            )
+            pairs = pairs_staging.to(device=device, non_blocking=async_h2d)
             rep_mask[pairs[: len(rep_rows)], pairs[len(rep_rows) :]] = True
         if sup_rows:
-            pairs = torch.tensor(sup_rows + sup_toks, dtype=torch.long, device=device)
+            pairs_staging = torch.tensor(
+                sup_rows + sup_toks,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=async_h2d,
+            )
+            pairs = pairs_staging.to(device=device, non_blocking=async_h2d)
             sup_mask[pairs[: len(sup_rows)], pairs[len(sup_rows) :]] = True
-        pen_col[:batch_size, 0] = torch.tensor(
-            penalties, dtype=torch.float32, device=device
+        penalties_staging = torch.tensor(
+            penalties,
+            dtype=torch.float32,
+            device="cpu",
+            pin_memory=async_h2d,
+        )
+        pen_col[:batch_size, 0].copy_(
+            penalties_staging,
+            non_blocking=async_h2d,
         )
         self._mask_rep_active = bool(rep_rows) or any(p != 1.0 for p in penalties)
         self._mask_sup_active = bool(sup_rows)
@@ -234,7 +257,8 @@ class Qwen3TTSModelRunner(ModelRunner):
                     if output_ids:
                         ModelRunner._rep_penalty_unique_tokens(data, output_ids, vocab)
         else:
-            self._rebuild_masks(requests, vocab, logits.device)
+            with TorchProfiler.record_function("qwen3_tts.sampling_masks.rebuild"):
+                self._rebuild_masks(requests, vocab, logits.device)
         self._mask_prep_rids = fingerprint
         if self._mask_rep_active:
             pen = pen_col[:batch_size]

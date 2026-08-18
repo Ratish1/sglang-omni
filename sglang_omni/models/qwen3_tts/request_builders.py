@@ -21,6 +21,7 @@ from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
 from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
 )
+from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.proto import StagePayload
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
@@ -479,7 +480,8 @@ def build_generation_kwargs(
 
 def build_embedding_cache_key_ids(input_embeds: torch.Tensor) -> list[int]:
     """Build stable radix-cache token ids for a precomputed embedding prefix."""
-    rows = input_embeds.detach().to(dtype=torch.float32, device="cpu")
+    with TorchProfiler.record_function("qwen3_tts.preprocess.cache_key.dtoh"):
+        rows = input_embeds.detach().to(dtype=torch.float32, device="cpu")
     key_ids: list[int] = []
     for row in rows:
         digest = hashlib.blake2b(row.numpy().tobytes(), digest_size=8).digest()
@@ -493,8 +495,9 @@ def _build_qwen3_tts_pad_embed(model: Any) -> torch.Tensor:
         return (
             model.text_projection(
                 model.get_text_embeddings()(
-                    torch.tensor(
-                        [[model.root_config.tts_pad_token_id]],
+                    torch.full(
+                        (1, 1),
+                        int(model.root_config.tts_pad_token_id),
                         device=model.device,
                         dtype=torch.long,
                     )
@@ -552,7 +555,8 @@ def _cacheable_qwen3_tts_voice_prompt(
 
 
 def _cacheable_qwen3_tts_tensor(value: torch.Tensor) -> torch.Tensor:
-    return value.detach().to(device="cpu").clone()
+    with TorchProfiler.record_function("qwen3_tts.preprocess.cache.dtoh"):
+        return value.detach().to(device="cpu").clone()
 
 
 def _qwen3_tts_voice_prompt_from_cache(
@@ -724,7 +728,10 @@ class _Qwen3TTSRefCodeBatcher:
                     else:
                         for (index, _), code in zip(group, encoded, strict=True):
                             outcomes[index] = code
-            self._synchronize_outcomes(outcomes)
+            with TorchProfiler.record_function(
+                "qwen3_tts.preprocess.reference_encode.publish_wait"
+            ):
+                self._synchronize_outcomes(outcomes)
             for index, (_, _, future) in enumerate(batch):
                 outcome = outcomes[index]
                 if isinstance(outcome, Exception):
@@ -1106,7 +1113,10 @@ def _prepare_qwen3_tts_request(
         )
     )
     if ref_code is not None:
-        ref_code = ref_code.detach().to(device=feedback_buffer.device)
+        with TorchProfiler.record_function(
+            "qwen3_tts.preprocess.prepared_ref_code_h2d"
+        ):
+            ref_code = ref_code.detach().to(device=feedback_buffer.device)
 
     return Qwen3TTSPreparedRequest(
         state=state,
@@ -1285,10 +1295,11 @@ def apply_sglang_qwen3_tts_result(
 
     if code_parts:
         device = code_parts[0].device
-        codes = torch.cat(
-            [part.to(device=device, dtype=torch.long) for part in code_parts],
-            dim=0,
-        ).cpu()
+        with TorchProfiler.record_function("qwen3_tts.engine.codes.dtoh"):
+            codes = torch.cat(
+                [part.to(device=device, dtype=torch.long) for part in code_parts],
+                dim=0,
+            ).cpu()
     else:
         codes = torch.empty((0, 0), dtype=torch.long)
 
