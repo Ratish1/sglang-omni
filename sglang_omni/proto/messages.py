@@ -279,6 +279,7 @@ class ProfilerStartMessage:
     trace_path_template: str  # e.g. "/tmp/profiles/{run_id}/{stage}/trace"
     event_dir: str | None = None  # Per-stage JSONL event sink dir for request profiling
     enable_torch: bool = True  # When False, only request-level events are captured
+    cuda_sync_debug_mode: str = "default"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -287,6 +288,7 @@ class ProfilerStartMessage:
             "trace_path_template": self.trace_path_template,
             "event_dir": self.event_dir,
             "enable_torch": self.enable_torch,
+            "cuda_sync_debug_mode": self.cuda_sync_debug_mode,
         }
 
     @classmethod
@@ -296,6 +298,7 @@ class ProfilerStartMessage:
             trace_path_template=d["trace_path_template"],
             event_dir=d.get("event_dir"),
             enable_torch=bool(d.get("enable_torch", True)),
+            cuda_sync_debug_mode=str(d.get("cuda_sync_debug_mode", "default")),
         )
 
 

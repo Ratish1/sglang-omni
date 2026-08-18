@@ -27,6 +27,7 @@ from sglang_omni.comm.router import CommRouter
 from sglang_omni.pipeline.stage.input import DirectInput, InputHandler
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
 from sglang_omni.pipeline.tp_control import TPLeaderFanout, TPWorkMessage
+from sglang_omni.profiler.cuda_sync_debug import CudaSyncDebug
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
 from sglang_omni.profiler.event_recorder import set_active_stage as _set_active_stage
@@ -126,6 +127,7 @@ class Stage:
         self._tp_fanout = tp_fanout
         self._is_terminal = is_terminal
         self._owns_external_io = role in {"single", "leader"}
+        self._cuda_sync_debug_run_id: str | None = None
 
         self._comm = CommEngine(
             CommRouter(
@@ -210,6 +212,12 @@ class Stage:
 
     async def stop(self) -> None:
         self._running = False
+        if self._cuda_sync_debug_run_id is not None:
+            CudaSyncDebug.stop(
+                run_id=self._cuda_sync_debug_run_id,
+                reason=f"stage {self.name} teardown",
+            )
+            self._cuda_sync_debug_run_id = None
         cleanup_error: Exception | None = None
 
         def _record_cleanup_error(component: str, exc: Exception) -> None:
@@ -1619,6 +1627,14 @@ class Stage:
             if prof_dir and not os.path.isabs(template):
                 template = os.path.join(prof_dir, template)
             TorchProfiler.start(template, run_id=run_id)
+        sync_debug_applied = CudaSyncDebug.start(
+            run_id=run_id,
+            mode=msg.cuda_sync_debug_mode,
+            participant=self.name,
+            cuda_capable_process=self.gpu_id is not None,
+        )
+        if sync_debug_applied:
+            self._cuda_sync_debug_run_id = run_id
         if msg.event_dir is not None:
             try:
                 _get_recorder().start(
@@ -1632,6 +1648,14 @@ class Stage:
                 )
 
     def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
+        # Reset before profiler export or stage cleanup can generate unrelated
+        # synchronization warnings.
+        CudaSyncDebug.stop(
+            run_id=msg.run_id,
+            reason=f"profile stop from stage {self.name}",
+        )
+        if msg.run_id is None or msg.run_id == self._cuda_sync_debug_run_id:
+            self._cuda_sync_debug_run_id = None
         # run_id=None is a wildcard (stop whatever's active).
         if TorchProfiler.is_active() and (
             msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sglang_omni.pipeline.control_plane import PushSocket
+from sglang_omni.profiler.cuda_sync_debug import CUDA_SYNC_DEBUG_MODES
 from sglang_omni.proto import ProfilerStartMessage, ProfilerStopMessage
 
 logger = logging.getLogger(__name__)
@@ -50,11 +51,20 @@ class ProfilerControlClient:
         await self.start()
         assert self._socks is not None
         targets = stages or list(self._socks.keys())
+        cuda_sync_debug_mode = str(
+            (config or {}).get("cuda_sync_debug_mode", "default")
+        )
+        if cuda_sync_debug_mode not in CUDA_SYNC_DEBUG_MODES:
+            raise ValueError(
+                "cuda_sync_debug_mode must be one of "
+                f"{sorted(CUDA_SYNC_DEBUG_MODES)}, got {cuda_sync_debug_mode!r}"
+            )
         msg = ProfilerStartMessage(
             run_id=run_id,
             trace_path_template=trace_path_template,
             event_dir=event_dir,
             enable_torch=enable_torch,
+            cuda_sync_debug_mode=cuda_sync_debug_mode,
         )
         for s in targets:
             sock = self._socks.get(s)
@@ -62,10 +72,12 @@ class ProfilerControlClient:
                 continue
             await sock.send(msg)
         logger.info(
-            "Broadcast profiler_start run_id=%s event_dir=%s torch=%s to stages=%s",
+            "Broadcast profiler_start run_id=%s event_dir=%s torch=%s "
+            "cuda_sync_debug_mode=%s to stages=%s",
             run_id,
             event_dir,
             enable_torch,
+            cuda_sync_debug_mode,
             targets,
         )
 
