@@ -2,8 +2,9 @@
 
 ## Plan status and decision
 
-- **Status:** Conditional. Instrumentation and the H100 experiment are ready;
-  production repair slices are selected only from measured critical-path evidence.
+- **Status:** Candidate repair selected. The clean H100 trace selected batched
+  sampling-metadata staging as the first production slice; matched H100 A/B is
+  now the acceptance gate.
 - **Repository boundary:** change only SGLang-Omni. The installed `sglang`,
   `qwen-tts`, Transformers, and PyTorch packages are read-only dependencies and
   primary-source references, not edit targets.
@@ -81,6 +82,35 @@ The branch now corrects those evidence mechanics before any transfer rewrite:
 No production synchronization rewrite is selected at this checkpoint. The clean
 target-thread rerun is the gate that maps compound copies to exact Omni-owned
 operators and ranks their non-overlapping critical-path cost.
+
+### Clean H100 attribution and repair checkpoint — 2026-08-18
+
+The scheduler-owned rerun at `e5d2a31f60134c9026fc74b015868284fa745de0`
+provides the missing selection evidence:
+
+- the warning-only pass and the timing trace were separate, and both ran after
+  graph/compile warmup with content-unique target references;
+- the accepted c16 trace contains scheduler-thread ATen operators and
+  `qwen3_tts.*` semantic ranges, with graph keys unchanged in-window;
+- 6,708 compound blocking copies were observed overall, but that total is not
+  treated as 6,708 removable bugs;
+- `qwen3_tts.sampling_metadata.h2d` contains 1,902 compound blocking H2Ds for
+  only 128,240 bytes, with 114.876 ms of compound host blocking;
+- the owner is the six Python-sequence-to-CUDA constructions in
+  `prepare_decode_buffers`, exactly matching the PyTorch DevLog's pageable
+  construction trap. The CPU does not consume a device result at this boundary,
+  so a host wait is not required for correctness.
+
+Branch B is therefore the first selected repair. The candidate groups the
+integer and floating-point metadata into immutable pinned CPU tensors and
+enqueues direct `copy_(..., non_blocking=True)` operations into the existing
+persistent device buffers. The sources are not reused: PyTorch's CUDA host
+allocator records their allocation contexts against the copy stream and delays
+storage reuse until the transfers finish. This avoids both unsafe host mutation
+and a replacement event/stream wait.
+
+The broad decode range, terminal codes D2H, and unscoped occurrences remain
+unselected. They must not be changed or counted as savings in this repair's A/B.
 
 ### Decision
 
@@ -527,15 +557,16 @@ are material.
 
 Select when `prepare_decode_buffers` H2Ds are on the prefill/decode critical path.
 
-1. Allocate bounded pinned host staging slots for semantic seed, sub-seed,
-   temperature, top-p, top-k, and sampled-row metadata, sized to
-   `max_running_requests`.
-2. Populate a free slot from Python request metadata on CPU.
-3. Enqueue `copy_(pinned_slice, non_blocking=True)` into the existing persistent GPU
-   buffers on the model's current stream.
-4. Record an event after the last copy. Never mutate/reuse a pinned slot until its
-   event completes. Use a bounded ring sized to the scheduler's actual in-flight
-   depth; on saturation, wait for the oldest slot rather than grow locked memory.
+1. Materialize the current invocation's integer, floating-point, and sampled-row
+   metadata in grouped pinned CPU tensors.
+2. Enqueue `copy_(pinned_row, non_blocking=True)` directly into the existing
+   persistent GPU buffers on the model's current stream.
+3. Keep each source immutable after enqueue and release it normally. PyTorch's
+   pinned caching allocator records the nonblocking copy stream and prevents
+   allocation reuse until the DMA completes.
+4. Do not add an explicit event wait or immediately reused persistent host slot to
+   the first repair. If host-allocation overhead is material after sync removal, a
+   bounded event-protected ring is a separate measured candidate.
 5. Preserve per-row mapping, mixed greedy/sampled branches, top-k ladder signature,
    per-request seed derivation, and predictor graph inputs exactly.
 
@@ -782,7 +813,9 @@ Every accepted run directory contains:
 - **Qwen3-TTS ownership choice:** Ready and repository-grounded.
 - **Sync-debug/Torch Profiler workflow:** Ready; implementation and H100 calibration
   are the first slice.
-- **Repair selection:** Conditional on H100 causal attribution.
+- **Repair selection:** Branch B sampling-metadata staging selected; candidate
+  implementation awaits matched H100 warning, trace, correctness, and
+  profiler-free A/B gates.
 - **Qwen3-TTS 0.6B production acceptance:** Conditional on correctness, lifecycle,
   memory, and profiler-free A/B gates.
 - **Other Omni TTS models:** Deferred until the first model supplies a proven,

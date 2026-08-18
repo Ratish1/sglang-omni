@@ -2,8 +2,10 @@
 
 This runbook profiles only SGLang-Omni-owned Qwen3-TTS code. It calibrates the
 installed Torch synchronization detector, captures bounded request and Kineto
-traces, and produces machine-readable attribution. It intentionally does not
-change transfer behavior; the first H100 artifacts select the repair.
+traces, and produces machine-readable attribution. The accepted baseline at
+`e5d2a31f60134c9026fc74b015868284fa745de0` selected the
+`qwen3_tts.sampling_metadata.h2d` repair; section 11 qualifies that candidate
+against the immutable baseline.
 
 Use the same container and Python environment for the probe, server, benchmark,
 and analyzer. Commands below assume Bash and repository-root working directory.
@@ -422,3 +424,96 @@ Interpretation rules:
   as unsafe merely because it waits;
 - select a repair only when the target's count/time and post-sync bubble are
   material on the request critical path.
+
+## 11. Qualify the sampling-metadata candidate
+
+Use the exact baseline commit and the current remote branch head as the two
+artifacts under test:
+
+```bash
+git fetch origin perf/qwen3-tts-hidden-h2d-sync
+export BASELINE_COMMIT=e5d2a31f60134c9026fc74b015868284fa745de0
+export CANDIDATE_COMMIT
+CANDIDATE_COMMIT=$(git rev-parse origin/perf/qwen3-tts-hidden-h2d-sync)
+test "$CANDIDATE_COMMIT" != "$BASELINE_COMMIT"
+printf 'baseline=%s\ncandidate=%s\n' "$BASELINE_COMMIT" "$CANDIDATE_COMMIT"
+```
+
+For every checkout, stop the old server, switch commits, and ensure the running
+package resolves to that checkout. An editable install is the simplest contract:
+
+```bash
+git switch --detach "$CANDIDATE_COMMIT"  # substitute BASELINE_COMMIT for A
+uv pip install --no-deps -e .
+python - <<'PY'
+from pathlib import Path
+import sglang_omni
+
+print(Path(sglang_omni.__file__).resolve())
+PY
+```
+
+The printed package path must be inside this checkout. Start a fresh server and
+repeat sections 4 and 5; never reuse cache or CUDA state across A/B processes.
+
+### 11.1 Candidate warning check
+
+On the candidate, repeat the c1 warning-only pass from section 6. It must complete
+all requests, and the warning stacks must contain no synchronizing operation from
+the sampling-metadata copies in `prepare_decode_buffers`. Other already-known
+warning owners are expected and do not fail this narrow candidate.
+
+An optional one-request `cuda_sync_debug_mode="error"` run is only a strict
+locator. It may stop at another remaining sync and is never timing evidence.
+
+### 11.2 Candidate matched trace
+
+On a second fresh candidate server, repeat the exact c16 trace from section 7
+with the same model, manifests, warmup, cache-miss delta, graph keys, seed,
+`max_new_tokens`, and profiler settings as the accepted baseline. After analysis:
+
+```bash
+jq '[.aggregates[]
+      | select(.semantic_range == "qwen3_tts.sampling_metadata.h2d")
+      | .blocking_copy_count] | add // 0' \
+  "$RUN_DIR/analysis/cuda_sync_aggregates.json"
+```
+
+The result must be `0`. H2D memcpy events may remain; the repair removes their
+host synchronization, not the need to transfer request metadata. Reject the
+candidate if it introduces a replacement stream, event, or device wait, changes
+predictor graph keys, changes the expected +64 reference-cache miss delta, fails
+a request, or changes seeded generated output.
+
+Do not subtract the baseline's 114.876 ms or overlapping idle aggregate from
+latency. Those values prioritize the owner; only end-to-end A/B measures savings.
+
+### 11.3 Profiler-free alternating A/B
+
+Only after sections 11.1 and 11.2 pass, run at least five fresh-server trials per
+commit without Torch Profiler or sync-debug. Use this order to distribute drift:
+
+```text
+A B B A A B B A A B
+```
+
+For every trial:
+
+1. check out A or B and verify the imported package path and commit;
+2. start a fresh server and perform the same disjoint c1/c16 warmup;
+3. run the fixed 64-request target manifest once at concurrency 16;
+4. save the full client directory, server log, start/end timestamps, provenance,
+   graph/cache snapshots, and audio hashes in a trial-specific directory;
+5. stop the server before the next checkout.
+
+Also run a smaller c1 condition to detect a single-request regression. Keep
+non-stream/stream and miss/hit results as separate experiment cells; do not pool
+or compare different semantic workloads.
+
+Accept the candidate only if:
+
+- completions, finish reasons, seeded outputs, graph keys, and cache deltas match;
+- the targeted compound blocking-copy count is zero with no replacement wait;
+- GPU and pinned-host memory remain bounded;
+- throughput and/or latency p95 improve beyond run-to-run variance, while c1 has
+  no material regression.
