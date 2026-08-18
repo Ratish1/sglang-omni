@@ -9,7 +9,12 @@ import subprocess
 import threading
 from contextlib import nullcontext
 
-from torch.profiler import ProfilerActivity, profile, record_function
+from torch.profiler import (
+    ProfilerActivity,
+    _ExperimentalConfig,
+    profile,
+    record_function,
+)
 
 from .base_profiler import ProfilerBase
 
@@ -107,9 +112,14 @@ class TorchProfiler(ProfilerBase):
             # No ``schedule``: record continuously between start/stop.
             # Expensive flags are env-var opt-in (default off keeps the
             # trace tens of MB; all on can hit multi-GB).
+            # Omni starts profiling from its control-plane thread after its
+            # long-lived scheduler and preprocessing threads already exist.
+            # Kineto's CPU operator callbacks are otherwise thread-local, so
+            # collect all threads to retain their ATen and semantic ranges.
             cls._profiler = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 on_trace_ready=trace_handler,
+                experimental_config=_ExperimentalConfig(profile_all_threads=True),
                 record_shapes=os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES")
                 == "1",
                 profile_memory=os.environ.get("SGLANG_TORCH_PROFILER_PROFILE_MEMORY")
