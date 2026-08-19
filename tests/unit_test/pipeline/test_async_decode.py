@@ -580,7 +580,7 @@ def test_runner_overriding_a_prefill_hook_is_ineligible_and_refused(hook):
     r = runner_cls()
     batch = types.SimpleNamespace(reqs=[], is_prefill_only=False)
     assert r.prefill_lookahead_eligible(batch) is False
-    with pytest.raises(RuntimeError, match="prefill_lookahead_eligible"):
+    with pytest.raises(AssertionError, match="prefill_lookahead_eligible"):
         r.execute_launch(_prefill_sched_output(1))
     assert r.prepare_calls == []
 
@@ -1068,6 +1068,28 @@ def test_launched_prefill_and_following_decode_resolve_in_launch_order():
         ("resolve", prefill),
         ("resolve", decode),
     ]
+
+
+def test_failed_prefill_launch_aborts_only_that_batch_and_keeps_the_pending_step():
+    events = []
+    pending_batch = _FakeBatch(2)
+    pending = (pending_batch, "prev_sched", "prev_step")
+    s = _scaffold_async_loop(async_pending=pending)
+    s._model_runner = _eligible_runner()
+    prefill = _FakeBatch(1, mode="extend")
+    boom = RuntimeError("boom")
+
+    def launch(batch):
+        raise boom
+
+    s._run_batch_launch = launch
+    s._handle_batch_failure = lambda batch, exc: events.append(("failed", batch, exc))
+    s._resolve_and_process = lambda pb, ps, pstep: events.append(("resolve", pb))
+    _script_batches(s, [prefill])
+    s._event_loop_async_decode()
+
+    assert events == [("failed", prefill, boom)]
+    assert s._async_pending == pending
 
 
 def test_row_finished_at_prefill_resolve_is_dropped_from_next_decode_resolve():

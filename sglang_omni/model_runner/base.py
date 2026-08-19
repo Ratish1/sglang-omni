@@ -313,11 +313,10 @@ class ModelRunner:
             if built is None:
                 return None
             forward_batch, schedule_batch, is_prefill = built
-            if is_prefill and not self.prefill_lookahead_eligible(schedule_batch):
-                raise RuntimeError(
-                    "async lookahead launch of an extend batch requires "
-                    "prefill_lookahead_eligible; route this batch synchronously"
-                )
+            assert not is_prefill or self.prefill_lookahead_eligible(schedule_batch), (
+                "async lookahead launch of an extend batch requires "
+                "prefill_lookahead_eligible; route this batch synchronously"
+            )
             batch_result = self._prepare_and_forward(
                 forward_batch,
                 schedule_batch,
