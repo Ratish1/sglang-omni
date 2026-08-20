@@ -1,0 +1,1817 @@
+From a9f9a8646dda134b7858d9258d2cad45e7e3e27f Mon Sep 17 00:00:00 2001
+From: ratish <formula733@gmail.com>
+Date: Thu, 20 Aug 2026 01:41:24 +0530
+Subject: [PATCH 2/2] remove prefill coalescing
+
+---
+ docs/cookbook/moss_transcribe_diarize.md      |   8 -
+ docs/cookbook/qwen3_asr.md                    |   5 -
+ docs/cookbook/whisper_asr.md                  |   7 +-
+ sglang_omni/cli/serve.py                      | 113 ------
+ sglang_omni/models/fun_asr/engine_builder.py  |   6 -
+ sglang_omni/models/fun_asr/stages.py          |   4 -
+ .../models/higgs_tts/engine_builder.py        |   6 -
+ sglang_omni/models/higgs_tts/stages.py        |   4 -
+ .../models/minimax_music3/scheduler.py        |   1 -
+ .../models/moss_transcribe_diarize/config.py  |   5 -
+ .../moss_transcribe_diarize/engine_builder.py |  23 --
+ .../models/moss_transcribe_diarize/stages.py  |  14 -
+ .../models/moss_tts_local/engine_builder.py   |   6 -
+ sglang_omni/models/moss_tts_local/stages.py   |   4 -
+ sglang_omni/models/qwen3_asr/config.py        |   5 -
+ .../models/qwen3_asr/engine_builder.py        |  23 --
+ sglang_omni/models/qwen3_asr/stages.py        |  14 -
+ sglang_omni/models/qwen3_omni/bootstrap.py    |   6 -
+ sglang_omni/models/qwen3_omni/stages.py       |   6 -
+ sglang_omni/models/whisper_asr/config.py      |   5 -
+ .../models/whisper_asr/engine_builder.py      |  23 --
+ sglang_omni/models/whisper_asr/stages.py      |  14 -
+ sglang_omni/scheduling/omni_scheduler.py      |  77 +---
+ sglang_omni/scheduling/prefill_coalesce.py    |  57 ---
+ .../minimax_music3/test_scheduler.py          |   2 -
+ .../moss_transcribe_diarize/test_pipeline.py  |  31 --
+ tests/unit_test/pipeline/test_scheduler.py    |  45 ---
+ tests/unit_test/qwen3_asr/test_pipeline.py    |  31 --
+ tests/unit_test/qwen3_omni/test_talker.py     |   3 +
+ .../scheduling/test_cli_prefill_coalesce.py   | 150 --------
+ .../scheduling/test_prefill_coalesce_gate.py  | 351 ------------------
+ .../test_prefill_coalesce_validation.py       |  57 ---
+ tests/unit_test/whisper_asr/test_pipeline.py  |  28 +-
+ 33 files changed, 12 insertions(+), 1122 deletions(-)
+ delete mode 100644 sglang_omni/scheduling/prefill_coalesce.py
+ delete mode 100644 tests/unit_test/scheduling/test_cli_prefill_coalesce.py
+ delete mode 100644 tests/unit_test/scheduling/test_prefill_coalesce_gate.py
+ delete mode 100644 tests/unit_test/scheduling/test_prefill_coalesce_validation.py
+
+diff --git a/docs/cookbook/moss_transcribe_diarize.md b/docs/cookbook/moss_transcribe_diarize.md
+index 4a2b9fee1..408ec77ed 100644
+--- a/docs/cookbook/moss_transcribe_diarize.md
++++ b/docs/cookbook/moss_transcribe_diarize.md
+@@ -114,14 +114,6 @@ sgl-omni serve \
+   --mem-fraction-static 0.80
+ ```
+
+-MOSS-TD briefly holds newly built LM requests to admit larger prefills. The
+-default target is 4 requests with a 12 ms oldest-request deadline. While more
+-request builds are pending, the scheduler waits for either limit; after build
+-work drains, it releases immediately only when decode is idle. During active
+-decode, it continues coalescing until the target or deadline. Override the two
+-limits with `--prefill-coalesce-requests` and `--prefill-coalesce-wait-ms`, or
+-set the request target to `0` to disable coalescing.
+-
+ ### Sending Requests
+
+ Use `response_format=verbose_json` when you need parsed speaker segments. `json` returns the raw transcript text only.
+diff --git a/docs/cookbook/qwen3_asr.md b/docs/cookbook/qwen3_asr.md
+index 419aa7273..15d2afb19 100644
+--- a/docs/cookbook/qwen3_asr.md
++++ b/docs/cookbook/qwen3_asr.md
+@@ -22,11 +22,6 @@ Async decode is enabled by default for all decode batch sizes, allowing the
+ shared one-step-lookahead path to overlap host-side result processing with the
+ next GPU decode forward even for a single request. Use `--decode-mode sync` to
+ disable it, or tune the crossover with `--async-lookahead-min-batch-size`.
+-The request builders also use the shared LM prefill-admission gate: prefill
+-starts when 16 built requests are ready or after the oldest ready request waits
+-40 ms. Once request-build work drains, a ready prefill is released immediately
+-if decode is idle; while decode is active, it continues coalescing until the
+-same request target or deadline.
+
+ ```bash
+ sgl-omni serve \
+diff --git a/docs/cookbook/whisper_asr.md b/docs/cookbook/whisper_asr.md
+index e673ade7f..b46396afa 100644
+--- a/docs/cookbook/whisper_asr.md
++++ b/docs/cookbook/whisper_asr.md
+@@ -36,19 +36,18 @@ runtime_overrides:
+
+ The graph is captured after SGLang's generation graphs. With pre-LM off, raise `max_prefill_tokens` before configuring larger LM-side buckets (12/16). Each request uses the smallest captured bucket that fits its batch. Requests larger than every captured bucket, with a different feature shape, or without a successful capture run eagerly. Startup and first-replay logs identify the captured and executed buckets.
+
+-## Prefill Coalescing
++## Request Building
+
+-Whisper builds requests with eight worker threads by default, matching other pre-LM ASR pipelines. The coalescing gate targets two requests, while the default 6,144-token atomic budget lets the LM scheduler admit up to four 1,504-token Whisper requests together. A partial batch waits for at most 6 ms only while another request build is pending; a single request and a partial batch with no remaining build work are released immediately.
++Whisper builds requests with eight worker threads by default, matching other pre-LM ASR pipelines. The default 6,144-token atomic budget lets the LM scheduler admit up to four 1,504-token Whisper requests together.
+
+ `request_build_max_pending` bounds submitted request-build futures, not the request backlog. When `max_queued_requests` is unset, requests beyond that pending-build limit remain queued for later construction. Setting `max_queued_requests` retains the configured finite-queue rejection behavior.
+
+-Use `prefill_coalesce_requests` and `prefill_coalesce_wait_ms` to tune the gate. Set `prefill_coalesce_requests: 0` to disable only coalescing, or also set `request_build_max_workers: 1` to restore the pre-optimization request-build path:
++Set `request_build_max_workers: 1` to restore the pre-optimization request-build path:
+
+ ```yaml
+ runtime_overrides:
+   asr:
+     request_build_max_workers: 1
+-    prefill_coalesce_requests: 0
+ ```
+
+ ## Async Decode
+diff --git a/sglang_omni/cli/serve.py b/sglang_omni/cli/serve.py
+index 1b94b90b7..89f02d7b5 100644
+--- a/sglang_omni/cli/serve.py
++++ b/sglang_omni/cli/serve.py
+@@ -15,10 +15,6 @@ from sglang_omni.config.manager import ConfigManager
+ from sglang_omni.preprocessing.resource_connector import (
+     resolve_allowed_local_media_path,
+ )
+-from sglang_omni.scheduling.prefill_coalesce import (
+-    validate_prefill_coalesce_requests,
+-    validate_prefill_coalesce_wait_ms,
+-)
+ from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
+ from sglang_omni.utils.gpu_compat import should_disable_custom_all_reduce_for_gpus
+
+@@ -45,23 +41,6 @@ _ASYNC_DECODE_SUPPORTED_MODELS = (
+     "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
+     "Qwen3-ASR, ARK-ASR, Whisper ASR, and the Qwen3-Omni thinker"
+ )
+-_PREFILL_COALESCE_FACTORIES = frozenset(
+-    {
+-        "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor",
+-        "sglang_omni.models.moss_tts_local.stages.create_sglang_tts_engine_executor",
+-        "sglang_omni.models.qwen3_omni.stages."
+-        "create_sglang_thinker_executor_from_config",
+-        "sglang_omni.models.moss_transcribe_diarize.stages."
+-        "create_sglang_moss_transcribe_diarize_executor",
+-        "sglang_omni.models.fun_asr.stages.create_sglang_fun_asr_executor",
+-        "sglang_omni.models.qwen3_asr.stages.create_sglang_qwen3_asr_executor",
+-        "sglang_omni.models.whisper_asr.stages.create_sglang_whisper_asr_executor",
+-    }
+-)
+-_PREFILL_COALESCE_SUPPORTED_MODELS = (
+-    "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
+-    "Qwen3-ASR, Whisper ASR, and the Qwen3-Omni thinker"
+-)
+ _QWEN_PARTIAL_START_TALKER_FACTORY = (
+     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
+ )
+@@ -902,67 +881,6 @@ def apply_decode_mode_cli_overrides(
+     return pipeline_config
+
+
+-def apply_prefill_coalesce_cli_overrides(
+-    pipeline_config: PipelineConfig,
+-    *,
+-    prefill_coalesce_requests: int | None,
+-    prefill_coalesce_wait_ms: float | None,
+-) -> PipelineConfig:
+-    updates: dict[str, object] = {}
+-    try:
+-        if prefill_coalesce_requests is not None:
+-            updates["prefill_coalesce_requests"] = validate_prefill_coalesce_requests(
+-                prefill_coalesce_requests
+-            )
+-        if prefill_coalesce_wait_ms is not None:
+-            updates["prefill_coalesce_wait_ms"] = validate_prefill_coalesce_wait_ms(
+-                prefill_coalesce_wait_ms
+-            )
+-    except ValueError as exc:
+-        raise typer.BadParameter(str(exc)) from exc
+-
+-    if not updates:
+-        return pipeline_config
+-    matching_stages = [
+-        stage
+-        for stage in pipeline_config.stages
+-        if stage.factory in _PREFILL_COALESCE_FACTORIES
+-    ]
+-    if not matching_stages:
+-        raise typer.BadParameter(
+-            "--prefill-coalesce-requests/--prefill-coalesce-wait-ms currently "
+-            f"support only {_PREFILL_COALESCE_SUPPORTED_MODELS}; no stage in "
+-            "this pipeline uses a supported factory"
+-        )
+-
+-    def configured_requests(stage: StageConfig) -> int:
+-        raw_value = (stage.factory_args or {}).get("prefill_coalesce_requests", 0)
+-        runtime_overrides = pipeline_config.runtime_overrides.get(stage.name)
+-        if (
+-            isinstance(runtime_overrides, dict)
+-            and "prefill_coalesce_requests" in runtime_overrides
+-        ):
+-            raw_value = runtime_overrides["prefill_coalesce_requests"]
+-        try:
+-            return validate_prefill_coalesce_requests(raw_value)
+-        except ValueError as exc:
+-            raise typer.BadParameter(str(exc)) from exc
+-
+-    if prefill_coalesce_requests is None and not any(
+-        # The YAML may already enable the gate; only warn when tuning the wait
+-        # would genuinely have no effect on any targeted stage.
+-        configured_requests(stage) >= 2
+-        for stage in matching_stages
+-    ):
+-        logger.warning(
+-            "--prefill-coalesce-wait-ms alone does not enable coalescing; the "
+-            "gate engages only when prefill_coalesce_requests is >= 2 (via "
+-            "--prefill-coalesce-requests or per-stage YAML)"
+-        )
+-    _apply_factory_args_updates(pipeline_config, matching_stages, updates)
+-    return pipeline_config
+-
+-
+ def apply_torch_compile_cli_overrides(
+     pipeline_config: PipelineConfig,
+     *,
+@@ -1363,32 +1281,6 @@ def serve(
+             ),
+         ),
+     ] = None,
+-    prefill_coalesce_requests: Annotated[
+-        int | None,
+-        typer.Option(
+-            "--prefill-coalesce-requests",
+-            "--prefill_coalesce_requests",
+-            help=(
+-                "Hold prefill admission until this many requests are waiting "
+-                "(or the oldest has waited --prefill-coalesce-wait-ms), "
+-                "amortizing the per-step host cost. The gate engages at >= 2; "
+-                "0 disables (default), and 1 is likewise a no-op (logs a "
+-                "warning). "
+-                f"Available for {_PREFILL_COALESCE_SUPPORTED_MODELS}."
+-            ),
+-        ),
+-    ] = None,
+-    prefill_coalesce_wait_ms: Annotated[
+-        float | None,
+-        typer.Option(
+-            "--prefill-coalesce-wait-ms",
+-            "--prefill_coalesce_wait_ms",
+-            help=(
+-                "Upper bound on the extra time-to-first-token a queued request "
+-                "pays for prefill coalescing. Default 60."
+-            ),
+-        ),
+-    ] = None,
+     max_running_requests: Annotated[
+         int | None,
+         typer.Option(
+@@ -1522,11 +1414,6 @@ def serve(
+         decode_mode=decode_mode,
+         async_lookahead_min_batch_size=async_lookahead_min_batch_size,
+     )
+-    merged_config = apply_prefill_coalesce_cli_overrides(
+-        merged_config,
+-        prefill_coalesce_requests=prefill_coalesce_requests,
+-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+-    )
+     generation_server_args_overrides: dict[str, object] = {}
+     if max_running_requests is not None:
+         generation_server_args_overrides["max_running_requests"] = max_running_requests
+diff --git a/sglang_omni/models/fun_asr/engine_builder.py b/sglang_omni/models/fun_asr/engine_builder.py
+index 84783927c..055f0266f 100644
+--- a/sglang_omni/models/fun_asr/engine_builder.py
++++ b/sglang_omni/models/fun_asr/engine_builder.py
+@@ -44,8 +44,6 @@ class FunASREngineBuilder(AsrEngineBuilder):
+         enable_encoder_cuda_graph: bool,
+         enable_async_decode: bool,
+         async_decode_min_batch_size: int,
+-        prefill_coalesce_requests: int,
+-        prefill_coalesce_wait_ms: float,
+         mm_attention_backend: str | None,
+         enable_pre_lm_encoder: bool,
+         pre_lm_cache_max_entries: int,
+@@ -65,8 +63,6 @@ class FunASREngineBuilder(AsrEngineBuilder):
+         self.enable_encoder_cuda_graph = enable_encoder_cuda_graph
+         self.enable_async_decode = enable_async_decode
+         self.async_decode_min_batch_size = async_decode_min_batch_size
+-        self.prefill_coalesce_requests = prefill_coalesce_requests
+-        self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
+         self.mm_attention_backend = mm_attention_backend
+         self.enable_pre_lm_encoder = enable_pre_lm_encoder
+         self.pre_lm_cache_max_entries = pre_lm_cache_max_entries
+@@ -210,8 +206,6 @@ class FunASREngineBuilder(AsrEngineBuilder):
+             ),
+             "enable_async_decode": self.enable_async_decode,
+             "async_decode_min_batch_size": self.async_decode_min_batch_size,
+-            "prefill_coalesce_requests": self.prefill_coalesce_requests,
+-            "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
+             "request_build_max_workers": self.request_build_max_workers,
+             "request_build_max_pending": self.request_build_max_pending,
+         }
+diff --git a/sglang_omni/models/fun_asr/stages.py b/sglang_omni/models/fun_asr/stages.py
+index 3981ecc09..dc20d63ee 100644
+--- a/sglang_omni/models/fun_asr/stages.py
++++ b/sglang_omni/models/fun_asr/stages.py
+@@ -104,8 +104,6 @@ def create_sglang_fun_asr_executor(
+     enable_encoder_cuda_graph: bool = False,
+     enable_async_decode: bool = True,
+     async_decode_min_batch_size: int = 2,
+-    prefill_coalesce_requests: int = 0,
+-    prefill_coalesce_wait_ms: float = 60.0,
+     mm_attention_backend: str | None = None,
+     enable_pre_lm_encoder: bool = True,
+     pre_lm_cache_max_entries: int = 4096,
+@@ -138,8 +136,6 @@ def create_sglang_fun_asr_executor(
+         enable_encoder_cuda_graph=enable_encoder_cuda_graph,
+         enable_async_decode=enable_async_decode,
+         async_decode_min_batch_size=async_decode_min_batch_size,
+-        prefill_coalesce_requests=prefill_coalesce_requests,
+-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+         mm_attention_backend=mm_attention_backend,
+         enable_pre_lm_encoder=enable_pre_lm_encoder,
+         pre_lm_cache_max_entries=pre_lm_cache_max_entries,
+diff --git a/sglang_omni/models/higgs_tts/engine_builder.py b/sglang_omni/models/higgs_tts/engine_builder.py
+index 061bd2576..87641fad4 100644
+--- a/sglang_omni/models/higgs_tts/engine_builder.py
++++ b/sglang_omni/models/higgs_tts/engine_builder.py
+@@ -40,8 +40,6 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
+         stream_stride: int = DEFAULT_HIGGS_STREAM_STRIDE,
+         stream_followup_stride: int = DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
+         initial_chunk_frames: int = DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
+-        prefill_coalesce_requests: int = 0,
+-        prefill_coalesce_wait_ms: float = 60.0,
+         total_gpu_memory_fraction: float | None = None,
+     ) -> None:
+         if total_gpu_memory_fraction is not None and not (
+@@ -59,8 +57,6 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
+         self.stream_stride = stream_stride
+         self.stream_followup_stride = stream_followup_stride
+         self.initial_chunk_frames = initial_chunk_frames
+-        self.prefill_coalesce_requests = prefill_coalesce_requests
+-        self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
+         self.total_gpu_memory_fraction = total_gpu_memory_fraction
+         self.model: Any | None = None
+
+@@ -157,8 +153,6 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
+         return {
+             "enable_async_decode": self.enable_async_decode,
+             "async_decode_min_batch_size": self.async_decode_min_batch_size,
+-            "prefill_coalesce_requests": self.prefill_coalesce_requests,
+-            "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
+         }
+
+     def post_scheduler_setup(self, scheduler: Any, model_runner: Any) -> None:
+diff --git a/sglang_omni/models/higgs_tts/stages.py b/sglang_omni/models/higgs_tts/stages.py
+index f619d2848..23a0f6974 100644
+--- a/sglang_omni/models/higgs_tts/stages.py
++++ b/sglang_omni/models/higgs_tts/stages.py
+@@ -470,8 +470,6 @@ def create_sglang_tts_engine_executor(
+     stream_stride: int = DEFAULT_HIGGS_STREAM_STRIDE,
+     stream_followup_stride: int = DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
+     initial_chunk_frames: int = DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
+-    prefill_coalesce_requests: int = 0,
+-    prefill_coalesce_wait_ms: float = 60.0,
+     total_gpu_memory_fraction: float | None = None,
+ ):
+     """sglang-backed AR engine for Higgs TTS."""
+@@ -486,8 +484,6 @@ def create_sglang_tts_engine_executor(
+         stream_stride=stream_stride,
+         stream_followup_stride=stream_followup_stride,
+         initial_chunk_frames=initial_chunk_frames,
+-        prefill_coalesce_requests=prefill_coalesce_requests,
+-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+         total_gpu_memory_fraction=total_gpu_memory_fraction,
+     ).build(
+         model_path,
+diff --git a/sglang_omni/models/minimax_music3/scheduler.py b/sglang_omni/models/minimax_music3/scheduler.py
+index 20b781ce2..30c869d3b 100644
+--- a/sglang_omni/models/minimax_music3/scheduler.py
++++ b/sglang_omni/models/minimax_music3/scheduler.py
+@@ -48,7 +48,6 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
+         req.time_stats.set_wait_queue_entry_time(
+             cond_req.time_stats.wait_queue_entry_time
+         )
+-        req._coalesce_enqueue_t = cond_req._coalesce_enqueue_t
+         req._omni_terminal_claimed = False
+         req._omni_data = uncond
+         self.waiting_queue.append(req)
+diff --git a/sglang_omni/models/moss_transcribe_diarize/config.py b/sglang_omni/models/moss_transcribe_diarize/config.py
+index 37e6d62c7..ba6de916a 100644
+--- a/sglang_omni/models/moss_transcribe_diarize/config.py
++++ b/sglang_omni/models/moss_transcribe_diarize/config.py
+@@ -48,11 +48,6 @@ class MossTranscribeDiarizePipelineConfig(PipelineConfig):
+                 "torch_compile_max_bs": 4,
+                 "request_build_max_workers": _REQUEST_BUILD_MAX_WORKERS,
+                 "request_build_max_pending": 16,
+-                "prefill_coalesce_requests": 4,
+-                "prefill_coalesce_wait_ms": 12,
+-                "prefill_coalesce_when_idle": True,
+-                "prefill_coalesce_requires_pending_builds": True,
+-                "prefill_coalesce_after_builds_during_decode": True,
+             },
+             gpu=0,
+             terminal=True,
+diff --git a/sglang_omni/models/moss_transcribe_diarize/engine_builder.py b/sglang_omni/models/moss_transcribe_diarize/engine_builder.py
+index e7b698825..3f9a304a6 100644
+--- a/sglang_omni/models/moss_transcribe_diarize/engine_builder.py
++++ b/sglang_omni/models/moss_transcribe_diarize/engine_builder.py
+@@ -38,11 +38,6 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
+         torch_compile_max_bs: int,
+         enable_async_decode: bool,
+         async_decode_min_batch_size: int,
+-        prefill_coalesce_requests: int,
+-        prefill_coalesce_wait_ms: float,
+-        prefill_coalesce_when_idle: bool,
+-        prefill_coalesce_requires_pending_builds: bool,
+-        prefill_coalesce_after_builds_during_decode: bool,
+         encoder_chunk_buckets: list[int],
+         encoder_torch_compile: bool,
+         encoder_max_batch_size: int,
+@@ -60,15 +55,6 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
+         self.torch_compile_max_bs = torch_compile_max_bs
+         self.enable_async_decode = enable_async_decode
+         self.async_decode_min_batch_size = async_decode_min_batch_size
+-        self.prefill_coalesce_requests = prefill_coalesce_requests
+-        self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
+-        self.prefill_coalesce_when_idle = prefill_coalesce_when_idle
+-        self.prefill_coalesce_requires_pending_builds = (
+-            prefill_coalesce_requires_pending_builds
+-        )
+-        self.prefill_coalesce_after_builds_during_decode = (
+-            prefill_coalesce_after_builds_during_decode
+-        )
+         self.encoder_chunk_buckets = encoder_chunk_buckets
+         self.encoder_torch_compile = encoder_torch_compile
+         self.encoder_max_batch_size = encoder_max_batch_size
+@@ -182,15 +168,6 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
+             ),
+             "enable_async_decode": self.enable_async_decode,
+             "async_decode_min_batch_size": self.async_decode_min_batch_size,
+-            "prefill_coalesce_requests": self.prefill_coalesce_requests,
+-            "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
+-            "prefill_coalesce_when_idle": self.prefill_coalesce_when_idle,
+-            "prefill_coalesce_requires_pending_builds": (
+-                self.prefill_coalesce_requires_pending_builds
+-            ),
+-            "prefill_coalesce_after_builds_during_decode": (
+-                self.prefill_coalesce_after_builds_during_decode
+-            ),
+             "request_build_max_workers": self.request_build_max_workers,
+             "request_build_max_pending": self.request_build_max_pending,
+         }
+diff --git a/sglang_omni/models/moss_transcribe_diarize/stages.py b/sglang_omni/models/moss_transcribe_diarize/stages.py
+index 26f125f2e..57e1c9ba5 100644
+--- a/sglang_omni/models/moss_transcribe_diarize/stages.py
++++ b/sglang_omni/models/moss_transcribe_diarize/stages.py
+@@ -85,11 +85,6 @@ def create_sglang_moss_transcribe_diarize_executor(
+     # --decode-mode sync remains the operator opt-out.
+     enable_async_decode: bool = True,
+     async_decode_min_batch_size: int = 1,
+-    prefill_coalesce_requests: int = 4,
+-    prefill_coalesce_wait_ms: float = 12.0,
+-    prefill_coalesce_when_idle: bool = True,
+-    prefill_coalesce_requires_pending_builds: bool = True,
+-    prefill_coalesce_after_builds_during_decode: bool = True,
+     encoder_chunk_buckets: list[int] | None = None,
+     encoder_torch_compile: bool = False,
+     encoder_max_batch_size: int = 2,
+@@ -123,15 +118,6 @@ def create_sglang_moss_transcribe_diarize_executor(
+         encoder_chunk_buckets=buckets,
+         encoder_torch_compile=encoder_torch_compile,
+         encoder_max_batch_size=encoder_max_batch_size,
+-        prefill_coalesce_requests=prefill_coalesce_requests,
+-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+-        prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+-        prefill_coalesce_requires_pending_builds=(
+-            prefill_coalesce_requires_pending_builds
+-        ),
+-        prefill_coalesce_after_builds_during_decode=(
+-            prefill_coalesce_after_builds_during_decode
+-        ),
+         request_build_max_workers=request_build_max_workers,
+         request_build_max_pending=request_build_max_pending,
+         stream_emit_interval_s=stream_emit_interval_s,
+diff --git a/sglang_omni/models/moss_tts_local/engine_builder.py b/sglang_omni/models/moss_tts_local/engine_builder.py
+index 15f4d0cbb..0e6a23581 100644
+--- a/sglang_omni/models/moss_tts_local/engine_builder.py
++++ b/sglang_omni/models/moss_tts_local/engine_builder.py
+@@ -21,16 +21,12 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
+         *,
+         enable_async_decode: bool,
+         async_decode_min_batch_size: int,
+-        prefill_coalesce_requests: int = 0,
+-        prefill_coalesce_wait_ms: float = 60.0,
+         total_gpu_memory_fraction: float | None,
+         codec_mem_reserve: float,
+         process_total_gpu_memory_fraction: float | None = None,
+     ) -> None:
+         self.enable_async_decode = enable_async_decode
+         self.async_decode_min_batch_size = async_decode_min_batch_size
+-        self.prefill_coalesce_requests = prefill_coalesce_requests
+-        self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
+         self.total_gpu_memory_fraction = total_gpu_memory_fraction
+         self.process_total_gpu_memory_fraction = process_total_gpu_memory_fraction
+         self.codec_mem_reserve = codec_mem_reserve
+@@ -156,8 +152,6 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
+         return {
+             "enable_async_decode": self.enable_async_decode,
+             "async_decode_min_batch_size": self.async_decode_min_batch_size,
+-            "prefill_coalesce_requests": self.prefill_coalesce_requests,
+-            "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
+         }
+
+     def post_scheduler_setup(self, scheduler: Any, model_runner: Any) -> None:
+diff --git a/sglang_omni/models/moss_tts_local/stages.py b/sglang_omni/models/moss_tts_local/stages.py
+index cd0fb9363..f96148377 100644
+--- a/sglang_omni/models/moss_tts_local/stages.py
++++ b/sglang_omni/models/moss_tts_local/stages.py
+@@ -608,8 +608,6 @@ def create_sglang_tts_engine_executor(
+     server_args_overrides: dict[str, Any] | None = None,
+     enable_async_decode: bool = False,
+     async_decode_min_batch_size: int = 2,
+-    prefill_coalesce_requests: int = 0,
+-    prefill_coalesce_wait_ms: float = 60.0,
+     total_gpu_memory_fraction: float | None = None,
+     process_total_gpu_memory_fraction: float | None = None,
+     codec_mem_reserve: float = 0.0,
+@@ -621,8 +619,6 @@ def create_sglang_tts_engine_executor(
+     return MossTtsLocalEngineBuilder(
+         enable_async_decode=enable_async_decode,
+         async_decode_min_batch_size=async_decode_min_batch_size,
+-        prefill_coalesce_requests=prefill_coalesce_requests,
+-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+         total_gpu_memory_fraction=total_gpu_memory_fraction,
+         process_total_gpu_memory_fraction=process_total_gpu_memory_fraction,
+         codec_mem_reserve=codec_mem_reserve,
+diff --git a/sglang_omni/models/qwen3_asr/config.py b/sglang_omni/models/qwen3_asr/config.py
+index 996cca76a..ade49ae02 100644
+--- a/sglang_omni/models/qwen3_asr/config.py
++++ b/sglang_omni/models/qwen3_asr/config.py
+@@ -46,11 +46,6 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
+                 "torch_compile_max_bs": 2,
+                 "request_build_max_workers": 8,
+                 "request_build_max_pending": 32,
+-                "prefill_coalesce_requests": 16,
+-                "prefill_coalesce_wait_ms": 40,
+-                "prefill_coalesce_when_idle": True,
+-                "prefill_coalesce_requires_pending_builds": True,
+-                "prefill_coalesce_after_builds_during_decode": True,
+                 "enable_pre_lm_encoder": True,
+                 "pre_lm_cache_max_entries": 4096,
+                 "pre_lm_cache_size_bytes": 2 * 1024**3,
+diff --git a/sglang_omni/models/qwen3_asr/engine_builder.py b/sglang_omni/models/qwen3_asr/engine_builder.py
+index 3fda7425a..7f3c5da77 100644
+--- a/sglang_omni/models/qwen3_asr/engine_builder.py
++++ b/sglang_omni/models/qwen3_asr/engine_builder.py
+@@ -49,11 +49,6 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
+         mm_attention_backend: str | None,
+         request_build_max_workers: int,
+         request_build_max_pending: int | None,
+-        prefill_coalesce_requests: int,
+-        prefill_coalesce_wait_ms: float,
+-        prefill_coalesce_when_idle: bool,
+-        prefill_coalesce_requires_pending_builds: bool,
+-        prefill_coalesce_after_builds_during_decode: bool,
+         enable_pre_lm_encoder: bool = True,
+         pre_lm_cache_max_entries: int = 4096,
+         pre_lm_cache_size_bytes: int = 2 * 1024**3,
+@@ -79,15 +74,6 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
+         self.mm_attention_backend = mm_attention_backend
+         self.request_build_max_workers = request_build_max_workers
+         self.request_build_max_pending = request_build_max_pending
+-        self.prefill_coalesce_requests = prefill_coalesce_requests
+-        self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
+-        self.prefill_coalesce_when_idle = prefill_coalesce_when_idle
+-        self.prefill_coalesce_requires_pending_builds = (
+-            prefill_coalesce_requires_pending_builds
+-        )
+-        self.prefill_coalesce_after_builds_during_decode = (
+-            prefill_coalesce_after_builds_during_decode
+-        )
+         self.enable_pre_lm_encoder = enable_pre_lm_encoder
+         self.pre_lm_cache_max_entries = pre_lm_cache_max_entries
+         self.pre_lm_cache_size_bytes = pre_lm_cache_size_bytes
+@@ -252,13 +238,4 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
+             "async_decode_min_batch_size": self.async_decode_min_batch_size,
+             "request_build_max_workers": self.request_build_max_workers,
+             "request_build_max_pending": self.request_build_max_pending,
+-            "prefill_coalesce_requests": self.prefill_coalesce_requests,
+-            "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
+-            "prefill_coalesce_when_idle": self.prefill_coalesce_when_idle,
+-            "prefill_coalesce_requires_pending_builds": (
+-                self.prefill_coalesce_requires_pending_builds
+-            ),
+-            "prefill_coalesce_after_builds_during_decode": (
+-                self.prefill_coalesce_after_builds_during_decode
+-            ),
+         }
+diff --git a/sglang_omni/models/qwen3_asr/stages.py b/sglang_omni/models/qwen3_asr/stages.py
+index bb09f7e5d..89b10ee1e 100644
+--- a/sglang_omni/models/qwen3_asr/stages.py
++++ b/sglang_omni/models/qwen3_asr/stages.py
+@@ -23,11 +23,6 @@ def create_sglang_qwen3_asr_executor(
+     mm_attention_backend: str | None = None,
+     request_build_max_workers: int = 8,
+     request_build_max_pending: int | None = 32,
+-    prefill_coalesce_requests: int = 16,
+-    prefill_coalesce_wait_ms: float = 40.0,
+-    prefill_coalesce_when_idle: bool = True,
+-    prefill_coalesce_requires_pending_builds: bool = True,
+-    prefill_coalesce_after_builds_during_decode: bool = True,
+     enable_pre_lm_encoder: bool = True,
+     pre_lm_cache_max_entries: int = 4096,
+     pre_lm_cache_size_bytes: int = 2 * 1024**3,
+@@ -49,15 +44,6 @@ def create_sglang_qwen3_asr_executor(
+         mm_attention_backend=mm_attention_backend,
+         request_build_max_workers=request_build_max_workers,
+         request_build_max_pending=request_build_max_pending,
+-        prefill_coalesce_requests=prefill_coalesce_requests,
+-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+-        prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+-        prefill_coalesce_requires_pending_builds=(
+-            prefill_coalesce_requires_pending_builds
+-        ),
+-        prefill_coalesce_after_builds_during_decode=(
+-            prefill_coalesce_after_builds_during_decode
+-        ),
+         enable_pre_lm_encoder=enable_pre_lm_encoder,
+         pre_lm_cache_max_entries=pre_lm_cache_max_entries,
+         pre_lm_cache_size_bytes=pre_lm_cache_size_bytes,
+diff --git a/sglang_omni/models/qwen3_omni/bootstrap.py b/sglang_omni/models/qwen3_omni/bootstrap.py
+index 1c567719c..f1a55ee3e 100644
+--- a/sglang_omni/models/qwen3_omni/bootstrap.py
++++ b/sglang_omni/models/qwen3_omni/bootstrap.py
+@@ -18,9 +18,6 @@ def create_thinker_scheduler(
+     total_gpu_memory_fraction: float | None = None,
+     enable_async_decode: bool = True,
+     async_decode_min_batch_size: int = 2,
+-    prefill_coalesce_requests: int = 0,
+-    prefill_coalesce_wait_ms: float = 60.0,
+-    prefill_coalesce_when_idle: bool = False,
+ ):
+     """Create the Qwen thinker scheduler."""
+     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+@@ -147,9 +144,6 @@ def create_thinker_scheduler(
+         stream_output_builder=stream_output_builder,
+         enable_async_decode=enable_async_decode,
+         async_decode_min_batch_size=async_decode_min_batch_size,
+-        prefill_coalesce_requests=prefill_coalesce_requests,
+-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+-        prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+     )
+
+
+diff --git a/sglang_omni/models/qwen3_omni/stages.py b/sglang_omni/models/qwen3_omni/stages.py
+index 3918316fe..9c591dca8 100644
+--- a/sglang_omni/models/qwen3_omni/stages.py
++++ b/sglang_omni/models/qwen3_omni/stages.py
+@@ -951,9 +951,6 @@ def create_sglang_thinker_executor_from_config(
+     total_gpu_memory_fraction: float | None = None,
+     enable_async_decode: bool = True,
+     async_decode_min_batch_size: int = 2,
+-    prefill_coalesce_requests: int = 0,
+-    prefill_coalesce_wait_ms: float = 60.0,
+-    prefill_coalesce_when_idle: bool = False,
+ ):
+     """Returns OmniScheduler for thinker."""
+     # note (luojiaxuan):
+@@ -1042,9 +1039,6 @@ def create_sglang_thinker_executor_from_config(
+         total_gpu_memory_fraction=effective_total_gpu_memory_fraction,
+         enable_async_decode=enable_async_decode,
+         async_decode_min_batch_size=async_decode_min_batch_size,
+-        prefill_coalesce_requests=prefill_coalesce_requests,
+-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+-        prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+     )
+     post_load_process_mem = get_process_gpu_memory_bytes(gpu_id)
+     logger.info(
+diff --git a/sglang_omni/models/whisper_asr/config.py b/sglang_omni/models/whisper_asr/config.py
+index 2b20afa6b..a61440855 100644
+--- a/sglang_omni/models/whisper_asr/config.py
++++ b/sglang_omni/models/whisper_asr/config.py
+@@ -50,11 +50,6 @@ class WhisperASRPipelineConfig(PipelineConfig):
+                 "enable_async_decode": True,
+                 "async_decode_min_batch_size": 2,
+                 "request_build_max_pending": 16,
+-                "prefill_coalesce_requests": 2,
+-                "prefill_coalesce_wait_ms": 6.0,
+-                "prefill_coalesce_when_idle": True,
+-                "prefill_coalesce_requires_pending_builds": True,
+-                "prefill_coalesce_after_builds_during_decode": False,
+                 "enable_pre_lm_encoder": True,
+                 # Note(Jeffro): Whisper is special: its input is always one 30-second chunk,
+                 # so the encoder output is fixed-size ([1500, d_model], 3.84 MB
+diff --git a/sglang_omni/models/whisper_asr/engine_builder.py b/sglang_omni/models/whisper_asr/engine_builder.py
+index 764676c03..d1845f5fd 100644
+--- a/sglang_omni/models/whisper_asr/engine_builder.py
++++ b/sglang_omni/models/whisper_asr/engine_builder.py
+@@ -75,11 +75,6 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
+         enable_async_decode: bool = True,
+         async_decode_min_batch_size: int = 2,
+         request_build_max_pending: int | None = 16,
+-        prefill_coalesce_requests: int = 2,
+-        prefill_coalesce_wait_ms: float = 6.0,
+-        prefill_coalesce_when_idle: bool = True,
+-        prefill_coalesce_requires_pending_builds: bool = True,
+-        prefill_coalesce_after_builds_during_decode: bool = False,
+         enable_pre_lm_encoder: bool = True,
+         pre_lm_cache_max_entries: int = 1024,
+         pre_lm_cache_size_bytes: int | None = None,
+@@ -106,15 +101,6 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
+         self.async_decode_min_batch_size = async_decode_min_batch_size
+         self.request_build_max_workers = request_build_max_workers
+         self.request_build_max_pending = request_build_max_pending
+-        self.prefill_coalesce_requests = prefill_coalesce_requests
+-        self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
+-        self.prefill_coalesce_when_idle = prefill_coalesce_when_idle
+-        self.prefill_coalesce_requires_pending_builds = (
+-            prefill_coalesce_requires_pending_builds
+-        )
+-        self.prefill_coalesce_after_builds_during_decode = (
+-            prefill_coalesce_after_builds_during_decode
+-        )
+         self.enable_pre_lm_encoder = bool(enable_pre_lm_encoder)
+         self.pre_lm_cache_max_entries = int(pre_lm_cache_max_entries)
+         # None: derive the byte budget from the entry count (see encoder_service).
+@@ -264,15 +250,6 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
+             "async_decode_min_batch_size": self.async_decode_min_batch_size,
+             "request_build_max_workers": self.request_build_max_workers,
+             "request_build_max_pending": self.request_build_max_pending,
+-            "prefill_coalesce_requests": self.prefill_coalesce_requests,
+-            "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
+-            "prefill_coalesce_when_idle": self.prefill_coalesce_when_idle,
+-            "prefill_coalesce_requires_pending_builds": (
+-                self.prefill_coalesce_requires_pending_builds
+-            ),
+-            "prefill_coalesce_after_builds_during_decode": (
+-                self.prefill_coalesce_after_builds_during_decode
+-            ),
+         }
+
+     def extra_scheduler_callbacks(self) -> dict[str, Any]:
+diff --git a/sglang_omni/models/whisper_asr/stages.py b/sglang_omni/models/whisper_asr/stages.py
+index 971887382..aa0cbef14 100644
+--- a/sglang_omni/models/whisper_asr/stages.py
++++ b/sglang_omni/models/whisper_asr/stages.py
+@@ -20,11 +20,6 @@ def create_sglang_whisper_asr_executor(
+     enable_async_decode: bool = True,
+     async_decode_min_batch_size: int = 2,
+     request_build_max_pending: int | None = 16,
+-    prefill_coalesce_requests: int = 2,
+-    prefill_coalesce_wait_ms: float = 6.0,
+-    prefill_coalesce_when_idle: bool = True,
+-    prefill_coalesce_requires_pending_builds: bool = True,
+-    prefill_coalesce_after_builds_during_decode: bool = False,
+     enable_pre_lm_encoder: bool = True,
+     pre_lm_cache_max_entries: int = 1024,
+     pre_lm_cache_size_bytes: int | None = None,
+@@ -44,15 +39,6 @@ def create_sglang_whisper_asr_executor(
+         async_decode_min_batch_size=async_decode_min_batch_size,
+         request_build_max_workers=request_build_max_workers,
+         request_build_max_pending=request_build_max_pending,
+-        prefill_coalesce_requests=prefill_coalesce_requests,
+-        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+-        prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+-        prefill_coalesce_requires_pending_builds=(
+-            prefill_coalesce_requires_pending_builds
+-        ),
+-        prefill_coalesce_after_builds_during_decode=(
+-            prefill_coalesce_after_builds_during_decode
+-        ),
+         enable_pre_lm_encoder=enable_pre_lm_encoder,
+         pre_lm_cache_max_entries=pre_lm_cache_max_entries,
+         pre_lm_cache_size_bytes=pre_lm_cache_size_bytes,
+diff --git a/sglang_omni/scheduling/omni_scheduler.py b/sglang_omni/scheduling/omni_scheduler.py
+index 01277382f..68bc58261 100644
+--- a/sglang_omni/scheduling/omni_scheduler.py
++++ b/sglang_omni/scheduling/omni_scheduler.py
+@@ -28,12 +28,7 @@ import torch
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+ from sglang.srt.managers.io_struct import AbortReq
+-from sglang.srt.managers.schedule_batch import (
+-    FINISH_ABORT,
+-    NextBatchPlan,
+-    ScheduleBatch,
+-    retract_all,
+-)
++from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch, retract_all
+ from sglang.srt.managers.scheduler import Scheduler as _Upstream
+ from sglang.srt.managers.scheduler import validate_input_length
+ from sglang.srt.mem_cache.common import release_kv_cache
+@@ -60,10 +55,6 @@ from sglang_omni.proto.admin import (
+     ADMIN_WEIGHTS_CHECKER,
+ )
+ from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+-from sglang_omni.scheduling.prefill_coalesce import (
+-    validate_prefill_coalesce_requests,
+-    validate_prefill_coalesce_wait_ms,
+-)
+ from sglang_omni.scheduling.types import DeferredAdmission
+ from sglang_omni.vendor.sglang.parallel_state import create_parallel_state
+ from sglang_omni.vendor.sglang.server_args import override_server_args
+@@ -196,11 +187,6 @@ class OmniScheduler:
+         enable_overlap: bool = False,
+         enable_async_decode: bool = False,
+         async_decode_min_batch_size: int = 2,
+-        prefill_coalesce_requests: int = 0,
+-        prefill_coalesce_wait_ms: float = 60.0,
+-        prefill_coalesce_when_idle: bool = False,
+-        prefill_coalesce_requires_pending_builds: bool = False,
+-        prefill_coalesce_after_builds_during_decode: bool = False,
+         request_build_max_workers: int = 1,
+         request_build_max_pending: int | None = None,
+         shutdown_callback: Callable[[], None] | None = None,
+@@ -294,28 +280,6 @@ class OmniScheduler:
+                 "requests"
+             )
+
+-        # Note: (maydomine) Validate here as well as in the CLI because per-stage
+-        # YAML reaches the scheduler through factory_args.
+-        requests = validate_prefill_coalesce_requests(prefill_coalesce_requests)
+-        wait_ms = validate_prefill_coalesce_wait_ms(prefill_coalesce_wait_ms)
+-        if requests > 1 and int(server_args.tp_size) > 1:
+-            logger.warning(
+-                "Prefill admission coalescing is disabled for "
+-                f"tp_size={server_args.tp_size}: the wait deadline reads each "
+-                "rank's local clock, so ranks could disagree on expiry and "
+-                "break lockstep scheduling"
+-            )
+-            requests = 0
+-        self.prefill_coalesce_requests = requests
+-        self.prefill_coalesce_wait_s = wait_ms / 1e3
+-        self.prefill_coalesce_when_idle = bool(prefill_coalesce_when_idle)
+-        self.prefill_coalesce_requires_pending_builds = bool(
+-            prefill_coalesce_requires_pending_builds
+-        )
+-        self.prefill_coalesce_after_builds_during_decode = bool(
+-            prefill_coalesce_after_builds_during_decode
+-        )
+-
+         # Token / memory info (upstream reads from tp_worker.get_worker_info)
+         mr = tp_worker.model_runner
+         self.max_total_num_tokens = mr.max_total_num_tokens
+@@ -1218,7 +1182,6 @@ class OmniScheduler:
+             # queue-time metrics all read it, and retracted requests already
+             # get it on requeue, so fresh requests must match.
+             req.time_stats.set_wait_queue_entry_time()
+-            req._coalesce_enqueue_t = time.perf_counter()
+             req._omni_terminal_claimed = False
+             req._omni_data = req_data
+             self.waiting_queue.append(req)
+@@ -1337,40 +1300,10 @@ class OmniScheduler:
+         return plan.batch_to_run
+
+     def get_new_batch_prefill(self, running_batch):
+-        # Note: (maydomine) batch prefill admissions to amortize the fixed step
+-        # cost; the oldest-request deadline survives partial admission and aborts.
+-        #
+-        # 0.5.16 passes ``running_batch`` in and expects a ``NextBatchPlan`` back,
+-        # so the coalesce hold-off returns an empty plan rather than None.
+-        if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
+-            return _Upstream.get_new_batch_prefill(self, running_batch)
+-        decode_is_idle = running_batch is None or running_batch.is_empty()
+-        if not self.prefill_coalesce_when_idle and decode_is_idle:
+-            return _Upstream.get_new_batch_prefill(self, running_batch)
+-        if self.prefill_coalesce_requires_pending_builds:
+-            with self._request_admission_lock:
+-                build_work_pending = bool(
+-                    self._pending_request_builds
+-                    or self._pending_request_admissions
+-                    or self._backlogged_request_build_payloads
+-                )
+-            if not build_work_pending and not (
+-                self.prefill_coalesce_after_builds_during_decode and not decode_is_idle
+-            ):
+-                return _Upstream.get_new_batch_prefill(self, running_batch)
+-        waiting = self.waiting_queue
+-        if not waiting or len(waiting) >= self.prefill_coalesce_requests:
+-            return _Upstream.get_new_batch_prefill(self, running_batch)
+-        now = time.perf_counter()
+-        oldest = now
+-        for req in waiting:
+-            t = getattr(req, "_coalesce_enqueue_t", None)
+-            if t is None:
+-                t = req._coalesce_enqueue_t = now
+-            oldest = min(oldest, t)
+-        if now - oldest >= self.prefill_coalesce_wait_s:
+-            return _Upstream.get_new_batch_prefill(self, running_batch)
+-        return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
++        # Kept as a real method rather than left to __getattr__: subclasses
++        # (MiniMaxMusic3Scheduler) reach it through super(), which searches
++        # class dicts only and never consults __getattr__.
++        return _Upstream.get_new_batch_prefill(self, running_batch)
+
+     def run_batch(self, batch, pp_proxy_tensors=None):
+         try:
+diff --git a/sglang_omni/scheduling/prefill_coalesce.py b/sglang_omni/scheduling/prefill_coalesce.py
+deleted file mode 100644
+index 5eb0a9194..000000000
+--- a/sglang_omni/scheduling/prefill_coalesce.py
++++ /dev/null
+@@ -1,57 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-"""Shared validation for prefill admission coalescing."""
+-
+-from __future__ import annotations
+-
+-import logging
+-import math
+-
+-logger = logging.getLogger(__name__)
+-
+-
+-def validate_prefill_coalesce_requests(value: object) -> int:
+-    """Validate a concrete admission threshold from CLI, YAML, or Python."""
+-
+-    if value is None:
+-        raise ValueError(
+-            "prefill_coalesce_requests cannot be null; omit it to use the "
+-            "default or use 0 to disable coalescing"
+-        )
+-    # bool is an int subclass, so `true` would otherwise mean 1.
+-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+-        raise ValueError(f"prefill_coalesce_requests must be a number, got {value!r}")
+-    # Reject non-integral and non-finite counts before int() changes their
+-    # meaning: YAML `-0.5` would land as 0 (silently off) and `2.9` as 2, while
+-    # int(inf) raises OverflowError, which callers do not catch.
+-    if isinstance(value, float) and not (math.isfinite(value) and value.is_integer()):
+-        raise ValueError(
+-            f"prefill_coalesce_requests must be a finite integer, got {value!r}"
+-        )
+-    requests = int(value)
+-    if requests < 0:
+-        raise ValueError("prefill_coalesce_requests must be >= 0")
+-    if requests == 1:
+-        logger.warning(
+-            "prefill_coalesce_requests=1 disables coalescing: the admission "
+-            "gate only engages at >= 2 (a batch of one has nothing to "
+-            "coalesce with). Use 0 to disable explicitly, or >= 2 to enable."
+-        )
+-    return requests
+-
+-
+-def validate_prefill_coalesce_wait_ms(value: object) -> float:
+-    """Validate a concrete admission deadline from CLI, YAML, or Python."""
+-
+-    if value is None:
+-        raise ValueError(
+-            "prefill_coalesce_wait_ms cannot be null; omit it to use the default"
+-        )
+-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+-        raise ValueError(f"prefill_coalesce_wait_ms must be a number, got {value!r}")
+-    try:
+-        wait_ms = float(value)
+-    except OverflowError as exc:
+-        raise ValueError("prefill_coalesce_wait_ms must be a finite value > 0") from exc
+-    if not (math.isfinite(wait_ms) and wait_ms > 0):
+-        raise ValueError("prefill_coalesce_wait_ms must be a finite value > 0")
+-    return wait_ms
+diff --git a/tests/unit_test/minimax_music3/test_scheduler.py b/tests/unit_test/minimax_music3/test_scheduler.py
+index 35ad68226..fbd11b021 100644
+--- a/tests/unit_test/minimax_music3/test_scheduler.py
++++ b/tests/unit_test/minimax_music3/test_scheduler.py
+@@ -30,7 +30,6 @@ def test_uncond_row_shares_the_cond_row_enqueue_stamps() -> None:
+     scheduler = object.__new__(MiniMaxMusic3Scheduler)
+     cond = _req("req-1")
+     cond.time_stats.set_wait_queue_entry_time(12.5)
+-    cond._coalesce_enqueue_t = 12.5
+     scheduler.waiting_queue = [cond]
+     uncond = SimpleNamespace(req=_req("req-1::uncond"))
+
+@@ -38,7 +37,6 @@ def test_uncond_row_shares_the_cond_row_enqueue_stamps() -> None:
+
+     assert scheduler.waiting_queue == [cond, uncond.req]
+     assert uncond.req.time_stats.wait_queue_entry_time == 12.5
+-    assert uncond.req._coalesce_enqueue_t == 12.5
+     assert uncond.req._omni_data is uncond
+
+
+diff --git a/tests/unit_test/moss_transcribe_diarize/test_pipeline.py b/tests/unit_test/moss_transcribe_diarize/test_pipeline.py
+index 7013005e4..ae3b78716 100644
+--- a/tests/unit_test/moss_transcribe_diarize/test_pipeline.py
++++ b/tests/unit_test/moss_transcribe_diarize/test_pipeline.py
+@@ -39,11 +39,6 @@ def _make_moss_engine_builder() -> MossTranscribeDiarizeEngineBuilder:
+         torch_compile_max_bs=4,
+         enable_async_decode=True,
+         async_decode_min_batch_size=2,
+-        prefill_coalesce_requests=0,
+-        prefill_coalesce_wait_ms=0.0,
+-        prefill_coalesce_when_idle=True,
+-        prefill_coalesce_requires_pending_builds=True,
+-        prefill_coalesce_after_builds_during_decode=True,
+         encoder_chunk_buckets=[1],
+         encoder_torch_compile=False,
+         encoder_max_batch_size=2,
+@@ -72,17 +67,6 @@ def test_moss_transcribe_diarize_config_uses_single_batched_stage() -> None:
+     assert config.stages[0].factory_args["encoder_max_batch_size"] == 2
+     assert config.stages[0].factory_args["request_build_max_workers"] == 8
+     assert config.stages[0].factory_args["request_build_max_pending"] == 16
+-    assert config.stages[0].factory_args["prefill_coalesce_requests"] == 4
+-    assert config.stages[0].factory_args["prefill_coalesce_wait_ms"] == 12
+-    assert config.stages[0].factory_args["prefill_coalesce_when_idle"] is True
+-    assert (
+-        config.stages[0].factory_args["prefill_coalesce_requires_pending_builds"]
+-        is True
+-    )
+-    assert (
+-        config.stages[0].factory_args["prefill_coalesce_after_builds_during_decode"]
+-        is True
+-    )
+     assert (
+         PIPELINE_CONFIG_REGISTRY.get_config(
+             "MossTranscribeDiarizeForConditionalGeneration"
+@@ -207,16 +191,6 @@ def test_moss_transcribe_diarize_stage_reserves_encoder_headroom() -> None:
+     assert signature.parameters["request_build_max_pending"].default == 16
+     assert signature.parameters["enable_async_decode"].default is True
+     assert signature.parameters["async_decode_min_batch_size"].default == 1
+-    assert signature.parameters["prefill_coalesce_requests"].default == 4
+-    assert signature.parameters["prefill_coalesce_wait_ms"].default == 12.0
+-    assert signature.parameters["prefill_coalesce_when_idle"].default is True
+-    assert (
+-        signature.parameters["prefill_coalesce_requires_pending_builds"].default is True
+-    )
+-    assert (
+-        signature.parameters["prefill_coalesce_after_builds_during_decode"].default
+-        is True
+-    )
+     assert signature.parameters["encoder_max_batch_size"].default == 2
+     assert signature.parameters["mm_embedding_cache_size_bytes"].default == 0
+     assert signature.parameters["encoder_chunk_buckets"].default is None
+@@ -413,11 +387,6 @@ def test_factory_compiles_encoder_and_skips_cuda_graph_when_flag_on(
+     scheduler_kwargs = calls["scheduler_kwargs"][0]
+     assert scheduler_kwargs["enable_async_decode"] is True
+     assert scheduler_kwargs["async_decode_min_batch_size"] == 1
+-    assert scheduler_kwargs["prefill_coalesce_requests"] == 4
+-    assert scheduler_kwargs["prefill_coalesce_wait_ms"] == 12.0
+-    assert scheduler_kwargs["prefill_coalesce_when_idle"] is True
+-    assert scheduler_kwargs["prefill_coalesce_requires_pending_builds"] is True
+-    assert scheduler_kwargs["prefill_coalesce_after_builds_during_decode"] is True
+
+
+ def test_factory_context_length_override_uses_final_server_value(
+diff --git a/tests/unit_test/pipeline/test_scheduler.py b/tests/unit_test/pipeline/test_scheduler.py
+index e66ec8250..4473ee47a 100644
+--- a/tests/unit_test/pipeline/test_scheduler.py
++++ b/tests/unit_test/pipeline/test_scheduler.py
+@@ -495,7 +495,6 @@ def test_enqueue_stamps_the_upstream_wait_queue_entry_time(monkeypatch) -> None:
+
+     assert [queued.rid for queued in scheduler.waiting_queue] == ["req-fresh"]
+     assert req.time_stats.wait_queue_entry_time > 0.0
+-    assert req._coalesce_enqueue_t > 0.0
+
+
+ def test_process_input_requests_rejects_before_build_when_waiting_queue_is_full() -> (
+@@ -2224,50 +2223,6 @@ def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
+         )
+
+
+-def test_omni_scheduler_normalizes_prefill_coalesce_args(monkeypatch) -> None:
+-    """Defaults keep the gate off; the wait is stored in seconds."""
+-    scheduler = _construct_omni_scheduler(monkeypatch)
+-    assert scheduler.prefill_coalesce_requests == 0
+-    assert scheduler.prefill_coalesce_wait_s == pytest.approx(0.06)
+-
+-    enabled = _construct_omni_scheduler(
+-        monkeypatch, prefill_coalesce_requests=32.0, prefill_coalesce_wait_ms=300
+-    )
+-    assert enabled.prefill_coalesce_requests == 32
+-    assert enabled.prefill_coalesce_wait_s == pytest.approx(0.3)
+-
+-
+-@pytest.mark.parametrize(
+-    "coalesce_kwargs",
+-    [
+-        {"prefill_coalesce_requests": None},
+-        {"prefill_coalesce_wait_ms": None},
+-        {"prefill_coalesce_requests": -1},
+-        {"prefill_coalesce_requests": True},
+-        {"prefill_coalesce_requests": -0.5},
+-        {"prefill_coalesce_requests": 2.9},
+-        {"prefill_coalesce_requests": float("inf")},
+-        {"prefill_coalesce_wait_ms": 0.0},
+-        {"prefill_coalesce_wait_ms": float("nan")},
+-        {"prefill_coalesce_wait_ms": float("inf")},
+-    ],
+-)
+-def test_omni_scheduler_rejects_invalid_prefill_coalesce_args(
+-    monkeypatch, coalesce_kwargs
+-) -> None:
+-    """Config-file values never pass through the CLI, so __init__ is the shared
+-    choke point where both entrypoints have to fail fast."""
+-    with pytest.raises(ValueError):
+-        _construct_omni_scheduler(monkeypatch, **coalesce_kwargs)
+-
+-
+-def test_omni_scheduler_null_coalesce_error_points_at_zero(monkeypatch) -> None:
+-    """An explicit YAML null is ambiguous, so it must name the documented off
+-    switch rather than trip an assert that -O would strip."""
+-    with pytest.raises(ValueError, match="use 0 to disable"):
+-        _construct_omni_scheduler(monkeypatch, prefill_coalesce_requests=None)
+-
+-
+ def test_stage_output_cache_eviction_uses_lru_order() -> None:
+     cache = StageOutputCache(max_size=2)
+
+diff --git a/tests/unit_test/qwen3_asr/test_pipeline.py b/tests/unit_test/qwen3_asr/test_pipeline.py
+index 2495bb68a..44a66ed95 100644
+--- a/tests/unit_test/qwen3_asr/test_pipeline.py
++++ b/tests/unit_test/qwen3_asr/test_pipeline.py
+@@ -85,11 +85,6 @@ def _make_engine_builder(
+         mm_attention_backend=mm_attention_backend,
+         request_build_max_workers=8,
+         request_build_max_pending=32,
+-        prefill_coalesce_requests=16,
+-        prefill_coalesce_wait_ms=24.0,
+-        prefill_coalesce_when_idle=True,
+-        prefill_coalesce_requires_pending_builds=True,
+-        prefill_coalesce_after_builds_during_decode=True,
+     )
+     builder.context_length = context_length
+     return builder
+@@ -154,17 +149,6 @@ def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
+     assert config.stages[0].factory_args["torch_compile_max_bs"] == 2
+     assert config.stages[0].factory_args["request_build_max_workers"] == 8
+     assert config.stages[0].factory_args["request_build_max_pending"] == 32
+-    assert config.stages[0].factory_args["prefill_coalesce_requests"] == 16
+-    assert config.stages[0].factory_args["prefill_coalesce_wait_ms"] == 40
+-    assert config.stages[0].factory_args["prefill_coalesce_when_idle"] is True
+-    assert (
+-        config.stages[0].factory_args["prefill_coalesce_requires_pending_builds"]
+-        is True
+-    )
+-    assert (
+-        config.stages[0].factory_args["prefill_coalesce_after_builds_during_decode"]
+-        is True
+-    )
+     assert "request_build_max_backlog" not in config.stages[0].factory_args
+     assert config.stages[0].factory_args["enable_pre_lm_encoder"] is True
+     assert config.stages[0].factory_args["pre_lm_cache_max_entries"] == 4096
+@@ -187,16 +171,6 @@ def test_qwen3_asr_stage_default_allows_64_running_requests() -> None:
+     assert signature.parameters["max_running_requests"].default == 64
+     assert signature.parameters["request_build_max_workers"].default == 8
+     assert signature.parameters["request_build_max_pending"].default == 32
+-    assert signature.parameters["prefill_coalesce_requests"].default == 16
+-    assert signature.parameters["prefill_coalesce_wait_ms"].default == 40.0
+-    assert signature.parameters["prefill_coalesce_when_idle"].default is True
+-    assert (
+-        signature.parameters["prefill_coalesce_requires_pending_builds"].default is True
+-    )
+-    assert (
+-        signature.parameters["prefill_coalesce_after_builds_during_decode"].default
+-        is True
+-    )
+     assert "request_build_max_backlog" not in signature.parameters
+
+
+@@ -418,11 +392,6 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch, caplog) -> None:
+     assert recorded.adapter_kwargs["context_length"] == 2048
+     assert scheduler.enable_async_decode is False
+     assert scheduler.async_decode_min_batch_size == 4
+-    assert scheduler.prefill_coalesce_requests == 16
+-    assert scheduler.prefill_coalesce_wait_ms == 40.0
+-    assert scheduler.prefill_coalesce_when_idle is True
+-    assert scheduler.prefill_coalesce_requires_pending_builds is True
+-    assert scheduler.prefill_coalesce_after_builds_during_decode is True
+     assert scheduler.shutdown_callback is recorded.encoder_service.close
+
+
+diff --git a/tests/unit_test/qwen3_omni/test_talker.py b/tests/unit_test/qwen3_omni/test_talker.py
+index 89821df74..cc1c9f6f6 100644
+--- a/tests/unit_test/qwen3_omni/test_talker.py
++++ b/tests/unit_test/qwen3_omni/test_talker.py
+@@ -11,6 +11,8 @@ from types import SimpleNamespace
+
+ import pytest
+ import torch
++from sglang.srt.disaggregation.utils import DisaggregationMode
++from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
+ from torch import nn
+
+ import sglang_omni.models.qwen3_omni.components.talker as talker_module
+@@ -1166,6 +1168,7 @@ def test_process_input_requests_partial_build_state_machine() -> None:
+                 origin_input_ids_unpadded=origin_input_ids,
+                 sampling_params=SimpleNamespace(max_new_tokens=0),
+                 priority=None,
++                time_stats=SchedulerReqTimeStats(disagg_mode=DisaggregationMode.NULL),
+             ),
+             thinker_chunks_done=captured_done,
+             pending_text_queue=deque(),
+diff --git a/tests/unit_test/scheduling/test_cli_prefill_coalesce.py b/tests/unit_test/scheduling/test_cli_prefill_coalesce.py
+deleted file mode 100644
+index b675053cd..000000000
+--- a/tests/unit_test/scheduling/test_cli_prefill_coalesce.py
++++ /dev/null
+@@ -1,150 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-"""CLI override tests for prefill admission coalescing.
+-
+-``--prefill-coalesce-requests/--prefill-coalesce-wait-ms`` apply to the
+-supported OmniScheduler AR stages; omitting both is a no-op and unsupported
+-pipelines are rejected.
+-"""
+-
+-from __future__ import annotations
+-
+-import pytest
+-import typer
+-
+-from sglang_omni.cli.serve import apply_prefill_coalesce_cli_overrides
+-from sglang_omni.config import PipelineConfig
+-from sglang_omni.config.manager import ConfigManager
+-from sglang_omni.config.runtime import (
+-    resolve_factory_signature_args,
+-    resolve_stage_factory_arg_defaults,
+-    resolve_stage_static_factory_args,
+-)
+-from sglang_omni.models.fun_asr.config import FunASRPipelineConfig
+-from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
+-from sglang_omni.models.moss_transcribe_diarize.config import (
+-    MossTranscribeDiarizePipelineConfig,
+-)
+-from sglang_omni.models.moss_tts_local.config import MossTTSLocalPipelineConfig
+-from sglang_omni.models.qwen3_asr.config import Qwen3ASRPipelineConfig
+-from sglang_omni.models.qwen3_omni.config import Qwen3OmniPipelineConfig
+-from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
+-from sglang_omni.models.whisper_asr.config import WhisperASRPipelineConfig
+-from sglang_omni.utils.imports import import_string
+-
+-
+-def _ar_stage_args(config: PipelineConfig, stage_name: str) -> dict[str, object]:
+-    # Compose the resolver sequence the launch path uses -- mp_runner resolves
+-    # static args plus defaults in the parent, stage_workers filters by factory
+-    # signature in the child -- rather than the resolve_stage_factory_args
+-    # convenience wrapper, which nothing on that path calls.
+-    stage = next(s for s in config.stages if s.name == stage_name)
+-    return resolve_factory_signature_args(
+-        import_string(stage.factory),
+-        resolve_stage_static_factory_args(stage, config),
+-        defaults=resolve_stage_factory_arg_defaults(stage, config),
+-    )
+-
+-
+-@pytest.mark.parametrize(
+-    ("config_cls", "stage_name"),
+-    [
+-        (HiggsTtsPipelineConfig, "tts_engine"),
+-        (MossTTSLocalPipelineConfig, "tts_engine"),
+-        (MossTranscribeDiarizePipelineConfig, "asr"),
+-        (FunASRPipelineConfig, "asr"),
+-        (Qwen3ASRPipelineConfig, "asr"),
+-        (WhisperASRPipelineConfig, "asr"),
+-        (Qwen3OmniPipelineConfig, "thinker"),
+-    ],
+-)
+-def test_cli_sets_coalesce_args(config_cls, stage_name):
+-    config = config_cls(model_path="dummy")
+-    apply_prefill_coalesce_cli_overrides(
+-        config, prefill_coalesce_requests=32, prefill_coalesce_wait_ms=300.0
+-    )
+-    args = _ar_stage_args(config, stage_name)
+-    assert args["prefill_coalesce_requests"] == 32
+-    assert args["prefill_coalesce_wait_ms"] == 300.0
+-
+-
+-def test_omitting_both_flags_is_a_noop():
+-    config = HiggsTtsPipelineConfig(model_path="dummy")
+-    before = _ar_stage_args(config, "tts_engine")
+-    apply_prefill_coalesce_cli_overrides(
+-        config, prefill_coalesce_requests=None, prefill_coalesce_wait_ms=None
+-    )
+-    assert _ar_stage_args(config, "tts_engine") == before
+-
+-
+-def test_per_stage_yaml_runtime_overrides_reach_factory(tmp_path):
+-    config_path = tmp_path / "moss_local.yaml"
+-    config_path.write_text(
+-        """
+-config_cls: MossTTSLocalPipelineConfig
+-model_path: dummy
+-runtime_overrides:
+-  tts_engine:
+-    prefill_coalesce_requests: 16
+-    prefill_coalesce_wait_ms: 200.0
+-"""
+-    )
+-    config = ConfigManager.from_file(str(config_path)).config
+-    assert config is not None
+-
+-    args = _ar_stage_args(config, "tts_engine")
+-    assert args["prefill_coalesce_requests"] == 16
+-    assert args["prefill_coalesce_wait_ms"] == 200.0
+-
+-
+-def test_wait_only_cli_respects_per_stage_runtime_override(caplog):
+-    config = MossTTSLocalPipelineConfig(model_path="dummy")
+-    config.runtime_overrides["tts_engine"] = {"prefill_coalesce_requests": 16}
+-
+-    with caplog.at_level("WARNING", logger="sglang_omni.cli.serve"):
+-        apply_prefill_coalesce_cli_overrides(
+-            config,
+-            prefill_coalesce_requests=None,
+-            prefill_coalesce_wait_ms=200.0,
+-        )
+-
+-    assert not any(
+-        "alone does not enable" in record.message for record in caplog.records
+-    )
+-    args = _ar_stage_args(config, "tts_engine")
+-    assert args["prefill_coalesce_requests"] == 16
+-    assert args["prefill_coalesce_wait_ms"] == 200.0
+-
+-
+-def test_wait_only_cli_validates_existing_per_stage_value():
+-    config = MossTTSLocalPipelineConfig(model_path="dummy")
+-    config.runtime_overrides["tts_engine"] = {"prefill_coalesce_requests": "bad"}
+-
+-    with pytest.raises(typer.BadParameter, match="must be a number"):
+-        apply_prefill_coalesce_cli_overrides(
+-            config,
+-            prefill_coalesce_requests=None,
+-            prefill_coalesce_wait_ms=200.0,
+-        )
+-
+-
+-def test_rejects_unsupported_pipeline():
+-    config = Qwen3TTSPipelineConfig(model_path="dummy")
+-    with pytest.raises(typer.BadParameter):
+-        apply_prefill_coalesce_cli_overrides(
+-            config, prefill_coalesce_requests=32, prefill_coalesce_wait_ms=None
+-        )
+-
+-
+-def test_rejects_invalid_values():
+-    config = HiggsTtsPipelineConfig(model_path="dummy")
+-    with pytest.raises(typer.BadParameter):
+-        apply_prefill_coalesce_cli_overrides(
+-            config, prefill_coalesce_requests=-1, prefill_coalesce_wait_ms=None
+-        )
+-    for bad_wait in (0.0, float("nan"), float("inf")):
+-        with pytest.raises(typer.BadParameter):
+-            apply_prefill_coalesce_cli_overrides(
+-                config,
+-                prefill_coalesce_requests=None,
+-                prefill_coalesce_wait_ms=bad_wait,
+-            )
+diff --git a/tests/unit_test/scheduling/test_prefill_coalesce_gate.py b/tests/unit_test/scheduling/test_prefill_coalesce_gate.py
+deleted file mode 100644
+index e2bb8ccf9..000000000
+--- a/tests/unit_test/scheduling/test_prefill_coalesce_gate.py
++++ /dev/null
+@@ -1,351 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-"""Behavior tests for the prefill admission-coalescing gate.
+-
+-The gate holds prefill until ``prefill_coalesce_requests`` are waiting or the
+-oldest queued request has waited ``prefill_coalesce_wait_ms``. The deadline is
+-keyed on each request's enqueue time (``_coalesce_enqueue_t``), so partial
+-upstream admission or an aborted request never restarts the window for the
+-requests left behind. Chunked prefill in flight and an empty queue pass
+-straight through. Tested against a stub scheduler with the upstream call
+-patched to a sentinel.
+-"""
+-
+-from __future__ import annotations
+-
+-import threading
+-from types import SimpleNamespace
+-from unittest import mock
+-
+-import pytest
+-
+-pytest.importorskip("sglang")
+-
+-from sglang.srt.managers.schedule_batch import NextBatchPlan  # noqa: E402
+-
+-from sglang_omni.scheduling import omni_scheduler  # noqa: E402
+-from sglang_omni.scheduling.omni_scheduler import OmniScheduler  # noqa: E402
+-
+-_UPSTREAM_BATCH = object()
+-
+-
+-def _req(enqueue_t: float | None):
+-    if enqueue_t is None:
+-        return SimpleNamespace()
+-    return SimpleNamespace(_coalesce_enqueue_t=enqueue_t)
+-
+-
+-class _StubScheduler:
+-    """The attribute surface get_new_batch_prefill touches."""
+-
+-    def __init__(
+-        self,
+-        *,
+-        coalesce_requests: int,
+-        wait_ms: float = 60.0,
+-        coalesce_when_idle: bool = False,
+-        requires_pending_builds: bool = False,
+-        coalesce_after_builds_during_decode: bool = False,
+-    ) -> None:
+-        self.prefill_coalesce_requests = coalesce_requests
+-        self.prefill_coalesce_wait_s = wait_ms / 1e3
+-        self.prefill_coalesce_when_idle = coalesce_when_idle
+-        self.prefill_coalesce_requires_pending_builds = requires_pending_builds
+-        self.prefill_coalesce_after_builds_during_decode = (
+-            coalesce_after_builds_during_decode
+-        )
+-        self.chunked_req = None
+-        self.waiting_queue: list = []
+-        self.running_batch = SimpleNamespace(is_empty=lambda: False)
+-        self._request_admission_lock = threading.RLock()
+-        self._pending_request_builds: dict = {}
+-        self._pending_request_admissions: dict = {}
+-        self._backlogged_request_build_payloads: list = []
+-
+-    def get_new_batch_prefill(self):
+-        # sglang 0.5.16 takes running_batch in and hands back a NextBatchPlan;
+-        # unwrap it so the assertions below stay about the gate decision.
+-        plan = OmniScheduler.get_new_batch_prefill(self, self.running_batch)
+-        return plan.batch_to_run
+-
+-
+-@pytest.fixture()
+-def upstream():
+-    with mock.patch.object(
+-        omni_scheduler._Upstream,
+-        "get_new_batch_prefill",
+-        return_value=NextBatchPlan(batch_to_run=_UPSTREAM_BATCH, running_batch=None),
+-    ) as patched:
+-        yield patched
+-
+-
+-@pytest.fixture()
+-def clock():
+-    with mock.patch.object(omni_scheduler.time, "perf_counter") as patched:
+-        patched.return_value = 100.0
+-        yield patched
+-
+-
+-def test_disabled_gate_passes_through(upstream):
+-    sched = _StubScheduler(coalesce_requests=0)
+-    sched.waiting_queue = [_req(0.0)]
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_chunked_prefill_bypasses_gate(upstream):
+-    sched = _StubScheduler(coalesce_requests=8)
+-    sched.waiting_queue = [_req(0.0)]
+-    sched.chunked_req = object()
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_empty_queue_passes_through(upstream):
+-    sched = _StubScheduler(coalesce_requests=8)
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_full_batch_passes_through_immediately(upstream):
+-    sched = _StubScheduler(coalesce_requests=4)
+-    sched.waiting_queue = [_req(100.0)] * 4
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_small_queue_is_held_until_oldest_expires(upstream, clock):
+-    sched = _StubScheduler(coalesce_requests=8, wait_ms=60.0)
+-    sched.waiting_queue = [_req(100.0), _req(100.01)]
+-
+-    clock.return_value = 100.03  # oldest has waited 30ms of the 60ms window
+-    assert sched.get_new_batch_prefill() is None
+-
+-    clock.return_value = 100.07  # oldest past the deadline
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-    upstream.assert_called_once()
+-
+-
+-def test_reaching_target_releases_before_deadline(upstream, clock):
+-    sched = _StubScheduler(coalesce_requests=3, wait_ms=60.0)
+-    sched.waiting_queue = [_req(100.0)]
+-    assert sched.get_new_batch_prefill() is None
+-
+-    sched.waiting_queue = [_req(100.0)] * 3  # target reached, clock unchanged
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_partial_admission_leftovers_keep_their_deadline(upstream, clock):
+-    # Note: (maydomine) leftovers of a partially admitted wave keep their old
+-    # stamps and must not re-wait a fresh window.
+-    sched = _StubScheduler(coalesce_requests=8, wait_ms=60.0)
+-    clock.return_value = 100.1
+-    sched.waiting_queue = [_req(100.0), _req(100.02)]  # both past the deadline
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_abort_does_not_hand_newcomers_an_expired_deadline(upstream, clock):
+-    # Note: (maydomine) a fresh arrival after an abort waits its own window
+-    # rather than inheriting the nearly expired one.
+-    sched = _StubScheduler(coalesce_requests=8, wait_ms=60.0)
+-    clock.return_value = 100.1
+-    sched.waiting_queue = [_req(100.09)]  # newcomer, 10ms old
+-    assert sched.get_new_batch_prefill() is None
+-
+-
+-def test_idle_loop_bypasses_gate(upstream):
+-    # Note: (maydomine) no decode in flight: holding amortizes nothing, only
+-    # costs TTFB.
+-    sched = _StubScheduler(coalesce_requests=8)
+-    sched.waiting_queue = [_req(0.0)]
+-    sched.running_batch = None
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-    sched.running_batch = SimpleNamespace(is_empty=lambda: True)
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_idle_loop_can_coalesce_when_explicitly_enabled(upstream, clock):
+-    sched = _StubScheduler(
+-        coalesce_requests=8,
+-        wait_ms=10.0,
+-        coalesce_when_idle=True,
+-    )
+-    sched.running_batch = None
+-    sched.waiting_queue = [_req(100.0)]
+-
+-    clock.return_value = 100.005
+-    assert sched.get_new_batch_prefill() is None
+-
+-    clock.return_value = 100.011
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-@pytest.mark.parametrize("source", ["pending", "backlog"])
+-def test_pending_build_work_holds_small_prefill(upstream, clock, source):
+-    sched = _StubScheduler(
+-        coalesce_requests=8,
+-        wait_ms=6.0,
+-        coalesce_when_idle=True,
+-        requires_pending_builds=True,
+-    )
+-    sched.running_batch = None
+-    sched.waiting_queue = [_req(100.0)]
+-    if source == "pending":
+-        sched._pending_request_builds["building"] = object()
+-    else:
+-        sched._backlogged_request_build_payloads.append(object())
+-
+-    clock.return_value = 100.005
+-    assert sched.get_new_batch_prefill() is None
+-
+-
+-def test_pending_build_gate_releases_when_build_work_drains(upstream, clock):
+-    sched = _StubScheduler(
+-        coalesce_requests=8,
+-        wait_ms=6.0,
+-        coalesce_when_idle=True,
+-        requires_pending_builds=True,
+-    )
+-    sched.running_batch = None
+-    sched.waiting_queue = [_req(100.0)]
+-    sched._pending_request_builds["building"] = object()
+-
+-    clock.return_value = 100.001
+-    assert sched.get_new_batch_prefill() is None
+-
+-    sched._pending_request_builds.clear()
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_pending_build_gate_releases_at_target(upstream, clock):
+-    sched = _StubScheduler(
+-        coalesce_requests=8,
+-        wait_ms=6.0,
+-        coalesce_when_idle=True,
+-        requires_pending_builds=True,
+-    )
+-    sched.running_batch = None
+-    sched.waiting_queue = [_req(100.0)] * 8
+-    sched._pending_request_builds["building"] = object()
+-
+-    clock.return_value = 100.001
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_pending_build_gate_releases_at_deadline(upstream, clock):
+-    sched = _StubScheduler(
+-        coalesce_requests=8,
+-        wait_ms=6.0,
+-        coalesce_when_idle=True,
+-        requires_pending_builds=True,
+-    )
+-    sched.running_batch = None
+-    sched.waiting_queue = [_req(100.0)]
+-    sched._pending_request_builds["building"] = object()
+-
+-    clock.return_value = 100.006
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_pending_build_gate_does_not_wait_without_build_work(upstream, clock):
+-    sched = _StubScheduler(
+-        coalesce_requests=8,
+-        wait_ms=6.0,
+-        coalesce_when_idle=True,
+-        requires_pending_builds=True,
+-    )
+-    sched.running_batch = None
+-    sched.waiting_queue = [_req(100.0)]
+-
+-    clock.return_value = 100.001
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_decode_can_coalesce_after_build_work_drains(upstream, clock):
+-    sched = _StubScheduler(
+-        coalesce_requests=8,
+-        wait_ms=6.0,
+-        coalesce_when_idle=True,
+-        requires_pending_builds=True,
+-        coalesce_after_builds_during_decode=True,
+-    )
+-    sched.waiting_queue = [_req(100.0)]
+-
+-    clock.return_value = 100.001
+-    assert sched.get_new_batch_prefill() is None
+-
+-
+-def test_idle_decode_still_releases_after_build_work_drains(upstream, clock):
+-    sched = _StubScheduler(
+-        coalesce_requests=8,
+-        wait_ms=6.0,
+-        coalesce_when_idle=True,
+-        requires_pending_builds=True,
+-        coalesce_after_builds_during_decode=True,
+-    )
+-    sched.running_batch = None
+-    sched.waiting_queue = [_req(100.0)]
+-
+-    clock.return_value = 100.001
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_real_partial_admission_cycle_releases_leftovers_immediately(clock):
+-    # Note: (Jiaxin Deng) real admit cycle: upstream pops only the head of an
+-    # expired wave; the leftover keeps its stamp and releases on the next pass.
+-    def _admit_head(self, running_batch):
+-        self.waiting_queue.pop(0)
+-        return NextBatchPlan(batch_to_run=_UPSTREAM_BATCH, running_batch=running_batch)
+-
+-    sched = _StubScheduler(coalesce_requests=8, wait_ms=60.0)
+-    clock.return_value = 100.07
+-    leftover = _req(100.005)
+-    sched.waiting_queue = [_req(100.0), leftover]
+-    with mock.patch.object(
+-        omni_scheduler._Upstream,
+-        "get_new_batch_prefill",
+-        autospec=True,
+-        side_effect=_admit_head,
+-    ) as patched:
+-        assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-        assert sched.waiting_queue == [leftover]
+-        assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-        assert patched.call_count == 2
+-        assert sched.waiting_queue == []
+-
+-
+-def test_newcomer_after_queue_drain_waits_its_own_window(upstream, clock):
+-    # Note: (Jiaxin Deng) once the arming request leaves the queue (abort's
+-    # queue filtering), a stamp-on-miss newcomer ages from its own arrival.
+-    sched = _StubScheduler(coalesce_requests=8, wait_ms=60.0)
+-    clock.return_value = 100.0
+-    armer = _req(None)
+-    sched.waiting_queue = [armer]
+-    assert sched.get_new_batch_prefill() is None
+-    assert armer._coalesce_enqueue_t == 100.0
+-
+-    clock.return_value = 100.059  # abort just before the armer's deadline
+-    sched.waiting_queue.remove(armer)
+-    newcomer = _req(None)
+-    sched.waiting_queue.append(newcomer)
+-    assert sched.get_new_batch_prefill() is None
+-    assert newcomer._coalesce_enqueue_t == 100.059
+-
+-    clock.return_value = 100.07  # past the armer's window, inside the newcomer's
+-    assert sched.get_new_batch_prefill() is None
+-
+-    clock.return_value = 100.12  # newcomer's own deadline expires
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+-
+-
+-def test_unstamped_request_is_stamped_and_eventually_released(upstream, clock):
+-    # Note: (maydomine) stamp-on-miss: held at first observation, released
+-    # within the wait deadline (never a K-only unbounded hold).
+-    sched = _StubScheduler(coalesce_requests=8, wait_ms=60.0)
+-    clock.return_value = 200.0
+-    req = _req(None)
+-    sched.waiting_queue = [req]
+-    assert sched.get_new_batch_prefill() is None
+-    assert req._coalesce_enqueue_t == 200.0
+-
+-    clock.return_value = 200.03  # inside the window
+-    assert sched.get_new_batch_prefill() is None
+-
+-    clock.return_value = 200.07  # past the deadline
+-    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+diff --git a/tests/unit_test/scheduling/test_prefill_coalesce_validation.py b/tests/unit_test/scheduling/test_prefill_coalesce_validation.py
+deleted file mode 100644
+index fec8261c3..000000000
+--- a/tests/unit_test/scheduling/test_prefill_coalesce_validation.py
++++ /dev/null
+@@ -1,57 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-
+-import pytest
+-
+-from sglang_omni.scheduling.prefill_coalesce import (
+-    validate_prefill_coalesce_requests,
+-    validate_prefill_coalesce_wait_ms,
+-)
+-
+-
+-def test_prefill_coalesce_validators_normalize_values():
+-    assert validate_prefill_coalesce_requests(32) == 32
+-    assert validate_prefill_coalesce_requests(32.0) == 32
+-    assert validate_prefill_coalesce_wait_ms(300) == 300.0
+-
+-
+-@pytest.mark.parametrize(
+-    "requests",
+-    [
+-        None,
+-        -1,
+-        True,
+-        False,
+-        -0.5,
+-        2.9,
+-        # int(inf) raises OverflowError, which is not a ValueError, so callers
+-        # wrapping this in typer.BadParameter would leak a traceback instead
+-        float("inf"),
+-        float("-inf"),
+-        "32",
+-    ],
+-)
+-def test_prefill_coalesce_requests_rejects_invalid_values(requests):
+-    with pytest.raises(ValueError):
+-        validate_prefill_coalesce_requests(requests)
+-
+-
+-@pytest.mark.parametrize(
+-    "wait_ms",
+-    [None, 0.0, float("nan"), float("inf"), True, "300"],
+-)
+-def test_prefill_coalesce_wait_rejects_invalid_values(wait_ms):
+-    with pytest.raises(ValueError):
+-        validate_prefill_coalesce_wait_ms(wait_ms)
+-
+-
+-def test_prefill_coalesce_requests_warns_on_one(caplog):
+-    # 1 passes validation but the gate only engages at >= 2, so it must warn
+-    # the user that coalescing stays disabled; 0 stays silent (explicit off).
+-    with caplog.at_level("WARNING", logger="sglang_omni.scheduling.prefill_coalesce"):
+-        assert validate_prefill_coalesce_requests(1) == 1
+-    assert any("disables coalescing" in r.message for r in caplog.records)
+-
+-    caplog.clear()
+-    with caplog.at_level("WARNING", logger="sglang_omni.scheduling.prefill_coalesce"):
+-        assert validate_prefill_coalesce_requests(0) == 0
+-    assert not caplog.records
+diff --git a/tests/unit_test/whisper_asr/test_pipeline.py b/tests/unit_test/whisper_asr/test_pipeline.py
+index 11ca27841..5b4b57feb 100644
+--- a/tests/unit_test/whisper_asr/test_pipeline.py
++++ b/tests/unit_test/whisper_asr/test_pipeline.py
+@@ -47,16 +47,6 @@ def test_whisper_stage_defaults() -> None:
+     assert signature.parameters["enable_async_decode"].default is True
+     assert signature.parameters["async_decode_min_batch_size"].default == 2
+     assert signature.parameters["request_build_max_pending"].default == 16
+-    assert signature.parameters["prefill_coalesce_requests"].default == 2
+-    assert signature.parameters["prefill_coalesce_wait_ms"].default == 6.0
+-    assert signature.parameters["prefill_coalesce_when_idle"].default is True
+-    assert (
+-        signature.parameters["prefill_coalesce_requires_pending_builds"].default is True
+-    )
+-    assert (
+-        signature.parameters["prefill_coalesce_after_builds_during_decode"].default
+-        is False
+-    )
+     assert signature.parameters["enable_pre_lm_encoder"].default is True
+     assert signature.parameters["pre_lm_max_batch_size"].default == 8
+
+@@ -163,7 +153,7 @@ def test_whisper_disables_chunked_prefill_for_atomic_encoder_prefix() -> None:
+         builder.adjust_overrides({"chunked_prefill_size": 4096})
+
+
+-def test_whisper_prefill_coalescing_defaults_are_forwarded() -> None:
++def test_whisper_scheduler_kwargs_are_forwarded() -> None:
+     from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
+
+     builder = WhisperASREngineBuilder(
+@@ -177,11 +167,6 @@ def test_whisper_prefill_coalescing_defaults_are_forwarded() -> None:
+         "async_decode_min_batch_size": 2,
+         "request_build_max_workers": 8,
+         "request_build_max_pending": 16,
+-        "prefill_coalesce_requests": 2,
+-        "prefill_coalesce_wait_ms": 6.0,
+-        "prefill_coalesce_when_idle": True,
+-        "prefill_coalesce_requires_pending_builds": True,
+-        "prefill_coalesce_after_builds_during_decode": False,
+     }
+
+
+@@ -219,17 +204,6 @@ def test_whisper_asr_config_uses_single_batched_stage() -> None:
+     assert config.stages[0].factory_args["enable_async_decode"] is True
+     assert config.stages[0].factory_args["async_decode_min_batch_size"] == 2
+     assert config.stages[0].factory_args["request_build_max_pending"] == 16
+-    assert config.stages[0].factory_args["prefill_coalesce_requests"] == 2
+-    assert config.stages[0].factory_args["prefill_coalesce_wait_ms"] == 6.0
+-    assert config.stages[0].factory_args["prefill_coalesce_when_idle"] is True
+-    assert (
+-        config.stages[0].factory_args["prefill_coalesce_requires_pending_builds"]
+-        is True
+-    )
+-    assert (
+-        config.stages[0].factory_args["prefill_coalesce_after_builds_during_decode"]
+-        is False
+-    )
+     assert config.stages[0].factory_args["enable_pre_lm_encoder"] is True
+     assert config.stages[0].factory_args["pre_lm_cache_max_entries"] == 1024
+     # None: the byte budget is derived from the entry count.
+--
+2.52.0
