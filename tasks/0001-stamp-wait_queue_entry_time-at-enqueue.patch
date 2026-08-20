@@ -1,0 +1,201 @@
+From d2f69d1d5c3fcf9a4b6163b0e134fd256adb554a Mon Sep 17 00:00:00 2001
+From: ratish <formula733@gmail.com>
+Date: Thu, 20 Aug 2026 01:31:25 +0530
+Subject: [PATCH 1/2] stamp wait_queue_entry_time at enqueue
+
+---
+ .../models/minimax_music3/scheduler.py        |  6 +++
+ sglang_omni/scheduling/omni_scheduler.py      |  5 ++
+ .../minimax_music3/test_scheduler.py          | 54 +++++++++++++++++++
+ tests/unit_test/pipeline/test_scheduler.py    | 51 +++++++++++++-----
+ 4 files changed, 103 insertions(+), 13 deletions(-)
+ create mode 100644 tests/unit_test/minimax_music3/test_scheduler.py
+
+diff --git a/sglang_omni/models/minimax_music3/scheduler.py b/sglang_omni/models/minimax_music3/scheduler.py
+index bbd8a682b..20b781ce2 100644
+--- a/sglang_omni/models/minimax_music3/scheduler.py
++++ b/sglang_omni/models/minimax_music3/scheduler.py
+@@ -42,6 +42,12 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
+             return
+         req = uncond.req
+         self._normalize_req_token_arrays(req)
++        # The pair must age identically for the waiting timeout and priority
++        # ordering, so the twin copies the cond row's stamps instead of taking
++        # its own.
++        req.time_stats.set_wait_queue_entry_time(
++            cond_req.time_stats.wait_queue_entry_time
++        )
+         req._coalesce_enqueue_t = cond_req._coalesce_enqueue_t
+         req._omni_terminal_claimed = False
+         req._omni_data = uncond
+diff --git a/sglang_omni/scheduling/omni_scheduler.py b/sglang_omni/scheduling/omni_scheduler.py
+index 87aca238f..01277382f 100644
+--- a/sglang_omni/scheduling/omni_scheduler.py
++++ b/sglang_omni/scheduling/omni_scheduler.py
+@@ -1213,6 +1213,11 @@ class OmniScheduler:
+                 stage=None,
+                 event_name="scheduler_queue_enter",
+             )
++            # Upstream stamps this in _add_request_to_queue; omni owns enqueue,
++            # so stamp it here. The waiting timeout, priority ordering, and
++            # queue-time metrics all read it, and retracted requests already
++            # get it on requeue, so fresh requests must match.
++            req.time_stats.set_wait_queue_entry_time()
+             req._coalesce_enqueue_t = time.perf_counter()
+             req._omni_terminal_claimed = False
+             req._omni_data = req_data
+diff --git a/tests/unit_test/minimax_music3/test_scheduler.py b/tests/unit_test/minimax_music3/test_scheduler.py
+new file mode 100644
+index 000000000..35ad68226
+--- /dev/null
++++ b/tests/unit_test/minimax_music3/test_scheduler.py
+@@ -0,0 +1,54 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from __future__ import annotations
++
++from array import array
++from types import SimpleNamespace
++
++import pytest
++
++pytest.importorskip("sglang")
++
++from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
++from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats  # noqa: E402
++
++from sglang_omni.models.minimax_music3.scheduler import (  # noqa: E402
++    MiniMaxMusic3Scheduler,
++)
++
++
++def _req(rid: str) -> SimpleNamespace:
++    return SimpleNamespace(
++        rid=rid,
++        origin_input_ids=array("q", [1, 2]),
++        origin_input_ids_unpadded=array("q", [1, 2]),
++        time_stats=SchedulerReqTimeStats(disagg_mode=DisaggregationMode.NULL),
++    )
++
++
++def test_uncond_row_shares_the_cond_row_enqueue_stamps() -> None:
++    scheduler = object.__new__(MiniMaxMusic3Scheduler)
++    cond = _req("req-1")
++    cond.time_stats.set_wait_queue_entry_time(12.5)
++    cond._coalesce_enqueue_t = 12.5
++    scheduler.waiting_queue = [cond]
++    uncond = SimpleNamespace(req=_req("req-1::uncond"))
++
++    scheduler._enqueue_cfg_uncond(SimpleNamespace(req=cond), uncond)
++
++    assert scheduler.waiting_queue == [cond, uncond.req]
++    assert uncond.req.time_stats.wait_queue_entry_time == 12.5
++    assert uncond.req._coalesce_enqueue_t == 12.5
++    assert uncond.req._omni_data is uncond
++
++
++def test_uncond_row_is_dropped_when_the_cond_row_was_not_admitted() -> None:
++    scheduler = object.__new__(MiniMaxMusic3Scheduler)
++    cond = _req("req-1")
++    scheduler.waiting_queue = []
++    uncond = SimpleNamespace(req=_req("req-1::uncond"))
++
++    scheduler._enqueue_cfg_uncond(SimpleNamespace(req=cond), uncond)
++
++    assert scheduler.waiting_queue == []
++    assert uncond.req.time_stats.wait_queue_entry_time == 0.0
+diff --git a/tests/unit_test/pipeline/test_scheduler.py b/tests/unit_test/pipeline/test_scheduler.py
+index b861346c0..e66ec8250 100644
+--- a/tests/unit_test/pipeline/test_scheduler.py
++++ b/tests/unit_test/pipeline/test_scheduler.py
+@@ -441,22 +441,27 @@ def _enqueue_limit_scheduler(monkeypatch):
+     return scheduler, events, aborts
+
+
++def _fresh_time_stats():
++    from sglang.srt.disaggregation.utils import DisaggregationMode
++    from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
++
++    return SchedulerReqTimeStats(disagg_mode=DisaggregationMode.NULL)
++
++
++def _built_req(rid: str) -> SimpleNamespace:
++    return SimpleNamespace(
++        rid=rid,
++        priority=None,
++        origin_input_ids=array("q", [1]),
++        origin_input_ids_unpadded=array("q", [1]),
++        time_stats=_fresh_time_stats(),
++    )
++
++
+ def test_enqueue_built_request_honors_max_queued_requests(monkeypatch) -> None:
+     scheduler, events, aborts = _enqueue_limit_scheduler(monkeypatch)
+
+-    def _req(rid: str):
+-        return SimpleNamespace(
+-            rid=rid,
+-            priority=None,
+-            origin_input_ids=array("q", [1]),
+-            origin_input_ids_unpadded=array("q", [1]),
+-            time_stats=SimpleNamespace(
+-                wait_queue_entry_time=0.0,
+-                trace_ctx=SimpleNamespace(abort=lambda *, abort_info: None),
+-            ),
+-        )
+-
+-    first, second = _req("req-ok"), _req("req-reject")
++    first, second = _built_req("req-ok"), _built_req("req-reject")
+     for req in (first, second):
+         OmniScheduler._enqueue_built_request(
+             scheduler,
+@@ -476,6 +481,23 @@ def test_enqueue_built_request_honors_max_queued_requests(monkeypatch) -> None:
+     assert aborts == ["req-reject"]
+
+
++def test_enqueue_stamps_the_upstream_wait_queue_entry_time(monkeypatch) -> None:
++    scheduler, _events, _aborts = _enqueue_limit_scheduler(monkeypatch)
++    scheduler.max_queued_requests = 4
++    req = _built_req("req-fresh")
++
++    OmniScheduler._enqueue_built_request(
++        scheduler,
++        SimpleNamespace(request_id=req.rid),
++        False,
++        SimpleNamespace(req=req, enforce_request_limits=False),
++    )
++
++    assert [queued.rid for queued in scheduler.waiting_queue] == ["req-fresh"]
++    assert req.time_stats.wait_queue_entry_time > 0.0
++    assert req._coalesce_enqueue_t > 0.0
++
++
+ def test_process_input_requests_rejects_before_build_when_waiting_queue_is_full() -> (
+     None
+ ):
+@@ -1815,6 +1837,7 @@ def test_omni_scheduler_distinguishes_queue_enter_from_prefill_start(
+         sampling_params=SimpleNamespace(max_new_tokens=1, min_new_tokens=0),
+         output_ids=[],
+         priority=None,
++        time_stats=_fresh_time_stats(),
+     )
+     scheduler._request_builder = lambda payload: SimpleNamespace(
+         req=req,
+@@ -2436,6 +2459,7 @@ def test_omni_scheduler_prepares_custom_request_token_budget() -> None:
+         sampling_params=sampling_params,
+         output_ids=[],
+         priority=None,
++        time_stats=_fresh_time_stats(),
+     )
+     req_data = SimpleNamespace(req=req, max_new_tokens=10, enforce_request_limits=True)
+     scheduler._request_builder = lambda payload: req_data
+@@ -2592,6 +2616,7 @@ def test_omni_scheduler_leaves_request_budget_unchanged_without_opt_in() -> None
+         sampling_params=sampling_params,
+         output_ids=[],
+         priority=None,
++        time_stats=_fresh_time_stats(),
+     )
+     req_data = SimpleNamespace(
+         req=req,
+--
+2.52.0
