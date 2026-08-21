@@ -3,8 +3,8 @@
 ## Status and scope
 
 **Status: the six selected H2D mechanisms passed the bounded H100 mechanical
-gates at `aebd777e`. Profiler-only ownership ranges for the remaining runtime
-synchronizations are implemented and await one bounded attribution trace. No
+gates at `aebd777e`; the remaining-owner attribution trace passed at
+`35b913ec`. The next isolated candidate is the text-tokenizer pageable H2D. No
 serving-speedup claim has been established.**
 
 - Repository: `sglang-omni`
@@ -325,25 +325,94 @@ blocking time, and correlated bytes for the next design decision.
 - Memory: pinned-host working set remains bounded by allocator size classes and
   observed batch metadata sizes; do not infer this from GPU memory.
 
-## Open evidence before the next production rewrite
+## Remaining-sync attribution result at `35b913ec`
 
-Question or missing evidence: the clean low-overhead trace contains no Python
-stacks for the 854 scalar D2H and 298 unscoped pageable copies. The warning pass
-identifies unique source locations, but it does not report per-location counts
-or durations. Profiler-only ownership ranges now cover text tokenization,
-reference-tokenizer encoding, speaker-encoder execution, prompt construction,
-SGLang sampling, and vocoder-tokenizer decoding; one trace is required to
-populate them.
+The returned `q3tts-35b913ec-remaining-sync-c16-artifacts.tar.gz` contains one
+stable all-thread trace of 64 successful requests. The archive was checked
+before extraction: its 19 members contain no absolute path, parent traversal,
+link, or device entry. It does not contain a provenance directory, request
+manifest, or `SHA256SUMS`, so the commit, model, dataset, and environment are
+recoverable from the logs but are not independently attested by the bundle.
 
-Why it matters; owner or authoritative source; how to resolve it: run one
-bounded clean c16 trace and require the unscoped scalar/H2D/D2H counts to move
-into the new ownership ranges. Use a short stack-enabled trace only for any
-aggregate that remains ambiguous after coarse ranges; do not profile another
-full corpus.
+The trace exercises all six mechanically qualified ranges and every new coarse
+owner range. The selected ranges remain wait-free. The formerly unscoped
+groups are now separated as follows:
 
-Which design, phase, or proof changes with the answer: the attribution decides
-whether the next repair is a same-stream pinned H2D, a device-resident local
-stage handoff with a cross-process fallback, an event-owned delayed D2H, or an
-unavoidable immediate CPU-consumer boundary. No transfer rewrite is authorized
-until that ownership is established. The separate repetition-penalty semantic
-future work remains out of scope.
+| Owner | Mechanism | Count | Sync wait sum | Compound host-block sum | Correlated bytes |
+|---|---|---:|---:|---:|---:|
+| Reference tokenizer encode | scalar D2H | 881 | 10.217 ms | 33.879 ms | 6,859 |
+| Reference tokenizer encode | pageable H2D | 54 | 1.003 ms | 22.431 ms | 41,204,384 |
+| Text tokenizer | pageable H2D | 128 | 24.644 ms | 29.634 ms | 19,848 |
+| Vocoder tokenizer decode | scalar D2H | 136 | 372.819 ms | 376.962 ms | 584 |
+| Vocoder tokenizer decode | pageable H2D | 36 | 25.586 ms | 27.892 ms | 943,744 |
+| Vocoder tokenizer decode | waveform D2H | 64 | 0.161 ms | 55.809 ms | 52,631,040 |
+| Shared SGLang forward-batch setup | pageable H2D | 33 | 22.139 ms | 22.304 ms | 256 |
+
+The trace-wide synchronization wait sum is 2,292.442 ms, while the union of
+host wait intervals is 2,015.382 ms. Compound blocking-copy intervals sum to
+869.536 ms and cover a 718.058 ms union. Correlated post-sync bubbles sum to
+3,606.232 ms and cover a 2,664.605 ms union. The unions remove overlap between
+occurrences on the common process timeline, but still are not recoverable
+serving time: mandatory consumers, other host work, and request concurrency
+remain part of the causal path.
+
+The request event stream reconstructs all 64 timelines. Mean/p95 stage time is
+154.066/378.345 ms for preprocessing, 939.234/1,341.122 ms for the TTS engine,
+and 157.805/227.604 ms for the vocoder. TTS prefill itself averages 33.871 ms;
+the post-prefill-to-completion interval averages 872.238 ms. Same-process stage
+hops average 0.031 ms into the engine and 0.027 ms into the vocoder. Client
+throughput is 11.467 requests/s with 1.259 s mean and 1.635 s p95 latency. These
+request intervals overlap and contextualize the trace; they are not additive
+component costs.
+
+The 327 unscoped event waits are the one-step async resolve boundary: one wait
+per sampled engine step. The remaining 33 unscoped H2D copies have the exact
+ATen/runtime sequence `ones -> tensor/to -> copy_ -> cudaMemcpyAsync ->
+cudaStreamSynchronize`, with payloads of 4--20 bytes. Source comparison against
+the pinned SGLang 0.5.16 tag identifies
+`sglang/srt/sampling/penaltylib/repetition_penalty.py::_prepare`: the CUDA
+penalty matrix is followed by `torch.tensor(penalties, device=cuda)`. This is
+also the separately documented double repetition-penalty ownership path.
+Changing it in Omni would mix a shared SGLang transfer fix with a sampling
+semantic correction, so it remains future work.
+
+The next model-owned rewrite is the text-tokenizer H2D. Official
+`qwen-tts==0.1.1` calls its CPU processor and then executes
+`input_ids.to(self.device)`. The SeedTTS trace contains exactly two calls per
+request (target and reference text). The source tensor is immutable and its
+first consumers are on the same preprocessing CUDA stream, so pinned CPU
+staging plus `non_blocking=True` is the mechanically correct rewrite. It
+preserves the official processor, dtype, shape normalization, token values, and
+device. Both the 0.6B and 1.7B Base configurations use the same
+`Qwen3TTSPipelineConfig`, request builder, and official tokenizer wrapper, so
+the code path is shared; the current evidence was captured with the 0.6B Base
+checkpoint only.
+
+The reference-tokenizer and vocoder groups are not folded into this change.
+The reference path combines large waveform/mask H2D with third-party scalar
+control flow; indiscriminate pinning can grow the host pool without removing
+the scalar boundaries. The vocoder's scalar waits and final waveform D2H sit at
+an immediate CPU/Numpy consumer boundary; its input-code H2D is independently
+fixable, but must be qualified as a separate mechanism after the text path.
+
+## Reproducible analysis and next proof
+
+The reviewed streaming analyzer now lives in this branch at
+`benchmarks/profiling/analyze_cuda_sync_trace.py`. The Qwen-specific companion
+`benchmarks/profiling/summarize_qwen3_tts_sync.py` checks CPU range execution,
+correlation-backed H2D exercise, synchronization absence, raw sums, interval
+unions, queue horizon, and post-sync launch gap. It intentionally marks the
+`35b913ec` artifact as failing only the text-tokenizer range.
+
+Torch-profiler windows also emit a rank-local `*.host_memory.json` with
+before/after `torch.cuda.host_memory_stats()` and deltas. These are the pinned
+host allocator counters required to bound this class of rewrite; GPU peak
+memory is not a proxy for pinned host memory.
+
+One fresh bounded c16 trace is sufficient for the text-tokenizer candidate. It
+must show a positive H2D count and zero synchronization inside
+`qwen3_tts.preprocess.text_tokenizer`, keep all prior selected ranges clean, and
+produce a host-memory artifact. A warning-only c1 pass is optional only if the
+trace gate fails; another full 1,088-sample A/B is not justified for this
+mechanical follow-up. The separate repetition-penalty semantic PR remains out
+of scope.

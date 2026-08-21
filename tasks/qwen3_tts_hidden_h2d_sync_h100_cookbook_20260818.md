@@ -12,9 +12,9 @@ defaults. `--max-samples`, `--sample-offset`, and `--warmup 0` are present only
 to make the diagnostic windows bounded, disjoint, and free of an unreported
 benchmark warm-up request.
 
-Sections 1-5 passed at `aebd777e`. Do not repeat their warning gate or the full
-corpus merely to qualify profiler annotations. Section 7 is the single bounded
-follow-up for attributing the remaining synchronization owners.
+Sections 1-5 passed at `aebd777e`, and Section 7 attributed the remaining
+owners at `35b913ec`. Do not repeat either pass or the full corpus. Section 8 is
+the single bounded follow-up for the isolated text-tokenizer H2D candidate.
 
 ## 1. Checkout and provenance
 
@@ -185,15 +185,10 @@ mtime_2=$(stat -c %Y "$TRACE_FILE")
 test "$size_1:$mtime_1" = "$size_2:$mtime_2"
 ```
 
-Reuse the already reviewed streaming analyzer from the earlier profiling branch
-without adding its 1,000-line diagnostic implementation to this production
-candidate:
+Run the reviewed streaming analyzer carried by this branch:
 
 ```bash
-git fetch origin perf/qwen3-tts-hidden-h2d-sync
-export TRACE_ANALYZER="$QUAL_DIR/analyze_cuda_sync_trace.py"
-git show origin/perf/qwen3-tts-hidden-h2d-sync:benchmarks/profiling/analyze_cuda_sync_trace.py \
-  > "$TRACE_ANALYZER"
+export TRACE_ANALYZER=benchmarks/profiling/analyze_cuda_sync_trace.py
 python "$TRACE_ANALYZER" \
   "$TRACE_FILE" \
   --output-dir "$QUAL_DIR/$TRACE_RUN/analysis"
@@ -220,8 +215,11 @@ occurrence can be inspected later without rerunning the workload.
 ```bash
 kill "$SERVER_PID"
 wait "$SERVER_PID" || true
-find "$QUAL_DIR" -type f -print0 | sort -z | xargs -0 sha256sum \
-  > "$QUAL_DIR/SHA256SUMS"
+(cd "$QUAL_DIR" && \
+  find . -type f ! -name SHA256SUMS -print0 \
+    | sort -z \
+    | xargs -0 sha256sum \
+    > SHA256SUMS)
 tar -C /tmp -czf /tmp/q3tts-hidden-sync-167a2573.tar.gz \
   q3tts-hidden-sync-167a2573
 ```
@@ -330,10 +328,7 @@ mtime_1=$(stat -c %Y "$TRACE_FILE")
 sleep 5
 test "$size_1:$mtime_1" = "$(stat -c %s "$TRACE_FILE"):$(stat -c %Y "$TRACE_FILE")"
 
-git fetch origin perf/qwen3-tts-hidden-h2d-sync
-export TRACE_ANALYZER="$QUAL_DIR/analyze_cuda_sync_trace.py"
-git show origin/perf/qwen3-tts-hidden-h2d-sync:benchmarks/profiling/analyze_cuda_sync_trace.py \
-  > "$TRACE_ANALYZER"
+export TRACE_ANALYZER=benchmarks/profiling/analyze_cuda_sync_trace.py
 python "$TRACE_ANALYZER" \
   "$TRACE_FILE" \
   --output-dir "$QUAL_DIR/$TRACE_RUN/analysis"
@@ -418,3 +413,131 @@ This trace is for choosing the next design, not accepting a performance claim.
 Return the stable trace, analyzer outputs, ownership counts, client output, and
 server log. A stack-enabled trace is justified only if a material unscoped group
 remains after these ownership ranges.
+
+## 8. One-pass text-tokenizer H2D qualification
+
+The Section 7 artifact selected one additional mechanism: official
+`qwen-tts==0.1.1` moves pageable CPU token ids to CUDA inside
+`_tokenize_texts`. The candidate keeps the official processor and shape logic,
+but stages its immutable output in pinned host memory and enqueues the copy on
+the preprocessing stream. Do not rerun the warning window or full corpus first.
+
+Use a fresh server at the candidate revision and the same pinned 0.6B Base
+snapshot. Warm the disjoint final 64 samples exactly as in Section 7, then
+capture only the offset-128 c16 window:
+
+```bash
+git fetch origin
+git switch --detach origin/perf/qwen3-tts-hidden-h2d-sync-v2
+export TEXT_REV
+TEXT_REV=$(git rev-parse --short=8 HEAD)
+export QUAL_DIR=/tmp/q3tts-text-tokenizer-$TEXT_REV
+export SERVER_LOG="$QUAL_DIR/server.log"
+mkdir -p "$QUAL_DIR"
+
+CUDA_VISIBLE_DEVICES=0 \
+SGLANG_TORCH_PROFILER_DIR="$QUAL_DIR/profiles" \
+sgl-omni serve \
+  --model-path "$MODEL_PATH" \
+  --config examples/configs/qwen3_tts_0_6b.yaml \
+  --port 8000 \
+  >"$SERVER_LOG" 2>&1 &
+export SERVER_PID=$!
+until curl -fsS http://127.0.0.1:8000/health >/dev/null; do sleep 2; done
+
+python -m benchmarks.eval.benchmark_tts_seedtts \
+  --generate-only \
+  --use-existing-server \
+  --model "$MODEL_PATH" \
+  --output-dir "$QUAL_DIR/warmup" \
+  --max-samples 64 \
+  --sample-offset 1024 \
+  --concurrency 16 \
+  --warmup 0
+
+export TRACE_RUN=q3tts-$TEXT_REV-text-tokenizer-c16
+mkdir -p "$QUAL_DIR/$TRACE_RUN/events" "$QUAL_DIR/$TRACE_RUN/analysis"
+curl -fsS -X POST http://127.0.0.1:8000/start_profile \
+  -H 'content-type: application/json' \
+  -d "{\"run_id\":\"$TRACE_RUN\",\"trace_path_template\":\"$QUAL_DIR/$TRACE_RUN/trace\",\"event_dir\":\"$QUAL_DIR/$TRACE_RUN/events\",\"enable_torch\":true}" \
+  | tee "$QUAL_DIR/$TRACE_RUN/start_response.json"
+until grep -Fq "Starting End-to-End Torch profiler (run_id=$TRACE_RUN)" "$SERVER_LOG"; do
+  sleep 1
+done
+
+python -m benchmarks.eval.benchmark_tts_seedtts \
+  --generate-only \
+  --use-existing-server \
+  --model "$MODEL_PATH" \
+  --output-dir "$QUAL_DIR/$TRACE_RUN/client" \
+  --max-samples 64 \
+  --sample-offset 128 \
+  --concurrency 16 \
+  --warmup 0
+
+curl -fsS -X POST http://127.0.0.1:8000/stop_profile \
+  -H 'content-type: application/json' \
+  -d "{\"run_id\":\"$TRACE_RUN\"}" \
+  | tee "$QUAL_DIR/$TRACE_RUN/stop_response.json"
+
+until find "$QUAL_DIR/$TRACE_RUN" -name '*.trace.json.gz' -size +0c | grep -q .; do
+  sleep 2
+done
+until find "$QUAL_DIR/$TRACE_RUN" -name '*.host_memory.json' -size +0c | grep -q .; do
+  sleep 1
+done
+export TRACE_FILE
+TRACE_FILE=$(find "$QUAL_DIR/$TRACE_RUN" -name '*.trace.json.gz' -size +0c -print -quit)
+size_1=$(stat -c %s "$TRACE_FILE")
+mtime_1=$(stat -c %Y "$TRACE_FILE")
+sleep 5
+test "$size_1:$mtime_1" = "$(stat -c %s "$TRACE_FILE"):$(stat -c %Y "$TRACE_FILE")"
+
+python benchmarks/profiling/analyze_cuda_sync_trace.py \
+  "$TRACE_FILE" \
+  --output-dir "$QUAL_DIR/$TRACE_RUN/analysis"
+python benchmarks/profiling/summarize_qwen3_tts_sync.py \
+  "$TRACE_FILE" \
+  --analysis-dir "$QUAL_DIR/$TRACE_RUN/analysis" \
+  --strict
+
+export HOST_MEMORY_FILE
+HOST_MEMORY_FILE=$(find "$QUAL_DIR/$TRACE_RUN" -name '*.host_memory.json' -size +0c -print -quit)
+jq '{run_id, pid, rank, start_available: .start.available,
+     end_available: .end.available,
+     allocated_bytes_current_delta: .delta["allocated_bytes.current"],
+     active_bytes_current_delta: .delta["active_bytes.current"],
+     host_alloc_delta: .delta.num_host_alloc}' \
+  "$HOST_MEMORY_FILE" \
+  | tee "$QUAL_DIR/$TRACE_RUN/analysis/host_memory_summary.json"
+```
+
+Pass conditions:
+
+- 64/64 requests complete without an HTTP, server, or CUDA error.
+- `summarize_qwen3_tts_sync.py --strict` exits zero. In particular,
+  `qwen3_tts.preprocess.text_tokenizer` has positive range and H2D counts, zero
+  synchronization, and every previously qualified range remains clean.
+- The rank-local host-memory artifact reports `start.available=true` and
+  `end.available=true`. Report the current-byte and host-allocation deltas; do
+  not substitute peak GPU memory or invent a zero-growth threshold for the
+  caching host allocator.
+- The trace still reports retained reference-tokenizer, cache-publication,
+  final-code, vocoder, async-resolve, and SGLang repetition-penalty boundaries.
+
+Package this single run after stopping the server:
+
+```bash
+kill "$SERVER_PID"
+wait "$SERVER_PID" || true
+(cd "$QUAL_DIR" && \
+  find . -type f ! -name SHA256SUMS -print0 \
+    | sort -z \
+    | xargs -0 sha256sum \
+    > SHA256SUMS)
+tar -C /tmp -czf "/tmp/q3tts-text-tokenizer-$TEXT_REV.tar.gz" \
+  "q3tts-text-tokenizer-$TEXT_REV"
+```
+
+This is a mechanical qualification, not another serving-speedup experiment.
+Run one warning-only c1 localization pass only if the strict trace gate fails.
