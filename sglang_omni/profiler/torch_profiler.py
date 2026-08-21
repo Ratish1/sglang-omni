@@ -3,12 +3,15 @@
 # Original files:
 # - https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/profiler/torch_profiler.py
 
+import json
 import logging
 import os
 import subprocess
 import threading
+import time
 from contextlib import nullcontext
 
+import torch
 from torch.profiler import (
     ProfilerActivity,
     _ExperimentalConfig,
@@ -36,7 +39,92 @@ class TorchProfiler(ProfilerBase):
     _trace_template: str = ""
 
     _active_run_id: str | None = None
+    _host_memory_start: dict | None = None
+    _host_memory_start_ns: int | None = None
     _lock = threading.Lock()
+
+    @staticmethod
+    def _host_memory_snapshot() -> dict:
+        """Read pinned-host allocator counters without initializing CUDA."""
+
+        if not torch.cuda.is_initialized():
+            return {
+                "available": False,
+                "reason": "cuda_not_initialized",
+                "stats": {},
+            }
+        try:
+            stats = {
+                str(key): value
+                for key, value in torch.cuda.host_memory_stats().items()
+                if isinstance(value, (int, float))
+            }
+        except Exception as exc:
+            logger.warning("Failed to read CUDA host-memory statistics: %s", exc)
+            return {
+                "available": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "stats": {},
+            }
+        return {"available": True, "reason": None, "stats": stats}
+
+    @staticmethod
+    def _host_memory_delta(start: dict, end: dict) -> dict[str, int | float]:
+        start_stats = start.get("stats", {})
+        end_stats = end.get("stats", {})
+        return {
+            key: end_stats[key] - start_stats[key]
+            for key in sorted(start_stats.keys() & end_stats.keys())
+            if isinstance(start_stats[key], (int, float))
+            and isinstance(end_stats[key], (int, float))
+        }
+
+    @classmethod
+    def _write_host_memory_artifact(
+        cls,
+        *,
+        base_path: str,
+        rank: int,
+        run_id: str | None,
+        end_snapshot: dict,
+        end_ns: int,
+    ) -> str:
+        path = f"{base_path}.host_memory.json"
+        start_snapshot = cls._host_memory_start or {
+            "available": False,
+            "reason": "start_snapshot_missing",
+            "stats": {},
+        }
+        payload = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "pid": os.getpid(),
+            "rank": rank,
+            "start_timestamp_ns": cls._host_memory_start_ns,
+            "end_timestamp_ns": end_ns,
+            "start": start_snapshot,
+            "end": end_snapshot,
+            "delta": cls._host_memory_delta(start_snapshot, end_snapshot),
+            "notes": [
+                "Counters are process-local CUDA pinned-host allocator statistics.",
+                (
+                    "Current-value deltas bound allocator growth during the "
+                    "profile window."
+                ),
+                (
+                    "Peak counters are not window-local because profiling does "
+                    "not reset global allocator statistics."
+                ),
+                "Pinned-host statistics do not measure GPU memory.",
+            ],
+        }
+        temporary_path = f"{path}.tmp"
+        with open(temporary_path, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        os.replace(temporary_path, path)
+        logger.info("[Rank %s] Host-memory statistics exported to %s", rank, path)
+        return path
 
     @classmethod
     def get_active_run_id(cls) -> str | None:
@@ -70,11 +158,15 @@ class TorchProfiler(ProfilerBase):
                 cls._profiler = None
                 cls._active_run_id = None
                 cls._trace_template = ""
+                cls._host_memory_start = None
+                cls._host_memory_start_ns = None
 
             # 2. Make path absolute
             trace_path_template = os.path.abspath(trace_path_template)
             cls._trace_template = trace_path_template
             cls._active_run_id = run_id
+            cls._host_memory_start_ns = time.time_ns()
+            cls._host_memory_start = cls._host_memory_snapshot()
 
             # Expected paths
             json_file = f"{trace_path_template}_rank{rank}.trace.json"
@@ -161,6 +253,8 @@ class TorchProfiler(ProfilerBase):
             base_path = f"{cls._trace_template}_rank{rank}"
             json_path = f"{base_path}.trace.json"
             gz_path = f"{json_path}.gz"
+            host_memory_end_ns = time.time_ns()
+            host_memory_end = cls._host_memory_snapshot()
 
             profiler = cls._profiler
             try:
@@ -190,11 +284,31 @@ class TorchProfiler(ProfilerBase):
             except Exception as e:
                 logger.warning("[Rank %s] Failed to export trace: %s", rank, e)
 
+            host_memory_path = None
+            try:
+                host_memory_path = cls._write_host_memory_artifact(
+                    base_path=base_path,
+                    rank=rank,
+                    run_id=active,
+                    end_snapshot=host_memory_end,
+                    end_ns=host_memory_end_ns,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Rank %s] Failed to export host-memory statistics: %s", rank, e
+                )
+
             cls._profiler = None
             cls._active_run_id = None
             cls._trace_template = ""
+            cls._host_memory_start = None
+            cls._host_memory_start_ns = None
 
-            return {"trace": gz_path, "table": None}
+            return {
+                "trace": gz_path,
+                "table": None,
+                "host_memory": host_memory_path,
+            }
 
     @classmethod
     def step(cls):
