@@ -511,10 +511,26 @@ def _build_qwen3_tts_pad_embed(model: Any) -> torch.Tensor:
 
 
 def _tokenize_qwen3_tts_text(wrapper: Any, text: str) -> torch.Tensor:
-    """Attribute the third-party tokenizer's CPU-to-device boundary."""
+    """Tokenize one prompt and enqueue its ids without a pageable H2D wait.
+
+    ``qwen-tts==0.1.1`` implements ``_tokenize_texts`` as a processor call
+    followed by ``input_ids.to(self.device)``.  The processor tensor is regular
+    CPU memory, so that copy is blocking even though the ids are consumed on
+    the same CUDA stream.  Preserve the upstream processor and shape handling,
+    but stage its immutable result in CUDA-pinned host memory first.
+    """
 
     with TorchProfiler.record_function("qwen3_tts.preprocess.text_tokenizer"):
-        return wrapper._tokenize_texts([text])[0]
+        encoded = wrapper.processor(text=text, return_tensors="pt", padding=True)
+        input_ids = encoded["input_ids"]
+        target_device = torch.device(wrapper.device)
+        async_h2d = input_ids.device.type == "cpu" and target_device.type == "cuda"
+        if async_h2d:
+            staging = input_ids if input_ids.is_pinned() else input_ids.pin_memory()
+            input_ids = staging.to(target_device, non_blocking=True)
+        else:
+            input_ids = input_ids.to(target_device)
+        return input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
 
 
 def _build_instruct_id(wrapper: Any, instructions: str | None) -> torch.Tensor | None:
