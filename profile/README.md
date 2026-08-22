@@ -335,3 +335,39 @@ phase, how many API calls and how many GPU rows one decode step and one
 extend issue, and the micro-gap table says where the bubbles sit. Each
 omni-side row with a large count is a candidate seam; each sgl-side row
 is a configuration question against the pinned sglang, not a patch.
+
+## 8. Campaign 6: two omni-side configuration levers (cold, clean, A vs A+lever)
+
+From campaign 5 (tasks/loop_profile_campaign5_results_20260823.md): the
+decode graph replays 369 kernels per step at 5.7 to 6.3 us each, about
+twice the bandwidth floor, because Qwen3-ASR compiles only buckets at or
+below `torch_compile_max_bs: 2`; the extend issues 612 CUDA API calls per
+extend in the breakable prefill graph. Both are omni-owned configuration.
+
+Both levers are CLI overrides on the same checkout (A = `2494125c9`), so
+the arms share a base by construction. Verify each override reaches the
+stage by reading the engine builder's startup log line (it prints
+torch_compile and the prefill backend).
+
+| Arm | Override | Isolates |
+|---|---|---|
+| A | none | baseline |
+| A+E1 | `--torch-compile-max-bs 32` | compiled decode graphs up to bs 32 |
+| A+E2 | `--cuda-graph-backend-prefill tc_piecewise` | piecewise-compiled prefill graph |
+| A+E1+E2 | both | the pair |
+
+If a flag is not accepted by `sglang_omni.cli serve`, pass it as a
+stage override the way `--prefill-coalesce-requests` is, and record the
+exact form used. Cells: c32 and c8 per arm, clean (no nsys), one cold
+pass per fresh server: eight servers. Record startup time to ready for
+every server (E1 adds compile time per bucket; that is part of the
+result). Report req/s, p50, p95, WER per cell.
+
+Then one profiled cell per winning arm at c32 (section 7 commands, node
+trace) so the launch table shows the new kernels per step and API calls
+per extend; that is the proof the lever did what the budget said.
+
+Reading, fixed in advance: E1 is expected to move c8 more than c32 (c8
+is GPU bound per step, c32 is host bound); E2 is expected to cut the
+extend's host time at both. A lever that does not change its own row in
+the launch table did not engage, whatever req/s says.
