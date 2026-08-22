@@ -1,7 +1,7 @@
 # Loop profile: GPU-idle attribution for the OmniScheduler
 
-Question: on main, in the regime the 2026-08-20 throughput numbers were
-measured in, how much GPU time is idle and what is the scheduler thread
+Question: on main, in the cold-pass regime that is real ASR serving (each
+clip seen once, encoder runs per request, full prefill), how much GPU time is idle and what is the scheduler thread
 doing at the start of each idle gap? Plan, label set, analysis definitions
 and the decision rules fixed before the data: tasks/loop_profile_plan_20260822.md
 (on the Mac). This file is the runbook for the H100 box.
@@ -61,111 +61,99 @@ Fixed across arms (do not vary; record the launch line in the result):
   one request-build worker. None of these is passed explicitly; passing
   any of them is a new arm and must be reported as such.
 - GPU: the same physical H100 for every cell; nothing else on it.
-- Client: the repo benchmark, three measured repeats, one discarded warmup
-  run done as a separate invocation (section 2 step 3) so the capture holds
-  only measured passes.
-- nsys: `--trace=cuda,nvtx --cuda-graph-trace=graph --sample=none
-  --cpuctxsw=none`. Graph mode records one row per graph replay (low
-  overhead); the analysis reads both the graph and kernel tables and prints
-  their row counts. If `GRAPH_TRACE` shows 0 rows on a cell where cuda
-  graphs are on, rerun that cell with `--cuda-graph-trace=node`.
+- nsys: `nsys launch --trace=cuda,nvtx --cuda-graph-trace=graph` on the
+  server; `--sample=none --cpuctxsw=none` on each `nsys start` (Nsight
+  2026.2.1 rejects them on launch). The analysis reads both the graph and
+  kernel tables and prints their row counts.
 
-Why whole passes instead of a 20 s steady-state window: at c32 one pass of
-1088 clips takes about 3 s (350 req/s), so a fixed window would span ramps
-anyway, and the 2026-08-20 req/s were measured over exactly these passes.
-The capture therefore spans the three measured repeats and the analysis
-uses the whole window (`--trim 0`). The inter-repeat idle lands in the
-`sched:sleep` and `sched:idle_check` buckets, which the decision rules
-treat as "not a loop cost"; everything else is the measured regime.
+### The cold-pass rule (the 2026-08-22 finding)
 
-## 2. Per arm (three times: A, A0, B)
+Every measured pass must be the first time the server sees each clip.
+The pre-LM embedding cache (4096 entries) and the radix cache (keyed by
+the audio content hash) both serve a repeated clip, so a pass that
+follows any same-corpus pass measures no encoder work and a one-token
+prefill per request. That is not ASR serving and it is what every earlier
+gate measured.
 
-1. Checkout and environment, in the server shell:
+Protocol: **one fresh server per measured pass, no client warmup** (no
+`--warmup`, `--repeats 1`). The server captures its CUDA graphs at
+startup, so the only cold-start cost left in the pass is the first few
+requests' allocator and JIT work; that is real serving behaviour and it is
+inside the window, once per pass, the same on every arm. Repeats are
+separate fresh servers. The proof that a pass was cold is in the
+attribution output: the extend `tok` median must be in the hundreds, not
+equal to `bs`, and the encoder thread count must be 1. A pass failing
+either check is discarded, not reported.
+
+## 2. Per cell (arm x concurrency), repeated for each measured pass
+
+One server, one capture, one pass. Cells: c32 and c8 for A, A0 and B, one
+pass each first (six servers, six captures); a second pass per cell only
+if the first six leave a decision on the margin.
 
 ```bash
-git checkout <arm checkout>            # A and A0: 2494125c9; B: 10f7f2570
+ARM=A; C=32                               # A0 adds the flag; B checks out 10f7f2570
+git checkout <arm checkout>
 export OMNI_NVTX_PROBE=1
 export PYTHONPATH=$PROBE_DIR${PYTHONPATH:+:$PYTHONPATH}
-ARM=A   # or A0 or B
-```
+R=$OUT/${ARM}_qwen3asr_c${C}_p1           # p2, p3 for later passes
 
-2. Launch the server under nsys (one server per arm; A0 is its own server
-   because the flag is a launch argument):
-
-```bash
-nsys launch --trace=cuda,nvtx --cuda-graph-trace=graph --sample=none --cpuctxsw=none -- \
+nsys launch --trace=cuda,nvtx --cuda-graph-trace=graph -- \
   python -m sglang_omni.cli serve \
     --model-path "$MODEL_PATH" --model-name Qwen/Qwen3-ASR-1.7B --port 8000 \
     <the same extra flags as the 2026-08-20 Qwen3-ASR cells, for example --mem-fraction-static> \
     $( [ "$ARM" = A0 ] && echo --prefill-coalesce-requests 1 ) \
-  2>&1 | tee $OUT/${ARM}_server.log
+  2>&1 | tee $R.server.log
 ```
 
-   Confirm in the log, once per stage process:
-   `[nvtx-probe] backend=nvtx pid=... installed=22 missing=none`.
-   `missing` must be `none`; if it is not, stop and report the line.
-
-3. Warmup, not captured (one pass at c32 is enough to settle graphs and the
-   encoder cache):
+Wait for the server to report ready and confirm once per stage process:
+`[nvtx-probe] backend=nvtx pid=... installed=22 missing=none`. `missing`
+must be `none`; if not, stop and report the line.
 
 ```bash
+nsys start --sample=none --cpuctxsw=none -o $R
 python -m benchmarks.eval.benchmark_asr_seedtts --port 8000 \
-  --concurrencies 32 --repeats 1 --max-samples 0 --lang en \
+  --concurrencies $C --repeats 1 --max-samples 0 --lang en \
   --dataset-revision 27f4c1adee83b5b29b7c4b375f6b976324bda308 \
   --model-revision 7278e1e70fe206f11671096ffdd38061171dd6e5 \
-  --output $OUT/${ARM}_warmup.json
+  --output $R.client.json
+nsys stop
+# stop the server now; the next pass gets a fresh one
+
+nsys export --type sqlite --force-overwrite true -o $R.sqlite $R.nsys-rep
+python $ATTR $R.sqlite --json $R.attr.json > $R.attr.md
+head -3 $R.attr.md; grep "Extend batch shape" $R.attr.md
 ```
 
-4. Capture, one per concurrency, c32 then c8:
+Expected pass lengths in the cold regime are longer than the 3 s per pass
+of the cached regime (the encoder runs for every clip); record the
+client's req/s for the log only, not as a gate.
 
-```bash
-for C in 32 8; do
-  nsys start -o $OUT/${ARM}_qwen3asr_c${C}
-  python -m benchmarks.eval.benchmark_asr_seedtts --port 8000 \
-    --concurrencies $C --repeats 3 --max-samples 0 --lang en \
-    --dataset-revision 27f4c1adee83b5b29b7c4b375f6b976324bda308 \
-    --model-revision 7278e1e70fe206f11671096ffdd38061171dd6e5 \
-    --output $OUT/${ARM}_qwen3asr_c${C}.json
-  nsys stop
-done
-```
-
-   Expected capture lengths: c32 about 10 to 15 s, c8 about 30 s. Record
-   the client's req/s for the log only; under nsys it is not a gate.
-
-5. Export and analyze:
-
-```bash
-for C in 32 8; do
-  R=$OUT/${ARM}_qwen3asr_c${C}
-  nsys export --type sqlite --force-overwrite true -o $R.sqlite $R.nsys-rep
-  python $ATTR $R.sqlite --json $R.attr.json > $R.attr.md
-done
-```
-
-6. Stop the server before the next arm.
-
-Total: three servers, one warmup each, six captures, six `.attr.md` files.
-Optional seventh: ArkASR c16 on arm A (eager prefill shape) with the same
-steps and the ArkASR model flags from 2026-08-20.
+Optional seventh cell: ArkASR c16 on arm A with the ArkASR model flags
+from 2026-08-20.
 
 ## 3. Sanity checks before reading the numbers
 
-- First line of each `.attr.md`: `scheduler threads 1, encoder threads 1`
-  and the GPU row counts. `GRAPH_TRACE` rows must be non-zero on a graph
-  mode capture (see section 1); `KERNEL` rows carry the eager work.
-- The script exits with a message if no `sched:recv` range exists (probe
-  not live in the LM stage) or no NVTX table exists (trace flag missing).
+- First line of each `.attr.md`: `threads: scheduler 1, encoder 1,
+  builder 0 or 1` and the GPU row counts. `GRAPH_TRACE` rows must be
+  non-zero on a graph mode capture; `KERNEL` rows carry the eager work.
+- Cold-pass proof: `Extend batch shape ... tok median` in the hundreds.
+  `tok median` equal to `bs` means a cached pass; discard it.
+- The default window is the benchmark pass (first to last exec range), so
+  lead-in and shutdown idle are excluded. Its length should match the
+  client wall time to within a second.
 - `unlabeled` host time should be a small share of the window. A large
   share means a host phase is missing from the label set; report it with
   the host table rather than interpreting around it.
 - A0 must show `0 hold marks`; A and B must show a non-zero count at c32.
-- Window length should match the client run length to within a second.
+- The script exits with a message if no `sched:recv` or no `exec:*` range
+  exists (probe not live in the LM stage, or nothing ran) or no NVTX
+  table exists (trace flag missing).
 
 ## 4. Report
 
-Keep per cell: `.nsys-rep`, `.sqlite`, `.attr.json`, `.attr.md`, the
-client `.json`, the server log. Send back the six `.attr.md` files, the
-six client req/s lines, and the `[nvtx-probe]` lines from the three server
-logs. The Mac side writes tasks/loop_profile_results_20260822.md and takes
-the decision from plan section 6.
+Keep per pass: `.nsys-rep`, `.sqlite`, `.attr.json`, `.attr.md`, the
+client `.json`, the server log. Send back the `.attr.md` files, the client
+req/s lines, and the `[nvtx-probe]` lines from the server logs. The Mac
+side writes tasks/loop_profile_results_<date>.md and takes the decision
+from plan section 6 plus the bubble rule added on 2026-08-22.

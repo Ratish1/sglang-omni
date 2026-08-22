@@ -2,13 +2,14 @@
 
     python profile/checks/check_attribution_local.py
 
-The timeline (ms): scheduler thread 1, encoder thread 2, window 0..5.
-  iteration 0: recv 0-0.1, next_batch 0.1-0.5 (new_prefill 0.15-0.45, hold mark 0.4), sleep 0.5-1.0
+Timeline (ms): scheduler thread 1, encoder thread 2, builder thread 3.
+  iteration 0: recv 0-0.1, next_batch 0.1-0.5 (new_prefill 0.15-0.45, hold mark 0.4), sleep 0.5-1.0;
+               builder: build:req 0.2-0.6
   iteration 1: recv 1.0-1.05, next_batch 1.05-1.3, exec:sync:extend bs=2 tok=40 1.3-2.7
-               (run:build 1.3-1.4, run:forward 1.4-1.6, run:finalize 1.6-2.7); kernel 1.5-2.5
+               (run:build 1.3-1.4, run:forward 1.4-1.6, run:finalize 1.6-2.7); kernels 1.5-1.95 and 1.98-2.5
   iteration 2: recv 2.7-2.75, next_batch 2.75-3.0 (prepare_decode 2.8-2.9), exec:launch:decode bs=2 3.0-3.2;
                kernel 3.3-4.0; encoder: enc:batch n=3 3.5-4.5 (enc:sync 3.8-4.5), kernel 3.6-3.9
-Expected idle gaps: 0-1.5 (sched:recv), 2.5-3.3 (run:finalize), 4.0-5.0 (unlabeled).
+Checked with an explicit 0..5 ms window and with the default exec window (1.3..3.2).
 """
 
 import json
@@ -31,6 +32,7 @@ def build(path: str) -> None:
         create table ENUM_NVTX_EVENT_TYPE (id integer, name text);
         create table NVTX_EVENTS (start integer, end integer, eventType integer, globalTid integer, text text, textId integer, domainId integer);
         create table CUPTI_ACTIVITY_KIND_KERNEL (start integer, end integer, deviceId integer, streamId integer, globalPid integer, shortName integer);
+        create table CUPTI_ACTIVITY_KIND_GRAPH_TRACE (start integer, end integer, deviceId integer, streamId integer, globalPid integer, graphId integer);
         create table CUPTI_ACTIVITY_KIND_MEMCPY (start integer, end integer, deviceId integer, streamId integer, globalPid integer, copyKind integer);
         """
     )
@@ -46,12 +48,13 @@ def build(path: str) -> None:
             con.execute("insert into StringIds values (?, ?)", (strings[text], text))
         return strings[text]
 
-    sched, enc = (7 << 24) | 1, (7 << 24) | 2
+    sched, enc, bld = (7 << 24) | 1, (7 << 24) | 2, (7 << 24) | 3
     ranges = [
         (0.0, 0.1, "sched:recv", sched),
         (0.1, 0.5, "sched:next_batch", sched),
         (0.15, 0.45, "sched:new_prefill", sched),
         (0.5, 1.0, "sched:sleep", sched),
+        (0.2, 0.6, "build:req", bld),
         (1.0, 1.05, "sched:recv", sched),
         (1.05, 1.3, "sched:next_batch", sched),
         (1.3, 2.7, "exec:sync:extend bs=2 tok=40", sched),
@@ -81,7 +84,11 @@ def build(path: str) -> None:
         "insert into NVTX_EVENTS values (?, NULL, 34, ?, ?, NULL, 0)",
         (int(0.4 * MS), sched, "sched:hold waiting=3"),
     )
-    for s, e in [(1.5, 2.5), (3.3, 4.0), (3.6, 3.9)]:
+    con.execute(
+        "insert into CUPTI_ACTIVITY_KIND_GRAPH_TRACE values (?, ?, 0, 7, 7, 1)",
+        (int(1.5 * MS), int(1.95 * MS)),
+    )
+    for s, e in [(1.98, 2.5), (3.3, 4.0), (3.6, 3.9)]:
         con.execute(
             "insert into CUPTI_ACTIVITY_KIND_KERNEL values (?, ?, 0, 7, 7, 1)",
             (int(s * MS), int(e * MS)),
@@ -94,31 +101,87 @@ def close(a, b, tol=1e-6):
     return abs(a - b) <= tol
 
 
-with tempfile.TemporaryDirectory() as d:
-    db = os.path.join(d, "synthetic.sqlite")
-    out = os.path.join(d, "out.json")
-    build(db)
+def run(db, out, *window):
     subprocess.run(
-        [sys.executable, SCRIPT, db, "--window", "0", str(5 * MS), "--json", out],
+        [
+            sys.executable,
+            SCRIPT,
+            db,
+            "--json",
+            out,
+            *(("--window", *window) if window else ()),
+        ],
         check=True,
         stdout=subprocess.PIPE,
     )
-    r = json.load(open(out))
+    return json.load(open(out))
 
-assert close(r["gpu_busy_ms"], 1.7), r["gpu_busy_ms"]
-assert close(r["gpu_idle_ms"], 3.3), r["gpu_idle_ms"]
-a = r["attribution"]
-assert close(a["sched:recv"]["idle_ms"], 1.5), a
-assert close(a["run:finalize"]["idle_ms"], 0.8), a
-assert close(a["unlabeled"]["idle_ms"], 1.0), a
-assert set(a) == {"sched:recv", "run:finalize", "unlabeled"}, set(a)
-assert r["hold_marks"] == 1 and r["hold_iterations"] == 1
-assert close(r["idle_in_hold_iterations_ms"], 1.5), r["idle_in_hold_iterations_ms"]
-assert r["extend_bs_hist"] == {"2": 1} and r["extend_tok_median"] == 40
-assert close(r["idle_overlapping_encoder_ms"], 0.5), r["idle_overlapping_encoder_ms"]
-assert close(r["enc_sync_overlapping_exec_ms"], 0.0)
-assert r["iterations"] == 2 and close(r["iterations_without_exec_pct"], 50.0), r
-assert close(r["host"]["exec:sync:extend"]["total_ms"], 1.4), r["host"]
-assert close(r["host_unlabeled_ms"], 5.0 - (1.0 + 1.7 + 0.5)), r["host_unlabeled_ms"]
-assert r["scheduler_threads_found"] == 1 and r["encoder_threads_found"] == 1
+
+with tempfile.TemporaryDirectory() as d:
+    db = os.path.join(d, "synthetic.sqlite")
+    build(db)
+    full = run(db, os.path.join(d, "full.json"), "0", str(5 * MS))
+    ex = run(db, os.path.join(d, "exec.json"))
+
+assert full["gpu_tables"] == {"KERNEL": 3, "GRAPH_TRACE": 1, "MEMCPY": 0}, full[
+    "gpu_tables"
+]
+assert close(full["gpu_busy_ms"], 1.67) and close(full["gpu_idle_ms"], 3.33), (
+    full["gpu_busy_ms"],
+    full["gpu_idle_ms"],
+)
+a = full["big_attribution"]
+expected = {
+    "sched:recv": 0.2,
+    "sched:next_batch": 0.5,
+    "sched:new_prefill": 0.3,
+    "sched:sleep": 0.5,
+    "run:build": 0.1,
+    "run:forward": 0.1,
+    "run:finalize": 0.2,
+    "sched:prepare_decode": 0.1,
+    "exec:launch:decode": 0.2,
+    "unlabeled": 1.1,
+}
+assert set(a) == set(expected), set(a) ^ set(expected)
+for k, v in expected.items():
+    assert close(a[k]["idle_ms"], v), (k, a[k])
+assert a["sched:next_batch"]["gaps"] == 2 and a["unlabeled"]["gaps"] == 2, a
+assert full["micro_gaps"] == 1 and close(full["micro_idle_ms"], 0.03)
+assert full["micro_by_exec"] == {
+    "exec:sync:extend": {"gaps": 1, "idle_ms": 0.03, "pct_of_idle": 100 * 0.03 / 3.33}
+} or close(full["micro_by_exec"]["exec:sync:extend"]["idle_ms"], 0.03)
+assert close(full["micro_by_inner"]["run:finalize"], 0.03)
+assert full["hold_marks"] == 1 and close(full["idle_in_hold_iterations_ms"], 1.5)
+assert full["extend_bs_hist"] == {"2": 1} and full["extend_tok_median"] == 40
+assert (
+    close(full["encoder_overlap_idle_ms"], 0.5)
+    and close(full["encoder_overlap_exec_ms"], 0.0)
+    and close(full["enc_sync_overlap_exec_ms"], 0.0)
+)
+assert (
+    full["builder_threads_found"] == 1
+    and close(full["builder_overlap_idle_ms"], 0.4)
+    and close(full["builder_overlap_exec_ms"], 0.0)
+)
+assert full["iterations"] == 2 and close(full["iterations_without_exec_pct"], 50.0)
+assert close(full["host"]["exec:sync:extend"]["total_ms"], 1.4)
+assert close(full["host_unlabeled_ms"], 5.0 - (1.0 + 1.7 + 0.5)), full[
+    "host_unlabeled_ms"
+]
+
+assert ex["window_ns"] == [int(1.3 * MS), int(3.2 * MS)], ex["window_ns"]
+assert close(ex["gpu_idle_ms"], 0.93), ex["gpu_idle_ms"]
+b = ex["big_attribution"]
+for k, v in {
+    "run:build": 0.1,
+    "run:forward": 0.1,
+    "run:finalize": 0.2,
+    "sched:recv": 0.05,
+    "sched:next_batch": 0.15,
+    "sched:prepare_decode": 0.1,
+    "exec:launch:decode": 0.2,
+}.items():
+    assert close(b[k]["idle_ms"], v), (k, b[k])
+assert "unlabeled" not in b and "sched:sleep" not in b, set(b)
 print("ATTRIBUTION LOCAL CHECK PASSED")

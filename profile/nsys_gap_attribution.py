@@ -1,23 +1,30 @@
-"""Attribute GPU idle gaps in an nsys capture to OmniScheduler host phases.
+"""Attribute GPU idle in an nsys capture to OmniScheduler host phases.
 
-Input: the sqlite export of a capture taken with tasks/nvtx_probe installed
-(nsys export --type sqlite <rep>). Output: the seven tables of
-tasks/loop_profile_plan_20260822.md section 5, as markdown on stdout, plus
-an optional JSON dump.
+Input: the sqlite export of a capture taken with profile/nvtx_probe
+installed (nsys export --type sqlite <rep>). Output: markdown tables on
+stdout and an optional JSON dump.
 
-    python tasks/nsys_gap_attribution.py capture.sqlite [--threshold-us 100]
-        [--window START_NS END_NS] [--trim 0.10] [--json out.json]
+    python profile/nsys_gap_attribution.py capture.sqlite [--threshold-us 100]
+        [--window exec|recv|START_NS END_NS] [--json out.json]
 
 Definitions:
-  window      first to last sched:recv on the scheduler thread, trimmed by
-              --trim (default 0: the capture spans complete benchmark
-              passes) at each end, unless --window is given (ns)
-  GPU busy    union of kernel, memcpy and memset intervals on every device,
-              stream and process, clipped to the window
-  idle gap    a maximal sub-interval of the window with no GPU busy time
-  attribution the innermost scheduler-thread NVTX range active at the gap
-              start; none active is reported as unlabeled
+  window      exec (default): first to last exec:* range on the scheduler
+              thread, the benchmark pass itself; recv: first to last
+              sched:recv, the whole capture; or explicit ns bounds
+  GPU busy    union of kernel, graph, memcpy and memset intervals on every
+              device, stream and process, clipped to the window
+  idle        window minus busy, as a set of gaps
+  big gap     a gap at or above the threshold; attributed time-weighted:
+              each part of it goes to the innermost scheduler-thread label
+              active at that instant, so a gap that spans several phases
+              is split across them and a gap with no label is unlabeled
+  micro gap   a gap below the threshold (a bubble between launches inside
+              a step); attributed to the innermost label at its start and
+              to the enclosing exec:* label, if any
   iteration   the interval between consecutive sched:recv starts
+Labels are aggregated by base name (the text before the first space), so
+exec:launch:decode bs=16 and bs=17 are one row; the extend shape has its
+own histogram.
 """
 
 from __future__ import annotations
@@ -43,6 +50,10 @@ GPU_TABLES = (
     "CUPTI_ACTIVITY_KIND_MEMSET",
 )
 EXTEND_RE = re.compile(r"^exec:(sync|launch):extend bs=(\d+) tok=(\d+)$")
+
+
+def base(name: str) -> str:
+    return name.split(" ", 1)[0]
 
 
 def tables(con) -> set[str]:
@@ -99,13 +110,11 @@ def load_gpu_intervals(con, present: set[str]):
     for table in GPU_TABLES:
         if table not in present:
             continue
-        cols = columns(con, table)
-        dev = "deviceId" if "deviceId" in cols else "0"
         n = 0
-        for start, end, device in con.execute(
-            f"select start, end, {dev} from {table} where end is not null"
+        for start, end in con.execute(
+            f"select start, end from {table} where end is not null"
         ):
-            out.append((start, end, device))
+            out.append((start, end))
             n += 1
         counts[table.replace("CUPTI_ACTIVITY_KIND_", "")] = n
     out.sort()
@@ -113,7 +122,6 @@ def load_gpu_intervals(con, present: set[str]):
 
 
 def merge(intervals):
-    """Union of (start, end) pairs, sorted by start."""
     merged = []
     for s, e in sorted(intervals):
         if merged and s <= merged[-1][1]:
@@ -139,30 +147,75 @@ def gaps_between(busy, lo, hi):
     return gaps
 
 
-def innermost_at(times, ranges):
-    """For each query time, the innermost range active there (sweep). Returns names list."""
-    events = []
-    for i, (s, e, name, _tid) in enumerate(ranges):
-        events.append((s, 1, i))
-        events.append((e, 0, i))
-    queries = sorted((t, 2, qi) for qi, t in enumerate(times))
-    events.sort()
-    out = [None] * len(times)
-    active: dict[int, tuple[int, str]] = {}
-    ei = 0
-    for t, _kind, qi in queries:
-        while ei < len(events) and (
-            events[ei][0] < t or (events[ei][0] == t and events[ei][1] == 1)
-        ):
-            _et, ekind, i = events[ei]
-            if ekind == 1:
-                active[i] = (ranges[i][0], ranges[i][2])
+def overlap_total(a, b):
+    """Total overlap between two sorted, merged interval lists."""
+    i = j = 0
+    total = 0
+    while i < len(a) and j < len(b):
+        s = max(a[i][0], b[j][0])
+        e = min(a[i][1], b[j][1])
+        if e > s:
+            total += e - s
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
+class LabelTimeline:
+    """Piecewise-constant innermost label (and enclosing exec label) of one thread.
+
+    Built by a sweep over range boundaries. segment k covers
+    [bounds[k], bounds[k+1]) with labels inner[k] and execl[k] (None if no
+    range is active).
+    """
+
+    def __init__(self, ranges):
+        events = []
+        for i, (s, e, _n, _t) in enumerate(ranges):
+            events.append((s, 1, i))
+            events.append((e, 0, i))
+        events.sort()
+        self.bounds, self.inner, self.execl = [], [], []
+        active: dict[int, tuple[int, str]] = {}
+        k = 0
+        while k < len(events):
+            t = events[k][0]
+            while k < len(events) and events[k][0] == t:
+                _t, kind, i = events[k]
+                if kind == 1:
+                    active[i] = (ranges[i][0], ranges[i][2])
+                else:
+                    active.pop(i, None)
+                k += 1
+            if active:
+                inner = max(active.values())[1]
+                execs = [v for v in active.values() if v[1].startswith("exec:")]
+                execl = max(execs)[1] if execs else None
             else:
-                active.pop(i, None)
-            ei += 1
-        if active:
-            out[qi] = max(active.values())[1]
-    return out
+                inner = execl = None
+            self.bounds.append(t)
+            self.inner.append(inner)
+            self.execl.append(execl)
+
+    def at(self, t):
+        k = bisect.bisect_right(self.bounds, t) - 1
+        if k < 0:
+            return None, None
+        return self.inner[k], self.execl[k]
+
+    def split(self, s, e):
+        """Yield (label, ns) pieces of [s, e) by innermost label."""
+        k = bisect.bisect_right(self.bounds, s) - 1
+        cursor = s
+        while cursor < e:
+            nxt = self.bounds[k + 1] if k + 1 < len(self.bounds) else e
+            piece_end = min(e, nxt)
+            label = self.inner[k] if k >= 0 else None
+            yield label, piece_end - cursor
+            cursor = piece_end
+            k += 1
 
 
 def pct(vals, p):
@@ -176,12 +229,31 @@ def ms(ns: float) -> float:
     return ns / 1e6
 
 
+def stats_row(vals):
+    return {
+        "count": len(vals),
+        "total_ms": ms(sum(vals)),
+        "median_ms": ms(statistics.median(vals)) if vals else 0.0,
+        "p90_ms": ms(pct(vals, 0.9)),
+    }
+
+
+def table(title, header, rows):
+    print(f"## {title}\n")
+    print("| " + " | ".join(header) + " |")
+    print("|" + "|".join("---:" if i else "---" for i in range(len(header))) + "|")
+    for r in rows:
+        print("| " + " | ".join(str(c) for c in r) + " |")
+    print()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("sqlite")
     ap.add_argument("--threshold-us", type=float, default=100.0)
-    ap.add_argument("--window", type=int, nargs=2, metavar=("START_NS", "END_NS"))
-    ap.add_argument("--trim", type=float, default=0.0)
+    ap.add_argument(
+        "--window", nargs="+", default=["exec"], metavar="exec|recv|START END"
+    )
     ap.add_argument("--json")
     args = ap.parse_args()
 
@@ -206,48 +278,80 @@ def main() -> None:
     enc_tids = [
         tid for tid, rs in by_tid.items() if any(r[2].startswith("enc:") for r in rs)
     ]
+    build_tids = [
+        tid
+        for tid, rs in by_tid.items()
+        if any(r[2] == "build:req" for r in rs) and tid != sched_tid
+    ]
     sched = by_tid[sched_tid]
-    recv_starts = [r[0] for r in sched if r[2] == "sched:recv"]
 
-    if args.window:
-        lo, hi = args.window
+    execs = [r for r in sched if r[2].startswith("exec:")]
+    if args.window == ["exec"]:
+        if not execs:
+            sys.exit(
+                "no exec:* range on the scheduler thread: nothing ran in the capture"
+            )
+        lo, hi = min(r[0] for r in execs), max(r[1] for r in execs)
+    elif args.window == ["recv"]:
+        recvs = [r for r in sched if r[2] == "sched:recv"]
+        lo, hi = recvs[0][0], max(r[1] for r in recvs)
+    elif len(args.window) == 2:
+        lo, hi = int(args.window[0]), int(args.window[1])
     else:
-        first, last = recv_starts[0], max(r[1] for r in sched if r[2] == "sched:recv")
-        span = last - first
-        lo, hi = int(first + args.trim * span), int(last - args.trim * span)
+        sys.exit("--window takes exec, recv, or START END in ns")
     window_ns = hi - lo
 
-    busy = merge(clip([(s, e) for s, e, _d in gpu], lo, hi))
+    busy = merge(clip(gpu, lo, hi))
     busy_ns = sum(e - s for s, e in busy)
     idle_ns = window_ns - busy_ns
     gaps = gaps_between(busy, lo, hi)
     thr_ns = int(args.threshold_us * 1e3)
     big = [(s, e) for s, e in gaps if e - s >= thr_ns]
-    small_ns = sum(e - s for s, e in gaps) - sum(e - s for s, e in big)
+    micro = [(s, e) for s, e in gaps if e - s < thr_ns]
 
     sched_in = [r for r in sched if r[1] > lo and r[0] < hi]
-    labels = innermost_at([s for s, _e in big], sched_in)
-    attrib = defaultdict(list)
-    for (s, e), name in zip(big, labels):
-        attrib[name or "unlabeled"].append(e - s)
+    timeline = LabelTimeline(sched_in)
+
+    big_attr = defaultdict(int)
+    big_gap_count = defaultdict(int)
+    big_gap_sizes = defaultdict(list)
+    for s, e in big:
+        seen = set()
+        for label, dur in timeline.split(s, e):
+            key = base(label) if label else "unlabeled"
+            big_attr[key] += dur
+            seen.add(key)
+        for key in seen:
+            big_gap_count[key] += 1
+            big_gap_sizes[key].append(e - s)
+
+    micro_inner = defaultdict(int)
+    micro_exec = defaultdict(int)
+    micro_count = defaultdict(int)
+    for s, e in micro:
+        inner, execl = timeline.at(s)
+        micro_inner[base(inner) if inner else "unlabeled"] += e - s
+        key = base(execl) if execl else "outside exec"
+        micro_exec[key] += e - s
+        micro_count[key] += 1
+    micro_ns = sum(e - s for s, e in micro)
+
+    recv_in = sorted(r[0] for r in sched if r[2] == "sched:recv" and lo <= r[0] < hi)
+
+    def iteration_index(t):
+        return bisect.bisect_right(recv_in, t) - 1
 
     hold_times = sorted(
         t
         for t, name, tid in marks
         if tid == sched_tid and name.startswith("sched:hold") and lo <= t < hi
     )
-    recv_in = sorted(t for t in recv_starts if lo <= t < hi)
-
-    def iteration_index(t):
-        return bisect.bisect_right(recv_in, t) - 1
-
     hold_iters = {iteration_index(t) for t in hold_times}
-    idle_in_hold_iters = sum(e - s for s, e in big if iteration_index(s) in hold_iters)
+    idle_in_hold = sum(e - s for s, e in big if iteration_index(s) in hold_iters)
 
     host = defaultdict(list)
     for s, e, name, _tid in sched_in:
-        base = name.split(" ")[0]
-        host[base].append(min(e, hi) - max(s, lo))
+        host[base(name)].append(min(e, hi) - max(s, lo))
     covered = sum(
         e - s for s, e in merge(clip([(s, e) for s, e, _n, _t in sched_in], lo, hi))
     )
@@ -260,44 +364,50 @@ def main() -> None:
             extend_bs.append(int(m.group(2)))
             extend_tok.append(int(m.group(3)))
 
-    enc_rows = []
-    enc_overlap_gap_ns = 0
-    enc_sync_overlap_exec_ns = 0
-    if enc_tids:
-        enc = [r for t in enc_tids for r in by_tid[t] if r[1] > lo and r[0] < hi]
-        enc_active = merge(clip([(s, e) for s, e, _n, _t in enc], lo, hi))
-        for s, e in big:
-            for a, b in enc_active:
-                if a < e and s < b:
-                    enc_overlap_gap_ns += min(e, b) - max(s, a)
-        exec_union = merge(
-            clip([(s, e) for s, e, n, _t in sched_in if n.startswith("exec:")], lo, hi)
+    exec_union = merge(
+        clip([(s, e) for s, e, n, _t in sched_in if n.startswith("exec:")], lo, hi)
+    )
+    big_merged = merge(big)
+
+    def other_thread_block(tids, prefix):
+        rows = {}
+        if not tids:
+            return rows, 0, 0
+        rs = [r for t in tids for r in by_tid[t] if r[1] > lo and r[0] < hi]
+        per = defaultdict(list)
+        for s, e, name, _tid in rs:
+            per[base(name)].append(min(e, hi) - max(s, lo))
+        rows = {k: stats_row(v) for k, v in sorted(per.items())}
+        active = merge(clip([(s, e) for s, e, _n, _t in rs], lo, hi))
+        return (
+            rows,
+            overlap_total(active, exec_union),
+            overlap_total(active, big_merged),
         )
-        sync = merge(clip([(s, e) for s, e, n, _t in enc if n == "enc:sync"], lo, hi))
-        for s, e in sync:
-            for a, b in exec_union:
-                if a < e and s < b:
-                    enc_sync_overlap_exec_ns += min(e, b) - max(s, a)
-        enc_host = defaultdict(list)
-        for s, e, name, _tid in enc:
-            enc_host[name.split(" ")[0]].append(e - s)
-        enc_rows = [
-            (k, len(v), ms(sum(v)), ms(statistics.median(v)), ms(pct(v, 0.9)))
-            for k, v in sorted(enc_host.items())
-        ]
+
+    enc_rows, enc_vs_exec, enc_vs_idle = other_thread_block(enc_tids, "enc:")
+    build_rows, build_vs_exec, build_vs_idle = other_thread_block(build_tids, "build:")
+    enc_sync = merge(
+        clip(
+            [(s, e) for t in enc_tids for s, e, n, _t in by_tid[t] if n == "enc:sync"],
+            lo,
+            hi,
+        )
+    )
+    enc_sync_vs_exec = overlap_total(enc_sync, exec_union) if enc_tids else 0
 
     iter_walls = [b - a for a, b in zip(recv_in, recv_in[1:])]
-    exec_starts = sorted(s for s, _e, n, _t in sched_in if n.startswith("exec:"))
+    n_iters = max(len(recv_in) - 1, 0)
     iters_with_exec = {
         i
-        for i in (iteration_index(t) for t in exec_starts)
-        if 0 <= i < max(len(recv_in) - 1, 0)
+        for i in (iteration_index(r[0]) for r in execs if lo <= r[0] < hi)
+        if 0 <= i < n_iters
     }
-    n_iters = max(len(recv_in) - 1, 0)
     no_exec_share = 1 - len(iters_with_exec) / n_iters if n_iters else 0.0
 
     out = {
         "gpu_tables": gpu_counts,
+        "window_mode": " ".join(args.window),
         "window_ns": [lo, hi],
         "window_ms": ms(window_ns),
         "gpu_busy_ms": ms(busy_ns),
@@ -305,29 +415,33 @@ def main() -> None:
         "gpu_idle_pct": 100 * idle_ns / window_ns if window_ns else 0,
         "threshold_us": args.threshold_us,
         "gaps_total": len(gaps),
-        "gaps_at_or_above_threshold": len(big),
-        "idle_below_threshold_ms": ms(small_ns),
+        "big_gaps": len(big),
+        "micro_gaps": len(micro),
+        "micro_idle_ms": ms(micro_ns),
+        "micro_idle_pct_of_idle": 100 * micro_ns / idle_ns if idle_ns else 0,
         "scheduler_threads_found": len(sched_tids),
         "encoder_threads_found": len(enc_tids),
-        "attribution": {
+        "builder_threads_found": len(build_tids),
+        "big_attribution": {
             k: {
-                "count": len(v),
-                "idle_ms": ms(sum(v)),
-                "pct_of_idle": 100 * sum(v) / idle_ns if idle_ns else 0,
-                "median_ms": ms(statistics.median(v)),
-                "p90_ms": ms(pct(v, 0.9)),
+                "gaps": big_gap_count[k],
+                "idle_ms": ms(v),
+                "pct_of_idle": 100 * v / idle_ns if idle_ns else 0,
+                "median_gap_ms": ms(statistics.median(big_gap_sizes[k])),
+                "p90_gap_ms": ms(pct(big_gap_sizes[k], 0.9)),
             }
-            for k, v in attrib.items()
+            for k, v in big_attr.items()
         },
-        "host": {
+        "micro_by_exec": {
             k: {
-                "count": len(v),
-                "total_ms": ms(sum(v)),
-                "median_ms": ms(statistics.median(v)),
-                "p90_ms": ms(pct(v, 0.9)),
+                "gaps": micro_count[k],
+                "idle_ms": ms(v),
+                "pct_of_idle": 100 * v / idle_ns if idle_ns else 0,
             }
-            for k, v in host.items()
+            for k, v in micro_exec.items()
         },
+        "micro_by_inner": {k: ms(v) for k, v in micro_inner.items()},
+        "host": {k: stats_row(v) for k, v in host.items()},
         "host_unlabeled_ms": ms(unlabeled_host_ns),
         "extend_bs_hist": dict(
             sorted((str(k), extend_bs.count(k)) for k in set(extend_bs))
@@ -336,10 +450,14 @@ def main() -> None:
         "extend_tok_p90": pct(extend_tok, 0.9) if extend_tok else None,
         "hold_marks": len(hold_times),
         "hold_iterations": len(hold_iters),
-        "idle_in_hold_iterations_ms": ms(idle_in_hold_iters),
+        "idle_in_hold_iterations_ms": ms(idle_in_hold),
         "encoder": enc_rows,
-        "idle_overlapping_encoder_ms": ms(enc_overlap_gap_ns),
-        "enc_sync_overlapping_exec_ms": ms(enc_sync_overlap_exec_ns),
+        "encoder_overlap_exec_ms": ms(enc_vs_exec),
+        "encoder_overlap_idle_ms": ms(enc_vs_idle),
+        "enc_sync_overlap_exec_ms": ms(enc_sync_vs_exec),
+        "builder": build_rows,
+        "builder_overlap_exec_ms": ms(build_vs_exec),
+        "builder_overlap_idle_ms": ms(build_vs_idle),
         "iterations": n_iters,
         "iteration_median_ms": (
             ms(statistics.median(iter_walls)) if iter_walls else None
@@ -349,43 +467,102 @@ def main() -> None:
     }
 
     print(
-        f"## Window: {ms(window_ns):.1f} ms  ({lo} .. {hi} ns); scheduler threads {len(sched_tids)}, encoder threads {len(enc_tids)}"
+        f"## Window ({out['window_mode']}): {ms(window_ns):.1f} ms  ({lo} .. {hi} ns); threads: scheduler {len(sched_tids)}, encoder {len(enc_tids)}, builder {len(build_tids)}; GPU rows {gpu_counts}"
     )
     print(
-        f"GPU busy {out['gpu_busy_ms']:.1f} ms, idle {out['gpu_idle_ms']:.1f} ms ({out['gpu_idle_pct']:.1f}%); gaps {len(gaps)}, at or above {args.threshold_us:.0f} us: {len(big)}; idle below threshold {out['idle_below_threshold_ms']:.1f} ms\n"
+        f"GPU busy {out['gpu_busy_ms']:.1f} ms, idle {out['gpu_idle_ms']:.1f} ms ({out['gpu_idle_pct']:.1f}%); gaps {len(gaps)}: {len(big)} at or above {args.threshold_us:.0f} us, {len(micro)} micro holding {out['micro_idle_ms']:.1f} ms ({out['micro_idle_pct_of_idle']:.1f}% of idle)\n"
     )
-    print("## Gap attribution (innermost scheduler-thread label at gap start)\n")
+    table(
+        "Big-gap attribution, time-weighted by innermost scheduler-thread label",
+        [
+            "label",
+            "gaps touched",
+            "idle ms",
+            "% of idle",
+            "median gap ms",
+            "p90 gap ms",
+        ],
+        [
+            (
+                k,
+                v["gaps"],
+                f"{v['idle_ms']:.1f}",
+                f"{v['pct_of_idle']:.1f}",
+                f"{v['median_gap_ms']:.3f}",
+                f"{v['p90_gap_ms']:.3f}",
+            )
+            for k, v in sorted(
+                out["big_attribution"].items(), key=lambda kv: -kv[1]["idle_ms"]
+            )
+        ],
+    )
     print(
-        "| label | gaps | idle ms | % of idle | median ms | p90 ms |\n|---|---:|---:|---:|---:|---:|"
+        f"Idle inside hold iterations: {out['idle_in_hold_iterations_ms']:.1f} ms over {len(hold_iters)} iterations ({len(hold_times)} hold marks)\n"
     )
-    for k, v in sorted(out["attribution"].items(), key=lambda kv: -kv[1]["idle_ms"]):
-        print(
-            f"| {k} | {v['count']} | {v['idle_ms']:.1f} | {v['pct_of_idle']:.1f} | {v['median_ms']:.3f} | {v['p90_ms']:.3f} |"
-        )
-    print(
-        f"\nIdle inside hold iterations: {out['idle_in_hold_iterations_ms']:.1f} ms over {len(hold_iters)} iterations ({len(hold_times)} hold marks)\n"
+    table(
+        "Micro-gap idle by enclosing exec label",
+        ["enclosing exec", "gaps", "idle ms", "% of idle"],
+        [
+            (k, v["gaps"], f"{v['idle_ms']:.1f}", f"{v['pct_of_idle']:.1f}")
+            for k, v in sorted(
+                out["micro_by_exec"].items(), key=lambda kv: -kv[1]["idle_ms"]
+            )
+        ],
     )
-    print("## Host phase totals (scheduler thread)\n")
-    print(
-        "| label | count | total ms | median ms | p90 ms |\n|---|---:|---:|---:|---:|"
+    table(
+        "Micro-gap idle by innermost label",
+        ["innermost", "idle ms"],
+        [
+            (k, f"{v:.1f}")
+            for k, v in sorted(out["micro_by_inner"].items(), key=lambda kv: -kv[1])
+        ],
     )
-    for k, v in sorted(out["host"].items(), key=lambda kv: -kv[1]["total_ms"]):
-        print(
-            f"| {k} | {v['count']} | {v['total_ms']:.1f} | {v['median_ms']:.3f} | {v['p90_ms']:.3f} |"
-        )
-    print(f"| unlabeled | | {out['host_unlabeled_ms']:.1f} | | |\n")
+    table(
+        "Host phase totals (scheduler thread)",
+        ["label", "count", "total ms", "median ms", "p90 ms"],
+        [
+            (
+                k,
+                v["count"],
+                f"{v['total_ms']:.1f}",
+                f"{v['median_ms']:.3f}",
+                f"{v['p90_ms']:.3f}",
+            )
+            for k, v in sorted(out["host"].items(), key=lambda kv: -kv[1]["total_ms"])
+        ]
+        + [("unlabeled", "", f"{out['host_unlabeled_ms']:.1f}", "", "")],
+    )
     print(
         f"## Extend batch shape: bs histogram {out['extend_bs_hist']}; tok median {out['extend_tok_median']}, p90 {out['extend_tok_p90']}\n"
     )
-    if enc_rows:
-        print(
-            "## Encoder thread\n\n| label | count | total ms | median ms | p90 ms |\n|---|---:|---:|---:|---:|"
-        )
-        for k, n, tot, med, p90 in enc_rows:
-            print(f"| {k} | {n} | {tot:.1f} | {med:.3f} | {p90:.3f} |")
-        print(
-            f"\nIdle overlapping an encoder range: {out['idle_overlapping_encoder_ms']:.1f} ms; enc:sync overlapping scheduler exec: {out['enc_sync_overlapping_exec_ms']:.1f} ms\n"
-        )
+    for name, rows, vs_exec, vs_idle in (
+        ("Encoder thread", enc_rows, enc_vs_exec, enc_vs_idle),
+        ("Builder thread", build_rows, build_vs_exec, build_vs_idle),
+    ):
+        if rows:
+            table(
+                name,
+                ["label", "count", "total ms", "median ms", "p90 ms"],
+                [
+                    (
+                        k,
+                        v["count"],
+                        f"{v['total_ms']:.1f}",
+                        f"{v['median_ms']:.3f}",
+                        f"{v['p90_ms']:.3f}",
+                    )
+                    for k, v in rows.items()
+                ],
+            )
+            print(
+                f"{name} active during scheduler exec: {ms(vs_exec):.1f} ms; during big idle gaps: {ms(vs_idle):.1f} ms"
+                + (
+                    f"; enc:sync during exec: {ms(enc_sync_vs_exec):.1f} ms"
+                    if name.startswith("Encoder")
+                    else ""
+                )
+                + "\n"
+            )
     print(
         f"## Iterations: {n_iters}; wall median {out['iteration_median_ms']} ms, p90 {out['iteration_p90_ms']} ms; without any exec range: {out['iterations_without_exec_pct']:.1f}%"
     )
