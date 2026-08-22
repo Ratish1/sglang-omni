@@ -33,8 +33,10 @@ python ../omni-profile/profile/checks/check_attribution_local.py
 ```
 
 Both print `... CHECK PASSED`. On a CUDA box the first one reports
-`backend=nvtx`; the check only asserts on the recorder backend, so read the
-`installed=22 missing=none` line and move on.
+`backend=nvtx` and skips the recorder-only assertions; the line that
+matters is `installed=22 missing=none`. Its idle-iteration part needs the
+repo's unit-test constructor to import; when it does not, it prints
+SKIPPED with the reason and the check still passes on the rest.
 
 ## 1. Arms and fixed factors
 
