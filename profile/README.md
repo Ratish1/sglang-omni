@@ -44,7 +44,18 @@ SKIPPED with the reason and the check still passes on the rest.
 |---|---|---|---|
 | A | upstream/main `2494125c9` | none | the shipped loop |
 | A0 | same | `--prefill-coalesce-requests 1` | the loop with the hold-off removed |
-| B | `prefill-launch-first` `10f7f2570` | none | the launch-first loop |
+| B | `launch-first-rebased` (the five launch-first commits on `2494125c9`) | none | the launch-first loop |
+
+`prefill-launch-first` at `10f7f2570` is on base `24e9a3552` and must not
+be compared with `2494125c9`: it lacks main's Qwen3-ASR encoder CUDA graph
+(#1633), the encoder overlap (#1569) and the pinned cache (#1591).
+
+Shared base, verified before any A/B (added 2026-08-22 after a campaign
+was lost to mismatched bases): both arms must descend from the same base
+commit, checked with `git merge-base --is-ancestor <base> <arm>` for each
+arm, and the base hash goes in the report. A branch cut from an older
+main is rebased first; comparing it against current main measures main's
+intervening commits, not the branch.
 
 Fixed across arms (do not vary; record the launch line in the result):
 
@@ -167,6 +178,11 @@ Two questions, in order: is the loss real without nsys; and is the
 coupling the GIL. Four fresh servers, all Qwen3-ASR c32, cold-pass rule as
 in section 1 (no warmup, `--repeats 1`, one pass per server).
 
+Outcome (2026-08-22): run as written with B = `10f7f2570`, which is on an
+older base; the A/B numbers were confounded and are retracted
+(tasks/loop_profile_campaign3_results_20260822.md). The GIL tables for A
+stand. Section 6 is the fair rerun.
+
 `profile/gil/aggregate_pyspy_raw.py` turns a py-spy raw recording into a
 per-thread GIL share table. py-spy: `pip install py-spy` in any venv (it
 is a static binary) and ptrace permission: run it with sudo, or
@@ -240,3 +256,26 @@ every process. Two extra clean A c32 servers: `0.0005` and `0.05` against
 the default `0.005` from 5.1. If req/s moves by more than the single-pass
 spread, GIL scheduling is load bearing on A too, and the direction says
 whether the scheduler thread or the builders are starved.
+
+## 6. Campaign 4: fair launch-first test (cold, clean)
+
+Arms: A = `2494125c9`; B = `launch-first-rebased` (five commits on
+`2494125c9`). Verify before starting:
+
+```bash
+git merge-base --is-ancestor 2494125c9 launch-first-rebased && echo base-ok
+git log --oneline 2494125c9..launch-first-rebased | wc -l      # 5
+test -f sglang_omni/models/qwen3_asr/encoder_cuda_graph.py && echo encoder-graph-ok
+```
+
+Cells: c32 and c8, A then B, one fresh server per cell, clean (no nsys,
+no probe, no PYTHONPATH), commands as in 5.1. Four servers. Report req/s,
+p50, p95, WER per cell.
+
+Reading, fixed in advance: launch-first was measured at +3.4 (c16) and
++4.9 percent (c32) on its own base in the cached regime; in the cold
+regime its benefit is the extend resolve moved off the critical path
+(13 ms total over 122 extends in the cold capture), so the expected gain
+is small. B above A by more than about 3 percent at c32 with c8 not
+worse: step 3 reopens for the three reads. Anything less: step 3 closes
+as no measurable gain in the real regime and the branch is archived.
