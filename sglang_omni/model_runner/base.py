@@ -8,6 +8,7 @@ pass, sampling, logit post-processing, and output extraction.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import cached_property
 from typing import Any
 
 import torch
@@ -717,11 +718,39 @@ class ModelRunner:
         output-history sampling gate applies. A runner with custom prefill
         semantics is ineligible by construction and may override to opt in once
         it provides ``post_prefill_launch`` / ``post_prefill_resolve``.
+
+        Additionally the runner's prefill must be graph-backed: launching an
+        eager prefill into the lookahead spends its full Python dispatch cost
+        on the scheduler thread before any overlap is bought.
         """
         return (
-            self._prefill_hooks_are_default()
+            self._has_graph_backed_prefill
+            and self._prefill_hooks_are_default()
             and not batch.is_prefill_only
             and self.lookahead_eligible(batch)
+        )
+
+    @cached_property
+    def _has_graph_backed_prefill(self) -> bool:
+        """Whether SGLang resolved this runner's prefill to a captured CUDA
+        graph. Cached: the capture outcome is fixed once serving starts, and
+        this is read per extend batch in the scheduler loop.
+
+        Launch-first only pays off when the launch half is a cheap graph
+        replay. With prefill graphs disabled, SGLang resolves the attribute to
+        the EagerRunner, whose launch spends its full Python dispatch cost on
+        the scheduler thread and can be force-drained before it buys any
+        overlap, so eager runners keep the synchronous path. A batch that misses the captured shapes still falls
+        back to eager inside the forward; this gate is the static capability,
+        not a per-batch guarantee.
+        """
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            PrefillCudaGraphRunner,
+        )
+
+        return isinstance(
+            self.tp_worker.model_runner.prefill_cuda_graph_runner,
+            PrefillCudaGraphRunner,
         )
 
     def _prefill_hooks_are_default(self) -> bool:

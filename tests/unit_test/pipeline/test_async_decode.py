@@ -38,6 +38,7 @@ class _StubRunner(ModelRunner):
     def __init__(self):
         self.device = _STUB_DEVICE
         self._async_enabled = True
+        self._has_graph_backed_prefill = True
         self._execution_bridge = FakeExecutionBridge(_STUB_DEVICE)
         self._staging_slot = 0
         self._host_staging_buffers = []
@@ -455,6 +456,7 @@ class _PlainPrefillRunner(ModelRunner):
     def __init__(self):
         self.device = _STUB_DEVICE
         self._async_enabled = True
+        self._has_graph_backed_prefill = True
         self._execution_bridge = FakeExecutionBridge(_STUB_DEVICE)
         self._staging_slot = 0
         self._host_staging_buffers = []
@@ -608,6 +610,35 @@ def test_prefill_lookahead_eligible_gates_sampling_history_and_prefill_only():
     assert r.prefill_lookahead_eligible(free_batch) is True
     assert r.prefill_lookahead_eligible(penalized_batch) is False
     assert r.prefill_lookahead_eligible(prefill_only_batch) is False
+
+
+def test_prefill_lookahead_requires_graph_backed_prefill():
+    r = _PlainPrefillRunner()
+    r._has_graph_backed_prefill = False
+    free_batch = types.SimpleNamespace(
+        reqs=[types.SimpleNamespace(sampling_params=_HISTORY_FREE)],
+        is_prefill_only=False,
+    )
+    assert r.prefill_lookahead_eligible(free_batch) is False
+
+
+def test_graph_backed_prefill_resolves_from_the_sglang_runner():
+    graph_mod = pytest.importorskip(
+        "sglang.srt.model_executor.runner.prefill_cuda_graph_runner"
+    )
+    eager_mod = pytest.importorskip("sglang.srt.model_executor.runner.eager_runner")
+
+    def resolved(prefill_runner):
+        r = _PlainPrefillRunner()
+        del r._has_graph_backed_prefill
+        r.tp_worker = types.SimpleNamespace(
+            model_runner=types.SimpleNamespace(prefill_cuda_graph_runner=prefill_runner)
+        )
+        return r._has_graph_backed_prefill
+
+    assert resolved(object.__new__(graph_mod.PrefillCudaGraphRunner)) is True
+    assert resolved(object.__new__(eager_mod.EagerRunner)) is False
+    assert resolved(None) is False
 
 
 def _real_radix_pools(size=64):
