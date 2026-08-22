@@ -157,3 +157,86 @@ client `.json`, the server log. Send back the `.attr.md` files, the client
 req/s lines, and the `[nvtx-probe]` lines from the server logs. The Mac
 side writes tasks/loop_profile_results_<date>.md and takes the decision
 from plan section 6 plus the bubble rule added on 2026-08-22.
+
+## 5. Campaign 3: unprofiled A vs B, and GIL attribution (2026-08-22)
+
+Why: the cold campaign (tasks/loop_profile_cold_results_20260822.md)
+found B at 130 req/s vs A at 210 at c32, builder bound (8 workers / 60.9 ms
+build = 131), with the builder and encoder threads 3 to 4x slower under B.
+Two questions, in order: is the loss real without nsys; and is the
+coupling the GIL. Four fresh servers, all Qwen3-ASR c32, cold-pass rule as
+in section 1 (no warmup, `--repeats 1`, one pass per server).
+
+`profile/gil/aggregate_pyspy_raw.py` turns a py-spy raw recording into a
+per-thread GIL share table. py-spy: `pip install py-spy` in any venv (it
+is a static binary) and ptrace permission: run it with sudo, or
+`echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope` once.
+
+### 5.1 Clean req/s, A then B (no nsys, no probe, no PYTHONPATH)
+
+```bash
+for ARM in A B; do                       # A: 2494125c9, B: 10f7f2570
+  git checkout <arm checkout>
+  R=$OUT/c3_${ARM}_c32_clean
+  python -m sglang_omni.cli serve --model-path "$MODEL_PATH" --model-name Qwen/Qwen3-ASR-1.7B --port 8000 \
+    <same extra flags as before> 2>&1 | tee $R.server.log &
+  # wait for ready
+  python -m benchmarks.eval.benchmark_asr_seedtts --port 8000 --concurrencies 32 --repeats 1 \
+    --max-samples 0 --lang en --dataset-revision 27f4c1adee83b5b29b7c4b375f6b976324bda308 \
+    --model-revision 7278e1e70fe206f11671096ffdd38061171dd6e5 --output $R.client.json
+  # stop the server
+done
+```
+
+Report: req/s and p50/p95 for A and B. This alone closes step 3 of the
+work order: B at or below A retires it; B above A by more than the
+single-pass spread reopens the nsys-artefact question.
+
+### 5.2 GIL share per thread, A then B (py-spy, probe env on for the pid line)
+
+The probe env is set only so the server log prints the LM stage pid
+(`[nvtx-probe] ... pid=NNN`); without nsys attached the NVTX calls are
+no-ops. py-spy samples at 200 Hz with `--gil`, which records a sample only
+when some thread holds the GIL.
+
+```bash
+for ARM in A B; do
+  git checkout <arm checkout>
+  export OMNI_NVTX_PROBE=1 PYTHONPATH=$PROBE_DIR${PYTHONPATH:+:$PYTHONPATH}
+  R=$OUT/c3_${ARM}_c32_gil
+  python -m sglang_omni.cli serve ... 2>&1 | tee $R.server.log &
+  # wait for ready; then
+  PID=$(grep -o 'nvtx-probe\] backend=nvtx pid=[0-9]*' $R.server.log | tail -1 | grep -o '[0-9]*$')
+  DUR=20                                 # c32 pass is about 6 s on A, 9 s on B; 20 s covers it
+  sudo py-spy record --pid $PID --gil --threads --format raw --rate 200 --duration $DUR -o $R.gil.raw &
+  sleep 1
+  python -m benchmarks.eval.benchmark_asr_seedtts --port 8000 --concurrencies 32 --repeats 1 \
+    --max-samples 0 --lang en --dataset-revision 27f4c1adee83b5b29b7c4b375f6b976324bda308 \
+    --model-revision 7278e1e70fe206f11671096ffdd38061171dd6e5 --output $R.client.json
+  wait                                   # py-spy finishes its duration
+  python $(dirname $ATTR)/gil/aggregate_pyspy_raw.py $R.gil.raw --rate 200 --duration $DUR > $R.gil.md
+  unset OMNI_NVTX_PROBE
+  # stop the server
+done
+```
+
+Because the recording window (20 s) is longer than the pass, the "share
+of wall" column is diluted by the idle tail; read the "share of GIL-held
+time" column, and the first line's held-by-anyone percentage as a lower
+bound. Threads to expect: `scheduler-<stage>`, `omni-request-build_0..7`,
+`qwen3-asr-audio-encode`, the asyncio main thread and its default
+executor threads.
+
+Report: the two `.gil.md` files. The reading: if `scheduler-*` holds a
+much larger share of GIL time on B than on A while the builders' share
+shrinks, the coupling is the GIL; if the shares are similar on both arms,
+the coupling is not the GIL (GPU stream contention is next).
+
+### 5.3 Optional: switch-interval sweep on A (cheap second method)
+
+`OMNI_SWITCH_INTERVAL=<seconds>` in the server environment (with
+`PYTHONPATH=$PROBE_DIR`, probe env unset) sets `sys.setswitchinterval` in
+every process. Two extra clean A c32 servers: `0.0005` and `0.05` against
+the default `0.005` from 5.1. If req/s moves by more than the single-pass
+spread, GIL scheduling is load bearing on A too, and the direction says
+whether the scheduler thread or the builders are starved.
