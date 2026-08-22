@@ -232,6 +232,7 @@ def test_omni_scheduler_flush_cache_has_upstream_idle_compat_fields() -> None:
             enable_hisparse=False,
             enable_priority_scheduling=False,
             disable_priority_preemption=False,
+            enable_unified_memory=False,
         ),
     )
     scheduler.running_batch = EmptyBatch()
