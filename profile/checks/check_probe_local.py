@@ -28,6 +28,7 @@ from sglang_omni.scheduling import omni_scheduler as omni_mod
 
 assert not probe.missing, probe.missing
 print(f"backend={probe.backend_name} installed={len(probe.installed)} missing=none")
+assert len(probe.installed) >= 45, probe.installed
 recorder = probe.backend if probe.backend_name == "recorder" else None
 
 

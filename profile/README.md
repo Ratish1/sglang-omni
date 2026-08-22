@@ -279,3 +279,59 @@ regime its benefit is the extend resolve moved off the critical path
 is small. B above A by more than about 3 percent at c32 with c8 not
 worse: step 3 reopens for the three reads. Anything less: step 3 closes
 as no measurable gain in the real regime and the branch is archived.
+
+## 7. Campaign 5: inside the decode step and the extend (main, cold, c32 and c8)
+
+Why: on main the GPU idle at c32 is 62 percent decode path and 25 percent
+extend path, and the scheduler thread spends about 70 percent of its
+time in C++ dispatch with the GIL released (campaign 3). The question is
+which phase issues the launches: 56 eager kernels per decode step and
+about 182 launch bubbles per extend. Findings are acted on at omni-owned
+seams (sglang is a pinned dependency), so every phase below is labeled by
+side: `run:` and `bridge:` are omni, `sgl:` is upstream, `sched:` is the
+loop.
+
+The probe now carries 45 wrappers (22 from before plus the launch
+internals). New labels, all nested inside `exec:launch:decode` /
+`exec:sync:extend`:
+
+| side | label | wraps |
+|---|---|---|
+| omni | run:before_decode, run:before_prefill | runner hooks |
+| omni | run:fwd_call | ModelWorker.forward_batch_generation |
+| sgl | sgl:forward | ModelRunner.forward |
+| sgl | sgl:decode_can_run, sgl:decode_load_batch, sgl:decode_graph | DecodeCudaGraphRunner can_run_graph, load_batch, execute |
+| sgl | sgl:prefill_can_run, sgl:prefill_load_batch, sgl:prefill_graph | PrefillCudaGraphRunner same |
+| sgl | sgl:attn_meta | the concrete attention backend's init_forward_metadata (wrapped on first forward; the log prints which backend) |
+| omni | run:sample, run:rep_penalty, run:suppress, run:seeds | omni's sampler wrapper and its three pre-steps |
+| sgl | sgl:sample | ModelRunner.sample |
+| omni | run:post_launch, run:post_decode, run:post_prefill | post hooks (default post_decode_launch does the pinned copy) |
+| omni | run:publish, bridge:publish, bridge:record_event | FutureMap stash and the completion event |
+| sched | sched:batch_copy | ScheduleBatch.copy |
+| omni | run:resolve | execute_resolve |
+
+The analysis gains one table: CUDA launches by innermost label, from the
+RUNTIME correlation rows: API calls, API host ms, GPU rows launched by
+kind, GPU ms of those rows. Divide a decode-path row by the window's
+decode steps (printed in the title) for the per-step view.
+
+Cells: A = `2494125c9` only, c32 and c8, one cold pass each, two servers.
+Same commands as section 2 with one change: `--cuda-graph-trace=node` on
+`nsys launch`, so the kernels inside a graph replay are rows and the
+per-phase kernel counts are complete. Expect a larger `.nsys-rep`.
+
+```bash
+nsys launch --trace=cuda,nvtx --cuda-graph-trace=node -- python -m sglang_omni.cli serve ...
+nsys start --sample=none --cpuctxsw=none -o $R
+...
+python $ATTR $R.sqlite --json $R.attr.json > $R.attr.md
+```
+
+Confirm in the server log: `installed=45 missing=none` and one line
+`[nvtx-probe] attention backend wrapped: <Backend>`.
+
+Report: the two `.attr.md` files. Reading: the launch table answers, per
+phase, how many API calls and how many GPU rows one decode step and one
+extend issue, and the micro-gap table says where the bubbles sit. Each
+omni-side row with a large count is a candidate seam; each sgl-side row
+is a configuration question against the pinned sglang, not a patch.

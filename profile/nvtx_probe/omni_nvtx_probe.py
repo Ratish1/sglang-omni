@@ -114,6 +114,17 @@ def _wrap(cls, attr: str, label) -> None:
     installed.append(f"{target}")
 
 
+def _wrap_defining_class(obj, attr: str, label) -> None:
+    """Wrap attr on the class in obj's MRO that defines it (an override on a
+    subclass, or the base); used for objects whose concrete type is only
+    known at runtime."""
+    for cls in type(obj).__mro__:
+        if attr in cls.__dict__:
+            _wrap(cls, attr, label)
+            return
+    missing.append(f"{type(obj).__name__}.{attr}")
+
+
 def _batch_kind(batch) -> str:
     mode = batch.forward_mode
     if mode is None:
@@ -185,10 +196,88 @@ def _install_scheduler(omni_mod, upstream_mod, schedule_batch_mod) -> None:
 
 
 def _install_runner(base_mod) -> None:
+    """Omni runner phases (prefix run:) inside one launch or sync step."""
     R = base_mod.ModelRunner
     _wrap(R, "_build_forward_batch", "run:build")
     _wrap(R, "_prepare_and_forward", "run:forward")
     _wrap(R, "_finalize", "run:finalize")
+    _wrap(R, "before_decode", "run:before_decode")
+    _wrap(R, "before_prefill", "run:before_prefill")
+    _wrap(R, "_sample_next_token_ids", "run:sample")
+    _wrap(R, "_apply_repetition_penalty", "run:rep_penalty")
+    _wrap(R, "_apply_codec_suppress_tokens", "run:suppress")
+    _wrap(R, "_install_sampling_seeds", "run:seeds")
+    _wrap(R, "post_decode_launch", "run:post_launch")
+    _wrap(R, "post_decode", "run:post_decode")
+    _wrap(R, "post_prefill", "run:post_prefill")
+    _wrap(R, "_publish_next_tokens", "run:publish")
+    _wrap(R, "execute_resolve", "run:resolve")
+
+
+def _install_bridge(exec_mod, worker_mod) -> None:
+    """The omni to sglang bridge: input resolution, event, forward call."""
+    B = exec_mod.__dict__.get("SGLangExecutionBridge") or next(
+        (
+            v
+            for k, v in exec_mod.__dict__.items()
+            if k.endswith("Bridge") and isinstance(v, type)
+        ),
+        None,
+    )
+    if B is None:
+        missing.append("sglang_execution.*Bridge")
+    else:
+        _wrap(B, "publish_next_tokens", "bridge:publish")
+        _wrap(B, "record_completion", "bridge:record_event")
+    W = worker_mod.ModelWorker
+    _wrap(W, "forward_batch_generation", "run:fwd_call")
+
+
+def _install_sglang(
+    model_runner_mod, decode_runner_mod, prefill_runner_mod, schedule_batch_mod
+) -> None:
+    """Upstream phases (prefix sgl:), wrapped for attribution only; the
+    pinned sglang is never patched, these ranges live in the probe."""
+    MR = model_runner_mod.ModelRunner
+    _wrap(MR, "sample", "sgl:sample")
+
+    # The attention backend is chosen at runtime and overrides the abstract
+    # base method, so its concrete class is wrapped on the first forward.
+    forward = MR.__dict__.get("forward")
+    if forward is None:
+        missing.append("ModelRunner.forward")
+    else:
+        state = {"done": False}
+
+        @functools.wraps(forward)
+        def forward_wrapper(self, *args, **kwargs):
+            if not state["done"]:
+                state["done"] = True
+                _wrap_defining_class(
+                    self.attn_backend, "init_forward_metadata", "sgl:attn_meta"
+                )
+                logger.warning(
+                    "[nvtx-probe] attention backend wrapped: %s",
+                    type(self.attn_backend).__name__,
+                )
+            backend.push("sgl:forward")
+            try:
+                return forward(self, *args, **kwargs)
+            finally:
+                backend.pop()
+
+        MR.forward = forward_wrapper
+        installed.append("ModelRunner.forward")
+    D = decode_runner_mod.DecodeCudaGraphRunner
+    _wrap(D, "execute", "sgl:decode_graph")
+    _wrap(D, "can_run_graph", "sgl:decode_can_run")
+    _wrap(D, "load_batch", "sgl:decode_load_batch")
+    P = prefill_runner_mod.PrefillCudaGraphRunner
+    _wrap(P, "execute", "sgl:prefill_graph")
+    _wrap(P, "can_run_graph", "sgl:prefill_can_run")
+    _wrap(P, "load_batch", "sgl:prefill_load_batch")
+    SB = schedule_batch_mod.ScheduleBatch
+    _wrap(SB, "copy", "sched:batch_copy")
 
 
 def _install_encoder(pre_lm_mod) -> None:
@@ -214,13 +303,26 @@ def install() -> None:
     _done = True
     from sglang.srt.managers import schedule_batch as schedule_batch_mod
     from sglang.srt.managers import scheduler as upstream_mod
+    from sglang.srt.model_executor import model_runner as model_runner_mod
+    from sglang.srt.model_executor.runner import (
+        decode_cuda_graph_runner as decode_runner_mod,
+    )
+    from sglang.srt.model_executor.runner import (
+        prefill_cuda_graph_runner as prefill_runner_mod,
+    )
 
     from sglang_omni.model_runner import base as base_mod
+    from sglang_omni.model_runner import model_worker as worker_mod
+    from sglang_omni.model_runner import sglang_execution as exec_mod
     from sglang_omni.scheduling import omni_scheduler as omni_mod
     from sglang_omni.scheduling import pre_lm_encoder as pre_lm_mod
 
     _install_scheduler(omni_mod, upstream_mod, schedule_batch_mod)
     _install_runner(base_mod)
+    _install_bridge(exec_mod, worker_mod)
+    _install_sglang(
+        model_runner_mod, decode_runner_mod, prefill_runner_mod, schedule_batch_mod
+    )
     _install_encoder(pre_lm_mod)
     logger.warning(
         "[nvtx-probe] backend=%s pid=%d installed=%d missing=%s",

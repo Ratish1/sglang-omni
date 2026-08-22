@@ -22,6 +22,9 @@ Definitions:
               a step); attributed to the innermost label at its start and
               to the enclosing exec:* label, if any
   iteration   the interval between consecutive sched:recv starts
+  launches    every host CUDA API call on the scheduler thread (RUNTIME
+              rows) and every GPU row it issued (by correlationId), counted
+              under the innermost label active at the call
 Labels are aggregated by base name (the text before the first space), so
 exec:launch:decode bs=16 and bs=17 are one row; the extend shape has its
 own histogram.
@@ -37,7 +40,7 @@ import re
 import sqlite3
 import statistics
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 PUSHPOP = "NvtxPushPopRange"
 STARTEND = "NvtxStartEndRange"
@@ -97,6 +100,39 @@ def load_nvtx(con, present: set[str]):
     ranges.sort()
     marks.sort()
     return ranges, marks
+
+
+def load_runtime(con, present: set[str]):
+    """Host-side CUDA API calls: correlationId -> (start, end, tid).
+
+    Recorded by --trace=cuda. Each kernel, memcpy, memset and graph launch
+    row carries the correlationId of the API call that issued it, which is
+    how a GPU row is attributed to the host phase that launched it.
+    """
+    table = "CUPTI_ACTIVITY_KIND_RUNTIME"
+    if table not in present or "correlationId" not in columns(con, table):
+        return {}
+    return {
+        cid: (start, end, tid)
+        for start, end, cid, tid in con.execute(
+            f"select start, end, correlationId, globalTid from {table}"
+        )
+    }
+
+
+def load_gpu_rows(con, present: set[str]):
+    """(start, end, correlationId or None, table) for every GPU row."""
+    out = []
+    for table in GPU_TABLES:
+        if table not in present:
+            continue
+        cid = "correlationId" if "correlationId" in columns(con, table) else "NULL"
+        short = table.replace("CUPTI_ACTIVITY_KIND_", "")
+        for start, end, c in con.execute(
+            f"select start, end, {cid} from {table} where end is not null"
+        ):
+            out.append((start, end, c, short))
+    return out
 
 
 def load_gpu_intervals(con, present: set[str]):
@@ -336,6 +372,44 @@ def main() -> None:
         micro_count[key] += 1
     micro_ns = sum(e - s for s, e in micro)
 
+    runtime = load_runtime(con, present)
+    gpu_rows = load_gpu_rows(con, present) if runtime else []
+    launches = defaultdict(
+        lambda: {"api_calls": 0, "api_ns": 0, "rows": Counter(), "gpu_ns": 0}
+    )
+    for cid, (a_s, a_e, tid) in runtime.items():
+        if tid != sched_tid or a_s < lo or a_s >= hi:
+            continue
+        inner, _execl = timeline.at(a_s)
+        key = base(inner) if inner else "unlabeled"
+        launches[key]["api_calls"] += 1
+        launches[key]["api_ns"] += a_e - a_s
+    for g_s, g_e, cid, short in gpu_rows:
+        if cid is None or cid not in runtime:
+            continue
+        a_s, _a_e, tid = runtime[cid]
+        if tid != sched_tid or a_s < lo or a_s >= hi:
+            continue
+        inner, _execl = timeline.at(a_s)
+        key = base(inner) if inner else "unlabeled"
+        launches[key]["rows"][short] += 1
+        launches[key]["gpu_ns"] += g_e - g_s
+    n_decode_steps = sum(
+        1 for r in sched_in if base(r[2]) in ("exec:launch:decode", "exec:sync:decode")
+    )
+    n_extends = sum(
+        1 for r in sched_in if base(r[2]) in ("exec:sync:extend", "exec:launch:extend")
+    )
+    per_label = {
+        key: {
+            "api_calls": v["api_calls"],
+            "api_ms": ms(v["api_ns"]),
+            "gpu_rows": dict(v["rows"]),
+            "gpu_ms": ms(v["gpu_ns"]),
+        }
+        for key, v in launches.items()
+    }
+
     recv_in = sorted(r[0] for r in sched if r[2] == "sched:recv" and lo <= r[0] < hi)
 
     def iteration_index(t):
@@ -458,6 +532,10 @@ def main() -> None:
         "builder": build_rows,
         "builder_overlap_exec_ms": ms(build_vs_exec),
         "builder_overlap_idle_ms": ms(build_vs_idle),
+        "decode_steps": n_decode_steps,
+        "extends": n_extends,
+        "runtime_rows_found": len(runtime),
+        "launches_by_label": per_label,
         "iterations": n_iters,
         "iteration_median_ms": (
             ms(statistics.median(iter_walls)) if iter_walls else None
@@ -535,6 +613,31 @@ def main() -> None:
     print(
         f"## Extend batch shape: bs histogram {out['extend_bs_hist']}; tok median {out['extend_tok_median']}, p90 {out['extend_tok_p90']}\n"
     )
+    if runtime:
+        rows = []
+        for key, v in sorted(per_label.items(), key=lambda kv: -kv[1]["api_calls"]):
+            kinds = ", ".join(f"{k} {n}" for k, n in sorted(v["gpu_rows"].items()))
+            rows.append(
+                (key, v["api_calls"], f"{v['api_ms']:.1f}", kinds, f"{v['gpu_ms']:.1f}")
+            )
+        table(
+            f"CUDA launches by innermost scheduler-thread label ({n_decode_steps} decode steps, {n_extends} extends in window)",
+            [
+                "label",
+                "API calls",
+                "API host ms",
+                "GPU rows launched",
+                "GPU ms of those rows",
+            ],
+            rows,
+        )
+        print(
+            "Per-step view: divide a decode-path row by decode steps and an extend-path row by extends; API host ms is time inside the CUDA runtime calls on the scheduler thread.\n"
+        )
+    else:
+        print(
+            "## CUDA launches by label: no CUPTI_ACTIVITY_KIND_RUNTIME rows (needs --trace=cuda); skipped\n"
+        )
     for name, rows, vs_exec, vs_idle in (
         ("Encoder thread", enc_rows, enc_vs_exec, enc_vs_idle),
         ("Builder thread", build_rows, build_vs_exec, build_vs_idle),
