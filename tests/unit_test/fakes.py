@@ -40,3 +40,38 @@ class FakeServerArgs(SimpleNamespace):
         del source
         for name, value in fields.items():
             setattr(self, name, value)
+
+
+def real_radix_pools(size: int = 64):
+    """CPU-resident upstream KV allocator, request pool and radix cache."""
+    import torch
+    from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+    from sglang.srt.mem_cache.radix_cache import RadixCache
+
+    kv = MHATokenToKVPool(
+        size=size,
+        page_size=1,
+        dtype=torch.float16,
+        head_num=1,
+        head_dim=8,
+        layer_num=1,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+    allocator = TokenToKVPoolAllocator(
+        size=size, dtype=torch.float16, device="cpu", kvcache=kv, need_sort=False
+    )
+    req_to_token_pool = ReqToTokenPool(
+        size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+    )
+    cache = RadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+        )
+    )
+    return allocator, req_to_token_pool, cache

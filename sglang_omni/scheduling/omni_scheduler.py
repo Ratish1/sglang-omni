@@ -564,6 +564,8 @@ class OmniScheduler:
         # init_req_max_new_tokens() clamps against this one.
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.cur_batch_for_debug = None
+        # on_idle() reads this before its opportunistic allocator flush.
+        self.enable_unified_memory = bool(server_args.enable_unified_memory)
         # get_next_batch_to_run() calls prepare_for_forward() on this
         # unconditionally, so it must be a real manager, not None. Upstream
         # takes it from the model runner; no Omni model uses ngram embedding
@@ -719,15 +721,20 @@ class OmniScheduler:
             output_streamer=self.output_streamer,
             abort_request=lambda request: self.abort(request.rid),
         )
+        # Borrowed from upstream through __getattr__. Builds
+        # SchedulerInvariantChecker over the pools wired above; on_idle() and
+        # the strict busy check read it.
+        self.init_invariant_checker()
 
     def self_check_during_idle(self) -> None:
-        self.new_token_ratio_tracker.reset()
-        idle_sleeper = self.idle_sleeper
-        if idle_sleeper is not None:
-            idle_sleeper.maybe_sleep()
-
-    def self_check_during_busy(self) -> None:
-        return None
+        """Idle hook for the event loops; subclasses gate it on their own
+        readiness. Delegates to upstream on_idle(): the is_fully_idle guard,
+        pool and request-slot leak checks, tree-cache check, idle metrics,
+        token-ratio reset and device-timer window reset. Its sleep step is a
+        no-op here (idle_sleeper is None); the loops sleep via
+        _sleep_during_idle instead.
+        """
+        self.on_idle()
 
     # ------------------------------------------------------------------
     # Composition: delegate missing attributes to the upstream class
@@ -2353,7 +2360,7 @@ class OmniScheduler:
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.self_check_during_busy()
+                self.invariant_checker.self_check_during_busy()
 
     def _event_loop_overlap(self) -> None:
         # Model runners read Req.inflight_middle_chunks at forward time under
@@ -2621,7 +2628,7 @@ class OmniScheduler:
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.self_check_during_busy()
+                self.invariant_checker.self_check_during_busy()
 
     def _drain_inbox_for_request(self, request_id: str) -> None:
         retained: list[IncomingMessage] = []

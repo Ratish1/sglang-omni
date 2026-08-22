@@ -27,7 +27,7 @@ from sglang_omni.scheduling.types import (
     RequestOutput,
     SchedulerOutput,
 )
-from tests.unit_test.fakes import FakeExecutionBridge
+from tests.unit_test.fakes import FakeExecutionBridge, real_radix_pools
 
 _STUB_DEVICE = torch.device("cpu")
 
@@ -451,39 +451,6 @@ def test_default_launch_staging_grows_then_slices_to_smaller_batch():
     assert small.next_token_ids.tolist() == [7, 8]
 
 
-def _real_radix_pools(size=64):
-    from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-    from sglang.srt.mem_cache.radix_cache import RadixCache
-
-    kv = MHATokenToKVPool(
-        size=size,
-        page_size=1,
-        dtype=torch.float16,
-        head_num=1,
-        head_dim=8,
-        layer_num=1,
-        device="cpu",
-        enable_memory_saver=False,
-    )
-    allocator = TokenToKVPoolAllocator(
-        size=size, dtype=torch.float16, device="cpu", kvcache=kv, need_sort=False
-    )
-    req_to_token_pool = ReqToTokenPool(
-        size=4, max_context_len=64, device="cpu", enable_memory_saver=False
-    )
-    cache = RadixCache(
-        CacheInitParams(
-            disable=False,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=1,
-        )
-    )
-    return allocator, req_to_token_pool, cache
-
-
 def _decoding_req(allocator, req_to_token_pool, rid, prompt, outputs):
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.sampling.sampling_params import SamplingParams
@@ -522,6 +489,9 @@ class _StaleDecodeBatch:
         self.forward_mode = ForwardMode.DECODE
         self.decoding_reqs = None
 
+    def is_empty(self):
+        return not self.reqs
+
     def filter_batch(self, keep_indices=None):
         self.reqs = [self.reqs[i] for i in keep_indices]
         self.out_cache_loc = None
@@ -534,7 +504,7 @@ def test_drop_stale_overrun_leaves_drained_rows_single_owned():
     from sglang.srt.runtime_context import get_context
 
     with get_context().override_server_args(page_size=1):
-        allocator, req_to_token_pool, cache = _real_radix_pools()
+        allocator, req_to_token_pool, cache = real_radix_pools()
         total = allocator.available_size()
         survivor = _decoding_req(allocator, req_to_token_pool, "s", [1, 2], [20])
         finished = _decoding_req(allocator, req_to_token_pool, "f", [3, 4], [30, 31])
@@ -587,6 +557,90 @@ def test_drop_stale_overrun_leaves_drained_rows_single_owned():
         )
         clean = _StaleDecodeBatch([survivor], torch.tensor(step_slots[:1]))
         assert s._drop_stale_overrun(clean) is clean
+
+
+def _real_invariant_checker(allocator, req_to_token_pool, cache, batch):
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.managers.scheduler_components.invariant_checker import (
+        SchedulerInvariantChecker,
+    )
+    from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+        SchedulerPoolStatsObserver,
+    )
+
+    observer = SchedulerPoolStatsObserver(
+        tree_cache=cache,
+        token_to_kv_pool_allocator=allocator,
+        req_to_token_pool=req_to_token_pool,
+        session_controller=types.SimpleNamespace(sessions={}),
+        hisparse_coordinator=None,
+        is_hybrid_swa=False,
+        is_hybrid_ssm=False,
+        enable_hisparse=False,
+        full_tokens_per_layer=None,
+        swa_tokens_per_layer=None,
+        max_total_num_tokens=allocator.size,
+        get_last_batch=lambda: batch,
+        get_running_batch=lambda: batch,
+    )
+    return SchedulerInvariantChecker(
+        is_hybrid_swa=False,
+        is_hybrid_ssm=False,
+        disaggregation_mode=DisaggregationMode.NULL,
+        page_size=1,
+        full_tokens_per_layer=None,
+        swa_tokens_per_layer=None,
+        max_total_num_tokens=allocator.size,
+        server_args=types.SimpleNamespace(dcp_size=1),
+        tree_cache=cache,
+        token_to_kv_pool_allocator=allocator,
+        req_to_token_pool=req_to_token_pool,
+        pool_stats_observer=observer,
+        get_last_batch=lambda: batch,
+        get_running_batch=lambda: batch,
+    )
+
+
+def test_busy_invariant_holds_across_a_lookahead_overrun(monkeypatch):
+    from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
+    from sglang.srt.mem_cache.common import release_kv_cache
+    from sglang.srt.runtime_context import get_context
+
+    monkeypatch.setenv("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", "1")
+    with get_context().override_server_args(page_size=1):
+        allocator, req_to_token_pool, cache = real_radix_pools()
+        survivor = _decoding_req(allocator, req_to_token_pool, "s", [1, 2], [20])
+        finished = _decoding_req(allocator, req_to_token_pool, "f", [3, 4], [30, 31])
+        step_slots = [
+            _commit_step_slot(allocator, req_to_token_pool, req)
+            for req in (survivor, finished)
+        ]
+        batch = _StaleDecodeBatch([survivor, finished], torch.tensor(step_slots))
+        checker = _real_invariant_checker(allocator, req_to_token_pool, cache, batch)
+
+        checker.self_check_during_busy()
+
+        finished.finished_reason = FINISH_MATCHED_TOKEN(matched=31)
+        release_kv_cache(finished, cache)
+        checker.self_check_during_busy()
+
+        batch.filter_batch([0])
+        checker.self_check_during_busy()
+
+
+def test_busy_invariant_detects_an_unowned_kv_slot(monkeypatch):
+    from sglang.srt.runtime_context import get_context
+
+    monkeypatch.setenv("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", "1")
+    with get_context().override_server_args(page_size=1):
+        allocator, req_to_token_pool, cache = real_radix_pools()
+        survivor = _decoding_req(allocator, req_to_token_pool, "s", [1, 2], [20])
+        batch = _StaleDecodeBatch([survivor], torch.tensor([0]))
+        checker = _real_invariant_checker(allocator, req_to_token_pool, cache, batch)
+        allocator.alloc(1)
+
+        with pytest.raises(AssertionError, match="Full Pool Mem Leak"):
+            checker.self_check_during_busy()
 
 
 def test_batch_is_decode():
@@ -676,7 +730,9 @@ def _drive_loop(seq, min_bs=2):
     s.process_input_requests = lambda r: None
     s._batch_is_decode = lambda b: True
     s.self_check_during_idle = lambda: events.append("idle")
-    s.self_check_during_busy = lambda: None
+    s.invariant_checker = types.SimpleNamespace(
+        self_check_during_busy=lambda: events.append("busy")
+    )
 
     def launch(b):
         events.append("launch")
@@ -707,6 +763,12 @@ def _drive_loop(seq, min_bs=2):
     s.get_next_batch_to_run = gnb
     s._event_loop_async_decode()
     return events, s
+
+
+def test_strict_busy_env_runs_the_invariant_checker_every_iteration(monkeypatch):
+    monkeypatch.setenv("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", "1")
+    events, _ = _drive_loop([2, 2])
+    assert events == ["launch", "busy", "launch", "resolve", "busy"]
 
 
 def test_fast_path_bs1_bypasses_lookahead_and_drains_on_transition():
@@ -895,7 +957,6 @@ def test_fast_path_does_not_double_free_req_finished_by_drain():
     s.process_input_requests = lambda r: None
     s._batch_is_decode = lambda b: True
     s.self_check_during_idle = lambda: None
-    s.self_check_during_busy = lambda: None
     s._run_batch_launch = lambda b: ("sched_output", "pending_step")
     # real drain helper -> exercises the real fast-path ordering under test
     s._resolve_pending_async = OmniScheduler._resolve_pending_async.__get__(s)
@@ -955,7 +1016,6 @@ def _scaffold_async_loop(*, async_pending=None):
     s.process_input_requests = lambda r: None
     s._batch_is_decode = lambda b: True
     s.self_check_during_idle = lambda: None
-    s.self_check_during_busy = lambda: None
     s._resolve_pending_async = OmniScheduler._resolve_pending_async.__get__(s)
     return s
 

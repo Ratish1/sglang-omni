@@ -23,7 +23,7 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from sglang_omni.scheduling.types import ModelRunnerOutput
-from tests.unit_test.fakes import FakeServerArgs
+from tests.unit_test.fakes import FakeServerArgs, real_radix_pools
 from tests.unit_test.pipeline.helpers import run_scheduler
 
 
@@ -86,7 +86,7 @@ def test_scheduler_idle_sleep_yields_to_pending_request_builds(monkeypatch) -> N
     assert sleep_calls == [0.001, 0.0001]
 
 
-def test_normal_event_loop_uses_request_build_aware_idle_sleep(monkeypatch) -> None:
+def _single_idle_iteration_scheduler() -> OmniScheduler:
     scheduler = object.__new__(OmniScheduler)
     scheduler._running = True
     scheduler._engine_paused = False
@@ -98,13 +98,18 @@ def test_normal_event_loop_uses_request_build_aware_idle_sleep(monkeypatch) -> N
     scheduler._take_deferred_request_payloads = lambda: []
     scheduler.process_input_requests = lambda _requests: None
     scheduler.self_check_during_idle = lambda: None
-    scheduler.self_check_during_busy = lambda: None
+    scheduler.invariant_checker = SimpleNamespace(self_check_during_busy=lambda: None)
 
     def get_next_batch_to_run():
         scheduler._running = False
         return None
 
     scheduler.get_next_batch_to_run = get_next_batch_to_run
+    return scheduler
+
+
+def test_normal_event_loop_uses_request_build_aware_idle_sleep(monkeypatch) -> None:
+    scheduler = _single_idle_iteration_scheduler()
     sleep_calls: list[float] = []
     monkeypatch.setattr(omni_scheduler_module.time, "sleep", sleep_calls.append)
 
@@ -1861,9 +1866,15 @@ def _construct_omni_scheduler(
     *,
     return_global_server_args: bool = False,
     server_max_queued_requests: int | None = 7,
+    pools: tuple[object, object, object] | None = None,
     **kwargs,
 ) -> OmniScheduler | tuple[OmniScheduler, object]:
     """Build an OmniScheduler over the minimum stub surface __init__ touches."""
+    token_to_kv_pool_allocator, req_to_token_pool, tree_cache = pools or (
+        None,
+        None,
+        None,
+    )
     monkeypatch.setattr(
         OmniScheduler,
         "_init_parallel_state",
@@ -1884,6 +1895,8 @@ def _construct_omni_scheduler(
             SimpleNamespace(
                 reset_metrics=lambda: None,
                 is_stats_logging_rank=False,
+                _maybe_log_idle_metrics=lambda: None,
+                reset_device_timer_window=lambda: None,
             ),
         ),
         raising=False,
@@ -1907,11 +1920,14 @@ def _construct_omni_scheduler(
         "sglang.srt.server_args.get_global_server_args",
         lambda: global_server_args,
     )
+    max_total_num_tokens = (
+        128 if token_to_kv_pool_allocator is None else token_to_kv_pool_allocator.size
+    )
     tp_worker = SimpleNamespace(
         gpu_id=0,
         tp_rank=0,
         model_runner=SimpleNamespace(
-            max_total_num_tokens=128,
+            max_total_num_tokens=max_total_num_tokens,
             effective_max_total_num_tokens=64,
             max_running_requests=1,
         ),
@@ -1943,13 +1959,14 @@ def _construct_omni_scheduler(
         schedule_conservativeness=1.0,
         enable_metrics=False,
         enable_metrics_for_all_schedulers=False,
+        enable_unified_memory=False,
     )
 
     scheduler = OmniScheduler(
         tp_worker=tp_worker,
-        tree_cache=None,
-        req_to_token_pool=None,
-        token_to_kv_pool_allocator=None,
+        tree_cache=tree_cache,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         server_args=server_args,
         model_config=SimpleNamespace(),
         **kwargs,
@@ -1958,6 +1975,67 @@ def _construct_omni_scheduler(
     if return_global_server_args:
         return scheduler, global_server_args
     return scheduler
+
+
+def _idle_scheduler_over_real_pools(monkeypatch):
+    pools = real_radix_pools()
+    scheduler = _construct_omni_scheduler(monkeypatch, pools=pools)
+    allocator, req_to_token_pool, _ = pools
+    return scheduler, allocator, req_to_token_pool
+
+
+def _unowned_req() -> object:
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    return Req("leaked", "", [1, 2], SamplingParams(max_new_tokens=1))
+
+
+def test_idle_check_reports_leaked_kv_tokens(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE", "true")
+    scheduler, allocator, _ = _idle_scheduler_over_real_pools(monkeypatch)
+    allocator.alloc(3)
+
+    with pytest.raises(ValueError, match="pool memory leak detected"):
+        scheduler.self_check_during_idle()
+
+
+def test_idle_check_reports_a_leaked_request_slot(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE", "true")
+    scheduler, _, req_to_token_pool = _idle_scheduler_over_real_pools(monkeypatch)
+    req_to_token_pool.alloc([_unowned_req()])
+
+    with pytest.raises(ValueError, match="req_to_token_pool memory leak"):
+        scheduler.self_check_during_idle()
+
+
+def test_idle_check_passes_on_balanced_pools_and_resets_the_token_ratio(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE", "true")
+    scheduler, _, _ = _idle_scheduler_over_real_pools(monkeypatch)
+    tracker = scheduler.new_token_ratio_tracker
+    tracker.current = tracker.min
+
+    scheduler.self_check_during_idle()
+
+    assert tracker.current == tracker.init
+
+
+def test_normal_event_loop_runs_the_busy_invariant_check_under_the_env(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY", "1")
+    scheduler = _single_idle_iteration_scheduler()
+    calls: list[str] = []
+    scheduler.invariant_checker = SimpleNamespace(
+        self_check_during_busy=lambda: calls.append("busy")
+    )
+    monkeypatch.setattr(omni_scheduler_module.time, "sleep", lambda _s: None)
+
+    scheduler._event_loop_normal()
+
+    assert calls == ["busy"]
 
 
 def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
@@ -2122,6 +2200,7 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
         schedule_conservativeness=1.0,
         enable_metrics=False,
         enable_metrics_for_all_schedulers=False,
+        enable_unified_memory=False,
     )
 
     scheduler = OmniScheduler(
@@ -2186,6 +2265,7 @@ def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
         schedule_conservativeness=1.0,
         enable_metrics=False,
         enable_metrics_for_all_schedulers=False,
+        enable_unified_memory=False,
     )
 
     with pytest.raises(ValueError, match="mutually exclusive"):
