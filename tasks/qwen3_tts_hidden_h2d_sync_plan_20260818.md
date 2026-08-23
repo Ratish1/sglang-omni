@@ -2,10 +2,12 @@
 
 ## Status and scope
 
-**Status: the six selected H2D mechanisms passed the bounded H100 mechanical
-gates at `aebd777e`; the remaining-owner attribution trace passed at
-`35b913ec`. The next isolated candidate is the text-tokenizer pageable H2D. No
-serving-speedup claim has been established.**
+**Status: seven selected H2D mechanisms, including the text-tokenizer path,
+passed bounded H100 mechanical gates through `c4203e66`. No serving-speedup
+claim has been established. The repetition portion of the qualified sampling
+mask is provisional because SGLang already applies the same penalty. Current
+ownership decisions, PR splits, and follow-up mechanics are maintained in
+`tasks/qwen3_tts_performance_pr_ledger_20260823.md`.**
 
 - Repository: `sglang-omni`
 - Worktree: `.worktrees/qwen3-tts-hidden-h2d-sync-v2`
