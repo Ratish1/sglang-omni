@@ -1060,27 +1060,45 @@ class Qwen3TTSTalker(nn.Module):
             self._decode_prep_rids = rids
             return
 
-        device = self._sub_temperature_tensor.device
-        self._semantic_sampling_seed_tensor[:batch_size] = torch.tensor(
-            semantic_seeds,
-            device=device,
+        # Pinned sources keep these same-stream CUDA copies host-asynchronous.
+        async_h2d = self._sub_temperature_tensor.is_cuda
+        integer_staging = torch.tensor(
+            [semantic_seeds, sub_top_ks, sub_seeds],
+            device="cpu",
             dtype=self._semantic_sampling_seed_tensor.dtype,
+            pin_memory=async_h2d,
         )
-        self._sub_temperature_tensor[:batch_size] = torch.tensor(
-            sub_temperatures, device=device, dtype=self._sub_temperature_tensor.dtype
+        float_staging = torch.tensor(
+            [sub_temperatures, sub_top_ps],
+            device="cpu",
+            dtype=self._sub_temperature_tensor.dtype,
+            pin_memory=async_h2d,
         )
-        self._sub_top_p_tensor[:batch_size] = torch.tensor(
-            sub_top_ps, device=device, dtype=self._sub_top_p_tensor.dtype
+        self._semantic_sampling_seed_tensor[:batch_size].copy_(
+            integer_staging[0], non_blocking=async_h2d
         )
-        self._sub_top_k_tensor[:batch_size] = torch.tensor(
-            sub_top_ks, device=device, dtype=self._sub_top_k_tensor.dtype
+        self._sub_top_k_tensor[:batch_size].copy_(
+            integer_staging[1], non_blocking=async_h2d
         )
-        self._sub_sampling_seed_tensor[:batch_size] = torch.tensor(
-            sub_seeds, device=device, dtype=self._sub_sampling_seed_tensor.dtype
+        self._sub_sampling_seed_tensor[:batch_size].copy_(
+            integer_staging[2], non_blocking=async_h2d
+        )
+        self._sub_temperature_tensor[:batch_size].copy_(
+            float_staging[0], non_blocking=async_h2d
+        )
+        self._sub_top_p_tensor[:batch_size].copy_(
+            float_staging[1], non_blocking=async_h2d
         )
         if self._sub_sample_count:
-            self._sub_sample_row_indices_tensor[: self._sub_sample_count] = (
-                torch.tensor(self._sub_sample_rows, device=device, dtype=torch.long)
+            sample_rows_staging = torch.tensor(
+                self._sub_sample_rows,
+                device="cpu",
+                dtype=self._sub_sample_row_indices_tensor.dtype,
+                pin_memory=async_h2d,
+            )
+            self._sub_sample_row_indices_tensor[: self._sub_sample_count].copy_(
+                sample_rows_staging,
+                non_blocking=async_h2d,
             )
         self._decode_prep_rids = rids
 
