@@ -20,10 +20,13 @@ def _runner() -> Qwen3TTSModelRunner:
 
 
 def _request(rid: str, epoch: int, penalty: float, output_ids, suppress):
-    sp = types.SimpleNamespace(repetition_penalty=penalty)
+    sp = types.SimpleNamespace(repetition_penalty=1.0)
     req = types.SimpleNamespace(sampling_params=sp, output_ids=output_ids)
     data = types.SimpleNamespace(
-        req=req, suppress_tokens=suppress, _qwen3_tts_prep_epoch=epoch
+        req=req,
+        repetition_penalty=penalty,
+        suppress_tokens=suppress,
+        _qwen3_tts_prep_epoch=epoch,
     )
     return types.SimpleNamespace(request_id=rid, data=data)
 
@@ -32,8 +35,9 @@ def _reference(logits, requests):
     out = logits.clone()
     vocab = out.shape[1]
     for row, sched_req in enumerate(requests):
-        req = sched_req.data.req
-        penalty = float(req.sampling_params.repetition_penalty)
+        data = sched_req.data
+        req = data.req
+        penalty = float(data.repetition_penalty)
         ids = req.output_ids or []
         unique = {int(t) for t in ids if 0 <= int(t) < vocab}
         if penalty != 1.0 and unique:

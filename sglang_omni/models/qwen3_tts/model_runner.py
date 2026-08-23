@@ -135,7 +135,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         for sched_req in requests:
             data = sched_req.data
             req = data.req
-            if float(req.sampling_params.repetition_penalty) == 1.0:
+            if float(data.repetition_penalty) == 1.0:
                 continue
             seen_len = getattr(data, "_rep_seen_len", None)
             output_ids = req.output_ids
@@ -175,7 +175,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
             req = data.req
-            penalty = float(req.sampling_params.repetition_penalty)
+            penalty = float(data.repetition_penalty)
             penalties[row_idx] = penalty
             output_ids = req.output_ids
             if penalty != 1.0 and output_ids:
