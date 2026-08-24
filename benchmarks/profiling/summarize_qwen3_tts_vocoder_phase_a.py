@@ -15,6 +15,7 @@ candidate; the report never treats such a pair as a serving A/B.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -56,6 +57,12 @@ _CAPACITY_RE = re.compile(
     r"Qwen3-TTS non-streaming code staging capacity: (?P<bytes>\d+) bytes"
 )
 _NORMALIZE_KEY_RE = re.compile(r"[^a-z0-9]")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_FIXED_CODE_FRAME_LENGTHS = {
+    1: [8],
+    2: [8, 10],
+    8: [8, 10, 12, 14, 16, 18, 20, 22],
+}
 
 
 def _normalized_args(event: dict[str, Any]) -> dict[str, Any]:
@@ -298,6 +305,55 @@ def _occurrence_groups(
     return result
 
 
+def _validate_fixed_code_result(result: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(result, dict):
+        return ["result is not a JSON object"]
+    if result.get("schema_version") != 1:
+        errors.append("schema_version is not 1")
+    if result.get("status") != "pass":
+        errors.append("status is not pass")
+    if result.get("seed") != 20260824:
+        errors.append("seed is not 20260824")
+    for key in ("torch_version", "qwen_tts_version"):
+        if not isinstance(result.get(key), str) or not result[key]:
+            errors.append(f"{key} is missing")
+
+    records = result.get("records")
+    if not isinstance(records, list):
+        return [*errors, "records is not a list"]
+    batch_sizes = [
+        record.get("batch_size") if isinstance(record, dict) else None
+        for record in records
+    ]
+    if batch_sizes != [1, 2, 8]:
+        errors.append("batch sizes are not exactly [1, 2, 8]")
+        return errors
+
+    for record in records:
+        batch_size = record["batch_size"]
+        frame_lengths = record.get("frame_lengths")
+        sample_lengths = record.get("sample_lengths")
+        digests = record.get("sha256")
+        expected_frame_lengths = _FIXED_CODE_FRAME_LENGTHS[batch_size]
+        if frame_lengths != expected_frame_lengths:
+            errors.append(f"B={batch_size} frame lengths do not match the probe")
+        if not isinstance(sample_lengths, list) or len(sample_lengths) != batch_size:
+            errors.append(f"B={batch_size} sample lengths are malformed")
+        elif sample_lengths != [
+            frame_length * 1920 for frame_length in expected_frame_lengths
+        ]:
+            errors.append(f"B={batch_size} sample lengths violate 1,920x expansion")
+        if not isinstance(digests, list) or len(digests) != batch_size:
+            errors.append(f"B={batch_size} SHA-256 list is malformed")
+        elif not all(
+            isinstance(digest, str) and _SHA256_RE.fullmatch(digest)
+            for digest in digests
+        ):
+            errors.append(f"B={batch_size} contains an invalid SHA-256 digest")
+    return errors
+
+
 def _artifact_summary(root: Path) -> dict[str, Any]:
     run = root / "q3tts-vocoder-phase-a-c16"
     fixed_log = (root / "fixed_code_differential.log").read_text(
@@ -314,11 +370,12 @@ def _artifact_summary(root: Path) -> dict[str, Any]:
         if isinstance(fixed_result, dict)
         else []
     )
-    fixed_json_pass = (
-        isinstance(fixed_result, dict)
-        and fixed_result.get("status") == "pass"
-        and [row.get("batch_size") for row in fixed_records] == [1, 2, 8]
+    fixed_validation_errors = (
+        _validate_fixed_code_result(fixed_result)
+        if fixed_result_path.exists()
+        else ["fixed_code_differential.json is missing"]
     )
+    fixed_json_pass = not fixed_validation_errors
     speed = json.loads((run / "client" / "speed_results.json").read_text())
     warmup = json.loads((root / "warmup" / "speed_results.json").read_text())
     server_log = (root / "server.log").read_text(encoding="utf-8", errors="replace")
@@ -362,6 +419,26 @@ def _artifact_summary(root: Path) -> dict[str, Any]:
                 else fixed_log.count("'batch_size':")
             ),
             "result_json_present": fixed_result_path.exists(),
+            "result_json_sha256": (
+                hashlib.sha256(fixed_result_path.read_bytes()).hexdigest()
+                if fixed_result_path.exists()
+                else None
+            ),
+            "validation_errors": fixed_validation_errors,
+            "seed": (
+                fixed_result.get("seed") if isinstance(fixed_result, dict) else None
+            ),
+            "torch_version": (
+                fixed_result.get("torch_version")
+                if isinstance(fixed_result, dict)
+                else None
+            ),
+            "qwen_tts_version": (
+                fixed_result.get("qwen_tts_version")
+                if isinstance(fixed_result, dict)
+                else None
+            ),
+            "records": fixed_records,
             "log_bytes": len(fixed_log.encode()),
         },
         "warmup_summary": warmup["summary"],
@@ -561,6 +638,7 @@ def _build_gate(
         "largest_codes_h2d_bytes": largest_codes_h2d,
         "narrow_mechanics_passed": narrow_mechanics_passed,
         "planned_trace_exit_passed": planned_trace_exit_passed,
+        "correctness_evidence_complete": common_checks["fixed_code_parity_proven"],
         "qualification_passed": common_checks["fixed_code_parity_proven"]
         and planned_trace_exit_passed,
     }
@@ -573,12 +651,18 @@ def _fmt_ms(value_us: float | int | None) -> str:
 def _write_markdown(summary: dict[str, Any], path: Path) -> None:
     gate = summary["gate"]
     artifact = summary["artifact"]
+    qualification_status = (
+        "PASS"
+        if gate["qualification_passed"]
+        else "FAIL" if gate["correctness_evidence_complete"] else "INCOMPLETE"
+    )
     lines = [
         "# Qwen3-TTS vocoder Phase-A summary",
         "",
         f"Narrow wrapper-mechanics gate: **{'PASS' if gate['narrow_mechanics_passed'] else 'FAIL'}**",
         f"Planned sync-free direct-range gate: **{'PASS' if gate['planned_trace_exit_passed'] else 'FAIL'}**",
-        f"Overall qualification: **{'PASS' if gate['qualification_passed'] else 'INCOMPLETE'}**",
+        f"Correctness evidence: **{'COMPLETE' if gate['correctness_evidence_complete'] else 'INCOMPLETE'}**",
+        f"Overall qualification: **{qualification_status}**",
         "",
         "## Gate checks",
         "",
@@ -645,6 +729,13 @@ def _write_markdown(summary: dict[str, Any], path: Path) -> None:
             "",
             f"- Fixed-code PASS marker: `{artifact['fixed_code']['pass_marker']}`; "
             f"batch records: {artifact['fixed_code']['batch_records']}.",
+            f"- Fixed-code artifact SHA-256: "
+            f"`{artifact['fixed_code']['result_json_sha256']}`; validation errors: "
+            f"`{artifact['fixed_code']['validation_errors']}`.",
+            f"- Fixed-code environment: Torch "
+            f"`{artifact['fixed_code']['torch_version']}`, qwen-tts "
+            f"`{artifact['fixed_code']['qwen_tts_version']}`, seed "
+            f"`{artifact['fixed_code']['seed']}`.",
             f"- Measured requests: {artifact['candidate_computed']}.",
             f"- Maximum logged pinned code staging: "
             f"{artifact['staging_capacity_max_bytes']} bytes.",
@@ -745,6 +836,9 @@ def main(argv: list[str] | None = None) -> int:
                 "narrow_mechanics_passed": summary["gate"]["narrow_mechanics_passed"],
                 "planned_trace_exit_passed": summary["gate"][
                     "planned_trace_exit_passed"
+                ],
+                "correctness_evidence_complete": summary["gate"][
+                    "correctness_evidence_complete"
                 ],
                 "qualification_passed": summary["gate"]["qualification_passed"],
                 "summary_json": str(json_path.resolve()),
