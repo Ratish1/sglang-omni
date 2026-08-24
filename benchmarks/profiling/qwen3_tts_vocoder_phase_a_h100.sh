@@ -11,6 +11,7 @@ QUAL_DIR="${QUAL_DIR:-/tmp/q3tts-vocoder-phase-a-$(git rev-parse --short=8 HEAD)
 CONFIG_PATH="${CONFIG_PATH:-examples/configs/qwen3_tts_1_7b.yaml}"
 SERVER_LOG="$QUAL_DIR/server.log"
 TRACE_RUN="q3tts-vocoder-phase-a-c16"
+FIXED_CODE_RESULT="$QUAL_DIR/fixed_code_differential.json"
 SERVER_PID=""
 
 cleanup() {
@@ -24,11 +25,17 @@ trap cleanup EXIT
 git merge-base --is-ancestor 6ea90f91a HEAD
 git merge-base --is-ancestor e92d8b11d HEAD
 mkdir -p "$QUAL_DIR"
+rm -f "$FIXED_CODE_RESULT"
 
-MODEL_PATH="$MODEL_PATH" python - <<'PY' \
-  | tee "$QUAL_DIR/fixed_code_differential.log"
+MODEL_PATH="$MODEL_PATH" \
+FIXED_CODE_RESULT="$FIXED_CODE_RESULT" \
+PYTHONUNBUFFERED=1 \
+python - <<'PY' 2>&1 | tee "$QUAL_DIR/fixed_code_differential.log"
 import hashlib
+import json
 import os
+from importlib.metadata import version
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -54,6 +61,7 @@ decoder_config = tokenizer.model.config.decoder_config
 num_quantizers = int(decoder_config.num_quantizers)
 codebook_size = int(decoder_config.codebook_size)
 generator = torch.Generator(device="cpu").manual_seed(20260824)
+records = []
 
 for batch_size in (1, 2, 8):
     lengths = [8 + 2 * row for row in range(batch_size)]
@@ -87,17 +95,44 @@ for batch_size in (1, 2, 8):
                 f"expected={want.shape}, actual={got_array.shape}, max_abs={max_abs}"
             )
         hashes.append(hashlib.sha256(got_array.tobytes()).hexdigest())
-    print(
-        {
-            "batch_size": batch_size,
-            "frame_lengths": lengths,
-            "sample_lengths": [int(item.shape[0]) for item in expected],
-            "sha256": hashes,
-        }
-    )
+    record = {
+        "batch_size": batch_size,
+        "frame_lengths": lengths,
+        "sample_lengths": [int(item.shape[0]) for item in expected],
+        "sha256": hashes,
+    }
+    records.append(record)
+    print(record, flush=True)
 
-print("fixed-code official/direct differential: PASS")
+result = {
+    "schema_version": 1,
+    "status": "pass",
+    "seed": 20260824,
+    "torch_version": torch.__version__,
+    "qwen_tts_version": version("qwen-tts"),
+    "records": records,
+}
+result_path = Path(os.environ["FIXED_CODE_RESULT"])
+temporary_path = result_path.with_suffix(result_path.suffix + ".tmp")
+temporary_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+temporary_path.replace(result_path)
+print("fixed-code official/direct differential: PASS", flush=True)
 PY
+
+python - "$FIXED_CODE_RESULT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert result["status"] == "pass"
+assert [record["batch_size"] for record in result["records"]] == [1, 2, 8]
+assert all(len(record["sha256"]) == record["batch_size"] for record in result["records"])
+PY
+
+if [[ "${FIXED_CODE_ONLY:-0}" == "1" ]]; then
+  exit 0
+fi
 
 CUDA_VISIBLE_DEVICES=0 \
 SGLANG_TORCH_PROFILER_DIR="$QUAL_DIR/profiles" \
