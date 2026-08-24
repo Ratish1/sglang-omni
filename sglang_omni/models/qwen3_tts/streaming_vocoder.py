@@ -193,6 +193,11 @@ class Qwen3TTSStreamingVocoderScheduler(
         self._tokenizer = tokenizer
         self._device = torch.device(device)
         self._decoder = tokenizer.model.decoder
+        self._nonstreaming_codes_staging: torch.Tensor | None = None
+        self._nonstreaming_codes_copy_done = (
+            torch.cuda.Event() if self._device.type == "cuda" else None
+        )
+        self._nonstreaming_codes_copy_recorded = False
         tokenizer_config = getattr(tokenizer.model, "config", None)
         decoder_config = getattr(tokenizer_config, "decoder_config", tokenizer_config)
         num_quantizers = int(getattr(decoder_config, "num_quantizers", 0) or 0)
@@ -1016,7 +1021,23 @@ class Qwen3TTSStreamingVocoderScheduler(
                 )
             codes.append(torch.as_tensor(state.audio_codes, dtype=torch.long))
 
-        if self._deterministic_inference:
+        if self._device.type == "cuda" and self._deterministic_inference:
+            results = []
+            for payload, state, item in zip(payloads, states, codes):
+                waveform = self._decode_nonstreaming_codes([item])[0]
+                results.append(
+                    self._store_vocoder_result(
+                        payload,
+                        state,
+                        waveform,
+                        self._sample_rate,
+                    )
+                )
+            return results
+        if self._device.type == "cuda":
+            wavs = self._decode_nonstreaming_codes(codes)
+            sample_rate = self._sample_rate
+        elif self._deterministic_inference:
             wavs = []
             for item in codes:
                 decoded, sample_rate = self._tokenizer.decode([{"audio_codes": item}])
@@ -1034,6 +1055,93 @@ class Qwen3TTSStreamingVocoderScheduler(
         return [
             self._store_vocoder_result(payload, state, wav, sample_rate)
             for payload, state, wav in zip(payloads, states, wavs)
+        ]
+
+    def _decode_nonstreaming_codes(
+        self, codes: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        """Decode CPU ``[T,Q]`` rows while retaining their lengths on the host."""
+
+        if not codes:
+            return []
+
+        frame_lengths: list[int] = []
+        num_quantizers: int | None = None
+        for row, item in enumerate(codes):
+            if item.device.type != "cpu":
+                raise ValueError(
+                    "Qwen3-TTS non-streaming vocoder expects CPU code tensors"
+                )
+            if item.ndim != 2 or int(item.shape[0]) <= 0:
+                raise ValueError(
+                    "Qwen3-TTS non-streaming codes must have shape [T,Q] with "
+                    f"T > 0, got row {row} shape {tuple(item.shape)}"
+                )
+            row_quantizers = int(item.shape[1])
+            if num_quantizers is None:
+                num_quantizers = row_quantizers
+            elif row_quantizers != num_quantizers:
+                raise ValueError(
+                    "Qwen3-TTS non-streaming code rows must share Q, got "
+                    f"{num_quantizers} and {row_quantizers}"
+                )
+            frame_lengths.append(int(item.shape[0]))
+
+        batch_size = len(codes)
+        max_frames = max(frame_lengths)
+        assert num_quantizers is not None
+        required_elements = batch_size * max_frames * num_quantizers
+        staging = self._nonstreaming_codes_staging
+        async_h2d = self._device.type == "cuda"
+        copy_done = self._nonstreaming_codes_copy_done
+        if (
+            copy_done is not None
+            and self._nonstreaming_codes_copy_recorded
+            and not copy_done.query()
+        ):
+            # The normal publication path has already drained the decoder
+            # stream. This wait only protects the persistent source after an
+            # earlier batch failed before publishing its waveform.
+            copy_done.synchronize()
+        if staging is None or int(staging.numel()) < required_elements:
+            staging = torch.empty(
+                required_elements,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=async_h2d,
+            )
+            self._nonstreaming_codes_staging = staging
+
+        active_staging = staging[:required_elements].view(
+            batch_size,
+            max_frames,
+            num_quantizers,
+        )
+        active_staging.zero_()
+        for row, (item, frames) in enumerate(zip(codes, frame_lengths)):
+            active_staging[row, :frames].copy_(item)
+        # The official wrapper pads with -1 and clamps before decode. These
+        # payload rows are unpadded, so zero-filled padding is equivalent.
+        active_staging.clamp_min_(0)
+
+        decoder_input = active_staging.to(
+            self._device,
+            non_blocking=async_h2d,
+        ).transpose(1, 2)
+        if copy_done is not None:
+            copy_done.record(torch.cuda.current_stream(self._device))
+            self._nonstreaming_codes_copy_recorded = True
+        with torch.inference_mode():
+            decoded = self._decoder.chunked_decode(decoder_input).squeeze(1)
+
+        if decoded.ndim != 2 or int(decoded.shape[0]) != batch_size:
+            raise RuntimeError(
+                "Qwen3-TTS decoder returned unexpected non-streaming shape "
+                f"{tuple(decoded.shape)}"
+            )
+        return [
+            decoded[row, : frames * self._samples_per_frame]
+            for row, frames in enumerate(frame_lengths)
         ]
 
     def _store_vocoder_result(
