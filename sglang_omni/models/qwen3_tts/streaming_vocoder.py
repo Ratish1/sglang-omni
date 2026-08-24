@@ -14,6 +14,7 @@ from typing import Any, Mapping
 import torch
 
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+from sglang_omni.profiler.torch_profiler import TorchProfiler
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
@@ -1024,7 +1025,10 @@ class Qwen3TTSStreamingVocoderScheduler(
         if self._device.type == "cuda" and self._deterministic_inference:
             results = []
             for payload, state, item in zip(payloads, states, codes):
-                waveform = self._decode_nonstreaming_codes([item])[0]
+                with TorchProfiler.record_function(
+                    "qwen3_tts.vocoder.direct_decode.total"
+                ):
+                    waveform = self._decode_nonstreaming_codes([item])[0]
                 results.append(
                     self._store_vocoder_result(
                         payload,
@@ -1035,7 +1039,8 @@ class Qwen3TTSStreamingVocoderScheduler(
                 )
             return results
         if self._device.type == "cuda":
-            wavs = self._decode_nonstreaming_codes(codes)
+            with TorchProfiler.record_function("qwen3_tts.vocoder.direct_decode.total"):
+                wavs = self._decode_nonstreaming_codes(codes)
             sample_rate = self._sample_rate
         elif self._deterministic_inference:
             wavs = []
@@ -1111,6 +1116,10 @@ class Qwen3TTSStreamingVocoderScheduler(
                 pin_memory=async_h2d,
             )
             self._nonstreaming_codes_staging = staging
+            logger.info(
+                "Qwen3-TTS non-streaming code staging capacity: %d bytes",
+                int(staging.numel()) * int(staging.element_size()),
+            )
 
         active_staging = staging[:required_elements].view(
             batch_size,
@@ -1124,15 +1133,17 @@ class Qwen3TTSStreamingVocoderScheduler(
         # payload rows are unpadded, so zero-filled padding is equivalent.
         active_staging.clamp_min_(0)
 
-        decoder_input = active_staging.to(
-            self._device,
-            non_blocking=async_h2d,
-        ).transpose(1, 2)
-        if copy_done is not None:
-            copy_done.record(torch.cuda.current_stream(self._device))
-            self._nonstreaming_codes_copy_recorded = True
-        with torch.inference_mode():
-            decoded = self._decoder.chunked_decode(decoder_input).squeeze(1)
+        with TorchProfiler.record_function("qwen3_tts.vocoder.direct_decode"):
+            with TorchProfiler.record_function("qwen3_tts.vocoder.codes.h2d"):
+                decoder_input = active_staging.to(
+                    self._device,
+                    non_blocking=async_h2d,
+                ).transpose(1, 2)
+                if copy_done is not None:
+                    copy_done.record(torch.cuda.current_stream(self._device))
+                    self._nonstreaming_codes_copy_recorded = True
+            with torch.inference_mode():
+                decoded = self._decoder.chunked_decode(decoder_input).squeeze(1)
 
         if decoded.ndim != 2 or int(decoded.shape[0]) != batch_size:
             raise RuntimeError(
@@ -1158,12 +1169,13 @@ class Qwen3TTSStreamingVocoderScheduler(
             cut = int(state.ref_code_len / max(total_frames, 1) * waveform.shape[0])
             waveform = waveform[cut:]
 
-        data = audio_waveform_payload(
-            waveform,
-            sample_rate=int(sample_rate),
-            modality="audio",
-            source_hint="Qwen3-TTS",
-        )
+        with TorchProfiler.record_function("qwen3_tts.vocoder.waveform.publish"):
+            data = audio_waveform_payload(
+                waveform,
+                sample_rate=int(sample_rate),
+                modality="audio",
+                source_hint="Qwen3-TTS",
+            )
         usage = build_usage(state)
         if usage is not None:
             data["usage"] = usage

@@ -9,7 +9,12 @@ import subprocess
 import threading
 from contextlib import nullcontext
 
-from torch.profiler import ProfilerActivity, profile
+from torch.profiler import (
+    ProfilerActivity,
+    _ExperimentalConfig,
+    profile,
+    record_function,
+)
 
 from .base_profiler import ProfilerBase
 
@@ -111,6 +116,10 @@ class TorchProfiler(ProfilerBase):
             cls._profiler = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 on_trace_ready=trace_handler,
+                # Omni starts profiling after its long-lived scheduler
+                # threads exist. Capture those threads so their ATen and
+                # semantic ranges remain attributable in the trace.
+                experimental_config=_ExperimentalConfig(profile_all_threads=True),
                 record_shapes=os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES")
                 == "1",
                 profile_memory=os.environ.get("SGLANG_TORCH_PROFILER_PROFILE_MEMORY")
@@ -199,3 +208,11 @@ class TorchProfiler(ProfilerBase):
     @classmethod
     def get_step_context(cls):
         return nullcontext()
+
+    @classmethod
+    def record_function(cls, name: str):
+        """Create a semantic range only while this process is profiled."""
+
+        if cls._profiler is None:
+            return nullcontext()
+        return record_function(name)
