@@ -2502,8 +2502,7 @@ def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     assert isinstance(data.semantic_sampling_seed, int)
     assert 0 <= data.semantic_sampling_seed <= 0x7FFFFFFF
     assert data.req.sampling_params.sampling_seed == data.semantic_sampling_seed
-    assert data.repetition_penalty == 1.1
-    assert data.req.sampling_params.repetition_penalty == 1.0
+    assert data.req.sampling_params.repetition_penalty == 1.1
     assert isinstance(data.subtalker_sampling_seed, int)
     assert 0 <= data.subtalker_sampling_seed <= 0x7FFFFFFF
 
@@ -2958,7 +2957,6 @@ def test_qwen3_tts_sampling_installs_semantic_seed_tensor(
                     sampling_params=SimpleNamespace(repetition_penalty=1.0),
                     output_ids=[],
                 ),
-                repetition_penalty=1.0,
                 suppress_tokens=[],
                 return_logprob=False,
             )
@@ -2969,7 +2967,6 @@ def test_qwen3_tts_sampling_installs_semantic_seed_tensor(
                     sampling_params=SimpleNamespace(repetition_penalty=1.0),
                     output_ids=[],
                 ),
-                repetition_penalty=1.0,
                 suppress_tokens=[],
                 return_logprob=False,
             )

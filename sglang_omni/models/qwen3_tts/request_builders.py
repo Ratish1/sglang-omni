@@ -1192,11 +1192,6 @@ def build_sglang_qwen3_tts_request(
     )
     sampling_params.normalize(None)
     sampling_params.verify(int(model.config.vocab_size))
-    # Preserve the verified public value in Omni-owned request state. The Qwen
-    # runner applies it with its device-resident history mask; the SGLang-facing
-    # value is the identity so SamplingBatchInfo cannot apply it a second time.
-    repetition_penalty = float(sampling_params.repetition_penalty)
-    sampling_params.repetition_penalty = 1.0
 
     req = Req(
         rid=payload.request_id,
@@ -1232,7 +1227,6 @@ def build_sglang_qwen3_tts_request(
         prompt_input_embeds=prepared.prompt_input_embeds,
         prefill_input_embeds=prepared.prompt_input_embeds,
         semantic_sampling_seed=semantic_sampling_seed,
-        repetition_penalty=repetition_penalty,
         subtalker_dosample=bool(gen_kwargs.get("subtalker_dosample", True)),
         subtalker_temperature=float(gen_kwargs.get("subtalker_temperature", 0.9)),
         subtalker_top_p=float(gen_kwargs.get("subtalker_top_p", 1.0)),
