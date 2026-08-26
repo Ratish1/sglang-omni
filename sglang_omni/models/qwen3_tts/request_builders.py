@@ -17,6 +17,10 @@ from typing import Any
 import torch
 
 from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQueue
+from sglang_omni.models.qwen3_tts.completion_diagnostics import (
+    completion_diagnostics_enabled,
+    record_qwen3_tts_completion,
+)
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
 from sglang_omni.preprocessing.cache_key import (
@@ -114,6 +118,9 @@ class Qwen3TTSSGLangRequestData(SGLangARRequestData):
     ref_code: torch.Tensor | None = None
     ref_code_len: int = 0
     prompt_input_embeds: torch.Tensor | None = None
+    public_sampling_seed: int | None = None
+    public_repetition_penalty: float = 1.0
+    semantic_eos_token_id: int = 0
     semantic_sampling_seed: int = field(default_factory=_new_qwen3_tts_sampling_seed)
     subtalker_dosample: bool = True
     subtalker_temperature: float = 0.9
@@ -1179,6 +1186,8 @@ def build_sglang_qwen3_tts_request(
         semantic_sampling_seed, subtalker_sampling_seed = (
             derive_qwen3_tts_sampling_seeds(state.seed)
         )
+    public_repetition_penalty = float(gen_kwargs.get("repetition_penalty", 1.05))
+    semantic_eos_token_id = int(model.config.codec_eos_token_id)
     sampling_params = SamplingParams(
         max_new_tokens=int(
             gen_kwargs.get("max_new_tokens", QWEN3_TTS_DEFAULT_MAX_NEW_TOKENS)
@@ -1186,8 +1195,8 @@ def build_sglang_qwen3_tts_request(
         temperature=temperature,
         top_p=float(gen_kwargs.get("top_p", 1.0)),
         top_k=int(gen_kwargs.get("top_k", 50)),
-        repetition_penalty=float(gen_kwargs.get("repetition_penalty", 1.05)),
-        stop_token_ids=[int(model.config.codec_eos_token_id)],
+        repetition_penalty=public_repetition_penalty,
+        stop_token_ids=[semantic_eos_token_id],
         sampling_seed=semantic_sampling_seed,
     )
     sampling_params.normalize(None)
@@ -1198,7 +1207,7 @@ def build_sglang_qwen3_tts_request(
         origin_input_text="",
         origin_input_ids=prepared.input_ids_list,
         sampling_params=sampling_params,
-        eos_token_ids={int(model.config.codec_eos_token_id)},
+        eos_token_ids={semantic_eos_token_id},
         vocab_size=int(model.config.vocab_size),
         extra_key=f"qwen3_tts:{uuid.uuid4().hex}",
     )
@@ -1221,6 +1230,9 @@ def build_sglang_qwen3_tts_request(
         ref_code_len=ref_code_len,
         prompt_input_embeds=prepared.prompt_input_embeds,
         prefill_input_embeds=prepared.prompt_input_embeds,
+        public_sampling_seed=state.seed,
+        public_repetition_penalty=public_repetition_penalty,
+        semantic_eos_token_id=semantic_eos_token_id,
         semantic_sampling_seed=semantic_sampling_seed,
         subtalker_dosample=bool(gen_kwargs.get("subtalker_dosample", True)),
         subtalker_temperature=float(gen_kwargs.get("subtalker_temperature", 0.9)),
@@ -1289,6 +1301,41 @@ def apply_sglang_qwen3_tts_result(
     else:
         codes = torch.empty((0, 0), dtype=torch.long)
 
+    finish_reason = _qwen3_tts_finish_reason(data)
+    if completion_diagnostics_enabled():
+        target_text, _ = normalize_qwen3_tts_inputs(payload.request.inputs)
+        sampling_params = data.req.sampling_params
+        generated_codes = codes[data.ref_code_len :]
+        record_qwen3_tts_completion(
+            metadata={
+                "request_id": payload.request_id,
+                "target_text_sha256": hashlib.sha256(
+                    target_text.encode("utf-8")
+                ).hexdigest(),
+                "public_seed": data.public_sampling_seed,
+                "semantic_sampling_seed": data.semantic_sampling_seed,
+                "subtalker_sampling_seed": data.subtalker_sampling_seed,
+                "repetition_penalty_owner": "sglang",
+                "public_repetition_penalty": data.public_repetition_penalty,
+                "sglang_repetition_penalty": float(sampling_params.repetition_penalty),
+                "semantic_temperature": float(sampling_params.temperature),
+                "semantic_top_p": float(sampling_params.top_p),
+                "semantic_top_k": int(sampling_params.top_k),
+                "subtalker_do_sample": data.subtalker_dosample,
+                "subtalker_temperature": data.subtalker_temperature,
+                "subtalker_top_p": data.subtalker_top_p,
+                "subtalker_top_k": data.subtalker_top_k,
+                "semantic_eos_token_id": data.semantic_eos_token_id,
+                "semantic_output_includes_eos": bool(data.output_ids)
+                and int(data.output_ids[-1]) == data.semantic_eos_token_id,
+                "ref_code_len": data.ref_code_len,
+                "completion_tokens": len(data.output_codes),
+                "finish_reason": finish_reason,
+            },
+            semantic_token_ids=list(data.output_ids),
+            generated_codec_codes=generated_codes,
+        )
+
     return StagePayload(
         request_id=payload.request_id,
         request=payload.request,
@@ -1299,7 +1346,7 @@ def apply_sglang_qwen3_tts_result(
             "completion_tokens": len(data.output_codes),
             "engine_time_s": time.perf_counter() - data.engine_start_s,
             "sample_rate": 24000,
-            "finish_reason": _qwen3_tts_finish_reason(data),
+            "finish_reason": finish_reason,
         },
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import threading
 import time
@@ -20,6 +21,11 @@ from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQu
 from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_builders
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts import streaming_vocoder as qwen3_streaming_vocoder
+from sglang_omni.models.qwen3_tts.completion_diagnostics import (
+    COMPLETION_DIAGNOSTICS_DIR_ENV,
+    COMPLETION_DIAGNOSTICS_RUN_LABEL_ENV,
+    close_completion_diagnostics,
+)
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.models.qwen3_tts.request_builders import (
@@ -3132,6 +3138,59 @@ def test_qwen3_tts_result_adapter_keeps_code_handoff_tensor_native() -> None:
     assert result.data["finish_reason"] == "stop"
 
 
+def test_qwen3_tts_result_adapter_records_completion_diagnostics(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_completion_diagnostics()
+    monkeypatch.setenv(COMPLETION_DIAGNOSTICS_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(COMPLETION_DIAGNOSTICS_RUN_LABEL_ENV, "candidate-p105")
+    payload = make_payload(inputs="target", params={"seed": 123})
+    sampling_params = SimpleNamespace(
+        repetition_penalty=1.05,
+        temperature=0.9,
+        top_p=1.0,
+        top_k=50,
+    )
+    data = Qwen3TTSSGLangRequestData(
+        req=SimpleNamespace(
+            output_ids=[17, 18, 2150],
+            sampling_params=sampling_params,
+        ),
+        output_ids=[17, 18, 2150],
+        output_codes=[torch.tensor([1, 2]), torch.tensor([3, 4])],
+        ref_code=torch.tensor([[9, 9]]),
+        ref_code_len=1,
+        stage_payload=payload,
+        public_sampling_seed=123,
+        public_repetition_penalty=1.05,
+        semantic_eos_token_id=2150,
+        semantic_sampling_seed=456,
+        subtalker_sampling_seed=789,
+    )
+
+    try:
+        result = apply_sglang_qwen3_tts_result(payload, data)
+    finally:
+        close_completion_diagnostics()
+
+    assert result.data["audio_codes"].tolist() == [[9, 9], [1, 2], [3, 4]]
+    paths = list(tmp_path.glob("qwen3-tts-completions-candidate-p105-*.jsonl"))
+    assert len(paths) == 1
+    records = [json.loads(line) for line in paths[0].read_text().splitlines()]
+    assert len(records) == 1
+    record = records[0]
+    assert record["request_id"] == payload.request_id
+    assert record["public_seed"] == 123
+    assert record["semantic_sampling_seed"] == 456
+    assert record["subtalker_sampling_seed"] == 789
+    assert record["repetition_penalty_owner"] == "sglang"
+    assert record["semantic_token_ids"] == [17, 18, 2150]
+    assert record["semantic_output_includes_eos"] is True
+    assert record["generated_codec_codes"] == [[1, 2], [3, 4]]
+    assert len(record["semantic_token_sha256"]) == 64
+    assert len(record["generated_codec_codes_sha256"]) == 64
+
+
 def test_qwen3_tts_result_adapter_preserves_length_finish_reason() -> None:
     """A length-capped generation must be distinguishable from natural EOS."""
     payload = make_payload(inputs="target")
@@ -3246,6 +3305,8 @@ def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     assert 0 <= data.semantic_sampling_seed <= 0x7FFFFFFF
     assert data.req.sampling_params.sampling_seed == data.semantic_sampling_seed
     assert data.req.sampling_params.repetition_penalty == 1.1
+    assert data.public_repetition_penalty == 1.1
+    assert data.semantic_eos_token_id == 42
     assert isinstance(data.subtalker_sampling_seed, int)
     assert 0 <= data.subtalker_sampling_seed <= 0x7FFFFFFF
 
@@ -3326,6 +3387,7 @@ def test_qwen3_tts_request_data_uses_public_seed_split(
 
     assert data.semantic_sampling_seed == expected_semantic_seed
     assert data.subtalker_sampling_seed == expected_subtalker_seed
+    assert data.public_sampling_seed == 123
     assert data.req.sampling_params.sampling_seed == expected_semantic_seed
 
 
