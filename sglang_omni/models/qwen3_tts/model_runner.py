@@ -111,7 +111,7 @@ class Qwen3TTSModelRunner(ModelRunner):
             schedule_batch,
             requests,
         )
-        if self._qwen_repetition_enabled:
+        if getattr(self, "_qwen_repetition_enabled", False):
             self._repetition_mask_last_sampled = (
                 next_token_ids
                 if self._repetition_mask_active
@@ -237,7 +237,7 @@ class Qwen3TTSModelRunner(ModelRunner):
     def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
         """Apply only the Qwen-owned diagnostic share of the public penalty."""
 
-        if not self._qwen_repetition_enabled:
+        if not getattr(self, "_qwen_repetition_enabled", False):
             return
         logits = logits_output.next_token_logits
         if logits is None or logits.ndim != 2 or not requests:

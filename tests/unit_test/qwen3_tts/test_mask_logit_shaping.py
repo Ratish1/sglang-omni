@@ -110,6 +110,21 @@ def test_qwen3_tts_leaves_repetition_penalty_to_sglang() -> None:
     assert torch.equal(got, original)
 
 
+def test_qwen3_tts_missing_diagnostic_owner_state_defaults_to_sglang() -> None:
+    runner = _runner(vocab_size=128, codec_eos_token_id=127)
+    del runner._qwen_repetition_enabled
+    logits = torch.randn(1, 128)
+    original = logits.clone()
+
+    got = _apply_qwen_penalty(
+        runner,
+        logits,
+        [_penalty_request("a", 1, 1.3, [3, 7])],
+    )
+
+    assert torch.equal(got, original)
+
+
 def test_qwen3_tts_public_penalty_disables_async_lookahead() -> None:
     runner = _runner(vocab_size=128, codec_eos_token_id=127)
 
