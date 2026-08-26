@@ -23,6 +23,7 @@ def _runner(*, vocab_size: int, codec_eos_token_id: int) -> Qwen3TTSModelRunner:
     runner._repetition_mask_last_sampled = None
     runner._repetition_mask_prep_rids = None
     runner._repetition_mask_active = False
+    runner._qwen_repetition_enabled = True
     return runner
 
 
@@ -96,11 +97,12 @@ def _apply_qwen_penalty(
 
 def test_qwen3_tts_leaves_repetition_penalty_to_sglang() -> None:
     runner = _runner(vocab_size=128, codec_eos_token_id=127)
+    runner._qwen_repetition_enabled = False
     logits = torch.randn(2, 128)
     original = logits.clone()
     requests = [
-        _penalty_request("a", 1, 1.0, [3, 7]),
-        _penalty_request("b", 2, 1.0, [4]),
+        _penalty_request("a", 1, 1.3, [3, 7]),
+        _penalty_request("b", 2, 1.2, [4]),
     ]
 
     got = _apply_qwen_penalty(runner, logits, requests)

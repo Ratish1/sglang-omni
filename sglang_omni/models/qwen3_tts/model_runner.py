@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.sglang_execution import attn_forward_context
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
+from sglang_omni.models.qwen3_tts.repetition_ownership import repetition_penalty_owner
 from sglang_omni.scheduling.types import RequestOutput
 
 
@@ -26,6 +27,10 @@ class Qwen3TTSModelRunner(ModelRunner):
         self._repetition_mask_last_sampled: torch.Tensor | None = None
         self._repetition_mask_prep_rids: list | None = None
         self._repetition_mask_active = False
+        self._qwen_repetition_enabled = repetition_penalty_owner() in {
+            "qwen",
+            "double",
+        }
 
     def before_prefill(
         self,
@@ -230,6 +235,8 @@ class Qwen3TTSModelRunner(ModelRunner):
     def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
         """Apply only the Qwen-owned diagnostic share of the public penalty."""
 
+        if not self._qwen_repetition_enabled:
+            return
         logits = logits_output.next_token_logits
         if logits is None or logits.ndim != 2 or not requests:
             return
