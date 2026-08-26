@@ -177,13 +177,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
@@ -258,6 +259,7 @@ class TtsSeedttsBenchmarkConfig:
     top_k: int | None = None
     repetition_penalty: float | None = None
     seed: int | None = None
+    sample_specific_seeds: bool = False
     warmup: int = 1
     concurrency: int = DEFAULT_TTS_BENCHMARK_CONCURRENCY
     request_rate: float = float("inf")
@@ -299,9 +301,34 @@ def _build_generation_kwargs(config: TtsSeedttsBenchmarkConfig) -> dict:
         generation_kwargs["top_k"] = config.top_k
     if config.repetition_penalty is not None:
         generation_kwargs["repetition_penalty"] = config.repetition_penalty
-    if config.seed is not None:
-        generation_kwargs["seed"] = config.seed
     return generation_kwargs
+
+
+def derive_sample_specific_seed(panel_seed: int, sample_id: str) -> int:
+    """Derive a stable paired request seed from a panel seed and sample ID."""
+    material = f"{int(panel_seed)}\0{sample_id}".encode("utf-8")
+    digest = hashlib.blake2b(
+        material,
+        digest_size=8,
+        person=b"sglomni-tts-v1",
+    ).digest()
+    return int.from_bytes(digest, "little") & 0x7FFFFFFF
+
+
+def _build_request_seed_fn(
+    config: TtsSeedttsBenchmarkConfig,
+) -> Callable[[SampleInput], int] | None:
+    if config.sample_specific_seeds and config.seed is None:
+        raise ValueError("sample-specific seeds require a panel seed")
+    if config.sample_specific_seeds and config.seed < 0:
+        raise ValueError("sample-specific panel seed must be non-negative")
+    if config.seed is None:
+        return None
+    if config.sample_specific_seeds:
+        panel_seed = int(config.seed)
+        return lambda sample: derive_sample_specific_seed(panel_seed, sample.sample_id)
+    shared_seed = int(config.seed)
+    return lambda _sample: shared_seed
 
 
 def _build_results_config(
@@ -325,6 +352,11 @@ def _build_results_config(
         "sample_offset": config.sample_offset,
         "max_new_tokens": config.max_new_tokens,
         "seed": config.seed,
+        "seed_mode": (
+            "sample_specific_blake2b_v1"
+            if config.sample_specific_seeds
+            else ("shared" if config.seed is not None else "none")
+        ),
         "token_count": config.token_count,
         "warmup": config.warmup,
         "concurrency": config.concurrency,
@@ -378,6 +410,7 @@ async def run_tts_seedtts_benchmark(
         os.makedirs(config.output_dir, exist_ok=True)
 
     generation_kwargs = _build_generation_kwargs(config)
+    request_seed_fn = _build_request_seed_fn(config)
     send_fn = make_tts_send_fn(
         config.model,
         api_url,
@@ -391,6 +424,7 @@ async def run_tts_seedtts_benchmark(
         task_type=config.task_type,
         instructions=config.instructions,
         save_audio_dir=save_audio_dir,
+        request_seed_fn=request_seed_fn,
         **generation_kwargs,
     )
 
@@ -408,7 +442,12 @@ async def run_tts_seedtts_benchmark(
     results_config = _build_results_config(config, base_url=base_url)
     benchmark_results = build_speed_results(outputs, metrics, results_config)
     save_speed_results(outputs, metrics, results_config, config.output_dir)
-    save_generated_audio_metadata(outputs, samples, config.output_dir)
+    save_generated_audio_metadata(
+        outputs,
+        samples,
+        config.output_dir,
+        request_seed_fn=request_seed_fn,
+    )
     return benchmark_results
 
 
@@ -482,6 +521,7 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         top_k=args.top_k,
         repetition_penalty=args.repetition_penalty,
         seed=args.seed,
+        sample_specific_seeds=args.sample_specific_seeds,
         warmup=args.warmup,
         concurrency=args.concurrency,
         request_rate=args.request_rate,
@@ -843,7 +883,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--seed",
         type=int,
         default=None,
-        help="Per-request sampler seed for reproducible generation.",
+        help=(
+            "Sampler seed. Reused for every request unless "
+            "--sample-specific-seeds is set."
+        ),
+    )
+    parser.add_argument(
+        "--sample-specific-seeds",
+        action="store_true",
+        help=(
+            "Derive a stable request seed from --seed and each sample ID; "
+            "paired runs with the same panel seed receive identical seeds."
+        ),
     )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument(
@@ -1033,6 +1084,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.sample_specific_seeds and args.seed is None:
+        parser.error("--sample-specific-seeds requires --seed")
+    if args.sample_specific_seeds and args.seed < 0:
+        parser.error("--seed must be non-negative with --sample-specific-seeds")
     if (
         args.initial_codec_chunk_frames is not None
         and args.initial_codec_chunk_frames < 0

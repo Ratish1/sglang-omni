@@ -8,10 +8,12 @@ from benchmarks.dataset.seedtts import SampleInput
 from benchmarks.eval.benchmark_tts_seedtts import (
     TtsSeedttsBenchmarkConfig,
     _build_arg_parser,
+    _build_request_seed_fn,
     _build_results_config,
     _config_from_args,
     _parse_concurrencies,
     _validate_args,
+    derive_sample_specific_seed,
     plan_sustained_overshoot,
     run_tts_concurrency_sweep,
     run_tts_sustained_overshoot,
@@ -40,6 +42,7 @@ def test_seedtts_benchmark_batch_args_default_to_64() -> None:
     assert results_config["max_running_requests"] == 64
     assert results_config["cuda_graph_max_bs"] == 64
     assert results_config["max_queued_requests"] is None
+    assert results_config["seed_mode"] == "none"
 
 
 def test_seedtts_benchmark_batch_args_are_independent() -> None:
@@ -77,6 +80,53 @@ def test_seedtts_benchmark_quantization_defaults_to_none() -> None:
     assert config.quantization is None
     results_config = _build_results_config(config, base_url="http://localhost:8000")
     assert results_config["quantization"] is None
+
+
+def test_sample_specific_seed_is_stable_paired_and_sample_dependent() -> None:
+    first = derive_sample_specific_seed(20260823, "sample-a")
+    assert first == 636208485
+    assert derive_sample_specific_seed(20260823, "sample-a") == first
+    assert derive_sample_specific_seed(20260823, "sample-b") != first
+    assert derive_sample_specific_seed(20260824, "sample-a") != first
+    assert 0 <= first <= 0x7FFFFFFF
+
+
+def test_sample_specific_seed_mode_records_and_resolves_request_seeds() -> None:
+    config = _config_from_cli(
+        "--seed",
+        "20260823",
+        "--sample-specific-seeds",
+    )
+    seed_fn = _build_request_seed_fn(config)
+    assert seed_fn is not None
+    assert seed_fn(_sample("sample-a")) == 636208485
+    results_config = _build_results_config(config, base_url="http://localhost:8000")
+    assert results_config["seed"] == 20260823
+    assert results_config["seed_mode"] == "sample_specific_blake2b_v1"
+
+
+def test_sample_specific_seed_mode_requires_non_negative_panel_seed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = _build_arg_parser()
+    for argv, needle in (
+        (["--sample-specific-seeds"], "requires --seed"),
+        (["--sample-specific-seeds", "--seed", "-1"], "must be non-negative"),
+    ):
+        args = parser.parse_args(argv)
+        with pytest.raises(SystemExit) as exc:
+            _validate_args(parser, args)
+        assert exc.value.code == 2
+        assert needle in capsys.readouterr().err
+
+    with pytest.raises(ValueError, match="require a panel seed"):
+        _build_request_seed_fn(
+            TtsSeedttsBenchmarkConfig(
+                model="model",
+                meta="meta",
+                sample_specific_seeds=True,
+            )
+        )
 
 
 def test_parse_concurrencies() -> None:

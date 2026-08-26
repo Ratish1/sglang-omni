@@ -19,7 +19,7 @@ import logging
 import os
 import time
 import wave
-from typing import AsyncIterator, Protocol
+from typing import AsyncIterator, Callable, Protocol
 
 import aiohttp
 import numpy as np
@@ -1268,6 +1268,7 @@ def make_tts_send_fn(
     task_type: str | None = None,
     instructions: str | None = None,
     save_audio_dir: str | None = None,
+    request_seed_fn: Callable[[SampleInput], int] | None = None,
     **gen_kwargs,
 ) -> SendFn:
     """Return a *send_fn(session, sample) -> RequestResult* for the runner."""
@@ -1293,6 +1294,8 @@ def make_tts_send_fn(
             instructions=instructions,
             **gen_kwargs,
         )
+        if request_seed_fn is not None:
+            payload["seed"] = int(request_seed_fn(sample))
         start_time = time.perf_counter()
         try:
             async with session.post(api_url, json=payload) as response:
@@ -1319,10 +1322,16 @@ def save_generated_audio_metadata(
     outputs: list[RequestResult],
     samples: list[SampleInput],
     output_dir: str,
+    *,
+    request_seed_fn: Callable[[SampleInput], int] | None = None,
 ) -> None:
     sample_by_id = {sample.sample_id: sample for sample in samples}
     generated = [
-        _request_result_to_generated_entry(output, sample_by_id[output.request_id])
+        _request_result_to_generated_entry(
+            output,
+            sample_by_id[output.request_id],
+            request_seed_fn=request_seed_fn,
+        )
         for output in outputs
     ]
     metadata_path = os.path.join(output_dir, "generated.json")
@@ -1334,6 +1343,8 @@ def save_generated_audio_metadata(
 def _request_result_to_generated_entry(
     output: RequestResult,
     sample: SampleInput,
+    *,
+    request_seed_fn: Callable[[SampleInput], int] | None = None,
 ) -> dict:
     entry: dict = {
         "sample_id": output.request_id,
@@ -1345,6 +1356,8 @@ def _request_result_to_generated_entry(
     }
     if output.error:
         entry["error"] = output.error
+    if request_seed_fn is not None:
+        entry["seed"] = int(request_seed_fn(sample))
     return entry
 
 
