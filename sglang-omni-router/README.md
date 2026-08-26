@@ -461,6 +461,47 @@ unapproved headers are removed.
 
 `--help` and `--version` do not require a configuration file.
 
+## Operations
+
+The following read-only routes inherit the router's mandatory loopback listener
+validation and remain available while the router is unready:
+
+- `GET /v1/models` returns a startup-precomputed, sorted, deduplicated union of
+  model IDs from correlated worker profiles and configured worker defaults. It
+  uses the direct SGLang-Omni `ModelList`, `ModelCard`, and default permission
+  schema and never contacts a worker.
+- `GET /metrics` returns Prometheus 0.0.4 text rendered from current lifecycle,
+  readiness, health, disposition, admission semaphores, and exact worker
+  capacity semaphores.
+- `GET /diagnostics` returns bounded JSON with lifecycle, readiness, fixed-order
+  admission state, and registration-ordered worker ID, ordinal, health,
+  disposition, and configured capacities.
+
+These endpoints require HTTP/1.1 with no query or body. `HEAD` and every other
+unsupported method return `405` with `Allow: GET`. Responses provide an exact
+content type and length plus `Cache-Control: no-store`. They do not contact
+workers or mutate routing state.
+
+Metrics have fixed labels and cardinality: five lifecycle states, three health
+states, two dispositions, global plus seven admission classes, and seven
+worker-capacity classes. The metric families are:
+
+- `sglang_omni_router_lifecycle` and `sglang_omni_router_ready`;
+- `sglang_omni_router_workers_by_health` and
+  `sglang_omni_router_workers_by_disposition`;
+- `sglang_omni_router_admission_limit` and
+  `sglang_omni_router_admission_in_flight`;
+- `sglang_omni_router_worker_capacity_limit` and
+  `sglang_omni_router_worker_capacity_in_flight`.
+
+Permit use is sampled from the enforcing semaphores at scrape time; request
+paths perform no metric mutation. Metrics contain no worker URL, model,
+request, voice, session, or error labels. Diagnostics exclude worker targets,
+trust domains, health paths, credentials, headers, request IDs, model inputs,
+media, and voice names. The default tracing path remains limited to lifecycle,
+health transitions, and exceptional failures; there are no per-request spans,
+access logs, or stage histograms.
+
 ## Health, readiness, and shutdown
 
 Workers start `Unknown`. One joined task per worker performs status-only probes
@@ -475,9 +516,8 @@ returns `200` only while serving and at least one compatible healthy worker
 exists for chat and every enabled media or WebSocket route. When voice state is
 enabled, the exact owner must also be healthy and serving. Exhausted capacity
 remains healthy; draining or unhealthy workers are not dispatchable. No
-router-local `/health`, worker CRUD, or metrics route is registered. Disabled
-media, voice-management, and WebSocket routes are not installed and return
-`404`.
+router-local `/health` or worker CRUD route is registered. Disabled media,
+voice-management, and WebSocket routes are not installed and return `404`.
 
 On the first `SIGINT` or `SIGTERM`, readiness fails, admission and exact worker
 semaphores close, tracked WebSocket sessions receive a service-restart close,
