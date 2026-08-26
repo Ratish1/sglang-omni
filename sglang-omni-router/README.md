@@ -1,7 +1,7 @@
 # SGLang-Omni Rust router
 
 `sgl-omni-router` is a standalone Rust router for static SGLang-Omni chat,
-speech, batch speech, transcription, and translation workers. It selects
+speech, batch speech, transcription, translation, and realtime workers. It selects
 compatible healthy workers from correlated startup profiles and preserves one
 direct upstream attempt with bounded admission and joined shutdown.
 
@@ -63,6 +63,9 @@ generation_http = 64
 speech_http = 32
 speech_batch = 64
 transcription_http = 32
+# Configure only the WebSocket classes whose routes are enabled.
+speech_websocket = 16
+realtime_websocket = 16
 
 [health]
 interval_ms = 5000
@@ -117,10 +120,37 @@ pool_idle_timeout_ms = 90000
 pool_max_idle_per_host = 8 # accepted range: 1 through 1024
 ```
 
-`[http_generation]` and `[http_media]` are independently optional, but at least
-one must be configured. Each handler owns its transport settings, pooled
-client, request timeout, and aggregate byte budget. They share the bounded
-classifier semaphore, worker health, routing policy, and response-body lease.
+Enable either terminating WebSocket route independently:
+
+```toml
+[websocket]
+uri_max_bytes = 2048
+header_max_fields = 64
+header_max_bytes = 32768
+frame_max_bytes = 16777216
+worker_message_max_bytes = 67108864
+speech_config_max_bytes = 15029592
+speech_message_max_bytes = 131072
+realtime_message_max_bytes = 16777216
+connect_timeout_ms = 5000
+setup_timeout_ms = 5000
+speech_config_timeout_ms = 10000
+close_timeout_ms = 5000
+
+[websocket.speech]
+trust_domain = "local"
+
+[websocket.realtime]
+trust_domain = "local"
+```
+
+`[http_generation]`, `[http_media]`, and `[websocket]` are independently
+optional, but at least one route owner must be configured. HTTP handlers own
+their transport settings, pooled client, request timeout, and aggregate byte
+budget. WebSocket routes use bounded connect, handshake, initial speech
+configuration, frame/message, close, and process-drain limits. All handlers
+share the bounded classifier semaphore, worker health, routing policy, and
+exact worker leases.
 
 Add only the capacity and profile rows a worker actually serves. A
 media-only worker may omit `generation_http` capacity and generation profiles,
@@ -135,6 +165,8 @@ accidentally:
 speech_http = 8
 speech_batch = 32
 transcription_http = 8
+speech_websocket = 4
+realtime_websocket = 4
 
 [[workers.service_profiles]]
 service = "speech_http"
@@ -171,6 +203,19 @@ task = "transcribe" # use a separate row with task = "translate"
 response_formats = ["json", "text", "verbose_json", "srt", "vtt", "sse"]
 media_profiles = ["audio", "audio_video"]
 stream_modes = ["non_streaming", "streaming"]
+
+[[workers.service_profiles]]
+service = "speech_websocket"
+model_ids = ["tts"]
+response_formats = ["pcm"]
+stream_modes = ["non_streaming", "streaming"]
+tasks = ["text_to_speech", "voice_clone", "voice_design"]
+reference_forms = ["none", "direct", "list", "vq_codes"]
+managed_voice = false
+
+[[workers.service_profiles]]
+service = "realtime_websocket"
+protocols = ["openai_realtime_v1"]
 ```
 
 `speech_batch` capacity is measured in items, not HTTP envelopes. One batch is
@@ -246,6 +291,50 @@ configured default. An absent stream value means `false`, so a header-only
 `true` assertion is rejected; `true` is valid only when the body or form also
 explicitly requests streaming.
 
+The terminating WebSocket routes are:
+
+- `GET /v1/audio/speech/stream` for speech sessions;
+- `GET /v1/realtime?model=<model-id>` for OpenAI-compatible realtime sessions.
+
+For example, with `websocat`:
+
+```console
+websocat ws://127.0.0.1:30000/v1/audio/speech/stream
+{"type":"session.config","model":"tts","response_format":"pcm","stream_audio":true}
+
+websocat 'ws://127.0.0.1:30000/v1/realtime?model=omni'
+```
+
+Speech upgrades downstream first, then receives one bounded text
+`session.config`, classifies it under the shared classifier limit, selects one
+worker, and replays the exact text once. Realtime strictly validates the
+optional `model` query, selects and connects one worker before completing the
+downstream upgrade, and forwards the worker's first exact `session.created`
+event before reading client application messages. An absent realtime model
+requires one unambiguous worker default in the route trust domain. Empty,
+duplicate, malformed, or invalid model values are rejected.
+
+Both routes pin one worker for the complete session. Speech relays text and
+binary application frames; realtime relays text and rejects binary application
+frames. Accepted frames remain ordered under destination-send backpressure and
+are not parsed or copied for routing. Host and TLS SNI retain the configured
+worker authority while the router dials only its statically resolved socket
+address.
+Upstream WebSocket handshakes forward only the canonical `x-request-id` and an
+optional singular `Origin`; authorization and arbitrary client headers are not
+forwarded.
+
+There is one upstream attempt and no retry, failover, proxy, ambient DNS, or
+worker reselection. The router owns only connect, handshake, initial speech
+configuration, close, and process-drain deadlines. Speech application idleness
+remains a worker contract, so the router has no speech idle timer.
+
+`speech_config_timeout_ms` bounds receipt of the initial speech configuration.
+After that event for speech, and before dispatch for realtime, the single
+`setup_timeout_ms` deadline covers classification, connect and handshake, the
+required first worker event, and its initial downstream send; `connect_timeout_ms`
+remains a separate upper bound on TCP connect.
+
 ## Routing and resource ownership
 
 At startup the router proves content-blind cohorts separately for generation
@@ -313,13 +402,14 @@ responses are relayed and do not mark the worker unhealthy.
 
 Exact `GET /live` reports process liveness. `GET /ready` is registered and
 returns `200` only while serving and at least one compatible healthy worker
-exists for chat and every enabled media route. Exhausted capacity remains
-healthy; draining or unhealthy workers are not dispatchable. No router-local
-`/health`, worker CRUD, WebSocket, or metrics route is registered. Disabled
-media routes are not installed and return `404`.
+exists for chat and every enabled media or WebSocket route. Exhausted capacity
+remains healthy; draining or unhealthy workers are not dispatchable. No
+router-local `/health`, worker CRUD, or metrics route is registered. Disabled
+media and WebSocket routes are not installed and return `404`.
 
 On the first `SIGINT` or `SIGTERM`, readiness fails, admission and exact worker
-semaphores close, health tasks are cancelled, and owned server/health tasks are
-joined within `shutdown.drain_timeout_ms`. A distinct second signal forces a
-failed shutdown. Health never terminates worker processes and is not a circuit
-breaker.
+semaphores close, tracked WebSocket sessions receive a service-restart close,
+health tasks are cancelled, and the server, health tasks, and upgraded sessions
+are joined within `shutdown.drain_timeout_ms`. A distinct second signal forces
+a failed shutdown. Health never terminates worker processes and is not a
+circuit breaker.

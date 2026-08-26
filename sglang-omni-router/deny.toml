@@ -36,7 +36,9 @@ deny = [
   { name = "openssl-sys", reason = "Native OpenSSL is outside the router trust boundary" },
 ]
 skip = [
-  { name = "windows-sys", version = "=0.52.0", reason = "ring 0.17.14 pins this target-only line; Tokio and Criterion use 0.61.2" },
+  { name = "windows-sys", version = "=0.52.0", reason = "ring 0.17.14 pins this target-only line while Tokio uses 0.61.2" },
+  { name = "getrandom", version = "=0.3.4", reason = "tungstenite 0.29 uses rand 0.9 while ring retains getrandom 0.2" },
+  { name = "webpki-roots", version = "=0.26.11", reason = "tokio-tungstenite 0.29 uses the compatibility wrapper over the shared WebPKI roots data" },
 ]
 skip-tree = []
 
@@ -46,7 +48,7 @@ deny = ["fs", "full", "io-std", "io-uring", "parking_lot", "process", "taskdump"
 
 [[bans.features]]
 name = "axum"
-deny = ["default", "form", "http2", "json", "macros", "multipart", "query", "ws"]
+deny = ["default", "form", "http2", "json", "macros", "multipart"]
 
 [[bans.features]]
 name = "clap"
@@ -76,6 +78,8 @@ include-workspace = true
 include-archives = true
 allow-build-scripts = [
   { name = "httparse", version = "=1.10.1" },
+  { name = "generic-array", version = "=0.14.7" },
+  { name = "getrandom", version = "=0.3.4" },
   { name = "libc", version = "=0.2.186" },
   { name = "icu_normalizer_data", version = "=2.2.0" },
   { name = "icu_properties_data", version = "=2.2.0" },
@@ -99,6 +103,8 @@ allow-build-scripts = [
   { name = "windows_x86_64_gnu", version = "=0.52.6" },
   { name = "windows_x86_64_gnullvm", version = "=0.52.6" },
   { name = "windows_x86_64_msvc", version = "=0.52.6" },
+  { name = "wit-bindgen", version = "=0.57.1" },
+  { name = "zerocopy", version = "=0.8.56" },
   { name = "zmij", version = "=1.0.23" },
 ]
 
@@ -154,6 +160,25 @@ allow-globs = [
   "crypto/perlasm/x86gas.pl",
   "crypto/perlasm/x86nasm.pl",
 ]
+
+[[bans.build.bypass]]
+name = "zerocopy"
+version = "=0.8.56"
+allow-globs = [
+  "cargo.sh",
+  "ci/check_all_toolchains_tested.sh",
+  "ci/check_fmt.sh",
+  "ci/check_msrv_is_minimal.sh",
+  "ci/check_readme.sh",
+  "ci/check_stale_stderr.sh",
+  "ci/check_versions.sh",
+  "ci/release_crate_version.sh",
+]
+
+[[bans.build.bypass]]
+name = "wit-bindgen"
+version = "=0.57.1"
+allow-globs = ["src/rt/libwit_bindgen_cabi.a"]
 
 [[bans.build.bypass]]
 name = "windows_aarch64_gnullvm"
