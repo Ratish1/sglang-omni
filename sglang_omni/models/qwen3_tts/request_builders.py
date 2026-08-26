@@ -22,6 +22,7 @@ from sglang_omni.models.qwen3_tts.completion_diagnostics import (
     record_qwen3_tts_completion,
 )
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+from sglang_omni.models.qwen3_tts.repetition_ownership import route_repetition_penalty
 from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
 from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
@@ -120,6 +121,8 @@ class Qwen3TTSSGLangRequestData(SGLangARRequestData):
     prompt_input_embeds: torch.Tensor | None = None
     public_sampling_seed: int | None = None
     public_repetition_penalty: float = 1.0
+    repetition_penalty_owner: str = "sglang"
+    qwen_repetition_penalty: float = 1.0
     semantic_eos_token_id: int = 0
     semantic_sampling_seed: int = field(default_factory=_new_qwen3_tts_sampling_seed)
     subtalker_dosample: bool = True
@@ -1187,6 +1190,9 @@ def build_sglang_qwen3_tts_request(
             derive_qwen3_tts_sampling_seeds(state.seed)
         )
     public_repetition_penalty = float(gen_kwargs.get("repetition_penalty", 1.05))
+    repetition_owner, qwen_repetition_penalty, sglang_repetition_penalty = (
+        route_repetition_penalty(public_repetition_penalty)
+    )
     semantic_eos_token_id = int(model.config.codec_eos_token_id)
     sampling_params = SamplingParams(
         max_new_tokens=int(
@@ -1195,7 +1201,7 @@ def build_sglang_qwen3_tts_request(
         temperature=temperature,
         top_p=float(gen_kwargs.get("top_p", 1.0)),
         top_k=int(gen_kwargs.get("top_k", 50)),
-        repetition_penalty=public_repetition_penalty,
+        repetition_penalty=sglang_repetition_penalty,
         stop_token_ids=[semantic_eos_token_id],
         sampling_seed=semantic_sampling_seed,
     )
@@ -1232,6 +1238,8 @@ def build_sglang_qwen3_tts_request(
         prefill_input_embeds=prepared.prompt_input_embeds,
         public_sampling_seed=state.seed,
         public_repetition_penalty=public_repetition_penalty,
+        repetition_penalty_owner=repetition_owner,
+        qwen_repetition_penalty=qwen_repetition_penalty,
         semantic_eos_token_id=semantic_eos_token_id,
         semantic_sampling_seed=semantic_sampling_seed,
         subtalker_dosample=bool(gen_kwargs.get("subtalker_dosample", True)),
@@ -1315,9 +1323,14 @@ def apply_sglang_qwen3_tts_result(
                 "public_seed": data.public_sampling_seed,
                 "semantic_sampling_seed": data.semantic_sampling_seed,
                 "subtalker_sampling_seed": data.subtalker_sampling_seed,
-                "repetition_penalty_owner": "sglang",
+                "repetition_penalty_owner": data.repetition_penalty_owner,
                 "public_repetition_penalty": data.public_repetition_penalty,
+                "qwen_repetition_penalty": data.qwen_repetition_penalty,
                 "sglang_repetition_penalty": float(sampling_params.repetition_penalty),
+                "nominal_effective_repetition_penalty": (
+                    data.qwen_repetition_penalty
+                    * float(sampling_params.repetition_penalty)
+                ),
                 "semantic_temperature": float(sampling_params.temperature),
                 "semantic_top_p": float(sampling_params.top_p),
                 "semantic_top_k": int(sampling_params.top_k),

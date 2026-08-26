@@ -28,6 +28,11 @@ from sglang_omni.models.qwen3_tts.completion_diagnostics import (
 )
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+from sglang_omni.models.qwen3_tts.repetition_ownership import (
+    REPETITION_PENALTY_OWNER_ENV,
+    repetition_penalty_owner,
+    route_repetition_penalty,
+)
 from sglang_omni.models.qwen3_tts.request_builders import (
     Qwen3TTSPreparedRequest,
     Qwen3TTSSGLangRequestData,
@@ -1106,6 +1111,39 @@ def test_qwen3_tts_public_seed_derivation_is_stable() -> None:
     assert first[0] != first[1]
     assert all(0 <= seed <= 0x7FFFFFFF for seed in first)
     assert derive_qwen3_tts_sampling_seeds(123456) == (709979716, 2088621061)
+
+
+@pytest.mark.parametrize(
+    ("owner", "expected_qwen", "expected_sglang"),
+    [
+        ("sglang", 1.0, 1.05),
+        ("qwen", 1.05, 1.0),
+        ("double", 1.05, 1.05),
+    ],
+)
+def test_qwen3_tts_routes_repetition_penalty_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    owner: str,
+    expected_qwen: float,
+    expected_sglang: float,
+) -> None:
+    monkeypatch.setenv(REPETITION_PENALTY_OWNER_ENV, owner.upper())
+
+    assert repetition_penalty_owner() == owner
+    assert route_repetition_penalty(1.05) == (
+        owner,
+        expected_qwen,
+        expected_sglang,
+    )
+
+
+def test_qwen3_tts_rejects_unknown_repetition_penalty_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(REPETITION_PENALTY_OWNER_ENV, "neither")
+
+    with pytest.raises(ValueError, match=REPETITION_PENALTY_OWNER_ENV):
+        repetition_penalty_owner()
 
 
 def test_qwen3_tts_text_only_defaults_to_custom_voice() -> None:
@@ -3184,6 +3222,9 @@ def test_qwen3_tts_result_adapter_records_completion_diagnostics(
     assert record["semantic_sampling_seed"] == 456
     assert record["subtalker_sampling_seed"] == 789
     assert record["repetition_penalty_owner"] == "sglang"
+    assert record["qwen_repetition_penalty"] == 1.0
+    assert record["sglang_repetition_penalty"] == 1.05
+    assert record["nominal_effective_repetition_penalty"] == 1.05
     assert record["semantic_token_ids"] == [17, 18, 2150]
     assert record["semantic_output_includes_eos"] is True
     assert record["generated_codec_codes"] == [[1, 2], [3, 4]]
@@ -3306,6 +3347,8 @@ def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     assert data.req.sampling_params.sampling_seed == data.semantic_sampling_seed
     assert data.req.sampling_params.repetition_penalty == 1.1
     assert data.public_repetition_penalty == 1.1
+    assert data.repetition_penalty_owner == "sglang"
+    assert data.qwen_repetition_penalty == 1.0
     assert data.semantic_eos_token_id == 42
     assert isinstance(data.subtalker_sampling_seed, int)
     assert 0 <= data.subtalker_sampling_seed <= 0x7FFFFFFF
@@ -3421,6 +3464,30 @@ def _build_qwen3_tts_sglang_request(monkeypatch: pytest.MonkeyPatch):
         ),
         wrapper=object(),
     )
+
+
+@pytest.mark.parametrize(
+    ("owner", "expected_qwen", "expected_sglang"),
+    [
+        ("sglang", 1.0, 1.05),
+        ("qwen", 1.05, 1.0),
+        ("double", 1.05, 1.05),
+    ],
+)
+def test_qwen3_tts_request_routes_repetition_penalty_to_selected_owners(
+    monkeypatch: pytest.MonkeyPatch,
+    owner: str,
+    expected_qwen: float,
+    expected_sglang: float,
+) -> None:
+    monkeypatch.setenv(REPETITION_PENALTY_OWNER_ENV, owner)
+
+    data = _build_qwen3_tts_sglang_request(monkeypatch)
+
+    assert data.public_repetition_penalty == 1.05
+    assert data.repetition_penalty_owner == owner
+    assert data.qwen_repetition_penalty == expected_qwen
+    assert data.req.sampling_params.repetition_penalty == expected_sglang
 
 
 def test_qwen3_tts_request_lifetime_extra_key_is_unique_and_survives_retract(

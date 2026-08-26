@@ -21,6 +21,11 @@ class Qwen3TTSModelRunner(ModelRunner):
         super().__init__(tp_worker, output_processor)
         self._has_pending_code_step = False
         self._row_ids_cache: torch.Tensor | None = None
+        self._repetition_mask: torch.Tensor | None = None
+        self._repetition_penalty_column: torch.Tensor | None = None
+        self._repetition_mask_last_sampled: torch.Tensor | None = None
+        self._repetition_mask_prep_rids: list | None = None
+        self._repetition_mask_active = False
 
     def before_prefill(
         self,
@@ -95,25 +100,193 @@ class Qwen3TTSModelRunner(ModelRunner):
         requests: list,
     ) -> Any:
         self._install_semantic_sampling_seeds(forward_batch, requests)
-        return super()._sample_next_token_ids(
+        next_token_ids = super()._sample_next_token_ids(
             logits_output,
             forward_batch,
             schedule_batch,
             requests,
         )
+        self._repetition_mask_last_sampled = (
+            next_token_ids
+            if self._repetition_mask_active and isinstance(next_token_ids, torch.Tensor)
+            else None
+        )
+        return next_token_ids
 
     # ------------------------------------------------------------------
     # Qwen3-TTS logit shaping
     # ------------------------------------------------------------------
 
-    def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
-        """Leave repetition-penalty ownership to SGLang's sampling state.
+    def lookahead_eligible(self, batch: Any) -> bool:
+        """Keep every history-owned diagnostic mode on the synchronous path."""
 
-        ``ScheduleBatch.prepare_for_decode`` accumulates committed output tokens
-        in SGLang's device-resident repetition penalizer. ``ModelRunner.sample``
-        applies that state once using the public ``SamplingParams`` value.
-        """
-        del logits_output, requests
+        for req in batch.reqs:
+            data = getattr(req, "_omni_data", None)
+            if data is None:
+                return False
+            if float(getattr(data, "qwen_repetition_penalty", 1.0)) != 1.0:
+                return False
+        return super().lookahead_eligible(batch)
+
+    @staticmethod
+    def _repetition_mask_fingerprint(requests: list) -> list | None:
+        rids = []
+        for sched_req in requests:
+            rid = getattr(sched_req, "request_id", None)
+            epoch = getattr(sched_req.data, "_qwen3_tts_prep_epoch", None)
+            if rid is None or epoch is None:
+                return None
+            rids.append((rid, epoch))
+        return rids
+
+    @staticmethod
+    def _every_penalized_row_grew_by_one(requests: list) -> bool:
+        for sched_req in requests:
+            data = sched_req.data
+            if float(data.qwen_repetition_penalty) == 1.0:
+                continue
+            seen_len = getattr(data, "_rep_seen_len", None)
+            output_ids = data.req.output_ids
+            if seen_len is None or not output_ids:
+                return False
+            if len(output_ids) != seen_len + 1:
+                return False
+        return True
+
+    def _ensure_repetition_mask(
+        self,
+        batch_size: int,
+        vocab: int,
+        device: Any,
+    ) -> None:
+        mask = getattr(self, "_repetition_mask", None)
+        if (
+            mask is not None
+            and mask.shape[0] >= batch_size
+            and mask.shape[1] == vocab
+            and mask.device == device
+        ):
+            return
+        rows = max(batch_size, 64)
+        self._repetition_mask = torch.zeros(
+            rows,
+            vocab,
+            dtype=torch.bool,
+            device=device,
+        )
+        self._repetition_penalty_column = torch.ones(
+            rows,
+            1,
+            dtype=torch.float32,
+            device=device,
+        )
+        self._repetition_mask_prep_rids = None
+
+    def _rebuild_repetition_mask(
+        self,
+        requests: list,
+        vocab: int,
+        device: Any,
+    ) -> None:
+        repetition_mask = self._repetition_mask
+        penalty_column = self._repetition_penalty_column
+        if repetition_mask is None or penalty_column is None:
+            raise RuntimeError("Qwen3-TTS repetition mask buffers are not initialized")
+
+        batch_size = len(requests)
+        repetition_mask[:batch_size] = False
+        repetition_rows: list[int] = []
+        repetition_tokens: list[int] = []
+        penalties = [1.0] * batch_size
+        for row_idx, sched_req in enumerate(requests):
+            data = sched_req.data
+            penalty = float(data.qwen_repetition_penalty)
+            penalties[row_idx] = penalty
+            output_ids = data.req.output_ids
+            if penalty != 1.0 and output_ids:
+                seen = ModelRunner._rep_penalty_unique_tokens(
+                    data,
+                    output_ids,
+                    vocab,
+                )
+                repetition_rows.extend([row_idx] * len(seen))
+                repetition_tokens.extend(seen)
+
+        if repetition_rows:
+            pairs = torch.tensor(
+                repetition_rows + repetition_tokens,
+                dtype=torch.long,
+                device=device,
+            )
+            pair_count = len(repetition_rows)
+            repetition_mask[pairs[:pair_count], pairs[pair_count:]] = True
+        penalty_column[:batch_size, 0] = torch.tensor(
+            penalties,
+            dtype=torch.float32,
+            device=device,
+        )
+        self._repetition_mask_active = any(penalty != 1.0 for penalty in penalties)
+
+    def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
+        """Apply only the Qwen-owned diagnostic share of the public penalty."""
+
+        logits = logits_output.next_token_logits
+        if logits is None or logits.ndim != 2 or not requests:
+            return
+        if not any(
+            float(sched_req.data.qwen_repetition_penalty) != 1.0
+            for sched_req in requests
+        ):
+            self._repetition_mask_active = False
+            return
+
+        batch_size = len(requests)
+        vocab = logits.shape[1]
+        self._ensure_repetition_mask(batch_size, vocab, logits.device)
+        repetition_mask = self._repetition_mask
+        penalty_column = self._repetition_penalty_column
+        if repetition_mask is None or penalty_column is None:
+            raise RuntimeError("Qwen3-TTS repetition mask buffers are not initialized")
+
+        fingerprint = self._repetition_mask_fingerprint(requests)
+        last_sampled = getattr(self, "_repetition_mask_last_sampled", None)
+        incremental_update = (
+            fingerprint is not None
+            and fingerprint == getattr(self, "_repetition_mask_prep_rids", None)
+            and last_sampled is not None
+            and last_sampled.shape[0] >= batch_size
+            and self._every_penalized_row_grew_by_one(requests)
+        )
+        if incremental_update:
+            rows = torch.arange(batch_size, device=logits.device)
+            repetition_mask[
+                rows,
+                last_sampled[:batch_size].clamp(0, vocab - 1),
+            ] = True
+            for sched_req in requests:
+                data = sched_req.data
+                output_ids = data.req.output_ids
+                if output_ids:
+                    ModelRunner._rep_penalty_unique_tokens(data, output_ids, vocab)
+        else:
+            self._rebuild_repetition_mask(requests, vocab, logits.device)
+        self._repetition_mask_prep_rids = fingerprint
+
+        if self._repetition_mask_active:
+            penalties = penalty_column[:batch_size]
+            scores = logits.to(torch.float32)
+            penalized = torch.where(
+                scores > 0,
+                scores / penalties,
+                scores * penalties,
+            )
+            logits.copy_(
+                torch.where(
+                    repetition_mask[:batch_size],
+                    penalized,
+                    scores,
+                ).to(logits.dtype)
+            )
 
     def _apply_codec_suppress_tokens(self, logits_output: Any, requests: list) -> None:
         logits = logits_output.next_token_logits
