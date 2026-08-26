@@ -111,11 +111,13 @@ class Qwen3TTSModelRunner(ModelRunner):
             schedule_batch,
             requests,
         )
-        self._repetition_mask_last_sampled = (
-            next_token_ids
-            if self._repetition_mask_active and isinstance(next_token_ids, torch.Tensor)
-            else None
-        )
+        if self._qwen_repetition_enabled:
+            self._repetition_mask_last_sampled = (
+                next_token_ids
+                if self._repetition_mask_active
+                and isinstance(next_token_ids, torch.Tensor)
+                else None
+            )
         return next_token_ids
 
     # ------------------------------------------------------------------
