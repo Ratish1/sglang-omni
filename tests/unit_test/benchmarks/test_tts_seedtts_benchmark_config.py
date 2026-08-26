@@ -16,6 +16,7 @@ from benchmarks.eval.benchmark_tts_seedtts import (
     derive_sample_specific_seed,
     plan_sustained_overshoot,
     run_tts_concurrency_sweep,
+    run_tts_seedtts_transcribe,
     run_tts_sustained_overshoot,
 )
 from sglang_omni.admission import QueueFullError
@@ -96,6 +97,14 @@ def test_sample_specific_seed_mode_records_and_resolves_request_seeds() -> None:
         "--seed",
         "20260823",
         "--sample-specific-seeds",
+        "--temperature",
+        "0.9",
+        "--top-p",
+        "0.95",
+        "--top-k",
+        "50",
+        "--repetition-penalty",
+        "1.05",
     )
     seed_fn = _build_request_seed_fn(config)
     assert seed_fn is not None
@@ -103,6 +112,10 @@ def test_sample_specific_seed_mode_records_and_resolves_request_seeds() -> None:
     results_config = _build_results_config(config, base_url="http://localhost:8000")
     assert results_config["seed"] == 20260823
     assert results_config["seed_mode"] == "sample_specific_blake2b_v1"
+    assert results_config["temperature"] == 0.9
+    assert results_config["top_p"] == 0.95
+    assert results_config["top_k"] == 50
+    assert results_config["repetition_penalty"] == 1.05
 
 
 def test_sample_specific_seed_mode_requires_non_negative_panel_seed(
@@ -127,6 +140,44 @@ def test_sample_specific_seed_mode_requires_non_negative_panel_seed(
                 sample_specific_seeds=True,
             )
         )
+
+
+def test_transcribe_artifact_records_sampling_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def _fake_transcribe(config, *, wer_config, **kwargs):
+        del config, kwargs
+        captured.update(wer_config)
+        return {"wer_summary": {}, "asr_speed": {}, "per_sample": []}
+
+    monkeypatch.setattr(
+        "benchmarks.eval.benchmark_tts_seedtts.run_seedtts_transcribe",
+        _fake_transcribe,
+    )
+    config = _config_from_cli(
+        "--seed",
+        "20260823",
+        "--sample-specific-seeds",
+        "--temperature",
+        "0.9",
+        "--top-p",
+        "0.95",
+        "--top-k",
+        "50",
+        "--repetition-penalty",
+        "1.05",
+    )
+
+    run_tts_seedtts_transcribe(config, asr_router_port=9000)
+
+    assert captured["seed"] == 20260823
+    assert captured["seed_mode"] == "sample_specific_blake2b_v1"
+    assert captured["temperature"] == 0.9
+    assert captured["top_p"] == 0.95
+    assert captured["top_k"] == 50
+    assert captured["repetition_penalty"] == 1.05
 
 
 def test_parse_concurrencies() -> None:

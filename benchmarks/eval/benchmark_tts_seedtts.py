@@ -351,6 +351,10 @@ def _build_results_config(
         "max_samples": config.max_samples,
         "sample_offset": config.sample_offset,
         "max_new_tokens": config.max_new_tokens,
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "top_k": config.top_k,
+        "repetition_penalty": config.repetition_penalty,
         "seed": config.seed,
         "seed_mode": (
             "sample_specific_blake2b_v1"
@@ -478,6 +482,15 @@ def run_tts_seedtts_transcribe(
         "max_new_tokens": config.max_new_tokens,
         "token_count": config.token_count,
         "temperature": config.temperature,
+        "top_p": config.top_p,
+        "top_k": config.top_k,
+        "repetition_penalty": config.repetition_penalty,
+        "seed": config.seed,
+        "seed_mode": (
+            "sample_specific_blake2b_v1"
+            if config.sample_specific_seeds
+            else ("shared" if config.seed is not None else "none")
+        ),
         "max_samples": config.max_samples,
         "stream": config.stream,
         "initial_codec_chunk_frames": config.initial_codec_chunk_frames,
