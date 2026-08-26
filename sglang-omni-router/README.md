@@ -1,527 +1,217 @@
-# SGLang-Omni Rust router
+# SGLang-Omni Rust Router
 
-`sgl-omni-router` is a standalone Rust router for static SGLang-Omni chat,
-speech, batch speech, transcription, translation, voice management, and
-realtime workers. It selects compatible healthy workers from correlated
-startup profiles and preserves one direct upstream attempt with bounded
-admission and joined shutdown.
+`sgl-omni-router` is a standalone Rust process that routes OpenAI-compatible
+chat, speech, transcription, translation, and realtime traffic to static
+SGLang-Omni workers. It validates worker capabilities at startup, selects one
+compatible healthy worker per request or session, and relays the original
+request and response with bounded admission.
 
-## Development setup
+The router does not launch model workers. Start each worker named by the
+selected manifest before starting the router.
 
-Install [Rustup](https://rustup.rs/), then enter this directory. The checked-in
-`rust-toolchain.toml` selects Rust 1.97.1 with rustfmt and Clippy. Rust 1.90.0
-is the minimum supported Rust version and is used only for the separate MSRV
-check.
+## Quick start
 
-```console
-rustup toolchain install 1.90.0 --profile minimal
-cargo fmt --all -- --check
-cargo check --workspace --all-targets --all-features --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo build --workspace --all-features --locked
-cargo test --workspace --all-features --locked
-cargo +1.90.0 check --workspace --all-targets --all-features --locked
-```
-
-Install `cargo-deny` 0.20.2 to run the dependency-policy check locally:
+Install [Rustup](https://rustup.rs/), enter this directory, and build the
+optimized binary:
 
 ```console
-cargo deny --locked check
+cargo build --release --locked
 ```
 
-The complete formatting, lint, build, test, documentation, dependency, and
-MSRV commands are recorded in `.github/workflows/rust-router.yml`.
-
-## Configuration
-
-The manifest is strict and limited to 64 KiB. Unknown and duplicate fields,
-uncorrelated profiles, invalid defaults, duplicate workers/targets, and
-unbounded values fail startup.
-
-```toml
-schema_version = 1
-
-[server]
-listen = "127.0.0.1:30000"
-max_connections = 1024
-
-[shutdown]
-drain_timeout_ms = 30000
-
-[logging]
-format = "json"
-filter = "info"
-
-[router]
-strategy = "round_robin" # or "least_requests"
-max_concurrent_classifications = 4
-
-[admission]
-global = 128
-# Required only when [http_generation] is configured.
-generation_http = 64
-# Configure only the media classes used by enabled routes.
-speech_http = 32
-speech_batch = 64
-transcription_http = 32
-# Configure only the WebSocket classes whose routes are enabled.
-speech_websocket = 16
-realtime_websocket = 16
-# Required only when voice_owner_worker_id is configured.
-# control = 8
-
-[health]
-interval_ms = 5000
-timeout_ms = 1000
-success_threshold = 2
-failure_threshold = 3
-max_concurrent_probes = 16
-
-[http_generation]
-trust_domain = "local"
-buffered_request_max_bytes = 8388608
-buffered_request_total_bytes = 268435456
-streamed_request_max_bytes = 536870912
-connect_timeout_ms = 5000
-request_timeout_ms = 1800000
-pool_idle_timeout_ms = 90000
-pool_max_idle_per_host = 8 # accepted range: 1 through 1024
-
-[[workers]]
-worker_id = "omni-a"
-base_url = "http://127.0.0.1:8000/"
-trust_domain = "local"
-default_model_id = "omni"
-health_path = "/health"
-
-[workers.capacity]
-generation_http = 8
-
-[[workers.service_profiles]]
-service = "generation_http"
-model_ids = ["omni"]
-message_content_forms = ["string", "typed_parts"]
-media_placements = ["top_level", "typed_parts"]
-input_modalities = ["text", "image", "audio", "video"]
-output_modalities = ["text", "audio"]
-chat_audio_formats = ["wav", "mp3", "flac", "pcm", "aac", "opus"]
-stream_modes = ["non_streaming", "streaming"]
-```
-
-Enable any subset of the media HTTP routes with one shared transport policy:
-
-```toml
-[http_media]
-routes = ["speech", "speech_batch", "transcription", "translation"]
-trust_domain = "local"
-buffered_request_max_bytes = 8388608
-buffered_request_total_bytes = 268435456
-streamed_request_max_bytes = 536870912
-connect_timeout_ms = 5000
-request_timeout_ms = 1800000
-pool_idle_timeout_ms = 90000
-pool_max_idle_per_host = 8 # accepted range: 1 through 1024
-```
-
-Enable either terminating WebSocket route independently:
-
-```toml
-[websocket]
-uri_max_bytes = 2048
-header_max_fields = 64
-header_max_bytes = 32768
-frame_max_bytes = 16777216
-worker_message_max_bytes = 67108864
-speech_config_max_bytes = 15029592
-speech_message_max_bytes = 131072
-realtime_message_max_bytes = 16777216
-connect_timeout_ms = 5000
-setup_timeout_ms = 5000
-speech_config_timeout_ms = 10000
-close_timeout_ms = 5000
-
-[websocket.speech]
-trust_domain = "local"
-
-[websocket.realtime]
-trust_domain = "local"
-```
-
-`[http_generation]`, `[http_media]`, and `[websocket]` are independently
-optional; at least one of them or a voice owner must configure a route. HTTP handlers own
-their transport settings, pooled client, request timeout, and aggregate byte
-budget. WebSocket routes use bounded connect, handshake, initial speech
-configuration, frame/message, close, and process-drain limits. All handlers
-share the bounded classifier semaphore, worker health, routing policy, and
-exact worker leases.
-
-Add only the capacity and profile rows a worker actually serves. A
-media-only worker may omit `generation_http` capacity and generation profiles,
-and may omit `default_model_id`. Requests for such a service must then provide
-an explicit body/form model; a route-model assertion only claims a configured
-worker default and cannot create one. Speech-to-text rows carry exactly one
-`task`, so transcription and translation capabilities cannot combine
-accidentally:
-
-```toml
-[workers.capacity]
-speech_http = 8
-speech_batch = 32
-transcription_http = 8
-speech_websocket = 4
-realtime_websocket = 4
-
-[[workers.service_profiles]]
-service = "speech_http"
-model_ids = ["tts"]
-response_formats = ["mp3", "opus", "aac", "flac", "wav"]
-stream_modes = ["non_streaming"]
-tasks = ["text_to_speech", "voice_clone", "voice_design"]
-reference_forms = ["none", "direct", "list", "vq_codes"]
-managed_voice = false
-
-[[workers.service_profiles]]
-service = "speech_http"
-model_ids = ["tts"]
-response_formats = ["pcm"]
-stream_modes = ["non_streaming", "streaming"]
-tasks = ["text_to_speech", "voice_clone", "voice_design"]
-reference_forms = ["none", "direct", "list", "vq_codes"]
-managed_voice = false
-
-[[workers.service_profiles]]
-service = "speech_batch"
-model_ids = ["tts"]
-response_formats = ["mp3", "opus", "aac", "flac", "wav", "pcm"]
-tasks = ["text_to_speech", "voice_clone", "voice_design"]
-reference_forms = ["none", "direct", "list", "vq_codes"]
-managed_voice = false
-max_batch_size = 32
-effective_features = ["model", "format", "task", "reference", "voice"]
-
-[[workers.service_profiles]]
-service = "transcription_http"
-model_ids = ["asr"]
-task = "transcribe" # use a separate row with task = "translate"
-response_formats = ["json", "text", "verbose_json", "srt", "vtt", "sse"]
-media_profiles = ["audio", "audio_video"]
-stream_modes = ["non_streaming", "streaming"]
-
-[[workers.service_profiles]]
-service = "speech_websocket"
-model_ids = ["tts"]
-response_formats = ["pcm"]
-stream_modes = ["non_streaming", "streaming"]
-tasks = ["text_to_speech", "voice_clone", "voice_design"]
-reference_forms = ["none", "direct", "list", "vq_codes"]
-managed_voice = false
-
-[[workers.service_profiles]]
-service = "realtime_websocket"
-protocols = ["openai_realtime_v1"]
-```
-
-`speech_batch` capacity is measured in items, not HTTP envelopes. One batch is
-never split: the router atomically reserves its complete item count from the
-class and selected worker, and one response lease returns every credit. Every
-`max_batch_size` must fit both the worker's `speech_batch` capacity and the
-configured `admission.speech_batch` limit.
-
-Voice management is enabled by adding `voice_owner_worker_id` to `[router]`, a
-`control` admission limit, and control capacity plus a `voice_control` profile
-to that exact worker:
-
-```toml
-[router]
-strategy = "round_robin"
-max_concurrent_classifications = 4
-voice_owner_worker_id = "tts-owner"
-
-[admission]
-global = 128
-control = 8
-
-[[workers]]
-worker_id = "tts-owner"
-base_url = "http://127.0.0.1:8000/"
-trust_domain = "local"
-
-[workers.capacity]
-control = 4
-
-[[workers.service_profiles]]
-service = "voice_control"
-```
-
-Merge these fields into the corresponding tables when other routes are also
-enabled. Each enabled speech, batch-speech, or speech-WebSocket consumer must
-also have a `managed_voice = true` profile row on this owner in the route's
-trust domain. Transcription and translation require no speech profile. A
-voice-only router may omit `[http_generation]`, `[http_media]`, model capacity,
-and `default_model_id`; it uses the internal bounded media transport defaults
-without installing ordinary media routes.
-
-Repeat the complete `[[workers]]`, `[workers.capacity]`, and correlated
-`[[workers.service_profiles]]` group for each static replica or heterogeneous
-worker. The stable worker fields are `worker_id`, `base_url`, and optional
-`resolved_ip`; a DNS authority requires a pinned `resolved_ip`, while Host and
-TLS SNI remain the configured URL authority. If `default_model_id` is set, that
-model must appear in a profile row for every service class advertised by the
-worker, and separately for each advertised transcription or translation task.
-Trust domains never cross.
-
-A profile row is a correlated capability claim. The router never combines a
-model from one row with modalities, forms, outputs, or stream support from
-another. A missing request model uses a worker default only when that default
-is unambiguous for the configured route trust domain.
-
-Validate configuration without binding the listener:
+Validate and run the one-worker chat example:
 
 ```console
-cargo run --locked -- --config router.toml --check-config
+./target/release/sgl-omni-router \
+  --config examples/minimal-chat.toml \
+  --check-config
+
+./target/release/sgl-omni-router \
+  --config examples/minimal-chat.toml
 ```
 
-Run the service:
+The example expects its worker at `127.0.0.1:8000`. Once `/ready` returns
+`200`, send a request through the router:
 
 ```console
-cargo run --locked -- --config router.toml
-```
-
-Send a fixed-length request:
-
-```console
-curl --http1.1 --request POST http://127.0.0.1:30000/v1/chat/completions \
+curl --http1.1 http://127.0.0.1:30000/v1/chat/completions \
   --header 'content-type: application/json' \
-  --header 'x-request-id: example-1' \
-  --data-binary '{"model":"omni","messages":[{"role":"user","content":"hello"}]}'
+  --data-binary \
+  '{"model":"chat-model","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-The media routes are:
+The checked examples are:
 
-- `POST /v1/audio/speech` for encoded audio or streaming PCM;
-- `POST /v1/audio/speech/batch` for one ordered, unsplit batch;
-- `POST /v1/audio/transcriptions` for multipart speech recognition;
-- `POST /v1/audio/translations` for multipart speech translation.
+- [minimal-chat.toml](examples/minimal-chat.toml): one text chat worker;
+- [homogeneous-omni.toml](examples/homogeneous-omni.toml): two replicas with
+  the same multimodal chat and audio-output contract;
+- [homogeneous-tts.toml](examples/homogeneous-tts.toml): two replicas serving
+  encoded speech and PCM speech streaming;
+- [homogeneous-asr.toml](examples/homogeneous-asr.toml): two replicas with
+  separate transcription and translation capability rows.
 
-When voice state is enabled, the additional routes are:
+These manifests use generic safety limits, not performance-optimal values.
+Set admission and worker capacities from the measured concurrency of the
+deployment. Configuration is strict: unknown fields, duplicate identities,
+invalid limits, or inconsistent capability rows fail `--check-config` and
+startup.
 
-- `GET /v1/audio/voices` to list uploaded voices, including the worker's
-  `names_only=true` query;
-- `POST /v1/audio/voices` to upload the original multipart body, bounded to
-  10,551,296 bytes;
-- `DELETE /v1/audio/voices/{name}` to delete one worker-owned voice.
+For the pinned toolchains and complete local quality gates, see
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
-```console
-curl --http1.1 http://127.0.0.1:30000/v1/audio/voices?names_only=true
+## Routes
 
-curl --http1.1 http://127.0.0.1:30000/v1/audio/voices \
-  --form 'audio_sample=@sample.wav' \
-  --form 'consent=true' \
-  --form 'name=sample'
+Only configured data-plane routes are installed:
 
-curl --http1.1 --request DELETE \
-  http://127.0.0.1:30000/v1/audio/voices/sample
-```
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/chat/completions` | Chat, multimodal generation, and chat audio output |
+| `POST` | `/v1/audio/speech` | Encoded speech or streaming PCM |
+| `POST` | `/v1/audio/speech/batch` | One ordered, unsplit speech batch |
+| `POST` | `/v1/audio/transcriptions` | Multipart transcription |
+| `POST` | `/v1/audio/translations` | Multipart speech translation |
+| `GET` | `/v1/audio/speech/stream` | Terminating speech WebSocket |
+| `GET` | `/v1/realtime?model=<id>` | Terminating OpenAI-compatible realtime WebSocket |
+| `GET` | `/v1/audio/voices` | List voices on the configured voice owner |
+| `POST` | `/v1/audio/voices` | Upload one voice to the configured voice owner |
+| `DELETE` | `/v1/audio/voices/{name}` | Delete one voice from the configured voice owner |
 
-The configured worker remains the only voice-store owner. The router keeps no
-voice-name cache or persistence state and performs no replication, fallback,
-retry, or reconciliation. Deployments must preserve the owner's backing voice
-storage across router restarts.
+Voice routes exist only when `router.voice_owner_worker_id` names one worker
+with control capacity and a `voice_control` profile. The router stores no voice
+registry and does not replicate or persist worker voice state.
 
-For transcription and translation, non-streaming `response_format` supports
-`json`, `text`, `verbose_json`, `srt`, and `vtt`. With `stream=true`, the form
-format must be `json` or `text`, and the worker response is relayed as SSE.
-Multipart bodies are forwarded byte-for-byte and are never reconstructed.
+Non-streaming transcription profiles may advertise `json`, `text`,
+`verbose_json`, `srt`, and `vtt`. Streaming requests use form format `json` or
+`text` and receive SSE. Translation support is independently declared by a
+`task = "translate"` profile row, so it cannot be inferred from transcription
+support. A translation row may advertise `srt` or `vtt` only when that worker
+supports segment timestamps; the checked ASR example intentionally does not.
+Speech profiles keep encoded non-streaming formats separate from PCM rows that
+support streaming.
 
-```console
-curl --http1.1 http://127.0.0.1:30000/v1/audio/transcriptions \
-  --form 'file=@sample.wav' \
-  --form 'model=asr' \
-  --form 'response_format=srt'
+The WebSocket routes terminate both handshakes and pin one worker for the
+session. Speech accepts one bounded `session.config` before worker selection;
+realtime selects and connects upstream before completing the downstream
+upgrade. Frames retain their type and order under direct destination
+backpressure.
 
-curl --http1.1 http://127.0.0.1:30000/v1/audio/speech \
-  --header 'content-type: application/json' \
-  --data-binary '{"model":"tts","input":"hello","response_format":"opus"}' \
-  --output speech.opus
-```
+`websocket.setup_timeout_ms` is one absolute pre-relay setup deadline: it
+starts after a valid speech configuration for speech and before upstream
+dispatch for realtime. It is not a relay idle timeout.
 
-On media routes, `x-sglang-omni-route-model` and
-`x-sglang-omni-route-stream` are bounded, router-local metadata assertions and
-are never sent to workers. An explicit body or form value must match its
-assertion. An absent model can be asserted only against the selected worker's
-configured default. An absent stream value means `false`, so a header-only
-`true` assertion is rejected; `true` is valid only when the body or form also
-explicitly requests streaming.
+## Configuration contracts
 
-The terminating WebSocket routes are:
+`http_media.routes` may contain any enabled subset of `speech`,
+`speech_batch`, `transcription`, and `translation`. Each enabled route needs
+its admission class, matching worker capacity, and a correlated profile in the
+same trust domain. Transcription and translation share
+`transcription_http` capacity but use separate profile rows with exactly one
+`task` value.
 
-- `GET /v1/audio/speech/stream` for speech sessions;
-- `GET /v1/realtime?model=<model-id>` for OpenAI-compatible realtime sessions.
+Speech-batch capacity is counted in items, not HTTP requests. A batch is never
+split: the router atomically acquires one global envelope plus its complete
+item count from `speech_batch` admission and one worker. Every profile
+`max_batch_size` must fit both the selected worker's batch capacity and
+`admission.speech_batch`.
 
-For example, with `websocat`:
+Enabling `websocket.speech` requires `speech_websocket` admission and worker
+capacity plus matching `speech_websocket` profiles. Enabling
+`websocket.realtime` similarly requires `realtime_websocket` admission and
+capacity plus a `realtime_websocket` profile declaring
+`openai_realtime_v1`. Each route has its own trust domain and may be enabled
+independently.
 
-```console
-websocat ws://127.0.0.1:30000/v1/audio/speech/stream
-{"type":"session.config","model":"tts","response_format":"pcm","stream_audio":true}
+Voice state has one exact owner: `router.voice_owner_worker_id` must name a
+configured worker with `control` capacity and a `voice_control` profile, and
+`admission.control` must be configured. For every enabled speech HTTP, batch,
+or speech-WebSocket consumer, that owner also needs a matching
+`managed_voice = true` row in the route's trust domain. Managed named-voice
+traffic without an explicit reference is pinned to the owner; stateless/default
+voice and explicit-reference traffic retain normal replica selection.
 
-websocat 'ws://127.0.0.1:30000/v1/realtime?model=omni'
-```
+Chat generation requires HTTP/1.1 with one valid `Content-Length` and rejects
+ambiguous or transfer-framed uploads. Fixed-length non-batch media requests can
+use a proven direct cohort; media without a usable fixed length uses the
+bounded buffered path. On media routes,
+`x-sglang-omni-route-model` and `x-sglang-omni-route-stream` are router-local
+assertions and are stripped before the upstream request. Explicit body/form
+facts must match their assertions. A model assertion can only confirm a
+configured worker default, and an absent stream value is `false`, so a
+header-only `true` stream assertion is rejected. Original body bytes are not
+reconstructed.
 
-Speech upgrades downstream first, then receives one bounded text
-`session.config`, classifies it under the shared classifier limit, selects one
-worker, and replays the exact text once. Realtime strictly validates the
-optional `model` query, selects and connects one worker before completing the
-downstream upgrade, and forwards the worker's first exact `session.created`
-event before reading client application messages. An absent realtime model
-requires one unambiguous worker default in the route trust domain. Empty,
-duplicate, malformed, or invalid model values are rejected.
+## Worker profiles and routing
 
-Both routes pin one worker for the complete session. Speech relays text and
-binary application frames; realtime relays text and rejects binary application
-frames. Accepted frames remain ordered under destination-send backpressure and
-are not parsed or copied for routing. Host and TLS SNI retain the configured
-worker authority while the router dials only its statically resolved socket
-address.
-Upstream WebSocket handshakes forward only the canonical `x-request-id` and an
-optional singular `Origin`; authorization and arbitrary client headers are not
-forwarded.
+Each worker has a static URL, trust domain, capacity table, and correlated
+service-profile rows. A profile row describes combinations the worker actually
+supports; the router never combines a model from one row with modalities,
+formats, tasks, or streaming support from another. A DNS worker authority must
+also provide `resolved_ip`; the router preserves the configured authority for
+HTTP `Host` and TLS SNI while dialing the pinned address.
 
-There is one upstream attempt and no retry, failover, proxy, ambient DNS, or
-worker reselection. The router owns only connect, handshake, initial speech
-configuration, close, and process-drain deadlines. Speech application idleness
-remains a worker contract, so the router has no speech idle timer.
+Homogeneous means replicas of the same service contract, not merely multiple
+workers and not different models. At startup, the router proves content-blind
+eligibility separately for generation and each media service/task from worker
+defaults and correlated rows. A fixed-length, non-batch request can then use
+the direct path without body classification. Batch speech is always classified
+because the body owns its item-credit requirement.
 
-`speech_config_timeout_ms` bounds receipt of the initial speech configuration.
-After that event for speech, and before dispatch for realtime, the single
-`setup_timeout_ms` deadline covers classification, connect and handshake, the
-required first worker event, and its initial downstream send; `connect_timeout_ms`
-remains a separate upper bound on TCP connect.
+Heterogeneous cohorts and requests with body-owned routing facts use the
+bounded path: reserve aggregate byte capacity, buffer once, classify once on
+the shared blocking-work limit, select one compatible worker, and relay the
+original bytes unchanged. Both paths make one upstream attempt and retain
+admission and exact-worker leases through response EOF, error, or downstream
+drop.
 
-## Routing and resource ownership
+`round_robin` is the default strategy for equal replicas. `least_requests` is
+also available and selects from current exact worker-capacity occupancy with
+deterministic ties. Neither policy is universally faster; qualify the policy
+with the deployment's models, topology, and workload.
 
-At startup the router proves content-blind cohorts separately for generation
-and for each media service and speech-to-text task. Generation authorities in a
-trust domain must have identical default-model semantics and correlated rows;
-media workers must match for the specific service and task. Equal replicas and
-a sole route authority can satisfy a proof; worker count by itself cannot.
-`speech_batch` is always classified because its item credits come from the
-body.
-
-With voice state enabled, a nonempty non-default voice without an explicit
-reference is conservatively pinned to the configured owner for speech HTTP,
-the whole speech batch, and speech WebSocket sessions. Default voices and
-requests carrying explicit references remain stateless and use normal policy
-routing. A mixed owner/non-owner speech cohort is classified once because the
-affinity fact is body-owned; content-blind speech dispatch remains available
-when voice state is disabled or every eligible member is the owner.
-
-Only fixed-length non-batch requests are eligible for the direct fast path. In
-a proven cohort they use direct streaming request and response adapters without
-buffering, parsing, classification work, or byte/classifier permits. Malformed
-JSON and unsupported models are delegated to equivalent workers.
-
-When a request is not direct-eligible, the router reserves aggregate byte
-capacity, buffers once, and performs one bounded Serde classification in a
-bounded `spawn_blocking` slot. It then selects one compatible worker and uses
-the same direct response adapter. Body size controls acceptance only; it never
-decides whether routing facts are needed.
-
-Global, route-class, and voice-control admission are fail-fast. Each worker has one exact
-semaphore per configured class, which is the sole mutable load authority. Round
-robin is the default. Least requests snapshots occupancy, orders deterministic
-ties, and reserves under one short policy guard; no lock crosses network or
-body work. All permits remain held through response EOF/error/drop.
-
-The chat-generation route accepts HTTP/1.1 `POST` without a query, exactly one
-valid `Content-Length`, and `application/json` with an optional UTF-8 charset.
-It rejects transfer encoding, trailers, expectations, content encoding, route
-internal worker-routing headers, ambiguous lengths, and oversized bodies before
-admission and dispatch. Media requests without a usable fixed length take the
-bounded buffered path. Non-POST methods use the same bounded JSON error and
-request-ID contract.
-
-One valid printable `x-request-id` of at most 128 bytes is preserved. A missing
-ID is generated. Duplicate, empty, or oversized representable IDs are rejected
-and replaced on the bounded error response. Invalid raw HTTP header bytes may
-be rejected by the HTTP parser before route dispatch. The canonical value is
-sent to the worker and echoed downstream.
-
-Admission is fail-fast. Global, generation, and exact worker permits are
-retained until response EOF, response error, or downstream drop. The request
-timeout covers upload, connection, classification when required, and upstream
-response headers. After headers are committed, response streaming has no
-wall-clock deadline: it ends on upstream EOF/error, downstream disconnect, or
-process drain. There is one upstream attempt and no queue or retry.
-
-The shared Reqwest client uses HTTP/1.1 pooling and pinned targets. Redirects,
-ambient proxies, automatic retries, and automatic response decompression are
-disabled. Responses preserve accepted status, encoded bytes, content framing,
-and duplicate allowlisted cache headers; hop-by-hop, topology, cookie, and
-unapproved headers are removed.
-
-`--help` and `--version` do not require a configuration file.
-
-## Operations
-
-The following read-only routes inherit the router's mandatory loopback listener
-validation and remain available while the router is unready:
-
-- `GET /v1/models` returns a startup-precomputed, sorted, deduplicated union of
-  model IDs from correlated worker profiles and configured worker defaults. It
-  uses the direct SGLang-Omni `ModelList`, `ModelCard`, and default permission
-  schema and never contacts a worker.
-- `GET /metrics` returns Prometheus 0.0.4 text rendered from current lifecycle,
-  readiness, health, disposition, admission semaphores, and exact worker
-  capacity semaphores.
-- `GET /diagnostics` returns bounded JSON with lifecycle, readiness, fixed-order
-  admission state, and registration-ordered worker ID, ordinal, health,
-  disposition, and configured capacities.
-
-These endpoints require HTTP/1.1 with no query or body. `HEAD` and every other
-unsupported method return `405` with `Allow: GET`. Responses provide an exact
-content type and length plus `Cache-Control: no-store`. They do not contact
-workers or mutate routing state.
-
-Metrics have fixed labels and cardinality: five lifecycle states, three health
-states, two dispositions, global plus seven admission classes, and seven
-worker-capacity classes. The metric families are:
-
-- `sglang_omni_router_lifecycle` and `sglang_omni_router_ready`;
-- `sglang_omni_router_workers_by_health` and
-  `sglang_omni_router_workers_by_disposition`;
-- `sglang_omni_router_admission_limit` and
-  `sglang_omni_router_admission_in_flight`;
-- `sglang_omni_router_worker_capacity_limit` and
-  `sglang_omni_router_worker_capacity_in_flight`.
-
-Permit use is sampled from the enforcing semaphores at scrape time; request
-paths perform no metric mutation. Metrics contain no worker URL, model,
-request, voice, session, or error labels. Diagnostics exclude worker targets,
-trust domains, health paths, credentials, headers, request IDs, model inputs,
-media, and voice names. The default tracing path remains limited to lifecycle,
-health transitions, and exceptional failures; there are no per-request spans,
-access logs, or stage histograms.
+The listener must be loopback because the router has no client authentication.
+Use a separately managed local TLS/auth proxy when external access is needed.
 
 ## Health, readiness, and shutdown
 
-Workers start `Unknown`. One joined task per worker performs status-only probes
-through one shared probe semaphore. The deployment defaults mark a worker
-unhealthy after three consecutive failures and recover it after two
-consecutive successes. Immediate notifications coalesce. Transport or protocol
-faults request a probe but do not directly change health; ordinary worker 4xx
-responses are relayed and do not mark the worker unhealthy.
+- `GET /live` reports process liveness.
+- `GET /ready` returns `200` only while serving and every configured route has
+  a compatible healthy worker. Voice state also requires its exact owner.
+- Workers begin `Unknown`. Periodic status-only probes apply the configured
+  consecutive success and failure thresholds; transport/protocol failures can
+  request an immediate probe.
+- Worker application errors are relayed and do not directly change health.
+- Capacity exhaustion does not make a worker unhealthy.
 
-Exact `GET /live` reports process liveness. `GET /ready` is registered and
-returns `200` only while serving and at least one compatible healthy worker
-exists for chat and every enabled media or WebSocket route. When voice state is
-enabled, the exact owner must also be healthy and serving. Exhausted capacity
-remains healthy; draining or unhealthy workers are not dispatchable. No
-router-local `/health` or worker CRUD route is registered. Disabled media,
-voice-management, and WebSocket routes are not installed and return `404`.
+The first `SIGINT` or `SIGTERM` fails readiness, closes admission, stops new
+dispatch, asks tracked WebSockets to close, cancels health work, and joins
+owned work within `shutdown.drain_timeout_ms`. A distinct second signal forces
+a failed shutdown.
 
-On the first `SIGINT` or `SIGTERM`, readiness fails, admission and exact worker
-semaphores close, tracked WebSocket sessions receive a service-restart close,
-health tasks are cancelled, and the server, health tasks, and upgraded sessions
-are joined within `shutdown.drain_timeout_ms`. A distinct second signal forces
-a failed shutdown. Health never terminates worker processes and is not a
-circuit breaker.
+## Operations
+
+The mandatory loopback boundary also owns these read-only routes:
+
+- `GET /v1/models`: startup-precomputed, sorted model inventory;
+- `GET /metrics`: Prometheus lifecycle, readiness, worker-state, admission,
+  and capacity gauges rendered from current enforcing state;
+- `GET /diagnostics`: bounded worker, lifecycle, admission, and capacity JSON.
+
+Operations endpoints never contact workers or mutate request-path metrics.
+They require HTTP/1.1 with no query or body. Unsupported methods return `405`
+with `Allow: GET`. Diagnostics are redacted and fixed-order; default tracing is
+limited to lifecycle, health, and exceptions, with no access logs, per-request
+spans, or stage histograms.
+
+One process-wide canonical `x-request-id` covers data, WebSocket, health,
+operations, `404`, and `405` responses. A valid caller value is preserved;
+otherwise the router generates one. Where a worker is contacted, that same ID
+is authoritative upstream and downstream.
+
+## Current scope
+
+The router intentionally uses one static manifest and one multi-threaded Rust
+process. It does not provide dynamic worker CRUD or discovery, queues, circuit
+breakers, cache-aware or PD routing, CP/DP shared state, Python bindings,
+model-worker supervision, or a Python-router compatibility API. One committed
+request or session has no in-request retry, worker reselection, or failover;
+later requests continue to select from workers that remain healthy. The router
+also does not replace GPU model CI or provide benchmark qualification tooling.
