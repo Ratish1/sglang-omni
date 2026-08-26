@@ -1,9 +1,10 @@
 # SGLang-Omni Rust router
 
 `sgl-omni-router` is a standalone Rust router for static SGLang-Omni chat,
-speech, batch speech, transcription, translation, and realtime workers. It selects
-compatible healthy workers from correlated startup profiles and preserves one
-direct upstream attempt with bounded admission and joined shutdown.
+speech, batch speech, transcription, translation, voice management, and
+realtime workers. It selects compatible healthy workers from correlated
+startup profiles and preserves one direct upstream attempt with bounded
+admission and joined shutdown.
 
 ## Development setup
 
@@ -66,6 +67,8 @@ transcription_http = 32
 # Configure only the WebSocket classes whose routes are enabled.
 speech_websocket = 16
 realtime_websocket = 16
+# Required only when voice_owner_worker_id is configured.
+# control = 8
 
 [health]
 interval_ms = 5000
@@ -145,7 +148,7 @@ trust_domain = "local"
 ```
 
 `[http_generation]`, `[http_media]`, and `[websocket]` are independently
-optional, but at least one route owner must be configured. HTTP handlers own
+optional; at least one of them or a voice owner must configure a route. HTTP handlers own
 their transport settings, pooled client, request timeout, and aggregate byte
 budget. WebSocket routes use bounded connect, handshake, initial speech
 configuration, frame/message, close, and process-drain limits. All handlers
@@ -224,6 +227,40 @@ class and selected worker, and one response lease returns every credit. Every
 `max_batch_size` must fit both the worker's `speech_batch` capacity and the
 configured `admission.speech_batch` limit.
 
+Voice management is enabled by adding `voice_owner_worker_id` to `[router]`, a
+`control` admission limit, and control capacity plus a `voice_control` profile
+to that exact worker:
+
+```toml
+[router]
+strategy = "round_robin"
+max_concurrent_classifications = 4
+voice_owner_worker_id = "tts-owner"
+
+[admission]
+global = 128
+control = 8
+
+[[workers]]
+worker_id = "tts-owner"
+base_url = "http://127.0.0.1:8000/"
+trust_domain = "local"
+
+[workers.capacity]
+control = 4
+
+[[workers.service_profiles]]
+service = "voice_control"
+```
+
+Merge these fields into the corresponding tables when other routes are also
+enabled. Each enabled speech, batch-speech, or speech-WebSocket consumer must
+also have a `managed_voice = true` profile row on this owner in the route's
+trust domain. Transcription and translation require no speech profile. A
+voice-only router may omit `[http_generation]`, `[http_media]`, model capacity,
+and `default_model_id`; it uses the internal bounded media transport defaults
+without installing ordinary media routes.
+
 Repeat the complete `[[workers]]`, `[workers.capacity]`, and correlated
 `[[workers.service_profiles]]` group for each static replica or heterogeneous
 worker. The stable worker fields are `worker_id`, `base_url`, and optional
@@ -265,6 +302,31 @@ The media routes are:
 - `POST /v1/audio/speech/batch` for one ordered, unsplit batch;
 - `POST /v1/audio/transcriptions` for multipart speech recognition;
 - `POST /v1/audio/translations` for multipart speech translation.
+
+When voice state is enabled, the additional routes are:
+
+- `GET /v1/audio/voices` to list uploaded voices, including the worker's
+  `names_only=true` query;
+- `POST /v1/audio/voices` to upload the original multipart body, bounded to
+  10,551,296 bytes;
+- `DELETE /v1/audio/voices/{name}` to delete one worker-owned voice.
+
+```console
+curl --http1.1 http://127.0.0.1:30000/v1/audio/voices?names_only=true
+
+curl --http1.1 http://127.0.0.1:30000/v1/audio/voices \
+  --form 'audio_sample=@sample.wav' \
+  --form 'consent=true' \
+  --form 'name=sample'
+
+curl --http1.1 --request DELETE \
+  http://127.0.0.1:30000/v1/audio/voices/sample
+```
+
+The configured worker remains the only voice-store owner. The router keeps no
+voice-name cache or persistence state and performs no replication, fallback,
+retry, or reconciliation. Deployments must preserve the owner's backing voice
+storage across router restarts.
 
 For transcription and translation, non-streaming `response_format` supports
 `json`, `text`, `verbose_json`, `srt`, and `vtt`. With `stream=true`, the form
@@ -345,6 +407,14 @@ a sole route authority can satisfy a proof; worker count by itself cannot.
 `speech_batch` is always classified because its item credits come from the
 body.
 
+With voice state enabled, a nonempty non-default voice without an explicit
+reference is conservatively pinned to the configured owner for speech HTTP,
+the whole speech batch, and speech WebSocket sessions. Default voices and
+requests carrying explicit references remain stateless and use normal policy
+routing. A mixed owner/non-owner speech cohort is classified once because the
+affinity fact is body-owned; content-blind speech dispatch remains available
+when voice state is disabled or every eligible member is the owner.
+
 Only fixed-length non-batch requests are eligible for the direct fast path. In
 a proven cohort they use direct streaming request and response adapters without
 buffering, parsing, classification work, or byte/classifier permits. Malformed
@@ -356,7 +426,7 @@ bounded `spawn_blocking` slot. It then selects one compatible worker and uses
 the same direct response adapter. Body size controls acceptance only; it never
 decides whether routing facts are needed.
 
-Global and route-class admission are fail-fast. Each worker has one exact
+Global, route-class, and voice-control admission are fail-fast. Each worker has one exact
 semaphore per configured class, which is the sole mutable load authority. Round
 robin is the default. Least requests snapshots occupancy, orders deterministic
 ties, and reserves under one short policy guard; no lock crosses network or
@@ -402,10 +472,12 @@ responses are relayed and do not mark the worker unhealthy.
 
 Exact `GET /live` reports process liveness. `GET /ready` is registered and
 returns `200` only while serving and at least one compatible healthy worker
-exists for chat and every enabled media or WebSocket route. Exhausted capacity
+exists for chat and every enabled media or WebSocket route. When voice state is
+enabled, the exact owner must also be healthy and serving. Exhausted capacity
 remains healthy; draining or unhealthy workers are not dispatchable. No
 router-local `/health`, worker CRUD, or metrics route is registered. Disabled
-media and WebSocket routes are not installed and return `404`.
+media, voice-management, and WebSocket routes are not installed and return
+`404`.
 
 On the first `SIGINT` or `SIGTERM`, readiness fails, admission and exact worker
 semaphores close, tracked WebSocket sessions receive a service-restart close,
