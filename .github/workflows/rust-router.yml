@@ -22,7 +22,7 @@ env:
 
 jobs:
   rust-router:
-    name: foundation
+    name: routing-health
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -120,10 +120,25 @@ jobs:
           format = "json"
           filter = "info"
 
+          [router]
+          strategy = "round_robin"
+          max_concurrent_classifications = 4
+
           [admission]
           global = 128
+          generation_http = 64
+
+          [health]
+          interval_ms = 5000
+          timeout_ms = 1000
+          success_threshold = 2
+          failure_threshold = 3
+          max_concurrent_probes = 16
 
           [http_generation]
+          trust_domain = "local"
+          buffered_request_max_bytes = 8388608
+          buffered_request_total_bytes = 268435456
           streamed_request_max_bytes = 536870912
           connect_timeout_ms = 5000
           request_timeout_ms = 1800000
@@ -133,6 +148,22 @@ jobs:
           [[workers]]
           worker_id = "omni-a"
           base_url = "http://127.0.0.1:8000/"
+          trust_domain = "local"
+          default_model_id = "omni"
+          health_path = "/health"
+
+          [workers.capacity]
+          generation_http = 8
+
+          [[workers.service_profiles]]
+          service = "generation_http"
+          model_ids = ["omni"]
+          message_content_forms = ["string"]
+          media_placements = []
+          input_modalities = ["text"]
+          output_modalities = ["text"]
+          chat_audio_formats = []
+          stream_modes = ["non_streaming"]
           EOF
 
           "$binary" --config "$config" --check-config
