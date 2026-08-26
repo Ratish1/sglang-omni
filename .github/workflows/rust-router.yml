@@ -119,6 +119,20 @@ jobs:
           [logging]
           format = "json"
           filter = "info"
+
+          [admission]
+          global = 128
+
+          [http_generation]
+          streamed_request_max_bytes = 536870912
+          connect_timeout_ms = 5000
+          request_timeout_ms = 1800000
+          pool_idle_timeout_ms = 90000
+          pool_max_idle_per_host = 8
+
+          [[workers]]
+          worker_id = "omni-a"
+          base_url = "http://127.0.0.1:8000/"
           EOF
 
           "$binary" --config "$config" --check-config
