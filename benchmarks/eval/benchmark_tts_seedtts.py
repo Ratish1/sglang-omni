@@ -275,6 +275,9 @@ class TtsSeedttsBenchmarkConfig:
     # examples/configs/dots_tts.yaml to run the canonical optimized
     # deployment).
     server_config: str | None = None
+    # Engine stage targeted by managed-server scheduling overrides. Omit for
+    # compatibility with pre-config-refactor launchers.
+    server_engine_stage: str | None = None
     # SGLang quantization mode (e.g. fp8) forwarded to the TTS generation
     # stage; recorded as run provenance so bf16 vs fp8 archives are
     # distinguishable. None = bf16.
@@ -371,6 +374,7 @@ def _build_results_config(
         "overshoot_duration_s": config.overshoot_duration_s,
         "cuda_graph_max_bs": config.cuda_graph_max_bs,
         "server_config": config.server_config,
+        "server_engine_stage": config.server_engine_stage,
         "quantization": config.quantization,
     }
 
@@ -546,6 +550,7 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         overshoot_duration_s=args.overshoot_duration_s,
         cuda_graph_max_bs=args.cuda_graph_max_bs,
         server_config=args.server_config,
+        server_engine_stage=args.server_engine_stage,
         quantization=args.quantization,
         lang=args.lang,
         device=args.device,
@@ -1045,6 +1050,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--server-engine-stage",
+        default=None,
+        help=(
+            "Engine stage targeted by managed-server scheduling and "
+            "quantization overrides (for example, tts_engine)."
+        ),
+    )
+    parser.add_argument(
         "--quantization",
         type=str,
         default=None,
@@ -1188,6 +1201,7 @@ def main() -> None:
             port=config.port,
             host=config.host,
             server_config=config.server_config,
+            engine_stage=config.server_engine_stage,
             max_running_requests=config.max_running_requests,
             max_queued_requests=config.max_queued_requests,
             cuda_graph_max_bs=config.cuda_graph_max_bs,

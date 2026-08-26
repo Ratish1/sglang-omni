@@ -60,6 +60,7 @@ def test_repetition_tail_generation_command_has_one_to_one_capture_contract(
     assert "--sample-specific-seeds" in command
     assert command[command.index("--warmup") + 1] == "0"
     assert command[command.index("--concurrency") + 1] == "16"
+    assert command[command.index("--server-engine-stage") + 1] == "tts_engine"
     assert command[command.index("--repetition-penalty") + 1] == "1.05"
     assert command[command.index("--max-samples") + 1] == "42"
     assert "--generate-only" in command

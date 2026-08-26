@@ -250,6 +250,7 @@ def managed_omni_server(
     host: str,
     log_file: Path | None,
     server_config: str | None = None,
+    engine_stage: str | None = None,
     max_running_requests: int | None = None,
     max_queued_requests: int | None = None,
     cuda_graph_max_bs: int | None = None,
@@ -259,6 +260,12 @@ def managed_omni_server(
     wait_for_gpu_release: bool = True,
 ) -> Iterator[None]:
     """Start an ``sglang_omni.cli serve`` process and clean it up on exit."""
+
+    def engine_option(name: str) -> str:
+        if engine_stage is None:
+            return f"--{name.replace('_', '-')}"
+        return f"--{engine_stage}.engine.{name}"
+
     _ensure_port_available(host, port)
     cmd = [
         sys.executable,
@@ -275,15 +282,15 @@ def managed_omni_server(
     if server_config is not None:
         cmd.extend(["--config", server_config])
     if max_running_requests is not None:
-        cmd.extend(["--max-running-requests", str(max_running_requests)])
+        cmd.extend([engine_option("max_running_requests"), str(max_running_requests)])
     if max_queued_requests is not None:
-        cmd.extend(["--max-queued-requests", str(max_queued_requests)])
+        cmd.extend([engine_option("max_queued_requests"), str(max_queued_requests)])
     if cuda_graph_max_bs is not None:
-        cmd.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
+        cmd.extend([engine_option("cuda_graph_max_bs"), str(cuda_graph_max_bs)])
     if mem_fraction_static is not None:
         cmd.extend(["--mem-fraction-static", str(mem_fraction_static)])
     if quantization is not None:
-        cmd.extend(["--quantization", quantization])
+        cmd.extend([engine_option("quantization"), quantization])
     logger.info(f"Starting server: {' '.join(cmd)}")
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)

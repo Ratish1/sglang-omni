@@ -69,6 +69,17 @@ def test_seedtts_benchmark_batch_args_are_independent() -> None:
     assert results_config["max_queued_requests"] == 16
 
 
+def test_seedtts_benchmark_records_managed_server_engine_stage() -> None:
+    config = _config_from_cli("--server-engine-stage", "tts_engine")
+
+    assert config.server_engine_stage == "tts_engine"
+    results_config = _build_results_config(
+        config,
+        base_url="http://localhost:8000",
+    )
+    assert results_config["server_engine_stage"] == "tts_engine"
+
+
 def test_seedtts_benchmark_records_quantization() -> None:
     config = _config_from_cli("--quantization", "fp8")
     assert config.quantization == "fp8"
