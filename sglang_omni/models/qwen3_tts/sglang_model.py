@@ -1107,8 +1107,15 @@ class Qwen3TTSTalker(nn.Module):
             last_index = self._extend_last_index(forward_batch, hidden_states.device)
             hidden_states = hidden_states[last_index]
         logits, _ = self.codec_head(hidden_states)
+        # Note: SGLang hands the sampler float32 logits on every LogitsProcessor
+        # path (the shared decode-graph buffer asserts torch.float, the
+        # non-buffer branch calls .float()). This model builds
+        # LogitsProcessorOutput itself and owes the sampler the same dtype:
+        # temperature division, softmax, the top-k sort and the top-p prefix
+        # sum all run in place on this tensor, so bfloat16 here quantizes the
+        # sampling distribution before any of them see it.
         logits_output = LogitsProcessorOutput(
-            next_token_logits=logits,
+            next_token_logits=logits.float(),
             hidden_states=hidden_states,
         )
         return logits_output
