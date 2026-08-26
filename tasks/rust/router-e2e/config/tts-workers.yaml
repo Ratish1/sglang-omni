@@ -1,0 +1,17 @@
+launcher:
+  backend: local
+  model_path: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+  model_name: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+  num_workers: 2
+  num_gpus_per_worker: 1
+  worker_host: 127.0.0.1
+  worker_base_port: 8011
+  worker_gpu_ids: ["0", "1"]
+  worker_extra_args: >-
+    --tts_engine.engine.max_running_requests 64
+    --tts_engine.engine.cuda_graph_max_bs 64
+    --tts_engine.engine.torch_compile_max_bs 64
+    --vocoder.process vocoder
+    --tts_engine.gpu_memory_fraction 0.85
+    --vocoder.gpu_memory_fraction 0.10
+  wait_timeout: 600

@@ -1,0 +1,15 @@
+launcher:
+  backend: local
+  model_path: marksverdhei/Qwen3-Omni-30B-A3B-FP8
+  model_name: qwen3-omni
+  num_workers: 2
+  num_gpus_per_worker: 1
+  worker_host: 127.0.0.1
+  worker_base_port: 8011
+  worker_gpu_ids: ["0", "1"]
+  worker_extra_args: >-
+    --config examples/configs/qwen3_omni_colocated_h100_fp8.yaml
+    --colocate
+    --preprocessing.factory.max_seq_len 32768
+    --thinker.factory.max_seq_len 32768
+  wait_timeout: 1200
