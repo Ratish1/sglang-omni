@@ -1107,10 +1107,16 @@ class Qwen3TTSTalker(nn.Module):
             last_index = self._extend_last_index(forward_batch, hidden_states.device)
             hidden_states = hidden_states[last_index]
         logits, _ = self.codec_head(hidden_states)
-        # Match SGLang's LogitsProcessor and HF generation by handing the
-        # sampler float32 logits while retaining model-dtype hidden states.
+        logits_buffer = forward_batch.next_token_logits_buffer
+        if logits_buffer is None:
+            logits = logits.float()
+        else:
+            assert logits_buffer.dtype == torch.float
+            assert logits_buffer.shape == logits.shape
+            logits_buffer.copy_(logits)
+            logits = logits_buffer
         logits_output = LogitsProcessorOutput(
-            next_token_logits=logits.float(),
+            next_token_logits=logits,
             hidden_states=hidden_states,
         )
         return logits_output
