@@ -414,6 +414,7 @@ def test_preprocess_and_build_request_share_prepared_state(
     assert request_data.max_new_tokens == 5
     assert request_data.temperature == 0.0
     assert request_data.req.sampling_params.sampling_seed == 7
+    assert request_data.req.sampling_params.repetition_penalty == 1.1
     # Stop on the full 200-id control range, not only EOS_ID.
     assert request_data.req.sampling_params.stop_token_ids == set(
         request_builders.CONTROL_TOKEN_IDS

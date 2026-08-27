@@ -17,6 +17,20 @@ from .sglang_model import VOCAB_SIZE
 class FunCosyVoice3ModelRunner(ModelRunner):
     """Runs Fun-CosyVoice3 AR steps and collects generated speech tokens."""
 
+    def _execution_context(
+        self,
+        schedule_batch: Any,
+        *,
+        isolate_sampling: bool = False,
+    ):
+        if schedule_batch.forward_mode.is_extend():
+            self._restore_repetition_penalty_history(schedule_batch)
+            self._restore_min_new_tokens_progress(schedule_batch)
+        return super()._execution_context(
+            schedule_batch,
+            isolate_sampling=isolate_sampling,
+        )
+
     def custom_prefill_forward(
         self,
         forward_batch: Any,
@@ -65,6 +79,10 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         del forward_batch, schedule_batch, requests
         return True
 
+    def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
+        """Leave repetition-penalty ownership to SGLang sampling state."""
+        del logits_output, requests
+
     def _collect_tokens(
         self,
         result: Any,
@@ -106,7 +124,16 @@ class FunCosyVoice3ModelRunner(ModelRunner):
                 raise RuntimeError(
                     "Fun-CosyVoice3 prefill requires prompt_input_embeds"
                 )
-            pieces.append(prompt_embeds[prefix_len : prefix_len + req_len])
+            input_embeds = prompt_embeds
+            if req.output_ids:
+                output_ids = torch.tensor(
+                    req.output_ids,
+                    dtype=torch.long,
+                    device=prompt_embeds.device,
+                )
+                generated_embeds = self.model.speech_embedding(output_ids)
+                input_embeds = torch.cat([prompt_embeds, generated_embeds], dim=0)
+            pieces.append(input_embeds[prefix_len : prefix_len + req_len])
         return torch.cat(pieces, dim=0).to(
             device=forward_batch.input_ids.device,
             dtype=next(self.model.parameters()).dtype,

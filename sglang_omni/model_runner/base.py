@@ -946,6 +946,32 @@ class ModelRunner:
         scaling_penalties[row_indices, token_indices] = penalty_values
 
     @staticmethod
+    def _restore_min_new_tokens_progress(schedule_batch: Any) -> None:
+        from sglang.srt.sampling.penaltylib import BatchedMinNewTokensPenalizer
+
+        orchestrator = schedule_batch.sampling_info.penalizer_orchestrator
+        if orchestrator is None:
+            return
+
+        min_new_tokens_penalizer = orchestrator.penalizers.get(
+            BatchedMinNewTokensPenalizer
+        )
+        if (
+            min_new_tokens_penalizer is not None
+            and min_new_tokens_penalizer.is_prepared()
+        ):
+            retained_lengths = [len(req.output_ids) for req in schedule_batch.reqs]
+            if not any(retained_lengths):
+                return
+            len_output_tokens = min_new_tokens_penalizer.len_output_tokens
+            retained_lengths_tensor = torch.tensor(
+                retained_lengths,
+                dtype=len_output_tokens.dtype,
+                device=len_output_tokens.device,
+            ).unsqueeze(1)
+            len_output_tokens.copy_(retained_lengths_tensor)
+
+    @staticmethod
     def _rep_penalty_unique_tokens(data: Any, output_ids: list, vocab: int) -> set:
         # Note: (Jiaxin Deng) rebuilding unique(output_ids) every decode step is
         # quadratic over the generation; track the consumed prefix and fold in
