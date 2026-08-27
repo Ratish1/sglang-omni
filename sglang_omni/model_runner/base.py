@@ -896,6 +896,56 @@ class ModelRunner:
         return bool(req.is_retracted)
 
     @staticmethod
+    def _restore_repetition_penalty_history(schedule_batch: Any) -> None:
+        """Seed a fresh SGLang penalizer from retained output token IDs.
+
+        Retraction can preserve generated output IDs while prepare_for_extend
+        creates fresh SGLang sampling state. Restore those retained IDs before
+        the re-prefill sample; subsequent decode steps resume SGLang's normal
+        one-token accumulation.
+        """
+        from sglang.srt.sampling.penaltylib import BatchedRepetitionPenalizer
+
+        orchestrator = schedule_batch.sampling_info.penalizer_orchestrator
+        if orchestrator is None:
+            return
+
+        penalizer = orchestrator.penalizers.get(BatchedRepetitionPenalizer)
+        if penalizer is None or not penalizer.is_prepared():
+            return
+
+        vocab_size = int(orchestrator.vocab_size)
+        rows: list[int] = []
+        token_ids: list[int] = []
+        penalties: list[float] = []
+        for row, req in enumerate(schedule_batch.reqs):
+            penalty = float(req.sampling_params.repetition_penalty)
+            if penalty == 1.0:
+                continue
+            retained_ids = {
+                token_id
+                for token_id in (int(value) for value in req.output_ids)
+                if 0 <= token_id < vocab_size
+            }
+            rows.extend([row] * len(retained_ids))
+            token_ids.extend(retained_ids)
+            penalties.extend([penalty] * len(retained_ids))
+
+        if not rows:
+            return
+
+        scaling_penalties = penalizer.get_scaling_penalties()
+        device = scaling_penalties.device
+        row_indices = torch.tensor(rows, dtype=torch.long, device=device)
+        token_indices = torch.tensor(token_ids, dtype=torch.long, device=device)
+        penalty_values = torch.tensor(
+            penalties,
+            dtype=scaling_penalties.dtype,
+            device=device,
+        )
+        scaling_penalties[row_indices, token_indices] = penalty_values
+
+    @staticmethod
     def _rep_penalty_unique_tokens(data: Any, output_ids: list, vocab: int) -> set:
         # Note: (Jiaxin Deng) rebuilding unique(output_ids) every decode step is
         # quadratic over the generation; track the consumed prefix and fold in
