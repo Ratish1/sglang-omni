@@ -16,8 +16,7 @@ Run every command from the repository root. Do not run another benchmark, model 
 git status --short --branch
 git rev-parse HEAD
 python -m benchmarks.dataset.prepare --dataset seedtts
-python -m benchmarks.dataset.prepare --dataset seedtts-50
-python -m benchmarks.dataset.prepare --dataset mmmu-ci-50
+python -m benchmarks.dataset.prepare --dataset mmmu
 (cd sglang-omni-router && cargo build --release --locked)
 oha --version
 ulimit -n
@@ -78,188 +77,180 @@ Router-only acceptance is deliberately conservative:
 - direct workers must sustain at least 1.20 times Python throughput. A Rust result at the direct ceiling remains valid when it materially exceeds Python;
 - Rust must provide at least 1.15 times Python throughput and 1.15 times CPU efficiency at a conclusive proxy-bound point;
 - if `info` versus `error` median throughput or p99 differs by more than 5%, repeat the sentinel with an otherwise idle host; do not attribute the difference until it repeats;
-- least requests is a mechanics sentinel only. It does not reopen the H100 policy search.
+- the least-requests sentinel checks selector mechanics only. The full-model campaign below selects the H100 policy.
 
 ## Layer C: two-H100 model qualification
 
-Use one complete worker per H100 at ports 8011 and 8012, with the candidate router at 30000. Keep both workers alive while switching routers. Never rebuild or restart workers within an A/B block.
+This is the next H100 run. It selects the Rust policy before comparing Rust with Python. Do not change production router code during this campaign.
 
-Use three measured paired rounds in this order:
+Use one complete worker per H100 at ports 8011 and 8012 and the temporary router at port 30000. Keep workers alive while switching policies or router implementations. Never rebuild the router or restart workers inside a paired block.
 
-| Trial | Candidate |
-| ---: | --- |
-| 1 | Python round robin (A) |
-| 2 | Rust round robin (B) |
-| 3 | Rust round robin (B) |
-| 4 | Python round robin (A) |
-| 5 | Python round robin (A) |
-| 6 | Rust round robin (B) |
-
-This is `AB`, `BA`, `AB`: three paired rounds with the first four trials forming ABBA. Add two rounds (`BA`, then `AB`) only when the observed ordering/noise can change the decision. Run one separate Python `least_request` trial at the selected concurrency to record current CI behavior; never use it for the implementation-isolation comparison.
-
-### Terminal layout
-
-Terminal 1 owns workers for one topology and remains open:
+### 1. Prepare the full datasets and policy configs
 
 ```bash
-export ROUTER_GPU_IDS=0,1  # for example, 2,3 on a reserved pair
+python -m benchmarks.dataset.prepare --dataset seedtts
+python -m benchmarks.dataset.prepare --dataset mmmu
+
+mkdir -p results/router-policy-config
+for NAME in asr tts omni-fp8 omni-bf16; do
+  cp "tasks/rust/router-e2e/config/${NAME}-rust.toml" \
+    "results/router-policy-config/${NAME}-round-robin.toml"
+  sed 's/strategy = "round_robin"/strategy = "least_requests"/' \
+    "tasks/rust/router-e2e/config/${NAME}-rust.toml" \
+    > "results/router-policy-config/${NAME}-least-requests.toml"
+done
+```
+
+These are runtime test configs under `results/`; do not commit them. Rust policy spelling is `round_robin` or `least_requests`. Python policy spelling is `round_robin` or `least_request`.
+
+Full-corpus selection is intentionally different between benchmarks:
+
+| Workload | Full-corpus arguments |
+| --- | --- |
+| ASR | `--meta zhaochenyang20/seed-tts-eval-arrow --max-samples 0` (1,088 EN samples) |
+| Standalone and Omni TTS | `--meta zhaochenyang20/seed-tts-eval-arrow` and omit `--max-samples` |
+| MMMU | Omit both `--repo-id` and `--max-samples` (all validation subjects, about 900 samples) |
+
+Do not pass `--max-samples 0` to either TTS benchmark: its shared loader treats zero as an empty dataset.
+
+### 2. Start one worker topology
+
+Terminal 1 owns both workers. Replace `asr` with `tts`, `omni-fp8`, or `omni-bf16` for the next topology.
+
+```bash
+export ROUTER_GPU_IDS=0,1
 python tasks/rust/router-e2e/scripts/manage_workers.py \
   --config tasks/rust/router-e2e/config/asr-workers.yaml \
   --gpu-ids "$ROUTER_GPU_IDS" \
   2>&1 | tee results/asr-workers.log
 ```
 
-Terminal 2 runs one candidate trial at a time. Python spelling is `round_robin` or `least_request`; Rust spelling is `round_robin`. Example:
+Stop the old topology before changing models and confirm ports 8011 and 8012 are closed. Terminal 2 runs the commands below. `run_candidate.py` starts and stops only the router, captures CPU/RSS and worker counters, verifies worker health, and requires every Rust lease to return to zero.
+
+### 3. Screen both Rust policies on the full corpus
+
+Run every screen once with `POLICY=round_robin`, then repeat it with `POLICY=least_requests`. Set the matching config each time:
+
+```bash
+export POLICY=round_robin
+export CONFIG_SUFFIX=round-robin
+```
+
+or:
+
+```bash
+export POLICY=least_requests
+export CONFIG_SUFFIX=least-requests
+```
+
+ASR, at c32/c64/c96:
 
 ```bash
 python tasks/rust/router-e2e/scripts/run_candidate.py \
-  --candidate rust \
-  --policy round_robin \
-  --rust-config tasks/rust/router-e2e/config/asr-rust.toml \
-  --worker-url http://127.0.0.1:8011 \
-  --worker-url http://127.0.0.1:8012 \
+  --candidate rust --policy "$POLICY" \
+  --rust-config "results/router-policy-config/asr-${CONFIG_SUFFIX}.toml" \
+  --worker-url http://127.0.0.1:8011 --worker-url http://127.0.0.1:8012 \
   --model Qwen/Qwen3-ASR-1.7B \
-  --output-dir results/asr-final/02-rust \
-  -- \
+  --output-dir "results/policy-screen/asr-${CONFIG_SUFFIX}" -- \
   python -m benchmarks.eval.benchmark_asr_seedtts \
-    --port {router_port} \
-    --model-path Qwen/Qwen3-ASR-1.7B \
-    --meta zhaochenyang20/seed-tts-eval-arrow \
-    --lang en --max-samples 0 --concurrencies 32 --repeats 1 --warmup \
+    --port {router_port} --model-path Qwen/Qwen3-ASR-1.7B \
+    --meta zhaochenyang20/seed-tts-eval-arrow --lang en --max-samples 0 \
+    --concurrencies 32,64,96 --repeats 1 --warmup \
     --output {output_dir}/asr.json --save-raw-dir {output_dir}/raw
 ```
 
-For Python, replace the candidate/config/policy fields with:
+Standalone TTS, at c16/c32/c64. The fixed seed gives both policies identical generation work. A repeated c64 correctness failure is a measured overload boundary, not a reason to rerun it.
+
+```bash
+python tasks/rust/router-e2e/scripts/run_candidate.py \
+  --candidate rust --policy "$POLICY" \
+  --rust-config "results/router-policy-config/tts-${CONFIG_SUFFIX}.toml" \
+  --worker-url http://127.0.0.1:8011 --worker-url http://127.0.0.1:8012 \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --output-dir "results/policy-screen/tts-${CONFIG_SUFFIX}" -- \
+  python -m benchmarks.eval.benchmark_tts_seedtts \
+    --use-existing-server --generate-only --port {router_port} \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --meta zhaochenyang20/seed-tts-eval-arrow --ref-format references \
+    --seed 0 --concurrencies 16,32,64 \
+    --output-dir {output_dir}/audio --disable-tqdm
+```
+
+Full MMMU, one complete run at c8/c16/c32:
+
+```bash
+for K in 8 16 32; do
+  python tasks/rust/router-e2e/scripts/run_candidate.py \
+    --candidate rust --policy "$POLICY" \
+    --rust-config "results/router-policy-config/omni-fp8-${CONFIG_SUFFIX}.toml" \
+    --worker-url http://127.0.0.1:8011 --worker-url http://127.0.0.1:8012 \
+    --model qwen3-omni \
+    --output-dir "results/policy-screen/mmmu-${CONFIG_SUFFIX}-c${K}" -- \
+    python tasks/rust/router-e2e/scripts/run_repo_benchmark.py \
+      benchmarks.eval.benchmark_omni_mmmu -- \
+      --base-url {router_url} --model qwen3-omni \
+      --max-concurrency "$K" --warmup 2 --temperature 0 \
+      --output-dir {output_dir}/mmmu --disable-tqdm
+done
+```
+
+Full Omni audio, one complete fixed-temperature generation run at c8/c16/c32:
+
+```bash
+for K in 8 16 32; do
+  python tasks/rust/router-e2e/scripts/run_candidate.py \
+    --candidate rust --policy "$POLICY" \
+    --rust-config "results/router-policy-config/omni-bf16-${CONFIG_SUFFIX}.toml" \
+    --worker-url http://127.0.0.1:8011 --worker-url http://127.0.0.1:8012 \
+    --model qwen3-omni \
+    --output-dir "results/policy-screen/omni-audio-${CONFIG_SUFFIX}-c${K}" -- \
+    python tasks/rust/router-e2e/scripts/run_repo_benchmark.py \
+      benchmarks.eval.benchmark_omni_seedtts -- \
+      --base-url {router_url} --model qwen3-omni \
+      --meta zhaochenyang20/seed-tts-eval-arrow \
+      --max-concurrency "$K" --temperature 0 --voice-clone --generate-only \
+      --output-dir {output_dir}/seedtts --disable-tqdm
+done
+```
+
+### 4. Select concurrency and repeat the Rust policy comparison
+
+For each workload, keep only concurrency points with the full expected sample count, zero unexpected 429/5xx responses, healthy workers, and zero retained Rust leases. Select the lowest concurrency within 3% of that workload's maximum valid throughput. Compare both policies at this same `K`; do not choose a separate concurrency for each policy.
+
+Run three paired full-corpus rounds in this order:
+
+| Round | First | Second |
+| ---: | --- | --- |
+| 1 | Rust round robin | Rust least requests |
+| 2 | Rust least requests | Rust round robin |
+| 3 | Rust round robin | Rust least requests |
+
+Use the screen command with only the selected `K` and a new output directory for every trial. Then repeat the paired rounds for the streaming modes:
+
+- ASR: add `--stream`.
+- Standalone TTS: replace `--concurrencies ...` with `--concurrency K` and add `--stream`.
+- Omni audio: add `--stream`.
+- MMMU has no streaming variant.
+
+Do not rerun c1 or every integer concurrency. The three full-corpus points represent below-knee, knee, and pressure behavior. Router-only microbenchmarks are not a substitute for this model test.
+
+### 5. Compare the selected Rust policy with the best Python policy
+
+At the selected `K`, run one full-corpus screen for Python `round_robin` and one for Python `least_request` using the same benchmark command and generation parameters. For Python, omit `--rust-config` and use:
 
 ```text
 --candidate python --policy round_robin
 ```
 
-and omit `--rust-config`. The wrapper starts only the router, waits for `/ready` or `/health`, captures diagnostics and worker metrics, samples the complete router process group, runs the benchmark without a shell, verifies zero Rust in-flight ownership, and stops the router cleanly.
+or:
 
-### ASR: Qwen3-ASR 1.7B
-
-Worker config: `config/asr-workers.yaml`. Rust config: `config/asr-rust.toml`.
-
-Find the saturation knee with a 256-sample screen for both candidates:
-
-```bash
-python tasks/rust/router-e2e/scripts/run_candidate.py \
-  --candidate rust --policy round_robin \
-  --rust-config tasks/rust/router-e2e/config/asr-rust.toml \
-  --worker-url http://127.0.0.1:8011 --worker-url http://127.0.0.1:8012 \
-  --model Qwen/Qwen3-ASR-1.7B --output-dir results/asr-screen/rust -- \
-  python -m benchmarks.eval.benchmark_asr_seedtts \
-    --port {router_port} --model-path Qwen/Qwen3-ASR-1.7B \
-    --meta zhaochenyang20/seed-tts-eval-arrow --lang en --max-samples 256 \
-    --concurrencies 1,16,32,64 --repeats 1 --warmup \
-    --output {output_dir}/asr.json --save-raw-dir {output_dir}/raw
+```text
+--candidate python --policy least_request
 ```
 
-Repeat for Python round robin. Select the lowest concurrency within 3% of maximum throughput with no correctness or tail failure. The screen supplies the c1 latency point; do not repeat a full corpus serially. Execute the six-trial order on the full 1,088-sample EN corpus using `--max-samples 0 --concurrencies K`. Repeat the six trials with `--stream` to qualify SSE and TTFT while preserving WER.
+Choose the valid Python policy with higher throughput; use p95 and then p99 to break a throughput tie within 2%. Finally run three paired full-corpus rounds of selected Python versus selected Rust in `AB`, `BA`, `AB` order, including each applicable streaming mode. This is the final implementation comparison. Do not compare Rust only against the slower Python policy.
 
-### Standalone TTS: Qwen3-TTS 1.7B Base
-
-Stop the ASR workers, confirm ports 8011/8012 are closed, then launch `config/tts-workers.yaml`. It contains the exact tuned Qwen3-TTS CI worker arguments from `tests/test_model/tts_ci_config.py`. Rust config: `config/tts-rust.toml`.
-
-Screen c1/c16/c32/c64:
-
-```bash
-python tasks/rust/router-e2e/scripts/run_candidate.py \
-  --candidate rust --policy round_robin \
-  --rust-config tasks/rust/router-e2e/config/tts-rust.toml \
-  --worker-url http://127.0.0.1:8011 --worker-url http://127.0.0.1:8012 \
-  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --output-dir results/tts-screen/rust -- \
-  python -m benchmarks.eval.benchmark_tts_seedtts \
-    --use-existing-server --generate-only --port {router_port} \
-    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-    --meta zhaochenyang20/seed-tts-eval-50-arrow --max-samples 50 \
-    --ref-format references --concurrencies 1,16,32,64 \
-    --output-dir {output_dir}/audio --disable-tqdm
-```
-
-Repeat for Python round robin, choose `K` by the same 3% knee rule, and run six measured non-stream trials with `--concurrency K` instead of the sweep option. Run six more with `--concurrency K --stream`. The screen supplies c1; do not regenerate it in every final trial. Every generated WAV/non-stream output and reconstructed streaming PCM WAV must be readable, nonempty, and have the expected 50 samples. Use the benchmark’s existing WER phase when making the final quality comparison; do not invent another score.
-
-After all TTS generation trials, stop the TTS workers, launch the ASR topology, and keep one ASR router fixed while scoring every retained output directory:
-
-```bash
-sglang-omni-router/target/release/sgl-omni-router \
-  --config tasks/rust/router-e2e/config/asr-rust.toml
-```
-
-```bash
-python -m benchmarks.eval.benchmark_tts_seedtts \
-  --use-existing-server --transcribe-only --port 30000 \
-  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-  --meta zhaochenyang20/seed-tts-eval-50-arrow \
-  --ref-format references --lang en \
-  --output-dir results/tts-final/02-rust/audio
-```
-
-Repeat only the `--output-dir` for each Python/Rust trial. This scoring phase is not timed router evidence.
-
-### Omni text/image: Qwen3-Omni FP8
-
-Launch `config/omni-fp8-workers.yaml`; use `config/omni-fp8-rust.toml`. Run one paired c1 latency check with 10 samples, then run the six measured rounds at c16 with the complete MMMU-50 set:
-
-```bash
-python tasks/rust/router-e2e/scripts/run_candidate.py \
-  --candidate rust --policy round_robin \
-  --rust-config tasks/rust/router-e2e/config/omni-fp8-rust.toml \
-  --worker-url http://127.0.0.1:8011 --worker-url http://127.0.0.1:8012 \
-  --model qwen3-omni --output-dir results/omni-fp8-c16/02-rust -- \
-  python tasks/rust/router-e2e/scripts/run_repo_benchmark.py \
-    benchmarks.eval.benchmark_omni_mmmu -- \
-    --base-url {router_url} --model qwen3-omni \
-    --repo-id zhaochenyang20/mmmu-ci-50 --max-samples 50 \
-    --max-concurrency 16 --warmup 2 --temperature 0 \
-    --output-dir {output_dir}/mmmu --disable-tqdm
-```
-
-For the c1 check, change to `--max-concurrency 1 --max-samples 10` and use a distinct output directory. The c16 gate requires 50/50 completed samples and unchanged MMMU accuracy.
-
-### Omni audio output: Qwen3-Omni BF16
-
-Launch `config/omni-bf16-workers.yaml`; use `config/omni-bf16-rust.toml`. Run SeedTTS-50 non-stream at c16:
-
-```bash
-python tasks/rust/router-e2e/scripts/run_candidate.py \
-  --candidate rust --policy round_robin \
-  --rust-config tasks/rust/router-e2e/config/omni-bf16-rust.toml \
-  --worker-url http://127.0.0.1:8011 --worker-url http://127.0.0.1:8012 \
-  --model qwen3-omni --output-dir results/omni-bf16/02-rust -- \
-  python tasks/rust/router-e2e/scripts/run_repo_benchmark.py \
-    benchmarks.eval.benchmark_omni_seedtts -- \
-    --base-url {router_url} --model qwen3-omni \
-    --meta zhaochenyang20/seed-tts-eval-50-arrow --max-samples 50 \
-    --max-concurrency 16 --voice-clone --generate-only \
-    --output-dir {output_dir}/seedtts --disable-tqdm
-```
-
-Then confirm streaming TTFT for each candidate:
-
-```bash
-python tasks/rust/router-e2e/scripts/run_candidate.py \
-  --candidate rust --policy round_robin \
-  --rust-config tasks/rust/router-e2e/config/omni-bf16-rust.toml \
-  --worker-url http://127.0.0.1:8011 --worker-url http://127.0.0.1:8012 \
-  --model qwen3-omni --output-dir results/omni-ttft/02-rust -- \
-  python tasks/rust/router-e2e/scripts/run_repo_benchmark.py \
-    benchmarks.eval.benchmark_omni_streaming_ttft -- \
-    --base-url {router_url} --model qwen3-omni --label rust \
-    --warmup 2 --repeats 5 --output {output_dir}/ttft.json
-```
-
-After generation is complete, use the same fixed ASR topology to run the benchmark’s existing transcription/WER phase against each retained SeedTTS output directory:
-
-```bash
-python -m benchmarks.eval.benchmark_omni_seedtts \
-  --transcribe-only --port 30000 --model qwen3-omni \
-  --meta zhaochenyang20/seed-tts-eval-50-arrow --lang en \
-  --output-dir results/omni-bf16/02-rust/seedtts
-```
-
-This quality-only phase is outside the timed Omni router comparison.
+Use the benchmark's existing WER, accuracy, and audio validation. Score all retained standalone/Omni TTS output directories through the same fixed ASR topology after timed generation is complete; this scoring phase is not router performance evidence.
 
 ### Direct-worker saturation point
 
@@ -288,7 +279,7 @@ Correctness is absolute for every measured trial:
 - both workers remain healthy after the trial;
 - every Rust admission and worker-capacity `in_flight` value is zero.
 
-For matched Python round robin versus Rust round robin, compare medians over the three paired rounds. Rust passes model E2E when throughput is within 2%, p95 is within 5%, p99 is within 10%, and correctness is identical. Router CPU-seconds/request must improve by at least 20% when Linux process metrics are available; peak RSS is reported, not used alone to fail a GPU-bound result. When direct workers establish GPU saturation, equal QPS is expected. The separate Python least-request point describes the current CI policy only.
+Select Rust and Python policies independently, then compare their medians over the three paired rounds at the same concurrency. Rust passes model E2E when throughput is within 2%, p95 is within 5%, p99 is within 10%, and correctness is identical. Router CPU-seconds/request must improve by at least 20% when Linux process metrics are available; peak RSS is reported, not used alone to fail a GPU-bound result. When direct workers establish GPU saturation, equal QPS is expected.
 
 Use `RESULTS_TEMPLATE.md`. Do not average incompatible models, concurrency points, streaming modes, or failed/inconclusive runs.
 
