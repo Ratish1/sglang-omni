@@ -57,7 +57,8 @@ serve_fp8_colocated() {
   && CUDA_VISIBLE_DEVICES="$GPU" nohup sgl-omni serve \
       --model-path "$FP8_MODEL" --host 127.0.0.1 --port "$port" --model-name qwen3-omni \
       --config "$FP8_CONFIG" --colocate \
-      --stages.thinker.factory-args.thinker-max-seq-len "$THINKER_MAX_SEQ_LEN" \
+      --preprocessing.factory.max_seq_len "$THINKER_MAX_SEQ_LEN" \
+      --thinker.factory.max_seq_len "$THINKER_MAX_SEQ_LEN" \
       "$@" > "$OUT/logs/serve_fp8_$port.log" 2>&1 &
   echo $! > "$OUT/logs/serve_$port.pid"
   wait_ready "$port"
@@ -158,10 +159,10 @@ run_fp8_arms() {
     case $arm in
       baseline)        serve_fp8_colocated $port ;;
       deepgemm_off)    SGLANG_ENABLE_JIT_DEEPGEMM=0 serve_fp8_colocated $port ;;
-      moe_triton)      serve_fp8_colocated $port --stages.thinker.engine.moe_runner_backend triton ;;
-      attn_triton)     serve_fp8_colocated $port --stages.thinker.engine.attention_backend triton ;;
-      audio_graph_off) serve_fp8_colocated $port --stages.audio_encoder.factory-args.enable-layer-cuda-graph false ;;
-      fp32_lm_head)    serve_fp8_colocated $port --stages.thinker.engine.enable_fp32_lm_head true ;;
+      moe_triton)      serve_fp8_colocated $port --thinker.engine.moe_runner_backend triton ;;
+      attn_triton)     serve_fp8_colocated $port --thinker.engine.attention_backend triton ;;
+      audio_graph_off) serve_fp8_colocated $port --audio_encoder.factory.enable_layer_cuda_graph false ;;
+      fp32_lm_head)    serve_fp8_colocated $port --thinker.engine.enable_fp32_lm_head true ;;
     esac || return 1
     backend_lines "$OUT/logs/serve_fp8_$port.log" > "$OUT/logs/backend_fp8_$arm.txt"
     bench_amme $port "fp8_${arm}_c1" 1
@@ -176,9 +177,9 @@ run_bf16_arms() {
   for arm in baseline attn_triton moe_flashinfer_cutlass fp32_lm_head; do
     case $arm in
       baseline)               serve_bf16_thinker $port ;;
-      attn_triton)            serve_bf16_thinker $port --stages.thinker.engine.attention_backend triton ;;
-      moe_flashinfer_cutlass) serve_bf16_thinker $port --stages.thinker.engine.moe_runner_backend flashinfer_cutlass ;;
-      fp32_lm_head)           serve_bf16_thinker $port --stages.thinker.engine.enable_fp32_lm_head true ;;
+      attn_triton)            serve_bf16_thinker $port --thinker.engine.attention_backend triton ;;
+      moe_flashinfer_cutlass) serve_bf16_thinker $port --thinker.engine.moe_runner_backend flashinfer_cutlass ;;
+      fp32_lm_head)           serve_bf16_thinker $port --thinker.engine.enable_fp32_lm_head true ;;
     esac || return 1
     backend_lines "$OUT/logs/serve_bf16_thinker_$port.log" > "$OUT/logs/backend_bf16_$arm.txt"
     bench_mmsu $port "bf16_${arm}_c1" 1

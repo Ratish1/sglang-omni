@@ -177,14 +177,14 @@ thinker and `flashinfer_cutlass` for the bf16 talker.
 | --- | --- | --- | --- | --- | --- |
 | gate GEMM (router logits) | `torch.matmul` bf16 (cuBLAS) | same | same | cuBLAS in torch 2.11 vs 2.13 on CUDA 13.0.1 vs 13.0.3 | none, `kernel_ab.py gate_gemm` |
 | router top-k | `moe_fused_gate` Triton `_router_triton_kernel` (JIT default on at 0.5.16, `SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=True`) | same function, no flag | identical except `num_warps` for N > 512 (N is 128) | Triton 3.6.0 vs 3.7.1 codegen | none, `kernel_ab.py router` |
-| MoE experts | Triton `fused_moe_kernel` with tile config `triton_3_2_0/E=128,N=768,device_name=NVIDIA_H100_80GB_HBM3.json` for up, reused for down (both stage 8 logs print the same fallback lines) | same kernel, `FUSE_SWIGLU` epilogue added but off (`SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED=False`) | same launched code | Triton recompile | `--stages.thinker.engine.moe_runner_backend flashinfer_cutlass` on both stacks (the bf16 talker path) |
+| MoE experts | Triton `fused_moe_kernel` with tile config `triton_3_2_0/E=128,N=768,device_name=NVIDIA_H100_80GB_HBM3.json` for up, reused for down (both stage 8 logs print the same fallback lines) | same kernel, `FUSE_SWIGLU` epilogue added but off (`SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED=False`) | same launched code | Triton recompile | `--thinker.engine.moe_runner_backend flashinfer_cutlass` on both stacks (the bf16 talker path) |
 | SiLU inside MoE | JIT `act_and_mul_kernel` (`silu_and_mul`) | same, two template flags added with defaults off | same math | nvcc rebuild | none, `kernel_ab.py silu_and_mul` |
 | top-k weighted sum | `sgl_kernel.moe_sum_reduce` | same | same | rebuild | none |
-| attention | FA3 from `sgl_kernel.flash_attn` (sgl-attn `f89bc2306632`) | same pin | identical | sgl-kernel 0.4.5 to 0.4.6.post1 rebuilt with the newer nvcc, `num_splits 0` heuristic on both | `--stages.thinker.engine.attention_backend triton` on both stacks |
+| attention | FA3 from `sgl_kernel.flash_attn` (sgl-attn `f89bc2306632`) | same pin | identical | sgl-kernel 0.4.5 to 0.4.6.post1 rebuilt with the newer nvcc, `num_splits 0` heuristic on both | `--thinker.engine.attention_backend triton` on both stacks |
 | input, post-attention, final RMSNorm | `sgl_kernel.fused_add_rmsnorm` and `rmsnorm` (flashinfer `norm.cu` at `bc29697b`) | same pin, python dispatch unchanged for the bf16 path | identical | rebuild | none, `kernel_ab.py rmsnorm` |
 | q_norm, k_norm | `sgl_kernel.rmsnorm` through `apply_qk_norm` (fused qk-norm-rope off, MRoPE incompatible) | same | identical | rebuild | none |
 | MRoPE | `triton_mrope_fused` (`kernels/ops/attention/rotary_triton.py`) | same file, no diff | identical | Triton recompile | none, `kernel_ab.py mrope` |
-| lm_head | `torch.matmul` bf16 (cuBLAS), bf16 logits, argmax (`enable_fp32_lm_head` unset by omni) | same | same | cuBLAS | `--stages.thinker.engine.enable_fp32_lm_head true` exists on both stacks |
+| lm_head | `torch.matmul` bf16 (cuBLAS), bf16 logits, argmax (`enable_fp32_lm_head` unset by omni) | same | same | cuBLAS | `--thinker.engine.enable_fp32_lm_head true` exists on both stacks |
 | sampler | argmax at temperature 0 | same | same | none | none |
 | MRoPE positions | omni `request_builders._compute_mrope_positions` | same | same | none | none |
 
@@ -194,7 +194,7 @@ thinker and `flashinfer_cutlass` for the bf16 talker.
 | --- | --- | --- | --- | --- | --- |
 | q, k, v, o projections | `Fp8LinearMethod` block [128,128] dynamic, `dispatch_w8a8_block_fp8_linear` auto to `deepgemm_w8a8_block_fp8_linear_with_fallback` (SM90, `SGLANG_ENABLE_JIT_DEEPGEMM=True`) | same dispatch | identical dispatch | sgl-deep-gemm 0.1.4.post1 to 0.1.5.post3, JIT compiled with the newer nvcc | `SGLANG_ENABLE_JIT_DEEPGEMM=0` routes to `triton_w8a8_block_fp8_linear` on both stacks |
 | activation quant before DeepGEMM and inside the MoE | `per_token_group_quant_8bit_v2.cuh` (JIT v2, default since `SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT=False`) | `per_token_group_quant.cuh` (new JIT kernel) | rewritten. Same arithmetic by reading: amax floored at 1e-10, `scale_inv = amax / 448`, `q = clamp(x * (448 / amax))`, fp32 scales | kernel binary | none, `kernel_ab.py fp8_group_quant` |
-| MoE experts | omni policy sets `moe_runner_backend=cutlass`: `cutlass_fused_experts_fp8` (group quant, `shuffle_rows`, `sgl_kernel.fp8_blockwise_scaled_grouped_mm`, JIT `silu_and_mul`, group quant, grouped GEMM, `apply_shuffle_mul_sum`) | same wrapper (2-line import diff), `fp8_blockwise_moe_kernel.cu` +3 lines for sm107 only, CUTLASS pin `57e3cfb47a2d` at both tags | identical launched code | sgl-kernel rebuild, quant kernel above | `--stages.thinker.engine.moe_runner_backend triton` on both stacks (Triton block-FP8 `fused_moe_kernel`, default tile config since no H100 `E=128,N=768,fp8_w8a8` file exists at either tag) |
+| MoE experts | omni policy sets `moe_runner_backend=cutlass`: `cutlass_fused_experts_fp8` (group quant, `shuffle_rows`, `sgl_kernel.fp8_blockwise_scaled_grouped_mm`, JIT `silu_and_mul`, group quant, grouped GEMM, `apply_shuffle_mul_sum`) | same wrapper (2-line import diff), `fp8_blockwise_moe_kernel.cu` +3 lines for sm107 only, CUTLASS pin `57e3cfb47a2d` at both tags | identical launched code | sgl-kernel rebuild, quant kernel above | `--thinker.engine.moe_runner_backend triton` on both stacks (Triton block-FP8 `fused_moe_kernel`, default tile config since no H100 `E=128,N=768,fp8_w8a8` file exists at either tag) |
 | weight scales | omni `convert_fp8_weight_scale_inv` reciprocal (omni-owned) | same | same | none | none |
 | gate, lm_head, norms, embeddings | bf16 as in 3.1 | | | | |
 
@@ -202,7 +202,7 @@ thinker and `flashinfer_cutlass` for the bf16 talker.
 
 | Component | v0.5.16 stack | v0.5.18 stack | Switch |
 | --- | --- | --- | --- |
-| audio tower, captured layer stack (`audio_layer_graph.py`) | transformers `ALL_ATTENTION_FUNCTIONS["flash_attention_2"]` inside the CUDA graph (log: "audio layer CUDA graphs captured for buckets [128 ... 4096]") | `VisionFlash3Attention` (sgl-kernel FA3 varlen) inside the graph (log: "... with fa3 attention"), rewritten by #1719 | `--stages.audio_encoder.factory-args.enable-layer-cuda-graph false` on both stacks (eager transformers path, `config._attn_implementation`) |
+| audio tower, captured layer stack (`audio_layer_graph.py`) | transformers `ALL_ATTENTION_FUNCTIONS["flash_attention_2"]` inside the CUDA graph (log: "audio layer CUDA graphs captured for buckets [128 ... 4096]") | `VisionFlash3Attention` (sgl-kernel FA3 varlen) inside the graph (log: "... with fa3 attention"), rewritten by #1719 | `--audio_encoder.factory.enable_layer_cuda_graph false` on both stacks (eager transformers path, `config._attn_implementation`) |
 | vision tower | transformers 5.12.1 `Qwen3OmniMoeVisionEncoder` (omni compat subclass), attention through transformers' default SDPA | same transformers, torch SDPA backend selection under torch 2.13 and its cuDNN | none in omni, `kernel_ab.py vision_sdpa` per backend |
 | video frames and mel features | HF processor with the torchvision video backend on torchcodec (`preprocessor.py:621`), torchcodec 0.11.1, torchvision 0.26 | torchcodec 0.15.0, torchvision 0.28 | none, `kernel_ab.py hf_processor` hashes `pixel_values_videos`, `input_features`, `input_ids` for one CI clip |
 
@@ -353,11 +353,11 @@ policy line, MoE config lines, audio graph line). Per-sample readout with
 | Arm | Flag or env | Removes | Stages |
 | --- | --- | --- | --- |
 | dense FP8 GEMM | `SGLANG_ENABLE_JIT_DEEPGEMM=0` | DeepGEMM (Triton block GEMM instead) | 9, 10 |
-| FP8 MoE runner | `--stages.thinker.engine.moe_runner_backend triton` | cutlass grouped GEMM path (Triton block-FP8 `fused_moe_kernel` instead) | 9, 10 |
-| attention | `--stages.thinker.engine.attention_backend triton` | FA3 | 5, 8, 9 |
-| audio graph | `--stages.audio_encoder.factory-args.enable-layer-cuda-graph false` | FA3 inside the captured audio stack, eager transformers attention instead | 8, 9, 10 |
-| bf16 MoE runner | `--stages.thinker.engine.moe_runner_backend flashinfer_cutlass` | Triton `fused_moe_kernel` (bf16 only, the policy rejects it for FP8) | 5, 8 |
-| fp32 logits | `--stages.thinker.engine.enable_fp32_lm_head true` | bf16 logits ties at argmax | 5, 8, 9 |
+| FP8 MoE runner | `--thinker.engine.moe_runner_backend triton` | cutlass grouped GEMM path (Triton block-FP8 `fused_moe_kernel` instead) | 9, 10 |
+| attention | `--thinker.engine.attention_backend triton` | FA3 | 5, 8, 9 |
+| audio graph | `--audio_encoder.factory.enable_layer_cuda_graph false` | FA3 inside the captured audio stack, eager transformers attention instead | 8, 9, 10 |
+| bf16 MoE runner | `--thinker.engine.moe_runner_backend flashinfer_cutlass` | Triton `fused_moe_kernel` (bf16 only, the policy rejects it for FP8) | 5, 8 |
+| fp32 logits | `--thinker.engine.enable_fp32_lm_head true` | bf16 logits ties at argmax | 5, 8, 9 |
 
 Decision rules:
 
