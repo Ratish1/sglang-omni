@@ -1,0 +1,74 @@
+33162750785	4b291538f	fix/qwen3-tts-vocoder-readiness-race	queued		2026-08-28T10:16:50Z	[qwen3-tts]: Fix Qwen3-TTS vocoder graph capture r
+33161572474	08f49ba7d	br_omni_npu_0815	completed	action_required	2026-08-28T09:59:01Z	[NPU] Add Ascend installation manifest and helper
+33161567347	071c65e8d	xpu-ci-workflow	in_progress		2026-08-28T09:58:56Z	[CI][XPU] Add initial PR CI workflow for XPU devic
+33160836543	f875f109b	xpu-ci-workflow	completed	action_required	2026-08-28T09:47:54Z	[CI][XPU] Add initial PR CI workflow for XPU devic
+33159941066	7615abfe1	feat/mps-native-runtime	completed	failure	2026-08-28T09:34:40Z	[Runtime] Native CUDA MPS for colocated GPU proces
+33158948928	9a693689d	fix/benchmark-managed-server-config-overrides	in_progress		2026-08-28T09:20:21Z	[Bench]: Fix managed benchmark server engine overr
+33158808529	ecde7c82c	codex/moss-tts-local-prefill-cuda-graph-v2	completed	failure	2026-08-28T09:18:16Z	[Perf][MOSS-TTS-Local] Enable breakable Prefill CU
+33156289386	f72dc6e3f	intel-cpu-omni-support	completed	action_required	2026-08-28T08:40:41Z	[Intel][CPU] Enable Intel CPU support for SGLang-O
+33155727618	a73675249	add_cpu_ci_workflow	completed	failure	2026-08-28T08:32:06Z	[WIP][CI][CPU] Add PR CI workflow for Intel CPU de
+33154783451	94a7c0164	voicechat	completed	failure	2026-08-28T08:17:51Z	Nemotron Voicechat
+33153255303	c73578ee3	intel-cpu-omni-support	completed	action_required	2026-08-28T07:54:54Z	[Intel][CPU] Enable Intel CPU support for SGLang-O
+33152732702	7e111fb7f	fix/qwen3-asr-prompt-sentinel	queued		2026-08-28T07:46:35Z	fix: align Qwen3-ASR prompt and language sentinel
+33152524358	7e111fb7f	fix/qwen3-asr-prompt-sentinel	completed	failure	2026-08-28T07:43:25Z	fix: align Qwen3-ASR prompt and language sentinel
+33151979714	56a1a8df8	feat/minimal-pd-disaggregation	completed	failure	2026-08-28T07:34:42Z	[DO NOT REVIEW] Feat/minimal pd disaggregation
+33151851461	061eedf49	feat/qwen3-asr-apple-silicon	completed	failure	2026-08-28T07:32:42Z	[Apple] Add Qwen3-ASR MLX and Torch MPS paths
+33151218608	9885b948d	cosyvoice	completed	failure	2026-08-28T07:22:30Z	[NPU] Cosyvoice3 support and docs
+33150070141	5c41b1999	voicechat	completed	failure	2026-08-28T07:03:31Z	Nemotron Voicechat
+33147701232	3c70c2863	xpu-ci-workflow	completed	failure	2026-08-28T06:22:27Z	[CI][XPU] Add initial PR CI workflow for XPU devic
+33145139818	f56f1665c	feat/fun-cosyvoice3-causal-streaming	completed	failure	2026-08-28T05:33:49Z	[Fun-CosyVoice3] Causal streaming vocoder (AR stre
+33144941370	a4b729d45	codex/fun-cosyvoice3-flow-batch	completed	failure	2026-08-28T05:29:59Z	[Perf][Fun-CosyVoice3] Batch inference for Flow de
+33144725604	f0399bcab	xpu-ci-workflow	completed	cancelled	2026-08-28T05:25:35Z	[CI][XPU] Add initial PR CI workflow for XPU devic
+33144675663	a150f5de4	xpu-ci-workflow	completed	action_required	2026-08-28T05:24:39Z	[CI][XPU] Add initial PR CI workflow for XPU devic
+33142984717	568b84f5b	perf/radix-persistent-evict-heap	completed	failure	2026-08-28T04:50:42Z	[Perf] Persistent lazy eviction heap for the radix
+33142962598	568b84f5b	perf/radix-persistent-evict-heap	completed	failure	2026-08-28T04:50:14Z	[Perf] Persistent lazy eviction heap for the radix
+33142326083	1d94208b5	xpu-ci-workflow	completed	cancelled	2026-08-28T04:37:02Z	[CI][XPU] Add initial PR CI workflow for XPU devic
+33138703172	32950d2ae	bench/omni-seedtts-drop-stale-reference-tables	completed	action_required	2026-08-28T03:22:37Z	[Benchmark] Drop stale reference-result tables fro
+33137953971	5a7e45bbe	perf/radix-persistent-evict-heap	completed	failure	2026-08-28T03:07:06Z	[Perf] Persistent lazy eviction heap for the radix
+33137013310	3ee39f058	perf/cosyvoice3-reference-preprocessing	completed	failure	2026-08-28T02:48:22Z	perf(cosyvoice3): parallelize reference preprocess
+33136088481	a4b729d45	codex/fun-cosyvoice3-flow-batch	completed	failure	2026-08-28T02:30:01Z	[Perf][Fun-CosyVoice3] Batch inference for Flow de
+33134962563	a7c249968	feat/qwen3-asr-apple-silicon	completed	failure	2026-08-28T02:07:42Z	[Apple] Add Qwen3-ASR MLX and Torch MPS paths
+33133809963	07ac81acf	npu-code2wav-npugraph	completed	action_required	2026-08-28T01:45:06Z	[NPU] Enable Qwen3-Omni Code2Wav NPUGraph
+33133443549	d67af83e3	npu-code2wav-npugraph	completed	action_required	2026-08-28T01:37:54Z	[NPU] Enable Qwen3-Omni Code2Wav NPUGraph
+33132612996	a112c2f93	feat/mps-native-runtime	completed	failure	2026-08-28T01:21:34Z	[Runtime] Native CUDA MPS for colocated GPU proces
+33132272177	e7f9b23a0	perf/arkasr-encoder-cuda-graph	completed	cancelled	2026-08-28T01:15:02Z	[ARK-ASR] Add encoder CUDA Graph (startup working-
+33130676559	95e650102	perf/radix-persistent-evict-heap	completed	failure	2026-08-28T00:44:32Z	[Perf] Persistent lazy eviction heap for the radix
+33129336761	49b130542	feat/asr-chunking-config	completed	failure	2026-08-28T00:19:15Z	[ASR] Make audio chunking configurable
+33128907608	341011add	feat/mps-native-runtime	completed	failure	2026-08-28T00:11:26Z	[Runtime] Native CUDA MPS for colocated GPU proces
+33128442080	0e4139648	feat/qwen3-omni-pd-disaggregation	completed	failure	2026-08-28T00:03:37Z	[DO NOT REVIEW] feat(qwen3-omni): add explicit PD
+33128442339	9b9a21455	feat/minimal-pd-disaggregation	completed	failure	2026-08-28T00:03:37Z	[DO NOT REVIEW] Feat/minimal pd disaggregation
+33127594471	aed867987	feat/minimal-pd-disaggregation	completed	failure	2026-08-27T23:48:50Z	[DO NOT REVIEW] Feat/minimal pd disaggregation
+33127594265	3c9d54d4a	feat/qwen3-omni-pd-disaggregation	completed	failure	2026-08-27T23:48:50Z	[DO NOT REVIEW] feat(qwen3-omni): add explicit PD
+33126719133	c779654e0	feat/minimal-pd-disaggregation	completed	failure	2026-08-27T23:33:56Z	[DO NOT REVIEW] Feat/minimal pd disaggregation
+33126429888	4ff91c2b2	fix/tts-prompt-cache-reuse	completed	failure	2026-08-27T23:28:58Z	[Fix][TTS] Restore Qwen3-TTS and delay Moss prompt
+33126210205	5458c2976	feat/minimal-pd-disaggregation	completed	failure	2026-08-27T23:25:13Z	[DO NOT REVIEW] Feat/minimal pd disaggregation
+33124285233	ecb4e6b99	feat/nemotron-voicechat	completed	action_required	2026-08-27T22:53:59Z	feat: Add realtime support for NVIDIA NemotronLabs
+33121628171	ff11fb3b2	fix/tts-prompt-cache-reuse	completed	cancelled	2026-08-27T22:13:37Z	[Fix][TTS] Restore Qwen3-TTS and delay Moss prompt
+33121145070	ff11fb3b2	fix/tts-prompt-cache-reuse	completed	failure	2026-08-27T22:06:47Z	[Fix][TTS] Restore Qwen3-TTS and delay Moss prompt
+33120628573	e75962d10	perf/zero-hit-radix-default-off	completed	failure	2026-08-27T21:59:48Z	[WIP] [Perf] Default disable_radix_cache for zero-
+33119649695	974be4547	feat/mosslocal-fused-frame-sampler	completed	failure	2026-08-27T21:46:09Z	[Perf][MOSS-TTS-Local] Fuse the seeded frame sampl
+33118378122	8d1ef6edb	rpatel4/semantic-vad	completed	failure	2026-08-27T21:29:28Z	[Feature] Add semantic VAD turn detection for /v1/
+33117796122	16d5680f9	rpatel4/realtime-barge-in-cancel-latency	completed	failure	2026-08-27T21:21:52Z	[Qwen3-Omni Perf] Reduce realtime barge-in cancell
+33117736499	b028fa9cc	rpatel4/realtime-barge-in-cancel-latency	completed	failure	2026-08-27T21:21:05Z	[Qwen3-Omni Perf] Reduce realtime barge-in cancell
+33113593418	7e86e6d97	fix/tts-prompt-cache-reuse	completed	failure	2026-08-27T20:29:47Z	[Fix][TTS] Restore Qwen3-TTS and delay Moss prompt
+33113140852	e354f087c	fix/tts-prompt-cache-reuse	completed	failure	2026-08-27T20:24:11Z	[Fix][TTS] Restore Qwen3-TTS and delay Moss prompt
+33102306522	9b8a7ba4e	perf/downstream-prewarm	completed	failure	2026-08-27T18:12:24Z	[WIP] [Qwen3-Omni Perf] Prewarm Qwen3-Omni Talker
+33100097251	378169298	amd/update-rocm-base-v0.5.18	completed	failure	2026-08-27T17:46:13Z	[AMD][ROCm] Update Docker base to SGLang v0.5.18
+33097350912	9f8cb2bbd	deps/xpu-sglang-0-5-18	completed	cancelled	2026-08-27T17:14:04Z	[Deps][XPU] Align the Intel XPU stack with SGLang
+33096942612	6ffeb9ca6	deps/xpu-sglang-0-5-18	completed	failure	2026-08-27T17:09:23Z	[Deps][XPU] Align the Intel XPU stack with SGLang
+33096281216	611970b46	docs/bump-version	completed	failure	2026-08-27T17:01:45Z	[Docs] Add the SGLang version bump guide
+33093384107	808cc335b	feat/ming_omni_tts_audio_vae_graph	completed	failure	2026-08-27T16:28:26Z	[2/2] [Perf] Improve Ming-Omni-TTS serving: decode
+33093059035	8dedd783a	Yuhao/f6-realtime-asr-transcription	completed	failure	2026-08-27T16:24:35Z	[ASR Feature] Add live Qwen3-ASR realtime transcri
+33088462837	4e167f6dc	feat/xpu-decode-graph	completed	failure	2026-08-27T15:33:27Z	[Perf][XPU] Request the decode CUDA graph for Omni
+33086689970	959881f41	add-musa-install-support	completed	failure	2026-08-27T15:14:07Z	[MUSA] Add installation guide and Dockerfile
+33085872333	fcce370ed	perf/arkasr-encoder-cuda-graph	completed	failure	2026-08-27T15:05:15Z	[ARK-ASR] Add encoder CUDA Graph (startup working-
+33085414776	36939a242	add-musa-install-support	completed	failure	2026-08-27T15:00:27Z	[MUSA] Add installation guide and Dockerfile
+33085238416	7e95b2201	codex/moss-tts-local-prefill-cuda-graph-v2	completed	failure	2026-08-27T14:58:35Z	[Perf][MOSS-TTS-Local] Enable breakable Prefill CU
+33082648186	19e63143f	main	completed	failure	2026-08-27T14:30:48Z	[Whisper ASR] Remove decode-path GPU sync and vect
+33080546195	bf39ef9d6	higgs_tts	completed	action_required	2026-08-27T14:07:59Z	[NPU] add Ascend NPU support for higgs-audio-v3-tt
+33076902754	993819dfe	shuleihe/qwen3-tts-mixed-sampling	completed	action_required	2026-08-27T13:27:18Z	[Qwen3-TTS] Implement full-batch mixed sampling
+33076540202	0ece34ed2	shuleihe/qwen3-tts-mixed-sampling	completed	action_required	2026-08-27T13:23:05Z	[Qwen3-TTS] Implement full-batch mixed sampling
+33073859764	99e190cbb	shuleihe/qwen3-tts-mixed-sampling	completed	action_required	2026-08-27T12:51:14Z	[Qwen3-TTS] Implement full-batch mixed sampling
+33071447456	aae7f662c	xpu-ci-workflow	completed	failure	2026-08-27T12:21:06Z	[CI][XPU] Add initial PR CI workflow for XPU devic
+33071158856	f83a8ea7a	xpu-ci-workflow	completed	action_required	2026-08-27T12:17:20Z	[CI][XPU] Add initial PR CI workflow for XPU devic
+33070192295	61280ecee	sglang-0.5.18-upgrade	completed	cancelled	2026-08-27T12:04:35Z	[Deps] Bump SGLang to 0.5.18
