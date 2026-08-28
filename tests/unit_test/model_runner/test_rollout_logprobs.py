@@ -12,12 +12,20 @@ import torch
 from sglang_omni.model_runner.base import ModelRunner
 
 
+def _req(inflight_middle_chunks: int = 0):
+    return SimpleNamespace(
+        inflight_middle_chunks=inflight_middle_chunks,
+        sampling_params=SimpleNamespace(sampling_seed=None),
+    )
+
+
 def _data(top_logprobs_num: int = 0, **overrides):
     fields = dict(
         return_logprob=True,
         output_token_logprobs=[],
         top_logprobs_num=top_logprobs_num,
         output_top_logprobs=[],
+        req=_req(),
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -117,6 +125,52 @@ def test_enable_sampler_logprobs_sets_per_row_top_k() -> None:
     assert forward_batch.token_ids_logprobs == [None, None, None]
 
 
+def test_enable_sampler_logprobs_requests_no_top_k_for_middle_chunk_rows() -> None:
+    forward_batch = SimpleNamespace(top_logprobs_nums=None, token_ids_logprobs=None)
+    requests = [
+        SimpleNamespace(data=_data(top_logprobs_num=3, req=_req(1))),
+        SimpleNamespace(data=_data(top_logprobs_num=3)),
+    ]
+
+    ModelRunner._enable_sampler_logprobs(forward_batch, requests)
+
+    assert forward_batch.top_logprobs_nums == [0, 3]
+
+
+def test_rollout_logprobs_skip_middle_chunk_rows() -> None:
+    runner = object.__new__(ModelRunner)
+    middle = _data(top_logprobs_num=2, req=_req(1))
+    final = _data(top_logprobs_num=2)
+    requests = [SimpleNamespace(data=middle), SimpleNamespace(data=final)]
+
+    runner._record_rollout_logprobs(
+        torch.tensor([-0.3, -0.5]),
+        torch.tensor([7, 11]),
+        requests,
+        top_logprobs_val=[torch.tensor([]), torch.tensor([-0.5, -1.2])],
+        top_logprobs_idx=[
+            torch.tensor([], dtype=torch.long),
+            torch.tensor([11, 13]),
+        ],
+    )
+
+    assert middle.output_token_logprobs == []
+    assert middle.output_top_logprobs == []
+    assert final.output_token_logprobs == [[-0.5, 11]]
+    assert [entry[1] for entry in final.output_top_logprobs[0]] == [11, 13]
+
+
+def test_rollout_logprobs_record_the_final_chunk_row() -> None:
+    runner = object.__new__(ModelRunner)
+    data = _data(req=_req(0))
+
+    runner._record_rollout_logprobs(
+        torch.tensor([-0.25]), torch.tensor([7]), [SimpleNamespace(data=data)]
+    )
+
+    assert data.output_token_logprobs == [[-0.25, 7]]
+
+
 def test_rollout_top_logprobs_record_only_rows_that_asked() -> None:
     runner = object.__new__(ModelRunner)
     data0 = _data(top_logprobs_num=2)
@@ -183,7 +237,7 @@ def test_record_rollout_logprobs_skips_without_return_flag() -> None:
 
 def test_record_rollout_logprobs_requires_output_list() -> None:
     runner = object.__new__(ModelRunner)
-    data = SimpleNamespace(return_logprob=True, top_logprobs_num=0)
+    data = SimpleNamespace(return_logprob=True, top_logprobs_num=0, req=_req())
 
     with pytest.raises(AttributeError, match="output_token_logprobs"):
         runner._record_rollout_logprobs(
@@ -212,8 +266,7 @@ def test_sample_next_token_ids_requires_sampler_logprobs_when_requested() -> Non
             sample=lambda _logits_output, _forward_batch: torch.tensor([44])
         )
     )
-    req = SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=None))
-    data = _data(req=req)
+    data = _data()
     request = SimpleNamespace(data=data)
     forward_batch = SimpleNamespace(
         sampling_info=SimpleNamespace(device="cpu", sampling_seed=None),
@@ -253,8 +306,7 @@ def test_sample_next_token_ids_records_sampler_top_logprobs() -> None:
         return torch.tensor([44])
 
     runner.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(sample=sample))
-    req = SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=None))
-    data = _data(top_logprobs_num=2, req=req)
+    data = _data(top_logprobs_num=2)
     forward_batch = SimpleNamespace(
         sampling_info=SimpleNamespace(device="cpu", sampling_seed=None),
         top_logprobs_nums=None,

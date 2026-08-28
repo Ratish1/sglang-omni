@@ -41,6 +41,19 @@ def _rank_shared_unseeded_sampling_seed(request: SchedulerRequest, row_idx: int)
     return derive_sampling_seed("sglang-omni-unseeded-row", request_id)
 
 
+def _is_middle_chunk_row(data: Any) -> bool:
+    """True for a chunked-prefill row whose prompt is not fully consumed yet.
+
+    SGLang samples such a row like any other and then drops the token: the
+    batch result processor appends to output_ids only once
+    inflight_middle_chunks reaches 0. The rollout logprob of that row has to
+    be dropped the same way, or the request reports one logprob more than it
+    has output tokens.
+    """
+    req = data.req
+    return req is not None and req.inflight_middle_chunks > 0
+
+
 def _logprob_row_to_list(row: Any) -> list:
     """One row of the sampler's top-k output as a Python list. SGLang keeps
     the rows on the device (get_top_logprobs with no_copy_to_cpu)."""
@@ -867,7 +880,12 @@ class ModelRunner:
         processor never computes prompt logprobs."""
         forward_batch.return_logprob = True
         forward_batch.top_logprobs_nums = [
-            sr.data.top_logprobs_num if sr.data.return_logprob else 0 for sr in requests
+            (
+                sr.data.top_logprobs_num
+                if sr.data.return_logprob and not _is_middle_chunk_row(sr.data)
+                else 0
+            )
+            for sr in requests
         ]
         if forward_batch.token_ids_logprobs is None:
             forward_batch.token_ids_logprobs = [None] * len(requests)
@@ -882,7 +900,9 @@ class ModelRunner:
     ) -> None:
         """Append each rollout request's sampled-token logprob (one per step)
         and, for requests with top_logprobs_num > 0, the [logprob, token_id]
-        pairs of the k most likely tokens at the same step."""
+        pairs of the k most likely tokens at the same step. Rows still inside
+        a chunked prefill are sampled too but their token is dropped, so
+        nothing is recorded for them."""
         logprobs = sampled_logprobs_to_list(next_token_logprobs)
         if logprobs is None:
             try:
@@ -909,7 +929,11 @@ class ModelRunner:
         top_rows: dict[int, list[list[float | int]]] = {}
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
-            if not data.return_logprob or data.top_logprobs_num <= 0:
+            if (
+                not data.return_logprob
+                or data.top_logprobs_num <= 0
+                or _is_middle_chunk_row(data)
+            ):
                 continue
             top_k = data.top_logprobs_num
             if top_logprobs_val is None or top_logprobs_idx is None:
@@ -930,7 +954,7 @@ class ModelRunner:
             ]
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
-            if not data.return_logprob:
+            if not data.return_logprob or _is_middle_chunk_row(data):
                 continue
             data.output_token_logprobs.append([logprobs[row_idx], token_ids[row_idx]])
             if row_idx in top_rows:
