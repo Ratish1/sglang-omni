@@ -224,7 +224,7 @@ fn handle_connection(
         "/v1/audio/speech" if contains_bytes(&body, b"\"response_format\":\"pcm\"") => {
             b"HTTP/1.1 200 OK\r\nContent-Type: audio/pcm\r\nContent-Length: 4\r\n\r\nPCM0"
         }
-        "/v1/audio/speech" => b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: 4\r\nContent-Disposition: attachment; filename=\"speech.wav\"\r\nX-Prompt-Tokens: 7\r\nX-Completion-Tokens: 9\r\nX-Engine-Time: 0.25\r\n\r\nWAVE",
+        "/v1/audio/speech" => b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: 4\r\nContent-Disposition: attachment; filename=\"speech.wav\"\r\nX-Prompt-Tokens: 7\r\nX-Completion-Tokens: 9\r\nX-Engine-Time: 0.25\r\nX-Finish-Reason: stop\r\n\r\nWAVE",
         "/v1/audio/speech/batch" => b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 23\r\n\r\n{\"results\":[0,1],\"n\":2}",
         "/v1/audio/transcriptions"
             if body
@@ -476,6 +476,7 @@ fn relays_all_media_routes_with_exact_bytes_headers_and_large_direct_uploads() {
         String::from_utf8_lossy(&response)
     );
     assert!(header(&response, "content-disposition").is_some());
+    assert_eq!(header(&response, "x-finish-reason"), Some("stop"));
     assert_eq!(response_body(&response), b"WAVE");
     assert_eq!(capture.body, speech);
     let generated_id = header(&response, "x-request-id").expect("generated media request ID");

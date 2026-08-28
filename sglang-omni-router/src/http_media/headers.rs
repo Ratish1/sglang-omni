@@ -225,6 +225,7 @@ pub(super) fn sanitize_response(
                 HeaderName::from_static("x-prompt-tokens"),
                 HeaderName::from_static("x-completion-tokens"),
                 HeaderName::from_static("x-engine-time"),
+                HeaderName::from_static("x-finish-reason"),
             ] {
                 copy_one(source, &connection, &mut result, name);
             }
@@ -609,6 +610,26 @@ mod tests {
             sanitize_response(StatusCode::OK, &headers, SuccessProfile::OpaqueSpeech)
                 .expect("supported opaque speech type");
         }
+    }
+
+    #[test]
+    fn speech_preserves_finish_reason_unless_connection_nominated() {
+        let profile = SuccessProfile::Speech(SpeechResponseFormat::Wav, StreamMode::NonStreaming);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+        headers.insert("x-finish-reason", HeaderValue::from_static("length"));
+
+        let sanitized =
+            sanitize_response(StatusCode::OK, &headers, profile).expect("speech finish reason");
+        assert_eq!(
+            sanitized.get("x-finish-reason"),
+            Some(&HeaderValue::from_static("length"))
+        );
+
+        headers.insert(CONNECTION, HeaderValue::from_static("x-finish-reason"));
+        let sanitized = sanitize_response(StatusCode::OK, &headers, profile)
+            .expect("connection-nominated speech metadata");
+        assert!(!sanitized.contains_key("x-finish-reason"));
     }
 
     #[test]
