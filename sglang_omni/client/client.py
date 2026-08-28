@@ -97,6 +97,8 @@ class Client:
         finish_reason: str | None = None
         logprobs_parts: list[Any] = []
         saw_output_token_logprobs = False
+        token_logprobs_parts: list[dict[str, Any]] = []
+        saw_token_logprobs = False
         omni_rollout: dict[str, Any] | None = None
         weight_version: str | None = None
 
@@ -113,6 +115,9 @@ class Client:
             if chunk.output_token_logprobs is not None:
                 saw_output_token_logprobs = True
                 logprobs_parts.extend(chunk.output_token_logprobs)
+            if chunk.token_logprobs is not None:
+                saw_token_logprobs = True
+                token_logprobs_parts.extend(chunk.token_logprobs)
             if chunk.omni_rollout is not None:
                 omni_rollout = chunk.omni_rollout
             if chunk.weight_version is not None:
@@ -151,6 +156,7 @@ class Client:
             output_token_logprobs=(
                 logprobs_parts if saw_output_token_logprobs else None
             ),
+            token_logprobs=token_logprobs_parts if saw_token_logprobs else None,
             omni_rollout=omni_rollout,
             weight_version=weight_version,
         )
@@ -489,6 +495,9 @@ class Client:
                 output_token_logprobs = decode_result.get("output_token_logprobs")
                 if output_token_logprobs is not None:
                     chunk.output_token_logprobs = output_token_logprobs
+                token_logprobs = decode_result.get("token_logprobs")
+                if token_logprobs is not None:
+                    chunk.token_logprobs = token_logprobs
                 omni_rollout = decode_result.get("omni_rollout")
                 if omni_rollout is not None:
                     chunk.omni_rollout = omni_rollout
@@ -514,6 +523,9 @@ class Client:
             output_token_logprobs = result.get("output_token_logprobs")
             if output_token_logprobs is not None:
                 chunk.output_token_logprobs = output_token_logprobs
+            token_logprobs = result.get("token_logprobs")
+            if token_logprobs is not None:
+                chunk.token_logprobs = token_logprobs
             omni_rollout = result.get("omni_rollout")
             if omni_rollout is not None:
                 chunk.omni_rollout = omni_rollout
@@ -570,6 +582,9 @@ class Client:
             output_token_logprobs = data.get("output_token_logprobs")
             if output_token_logprobs is not None:
                 chunk.output_token_logprobs = output_token_logprobs
+            token_logprobs = data.get("token_logprobs")
+            if token_logprobs is not None:
+                chunk.token_logprobs = token_logprobs
             omni_rollout = data.get("omni_rollout")
             if omni_rollout is not None:
                 chunk.omni_rollout = omni_rollout

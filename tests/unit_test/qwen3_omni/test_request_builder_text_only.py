@@ -127,3 +127,38 @@ def test_pure_text_qwen_mrope_is_ordinary_sequential_positions():
         positions,
         torch.arange(sequence_length, dtype=torch.long).repeat(3, 1),
     )
+
+
+def _text_only_state() -> Qwen3OmniPipelineState:
+    merged = merge_for_thinker({"preprocessing": make_qwen_payload(make_qwen_state())})
+    return Qwen3OmniPipelineState.from_dict(merged.data)
+
+
+def _build_with_params(params: dict) -> object:
+    return build_sglang_thinker_request(
+        _text_only_state(),
+        params=params,
+        tokenizer=FakeQwenTokenizer(),
+        vocab_size=256,
+        request_id="logprobs",
+        thinker_config=SimpleNamespace(
+            image_token_id=55,
+            video_token_id=66,
+            audio_token_id=77,
+        ),
+    )
+
+
+def test_sglang_thinker_request_reads_logprob_params(monkeypatch):
+    _patch_sampling_validation(monkeypatch)
+
+    plain = _build_with_params({"max_new_tokens": 3})
+    with_logprobs = _build_with_params(
+        {"max_new_tokens": 3, "return_logprob": True, "top_logprobs_num": 4}
+    )
+
+    assert plain.return_logprob is False
+    assert plain.top_logprobs_num == 0
+    assert plain.output_top_logprobs == []
+    assert with_logprobs.return_logprob is True
+    assert with_logprobs.top_logprobs_num == 4

@@ -41,6 +41,14 @@ def _rank_shared_unseeded_sampling_seed(request: SchedulerRequest, row_idx: int)
     return derive_sampling_seed("sglang-omni-unseeded-row", request_id)
 
 
+def _logprob_row_to_list(row: Any) -> list:
+    """One row of the sampler's top-k output as a Python list. SGLang keeps
+    the rows on the device (get_top_logprobs with no_copy_to_cpu)."""
+    if hasattr(row, "tolist"):
+        return row.tolist()
+    return list(row)
+
+
 def resolve_deferred_prefill_inputs(schedule_batch: Any, device: torch.device) -> None:
     """Materialize staged CPU prefill inputs before a direct worker forward.
 
@@ -775,7 +783,7 @@ class ModelRunner:
         self._install_sampling_seeds(forward_batch, requests)
         wants_rollout_logprob = any(sr.data.return_logprob for sr in requests)
         if wants_rollout_logprob:
-            self._enable_sampler_logprobs(forward_batch, len(requests))
+            self._enable_sampler_logprobs(forward_batch, requests)
         next_token_ids = self.tp_worker.model_runner.sample(
             logits_output, forward_batch
         )
@@ -796,6 +804,8 @@ class ModelRunner:
                 next_token_logprobs,
                 next_token_ids,
                 requests,
+                top_logprobs_val=logits_output.next_token_top_logprobs_val,
+                top_logprobs_idx=logits_output.next_token_top_logprobs_idx,
             )
         return next_token_ids
 
@@ -850,17 +860,29 @@ class ModelRunner:
             )
 
     @staticmethod
-    def _enable_sampler_logprobs(forward_batch: Any, batch_size: int) -> None:
+    def _enable_sampler_logprobs(forward_batch: Any, requests: list) -> None:
+        """Ask the SGLang sampler for the sampled-token logprob of every row
+        and for the top-k logprobs of the rows whose request set
+        top_logprobs_num. Runs after the forward pass, so the logits
+        processor never computes prompt logprobs."""
         forward_batch.return_logprob = True
-        if forward_batch.top_logprobs_nums is None:
-            forward_batch.top_logprobs_nums = [0] * batch_size
+        forward_batch.top_logprobs_nums = [
+            sr.data.top_logprobs_num if sr.data.return_logprob else 0 for sr in requests
+        ]
         if forward_batch.token_ids_logprobs is None:
-            forward_batch.token_ids_logprobs = [None] * batch_size
+            forward_batch.token_ids_logprobs = [None] * len(requests)
 
     def _record_rollout_logprobs(
-        self, next_token_logprobs, next_token_ids, requests
+        self,
+        next_token_logprobs,
+        next_token_ids,
+        requests,
+        top_logprobs_val=None,
+        top_logprobs_idx=None,
     ) -> None:
-        """Append each rollout request's sampled-token logprob (one per step)."""
+        """Append each rollout request's sampled-token logprob (one per step)
+        and, for requests with top_logprobs_num > 0, the [logprob, token_id]
+        pairs of the k most likely tokens at the same step."""
         logprobs = sampled_logprobs_to_list(next_token_logprobs)
         if logprobs is None:
             try:
@@ -884,12 +906,35 @@ class ModelRunner:
                 f"logprobs={len(logprobs)} token_ids={len(token_ids)} "
                 f"requests={len(requests)}"
             )
+        top_rows: dict[int, list[list[float | int]]] = {}
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
-            if data.return_logprob:
-                data.output_token_logprobs.append(
-                    [logprobs[row_idx], token_ids[row_idx]]
+            if not data.return_logprob or data.top_logprobs_num <= 0:
+                continue
+            top_k = data.top_logprobs_num
+            if top_logprobs_val is None or top_logprobs_idx is None:
+                raise RuntimeError(
+                    "Sampler did not populate next_token_top_logprobs when "
+                    f"top_logprobs_num={top_k} is requested"
                 )
+            values = _logprob_row_to_list(top_logprobs_val[row_idx])
+            indices = _logprob_row_to_list(top_logprobs_idx[row_idx])
+            if len(values) != top_k or len(indices) != top_k:
+                raise RuntimeError(
+                    "rollout top-k logprob size mismatch: "
+                    f"values={len(values)} indices={len(indices)} "
+                    f"requested={top_k}"
+                )
+            top_rows[row_idx] = [
+                [float(value), int(index)] for value, index in zip(values, indices)
+            ]
+        for row_idx, sched_req in enumerate(requests):
+            data = sched_req.data
+            if not data.return_logprob:
+                continue
+            data.output_token_logprobs.append([logprobs[row_idx], token_ids[row_idx]])
+            if row_idx in top_rows:
+                data.output_top_logprobs.append(top_rows[row_idx])
 
     @staticmethod
     def _req_is_retracted(req: Any) -> bool:

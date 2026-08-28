@@ -94,6 +94,10 @@ class ChatCompletionRequest(BaseModel):
     talker_repetition_penalty: float | None = None
     talker_max_new_tokens: int | None = None
 
+    # Logprobs of the generated text tokens (OpenAI logprobs and top_logprobs)
+    logprobs: bool = False
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+
     # Misc
     request_id: str | None = None
     user: str | None = None
@@ -102,6 +106,12 @@ class ChatCompletionRequest(BaseModel):
     def effective_max_tokens(self) -> int | None:
         return self.max_completion_tokens or self.max_tokens
 
+    @model_validator(mode="after")
+    def _validate_logprobs(self) -> ChatCompletionRequest:
+        if self.top_logprobs is not None and not self.logprobs:
+            raise ValueError("top_logprobs requires logprobs=true")
+        return self
+
 
 class ChatCompletionChoice(BaseModel):
     """A single choice in a chat completion response."""
@@ -109,6 +119,7 @@ class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: dict[str, Any]
     finish_reason: str | None = "stop"
+    logprobs: dict[str, Any] | None = None
 
 
 class ChatCompletionResponse(BaseModel):

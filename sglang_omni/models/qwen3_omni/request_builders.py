@@ -707,6 +707,7 @@ def build_sglang_thinker_request(
         req=req,
     )
     data.return_logprob = bool(params.get("return_logprob"))
+    data.top_logprobs_num = int(params.get("top_logprobs_num") or 0)
     return data
 
 
@@ -893,6 +894,10 @@ def apply_thinker_result(
     output_token_logprobs = getattr(result, "output_token_logprobs", None)
     if output_token_logprobs is not None:
         thinker_out["output_token_logprobs"] = output_token_logprobs
+
+    output_top_logprobs = getattr(result, "output_top_logprobs", None)
+    if output_top_logprobs is not None:
+        thinker_out["output_top_logprobs"] = output_top_logprobs
 
     state.thinker_out = thinker_out
     state.engine_outputs[stage_name] = thinker_out

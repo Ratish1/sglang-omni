@@ -108,6 +108,7 @@ def test_completion_without_logprobs_leaves_fields_none() -> None:
     )
 
     assert out.output_token_logprobs is None
+    assert out.token_logprobs is None
     assert out.weight_version is None
     assert out.omni_rollout is None
 
@@ -149,6 +150,48 @@ def test_completion_surfaces_rollout_from_multiterminal_decode() -> None:
     assert out.output_token_logprobs == [[-0.5, 9]]
     assert out.weight_version == "v9"
     assert out.omni_rollout == {"version": 1, "action_streams": []}
+
+
+def test_completion_surfaces_token_logprobs() -> None:
+    token_logprobs = [
+        {"token": "A", "token_id": 11, "logprob": -0.1, "top_logprobs": []}
+    ]
+    result = {
+        "text": "A",
+        "finish_reason": "stop",
+        "output_token_logprobs": [[-0.1, 11]],
+        "token_logprobs": token_logprobs,
+    }
+    client = Client(_SubmitStubCoordinator(result))
+
+    out = asyncio.run(
+        client.completion(GenerateRequest(prompt="hi", stream=False), request_id="r1")
+    )
+
+    assert out.output_token_logprobs == [[-0.1, 11]]
+    assert out.token_logprobs == token_logprobs
+
+
+def test_completion_surfaces_token_logprobs_from_multiterminal_decode() -> None:
+    token_logprobs = [
+        {"token": "hi", "token_id": 9, "logprob": -0.5, "top_logprobs": []}
+    ]
+    result = {
+        "decode": {
+            "text": "hi",
+            "finish_reason": "stop",
+            "token_logprobs": token_logprobs,
+        },
+        "code2wav": {"audio_data": [0.0, 0.1, -0.1], "sample_rate": 24000},
+    }
+    client = Client(_SubmitStubCoordinator(result))
+
+    out = asyncio.run(
+        client.completion(GenerateRequest(prompt="hi", stream=False), request_id="r1")
+    )
+
+    assert out.audio is not None
+    assert out.token_logprobs == token_logprobs
 
 
 def test_completion_concatenates_streamed_logprobs() -> None:

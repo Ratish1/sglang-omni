@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -27,3 +28,4 @@ class RequestResult:
     text_ttft_s: float | None = None
     audio_chunk_count: int = 0
     first_audio_payload_bytes: int = 0
+    token_logprobs: list[dict[str, Any]] | None = None

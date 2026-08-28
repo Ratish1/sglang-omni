@@ -54,6 +54,41 @@ class _RequestState:
     done: bool = False
 
 
+def build_token_logprobs(
+    output_token_logprobs: list[Any],
+    output_top_logprobs: list[Any],
+    tokenizer: Any,
+) -> list[dict[str, Any]]:
+    """Per generated token: the sampled token's logprob and the top-k
+    alternatives of the same step, each with its decoded text.
+
+    output_token_logprobs holds one [logprob, token_id] pair per step and
+    output_top_logprobs holds a list of such pairs per step, or is empty when
+    no top-k was requested. The two lists are aligned by step.
+    """
+    if output_top_logprobs and len(output_top_logprobs) != len(output_token_logprobs):
+        raise ValueError(
+            f"output_top_logprobs has {len(output_top_logprobs)} steps for "
+            f"{len(output_token_logprobs)} sampled tokens"
+        )
+
+    def entry(logprob: Any, token_id: Any) -> dict[str, Any]:
+        token_id = int(token_id)
+        return {
+            "token": tokenizer.decode([token_id], skip_special_tokens=False),
+            "token_id": token_id,
+            "logprob": float(logprob),
+        }
+
+    out: list[dict[str, Any]] = []
+    for step, (logprob, token_id) in enumerate(output_token_logprobs):
+        item = entry(logprob, token_id)
+        top = output_top_logprobs[step] if output_top_logprobs else []
+        item["top_logprobs"] = [entry(lp, tid) for lp, tid in top]
+        out.append(item)
+    return out
+
+
 class StreamingDetokenizeScheduler:
     """Stream-aware decode stage."""
 
@@ -276,6 +311,12 @@ class StreamingDetokenizeScheduler:
         output_token_logprobs = thinker_out.get("output_token_logprobs")
         if output_token_logprobs is not None:
             result.setdefault("output_token_logprobs", output_token_logprobs)
+        if (payload.request.params or {}).get("return_token_logprobs"):
+            result["token_logprobs"] = build_token_logprobs(
+                output_token_logprobs or [],
+                thinker_out.get("output_top_logprobs") or [],
+                self._tokenizer,
+            )
         weight_version = thinker_out.get("weight_version")
         if weight_version is not None:
             result.setdefault("weight_version", weight_version)

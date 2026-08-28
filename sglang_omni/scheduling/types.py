@@ -81,6 +81,11 @@ class ARRequestData:
     weight_version: str | None = None
     return_logprob: bool = False
     output_token_logprobs: list[Any] = field(default_factory=list)
+    # Number of top-k logprob entries recorded per generated token (0 = none).
+    top_logprobs_num: int = 0
+    # Per generated token, a list of [logprob, token_id] pairs sorted by
+    # descending logprob, top_logprobs_num entries each.
+    output_top_logprobs: list[Any] = field(default_factory=list)
     capture_model_output_keys: tuple[str, ...] = ()
     max_new_tokens: int | None = None
     enforce_request_limits: bool = False

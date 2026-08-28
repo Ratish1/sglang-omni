@@ -150,11 +150,13 @@ async def run(
         save_audio_dir = os.path.join(args.output_dir, "audio")
         os.makedirs(save_audio_dir, exist_ok=True)
 
+    top_logprobs = getattr(args, "top_logprobs", None)
     send_fn_kwargs = dict(
         modalities=modalities,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         save_audio_dir=save_audio_dir,
+        top_logprobs=top_logprobs,
     )
     if args.prompt:
         send_fn_kwargs["prompt"] = args.prompt
@@ -208,6 +210,7 @@ async def run(
                 "temperature": args.temperature,
                 "seed": args.seed,
                 "asr_concurrency": asr_concurrency,
+                "top_logprobs": top_logprobs,
             },
             args.output_dir,
             speed_metrics=speed,
@@ -256,6 +259,12 @@ def main() -> None:
         type=int,
         default=DEFAULT_ASR_TRANSCRIBE_CONCURRENCY,
         help="Concurrent ASR transcription requests for WER.",
+    )
+    p.add_argument(
+        "--top-logprobs",
+        type=int,
+        default=None,
+        help="Request per-token logprobs with this many top alternatives.",
     )
 
     args = p.parse_args()

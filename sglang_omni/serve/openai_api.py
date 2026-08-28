@@ -660,6 +660,12 @@ def _register_chat_completions(app: FastAPI) -> None:
         created = int(time.time())
         model = req.model or default_model
 
+        if req.stream and req.logprobs:
+            raise HTTPException(
+                status_code=400,
+                detail="logprobs are not supported with stream=true",
+            )
+
         gen_req = _build_chat_generate_request(req)
 
         # Determine audio format from request
@@ -748,6 +754,24 @@ async def _chat_non_stream(
             total_tokens=result.usage.total_tokens or 0,
         )
 
+    logprobs: dict[str, Any] | None = None
+    if req.logprobs:
+        if result.token_logprobs is None:
+            raise HTTPException(
+                status_code=501,
+                detail="backend did not return requested logprobs (token_logprobs)",
+            )
+        if usage is not None and len(result.token_logprobs) != usage.completion_tokens:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"backend returned token_logprobs length "
+                    f"{len(result.token_logprobs)} for "
+                    f"completion_tokens={usage.completion_tokens}"
+                ),
+            )
+        logprobs = _chat_logprobs_block(result.token_logprobs)
+
     response = ChatCompletionResponse(
         id=response_id,
         created=created,
@@ -757,12 +781,36 @@ async def _chat_non_stream(
                 index=0,
                 message=message,
                 finish_reason=result.finish_reason,
+                logprobs=logprobs,
             )
         ],
         usage=usage,
     )
 
     return JSONResponse(content=response.model_dump())
+
+
+def _chat_logprobs_entry(item: dict[str, Any]) -> dict[str, Any]:
+    token = item["token"]
+    return {
+        "token": token,
+        "token_id": item["token_id"],
+        "logprob": item["logprob"],
+        "bytes": list(token.encode("utf-8")),
+    }
+
+
+def _chat_logprobs_block(token_logprobs: list[dict[str, Any]]) -> dict[str, Any]:
+    """OpenAI chat logprobs block built from the backend's token_logprobs.
+    token_id is kept on every entry as an sglang-omni extension."""
+    content: list[dict[str, Any]] = []
+    for item in token_logprobs:
+        entry = _chat_logprobs_entry(item)
+        entry["top_logprobs"] = [
+            _chat_logprobs_entry(top) for top in item["top_logprobs"]
+        ]
+        content.append(entry)
+    return {"content": content}
 
 
 async def _chat_stream(
@@ -983,6 +1031,10 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
     ):
         if value is not None:
             extra_params[field_name] = value
+    if req.logprobs:
+        extra_params["return_logprob"] = True
+        extra_params["top_logprobs_num"] = req.top_logprobs or 0
+        extra_params["return_token_logprobs"] = True
 
     return GenerateRequest(
         model=req.model,

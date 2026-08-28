@@ -279,6 +279,23 @@ def test_qwen_apply_thinker_result_preserves_empty_logprob_list() -> None:
     assert state.engine_outputs["thinker"]["output_token_logprobs"] == []
 
 
+def test_qwen_apply_thinker_result_copies_top_logprobs() -> None:
+    state = Qwen3OmniPipelineState()
+    top = [[[-0.1, 3], [-1.5, 4]], [[-0.2, 9], [-2.0, 1]]]
+    result = SimpleNamespace(
+        output_ids=[3, 9],
+        extra_model_outputs={},
+        output_token_logprobs=[[-0.1, 3], [-0.2, 9]],
+        output_top_logprobs=top,
+    )
+
+    thinker_out = apply_thinker_result(state, stage_name="thinker", result=result)
+
+    assert thinker_out["output_token_logprobs"] == [[-0.1, 3], [-0.2, 9]]
+    assert thinker_out["output_top_logprobs"] == top
+    assert state.engine_outputs["thinker"]["output_top_logprobs"] == top
+
+
 def test_qwen_apply_thinker_result_omits_missing_optional_fields() -> None:
     state = Qwen3OmniPipelineState()
     result = SimpleNamespace(output_ids=[8], extra_model_outputs={})
@@ -288,6 +305,7 @@ def test_qwen_apply_thinker_result_omits_missing_optional_fields() -> None:
     assert "finish_reason" not in thinker_out
     assert "weight_version" not in thinker_out
     assert "output_token_logprobs" not in thinker_out
+    assert "output_top_logprobs" not in thinker_out
     assert state.thinker_out is thinker_out
     assert state.engine_outputs["thinker"] is thinker_out
 

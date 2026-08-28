@@ -127,6 +127,7 @@ class VideoEvalConfig:
     asr_device: str = "cuda:0"
     asr_concurrency: int = DEFAULT_ASR_TRANSCRIBE_CONCURRENCY
     lang: str = "en"
+    top_logprobs: int | None = None
 
 
 def _build_base_url(config: VideoEvalConfig) -> str:
@@ -173,6 +174,7 @@ async def run_video_eval(
         enable_audio_input=enable_audio_input,
         audio_output_dir=audio_output_dir,
         fixed_prompt=fixed_prompt,
+        top_logprobs=config.top_logprobs,
     )
     runner = BenchmarkRunner(
         RunConfig(
@@ -210,6 +212,7 @@ async def run_video_eval(
             "asr_device": config.asr_device,
             "asr_concurrency": config.asr_concurrency,
             "lang": config.lang,
+            "top_logprobs": config.top_logprobs,
         },
         "per_sample": per_sample,
     }
@@ -253,6 +256,7 @@ def video_eval_config_from_args(args: argparse.Namespace) -> VideoEvalConfig:
         asr_device=args.asr_device,
         asr_concurrency=args.asr_concurrency,
         lang=args.lang,
+        top_logprobs=args.top_logprobs,
     )
 
 
@@ -303,6 +307,12 @@ def add_video_eval_args(parser: argparse.ArgumentParser, *, repo_help: str) -> N
         choices=["en", "zh"],
         default="en",
         help="Language for ASR transcription when --enable-audio is used.",
+    )
+    parser.add_argument(
+        "--top-logprobs",
+        type=int,
+        default=None,
+        help="Request per-token logprobs with this many top alternatives.",
     )
 
 

@@ -19,6 +19,10 @@ from benchmarks.benchmarker.runner import SendFn
 from benchmarks.benchmarker.utils import get_wav_duration, save_json_results
 from benchmarks.dataset.mmsu import MmsuSample, normalize_text
 from benchmarks.metrics.accuracy import INDEX_TO_LETTER, extract_answer_letter
+from benchmarks.tasks.token_logprobs import (
+    extract_token_logprobs,
+    summarize_token_logprobs,
+)
 
 DEFAULT_PROMPT = (
     "Listen to the audio and answer the multiple-choice question. "
@@ -71,6 +75,7 @@ def _build_request_payload(
     modalities: list[str],
     max_tokens: int,
     temperature: float,
+    top_logprobs: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model_name,
@@ -88,6 +93,9 @@ def _build_request_payload(
     }
     if "audio" in modalities:
         payload["audio"] = {"format": "wav"}
+    if top_logprobs is not None:
+        payload["logprobs"] = True
+        payload["top_logprobs"] = top_logprobs
     return payload
 
 
@@ -115,6 +123,7 @@ def _build_result_from_response(
 ) -> RequestResult:
     message = response_json.get("choices", [{}])[0].get("message", {})
     result.text = _extract_message_text(message)
+    result.token_logprobs = extract_token_logprobs(response_json)
 
     usage = response_json.get("usage") or {}
     result.prompt_tokens = usage.get("prompt_tokens", 0)
@@ -160,6 +169,12 @@ class MmsuResult:
     has_audio: bool = False
     audio_duration_s: float = 0.0
     error: str = ""
+    answer_token_index: int | None = None
+    answer_logprob: float | None = None
+    answer_margin: float | None = None
+    min_margin: float | None = None
+    min_margin_index: int | None = None
+    token_logprobs: list[dict[str, Any]] | None = None
 
 
 def make_mmsu_send_fn(
@@ -171,6 +186,7 @@ def make_mmsu_send_fn(
     max_tokens: int = 32,
     temperature: float = 0.0,
     save_audio_dir: str | None = None,
+    top_logprobs: int | None = None,
 ) -> SendFn:
     if modalities is None:
         modalities = ["text"]
@@ -189,6 +205,7 @@ def make_mmsu_send_fn(
             modalities=modalities,
             max_tokens=max_tokens,
             temperature=temperature,
+            top_logprobs=top_logprobs,
         )
 
         start_time = time.perf_counter()
@@ -276,6 +293,13 @@ def build_mmsu_results(
         if audio_mode:
             result.has_audio = request_result.audio_duration_s > 0
             result.audio_duration_s = request_result.audio_duration_s
+
+        if request_result.token_logprobs is not None:
+            result.token_logprobs = request_result.token_logprobs
+            for key, value in summarize_token_logprobs(
+                request_result.token_logprobs, result.predicted_choice
+            ).items():
+                setattr(result, key, value)
 
         results.append(result)
 

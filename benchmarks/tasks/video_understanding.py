@@ -19,6 +19,10 @@ from benchmarks.benchmarker.data import RequestResult
 from benchmarks.benchmarker.runner import SendFn
 from benchmarks.benchmarker.utils import get_wav_duration
 from benchmarks.dataset.videomme import VideoAMMESample, VideoMMESample
+from benchmarks.tasks.token_logprobs import (
+    extract_token_logprobs,
+    summarize_token_logprobs,
+)
 from benchmarks.tasks.visual_understand import parse_multi_choice_response
 
 logger = logging.getLogger(__name__)
@@ -53,6 +57,12 @@ class VideoMMERecord(TypedDict):
     is_success: bool
     is_mc_fallback: bool
     error: str
+    answer_token_index: int | None
+    answer_logprob: float | None
+    answer_margin: float | None
+    min_margin: float | None
+    min_margin_index: int | None
+    token_logprobs: list[dict[str, Any]] | None
 
 
 def _apply_chat_completion_response(
@@ -64,6 +74,7 @@ def _apply_chat_completion_response(
 ) -> bool:
     message = body.get("choices", [{}])[0].get("message", {})
     result.text = message.get("content", "") or ""
+    result.token_logprobs = extract_token_logprobs(body)
     wav_bytes = b""
 
     if audio_output_dir:
@@ -116,6 +127,7 @@ def make_video_send_fn(
     enable_audio_input: bool = False,
     audio_output_dir: str | None = None,
     fixed_prompt: str | None = None,
+    top_logprobs: int | None = None,
 ) -> SendFn:
     modalities = ["text", "audio"] if audio_output_dir else ["text"]
 
@@ -153,6 +165,9 @@ def make_video_send_fn(
             payload["video_max_pixels"] = video_max_pixels
         if video_total_pixels is not None:
             payload["video_total_pixels"] = video_total_pixels
+        if top_logprobs is not None:
+            payload["logprobs"] = True
+            payload["top_logprobs"] = top_logprobs
 
         start_time = time.perf_counter()
         try:
@@ -227,6 +242,12 @@ def build_videomme_result_records(
             "is_success": False,
             "is_mc_fallback": False,
             "error": result.error,
+            "answer_token_index": None,
+            "answer_logprob": None,
+            "answer_margin": None,
+            "min_margin": None,
+            "min_margin_index": None,
+            "token_logprobs": None,
         }
 
         if not result.is_success:
@@ -250,6 +271,13 @@ def build_videomme_result_records(
             is_mc_fallback=is_fallback,
             error="",
         )
+        if result.token_logprobs is not None:
+            record["token_logprobs"] = result.token_logprobs
+            record.update(
+                summarize_token_logprobs(
+                    result.token_logprobs, "" if is_fallback else predicted
+                )
+            )
         per_sample.append(record)
 
     return per_sample

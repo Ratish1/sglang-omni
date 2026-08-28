@@ -12,13 +12,24 @@ import torch
 from sglang_omni.model_runner.base import ModelRunner
 
 
+def _data(top_logprobs_num: int = 0, **overrides):
+    fields = dict(
+        return_logprob=True,
+        output_token_logprobs=[],
+        top_logprobs_num=top_logprobs_num,
+        output_top_logprobs=[],
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 def test_rollout_logprobs_record_sampler_values_not_raw_logits() -> None:
     runner = object.__new__(ModelRunner)
     logits = torch.tensor([[2.0, 1.0]])
     token_ids = torch.tensor([0])
     raw_logprob = torch.log_softmax(logits, dim=-1)[0, 0].item()
     sampler_logprob = torch.log_softmax(logits / 0.5, dim=-1)[0, 0].item()
-    data = SimpleNamespace(return_logprob=True, output_token_logprobs=[])
+    data = _data()
     request = SimpleNamespace(data=data)
 
     runner._record_rollout_logprobs(
@@ -33,8 +44,8 @@ def test_rollout_logprobs_record_sampler_values_not_raw_logits() -> None:
 
 def test_rollout_logprobs_align_per_request_at_batch_2() -> None:
     runner = object.__new__(ModelRunner)
-    data0 = SimpleNamespace(return_logprob=True, output_token_logprobs=[])
-    data1 = SimpleNamespace(return_logprob=True, output_token_logprobs=[])
+    data0 = _data()
+    data1 = _data()
     requests = [SimpleNamespace(data=data0), SimpleNamespace(data=data1)]
 
     runner._record_rollout_logprobs(
@@ -50,7 +61,7 @@ def test_rollout_logprobs_align_per_request_at_batch_2() -> None:
 
 def test_rollout_logprobs_raises_on_batch_size_mismatch() -> None:
     runner = object.__new__(ModelRunner)
-    data = SimpleNamespace(return_logprob=True, output_token_logprobs=[])
+    data = _data()
 
     # more logprobs than requests => batching assumption broke => fail loud
     with pytest.raises(RuntimeError, match="batch-size mismatch"):
@@ -65,7 +76,7 @@ def test_rollout_logprobs_raises_on_batch_size_mismatch() -> None:
 
 def test_rollout_logprobs_raises_on_malformed_sampler_shape() -> None:
     runner = object.__new__(ModelRunner)
-    data = SimpleNamespace(return_logprob=True, output_token_logprobs=[])
+    data = _data()
 
     with pytest.raises(RuntimeError, match="Failed to convert"):
         runner._record_rollout_logprobs(
@@ -79,7 +90,7 @@ def test_rollout_logprobs_raises_on_malformed_sampler_shape() -> None:
 
 def test_rollout_logprobs_raises_when_sampler_omits_token_ids() -> None:
     runner = object.__new__(ModelRunner)
-    data = SimpleNamespace(return_logprob=True, output_token_logprobs=[])
+    data = _data()
 
     with pytest.raises(RuntimeError, match="next_token_ids"):
         runner._record_rollout_logprobs(
@@ -91,19 +102,77 @@ def test_rollout_logprobs_raises_when_sampler_omits_token_ids() -> None:
     assert data.output_token_logprobs == []
 
 
-def test_enable_sampler_logprobs_initializes_missing_forward_batch_fields() -> None:
+def test_enable_sampler_logprobs_sets_per_row_top_k() -> None:
     forward_batch = SimpleNamespace(top_logprobs_nums=None, token_ids_logprobs=None)
+    requests = [
+        SimpleNamespace(data=_data(top_logprobs_num=3)),
+        SimpleNamespace(data=SimpleNamespace(return_logprob=False)),
+        SimpleNamespace(data=_data()),
+    ]
 
-    ModelRunner._enable_sampler_logprobs(forward_batch, batch_size=2)
+    ModelRunner._enable_sampler_logprobs(forward_batch, requests)
 
     assert forward_batch.return_logprob is True
-    assert forward_batch.top_logprobs_nums == [0, 0]
-    assert forward_batch.token_ids_logprobs == [None, None]
+    assert forward_batch.top_logprobs_nums == [3, 0, 0]
+    assert forward_batch.token_ids_logprobs == [None, None, None]
+
+
+def test_rollout_top_logprobs_record_only_rows_that_asked() -> None:
+    runner = object.__new__(ModelRunner)
+    data0 = _data(top_logprobs_num=2)
+    data1 = _data()
+    requests = [SimpleNamespace(data=data0), SimpleNamespace(data=data1)]
+
+    runner._record_rollout_logprobs(
+        torch.tensor([-0.5, -1.5]),
+        torch.tensor([11, 22]),
+        requests,
+        top_logprobs_val=[torch.tensor([-0.5, -1.2]), torch.tensor([])],
+        top_logprobs_idx=[torch.tensor([11, 13]), torch.tensor([], dtype=torch.long)],
+    )
+
+    assert data0.output_token_logprobs[0][1] == 11
+    (row,) = data0.output_top_logprobs
+    assert [entry[1] for entry in row] == [11, 13]
+    assert math.isclose(row[0][0], -0.5, abs_tol=1e-4)
+    assert math.isclose(row[1][0], -1.2, abs_tol=1e-4)
+    assert data1.output_token_logprobs[0][1] == 22
+    assert data1.output_top_logprobs == []
+
+
+def test_rollout_top_logprobs_raise_when_sampler_omits_them() -> None:
+    runner = object.__new__(ModelRunner)
+    data = _data(top_logprobs_num=2)
+
+    with pytest.raises(RuntimeError, match="next_token_top_logprobs"):
+        runner._record_rollout_logprobs(
+            torch.tensor([-0.5]), torch.tensor([11]), [SimpleNamespace(data=data)]
+        )
+
+    assert data.output_token_logprobs == []
+    assert data.output_top_logprobs == []
+
+
+def test_rollout_top_logprobs_raise_on_row_size_mismatch() -> None:
+    runner = object.__new__(ModelRunner)
+    data = _data(top_logprobs_num=3)
+
+    with pytest.raises(RuntimeError, match="top-k logprob size mismatch"):
+        runner._record_rollout_logprobs(
+            torch.tensor([-0.5]),
+            torch.tensor([11]),
+            [SimpleNamespace(data=data)],
+            top_logprobs_val=[torch.tensor([-0.5, -1.2])],
+            top_logprobs_idx=[torch.tensor([11, 13])],
+        )
+
+    assert data.output_token_logprobs == []
+    assert data.output_top_logprobs == []
 
 
 def test_record_rollout_logprobs_skips_without_return_flag() -> None:
     runner = object.__new__(ModelRunner)
-    data = SimpleNamespace(return_logprob=False, output_token_logprobs=[])
+    data = _data(return_logprob=False)
 
     runner._record_rollout_logprobs(
         torch.tensor([-0.25]), torch.tensor([33]), [SimpleNamespace(data=data)]
@@ -114,7 +183,7 @@ def test_record_rollout_logprobs_skips_without_return_flag() -> None:
 
 def test_record_rollout_logprobs_requires_output_list() -> None:
     runner = object.__new__(ModelRunner)
-    data = SimpleNamespace(return_logprob=True)
+    data = SimpleNamespace(return_logprob=True, top_logprobs_num=0)
 
     with pytest.raises(AttributeError, match="output_token_logprobs"):
         runner._record_rollout_logprobs(
@@ -144,7 +213,7 @@ def test_sample_next_token_ids_requires_sampler_logprobs_when_requested() -> Non
         )
     )
     req = SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=None))
-    data = SimpleNamespace(return_logprob=True, output_token_logprobs=[], req=req)
+    data = _data(req=req)
     request = SimpleNamespace(data=data)
     forward_batch = SimpleNamespace(
         sampling_info=SimpleNamespace(device="cpu", sampling_seed=None),
@@ -163,3 +232,41 @@ def test_sample_next_token_ids_requires_sampler_logprobs_when_requested() -> Non
 
     assert forward_batch.return_logprob is True
     assert data.output_token_logprobs == []
+
+
+def test_sample_next_token_ids_records_sampler_top_logprobs() -> None:
+    runner = object.__new__(ModelRunner)
+    runner._apply_repetition_penalty = lambda *args: None
+    runner._apply_codec_suppress_tokens = lambda *args: None
+    logits_output = SimpleNamespace(
+        next_token_logprobs=None,
+        next_token_top_logprobs_val=None,
+        next_token_top_logprobs_idx=None,
+    )
+
+    def sample(_logits_output, forward_batch):
+        assert forward_batch.return_logprob is True
+        assert forward_batch.top_logprobs_nums == [2]
+        logits_output.next_token_logprobs = torch.tensor([-0.25])
+        logits_output.next_token_top_logprobs_val = [torch.tensor([-0.25, -1.75])]
+        logits_output.next_token_top_logprobs_idx = [torch.tensor([44, 45])]
+        return torch.tensor([44])
+
+    runner.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(sample=sample))
+    req = SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=None))
+    data = _data(top_logprobs_num=2, req=req)
+    forward_batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(device="cpu", sampling_seed=None),
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+    )
+
+    runner._sample_next_token_ids(
+        logits_output,
+        forward_batch,
+        SimpleNamespace(),
+        [SimpleNamespace(data=data)],
+    )
+
+    assert data.output_token_logprobs == [[-0.25, 44]]
+    assert data.output_top_logprobs == [[[-0.25, 44], [-1.75, 45]]]
