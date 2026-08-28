@@ -431,7 +431,7 @@ impl WorkerPool {
         if eligible_count == 0 {
             return Err(DispatchError::Unavailable);
         }
-        let policy_guard = self.selector.least_requests_guard(eligible_count);
+        let policy_guard = self.selector.least_requests_guard();
         let gate = self.gate.read().map_err(|_| DispatchError::Internal)?;
         if !gate.open {
             return Err(DispatchError::Draining);

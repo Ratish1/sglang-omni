@@ -20,11 +20,8 @@ impl Selector {
         }
     }
 
-    pub(super) fn least_requests_guard(
-        &self,
-        candidate_count: usize,
-    ) -> Option<MutexGuard<'_, ()>> {
-        if self.strategy != RoutingStrategy::LeastRequests || candidate_count < 2 {
+    pub(super) fn least_requests_guard(&self) -> Option<MutexGuard<'_, ()>> {
+        if self.strategy != RoutingStrategy::LeastRequests {
             return None;
         }
         Some(
@@ -47,5 +44,20 @@ impl Selector {
             .ok()
             .and_then(|size| usize::try_from(sequence % size).ok())
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Selector;
+    use crate::config::RoutingStrategy;
+
+    #[test]
+    fn least_requests_always_serializes_while_round_robin_remains_lock_free() {
+        let least_requests = Selector::new(RoutingStrategy::LeastRequests);
+        let round_robin = Selector::new(RoutingStrategy::RoundRobin);
+
+        assert!(least_requests.least_requests_guard().is_some());
+        assert!(round_robin.least_requests_guard().is_none());
     }
 }
