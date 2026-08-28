@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kernel-level A/B between two sglang stacks on the Qwen3-Omni thinker path.
+"""Kernel-level A/B on the Qwen3-Omni thinker path.
 
-Usage (in each container, same GPU):
-    python kernel_ab.py run --seed 0 --out /shared/ab/old.pt [--model-path P] [--video V]
-    python kernel_ab.py compare /shared/ab/old.pt /shared/ab/new.pt
+Usage (one GPU):
+    python kernel_ab.py run --seed 0 --out $OUT/ab/run1.pt [--model-path P] [--video V]
+    python kernel_ab.py run --seed 0 --out $OUT/ab/run2.pt [--model-path P] [--video V]
+    python kernel_ab.py compare $OUT/ab/run1.pt $OUT/ab/run2.pt
+    python kernel_ab.py pairs $OUT/ab/run1.pt
 
 run generates inputs on the CPU with numpy's legacy RandomState (stable
 across versions), hashes them, executes every kernel of the inventory in
-00_plan.md section 3 and saves the outputs. compare refuses to run when the
-input hashes differ and prints, per case and tensor, whether the outputs are
-bitwise equal, the mismatch fraction, the max absolute and max relative
-difference, and the kernel time.
+00_plan.md section 3 and saves the outputs. compare takes two dumps with the
+same inputs (it refuses to run when the input hashes differ) and prints, per
+case and tensor, whether the outputs are bitwise equal, the mismatch
+fraction, the max absolute and max relative difference, and the kernel time.
+Two runs of the same stack show which kernels are nondeterministic. pairs
+compares, inside one dump, the backends that compute the same function
+(PAIRS below and the vision SDPA backends), which sizes the numerical
+difference each server-level arm of 00_plan.md section 4.3 introduces.
 
 Cases that need a published sglang runtime context (MRoPE) or model files
 (HF processor) run only when --model-path (and --video) are given. Every
@@ -804,6 +810,92 @@ def compare(path_a: str, path_b: str) -> int:
     return 0
 
 
+# Backend pairs that compute the same function inside one dump: the kernel
+# family the server switches between with the section 4.3 arms, plus the
+# encoder attention implementations. Each pair is compared at every M or L
+# the run produced.
+PAIRS = (
+    ("fp8_dense_deepgemm", "fp8_dense_triton"),
+    ("moe_fp8_cutlass", "moe_fp8_triton"),
+    ("silu_and_mul_aot", "silu_and_mul_jit"),
+    ("audio_sdpa", "audio_fa3_varlen"),
+)
+
+
+def _pair_rows(results: dict, name_a: str, name_b: str):
+    rows = []
+    for name in results:
+        if not name.startswith(name_a + "/"):
+            continue
+        other = name_b + name[len(name_a) :]
+        ra, rb = results[name], results.get(other)
+        if rb is None:
+            rows.append((name, other, "-", "missing", None, None, None))
+            continue
+        if ra["error"] or rb["error"]:
+            rows.append(
+                (
+                    name,
+                    other,
+                    "-",
+                    f"error A={bool(ra['error'])} B={bool(rb['error'])}",
+                    None,
+                    None,
+                    None,
+                )
+            )
+            continue
+        oa, ob = ra["out"], rb["out"]
+        if not isinstance(oa, dict):
+            oa, ob = {"out": oa}, {"out": ob}
+        for key, va in oa.items():
+            vb = ob.get(key)
+            if isinstance(va, torch.Tensor) and isinstance(vb, torch.Tensor):
+                mt = _metrics(va, vb)
+                rows.append(
+                    (
+                        name,
+                        other,
+                        key,
+                        "bitwise" if mt.get("equal") else "differs",
+                        mt.get("mismatch_frac"),
+                        mt.get("max_abs"),
+                        mt.get("max_rel"),
+                    )
+                )
+    return rows
+
+
+def pairs(path: str) -> int:
+    """Compare the backend pairs of PAIRS inside one dump. The vision SDPA
+    backends are compared against vision_sdpa_default."""
+    dump = torch.load(path, weights_only=False)
+    results = dump["results"]
+    print("env:", json.dumps(dump["env"]))
+    rows = []
+    for name_a, name_b in PAIRS:
+        rows += _pair_rows(results, name_a, name_b)
+    vision_backends = sorted(
+        {
+            n.split("/")[0]
+            for n in results
+            if n.startswith("vision_sdpa_") and not n.startswith("vision_sdpa_default")
+        }
+    )
+    for backend in vision_backends:
+        rows += _pair_rows(results, "vision_sdpa_default", backend)
+    rows.sort(key=lambda r: -(r[6] or 0.0))
+    print(
+        f"{'case A':38s} {'case B':38s} {'tensor':10s} {'verdict':22s} {'mismatch':>9s} {'max_abs':>10s} {'max_rel':>10s}"
+    )
+    for r in rows:
+        f = lambda v, w: ("" if v is None else f"{v:.3g}").rjust(w)
+        print(
+            f"{r[0]:38s} {r[1]:38s} {r[2]:10s} {r[3]:22s} {f(r[4], 9)} {f(r[5], 10)} {f(r[6], 10)}"
+        )
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -815,10 +907,14 @@ def main(argv=None) -> int:
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")
+    pr = sub.add_parser("pairs")
+    pr.add_argument("dump")
     a = p.parse_args(argv)
     if a.cmd == "run":
         run(a)
         return 0
+    if a.cmd == "pairs":
+        return pairs(a.dump)
     return compare(a.a, a.b)
 
 

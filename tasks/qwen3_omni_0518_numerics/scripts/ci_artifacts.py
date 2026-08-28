@@ -11,7 +11,10 @@ for each run with gh. compare prints the per-attempt gate values and the
 per-sample changes between the two run groups. compare-local takes result
 JSON files produced by local benchmark runs (one file per attempt) and
 applies the same per-sample comparison, so H100 ablation arms are read the
-same way as CI runs.
+same way as CI runs: --pre is the reference arm, --post the arm under test.
+Local runs made with run_bench.py carry answer_margin and min_margin per
+sample (top-1 minus top-2 logprob, in nat); when present they are printed
+per sample with the near-tie count of each group.
 
 Artifacts keep one directory per pytest attempt (pytest-0, pytest-1, ...).
 The pytest-current directory duplicates the last attempt and is skipped.
@@ -115,6 +118,10 @@ def _print_gate_table(label: str, rows, cols) -> None:
         print(" | ".join(str(x) for x in r))
 
 
+NEAR_TIE_NAT = 0.1
+MOVED_NAT = 0.5
+
+
 def _video_preds(items):
     return [
         {
@@ -122,6 +129,8 @@ def _video_preds(items):
                 x["predicted"],
                 x["predicted"] == x["expected"],
                 x["completion_tokens"],
+                x.get("answer_margin"),
+                x.get("min_margin"),
             )
             for x in d["per_sample"]
         }
@@ -132,11 +141,58 @@ def _video_preds(items):
 def _mmsu_preds(items):
     return [
         {
-            x["sample_id"]: (x["predicted_choice"], x["is_correct"])
+            x["sample_id"]: (
+                x["predicted_choice"],
+                x["is_correct"],
+                x.get("answer_margin"),
+            )
             for x in d["per_sample"]
         }
         for _, d in items
     ]
+
+
+def _mean_margin(group, sample, index):
+    values = [
+        p[sample][index] for p in group if sample in p and p[sample][index] is not None
+    ]
+    return sum(values) / len(values) if values else None
+
+
+def _fmt(value):
+    return "-" if value is None else f"{value:.3f}"
+
+
+def _margin_readout(label, ppre, ppost, samples, index, *, show_all):
+    pre = {s: _mean_margin(ppre, s, index) for s in samples}
+    post = {s: _mean_margin(ppost, s, index) for s in samples}
+    if all(v is None for v in pre.values()) and all(v is None for v in post.values()):
+        return
+    print(f"\n=== {label} (mean over attempts, nat) ===")
+    print("sample | pre -> post")
+
+    def order(s):
+        values = [v for v in (pre[s], post[s]) if v is not None]
+        return min(values) if values else float("inf")
+
+    for s in sorted(samples, key=order):
+        a, b = pre[s], post[s]
+        if a is None and b is None:
+            continue
+        near = (a is not None and a < NEAR_TIE_NAT) or (
+            b is not None and b < NEAR_TIE_NAT
+        )
+        moved = a is not None and b is not None and abs(a - b) >= MOVED_NAT
+        if show_all or near or moved:
+            print(f"{s} | {_fmt(a)} -> {_fmt(b)}")
+    for name, group in (("pre", pre), ("post", post)):
+        values = [v for v in group.values() if v is not None]
+        if values:
+            near = sum(1 for v in values if v < NEAR_TIE_NAT)
+            print(
+                f"{name}: {len(values)} samples with margins, {near} below "
+                f"{NEAR_TIE_NAT} nat, median {statistics.median(values):.3f}"
+            )
 
 
 def _majority(values):
@@ -176,6 +232,8 @@ def _compare_video(label: str, pre, post) -> None:
             1 for s in samples if len({p[s][0] for p in group if s in p}) > 1
         )
         print(f"{name}: samples whose prediction differs across attempts: {unstable}")
+    _margin_readout(f"{label}: answer margin", ppre, ppost, samples, 3, show_all=True)
+    _margin_readout(f"{label}: min margin", ppre, ppost, samples, 4, show_all=True)
 
 
 def _compare_mmsu(pre, post) -> None:
@@ -207,6 +265,14 @@ def _compare_mmsu(pre, post) -> None:
         print(
             f"{name}: attempts {len(group)}, unstable samples {unstable}, mean accuracy {mean:.4f}"
         )
+    _margin_readout(
+        "MMSU: answer margin (near-ties and moves only)",
+        ppre,
+        ppost,
+        ids,
+        2,
+        show_all=False,
+    )
 
 
 def _stage8_rows(items):

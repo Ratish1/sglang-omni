@@ -2,7 +2,7 @@
 """Run one CI stage's benchmark against a running server with the CI settings.
 
 Usage:
-    python run_bench.py videoamme --port P --out DIR [--concurrency 16]
+    python run_bench.py videoamme --port P --out DIR [--concurrency 16] [--top-logprobs 5]
     python run_bench.py videomme-talker --port P --out DIR [--concurrency 16] [--max-samples 20]
     python run_bench.py mmsu --port P --out DIR [--concurrency 16] [--max-samples N]
 
@@ -12,7 +12,10 @@ the same short-answer prompt and speech output but without the inline WER
 pass (the CLI would load Qwen3-ASR on cuda:0 next to the server), and mmsu
 mirrors test_qwen3_omni_mmsu_ci.py (stage 5, text only). Each run writes the
 same result JSON the CI artifacts contain, so ci_artifacts.py compare-local
-reads it. Run from the omni checkout root with PYTHONPATH=$PWD.
+reads it. --top-logprobs K (default 5) asks the chat endpoint for per-token
+logprobs with K alternatives, which fills answer_margin and min_margin in
+every per-sample record. Pass --top-logprobs 0 for CI-identical requests
+without logprobs. Run from the omni checkout root with PYTHONPATH=$PWD.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ def run_videoamme(args) -> None:
         video_max_pixels=401408,
         disable_tqdm=True,
         timeout_s=500,
+        top_logprobs=args.top_logprobs,
     )
     results = asyncio.run(run_videoamme_eval(config, compute_wer=False))
     s = results["summary"]
@@ -76,6 +80,7 @@ def run_videomme_talker(args) -> None:
         enable_audio=True,
         disable_tqdm=True,
         timeout_s=500,
+        top_logprobs=args.top_logprobs,
     )
     results = asyncio.run(
         run_video_eval(
@@ -120,6 +125,7 @@ def run_mmsu(args) -> None:
         repo_id=DATASETS["mmsu-ci-2000"],
         lang="en",
         asr_device="cuda:0",
+        top_logprobs=args.top_logprobs,
     )
     results = asyncio.run(run_mmsu_eval(ns, compute_wer=False))
     a, sp = results["accuracy"], results["speed"]
@@ -135,7 +141,10 @@ def main(argv=None) -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--concurrency", type=int, default=16)
     p.add_argument("--max-samples", type=int, default=None)
+    p.add_argument("--top-logprobs", type=int, default=5)
     args = p.parse_args(argv)
+    if args.top_logprobs <= 0:
+        args.top_logprobs = None
     Path(args.out).mkdir(parents=True, exist_ok=True)
     {
         "videoamme": run_videoamme,

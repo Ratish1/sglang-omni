@@ -1,9 +1,11 @@
 # Qwen3-Omni numerics and RTF after the sglang 0.5.18 bump
 
-Date: 2026-08-28. Written from the CI artifacts of 16 Omni CI runs, the two
-sglang checkouts, and the omni tree at `upstream/main`. No GPU was used.
-Every claim below names its source. Items that need a GPU are written as
-measurements in section 4.
+Date: 2026-08-28. Sections 0 to 3 were written from the CI artifacts of 16
+Omni CI runs, the two sglang checkouts, and the omni tree at `upstream/main`.
+No GPU was used. Every claim names its source. Section 4 is the H100
+protocol. It runs on the current stack only and measures per-token logprob
+margins, which this branch adds to the omni chat endpoint and to the
+benchmark records (4.0).
 
 ## 0. Trees, images, runs
 
@@ -128,10 +130,8 @@ two where 001-1 answered with 38 tokens.
 | 10 | rtf_mean | 2.9 to 3.4 | 3.3 to 3.8 |
 
 Stage 9 produces 11 percent fewer tokens post and is 3 percent slower in
-qps, so its per-token cost rose by about 10 percent. Doc
-`tasks/sglang_0518_upgrade/19_h200_regressions_root_cause.md` section 11
-attributes a 3 percent c1 cost to prefill and single-request decode on the
-new stack. The stage 8 and stage 10 latency moves are the same size.
+qps, so its per-token cost rose by about 10 percent. The stage 8 and stage
+10 latency moves are 4 to 12 percent.
 
 ### 2.5 What the evidence establishes
 
@@ -142,7 +142,7 @@ new stack. The stage 8 and stage 10 latency moves are the same size.
 2. The bf16 thinker is more sensitive to batch composition on the new stack
    (stage 8 run-to-run variance, stage 5 unstable count).
 3. Net accuracy is flat to slightly better (stage 5 +0.0007, stage 10 +0.1,
-   stage 9 net -1 sample on the majority, MMMU +1 in doc 19). The gate
+   stage 9 net -1 sample on the majority). The gate
    failures are one-sample margins against gates calibrated on 2026-08-01
    (#1260) that main already failed before the bump (stage 5 in 12 of 12
    attempts, stage 8 in 8 of 10, stage 9 in 4 of 7).
@@ -239,127 +239,168 @@ FP8 group quant kernel, the audio tower attention swap, and the input-side
 video and audio decoders. None of these can be classified further by
 reading. Section 4 measures them.
 
-## 4. H100 attribution protocol
+## 4. H100 protocol
 
-One variable per run. Both stacks on the same host and GPU, same HF cache,
-same clips. The commands are in `scripts/h100_runs.sh`.
+One container, the current CI image (`hongccc/sglang-omni@sha256:02a85f00...`),
+this branch mounted at `OMNI_ROOT`. One variable per run. Servers run one
+worker on one GPU (the router and DP=2 of CI change batch composition
+only), the stage 8 server uses two GPUs as in CI. The commands are the
+functions of `scripts/h100_runs.sh`, listed in the order of 4.5 at the top
+of that file.
 
-### 4.0 Containers and checkouts
+### 4.0 Measurement: per-token logprob margins
 
-| Arm | Image | omni checkout |
-| --- | --- | --- |
-| old | `hongccc/sglang-omni@sha256:374d0b1c...` | `8f8b73d3c` (main before the bump) |
-| new | `hongccc/sglang-omni@sha256:02a85f00...` | `d5eac2627` (upstream/main) |
+At temperature 0 the sampled token of every step is the argmax of the
+logits. This branch makes the chat endpoint return, per generated token,
+the sampled token's logprob and the k most likely tokens with their
+logprobs: `logprobs: true` and `top_logprobs: k` on
+`POST /v1/chat/completions`, OpenAI's request and response shape with
+`token_id` added to every entry. The benchmarks request k=5
+(`run_bench.py --top-logprobs`) and write per sample:
 
-Start the containers with `SGLANG_OMNI_AUTO_CLONE=0` and mount the two
-checkouts (the image entrypoint clones main otherwise, doc 19 section 7).
-Record the versions of torch, triton, sglang, sgl_kernel, flashinfer and
-deep_gemm (`scripts/kernel_ab.py run` prints them) and `nvidia-smi` in each. Servers run one worker on one GPU
-(the router and DP=2 change batch composition only).
+| Field | Meaning |
+| --- | --- |
+| `answer_token_index` | last position whose token text is the predicted letter |
+| `answer_logprob` | the sampled logprob at that position |
+| `answer_margin` | top-1 minus top-2 logprob at that position, in nat |
+| `min_margin`, `min_margin_index` | the smallest top-1 minus top-2 gap over the completion, and its position |
+| `token_logprobs` | the full per-token list (token, token_id, logprob, top_logprobs) |
 
-### 4.1 Reproduce with single workers
+log_softmax preserves logit differences, so a margin is the logit distance
+between the chosen token and the runner-up. A kernel change flips the
+token only if it moves the two candidates' logits apart by at least the
+margin. The margin therefore measures, per sample and per position, how
+far the greedy path is from taking another token, which accuracy on 50
+samples cannot show. The thinker's logits are bf16 (3.1), which keeps 8
+significant bits, so a logit of magnitude 25 is representable to about
+0.1. A margin under 0.1 nat is a near-tie. `min_margin_index` is the
+earliest place where a completion can diverge, which is where the
+token-count changes of 2.2 (011-1, 135 to 57 tokens) come from.
 
-Per stack: FP8 colocated server (stage 9 config) and Video-AMME 50 at c16
-three times and at c1 once (`run_bench.py videoamme`). bf16 thinker-only server (stage 5 config) and
-MMSU text at c16 once and at c1 once. Readout with
-`scripts/ci_artifacts.py compare-local`. The c1 runs give one deterministic
-answer per sample per stack and are the reference for every arm below. The
-c16 runs must show the same flips as CI (007-1, 017-1, 003-1, the MMSU
-twelve) for the reproduction to count.
+The code path: `ChatCompletionRequest.logprobs` and `top_logprobs`
+(`serve/protocol.py:98-113`), forwarded as `return_logprob`,
+`top_logprobs_num` and `return_token_logprobs` in `extra_params`
+(`serve/openai_api.py:1035`), read into `ARRequestData.top_logprobs_num`
+(`scheduling/types.py:85`, `models/qwen3_omni/request_builders.py:710`),
+passed to the SGLang sampler as `forward_batch.top_logprobs_nums` after the
+forward pass (`model_runner/base.py:863`, so the logits processor never
+computes prompt logprobs), recorded per step as `output_top_logprobs`
+(`model_runner/base.py:875`), copied into the thinker output
+(`request_builders.py:898`), decoded to text by the decode stage where the
+tokenizer lives (`components/streaming_detokenizer.py:57`, result key
+`token_logprobs`), carried by `GenerateChunk` and `CompletionResult`
+(`client/types.py:136` and `:208`) and rendered as the OpenAI `logprobs`
+block (`serve/openai_api.py:803`). Requests with logprobs take the
+synchronous sampling path (`thinker_model_runner.py:431`), so they run the
+same kernels as CI under a different decode schedule. `/generate` is
+unchanged. The benchmark readout is `benchmarks/tasks/token_logprobs.py`.
+Streaming chat requests with `logprobs` are rejected with 400.
+
+Noise floor: three c16 attempts of the same arm. The c1 run is
+deterministic and is the reference value of each arm.
+
+### 4.1 Reproduce with single workers (baseline arms)
+
+`run_fp8_arms` starts with the baseline arm: FP8 colocated server (stage 9
+config), Video-AMME 50 at c1 once and at c16 three times. `run_bf16_arms`
+starts with the bf16 thinker-only server (stage 5 config), MMSU text at c1
+and c16. `run_stage8` runs the bf16 disagg server (stage 8 config) at c16
+three times plus the RTF sample of 4.4. Readout with `compare_arms`
+between the baseline attempts (noise floor, no prediction change expected
+at c1). The c16 predictions must match the post-bump CI majorities of 2.2
+(007-1 A, 017-1 D, 003-1 C with 25 tokens or A with 61, 001-1 with 8
+tokens, the MMSU twelve) for the reproduction to count. The baseline
+margins of those samples are the first result: a near-tie (under 0.1 nat)
+on a flipped sample says the flip is a rounding-level effect, a large
+margin (above 1 nat) says the model output moved as a whole.
 
 ### 4.2 Kernel-level A/B
 
-`scripts/kernel_ab.py run --seed 0 --out /shared/ab/<arm>.pt` in each
-container, then `scripts/kernel_ab.py compare old.pt new.pt`. Inputs are
-generated on the CPU from a seeded generator and hashed, and compare refuses
-to run when the input hashes differ. Each case records bitwise equality,
-mismatch count, max absolute and max relative difference:
+`run_kernel_ab`: `scripts/kernel_ab.py run --seed 0` twice, then `compare`
+between the two runs and `pairs` inside one run. Inputs are generated on
+the CPU from a seeded generator and hashed, and compare refuses to run
+when the input hashes differ. Each case records bitwise equality, mismatch
+count, max absolute and max relative difference:
 
 `gate_gemm`, `lm_head` (with argmax agreement), `qkv_gemm_bf16`, `rmsnorm`,
-`fused_add_rmsnorm`, `qk_norm`, `mrope`, `router`, `silu_and_mul`,
-`moe_sum_reduce`, `moe_bf16_triton`, `fa3_prefill`, `fa3_decode`,
-`fp8_group_quant`, `fp8_dense_deepgemm`, `fp8_dense_triton`,
-`moe_fp8_cutlass`, `moe_fp8_triton`, `vision_sdpa` (default, and each SDPA
-backend forced), `audio_attention` (SDPA against FA3 varlen at head_dim 64),
-and `hf_processor` on one CI clip (hashes of `pixel_values_videos`,
-`input_features`, `input_ids`).
+`fused_add_rmsnorm`, `qk_norm`, `mrope`, `router`, `silu_and_mul_aot`,
+`silu_and_mul_jit`, `moe_sum_reduce`, `moe_bf16_triton`, `fa3_prefill`,
+`fa3_decode`, `fp8_group_quant`, `fp8_group_quant_colmajor`,
+`fp8_dense_deepgemm`, `fp8_dense_triton`, `moe_fp8_cutlass`,
+`moe_fp8_triton`, `vision_sdpa_default` and each SDPA backend forced,
+`audio_sdpa`, `audio_fa3_varlen` (head_dim 64), and `hf_processor` on one
+CI clip (hashes of `pixel_values_videos`, `input_features`, `input_ids`).
 
-Readout: cases that are bitwise identical across stacks are excluded. The
-remaining cases are ranked by max relative difference at M = 4096 and at
-M = 1. A case that differs across stacks but is bitwise identical across
-two runs on the same stack is a deterministic kernel change. A case that
-differs between two runs on the same stack is nondeterministic and is
-reported as such.
+Readout: `compare` lists the cases that are not bitwise identical between
+two runs on the same inputs. Those kernels are nondeterministic, and a
+sample whose margin is below that kernel's difference cannot be attributed
+to an arm. `pairs` gives the max relative difference between the backends
+that the arms of 4.3 switch (DeepGEMM against Triton dense FP8, cutlass
+against Triton FP8 MoE, AOT against JIT `silu_and_mul`, audio SDPA against
+FA3 varlen, each vision SDPA backend against the default) at M = 1 to
+4096. This sizes the perturbation an arm applies, to be read against the
+margins.
 
 ### 4.3 Server-level ablations
 
-Each arm on both stacks, Video-AMME at c1 (deterministic) and at c16 three
-times, MMSU text at c1 for the bf16 arms. Per-sample readout against the
-4.1 reference of the same stack and of the other stack.
+Each arm restarts the server with one switch: Video-AMME at c1 and at c16
+three times on the FP8 server, MMSU at c1 and c16 on the bf16 server.
+`backend_lines` of the server log confirms the arm took effect (backend
+policy line, MoE config lines, audio graph line). Per-sample readout with
+`compare_arms` against the baseline arm: predictions, token counts,
+`answer_margin` and `min_margin`.
 
 | Arm | Flag or env | Removes | Stages |
 | --- | --- | --- | --- |
-| dense FP8 GEMM | `SGLANG_ENABLE_JIT_DEEPGEMM=0` | DeepGEMM (Triton block GEMM instead, same family on both stacks) | 9, 10 |
+| dense FP8 GEMM | `SGLANG_ENABLE_JIT_DEEPGEMM=0` | DeepGEMM (Triton block GEMM instead) | 9, 10 |
 | FP8 MoE runner | `--stages.thinker.engine.moe_runner_backend triton` | cutlass grouped GEMM path (Triton block-FP8 `fused_moe_kernel` instead) | 9, 10 |
 | attention | `--stages.thinker.engine.attention_backend triton` | FA3 | 5, 8, 9 |
-| audio graph | `--stages.audio_encoder.factory-args.enable-layer-cuda-graph false` | FA2 (old) or FA3 (new) inside the captured audio stack, eager transformers attention instead | 8, 9, 10 |
+| audio graph | `--stages.audio_encoder.factory-args.enable-layer-cuda-graph false` | FA3 inside the captured audio stack, eager transformers attention instead | 8, 9, 10 |
 | bf16 MoE runner | `--stages.thinker.engine.moe_runner_backend flashinfer_cutlass` | Triton `fused_moe_kernel` (bf16 only, the policy rejects it for FP8) | 5, 8 |
 | fp32 logits | `--stages.thinker.engine.enable_fp32_lm_head true` | bf16 logits ties at argmax | 5, 8, 9 |
 
 Decision rules:
 
-- An arm on the new stack that reproduces the old stack's c1 predictions and
-  token counts on the flipped samples names the kernel family. The same arm
-  on the old stack then shows whether that family is where the old stack's
-  answers came from (its outputs move too) or not.
-- An arm that moves the flipped samples on both stacks without matching
-  either reference shows a near-tie sample, not a defect.
-- If no arm reproduces, the residual is in the components without a switch
-  (cuBLAS GEMMs for gate and lm_head, rebuilt norm binaries, the Triton
-  recompiles) and 4.2 ranks them.
+- An arm that leaves a sample's `answer_margin` within the baseline's c16
+  noise floor does not involve that kernel family in the decision.
+- An arm that moves a sample's margin by more than the noise floor involves
+  it. If the sample is a CI flip and its baseline margin is under 0.1 nat,
+  the flip is a near-tie decided by that family's arithmetic on the new
+  stack, and `pairs` gives the size of the difference the family
+  introduces.
+- A CI flip with a large baseline margin (above 1 nat) that no arm moves is
+  a shift of the model output as a whole. The thinker kernels are then
+  excluded and the residual is the input side: the `hf_processor` hashes
+  of 4.2 (video frames and mel features), the vision SDPA backend, the
+  audio graph arm.
+- Token-count changes: `min_margin_index` of the baseline names the
+  position where the completion is closest to diverging. An arm that
+  changes the token count changes the token at that position.
 
-### 4.4 Logprob margins (stage 5)
+### 4.4 Stage 8 RTF sample and speed
 
-The omni chat endpoint the benchmarks use has no logprob field. `/generate`
-returns `[logprob, token_id]` per generated token when `return_logprob` is
-set (`serve/protocol.py:248`, `serve/openai_api.py:1178`,
-`model_runner/base.py:888`) but carries no video or audio inputs, so the
-measurement covers the text-only MMSU questions. `scripts/logprob_probe.py`
-sends the mmsu-ci-2000 questions (all 2000, or the 12 flipped ids) with the
-benchmark's prompt at temperature 0 and records the answer token's
-probability p and `log(p / (1 - p))`, a lower bound of the margin over the
-runner-up. Run it on both stacks (`run_logprob_probe` in `h100_runs.sh`).
-Margins under 0.1 nat on both stacks classify a question as a near-tie. A
-margin that is large on one stack and small or reversed on the other is a
-systematic shift and the 4.3 arm that removes it is the cause. The whole-set
-run also gives each stack's count of near-tie questions, which bounds the
-attempt-to-attempt variance seen in 2.2.
+- `run_rtf_sample`: the 001-1 prompt alone ten times, recording thinker
+  latency, talker audio duration and rtf, plus `answer_margin` and
+  `min_margin` of its 8-token answer. This separates the answer-length
+  effect (2.3: the two pre-bump attempts with 38 tokens are the two that
+  passed with margin) from pipeline speed. The 14k-token prefill time of
+  the thinker and the talker comes from the server log ("Prefill batch ...
+  input throughput").
+- Throughput: `throughput_qps`, `latency_mean_s` and `output_tokens_mean`
+  of the c16 baseline runs against the post-bump CI values of 2.4. The
+  stage 9 per-token cost is measured with the FP8 arms of 4.3
+  (`deepgemm_off`, `moe_triton`), since DeepGEMM and the cutlass MoE are
+  the only FP8-specific kernels.
 
-The video samples (007-1, 017-1, 003-1) have no logprob path today. Adding
-`return_logprob` to the chat request (`serve/protocol.py:71-80` already
-carries `videos`, `audios`, `video_fps`) and forwarding it in
-`extra_params` is the one omni change that would extend the probe to
-stages 8 and 9. It is not part of this plan.
+### 4.5 Order
 
-### 4.5 Speed and RTF
-
-- Stage 8: send the 001-1 prompt alone ten times per stack, record thinker
-  latency, talker audio duration and rtf. This separates the answer-length
-  effect (numerics) from pipeline speed. Record the 14k-token prefill time
-  of the thinker and the talker from the server logs ("Prefill batch ...
-  input throughput") on both stacks.
-- Stage 5 and 9 throughput: the per-stage traces of
-  `tasks/sglang_0518_upgrade/20_profiling_protocol.md` apply unchanged.
-  The stage 9 per-token cost (+10 percent) is measured with the FP8 arms of
-  4.3, since DeepGEMM and the cutlass MoE are the only FP8-specific kernels.
-
-### 4.6 Order
-
-1. 4.0 and 4.1 (reproduction, about 1 hour of GPU time).
-2. 4.2 (kernel A/B, minutes per container).
-3. 4.3 FP8 arms (dense GEMM, MoE runner), then attention, then audio graph.
-4. 4.4 on the samples still unexplained.
-5. 4.5.
+1. `run_unit_tests`, then one FP8 server with `smoke_logprobs` (the
+   endpoint returns the block and the top-1 entry is the sampled token).
+2. `run_kernel_ab`.
+3. `run_fp8_arms` (baseline first, then the five arms).
+4. `run_bf16_arms`.
+5. `GPU=0,1 run_stage8`.
+6. `compare_arms` per arm against its baseline.
 
 ## 5. Follow-up work after attribution
 
@@ -369,36 +410,75 @@ stages 8 and 9. It is not part of this plan.
   replace stage 8 `rtf_mean` with the ratio of total latency to total audio
   (0.74 to 0.81 on both stacks) or exclude answers shorter than a fixed
   token count from the per-sample rtf.
+- Logprob margins in CI: with `--top-logprobs` the stage benchmarks record
+  margins without changing the requests' text. A gate on the count of
+  near-tie samples, or on per-sample margin deltas against a reference
+  file, detects numerical drift per sample instead of through accuracy on
+  50 samples. The reference file is the baseline c1 run of 4.1.
 - MoE Triton configs: no tuned `triton_3_7_1` file for `E=128,N=768` on
   H100 exists, bf16 or fp8_w8a8. Tune with sglang's `tuning_fused_moe_triton`
   benchmark on the new stack for TP=1 and TP=2 and check accuracy and speed
   through 4.3.
 - FlashInfer autotune cache for the talker's `trtllm::fused_moe` at
   (14208, 1024) is missing on both stacks.
-- Stage 10 WER gate (1.65 percent on ten clips) fails on sampling noise on
-  both stacks (doc 19 section 13).
+- Stage 10 WER gate (1.65 percent on ten clips): the post-bump attempts
+  range from 0.0 to 2.87 percent (2.1), so the gate is decided by talker
+  sampling on ten clips.
 
 ## 6. Files
 
+Analysis folder:
+
 - `00_plan.md`: this document.
 - `scripts/ci_artifacts.py`: artifact download and comparison, also reads
-  local benchmark result files (`compare-local`).
+  local benchmark result files (`compare-local`) and prints the margin
+  readout when the records carry margins.
 - `scripts/runs_postmerge_20260828.tsv`: the Omni CI runs created after the
   bump, with head SHA, branch and time.
 - `scripts/run_bench.py`: runs one stage's benchmark with the CI settings
-  against a running server, without the inline WER pass.
-- `scripts/logprob_probe.py`: MMSU answer-token logprobs through `/generate`.
-- `scripts/kernel_ab.py`: kernel-level A/B dump and compare.
-- `scripts/h100_runs.sh`: server launch, benchmark, probe and log-grep
-  functions for every arm of section 4.
+  against a running server, without the inline WER pass, with
+  `--top-logprobs`.
+- `scripts/kernel_ab.py`: kernel-level dump, determinism compare and
+  backend pairs.
+- `scripts/h100_runs.sh`: unit tests, server launch, smoke test, benchmark,
+  kernel A/B and readout functions for every step of section 4.
 
-## 7. Verification status of the scripts
+Omni change on this branch (logprobs on the chat endpoint and in the
+benchmark records):
 
-Checked on this machine (no GPU):
+- `sglang_omni/serve/protocol.py`, `sglang_omni/serve/openai_api.py`
+- `sglang_omni/scheduling/types.py`, `sglang_omni/model_runner/base.py`
+- `sglang_omni/models/qwen3_omni/request_builders.py`,
+  `sglang_omni/models/qwen3_omni/components/streaming_detokenizer.py`
+- `sglang_omni/client/types.py`, `sglang_omni/client/client.py`
+- `benchmarks/tasks/token_logprobs.py` (new), `benchmarks/benchmarker/data.py`,
+  `benchmarks/tasks/video_understanding.py`,
+  `benchmarks/tasks/audio_understanding.py`,
+  `benchmarks/eval/benchmark_omni_videomme.py`,
+  `benchmarks/eval/benchmark_omni_mmsu.py`
+- Tests: `tests/unit_test/model_runner/test_rollout_logprobs.py`,
+  `tests/unit_test/qwen3_omni/test_pipeline.py`,
+  `tests/unit_test/qwen3_omni/test_request_builder_text_only.py`,
+  `tests/unit_test/qwen3_omni/test_token_logprobs.py` (new),
+  `tests/unit_test/client/test_completion_rollout.py`,
+  `tests/unit_test/serve/test_chat_logprobs.py` (new),
+  `tests/unit_test/benchmarks/test_token_logprobs.py` (new)
 
+## 7. Verification status
+
+Checked on this machine (no GPU, no sglang):
+
+- Unit tests: `serve/test_chat_logprobs.py`, `serve/test_generate_rollout.py`,
+  `serve/test_openai_api.py`, `client/test_completion_rollout.py`,
+  `qwen3_omni/test_token_logprobs.py`, `benchmarks/test_token_logprobs.py`
+  pass (175 tests, one pre-existing test in `test_openai_api.py` needs the
+  `av` package). `model_runner/test_rollout_logprobs.py`,
+  `qwen3_omni/test_pipeline.py` and
+  `qwen3_omni/test_request_builder_text_only.py` import sglang and run
+  through `run_unit_tests` on the H100.
 - `ci_artifacts.py compare` reproduced every table in section 2 from the
-  downloaded artifacts. `compare-local` was run on artifact files renamed as
-  local results.
+  downloaded artifacts before the margin readout was added. The margin
+  readout prints nothing for records without margins.
 - `kernel_ab.py`: every kernel signature it calls was read at both tags
   (`sgl_kernel.rmsnorm`, `fused_add_rmsnorm`, `silu_and_mul`,
   `flash_attn_varlen_func`, `flash_attn_with_kvcache`, `moe_sum_reduce`,
@@ -412,13 +492,11 @@ Checked on this machine (no GPU):
   case is isolated and a failing case records its traceback.
 - `run_bench.py` mirrors the three CI test files' configurations
   (`VideoEvalConfig` fields, the stage 8 short-answer prompt, the MMSU
-  `argparse.Namespace`). It compiles and has not executed.
-- `logprob_probe.py` follows the `/generate` request and response shapes read
-  in `serve/openai_api.py:1002-1183`. It compiles and has not executed.
+  `argparse.Namespace`) plus `top_logprobs`. It compiles and has not
+  executed.
 - `h100_runs.sh` passes `bash -n`. Flags were read from
   `sglang_omni_router/launcher/local.py:build_worker_command`, the CI
   conftest, `examples/launchers/qwen3_omni.py` and the benchmark parsers.
 
-The first execution on the H100 is the remaining verification. Read the
-server log with `backend_lines` after each launch to confirm the arm took
-effect (backend policy line, MoE config lines, audio graph line).
+The first execution on the H100 is the remaining verification:
+`run_unit_tests`, then `smoke_logprobs` against one server.
