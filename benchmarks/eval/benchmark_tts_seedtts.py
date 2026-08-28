@@ -298,11 +298,16 @@ async def run_tts_seedtts_benchmark(
         **generation_kwargs,
     )
 
+    warmup_requests = (
+        config.concurrency
+        if config.warmup == 1 and config.concurrency > 0
+        else config.warmup
+    )
     runner = BenchmarkRunner(
         RunConfig(
             max_concurrency=config.concurrency,
             request_rate=config.request_rate,
-            warmup=config.warmup,
+            warmup=warmup_requests,
             disable_tqdm=config.disable_tqdm,
         )
     )
