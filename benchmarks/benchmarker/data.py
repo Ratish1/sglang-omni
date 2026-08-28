@@ -16,6 +16,7 @@ class RequestResult:
     rtf: float = 0.0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    finish_reason: str | None = None
     engine_time_s: float = 0.0
     tok_per_s: float = 0.0
     wav_path: str = ""

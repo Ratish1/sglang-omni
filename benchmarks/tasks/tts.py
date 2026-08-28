@@ -1048,12 +1048,15 @@ def _parse_response_headers(result: RequestResult, headers: dict) -> None:
     prompt_tok = headers.get("X-Prompt-Tokens")
     comp_tok = headers.get("X-Completion-Tokens")
     eng_time = headers.get("X-Engine-Time")
+    finish_reason = headers.get("X-Finish-Reason")
     if prompt_tok is not None:
         result.prompt_tokens = int(prompt_tok)
     if comp_tok is not None:
         result.completion_tokens = int(comp_tok)
     if eng_time is not None:
         result.engine_time_s = float(eng_time)
+    if finish_reason is not None:
+        result.finish_reason = str(finish_reason)
     if result.completion_tokens > 0 and result.engine_time_s > 0:
         result.tok_per_s = result.completion_tokens / result.engine_time_s
 
@@ -1109,6 +1112,7 @@ async def _handle_raw_pcm_streaming_response(
     start_time: float,
     save_audio_dir: str | None,
 ) -> None:
+    _parse_response_headers(result, response.headers)
     pcm_chunks: list[bytes] = []
     chunk_times: list[float] = []
     try:
@@ -1342,6 +1346,7 @@ def _request_result_to_generated_entry(
         "is_success": output.is_success,
         "latency_s": round(output.latency_s, 4),
         "audio_duration_s": round(output.audio_duration_s, 4),
+        "finish_reason": output.finish_reason,
     }
     if output.error:
         entry["error"] = output.error
@@ -1369,6 +1374,7 @@ def save_speed_results(
                 "rtf",
                 "prompt_tokens",
                 "completion_tokens",
+                "finish_reason",
                 "output_token_rate",
                 "audio_ttfp_s",
                 "audio_chunk_count",
@@ -1387,6 +1393,7 @@ def save_speed_results(
                     f"{o.rtf:.4f}" if o.rtf < float("inf") else "",
                     o.prompt_tokens or "",
                     o.completion_tokens or "",
+                    o.finish_reason or "",
                     f"{o.tok_per_s:.1f}" if o.tok_per_s > 0 else "",
                     (f"{o.audio_ttfp_s:.4f}" if o.audio_ttfp_s is not None else ""),
                     o.audio_chunk_count or "",

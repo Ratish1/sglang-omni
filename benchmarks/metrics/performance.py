@@ -403,6 +403,7 @@ def _request_result_to_dict(output: RequestResult) -> dict:
         "rtf": round(output.rtf, 4) if output.rtf < float("inf") else None,
         "prompt_tokens": output.prompt_tokens or None,
         "completion_tokens": output.completion_tokens or None,
+        "finish_reason": output.finish_reason,
         "output_token_rate": (
             round(output.tok_per_s, 1) if output.tok_per_s > 0 else None
         ),
