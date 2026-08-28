@@ -10,6 +10,12 @@ All Rust Omni, TTS, and ASR routing behavior is in the single `sglang-omni-route
 
 Run every command from the repository root. Do not run another benchmark, model server, or GPU job on the selected CPUs or GPUs.
 
+The qualification at carry-forward baseline
+`a1452e143406bfe94aa1fd2b5203ee68b4308e9d` already completed the router-only,
+ASR, Qwen3-TTS, and Qwen3-Omni campaigns. For the incremental Higgs control,
+the candidate is the new HEAD and has a different binary hash. Run only
+[`HIGGS_INCREMENTAL.md`](HIGGS_INCREMENTAL.md). Do not rerun Layers B or C.
+
 ## Prerequisites
 
 ```bash

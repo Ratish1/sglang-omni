@@ -1,0 +1,94 @@
+schema_version = 1
+
+[server]
+listen = "127.0.0.1:30000"
+max_connections = 1024
+
+[shutdown]
+drain_timeout_ms = 30000
+
+[logging]
+format = "json"
+filter = "info"
+
+[router]
+strategy = "round_robin"
+max_concurrent_classifications = 4
+
+[admission]
+global = 128
+speech_http = 128
+
+[health]
+interval_ms = 2000
+timeout_ms = 1000
+success_threshold = 1
+failure_threshold = 3
+max_concurrent_probes = 2
+
+[http_media]
+routes = ["speech"]
+trust_domain = "local"
+buffered_request_max_bytes = 8388608
+buffered_request_total_bytes = 268435456
+streamed_request_max_bytes = 536870912
+connect_timeout_ms = 5000
+request_timeout_ms = 1800000
+pool_idle_timeout_ms = 90000
+pool_max_idle_per_host = 64
+
+[[workers]]
+worker_id = "higgs-1"
+base_url = "http://127.0.0.1:8011/"
+trust_domain = "local"
+default_model_id = "bosonai/higgs-tts-3-4b"
+health_path = "/health"
+
+[workers.capacity]
+speech_http = 64
+
+[[workers.service_profiles]]
+service = "speech_http"
+model_ids = ["bosonai/higgs-tts-3-4b"]
+response_formats = ["wav"]
+stream_modes = ["non_streaming"]
+tasks = ["text_to_speech", "voice_clone"]
+reference_forms = ["none", "direct", "list"]
+managed_voice = false
+
+[[workers.service_profiles]]
+service = "speech_http"
+model_ids = ["bosonai/higgs-tts-3-4b"]
+response_formats = ["pcm"]
+stream_modes = ["non_streaming", "streaming"]
+tasks = ["text_to_speech", "voice_clone"]
+reference_forms = ["none", "direct", "list"]
+managed_voice = false
+
+[[workers]]
+worker_id = "higgs-2"
+base_url = "http://127.0.0.1:8012/"
+trust_domain = "local"
+default_model_id = "bosonai/higgs-tts-3-4b"
+health_path = "/health"
+
+[workers.capacity]
+speech_http = 64
+
+[[workers.service_profiles]]
+service = "speech_http"
+model_ids = ["bosonai/higgs-tts-3-4b"]
+response_formats = ["wav"]
+stream_modes = ["non_streaming"]
+tasks = ["text_to_speech", "voice_clone"]
+reference_forms = ["none", "direct", "list"]
+managed_voice = false
+
+[[workers.service_profiles]]
+service = "speech_http"
+model_ids = ["bosonai/higgs-tts-3-4b"]
+response_formats = ["pcm"]
+stream_modes = ["non_streaming", "streaming"]
+tasks = ["text_to_speech", "voice_clone"]
+reference_forms = ["none", "direct", "list"]
+managed_voice = false

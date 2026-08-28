@@ -1,0 +1,11 @@
+launcher:
+  backend: local
+  model_path: bosonai/higgs-tts-3-4b
+  model_name: bosonai/higgs-tts-3-4b
+  num_workers: 2
+  num_gpus_per_worker: 1
+  worker_host: 127.0.0.1
+  worker_base_port: 8011
+  worker_gpu_ids: ["0", "1"]
+  worker_extra_args: ""
+  wait_timeout: 600
