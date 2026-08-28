@@ -9,8 +9,9 @@
 #   OUT         result directory
 #   GPU         CUDA_VISIBLE_DEVICES value (one GPU, two for serve_bf16_disagg)
 #
-# Order (section 4.6):
+# Order (section 4.5):
 #   source h100_runs.sh
+#   check_install
 #   run_unit_tests
 #   serve_fp8_colocated 31000 && smoke_logprobs 31000 && stop_server 31000
 #   run_kernel_ab                    # section 4.2
@@ -30,6 +31,23 @@ THINKER_MAX_SEQ_LEN=32768
 TOP_LOGPROBS=5
 SCRIPTS="$OMNI_ROOT/tasks/qwen3_omni_0518_numerics/scripts"
 RUN_BENCH="$SCRIPTS/run_bench.py"
+
+# The sgl-omni entry point imports the installed sglang_omni package, which
+# is this checkout only when it was installed editable from $OMNI_ROOT.
+# pytest imports the checkout directly (pythonpath = ["."] in pyproject.toml),
+# so passing unit tests do not show which code the server runs. The import
+# runs from / so the current directory cannot shadow the installed package.
+check_install() {
+  local location
+  location=$(cd / && python -c 'import os, sglang_omni; print(os.path.dirname(os.path.dirname(os.path.abspath(sglang_omni.__file__))))')
+  echo "sglang_omni imports from: $location"
+  echo "OMNI_ROOT:                $(cd "$OMNI_ROOT" && pwd)"
+  if [ "$location" != "$(cd "$OMNI_ROOT" && pwd)" ]; then
+    echo "the server would not run this checkout; run: python -m pip install -e \"$OMNI_ROOT\" --no-deps" >&2
+    return 1
+  fi
+  (cd "$OMNI_ROOT" && git rev-parse --short HEAD)
+}
 
 # Unit tests of the logprob path (runner, request data, decode stage, client,
 # chat endpoint, benchmark records). The runner and request builder tests
@@ -123,6 +141,12 @@ import json, sys
 body = json.load(sys.stdin)
 choice = body["choices"][0]
 print(repr(choice["message"]["content"]))
+if "logprobs" not in choice:
+    print("no logprobs key in the choice (keys: %s): the server runs a sglang_omni without this branch, see check_install" % sorted(choice))
+    sys.exit(1)
+if choice["logprobs"] is None:
+    print("logprobs is null although the request asked for it")
+    sys.exit(1)
 for item in choice["logprobs"]["content"]:
     top = [(t["token"], round(t["logprob"], 4)) for t in item["top_logprobs"]]
     print(repr(item["token"]), round(item["logprob"], 4), top)
@@ -198,7 +222,7 @@ run_stage8() {
   stop_server $port
 }
 
-# Stage 8 RTF sample: the first Video-MME clip (001-1) alone, ten times (section 4.5).
+# Stage 8 RTF sample: the first Video-MME clip (001-1) alone, ten times (section 4.4).
 run_rtf_sample() {
   local port=$1
   for i in $(seq 1 10); do

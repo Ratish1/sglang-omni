@@ -394,8 +394,11 @@ Decision rules:
 
 ### 4.5 Order
 
-1. `run_unit_tests`, then one FP8 server with `smoke_logprobs` (the
-   endpoint returns the block and the top-1 entry is the sampled token).
+1. `check_install` (the `sgl-omni` entry point imports the installed
+   `sglang_omni`, which must be this checkout, while pytest imports the
+   checkout directly), `run_unit_tests`, then one FP8 server with
+   `smoke_logprobs` (the endpoint returns the block and the top-1 entry is
+   the sampled token).
 2. `run_kernel_ab`.
 3. `run_fp8_arms` (baseline first, then the five arms).
 4. `run_bf16_arms`.
