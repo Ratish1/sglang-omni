@@ -346,11 +346,16 @@ async def run_omni_seedtts_benchmark(
         system_prompt=config.system_prompt,
     )
 
+    warmup_requests = (
+        config.max_concurrency
+        if config.warmup == 1 and config.max_concurrency > 0
+        else config.warmup
+    )
     runner = BenchmarkRunner(
         RunConfig(
             max_concurrency=config.max_concurrency,
             request_rate=config.request_rate,
-            warmup=config.warmup,
+            warmup=warmup_requests,
             disable_tqdm=config.disable_tqdm,
         )
     )
