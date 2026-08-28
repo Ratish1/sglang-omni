@@ -159,7 +159,7 @@ python tasks/rust/router-e2e/scripts/run_candidate.py \
     --output {output_dir}/asr.json --save-raw-dir {output_dir}/raw
 ```
 
-Standalone TTS, at c16/c32/c64. The fixed seed gives both policies identical generation work. A repeated c64 correctness failure is a measured overload boundary, not a reason to rerun it.
+Standalone TTS, at c16/c32/c64. Qualification uses normal unseeded serving requests. The full corpus and paired AB/BA repeated trials below measure stochastic variance. A repeated c64 correctness failure is a measured overload boundary, not a reason to rerun it.
 
 ```bash
 python tasks/rust/router-e2e/scripts/run_candidate.py \
@@ -172,7 +172,7 @@ python tasks/rust/router-e2e/scripts/run_candidate.py \
     --use-existing-server --generate-only --port {router_port} \
     --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --meta zhaochenyang20/seed-tts-eval-arrow --ref-format references \
-    --seed 0 --concurrencies 16,32,64 \
+    --concurrencies 16,32,64 \
     --output-dir {output_dir}/audio --disable-tqdm
 ```
 
