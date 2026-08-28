@@ -13,7 +13,7 @@
 #   source h100_runs.sh
 #   check_install
 #   run_unit_tests
-#   serve_fp8_colocated 31000 && smoke_logprobs 31000 && stop_server 31000
+#   serve_fp8_colocated 31000 && smoke_logprobs 31000 && smoke_logprobs_chunked 31000 && stop_server 31000
 #   run_kernel_ab                    # section 4.2
 #   run_fp8_arms                     # sections 4.1 and 4.3, FP8 (stage 9 config)
 #   run_bf16_arms                    # sections 4.1 and 4.3, bf16 (stage 5 config)
@@ -68,44 +68,62 @@ run_unit_tests() {
     tests/unit_test/benchmarks/test_token_logprobs.py
 }
 
+# Launch one server as its own process group so stop_server can end every
+# stage process it spawned, and refuse to start while the port is still served
+# (the omni launcher would otherwise pick a free port and the benchmarks would
+# keep talking to the previous server).
+_launch_server() {
+  local port=$1 log=$2
+  shift 2
+  mkdir -p "$OUT/logs"
+  if _port_open "$port"; then
+    echo "port $port is still in use, run stop_server $port first" >&2
+    return 1
+  fi
+  cd "$OMNI_ROOT" || return 1
+  CUDA_VISIBLE_DEVICES="$GPU" setsid "$@" > "$OUT/logs/$log" 2>&1 &
+  echo $! > "$OUT/logs/serve_$port.pid"
+  wait_ready "$port"
+}
+
+_port_open() {
+  python3 - "$1" <<'PY'
+import socket, sys
+s = socket.socket()
+s.settimeout(1)
+sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)
+PY
+}
+
 serve_fp8_colocated() {
   local port=$1
   shift
-  cd "$OMNI_ROOT" && mkdir -p "$OUT/logs" \
-  && CUDA_VISIBLE_DEVICES="$GPU" nohup sgl-omni serve \
+  _launch_server "$port" "serve_fp8_$port.log" sgl-omni serve \
       --model-path "$FP8_MODEL" --host 127.0.0.1 --port "$port" --model-name qwen3-omni \
       --config "$FP8_CONFIG" --colocate \
       --preprocessing.factory.max_seq_len "$THINKER_MAX_SEQ_LEN" \
       --thinker.factory.max_seq_len "$THINKER_MAX_SEQ_LEN" \
-      "$@" > "$OUT/logs/serve_fp8_$port.log" 2>&1 &
-  echo $! > "$OUT/logs/serve_$port.pid"
-  wait_ready "$port"
+      "$@"
 }
 
 serve_bf16_thinker() {
   local port=$1
   shift
-  cd "$OMNI_ROOT" && mkdir -p "$OUT/logs" \
-  && CUDA_VISIBLE_DEVICES="$GPU" nohup sgl-omni serve \
+  _launch_server "$port" "serve_bf16_thinker_$port.log" sgl-omni serve \
       --model-path "$BF16_MODEL" --host 127.0.0.1 --port "$port" --model-name qwen3-omni \
       --config "$BF16_THINKER_CONFIG" \
-      "$@" > "$OUT/logs/serve_bf16_thinker_$port.log" 2>&1 &
-  echo $! > "$OUT/logs/serve_$port.pid"
-  wait_ready "$port"
+      "$@"
 }
 
 serve_bf16_disagg() {
   local port=$1
   shift
-  cd "$OMNI_ROOT" && mkdir -p "$OUT/logs" \
-  && CUDA_VISIBLE_DEVICES="$GPU" nohup python examples/run_qwen3_omni_speech_server.py \
+  _launch_server "$port" "serve_bf16_disagg_$port.log" python examples/run_qwen3_omni_speech_server.py \
       --model-path "$BF16_MODEL" --port "$port" --model-name qwen3-omni \
       --thinker-max-seq-len "$THINKER_MAX_SEQ_LEN" \
       --gpu-thinker 0 --gpu-image-encoder 0 --gpu-audio-encoder 0 --gpu-talker 1 --gpu-code2wav 1 \
       --thinker-mem-fraction-static 0.82 --talker-mem-fraction-static 0.40 \
-      "$@" > "$OUT/logs/serve_bf16_disagg_$port.log" 2>&1 &
-  echo $! > "$OUT/logs/serve_$port.pid"
-  wait_ready "$port"
+      "$@"
 }
 
 wait_ready() {
@@ -121,13 +139,27 @@ wait_ready() {
   return 1
 }
 
+# End the server's whole process group and wait until the port is released.
 stop_server() {
-  local port=$1
+  local port=$1 pid
   if [ -f "$OUT/logs/serve_$port.pid" ]; then
-    kill "$(cat "$OUT/logs/serve_$port.pid")" 2>/dev/null || true
+    pid=$(cat "$OUT/logs/serve_$port.pid")
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 24); do
+      _port_open "$port" || break
+      sleep 5
+    done
+    if _port_open "$port"; then
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      sleep 10
+    fi
     rm -f "$OUT/logs/serve_$port.pid"
   fi
-  sleep 15
+  if _port_open "$port"; then
+    echo "port $port is still in use after stop_server" >&2
+    return 1
+  fi
+  echo "stopped server on $port"
 }
 
 # One chat request with logprobs against a running server. Prints the text,
@@ -151,6 +183,51 @@ for item in choice["logprobs"]["content"]:
     top = [(t["token"], round(t["logprob"], 4)) for t in item["top_logprobs"]]
     print(repr(item["token"]), round(item["logprob"], 4), top)
 '
+}
+
+# Same check on a prompt longer than the thinker's chunked_prefill_size
+# (8192): the prompt is prefilled in two chunks, and the first chunk's row is
+# sampled and discarded by SGLang, so it must not add a logprob entry.
+smoke_logprobs_chunked() {
+  local port=$1
+  python3 - "$port" <<'PY'
+import json, sys, urllib.error, urllib.request
+
+port = sys.argv[1]
+prompt = "Reply with the single word yes.\n" + "apple banana cherry " * 3000
+body = {
+    "model": "qwen3-omni",
+    "messages": [{"role": "user", "content": prompt}],
+    "max_tokens": 8,
+    "temperature": 0,
+    "logprobs": True,
+    "top_logprobs": 3,
+}
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/v1/chat/completions",
+    data=json.dumps(body).encode(),
+    headers={"Content-Type": "application/json"},
+)
+try:
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        out = json.load(resp)
+except urllib.error.HTTPError as exc:
+    print("HTTP", exc.code, exc.read().decode()[:500])
+    sys.exit(1)
+choice = out["choices"][0]
+usage = out["usage"]
+entries = choice["logprobs"]["content"]
+print(
+    "prompt_tokens", usage["prompt_tokens"],
+    "completion_tokens", usage["completion_tokens"],
+    "logprob_entries", len(entries),
+    repr(choice["message"]["content"]),
+)
+if usage["prompt_tokens"] <= 8192:
+    print("prompt did not exceed chunked_prefill_size, no chunking exercised")
+    sys.exit(1)
+sys.exit(0 if len(entries) == usage["completion_tokens"] else 1)
+PY
 }
 
 # Video-AMME, stage 9 settings (50 clips, 2 fps, 128 frames, 401408 pixels).
@@ -245,7 +322,7 @@ run_kernel_ab() {
 
 # Backend and capture lines from a server log (which kernels actually ran).
 backend_lines() {
-  grep -E "Configured SGLang backend policy|Config file not found|Down MoE config|audio layer CUDA graphs|Capture target decode CUDA graph begin|deferred finalize is|staying eager|Code2Wav CUDA graph runner" "$1" | cut -c1-400
+  grep -E "Configured SGLang backend policy|attention_backend=|enable_fp32_lm_head|DeepGEMM|deep_gemm|Config file not found|Down MoE config|audio layer CUDA graphs|Capture target decode CUDA graph begin|deferred finalize is|staying eager|Code2Wav CUDA graph runner" "$1" | cut -c1-400
 }
 
 # Compare two arms per sample (section 4.3 readout), one result file per
