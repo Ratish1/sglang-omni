@@ -36,7 +36,7 @@ The other places a version lives:
 | `docker/Dockerfile` | `SGLANG_IMAGE` (digest of the new tag's cu13 manifest), the FlashInfer reinstall version, the JIT cache path `/root/.cache/flashinfer/<version>`, `FLASHINFER_CACHE_IMAGE` |
 | `.github/workflows/*.yaml` | Every `image:` line, pinned by digest |
 | `docs/get_started/installation.md`, `docs/basic_usage/tts.md`, `docs/cookbook/*.md`, model READMEs | Version names in install instructions |
-| Comments in `sglang_omni/` | Should not name versions at all; state the invariant the code relies on so the text survives the next bump |
+| Comments in `sglang_omni/` | Never name a version; state the invariant the code relies on so the text survives the next bump |
 
 Search the tree for the old versions and the old image digest; the table is
 what past bumps touched.
@@ -53,15 +53,15 @@ provider image digest if one exists, and any platform dispatch change made in
 
 Omni's contracts with SGLang are not all visible from the import list. The
 surfaces below are the ones past bumps had to revisit, each with an example
-of how it broke. They are the places to look first, not a complete list; a
-release can add one.
+of how it broke. Check every one of them, and expect a release to add a
+surface this list does not name.
 
 **Imports.** Every `from sglang... import` in `sglang_omni/` and `tests/`.
 Most files import upstream directly; `sglang_omni/vendor/sglang/` re-exports
 the layers, distributed helpers and core types that Omni patches or wants one
 import site for. Check that the module and symbol still exist, that a
 re-export resolves to the same origin, and that the signature or dataclass
-fields are unchanged. An import behind `except ImportError` deserves the
+fields are unchanged. An import behind `except ImportError` gets the
 same check: the MOSS-TTS flash attention import was guarded that way, and
 when `sglang.jit_kernel` became `sglang.kernels.ops` it would have fallen
 back to SDPA without a word.
@@ -188,8 +188,8 @@ A bump therefore ships a new image: build `docker/Dockerfile` on the
 `lmsysorg/sglang` digest for the new tag, populate the FlashInfer JIT cache
 on a GPU for the architectures CI runs on (Docker builds have none, so the
 Dockerfile copies the cache from a previous image), push it, and put the new
-digest in the Dockerfile and the workflows. CI on the branch is meaningful
-once the workflows point at the new image; on the old one the setup step
+digest in the Dockerfile and the workflows. CI on the branch means nothing
+until the workflows point at the new image: on the old one the setup step
 installs the new torch into the virtualenv and nothing after that reflects
 the shipped stack.
 
@@ -221,8 +221,8 @@ that flips between two runs of one arm is noise, a sample that is stable on
 each arm and differs across arms is the bump. Compare the startup logs too:
 CUDA graphs captured for the families that enable them, the same set of
 fallback warnings, the KV pool size, and time to ready from a warm cache. A
-gate that `main` also fails is a calibration problem for its own PR, not
-something the bump retunes.
+gate that `main` also fails is not the bump's to retune; it belongs to a
+calibration PR of its own.
 
 When a number moves, the request-level event recorder says which stage owns
 the difference, a torch trace per stage separates kernel time from host
