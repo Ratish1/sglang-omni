@@ -251,9 +251,6 @@ the new image before merge.
 
 After the merge, everyone pulls the new image and rebuilds their
 virtualenvs; an environment built against the old pins does not run `main`.
-Follow-ups the bump surfaced, such as opt-in upstream features, are filed
-separately, and the written delta is kept where the next bump can diff
-against it.
 
 A full CI calibration must follow the merge. The new stack moves throughput
 and latency, so the thresholds in the workflows still describe the old image.
