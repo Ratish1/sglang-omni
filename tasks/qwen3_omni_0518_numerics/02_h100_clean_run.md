@@ -133,61 +133,105 @@ server, and are held until the speed moves of section 5 are attributed.
 Kept on the branch: h100_runs.sh backend_lines uses grep -a (three per-arm
 readouts were empty because grep treated the server log as binary).
 
-## 5. Speed attribution protocol
+## 5. Component profiling protocol
 
-The arms of sections 4.1 to 4.3 varied thinker kernels. Stage 8 and 9 latency
-is set by the serial CPU preprocessing stage and stage 10 adds the FP8 TP=2
-talker, and the image bump also moved torch 2.11.0 to 2.13.0, torchvision
-0.26 to 0.28 and torchcodec 0.11.1 to 0.15.0, the libraries that stage runs.
-Measured moves across the bump in CI: stage 8 latency_mean 9.9 to 10.6 s
-against 10.2 to 11.2 s, stage 9 qps 1.58 to 1.75 against 1.53 to 1.70, stage
-10 latency_mean 41.3 to 44.8 s against 43.2 to 45.8 s and rtf_mean 3.04 to
-3.42 against 3.26 to 3.81.
+The arms of sections 4.1 to 4.3 varied thinker kernels one at a time and
+found no kernel that changes results beyond the tie band. Stage 8 and 9
+latency is set by the serial CPU preprocessing stage and stage 10 adds the
+FP8 TP=2 talker, and the image bump also moved torch 2.11.0 to 2.13.0,
+torchvision 0.26 to 0.28 and torchcodec 0.11.1 to 0.15.0, the libraries that
+stage runs. Measured moves across the bump in CI: stage 8 latency_mean 9.9 to
+10.6 s against 10.2 to 11.2 s, stage 9 qps 1.58 to 1.75 against 1.53 to
+1.70, stage 10 latency_mean 41.3 to 44.8 s against 43.2 to 45.8 s and
+rtf_mean 3.04 to 3.42 against 3.26 to 3.81. The protocol below measures every
+Qwen3-Omni component on the stage 8, 9 and 10 paths per request and per
+kernel, on the current image first, then on the previous image with the same
+commands, and attributes the moves by diff.
 
-1. CPU preprocessing A/B (scripts/preprocess_ab.py). Times, per video of the
-   stage 8 result file, the two heavy steps of the preprocessing stage with
-   the CI request settings: ensure_video_list_async (decode plus resize) and
-   the HF processor call, median of 3 repeats after a warmup. With --full it
-   also times the real Qwen3OmniPreprocessor on the same payloads so the two
-   steps can be checked against the 0.63 to 0.86 s per request seen in the
-   server log. Commands, in the server venv then in a CPU-only venv that
-   differs in torch, torchvision and torchcodec only:
+Components and where each shows up:
 
-       source tasks/qwen3_omni_0518_numerics/scripts/h100_runs.sh
-       run_preprocess_ab
-       make_old_cpu_venv && run_preprocess_ab_old
+| component | process (stage events, trace file) | stages |
+|---|---|---|
+| video decode, frame resize, mel features (torchcodec, torchvision, transformers processor, CPU) | preprocessing | 8, 9, 10 |
+| vision tower (transformers Qwen3OmniMoeVisionEncoder, SDPA) | image_encoder | 8, 9, 10 |
+| audio tower (captured layer stack, FA3 varlen) | audio_encoder | 8, 9, 10 |
+| thinker prefill and decode (attention, MoE, dense GEMM, norms, MRoPE, lm_head, sampler) | thinker | 8, 9, 10 |
+| text detokenizer and stream assembly | decode | 8, 9, 10 |
+| talker (bf16 flashinfer_cutlass MoE on stage 8, FP8 cutlass MoE plus Triton dense on stage 10) | talker_ar | 8, 10 |
+| code2wav (4 CUDA graphs) | code2wav | 8, 10 |
+| coordinator hops and IPC | coordinator, hop breakdown | all |
 
-   Outputs $OUT/preprocess_ab_new.json and $OUT/preprocess_ab_old.json with
-   env versions, per-video load_s, processor_s, total_s and the summary.
-   Reading: if total_s_mean moves by the 4 to 7 percent seen in stage 8
-   latency, the stage 8 and 9 speed move is the CPU library set. If it does
-   not, the move is elsewhere and task 2 locates it.
-2. Per-request stage events (scripts/stage_events.py). The request profiler
-   writes request_admission, preprocess_start, preprocess_end, encoder_start,
-   encoder_end, scheduler_request_build_start, scheduler_request_build_end
-   and terminal_response per request (profiler/event_recorder.py, routes
-   /start_request_profile and /stop_request_profile). The runs use the CI
-   request shape (no logprobs):
+Step 1. CPU preprocessing A/B (scripts/preprocess_ab.py). Times, per video of
+the stage 8 result file, the two heavy steps of the preprocessing stage with
+the CI request settings (ensure_video_list_async, then the HF processor
+call), median of 3 repeats after a warmup. With --full it also times the
+real Qwen3OmniPreprocessor on the same payloads, to be checked against the
+0.63 to 0.86 s per request seen in the server log. Runs in the server venv
+and then in a CPU-only venv that differs in torch, torchvision and torchcodec
+only:
 
-       GPU=0,1 run_stage8_events
-       run_stage9_events
+    source tasks/qwen3_omni_0518_numerics/scripts/h100_runs.sh
+    run_preprocess_ab
+    make_old_cpu_venv && run_preprocess_ab_old
 
-   Outputs $OUT/events_<stage>_stages.txt (python -m sglang_omni.profiler
-   stage and hop breakdown) and $OUT/events_<stage>_requests.txt (per
-   request: submit offset, preprocessing queue wait, preprocess duration,
-   encoder durations, thinker request build, total). This replaces the log
-   reconstruction of section 3 with measured intervals and shows where the
-   first request waits.
-3. Stage 10 needs the same event run on the old image, which is the one
-   measurement that requires the old stack. The talker share of each request
-   (stage_input_received to stage_complete on talker_ar and code2wav) is the
-   number to compare.
-4. Preprocessing replicas, once the above is attributed.
-   processes.<name>.num_replicas exists in the pipeline config
-   (config/schema.py:180), the coordinator binds requests round robin
-   (pipeline/replicas.py:239) and the preprocessing process has no GPU stage,
-   so it needs no replica_devices. Expected at c16: latency from 15 s toward
-   4 s with identical per-sample letters.
-5. Field reports. The evidence here is CI plus the H100 arms. Reports of
-   quality or latency changes in real traffic need to be matched against
-   these mechanisms before any of them is called explained.
+Outputs preprocess_ab_new.json and preprocess_ab_old.json (env versions,
+per-video load_s, processor_s, total_s, summary).
+
+Step 2. Per-request stage events (scripts/stage_events.py). The request
+profiler writes request_admission, preprocess_start and preprocess_end,
+encoder_start and encoder_end, scheduler_request_build_start and end,
+stage_input_received, stage_complete and terminal_response per request
+(profiler/event_recorder.py, routes /start_request_profile and
+/stop_request_profile). The runs use the CI request shape (no logprobs):
+
+    GPU=0,1 run_stage8_events
+    run_stage9_events
+    GPU=0,1 run_stage10_events
+
+Outputs events_<stage>_stages.txt (python -m sglang_omni.profiler stage and
+hop breakdown: per stage interval count, avg and p95, and the time spent on
+each hop between stages) and events_<stage>_requests.txt (per request: submit
+offset, preprocessing queue wait, preprocess duration, encoder durations,
+thinker request build, total).
+
+Step 3. Torch profiler traces per stage process (scripts/trace_kernels.py).
+POST /start_profile with enable_torch true records CPU and CUDA activity in
+every stage process between start and stop and writes
+traces_<stage>/<process>_pid<pid>_rank<r>.trace.json.gz. The workload is
+fixed: the first 8 samples at c1, then the first 16 at c16, both without
+logprobs, with stage events recorded alongside:
+
+    GPU=0,1 run_stage8_traces
+    run_stage9_traces
+    GPU=0,1 run_stage10_traces
+
+Outputs traces_<stage>_kernels.txt: per process, total CUDA kernel time, time
+per kernel family (attention, moe, gemm, norm, rope, sampling, copy, reduce,
+other) and the top kernels by total time.
+
+Step 4. Same three steps on the previous image. The pre-bump commit
+8f8b73d3c has the profiler package and both profiler routes, and the tools
+under tasks/ import nothing that changed, so on the old image check out
+8f8b73d3c, copy tasks/qwen3_omni_0518_numerics/scripts into it, install the
+checkout, and run the same commands into a second OUT. Then:
+
+    python scripts/trace_kernels.py diff OLD/traces_stage8 NEW/traces_stage8
+    python scripts/trace_kernels.py diff OLD/traces_stage9 NEW/traces_stage9
+    python scripts/trace_kernels.py diff OLD/traces_stage10 NEW/traces_stage10
+
+diff aligns the two runs by process and kernel name and prints the kernel
+family and kernel totals that moved, per stage process. Together with the
+stage breakdown diff (queue waits, preprocess, encoders, talker, code2wav
+intervals) and the preprocessing A/B, this places the 3 to 10 percent moves
+on a component and a kernel.
+
+Step 5. Preprocessing replicas, once the above is attributed.
+processes.<name>.num_replicas exists in the pipeline config
+(config/schema.py:180), the coordinator binds requests round robin
+(pipeline/replicas.py:239) and the preprocessing process has no GPU stage, so
+it needs no replica_devices. Expected at c16: latency from 15 s toward 4 s
+with identical per-sample letters.
+
+Step 6. Field reports. The evidence here is CI plus the H100 arms. Reports of
+quality or latency changes in real traffic are matched against these
+measurements before any of them is called explained.

@@ -26,6 +26,12 @@
 #   make_old_cpu_venv && run_preprocess_ab_old   # same with torch 2.11 libs
 #   GPU=0,1 run_stage8_events        # stage 8 with per-request stage events
 #   run_stage9_events                # stage 9 with per-request stage events
+#   GPU=0,1 run_stage10_events       # stage 10 (FP8 thinker TP=2, talker) events
+#   GPU=0,1 run_stage8_traces        # torch profiler trace per stage process
+#   run_stage9_traces
+#   GPU=0,1 run_stage10_traces
+#   python scripts/trace_kernels.py summary "$OUT/traces_stage8"
+#   python scripts/trace_kernels.py diff OLD/traces_stage8 NEW/traces_stage8
 
 set -u
 
@@ -129,6 +135,19 @@ serve_bf16_disagg() {
       --thinker-max-seq-len "$THINKER_MAX_SEQ_LEN" \
       --gpu-thinker 0 --gpu-image-encoder 0 --gpu-audio-encoder 0 --gpu-talker 1 --gpu-code2wav 1 \
       --thinker-mem-fraction-static 0.82 --talker-mem-fraction-static 0.40 \
+      "$@"
+}
+
+# Stage 10 server: FP8 thinker TP=2 on GPUs 0,1 with the talker and code2wav
+# stacked on GPU 1 (tests/test_model/conftest.py _start_qwen3_omni_fp8_tp2).
+serve_fp8_tp2_disagg() {
+  local port=$1
+  shift
+  _launch_server "$port" "serve_fp8_tp2_$port.log" python examples/run_qwen3_omni_speech_server.py \
+      --model-path "$FP8_MODEL" --port "$port" --model-name qwen3-omni \
+      --thinker-max-seq-len "$THINKER_MAX_SEQ_LEN" \
+      --thinker-tp-size 2 --gpu-thinker-tp 0,1 --gpu-talker 1 --gpu-code2wav 1 \
+      --thinker-mem-fraction-static 0.40 --talker-mem-fraction-static 0.21 \
       "$@"
 }
 
@@ -403,6 +422,65 @@ run_stage9_events() {
   local port=31000
   serve_fp8_colocated $port || return 1
   _events_run $port stage9 bench_amme
+  stop_server $port
+}
+
+# Stage 10 config with speech output on the Video-MME clips (20 samples), the
+# shape of test_qwen3_omni_videoamme_talker_tp2_ci without its WER pass.
+run_stage10_events() {
+  local port=31003
+  serve_fp8_tp2_disagg $port || return 1
+  _events_run $port stage10 bench_mme_talker
+  stop_server $port
+}
+
+# Torch profiler traces, one file per stage process, on a fixed workload: the
+# first 8 samples at c1 (per-component time without queueing) then the first
+# 16 samples at c16 (the CI shape). Stage events are recorded at the same
+# time. The template puts the stage name in the file name, see
+# pipeline/stage/runtime.py _on_profiler_start.
+_traces_run() {
+  local port=$1 label=$2 stage=$3
+  local dir="$OUT/traces_$label"
+  mkdir -p "$dir"
+  local code
+  code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:$port/start_profile" \
+    -H 'Content-Type: application/json' \
+    -d "{\"run_id\":\"$label\",\"enable_torch\":true,\"trace_path_template\":\"$dir/{stage}\",\"event_dir\":\"$dir/events\"}")
+  if [ "$code" != "200" ]; then
+    echo "start_profile returned $code on $port" >&2
+    return 1
+  fi
+  cd "$OMNI_ROOT" && PYTHONPATH="$OMNI_ROOT" python "$RUN_BENCH" "$stage" \
+    --port "$port" --out "$OUT/${label}_traces_c1" --concurrency 1 --max-samples 8 --top-logprobs 0
+  PYTHONPATH="$OMNI_ROOT" python "$RUN_BENCH" "$stage" \
+    --port "$port" --out "$OUT/${label}_traces_c16" --concurrency 16 --max-samples 16 --top-logprobs 0
+  curl -s -o /dev/null -X POST "http://127.0.0.1:$port/stop_profile" \
+    -H 'Content-Type: application/json' -d "{\"run_id\":\"$label\"}"
+  sleep 20
+  ls -la "$dir"
+  PYTHONPATH="$OMNI_ROOT" python "$SCRIPTS/trace_kernels.py" summary "$dir" > "$OUT/traces_${label}_kernels.txt" && head -40 "$OUT/traces_${label}_kernels.txt"
+  PYTHONPATH="$OMNI_ROOT" python "$SCRIPTS/stage_events.py" "$dir/events" --sort total > "$OUT/traces_${label}_requests.txt"
+}
+
+run_stage8_traces() {
+  local port=31002
+  serve_bf16_disagg $port || return 1
+  _traces_run $port stage8 videomme-talker
+  stop_server $port
+}
+
+run_stage9_traces() {
+  local port=31000
+  serve_fp8_colocated $port || return 1
+  _traces_run $port stage9 videoamme
+  stop_server $port
+}
+
+run_stage10_traces() {
+  local port=31003
+  serve_fp8_tp2_disagg $port || return 1
+  _traces_run $port stage10 videomme-talker
   stop_server $port
 }
 
