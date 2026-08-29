@@ -9,6 +9,7 @@ use axum::serve::Listener;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::trace;
 
 /// TCP listener that bounds sockets accepted into Axum connection tasks.
 pub(super) struct BoundedTcpListener {
@@ -36,6 +37,9 @@ impl Listener for BoundedTcpListener {
             Err(_closed) => pending().await,
         };
         let (stream, address) = Listener::accept(&mut self.listener).await;
+        if let Err(error) = stream.set_nodelay(true) {
+            trace!(%error, "failed to enable TCP_NODELAY on client connection");
+        }
         (ConnectionIo::new(stream, permit), address)
     }
 
@@ -200,6 +204,21 @@ mod tests {
         assert_eq!(listener.permits.available_permits(), 0);
         drop(second_io);
         assert_eq!(listener.permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_sockets_enable_tcp_nodelay() {
+        let (mut listener, address) = listener(1).await;
+        let _client = TcpStream::connect(address)
+            .await
+            .expect("connect isolated client");
+
+        let (connection, _) = listener.accept().await;
+
+        assert!(
+            connection.stream.nodelay().expect("read TCP_NODELAY"),
+            "accepted client sockets must disable Nagle's algorithm"
+        );
     }
 
     #[tokio::test]
