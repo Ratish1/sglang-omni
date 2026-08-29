@@ -20,6 +20,12 @@
 #   GPU=0,1 run_stage8               # sections 4.1 and 4.5, stage 8 config
 #   compare_arms "$OUT/fp8_baseline_c16_*/videoamme/videoamme_results.json" \
 #                "$OUT/fp8_moe_triton_c16_*/videoamme/videoamme_results.json"
+#
+# Speed attribution (02_h100_clean_run.md section 5):
+#   run_preprocess_ab                # CPU preprocessing timing, server venv
+#   make_old_cpu_venv && run_preprocess_ab_old   # same with torch 2.11 libs
+#   GPU=0,1 run_stage8_events        # stage 8 with per-request stage events
+#   run_stage9_events                # stage 9 with per-request stage events
 
 set -u
 
@@ -322,7 +328,82 @@ run_kernel_ab() {
 
 # Backend and capture lines from a server log (which kernels actually ran).
 backend_lines() {
-  grep -E "Configured SGLang backend policy|attention_backend=|enable_fp32_lm_head|DeepGEMM|deep_gemm|Config file not found|Down MoE config|audio layer CUDA graphs|Capture target decode CUDA graph begin|deferred finalize is|staying eager|Code2Wav CUDA graph runner" "$1" | cut -c1-400
+  grep -a -E "Configured SGLang backend policy|attention_backend=|enable_fp32_lm_head|DeepGEMM|deep_gemm|Config file not found|Down MoE config|audio layer CUDA graphs|Capture target decode CUDA graph begin|deferred finalize is|staying eager|Code2Wav CUDA graph runner" "$1" | cut -c1-400
+}
+
+# CPU preprocessing A/B. The server venv holds torch 2.13, torchvision 0.28
+# and torchcodec 0.15. make_old_cpu_venv builds a CPU-only venv with the
+# previous image's torch 2.11.0, torchvision 0.26 and torchcodec 0.11.1 and
+# the same versions of everything else, so the two runs differ in those three
+# packages only. The video list comes from an existing stage 8 result file.
+PREPROCESS_AB="$SCRIPTS/preprocess_ab.py"
+PREPROCESS_SAMPLES="$OUT/bf16_disagg_c16_1/videomme_audio/videomme_results.json"
+OLD_CPU_VENV="$OUT/venv_old_cpu"
+
+run_preprocess_ab() {
+  cd "$OMNI_ROOT" && PYTHONPATH="$OMNI_ROOT" python "$PREPROCESS_AB" \
+    --samples-json "$PREPROCESS_SAMPLES" --model-path "$BF16_MODEL" \
+    --repeats 3 --full --out "$OUT/preprocess_ab_new.json"
+}
+
+make_old_cpu_venv() {
+  local qvu av librosa pillow numpy xxhash httpx hub
+  qvu=$(python -c "import importlib.metadata as m; print(m.version('qwen-vl-utils'))")
+  av=$(python -c "import importlib.metadata as m; print(m.version('av'))")
+  librosa=$(python -c "import importlib.metadata as m; print(m.version('librosa'))")
+  pillow=$(python -c "import importlib.metadata as m; print(m.version('pillow'))")
+  numpy=$(python -c "import importlib.metadata as m; print(m.version('numpy'))")
+  xxhash=$(python -c "import importlib.metadata as m; print(m.version('xxhash'))")
+  httpx=$(python -c "import importlib.metadata as m; print(m.version('httpx'))")
+  hub=$(python -c "import importlib.metadata as m; print(m.version('huggingface-hub'))")
+  python -m venv "$OLD_CPU_VENV" || return 1
+  "$OLD_CPU_VENV/bin/pip" install -q --index-url https://download.pytorch.org/whl/cpu \
+    torch==2.11.0 torchvision==0.26.0 torchcodec==0.11.1 || return 1
+  "$OLD_CPU_VENV/bin/pip" install -q transformers==5.12.1 "qwen-vl-utils==$qvu" "av==$av" \
+    "librosa==$librosa" "pillow==$pillow" "numpy==$numpy" "xxhash==$xxhash" \
+    "httpx==$httpx" "huggingface-hub==$hub" accelerate || return 1
+  "$OLD_CPU_VENV/bin/python" -c "import torch, torchvision, torchcodec, transformers; print(torch.__version__, torchvision.__version__, torchcodec.__version__, transformers.__version__)"
+}
+
+run_preprocess_ab_old() {
+  cd "$OMNI_ROOT" && PYTHONPATH="$OMNI_ROOT" "$OLD_CPU_VENV/bin/python" "$PREPROCESS_AB" \
+    --samples-json "$PREPROCESS_SAMPLES" --model-path "$BF16_MODEL" \
+    --repeats 3 --out "$OUT/preprocess_ab_old.json"
+}
+
+# Per-request stage events through the request profiler (no torch profiler).
+# The benchmark runs without logprobs so the requests match CI exactly.
+_events_run() {
+  local port=$1 label=$2 bench=$3
+  local dir="$OUT/events_$label"
+  local code
+  code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:$port/start_request_profile" \
+    -H 'Content-Type: application/json' -d "{\"run_id\":\"$label\",\"event_dir\":\"$dir\"}")
+  if [ "$code" != "200" ]; then
+    echo "start_request_profile returned $code on $port (profiler routes not mounted?)" >&2
+    return 1
+  fi
+  TOP_LOGPROBS=0 $bench $port "${label}_events" 16
+  curl -s -o /dev/null -X POST "http://127.0.0.1:$port/stop_request_profile" \
+    -H 'Content-Type: application/json' -d "{\"run_id\":\"$label\"}"
+  sleep 3
+  cd "$OMNI_ROOT" && PYTHONPATH="$OMNI_ROOT" python -m sglang_omni.profiler "$dir" --format table > "$OUT/events_${label}_stages.txt"
+  PYTHONPATH="$OMNI_ROOT" python "$SCRIPTS/stage_events.py" "$dir" --sort total --json "$OUT/events_${label}_requests.json" > "$OUT/events_${label}_requests.txt"
+  tail -4 "$OUT/events_${label}_requests.txt"
+}
+
+run_stage8_events() {
+  local port=31002
+  serve_bf16_disagg $port || return 1
+  _events_run $port stage8 bench_mme_talker
+  stop_server $port
+}
+
+run_stage9_events() {
+  local port=31000
+  serve_fp8_colocated $port || return 1
+  _events_run $port stage9 bench_amme
+  stop_server $port
 }
 
 # Compare two arms per sample (section 4.3 readout), one result file per
