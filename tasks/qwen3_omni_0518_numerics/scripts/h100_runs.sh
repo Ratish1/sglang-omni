@@ -32,6 +32,15 @@
 #   GPU=0,1 run_stage10_traces
 #   python scripts/trace_kernels.py summary "$OUT/traces_stage8"
 #   python scripts/trace_kernels.py diff OLD/traces_stage8 NEW/traces_stage8
+#
+# In-container comparison (03_in_container_analysis.md):
+#   capture_env                      # versions, git head, GPU state, JIT cache sizes into $OUT/env
+#   run_tts_repeats                  # voice clone stage, bf16 colocated one GPU, five c16 runs
+#   run_talker_moe_arm               # same server with the talker MoE on triton instead of flashinfer_cutlass
+#   run_tts_events / run_tts_traces  # voice clone stage events and traces
+#   run_cold_warm                    # stage 9 and stage 8 with empty and warm JIT caches
+#   run_compare OLD NEW              # writes NEW/compare/report.md from both trees in place
+#   make_slim_bundle OLD NEW FILE    # both trees without traces and audio, for download
 
 set -u
 
@@ -39,6 +48,7 @@ FP8_MODEL=marksverdhei/Qwen3-Omni-30B-A3B-FP8
 BF16_MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
 FP8_CONFIG=examples/configs/qwen3_omni_colocated_h100_fp8.yaml
 BF16_THINKER_CONFIG=examples/configs/qwen3_omni_mmmu_h100.yaml
+BF16_COLOCATED_CONFIG=examples/configs/qwen3_omni_colocated_h100_bf16.yaml
 THINKER_MAX_SEQ_LEN=32768
 TOP_LOGPROBS=5
 SCRIPTS="$OMNI_ROOT/tasks/qwen3_omni_0518_numerics/scripts"
@@ -127,6 +137,19 @@ serve_bf16_thinker() {
       "$@"
 }
 
+# Voice clone stage server: the bf16 colocated speech config of
+# test_qwen3_omni_tts_ci.py on one GPU (CI runs two of these behind a router).
+serve_bf16_colocated() {
+  local port=$1
+  shift
+  _launch_server "$port" "serve_bf16_colocated_$port.log" sgl-omni serve \
+      --model-path "$BF16_MODEL" --host 127.0.0.1 --port "$port" --model-name qwen3-omni \
+      --config "$BF16_COLOCATED_CONFIG" --colocate \
+      --preprocessing.factory.max_seq_len "$THINKER_MAX_SEQ_LEN" \
+      --thinker.factory.max_seq_len "$THINKER_MAX_SEQ_LEN" \
+      "$@"
+}
+
 serve_bf16_disagg() {
   local port=$1
   shift
@@ -151,9 +174,10 @@ serve_fp8_tp2_disagg() {
       "$@"
 }
 
+WAIT_READY_TRIES=${WAIT_READY_TRIES:-180}
 wait_ready() {
   local port=$1
-  for _ in $(seq 1 180); do
+  for _ in $(seq 1 "$WAIT_READY_TRIES"); do
     if curl -sf "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
       echo "ready on $port"
       return 0
@@ -347,7 +371,7 @@ run_kernel_ab() {
 
 # Backend and capture lines from a server log (which kernels actually ran).
 backend_lines() {
-  grep -a -E "Configured SGLang backend policy|attention_backend=|enable_fp32_lm_head|DeepGEMM|deep_gemm|Config file not found|Down MoE config|audio layer CUDA graphs|Capture target decode CUDA graph begin|deferred finalize is|staying eager|Code2Wav CUDA graph runner" "$1" | cut -c1-400
+  grep -a -E "Configured SGLang backend policy|attention_backend=|enable_fp32_lm_head|DeepGEMM|deep_gemm|Config file not found|Down MoE config|audio layer CUDA graphs|Capture target decode CUDA graph begin|deferred finalize is|staying eager|Code2Wav CUDA graph runner|Autotuner|No tuned config|W8A8 Block FP8" "$1" | cut -c1-400
 }
 
 # CPU preprocessing A/B. The server venv holds torch 2.13, torchvision 0.28
@@ -392,6 +416,12 @@ run_preprocess_ab_old() {
 
 # Per-request stage events through the request profiler (no torch profiler).
 # The benchmark runs without logprobs so the requests match CI exactly.
+bench_seedtts_vc() {
+  local port=$1 arm=$2 conc=$3
+  cd "$OMNI_ROOT" && PYTHONPATH="$OMNI_ROOT" python "$RUN_BENCH" seedtts-vc \
+    --port "$port" --out "$OUT/$arm" --concurrency "$conc"
+}
+
 _events_run() {
   local port=$1 label=$2 bench=$3
   local dir="$OUT/events_$label"
@@ -482,6 +512,140 @@ run_stage10_traces() {
   serve_fp8_tp2_disagg $port || return 1
   _traces_run $port stage10 videomme-talker
   stop_server $port
+}
+
+
+# Versions, git state, GPU state and JIT cache sizes of this container, read
+# by compare_runs.py section 1.
+capture_env() {
+  mkdir -p "$OUT/env"
+  python -m pip freeze > "$OUT/env/pip_freeze.txt" 2>/dev/null
+  python - > "$OUT/env/torch.txt" 2>&1 <<'PY'
+import torch
+print("torch", torch.__version__)
+print("cuda", torch.version.cuda)
+print("cudnn", torch.backends.cudnn.version())
+try:
+    import triton
+    print("triton", triton.__version__)
+except Exception as exc:
+    print("triton", exc)
+for name in ("sglang", "sgl_kernel", "flashinfer", "deep_gemm", "transformers", "torchvision", "torchcodec"):
+    try:
+        mod = __import__(name)
+        print(name, getattr(mod, "__version__", "?"))
+    except Exception as exc:
+        print(name, "import failed:", exc)
+PY
+  nvidia-smi --query-gpu=index,name,driver_version,clocks.sm,clocks.max.sm,clocks.mem,power.limit,temperature.gpu,ecc.mode.current --format=csv > "$OUT/env/nvidia_smi.txt" 2>&1
+  env | grep -E '^(SGLANG_|SGL_|TRITON_|FLASHINFER_|DG_|TORCH|CUDA_|NCCL_|OMNI_|HF_)' | sort > "$OUT/env/env.txt"
+  (cd "$OMNI_ROOT" && git rev-parse HEAD && git status --short | head -20) > "$OUT/env/git_head.txt" 2>&1
+  for d in $JIT_CACHE_DIRS; do
+    if [ -e "$d" ]; then
+      echo "== $d $(du -sh "$d" 2>/dev/null | cut -f1) $(find "$d" -type f 2>/dev/null | wc -l) files"
+    fi
+  done > "$OUT/env/jit_caches.txt" 2>&1
+  cat "$OUT/env/torch.txt"
+}
+
+# Compiled kernel caches. sglang 0.5.18 puts triton, inductor, flashinfer and
+# DeepGEMM caches under SGLANG_CACHE_DIR (default ~/.cache/sglang), sglang
+# 0.5.16 used ~/.triton, ~/.cache/flashinfer and ~/.cache/deep_gemm.
+JIT_CACHE_DIRS="${JIT_CACHE_DIRS:-$HOME/.cache/sglang $HOME/.triton $HOME/.cache/flashinfer $HOME/.cache/deep_gemm $HOME/.cache/torch/inductor}"
+
+# Move the caches aside (nothing is deleted, restore by moving them back).
+set_aside_jit_caches() {
+  local stamp
+  stamp=$(date +%s)
+  for d in $JIT_CACHE_DIRS; do
+    if [ -e "$d" ]; then
+      mv "$d" "$d.aside_$stamp" && echo "moved $d to $d.aside_$stamp"
+    fi
+  done
+}
+
+# Cold caches versus warm caches, stage 9 config then stage 8 config: the first
+# pass on a fresh process with empty caches, a second pass on the same process,
+# then a fresh process on the caches the first server filled. CI starts every
+# job in a fresh container, so its runs are the cold pass.
+run_cold_warm() {
+  local port=31000
+  set_aside_jit_caches
+  WAIT_READY_TRIES=600 serve_fp8_colocated $port || return 1
+  TOP_LOGPROBS=0 bench_amme $port cold_stage9_c16_1 16
+  TOP_LOGPROBS=0 bench_amme $port cold_stage9_c16_2 16
+  stop_server $port
+  serve_fp8_colocated $port || return 1
+  TOP_LOGPROBS=0 bench_amme $port warm_stage9_c16_1 16
+  TOP_LOGPROBS=0 bench_amme $port warm_stage9_c16_2 16
+  stop_server $port
+  port=31002
+  set_aside_jit_caches
+  WAIT_READY_TRIES=600 serve_bf16_disagg $port || return 1
+  TOP_LOGPROBS=0 bench_mme_talker $port cold_stage8_c16_1 16
+  TOP_LOGPROBS=0 bench_mme_talker $port cold_stage8_c16_2 16
+  stop_server $port
+  serve_bf16_disagg $port || return 1
+  TOP_LOGPROBS=0 bench_mme_talker $port warm_stage8_c16_1 16
+  TOP_LOGPROBS=0 bench_mme_talker $port warm_stage8_c16_2 16
+  stop_server $port
+}
+
+# Voice clone stage (test_qwen3_omni_tts_ci.py speed benchmark shape) on one
+# worker: five c16 runs of the 50 SeedTTS samples, then the stage 8 workload on
+# the same colocated server as the talker baseline for run_talker_moe_arm.
+run_tts_repeats() {
+  local port=31004
+  serve_bf16_colocated $port || return 1
+  backend_lines "$OUT/logs/serve_bf16_colocated_$port.log" > "$OUT/logs/backend_bf16_colocated.txt"
+  for i in 1 2 3 4 5; do bench_seedtts_vc $port "tts_vc_c16_$i" 16; done
+  TOP_LOGPROBS=0 bench_mme_talker $port colocated_mme_talker_c16 16
+  stop_server $port
+}
+
+# The bf16 talker MoE runs on flashinfer_cutlass by omni policy
+# (sglang_omni/platforms/cuda.py). Same server and workload with the talker MoE
+# on triton, so the two backends are priced against each other on this image.
+run_talker_moe_arm() {
+  local port=31004
+  serve_bf16_colocated $port --talker_ar.engine.moe_runner_backend triton || return 1
+  backend_lines "$OUT/logs/serve_bf16_colocated_$port.log" > "$OUT/logs/backend_bf16_colocated_talker_triton.txt"
+  for i in 1 2 3 4 5; do bench_seedtts_vc $port "tts_vc_talker_triton_c16_$i" 16; done
+  TOP_LOGPROBS=0 bench_mme_talker $port colocated_mme_talker_triton_c16 16
+  stop_server $port
+}
+
+run_tts_events() {
+  local port=31004
+  serve_bf16_colocated $port || return 1
+  _events_run $port tts bench_seedtts_vc
+  stop_server $port
+}
+
+run_tts_traces() {
+  local port=31004
+  serve_bf16_colocated $port || return 1
+  _traces_run $port tts seedtts-vc
+  stop_server $port
+}
+
+# Both trees compared in place. OLD is the previous image's OUT, NEW this one's.
+# Trace statistics are cached next to the traces, a second run is quick.
+run_compare() {
+  local old=$1 new=$2
+  cd "$OMNI_ROOT" && PYTHONPATH="$OMNI_ROOT" python "$SCRIPTS/compare_runs.py" "$old" "$new" \
+    --out "$new/compare" --workers "${COMPARE_WORKERS:-8}" --top "${COMPARE_TOP:-30}"
+}
+
+# Everything except the traces and the generated audio, small enough to send.
+make_slim_bundle() {
+  local old=$1 new=$2 file=$3
+  tar czf "$file" \
+    --exclude='*.trace.json' --exclude='*.trace.json.gz' --exclude='*.wav' \
+    --exclude='venv_old_cpu' \
+    -C "$(dirname "$old")" "$(basename "$old")" \
+    -C "$(dirname "$new")" "$(basename "$new")"
+  ls -la "$file"
 }
 
 # Compare two arms per sample (section 4.3 readout), one result file per

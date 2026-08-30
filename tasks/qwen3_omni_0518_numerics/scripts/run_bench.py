@@ -5,12 +5,17 @@ Usage:
     python run_bench.py videoamme --port P --out DIR [--concurrency 16] [--top-logprobs 5]
     python run_bench.py videomme-talker --port P --out DIR [--concurrency 16] [--max-samples 20]
     python run_bench.py mmsu --port P --out DIR [--concurrency 16] [--max-samples N]
+    python run_bench.py seedtts-vc --port P --out DIR [--concurrency 16] [--max-samples 50]
 
 videoamme mirrors tests/test_model/test_qwen3_omni_videoamme_ci.py (stage 9),
 videomme-talker mirrors test_qwen3_omni_videomme_talker_ci.py (stage 8) with
 the same short-answer prompt and speech output but without the inline WER
 pass (the CLI would load Qwen3-ASR on cuda:0 next to the server), and mmsu
-mirrors test_qwen3_omni_mmsu_ci.py (stage 5, text only). Each run writes the
+mirrors test_qwen3_omni_mmsu_ci.py (stage 5, text only), and seedtts-vc
+mirrors the voice clone speed benchmark of test_qwen3_omni_tts_ci.py (50
+SeedTTS-50 samples, one warmup request, speech output) without its WER, UTMOS
+and similarity passes, so it exercises the talker and code2wav with a short
+text prompt only. Each run writes the
 same result JSON the CI artifacts contain, so ci_artifacts.py compare-local
 reads it. --top-logprobs K (default 5) asks the chat endpoint for per-token
 logprobs with K alternatives, which fills answer_margin and min_margin in
@@ -134,9 +139,37 @@ def run_mmsu(args) -> None:
     )
 
 
+def run_seedtts_vc(args) -> None:
+    from benchmarks.dataset.prepare import DATASETS, download_dataset
+    from benchmarks.eval.benchmark_omni_seedtts import (
+        OmniSeedttsBenchmarkConfig,
+        run_omni_seedtts_benchmark,
+    )
+
+    repo_id = DATASETS["seedtts-50"]
+    download_dataset(repo_id, quiet=True)
+    config = OmniSeedttsBenchmarkConfig(
+        model="qwen3-omni",
+        port=args.port,
+        meta=repo_id,
+        output_dir=str(Path(args.out) / "seedtts_vc"),
+        max_samples=args.max_samples or 50,
+        max_concurrency=args.concurrency,
+        voice_clone=True,
+        disable_tqdm=True,
+    )
+    results = asyncio.run(run_omni_seedtts_benchmark(config))
+    s = results["summary"]
+    print(
+        f"seedtts-vc qps={s.get('throughput_qps')} latency_mean_s={s.get('latency_mean_s')} rtf_mean={s.get('rtf_mean')} failed={s.get('failed_requests')}"
+    )
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("stage", choices=("videoamme", "videomme-talker", "mmsu"))
+    p.add_argument(
+        "stage", choices=("videoamme", "videomme-talker", "mmsu", "seedtts-vc")
+    )
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--concurrency", type=int, default=16)
@@ -150,6 +183,7 @@ def main(argv=None) -> int:
         "videoamme": run_videoamme,
         "videomme-talker": run_videomme_talker,
         "mmsu": run_mmsu,
+        "seedtts-vc": run_seedtts_vc,
     }[args.stage](args)
     return 0
 
