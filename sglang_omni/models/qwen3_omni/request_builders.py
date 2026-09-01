@@ -809,24 +809,23 @@ def build_sglang_talker_request(
     )
     if thinker_config is not None and talker_model_inputs:
         from sglang_omni.models.qwen3_omni.mrope_positions import (
-            linear_mrope_positions,
             talker_can_use_linear_mrope,
         )
 
         ids = input_ids_tensor.to(dtype=torch.long)
         mm_model_inputs = talker_model_inputs or {}
-        if talker_can_use_linear_mrope(ids, mm_model_inputs, thinker_config):
-            mrope_positions, mrope_position_delta = linear_mrope_positions(
-                int(ids.numel())
-            )
-        else:
+        # Linear positions (arange, delta 0) are what SGLang computes on the
+        # device for a request without multimodal input, on extend and on
+        # decode. Attaching them as MultimodalInputs only routes every decode
+        # step through a host read of the delta and a pageable copy.
+        if not talker_can_use_linear_mrope(ids, mm_model_inputs, thinker_config):
             mrope_positions, mrope_position_delta = _compute_mrope_positions(
                 ids, mm_model_inputs, thinker_config
             )
-        mm_inputs = MultimodalInputs(mm_items=[])
-        mm_inputs.mrope_positions = mrope_positions
-        mm_inputs.mrope_position_delta = mrope_position_delta
-        req.multimodal_inputs = mm_inputs
+            mm_inputs = MultimodalInputs(mm_items=[])
+            mm_inputs.mrope_positions = mrope_positions
+            mm_inputs.mrope_position_delta = mrope_position_delta
+            req.multimodal_inputs = mm_inputs
 
     multimodal_mask: torch.Tensor | None = None
     if thinker_token_ids is not None:

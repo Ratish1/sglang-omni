@@ -14,6 +14,7 @@ from sglang.srt.layers.rotary_embedding.mrope_rope_index import (
 from sglang_omni.models.qwen3_omni.mrope_positions import (
     _feat_extract_output_lengths,
     get_rope_index_qwen3_omni_vectorized,
+    linear_mrope_positions,
 )
 
 # Defaults from Qwen3OmniMoeThinkerConfig
@@ -546,10 +547,10 @@ def test_build_talker_request_keeps_mm_mrope_for_image_prompt(monkeypatch) -> No
     )
 
 
-def test_build_talker_request_uses_linear_mrope_without_mm_markers(
+def test_build_talker_request_leaves_mm_inputs_unset_without_mm_markers(
     monkeypatch,
 ) -> None:
-    """Grids but no mm markers → builder installs linear positions directly."""
+    """Grids but no mm markers: no MultimodalInputs, SGLang computes arange."""
     from unittest.mock import MagicMock
 
     from sglang_omni.models.qwen3_omni import request_builders as rb
@@ -562,6 +563,7 @@ def test_build_talker_request_uses_linear_mrope_without_mm_markers(
 
     fake_req = MagicMock()
     fake_req.output_ids = []
+    fake_req.multimodal_inputs = None
     fake_sampling = MagicMock()
     monkeypatch.setattr(
         "sglang.srt.managers.schedule_batch.Req",
@@ -589,10 +591,23 @@ def test_build_talker_request_uses_linear_mrope_without_mm_markers(
         thinker_config=cfg,
         talker_model_inputs=model_inputs,
     )
-    mm = data.req.multimodal_inputs
-    assert mm is not None
-    assert torch.equal(
-        mm.mrope_positions,
-        torch.arange(len(tokens), dtype=torch.long).unsqueeze(0).expand(3, -1),
-    )
-    assert torch.equal(mm.mrope_position_delta, torch.zeros((1, 1), dtype=torch.long))
+    assert data.req.multimodal_inputs is None
+
+
+def test_linear_positions_equal_the_text_only_positions_sglang_computes() -> None:
+    """The positions SGLang derives for a request without multimodal input.
+
+    Extend uses arange(prefix, prefix + extend) on every M-RoPE axis and
+    decode uses seq_len - 1, which is linear_mrope_positions with delta 0.
+    """
+    seq_len = 9
+    positions, delta = linear_mrope_positions(seq_len)
+    extend = torch.arange(0, seq_len, dtype=torch.int64).unsqueeze(0).repeat(3, 1)
+    assert torch.equal(positions, extend)
+    assert int(delta) == 0
+    for decoded in range(1, 4):
+        decode_pos = torch.tensor([seq_len + decoded - 1], dtype=torch.int64)
+        assert torch.equal(
+            decode_pos.unsqueeze(0).repeat(3, 1),
+            ((delta.flatten() - 1) + (seq_len + decoded)).unsqueeze(0).repeat(3, 1),
+        )
