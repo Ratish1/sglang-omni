@@ -14,6 +14,22 @@ from sglang_omni.vendor.sglang.server_args import override_server_args
 logger = logging.getLogger(__name__)
 
 
+# SGLang admits a request only while the KV pool holds every running
+# request's reservation, min(max_new_tokens, 4096) times new_token_ratio,
+# and new_token_ratio starts at 0.7 times schedule_conservativeness and decays
+# to 0.14 of that over 600 decode steps. The talker keeps the official
+# max_new_tokens of 4096 as its stop, but it emits 12.5 codec frames per audio
+# second (42 frames median, 93 at most on the voice clone set), so at 1.0 each
+# running request reserves 2867 tokens it never uses and a 21373 token pool
+# runs six to nine talker requests. 0.1 reserves 287 tokens per running
+# request at the start of a burst, three times the median output, and the
+# pool fills to max_running_requests. Outputs that outrun the reservation are
+# handled the way SGLang handles them for every model: the scheduler retracts
+# the youngest rows and the talker replays them from its decode input history
+# (QwenTalkerModelRunner._decode_input_history).
+TALKER_SCHEDULE_CONSERVATIVENESS = 0.1
+
+
 def configure_talker_server_args(
     server_args: Any,
     *,
@@ -29,6 +45,7 @@ def configure_talker_server_args(
     overrides = {
         "disable_radix_cache": True,
         "chunked_prefill_size": 0,
+        "schedule_conservativeness": TALKER_SCHEDULE_CONSERVATIVENESS,
     }
     if feedback_enabled:
         overrides["disable_overlap_schedule"] = True

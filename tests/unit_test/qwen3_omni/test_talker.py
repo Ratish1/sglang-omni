@@ -30,6 +30,7 @@ from sglang_omni.models.qwen3_omni.request_builders import build_sglang_talker_r
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
 from sglang_omni.models.qwen3_omni.talker_scheduler import (
     MIN_PARTIAL_START_CHUNKS,
+    TALKER_SCHEDULE_CONSERVATIVENESS,
     QwenTalkerScheduler,
     configure_talker_server_args,
 )
@@ -98,6 +99,7 @@ def test_configure_talker_server_args_writes_through_the_mutation_guard() -> Non
     assert server_args.disable_cuda_graph is False
     assert server_args.disable_radix_cache is True
     assert server_args.chunked_prefill_size == 0
+    assert server_args.schedule_conservativeness == TALKER_SCHEDULE_CONSERVATIVENESS
     audited_overrides = {}
     for source, fields in server_args._runtime_mutations:
         assert source == "qwen3_omni.talker"
@@ -105,6 +107,7 @@ def test_configure_talker_server_args_writes_through_the_mutation_guard() -> Non
     assert audited_overrides == {
         "disable_radix_cache": True,
         "chunked_prefill_size": 0,
+        "schedule_conservativeness": TALKER_SCHEDULE_CONSERVATIVENESS,
         "disable_overlap_schedule": True,
     }
 
