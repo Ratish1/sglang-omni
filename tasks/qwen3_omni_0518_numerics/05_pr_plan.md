@@ -759,49 +759,41 @@ section 5 gives the mechanism behind its regression: two stream syncs per
 step that serialize the host behind the in flight step. The work is three
 groups, each one PR with one proof, accepted before the next starts.
 
-### 7.1 Group E1, talker admission cap (request builder)
+### 7.1 Group E1, talker KV reservation (talker scheduler defaults)
 
-Title: `[Qwen3-Omni] Bound the talker max_new_tokens by the thinker text`
+Title: `[Qwen3-Omni] Reserve talker KV by the expected output instead of the 4096 ceiling`
 
-Seam: `_resolve_talker_sampling_config` and `_build_talker_request_data`
-(request_builders.py). At build time with the thinker done the builder
-knows the text length (one chunk per thinker token,
-talker_prefill.py `extract_chunk_token_ids`).
+Seam: `configure_talker_server_args` (talker_scheduler.py), the place that
+already sets the talker's scheduler defaults (radix cache off, chunked
+prefill off, overlap off).
 
-Change: when the request did not pass `talker_max_new_tokens` and the
-thinker is done, `max_new_tokens = min(4096, 64 + 32 * text_tokens)`.
-Explicit `talker_max_new_tokens` is honored unchanged. Partial start
-(thinker not done at build) keeps 4096. Constants from 06: 12.5 frames per
-audio second, 1.8 to 5.2 frames per text token observed (p50 2.9), digit
-heavy text can exceed the ratio, so 32 per token plus 64 leaves six
-times the observed maximum.
+Change: `schedule_conservativeness` 0.1 for the talker. SGLang reads it in
+one place, the initial `new_token_ratio` (new_token_ratio_tracker.py:20-32),
+so each running talker request reserves min(max_new_tokens, 4096) x 0.07 =
+287 tokens at the start of a burst instead of 2867, and the pool fills to
+`max_running_requests` (32). `talker_max_new_tokens` stays 4096, the
+official stop. Overruns take SGLang's retract path, which the talker
+supports (replay from `_decode_input_history`, talker_model_runner.py:328-340).
+Reference: vLLM-Omni keeps the talker at max_tokens 4096 and its scheduler
+allocates per generated token with preemption, never a reservation (07
+section 5).
 
-Why the cap and not the SGLang estimate env
-(`SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION`): the env changes only the
-reservation and leaves the worst case unbounded, so under load the pool
-can fill and SGLang retracts, and a retracted talker request re prefills
-and re emits frames to code2wav. The per request cap bounds the worst
-case too: with `max_running_requests` 32 and 14 token texts,
-32 x (150 + 512) fits the 21373 token pool. Tradeoff: a runaway
-generation stops at 5 s plus 2.6 s per text token of audio instead of at
-328 s.
+Why not a text derived `max_new_tokens`: measured first (07 sections 1 to
+4, c16 qps +24 percent, c32 +48 percent, running 9 to 16 and 32) and then
+reverted, because it changes the model's stop with a dataset fitted
+constant, which is the wrong seam for a reservation problem.
 
-Tests: tests/unit_test/qwen3_omni/test_talker_max_new_tokens.py, the
-bound function, the builder with a fake prefill builder (cap from the
-chunk count, explicit override wins, thinker not done keeps the default).
+Tests: test_talker.py `test_configure_talker_server_args_writes_through_the_mutation_guard`
+asserts the audited override.
 
-Proof (container): voice clone events at c16 and c32 against the
-baseline: running count in the talker (max and time share, from
-prefill_start and stage_complete), admission wait p50, latency p50, RTF.
-The cap binds on no request at any concurrency (frames against cap from
-the results).
+Proof (container, f74c4fcda): the three boot interleaved sweep at c1, c16
+and c32 with WER, similarity and UTMOS on both arms, plus one c32 boot with
+`--talker_ar.engine.max_total_tokens 4096` to force retracts and show the
+audio intact (retract count from the log, WER and similarity against the
+normal boot).
 
-Status: measured on 2026-09-01, doc 07. Three interleaved boots per arm
-on the bf16 colocated config: c16 qps +24 percent, latency p50 -23
-percent, RTF p95 -30 percent, c32 qps +48 percent, RTF p95 -50 percent,
-c1 unchanged inside the boot to boot range. Talker running count 9 to 16
-at c16 and 9 to 32 at c32, admission wait p50 928 ms to 4 ms. Accepted,
-branch perf/talker-admission-cap 112b7bf0c on origin.
+Status: cap version measured and reverted, reservation version pushed
+(perf/talker-admission-cap f74c4fcda), sweep pending.
 
 ### 7.2 Group E2, per step host syncs and copies (model code)
 

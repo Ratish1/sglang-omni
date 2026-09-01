@@ -95,3 +95,39 @@ config (talker fraction 0.12, so a larger talker pool and a different
 base cap) has not been measured, and its earlier boots on that host
 died at image_encoder startup with an external SIGKILL, which needs a
 host side look first.
+
+## 5. Redesign after review (2026-09-01)
+
+The measured branch lowered `max_new_tokens` itself, which changes the
+model's official stop (4096, the HF `talker_max_new_tokens` default) with a
+constant fitted on one dataset. That is the wrong seam: the stop was never
+the problem, the reservation was. vLLM-Omni keeps the talker at
+`max_tokens: 4096` (vllm_omni/deploy/qwen3_omni_moe.yaml:49) and its
+scheduler never reserves for it: `max_tokens` appears in vllm/v1/core/sched/
+scheduler.py only as the stop check (:489-492), blocks are allocated for the
+tokens being generated (`allocate_slots(request, num_new_tokens, ...)`,
+kv_cache_manager.py:344) and a request is preempted when blocks run out
+(scheduler.py:569-593). SGLang reserves `min(max_new_tokens, 4096) x
+new_token_ratio` and retracts when the reservation was too small, so the
+equivalent is a small reservation with the official ceiling intact.
+
+The branch now reverts the cap (50c6d424c) and sets
+`schedule_conservativeness` 0.1 for the talker in
+`configure_talker_server_args` (f74c4fcda). SGLang uses that argument in one
+place, the initial `new_token_ratio` (0.7 x 0.1, decaying to 0.14 of it,
+new_token_ratio_tracker.py:20-32), so each running talker request reserves
+287 tokens at the start of a burst instead of 2867, and the pool fills to
+`max_running_requests`. Overruns take SGLang's retract path, which the
+talker supports: retracted rows are replayed from `_decode_input_history`
+(talker_model_runner.py:328-340) and the base runner skips retracted rows and
+resets penalty state on a shrunk `output_ids` (base.py:363-368, 895-933).
+
+The mechanism is the same arithmetic the cap exercised, so the sweep above
+is the prediction for the new branch, not its proof. To do on f74c4fcda:
+
+- the same three boot interleaved sweep at c1, c16 and c32, plus WER,
+  speaker similarity and UTMOS on the outputs of both arms;
+- one boot with the talker pool shrunk (`--talker_ar.engine.max_total_tokens
+  4096`) at c32 to force retracts, reading the retract count from the
+  server log and the WER and similarity of that run against the normal one,
+  which is the proof that the safety valve keeps the audio intact.
