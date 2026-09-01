@@ -14,20 +14,20 @@ from sglang_omni.vendor.sglang.server_args import override_server_args
 logger = logging.getLogger(__name__)
 
 
-# SGLang admits a request only while the KV pool holds every running
-# request's reservation, min(max_new_tokens, 4096) times new_token_ratio,
-# and new_token_ratio starts at 0.7 times schedule_conservativeness and decays
-# to 0.14 of that over 600 decode steps. The talker keeps the official
-# max_new_tokens of 4096 as its stop, but it emits 12.5 codec frames per audio
-# second (42 frames median, 93 at most on the voice clone set), so at 1.0 each
-# running request reserves 2867 tokens it never uses and a 21373 token pool
-# runs six to nine talker requests. 0.1 reserves 287 tokens per running
-# request at the start of a burst, three times the median output, and the
-# pool fills to max_running_requests. Outputs that outrun the reservation are
-# handled the way SGLang handles them for every model: the scheduler retracts
-# the youngest rows and the talker replays them from its decode input history
-# (QwenTalkerModelRunner._decode_input_history).
-TALKER_SCHEDULE_CONSERVATIVENESS = 0.1
+# SGLang's PrefillAdder admits a request only while the KV pool holds, for
+# every running request, min(max_new_tokens, 4096) times new_token_ratio, and
+# new_token_ratio starts at 0.7 times schedule_conservativeness. That is a
+# reservation for the worst case of every running row. The talker keeps the
+# official max_new_tokens of 4096 as its stop but emits 12.5 codec frames per
+# audio second, so the reservation is about a hundred times its typical
+# output and a 21373 token pool admits six to nine talker requests. Zero
+# turns the reservation off: a request is admitted while its own ceiling
+# fits the free pool, running rows hold only what they use, and if the pool
+# fills SGLang retracts the youngest rows and requeues them, which the talker
+# replays from its decode input history. That is the admission policy vLLM
+# applies to the same talker (allocate per generated token, preempt on
+# exhaustion) expressed through SGLang's own knob.
+TALKER_SCHEDULE_CONSERVATIVENESS = 0.0
 
 
 def configure_talker_server_args(
