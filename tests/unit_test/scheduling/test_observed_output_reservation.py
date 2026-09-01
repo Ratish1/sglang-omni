@@ -3,9 +3,10 @@
 
 SGLang's PrefillAdder reserves min(max_new_tokens, CLIP_MAX_NEW_TOKENS) times
 new_token_ratio per running request. OmniScheduler records the fraction of
-the clipped cap each finished request used and applies the largest recent
-fraction to the tracker before every prefill admission. Tested against a stub
-scheduler with the upstream admission patched to a sentinel.
+the clipped cap each finished request used, keeps one cohort of
+max_running_requests of them, and applies the largest to the tracker before
+every prefill admission. Tested against a stub scheduler with the upstream
+admission patched to a sentinel.
 """
 
 from __future__ import annotations
@@ -90,7 +91,7 @@ def test_fraction_uses_the_clipped_cap_like_the_adder(upstream) -> None:
     )
 
 
-def test_old_outputs_leave_the_window(upstream) -> None:
+def test_outputs_older_than_one_cohort_leave_the_window(upstream) -> None:
     sched = _StubScheduler(window=2)
     sched.finish(900, 4096)
     sched.finish(40, 4096)

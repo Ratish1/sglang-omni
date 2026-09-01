@@ -66,10 +66,6 @@ from sglang_omni.scheduling.types import DeferredAdmission
 
 logger = logging.getLogger(__name__)
 
-# Finished requests whose output length feeds the KV reservation estimate.
-# The bound only limits memory, one float per finished request.
-FINISHED_OUTPUT_WINDOW = 1024
-
 _FAILED_BATCH_RESULT = object()
 
 _ABORTED_REQUEST_ID_LIMIT = 10000
@@ -421,11 +417,14 @@ class OmniScheduler:
         # max_running_requests. This scheduler finishes requests continuously,
         # so the fraction is measured instead: the largest fraction of the
         # clipped cap that a recently finished request used, applied before
-        # every admission. Until a request has finished the tracker keeps
-        # SGLang's guess, and an output longer than any recent one takes
+        # every admission. The window is one cohort of the rows that share the
+        # pool at once, so each running row is reserved what the longest
+        # member of the previous cohort needed and an outlier leaves after one
+        # turnover of the batch. Until a request has finished the tracker
+        # keeps SGLang's guess, and an output longer than any recent one takes
         # SGLang's retract path like any other overrun.
         self._finished_output_fractions: deque[float] = deque(
-            maxlen=FINISHED_OUTPUT_WINDOW
+            maxlen=max(int(self.max_running_requests), 1)
         )
         self._observed_new_token_ratio: float | None = None
         self.prefill_delayer = None
