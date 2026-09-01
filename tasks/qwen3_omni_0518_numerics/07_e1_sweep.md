@@ -112,15 +112,46 @@ new_token_ratio` and retracts when the reservation was too small, so the
 equivalent is a small reservation with the official ceiling intact.
 
 The branch now reverts the cap (50c6d424c) and sets
-`schedule_conservativeness` 0.1 for the talker in
-`configure_talker_server_args` (f74c4fcda). SGLang uses that argument in one
-place, the initial `new_token_ratio` (0.7 x 0.1, decaying to 0.14 of it,
-new_token_ratio_tracker.py:20-32), so each running talker request reserves
-287 tokens at the start of a burst instead of 2867, and the pool fills to
-`max_running_requests`. Overruns take SGLang's retract path, which the
-talker supports: retracted rows are replayed from `_decode_input_history`
-(talker_model_runner.py:328-340) and the base runner skips retracted rows and
-resets penalty state on a shrunk `output_ids` (base.py:363-368, 895-933).
+`schedule_conservativeness` 0 for the talker in
+`configure_talker_server_args` (48bbc40fa, after a 0.1 step at f74c4fcda).
+SGLang uses that argument in one place, the initial `new_token_ratio`
+(0.7 x conservativeness, new_token_ratio_tracker.py:20-32). At 0 the
+reservation for running rows is off: a request is admitted while its own
+ceiling fits the free pool (the candidate charge stays min(max_new_tokens,
+4096) unscaled, schedule_policy.py:1219-1237), running rows hold only what
+they use, and the pool fills to `max_running_requests`. When the pool does
+fill, `check_decode_mem` fails and `retract_decode` releases the youngest
+rows back to the waiting queue (scheduler.py:3491-3526,
+schedule_batch.py:2816-2865), which the talker supports: retracted rows are
+replayed from `_decode_input_history` (talker_model_runner.py:328-340) and
+the base runner skips retracted rows and resets penalty state on a shrunk
+`output_ids` (base.py:363-368, 895-933). This is vLLM's policy for the same
+talker (allocate per generated token, preempt on exhaustion) expressed
+through SGLang's knob, with no fitted constant.
+
+The admission call chain, so the seam is not in doubt:
+`QwenTalkerScheduler.get_next_batch_to_run` (talker_scheduler.py:110-137,
+readiness only) -> `OmniScheduler.get_next_batch_to_run`
+(omni_scheduler.py:1317-1329, hands running_batch to upstream) ->
+`Scheduler.get_next_batch_to_run` (sglang scheduler.py:3015-3149, prefill
+wins over decode at :3121-3131) -> `OmniScheduler.get_new_batch_prefill`
+(omni_scheduler.py:1331-1352, only coalescing, then `_Upstream`) ->
+`_get_new_batch_prefill_raw` builds `PrefillAdder(..., self.new_token_ratio_tracker.current, ...)`
+(scheduler.py:3257-3262) -> `add_one_req` (schedule_policy.py:1219-1237).
+The tracker is built once from `schedule_conservativeness`
+(scheduler.py:1255, new_token_ratio_tracker.py:20-32), decays per decode
+step (:3554) and is reset on idle (:4074). Omni owns none of the policy;
+it owns the server args the policy reads, which is where the change is.
+
+What the measurement covered and did not: the E0 profile and the sweep used
+the repository's SeedTTS voice clone benchmark (run_bench.py seedtts-vc,
+benchmark_omni_seedtts, 50 requests, warmup), not raw requests, on one
+workload: 5 to 29 thinker text tokens, 1 to 7 s of audio. The reservation
+arithmetic does not depend on the workload but the size of the gain does,
+so the sweep on the reservation branch adds a long output arm (texts of 60
+to 120 tokens, 20 to 40 s of audio, where the reservation is closer to the
+truth and the gain smaller) and, once the fp8 boot is fixed, the video to
+speech workload on the fp8 colocated config.
 
 The mechanism is the same arithmetic the cap exercised, so the sweep above
 is the prediction for the new branch, not its proof. To do on f74c4fcda:

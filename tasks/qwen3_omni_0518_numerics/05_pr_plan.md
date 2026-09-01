@@ -767,16 +767,16 @@ Seam: `configure_talker_server_args` (talker_scheduler.py), the place that
 already sets the talker's scheduler defaults (radix cache off, chunked
 prefill off, overlap off).
 
-Change: `schedule_conservativeness` 0.1 for the talker. SGLang reads it in
+Change: `schedule_conservativeness` 0 for the talker. SGLang reads it in
 one place, the initial `new_token_ratio` (new_token_ratio_tracker.py:20-32),
-so each running talker request reserves min(max_new_tokens, 4096) x 0.07 =
-287 tokens at the start of a burst instead of 2867, and the pool fills to
+so running talker rows reserve nothing beyond what they use, a request is
+admitted while its own ceiling fits the free pool, and the pool fills to
 `max_running_requests` (32). `talker_max_new_tokens` stays 4096, the
-official stop. Overruns take SGLang's retract path, which the talker
+official stop. A full pool takes SGLang's retract path, which the talker
 supports (replay from `_decode_input_history`, talker_model_runner.py:328-340).
-Reference: vLLM-Omni keeps the talker at max_tokens 4096 and its scheduler
-allocates per generated token with preemption, never a reservation (07
-section 5).
+This is vLLM-Omni's policy for the same talker (max_tokens 4096, allocate
+per generated token, preempt on exhaustion) through SGLang's knob, no
+fitted constant (07 section 5 has the call chain).
 
 Why not a text derived `max_new_tokens`: measured first (07 sections 1 to
 4, c16 qps +24 percent, c32 +48 percent, running 9 to 16 and 32) and then
@@ -792,8 +792,9 @@ and c32 with WER, similarity and UTMOS on both arms, plus one c32 boot with
 audio intact (retract count from the log, WER and similarity against the
 normal boot).
 
-Status: cap version measured and reverted, reservation version pushed
-(perf/talker-admission-cap f74c4fcda), sweep pending.
+Status: cap version measured and reverted, reservation off version
+pushed (perf/talker-admission-cap 48bbc40fa), sweep pending, with a long
+output arm and the forced retract boot added to the proof.
 
 ### 7.2 Group E2, per step host syncs and copies (model code)
 
