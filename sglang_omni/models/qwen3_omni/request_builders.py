@@ -710,6 +710,28 @@ def build_sglang_thinker_request(
     return data
 
 
+TALKER_MAX_NEW_TOKENS_DEFAULT = 4096
+TALKER_MAX_NEW_TOKENS_BASE = 64
+TALKER_MAX_NEW_TOKENS_PER_TEXT_TOKEN = 32
+
+
+def talker_max_new_tokens_bound(text_token_count: int) -> int:
+    """Talker output cap for a text of text_token_count thinker tokens.
+
+    The talker emits 12.5 codec frames per audio second and the voice clone
+    set measures 1.8 to 5.2 frames per thinker text token, so 32 per token
+    plus 64 keeps six times that maximum. The cap only ends a generation that
+    never emitted the codec EOS, while the KV reservation SGLang derives from
+    max_new_tokens follows the text instead of the 4096 default, which is
+    what bounds how many talker requests run at once.
+    """
+    tokens = max(int(text_token_count), 0)
+    return min(
+        TALKER_MAX_NEW_TOKENS_DEFAULT,
+        TALKER_MAX_NEW_TOKENS_BASE + TALKER_MAX_NEW_TOKENS_PER_TEXT_TOKEN * tokens,
+    )
+
+
 def build_sglang_talker_request(
     thinker_hidden_states: torch.Tensor,
     *,
@@ -1083,7 +1105,9 @@ def make_talker_scheduler_adapters(
             if token_id != codec_eos_id
         ]
         return {
-            "max_new_tokens": int(params.get("talker_max_new_tokens", 4096)),
+            "max_new_tokens": int(
+                params.get("talker_max_new_tokens", TALKER_MAX_NEW_TOKENS_DEFAULT)
+            ),
             "temperature": float(params.get("talker_temperature", 0.9)),
             "top_k": int(params.get("talker_top_k", 50)),
             "top_p": float(params.get("talker_top_p", 1.0)),
@@ -1150,6 +1174,13 @@ def _build_talker_request_data(
         raise RuntimeError(
             "talker request_builder requires prefetched thinker chunks; "
             "check the partial-start readiness policy or upstream wiring"
+        )
+    if params.get("talker_max_new_tokens") is None and thinker_done:
+        # One prefetched chunk per thinker text token once the thinker is
+        # done, so the text length is known here and bounds the output.
+        sampling_cfg["max_new_tokens"] = min(
+            int(sampling_cfg["max_new_tokens"]),
+            talker_max_new_tokens_bound(len(thinker_chunks)),
         )
 
     prompt_prefill = prefill_builder.build_prompt_prefill(
