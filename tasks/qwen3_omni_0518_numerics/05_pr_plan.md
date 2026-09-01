@@ -793,7 +793,15 @@ chunk count, explicit override wins, thinker not done keeps the default).
 Proof (container): voice clone events at c16 and c32 against the
 baseline: running count in the talker (max and time share, from
 prefill_start and stage_complete), admission wait p50, latency p50, RTF.
-Codes bit identical at c1 (the cap binds on no request there).
+The cap binds on no request at any concurrency (frames against cap from
+the results).
+
+Status: measured on 2026-09-01, doc 07. Three interleaved boots per arm
+on the bf16 colocated config: c16 qps +24 percent, latency p50 -23
+percent, RTF p95 -30 percent, c32 qps +48 percent, RTF p95 -50 percent,
+c1 unchanged inside the boot to boot range. Talker running count 9 to 16
+at c16 and 9 to 32 at c32, admission wait p50 928 ms to 4 ms. Accepted,
+branch perf/talker-admission-cap 112b7bf0c on origin.
 
 ### 7.2 Group E2, per step host syncs and copies (model code)
 
@@ -860,7 +868,10 @@ scripts/h100_runs.sh, baseline and change interleaved on the same GPU:
 - trace: `SGLANG_TORCH_PROFILER_WITH_STACK=1` then `_traces_run PORT LABEL seedtts-vc`,
   read with trace_ingest.py and trace_steps.py (with `--other` for the
   code2wav trace).
-- numerics: `run_compare OLD NEW` on the codes at c1 with the fixed seeds.
+- numerics: `run_compare OLD NEW` on the codes at c1, which needs a fixed
+  seed per sample passed by the bench (run_bench.py sets seed None and an
+  unseeded request draws its talker seed from its request id, so two
+  boots never produce the same codes). Tooling item before E2's proof.
 - read: 06 section 3.1 table for the change, 06 section 2 table for the
   request, and the bench table.
 
