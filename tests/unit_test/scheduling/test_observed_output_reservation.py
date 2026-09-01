@@ -45,12 +45,16 @@ class _StubScheduler:
         self._pending_request_admissions: dict = {}
         self._backlogged_request_build_payloads: list = []
 
+    _record_finished_output = OmniScheduler._record_finished_output
+    _apply_observed_new_token_ratio = OmniScheduler._apply_observed_new_token_ratio
+
     def finish(self, output_len: int, cap: int | None) -> None:
-        req = SimpleNamespace(
-            output_ids=list(range(output_len)),
-            sampling_params=SimpleNamespace(max_new_tokens=cap),
+        self._record_finished_output(
+            SimpleNamespace(
+                output_ids=list(range(output_len)),
+                sampling_params=SimpleNamespace(max_new_tokens=cap),
+            )
         )
-        OmniScheduler._record_finished_output(self, req)
 
     def admit(self):
         plan = OmniScheduler.get_new_batch_prefill(self, running_batch=None)
