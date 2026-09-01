@@ -126,7 +126,7 @@ The mechanism is the same arithmetic the cap exercised, so the sweep above
 is the prediction for the new branch, not its proof. To do on f74c4fcda:
 
 - the same three boot interleaved sweep at c1, c16 and c32, plus WER,
-  speaker similarity and UTMOS on the outputs of both arms;
+  speaker similarity and UTMOS on the outputs of both arms, and
 - one boot with the talker pool shrunk (`--talker_ar.engine.max_total_tokens
   4096`) at c32 to force retracts, reading the retract count from the
   server log and the WER and similarity of that run against the normal one,
