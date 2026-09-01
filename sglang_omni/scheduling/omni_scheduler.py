@@ -717,7 +717,13 @@ class OmniScheduler:
         if not cap:
             return
         clipped_cap = min(int(cap), CLIP_MAX_NEW_TOKENS)
-        self._finished_output_fractions.append(len(req.output_ids) / clipped_cap)
+        # An output that ran past the clip counts as the whole clipped cap.
+        # sglang keeps the ratio within (0, 1]: from_config clamps init and
+        # min at 1.0, the post retract estimate clamps at 1.0, and the running
+        # budget in PrefillAdder multiplies the unclipped cap by the ratio, so
+        # a ratio above 1.0 would reserve more than the cap itself.
+        used = min(len(req.output_ids), clipped_cap)
+        self._finished_output_fractions.append(used / clipped_cap)
         self._observed_new_token_ratio = None
 
     def _apply_observed_new_token_ratio(self) -> None:

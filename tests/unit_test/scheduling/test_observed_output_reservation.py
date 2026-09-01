@@ -95,6 +95,13 @@ def test_fraction_uses_the_clipped_cap_like_the_adder(upstream) -> None:
     )
 
 
+def test_outputs_past_the_clip_reserve_the_whole_clipped_cap(upstream) -> None:
+    sched = _StubScheduler()
+    sched.finish(9000, 9001)
+    sched.admit()
+    assert sched.new_token_ratio_tracker.current == 1.0
+
+
 def test_outputs_older_than_one_cohort_leave_the_window(upstream) -> None:
     sched = _StubScheduler(window=2)
     sched.finish(900, 4096)
