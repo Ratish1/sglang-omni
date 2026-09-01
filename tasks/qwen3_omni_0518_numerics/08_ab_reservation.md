@@ -187,9 +187,20 @@ Task, optional: one more A video run at c16.
 
 ## 5. Remaining before the PR
 
-- WER and UTMOS on B_talker_retract_c16 and c32.
-- Same sample similarity A versus B, with B versus B talker retract as the
-  baseline.
+Both items were closed by the clip fix bundle
+(ab-reservation-clipfix.tar.gz, B at ce2735c02, scheduler unit tests 232
+passed in the container).
+
+- WER and UTMOS on the talker retract runs sit in the band of the other
+  arms: wer_corpus 0.0142 (c16) and 0.0124 (c32) against A 0.0142 and
+  0.0124 and B 0.0106 and 0.0142, 50 of 50 evaluated everywhere, UTMOS
+  4.4617 and 4.4634 against 4.43 to 4.45 elsewhere. The nine talker
+  retractions left no trace in intelligibility or MOS.
+- Same sample similarity, generated wav against generated wav with the
+  fine tuned head: A versus B scores 82.2 (c1), 84.2 (c16) and 82.7 (c32)
+  with minima 64.9 to 71.3, and the run to run baseline B versus B talker
+  retract scores 84.1 (c16) and 83.8 (c32). The arms are as close to each
+  other as B is to its own rerun, so the talker voice is unchanged.
 
 ## 6. Which stages the change reaches
 
@@ -252,3 +263,44 @@ value sglang itself uses for ignore_eos requests (schedule_policy.py:1086).
 That is more conservative than today for cap filling stages. Task: A
 versus B on minimax_music3 at its CI concurrency, reading admission wait
 and retractions in both arms, before merging.
+
+## 7. MiniMax Music 3 A/B (c16, one wave, seeded per request)
+
+A 68c88dae6 versus B ce2735c02, 16 requests with max_new_tokens 9000
+submitted at once, seed equal to the request index, from
+bench_minimax_music3_c16.py in the bundle.
+
+| arm | completed | qps | latency p50 s | wall s | AR rows max | admission p50 ms | admission max ms | retract lines |
+|---|---|---|---|---|---|---|---|---|
+| A | 16/16 | 0.0822 | 163.5 | 194.6 | 30 | 5.6 | 19625 | 0 |
+| B | 16/16 | 0.0884 | 156.6 | 181.0 | 32 | 4.5 | 7 | 0 |
+
+No failures and no retraction in either arm. Five of the sixteen outputs
+are byte identical across the arms (indices 2, 3, 5, 9, 13), the rest
+differ under different batch composition with the same seeds.
+
+The conservatism section 6 warned about never triggers on this workload:
+outputs ran 587 to 1609 frames against the 9000 cap, far below the 4096
+clip, so the observed fraction stays at 0.36 to 0.39 and the post finish
+reservation sits below sglang's 0.7 guess, not above it. Section 6
+repeated the cookbook's claim that requests typically fill the cap. This
+run says otherwise for an ordinary lyrics prompt: a 1.0 fraction needs a
+single output past 4096 frames, which is 164 s of music at 25 fps.
+
+The qps difference is confounded by boot load order and is not
+attributable to the change. In A the dit_dav process took the GPU startup
+lock first and loaded the fp32 DIT and DAV before the AR sized its pool,
+in B the AR loaded first, so the pools differ: 118366 tokens in A against
+166892 in B. With the smaller pool A admitted 30 rows at the initial 0.7
+ratio and held the last request (two rows) for 19.6 s, the time the
+decaying ratio needed to shrink the reservation enough, since nothing
+finishes for the first 97 s. B admitted all 32 rows within 7 ms.
+
+What one wave cannot show: the observed ratio only acts on admissions
+after a finish, and every request here was admitted before the first
+finish. A two wave run (32 requests at concurrency 16) would show B
+readmitting at the observed 0.39 while A readmits at whatever the decay
+reached. Optional, the no regression question is answered without it.
+
+Task, only if a gain number is ever claimed for this model: pin the stage
+load order first, the pool size depends on it.
