@@ -95,7 +95,7 @@ Standard sampling parameters apply to the thinker stage. When `modalities` inclu
 | `talker_top_p` | float | `1.0` | Talker (audio output only) |
 | `talker_top_k` | int | `50` | Talker (audio output only) |
 | `talker_repetition_penalty` | float | `1.05` | Talker (audio output only) |
-| `talker_max_new_tokens` | int | `4096` | Talker (audio output only) |
+| `talker_max_new_tokens` | int | derived | Talker (audio output only). Unset, the cap is 64 plus 32 codec frames per thinker text token, at most 4096, so the talker's KV reservation follows the text length instead of the 4096 ceiling. Set it to force a fixed cap. |
 | `stage_sampling` | dict | `null` | Per-stage sampling override |
 | `stage_params` | dict | `null` | Per-stage non-sampling params |
 | `video_fps` | float | `null` | Frame sampling rate for video input (uses server default if unset) |
