@@ -140,7 +140,7 @@ wins over decode at :3121-3131) -> `OmniScheduler.get_new_batch_prefill`
 (scheduler.py:3257-3262) -> `add_one_req` (schedule_policy.py:1219-1237).
 The tracker is built once from `schedule_conservativeness`
 (scheduler.py:1255, new_token_ratio_tracker.py:20-32), decays per decode
-step (:3554) and is reset on idle (:4074). Omni owns none of the policy;
+step (:3554) and is reset on idle (:4074). Omni owns none of the policy,
 it owns the server args the policy reads, which is where the change is.
 
 What the measurement covered and did not: the E0 profile and the sweep used
