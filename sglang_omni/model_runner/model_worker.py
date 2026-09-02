@@ -41,6 +41,9 @@ class _PrefillCudaGraphUsage:
     standard_eager_count: int = 0
     custom_eager_count: int = 0
     replay_buckets: Counter[int] = field(default_factory=Counter)
+    # note(ratish): token count and batch size of every standard eager
+    # prefill, so a run can say which shapes the graph refused.
+    standard_eager_shapes: Counter[tuple[int, int]] = field(default_factory=Counter)
 
 
 _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
@@ -319,6 +322,9 @@ class ModelWorker:
             # Note (wenyao): custom eager forwards (visual/deepstack) return
             # before ModelWorker is called; intentionally absent here.
             self._prefill_cuda_graph_usage.standard_eager_count += 1
+            self._prefill_cuda_graph_usage.standard_eager_shapes[
+                (len(forward_batch.input_ids), int(forward_batch.batch_size))
+            ] += 1
             return
 
         runner = self.model_runner.prefill_cuda_graph_runner
@@ -357,6 +363,12 @@ class ModelWorker:
             "replay_buckets": {
                 str(bucket): int(count)
                 for bucket, count in sorted(usage.replay_buckets.items())
+            },
+            "standard_eager_shapes": {
+                f"{tokens}x{batch_size}": int(count)
+                for (tokens, batch_size), count in sorted(
+                    usage.standard_eager_shapes.items()
+                )
             },
         }
 
