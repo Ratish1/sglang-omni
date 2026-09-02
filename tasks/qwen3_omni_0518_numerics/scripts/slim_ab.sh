@@ -11,7 +11,9 @@
 #
 # PROFILE=bf16 runs the CI's bf16 topologies instead: bf16 colocated for
 # the voice clone, bf16 thinker only for MMSU, bf16 disagg (two GPUs) for
-# Video-MME, three boots per arm.
+# Video-MME, three boots per arm. SLIM_STAGES="seedtts" limits either
+# profile to the voice clone stage:
+#   PROFILE=bf16 SLIM_STAGES=seedtts OMNI_ROOT=... OUT=... GPU=0 bash "$OUT/scripts/slim_ab.sh"
 #
 # Required: OMNI_ROOT (clean tree, installed editable), OUT (outside the
 # tree), GPU (default 0, two GPUs for PROFILE=bf16). Optional: A_SHA, B_SHA.
@@ -26,6 +28,8 @@ set -uo pipefail
 : "${OUT:?set OUT}"
 GPU="${GPU:-0}"
 PROFILE="${PROFILE:-fp8}"
+# Space separated subset of: seedtts mmsu videomme (default all three).
+SLIM_STAGES="${SLIM_STAGES:-seedtts mmsu videomme}"
 A_SHA="${A_SHA:-68c88dae6}"
 B_SHA="${B_SHA:-9769867a0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,6 +43,7 @@ TOP_LOGPROBS=0
 GPU_ONE=${GPU%%,*}
 
 log() { echo "$(date -Is) $*" | tee -a "$OUT/slim_ab.log"; }
+wants() { [[ " $SLIM_STAGES " == *" $1 "* ]]; }
 
 gpus_idle() {
   OMNI_CI_GPU_MEMORY_CLEAN_THRESHOLD_MB=2048 \
@@ -80,33 +85,37 @@ run_arm() {
   if [ "$PROFILE" = fp8 ]; then
     gpus_idle || return 1
     GPU=$GPU_ONE serve_fp8_colocated 31000 || return 1
-    for c in 1 16 32; do bench "seedtts_c$c" "$arm" seedtts-vc 31000 "$c"; done
-    bench mmsu_c16 "$arm" mmsu 31000 16
-    bench videomme_talker_c16 "$arm" videomme-talker 31000 16
+    if wants seedtts; then for c in 1 16 32; do bench "seedtts_c$c" "$arm" seedtts-vc 31000 "$c"; done; fi
+    if wants mmsu; then bench mmsu_c16 "$arm" mmsu 31000 16; fi
+    if wants videomme; then bench videomme_talker_c16 "$arm" videomme-talker 31000 16; fi
     stop_server 31000
     for s in seedtts_c1 seedtts_c16 seedtts_c32 mmsu_c16 videomme_talker_c16; do
-      serve_logs serve_fp8_31000.log "$s" "$arm"
+      [ -d "$OUT/$s/$arm" ] && serve_logs serve_fp8_31000.log "$s" "$arm"
     done
     return
   fi
 
-  gpus_idle || return 1
-  GPU=$GPU_ONE serve_bf16_colocated 31000 || return 1
-  for c in 1 16 32; do bench "seedtts_c$c" "$arm" seedtts-vc 31000 "$c"; done
-  stop_server 31000
-  for c in 1 16 32; do serve_logs serve_bf16_colocated_31000.log "seedtts_c$c" "$arm"; done
-
-  gpus_idle || return 1
-  GPU=$GPU_ONE serve_bf16_thinker 31001 || return 1
-  bench mmsu_c16 "$arm" mmsu 31001 16
-  stop_server 31001
-  serve_logs serve_bf16_thinker_31001.log mmsu_c16 "$arm"
-
-  gpus_idle || return 1
-  GPU=$GPU serve_bf16_disagg 31002 || return 1
-  bench videomme_talker_c16 "$arm" videomme-talker 31002 16
-  stop_server 31002
-  serve_logs serve_bf16_disagg_31002.log videomme_talker_c16 "$arm"
+  if wants seedtts; then
+    gpus_idle || return 1
+    GPU=$GPU_ONE serve_bf16_colocated 31000 || return 1
+    for c in 1 16 32; do bench "seedtts_c$c" "$arm" seedtts-vc 31000 "$c"; done
+    stop_server 31000
+    for c in 1 16 32; do serve_logs serve_bf16_colocated_31000.log "seedtts_c$c" "$arm"; done
+  fi
+  if wants mmsu; then
+    gpus_idle || return 1
+    GPU=$GPU_ONE serve_bf16_thinker 31001 || return 1
+    bench mmsu_c16 "$arm" mmsu 31001 16
+    stop_server 31001
+    serve_logs serve_bf16_thinker_31001.log mmsu_c16 "$arm"
+  fi
+  if wants videomme; then
+    gpus_idle || return 1
+    GPU=$GPU serve_bf16_disagg 31002 || return 1
+    bench videomme_talker_c16 "$arm" videomme-talker 31002 16
+    stop_server 31002
+    serve_logs serve_bf16_disagg_31002.log videomme_talker_c16 "$arm"
+  fi
 }
 
 run_score() {
