@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
-# The slim A/B: three workloads on manually started servers, no router, no
-# pytest. Per arm: the voice clone bench at c1, c16 and c32 on the bf16
-# colocated profile (one GPU), MMSU at c16 on the bf16 thinker profile (one
-# GPU), Video-MME with the talker at c16 on the bf16 disagg topology (two
-# GPUs). Then `score` runs the CI's WER and UTMOS scorers on the voice
-# clone outputs against a Qwen3-ASR server. Results land in
-# $OUT/<stage>/<arm>/ so full_ab_compare.py reads them.
+# The slim A/B: three workloads on a manually started server, no router, no
+# pytest. Per arm, one fp8 colocated boot on one GPU (the H100 serving
+# profile, examples/configs/qwen3_omni_colocated_h100_fp8.yaml) takes the
+# voice clone bench at c1, c16 and c32, MMSU at c16 and Video-MME with the
+# talker at c16, in that order, so the finished output window carries
+# across workloads as it does on a production server. Then `score` runs
+# the CI's WER and UTMOS scorers on the voice clone outputs against a
+# Qwen3-ASR server. Results land in $OUT/<stage>/<arm>/ so
+# full_ab_compare.py reads them.
+#
+# PROFILE=bf16 runs the CI's bf16 topologies instead: bf16 colocated for
+# the voice clone, bf16 thinker only for MMSU, bf16 disagg (two GPUs) for
+# Video-MME, three boots per arm.
 #
 # Required: OMNI_ROOT (clean tree, installed editable), OUT (outside the
-# tree), GPU (two GPUs, default 0,1). Optional: A_SHA, B_SHA.
+# tree), GPU (default 0, two GPUs for PROFILE=bf16). Optional: A_SHA, B_SHA.
 # Run from a copy outside the tree:
 #   cp -r "$OMNI_ROOT/tasks/qwen3_omni_0518_numerics/scripts" "$OUT/scripts"
-#   OMNI_ROOT=... OUT=... GPU=0,1 bash "$OUT/scripts/slim_ab.sh"
-#   OMNI_ROOT=... OUT=... GPU=0   bash "$OUT/scripts/slim_ab.sh" score
+#   OMNI_ROOT=... OUT=... GPU=0 bash "$OUT/scripts/slim_ab.sh"
+#   OMNI_ROOT=... OUT=... GPU=0 bash "$OUT/scripts/slim_ab.sh" score
 #   python "$OUT/scripts/full_ab_compare.py" "$OUT" --md "$OUT/readout.md"
 set -uo pipefail
 
 : "${OMNI_ROOT:?set OMNI_ROOT}"
 : "${OUT:?set OUT}"
-GPU="${GPU:-0,1}"
+GPU="${GPU:-0}"
+PROFILE="${PROFILE:-fp8}"
 A_SHA="${A_SHA:-68c88dae6}"
 B_SHA="${B_SHA:-9769867a0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -66,9 +73,22 @@ serve_logs() {
 }
 
 run_arm() {
-  local arm=$1
+  local arm=$1 s
   checkout_arm "$arm" > /dev/null || return 1
-  log "arm $arm at $(git -C "$OMNI_ROOT" rev-parse --short HEAD)"
+  log "arm $arm at $(git -C "$OMNI_ROOT" rev-parse --short HEAD) profile $PROFILE"
+
+  if [ "$PROFILE" = fp8 ]; then
+    gpus_idle || return 1
+    GPU=$GPU_ONE serve_fp8_colocated 31000 || return 1
+    for c in 1 16 32; do bench "seedtts_c$c" "$arm" seedtts-vc 31000 "$c"; done
+    bench mmsu_c16 "$arm" mmsu 31000 16
+    bench videomme_talker_c16 "$arm" videomme-talker 31000 16
+    stop_server 31000
+    for s in seedtts_c1 seedtts_c16 seedtts_c32 mmsu_c16 videomme_talker_c16; do
+      serve_logs serve_fp8_31000.log "$s" "$arm"
+    done
+    return
+  fi
 
   gpus_idle || return 1
   GPU=$GPU_ONE serve_bf16_colocated 31000 || return 1
