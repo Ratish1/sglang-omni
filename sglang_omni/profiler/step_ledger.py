@@ -4,11 +4,19 @@
 While a request profile run is active, the scheduler records one row per
 batch it runs: the launch to launch cycle, the host wall of the launch call
 and of the lookahead resolve, the time the host blocked on a device event,
-the device span from the start of the forward to the published tokens, the
-batch shape, whether a CUDA graph replayed, the idle sleeps taken before the
-step, and the caching allocator's allocation count over the cycle. Together
-these say whether a stage is host bound or device bound, and by how much,
-without a kernel trace.
+the device span from the input resolve to the published tokens and the
+device span of the model forward inside it, the batch shape with its new
+and cached prefix tokens, whether a CUDA graph replayed, the idle sleeps
+taken before the next launch, and the caching allocator's allocation count
+over the cycle. Together these say whether a stage is host bound or device
+bound, and by how much, without a kernel trace.
+
+Attribution. Everything measured inside a step (host, resolve, wait, the
+spans, graph, rows, tokens) belongs to that step. Everything measured over
+the interval from one launch to the next (cycle, idle sleeps, allocations)
+belongs to the step whose launch opened the interval, so cycle minus span
+is that step's own device idle and a prefill's cycle is the prefill's, not
+the decode step before it. The last step of a run has no interval.
 
 Recording follows the request event recorder: a stage joins the run at its
 next batch after the recorder becomes active and writes the run when it
@@ -53,17 +61,22 @@ class _Step:
     mode: str
     rows: int
     extend_tokens: int
+    cached_tokens: int
     t_launch: float
-    cycle: float | None
-    idle_sleeps: int
+    # Interval fields, filled when the next launch opens.
+    cycle: float | None = None
+    idle_sleeps: int = 0
+    allocations: int | None = None
     host: float | None = None
     resolve: float | None = None
     wait: float = 0.0
     graph: bool = False
     gpu_span_ms: float | None = None
-    allocations: int | None = None
+    forward_ms: float | None = None
     gpu_start: Any = None
     gpu_end: Any = None
+    fwd_start: Any = None
+    fwd_end: Any = None
     closed: bool = False
 
 
@@ -212,22 +225,29 @@ class StepLedger:
             if self._current is not None and not self._current.closed:
                 self._discard_unlocked(self._current)
             now = self._clock()
-            cycle = None if self._last_launch_t is None else now - self._last_launch_t
+            previous = self._last_step
+            if previous is not None and self._last_launch_t is not None:
+                # The interval this launch closes belongs to the step that
+                # opened it: its cycle, and the idle sleeps taken after it.
+                previous.cycle = now - self._last_launch_t
+                previous.idle_sleeps = self._idle_sleeps
             self._last_launch_t = now
+            self._idle_sleeps = 0
             self._note_allocations_unlocked()
             mode = _batch_mode(batch)
-            tokens = int(batch.extend_num_tokens or 0) if mode == "extend" else 0
+            tokens = cached = 0
+            if mode == "extend":
+                tokens = int(batch.extend_num_tokens or 0)
+                cached = int(sum(getattr(batch, "prefix_lens", None) or ()))
             step = _Step(
                 step_id=self._next_id,
                 mode=mode,
                 rows=len(batch.reqs),
                 extend_tokens=tokens,
+                cached_tokens=cached,
                 t_launch=now,
-                cycle=cycle,
-                idle_sleeps=self._idle_sleeps,
             )
             self._next_id += 1
-            self._idle_sleeps = 0
             self._current = step
             self._last_step = step
             self._open[step.step_id] = step
@@ -284,6 +304,32 @@ class StepLedger:
         event = self._device_module.Event(enable_timing=True)
         event.record()
         step.gpu_start = event
+
+    @_guarded
+    def mark_forward_start(self) -> None:
+        """Record the timing event right before the model forward is launched.
+
+        With the end mark this brackets the forward alone, which for a CUDA
+        graph replay is the graph's device time with no host starvation in
+        it. Hooks before the forward and sampling after it stay in the wider
+        span only.
+        """
+        step = self._current
+        if step is None or step.gpu_start is None:
+            return
+        event = self._device_module.Event(enable_timing=True)
+        event.record()
+        step.fwd_start = event
+
+    @_guarded
+    def mark_forward_end(self) -> None:
+        """Record the timing event right after the model forward returned."""
+        step = self._current
+        if step is None or step.fwd_start is None:
+            return
+        event = self._device_module.Event(enable_timing=True)
+        event.record()
+        step.fwd_end = event
 
     @_guarded
     def mark_gpu_end(self) -> None:
@@ -405,8 +451,17 @@ class StepLedger:
                 step.gpu_span_ms = float(step.gpu_start.elapsed_time(end))
             except Exception:
                 step.gpu_span_ms = None
+            # The forward events sit between the span events on the same
+            # stream, so a complete end event means they are complete too.
+            if step.fwd_start is not None and step.fwd_end is not None:
+                try:
+                    step.forward_ms = float(step.fwd_start.elapsed_time(step.fwd_end))
+                except Exception:
+                    step.forward_ms = None
             step.gpu_start = None
             step.gpu_end = None
+            step.fwd_start = None
+            step.fwd_end = None
 
     def _note_allocations_unlocked(self) -> None:
         """Sample the allocation counter at launch and charge the delta since
@@ -472,6 +527,9 @@ class StepLedger:
                 ),
                 "wait_ms": _percentiles([s.wait * 1e3 for s in steps]),
                 "gpu_span_ms": _percentiles(spans),
+                "forward_ms": _percentiles(
+                    [s.forward_ms for s in steps if s.forward_ms is not None]
+                ),
                 "gpu_idle_floor_ms": _percentiles(idle_floor),
                 "graph_share": round(sum(1 for s in steps if s.graph) / len(steps), 4),
                 "idle_sleeps_per_step": round(
@@ -486,6 +544,9 @@ class StepLedger:
             if mode == "extend":
                 row["extend_tokens"] = _percentiles(
                     [float(s.extend_tokens) for s in steps]
+                )
+                row["cached_tokens"] = _percentiles(
+                    [float(s.cached_tokens) for s in steps]
                 )
             shapes.append(row)
         return {
@@ -525,13 +586,17 @@ def _format_lines(stage: str, summary: dict[str, Any]) -> list[str]:
     for row in summary["shapes"]:
         extra = ""
         if row["mode"] == "extend":
-            extra = f" tokens p50 {_fmt(row['extend_tokens'])}"
+            extra = (
+                f" tokens p50 {_fmt(row['extend_tokens'])}"
+                f" cached p50 {_fmt(row['cached_tokens'])}"
+            )
         allocations = row["allocations_per_step"]
         lines.append(
             f"step_ledger stage={stage} {row['mode']} rows={row['rows']} steps={row['steps']}"
             f" cycle p50/p90 {_fmt(row['cycle_ms'])}/{_fmt(row['cycle_ms'], 'p90')} ms"
             f" host {_fmt(row['host_ms'])} resolve {_fmt(row['resolve_ms'])}"
             f" wait {_fmt(row['wait_ms'])} gpu_span {_fmt(row['gpu_span_ms'])}"
+            f" forward {_fmt(row['forward_ms'])}"
             f" idle_floor {_fmt(row['gpu_idle_floor_ms'])}"
             f" graph {row['graph_share'] * 100:.0f}%"
             f" sleeps/step {row['idle_sleeps_per_step']:.2f}"
