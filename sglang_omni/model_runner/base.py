@@ -7,6 +7,7 @@ pass, sampling, logit post-processing, and output extraction.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -96,6 +97,10 @@ class ModelRunner:
       - decode hooks for single-step autoregressive decode processing
     """
 
+    # note(ratish): set by OmniScheduler.bind_model_runner. The runner marks
+    # the forward and the event waits on it; None means no accounting.
+    step_ledger: Any = None
+
     def __init__(self, tp_worker: Any, output_processor: Any):
         self.tp_worker = tp_worker
         self.output_processor = output_processor
@@ -182,7 +187,11 @@ class ModelRunner:
     def _resolve_host_token_ids(self, result: Any) -> Any:
         event = getattr(result, "_host_token_ids_event", None)
         if event is not None:
+            ledger = self.step_ledger
+            waited_from = time.perf_counter() if ledger is not None else 0.0
             event.synchronize()
+            if ledger is not None:
+                ledger.add_wait(time.perf_counter() - waited_from)
             result._host_token_ids_event = None
         return getattr(result, "_host_token_ids", None)
 
@@ -244,6 +253,9 @@ class ModelRunner:
             if built is None:
                 return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
             forward_batch, schedule_batch, is_prefill = built
+            ledger = self.step_ledger
+            if ledger is not None:
+                ledger.mark_gpu_start()
             batch_result = self._prepare_and_forward(
                 forward_batch, schedule_batch, scheduler_output.requests, is_prefill
             )
@@ -273,6 +285,8 @@ class ModelRunner:
                 schedule_batch,
                 scheduler_output.requests,
             )
+            if ledger is not None:
+                ledger.mark_gpu_end()
         return self._finalize(
             batch_result,
             forward_batch,
@@ -305,6 +319,9 @@ class ModelRunner:
                 return None
             forward_batch, schedule_batch, is_prefill = built
             assert not is_prefill, "async lookahead launch is decode-only"
+            ledger = self.step_ledger
+            if ledger is not None:
+                ledger.mark_gpu_start()
             batch_result = self._prepare_and_forward(
                 forward_batch,
                 schedule_batch,
@@ -327,6 +344,8 @@ class ModelRunner:
                 schedule_batch,
                 scheduler_output.requests,
             )
+            if ledger is not None:
+                ledger.mark_gpu_end()
             event = self._execution_bridge.record_completion()
             # Never retain the mutable live ScheduleBatch across a lookahead
             # iteration. The upstream overlap loop likewise queues batch.copy().
@@ -358,7 +377,11 @@ class ModelRunner:
         if pending.event.query():
             self._async_query_hit += 1
         else:
+            ledger = self.step_ledger
+            waited_from = time.perf_counter() if ledger is not None else 0.0
             pending.event.synchronize()
+            if ledger is not None:
+                ledger.add_wait(time.perf_counter() - waited_from)
             self._async_query_miss += 1
         # Skip reqs finished or retracted in a prior (lagged) step so _finalize
         # neither re-emits nor re-frees their KV (mirrors _resolve_and_process).

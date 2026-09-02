@@ -209,6 +209,42 @@ With all four off (the default), a typical 10-sample MMMU run produces a
 trace in the tens of MB. With all four on, the same workload can produce a
 multi-GB trace — only opt in when you need that specific information.
 
+## Step ledger
+
+Every OmniScheduler stage keeps a per step ledger that records while the
+request event recorder is active, so `/start_request_profile` and
+`/start_profile` are its only switch. One row per batch the scheduler runs:
+
+| field | meaning |
+|---|---|
+| `cycle_ms` | launch to launch interval, the step period the loop achieves |
+| `host_ms` | wall of the launch call: forward batch build, hooks, forward, sampling, publish, stream emission |
+| `resolve_ms` | wall of the lookahead resolve of that step, absent on the synchronous path |
+| `wait_ms` | host time blocked on a device event inside the step: the staged token event on the synchronous path, the completion event at resolve |
+| `gpu_span_ms` | device time from the start of the forward to the published tokens, from a timing event pair |
+| `gpu_idle_floor_ms` | `cycle_ms` minus `gpu_span_ms`, a lower bound on device idle per step |
+| `graph_share` | share of steps that replayed a CUDA graph |
+| `idle_sleeps_per_step` | idle loop sleeps taken before the step |
+| `allocations_per_step` | caching allocator allocation count delta across the step, CUDA only |
+| `extend_tokens` | extend rows only, tokens per prefill batch |
+
+Rows are aggregated per `(mode, rows)` with p50, p90 and max. `wait_ms`
+near zero with `host_ms` near `cycle_ms` is a host bound stage. A large
+`wait_ms` is a device bound stage. `gpu_idle_floor_ms` says how much of
+each cycle the device was idle at least, and `graph_share` below one at a
+steady batch size means the stage runs eager steps.
+
+The ledger never synchronizes the device: device spans are read only after
+their end event reports complete, and spans still in flight when a run
+ends are counted in `unread_gpu_spans`. Its cost is two timing events and
+a few clock reads per step, plus one allocator statistics read per step on
+CUDA.
+
+On `/stop_profile` or `/stop_request_profile` each stage writes
+`<event_dir>/step_ledger_<stage>_<pid>.json` and logs one line per batch
+shape. The live aggregate is also returned under `step_ledger` in each
+stage's `/model_info` data.
+
 ## HTTP surface
 
 | Method | Path | Body | Notes |

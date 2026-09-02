@@ -49,6 +49,7 @@ from sglang_omni.profiler.event_recorder import (
     emit_model_path_start as _emit_model_path_start,
 )
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
+from sglang_omni.profiler.step_ledger import StepLedger
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
@@ -323,6 +324,10 @@ class OmniScheduler:
         self.max_req_input_len = self.max_req_len - 1
         self.random_seed = tp_worker.random_seed
         self.device = tp_worker.device
+        # note(ratish): per step host and device accounting, recording only
+        # while a request profile run is active. Handed to the runner in
+        # bind_model_runner so it can mark the forward and the event waits.
+        self.step_ledger = StepLedger(self.device)
         # Hybrid-SWA per-layer capacities: upstream sources these from its
         # kv_cache_builder; no Omni model serves hybrid-SWA, so they stay None.
         self.full_tokens_per_layer = None
@@ -524,6 +529,7 @@ class OmniScheduler:
             spec_algorithm=self.spec_algorithm,
         )
         model_runner._async_enabled = self.enable_async_decode
+        model_runner.step_ledger = self.step_ledger
         model_runner.bind_execution_bridge(bridge)
         # Keep the upstream attribute available to delegated scheduler methods,
         # but make the custom ModelRunner the sole owner of relay.
@@ -940,6 +946,7 @@ class OmniScheduler:
             request_admission_pending = bool(
                 self._pending_request_builds or self._pending_request_admissions
             )
+        self.step_ledger.note_idle_sleep()
         time.sleep(0.0001 if request_admission_pending else 0.001)
 
     def _queued_admission_count(self) -> int:
@@ -1390,6 +1397,7 @@ class OmniScheduler:
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
+        self.step_ledger.begin(batch)
 
     def _run_batch(self, batch, pp_proxy_tensors=None):
         """Run a batch through the model runner.
@@ -1407,6 +1415,9 @@ class OmniScheduler:
         mr_output = self._model_runner.execute(sched_output)
         self._emit_prefill_end_for_batch(batch)
         self._emit_stream_output(sched_output, mr_output)
+        self.step_ledger.end_launch(
+            can_run_cuda_graph=mr_output.can_run_cuda_graph, lookahead=False
+        )
         return self._make_batch_result(mr_output)
 
     def _build_sched_output(self, batch):
@@ -1418,7 +1429,11 @@ class OmniScheduler:
             SchedulerRequest(request_id=req.rid, data=req._omni_data)
             for req in batch.reqs
         ]
-        return SchedulerOutput(requests=sched_reqs, batch_data=batch)
+        return SchedulerOutput(
+            requests=sched_reqs,
+            batch_data=batch,
+            step_id=self.step_ledger.current_id,
+        )
 
     def _emit_stream_output(self, sched_output, mr_output, skip_rids=()) -> None:
         """Emit per-request stream chunks from a ModelRunnerOutput. Shared by
@@ -1489,6 +1504,13 @@ class OmniScheduler:
         self._stamp_batch_launch(batch)
         sched_output = self._build_sched_output(batch)
         pending_step = self._model_runner.execute_launch(sched_output)
+        self.step_ledger.end_launch(
+            can_run_cuda_graph=(
+                pending_step is not None
+                and bool(pending_step.batch_result.can_run_cuda_graph)
+            ),
+            lookahead=pending_step is not None,
+        )
         return sched_output, pending_step
 
     def _run_batch_resolve(self, batch, sched_output, pending_step, skip_rids=()):
@@ -1502,10 +1524,15 @@ class OmniScheduler:
         """
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
-        mr_output = self._model_runner.execute_resolve(pending_step)
-        if mr_output is None:
-            return _FAILED_BATCH_RESULT
-        self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
+        ledger = self.step_ledger
+        ledger.begin_resolve(sched_output.step_id)
+        try:
+            mr_output = self._model_runner.execute_resolve(pending_step)
+            if mr_output is None:
+                return _FAILED_BATCH_RESULT
+            self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
+        finally:
+            ledger.end_resolve()
         return GenerationBatchResult(
             logits_output=None,
             next_token_ids=mr_output.next_token_ids,
@@ -1736,6 +1763,7 @@ class OmniScheduler:
                 self._event_loop_normal()
             model_path_status = "aborted"
         finally:
+            self.step_ledger.finish()
             self._emit_remaining_model_path_ends(status=model_path_status)
             self._scheduler_thread_id = None
             try:
@@ -1934,6 +1962,7 @@ class OmniScheduler:
                 "model_path": get_model().model_path,
                 "load_format": get_model().load_format,
                 "weight_version": get_serving().weight_version,
+                "step_ledger": self.step_ledger.summary(),
             }
         )
         return {"success": True, "message": "ok", "data": info}
