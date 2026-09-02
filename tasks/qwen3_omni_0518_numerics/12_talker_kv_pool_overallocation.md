@@ -87,3 +87,23 @@ writes, only the unused 28 layers of cells disappear.
 The 0.5.16 pin sizes the pool with the same max (its
 layer_setup.py:167-168), so the gap is as old as the override itself
 (model_worker.py, from the V0 retirement of 2026-05-14), not a pin bump.
+
+## 5. What kind of change it is, and the order
+
+It is a correctness fix of the memory accounting: the pool is sized for
+layers the model does not have. It changes no computation and no output,
+the 20 layers the model writes keep the same cells and the same bytes.
+Its performance effect is capacity: 2.4 times the talker tokens for the
+same bytes, or the same tokens for 42 percent of the bytes, which only
+shows where the pool binds (bf16 H100) or where the freed bytes are
+handed to a stage that binds (the thinker on fp8 H100 video prompts,
+through a yaml change with its own measurement).
+
+It lands before the reservation change, on its own branch, because it
+moves the reservation's baseline: on bf16 H100 sglang's guess binds at
+about 14 rows once the pool holds 48k tokens, so the reservation's gain
+at c16 shrinks to the two rows the guess still holds back and at c32 it
+stays. The bf16 slim A/B has to be rerun with the pool fix in both arms
+to read the reservation's remaining value on the CI profile. A combined
+PR would hide that, and the two changes have different proofs: a boot
+line and bit identical codes for the pool, an A/B for the reservation.
