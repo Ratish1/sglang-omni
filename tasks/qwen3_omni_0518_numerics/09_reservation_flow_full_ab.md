@@ -132,8 +132,8 @@ min(cap, 4096), at ratio 1.0. sglang's start is 0.7 of that, its floor is
 
 | stage | rows | clipped cap | B at 1.0, tokens | A at 0.7 | A floor | fraction seen | pool read |
 |---|---|---|---|---|---|---|---|
-| qwen3_omni talker_ar (0.10 fraction) | 32 | 4096 | 131072 | 91750 | 12845 | tens of frames of 4096 | 21373 |
-| qwen3_omni thinker | 64 | 2048 default, 256 or 32 in the video and mmsu benches | 131072 | 91750 | 12845 | not recorded | about 120000 (fp8 colocated) |
+| qwen3_omni talker_ar | 32 | 4096 | 131072 | 91750 | 12845 | tens of frames of 4096 | 21373 (bf16 colocated, 0.10), 120769 (fp8 colocated, 0.12, fp8 talker weights) |
+| qwen3_omni thinker | 64 | 2048 default, 256 or 32 in the video and mmsu benches | 131072 | 91750 | 12845 | not recorded | 109029 (fp8 colocated, 0.50) |
 | minimax_music3 ar | 32 | 4096 | 131072 | 91750 | 12845 | 0.36 to 0.39 | 118366 and 166892 |
 | moss_tts, moss_tts_local, voxtral_tts | 16 | 4096 | 65536 | 45875 | 6423 | not measured | not read |
 | moss_transcribe_diarize | 16 | 4096 | 65536 | 45875 | 6423 | 1.0 on long audio by construction, see 5.3 | not read (0.80 fraction) |
@@ -338,3 +338,78 @@ bands are bf16 boots and do not carry over, and the fp8 video run of doc
 only fp8 band on file. The pass criteria are therefore A against B on
 this profile, with the doc 08 bands as a sanity check on the bf16 run
 only.
+
+## 6. The slim run on fp8 (2026-09-02, bundle ab-slim.tar.gz)
+
+A 68c88dae6 against B 9769867a0 on the fp8 colocated profile, one boot per
+arm on one H100, the five runs of section 5.4 in order, WER and UTMOS
+scored afterwards. No retraction line in either arm, no failed request,
+50 of 50 and 2000 of 2000 and 20 of 20 completed everywhere.
+
+| run | metric | A | B |
+|---|---|---|---|
+| seedtts c1 | qps, latency p95 s, WER, UTMOS | 1.530, 1.001, 0.0142, 4.445 | 1.519, 1.064, 0.0160, 4.471 |
+| seedtts c16 | qps, latency p95 s, WER, UTMOS | 8.976, 2.439, 0.0089, 4.462 | 8.272, 2.869, 0.0106, 4.471 |
+| seedtts c32 | qps, latency p95 s, WER, UTMOS | 11.535, 3.059, 0.0177, 4.441 | 11.455, 3.154, 0.0089, 4.463 |
+| mmsu c16 | accuracy, qps, latency p99 s | 0.7125, 60.8, 2.109 | 0.7105, 76.8, 0.464 |
+| videomme talker c16 | accuracy, qps, latency p95 s | 11/20, 0.773, 21.7 | 11/20, 0.776, 23.1 |
+
+### 6.1 Why the talker gain of doc 08 does not appear here
+
+The pools differ from the bf16 profile by the talker's weight format. On
+this boot the talker loads as fp8 (Load weight end, type Qwen3OmniTalker,
+quant fp8, mem usage 3.32 GB) and its 0.12 fraction leaves a pool of
+120769 tokens (K 2.76 GB, V 2.76 GB). On the bf16 profile the talker's
+0.10 fraction held bf16 weights and left 21373 tokens (doc 08 section 2).
+The thinker at 0.50 has 109029 tokens.
+
+sglang's start reservation at 32 rows is 32 times 2867 plus the prompts,
+about 96k tokens, and the candidate check needs another 4.2k, so all 32
+rows fit the 120769 token pool at once. The log agrees: in the c32
+window A reaches 29 running rows and B 32 with at most 4 and 3 queued on
+two lines each, in the c16 window both arms admit every request in the
+first prefill pass (A 15, B 16 running, nothing queued). With the pool
+never binding there is no mechanism by which the two arms can differ, and
+section 2's rule applies: the row limit binds, not the reservation. On
+this profile the start reservation would first bind above about 38 rows,
+past the talker's max_running_requests of 32.
+
+The c16 difference (8.98 against 8.27 qps) is 0.47 s of wall time on a 50
+request run that lasts 6 s, carried by five requests above 2.5 s in B
+against three in A. Both arms ran the same admission in that window, so
+it is boot and sampling variance, and c32 on the same boots agrees to
+0.7 percent. A three repeat run at c16 would put a band on it. Task, only
+if a number at c16 on this profile is ever needed.
+
+### 6.2 The other two runs
+
+MMSU: accuracy 1425 against 1421 of 2000, four answers out of 2000 under
+unseeded sampling. A's lower qps and its 2.1 s p99 come from two windows
+of 4.0 s and 2.0 s at the start of its run in which neither scheduler
+logged a prefill or a decode and nothing was queued, so the stall sits
+before the schedulers (client, preprocessing or the audio encoder), in
+code both arms share. B's run has no gap above one second. The thinker's
+reservation on this workload is at most 22 tokens per row (cap 32), so
+the change cannot reach it.
+
+Video-MME with the talker: identical answers (11 of 20, the same
+mc_fallback), qps equal. The thinker pool is what binds here in both
+arms: 7 running rows at token usage 0.83 to 0.84, because each prompt is
+14210 tokens against a 109029 token pool. The reservation of 256 tokens
+per row is noise next to the prompts.
+
+### 6.3 What this says about the change
+
+The code is doing what it does on bf16: it sets the ratio from finished
+outputs and both arms admit everything the pool allows. What differs is
+the pool. The gain exists where rows times 0.7 times min(cap, 4096) plus
+the prompts exceed the stage's pool: the bf16 colocated profile of the
+CI's TTS stage (21373 tokens, plus 25 percent qps at c16 and plus 43
+percent at c32 in doc 08), and any profile with a talker pool under about
+115k tokens at 32 rows. On the fp8 colocated H100 profile the talker pool
+is 120769 tokens and the change is neutral at the default row limit,
+which is what this run shows: no gain and no regression. Profiles not
+read yet, with the pool line as the one thing to read before expecting
+anything: the MPS DP yamls at fractions 0.20 to 0.37, the H20 and H200
+colocated yamls (talker 0.12 and 0.123 with bf16 weights), and fp8 with
+max_running_requests raised above 38.
