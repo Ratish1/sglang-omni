@@ -56,7 +56,7 @@ start=$(date +%s.%N)
 for i in 0 1 2 3 4; do
   request "${NAMES[$i]}" "${SEEDS[$i]}" "${LYRICS[$i]}" "${CAPTIONS[$i]}" "$OUT/sequential"
 done
-echo "sequential wall $(echo "$(date +%s.%N) - $start" | bc)" >> "$OUT/timing.txt"
+echo "sequential wall $(python3 -c "import sys; print(round(float(sys.argv[1]) - float(sys.argv[2]), 3))" "$(date +%s.%N)" "$start")" >> "$OUT/timing.txt"
 (cd "$OUT/sequential" && sha256sum *.wav) > "$OUT/sequential.sha256"
 
 echo "pass 2, the same five at once" >> "$OUT/timing.txt"
@@ -65,6 +65,6 @@ for i in 0 1 2 3 4; do
   request "${NAMES[$i]}" "${SEEDS[$i]}" "${LYRICS[$i]}" "${CAPTIONS[$i]}" "$OUT/parallel" &
 done
 wait
-echo "parallel wall $(echo "$(date +%s.%N) - $start" | bc)" >> "$OUT/timing.txt"
+echo "parallel wall $(python3 -c "import sys; print(round(float(sys.argv[1]) - float(sys.argv[2]), 3))" "$(date +%s.%N)" "$start")" >> "$OUT/timing.txt"
 (cd "$OUT/parallel" && sha256sum *.wav) > "$OUT/parallel.sha256"
 cat "$OUT/timing.txt"
