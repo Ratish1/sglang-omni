@@ -246,12 +246,19 @@ Defects:
 1. Rebase perf/step-ledger onto 15c4568bb, run doc 15 (fresh server per
    point) on a quiet box with MiniMax, and re read sections 5.1 and 5.3 of
    doc 17 against #1641, #1665 and #1666.
-2. T20, the Qwen3-TTS predictor graph: capture the bucket ladder for the
-   default signature at startup, and take the per request top k out of
-   the key (a device side mask, as the per row top p already is) so the
-   key count is bounded by buckets times three. No open work covers it,
-   it is the largest single stall measured, and #1855's codec capture has
-   the publish and rollback pattern to reuse.
+2. T20, the Qwen3-TTS predictor graph: capture the bucket ladder at
+   startup for the two signatures every default request lands on (greedy
+   subtalker, and the checkpoint's sampled subtalker at its default top k
+   and top p), exempt those keys from the serving time capture cap, and
+   keep the lazy path for other signatures. Built on
+   perf/qwen3-tts-predictor-warmup from upstream main: a shared
+   `_predictor_sampling_branches` helper used by the decode path and by
+   `predictor_graph_signature_for_sampling`, `warmup_predictor_graphs` on
+   the model, and the Qwen3-TTS builder's `setup_model_resources`, which
+   runs after sglang's own graph capture and before readiness. Verdict:
+   the accelerator tests in `test_predictor_cuda_graph.py` on the box,
+   then a c16 window whose extend rows show no capture stall and whose
+   server log shows the captures at startup, then the CI stage set.
 3. T15 on top of #1910: the reservation against the observed output,
    with `schedule_conservativeness` as the control arm.
 4. T21, the code2wav final window: drop the `is_final` eager gate, add
