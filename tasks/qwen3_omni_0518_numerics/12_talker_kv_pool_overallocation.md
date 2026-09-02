@@ -107,3 +107,30 @@ stays. The bf16 slim A/B has to be rerun with the pool fix in both arms
 to read the reservation's remaining value on the CI profile. A combined
 PR would hide that, and the two changes have different proofs: a boot
 line and bit identical codes for the pool, an A/B for the reservation.
+
+## 6. What the fix does to the reservation branch
+
+The code on perf/observed-kv-reservation is unaffected, the two changes
+touch different seams and compose. What changes is the reservation's
+case. With the talker pool at 2.4 times the tokens, the row count at
+which sglang's start reservation binds moves with it (doc 09 section 6.4
+recomputed, same inputs):
+
+| profile | talker pool after the fix | rows where the guess starts binding | at the default 32 rows |
+|---|---|---|---|
+| H100 bf16 colocated (CI TTS stage) | about 48k | about 14 | binds at c16 by two rows, at c32 by 18 |
+| H100 fp8 colocated | about 290k | about 95 | nothing |
+| H200 bf16 colocated | about 540k derived | about 175 | nothing |
+| H20 bf16 colocated | about 230k derived | about 75 | nothing |
+
+So after the fix the reservation change acts on the CI TTS profile at
+c32, barely at c16, and otherwise only on pools under about 100k tokens
+at 32 rows (the MPS DP fractions, unread) or a raised row limit. The doc
+08 numbers (+25 percent at c16, +43 percent at c32) were measured on the
+oversized pool and no longer describe that profile. Before the
+reservation PR opens its A/B has to be rerun on bf16 with the pool fix in
+both arms: rebase perf/observed-kv-reservation onto
+fix/arch-override-attention-layers, A at the fix commit, B at the rebased
+head, the voice clone bench at c1, c16 and c32 with WER and UTMOS. The
+fp8 and MiniMax runs stand as the neutral cases, nothing binds there
+with or without the fix.
