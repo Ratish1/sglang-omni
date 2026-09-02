@@ -43,7 +43,7 @@ max(model_config.num_hidden_layers, model_config.num_attention_layers)
 unless the model object carries start_layer and end_layer, and the top
 level Qwen3OmniTalker does not (only its inner text model does). So the
 pool gets max(20, 48) = 48 layers, with the overridden head count of 2.
-The same max is in the 0.5.17 pin (layer_setup.py:172).
+The same max is in the 0.5.17 pin (layer_setup.py:172) and the 0.5.16 pin (:167-168).
 
 The code predictor is not involved: its five layers keep their own K and
 V tensors (components/talker.py:904-913, 1706-1707), outside the pool.
@@ -84,5 +84,6 @@ request on fp8 to show the thinker unaffected. The codes cannot change:
 the pool holds the same bytes per token for the 20 layers the model
 writes, only the unused 28 layers of cells disappear.
 
-Task: git history of the sglang pin bump (0.5.16 to 0.5.17) against the
-override, to date since when the pool has been oversized.
+The 0.5.16 pin sizes the pool with the same max (its
+layer_setup.py:167-168), so the gap is as old as the override itself
+(model_worker.py, from the V0 retirement of 2026-05-14), not a pin bump.
