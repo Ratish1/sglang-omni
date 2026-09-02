@@ -413,3 +413,42 @@ read yet, with the pool line as the one thing to read before expecting
 anything: the MPS DP yamls at fractions 0.20 to 0.37, the H20 and H200
 colocated yamls (talker 0.12 and 0.123 with bf16 weights), and fp8 with
 max_running_requests raised above 38.
+
+### 6.4 Where the talker reservation can bind, by profile
+
+Inputs read from boot logs: the talker's KV is 45.7 KB per token in both
+runs (bf16 run: 0.92 GB for 20136 tokens, fp8 run: 5.52 GB for 120769),
+its bf16 weights take 6.35 GB and its fp8 weights 3.32 GB (Load weight
+end lines), and the fraction minus weights minus pool leaves 0.70 GB on
+both boots (the runner's reserve). sglang's start reservation at 32 rows
+is 32 times (2867 plus a 170 token prompt and output) plus the 4.2k the
+candidate check needs, about 101k tokens. The doc 08 bf16 run also shows
+the thinker on that profile at 5248 tokens (0.73 fraction over 56.9 GB
+of bf16 weights), so that profile is starved on both stages.
+
+| profile | card | talker fraction and weights | pool, tokens | rows at which the start reservation binds | at 32 rows |
+|---|---|---|---|---|---|
+| H100 bf16 colocated (CI TTS stage) | 79.65 GB | 0.10, bf16 | 20136 read | 6 | binds hard, the doc 08 gain |
+| H100 fp8 colocated | 79.65 GB | 0.12, fp8 | 120769 read | 38 | nothing, this run |
+| H200 bf16 colocated (qwen3_omni_colocated_h200.yaml) | 141 GB card | 0.123, bf16 | about 223k derived | about 72 | nothing |
+| H20 bf16 colocated | 96 GB card | 0.12, bf16 | about 95k derived | about 30 | two rows wait, marginal |
+
+The derived rows assume sglang reports the whole card as total and the
+same 0.70 GB reserve. Task before quoting either: read the pool line from
+one boot on that card.
+
+So the change is a correction to the admission estimate that pays only
+where a stage's pool is small next to rows times 0.7 times the clipped
+cap: the bf16 H100 colocated profile, where 57 GB of bf16 weights leave
+sub gigabyte pools and the card is 0.96 allocated so no fraction can
+grow, the MPS DP profiles at fractions 0.20 to 0.37 (pools not read), H20
+at the row limit, and any profile with max_running_requests raised past
+the row count in the table. On fp8 H100 and on H200 at the default 32
+rows it changes nothing, and that is what section 6 measured.
+
+One more bound on the gain even where it binds: sglang's own decay
+reaches its floor after 600 decode steps without an idle iteration, and
+the idle reset returns it to 0.7. Under continuous saturated traffic the
+two arms therefore converge after about 600 steps (roughly 15 s of talker
+decode), and the gain lives in the first 600 steps after every idle gap,
+which is what bursty TTS traffic and a 50 request benchmark both are.
