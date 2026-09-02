@@ -51,6 +51,15 @@ ALL_STAGES=(
   "videoamme_talker_tp2 tests/test_model/test_qwen3_omni_videoamme_talker_tp2_ci.py"
 )
 
+# Other models whose stages run the same scheduler, only when named in
+# STAGES (STAGES="moss_td qwen3_asr qwen3_tts"). One GPU each, the fixtures
+# pick device 0 of the visible set.
+EXTRA_STAGES=(
+  "moss_td tests/test_model/test_asr_ci_multi_speaker.py"
+  "qwen3_asr tests/test_model/test_asr_ci_seedtts.py --asr-ci-model qwen3"
+  "qwen3_tts tests/test_model/test_tts_ci.py --tts-ci-model qwen3-tts"
+)
+
 # Workflow level env of the CI (test-qwen3-omni-ci.yaml).
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export NCCL_NVLS_ENABLE=0
@@ -116,7 +125,8 @@ checkout_arm() {
 }
 
 run_stage_arm() {
-  local name=$1 testfile=$2 arm=$3
+  # $2 is the test file followed by its pytest options, split on spaces.
+  local name=$1 testargs=$2 arm=$3
   local dir="$OUT/$name/$arm"
   mkdir -p "$dir/tmp"
   checkout_arm "$arm" > "$dir/git_head.txt" || return 1
@@ -127,7 +137,7 @@ run_stage_arm() {
   # instead of streaming it into the pytest output.
   (
     cd "$OMNI_ROOT" && CUDA_VISIBLE_DEVICES="$GPU" PYTHONPATH="$OMNI_ROOT" GITHUB_ACTIONS=true \
-      python -m pytest "$testfile" -v -s -x -p no:cacheprovider --basetemp "$dir/tmp" \
+      python -m pytest $testargs -v -s -x -p no:cacheprovider --basetemp "$dir/tmp" \
       > "$dir/pytest.log" 2>&1
   )
   local code=$?
@@ -139,7 +149,7 @@ run_stage_arm() {
 }
 
 run_stage() {
-  local name=$1 testfile=$2 index=$3 order
+  local name=$1 testargs=$2 index=$3 order
   if [ $((index % 2)) -eq 0 ]; then order="A B"; else order="B A"; fi
   mkdir -p "$OUT/$name"
   echo "$order" > "$OUT/$name/order.txt"
@@ -147,7 +157,7 @@ run_stage() {
     (cd "$OMNI_ROOT" && python -m benchmarks.metrics.speaker_similarity_assets --warm-cache) >> "$OUT/full_ab.log" 2>&1
   fi
   for arm in $order; do
-    run_stage_arm "$name" "$testfile" "$arm" || true
+    run_stage_arm "$name" "$testargs" "$arm" || true
   done
 }
 
@@ -187,14 +197,16 @@ main() {
     run_tts_c1
     return
   fi
-  local wanted="${STAGES:-}" index=0 name testfile
-  for entry in "${ALL_STAGES[@]}"; do
+  local wanted="${STAGES:-}" index=0 name testargs
+  for entry in "${ALL_STAGES[@]}" "${EXTRA_STAGES[@]}"; do
     name=${entry%% *}
-    testfile=${entry#* }
-    if [ -n "$wanted" ] && ! [[ " $wanted " == *" $name "* ]]; then
+    testargs=${entry#* }
+    if [ -n "$wanted" ]; then
+      [[ " $wanted " == *" $name "* ]] || continue
+    elif [[ " ${EXTRA_STAGES[*]} " == *" $entry "* ]]; then
       continue
     fi
-    run_stage "$name" "$testfile" "$index"
+    run_stage "$name" "$testargs" "$index"
     index=$((index + 1))
   done
   log "done, readout: python $SCRIPT_DIR/full_ab_compare.py $OUT --md $OUT/readout.md"

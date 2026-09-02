@@ -1,8 +1,9 @@
 # 09. The reservation change, traced, and the full Qwen3-Omni A/B (2026-09-02)
 
-Code read: perf/scheduler-observed-reservation at ce2735c02 (the 44 added
-lines in sglang_omni/scheduling/omni_scheduler.py) against sglang 0.5.18
-(python/sglang/srt/managers). Line numbers below are from those two trees.
+Code read: perf/scheduler-observed-reservation with the tracker extraction
+on top of ce2735c02 (sglang_omni/scheduling/finished_output_tracker.py and
+the two hooks in omni_scheduler.py) against sglang 0.5.18
+(python/sglang/srt/managers). Line numbers below are from those trees.
 
 ## 1. The path of one scheduler iteration, with the two hooks
 
@@ -17,12 +18,12 @@ recv_requests, process_input_requests
 get_next_batch_to_run            omni 1359 -> upstream scheduler.py:3015
         |   merge the last prefill batch into running_batch (3067-3092)
         v
-get_new_batch_prefill            omni 1373                          <- hook 1
-   |  _apply_observed_new_token_ratio()                    omni 729-734
-   |     deque empty  -> leave tracker.current as sglang left it
-   |     deque filled -> tracker.current = max(deque)
-   |                     (the max is cached until the next finish)
-   |  coalesce hold off may return an empty plan here (1380-1408)
+get_new_batch_prefill            omni 1341                          <- hook 1
+   |  observed = finished_output_tracker.max_fraction        omni 1347
+   |     None (nothing finished yet) -> tracker.current stays as sglang left it
+   |     else tracker.current = observed
+   |        (max over the window, finished_output_tracker.py:41-42)
+   |  coalesce hold off may return an empty plan here (1350-1376)
    v
 _Upstream.get_new_batch_prefill  -> _get_new_batch_prefill_raw (3184)
    |  batch_is_full or empty waiting queue -> no prefill (3202-3205)
@@ -54,26 +55,26 @@ run_batch(decode) -> process_batch_result   omni 1417 -> upstream
    |  batch_result_processor -> output_streamer.stream_output
    |     (omni binds it to its own stream_output, 686-691)
    v
-stream_output                    omni 1622                          <- hook 2
-   |  finished, not aborted, not a stale alias (1632-1667)
-   |  _record_finished_output(req)                          omni 715-727
-   |     clipped = min(cap, 4096)
-   |     deque.append(min(len(output_ids), clipped) / clipped)
-   |     cached max = None
+stream_output                    omni 1592                          <- hook 2
+   |  finished, not aborted, not a stale alias (1602-1637)
+   |  finished_output_tracker.observe_finished(req)         omni 1639
+   |     clipped = min(cap, CLIP_MAX_NEW_TOKENS)   finished_output_tracker.py:44-54
+   |     window.append(min(len(output_ids), clipped) / clipped)
    |  terminal payload, callbacks, KV release
    v
 no batch this iteration -> self_check_during_idle -> tracker.reset()
-                                                     omni 736-737
+                                                     omni 704-705
 ```
 
 Three sglang writes to the ratio survive in the code and are overwritten
-at the next iteration's hook 1 once the deque holds an entry: the decay
-step (3554), the idle reset to 0.7 (omni 737) and the raise after a KV
+at the next iteration's hook 1 once the window holds an entry: the decay
+step (3554), the idle reset to 0.7 (omni 705) and the raise after a KV
 full retract (3526). Until the first finish of the process, all three act
 exactly as before.
 
-The deque has maxlen max_running_requests (omni 427-429), so an entry
-leaves after that many later finishes. Retracted rows are not finished and
+The window holds max_running_requests entries (omni 416-418,
+finished_output_tracker.py:38), so an entry leaves after that many later
+finishes. Retracted rows are not finished and
 are not recorded. Aborted rows, including the last row aborted by
 retract_decode when nothing fits (schedule_batch.py:2838-2852), take the
 is_aborted branch before hook 2 and are not recorded either.
@@ -135,7 +136,7 @@ min(cap, 4096), at ratio 1.0. sglang's start is 0.7 of that, its floor is
 | qwen3_omni thinker | 64 | 2048 default, 256 or 32 in the video and mmsu benches | 131072 | 91750 | 12845 | not recorded | about 120000 (fp8 colocated) |
 | minimax_music3 ar | 32 | 4096 | 131072 | 91750 | 12845 | 0.36 to 0.39 | 118366 and 166892 |
 | moss_tts, moss_tts_local, voxtral_tts | 16 | 4096 | 65536 | 45875 | 6423 | not measured | not read |
-| moss_transcribe_diarize | 16 | 4096 | 65536 | 45875 | 6423 | not measured | not read |
+| moss_transcribe_diarize | 16 | 4096 | 65536 | 45875 | 6423 | 1.0 on long audio by construction, see 5.3 | not read (0.80 fraction) |
 | fishaudio_s2_pro, higgs_tts | 64 | 2048 | 131072 | 91750 | 12845 | not measured | not read |
 | qwen3_tts | 16 | 2048 | 32768 | 22938 | 3211 | not measured | not read |
 | fun_cosyvoice3 | 32 | up to 2048 | 65536 | 45875 | 6423 | not measured | not read |
@@ -256,3 +257,41 @@ three repeats of that stage on both arms, not a conclusion.
 Not in this pass: the admission wait and running count per stage, which
 need the request profiler on a manual boot (doc 08 section 2 shows how
 the talker's were read). The pytest path does not start the profiler.
+
+### 5.3 The other models the hook runs in
+
+The clip is always on in sglang: CLIP_MAX_NEW_TOKENS is a module constant
+of schedule_policy.py read from SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION
+(default 4096) with no switch, applied to every running row's reservation
+and to every candidate's own reservation. The tracker imports that
+constant, so the two always agree.
+
+full_ab.sh takes three more stages when named in STAGES, each the model's
+own CI test file at CI settings:
+
+| stage | test file | why it is worth a run |
+|---|---|---|
+| moss_td | test_asr_ci_multi_speaker.py (movies800, aishell4, googletime, c16) | the one stage where a 1.0 fraction is expected: the default cap scales with audio duration (request_builders.py:452-457) and a transcript past the 4096 clip reads as 1.0, so B reserves 16 times 4096 (65536 tokens) against A's 45875 at the start. Its pool at mem_fraction_static 0.80 (stages.py:79) has not been read |
+| qwen3_asr | test_asr_ci_seedtts.py with --asr-ci-model qwen3 | the ASR bound of section 3, at most 13440 tokens, for the record |
+| qwen3_tts | test_tts_ci.py with --tts-ci-model qwen3-tts (all three tts stages) | the 12 Hz codec case, at most 32768 tokens, pool not read |
+
+MiniMax Music 3 has no CI test. Its before and after follows the
+cookbook (docs/cookbook/minimax_music3.md) with
+scripts/minimax_cookbook_ab.sh: the cookbook's serve line, then the five
+reference requests one at a time, then the same five at once, per arm.
+The sequential pass is a quality check by construction. Each request is a
+batch of one row pair with the same seed and prompt in both arms, and the
+scheduler change cannot reach a single request's numerics, so the five
+wavs must be byte identical across the arms (the cookbook documents seed
+determinism). The parallel pass is where admission differs and gives the
+wall time. Byte identity is not expected there because batch composition
+changes the arithmetic, which the c16 run of doc 08 section 7 showed with
+5 of 16 identical.
+
+Why quality cannot move: the change decides only when a request is
+admitted. It does not touch a forward pass, a sampling draw, a KV entry or
+the retract replay, which is sglang's path and was measured on the talker
+(doc 08 sections 4.1 and 5). What admission timing does change is which
+requests share a batch, and batched kernels are not bitwise invariant to
+their batch mates. That is the same variance any two boots have and it is
+what the full A/B reads as run to run spread.
