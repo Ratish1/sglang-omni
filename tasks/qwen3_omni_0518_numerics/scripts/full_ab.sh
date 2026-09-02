@@ -15,7 +15,7 @@
 #   OUT         result directory, outside OMNI_ROOT
 #   GPU         CUDA_VISIBLE_DEVICES value, two GPUs (default 0,1)
 # Optional:
-#   A_SHA, B_SHA   the arms (default 68c88dae6 and 9769867a0)
+#   A_SHA, B_SHA   the arms (default 216e946dd and 81a87e474)
 #   STAGES         space separated subset of the stage names below
 #   SGLANG_SEEDTTS50_DIR, SEEDTTS_SIM_CACHE_DIR   as the CI tts stage sets them
 #
@@ -35,8 +35,8 @@ set -uo pipefail
 : "${OMNI_ROOT:?set OMNI_ROOT}"
 : "${OUT:?set OUT}"
 GPU="${GPU:-0,1}"
-A_SHA="${A_SHA:-68c88dae6}"
-B_SHA="${B_SHA:-9769867a0}"
+A_SHA="${A_SHA:-216e946dd}"
+B_SHA="${B_SHA:-81a87e474}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # CI order (.github/workflows/test-qwen3-omni-ci.yaml).

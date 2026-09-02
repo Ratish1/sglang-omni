@@ -30,8 +30,8 @@ GPU="${GPU:-0}"
 PROFILE="${PROFILE:-fp8}"
 # Space separated subset of: seedtts mmsu videomme (default all three).
 SLIM_STAGES="${SLIM_STAGES:-seedtts mmsu videomme}"
-A_SHA="${A_SHA:-68c88dae6}"
-B_SHA="${B_SHA:-9769867a0}"
+A_SHA="${A_SHA:-216e946dd}"
+B_SHA="${B_SHA:-81a87e474}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export NCCL_NVLS_ENABLE=0

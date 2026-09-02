@@ -452,3 +452,26 @@ the idle reset returns it to 0.7. Under continuous saturated traffic the
 two arms therefore converge after about 600 steps (roughly 15 s of talker
 decode), and the gain lives in the first 600 steps after every idle gap,
 which is what bursty TTS traffic and a 50 request benchmark both are.
+
+## 7. The clean branch (2026-09-02)
+
+perf/observed-kv-reservation at 81a87e474, one commit on main 216e946dd,
+carries the same change as 9769867a0 with the tracker class inside
+omni_scheduler.py (no new module): the class, the construction in
+__init__, the push in get_new_batch_prefill and the observe call in
+stream_output, plus the two test files. The scheduling unit tests pass
+locally against the Apple venv (227 passed, 3 skipped for CUDA). The
+runner defaults now point at 216e946dd against 81a87e474. The PR is not
+opened yet.
+
+The two measurements left before the PR opens, on that pair:
+
+1. Voice clone on the bf16 colocated profile at c1, c16 and c32 with WER
+   and UTMOS, the profile where the change binds:
+   `PROFILE=bf16 SLIM_STAGES=seedtts bash slim_ab.sh` then `slim_ab.sh score`.
+2. MiniMax Music 3 through the cookbook requests on both arms
+   (minimax_cookbook_ab.sh), five sequential wavs byte identical across
+   the arms and the parallel wall time no worse.
+
+The fp8 slim run of section 6 stands as the neutral case and is not
+repeated.
