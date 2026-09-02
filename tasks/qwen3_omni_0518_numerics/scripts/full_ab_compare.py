@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Side by side readout of a full_ab.sh run.
+"""Side by side readout of a slim_ab.sh run.
 
 Usage:
     python full_ab_compare.py OUT [--md FILE]

@@ -359,24 +359,8 @@ and they re prefill (scheduler.py:3490-3526, schedule_batch.py:2816-2865).
 
 ### 5.2 The design, one PR per seam, in order of measured value
 
-E1, talker admission estimate. Set `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION`
-for the talker process from the talker stage's `env_defaults` (stage
-processes are spawned with the spawn context and the stage env is applied
-before the child imports sglang, pipeline/stage_workers.py:161-185,
-mp_runner.py:95). The value is the reservation estimate, not the stop:
-`max_new_tokens` stays 4096 and the codec EOS stays the real stop. This is
-the knob SGLang built for outputs that are usually far shorter than their
-cap. Tradeoff: if enough requests run long at once the pool fills and
-SGLang retracts. The PR must therefore prove one of two things before it
-lands: that the talker survives `retract_decode` (a retracted talker
-request re prefills and would re emit frames to code2wav, which must not
-happen), or that with the chosen estimate and `max_running_requests` 32
-the pool cannot fill for any prompt the request builder accepts
-(32 x (P_max + 4096) is far above 21373, so this needs the retract path
-to be correct or a talker side bound on running requests times worst
-case). Expected effect at c16: the running count goes from 6 to 9 to 16,
-the 1.0 s admission wait disappears, latency p50 from 2.4 s toward 1.4 s.
-Measured, not assumed: the run in section 8.
+E1, talker admission estimate. Superseded by the measured reservation
+(doc 09) and the pool sizing fix (doc 12).
 
 E2, the two stream syncs and the per step pageable copies, talker side.
 (a) request_builders.py:812-833 attaches a `MultimodalInputs` carrying

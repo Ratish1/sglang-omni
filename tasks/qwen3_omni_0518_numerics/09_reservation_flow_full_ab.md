@@ -176,9 +176,10 @@ c1 difference on Qwen3-Omni is boot and sampling variance until a run
 shows a shift larger than that band, and the full A/B below runs c1 on
 every stage so the band is measured again on both arms.
 
-## 5. The full Qwen3-Omni A/B
+## 5. The Qwen3-Omni A/B
 
-One pass over every stage of the Qwen3-Omni CI
+The pass that runs is the slim one of 5.4. The CI stages, for reference:
+every stage of the Qwen3-Omni CI
 (.github/workflows/test-qwen3-omni-ci.yaml), each stage being its CI test
 file run with pytest at the CI settings, so the thresholds the tests assert
 are the verdict of each arm and nothing is re implemented. Arms as in every
@@ -206,64 +207,6 @@ carries from one benchmark into another. Inside a stage it carries from
 the warmup requests into the measured run, per worker, which is what
 production sees.
 
-### 5.1 Running it
-
-scripts/full_ab.sh runs the ten stages in CI order, both arms per stage
-with the order alternating from stage to stage (A then B, then B then A)
-so neither arm always pays a cold cache or follows a hot GPU. Between runs
-it cleans the GPUs with the CI script (.github/scripts/delete_gpu_process.sh
-with the thresholds of run_all_wer_ci_aligned.sh), switches the checkout
-with git checkout --detach and restores the original ref at the end. Each
-run gets its own pytest basetemp under $OUT/<stage>/<arm>/tmp, which holds
-the result JSONs and, with GITHUB_ACTIONS=true set for pytest, the
-server.log of every server the fixtures start
-(benchmarks/benchmarker/utils.py:67-72). The script must run from a copy
-outside the tree because the checkout changes under it.
-
-```
-cp -r "$OMNI_ROOT/tasks/qwen3_omni_0518_numerics/scripts" "$OUT/scripts"
-OMNI_ROOT=/path/to/checkout OUT=/data/ab-full GPU=0,1 bash "$OUT/scripts/full_ab.sh"
-OMNI_ROOT=/path/to/checkout OUT=/data/ab-full GPU=0 bash "$OUT/scripts/full_ab.sh" tts_conc
-OMNI_ROOT=/path/to/checkout OUT=/data/ab-full GPU=0 bash "$OUT/scripts/full_ab.sh" tts_score
-python "$OUT/scripts/full_ab_compare.py" "$OUT" --md "$OUT/readout.md"
-```
-
-The CI stages run at c16 only. The tts_conc pass is the concurrency
-sweep on the one stage where the reservation binds: the voice clone bench
-at c1, c16 and c32 on the bf16 colocated profile through run_bench.py,
-one manual boot per arm with the three runs on that boot, the measurement
-of doc 08 section 1 repeated on the final commit. tts_score then runs the
-CI's own WER scorer (against a Qwen3-ASR-1.7B server, the CI's WER model)
-and the UTMOS scorer on every run, so each concurrency has speed, WER and
-UTMOS on both arms.
-
-Budget: the CI stage timeouts sum to 240 min, so one arm is at most 4 h
-and the pass at most 8 h plus two boots for c1. STAGES="tts videoamme"
-runs a subset.
-
-### 5.2 Reading it
-
-full_ab_compare.py prints, per stage, the pytest exit code of both arms,
-every *_results.json under A next to the same file under B with the
-numeric leaves of summary, speed, speed_metrics and wer.summary and the
-ratio B over A, then the KV pool sizes at boot and the count of
-retraction lines from the server logs of both arms. Checked against the
-clip fix bundle's c16 result files, the readout reproduces the doc 08
-section 1 numbers.
-
-What counts as a regression: an assertion that fails in B and passed in A
-on the same stage, a retraction line in B's logs with none in A's, or a B
-metric worse than A by more than the boot to boot spread measured for
-that stage (doc 07 for the voice clone stage). For the other stages no
-spread has been measured, so a single A/B there catches an assertion flip
-and a shift larger than the CI's own P95 slack, not a few percent. If a
-stage shows a few percent shift in either direction, the next step is
-three repeats of that stage on both arms, not a conclusion.
-
-Not in this pass: the admission wait and running count per stage, which
-need the request profiler on a manual boot (doc 08 section 2 shows how
-the talker's were read). The pytest path does not start the profiler.
-
 ### 5.3 The other models the hook runs in
 
 The clip is always on in sglang: CLIP_MAX_NEW_TOKENS is a module constant
@@ -271,15 +214,6 @@ of schedule_policy.py read from SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION
 (default 4096) with no switch, applied to every running row's reservation
 and to every candidate's own reservation. The tracker imports that
 constant, so the two always agree.
-
-full_ab.sh takes three more stages when named in STAGES, each the model's
-own CI test file at CI settings:
-
-| stage | test file | why it is worth a run |
-|---|---|---|
-| moss_td | test_asr_ci_multi_speaker.py (movies800, aishell4, googletime, c16) | the one stage where a 1.0 fraction is expected: the default cap scales with audio duration (request_builders.py:452-457) and a transcript past the 4096 clip reads as 1.0, so B reserves 16 times 4096 (65536 tokens) against A's 45875 at the start. Its pool at mem_fraction_static 0.80 (stages.py:79) has not been read |
-| qwen3_asr | test_asr_ci_seedtts.py with --asr-ci-model qwen3 | the ASR bound of section 3, at most 13440 tokens, for the record |
-| qwen3_tts | test_tts_ci.py with --tts-ci-model qwen3-tts (all three tts stages) | the 12 Hz codec case, at most 32768 tokens, pool not read |
 
 MiniMax Music 3 has no CI test. Its before and after follows the
 cookbook (docs/cookbook/minimax_music3.md) with
@@ -426,16 +360,9 @@ candidate check needs, about 101k tokens. The doc 08 bf16 run also shows
 the thinker on that profile at 5248 tokens (0.73 fraction over 56.9 GB
 of bf16 weights), so that profile is starved on both stages.
 
-| profile | card | talker fraction and weights | pool, tokens | rows at which the start reservation binds | at 32 rows |
-|---|---|---|---|---|---|
-| H100 bf16 colocated (CI TTS stage) | 79.65 GB | 0.10, bf16 | 20136 read | 6 | binds hard, the doc 08 gain |
-| H100 fp8 colocated | 79.65 GB | 0.12, fp8 | 120769 read | 38 | nothing, this run |
-| H200 bf16 colocated (qwen3_omni_colocated_h200.yaml) | 141 GB card | 0.123, bf16 | about 223k derived | about 72 | nothing |
-| H20 bf16 colocated | 96 GB card | 0.12, bf16 | about 95k derived | about 30 | two rows wait, marginal |
-
-The derived rows assume sglang reports the whole card as total and the
-same 0.70 GB reserve. Task before quoting either: read the pool line from
-one boot on that card.
+The per profile table of this section was computed on the oversized
+talker pool and is superseded by doc 12 section 6, which recomputes it
+after the pool fix.
 
 So the change is a correction to the admission estimate that pays only
 where a stage's pool is small next to rows times 0.7 times the clipped

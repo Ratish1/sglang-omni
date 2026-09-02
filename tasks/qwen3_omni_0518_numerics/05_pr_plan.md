@@ -759,42 +759,13 @@ section 5 gives the mechanism behind its regression: two stream syncs per
 step that serialize the host behind the in flight step. The work is three
 groups, each one PR with one proof, accepted before the next starts.
 
-### 7.1 Group E1, talker KV reservation (talker scheduler defaults)
+### 7.1 Group E1, talker KV reservation
 
-Title: `[Qwen3-Omni] Reserve talker KV by the expected output instead of the 4096 ceiling`
-
-Seam: `configure_talker_server_args` (talker_scheduler.py), the place that
-already sets the talker's scheduler defaults (radix cache off, chunked
-prefill off, overlap off).
-
-Change: `schedule_conservativeness` 0 for the talker. SGLang reads it in
-one place, the initial `new_token_ratio` (new_token_ratio_tracker.py:20-32),
-so running talker rows reserve nothing beyond what they use, a request is
-admitted while its own ceiling fits the free pool, and the pool fills to
-`max_running_requests` (32). `talker_max_new_tokens` stays 4096, the
-official stop. A full pool takes SGLang's retract path, which the talker
-supports (replay from `_decode_input_history`, talker_model_runner.py:328-340).
-This is vLLM-Omni's policy for the same talker (max_tokens 4096, allocate
-per generated token, preempt on exhaustion) through SGLang's knob, no
-fitted constant (07 section 5 has the call chain).
-
-Why not a text derived `max_new_tokens`: measured first (07 sections 1 to
-4, c16 qps +24 percent, c32 +48 percent, running 9 to 16 and 32) and then
-reverted, because it changes the model's stop with a dataset fitted
-constant, which is the wrong seam for a reservation problem.
-
-Tests: test_talker.py `test_configure_talker_server_args_writes_through_the_mutation_guard`
-asserts the audited override.
-
-Proof (container, f74c4fcda): the three boot interleaved sweep at c1, c16
-and c32 with WER, similarity and UTMOS on both arms, plus one c32 boot with
-`--talker_ar.engine.max_total_tokens 4096` to force retracts and show the
-audio intact (retract count from the log, WER and similarity against the
-normal boot).
-
-Status: cap version measured and reverted, reservation off version
-pushed (perf/talker-admission-cap 48bbc40fa), sweep pending, with a long
-output arm and the forced retract boot added to the proof.
+Superseded. The reservation is measured from finished outputs on
+perf/observed-kv-reservation (doc 09), and the talker pool itself was
+sized for the thinker's layer count (doc 12, PR #1910). The
+conservativeness and clip constant versions and perf/talker-admission-cap
+are dropped.
 
 ### 7.2 Group E2, per step host syncs and copies (model code)
 
