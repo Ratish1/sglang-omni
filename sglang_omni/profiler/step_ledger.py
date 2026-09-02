@@ -6,23 +6,30 @@ batch it runs: the launch to launch cycle, the host wall of the launch call
 and of the lookahead resolve, the time the host blocked on a device event,
 the device span from the start of the forward to the published tokens, the
 batch shape, whether a CUDA graph replayed, the idle sleeps taken before the
-step, and the caching allocator's allocation count delta. Together these say
-whether a stage is host bound or device bound, and by how much, without a
-kernel trace.
+step, and the caching allocator's allocation count over the cycle. Together
+these say whether a stage is host bound or device bound, and by how much,
+without a kernel trace.
 
-Recording follows the request event recorder: it starts when the recorder
-becomes active and ends when the recorder stops, so the existing
-start_profile and start_request_profile calls are the only switch. The
-summary is written next to the events file as step_ledger_<stage>_<pid>.json
-and logged as one line per batch shape.
+Recording follows the request event recorder: a stage joins the run at its
+next batch after the recorder becomes active and writes the run when it
+handles the profiler stop, so the existing start_profile and
+start_request_profile calls are the only switch. The summary is written next
+to the events file as step_ledger_<stage>_<pid>.json and logged as one line
+per batch shape. A stage that ran no batch during the run writes nothing.
 
-The ledger never synchronizes the device. Device spans come from timing
-event pairs that are read only after the end event reports complete, and
-pairs still in flight when a run ends are counted, not waited for.
+Two guarantees. The ledger adds no device wait of its own: device spans come
+from timing event pairs that are read only after the end event reports
+complete, pairs still in flight when a run ends are counted, not waited for,
+and the one synchronize it performs, wait_for_gpu_end, stands in for a
+blocking copy the runner is about to do on the same work. And the ledger
+never raises into the scheduler loop or the runner: the first failure inside
+it is logged and disables it for the rest of the process, so a request can
+never fail because of its accounting.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -38,8 +45,6 @@ import torch
 from sglang_omni.profiler.event_recorder import get_active_stage, get_recorder
 
 logger = logging.getLogger(__name__)
-
-_OPEN_STEP_LIMIT = 8
 
 
 @dataclass
@@ -84,6 +89,27 @@ def _percentiles(values: list[float]) -> dict[str, float] | None:
     }
 
 
+def _guarded(method: Callable) -> Callable:
+    """Turn the first failure inside the ledger into a logged disable."""
+
+    @functools.wraps(method)
+    def wrapper(self: "StepLedger", *args: Any, **kwargs: Any) -> Any:
+        if self._disabled:
+            return None
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            self._disabled = True
+            logger.warning(
+                "step ledger disabled after a failure in %s",
+                method.__name__,
+                exc_info=True,
+            )
+            return None
+
+    return wrapper
+
+
 class StepLedger:
     """Per step host and device accounting for one scheduler."""
 
@@ -94,10 +120,7 @@ class StepLedger:
         clock: Callable[[], float] = time.perf_counter,
         gpu_timing: bool | None = None,
     ) -> None:
-        self._device = (
-            torch.device(device) if not isinstance(device, torch.device) else device
-        )
-        self._device_module = torch.get_device_module(self._device)
+        self._disabled = False
         self._clock = clock
         self._lock = threading.Lock()
         self._recorder = get_recorder()
@@ -109,16 +132,34 @@ class StepLedger:
         self._pending_spans: deque[_Step] = deque()
         self._current: _Step | None = None
         self._resolving: _Step | None = None
+        self._last_step: _Step | None = None
+        # Never reset between runs: a SchedulerOutput stamped in an earlier
+        # run must not resolve against a step of a later one.
         self._next_id = 1
         self._last_launch_t: float | None = None
         self._idle_sleeps = 0
-        self._unread_spans = 0
         self._dropped_steps = 0
         self._last_allocations: int | None = None
-        self._gpu_timing = (
-            self._probe_gpu_timing() if gpu_timing is None else bool(gpu_timing)
-        )
-        self._allocation_stats = self._device.type == "cuda"
+        self._device: Any = None
+        self._device_module: Any = None
+        self._gpu_timing = False
+        self._allocation_stats = False
+        try:
+            self._device = (
+                device if isinstance(device, torch.device) else torch.device(device)
+            )
+            self._device_module = torch.get_device_module(self._device)
+            self._gpu_timing = (
+                self._probe_gpu_timing() if gpu_timing is None else bool(gpu_timing)
+            )
+            self._allocation_stats = self._device.type == "cuda"
+        except Exception:
+            self._disabled = True
+            logger.warning(
+                "step ledger disabled: no accounting for device %r",
+                device,
+                exc_info=True,
+            )
 
     # ---- capability -----------------------------------------------------
 
@@ -139,18 +180,20 @@ class StepLedger:
 
     # ---- scheduler side -------------------------------------------------
 
+    @_guarded
     def begin(self, batch: Any) -> None:
         """Open a step for the batch about to be launched.
 
         Called from the scheduler thread once per batch, before the runner
-        is entered. Starts or ends a run as the request recorder toggles.
+        is entered. Joins or leaves a run as the request recorder toggles.
         """
-        recorder = self._recorder
-        if not recorder.is_active():
+        # One read: the recorder can be stopped by another thread between
+        # is_active and active_run_id, and a run id of None means inactive.
+        run_id = self._recorder.active_run_id()
+        if run_id is None:
             if self._run_id is not None:
                 self.finish()
             return
-        run_id = recorder.active_run_id()
         if self._run_id is not None and run_id != self._run_id:
             # A new run started before this stage saw the previous stop:
             # write the previous run instead of dropping it.
@@ -158,15 +201,20 @@ class StepLedger:
         with self._lock:
             if self._run_id is None:
                 self._run_id = run_id
-                path = recorder.active_path()
+                path = self._recorder.active_path()
                 self._event_dir = None if path is None else str(Path(path).parent)
                 self._stage = get_active_stage()
+                self._last_launch_t = None
+                self._last_step = None
+                self._idle_sleeps = 0
+                self._last_allocations = None
             self._drain_spans_unlocked()
             if self._current is not None and not self._current.closed:
                 self._discard_unlocked(self._current)
             now = self._clock()
             cycle = None if self._last_launch_t is None else now - self._last_launch_t
             self._last_launch_t = now
+            self._note_allocations_unlocked()
             mode = _batch_mode(batch)
             tokens = int(batch.extend_num_tokens or 0) if mode == "extend" else 0
             step = _Step(
@@ -181,12 +229,10 @@ class StepLedger:
             self._next_id += 1
             self._idle_sleeps = 0
             self._current = step
+            self._last_step = step
             self._open[step.step_id] = step
-            if len(self._open) > _OPEN_STEP_LIMIT:
-                oldest = min(self._open)
-                if oldest != step.step_id:
-                    self._discard_unlocked(self._open[oldest])
 
+    @_guarded
     def end_launch(self, *, can_run_cuda_graph: bool, lookahead: bool) -> None:
         """Close the launch call of the current step.
 
@@ -203,6 +249,7 @@ class StepLedger:
             if not lookahead:
                 self._close_unlocked(step)
 
+    @_guarded
     def begin_resolve(self, step_id: int) -> None:
         step = self._open.get(step_id)
         if step is None:
@@ -211,6 +258,7 @@ class StepLedger:
             self._resolving = step
             step.resolve = self._clock()
 
+    @_guarded
     def end_resolve(self) -> None:
         step = self._resolving
         if step is None:
@@ -222,10 +270,12 @@ class StepLedger:
             self._close_unlocked(step)
 
     def note_idle_sleep(self) -> None:
-        self._idle_sleeps += 1
+        if self._run_id is not None:
+            self._idle_sleeps += 1
 
     # ---- runner side ----------------------------------------------------
 
+    @_guarded
     def mark_gpu_start(self) -> None:
         """Record the timing event before the forward of the open step."""
         step = self._current
@@ -235,6 +285,7 @@ class StepLedger:
         event.record()
         step.gpu_start = event
 
+    @_guarded
     def mark_gpu_end(self) -> None:
         """Record the timing event after the open step published its tokens."""
         step = self._current
@@ -246,6 +297,7 @@ class StepLedger:
         with self._lock:
             self._pending_spans.append(step)
 
+    @_guarded
     def add_wait(self, seconds: float) -> None:
         """Account host time blocked on a device event.
 
@@ -258,13 +310,31 @@ class StepLedger:
             return
         step.wait += seconds
 
+    @_guarded
+    def wait_for_gpu_end(self) -> None:
+        """Block on the open step's end event and book the time as wait.
+
+        The one place the ledger waits on the device: the runner calls it
+        right before a blocking copy of the step's tokens, which would wait
+        for the same work an instant later. The wall is unchanged, the wait
+        becomes visible.
+        """
+        step = self._resolving if self._resolving is not None else self._current
+        if step is None or step.gpu_end is None or step.gpu_end.query():
+            return
+        waited_from = self._clock()
+        step.gpu_end.synchronize()
+        step.wait += self._clock() - waited_from
+
     # ---- readout --------------------------------------------------------
 
+    @_guarded
     def summary(self) -> dict[str, Any]:
         with self._lock:
             self._drain_spans_unlocked()
             return self._summary_unlocked()
 
+    @_guarded
     def finish(self, run_id: str | None = None) -> str | None:
         """Write the run's summary next to its events and reset.
 
@@ -283,7 +353,7 @@ class StepLedger:
             summary = self._summary_unlocked()
             event_dir = self._event_dir
             stage = self._stage or "unknown"
-            run_id = self._run_id
+            finished_run = self._run_id
             self._reset_unlocked()
         for line in _format_lines(stage, summary):
             logger.info(line)
@@ -294,7 +364,9 @@ class StepLedger:
             path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         except OSError:
             logger.warning(
-                "step ledger for run %s could not be written", run_id, exc_info=True
+                "step ledger for run %s could not be written",
+                finished_run,
+                exc_info=True,
             )
             return None
         return str(path)
@@ -306,8 +378,6 @@ class StepLedger:
             return
         step.closed = True
         self._open.pop(step.step_id, None)
-        if self._allocation_stats:
-            step.allocations = self._allocation_delta()
         self._shapes.setdefault((step.mode, step.rows), _Shape()).steps.append(step)
 
     def _discard_unlocked(self, step: _Step) -> None:
@@ -338,15 +408,21 @@ class StepLedger:
             step.gpu_start = None
             step.gpu_end = None
 
-    def _allocation_delta(self) -> int | None:
+    def _note_allocations_unlocked(self) -> None:
+        """Sample the allocation counter at launch and charge the delta since
+        the previous launch to the previous step: allocations per cycle."""
+        if not self._allocation_stats:
+            return
         try:
-            stats = torch.cuda.memory_stats(self._device)
-            count = int(stats.get("allocation.all.allocated", 0))
+            stats = torch.cuda.memory_stats_as_nested_dict(self._device)
+            count = int(stats["allocation"]["all"]["allocated"])
         except Exception:
-            return None
+            self._allocation_stats = False
+            return
         previous = self._last_allocations
         self._last_allocations = count
-        return None if previous is None else count - previous
+        if previous is not None and self._last_step is not None:
+            self._last_step.allocations = count - previous
 
     def _reset_unlocked(self) -> None:
         self._run_id = None
@@ -357,9 +433,9 @@ class StepLedger:
         self._pending_spans = deque()
         self._current = None
         self._resolving = None
+        self._last_step = None
         self._last_launch_t = None
         self._idle_sleeps = 0
-        self._unread_spans = 0
         self._dropped_steps = 0
         self._last_allocations = None
 
@@ -375,6 +451,8 @@ class StepLedger:
                 1 for s in steps if s.gpu_span_ms is None and s.gpu_end is not None
             )
             cycles = [s.cycle * 1e3 for s in steps if s.cycle is not None]
+            # Zero when the device is behind the host: the next launch came
+            # before this step's span ended, so the device had no idle.
             idle_floor = [
                 max(0.0, s.cycle * 1e3 - s.gpu_span_ms)
                 for s in steps
