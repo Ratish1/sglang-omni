@@ -47,12 +47,29 @@ def _main(argv: list[str] | None = None) -> int:
             "## Stage breakdown\n"
             + format_table(
                 report["stage_breakdown"],
-                ["stage", "interval", "count", "total_ms", "avg_ms", "p95_ms"],
+                [
+                    "stage",
+                    "interval",
+                    "count",
+                    "total_ms",
+                    "avg_ms",
+                    "p50_ms",
+                    "p95_ms",
+                ],
             )
             + "\n## Hop breakdown\n"
             + format_table(
                 report["hop_breakdown"],
-                ["src", "dst", "kind", "count", "total_ms", "avg_ms", "p95_ms"],
+                [
+                    "src",
+                    "dst",
+                    "kind",
+                    "count",
+                    "total_ms",
+                    "avg_ms",
+                    "p50_ms",
+                    "p95_ms",
+                ],
             )
         )
 
