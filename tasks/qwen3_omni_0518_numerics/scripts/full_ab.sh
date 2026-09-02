@@ -25,9 +25,11 @@
 #   OMNI_ROOT=... OUT=... GPU=0,1 bash "$OUT/scripts/full_ab.sh"
 #   python "$OUT/scripts/full_ab_compare.py" "$OUT" --md "$OUT/readout.md"
 #
-# Then the c1 addendum for the tts stage (two manual boots, section 5 of
+# Then the concurrency sweep of the voice clone stage (c1, c16, c32, one
+# manual boot per arm) and its WER and UTMOS scoring (section 5 of
 # 09_reservation_flow_full_ab.md):
-#   OMNI_ROOT=... OUT=... GPU=0 bash "$OUT/scripts/full_ab.sh" tts_c1
+#   OMNI_ROOT=... OUT=... GPU=0 bash "$OUT/scripts/full_ab.sh" tts_conc
+#   OMNI_ROOT=... OUT=... GPU=0 bash "$OUT/scripts/full_ab.sh" tts_score
 set -uo pipefail
 
 : "${OMNI_ROOT:?set OMNI_ROOT}"
@@ -161,29 +163,65 @@ run_stage() {
   done
 }
 
-# c1 addendum: the voice clone bench at concurrency 1 on the bf16 colocated
-# profile, one manual boot per arm, through h100_runs.sh from this copy.
-run_tts_c1() {
-  local port=31010
+# Concurrency sweep on the stage where the reservation binds: the voice
+# clone bench at c1, c16 and c32 on the bf16 colocated profile, one manual
+# boot per arm through h100_runs.sh from this copy, the three runs in that
+# order on the same boot. Results land in $OUT/tts_c<N>/<arm>/seedtts_vc
+# (speed_results.json, generated.json and the wavs), the serve log in
+# $OUT/tts_conc_logs/<arm>/logs.
+TTS_CONCURRENCIES="${TTS_CONCURRENCIES:-1 16 32}"
+run_tts_conc() {
+  local port=31010 conc dir
   # shellcheck source=/dev/null
   source "$SCRIPT_DIR/h100_runs.sh"
   RUN_BENCH="$SCRIPT_DIR/run_bench.py"
   SCRIPTS="$SCRIPT_DIR"
-  mkdir -p "$OUT/tts_c1"
-  echo "A B" > "$OUT/tts_c1/order.txt"
   for arm in A B; do
-    local dir="$OUT/tts_c1/$arm"
-    mkdir -p "$dir"
-    checkout_arm "$arm" > "$dir/git_head.txt" || return 1
+    local logs="$OUT/tts_conc_logs/$arm"
+    mkdir -p "$logs"
+    checkout_arm "$arm" > "$logs/git_head.txt" || return 1
     gpus_idle || return 1
-    log "start tts_c1 $arm $(cat "$dir/git_head.txt")"
-    OUT="$dir" serve_bf16_colocated $port || { echo 1 > "$dir/exit_code"; continue; }
-    (cd "$OMNI_ROOT" && PYTHONPATH="$OMNI_ROOT" python "$RUN_BENCH" seedtts-vc \
-      --port $port --out "$dir" --concurrency 1) > "$dir/bench.log" 2>&1
-    echo $? > "$dir/exit_code"
-    OUT="$dir" stop_server $port
-    log "end tts_c1 $arm exit $(cat "$dir/exit_code")"
+    log "start tts_conc $arm $(cat "$logs/git_head.txt")"
+    OUT="$logs" serve_bf16_colocated $port || { log "boot failed for $arm"; continue; }
+    for conc in $TTS_CONCURRENCIES; do
+      dir="$OUT/tts_c$conc/$arm"
+      mkdir -p "$dir"
+      echo "A B" > "$OUT/tts_c$conc/order.txt"
+      cp "$logs/git_head.txt" "$dir/git_head.txt"
+      (cd "$OMNI_ROOT" && PYTHONPATH="$OMNI_ROOT" python "$RUN_BENCH" seedtts-vc \
+        --port $port --out "$dir" --concurrency "$conc") > "$dir/bench.log" 2>&1
+      echo $? > "$dir/exit_code"
+      log "tts_c$conc $arm exit $(cat "$dir/exit_code")"
+    done
+    OUT="$logs" stop_server $port
+    grep -h "KV Cache is allocated\|Retract requests\|Testing retraction" "$logs"/logs/*.log > "$logs/scheduler_lines.txt" 2>/dev/null
+    log "end tts_conc $arm"
   done
+}
+
+# WER and UTMOS for every tts_c<N>/<arm> run, the CI's own scorers against
+# a Qwen3-ASR server (the CI's WER model), started here on one GPU after the
+# omni server is down. Writes wer_results.json and utmos_results.json next
+# to speed_results.json, which the readout picks up.
+SEEDTTS_META="${SEEDTTS_META:-zhaochenyang20/seed-tts-eval-50-arrow}"
+run_tts_score() {
+  local port=31011 dir
+  # shellcheck source=/dev/null
+  source "$SCRIPT_DIR/h100_runs.sh"
+  mkdir -p "$OUT/tts_score_logs"
+  gpus_idle || return 1
+  OUT="$OUT/tts_score_logs" _launch_server $port "serve_asr_$port.log" sgl-omni serve \
+    --model-path Qwen/Qwen3-ASR-1.7B --host 127.0.0.1 --port $port || return 1
+  for dir in "$OUT"/tts_c*/[AB]/seedtts_vc; do
+    [ -f "$dir/speed_results.json" ] || continue
+    log "score $dir"
+    (cd "$OMNI_ROOT" && PYTHONPATH="$OMNI_ROOT" python -m benchmarks.eval.benchmark_omni_seedtts \
+      --transcribe-only --meta "$SEEDTTS_META" --output-dir "$dir" \
+      --model qwen3-omni --lang en --port $port) > "$dir/../transcribe.log" 2>&1
+    (cd "$OMNI_ROOT" && PYTHONPATH="$OMNI_ROOT" python -m benchmarks.eval.benchmark_omni_seedtts \
+      --utmos-only --output-dir "$dir" --device cuda:0) > "$dir/../utmos.log" 2>&1
+  done
+  OUT="$OUT/tts_score_logs" stop_server $port
 }
 
 main() {
@@ -193,10 +231,10 @@ main() {
   orig_ref=$(git -C "$OMNI_ROOT" symbolic-ref -q --short HEAD || git -C "$OMNI_ROOT" rev-parse HEAD)
   trap 'git -C "$OMNI_ROOT" checkout -q "$orig_ref"; log "restored $orig_ref"' EXIT
   capture_env
-  if [ "${1:-}" = tts_c1 ]; then
-    run_tts_c1
-    return
-  fi
+  case "${1:-}" in
+    tts_conc) run_tts_conc; return ;;
+    tts_score) run_tts_score; return ;;
+  esac
   local wanted="${STAGES:-}" index=0 name testargs
   for entry in "${ALL_STAGES[@]}" "${EXTRA_STAGES[@]}"; do
     name=${entry%% *}

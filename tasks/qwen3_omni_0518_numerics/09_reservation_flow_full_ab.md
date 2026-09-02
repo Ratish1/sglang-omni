@@ -223,13 +223,19 @@ outside the tree because the checkout changes under it.
 ```
 cp -r "$OMNI_ROOT/tasks/qwen3_omni_0518_numerics/scripts" "$OUT/scripts"
 OMNI_ROOT=/path/to/checkout OUT=/data/ab-full GPU=0,1 bash "$OUT/scripts/full_ab.sh"
-OMNI_ROOT=/path/to/checkout OUT=/data/ab-full GPU=0 bash "$OUT/scripts/full_ab.sh" tts_c1
+OMNI_ROOT=/path/to/checkout OUT=/data/ab-full GPU=0 bash "$OUT/scripts/full_ab.sh" tts_conc
+OMNI_ROOT=/path/to/checkout OUT=/data/ab-full GPU=0 bash "$OUT/scripts/full_ab.sh" tts_score
 python "$OUT/scripts/full_ab_compare.py" "$OUT" --md "$OUT/readout.md"
 ```
 
-The tts_c1 pass is the c1 addendum of section 4: the voice clone bench at
-concurrency 1 on the bf16 colocated profile through run_bench.py, one
-manual boot per arm, the same measurement as doc 08 section 1.
+The CI stages run at c16 only. The tts_conc pass is the concurrency
+sweep on the one stage where the reservation binds: the voice clone bench
+at c1, c16 and c32 on the bf16 colocated profile through run_bench.py,
+one manual boot per arm with the three runs on that boot, the measurement
+of doc 08 section 1 repeated on the final commit. tts_score then runs the
+CI's own WER scorer (against a Qwen3-ASR-1.7B server, the CI's WER model)
+and the UTMOS scorer on every run, so each concurrency has speed, WER and
+UTMOS on both arms.
 
 Budget: the CI stage timeouts sum to 240 min, so one arm is at most 4 h
 and the pass at most 8 h plus two boots for c1. STAGES="tts videoamme"
