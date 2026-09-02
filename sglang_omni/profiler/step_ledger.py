@@ -151,9 +151,12 @@ class StepLedger:
                 self.finish()
             return
         run_id = recorder.active_run_id()
+        if self._run_id is not None and run_id != self._run_id:
+            # A new run started before this stage saw the previous stop:
+            # write the previous run instead of dropping it.
+            self.finish()
         with self._lock:
-            if run_id != self._run_id:
-                self._reset_unlocked()
+            if self._run_id is None:
                 self._run_id = run_id
                 path = recorder.active_path()
                 self._event_dir = None if path is None else str(Path(path).parent)
@@ -262,13 +265,17 @@ class StepLedger:
             self._drain_spans_unlocked()
             return self._summary_unlocked()
 
-    def finish(self) -> str | None:
+    def finish(self, run_id: str | None = None) -> str | None:
         """Write the run's summary next to its events and reset.
 
-        Safe to call from any thread and when nothing was recorded.
+        Safe to call from any thread and when nothing was recorded. With a
+        run id, only that run is finished, so a stop for another run is
+        ignored the way the recorder ignores it.
         """
         with self._lock:
             if self._run_id is None:
+                return None
+            if run_id is not None and run_id != self._run_id:
                 return None
             self._drain_spans_unlocked()
             for step in list(self._open.values()):
