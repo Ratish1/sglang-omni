@@ -1818,9 +1818,12 @@ class Stage:
             msg.run_id is None or recorder.active_run_id() == msg.run_id
         ):
             recorder.stop(run_id=msg.run_id)
-            ledger = getattr(self.scheduler, "step_ledger", None)
-            if ledger is not None:
-                ledger.finish()
+        # note(ratish): the recorder is process global, so in a shared process
+        # topology a sibling stage may have closed it already. Each stage
+        # finishes its own ledger regardless, matched on the run id.
+        ledger = getattr(self.scheduler, "step_ledger", None)
+        if ledger is not None:
+            ledger.finish(run_id=msg.run_id)
 
     def _on_background_task_done(self, task: asyncio.Task, label: str) -> None:
         if task.cancelled():
