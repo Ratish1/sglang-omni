@@ -25,8 +25,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export NCCL_NVLS_ENABLE=0
 # shellcheck source=/dev/null
-source "$SCRIPT_DIR/full_ab.sh" --functions-only 2>/dev/null || true
-# shellcheck source=/dev/null
 source "$SCRIPT_DIR/h100_runs.sh"
 RUN_BENCH="$SCRIPT_DIR/run_bench.py"
 SCRIPTS="$SCRIPT_DIR"
