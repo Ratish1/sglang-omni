@@ -1823,7 +1823,14 @@ class Stage:
         # finishes its own ledger regardless, matched on the run id.
         ledger = getattr(self.scheduler, "step_ledger", None)
         if ledger is not None:
-            ledger.finish(run_id=msg.run_id)
+            try:
+                ledger.finish(run_id=msg.run_id)
+            except Exception:
+                logger.warning(
+                    "Stage %s failed to finish its step ledger",
+                    self.name,
+                    exc_info=True,
+                )
 
     def _on_background_task_done(self, task: asyncio.Task, label: str) -> None:
         if task.cancelled():

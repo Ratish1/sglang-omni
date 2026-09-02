@@ -248,14 +248,16 @@ class ModelRunner:
         schedule_batch = scheduler_output.batch_data
         if schedule_batch is None:
             return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
+        # note(ratish): the span opens before the input resolve and the
+        # forward batch build, the step's first device work.
+        ledger = self.step_ledger
+        if ledger is not None:
+            ledger.mark_gpu_start()
         with self._execution_context(schedule_batch, isolate_sampling=True):
             built = self._build_forward_batch(scheduler_output)
             if built is None:
                 return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
             forward_batch, schedule_batch, is_prefill = built
-            ledger = self.step_ledger
-            if ledger is not None:
-                ledger.mark_gpu_start()
             batch_result = self._prepare_and_forward(
                 forward_batch, schedule_batch, scheduler_output.requests, is_prefill
             )
@@ -313,15 +315,15 @@ class ModelRunner:
         schedule_batch = scheduler_output.batch_data
         if schedule_batch is None:
             return None
+        ledger = self.step_ledger
+        if ledger is not None:
+            ledger.mark_gpu_start()
         with self._execution_context(schedule_batch, isolate_sampling=True):
             built = self._build_forward_batch(scheduler_output)
             if built is None:
                 return None
             forward_batch, schedule_batch, is_prefill = built
             assert not is_prefill, "async lookahead launch is decode-only"
-            ledger = self.step_ledger
-            if ledger is not None:
-                ledger.mark_gpu_start()
             batch_result = self._prepare_and_forward(
                 forward_batch,
                 schedule_batch,
@@ -542,6 +544,18 @@ class ModelRunner:
         async resolve must never stamp its lagged result onto a live batch."""
         host_token_ids = self._resolve_host_token_ids(batch_result)
         if host_token_ids is None:
+            ledger = self.step_ledger
+            ids = batch_result.next_token_ids
+            if (
+                ledger is not None
+                and isinstance(ids, torch.Tensor)
+                and ids.device.type != "cpu"
+            ):
+                # note(ratish): the output processor reads these ids with a
+                # blocking copy, so the host is about to wait for the step's
+                # device work anyway. Waiting on the step's end event first
+                # costs the same wall and lets the ledger book it as wait.
+                ledger.wait_for_gpu_end()
             outputs = self.output_processor.process(batch_result, scheduler_output)
         else:
             outputs = self.output_processor.process(

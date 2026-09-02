@@ -213,37 +213,43 @@ multi-GB trace — only opt in when you need that specific information.
 
 Every OmniScheduler stage keeps a per step ledger that records while the
 request event recorder is active, so `/start_request_profile` and
-`/start_profile` are its only switch. One row per batch the scheduler runs:
+`/start_profile` are its only switch. A stage joins the run at its next
+batch after the start and writes the run when it handles the stop. One row
+per batch the scheduler runs:
 
 | field | meaning |
 |---|---|
-| `cycle_ms` | launch to launch interval, the step period the loop achieves |
-| `host_ms` | wall of the launch call: forward batch build, hooks, forward, sampling, publish, stream emission |
+| `cycle_ms` | launch to launch interval, the step period the loop achieves. Iterations that ran no batch (idle, or a talker batch deferred until thinker text arrives) are folded into the next step's cycle |
+| `host_ms` | wall of the launch call. Synchronous path: forward batch build, hooks, forward, sampling, publish, finalize, stream emission. Lookahead path: up to the launch's return, stream emission lands in `resolve_ms` |
 | `resolve_ms` | wall of the lookahead resolve of that step, absent on the synchronous path |
-| `wait_ms` | host time blocked on a device event inside the step: the staged token event on the synchronous path, the completion event at resolve |
-| `gpu_span_ms` | device time from the start of the forward to the published tokens, from a timing event pair |
-| `gpu_idle_floor_ms` | `cycle_ms` minus `gpu_span_ms`, a lower bound on device idle per step |
-| `graph_share` | share of steps that replayed a CUDA graph |
-| `idle_sleeps_per_step` | idle loop sleeps taken before the step |
-| `allocations_per_step` | caching allocator allocation count delta across the step, CUDA only |
+| `wait_ms` | host time blocked on the step's device work: the staged token event, the completion event at resolve, and the end event a runner without staged tokens waits on before its blocking token copy. A synchronize a runner performs inside its own forward or hooks is not counted, it lands in `host_ms` and inflates `gpu_span_ms` |
+| `gpu_span_ms` | device time from the step's first device work (the input resolve) to the published tokens, from a timing event pair. Clones a runner performs after publish are outside. Under colocation it is elapsed time under contention, not kernel time |
+| `gpu_idle_floor_ms` | `cycle_ms` minus `gpu_span_ms`, zero when the next launch came before the span ended, a lower bound on device idle per step |
+| `graph_share` | share of steps whose sglang backbone forward replayed a CUDA graph. Model owned graphs (code predictors, frame graphs) are not represented, and custom prefill forwards report false by construction |
+| `idle_sleeps_per_step` | idle loop sleeps taken since the previous launch. Zero on the first step of a run. On the talker a sleep is a deferred batch waiting for thinker text |
+| `allocations_per_step` | caching allocator allocation count between consecutive launches, charged to the earlier step, process wide on the device, so encoder threads in the same process count. CUDA only |
 | `extend_tokens` | extend rows only, tokens per prefill batch |
 
 Rows are aggregated per `(mode, rows)` with p50, p90 and max. `wait_ms`
-near zero with `host_ms` near `cycle_ms` is a host bound stage. A large
-`wait_ms` is a device bound stage. `gpu_idle_floor_ms` says how much of
-each cycle the device was idle at least, and `graph_share` below one at a
-steady batch size means the stage runs eager steps.
+near zero with `host_ms` near `cycle_ms` is a host bound stage, on runners
+whose in forward synchronizations are known to be absent. A large `wait_ms`
+is a device bound stage. `gpu_idle_floor_ms` says how much of each cycle
+the device was idle at least, and `graph_share` below one at a steady batch
+size means the stage runs eager backbone steps.
 
-The ledger never synchronizes the device: device spans are read only after
-their end event reports complete, and spans still in flight when a run
-ends are counted in `unread_gpu_spans`. Its cost is two timing events and
-a few clock reads per step, plus one allocator statistics read per step on
-CUDA.
+The ledger adds no device wait of its own: spans are read only after their
+end event reports complete, spans still in flight when a run ends are
+counted in `unread_gpu_spans`, and its one synchronize stands in for the
+blocking token copy the runner is about to do on the same work. Its cost
+is two timing events, a few clock reads and one allocator counter read per
+step. A failure inside the ledger disables it for the process and never
+fails a request.
 
-On `/stop_profile` or `/stop_request_profile` each stage writes
-`<event_dir>/step_ledger_<stage>_<pid>.json` and logs one line per batch
-shape. The live aggregate is also returned under `step_ledger` in each
-stage's `/model_info` data.
+On `/stop_profile` or `/stop_request_profile` each stage that ran a batch
+during the run writes `<event_dir>/step_ledger_<stage>_<pid>.json` and logs
+one line per batch shape. The live aggregate is also returned under
+`step_ledger` in the `/model_info` data of every stage that runs an
+OmniScheduler.
 
 ## HTTP surface
 

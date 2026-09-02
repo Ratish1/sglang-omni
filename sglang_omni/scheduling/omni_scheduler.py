@@ -327,7 +327,10 @@ class OmniScheduler:
         # note(ratish): per step host and device accounting, recording only
         # while a request profile run is active. Handed to the runner in
         # bind_model_runner so it can mark the forward and the event waits.
-        self.step_ledger = StepLedger(self.device)
+        # The indexed device names the GPU in the written file.
+        from sglang_omni.platforms import current_platform
+
+        self.step_ledger = StepLedger(current_platform.get_device(self.gpu_id))
         # Hybrid-SWA per-layer capacities: upstream sources these from its
         # kv_cache_builder; no Omni model serves hybrid-SWA, so they stay None.
         self.full_tokens_per_layer = None
