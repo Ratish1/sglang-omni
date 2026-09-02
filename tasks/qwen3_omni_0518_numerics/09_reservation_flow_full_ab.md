@@ -1,6 +1,6 @@
 # 09. The reservation change, traced, and the full Qwen3-Omni A/B (2026-09-02)
 
-Code read: perf/scheduler-observed-reservation with the tracker extraction
+Code read: perf/scheduler-observed-reservation at 9769867a0, the tracker extraction
 on top of ce2735c02 (sglang_omni/scheduling/finished_output_tracker.py and
 the two hooks in omni_scheduler.py) against sglang 0.5.18
 (python/sglang/srt/managers). Line numbers below are from those trees.
@@ -183,7 +183,7 @@ One pass over every stage of the Qwen3-Omni CI
 file run with pytest at the CI settings, so the thresholds the tests assert
 are the verdict of each arm and nothing is re implemented. Arms as in every
 run so far: A 68c88dae6 (the base of perf/scheduler-observed-reservation),
-B ce2735c02. main has moved by three commits since the base (a README news
+B 9769867a0 (ce2735c02 plus the tracker extraction, same behavior). main has moved by three commits since the base (a README news
 order fix, the 0.1.4 release preparation, a README for .claude/skills),
 which the branch has to take before the PR opens. The test files are
 identical in the two arms (git diff of tests/test_model is empty).
