@@ -458,12 +458,10 @@ class ModelRunner:
     ):
         """Prepare hook → standard forward (if not custom) → sample-before-post
         block. Returns ``batch_result``."""
+        ledger = self.step_ledger
         try:
             if is_prefill:
                 self.before_prefill(forward_batch, schedule_batch, requests)
-                batch_result = self.custom_prefill_forward(
-                    forward_batch, schedule_batch, requests
-                )
             else:
                 self.before_decode(
                     forward_batch,
@@ -471,11 +469,23 @@ class ModelRunner:
                     requests,
                     is_lookahead=is_lookahead,
                 )
+            # note(ratish): the forward marks bracket the model forward only,
+            # custom or standard. The hooks above and the sampling below are
+            # in the wider step span, not in forward_ms.
+            if ledger is not None:
+                ledger.mark_forward_start()
+            if is_prefill:
+                batch_result = self.custom_prefill_forward(
+                    forward_batch, schedule_batch, requests
+                )
+            else:
                 batch_result = self.custom_decode_forward(
                     forward_batch, schedule_batch, requests
                 )
             if batch_result is None:
                 batch_result = self.tp_worker.forward_batch_generation(forward_batch)
+            if ledger is not None:
+                ledger.mark_forward_end()
 
             if (
                 not schedule_batch.is_prefill_only

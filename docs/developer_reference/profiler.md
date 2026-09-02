@@ -219,29 +219,32 @@ per batch the scheduler runs:
 
 | field | meaning |
 |---|---|
-| `cycle_ms` | launch to launch interval, the step period the loop achieves. Iterations that ran no batch (idle, or a talker batch deferred until thinker text arrives) are folded into the next step's cycle |
+| `cycle_ms` | launch to launch interval opened by this step's launch, the step period the loop achieves. Iterations that ran no batch (idle, or a talker batch deferred until thinker text arrives) are folded in. The last step of a run has none |
 | `host_ms` | wall of the launch call. Synchronous path: forward batch build, hooks, forward, sampling, publish, finalize, stream emission. Lookahead path: up to the launch's return, stream emission lands in `resolve_ms` |
 | `resolve_ms` | wall of the lookahead resolve of that step, absent on the synchronous path |
 | `wait_ms` | host time blocked on the step's device work: the staged token event, the completion event at resolve, and the end event a runner without staged tokens waits on before its blocking token copy. A synchronize a runner performs inside its own forward or hooks is not counted, it lands in `host_ms` and inflates `gpu_span_ms` |
-| `gpu_span_ms` | device time from the step's first device work (the input resolve) to the published tokens, from a timing event pair. Clones a runner performs after publish are outside. Under colocation it is elapsed time under contention, not kernel time |
-| `gpu_idle_floor_ms` | `cycle_ms` minus `gpu_span_ms`, zero when the next launch came before the span ended, a lower bound on device idle per step |
-| `graph_share` | share of steps whose sglang backbone forward replayed a CUDA graph. Model owned graphs (code predictors, frame graphs) are not represented, and custom prefill forwards report false by construction |
-| `idle_sleeps_per_step` | idle loop sleeps taken since the previous launch. Zero on the first step of a run. On the talker a sleep is a deferred batch waiting for thinker text |
-| `allocations_per_step` | caching allocator allocation count between consecutive launches, charged to the earlier step, process wide on the device, so encoder threads in the same process count. CUDA only |
-| `extend_tokens` | extend rows only, tokens per prefill batch |
+| `gpu_span_ms` | device time from the step's first device work (the input resolve) to the published tokens, from a timing event pair. Clones a runner performs after publish are outside. When the host launches slower than the device runs, the span holds the device's starvation, so it is elapsed time, not kernel time |
+| `forward_ms` | device time of the model forward alone, custom or standard, from a second event pair inside the span. A CUDA graph replay is one launch, so for graph steps this is the graph's device time with no starvation in it. A custom forward that samples or synchronizes inside itself (MOSS-TTS, MiniMax Music 3) includes that work |
+| `gpu_idle_floor_ms` | `cycle_ms` minus `gpu_span_ms` of the same step, zero when the next launch came before the span ended, a lower bound on device idle after the step |
+| `graph_share` | share of steps whose sglang backbone forward replayed a CUDA graph: the decode graph, or for extend rows the prefill graph, which sglang 0.5.18 refuses when bucket padding would exceed twice the token count, so a one token extend runs eager unless the engine captured a one token bucket. Model owned graphs (code predictors, frame graphs) are not represented, and custom prefill forwards report false by construction |
+| `idle_sleeps_per_step` | idle loop sleeps taken after this step's launch and before the next. On the talker a sleep is a deferred batch waiting for thinker text |
+| `allocations_per_step` | caching allocator allocation count between this launch and the next, process wide on the device, so encoder threads in the same process count. CUDA only |
+| `extend_tokens` | extend rows only, new tokens per prefill batch |
+| `cached_tokens` | extend rows only, radix cache prefix tokens per prefill batch. A row whose `extend_tokens` equals its rows is cache hits, not prefills |
 
 Rows are aggregated per `(mode, rows)` with p50, p90 and max. `wait_ms`
 near zero with `host_ms` near `cycle_ms` is a host bound stage, on runners
 whose in forward synchronizations are known to be absent. A large `wait_ms`
 is a device bound stage. `gpu_idle_floor_ms` says how much of each cycle
-the device was idle at least, and `graph_share` below one at a steady batch
-size means the stage runs eager backbone steps.
+the device was idle at least, `forward_ms` against `gpu_span_ms` says how
+much of the device span is the model forward, and `graph_share` below one
+at a steady batch size means the stage runs eager backbone steps.
 
 The ledger adds no device wait of its own: spans are read only after their
 end event reports complete, spans still in flight when a run ends are
 counted in `unread_gpu_spans`, and its one synchronize stands in for the
 blocking token copy the runner is about to do on the same work. Its cost
-is two timing events, a few clock reads and one allocator counter read per
+is four timing events, a few clock reads and one allocator counter read per
 step. A failure inside the ledger disables it for the process and never
 fails a request.
 
