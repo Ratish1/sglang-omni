@@ -475,3 +475,34 @@ The two measurements left before the PR opens, on that pair:
 
 The fp8 slim run of section 6 stands as the neutral case and is not
 repeated.
+
+### 6.5 Memory split or estimate
+
+Read from the doc 08 bf16 serve logs, lines attributed to a stage by the
+pool their token usage implies (5248 thinker, 20136 talker):
+
+| arm | talker running max | talker queued max | talker pool usage max | thinker running max | thinker queued |
+|---|---|---|---|---|---|
+| A 68c88dae6 | 9 | 27 | 0.07 (1.4k of 20136 tokens) | 3 | 0 |
+| B | 32 | 27 | 0.23 (4.6k of 20136 tokens) | 4 | 0 |
+
+The talker's pool holds 32 voice clone rows at under a quarter of its
+size. What stopped A at 9 rows was the estimate, 2867 reserved tokens per
+row for outputs of about 45 frames, not the memory. To satisfy that
+estimate at 32 rows the talker would need about 101k tokens, 4.6 GB of
+KV and five times what the rows use, and on this card that memory does
+not exist: the thinker's 0.73 leaves it 0.48 GB of KV over 56.9 GB of
+bf16 weights, so nothing can move from it to the talker. The bf16 H100
+colocated split is at the card's limit, and it is sized correctly for
+the workload once the estimate is right.
+
+A memory side calculation that sized each stage from rows times expected
+tokens would need the expected output length per stage, the quantity the
+tracker measures at runtime, as a static constant. It would also change
+nothing on fp8 H100 or H200, whose pools already exceed the estimate.
+sglang's 0.7 is a fair guess for chat, where outputs approach the cap. It
+is wrong for TTS stages whose cap is a safety stop 60 to 90 times the
+typical output, which is a property of Omni's request builders, and the
+measured fraction is the generic correction at the scheduler seam. The
+thinker on this profile carries the benchmark's max_tokens of 256
+(benchmarks/tasks/tts.py:779) and was never queued.
