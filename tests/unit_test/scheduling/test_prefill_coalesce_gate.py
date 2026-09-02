@@ -23,7 +23,10 @@ pytest.importorskip("sglang")
 from sglang.srt.managers.schedule_batch import NextBatchPlan  # noqa: E402
 
 from sglang_omni.scheduling import omni_scheduler  # noqa: E402
-from sglang_omni.scheduling.omni_scheduler import OmniScheduler  # noqa: E402
+from sglang_omni.scheduling.omni_scheduler import (  # noqa: E402
+    OmniScheduler,
+    RecentFinishedOutputTracker,
+)
 
 _UPSTREAM_BATCH = object()
 
@@ -60,6 +63,8 @@ class _StubScheduler:
         self._pending_request_builds: dict = {}
         self._pending_request_admissions: dict = {}
         self._backlogged_request_build_payloads: list = []
+        self.new_token_ratio_tracker = SimpleNamespace(current=0.7)
+        self.finished_output_tracker = RecentFinishedOutputTracker(window_size=1)
 
     def get_new_batch_prefill(self):
         # sglang 0.5.16 takes running_batch in and hands back a NextBatchPlan;
