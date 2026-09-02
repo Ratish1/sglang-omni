@@ -31,6 +31,14 @@ import sys
 from pathlib import Path
 
 
+def _logprob_kwargs(args, config_cls) -> dict:
+    # Checkouts before the logprob work have no top_logprobs field, so the
+    # helper stays usable on both arms of an A/B.
+    if args.top_logprobs and "top_logprobs" in config_cls.__dataclass_fields__:
+        return {"top_logprobs": args.top_logprobs}
+    return {}
+
+
 def run_videoamme(args) -> None:
     from benchmarks.dataset.prepare import DATASETS
     from benchmarks.eval.benchmark_omni_videoamme import run_videoamme_eval
@@ -48,7 +56,7 @@ def run_videoamme(args) -> None:
         video_max_pixels=401408,
         disable_tqdm=True,
         timeout_s=500,
-        top_logprobs=args.top_logprobs,
+        **_logprob_kwargs(args, VideoEvalConfig),
     )
     results = asyncio.run(run_videoamme_eval(config, compute_wer=False))
     s = results["summary"]
@@ -85,7 +93,7 @@ def run_videomme_talker(args) -> None:
         enable_audio=True,
         disable_tqdm=True,
         timeout_s=500,
-        top_logprobs=args.top_logprobs,
+        **_logprob_kwargs(args, VideoEvalConfig),
     )
     results = asyncio.run(
         run_video_eval(

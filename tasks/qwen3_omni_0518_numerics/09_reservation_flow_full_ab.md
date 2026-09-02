@@ -301,3 +301,21 @@ the retract replay, which is sglang's path and was measured on the talker
 requests share a batch, and batched kernels are not bitwise invariant to
 their batch mates. That is the same variance any two boots have and it is
 what the full A/B reads as run to run spread.
+
+### 5.4 The slim pass, the one that runs
+
+The CI pass of 5.1 is more than the question needs. The pass that runs is
+scripts/slim_ab.sh: manually started servers, no router, no pytest, three
+workloads per arm in this order, A then B.
+
+| stage | server | GPUs | concurrency | what it reads |
+|---|---|---|---|---|
+| seedtts_c1, c16, c32 | bf16 colocated profile (sgl-omni serve, the CI's yaml) | 1 | 1, 16, 32 on one boot | speed, then WER and UTMOS from the score pass |
+| mmsu_c16 | bf16 thinker only profile | 1 | 16 | accuracy over the 2000 clips, speed |
+| videomme_talker_c16 | bf16 disagg (run_qwen3_omni_speech_server.py) | 2 | 16 | thinker text accuracy, rtf, latency, qps |
+
+run_bench.py sends CI identical requests (top_logprobs off, the field does
+not exist on either arm). The score pass starts a Qwen3-ASR-1.7B server and
+runs the seedtts scorers in transcribe only and utmos only mode on every
+voice clone output directory. The readout is full_ab_compare.py over $OUT.
+Wall time is about 45 minutes per arm plus 15 minutes of scoring.
