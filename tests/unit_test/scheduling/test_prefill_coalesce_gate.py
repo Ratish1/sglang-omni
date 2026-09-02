@@ -13,7 +13,6 @@ patched to a sentinel.
 from __future__ import annotations
 
 import threading
-from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
@@ -24,6 +23,9 @@ pytest.importorskip("sglang")
 from sglang.srt.managers.schedule_batch import NextBatchPlan  # noqa: E402
 
 from sglang_omni.scheduling import omni_scheduler  # noqa: E402
+from sglang_omni.scheduling.finished_output_tracker import (  # noqa: E402
+    RecentFinishedOutputTracker,
+)
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler  # noqa: E402
 
 _UPSTREAM_BATCH = object()
@@ -62,10 +64,7 @@ class _StubScheduler:
         self._pending_request_admissions: dict = {}
         self._backlogged_request_build_payloads: list = []
         self.new_token_ratio_tracker = SimpleNamespace(current=0.7)
-        self._finished_output_fractions: deque[float] = deque()
-        self._observed_new_token_ratio = None
-
-    _apply_observed_new_token_ratio = OmniScheduler._apply_observed_new_token_ratio
+        self.finished_output_tracker = RecentFinishedOutputTracker(window_size=1)
 
     def get_new_batch_prefill(self):
         # sglang 0.5.16 takes running_batch in and hands back a NextBatchPlan;

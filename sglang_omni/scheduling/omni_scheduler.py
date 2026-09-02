@@ -34,7 +34,6 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     retract_all,
 )
-from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
 from sglang.srt.managers.scheduler import Scheduler as _Upstream
 from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -61,6 +60,7 @@ from sglang_omni.proto.admin import (
     ADMIN_UPDATE_WEIGHTS_FROM_TENSOR,
     ADMIN_WEIGHTS_CHECKER,
 )
+from sglang_omni.scheduling.finished_output_tracker import RecentFinishedOutputTracker
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.types import DeferredAdmission
 
@@ -407,26 +407,13 @@ class OmniScheduler:
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
-        # SGLang admits a request only while the KV pool holds, for every
-        # running request, min(max_new_tokens, CLIP_MAX_NEW_TOKENS) times
-        # new_token_ratio, its guess at how much of the cap an output uses
-        # (0.7 at first, decaying over 600 decode steps). Omni's stages set
-        # caps far above their typical output (a TTS talker emits tens of
-        # frames under a cap of thousands), so the guess reserves most of the
-        # pool for outputs that never come and admission stops well below
-        # max_running_requests. This scheduler finishes requests continuously,
-        # so the fraction is measured instead: the largest fraction of the
-        # clipped cap that a recently finished request used, applied before
-        # every admission. The window is one cohort of the rows that share the
-        # pool at once, so each running row is reserved what the longest
-        # member of the previous cohort needed and an outlier leaves after one
-        # turnover of the batch. Until a request has finished the tracker
-        # keeps SGLang's guess, and an output longer than any recent one takes
-        # SGLang's retract path like any other overrun.
-        self._finished_output_fractions: deque[float] = deque(
-            maxlen=max(int(self.max_running_requests), 1)
+        # The reservation SGLang's tracker guesses is measured from finished
+        # outputs instead (finished_output_tracker.py): the largest fraction
+        # of the clipped cap used in the last cohort of max_running_requests
+        # finishes is pushed into the tracker before every admission.
+        self.finished_output_tracker = RecentFinishedOutputTracker(
+            window_size=max(int(self.max_running_requests), 1)
         )
-        self._observed_new_token_ratio: float | None = None
         self.prefill_delayer = None
         self.lora_drainer = None
 
@@ -711,27 +698,6 @@ class OmniScheduler:
             output_streamer=self.output_streamer,
             abort_request=lambda request: self.abort(request.rid),
         )
-
-    def _record_finished_output(self, req: Any) -> None:
-        cap = req.sampling_params.max_new_tokens
-        if not cap:
-            return
-        clipped_cap = min(int(cap), CLIP_MAX_NEW_TOKENS)
-        # An output that ran past the clip counts as the whole clipped cap.
-        # sglang keeps the ratio within (0, 1]: from_config clamps init and
-        # min at 1.0, the post retract estimate clamps at 1.0, and the running
-        # budget in PrefillAdder multiplies the unclipped cap by the ratio, so
-        # a ratio above 1.0 would reserve more than the cap itself.
-        used = min(len(req.output_ids), clipped_cap)
-        self._finished_output_fractions.append(used / clipped_cap)
-        self._observed_new_token_ratio = None
-
-    def _apply_observed_new_token_ratio(self) -> None:
-        if not self._finished_output_fractions:
-            return
-        if self._observed_new_token_ratio is None:
-            self._observed_new_token_ratio = max(self._finished_output_fractions)
-        self.new_token_ratio_tracker.current = self._observed_new_token_ratio
 
     def self_check_during_idle(self) -> None:
         self.new_token_ratio_tracker.reset()
@@ -1376,7 +1342,9 @@ class OmniScheduler:
         #
         # Upstream passes running_batch in and expects a NextBatchPlan back,
         # so the coalesce hold-off returns an empty plan rather than None.
-        self._apply_observed_new_token_ratio()
+        observed_ratio = self.finished_output_tracker.max_fraction
+        if observed_ratio is not None:
+            self.new_token_ratio_tracker.current = observed_ratio
         if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
             return _Upstream.get_new_batch_prefill(self, running_batch)
         decode_is_idle = running_batch is None or running_batch.is_empty()
@@ -1666,7 +1634,7 @@ class OmniScheduler:
                 _detach_request_data(req)
                 continue
 
-            self._record_finished_output(req)
+            self.finished_output_tracker.observe_finished(req)
             result = None
             terminal_error = None
             try:
