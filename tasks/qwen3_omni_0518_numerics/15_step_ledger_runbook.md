@@ -24,8 +24,15 @@ Every server below runs alone on its GPU. Kill leftovers first with
 
 ## 1. The protocol, the same for every model
 
-One server per model. For each concurrency C in the model's list, in order,
-one profiled pass with the benchmark's default warmup:
+One fresh server per model and per concurrency point, one profiled pass
+with the benchmark's default warmup. Boot the server, run the point,
+stop the server, then the next point. The second run (doc 17 section
+1.3) showed why a server cannot be reused across points: the radix cache
+and the speaker artifact cache both hold the whole corpus after the
+first point, so every later point measures cache hits, and the cache
+state also changes what the pool admits. A fresh server per point is
+what CI does, so the numbers match CI's cold and warm mix exactly (C
+warm of 50 at concurrency C).
 
 ```
 curl -s -X POST http://127.0.0.1:$PORT/start_request_profile \
@@ -45,13 +52,24 @@ MOSS-TD, MOSS-TTS-Local, MOSS-TTS Delay and Higgs into a one token extend
 on a full prefix hit (doc 16 section 1). The benchmark's own warmup sends
 C requests first (`benchmarks/benchmarker/runner.py:23`), the same
 protocol CI runs, so at most C of the profiled prefills are hits and the
-`cached_tokens` column shows which rows they are. CUDA graphs are captured
-at server start and do not need a warm pass. The first steps of a window
-carry any remaining first use cost in their p90 and max, not in the p50.
+`cached_tokens` column shows which rows they are. Backbone CUDA graphs are
+captured at server start. Model owned graphs are not all captured at
+start (the Qwen3-TTS predictor graph is captured per batch bucket on
+first use, doc 17 section 4), so the first steps of a window carry first
+use costs in the ledger's max and in the request view's mean. Read the
+p50 columns of both, the view prints one since fa5ee9631.
 
 Each stage process writes `step_ledger_<stage>_<pid>.json` and logs one line
 per batch shape. The request view of the same window comes from
 `python -m sglang_omni.profiler $OUT/${MODEL}_c${C} --format table`.
+Before stopping the server, also keep its `/model_info`: since 5a0a6a6e2
+it lists, under `prefill_cuda_graph`, the replay buckets and the token
+count and batch size of every prefill that ran eager, which is what
+attributes an extend row whose `graph_share` is below one.
+
+```
+curl -s http://127.0.0.1:$PORT/model_info > $OUT/${MODEL}_c${C}/model_info.json
+```
 
 Keep per model and concurrency: the JSON files, the server log, and the
 benchmark's own results directory.
