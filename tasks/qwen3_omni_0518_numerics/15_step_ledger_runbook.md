@@ -7,7 +7,14 @@ active, and writes one JSON per stage process when the run stops. The
 first run on 79cc7c70a is read in doc 16, and the protocol below is the
 one corrected by that read: it needs 7b1bee5c4 or later, which charges
 cycles to the right step and adds the `forward_ms` and `cached_tokens`
-columns.
+columns. Since cec7b6b11 the branch sits on upstream main 15c4568bb, so
+the next run measures the merged predictor, head and sampler fusions
+(doc 18 section 1), and every run from now on uses that head or later.
+
+MiniMax Music 3 must be launched in the foreground under a terminal
+multiplexer: four detached launches died with exit code -9 in the
+dit_dav process during startup and a foreground launch succeeded
+(doc 17 section 8.3).
 
 ## 0. Before the first server
 
