@@ -1289,6 +1289,22 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         # graphed chain is only validated single-rank, so TP stays eager.
         return int(server_args.tp_size) == 1
 
+    def _record_predictor_graph_failure(self, key: tuple) -> None:
+        self._predictor_graph_disabled.add(key)
+        self._predictor_graph_failure_count += 1
+        logger.warning(
+            "Disabling Qwen3-TTS predictor CUDA graph for key=%s",
+            key,
+            exc_info=True,
+        )
+        if self._predictor_graph_failure_count >= _PREDICTOR_GRAPH_MAX_FAILURES:
+            self._predictor_graph_enabled = False
+            logger.warning(
+                "Disabling Qwen3-TTS predictor CUDA graphs entirely "
+                "after %d capture failures",
+                self._predictor_graph_failure_count,
+            )
+
     def _predictor_forward_graphed(
         self,
         layer0_codes: torch.Tensor,
@@ -1341,20 +1357,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     hidden_dtype=talker_hidden.dtype,
                 )
             except Exception:
-                self._predictor_graph_disabled.add(key)
-                self._predictor_graph_failure_count += 1
-                logger.warning(
-                    "Disabling Qwen3-TTS predictor CUDA graph for key=%s",
-                    key,
-                    exc_info=True,
-                )
-                if self._predictor_graph_failure_count >= _PREDICTOR_GRAPH_MAX_FAILURES:
-                    self._predictor_graph_enabled = False
-                    logger.warning(
-                        "Disabling Qwen3-TTS predictor CUDA graphs entirely "
-                        "after %d capture failures",
-                        self._predictor_graph_failure_count,
-                    )
+                self._record_predictor_graph_failure(key)
                 return None
             self._predictor_graphs[key] = graph
             self._predictor_graph_capture_count += 1
