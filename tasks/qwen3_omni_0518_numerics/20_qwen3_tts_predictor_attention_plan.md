@@ -380,11 +380,14 @@ Existing files changed:
   dispatch default, not a policy an operator chooses, and the capture
   timing shows its effect directly.
 - `tests/unit_test/qwen3_tts/test_pipeline.py`: three contract tests,
-  CPU runnable, one per factory, each asserting
-  `torch.backends.cuda.cudnn_sdp_enabled()` is false after the factory
-  ran, with the tokenizer loader, the vocoder warmup and the builder's
-  `build` stubbed the way the existing factory tests stub them
-  (`:1484`, `:3070`, `:306`), and a fixture restoring the flag.
+  CPU runnable, one per factory, and a fixture restoring the flag. The
+  preprocessing test asserts the flag is off after the factory. The
+  vocoder and engine tests assert the ordering contract itself: the
+  stubbed tokenizer loader and the stubbed `build` record the flag at
+  the moment they run, and the test asserts it was already off, so a
+  factory that set the flag after its first attention caller would
+  fail. Stubs follow the existing factory tests (`:1484`, `:3070`,
+  `:306`).
 - `tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py`: one new
   accelerator test that runs `scaled_dot_product_attention` under
   `torch.profiler` on the predictor's real shape family (batch 2, 16
