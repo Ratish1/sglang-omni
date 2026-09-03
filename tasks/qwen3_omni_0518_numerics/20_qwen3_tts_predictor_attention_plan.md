@@ -349,10 +349,10 @@ message change. Rollback is a revert, after which the process returns
 to cuDNN dispatch on its next start. Mixed versions are not a concern,
 the flag is per process.
 
-Observability. The INFO line in every stage process log, and the
-capture timing lines on the measurement branch, whose first warmup pass
-shows the absence of plan builds directly. The trace scripts of doc 19
-read the same from a torch trace.
+Observability. The capture timing lines on the measurement branch,
+whose first warmup pass shows the absence of plan builds directly, and
+the trace scripts of doc 19 for a torch trace. No log line, the flag is
+a repair of a dispatch default.
 
 Cost. Startup: none. Steady state: one kernel per attention call as
 before, flash instead of cuDNN. First eager pass per bucket: the 15
@@ -372,21 +372,19 @@ it carries.
 Existing files changed:
 
 - `sglang_omni/models/qwen3_tts/stages.py`: new module function
-  `disable_cudnn_attention()` with a module level `_cudnn_attention_logged`
-  guard, a `note(ratish)` comment stating the reason in one sentence
-  with the doc 19 finding, and a call at the top of
+  `disable_cudnn_attention()` that calls
+  `torch.backends.cuda.enable_cudnn_sdp(False)`, with a `note(ratish)`
+  comment carrying the doc 19 finding, and a call at the top of
   `create_preprocessing_executor`, `create_sglang_tts_engine_executor`
-  and `create_vocoder_executor`. The helper calls
-  `torch.backends.cuda.enable_cudnn_sdp(False)` unconditionally and
-  logs once at INFO with the stage name passed by the caller.
+  and `create_vocoder_executor`. No log line: this is a repair of a
+  dispatch default, not a policy an operator chooses, and the capture
+  timing shows its effect directly.
 - `tests/unit_test/qwen3_tts/test_pipeline.py`: three contract tests,
-  CPU runnable. One asserts the helper turns the flag off and is
-  idempotent, restoring the flag afterwards through a fixture. One
-  asserts `create_preprocessing_executor("model")` leaves
-  `torch.backends.cuda.cudnn_sdp_enabled()` false. One asserts the
-  vocoder and engine factories do the same with the loader and the
-  builder's `build` stubbed the way the existing factory tests stub
-  them (`:1484`, `:3070`, `:306`).
+  CPU runnable, one per factory, each asserting
+  `torch.backends.cuda.cudnn_sdp_enabled()` is false after the factory
+  ran, with the tokenizer loader, the vocoder warmup and the builder's
+  `build` stubbed the way the existing factory tests stub them
+  (`:1484`, `:3070`, `:306`), and a fixture restoring the flag.
 - `tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py`: one new
   accelerator test that runs `scaled_dot_product_attention` under
   `torch.profiler` on the predictor's real shape family (batch 2, 16
@@ -395,9 +393,7 @@ Existing files changed:
   kernel name contains `cudnn`. This is the dispatch decision for the
   real shapes on the CI H100, which the fake talker with head dim 4
   cannot exercise.
-- `docs/cookbook/qwen3_tts.md`: one sentence in the server
-  configuration section stating that the pipeline's stage processes run
-  with cuDNN scaled dot product attention disabled and why.
+No cookbook change: the comment on the helper is the record.
 
 No file is generated. No configuration schema changes. The predictor
 code does not change in this slice.
@@ -410,7 +406,7 @@ black and isort, and the accelerator module passes on the box.
 | requirement or invariant | plausible violation | evidence | oracle |
 |---|---|---|---|
 | no plan build on the first eager pass at a new bucket | the flag is not set in the engine process, or is set after the first call | run 5: c1 and c16 on a measurement branch that is `perf/step-ledger` rebased onto the fix commit, fresh server per point | every capture line shows warmup 1 within about two times warmup 2 and no `cudaGetDeviceProperties` gap in a trace if one is taken |
-| the flag is set in every stage process in every layout | a factory does not call the helper, or the vocoder split out keeps cuDNN | the three factory contract tests, and the INFO line in each stage log of run 5 with `--vocoder.process vocoder` and once without | flag false after each factory, one line per process |
+| the flag is set in every stage process in every layout | a factory does not call the helper, or the vocoder split out keeps cuDNN | the three factory contract tests, and run 5 once with `--vocoder.process vocoder` and once without | flag false after each factory, no plan build gap in either layout |
 | flash admits the predictor's shapes | a constraint not read here rejects them and math serves, slower | the new accelerator kernel name test on the CI H100, plus decode `forward_ms` p50 in run 5 | no `cudnn` kernel, and p50 within noise of run 3 |
 | graph against eager bit identity | a backend that differs between capture and eager | the existing 55 tests on the box | all pass |
 | batch invariance of outputs | a backend whose per row result depends on batch | `tests/test_model/test_qwen3_tts_batch_invariance.py` on the box | passes |
@@ -431,11 +427,13 @@ run so far.
 
 ## 8. Implementation state
 
-Implemented at abe1c2221 on `perf/qwen3-tts-cudnn-attention` (local, not
-pushed at the time of writing): the helper and its three calls in
-`qwen3_tts/stages.py`, four CPU contract tests in `test_pipeline.py`,
-the accelerator kernel name test in `test_predictor_cuda_graph.py`, and
-the cookbook sentence. The CPU tests could not run on the laptop, whose
+Implemented on `perf/qwen3-tts-cudnn-attention` (local, not pushed at
+the time of writing, the commit hash is in the branch): the helper and
+its three calls in `qwen3_tts/stages.py`, three CPU contract tests in
+`test_pipeline.py` and the accelerator kernel name test in
+`test_predictor_cuda_graph.py`. The log line and the cookbook sentence
+of the first cut were removed on review: a repair of a dispatch default
+is not something to announce. The CPU tests could not run on the laptop, whose
 environment lacks the omni import chain, so the commit's exit gate is
 open until the box runs `tests/unit_test/qwen3_tts` and the accelerator
 module. Section 7 is the order of what follows.
