@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from typing import Any, Iterable, Optional, Tuple
 
 import torch
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import multinomial_with_seed
@@ -48,7 +49,6 @@ logger = logging.getLogger(__name__)
 QTTS_PREDICTOR_GRAPH_ENV = "SGLANG_OMNI_QTTS_PREDICTOR_GRAPH"
 _PREDICTOR_GRAPH_MAX_KEYS = 32
 _PREDICTOR_GRAPH_MAX_FAILURES = 8
-# note(ratish): two, the count sglang's decode graph backend uses.
 _PREDICTOR_GRAPH_WARMUP_PASSES = 2
 # Note: (Jiaxin Deng) 50 is on the ladder because it is the family checkpoint
 # default, keeping the dominant signature's kernel width exactly as before.
@@ -95,16 +95,6 @@ def _predictor_signature_terms(
         else:
             max_top_k = quantized
     return max_top_k, has_top_p, has_unbounded_top_k
-
-
-def _batch_invariant_mode_enabled() -> bool:
-    # note(ratish): imported lazily, the module needs triton and torch's CPU
-    # and macOS wheels ship without it.
-    try:
-        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-    except ImportError:
-        return False
-    return bool(is_batch_invariant_mode_enabled())
 
 
 def _sample_seeded_categorical(
@@ -1258,10 +1248,8 @@ class Qwen3TTSTalker(nn.Module):
         return int(server_args.tp_size) == 1
 
     def _resolve_predictor_graph_policy(self) -> None:
-        # note(ratish): read after ModelRunner.initialize, which turns batch
-        # invariant mode on only after the model is built. That mode overrides
-        # aten::addmm but not the out variant, so the fused addmm would keep
-        # the batch dependent GEMM.
+        # note(ratish): batch invariant mode is on only after ModelRunner.initialize,
+        # and it overrides aten::addmm but not the out variant.
         device = self._predictor_k_cache.device
         is_cuda = device.type == "cuda"
         self._predictor_graph_enabled = (
@@ -1270,7 +1258,7 @@ class Qwen3TTSTalker(nn.Module):
         self._predictor_fused_addmm_allowed = (
             is_cuda
             and torch.cuda.get_device_capability(device) == (9, 0)
-            and not _batch_invariant_mode_enabled()
+            and not is_batch_invariant_mode_enabled()
         )
 
     def uniform_predictor_graph_signature(

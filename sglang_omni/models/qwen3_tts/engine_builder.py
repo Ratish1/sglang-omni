@@ -118,10 +118,8 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         del server_args
         if not generation_cuda_graph_enabled:
             return
-        # note(ratish): after sglang's backbone graphs and before the stage
-        # reports ready. The bucket warmups also build cuDNN's attention plans,
-        # which otherwise land inside the first serving step of each new batch
-        # size.
+        # note(ratish): the bucket warmups also build cuDNN's attention plans,
+        # which otherwise land inside the first serving step of each batch size.
         defaults = self.wrapper._merge_generate_kwargs()
         signature = model.uniform_predictor_graph_signature(
             do_sample=bool(defaults["subtalker_dosample"]),

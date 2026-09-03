@@ -1328,7 +1328,7 @@ def test_batch_invariant_mode_keeps_the_eager_gemm_on_the_graph_path(
         lambda: SimpleNamespace(disable_cuda_graph=False, tp_size=1),
     )
     monkeypatch.setattr(
-        sglang_model_module, "_batch_invariant_mode_enabled", lambda: True
+        sglang_model_module, "is_batch_invariant_mode_enabled", lambda: True
     )
     original_addmm = torch.addmm
     calls = []
