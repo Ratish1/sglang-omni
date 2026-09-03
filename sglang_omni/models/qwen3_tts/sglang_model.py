@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+import time
 from contextlib import contextmanager
 from typing import Any, Iterable, Optional, Tuple
 
@@ -77,6 +79,84 @@ def _sample_seeded_categorical(
     return multinomial_with_seed(logprobs, seeds, positions).view(-1)
 
 
+class _PredictorCaptureTiming:
+    """Host wall and caching allocator deltas for each phase of one predictor
+    graph capture, logged as one line so the serve log dates every capture
+    with its split.
+
+    Allocator samples are taken between phases, never inside one, so their
+    own cost lands in the instrument figure and in no phase. Device side
+    figures come from timing events on the streams involved and add no
+    wait of their own.
+    """
+
+    _ALLOCATOR_KEYS = (
+        "allocation.all.allocated",
+        "num_device_alloc",
+        "num_device_free",
+        "reserved_bytes.all.current",
+    )
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._started = time.perf_counter()
+        self._phases: list[tuple[str, float, dict[str, int]]] = []
+        self._device_ms: dict[str, float] = {}
+
+    def _sample(self) -> dict[str, int]:
+        try:
+            stats = torch.cuda.memory_stats(self._device)
+        except Exception:
+            return {}
+        return {key: int(stats.get(key, 0)) for key in self._ALLOCATOR_KEYS}
+
+    @contextmanager
+    def phase(self, name: str):
+        before = self._sample()
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - started
+            after = self._sample()
+            delta = {key: after.get(key, 0) - before.get(key, 0) for key in before}
+            self._phases.append((name, elapsed, delta))
+
+    def device_ms(self, name: str, value: float) -> None:
+        self._device_ms[name] = value
+
+    def log(self, key: tuple, ordinal: int) -> None:
+        total = time.perf_counter() - self._started
+        phase_total = sum(elapsed for _, elapsed, _ in self._phases)
+        parts = []
+        for name, elapsed, delta in self._phases:
+            part = f"{name}={elapsed * 1e3:.1f}ms"
+            allocations = delta.get("allocation.all.allocated", 0)
+            if allocations:
+                part += f"/{allocations}allocs"
+            device_allocs = delta.get("num_device_alloc", 0)
+            if device_allocs:
+                part += f"/{device_allocs}mallocs"
+            device_frees = delta.get("num_device_free", 0)
+            if device_frees:
+                part += f"/{device_frees}frees"
+            released = -delta.get("reserved_bytes.all.current", 0)
+            if released > 0:
+                part += f"/{released / 2**20:.0f}MiB_released"
+            parts.append(part)
+        for name, value in self._device_ms.items():
+            parts.append(f"{name}={value:.1f}ms")
+        logger.info(
+            "Qwen3-TTS predictor CUDA graph capture key=%s ordinal=%d "
+            "total=%.1fms instrument=%.1fms %s",
+            key,
+            ordinal,
+            total * 1e3,
+            (total - phase_total) * 1e3,
+            " ".join(parts),
+        )
+
+
 class _PredictorDecodeGraph:
     """CUDA graph over the full per-token predictor chain for one batch bucket.
 
@@ -110,6 +190,7 @@ class _PredictorDecodeGraph:
         self.graph = torch.cuda.CUDAGraph()
         self.result_codes: torch.Tensor | None = None
         self.summed_embeddings: torch.Tensor | None = None
+        self._replay_count = 0
         try:
             self._capture()
         except Exception:
@@ -125,43 +206,90 @@ class _PredictorDecodeGraph:
     def _capture(self) -> None:
         model = self.model
         device = self.layer0_codes.device
+        timing = _PredictorCaptureTiming(device)
+        ordinal = (
+            int(getattr(model, "_predictor_graph_capture_count", 0))
+            + int(getattr(model, "_predictor_graph_failure_count", 0))
+            + 1
+        )
         with (
             torch.cuda.device(device),
             model._predictor_graph_capture_state(self.batch_size, self.signature),
         ):
             current_stream = torch.cuda.current_stream(device=device)
+            # note(ratish): three timing events, none waited on early. The
+            # step event marks where the serving stream stood when the
+            # capture began, the warmup stream reaches its start event only
+            # after that work, so the gap between the two is the step's own
+            # device work still pending, and the gap between the warmup
+            # events is the device time of the two warmup passes.
+            step_pending = torch.cuda.Event(enable_timing=True)
+            warmup_started = torch.cuda.Event(enable_timing=True)
+            warmup_done = torch.cuda.Event(enable_timing=True)
+            step_pending.record(current_stream)
             warmup_stream = torch.cuda.Stream(device=device)
             warmup_stream.wait_stream(current_stream)
             with torch.cuda.stream(warmup_stream):
-                for _ in range(2):
-                    model._code_predictor_forward_incremental(
-                        self.layer0_codes,
-                        self.talker_hidden,
-                        semantic_positions=self.semantic_positions,
-                        for_capture=True,
-                    )
+                warmup_started.record(warmup_stream)
+                for pass_index in (1, 2):
+                    with timing.phase(f"warmup{pass_index}"):
+                        model._code_predictor_forward_incremental(
+                            self.layer0_codes,
+                            self.talker_hidden,
+                            semantic_positions=self.semantic_positions,
+                            for_capture=True,
+                        )
+                warmup_done.record(warmup_stream)
             current_stream.wait_stream(warmup_stream)
+
+            # note(ratish): torch.cuda.graph synchronizes the whole device and
+            # empties the caching allocator on entry. The same two calls run
+            # here first, split so the wait for this capture's own warmup
+            # work, the wait for every other stream on the device, and the
+            # allocator flush are each timed alone. Both calls are
+            # idempotent, so the context manager's own entry then repeats
+            # them at no cost, and its timing shows that.
+            with timing.phase("warmup_drain"):
+                warmup_done.synchronize()
+            timing.device_ms(
+                "step_pending_gpu", step_pending.elapsed_time(warmup_started)
+            )
+            timing.device_ms("warmup_gpu", warmup_started.elapsed_time(warmup_done))
+            with timing.phase("device_drain"):
+                torch.cuda.synchronize(device)
+            with timing.phase("empty_cache"):
+                torch.cuda.empty_cache()
 
             capture_stream = torch.cuda.Stream(device=device)
             capture_stream.wait_stream(current_stream)
-            with torch.cuda.graph(
+            graph_context = torch.cuda.graph(
                 self.graph,
                 pool=model._predictor_graph_memory_pool(),
                 stream=capture_stream,
                 capture_error_mode="thread_local",
-            ):
-                self.result_codes, self.summed_embeddings = (
-                    model._code_predictor_forward_incremental(
-                        self.layer0_codes,
-                        self.talker_hidden,
-                        semantic_positions=self.semantic_positions,
-                        for_capture=True,
+            )
+            with timing.phase("graph_enter"):
+                graph_context.__enter__()
+            try:
+                with timing.phase("capture_pass"):
+                    self.result_codes, self.summed_embeddings = (
+                        model._code_predictor_forward_incremental(
+                            self.layer0_codes,
+                            self.talker_hidden,
+                            semantic_positions=self.semantic_positions,
+                            for_capture=True,
+                        )
                     )
-                )
+            except BaseException:
+                graph_context.__exit__(*sys.exc_info())
+                raise
+            with timing.phase("graph_exit"):
+                graph_context.__exit__(None, None, None)
             current_stream.wait_stream(capture_stream)
 
         if self.result_codes is None or self.summed_embeddings is None:
             raise RuntimeError("Qwen3-TTS predictor CUDA graph captured no outputs")
+        timing.log(key=(self.batch_size, *self.signature), ordinal=ordinal)
 
     @torch.no_grad()
     def replay(
@@ -188,7 +316,18 @@ class _PredictorDecodeGraph:
                 self.talker_hidden[live:].zero_()
                 if semantic_positions is not None:
                     self.semantic_positions[live:].zero_()
+            replay_started = time.perf_counter()
             self.graph.replay()
+            if self._replay_count == 0:
+                # note(ratish): the first launch of an instantiated graph can
+                # upload it, so its host wall is logged once per key.
+                logger.info(
+                    "Qwen3-TTS predictor CUDA graph first replay key=%s "
+                    "launch=%.1fms",
+                    (self.batch_size, *self.signature),
+                    (time.perf_counter() - replay_started) * 1e3,
+                )
+            self._replay_count += 1
         assert self.result_codes is not None
         assert self.summed_embeddings is not None
         return self.result_codes[:live], self.summed_embeddings[:live]
