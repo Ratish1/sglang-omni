@@ -69,6 +69,30 @@ def _quantize_predictor_top_k(max_top_k: int, vocab_size: int) -> int | None:
     return None
 
 
+def _predictor_signature_terms(
+    sampled_top_ks: list[int],
+    sampled_top_ps: list[float],
+    vocab_size: int,
+) -> tuple[int, bool, bool]:
+    """The one signature rule, shared by the batch path and the startup capture."""
+    bounded_top_ks = [
+        int(top_k) for top_k in sampled_top_ks if 0 < int(top_k) < vocab_size
+    ]
+    has_top_p = any(0.0 < float(top_p) < 1.0 for top_p in sampled_top_ps)
+    has_unbounded_top_k = len(bounded_top_ks) != len(sampled_top_ks)
+    max_top_k = 0
+    max_bounded_top_k = max(bounded_top_ks, default=0)
+    if max_bounded_top_k > 0 and not has_unbounded_top_k:
+        # Note: (Jiaxin Deng) ladder-quantized so predictor-graph keys are
+        # shared across request top_k values; per-row masks keep true k.
+        quantized = _quantize_predictor_top_k(max_bounded_top_k, vocab_size)
+        if quantized is None:
+            has_unbounded_top_k = True
+        else:
+            max_top_k = quantized
+    return max_top_k, has_top_p, has_unbounded_top_k
+
+
 def _sample_seeded_categorical(
     logprobs: torch.Tensor,
     seeds: torch.Tensor,
@@ -1063,30 +1087,16 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 sample_rows.append(row_idx)
 
         predictor_vocab_size = int(self.config.code_predictor_config.vocab_size)
-        sampled_top_ks = [sub_top_ks[row_idx] for row_idx in sample_rows]
-        bounded_top_ks = [
-            top_k for top_k in sampled_top_ks if 0 < int(top_k) < predictor_vocab_size
-        ]
+        max_top_k, has_top_p, has_unbounded_top_k = _predictor_signature_terms(
+            [sub_top_ks[row_idx] for row_idx in sample_rows],
+            [sub_top_ps[row_idx] for row_idx in sample_rows],
+            predictor_vocab_size,
+        )
         self._sub_batch_size = batch_size
         self._sub_sample_count = len(sample_rows)
         self._sub_sample_max_row_index = sample_rows[-1] if sample_rows else -1
         self._sub_has_sampled_rows = bool(sample_rows)
-        self._sub_sampled_has_top_p = any(
-            0.0 < float(sub_top_ps[row_idx]) < 1.0 for row_idx in sample_rows
-        )
-        has_unbounded_top_k = len(bounded_top_ks) != len(sampled_top_ks)
-        max_top_k = 0
-        max_bounded_top_k = max(bounded_top_ks, default=0)
-        if max_bounded_top_k > 0 and not has_unbounded_top_k:
-            # Note: (Jiaxin Deng) ladder-quantized so predictor-graph keys are
-            # shared across request top_k values; per-row masks keep true k.
-            quantized = _quantize_predictor_top_k(
-                max_bounded_top_k, predictor_vocab_size
-            )
-            if quantized is None:
-                has_unbounded_top_k = True
-            else:
-                max_top_k = quantized
+        self._sub_sampled_has_top_p = has_top_p
         self._sub_sampled_max_top_k = max_top_k
         self._sub_sampled_has_unbounded_top_k = has_unbounded_top_k
 
