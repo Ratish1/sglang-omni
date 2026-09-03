@@ -187,6 +187,7 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
     talker._predictor_graph_capacity_warned = False
     talker._predictor_graph_capture_count = 0
     talker._predictor_graph_pool = None
+    talker._predictor_capture_stream = None
     return talker
 
 
@@ -1057,6 +1058,34 @@ def test_server_disable_cuda_graph_gates_predictor(monkeypatch: pytest.MonkeyPat
 
     assert not talker._predictor_graphs
     assert talker._predictor_graph_enabled is False
+    assert torch.equal(graph_codes, eager_codes)
+    assert torch.equal(graph_embeds, eager_embeds)
+
+
+@pytest.mark.accelerator
+def test_failed_capture_restores_the_current_stream(monkeypatch: pytest.MonkeyPatch):
+    device = torch.device("cuda")
+    talker = _build_talker(device)
+    real_forward = Qwen3TTSTalker._code_predictor_forward_incremental
+
+    def _sync_inside_capture(self, *args, **kwargs):
+        if torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()
+        return real_forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Qwen3TTSTalker, "_code_predictor_forward_incremental", _sync_inside_capture
+    )
+    talker.prepare_decode_buffers(_uniform_requests(2))
+    layer0, hidden, positions = _step_inputs(2, device)
+    eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
+
+    graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
+
+    assert torch.cuda.current_stream(device) == torch.cuda.default_stream(device)
+    assert gc.isenabled()
+    assert not talker._predictor_graphs
+    assert talker._predictor_graph_failure_count == 1
     assert torch.equal(graph_codes, eager_codes)
     assert torch.equal(graph_embeds, eager_embeds)
 

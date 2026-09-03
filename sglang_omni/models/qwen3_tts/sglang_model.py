@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 from contextlib import contextmanager
@@ -50,6 +51,7 @@ logger = logging.getLogger(__name__)
 QTTS_PREDICTOR_GRAPH_ENV = "SGLANG_OMNI_QTTS_PREDICTOR_GRAPH"
 _PREDICTOR_GRAPH_MAX_KEYS = 32
 _PREDICTOR_GRAPH_MAX_FAILURES = 8
+_PREDICTOR_GRAPH_WARMUP_PASSES = 2
 # Note: (Jiaxin Deng) 50 is on the ladder because it is the family checkpoint
 # default, keeping the dominant signature's kernel width exactly as before.
 _PREDICTOR_TOP_K_LADDER = (4, 8, 16, 32, 50, 64, 128, 256, 512, 1024)
@@ -965,6 +967,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self._predictor_graph_capacity_warned = False
         self._predictor_graph_capture_count = 0
         self._predictor_graph_pool = None
+        self._predictor_capture_stream: torch.cuda.Stream | None = None
         _bind_default_weight_loaders(self)
         self._cached_params_dict = dict(self.named_parameters())
         self._sampler = None
@@ -1239,12 +1242,37 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         # graphed chain is only validated single-rank, so TP stays eager.
         return int(server_args.tp_size) == 1
 
+    @contextmanager
+    def _predictor_capture_session(self):
+        """One stream per talker for warmups and captures: the allocator only
+        reuses a pool block on the stream that freed it. Automatic collection
+        is off for the window because a CUDAGraph finalizer reached by the
+        cyclic collector while a stream is capturing destroys its pool inside
+        the capture."""
+        device = self._predictor_k_cache.device
+        if self._predictor_capture_stream is None:
+            self._predictor_capture_stream = torch.cuda.Stream(device=device)
+        capture_stream = self._predictor_capture_stream
+        current_stream = torch.cuda.current_stream(device=device)
+        capture_stream.wait_stream(current_stream)
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with torch.cuda.device(device):
+                yield
+        finally:
+            current_stream.wait_stream(capture_stream)
+            if gc_was_enabled:
+                gc.enable()
+
     @torch.no_grad()
     def _capture_predictor_graph(
         self,
         bucket_size: int,
         signature: tuple,
     ) -> _PredictorDecodeGraph:
+        capture_stream = self._predictor_capture_stream
+        assert capture_stream is not None, "capture outside a capture session"
         device = self._predictor_k_cache.device
         graph = _PredictorDecodeGraph(
             bucket_size,
@@ -1253,6 +1281,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             hidden_size=int(self._output_embeds.shape[-1]),
             hidden_dtype=self._output_embeds.dtype,
         )
+        # note(ratish): the buffers are zero filled on the current stream and
+        # layer0_codes is an embedding index, so the capture stream waits here.
+        capture_stream.wait_stream(torch.cuda.current_stream(device=device))
 
         def run_once() -> Tuple[torch.Tensor, torch.Tensor]:
             return self._code_predictor_forward_incremental(
@@ -1262,20 +1293,15 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             )
 
         try:
+            # note(ratish): the outer stream context restores the current stream
+            # when a failed capture raises from capture_end before torch.cuda.graph
+            # restores it.
             with (
-                torch.cuda.device(device),
                 self._predictor_graph_capture_state(bucket_size, signature),
+                torch.cuda.stream(capture_stream),
             ):
-                current_stream = torch.cuda.current_stream(device=device)
-                warmup_stream = torch.cuda.Stream(device=device)
-                warmup_stream.wait_stream(current_stream)
-                with torch.cuda.stream(warmup_stream):
-                    for _ in range(2):
-                        run_once()
-                current_stream.wait_stream(warmup_stream)
-
-                capture_stream = torch.cuda.Stream(device=device)
-                capture_stream.wait_stream(current_stream)
+                for _ in range(_PREDICTOR_GRAPH_WARMUP_PASSES):
+                    run_once()
                 with torch.cuda.graph(
                     graph.graph,
                     pool=self._predictor_graph_memory_pool(),
@@ -1283,7 +1309,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     capture_error_mode="thread_local",
                 ):
                     graph.result_codes, graph.summed_embeddings = run_once()
-                current_stream.wait_stream(capture_stream)
         except Exception:
             # Note: (Jiaxin Deng) release the graph's private memory pool
             # eagerly; the raising object may linger on traceback frames.
@@ -1356,7 +1381,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     )
                 return None
             try:
-                graph = self._capture_predictor_graph(bucket_size, signature)
+                with self._predictor_capture_session():
+                    graph = self._capture_predictor_graph(bucket_size, signature)
             except Exception:
                 self._record_predictor_graph_failure(key)
                 return None
