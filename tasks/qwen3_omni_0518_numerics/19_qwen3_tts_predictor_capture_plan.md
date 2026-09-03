@@ -13,8 +13,10 @@ read, the evidence, the hypotheses with the measurement that decides
 each, and the design options gated on those numbers. No fix is written
 until section 5 has numbers.
 
-Anchors are main 15c4568bb for omni, v0.5.18 for sglang, 2.9.1 for
-PyTorch.
+Anchors are main 15c4568bb for omni, v0.5.18 for sglang, and v2.13.0
+for PyTorch, the pin in pyproject and the version on the H100 box. The
+local clones at /Users/ratish/sglang and /Users/ratish/pytorch are
+checked out at those tags.
 
 ## 1. Mechanics as read
 
@@ -38,11 +40,12 @@ decode or prefill step
                     :145 new capture stream, wait on the serving stream
                     :147 torch.cuda.graph(graph, pool, capture stream,
                          capture_error_mode="thread_local")
-                           torch/cuda/graphs.py:242 torch.cuda.synchronize()
-                           :252 torch.cuda.empty_cache()
-                           :258 capture_begin
+                           torch/cuda/graphs.py:439 torch.cuda.synchronize()
+                           :449 torch.cuda.empty_cache()
+                           :451 torch._C._host_emptyCache()
+                           :462 capture_begin
                     :153 one pass of the chain, recorded
-                           graphs.py:266 capture_end (instantiate)
+                           graphs.py:477 capture_end (instantiate)
                     :161 serving stream waits on the capture stream
 ```
 
@@ -81,13 +84,14 @@ cannot move to a moment when those buffers are live for another batch.
   one-time setup is paid before capture"
   (`runner_backend/full_cuda_graph_backend.py:103-108`). No rationale
   for the count. PyTorch's training helper uses three
-  (`graphs.py:296`, "hopefully prevents cudnn benchmarking and other
+  (`graphs.py:494`, "hopefully prevents cudnn benchmarking and other
   lazy-initialization cuda work from ending up in any captures",
-  :422-424).
+  :644).
 - The same `torch.cuda.graph` context as ours, so it pays the device
-  synchronize and the allocator flush per shape too, at startup where
-  nothing waits (`full_cuda_graph_backend.py:126-129`). Default
-  `capture_error_mode` "global", ours is "thread_local".
+  synchronize, the allocator flush and the pinned host cache flush per
+  shape too, at startup where nothing waits
+  (`full_cuda_graph_backend.py:126-129`). Default `capture_error_mode`
+  "global" (`graphs.py:415`), ours is "thread_local".
 - One capture stream for every shape, taken from the
   `graph_capture` context (`parallel_state.py:586-608`), and one
   process wide memory pool (`runner_utils/pool.py:34-40`). Shapes are
@@ -97,12 +101,12 @@ cannot move to a moment when those buffers are live for another batch.
 - Garbage collection is frozen across the whole capture loop
   (`base_cuda_graph_runner.py:45-61`), and `torch.cuda.graph` itself no
   longer collects on entry unless `TORCH_CUDAGRAPH_GC` is set
-  (`torch/compiler/config.py:117`).
+  (`torch/compiler/config.py:182`).
 - A one time kernel warmup and autotune runs before any capture
   (`base_runner.py:229-260`), for flashinfer workspaces and autotuning,
   not a per shape model warmup.
 
-PyTorch's own note on pool sharing (`graphs.py:204-206`): "if you pass a
+PyTorch's own note on pool sharing (`graphs.py:398-399`): "if you pass a
 pool used by a previous capture and the previous capture used an
 explicit stream argument, you should pass the same stream argument to
 this capture". Our code takes two new streams per capture. PyTorch hands
@@ -234,3 +238,100 @@ the same way after A.
 The Qwen3-TTS server log with the capture and first replay lines, the
 ledger JSON of the c1 and c16 windows, and `/model_info` per window, per
 the runbook in doc 15 section 3.2.
+
+## 7. Run 3 results (d6425827b, GPU 3, fresh server per point)
+
+Seven captures, host wall per phase in ms, from the capture lines of
+the two server logs. Ordinal is the capture's number in its process.
+
+| window | bucket | ordinal | total | warmup 1 | warmup 2 | drain | flush | enter | capture pass | exit |
+|---|---|---|---|---|---|---|---|---|---|---|
+| c1 | 1 | 1 | 683.5 | 601.4 | 34.0 | 0.4 | 0.9 | 0.2 | 38.8 | 5.5 |
+| c16 | 8 | 1 | 651.6 | 569.1 | 35.2 | 0.0 | 1.6 | 0.2 | 38.3 | 5.3 |
+| c16 | 16 | 2 | 477.6 | 396.2 | 33.3 | 0.1 | 0.5 | 0.2 | 31.6 | 13.5 |
+| c16 | 12 | 3 | 591.9 | 499.5 | 36.8 | 0.0 | 0.4 | 0.1 | 33.6 | 19.2 |
+| c16 | 2 | 4 | 483.9 | 389.0 | 34.0 | 0.0 | 24.2 | 0.2 | 29.0 | 5.5 |
+| c16 | 1 | 5 | 467.6 | 401.6 | 32.1 | 0.0 | 0.2 | 0.1 | 28.3 | 2.9 |
+| c16 | 4 | 6 | 600.3 | 470.8 | 32.8 | 0.0 | 46.3 | 0.2 | 28.2 | 20.0 |
+
+The allocator deltas on every line: warmup 1 makes 1422 tensor
+allocations and 2 device allocations, warmup 2 makes 1421 and none, the
+capture pass makes 1022 and 2. The flush freed 2 to 906 MiB in 1 to 26
+device frees. The two device timings: the serving stream had at most
+0.1 ms of work pending when the capture began, and the device timeline
+of the two warmup passes equals their host wall to within a millisecond
+with a zero wait for the warmup work afterwards, so the device was idle
+waiting on the host throughout. First replay launches were 0.5 to 0.7
+ms. The instrument cost 1.9 to 2.3 ms per capture.
+
+Verdicts on section 3:
+
+- H1 held in kind and failed in shape. The cost is host work, but it is
+  not three equal passes. The second warmup pass and the capture pass
+  cost 28 to 39 ms each, which is the chain's launch cost. The first
+  warmup pass costs 389 to 601 ms on the same 1422 allocations, twelve
+  to seventeen times the second pass, on every capture, on every bucket
+  and in every order. Whatever it pays is paid once per new bucket, or
+  once per new stream, and is not the allocator: two device allocations
+  cannot cost 400 ms.
+- H2 held in a small way. The first capture in each process pays about
+  150 to 200 ms more in warmup 1 and about 8 ms more in the capture
+  pass, so the fused kernels' first launch inside the capture is cheap
+  on this box and the first process wide cost sits in the eager pass.
+- H3 failed. The device drain is at most 0.4 ms and the flush at most
+  46 ms, so the synchronize and empty cache of `torch.cuda.graph` are
+  not the stall.
+- H4 is consistent with a per stream cost. Every capture pass makes two
+  device allocations into the shared pool although the pool already
+  holds the previous captures' blocks, which is what a fresh capture
+  stream needing its own cuBLAS workspace would do. The sizes are not
+  logged.
+- H5 failed. The first replay is under a millisecond.
+
+Two further facts from the ledger of the same windows. The first prefill
+of each process cost far more than its capture: c1 extend rows 1 host
+1476 ms against a 683 ms capture and a 30 ms forward, c16 extend rows 8
+host 1681 ms against a 652 ms capture and a 31 ms forward, so 800 to
+1000 ms of first request cost sits outside the predictor capture and is
+unattributed. And the accelerator test module on d6425827b passed 54 of
+55, with `test_mixed_padded_bucket_bit_identity_and_reuse` failing at
+`capture_end` with `cudaErrorStreamCaptureInvalidated` after 28 earlier
+tests in the same process, and passing alone. The only work the timing
+adds inside a capture is two reads of the allocator statistics, whose
+binding calls `getDeviceStats` and no CUDA API
+(`torch/csrc/cuda/Module.cpp:579`), so the failure is either order
+dependent state that the base commit also has or something not yet
+understood. It is decided by running the same module on cec7b6b11 in
+the same order.
+
+What the first warmup pass pays is the open question, and the reading
+so far rules out the obvious candidates: the eager sampler is omni's
+own small k Triton kernel (`sampling_kernels.py:450-495`, entry
+conditions met for every bucket), not sglang's compiled
+`multinomial_with_seed`, and its launch arguments are constant across
+buckets, so there is no per bucket compilation on the path. The
+attention is `scaled_dot_product_attention` on flash with no plan
+cache. No compiled function is on the chain (`torch.compile` appears
+in the engine only for the vocoder layers, which live in the vocoder
+process). The candidates left are per stream first use costs inside
+CUDA or PyTorch, and they are read off a trace, not off the code.
+
+## 8. Run 4
+
+One c16 window with the torch profiler on, through the existing
+`/start_profile` route with `enable_torch` true and a
+`trace_path_template`, which records every stage process continuously
+between start and stop (`profiler/torch_profiler.py:111-120`, CPU and
+CUDA activities, no stack). The capture lines stay in the log and the
+ledger still writes, since the route also starts the event recorder.
+The trace answers two questions at once: which ops carry the first
+warmup pass of each capture, against the same ops in the second pass,
+and what the first prefill of the process pays outside the capture.
+Alongside it, the predictor test module on cec7b6b11 in the same order,
+for the failure above.
+
+The design options of section 4 stand, with one change already
+decided by the numbers: the per bucket warmup passes are the cost, the
+flush and the drain are not, so option B is dropped and option A's
+first step is to find what the first pass initialises and move it out
+of the serving step.

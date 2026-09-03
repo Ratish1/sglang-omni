@@ -122,11 +122,13 @@ Defects:
   of is measured, not assumed, by the capture phase timing on
   perf/step-ledger (d6425827b) and decided in doc 19. `torch.cuda.graph`
   does synchronize the whole device and empty the caching allocator on
-  entry (`torch/cuda/graphs.py:242`, `:252`), inside the serving step,
-  in a process shared with the preprocessing stage, and that is the
-  candidate for the variable part. `capture_error_mode thread_local`
-  (`:151` on 15c4568bb) exempts other threads from erroring, it does
-  not keep them out.
+  entry (`torch/cuda/graphs.py:439`, `:449` on v2.13.0, the pinned
+  torch), inside the serving step, in a process shared with the
+  preprocessing stage. Run 3 measured both at under a millisecond and
+  under 50 ms, so they are not the stall, the first warmup pass is
+  (doc 19 section 7). `capture_error_mode thread_local` (`:151` on
+  15c4568bb) exempts other threads from erroring, it does not keep them
+  out.
 - **The warmup passes warm the wrong kernels.** The fused gather, sampler
   and addmm are gated on `is_current_stream_capturing()` (`:1496`,
   `:1712`, `:1820` on 15c4568bb), the two warmup passes are not
@@ -137,7 +139,7 @@ Defects:
   serving step for state that is process wide.
 - **A new stream per capture with a shared pool.** Two fresh streams per
   capture (`:133`, `:145`) against PyTorch's note that captures sharing
-  a pool should share the stream (`graphs.py:204-206`) and sglang's one
+  a pool should share the stream (`graphs.py:398-399`) and sglang's one
   stream for every shape, captured from the largest down. Whether the
   pool is reused across our captures is read off the device allocation
   count inside the capture pass (doc 19, H4).

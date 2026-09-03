@@ -164,6 +164,34 @@ of the two warmup passes), both from timing events. `instrument` is the
 cost of the timing itself and belongs to no phase. The c16 window is the
 one to read: it captures buckets 16, 12, 8, 4 and 2 in one pass.
 
+Run 4 (doc 19 section 8) is the same c16 window with the torch profiler
+on. Use the `/start_profile` route instead of `/start_request_profile`:
+it starts the same event recorder and ledger, and records a continuous
+torch trace per stage process between start and stop, exported as
+`<template>_rank0.trace.json.gz` next to the events. No stack, shapes
+or memory flags, the default trace is tens of MB.
+
+```
+curl -s -X POST http://127.0.0.1:$PORT/start_profile \
+  -H 'Content-Type: application/json' \
+  -d "{\"run_id\":\"qwen3tts_c16\",\"event_dir\":\"$OUT/qwen3tts_c16\",\"enable_torch\":true,\"trace_path_template\":\"$OUT/qwen3tts_c16/trace\"}"
+<the benchmark at 16>
+curl -s -X POST http://127.0.0.1:$PORT/stop_profile \
+  -H 'Content-Type: application/json' -d '{"run_id":"qwen3tts_c16"}'
+```
+
+Send back the trace files of every stage, the capture lines, and the
+ledger JSON. Alongside, run the predictor test module once on cec7b6b11,
+the branch head before the capture timing, in the same order as on
+d6425827b, and keep its log:
+
+```
+git checkout cec7b6b11 && python -m pytest tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py -x -q -p no:randomly 2>&1 | tail -30
+```
+
+The H100 image runs torch 2.13.0, the pin in pyproject. Read the torch
+side of any capture question on that version.
+
 ### 3.3 Qwen3-ASR 1.7B
 
 Concurrencies: 1, 8, 32 (CI). The benchmark talks to the running server.
