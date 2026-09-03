@@ -113,14 +113,34 @@ feature is off under tp above 1 (`:1258-1266`).
 
 Defects:
 
-- **Every new key stalls the device.** `torch.cuda.graph.__enter__` in the
-  pinned torch runs `synchronize`, `empty_cache` and the host cache flush
-  before capture (`torch/cuda/graphs.py:247-259`), inside the serving
-  step, for every new (bucket, signature). That is the mechanism behind
-  the 500 to 1089 ms stalls of doc 17 section 4, and it also drains the
-  vocoder threads that share the CUDA context. `capture_error_mode
-  thread_local` (`:138`) exempts other threads from erroring, it does not
-  keep them out.
+- **Every new key stalls the batch for about half a second.** All twelve
+  captures of run 2 cost 496 to 565 ms of host wall, whatever the bucket
+  and whatever the allocator held, and each ran the chain three times
+  (about 4400 tensor allocations against 50 for a normal step). The
+  first capture in the process and the one after a prefill burst cost
+  more (doc 17 section 4, corrected table). What the flat part is made
+  of is measured, not assumed, by the capture phase timing on
+  perf/step-ledger (d6425827b) and decided in doc 19. `torch.cuda.graph`
+  does synchronize the whole device and empty the caching allocator on
+  entry (`torch/cuda/graphs.py:242`, `:252`), inside the serving step,
+  in a process shared with the preprocessing stage, and that is the
+  candidate for the variable part. `capture_error_mode thread_local`
+  (`:151` on 15c4568bb) exempts other threads from erroring, it does
+  not keep them out.
+- **The warmup passes warm the wrong kernels.** The fused gather, sampler
+  and addmm are gated on `is_current_stream_capturing()` (`:1496`,
+  `:1712`, `:1820` on 15c4568bb), the two warmup passes are not
+  capturing, so they run the eager branches and the fused Triton kernels
+  are first launched inside the capture pass of the first capture.
+  Sglang's two warmups per shape run at startup only
+  (`full_cuda_graph_backend.py:103-108`), ours run per bucket inside a
+  serving step for state that is process wide.
+- **A new stream per capture with a shared pool.** Two fresh streams per
+  capture (`:133`, `:145`) against PyTorch's note that captures sharing
+  a pool should share the stream (`graphs.py:204-206`) and sglang's one
+  stream for every shape, captured from the largest down. Whether the
+  pool is reused across our captures is read off the device allocation
+  count inside the capture pass (doc 19, H4).
 - **The 32 key cap is reachable by a benign mix.** Per request top k enters
   the key through a ten rung ladder (`:43`, `:1054-1065`), so six buckets
   times 23 signatures gives 138 reachable keys against a cap of 32
@@ -246,19 +266,16 @@ Defects:
 1. Rebase perf/step-ledger onto 15c4568bb, run doc 15 (fresh server per
    point) on a quiet box with MiniMax, and re read sections 5.1 and 5.3 of
    doc 17 against #1641, #1665 and #1666.
-2. T20, the Qwen3-TTS predictor graph: capture the bucket ladder at
-   startup for the two signatures every default request lands on (greedy
-   subtalker, and the checkpoint's sampled subtalker at its default top k
-   and top p), exempt those keys from the serving time capture cap, and
-   keep the lazy path for other signatures. Built on
-   perf/qwen3-tts-predictor-warmup from upstream main: a shared
-   `_predictor_sampling_branches` helper used by the decode path and by
-   `predictor_graph_signature_for_sampling`, `warmup_predictor_graphs` on
-   the model, and the Qwen3-TTS builder's `setup_model_resources`, which
-   runs after sglang's own graph capture and before readiness. Verdict:
-   the accelerator tests in `test_predictor_cuda_graph.py` on the box,
-   then a c16 window whose extend rows show no capture stall and whose
-   server log shows the captures at startup, then the CI stage set.
+2. T20, the Qwen3-TTS predictor graph, now doc 19. The startup warmup
+   that was drafted on perf/qwen3-tts-predictor-warmup was dropped: it
+   changed when captures happen, not what one costs, and took its
+   signature from dataclass defaults instead of the checkpoint's merged
+   generation config. The order is now: run 3 with the capture phase
+   timing (d6425827b), fix the capture in place on those numbers (the
+   graph path flag, one process wide warm pass of the captured kernel
+   set, no per bucket warmup, one capture stream), then decide startup
+   capture of the merged default signature as a policy on the residual.
+   Verdict per doc 19 section 5.
 3. T15 on top of #1910: the reservation against the observed output,
    with `schedule_conservativeness` as the control arm.
 4. T21, the code2wav final window: drop the `is_final` eager gate, add

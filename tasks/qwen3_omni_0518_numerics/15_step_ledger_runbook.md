@@ -145,6 +145,25 @@ python -m benchmarks.eval.benchmark_tts_seedtts --generate-only --use-existing-s
   --output-dir $OUT/qwen3tts_c${C}_bench
 ```
 
+Since d6425827b, every predictor graph capture logs one line with its
+phases, and the first replay of each key
+logs its launch wall. These lines are the measurement doc 19 is gated on,
+so keep the server log and check they are there before stopping the
+server:
+
+```
+grep -c "predictor CUDA graph capture" $OUT/logs/serve_qwen3tts.log   # 12 at the 64 row launch, over all windows
+grep "predictor CUDA graph capture\|predictor CUDA graph first replay" $OUT/logs/serve_qwen3tts.log
+```
+
+Each capture line carries, per phase, the host wall and the allocator
+deltas (`allocs` tensor allocations, `mallocs` and `frees` device calls,
+`MiB_released`), then `step_pending_gpu` (the serving stream's work
+still running when the capture began) and `warmup_gpu` (the device time
+of the two warmup passes), both from timing events. `instrument` is the
+cost of the timing itself and belongs to no phase. The c16 window is the
+one to read: it captures buckets 16, 12, 8, 4 and 2 in one pass.
+
 ### 3.3 Qwen3-ASR 1.7B
 
 Concurrencies: 1, 8, 32 (CI). The benchmark talks to the running server.
