@@ -127,10 +127,6 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
     talker._sub_identity_row_indices_tensor = torch.arange(
         MAX_BS, device=device, dtype=torch.long
     )
-    talker._sub_sample_row_indices_tensor = torch.zeros(
-        MAX_BS, device=device, dtype=torch.long
-    )
-    talker._sub_sample_count = 0
     talker._sub_has_sampled_rows = False
     talker._sub_sampled_has_top_p = False
     talker._sub_sampled_max_top_k = 0
@@ -319,61 +315,17 @@ def test_missing_embedding_buffer_uses_original_graph_path():
 
 
 @pytest.mark.accelerator
-def test_fused_embedding_runs_only_during_cuda_graph_capture(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_eager_predictor_leaves_the_talker_hidden_untouched_for_an_identity_projection():
     device = torch.device("cuda")
     talker = _build_talker(device)
+    talker.code_predictor.project_input = lambda hidden: hidden
     talker.prepare_decode_buffers(_uniform_requests(2))
     layer0, hidden, positions = _step_inputs(2, device)
-    original_kernel = sglang_model_module.gather_codec_embedding_and_add
-    calls = []
+    hidden_before = hidden.clone()
 
-    def _record_kernel(*args):
-        calls.append(None)
-        return original_kernel(*args)
+    _run_eager(talker, layer0, hidden, positions)
 
-    monkeypatch.setattr(
-        sglang_model_module,
-        "gather_codec_embedding_and_add",
-        _record_kernel,
-    )
-    eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
-    assert not calls
-
-    graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
-    assert len(calls) == NUM_CODE_GROUPS - 1
-    assert torch.equal(graph_codes, eager_codes)
-    assert torch.equal(graph_embeds, eager_embeds)
-
-
-@pytest.mark.accelerator
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 16])
-def test_fused_o_proj_residual_runs_only_during_cuda_graph_capture(
-    monkeypatch: pytest.MonkeyPatch,
-    batch_size: int,
-):
-    device = torch.device("cuda")
-    talker = _build_talker(device)
-    talker.prepare_decode_buffers(_uniform_requests(batch_size))
-    layer0, hidden, positions = _step_inputs(batch_size, device)
-    original_addmm = torch.addmm
-    calls = []
-
-    def _record_addmm(input, *args, **kwargs):
-        assert kwargs["out"] is input
-        calls.append(None)
-        return original_addmm(input, *args, **kwargs)
-
-    monkeypatch.setattr(torch, "addmm", _record_addmm)
-
-    eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
-    assert not calls
-
-    graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
-    assert len(calls) == NUM_CODE_GROUPS
-    assert torch.equal(graph_codes, eager_codes)
-    assert torch.equal(graph_embeds, eager_embeds)
+    assert torch.equal(hidden, hidden_before)
 
 
 @pytest.mark.accelerator
@@ -660,7 +612,6 @@ def test_capture_failure_restores_live_sub_state(monkeypatch: pytest.MonkeyPatch
     _run_forward(talker, layer0, hidden, positions)
 
     assert talker._sub_batch_size == 2
-    assert talker._sub_sample_count == 1
     assert talker._sub_has_sampled_rows is True
     assert talker._sub_do_sample_tensor[:2].tolist() == [True, False]
 
@@ -1038,7 +989,6 @@ def test_capture_state_body_failure_restores_state():
     talker.prepare_decode_buffers(_uniform_requests(3, dosample=False))
     saved = (
         talker._sub_batch_size,
-        talker._sub_sample_count,
         talker._sub_has_sampled_rows,
         talker._sub_sampled_has_top_p,
         talker._sub_sampled_max_top_k,
@@ -1048,7 +998,6 @@ def test_capture_state_body_failure_restores_state():
     with pytest.raises(RuntimeError, match="simulated capture failure"):
         with talker._predictor_graph_capture_state(4, ("sampled", 8, True, False)):
             assert talker._sub_batch_size == 4
-            assert talker._sub_sample_count == 4
             assert talker._sub_has_sampled_rows is True
             assert talker._sub_sampled_has_top_p is True
             assert talker._sub_sampled_max_top_k == 8
@@ -1057,7 +1006,6 @@ def test_capture_state_body_failure_restores_state():
 
     assert (
         talker._sub_batch_size,
-        talker._sub_sample_count,
         talker._sub_has_sampled_rows,
         talker._sub_sampled_has_top_p,
         talker._sub_sampled_max_top_k,
