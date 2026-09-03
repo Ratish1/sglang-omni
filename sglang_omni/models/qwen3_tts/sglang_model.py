@@ -48,9 +48,7 @@ logger = logging.getLogger(__name__)
 QTTS_PREDICTOR_GRAPH_ENV = "SGLANG_OMNI_QTTS_PREDICTOR_GRAPH"
 _PREDICTOR_GRAPH_MAX_KEYS = 32
 _PREDICTOR_GRAPH_MAX_FAILURES = 8
-# note(ratish): two warmup passes per shape, the count sglang's decode graph
-# backend uses. The passes run the graph-only kernels, so every first use
-# is paid before the capture pass records.
+# note(ratish): two, the count sglang's decode graph backend uses.
 _PREDICTOR_GRAPH_WARMUP_PASSES = 2
 # Note: (Jiaxin Deng) 50 is on the ladder because it is the family checkpoint
 # default, keeping the dominant signature's kernel width exactly as before.
@@ -75,16 +73,12 @@ def _quantize_predictor_top_k(max_top_k: int, vocab_size: int) -> int | None:
     return None
 
 
-def _predictor_sampling_signature(
+def _predictor_signature_terms(
     sampled_top_ks: list[int],
     sampled_top_ps: list[float],
     vocab_size: int,
 ) -> tuple[int, bool, bool]:
-    """Return (max_top_k, has_top_p, has_unbounded_top_k) for a batch's sampled rows.
-
-    The one rule behind the predictor graph signature, shared by the batch
-    path of prepare_decode_buffers and the startup capture.
-    """
+    """The one signature rule, shared by the batch path and the startup capture."""
     bounded_top_ks = [
         int(top_k) for top_k in sampled_top_ks if 0 < int(top_k) < vocab_size
     ]
@@ -104,9 +98,8 @@ def _predictor_sampling_signature(
 
 
 def _batch_invariant_mode_enabled() -> bool:
-    # note(ratish): sglang turns batch invariant mode on after the model is
-    # built, and the module that says so imports triton, so it is read lazily
-    # and only where the predictor graph policy is resolved.
+    # note(ratish): imported lazily, the module needs triton and torch's CPU
+    # and macOS wheels ship without it.
     try:
         from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     except ImportError:
@@ -127,12 +120,11 @@ class _PredictorDecodeGraph:
 
     One graph per (bucket, sampling signature): the signature pins the host
     branches of the sampling path (argmax vs sampled, top-k bound, top-p
-    presence), so replay reproduces the bits of the graph-mode eager pass.
+    presence), so replay reproduces the bits of the capture-mode eager pass.
     Per-step inputs reach the captured region through persistent device
-    buffers written with device-side copies before replay. The talker owns
-    the capture (Qwen3TTSTalker._capture_predictor_graph). This object holds
-    its buffers, the graph and the captured outputs and nothing else, so a
-    talker and its graphs form no reference cycle.
+    buffers written with device-side copies before replay. Holds no reference
+    to the talker: a cycle would put the CUDAGraph finalizer behind the
+    cyclic collector.
     """
 
     def __init__(
@@ -392,11 +384,8 @@ class Qwen3TTSTalker(nn.Module):
     # are present. Prefill CUDA graph runners capture the inner text model
     # directly and use this marker to preserve that position contract.
     is_mrope_enabled = True
-    # note(ratish): class defaults so a talker built without __init__ (the
-    # unit tests do this) reads the eager policy. The instances set both in
-    # __init__ and _resolve_predictor_graph_policy.
-    _predictor_graph_mode_active = False
-    _predictor_batch_invariant = False
+    _predictor_capture_mode_active = False
+    _predictor_fused_addmm_allowed = False
 
     def __init__(self, config: Any, quant_config: Any = None, prefix: str = "") -> None:
         del quant_config
@@ -537,12 +526,7 @@ class Qwen3TTSTalker(nn.Module):
         self._predictor_graph_capacity_warned = False
         self._predictor_graph_capture_count = 0
         self._predictor_graph_pool = None
-        self._predictor_graph_mode_active = False
         self._predictor_capture_stream: torch.cuda.Stream | None = None
-        # note(ratish): resolved with the graph policy, after sglang's model
-        # runner has enabled batch invariant mode, which it does after the
-        # model is built.
-        self._predictor_batch_invariant = False
         _bind_default_weight_loaders(self)
         self._cached_params_dict = dict(self.named_parameters())
         self._sampler = None
@@ -1059,7 +1043,7 @@ class Qwen3TTSTalker(nn.Module):
                 sample_rows.append(row_idx)
 
         predictor_vocab_size = int(self.config.code_predictor_config.vocab_size)
-        max_top_k, has_top_p, has_unbounded_top_k = _predictor_sampling_signature(
+        max_top_k, has_top_p, has_unbounded_top_k = _predictor_signature_terms(
             [sub_top_ks[row_idx] for row_idx in sample_rows],
             [sub_top_ps[row_idx] for row_idx in sample_rows],
             predictor_vocab_size,
@@ -1274,14 +1258,22 @@ class Qwen3TTSTalker(nn.Module):
         return int(server_args.tp_size) == 1
 
     def _resolve_predictor_graph_policy(self) -> None:
-        """Fix the graph policy once the server args and batch invariance are final."""
-        self._predictor_batch_invariant = _batch_invariant_mode_enabled()
+        # note(ratish): read after ModelRunner.initialize, which turns batch
+        # invariant mode on only after the model is built. That mode overrides
+        # aten::addmm but not the out variant, so the fused addmm would keep
+        # the batch dependent GEMM.
+        device = self._predictor_k_cache.device
+        is_cuda = device.type == "cuda"
         self._predictor_graph_enabled = (
-            self._predictor_k_cache.device.type == "cuda"
-            and self._resolve_predictor_graph_enabled()
+            is_cuda and self._resolve_predictor_graph_enabled()
+        )
+        self._predictor_fused_addmm_allowed = (
+            is_cuda
+            and torch.cuda.get_device_capability(device) == (9, 0)
+            and not _batch_invariant_mode_enabled()
         )
 
-    def predictor_graph_signature_for_sampling(
+    def uniform_predictor_graph_signature(
         self,
         *,
         do_sample: bool,
@@ -1291,7 +1283,7 @@ class Qwen3TTSTalker(nn.Module):
         """Graph signature of a batch whose rows all sample with these values."""
         if not do_sample:
             return ("argmax", 0, False, False)
-        max_top_k, has_top_p, has_unbounded_top_k = _predictor_sampling_signature(
+        max_top_k, has_top_p, has_unbounded_top_k = _predictor_signature_terms(
             [int(top_k)],
             [float(top_p)],
             int(self.config.code_predictor_config.vocab_size),
@@ -1299,38 +1291,26 @@ class Qwen3TTSTalker(nn.Module):
         return ("sampled", max_top_k, has_top_p, has_unbounded_top_k)
 
     def capture_predictor_graphs(self, signature: tuple) -> int:
-        """Capture the predictor graph of every batch bucket for one signature.
-
-        Runs before the stage reports ready. Buckets go in descending order so
-        the smaller ones reuse the pool of the larger ones, the order sglang's
-        decode runner uses. Returns the number of graphs captured.
-        """
+        """Buckets go in descending order so the smaller ones reuse the pool of
+        the larger ones, the order sglang's decode runner uses."""
         if self._predictor_graph_enabled is None:
             self._resolve_predictor_graph_policy()
         if not self._predictor_graph_enabled:
             return 0
         started = time.perf_counter()
-        captured = 0
-        with self._predictor_capture_session() as capture_stream:
+        captured_before = len(self._predictor_graphs)
+        with self._predictor_capture_session():
             for bucket_size in reversed(self._predictor_graph_batch_sizes):
                 key = (bucket_size, *signature)
-                if (
-                    key in self._predictor_graphs
-                    or key in self._predictor_graph_disabled
-                ):
+                if key in self._predictor_graphs:
                     continue
                 if len(self._predictor_graphs) >= _PREDICTOR_GRAPH_MAX_KEYS:
                     break
-                try:
-                    graph = self._capture_predictor_graph(key, capture_stream)
-                except Exception:
-                    self._record_predictor_graph_failure(key)
-                    if not self._predictor_graph_enabled:
-                        break
-                    continue
-                self._predictor_graphs[key] = graph
+                self._predictor_graphs[key] = self._capture_predictor_graph(
+                    bucket_size, signature
+                )
                 self._predictor_graph_capture_count += 1
-                captured += 1
+        captured = len(self._predictor_graphs) - captured_before
         logger.info(
             "Captured %d Qwen3-TTS predictor CUDA graphs for signature=%s "
             "at startup in %.1f s",
@@ -1341,30 +1321,22 @@ class Qwen3TTSTalker(nn.Module):
         return captured
 
     @contextmanager
-    def _predictor_graph_mode(self):
-        """Select the graph-only kernels for the warmup passes and the capture.
-
-        Set for both so the capture records exactly the kernels the warmups
-        loaded. Eager execution and replay never see it.
-        """
-        previous = self._predictor_graph_mode_active
-        self._predictor_graph_mode_active = True
+    def _predictor_capture_mode(self):
+        """Set for the warmups as well as the capture, so the capture records
+        exactly the kernels the warmups loaded."""
+        self._predictor_capture_mode_active = True
         try:
             yield
         finally:
-            self._predictor_graph_mode_active = previous
+            self._predictor_capture_mode_active = False
 
     @contextmanager
     def _predictor_capture_session(self):
-        """Bind the talker's capture stream and hold the collector off.
-
-        One stream per talker for warmups and captures, as sglang binds one
-        stream per capture session: the allocator only reuses a pool block on
-        the stream that freed it, so a fresh stream per capture defeats the
-        shared pool. Automatic collection is off for the window because a
-        CUDAGraph finalizer reached by the cyclic collector while a stream is
-        capturing destroys its pool inside the capture.
-        """
+        """One stream per talker for warmups and captures, as sglang keeps one
+        capture stream for its pool: the allocator only reuses a pool block on
+        the stream that freed it. Automatic collection is off for the window
+        because a CUDAGraph finalizer reached by the cyclic collector while a
+        stream is capturing destroys its pool inside the capture."""
         device = self._predictor_k_cache.device
         if self._predictor_capture_stream is None:
             self._predictor_capture_stream = torch.cuda.Stream(device=device)
@@ -1375,7 +1347,7 @@ class Qwen3TTSTalker(nn.Module):
         gc.disable()
         try:
             with torch.cuda.device(device):
-                yield capture_stream
+                yield
         finally:
             current_stream.wait_stream(capture_stream)
             if gc_was_enabled:
@@ -1384,11 +1356,11 @@ class Qwen3TTSTalker(nn.Module):
     @torch.no_grad()
     def _capture_predictor_graph(
         self,
-        key: tuple,
-        capture_stream: torch.cuda.Stream,
+        bucket_size: int,
+        signature: tuple,
     ) -> _PredictorDecodeGraph:
-        """Warm up and capture one (bucket, signature) graph on the session stream."""
-        bucket_size, signature = int(key[0]), tuple(key[1:])
+        capture_stream = self._predictor_capture_stream
+        assert capture_stream is not None, "capture outside a capture session"
         device = self._predictor_k_cache.device
         graph = _PredictorDecodeGraph(
             bucket_size,
@@ -1397,9 +1369,8 @@ class Qwen3TTSTalker(nn.Module):
             hidden_size=int(self._output_embeds.shape[-1]),
             hidden_dtype=self._output_embeds.dtype,
         )
-        # note(ratish): the input buffers are zero filled on the current stream
-        # and read by the warmups on the capture stream, and layer0_codes is an
-        # embedding index, so the capture stream waits here, after the fill.
+        # note(ratish): the buffers are zero filled on the current stream and
+        # layer0_codes is an embedding index, so the capture stream waits here.
         capture_stream.wait_stream(torch.cuda.current_stream(device=device))
 
         def run_once() -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1412,7 +1383,7 @@ class Qwen3TTSTalker(nn.Module):
         try:
             with (
                 self._predictor_graph_capture_state(bucket_size, signature),
-                self._predictor_graph_mode(),
+                self._predictor_capture_mode(),
             ):
                 with torch.cuda.stream(capture_stream):
                     for _ in range(_PREDICTOR_GRAPH_WARMUP_PASSES):
@@ -1471,7 +1442,10 @@ class Qwen3TTSTalker(nn.Module):
             return None
         if batch_size != self._sub_batch_size:
             return None
-        if torch.cuda.is_current_stream_capturing():
+        if (
+            self._predictor_capture_mode_active
+            or torch.cuda.is_current_stream_capturing()
+        ):
             return None
         signature = self._predictor_graph_signature(batch_size, semantic_positions)
         if signature is None:
@@ -1496,8 +1470,8 @@ class Qwen3TTSTalker(nn.Module):
                     )
                 return None
             try:
-                with self._predictor_capture_session() as capture_stream:
-                    graph = self._capture_predictor_graph(key, capture_stream)
+                with self._predictor_capture_session():
+                    graph = self._capture_predictor_graph(bucket_size, signature)
             except Exception:
                 self._record_predictor_graph_failure(key)
                 return None
@@ -1539,7 +1513,7 @@ class Qwen3TTSTalker(nn.Module):
         use_fused_embedding = (
             embedding_buffer is not None
             and layer0_codes.is_cuda
-            and self._predictor_graph_mode_active
+            and self._predictor_capture_mode_active
         )
 
         for pos in range(seq_len):
@@ -1635,7 +1609,7 @@ class Qwen3TTSTalker(nn.Module):
         *,
         semantic_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self._predictor_graph_mode_active:
+        if self._predictor_capture_mode_active:
             return self._sample_subtalker_token_graph_safe(
                 logits, layer_idx, semantic_positions=semantic_positions
             )
@@ -1753,7 +1727,7 @@ class Qwen3TTSTalker(nn.Module):
         # Note (Jun Liu): The raw-logit fusion has a favorable launch-count
         # tradeoff only in the predictor CUDA graph. The eager path keeps the
         # mature ATen sequence, including all of its shape coverage.
-        if logits.is_cuda and self._predictor_graph_mode_active:
+        if logits.is_cuda and self._predictor_capture_mode_active:
             fused_sampled = sample_from_logits_with_seed_top_k_top_p(
                 logits,
                 temperatures,
@@ -1859,15 +1833,10 @@ class Qwen3TTSTalker(nn.Module):
         """Run the Predictor attention output projection and residual add."""
 
         weight = getattr(o_proj, "weight", None)
-        # note(ratish): the addmm out variant is not on sglang's batch invariant
-        # override list, so under deterministic inference the graph path keeps
-        # the GEMM the eager path runs (tracker issue 1936, fault 1).
         use_fused_addmm = (
-            attn_input.is_cuda
-            and self._predictor_graph_mode_active
-            and not self._predictor_batch_invariant
+            self._predictor_capture_mode_active
+            and self._predictor_fused_addmm_allowed
             and not torch.is_grad_enabled()
-            and torch.cuda.get_device_capability(attn_input.device) == (9, 0)
             and isinstance(
                 getattr(o_proj, "quant_method", None), UnquantizedLinearMethod
             )

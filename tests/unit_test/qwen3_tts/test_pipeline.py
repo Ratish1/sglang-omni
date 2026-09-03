@@ -336,8 +336,8 @@ def test_qwen3_tts_engine_builder_captures_default_signature_at_startup(
         config=SimpleNamespace(code_predictor_config=SimpleNamespace(vocab_size=2048)),
         capture_predictor_graphs=captured.append,
     )
-    model.predictor_graph_signature_for_sampling = types.MethodType(
-        Qwen3TTSTalker.predictor_graph_signature_for_sampling, model
+    model.uniform_predictor_graph_signature = types.MethodType(
+        Qwen3TTSTalker.uniform_predictor_graph_signature, model
     )
 
     builder.setup_model_resources(

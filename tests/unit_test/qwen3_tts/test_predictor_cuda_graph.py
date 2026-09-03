@@ -190,9 +190,10 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
     talker._predictor_graph_capacity_warned = False
     talker._predictor_graph_capture_count = 0
     talker._predictor_graph_pool = None
-    talker._predictor_graph_mode_active = False
     talker._predictor_capture_stream = None
-    talker._predictor_batch_invariant = False
+    talker._predictor_fused_addmm_allowed = (
+        device.type == "cuda" and torch.cuda.get_device_capability(device) == (9, 0)
+    )
     return talker
 
 
@@ -658,7 +659,7 @@ def test_capture_failure_restores_live_sub_state(monkeypatch: pytest.MonkeyPatch
     real_forward = Qwen3TTSTalker._code_predictor_forward_incremental
 
     def _boom_forward(self, *args, **kwargs):
-        if self._predictor_graph_mode_active:
+        if self._predictor_capture_mode_active:
             raise RuntimeError("simulated capture failure")
         return real_forward(self, *args, **kwargs)
 
@@ -668,7 +669,7 @@ def test_capture_failure_restores_live_sub_state(monkeypatch: pytest.MonkeyPatch
     _run_forward(talker, layer0, hidden, positions)
 
     assert talker._predictor_graph_disabled
-    assert talker._predictor_graph_mode_active is False
+    assert talker._predictor_capture_mode_active is False
     assert talker._sub_batch_size == 2
     assert talker._sub_sample_count == 1
     assert talker._sub_has_sampled_rows is True
@@ -1126,7 +1127,7 @@ def test_captures_share_one_stream_for_warmups_and_capture(
     real_forward = Qwen3TTSTalker._code_predictor_forward_incremental
 
     def _record_forward(self, *args, **kwargs):
-        if self._predictor_graph_mode_active:
+        if self._predictor_capture_mode_active:
             forward_streams.append(torch.cuda.current_stream(device))
         return real_forward(self, *args, **kwargs)
 
@@ -1170,7 +1171,7 @@ def test_collector_is_disabled_during_capture_and_restored_after(
     real_forward = Qwen3TTSTalker._code_predictor_forward_incremental
 
     def _record_forward(self, *args, **kwargs):
-        if self._predictor_graph_mode_active:
+        if self._predictor_capture_mode_active:
             collector_states.append(gc.isenabled())
         return real_forward(self, *args, **kwargs)
 
@@ -1187,7 +1188,7 @@ def test_collector_is_disabled_during_capture_and_restored_after(
     assert gc.isenabled()
 
     def _boom_forward(self, *args, **kwargs):
-        if self._predictor_graph_mode_active:
+        if self._predictor_capture_mode_active:
             raise RuntimeError("simulated capture failure")
         return real_forward(self, *args, **kwargs)
 
@@ -1211,9 +1212,9 @@ def test_startup_capture_builds_the_ladder_for_one_signature(
     capture_order = []
     real_capture = Qwen3TTSTalker._capture_predictor_graph
 
-    def _record_capture(self, key, capture_stream):
-        capture_order.append(key[0])
-        return real_capture(self, key, capture_stream)
+    def _record_capture(self, bucket_size, signature):
+        capture_order.append(bucket_size)
+        return real_capture(self, bucket_size, signature)
 
     monkeypatch.setattr(Qwen3TTSTalker, "_capture_predictor_graph", _record_capture)
     signature = ("sampled", 8, False, False)
@@ -1234,6 +1235,32 @@ def test_startup_capture_builds_the_ladder_for_one_signature(
     assert torch.equal(graph_codes, eager_codes)
     assert torch.equal(graph_embeds, eager_embeds)
     assert talker.capture_predictor_graphs(signature) == 0
+
+
+@pytest.mark.accelerator
+def test_startup_capture_failure_raises_and_restores_state(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    device = torch.device("cuda")
+    talker = _build_talker(device)
+    real_forward = Qwen3TTSTalker._code_predictor_forward_incremental
+
+    def _boom_forward(self, *args, **kwargs):
+        if self._predictor_capture_mode_active:
+            raise RuntimeError("simulated capture failure")
+        return real_forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Qwen3TTSTalker, "_code_predictor_forward_incremental", _boom_forward
+    )
+
+    with pytest.raises(RuntimeError, match="simulated capture failure"):
+        talker.capture_predictor_graphs(("sampled", 8, False, False))
+
+    assert not talker._predictor_graphs
+    assert talker._predictor_capture_mode_active is False
+    assert talker._sub_batch_size == 0
+    assert gc.isenabled()
 
 
 def test_signature_rule_is_shared_by_batch_and_startup_paths():
@@ -1262,7 +1289,7 @@ def test_signature_rule_is_shared_by_batch_and_startup_paths():
         else:
             expected = ("argmax", 0, False, False)
         assert (
-            talker.predictor_graph_signature_for_sampling(
+            talker.uniform_predictor_graph_signature(
                 do_sample=dosample, top_k=top_k, top_p=top_p
             )
             == expected
@@ -1317,7 +1344,7 @@ def test_batch_invariant_mode_keeps_the_eager_gemm_on_the_graph_path(
     eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
     graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
 
-    assert talker._predictor_batch_invariant is True
+    assert talker._predictor_fused_addmm_allowed is False
     assert talker._predictor_graphs
     assert not calls
     assert torch.equal(graph_codes, eager_codes)

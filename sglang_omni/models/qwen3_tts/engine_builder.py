@@ -118,15 +118,12 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         del server_args
         if not generation_cuda_graph_enabled:
             return
-        # note(ratish): the code predictor's graphs are captured here, after
-        # sglang's backbone graphs and before the stage reports ready, for the
-        # sampling signature the checkpoint's generation defaults produce. The
-        # warmups of each bucket also build cuDNN's attention plans, which
-        # otherwise cost about half a second inside the first serving step of
-        # every new batch size. A request that changes the subtalker top_k or
-        # top_p still captures its signature lazily.
+        # note(ratish): after sglang's backbone graphs and before the stage
+        # reports ready. The bucket warmups also build cuDNN's attention plans,
+        # which otherwise land inside the first serving step of each new batch
+        # size.
         defaults = self.wrapper._merge_generate_kwargs()
-        signature = model.predictor_graph_signature_for_sampling(
+        signature = model.uniform_predictor_graph_signature(
             do_sample=bool(defaults["subtalker_dosample"]),
             top_k=int(defaults["subtalker_top_k"]),
             top_p=float(defaults["subtalker_top_p"]),
