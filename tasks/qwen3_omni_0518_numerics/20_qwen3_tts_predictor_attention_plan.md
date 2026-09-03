@@ -429,7 +429,18 @@ both sides, one c1 and one c16 window per side, fresh servers, the
 same GPU, the benchmark's default warmup inside the window as in every
 run so far.
 
-## 8. Open items, none blocking
+## 8. Implementation state
+
+Implemented at abe1c2221 on `perf/qwen3-tts-cudnn-attention` (local, not
+pushed at the time of writing): the helper and its three calls in
+`qwen3_tts/stages.py`, four CPU contract tests in `test_pipeline.py`,
+the accelerator kernel name test in `test_predictor_cuda_graph.py`, and
+the cookbook sentence. The CPU tests could not run on the laptop, whose
+environment lacks the omni import chain, so the commit's exit gate is
+open until the box runs `tests/unit_test/qwen3_tts` and the accelerator
+module. Section 7 is the order of what follows.
+
+## 9. Open items, none blocking
 
 - Flash admission of the predictor's shapes on the CI H100. Resolved by
   the accelerator kernel name test. If math serves instead, the plan
