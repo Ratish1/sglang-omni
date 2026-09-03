@@ -282,6 +282,40 @@ def test_graph_bit_identity_sampled(batch_size: int, sampling_kwargs: dict):
 
 
 @pytest.mark.accelerator
+@pytest.mark.parametrize("key_len", [1, 16])
+def test_predictor_shape_family_attention_runs_without_cudnn(key_len: int):
+    from torch.profiler import ProfilerActivity, profile
+
+    device = torch.device("cuda")
+    enabled = torch.backends.cuda.cudnn_sdp_enabled()
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    try:
+        query = torch.randn(2, 16, 1, 128, device=device, dtype=torch.bfloat16)
+        key = torch.randn(2, 8, key_len, 128, device=device, dtype=torch.bfloat16)
+        value = torch.randn_like(key)
+        torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, is_causal=False, enable_gqa=True
+        )
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            out = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value, is_causal=False, enable_gqa=True
+            )
+            torch.cuda.synchronize()
+    finally:
+        torch.backends.cuda.enable_cudnn_sdp(enabled)
+
+    kernels = [
+        event.name
+        for event in prof.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert out.shape == (2, 16, 1, 128)
+    assert kernels
+    assert not any("cudnn" in name.lower() for name in kernels), kernels
+
+
+@pytest.mark.accelerator
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 def test_graph_bit_identity_argmax(batch_size: int):
     device = torch.device("cuda")

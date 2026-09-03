@@ -892,6 +892,58 @@ def test_qwen3_tts_preprocessing_executor_admits_concurrent_requests() -> None:
     assert executor._max_concurrency > 1
 
 
+@pytest.fixture
+def _restore_cudnn_attention():
+    enabled = torch.backends.cuda.cudnn_sdp_enabled()
+    try:
+        yield
+    finally:
+        torch.backends.cuda.enable_cudnn_sdp(enabled)
+
+
+def test_qwen3_tts_preprocessing_factory_disables_cudnn_attention(
+    _restore_cudnn_attention,
+) -> None:
+    torch.backends.cuda.enable_cudnn_sdp(True)
+    qwen3_stages.create_preprocessing_executor("unused-model-path")
+    assert torch.backends.cuda.cudnn_sdp_enabled() is False
+
+
+def test_qwen3_tts_vocoder_factory_disables_cudnn_attention_before_loading(
+    monkeypatch: pytest.MonkeyPatch, _restore_cudnn_attention
+) -> None:
+    cudnn_enabled_at_load: list[bool] = []
+
+    def fake_load(*args, **kwargs):
+        cudnn_enabled_at_load.append(torch.backends.cuda.cudnn_sdp_enabled())
+        return _FakeQwen3TTSTokenizer()
+
+    monkeypatch.setattr(qwen3_stages, "_load_qwen3_tts_tokenizer", fake_load)
+    monkeypatch.setattr(
+        Qwen3TTSStreamingVocoderScheduler, "warmup_now", lambda scheduler: None
+    )
+    torch.backends.cuda.enable_cudnn_sdp(True)
+    qwen3_stages.create_vocoder_executor("model", device="cpu")
+    assert cudnn_enabled_at_load == [False]
+
+
+def test_qwen3_tts_engine_factory_disables_cudnn_attention_before_building(
+    monkeypatch: pytest.MonkeyPatch, _restore_cudnn_attention
+) -> None:
+    from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
+
+    cudnn_enabled_at_build: list[bool] = []
+
+    def fake_build(self, *args, **kwargs):
+        cudnn_enabled_at_build.append(torch.backends.cuda.cudnn_sdp_enabled())
+        return object()
+
+    monkeypatch.setattr(Qwen3TtsEngineBuilder, "build", fake_build)
+    torch.backends.cuda.enable_cudnn_sdp(True)
+    qwen3_stages.create_sglang_tts_engine_executor("model")
+    assert cudnn_enabled_at_build == [False]
+
+
 def test_qwen3_tts_preprocess_payload_batches_reference_codes_across_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

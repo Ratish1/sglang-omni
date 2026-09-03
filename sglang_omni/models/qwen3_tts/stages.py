@@ -40,6 +40,25 @@ _QWEN_TTS_INSTALL_HINT = (
 )
 
 
+def disable_cudnn_attention() -> None:
+    """Turn cuDNN scaled dot product attention off for this process.
+
+    Every Qwen3-TTS stage factory calls this before the first attention of
+    its process, so the policy holds in the shared pipeline process and in
+    split stage processes alike.
+    """
+    # note(ratish): torch 2.13 puts cuDNN first for scaled dot product
+    # attention on sm90. cuDNN builds one execution plan per problem shape,
+    # keyed by batch and key length, and the code predictor's chain walks
+    # sixteen key lengths per token, so every new batch bucket paid fifteen
+    # plan builds of about 25 ms on its first eager pass inside a serving
+    # step. The speech tokenizer's encoder and decoder run the same dispatch
+    # in this process on their own shapes. Flash attention serves the same
+    # shapes with no per shape state. cuDNN convolutions stay on, the speaker
+    # encoder and the tokenizer's convolutions use them.
+    torch.backends.cuda.enable_cudnn_sdp(False)
+
+
 def _load_qwen3_tts_tokenizer(
     model_path: str,
     *,
@@ -108,6 +127,7 @@ def create_preprocessing_executor(
     max_concurrency: int = 8,
 ) -> ThreadedSimpleScheduler:
     del model_path
+    disable_cudnn_attention()
     # note (luojiaxuan): preprocessing must admit several requests at once. A
     # serial executor keeps at most one reference-code request in flight, so
     # the speech-tokenizer batcher would only ever see batches of one; the
@@ -130,6 +150,7 @@ def create_sglang_tts_engine_executor(
 ) -> Any:
     from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
 
+    disable_cudnn_attention()
     return Qwen3TtsEngineBuilder(
         attn_implementation=attn_implementation,
     ).build(
@@ -168,6 +189,7 @@ def create_vocoder_executor(
     followup_cuda_graph: bool = True,
     enable_stateful_codec_decoder: bool = False,
 ) -> SimpleScheduler:
+    disable_cudnn_attention()
     device = resolve_device_spec(device, gpu_id)
     tokenizer = _load_qwen3_tts_tokenizer(
         model_path,
