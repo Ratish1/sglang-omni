@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from sglang.srt.layers.quantization.unquant import Bf16GemmBackend
 from torch import nn
 
 import sglang_omni.models.qwen3_tts.sglang_model as sglang_model_module
@@ -1050,6 +1051,41 @@ def test_server_disable_cuda_graph_gates_predictor(monkeypatch: pytest.MonkeyPat
 
     assert not talker._predictor_graphs
     assert talker._predictor_graph_enabled is False
+    assert torch.equal(graph_codes, eager_codes)
+    assert torch.equal(graph_embeds, eager_embeds)
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize(
+    "sglang_gemm_override",
+    [
+        ("is_batch_invariant_mode_enabled", lambda: True),
+        ("get_bf16_gemm_backend", lambda: Bf16GemmBackend.CUTEDSL),
+    ],
+    ids=["batch-invariant", "optimized-backend"],
+)
+def test_sglang_gemm_overrides_keep_the_eager_gemm_on_both_paths(
+    monkeypatch: pytest.MonkeyPatch, sglang_gemm_override
+):
+    device = torch.device("cuda")
+    talker = _build_talker(device)
+    monkeypatch.setattr(sglang_model_module, *sglang_gemm_override)
+    original_addmm = torch.addmm
+    calls = []
+
+    def _record_addmm(*args, **kwargs):
+        calls.append(None)
+        return original_addmm(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "addmm", _record_addmm)
+    talker.prepare_decode_buffers(_uniform_requests(2))
+    layer0, hidden, positions = _step_inputs(2, device)
+
+    eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
+    graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
+
+    assert talker._predictor_graphs
+    assert not calls
     assert torch.equal(graph_codes, eager_codes)
     assert torch.equal(graph_embeds, eager_embeds)
 

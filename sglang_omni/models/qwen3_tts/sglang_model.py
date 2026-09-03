@@ -9,8 +9,12 @@ from contextlib import contextmanager
 from typing import Any, Iterable, Optional, Tuple
 
 import torch
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    get_bf16_gemm_backend,
+)
 from sglang.srt.layers.sampler import multinomial_with_seed
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -1658,10 +1662,14 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         """Run the Predictor attention output projection and residual add."""
 
         weight = getattr(o_proj, "weight", None)
+        # note(ratish): the fusion stands in for sglang's linear only where that
+        # linear is torch's GEMM: batch invariant mode overrides aten::addmm but
+        # not the out variant, and the cutedsl backend replaces F.linear on sm100.
         use_fused_addmm = (
             attn_input.is_cuda
+            and not is_batch_invariant_mode_enabled()
+            and not get_bf16_gemm_backend().is_cutedsl()
             and not torch.is_grad_enabled()
-            and torch.cuda.get_device_capability(attn_input.device) == (9, 0)
             and isinstance(
                 getattr(o_proj, "quant_method", None), UnquantizedLinearMethod
             )
