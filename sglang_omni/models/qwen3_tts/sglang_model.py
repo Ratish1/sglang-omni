@@ -1389,13 +1389,18 @@ class Qwen3TTSTalker(nn.Module):
     ) -> _PredictorDecodeGraph:
         """Warm up and capture one (bucket, signature) graph on the session stream."""
         bucket_size, signature = int(key[0]), tuple(key[1:])
+        device = self._predictor_k_cache.device
         graph = _PredictorDecodeGraph(
             bucket_size,
             signature,
-            device=self._predictor_k_cache.device,
+            device=device,
             hidden_size=int(self._output_embeds.shape[-1]),
             hidden_dtype=self._output_embeds.dtype,
         )
+        # note(ratish): the input buffers are zero filled on the current stream
+        # and read by the warmups on the capture stream, and layer0_codes is an
+        # embedding index, so the capture stream waits here, after the fill.
+        capture_stream.wait_stream(torch.cuda.current_stream(device=device))
 
         def run_once() -> Tuple[torch.Tensor, torch.Tensor]:
             return self._code_predictor_forward_incremental(
