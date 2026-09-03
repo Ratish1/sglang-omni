@@ -109,25 +109,25 @@ class _PredictorDecodeGraph:
     """CUDA graph over the full per-token predictor chain for one batch bucket.
 
     One graph per (bucket, sampling signature): the signature pins the host
-    branches of the eager sampling path (argmax vs sampled, top-k bound,
-    top-p presence), so replay reproduces the eager sampling bits.
+    branches of the sampling path (argmax vs sampled, top-k bound, top-p
+    presence), so replay reproduces the bits of the eager pass.
     Per-step inputs reach the captured region through persistent device
-    buffers written with device-side copies before replay.
+    buffers written with device-side copies before replay. Holds no reference
+    to the talker: a cycle would put the CUDAGraph finalizer behind the
+    cyclic collector.
     """
 
     def __init__(
         self,
-        model: "Qwen3TTSTalker",
         batch_size: int,
         signature: tuple,
         *,
+        device: torch.device,
         hidden_size: int,
         hidden_dtype: torch.dtype,
     ) -> None:
-        self.model = model
         self.batch_size = batch_size
         self.signature = signature
-        device = model._predictor_k_cache.device
         self.layer0_codes = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         self.talker_hidden = torch.zeros(
             batch_size, 1, hidden_size, dtype=hidden_dtype, device=device
@@ -138,56 +138,6 @@ class _PredictorDecodeGraph:
         self.graph = torch.cuda.CUDAGraph()
         self.result_codes: torch.Tensor | None = None
         self.summed_embeddings: torch.Tensor | None = None
-        try:
-            self._capture()
-        except Exception:
-            # Note: (Jiaxin Deng) release the graph's private memory pool
-            # eagerly; the raising object may linger on traceback frames.
-            try:
-                self.graph.reset()
-            except Exception:
-                pass
-            raise
-
-    @torch.no_grad()
-    def _capture(self) -> None:
-        model = self.model
-        device = self.layer0_codes.device
-        with (
-            torch.cuda.device(device),
-            model._predictor_graph_capture_state(self.batch_size, self.signature),
-        ):
-            current_stream = torch.cuda.current_stream(device=device)
-            warmup_stream = torch.cuda.Stream(device=device)
-            warmup_stream.wait_stream(current_stream)
-            with torch.cuda.stream(warmup_stream):
-                for _ in range(2):
-                    model._code_predictor_forward_incremental(
-                        self.layer0_codes,
-                        self.talker_hidden,
-                        semantic_positions=self.semantic_positions,
-                    )
-            current_stream.wait_stream(warmup_stream)
-
-            capture_stream = torch.cuda.Stream(device=device)
-            capture_stream.wait_stream(current_stream)
-            with torch.cuda.graph(
-                self.graph,
-                pool=model._predictor_graph_memory_pool(),
-                stream=capture_stream,
-                capture_error_mode="thread_local",
-            ):
-                self.result_codes, self.summed_embeddings = (
-                    model._code_predictor_forward_incremental(
-                        self.layer0_codes,
-                        self.talker_hidden,
-                        semantic_positions=self.semantic_positions,
-                    )
-                )
-            current_stream.wait_stream(capture_stream)
-
-        if self.result_codes is None or self.summed_embeddings is None:
-            raise RuntimeError("Qwen3-TTS predictor CUDA graph captured no outputs")
 
     @torch.no_grad()
     def replay(
@@ -1289,6 +1239,63 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         # graphed chain is only validated single-rank, so TP stays eager.
         return int(server_args.tp_size) == 1
 
+    @torch.no_grad()
+    def _capture_predictor_graph(
+        self,
+        bucket_size: int,
+        signature: tuple,
+    ) -> _PredictorDecodeGraph:
+        device = self._predictor_k_cache.device
+        graph = _PredictorDecodeGraph(
+            bucket_size,
+            signature,
+            device=device,
+            hidden_size=int(self._output_embeds.shape[-1]),
+            hidden_dtype=self._output_embeds.dtype,
+        )
+
+        def run_once() -> Tuple[torch.Tensor, torch.Tensor]:
+            return self._code_predictor_forward_incremental(
+                graph.layer0_codes,
+                graph.talker_hidden,
+                semantic_positions=graph.semantic_positions,
+            )
+
+        try:
+            with (
+                torch.cuda.device(device),
+                self._predictor_graph_capture_state(bucket_size, signature),
+            ):
+                current_stream = torch.cuda.current_stream(device=device)
+                warmup_stream = torch.cuda.Stream(device=device)
+                warmup_stream.wait_stream(current_stream)
+                with torch.cuda.stream(warmup_stream):
+                    for _ in range(2):
+                        run_once()
+                current_stream.wait_stream(warmup_stream)
+
+                capture_stream = torch.cuda.Stream(device=device)
+                capture_stream.wait_stream(current_stream)
+                with torch.cuda.graph(
+                    graph.graph,
+                    pool=self._predictor_graph_memory_pool(),
+                    stream=capture_stream,
+                    capture_error_mode="thread_local",
+                ):
+                    graph.result_codes, graph.summed_embeddings = run_once()
+                current_stream.wait_stream(capture_stream)
+        except Exception:
+            # Note: (Jiaxin Deng) release the graph's private memory pool
+            # eagerly; the raising object may linger on traceback frames.
+            try:
+                graph.graph.reset()
+            except Exception:
+                pass
+            raise
+        if graph.result_codes is None or graph.summed_embeddings is None:
+            raise RuntimeError("Qwen3-TTS predictor CUDA graph captured no outputs")
+        return graph
+
     def _record_predictor_graph_failure(self, key: tuple) -> None:
         self._predictor_graph_disabled.add(key)
         self._predictor_graph_failure_count += 1
@@ -1349,13 +1356,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     )
                 return None
             try:
-                graph = _PredictorDecodeGraph(
-                    self,
-                    bucket_size,
-                    signature,
-                    hidden_size=int(talker_hidden.shape[-1]),
-                    hidden_dtype=talker_hidden.dtype,
-                )
+                graph = self._capture_predictor_graph(bucket_size, signature)
             except Exception:
                 self._record_predictor_graph_failure(key)
                 return None

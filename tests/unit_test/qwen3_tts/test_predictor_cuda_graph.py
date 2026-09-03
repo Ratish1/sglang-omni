@@ -11,6 +11,8 @@ bucket-exact batch sizes, and the dispatch/replay path must never host-sync.
 from __future__ import annotations
 
 import ast
+import gc
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -603,15 +605,19 @@ def test_capture_failure_restores_live_sub_state(monkeypatch: pytest.MonkeyPatch
     )
     layer0, hidden, positions = _step_inputs(2, device)
 
-    class _BoomGraph:
-        def __init__(self, model, bucket_size, signature, **kwargs) -> None:
-            del kwargs
-            with model._predictor_graph_capture_state(bucket_size, signature):
-                raise RuntimeError("simulated capture failure")
+    real_forward = Qwen3TTSTalker._code_predictor_forward_incremental
 
-    monkeypatch.setattr(sglang_model_module, "_PredictorDecodeGraph", _BoomGraph)
+    def _boom_forward(self, *args, **kwargs):
+        if torch.cuda.current_stream(device) != torch.cuda.default_stream(device):
+            raise RuntimeError("simulated capture failure")
+        return real_forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Qwen3TTSTalker, "_code_predictor_forward_incremental", _boom_forward
+    )
     _run_forward(talker, layer0, hidden, positions)
 
+    assert talker._predictor_graph_disabled
     assert talker._sub_batch_size == 2
     assert talker._sub_has_sampled_rows is True
     assert talker._sub_do_sample_tensor[:2].tolist() == [True, False]
@@ -1053,6 +1059,24 @@ def test_server_disable_cuda_graph_gates_predictor(monkeypatch: pytest.MonkeyPat
     assert talker._predictor_graph_enabled is False
     assert torch.equal(graph_codes, eager_codes)
     assert torch.equal(graph_embeds, eager_embeds)
+
+
+@pytest.mark.accelerator
+def test_graph_object_holds_no_reference_to_the_talker():
+    device = torch.device("cuda")
+    talker = _build_talker(device)
+    talker.prepare_decode_buffers(_uniform_requests(2))
+    layer0, hidden, positions = _step_inputs(2, device)
+    _run_forward(talker, layer0, hidden, positions)
+    (graph,) = talker._predictor_graphs.values()
+
+    assert all(value is not talker for value in vars(graph).values())
+    assert talker not in gc.get_referents(graph)
+
+    graph_ref = weakref.ref(graph)
+    talker._predictor_graphs.clear()
+    del graph
+    assert graph_ref() is None
 
 
 @pytest.mark.accelerator
