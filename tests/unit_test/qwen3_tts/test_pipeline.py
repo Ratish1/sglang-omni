@@ -316,6 +316,41 @@ def test_qwen3_tts_breakable_prefill_is_compatible_but_not_default_enabled() -> 
     assert defaults["disable_cuda_graph"] is False
 
 
+def test_qwen3_tts_engine_builder_captures_default_signature_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+
+    builder = Qwen3TtsEngineBuilder()
+    builder.wrapper = SimpleNamespace(
+        _merge_generate_kwargs=lambda **kwargs: {
+            "subtalker_dosample": True,
+            "subtalker_top_k": 7,
+            "subtalker_top_p": 0.5,
+        }
+    )
+    captured: list[tuple] = []
+    model = SimpleNamespace(
+        config=SimpleNamespace(code_predictor_config=SimpleNamespace(vocab_size=2048)),
+        capture_predictor_graphs=captured.append,
+    )
+    model.predictor_graph_signature_for_sampling = types.MethodType(
+        Qwen3TTSTalker.predictor_graph_signature_for_sampling, model
+    )
+
+    builder.setup_model_resources(
+        model, SimpleNamespace(), generation_cuda_graph_enabled=True
+    )
+    assert captured == [("sampled", 8, True, False)]
+
+    builder.setup_model_resources(
+        model, SimpleNamespace(), generation_cuda_graph_enabled=False
+    )
+    assert captured == [("sampled", 8, True, False)]
+
+
 def test_qwen3_tts_breakable_prefill_breaks_around_qk_norm_rope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

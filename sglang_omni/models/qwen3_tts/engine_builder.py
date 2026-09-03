@@ -108,6 +108,31 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         if _is_truthy(overrides.get("enable_torch_compile", False)):
             raise ValueError("Qwen3-TTS torch.compile is not supported")
 
+    def setup_model_resources(
+        self,
+        model: Any,
+        server_args: Any,
+        *,
+        generation_cuda_graph_enabled: bool,
+    ) -> None:
+        del server_args
+        if not generation_cuda_graph_enabled:
+            return
+        # note(ratish): the code predictor's graphs are captured here, after
+        # sglang's backbone graphs and before the stage reports ready, for the
+        # sampling signature the checkpoint's generation defaults produce. The
+        # warmups of each bucket also build cuDNN's attention plans, which
+        # otherwise cost about half a second inside the first serving step of
+        # every new batch size. A request that changes the subtalker top_k or
+        # top_p still captures its signature lazily.
+        defaults = self.wrapper._merge_generate_kwargs()
+        signature = model.predictor_graph_signature_for_sampling(
+            do_sample=bool(defaults["subtalker_dosample"]),
+            top_k=int(defaults["subtalker_top_k"]),
+            top_p=float(defaults["subtalker_top_p"]),
+        )
+        model.capture_predictor_graphs(signature)
+
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         model_runner_mod = importlib.import_module(
             "sglang_omni.models.qwen3_tts.model_runner"
