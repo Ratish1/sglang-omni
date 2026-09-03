@@ -453,3 +453,59 @@ module. Section 7 is the order of what follows.
 - The run 5 measurement branch. `perf/step-ledger` sits on 15c4568bb,
   the fix branch sits on 15c4568bb, so rebasing the timing commit onto
   the fix commit is a clean cherry pick. Done at measurement time.
+
+## 10. The PyTorch side, traced
+
+Read on the v2.13.0 clone and its history (anchors verified):
+
+- The dispatcher tries backends in a process wide order and takes the
+  first whose checks pass (`sdp_utils.cpp:1049-1096`). The order is
+  latched once per process: cudnn, flash, efficient, math when
+  `check_prefer_cudnn_attention` holds, otherwise flash first
+  (`:110-123`, `Context.h:480-484`).
+- cuDNN became first on sm90 and sm100 in #162073 (6f7608d603,
+  2025-09-04), whose whole message is "for 2.9". It had been made opt in
+  in #138522 after correctness bugs in 2.5, opt in preferred in #149282,
+  and the switch was renamed to the opt out `TORCH_CUDNN_SDPA_DEPRIORITIZED`
+  in #166201. #171627 added the cuDNN 9.15 gate for a correctness bug.
+  No commit in that chain states a performance rationale or considers
+  problem size.
+- The only small size check cuDNN makes is to reject key length 1
+  (`:678-683`), which is why the trace showed 75 cuDNN launches for 80
+  attention calls: lengths 2 to 16 go to cuDNN, length 1 to flash.
+- The cuDNN plan cache is keyed on exact sizes and strides including
+  batch and key length (`MHA.cpp:198-223`, `:275-280`), is thread local
+  and unbounded (`:343-399`), and every miss builds plans
+  (`:640-645`). PyTorch does not use the cudnn frontend's dynamic
+  shape or kernel cache facilities, which the pinned frontend v1.24.0
+  exposes. The opt in `TORCH_CUDNN_SDPA_AVOID_RECOMPILE` only applies
+  when q, k, v and the output are BSHD contiguous (`:168-181`), so it
+  cannot apply to a sliced BHSD KV cache like the predictor's, and even
+  where it applies the batch stays in the key.
+- Upstream, the per shape build is tracked as intentional in the open
+  issue #154602 (large prefill shapes, "recompilation"), with the opt
+  in above as its mitigation. The decode shaped consequence, a host
+  stall per new key length for microsecond kernels, is not reported.
+- Sglang core disables cuDNN attention in its diffusion runtime for a
+  different reason, a correctness crash in 2.5
+  (`multimodal_gen/runtime/platforms/cuda.py:43-45`). That module is
+  not imported in the TTS process, so it did not protect us.
+
+Consequences for this plan: the repair stands as designed, the same
+seam sglang core uses, and it is not a workaround for a bug in our
+chain. Two follow ups, tracked as tasks:
+
+- T29 File the PyTorch issue: on torch 2.13.0, H100, CUDA 13 and cuDNN
+  above 9.15, `scaled_dot_product_attention` with q `(B, 16, 1, 128)`
+  and k, v `(B, 8, L, 128)` in bf16 with `enable_gqa` is routed to
+  cuDNN for every L of 2 or more, whose graph cache is keyed on exact
+  sizes and rebuilt on every miss, so a decode loop pays one 23 to 37
+  ms host stall per new (batch, key length), fifteen per new batch
+  size in our trace, for kernels that run in microseconds, and the
+  documented recompile switch cannot apply to a BHSD cache. Proposal:
+  skip cuDNN for tiny problems the way key length 1 is skipped, or use
+  the frontend kernel cache, and until then document
+  `enable_cudnn_sdp(False)` as the intended workaround for eager
+  decode. Attach the run 4 capture lines and the trace accounting.
+- T30 The same policy for the talker, MOSS-TTS-Local and MOSS-TTS Delay
+  processes once their first shape costs are measured (doc 19 A5).
