@@ -47,8 +47,10 @@ Success criteria, measured on the H100 box with the capture timing:
   within run to run noise, so the replay pays nothing for the change
 - `tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py` passes on
   the box, all 55
-- the Qwen3-TTS CI stage set passes its thresholds on the fix commit
-  as it does on 15c4568bb, fresh servers, same box
+- the full seed-tts-eval corpus at c1 and c16 on one server per arm,
+  the fix commit against 15c4568bb, shows no quality regression in WER
+  and speaker similarity and no speed regression, same box, fresh
+  server per point
 - preprocessing p50 and the vocoder's first request cost are not worse
 
 Non goals, each owned elsewhere: the warmup count, the shared capture
@@ -412,9 +414,8 @@ black and isort, and the accelerator module passes on the box.
 | the flag is set in every stage process in every layout | a factory does not call the helper, or the vocoder split out keeps cuDNN | the three factory contract tests, and run 5 once with `--vocoder.process vocoder` and once without | flag false after each factory, no plan build gap in either layout |
 | flash admits the predictor's shapes | a constraint not read here rejects them and math serves, slower | the new accelerator kernel name test on the CI H100, plus decode `forward_ms` p50 in run 5 | no `cudnn` kernel, and p50 within noise of run 3 |
 | graph against eager bit identity | a backend that differs between capture and eager | the existing 55 tests on the box | all pass |
-| batch invariance of outputs | a backend whose per row result depends on batch | `tests/test_model/test_qwen3_tts_batch_invariance.py` on the box | passes |
-| output quality | flash rounding flips sampled codes often enough to move WER or similarity | the CI stage set A/B, `TTS_CI_MODEL=qwen3-tts pytest tests/test_model/test_tts_ci.py --tts-stage tts-stage-1-nonstream -k "test_voice_cloning_non_streaming or test_voice_cloning_wer"` and the `tts-stage-2-stream` line from `run_all_wer_ci_aligned.sh:108-114`, on 15c4568bb and on the fix commit, same box, fresh servers | thresholds pass on both, and the fix commit's metrics sit within the base's run to run spread |
-| tokenizer and vocoder not slower | flash slower than cuDNN at their lengths | run 5 request view, preprocessing p50 and the vocoder per request timings, against run 3 | not worse beyond noise |
+| output quality | flash rounding flips sampled codes often enough to move WER or similarity | the full corpus A/B of doc 15 section 3.2: one server per arm, `benchmark_tts_seedtts` generate only on `seed-tts-eval-arrow` at c1 and c16, then transcribe only and similarity only on each output directory, 15c4568bb against the fix commit, same box, fresh server per point | WER and speaker similarity of the fix commit within the base's run to run spread, never worse beyond it |
+| tokenizer and vocoder not slower | flash slower than cuDNN at their lengths | run 5 request view, preprocessing p50 and the vocoder per request timings, against run 3, and the full corpus speed results per arm | not worse beyond noise |
 | replay unchanged | a different kernel count or slower kernel in the graph | run 5 decode `host_ms` and `forward_ms` p50 at rows 1 and 16 against run 3 | within noise |
 
 Omitted layers and why: no fault injection, the change has no failure
@@ -426,7 +427,9 @@ Performance qualification runs against 15c4568bb exactly, the base of
 the fix branch, with the measurement branch built the same way on
 both sides, one c1 and one c16 window per side, fresh servers, the
 same GPU, the benchmark's default warmup inside the window as in every
-run so far.
+run so far. Quality qualification is our own A/B with one server per
+arm and the full corpus, not the CI harness, which runs a router over
+two workers and exists to catch regressions, not to measure a change.
 
 ## 8. Implementation state
 
@@ -447,8 +450,8 @@ module. Section 7 is the order of what follows.
   the accelerator kernel name test. If math serves instead, the plan
   builds are still gone and the replay time gate decides whether the
   T22 explicit attention comes forward.
-- Tokenizer and vocoder numerics under flash. Resolved by the stage set
-  A/B. If a threshold fails, the design does not change: the fallback
+- Tokenizer and vocoder numerics under flash. Resolved by the full
+  corpus A/B. If a threshold fails, the design does not change: the fallback
   is to keep the flag in the engine factory only and pass
   `attn_implementation="eager"` or a per stage decision to the
   tokenizer loaders, and that fallback is decided on the failing

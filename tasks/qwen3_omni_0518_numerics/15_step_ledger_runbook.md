@@ -197,6 +197,31 @@ git checkout cec7b6b11 && python -m pytest tests/unit_test/qwen3_tts/test_predic
 The H100 image runs torch 2.13.0, the pin in pyproject. Read the torch
 side of any capture question on that version.
 
+The quality and speed A/B for a Qwen3-TTS change (doc 20 section 7) is
+our own, one server per arm and the full corpus, not the CI harness.
+Per arm (15c4568bb and the fix commit) and per point (c1, c16): boot
+one server as above, generate on the full corpus, stop the server, then
+score the output directory. The benchmark requires the two phases to be
+separate when it talks to an existing server, and the scoring phase
+starts its own ASR server, so the TTS server must be down first.
+
+```
+python -m benchmarks.eval.benchmark_tts_seedtts --generate-only --use-existing-server \
+  --meta zhaochenyang20/seed-tts-eval-arrow --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --ref-format references --lang en --port 31001 --max-concurrency $C \
+  --output-dir $OUT/${ARM}_qwen3tts_c${C}_full
+# stop the server, then
+python -m benchmarks.eval.benchmark_tts_seedtts --transcribe-only \
+  --meta zhaochenyang20/seed-tts-eval-arrow --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --lang en --output-dir $OUT/${ARM}_qwen3tts_c${C}_full
+python -m benchmarks.eval.benchmark_tts_seedtts --similarity-only \
+  --meta zhaochenyang20/seed-tts-eval-arrow --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --lang en --output-dir $OUT/${ARM}_qwen3tts_c${C}_full
+```
+
+Keep the speed results and the WER and similarity JSON per arm and
+point. Alternate the arm order between points.
+
 ### 3.3 Qwen3-ASR 1.7B
 
 Concurrencies: 1, 8, 32 (CI). The benchmark talks to the running server.
