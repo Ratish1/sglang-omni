@@ -164,8 +164,13 @@ of the two warmup passes), both from timing events. `instrument` is the
 cost of the timing itself and belongs to no phase. The c16 window is the
 one to read: it captures buckets 16, 12, 8, 4 and 2 in one pass.
 
-Run 4 (doc 19 section 8) is the same c16 window with the torch profiler
-on. Use the `/start_profile` route instead of `/start_request_profile`:
+Run 4 (doc 19 section 8, done, read in section 9) is the same c16
+window with the torch profiler on. The profiler's op callbacks are
+thread local, so the scheduler thread's PyTorch ops are absent from the
+trace and only its CUDA runtime and driver calls are recorded, which
+was enough to name the cost. The trace is cut and read with
+`scripts/trace_windows.py` and `scripts/trace_capture_regions.py`. Use
+the `/start_profile` route instead of `/start_request_profile`:
 it starts the same event recorder and ledger, and records a continuous
 torch trace per stage process between start and stop, exported as
 `<template>_rank0.trace.json.gz` next to the events. No stack, shapes

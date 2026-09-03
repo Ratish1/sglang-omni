@@ -334,4 +334,167 @@ The design options of section 4 stand, with one change already
 decided by the numbers: the per bucket warmup passes are the cost, the
 flush and the drain are not, so option B is dropped and option A's
 first step is to find what the first pass initialises and move it out
-of the serving step.
+of the serving step. Run 4 was done and section 9 names it.
+
+## 9. Run 4: the first pass builds cuDNN attention plans
+
+Run 4 (predictor-trace-d6425827b, GPU 3, one c16 window, 50 of 50,
+torch profiler on through `/start_profile`) recorded six captures with
+the same phase split as run 3 under the profiler's overhead: warmup 1
+at 429 to 639 ms, warmup 2 at 44 to 46 ms, the capture pass at 35 to
+49 ms.
+
+The trace holds no PyTorch op events for the scheduler thread, only its
+CUDA runtime and driver calls: the profiler's op callbacks are thread
+local and the scheduler thread predates the profiler, while CUPTI
+records API calls process wide. That was enough. The windows were cut
+out of the 5.5 GB trace with `scripts/trace_windows.py` and the
+regions accounted with `scripts/trace_capture_regions.py`, both keyed to
+this run's capture timestamps.
+
+Per capture, the first warmup pass is host time outside any CUDA call:
+the pass makes about 2278 API calls summing 8 to 23 ms, and the rest of
+its wall is gaps. The gaps are fifteen per pass, 23 to 37 ms each,
+every one between a `cudaGetDeviceProperties` call and a driver level
+kernel launch, and the kernel each of those launches is
+`cudnn_generated_fort_native_sdpa_sm80_flash_fprop_wmma_f16_knob_2_64x3`,
+the cuDNN attention kernel. The second pass launches the same 75 cuDNN
+attention kernels with no property query and no gap.
+
+| capture | warmup 1 wall | plan gaps | other gaps over 1 ms | remainder |
+|---|---|---|---|---|
+| bucket 1, ordinal 1 | 639.1 | 15 summing 369.8 | 185.5, of which 165 before `cudaLibraryLoadData` | 84 |
+| bucket 16 | 428.9 | 15 summing 352.2 | 4.1 | 73 |
+| bucket 12 | 459.9 | 15 summing 374.0 | 10.3 | 76 |
+| bucket 8 | 453.9 | 15 summing 349.5 | 1.2 | 103, of which 15 in one `cudaMalloc` |
+| bucket 4 | 435.0 | 15 summing 352.3 | 3.4 | 79 |
+| bucket 2 | 476.5 | 15 summing 389.4 | 3.4 | 84 |
+
+The mechanism, from the pinned sources:
+
+- The predictor's attention is `scaled_dot_product_attention` over the
+  KV cache slice up to `cache_len + 1` (`sglang_model.py:1798`,
+  `:1809-1815` with `enable_gqa=True`), so one token's chain calls it
+  with sixteen key lengths, 1 to 16, five layers each.
+- On torch 2.13 the backend order starts with cuDNN whenever
+  `check_prefer_cudnn_attention` holds (`sdp_utils.cpp:80-98`, cuDNN
+  above 9.15 on an sm90 or sm100 device unless
+  `TORCH_CUDNN_SDPA_DEPRIORITIZED` is set), then `priority_order`
+  installs cudnn, flash, efficient, math (`:110-118`). The 2.9.1 build
+  on the laptop has flash first, which is why the earlier reading
+  assumed flash.
+- cuDNN attention caches one built execution graph per problem, keyed
+  by `MHAParams` (`cudnn/MHA.cpp:198-223`), which includes the batch
+  `b` and the key length `s_kv`. A miss builds the graph
+  (`:1384-1420`, `build_graph` on `try_emplace` miss). Building one
+  costs 23 to 37 ms of host on this box, and it begins with the device
+  property and runtime version queries the trace shows.
+- A new batch bucket therefore misses fifteen times (key lengths 2 to
+  16, the length 1 case takes another path, 75 cuDNN launches per pass
+  against 80 attention calls), on every layer's first call at that
+  length, once per process per bucket. The second pass hits the cache.
+  The first capture in the process also loads the cuDNN kernel library
+  (165 ms).
+
+The remainder of 73 to 103 ms per first pass is the chain's own launch
+cost plus the per stream first use costs (the cuBLAS workspace
+allocation among them). The second pass at 45 ms is the chain's launch
+cost alone.
+
+Two consequences that the earlier sections got wrong:
+
+- The warmup passes are not waste. The first pass does the one thing
+  the capture needs done outside it, building the plans, and it does
+  it at the worst moment. Dropping the warmups would move the same
+  builds into the capture pass. The gating of the fused kernels on
+  capture state stays a defect, but its cost is the 8 ms measured in
+  run 3, not the stall.
+- The cost is not a property of graph capture. Any eager run of the
+  chain at a batch size the process has not seen pays the same fifteen
+  builds. The graphed path pads to the ladder, so only the ladder sizes
+  pay. An eager fallback, when the graph is disabled or the key cap is
+  reached, pays at every distinct batch size.
+
+### 9.1 The same pattern elsewhere in omni
+
+The identical code, attention over a cache slice that grows one
+position per sub step through the default backend order, is the talker
+predictor (`qwen3_omni/components/talker.py:1715`) and the MOSS-TTS-Local
+local transformer (`moss_tts_local/local_transformer.py:163`), and
+MOSS-TTS Delay's chunked attention with an explicit mask
+(`moss_tts/attention.py:514`). These are the first shape prefill costs
+of doc 17 task T26, unmeasured but now with a named candidate. Two
+models in the tree already opt out of cuDNN attention: dots_tts pins
+`[EFFICIENT_ATTENTION, MATH]` around its tail (`dots_tts/tail.py:27`,
+`:654`), and MiniMax Music 3 disables it process wide
+(`minimax_music3/stages.py:54`, `acoustic.py:140`).
+
+### 9.2 The first prefill of a process
+
+The trace region before the first capture's warmup holds 430 ms of gaps
+over 5 ms on the scheduler thread: 216 and 91 ms between two allocator
+capture status checks and 36 and 25 ms before launches of
+`triton_poi_fused_copy_copy__div_lt_mul_where_0` and
+`triton_poi_fused__to_copy_arange_0`, which are Inductor generated
+kernels, alongside 140 `cudaGetDriverEntryPointByVersion` calls. That
+is the compiled `multinomial_with_seed` of sglang's sampler
+(`layers/sampler.py:687`) being compiled or loaded for the eager
+prefill's seeded sampling, plus the Triton runtime's first use. With the
+cuDNN library load of the first capture it accounts for most of the 800
+to 1000 ms the first prefill paid outside its capture in run 3. Omni's
+launcher sends no warmup request before readiness (no warmup in
+`serve/launcher.py` or `pipeline/`), sglang's own server does
+(`entrypoints/http_server.py:411-413`, `_wait_and_warmup`), so every
+process wide first use lands on the first user request.
+
+### 9.3 The test failure is a garbage collection hazard of the design
+
+On d6425827b the predictor test module fails in the same order that
+passes on cec7b6b11: the sixth test's capture is invalidated, four
+`CUDAGraph.reset` warnings "operation not permitted when stream is
+capturing" precede the failure, and the allocator then asserts
+`Invalid stream capture status` on the next allocation inside the
+capture. The resets are the destructors of the earlier tests' graphs.
+A talker and its graphs form a reference cycle (`_predictor_graphs`
+holds the graph, the graph holds `model`), so they are freed by the
+cyclic collector, whose timing follows allocation counts. The timing
+code allocates a few Python objects per capture, which moved a
+collection into the sixth capture. The base commit has the same cycle
+and the same exposure, it only collects at a different moment. Sglang
+freezes the collector around its own capture loop
+(`base_cuda_graph_runner.py:45-61`) for this reason. In production the
+talker lives for the process, but any cyclic garbage that owns a CUDA
+graph or event and is collected inside a capture invalidates it.
+
+### 9.4 What the fix is, now
+
+- **A1. Take cuDNN out of the predictor attention.** Flash admits the
+  predictor's shapes on 2.13: the dense constraints allow grouped
+  query attention, head dim 128 and bf16, and there is no mask
+  (`sdp_utils.cpp`, the flash constraint lists). Either pin the
+  backend around the chain with `sdpa_kernel([FLASH_ATTENTION, MATH])`,
+  as dots_tts does, or replace the call with attention written out over
+  the fixed 17 slot cache with a length mask, two small matmuls and a
+  softmax, which has no per shape state at all and one shape per
+  batch. Decided by the eager pass time (the second warmup's wall) and
+  the replay time (the ledger's decode host and forward at rows 1 and
+  16) of each, then the bit match tests. The sampled codes change
+  slightly under any backend change, so the stage set A/B is the
+  verdict on quality.
+- **A2. Then the capture itself.** With the plans gone a capture is
+  two 45 ms passes, a 35 ms capture pass and the instantiate. Measure
+  again with one warmup, keep the shared capture stream, break the
+  talker to graph cycle with a weak reference, and run the capture
+  with the cyclic collector disabled.
+- **A3. Startup capture of the default signature's ladder** stays a
+  policy on the residual, which after A2 is roughly 100 ms per rung
+  crossing.
+- **A4. A startup warmup request per stage**, one greedy request at
+  batch one before readiness, pulls the compile, the library loads and
+  the bucket 1 capture off the first user request. Separate task, all
+  models.
+- **A5. The other predictors and attentions of section 9.1** get the
+  same A1 treatment once measured, under T26.
+
+Option C of section 4 is A3 above. Option D, the chain's op count, is
+unchanged and separate.

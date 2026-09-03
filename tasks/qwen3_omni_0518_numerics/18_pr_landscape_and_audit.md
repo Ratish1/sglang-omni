@@ -129,14 +129,28 @@ Defects:
   (doc 19 section 7). `capture_error_mode thread_local` (`:151` on
   15c4568bb) exempts other threads from erroring, it does not keep them
   out.
-- **The warmup passes warm the wrong kernels.** The fused gather, sampler
-  and addmm are gated on `is_current_stream_capturing()` (`:1496`,
-  `:1712`, `:1820` on 15c4568bb), the two warmup passes are not
-  capturing, so they run the eager branches and the fused Triton kernels
-  are first launched inside the capture pass of the first capture.
-  Sglang's two warmups per shape run at startup only
-  (`full_cuda_graph_backend.py:103-108`), ours run per bucket inside a
-  serving step for state that is process wide.
+- **The first warmup pass builds fifteen cuDNN attention plans per
+  bucket.** The predictor's `scaled_dot_product_attention` over a cache
+  slice of 1 to 16 keys (`:1798`, `:1809-1815`) runs on cuDNN on torch
+  2.13 and H100, whose plan cache is keyed by batch and key length, so
+  each new bucket builds fifteen plans at 23 to 37 ms each on its first
+  eager pass (doc 19 section 9, from the run 4 trace). That is the
+  stall. The same code pattern is in the talker predictor and the
+  MOSS-TTS attentions (doc 19 section 9.1), and dots_tts and MiniMax
+  already opt out of cuDNN attention.
+- **The fused kernels are gated on capture state.** The fused gather,
+  sampler and addmm are gated on `is_current_stream_capturing()`
+  (`:1496`, `:1712`, `:1820` on 15c4568bb), so the warmup passes run the
+  eager branches and the fused Triton kernels are first launched inside
+  the capture pass. Measured at about 8 ms on the first capture, a
+  defect but not the stall.
+- **A capture with the cyclic collector running.** A talker and its
+  graphs form a reference cycle, and a graph freed by the collector
+  during another capture resets itself on a capturing stream and
+  invalidates that capture. It surfaced as an order dependent test
+  failure on the timing branch, the base has the same exposure (doc 19
+  section 9.3). Sglang freezes the collector around its capture loop
+  (`base_cuda_graph_runner.py:45-61`).
 - **A new stream per capture with a shared pool.** Two fresh streams per
   capture (`:133`, `:145`) against PyTorch's note that captures sharing
   a pool should share the stream (`graphs.py:398-399`) and sglang's one
