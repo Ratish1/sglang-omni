@@ -6,6 +6,16 @@ measured branch, the replay time gate of section 8.3, whose outcome selects
 between keeping the kernel and keeping the SDPA call inside the graph. No
 other decision is delegated to the implementer.
 
+Amendment, 2026-09-03, after doc 22. The full-corpus A/B showed the cuDNN
+repair (doc 20) trades a per process warm up cost for a per step replay
+cost, so cuDNN attention stays on and the repair branch stays unmerged.
+The decisions below that this changes: D13 replaces the base branch of
+section 7, the startup capture of 6.3 now also builds cuDNN's attention
+plans in its warmups, and the gate of 8.3 compares against the cuDNN
+replay. The thread local plan cache note in 6.3 and tasks T39 and T40
+follow from the same doc. Slice A was implemented on
+`perf/qwen3-tts-predictor-capture` from upstream main on 2026-09-03.
+
 Task class: cross-boundary. The change crosses the model file, the engine
 builder lifecycle, the pipeline process and thread topology, sglang's kernel
 and runner contracts, and PyTorch's capture and allocator contracts.
@@ -370,6 +380,10 @@ This document does not restate the cuDNN finding.
   changes no kernel and must be bit identical to today's graph path
   outside deterministic mode. Slice B changes the attention numerics and
   needs its own quality verdict.
+- D13 cuDNN attention stays on. Both slices branch from upstream main and
+  not from the cuDNN repair branch. Reason: doc 22, the repair's replay
+  cost of 0.13 ms per step at one row and 0.21 ms at sixteen rows outlives
+  its per process savings after about 700 requests.
 
 ### 2.7 Open questions
 
@@ -611,6 +625,15 @@ scheduler thread. The cuBLAS handle is per thread (P4). On both threads the
 first use of every branch now happens in warmup 1, the fused addmm included,
 so no first use lands inside the capture on either thread.
 
+With cuDNN attention on (D13) the warmups of the startup capture also build
+cuDNN's plans for every (bucket, key length) of the default signature, so
+the serving steps of the default path never pay a plan build, and the
+captured graph keeps the fused cuDNN kernel at replay. The cuDNN plan cache
+is thread local (doc 20 section 10), so the lazy capture of a non default
+signature on the scheduler thread still builds its plans, about 350 ms per
+new key (run 3). That is today's cost, bounded by the key cache, not a
+regression.
+
 `capture_predictor_graphs` returns without work when the resolved policy
 is off. It does not raise on a key failure (section 6.1 table). It records
 `_predictor_graph_capture_count` as today.
@@ -705,9 +728,9 @@ absent, in which case the CUDA branch is not taken.
 
 ## 7. Execution plan
 
-Both slices branch from `perf/qwen3-tts-cudnn-attention` (a4f3590b2). If
-the cuDNN repair merges first they rebase onto upstream main, whose
-predictor files are identical (revision table).
+Both slices branch from upstream main (`fa1ea43dc`), whose predictor files
+are identical to the fix base (revision table). The cuDNN repair branch is
+not a base and is not merged (D13).
 
 ### 7.1 Slice A, `perf/qwen3-tts-predictor-capture`
 
@@ -806,17 +829,18 @@ cherry-picked for ledger runs).
 | --- | --- | --- |
 | run 6, ledger | Slice A | startup log has the capture line with 6 keys, no `Captured Qwen3-TTS predictor CUDA graph` line inside a serving step at c1 or c16 for default requests, first step latency at c1 and c16 versus run 5 |
 | run 6d, ledger | Slice A with `--enable-deterministic-inference true` (the flag of #1936) | every key captures, no `CUBLAS_STATUS_NOT_INITIALIZED`, one request at c1 completes |
-| A/B A | fix branch head versus Slice A, c1 and c16, full corpus, generate-only then transcribe-only and similarity-only, arms alternated | WER and similarity flat within run to run noise, speed distributions not worse |
+| A/B A | upstream main versus Slice A, c1 and c16, full corpus, generate-only then transcribe-only and similarity-only, arms alternated, a fixed `--seed` (T39) | WER and similarity flat within run to run noise, paired per sample latency not worse (doc 22 section 4 method) |
 | A/B B | Slice A versus Slice B, same protocol | quality within the gates of doc 15, speed not worse, plus the gate of 8.3 |
 
 ### 8.3 The replay time gate (Slice B)
 
-With the ledger on both arms at c1 and c16, compare the decode forward
-wall per step (the ledger's `decode host` and `forward` rows) and the per
-step predictor time from a `/start_profile` window of 20 steps (doc 15).
-Accept the kernel when the c16 per step time is not worse than Slice A
-beyond the run to run spread of two repeats. Otherwise select SDPA and
-close Slice B as in 7.2.
+With the ledger on both arms at c1 and c16, compare the decode step's GPU
+span minus the backbone forward (the predictor replay, sampling and
+collect, doc 22 section 2) and the per step predictor time from a
+`/start_profile` window of 20 steps (doc 15). The Slice A arm replays the
+fused cuDNN kernel (D13). Accept the kernel when the c16 per step time is
+not worse than Slice A beyond the run to run spread of two repeats.
+Otherwise keep SDPA on cuDNN and close Slice B as in 7.2.
 
 ## 9. Rollout, observability, rollback
 
@@ -851,4 +875,11 @@ close Slice B as in 7.2.
   2 stays open.
 - T38 If a lazy vocoder capture lands (PR #1855), serialize it against the
   predictor's lazy capture in the shared process (P7).
+- T39 Run every A/B with a fixed `--seed` so both arms sample the same
+  trajectories where their numerics agree and a runaway can be replayed.
+  Add to doc 15.
+- T40 The speech tokenizer and the codec decoder build a cuDNN plan per new
+  sequence length, 38 ms and 34 ms at the p50 of the run 3 window (doc 22
+  section 3). A startup sweep over a length ladder for both is decided
+  after Slice A lands.
 - T22, T29, T30, A4 remain as recorded in docs 19 and 20.
