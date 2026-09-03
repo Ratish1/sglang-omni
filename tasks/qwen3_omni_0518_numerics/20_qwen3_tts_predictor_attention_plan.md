@@ -68,21 +68,21 @@ Repository facts, all at 15c4568bb unless named.
   with `enable_gqa=True` when `num_heads // num_kv_heads` is above one
   (`:1798-1815`). The cache is `[layers, max_batch, kv_heads, predictor_len, head_dim]`
   with `predictor_len = num_code_groups + 1` (`:454`, `:470-478`).
-- `_predictor_forward_one_token` (`:1660-1700`) runs every predictor
+- `_predictor_forward_one_token` (`:1667-1700`) runs every predictor
   layer for one token at `cache_len`, reading positions from
   `_predictor_position_rows[cache_len, :batch_size]` (`:1676`).
 - `_code_predictor_forward_incremental` (`:1358-1466`) runs, per token,
   one forward at `cache_len` 0, one at 1, then one per remaining group,
   so key lengths 1 to `num_code_groups`, and samples one code per group.
 - The chain executes in four contexts, all through that one function:
-  the eager fallback in `code_predictor_forward` (`:1173`), the two
+  the eager fallback in `code_predictor_forward` (`:1156`, the call at `:1173`), the two
   warmup passes and the capture pass of `_PredictorDecodeGraph._capture`
   (`:137`, `:154`, and the capture body), and the replay of that graph.
   Prefill and decode both reach it through `_collect_codes`
   (`qwen3_tts/model_runner.py:210-230`, called from `post_prefill` and
-  `post_decode` at `:76-92`).
+  `post_decode` at `:72-89`).
 - The predictor graph is enabled only for `tp_size == 1`
-  (`_resolve_predictor_graph_enabled`, `:1296-1304`), so under tensor
+  (`_resolve_predictor_graph_enabled`, `:1275-1283`), so under tensor
   parallel the chain runs eagerly at every batch size.
 - The attention object is `Qwen3OmniMoeThinkerTextAttention`
   (`qwen3_omni/components/thinker_model.py:142-250`), with
@@ -206,8 +206,8 @@ Decisions are in section 5. Open questions are in section 8.
 serving step on the scheduler thread of the pipeline process
   model_runner.py:210 _collect_codes  (post_prefill and post_decode)
     :228 model.code_predictor_forward(layer0_codes, hidden, semantic_positions)
-      sglang_model.py:1177 code_predictor_forward
-        :1306 _predictor_forward_graphed
+      sglang_model.py:1156 code_predictor_forward
+        :1285 _predictor_forward_graphed
           key hit  -> _PredictorDecodeGraph.replay   [graph, no host attention]
           key miss -> _PredictorDecodeGraph._capture
                         :137 warmup pass 1  -> chain, eager   <- 15 cuDNN plan builds
@@ -217,7 +217,7 @@ serving step on the scheduler thread of the pipeline process
 
 chain = _code_predictor_forward_incremental :1358
   per token: forward at cache_len 0, 1, then one per remaining group
-    _predictor_forward_one_token :1660  per layer:
+    _predictor_forward_one_token :1667  per layer:
       _predictor_cached_self_attention :1758
         qkv_proj, qk norm, rope, write k v at cache_len
         scaled_dot_product_attention(q, cache[: cache_len + 1], enable_gqa)
