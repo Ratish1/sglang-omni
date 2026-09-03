@@ -1091,6 +1091,86 @@ def test_failed_capture_restores_the_current_stream(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.accelerator
+@pytest.mark.accelerator
+def test_startup_capture_builds_the_ladder_for_one_signature():
+    device = torch.device("cuda")
+    talker = _build_talker(device)
+    signature = ("sampled", 8, False, False)
+
+    assert talker.capture_predictor_graphs(signature) == len(BUCKETS)
+    assert set(talker._predictor_graphs) == {(bucket, *signature) for bucket in BUCKETS}
+    assert talker.capture_predictor_graphs(signature) == 0
+
+    for batch_size in BUCKETS:
+        talker.prepare_decode_buffers(_uniform_requests(batch_size, top_k=5))
+        layer0, hidden, positions = _step_inputs(batch_size, device)
+        eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
+        graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
+        assert torch.equal(graph_codes, eager_codes)
+        assert torch.equal(graph_embeds, eager_embeds)
+
+    assert len(talker._predictor_graphs) == len(BUCKETS)
+
+
+@pytest.mark.accelerator
+def test_startup_capture_failure_raises_and_restores_state(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    device = torch.device("cuda")
+    talker = _build_talker(device)
+    real_forward = Qwen3TTSTalker._code_predictor_forward_incremental
+
+    def _boom_forward(self, *args, **kwargs):
+        if torch.cuda.current_stream(device) != torch.cuda.default_stream(device):
+            raise RuntimeError("simulated capture failure")
+        return real_forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Qwen3TTSTalker, "_code_predictor_forward_incremental", _boom_forward
+    )
+
+    with pytest.raises(RuntimeError, match="simulated capture failure"):
+        talker.capture_predictor_graphs(("sampled", 8, False, False))
+
+    assert not talker._predictor_graphs
+    assert talker._sub_batch_size == 0
+    assert gc.isenabled()
+
+
+def test_signature_rule_is_shared_by_batch_and_startup_paths():
+    talker = _build_talker(torch.device("cpu"))
+    cases = [
+        (True, 5, 1.0),
+        (True, 5, 0.9),
+        (True, 0, 1.0),
+        (True, 3, 0.5),
+        (True, PRED_VOCAB, 1.0),
+        (True, 4, 1.0),
+        (True, 9, 1.0),
+        (False, 5, 1.0),
+    ]
+    for dosample, top_k, top_p in cases:
+        talker.prepare_decode_buffers(
+            _uniform_requests(3, dosample=dosample, top_k=top_k, top_p=top_p)
+        )
+        if talker._sub_has_sampled_rows:
+            expected = (
+                "sampled",
+                talker._sub_sampled_max_top_k,
+                talker._sub_sampled_has_top_p,
+                talker._sub_sampled_has_unbounded_top_k,
+            )
+        else:
+            expected = ("argmax", 0, False, False)
+        assert (
+            talker.uniform_predictor_graph_signature(
+                do_sample=dosample, top_k=top_k, top_p=top_p
+            )
+            == expected
+        ), (dosample, top_k, top_p)
+
+
+@pytest.mark.accelerator
 def test_graph_object_holds_no_reference_to_the_talker():
     device = torch.device("cuda")
     talker = _build_talker(device)

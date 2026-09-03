@@ -6,6 +6,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import time
 from contextlib import contextmanager
 from typing import Any, Iterable, Optional, Tuple
 
@@ -959,8 +960,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         )
         self._predictor_graphs: dict[tuple, _PredictorDecodeGraph] = {}
         self._predictor_graph_disabled: set[tuple] = set()
-        # Note: (Jiaxin Deng) None = resolved at decode time; the bootstrap
-        # defers graph capture past init, so nothing is decided here.
+        # note(ratish): None until the startup capture or the first decode
+        # resolves it, after the bootstrap has built sglang's graphs.
         self._predictor_graph_enabled: bool | None = None
         self._predictor_graph_failure_count = 0
         self._predictor_graph_capacity_fallback_count = 0
@@ -1241,6 +1242,51 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         # Note: (Jiaxin Deng) capture under TP would record collectives; the
         # graphed chain is only validated single-rank, so TP stays eager.
         return int(server_args.tp_size) == 1
+
+    def uniform_predictor_graph_signature(
+        self,
+        *,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+    ) -> tuple:
+        """Graph signature of a batch whose rows all sample with these values."""
+        if not do_sample:
+            return ("argmax", 0, False, False)
+        max_top_k, has_top_p, has_unbounded_top_k = _predictor_signature_terms(
+            [int(top_k)],
+            [float(top_p)],
+            int(self.config.code_predictor_config.vocab_size),
+        )
+        return ("sampled", max_top_k, has_top_p, has_unbounded_top_k)
+
+    def capture_predictor_graphs(self, signature: tuple) -> int:
+        """Buckets go in descending order so the smaller ones reuse the pool of
+        the larger ones."""
+        if self._predictor_graph_enabled is None:
+            self._predictor_graph_enabled = self._resolve_predictor_graph_enabled()
+        if not self._predictor_graph_enabled:
+            return 0
+        started = time.perf_counter()
+        captured_before = len(self._predictor_graphs)
+        with self._predictor_capture_session():
+            for bucket_size in reversed(self._predictor_graph_batch_sizes):
+                key = (bucket_size, *signature)
+                if key in self._predictor_graphs:
+                    continue
+                if len(self._predictor_graphs) >= _PREDICTOR_GRAPH_MAX_KEYS:
+                    break
+                self._predictor_graphs[key] = self._capture_predictor_graph(
+                    bucket_size, signature
+                )
+                self._predictor_graph_capture_count += 1
+        captured = len(self._predictor_graphs) - captured_before
+        elapsed_s = time.perf_counter() - started
+        logger.info(
+            f"Captured {captured} Qwen3-TTS predictor CUDA graphs for "
+            f"signature={signature} in {elapsed_s:.1f} s"
+        )
+        return captured
 
     @contextmanager
     def _predictor_capture_session(self):

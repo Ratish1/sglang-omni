@@ -5245,6 +5245,7 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     from sglang_omni.models.qwen3_tts.request_builders import (
         clear_qwen3_tts_preprocessing_context,
     )
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
     from sglang_omni.scheduling import bootstrap as bootstrap_mod
     from sglang_omni.scheduling import omni_scheduler as scheduler_mod
     from sglang_omni.scheduling import sglang_backend
@@ -5277,10 +5278,20 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     build_kwargs: dict = {}
     infrastructure_saw_deferred_capture: list[bool] = []
     init_graph_calls: list[bool] = []
+    predictor_captures: list[tuple] = []
 
     class FakeModel:
+        config = SimpleNamespace(code_predictor_config=SimpleNamespace(vocab_size=2048))
+        uniform_predictor_graph_signature = (
+            Qwen3TTSTalker.uniform_predictor_graph_signature
+        )
+
         def load_speech_tokenizer(self, tokenizer) -> None:
             self.speech_tokenizer = tokenizer
+
+        def capture_predictor_graphs(self, signature: tuple) -> int:
+            predictor_captures.append(signature)
+            return 6
 
     class FakeSGLangRunner:
         def __init__(self, server_args) -> None:
@@ -5300,6 +5311,9 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     class FakeQwen3TTSModel:
         def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
+
+        def _merge_generate_kwargs(self, **kwargs):
+            return {**self.kwargs["generate_defaults"], **kwargs}
 
     qwen_tts_module = types.ModuleType("qwen_tts")
     qwen_tts_module.Qwen3TTSModel = FakeQwen3TTSModel
@@ -5480,6 +5494,7 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
 
     assert infrastructure_saw_deferred_capture == [True]
     assert init_graph_calls == [True]
+    assert predictor_captures == [("sampled", 50, False, False)]
     assert scheduler.server_args.cuda_graph_bs == expected_cuda_graph_bs
     assert scheduler.server_args.cuda_graph_max_bs == 64
     assert scheduler.server_args.disable_cuda_graph is False
