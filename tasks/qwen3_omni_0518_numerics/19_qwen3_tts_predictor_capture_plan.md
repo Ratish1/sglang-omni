@@ -482,10 +482,65 @@ graph or event and is collected inside a capture invalidates it.
   slightly under any backend change, so the stage set A/B is the
   verdict on quality.
 - **A2. Then the capture itself.** With the plans gone a capture is
-  two 45 ms passes, a 35 ms capture pass and the instantiate. Measure
-  again with one warmup, keep the shared capture stream, break the
-  talker to graph cycle with a weak reference, and run the capture
-  with the cyclic collector disabled.
+  two 45 ms passes, a 35 ms capture pass and the instantiate. Sglang's
+  two warmups per shape carry no rationale for the count
+  (`full_cuda_graph_backend.py:103`), PyTorch's helper uses three, and
+  a warmup count is right when it covers both the state that
+  materialises on the first call and the state that only settles on
+  the second, such as an autotuner that benchmarks on call one. Runs 3
+  and 4 show the second pass already matching the capture pass call
+  for call, with no first use call left in it, but that was measured
+  with cuDNN in the path. So the count is decided after A1 by the same
+  capture timing: if the second pass matches the capture pass call for
+  call it goes, otherwise two stay. Independently: one capture stream
+  reused across captures, the talker to graph cycle broken with a weak
+  reference, and the capture run with the cyclic collector disabled.
+
+### 9.5 What sglang does, and what it ships that we can reuse
+
+Read on the v0.5.18 checkout (anchors verified):
+
+- Sglang serves no model that runs attention over a small private
+  growing cache inside one generation step. The Qwen3-Omni talker is
+  not instantiated (`srt/models/qwen3_omni_moe.py:555`,
+  `enable_talker = False`), MiniCPM-o's ChatTTS decoder is switched
+  off, MiMo-Audio's local transformer is an encoder side call, and the
+  MTP and EAGLE draft models are full sglang models on the paged pool
+  and a backend, captured at startup by the draft graph runner.
+- The one backend control in the tree is a vision encoder that lists
+  cuDNN last (`srt/models/phi4mm_utils.py:1794-1802`), with no
+  rationale in code. Nothing in srt sets `enable_cudnn_sdp` or the
+  deprioritise env.
+- The torch native backend computes decode attention per request in a
+  Python loop with `scaled_dot_product_attention` at key length
+  `seq_lens[i]`, growing by one per step, with no backend control
+  (`srt/layers/attention/torch_native_backend.py:216-270`). On torch
+  2.13 and an H100 it would build a cuDNN plan per new key length the
+  same way. It is not what sglang serves with on CUDA.
+- The reusable piece is the triton decode kernel,
+  `sglang.kernels.ops.attention.decode_attention.decode_attention_fwd`
+  (`kernels/ops/attention/decode_attention.py:1163-1185`). Batch size
+  and key length are runtime values read from `kv_indptr`, not
+  constexprs, by design: "a constexpr buys nothing and costs one
+  stage-1 variant per cuda-graph ladder rung" (`:609-612`). Grouped
+  query attention is native (`kv_group_num = q_heads // kv_heads`),
+  head dim 128 is native, bf16 is the normal case, and the file has no
+  autotune and no cache. It wants `q` as `[batch, heads, head_dim]`,
+  `k_buffer` and `v_buffer` as `[slots, kv_heads, head_dim]`, an
+  int32 `kv_indptr` of cumulative lengths, a flat `kv_indices` (an
+  arange for a contiguous cache), the fp32 scratch `attn_logits` and
+  `attn_lse`, and a per row `num_kv_splits` tensor, and it is importable
+  from omni as the pinned dependency without touching sglang.
+
+So A1 has three candidates, all free of per shape state: the backend
+pin around the chain (smallest change, in repo precedent), sglang's
+triton decode kernel over the predictor cache (the same kernel the
+backbone decodes with, batch and length agnostic by construction, at
+the cost of the indptr, indices and scratch plumbing), and the explicit
+masked attention over the fixed 17 slot cache. The pin first, because
+it removes the stall with three lines and lets the capture measurement
+of A2 run, then the other two under T22 where replay time is the
+question.
 - **A3. Startup capture of the default signature's ladder** stays a
   policy on the residual, which after A2 is roughly 100 ms per rung
   crossing.
