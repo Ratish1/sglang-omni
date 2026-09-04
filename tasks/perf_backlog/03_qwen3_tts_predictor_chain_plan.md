@@ -245,7 +245,8 @@ for row_idx, sched_req in enumerate(requests):
     if feedback is None or text is None:
         eager_rows.append(row_idx)          # today's per row path for this row
         continue
-    feedback_rows.append(feedback); text_rows.append(text)
+    feedback_rows.append(feedback)
+    text_rows.append(text)
     pop both queues
 weight = decode_feedback_embedding.weight[:batch_size]
 torch.stack(feedback_rows, out=weight[batched_rows])   # one cat kernel
@@ -289,7 +290,7 @@ their base.
   #1649) and the predictor sampling path (#1641, #1726). The per step
   tail of doc 02 section 8 is not covered by any of them.
 - #1792, MOSS-TTS, captures the feedback embeddings inside the sampling
-  graph. Same problem shape as B1 on a different model; B1 batches the
+  graph. Same problem shape as B1 on a different model. B1 batches the
   eager path instead, because the Qwen3-TTS feedback needs the next text
   row that the host owns.
 - #1779, starting the torch profiler with `with_stack` deadlocks the
