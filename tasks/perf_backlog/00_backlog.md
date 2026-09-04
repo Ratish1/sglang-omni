@@ -11,10 +11,13 @@ Plans for items in this list are written as numbered docs in this folder.
 ## 1. Order
 
 1. Close the Qwen3-TTS predictor startup capture (A.1). The branch is at
-   `d7e34a16c`, validated on that head: 348 unit tests, c1 byte identical
-   with the order swapped, c16 first batch 2.5 s per request faster and
-   steady state flat. PR draft in `pr_qwen3_tts_predictor_startup_capture.md`,
-   not opened.
+   `3d020c85f`, the same change rebased onto upstream `556166dde` and
+   validated as `d7e34a16c` on the previous base: 348 unit tests, c1 byte
+   identical with the order swapped, c16 first batch 2.5 s per request
+   faster and steady state flat. A main warmup 1 control still captured
+   five buckets inside serving. PR #1947 open, body in
+   `pr_qwen3_tts_predictor_startup_capture.md`. Owed: CI on the rebased
+   head.
 2. Observed KV reservation on the Qwen3-Omni talker (A.3). Implemented on
    `perf/observed-kv-reservation` at `81a87e474`, measured at +25% qps at
    c16 and +43% at c32 on the bf16 colocated profile (doc 08 section 1).

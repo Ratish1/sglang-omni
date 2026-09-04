@@ -283,3 +283,25 @@ steady state is flat.
 WER is 1.01315% on both arms here against 1.00477% for the same c1 WAVs
 in run 7, one more judge error on identical audio, the noise of section
 3.4.
+
+## 9. Run 9: c16 on `d7e34a16c`, then the PR
+
+B first then A, fresh servers, `--seed 1234`, no warmup. Unit tests on
+that head: 348 passed.
+
+| Point | Latency mean s | Median s | p95 s | p99 s | QPS | First batch mean s | WER |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A c16 | 1.077 | 1.006 | 1.509 | 4.260 | 14.778 | 4.503 | 0.94616% |
+| B c16 | 1.035 | 1.008 | 1.475 | 1.881 | 15.357 | 1.992 | 0.95453% |
+
+Past the first batch B minus A is -5.1 ms mean and +1.3 ms median, with
+492 of 1088 token counts matching. A main control with one warmup
+request came in at 1.072 s mean, 3.339 s p99, 14.840 QPS and a 3.756 s
+first batch: the warmup captured bucket 1 only and the other five buckets
+still captured inside serving, so B stays 1.76 s per request faster on
+the first batch than warmed main.
+
+The branch was rebased onto upstream `556166dde` (#1923, #1852 and #1554
+had landed on the Qwen3-TTS files), the change verified identical hunk by
+hunk on both bases, pushed as `3d020c85f`, and opened as PR #1947 with the
+body in `tasks/perf_backlog/pr_qwen3_tts_predictor_startup_capture.md`.
