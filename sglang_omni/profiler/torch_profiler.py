@@ -9,9 +9,15 @@ import subprocess
 import threading
 from contextlib import nullcontext
 
+import torch
 from torch.profiler import ProfilerActivity, profile
 
 from .base_profiler import ProfilerBase
+
+
+def _memory_snapshot_enabled() -> bool:
+    return os.environ.get("SGLANG_TORCH_PROFILER_MEMORY_SNAPSHOT") == "1"
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -122,6 +128,19 @@ class TorchProfiler(ProfilerBase):
             # 5. Start profiling
             cls._profiler.start()
 
+            # note(ratish): the profiler reports allocations through thread
+            # local state, so a profile started on the stage's control thread
+            # misses the scheduler and vocoder threads. The allocator's own
+            # history is process wide and keeps the stack of every allocation.
+            if _memory_snapshot_enabled():
+                kwargs = {}
+                max_entries = os.environ.get(
+                    "SGLANG_TORCH_PROFILER_MEMORY_SNAPSHOT_ENTRIES"
+                )
+                if max_entries:
+                    kwargs["max_entries"] = int(max_entries)
+                torch.cuda.memory._record_memory_history(enabled="all", **kwargs)
+
             # Return the expected final path
             return f"{trace_path_template}_rank{rank}.trace.json.gz"
 
@@ -181,11 +200,25 @@ class TorchProfiler(ProfilerBase):
             except Exception as e:
                 logger.warning("[Rank %s] Failed to export trace: %s", rank, e)
 
+            snapshot_path = None
+            if _memory_snapshot_enabled():
+                snapshot_path = f"{base_path}.memory.pickle"
+                try:
+                    torch.cuda.memory._dump_snapshot(snapshot_path)
+                    logger.info(
+                        f"[Rank {rank}] Memory snapshot written to {snapshot_path}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[Rank {rank}] Memory snapshot failed: {e}")
+                    snapshot_path = None
+                finally:
+                    torch.cuda.memory._record_memory_history(enabled=None)
+
             cls._profiler = None
             cls._active_run_id = None
             cls._trace_template = ""
 
-            return {"trace": gz_path, "table": None}
+            return {"trace": gz_path, "table": None, "memory_snapshot": snapshot_path}
 
     @classmethod
     def step(cls):
