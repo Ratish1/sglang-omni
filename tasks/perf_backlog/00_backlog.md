@@ -23,7 +23,9 @@ Plans for items in this list are written as numbered docs in this folder.
    UTMOS, and the MiniMax cookbook A/B (doc 09 section 7).
 3. T40, the speech tokenizer and codec decoder cuDNN plan per new length
    (A.1). 38 ms and 34 ms per new length at the run 3 medians (doc 22
-   section 6). Plan in `01_qwen3_tts_length_plan_builds_plan.md` (next).
+   section 6). Measured at 68 to 81 ms per new length per side at c1
+   (plan section 2). Plan: `01_qwen3_tts_length_plan_builds_plan.md`,
+   Conditional on its section 9.
 4. A4, one greedy warmup request per stage before readiness, every model
    (doc 19 section 9.5).
 5. T18, rebase `perf/step-ledger` onto upstream main and rerun the doc 15
