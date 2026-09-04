@@ -163,7 +163,7 @@ commits from `fb6cd93e8`:
 8. capture the predictor graphs at startup
 
 Every commit compiles and references nothing from a later commit. Head
-`08cd988b1`, force pushed. The runtime source differs from `b6fdc94d7` in
+`4f43776fe`, force pushed. The runtime source differs from `b6fdc94d7` in
 the resolver removal, the gate of section 6, the layer 0 copy of section
 6, the stream restore of section 6 and the subtalker defaults extraction.
 None of these touches the replayed kernels, so the c1 output should stay
@@ -175,14 +175,19 @@ A second whole file review of the rebuild against torch 2.13 and sglang
 0.5.18 sources. Applied:
 
 - Gate of the fused addmm. sglang's `UnquantizedLinearMethod.apply`
-  routes bf16 GEMMs through the cutedsl backend on sm100 when
-  `--bf16-gemm-backend` is `auto` (`unquant.py:165-170`, `:386-401`), so a
-  fused `torch.addmm` there would bypass sglang's GEMM choice. The sm90
-  pin was protecting that assumption by architecture. The gate is now the
-  assumption itself: `not is_batch_invariant_mode_enabled()` and
-  `not get_bf16_gemm_backend().is_optimized()`, which is true on sm80 and
-  sm90 parts and false on Blackwell and in deterministic mode. The
-  `Bf16GemmBackend.AUTO` default makes the read safe before sglang
+  routes bf16 GEMMs through the cutedsl backend when the backend resolves
+  to it, which `initialize_bf16_gemm_config` does for `auto` on sm100
+  outside deterministic mode (v0.5.18 `unquant.py:89-119` and
+  `:238-265`), so a fused `torch.addmm` there would bypass sglang's GEMM
+  choice. The sm90 pin was protecting that assumption by architecture. The
+  gate is now the assumption itself: `not is_batch_invariant_mode_enabled()`
+  and `not get_bf16_gemm_backend().is_cutedsl()`, the same test sglang's
+  `apply` makes. `get_bf16_gemm_backend()` defaults to `AUTO` before
+  initialisation (`unquant.py:141-145`), and the only initialisation call
+  in v0.5.18 is in sglang's own `Scheduler.__init__`
+  (`managers/scheduler.py:900`), which omni does not construct, so in an
+  omni process the backend stays `AUTO` and sglang's linear runs
+  `F.linear` on every platform. The gate then only bites if omni ever
   initialises the backend.
 - Layer 0 input ownership on the eager path. `project_input` returns its
   argument when the talker and predictor hidden sizes match, which is the
@@ -215,6 +220,24 @@ Not applied, with the reason:
   predates this change. Follow up with the file split (doc 25).
 - ROCm with aiter is not excluded by the new gate, as the sm90 pin used to
   exclude it. Not a target of this work.
+
+### 6.1 Correction after the first push of the rebuild
+
+The rebuild first went out as `08cd988b1` with
+`get_bf16_gemm_backend().is_optimized()` in the gate. That method exists
+on sglang upstream main, which the local `/Users/ratish/sglang` checkout
+had been switched to by mistake when the review read it (its reflog shows
+the moves between `main` and `v0.5.18`). The v0.5.18 enum has `is_auto`
+and `is_cutedsl` only, and the box returned 303 passed and 53 failed, all
+`AttributeError: 'Bf16GemmBackend' object has no attribute 'is_optimized'`.
+Every sglang fact this branch relies on was then re-read at the `v0.5.18`
+tag: `is_batch_invariant_mode_enabled` and the `aten::addmm` override
+without an out variant (`batch_invariant_ops.py:976-1000`),
+`maybe_enable_batch_invariant_mode` after `load_model` in
+`ModelRunner.initialize` (`model_runner.py:620-661`), `get_bf16_gemm_backend`
+and `apply` as cited above, `multinomial_with_seed`,
+`get_global_server_args` and the murmur hash kernel. Only the enum method
+was wrong. `4f43776fe` differs from `08cd988b1` in that one token.
 
 ## 7. What to run next
 

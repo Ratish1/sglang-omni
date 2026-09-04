@@ -23,7 +23,7 @@ of degrading like the lazy path. There is no mode flag and no policy
 resolver: the eager path runs the same fused kernels as the graph, the
 mixed eager sampler and its staging fields are deleted, and the fused
 addmm reads `is_batch_invariant_mode_enabled()` and
-`get_bf16_gemm_backend().is_optimized()` at the call instead of an sm90
+`get_bf16_gemm_backend().is_cutedsl()` at the call instead of an sm90
 pin, so `_resolve_predictor_graph_enabled` stays as it was. The subtalker
 sampling fallbacks moved into `resolve_subtalker_sampling` in
 `request_builders`, shared by the request path and the builder hook. The
