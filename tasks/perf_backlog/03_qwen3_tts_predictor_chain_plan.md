@@ -85,13 +85,12 @@ of 16 sub-steps.
   feedback queue into the embedding rows, one launch per step. Removes
   `rows` launches, 0.19 ms at 16 rows, more at 64. Bit identical: the
   same rows land in the same slots.
-- B2 `prepare_decode_buffers` uploads six `torch.tensor(list)` per step
-  for the sampling parameters (sglang_model.py). At steady state the
-  batch does not change between steps, so the uploads rewrite the same
-  values. Change: key the staged parameters by the ordered request ids
-  and skip the uploads when the key is unchanged, upload only the rows
-  that changed otherwise. Removes 6 host to device copies and their
-  launches per steady step, about 0.1 ms of host time. Bit identical.
+- B2 Withdrawn. `prepare_decode_buffers` already keys its staging by
+  the ordered request ids and a per request epoch and returns early when
+  the batch is unchanged (sglang_model.py, the rids check at the top of
+  the function), so the six uploads do not run at steady state. The
+  copies in the tail are sglang's forward batch build and graph input
+  copies, not ours.
 - B3 Measure the graph launch cost without the profiler: the ledger
   records the host duration of the backbone replay call and of
   `graph.replay` per step. If a 1371 node launch costs more than the
@@ -128,9 +127,10 @@ of 16 sub-steps.
 
 - S0 B3 on the profiling branch, one census run. Decides whether the
   launch cost enters the accounting. Box time only.
-- S1 A1, A2, B1, B2. Omni Python only, no new kernel, expected bit
-  identical. About 0.3 ms off the replay and 0.3 ms off the tail at 16
-  rows, 7% of the step. Its census diff also fixes the base for S2.
+- S1 A1, A2, B1. Omni Python only, no new kernel, expected bit
+  identical. About 0.3 ms off the replay and 0.2 ms off the tail at 16
+  rows, 6% of the step. Its census diff also fixes the base for S2. The
+  exact design is section 8.
 - S2 A3, one Triton kernel in `predictor_kernels.py`, G2 gate.
 - S3 A4 with `fused_add_rmsnorm`, G2 gate.
 - S4 A5, A6 and target C, each behind its own micro benchmark.
@@ -144,3 +144,156 @@ rebased onto main when #1947 merges. Measurement runs on
 - B3, the unprofiled launch cost.
 - The G2 band, produced by the S1 base run.
 - Whether A5 pays, and the GEMV floor of target C.
+
+## 8. Exact design of S1
+
+Read against `perf/qwen3-tts-predictor-startup-capture` head `fff86552c`.
+
+### 8.1 A1, the sampler prologue
+
+Today, `_sample_subtalker_token` (sglang_model.py) builds
+`row_indices = self._sub_identity_row_indices_tensor[:batch_size]` and
+`_sample_subtalker_token_seeded(logits, layer_idx, row_indices=..., semantic_positions=...)`
+runs, per sub-step:
+
+```
+temperatures = self._sub_temperature_tensor.index_select(0, row_indices).clamp_min(1e-5)
+top_ks       = self._sub_top_k_tensor.index_select(0, row_indices)
+top_ps       = self._sub_top_p_tensor.index_select(0, row_indices)
+seeds        = self._sub_sampling_seed_tensor.index_select(0, row_indices)
+sub_positions = semantic_positions * (num_code_groups - 1) + layer_idx + 1
+```
+
+Eight kernels whose only effect is copying the first `batch_size` rows and
+adding two constants, because `row_indices` is always the identity since
+the eager and graph paths were unified.
+
+Target:
+
+- `_sample_subtalker_token_seeded(self, logits, layer_idx, *, sub_positions)`.
+  The four parameters become slices: `self._sub_temperature_tensor[:batch]`
+  and so on, views of the staged tensors, no kernel. `row_indices`,
+  `_sub_identity_row_indices_tensor` and its construction in `__init__`
+  go away.
+- The clamp moves to staging: `prepare_decode_buffers` stages
+  `max(subtalker_temperature, 1e-5)` in the host list it already builds.
+  Same value, no kernel.
+- `_code_predictor_forward_incremental` computes the sub position table
+  once per call, `positions_table = semantic_positions[None, :] * (num_code_groups - 1) + self._predictor_sub_offsets[:, None]`
+  with `_predictor_sub_offsets = arange(1, num_code_groups)` allocated in
+  `__init__`, and hands `positions_table[layer_idx]` to the sampler for
+  sub-step `layer_idx`. One kernel per call instead of three per sub-step.
+- `_sample_subtalker_token(logits, layer_idx, *, sub_positions)` passes it
+  through. `_select_semantic_positions` keeps its checks, applied once on
+  the table's source.
+
+Removed per replay: 4 index_select, 1 clamp, 3 elementwise per sub-step,
+128 kernels, minus the one table kernel. Tests: the sampling kernel tests
+build the talker through `_build_sampling_talker` and call the seeded
+sampler with `row_indices`, they switch to the `sub_positions` argument
+with the same values, computed by the same rule in the test. The graph
+bit identity tests are unchanged and prove the graph path.
+
+### 8.2 A2, all rows sample
+
+Today, `_sample_subtalker_token` returns
+`torch.where(self._sub_do_sample_tensor[:batch], sampled, argmax)` whenever
+any row samples, so a batch where every row samples still runs the
+argmax reduce and the select on every sub-step.
+
+Target:
+
+- `prepare_decode_buffers` sets `self._sub_has_argmax_rows = len(sample_rows) < batch_size`
+  next to `_sub_has_sampled_rows`.
+- `_sample_subtalker_token`: no sampled rows, argmax as today. Sampled
+  rows and no argmax rows, return the sampled tokens. Both, the `where`
+  as today.
+- `_predictor_graph_signature` appends the term, so the key of a batch
+  where every row samples is `("sampled", max_top_k, has_top_p, has_unbounded, False)`
+  and a mixed batch is captured under its own key with the `where`.
+  `capture_predictor_graphs` derives `False` for the fifth term, the
+  builder passes the same three values as today.
+
+Removed per replay: the argmax and the `where`, 32 kernels, 0.09 ms at 1
+row and 0.22 ms at 16. Bit identical for the default signature: with
+every row sampling the `where` selected the sampled token. Tests: the
+signature rule test gains the mixed case, `test_mixed_sampled_argmax_rows_use_graph_bit_identity`
+and `test_mixed_padded_bucket_bit_identity_and_reuse` keep the mixed
+path honest, and the graph key count for a mixed batch after an all
+sampled batch is asserted.
+
+### 8.3 B1, the feedback write
+
+Today, `Qwen3TTSModelRunner._write_feedback_buffers` (model_runner.py)
+loops over the rows, and for each calls the Omni talker helper
+`_take_next_decode_input_embed`, which reads the row's pending feedback
+(a row view of the previous step's `embeds_snap`), reads the next text
+row from `pending_text_queue`, and returns `feedback + text`: one add
+kernel per row, then one `torch.stack` into the feedback embedding
+rows and one copy of the row ids. At 16 rows that is the run of 16
+launches 12 us apart in the timeline, 0.19 ms, and it grows with the
+batch.
+
+Target, in `Qwen3TTSModelRunner` only, the Omni talker helpers untouched:
+
+```
+feedback_rows, text_rows, eager_rows = [], [], []
+for row_idx, sched_req in enumerate(requests):
+    data = sched_req.data
+    feedback = peek(data.pending_feedback_queue)
+    text = peek(data.pending_text_queue) or (data.tts_pad_embed if data.thinker_chunks_done else None)
+    if feedback is None or text is None:
+        eager_rows.append(row_idx)          # today's per row path for this row
+        continue
+    feedback_rows.append(feedback); text_rows.append(text)
+    pop both queues
+weight = decode_feedback_embedding.weight[:batch_size]
+torch.stack(feedback_rows, out=weight[batched_rows])   # one cat kernel
+weight[batched_rows].add_(torch.stack(text_rows))      # one cat, one add
+history rows appended as views of one clone of weight[:batch_size]
+```
+
+Four kernels per step for the batched rows instead of one per row plus
+the stack. The rows without feedback (the first decode step of a request)
+or without text keep today's path, so a first step after prefill is
+unchanged. `torch.stack` of up to 64 equal rows is one kernel.
+`decode_input_embeds` is appended today and never read on the Qwen3-TTS
+path (only cleared in the scheduler), so the history keeps views of the
+step's clone. Bit identical: the same add on the same rows. Tests:
+`test_pipeline.py` has the feedback buffer cases; they gain a case where
+half the rows have no feedback yet and the rest are batched, asserting
+the buffer rows equal the per row computation.
+
+### 8.4 What is not in S1
+
+B3, the ledger field for the host duration of `graph.replay` and of the
+backbone replay, lands on the profiling branch first and is read from
+the next census. A3, A4 and the GEMM path wait for S1's census diff as
+their base.
+
+## 9. Tracker and open work checked on 2026-09-04
+
+- #1754, the Qwen3-TTS roadmap. T-PR18, "profile and optimize remaining
+  GPU kernels after the architecture level work lands", lists the code
+  predictor attention, QK norm plus RoPE fusion, RMSNorm and SwiGLU as
+  candidates and asks for end to end profiling before any model specific
+  kernel. Doc 02 is that profiling. Its first PR is #1794, the vocoder
+  SnakeBeta fusion, merged. No PR exists for the predictor items.
+- T-PR17, #1790, opt-in FP8 for the talker and predictor MLPs, touches
+  the GEMM half of the replay. It is blocked: nine c16 runs produced 14
+  max token runaways, isolated to the predictor graph path, and #1418
+  lists it under evaluated no go. Target C stays BF16 and is sized after
+  S1.
+- #1418, the 1.7B single instance issue, attributes the gap to host side
+  overhead and closed the admission and queue path (#1413, #1449, #1462,
+  #1649) and the predictor sampling path (#1641, #1726). The per step
+  tail of doc 02 section 8 is not covered by any of them.
+- #1792, MOSS-TTS, captures the feedback embeddings inside the sampling
+  graph. Same problem shape as B1 on a different model; B1 batches the
+  eager path instead, because the Qwen3-TTS feedback needs the next text
+  row that the host owns.
+- #1779, starting the torch profiler with `with_stack` deadlocks the
+  engine stage at c16. The census tool does not need stacks, which is why
+  the tail is attributed from the code rather than from frames.
+- #1936, fault 2 (illegal instruction under load with the predictor graph
+  off) stays open and unrelated.
