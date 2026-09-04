@@ -1030,7 +1030,11 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             sub_do_samples.append(do_sample)
             # Note (Shulei He): a greedy row's original top_k can be 0 or -1,
             # which would otherwise hit the full-sort branch.
-            sub_temperatures.append(subtalker_temperature if do_sample else 1.0)
+            # note(ratish): the sampler divides by the temperature, staged clamped
+            # so the sub-steps read it without a kernel.
+            sub_temperatures.append(
+                max(subtalker_temperature, 1e-5) if do_sample else 1.0
+            )
             sub_top_ps.append(subtalker_top_p if do_sample else 1.0)
             sub_top_ks.append(subtalker_top_k if do_sample else 1)
             sub_seeds.append(subtalker_seed)
@@ -1600,9 +1604,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         semantic_positions: torch.Tensor,
     ) -> torch.Tensor:
         row_indices = row_indices.to(device=logits.device, dtype=torch.long)
-        temperatures = self._sub_temperature_tensor.index_select(
-            0, row_indices
-        ).clamp_min(1e-5)
+        temperatures = self._sub_temperature_tensor.index_select(0, row_indices)
 
         vocab_size = int(logits.shape[-1])
         top_ks = self._sub_top_k_tensor.index_select(0, row_indices)

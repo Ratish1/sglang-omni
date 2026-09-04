@@ -203,7 +203,7 @@ def _build_sampling_talker(
     """Build only the fields used by the production sampled-token reference."""
     talker = object.__new__(Qwen3TTSTalker)
     talker.config = SimpleNamespace(num_code_groups=16)
-    talker._sub_temperature_tensor = temperatures
+    talker._sub_temperature_tensor = temperatures.clamp_min(1e-5)
     talker._sub_top_k_tensor = top_ks
     talker._sub_top_p_tensor = top_ps
     talker._sub_sampling_seed_tensor = seeds
@@ -263,7 +263,7 @@ def _fused_seeded_tokens(
     )
     sampled = sample_from_logits_with_seed_top_k_top_p(
         logits,
-        talker._sub_temperature_tensor.clamp_min(1e-5),
+        talker._sub_temperature_tensor,
         talker._sub_top_k_tensor,
         talker._sub_top_p_tensor,
         talker._sub_sampling_seed_tensor,
