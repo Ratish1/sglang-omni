@@ -163,7 +163,13 @@ commits from `fb6cd93e8`:
 8. capture the predictor graphs at startup
 
 Every commit compiles and references nothing from a later commit. Head
-`4f43776fe`, force pushed. The runtime source differs from `b6fdc94d7` in
+`d7e34a16c`, force pushed. That head also prunes the branch's tests to
+contract and edge case tests: the two kernel count tests (monkeypatched
+kernels counted across warmups and capture), the stream identity test and
+the collector state test (mechanics recorded inside the forward) and the
+builder test with a namespace model are gone. The ladder test now replays
+every bucket from the shared pool against the eager path bit for bit, and
+the failed capture test asserts the collector is enabled again. The runtime source differs from `b6fdc94d7` in
 the resolver removal, the gate of section 6, the layer 0 copy of section
 6, the stream restore of section 6 and the subtalker defaults extraction.
 None of these touches the replayed kernels, so the c1 output should stay
