@@ -253,3 +253,33 @@ was wrong. `4f43776fe` differs from `08cd988b1` in that one token.
 3. c1 only, fresh servers, order B then A, to settle section 4. No c16
    rerun: the c16 speed result is reproduced twice (doc 23 and section 1)
    and a c16 WER point cannot answer a numerical question by construction.
+
+## 8. Run 8: c1 with the order swapped, head `d7e34a16c`
+
+Same box, same corpus, same seed, fresh server per arm, B first then A.
+The unit tests of the pruned head are not part of this report.
+
+| Point | Latency mean s | Median s | p95 s | p99 s | QPS | WER | Similarity |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| B c1 | 0.440 | 0.427 | 0.641 | 0.763 | 2.270 | 1.01315% | 71.30515 |
+| A c1 | 0.443 | 0.430 | 0.644 | 0.766 | 2.254 | 1.01315% | 71.30515 |
+
+B minus A past the first request: mean -2.5 ms, median -1.9 ms, B faster
+in 786 of 1088 requests, first request -0.672 s. 1088 of 1088 WAVs byte
+identical, durations and token counts equal. Startup line: six graphs in
+2.8 s, no lazy capture line. Arm A: one lazy capture on the first request.
+
+Read together with section 4:
+
+| Order | B minus A past the first request, mean | Median |
+| --- | ---: | ---: |
+| A first, B second (run 7) | +1.84 ms | +2.50 ms |
+| B first, A second (run 8) | -2.50 ms | -1.90 ms |
+
+Whichever arm runs second is about 2 ms slower. The delta follows the
+position, not the code, which is the drift section 4 described. The c1
+steady state is flat.
+
+WER is 1.01315% on both arms here against 1.00477% for the same c1 WAVs
+in run 7, one more judge error on identical audio, the noise of section
+3.4.
