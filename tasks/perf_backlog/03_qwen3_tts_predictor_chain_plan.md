@@ -352,7 +352,7 @@ summary like `forward_ms`.
 ## 11. S1 as committed and reviewed, and what to run
 
 Commits on `perf/qwen3-tts-predictor-chain`, from `fff86552c`, head
-`552937d6c`, pushed:
+`1d047d541`, pushed:
 
 1. `1071895f3` stage the clamped subtalker temperature
 2. `c77a3e740` compute the predictor sub positions once per call
@@ -365,30 +365,53 @@ Commits on `perf/qwen3-tts-predictor-chain`, from `fff86552c`, head
 9. `901e7acef` index the batched feedback rows through the shared decode input policy
 10. `60ad96b90` compact the decode input history into its own storage every 64 rows
 11. `552937d6c` name the seed positions with the sampling state and tidy the capture state order
+12. `5a0087b73` drop the decode input history compaction
+13. `1d047d541` restore the predictor graph key budget
 
 Commits 1 to 5 are the section 10 map. Commits 6 to 11 are the review of
-that series, one commit per finding:
+that series, one commit per finding. Commits 12 and 13 remove the two
+numbers that review had introduced without a derivation:
 
 - Two rank tests in `test_predictor_cuda_graph.py` still called the seeded
   sampler with `row_indices`, which no longer exists. They pass the sub
   positions now (6).
 - A batch with greedy rows carries the fifth signature term, so its graph
   would have been captured lazily inside serving on the first mixed batch.
-  Startup captures both sampled variants. The cuDNN plans are shared, so
-  the second set costs about 0.5 s, and the key budget is 64 (7).
+  Startup captures both sampled variants. The second set shares the cuDNN
+  plans of the first, its cost is the capture time the startup log prints
+  (7). The key budget stays at its prior value of 32 (13). The mixed graphs
+  count against it exactly as they would have when captured lazily, so the
+  room for run time signatures is unchanged: at the default ladder of six
+  buckets the startup set takes 12 keys, at 64 rows and twelve buckets it
+  takes 24.
 - The batched feedback write held its own copy of the rule that decides
   whether a row reads a staged feedback row plus a text row or embeds its
   token id. The rule lives in `QwenTalkerModelRunner._peek_next_decode_inputs`
   and `_pop_next_decode_inputs`, and the per row helper is written on them
   (8, 9).
-- Each history row was a view of one batch wide clone, so one runaway
-  request at 64 rows kept the whole batch alive per step, up to 512 MB
-  over 2048 steps. Every 64 rows the last 64 history rows are stacked into
-  their own storage (10).
+- Each history row is a view of its step's batch wide clone, so a clone
+  lives until the last request of that step's batch drops it. A compaction
+  every 64 rows was added (10) and dropped again (12): the interval was a
+  chosen number that no measurement pins, and the post decode already
+  keeps the output codes the same way. The bound without compaction comes
+  from the repo defaults, max_new_tokens 2048 and max_running_requests 16:
+  one request that lives its full 2048 steps while the rest of the batch
+  churns pins 2048 times batch rows of hidden times 2 bytes, 128 MB at
+  16 rows and hidden 2048, 512 MB at 64 rows. Requests that finish at
+  normal lengths pin only their own rows for long. The principled fix, if
+  that bound ever binds, is to rebuild the history from the output codes at
+  retract time, since the feedback row is a function of the codes and the
+  text pad. That reworks the retract seam shared with Qwen3-Omni and is not
+  S1.
 - The seed offsets and positions carry the `_sub_` prefix of the sampling
   state they belong to, `sub_positions` is a required keyword of the
   sampler, the saved capture state is in signature order, and the dead
   test scaffolding is gone (11).
+
+After 13 the series adds no chosen number. The two literals it touches
+predate it: the 1e-5 temperature floor moved from a kernel on the device
+to the host staging with the same value, and the greedy row staging of
+temperature 1.0, top_p 1.0 and top_k 1 is unchanged.
 
 Deviations from section 10 that stand: the sampler takes no `layer_idx`,
 the sub position row carries it. The argmax signature is
@@ -422,9 +445,9 @@ Three questions raised at review, answered from the code:
 On the box, in this order:
 
 1. `pytest tests/unit_test/qwen3_tts -q` on `perf/qwen3-tts-predictor-chain`
-   `552937d6c`.
-2. The census on `perf/qwen3-tts-profiling` `6584969d2` (the ledger
-   commits plus the 11 above) with the doc 02 section 4 protocol, then
+   `1d047d541`.
+2. The census on `perf/qwen3-tts-profiling` `93684aa0b` (the ledger
+   commits plus the 13 above) with the doc 02 section 4 protocol, then
    `perfkit.py diff` against the 2026-09-04 census JSONs at 1 and 16 rows,
    and the two timelines. Expected: 1371 to about 1213 kernels per replay
    at 1 row, and the run of per row launches after the replay replaced by
@@ -433,3 +456,8 @@ On the box, in this order:
    `fff86552c` as arm A, 1088 of 1088 WAVs byte identical expected. The
    c16 A/B for the tail, which shows in the step wall time and not in the
    replay.
+4. Peak allocator memory per arm of the c16 A/B, the check for the history
+   bound above. The ledger does not report it yet, S0 adds
+   `torch.cuda.max_memory_allocated` at profiler stop. Expected: arm B
+   above arm A by no more than the live rows of the run, and a long
+   request outliving its batch is the case that shows the bound.
