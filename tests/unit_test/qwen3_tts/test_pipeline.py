@@ -4802,7 +4802,6 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     install_fake_sglang(monkeypatch)
     from sglang.srt.model_executor import forward_batch_info
 
-    from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
     from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
 
     fake_forward_batch = SimpleNamespace(
@@ -4815,15 +4814,6 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
         "init_new",
         staticmethod(
             lambda model_worker_batch, model_runner, *, capture_hidden_mode=None, return_hidden_states_before_norm: fake_forward_batch
-        ),
-    )
-    monkeypatch.setattr(
-        QwenTalkerModelRunner,
-        "_take_next_decode_input_embed",
-        staticmethod(
-            lambda *, sched_req, device, dtype: torch.ones(
-                4, device=device, dtype=dtype
-            )
         ),
     )
 
@@ -4882,7 +4872,8 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     data = SimpleNamespace(
         req=SimpleNamespace(sampling_params=SimpleNamespace(repetition_penalty=1.0)),
         output_codes=[],
-        pending_feedback_queue=[],
+        pending_feedback_queue=[torch.ones(4)],
+        pending_text_queue=[torch.zeros(4)],
         generation_steps=0,
         extra_model_outputs={},
     )
@@ -4899,6 +4890,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     assert output.can_run_cuda_graph is True
     assert runner.model.prepare_calls == 1
     assert fake_forward_batch.input_ids.tolist() == [0]
+    assert torch.equal(runner.model._decode_feedback_embedding.weight[0], torch.ones(4))
 
 
 def test_qwen3_tts_decode_feedback_empty_batch_noops() -> None:
