@@ -514,7 +514,7 @@ def test_mixed_sampling_masks_reuse_one_graph():
 
 
 @pytest.mark.accelerator
-def test_all_sampled_and_mixed_batches_share_one_graph():
+def test_all_sampled_and_mixed_batches_capture_separate_graphs():
     device = torch.device("cuda")
     talker = _build_talker(device)
     layer0, hidden, positions = _step_inputs(4, device)
@@ -532,9 +532,11 @@ def test_all_sampled_and_mixed_batches_share_one_graph():
     )
     _run_forward(talker, layer0, hidden, positions)
 
-    modes = {key[1] for key in talker._predictor_graphs}
-    assert modes == {"sampled"}
-    assert len(talker._predictor_graphs) == 1
+    keys = sorted(talker._predictor_graphs)
+    assert len(keys) == 2
+    assert len({key[:-1] for key in keys}) == 1
+    assert {key[1] for key in keys} == {"sampled"}
+    assert {key[-1] for key in keys} == {False, True}
 
 
 @pytest.mark.accelerator
@@ -1096,12 +1098,14 @@ def test_failed_capture_restores_the_current_stream(monkeypatch: pytest.MonkeyPa
 def test_startup_capture_builds_the_ladder_for_one_signature():
     device = torch.device("cuda")
     talker = _build_talker(device)
-    signature = ("sampled", 8, False, False, False)
+    signatures = [("sampled", 8, False, False, mixed) for mixed in (False, True)]
 
-    assert talker.capture_predictor_graphs(do_sample=True, top_k=5, top_p=1.0) == len(
-        BUCKETS
-    )
-    assert set(talker._predictor_graphs) == {(bucket, *signature) for bucket in BUCKETS}
+    assert talker.capture_predictor_graphs(
+        do_sample=True, top_k=5, top_p=1.0
+    ) == 2 * len(BUCKETS)
+    assert set(talker._predictor_graphs) == {
+        (bucket, *signature) for signature in signatures for bucket in BUCKETS
+    }
     assert talker.capture_predictor_graphs(do_sample=True, top_k=5, top_p=1.0) == 0
 
     for batch_size in BUCKETS:
@@ -1112,7 +1116,14 @@ def test_startup_capture_builds_the_ladder_for_one_signature():
         assert torch.equal(graph_codes, eager_codes)
         assert torch.equal(graph_embeds, eager_embeds)
 
-    assert len(talker._predictor_graphs) == len(BUCKETS)
+    talker.prepare_decode_buffers([_request(top_k=5), _request(dosample=False)])
+    layer0, hidden, positions = _step_inputs(2, device)
+    eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
+    graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
+    assert torch.equal(graph_codes, eager_codes)
+    assert torch.equal(graph_embeds, eager_embeds)
+
+    assert len(talker._predictor_graphs) == 2 * len(BUCKETS)
 
 
 @pytest.mark.accelerator
@@ -1166,30 +1177,23 @@ def test_signature_rule_is_shared_by_batch_and_startup_paths(
             _uniform_requests(3, dosample=dosample, top_k=top_k, top_p=top_p)
         )
         if talker._sub_has_sampled_rows:
-            expected = (
+            batch_terms = (
                 "sampled",
                 talker._sub_sampled_max_top_k,
                 talker._sub_sampled_has_top_p,
                 talker._sub_sampled_has_unbounded_top_k,
-                talker._sub_has_argmax_rows,
             )
+            expected = {batch_terms + (mixed,) for mixed in (False, True)}
         else:
-            expected = ("argmax", 0, False, False, False)
+            expected = {("argmax", 0, False, False, False)}
         talker._predictor_graphs.clear()
+        startup_keys.clear()
         talker.capture_predictor_graphs(do_sample=dosample, top_k=top_k, top_p=top_p)
-        assert startup_keys[-1][1:] == expected, (dosample, top_k, top_p)
+        assert {key[1:] for key in startup_keys} == expected, (dosample, top_k, top_p)
 
     talker.prepare_decode_buffers([_request(dosample=True), _request(dosample=False)])
     assert talker._sub_has_argmax_rows is True
-    talker._predictor_graphs.clear()
-    talker.capture_predictor_graphs(do_sample=True, top_k=5, top_p=1.0)
-    assert startup_keys[-1][1:] == (
-        "sampled",
-        talker._sub_sampled_max_top_k,
-        talker._sub_sampled_has_top_p,
-        talker._sub_sampled_has_unbounded_top_k,
-        False,
-    )
+    assert talker._sub_has_sampled_rows is True
 
 
 @pytest.mark.accelerator
