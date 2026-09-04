@@ -210,7 +210,7 @@ def _build_sampling_talker(
     talker._sub_sampled_max_top_k = max_top_k
     talker._sub_sampled_has_top_p = bool(((top_ps > 0.0) & (top_ps < 1.0)).any().item())
     talker._sub_sampled_has_unbounded_top_k = False
-    talker._predictor_sub_offsets = torch.arange(
+    talker._sub_seed_offsets = torch.arange(
         1, talker.config.num_code_groups, device=temperatures.device, dtype=torch.long
     )
     return talker
@@ -225,7 +225,7 @@ def _production_seeded_tokens(
 ) -> torch.Tensor:
     return talker._sample_subtalker_token_seeded(
         logits,
-        sub_positions=talker._predictor_sub_positions(semantic_positions)[layer_idx],
+        sub_positions=talker._sub_seed_positions(semantic_positions)[layer_idx],
     )
 
 
