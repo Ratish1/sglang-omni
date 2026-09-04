@@ -949,6 +949,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self._sub_identity_row_indices_tensor = torch.arange(
             max_batch_size, device=device, dtype=torch.long
         )
+        self._predictor_sub_offsets = torch.arange(
+            1, config.num_code_groups, device=device, dtype=torch.long
+        )
         self._sub_has_sampled_rows = False
         self._sub_sampled_has_top_p = False
         self._sub_sampled_max_top_k = 0
@@ -1490,12 +1493,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             )
             cache_len += 1
 
+            sub_positions = self._predictor_sub_positions(semantic_positions[:, pos])
             for layer_idx in range(num_groups - 1):
                 logits, _ = self.code_predictor.lm_head[layer_idx](last_hidden)
                 next_code = self._sample_subtalker_token(
                     logits[:, -1, :],
-                    layer_idx,
-                    semantic_positions=semantic_positions[:, pos],
+                    sub_positions=sub_positions[layer_idx],
                 )
                 pos_codes[:, layer_idx + 1].copy_(next_code)
                 codec_embedding = self.code_predictor.model.codec_embedding[layer_idx]
@@ -1547,12 +1550,23 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         offsets = torch.arange(seq_len, device=device, dtype=torch.long)
         return base.unsqueeze(1) + offsets.unsqueeze(0)
 
+    def _predictor_sub_positions(
+        self, semantic_positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Seed positions of every sub-step of one decode position, sub-step
+        first, so each sub-step reads its row without a kernel."""
+        group_stride = max(int(self.config.num_code_groups) - 1, 1)
+        return torch.add(
+            self._predictor_sub_offsets.unsqueeze(1),
+            semantic_positions.unsqueeze(0),
+            alpha=group_stride,
+        )
+
     def _sample_subtalker_token(
         self,
         logits: torch.Tensor,
-        layer_idx: int = 0,
         *,
-        semantic_positions: torch.Tensor | None = None,
+        sub_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if logits.shape[0] == 0:
             return torch.empty((0,), device=logits.device, dtype=torch.long)
@@ -1564,16 +1578,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             return torch.argmax(logits, dim=-1).to(dtype=torch.long)
 
         row_indices = self._sub_identity_row_indices_tensor[:batch_size]
-        batch_positions = self._select_semantic_positions(
-            semantic_positions,
-            batch_size,
-            logits.device,
-        )
         sampled_tokens = self._sample_subtalker_token_seeded(
             logits,
-            layer_idx,
             row_indices=row_indices,
-            semantic_positions=batch_positions,
+            sub_positions=sub_positions,
         )
         argmax_tokens = torch.argmax(logits, dim=-1).to(dtype=torch.long)
         return torch.where(
@@ -1582,26 +1590,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             argmax_tokens,
         )
 
-    def _select_semantic_positions(
-        self,
-        semantic_positions: torch.Tensor | None,
-        batch_size: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if semantic_positions is None:
-            raise RuntimeError("Qwen3-TTS sampled subtalker rows require positions")
-        semantic_positions = semantic_positions.to(device=device, dtype=torch.long)
-        if semantic_positions.ndim != 1 or semantic_positions.shape[0] != batch_size:
-            raise ValueError("Qwen3-TTS subtalker positions shape mismatch")
-        return semantic_positions
-
     def _sample_subtalker_token_seeded(
         self,
         logits: torch.Tensor,
-        layer_idx: int,
         *,
         row_indices: torch.Tensor,
-        semantic_positions: torch.Tensor,
+        sub_positions: torch.Tensor,
     ) -> torch.Tensor:
         row_indices = row_indices.to(device=logits.device, dtype=torch.long)
         temperatures = self._sub_temperature_tensor.index_select(0, row_indices)
@@ -1612,12 +1606,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         has_unbounded_top_k = bool(self._sub_sampled_has_unbounded_top_k)
         top_ps = self._sub_top_p_tensor.index_select(0, row_indices)
         seeds = self._sub_sampling_seed_tensor.index_select(0, row_indices)
-        sub_positions = (
-            semantic_positions.to(device=logits.device, dtype=torch.long)
-            * max(int(self.config.num_code_groups) - 1, 1)
-            + int(layer_idx)
-            + 1
-        )
 
         if logits.is_cuda:
             fused_sampled = sample_from_logits_with_seed_top_k_top_p(
