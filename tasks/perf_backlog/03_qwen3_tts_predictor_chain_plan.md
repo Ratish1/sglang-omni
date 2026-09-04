@@ -349,31 +349,87 @@ in `model_runner/base.py` `_prepare_and_forward` and around
 `graph.replay` in `_predictor_forward_graphed`, reported per shape in the
 summary like `forward_ms`.
 
-## 11. S1 as committed, and what to run
+## 11. S1 as committed and reviewed, and what to run
 
-Commits on `perf/qwen3-tts-predictor-chain`, from `fff86552c`:
+Commits on `perf/qwen3-tts-predictor-chain`, from `fff86552c`, head
+`552937d6c`, pushed:
 
 1. `1071895f3` stage the clamped subtalker temperature
 2. `c77a3e740` compute the predictor sub positions once per call
 3. `54c43ca9f` read the sampler parameters as slices of the staged rows
 4. `d10706cea` skip the argmax when every row samples
 5. `fd16b0e05` batch the feedback rows into the decode embedding
+6. `8f83a1216` call the seeded sampler with its sub positions in the rank tests
+7. `09b61f772` capture the mixed batch signature at startup
+8. `2188e5776` extract the next decode input peek and pop from the talker runner
+9. `901e7acef` index the batched feedback rows through the shared decode input policy
+10. `60ad96b90` compact the decode input history into its own storage every 64 rows
+11. `552937d6c` name the seed positions with the sampling state and tidy the capture state order
 
-Deviations from section 10, all in the direction of less code: the
-sampler no longer takes `layer_idx` (the sub position row carries it),
-`_predictor_sub_positions` is the one owner of the position rule and the
-tests read it through that method, and the test that required positions
-on the direct sampler call went with `_select_semantic_positions`. The
-argmax signature is `("argmax", 0, False, False, False)` so both tuples
-have five terms. Every commit compiles, no reference to the removed
-names remains.
+Commits 1 to 5 are the section 10 map. Commits 6 to 11 are the review of
+that series, one commit per finding:
+
+- Two rank tests in `test_predictor_cuda_graph.py` still called the seeded
+  sampler with `row_indices`, which no longer exists. They pass the sub
+  positions now (6).
+- A batch with greedy rows carries the fifth signature term, so its graph
+  would have been captured lazily inside serving on the first mixed batch.
+  Startup captures both sampled variants. The cuDNN plans are shared, so
+  the second set costs about 0.5 s, and the key budget is 64 (7).
+- The batched feedback write held its own copy of the rule that decides
+  whether a row reads a staged feedback row plus a text row or embeds its
+  token id. The rule lives in `QwenTalkerModelRunner._peek_next_decode_inputs`
+  and `_pop_next_decode_inputs`, and the per row helper is written on them
+  (8, 9).
+- Each history row was a view of one batch wide clone, so one runaway
+  request at 64 rows kept the whole batch alive per step, up to 512 MB
+  over 2048 steps. Every 64 rows the last 64 history rows are stacked into
+  their own storage (10).
+- The seed offsets and positions carry the `_sub_` prefix of the sampling
+  state they belong to, `sub_positions` is a required keyword of the
+  sampler, the saved capture state is in signature order, and the dead
+  test scaffolding is gone (11).
+
+Deviations from section 10 that stand: the sampler takes no `layer_idx`,
+the sub position row carries it. The argmax signature is
+`("argmax", 0, False, False, False)` so both tuples have five terms. The
+test that required positions on the direct sampler call went with
+`_select_semantic_positions`.
+
+Three questions raised at review, answered from the code:
+
+- Why remove kernels before fusing. Every kernel S1 removes was dead work:
+  the four `index_select` copies per sub-step read parameters that a slice
+  of the staged buffer already holds, the clamp repeated a bound the host
+  staged, the argmax and the `where` ran for batches without a greedy row,
+  and the per row feedback embedding ran one launch per row for one add
+  per batch. Fusing dead work fuses nothing. The fused sampler of sglang
+  is still called, the slices feed it. The fusions are S2 and S3, section
+  8.4.
+- Whether the slices are the right torch. A slice of a static buffer is a
+  view, no kernel, and it is what sglang reads in its captured regions
+  (`decode_cuda_graph_runner.py`, `cuda_graph_buffer_registry.py`, the
+  eagle draft runner). The `index_select` copy was the wrong tool for a
+  buffer that already holds the rows in batch order.
+- Whether the feedback batching follows the flow. For Qwen3-TTS there is
+  no thinker, so `thinker_chunks_done` is always set and a decode row is
+  in one of two states: it has a staged feedback row (every step after the
+  first) or it embeds its token id (the first decode after prefill, and
+  after a retract re-prefill). The writer has one loop that sorts the rows
+  into the two states, one batched stack and add, one clone, and one loop
+  that appends the history. No loop nests in another.
 
 On the box, in this order:
 
-1. `pytest tests/unit_test/qwen3_tts -q` on `perf/qwen3-tts-predictor-chain`.
-2. The census on `perf/qwen3-tts-profiling` with the doc 02 section 4
-   protocol, then `perfkit.py diff` against the 2026-09-04 census JSONs
-   at 1 and 16 rows, and the two timelines. Expected: 1371 to about 1213
-   kernels per replay, the run of per row launches after the replay gone.
+1. `pytest tests/unit_test/qwen3_tts -q` on `perf/qwen3-tts-predictor-chain`
+   `552937d6c`.
+2. The census on `perf/qwen3-tts-profiling` `6584969d2` (the ledger
+   commits plus the 11 above) with the doc 02 section 4 protocol, then
+   `perfkit.py diff` against the 2026-09-04 census JSONs at 1 and 16 rows,
+   and the two timelines. Expected: 1371 to about 1213 kernels per replay
+   at 1 row, and the run of per row launches after the replay replaced by
+   the batched write in the 16 row timeline.
 3. The c1 A/B against `perf/qwen3-tts-predictor-startup-capture`
-   `fff86552c` as arm A, 1088 of 1088 WAVs byte identical expected.
+   `fff86552c` as arm A, 1088 of 1088 WAVs byte identical expected. The
+   c16 A/B for the tail, which shows in the step wall time and not in the
+   replay.

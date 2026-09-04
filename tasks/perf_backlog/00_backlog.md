@@ -27,10 +27,11 @@ Plans for items in this list are written as numbered docs in this folder.
 3. T22, the predictor chain (A.1). Census and timeline done on H100
    (`02_qwen3_tts_predictor_chain_census.md`): 1371 kernels per replay
    bound by kernel count, and a 1.1 to 1.4 ms host tail per step. Plan in
-   `03_qwen3_tts_predictor_chain_plan.md`. S1 implemented on
-   `perf/qwen3-tts-predictor-chain` at `fd16b0e05`, untested on the box,
-   expected bit identical, about 6% of the step. Tool `scripts/perfkit.py`,
-   branch `perf/qwen3-tts-profiling` (ledger plus S1) for the census diff.
+   `03_qwen3_tts_predictor_chain_plan.md`. S1 implemented and reviewed
+   on `perf/qwen3-tts-predictor-chain` at `552937d6c` (11 commits, plan
+   section 11), untested on the box, expected bit identical, about 6% of
+   the step. Tool `scripts/perfkit.py`, branch `perf/qwen3-tts-profiling`
+   at `6584969d2` (ledger plus S1) for the census diff.
 4. T40, the speech tokenizer and codec decoder cuDNN plan per new length
    (A.1). 38 ms and 34 ms per new length at the run 3 medians (doc 22
    section 6). Measured at 68 to 81 ms per new length per side at c1
