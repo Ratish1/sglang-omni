@@ -893,7 +893,6 @@ def test_widened_top_k_masked_ranks_never_sampled():
     talker = _build_talker(device)
     logits = torch.linspace(2.0, -2.0, PRED_VOCAB, device=device).unsqueeze(0)
     allowed = set(torch.topk(logits[0], 2).indices.tolist())
-    row_indices = torch.zeros(1, dtype=torch.long, device=device)
     positions = torch.zeros(1, dtype=torch.long, device=device)
 
     for seed in range(100):
@@ -901,9 +900,7 @@ def test_widened_top_k_masked_ranks_never_sampled():
         talker.prepare_decode_buffers([_request(top_k=2, sub_seed=seed)])
         token = talker._sample_subtalker_token_seeded(
             logits,
-            0,
-            row_indices=row_indices,
-            semantic_positions=positions,
+            sub_positions=talker._predictor_sub_positions(positions)[0],
         )
         assert token.item() in allowed, (
             f"seed={seed} sampled rank outside the request's top_k=2: "
@@ -976,7 +973,6 @@ def test_top_p_removed_ranks_never_sampled():
     talker = _build_talker(device)
     logits = torch.zeros(1, PRED_VOCAB, device=device)
     logits[0, 3] = 4.0
-    row_indices = torch.zeros(1, dtype=torch.long, device=device)
     positions = torch.zeros(1, dtype=torch.long, device=device)
 
     for seed in range(100):
@@ -984,9 +980,7 @@ def test_top_p_removed_ranks_never_sampled():
         talker.prepare_decode_buffers([_request(top_k=4, top_p=0.5, sub_seed=seed)])
         token = talker._sample_subtalker_token_seeded(
             logits,
-            0,
-            row_indices=row_indices,
-            semantic_positions=positions,
+            sub_positions=talker._predictor_sub_positions(positions)[0],
         )
         assert (
             token.item() == 3
