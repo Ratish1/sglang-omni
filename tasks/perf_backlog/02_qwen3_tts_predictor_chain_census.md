@@ -1,7 +1,7 @@
 # 02. Qwen3-TTS predictor chain: kernel census (T22)
 
-Status: census done (section 6), the step timeline is the next box step
-(section 7), the fusion plan follows from both. Every number here comes
+Status: census and timeline done (sections 6 and 8), the plan is
+`03_qwen3_tts_predictor_chain_plan.md`. Every number here comes
 from the H100 run of 2026-09-04 on the profiling branch.
 
 ## 1. What this measures
@@ -231,3 +231,44 @@ kernels occupied, and the device idle before each span. That is the line
 of code launches against the line of kernels, and it names the host work
 the GPU waits on. The fusion plan and the host plan are written from
 these two tables.
+
+## 8. The timeline, read
+
+Source: `timeline_rows1.md` and `timeline_rows16.md` of the same run, the
+median wall step of each row count. Times from the step's backbone launch.
+
+| | 1 row | 16 rows |
+| --- | ---: | ---: |
+| backbone launch call on the host | 0.518 ms | 0.381 ms |
+| device idle until the backbone kernels start | 0.521 ms | 0.384 ms |
+| backbone kernels | 0.521 to 2.520 | 0.384 to 2.603 |
+| eager sampling and predictor input copies, about 30 launches | host 0.60 to 1.31, device 2.53 to 2.64 | host 0.47 to 1.21, device 2.61 to 2.73 |
+| predictor launch call on the host | 1.801 ms, from 1.313 | 1.222 ms, from 1.215 |
+| device idle until the predictor kernels start | 0.482 ms | 0.005 ms |
+| predictor kernels | 3.118 to 7.857 | 2.735 to 8.031 |
+| host silent, waiting on the token copy | 3.23 to 7.90 | 2.55 to 8.08 |
+| tail: 35 to 45 launches and copies, device busy 40 to 60 us | 7.86 to 8.96, 1.10 ms | 8.03 to 9.43, 1.40 ms |
+
+Three readings.
+
+- The eager sampling is not on the critical path. The host issues it
+  while the backbone runs and the device executes it in 0.11 ms right
+  after.
+- The two graph launch calls cost the host 0.5 and 1.8 ms at 1 row, and
+  the device idles for exactly the time the call takes to submit the
+  nodes. The profiler instruments every node it submits, and the ledger
+  run without the profiler had a 7.84 ms cycle against 8.95 here, so most
+  of that 1.0 ms of idle is the profiler's. How much a 1371 node launch
+  costs without it is not known from this run: measured by B3 of doc 03.
+  Whatever it is, it scales with the node count that the fusions cut.
+- The tail after the predictor is real and host bound: 1.1 ms at 1 row
+  and 1.4 ms at 16, for 40 to 60 us of device work, as 35 to 45 launches
+  each separated by 10 to 170 us of host time. From the code on that path:
+  the token staging copy and its wait, the two output clones of
+  `post_process_outputs`, the next step's `prepare_decode_buffers` with
+  six `torch.tensor(list)` uploads (sglang_model.py, one per sampling
+  parameter), `_write_feedback_buffers` with one launch per row inside a
+  Python loop (the run of 16 launches 12 us apart at 16 rows,
+  model_runner.py), the forward batch build and the graph input copies of
+  sglang's runner, then the backbone launch. The per row loop alone is
+  0.19 ms at 16 rows and grows with the batch.
