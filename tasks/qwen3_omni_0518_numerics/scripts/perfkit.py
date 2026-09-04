@@ -37,14 +37,14 @@ FAMILIES = (
         re.compile(r"sampl|argmax|multinomial|top_?k|top_?p|categorical", re.I),
     ),
     ("embedding", re.compile(r"gather_codec|embedding|index_select|indexSelect", re.I)),
+    ("norm", re.compile(r"rms|norm", re.I)),
+    ("rope", re.compile(r"rope|rotary", re.I)),
+    ("activation", re.compile(r"silu|gelu|swiglu|act_and_mul", re.I)),
     ("attention", re.compile(r"fmha|flash|attn|sdpa|mha|scaled_dot", re.I)),
     (
         "gemm",
         re.compile(r"gemm|cutlass|nvjet|matmul|xmma|ampere_|wgmma|cublas|Sm90", re.I),
     ),
-    ("norm", re.compile(r"rms|norm", re.I)),
-    ("rope", re.compile(r"rope|rotary", re.I)),
-    ("activation", re.compile(r"silu|gelu|swiglu|act_and_mul", re.I)),
     ("reduce", re.compile(r"reduce", re.I)),
     (
         "elementwise",
@@ -69,7 +69,7 @@ def family(name: str) -> str:
 def short(name: str) -> str:
     name = name.replace("void ", "").replace("(anonymous namespace)::", "")
     cut = min((i for i in (name.find("<"), name.find("(")) if i > 0), default=len(name))
-    return name[:cut][-90:]
+    return name[:cut][:90]
 
 
 # ---------------------------------------------------------------- ingest
@@ -515,6 +515,61 @@ def census_report(
             json.dump(result, handle, indent=2)
 
 
+def timeline_report(
+    d: dict, rows_filter: int, predictor_marker: re.Pattern, index: int | None
+):
+    """Host launches on the scheduler thread against the device spans of one
+    step, so the gaps where the GPU waits for the host are visible next to
+    what the host was issuing. The step is the median wall step of the row
+    count unless an index is given."""
+    sched_tid, launches, kinds = build_launches(d, predictor_marker)
+    steps = build_steps(launches, kinds)
+    group = [s for s in steps if s.predictor is not None and s.rows == rows_filter]
+    if not group:
+        raise SystemExit(f"no decode step with rows {rows_filter}")
+    if index is None:
+        walls = sorted(group, key=lambda s: s.next_ts - s.ts)
+        step = walls[len(walls) // 2]
+    else:
+        step = group[index]
+    t0 = step.ts
+    phases = [
+        ("backbone", [step.backbone]),
+        ("before predictor", step.before),
+        ("predictor", [step.predictor]),
+        ("after predictor", step.after),
+    ]
+    print(
+        f"rows {rows_filter}, step at {t0:.0f} us, wall {(step.next_ts - t0) / 1000:.3f} ms to the next backbone launch\n"
+    )
+    print(
+        "| phase | host call | host t0 ms | host dur us | device t0 ms | device end ms | kernels | device busy us |"
+    )
+    print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    gpu_end = t0
+    for label, group_launches in phases:
+        for l in group_launches:
+            spans = [(k[0], k[0] + k[1]) for k in l.kernels] + [
+                (m[0], m[0] + m[1]) for m in l.memops
+            ]
+            if not spans:
+                print(
+                    f"| {label} | {l.name} | {(l.ts - t0) / 1000:.3f} | {l.dur:.1f} | | | 0 | 0 |"
+                )
+                continue
+            d0, d1 = min(x[0] for x in spans), max(x[1] for x in spans)
+            busy = sum(x[1] - x[0] for x in spans)
+            wait = d0 - gpu_end
+            gpu_end = max(gpu_end, d1)
+            note = f" (device idle {wait / 1000:.3f} ms before)" if wait > 5 else ""
+            print(
+                f"| {label} | {l.name}{note} | {(l.ts - t0) / 1000:.3f} | {l.dur:.1f} | {(d0 - t0) / 1000:.3f} | {(d1 - t0) / 1000:.3f} | {len(l.kernels)} | {busy:.1f} |"
+            )
+    print(
+        f"\ndevice end of the step {(gpu_end - t0) / 1000:.3f} ms, next backbone launch at {(step.next_ts - t0) / 1000:.3f} ms, host only tail {(step.next_ts - gpu_end) / 1000:.3f} ms"
+    )
+
+
 def diff_report(a_path: str, b_path: str):
     a, b = json.load(open(a_path)), json.load(open(b_path))
     for rows in sorted(set(a) | set(b), key=int):
@@ -562,6 +617,14 @@ def main() -> int:
                 help="regex on the kernel that ends each predictor sub-step",
             )
             s.add_argument("--top", type=int, default=40)
+    s = sub.add_parser("timeline")
+    s.add_argument("pkl")
+    s.add_argument("--rows", type=int, required=True)
+    s.add_argument("--index", type=int, default=None)
+    s.add_argument(
+        "--predictor-marker",
+        default=r"gather_codec_embedding|seeded_top_k_top_p|seeded_gumbel",
+    )
     s = sub.add_parser("diff")
     s.add_argument("a")
     s.add_argument("b")
@@ -583,6 +646,13 @@ def main() -> int:
             re.compile(args.substep_marker, re.I),
             args.top,
             args.json,
+        )
+    elif args.cmd == "timeline":
+        timeline_report(
+            load(args.pkl),
+            args.rows,
+            re.compile(args.predictor_marker, re.I),
+            args.index,
         )
     else:
         diff_report(args.a, args.b)

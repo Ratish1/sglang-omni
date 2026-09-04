@@ -1,9 +1,8 @@
 # 02. Qwen3-TTS predictor chain: kernel census (T22)
 
-Status: profiling step, no code. The tool is written and its attribution was
-checked once against a trace's own step ledger. Every number for this item
-comes from a fresh H100 trace on the profiling branch, nothing older is
-used.
+Status: census done (section 6), the step timeline is the next box step
+(section 7), the fusion plan follows from both. Every number here comes
+from the H100 run of 2026-09-04 on the profiling branch.
 
 ## 1. What this measures
 
@@ -124,3 +123,111 @@ Send back: the two `steps.md`, the two census `.md` and `.json`, the
   first slice targets kernel count or GEMM efficiency.
 
 The plan for the fusions is written after this census, from its numbers.
+
+## 6. Results, run of 2026-09-04
+
+Source: `artifacts/qwen3-tts-predictor-census-results.tar.gz`, branch head
+`4970be647`. c1 window 12 samples, 649 decode steps. c16 window 192
+samples, 803 decode steps, 47 at 16 rows. The tool's step wall equals the
+ledger's cycle p50 within 10 us at both row counts (8.962 against 8.952
+ms at 1 row, 9.434 against 9.425 at 16), so the attribution is right on
+this run.
+
+| | 1 row | 16 rows |
+| --- | ---: | ---: |
+| step wall p50 | 8.962 ms | 9.434 ms |
+| device busy in the step | 5.843 ms | 6.620 ms |
+| device idle in the step | 3.119 ms (35%) | 2.815 ms (30%) |
+| backbone replay busy | 1.793 ms | 2.014 ms |
+| eager sampling before the predictor | 0.074 ms | 0.083 ms |
+| predictor replay busy | 3.932 ms | 4.464 ms |
+| predictor replay wall | 4.740 ms | 5.282 ms |
+| kernels per replay | 1371 | 1371 |
+| kernel duration p50 | 1.70 us | 1.95 us |
+| gap between kernels p50 | 0.45 us | 0.45 us |
+| staging and collect | 0.044 ms | 0.059 ms |
+
+The profiler itself costs about 1 ms of host time per step: the ledger run
+without it (doc 22 section 2) had a 7.84 ms cycle at 1 row.
+
+### 6.1 The replay is bound by kernel count
+
+Busy time grows 13.5% from 1 row to 16 while the work grows 16 times, and
+the replay wall is the sum of 1371 kernel durations plus 1370 gaps of
+0.45 us (0.62 ms of the 0.81 ms difference between wall and busy). There
+is no host launch inside a replay, the whole chain is one
+`cudaGraphLaunch`, so the only way down is fewer kernels and cheaper
+kernels.
+
+Families per replay at 1 row: GEMM 432 kernels 2.073 ms (53%), attention
+256 kernels 0.517 ms (176 of those are the RMSNorm Triton kernel the
+family regex misread, fixed in the tool), elementwise 321 kernels 0.503
+ms, sampling 30 kernels 0.366 ms, embedding 76 kernels 0.130 ms, norm 80
+kernels 0.115 ms, rope 80 kernels 0.109 ms, activation 80 kernels 0.104
+ms.
+
+### 6.2 One sub-step, 86 kernels
+
+Sixteen sub-steps: the first has 162 kernels (the talker hidden enters
+through the projection and flash attention at cache length 0), fourteen
+have 86, the last has 5. The 86 of a middle sub-step, in order:
+
+- 6 to enter: the argmax reduce of the previous sub-step's logits (4.1 us
+  at 1 row, 9.9 us at 16), the `where` that selects sampled against argmax
+  rows, a 32 byte copy of the codes, the fused codec embedding gather and
+  add, the projection GEMM with bias from the talker width to the
+  predictor width (5.9 us).
+- 5 layers of 16: RMSNorm, qkv GEMM (5.2 us), fused qk norm, fused rope,
+  two elementwise kernels writing k and v into the private cache (1.9 and
+  2.1 us), the cuDNN attention kernel (2.9 us), the o_proj GEMM with the
+  residual in its epilogue (5.4 us), RMSNorm, gate_up GEMM (6.5 us),
+  act_and_mul, down GEMM as split K (5.1 us) plus its reduce (1.6 us),
+  the residual add.
+- 9 to leave: final RMSNorm, head GEMM (4.4 us), four `index_select` of
+  the sampling parameters by row and three elementwise kernels for the
+  sub positions (the sampler's prologue, 8 kernels, about 12 us), the
+  fused seeded top k top p sampler (20.6 us, the largest kernel in the
+  chain).
+
+### 6.3 Candidates, sized from the counts
+
+Each removed kernel saves its duration plus the 0.45 us gap. Per replay
+at 1 row:
+
+| Candidate | Kernels removed | Busy removed | Note |
+| --- | ---: | ---: | --- |
+| Sampler prologue: the four index selects are identity gathers on the graph path, the sub positions are one table per step | 128 | about 0.20 ms | omni code only |
+| All rows sample: skip the argmax, the where and the copy when the signature says so | 48 | about 0.16 ms | a signature term, omni code only |
+| Rope, qk norm and the two cache writes as one kernel per layer | 240 | about 0.30 ms | one Triton kernel, omni owned |
+| Residual add fused into the next RMSNorm | 80 | about 0.10 ms | sglang's fused_add_rmsnorm exists |
+| Down projection without split K reduce | 80 | about 0.13 ms | algorithm choice, may cost GEMM time, measure |
+| The sampler kernel itself, 20.6 us for a 2048 wide row | 0 | up to 0.20 ms | kernel work |
+
+About 1.0 ms of the 4.74 ms replay wall from kernel count alone, 21%,
+before any GEMM work. The GEMMs are 432 calls at 5 to 6.5 us each moving
+4 to 12 MB of weights per call, 40% of H100 bandwidth, 2.07 ms against a
+0.75 ms bandwidth floor per replay: the second half of the item, a GEMV
+path for M up to 16, sized after the first half lands.
+
+### 6.4 The host side is a second item
+
+The GPU is idle 3.1 ms of every 9.0 ms step at 1 row and 2.8 ms of 9.4 at
+16, about 2 ms of it after the profiler's own cost is taken out. The
+ledger agrees: gpu span 8.49 ms against 5.84 ms of kernel time. Where in
+the step the host is late is what section 7 measures.
+
+## 7. Next box step: the timeline of one step
+
+On the existing pickles, seconds each, no new profile:
+
+```
+python tasks/qwen3_omni_0518_numerics/scripts/perfkit.py timeline $OUT/census_c1/tts_engine.pkl --rows 1 | tee $OUT/census_c1/timeline_rows1.md
+python tasks/qwen3_omni_0518_numerics/scripts/perfkit.py timeline $OUT/census_c16/tts_engine.pkl --rows 16 | tee $OUT/census_c16/timeline_rows16.md
+```
+
+It prints, for the median step of that row count, every host call on the
+scheduler thread with its time from the step start, the device span its
+kernels occupied, and the device idle before each span. That is the line
+of code launches against the line of kernels, and it names the host work
+the GPU waits on. The fusion plan and the host plan are written from
+these two tables.
