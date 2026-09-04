@@ -12,6 +12,7 @@ cudaGraphLaunch call and the graph id, which is enough to attribute them.
     perfkit.py diff A.json B.json
     perfkit.py memory TRACE.pkl [--top 30] [--min-mb 64] [--json OUT]
     perfkit.py memdiff A.json B.json
+    perfkit.py snapshot TRACE.memory.pickle [--top 30] [--min-mb 64] [--json OUT]
 
 A step is the span from one backbone graph launch to the next on the scheduler
 thread. Its phases in launch order are the backbone replay, the eager launches
@@ -799,6 +800,126 @@ def memory_report(d: dict, top: int, min_mb: float, json_out: str | None):
             json.dump(result, handle, indent=2)
 
 
+def _frame_label(frames) -> str:
+    """The first omni frame of an allocation's stack, else its first frame."""
+    if not frames:
+        return "no frames"
+    chosen = next(
+        (f for f in frames if "sglang_omni" in str(f.get("filename", ""))), frames[0]
+    )
+    filename = str(chosen.get("filename", "")).rsplit("/", 1)[-1]
+    return f"{filename}:{chosen.get('line')} {chosen.get('name')}"
+
+
+def snapshot_report(path: str, top: int, min_mb: float, json_out: str | None):
+    """Live blocks and allocation history of a torch allocator snapshot, the
+    pickle the profiler writes with SGLANG_TORCH_PROFILER_MEMORY_SNAPSHOT=1."""
+    with open(path, "rb") as handle:
+        snap = pickle.load(handle)
+    segments = snap.get("segments", [])
+    reserved = sum(s["total_size"] for s in segments)
+    live = []
+    for seg in segments:
+        for block in seg["blocks"]:
+            if block.get("state") != "active_allocated":
+                continue
+            frames = block.get("frames")
+            if frames is None and block.get("history"):
+                frames = block["history"][0].get("frames")
+            live.append((block["size"], _frame_label(frames), seg.get("stream", 0)))
+    allocated = sum(b[0] for b in live)
+    per_stream = defaultdict(int)
+    for seg in segments:
+        per_stream[seg.get("stream", 0)] += seg["total_size"]
+    print(
+        f"segments {len(segments)}, reserved {reserved / MIB:.0f} MiB, live {allocated / MIB:.0f} MiB in {len(live)} blocks, cached {(reserved - allocated) / MIB:.0f} MiB"
+    )
+    print(
+        "reserved per stream: "
+        + ", ".join(
+            f"stream {s}: {v / MIB:.0f} MiB"
+            for s, v in sorted(per_stream.items(), key=lambda x: -x[1])
+        )
+    )
+    print(f"\nlargest live blocks at the snapshot:")
+    print("| MiB | stream | allocated by |\n| ---: | ---: | --- |")
+    live_rows = []
+    for size, label, stream in sorted(live, key=lambda b: -b[0])[:top]:
+        live_rows.append({"bytes": size, "stream": stream, "frame": label})
+        print(f"| {size / MIB:.1f} | {stream} | {label} |")
+    traces = snap.get("device_traces", [])
+    events = traces[0] if traces else []
+    allocs = [e for e in events if e.get("action") == "alloc"]
+    ooms = [e for e in events if e.get("action") == "oom"]
+    grows = [e for e in events if e.get("action") == "segment_alloc"]
+    t0 = min((e["time_us"] for e in events if "time_us" in e), default=None)
+    at = (
+        (lambda e: f"{(e['time_us'] - t0) / 1000:.1f}")
+        if t0 is not None
+        else (lambda e: "")
+    )
+    print(
+        f"\nhistory: {len(events)} events, {len(allocs)} allocations, {len(grows)} segment growths totalling {sum(e['size'] for e in grows) / MIB:.0f} MiB, {len(ooms)} out of memory events"
+    )
+    if ooms:
+        print("\nout of memory events:")
+        print("| at ms | requested MiB | allocated by |\n| ---: | ---: | --- |")
+        for e in ooms:
+            print(
+                f"| {at(e)} | {e.get('size', 0) / MIB:.0f} | {_frame_label(e.get('frames'))} |"
+            )
+    largest = sorted(
+        (e for e in allocs if e["size"] >= min_mb * MIB), key=lambda e: -e["size"]
+    )[:top]
+    print(f"\nlargest allocations in the history of at least {min_mb:g} MiB:")
+    print("| MiB | at ms | stream | allocated by |\n| ---: | ---: | ---: | --- |")
+    hist_rows = []
+    for e in largest:
+        label = _frame_label(e.get("frames"))
+        hist_rows.append(
+            {
+                "bytes": e["size"],
+                "at_ms": at(e),
+                "stream": e.get("stream", 0),
+                "frame": label,
+            }
+        )
+        print(f"| {e['size'] / MIB:.1f} | {at(e)} | {e.get('stream', 0)} | {label} |")
+    if grows:
+        print(f"\nlargest segment growths, the allocator asking the driver for memory:")
+        print("| MiB | at ms | stream | allocated by |\n| ---: | ---: | ---: | --- |")
+        for e in sorted(grows, key=lambda e: -e["size"])[:top]:
+            print(
+                f"| {e['size'] / MIB:.1f} | {at(e)} | {e.get('stream', 0)} | {_frame_label(e.get('frames'))} |"
+            )
+    if json_out:
+        with open(json_out, "w") as handle:
+            json.dump(
+                {
+                    "segments": len(segments),
+                    "reserved": reserved,
+                    "live": allocated,
+                    "live_blocks": len(live),
+                    "per_stream": {str(k): v for k, v in per_stream.items()},
+                    "largest_live": live_rows,
+                    "history_events": len(events),
+                    "allocations": len(allocs),
+                    "segment_growth_bytes": sum(e["size"] for e in grows),
+                    "ooms": [
+                        {
+                            "bytes": e.get("size", 0),
+                            "at_ms": at(e),
+                            "frame": _frame_label(e.get("frames")),
+                        }
+                        for e in ooms
+                    ],
+                    "largest": hist_rows,
+                },
+                handle,
+                indent=2,
+            )
+
+
 def memdiff_report(a_path: str, b_path: str, top: int = 15):
     a, b = json.load(open(a_path)), json.load(open(b_path))
     print("| | A | B | B minus A |\n| --- | ---: | ---: | ---: |")
@@ -882,6 +1003,11 @@ def main() -> int:
     s.add_argument("a")
     s.add_argument("b")
     s.add_argument("--top", type=int, default=15)
+    s = sub.add_parser("snapshot")
+    s.add_argument("pickle")
+    s.add_argument("--top", type=int, default=30)
+    s.add_argument("--min-mb", type=float, default=64.0)
+    s.add_argument("--json", default=None)
     args = parser.parse_args()
     if args.cmd == "ingest":
         ingest(args.trace, args.out)
@@ -912,6 +1038,8 @@ def main() -> int:
         memory_report(load(args.pkl), args.top, args.min_mb, args.json)
     elif args.cmd == "memdiff":
         memdiff_report(args.a, args.b, args.top)
+    elif args.cmd == "snapshot":
+        snapshot_report(args.pickle, args.top, args.min_mb, args.json)
     else:
         diff_report(args.a, args.b)
     return 0
