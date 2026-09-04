@@ -55,38 +55,35 @@ about 3 s.
 ## Test results
 
 H100, `Qwen/Qwen3-TTS-12Hz-1.7B-Base`, SGLang 0.5.18, torch 2.13.0.
-
-`pytest tests/unit_test/qwen3_tts -q`: 348 passed. The accelerator tests
-compare every startup-captured bucket against the eager path bit for bit,
-exercise a failure inside the capture region, and cover the identity
-projection and the two GEMM overrides.
+`pytest tests/unit_test/qwen3_tts -q`: 348 passed.
 
 Full-corpus A/B on the seed-tts-eval English split (1088 samples), one
-fresh server per arm, `--seed 1234`, no warmup requests so the capture
-cost is visible, arms alternated. A is main, B is this branch.
+fresh server per arm, `--seed 1234`, no warmup requests, arms alternated.
+A is main, B is this branch.
 
-c1, B first:
+c1:
 
 | | Mean | Median | p95 | p99 | QPS | WER | Similarity |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | A | 0.443 s | 0.430 s | 0.644 s | 0.766 s | 2.254 | 1.01315% | 71.30515 |
 | B | 0.440 s | 0.427 s | 0.641 s | 0.763 s | 2.270 | 1.01315% | 71.30515 |
+| B minus A | -0.003 s | -0.003 s | -0.003 s | -0.003 s | +0.016 (+0.7%) | 0 | 0 |
 
-1088 of 1088 WAVs byte-identical across arms. First request 0.67 s
-faster on B. Past the first request the arms differ by 2.5 ms, the same
-size as the drift between two runs of one revision.
+c16:
 
-c16, B first:
+| | Mean | Median | p95 | p99 | QPS | First batch mean | WER |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 1.077 s | 1.006 s | 1.509 s | 4.260 s | 14.778 | 4.503 s | 0.94616% |
+| B | 1.035 s | 1.008 s | 1.475 s | 1.881 s | 15.357 | 1.992 s | 0.95453% |
+| B minus A | -0.042 s (-3.9%) | +0.002 s | -0.034 s (-2.3%) | -2.379 s (-55.9%) | +0.579 (+3.9%) | -2.511 s | +0.008 pp |
 
-| | Mean | Median | p95 | p99 | QPS | WER |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| A | 1.077 s | 1.006 s | 1.509 s | 4.260 s | 14.778 | 0.94616% |
-| B | 1.035 s | 1.008 s | 1.475 s | 1.881 s | 15.357 | 0.95453% |
+Output identity and capture logs:
 
-First batch 2.5 s per request faster on B, p99 2.4 s lower, QPS +3.9%.
-Past the first batch the arms differ by 5 ms mean and 1 ms median. WER
-differs by one error over 11943 reference words. A's log shows six lazy
-captures inside serving steps, B's shows one startup line and none.
-
-One request under `--enable-deterministic-inference` completes, with the
-six graphs captured at startup and no CUBLAS error.
+| | A | B |
+| --- | ---: | ---: |
+| c1 WAVs byte-identical across arms | 1088 of 1088 | 1088 of 1088 |
+| c1 first request, B minus A | | -0.672 s |
+| c1 lazy captures inside serving steps | 1 | 0 |
+| c16 lazy captures inside serving steps | 6 | 0 |
+| Startup captures before ready | 0 | 6, in 2.9 s |
+| Request under `--enable-deterministic-inference` | CUBLAS error | completes |
