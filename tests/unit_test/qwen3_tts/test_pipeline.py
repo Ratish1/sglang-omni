@@ -5029,6 +5029,7 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
     assert talker._sub_top_k_tensor[:2].tolist() == [40, 1]
     assert talker._sub_do_sample_tensor[:2].tolist() == [True, False]
     assert talker._sub_has_sampled_rows is True
+    assert talker._sub_has_argmax_rows is True
     assert talker._sub_sampled_has_top_p is True
     # top_k=40 ladder-quantizes to 50 (shared predictor-graph key width).
     assert talker._sub_sampled_max_top_k == 50
@@ -5084,6 +5085,7 @@ def test_qwen3_tts_subtalker_sampling_batches_sampled_path_without_global_rng(
     talker._sub_do_sample_tensor = torch.tensor([True, True])
     talker._predictor_sub_offsets = torch.arange(1, 4)
     talker._sub_has_sampled_rows = True
+    talker._sub_has_argmax_rows = False
     talker._sub_sampled_has_top_p = False
     talker._sub_sampled_max_top_k = 0
     talker._sub_sampled_has_unbounded_top_k = True
