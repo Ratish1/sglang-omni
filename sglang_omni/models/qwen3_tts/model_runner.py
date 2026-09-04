@@ -16,6 +16,8 @@ from sglang_omni.model_runner.prefill_inputs import (
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
 from sglang_omni.scheduling.types import RequestOutput
 
+_DECODE_HISTORY_COMPACT_ROWS = 64
+
 
 class Qwen3TTSModelRunner(ModelRunner):
     """Runs Qwen3-TTS AR steps and stores generated codec frames per request."""
@@ -344,8 +346,21 @@ class Qwen3TTSModelRunner(ModelRunner):
             QwenTalkerModelRunner._append_decode_input_history(
                 sched_req.data, history[row_idx]
             )
+            self._compact_decode_input_history(sched_req.data)
         # During graph decode, input_ids carries staged embedding row ids.
         input_ids[:batch_size].copy_(row_ids)
+
+    @staticmethod
+    def _compact_decode_input_history(data: Any) -> None:
+        # note(ratish): every appended row is a view of its step's batch wide
+        # clone, so a request would pin one clone per step of its life. Stacking
+        # the last rows into storage of their own bounds that to the rows since
+        # the previous compaction.
+        history = data.decode_input_embeds
+        if len(history) % _DECODE_HISTORY_COMPACT_ROWS:
+            return
+        rows = history[-_DECODE_HISTORY_COMPACT_ROWS:]
+        history[-_DECODE_HISTORY_COMPACT_ROWS:] = torch.stack(rows, dim=0).unbind(0)
 
     def _decode_row_ids(self, batch_size: int, input_ids: torch.Tensor) -> torch.Tensor:
         cached = getattr(self, "_row_ids_cache", None)

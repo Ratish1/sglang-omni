@@ -132,6 +132,47 @@ def test_write_feedback_buffers_batches_staged_rows_and_embeds_the_rest() -> Non
     assert len(first_step.data.pending_text_queue) == 1
 
 
+def test_write_feedback_buffers_compacts_the_history_into_its_own_storage() -> None:
+    from sglang_omni.models.qwen3_tts import model_runner as model_runner_module
+
+    rows = model_runner_module._DECODE_HISTORY_COMPACT_ROWS
+    hidden = 2
+    embedding = torch.nn.Embedding(4, hidden)
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    runner.model = SimpleNamespace(
+        _decode_feedback_embedding=embedding,
+        get_input_embeddings=lambda: embedding,
+    )
+    requests = [
+        SimpleNamespace(
+            data=SimpleNamespace(
+                pending_feedback_queue=deque(),
+                pending_text_queue=deque(),
+                decode_input_embeds=[],
+                thinker_chunks_done=True,
+                tts_pad_embed=torch.full((hidden,), float(10 * row)),
+            )
+        )
+        for row in range(2)
+    ]
+    forward_batch = SimpleNamespace(input_ids=torch.zeros(2, dtype=torch.long))
+
+    for step in range(rows):
+        for row, sched_req in enumerate(requests):
+            sched_req.data.pending_feedback_queue.append(
+                torch.full((hidden,), float(step + row))
+            )
+        runner._write_feedback_buffers(forward_batch, requests)
+
+    row_bytes = hidden * torch.float32.itemsize
+    for row, sched_req in enumerate(requests):
+        history = sched_req.data.decode_input_embeds
+        assert len(history) == rows
+        assert torch.equal(history[5], torch.full((hidden,), float(5 + 11 * row)))
+        assert history[0].untyped_storage().nbytes() == rows * row_bytes
+        assert history[0].untyped_storage() is history[rows - 1].untyped_storage()
+
+
 def test_reprefill_after_retract_replays_prompt_plus_generated() -> None:
     # note (Richard Wang): 460 plus 134 is the #1555 594 vs 460 mismatch
     prompt_len, generated_len, hidden = 460, 134, 4
