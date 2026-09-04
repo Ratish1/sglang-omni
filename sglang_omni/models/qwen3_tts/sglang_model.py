@@ -948,7 +948,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self._sub_do_sample_tensor = torch.zeros(
             max_batch_size, device=device, dtype=torch.bool
         )
-        self._predictor_sub_offsets = torch.arange(
+        self._sub_seed_offsets = torch.arange(
             1, config.num_code_groups, device=device, dtype=torch.long
         )
         self._sub_has_sampled_rows = False
@@ -1031,14 +1031,14 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 ) from exc
             semantic_seeds.append(semantic_seed)
             sub_do_samples.append(do_sample)
-            # Note (Shulei He): a greedy row's original top_k can be 0 or -1,
-            # which would otherwise hit the full-sort branch.
             # note(ratish): the sampler divides by the temperature, staged clamped
             # so the sub-steps read it without a kernel.
             sub_temperatures.append(
                 max(subtalker_temperature, 1e-5) if do_sample else 1.0
             )
             sub_top_ps.append(subtalker_top_p if do_sample else 1.0)
+            # Note (Shulei He): a greedy row's original top_k can be 0 or -1,
+            # which would otherwise hit the full-sort branch.
             sub_top_ks.append(subtalker_top_k if do_sample else 1)
             sub_seeds.append(subtalker_seed)
             if do_sample:
@@ -1213,29 +1213,30 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         saved = (
             self._sub_batch_size,
             self._sub_has_sampled_rows,
-            self._sub_has_argmax_rows,
-            self._sub_sampled_has_top_p,
             self._sub_sampled_max_top_k,
+            self._sub_sampled_has_top_p,
             self._sub_sampled_has_unbounded_top_k,
+            self._sub_has_argmax_rows,
         )
-        sampled = signature[0] == "sampled"
         try:
             self._sub_batch_size = bucket_size
-            self._sub_has_sampled_rows = sampled
-            _, max_top_k, has_top_p, has_unbounded_top_k, has_argmax_rows = signature
-            self._sub_sampled_max_top_k = max_top_k
-            self._sub_sampled_has_top_p = has_top_p
-            self._sub_sampled_has_unbounded_top_k = has_unbounded_top_k
-            self._sub_has_argmax_rows = has_argmax_rows
+            self._sub_has_sampled_rows = signature[0] == "sampled"
+            (
+                _,
+                self._sub_sampled_max_top_k,
+                self._sub_sampled_has_top_p,
+                self._sub_sampled_has_unbounded_top_k,
+                self._sub_has_argmax_rows,
+            ) = signature
             yield
         finally:
             (
                 self._sub_batch_size,
                 self._sub_has_sampled_rows,
-                self._sub_has_argmax_rows,
-                self._sub_sampled_has_top_p,
                 self._sub_sampled_max_top_k,
+                self._sub_sampled_has_top_p,
                 self._sub_sampled_has_unbounded_top_k,
+                self._sub_has_argmax_rows,
             ) = saved
 
     def _predictor_graph_memory_pool(self):
@@ -1503,7 +1504,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             )
             cache_len += 1
 
-            sub_positions = self._predictor_sub_positions(semantic_positions[:, pos])
+            sub_positions = self._sub_seed_positions(semantic_positions[:, pos])
             for layer_idx in range(num_groups - 1):
                 logits, _ = self.code_predictor.lm_head[layer_idx](last_hidden)
                 next_code = self._sample_subtalker_token(
@@ -1560,14 +1561,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         offsets = torch.arange(seq_len, device=device, dtype=torch.long)
         return base.unsqueeze(1) + offsets.unsqueeze(0)
 
-    def _predictor_sub_positions(
-        self, semantic_positions: torch.Tensor
-    ) -> torch.Tensor:
+    def _sub_seed_positions(self, semantic_positions: torch.Tensor) -> torch.Tensor:
         """Seed positions of every sub-step of one decode position, sub-step
         first, so each sub-step reads its row without a kernel."""
         group_stride = max(int(self.config.num_code_groups) - 1, 1)
         return torch.add(
-            self._predictor_sub_offsets.unsqueeze(1),
+            self._sub_seed_offsets.unsqueeze(1),
             semantic_positions.unsqueeze(0),
             alpha=group_stride,
         )
@@ -1576,7 +1575,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self,
         logits: torch.Tensor,
         *,
-        sub_positions: torch.Tensor | None = None,
+        sub_positions: torch.Tensor | None,
     ) -> torch.Tensor:
         if logits.shape[0] == 0:
             return torch.empty((0,), device=logits.device, dtype=torch.long)

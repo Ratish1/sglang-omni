@@ -5063,6 +5063,7 @@ def test_qwen3_tts_subtalker_sampling_batches_argmax_path(
     tokens = Qwen3TTSTalker._sample_subtalker_token(
         talker,
         torch.tensor([[0.1, 0.9], [0.7, 0.2]]),
+        sub_positions=None,
     )
 
     assert tokens.tolist() == [1, 0]
@@ -5082,8 +5083,7 @@ def test_qwen3_tts_subtalker_sampling_batches_sampled_path_without_global_rng(
     talker._sub_top_p_tensor = torch.tensor([1.0, 1.0])
     talker._sub_top_k_tensor = torch.tensor([-1, -1])
     talker._sub_sampling_seed_tensor = torch.tensor([17, 23])
-    talker._sub_do_sample_tensor = torch.tensor([True, True])
-    talker._predictor_sub_offsets = torch.arange(1, 4)
+    talker._sub_seed_offsets = torch.arange(1, 4)
     talker._sub_has_sampled_rows = True
     talker._sub_has_argmax_rows = False
     talker._sub_sampled_has_top_p = False
@@ -5116,7 +5116,7 @@ def test_qwen3_tts_subtalker_sampling_batches_sampled_path_without_global_rng(
 
     monkeypatch.setattr(torch, "multinomial", fail_multinomial)
 
-    sub_positions = talker._predictor_sub_positions(torch.tensor([3, 3]))
+    sub_positions = talker._sub_seed_positions(torch.tensor([3, 3]))
     tokens = Qwen3TTSTalker._sample_subtalker_token(
         talker,
         torch.tensor([[0.0, 0.0], [0.0, 0.0]]),
@@ -5610,7 +5610,6 @@ def _make_prep_talker(monkeypatch):
     talker._semantic_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
     talker._sub_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
     talker._sub_do_sample_tensor = torch.empty(2, dtype=torch.bool)
-    talker._sub_identity_row_indices_tensor = torch.arange(2, dtype=torch.long)
     return Qwen3TTSTalker, talker
 
 

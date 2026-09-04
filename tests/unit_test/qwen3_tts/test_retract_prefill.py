@@ -170,7 +170,10 @@ def test_write_feedback_buffers_compacts_the_history_into_its_own_storage() -> N
         assert len(history) == rows
         assert torch.equal(history[5], torch.full((hidden,), float(5 + 11 * row)))
         assert history[0].untyped_storage().nbytes() == rows * row_bytes
-        assert history[0].untyped_storage() is history[rows - 1].untyped_storage()
+        assert (
+            history[0].untyped_storage().data_ptr()
+            == history[rows - 1].untyped_storage().data_ptr()
+        )
 
 
 def test_reprefill_after_retract_replays_prompt_plus_generated() -> None:

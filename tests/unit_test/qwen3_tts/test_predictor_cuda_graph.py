@@ -127,7 +127,7 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
         MAX_BS, device=device, dtype=torch.long
     )
     talker._sub_do_sample_tensor = torch.zeros(MAX_BS, device=device, dtype=torch.bool)
-    talker._predictor_sub_offsets = torch.arange(
+    talker._sub_seed_offsets = torch.arange(
         1, NUM_CODE_GROUPS, device=device, dtype=torch.long
     )
     talker._sub_has_sampled_rows = False
@@ -471,7 +471,7 @@ def test_mixed_sampled_argmax_rows_preserve_argmax_tie_break():
 
     tokens = talker._sample_subtalker_token(
         logits,
-        sub_positions=talker._predictor_sub_positions(
+        sub_positions=talker._sub_seed_positions(
             torch.zeros(2, dtype=torch.long, device=device)
         )[0],
     )
@@ -902,7 +902,7 @@ def test_widened_top_k_masked_ranks_never_sampled():
         talker.prepare_decode_buffers([_request(top_k=2, sub_seed=seed)])
         token = talker._sample_subtalker_token_seeded(
             logits,
-            sub_positions=talker._predictor_sub_positions(positions)[0],
+            sub_positions=talker._sub_seed_positions(positions)[0],
         )
         assert token.item() in allowed, (
             f"seed={seed} sampled rank outside the request's top_k=2: "
@@ -982,7 +982,7 @@ def test_top_p_removed_ranks_never_sampled():
         talker.prepare_decode_buffers([_request(top_k=4, top_p=0.5, sub_seed=seed)])
         token = talker._sample_subtalker_token_seeded(
             logits,
-            sub_positions=talker._predictor_sub_positions(positions)[0],
+            sub_positions=talker._sub_seed_positions(positions)[0],
         )
         assert (
             token.item() == 3
