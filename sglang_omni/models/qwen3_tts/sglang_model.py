@@ -50,7 +50,9 @@ from sglang_omni.vendor.sglang.server_args import get_global_server_args
 logger = logging.getLogger(__name__)
 
 QTTS_PREDICTOR_GRAPH_ENV = "SGLANG_OMNI_QTTS_PREDICTOR_GRAPH"
-_PREDICTOR_GRAPH_MAX_KEYS = 32
+# note(ratish): the default signature takes two keys per bucket, with and
+# without argmax rows, twelve buckets at 64 rows, and the graphs share one pool.
+_PREDICTOR_GRAPH_MAX_KEYS = 64
 _PREDICTOR_GRAPH_MAX_FAILURES = 8
 _PREDICTOR_GRAPH_WARMUP_PASSES = 2
 # Note: (Jiaxin Deng) 50 is on the ladder because it is the family checkpoint
@@ -1260,9 +1262,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         top_k: int,
         top_p: float,
     ) -> int:
-        """Capture the bucket ladder of the signature a batch gets when every row
-        samples with these values. Buckets go in descending order so the smaller
-        ones reuse the pool of the larger ones."""
+        """Capture the bucket ladder of the signatures a batch gets when its rows
+        sample with these values, with and without argmax rows mixed in. Buckets
+        go in descending order so the smaller ones reuse the pool of the larger
+        ones."""
         if self._predictor_graph_enabled is None:
             self._predictor_graph_enabled = self._resolve_predictor_graph_enabled()
         if not self._predictor_graph_enabled:
@@ -1273,26 +1276,30 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 [float(top_p)],
                 int(self.config.code_predictor_config.vocab_size),
             )
-            signature = ("sampled", max_top_k, has_top_p, has_unbounded_top_k, False)
+            signatures = [
+                ("sampled", max_top_k, has_top_p, has_unbounded_top_k, has_argmax_rows)
+                for has_argmax_rows in (False, True)
+            ]
         else:
-            signature = ("argmax", 0, False, False, False)
+            signatures = [("argmax", 0, False, False, False)]
         started = time.perf_counter()
         captured_before = len(self._predictor_graphs)
-        for bucket_size in reversed(self._predictor_graph_batch_sizes):
-            key = (bucket_size, *signature)
-            if key in self._predictor_graphs:
-                continue
-            if len(self._predictor_graphs) >= _PREDICTOR_GRAPH_MAX_KEYS:
-                break
-            self._predictor_graphs[key] = self._capture_predictor_graph(
-                bucket_size, signature
-            )
-            self._predictor_graph_capture_count += 1
+        for signature in signatures:
+            for bucket_size in reversed(self._predictor_graph_batch_sizes):
+                key = (bucket_size, *signature)
+                if key in self._predictor_graphs:
+                    continue
+                if len(self._predictor_graphs) >= _PREDICTOR_GRAPH_MAX_KEYS:
+                    break
+                self._predictor_graphs[key] = self._capture_predictor_graph(
+                    bucket_size, signature
+                )
+                self._predictor_graph_capture_count += 1
         captured = len(self._predictor_graphs) - captured_before
         elapsed_s = time.perf_counter() - started
         logger.info(
             f"Captured {captured} Qwen3-TTS predictor CUDA graphs for "
-            f"signature={signature} in {elapsed_s:.1f} s"
+            f"signatures={signatures} in {elapsed_s:.1f} s"
         )
         return captured
 
