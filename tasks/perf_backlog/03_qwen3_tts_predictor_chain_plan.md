@@ -261,7 +261,7 @@ unchanged. `torch.stack` of up to 64 equal rows is one kernel.
 `decode_input_embeds` is appended today and never read on the Qwen3-TTS
 path (only cleared in the scheduler), so the history keeps views of the
 step's clone. Bit identical: the same add on the same rows. Tests:
-`test_pipeline.py` has the feedback buffer cases; they gain a case where
+`test_pipeline.py` has the feedback buffer cases. They gain a case where
 half the rows have no feedback yet and the rest are batched, asserting
 the buffer rows equal the per row computation.
 
