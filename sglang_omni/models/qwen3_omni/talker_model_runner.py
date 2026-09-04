@@ -451,22 +451,16 @@ class QwenTalkerModelRunner(ModelRunner):
         return row
 
     @staticmethod
-    def _combine_feedback_with_next_text(
-        *,
+    def _peek_next_decode_inputs(
         data: Any,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor | None:
-        pending_feedback_queue = getattr(data, "pending_feedback_queue", None)
-        feedback = QwenTalkerModelRunner._peek_left(pending_feedback_queue)
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The feedback row and the text row of the next decode input, or None
+        while either is still missing."""
+        feedback = QwenTalkerModelRunner._peek_left(
+            getattr(data, "pending_feedback_queue", None)
+        )
         if feedback is None:
             return None
-
-        combined = QwenTalkerModelRunner._decode_row(
-            feedback,
-            device=device,
-            dtype=dtype,
-        )
         next_text = QwenTalkerModelRunner._peek_left(
             getattr(data, "pending_text_queue", None)
         )
@@ -474,8 +468,30 @@ class QwenTalkerModelRunner(ModelRunner):
             if not data.thinker_chunks_done:
                 return None
             next_text = data.tts_pad_embed
+        return feedback, next_text
 
-        return combined + QwenTalkerModelRunner._decode_row(
+    @staticmethod
+    def _pop_next_decode_inputs(data: Any) -> None:
+        QwenTalkerModelRunner._pop_left(getattr(data, "pending_feedback_queue", None))
+        if getattr(data, "pending_text_queue", None):
+            QwenTalkerModelRunner._pop_left(data.pending_text_queue)
+
+    @staticmethod
+    def _combine_feedback_with_next_text(
+        *,
+        data: Any,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        inputs = QwenTalkerModelRunner._peek_next_decode_inputs(data)
+        if inputs is None:
+            return None
+        feedback, next_text = inputs
+        return QwenTalkerModelRunner._decode_row(
+            feedback,
+            device=device,
+            dtype=dtype,
+        ) + QwenTalkerModelRunner._decode_row(
             next_text,
             device=device,
             dtype=dtype,
@@ -496,8 +512,5 @@ class QwenTalkerModelRunner(ModelRunner):
         )
         if combined is None:
             return None
-
-        QwenTalkerModelRunner._pop_left(getattr(data, "pending_feedback_queue", None))
-        if getattr(data, "pending_text_queue", None):
-            QwenTalkerModelRunner._pop_left(data.pending_text_queue)
+        QwenTalkerModelRunner._pop_next_decode_inputs(data)
         return combined
