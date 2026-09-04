@@ -946,9 +946,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self._sub_do_sample_tensor = torch.zeros(
             max_batch_size, device=device, dtype=torch.bool
         )
-        self._sub_identity_row_indices_tensor = torch.arange(
-            max_batch_size, device=device, dtype=torch.long
-        )
         self._predictor_sub_offsets = torch.arange(
             1, config.num_code_groups, device=device, dtype=torch.long
         )
@@ -1577,10 +1574,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         if not self._sub_has_sampled_rows:
             return torch.argmax(logits, dim=-1).to(dtype=torch.long)
 
-        row_indices = self._sub_identity_row_indices_tensor[:batch_size]
         sampled_tokens = self._sample_subtalker_token_seeded(
             logits,
-            row_indices=row_indices,
             sub_positions=sub_positions,
         )
         argmax_tokens = torch.argmax(logits, dim=-1).to(dtype=torch.long)
@@ -1594,18 +1589,16 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self,
         logits: torch.Tensor,
         *,
-        row_indices: torch.Tensor,
         sub_positions: torch.Tensor,
     ) -> torch.Tensor:
-        row_indices = row_indices.to(device=logits.device, dtype=torch.long)
-        temperatures = self._sub_temperature_tensor.index_select(0, row_indices)
-
+        batch_size = int(logits.shape[0])
         vocab_size = int(logits.shape[-1])
-        top_ks = self._sub_top_k_tensor.index_select(0, row_indices)
+        temperatures = self._sub_temperature_tensor[:batch_size]
+        top_ks = self._sub_top_k_tensor[:batch_size]
+        top_ps = self._sub_top_p_tensor[:batch_size]
+        seeds = self._sub_sampling_seed_tensor[:batch_size]
         max_top_k = int(self._sub_sampled_max_top_k)
         has_unbounded_top_k = bool(self._sub_sampled_has_unbounded_top_k)
-        top_ps = self._sub_top_p_tensor.index_select(0, row_indices)
-        seeds = self._sub_sampling_seed_tensor.index_select(0, row_indices)
 
         if logits.is_cuda:
             fused_sampled = sample_from_logits_with_seed_top_k_top_p(

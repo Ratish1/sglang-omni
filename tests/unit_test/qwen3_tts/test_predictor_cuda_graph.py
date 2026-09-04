@@ -127,9 +127,6 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
         MAX_BS, device=device, dtype=torch.long
     )
     talker._sub_do_sample_tensor = torch.zeros(MAX_BS, device=device, dtype=torch.bool)
-    talker._sub_identity_row_indices_tensor = torch.arange(
-        MAX_BS, device=device, dtype=torch.long
-    )
     talker._predictor_sub_offsets = torch.arange(
         1, NUM_CODE_GROUPS, device=device, dtype=torch.long
     )
@@ -432,8 +429,8 @@ def test_mixed_sampled_argmax_rows_use_graph_bit_identity(
 
     real_seeded = Qwen3TTSTalker._sample_subtalker_token_seeded
 
-    def _sentinel_seeded(self, logits, *, row_indices, sub_positions):
-        del self, row_indices, sub_positions
+    def _sentinel_seeded(self, logits, *, sub_positions):
+        del self, sub_positions
         return (torch.argmax(logits, dim=-1) + 1) % PRED_VOCAB
 
     monkeypatch.setattr(

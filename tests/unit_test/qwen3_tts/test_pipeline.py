@@ -4997,7 +4997,6 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
     talker._semantic_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
     talker._sub_sampling_seed_tensor = torch.empty(2, dtype=torch.long)
     talker._sub_do_sample_tensor = torch.empty(2, dtype=torch.bool)
-    talker._sub_identity_row_indices_tensor = torch.arange(2, dtype=torch.long)
     requests = [
         SimpleNamespace(
             data=Qwen3TTSSGLangRequestData(
@@ -5029,7 +5028,6 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
     assert talker._sub_temperature_tensor[:2].tolist() == pytest.approx([0.8, 1.0])
     assert talker._sub_top_k_tensor[:2].tolist() == [40, 1]
     assert talker._sub_do_sample_tensor[:2].tolist() == [True, False]
-    assert talker._sub_identity_row_indices_tensor.tolist() == [0, 1]
     assert talker._sub_has_sampled_rows is True
     assert talker._sub_sampled_has_top_p is True
     # top_k=40 ladder-quantizes to 50 (shared predictor-graph key width).
@@ -5084,7 +5082,6 @@ def test_qwen3_tts_subtalker_sampling_batches_sampled_path_without_global_rng(
     talker._sub_top_k_tensor = torch.tensor([-1, -1])
     talker._sub_sampling_seed_tensor = torch.tensor([17, 23])
     talker._sub_do_sample_tensor = torch.tensor([True, True])
-    talker._sub_identity_row_indices_tensor = torch.tensor([0, 1])
     talker._predictor_sub_offsets = torch.arange(1, 4)
     talker._sub_has_sampled_rows = True
     talker._sub_sampled_has_top_p = False
@@ -5169,7 +5166,6 @@ def test_qwen3_tts_subtalker_top_p_keeps_threshold_crossing_token(
     token = Qwen3TTSTalker._sample_subtalker_token_seeded(
         talker,
         torch.log(torch.tensor([[0.4, 0.35, 0.25]])),
-        row_indices=torch.tensor([0]),
         sub_positions=torch.tensor([1]),
     )
 
