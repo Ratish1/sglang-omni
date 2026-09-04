@@ -303,49 +303,39 @@ class Qwen3TTSModelRunner(ModelRunner):
         weight = decode_feedback_embedding.weight
         device = weight.device
         dtype = weight.dtype
-        # note(ratish): rows with their feedback and next text staged are added
-        # in one batch, a row still waiting for either keeps its own embedding.
         feedback_rows: list[torch.Tensor] = []
         text_rows: list[torch.Tensor] = []
-        eager_rows: list[tuple[int, torch.Tensor]] = []
+        batched_row_ids: list[int] = []
+        rows: list[torch.Tensor | None] = [None] * batch_size
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
-            feedback = QwenTalkerModelRunner._peek_left(data.pending_feedback_queue)
-            text = QwenTalkerModelRunner._peek_left(data.pending_text_queue)
-            if text is None and data.thinker_chunks_done:
-                text = data.tts_pad_embed
-            if feedback is None or text is None:
+            inputs = QwenTalkerModelRunner._peek_next_decode_inputs(data)
+            if inputs is None:
                 token_id = input_ids[row_idx : row_idx + 1].to(device=device)
-                embed = self.model.get_input_embeddings()(token_id).reshape(-1)
-                eager_rows.append((row_idx, embed))
+                rows[row_idx] = self.model.get_input_embeddings()(token_id).reshape(-1)
                 continue
+            feedback, text = inputs
             feedback_rows.append(
                 QwenTalkerModelRunner._decode_row(feedback, device=device, dtype=dtype)
             )
             text_rows.append(
                 QwenTalkerModelRunner._decode_row(text, device=device, dtype=dtype)
             )
-            QwenTalkerModelRunner._pop_left(data.pending_feedback_queue)
-            if data.pending_text_queue:
-                QwenTalkerModelRunner._pop_left(data.pending_text_queue)
+            batched_row_ids.append(row_idx)
+            QwenTalkerModelRunner._pop_next_decode_inputs(data)
 
         with torch.no_grad():
             target = weight[:batch_size]
-            if not eager_rows:
+            if len(batched_row_ids) == batch_size:
                 torch.stack(feedback_rows, dim=0, out=target)
                 target.add_(torch.stack(text_rows, dim=0))
             else:
-                rows: list[torch.Tensor | None] = [None] * batch_size
-                for row_idx, embed in eager_rows:
-                    rows[row_idx] = embed
                 if feedback_rows:
                     combined = torch.stack(feedback_rows, dim=0) + torch.stack(
                         text_rows, dim=0
                     )
-                    batched_rows = (embed for embed in combined)
-                    for row_idx in range(batch_size):
-                        if rows[row_idx] is None:
-                            rows[row_idx] = next(batched_rows)
+                    for slot, row_idx in enumerate(batched_row_ids):
+                        rows[row_idx] = combined[slot]
                 torch.stack(rows, dim=0, out=target)
             # note(ratish): the history outlives the buffer, a retracted request
             # replays it in its re-prefill.
