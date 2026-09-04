@@ -11,10 +11,10 @@ Plans for items in this list are written as numbered docs in this folder.
 ## 1. Order
 
 1. Close the Qwen3-TTS predictor startup capture (A.1). The branch is at
-   `d7e34a16c`. Run 8 (doc 24 section 8) closed the c1 order question and
-   the deterministic check passed. Owed: the unit tests of that head on
-   the box and one c16 pass on it so every PR number comes from the final
-   head. Then the PR.
+   `d7e34a16c`, validated on that head: 348 unit tests, c1 byte identical
+   with the order swapped, c16 first batch 2.5 s per request faster and
+   steady state flat. PR draft in `pr_qwen3_tts_predictor_startup_capture.md`,
+   not opened.
 2. Observed KV reservation on the Qwen3-Omni talker (A.3). Implemented on
    `perf/observed-kv-reservation` at `81a87e474`, measured at +25% qps at
    c16 and +43% at c32 on the bf16 colocated profile (doc 08 section 1).
