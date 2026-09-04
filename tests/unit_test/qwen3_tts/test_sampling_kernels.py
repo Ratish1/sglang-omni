@@ -223,10 +223,8 @@ def _production_seeded_tokens(
     layer_idx: int,
     semantic_positions: torch.Tensor,
 ) -> torch.Tensor:
-    rows = torch.arange(logits.shape[0], device=logits.device, dtype=torch.long)
     return talker._sample_subtalker_token_seeded(
         logits,
-        row_indices=rows,
         sub_positions=talker._predictor_sub_positions(semantic_positions)[layer_idx],
     )
 
