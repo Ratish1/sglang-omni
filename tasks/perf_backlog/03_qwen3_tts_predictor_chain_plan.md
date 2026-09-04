@@ -1,7 +1,11 @@
 # 03. Qwen3-TTS predictor chain: fewer kernels in the replay, a shorter tail (T22)
 
-Status: Conditional. Slices S1 and B1 are fully specified from the census
-and the code. S2 and S3 carry a numerics gate whose band is measured in
+Status: S1 implemented, untested on the box. Branch
+`perf/qwen3-tts-predictor-chain` at `fd16b0e05`, five commits on the
+startup capture head, pushed 2026-09-04. `perf/qwen3-tts-profiling` at
+`892c4b5cc` carries the ledger plus the same five commits for the census
+diff. Section 11 has what to run. Slices S1 and B1 are fully specified
+from the census and the code. S2 and S3 carry a numerics gate whose band is measured in
 S1. B3 is a measurement that decides whether the graph launch cost is a
 third target. Evidence: doc 02 sections 6 and 8 (the H100 census and
 timeline of 2026-09-04, branch `perf/qwen3-tts-profiling`), and the code
@@ -344,3 +348,32 @@ S0 in parallel, on `perf/qwen3-tts-profiling` only: `StepLedger` gains
 in `model_runner/base.py` `_prepare_and_forward` and around
 `graph.replay` in `_predictor_forward_graphed`, reported per shape in the
 summary like `forward_ms`.
+
+## 11. S1 as committed, and what to run
+
+Commits on `perf/qwen3-tts-predictor-chain`, from `fff86552c`:
+
+1. `1071895f3` stage the clamped subtalker temperature
+2. `c77a3e740` compute the predictor sub positions once per call
+3. `54c43ca9f` read the sampler parameters as slices of the staged rows
+4. `d10706cea` skip the argmax when every row samples
+5. `fd16b0e05` batch the feedback rows into the decode embedding
+
+Deviations from section 10, all in the direction of less code: the
+sampler no longer takes `layer_idx` (the sub position row carries it),
+`_predictor_sub_positions` is the one owner of the position rule and the
+tests read it through that method, and the test that required positions
+on the direct sampler call went with `_select_semantic_positions`. The
+argmax signature is `("argmax", 0, False, False, False)` so both tuples
+have five terms. Every commit compiles, no reference to the removed
+names remains.
+
+On the box, in this order:
+
+1. `pytest tests/unit_test/qwen3_tts -q` on `perf/qwen3-tts-predictor-chain`.
+2. The census on `perf/qwen3-tts-profiling` with the doc 02 section 4
+   protocol, then `perfkit.py diff` against the 2026-09-04 census JSONs
+   at 1 and 16 rows, and the two timelines. Expected: 1371 to about 1213
+   kernels per replay, the run of per row launches after the replay gone.
+3. The c1 A/B against `perf/qwen3-tts-predictor-startup-capture`
+   `fff86552c` as arm A, 1088 of 1088 WAVs byte identical expected.
