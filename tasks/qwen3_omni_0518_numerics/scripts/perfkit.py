@@ -10,16 +10,26 @@ cudaGraphLaunch call and the graph id, which is enough to attribute them.
     perfkit.py steps TRACE.pkl [--rows N] [--json OUT]
     perfkit.py census TRACE.pkl [--rows N] [--json OUT] [--top 40]
     perfkit.py diff A.json B.json
+    perfkit.py memory TRACE.pkl [--top 30] [--min-mb 64] [--json OUT]
+    perfkit.py memdiff A.json B.json
 
 A step is the span from one backbone graph launch to the next on the scheduler
 thread. Its phases in launch order are the backbone replay, the eager launches
 before the predictor replay (layer 0 sampling and predictor prep), the
 predictor replay, and the launches after it (token staging and collect).
+
+The memory report reads the allocator events a profile made with
+SGLANG_TORCH_PROFILER_PROFILE_MEMORY=1 carries: every CUDA allocation and free
+with the allocator's total allocated and total reserved bytes at that moment,
+and the allocator's own out of memory retries. Each large allocation is
+attributed to the CPU op that was running on its thread, or, where the thread
+has no recorded ops, to the next kernel launch on that thread.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import gzip
 import json
 import pickle
@@ -103,15 +113,36 @@ def iter_events(path: str):
             pos = 0
 
 
+MEMORY_EVENTS = ("[memory]", "[OutOfMemory]")
+CUDA_DEVICE_TYPE = 1
+
+
 def ingest(path: str, out: str) -> None:
-    kernels, runtime, memops = [], [], []
+    kernels, runtime, memops, memory, ops = [], [], [], [], []
     names: dict[str, int] = {}
     for ev in iter_events(path):
+        args = ev.get("args") or {}
+        if ev.get("ph") == "i" and ev.get("name") in MEMORY_EVENTS:
+            if args.get("Device Type") != CUDA_DEVICE_TYPE:
+                continue
+            memory.append(
+                (
+                    ev["ts"],
+                    ev.get("tid"),
+                    int(args.get("Bytes", 0)),
+                    int(args.get("Total Allocated", 0)),
+                    int(args.get("Total Reserved", 0)),
+                    ev["name"] == "[OutOfMemory]",
+                )
+            )
+            continue
         if ev.get("ph") != "X":
             continue
         cat = ev.get("cat")
-        args = ev.get("args") or {}
-        if cat == "kernel":
+        if cat == "cpu_op":
+            nid = names.setdefault(ev["name"], len(names))
+            ops.append((ev["ts"], ev["dur"], nid, ev.get("tid")))
+        elif cat == "kernel":
             nid = names.setdefault(ev["name"], len(names))
             kernels.append(
                 (
@@ -142,14 +173,24 @@ def ingest(path: str, out: str) -> None:
     kernels.sort()
     memops.sort()
     runtime.sort()
+    memory.sort()
+    ops.sort()
     with open(out, "wb") as handle:
         pickle.dump(
-            {"names": names, "kernels": kernels, "runtime": runtime, "memops": memops},
+            {
+                "names": names,
+                "kernels": kernels,
+                "runtime": runtime,
+                "memops": memops,
+                "memory": memory,
+                "ops": ops,
+            },
             handle,
             protocol=5,
         )
     print(
-        f"kernels={len(kernels)} runtime={len(runtime)} memops={len(memops)} names={len(names)} -> {out}"
+        f"kernels={len(kernels)} runtime={len(runtime)} memops={len(memops)} "
+        f"memory={len(memory)} ops={len(ops)} names={len(names)} -> {out}"
     )
 
 
@@ -589,6 +630,210 @@ def diff_report(a_path: str, b_path: str):
             )
 
 
+# ---------------------------------------------------------------- memory
+
+MIB = 1 << 20
+
+
+def _enclosing_op(ops_by_tid: dict, inv: dict, tid, ts: float) -> str | None:
+    """Innermost CPU op on the thread whose span holds ts, or None."""
+    starts, rows = ops_by_tid.get(tid, ([], []))
+    i = bisect.bisect_right(starts, ts) - 1
+    # note: ops nest, so the innermost holder is the latest start that still
+    # covers ts; a bounded walk back is enough for any real nesting depth
+    for j in range(i, max(-1, i - 256), -1):
+        o_ts, o_dur, nid, _ = rows[j]
+        if o_ts <= ts <= o_ts + o_dur:
+            return inv[nid]
+    return None
+
+
+def _next_launch(launches_by_tid: dict, tid, ts: float) -> str | None:
+    """Name of the first kernel of the next launch on the thread after ts."""
+    starts, rows = launches_by_tid.get(tid, ([], []))
+    i = bisect.bisect_left(starts, ts)
+    if i < len(rows):
+        return rows[i]
+    return None
+
+
+def memory_report(d: dict, top: int, min_mb: float, json_out: str | None):
+    mem = d.get("memory", [])
+    if not mem:
+        raise SystemExit(
+            "no allocator events in the trace, profile with SGLANG_TORCH_PROFILER_PROFILE_MEMORY=1"
+        )
+    inv = d["inv"]
+    t0 = min(
+        [mem[0][0]]
+        + ([d["kernels"][0][0]] if d["kernels"] else [])
+        + ([d["runtime"][0][0]] if d["runtime"] else [])
+    )
+    ms = lambda ts: (ts - t0) / 1000  # noqa: E731
+
+    ops_by_tid: dict = {}
+    for row in d.get("ops", []):
+        ops_by_tid.setdefault(row[3], ([], []))
+        ops_by_tid[row[3]][0].append(row[0])
+        ops_by_tid[row[3]][1].append(row)
+    first_kernel = {}
+    for ts, dur, nid, corr, stream, graph in d["kernels"]:
+        first_kernel.setdefault(corr, inv[nid])
+    launches_by_tid: dict = {}
+    for ts, dur, nid, corr, tid in d["runtime"]:
+        if corr in first_kernel:
+            launches_by_tid.setdefault(tid, ([], []))
+            launches_by_tid[tid][0].append(ts)
+            launches_by_tid[tid][1].append(first_kernel[corr])
+
+    events = [m for m in mem if not m[5]]
+    ooms = [m for m in mem if m[5]]
+    allocs = [m for m in events if m[2] > 0]
+    per_tid = Counter(m[1] for m in events)
+    print(
+        f"allocator events {len(events)} on {len(per_tid)} threads, allocations {len(allocs)}, out of memory retries {len(ooms)}"
+    )
+    print(
+        "events per thread: "
+        + ", ".join(f"tid {tid}: {n}" for tid, n in per_tid.most_common())
+    )
+    peak_alloc = max(events, key=lambda m: m[3])
+    peak_res = max(events, key=lambda m: m[4])
+    print(
+        f"\n| | at start | peak | at end |\n| --- | ---: | ---: | ---: |\n"
+        f"| allocated MiB | {events[0][3] / MIB:.0f} | {peak_alloc[3] / MIB:.0f} at {ms(peak_alloc[0]):.1f} ms | {events[-1][3] / MIB:.0f} |\n"
+        f"| reserved MiB | {events[0][4] / MIB:.0f} | {peak_res[4] / MIB:.0f} at {ms(peak_res[0]):.1f} ms | {events[-1][4] / MIB:.0f} |"
+    )
+    drops = []
+    for prev, cur in zip(events, events[1:]):
+        if prev[4] - cur[4] >= 64 * MIB:
+            drops.append((cur[0], prev[4], cur[4]))
+    if drops:
+        print(
+            "\nreserved memory released by the allocator, a cache flush before a retry:"
+        )
+        print("| at ms | reserved before MiB | after MiB |\n| ---: | ---: | ---: |")
+        for ts, before, after in drops:
+            print(f"| {ms(ts):.1f} | {before / MIB:.0f} | {after / MIB:.0f} |")
+    if ooms:
+        print("\nout of memory retries:")
+        print(
+            "| at ms | requested MiB | allocated MiB | reserved MiB | thread | op or next launch |\n| ---: | ---: | ---: | ---: | ---: | --- |"
+        )
+        for ts, tid, nbytes, total_a, total_r, _ in ooms:
+            who = _enclosing_op(ops_by_tid, inv, tid, ts) or _next_launch(
+                launches_by_tid, tid, ts
+            )
+            print(
+                f"| {ms(ts):.1f} | {nbytes / MIB:.0f} | {total_a / MIB:.0f} | {total_r / MIB:.0f} | {tid} | {short(who) if who else 'unknown'} |"
+            )
+    classes = defaultdict(lambda: [0, 0, 0])
+    for m in allocs:
+        if m[2] < MIB:
+            continue
+        cls = 1 << (m[2] // MIB).bit_length()
+        c = classes[cls]
+        c[0] += 1
+        c[1] += m[2]
+        c[2] = max(c[2], m[2])
+    print("\nallocations of at least 1 MiB by size class:")
+    print(
+        "| under MiB | count | total MiB | largest MiB |\n| ---: | ---: | ---: | ---: |"
+    )
+    for cls in sorted(classes):
+        c = classes[cls]
+        print(f"| {cls} | {c[0]} | {c[1] / MIB:.0f} | {c[2] / MIB:.1f} |")
+    largest = sorted((m for m in allocs if m[2] >= min_mb * MIB), key=lambda m: -m[2])[
+        :top
+    ]
+    print(f"\nlargest allocations of at least {min_mb:g} MiB:")
+    print(
+        "| MiB | at ms | thread | allocated after MiB | reserved after MiB | op or next launch |\n| ---: | ---: | ---: | ---: | ---: | --- |"
+    )
+    top_rows = []
+    for ts, tid, nbytes, total_a, total_r, _ in largest:
+        who = _enclosing_op(ops_by_tid, inv, tid, ts)
+        source = "op" if who else "next launch"
+        if who is None:
+            who = _next_launch(launches_by_tid, tid, ts)
+        label = short(who) if who else "unknown"
+        top_rows.append(
+            {
+                "bytes": nbytes,
+                "ts_us": ts,
+                "at_ms": ms(ts),
+                "tid": tid,
+                "allocated_after": total_a,
+                "reserved_after": total_r,
+                "attribution": label,
+                "attribution_kind": source,
+            }
+        )
+        print(
+            f"| {nbytes / MIB:.1f} | {ms(ts):.1f} | {tid} | {total_a / MIB:.0f} | {total_r / MIB:.0f} | {label} ({source}) |"
+        )
+    result = {
+        "events": len(events),
+        "allocations": len(allocs),
+        "threads": {str(k): v for k, v in per_tid.items()},
+        "allocated_start": events[0][3],
+        "allocated_peak": peak_alloc[3],
+        "allocated_peak_ms": ms(peak_alloc[0]),
+        "allocated_end": events[-1][3],
+        "reserved_start": events[0][4],
+        "reserved_peak": peak_res[4],
+        "reserved_peak_ms": ms(peak_res[0]),
+        "reserved_end": events[-1][4],
+        "reserved_drops": [
+            {"at_ms": ms(ts), "before": b, "after": a} for ts, b, a in drops
+        ],
+        "ooms": [
+            {"at_ms": ms(m[0]), "bytes": m[2], "allocated": m[3], "reserved": m[4]}
+            for m in ooms
+        ],
+        "size_classes": {str(k): v for k, v in sorted(classes.items())},
+        "largest": top_rows,
+    }
+    if json_out:
+        with open(json_out, "w") as handle:
+            json.dump(result, handle, indent=2)
+
+
+def memdiff_report(a_path: str, b_path: str, top: int = 15):
+    a, b = json.load(open(a_path)), json.load(open(b_path))
+    print("| | A | B | B minus A |\n| --- | ---: | ---: | ---: |")
+    for key, label in (
+        ("allocated_peak", "allocated peak MiB"),
+        ("reserved_peak", "reserved peak MiB"),
+        ("allocated_end", "allocated at end MiB"),
+        ("reserved_end", "reserved at end MiB"),
+    ):
+        print(
+            f"| {label} | {a[key] / MIB:.0f} | {b[key] / MIB:.0f} | {(b[key] - a[key]) / MIB:+.0f} |"
+        )
+    print(f"| out of memory retries | {len(a['ooms'])} | {len(b['ooms'])} | |")
+    print(
+        f"| allocator cache flushes | {len(a['reserved_drops'])} | {len(b['reserved_drops'])} | |"
+    )
+    print(f"| allocations | {a['allocations']} | {b['allocations']} | |")
+    print("\nlargest allocations, A against B by rank:")
+    print(
+        "| rank | A MiB | A attribution | B MiB | B attribution |\n| ---: | ---: | --- | ---: | --- |"
+    )
+    for i in range(top):
+        ra = a["largest"][i] if i < len(a["largest"]) else None
+        rb = b["largest"][i] if i < len(b["largest"]) else None
+        print(
+            (
+                f"| {i} | {ra['bytes'] / MIB:.1f} | {ra['attribution']} |"
+                if ra
+                else f"| {i} | | |"
+            ),
+            end="",
+        )
+        print(f" {rb['bytes'] / MIB:.1f} | {rb['attribution']} |" if rb else " | |")
+
+
 # ---------------------------------------------------------------- cli
 
 
@@ -628,6 +873,15 @@ def main() -> int:
     s = sub.add_parser("diff")
     s.add_argument("a")
     s.add_argument("b")
+    s = sub.add_parser("memory")
+    s.add_argument("pkl")
+    s.add_argument("--top", type=int, default=30)
+    s.add_argument("--min-mb", type=float, default=64.0)
+    s.add_argument("--json", default=None)
+    s = sub.add_parser("memdiff")
+    s.add_argument("a")
+    s.add_argument("b")
+    s.add_argument("--top", type=int, default=15)
     args = parser.parse_args()
     if args.cmd == "ingest":
         ingest(args.trace, args.out)
@@ -654,6 +908,10 @@ def main() -> int:
             re.compile(args.predictor_marker, re.I),
             args.index,
         )
+    elif args.cmd == "memory":
+        memory_report(load(args.pkl), args.top, args.min_mb, args.json)
+    elif args.cmd == "memdiff":
+        memdiff_report(args.a, args.b, args.top)
     else:
         diff_report(args.a, args.b)
     return 0
