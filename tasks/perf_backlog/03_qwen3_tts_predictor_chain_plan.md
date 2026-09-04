@@ -298,3 +298,49 @@ their base.
   the tail is attributed from the code rather than from frames.
 - #1936, fault 2 (illegal instruction under load with the predictor graph
   off) stays open and unrelated.
+
+## 10. Implementation map of S1
+
+Anchors are `perf/qwen3-tts-predictor-startup-capture` head `fff86552c`.
+The package is `sglang_omni/models/qwen3_tts/`: `sglang_model.py` (1872
+lines, the talker and the predictor), `model_runner.py` (370, the decode
+hooks), `predictor_kernels.py` (143, the Triton embedding gather),
+`sampling_kernels.py` (576, the Triton samplers), `engine_builder.py`. S1
+touches the first two and their tests. No new file, no new class.
+
+| File | Class, function, line | Change |
+| --- | --- | --- |
+| `sglang_model.py` | `Qwen3TTSTalker.__init__`, :949 | remove `_sub_identity_row_indices_tensor`. Add `_predictor_sub_offsets = torch.arange(1, num_code_groups, device, long)`. Add `_sub_has_argmax_rows = False` next to `_sub_has_sampled_rows` (:952). |
+| `sglang_model.py` | `prepare_decode_buffers`, :976 | stage `max(subtalker_temperature, 1e-5)` in the host list (the row loop near :1020). Set `_sub_has_argmax_rows = len(sample_rows) < batch_size` next to `_sub_has_sampled_rows` (:1047). |
+| `sglang_model.py` | `_predictor_graph_signature`, :1176 | the sampled tuple gains `bool(self._sub_has_argmax_rows)` as its fifth element. |
+| `sglang_model.py` | `_predictor_graph_capture_state`, :1203 | save and restore `_sub_has_argmax_rows`, set it from `signature[4]` for the capture, as the other four fields are set from the signature at :1214. |
+| `sglang_model.py` | `capture_predictor_graphs`, :1246 | the derived signature appends `False`. |
+| `sglang_model.py` | `_code_predictor_forward_incremental`, :1426 | after the positions are validated once, `positions_table = semantic_positions[None, :] * (num_code_groups - 1) + self._predictor_sub_offsets[:, None]`. Each sub-step passes `positions_table[layer_idx]` where it passes `semantic_positions` today. |
+| `sglang_model.py` | `_sample_subtalker_token`, :1546 | signature `(logits, layer_idx, *, sub_positions)`. Drop the `row_indices` slice and `_select_semantic_positions`. Return the sampled tokens when `not self._sub_has_argmax_rows`, keep the `where` otherwise. |
+| `sglang_model.py` | `_select_semantic_positions`, :1581 | its checks move to the single validation of `semantic_positions` in `_code_predictor_forward_incremental`, the function goes. |
+| `sglang_model.py` | `_sample_subtalker_token_seeded`, :1594 | signature `(logits, layer_idx, *, sub_positions)`. `temperatures = self._sub_temperature_tensor[:batch]`, same for `top_ks`, `top_ps`, `seeds`, no `index_select`, no `clamp_min`, no position arithmetic. The fused call and the ATen fallback take the slices as they took the copies. |
+| `model_runner.py` | `Qwen3TTSModelRunner._write_feedback_buffers`, :288 | the batched path of section 8.3. Rows with a feedback row and a text row are stacked into `decode_feedback_embedding.weight[:batch]` and the text rows added in one call. Rows without one keep the per row helper. The history rows are views of one clone of the written rows, because the retract re-prefill reads that history (`test_retract_prefill.py`). |
+| `engine_builder.py` | `setup_model_resources` | unchanged. |
+| `tests/unit_test/qwen3_tts/test_sampling_kernels.py` | `_build_sampling_talker`, `_production_seeded_tokens`, `_reference_seeded_tokens`, `_fused_seeded_tokens` | the helpers compute `sub_positions` with the plan's rule from the same `semantic_positions` and pass it instead of `row_indices`. Every existing case keeps its expected tokens. |
+| `tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py` | `test_signature_rule_is_shared_by_batch_and_startup_paths` | the expected tuple has five terms, plus a mixed case (one argmax row) that expects `True`. |
+| `tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py` | `test_mixed_sampled_argmax_rows_use_graph_bit_identity`, `test_mixed_padded_bucket_bit_identity_and_reuse` | unchanged, they prove the `where` path. One assertion added: an all sampled batch and a mixed batch of the same bucket hold two keys. |
+| `tests/unit_test/qwen3_tts/test_pipeline.py` | the feedback cases at :4904 to :4956 | one case with half the rows lacking a feedback row, asserting the written rows equal the per row computation and the queues are popped only for the batched rows. |
+| `tests/unit_test/qwen3_tts/test_retract_prefill.py` | `test_write_feedback_buffers_records_decode_input_history` | unchanged, it is the guard for the history clone. |
+
+Commits, in order, each compiling and tested on its own:
+
+1. stage the clamped subtalker temperature
+2. compute the predictor sub positions once per call
+3. read the sampler parameters as slices of the staged rows
+4. skip the argmax when every row samples
+5. batch the feedback rows into the decode embedding
+
+Expected census diff after 5, per replay at 1 row: kernels 1371 to about
+1213, busy down by about 0.25 ms. Timeline at 16 rows: the run of 16
+launches after the predictor replaced by 4.
+
+S0 in parallel, on `perf/qwen3-tts-profiling` only: `StepLedger` gains
+`host_launch_ms` from `time.perf_counter` around the backbone replay call
+in `model_runner/base.py` `_prepare_and_forward` and around
+`graph.replay` in `_predictor_forward_graphed`, reported per shape in the
+summary like `forward_ms`.
