@@ -50,9 +50,7 @@ from sglang_omni.vendor.sglang.server_args import get_global_server_args
 logger = logging.getLogger(__name__)
 
 QTTS_PREDICTOR_GRAPH_ENV = "SGLANG_OMNI_QTTS_PREDICTOR_GRAPH"
-# note(ratish): the default signature takes two keys per bucket, with and
-# without argmax rows, twelve buckets at 64 rows, and the graphs share one pool.
-_PREDICTOR_GRAPH_MAX_KEYS = 64
+_PREDICTOR_GRAPH_MAX_KEYS = 32
 _PREDICTOR_GRAPH_MAX_FAILURES = 8
 _PREDICTOR_GRAPH_WARMUP_PASSES = 2
 # Note: (Jiaxin Deng) 50 is on the ladder because it is the family checkpoint
