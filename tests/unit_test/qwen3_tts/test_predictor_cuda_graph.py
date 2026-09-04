@@ -131,6 +131,7 @@ def _build_talker(device: torch.device) -> Qwen3TTSTalker:
         1, NUM_CODE_GROUPS, device=device, dtype=torch.long
     )
     talker._sub_has_sampled_rows = False
+    talker._sub_has_argmax_rows = False
     talker._sub_sampled_has_top_p = False
     talker._sub_sampled_max_top_k = 0
     talker._sub_sampled_has_unbounded_top_k = False
@@ -1000,15 +1001,19 @@ def test_capture_state_body_failure_restores_state():
     saved = (
         talker._sub_batch_size,
         talker._sub_has_sampled_rows,
+        talker._sub_has_argmax_rows,
         talker._sub_sampled_has_top_p,
         talker._sub_sampled_max_top_k,
         talker._sub_sampled_has_unbounded_top_k,
     )
 
     with pytest.raises(RuntimeError, match="simulated capture failure"):
-        with talker._predictor_graph_capture_state(4, ("sampled", 8, True, False)):
+        with talker._predictor_graph_capture_state(
+            4, ("sampled", 8, True, False, True)
+        ):
             assert talker._sub_batch_size == 4
             assert talker._sub_has_sampled_rows is True
+            assert talker._sub_has_argmax_rows is True
             assert talker._sub_sampled_has_top_p is True
             assert talker._sub_sampled_max_top_k == 8
             assert talker._sub_sampled_has_unbounded_top_k is False
@@ -1017,6 +1022,7 @@ def test_capture_state_body_failure_restores_state():
     assert (
         talker._sub_batch_size,
         talker._sub_has_sampled_rows,
+        talker._sub_has_argmax_rows,
         talker._sub_sampled_has_top_p,
         talker._sub_sampled_max_top_k,
         talker._sub_sampled_has_unbounded_top_k,
@@ -1093,11 +1099,10 @@ def test_failed_capture_restores_the_current_stream(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.accelerator
-@pytest.mark.accelerator
 def test_startup_capture_builds_the_ladder_for_one_signature():
     device = torch.device("cuda")
     talker = _build_talker(device)
-    signature = ("sampled", 8, False, False)
+    signature = ("sampled", 8, False, False, False)
 
     assert talker.capture_predictor_graphs(do_sample=True, top_k=5, top_p=1.0) == len(
         BUCKETS
@@ -1172,12 +1177,25 @@ def test_signature_rule_is_shared_by_batch_and_startup_paths(
                 talker._sub_sampled_max_top_k,
                 talker._sub_sampled_has_top_p,
                 talker._sub_sampled_has_unbounded_top_k,
+                talker._sub_has_argmax_rows,
             )
         else:
-            expected = ("argmax", 0, False, False)
+            expected = ("argmax", 0, False, False, False)
         talker._predictor_graphs.clear()
         talker.capture_predictor_graphs(do_sample=dosample, top_k=top_k, top_p=top_p)
         assert startup_keys[-1][1:] == expected, (dosample, top_k, top_p)
+
+    talker.prepare_decode_buffers([_request(dosample=True), _request(dosample=False)])
+    assert talker._sub_has_argmax_rows is True
+    talker._predictor_graphs.clear()
+    talker.capture_predictor_graphs(do_sample=True, top_k=5, top_p=1.0)
+    assert startup_keys[-1][1:] == (
+        "sampled",
+        talker._sub_sampled_max_top_k,
+        talker._sub_sampled_has_top_p,
+        talker._sub_sampled_has_unbounded_top_k,
+        False,
+    )
 
 
 @pytest.mark.accelerator

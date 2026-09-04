@@ -950,6 +950,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             1, config.num_code_groups, device=device, dtype=torch.long
         )
         self._sub_has_sampled_rows = False
+        self._sub_has_argmax_rows = False
         self._sub_sampled_has_top_p = False
         self._sub_sampled_max_top_k = 0
         self._sub_sampled_has_unbounded_top_k = False
@@ -1049,6 +1050,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         )
         self._sub_batch_size = batch_size
         self._sub_has_sampled_rows = bool(sample_rows)
+        self._sub_has_argmax_rows = len(sample_rows) < batch_size
         self._sub_sampled_has_top_p = has_top_p
         self._sub_sampled_max_top_k = max_top_k
         self._sub_sampled_has_unbounded_top_k = has_unbounded_top_k
@@ -1193,7 +1195,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             if semantic_positions.ndim == 2 and semantic_positions.shape[1] != 1:
                 return None
         if not self._sub_has_sampled_rows:
-            return ("argmax", 0, False, False)
+            return ("argmax", 0, False, False, False)
         if semantic_positions is None:
             return None
         return (
@@ -1201,6 +1203,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             int(self._sub_sampled_max_top_k),
             bool(self._sub_sampled_has_top_p),
             bool(self._sub_sampled_has_unbounded_top_k),
+            bool(self._sub_has_argmax_rows),
         )
 
     @contextmanager
@@ -1208,6 +1211,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         saved = (
             self._sub_batch_size,
             self._sub_has_sampled_rows,
+            self._sub_has_argmax_rows,
             self._sub_sampled_has_top_p,
             self._sub_sampled_max_top_k,
             self._sub_sampled_has_unbounded_top_k,
@@ -1216,15 +1220,17 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         try:
             self._sub_batch_size = bucket_size
             self._sub_has_sampled_rows = sampled
-            _, max_top_k, has_top_p, has_unbounded_top_k = signature
+            _, max_top_k, has_top_p, has_unbounded_top_k, has_argmax_rows = signature
             self._sub_sampled_max_top_k = max_top_k
             self._sub_sampled_has_top_p = has_top_p
             self._sub_sampled_has_unbounded_top_k = has_unbounded_top_k
+            self._sub_has_argmax_rows = has_argmax_rows
             yield
         finally:
             (
                 self._sub_batch_size,
                 self._sub_has_sampled_rows,
+                self._sub_has_argmax_rows,
                 self._sub_sampled_has_top_p,
                 self._sub_sampled_max_top_k,
                 self._sub_sampled_has_unbounded_top_k,
@@ -1267,9 +1273,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 [float(top_p)],
                 int(self.config.code_predictor_config.vocab_size),
             )
-            signature = ("sampled", max_top_k, has_top_p, has_unbounded_top_k)
+            signature = ("sampled", max_top_k, has_top_p, has_unbounded_top_k, False)
         else:
-            signature = ("argmax", 0, False, False)
+            signature = ("argmax", 0, False, False, False)
         started = time.perf_counter()
         captured_before = len(self._predictor_graphs)
         for bucket_size in reversed(self._predictor_graph_batch_sizes):
@@ -1578,6 +1584,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             logits,
             sub_positions=sub_positions,
         )
+        if not self._sub_has_argmax_rows:
+            return sampled_tokens
         argmax_tokens = torch.argmax(logits, dim=-1).to(dtype=torch.long)
         return torch.where(
             self._sub_do_sample_tensor[:batch_size],
