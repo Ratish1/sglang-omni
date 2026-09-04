@@ -5245,7 +5245,6 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     from sglang_omni.models.qwen3_tts.request_builders import (
         clear_qwen3_tts_preprocessing_context,
     )
-    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
     from sglang_omni.scheduling import bootstrap as bootstrap_mod
     from sglang_omni.scheduling import omni_scheduler as scheduler_mod
     from sglang_omni.scheduling import sglang_backend
@@ -5281,16 +5280,13 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     predictor_captures: list[tuple] = []
 
     class FakeModel:
-        config = SimpleNamespace(code_predictor_config=SimpleNamespace(vocab_size=2048))
-        uniform_predictor_graph_signature = (
-            Qwen3TTSTalker.uniform_predictor_graph_signature
-        )
-
         def load_speech_tokenizer(self, tokenizer) -> None:
             self.speech_tokenizer = tokenizer
 
-        def capture_predictor_graphs(self, signature: tuple) -> int:
-            predictor_captures.append(signature)
+        def capture_predictor_graphs(
+            self, *, do_sample: bool, top_k: int, top_p: float
+        ) -> int:
+            predictor_captures.append((do_sample, top_k, top_p))
             return 6
 
     class FakeSGLangRunner:
@@ -5494,7 +5490,7 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
 
     assert infrastructure_saw_deferred_capture == [True]
     assert init_graph_calls == [True]
-    assert predictor_captures == [("sampled", 50, False, False)]
+    assert predictor_captures == [(True, 50, 1.0)]
     assert scheduler.server_args.cuda_graph_bs == expected_cuda_graph_bs
     assert scheduler.server_args.cuda_graph_max_bs == 64
     assert scheduler.server_args.disable_cuda_graph is False

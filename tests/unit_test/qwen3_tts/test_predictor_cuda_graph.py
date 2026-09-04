@@ -1097,9 +1097,11 @@ def test_startup_capture_builds_the_ladder_for_one_signature():
     talker = _build_talker(device)
     signature = ("sampled", 8, False, False)
 
-    assert talker.capture_predictor_graphs(signature) == len(BUCKETS)
+    assert talker.capture_predictor_graphs(do_sample=True, top_k=5, top_p=1.0) == len(
+        BUCKETS
+    )
     assert set(talker._predictor_graphs) == {(bucket, *signature) for bucket in BUCKETS}
-    assert talker.capture_predictor_graphs(signature) == 0
+    assert talker.capture_predictor_graphs(do_sample=True, top_k=5, top_p=1.0) == 0
 
     for batch_size in BUCKETS:
         talker.prepare_decode_buffers(_uniform_requests(batch_size, top_k=5))
@@ -1130,15 +1132,24 @@ def test_startup_capture_failure_raises_and_restores_state(
     )
 
     with pytest.raises(RuntimeError, match="simulated capture failure"):
-        talker.capture_predictor_graphs(("sampled", 8, False, False))
+        talker.capture_predictor_graphs(do_sample=True, top_k=8, top_p=1.0)
 
     assert not talker._predictor_graphs
     assert talker._sub_batch_size == 0
     assert gc.isenabled()
 
 
-def test_signature_rule_is_shared_by_batch_and_startup_paths():
+def test_signature_rule_is_shared_by_batch_and_startup_paths(
+    monkeypatch: pytest.MonkeyPatch,
+):
     talker = _build_talker(torch.device("cpu"))
+    startup_keys: list[tuple] = []
+
+    def _record_capture(self, bucket_size, signature):
+        startup_keys.append((bucket_size, *signature))
+        return object()
+
+    monkeypatch.setattr(Qwen3TTSTalker, "_capture_predictor_graph", _record_capture)
     cases = [
         (True, 5, 1.0),
         (True, 5, 0.9),
@@ -1162,12 +1173,9 @@ def test_signature_rule_is_shared_by_batch_and_startup_paths():
             )
         else:
             expected = ("argmax", 0, False, False)
-        assert (
-            talker.uniform_predictor_graph_signature(
-                do_sample=dosample, top_k=top_k, top_p=top_p
-            )
-            == expected
-        ), (dosample, top_k, top_p)
+        talker._predictor_graphs.clear()
+        talker.capture_predictor_graphs(do_sample=dosample, top_k=top_k, top_p=top_p)
+        assert startup_keys[-1][1:] == expected, (dosample, top_k, top_p)
 
 
 @pytest.mark.accelerator

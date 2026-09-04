@@ -1243,30 +1243,29 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         # graphed chain is only validated single-rank, so TP stays eager.
         return int(server_args.tp_size) == 1
 
-    def uniform_predictor_graph_signature(
+    def capture_predictor_graphs(
         self,
         *,
         do_sample: bool,
         top_k: int,
         top_p: float,
-    ) -> tuple:
-        """Graph signature of a batch whose rows all sample with these values."""
-        if not do_sample:
-            return ("argmax", 0, False, False)
-        max_top_k, has_top_p, has_unbounded_top_k = _predictor_signature_terms(
-            [int(top_k)],
-            [float(top_p)],
-            int(self.config.code_predictor_config.vocab_size),
-        )
-        return ("sampled", max_top_k, has_top_p, has_unbounded_top_k)
-
-    def capture_predictor_graphs(self, signature: tuple) -> int:
-        """Buckets go in descending order so the smaller ones reuse the pool of
-        the larger ones."""
+    ) -> int:
+        """Capture the bucket ladder of the signature a batch gets when every row
+        samples with these values. Buckets go in descending order so the smaller
+        ones reuse the pool of the larger ones."""
         if self._predictor_graph_enabled is None:
             self._predictor_graph_enabled = self._resolve_predictor_graph_enabled()
         if not self._predictor_graph_enabled:
             return 0
+        if do_sample:
+            max_top_k, has_top_p, has_unbounded_top_k = _predictor_signature_terms(
+                [int(top_k)],
+                [float(top_p)],
+                int(self.config.code_predictor_config.vocab_size),
+            )
+            signature = ("sampled", max_top_k, has_top_p, has_unbounded_top_k)
+        else:
+            signature = ("argmax", 0, False, False)
         started = time.perf_counter()
         captured_before = len(self._predictor_graphs)
         for bucket_size in reversed(self._predictor_graph_batch_sizes):

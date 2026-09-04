@@ -131,12 +131,11 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         subtalker = request_builders.resolve_subtalker_sampling(
             self.wrapper._merge_generate_kwargs()
         )
-        signature = model.uniform_predictor_graph_signature(
+        model.capture_predictor_graphs(
             do_sample=subtalker.do_sample,
             top_k=subtalker.top_k,
             top_p=subtalker.top_p,
         )
-        model.capture_predictor_graphs(signature)
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         model_runner_mod = importlib.import_module(
