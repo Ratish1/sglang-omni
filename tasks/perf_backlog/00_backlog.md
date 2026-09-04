@@ -24,31 +24,35 @@ Plans for items in this list are written as numbered docs in this folder.
    Owed before the PR: the bf16 slim A/B rerun with #1910 in both arms
    (doc 12 section 5), voice clone bf16 at c1, c16 and c32 with WER and
    UTMOS, and the MiniMax cookbook A/B (doc 09 section 7).
-3. T40, the speech tokenizer and codec decoder cuDNN plan per new length
+3. T22, the predictor chain kernel census and fusions (A.1). Two thirds of
+   the decode step's GPU time at c1 (doc 22 section 2). Profiling step in
+   `02_qwen3_tts_predictor_chain_census.md`, tool `scripts/perfkit.py`,
+   branch `perf/qwen3-tts-profiling`.
+4. T40, the speech tokenizer and codec decoder cuDNN plan per new length
    (A.1). 38 ms and 34 ms per new length at the run 3 medians (doc 22
    section 6). Measured at 68 to 81 ms per new length per side at c1
    (plan section 2). Plan: `01_qwen3_tts_length_plan_builds_plan.md`,
    Conditional on its section 9.
-4. A4, one greedy warmup request per stage before readiness, every model
+5. A4, one greedy warmup request per stage before readiness, every model
    (doc 19 section 9.5).
-5. T18, rebase `perf/step-ledger` onto upstream main and rerun the doc 15
+6. T18, rebase `perf/step-ledger` onto upstream main and rerun the doc 15
    fleet table on a quiet box with MiniMax (doc 18 section 5 item 1).
-6. E2 and T23, the talker per step host syncs and the decode buffer
+7. E2 and T23, the talker per step host syncs and the decode buffer
    rebuilds (A.3). Needs the fixed per sample seed in `run_bench.py`
    first (doc 05 section 7.5).
-7. T21, the code2wav final window graphs, after #1758 lands (doc 18
+8. T21, the code2wav final window graphs, after #1758 lands (doc 18
    section 5 item 4).
-8. T19, prefill graph buckets 1 and 2 on the Higgs and Qwen3-ASR builders,
+9. T19, prefill graph buckets 1 and 2 on the Higgs and Qwen3-ASR builders,
    unblocked now that #1915 landed (doc 18 section 5 item 6).
-9. T24, MOSS-TTS-Local and Delay uploads and the eager hash, after #1792
+10. T24, MOSS-TTS-Local and Delay uploads and the eager hash, after #1792
    lands (doc 18 section 5 item 7).
-10. Higgs codec graphs, bucketed capture over the reachable window shapes
+11. Higgs codec graphs, bucketed capture over the reachable window shapes
     (doc 18 section 5 item 8).
-11. Sampler candidates, after the per model sampler profile that doc 11
+12. Sampler candidates, after the per model sampler profile that doc 11
     section 3 makes the gate.
-12. PRs A to D on the Qwen3-Omni stage path (doc 05), each behind a
+13. PRs A to D on the Qwen3-Omni stage path (doc 05), each behind a
     decision the user owns (section 4 below).
-13. Reviews to post on other people's PRs (doc 18 section 5 item 9).
+14. Reviews to post on other people's PRs (doc 18 section 5 item 9).
 
 ## 2. Open items by area
 
