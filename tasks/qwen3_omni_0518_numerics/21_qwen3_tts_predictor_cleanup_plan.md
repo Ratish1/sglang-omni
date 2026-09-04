@@ -14,13 +14,21 @@ section 7, the startup capture of 6.3 now also builds cuDNN's attention
 plans in its warmups, and the gate of 8.3 compares against the cuDNN
 replay. The thread local plan cache note in 6.3 and tasks T39 and T40
 follow from the same doc. Slice A was implemented on
-`perf/qwen3-tts-predictor-capture` from upstream main on 2026-09-03 and
-validated by the final A/B (doc 23 records it). Two deviations from the
-text below were made on review: a startup capture failure raises and
-fails the boot, as sglang's capture does, instead of degrading like the
-lazy path, and the fused addmm policy (sm90 and not batch invariant) is
-resolved once with the graph policy instead of per call. The names in
-the code are `_predictor_capture_mode`, `_predictor_capture_session`,
+`perf/qwen3-tts-predictor-capture` from upstream main on 2026-09-03,
+validated by the A/B of doc 23, then rebuilt as a series of mechanical
+commits on `perf/qwen3-tts-predictor-startup-capture` (doc 24 records the
+A/B of the rebuild). The shipped code deviates from the text below in
+four places. A startup capture failure raises and fails the boot instead
+of degrading like the lazy path. There is no mode flag and no policy
+resolver: the eager path runs the same fused kernels as the graph, the
+mixed eager sampler and its staging fields are deleted, and the fused
+addmm reads `is_batch_invariant_mode_enabled()` and
+`get_bf16_gemm_backend().is_optimized()` at the call instead of an sm90
+pin, so `_resolve_predictor_graph_enabled` stays as it was. The subtalker
+sampling fallbacks moved into `resolve_subtalker_sampling` in
+`request_builders`, shared by the request path and the builder hook. The
+names in the code are `_predictor_capture_session`,
+`_capture_predictor_graph`, `capture_predictor_graphs`,
 `uniform_predictor_graph_signature` and `_predictor_signature_terms`.
 
 Task class: cross-boundary. The change crosses the model file, the engine
