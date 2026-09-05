@@ -27,10 +27,11 @@ Plans for items in this list are written as numbered docs in this folder.
    against the #1947 head: 1222 kernels per replay, c1 byte identical
    1088 of 1088, c1 median latency down 3.6%, c16 down 2.1%, and the
    c16 peak memory difference attributed by the 2026-09-05 allocator
-   snapshot to the vocoder's batch, not the series. Branch
-   `perf/qwen3-tts-predictor-chain` at `2c00eb688` with upstream main
-   merged, owed: the rerun on that base (doc 04 section 7 step 1), then
-   the PR. The slices after S1 are `04_qwen3_tts_decode_step_slices_plan.md`:
+   snapshot to the vocoder's batch, not the series. Rerun on the merged
+   base `2c00eb688` against upstream main `91e9c3095` on 2026-09-05 with
+   the same outcome (doc 03 section 12), PR body ready in
+   `pr_qwen3_tts_predictor_chain.md`, owed: open the PR. The slices
+   after S1 are `04_qwen3_tts_decode_step_slices_plan.md`:
    S2 rope writes the cache (160 kernels), S3 the residual add inside
    the norm (80), S4 the host tail after the E2 breakdown, S5 measured
    experiments, and the three experiments E0 to E2 that gate them.

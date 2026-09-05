@@ -464,9 +464,29 @@ On the box, in this order:
 
 ## 12. S1 as measured, H200 and H100, 2026-09-04 and 2026-09-05
 
-Both runs against the #1947 head `fff86552c` as arm A, the series head
-as arm B, the doc 02 protocol for the census and the doc 15 protocol for
-the A/B.
+The shipping measurement is the new base run of 2026-09-05 on H100: A is
+upstream main `91e9c3095`, B is `2c00eb688`, one fresh server per point,
+profiling off for the full corpus, archive
+`artifacts/qwen3-tts-chain-newbase-20260905-results.tar.gz`, PR body in
+`pr_qwen3_tts_predictor_chain.md`. Its numbers: 1371 to 1222 kernels per
+replay, replay wall 4.714 to 4.405 ms at 1 row and 5.258 to 4.706 at 16,
+c1 byte identical 1088 of 1088, c1 median latency down 3.2% and QPS up
+3.4%, c16 median down 4.0%, p95 down 6.3%, QPS up 3.8%, c16 errors 128
+(A) and 119 (B) over 11943 words and similarity 71.32 and 71.20, both
+inside the identical kernel spread of doc 24 section 3.2 (116 to 128
+errors, 71.18 to 71.32), GPU peak at c16 81055 MiB (A) and 80735 MiB
+(B), no lazy capture, fallback, retract or CUDA error in any log, 394
+unit tests. The census names the layer's 14 kernels: FlashInfer
+`RMSNormKernel`, the qkv GEMM, `fused_qknorm_warp`, `fused_rope_kernel`,
+two `elementwise_kernel` cache writes (2.18 and 1.73 us at 1 row, 2.43
+and 2.30 at 16), the cuDNN `sdpa_sm80_flash_fprop` kernel (flash for the
+key length 1 sub-step), the o_proj addmm, the norm, gate_up, `act_and_mul`,
+the split K down GEMM and its reduce, and the residual add
+`vectorized_elementwise_kernel` (1.09 us at 1 row, 1.12 at 16).
+
+The two earlier runs, both against the #1947 head `fff86552c` as arm A
+and the series head as arm B with the doc 02 protocol for the census and
+the doc 15 protocol for the A/B, agree with it:
 
 - Census, H100: 1371 to 1222 kernels per replay at 1 row and at 16 rows,
   the 149 the section 10 map derives (60 index copies, 74 elementwise,

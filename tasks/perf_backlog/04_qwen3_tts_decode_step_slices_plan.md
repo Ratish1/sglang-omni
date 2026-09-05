@@ -46,29 +46,54 @@ Rules that shape every slice:
 
 ## 2. Where the step goes today
 
-From the H100 run of S1 on 2026-09-05 (profiled window, the profiler adds
-about 1 ms of host time per step, doc 02 section 6):
+From the new base run of S1 on H100, 2026-09-05, arm B `2c00eb688`
+(census window with the profiler on, which adds about 1 ms of host time
+per step, doc 02 section 6):
 
-| 16 rows, per step | ms | share |
+| Per step at 16 rows | ms | share |
 | --- | ---: | ---: |
-| predictor replay wall | 4.71 | 53% |
-| host gaps, device idle | 2.75 | 31% |
-| backbone replay | 2.00 | 22% |
-| eager sampling and staging | 0.13 | 1% |
+| step wall p50 | 8.49 | |
+| predictor replay wall | 4.71 | 55% |
+| device idle in the step | 2.42 | 28% |
+| backbone replay busy | 2.00 | 24% |
+| eager sampling and staging | 0.12 | 1% |
 
 Kernels per predictor replay after S1: 1222 at 1 row and at 16 rows, from
-1371, the exact 149 the S1 design removes. Replay wall down 0.31 ms at 1
-row and 0.55 ms at 16. The c1 A/B was byte identical, 1088 of 1088 WAVs.
+1371, the exact 149 the S1 design removes (60 index copies, 74
+elementwise, 15 argmax). Replay wall 4.714 to 4.405 ms at 1 row and
+5.258 to 4.706 ms at 16. The c1 A/B was byte identical, 1088 of 1088
+WAVs, and the full corpus with profiling off ran 3.4% faster at c1 and
+3.8% at c16 (doc 03 section 12).
 
-A middle sub-step after S1 has 76 kernels: 3 to enter (the code copy, the
-fused codec embedding gather, the projection GEMM), 5 layers of 14
-(RMSNorm, qkv GEMM, fused qk norm, fused rope, the k write, the v write,
-the cuDNN attention, the o_proj GEMM with the residual in its epilogue,
-RMSNorm, gate_up GEMM, act_and_mul, the down GEMM as split K and its
-reduce, the residual add), and 3 to leave (final RMSNorm, head GEMM, the
-fused seeded sampler). The census counted 16 per layer, the two unnamed
-launches are inside the cuDNN attention call and are read from the new
-census by kernel name.
+A middle sub-step after S1 has 76 kernels: 3 to enter (the 32 byte code
+copy, the fused codec embedding gather, the projection GEMM with bias),
+5 layers of 14, and 3 to leave (final RMSNorm, head GEMM, the fused
+seeded sampler). The 14 of one layer, by census kernel name with the p50
+at 1 row and at 16 rows:
+
+| # | kernel | 1 row us | 16 rows us |
+| ---: | --- | ---: | ---: |
+| 1 | FlashInfer `RMSNormKernel` (sgl_kernel `rmsnorm`) | 1.50 | 1.66 |
+| 2 | qkv GEMM `nvjet_sm90_..._TNT` | 5.18 | 5.60 |
+| 3 | `sglang::fused_qknorm_warp` | 1.38 | 1.60 |
+| 4 | `sglang::fused_rope_kernel` | 1.60 | 1.76 |
+| 5 | k cache write, `at::native::elementwise_kernel` | 2.18 | 2.43 |
+| 6 | v cache write, `at::native::elementwise_kernel` | 1.73 | 2.30 |
+| 7 | cuDNN `sdpa_sm80_flash_fprop_wmma_f16` | 2.88 | 3.68 |
+| 8 | o_proj addmm `nvjet_sm90_..._badd_TNT` | 5.31 | 5.47 |
+| 9 | FlashInfer `RMSNormKernel` | 1.47 | 1.66 |
+| 10 | gate_up GEMM | 6.56 | 7.17 |
+| 11 | `sglang::act_and_mul_kernel` | 1.28 | 1.34 |
+| 12 | down GEMM `..._splitK_TNT` | 5.09 | 5.28 |
+| 13 | `cublasLt::splitKreduce_kernel` | 1.63 | 1.70 |
+| 14 | residual add `at::native::vectorized_elementwise_kernel` | 1.09 | 1.12 |
+
+The sub-step at key length 1 runs `pytorch_flash::flash_fwd_kernel`
+instead of cuDNN, which rejects a key length of 1 (sdp_utils.cpp:678-683),
+so the replay has 75 cuDNN and 5 flash attention kernels. The RMSNorm is
+FlashInfer's CUDA kernel through sgl_kernel, so the engine runs the
+shipped configuration and the norm path E1 must test is the FlashInfer
+one.
 
 The two targets of this plan are the replay, where each removed kernel
 saves its duration plus a 0.45 us gap, and the host gaps, which are the
@@ -252,11 +277,14 @@ eagerly (streaming_vocoder.py:379-396, :1190-1192, :1623-1633).
 | S4 | host tail: measure, then remove the dead passes | 0 | sized by E2 | bit identical |
 | S5 | measured experiments: small M GEMMs, sampler kernel, attention layout | 0 to 160 | unknown | each behind a micro benchmark |
 
-The expected numbers use the doc 02 census durations: the two cache
-writes are 1.9 and 2.1 us plus two gaps per layer instance, 80 instances
-per replay, and the residual add is one elementwise kernel of 1.7 us plus
-a gap, 80 per replay. They are estimates of the busy time removed, the
-census diff of section 6 is the measurement.
+The expected numbers use the section 2 census durations: the two cache
+writes are 2.18 and 1.73 us at 1 row (2.43 and 2.30 at 16) plus two gaps
+of 0.45 us per layer instance, 80 instances per replay, so S2 removes
+about 0.38 ms of replay wall at 1 row and 0.45 ms at 16. The residual add
+is 1.09 us at 1 row plus a gap, 80 per replay, so S3 removes about 0.12
+ms less whatever the fused norm costs over the plain one. These are
+estimates of the busy time removed, the census diff of section 6 is the
+measurement.
 
 ### 4.1 S2, rope writes the cache
 
@@ -523,9 +551,8 @@ in, and the census against the slice's own base run on the same day.
 ## 8. Open until measured
 
 - E0, E1, E2 results.
-- The two unnamed kernels per layer inside the cuDNN attention call,
-  from the new census's kernel names.
-- The kernel name of the predictor's RMSNorm in the census. If it is
-  `_rms_norm_kernel`, the engine ran under batch invariant mode and the
-  census run must be repeated with the shipped configuration.
 - The M1 number.
+
+Resolved by the 2026-09-05 census: the layer has exactly 14 kernels
+(section 2), and the RMSNorm is FlashInfer's kernel, so the census ran
+the shipped configuration.
