@@ -5466,6 +5466,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
         output_codes=[],
         pending_feedback_queue=[torch.ones(4)],
         pending_text_queue=[torch.zeros(4)],
+        decode_input_embeds=[],
         generation_steps=0,
         extra_model_outputs={},
     )

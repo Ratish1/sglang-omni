@@ -386,16 +386,11 @@ class QwenTalkerModelRunner(ModelRunner):
     def _data_has_next_decode_input(data: Any) -> bool:
         if data is None:
             return False
-        pending_feedback_queue = getattr(data, "pending_feedback_queue", None)
-        if not pending_feedback_queue:
+        if not data.pending_feedback_queue:
             return False
-        pending_text_queue = getattr(data, "pending_text_queue", None)
-        if pending_text_queue:
+        if data.pending_text_queue:
             return True
-        return bool(
-            data.thinker_chunks_done
-            and getattr(data, "tts_pad_embed", None) is not None
-        )
+        return bool(data.thinker_chunks_done and data.tts_pad_embed is not None)
 
     def _requests_ready_for_decode(self, requests: list) -> bool:
         return all(
@@ -424,7 +419,7 @@ class QwenTalkerModelRunner(ModelRunner):
 
     @staticmethod
     def _decode_input_history(data: Any) -> list[torch.Tensor]:
-        history = getattr(data, "decode_input_embeds", None)
+        history = data.decode_input_embeds
         if history is None:
             history = []
             data.decode_input_embeds = history
@@ -456,14 +451,10 @@ class QwenTalkerModelRunner(ModelRunner):
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """The feedback row and the text row of the next decode input, or None
         while either is still missing."""
-        feedback = QwenTalkerModelRunner._peek_left(
-            getattr(data, "pending_feedback_queue", None)
-        )
+        feedback = QwenTalkerModelRunner._peek_left(data.pending_feedback_queue)
         if feedback is None:
             return None
-        next_text = QwenTalkerModelRunner._peek_left(
-            getattr(data, "pending_text_queue", None)
-        )
+        next_text = QwenTalkerModelRunner._peek_left(data.pending_text_queue)
         if next_text is None:
             if not data.thinker_chunks_done:
                 return None
@@ -472,9 +463,8 @@ class QwenTalkerModelRunner(ModelRunner):
 
     @staticmethod
     def _pop_next_decode_inputs(data: Any) -> None:
-        QwenTalkerModelRunner._pop_left(getattr(data, "pending_feedback_queue", None))
-        if getattr(data, "pending_text_queue", None):
-            QwenTalkerModelRunner._pop_left(data.pending_text_queue)
+        QwenTalkerModelRunner._pop_left(data.pending_feedback_queue)
+        QwenTalkerModelRunner._pop_left(data.pending_text_queue)
 
     @staticmethod
     def _combine_feedback_with_next_text(
