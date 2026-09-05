@@ -10,14 +10,10 @@ Plans for items in this list are written as numbered docs in this folder.
 
 ## 1. Order
 
-1. Close the Qwen3-TTS predictor startup capture (A.1). The branch is at
-   `3d020c85f`, the same change rebased onto upstream `556166dde` and
-   validated as `d7e34a16c` on the previous base: 348 unit tests, c1 byte
-   identical with the order swapped, c16 first batch 2.5 s per request
-   faster and steady state flat. A main warmup 1 control still captured
-   five buckets inside serving. PR #1947 open, body in
-   `pr_qwen3_tts_predictor_startup_capture.md`. Owed: CI on the rebased
-   head.
+1. Done. The Qwen3-TTS predictor startup capture (A.1) merged as #1947
+   on 2026-09-05, upstream main `f259cd7fa`, after the sm90 pin was
+   dropped from the fused addmm gate at review. Body in
+   `pr_qwen3_tts_predictor_startup_capture.md`.
 2. Observed KV reservation on the Qwen3-Omni talker (A.3). Implemented on
    `perf/observed-kv-reservation` at `81a87e474`, measured at +25% qps at
    c16 and +43% at c32 on the bf16 colocated profile (doc 08 section 1).
@@ -26,13 +22,22 @@ Plans for items in this list are written as numbered docs in this folder.
    UTMOS, and the MiniMax cookbook A/B (doc 09 section 7).
 3. T22, the predictor chain (A.1). Census and timeline done on H100
    (`02_qwen3_tts_predictor_chain_census.md`): 1371 kernels per replay
-   bound by kernel count, and a 1.1 to 1.4 ms host tail per step. Plan in
-   `03_qwen3_tts_predictor_chain_plan.md`. S1 implemented and reviewed
-   on `perf/qwen3-tts-predictor-chain` at `1d047d541` (13 commits, plan
-   section 11, no chosen number left in the series), untested on the box,
-   expected bit identical, about 6% of the step. Tool `scripts/perfkit.py`,
-   branch `perf/qwen3-tts-profiling` at `93684aa0b` (ledger plus S1) for
-   the census diff.
+   bound by kernel count, and a 1.1 to 1.4 ms host tail per step. S1
+   (`03_qwen3_tts_predictor_chain_plan.md`) validated on H200 and H100
+   against the #1947 head: 1222 kernels per replay, c1 byte identical
+   1088 of 1088, c1 median latency down 3.6%, c16 down 2.1%, and the
+   c16 peak memory difference attributed by the 2026-09-05 allocator
+   snapshot to the vocoder's batch, not the series. Branch
+   `perf/qwen3-tts-predictor-chain` at `2c00eb688` with upstream main
+   merged, owed: the rerun on that base (doc 04 section 7 step 1), then
+   the PR. The slices after S1 are `04_qwen3_tts_decode_step_slices_plan.md`:
+   S2 rope writes the cache (160 kernels), S3 the residual add inside
+   the norm (80), S4 the host tail after the E2 breakdown, S5 measured
+   experiments, and the three experiments E0 to E2 that gate them.
+   Research reports with anchors in `research/`. Tools:
+   `scripts/perfkit.py` (census, timeline, memory, snapshot), branch
+   `perf/qwen3-tts-profiling` at `7898e244e` (ledger, S1, the allocator
+   snapshot hook, upstream main merged).
 4. T40, the speech tokenizer and codec decoder cuDNN plan per new length
    (A.1). 38 ms and 34 ms per new length at the run 3 medians (doc 22
    section 6). Measured at 68 to 81 ms per new length per side at c1
@@ -65,9 +70,11 @@ Plans for items in this list are written as numbered docs in this folder.
 
 | Item | Source | Status | Blocker or hold |
 | --- | --- | --- | --- |
-| Slice A, startup capture and capture hygiene | doc 21 section 7.1, docs 23 and 24 | implemented, validated twice, no PR, branch `perf/qwen3-tts-predictor-startup-capture` at `4f43776fe` | the three runs of doc 24 section 7 |
-| Slice B, predictor attention on sglang's `decode_attention_fwd` | doc 21 section 7.2, gate G1 in 8.3 | not written | doc 22 section 7 expects the gate to close it |
-| T22, one launch masked attention over the fixed 17 slot cache | doc 17 section 7, doc 21 section 6.7 | deferred, not rejected | only if Slice B closes on the gate |
+| Slice A, startup capture and capture hygiene | doc 21 section 7.1, docs 23 and 24 | merged as #1947 on 2026-09-05 | none |
+| Slice B, predictor attention on sglang's `decode_attention_fwd` | doc 21 section 7.2, gate G1 in 8.3 | closed: two launches per attention against one cuDNN kernel, and doc 04 S2 keeps cuDNN on a slot major cache | none |
+| T22, one launch masked attention over the fixed 17 slot cache | doc 17 section 7, doc 21 section 6.7 | deferred, not rejected | only if the S2 census shows the cuDNN kernel as a target |
+| S2 to S5 of doc 04, the decode step slices after S1 | doc 04 sections 4 and 5 | planned, gated by E0, E1, E2 | the box session of doc 04 section 7 step 2 |
+| M1, the non streaming vocoder decodes whole utterances in batches of 8 with no bound on total audio | doc 04 section 4.5 | named, measurement first | a long input c16 allocator snapshot |
 | T40, tokenizer and vocoder cuDNN plan per new length | doc 21 section 10, doc 22 sections 3 and 6 | open, decided after Slice A | none |
 | T29, PyTorch issue on the cuDNN SDPA plan per batch and key length | doc 20 section 10 | open, evidence on `perf/qwen3-tts-cudnn-attention` | none |
 | T30 and A5, the cuDNN policy on the Qwen3-Omni talker predictor and the MOSS-TTS attentions | doc 20 section 10, doc 19 section 9.1 | open | one trace per model first (T26), and no blanket cuDNN disable after doc 22 |

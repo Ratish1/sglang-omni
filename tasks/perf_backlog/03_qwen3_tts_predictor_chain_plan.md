@@ -1,15 +1,15 @@
 # 03. Qwen3-TTS predictor chain: fewer kernels in the replay, a shorter tail (T22)
 
-Status: S1 implemented, untested on the box. Branch
-`perf/qwen3-tts-predictor-chain` at `fd16b0e05`, five commits on the
-startup capture head, pushed 2026-09-04. `perf/qwen3-tts-profiling` at
-`892c4b5cc` carries the ledger plus the same five commits for the census
-diff. Section 11 has what to run. Slices S1 and B1 are fully specified
-from the census and the code. S2 and S3 carry a numerics gate whose band is measured in
-S1. B3 is a measurement that decides whether the graph launch cost is a
-third target. Evidence: doc 02 sections 6 and 8 (the H100 census and
-timeline of 2026-09-04, branch `perf/qwen3-tts-profiling`), and the code
-at `perf/qwen3-tts-predictor-startup-capture` head `fff86552c`.
+Status: S1 validated on H200 and H100 against the #1947 head (section
+12), branch `perf/qwen3-tts-predictor-chain` at `2c00eb688` with upstream
+main `91e9c3095` merged, owed the rerun on that base before the PR.
+`perf/qwen3-tts-profiling` at `7898e244e` carries the ledger, the same
+series, the allocator snapshot hook and the merge. The slices after S1
+are re planned in `04_qwen3_tts_decode_step_slices_plan.md` from the
+verified mechanics, which supersedes sections 3 to 7 of this doc for S2
+onward. Evidence: doc 02 sections 6 and 8 (the H100 census and timeline
+of 2026-09-04), and the code at `perf/qwen3-tts-predictor-startup-capture`
+head `fff86552c`.
 
 ## 1. Requirement
 
@@ -461,3 +461,36 @@ On the box, in this order:
    `torch.cuda.max_memory_allocated` at profiler stop. Expected: arm B
    above arm A by no more than the live rows of the run, and a long
    request outliving its batch is the case that shows the bound.
+
+## 12. S1 as measured, H200 and H100, 2026-09-04 and 2026-09-05
+
+Both runs against the #1947 head `fff86552c` as arm A, the series head
+as arm B, the doc 02 protocol for the census and the doc 15 protocol for
+the A/B.
+
+- Census, H100: 1371 to 1222 kernels per replay at 1 row and at 16 rows,
+  the 149 the section 10 map derives (60 index copies, 74 elementwise,
+  15 argmax). Replay wall down 0.31 ms at 1 row and 0.55 ms at 16.
+- A/B, H100: c1 byte identical, 1088 of 1088 WAVs. c1 median latency
+  down 3.6% (QPS up 3.5%), c16 median down 2.1% (QPS up 1.7%). c16 p99
+  up 0.9% and c16 WER up 0.025 points, both inside the doc 24 section 3
+  band, and the filtered WER equal.
+- Step composition at 16 rows on H100 in the profiled window: predictor
+  replay 4.71 ms (53%), host gaps 2.75 ms (31%), backbone 2.00 ms,
+  sampling and staging 0.13 ms.
+- The tail. Section 4 attributed the per row feedback launches to most
+  of the 1.1 to 1.4 ms tail. Measured, the batched write saved 0.03 to
+  0.15 ms. The rest of the tail is the scheduler's host work between
+  launches, the sglang forward batch build, the graph buffer fill, the
+  result loop and the output streamer, none of which the series
+  touches. Doc 04 section 4.3 and its E2 measurement take that over.
+- Memory. Arm B's c16 peak was 724 MiB above arm A on H100 with one
+  allocator retry in the first run and none in the second. The
+  process wide allocator snapshot of 2026-09-05 (profiling branch hook,
+  `perfkit.py snapshot`) attributes the largest allocation of both arms
+  to the same cuDNN convolution of the vocoder's whole utterance decode
+  at different batch sizes, 549 MiB and 765 MiB, with start and end
+  allocated memory equal across arms. The series allocates only the 64
+  KB history clone per step at 16 rows. The difference is which
+  requests finish together, run to run, not the series. The exposure
+  itself is doc 04 item M1.
