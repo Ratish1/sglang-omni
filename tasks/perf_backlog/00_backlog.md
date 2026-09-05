@@ -29,8 +29,9 @@ Plans for items in this list are written as numbered docs in this folder.
    c16 peak memory difference attributed by the 2026-09-05 allocator
    snapshot to the vocoder's batch, not the series. Rerun on the merged
    base `2c00eb688` against upstream main `91e9c3095` on 2026-09-05 with
-   the same outcome (doc 03 section 12), PR body ready in
-   `pr_qwen3_tts_predictor_chain.md`, owed: open the PR. The slices
+   the same outcome (doc 03 section 12). PR #1971 opened 2026-09-05 with
+   the body in `pr_qwen3_tts_predictor_chain.md`, owed: CI and review.
+   The slices
    after S1 are `04_qwen3_tts_decode_step_slices_plan.md`:
    S2 rope writes the cache (160 kernels), S3 the residual add inside
    the norm (80), S4 the host tail after the E2 breakdown, S5 measured
