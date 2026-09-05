@@ -288,6 +288,20 @@ measurement.
 
 ### 4.1 S2, rope writes the cache
 
+Status: implemented as one commit, `ccfc4af45` on
+`perf/qwen3-tts-predictor-rope-store`, stacked on the S1 PR head
+`8c8ae636b` (PR #1971) because S1 is not merged yet. Its A/B arm A is
+that S1 head, so the gain is S2's alone. Owed: the box run of section
+7 step 3. The gate is `_resolve_predictor_rope_store`, resolved once in
+`__init__` from the first predictor layer's attention. E0 is the
+accelerator test `test_rope_store_writes_the_cache_the_copy_path_writes`,
+head dim 64, batch 1 and 16, every slot. One numerics point the design
+below did not state: the store is bit identical by the kernel contract,
+but the attention now reads the cache through a transposed view with
+different strides, so cuDNN may choose a different kernel for it. The
+census kernel name (today `sdpa_sm80_flash_fprop_wmma_f16_knob_2_64x32x128`)
+says whether it did, and G1 decides identity either way.
+
 Design. Change the private cache to slot major,
 `[layers, max_batch, predictor_len, kv_heads, head_dim]`, and let
 sglang's rope kernel store k and v into it through
@@ -535,14 +549,21 @@ its result is recorded in this doc.
 
 ## 7. Order and branches
 
-1. S1 PR after its H100 rerun on the new base (doc 03 section 11 for
-   what to run, the commands are in the 2026-09-05 protocol).
-2. E0, E1, E2 in one box session on the profiling branch.
-3. S2 on `perf/qwen3-tts-predictor-rope-store` from upstream main.
-4. S3 on `perf/qwen3-tts-predictor-fused-residual` from upstream main.
-   S2 and S3 touch different functions and can be written in parallel,
-   they are measured separately.
-5. S4 on `perf/qwen3-tts-decode-host-tail` from upstream main, after E2.
+1. Done: S1 is PR #1971 on the new base run of doc 03 section 12.
+2. E1 and E2 in one box session on the profiling branch. E0 became the
+   S2 accelerator test and runs with the S2 unit tests.
+3. S2 on `perf/qwen3-tts-predictor-rope-store` at `ccfc4af45`, stacked on
+   the S1 head `8c8ae636b`. Box run: `pytest tests/unit_test/qwen3_tts -q`
+   on the S2 head, the census on both heads at 1 and 16 rows, the full
+   corpus A/B with arm A the S1 head and arm B the S2 head, c1 and c16,
+   the same protocol as the S1 run. Expected: 1222 to 1062 kernels per
+   replay, `fused_rope_store_kernel` in place of `fused_rope_kernel` and
+   the two `elementwise_kernel` cache writes gone, c1 byte identical if
+   cuDNN keeps its kernel.
+4. S3 on `perf/qwen3-tts-predictor-fused-residual`, stacked the same way,
+   after E1. S2 and S3 touch different functions and are measured
+   separately.
+5. S4 on `perf/qwen3-tts-decode-host-tail`, after E2.
 6. S5 items as their measurements come in. M1 as its own plan.
 
 Measurement runs use `perf/qwen3-tts-profiling` with the slice merged
