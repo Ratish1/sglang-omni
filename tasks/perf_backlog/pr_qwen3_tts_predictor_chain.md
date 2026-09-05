@@ -10,16 +10,19 @@ This branch removes that work. The replayed kernels that remain are the same ker
 
 - `prepare_decode_buffers` stages the subtalker temperature already clamped to the sampler's floor, so the sub-steps read it without a kernel.
 - The seed positions of the 15 sub-steps of one decode position are one table computed once per predictor call, `_sub_seed_positions`, and each sub-step passes its row to the sampler. The sampler reads temperatures, top k, top p and seeds as slices of the staged buffers, which are views, in place of the four `index_select` copies through the identity index. `_sub_identity_row_indices_tensor` and `_select_semantic_positions` go away with the copies.
-- A fifth graph signature term, whether the batch has argmax rows. The graph of a batch where every row samples returns the sampled tokens and runs no argmax and no `where`. A mixed batch keeps today's path under its own key. `prepare_decode_buffers` sets the term, the capture state saves and restores it in signature order, and the startup capture builds both variants of the default signature, so a mixed batch never captures inside a serving step. The startup log reads `Captured 12 Qwen3-TTS predictor CUDA graphs for signatures=[...] in 3.3 s`, against 6 in 2.8 s before, with the same key budget.
-- `_write_feedback_buffers` stacks the staged feedback rows and the next text rows of the whole batch and adds them in one call, four launches per step in place of one per row plus the stack. Rows without a staged feedback row, the first decode after a prefill or a retract re-prefill, keep the per row embedding of their token id. The rule that decides which rows have a staged input lives in `QwenTalkerModelRunner._peek_next_decode_inputs` and `_pop_next_decode_inputs`, and the Qwen3-Omni per row helper is written on the same two functions. The history rows a retracted request replays are views of one clone per step.
+- A fifth graph signature term, whether the batch has argmax rows. The graph of a batch where every row samples returns the sampled tokens and runs no argmax and no `where`. A mixed batch keeps today's path under its own key. `prepare_decode_buffers` sets the term, the capture state saves and restores it in signature order, and the startup capture builds both variants of the default signature, so a mixed batch never captures inside a serving step. The mixed variant skips bucket 1, which no batch can reach, so the default ladder of six buckets captures 11 graphs against 6 before.
+- The startup set is captured whole. The cap of 32 keys that predates this branch now bounds the captures beyond the startup set, the ones a client's own sampling values trigger, in place of the whole cache. Before, a ladder of more than 16 buckets, which a running cap above 96 or a dense explicit bucket list produces, filled the cap during startup and left the smaller mixed buckets and every later signature eager for the life of the server. The constant is `_PREDICTOR_GRAPH_MAX_LAZY_KEYS` and the warning names the keys beyond the startup set.
+- A frame whose rows all take the argmax builds no seed position table: the table only feeds the sampler, and the flag that decides it is already a term of the graph signature.
+- `_write_feedback_buffers` stacks the staged feedback rows and the next text rows of the whole batch and adds them in one call, four launches per step in place of one per row plus the stack. Rows without a staged feedback row, the first decode after a prefill or a retract re-prefill, keep the per row embedding of their token id. The rule that decides which rows have a staged input lives in `QwenTalkerModelRunner._peek_next_decode_inputs` and `_pop_next_decode_inputs`, and the Qwen3-Omni per row helper is written on the same two functions.
+- The history rows a retracted request replays are views of one clone per step, so a request holds the clone of every step it ran in. While a request advances with the batch, the clones alive are those of the last max_new_tokens steps, at most 16 rows of 4 KiB each at the defaults, 128 MiB for 2048 tokens, the same ceiling the per row allocation had. A request that leaves the running batch, by KV retraction or by the retract pause, would keep every clone of its run alive while it waits, so the scheduler copies its rows into storage of their own before it requeues them, one stack per retraction, on a path that already pays a full re-prefill. `OmniScheduler._add_request_to_queue` wraps the upstream method for that.
 
-No new kernel, no new configuration, no chosen constant. The temperature floor of 1e-5 moved from a kernel on the device to the host staging with the same value.
+No new kernel, no new configuration, no chosen constant. The temperature floor of 1e-5 moved from a kernel on the device to the host staging with the same value, and a test stages temperatures at zero, below, at and above the floor against the former device order of conversion then clamp.
 
 ## Test results
 
 H100 80GB HBM3, driver 580.126.20, CUDA 13.0, SGLang 0.5.18, torch 2.13.0, `Qwen/Qwen3-TTS-12Hz-1.7B-Base`, default engine config. `pytest tests/unit_test/qwen3_tts -q`: 394 passed.
 
-A is upstream main `91e9c3095`, B is this branch with that main merged, `2c00eb688`.
+A is upstream main `91e9c3095`, B is this branch with that main merged, `2c00eb688`. The commits after `2c00eb688` are host Python and tests: the direct field reads in the talker runner (8 insertions, 18 deletions), the review fixes above, and their tests. The device path of the replay is unchanged by them, and a later census of `8c8ae636b`, the head after the field reads, counted the same 1222 kernels per replay at 1 and 16 rows with the same kernel names.
 
 Kernel census of the predictor replay, torch profiler window of 12 requests at c1 and 192 at c16, one fresh server per arm, one unprofiled warmup request:
 
@@ -64,3 +67,42 @@ At c16 the batch composition differs between arms, so every sample's audio diffe
 Memory, GPU total sampled once a second including startup: c1 76863 MiB (A) and 76887 MiB (B), c16 81055 MiB (A) and 80735 MiB (B). A process wide allocator snapshot of the c16 window on both arms showed equal allocated memory at start and end and no out of memory event on either arm.
 
 Serving logs: no lazy capture, no fallback to eager, no retract, no CUDA error on either arm at either concurrency.
+
+## Reproduction
+
+One arm at a time, each arm a checkout selected by `PYTHONPATH`, one fresh server per point, `CUDA_VISIBLE_DEVICES` set to the one GPU, GPU memory sampled once a second from before the server starts:
+
+```bash
+nvidia-smi -i $GPU --query-gpu=timestamp,index,memory.used,utilization.gpu --format=csv -l 1 > mem.csv &
+python -m sglang_omni.cli serve --model-path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --config examples/configs/qwen3_tts_1_7b.yaml --host 127.0.0.1 --port 31001
+```
+
+Full corpus point at concurrency C, generation only, then scoring against the same output directory:
+
+```bash
+python -m benchmarks.eval.benchmark_tts_seedtts --generate-only --use-existing-server \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --meta zhaochenyang20/seed-tts-eval-arrow \
+  --ref-format references --lang en --seed 1234 --warmup 0 --port 31001 \
+  --max-concurrency $C --output-dir $DIR
+python -m benchmarks.eval.benchmark_tts_seedtts --transcribe-only \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --meta zhaochenyang20/seed-tts-eval-arrow --lang en \
+  --asr-model-path Qwen/Qwen3-ASR-1.7B --asr-concurrency 1 --port 31010 --output-dir $DIR
+python -m benchmarks.eval.benchmark_tts_seedtts --similarity-only \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --meta zhaochenyang20/seed-tts-eval-arrow --lang en \
+  --device cuda:0 --output-dir $DIR
+```
+
+Kernel census: one unprofiled request first (`--max-samples 1`), then a torch profiler window of 12 requests per concurrency unit opened and closed through the server, and the trace reduced by the census script shipped with the results archive at `tools/tasks/qwen3_omni_0518_numerics/scripts/perfkit.py`:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:31001/start_profile -H 'Content-Type: application/json' \
+  -d '{"run_id":"census_c'$C'","event_dir":"'$DIR'/events","enable_torch":true,"trace_path_template":"'$DIR'/trace_{stage}"}'
+python -m benchmarks.eval.benchmark_tts_seedtts ... --max-concurrency $C --max-samples $((C*12)) --output-dir $DIR/bench
+curl -fsS -X POST http://127.0.0.1:31001/stop_profile -H 'Content-Type: application/json' -d '{"run_id":"census_c'$C'"}'
+python perfkit.py ingest $DIR/*.trace.json.gz -o $DIR/tts_engine.pkl
+python perfkit.py census $DIR/tts_engine.pkl --rows $C --json $DIR/census.json
+python perfkit.py diff A/census_c$C/census.json B/census_c$C/census.json
+```
+
+WAV identity at c1 is the SHA256 of every generated file in A against B.
