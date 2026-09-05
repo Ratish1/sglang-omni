@@ -288,13 +288,23 @@ measurement.
 
 ### 4.1 S2, rope writes the cache
 
-Status: implemented as one commit, `ccfc4af45` on
+Status: implemented, `ccfc4af45` and `cbf6c31d3` on
 `perf/qwen3-tts-predictor-rope-store`, stacked on the S1 PR head
 `8c8ae636b` (PR #1971) because S1 is not merged yet. Its A/B arm A is
 that S1 head, so the gain is S2's alone. Owed: the box run of section
-7 step 3. The gate is `_resolve_predictor_rope_store`, resolved once in
-`__init__` from the first predictor layer's attention. E0 is the
-accelerator test `test_rope_store_writes_the_cache_the_copy_path_writes`,
+7 step 3. For this model the store path is a certainty, not a choice:
+the code predictor's config sets no rope scaling and head dim 128, so
+its rotary is sglang's plain `RotaryEmbedding` on the CUDA fast kernel,
+and that kernel's store variant is the one that writes the cache. The
+gate `_resolve_predictor_rope_store` exists for the other platforms this
+model runs on in the tree (CPU, MPS, XPU, ROCm through the fallback
+kernel), whose rotary forwards assert the store argument is None
+(rotary_embedding/base.py:243-245, :420-422). Its three terms are the
+device, the attention's own non MRoPE flag, and the rotary's fallback
+flag. The bf16 term of the first cut was copied from sglang's pool gate,
+which exists for fp8 pools, and was dropped: the JIT rope module is
+templated on the k dtype and the cache dtype equals k's by construction.
+E0 is the accelerator test `test_rope_store_writes_the_cache_the_copy_path_writes`,
 head dim 64, batch 1 and 16, every slot. One numerics point the design
 below did not state: the store is bit identical by the kernel contract,
 but the attention now reads the cache through a transposed view with
