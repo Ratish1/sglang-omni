@@ -62,6 +62,13 @@ data is the real moss_tts and moss_tts_local class. The commit is local until pu
 
 Both lanes need the branch head pushed. A is `7989a5ed2` in both lanes.
 
+Correction after the 2026-09-06 run (readout 08): the lanes may share the host only for
+suites, probes, coverage, census and retraction checks. Every full corpus A/B point runs alone
+on the host, with a host gate recorded before each boot (every GPU at 0 MiB and 0 percent,
+the load average, `dmesg -T | tail`), two boots per arm and point. The Qwen3-TTS decode loop
+waits on the host for a third of its step, so a concurrent 30B boot or a foreign tenant lands
+in its qps.
+
 ### Lane 1, Qwen3-TTS, one H100
 
 Runbook 06 in this order, shortest first so the long A/B runs last:
@@ -97,6 +104,10 @@ Read against the recorded noise floor: two identical c16 runs of the same 50 req
 by 9 percent in qps (`06_e0_talker_step.md:31-34`), so c1 latency is the metric that can
 resolve a per step host change, and c16 and c32 are regression guards, not a measurement of
 the helpers. Serve logs of B: no exception, no `AttributeError`.
+
+The 50 sample points are the smoke. The measurement is the full corpus, 1088 samples, on the
+same fp8 server, c1, c16 and c32, two boots per arm and point, alone on the host, then WER
+and UTMOS through the same two scoring passes (commands in readout 08 §4).
 
 3. Qwen3-Omni talker retraction, both arms, bf16 colocated with the test switch scoped to the
 talker stage through the stage env, the form the earlier run used (`08_ab_reservation.md`

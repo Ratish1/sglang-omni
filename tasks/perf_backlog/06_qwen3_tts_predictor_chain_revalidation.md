@@ -93,13 +93,18 @@ Then on that server, sampled and mixed traffic:
 
 ```bash
 bench 16 $OUT/B/cov_c16_mixed --max-samples 192 --subtalker-dosample-ratio 0.5
-bench 16 $OUT/B/cov_c16_topk64 --max-samples 64 --top-k 64
 ```
 
+The lazy signature needs the subtalker's top k, which the benchmark's `--top-k` does not set
+(that flag is the backbone's). Send 64 requests with `stage_params.tts_engine.subtalker_top_k`
+64 in the request, as the archive's `bench_subtalker_topk64.py` does.
+
 Expected: no `holds N keys beyond the startup set` warning, no `Disabling Qwen3-TTS predictor
-CUDA graph`, and exactly one `Captured Qwen3-TTS predictor CUDA graph for key=(16, 'sampled',
-64, ...)` line for the top k run, that is one lazy capture inside a budget that startup no
-longer consumes. The mixed run replays the startup mixed keys and captures nothing.
+CUDA graph`, and one `Captured Qwen3-TTS predictor CUDA graph for key=(<bucket>, 'sampled',
+64, ...)` line per bucket the run reaches, lazy captures inside a budget that startup no longer
+consumes. The mixed run replays the startup mixed keys and captures nothing. The 2026-09-06 run
+met the capture expectations and failed 2 of 64 requests inside cuDNN with the card full
+(readout 08), which the memory provisioning slice has to clear before this gate can pass.
 
 ## 4. The argmax graph (F3)
 
