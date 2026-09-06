@@ -1054,7 +1054,9 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     monkeypatch.setattr(
         cuda_graph_batch_validator,
         "attest_prefill_cuda_graphs",
-        lambda runner, args: attest_calls.append((runner, args)),
+        lambda runner, *, operator_selected: attest_calls.append(
+            (runner, operator_selected)
+        ),
     )
     monkeypatch.setattr(
         hf_transformers_utils, "get_tokenizer", lambda *a, **k: object()
@@ -1092,7 +1094,7 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     assert captured["capture_hidden_layers"] == ([0, 24] if speech_enabled else None)
     assert captured["defer_cuda_graph_capture"] is speech_enabled
     assert graph_init_workers == ([model_worker] if speech_enabled else [])
-    assert attest_calls == [(model_worker.model_runner, server_args)]
+    assert attest_calls == [(model_worker.model_runner, False)]
     assert len(output_proc_kwargs) == 1
     output_args = output_proc_kwargs[0]
     assert output_args["capture_hidden"] is speech_enabled

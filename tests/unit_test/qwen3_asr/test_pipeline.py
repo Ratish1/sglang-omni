@@ -521,8 +521,8 @@ def _patch_engine_dependencies(
     monkeypatch.setattr(
         cuda_graph_batch_validator,
         "attest_prefill_cuda_graphs",
-        lambda model_runner, server_args: recorded.attest_calls.append(
-            (model_runner, server_args)
+        lambda model_runner, *, operator_selected: recorded.attest_calls.append(
+            (model_runner, operator_selected)
         ),
     )
     return recorded
@@ -645,9 +645,9 @@ def test_qwen3_asr_ladder_respects_deployment_cap_overrides(
         "dummy", server_args_overrides=dict(cap_override)
     )
 
-    _, attested = recorded.attest_calls[-1]
-    assert max(attested.cuda_graph_config.prefill.bs) == expected_cap
-    assert attested.cuda_graph_config.prefill.max_bs == expected_cap
+    assert len(recorded.attest_calls) == 1
+    assert max(recorded.build_kwargs["cuda_graph_bs_prefill"]) == expected_cap
+    assert recorded.build_kwargs["cuda_graph_max_bs_prefill"] == expected_cap
 
 
 @pytest.mark.parametrize(
@@ -686,6 +686,6 @@ def test_qwen3_asr_nested_prefill_override_supersedes_the_derived_ladder(
         },
     )
 
-    _, attested = recorded.attest_calls[-1]
-    assert list(attested.cuda_graph_config.prefill.bs) == [128, 256]
-    assert attested.cuda_graph_config.prefill.max_bs == 256
+    assert recorded.attest_calls[-1][1] is True
+    assert list(recorded.build_kwargs["cuda_graph_bs_prefill"]) == [128, 256]
+    assert recorded.build_kwargs["cuda_graph_max_bs_prefill"] == 256

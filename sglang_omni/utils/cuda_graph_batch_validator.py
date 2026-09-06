@@ -267,12 +267,12 @@ def read_model_buffer_capacity(model: object) -> tuple[int | None, str]:
     return smallest, source
 
 
-def attest_prefill_cuda_graphs(model_runner: Any, server_args: Any) -> None:
+def attest_prefill_cuda_graphs(model_runner: Any, *, operator_selected: bool) -> None:
     """Assert captured prefill graphs match an explicit or realized policy.
 
-    An operator-locked backend must materialize or fail startup. An unlocked
-    model default retains SGLang's auto-selection semantics and may fall back
-    to eager at capture-time safety gates such as insufficient free memory.
+    An operator-selected backend must materialize or fail startup. A model
+    default keeps SGLang's auto-selection semantics and may fall back to eager
+    at capture-time safety gates such as insufficient free memory.
     """
     from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
         PrefillCudaGraphRunner,
@@ -282,7 +282,7 @@ def attest_prefill_cuda_graphs(model_runner: Any, server_args: Any) -> None:
     # init_cuda_graphs always assigns this before attestation runs.
     runner = model_runner.prefill_cuda_graph_runner
     if not isinstance(runner, PrefillCudaGraphRunner):
-        if ("prefill", "backend") not in server_args._cuda_graph_config_locked:
+        if not operator_selected:
             logger.warning(
                 "auto-selected prefill CUDA graph backend %r did not capture; "
                 "using SGLang's eager prefill fallback",

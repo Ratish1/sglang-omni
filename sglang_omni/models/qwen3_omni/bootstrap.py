@@ -19,6 +19,7 @@ def create_thinker_scheduler(
     prefill_coalesce_requests: int = 0,
     prefill_coalesce_wait_ms: float = 60.0,
     prefill_coalesce_when_idle: bool = False,
+    operator_selected_prefill_backend: bool = False,
 ):
     """Create the Qwen thinker scheduler."""
     from sglang.srt.arg_groups.model_override_base import resolved_view
@@ -81,7 +82,8 @@ def create_thinker_scheduler(
 
     if prefill_graph_backend == CudaGraphBackend.BREAKABLE:
         cuda_graph_batch_validator.attest_prefill_cuda_graphs(
-            model_worker.model_runner, server_args
+            model_worker.model_runner,
+            operator_selected=operator_selected_prefill_backend,
         )
 
     def _should_generate_qwen_audio_output(request: Any) -> bool:

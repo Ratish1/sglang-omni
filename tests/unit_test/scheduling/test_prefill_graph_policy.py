@@ -429,8 +429,7 @@ def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
     from sglang_omni.utils import cuda_graph_batch_validator
 
     infra_kwargs_seen: list[dict[str, Any]] = []
-    attest_calls: list[tuple[Any, Any]] = []
-    backend_locks_seen: list[bool] = []
+    attest_calls: list[tuple[Any, bool]] = []
 
     def fake_build_sglang_server_args(checkpoint_dir, *, context_length, **overrides):
         del checkpoint_dir, context_length
@@ -447,11 +446,8 @@ def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
         )
 
     def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):
-        del gpu_id
+        del gpu_id, server_args
         infra_kwargs_seen.append(dict(kwargs))
-        backend_locks_seen.append(
-            ("prefill", "backend") in server_args._cuda_graph_config_locked
-        )
         model_runner = SimpleNamespace(
             model=SimpleNamespace(),
             init_cuda_graphs=lambda: None,
@@ -470,8 +466,8 @@ def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
             "model_config",
         )
 
-    def fake_attest(model_runner, server_args) -> None:
-        attest_calls.append((model_runner, server_args))
+    def fake_attest(model_runner, *, operator_selected: bool) -> None:
+        attest_calls.append((model_runner, operator_selected))
 
     monkeypatch.setattr(
         sglang_backend, "build_sglang_server_args", fake_build_sglang_server_args
@@ -521,13 +517,12 @@ def test_builder_wires_payload_slot_and_attestation(monkeypatch) -> None:
     )
 
     assert infra_kwargs_seen[-1]["enable_prefill_input_embeds"] is True
-    assert backend_locks_seen[-1] is True
+    assert attest_calls[-1][1] is True
     assert len(attest_calls) == 1
 
     PolicyBuilder().build("model")
 
     assert "enable_prefill_input_embeds" not in infra_kwargs_seen[-1]
-    assert backend_locks_seen[-1] is False
     assert len(attest_calls) == 1
 
 

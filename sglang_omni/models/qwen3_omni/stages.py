@@ -32,6 +32,7 @@ from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
+    operator_selected_prefill_backend,
     validate_generation_batch_policy,
 )
 from sglang_omni.scheduling.sglang_backend import (
@@ -1121,6 +1122,9 @@ def create_sglang_thinker_executor_from_config(
         prefill_coalesce_requests=prefill_coalesce_requests,
         prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
         prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+        operator_selected_prefill_backend=operator_selected_prefill_backend(
+            server_args_overrides
+        ),
     )
     from sglang.srt.runtime_context import get_schedule
 

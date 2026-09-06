@@ -110,6 +110,17 @@ def nested_prefill_overrides(overrides: Mapping[str, Any]) -> Mapping[str, Any]:
     return prefill_config if isinstance(prefill_config, Mapping) else {}
 
 
+def operator_selected_prefill_backend(
+    server_args_overrides: Mapping[str, Any] | None,
+) -> bool:
+    """Whether the operator named the prefill CUDA graph backend in the overrides."""
+    if not server_args_overrides:
+        return False
+    if "cuda_graph_backend_prefill" in server_args_overrides:
+        return True
+    return "backend" in nested_prefill_overrides(server_args_overrides)
+
+
 def build_generation_batch_overrides(
     *,
     max_running_requests: int,
