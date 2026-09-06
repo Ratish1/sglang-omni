@@ -44,6 +44,10 @@ def _ingress(
     return entry
 
 
+def _req_to_token_pool() -> SimpleNamespace:
+    return SimpleNamespace(req_to_token=torch.zeros((2, 4), dtype=torch.int32))
+
+
 def _init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler._request_admission_lock = threading.RLock()
     scheduler._request_build_executor = None
@@ -1972,7 +1976,7 @@ def _construct_omni_scheduler(
     scheduler = OmniScheduler(
         tp_worker=tp_worker,
         tree_cache=None,
-        req_to_token_pool=None,
+        req_to_token_pool=_req_to_token_pool(),
         token_to_kv_pool_allocator=None,
         server_args=server_args,
         model_config=SimpleNamespace(),
@@ -2178,7 +2182,7 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
     scheduler = OmniScheduler(
         tp_worker=tp_worker,
         tree_cache=None,
-        req_to_token_pool=None,
+        req_to_token_pool=_req_to_token_pool(),
         token_to_kv_pool_allocator=None,
         server_args=server_args,
         model_config=SimpleNamespace(),
@@ -2257,7 +2261,7 @@ def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
         OmniScheduler(
             tp_worker=tp_worker,
             tree_cache=None,
-            req_to_token_pool=None,
+            req_to_token_pool=_req_to_token_pool(),
             token_to_kv_pool_allocator=None,
             server_args=server_args,
             model_config=SimpleNamespace(),

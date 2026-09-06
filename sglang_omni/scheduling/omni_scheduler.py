@@ -433,6 +433,11 @@ class OmniScheduler:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.spec_algorithm = SpeculativeAlgorithm.NONE
+        self.future_map = self.spec_algorithm.create_future_map(
+            torch.device(self.device),
+            self.req_to_token_pool,
+            needs_cpu_seq_lens=True,
+        )
         self.dllm_config = None
         self.draft_worker = None
         self._execution_bridge = None
@@ -522,8 +527,8 @@ class OmniScheduler:
         bridge = SGLangExecutionBridge(
             device=torch.device(self.device),
             worker=self.tp_worker,
-            req_to_token_pool=self.req_to_token_pool,
             spec_algorithm=self.spec_algorithm,
+            future_map=self.future_map,
         )
         model_runner._async_enabled = self.enable_async_decode
         model_runner.bind_execution_bridge(bridge)
@@ -531,7 +536,6 @@ class OmniScheduler:
         # but make the custom ModelRunner the sole owner of relay.
         self._model_runner = model_runner
         self._execution_bridge = bridge
-        self.future_map = bridge.future_map
 
     def _init_upstream_compat_flags(self, server_args: Any) -> None:
         self.enable_hisparse = bool(server_args.enable_hisparse)
