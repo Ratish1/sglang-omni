@@ -1886,45 +1886,6 @@ def _construct_omni_scheduler(
         raising=False,
     )
 
-    class StrictParallelContext:
-        def __init__(self) -> None:
-            object.__setattr__(self, "pp_max_micro_batch_size", None)
-            object.__setattr__(self, "attn_dcp_size", 1)
-
-        def __setattr__(self, name, value) -> None:
-            raise AttributeError(f"bare mutation of {name}")
-
-    class StrictRuntimeContext:
-        def __init__(self, parallel) -> None:
-            self.parallel = parallel
-            self.override_calls = []
-
-        def override(self, source, **fields) -> None:
-            self.override_calls.append((source, dict(fields)))
-            for name, value in fields.items():
-                object.__setattr__(self.parallel, name, value)
-
-    parallel_context = StrictParallelContext()
-    runtime_context = StrictRuntimeContext(parallel_context)
-    monkeypatch.setattr(
-        "sglang.srt.runtime_context.get_parallel",
-        lambda: parallel_context,
-    )
-    monkeypatch.setattr(
-        "sglang.srt.runtime_context.get_context",
-        lambda: runtime_context,
-    )
-    tp_worker = SimpleNamespace(
-        gpu_id=0,
-        tp_rank=0,
-        model_runner=SimpleNamespace(
-            max_total_num_tokens=128,
-            effective_max_total_num_tokens=64,
-            max_running_requests=1,
-        ),
-        random_seed=0,
-        device=torch.device("cpu"),
-    )
     server_args = SimpleNamespace(
         tp_size=1,
         pp_size=1,
@@ -1950,6 +1911,56 @@ def _construct_omni_scheduler(
         schedule_conservativeness=1.0,
         enable_metrics=False,
         enable_metrics_for_all_schedulers=False,
+    )
+
+    class StrictParallelContext:
+        def __init__(self) -> None:
+            object.__setattr__(self, "pp_max_micro_batch_size", None)
+            object.__setattr__(self, "attn_dcp_size", 1)
+            for name in (
+                "tp_size",
+                "pp_size",
+                "dp_size",
+                "moe_dp_size",
+                "attn_cp_size",
+            ):
+                object.__setattr__(self, name, getattr(server_args, name))
+
+        def __setattr__(self, name, value) -> None:
+            raise AttributeError(f"bare mutation of {name}")
+
+    class StrictRuntimeContext:
+        def __init__(self, parallel) -> None:
+            self.parallel = parallel
+            self.override_calls = []
+
+        def override(self, source, **fields) -> None:
+            self.override_calls.append((source, dict(fields)))
+            for name, value in fields.items():
+                object.__setattr__(self.parallel, name, value)
+
+    parallel_context = StrictParallelContext()
+    runtime_context = StrictRuntimeContext(parallel_context)
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: parallel_context,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_context",
+        lambda: runtime_context,
+    )
+    monkeypatch.setattr("sglang.srt.runtime_context.get_schedule", lambda: server_args)
+    monkeypatch.setattr("sglang.srt.runtime_context.get_memory", lambda: server_args)
+    tp_worker = SimpleNamespace(
+        gpu_id=0,
+        tp_rank=0,
+        model_runner=SimpleNamespace(
+            max_total_num_tokens=128,
+            effective_max_total_num_tokens=64,
+            max_running_requests=1,
+        ),
+        random_seed=0,
+        device=torch.device("cpu"),
     )
     monkeypatch.setattr(
         "sglang.srt.managers.scheduler_components.new_token_ratio_tracker.get_schedule",
@@ -2080,7 +2091,15 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
         ),
         raising=False,
     )
-    bridge_parallel = SimpleNamespace(pp_max_micro_batch_size=None, attn_dcp_size=1)
+    bridge_parallel = SimpleNamespace(
+        pp_max_micro_batch_size=None,
+        attn_dcp_size=1,
+        tp_size=1,
+        pp_size=1,
+        dp_size=1,
+        moe_dp_size=1,
+        attn_cp_size=1,
+    )
 
     def _override(_source, **fields) -> None:
         for name, value in fields.items():
@@ -2153,6 +2172,9 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
         ),
     )
 
+    monkeypatch.setattr("sglang.srt.runtime_context.get_schedule", lambda: server_args)
+    monkeypatch.setattr("sglang.srt.runtime_context.get_memory", lambda: server_args)
+
     scheduler = OmniScheduler(
         tp_worker=tp_worker,
         tree_cache=None,
@@ -2216,6 +2238,20 @@ def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
         enable_metrics=False,
         enable_metrics_for_all_schedulers=False,
     )
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(
+            pp_max_micro_batch_size=None,
+            attn_dcp_size=1,
+            tp_size=1,
+            pp_size=1,
+            dp_size=1,
+            moe_dp_size=1,
+            attn_cp_size=1,
+        ),
+    )
+    monkeypatch.setattr("sglang.srt.runtime_context.get_schedule", lambda: server_args)
+    monkeypatch.setattr("sglang.srt.runtime_context.get_memory", lambda: server_args)
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         OmniScheduler(

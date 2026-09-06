@@ -155,11 +155,9 @@ def test_dllm_scheduler_event_loop_passes_schedule_batch_to_worker(
 def test_dllm_staging_admission_uses_dllm_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from sglang.srt.runtime_context import get_context
+
     scheduler = _scheduler(fdfo=True)
-    scheduler.server_args = SimpleNamespace(
-        page_size=1,
-        max_prefill_tokens=16,
-    )
     scheduler.tree_cache = object()
     scheduler.token_to_kv_pool_allocator = object()
     scheduler.req_to_token_pool = object()
@@ -193,7 +191,8 @@ def test_dllm_staging_admission_uses_dllm_config(
     monkeypatch.setattr(dllm_scheduler_module, "PrefillAdder", _Adder)
     monkeypatch.setattr(dllm_scheduler_module, "ScheduleBatch", _Batch)
 
-    batch = scheduler._schedule_next_batch()
+    with get_context().override_server_args(page_size=1, max_prefill_tokens=16):
+        batch = scheduler._schedule_next_batch()
 
     assert batch is not None
     assert created["dllm_config"] is scheduler.dllm_config

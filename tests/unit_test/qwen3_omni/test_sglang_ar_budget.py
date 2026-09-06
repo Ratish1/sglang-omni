@@ -15,6 +15,13 @@ import sglang_omni.models.qwen3_omni.stages as qwen_stages
 from sglang_omni.platforms import current_platform
 
 
+@pytest.fixture(autouse=True)
+def _schedule_bag(monkeypatch):
+    monkeypatch.setattr(
+        runner_mod, "get_schedule", lambda: SimpleNamespace(mem_fraction_static=0.9)
+    )
+
+
 def _configurator(
     *, total_gpu_memory_fraction: float | None, kv_cache_bytes: int | None = None
 ):
@@ -28,7 +35,6 @@ def _configurator(
     )
     configurator.gpu_id = 0
     configurator.device = "cuda"
-    configurator.server_args = SimpleNamespace(mem_fraction_static=0.9)
     configurator.total_gpu_memory_fraction = total_gpu_memory_fraction
     configurator.kv_cache_bytes = kv_cache_bytes
     configurator.mambaish_config = None

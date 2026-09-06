@@ -69,25 +69,27 @@ def init_sglang_cuda_graphs(model_worker: Any) -> None:
         model_config.is_multimodal = original_is_multimodal
 
 
-def _hidden_capture_max_tokens(server_args: Any) -> int:
+def _hidden_capture_max_tokens() -> int:
     """Largest token-row count a single thinker forward can produce.
 
     Covers chunked prefill, non-chunked prefill, decode batches, and every
     configured CUDA graph bucket maximum, so the capture buffers are large
     enough for both eager forwards and graph replay.
     """
-    chunked_prefill_size = server_args.chunked_prefill_size
+    from sglang.srt.runtime_context import get_exec, get_model, get_schedule
+
+    chunked_prefill_size = get_schedule().chunked_prefill_size
     candidates: list[Any] = []
     if chunked_prefill_size is not None and chunked_prefill_size > 0:
         candidates.append(chunked_prefill_size)
     else:
-        candidates.append(server_args.max_prefill_tokens)
+        candidates.append(get_schedule().max_prefill_tokens)
         # Note(wenyao): Without chunking, SGLang always admits the first prefill request even
         # when it exceeds the batch token budget, up to the model context bound.
-        candidates.append(server_args.context_length)
-    candidates.append(server_args.max_running_requests)
-    candidates.append(server_args.cuda_graph_config.decode.max_bs)
-    candidates.append(server_args.cuda_graph_config.prefill.max_bs)
+        candidates.append(get_model().context_length)
+    candidates.append(get_schedule().max_running_requests)
+    candidates.append(get_exec().graph.cuda_graph_config.decode.max_bs)
+    candidates.append(get_exec().graph.cuda_graph_config.prefill.max_bs)
 
     positive = [int(value) for value in candidates if value is not None and value > 0]
     if not positive:
@@ -118,7 +120,7 @@ def create_sglang_infrastructure(
     # silently reconfigure whatever already runs here, so an engine is only
     # built where the context is unpublished. A construction that failed after
     # publishing is therefore not retried here.
-    from sglang.srt.runtime_context import get_context
+    from sglang.srt.runtime_context import get_context, get_schedule
 
     from sglang_omni.model_runner.model_worker import ModelWorker, ModelWorkerConfig
     from sglang_omni.scheduling.sglang_backend import create_tree_cache
@@ -177,7 +179,7 @@ def create_sglang_infrastructure(
         install_hidden_capture_hooks(
             model,
             capture_hidden_layers,
-            max_tokens=_hidden_capture_max_tokens(server_args),
+            max_tokens=_hidden_capture_max_tokens(),
         )
 
     # Phase order follows upstream Scheduler.init_model_worker().
@@ -191,10 +193,9 @@ def create_sglang_infrastructure(
     req_to_token_pool, token_to_kv_pool_allocator = model_worker.get_memory_pool()
 
     tree_cache = create_tree_cache(
-        server_args,
         req_to_token_pool,
         token_to_kv_pool_allocator,
-        server_args.page_size,
+        get_schedule().page_size,
     )
 
     return (

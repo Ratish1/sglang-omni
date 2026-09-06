@@ -214,11 +214,13 @@ class OmniScheduler:
         self._shutdown_lock = threading.Lock()
         self._request_admission_lock = threading.RLock()
         self._prompt_cache_epoch = 0
+        from sglang.srt.runtime_context import get_memory, get_parallel, get_schedule
+
         self.request_build_max_workers = max(1, int(request_build_max_workers))
-        if self.request_build_max_workers > 1 and int(server_args.tp_size) > 1:
+        if self.request_build_max_workers > 1 and int(get_parallel().tp_size) > 1:
             logger.warning(
                 "OmniScheduler request-build workers are disabled for "
-                f"tp_size={server_args.tp_size} to preserve identical request "
+                f"tp_size={get_parallel().tp_size} to preserve identical request "
                 "admission order on every TP rank"
             )
             self.request_build_max_workers = 1
@@ -257,18 +259,18 @@ class OmniScheduler:
         self.model_config = model_config
         self.gpu_id = tp_worker.gpu_id
         self.tp_rank = tp_worker.tp_rank
-        self.tp_size = server_args.tp_size
+        self.tp_size = get_parallel().tp_size
         self.pp_rank = 0
-        self.pp_size = server_args.pp_size
+        self.pp_size = get_parallel().pp_size
         self.dp_rank = None
-        self.dp_size = server_args.dp_size
+        self.dp_size = get_parallel().dp_size
         self.moe_ep_rank = 0
         self.moe_ep_size = 1
         self.moe_dp_rank = None
-        self.moe_dp_size = server_args.moe_dp_size
+        self.moe_dp_size = get_parallel().moe_dp_size
         self.attn_cp_rank = 0
-        self.attn_cp_size = server_args.attn_cp_size
-        self.page_size = server_args.page_size
+        self.attn_cp_size = get_parallel().attn_cp_size
+        self.page_size = get_schedule().page_size
         self.enable_overlap = enable_overlap
         # One-step-lookahead async decode (single stream + CUDA event). Only
         # safe for model runners that implement post_decode_launch/resolve.
@@ -291,10 +293,10 @@ class OmniScheduler:
         # (FactoryArgs); only the TP interaction is this scheduler's call.
         requests = int(prefill_coalesce_requests)
         wait_ms = float(prefill_coalesce_wait_ms)
-        if requests > 1 and int(server_args.tp_size) > 1:
+        if requests > 1 and int(get_parallel().tp_size) > 1:
             logger.warning(
                 "Prefill admission coalescing is disabled for "
-                f"tp_size={server_args.tp_size}: the wait deadline reads each "
+                f"tp_size={get_parallel().tp_size}: the wait deadline reads each "
                 "rank's local clock, so ranks could disagree on expiry and "
                 "break lockstep scheduling"
             )
@@ -372,13 +374,13 @@ class OmniScheduler:
         self._last_pause_mode: str | None = None
 
         # Chunked prefill
-        self.chunked_prefill_size = server_args.chunked_prefill_size
+        self.chunked_prefill_size = get_schedule().chunked_prefill_size
         if self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
-            self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
+            self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
         self.enable_dynamic_chunking = False
 
@@ -389,7 +391,7 @@ class OmniScheduler:
         self.policy = SchedulePolicy(
             self.schedule_policy,
             self.tree_cache,
-            server_args.enable_hierarchical_cache,
+            get_memory().enable_hierarchical_cache,
             server_args.enable_priority_scheduling,
             server_args.schedule_low_priority_values_first,
         )
@@ -731,7 +733,9 @@ class OmniScheduler:
         return attr
 
     def _init_parallel_state(self, tp_worker: Any) -> None:
-        enable_dp_attention = self.server_args.enable_dp_attention
+        from sglang.srt.runtime_context import get_parallel
+
+        enable_dp_attention = get_parallel().enable_dp_attention
         (
             self.attn_tp_rank,
             self.attn_tp_size,
@@ -781,8 +785,8 @@ class OmniScheduler:
             attn_tp_size=self.attn_tp_size,
             attn_cp_rank=self.attn_cp_rank,
             attn_cp_size=self.attn_cp_size,
-            attn_dcp_rank=self.tp_rank % self.server_args.dcp_size,
-            attn_dcp_size=self.server_args.dcp_size,
+            attn_dcp_rank=self.tp_rank % get_parallel().dcp_size,
+            attn_dcp_size=get_parallel().dcp_size,
             attn_dp_rank=self.attn_dp_rank,
             attn_dp_size=self.attn_dp_size,
             moe_ep_rank=self.moe_ep_rank,
@@ -1287,10 +1291,12 @@ class OmniScheduler:
         if required_tokens <= kv_capacity:
             return None
 
+        from sglang.srt.runtime_context import get_schedule
+
         kv_cache_bytes = getattr(
             getattr(self, "tp_worker", None), "kv_cache_bytes", None
         )
-        mem_fraction = self.server_args.mem_fraction_static
+        mem_fraction = get_schedule().mem_fraction_static
         if kv_cache_bytes is not None:
             mem_hint = " Try raising engine.kv_cache_bytes."
         elif mem_fraction is not None:

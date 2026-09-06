@@ -31,6 +31,15 @@ from sglang_omni.utils import ipc_weights  # noqa: E402
 SGLModelRunner = sglang_model_runner.SGLModelRunner
 
 
+@pytest.fixture(autouse=True)
+def _parallel_bag(monkeypatch):
+    monkeypatch.setattr(
+        sglang_model_runner,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_size=1, pp_size=1),
+    )
+
+
 class SmallModel(nn.Module):
     def __init__(self, fill: float):
         super().__init__()
@@ -45,8 +54,6 @@ def _bare_runner(load_format="auto"):
     runner.server_args = SimpleNamespace(
         load_format=load_format,
         max_total_tokens=1000,
-        tp_size=1,
-        pp_size=1,
         model_path="m",
         revision="r",
         enable_torch_compile=False,

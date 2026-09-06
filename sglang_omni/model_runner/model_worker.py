@@ -89,10 +89,11 @@ class ModelWorker:
         self._prefill_cuda_graph_usage = _PrefillCudaGraphUsage()
 
         self.device = self.model_runner.device
+        from sglang.srt.runtime_context import get_device
         from sglang.srt.utils import broadcast_pyobj, set_random_seed
 
         self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
+            [get_device().random_seed],
             self.tp_rank,
             self.model_runner.tp_group.cpu_group,
         )[0]
@@ -339,7 +340,9 @@ class ModelWorker:
             input_embeds_slot = runner.buffer_registry.has_slot("input_embeds")
         else:
             capture_num_tokens, backend_runner, input_embeds_slot = None, None, False
-        backend = self.server_args.cuda_graph_config.prefill.backend
+        from sglang.srt.runtime_context import get_exec
+
+        backend = get_exec().graph.cuda_graph_config.prefill.backend
         usage = self._prefill_cuda_graph_usage
         return {
             "backend": backend,
@@ -357,14 +360,14 @@ class ModelWorker:
         }
 
     def model_info(self) -> dict[str, Any]:
-        from sglang.srt.runtime_context import get_model, get_serving
+        from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 
         return {
             "model_path": get_model().model_path,
             "load_format": get_model().load_format,
             "weight_version": get_serving().weight_version,
             "tp_rank": self.tp_rank,
-            "tp_size": self.server_args.tp_size,
+            "tp_size": get_parallel().tp_size,
             "model_arch_override": self.model_arch_override,
             "supports_weight_update": True,
             "supports_weight_checker": True,
