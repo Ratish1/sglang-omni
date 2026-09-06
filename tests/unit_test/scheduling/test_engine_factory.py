@@ -140,9 +140,6 @@ def test_tts_engine_builder_phase_order_and_override_contract(monkeypatch) -> No
     monkeypatch.setattr(
         platforms.current_platform, "device_type", "cuda", raising=False
     )
-    monkeypatch.setattr(
-        "sglang.srt.utils.get_device", lambda device_id=None: f"cuda:{device_id}"
-    )
 
     events: list[str] = []
     build_kwargs: dict[str, Any] = {}
@@ -432,9 +429,6 @@ def _build_minimal_tts_builder_harness(monkeypatch):
 
     monkeypatch.setattr(
         platforms.current_platform, "device_type", "cuda", raising=False
-    )
-    monkeypatch.setattr(
-        "sglang.srt.utils.get_device", lambda device_id=None: f"cuda:{device_id}"
     )
 
     build_kwargs: dict[str, Any] = {}

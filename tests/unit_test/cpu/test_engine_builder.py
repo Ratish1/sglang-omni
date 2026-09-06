@@ -20,7 +20,6 @@ def _build_on(monkeypatch, device: str) -> dict[str, Any]:
     from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 
     monkeypatch.setattr(platforms.current_platform, "is_cpu", lambda: True)
-    monkeypatch.setattr("sglang.srt.utils.get_device", lambda device_id=None: "cpu")
 
     build_kwargs: dict[str, Any] = {}
     events: list[str] = []
