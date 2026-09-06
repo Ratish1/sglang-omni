@@ -1915,6 +1915,7 @@ def _construct_omni_scheduler(
         schedule_conservativeness=1.0,
         enable_metrics=False,
         enable_metrics_for_all_schedulers=False,
+        prefill_decode_interval=0,
     )
 
     class StrictParallelContext:
@@ -1955,6 +1956,14 @@ def _construct_omni_scheduler(
     )
     monkeypatch.setattr("sglang.srt.runtime_context.get_schedule", lambda: server_args)
     monkeypatch.setattr("sglang.srt.runtime_context.get_memory", lambda: server_args)
+    monkeypatch.setattr(
+        "sglang.srt.managers.scheduler.get_observability",
+        lambda: SimpleNamespace(
+            kv_events_config=None,
+            load_publish_endpoint=None,
+            load_snapshot_publish_interval=1,
+        ),
+    )
     tp_worker = SimpleNamespace(
         gpu_id=0,
         tp_rank=0,
@@ -2168,6 +2177,7 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
         schedule_conservativeness=1.0,
         enable_metrics=False,
         enable_metrics_for_all_schedulers=False,
+        prefill_decode_interval=0,
     )
     monkeypatch.setattr(
         "sglang.srt.managers.scheduler_components.new_token_ratio_tracker.get_schedule",
@@ -2178,6 +2188,14 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
 
     monkeypatch.setattr("sglang.srt.runtime_context.get_schedule", lambda: server_args)
     monkeypatch.setattr("sglang.srt.runtime_context.get_memory", lambda: server_args)
+    monkeypatch.setattr(
+        "sglang.srt.managers.scheduler.get_observability",
+        lambda: SimpleNamespace(
+            kv_events_config=None,
+            load_publish_endpoint=None,
+            load_snapshot_publish_interval=1,
+        ),
+    )
 
     scheduler = OmniScheduler(
         tp_worker=tp_worker,
@@ -2241,6 +2259,7 @@ def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
         schedule_conservativeness=1.0,
         enable_metrics=False,
         enable_metrics_for_all_schedulers=False,
+        prefill_decode_interval=0,
     )
     monkeypatch.setattr(
         "sglang.srt.runtime_context.get_parallel",
@@ -2256,6 +2275,14 @@ def test_omni_scheduler_refuses_overlap_with_async_decode(monkeypatch) -> None:
     )
     monkeypatch.setattr("sglang.srt.runtime_context.get_schedule", lambda: server_args)
     monkeypatch.setattr("sglang.srt.runtime_context.get_memory", lambda: server_args)
+    monkeypatch.setattr(
+        "sglang.srt.managers.scheduler.get_observability",
+        lambda: SimpleNamespace(
+            kv_events_config=None,
+            load_publish_endpoint=None,
+            load_snapshot_publish_interval=1,
+        ),
+    )
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         OmniScheduler(

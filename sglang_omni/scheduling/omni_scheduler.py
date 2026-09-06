@@ -383,6 +383,8 @@ class OmniScheduler:
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
         self.enable_dynamic_chunking = False
+        self.prefill_decode_interval = get_schedule().prefill_decode_interval
+        self._prefill_decode_interval_remaining = 0
 
         # Schedule policy
         from sglang.srt.managers.schedule_policy import SchedulePolicy
@@ -609,7 +611,6 @@ class OmniScheduler:
             tree_cache=self.tree_cache,
             offload_tags=self.offload_tags,
             ps=self.ps,
-            server_args=self.server_args,
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
@@ -638,6 +639,7 @@ class OmniScheduler:
         self.decode_moment_totals: list[float] = [0.0] * 6
         self._prev_step = None
         self._sched_idled = False
+        self.init_load_publisher()
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
@@ -650,6 +652,10 @@ class OmniScheduler:
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
+            waiting_queue_prefix_matched=lambda: self.policy.waiting_queue_prefix_matched(
+                self.waiting_queue
+            ),
+            get_recent_cache_hit_rate=lambda: self.metrics_reporter.recent_cache_hit_rate,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
             get_disagg_prefill_bootstrap_queue=lambda: empty_queue,
@@ -674,12 +680,12 @@ class OmniScheduler:
                 reqs, return_logprob
             ),
         )
+        self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
             enable_overlap=self.enable_overlap,
             enable_overlap_mlx=self.enable_overlap_mlx,
-            server_args=self.server_args,
             model_config=self.model_config,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
@@ -694,6 +700,7 @@ class OmniScheduler:
                 model_config=self.model_config
             ),
             output_streamer=self.output_streamer,
+            beam_coordinator=self.beam_coordinator,
             abort_request=lambda request: self.abort(request.rid),
         )
 
@@ -2206,7 +2213,6 @@ class OmniScheduler:
         retracted_reqs = list(batch.reqs)
         retract_all(
             reqs=batch.reqs,
-            server_args=self.server_args,
             req_to_token_pool=batch.req_to_token_pool,
             token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
             tree_cache=batch.tree_cache,
