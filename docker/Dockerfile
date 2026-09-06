@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG SGLANG_IMAGE=lmsysorg/sglang@sha256:9e148f5ac788e856a06166bd6347a831831eb9fcfab4d1770874823a7c29a1a1
+ARG SGLANG_IMAGE=lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9
 ARG FLASHINFER_CACHE_IMAGE=hongccc/sglang-omni@sha256:02a85f00438c901c72a2eb2ef738974a807f63af3d13084445604f3344067b19
 
 FROM ${FLASHINFER_CACHE_IMAGE} AS flashinfer-cache
@@ -34,18 +34,21 @@ RUN git clone --filter=blob:none https://github.com/openucx/ucx.git /tmp/ucx \
 
 # Install only project dependencies. The repository itself is fetched when the
 # container starts, so the image never contains a stale sglang-omni checkout.
+# The base image installs its stack into the /opt/sglang virtualenv that PATH
+# resolves. uv finds a virtualenv only through VIRTUAL_ENV or a .venv directory,
+# so name the interpreter explicitly.
 COPY pyproject.toml /tmp/pyproject.toml
-RUN uv pip install --system --break-system-packages --no-build-isolation \
+RUN uv pip install --python /opt/sglang/bin/python3 --no-build-isolation \
         -r /tmp/pyproject.toml \
-    && uv pip install --system --break-system-packages --no-deps qwen-tts==0.1.1 \
-    && uv pip install --system --break-system-packages --no-deps --reinstall flashinfer-python==0.6.17 \
+    && uv pip install --python /opt/sglang/bin/python3 --no-deps qwen-tts==0.1.1 \
+    && uv pip install --python /opt/sglang/bin/python3 --no-deps --reinstall flashinfer-python==0.6.18 \
     && python3 -m pip uninstall -y flashinfer-cubin flashinfer-jit-cache \
     && rm /tmp/pyproject.toml
 
 # Docker builds do not have a GPU to regenerate architecture-specific JIT
 # artifacts. Reuse the Python 3.12 cache validated on Ada (SM89) and Hopper
 # (SM90a); other architectures compile into their own cache directory.
-COPY --from=flashinfer-cache /root/.cache/flashinfer/0.6.17 /root/.cache/flashinfer/0.6.17
+COPY --from=flashinfer-cache /root/.cache/flashinfer/0.6.18 /root/.cache/flashinfer/0.6.18
 
 ENV FLASHINFER_WORKSPACE_BASE=/root \
     FLASHINFER_JIT_DEBUG=0
