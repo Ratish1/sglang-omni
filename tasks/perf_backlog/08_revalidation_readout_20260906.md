@@ -112,9 +112,10 @@ host, two boots per arm and point.
 
 ## 4. What runs next
 
-1. Qwen3-TTS c1 and c16 pair again, alone on the host, two boots per arm per point in
-   A B B A order, with a host gate recorded before every boot: every GPU on the host at 0 MiB
-   and 0 percent, the load average, and `dmesg -T | tail` for kills.
+1. Qwen3-TTS c1 and c16 pair again, without our second lane, two boots per arm per point in
+   A B B A order, with the one second sample of every GPU kept for each run and the load
+   average and `dmesg -T | tail` recorded before every boot. Done in readout 09, which also
+   replaces the idle host requirement with the paired protocol of plan 07.
 2. Qwen3-Omni on the full corpus, alone on the host, fp8 colocated, c1, c16 and c32, two
    boots per arm per point, then WER and UTMOS:
 

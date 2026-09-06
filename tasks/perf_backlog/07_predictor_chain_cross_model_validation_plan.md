@@ -62,12 +62,14 @@ data is the real moss_tts and moss_tts_local class. The commit is local until pu
 
 Both lanes need the branch head pushed. A is `7989a5ed2` in both lanes.
 
-Correction after the 2026-09-06 run (readout 08): the lanes may share the host only for
-suites, probes, coverage, census and retraction checks. Every full corpus A/B point runs alone
-on the host, with a host gate recorded before each boot (every GPU at 0 MiB and 0 percent,
-the load average, `dmesg -T | tail`), two boots per arm and point. The Qwen3-TTS decode loop
-waits on the host for a third of its step, so a concurrent 30B boot or a foreign tenant lands
-in its qps.
+Correction after the 2026-09-06 runs (readouts 08 and 09): the node is shared and an idle
+host is not a condition we can set. The Qwen3-TTS run at c16 keeps its GPU busy 40 to 46
+percent of the time, so other tenants' jobs land in its qps, and in readout 09 the qps of each
+boot tracks the other GPUs' utilization during that boot. The protocol that survives that:
+our own two lanes never overlap a full corpus point, boots interleave A B B A with at least
+two per arm and point, the one second sample of every GPU on the host is kept for each run
+and reported next to it, the paired deltas are what is quoted, and the c1 point and the
+kernel census carry the device side claim, since neither moves with the host.
 
 ### Lane 1, Qwen3-TTS, one H100
 
