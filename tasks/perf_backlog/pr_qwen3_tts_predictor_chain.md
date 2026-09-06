@@ -23,7 +23,7 @@ No new kernel, no new configuration, no chosen constant. The temperature floor o
 
 H100 80GB HBM3, driver 580.126.20, CUDA 13.0, SGLang 0.5.18, torch 2.13.0, `Qwen/Qwen3-TTS-12Hz-1.7B-Base`, default engine config. `pytest tests/unit_test/qwen3_tts -q`: 394 passed.
 
-A is upstream main `91e9c3095`, B is this branch with that main merged, `2c00eb688`. The commits after `2c00eb688` are host Python and tests: the direct field reads in the talker runner (8 insertions, 18 deletions), the review fixes above, and their tests. The device path of the replay is unchanged by them, and a later census of `8c8ae636b`, the head after the field reads, counted the same 1222 kernels per replay at 1 and 16 rows with the same kernel names.
+A is upstream main `91e9c3095`, B is this branch with that main merged, `2c00eb688`. The commits after `2c00eb688` are host Python and tests: the direct field reads in the talker runner (8 insertions, 18 deletions), the review fixes above, and their tests. The device path of the replay is unchanged by them: the census of the final head counts the same 1222 kernels per replay at 1 and 16 rows with the same kernel names, and its c1 WAVs equal this run's byte for byte. The final head's own A/B is in the section after the tables.
 
 Kernel census of the predictor replay, torch profiler window of 12 requests at c1 and 192 at c16, one fresh server per arm, one unprofiled warmup request:
 
@@ -68,6 +68,35 @@ At c16 the batch composition differs between arms, so every sample's audio diffe
 Memory, GPU total sampled once a second including startup: c1 76863 MiB (A) and 76887 MiB (B), c16 81055 MiB (A) and 80735 MiB (B). A process wide allocator snapshot of the c16 window on both arms showed equal allocated memory at start and end and no out of memory event on either arm.
 
 Serving logs: no lazy capture, no fallback to eager, no retract, no CUDA error on either arm at either concurrency.
+
+## Validation of the final head
+
+A is upstream main `7989a5ed2`, the commit this branch merged, B is the final head `d26ac7a1e`. Same corpus, seed and scoring, two fresh boots per arm and point in the order A B B A, on one H100 of a host whose other GPUs carried other tenants' jobs, so the qps ranges below carry that noise. `pytest tests/unit_test/qwen3_tts -q`: 397 passed. The CPU suite with CUDA hidden: 6005 passed. The accelerator suite: 292 passed.
+
+| Point | Metric | A, two boots | B, two boots |
+| --- | --- | ---: | ---: |
+| c1 | QPS | 2.196 (2.192 to 2.200) | 2.266 (2.262 to 2.269) |
+| c1 | mean latency | 0.455 s | 0.441 s |
+| c1 | WER, similarity | 1.00477%, 71.30515 | 1.00477%, 71.30515 |
+| c1 | WAVs byte identical | reference | 1088 of 1088 in both boots, and equal to the run above |
+| c16 | QPS | 14.265 (13.783 to 14.747) | 15.092 (14.947 to 15.237) |
+| c16 | mean latency | 1.117 s | 1.054 s |
+| c16 | p95 latency | 1.636 s | 1.504 s |
+| c16 | WER | 1.005%, 1.105% | 1.038%, 1.038% |
+| c16 | similarity | 71.281, 71.122 | 71.195, 71.264 |
+| c16 | peak GPU memory | 80343, 80825 MiB | 80767, 80547 MiB |
+
+Both arms log the caching allocator's retry warning once or twice per c16 boot, with every request completing, so the card is at its edge at c16 on main as well as here.
+
+The review fixes changed two files other models execute, the scheduler requeue and the talker decode input helpers, so the same session validated them on the other models:
+
+- Qwen3-Omni, fp8 colocated, full corpus with voice clone, two boots per arm at c1, c16 and c32, no seed flag on that benchmark: qps within 0.7 percent of A at every point (1.579 against 1.574, 7.570 against 7.521, 9.887 against 9.909), UTMOS equal, every paired WER interval covering zero, no retraction and no exception. Three of B's 6528 outputs ran long, 20.7, 39.3 and 80.8 s of audio, against none of A's 6528; the same prompts run at 3 to 7 s in every other boot, the diff has no mechanism that changes the talker's inputs, and the targeted check is recorded in the analysis docs.
+- Qwen3-Omni talker retraction forced through the sglang test switch on the talker stage: 4 and 5 retractions, every re-prefill at N plus 1 tokens, all requests complete.
+- Qwen3-TTS retraction forced the same way at c16: 13 retractions, 192 of 192 complete.
+- MOSS-TTS Local, the model whose request data lacked the history fields: 3 retractions at c4, 16 of 16 complete, no exception.
+- The reviewer's probes: 11, 23 and 39 startup keys at 16, 64 and 128 running with no missing mixed bucket, temperature bits equal to the former device order, survivor amplification 16.
+
+Not obtained: the allocator peak of the retraction window, since the exported traces carry no allocator events, and a clean run of the larger graph ladder, which waits on the pool provisioning of a separate slice.
 
 ## Reproduction
 

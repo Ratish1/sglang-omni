@@ -33,8 +33,11 @@ Plans for items in this list are written as numbered docs in this folder.
    the body in `pr_qwen3_tts_predictor_chain.md`, head `8c8ae636b` after
    the getattr removal and its test fakes. Review fixes and the cross
    model audit landed as six commits, head `d26ac7a1e` pushed 2026-09-06
-   (docs 06 and 07, readout 08). Owed: the idle host rerun of doc 08
-   section 4 (Qwen3-TTS c1 and c16, Qwen3-Omni full corpus, probes), then
+   (docs 06 and 07, readout 08). The rerun of doc 08 section 4 passed on
+   `d26ac7a1e` (readout 09): c1 plus 3.2 percent byte identical, c16 plus
+   5.8 percent over two boots, Qwen3-Omni full corpus equal in speed and
+   quality, retraction on three models, MOSS-TTS Local fixed. Owed: the
+   PR body update on GitHub, the long generation check of doc 09, then
    the memory provisioning slice before the 128 running gate and S2's c16,
    since both fail inside cuDNN with the card full (doc 08 section 2, seam
    decision in section 4 below). S2
