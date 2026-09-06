@@ -5813,14 +5813,64 @@ def test_qwen3_tts_engine_rejects_torch_compile(value) -> None:
     from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
 
     with pytest.raises(ValueError, match="Qwen3-TTS torch.compile is not supported"):
-        Qwen3TtsEngineBuilder().adjust_overrides({"enable_torch_compile": value})
+        Qwen3TtsEngineBuilder().adjust_overrides(
+            {"enable_torch_compile": value, "max_running_requests": 16}
+        )
 
 
 @pytest.mark.parametrize("value", [False, 0, "false", "no", "", None])
 def test_qwen3_tts_engine_accepts_disabled_torch_compile(value) -> None:
     from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
 
-    Qwen3TtsEngineBuilder().adjust_overrides({"enable_torch_compile": value})
+    Qwen3TtsEngineBuilder().adjust_overrides(
+        {"enable_torch_compile": value, "max_running_requests": 16}
+    )
+
+
+@pytest.mark.parametrize(
+    "max_running_requests, context_length",
+    [(16, 8192), (89, 8192), (128, 4096)],
+)
+def test_qwen3_tts_engine_caps_the_kv_pool_at_the_admission_bound(
+    max_running_requests: int, context_length: int
+) -> None:
+    from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
+
+    builder = Qwen3TtsEngineBuilder()
+    builder.context_length = context_length
+    overrides = {
+        "enable_torch_compile": False,
+        "max_running_requests": max_running_requests,
+    }
+
+    builder.adjust_overrides(overrides)
+
+    assert overrides["max_total_tokens"] == max_running_requests * context_length
+
+
+def test_qwen3_tts_engine_keeps_a_deployment_token_cap() -> None:
+    from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
+
+    overrides = {"max_running_requests": 16, "max_total_tokens": 4096}
+
+    Qwen3TtsEngineBuilder().adjust_overrides(overrides)
+
+    assert overrides["max_total_tokens"] == 4096
+
+
+def test_qwen3_tts_engine_adds_no_token_cap_under_a_stage_byte_budget() -> None:
+    from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
+    from sglang_omni.scheduling.stage_kv_budget import (
+        consume_stage_kv_cache_bytes,
+        stage_kv_cache_budget,
+    )
+
+    overrides = {"max_running_requests": 16}
+    with stage_kv_cache_budget("tts_engine", 2 * 1024**3):
+        Qwen3TtsEngineBuilder().adjust_overrides(overrides)
+        assert consume_stage_kv_cache_bytes() == 2 * 1024**3
+
+    assert "max_total_tokens" not in overrides
 
 
 def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
@@ -6048,6 +6098,7 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     assert build_kwargs["sampling_backend"] == "pytorch"
     assert build_kwargs["mem_fraction_static"] == 0.7
     assert build_kwargs["max_running_requests"] == 64
+    assert build_kwargs["max_total_tokens"] == 64 * 8192
     assert build_kwargs["torch_compile_max_bs"] == 64
     assert validation_state == {
         "model_name": "Qwen3-TTS",

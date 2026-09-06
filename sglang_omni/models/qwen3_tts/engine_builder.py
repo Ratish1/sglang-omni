@@ -14,6 +14,7 @@ from sglang_omni.scheduling.generation_batch_policy import (
     CudaGraphBackend,
     build_default_prefill_cuda_graph_bs,
 )
+from sglang_omni.scheduling.stage_kv_budget import peek_stage_kv_cache_bytes
 
 
 def _is_truthy(value: Any) -> bool:
@@ -146,6 +147,13 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
         if _is_truthy(overrides.get("enable_torch_compile", False)):
             raise ValueError("Qwen3-TTS torch.compile is not supported")
+        # note(ratish): the pool covers what admission can commit, the running
+        # cap times the context length. A stage byte budget sizes it instead.
+        if peek_stage_kv_cache_bytes() is None:
+            overrides.setdefault(
+                "max_total_tokens",
+                int(overrides["max_running_requests"]) * int(self.context_length),
+            )
 
     def setup_model_resources(
         self,
