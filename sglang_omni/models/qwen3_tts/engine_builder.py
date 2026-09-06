@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 from typing import Any
 
 from sglang_omni.models.qwen3_tts import CAPABILITIES, request_builders
@@ -15,6 +16,8 @@ from sglang_omni.scheduling.generation_batch_policy import (
     build_default_prefill_cuda_graph_bs,
 )
 from sglang_omni.scheduling.stage_kv_budget import peek_stage_kv_cache_bytes
+
+logger = logging.getLogger(__name__)
 
 
 def _is_truthy(value: Any) -> bool:
@@ -199,6 +202,20 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
             "prefill_coalesce_requests": self.prefill_coalesce_requests,
             "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
         }
+
+    def post_scheduler_setup(self, scheduler: Any, model_runner: Any) -> None:
+        del model_runner
+        server_args = scheduler.server_args
+        running = int(server_args.max_running_requests)
+        context = int(server_args.context_length)
+        logger.info(
+            "Qwen3-TTS KV pool holds %d tokens against an admission bound of %d "
+            "(%d running x %d context)",
+            int(scheduler.max_total_num_tokens),
+            running * context,
+            running,
+            context,
+        )
 
     def make_abort_callback(self) -> Any | None:
         return request_builders.cleanup_prepared_qwen3_tts_request

@@ -5881,6 +5881,36 @@ def test_qwen3_tts_engine_adds_no_token_cap_under_a_stage_byte_budget() -> None:
     assert "max_total_tokens" not in overrides
 
 
+@pytest.mark.parametrize(
+    "pool_tokens, max_running_requests, context_length",
+    [(131072, 16, 8192), (589142, 128, 8192)],
+)
+def test_qwen3_tts_engine_reports_the_pool_against_the_admission_bound(
+    pool_tokens: int,
+    max_running_requests: int,
+    context_length: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
+
+    scheduler = SimpleNamespace(
+        max_total_num_tokens=pool_tokens,
+        server_args=SimpleNamespace(
+            max_running_requests=max_running_requests,
+            context_length=context_length,
+        ),
+    )
+
+    with caplog.at_level("INFO", logger="sglang_omni.models.qwen3_tts.engine_builder"):
+        Qwen3TtsEngineBuilder().post_scheduler_setup(scheduler, model_runner=None)
+
+    assert caplog.messages == [
+        f"Qwen3-TTS KV pool holds {pool_tokens} tokens against an admission "
+        f"bound of {max_running_requests * context_length} "
+        f"({max_running_requests} running x {context_length} context)"
+    ]
+
+
 def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6024,9 +6054,11 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     )
 
     def fake_build_sglang_server_args(model_path, context_length, **kwargs):
-        del model_path, context_length
+        del model_path
         build_kwargs.update(kwargs)
         return SimpleNamespace(
+            context_length=context_length,
+            max_total_tokens=kwargs["max_total_tokens"],
             cuda_graph_bs=kwargs["cuda_graph_bs"],
             cuda_graph_max_bs=kwargs["cuda_graph_max_bs"],
             cuda_graph_config=SimpleNamespace(
@@ -6085,7 +6117,9 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     monkeypatch.setattr(
         scheduler_mod,
         "OmniScheduler",
-        lambda **kwargs: SimpleNamespace(**kwargs),
+        lambda **kwargs: SimpleNamespace(
+            max_total_num_tokens=kwargs["server_args"].max_total_tokens, **kwargs
+        ),
     )
 
     scheduler = stages.create_sglang_tts_engine_executor(
