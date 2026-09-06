@@ -25,13 +25,26 @@ is
     need = max_running_requests * context_length tokens
 
 For this profile that is 16 times 8192, 131072 tokens, at the 114688 bytes per token the log
-reports (K plus V, 62.92 GiB over 589142 tokens), 14.0 GiB. Anything above that is capacity no
-request can occupy. Today the pool holds 589142 tokens, 4.5 times the need, and the 48.9 GiB
-between the two is what starves everything else.
+reports (K plus V, 62.92 GiB over 589142 tokens), 14.0 GiB. Today the pool holds 589142
+tokens, 4.5 times that bound.
 
-The requirement is therefore: the pool covers the admission bound and no more, and the rest
-of the card stays free for the allocations the process makes as it serves. No fraction, no
-tuned constant: two settings the deployment already owns, multiplied.
+The pool has a second occupant, the radix prefix cache: the KV of finished requests stays in
+the pool as evictable prefixes, and a later request whose prompt starts the same way skips
+that prefill. It is live on this path, the serve logs count `#cached-token` on every prefill
+batch, and it is what the capacity above the admission bound serves. What that is worth is
+measured, not assumed. On the full corpus the running batch never uses more than a few
+thousand tokens (`token usage` rounds to 0.000 of 589142 in every boot), the prefixes the
+whole corpus can cache sum to 60520 tokens, and the cache serves 18.3 percent of prefill
+tokens at c1 and 13 to 14 percent at c16, identical between arms. Under the admission bound
+the cache keeps 131072 minus the running set, about 129000 tokens, twice the corpus. So on
+this workload the cap loses no hit, and the loss begins only for a voice library whose
+distinct prompts exceed about 129000 tokens, where the deployment sets `engine.max_total_tokens`
+or `engine.kv_cache_bytes`, both of which exist today.
+
+The requirement is therefore: the pool covers the admission bound, the prefix cache lives in
+what the running set leaves of it, and the rest of the card stays free for the allocations the
+process makes as it serves. No fraction, no tuned constant: two settings the deployment already
+owns, multiplied, and the cache share verified on the corpus (section 5, gate 2).
 
 ## 2. What sizes the pool today, and why the card fills
 
@@ -171,7 +184,9 @@ Box, with the paired protocol of plan 07 (interleaved boots, all GPU sample kept
 1. Startup log: `KV Cache is allocated ... #tokens: 131072` and `Memory pool end` with about
    59 GB available, ready memory about 27 GB, in place of 75.2.
 2. c1 full corpus against the chain head: byte identical WAVs, the pool size does not touch a
-   kernel. Latency and qps within the paired spread.
+   kernel. Latency and qps within the paired spread. The prefill lines of both arms sum to
+   the same `#cached-token` share, 13576 of 74096 tokens at c1, which is the prefix cache
+   gate: the cap keeps every hit the corpus has.
 3. c16 full corpus, two boots per arm: no allocator retry warning in either B boot, quality
    inside the identical kernel band, peak memory about 32 GB.
 4. The 128 running server with the request level subtalker top k 64: 64 of 64 complete, six
@@ -201,9 +216,11 @@ Box, with the paired protocol of plan 07 (interleaved boots, all GPU sample kept
 ## 8. Validation tasks and open facts
 
 - `/Users/ratish/sglang` now sits at tag v0.5.19 while the chain branch pins 0.5.18. The
-  functions this plan cites were read from the v0.5.18 blob. Before implementation, confirm
-  which pin main carries and re-read `_apply_token_constraints`, `config_from_budget` and the
-  automatic fraction at that tag.
+  functions this plan cites were read from the v0.5.18 blob, and a v0.5.18 worktree now lives
+  at `/Users/ratish/sglang-worktrees/v0.5.18` next to the v0.5.16 and v0.5.17 ones, for
+  reading without moving the shared checkout. Before
+  implementation, confirm which pin main carries and re-read `_apply_token_constraints`,
+  `config_from_budget` and the automatic fraction at that tag.
 - The 114688 bytes per token is arithmetic on the log, its factorization is not read from the
   checkpoint. The unit test uses the resolved cell size, not the number.
 - The 14 GB process need at c16 is inferred from two memory samples (ready and peak). The
