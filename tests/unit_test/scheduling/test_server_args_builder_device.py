@@ -20,6 +20,10 @@ class _CapturedServerArgs:
         self.kwargs = kwargs
         self.enable_dp_attention = False
         self.startup_weight_load_mode = kwargs.get("startup_weight_load_mode", "serial")
+        self._resolution_finished = False
+
+    def resolve_once(self) -> None:
+        self._resolution_finished = True
 
 
 def _build(monkeypatch, **extra: Any) -> dict[str, Any]:

@@ -85,12 +85,15 @@ removing it. Check that the wrapped upstream body still has the shape the
 patch assumes (a dispatch rewrite upstream can route around a patched method
 without an error) and that `tests/unit_test/vendor/` still pins it.
 
-**`ServerArgs` mutation.** Omni changes engine configuration after
-`build_sglang_server_args` through one seam,
+**`ServerArgs` mutation.** `build_sglang_server_args` constructs the record
+and resolves it once, so every reader between the builder and publish sees
+what resolution decided rather than the raw input. Omni changes engine
+configuration after the builder through one seam,
 `sglang_omni/vendor/sglang/server_args.py::override_server_args`. Upstream
-decides what a mutation means at each lifecycle phase; today a record that
-is not yet published resolves in place, and a published record is read-only
-with its values living on the runtime-context bags. Every call site has a
+decides what a mutation means at each lifecycle phase; today a resolved record
+that is not yet published takes the change as a late declaration, and a
+published record is read-only with its values living on the runtime-context
+bags. Every call site has a
 phase, and every later reader has to read from where the current release
 stores the value. The bump that introduced the read-only record turned
 several write-then-read-back sites into hard errors.

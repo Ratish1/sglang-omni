@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
@@ -86,14 +87,16 @@ def build_sglang_server_args(
     kwargs.setdefault("device", _platform_device_type())
     _apply_platform_decode_cuda_graph_backend(kwargs)
     server_args = ServerArgs(**kwargs)
+    server_args.resolve_once()
+    resolved = resolved_view(server_args)
     # DP attention is unsupported; reject at configuration time. Mixed
     # chunked prefill stays allowed (the bridge handles it natively).
-    if server_args.enable_dp_attention:
+    if resolved.enable_dp_attention:
         raise ValueError("sglang-omni does not support enable_dp_attention")
     # Overlapped startup weight load leaves sentinel weights until the scheduler
     # calls finalize_startup_weight_load after capture; omni's bootstrap never
     # does, so profiling, weight sharing and capture would run on the sentinels.
-    if server_args.startup_weight_load_mode == "overlap":
+    if resolved.startup_weight_load_mode == "overlap":
         raise ValueError(
             "sglang-omni does not support startup_weight_load_mode='overlap'"
         )
