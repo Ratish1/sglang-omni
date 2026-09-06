@@ -186,6 +186,14 @@ before (0.85 fraction)                          after (cap = 16 x 8192 tokens)
 - Profiler windows at c16 without allocator retries, and the retraction memory measurement.
 - Colocating a second stage process on the card, which the placement check today skips only
   because this profile is one process (topology.py:456-458).
+- A second replica per card. The pipeline keeps its GPU busy 40 to 46 percent of the time at
+  c16, so a replica in its own process is the throughput lever, and a replica needs about
+  31 GB at the c16 peak: weights 3.7, pool 14.0, the process's own 8.6 at ready and a 5.1 GB
+  working set. Two fit on an 80 GB card with the cap. Today one replica holds the whole card.
+
+The other reading of the freed memory is prefix cache for a deployment with a large hot voice
+set, section 1. The default has to pick one, and the alternative default is in section 7,
+decision 4.
 
 ## 5. Validation
 
@@ -226,6 +234,16 @@ Box, with the paired protocol of plan 07 (interleaved boots, all GPU sample kept
 2. Drop `mem_fraction_static: 0.85` in this slice, or keep it and retire it separately.
    Recommended: drop, the profile never depends on it once the cap binds.
 3. The coverage log line: keep as one info line, or leave it to sglang's warning alone.
+4. The default beyond the bound. The cap leaves about 48 GB free on an 80 GB card, for
+   replicas and colocation by default and for the prefix cache through the existing knobs.
+   The alternative fixes the accounting instead of the pool: construct the vocoder before the
+   engine so sglang's profile sees its tokenizer copy and graphs, drop the 0.85 for sglang's
+   derived reserve, and let the pool take the rest, about 40 GB of prefix cache and roughly
+   7 GB free at the c16 peak. It is a construction order change in the pipeline process, a
+   larger slice, and it makes one replica hold the card unless budgets are declared.
+   Recommended: the cap, for the guarantee, the 48 GB margin the failed runs needed, and
+   density. The construction order fix stays a candidate for a later slice because it makes
+   the profiled ceiling honest for a deployment that raises the cap.
 
 ## 8. Validation tasks and open facts
 
