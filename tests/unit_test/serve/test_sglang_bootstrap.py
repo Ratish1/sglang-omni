@@ -139,7 +139,7 @@ def test_create_sglang_infrastructure_runs_0515_initialization_phases(
 def test_an_engine_is_refused_in_a_process_with_a_published_context(
     monkeypatch,
 ) -> None:
-    """ModelRunner publishes the process-wide runtime context, so a process
+    """ModelWorker publishes the process-wide runtime context, so a process
     that already holds one cannot host a second engine.
     """
     from sglang.srt.runtime_context import get_context

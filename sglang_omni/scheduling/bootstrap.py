@@ -109,10 +109,11 @@ def create_sglang_infrastructure(
     enable_prefill_input_embeds: bool = False,
 ):
     """Create SGLang worker, memory pools, and tree cache."""
-    # ModelRunner.__init__ publishes server_args as the process-wide runtime
-    # context; publishing again would silently reconfigure whatever already runs
-    # here, so an engine is only built where the context is unpublished. A
-    # construction that failed after publishing is therefore not retried here.
+    # ModelWorker publishes server_args as the process-wide runtime context
+    # once its pre-publish declarations are made; publishing again would
+    # silently reconfigure whatever already runs here, so an engine is only
+    # built where the context is unpublished. A construction that failed after
+    # publishing is therefore not retried here.
     from sglang.srt.runtime_context import get_context
 
     from sglang_omni.model_runner.model_worker import ModelWorker, ModelWorkerConfig

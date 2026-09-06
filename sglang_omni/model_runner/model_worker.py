@@ -78,6 +78,9 @@ class ModelWorker:
         self.tp_rank = tp_rank
         self._init_model_config()
         self._configure_backend_policy()
+        from sglang.srt.runtime_context import publish
+
+        publish(self.server_args, role="scheduler")
         self._init_model_runner()
         self._init_dllm_algorithm()
         self._prefill_cuda_graph_usage = _PrefillCudaGraphUsage()
@@ -116,8 +119,6 @@ class ModelWorker:
 
         self.model_config = ModelConfig.from_server_args(
             server_args=self.server_args,
-            model_path=self.server_args.model_path,
-            model_revision=self.server_args.revision,
             is_draft_model=False,
         )
 
