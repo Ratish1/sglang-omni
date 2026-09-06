@@ -10,7 +10,6 @@ from typing import Any
 import pytest
 
 import sglang_omni.platforms as platforms
-from tests.unit_test.fakes import FakeServerArgs
 
 TEST_MAX_TOTAL_TOKENS = 82000
 
@@ -456,7 +455,7 @@ def _build_minimal_tts_builder_harness(monkeypatch):
         checkpoint_dir: str, *, context_length: int, **kwargs: Any
     ) -> Any:
         build_kwargs.update(kwargs)
-        return FakeServerArgs(
+        return SimpleNamespace(
             checkpoint_dir=checkpoint_dir,
             context_length=context_length,
             cuda_graph_bs=None,

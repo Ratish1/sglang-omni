@@ -87,7 +87,10 @@ def test_configure_talker_server_args_writes_through_the_mutation_guard() -> Non
     configuration must go through the audited override path.
     """
     server_args_mod = pytest.importorskip("sglang.srt.server_args")
+    from sglang.srt.arg_groups.overrides import resolution_result
+
     server_args = server_args_mod.ServerArgs(model_path="dummy")
+    server_args.resolve_once()
 
     want_cuda_graph = configure_talker_server_args(
         server_args,
@@ -95,10 +98,11 @@ def test_configure_talker_server_args_writes_through_the_mutation_guard() -> Non
     )
 
     assert want_cuda_graph is True
-    assert server_args.disable_overlap_schedule is True
-    assert server_args.disable_cuda_graph is False
-    assert server_args.disable_radix_cache is True
-    assert server_args.chunked_prefill_size == 0
+    assert resolution_result(server_args, "disable_overlap_schedule") is True
+    assert resolution_result(server_args, "disable_cuda_graph") is False
+    assert resolution_result(server_args, "disable_radix_cache") is True
+    assert resolution_result(server_args, "chunked_prefill_size") == 0
+    assert server_args.disable_radix_cache is False
     audited_overrides = {}
     for source, fields in server_args._runtime_mutations:
         assert source == "qwen3_omni.talker"

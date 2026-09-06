@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from sglang.srt.arg_groups.overrides import resolution_result
 
 from sglang_omni.model_runner import model_worker
 from sglang_omni.platforms import cuda
@@ -401,8 +402,14 @@ def test_model_worker_backend_policy_precedence(
 
     assert effective_quantization == case.expected_quantization
     assert server_args.quantization == case.server_quantization
-    assert server_args.moe_runner_backend == case.expected_moe_backend
-    assert server_args.fp8_gemm_runner_backend == case.expected_fp8_gemm_backend
+    assert (
+        resolution_result(server_args, "moe_runner_backend")
+        == case.expected_moe_backend
+    )
+    assert (
+        resolution_result(server_args, "fp8_gemm_runner_backend")
+        == case.expected_fp8_gemm_backend
+    )
 
 
 def test_model_worker_backend_policy_uses_strict_server_args_override(
@@ -437,8 +444,8 @@ def test_model_worker_backend_policy_uses_strict_server_args_override(
     )
 
     assert effective_quantization == "fp8"
-    assert server_args.moe_runner_backend == "cutlass"
-    assert server_args.fp8_gemm_runner_backend == "triton"
+    assert resolution_result(server_args, "moe_runner_backend") == "cutlass"
+    assert resolution_result(server_args, "fp8_gemm_runner_backend") == "triton"
     assert server_args._runtime_mutations == [
         (
             "sglang-omni-qwen3-backend-policy",
@@ -480,7 +487,7 @@ def test_bf16_talker_moe_downgrade_keys_on_device_not_fp8(
     )
 
     assert effective_quantization is None
-    assert server_args.moe_runner_backend == expected_moe_backend
+    assert resolution_result(server_args, "moe_runner_backend") == expected_moe_backend
 
 
 @pytest.mark.parametrize("backend", ["flashinfer_cutlass", "cutlass"])
@@ -508,7 +515,7 @@ def test_auto_moe_runner_is_left_to_sglang_on_xpu() -> None:
     )
 
     assert effective_quantization is None
-    assert server_args.moe_runner_backend == "auto"
+    assert resolution_result(server_args, "moe_runner_backend") == "auto"
 
 
 def test_model_config_has_moe_prefers_effective_text_config() -> None:
@@ -846,11 +853,11 @@ def test_configure_backend_policy_fp8_gemm_ordering(
         case.model_arch_override,
     )
 
-    assert server_args.moe_runner_backend == case.expected_moe_backend, (
-        f"moe_runner_backend: expected {case.expected_moe_backend!r}, "
-        f"got {server_args.moe_runner_backend!r}"
+    assert (
+        resolution_result(server_args, "moe_runner_backend")
+        == case.expected_moe_backend
     )
-    assert server_args.fp8_gemm_runner_backend == case.expected_fp8_gemm_backend, (
-        f"fp8_gemm_runner_backend: expected {case.expected_fp8_gemm_backend!r}, "
-        f"got {server_args.fp8_gemm_runner_backend!r}"
+    assert (
+        resolution_result(server_args, "fp8_gemm_runner_backend")
+        == case.expected_fp8_gemm_backend
     )
