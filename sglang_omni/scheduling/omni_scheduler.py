@@ -2274,7 +2274,7 @@ class OmniScheduler:
                 self._release_request_kv_cache(req)
 
     def _release_request_kv_cache(self, req: Any) -> None:
-        if req.req_pool_idx is None and req.mamba_pool_idx is None:
+        if not req.kv.holds_kv and not req.kv.holds_mamba:
             return
         release_kv_cache(req, self.tree_cache)
 
@@ -2406,7 +2406,7 @@ class OmniScheduler:
         _resolve_and_process; the fast path previously dropped only finished.
 
         The dropped rows' step slots need no compensating free: the batch's
-        prepare already advanced req.kv_committed_len over them, and the
+        prepare already advanced req.kv.kv_committed_len over them, and the
         drain's release_kv_cache frees or caches every committed slot, so
         a second free here would put a slot on the free list that the radix
         tree (or another request) still owns.

@@ -12,7 +12,9 @@ from queue import Queue
 from types import SimpleNamespace
 
 import pytest
+import sglang.srt.managers.scheduler as sglang_scheduler_module
 import torch
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -28,11 +30,9 @@ from tests.unit_test.pipeline.helpers import run_scheduler
 
 @pytest.fixture(autouse=True)
 def _serving_bag(monkeypatch):
-    monkeypatch.setattr(
-        omni_scheduler_module,
-        "get_serving",
-        lambda: SimpleNamespace(weight_version=None),
-    )
+    serving = SimpleNamespace(weight_version=None)
+    monkeypatch.setattr(omni_scheduler_module, "get_serving", lambda: serving)
+    monkeypatch.setattr(sglang_scheduler_module, "get_serving", lambda: serving)
 
 
 def _ingress(
@@ -325,15 +325,13 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
             SimpleNamespace(
                 rid="req-1",
                 _omni_data=SimpleNamespace(),
-                req_pool_idx=1,
-                mamba_pool_idx=None,
+                kv=ReqKvInfo(req_pool_idx=1),
                 inflight_middle_chunks=0,
             ),
             SimpleNamespace(
                 rid="req-2",
                 _omni_data=SimpleNamespace(),
-                req_pool_idx=2,
-                mamba_pool_idx=None,
+                kv=ReqKvInfo(req_pool_idx=2),
                 inflight_middle_chunks=0,
             ),
         ],
@@ -394,6 +392,7 @@ def test_upstream_queue_limit_abort_is_translated_to_omni_output() -> None:
     req = SimpleNamespace(
         rid="req-over-limit",
         priority=None,
+        weight_version_events=[],
         time_stats=SimpleNamespace(
             trace_ctx=SimpleNamespace(
                 abort=lambda *, abort_info: trace_aborts.append(abort_info)
@@ -456,6 +455,7 @@ def test_enqueue_built_request_honors_max_queued_requests(monkeypatch) -> None:
         return SimpleNamespace(
             rid=rid,
             priority=None,
+            weight_version_events=[],
             origin_input_ids=array("q", [1]),
             origin_input_ids_unpadded=array("q", [1]),
             time_stats=SimpleNamespace(
@@ -636,6 +636,7 @@ def test_upstream_kv_exhaustion_abort_is_translated_to_omni_output() -> None:
     req = SimpleNamespace(
         rid="req-kv-exhausted",
         to_finish=omni_scheduler_module.FINISH_ABORT("decode KV exhausted"),
+        weight_version_events=[],
     )
 
     class ExhaustedBatch:
@@ -847,8 +848,7 @@ def test_omni_scheduler_abort_propagates_immediate_kv_cleanup_failure(
     req = SimpleNamespace(
         rid="req-fail",
         _omni_data=SimpleNamespace(),
-        req_pool_idx=1,
-        mamba_pool_idx=None,
+        kv=ReqKvInfo(req_pool_idx=1),
     )
     batch = SimpleNamespace(reqs=[req], batch_is_full=True)
     scheduler.running_batch = batch
@@ -896,7 +896,7 @@ def test_omni_scheduler_abort_marks_running_request_for_finish(monkeypatch) -> N
         rid="req-run",
         to_finish=None,
         finished_reason=None,
-        req_pool_idx=1,
+        kv=ReqKvInfo(req_pool_idx=1),
         is_retracted=False,
         finished=lambda: False,
         _omni_terminal_claimed=False,
@@ -988,8 +988,7 @@ def test_omni_scheduler_abort_treats_retracted_alias_as_waiting_owned() -> None:
         finished=lambda: False,
         to_finish=None,
         finished_reason=None,
-        req_pool_idx=None,
-        mamba_pool_idx=None,
+        kv=ReqKvInfo(),
         _omni_terminal_claimed=False,
     )
     request_data = SimpleNamespace(req=req)
@@ -1148,7 +1147,7 @@ def test_omni_scheduler_fish_abort_during_step_suppresses_chunk_and_result() -> 
         to_finish=None,
         finished=lambda: False,
         finished_reason=None,
-        req_pool_idx=1,
+        kv=ReqKvInfo(req_pool_idx=1),
         is_retracted=False,
         _omni_data=data,
         _omni_terminal_claimed=False,
@@ -1334,8 +1333,7 @@ def test_stream_output_atomically_claims_request_data_against_abort() -> None:
             self.finished_reason = None
             self.is_retracted = False
             self.to_finish = None
-            self.req_pool_idx = None
-            self.mamba_pool_idx = None
+            self.kv = ReqKvInfo()
             self._omni_terminal_claimed = False
 
         @property
@@ -1438,8 +1436,7 @@ def test_abort_after_terminal_close_runs_its_own_cleanup() -> None:
         rid="req-abort-after-close",
         _omni_data=data,
         _omni_terminal_claimed=True,
-        req_pool_idx=None,
-        mamba_pool_idx=None,
+        kv=ReqKvInfo(),
     )
     data.req = req
     batch = SimpleNamespace(reqs=[req], batch_is_full=True)
@@ -1506,8 +1503,7 @@ def test_abort_publishes_request_id_before_marking_terminal_finish() -> None:
         finished_reason=None,
         is_retracted=False,
         to_finish=None,
-        req_pool_idx=None,
-        mamba_pool_idx=None,
+        kv=ReqKvInfo(),
         _omni_data=data,
         _omni_terminal_claimed=False,
     )

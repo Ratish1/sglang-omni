@@ -5,6 +5,7 @@ from array import array
 from types import SimpleNamespace
 
 import pytest
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.scheduling import dllm_scheduler as dllm_scheduler_module
@@ -24,7 +25,7 @@ class _ReqDouble:
         self.output_ids: list[int] = []
         self.output_ids_through_stop: list[int] = self.output_ids
         self.finished_reason = None
-        self.req_pool_idx = 3
+        self.kv = ReqKvInfo(req_pool_idx=3)
         self.accepted_lengths: list[int] = []
         self._finished = False
 
@@ -233,7 +234,7 @@ def test_fdfo_unresolved_block_carries_tokens_state_and_resident_kv() -> None:
     assert scheduler._staging_queue == [req]
     assert cache_calls == []
     assert free_calls == []
-    assert req.req_pool_idx == 3
+    assert req.kv.req_pool_idx == 3
 
 
 def test_fdfo_resolved_block_commits_fill_ids_and_output_tokens() -> None:

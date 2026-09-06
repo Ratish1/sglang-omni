@@ -353,9 +353,9 @@ class DllmScheduler:
                 new_staging.append(req)
                 continue
             self.tree_cache.cache_unfinished_req(req, chunked=True)
-            if req.req_pool_idx is not None:
-                # Note:(Chenchen Hong) post1 ReqToTokenPool.free takes the Req
-                # (reads req.req_pool_idx then resets it to None), not the int.
+            if req.kv.holds_kv:
+                # ReqToTokenPool.free takes the Req, not the int: it reads
+                # req.kv.req_pool_idx and resets it to None.
                 self.req_to_token_pool.free(req)
             new_staging.append(req)
         self._staging_queue = new_staging
