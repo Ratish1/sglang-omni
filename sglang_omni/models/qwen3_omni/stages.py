@@ -1122,13 +1122,15 @@ def create_sglang_thinker_executor_from_config(
         prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
         prefill_coalesce_when_idle=prefill_coalesce_when_idle,
     )
+    from sglang.srt.runtime_context import get_schedule
+
     post_load_process_mem = get_process_gpu_memory_bytes(gpu_id)
     logger.info(
         f"sglang_ar_started stage=thinker gpu_id={gpu_id} tp_rank={tp_rank}/{tp_size} "
         f"context_length={max_seq_len} "
         f"total_gpu_memory_fraction={total_gpu_memory_fraction} "
         f"effective_total_gpu_memory_fraction={effective_total_gpu_memory_fraction} "
-        f"mem_fraction_static={server_args.mem_fraction_static} "
+        f"mem_fraction_static={get_schedule().mem_fraction_static} "
         f"pre_load_avail_mem={pre_load_avail_mem} "
         f"post_load_avail_mem={avail_gpu_mem(gpu_id)} "
         f"pid={os.getpid()} "
@@ -1218,12 +1220,14 @@ def create_talker_ar_executor_from_config(
         enable_partial_start=enable_partial_start,
         partial_start_min_chunks=partial_start_min_chunks,
     )
+    from sglang.srt.runtime_context import get_schedule
+
     post_load_process_mem = get_process_gpu_memory_bytes(gpu_id)
     logger.info(
         f"sglang_ar_started stage=talker_ar gpu_id={gpu_id} tp_rank={tp_rank}/{tp_size} "
         f"context_length={max_seq_len} "
         f"total_gpu_memory_fraction={total_gpu_memory_fraction} "
-        f"mem_fraction_static={server_args.mem_fraction_static} "
+        f"mem_fraction_static={get_schedule().mem_fraction_static} "
         f"pre_load_avail_mem={pre_load_avail_mem} "
         f"post_load_avail_mem={avail_gpu_mem(gpu_id)} "
         f"pid={os.getpid()} "

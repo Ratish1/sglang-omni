@@ -15,6 +15,7 @@ from sglang.srt.layers.sampler import multinomial_with_seed
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix
 from torch import nn
 
@@ -1275,12 +1276,11 @@ class Qwen3TTSTalker(nn.Module):
     def _resolve_predictor_graph_enabled(self) -> bool:
         if not _predictor_graph_env_enabled():
             return False
-        server_args = get_global_server_args()
-        if bool(server_args.disable_cuda_graph):
+        if bool(get_exec().graph.disable_cuda_graph):
             return False
         # Note: (Jiaxin Deng) capture under TP would record collectives; the
         # graphed chain is only validated single-rank, so TP stays eager.
-        return int(server_args.tp_size) == 1
+        return int(get_parallel().tp_size) == 1
 
     def _predictor_forward_graphed(
         self,

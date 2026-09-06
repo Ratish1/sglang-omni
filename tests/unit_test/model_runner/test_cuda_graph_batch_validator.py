@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import sglang_omni.utils.cuda_graph_batch_validator as cgv
 from sglang_omni.utils.cuda_graph_batch_validator import (
     evaluate_cuda_graph_batch_sizing,
@@ -12,6 +14,16 @@ from sglang_omni.utils.cuda_graph_batch_validator import (
     read_model_buffer_capacity,
     validate_stage,
 )
+
+_BAGS = SimpleNamespace(schedule=SimpleNamespace(), graph=SimpleNamespace())
+
+
+@pytest.fixture(autouse=True)
+def _published_bags(monkeypatch):
+    _BAGS.schedule = SimpleNamespace(max_running_requests=64)
+    _BAGS.graph = SimpleNamespace(disable_cuda_graph=False, cuda_graph_config=None)
+    monkeypatch.setattr(cgv, "get_schedule", lambda: _BAGS.schedule)
+    monkeypatch.setattr(cgv, "get_exec", lambda: SimpleNamespace(graph=_BAGS.graph))
 
 
 class _FakeTensor:
@@ -34,13 +46,13 @@ def _fake_runner(
     decode_cuda_graph_runner = (
         SimpleNamespace(capture_bs=capture_bs) if has_decode_cuda_graph_runner else None
     )
+    _BAGS.schedule.max_running_requests = max_running_requests
+    _BAGS.graph.disable_cuda_graph = disable_cuda_graph
     return SimpleNamespace(
         server_args=SimpleNamespace(
-            max_running_requests=max_running_requests,
             cuda_graph_config=SimpleNamespace(
                 decode=SimpleNamespace(max_bs=cuda_graph_max_bs)
             ),
-            disable_cuda_graph=disable_cuda_graph,
         ),
         req_to_token_pool=SimpleNamespace(size=request_slots),
         decode_cuda_graph_runner=decode_cuda_graph_runner,
@@ -365,10 +377,10 @@ def _attest_server_args(
     bs: tuple[int, ...] = (128, 256),
     backend_locked: bool = True,
 ):
+    _BAGS.graph.cuda_graph_config = SimpleNamespace(
+        prefill=SimpleNamespace(backend=backend, bs=list(bs))
+    )
     return SimpleNamespace(
-        cuda_graph_config=SimpleNamespace(
-            prefill=SimpleNamespace(backend=backend, bs=list(bs))
-        ),
         _cuda_graph_config_locked=(
             {("prefill", "backend")} if backend_locked else set()
         ),
