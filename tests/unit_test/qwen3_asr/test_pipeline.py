@@ -31,11 +31,11 @@ from sglang_omni.scheduling.generation_batch_policy import (
 
 @pytest.fixture(autouse=True)
 def _select_non_mlx_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    import sglang.srt.utils.tensor_bridge as tensor_bridge
+    import sglang.srt.hardware_backend.mlx.runtime as mlx_runtime
 
     # Backend-specific tests opt into MLX explicitly. Keep CUDA/ROCm/Torch MPS
     # profile tests independent of the caller's SGLANG_USE_MLX environment.
-    monkeypatch.setattr(tensor_bridge, "use_mlx", lambda: False)
+    monkeypatch.setattr(mlx_runtime, "use_mlx", lambda: False)
 
 
 def _fake_server_args_builder(build_kwargs: dict[str, object]):
@@ -222,7 +222,7 @@ def test_qwen3_asr_explicit_prefill_backend_overrides_rocm_default(
 
 
 def test_qwen3_asr_torch_mps_uses_eager_native_profile() -> None:
-    from sglang.srt.utils.tensor_bridge import use_mlx
+    from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
     if use_mlx():
         pytest.skip("Torch MPS profile requires SGLANG_USE_MLX=0")
@@ -252,9 +252,9 @@ def test_qwen3_asr_torch_mps_uses_eager_native_profile() -> None:
 def test_qwen3_asr_mlx_profile_overrides_typed_torch_compile_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import sglang.srt.utils.tensor_bridge as tensor_bridge
+    import sglang.srt.hardware_backend.mlx.runtime as mlx_runtime
 
-    monkeypatch.setattr(tensor_bridge, "use_mlx", lambda: True)
+    monkeypatch.setattr(mlx_runtime, "use_mlx", lambda: True)
     monkeypatch.setattr(qwen3_asr_builder.current_platform, "is_mps", lambda: True)
     builder = _make_engine_builder()
     builder.device = "mps"

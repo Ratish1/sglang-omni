@@ -132,7 +132,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
 
     def _uses_torch_mps(self) -> bool:
         import torch
-        from sglang.srt.utils.tensor_bridge import use_mlx
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
         return (
             not use_mlx()
@@ -141,7 +141,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         )
 
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
-        from sglang.srt.utils.tensor_bridge import use_mlx
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
         if use_mlx():
             if not current_platform.is_mps():
@@ -210,7 +210,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         return defaults
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
-        from sglang.srt.utils.tensor_bridge import use_mlx
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
         if use_mlx():
             from sglang_omni.model_runner.mlx_model_worker import (
@@ -259,7 +259,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         )
 
     def validate_before_infrastructure(self, server_args: Any) -> None:
-        from sglang.srt.utils.tensor_bridge import use_mlx
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
         if use_mlx() and server_args.mlx_enable_sampling:
             raise ValueError(
@@ -301,7 +301,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         self._log_memory_checkpoint("post_static_allocation")
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
-        from sglang.srt.utils.tensor_bridge import use_mlx
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
         if "context_length" in overrides:
             self.context_length = int(overrides.pop("context_length"))
@@ -331,7 +331,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         *,
         generation_cuda_graph_enabled: bool,
     ) -> None:
-        from sglang.srt.utils.tensor_bridge import use_mlx
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
         if use_mlx():
             # note (yexiaodong): Native MLX prefill owns audio encoding, so the
@@ -392,7 +392,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
 
     def make_adapters(self, model: Any) -> tuple[Any, Any]:
         del model
-        from sglang.srt.utils.tensor_bridge import use_mlx
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
         return request_builders.make_qwen3_asr_scheduler_adapters(
             tokenizer=self.tokenizer,

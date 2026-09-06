@@ -41,7 +41,7 @@ def _describe_sglang_runtime_configuration(
 
 def init_sglang_cuda_graphs(model_worker: Any) -> None:
     """Initialize SGLang graphs with Omni's prefill-embedding capture view."""
-    from sglang.srt.utils.tensor_bridge import use_mlx
+    from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
     if use_mlx():
         # note (yexiaodong): The MLX stub has no Torch graph lifecycle because
@@ -137,7 +137,7 @@ def create_sglang_infrastructure(
         kv_cache_bytes=kv_cache_bytes,
         enable_prefill_input_embeds=enable_prefill_input_embeds,
     )
-    from sglang.srt.utils.tensor_bridge import use_mlx
+    from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
     if use_mlx():
         # Note (Jiaxin Deng): the MLX worker sizes no SGLang KV pool, so a
