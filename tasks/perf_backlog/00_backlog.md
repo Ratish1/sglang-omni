@@ -31,7 +31,13 @@ Plans for items in this list are written as numbered docs in this folder.
    base `2c00eb688` against upstream main `91e9c3095` on 2026-09-05 with
    the same outcome (doc 03 section 12). PR #1971 opened 2026-09-05 with
    the body in `pr_qwen3_tts_predictor_chain.md`, head `8c8ae636b` after
-   the getattr removal and its test fakes, owed: CI and review. S2
+   the getattr removal and its test fakes. Review fixes and the cross
+   model audit landed as six commits, head `d26ac7a1e` pushed 2026-09-06
+   (docs 06 and 07, readout 08). Owed: the idle host rerun of doc 08
+   section 4 (Qwen3-TTS c1 and c16, Qwen3-Omni full corpus, probes), then
+   the memory provisioning slice before the 128 running gate and S2's c16,
+   since both fail inside cuDNN with the card full (doc 08 section 2, seam
+   decision in section 4 below). S2
    implemented at `ccfc4af45` on `perf/qwen3-tts-predictor-rope-store`,
    stacked on that head, owed: its box run (doc 04 section 7 step 3).
    The slices
@@ -199,6 +205,10 @@ Source: the ledger on `perf/qwen3-tts-hidden-h2d-sync-v2` at
 
 ## 4. Decisions the user owns
 
+- The Qwen3-TTS pool sizing seam for the memory provisioning slice: a
+  builder default `max_total_tokens` derived from the running cap times
+  the context length (recommended, doc 07 section 4) or a stage
+  `engine.kv_cache_bytes`. Plan doc 05 follows the decision.
 - E3 penalty ownership on Qwen3-TTS, device side mask or synchronous
   penalty requests (doc 05 section 9).
 - PR A pinned budget for the encoder caches (doc 05 section 9).
