@@ -88,6 +88,20 @@ matters:
 The schema already refuses `kv_cache_bytes` together with `max_total_tokens` (schema.py:154-160)
 because the lower token cap would silently shrink the byte pool. That rule shapes the seam.
 
+Two regimes, so the knobs above stop reading as one jumble. When stages run as separate
+processes on one card, the Qwen3-Omni colocated profile, the card is partitioned: each stage
+declares `gpu_memory_fraction`, an engine's pool is its share minus what its process already
+used (sglang_model_runner.py:122-147), or an operator declares the pool in bytes, and
+`total_reserve_bytes` caps a process so it fails itself and not a co-tenant. Those are the
+tools for a partition. When the stages share one process, the shipped Qwen3-TTS profile, there
+is nothing to partition, the stage fraction never reaches the factory, and sglang's LLM rule
+sizes the one pool for the whole process while knowing only the LLM's activations. The
+vocoder's tokenizer copy and graphs, the reference encoder and the predictor graphs are the
+first regime's needs living in the second regime's process. The talker is LLM serving in every
+other respect, and for a large thinker with long contexts the tight fraction rule stands; for
+this engine the pool is not the throughput lever, section 1 measures why, and the cap is the
+seam.
+
 ## 3. Design
 
 One change at the builder: derive the token cap from the admission bound after the overrides
