@@ -562,7 +562,6 @@ def test_backend_global_initialization_for_fp8_moe_model(monkeypatch) -> None:
     _install_fake_backend_modules(monkeypatch, calls)
 
     model_worker._initialize_model_worker_backend_globals(
-        _server_args(),
         _model_config(quantization="fp8", native_fp8_block_quant=True),
         "fp8",
     )
@@ -576,7 +575,6 @@ def test_backend_global_initialization_for_bf16_moe_omits_fp8(monkeypatch) -> No
     _install_fake_backend_modules(monkeypatch, calls)
 
     model_worker._initialize_model_worker_backend_globals(
-        _server_args(),
         _model_config(quantization=None),
         None,
     )
@@ -707,12 +705,12 @@ def _install_fake_backend_modules(
     _install_fake_module(
         monkeypatch,
         "sglang.srt.layers.moe",
-        initialize_moe_config=lambda server_args: calls.append("moe"),
+        initialize_moe_config=lambda: calls.append("moe"),
     )
     _install_fake_module(
         monkeypatch,
         "sglang.srt.layers.quantization.fp8_utils",
-        initialize_fp8_gemm_config=lambda server_args: calls.append("fp8"),
+        initialize_fp8_gemm_config=lambda: calls.append("fp8"),
     )
 
 

@@ -77,10 +77,13 @@ class ModelWorker:
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self._init_model_config()
-        self._configure_backend_policy()
+        effective_quantization = self._configure_backend_policy()
         from sglang.srt.runtime_context import publish
 
         publish(self.server_args, role="scheduler")
+        _initialize_model_worker_backend_globals(
+            self.model_config, effective_quantization
+        )
         self._init_model_runner()
         self._init_dllm_algorithm()
         self._prefill_cuda_graph_usage = _PrefillCudaGraphUsage()
@@ -160,7 +163,7 @@ class ModelWorker:
             model_config.v_head_dim = model_config.head_dim
             model_config.vocab_size = int(text_cfg.vocab_size)
 
-    def _configure_backend_policy(self) -> None:
+    def _configure_backend_policy(self) -> str | None:
         # Apply Omni-specific quantization adapters (stage-local checkpoint name
         # normalization) before SGLang builds its quant config, then run the
         # model_worker backend policy.
@@ -171,15 +174,10 @@ class ModelWorker:
             self.model_arch_override,
         )
 
-        effective_quantization = current_platform.apply_model_worker_backend_policy(
+        return current_platform.apply_model_worker_backend_policy(
             self.server_args,
             self.model_config,
             self.model_arch_override,
-        )
-        _initialize_model_worker_backend_globals(
-            self.server_args,
-            self.model_config,
-            effective_quantization,
         )
 
     def get_memory_pool(self):
@@ -542,18 +540,20 @@ def _apply_omni_quantization_adapters(model_config: ModelConfig) -> None:
 
 
 def _initialize_model_worker_backend_globals(
-    server_args: ServerArgs,
     model_config: ModelConfig,
     effective_quantization: str | None,
 ) -> None:
-    """Initialize backend globals needed by direct workers before model loading."""
+    """Initialize backend globals needed by direct workers before model loading.
+
+    Both initializers read the published config bags, so this runs after publish.
+    """
 
     if model_config_has_moe(model_config):
         from sglang.srt.layers.moe import initialize_moe_config
 
-        initialize_moe_config(server_args)
+        initialize_moe_config()
 
     if effective_quantization == "fp8":
         from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 
-        initialize_fp8_gemm_config(server_args)
+        initialize_fp8_gemm_config()
