@@ -645,7 +645,7 @@ def test_qwen_predictor_decode_graph_matches_eager(monkeypatch: pytest.MonkeyPat
     layer0_codes = torch.tensor([[1], [7]], dtype=torch.int, device=device)
     talker_hidden = torch.randn(2, 1, 8, device=device)
 
-    # SGLang 0.5.15 constructs nested model buffers while its outer runner is
+    # Upstream constructs nested model buffers while its outer runner is
     # in inference mode. Replaying later from a no-grad capture must still be
     # allowed to update those inference tensors in place.
     with torch.inference_mode():

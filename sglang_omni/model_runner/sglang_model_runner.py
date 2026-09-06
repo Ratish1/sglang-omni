@@ -449,7 +449,7 @@ class SGLModelRunner(ModelRunner):
     def post_capture_resize_kv_pool(self):
         """Back the KV pool post-capture without silently shrinking a byte budget.
 
-        SGLang 0.5.16's post-capture sizing re-derives the pool from live free
+        Upstream's post-capture sizing re-derives the pool from live free
         memory, which can only shrink the pool below the declared
         ``kv_cache_bytes`` when capture-time allocations ate into it. A byte
         budget is authoritative, so a shrink must fail loudly instead of

@@ -79,7 +79,7 @@ def test_runtime_configuration_reports_explicit_phase_backends(
     )
 
 
-def test_create_sglang_infrastructure_runs_0515_initialization_phases(
+def test_create_sglang_infrastructure_runs_the_upstream_initialization_phases(
     monkeypatch, published
 ) -> None:
     events: list[str] = []

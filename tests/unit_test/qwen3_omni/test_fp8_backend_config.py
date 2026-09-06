@@ -551,7 +551,7 @@ def test_fp8_cutlass_moe_support_matches_sglang_0_5_16_contract(
     sm120_supported: bool,
     expected_supported: bool,
 ) -> None:
-    """Mirrors the CUTLASS FP8 MoE assertions in SGLang 0.5.16."""
+    """Mirrors upstream's CUTLASS FP8 MoE assertions."""
     _install_fake_cutlass_support_modules(
         monkeypatch,
         cutlass_supported=cutlass_supported,
