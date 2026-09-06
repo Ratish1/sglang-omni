@@ -512,11 +512,14 @@ def _apply_model_worker_backend_common_policy(
     server_args: ServerArgs,
     model_arch_override: str | None,
 ) -> str | None:
+    from sglang.srt.arg_groups.model_override_base import resolved_view
+
+    cfg = resolved_view(server_args)
     is_qwen3_omni_arch = model_arch_override in (
         "Qwen3OmniTalker",
         "Qwen3OmniThinkerForCausalLM",
     )
-    if is_qwen3_omni_arch and server_args.ep_size != 1:
+    if is_qwen3_omni_arch and cfg.ep_size != 1:
         raise ValueError(
             "Qwen3-Omni ModelWorker does not support expert parallelism; "
             "use ep_size=1."

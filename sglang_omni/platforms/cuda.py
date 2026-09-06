@@ -5,6 +5,7 @@ import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.platforms.cuda import CudaDeviceMixin
 
 from sglang_omni.platforms.interface import OmniPlatform
@@ -98,7 +99,8 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
             server_args, model_config, model_arch_override
         )
 
-        moe_runner_backend = server_args.moe_runner_backend
+        cfg = resolved_view(server_args)
+        moe_runner_backend = cfg.moe_runner_backend
         is_qwen3_omni_arch = model_arch_override in (
             "Qwen3OmniTalker",
             "Qwen3OmniThinkerForCausalLM",
@@ -118,14 +120,12 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
         ):
             # Note:(Chenchen Hong) flashinfer_cutlass MoE deadlocks CUDA-graph
             # capture on H20 (no H20 kernel coverage); triton captures cleanly there.
+            moe_runner_backend = "triton" if _is_h20_device() else "flashinfer_cutlass"
             override_server_args(
                 server_args,
                 "sglang-omni-qwen3-backend-policy",
-                moe_runner_backend=(
-                    "triton" if _is_h20_device() else "flashinfer_cutlass"
-                ),
+                moe_runner_backend=moe_runner_backend,
             )
-            moe_runner_backend = server_args.moe_runner_backend
 
         if (
             is_qwen3_omni_arch
@@ -135,12 +135,12 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
             and has_native_fp8_block_quant
             and _is_fp8_cutlass_moe_supported()
         ):
+            moe_runner_backend = "cutlass"
             override_server_args(
                 server_args,
                 "sglang-omni-qwen3-backend-policy",
-                moe_runner_backend="cutlass",
+                moe_runner_backend=moe_runner_backend,
             )
-            moe_runner_backend = server_args.moe_runner_backend
 
         if (
             is_qwen3_omni_arch
@@ -165,7 +165,7 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
                 "'auto' so Omni selects a native-FP8-compatible MoE runner."
             )
 
-        fp8_gemm_backend = normalize_quantization(server_args.fp8_gemm_runner_backend)
+        fp8_gemm_backend = normalize_quantization(cfg.fp8_gemm_runner_backend)
         if (
             model_arch_override == "Qwen3OmniTalker"
             and effective_quantization == "fp8"
@@ -174,14 +174,14 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
         ):
             # Projected talker prefill has request-dependent FP8 dense GEMM shapes
             # outside decode CUDA graph replay; DeepGEMM can otherwise JIT there.
+            fp8_gemm_backend = "triton"
             override_server_args(
                 server_args,
                 "sglang-omni-qwen3-backend-policy",
-                fp8_gemm_runner_backend="triton",
+                fp8_gemm_runner_backend=fp8_gemm_backend,
             )
-            fp8_gemm_backend = server_args.fp8_gemm_runner_backend
 
-        server_quantization = server_args.quantization
+        server_quantization = cfg.quantization
         logger.info(
             f"Configured SGLang backend policy: arch={model_arch_override} "
             f"effective_quantization={effective_quantization} "

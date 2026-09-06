@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from numbers import Integral
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
 
@@ -22,17 +23,20 @@ _PREFILL_PADDING_FACTOR = 2
 
 def get_decode_cuda_graph_max_bs(server_args: Any) -> Any:
     """Read the resolved SGLang decode CUDA Graph batch cap."""
-    return server_args.cuda_graph_config.decode.max_bs
+    cfg = resolved_view(server_args)
+    return cfg.cuda_graph_config.decode.max_bs
 
 
 def get_decode_cuda_graph_bs(server_args: Any) -> Any:
     """Read the resolved SGLang decode CUDA Graph batch buckets."""
-    return server_args.cuda_graph_config.decode.bs
+    cfg = resolved_view(server_args)
+    return cfg.cuda_graph_config.decode.bs
 
 
 def get_prefill_cuda_graph_backend(server_args: Any) -> str:
     """Read the resolved SGLang prefill CUDA graph backend."""
-    return server_args.cuda_graph_config.prefill.backend
+    cfg = resolved_view(server_args)
+    return cfg.cuda_graph_config.prefill.backend
 
 
 def build_default_cuda_graph_bs(max_bs: int) -> list[int]:
@@ -211,13 +215,14 @@ def validate_generation_batch_policy(
     model_buffer_bs: int | None = None,
 ) -> None:
     errors: list[str] = []
+    cfg = resolved_view(server_args)
 
     max_running_requests = _validate_positive_int(
         "max_running_requests",
-        server_args.max_running_requests,
+        cfg.max_running_requests,
         errors,
     )
-    cuda_graph_enabled = not bool(server_args.disable_cuda_graph)
+    cuda_graph_enabled = not bool(cfg.disable_cuda_graph)
 
     cuda_graph_max_bs: int | None = None
     cuda_graph_bs: tuple[int, ...] | None = None
@@ -255,10 +260,10 @@ def validate_generation_batch_policy(
 
     _validate_prefill_graph_policy(server_args, cuda_graph_enabled, errors)
 
-    torch_compile_enabled = bool(server_args.enable_torch_compile)
+    torch_compile_enabled = bool(cfg.enable_torch_compile)
     torch_compile_max_bs = _validate_positive_int(
         "torch_compile_max_bs",
-        server_args.torch_compile_max_bs,
+        cfg.torch_compile_max_bs,
         errors,
         required=torch_compile_enabled,
     )
@@ -289,7 +294,8 @@ def _validate_prefill_graph_policy(
 ) -> None:
     """Validate the declared prefill CUDA graph policy: breakable backend
     only, with explicitly declared buckets."""
-    backend = get_prefill_cuda_graph_backend(server_args)
+    cfg = resolved_view(server_args)
+    backend = cfg.cuda_graph_config.prefill.backend
     if backend == CudaGraphBackend.DISABLED:
         return
 
@@ -307,10 +313,10 @@ def _validate_prefill_graph_policy(
         return
 
     incompatibilities = (
-        ("context parallel (attn_cp_size > 1)", server_args.attn_cp_size > 1),
-        ("decode context parallel (dcp_size > 1)", server_args.dcp_size > 1),
-        ("LoRA", bool(server_args.lora_paths) or bool(server_args.enable_lora)),
-        ("MoE A2A", server_args.moe_a2a_backend != "none"),
+        ("context parallel (attn_cp_size > 1)", cfg.attn_cp_size > 1),
+        ("decode context parallel (dcp_size > 1)", cfg.dcp_size > 1),
+        ("LoRA", bool(cfg.lora_paths) or bool(cfg.enable_lora)),
+        ("MoE A2A", cfg.moe_a2a_backend != "none"),
     )
     for feature, is_active in incompatibilities:
         if is_active:
@@ -327,7 +333,7 @@ def _validate_prefill_graph_policy(
         )
         return
 
-    prefill_cfg = server_args.cuda_graph_config.prefill
+    prefill_cfg = cfg.cuda_graph_config.prefill
     buckets = _normalize_cuda_graph_bs(
         prefill_cfg.bs, errors, field="cuda_graph_bs_prefill"
     )
@@ -343,8 +349,8 @@ def _validate_prefill_graph_policy(
 
     # Buckets above either per-forward token cap can never replay.
     for cap_name, cap_value in (
-        ("chunked_prefill_size", server_args.chunked_prefill_size),
-        ("max_prefill_tokens", server_args.max_prefill_tokens),
+        ("chunked_prefill_size", cfg.chunked_prefill_size),
+        ("max_prefill_tokens", cfg.max_prefill_tokens),
     ):
         if (
             cap_value is not None

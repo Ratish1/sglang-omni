@@ -41,11 +41,14 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
         register_dots_tts_hf_config()
 
     def customize_server_args(self, server_args: Any) -> None:
+        from sglang.srt.arg_groups.model_override_base import resolved_view
+
+        cfg = resolved_view(server_args)
         # The compiled DiT path only serves max_running_requests=1; the batched
         # tail is eager, so skip the process-global compile policy otherwise.
         # The policy must exist before SGLang builds the model; applying it in
         # setup_model nests Dynamo under FX.
-        if self.optimize and int(server_args.max_running_requests) == 1:
+        if self.optimize and int(cfg.max_running_requests) == 1:
             from sglang_omni.models.dots_tts.stages import _configure_optimized_kernels
 
             _configure_optimized_kernels()

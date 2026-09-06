@@ -259,13 +259,15 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         )
 
     def validate_before_infrastructure(self, server_args: Any) -> None:
+        from sglang.srt.arg_groups.model_override_base import resolved_view
         from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
-        if use_mlx() and server_args.mlx_enable_sampling:
+        cfg = resolved_view(server_args)
+        if use_mlx() and cfg.mlx_enable_sampling:
             raise ValueError(
                 "Qwen3-ASR MLX currently requires mlx_enable_sampling=False"
             )
-        if self._uses_torch_mps() and server_args.max_running_requests != 1:
+        if self._uses_torch_mps() and cfg.max_running_requests != 1:
             raise ValueError(
                 "Qwen3-ASR Torch MPS currently requires max_running_requests=1"
             )

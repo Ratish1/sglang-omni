@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.platforms.device_mixin import DeviceMixin
 
 from sglang_omni.utils.misc import normalize_quantization
@@ -51,8 +52,9 @@ class OmniPlatform(DeviceMixin):
     ) -> str | None:
         """Apply Omni backend policy after checkpoint quantization is known."""
 
+        cfg = resolved_view(server_args)
         effective_quantization = normalize_quantization(model_config.quantization)
-        server_quantization = normalize_quantization(server_args.quantization)
+        server_quantization = normalize_quantization(cfg.quantization)
         if server_quantization is not None:
             effective_quantization = server_quantization
         return effective_quantization

@@ -26,7 +26,6 @@ def test_runtime_configuration_reports_global_backend_for_each_phase(
         decode_attention_backend=None,
         prefill_attention_backend=None,
         sampling_backend="pytorch",
-        get_attention_backends=lambda: ("flashinfer", "flashinfer"),
     )
 
     description = bootstrap._describe_sglang_runtime_configuration(
@@ -55,7 +54,6 @@ def test_runtime_configuration_reports_explicit_phase_backends(
         decode_attention_backend="triton",
         prefill_attention_backend="fa3",
         sampling_backend="pytorch",
-        get_attention_backends=lambda: ("fa3", "triton"),
     )
 
     description = bootstrap._describe_sglang_runtime_configuration(

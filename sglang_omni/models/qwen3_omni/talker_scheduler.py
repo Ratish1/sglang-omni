@@ -25,7 +25,10 @@ def configure_talker_server_args(
     after the model worker is constructed.
     """
 
-    want_cuda_graph = not bool(server_args.disable_cuda_graph)
+    from sglang.srt.arg_groups.model_override_base import resolved_view
+
+    cfg = resolved_view(server_args)
+    want_cuda_graph = not bool(cfg.disable_cuda_graph)
     overrides = {
         "disable_radix_cache": True,
         "chunked_prefill_size": 0,

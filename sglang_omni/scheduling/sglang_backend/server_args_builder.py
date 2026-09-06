@@ -113,7 +113,8 @@ def apply_encoder_mem_reserve(
     if encoder_mem_reserve == 0:
         return
 
-    current = server_args.mem_fraction_static
+    cfg = resolved_view(server_args)
+    current = cfg.mem_fraction_static
     if current is None:
         return
 
