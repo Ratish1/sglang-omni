@@ -1,9 +1,10 @@
 # Revalidation of the predictor chain branch after the review fixes
 
-Branch `perf/qwen3-tts-predictor-chain`, head `0a88253c6`. The five commits after the benchmarked
-head `8c8ae636b` are `92bad0055` (greedy seed table gate), `00b31da66` (startup set outside the
-lazy budget), `377e42a1a` (temperature floor test), `c93ba9858` (history compaction at
-retraction) and `0a88253c6` (typing). None of the branches below is pushed yet.
+Branch `perf/qwen3-tts-predictor-chain`. The commits after the benchmarked head `8c8ae636b`
+are `92bad0055` (greedy seed table gate), `00b31da66` (startup set outside the lazy budget),
+`377e42a1a` (temperature floor test), `c93ba9858` (history compaction at retraction),
+`0a88253c6` (typing) and `d26ac7a1e` (history fields on the base request data, see plan 07).
+The B arm is the branch head once `d26ac7a1e` is pushed.
 
 Arms: A is `7989a5ed2`, the main commit merged into the branch at `6b233296d`, so the diff of
 the arms is the branch alone. B is `0a88253c6`. Checkouts on the box follow the archive layout,
