@@ -5808,6 +5808,14 @@ def test_qwen3_tts_engine_disables_torch_compile_by_default() -> None:
     assert defaults["enable_torch_compile"] is False
 
 
+def test_qwen3_tts_engine_leaves_the_memory_fraction_to_sglang() -> None:
+    from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
+
+    defaults = Qwen3TtsEngineBuilder().generation_defaults(dtype="bfloat16")
+
+    assert "mem_fraction_static" not in defaults
+
+
 @pytest.mark.parametrize("value", [True, 1, "1", "true", " yes ", "on"])
 def test_qwen3_tts_engine_rejects_torch_compile(value) -> None:
     from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder

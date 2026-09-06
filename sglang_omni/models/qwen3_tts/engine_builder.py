@@ -89,7 +89,6 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
             "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
             "enable_torch_compile": False,
-            "mem_fraction_static": 0.85,
             "max_prefill_tokens": 8192,
             "sampling_backend": "pytorch",
             "trust_remote_code": True,
