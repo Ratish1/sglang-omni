@@ -1,190 +1,210 @@
 # Qwen3-TTS memory provisioning plan
 
-Revision 3, Sep 7 2026, after the design review in
-`tasks/qwen3_tts_memory_provisioning_review_20260907/` (review.md and mechanics.md). Every
-finding of that review was re-read against the sources it cites and holds, and each is folded
-in below with its number. One PR carries the whole thing, the rope store lands after it on its
-own branch. Sources: the branch `perf/qwen3-tts-kv-pool-admission-bound` at `52ee606fa`, merged
-with main `53e94dfa5`, sglang v0.5.18 at `/Users/ratish/sglang-worktrees/v0.5.18`, torch
-v2.13.0 at `/Users/ratish/pytorch`, qwen-tts 0.1.1 from the review's evidence tarball, which is
-the version the box runs (`env/pip_freeze.txt` of the kv pool archive).
+Revision 4, Sep 7 2026, after `review_revision3.md` in
+`tasks/qwen3_tts_memory_provisioning_review_20260907/`. Every finding R3-1 to R3-6 was re-read
+against its sources and holds, and each is folded in below by number. One PR carries the
+whole thing, the rope store lands after it. Sources: the branch
+`perf/qwen3-tts-kv-pool-admission-bound` at `52ee606fa` on main `53e94dfa5`, sglang v0.5.18,
+torch v2.13.0, qwen-tts 0.1.1 as installed on the box, transformers v5.12.1 Mimi source from
+the review's evidence, and the speech tokenizer config of `Qwen/Qwen3-TTS-12Hz-1.7B-Base`.
 
 ## 1. The origin of the problem
 
 The process is one OS process with three stages built in config order, preprocessing,
 tts_engine, vocoder (stage_workers.py:493-500). Memory is provisioned once, when sglang sizes
-the KV pool inside the engine stage's factory (bootstrap.py:180). sglang sizes it from device
-free memory after `empty_cache` (v0.5.18 utils/common.py:433-443), minus a slack it derives
-for an LLM's own activations and graphs (server_args.py:4956-4983, kv_cache_configurator.py:
-1764-1811). That rule sees what is resident at that moment and nothing else.
+the KV pool inside the engine's factory (bootstrap.py:180), from device free memory after
+`empty_cache` (v0.5.18 utils/common.py:433-443) minus a slack derived for an LLM's activations
+and graphs (server_args.py:4956-4983, kv_cache_configurator.py:1764-1811). The rule sees what
+is resident at that moment and nothing else.
 
-Two things are wrong with the moment, and they are the origin. Everything else in the archives
-is a symptom of them.
+Two things are wrong with that moment. Resources of the same process are created after it:
+the engine's tokenizer copy in `setup_model` (engine_builder.py:126-132), the vocoder's copy
+and its 192 decode graphs in the vocoder factory (stages.py:245-279), whose three private
+pools hold 1544 MiB each, proven by pool id in the kv pool snapshot. And no transient of the
+non LLM components is accounted anywhere, they allocate at request time out of what the pool
+left. At 16 running the admission cap hides both, at 128 running the card fills and the run
+failed with `CUDNN_STATUS_INTERNAL_ERROR` at 6 MiB free, with the failing allocation not
+attributed (R3, F6).
 
-1. Resources of the same process are created after the pool is sized: the engine's tokenizer
-   copy in `setup_model` (engine_builder.py:126-132), the vocoder's tokenizer copy and its 192
-   decode graphs in the vocoder factory (stages.py:245-279). The graph pools alone are 4.5 GiB,
-   three private pools of 1544 MiB, one per capture stream, proven by pool id in the kv pool
-   snapshot. sglang never sees them, so its slack is spent on them before a request arrives.
-2. No transient of the non LLM components is accounted anywhere. The reference encoder, the
-   speaker encoder and the whole utterance decode allocate at request time out of whatever is
-   left, and sglang's slack is a formula for LLM activations, not for them.
+The rule:
 
-At 16 running the admission cap on this branch hides both, the pool is 14 GiB and 48 GB stays
-free. At 128 running the cap does not bind, the pool takes the card again, the vocoder's graph
-pools and transients fill the rest, and the run failed with `CUDNN_STATUS_INTERNAL_ERROR` at
-6 MiB free (revalidation LIMITATIONS.md:9). Which allocation failed is not proven, cuDNN's
-convolution workspace goes through torch's allocator (torch Conv_v8.cpp, `run_conv_plan`),
-so the fix rests on headroom, not on that attribution (F6).
+    pool = min(admission bound, upstream sizing over the resident set − transient allowances)
 
-The rule this plan implements:
+The first term is on the branch and measured. This revision adds the second by building the
+resident set before the readings and by subtracting allowances measured for a declared
+envelope. Conservation is over what is simultaneously live on the device, so every allowance
+below names its execution owner and its lifetime (R3-3).
 
-    pool = min(what admission can commit, budget − resident need − transient allowances)
+## 2. Every allocator in the process
 
-The first term is on the branch and measured. The second term is what this revision adds:
-make the resident need visible to sglang's own rule by building it first, and subtract the
-transient allowances measured at the bounds the deployment already declares.
+The inventory the plan has to conserve, with who creates it, when, and what bounds it.
 
-## 2. What already exists and is reused, not rebuilt
+| Allocation | Owner and creation point | Lifetime | Bound today |
+| --- | --- | --- | --- |
+| talker, code predictor, speaker encoder weights | ModelWorker in create_sglang_infrastructure (bootstrap.py:159). The speaker encoder exists for Base only (sglang_model.py:878-884) | resident | checkpoint |
+| per row decode buffers, predictor K and V cache | talker init (sglang_model.py:255-272, 900-954) | resident | `max_running_requests` |
+| KV pool, req_to_token, allocator free list | alloc_memory_pool (bootstrap.py:180) | resident | this plan |
+| sglang decode and prefill graphs | init_sglang_cuda_graphs (engine_factory.py:223) | resident, private pools | sglang's graph reserve |
+| predictor graphs | setup_model_resources (engine_builder.py:172-179) | resident | bucket ladder |
+| speech tokenizer weights, encoder and decoder halves | engine `setup_model` and vocoder factory, two copies today | resident | checkpoint |
+| vocoder decode graph pools, 3 holders x 64 graphs | `warmup_now` in the vocoder factory (streaming_vocoder.py:336-372, 699-704) | resident, private pools (0,3) (0,4) (0,5) | shape table x graph flags |
+| per holder static input and output buffers | same | resident, 32 MiB per stream | shape table |
+| LLM prefill and decode activations | sglang forward | transient | sglang's slack |
+| reference encode activations | two callers: the ref code batcher thread, batches of up to 8 clips (request_builders.py:743-756, 834-843), and the uploaded voice miss path calling `wrapper.create_voice_clone_prompt` on a preprocessing worker (request_builders.py:1105-1112, wrapper `qwen3_tts_model.py:418-419`) | transient, until the batcher's stream event or the worker's call returns. A caller that times out at 130 s (request_builders.py:951) stops waiting, the GPU work still completes | nothing. Mimi's first convolution writes `samples x 64 channels` at the input rate (encoder config `num_filters` 64, MimiEncoder `layers.0`) |
+| speaker encoder mel and forward | each preprocessing worker, singleton calls, up to 8 workers (stages.py:109, request_builders.py:946-949) | transient | nothing, same clip |
+| whole utterance decode | one call at a time on the vocoder scheduler thread (streaming_simple_scheduler.py:383-430), also reachable through `fallback_full_decode` (streaming_vocoder.py:1836-1843, 1923-1927) | transient | batch <= `max_batch_size`, padded to the longest item, forwards of at most 325 frames (qwen-tts `chunked_decode`, 300 plus 25), retained chunk views, concatenation, float32 conversion |
+| streaming decode, graph replay | initial worker plus 2 follow up workers, each its own stream and holder (streaming_vocoder.py:519-521, 626-648, 713-726) | transient per worker: the replay clones its output (streaming_vocoder.py:396), the deltas are converted to float32 and kept alive through the D2H copy (streaming_vocoder.py:1193-1215) | window <= 24 frames, batches 32 initial and 8 follow up |
+| streaming decode, eager fallback | any worker when a shape has no graph: capture continues past a failed shape (streaming_vocoder.py:355-368), replay returns None on a miss (379-393), the worker then runs `chunked_decode` eagerly (1191-1192) | transient per worker, can overlap across all three | same batches, no graph pool |
+| pinned host staging, speaker cache | per worker and module level | host memory | not on the device |
+| CUDA context, cuDNN plans, graph executables | driver and libraries, plan caches are per thread (torch Conv_v8.cpp:357, 366), the conv workspace goes through torch's allocator | resident and growing at first use per thread and shape | nothing |
+| allocator cache and fragmentation | torch | reserved but not live, released only by `empty_cache` and never for surviving graph pools (torch CUDACachingAllocator.cpp:111-120) | nothing |
 
-The review's instruction was to fix the origin and not re-implement bounds the code has.
-These are the bounds the plan relies on, each read at its line.
+## 3. What already exists and is reused
 
-| Bound | Where it lives today | How the plan uses it |
+| Bound | Where it lives | How the plan uses it |
 | --- | --- | --- |
-| Prompt plus generation must fit the context | `enforce_request_limits` is on for Qwen3-TTS (request_builders.py:127), the engine rejects prompt plus `max_new_tokens` above `context_length − 1` (omni_scheduler.py:1171-1180, 1291-1299, 319-322) | It bounds the reference too: the prompt ids carry one id per reference frame (request_builders.py:1239, 1427-1428), so a reference can never exceed `context_length` frames, 8191 frames or 655 s at 12.5 frames per second. The plan applies this same bound before the encoder runs, section 3.3 |
-| Whole utterance decode is chunked and padded | qwen-tts 0.1.1: the wrapper pads the batch to its longest item (`qwen3_tts_tokenizer.py:329`), `model.decode` calls `chunked_decode` with 300 frame chunks and 25 frames of left context, chunks are kept on the GPU and concatenated (`modeling_qwen3_tts_tokenizer_v2.py:886-896, 1015`) | The decoder's peak is bounded by `max_batch_size` × 325 frames of chunk activation plus batch × `context_length` × 1920 samples × 4 bytes of retained output. A fixed shape, probed once. No split, no window, no schedule change (F1) |
-| One whole utterance decode at a time | the non streaming loop calls `_vocode_payloads` synchronously on the scheduler thread (streaming_simple_scheduler.py:383-430) | One decode allowance, not three (F2) |
-| Reference encode concurrency | one batcher thread, batches of up to 8 clips (request_builders.py:743-756, 834-843), up to 8 preprocessing workers each running the speaker encoder (stages.py:109, request_builders.py:923-949) | The encode and speaker allowances are taken at those widths (F2) |
-| Streaming decode shapes | windows of at most 24 frames, initial batches up to 32, follow up batches up to 8, 2 follow up workers (streaming_vocoder.py:54-90, 519-521, stages.py:227-235) | Graph pools become resident before the pool by the reorder, the eager fallback for groups above 8 is one more allowance |
-| The engine's own reserve | sglang's derived `mem_fraction_static`, reachable as `pre_capture_activation_reserve_mb` and `reserve_for_graph_mb` (server_args.py:5057-5118) | Kept as is for the LLM, never re-derived here |
-| Byte budget and stage fraction paths | `engine.kv_cache_bytes` and `gpu_memory_fraction` (sglang_model_runner.py:93-147) | Untouched, a deployment that declares either keeps its own rule |
+| prompt length | Qwen3-TTS sets `enforce_request_limits` (request_builders.py:127), the engine rejects an input at or above `context_length − 2` (omni_scheduler.py:1247-1258, sglang utils.py:193-223) | final authority for the ICL prompt, which carries one id per reference frame plus text and control positions (sglang_model.py:621-660, 773-800) |
+| generation length | sglang clamps `max_new_tokens` to `max_req_len − input − 1` and to the pool (scheduler.py:2176-2210), it does not reject | the decoder's input from the engine is bounded by `context_length` frames in every mode (R3-4) |
+| whole utterance decode shape | qwen-tts 0.1.1 pads and chunks | the decoder scratch is a fixed shape, no algorithm change (F1) |
+| explicit budgets | `engine.kv_cache_bytes`, `gpu_memory_fraction`, `total_reserve_bytes` | untouched, and legitimate operator contracts, not heuristics (R3-2) |
+| the 30 s uploaded voice bound | speech_voices.py:33-34 | the shipped default of the reference envelope, section 3.3 |
 
-## 3. Design
+Two relations the previous revision claimed and the review disproved (R3-1). The context does
+not bound a reference in x vector only mode: `ref_code` is None there
+(request_builders.py:956-960), `build_voice_clone_inputs` takes the plain text route
+(sglang_model.py:626-643), and the clip's length never reaches the prompt. The flag is a
+request field (protocol.py:354). And for ICL the reference frames fitting the context is a
+necessary precheck, not the engine's check, because the prompt adds text and control
+positions. So the context bounds the decoder's input, never the raw reference.
 
-### 3.1 Build the vocoder before the engine, one tokenizer per process
+## 4. Design
 
-Config order becomes preprocessing, vocoder, tts_engine (config.py:54-83). Stages build in
-list order, the dispatcher registers all of them after the last factory returns, readiness
-follows the last start, and routing follows the named `next` and `stream_to` edges, so the
-reorder changes construction and not data flow (stage_workers.py:450-500, F5 agrees).
+### 4.1 Build the vocoder before the engine, one tokenizer per process
 
-The vocoder factory loads the tokenizer and captures its graphs (stages.py:245-279), then
-publishes the tokenizer through a Qwen owned, process local registry keyed by checkpoint
-revision, resolved device, dtype and attention implementation. The engine's `setup_model`
-asks the registry with its own key and loads its own copy on a miss, which is what happens in
-the split preprocessing layout where the vocoder lives in another process (config.py:85-94,
-F5). The two users touch disjoint halves of the object: the encoder on the ref code thread
-(request_builders.py:840-843, 884-893), the decoder in the vocoder (streaming_vocoder.py:503,
-1884-1886, 1927). The graph holders own their static buffers per worker, not the module
-(streaming_vocoder.py:671-675). The fused SnakeBeta swap mutates the decoder in place and is
-off by default (streaming_vocoder.py:504-512), a registry entry records whether it was applied
-so a consumer never receives a module it did not expect.
+Config order becomes preprocessing, vocoder, tts_engine (config.py:54-83). Construction is
+list order, registration and start follow the last factory, routing follows the named edges
+(stage_workers.py:450-500). The vocoder factory loads the tokenizer, captures its graphs and
+publishes the object in a Qwen owned, process local registry keyed by checkpoint revision,
+device, dtype, attention implementation and whether the fused SnakeBeta swap was applied
+(streaming_vocoder.py:504-512). The engine acquires it inside the before pool callback of 4.4
+with its own key, and loads its own copy on a miss before any probe runs (R3-6). A split
+preprocessing layout moves preprocessing only (config.py:85-88), the vocoder and the engine
+still share a process and the registry works there.
 
-Effect: the tokenizer weights and the 4.5 GiB of graph pools are resident when sglang takes
-both of its free memory readings, so its own rule charges them. One tokenizer copy fewer.
+Effect: the tokenizer weights and the graph pools are resident when sglang takes both of its
+free memory readings. sglang's own rule charges them, nothing here charges them again.
 
-### 3.2 Probe at the loaded model, before the pool
+### 4.2 The envelope, declared by the pipeline config
 
-`pre_infra_setup` runs before the model exists, so it cannot touch the speaker encoder, which
-is a sub module of the talker (sglang_model.py:878-884, F4). The probe runs at the one
-boundary where the real weights exist and the pool does not: between `ModelWorker`
-construction and `alloc_memory_pool` (bootstrap.py:159-180). `create_sglang_infrastructure`
-gains one optional keyword, a callback that receives the model worker and the resolved server
-args, carried through `infra_kwargs` like `total_gpu_memory_fraction` is today
-(engine_factory.py:175, bootstrap.py:98-110). The default is none, so no other model changes.
+The engine builder does not know the sibling stages' settings. The pipeline config does, and
+it already injects cross stage facts per stage (config.py:88-110). It passes the engine
+factory one `memory_envelope` argument built from its own stage list and factory settings:
 
-Qwen3-TTS's callback runs each non LLM component once at its derived maximum and records its
-peak the way vLLM's profiling context does (F6): synchronize, reset the peak counter, run,
-synchronize, read `max_memory_allocated` minus the allocation live before the run, free the
-outputs, `empty_cache`. Each run is on the thread that owns it in serving where that thread
-exists at startup, and the plan records that cuDNN's plan caches are per thread (torch
-Conv_v8.cpp:357, 366), so plans for other serving threads build at first use inside the
-headroom of 3.6.
+- whether preprocessing runs in this process, and its worker width (8)
+- whether the vocoder runs in this process, its decode batch (8), initial and follow up
+  batches (32, 8), follow up worker count (2), graph flags
+- the model variant, Base or not
+- the accepted reference duration, section 4.3
+- an optional `headroom_bytes`, section 4.6
 
-| Probe | Shape, all derived | Bounds it from |
+Probes run only for components this process executes for this variant (R3-2, R3-6): no
+reference probes for CustomVoice or VoiceDesign, none when preprocessing is in another
+process, no decoder probes when the vocoder is, none at all under a byte budget or a stage
+fraction, and nothing when the envelope is absent, so every other model is unchanged.
+
+### 4.3 The reference envelope is a serving contract
+
+An encoder whose memory is linear in samples cannot be reserved for an input with no bound,
+and the model provides none. At the context bound the first Mimi activation alone is
+8 clips x 15,728,640 samples x 64 channels x 2 bytes, about 16 GB, before the residual and
+transformer layers (R3-2). So the accepted reference duration is a declared value, applied at
+input normalization for every encoder caller, the ad hoc hook, the uploaded voice miss path
+and x vector only mode alike, rejected before any GPU work with a named error. The shipped
+default is the uploaded voice bound, 30 s, so ad hoc and uploaded references follow one rule.
+A deployment that serves longer references raises the value and pays the measured allowance.
+Frame counts use the tokenizer's rounding, ceiling of samples over the downsample rate
+(qwen-tts `modeling_qwen3_tts_tokenizer_v2.py:983`), never a float multiplication. The ICL
+precheck against the context stays, and the engine keeps final authority. The context derived
+bound of revision 3 is withdrawn.
+
+### 4.4 The before pool callback
+
+`create_sglang_infrastructure` gains one optional keyword, a callback invoked between
+`ModelWorker` construction and `alloc_memory_pool` (bootstrap.py:159-180), carried through
+`infra_kwargs`. It receives the model worker and the resolved server args and returns a
+result: the allowances by component, the retained bytes the probes left behind, and the
+envelope they used. Bootstrap consumes the result once and assigns it on the runner before
+`alloc_memory_pool` creates the configurator (v0.5.18 model_runner.py:799-807), the way the
+omni configurator swap already reads runner attributes (sglang_model_runner.py:600-618).
+`ModelWorkerConfig` is not the carrier, it is built and copied before the callback runs
+(R3-6). Failure of a probe aborts startup naming the component.
+
+Measurement, per probe, on the thread that owns it where that thread exists at startup:
+synchronize, record allocated, reset the peak, run, synchronize, read the peak, free the
+outputs, record allocated again.
+
+    transient = peak − allocated after the run
+    retained  = allocated after − allocated before
+
+Only the transient enters an allowance. The retained bytes are reported and not subtracted,
+sglang's reading after the callback sees them (R3-5, vLLM `mem_utils.py:314-328`). Peak
+allocated does not include cross stream deferred frees or fragmentation, which section 4.6
+addresses.
+
+### 4.5 The allowances, one per execution owner
+
+| Owner | Probe | Geometry, all declared |
 | --- | --- | --- |
-| tokenizer encoder | 8 clips of `context_length` frames of audio at the tokenizer's input rate | batcher width, section 2 |
-| speaker encoder | 8 clips of the same length, one per preprocessing worker | preprocessing width |
-| whole utterance decode | 8 items of 325 frames, one chunk with its left context, plus retained output computed as 8 × `context_length` × `decode_upsample_rate` × 4 bytes | vocoder batch, decoder chunking, engine context |
-| streaming eager fallback | one initial batch of 32 windows of 24 frames through `chunked_decode` | initial batch width |
+| reference encode | the larger of one batched encode of 8 clips at the envelope and 8 singleton wrapper encodes of one clip, since under 8 workers at most 8 clips are in preparation and either caller geometry can hold them (R3-3) | batcher width, worker width, envelope |
+| speaker encoder | 8 singleton forwards at the envelope, mel included | worker width, envelope |
+| whole utterance decode | scratch: `decoder.forward` on `(8, num_quantizers, 325)`, the real maximum forward, which a `tokenizer.decode` of 325 frames never runs (R3-4). Retained storage: the maximum over the loop's three phases, retained chunk views including their discarded context plus the current forward, all retained chunks plus the concatenation, the final output plus the float32 conversion of one item, computed from batch, `context_length`, `decode_upsample_rate` 1920 and the resident dtype | vocoder batch, engine context, decoder config |
+| streaming workers | three eager `chunked_decode` calls at once, 32 windows on the initial worker and 8 on each follow up, plus per worker the replay clone and the float32 deltas at the largest captured shape | worker policy, batches, shape table |
 
-Every input is a configuration value or a value read from the loaded checkpoint. Nothing is a
-constant chosen here. If the encoder probe at 655 s of audio is too large for a card, the knob
-that shrinks it is `context_length`, which the deployment owns, and the startup line says so.
+Summed, never shared (decision 2). No allowance for a component this process does not run.
 
-### 3.3 Apply the existing context bound before the encoder runs
+### 4.6 Sizing, the post capture path, and headroom
 
-Preprocessing knows a clip's duration after normalization and before it submits the encode
-(request_builders.py:923-935). It rejects a reference whose frame count, duration times the
-tokenizer's frame rate, exceeds `context_length − 1`, with the same error the engine would
-raise later. This is the engine's rule moved to the point where the GPU work starts, not a
-new limit, and it does not touch the 30 s uploaded voice rule or the byte limits of the
-serving layer (speech_voices.py:33-34, speech_limits.py:10). The seed-tts corpus sits between
-36 and 111 frames, so no request of any archive changes. The 30 s limit of revision 2 is
-withdrawn (F3).
+`_OmniKVCacheConfigurator` gains `kv_cache_reserve_bytes`, set from the callback result. On
+the upstream path only:
 
-### 3.4 The reserve, static allowances, one accounting
+    bytes  = upstream(free after load, pre load free, slack, mm reservation) − reserve
+    tokens = min(running × context, bytes // cell size)
 
-The reserve is the sum of the probe peaks of 3.2, one allowance per component that can
-allocate at the same time as the others (F2): encode, speaker, one whole utterance decode,
-one eager streaming fallback. Summed, never shared. The double spend of revision 2, the
-decoder allowed to consume the whole reserve, is gone. Shared credits are not in this plan
-and only become a question if the sum does not fit a card, section 7.
+sglang keeps its slack, its multimodal and hybrid handling, and the cap applies as the
+minimum (kv_cache_configurator.py:1844-1859). The byte budget and fraction paths are
+untouched.
 
-The reserve reaches the pool sizing through the omni configurator, which is the existing
-integration point. `ModelWorkerConfig` and `_OmniKVCacheConfigurator` gain
-`kv_cache_reserve_bytes` (model_worker.py:28-35, sglang_model_runner.py:600-618), carried by
-`infra_kwargs` next to the callback above. On the upstream path only, the reserve is subtracted
-from what sglang's own rule returns:
+The post capture resize (kv_pool_runtime.py:41-101) would recompute without the reserve.
+With a reserve present the flag is refused when the server args are validated, before any
+weight loads (engine_factory.py:173), not after startup work (R3, F7).
 
-    bytes = upstream(free after load, pre load free, slack, mm reservation) − reserve
+Headroom has an owner and a definition (R3-5). Two quantities are measured on the
+qualification run and reported separately: external growth, device used minus torch reserved
+at time t minus the same at ready, its maximum over the run, and torch retention above live,
+reserved minus allocated at the peak. The readout states whether sglang's slack covered both.
+If it did not, the deployment declares `headroom_bytes` in the envelope and it is added to
+the reserve. No number is written into code for any card, and a card the run did not
+qualify is architecture compatible, not qualified (section 5).
 
-sglang keeps its own slack for the LLM and its multimodal and hybrid handling, the reserve is
-subtracted from its result and never recomputed here (F7 second half). The admission cap then
-applies as the minimum (kv_cache_configurator.py:1844-1859):
+### 4.7 The startup line
 
-    tokens = min(running × context, (upstream − reserve) // cell size)
+`post_scheduler_setup` reports the accounting mode, the envelope, each allowance and the
+retained bytes, the reserve, the pool in tokens and bytes, the admission bound, and free
+memory at startup end, named as such.
 
-Both `resident need` terms of section 1 are inside `upstream` because 3.1 made them resident
-before the readings, so nothing is charged twice (F6).
-
-The post capture resize path (kv_pool_runtime.py:41-101) recomputes the budget from live free
-memory and would not carry the reserve (F7). It is off by default
-(`SGLANG_ENABLE_POST_CAPTURE_KV_SIZING`, environ.py:513). The omni override that already wraps
-it (sglang_model_runner.py:442-497) refuses the flag when a reserve is present, with a message
-naming both, until that path is integrated.
-
-### 3.5 The startup line
-
-`post_scheduler_setup` (engine_builder.py:206-218) reports: the accounting mode (cap, upstream
-with reserve, byte budget, fraction), the resolved envelope (running, context, decoder batch,
-encode width, preprocessing width), each probe's peak, the reserve, the pool in tokens and
-bytes, the admission bound, and the free memory sampled at that point, named as free at
-startup end rather than pool end (F8).
-
-### 3.6 Headroom
-
-Two things stay outside the reserve by their nature: cuDNN plan caches built at first use on
-threads the probe did not run on, and any growth outside the torch allocator. The
-qualification run of section 5 measures them as whole device used minus torch reserved at the
-steady peak, on both configured points. That measured number is recorded per card in the
-readout and becomes the free floor the run must hold, a declared value with a measurement
-behind it, never an inferred guarantee (F6, F8).
-
-### 3.7 Memory map and startup flow, 80 GB H100
+### 4.8 Memory map and flow, 80 GB H100
 
 ```
 main, fraction 0.85            branch today, cap             this plan
 +----------------------+ 81 GB +----------------------+ 81 GB +----------------------+ 81 GB
-| free at peak: <1 GB  |       | free: ~48 GB         |       | free: >= headroom    |
+| free at peak: <1 GB  |       | free: ~48 GB         |       | free: slack, headroom|
 +----------------------+       |                      |       +----------------------+
-| decode transients,   | ~7    |                      |       | allowances: encode,  | reserve,
-| cache, cuDNN plans   |       +----------------------+       | speaker, decode,     | measured
-+----------------------+       | transients, graphs   | ~7    | eager fallback       |
+| transients, cache,   | ~7    |                      |       | allowances: encode,  | measured
+| cuDNN plans          |       +----------------------+       | speaker, decode,     | at the
++----------------------+       | transients, graphs   | ~7    | streaming            | envelope
 | graphs 4.5, tok x2   | ~6    +----------------------+       +----------------------+
 +----------------------+       | graphs 4.5, tok x2   | ~6    | graphs 4.5, tok x1   | resident,
-|                      |       +----------------------+       | seen by sglang       | charged once
+|                      |       +----------------------+       | charged by sglang    | once
 |  KV pool 589142      | 62.9  | KV pool 131072       | 14.0  +----------------------+
 |  (bound 131072)      |       |                      |       | KV pool = min(bound, | 14.0 at 16
 +----------------------+       +----------------------+       |  upstream − reserve) | fits at 128
@@ -194,100 +214,100 @@ main, fraction 0.85            branch today, cap             this plan
 
 ```
 preprocessing factory                                           stages.py:106
-vocoder factory: tokenizer, publish, 192 graphs                 stages.py:216-279      3.1
+vocoder factory: tokenizer, publish, 192 graphs                 stages.py:216-279      4.1
 tts_engine factory -> build()
-  adjust_overrides: max_total_tokens = running x context        engine_builder.py:152-158
-  infra_kwargs: before_pool callback, reserve holder            engine_factory.py:175  3.2, 3.4
+  envelope from the pipeline config                             config.py:88           4.2
+  adjust_overrides: max_total_tokens = running x context        engine_builder.py:152
+  validate: refuse post capture sizing with a reserve           engine_factory.py:173  4.6
+  infra_kwargs: before pool callback                            engine_factory.py:175  4.4
   create_sglang_infrastructure
     consume byte budget if declared                             bootstrap.py:131
-    ModelWorker: weights load, both free readings               bootstrap.py:159
-    before_pool callback: probes, peaks -> reserve              new, bootstrap.py:159-180  3.2
-    alloc_memory_pool: upstream − reserve, min with the cap     bootstrap.py:180, kvcc 1844
-  setup_model: registry hit or local load                       engine_builder.py:126  3.1
+    ModelWorker: weights, both free readings                    bootstrap.py:159
+    callback: acquire tokenizer, probe, return result           new                    4.4, 4.5
+    result assigned on the runner                               new
+    alloc_memory_pool: upstream − reserve, min with the cap     bootstrap.py:180
+  setup_model: registry object already attached                 engine_builder.py:126
   graphs, predictor graphs                                      engine_factory.py:223, 235
-  post_scheduler_setup: the line of 3.5                         engine_builder.py:206
-serving: preprocessing applies the context bound before encode  request_builders.py:923  3.3
+  post_scheduler_setup: the line of 4.7                         engine_builder.py:206
+serving: normalization applies the reference envelope           request_builders.py:931 4.3
 ```
 
-### 3.8 Alternatives read and not taken
+### 4.9 Alternatives read and not taken
 
-- Splitting the decode batch to a byte budget and windowing oversize items, revision 2. The
-  decoder is already chunked and padded, the transient is bounded by configuration, and the
-  windowed path would change the audio of every non streaming response (F1).
-- A 30 s limit for ad hoc references. Not a model rule, the card and README state none, and
-  the context already bounds the reference (F3, section 3.3).
-- Probing in `pre_infra_setup`. The speaker encoder does not exist yet (F4).
-- A stage `gpu_memory_fraction` for tts_engine. A constant no measurement pins, and it still
-  measures no transient.
-- Fencing torch with `total_reserve_bytes` alone. It caps this process's allocator and reserves
-  nothing for what fails outside it.
-- Generalizing the probes to every model. Only the callback and the reserve field are
-  generic. Each model's envelope is its own contract, with default reserve zero (review).
+- A context derived reference bound. It bounds nothing in x vector mode and only prechecks
+  ICL (R3-1).
+- Probing the encoder at the context bound. 16 GB for one activation, and it shrinks the
+  text and generation capacity if used as the remedy (R3-2).
+- A decoder split or window, revision 2 (F1).
+- Probing in `pre_infra_setup`, the model does not exist there (F4).
+- Carrying the reserve through `ModelWorkerConfig`, it is built before the callback (R3-6).
+- A per card headroom constant in code (R3-5).
 
-## 4. What the freed memory unblocks
+## 5. Portability
 
-Measured on the branch: 48 GB free at c16 on an 80 GB card. Expected from this revision: the
-128 running run holding the headroom instead of 2 GB, the rope store's c16 pair with the card
-free, a second replica or a colocated stage under declared budgets, which remain the
-deployment's to declare (review).
+The algorithm is the same on every card: the resident set built first, sglang's own reading
+of the local device, allowances measured locally at the declared envelope. The numbers are
+not: an H200 sizes a larger pool from its larger reading when the cap does not bind, and its
+workspaces, graph residency and headroom are its own measurements. A run on one card
+qualifies that card. The plan promises the accounting, not equal pool sizes or throughput.
 
-## 5. Validation
+## 6. Validation
 
-Unit, per commit: the reorder keeps routing and readiness order, the registry hits on an equal
-key and loads locally on a different device, dtype, revision or attention implementation, the
-callback runs between weights and pool and its failure aborts startup with the component
-named, the reserve reaches the configurator and is subtracted only on the upstream path, the
-post capture flag with a reserve is refused, the context bound rejects a clip before the
-encode is submitted and passes one at the bound, the startup line carries every field.
+Remote unit checks, per commit: the reference envelope rejects above the bound on all three
+caller paths and before any device work, an x vector reference longer than the context is
+accepted below the envelope and rejected above it, the ICL precheck passes what the engine
+would accept and the engine keeps final authority, the registry hits on an equal key and
+loads locally otherwise, the callback runs between weights and pool, returns a consumed
+result, and aborts startup naming a failed probe, the reserve reaches the configurator on the
+upstream path only, the post capture flag is refused before weights load, the allowances
+follow the envelope predicates for every layout and variant, the startup line carries every
+field.
 
-Box, paired protocol of plan 07, three arms on one frozen base (F8): A upstream main, C the
-cap alone, B the whole branch. Same packages, same checkpoint revision recorded.
+Box, three frozen arms on one base: A upstream main, C the cap alone, B the whole branch.
 
 | Gate | Setup | Evidence |
 | --- | --- | --- |
-| Startup accounting | default and 128 running, cold boots | allocator snapshots before resources, after weights, after probes, after the pool, after each capture, at ready. Allocated, reserved, private pools, device free. No term counted twice. Startup time |
-| Decoder shape contract | fixed codes at 1, 24, 25, 299, 300, 301, 325, 326 frames and at the context bound, batch 1, 2, 8, ragged batches | padded shape, chunk shape, peak, retained output. Sample counts, trimming, order and audio identical to A on the same codes, deterministic mode included |
-| Reference envelope | cold distinct references at the context bound, above it, cache hits, x vector only | encoder and speaker peaks, rejection before GPU work above the bound, cache hit behaviour unchanged |
-| Concurrent serving | 128 requests in flight with long completions, reference misses and streaming mixed in | no OOM, no cuDNN failure, no allocator retry, free memory above the headroom throughout |
-| Alternate decode route | streaming transport with codec streaming off, eager fallbacks forced | every full decode route completes and stays inside its allowance |
-| c1 and c16 corpus | two boots per arm | c1 byte identical to A, c16 inside the archived range, throughput inside the paired spread, cached tokens 13576 of 74096 at c1 |
-| Lifecycle | cancellation while queued, during encode, during decode, forced retraction | no leak, no missing or duplicate result, memory returns to its steady envelope |
-| Layouts | shared process, split preprocessing, explicit byte budget, stage fraction | local fallback, unchanged override authority, reserve absent where a budget is declared |
-| Cache capacity | a prefix working set above the cap | hit rate and prefill work documented, the opt out through explicit sizing works |
+| Probe cost | default and 128 running, cold boots | each probe's time and transient, retained bytes, startup time against A |
+| Startup accounting | same | snapshots before resources, after weights, after probes, after the pool, after each capture, at ready. Each category mapped to the sizing input exactly once |
+| Reference contract | ICL and x vector, ad hoc batched and uploaded misses, cache hits, clips at and above the envelope | encoder and speaker transients per caller geometry, rejection before device work above the envelope |
+| Decoder contract | fixed codes at 1, 24, 25, 299, 300, 301, 325, 326, 625 frames and the context bound, batch 1, 2, 8, ragged | forward shapes, scratch and retained storage against the formula, audio identical to A on the same codes, deterministic mode |
+| Execution classes | full decode, replay, eager fallback with a shape removed from the capture, singleton and overlapping workers, timeout and cancellation | every path inside its allowance, memory back to the steady envelope |
+| Concurrent serving | 128 in flight with long completions, reference misses and streaming mixed | no OOM, no cuDNN failure, no allocator retry, external growth and torch retention recorded for 4.6 |
+| c1 and c16 corpus | two boots per arm | c1 byte identical to A, c16 inside the archived range, throughput inside the paired spread, cached tokens 13576 of 74096 |
+| Layouts | shared process, split preprocessing, byte budget, stage fraction, CustomVoice | predicates hold, override authority unchanged, no probe where the process does not run the component |
+| Cache capacity | a prefix working set above the cap | hit rate and prefill work documented, the explicit sizing opt out works |
 
-## 6. The commit series inside the one PR
-
-Each reviewed by you before it lands.
+## 7. The commit series inside the one PR
 
 1. On the branch: the cap, the fraction removal, the startup line.
-2. The context bound before the encode, with its test.
-3. Stage order, the tokenizer registry with its key and fallback, the engine and vocoder
-   consumers.
-4. The before pool callback in bootstrap and the engine factory, default none.
-5. Qwen3-TTS's probes and the measurement helper.
-6. `kv_cache_reserve_bytes` through the worker config and the configurator, the post capture
-   refusal.
-7. The startup line.
+2. The reference envelope at normalization, all three callers, with tests.
+3. Stage order, the keyed tokenizer registry, the vocoder publish and the engine acquire.
+4. The envelope argument from the pipeline config.
+5. The before pool callback in bootstrap and the engine factory, default none.
+6. Qwen3-TTS's probes and the measurement helper.
+7. `kv_cache_reserve_bytes` on the runner and the configurator, the early post capture
+   refusal, `headroom_bytes`.
+8. The startup line.
 
-## 7. Decisions
+## 8. Decisions
 
-1. Static allowances, no shared credits. Shared credits become a question only if the summed
-   reserve does not fit a card at its deployment's context, and the first answer then is the
-   context, not a scheduler.
-2. Scope is the default CUDA layout. Split and budgeted layouts keep today's behaviour with
-   the local fallback.
-3. Post capture sizing with a reserve is refused until integrated.
-4. Headroom is the measured non torch growth of the qualification run, recorded per card.
+1. The reference envelope default. Recommended: the uploaded voice bound, 30 s, so both
+   reference paths follow one rule. It rejects ad hoc references above 30 s that succeed
+   today when memory allows, which is a serving contract change and yours to make.
+2. Static allowances, no shared credits.
+3. Scope: the default CUDA layout for Base. Other variants and layouts run only the probes
+   for what they execute.
+4. Post capture sizing with a reserve refused at validation.
+5. Headroom is deployment declared, measured by the qualification run, never a constant in
+   code.
 
-## 8. Validation tasks and open facts
+## 9. Validation tasks and open facts
 
-1. Tokenizer resident bytes and the graph pool footprint at startup, from the snapshots of
-   gate one.
-2. The four probe peaks on the H100 at `context_length` 8192, and whether the encoder probe at
-   that bound is acceptable at startup.
-3. Non torch growth at the steady peak, the headroom of 3.6.
-4. Whether `Qwen3TTSTokenizer.decode` output padding changes any sample of a shorter item in a
-   ragged batch, from the decoder shape gate. The plan makes no batch change, so this only
-   documents the existing behaviour.
-5. The cell size and the 114688 bytes per token, from the resolved checkpoint rather than the
-   log.
+1. The resident bytes of one tokenizer copy and of the graph pools at startup, from the
+   snapshots of the accounting gate.
+2. The four allowances on the H100 at the 30 s envelope and the probes' startup cost.
+3. External growth and torch retention at the steady peak, and whether sglang's slack covers
+   them.
+4. Whether `tokenizer.decode` output padding changes any sample of a shorter item in a ragged
+   batch, documented from the decoder gate, no change planned.
+5. The cell size from the resolved checkpoint.
