@@ -1,5 +1,15 @@
 # Runbook for the KV pool admission bound slice
 
+Head note after the run, readout in `11_kv_pool_readout_20260906.md`. Three expectations below
+were wrong and are corrected here rather than rewritten, so the archive's README still maps onto
+the sections. Section 4: this arm is main plus the slice, whose single signature startup captures
+20 predictor graphs at 128 running, the 39 is the chain branch's two signature set. Section 3:
+the cached token equality holds at c1 only, at c16 the count moves with prefill timing and the
+two A boots differ from each other. Section 3: the c16 quality band of 116 to 128 errors and
+71.18 to 71.32 similarity was written from a subset, eighteen archived boots span 114 to 135 and
+71.12 to 71.34 with upstream main at both ends, so c16 quality is reported against that range
+and the gate is c1 byte identity plus the kernel census.
+
 Branch `perf/qwen3-tts-kv-pool-admission-bound`, head `8807833ca`, three commits on upstream
 main `50db4a550` (sglang pin 0.5.18): the token cap derived in `adjust_overrides`, the builder
 fraction removed, and the startup line reporting the pool against the bound. A is
