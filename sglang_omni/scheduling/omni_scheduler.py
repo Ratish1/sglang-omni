@@ -784,6 +784,7 @@ class OmniScheduler:
     def _refresh_upstream_parallel_state(self) -> None:
         """Build the rank container expected by upstream scheduler methods."""
         from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+        from sglang.srt.runtime_context import get_parallel
 
         self.ps = ParallelState(
             tp_rank=self.tp_rank,

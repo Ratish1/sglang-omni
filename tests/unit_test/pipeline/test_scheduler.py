@@ -2022,6 +2022,46 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     assert scheduler._abort_on_queued_limit(object()) is False
 
 
+def test_refresh_upstream_parallel_state_reads_dcp_from_the_parallel_bag(
+    monkeypatch,
+) -> None:
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(dcp_size=2),
+    )
+    scheduler = object.__new__(omni_scheduler_module.OmniScheduler)
+    ranks = {
+        "tp_rank": 3,
+        "tp_size": 4,
+        "pp_rank": 0,
+        "pp_size": 1,
+        "dp_rank": None,
+        "dp_size": 1,
+        "attn_tp_rank": 3,
+        "attn_tp_size": 4,
+        "attn_cp_rank": 0,
+        "attn_cp_size": 1,
+        "attn_dp_rank": 0,
+        "attn_dp_size": 1,
+        "moe_ep_rank": 0,
+        "moe_ep_size": 1,
+        "moe_dp_rank": None,
+        "moe_dp_size": 1,
+        "gpu_id": 3,
+    }
+    for name, value in ranks.items():
+        setattr(scheduler, name, value)
+
+    scheduler._refresh_upstream_parallel_state()
+
+    assert isinstance(scheduler.ps, ParallelState)
+    assert scheduler.ps.tp_rank == 3
+    assert scheduler.ps.attn_dcp_rank == 1
+    assert scheduler.ps.attn_dcp_size == 2
+
+
 def test_request_build_pending_limit_does_not_cap_unconfigured_backlog(
     monkeypatch,
 ) -> None:
