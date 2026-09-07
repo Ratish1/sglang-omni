@@ -1,262 +1,279 @@
 # Qwen3-TTS memory provisioning plan
 
-Draft for discussion. Every mechanism below was read at the cited line in the chain worktree
-(`0a88253c6` and later) or in the sglang v0.5.18 blob (`git show v0.5.18:<path>` in
-`/Users/ratish/sglang`, whose working tree now sits at v0.5.19, see section 8). The mechanics
-reports behind it are `research/qwen3_tts_stage_memory_mechanics.md`,
-`research/torch_cuda_memory_mechanics.md` and their verification.
+Revised Sep 7 2026 after the kv pool archive (readout 11) and the vLLM comparison
+(`research/vllm_omni_memory_sizing.md`, `research/model_memory_provisioning.md`). One PR
+carries the whole thing: the admission cap already on
+`perf/qwen3-tts-kv-pool-admission-bound`, one tokenizer per process, the vocoder built before
+the engine, the probes, the reserve, and a budget aware whole utterance decode. The rope store
+is its own branch and lands after. Every mechanism below was read at the cited line on that
+branch merged with main `53e94dfa5`, or in sglang v0.5.18 at
+`/Users/ratish/sglang-worktrees/v0.5.18`.
 
-## 1. The requirement, stated once
+## 1. The requirement
 
-The engine process on the card holds, in construction order, the talker weights, the KV pool,
-the attention workspaces, the per row decode buffers, one copy of the speech tokenizer, the
-sglang decode graphs, the predictor graphs, a second copy of the speech tokenizer for the
-vocoder and 192 vocoder decode graphs. At request time it adds the reference encode
-activations, the prefill and decode activations, the history clones, the vocoder windows, and
-the allocations that happen outside the torch allocator: cuDNN plans and workspaces at first
-use of each shape, and lazily loaded CUDA modules.
+The process on the card is one OS process holding three stages, built in config order
+(stage_workers.py:493-500): preprocessing, tts_engine, vocoder. Memory is provisioned once,
+inside the engine stage's factory, when sglang sizes the KV pool (bootstrap.py:180). Anything
+resident at that moment is seen. Anything loaded or allocated after it lives off whatever the
+pool left.
 
-Only one of those is sized by policy rather than by what the code needs: the KV pool. Its
-size follows from admission. The scheduler refuses any request longer than
-`min(context_length - 1, max_total_num_tokens - 1)` (omni_scheduler.py:329-332, 1292-1319),
-and runs at most `max_running_requests` of them. So the pool the running batch can ever use
-is
+The correct rule, and the one vLLM implements for the second term:
 
-    need = max_running_requests * context_length tokens
+    pool = min(what admission can commit, budget − measured need)
 
-For this profile that is 16 times 8192, 131072 tokens, at the 114688 bytes per token the log
-reports (K plus V, 62.92 GiB over 589142 tokens), 14.0 GiB. Today the pool holds 589142
-tokens, 4.5 times that bound.
+The first term is the running cap times the context length, 16 x 8192 = 131072 tokens,
+14.0 GiB at 114688 bytes per token, exact and free. It is on the branch and measured: the
+pool drops from 589142 tokens, ready memory from 75.2 GB to 25.0 GB, no allocator retry, c1
+byte identical, throughput flat. The second term does not exist in this tree for any model,
+and it is what keeps a deployment whose bound exceeds the card, 128 running, from filling it
+again. This plan adds it.
 
-The pool has a second occupant, the radix prefix cache: the KV of finished requests stays in
-the pool as evictable prefixes, and a later request whose prompt starts the same way skips
-that prefill. It is live on this path, the serve logs count `#cached-token` on every prefill
-batch, and it is what the capacity above the admission bound serves. What that is worth is
-measured, not assumed. On the full corpus the running batch never uses more than a few
-thousand tokens (`token usage` rounds to 0.000 of 589142 in every boot), the prefixes the
-whole corpus can cache sum to 60520 tokens, and the cache serves 18.3 percent of prefill
-tokens at c1 and 13 to 14 percent at c16, identical between arms. Under the admission bound
-the cache keeps 131072 minus the running set, about 129000 tokens, twice the corpus. So on
-this workload the cap loses no hit, and the loss begins only for a voice library whose
-distinct prompts exceed about 129000 tokens, where the deployment sets `engine.max_total_tokens`
-or `engine.kv_cache_bytes`, both of which exist today.
+## 2. What the process holds, and what sizes each part today
 
-The requirement is therefore: the pool covers the admission bound, the prefix cache lives in
-what the running set leaves of it, and the rest of the card stays free for the allocations the
-process makes as it serves. No fraction, no tuned constant: two settings the deployment already
-owns, multiplied, and the cache share verified on the corpus (section 5, gate 2).
+| Component | Where it is created | Before or after the pool | Sized by | Measured |
+| --- | --- | --- | --- | --- |
+| talker, predictor, speaker encoder weights | ModelWorker in create_sglang_infrastructure (bootstrap.py:159) | before | checkpoint | 4.6 GiB with the text embedding, from the snapshot's block sizes |
+| KV pool | alloc_memory_pool (bootstrap.py:180) | the pool | this plan | 14.0 GiB at 16 running |
+| sglang decode and prefill graphs | init_sglang_cuda_graphs (engine_factory.py:223) | after | sglang's graph reserve, formula (server_args.py:5078-5118) | inside the 6 GB at ready |
+| predictor graphs | setup_model_resources (engine_builder.py:172-179) | after | bucket ladder | small at 16 running, 20 to 39 graphs at 128 |
+| speech tokenizer, engine copy | setup_model (engine_builder.py:126-132) | after | checkpoint | not yet named, validation task |
+| speech tokenizer, vocoder copy | create_vocoder_executor (stages.py:245) | after | checkpoint | same |
+| vocoder decode graphs, 3 holders x 64 graphs | warmup_now in the vocoder factory (stages.py:279, streaming_vocoder.py:699-704) | after | shape table (streaming_vocoder.py:54-90) | 3 x 1576 MiB reserved, one stream per holder |
+| reference encode transient | ref code thread and stream (request_builders.py:749-756, 834-843) | runtime | reference audio, 30 s for uploaded voices (speech_voices.py:33-34), 10 MiB for ad hoc (speech_limits.py:10) | 650 to 852 MiB reserved on that stream |
+| LLM prefill and decode activations | sglang | runtime | sglang's activation reserve, formula (server_args.py:4956-4977) | inside sglang's slack |
+| whole utterance decode transient | _vocode_payloads (streaming_vocoder.py:1865-1895) | runtime | batch up to 8 (stages.py:223) x up to 2048 generated frames (request_builders.py:43) plus reference frames | 400 to 760 MiB per call at about 52 frames, the largest allocation of both arms |
+| non torch: CUDA context, cuDNN plans, graph executables | driver | runtime | nothing | whole device minus torch reserved, about 2.2 GB plus context at the c16 peak |
 
-## 2. What sizes the pool today, and why the card fills
+Three facts from the reads that the design rests on.
 
-The Base profile declares no memory setting (`examples/configs/qwen3_tts_1_7b.yaml` carries
-two keys), so the pool comes from sglang's profile with the builder's
-`mem_fraction_static: 0.85` (engine_builder.py:91):
+The preprocessing stage loads no tokenizer in the shipped layout. `load_frontend` is set only
+when preprocessing runs in its own process (config.py:85-94, stages.py:117-124). So there are
+two copies, the engine's and the vocoder's, and both load after the pool. The engine's copy
+serves one call, `encode` of reference audio on the ref code thread (request_builders.py:840-843,
+884-893). The vocoder's copy serves the decoder half only: `tokenizer.model.decoder` for the
+graphs and windows, `tokenizer.decode` for whole utterances (streaming_vocoder.py:503,
+1884-1886, 1927). Disjoint halves of one object.
 
-    pool_bytes = free_after_weights - pre_model_load_free * (1 - 0.85) - multimodal_reserve
-                                                                (v0.5.18 kv_cache_configurator.py:1764-1811)
+Codec streaming to the vocoder happens only when the HTTP request streams. The engine emits
+code chunks only if `stream_codec_output` and `params["stream"]` both hold
+(request_builders.py:1546-1552), and the vocoder classifies a payload as streaming by
+`params["stream"]` alone (scheduling/streaming_vocoder.py:170-177). Every non streaming request,
+the benchmark included, arrives as one terminal payload with all its codes and is decoded in
+one call, batch up to 8. Streaming requests decode windows of at most 24 frames, graph captured.
+The unbounded transient is the non streaming path, and it is the production path for every
+client that does not stream.
 
-which leaves `pre_model_load_free * 0.15`, 11.79 GB in the log, for everything in section 1
-that comes after the pool. What actually comes after it, from the memory samples of the
-validation archives:
+sglang's measurements are device wide `torch.cuda.mem_get_info` after `empty_cache`
+(v0.5.18 utils/common.py:433-443), before the weights load (distributed/bootstrap.py:132-137)
+and again before the pool (kv_cache_configurator.py:1768-1773). `empty_cache` releases the
+allocator's cached blocks first, so a transient that already ran is not seen, only live
+tensors and non torch allocations are. That is why a probe alone does not reserve anything.
+Its peak has to be subtracted explicitly.
 
-| Point | GPU total used | Free of 81079 MiB |
-| --- | ---: | ---: |
-| ready, c1 and c16 alike | 75167 to 75183 MiB | about 5.9 GB |
-| c16 peak, either arm | 80343 to 81055 MiB | 24 MiB to 736 MiB |
-| c16 peak with 39 predictor graphs and lazy captures | card full | cuDNN conv1d fails at 6 MiB free |
-
-So the process needs about 14 GB beyond weights and pool at c16, the 0.85 rule reserved 11.8,
-and the difference is exactly the margin that vanished. The symptoms in the archives follow
-from that alone: the caching allocator's retry warnings on both arms at c16 (it frees cached
-blocks and retries, torch CUDACachingAllocator.cpp:1778-1792 and 3933), the rope store c16
-failing inside cuDNN's SDPA plan build in the reference encoder, and the 128 running run
-failing inside cuDNN's conv1d in the speaker encoder. cuDNN allocates its plans and workspaces
-at first use of a shape, outside the torch pool, so it is the first thing to fail when the card
-is full, whatever the operator.
-
-The other five knobs on this path and what they do, so the plan touches only the one that
-matters:
-
-| Knob | Where | Effect |
-| --- | --- | --- |
-| `engine.kv_cache_bytes` | schema.py:128-142, sglang_model_runner.py:93-120 | operator declares the pool in bytes, authoritative, drops the builder fraction (engine_factory.py:138-145) |
-| `engine.max_total_tokens` | schema.py:120, v0.5.18 kv_cache_configurator.py:1844-1871 | a cap on the profiled token count, the pool is then allocated at the capped size (config_from_budget, 1946-1968) |
-| `engine.mem_fraction_static` | schema.py, engine_builder.py:91 | the 0.85 above, a user value is refused, the builder's is the one in force |
-| `gpu_memory_fraction` per stage | schema.py:331-341, runtime.py:152-183 | never reaches this factory, it declares no such parameter (stages.py:187-197) |
-| `total_reserve_bytes` per stage | schema.py:342-355, stage_workers.py:810-845 | a per process torch allocator cap, unset here |
-
-The schema already refuses `kv_cache_bytes` together with `max_total_tokens` (schema.py:154-160)
-because the lower token cap would silently shrink the byte pool. That rule shapes the seam.
-
-Two regimes, so the knobs above stop reading as one jumble. When stages run as separate
-processes on one card, the Qwen3-Omni colocated profile, the card is partitioned: each stage
-declares `gpu_memory_fraction`, an engine's pool is its share minus what its process already
-used (sglang_model_runner.py:122-147), or an operator declares the pool in bytes, and
-`total_reserve_bytes` caps a process so it fails itself and not a co-tenant. Those are the
-tools for a partition. When the stages share one process, the shipped Qwen3-TTS profile, there
-is nothing to partition, the stage fraction never reaches the factory, and sglang's LLM rule
-sizes the one pool for the whole process while knowing only the LLM's activations. The
-vocoder's tokenizer copy and graphs, the reference encoder and the predictor graphs are the
-first regime's needs living in the second regime's process. The talker is LLM serving in every
-other respect, and for a large thinker with long contexts the tight fraction rule stands; for
-this engine the pool is not the throughput lever, section 1 measures why, and the cap is the
-seam.
+The failure the archives recorded: at 128 running the pool takes the card, the vocoder's
+transients fill the allocator's cache, and cuDNN's own allocation for the speaker encoder's
+convolution fails with `CUDNN_STATUS_INTERNAL_ERROR` at about 6 MiB free (revalidation
+LIMITATIONS.md:9). Non torch allocations cannot be served from torch's cache, so the last few
+MiB of the card decide whether cuDNN runs.
 
 ## 3. Design
 
-One change at the builder: derive the token cap from the admission bound after the overrides
-are merged, when no byte budget is declared.
+Four changes, all omni owned, none in sglang. In the order they act at startup.
+
+### 3.1 Build the vocoder before the engine, with one tokenizer
+
+Move the vocoder ahead of the engine in the stage list (config.py:54-83), so config order
+becomes preprocessing, vocoder, tts_engine. The vocoder factory loads the tokenizer, captures
+its 192 graphs (stages.py:245-279) and publishes the tokenizer for the process. The engine's
+`setup_model` takes the published object instead of loading a second one
+(engine_builder.py:126-132) and attaches it to the talker for the ref code thread. Sharing is
+safe by the reads above: the two users touch disjoint halves, the graph holders own their
+static buffers per worker and not the module (streaming_vocoder.py:671-675), and the only in
+place mutation of the decoder, the fused SnakeBeta swap, is off by default and would apply
+to the one object either way.
+
+Effect: the tokenizer weights and the 4.6 GiB of vocoder graph pools are resident when sglang
+measures free memory, so its own rule charges them. One tokenizer copy fewer.
+
+What must hold for the reorder, validation task 1: no construction order dependency between
+the engine and the vocoder. `stream_to` targets are wired after all stages exist, readiness
+is published after the last factory returns (stage_workers.py:456-465), and the vocoder
+factory reads nothing from the engine. Preprocessing already builds before both.
+
+### 3.2 Probe the components at their declared maximum before the pool
+
+In the engine builder's `pre_infra_setup` (engine_factory.py:92, no weights loaded, CUDA
+device set), run each non LLM component once at the largest shape a request can bring, and
+record the torch peak of each run with `torch.cuda.max_memory_allocated` deltas:
+
+- the tokenizer encoder on 30 s of audio, the uploaded voice bound
+  (speech_voices.py:33-34), and the speaker encoder on the same audio
+- the tokenizer decoder on one utterance of `max_new_tokens` plus the reference bound,
+  2048 plus 360 frames at 12 Hz, batch 1
+- the decoder on two frame counts, to measure bytes per frame
+
+The runs build cuDNN's plans for those shapes, which then stay resident and are seen by
+sglang's profile. The peaks are the measured need. The bytes per frame is the slope the
+vocoder uses in 3.4. Nothing here is a constant: every shape comes from a declared bound
+in the serving layer or the request defaults, and every byte count is measured on the card
+at startup.
+
+### 3.3 Subtract the measured need through the omni configurator
+
+`_OmniKVCacheConfigurator` gains one field, `kv_cache_reserve_bytes`, carried the same way
+`total_gpu_memory_fraction` is today: `infra_kwargs` (engine_factory.py:175) into
+`ModelWorkerConfig` (model_worker.py:28-35) into the configurator
+(sglang_model_runner.py:610-618). In `_profile_available_bytes`, when neither a byte budget
+nor a stage fraction is declared, the upstream rule runs unchanged and the reserve is
+subtracted from its result:
+
+    bytes = upstream(free_after_load) − kv_cache_reserve_bytes
+          = free − pre_load × (1 − f) − reserve
+
+sglang's own slack, `pre_load × (1 − f)` with f derived (server_args.py:4979-4983), stays as
+the LLM's activation and graph reserve. The omni reserve is the sum of the probe peaks from
+3.2. The admission cap keeps applying as the minimum afterwards (kv_cache_configurator.py:
+1844-1859), so the pool is
+
+    tokens = min(running × context, (free − slack − reserve) // cell_size)
+
+At 16 running on this card the second term is about 45 GiB against 14 GiB, the pool is the
+one already measured, nothing changes. At 128 running the second term wins and the reserve is
+what keeps the card from filling. The byte path and the fraction path are untouched: a
+deployment that declares `engine.kv_cache_bytes` or `gpu_memory_fraction` keeps its own rule.
+
+### 3.4 Make the whole utterance decode fit a budget
+
+`_vocode_payloads` (streaming_vocoder.py:1865-1895) decodes its batch in one call today. It
+becomes budget aware: with the measured bytes per frame from 3.2 and the reserve as its
+budget, it splits a batch into calls whose total frames fit, and decodes a single utterance
+that alone exceeds the budget through the windowed decoder that the streaming path already
+uses (`chunked_decode`, streaming_vocoder.py:1192). A batch that fits is decoded exactly as
+today, so c1 audio stays byte identical on this corpus, where every utterance is far below
+the budget. c16 batches may split, which changes bytes on a path whose bytes already vary
+per boot.
+
+This is the piece that makes the reserve a guarantee: without it the reserve is a number the
+vocoder can exceed on a batch of long utterances, with it the transient never exceeds what was
+subtracted.
+
+### 3.5 The startup line
+
+`post_scheduler_setup` (engine_builder.py:206-218) reports pool tokens, the admission bound,
+the reserve, and the free memory at pool end, so a deployment reads which term won.
+
+### 3.6 Memory map, 80 GB H100
 
 ```
-Qwen3TtsEngineBuilder.adjust_overrides(overrides)           engine_builder.py:146
-    existing: refuse enable_torch_compile
-    new:      if peek_stage_kv_cache_bytes() is None:
-                  overrides.setdefault(
-                      "max_total_tokens",
-                      overrides["max_running_requests"] * self.context_length,
-                  )
+main, fraction 0.85            branch today, cap             this plan
++----------------------+ 81 GB +----------------------+ 81 GB +----------------------+ 81 GB
+| free at peak: <1 GB  |       | free: ~48 GB         |       | free: ~48 GB at 16   |
+|                      |       |                      |       |  reserve at 128      |
++----------------------+       |                      |       +----------------------+
+| vocoder transients,  | ~7    |                      |       | vocoder transients   | <= reserve
+| cache, cuDNN plans   |       +----------------------+       | (split to budget)    |
++----------------------+       | transients, graphs   | ~7    +----------------------+
+| graphs, tokenizer x2 | ~6    +----------------------+       | graphs, tokenizer x1 | seen by
++----------------------+       | graphs, tokenizer x2 | ~6    | probes' cuDNN plans  | sglang
+|                      |       +----------------------+       +----------------------+
+|  KV pool 589142      | 62.9  | KV pool 131072       | 14.0  | KV pool = min(bound, | 14.0 at 16
+|  (bound 131072)      |       |                      |       |  free−slack−reserve) | ~45 at 128
++----------------------+       +----------------------+       +----------------------+
+| weights              | 4.6   | weights              | 4.6   | weights              | 4.6
++----------------------+       +----------------------+       +----------------------+
 ```
 
-Why there and not in `generation_defaults`: the defaults are merged before a deployment's
-`max_running_requests` is known (`build_generation_batch_overrides`, generation_batch_policy.py:99-217,
-`{**stage_defaults, **incoming}`), and `build` resolves `self.context_length` before it calls
-`adjust_overrides` (engine_factory.py:100-127). At that point both factors are the resolved
-ones. `setdefault` keeps a deployment's own `max_total_tokens`, and the byte budget check keeps
-the schema's rule: a stage that declares `kv_cache_bytes` gets no token cap from the builder,
-the same way it gets no fraction.
-
-What the cap does downstream, all upstream semantics: `_apply_token_constraints` takes the
-minimum of the profiled capacity and the cap, `config_from_budget` recomputes the pool at the
-capped count, and the allocation happens at that size. Everything past the pool then sees
-about 60 GB free instead of 11.8.
-
-The fraction. With the cap binding, `mem_fraction_static: 0.85` decides nothing on this
-profile. It would decide only when need exceeds what the card can hold (a running cap of 128
-needs 112 GiB), where sglang's warning applies, the profiled value wins, and the pool is
-smaller than admission. The 0.85 is a constant no measurement pins, so the plan drops it and
-lets sglang derive its own reserve (v0.5.18 server_args.py:4955-4980: 512 MB plus 1.5 MB per
-activation token plus the graph reserve, floor 10 GB above 60 GB of VRAM), which on this card
-lands near 0.84. Decision 2 in section 7 is whether to drop it in this slice or keep it and
-retire it separately.
-
-Coverage log. When the cap does not fit, the deployment should read it at startup rather
-than discover retraction under load. One omni owned line after engine construction, on the
-existing `Memory pool end` information: the pool's token count against the need, so a
-deployment sees `131072 of 131072` or `589142 of 1048576`.
-
-### 3.1 Memory map, before and after, at c16 on an 80 GB H100
-
 ```
-before (0.85 fraction)                          after (cap = 16 x 8192 tokens)
-+------------------------------+ 81.1 GB        +------------------------------+ 81.1 GB
-| free at c16 peak: 24-736 MiB |                | free at c16 peak: ~48 GB     |
-+------------------------------+                |                              |
-| activations, cuDNN plans,    |  ~14 GB        |  cuDNN plans and workspaces, |
-| vocoder windows, histories,  |  (needs 14,    |  lazy captures, profiler     |
-| graphs, tokenizer copy 2     |   got 11.8)    |  windows, 39 graph ladders,  |
-+------------------------------+                |  all land here               |
-|                              |                +------------------------------+
-|  KV pool 589142 tokens       |  62.9 GB       | activations, graphs, copy 2  |  ~14 GB
-|  (need: 131072)              |                +------------------------------+
-|                              |                | KV pool 131072 tokens        |  14.0 GiB
-+------------------------------+                +------------------------------+
-| talker weights               |  3.7 GB        | talker weights               |  3.7 GB
-+------------------------------+                +------------------------------+
+startup, this plan                                              file:line
+preprocessing factory                                           stages.py:106
+vocoder factory: tokenizer, publish, 192 graphs                 stages.py:216-279   (3.1)
+tts_engine factory -> build()
+  pre_infra_setup: probes, peaks, bytes per frame               engine_factory.py:92   (3.2)
+  adjust_overrides: max_total_tokens = running x context        engine_builder.py:152-158
+  infra_kwargs: kv_cache_reserve_bytes = sum of peaks           engine_factory.py:175  (3.3)
+  create_sglang_infrastructure
+    weights load, free measured after empty_cache               bootstrap.py:159, kvcc.py:1768
+    _OmniKVCacheConfigurator: upstream rule − reserve           sglang_model_runner.py:68  (3.3)
+    min with the cap, pool allocated                             kvcc.py:1844-1859, 1946-1968
+  setup_model: take the published tokenizer                     engine_builder.py:126  (3.1)
+  graphs, predictor graphs                                      engine_factory.py:223, 235
+  post_scheduler_setup: pool, bound, reserve, free              engine_builder.py:206  (3.5)
+serving: _vocode_payloads splits to the budget                  streaming_vocoder.py:1865 (3.4)
 ```
 
-### 3.2 Alternatives read and not taken
+### 3.7 Alternatives read and not taken
 
-- Deriving the bytes inside `_OmniKVCacheConfigurator._profile_available_bytes`
-  (sglang_model_runner.py:68-147) for every engine. That changes the pool policy of every
-  model in the repo from one place. The requirement is per builder, and this slice is
-  Qwen3-TTS.
-- A stage `engine.kv_cache_bytes` default in the YAML. It states bytes, which move with the
-  checkpoint's head geometry and dtype, while the admission bound states tokens the deployment
-  already reasons in, and the byte path refuses the fraction and the cap by schema.
-- Turning off cuDNN attention in the stage processes (`perf/qwen3-tts-cudnn-attention`, held).
-  The failing call at 128 running was a convolution, so it is not an attention problem, and the
-  branch holds on a measured regression.
+- Route every non streaming request through the windowed decoder. Bounds the transient
+  with no reserve, but changes the audio of every non streaming response and the c1 baseline
+  with it. 3.4 keeps whole utterance decode where it fits and windows only what cannot.
+- Load and probe inside the engine's `pre_infra_setup` without reordering the stages. Works
+  for the tokenizer, but the vocoder graphs would still capture after the pool and need a
+  second measurement to subtract. Reordering lets sglang's own rule see them.
+- A stage `gpu_memory_fraction` for tts_engine through the existing process budget path. It
+  is a constant no measurement pins for this model, and it still measures no activation peak.
+- Sizing from `torch.cuda.set_per_process_memory_fraction` alone, the `total_reserve_bytes`
+  mechanism (stage_workers.py:805-838). It fences torch but reserves nothing for cuDNN's own
+  allocations, which is where the card failed.
 
 ## 4. What the freed memory unblocks
 
-- The larger graph ladder: 39 predictor graphs at 128 running plus sglang's 20, and the lazy
-  captures a client's sampling values trigger, without the card reaching cuDNN's failure.
-- The rope store slice's c16 point, which failed in the reference encoder with the card two
-  MiB from full on both arms.
-- Profiler windows at c16 without allocator retries, and the retraction memory measurement.
-- Colocating a second stage process on the card, which the placement check today skips only
-  because this profile is one process (topology.py:456-458).
-- A second replica per card. The pipeline keeps its GPU busy 40 to 46 percent of the time at
-  c16, so a replica in its own process is the throughput lever, and a replica needs about
-  31 GB at the c16 peak: weights 3.7, pool 14.0, the process's own 8.6 at ready and a 5.1 GB
-  working set. Two fit on an 80 GB card with the cap. Today one replica holds the whole card.
-
-The other reading of the freed memory is prefix cache for a deployment with a large hot voice
-set, section 1. The default has to pick one, and the alternative default is in section 7,
-decision 4.
+Unchanged from the first draft and now measured for the first two: 48 GB free at c16 on an
+80 GB card, the larger graph ladders at 128 running, the rope store's c16 pair, a second
+replica per card at about 32 GB each, and colocation of another stage process.
 
 ## 5. Validation
 
-Unit, on the builder: the cap is derived from the merged running cap and the resolved context
-length, a deployment's own `max_total_tokens` wins, a declared `kv_cache_bytes` yields no cap,
-and the values are the resolved ones for an off grid running cap such as 89.
+Unit, per commit: the cap tests already on the branch; the shared tokenizer is one object in
+both stages with the encoder and decoder halves reachable; the reserve reaches the configurator
+and is subtracted only on the upstream path; the split keeps every call within the budget and
+windows an oversize utterance; the startup line carries all four numbers.
 
-Box, with the paired protocol of plan 07 (interleaved boots, all GPU sample kept):
+Box, paired protocol of plan 07, A is upstream main, B is the whole branch:
 
-1. Startup log: `KV Cache is allocated ... #tokens: 131072` and `Memory pool end` with about
-   59 GB available, ready memory about 27 GB, in place of 75.2.
-2. c1 full corpus against the chain head: byte identical WAVs, the pool size does not touch a
-   kernel. Latency and qps within the paired spread. The prefill lines of both arms sum to
-   the same `#cached-token` share, 13576 of 74096 tokens at c1, which is the prefix cache
-   gate: the cap keeps every hit the corpus has.
-3. c16 full corpus, two boots per arm: no allocator retry warning in either B boot, quality
-   inside the identical kernel band, peak memory about 32 GB.
-4. The 128 running server with the request level subtalker top k 64: 64 of 64 complete, six
-   lazy captures, no cuDNN error.
-5. The retraction run at c16 with the profiler memory flag, after confirming the flag reached
-   the stage process (`/proc/<pid>/environ`): allocator peak recorded.
-6. The rope store branch rebased on the chain head, its c16 pair on top of this slice.
+1. Startup: pool 131072, the reserve printed, ready memory below the 25.0 GB of the cap alone
+   by one tokenizer copy, the probes' time in the ready line.
+2. c1 full corpus: 1088 of 1088 byte identical to the archive, cached tokens 13576 of 74096.
+3. c16 full corpus, two boots per arm: no allocator retry on B, quality inside the archived
+   range of 114 to 135 errors and 71.12 to 71.34 similarity, throughput inside the paired
+   spread.
+4. 128 running with the request level subtalker top k 64: 64 of 64, no cuDNN error, and the
+   new gate, whole device peak at least the reserve below the card.
+5. 128 running with `max_new_tokens` 2048 on a long text set, the split exercised: every
+   request completes, the log shows the splits, peak still the reserve below the card.
+6. A streaming run at c16: unchanged path, unchanged audio contract.
+7. Retraction at c16 as before, 192 of 192.
 
-## 6. Slices
+## 6. The commit series inside the one PR
 
-1. This slice, one PR: `[Qwen3-TTS] Size the KV pool from the admission bound`. Diff:
-   `adjust_overrides` in engine_builder.py, the coverage log line, the tests, and the fraction
-   line removed if decision 2 says so. No new constant, no new configuration key.
-2. The rope store, rebased, with its own A/B.
-3. Later, separately measured, none required by this plan: the vocoder's second tokenizer copy
-   (stages.py:245-250), the 192 vocoder graph keys (streaming_vocoder.py:54-90, 473-479), the
-   reference cache device policy. Each is a memory reduction inside the 14 GB, not a
-   provisioning question.
+Each commit reviewed by you before it lands on the branch.
+
+1. On the branch already: the cap, the fraction removal, the startup line.
+2. Stage order and the shared tokenizer, with the publish mechanism.
+3. The probes in `pre_infra_setup` and the bytes per frame measurement.
+4. `kv_cache_reserve_bytes` through `infra_kwargs`, `ModelWorkerConfig` and the configurator.
+5. The budget aware `_vocode_payloads`.
+6. The startup line extended.
 
 ## 7. Decisions
 
-1. The seam: the builder derived token cap in `adjust_overrides` as above. Recommended.
-2. Drop `mem_fraction_static: 0.85` in this slice, or keep it and retire it separately.
-   Recommended: drop, the profile never depends on it once the cap binds.
-3. The coverage log line: keep as one info line, or leave it to sglang's warning alone.
-4. The default beyond the bound. The cap leaves about 48 GB free on an 80 GB card, for
-   replicas and colocation by default and for the prefix cache through the existing knobs.
-   The alternative fixes the accounting instead of the pool: construct the vocoder before the
-   engine so sglang's profile sees its tokenizer copy and graphs, drop the 0.85 for sglang's
-   derived reserve, and let the pool take the rest, about 40 GB of prefix cache and roughly
-   7 GB free at the c16 peak. It is a construction order change in the pipeline process, a
-   larger slice, and it makes one replica hold the card unless budgets are declared.
-   Recommended: the cap, for the guarantee, the 48 GB margin the failed runs needed, and
-   density. The construction order fix stays a candidate for a later slice because it makes
-   the profiled ceiling honest for a deployment that raises the cap.
+1. Reorder the stages, 3.1, against loading the tokenizer in the engine's hook. Recommended:
+   reorder, it is one line in the config and it lets sglang see the graphs without a second
+   measurement. Depends on validation task 1.
+2. The reserve is the sum of the probe peaks, nothing added. Any margin would be a constant.
+3. The vocoder's budget equals the reserve. Recommended, it is the number the pool sizing
+   subtracted, so the guarantee is exact.
+4. The reference bound used by the probe is the uploaded voice limit, 30 s. Ad hoc references
+   are bounded in bytes, not seconds, so an ad hoc reference longer than 30 s decodes through
+   the window path of 3.4 when it exceeds the budget.
 
 ## 8. Validation tasks and open facts
 
-- `/Users/ratish/sglang` now sits at tag v0.5.19 while the chain branch pins 0.5.18. The
-  functions this plan cites were read from the v0.5.18 blob, and a v0.5.18 worktree now lives
-  at `/Users/ratish/sglang-worktrees/v0.5.18` next to the v0.5.16 and v0.5.17 ones, for
-  reading without moving the shared checkout. Before
-  implementation, confirm which pin main carries and re-read `_apply_token_constraints`,
-  `config_from_budget` and the automatic fraction at that tag.
-- The 114688 bytes per token is arithmetic on the log, its factorization is not read from the
-  checkpoint. The unit test uses the resolved cell size, not the number.
-- The 14 GB process need at c16 is inferred from two memory samples (ready and peak). The
-  first box run of this slice reads it directly from the new free memory at ready and at peak.
-- Whether `max_total_tokens` also caps the prefill graph ladder in a way that matters here:
-  generation_batch_policy.py:82-84 and v0.5.18 server_args.py:4928-4931 take the minimum with
-  the chunk size, 131072 is above every prefill bucket, so no.
+1. Read stage_workers.py:456-560 and the stream wiring for any dependency on the engine being
+   built before the vocoder.
+2. The size of one tokenizer copy, from the ready memory delta of commit 2's box run.
+3. The bytes per frame of the decoder and the three probe peaks on this card, from the
+   startup line of commit 3.
+4. Whether `Qwen3TTSTokenizer.decode` pads a batch to its longest item, which decides whether
+   a split changes bytes of the shorter items. Read from the installed qwen_tts on the box.
+5. The 114688 bytes per token is arithmetic on the log, the unit test uses the resolved cell
+   size.
