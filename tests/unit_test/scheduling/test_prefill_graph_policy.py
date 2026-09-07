@@ -8,7 +8,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    generate_prefill_cuda_graph_batch_sizes,
+)
 
 from sglang_omni.scheduling.generation_batch_policy import (
     build_default_prefill_cuda_graph_bs,
@@ -459,8 +461,7 @@ def test_padding_gap_warning_requires_a_non_empty_eager_range(caplog) -> None:
 
 
 def _sglang_prefill_ladder(max_bs: int) -> list[int]:
-    unresolved = ServerArgs.__new__(ServerArgs)
-    return ServerArgs._generate_prefill_cuda_graph_batch_sizes(unresolved, max_bs)
+    return generate_prefill_cuda_graph_batch_sizes(max_bs)
 
 
 @pytest.mark.parametrize("cap", [256, 512, 2048, 4096, 8192, 16384])

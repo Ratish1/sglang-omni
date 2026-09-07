@@ -8,7 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    generate_prefill_cuda_graph_batch_sizes,
+)
 
 import sglang_omni.model_runner.base as model_runner_base
 import sglang_omni.models.qwen3_asr.engine_builder as qwen3_asr_builder
@@ -40,8 +42,7 @@ def _select_non_mlx_backend(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _sglang_prefill_ladder(max_bs: int) -> list[int]:
-    unresolved = ServerArgs.__new__(ServerArgs)
-    return ServerArgs._generate_prefill_cuda_graph_batch_sizes(unresolved, max_bs)
+    return generate_prefill_cuda_graph_batch_sizes(max_bs)
 
 
 def _fake_server_args_builder(
