@@ -1577,6 +1577,7 @@ def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) ->
         b.req_to_token_pool.req_to_token[b.req_pool_indices, locs] = out.to(torch.int32)
         for req in b.reqs:
             req.kv.kv_allocated_len += token_per_req
+            req.kv.kv_committed_len += token_per_req
         return out
 
     monkeypatch.setattr(
@@ -1589,6 +1590,7 @@ def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) ->
     ScheduleBatch.prepare_for_decode(batch)
     assert batch.seq_lens_sum is None
     assert reqs[0].kv.kv_allocated_len == 12
+    assert reqs[0].kv.kv_committed_len == 11
     assert int(req_to_token[2, 10]) == 123
 
     allocated = batch.out_cache_loc

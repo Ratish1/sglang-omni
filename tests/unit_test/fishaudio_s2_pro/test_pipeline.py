@@ -13,8 +13,7 @@ import numpy as np
 import pytest
 import torch
 from sglang.srt.arg_groups.overrides import resolution_result
-from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.runtime_context import get_context, get_exec
+from sglang.srt.runtime_context import get_context, get_exec, publish
 
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
 from sglang_omni.models.fishaudio_s2_pro.fish_speech.tokenizer import (
@@ -39,6 +38,7 @@ from tests.unit_test.fixtures.fish_fakes import (
     make_s2pro_payload,
     make_s2pro_state,
 )
+from tests.unit_test.fixtures.mini_checkpoint import write_mini_llama_checkpoint
 from tests.unit_test.pipeline.helpers import build_compiled_process_topology
 
 
@@ -595,19 +595,27 @@ def test_s2pro_compile_helper_targets_forward_kvcached(
     assert audio_decoder._compiled_forward_kvcached_max_bs == 2
 
 
-_PUBLISHED: list = []
+@pytest.fixture
+def run_s2pro_engine(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """The engine build with fakes around a real, resolved and published record."""
+    checkpoint = write_mini_llama_checkpoint(tmp_path)
+    published: list = []
 
+    def run(**kwargs):
+        return _run_s2pro_engine_with_fake_buffers(
+            monkeypatch, checkpoint=checkpoint, published=published, **kwargs
+        )
 
-@pytest.fixture(autouse=True)
-def _restore_published_context():
-    yield
-    while _PUBLISHED:
-        _PUBLISHED.pop().restore()
+    yield run
+    while published:
+        published.pop().restore()
 
 
 def _run_s2pro_engine_with_fake_buffers(
     monkeypatch: pytest.MonkeyPatch,
     *,
+    checkpoint: str,
+    published: list,
     text_buffer_bs: int = 64,
     audio_buffer_bs: int = 64,
     sm_version: int | None = 90,
@@ -634,7 +642,7 @@ def _run_s2pro_engine_with_fake_buffers(
         raising=False,
     )
     monkeypatch.setattr(
-        engine_factory, "_resolve_checkpoint", lambda model_path: model_path
+        engine_factory, "_resolve_checkpoint", lambda model_path: checkpoint
     )
 
     build_kwargs: dict[str, object] = {}
@@ -683,44 +691,28 @@ def _run_s2pro_engine_with_fake_buffers(
         fake_bootstrap_text_model_for_decode,
     )
 
-    def fake_build_sglang_server_args(
+    real_build_sglang_server_args = sglang_backend.build_sglang_server_args
+
+    def recording_build_sglang_server_args(
         model_path: str,
         context_length: int,
         **kwargs: object,
     ):
-        del model_path
         build_kwargs.update(kwargs)
-        published = get_context().override_server_args(
-            context_length=context_length,
-            cuda_graph_bs=kwargs["cuda_graph_bs"],
-            cuda_graph_max_bs=kwargs["cuda_graph_max_bs"],
-            cuda_graph_config=CudaGraphConfig(
-                decode=PhaseConfig(
-                    max_bs=kwargs["cuda_graph_max_bs"],
-                    bs=kwargs["cuda_graph_bs"],
-                ),
-                prefill=PhaseConfig(backend="disabled"),
-            ),
-            disable_cuda_graph=kwargs["disable_cuda_graph"],
-            enable_torch_compile=kwargs["enable_torch_compile"],
-            torch_compile_max_bs=kwargs["torch_compile_max_bs"],
-            max_running_requests=kwargs["max_running_requests"],
-            page_size=1,
-            chunked_prefill_size=kwargs["chunked_prefill_size"],
-            max_prefill_tokens=16384,
-            attention_backend=kwargs.get("attention_backend"),
-        )
-        _PUBLISHED.append(published)
-        return published.install()
+        return real_build_sglang_server_args(model_path, context_length, **kwargs)
 
     def fake_create_sglang_infrastructure(
-        server_args: SimpleNamespace,
+        server_args,
         gpu_id: int,
         *,
         defer_cuda_graph_capture: bool = False,
     ) -> tuple[object, object, object, object, object]:
         assert gpu_id == 0
         infrastructure_saw_deferred_capture.append(defer_cuda_graph_capture)
+        slot = get_context().override_server_args()
+        slot.install()
+        published.append(slot)
+        publish(server_args, role="scheduler")
         return (
             _FakeWorker(server_args),
             object(),
@@ -736,7 +728,7 @@ def _run_s2pro_engine_with_fake_buffers(
     )
 
     def fake_create_sglang_infrastructure_defer_cuda_graph(
-        server_args: SimpleNamespace,
+        server_args,
         gpu_id: int,
     ) -> tuple[bool, tuple[object, object, object, object, object]]:
         want_cuda_graph = not bool(resolution_result(server_args, "disable_cuda_graph"))
@@ -754,7 +746,7 @@ def _run_s2pro_engine_with_fake_buffers(
     monkeypatch.setattr(
         sglang_backend,
         "build_sglang_server_args",
-        fake_build_sglang_server_args,
+        recording_build_sglang_server_args,
     )
     monkeypatch.setattr(
         sglang_backend,
@@ -801,9 +793,9 @@ def _run_s2pro_engine_with_fake_buffers(
 
 
 def test_s2pro_engine_disables_generic_compile_after_local_compile(
-    monkeypatch: pytest.MonkeyPatch,
+    run_s2pro_engine,
 ) -> None:
-    result = _run_s2pro_engine_with_fake_buffers(monkeypatch)
+    result = run_s2pro_engine()
     scheduler = result.scheduler
     build_kwargs = result.build_kwargs
 
@@ -834,11 +826,11 @@ def test_s2pro_engine_disables_generic_compile_after_local_compile(
         (scheduler.model_runner.args[0].model_runner.model, 64)
     ]
     assert result.init_graph_calls == [True]
-    server_args = scheduler.server_args
-    assert resolution_result(server_args, "disable_cuda_graph") is False
-    assert get_exec().graph.enable_torch_compile is False
-    assert resolution_result(server_args, "cuda_graph_max_bs") == 64
-    assert resolution_result(server_args, "cuda_graph_bs") == [
+    graph = get_exec().graph
+    assert graph.disable_cuda_graph is False
+    assert graph.enable_torch_compile is False
+    assert graph.cuda_graph_config.decode.max_bs == 64
+    assert graph.cuda_graph_config.decode.bs == [
         1,
         2,
         4,
@@ -852,7 +844,7 @@ def test_s2pro_engine_disables_generic_compile_after_local_compile(
         56,
         64,
     ]
-    assert resolution_result(server_args, "torch_compile_max_bs") == 64
+    assert graph.torch_compile_max_bs == 64
 
 
 @pytest.mark.parametrize(
@@ -865,12 +857,11 @@ def test_s2pro_engine_disables_generic_compile_after_local_compile(
     ],
 )
 def test_s2pro_engine_selects_model_local_attention_backend(
-    monkeypatch: pytest.MonkeyPatch,
+    run_s2pro_engine,
     sm_version: int | None,
     expected_backend: str,
 ) -> None:
-    result = _run_s2pro_engine_with_fake_buffers(
-        monkeypatch,
+    result = run_s2pro_engine(
         sm_version=sm_version,
     )
 
@@ -881,10 +872,9 @@ def test_s2pro_engine_selects_model_local_attention_backend(
 
 
 def test_s2pro_engine_preserves_explicit_attention_backend(
-    monkeypatch: pytest.MonkeyPatch,
+    run_s2pro_engine,
 ) -> None:
-    result = _run_s2pro_engine_with_fake_buffers(
-        monkeypatch,
+    result = run_s2pro_engine(
         sm_version=89,
         flashinfer_available=True,
         server_args_overrides={"attention_backend": "triton"},
@@ -904,27 +894,25 @@ def test_s2pro_engine_preserves_explicit_attention_backend(
     ],
 )
 def test_s2pro_engine_rejects_explicit_override_on_unvalidated_fast_ar_architecture(
-    monkeypatch: pytest.MonkeyPatch,
+    run_s2pro_engine,
     sm_version: int | None,
     expected_error: str,
 ) -> None:
     with pytest.raises(RuntimeError, match=expected_error):
-        _run_s2pro_engine_with_fake_buffers(
-            monkeypatch,
+        run_s2pro_engine(
             sm_version=sm_version,
             server_args_overrides={"attention_backend": "fa3"},
         )
 
 
 def test_s2pro_engine_rejects_explicit_override_without_fast_ar_flashinfer(
-    monkeypatch: pytest.MonkeyPatch,
+    run_s2pro_engine,
 ) -> None:
     with pytest.raises(
         RuntimeError,
         match="Fast-AR requires FlashInfer.*SGLANG_IS_FLASHINFER_AVAILABLE",
     ):
-        _run_s2pro_engine_with_fake_buffers(
-            monkeypatch,
+        run_s2pro_engine(
             sm_version=89,
             flashinfer_available=False,
             server_args_overrides={"attention_backend": "fa3"},
@@ -936,12 +924,11 @@ def test_s2pro_engine_rejects_explicit_override_without_fast_ar_flashinfer(
     [(89, False), (90, True), (100, False), (120, False)],
 )
 def test_s2pro_engine_compile_default_follows_validation_scope(
-    monkeypatch: pytest.MonkeyPatch,
+    run_s2pro_engine,
     sm_version: int,
     expected_compile: bool,
 ) -> None:
-    result = _run_s2pro_engine_with_fake_buffers(
-        monkeypatch,
+    result = run_s2pro_engine(
         sm_version=sm_version,
     )
 
@@ -964,27 +951,26 @@ def test_s2pro_engine_compile_default_follows_validation_scope(
     ],
 )
 def test_s2pro_engine_rejects_unvalidated_automatic_backend_selection(
-    monkeypatch: pytest.MonkeyPatch,
+    run_s2pro_engine,
     sm_version: int | None,
     expected_error: str,
 ) -> None:
     with pytest.raises(RuntimeError, match=expected_error):
-        _run_s2pro_engine_with_fake_buffers(
-            monkeypatch,
+        run_s2pro_engine(
             sm_version=sm_version,
         )
 
 
 def test_s2pro_engine_rejects_flashinfer_disabled_by_environment(
     monkeypatch: pytest.MonkeyPatch,
+    run_s2pro_engine,
 ) -> None:
     monkeypatch.setenv("SGLANG_IS_FLASHINFER_AVAILABLE", "false")
     with pytest.raises(
         RuntimeError,
         match="FlashInfer is unavailable.*SGLANG_IS_FLASHINFER_AVAILABLE",
     ):
-        _run_s2pro_engine_with_fake_buffers(
-            monkeypatch,
+        run_s2pro_engine(
             sm_version=89,
             flashinfer_available=False,
         )
@@ -998,7 +984,7 @@ def test_s2pro_engine_rejects_flashinfer_disabled_by_environment(
     ],
 )
 def test_s2pro_engine_validates_allocated_decode_buffers(
-    monkeypatch: pytest.MonkeyPatch,
+    run_s2pro_engine,
     text_buffer_bs: int,
     audio_buffer_bs: int,
 ) -> None:
@@ -1006,8 +992,7 @@ def test_s2pro_engine_validates_allocated_decode_buffers(
         ValueError,
         match="model_buffer_bs must cover max_running_requests",
     ):
-        _run_s2pro_engine_with_fake_buffers(
-            monkeypatch,
+        run_s2pro_engine(
             text_buffer_bs=text_buffer_bs,
             audio_buffer_bs=audio_buffer_bs,
         )

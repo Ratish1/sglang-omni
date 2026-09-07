@@ -9,7 +9,6 @@ same on an accelerator-less host.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -23,32 +22,14 @@ from sglang_omni.scheduling.sglang_backend.server_args_builder import (
     apply_encoder_mem_reserve,
     build_sglang_server_args,
 )
-
-_MINI_CONFIG = {
-    "architectures": ["LlamaForCausalLM"],
-    "hidden_size": 128,
-    "intermediate_size": 256,
-    "max_position_embeddings": 2048,
-    "model_type": "llama",
-    "num_attention_heads": 4,
-    "num_hidden_layers": 2,
-    "num_key_value_heads": 4,
-    "rms_norm_eps": 1e-6,
-    "torch_dtype": "bfloat16",
-    "vocab_size": 1000,
-}
-
-
-def _checkpoint(tmp_path: Path) -> str:
-    (tmp_path / "config.json").write_text(json.dumps(_MINI_CONFIG))
-    return str(tmp_path)
+from tests.unit_test.fixtures.mini_checkpoint import write_mini_llama_checkpoint
 
 
 def test_builder_record_is_resolved_with_the_cuda_graph_config_declared(
     tmp_path: Path,
 ) -> None:
     server_args = build_sglang_server_args(
-        _checkpoint(tmp_path), context_length=2048, device="cuda"
+        write_mini_llama_checkpoint(tmp_path), context_length=2048, device="cuda"
     )
 
     assert server_args._resolution_finished is True
@@ -59,7 +40,7 @@ def test_builder_record_is_resolved_with_the_cuda_graph_config_declared(
 
 def test_accessors_read_the_declared_cuda_graph_config(tmp_path: Path) -> None:
     server_args = build_sglang_server_args(
-        _checkpoint(tmp_path),
+        write_mini_llama_checkpoint(tmp_path),
         context_length=2048,
         device="cuda",
         cuda_graph_max_bs=8,
@@ -74,7 +55,7 @@ def test_accessors_read_the_declared_cuda_graph_config(tmp_path: Path) -> None:
 
 def test_encoder_mem_reserve_reads_the_declared_fraction(tmp_path: Path) -> None:
     server_args = build_sglang_server_args(
-        _checkpoint(tmp_path), context_length=2048, device="cuda"
+        write_mini_llama_checkpoint(tmp_path), context_length=2048, device="cuda"
     )
     declared = resolution_result(server_args, "mem_fraction_static")
 
