@@ -12,6 +12,9 @@ from types import ModuleType, SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.runtime_context import get_context, get_exec
 
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
 from sglang_omni.models.fishaudio_s2_pro.fish_speech.tokenizer import (
@@ -592,6 +595,16 @@ def test_s2pro_compile_helper_targets_forward_kvcached(
     assert audio_decoder._compiled_forward_kvcached_max_bs == 2
 
 
+_PUBLISHED: list = []
+
+
+@pytest.fixture(autouse=True)
+def _restore_published_context():
+    yield
+    while _PUBLISHED:
+        _PUBLISHED.pop().restore()
+
+
 def _run_s2pro_engine_with_fake_buffers(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -635,8 +648,8 @@ def _run_s2pro_engine_with_fake_buffers(
             self.model = SimpleNamespace()
 
         def init_cuda_graphs(self) -> None:
-            assert self.server_args.enable_torch_compile is False
-            assert self.server_args.torch_compile_max_bs == 64
+            assert get_exec().graph.enable_torch_compile is False
+            assert get_exec().graph.torch_compile_max_bs == 64
             init_graph_calls.append(True)
 
     class _FakeWorker:
@@ -674,19 +687,19 @@ def _run_s2pro_engine_with_fake_buffers(
         model_path: str,
         context_length: int,
         **kwargs: object,
-    ) -> SimpleNamespace:
+    ):
         del model_path
         build_kwargs.update(kwargs)
-        return SimpleNamespace(
+        published = get_context().override_server_args(
             context_length=context_length,
             cuda_graph_bs=kwargs["cuda_graph_bs"],
             cuda_graph_max_bs=kwargs["cuda_graph_max_bs"],
-            cuda_graph_config=SimpleNamespace(
-                decode=SimpleNamespace(
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
                     max_bs=kwargs["cuda_graph_max_bs"],
                     bs=kwargs["cuda_graph_bs"],
                 ),
-                prefill=SimpleNamespace(backend="disabled", bs=None, max_bs=None),
+                prefill=PhaseConfig(backend="disabled"),
             ),
             disable_cuda_graph=kwargs["disable_cuda_graph"],
             enable_torch_compile=kwargs["enable_torch_compile"],
@@ -695,8 +708,10 @@ def _run_s2pro_engine_with_fake_buffers(
             page_size=1,
             chunked_prefill_size=kwargs["chunked_prefill_size"],
             max_prefill_tokens=16384,
-            attention_backend=kwargs.get("attention_backend", "auto-resolved"),
+            attention_backend=kwargs.get("attention_backend"),
         )
+        _PUBLISHED.append(published)
+        return published.install()
 
     def fake_create_sglang_infrastructure(
         server_args: SimpleNamespace,
@@ -724,7 +739,7 @@ def _run_s2pro_engine_with_fake_buffers(
         server_args: SimpleNamespace,
         gpu_id: int,
     ) -> tuple[bool, tuple[object, object, object, object, object]]:
-        want_cuda_graph = not bool(server_args.disable_cuda_graph)
+        want_cuda_graph = not bool(resolution_result(server_args, "disable_cuda_graph"))
         infrastructure = fake_create_sglang_infrastructure(
             server_args, gpu_id, defer_cuda_graph_capture=want_cuda_graph
         )
@@ -819,10 +834,11 @@ def test_s2pro_engine_disables_generic_compile_after_local_compile(
         (scheduler.model_runner.args[0].model_runner.model, 64)
     ]
     assert result.init_graph_calls == [True]
-    assert scheduler.server_args.disable_cuda_graph is False
-    assert scheduler.server_args.enable_torch_compile is False
-    assert scheduler.server_args.cuda_graph_max_bs == 64
-    assert scheduler.server_args.cuda_graph_bs == [
+    server_args = scheduler.server_args
+    assert resolution_result(server_args, "disable_cuda_graph") is False
+    assert get_exec().graph.enable_torch_compile is False
+    assert resolution_result(server_args, "cuda_graph_max_bs") == 64
+    assert resolution_result(server_args, "cuda_graph_bs") == [
         1,
         2,
         4,
@@ -836,7 +852,7 @@ def test_s2pro_engine_disables_generic_compile_after_local_compile(
         56,
         64,
     ]
-    assert scheduler.server_args.torch_compile_max_bs == 64
+    assert resolution_result(server_args, "torch_compile_max_bs") == 64
 
 
 @pytest.mark.parametrize(
@@ -858,7 +874,10 @@ def test_s2pro_engine_selects_model_local_attention_backend(
         sm_version=sm_version,
     )
 
-    assert result.scheduler.server_args.attention_backend == expected_backend
+    assert (
+        resolution_result(result.scheduler.server_args, "attention_backend")
+        == expected_backend
+    )
 
 
 def test_s2pro_engine_preserves_explicit_attention_backend(
@@ -871,7 +890,9 @@ def test_s2pro_engine_preserves_explicit_attention_backend(
         server_args_overrides={"attention_backend": "triton"},
     )
 
-    assert result.scheduler.server_args.attention_backend == "triton"
+    assert (
+        resolution_result(result.scheduler.server_args, "attention_backend") == "triton"
+    )
 
 
 @pytest.mark.parametrize(

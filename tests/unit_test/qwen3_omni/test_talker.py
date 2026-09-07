@@ -1549,6 +1549,7 @@ def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) ->
             kv=ReqKvInfo(kv_committed_len=10, kv_allocated_len=11),
             output_ids=[6],
             origin_input_ids=[5],
+            beam_group=None,
         )
     ]
     batch.reqs = reqs

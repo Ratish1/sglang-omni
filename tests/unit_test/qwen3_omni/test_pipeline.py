@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import typer
+from sglang.srt.arg_groups.overrides import resolution_result
 
 import sglang_omni.models.qwen3_omni.stages as qwen_stages
 from sglang_omni.cli.serve import (
@@ -706,10 +707,10 @@ def test_qwen_encoder_mem_reserve_applies_only_to_valid_auto_values() -> None:
 
     apply_encoder_mem_reserve(server_args, 0.05)
 
-    assert server_args.mem_fraction_static == 0.879
+    assert resolution_result(server_args, "mem_fraction_static") == 0.879
 
     apply_encoder_mem_reserve(server_args, 0.0)
-    assert server_args.mem_fraction_static == 0.879
+    assert resolution_result(server_args, "mem_fraction_static") == 0.879
 
     with pytest.raises(ValueError, match="below the safe floor"):
         apply_encoder_mem_reserve(SimpleNamespace(mem_fraction_static=0.15), 0.10)
@@ -1260,7 +1261,7 @@ def test_qwen_thinker_auto_path_applies_encoder_reserve() -> None:
     )
 
     assert applied is True
-    assert server_args.mem_fraction_static == 0.879
+    assert resolution_result(server_args, "mem_fraction_static") == 0.879
 
 
 def test_qwen_thinker_explicit_pin_bypasses_encoder_reserve() -> None:

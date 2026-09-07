@@ -12,7 +12,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputFormat,
+)
 
 from sglang_omni.models.fun_asr import encoder_service
 from sglang_omni.models.fun_asr.encoder_service import (
@@ -372,7 +376,7 @@ def test_execute_batch_commits_item_state_only_after_stream_success(
     for item, feature in zip(items, features):
         assert item.feature is feature
         assert item.precomputed_embeddings is None
-        assert not hasattr(item, "format")
+        assert item.format == MultimodalInputFormat.NORMAL
 
 
 def test_singleton_oom_is_not_retried_and_next_request_succeeds(

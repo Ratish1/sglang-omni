@@ -397,6 +397,7 @@ def test_upstream_queue_limit_abort_is_translated_to_omni_output() -> None:
         rid="req-over-limit",
         priority=None,
         weight_version_events=[],
+        output_ids=[],
         time_stats=SimpleNamespace(
             trace_ctx=SimpleNamespace(
                 abort=lambda *, abort_info: trace_aborts.append(abort_info)
@@ -460,6 +461,7 @@ def test_enqueue_built_request_honors_max_queued_requests(monkeypatch) -> None:
             rid=rid,
             priority=None,
             weight_version_events=[],
+            output_ids=[],
             origin_input_ids=array("q", [1]),
             origin_input_ids_unpadded=array("q", [1]),
             time_stats=SimpleNamespace(
@@ -630,6 +632,7 @@ def test_upstream_kv_exhaustion_abort_is_translated_to_omni_output() -> None:
         num_retracted_reqs=0,
         enable_metrics=False,
     )
+    scheduler.beam_coordinator = SimpleNamespace(retire_group=lambda req: None)
     aborts: list[tuple[str, bool]] = []
     scheduler.abort = lambda rid, *, defer_running_cleanup=True: aborts.append(
         (rid, defer_running_cleanup)
@@ -641,6 +644,8 @@ def test_upstream_kv_exhaustion_abort_is_translated_to_omni_output() -> None:
         rid="req-kv-exhausted",
         to_finish=omni_scheduler_module.FINISH_ABORT("decode KV exhausted"),
         weight_version_events=[],
+        output_ids=[],
+        beam_group=None,
     )
 
     class ExhaustedBatch:
@@ -660,7 +665,7 @@ def test_upstream_kv_exhaustion_abort_is_translated_to_omni_output() -> None:
         def check_decode_mem(self) -> bool:
             return False
 
-        def retract_decode(self, _server_args):
+        def retract_decode(self):
             self.reqs = []
             return [], 0.5, [req]
 
@@ -2673,8 +2678,12 @@ def test_omni_scheduler_rejects_custom_request_over_context() -> None:
     assert request_data.req is req
 
 
-def test_omni_scheduler_follower_rejections_do_not_emit_errors() -> None:
+def test_omni_scheduler_follower_rejections_do_not_emit_errors(monkeypatch) -> None:
     """Request-limit and KV-capacity rejections are entry-rank emissions only."""
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_schedule",
+        lambda: SimpleNamespace(mem_fraction_static=0.85),
+    )
     scheduler = object.__new__(OmniScheduler)
     scheduler.outbox = Queue()
     scheduler.waiting_queue = []

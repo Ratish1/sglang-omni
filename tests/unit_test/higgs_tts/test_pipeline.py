@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from sglang.srt.arg_groups.overrides import resolution_result
 
 from sglang_omni.cli.serve import patches_from_broadcast_flags
 from sglang_omni.config.resolver import ConfigResolver
@@ -378,7 +379,9 @@ def test_higgs_tts_engine_default_enables_breakable_prefill_graphs(
     assert captured["server_args"].cuda_graph_config.prefill.backend == "breakable"
     assert captured["infra_kwargs"]["enable_prefill_input_embeds"] is True
     assert records["attest_calls"][-1][1] is False
-    assert captured["server_args"].disable_overlap_schedule is True
+    assert (
+        resolution_result(captured["server_args"], "disable_overlap_schedule") is True
+    )
     assert captured["server_args"].enable_torch_compile is False
     assert captured["server_args"].torch_compile_max_bs == 32
     assert records["infrastructure_saw_deferred_capture"] == [True]
@@ -488,7 +491,7 @@ def test_higgs_tts_engine_prefill_backend_policy() -> None:
         cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(backend="disabled"))
     )
     builder.customize_server_args(server_args)
-    assert server_args.disable_overlap_schedule is True
+    assert resolution_result(server_args, "disable_overlap_schedule") is True
 
 
 @pytest.mark.parametrize("fraction", [0.0, 1.0, 1.2, -0.1])
