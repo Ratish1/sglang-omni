@@ -17,10 +17,13 @@ from sgl_kernel import top_k_renorm_prob as _fused_top_k_renorm
 from sgl_kernel import top_p_renorm_prob as _fused_top_p_renorm
 from sglang.srt.layers.sampler import multinomial_with_seed
 
+from sglang_omni.models.higgs_tts.sampling_diagnostics import (
+    USE_GUMBEL_SAMPLE,
+    profile_sampling,
+)
 from sglang_omni.models.higgs_tts.utils import BOC_ID, EOC_ID
 
-# Sentinel seed for rows with no user seed: keeps the legacy unseeded
-# torch.multinomial path, so unseeded decode is byte-identical to before.
+# Sentinel for rows that use the configured unseeded draw.
 NO_SEED = -1
 
 # Sentinel returned by ``step`` after ``generation_done``; engine treats as stop.
@@ -218,43 +221,37 @@ def step(
     return codes_N
 
 
-def _sample_independent_batched(
+@profile_sampling("higgs.draw_unseeded")
+def _draw_unseeded_probs(probs: torch.Tensor) -> torch.Tensor:
+    """Draw one int64 category per valid probability row without mutating it."""
+    if (
+        not USE_GUMBEL_SAMPLE
+        or probs.device.type != "cuda"
+        or probs.dtype != torch.float32
+    ):
+        return probs.multinomial(num_samples=1).squeeze(-1)
+    # The Higgs filters produce contiguous FP32 probabilities. Unlike
+    # multinomial, this path does not validate finite/nonnegative/positive mass.
+    # Keep probabilities intact: the seeded branch also consumes them.
+    noise = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+    noise.clamp_min_(torch.finfo(torch.float32).tiny)
+    return (probs.float() / noise).argmax(dim=-1)
+
+
+@profile_sampling("higgs.filter")
+def _filtered_probs(
     logits_BNV: torch.Tensor,
     *,
     temperature: torch.Tensor,
     top_p: torch.Tensor | None,
-    top_k_buf: torch.Tensor | None = None,
-    seeds_B: torch.Tensor | None = None,
-    step_B: torch.Tensor | None = None,
+    top_k_buf: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Batched ``[B, N, V] → [B, N]`` sampler.
-
-    Greedy rows short-circuit to ``argmax`` over the raw logits — mirroring the
-    per-row :func:`_sample_independent` — so they are RNG-free and reproducible.
-    A row is greedy when ``temperature <= _GREEDY_TEMP_THRESHOLD`` (or
-    ``top_k == 1``). Without this, multinomial on the near-one-hot distribution
-    that ``temperature≈0`` produces breaks near-ties differently run-to-run,
-    making ``temperature=0`` decode non-deterministic. The selection is
-    branchless (compute both, then ``torch.where``) because this runs inside the
-    captured CUDA graph, where data-dependent host control flow is illegal.
-    """
+    """Existing temperature, FP32 softmax, top-k, then top-p operations."""
     B, N, V = logits_BNV.shape
-
-    # Per-row greedy mask (broadcast over codebooks). argmax over RAW logits,
-    # exactly as _sample_independent does.
-    greedy_B1 = (temperature <= _GREEDY_TEMP_THRESHOLD).view(B, 1)
-    if top_k_buf is not None:
-        greedy_B1 = greedy_B1 | (top_k_buf == 1).view(B, 1)
-    argmax_BN = logits_BNV.argmax(dim=-1)
-
     safe_temp = temperature.clamp(min=_GREEDY_TEMP_THRESHOLD).view(B, 1, 1)
     logits = logits_BNV / safe_temp
 
-    # PR-D: fused top-k/top-p renormalization replaces full-vocab torch.sort +
-    # logit masking. Numerically equivalent to the sort path (max prob diff ~5e-7,
-    # identical support across temp/top_k/top_p sweeps); only differs from the prior
-    # code at an exact cumsum==top_p boundary, where it uses the standard nucleus
-    # convention. Inputs MUST be contiguous fp32 for the flashinfer renorm kernels.
+    # Inputs MUST be contiguous fp32 for the flashinfer renorm kernels.
     probs = logits.float().softmax(dim=-1).reshape(B * N, V).contiguous()
     if top_k_buf is not None:
         tk = (
@@ -269,17 +266,59 @@ def _sample_independent_batched(
     if top_p is not None:
         tp = top_p.view(B, 1).expand(B, N).reshape(B * N).to(torch.float32).contiguous()
         probs = _fused_top_p_renorm(probs, tp)
+    return probs
 
-    codes_flat = probs.multinomial(num_samples=1).squeeze(-1)
+
+@profile_sampling("higgs.draw_seeded")
+def _draw_seeded_probs(
+    probs: torch.Tensor, seeds: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    return multinomial_with_seed(torch.log(probs), seeds, positions).squeeze(-1)
+
+
+@profile_sampling("higgs.sampler")
+def _sample_independent_batched(
+    logits_BNV: torch.Tensor,
+    *,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor | None,
+    top_k_buf: torch.Tensor | None = None,
+    seeds_B: torch.Tensor | None = None,
+    step_B: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Batched ``[B, N, V] → [B, N]`` sampler.
+
+    Greedy rows select ``argmax`` over the raw logits — mirroring the
+    per-row :func:`_sample_independent`. Both stochastic draws still execute;
+    greedy outputs are reproducible, but the operation consumes RNG state.
+    A row is greedy when ``temperature <= _GREEDY_TEMP_THRESHOLD`` (or
+    ``top_k == 1``). Without this, multinomial on the near-one-hot distribution
+    that ``temperature≈0`` produces breaks near-ties differently run-to-run,
+    making ``temperature=0`` decode non-deterministic. The selection is
+    branchless (compute both, then ``torch.where``) because this runs inside the
+    captured CUDA graph, where data-dependent host control flow is illegal.
+    """
+    B, N, _ = logits_BNV.shape
+
+    # Per-row greedy mask (broadcast over codebooks). argmax over RAW logits,
+    # exactly as _sample_independent does.
+    greedy_B1 = (temperature <= _GREEDY_TEMP_THRESHOLD).view(B, 1)
+    if top_k_buf is not None:
+        greedy_B1 = greedy_B1 | (top_k_buf == 1).view(B, 1)
+    argmax_BN = logits_BNV.argmax(dim=-1)
+
+    probs = _filtered_probs(
+        logits_BNV, temperature=temperature, top_p=top_p, top_k_buf=top_k_buf
+    )
+
+    codes_flat = _draw_unseeded_probs(probs)
     if seeds_B is not None:
         # Seeded rows draw deterministically from (seed, step*N + codebook);
-        # unseeded rows (seed == NO_SEED) keep the torch.multinomial draw above.
+        # unseeded rows (seed == NO_SEED) keep the configured draw above.
         cb = torch.arange(N, device=logits_BNV.device).view(1, N).expand(B, N)
         positions = (step_B.view(B, 1) * N + cb).reshape(B * N)
         seeds_flat = seeds_B.clamp_min(0).view(B, 1).expand(B, N).reshape(B * N)
-        seeded_flat = multinomial_with_seed(
-            torch.log(probs), seeds_flat, positions
-        ).squeeze(-1)
+        seeded_flat = _draw_seeded_probs(probs, seeds_flat, positions)
         has_seed = (seeds_B >= 0).view(B, 1).expand(B, N).reshape(B * N)
         codes_flat = torch.where(has_seed, seeded_flat, codes_flat)
     sampled_BN = codes_flat.view(B, N)
@@ -365,6 +404,7 @@ def batched_step(
     return out_codes
 
 
+@profile_sampling("higgs.sampler_fsm")
 def batched_step_direct(
     logits_BNV: torch.Tensor,
     delay_count: torch.Tensor,

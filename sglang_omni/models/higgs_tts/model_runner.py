@@ -23,6 +23,11 @@ from sglang_omni.model_runner.prefill_inputs import (
     attach_omni_prefill_inputs,
 )
 from sglang_omni.models.higgs_tts.sampler import K_MAX, selected_token_logprobs
+from sglang_omni.models.higgs_tts.sampling_diagnostics import (
+    PROFILE_SAMPLING,
+    USE_GUMBEL_SAMPLE,
+    profile_sampling,
+)
 from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.utils import EOC_ID
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
@@ -31,6 +36,7 @@ from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA,
     HIGGS_STREAM_STRIDE_METADATA,
 )
+from sglang_omni.profiler.event_recorder import emit, get_recorder
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 
@@ -98,6 +104,47 @@ class HiggsTTSModelRunner(ModelRunner):
         del schedule_batch
         self._collect_step_outputs(result, requests, forward_batch)
 
+    def custom_prefill_forward(
+        self, forward_batch: Any, schedule_batch: Any, requests: list
+    ) -> Any | None:
+        if not PROFILE_SAMPLING:
+            return None
+        return self._profiled_forward(forward_batch, requests, is_prefill=True)
+
+    def custom_decode_forward(
+        self, forward_batch: Any, schedule_batch: Any, requests: list
+    ) -> Any | None:
+        if not PROFILE_SAMPLING:
+            return None
+        return self._profiled_forward(forward_batch, requests, is_prefill=False)
+
+    def _profiled_forward(
+        self, forward_batch: Any, requests: list, *, is_prefill: bool
+    ) -> Any:
+        batch_result = self._forward_with_range(forward_batch)
+        if requests and get_recorder().is_active():
+            emit(
+                request_id=requests[0].request_id,
+                stage=None,
+                event_name="higgs_sampling_forward",
+                metadata={
+                    "is_prefill": is_prefill,
+                    "is_graph": bool(batch_result.can_run_cuda_graph),
+                    "live_requests": len(requests),
+                    "forward_batch_size": int(forward_batch.batch_size),
+                    "use_gumbel": USE_GUMBEL_SAMPLE,
+                    "unseeded_requests": sum(
+                        req.data.req.sampling_params.sampling_seed is None
+                        for req in requests
+                    ),
+                },
+            )
+        return batch_result
+
+    @profile_sampling("higgs.forward")
+    def _forward_with_range(self, forward_batch: Any) -> Any:
+        return self.tp_worker.forward_batch_generation(forward_batch)
+
     def before_decode(
         self,
         forward_batch,
@@ -113,6 +160,7 @@ class HiggsTTSModelRunner(ModelRunner):
         del schedule_batch
         self._collect_step_outputs_cg(result, forward_batch, requests)
 
+    @profile_sampling("higgs.pack_and_d2h_submit")
     def post_decode_launch(self, result, forward_batch, requests):
         """Async-decode GPU half: scatter + pack (GPU->GPU), then a
         non-blocking copy of the staging snapshot into a pinned host staging buffer.
@@ -185,6 +233,7 @@ class HiggsTTSModelRunner(ModelRunner):
             requests,
         )
 
+    @profile_sampling("higgs.prepare")
     def _populate_cg_buffers(
         self, forward_batch, requests, *, is_lookahead: bool = False
     ) -> None:
@@ -302,6 +351,7 @@ class HiggsTTSModelRunner(ModelRunner):
             )
         return temps, top_ps, top_ks
 
+    @profile_sampling("higgs.sync_collect")
     def _collect_step_outputs_cg(
         self, result: Any, forward_batch: Any, requests: list
     ) -> None:
@@ -331,6 +381,7 @@ class HiggsTTSModelRunner(ModelRunner):
             requests,
         )
 
+    @profile_sampling("higgs.pack_gpu")
     def _decode_pack_gpu(self, n_real: int) -> torch.Tensor:
         """Scatter shadow sampler state back into the pool and pack the three
         collect tensors (codes / was_done / generation_done) into the staging
@@ -353,6 +404,7 @@ class HiggsTTSModelRunner(ModelRunner):
         staging[:n_real, num_codebooks + 1] = model._cg_active_generation_done[:n_real]
         return staging
 
+    @profile_sampling("higgs.collect_host")
     def _decode_collect_host(
         self,
         combined_cpu: torch.Tensor,

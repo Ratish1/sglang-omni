@@ -24,6 +24,11 @@ from sglang_omni.models.higgs_tts.sampler import (
     batched_step,
     batched_step_direct,
 )
+from sglang_omni.models.higgs_tts.sampling_diagnostics import (
+    PROFILE_SAMPLING,
+    USE_GUMBEL_SAMPLE,
+    profile_sampling,
+)
 from sglang_omni.models.higgs_tts.weight_loader import DiscreteWeightMapper
 from sglang_omni.sampling.seed import resolve_row_seed
 
@@ -136,6 +141,15 @@ class HiggsTTSModel(nn.Module):
         self._num_codebooks = num_codebooks
         self._codebook_vocab_size = vocab_size
         self._tie_modality = bool(enc_cfg.get("tie_word_embeddings", True))
+        self._profiled_sampling_shapes: set[int] = set()
+        logger.info(
+            "Higgs sampling: gumbel_requested=%s cuda_only=True profile=%s "
+            "codebooks=%s vocab=%s (restart required to change switches)",
+            USE_GUMBEL_SAMPLE,
+            PROFILE_SAMPLING,
+            num_codebooks,
+            vocab_size,
+        )
 
         self.multimodal_embedding = _HiggsMultimodalEmbedding(
             num_codebooks=num_codebooks,
@@ -256,7 +270,7 @@ class HiggsTTSModel(nn.Module):
         return row
 
     def set_request_seed(self, req_id: str, seed: int | None) -> None:
-        """Pin req_id's sampler seed (None -> unseeded torch.multinomial).
+        """Pin req_id's sampler seed (None -> configured unseeded draw).
 
         Constant across the request's AR steps; consumed by
         multinomial_with_seed for seeded rows.
@@ -286,6 +300,20 @@ class HiggsTTSModel(nn.Module):
             )
         return torch.stack(codes, dim=0).to(torch.long)
 
+    @profile_sampling("higgs.head")
+    def _codebook_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size = hidden_states.shape[0]
+        if PROFILE_SAMPLING and batch_size not in self._profiled_sampling_shapes:
+            self._profiled_sampling_shapes.add(batch_size)
+            logger.info(
+                "Higgs sampler shape: B=%s N=%s V=%s device=%s dtype=float32",
+                batch_size,
+                self._num_codebooks,
+                self._codebook_vocab_size,
+                hidden_states.device,
+            )
+        return self.modality_head.generate(hidden_states).to(torch.float32)
+
     @torch.no_grad()
     def decode_codebooks_batch(
         self,
@@ -302,7 +330,7 @@ class HiggsTTSModel(nn.Module):
             )
 
         # fp32 for softmax numerical stability.
-        logits_BNV = self.modality_head.generate(hidden_states_BD).to(torch.float32)
+        logits_BNV = self._codebook_logits(hidden_states_BD)
         device = logits_BNV.device
 
         row_indices = torch.tensor(
@@ -370,7 +398,7 @@ class HiggsTTSModel(nn.Module):
         batch_size = hidden_states_BD.shape[0]
         device = hidden_states_BD.device
 
-        logits_BNV = self.modality_head.generate(hidden_states_BD).to(torch.float32)
+        logits_BNV = self._codebook_logits(hidden_states_BD)
 
         temperature = self._cg_temperature[:batch_size]
         top_p = self._cg_top_p[:batch_size]
