@@ -37,8 +37,10 @@ bound slice is how a serving engine should size memory, or a shortcut.
 - Qwen3-TTS default: two stages on device 0, the talker at 0.3 with 64 sequences and
   `max_model_len` 4096, code2wav at 0.3 with 64 sequences (`vllm_omni/deploy/qwen3_tts.yaml`).
   The talker process holds the speaker encoder and the speech tokenizer encoder as parts of
-  the model (`qwen3_tts_talker.py:388, 471-484`), so the profile run sees their weights and
-  their activations. Higgs: 0.6 and 0.25 on one device. MOSS nano: 0.3.
+  the model (`qwen3_tts_talker.py:388, 471-484`), so the profile run sees their weights.
+  Correction after the Sep 7 review: it does not see their activations. The talker declares
+  no multimodal support, so the dummy run takes the plain embedding path
+  (`vllm_omni/worker/gpu_model_runner.py:1092-1105`) and never runs the encoders. Higgs: 0.6 and 0.25 on one device. MOSS nano: 0.3.
 
 ## 3. What that says about the sglang-omni side
 

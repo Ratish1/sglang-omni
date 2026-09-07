@@ -9,7 +9,7 @@ during our windows and the load average sat between 3.6 and 6.2. Two boots per a
 ## Verdict
 
 The slice does what it claims and regresses nothing the code owns. The pool drops from 589142
-to 131072 tokens, the process at ready drops from 75.2 GB to 25.0 GB, no B boot logs an
+to 131072 tokens, the process at ready drops from 75167 MiB to 25043 MiB, no B boot logs an
 allocator retry, c1 audio is byte identical to A and to the d26 archive, the kernel census is
 identical, every request of every run completed, and all three suites pass on B.
 
@@ -199,8 +199,13 @@ _run`, 32 MiB each under the thinker prepare and the vocoder, a few MiB of decod
 
 The transient that drives the cache is the vocoder's whole utterance decode,
 `streaming_vocoder.py:1884 _vocode_payloads`, the thirty largest allocations of both histories
-are its, 390 to 760 MiB each, three at a time on three vocoder streams that each hold 1576 MiB
-reserved. The preprocessing thread's `_run` stream holds 650 MiB on A and 852 MiB on B. That is
+are its, 390 to 760 MiB each, on stream 0. Correction after the Sep 7 review: the non streaming
+loop runs one `_vocode_payloads` call at a time (streaming_simple_scheduler.py:383-430), so the
+three allocations one millisecond apart are tensors of one call, not three calls. The three
+streams at 1576 MiB are the vocoder's decode graph pools, proven by pool id from the pickle:
+private pools (0, 3), (0, 4) and (0, 5), one per capture stream, 1544 MiB reserved and 12 MiB
+live each on both arms, plus a 32 MiB default pool segment per stream for the static buffers.
+The preprocessing thread's `_run` stream holds 650 MiB on A and 852 MiB on B. That is
 the composition plan 05 section 1 asked for, at the resolution the window allows: pool, weights,
 and a vocoder transient of about 2.3 GB across three streams, plus the allocator's cache of it.
 
