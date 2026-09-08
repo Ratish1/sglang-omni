@@ -1,8 +1,9 @@
 # Qwen3-TTS memory provisioning plan
 
-Revision 6, Sep 8 2026. Replaces revision 5 after the sglang bump readout of Sep 8 reproduced
-the failure on main and attributed it. The design is reduced to ordering and the cap, no
-measurement machinery. Sources: upstream main `53239c285`, sglang v0.5.18, the Sep 6 archive
+Revision 7, Sep 8 2026. Replaces revision 5 after the sglang bump readout of Sep 8 reproduced
+the failure on main and attributed it. The design is reduced to ordering, no measurement
+machinery and no admission cap: the user's decision on Sep 8 after the first B arm showed a
+14 GB pool, "the normal memory PR by just rearranging and freeing the memory a little bit". Sources: upstream main `53239c285`, sglang v0.5.18, the Sep 6 archive
 readout (`11_kv_pool_readout_20260906.md`), the bump readout quoted in section 1, the review
 documents in `tasks/qwen3_tts_memory_provisioning_review_20260907/`, qwen-tts 0.1.1 as
 installed on the box. Code branch: `perf/qwen3-tts-memory-provisioning` from `53239c285`.
@@ -47,8 +48,9 @@ Two more facts from revision 5 stay true and are handled as follows.
   clip through the Mimi tokenizer and drop the codes (request_builders.py:965, 984 and the
   wrapper, qwen-tts `qwen3_tts_model.py:426-432, 449`). That encode is the one allocation in
   the process with no input bound. It is an origin bug and is fixed here, section 4.5.
-- No transient of the non LLM components is accounted anywhere. That matters only where the
-  cap of 4.4 does not bind. It is deferred with a gate, section 4.8.
+- No transient of the non LLM components is accounted anywhere. They run inside sglang's
+  slack, which this plan makes whole again. Accounting them is deferred with a gate,
+  section 4.8.
 
 One more consequence of the order. The incremental codec graph capture refuses to run below
 3 GiB free (`incremental_codec_cuda_graph_min_free_gb`, incremental_codec_cuda_graph.py:79,
@@ -68,7 +70,7 @@ vocoder built first the reading precedes the engine.
 | KV pool, req_to_token, allocator free list | alloc_memory_pool (bootstrap.py:180) | resident | sized by the rule of 4.1 |
 | sglang decode and prefill graphs | init_sglang_cuda_graphs (engine_factory.py:223) | resident, private pools | sglang's own graph reserve, unchanged |
 | LLM prefill and decode activations | sglang forward | transient | sglang's slack, unchanged |
-| Mimi encode of a reference | the ref code batcher thread, batches of up to 8 clips (request_builders.py:870, 882) | transient | sglang's slack, or the room the cap leaves |
+| Mimi encode of a reference | the ref code batcher thread, batches of up to 8 clips (request_builders.py:870, 882) | transient | sglang's slack |
 | speaker encoder forward | preprocessing workers, up to 8 (sglang_model.py:404-425) | transient | same |
 | streaming and whole utterance decodes | vocoder workers | transient | same |
 | cuDNN plans, graph executables, allocator cache | libraries and torch | resident, grows at first use | sglang's slack |
@@ -78,8 +80,7 @@ vocoder built first the reading precedes the engine.
 | Mechanism | Where | Use |
 | --- | --- | --- |
 | sglang's sizing rule and slack | kv_cache_configurator.py:1764-1811, server_args.py:4956-4983 | untouched, fed a complete resident set |
-| `max_total_tokens` as a minimum on the pool | kv_cache_configurator.py:1844-1859 | the cap, 4.4 |
-| `mem_fraction_static`, `engine.kv_cache_bytes`, `gpu_memory_fraction` | server args, stage config | untouched deployment knobs |
+| `max_total_tokens`, `mem_fraction_static`, `engine.kv_cache_bytes`, `gpu_memory_fraction` | server args, stage config | untouched deployment knobs, the builder default of 0.85 stays |
 | the reference hook and its batcher | request_builders.py:943-997, 762-905 | becomes the single encoder caller |
 | the engine's input length refusal | omni_scheduler.py:1247-1258, sglang managers/utils.py:193-223 | final authority behind the ICL precheck |
 
@@ -87,12 +88,13 @@ vocoder built first the reading precedes the engine.
 
 ### 4.1 The rule
 
-    pool = min(running × context, sglang's rule over the true resident set)
+    pool = sglang's rule over the true resident set
 
 Every allocation that lives for the life of the process exists before sglang takes the
 reading that sizes the pool. That is an ordering property, not a measurement, and it holds
-on every card. The second term is sglang's, unchanged. The first term is the demand bound,
-measured on Sep 6.
+on every card. The rule itself is sglang's, unchanged, with the builder's 0.85 fraction as on
+main. The pool shrinks by exactly the residency that used to sit in the slack, and the slack
+is whole again for the transients of section 2. Nothing else about the memory map changes.
 
 ### 4.2 The vocoder before the engine, one tokenizer per process
 
@@ -135,14 +137,13 @@ SDPA (1816-1823). It does not touch the KV pool or the attention backends (1310-
 nothing it needs is missing before the pool. sglang's own decode and prefill graphs stay
 after the pool, where its graph reserve was written for them.
 
-### 4.4 The cap
+### 4.4 The cap, not taken
 
-From the Sep 6 branch, measured there: `max_total_tokens = running × context` when no stage
-byte budget is declared (engine_builder.py:149), and the builder's `mem_fraction_static`
-default of 0.85 (engine_builder.py:93) removed so sglang derives its slack. The deployment
-knob stays. At 16 running the pool holds 131072 tokens, about 14 GB from the archive's two
-pool sizes and process footprints, which is every token admission can commit. The rest of
-the card is room for the transients of section 2 without any accounting.
+The Sep 6 branch capped the pool at `running × context`, 131072 tokens and 14.00 GiB at 16
+running, leaving about 40 GB of the card unused. Measured on Sep 6 against the older main
+and again on Sep 8 against `53239c285` as the first B arm: c1 byte identical, no regression.
+It is not in this PR. The pool fills the card the way sglang and every other model in the
+tree do, and a deployment that wants a smaller pool sets `max_total_tokens` itself.
 
 ### 4.5 The reference path origin fix
 
@@ -170,39 +171,43 @@ encode it never used.
 ### 4.6 The startup line
 
 `post_scheduler_setup` (engine_builder.py) reports the pool in tokens and GiB from the pool's
-own byte accounting, the admission bound, and `mem_fraction_static` as resolved. Free device
-memory is already printed by sglang after the pool and after graph capture.
+own byte accounting, the admission bound `running × context` for comparison, and
+`mem_fraction_static` as resolved. Free device memory is already printed by sglang after the
+pool and after graph capture.
 
 ### 4.7 Memory map and flow, 80 GB H100
 
 ```
-main 53239c285 at 16 running       this plan at 16 running        this plan where the cap does not bind
-+---------------------------+      +---------------------------+  +---------------------------+
-| free at the failure: 0.5  |      | free: about 40 GB          |  | free: sglang's slack       |
-+---------------------------+      |   room for every transient |  +---------------------------+
-| slack after residency: ~5 |      |                            |  | slack, 10 GB floor         |
-+---------------------------+      +---------------------------+  +---------------------------+
-| tokenizer x2, predictor,  |      | KV pool: 131072 tokens     |  | KV pool: rule − residency  |
-| codec graphs, arena:      |      |   about 14 GB              |  +---------------------------+
-| after sizing, from slack  |      +---------------------------+  | tokenizer x1, predictor,   |
-+---------------------------+      | tokenizer x1, predictor,   |  | codec graphs, arena:       |
-| KV pool: free − 10 GB     |      | codec graphs, arena:       |  | before sizing, in the read |
-|   most of it never used   |      | before sizing, in the read |  +---------------------------+
-+---------------------------+      +---------------------------+  | weights                    |
-| weights                   |      | weights                    |  +---------------------------+
-+---------------------------+      +---------------------------+
+main 53239c285, any cap                 this plan, any cap
++-------------------------------+       +-------------------------------+
+| slack left for transients:    |       | slack for transients: whole,  |
+|   0.85 slack minus residency  |       |   the full 0.85 slack         |
++-------------------------------+       +-------------------------------+
+| tokenizer x2, predictor,      |       | KV pool: rule − residency     |
+| codec graphs, arena:          |       |                               |
+| created after sizing,         |       +-------------------------------+
+| paid from the slack           |       | tokenizer x1, predictor,      |
++-------------------------------+       | codec graphs, arena:          |
+| KV pool: free after weights   |       | before sizing, in the reading |
+|   minus the 0.85 slack        |       +-------------------------------+
++-------------------------------+       | weights                       |
+| weights                       |       +-------------------------------+
++-------------------------------+
 ```
+
+Same peak on both, the card is full either way. What moves is the residency, out of the slack
+and into the pool's reading, so the room at request time grows by that residency, one
+tokenizer copy less.
 
 ```
 preprocessing factory                                          stages.py:108
 vocoder factory: registry load, arena, codec graphs            stages.py:218-302     4.2
 tts_engine factory -> build()
-  adjust_overrides: max_total_tokens = running x context        engine_builder.py:149 4.4
   create_sglang_infrastructure
     ModelWorker: weights, both free readings                    bootstrap.py:159
     before_memory_pool: registry hit, processor, wrapper,
       preprocessing context, predictor graphs                   new                   4.3
-    alloc_memory_pool: sglang's rule, min with the cap          bootstrap.py:180
+    alloc_memory_pool: sglang's rule over the resident set      bootstrap.py:180
   init_sglang_cuda_graphs: decode and prefill graphs            engine_factory.py:223
   post_scheduler_setup: the startup line                        engine_builder.py     4.6
 serving: the hook prechecks ICL frames, skips the encode in
@@ -213,11 +218,9 @@ serving: the hook prechecks ICL frames, skips the encode in
 
 Revision 5's envelope, before pool measurement, allowances, `kv_cache_reserve_bytes`,
 `headroom_bytes`, the byte aware batcher with its refusal above context frames, and the post
-capture refusal. They account request time transients of the non LLM components. They matter
-only where `running × context` no longer fits and sglang's slack is all the room there is,
-about 72 running on an 80 GB card at 8192 context. Gate: a run at the smallest cap where
-the bound stops binding that shows a transient of section 2 exceeding the slack. Until then
-none of it ships.
+capture refusal. They account request time transients of the non LLM components, which run
+inside sglang's slack. Gate: a run that shows a transient of section 2 exceeding the whole
+slack. Until then none of it ships.
 
 sglang's post capture sizing (`SGLANG_ENABLE_POST_CAPTURE_KV_SIZING`, off by default) is not
 used. Omni runs it inside `init_cuda_graphs` (sglang_model_runner.py:477-478), before the
@@ -247,38 +250,33 @@ Remote unit checks, per commit: the stage list builds the vocoder before the eng
 entry stage and the routing unchanged, the registry returns one object for an equal key and
 loads for a different one, the bootstrap runs the callback between the worker and the pool,
 the engine factory passes it and the Qwen3-TTS hook attaches the tokenizer and captures the
-predictor graphs there and nowhere else, the cap and its refusal under a byte budget, the
-uploaded miss path reaches the hook, x vector mode submits no encode and yields the same
-prompt and artifact, the precheck refuses a reference at context frames before the submit
-and passes one below it, the startup line carries every field.
+predictor graphs there and nowhere else, the uploaded miss path reaches the hook, x vector
+mode submits no encode and yields the same prompt and artifact, the precheck refuses a
+reference at context frames before the submit and passes one below it, the startup line
+carries every field. Run on the box on Sep 8: 280 passed, one test double fixed after.
 
-Box, two frozen arms on `53239c285`: A main, B the branch. The cap alone was measured on
-Sep 6 against the older main and holds.
+Box, two frozen arms on `53239c285`: A main, B the branch.
 
 | Gate | Setup | Evidence |
 | --- | --- | --- |
-| The bump failure | the sglang bump on both arms, default cap, CustomVoice with prefill graphs | B completes 16 of 16 where A fails, the startup line shows the pool at the bound |
-| Resident set at sizing | default cap, cold boots | the free reading before the pool is below A's by the vocoder residency and the predictor pools, taken from the sglang pool logs and the codec graph footprint line |
-| Codec graph gate | same | no `below headroom` warning from the incremental codec runner on B |
-| The regime above the cap | the smallest cap where `running × context` exceeds the rule, and one above | B completes with the pool reduced by the residency, A's outcome recorded |
-| Reference contract | ICL and x vector, ad hoc and uploaded misses, cache hits, a reference at context frames | codes and speaker embeddings identical to A for the same clips, no encode call in x vector mode, the refusal before device work |
-| c1 and c16 corpus | two boots per arm, paired A B B A, the 1 s all GPU sample | c1 byte identical to A, c16 inside the archived range, throughput inside the paired spread, the kernel census |
-| Startup time | same | B against A, the registry saves one tokenizer load |
+| Numerics | Base, seed-tts corpus at c1, one boot per arm | every WAV byte identical to A. Done Sep 8 with the cap present, 1088 of 1088 identical, the cap does not touch the numerics so it stands |
+| The residency moved | Base, default settings, one boot per arm | free device memory at ready, after every stage is built and before the first request, is higher on B than on A by the residency. sglang's pool end line is the same on both, it is the slack. B logs one tokenizer load and one reuse, the predictor capture before the pool, and no codec graph headroom warning |
+| The OOM we faced | Base, seed-tts corpus at c16, `--tts_engine.engine.max_running_requests 128 --tts_engine.engine.cuda_graph_max_bs 128`, one boot per arm | A fails the way the Sep 6 run did, B completes |
 
 ## 7. The commit series inside the one PR
 
 1. The vocoder before the engine, the keyed tokenizer registry, tests.
 2. `before_memory_pool` in bootstrap and the engine factory, the Qwen3-TTS hook with the
    tokenizer attach and the predictor capture, tests.
-3. The cap and the builder fraction default, the startup line, tests.
+3. The startup line, tests. The cap landed here first and was removed by a later commit.
 4. The reference hook as the single encoder caller, no encode in x vector mode, the ICL
    precheck, tests.
 
 ## 8. Decisions taken
 
 1. Ordering, not measurement. No envelope, no probes, no reserve, no headroom field.
-2. The cap stays as the demand term. It is not a memory saving for its own sake, it is the
-   most the pool can ever hold live at that running count.
+2. No cap. The pool fills the card under sglang's rule as for every other model, and the
+   builder's 0.85 fraction default stays as on main. The user's decision of Sep 8.
 3. No input policy. The x vector encode is removed because its output was never used.
 4. Transient accounting is deferred behind the gate of 4.8.
 5. The post capture flag is left alone.
@@ -287,6 +285,5 @@ Sep 6 against the older main and holds.
 
 1. The resident bytes of one tokenizer copy, the predictor graph pool, the codec state arena
    and the codec graph pools on `53239c285`, from the startup logs of the B arm.
-2. The pool size in bytes at the cap from the startup line, against the 14 GB estimate.
-3. The free reading before the pool on B against A, and how much of A's slack the residency
+2. Free device memory at ready on B against A, which is how much of A's slack the residency
    consumed.
