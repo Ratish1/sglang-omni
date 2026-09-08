@@ -19,6 +19,8 @@ class _CapturedServerArgs:
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
         self.enable_dp_attention = False
+        self.enable_nccl_nvls = kwargs.get("enable_nccl_nvls", False)
+        self.enable_symm_mem = kwargs.get("enable_symm_mem", False)
         self.startup_weight_load_mode = kwargs.get("startup_weight_load_mode", "serial")
         self.weight_cache_mode = kwargs.get("weight_cache_mode", "off")
         self._resolution_finished = False
@@ -72,6 +74,15 @@ def test_ipc_weight_cache_modes_are_rejected(monkeypatch) -> None:
             _build(monkeypatch, weight_cache_mode=mode)
 
     assert _build(monkeypatch, weight_cache_mode="off")["weight_cache_mode"] == "off"
+
+
+def test_nvls_and_symmetric_memory_engine_flags_are_rejected(monkeypatch) -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="enable_nccl_nvls"):
+        _build(monkeypatch, enable_nccl_nvls=True)
+    with pytest.raises(ValueError, match="enable_symm_mem"):
+        _build(monkeypatch, enable_symm_mem=True)
 
 
 def _drive_build(monkeypatch, *, overrides, gpu_id=0):
