@@ -98,8 +98,10 @@ measured on Sep 6.
 
 Config order becomes preprocessing, vocoder, tts_engine (config.py:54-83). The entry stage
 is the first of the list (schema.py:696) so preprocessing stays first. Routing follows the
-named edges, `next` and `stream_to`, and does not change. Construction is list order, one
-factory at a time under the GPU startup lock (stage_workers.py:493, 884).
+named edges, `next` and `stream_to`, and does not change. Stages sharing a process keep
+config order in the launch spec, "config order is load order inside one OS process"
+(topology.py `_group_stages_by_process`), and construction is one factory at a time under
+the GPU startup lock (stage_workers.py:493, 884).
 
 `_load_qwen3_tts_tokenizer` (stages.py:46) becomes a process local registry keyed by
 tokenizer path, device, dtype and attention implementation. The vocoder loads and registers,
@@ -165,9 +167,9 @@ encode it never used.
 
 ### 4.6 The startup line
 
-`post_scheduler_setup` (engine_builder.py) reports the pool in tokens and bytes, the
-admission bound, `mem_fraction_static` as resolved, and free device memory at the end of the
-engine build, named as such.
+`post_scheduler_setup` (engine_builder.py) reports the pool in tokens and GiB from the pool's
+own byte accounting, the admission bound, and `mem_fraction_static` as resolved. Free device
+memory is already printed by sglang after the pool and after graph capture.
 
 ### 4.7 Memory map and flow, 80 GB H100
 
@@ -283,8 +285,6 @@ Sep 6 against the older main and holds.
 
 1. The resident bytes of one tokenizer copy, the predictor graph pool, the codec state arena
    and the codec graph pools on `53239c285`, from the startup logs of the B arm.
-2. The pool size in bytes at the cap from the sglang pool log, against the 14 GB estimate.
-3. Whether any layout builds the engine before the vocoder after the reorder, from the
-   launch specs of the shared, split preprocessing and separate vocoder layouts.
-4. The free reading before the pool on B against A, and how much of A's slack the residency
+2. The pool size in bytes at the cap from the startup line, against the 14 GB estimate.
+3. The free reading before the pool on B against A, and how much of A's slack the residency
    consumed.
