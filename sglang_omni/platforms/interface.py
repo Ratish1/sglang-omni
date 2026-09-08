@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.model_override_base import resolved_view
@@ -12,6 +13,7 @@ from sglang_omni.utils.misc import normalize_quantization
 
 if TYPE_CHECKING:
     import torch
+    from torch.nn.attention import SDPBackend
 
     from sglang_omni.comm.data_ref import TransportKind
     from sglang_omni.pipeline.stage_workers import StageLaunchConfig
@@ -93,3 +95,16 @@ class OmniPlatform(DeviceMixin):
     def supports_torchaudio_resample(self) -> bool:
         """Check if current platform support torchaudio.functional.resample"""
         return True
+
+    def get_graph_capture_sdpa_backends(self) -> tuple["SDPBackend", ...]:
+        """Empty leaves dispatch alone."""
+        return ()
+
+    def graph_capture_attention(self) -> AbstractContextManager[object]:
+        backends = self.get_graph_capture_sdpa_backends()
+        if not backends:
+            return nullcontext()
+
+        from torch.nn.attention import sdpa_kernel
+
+        return sdpa_kernel(list(backends))
