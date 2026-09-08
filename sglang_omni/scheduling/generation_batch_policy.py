@@ -106,7 +106,9 @@ def operator_selected_prefill_backend(
     """Whether the operator named the prefill CUDA graph backend in the overrides."""
     if not server_args_overrides:
         return False
-    if "cuda_graph_backend_prefill" in server_args_overrides:
+    # note (ratish): a null flat selector is unset in sglang; a nested key is
+    # locked at any value.
+    if server_args_overrides.get("cuda_graph_backend_prefill") is not None:
         return True
     return "backend" in nested_prefill_overrides(server_args_overrides)
 
