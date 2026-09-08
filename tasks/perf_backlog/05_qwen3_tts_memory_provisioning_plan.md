@@ -127,7 +127,9 @@ checkpoint directory, the device, the gpu id and the server args. The base hook 
 
 Qwen3-TTS implements it with what `setup_model` and `setup_model_resources` do today: the
 tokenizer attach, now a registry hit, the processor, the wrapper, the preprocessing context,
-and the predictor graph capture. Those two hooks become empty for Qwen3-TTS. The predictor
+and the predictor graph capture. Those two hooks become empty for Qwen3-TTS. The TTS family
+builder keeps `setup_model` abstract (engine_factory.py:471), so Qwen3-TTS declares it
+explicitly as empty rather than inheriting the base no op. The predictor
 capture reads only buffers the model allocated at init (sglang_model.py:895-948) and runs
 SDPA (1816-1823). It does not touch the KV pool or the attention backends (1310-1350), so
 nothing it needs is missing before the pool. sglang's own decode and prefill graphs stay
