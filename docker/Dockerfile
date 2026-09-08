@@ -53,6 +53,23 @@ RUN python3 -c 'import tomllib; print("\n".join(tomllib.load(open("/tmp/pyprojec
     && python3 -m pip uninstall -y flashinfer-cubin flashinfer-jit-cache \
     && rm /tmp/pyproject.toml /tmp/omni-overrides.txt
 
+# Reinstalling the same wheel changes header mtimes and invalidates Ninja's
+# objects. Preserve donor mtimes only for byte-identical FlashInfer sources.
+RUN --mount=type=bind,from=flashinfer-cache,source=/opt/sglang/lib/python3.12/site-packages/flashinfer/data,target=/tmp/flashinfer-data,ro <<'EOF'
+python3 - <<'PY'
+import filecmp
+import os
+from pathlib import Path
+
+reference = Path("/tmp/flashinfer-data")
+installed = Path("/opt/sglang/lib/python3.12/site-packages/flashinfer/data")
+for source in reference.rglob("*"):
+    target = installed / source.relative_to(reference)
+    if source.is_file() and target.is_file() and filecmp.cmp(source, target, shallow=False):
+        os.utime(target, ns=(target.stat().st_atime_ns, source.stat().st_mtime_ns))
+PY
+EOF
+
 # Docker builds do not have a GPU to regenerate architecture-specific JIT
 # artifacts. Reuse the Python 3.12 cache validated on Ada (SM89) and Hopper
 # (SM90a); other architectures compile into their own cache directory.

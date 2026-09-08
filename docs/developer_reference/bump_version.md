@@ -197,6 +197,12 @@ and the SoX executable. It imports llama.cpp before Torch to catch system NCCL
 conflicts; the image prioritizes Torch's NCCL library. A package listing alone
 does not prove a usable runtime.
 
+Reinstalling even the same FlashInfer wheel refreshes bundled header mtimes.
+The Dockerfile preserves the cache donor's mtimes only for byte-identical
+FlashInfer sources; changed sources remain newer and invalidate their objects.
+After rebuilding, run Ninja with `-n -d explain` in the copied `cached_ops`
+directories before GPU validation to catch unintended object recompilation.
+
 A bump therefore ships a new image: build `docker/Dockerfile` on the
 `lmsysorg/sglang` digest for the new tag, populate the FlashInfer JIT cache
 on a GPU for the architectures CI runs on (Docker builds have none, so the
