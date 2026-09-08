@@ -1227,7 +1227,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             # note(ratish): raw CUDA IPC orders only the receiver's default
             # stream after the producer; the decode workers read on their own.
             codes_ready = torch.cuda.Event()
-            codes_ready.record(torch.cuda.current_stream(codes.device))
+            codes_ready.record()
         state.codes_ready = codes_ready
         state.total_frames += int(codes.shape[0])
 
