@@ -2283,8 +2283,7 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
 
     class _ExecutionBridge:
         def __init__(self, **kwargs):
-            del kwargs
-            self.future_map = object()
+            self.future_map = kwargs["future_map"]
 
     monkeypatch.setattr(
         "sglang_omni.model_runner.sglang_execution.SGLangExecutionBridge",
@@ -2360,10 +2359,14 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
         enable_overlap=enable_overlap,
         enable_async_decode=enable_async_decode,
     )
+    future_map = scheduler.future_map
     if bind_late:
         scheduler.bind_model_runner(model_runner)
 
     assert observed == [scheduler._execution_bridge]
+    assert scheduler.future_map is future_map
+    assert scheduler._execution_bridge.future_map is future_map
+    assert scheduler.beam_coordinator.future_map is future_map
     assert model_runner._async_enabled is enable_async_decode
 
 
