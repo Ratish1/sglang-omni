@@ -1226,6 +1226,9 @@ class Qwen3TTSStreamingVocoderScheduler(
         if codes_ready is None and codes.is_cuda:
             # note(ratish): raw CUDA IPC orders only the receiver's default
             # stream after the producer; the decode workers read on their own.
+            # note (luojiaxuan): so `record` has to land on that same default
+            # stream. It does because nothing on the ingest path switches
+            # streams; the workers' `set_stream` calls stay in their threads.
             codes_ready = torch.cuda.Event()
             codes_ready.record()
         state.codes_ready = codes_ready
