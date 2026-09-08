@@ -35,19 +35,29 @@ The other places a version lives:
 |---|---|
 | `docker/Dockerfile` | `SGLANG_IMAGE` (digest of the new tag's cu13 manifest), the FlashInfer reinstall version, the JIT cache path `/root/.cache/flashinfer/<version>`, `FLASHINFER_CACHE_IMAGE` |
 | `.github/workflows/*.yaml` | Every `image:` line, pinned by digest |
-| `docs/get_started/installation.md`, `docs/basic_usage/tts.md`, `docs/cookbook/*.md`, model READMEs | Version names in install instructions |
+| `docker/cpu.Dockerfile` | `SGLANG_IMAGE` (digest of the new tag's `-xeon` manifest) |
+| `docker/xpu.Dockerfile` | `SGLANG_XPU_BRANCH` (the tag) and `SGL_KERNEL_XPU_REF` (the last `sgl-kernel-xpu` commit before the tag) |
+| `pyproject_cpu.toml`, `pyproject_xpu.toml`, `scripts/cpu/install_cpu.sh`, `scripts/xpu/install_xpu.sh` | The verified SGLang tag; the provider pyprojects cannot pin `sglang` because every wheel pulls CUDA torch |
+| `docs/get_started/installation.md`, `docs/get_started/installation_cpu.md`, `docs/get_started/installation_xpu.md`, `docs/basic_usage/tts.md`, `docs/cookbook/*.md`, model READMEs | Version names in install instructions |
 | Comments in `sglang_omni/` | Never name a version; state the invariant the code relies on so the text survives the next bump |
 
 Search the tree for the old versions and the old image digest; the table is
 what past bumps touched.
 
-The ROCm, XPU, NPU and MUSA stacks (`docker/rocm.Dockerfile`,
-`docker/xpu.Dockerfile`, `pyproject_rocm.toml`, `pyproject_xpu.toml`,
-`docs/get_started/installation_xpu.md`) pin their own SGLang tag and base
-images. No project CI builds them, so a bump PR leaves them alone, says so in
-its description, and hands the provider owners the new tag, the matching
-provider image digest if one exists, and any platform dispatch change made in
-`sglang_omni/platforms/`.
+The Intel CPU and XPU stacks pin their own SGLang tag and base images, and
+their CI workflows build `docker/cpu.Dockerfile` and `docker/xpu.Dockerfile`
+on every PR that touches `sglang_omni/`. `sglang_omni/platforms/` imports the
+pinned release's modules at import time, so those workflows fail on a bump
+until the two stacks move with it: the `-xeon` image digest, the XPU tag and
+its `sgl-kernel-xpu` revision, and the verified tag in the provider
+pyprojects, install scripts and install docs. Upstream's `docker/xpu.Dockerfile`
+at the tag names any new build prerequisite.
+
+The ROCm, NPU and MUSA stacks (`docker/rocm.Dockerfile`, `pyproject_rocm.toml`)
+pin their own SGLang tag and base images. No project CI builds them, so a bump
+PR leaves them alone, says so in its description, and hands the provider owners
+the new tag, the matching provider image digest if one exists, and any platform
+dispatch change made in `sglang_omni/platforms/`.
 
 ## Where Omni depends on SGLang
 
