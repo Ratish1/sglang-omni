@@ -4,6 +4,7 @@ import dataclasses
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -11,7 +12,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.server_args import PortArgs, ServerArgs
 
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
@@ -24,6 +25,27 @@ from sglang_omni.utils.gpu_memory import (
 )
 
 logger = logging.getLogger(__name__)
+_PREFILL_RUNNER_DISPATCH_LOCK = Lock()
+_PREFILL_RUNNER_DISPATCH_DEFAULT: type | None = None
+
+
+def _install_prefill_runner_dispatch() -> None:
+    """Let each model runner pick its own prefill graph runner class."""
+    global _PREFILL_RUNNER_DISPATCH_DEFAULT
+    from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
+
+    with _PREFILL_RUNNER_DISPATCH_LOCK:
+        if _PREFILL_RUNNER_DISPATCH_DEFAULT is not None:
+            return
+        default_cls = cuda_graph_setup.PrefillCudaGraphRunner
+
+        def _dispatch_prefill_runner(model_runner):
+            select = getattr(model_runner, "_prefill_cuda_graph_runner_cls", None)
+            runner_cls = select() if select is not None else None
+            return (runner_cls or default_cls)(model_runner)
+
+        cuda_graph_setup.PrefillCudaGraphRunner = _dispatch_prefill_runner
+        _PREFILL_RUNNER_DISPATCH_DEFAULT = default_cls
 
 
 def filter_weights_by_prefix(
@@ -441,6 +463,7 @@ class SGLModelRunner(ModelRunner):
         from sglang.srt.runtime_context import get_exec, get_flags
 
         get_flags().capture.enable_torch_compile = get_exec().graph.enable_torch_compile
+        _install_prefill_runner_dispatch()
         result = super().init_cuda_graphs(capture_decode_cuda_graph)
         if self.token_to_kv_pool.post_capture_active:
             self.post_capture_resize_kv_pool()
@@ -473,6 +496,23 @@ class SGLModelRunner(ModelRunner):
                 "below max_running_requests that raises the reserved headroom."
             )
         return result
+
+    def _prefill_cuda_graph_runner_cls(self):
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend as CudaGraphBackend,
+        )
+
+        if (
+            self._model_arch_override == "WhisperForConditionalGeneration"
+            and get_exec().graph.cuda_graph_config.prefill.backend
+            == CudaGraphBackend.BREAKABLE
+        ):
+            from sglang_omni.model_runner.whisper_prefill_cuda_graph_runner import (
+                WhisperPrefillCudaGraphRunner,
+            )
+
+            return WhisperPrefillCudaGraphRunner
+        return None
 
     def _weight_update_blocked_reason(self) -> str | None:
         ws = self._weight_share_config
