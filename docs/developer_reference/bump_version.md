@@ -182,10 +182,20 @@ that have cost time:
 ## The CI image
 
 GPU CI runs inside `hongccc/sglang-omni`, pinned by digest in every
-workflow. The CI virtualenv is built on the image's Python with system site
-packages, so torch, FlashInfer and SGLang come from the image and only what
+workflow. The CI virtualenv uses Python 3.12 with system site-packages and
+loads `/opt/sglang/lib/python3.12/site-packages` with `site.addsitedir`, including
+the upstream SGLang editable-install `.pth` file. Torch, FlashInfer and SGLang
+come from the image and only what
 the image lacks is installed on top; `verify_omni_installed_pins.py` then
 checks every exact pin in `pyproject.toml` against what is installed.
+
+The image also installs Qwen-TTS without its conflicting dependencies, system
+SoX, the Descript DAC packages, and the Audar/CosyVoice extras. Apply the
+project's dependency overrides when resolving these packages. The CI import
+gate checks Qwen-TTS after the compatibility patch, DAC and NeuCodec imports,
+and the SoX executable. It imports llama.cpp before Torch to catch system NCCL
+conflicts; the image prioritizes Torch's NCCL library. A package listing alone
+does not prove a usable runtime.
 
 A bump therefore ships a new image: build `docker/Dockerfile` on the
 `lmsysorg/sglang` digest for the new tag, populate the FlashInfer JIT cache

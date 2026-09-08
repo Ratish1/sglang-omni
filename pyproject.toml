@@ -101,6 +101,7 @@ dependencies = [
 audar-tts = [
     "llama-cpp-python==0.3.34",
     "neucodec==0.0.6",
+    "torchao==0.13.0",  # NeuCodec's torchtune imports the removed torchao.dtypes.nf4tensor.
 ]
 fun-cosyvoice3 = [
     "conformer==0.3.2",
