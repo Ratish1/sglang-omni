@@ -100,6 +100,13 @@ def build_sglang_server_args(
         raise ValueError(
             "sglang-omni does not support startup_weight_load_mode='overlap'"
         )
+    # note (ratish): the bootstrap allocates the KV pool without the
+    # resident-weight accounting an IPC-cached engine needs.
+    if resolved.weight_cache_mode != "off":
+        raise ValueError(
+            "sglang-omni does not support "
+            f"weight_cache_mode={resolved.weight_cache_mode!r}"
+        )
     return server_args
 
 

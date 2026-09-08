@@ -20,6 +20,7 @@ class _CapturedServerArgs:
         self.kwargs = kwargs
         self.enable_dp_attention = False
         self.startup_weight_load_mode = kwargs.get("startup_weight_load_mode", "serial")
+        self.weight_cache_mode = kwargs.get("weight_cache_mode", "off")
         self._resolution_finished = False
 
     def resolve_once(self) -> None:
@@ -58,6 +59,19 @@ def test_overlapped_startup_weight_load_is_rejected(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="startup_weight_load_mode"):
         _build(monkeypatch, startup_weight_load_mode="overlap")
+
+
+def test_ipc_weight_cache_modes_are_rejected(monkeypatch) -> None:
+    """The bootstrap sizes the KV pool from a free-memory baseline that never
+    has the bytes a weight cache daemon already holds added back.
+    """
+    import pytest
+
+    for mode in ("client", "daemon"):
+        with pytest.raises(ValueError, match="weight_cache_mode"):
+            _build(monkeypatch, weight_cache_mode=mode)
+
+    assert _build(monkeypatch, weight_cache_mode="off")["weight_cache_mode"] == "off"
 
 
 def _drive_build(monkeypatch, *, overrides, gpu_id=0):
