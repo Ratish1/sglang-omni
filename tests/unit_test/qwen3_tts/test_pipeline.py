@@ -2729,6 +2729,34 @@ def test_qwen3_tts_ingest_keeps_the_newest_chunk_event() -> None:
     assert state.codes_ready is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen3_tts_ingest_records_readiness_for_a_device_chunk_without_an_event() -> (
+    None
+):
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+    )
+    state = scheduler.create_stream_state("request")
+    state.num_quantizers = 2
+    scheduler.latch_stream_contract(
+        "request", state, {"num_quantizers": 2}, origin="stream metadata"
+    )
+    producer = torch.cuda.Stream()
+    with torch.cuda.stream(producer):
+        codes = torch.ones((1, 2), dtype=torch.long, device="cuda")
+    torch.cuda.current_stream().wait_stream(producer)
+
+    scheduler.ingest("request", state, codes)
+
+    assert isinstance(state.codes_ready, torch.cuda.Event)
+    worker = torch.cuda.Stream()
+    worker.wait_event(state.codes_ready)
+    worker.synchronize()
+    assert state.codes_ready.query()
+    assert state.code_chunks == [codes]
+
+
 def test_qwen3_tts_pageable_fallback_syncs_with_empty_delta(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

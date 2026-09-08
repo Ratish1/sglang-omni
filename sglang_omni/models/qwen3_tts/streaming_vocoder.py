@@ -1112,7 +1112,7 @@ class Qwen3TTSStreamingVocoderScheduler(
 
         metadata: Mapping[str, Any] = source
         # note (luojiaxuan): absent for chunks that crossed a process boundary;
-        # the transport made those complete before handing them over.
+        # ingest records the readiness those chunks need, see there.
         state.pending_codes_ready = metadata.get("codes_ready_event")
         if "num_quantizers" not in metadata and state.num_quantizers is None:
             raise RuntimeError(
@@ -1221,8 +1221,16 @@ class Qwen3TTSStreamingVocoderScheduler(
         state.code_chunks.append(codes)
         # note (luojiaxuan): chunks arrive in production order on one talker
         # stream, so the newest chunk's event also covers every older one.
-        state.codes_ready = state.pending_codes_ready
+        codes_ready = state.pending_codes_ready
         state.pending_codes_ready = None
+        if codes_ready is None and codes.is_cuda:
+            # note(ratish): a chunk that crossed a process boundary was made
+            # complete on this thread's stream only, by the CUDA IPC import. The
+            # decode workers run on their own streams, so they need an event
+            # recorded here, after that import, to order their reads behind it.
+            codes_ready = torch.cuda.Event()
+            codes_ready.record()
+        state.codes_ready = codes_ready
         state.total_frames += int(codes.shape[0])
 
     def should_decode(self, state: _Qwen3TTSStreamState, *, is_final: bool) -> bool:
