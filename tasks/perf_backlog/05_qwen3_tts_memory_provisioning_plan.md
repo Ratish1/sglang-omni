@@ -93,8 +93,15 @@ vocoder built first the reading precedes the engine.
 Every allocation that lives for the life of the process exists before sglang takes the
 reading that sizes the pool. That is an ordering property, not a measurement, and it holds
 on every card. The rule itself is sglang's, unchanged, with the builder's 0.85 fraction as on
-main. The pool shrinks by exactly the residency that used to sit in the slack, and the slack
-is whole again for the transients of section 2. Nothing else about the memory map changes.
+main. How much the pool shrinks depends on where each residency lands relative to sglang's two
+readings (PR 2042 review, F3). sglang takes the pre load reading P in its distributed
+bootstrap before the weights (v0.5.18 distributed/bootstrap.py:131) and the profiling reading F
+after them, and the budget is F − (1 − f) × P. The vocoder is built before both readings, so
+its residency R lowers the budget by f × R. The predictor graphs are captured between the two,
+so theirs lowers it by the full amount. The tokenizer copy is simply gone. In every case the
+slack (1 − f) × P is intact for the transients of section 2, which is the property that
+matters. Measured on Sep 8 at 128 running: pool 588721 to 571378 tokens, free at ready 9525
+to 11745 MiB, sampled peak 77793 to 76393 MiB.
 
 ### 4.2 The vocoder before the engine, one tokenizer per process
 
