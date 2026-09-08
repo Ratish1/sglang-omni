@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from sglang.srt.sampling.sampling_params import (
     MAX_STOP_COUNT,
@@ -42,7 +44,8 @@ def test_the_stop_bounds_themselves_normalize() -> None:
         stop_regex=["a" * MAX_STOP_REGEX_LEN] * MAX_STOP_REGEX_COUNT,
     )
 
-    params.normalize(None)
+    tokenizer = SimpleNamespace(encode=lambda text, **_: list(text.encode()))
+    params.normalize(tokenizer)
 
     assert len(params.stop_strs) == MAX_STOP_COUNT
     assert len(params.stop_regex_strs) == MAX_STOP_REGEX_COUNT
