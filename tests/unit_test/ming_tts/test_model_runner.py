@@ -272,3 +272,18 @@ def test_ming_tts_prefill_replays_prompt_and_generated_feedback() -> None:
             ]
         ),
     )
+
+
+def test_runner_reads_tp_size_from_the_published_parallel_bag() -> None:
+    from sglang.srt.runtime_context import get_context
+
+    tp_worker = SimpleNamespace(
+        gpu_id=0,
+        tp_rank=1,
+        model_runner=SimpleNamespace(model=object()),
+    )
+    with get_context().override_server_args(tp_size=2):
+        runner = MingTTSModelRunner(tp_worker, output_processor=None)
+
+    assert runner._tp_rank == 1
+    assert runner._tp_size == 2
