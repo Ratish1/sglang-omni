@@ -6509,11 +6509,20 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
             torch_compile_max_bs=kwargs["torch_compile_max_bs"],
         )
 
+    published: list = []
+
     def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):
         del gpu_id
         infrastructure_saw_deferred_capture.append(
             bool(kwargs.get("defer_cuda_graph_capture"))
         )
+        slot = get_context().override_server_args(
+            max_running_requests=server_args.max_running_requests,
+            context_length=server_args.context_length,
+            mem_fraction_static=server_args.mem_fraction_static,
+        )
+        slot.install()
+        published.append(slot)
         worker = FakeWorker(server_args)
         kwargs["before_memory_pool"](worker)
         events.append("memory_pool")
@@ -6551,16 +6560,20 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
         lambda **kwargs: SimpleNamespace(max_total_num_tokens=579894, **kwargs),
     )
 
-    scheduler = stages.create_sglang_tts_engine_executor(
-        "model",
-        device=None,
-        server_args_overrides={
-            "cuda_graph_max_bs": 64,
-            "torch_compile_max_bs": 64,
-            "mem_fraction_static": 0.7,
-            "max_running_requests": 64,
-        },
-    )
+    try:
+        scheduler = stages.create_sglang_tts_engine_executor(
+            "model",
+            device=None,
+            server_args_overrides={
+                "cuda_graph_max_bs": 64,
+                "torch_compile_max_bs": 64,
+                "mem_fraction_static": 0.7,
+                "max_running_requests": 64,
+            },
+        )
+    finally:
+        while published:
+            published.pop().restore()
 
     assert build_kwargs["disable_cuda_graph"] is False
     assert build_kwargs["cuda_graph_bs"] == expected_cuda_graph_bs
