@@ -57,6 +57,11 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
+        # Preserve SGLang 0.5.18's deepstack order for Omni. The 0.5.19
+        # inference default regresses MMMU/Video-MME thinker accuracy.
+        # Set the model-local policy before any forward or graph capture;
+        # this does not enable global RL/on-policy execution.
+        self.model.use_hf_deepstack_order = True
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = self.model.embed_tokens
         else:
