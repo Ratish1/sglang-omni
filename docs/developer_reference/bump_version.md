@@ -185,9 +185,12 @@ that have cost time:
   pretrained model the arithmetic that interprets its weights is part of
   the contract; the overlay preserves the old sequence and is verified on
   intermediates, not only on the final score.
-- Caches. New Inductor, Triton and FlashInfer versions invalidate every
-  compiled artifact once, so the first pass in a fresh image measures
-  compilation, not serving.
+- Caches. New Inductor, Triton, FlashInfer and DeepGEMM versions invalidate
+  every compiled artifact once, so the first pass in a fresh image measures
+  compilation, not serving. SGLang builds DeepGEMM, Triton and its own JIT
+  kernels under `SGLANG_CACHE_DIR`; the CI setup action points it at a
+  directory shared across PRs on the persistent CI mount, so only the first
+  job after a bump pays the build.
 
 ## The CI image
 
