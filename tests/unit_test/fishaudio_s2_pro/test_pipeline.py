@@ -962,6 +962,7 @@ def _run_s2pro_engine_with_fake_buffers(
         gpu_id: int,
         *,
         defer_cuda_graph_capture: bool = False,
+        before_memory_pool=None,
     ) -> tuple[object, object, object, object, object]:
         assert gpu_id == 0
         infrastructure_saw_deferred_capture.append(defer_cuda_graph_capture)
@@ -969,8 +970,11 @@ def _run_s2pro_engine_with_fake_buffers(
         slot.install()
         published.append(slot)
         publish(server_args, role="scheduler")
+        worker = _FakeWorker(server_args)
+        if before_memory_pool is not None:
+            before_memory_pool(worker)
         return (
-            _FakeWorker(server_args),
+            worker,
             object(),
             object(),
             object(),
@@ -986,10 +990,14 @@ def _run_s2pro_engine_with_fake_buffers(
     def fake_create_sglang_infrastructure_defer_cuda_graph(
         server_args,
         gpu_id: int,
+        **kwargs,
     ) -> tuple[bool, tuple[object, object, object, object, object]]:
         want_cuda_graph = not bool(resolution_result(server_args, "disable_cuda_graph"))
         infrastructure = fake_create_sglang_infrastructure(
-            server_args, gpu_id, defer_cuda_graph_capture=want_cuda_graph
+            server_args,
+            gpu_id,
+            defer_cuda_graph_capture=want_cuda_graph,
+            **kwargs,
         )
         return want_cuda_graph, infrastructure
 
