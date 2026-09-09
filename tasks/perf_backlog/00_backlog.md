@@ -40,9 +40,14 @@ Plans for items in this list are written as numbered docs in this folder.
    PR body update on GitHub, the long generation check of doc 09, then
    the memory provisioning slice before the 128 running gate and S2's c16,
    since both fail inside cuDNN with the card full (doc 08 section 2, seam
-   decision in section 4 below). S2
-   implemented at `ccfc4af45` on `perf/qwen3-tts-predictor-rope-store`,
-   stacked on that head, owed: its box run (doc 04 section 7 step 3).
+   decision in section 4 below). Update 2026-09-09: #1971 merged on
+   2026-09-08, the memory provisioning slice merged as #2042 (plan 05,
+   readout 11 for the dropped cap), and S2 was measured on main with both
+   in (runbook 12, readout 13) and opened as PR #2057 from
+   `perf/qwen3-tts-predictor-rope-store` at `79cdfe185`: 1222 to 1062
+   kernels per replay, c1 byte identical in both pairs, QPS plus 3.6 to
+   5.2 percent at c1 and plus 1.7 to 6.7 at c16, streaming 3264 of 3264
+   per arm. Next: E1 and E2, then S3 and S4, see `14_handoff_20260909.md`.
    The slices
    after S1 are `04_qwen3_tts_decode_step_slices_plan.md`:
    S2 rope writes the cache (160 kernels), S3 the residual add inside
