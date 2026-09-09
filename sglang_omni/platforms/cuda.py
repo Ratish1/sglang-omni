@@ -181,13 +181,16 @@ class CUDAOmniPlatform(CudaDeviceMixin, OmniPlatform):
 
         fp8_gemm_backend = normalize_quantization(cfg.fp8_gemm_runner_backend)
         if (
-            model_arch_override == "Qwen3OmniTalker"
+            is_qwen3_omni_arch
             and effective_quantization == "fp8"
             and has_native_fp8_block_quant
             and fp8_gemm_backend in (None, "auto")
         ):
-            # Projected talker prefill has request-dependent FP8 dense GEMM shapes
-            # outside decode CUDA graph replay; DeepGEMM can otherwise JIT there.
+            # Prefill has request-dependent FP8 dense GEMM shapes outside CUDA
+            # graph replay, and DeepGEMM compiles one kernel per shape after
+            # readiness. note (ratish): on H100 the thinker measured 3 to 6
+            # percent more throughput on Triton at c1 and c16 with equal
+            # accuracy over 5000 MMSU prompts, and no post-ready compiles.
             fp8_gemm_backend = "triton"
             override_server_args(
                 server_args,

@@ -139,7 +139,7 @@ def _model_config(
             expected_fp8_gemm_backend="triton",
         ),
         BackendPolicyCase(
-            name="fp8_thinker_auto_uses_cutlass_moe_and_preserves_dense_gemm_auto",
+            name="fp8_thinker_auto_uses_cutlass_moe_and_triton_dense_gemm",
             model_quantization="fp8",
             server_quantization=None,
             native_fp8_block_quant=True,
@@ -151,7 +151,22 @@ def _model_config(
             cutlass_supported=True,
             expected_quantization="fp8",
             expected_moe_backend="cutlass",
-            expected_fp8_gemm_backend="auto",
+            expected_fp8_gemm_backend="triton",
+        ),
+        BackendPolicyCase(
+            name="fp8_thinker_explicit_dense_deep_gemm_is_preserved",
+            model_quantization="fp8",
+            server_quantization=None,
+            native_fp8_block_quant=True,
+            model_arch_override="Qwen3OmniThinkerForCausalLM",
+            has_moe=True,
+            initial_moe_backend="auto",
+            initial_fp8_gemm_backend="deep_gemm",
+            ep_size=1,
+            cutlass_supported=True,
+            expected_quantization="fp8",
+            expected_moe_backend="cutlass",
+            expected_fp8_gemm_backend="deep_gemm",
         ),
         BackendPolicyCase(
             name="server_fp8_override_without_native_block_quant_stays_auto",
@@ -608,11 +623,11 @@ class FullConfigureBackendPolicyCase:
 
 
 # Test cases covering the ordering issue: the Omni quantization adapters
-# run BEFORE apply_model_worker_backend_policy(), so only Talker FP8
-# with native block quant should get triton GEMM; Thinker and non-Qwen
-# should preserve auto. The adapters are a no-op for FP8 (they only
-# normalize stage-local names for methods like AutoRound), so all FP8
-# backend policy stays owned by apply_model_worker_backend_policy().
+# run BEFORE apply_model_worker_backend_policy(), so only Qwen3-Omni FP8
+# engines with native block quant should get triton GEMM; non-Qwen should
+# preserve auto. The adapters are a no-op for FP8 (they only normalize
+# stage-local names for methods like AutoRound), so all FP8 backend policy
+# stays owned by apply_model_worker_backend_policy().
 CONFIGURE_BACKEND_POLICY_CASES = [
     FullConfigureBackendPolicyCase(
         name="talker_fp8_auto_gemm_becomes_triton",
@@ -629,7 +644,7 @@ CONFIGURE_BACKEND_POLICY_CASES = [
         expected_fp8_gemm_backend="triton",
     ),
     FullConfigureBackendPolicyCase(
-        name="thinker_fp8_auto_gemm_preserved_as_auto",
+        name="thinker_fp8_auto_gemm_becomes_triton",
         model_quantization="fp8",
         server_quantization=None,
         native_fp8_block_quant=True,
@@ -640,7 +655,21 @@ CONFIGURE_BACKEND_POLICY_CASES = [
         ep_size=1,
         cutlass_supported=True,
         expected_moe_backend="cutlass",
-        expected_fp8_gemm_backend="auto",
+        expected_fp8_gemm_backend="triton",
+    ),
+    FullConfigureBackendPolicyCase(
+        name="thinker_fp8_explicit_deep_gemm_preserved",
+        model_quantization="fp8",
+        server_quantization=None,
+        native_fp8_block_quant=True,
+        model_arch_override="Qwen3OmniThinkerForCausalLM",
+        has_moe=True,
+        initial_moe_backend="auto",
+        initial_fp8_gemm_backend="deep_gemm",
+        ep_size=1,
+        cutlass_supported=True,
+        expected_moe_backend="cutlass",
+        expected_fp8_gemm_backend="deep_gemm",
     ),
     FullConfigureBackendPolicyCase(
         name="talker_bf16_fp8_gemm_explicit_preserved",
@@ -775,7 +804,7 @@ def test_configure_backend_policy_fp8_gemm_ordering(
         2. apply_model_worker_backend_policy()
 
     Only step 2 (arch-aware) should set fp8_gemm_runner_backend="triton"
-    for Talker FP8. Step 1 must NOT touch FP8 backend selection.
+    for Qwen3-Omni FP8. Step 1 must NOT touch FP8 backend selection.
     """
     # Install fake modules so we don't need real GPU hardware.
     _install_fake_module(monkeypatch, "sglang")
