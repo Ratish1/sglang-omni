@@ -24,12 +24,13 @@ pytest tests/ -v -m "not benchmark and not accelerator" -x
 pytest tests/ -v -m "accelerator and not benchmark" -x
 ```
 
-New tests to see pass, all in `tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py`: the
+New test to see pass, in `tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py`: the
 accelerator test `test_rope_store_writes_the_cache_the_copy_path_writes`, which is experiment
 E0 of doc 04, a real `RotaryEmbedding` at head dim 128 with batch 1 and 16 over every slot, the
-stored rows equal to the copy path and q and k equal to the plain rope call bit for bit. And the
-gate test: the copy path for the fixture's identity rotary, the fused path for a CUDA rotary
-without the fallback kernel. Every existing bit identity test of the predictor graph unchanged.
+stored rows equal to the copy path and q and k equal to the plain rope call bit for bit. The
+same test asserts the gate resolves to the fused path for that rotary on CUDA. The fixture
+talker of the other tests pins the gate to the copy path. Every existing bit identity test of
+the predictor graph unchanged.
 
 ## 2. Startup, B, default config
 
