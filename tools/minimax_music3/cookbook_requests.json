@@ -1,0 +1,223 @@
+{
+  "source": "docs/cookbook/minimax_music3.md",
+  "source_commit": "ac288638261e95c0b895ebe005e677af8d12b163",
+  "cases": [
+    {
+      "name": "cookbook_68",
+      "line": 68,
+      "client": "curl",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Verse]\nSunday morning, quiet and slow\nSunlight through the half-drawn blinds\nCoffee cooling by the window\nNothing on my mind\n[Chorus]\nTake it easy, take it slow\nWe got nowhere else to go",
+        "instructions": "A melancholic lo-fi hip-hop track with a mellow piano riff, soft vinyl crackle, and a slow steady drum beat at 85 BPM",
+        "seed": 42,
+        "max_new_tokens": 750
+      }
+    },
+    {
+      "name": "cookbook_91_0",
+      "line": 91,
+      "client": "requests",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Verse]\nSunday morning, quiet and slow\nSunlight through the half-drawn blinds\n[Chorus]\nTake it easy, take it slow\nWe got nowhere else to go",
+        "instructions": "A melancholic lo-fi hip-hop track with a mellow piano riff at 85 BPM",
+        "seed": 42,
+        "max_new_tokens": 750
+      }
+    },
+    {
+      "name": "cookbook_117",
+      "line": 117,
+      "client": "openai",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "voice": "default",
+        "input": "[Verse]\nSunday morning, quiet and slow\nSunlight through the half-drawn blinds\n[Chorus]\nTake it easy, take it slow",
+        "instructions": "A melancholic lo-fi hip-hop track with a mellow piano riff at 85 BPM",
+        "response_format": "wav",
+        "seed": 42,
+        "max_new_tokens": 750
+      }
+    },
+    {
+      "name": "cookbook_142",
+      "line": 142,
+      "client": "curl",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Chorus]\nWe are the fire that never dies\nBurning bright against the sky",
+        "instructions": "An energetic arena rock anthem with distorted electric guitars, punchy live drums and a soaring male vocal at 130 BPM, wide stereo image, lightly compressed",
+        "seed": 7,
+        "max_new_tokens": 750
+      }
+    },
+    {
+      "name": "cookbook_162_0",
+      "line": 162,
+      "client": "requests",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Verse]\nI came up on a dirt road, nothing but a name\n[Chorus]\nAnd the thunder rolls the same",
+        "instructions": "Basic Attributes: bpm is 92, key is E minor, Electric Blues / Blues Rock.\nEmotional Progression: confident and gritty from the outset, building tension through\ncall-and-response verses before releasing into an extended lead guitar solo.\nSonics: live and organic, warm mid-range, tube grit, relatively uncompressed so the\ndrums keep their natural attack.\nVocal: male baritone, gravelly and textured, conversational phrasing in the verses\nturning melodic in the refrain.",
+        "seed": 11,
+        "max_new_tokens": 1500
+      }
+    },
+    {
+      "name": "cookbook_199",
+      "line": 199,
+      "client": "curl",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Intro]\n(instrumental)",
+        "instructions": "An instrumental ambient piece, no vocals: warm analog pads, slow evolving texture, distant piano, 70 BPM",
+        "seed": 3,
+        "max_new_tokens": 250
+      }
+    },
+    {
+      "name": "cookbook_222_0",
+      "line": 222,
+      "client": "requests",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Verse]\nCity lights are calling out my name",
+        "instructions": "A dreamy synthwave track with analog pads and a driving bassline at 110 BPM",
+        "seed": 1,
+        "max_new_tokens": 500
+      }
+    },
+    {
+      "name": "cookbook_222_1",
+      "line": 222,
+      "client": "requests",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Verse]\nCity lights are calling out my name",
+        "instructions": "A dreamy synthwave track with analog pads and a driving bassline at 110 BPM",
+        "seed": 2,
+        "max_new_tokens": 500
+      }
+    },
+    {
+      "name": "cookbook_222_2",
+      "line": 222,
+      "client": "requests",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Verse]\nCity lights are calling out my name",
+        "instructions": "A dreamy synthwave track with analog pads and a driving bassline at 110 BPM",
+        "seed": 3,
+        "max_new_tokens": 500
+      }
+    },
+    {
+      "name": "cookbook_263",
+      "line": 263,
+      "client": "curl",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Verse]\nWalking down the empty street at midnight\nStreetlights flicker like a broken dream\nI've got nothing but the sound of my own heartbeat\nEchoing through the silent concrete stream\n[Chorus]\nAnd I keep on walking\nTill the morning finds me\nLeave the night behind me",
+        "instructions": "A melancholic lo-fi hip-hop track at 85 BPM in F minor: mellow Rhodes piano riff, soft vinyl crackle, dusty boom-bap drums with a laid-back swing, warm upright bass. Intimate bedroom production, gentle tape saturation, no bright cymbals.",
+        "seed": 1,
+        "max_new_tokens": 750,
+        "response_format": "wav",
+        "stream": false
+      }
+    },
+    {
+      "name": "cookbook_287",
+      "line": 287,
+      "client": "curl",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Verse]\nMorning light is spilling through the curtain\nEvery colour waking up with me\n[Chorus]\nRun into the day and never look back\nEverything we wanted is ahead of us",
+        "instructions": "A cheerful J-pop song at 128 BPM in C major: bright acoustic piano, chiming electric guitar, punchy four-on-the-floor drums, and a clear female lead vocal. Polished modern pop production, wide stereo, energetic and uplifting.",
+        "seed": 2,
+        "max_new_tokens": 750,
+        "response_format": "wav",
+        "stream": false
+      }
+    },
+    {
+      "name": "cookbook_311",
+      "line": 311,
+      "client": "curl",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Intro]\n(instrumental)\n[Outro]\n(instrumental)",
+        "instructions": "A moody synthwave instrumental at 100 BPM in D minor: pulsing analog bass arpeggio, gated reverb drum machine, wide atmospheric pads, and a soaring lead synth melody. Retro 1980s production, heavy chorus effect, cinematic and nocturnal.",
+        "seed": 3,
+        "max_new_tokens": 750,
+        "response_format": "wav",
+        "stream": false
+      }
+    },
+    {
+      "name": "cookbook_335",
+      "line": 335,
+      "client": "curl",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Verse]\nI came up on a dirt road, nothing but a name\nCarried all my summers in a canvas bag\n[Chorus]\nAnd the river keeps on running\nLike it never learned to stay",
+        "instructions": "A gentle acoustic folk ballad at 76 BPM in G major: fingerpicked steel-string guitar, soft brushed snare, subtle cello underneath, and a warm male vocal close to the microphone. Sparse and organic, natural room sound, very little compression.",
+        "seed": 4,
+        "max_new_tokens": 750,
+        "response_format": "wav",
+        "stream": false
+      }
+    },
+    {
+      "name": "cookbook_359",
+      "line": 359,
+      "client": "curl",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Intro]\n(instrumental)\n[Chorus]\nRise above the ashes of the fallen sky\nWe were never meant to say goodbye",
+        "instructions": "An epic cinematic orchestral piece at 90 BPM in E minor: sweeping string ostinato, powerful brass swells, timpani and taiko percussion, and a distant choir. Wide concert-hall reverb, dynamic build from restrained to triumphant, no drum kit.",
+        "seed": 5,
+        "max_new_tokens": 750,
+        "response_format": "wav",
+        "stream": false
+      }
+    },
+    {
+      "name": "cookbook_408_0",
+      "line": 408,
+      "client": "requests",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Verse]\nMorning breaks over the harbour",
+        "instructions": "A gentle acoustic folk song with fingerpicked guitar at 90 BPM",
+        "seed": 0,
+        "max_new_tokens": 750
+      }
+    },
+    {
+      "name": "cookbook_408_1",
+      "line": 408,
+      "client": "requests",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Chorus]\nDance until the record stops",
+        "instructions": "A disco house track with four-on-the-floor drums and funk guitar at 122 BPM",
+        "seed": 1,
+        "max_new_tokens": 750
+      }
+    },
+    {
+      "name": "cookbook_408_2",
+      "line": 408,
+      "client": "requests",
+      "request": {
+        "model": "MiniMaxAI/MiniMax-Music3",
+        "input": "[Verse]\nSnow falls quiet on the pines",
+        "instructions": "A cinematic orchestral piece with strings and soft horns at 60 BPM",
+        "seed": 2,
+        "max_new_tokens": 750
+      }
+    }
+  ],
+  "source_sha256": "53437cf989920376bff7545132257a5a215f90ab931bfa8a7f0a4858a4ba3763"
+}
