@@ -209,13 +209,7 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
             assert cond._omni_data.cfg_uncond is uncond._omni_data
             assert len(cond.output_ids) == len(uncond.output_ids)
 
-        row_order = batch._get_decode_retraction_order(
-            batch.reqs,
-            self.server_args,
-            allow_policy_sort=(
-                batch.spec_algorithm is None or batch.spec_algorithm.is_none()
-            ),
-        )
+        row_order = batch._get_decode_retraction_order(batch.reqs)
         pair_order = []
         seen_pairs = set()
         for row_index in row_order:
@@ -241,7 +235,7 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
             keep_indices = [index for index in keep_indices if index not in row_indices]
             for offset, row_index in enumerate(row_indices):
                 remaining_reqs = len(keep_indices) + 1 - offset
-                batch.release_req(row_index, remaining_reqs, self.server_args)
+                batch.release_req(row_index, remaining_reqs)
 
         aborted_pair = None
         if not batch.check_decode_mem(selected_indices=keep_indices):
@@ -254,7 +248,7 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
             )
             keep_indices = []
             for remaining_reqs, row_index in zip((1, 0), row_indices, strict=True):
-                batch.release_req(row_index, remaining_reqs, self.server_args)
+                batch.release_req(row_index, remaining_reqs, offload_kv=False)
 
         batch.filter_batch(keep_indices=keep_indices)
         return retracted_pairs, aborted_pair
