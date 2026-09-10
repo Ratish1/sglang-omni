@@ -434,12 +434,23 @@ starts with E2 and removes what E2 names. The candidates from the
 mechanics, each bit identical:
 
 - The finish path copy: `torch.cat(...).cpu()` per finished request on
-  the scheduler thread (request_builders.py:1503-1506). It waits for the
-  device and then copies through pageable memory. The same pinned
-  staging that `_stage_token_ids` uses (base.py:121-180) with the event
-  waited on the vocoder side would take it off the critical path. Its
-  share is one copy per finished request, so at c16 with short
-  utterances it lands on about every second step.
+  the scheduler thread (request_builders.py:1546-1549 on main `80b5aaed7`).
+  Read in full on 2026-09-11 (trace verified against the sources): the
+  result adapter runs inside `stream_output` on the scheduler thread,
+  between two forwards (omni_scheduler.py:1676, called from
+  process_batch_result at :2336). By then the device is already drained,
+  because `_finalize` waits on the pinned token id copy's event once per
+  forward before any output processing (base.py:186, :588). So the
+  `.cpu()` waits only on the `torch.stack` and `torch.cat` it enqueued
+  itself over the request's per step code rows, which are views of one
+  `[batch, groups]` device clone per step (model_runner.py:213-224), then
+  a pageable D2H of `[frames, groups]` int64. That is tens of
+  microseconds per finished request, not a device wait for the step. The
+  payload then leaves the scheduler thread through the outbox; same
+  process it passes by reference, across processes the CPU tensor is
+  packed through shared memory (stage_io.py:377-441), never pickled, and
+  the vocoder reads it on its own default stream. A pinned copy with an
+  event would save the D2H latency only. Ranked by E2 before any change.
 - `_emit_prefill_start_for_batch` (omni_scheduler.py:1524-1541) and
   `_emit_stream_output` (:1423-1440) walk all rows every step, the first
   to find rows that already emitted, the second to call a builder that
@@ -528,14 +539,19 @@ its result is recorded in this doc.
   calls the JIT kernel directly at the omni seam (it takes plain tensors,
   research file 3 section B) and is G1. Or neither, then S3 is G2 with
   the measured max difference recorded.
-- E2, the host phase breakdown. On the profiling branch, the ledger
-  gains `perf_counter` marks at the omni hook boundaries: launch begin,
-  before_decode end, backbone launch end (exists as `host_ms`), post
-  decode predictor call begin and end, staging end, the wait (exists as
-  `wait_ms`), output processing end, stream output end, process batch
-  result end, and the finish path copy when it runs. One c16 window of
-  200 steps without the torch profiler. Output: a per phase p50 and p90
-  table at 1 and 16 rows. This ranks the S4 candidates and gives B3.
+- E2, the host phase breakdown. Instrument, 2026-09-11: no marks in the
+  runtime and no profiling branch merge. The omni torch profiler already
+  records CPU and CUDA activity and takes
+  `SGLANG_TORCH_PROFILER_WITH_STACK=1`, which adds the Python frames of
+  every thread to the trace. `perfkit.py hosttail --rows N` attributes
+  the host only tail of each decode step (GPU idle after the step's last
+  device span to the next backbone launch) and the whole launch to
+  launch window to those frames by self time, so the rows of a window
+  sum to the window, with an owner split (omni, sglang, torch, python)
+  and a "(no frame)" row for time no frame covers. One c16 window of
+  about 200 steps on main, rows 1 and 16. Output: the ranked frames and
+  the owner shares. This ranks the S4 candidates and gives B3, and says
+  how much of the tail is omni owned at all.
 
 ## 6. Proof, per slice
 

@@ -10,6 +10,7 @@ cudaGraphLaunch call and the graph id, which is enough to attribute them.
     perfkit.py steps TRACE.pkl [--rows N] [--json OUT]
     perfkit.py census TRACE.pkl [--rows N] [--json OUT] [--top 40]
     perfkit.py diff A.json B.json
+    perfkit.py hosttail TRACE.pkl --rows N [--top 30] [--json OUT]
     perfkit.py memory TRACE.pkl [--top 30] [--min-mb 64] [--json OUT]
     perfkit.py memdiff A.json B.json
     perfkit.py snapshot TRACE.memory.pickle [--top 30] [--min-mb 64] [--json OUT]
@@ -119,7 +120,7 @@ CUDA_DEVICE_TYPE = 1
 
 
 def ingest(path: str, out: str) -> None:
-    kernels, runtime, memops, memory, ops = [], [], [], [], []
+    kernels, runtime, memops, memory, ops, pyfuncs = [], [], [], [], [], []
     names: dict[str, int] = {}
     for ev in iter_events(path):
         args = ev.get("args") or {}
@@ -143,6 +144,11 @@ def ingest(path: str, out: str) -> None:
         if cat == "cpu_op":
             nid = names.setdefault(ev["name"], len(names))
             ops.append((ev["ts"], ev["dur"], nid, ev.get("tid")))
+        elif cat == "python_function":
+            # note: present only in a trace made with
+            # SGLANG_TORCH_PROFILER_WITH_STACK=1; names are file(line): function
+            nid = names.setdefault(ev["name"], len(names))
+            pyfuncs.append((ev["ts"], ev["dur"], nid, ev.get("tid")))
         elif cat == "kernel":
             nid = names.setdefault(ev["name"], len(names))
             kernels.append(
@@ -176,6 +182,7 @@ def ingest(path: str, out: str) -> None:
     runtime.sort()
     memory.sort()
     ops.sort()
+    pyfuncs.sort()
     with open(out, "wb") as handle:
         pickle.dump(
             {
@@ -185,13 +192,15 @@ def ingest(path: str, out: str) -> None:
                 "memops": memops,
                 "memory": memory,
                 "ops": ops,
+                "pyfuncs": pyfuncs,
             },
             handle,
             protocol=5,
         )
     print(
         f"kernels={len(kernels)} runtime={len(runtime)} memops={len(memops)} "
-        f"memory={len(memory)} ops={len(ops)} names={len(names)} -> {out}"
+        f"memory={len(memory)} ops={len(ops)} pyfuncs={len(pyfuncs)} "
+        f"names={len(names)} -> {out}"
     )
 
 
@@ -612,6 +621,183 @@ def timeline_report(
     )
 
 
+def _step_device_end(step: Step) -> float:
+    """End of the last device span of the step, the moment the GPU goes idle."""
+    end = step.ts
+    for launch in [
+        step.backbone,
+        *step.before,
+        *([step.predictor] if step.predictor else []),
+        *step.after,
+    ]:
+        for k in launch.kernels:
+            end = max(end, k[0] + k[1])
+        for m in launch.memops:
+            end = max(end, m[0] + m[1])
+    return end
+
+
+def _self_time_in_window(rows, inv, w0: float, w1: float) -> Counter:
+    """Self time per event name inside [w0, w1] for nested spans of one thread.
+
+    rows are (ts, dur, nid, tid) sorted by ts. A span's self time is its own
+    length clipped to the window minus the clipped length of its direct
+    children, so every microsecond of the window lands on exactly one frame."""
+    lo = bisect.bisect_left(rows, (w0 - 1e9,))
+    stack: list[tuple[float, float, int, float]] = []  # (start, end, nid, children)
+    out: Counter = Counter()
+
+    def close(top):
+        start, end, nid, children = top
+        own = max(0.0, min(end, w1) - max(start, w0)) - children
+        if own > 0:
+            out[inv[nid]] += own
+
+    for ts, dur, nid, _ in rows[lo:]:
+        if ts >= w1:
+            break
+        end = ts + dur
+        if end <= w0:
+            continue
+        while stack and stack[-1][1] <= ts:
+            close(stack.pop())
+        clipped = max(0.0, min(end, w1) - max(ts, w0))
+        if stack:
+            s, e, n, c = stack[-1]
+            stack[-1] = (s, e, n, c + clipped)
+        stack.append((ts, end, nid, 0.0))
+    while stack:
+        close(stack.pop())
+    return out
+
+
+def _short_frame(name: str) -> str:
+    """file(line): function with the path cut to its last two components."""
+    head, sep, func = name.partition("): ")
+    if not sep:
+        return short(name)
+    path, _, line = head.rpartition("(")
+    return "/".join(path.split("/")[-2:]) + f"({line}): {func}"
+
+
+def _owner(name: str) -> str:
+    if "sglang_omni/" in name:
+        return "omni"
+    if "/sglang/" in name or "sgl_kernel" in name:
+        return "sglang"
+    if "/torch/" in name:
+        return "torch"
+    return "python"
+
+
+def hosttail_report(
+    d: dict,
+    rows_filter: int,
+    predictor_marker: re.Pattern,
+    top: int,
+    json_out: str | None,
+):
+    """Where the scheduler thread spends the host only tail of a decode step.
+
+    The tail is the span from the GPU going idle after the step's last device
+    work to the next backbone graph launch. Its time is attributed to the
+    Python frames the profiler recorded on the scheduler thread (a trace made
+    with SGLANG_TORCH_PROFILER_WITH_STACK=1) by self time, so the numbers of a
+    step sum to its tail. The step level window, launch to launch, is reported
+    the same way for the host work that overlaps the device."""
+    sched_tid, launches, kinds = build_launches(d, predictor_marker)
+    steps = [
+        s
+        for s in build_steps(launches, kinds)
+        if s.predictor is not None and s.rows == rows_filter
+    ]
+    if not steps:
+        raise SystemExit(f"no decode step with rows {rows_filter}")
+    inv = d["inv"]
+    pyrows = [r for r in d.get("pyfuncs", []) if r[3] == sched_tid]
+    oprows = [r for r in d["ops"] if r[3] == sched_tid]
+    if not pyrows:
+        print(
+            "no python_function events on the scheduler thread: the trace was made "
+            "without SGLANG_TORCH_PROFILER_WITH_STACK=1, only aten ops are attributed"
+        )
+    tails, walls = [], []
+    per_step_tail: list[Counter] = []
+    per_step_full: list[Counter] = []
+    rows_src = pyrows or oprows
+
+    def attributed(w0: float, w1: float) -> Counter:
+        c = _self_time_in_window(rows_src, inv, w0, w1)
+        # note: time no recorded frame covers, the thread blocked in native
+        # code or sleeping, is kept so the rows of a window sum to the window
+        c["(no frame)"] = max(0.0, (w1 - w0) - sum(c.values()))
+        return c
+
+    for step in steps:
+        gpu_end = _step_device_end(step)
+        tail = (step.next_ts - gpu_end) / 1000
+        tails.append(tail)
+        walls.append((step.next_ts - step.ts) / 1000)
+        per_step_tail.append(attributed(gpu_end, step.next_ts))
+        per_step_full.append(attributed(step.ts, step.next_ts))
+    n = len(steps)
+    print(
+        f"rows {rows_filter}: {n} steps, wall p50 {p50(walls):.3f} ms p90 {p90(walls):.3f}, "
+        f"host only tail p50 {p50(tails):.3f} ms p90 {p90(tails):.3f}"
+    )
+
+    def table(title: str, per_step: list[Counter], total_p50: float):
+        names = Counter()
+        for c in per_step:
+            names.update(c)
+        print(f"\n### {title}, self time per step, top {top}\n")
+        print("| frame | owner | p50 us | p90 us | share of p50 |")
+        print("| --- | --- | ---: | ---: | ---: |")
+        report = []
+        for name, _ in names.most_common(top):
+            vals = [c.get(name, 0.0) for c in per_step]
+            share = p50(vals) / (total_p50 * 1000) if total_p50 else 0.0
+            report.append((name, _owner(name), p50(vals), p90(vals), share))
+            print(
+                f"| {_short_frame(name)} | {_owner(name)} | {p50(vals):.1f} | "
+                f"{p90(vals):.1f} | {share:.1%} |"
+            )
+        owners = defaultdict(list)
+        for c in per_step:
+            by = Counter()
+            for name, v in c.items():
+                by[_owner(name)] += v
+            for owner in ("omni", "sglang", "torch", "python"):
+                owners[owner].append(by.get(owner, 0.0))
+        print("\n| owner | p50 us | p90 us | share of p50 |")
+        print("| --- | ---: | ---: | ---: |")
+        for owner, vals in owners.items():
+            share = p50(vals) / (total_p50 * 1000) if total_p50 else 0.0
+            print(f"| {owner} | {p50(vals):.1f} | {p90(vals):.1f} | {share:.1%} |")
+        return report, {o: (p50(v), p90(v)) for o, v in owners.items()}
+
+    tail_report, tail_owners = table("host only tail", per_step_tail, p50(tails))
+    full_report, full_owners = table(
+        "whole step, launch to launch", per_step_full, p50(walls)
+    )
+    if json_out:
+        with open(json_out, "w") as handle:
+            json.dump(
+                {
+                    "rows": rows_filter,
+                    "steps": n,
+                    "wall_ms": {"p50": p50(walls), "p90": p90(walls)},
+                    "tail_ms": {"p50": p50(tails), "p90": p90(tails)},
+                    "tail": tail_report,
+                    "tail_owners": tail_owners,
+                    "step": full_report,
+                    "step_owners": full_owners,
+                },
+                handle,
+                indent=1,
+            )
+
+
 def diff_report(a_path: str, b_path: str):
     a, b = json.load(open(a_path)), json.load(open(b_path))
     for rows in sorted(set(a) | set(b), key=int):
@@ -991,6 +1177,15 @@ def main() -> int:
         "--predictor-marker",
         default=r"gather_codec_embedding|seeded_top_k_top_p|seeded_gumbel",
     )
+    s = sub.add_parser("hosttail")
+    s.add_argument("pkl")
+    s.add_argument("--rows", type=int, required=True)
+    s.add_argument("--top", type=int, default=30)
+    s.add_argument("--json", default=None)
+    s.add_argument(
+        "--predictor-marker",
+        default=r"gather_codec_embedding|seeded_top_k_top_p|seeded_gumbel",
+    )
     s = sub.add_parser("diff")
     s.add_argument("a")
     s.add_argument("b")
@@ -1033,6 +1228,14 @@ def main() -> int:
             args.rows,
             re.compile(args.predictor_marker, re.I),
             args.index,
+        )
+    elif args.cmd == "hosttail":
+        hosttail_report(
+            load(args.pkl),
+            args.rows,
+            re.compile(args.predictor_marker, re.I),
+            args.top,
+            args.json,
         )
     elif args.cmd == "memory":
         memory_report(load(args.pkl), args.top, args.min_mb, args.json)

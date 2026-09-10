@@ -92,3 +92,24 @@ Suites' output, census directories and diffs, serve logs, speed and WER and simi
 summaries, the memory csvs, the streaming pass summaries, and the E1 table. Readout as doc 16,
 PR body from it in the #2057 format: mechanism, changes, census table, the c1 and c16 delta
 tables from the best pair, the streaming delta table.
+
+## 7. E2, the host tail breakdown, same session, on A
+
+One server on main with `SGLANG_TORCH_PROFILER_WITH_STACK=1` in its environment, default
+config. One profiler window at c1 of 12 requests and one at c16 of 192 requests, the same
+`/start_profile` and `/stop_profile` calls as the census. Then:
+
+```bash
+python perfkit.py ingest $OUT/e2_c16/trace_tts_engine_pid*_rank0.trace.json.gz -o $OUT/e2_c16/tts_engine.pkl
+python perfkit.py hosttail $OUT/e2_c16/tts_engine.pkl --rows 16 --top 40 --json $OUT/e2_c16/hosttail_rows16.json | tee $OUT/e2_c16/hosttail_rows16.md
+python perfkit.py hosttail $OUT/e2_c1/tts_engine.pkl --rows 1 --top 40 --json $OUT/e2_c1/hosttail_rows1.json | tee $OUT/e2_c1/hosttail_rows1.md
+```
+
+`perfkit.py` is `tasks/qwen3_omni_0518_numerics/scripts/perfkit.py` on the analysis branch,
+with the `hosttail` command added on 2026-09-11. The ingest line prints a `pyfuncs` count; if
+it is zero the server ran without the stack flag and the report falls back to aten ops only.
+The traces are large with stacks, keep the windows to the sizes above.
+
+What to read: the tail p50 against doc 02's 1.1 to 1.4 ms, the owner table (how much of the
+tail is omni owned), and the top frames. S4 takes only omni owned frames above the noise
+floor of the (no frame) row.
