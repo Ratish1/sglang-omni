@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, NamedTuple
 
 from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
 from sglang.srt.managers.scheduler import TEST_RETRACT, TEST_RETRACT_INTERVAL
@@ -17,6 +17,12 @@ from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from .sglang_request_builder import cfg_uncond_rid, is_cfg_uncond_rid
 
 logger = logging.getLogger(__name__)
+
+
+class _PairPrefillBudget(NamedTuple):
+    input_tokens: int
+    required_tokens: int
+    reserved_tokens: int
 
 
 class MiniMaxMusic3Scheduler(OmniScheduler):
@@ -57,6 +63,7 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
         self.waiting_queue.append(req)
 
     def get_new_batch_prefill(self, running_batch: Any) -> Any:
+        self._reject_unadmittable_pairs()
         queue = self.waiting_queue
         prefill_budget = self.max_prefill_tokens
         expanded_pair_budget = False
@@ -91,7 +98,6 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
         limit = min(len(queue), max(0, allocatable))
         limit -= limit % 2
 
-        page_size = int(self.page_size)
         remaining_input_tokens = int(self.max_prefill_tokens)
         running_token_reserve = sum(
             min(
@@ -107,25 +113,55 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
             - running_token_reserve
         )
         for index in range(0, limit, 2):
-            cond, uncond = queue[index : index + 2]
-            pair_input_tokens = 0
-            pair_total_tokens = 0
-            for req in (cond, uncond):
-                input_length = len(req.origin_input_ids) + len(req.output_ids)
-                input_tokens = -(-input_length // page_size) * page_size
-                new_tokens = min(
-                    req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
-                )
-                pair_input_tokens += input_tokens
-                pair_total_tokens += input_tokens + new_tokens + page_size
+            budget = self._pair_prefill_budget(queue[index : index + 2])
             if (
-                pair_input_tokens >= remaining_input_tokens
-                or pair_total_tokens >= remaining_total_tokens
+                budget.input_tokens >= remaining_input_tokens
+                or budget.required_tokens >= remaining_total_tokens
             ):
                 return index
-            remaining_input_tokens -= pair_input_tokens
-            remaining_total_tokens -= pair_total_tokens
+            remaining_input_tokens -= budget.input_tokens
+            remaining_total_tokens -= budget.reserved_tokens
         return limit
+
+    def _pair_prefill_budget(self, pair: list) -> _PairPrefillBudget:
+        input_tokens = required_tokens = reserved_tokens = 0
+        for req in pair:
+            input_length = len(req.origin_input_ids) + len(req.output_ids)
+            paged_input = -(-input_length // self.page_size) * self.page_size
+            max_new = req.sampling_params.max_new_tokens
+            remaining_new = min(
+                max(max_new - len(req.output_ids), 0), CLIP_MAX_NEW_TOKENS
+            )
+            required_tokens = max(
+                required_tokens,
+                reserved_tokens + input_length + remaining_new + self.page_size,
+            )
+            input_tokens += paged_input
+            # v0.5.19 gates remaining generation but debits the original allowance
+            # after each row. Include that debit before checking the second row.
+            reserved_tokens += (
+                paged_input + min(max_new, CLIP_MAX_NEW_TOKENS) + self.page_size
+            )
+        return _PairPrefillBudget(input_tokens, required_tokens, reserved_tokens)
+
+    def _reject_unadmittable_pairs(self) -> None:
+        while len(self.waiting_queue) >= 2:
+            pair = self.waiting_queue[:2]
+            budget = self._pair_prefill_budget(pair)
+            if budget.required_tokens < self.max_total_num_tokens:
+                return
+            request_id = pair[0].rid
+            self._emit_request_error(
+                request_id,
+                RuntimeError(
+                    "MiniMax Music 3 cannot admit both CFG rows under SGLang's "
+                    "KV reservation: "
+                    f"required_tokens={budget.required_tokens}, "
+                    f"pool_tokens={self.max_total_num_tokens}. "
+                    "Increase the engine KV capacity or reduce the request length."
+                ),
+            )
+            self.abort(request_id, defer_running_cleanup=False)
 
     def update_running_batch(self, batch: Any) -> Any:
         """Apply SGLang's decode update to complete CFG pairs."""
