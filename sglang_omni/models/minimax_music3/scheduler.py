@@ -97,6 +97,8 @@ class MiniMaxMusic3Scheduler(OmniScheduler):
         allocatable = int(self.get_num_allocatable_reqs(len(running_batch.reqs)))
         limit = min(len(queue), max(0, allocatable))
         limit -= limit % 2
+        if limit == 0:
+            return 0
 
         remaining_input_tokens = int(self.max_prefill_tokens)
         running_token_reserve = sum(
