@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from enum import StrEnum
+from typing import Literal
 
 CI_ROUTER_MAX_INFLIGHT = 256
 TTS_SERVING_WORKER_BATCH_LIMIT = 32
@@ -25,9 +26,10 @@ def render_router_config(
     router_port: int,
     worker_urls: list[str],
     model_name: str,
+    strategy: Literal["round_robin", "least_requests"] | None = None,
 ) -> str:
     """Render one current-schema router config for a homogeneous CI worker pool."""
-    preamble = _router_preamble(topology, router_port)
+    preamble = _router_preamble(topology, router_port, strategy)
     worker_blocks = [
         _worker_block(
             topology=topology,
@@ -40,8 +42,15 @@ def render_router_config(
     return f"{preamble.rstrip()}\n\n" + "\n\n".join(worker_blocks) + "\n"
 
 
-def _router_preamble(topology: CiRouterTopology, router_port: int) -> str:
-    strategy = "round_robin" if topology is CiRouterTopology.ASR else "least_requests"
+def _router_preamble(
+    topology: CiRouterTopology,
+    router_port: int,
+    strategy: Literal["round_robin", "least_requests"] | None,
+) -> str:
+    if strategy is None:
+        strategy = (
+            "round_robin" if topology is CiRouterTopology.ASR else "least_requests"
+        )
     admission = {
         CiRouterTopology.ASR: (
             f"global = {CI_ROUTER_MAX_INFLIGHT}",
