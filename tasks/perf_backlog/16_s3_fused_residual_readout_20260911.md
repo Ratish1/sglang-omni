@@ -128,3 +128,24 @@ between layers is bit identical. c1 similarity reads 71.21 and 71.32 on B agains
 
 Decision: ship under the band gate with the numerics change stated in the PR. Protocol from
 this run on: one boot per arm and point on this box, the census as the measurement.
+
+## Seeded c1 paired follow up, 2026-09-11
+
+One full corpus pass per arm with seed 1234, warmup 0, c1, so both arms draw the same random
+numbers and each utterance differs only where the rounding flips a sampled code. Recomputed on
+the Mac from `seeded_c1/{A,B}/bench/similarity_results.json`, `wer_results.json` and
+`wav_sha256.json`:
+
+| metric | A | B | B minus A |
+|---|---:|---:|---:|
+| similarity mean | 71.3052 | 71.3647 | +0.0595 |
+| paired per sample similarity delta, 95 percent interval | | | [-0.286, +0.405] |
+| samples with B lower, higher | | | 535, 553 |
+| corpus WER | 1.013% | 1.047% | +0.033 points, interval includes zero |
+| WAVs byte identical | | | 0 of 1088 |
+
+A reproduces the seeded baseline of every earlier seeded boot, 71.3052. Every WAV differs
+because a one rounding change flips at least one of the roughly 800 sampled codes of an
+utterance somewhere, and the paired similarity delta is centred on zero with half the samples
+on each side. The unseeded c1 reading of the first run was boot to boot noise. Quality gate
+closed; the PR stands.
