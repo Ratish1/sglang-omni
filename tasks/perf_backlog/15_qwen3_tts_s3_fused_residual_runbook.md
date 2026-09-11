@@ -33,6 +33,11 @@ on the same class the predictor uses.
 
 Paste the table into the readout either way.
 
+Result, 2026-09-11, H100, sglang 0.5.19: residual equal 1000 of 1000 at every row count,
+normed equal 0 of 1000 at every row count. The fused kernel normalizes the fp32 sum, today's
+path normalizes the bf16 rounded sum. S3 is the band gate, sections 4 and 5 decide, the seeded
+pass is skipped. The residual carried between layers is the same bits on both forms.
+
 ## 2. Suites on B
 
 ```bash
@@ -45,9 +50,11 @@ pytest tests/ -v -m "accelerator and not benchmark" -x
 New tests, all in `tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py`, on a three layer
 copy of the fixture predictor so the fused branch runs on the inner layers:
 
-- `test_eager_predictor_fused_residual_norms_match_add_then_norm`, three parameter sets, the
-  fused form against the add then norm form of the same modules within torch's bf16
-  tolerance, and the written k cache the same way.
+- `test_eager_predictor_in_place_residual_norms_match_the_out_of_place_form`, three parameter
+  sets, the talker's in place forward against the same residual form on cloned operands, bit
+  for bit, output and both caches. This replaced a tolerance test against the add then norm
+  form after E1 on 2026-09-11 showed the two forms differ by design (below), so no tolerance
+  could be pinned and the aliasing contract is what the test has to hold.
 - `test_eager_predictor_adds_each_residual_inside_the_norm_that_follows`, the exact sequence of
   plain and residual norm calls for three layers, every call on 2D rows.
 - `test_eager_predictor_output_survives_the_next_token`, the returned tensor is not aliased
