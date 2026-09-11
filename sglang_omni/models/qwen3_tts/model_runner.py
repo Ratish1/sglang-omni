@@ -117,6 +117,12 @@ class Qwen3TTSModelRunner(ModelRunner):
         del forward_batch, schedule_batch, requests
         return True
 
+    def lookahead_eligible(self, batch: Any) -> bool:
+        # note(ratish): the codec collect runs in post_decode only, the launch
+        # and resolve halves would skip it and feed token embeddings back.
+        del batch
+        return False
+
     def _sample_next_token_ids(
         self,
         logits_output: Any,

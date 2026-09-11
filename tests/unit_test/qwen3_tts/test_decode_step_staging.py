@@ -95,6 +95,22 @@ def test_collect_codes_stages_the_ids_before_the_predictor_runs():
     assert requests[2].data.pending_feedback_queue[0].tolist() == [9.0, 9.0]
 
 
+def test_lookahead_is_never_eligible():
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    history_free = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            repetition_penalty=1.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            min_new_tokens=0,
+        ),
+        custom_logit_processor=None,
+    )
+
+    assert runner.lookahead_eligible(SimpleNamespace(reqs=[history_free])) is False
+    assert runner.lookahead_eligible(SimpleNamespace(reqs=[])) is False
+
+
 @pytest.mark.accelerator
 def test_staged_ids_resolve_while_the_predictor_is_still_running():
     device = torch.device("cuda")
