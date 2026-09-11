@@ -120,3 +120,17 @@ The traces are large with stacks, keep the windows to the sizes above.
 What to read: the tail p50 against doc 02's 1.1 to 1.4 ms, the owner table (how much of the
 tail is omni owned), and the top frames. S4 takes only omni owned frames above the noise
 floor of the (no frame) row.
+
+First run, 2026-09-11: the traces were made and ingested (2.1 M and 6.5 M Python frames), but
+the first version of `hosttail` measured the wrong window and misread the owners: it took the
+tail from the last device span of the step, which is the next step's input staging copy just
+before the launch, so it reported 37 to 48 us, and it matched owners on paths with a leading
+slash the profiler does not write, so every frame read as python. The tool was corrected the
+same day: the tail now starts at the end of the predictor replay's device work, C level frames
+fold into their Python caller, a child span is clipped to its parent, and the report carries the
+device idle time of the step. Rerun on the retained pickles, no new trace needed:
+
+```bash
+python perfkit.py hosttail $OUT/e2_c16/tts_engine.pkl --rows 16 --top 40 --json $OUT/e2_c16/hosttail_rows16.json | tee $OUT/e2_c16/hosttail_rows16.md
+python perfkit.py hosttail $OUT/e2_c1/tts_engine.pkl --rows 1 --top 40 --json $OUT/e2_c1/hosttail_rows1.json | tee $OUT/e2_c1/hosttail_rows1.md
+```

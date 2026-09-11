@@ -621,20 +621,50 @@ def timeline_report(
     )
 
 
-def _step_device_end(step: Step) -> float:
-    """End of the last device span of the step, the moment the GPU goes idle."""
-    end = step.ts
+def _launch_device_end(launch: Launch) -> float:
+    end = launch.ts
+    for k in launch.kernels:
+        end = max(end, k[0] + k[1])
+    for m in launch.memops:
+        end = max(end, m[0] + m[1])
+    return end
+
+
+def _tail_start(step: Step) -> float:
+    """Start of the host tail: the end of the predictor replay's device work.
+
+    The launches after the replay are the token staging copy, which ends
+    microseconds later, and the next step's input staging, which lands just
+    before the next backbone launch. Measuring from the replay's end is doc
+    02's definition of the tail and keeps the next step's staging inside it."""
+    if step.predictor is not None:
+        return _launch_device_end(step.predictor)
+    return _launch_device_end(step.backbone)
+
+
+def _device_idle_in_step(step: Step) -> float:
+    """Microseconds of the launch to launch window with no device span."""
+    spans = []
     for launch in [
         step.backbone,
         *step.before,
         *([step.predictor] if step.predictor else []),
         *step.after,
     ]:
-        for k in launch.kernels:
-            end = max(end, k[0] + k[1])
-        for m in launch.memops:
-            end = max(end, m[0] + m[1])
-    return end
+        spans += [(k[0], k[0] + k[1]) for k in launch.kernels]
+        spans += [(m[0], m[0] + m[1]) for m in launch.memops]
+    spans.sort()
+    busy, cur_start, cur_end = 0.0, None, None
+    for s, e in spans:
+        if cur_end is None or s > cur_end:
+            if cur_end is not None:
+                busy += cur_end - cur_start
+            cur_start, cur_end = s, e
+        else:
+            cur_end = max(cur_end, e)
+    if cur_end is not None:
+        busy += cur_end - cur_start
+    return max(0.0, (step.next_ts - step.ts) - busy)
 
 
 def _self_time_in_window(rows, inv, w0: float, w1: float) -> Counter:
@@ -661,10 +691,12 @@ def _self_time_in_window(rows, inv, w0: float, w1: float) -> Counter:
             continue
         while stack and stack[-1][1] <= ts:
             close(stack.pop())
-        clipped = max(0.0, min(end, w1) - max(ts, w0))
         if stack:
             s, e, n, c = stack[-1]
-            stack[-1] = (s, e, n, c + clipped)
+            # note: a child is clipped to its parent's span as well as to the
+            # window, so a malformed span cannot push the parent below zero
+            inside = max(0.0, min(end, w1, e) - max(ts, w0, s))
+            stack[-1] = (s, e, n, c + inside)
         stack.append((ts, end, nid, 0.0))
     while stack:
         close(stack.pop())
@@ -681,11 +713,13 @@ def _short_frame(name: str) -> str:
 
 
 def _owner(name: str) -> str:
+    # note: the profiler writes site relative paths, sglang/srt/... and
+    # torch/cuda/..., so the match is on the package segment without a slash
     if "sglang_omni/" in name:
         return "omni"
-    if "/sglang/" in name or "sgl_kernel" in name:
+    if "sglang/" in name or "sgl_kernel" in name:
         return "sglang"
-    if "/torch/" in name:
+    if "torch/" in name:
         return "torch"
     return "python"
 
@@ -714,14 +748,22 @@ def hosttail_report(
     if not steps:
         raise SystemExit(f"no decode step with rows {rows_filter}")
     inv = d["inv"]
-    pyrows = [r for r in d.get("pyfuncs", []) if r[3] == sched_tid]
+    # note: C level frames (<built-in ...>, <frozen ...>) are dropped so their
+    # time folds into the Python frame that called them; the profiler records
+    # some of them with spans that outlive their caller, which would otherwise
+    # be counted twice
+    pyrows = [
+        r
+        for r in d.get("pyfuncs", [])
+        if r[3] == sched_tid and not inv[r[2]].startswith("<")
+    ]
     oprows = [r for r in d["ops"] if r[3] == sched_tid]
     if not pyrows:
         print(
             "no python_function events on the scheduler thread: the trace was made "
             "without SGLANG_TORCH_PROFILER_WITH_STACK=1, only aten ops are attributed"
         )
-    tails, walls = [], []
+    tails, walls, idles = [], [], []
     per_step_tail: list[Counter] = []
     per_step_full: list[Counter] = []
     rows_src = pyrows or oprows
@@ -734,16 +776,17 @@ def hosttail_report(
         return c
 
     for step in steps:
-        gpu_end = _step_device_end(step)
-        tail = (step.next_ts - gpu_end) / 1000
-        tails.append(tail)
+        tail_start = _tail_start(step)
+        tails.append((step.next_ts - tail_start) / 1000)
         walls.append((step.next_ts - step.ts) / 1000)
-        per_step_tail.append(attributed(gpu_end, step.next_ts))
+        idles.append(_device_idle_in_step(step) / 1000)
+        per_step_tail.append(attributed(tail_start, step.next_ts))
         per_step_full.append(attributed(step.ts, step.next_ts))
     n = len(steps)
     print(
         f"rows {rows_filter}: {n} steps, wall p50 {p50(walls):.3f} ms p90 {p90(walls):.3f}, "
-        f"host only tail p50 {p50(tails):.3f} ms p90 {p90(tails):.3f}"
+        f"tail after the predictor replay p50 {p50(tails):.3f} ms p90 {p90(tails):.3f}, "
+        f"device idle in the step p50 {p50(idles):.3f} ms p90 {p90(idles):.3f}"
     )
 
     def table(title: str, per_step: list[Counter], total_p50: float):
@@ -776,7 +819,9 @@ def hosttail_report(
             print(f"| {owner} | {p50(vals):.1f} | {p90(vals):.1f} | {share:.1%} |")
         return report, {o: (p50(v), p90(v)) for o, v in owners.items()}
 
-    tail_report, tail_owners = table("host only tail", per_step_tail, p50(tails))
+    tail_report, tail_owners = table(
+        "tail after the predictor replay", per_step_tail, p50(tails)
+    )
     full_report, full_owners = table(
         "whole step, launch to launch", per_step_full, p50(walls)
     )
@@ -788,6 +833,7 @@ def hosttail_report(
                     "steps": n,
                     "wall_ms": {"p50": p50(walls), "p90": p90(walls)},
                     "tail_ms": {"p50": p50(tails), "p90": p90(tails)},
+                    "device_idle_ms": {"p50": p50(idles), "p90": p90(idles)},
                     "tail": tail_report,
                     "tail_owners": tail_owners,
                     "step": full_report,
