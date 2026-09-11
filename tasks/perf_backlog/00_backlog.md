@@ -48,6 +48,12 @@ Plans for items in this list are written as numbered docs in this folder.
    kernels per replay, c1 byte identical in both pairs, QPS plus 3.6 to
    5.2 percent at c1 and plus 1.7 to 6.7 at c16, streaming 3264 of 3264
    per arm. Next: E1 and E2, then S3 and S4, see `14_handoff_20260909.md`.
+   Update 2026-09-11: #2057 merged, S3 measured (runbook 15, readout 16)
+   and opened as PR #2108 at `33c92c52a`, E2 read (readout 17) and S4
+   closed as scoped. Plan 18 overlaps the decode step inside the sync
+   loop; slice A, the ids staged before the predictor, is on
+   `perf/qwen3-tts-stage-ids-early` at `51c5bb064` with runbook 19 owed
+   on the box, then slices B and C, then slice D's plan.
    The slices
    after S1 are `04_qwen3_tts_decode_step_slices_plan.md`:
    S2 rope writes the cache (160 kernels), S3 the residual add inside
