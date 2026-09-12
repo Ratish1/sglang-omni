@@ -122,6 +122,38 @@ Not run: the CI layout needs GPU 1 and it was held by another user's process for
 session (76 GB, 81 percent). Owed when GPU 1 is free, or as a one worker pair if it stays
 busy, since the delta is the measurement.
 
+## 7. E3, the seeded c16 pair, 2026-09-12
+
+Archive `qwen3-tts-stage-ids-early-b26971164-e3-upstreamA-20260912.tar.gz`. A is upstream main
+`9147eb5b3`, B is `b26971164`; the one upstream commit between B's merge base and A is the
+Fun-CosyVoice3 flow coalescing (#1899), not on this path. Seed 1234, warmup 1, c16, one boot
+per arm, 1088 of 1088 completed on both.
+
+| | A | B | paired delta, 95 percent interval |
+| --- | ---: | ---: | ---: |
+| WAV hashes equal | | | 81 of 1088 |
+| similarity | 71.2888 | 71.2892 | +0.0004, −0.28 to +0.28 |
+| errors | 114 | 125 | +11, −1 to +23, 30 samples changed |
+| req/s | 16.662 | 16.863 | |
+| median, p95 | 0.944, 1.361 s | 0.940, 1.315 s | |
+
+Every equal WAV has a similarity delta of exactly zero; over the differing ones the per sample
+deltas have a standard deviation of 4.8 and a mean of +0.0004. So at c16 the seeded draws
+still diverge between arms, the sampled tokens depend on the batch composition (the seeded c1
+pair is bit identical, so the kernels are), and once one token differs a sample's similarity
+moves by about 5 points either way. The corpus mean does not move. The streak of six negative
+unseeded pairs is settled as draws. Protocol consequence: the hash identity gate stays at c1,
+and a bit exact slice runs no c16 quality comparison.
+
+Streaming: the archive carries three passes of A only, two workers on GPUs 0 and 1: 19.5 to
+20.4 req/s, TTFC mean 0.126 to 0.182 s, inter chunk mean 0.078 to 0.081 s, continuity 100
+percent, 3264 of 3264. B's three passes are owed for the delta table.
+
+Per process memory in the streaming layout: the engines 71.0 and 69.0 GB, the vocoders 3.6
+and 3.8 GB. In the single process layout the one process peaks at 77.4 GB, so the 8 GB above
+readiness in section 2 is the vocoder and preprocessing stages living in the same process,
+not the talker.
+
 ## 6. Protocol, cheaper from here
 
 - A stacked slice reuses the previous slice's B boots as its A when the base is the same; here
