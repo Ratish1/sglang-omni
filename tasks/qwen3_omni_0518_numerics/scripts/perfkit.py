@@ -317,10 +317,11 @@ def build_steps(launches, kinds) -> list[Step]:
                 after.append(cur)
             j += 1
         next_ts = launches[j].ts if j < n else launch.ts + 1e9
-        # note: the first device to host copy after the predictor replay is the
-        # int32 token staging copy, one element per row
+        # note: the first device to host copy of the step is the int32 token
+        # staging copy, one element per row; since slice A of plan 18 it sits
+        # before the predictor replay, older traces have it after
         rows = 0
-        for cur in after:
+        for cur in [*before, *after]:
             for ts, dur, name, nbytes in cur.memops:
                 if name.startswith(D2H) and nbytes:
                     rows = nbytes // 4
@@ -593,11 +594,31 @@ def timeline_report(
     print(
         f"rows {rows_filter}, step at {t0:.0f} us, wall {(step.next_ts - t0) / 1000:.3f} ms to the next backbone launch\n"
     )
+    # note: with the host ahead of the device the previous step's predictor is
+    # still running at this launch, so the idle before the backbone is read
+    # against its device end, not against the launch
+    position = steps.index(step)
+    prev_end = t0
+    if position > 0:
+        prev = steps[position - 1]
+        prev_end = max(
+            _launch_device_end(l)
+            for l in [
+                prev.backbone,
+                *prev.before,
+                *([prev.predictor] if prev.predictor else []),
+                *prev.after,
+            ]
+        )
+    if prev_end > t0:
+        print(
+            f"device busy with the previous step until {(prev_end - t0) / 1000:.3f} ms\n"
+        )
     print(
         "| phase | host call | host t0 ms | host dur us | device t0 ms | device end ms | kernels | device busy us |"
     )
     print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
-    gpu_end = t0
+    gpu_end = max(t0, prev_end)
     for label, group_launches in phases:
         for l in group_launches:
             spans = [(k[0], k[0] + k[1]) for k in l.kernels] + [
@@ -819,9 +840,18 @@ def hosttail_report(
             print(f"| {owner} | {p50(vals):.1f} | {p90(vals):.1f} | {share:.1%} |")
         return report, {o: (p50(v), p90(v)) for o, v in owners.items()}
 
-    tail_report, tail_owners = table(
-        "tail after the predictor replay", per_step_tail, p50(tails)
-    )
+    if p50(tails) > 0:
+        tail_report, tail_owners = table(
+            "tail after the predictor replay", per_step_tail, p50(tails)
+        )
+    else:
+        ahead = sum(1 for t in tails if t <= 0)
+        print(
+            f"\nno host only tail: the next backbone launch precedes the predictor "
+            f"replay's device end in {ahead} of {n} steps, the negative tail is the "
+            "host's lead"
+        )
+        tail_report, tail_owners = [], {}
     full_report, full_owners = table(
         "whole step, launch to launch", per_step_full, p50(walls)
     )
