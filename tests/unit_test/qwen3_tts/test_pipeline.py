@@ -2446,10 +2446,11 @@ def test_qwen3_tts_prime_commit_finishes_a_stream_that_ended_meanwhile(
 
     state.final_pending = True
     scheduler._commit_initial("request", state, plan, torch.empty(0))
+    assert state.prefix_primed is True
+    assert state.codec_slot is None
+    assert scheduler._codec_arena.active_slots() == 1
     scheduler._finish_codec_slots([plan.slot])
 
-    assert state.prefix_primed is True
-    assert state.codec_frame_position == 1
     result = scheduler.outbox.get_nowait()
     assert result.type == "result"
     assert scheduler.outbox.empty()

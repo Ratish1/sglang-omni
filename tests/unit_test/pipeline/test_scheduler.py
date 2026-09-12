@@ -60,6 +60,7 @@ def _init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler._backlogged_request_build_payloads = deque()
     scheduler._request_build_max_pending_observed = 0
     scheduler._async_pending = None
+    scheduler._stream_prefix_builder = None
     scheduler.enable_priority_scheduling = False
     scheduler.abort_on_priority_when_disabled = False
     if not hasattr(scheduler, "max_queued_requests"):
@@ -598,6 +599,7 @@ def _enqueue_limit_scheduler(monkeypatch):
     scheduler._pending_stream_ingress = {}
     scheduler._request_admission_lock = threading.RLock()
     scheduler._abort_callback = None
+    scheduler._stream_prefix_builder = None
     aborts: list[str] = []
     scheduler.abort = lambda rid, *, defer_running_cleanup=True: aborts.append(rid)
     scheduler.send_to_detokenizer = omni_scheduler_module._NoOpSender()
