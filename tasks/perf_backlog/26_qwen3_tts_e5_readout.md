@@ -1,5 +1,9 @@
 # 26. E5 readout, control against early ids on one base, 2026-09-12
 
+Doc 28 found the regime: this session's servers ran with
+`SGLANG_FORCE_FUSED_OP_BACKEND=torch`. The pair is valid as a pair on that backend and
+none of its numbers is a production number.
+
 Archive `qwen3-tts-e5-22951f0ee-20260912.tar.gz`. Every number below was recomputed from
 the raw files (speed_results.json, client_timestamps.jsonl, events_pass2/*.jsonl, serve.log,
 the Nsight stats CSVs); the box's `readout.md` and `trace_readout.tsv` were read afterwards

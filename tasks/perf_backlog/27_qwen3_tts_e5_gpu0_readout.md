@@ -1,5 +1,9 @@
 # 27. E5 on GPU 0, control against early ids, bounded run ahead, clean Nsight, 2026-09-12
 
+Doc 28 found the regime: every E5 server ran with `SGLANG_FORCE_FUSED_OP_BACKEND=torch`.
+The pairs below are valid as pairs on that backend and none of their numbers is a
+production number; the run has to be repeated with the plain server command.
+
 Archive `e5-gpu0-rerun-22951f0ee.tar.gz`. Every number was recomputed from the raw files
 (speed_results.json, client_timestamps.jsonl, the event recorder files, serve.log,
 telemetry.txt, the SQLite exports of the two clean Nsight windows). The box's REPORT.md
