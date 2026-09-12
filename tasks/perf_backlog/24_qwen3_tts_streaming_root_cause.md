@@ -1,5 +1,9 @@
 # 24. Why the decode step overlap raises the first chunk latency, 2026-09-12
 
+Superseded in part by doc 25 (the E4 readout): the lock mechanism of section 3 is rejected
+by E4a, the segment table of section 2 comes from profiler loaded windows, and the E4
+experiments of section 4 have run. Doc 25 section 5 lists the corrections.
+
 Written from the single server streaming pairs (archive
 `qwen3-tts-runbook22-streaming-pairs-898dc3234-20260912.tar.gz`) and the per request event
 files the c16 census windows recorded on 2026-09-11 (slice A archive, `events/` under
