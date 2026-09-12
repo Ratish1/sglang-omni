@@ -113,6 +113,22 @@ archive. Slice A's own identity (readout 20) was two warmup 0 boots, which is wh
 Streaming: engines 69.4 and 71.0 GB, vocoders 4.1 and 3.8 GB (slice A: 71.0 and 69.0, 3.6 and
 3.8). Single process c16 peak 76977 MiB against slice A's 79555 on the same readiness level.
 
+## 9. The finish test, settled
+
+Follow up archive `qwen3-tts-nonblocking-copies-7bd3b86db-followup-20260912.tar.gz`: the
+identity gate passed with the same warmup on both arms, 1088 of 1088, A at `04b62c255`
+seeded c1 warmup 1 against B's hashes. The two scheduler tests pass with their fakes fixed.
+The finish timing test still failed with the pinned class primed, so the probe of runbook
+22 section 7 ran on the box: with the stream busy, `stack` 0.04 ms, `cat` 0.07, the pinned
+allocation 0.04, the D2H copy 0.07, the event 0.01 and its record 0.04, the stream busy
+after every one and the event not done. The builder's calls do not synchronize. The
+difference between the probe and the test was that the probe had launched `stack` once
+before the sleep: the test's first `stack` and `cat` of the process came after the sleep,
+and a kernel's first launch under lazy module loading synchronizes the device. Serving
+pays that once on the warmup request. The test now runs the builder once on a warmup
+request before the timed call (`9900cb82e`). The mirror test of the restage sources'
+shapes and dtypes went under the admission rule (`2a10d594f`).
+
 ## 8. What is left on this branch
 
 1. The A seeded c1 warmup 1 boot for the identity gate.
