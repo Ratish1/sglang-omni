@@ -154,6 +154,71 @@ and 3.8 GB. In the single process layout the one process peaks at 77.4 GB, so th
 readiness in section 2 is the vocoder and preprocessing stages living in the same process,
 not the talker.
 
+## 8. Follow up with GPU 1 idle, 2026-09-12
+
+Archive `qwen3-tts-stage-ids-early-04b62c255-followup-20260912-compact.tar.gz`. A upstream main
+`9147eb5b3`, B `04b62c255`. GPU 1 idle on every boot, GPUs 2 to 5 at 98 to 100 percent under
+other tenants throughout.
+
+### Why main reads 16 and not 17 at c16
+
+Nothing in main moved this path: the commits between the S3 base and today on the decode
+path are S3 itself, the scheduler's idle wait (#1809, which only runs when no batch exists),
+and unrelated models. The absolute c16 number follows the host load of the socket:
+
+| run | GPU 1 | GPUs 2 and 3 | main c16 req/s | branch c16 req/s |
+| --- | ---: | ---: | ---: | ---: |
+| S2, 2026-09-09 | 28 to 31% | 0% | 15.09, 15.99 | 16.10, 16.25 |
+| S3, 2026-09-11 | 0% | 0% | 16.40, 16.35 | 17.00, 16.73 |
+| slice A, 2026-09-11 | 67 to 79% | 0% | 15.30, 15.22 | 15.45, 15.93 |
+| E3 seeded, 2026-09-12 | 0% | 98% | 16.66 | 16.86 |
+| follow up, 2026-09-12 | 0% | 98% | 16.03 | 17.03 |
+
+The c16 workload is host bound on its churn steps, so a tenant on the same CPU as GPU 0 slows
+both arms. Deltas within a pair hold, absolute numbers across days do not. `nvidia-smi topo -m`
+on the box says which GPUs share GPU 0's CPU; until then a boot is clean when GPU 1 is idle
+and GPUs 2 and 3 are recorded.
+
+### Unseeded c16, one boot per arm
+
+| | A | B | delta |
+| --- | ---: | ---: | ---: |
+| req/s | 16.027 | 17.034 | +6.3% |
+| audio s/s | 69.221 | 70.433 | +1.8% |
+| median, p95, p99 s | 0.951, 1.375, 1.593 | 0.914, 1.311, 1.513 | −3.9, −4.7, −5.0% |
+| RTF mean | 0.2361 | 0.2333 | −1.2% |
+| GPU 0 peak MiB, ready 69325 both | 77835 | 79555 | +1720 |
+
+This pair replaces the throttled one in PR #2123.
+
+### Streaming, three passes per arm, two workers on GPUs 0 and 1
+
+Per request records, A from the E3 archive, B from this one:
+
+| pass | TTFC mean, p50, p90, p99 s | inter chunk mean, p99 s | latency mean, p99 s | req/s | gaps over 200 ms |
+| --- | --- | --- | --- | ---: | ---: |
+| A 1 | 0.182, 0.159, 0.250, 0.783 | 0.0784, 0.173 | 0.814, 1.415 | 19.52 | 0 |
+| A 2 | 0.133, 0.123, 0.181, 0.322 | 0.0808, 0.186 | 0.785, 1.245 | 20.26 | 0 |
+| A 3 | 0.126, 0.117, 0.164, 0.295 | 0.0811, 0.185 | 0.780, 1.281 | 20.38 | 0 |
+| B 1 | 0.208, 0.180, 0.292, 0.928 | 0.0722, 0.191 | 0.809, 1.399 | 19.64 | 1 |
+| B 2 | 0.150, 0.136, 0.221, 0.380 | 0.0756, 0.190 | 0.780, 1.225 | 20.39 | 5 |
+| B 3 | 0.133, 0.123, 0.181, 0.308 | 0.0744, 0.186 | 0.734, 1.169 | 21.63 | 0 |
+
+Inter chunk mean −8 percent, request latency and throughput better on every pass, continuity
+100 percent on A and 99.9, 99.5, 100 on B. TTFC is higher on B in every pass, +14, +13 and
++6 percent at the mean, 12 to 17 ms, also on the steady requests after the first 64. The five
+gaps of B pass 2 sit in two clusters of adjacent requests (indexes 58 to 59 and 220 to 224),
+a stall of about 300 ms on one worker each, none on A.
+
+The per request records carry no engine side first emit time, so the split between the
+talker and the vocoder is not in the archive. The mechanism this readout already measured
+fits: on churn steps the restage and the finish copy now block the scheduler thread for up
+to 3 ms each behind the queued predictor (section 3), and a joining request's first frames
+wait behind those stalls. Slices C and B remove exactly those stalls, so the stacked branch's
+streaming pair (runbook 22 section 5) is the test: TTFC back at A's level or better closes
+it; if not, the vocoder sharing GPU time with a busier talker is the next suspect and needs
+the engine side first emit stamp in the benchmark's per request record.
+
 ## 6. Protocol, cheaper from here
 
 - A stacked slice reuses the previous slice's B boots as its A when the base is the same; here
