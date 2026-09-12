@@ -118,8 +118,8 @@ class Qwen3TTSModelRunner(ModelRunner):
         return True
 
     def lookahead_eligible(self, batch: Any) -> bool:
-        # note(ratish): the codec collect runs in post_decode only, the launch
-        # and resolve halves would skip it and feed token embeddings back.
+        # note(ratish): the lookahead's launch and resolve hooks do not run the
+        # codec collect, they would feed token embeddings back.
         del batch
         return False
 
@@ -186,8 +186,8 @@ class Qwen3TTSModelRunner(ModelRunner):
         layer0_codes = result.next_token_ids
         if layer0_codes.ndim == 1:
             layer0_codes = layer0_codes.unsqueeze(1)
-        # note(ratish): the layer 0 id is the step's only host read, so its copy
-        # goes ahead of the predictor and the finalize wait no longer covers it.
+        # note(ratish): the layer 0 id is the step's only host read, staged ahead
+        # of the predictor so the finalize wait covers the sample, not the predictor.
         self._stage_token_ids(result, result.next_token_ids)
 
         hidden = result.logits_output.hidden_states
