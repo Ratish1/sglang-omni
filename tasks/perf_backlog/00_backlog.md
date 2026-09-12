@@ -52,8 +52,12 @@ Plans for items in this list are written as numbered docs in this folder.
    and opened as PR #2108 at `33c92c52a`, E2 read (readout 17) and S4
    closed as scoped. Plan 18 overlaps the decode step inside the sync
    loop; slice A, the ids staged before the predictor, is on
-   `perf/qwen3-tts-stage-ids-early` at `51c5bb064` with runbook 19 owed
-   on the box, then slices B and C, then slice D's plan.
+   `perf/qwen3-tts-stage-ids-early`, measured on 2026-09-11 (runbook 19,
+   readout 20): c1 step 8.04 to 6.25 ms, req/s +14 percent at c1, +1 to
+   +5 at c16, bit identical; branch at `b26971164` with main merged.
+   Next: slice C (the restage) then slice B (the finish copy), both now
+   blocking behind the queued predictor on c16 churn steps (readout 20
+   section 3), then slice D's plan.
    The slices
    after S1 are `04_qwen3_tts_decode_step_slices_plan.md`:
    S2 rope writes the cache (160 kernels), S3 the residual add inside
