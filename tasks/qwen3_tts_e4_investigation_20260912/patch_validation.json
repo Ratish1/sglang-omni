@@ -1,0 +1,14 @@
+{
+  "base": "645b472cdb2d7b93a1825a5bfa6a603b62b03936",
+  "patches": {
+    "early_ids.patch": {
+      "sha256": "7afb15aa30ea79a789c40aca850fb3ce2fc65987cc0259109edcd376d2dbb077",
+      "sequential_apply_check": "pass"
+    },
+    "nonblocking.patch": {
+      "sha256": "eea70ffd72277b611a35f63d46cc243285327313b6bd00d7073702d83d1ee89f",
+      "sequential_apply_check": "pass"
+    }
+  },
+  "combined_stat": " sglang_omni/models/qwen3_tts/model_runner.py     | 13 ++--\n sglang_omni/models/qwen3_tts/request_builders.py | 14 +++-\n sglang_omni/models/qwen3_tts/sglang_model.py     | 81 ++++++++++++++++++------\n sglang_omni/pipeline/stage/runtime.py            | 10 ++-\n sglang_omni/scheduling/omni_scheduler.py         |  4 ++\n sglang_omni/scheduling/types.py                  |  3 +\n 6 files changed, 99 insertions(+), 26 deletions(-)\n"
+}
