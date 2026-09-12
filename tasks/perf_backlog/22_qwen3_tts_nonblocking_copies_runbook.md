@@ -17,6 +17,13 @@ stream position, and the same CPU tensor reaches every reader after the same com
 Protocol of 2026-09-12: four boots on B, the census boot with stacks, a seeded c1 boot, a c16
 boot and the streaming pair. No c16 quality comparison.
 
+Host load (readout 20 section 8): GPUs 0 to 3 share NUMA node 0, so a tenant on GPU 1, 2 or
+3 slows every host bound step on whichever arm runs under it. Record GPUs 1 to 3 before each
+boot. Tenants do not block the run: a pair is valid when both arms ran under the same load.
+So when GPUs 1 to 3 are loaded, run A's c16 boot and A's three streaming passes in the same
+session (sections 4 and 5) instead of reusing the follow up's A numbers; the census, the
+identity pass and the c1 speed do not need it.
+
 ## 1. Suites on B
 
 ```bash
@@ -63,21 +70,24 @@ in the slice A archive), and the c1 speed inside 2 percent of A's 2.58 req/s.
 
 ## 4. c16 on B, one boot
 
-Unseeded, `--warmup 1`, full corpus. Against A's two c16 boots (readout 20 section 2, B r1
-and B r2): req/s 15.45 and 15.93, median 0.987 and 0.979 s, p95 1.421 and 1.393 s. Pass: B at
-or above the better of the two on req/s, median and p95 beyond the 2 percent spread; this is
-the point of the slices. WER and similarity are recorded, not compared. Peak memory as a
-level from the gpu samples plus the per process reading.
+Unseeded, `--warmup 1`, full corpus. A is the follow up's slice A boot (readout 20 section
+8: 17.03 req/s, median 0.914 s, p95 1.311 s, GPU 1 idle, GPUs 2 and 3 at 98 percent) when
+the load is the same, otherwise one A boot at `04b62c255` in this session. Pass: B above A
+on req/s, median and p95 beyond the 2 percent spread; this is the point of the slices. WER
+and similarity are recorded, not compared. Peak memory as a level from the gpu samples plus
+the per process reading.
 
 ## 5. Streaming on B, three passes
 
 CI layout, two workers on GPUs 0 and 1, separate vocoder processes, warmup 1, full corpus,
-c16. A's three passes are in the E3 archive (`streaming/A`, 19.5 to 20.4 req/s, TTFC mean
-0.126 to 0.182 s, inter chunk mean 0.078 to 0.081 s). Delta table: requests per second, audio
-seconds per second, TTFC mean and p99, inter chunk mean and p99, request latency mean and p99,
-RTF, continuity at 200 ms, completed. Pass: nothing worse than A's band, 3264 of 3264. If the
-slice A B passes were run on the box earlier, archive them too; they give the slice A delta
-table that PR #2123 does not carry yet.
+c16. A is slice A's three passes from the follow up archive (readout 20 section 8: TTFC mean
+0.133 to 0.208 s, inter chunk mean 0.072 to 0.076 s, 19.6 to 21.6 req/s) when the load is
+the same, otherwise three passes at `04b62c255` in this session. Delta table: requests per
+second, audio seconds per second, TTFC mean and p99, inter chunk mean and p99, request latency
+mean and p99, RTF, continuity at 200 ms, completed. Pass: nothing worse than A's band, 3264 of
+3264, and the question of readout 20 section 8 answered: TTFC at or below upstream main's
+0.126 to 0.133 s mean of the E3 passes means the slice A cost was the two stalls these slices
+remove.
 
 ## 6. Archive
 
