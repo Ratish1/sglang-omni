@@ -124,6 +124,9 @@ class _Qwen3TTSStreamState:
     # arena also keeps it on device, but reading that back would sync; the
     # cohort's positions are built from this instead.
     codec_frame_position: int = 0
+    # note(ratish): set once the slot holds the reference prefix's state, so
+    # the first generated frames decode as a fresh chunk of their own width.
+    prefix_primed: bool = False
     suppress_bootstrap: bool = False
 
 
@@ -1211,10 +1214,12 @@ class Qwen3TTSStreamingVocoderScheduler(
     ) -> None:
         del request_id
         if state.pending_ref_frames:
-            if state.pending_ref_frames >= int(codes.shape[0]):
+            # note(ratish): the reference arrives either alone, ahead of
+            # generation, or prefixed to the first generated frames.
+            if state.pending_ref_frames > int(codes.shape[0]):
                 raise ValueError(
-                    "Qwen3-TTS first stream chunk must include at least one "
-                    "generated codec frame after the reference"
+                    "Qwen3-TTS first stream chunk is shorter than its "
+                    f"ref_code_len of {state.pending_ref_frames}"
                 )
             state.ref_frames = state.pending_ref_frames
             state.pending_ref_frames = 0
@@ -1381,6 +1386,23 @@ class Qwen3TTSStreamingVocoderScheduler(
             and not state.incremental_codec_fallback
         )
 
+    def _prefix_prime_pending(self, state: _Qwen3TTSStreamState) -> bool:
+        """True while the reference has arrived alone and its state is not built.
+
+        A prime consumes the reference into the stream's arena slot without
+        emitting audio. It only applies on the incremental path before any
+        generated frame has arrived; once one has, the ordinary first decode
+        takes the reference and the frame together.
+        """
+        return (
+            state.ref_frames > 0
+            and not state.prefix_primed
+            and not state.decoded_chunks
+            and state.total_frames == state.ref_frames
+            and state.codec_frame_position == 0
+            and self._use_incremental_path(state)
+        )
+
     def _build_incremental_plan(
         self,
         state: _Qwen3TTSStreamState,
@@ -1395,12 +1417,14 @@ class Qwen3TTSStreamingVocoderScheduler(
         caller falls through to the left-context planner.
         """
         available_generated_frames = state.total_frames - state.ref_frames
-        if available_generated_frames <= state.emitted_generated_frames:
-            return None
-        next_frames = self._next_decode_threshold(state)
-        if not is_final and available_generated_frames < next_frames:
-            state.next_decode_generated_frames = next_frames
-            return None
+        prime = not is_final and self._prefix_prime_pending(state)
+        if not prime:
+            if available_generated_frames <= state.emitted_generated_frames:
+                return None
+            next_frames = self._next_decode_threshold(state)
+            if not is_final and available_generated_frames < next_frames:
+                state.next_decode_generated_frames = next_frames
+                return None
 
         generated_frames = available_generated_frames
         if max_generated_frames is not None:
@@ -1425,7 +1449,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         consumed_frames = state.codec_frame_position
         expected_consumed_frames = (
             state.ref_frames + state.emitted_generated_frames
-            if state.decoded_chunks
+            if state.decoded_chunks or state.prefix_primed
             else 0
         )
         if consumed_frames != expected_consumed_frames:
@@ -2047,6 +2071,9 @@ class Qwen3TTSStreamingVocoderScheduler(
         request_id: str,
         state: _Qwen3TTSStreamState,
     ) -> list[OutgoingMessage]:
+        if self._async_decode and self._prefix_prime_pending(state):
+            self._schedule_initial(request_id, state)
+            return []
         if not self.should_decode(state, is_final=False):
             return []
         if self._async_decode:
@@ -2243,6 +2270,10 @@ class Qwen3TTSStreamingVocoderScheduler(
                 )
                 if plan is None:
                     state.initial_pending = False
+                    # note(ratish): a stream that ended while its prime was
+                    # queued, with nothing generated, has no decode left.
+                    if state.final_pending and state.total_frames <= state.ref_frames:
+                        self._finish_async_stream(request_id, state)
                     continue
                 if incremental:
                     planned_incremental.append((request_id, state, plan))
@@ -2482,6 +2513,9 @@ class Qwen3TTSStreamingVocoderScheduler(
         with self._state_lock:
             if self._stream_states.get(request_id) is not state:
                 return
+            if isinstance(plan, _IncrementalDecodePlan) and plan.generated_frames == 0:
+                self._commit_prefix_prime(request_id, state, plan)
+                return
             try:
                 delta = self._commit_decode_plan(state, plan, delta)
             except Exception as exc:
@@ -2503,6 +2537,30 @@ class Qwen3TTSStreamingVocoderScheduler(
                     self._schedule_followup(request_id, state)
         if cleanup_abort:
             self._cleanup_aborted_request(request_id)
+
+    def _commit_prefix_prime(
+        self,
+        request_id: str,
+        state: _Qwen3TTSStreamState,
+        plan: _IncrementalDecodePlan,
+    ) -> None:
+        """Record a consumed reference prefix; nothing is emitted for it.
+
+        Must be called under the state lock. Frames that arrived while the
+        prime ran go back to the initial worker, and a stream that ended
+        without generating anything finishes here.
+        """
+        state.codec_frame_position += plan.fresh_frames
+        self._prune_codes_before(state, state.codec_frame_position)
+        state.prefix_primed = True
+        state.initial_pending = False
+        if self._is_aborted(request_id):
+            return
+        has_generated = state.total_frames > state.ref_frames
+        if state.final_pending and not has_generated:
+            self._finish_async_stream(request_id, state)
+        elif state.final_pending or self.should_decode(state, is_final=False):
+            self._schedule_initial(request_id, state)
 
     def _run_followup_worker(self, index: int = 0) -> None:
         self._worker_ctx.graphs = (
