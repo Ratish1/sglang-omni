@@ -1,5 +1,11 @@
 # 30. Plan: remove the first chunk cost of the decode step overlap
 
+Status 2026-09-13: P1 measured, not a win (doc 32). It shortens the idle worker's segment
+by 13 ms and pays it back in prefill contention and initial worker occupancy, throughput
+minus 4 percent. P2 to P4 are deferred behind doc 32's origin experiments; this plan's
+ordering (largest lock holder first) was wrong because it optimizes inside the shared
+process instead of removing the sharing.
+
 Basis: doc 29 (the interpreter lock is held 79 percent of the time at c16 on early ids
 against 69 on control, and the three sibling stages pay the first chunk in lock waits),
 and the mechanics inventory of 2026-09-13 (Opus, every anchor below verified by hand).

@@ -1,5 +1,8 @@
 # 31. Runbook: the reference prefix prime (P1 of doc 30)
 
+Status 2026-09-13: run, archive `p1-prefix-prime-7ceaf8f2c-compact.tar.gz`, readout in
+doc 32. The gate failed; the next runbook is doc 32 section 7.
+
 Branch `perf/qwen3-tts-prefix-prime` at 7ceaf8f2c, three commits on upstream main d90d71c37
 (runtime in 2287c6e26 and 651de81e3, test fixes in 7ceaf8f2c).
 One session, plain server command with no environment variable in front of it, physical
