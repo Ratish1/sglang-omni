@@ -62,6 +62,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
         self.wrapper: Any | None = None
         self._stream_output_builder: Any | None = None
+        self._stream_prefix_builder: Any | None = None
         # note (luojiaxuan): the factory assigns this before generation_defaults
         # runs, but Qwen3TTSPipelineConfig.generation_admission_defaults builds a
         # bare builder just to read the admission keys, so it needs a value.
@@ -207,17 +208,21 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         return model_runner_mod.Qwen3TTSModelRunner(model_worker, output_proc)
 
     def make_adapters(self, model: Any) -> tuple[Any, Any]:
-        request_builder, result_adapter, self._stream_output_builder = (
-            request_builders.make_qwen3_tts_scheduler_adapters(
-                model=model,
-                wrapper=self.wrapper,
-            )
+        (
+            request_builder,
+            result_adapter,
+            self._stream_output_builder,
+            self._stream_prefix_builder,
+        ) = request_builders.make_qwen3_tts_scheduler_adapters(
+            model=model,
+            wrapper=self.wrapper,
         )
         return request_builder, result_adapter
 
     def extra_scheduler_kwargs(self) -> dict[str, Any]:
         return {
             "stream_output_builder": self._stream_output_builder,
+            "stream_prefix_builder": self._stream_prefix_builder,
             "request_build_max_workers": 4,
             "request_build_max_pending": 16,
             "prefill_coalesce_requests": self.prefill_coalesce_requests,

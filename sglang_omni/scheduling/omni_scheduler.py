@@ -192,6 +192,7 @@ class OmniScheduler:
         request_builder: Callable | None = None,
         result_adapter: Callable | None = None,
         stream_output_builder: Callable | None = None,
+        stream_prefix_builder: Callable | None = None,
         stream_chunk_handler: Callable | None = None,
         stream_done_handler: Callable | None = None,
         abort_callback: Callable[[str], None] | None = None,
@@ -217,6 +218,7 @@ class OmniScheduler:
         self._result_adapter = result_adapter
         self._model_runner = None
         self._stream_output_builder = stream_output_builder
+        self._stream_prefix_builder = stream_prefix_builder
         self._stream_chunk_handler = stream_chunk_handler
         self._stream_done_handler = stream_done_handler
         self._abort_callback = abort_callback
@@ -1236,6 +1238,8 @@ class OmniScheduler:
                 )
                 return
             self._apply_prompt_cache_epoch(req)
+            if not self._emit_stream_prefix(req_id, req_data):
+                return
             _emit_event(
                 request_id=req_id,
                 stage=None,
@@ -1251,6 +1255,28 @@ class OmniScheduler:
         else:
             with self._request_admission_lock:
                 enqueue_if_live()
+
+    def _emit_stream_prefix(self, request_id: str, req_data: Any) -> bool:
+        """Send a request's stream prefix, if the model has one, before it is queued.
+
+        The prefix leaves through the same outbox as the request's chunks and
+        ahead of every one of them, so the target stage sees it first. A
+        builder failure fails the request the way a build failure does.
+        """
+        if self._stream_prefix_builder is None:
+            return True
+        try:
+            messages = self._stream_prefix_builder(request_id, req_data)
+        except Exception as exc:
+            logger.exception(
+                f"OmniScheduler: stream prefix builder failed for {request_id}"
+            )
+            self._emit_request_error(request_id, exc)
+            self.abort(request_id)
+            return False
+        for msg in messages:
+            self.outbox.put(msg)
+        return True
 
     def _apply_prompt_cache_epoch(self, req: Any) -> None:
         cache_key = getattr(req, "_omni_prompt_cache_key", None)

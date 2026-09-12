@@ -646,6 +646,79 @@ def test_enqueue_built_request_honors_max_queued_requests(monkeypatch) -> None:
     assert aborts == ["req-reject"]
 
 
+def _admission_req(rid: str):
+    return SimpleNamespace(
+        rid=rid,
+        priority=None,
+        weight_version_events=[],
+        output_ids=[],
+        origin_input_ids=array("q", [1]),
+        origin_input_ids_unpadded=array("q", [1]),
+        time_stats=SimpleNamespace(
+            wait_queue_entry_time=0.0,
+            trace_ctx=SimpleNamespace(abort=lambda *, abort_info: None),
+        ),
+    )
+
+
+def test_enqueue_built_request_sends_the_stream_prefix_before_queueing(
+    monkeypatch,
+) -> None:
+    scheduler, events, aborts = _enqueue_limit_scheduler(monkeypatch)
+    scheduler.max_queued_requests = 4
+    seen: list[tuple] = []
+
+    def stream_prefix_builder(rid, data):
+        seen.append((rid, data, list(scheduler.waiting_queue)))
+        return [SimpleNamespace(request_id=rid, type="stream", target="vocoder")]
+
+    scheduler._stream_prefix_builder = stream_prefix_builder
+    req = _admission_req("req-prefixed")
+    req_data = SimpleNamespace(req=req, enforce_request_limits=False)
+
+    OmniScheduler._enqueue_built_request(
+        scheduler, SimpleNamespace(request_id=req.rid), False, req_data
+    )
+
+    assert [entry.rid for entry in scheduler.waiting_queue] == ["req-prefixed"]
+    assert seen == [("req-prefixed", req_data, [])]
+    prefix = scheduler.outbox.get_nowait()
+    assert prefix.request_id == "req-prefixed"
+    assert prefix.type == "stream"
+    assert scheduler.outbox.empty()
+    assert events.count("scheduler_queue_enter") == 1
+    assert aborts == []
+
+
+def test_enqueue_built_request_fails_the_request_when_its_prefix_fails(
+    monkeypatch,
+) -> None:
+    scheduler, events, aborts = _enqueue_limit_scheduler(monkeypatch)
+    scheduler.max_queued_requests = 4
+
+    def stream_prefix_builder(rid, data):
+        raise ValueError("reference codes must have shape [T, Q]")
+
+    scheduler._stream_prefix_builder = stream_prefix_builder
+    req = _admission_req("req-broken")
+
+    OmniScheduler._enqueue_built_request(
+        scheduler,
+        SimpleNamespace(request_id=req.rid),
+        False,
+        SimpleNamespace(req=req, enforce_request_limits=False),
+    )
+
+    assert scheduler.waiting_queue == []
+    error = scheduler.outbox.get_nowait()
+    assert error.request_id == "req-broken"
+    assert error.type == "error"
+    assert "shape [T, Q]" in str(error.data)
+    assert scheduler.outbox.empty()
+    assert aborts == ["req-broken"]
+    assert "scheduler_queue_enter" not in events
+
+
 def test_process_input_requests_rejects_before_build_when_waiting_queue_is_full() -> (
     None
 ):

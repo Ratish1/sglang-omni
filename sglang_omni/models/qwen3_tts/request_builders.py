@@ -1578,19 +1578,75 @@ def make_qwen3_tts_scheduler_adapters(*, model: Any, wrapper: Any):
     def result_adapter(data: Qwen3TTSSGLangRequestData) -> StagePayload:
         return apply_sglang_qwen3_tts_result(data.stage_payload, data)
 
+    def _streams_codec_output(data: Qwen3TTSSGLangRequestData) -> bool:
+        params = data.stage_payload.request.params
+        return bool(
+            data.stream_codec_output
+            and isinstance(params, dict)
+            and params.get("stream")
+        )
+
+    def stream_prefix_builder(
+        request_id: str,
+        data: Qwen3TTSSGLangRequestData,
+    ) -> list[OutgoingMessage]:
+        """The reference codes as a chunk of their own, sent before generation.
+
+        The vocoder consumes them into its codec state while the talker is
+        still in prefill, so the first generated frame decodes as a fresh
+        chunk of its own width instead of behind the whole reference.
+        """
+        if not _streams_codec_output(data):
+            return []
+        ref_code = data.ref_code
+        if data.stream_ref_sent or ref_code is None or ref_code.numel() == 0:
+            return []
+        if ref_code.ndim != 2:
+            raise ValueError(
+                "Qwen3-TTS reference codes must have shape [T, Q], got "
+                f"{tuple(ref_code.shape)}"
+            )
+        codes = ref_code.detach().to(dtype=torch.long)
+        params = data.stage_payload.request.params
+        metadata: dict[str, Any] = {
+            "modality": "audio_codes",
+            "stream": True,
+            "num_quantizers": int(codes.shape[-1]),
+            "ref_code_len": int(codes.shape[0]),
+        }
+        if INITIAL_CODEC_CHUNK_FRAMES_PARAM in params:
+            metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = params[
+                INITIAL_CODEC_CHUNK_FRAMES_PARAM
+            ]
+        if data.suppress_bootstrap_silence:
+            metadata["bootstrap_silence_suppression"] = True
+        if codes.is_cuda:
+            # note(ratish): the request builder already ordered this stream
+            # after the reference's preparation, so an event here covers the
+            # rows for the vocoder's own stream.
+            ready = torch.cuda.Event()
+            ready.record()
+            metadata["codes_ready_event"] = ready
+        data.stream_ref_sent = True
+        return [
+            OutgoingMessage(
+                request_id=request_id,
+                type="stream",
+                data=codes,
+                target="vocoder",
+                metadata=metadata,
+            )
+        ]
+
     def stream_output_builder(
         request_id: str,
         data: Qwen3TTSSGLangRequestData,
         req_output: Any,
     ) -> list[OutgoingMessage]:
         del req_output
-        params = data.stage_payload.request.params
-        if (
-            not data.stream_codec_output
-            or not isinstance(params, dict)
-            or not params.get("stream")
-        ):
+        if not _streams_codec_output(data):
             return []
+        params = data.stage_payload.request.params
 
         codes = data.latest_stream_code_chunk
         if codes is None:
@@ -1652,4 +1708,9 @@ def make_qwen3_tts_scheduler_adapters(*, model: Any, wrapper: Any):
             )
         ]
 
-    return request_builder, result_adapter, stream_output_builder
+    return (
+        request_builder,
+        result_adapter,
+        stream_output_builder,
+        stream_prefix_builder,
+    )
