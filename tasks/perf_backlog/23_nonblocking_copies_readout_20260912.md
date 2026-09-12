@@ -129,6 +129,38 @@ pays that once on the warmup request. The test now runs the builder once on a wa
 request before the timed call (`9900cb82e`). The mirror test of the restage sources'
 shapes and dtypes went under the admission rule (`2a10d594f`).
 
+## 10. Review of 2026-09-12 and what changed
+
+`tasks/qwen3_tts_nonblocking_copies_review_20260912.md`, head `9900cb82e`. Four findings.
+
+- F1, blocker, real: the outbox drain awaited the readiness event and then routed
+  unconditionally; an abort during that await clears the request and its replica bindings,
+  so the drain would send stale traffic or, with a replicated target, raise on the missing
+  binding and stop the stage. Fixed: the drain rechecks that the request is active after the
+  wait and drops the result otherwise; an already complete event skips the executor. Test:
+  a gated readiness object that signals entry and blocks until released, the drain started
+  as a task, the abort delivered while it is blocked, then released: no completion or stream
+  for the aborted request, the live request behind it still drains.
+- F2, maintain: `engine_time_s` used to be sampled after the blocking copy, which the
+  finishing step's predictor delayed; it now ends at the handoff. Redefined as such at the
+  site; A/B claims use client visible metrics only, as they did.
+- F3, process: busy stream assertions are timing dependent. Added the deterministic
+  ownership test: three restages behind a busy stream with reordered, sampled and greedy
+  rows and distinct seeds, a device snapshot after each, every one of the six columns
+  compared after completion. One busy stream test per file stays as the overlap diagnostic.
+- F4, style: the restage test docstring overstated "never waits"; corrected to the actual
+  rule, a source waits only for its own previous copy.
+- Cleanup taken: the slot's wait folded into `stage()` so no caller can separate them.
+
+The branch was then rebuilt as two commits on upstream main `645b472cd` (`3c537ff31`,
+`898dc3234`) and force pushed, so PR #2126 carries only its own commits; its measurements
+were taken on top of #2123 and the body says so.
+
+Protocol correction from the same review round: streaming is never measured behind the
+router. The two worker router passes of section 5 do not enter any PR; the single server
+streaming pair (runbook 22 section 5) is owed for both #2123 and #2126, and so is a rerun of
+the three changed test files at `898dc3234`.
+
 ## 8. What is left on this branch
 
 1. The A seeded c1 warmup 1 boot for the identity gate.
