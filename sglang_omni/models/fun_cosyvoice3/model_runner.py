@@ -15,7 +15,9 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     first_ar_flush_tokens,
     prompt_token_len,
 )
+from sglang_omni.profiler.pipeline_nvtx import mark, trace_call, trace_range
 from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.types import ModelRunnerOutput, SchedulerOutput
 
 from .sglang_model import VOCAB_SIZE
 
@@ -42,9 +44,24 @@ class FunCosyVoice3ModelRunner(ModelRunner):
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
 
+    @trace_call(
+        "ar",
+        "execute",
+        lambda self, scheduler_output: {
+            "request_ids": scheduler_output.request_ids,
+            "batch_size": len(scheduler_output.requests),
+            "mode": str(getattr(scheduler_output.batch_data, "forward_mode", None)),
+        },
+    )
+    def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
+        result = super().execute(scheduler_output)
+        mark("ar", "result", graph=result.can_run_cuda_graph)
+        return result
+
     def on_request_finished(self, request_id: str, req_data: Any) -> None:
         self._flush_code_chunks(request_id, req_data, force=True)
 
+    @trace_call("ar", "prefill")
     def custom_prefill_forward(
         self,
         forward_batch: Any,
@@ -83,6 +100,18 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         del forward_batch, schedule_batch, requests
         return True
 
+    @trace_call("ar", "sampling")
+    def _sample_next_token_ids(
+        self,
+        logits_output: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> Any:
+        return super()._sample_next_token_ids(
+            logits_output, forward_batch, schedule_batch, requests
+        )
+
     def sample_before_post_decode(
         self,
         forward_batch: Any,
@@ -106,7 +135,8 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         if token_ids.ndim != 1:
             token_ids = token_ids.reshape(-1)
         # note (guozhihao-224): one batched D2H instead of per-request .item() syncs.
-        token_ids_cpu = token_ids.tolist()
+        with trace_range("ar", "codec_ids_d2h", batch_size=token_ids.numel()):
+            token_ids_cpu = token_ids.tolist()
         for idx, sched_req in enumerate(requests):
             token_id = int(token_ids_cpu[idx])
             if token_id >= VOCAB_SIZE:

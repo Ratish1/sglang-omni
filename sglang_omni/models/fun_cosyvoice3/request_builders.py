@@ -23,6 +23,7 @@ from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
 from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
 )
+from sglang_omni.profiler.pipeline_nvtx import ENABLED, mark, trace_call, trace_range
 from sglang_omni.proto import StagePayload
 from sglang_omni.sampling.seed import SAMPLING_SEED_MASK
 from sglang_omni.scheduling.reference_encoder import (
@@ -274,6 +275,7 @@ class _CosyVoice3ReferenceEncodeHook(
         del item
         return "prompt_16k+flow_24k+mono"
 
+    @trace_call("preprocessing", "reference_cache_miss")
     def encode_one(
         self, item: _CosyVoice3ReferenceInput
     ) -> _CosyVoice3ReferenceArtifact:
@@ -614,6 +616,7 @@ def build_generation_kwargs(
     return generation_kwargs
 
 
+@trace_call("preprocessing", "embedding_cache_key")
 def build_embedding_cache_key_ids(input_embeds: torch.Tensor) -> list[int]:
     rows = input_embeds.detach().to(dtype=torch.float32, device="cpu")
     key_ids: list[int] = []
@@ -701,6 +704,11 @@ def _prepare_cosyvoice3_request(
     )
 
 
+@trace_call(
+    "preprocessing",
+    "request",
+    lambda payload: {"request_id": payload.request_id},
+)
 def preprocess_cosyvoice3_payload(payload: StagePayload) -> StagePayload:
     with _PREPARED_REQUESTS_LOCK:
         context = _PREPROCESSING_CONTEXT
@@ -708,20 +716,32 @@ def preprocess_cosyvoice3_payload(payload: StagePayload) -> StagePayload:
         raise RuntimeError("CosyVoice3 preprocessing context is not initialized")
 
     state = build_cosyvoice3_state(payload)
+    if ENABLED:
+        mark(
+            "preprocessing",
+            "input_identity",
+            request_id=payload.request_id,
+            target_text_sha256=hashlib.sha256(state.text.encode()).hexdigest(),
+        )
     reference_artifact = None
     if state.ref_audio is not None:
-        reference_artifact = context.reference_service.get_or_encode(
-            state.ref_audio,
-            desc="Fun-CosyVoice3 reference conditioning",
-        )
+        with trace_range("preprocessing", "reference_lookup_or_encode"):
+            reference_artifact = context.reference_service.get_or_encode(
+                state.ref_audio,
+                desc="Fun-CosyVoice3 reference conditioning",
+            )
 
-    with _PREPROCESSING_FINALIZE_LOCK:
-        prepared = _prepare_cosyvoice3_request(
-            model=context.model,
-            tokenizer=context.tokenizer,
-            state=state,
-            reference_artifact=reference_artifact,
-        )
+    with (
+        trace_range("preprocessing", "finalize_including_lock"),
+        _PREPROCESSING_FINALIZE_LOCK,
+    ):
+        with trace_range("preprocessing", "prepare_embeddings"):
+            prepared = _prepare_cosyvoice3_request(
+                model=context.model,
+                tokenizer=context.tokenizer,
+                state=state,
+                reference_artifact=reference_artifact,
+            )
 
     prepared.state.flow_embedding = prepared.flow_embedding
     prepared.state.flow_prompt_speech_token = prepared.flow_prompt_speech_token

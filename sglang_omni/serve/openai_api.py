@@ -68,6 +68,7 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
+from sglang_omni.profiler.pipeline_nvtx import mark as _pipeline_mark
 from sglang_omni.serve.generation_params import (
     record_explicit_generation_params as _record_explicit_generation_params,
 )
@@ -1282,6 +1283,7 @@ def _register_speech(app: FastAPI) -> None:
         speech_service: SpeechRequestValidator = app.state.speech_service
 
         request_id = f"speech-{uuid.uuid4()}"
+        _pipeline_mark("http", "received", request_id=request_id)
         try:
             payload = await request.json()
             prepared = await asyncio.to_thread(
@@ -1294,6 +1296,7 @@ def _register_speech(app: FastAPI) -> None:
                 reference_descriptors=prepared.reference_descriptors,
                 uploaded_voice=prepared.uploaded_voice,
             )
+            _pipeline_mark("http", "validated", request_id=request_id)
         except json.JSONDecodeError:
             return speech_error_response(
                 bad_request("speech request body must be valid JSON")
@@ -1354,6 +1357,7 @@ def _register_speech(app: FastAPI) -> None:
             if result.usage.engine_time_s is not None:
                 headers["X-Engine-Time"] = str(result.usage.engine_time_s)
 
+        _pipeline_mark("http", "buffered_body_ready", request_id=request_id)
         return Response(
             content=result.audio_bytes,
             media_type=result.mime_type,
@@ -1540,6 +1544,7 @@ async def _speech_audio_response(
         nonlocal emitted_samples
         active_request = True
         try:
+            _pipeline_mark("http", "first_pcm_yield", request_id=request_id)
             yield first_audio_bytes
 
             async for chunk in chunk_stream:
@@ -1558,8 +1563,12 @@ async def _speech_audio_response(
                         "Raw PCM speech stream sample rate changed from "
                         f"{stream_sample_rate} to {sample_rate}"
                     )
+                _pipeline_mark(
+                    "http", "pcm_yield", request_id=request_id, bytes=len(audio_bytes)
+                )
                 yield audio_bytes
             active_request = False
+            _pipeline_mark("http", "stream_body_complete", request_id=request_id)
         finally:
             if active_request:
                 await _abort_and_close_speech_stream(client, request_id, chunk_stream)

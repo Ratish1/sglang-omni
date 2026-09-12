@@ -2,8 +2,8 @@
 """Request-level event recorder.
 
 Each process appends events to ``<dir>/events_<stage>_<pid>.jsonl``; the
-views layer merges files by ``request_id``. Kept free of sglang-omni
-imports so it can be loaded from any process without circular risk.
+views layer merges files by ``request_id``. The optional NVTX sink imports
+no model or CUDA modules, so this recorder also works in the coordinator.
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
+
+from sglang_omni.profiler import pipeline_nvtx
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +270,13 @@ def emit(
     timestamp_ns: int | None = None,
 ) -> None:
     """Module-level shortcut for ``get_recorder().emit(...)``."""
+    if pipeline_nvtx.ENABLED:
+        pipeline_nvtx.mark(
+            stage or get_active_stage() or "unknown",
+            event_name,
+            request_id=request_id,
+            metadata=dict(metadata) if metadata else {},
+        )
     _RECORDER.emit(
         request_id=request_id,
         stage=stage,

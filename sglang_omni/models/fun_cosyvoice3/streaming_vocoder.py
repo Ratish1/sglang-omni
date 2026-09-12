@@ -29,6 +29,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     stream_hop_len,
     tokens_needed_for_causal_chunk,
 )
+from sglang_omni.profiler.pipeline_nvtx import ENABLED, mark, trace_call, trace_range
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
@@ -115,12 +116,19 @@ class FunCosyVoice3StreamingVocoderScheduler(
         )
 
     async def _vocode_payload(self, payload: StagePayload) -> StagePayload:
+        mark("vocoder", "buffered_inputs", request_ids=[payload.request_id])
         results = await self._vocoder.decode_payloads([payload])
         return results[0]
 
     async def _vocode_payloads(
         self, payloads: list[StagePayload]
     ) -> list[StagePayload]:
+        if ENABLED:
+            mark(
+                "vocoder",
+                "buffered_inputs",
+                request_ids=[payload.request_id for payload in payloads],
+            )
         return await self._vocoder.decode_payloads(payloads)
 
     def create_stream_state(self, request_id: str) -> _CosyVoice3StreamState:
@@ -190,6 +198,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         for failed_id in failed:
             self._cleanup_aborted_request(failed_id)
 
+    @trace_call("scheduler", "payload_collection")
     def _collect_new_request_batch(
         self, first_msg: IncomingMessage
     ) -> list[IncomingMessage]:
@@ -227,6 +236,14 @@ class FunCosyVoice3StreamingVocoderScheduler(
             batch.append(msg)
         return batch
 
+    @trace_call(
+        "vocoder",
+        "payload_batch",
+        lambda self, batch, loop=None: {
+            "request_ids": [msg.request_id for msg in batch],
+            "batch_size": len(batch),
+        },
+    )
     def _handle_new_request_batch(
         self,
         batch: list[IncomingMessage],
@@ -342,6 +359,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self._pending_messages.appendleft(msg)
         return False
 
+    @trace_call("scheduler", "first_hop_peer_wait")
     def _wait_for_first_hop_peers(self) -> None:
         if self._first_hop_group_size() >= 2:
             return
@@ -406,6 +424,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             return True
         return False
 
+    @trace_call("scheduler", "follow_up_peer_wait")
     def _wait_for_follow_up_peers(self) -> None:
         # note (guozhihao-224): same 30ms window as first hops; without it
         # equal follow-ups arrive staggered and stay B=1 native.
@@ -579,6 +598,13 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 first_hops.append((request_id, state))
             else:
                 follow_ups.append((request_id, state))
+        if ENABLED:
+            mark(
+                "scheduler",
+                "ready_candidates",
+                first_hops=[rid for rid, _ in first_hops],
+                follow_ups=[rid for rid, _ in follow_ups],
+            )
         if first_hops:
             if not self._can_batch_stream_chunks:
                 return first_hops[:1]
@@ -617,6 +643,17 @@ class FunCosyVoice3StreamingVocoderScheduler(
             batched=len(participants) > 1,
         )
 
+    @trace_call(
+        "vocoder",
+        "stream_step",
+        lambda self, participants, plan: {
+            "request_ids": [rid for rid, _ in participants],
+            "batch_size": len(participants),
+            "hop": plan.hop,
+            "token_offset": plan.token_offset,
+            "token_end": plan.token_end,
+        },
+    )
     def run_step(
         self,
         participants: list[tuple[str, _CosyVoice3StreamState]],
@@ -681,12 +718,13 @@ class FunCosyVoice3StreamingVocoderScheduler(
                     "Fun-CosyVoice3 causal Flow batch returned "
                     f"{mel.shape[-1]} frames, need offset {offset_frames}"
                 )
-            delta, hift_mel, speech_offset = self._vocoder._hift_delta(
-                mel[:, :, offset_frames:],
-                hift_mel=state.hift_mel,
-                speech_offset=state.speech_offset,
-                finalize=False,
-            )
+            with trace_range("vocoder", "stream_hift", request_id=request_id):
+                delta, hift_mel, speech_offset = self._vocoder._hift_delta(
+                    mel[:, :, offset_frames:],
+                    hift_mel=state.hift_mel,
+                    speech_offset=state.speech_offset,
+                    finalize=False,
+                )
             state.token_offset += plan.hop
             self._advance_hop_len(state)
             state.hift_mel = hift_mel
@@ -713,6 +751,16 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self._advance_hop_len(state)
         return delta
 
+    @trace_call(
+        "vocoder",
+        "stream_delta",
+        lambda self, request_id, state, *, is_final: {
+            "request_id": request_id,
+            "finalize": is_final,
+            "token_offset": state.token_offset,
+            "tokens_available": len(state.tokens),
+        },
+    )
     def decode_delta(
         self,
         request_id: str,

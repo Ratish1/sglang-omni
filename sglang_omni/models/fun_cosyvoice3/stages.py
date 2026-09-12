@@ -32,6 +32,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     TOKEN_MEL_RATIO,
 )
 from sglang_omni.platforms import current_platform
+from sglang_omni.profiler.pipeline_nvtx import ENABLED, trace_call, trace_range
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.pipeline_state import load_state as _load_pipeline_state
@@ -248,6 +249,15 @@ def _apply_pre_lookahead(
     return torch.cat(pieces, dim=0)
 
 
+@trace_call(
+    "flow",
+    "euler",
+    lambda decoder, x, *args, **kwargs: {
+        "batch_size": x.shape[0],
+        "frames": x.shape[-1],
+        "streaming": kwargs.get("streaming", False),
+    },
+)
 def _solve_flow_euler(
     decoder: Any,
     x: torch.Tensor,
@@ -431,6 +441,7 @@ def _split_generated_mels(
     return outputs
 
 
+@trace_call("flow", "estimator")
 def _forward_flow_estimator(
     decoder: Any,
     x: torch.Tensor,
@@ -491,6 +502,15 @@ class FunCosyVoice3Flow:
         )
 
     @torch.inference_mode()
+    @trace_call(
+        "flow",
+        "packed_buffered",
+        lambda self, inputs: {
+            "batch_size": len(inputs),
+            "token_lengths": [x.token.shape[1] for x in inputs],
+            "prompt_lengths": [x.prompt_token.shape[1] for x in inputs],
+        },
+    )
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
         packed = _pack_flow_inputs(self._flow, inputs)
         # note (db-ol): the solve is timed only while the debug record can be
@@ -509,6 +529,15 @@ class FunCosyVoice3Flow:
         )
 
     @torch.inference_mode()
+    @trace_call(
+        "flow",
+        "packed_causal",
+        lambda self, inputs: {
+            "batch_size": len(inputs),
+            "token_lengths": [x.token.shape[1] for x in inputs],
+            "prompt_lengths": [x.prompt_token.shape[1] for x in inputs],
+        },
+    )
     def inference_causal(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
         # note (guozhihao-224): causal hops (first and follow-up). Same
         # packing as buffered inference, but strip lookahead per row so
@@ -1014,10 +1043,19 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         )
 
         for flow_group in flow_groups:
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=self._compute_dtype,
-                enabled=self._compute_dtype is not None,
+            with (
+                trace_range(
+                    "vocoder",
+                    "flow_group",
+                    buffered_item_indices=(
+                        [r.index for r in flow_group] if ENABLED else ()
+                    ),
+                ),
+                torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=self._compute_dtype,
+                    enabled=self._compute_dtype is not None,
+                ),
             ):
                 mel_list = self._flow.inference(
                     [request.flow_input for request in flow_group]
@@ -1026,7 +1064,14 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
                 list(zip(flow_group, mel_list, strict=True)),
                 max_waste=self._hift_max_padding_waste,
             ):
-                wavs = self._mel2wav_batch([mel for _, mel in group])
+                with trace_range(
+                    "vocoder",
+                    "hift_group",
+                    buffered_item_indices=(
+                        [r.index for r, _ in group] if ENABLED else ()
+                    ),
+                ):
+                    wavs = self._mel2wav_batch([mel for _, mel in group])
                 for (request, _), wav in zip(group, wavs, strict=True):
                     results[request.index] = (wav, request.sample_rate)
             self._flow.log_last_solve()
@@ -1088,10 +1133,22 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         device = next(native_flow.parameters()).device
         offset = max(int(token_offset), 0)
 
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=self._compute_dtype,
-            enabled=self._compute_dtype is not None,
+        with (
+            trace_range(
+                "flow",
+                "native",
+                batch_size=1,
+                tokens=token.shape[1],
+                prompt_tokens=prompt_token.shape[1],
+                offset=offset,
+                streaming=streaming,
+                finalize=finalize,
+            ),
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=self._compute_dtype,
+                enabled=self._compute_dtype is not None,
+            ),
         ):
             tts_mel, _ = native_flow.inference(
                 token=token.to(device, dtype=torch.int32),
@@ -1138,9 +1195,18 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         if hift_mel is not None:
             tts_mel = torch.cat([hift_mel.to(device=tts_mel.device), tts_mel], dim=2)
-        tts_speech, _ = self._hift.inference(speech_feat=tts_mel, finalize=finalize)
+        with trace_range(
+            "hift",
+            "inference",
+            batch_size=1,
+            frames=tts_mel.shape[-1],
+            finalize=finalize,
+            speech_offset=speech_offset,
+        ):
+            tts_speech, _ = self._hift.inference(speech_feat=tts_mel, finalize=finalize)
         held = max(int(speech_offset), 0)
-        delta = tts_speech[:, held:].detach().cpu()
+        with trace_range("d2h", "waveform", samples=tts_speech.shape[-1] - held):
+            delta = tts_speech[:, held:].detach().cpu()
         return delta, tts_mel.detach(), int(tts_speech.shape[1])
 
     def _make_flow_input(
@@ -1181,9 +1247,19 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         return self._flow_total_mel_frames(self._make_flow_input(state, codes))
 
     def _mel2wav(self, tts_mel: torch.Tensor) -> torch.Tensor:
-        with self._hift_autocast():
+        with (
+            trace_range(
+                "hift",
+                "inference",
+                batch_size=1,
+                frames=tts_mel.shape[-1],
+                finalize=True,
+            ),
+            self._hift_autocast(),
+        ):
             tts_speech, _ = self._hift.inference(speech_feat=tts_mel, finalize=True)
-        return tts_speech.detach().cpu()
+        with trace_range("d2h", "waveform", samples=tts_speech.shape[-1]):
+            return tts_speech.detach().cpu()
 
     def _hift_autocast(self) -> torch.autocast:
         return torch.autocast(
@@ -1209,14 +1285,25 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
                 ],
                 dim=0,
             )
-        with self._hift_autocast():
+        with (
+            trace_range(
+                "hift",
+                "inference",
+                batch_size=len(mels),
+                frames=longest,
+                lengths=lengths,
+                finalize=True,
+            ),
+            self._hift_autocast(),
+        ):
             wav, _ = self._hift.inference(speech_feat=padded, finalize=True)
         wav = wav.detach()
         samples_per_frame = self._mel_stride()
-        return [
-            wav[index : index + 1, : length * samples_per_frame].cpu()
-            for index, length in enumerate(lengths)
-        ]
+        with trace_range("d2h", "waveform_batch", batch_size=len(mels)):
+            return [
+                wav[index : index + 1, : length * samples_per_frame].cpu()
+                for index, length in enumerate(lengths)
+            ]
 
     def store_result(
         self,
