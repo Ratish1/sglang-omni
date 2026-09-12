@@ -1,6 +1,7 @@
 # 31. Runbook: the reference prefix prime (P1 of doc 30)
 
-Branch `perf/qwen3-tts-prefix-prime` at 651de81e3, two commits on upstream main d90d71c37.
+Branch `perf/qwen3-tts-prefix-prime` at 7ceaf8f2c, three commits on upstream main d90d71c37
+(runtime in 2287c6e26 and 651de81e3, test fixes in 7ceaf8f2c).
 One session, plain server command with no environment variable in front of it, physical
 GPU 0, GPUs 1 to 3 recorded before every boot, `nvidia-smi dmon -i 0 -s pucv -d 1` logging
 on every boot. Every pass is the full 1088 request corpus, warmup 1, no seed. Check the
@@ -9,7 +10,7 @@ decode log line gap on the first boot: about 0.6 s per 40 steps, or stop.
 ## Step 0, unit tests on the box
 
 ```bash
-git fetch origin perf/qwen3-tts-prefix-prime && git worktree add tmp/p1 651de81e3
+git fetch origin perf/qwen3-tts-prefix-prime && git worktree add tmp/p1 7ceaf8f2c
 cd tmp/p1 && python -m pytest tests/unit_test/qwen3_tts/test_pipeline.py -k "prefix or prime or stateful_codec or stream_output or bootstrap" -q
 python -m pytest tests/unit_test/pipeline/test_scheduler.py -k "enqueue_built_request or stream_output" -q
 python -m pytest tests/unit_test/qwen3_tts/test_incremental_codec.py -q
@@ -19,7 +20,7 @@ All must pass before a boot. Archive the output.
 
 ## Step 1, the pair on main (2 boots)
 
-A: upstream main d90d71c37 from a worktree. B: 651de81e3. Streaming c16, two passes each,
+A: upstream main d90d71c37 from a worktree. B: 7ceaf8f2c. Streaming c16, two passes each,
 event recorder in pass 2 (`enable_torch` false, stopped after 200 completions), the
 anatomy script on both event dirs. Read: first audio at zero requests ahead, code chunks
 received before first audio, preprocessing segment, first chunk mean and p99, req/s,
@@ -29,7 +30,7 @@ mean below control's.
 
 ## Step 2, the pair on early ids (2 boots)
 
-A: d90d71c37 plus `tasks/qwen3_tts_e4_investigation_20260912/early_ids.patch`. B: 651de81e3
+A: d90d71c37 plus `tasks/qwen3_tts_e4_investigation_20260912/early_ids.patch`. B: 7ceaf8f2c
 plus the same patch (it applies to model_runner.py only, which P1 does not touch). Same
 protocol and reads as step 1. This is the pair that decides #2123: the target is B's first
 chunk mean within 10 ms of step 1's main control at the same throughput as early ids.
