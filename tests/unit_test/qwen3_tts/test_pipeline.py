@@ -6730,6 +6730,7 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
             lambda payload: payload,
             lambda data: data,
             lambda request_id, data, output: [],
+            lambda request_id, data: [],
         ),
     )
 
