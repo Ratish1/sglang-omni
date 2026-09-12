@@ -24,8 +24,9 @@ P1 does what it was designed to do at the point it was aimed at, and loses overa
   control at early ids' throughput) fails by 25 ms with less throughput.
 
 P1 is parked on `perf/qwen3-tts-prefix-prime` at ac29b71b7 (runtime 2287c6e26 and
-651de81e3, test fixes 7ceaf8f2c and ac29b71b7). No PR. It is only worth re-measuring in a
-layout where the vocoder does not share the talker's interpreter (section 6).
+651de81e3, test fixes 7ceaf8f2c and ac29b71b7). No PR. Section 8 item 1 makes the
+bootstrap a graph replay, which is what the prime was trying to reach, so P1 is superseded
+by it rather than re-measured.
 
 ## 2. Provenance
 
@@ -134,84 +135,95 @@ of that waiting. Two prior data points say the layout, not the device, carries i
 - Doc 24 section 3: the two worker router layout with a separate vocoder process paid
   +13 percent TTFC for slice A against +22 to +70 percent in the shared process.
 
-E4c could not settle it because it ran three CUDA contexts on one GPU without MPS: the
-device time sliced between them, request build went to 15 ms on cross process payload
-import, inter chunk doubled and throughput halved. The runtime has native MPS for exactly
-this case (`--mps on`, docs/basic_usage/mps_dp.md: the daemon is created and verified by
-the launcher, a client that misses the pipe directory is refused rather than left to time
-slice) and E4c did not use it. Doc 29's first candidate, the siblings on a second GPU,
-was set aside in doc 30 as a deployment option; it is the cleanest measurement of what
-the lock costs and it comes first now.
+Those two layouts are not the fix. Separate processes on one GPU time slice their CUDA
+contexts (E4c, throughput halved) unless an MPS daemon runs, and a second GPU is a
+deployment choice. Neither can be the default launch, and the default launch is what has
+to be fastest. They are measurements of what the lock costs, nothing more, and they are not
+pursued. What can change in the default launch is the number of handoffs: one per eager
+torch call, on every thread. P1 moved eager work and removed none of it. The plan below
+removes it, path by path, largest first.
 
-## 7. The origin experiments, O1 and O2
+## 7. The origin in numbers: eager launches per request, per thread
 
-Same code on every arm, upstream main d90d71c37, no patches. One session, the protocol of
-doc 31 (plain command apart from `CUDA_VISIBLE_DEVICES`, GPUs 1 to 3 recorded before every
-boot, dmon on every boot, full corpus, warmup 1, no seed, two passes per arm, event
-recorder in pass 2 stopped after 200 completions, decode log gap check on the first boot).
-GPU 2 must be free of the CosyVoice server for O1 if GPU 1 is not available; O1 needs one
-idle GPU next to GPU 0.
+What is in hand. Streaming c16, the E5 GPU0 Nsight thread summaries (doc 27's session,
+forced torch backend; the sibling threads do not use the fused ops so their counts stand,
+the talker's do not), 20 s windows:
 
-A, one boot: the default single process layout, the command of doc 31.
+| thread | launches in the window | per unit of work |
+| --- | ---: | ---: |
+| initial vocoder worker | 198k, 231 bootstraps | about 860 per bootstrap |
+| reference encoder batcher | 137k | about 430 per request at 15.9 req/s |
+| preprocessing workers, 8 | 47k | about 150 per request |
+| follow up workers, 2 | 11k, 867 chunks | about 13 per chunk, 35 per request |
 
-O1, the siblings on a second GPU, one boot:
+Non streaming c16 census on the default backend (main, `trace_A_main.json`, 23.7 s):
+eager kernel launches per second on the talker's stream 7757 (the scheduler thread:
+sampling, prefill, and the non streaming vocoder decode which runs on the caller's
+stream), the encoder batcher's stream 3449, the preprocessing workers' stream 1777. At
+15.9 req/s that is about 490, 220 and 110 eager launches per request.
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1 /sgl-workspace/sglang-omni/.venv/bin/python -m sglang_omni.cli serve \
-  --model-path Qwen/Qwen3-TTS-12Hz-1.7B-Base --config examples/configs/qwen3_tts_1_7b.yaml \
-  --host 127.0.0.1 --port 32300 \
-  --preprocessing.process siblings --preprocessing.gpu 1 \
-  --vocoder.process siblings --vocoder.gpu 1
-```
+Doc 29's per thread lock waits on the default backend order the same way: the initial
+worker 20 to 48 ms per bootstrap, the preprocessing workers 20 to 32 ms per request, and
+the scheduler thread 5.3 to 8.4 ms per step waiting behind all of them.
 
-The talker keeps GPU 0 and its 0.85 static fraction; the siblings share one interpreter
-on GPU 1 with no fraction needed (one process group per GPU). The serve log's placement
-line must show two process groups, `pipeline` on GPU 0 and `siblings` on GPU 1.
+Validation task, step 0 of the next session: `nsys_threads.py` on the E5 default backend
+SQLite (session 10e0aa1dc, on the box) so the streaming launch counts per thread are on
+the default backend, with the scheduler's per step count split into decode steps and
+prefills. The order below is expected to hold; the numbers replace the table.
 
-O2, three processes on GPU 0 under MPS, one boot, E4c's layout plus the daemon:
+## 8. The plan: fewer launches in the default launch, ordered by handoffs removed
 
-```bash
-CUDA_VISIBLE_DEVICES=0 /sgl-workspace/sglang-omni/.venv/bin/python -m sglang_omni.cli serve \
-  --model-path Qwen/Qwen3-TTS-12Hz-1.7B-Base --config examples/configs/qwen3_tts_1_7b.yaml \
-  --host 127.0.0.1 --port 32300 --mps on \
-  --preprocessing.process preprocessing --preprocessing.gpu 0 --preprocessing.gpu_memory_fraction 0.05 \
-  --tts_engine.gpu_memory_fraction 0.72 --tts_engine.engine.mem_fraction_static 0.72 \
-  --vocoder.process vocoder --vocoder.gpu_memory_fraction 0.15
-```
+Every item is one slice on upstream main, one pair in the default layout on the plain
+command (doc 31 protocol), read by TTFC mean and p99, req/s, inter chunk, the anatomy
+script, and one Nsight window per arm through `nsys_threads.py`: launches per request and
+lock wait per thread. A slice passes only if the launches it targets are gone from the
+census and the sibling lock waits fell with them; that is the check that it reached the
+origin rather than a segment.
 
-`--mps on` rather than `auto` so an MPS incapable container fails the boot instead of
-time slicing silently. Before the boot: `which nvidia-cuda-mps-control`, and no
-`CUDA_MPS_PIPE_DIRECTORY` in the environment. The serve log must show the MPS client
-verification lines, and `nvidia-smi` during traffic must list the three processes under one
-MPS server. The engine's static fraction drops from 0.85 to 0.72; its KV pool stays above
-four times the c16 maximum demand (131072 tokens against 573267 at 0.85), so the change
-does not touch the benchmark. If MPS cannot start in the container, O2 is skipped and
-reported as such, not replaced by E4c's time sliced layout.
+1. **The vocoder bootstrap through captured graphs.** Today a reference prefixed
+   bootstrap is one eager decode of `ref_frames + initial_chunk_frames` frames, a width
+   the cold runner never captured (`incremental_codec_cuda_graph_cold_frames` resolves to
+   the initial chunk widths, streaming_vocoder.py:777-783), so `decode_slots` misses
+   (incremental_codec_cuda_graph.py:464) and `_launch_async` runs the eager decoder on a
+   gathered copy of the slot (streaming_vocoder.py:1764-1775): about 860 launches per
+   request, 11 ms of GPU time, 20 to 48 ms of lock waiting. The change: the initial
+   worker consumes that width in windows of captured widths against the same slot, each
+   window one graph replay (`decode_slots` writes the arena directly, so no gather and
+   scatter), the last window carrying the generated frames whose samples are emitted.
+   The stateful decoder is partition invariant (the P1 test at rtol 2e-5), so the audio
+   is the same up to graph replay numerics. The window widths are not a guess: a replay
+   time per width microbenchmark on the box (the `graph_replay_bench.py` pattern against
+   the incremental runner) picks the set whose total replay time for the corpus's
+   reference lengths stays at or under the eager 11 ms, and the cold runner captures
+   those widths at boot (capture memory is logged per key, 165 MB for the eight keys
+   today). Expected: the initial worker's launches per bootstrap from about 860 to the
+   number of windows times a few, the ahead 0 segment from 30 and 52 ms toward its GPU
+   time, and every other thread's lock wait down by the handoffs removed. This supersedes
+   P1 and doc 30's P1.
+2. **The scheduler thread's eager launches per step.** First the census of what they are
+   on the default backend (a kineto window of a few steps, ops by name on the scheduler
+   thread: layer 0 sampling, predictor input assembly, per row stream output building,
+   recorder work, prefill), then the reductions with the most launches first. Two are
+   already known: doc 30's P2 and P4 (one pass over the batch rows instead of per row
+   tensors, one stream message per step), and the Base prefill through the breakable
+   prefill graph. CustomVoice already uses that graph; Base keeps the eager prefill only
+   because its shapes were never measured (engine_builder.py:107-113). They are now:
+   from main A's serve log, single request prefills are 1 / 34 / 68 / 114 tokens at
+   p10 / p50 / p90 / max, batches up to 384, all inside the default ladder with the 1
+   token bucket. The prefill runs on the scheduler thread, so its launches are what every
+   sibling waits behind during the 22 to 28 ms it takes.
+3. **The reference encoder batcher and the preprocessing workers through graphs.** About
+   220 and 110 eager launches per request on the default backend census, on nine threads,
+   and the preprocessing segment is the largest in the first chunk chain (43 ms on main,
+   85 on early ids). Shapes vary with the reference length, so the same bucket and window
+   reasoning as item 1 applies, after items 1 and 2 show what remains.
 
-Reads, per arm, the updated `first_chunk_anatomy.py` on the pass 2 events plus the client
-summary: TTFC mean and p99, req/s, inter chunk, the prefill by overlap table, the first
-frame to first audio segment at ahead 0 and its mean, preprocessing p50, build end to
-queue enter, the cadence, dmon GR active mean during traffic. On O1 and O2 the engine's
-own events file no longer holds the sibling events; the anatomy script reads every jsonl
-in the event dir, so the box archives all three stage files per arm.
+After each item the census is re-read and the order re-checked. #2123 (the decode step
+overlap) is re-measured only once the handoff count is down, since its first chunk cost
+is the siblings' lock waits (doc 29); #2126 after it.
 
-What the reads decide:
+## 9. Archive per boot
 
-- O1 is the prize: the lock removed and the device not shared. Its cadence and req/s
-  against A say how much of the scheduler's 5 to 8 ms of waiting per step becomes step
-  time; its preprocessing and bootstrap segments against A say how much of the first
-  chunk was the lock.
-- O2 is the deployable form of the same thing on one GPU. If it matches O1 within the
-  session's noise, the default layout question goes to the team with both numbers. If it
-  falls short, the difference is the cost of MPS sharing on this workload, and O1's number
-  is still the target for the shared process work.
-- Only after that: #2123, #2126 and P1 re-measured on the winning layout, as stacked
-  pairs. Doc 24 and doc 25 already say the overlap's first chunk cost is the lock, so the
-  overlap is expected to read as a clean throughput win there; P1's prime no longer
-  contends with the prefill there. Doc 30's P2 to P4 stay behind these.
-
-## 8. Archive per boot
-
-Head, import path, the full server command, the placement line and (for O2) the MPS lines
-from serve.log, gpus before, dmon log, both passes' speed_results and client logs, every
-event file of pass 2, serve.log, and `nvidia-smi --query-compute-apps` during traffic.
+Head, import path, the full server command, gpus before, dmon log, both passes'
+speed_results and client logs, the event files of pass 2, serve.log, the Nsight SQLite
+export of the window and the `nsys_threads.py` JSON.
