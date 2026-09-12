@@ -1,0 +1,10 @@
+[
+  {"repo":"sglang","path":"python/sglang/srt/layers/attention/flashinfer_backend.py","sha256":"ac46fc8c976285e20c7217beeaa882cc5a673072a7ddadf6a8508fdba5b6f6f0","total_lines":2540,"read_ranges":[[1,2540]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/layers/attention/triton_backend.py","sha256":"16e2572d15597175e136a04eaee7000d08da0b4fbc3380f8badb8f8250646f09","total_lines":2255,"read_ranges":[[1,2255]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/layers/attention/base_attn_backend.py","sha256":"ff8a2b28549212dcb357e3636a2f78293eef5a6cdd3ab229fff0513ac60a89e0","total_lines":341,"read_ranges":[[1,341]],"status":"complete","role":"dependency"},
+  {"repo":"sglang","path":"python/sglang/srt/layers/radix_attention.py","sha256":"d372acd740bf13c2896077b05dd1dce546cc566fb92f33e3ac39c2ec3a266993","total_lines":657,"read_ranges":[[1,657]],"status":"complete","role":"dependency"},
+  {"repo":"sglang","path":"python/sglang/srt/models/qwen2.py","sha256":"41741eb780a3f75bc3ae4f43cc09d538b15752b1d5da34b5a96d8bca36970fdc","total_lines":769,"read_ranges":[[1,769]],"status":"complete","role":"dependency"},
+  {"repo":"sglang","path":"python/sglang/srt/layers/attention/attention_registry.py","sha256":"72f5fbab48a15174e24159fc574ee43248e70e53ad7cb3340670fcc16aecec33","total_lines":542,"read_ranges":[[1,542]],"status":"complete","role":"dispatch"},
+  {"repo":"sglang","path":"python/sglang/srt/model_executor/model_runner_components/attention_backend_setup.py","sha256":"bf01b845e22471e19941168dad276e8f429ca302e7cd59ec4c0463defc5bbda0","total_lines":257,"read_ranges":[[1,257]],"status":"complete","role":"dispatch"},
+  {"repo":"sglang-omni","path":"tasks/cosyvoice_utilization_20260912/RESEARCH_CONTRACT.md","sha256":"7219c1beb4f33a334c37cc9d931ff91f8aab00465052fe6cfd083239690f3449","total_lines":9,"read_ranges":[[1,9]],"status":"complete","role":"contract"}
+]

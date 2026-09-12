@@ -1,0 +1,82 @@
+{
+  "python": "3.14.2 (main, Dec  5 2025, 16:49:16) [Clang 17.0.0 (clang-1700.4.4.1)]",
+  "checks": {
+    "python_ast_files": 11,
+    "cli_help": [
+      {
+        "file": "tasks/cosyvoice_utilization_20260912/diagnostics/analyze_pipeline_nsys.py",
+        "returncode": 0
+      },
+      {
+        "file": "tasks/cosyvoice_utilization_20260912/diagnostics/collect_env.py",
+        "returncode": 0
+      },
+      {
+        "file": "tasks/cosyvoice_utilization_20260912/diagnostics/compare_ab.py",
+        "returncode": 0
+      },
+      {
+        "file": "tasks/cosyvoice_utilization_20260912/diagnostics/run_seedtts.py",
+        "returncode": 0
+      }
+    ],
+    "json_files": 25,
+    "markdown_relative_links": 83,
+    "git_diff_check": "passed",
+    "coverage": "288 complete files, 159173 lines; source hashes reverified against unchanged audited baselines",
+    "bash_syntax_blocks": 12,
+    "production_pre_commit": "all applicable hooks passed on commit 5ab17f8c9",
+    "diagnostic_scripts_pre_commit": "all applicable hooks passed on commit a1bcd79f7, including the runbook; no tests invoked",
+    "open_pr_metadata_root_spot_check": "gh pr view independently confirmed state/head/ref/base/updated/url for #1861, #1933, #1693 against the final recorded snapshot",
+    "open_pr_screen": {
+      "upstream_open": 408,
+      "origin_open": 0,
+      "changed_file_pagination_complete": true,
+      "retained_candidates": 22,
+      "immutable_owner_files": 16,
+      "concrete_table_identities_generated_from_api": 10
+    },
+    "research_whitespace": "authored plans, reports, evidence and root docs passed git diff --cached --check; supplied/external inputs preserved byte-for-byte"
+  },
+  "formatter": {
+    "name": "black",
+    "version": "25.1.0",
+    "scope": "four diagnostic scripts",
+    "environment": "isolated tool environment under /private/tmp/cosyvoice-format-cache"
+  },
+  "source_sha256": {
+    "sglang_omni/models/fun_cosyvoice3/model_runner.py": "c34b5775e7b396ac4c1513411586ca36e5048aac2ac946744d5550047247029b",
+    "sglang_omni/models/fun_cosyvoice3/request_builders.py": "c87a6a6b9f4b934f093d4a167ebcf5785f9084984d1a562ff32e48cdc86d520a",
+    "sglang_omni/models/fun_cosyvoice3/stages.py": "b235874ecce35dff2ce9f93109a3294aea14bcc7db49f807f17ebb80d00d7b9b",
+    "sglang_omni/models/fun_cosyvoice3/streaming_vocoder.py": "dfcbb3657c4f255e7e7d3b4482832deb4e861ddb0d5bc410179cb7e2fcbb7a4a",
+    "sglang_omni/profiler/event_recorder.py": "1d31903b311e06910e80f8a0275375112253440e0e0f752cf6eeb271ff2c3aa8",
+    "sglang_omni/serve/openai_api.py": "20fecb02654aa18e918728279ac317f09d17c6b758e00c7412d95e2d2c2664d3",
+    "sglang_omni/profiler/pipeline_nvtx.py": "22ec06484150af5723871199e3346b2ff69ca51b5703b47eae046a0757a6c6e1",
+    "tasks/cosyvoice_utilization_20260912/diagnostics/analyze_pipeline_nsys.py": "eedc9d534f4b1545973a6c8a92b8fce857a12ebb70b1636b2258c846af54e26c",
+    "tasks/cosyvoice_utilization_20260912/diagnostics/collect_env.py": "ac0a9b9a7b36ca89c796fc453e9c96a2ef73535853be7d30ba2d990717f75455",
+    "tasks/cosyvoice_utilization_20260912/diagnostics/compare_ab.py": "d6a70afca9e28b81b23b6eb2ee423880f91148d4ae29d2e8887dc69a6923db11",
+    "tasks/cosyvoice_utilization_20260912/diagnostics/run_seedtts.py": "b047686465ea722ec1b603ad7bbae630def8b0c8249ad2c97e96e38ab2dbcb66"
+  },
+  "not_run": [
+    "pytest",
+    "unit tests",
+    "synthetic profiler tests",
+    "model imports or generation",
+    "benchmarks",
+    "GPU execution",
+    "NSYS/NCU capture",
+    "quality evaluation"
+  ],
+  "remote_gates_pending": [
+    "installed source/model/runtime identity",
+    "NSYS schema and graph-node correlation",
+    "NVTX on/off and collection overhead",
+    "exact output contract with annotation flag",
+    "full SeedTTS A/B quality and latency",
+    "reproduce 3% and demonstrate 30% under same metric"
+  ],
+  "diagnostic_source_commit": "5ab17f8c9bc6457a7d56f30c9e03c4679d17c58d",
+  "delivery": "Git-tracked source and tasks directory; no archive or separate patch. Plain returned results under artifacts/cosyvoice/, without WAVs after remote quality scoring.",
+  "research_commit_hook_policy": "Immutable supplied inputs and external source snapshots are committed without rewriting formatter hooks to preserve audited bytes. Authored executable code passes the repository hooks separately. Research metadata, links and source hashes are validated explicitly.",
+  "diagnostic_tools_commit": "a1bcd79f70216845b24125cd7c451c88685a64c1"
+}

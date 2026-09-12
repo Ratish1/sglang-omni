@@ -1,0 +1,14 @@
+[
+  {"repo":"omni","path":"tasks/cosyvoice_utilization_20260912/RESEARCH_CONTRACT.md","sha256":"7219c1beb4f33a334c37cc9d931ff91f8aab00465052fe6cfd083239690f3449","total_lines":9,"read_ranges":[[1,9]],"status":"complete","role":"contract"},
+  {"repo":"sglang","path":"python/sglang/srt/layers/attention/attention_registry.py","sha256":"72f5fbab48a15174e24159fc574ee43248e70e53ad7cb3340670fcc16aecec33","total_lines":542,"read_ranges":[[1,542]],"status":"complete","role":"dependency"},
+  {"repo":"sglang","path":"python/sglang/srt/layers/attention/flashattention_backend.py","sha256":"bd6afb54f832d056f37ff018f8140ce1f756293fd90b73e879fa686f82ea513a","total_lines":3709,"read_ranges":[[1,3709]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/kernels/ops/attention/flash_attention.py","sha256":"9f03405f95d100b1989c7041b4dd27298374bb8b8fe152f16949dd0e73ad22bc","total_lines":327,"read_ranges":[[1,327]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/kernels/ops/attention/flash_attention_v3.py","sha256":"8c6e0d642b44d8e233f8987bf3370a6a3310d52cfcc12d4ad45d66527f81e86d","total_lines":280,"read_ranges":[[1,280]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/mem_cache/kv_index_translator.py","sha256":"c50093a55ad72f708a4929bf0ebd77c15472f1426fe6a9447040523bd9be8fd0","total_lines":376,"read_ranges":[[1,376]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/kernels/ops/kvcache/kv_read_table.py","sha256":"2964338801b38550d355a452bd05ff0efcf0dddcefc487c1690a1b700325f5cf","total_lines":140,"read_ranges":[[1,140]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/kernels/ops/attention/metadata.py","sha256":"d7b1d0fbcebfe360dded5a99b33cbe672606943ce5aa6c3207dc10d48ac9729b","total_lines":757,"read_ranges":[[1,757]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/environ.py","sha256":"a39ae8475f2bff6e5cea99f0675bcb6d6647c07540b4b5be65fa7b0b916327cd","total_lines":1839,"read_ranges":[[1,1839]],"status":"complete","role":"dependency"},
+  {"repo":"sglang","path":"python/sglang/kernels/jit/utils/common.py","sha256":"cdaab0ec52cd48eddf527e03e3c109745f2bf882751802407bc51b7e7ad4c22b","total_lines":88,"read_ranges":[[1,88]],"status":"complete","role":"dependency"},
+  {"repo":"sglang","path":"python/sglang/kernels/jit/utils/__init__.py","sha256":"143200928e33d8630ca5b9a38cac8e4d0f37bd4657c0d6ca9bc4bd5581d6fc7e","total_lines":33,"read_ranges":[[1,33]],"status":"complete","role":"dependency"},
+  {"repo":"sglang","path":"python/sglang/kernels/kernel_api_logging.py","sha256":"d3cfbaa939422f47b84b96a8878a98b178a7182a79656440c08938804517c4f7","total_lines":517,"read_ranges":[[1,517]],"status":"complete","role":"dependency"}
+]

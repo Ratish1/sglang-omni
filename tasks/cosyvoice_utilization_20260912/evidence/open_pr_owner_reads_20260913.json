@@ -1,0 +1,312 @@
+{
+  "schema_version": 1,
+  "verified_utc": "2026-09-12T19:03:56Z",
+  "provenance_note": "Each complete owner file was fetched through the GitHub Contents API using the immutable PR head OID, read to EOF, and hashed locally. The first ten entries were also compared byte-for-byte with the earlier branch-ref fetch used during analysis; hashes matched. Relevant PR diffs were read before this verification, and live REST metadata at verification returned the same head OIDs and updated_at values preserved in open_prs_20260913.json.",
+  "initial_table_correction": "The nonfinal head SHAs shown in the first draft report were transcription errors: they were not copied from a GitHub response. No live-head movement was observed. The final report and both evidence files use the GraphQL-preserved OIDs, independently reconfirmed with REST.",
+  "owner_reads": [
+    {
+      "pr": 1861,
+      "repository": "charliechenye/sglang-omni",
+      "head_oid": "0a09589ef36a5bdff701da2019c24ecfd5034945",
+      "path": "sglang_omni/models/fun_cosyvoice3/stages.py",
+      "sha256": "3d5e6571a59a8f192b6a3cf112a5bd46786f4ab32d41d676dab9d61ab69a9987",
+      "total_lines": 1641,
+      "read_ranges": [
+        [
+          1,
+          1641
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": true
+    },
+    {
+      "pr": 1933,
+      "repository": "JiaxinD/sglang-omni",
+      "head_oid": "03c0efd9482e6771e815dcbd0b160f4ffbe18eae",
+      "path": "sglang_omni/models/fun_cosyvoice3/config.py",
+      "sha256": "3d107d0de19c8b3cddd7c9066c856bf7468a6f005ea6f1e125695cf97959101d",
+      "total_lines": 146,
+      "read_ranges": [
+        [
+          1,
+          146
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": true
+    },
+    {
+      "pr": 1933,
+      "repository": "JiaxinD/sglang-omni",
+      "head_oid": "03c0efd9482e6771e815dcbd0b160f4ffbe18eae",
+      "path": "sglang_omni/models/fun_cosyvoice3/engine_builder.py",
+      "sha256": "7d6f55cf61d2a5a262b25f8e133af26e056bf6e0d71e817dc54b939c66442b89",
+      "total_lines": 154,
+      "read_ranges": [
+        [
+          1,
+          154
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": true
+    },
+    {
+      "pr": 1933,
+      "repository": "JiaxinD/sglang-omni",
+      "head_oid": "03c0efd9482e6771e815dcbd0b160f4ffbe18eae",
+      "path": "sglang_omni/models/fun_cosyvoice3/stages.py",
+      "sha256": "1338a538b926a7fdeb3ea38fc0e54617c2aafce88bedcdfea4fa8a7cb75aece9",
+      "total_lines": 1313,
+      "read_ranges": [
+        [
+          1,
+          1313
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": true
+    },
+    {
+      "pr": 1693,
+      "repository": "Fyrgo8/sglang-omni",
+      "head_oid": "5088f881484e8f6eadb81bf14164c1b0dcf3e485",
+      "path": "sglang_omni/models/fun_cosyvoice3/request_builders.py",
+      "sha256": "866f53e8ec8e939a9b1a8d0ec2641cb3dd711af8e81fbc6d41e60993ea91bb64",
+      "total_lines": 1011,
+      "read_ranges": [
+        [
+          1,
+          1011
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": true
+    },
+    {
+      "pr": 1693,
+      "repository": "Fyrgo8/sglang-omni",
+      "head_oid": "5088f881484e8f6eadb81bf14164c1b0dcf3e485",
+      "path": "sglang_omni/models/fun_cosyvoice3/stages.py",
+      "sha256": "17c8a7af2bf7476dcfb9eebc548083733cd7ba090dc61cddbb08a1ad159f0019",
+      "total_lines": 237,
+      "read_ranges": [
+        [
+          1,
+          237
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": true
+    },
+    {
+      "pr": 1693,
+      "repository": "Fyrgo8/sglang-omni",
+      "head_oid": "5088f881484e8f6eadb81bf14164c1b0dcf3e485",
+      "path": "sglang_omni/models/fun_cosyvoice3/utils.py",
+      "sha256": "ca6253e7c0b90aa72899b6eae2d014e12208c300875a1bbfa9c1e0bcb4f3a076",
+      "total_lines": 524,
+      "read_ranges": [
+        [
+          1,
+          524
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": true
+    },
+    {
+      "pr": 1693,
+      "repository": "Fyrgo8/sglang-omni",
+      "head_oid": "5088f881484e8f6eadb81bf14164c1b0dcf3e485",
+      "path": "sglang_omni/scheduling/simple_scheduler.py",
+      "sha256": "057b7c5d50153965a82507f9ea539123887ba0f5a88f43151542e8244d8ca67a",
+      "total_lines": 331,
+      "read_ranges": [
+        [
+          1,
+          331
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": true
+    },
+    {
+      "pr": 2110,
+      "repository": "sgl-project/sglang-omni",
+      "head_oid": "ec2c8bc22614cd79082626c80bc76dd53ed7fe0d",
+      "path": "sglang_omni/models/fun_cosyvoice3/stages.py",
+      "sha256": "4771ceeb4ab014a4b73da701c64d5065f8943a7c05e6f31eadeddec859e76e0a",
+      "total_lines": 1312,
+      "read_ranges": [
+        [
+          1,
+          1312
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": true
+    },
+    {
+      "pr": 2110,
+      "repository": "sgl-project/sglang-omni",
+      "head_oid": "ec2c8bc22614cd79082626c80bc76dd53ed7fe0d",
+      "path": "sglang_omni/models/fun_cosyvoice3/streaming_vocoder.py",
+      "sha256": "5004a6e1862525493d6250a92471cbadb4526a363546fff5478bed07edaaca48",
+      "total_lines": 876,
+      "read_ranges": [
+        [
+          1,
+          876
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": true
+    },
+    {
+      "pr": 2086,
+      "repository": "Jshipper-art/sglang-omni",
+      "head_oid": "cd486d29d76832052048ca4c77ea268a91f6c137",
+      "path": "sglang_omni/models/fun_cosyvoice3/streaming_vocoder.py",
+      "sha256": "c5e5127ad2877a58f973a53f65373305ba67bed1e279bf9fa446bb090ac6509b",
+      "total_lines": 870,
+      "read_ranges": [
+        [
+          1,
+          870
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": null
+    },
+    {
+      "pr": 2086,
+      "repository": "Jshipper-art/sglang-omni",
+      "head_oid": "cd486d29d76832052048ca4c77ea268a91f6c137",
+      "path": "sglang_omni/scheduling/streaming_simple_scheduler.py",
+      "sha256": "7e42c0b0e0c98c487ba3dfe7e10316c94a7a0d80429d231b07d9470caff2e736",
+      "total_lines": 561,
+      "read_ranges": [
+        [
+          1,
+          561
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": null
+    },
+    {
+      "pr": 1669,
+      "repository": "Cerdore/sglang-omni",
+      "head_oid": "617fb9adab6562b9836a576841cf0450f509962f",
+      "path": "sglang_omni/models/fun_cosyvoice3/engine_builder.py",
+      "sha256": "9a3b94a7e8b3690fc76bbeda9fccc59a26196279b2887ead83977d795b2fda9a",
+      "total_lines": 112,
+      "read_ranges": [
+        [
+          1,
+          112
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": null
+    },
+    {
+      "pr": 1995,
+      "repository": "Anai-Guo/sglang-omni",
+      "head_oid": "863a9d191dac933d948e17de476df35560430491",
+      "path": "sglang_omni/profiler/torch_profiler.py",
+      "sha256": "21e0588b10a18b78f9ec56eb0c2a5301e976a0e22eee466dfb04539446924927",
+      "total_lines": 200,
+      "read_ranges": [
+        [
+          1,
+          200
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": null
+    },
+    {
+      "pr": 1216,
+      "repository": "dyyfk/sglang-omni",
+      "head_oid": "a5b279d71c0fbbdf8dfb3e512fef8f818af4ee74",
+      "path": "sglang_omni/profiler/torch_profiler.py",
+      "sha256": "21e0588b10a18b78f9ec56eb0c2a5301e976a0e22eee466dfb04539446924927",
+      "total_lines": 200,
+      "read_ranges": [
+        [
+          1,
+          200
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": null
+    },
+    {
+      "pr": 1304,
+      "repository": "estellaliu233/sglang-omni",
+      "head_oid": "0860241a18e856eeb0454bf6cbbd410496937ae1",
+      "path": "sglang_omni/profiler/torch_profiler.py",
+      "sha256": "ff26614f359e093a888fc2b3b8523133175a9bdd3e23bcdabd69082a3b5063aa",
+      "total_lines": 204,
+      "read_ranges": [
+        [
+          1,
+          204
+        ]
+      ],
+      "status": "complete",
+      "fetch_ref_kind": "immutable_commit_oid",
+      "earlier_mutable_ref_bytes_matched": null
+    }
+  ],
+  "bounded_shared_diff_reads": [
+    {
+      "pr": 1304,
+      "head_oid": "0860241a18e856eeb0454bf6cbbd410496937ae1",
+      "paths": [
+        "sglang_omni/pipeline/stage/runtime.py",
+        "sglang_omni/scheduling/omni_scheduler.py"
+      ],
+      "status": "relevant_diff_complete_owner_file_not_reread",
+      "reason": "large shared owners; exact profiler owner file was read completely"
+    },
+    {
+      "pr": 1106,
+      "head_oid": "6d66b211ebc1260598c62a0b00f9567350a6d75c",
+      "paths": [
+        "sglang_omni/scheduling/omni_scheduler.py"
+      ],
+      "status": "relevant_diff_complete_owner_file_not_reread",
+      "reason": "complementary shared diagnostic candidate"
+    },
+    {
+      "pr": 1247,
+      "head_oid": "0e75e63e4eba0aefd4a8070235a8112eb2b0289a",
+      "paths": [
+        "sglang_omni/scheduling/engine_factory.py",
+        "sglang_omni/scheduling/omni_scheduler.py"
+      ],
+      "status": "title_file_body_screen",
+      "reason": "complementary metrics candidate without direct D0 owner overlap"
+    }
+  ],
+  "mutable_comparison_note": "true means bytes matched an earlier mutable-ref copy; null means no earlier copy existed and no such comparison was performed. All entries were fetched and read by immutable head OID."
+}

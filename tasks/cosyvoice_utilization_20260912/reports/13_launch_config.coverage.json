@@ -1,0 +1,21 @@
+[
+  {"repo":"sglang-omni","path":"sglang_omni/cli/__init__.py","sha256":"12187337be08e0f21bcc24596b62e45a06f828e2b4dbe0a1326ed3069ab56c63","total_lines":16,"read_ranges":[[1,16]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/cli/__main__.py","sha256":"48cf6d11cf9f896edc0c74ca411c202a86dee457e28c72d888059f59a20cff38","total_lines":4,"read_ranges":[[1,4]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/cli/serve.py","sha256":"bea6409cb31934ce72bf95d96cca1ab7b4622cfb154b8f1f6e3e1b9d16ebf06d","total_lines":434,"read_ranges":[[1,434]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/cli/config.py","sha256":"ad046eb9a940690f9e63b18a3dc39119e765823ff946ac611e288805ff2d378b","total_lines":344,"read_ranges":[[1,344]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/serve/launcher.py","sha256":"48ff1b80cac5aca8a21627f4a83640d203ba49540d93f9d3aeeab4e9093503af","total_lines":560,"read_ranges":[[1,560]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/config/manager.py","sha256":"fed1146f7e1aadc00c28ba78e39eca8d1ac90b4ae2d4e36206919714cd2b8971","total_lines":197,"read_ranges":[[1,197]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/config/resolver.py","sha256":"b32e90b2c1754d040d43373fee0c585a8b513e0808a57ec0586aedc15c2731c6","total_lines":197,"read_ranges":[[1,197]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/config/sources.py","sha256":"92b352dca8d5ec7a38a327df98e259d48e9ee030301b854f2df99b128204ab20","total_lines":497,"read_ranges":[[1,497]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/config/compat.py","sha256":"fcda2b6461eab724bd64283e4d0b754a45072ade96c5c8776dd04b6052026803","total_lines":66,"read_ranges":[[1,66]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/config/path.py","sha256":"8547451e7202ee85a93c7ebc11c3bbcab03fc4426b0b8fa0e77d56f67c2bd883","total_lines":869,"read_ranges":[[1,869]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/config/patch.py","sha256":"19ea94fea0506b7d870134c59ea90981928435b4bcd2c258face6a68eeb7f887","total_lines":269,"read_ranges":[[1,269]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/config/provenance.py","sha256":"43d047e36461aa39f57d1340bcee95b6ce366856d68fcdb2575d3864c7f9bd94","total_lines":146,"read_ranges":[[1,146]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/config/__init__.py","sha256":"4c6f47359c0ba4284016695eb217e42c40b14621bf26c3454ac45d9de2fd108f","total_lines":68,"read_ranges":[[1,68]],"status":"complete","role":"owner"},
+  {"repo":"sglang-omni","path":"sglang_omni/models/fun_cosyvoice3/config.py","sha256":"6afb3d4e22c10124817684dc69a1cd8e473f0eb73d3a8bbb9160078322e90b86","total_lines":109,"read_ranges":[[1,109]],"status":"complete","role":"dependency"},
+  {"repo":"sglang-omni","path":"docs/cookbook/fun_cosyvoice3.md","sha256":"5c0bdde0a9e6374c215f384def46d524f1f8c7ef026bd9d0682564b9b8e6f314","total_lines":465,"read_ranges":[[1,465]],"status":"complete","role":"documentation"},
+  {"repo":"sglang-omni","path":"sglang_omni/utils/device.py","sha256":"38bec77a39f3f3e832b445fc0dfc05fc8ab78cf39ff283376c081d89d7d53793","total_lines":74,"read_ranges":[[1,74]],"status":"complete","role":"dependency"},
+  {"repo":"sglang-omni","path":"sglang_omni/platforms/cuda.py","sha256":"47b4cf8d9f4b4c42b1314d7d5a960ce51bd8cbe2336c4366cc60f1afb5ffb5d4","total_lines":215,"read_ranges":[[1,215]],"status":"complete","role":"dependency"},
+  {"repo":"sglang-omni","path":"tasks/cosyvoice_utilization_20260912/inputs/SGLang_Omni_CosyVoice_Utilization_Playbook.md","sha256":"06ebf41d104365c1b47b71f9700050903fb1e22662171bebd3b838289443f118","total_lines":570,"read_ranges":[[80,200],[420,445]],"status":"partial","role":"documentation"},
+  {"repo":"sglang-omni","path":"tasks/cosyvoice_utilization_20260912/RESEARCH_CONTRACT.md","sha256":"7219c1beb4f33a334c37cc9d931ff91f8aab00465052fe6cfd083239690f3449","total_lines":9,"read_ranges":[[1,9]],"status":"complete","role":"contract"}
+]

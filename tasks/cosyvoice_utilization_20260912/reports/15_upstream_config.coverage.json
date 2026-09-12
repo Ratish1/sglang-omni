@@ -1,0 +1,18 @@
+[
+  {"repo":"sglang","path":"python/sglang/srt/server_args.py","sha256":"204fe57ba81acc25b7badcabf3b4b741021767c91f1d64e0df949cb175464b7c","total_lines":4470,"read_ranges":[[1,4470]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/arg_groups/pipeline.py","sha256":"4c46d8a8966914e361ed9e5d18956025c1ffe64de928d25b3a6111ac3a0ee8c8","total_lines":370,"read_ranges":[[1,370]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/arg_groups/overrides.py","sha256":"af4086d5c3bbfc8789d82b196240226785c104809c48cb1f9a24f6962cafe4ac","total_lines":1900,"read_ranges":[[1,1900]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/arg_groups/model_override_base.py","sha256":"0d849673c1f7c05797c793381e4fe5d295c2d6833d86f45b32f7bfc817772010","total_lines":376,"read_ranges":[[1,376]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/arg_groups/attention_hook.py","sha256":"6f070ec56e38eefc5d8127741b3a422f334567064f1bc1e03e6cacab55e3cdbb","total_lines":634,"read_ranges":[[1,634]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/arg_groups/cuda_graph_hook.py","sha256":"a234ccf4f8f23328a18ed72ea4c7313286e6b205921d8bcea128e6fb0372defa","total_lines":588,"read_ranges":[[1,588]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/arg_groups/memory_hook.py","sha256":"91086cb29f78d52ed7a8e6cc3367adbaea62ca20619392e5e131bf7a2214085d","total_lines":389,"read_ranges":[[1,389]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/arg_groups/kv_cache_hook.py","sha256":"7660d228272197e2418deb503d14227f2337056fa4a38f3fc242d0f82b00a90b","total_lines":468,"read_ranges":[[1,468]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/arg_groups/platform_hook.py","sha256":"042067ed2c60036cc87ec0630f7ccd31b4b620c4ac38ee929ef276b2cb2dd2fc","total_lines":158,"read_ranges":[[1,158]],"status":"complete","role":"dependency"},
+  {"repo":"sglang","path":"python/sglang/srt/model_executor/cuda_graph_config.py","sha256":"9f9250e3c4f9a36e6bd95aea9b57e76068b780ef38a6317c3b6240c0fcd3916d","total_lines":282,"read_ranges":[[1,282]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/platforms/cuda.py","sha256":"fa43e9386319d9f410cc9a9eae4af804df949eaa1d6bcde98b184f7912e32845","total_lines":80,"read_ranges":[[1,80]],"status":"complete","role":"dependency"},
+  {"repo":"sglang","path":"python/sglang/srt/platforms/interface.py","sha256":"9612ea0d8a40bddc7b4f36c6965352b5d76e051638b07f2551a4f703f8681a33","total_lines":142,"read_ranges":[[1,142]],"status":"complete","role":"dependency"},
+  {"repo":"sglang","path":"python/sglang/srt/platforms/device_mixin.py","sha256":"1956853a6cb6ff390d525d6b4e13141d7fb04360f1257ba858744fb911b64238","total_lines":267,"read_ranges":[[1,267]],"status":"complete","role":"dependency"},
+  {"repo":"sglang","path":"python/sglang/srt/mem_cache/kv_cache_dtype.py","sha256":"c104b125ff723c584bfdcd368a2129a9980e10381de0470c22522d4a0ae55f1c","total_lines":101,"read_ranges":[[1,101]],"status":"complete","role":"owner"},
+  {"repo":"sglang","path":"python/sglang/srt/utils/common.py","sha256":"86ba460333a7f80b0adf648d29fe2e7cda4d6c3886ebc55acb9bf6b0b2fa5e87","total_lines":4755,"read_ranges":[[1,4755]],"status":"complete","role":"dependency"},
+  {"repo":"sglang-omni","path":"tasks/cosyvoice_utilization_20260912/RESEARCH_CONTRACT.md","sha256":"7219c1beb4f33a334c37cc9d931ff91f8aab00465052fe6cfd083239690f3449","total_lines":9,"read_ranges":[[1,9]],"status":"complete","role":"contract"}
+]

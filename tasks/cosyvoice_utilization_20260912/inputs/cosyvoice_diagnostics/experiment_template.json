@@ -1,0 +1,75 @@
+{
+  "experiment_id": "replace_with_unique_id",
+  "hypothesis": "State one falsifiable bottleneck hypothesis",
+  "treatment": "Exactly one changed dimension for the first comparison",
+  "baseline": {
+    "sglang_omni_sha": null,
+    "sglang_sha": null,
+    "checkpoint_revision": null,
+    "gpu_uuid": null,
+    "gpu_model": null,
+    "effective_server_config_file": null,
+    "environment_json": null,
+    "other_gpu_processes": [],
+    "cpu_quota_and_affinity": null
+  },
+  "workload": {
+    "concurrency": 16,
+    "arrival_model": "closed_loop_for_screening; separate_rate_driven_qualification",
+    "request_count": null,
+    "input_dataset_and_order_hash": null,
+    "reference_mix": "record_repeated_or_unique_content_and_cache_hit_rate",
+    "streaming": true,
+    "generation_parameters": {},
+    "warmup_policy": null,
+    "measurement_start_and_end": null,
+    "first_audio_definition": "first_playable_audio_not_header",
+    "audio_quality_gate": null
+  },
+  "acceptance_policy": {
+    "maximum_p95_ttfa_ms": null,
+    "maximum_p99_completion_ms": null,
+    "maximum_stream_stall_rate": null,
+    "maximum_error_rate": null,
+    "quality_non_regression_criteria": null,
+    "minimum_goodput_gain_above_AA_noise": null,
+    "memory_and_queue_bounds": null
+  },
+  "measurements": {
+    "successful_requests": null,
+    "audio_seconds": null,
+    "measurement_wall_seconds": null,
+    "audio_seconds_per_second": null,
+    "slo_qualified_audio_seconds_per_second": null,
+    "p50_p95_p99_ttfa_ms": null,
+    "p50_p95_p99_completion_ms": null,
+    "actual_ar_batch_distribution": null,
+    "flow_eligible_count_distribution": null,
+    "actual_flow_cfg_tensor_shapes": null,
+    "actual_hift_batch_distribution": null,
+    "padding_and_repeated_context_work": null,
+    "compiler_or_graph_fallback_counts": null,
+    "trt_enqueue_shapes_and_fallback_counts": null,
+    "counter_name_unit_window_and_normalization": null,
+    "sm_active": null,
+    "captured_kernel_union_fraction": null,
+    "cpu_throttling_delta": null,
+    "peak_memory_and_queue_depth": null
+  },
+  "evidence_paths": {
+    "raw_requests": null,
+    "benchmark_console": null,
+    "profiler_off_results": null,
+    "nsys_report": null,
+    "selected_trace_window": null,
+    "device_counters": null,
+    "quality_results": null
+  },
+  "conclusion": {
+    "hypothesis_supported": null,
+    "observed_effect_vs_noise": null,
+    "accept_or_reject": null,
+    "new_dominant_bottleneck": null,
+    "remaining_uncertainty": null
+  }
+}

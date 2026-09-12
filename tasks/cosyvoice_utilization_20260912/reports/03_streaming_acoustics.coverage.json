@@ -1,0 +1,306 @@
+[
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/models/fun_cosyvoice3/streaming.py",
+    "sha256": "823b9c71ebd9316eca4a864722b64ff548d7d7ebfd988a66bf85c8f27fe03897",
+    "total_lines": 211,
+    "read_ranges": [
+      [
+        1,
+        211
+      ]
+    ],
+    "status": "complete",
+    "role": "owner"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/models/fun_cosyvoice3/streaming_vocoder.py",
+    "sha256": "242178ce2e4b28338e78b2408eb357ccf73bfced413290b8a5fea8085bade183",
+    "total_lines": 859,
+    "read_ranges": [
+      [
+        1,
+        859
+      ]
+    ],
+    "status": "complete",
+    "role": "owner"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/models/fun_cosyvoice3/model_runner.py",
+    "sha256": "a236fc34165f0d988c943632c15839525b6a0685abdbf630ff6e26660682f6a7",
+    "total_lines": 233,
+    "read_ranges": [
+      [
+        1,
+        233
+      ]
+    ],
+    "status": "complete",
+    "role": "owner"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/scheduling/streaming_vocoder.py",
+    "sha256": "1a644efd3be98025c5c2643da23b3eb97ee417a0c9da6921207e0c053b73a9d5",
+    "total_lines": 513,
+    "read_ranges": [
+      [
+        1,
+        513
+      ]
+    ],
+    "status": "complete",
+    "role": "owner"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/scheduling/streaming_simple_scheduler.py",
+    "sha256": "a01a1b271602d4c337ec6880ff2d3c5f3da6cb24e93cbac9d30eefec66b72e4f",
+    "total_lines": 551,
+    "read_ranges": [
+      [
+        1,
+        551
+      ]
+    ],
+    "status": "complete",
+    "role": "owner"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/scheduling/vocoder_base.py",
+    "sha256": "11ecde93d29ddf25b736121d1d4350258f8524d4a45eba75856613d0cc7acbe5",
+    "total_lines": 66,
+    "read_ranges": [
+      [
+        1,
+        66
+      ]
+    ],
+    "status": "complete",
+    "role": "owner"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/scheduling/messages.py",
+    "sha256": "7af785b0d168cc135020e54d31ec3993159472382efa00128f9d4165571f2d01",
+    "total_lines": 23,
+    "read_ranges": [
+      [
+        1,
+        23
+      ]
+    ],
+    "status": "complete",
+    "role": "owner"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/scheduling/types.py",
+    "sha256": "e0908ae602eec7426a3d4f1e21b856bf54e01ba2f797e7a202ba0d39187788e5",
+    "total_lines": 122,
+    "read_ranges": [
+      [
+        1,
+        122
+      ]
+    ],
+    "status": "complete",
+    "role": "owner"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/models/fun_cosyvoice3/request_builders.py",
+    "sha256": "2cdc46d8f7cf022081d5e0b7f53963ea72e29fa1632498356b14d111cbe1fe6f",
+    "total_lines": 860,
+    "read_ranges": [
+      [
+        1,
+        860
+      ]
+    ],
+    "status": "complete",
+    "role": "dependency"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/models/fun_cosyvoice3/payload_types.py",
+    "sha256": "31b0e2ae558208ea4fa42cdd18de665a76dbb7eaf72bc69252cc776a502e2b9d",
+    "total_lines": 31,
+    "read_ranges": [
+      [
+        1,
+        31
+      ]
+    ],
+    "status": "complete",
+    "role": "dependency"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/scheduling/pipeline_state.py",
+    "sha256": "708f28e22d46426dab42c1551798872de788847df9d802ee7e5da0d356b7be05",
+    "total_lines": 304,
+    "read_ranges": [
+      [
+        1,
+        304
+      ]
+    ],
+    "status": "complete",
+    "role": "dependency"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/pipeline/stage/stream_queue.py",
+    "sha256": "eeca21effb9525c64ac41083f88501062ba873960edf498b9a3518cd2a234548",
+    "total_lines": 128,
+    "read_ranges": [
+      [
+        1,
+        128
+      ]
+    ],
+    "status": "complete",
+    "role": "dependency"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/utils/audio_payload.py",
+    "sha256": "d3108c9a317f46dd1997889a3389e4117341c1427e5f4656aa97241f483eba82",
+    "total_lines": 54,
+    "read_ranges": [
+      [
+        1,
+        54
+      ]
+    ],
+    "status": "complete",
+    "role": "dependency"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/proto/__init__.py",
+    "sha256": "75b3a88a0747bf660ccc1425e2bd94299bbe222030d6149d532c4128aeff7930",
+    "total_lines": 80,
+    "read_ranges": [
+      [
+        1,
+        80
+      ]
+    ],
+    "status": "complete",
+    "role": "dependency"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/proto/request.py",
+    "sha256": "a253638cad5d552859ef02299f717bec226606e0aea57c62b47cd6e8d8d18f51",
+    "total_lines": 95,
+    "read_ranges": [
+      [
+        1,
+        95
+      ]
+    ],
+    "status": "complete",
+    "role": "dependency"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/models/fun_cosyvoice3/config.py",
+    "sha256": "6afb3d4e22c10124817684dc69a1cd8e473f0eb73d3a8bbb9160078322e90b86",
+    "total_lines": 109,
+    "read_ranges": [
+      [
+        1,
+        109
+      ]
+    ],
+    "status": "complete",
+    "role": "contract"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/models/fun_cosyvoice3/stages.py",
+    "sha256": "adea1c4651c7e04effd9533a9a48f759f3ca5894f7c10f23e2e8d46332341248",
+    "total_lines": 1311,
+    "read_ranges": [
+      [
+        55,
+        542
+      ],
+      [
+        920,
+        1311
+      ]
+    ],
+    "status": "partial",
+    "role": "contract"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/models/fun_cosyvoice3/engine_builder.py",
+    "sha256": "c0168e2d97f41444f60bccec2aa0dd4954bfbefc10220bc9ddb4fcabaee48644",
+    "total_lines": 143,
+    "read_ranges": [
+      [
+        110,
+        143
+      ]
+    ],
+    "status": "partial",
+    "role": "contract"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/scheduling/omni_scheduler.py",
+    "sha256": "59a864bdf773fc8e5f415be9accb65d359f950d2d7b87ef2c53984a4a3f1295f",
+    "total_lines": 2735,
+    "read_ranges": [
+      [
+        1480,
+        1525
+      ],
+      [
+        1650,
+        1770
+      ],
+      [
+        2710,
+        2735
+      ]
+    ],
+    "status": "partial",
+    "role": "contract"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/pipeline/stage/runtime.py",
+    "sha256": "eb92ec67edce44e724929a5830169b9f32b3b7eeef8899af0422c04dae884fae",
+    "total_lines": 1846,
+    "read_ranges": [
+      [
+        900,
+        980
+      ],
+      [
+        1060,
+        1248
+      ],
+      [
+        1435,
+        1535
+      ],
+      [
+        1590,
+        1680
+      ]
+    ],
+    "status": "partial",
+    "role": "contract"
+  }
+]

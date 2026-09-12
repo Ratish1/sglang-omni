@@ -1,0 +1,32 @@
+[
+  {
+    "source": "CosyVoice",
+    "read_snapshot": "inputs/external_sources/CosyVoice",
+    "git_head": "074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc",
+    "identity_note": "Only fully read source files are included, not a runnable dependency installation."
+  },
+  {
+    "source": "Fun-CosyVoice3-0.5B-2512",
+    "read_snapshot": "inputs/external_sources/Fun-CosyVoice3-0.5B-2512",
+    "git_head": null,
+    "identity_note": "HF checkpoint config revision is 29e01c4e8d000f4bcd70751be16fa94bf3d85a18; no weights downloaded."
+  },
+  {
+    "source": "flashinfer",
+    "read_snapshot": "inputs/external_sources/flashinfer",
+    "git_head": "bc29697ba20b7e6bdb728ded98f04788e16ee021",
+    "identity_note": "Only fully read source files are included, not a runnable dependency installation."
+  },
+  {
+    "source": "x-transformers",
+    "read_snapshot": "inputs/external_sources/x-transformers",
+    "git_head": "9d8ae7e12d3e12765ae0df1ba77b8887ba3e16bc",
+    "identity_note": "Only fully read source files are included, not a runnable dependency installation."
+  },
+  {
+    "source": "Matcha-TTS",
+    "read_snapshot": "inputs/external_sources/Matcha-TTS",
+    "git_head": "dd9105b34bf2be2230f4aa1e4769fb586a3c824e",
+    "identity_note": "Only fully read source files are included, not a runnable dependency installation."
+  }
+]

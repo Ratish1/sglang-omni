@@ -1,0 +1,236 @@
+[
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/scheduling/omni_scheduler.py",
+    "sha256": "59a864bdf773fc8e5f415be9accb65d359f950d2d7b87ef2c53984a4a3f1295f",
+    "total_lines": 2735,
+    "read_ranges": [[1, 2735]],
+    "status": "complete",
+    "role": "Omni composition, scheduling wrappers, event loops, result adaptation, output and abort ownership"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/scheduling/sglang_backend/cache.py",
+    "sha256": "f3ea8b53b1b11d16ef0ec3195e468f35e49639745ea8737fd4b7b5cf1f5e04e4",
+    "total_lines": 43,
+    "read_ranges": [[1, 43]],
+    "status": "complete",
+    "role": "Omni prefix-cache factory"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/scheduling/sglang_backend/evict_heap_radix_cache.py",
+    "sha256": "6deecbbadc1b0c87e0cace641c822dd1718f93fe5b5337b8d0082fa8eed6520d",
+    "total_lines": 76,
+    "read_ranges": [[1, 76]],
+    "status": "complete",
+    "role": "Omni LRU radix eviction specialization"
+  },
+  {
+    "repo": "sglang-omni",
+    "path": "sglang_omni/models/fun_cosyvoice3/engine_builder.py",
+    "sha256": "c0168e2d97f41444f60bccec2aa0dd4954bfbefc10220bc9ddb4fcabaee48644",
+    "total_lines": 143,
+    "read_ranges": [[1, 143]],
+    "status": "complete",
+    "role": "FunCosyVoice3 scheduler/runtime defaults"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/scheduler.py",
+    "sha256": "3a12fdfb9c21571d8007ba60aedd7e84b67636583bac8243373c75d6a2ab324e",
+    "total_lines": 5635,
+    "read_ranges": [[1, 5635]],
+    "status": "complete",
+    "role": "Upstream scheduler lifecycle, admission, event loops, execution, result dispatch, abort and administration"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/schedule_policy.py",
+    "sha256": "5ceae6ad98493297bf557fdb38b6e53f654319e26238c9e4e22a00aead230e3c",
+    "total_lines": 1476,
+    "read_ranges": [[1, 1476]],
+    "status": "complete",
+    "role": "Priority, prefix matching and prefill admission budgets"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/schedule_batch.py",
+    "sha256": "170f847aba6701d8d876a98c5edb8a66f188f5bc12fc30973596d132fcbb8c72",
+    "total_lines": 3663,
+    "read_ranges": [[1, 3663]],
+    "status": "complete",
+    "role": "Request state, batch tensors, allocation, retraction, merge/filter/copy, release"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
+    "sha256": "0f0a3d92603c58bc555969b4f01daf2796f5aac9f38ad5a7155455ef5ca3ed4a",
+    "total_lines": 1376,
+    "read_ranges": [[1, 1376]],
+    "status": "complete",
+    "role": "Prefill/decode result commit, finish, cache/release and output callback"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/scheduler_components/dp_attn.py",
+    "sha256": "7b8f8adc737eba4f812018a944ee7642da8380521c22476fa5bae58002baf410",
+    "total_lines": 596,
+    "read_ranges": [[1, 596]],
+    "status": "complete",
+    "role": "DP-attention scheduling adapter"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/scheduler_components/load_inquirer.py",
+    "sha256": "bd81d06c60ecb49fe68e4d5bcfa8ae1cd103a853d2e6df91a04a33369b6848e7",
+    "total_lines": 237,
+    "read_ranges": [[1, 237]],
+    "status": "complete",
+    "role": "Live scheduler load snapshot"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/scheduler_components/pool_stats_observer.py",
+    "sha256": "973e04f7c2b102efd40e52682117d3ba1c7db7c84a6faa1ec3dc069ea6d08370",
+    "total_lines": 335,
+    "read_ranges": [[1, 335]],
+    "status": "complete",
+    "role": "Allocator/cache/session pool statistics"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/scheduler_components/new_token_ratio_tracker.py",
+    "sha256": "2086ea0fad965f24fcda645a0ceddb4b5fc576013f9c983335ff7db092942185",
+    "total_lines": 51,
+    "read_ranges": [[1, 51]],
+    "status": "complete",
+    "role": "Decode reservation ratio state"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/scheduler_components/logprob_result_processor.py",
+    "sha256": "19343a61d949399d89f65bae2b92b713fdd94ec38a810b0973039a649cea036f",
+    "total_lines": 377,
+    "read_ranges": [[1, 377]],
+    "status": "complete",
+    "role": "Prompt and output logprob result ownership"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/scheduler_components/metrics_reporter.py",
+    "sha256": "9f5a94ac2da99f90b2a6e28f503fb86610a35d44b93e2c702efaafce3265edd9",
+    "total_lines": 1242,
+    "read_ranges": [[1, 1242]],
+    "status": "complete",
+    "role": "Scheduler logging, counters, utilization and forward metrics"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/scheduler_components/load_publisher.py",
+    "sha256": "04f0aea3c79c0a88f1defa333d0bdc94e9ec051eed3a9ee482ac512b13bf5455",
+    "total_lines": 267,
+    "read_ranges": [[1, 267]],
+    "status": "complete",
+    "role": "Best-effort router load publisher"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/scheduler_components/kv_events_publisher.py",
+    "sha256": "c72c73224beede7b7955e90e44af409f4c1fcc57707a33739e47168f039ac723",
+    "total_lines": 103,
+    "read_ranges": [[1, 103]],
+    "status": "complete",
+    "role": "Prefix-cache event and KV metric publication"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/managers/scheduler_components/output_streamer.py",
+    "sha256": "67bd9278d0680c6a8b4ead37faa1970e2a5c200b676f62b73125a8461e3ea676",
+    "total_lines": 774,
+    "read_ranges": [[1, 774]],
+    "status": "complete",
+    "role": "Upstream detokenizer egress contract replaced by Omni callback"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/beam_search/coordinator.py",
+    "sha256": "93294bdd02e2bba900c0c6a52ecc17313334d70461d8f554fd2a6e299a6a06db",
+    "total_lines": 534,
+    "read_ranges": [[1, 534]],
+    "status": "complete",
+    "role": "Beam admission, row/slot lifecycle and delayed commit hooks"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/mem_cache/base_prefix_cache.py",
+    "sha256": "402206114229bb4a882fe0f4f701ce01c000e31acfc61bf4387265da6031c9d0",
+    "total_lines": 509,
+    "read_ranges": [[1, 509]],
+    "status": "complete",
+    "role": "Prefix-cache abstract contract"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/mem_cache/radix_cache.py",
+    "sha256": "6366bf2db750754037471698d26d1724dd4534fb25b01f6d662825351a7712e6",
+    "total_lines": 863,
+    "read_ranges": [[1, 863]],
+    "status": "complete",
+    "role": "Radix prefix ownership, locks, insertion and eviction"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/mem_cache/common.py",
+    "sha256": "a209daeb493fc701e56e452dfcd336520ae8a7343f76faa3cd6d1b956039ea52",
+    "total_lines": 323,
+    "read_ranges": [[1, 323]],
+    "status": "complete",
+    "role": "Shared cache traits and allocation result records"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/mem_cache/allocation.py",
+    "sha256": "478e0abda17d8976ab223c78777592a93736698084d03c353c90bd9ded09d7e2",
+    "total_lines": 712,
+    "read_ranges": [[1, 712]],
+    "status": "complete",
+    "role": "Batch extend/decode slot allocation helpers"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/mem_cache/allocator/base.py",
+    "sha256": "0539a30f78023e1809359c88e3ed00e91dbac3e7699cc418b20120374af8aa19",
+    "total_lines": 189,
+    "read_ranges": [[1, 189]],
+    "status": "complete",
+    "role": "Token-slot allocator interface and cache eviction bridge"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/mem_cache/allocator/token.py",
+    "sha256": "e04f530e6af7860891b956e9665632a6225a821e66ade4b1ba933430c5f175d0",
+    "total_lines": 83,
+    "read_ranges": [[1, 83]],
+    "status": "complete",
+    "role": "Flat token-slot allocator"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/mem_cache/allocator/paged.py",
+    "sha256": "285417348f64b81415f4d71488390ff324119282fb167c2543d2b63d06bf31fc",
+    "total_lines": 346,
+    "read_ranges": [[1, 346]],
+    "status": "complete",
+    "role": "Paged token-slot allocator"
+  },
+  {
+    "repo": "sglang",
+    "path": "python/sglang/srt/mem_cache/memory_pool.py",
+    "sha256": "7955db1470ea36b99eb43483a5bd999dbda62119ff54aee7f9e8e01f31b2a9b5",
+    "total_lines": 5071,
+    "read_ranges": [[1, 5071]],
+    "status": "complete",
+    "role": "Request-row, recurrent-state, MHA/MLA, quantized and composite physical KV pool ownership"
+  }
+]
