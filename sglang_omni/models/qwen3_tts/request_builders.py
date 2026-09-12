@@ -1568,8 +1568,8 @@ def apply_sglang_qwen3_tts_result(
             "ref_code_len": data.ref_code_len,
             "prompt_tokens": data.ref_code_len,
             "completion_tokens": len(data.output_codes),
-            # note(ratish): ends at the handoff, the copy lands within the
-            # finishing step's predictor, which this no longer waits for.
+            # note(ratish): host time through result construction, the runtime
+            # waits for the final copy before routing.
             "engine_time_s": time.perf_counter() - data.engine_start_s,
             "sample_rate": 24000,
             "finish_reason": _qwen3_tts_finish_reason(data),

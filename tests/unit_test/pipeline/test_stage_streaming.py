@@ -447,7 +447,7 @@ class _GatedReadiness:
 
     def synchronize(self) -> None:
         self.entered.set()
-        self.release.wait(timeout=5)
+        assert self.release.wait(timeout=5)
         self.done = True
 
 
@@ -536,11 +536,12 @@ def test_result_aborted_during_its_readiness_wait_is_dropped() -> None:
         )
 
         drain = asyncio.create_task(stage._drain_outbox_external())
-        while not event.entered.is_set():
-            await asyncio.sleep(0)
+        loop = asyncio.get_running_loop()
+        entered = await loop.run_in_executor(None, event.entered.wait, 5)
+        assert entered
         stage._on_abort("req-aborted")
         event.release.set()
-        await drain
+        await asyncio.wait_for(drain, timeout=5)
 
         assert [m.request_id for m in control_plane.completions] == ["req-live"]
         assert control_plane.streams == []
