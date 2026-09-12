@@ -77,17 +77,17 @@ on req/s, median and p95 beyond the 2 percent spread; this is the point of the s
 and similarity are recorded, not compared. Peak memory as a level from the gpu samples plus
 the per process reading.
 
-## 5. Streaming on B, three passes
+## 5. Streaming, three passes per arm, one independent server
 
-CI layout, two workers on GPUs 0 and 1, separate vocoder processes, warmup 1, full corpus,
-c16. A is slice A's three passes from the follow up archive (readout 20 section 8: TTFC mean
-0.133 to 0.208 s, inter chunk mean 0.072 to 0.076 s, 19.6 to 21.6 req/s) when the load is
-the same, otherwise three passes at `04b62c255` in this session. Delta table: requests per
-second, audio seconds per second, TTFC mean and p99, inter chunk mean and p99, request latency
-mean and p99, RTF, continuity at 200 ms, completed. Pass: nothing worse than A's band, 3264 of
-3264, and the question of readout 20 section 8 answered: TTFC at or below upstream main's
-0.126 to 0.133 s mean of the E3 passes means the slice A cost was the two stalls these slices
-remove.
+Corrected 2026-09-12: never behind the router. One independent server per arm on GPU 0,
+default engine config, the benchmark's streaming client at c16, warmup 1, full corpus, three
+passes per arm, A at `04b62c255` and B, back to back. The earlier two worker router passes
+(readout 23 section 5) are not the protocol and do not enter the PR. Delta table: requests
+per second, audio seconds per second, TTFC mean and p99, inter chunk mean and p99, request
+latency mean and p99, RTF, continuity at 200 ms, completed. Pass: nothing worse than A's
+band on the warm pass, 3264 of 3264. The same single server pair is owed for PR #2123
+(main at its base against `04b62c255`) so both PRs carry streaming evidence from the same
+layout.
 
 ## 7. The finish test probe, added 2026-09-12
 
