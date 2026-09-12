@@ -52,12 +52,15 @@ Plans for items in this list are written as numbered docs in this folder.
    and opened as PR #2108 at `33c92c52a`, E2 read (readout 17) and S4
    closed as scoped. Plan 18 overlaps the decode step inside the sync
    loop; slice A, the ids staged before the predictor, is on
-   `perf/qwen3-tts-stage-ids-early`, measured on 2026-09-11 (runbook 19,
-   readout 20): c1 step 8.04 to 6.25 ms, req/s +14 percent at c1, +1 to
-   +5 at c16, bit identical; branch at `b26971164` with main merged.
-   Next: slice C (the restage) then slice B (the finish copy), both now
-   blocking behind the queued predictor on c16 churn steps (readout 20
-   section 3), then slice D's plan.
+   `perf/qwen3-tts-stage-ids-early`, measured (runbook 19, readout 20):
+   c1 step 8.04 to 6.25 ms, req/s +14 percent at c1, +6.3 at c16 with
+   GPU 1 idle, bit identical; PR #2123 at `04b62c255`. Slices C and B
+   (plan 21, runbook 22, readout 23) on `perf/qwen3-tts-nonblocking-copies`
+   at `9900cb82e`, PR #2126 stacked on #2123: the two churn step copies
+   from 3 ms to 0.1 ms at p90, c16 +1.9 percent, streaming warm pass TTFC
+   back at main's, inter chunk −13 percent, throughput +12 against main.
+   Next: slice D's plan (the layer 0 sampling into the replay), and the
+   vocoder warm up gaps (T40) that a faster talker exposes.
    The slices
    after S1 are `04_qwen3_tts_decode_step_slices_plan.md`:
    S2 rope writes the cache (160 kernels), S3 the residual add inside
