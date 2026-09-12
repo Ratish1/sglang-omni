@@ -79,15 +79,20 @@ the per process reading.
 
 ## 5. Streaming, three passes per arm, one independent server
 
-Corrected 2026-09-12: never behind the router. One independent server per arm on GPU 0,
-default engine config, the benchmark's streaming client at c16, warmup 1, full corpus, three
-passes per arm, A at `04b62c255` and B, back to back. The earlier two worker router passes
-(readout 23 section 5) are not the protocol and do not enter the PR. Delta table: requests
-per second, audio seconds per second, TTFC mean and p99, inter chunk mean and p99, request
-latency mean and p99, RTF, continuity at 200 ms, completed. Pass: nothing worse than A's
-band on the warm pass, 3264 of 3264. The same single server pair is owed for PR #2123
-(main at its base against `04b62c255`) so both PRs carry streaming evidence from the same
-layout.
+Corrected 2026-09-12: never behind the router, two passes per arm. One independent server
+per arm on GPU 0, default engine config, the benchmark's streaming client at c16, warmup 1,
+full corpus, back to back. The earlier two worker router passes (readout 23 section 5) are
+not the protocol and do not enter any PR. Two pairs:
+
+1. For PR #2123: A upstream main, B `04b62c255`.
+2. For PR #2126: A `04b62c255`, B the #2126 branch at `898dc3234` with `04b62c255` merged
+   in locally (`git merge 04b62c255`, no push; the two branches touch no common line). The
+   copies only block once the host runs ahead, which is #2123's change, so B must carry
+   both.
+
+Delta table per pair: requests per second, audio seconds per second, TTFC mean and p99,
+inter chunk mean and p99, request latency mean and p99, RTF, continuity at 200 ms,
+completed. Pass: nothing worse than A's band on the second pass, 2176 of 2176 per arm.
 
 ## 7. The finish test probe, added 2026-09-12
 
