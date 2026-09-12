@@ -43,7 +43,7 @@ The user's playbook and analysis are retained as hypotheses and experiment guida
 
 ## Required first evidence packet
 
-Capture baseline launch/config and package/source identities, H100 UUID and CPU quota/affinity; full profiler-off en/zh SeedTTS streaming and buffered results; one small trace per mode at c16, plus c1 for dispatch comparison; input hashes; actual backend/graph logs; quality outputs and error rows. Include the original 3% report if available. Until those arrive, the root cause and the size of each recoverable opportunity remain **unmeasured**.
+Capture baseline launch/config and package/source identities, H100 UUID and CPU quota/affinity; full profiler-off English SeedTTS streaming and buffered results; one small trace per mode at c16, plus c1 for dispatch comparison; input hashes; actual backend/graph logs; quality outputs and error rows. Include the original 3% report if available. Until those arrive, the root cause and the size of each recoverable opportunity remain **unmeasured**.
 
 Timing arithmetic uses the exported integer nanosecond clock. It preserves the recorded intervals exactly; it does not make physical measurements “bit exact.” Clock resolution, sampling, collection overhead, trace loss and launch-correlation coverage must be qualified. Do not subtract `time.time_ns()` JSONL events from Nsight timestamps. The new NVTX request markers avoid that clock mismatch.
 

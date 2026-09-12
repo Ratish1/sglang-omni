@@ -2,6 +2,8 @@
 
 These tools are an initial diagnostic implementation with static checks only. Run them in the H100 serving environment. No local pytest or profiling unit tests are required. Use branch `analysis/cosyvoice-utilization-20260912` and the same Python executable/package paths as the server.
 
+**Scope: English only (`en`), at c1 and c16, for streaming and buffered output.** The current task is baseline collection and small NSYS captures. Full performance A/B begins after an optimization candidate exists; a small annotation-off/on check only qualifies diagnostic overhead.
+
 ## 1. Establish identity and a profiler-off baseline
 
 From the Omni checkout:
@@ -26,7 +28,7 @@ Save the complete launch command and startup log separately. `config resolve` de
 
 The commands above describe the inspected eager defaults; first reproduce the team's actual launch when it differs. GPU “0” may be a remapped CUDA ordinal. Match it to Nsight metric device ID and physical GPU UUID. Save CPU cgroup quota/affinity, GPU clocks/power, other GPU processes, MIG/MPS status, Torch/CUDA/driver/NSYS/ONNX/TRT versions. Use a dedicated measurement interval.
 
-## 2. Full SeedTTS A/B, profiling disabled
+## 2. Full English SeedTTS baseline, profiling disabled
 
 With the server ready, in another terminal:
 
@@ -36,23 +38,23 @@ COSY_VARIANT=eager
 COSY_REPEAT=r1
 for COSY_CONCURRENCY in 1 16; do
   for COSY_MODE in streaming buffered; do
-    for COSY_LANG in en zh; do
-      python "$DIAG/run_seedtts.py" --mode "$COSY_MODE" --lang "$COSY_LANG" \
-        --concurrency "$COSY_CONCURRENCY" \
-        --output "artifacts/cosyvoice/${COSY_VARIANT}-${COSY_MODE}-${COSY_LANG}-c${COSY_CONCURRENCY}-${COSY_REPEAT}" \
-        || exit 1
-    done
+    python "$DIAG/run_seedtts.py" --mode "$COSY_MODE" --lang en \
+      --concurrency "$COSY_CONCURRENCY" \
+      --output "artifacts/cosyvoice/${COSY_VARIANT}-${COSY_MODE}-en-c${COSY_CONCURRENCY}-${COSY_REPEAT}" \
+      || exit 1
   done
 done
 ```
 
-**Omitting `--samples` and using offset zero selects the full split.** Default dataset revision is `27f4c1adee83b5b29b7c4b375f6b976324bda308`; source order is preserved. `inputs.json` hashes each selected target/reference text and reference-audio bytes; `experiment.json` records the ordered identity, complete client configuration and run status. Native outputs are in `measured/`: `speed_results.json`, `generated.json`, `results.csv`, and all WAVs. Fresh output paths are mandatory. The model requires reference audio; `--reference audio` removes only its transcript, while the default uses audio and text.
+**Omitting `--samples` and using offset zero selects the full English split.** Default dataset revision is `27f4c1adee83b5b29b7c4b375f6b976324bda308`; source order is preserved. `inputs.json` hashes each selected target/reference text and reference-audio bytes; `experiment.json` records the ordered identity, complete client configuration and run status. Native outputs are in `measured/`: `speed_results.json`, `generated.json`, `results.csv`, and all WAVs. Fresh output paths are mandatory. The model requires reference audio; `--reference audio` removes only its transcript, while the default uses audio and text.
 
-Default warmup is 32 copies of the first sample. It is excluded from native measured wall time. Preserve this cache policy across A/B; a warm-cache repeat and a fresh-server run answer different questions. Both concurrency 1 and 16 use the full selected split for every PR A/B. Keep their results separate; c16 additionally carries the SM target. Repeat the same run order and cache policy for each variant, or restart consistently between matrix cells.
+Default warmup is 32 copies of the first sample. It is excluded from native measured wall time. Preserve this cache policy across A/B; a warm-cache repeat and a fresh-server run answer different questions. Both concurrency 1 and 16 use the full English split for the baseline and each later PR A/B. Keep their results separate; c16 additionally carries the SM target. Repeat the same run order and cache policy for each variant, or restart consistently between matrix cells.
 
-Use the same optional `--generation-json params.json` on both sides to pin sampling fields. For example `{"seed":1234,"max_new_tokens":2048}`. An explicit seed selects a particular upstream deterministic sampling path; do not add one to only one side or assume it reproduces the team's unseeded baseline. The harness preserves benchmark max-new-token default 2048, which differs from an API request that omits it and lets Cosy derive its length bound. Record this distinction.
+Record any optional `--generation-json params.json` used for the baseline and reuse it unchanged for a future candidate. For example `{"seed":1234,"max_new_tokens":2048}`. An explicit seed selects a particular upstream deterministic sampling path; do not add one to only one side or assume it reproduces the team's unseeded baseline. The harness preserves benchmark max-new-token default 2048, which differs from an API request that omits it and lets Cosy derive its length bound. Record this distinction.
 
-Restart with one candidate change and fresh matching state, set `COSY_VARIANT=candidate`, and repeat the complete c1/c16 matrix. Compare each matching mode/language/concurrency separately, for example:
+### Later: compare an optimization candidate
+
+Skip this subsection during initial baseline collection. Once an optimization candidate is implemented, restart with that one change and fresh matching state, set `COSY_VARIANT=candidate`, and repeat the complete c1/c16 matrix. Compare each matching mode/concurrency separately, for example:
 
 ```bash
 python "$DIAG/compare_ab.py" \
@@ -60,7 +62,7 @@ python "$DIAG/compare_ab.py" \
   --output artifacts/cosyvoice/comparison-streaming-en-c16-r1.json
 ```
 
-The comparator rejects profiled/incomplete runs and mismatched ordered inputs/client contracts. It reports ratios without declaring a winner. Verify identical model/weight and server contracts separately; repeat paired A/B runs to quantify variance. Full-language/mode quality and tail-latency gates are in [the PR acceptance contract](../plans/00_stack.md).
+The comparator rejects profiled/incomplete runs and mismatched ordered inputs/client contracts. It reports ratios without declaring a winner. Verify identical model/weight and server contracts separately; repeat paired A/B runs to quantify variance. English quality for each mode and tail-latency gates are in [the PR acceptance contract](../plans/00_stack.md).
 
 ## 3. Small complete-pipeline NSYS capture
 
@@ -159,7 +161,7 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
   --output-dir artifacts/cosyvoice/eager-streaming-en-c16-r1/measured
 ```
 
-Repeat for B, both c1/c16, zh, and buffered output; preserve identical scorer/checkpoint identities. The zh path character-spaces normalized text but still names its metric `wer`. SIM is cosine×100; the scorer provides no acceptance threshold. Inspect skipped/evaluated counts: all-failure WER summaries can contain zeros. Use paired per-sample differences and listening around streaming joins, not mean quality alone.
+Repeat for both c1/c16 and buffered output, then for a future candidate when available; preserve identical scorer/checkpoint identities. Score English only. SIM is cosine×100; the scorer provides no acceptance threshold. Inspect skipped/evaluated counts: all-failure WER summaries can contain zeros. Use paired per-sample differences and listening around streaming joins, not mean quality alone.
 
 ## 7. Return plain artifacts without WAVs
 
@@ -174,6 +176,6 @@ Retain each run's `experiment.json`, `inputs.json`, `measured/speed_results.json
 
 The supplied comparator and SQLite analyzer read these artifacts without opening WAVs. `generated.json` may refer to remote WAV paths; those references preserve provenance but cannot support local rescoring after audio is omitted. Per-request speed/quality rows, input hashes and trace request markers support selecting a failing cohort and replaying its source offset on H100. Inspect duplicate target hashes before matching server requests; never infer their identity from arrival order.
 
-Use `compare_ab.py` for each c1/c16 pair and `analyze_pipeline_nsys.py` for each explicit trace window. The raw SQLite and per-request JSON also remain available for perfkit or another later analysis tool; this branch does not depend on an uninspected perfkit interface. Promote a component PR only after the [open-PR overlap audit](../reports/17_open_prs.md), [existing optimization assessment](../plans/09_existing_optimizations.md), and the measured trigger in its plan agree.
+Use `analyze_pipeline_nsys.py` for each explicit baseline trace window. Once a candidate exists, use `compare_ab.py` for each matching English c1/c16 pair. The raw SQLite and per-request JSON also remain available for perfkit or another later analysis tool; this branch does not depend on an uninspected perfkit interface. Promote a component PR only after the [open-PR overlap audit](../reports/17_open_prs.md), [existing optimization assessment](../plans/09_existing_optimizations.md), and the measured trigger in its plan agree.
 
 References: [Nsight Systems command/lifecycle documentation](https://docs.nvidia.com/nsight-systems/UserGuide/index.html), [export schema](https://docs.nvidia.com/nsight-systems/AnalysisGuide/index.html), [NVTX API and message caching](https://nvidia.github.io/NVTX/python/reference.html). Upstream SGLang's complete profiling code and examples are covered by [report 08](../reports/08_profiling.md).

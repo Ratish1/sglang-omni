@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare matching profiler-off SeedTTS artifacts; no benchmark execution."""
+"""Compare matching profiler-off English SeedTTS artifacts; no benchmark execution."""
 import argparse
 import json
 import math
@@ -20,6 +20,8 @@ def main():
         parser.error("Use a fresh output path")
     a, b = [read(p / "experiment.json") for p in (args.baseline, args.candidate)]
     for label, run in (("baseline", a), ("candidate", b)):
+        if run["client_config"].get("lang") != "en":
+            parser.error(f"{label} must use the English split")
         if run["profiled"] or run["status"] != "complete":
             parser.error(f"{label} must be a complete profiler-off run")
     if a["ordered_inputs_sha256"] != b["ordered_inputs_sha256"]:
@@ -56,7 +58,7 @@ def main():
         "full_split": a["full_split"] and b["full_split"],
         "metrics": metrics,
         "model_labels": [a["client_config"]["model"], b["client_config"]["model"]],
-        "note": "Ratios are descriptive, not acceptance decisions. Match server/model identities separately; evaluate WER/CER-like zh, SIM, UTMOS and latency/continuity gates. Repeat paired runs for variance.",
+        "note": "Ratios are descriptive, not acceptance decisions. Match server/model identities separately; evaluate English WER, SIM, UTMOS and latency/continuity gates. Repeat paired runs for variance.",
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(out, indent=2, allow_nan=False) + "\n")

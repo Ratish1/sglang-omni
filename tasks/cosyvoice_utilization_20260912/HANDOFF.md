@@ -22,7 +22,7 @@ cd /tmp/cosyvoice-utilization-h100
 
 Use a fresh worktree path if that directory already exists. Do not apply a separate patch on top of the branch. Use the server's Python environment and verify imported package paths against the recorded source identities. No tar/zip transfer is needed.
 
-Follow [the H100 runbook](diagnostics/README.md): establish the team's actual baseline, qualify annotations with small captures, then run full SeedTTS A/B at **both concurrency 1 and 16**, independently for streaming/buffered and en/zh. Use profiling only for small diagnostic cohorts. Complete quality scoring remotely before returning plain results without WAVs under `artifacts/cosyvoice/` in the local Omni checkout.
+Follow [the H100 runbook](diagnostics/README.md): establish the team's actual baseline, qualify annotations with small captures, and collect the full English SeedTTS baseline at **both concurrency 1 and 16**, independently for streaming and buffered output. Full A/B starts only after an optimization candidate exists. English is the only benchmark language in scope. Use profiling only for small diagnostic cohorts. Complete quality scoring remotely before returning plain results without WAVs under `artifacts/cosyvoice/` in the local Omni checkout.
 
 Read [the open-PR overlap audit](reports/17_open_prs.md) before implementing another component. It records the inspected PR heads and overlaps; an open PR is not evidence of an optimization already present in the baseline. [Existing optimization assessment](plans/09_existing_optimizations.md) specifies which current paths need correctness and performance qualification before replacement or reuse.
 

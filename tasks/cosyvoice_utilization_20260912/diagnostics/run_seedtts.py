@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canonical SeedTTS generation: full unprofiled A/B or small named NSYS window.
+"""English SeedTTS baseline/candidate generation or a small named NSYS window.
 
 Run from the Omni checkout with its Python environment. This does not launch a
 server. --session controls ONLY the named NSYS session already hosting the server.
@@ -223,13 +223,15 @@ def main():
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--mode", choices=("streaming", "buffered"), required=True)
-    parser.add_argument("--lang", choices=("en", "zh"), default="en")
+    parser.add_argument(
+        "--lang", choices=("en",), default="en", help="English-only investigation"
+    )
     parser.add_argument(
         "--reference", choices=("audio_text", "audio"), default="audio_text"
     )
     parser.add_argument("--concurrency", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=32)
-    parser.add_argument("--samples", type=int, help="Omit for the full selected split")
+    parser.add_argument("--samples", type=int, help="Omit for the full English split")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument(
         "--session", help="Existing named NSYS server session; requires --samples"

@@ -36,7 +36,14 @@
       "immutable_owner_files": 16,
       "concrete_table_identities_generated_from_api": 10
     },
-    "research_whitespace": "authored plans, reports, evidence and root docs passed git diff --cached --check; supplied/external inputs preserved byte-for-byte"
+    "research_whitespace": "authored plans, reports, evidence and root docs passed git diff --cached --check; supplied/external inputs preserved byte-for-byte",
+    "english_scope_update": {
+      "python_ast_files": 2,
+      "cli_help_paths": 2,
+      "runner_help": "--lang {en}",
+      "runbook_bash_syntax_blocks": 10,
+      "workloads_run": false
+    }
   },
   "formatter": {
     "name": "black",
@@ -54,8 +61,8 @@
     "sglang_omni/profiler/pipeline_nvtx.py": "22ec06484150af5723871199e3346b2ff69ca51b5703b47eae046a0757a6c6e1",
     "tasks/cosyvoice_utilization_20260912/diagnostics/analyze_pipeline_nsys.py": "eedc9d534f4b1545973a6c8a92b8fce857a12ebb70b1636b2258c846af54e26c",
     "tasks/cosyvoice_utilization_20260912/diagnostics/collect_env.py": "ac0a9b9a7b36ca89c796fc453e9c96a2ef73535853be7d30ba2d990717f75455",
-    "tasks/cosyvoice_utilization_20260912/diagnostics/compare_ab.py": "d6a70afca9e28b81b23b6eb2ee423880f91148d4ae29d2e8887dc69a6923db11",
-    "tasks/cosyvoice_utilization_20260912/diagnostics/run_seedtts.py": "b047686465ea722ec1b603ad7bbae630def8b0c8249ad2c97e96e38ab2dbcb66"
+    "tasks/cosyvoice_utilization_20260912/diagnostics/compare_ab.py": "596ce937485b69908a3a3f081fdea51175665052b348ad4a696c5ce0966753a0",
+    "tasks/cosyvoice_utilization_20260912/diagnostics/run_seedtts.py": "535a4535b49d795494117a7236d6477607fe52900a5208b47709f9a5d2a32c43"
   },
   "not_run": [
     "pytest",
@@ -78,5 +85,18 @@
   "diagnostic_source_commit": "5ab17f8c9bc6457a7d56f30c9e03c4679d17c58d",
   "delivery": "Git-tracked source and tasks directory; no archive or separate patch. Plain returned results under artifacts/cosyvoice/, without WAVs after remote quality scoring.",
   "research_commit_hook_policy": "Immutable supplied inputs and external source snapshots are committed without rewriting formatter hooks to preserve audited bytes. Authored executable code passes the repository hooks separately. Research metadata, links and source hashes are validated explicitly.",
-  "diagnostic_tools_commit": "a1bcd79f70216845b24125cd7c451c88685a64c1"
+  "diagnostic_tools_commit": "a1bcd79f70216845b24125cd7c451c88685a64c1",
+  "benchmark_scope": {
+    "language": "en",
+    "concurrency": [
+      1,
+      16
+    ],
+    "modes": [
+      "streaming",
+      "buffered"
+    ],
+    "current_phase": "baseline and small profiling cohorts",
+    "ab_phase": "after an optimization candidate exists"
+  }
 }
