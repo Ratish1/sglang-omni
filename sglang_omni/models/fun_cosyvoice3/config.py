@@ -11,7 +11,6 @@ from sglang_omni.config import (
     PipelineConfig,
     StageConfig,
 )
-from sglang_omni.platforms import current_platform
 
 _PKG = "sglang_omni.models.fun_cosyvoice3"
 
@@ -60,7 +59,6 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             process="pipeline",
             factory_path=f"{_PKG}.stages.create_sglang_tts_engine_executor",
             factory=FactoryArgs(
-                device=current_platform.device_type,
                 dtype="bfloat16",
                 onnx_intra_op_threads=16,
                 # Keep in sync with vocoder token_hop_len (AR flush cadence).
@@ -76,8 +74,11 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             factory_path=f"{_PKG}.stages.create_vocoder_executor",
             factory=FactoryArgs(
                 dtype="bfloat16",
-                flow_batch_bucket_frames=50,
                 flow_batch_admission_frames=8000,
+                flow_merge_max_gap_frames=384,
+                flow_merge_pad_budget_percent=25.0,
+                # Note (chenyang): Adjacent length-sorted requests may share a Flow solve
+                # when their mel-length gap and total added padding stay within these limits.
                 max_batch_size=16,
                 max_batch_wait_ms=30,
                 # note (guozhihao-224, chenyang):
