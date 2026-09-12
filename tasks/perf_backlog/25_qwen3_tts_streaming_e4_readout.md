@@ -63,16 +63,39 @@ anatomy; main's anatomy under the same recorder has not been recorded (E5a below
 | total, admission to first chunk at the coordinator | 198.8 / 363.6 | 138.3 / 349.2 | 208.8 / 368.8 |
 
 Two segments carry the first chunk: preprocessing (78 ms) and the vocoder's first decode
-(70 ms). Everything the talker does between them is 43 ms. Under E4b both sibling segments
-drop by 45 ms while every talker segment grows, and the vocoder segment drops although its
-priority went down: what the siblings wait on is the talker's device work, and the vocoder's
-existing priority does not buy it a prompt first decode.
+(70 ms). Everything the talker does between them is 43 ms.
 
-The vocoder's first decode is the eager, reference prefixed bootstrap (`_run_initial_batch`,
-streaming_vocoder.py:2221): the whole reference prefix plus the first frames go through the
-incremental decoder without a graph (every archived cold runner has zero replays), planned
-after `_wait_codes_ready` orders the worker's stream behind the talker's newest chunk event
-(streaming_vocoder.py:1584). Nothing in that path changed between the arms.
+Under E4b both sibling segments drop by 45 ms, but E4b and E4c also admit half as many
+requests per second, so their siblings run under half the load (the user's audit,
+`tasks/qwen3_tts_e4_investigation_20260912/README.md`). The vocoder segment binned by how
+many other requests were between their first code receipt and their first audio send at the
+moment a request's first code arrived:
+
+| other requests mid bootstrap | E4a n / p50 ms | E4b n / p50 ms | E4c n / p50 ms |
+| ---: | ---: | ---: | ---: |
+| 0 | 82 / 51.8 | 162 / 23.5 | 147 / 25.9 |
+| 1 | 82 / 64.7 | 34 / 38.8 | 46 / 49.1 |
+| 2 | 63 / 72.2 | 5 / 62.6 | 7 / 67.6 |
+| 3 | 35 / 91.4 | 1 / 65.6 | 4 / 82.5 |
+| 4 | 11 / 108.6 | 1 / 89.2 | 4 / 108.6 |
+
+The slope is the same in every arm, 15 to 20 ms per request ahead in the queue, and E4b and
+E4c mostly bootstrapped alone. The vocoder's first decode is a serial queue: the initial
+worker takes a batch off its queue, plans every request in it under the state lock
+(`_run_initial_batch`, streaming_vocoder.py:2221), each plan waiting on the newest chunk's
+event and concatenating every retained chunk (`_build_incremental_plan`, 1384 and 1441), and
+reference prefixed bootstraps fall into singleton cohorts decoded one after another through
+the eager incremental decoder (no cold graph replays in any arm). At 17 req/s a request
+usually finds one to three others ahead of it. That queue predates both PRs.
+
+What is left once queueing is removed is the lone bootstrap: 52 ms in E4a against 24 to
+26 ms in the two arms whose talker was starved. That residual, and the same question for
+preprocessing, is what a main against slice A trace has to split between the talker's
+device pressure and host time; section 3 says the device execution of sibling kernels is not
+it. The median number of code chunks already received when first audio leaves is 4 in E4a
+and 1 to 2 in E4b and E4c, so a plan in E4a waits on a chunk event up to a few steps newer
+than the frame it decodes; that costs at most a step or two per plan and is worth reading
+directly.
 
 ## 3. What the census traces show, main against slice A
 
@@ -170,32 +193,33 @@ measures it in production.
 
 ## 6. E5
 
-All streaming at c16, one independent server per arm, two passes, warmup 1, no seed, the
-event recorder on for a 200 request window in pass 2 with `enable_torch` false (the E4
-protocol, `protocol.md` in the E4 archive), GPUs 1 to 3 recorded before each boot, one
-session.
+The procedure is the user's `tasks/qwen3_tts_e4_investigation_20260912/next_diagnostic.md`:
+control `645b472cd` and control plus `early_ids.patch` (the same base, so #2115 is on both
+arms), the default single process layout, streaming c16, control then early ids then control,
+two passes per boot, then a 15 to 25 s Nsight Systems window on the server process tree
+with CUDA, OS runtime, Python sampling and GIL tracing, plus temporary ranges at the seven
+sites its table lists (scheduler publish, vocoder ingest and initial enqueue, initial batch
+planning with the lock, cohort launch, handle wait and commit, outbox send, prefix key
+digest). Read for a delayed first chunk: when its codes were device ready, when the initial
+worker took it, when the decode was submitted, started and finished, when the audio left the
+outbox. The decision table in that file maps each outcome to the fix.
 
-- E5a, the anatomy pair. Main (current upstream main) and slice A `04b62c255` with no source
-  change. Read the section 2 table for both arms and the client TTFC. This is the number the
-  PR needs and the baseline every mitigation is read against.
-- E5b, bounded run ahead. Slice A plus an uncommitted change in model_runner.py: record an
-  event after `code_predictor_forward` in `_collect_codes` and wait on it at the top of
-  `before_decode` for the same batch, so the host tail still overlaps the predictor but the
-  next backbone is launched onto a drained stream. Expected cost at c1: the backbone graph
-  launch no longer overlaps, a fraction of the 1.8 ms step gain. Expected effect: the
-  talker's queue empties once per step, the scheduler thread blocks for the predictor's
-  remainder (lock released), and the siblings dispatch into that window. Read: section 2
-  segments, TTFC, req/s, plus a c1 seeded pass for the step cost.
-- E5c, non streaming vocoder off the talker's stream. Slice A plus `_vocode_payloads` run
-  under `_decode_stream_context()` (streaming_vocoder.py:2782); `tokenizer.decode` returns
-  host arrays so it synchronizes its stream before returning and no consumer reads the
-  device. Non streaming c16 pair against slice A: the vocoder stage segment and QPS. This
-  is independent of the first chunk question and may be a c16 latency win on its own.
-- Only if E5a leaves the vocoder segment unexplained: a streaming window with the torch
-  profiler on both arms (`enable_torch` true, 192 requests) and the two scripts under
-  `tasks/perf_backlog/scripts/` (`trace_streams.py`, `trace_dispatch.py`) applied to the
-  initial worker's stream. Archive the traces for that run; the reports only rule does not
-  cover a dispatch question.
+Two additions from this doc:
+
+- The segments of section 2 and the queue table come for free from the event recorder in
+  pass 2, so run it on both arms alongside; the queue depth at first code receipt and the
+  lone bootstrap time are the two numbers to compare between control and early ids.
+- If Nsight is not installed on the box, the fallback is a torch profiler window on both
+  arms (`enable_torch` true) read with `tasks/perf_backlog/scripts/trace_streams.py` and
+  `trace_dispatch.py` on the initial worker's stream and thread; it gives dispatch, launch
+  and execution but not lock ownership, and the lock question then stays open. Archive the
+  raw traces for this run.
+
+Deferred until that trace has been read: the bounded run ahead (an event after
+`code_predictor_forward` waited at the top of the next `before_decode`, so the stream
+drains once per step at a fraction of the 1.8 ms gain), a raised priority for the
+preprocessing stream alone, and the non streaming vocoder decode moved onto its priority
+stream (`_vocode_payloads`, streaming_vocoder.py:2782, a c16 latency candidate of its own).
 
 ## 7. Consequence for the PRs
 
