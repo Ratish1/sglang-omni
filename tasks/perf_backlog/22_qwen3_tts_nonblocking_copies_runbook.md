@@ -89,6 +89,21 @@ mean and p99, RTF, continuity at 200 ms, completed. Pass: nothing worse than A's
 0.126 to 0.133 s mean of the E3 passes means the slice A cost was the two stalls these slices
 remove.
 
+## 7. The finish test probe, added 2026-09-12
+
+`test_cuda_codes_leave_as_a_pinned_copy_that_the_event_completes` still returns after the
+stream sleep with the pinned size class primed, so one of the builder's calls waits on the
+stream and it is not the host allocator. The probe times each call with the stream busy:
+
+```bash
+python tasks/perf_backlog/scripts/finish_copy_probe.py
+```
+
+(copy it from the analysis branch). It prints, per call, the wall time and whether the
+stream was still busy afterwards: `stack`, `cat`, `pinned empty`, `copy_ D2H`, `Event()`,
+`record`. The call that reports the stream no longer busy, or a wall time near the sleep's
+half second, is the one that synchronizes. Paste the output into the archive's readout.
+
 ## 6. Archive
 
 Suites' output, the reports of section 2, the seeded hashes, the speed, WER and similarity
