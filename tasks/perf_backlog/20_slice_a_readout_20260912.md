@@ -176,8 +176,11 @@ and unrelated models. The absolute c16 number follows the host load of the socke
 
 The c16 workload is host bound on its churn steps, so a tenant on the same CPU as GPU 0 slows
 both arms. Deltas within a pair hold, absolute numbers across days do not. `nvidia-smi topo -m`
-on the box says which GPUs share GPU 0's CPU; until then a boot is clean when GPU 1 is idle
-and GPUs 2 and 3 are recorded.
+on the box: GPUs 0 to 3 sit on NUMA node 0 (cores 0 to 31 and 64 to 95), GPUs 4 to 7 on node
+1. So a tenant on GPU 1, 2 or 3 shares our cores and a tenant on GPUs 4 to 7 does not, which
+is exactly the table above. A boot is clean when GPUs 1 to 3 are idle; when they are not, the
+pair is still valid within the session and the absolute numbers are not comparable to a
+clean day.
 
 ### Unseeded c16, one boot per arm
 
