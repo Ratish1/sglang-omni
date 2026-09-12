@@ -102,7 +102,8 @@ Run the full 1,088-sample SeedTTS English corpus at every point:
   --model "$MODEL" \
   --worker-url http://127.0.0.1:8011 \
   --worker-url http://127.0.0.1:8012 \
-  --concurrencies 8,16,32,64,96,128 \
+  --concurrencies 32,64,96,128 \
+  --candidates direct,rust-rr,rust-lr \
   --rust-binary "$RUST_ROUTER_BIN" \
   --output-dir "$RUN_ROOT/asr/nonstream" -- \
   "$OMNI_PYTHON" -m benchmarks.eval.benchmark_asr_seedtts \
@@ -201,7 +202,8 @@ unseeded, matching normal serving:
   --model "$MODEL" \
   --worker-url http://127.0.0.1:8011 \
   --worker-url http://127.0.0.1:8012 \
-  --concurrencies 8,16,32,64,96,128 \
+  --concurrencies 16,32 \
+  --candidates direct,rust-rr,rust-lr \
   --rust-binary "$RUST_ROUTER_BIN" \
   --output-dir "$RUN_ROOT/tts/wav" -- \
   "$OMNI_PYTHON" -m benchmarks.eval.benchmark_tts_seedtts \
@@ -228,13 +230,33 @@ the current `TtsCiPreset` values for each model:
 The worker arguments must come from the same preset. Do not reuse the Qwen3
 engine and memory settings for Higgs or MOSS.
 
+The unchanged Qwen3-TTS CI preset is valid at aggregate c16 and c32. It raises
+`max_running_requests` to 64 per worker but leaves
+`max_queued_requests` at 16, and every request enters the waiting queue first.
+The direct workers, Python RR, and Rust RR therefore all reject a synchronized
+c64 aggregate burst with `The request queue is full.` This is not a router
+failure, and c64/c96/c128 do not need to be repeated against that preset.
+
+To evaluate a higher worker operating point separately, restart both workers
+with this additional argument and measure the direct curve before routed runs:
+
+```bash
+--tts_engine.engine.max_queued_requests 64
+```
+
+Latest `upstream/main` rejects a MOSS-TTS Local empty audio generation before
+the zero-byte tensor reaches the SHM relay. Rerun PCM c32 on the updated revision.
+The worker should remain alive, but an empty generation is still a failed
+request and makes that point invalid.
+
 ### Routed Qwen3-Omni
 
 Use only the existing two-H100 colocated DP2 topologies. Start one complete
 worker per GPU with the exact worker arguments from `tests/test_model/conftest.py`.
 Do not convert the direct TP2 or disaggregated two-GPU stages into router tests.
 
-For Omni audio, use `--topology omni_audio` and the full SeedTTS corpus:
+For Omni audio, use `--topology omni_audio` and the same SeedTTS-50 repository
+as CI:
 
 ```bash
 "$OMNI_PYTHON" tasks/rust/router-e2e/scripts/run_matrix.py \
@@ -242,14 +264,15 @@ For Omni audio, use `--topology omni_audio` and the full SeedTTS corpus:
   --model qwen3-omni \
   --worker-url http://127.0.0.1:8011 \
   --worker-url http://127.0.0.1:8012 \
-  --concurrencies 8,16,32,64,96,128 \
+  --concurrencies 16,32 \
+  --candidates direct,rust-rr,rust-lr \
   --rust-binary "$RUST_ROUTER_BIN" \
   --output-dir "$RUN_ROOT/omni/audio" -- \
   "$OMNI_PYTHON" tasks/rust/router-e2e/scripts/run_repo_benchmark.py \
     benchmarks.eval.benchmark_omni_seedtts -- \
     --base-url '{router_url}' \
     --model qwen3-omni \
-    --meta zhaochenyang20/seed-tts-eval-arrow \
+    --meta zhaochenyang20/seed-tts-eval-50-arrow \
     --max-concurrency '{target_concurrency}' \
     --voice-clone \
     --generate-only \
@@ -257,11 +280,46 @@ For Omni audio, use `--topology omni_audio` and the full SeedTTS corpus:
     --disable-tqdm
 ```
 
-Repeat with `--stream` and a new output directory. For MMMU, MMSU, and
-Video-AMME, use `--topology omni_text` and their existing benchmark modules.
-Run each module once per matrix point with
-`--max-concurrency '{target_concurrency}'`; preserve its complete dataset and
-current CI request arguments.
+Repeat with `--stream` and a new output directory. Use the exact routed CI
+datasets and request arguments for the remaining Omni text-output stages:
+
+| Stage | Dataset and request count | Aggregate concurrency |
+| --- | --- | --- |
+| MMMU | `zhaochenyang20/mmmu-ci-50`, 50 requests, warmup 2 | 16, 32 |
+| MMSU | `zhaochenyang20/mmsu-ci-2000`, 2,000 requests, warmup 0 | 16, 32, 64, 96, 128 |
+| Video-AMME | `zhaochenyang20/Video_AMME_ci`, 50 requests | 16, 32 |
+
+MMMU and Video-AMME must not load their full upstream evaluation splits. MMSU
+CI is not a small subset: all 2,000 requests are part of its current contract.
+Use `--topology omni_text`,
+`--candidates direct,rust-rr,rust-lr`, and the corresponding benchmark template:
+
+```bash
+# MMMU
+"$OMNI_PYTHON" tasks/rust/router-e2e/scripts/run_repo_benchmark.py \
+  benchmarks.eval.benchmark_omni_mmmu -- \
+  --base-url '{router_url}' --model qwen3-omni \
+  --repo-id zhaochenyang20/mmmu-ci-50 --max-samples 50 \
+  --warmup 2 --max-concurrency '{target_concurrency}' \
+  --output-dir '{output_dir}/mmmu' --disable-tqdm
+
+# MMSU
+"$OMNI_PYTHON" tasks/rust/router-e2e/scripts/run_repo_benchmark.py \
+  benchmarks.eval.benchmark_omni_mmsu -- \
+  --base-url '{router_url}' --model qwen3-omni --modalities text \
+  --repo-id zhaochenyang20/mmsu-ci-2000 --max-tokens 32 --warmup 0 \
+  --max-concurrency '{target_concurrency}' \
+  --output-dir '{output_dir}/mmsu' --disable-tqdm
+
+# Video-AMME
+"$OMNI_PYTHON" tasks/rust/router-e2e/scripts/run_repo_benchmark.py \
+  benchmarks.eval.benchmark_omni_videoamme -- \
+  --base-url '{router_url}' --model qwen3-omni \
+  --repo-id zhaochenyang20/Video_AMME_ci --max-samples 50 \
+  --max-concurrency '{target_concurrency}' --video-fps 2 \
+  --video-max-frames 128 --video-max-pixels 401408 --timeout-s 500 \
+  --output-dir '{output_dir}/videoamme' --disable-tqdm
+```
 
 ## Final comparison and correctness
 

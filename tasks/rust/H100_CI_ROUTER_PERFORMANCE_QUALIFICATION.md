@@ -106,7 +106,7 @@ Use the following controls throughout:
   comparison point;
 - a router restart when policy changes, followed by an untimed warmup;
 - no local macOS performance evidence;
-- no threshold, model argument, or CI concurrency changes during measurement.
+- no threshold or model-argument changes during measurement.
 
 Capture the full worker command line, environment, model revision, dataset
 revision, container digest, binary hash, CPU affinity, GPU assignment, and
@@ -146,7 +146,9 @@ launch one persistent worker set
   -> zero-resource and cleanup audit
 ```
 
-For example, after the two Qwen3-TTS workers are ready on ports 8011 and 8012:
+For example, after the two Qwen3-TTS workers are ready on ports 8011 and 8012,
+screen the unchanged CI worker preset at its current c16 point and the next
+higher valid point:
 
 ```bash
 "$OMNI_PYTHON" tasks/rust/router-e2e/scripts/run_matrix.py \
@@ -154,7 +156,8 @@ For example, after the two Qwen3-TTS workers are ready on ports 8011 and 8012:
   --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
   --worker-url http://127.0.0.1:8011 \
   --worker-url http://127.0.0.1:8012 \
-  --concurrencies 8,16,32,64,96,128 \
+  --concurrencies 16,32 \
+  --candidates direct,rust-rr,rust-lr \
   --rust-binary "$RUST_ROUTER_BIN" \
   --output-dir results/qwen3-tts-wav -- \
   "$OMNI_PYTHON" -m benchmarks.eval.benchmark_tts_seedtts \
@@ -214,11 +217,13 @@ valid tails, extend the same screen to c192 and c256. Stop at c256 because that
 is the current CI admission envelope, and record that boundary rather than
 calling the workers saturated.
 
-Every matrix point uses the complete declared performance corpus. Never claim
-a c64 or c128 result from a 20- or 50-request CI subset. Use the full source
-dataset for the performance curve and retain the exact CI subset for the final
-CI-contract replay. For generated audio, score every retained output directory;
-do not infer quality from the selected point alone.
+The current CI concurrency is the lower bound of each model sweep. Do not spend
+qualification time on lower points: they cannot establish a faster CI operating
+point. Every matrix point uses the exact CI performance corpus and request
+arguments for that stage. A concurrency greater than the request count is not a
+scaling point because the client cannot offer that many simultaneous requests.
+For generated audio, score every retained output directory; do not infer quality
+from the selected point alone.
 
 Record:
 
@@ -251,11 +256,11 @@ misrepresented as a router scaling limit.
 
 | Workload | Requests | Rust policies | Aggregate `K` |
 | --- | ---: | --- | --- |
-| Fun-ASR SeedTTS EN | 1,088 | RR, LR | 16, 32, 64, 96, 128 |
-| Qwen3-ASR SeedTTS EN | 1,088 | RR, LR | 16, 32, 64, 96, 128 |
-| Whisper SeedTTS EN | 1,088 | RR, LR | 16, 32, 64, 96, 128 |
-| MOSS-TD movies800 non-stream | 800 | RR, LR | 8, 16, 32, 64, 96 |
-| MOSS-TD movies800 stream | 800 | RR, LR | 8, 16, 32, 64, 96 |
+| Fun-ASR SeedTTS EN | 1,088 | RR, LR | 32, 64, 96, 128 |
+| Qwen3-ASR SeedTTS EN | 1,088 | RR, LR | 32, 64, 96, 128 |
+| Whisper SeedTTS EN | 1,088 | RR, LR | 32, 64, 96, 128 |
+| MOSS-TD movies800 non-stream | 800 | RR, LR | 16, 32, 64, 96 |
+| MOSS-TD movies800 stream | 800 | RR, LR | 16, 32, 64, 96 |
 
 Run a streaming control for all three SeedTTS ASR models at the selected
 non-stream `K`. If streaming selects a different policy or changes throughput
@@ -270,18 +275,35 @@ correctness and long-request tail checks, not high-concurrency scaling claims.
 
 | Model | Modes | Rust policies | Aggregate `K` |
 | --- | --- | --- | --- |
-| Higgs TTS | WAV, PCM stream | RR, LR | 8, 16, 32, 64, 96, 128 |
-| MOSS-TTS Local | WAV, PCM stream | RR, LR | 8, 16, 32, 64, 96, 128 |
-| Qwen3-TTS 1.7B Base | WAV, PCM stream | RR, LR | 8, 16, 32, 64, 96, 128 |
+| Higgs TTS | WAV, PCM stream | RR, LR | 16, 32, 64, 96, 128 |
+| MOSS-TTS Local | WAV, PCM stream | RR, LR | 16, 32, 64, 96, 128 |
+| Qwen3-TTS 1.7B Base, unchanged CI preset | WAV, PCM stream | RR, LR | 16, 32 |
 
 Use all 1,088 SeedTTS EN requests at every matrix point and for final
 correctness. Generation remains unseeded. Preserve and score every retained
 WAV/PCM output directory.
 
-Qwen3-TTS currently configures 64 running requests and CUDA graph/compile batch
-size per worker, so c128 is a meaningful aggregate endpoint. Do not copy those
-worker settings to Higgs or MOSS. Their direct curves decide whether c96/c128
+Qwen3-TTS CI configures 64 running requests but retains the worker's default
+16-request waiting queue. Every request enters that queue before admission, so
+the unchanged preset can reject a synchronized aggregate c64 burst even though
+the running limit is higher. Direct workers, Python RR, and Rust RR all reproduced
+that 503 at c64; it is a worker admission limit, not a router result. Do not rerun
+c64/c96/c128 against the unchanged preset.
+
+If a higher Qwen3-TTS operating point is still desired, run it as a separate
+worker-tuning experiment. Add
+`--tts_engine.engine.max_queued_requests 64`, measure the direct c64/c96/c128
+curve first, and only then repeat the selected Rust points. The 16-request
+request-build pending depth is not the waiting-queue limit: overflow build work
+can remain in the scheduler backlog once the waiting queue is raised. Do not copy
+Qwen3-TTS settings to Higgs or MOSS. Their direct curves decide whether c96/c128
 are useful.
+
+On latest `upstream/main`, MOSS-TTS Local rejects an empty generated-audio result
+before it can reach the SHM relay as a zero-byte tensor. This prevents the prior
+relay exception from crashing the workers, but an empty generation is still a
+failed request. Replay PCM c32 on the updated revision; any recurrence remains an
+invalid point and must be recorded as a worker/model failure.
 
 ### Higgs mixed serving
 
@@ -307,8 +329,8 @@ from aggregate latency.
 
 | Model | Rust policies | Aggregate `K` |
 | --- | --- | --- |
-| Higgs MPS pool | RR, LR | 8, 16, 32, 64 |
-| MOSS-TTS MPS pool | RR, LR | 8, 16, 32, 64 |
+| Higgs MPS pool | RR, LR | 16, 32, 64 |
+| MOSS-TTS MPS pool | RR, LR | 16, 32, 64 |
 
 Run the full 1,088-sample canonical benchmark at the selected point, including
 overlap canary, WER, similarity, CPU/request, RSS, worker distribution, and MPS
@@ -318,14 +340,17 @@ cleanup evidence. MPS concurrency is selected independently of ordinary DP2.
 
 | Stage | Performance input scope | Rust policies | Aggregate `K` |
 | --- | --- | --- | --- |
-| BF16 Omni TTS | full SeedTTS EN for screening; SeedTTS-50 for CI correctness | RR, LR | 8, 16, 32, 64, 96, 128 |
-| FP8 MMMU text/image | full MMMU evaluation split | RR, LR | 4, 8, 16, 32, then 64 only when at least 256 requests are available |
-| BF16 MMSU audio/text | 2,000 requests | RR, LR | 8, 16, 32, 64, 96, 128 |
-| FP8 Video-AMME video/text | full Video-AMME evaluation split | RR, LR | 4, 8, 16, 32, then 64 only when at least 256 requests are available |
+| BF16 Omni TTS | SeedTTS-50 | RR, LR | 16, 32 |
+| FP8 MMMU text/image | `mmmu-ci-50`, 50 requests, warmup 2 | RR, LR | 16, 32 |
+| BF16 MMSU audio/text | `mmsu-ci-2000`, 2,000 requests, warmup 0 | RR, LR | 16, 32, 64, 96, 128 |
+| FP8 Video-AMME video/text | `videoamme-ci-50`, 50 requests | RR, LR | 16, 32 |
 
 The four request shapes remain separate even when they use the same model.
 Image upload, audio upload, video upload, and audio-output streaming exercise
 different relay costs and can select different useful concurrency points.
+MMMU and Video-AMME use their exact 50-request CI datasets rather than the full
+upstream evaluation splits. MMSU CI intentionally uses all 2,000 requests; do
+not reduce it to a 20- or 50-request sample.
 
 ## Worker-argument tuning boundary
 
