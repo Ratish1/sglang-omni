@@ -90,6 +90,31 @@ table: requests per second, audio seconds per second, TTFC mean and p99, inter c
 p99, request latency mean and p99, RTF, playback continuity at 200 ms, WER, completed. Pass:
 nothing worse than A's three pass band, 3264 of 3264 per arm, no traceback.
 
+## 7. E3, added 2026-09-12, the c16 similarity streak
+
+Six of seven unseeded c16 and c1 pairs since S3 read B below A on similarity by 0.09 to 0.23,
+inside every interval but one signed. The one same-draw comparison so far (S3 seeded c1) read
+B above A, and slice A is bit exact at c1, so the only mechanism left at c16 is the vocoder's
+batch composition, which a faster talker changes. Two boots settle it:
+
+```bash
+# one server per arm, same as the seeded c1 pass, then on each:
+python -m benchmarks.eval.benchmark_tts_seedtts --generate-only --use-existing-server \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --meta zhaochenyang20/seed-tts-eval-arrow \
+  --ref-format references --lang en --seed 1234 --warmup 1 --max-concurrency 16 \
+  --port $PORT --output-dir $OUT/seeded_c16/$ARM/bench
+```
+
+Then the WAV hashes of both arms and the similarity and WER scores of both. Read:
+
+- Hashes equal 1088 of 1088: the c16 quality numbers of a bit exact slice are the draw, and no
+  future bit exact slice runs a c16 quality comparison.
+- Hashes differ: the count that differ and the paired per sample similarity delta, scored on
+  the Mac as in readout 20, say whether batch composition moves similarity. That is a vocoder
+  finding (backlog M1), owned by its own item, not by this slice.
+
+Archive `seeded_c16/{A,B}` with the rest.
+
 ## 6. Archive
 
 Suites' output, census directories, the seeded hashes, the E2 traces and their timeline and
