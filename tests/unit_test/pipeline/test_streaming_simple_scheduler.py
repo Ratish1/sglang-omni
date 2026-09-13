@@ -414,6 +414,40 @@ def test_stream_chunk_batch_filters_request_aborted_during_validation() -> None:
     assert "bad" not in scheduler.stream_state
 
 
+class _ReadyStepScheduler(_TestStreamingScheduler):
+    def __init__(self, **kw: int) -> None:
+        self.events: list[str] = []
+        self.ready = False
+        super().__init__(**kw)
+
+    def _has_ready_work(self) -> bool:
+        return self.ready
+
+    def _run_ready_step(self) -> None:
+        self.events.append("step")
+        self.ready = False
+        self.stop()
+
+    def on_stream_chunk(
+        self, request_id: str, item: StreamItem
+    ) -> list[OutgoingMessage]:
+        self.events.append(f"chunk:{request_id}")
+        return super().on_stream_chunk(request_id, item)
+
+
+def test_serving_loop_drains_pending_then_inbox_before_the_ready_step() -> None:
+    scheduler = _ReadyStepScheduler()
+    scheduler.ready = True
+    scheduler._pending_messages.append(_chunk("a", "x"))
+    scheduler.inbox.put(_chunk("b", "y"))
+
+    scheduler.start()
+
+    assert scheduler.events == ["chunk:a", "chunk:b", "step"]
+    assert not scheduler._pending_messages
+    assert scheduler.inbox.empty()
+
+
 class _DeferredDoneScheduler(_TestStreamingScheduler):
     def on_stream_done(self, request_id: str) -> None:
         del request_id
