@@ -904,6 +904,7 @@ def load_cosyvoice3_flow_hift(
     flow.to(device).eval()
     hift.to(device).eval()
     _keep_hift_constants_on_device(hift, device)
+    _patch_causal_conv_cache()
     # note (Dayuxiaoshui): folding weight_norm is the only load-time step
     # batched decode needs.
     folded = 0
@@ -971,6 +972,25 @@ def _patch_chunk_mask() -> None:
         return masks
 
     cosyvoice_dit.add_optional_chunk_mask = _chunk_mask
+
+
+def _patch_causal_conv_cache() -> None:
+    """Allocate CausalConv1d's zero cache on the device. CosyVoice builds it
+    on the CPU and copies it in, one host sync per conv per HiFT call.
+    """
+    try:
+        from cosyvoice.transformer.convolution import CausalConv1d
+    except ImportError as exc:
+        raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
+
+    original_forward = CausalConv1d.forward
+
+    def forward(self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)):
+        if cache.size(2) == 0:
+            cache = x.new_zeros(x.shape[0], x.shape[1], self.causal_padding)
+        return original_forward(self, x, cache)
+
+    CausalConv1d.forward = forward
 
 
 def _keep_hift_constants_on_device(hift: torch.nn.Module, device: str) -> None:
