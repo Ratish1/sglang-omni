@@ -685,6 +685,8 @@ class Qwen3TTSIncrementalDecoder:
         context: Dynamo guards on both, and the step advances the state.
         """
         if self._compiled_kernel is None:
+            # Dynamo admits 8 traced shapes per function (recompile_limit) and
+            # raises past that under fullgraph; raise the limit before tracing more.
             self._compiled_kernel = torch.compile(
                 self._decode_tensors, dynamic=False, fullgraph=True
             )
