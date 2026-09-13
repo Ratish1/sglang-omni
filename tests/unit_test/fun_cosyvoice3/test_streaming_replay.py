@@ -57,13 +57,9 @@ class _ReplayFlow(_PackedFlow):
     def __init__(self) -> None:
         super().__init__(channels=80, max_frames=2048)
         self.spk_embed_affine_layer = torch.nn.Linear(192, 80, bias=False)
-        self.native_calls: list[dict] = []
 
     def inference(self, **kwargs):
-        self.native_calls.append(kwargs)
-        token_count = int(kwargs["token"].shape[1])
-        if not kwargs["finalize"]:
-            token_count = max(token_count - PRE_LOOKAHEAD_LEN, 0)
+        token_count = int(kwargs["token"].shape[1]) - PRE_LOOKAHEAD_LEN
         return torch.ones(1, 80, token_count * TOKEN_MEL_RATIO), None
 
 
@@ -72,6 +68,16 @@ class _ReplayHiFT(_FakeHiFT):
         frames = int(speech_feat.shape[-1])
         self.calls.append((frames, finalize))
         return torch.zeros(1, frames * SAMPLES_PER_FRAME), None
+
+
+class _ReplayVocoder(stages.CosyVoice3Vocoder):
+    def __init__(self, flow: _ReplayFlow, hift: _ReplayHiFT) -> None:
+        super().__init__(FunCosyVoice3Flow(flow), hift)
+        self.leftover_tokens: list[list[int]] = []
+
+    def leftover_batch(self, items):
+        self.leftover_tokens.extend(item.token.flatten().tolist() for item in items)
+        return super().leftover_batch(items)
 
 
 @dataclass
@@ -99,8 +105,7 @@ def _replay(
 ) -> tuple[_ReplayFlow, FunCosyVoice3StreamingVocoderScheduler, _ReplayStats]:
     flow = _ReplayFlow()
     scheduler = FunCosyVoice3StreamingVocoderScheduler(
-        stages.CosyVoice3Vocoder(FunCosyVoice3Flow(flow), _ReplayHiFT()),
-        max_batch_size=8,
+        _ReplayVocoder(flow, _ReplayHiFT()), max_batch_size=8
     )
     clock = _Clock(events[0]["t_ns"] / 1e9)
     scheduler._clock = clock
@@ -198,10 +203,8 @@ def test_recorded_c16_inbox_replays_in_order_and_completes(fixture: str) -> None
     assert set(last_type.values()) == {"result"}
 
     remaining = {tuple(tokens): rid for rid, tokens in stats.expected.items()}
-    for call in flow.native_calls:
-        if not call["finalize"]:
-            continue
-        remaining.pop(tuple(call["token"].flatten().tolist()))
+    for tokens in scheduler._vocoder.leftover_tokens:
+        remaining.pop(tuple(tokens))
     assert remaining == {}
 
     samples = {rid: 0 for rid in request_ids}
