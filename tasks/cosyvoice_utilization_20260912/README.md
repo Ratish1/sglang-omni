@@ -4,6 +4,8 @@ The reported baseline is **3% SM utilization at concurrency 16**; the target rem
 
 Worktree: `analysis/cosyvoice-utilization-20260912`, based on Omni `645b472cdb2d7b93a1825a5bfa6a603b62b03936`. Local SGLang is `v0.5.19`, `0bcd822377da7b5718e674eaf9c870d349424dd1`. The original user documents and diagnostics are preserved under [inputs](inputs). Research agents used GPT‑5.6 Sol at medium effort, read assigned files completely, and produced factual mechanics reports. Root reconciled those reports and owns the conclusions and plans.
 
+Status 2026-09-13: the H100 results returned under `artifacts/cosyvoice-results-20260913/` were sliced with the [perfkit](perfkit/README.md); the measured ledgers are in [perfkit/RESULTS_20260913.md](perfkit/RESULTS_20260913.md) and the resulting root-cause-ordered program is [OPTIMIZATION_PLAN.md](OPTIMIZATION_PLAN.md). That plan supersedes the conditional sequence in `plans/00_stack.md` where the two differ.
+
 Read these in order:
 
 1. [Architecture and runtime contracts](ARCHITECTURE.md): topology, model math, streaming, ownership, and existing SGLang reuse.
