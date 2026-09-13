@@ -91,16 +91,16 @@ the seed-tts corpus.
 
 ## 6. What the branch needs, in order, each its own commit
 
-1. `precompile` builds its sample state under inference mode (one trace per shape), with
-   the bench's `--inference-precompile` run as the measurement: 12 unique graphs for 12
-   shapes, capture near 55 s at buckets 1 and 4.
-2. The compile configuration the runner lacks: Dynamo's recompile limit raised for the
-   shapes the vocoder compiles, mirroring SGLang's `set_torch_compile_config`
-   (cpu_graph_runner.py:121-131 in the pinned tree, called by the decode graph runner at
-   decode_cuda_graph_runner.py:391). The inductor cache is already on by default in this
-   torch.
-3. The window runner compiles widths 16, 32 and 64 (8 shared, 1, 2, 4 uncompiled).
-4. The default ladder 1 to 64 with these numbers in the message. The bucket list follows
-   the other runners unless the boot budget says otherwise.
+1. `precompile` traces on the runner's own capture tensors under inference mode (one
+   trace per shape), with the bench's `--inference-precompile` run as the measurement:
+   12 unique graphs for 12 shapes, capture near 55 s at buckets 1 and 4. Dynamo's
+   recompile limit stays at its default of 8 per function: the warm runner traces four
+   shapes and this slice compiles no other.
+2. The window runner at the buckets the cold and warm runners use (1, 2, 4, 8), every
+   width captured eager except width 8, which replays the compiled step the warm runners
+   trace. Compiling 16, 32 and 64 at four buckets is 12 shapes, about 50 s of boot by the
+   table above, for the 2 to 9 ms per bootstrap between the uncompiled and compiled rows
+   of section 3; that is a later slice with its own boot and first chunk reads.
+3. The default ladder 1 to 64 with these numbers in the message.
 
-Then the three test files on the box, then the pair of runbook 33.
+Then the three test files on the box, then the pairs of runbook 33.
