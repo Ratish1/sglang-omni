@@ -308,27 +308,30 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         static_codes: torch.Tensor,
         resources: _CaptureResourceSet,
     ) -> None:
-        """Run eager decodes that settle one shape before graph capture."""
+        """Run eager decodes that settle one shape before graph capture.
+
+        A compiled shape is traced first, on the static codes and a state
+        gathered the way the warmups and the capture gather theirs, so the
+        trace and the capture see the same tensors and the shape compiles
+        once.
+        """
 
         capture_stream = resources.stream
-        if key.fresh_frames in self._compile_fresh_frames:
-            self._decoder.precompile(
-                key.batch_bucket,
-                key.fresh_frames,
-                num_quantizers=self._num_quantizers,
-            )
+        compiled = key.fresh_frames in self._compile_fresh_frames
         capture_stream.wait_stream(torch.cuda.current_stream(self._device))
         with torch.cuda.stream(capture_stream), torch.inference_mode():
+            if compiled:
+                trace_state = self._arena.gather_by_index(
+                    self._scratch_index(key.batch_bucket)
+                )
+                resources.keepalives.append(trace_state)
+                self._decoder.precompile(static_codes, trace_state)
             for _ in range(self._WARMUP_ITERATIONS):
                 warmup_state = self._arena.gather_by_index(
                     self._scratch_index(key.batch_bucket)
                 )
                 resources.keepalives.append(warmup_state)
-                self._decoder.decode(
-                    static_codes,
-                    warmup_state,
-                    compiled=key.fresh_frames in self._compile_fresh_frames,
-                )
+                self._decoder.decode(static_codes, warmup_state, compiled=compiled)
         capture_stream.synchronize()
         del resources.keepalives[1:]
 

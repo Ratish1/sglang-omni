@@ -9,6 +9,10 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+# note(ratish): the cache entry limits sglang's set_torch_compile_config raises
+# to before it compiles one model forward per batch bucket.
+_DYNAMO_CACHE_ENTRIES = 1024
+
 
 @dataclass(frozen=True)
 class Qwen3TTSIncrementalCodecStateSpec:
@@ -673,30 +677,42 @@ class Qwen3TTSIncrementalDecoder:
         ).clamp(min=-1, max=1)
 
     def precompile(
-        self, batch_size: int, fresh_frames: int, *, num_quantizers: int
+        self, codes: torch.Tensor, state: Qwen3TTSIncrementalCodecState
     ) -> None:
-        """Compile the tensor-only step for one static shape.
+        """Trace the tensor-only step on these inputs and admit their shape.
 
         ``decode`` routes a shape through the compiled kernel only after it was
         precompiled here, so an unforeseen shape at serving time takes the eager
         path instead of a multi-second compile on a request's critical path.
+
+        The caller passes the codes and state it will decode with, under the
+        grad-disabling context it will decode in. Dynamo guards on the kind of
+        tensor it traced (an inference tensor and a plain one differ), so a
+        trace on stand-in tensors is thrown away at the first real call and
+        the shape compiles twice. The step writes the state's buffers, so pass
+        a state you can discard.
         """
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "Qwen3-TTS incremental codec precompile runs under the caller's "
+                "no_grad or inference_mode context"
+            )
         if self._compiled_kernel is None:
+            from torch._dynamo import config as dynamo_config
+
+            # note(ratish): one compiled function serves every shape the graph
+            # runners capture, more than Dynamo admits per function by default.
+            dynamo_config.cache_size_limit = max(
+                dynamo_config.cache_size_limit, _DYNAMO_CACHE_ENTRIES
+            )
+            dynamo_config.accumulated_cache_size_limit = max(
+                dynamo_config.accumulated_cache_size_limit, _DYNAMO_CACHE_ENTRIES
+            )
             self._compiled_kernel = torch.compile(
                 self._decode_tensors, dynamic=False, fullgraph=True
             )
-        shape = (int(batch_size), int(fresh_frames))
+        shape = (int(codes.shape[0]), int(codes.shape[-1]))
         if shape in self._compiled_shapes:
             return
-        parameter = next(self._decoder.parameters())
-        codes = torch.zeros(
-            (shape[0], int(num_quantizers), shape[1]),
-            dtype=torch.long,
-            device=parameter.device,
-        )
-        state = self.init_state(
-            shape[0], device=parameter.device, dtype=parameter.dtype
-        )
-        with torch.inference_mode():
-            self._compiled_kernel(codes, state)
+        self._compiled_kernel(codes, state)
         self._compiled_shapes.add(shape)
