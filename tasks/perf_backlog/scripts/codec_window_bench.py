@@ -22,6 +22,7 @@ import statistics
 import time
 
 import torch
+import torch._dynamo
 
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts.codec_state_arena import Qwen3TTSCodecStateArena
@@ -88,8 +89,6 @@ def main():
         # note(ratish): the decoder compiles one shape per width and bucket
         # through a single function, and Dynamo refuses more than eight per
         # function by default; the warm runner never asks for more, this does.
-        import torch._dynamo
-
         shapes = len(all_widths) * len(buckets) + 1
         torch._dynamo.config.cache_size_limit = max(
             torch._dynamo.config.cache_size_limit, shapes
