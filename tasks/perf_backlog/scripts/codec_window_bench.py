@@ -68,11 +68,19 @@ def main():
         help="capture every width from the compiled decoder step, as the warm "
         "runner does for its steady stride",
     )
+    parser.add_argument(
+        "--dynamic",
+        action="store_true",
+        help="with --compile: one dynamic shape trace of the decoder step serves "
+        "every width and bucket instead of one trace per shape",
+    )
     parser.add_argument("--out", default="codec_window_bench.json")
     args = parser.parse_args()
     widths = tuple(int(w) for w in args.widths.split(","))
     totals = tuple(int(t) for t in args.totals.split(","))
     buckets = tuple(int(b) for b in args.buckets.split(","))
+    if args.dynamic and not args.compile:
+        parser.error("--dynamic needs --compile")
 
     device = torch.device("cuda", torch.cuda.current_device())
     tokenizer = qwen3_stages._load_qwen3_tts_tokenizer(
@@ -85,6 +93,7 @@ def main():
     dtype = next(tokenizer.model.decoder.parameters()).dtype
     arena = Qwen3TTSCodecStateArena(decoder, num_slots=8, device=device, dtype=dtype)
     all_widths = tuple(sorted({1, 2, *widths}))
+    compile_s_per_shape: dict[str, float] = {}
     if args.compile:
         # note(ratish): the decoder compiles one shape per width and bucket
         # through a single function, and Dynamo refuses more than eight per
@@ -96,6 +105,23 @@ def main():
         torch._dynamo.config.accumulated_cache_size_limit = max(
             torch._dynamo.config.accumulated_cache_size_limit, shapes
         )
+        if args.dynamic:
+            # note(ratish): precompile keeps whatever kernel is installed and
+            # only records shapes, so one dynamic trace stands in for the per
+            # shape static compiles the decoder would otherwise build.
+            decoder._compiled_kernel = torch.compile(
+                decoder._decode_tensors, dynamic=True, fullgraph=True
+            )
+        original_precompile = decoder.precompile
+
+        def timed_precompile(batch_size, fresh_frames, *, num_quantizers):
+            started = time.perf_counter()
+            original_precompile(batch_size, fresh_frames, num_quantizers=num_quantizers)
+            compile_s_per_shape[f"{fresh_frames}x{batch_size}"] = (
+                time.perf_counter() - started
+            )
+
+        decoder.precompile = timed_precompile
     # note(ratish): the same construction the vocoder uses for its window
     # runner, with every candidate cap's rungs captured at once.
     runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
@@ -116,8 +142,13 @@ def main():
     transformer = tokenizer.model.decoder.pre_transformer
     result = {
         "compiled": bool(args.compile),
+        "dynamic": bool(args.dynamic),
         "buckets": list(buckets),
         "capture_s": time.perf_counter() - capture_start,
+        "compile_s_per_shape": compile_s_per_shape,
+        "dynamo_stats": (
+            dict(torch._dynamo.utils.counters["stats"]) if args.compile else {}
+        ),
         "captured_keys": stats["build"]["captured_keys"],
         "graph_footprint_bytes": stats["memory"].get("graph_footprint_bytes"),
         "decoder": {
