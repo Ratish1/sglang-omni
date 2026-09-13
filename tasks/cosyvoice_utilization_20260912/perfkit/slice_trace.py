@@ -719,6 +719,40 @@ def hift_frames(r):
     return int(r.get("frames", 0))
 
 
+def admission_waits(marks, lo, hi):
+    """Time each request waited unstarted while the scheduler kept the started pool.
+
+    The step selection marks are ordered on the vocoder thread and each one is
+    the scheduler's view until the next one, so the interval after a mark with
+    `admitting` false is charged to every request that mark lists as unstarted.
+    """
+    selections = [
+        m
+        for m in marks
+        if m["stage"] == "scheduler"
+        and m["op"] == "ready_candidates"
+        and lo <= m["start"] < hi
+    ]
+    per_request = defaultdict(lambda: {"held_ns": 0, "denials": 0})
+    for i, m in enumerate(selections):
+        if m["admitting"]:
+            continue
+        end = selections[i + 1]["start"] if i + 1 < len(selections) else hi
+        for rid in m["unstarted"]:
+            per_request[rid]["held_ns"] += end - m["start"]
+            per_request[rid]["denials"] += 1
+    return {
+        "marks": len(selections),
+        "admitting_share": (
+            round(sum(1 for m in selections if m["admitting"]) / len(selections), 3)
+            if selections
+            else None
+        ),
+        "last_step_s": describe([m["last_step_s"] for m in selections]),
+        "per_request": dict(per_request),
+    }
+
+
 def request_timeline(ranges, marks, threads, lo, hi):
     per = defaultdict(lambda: defaultdict(list))
     for m in marks:
@@ -765,6 +799,8 @@ def request_timeline(ranges, marks, threads, lo, hi):
                 "end": f["end"],
             }
         )
+    admission = admission_waits(marks, lo, hi)
+    per_request_waits = admission.pop("per_request")
     requests = []
     hop_rows = []
     for rid, ev in per.items():
@@ -799,6 +835,10 @@ def request_timeline(ranges, marks, threads, lo, hi):
         }
         rid_hops = sorted(hops.get(rid, []), key=lambda h: h["start"])
         rec["hops"] = len(rid_hops)
+        first_step = next(
+            (j for j, h in enumerate(rid_hops) if h["kind"] != "final"), None
+        )
+        waits = per_request_waits.get(rid, {"held_ns": 0, "denials": 0})
         for i, h in enumerate(rid_hops):
             if h["kind"] == "final":
                 ready = ar_done
@@ -827,6 +867,12 @@ def request_timeline(ranges, marks, threads, lo, hi):
                     ),
                     "run_ns": h["end"] - h["start"],
                     "to_pcm_yield_ns": (yields[0] - h["end"]) if yields else None,
+                    "admission_held_s": (
+                        round(waits["held_ns"] / 1e9, 6) if i == first_step else None
+                    ),
+                    "admission_denials": (
+                        waits["denials"] if i == first_step else None
+                    ),
                 }
             )
         requests.append(rec)
@@ -932,6 +978,7 @@ def request_timeline(ranges, marks, threads, lo, hi):
     return {
         "summary": summary,
         "hop_table": hop_table,
+        "admission": admission,
         "requests": requests,
         "hops": hop_rows,
     }
@@ -1225,6 +1272,13 @@ def markdown(result):
             ],
         )
     )
+    ad = rt["admission"]
+    if ad["marks"]:
+        out.append(
+            f"step selections {ad['marks']}, admitting share {ad['admitting_share']}, "
+            f"last step mean {ad['last_step_s']['mean']:.3f} s "
+            f"p90 {ad['last_step_s']['p90']:.3f} s\n"
+        )
     ga = result["gaps"]
     out.append("## GPU idle gaps by joint thread state\n")
     out.append(
@@ -1381,6 +1435,7 @@ def main():
         slim["requests"] = {
             "summary": result["requests"]["summary"],
             "hop_table": result["requests"]["hop_table"],
+            "admission": result["requests"]["admission"],
             "requests": result["requests"]["requests"],
         }
         args.json.write_text(json.dumps(slim, indent=1) + "\n")

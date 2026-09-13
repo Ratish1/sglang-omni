@@ -24,7 +24,7 @@ threshold, default 0.5).
 | Flow calls, HiFT calls | `flow/native`, `flow/packed_*`, `hift/inference` ranges with launched kernels and runtime API calls in the range | host per call, GPU union per call, host µs per launch, kernel count, mean kernel duration, GPU tail after host return, synchronizing API counts (`cudaStreamSynchronize`, `cudaMemcpy`, `cudaStreamWaitEvent`, `cudaEventQuery`) |
 | Preprocessing | `preprocessing/request` and nested ranges | reference miss against hit, finalize lock wait, embedding preparation, cache key |
 | Request timeline | HTTP, coordinator, `tts_engine` and `vocoder` marks per request | first-audio decomposition, AR span, drain after AR completion |
-| Streaming hops | `vocoder/stream_step` participants, `vocoder/stream_delta` finals, `tts_engine/stage_stream_chunk_sent` chunk ids | per hop: ready time (chunk 0 for 28 tokens, chunk n for 28 plus 25 n), start, run, queue delay, time to PCM yield |
+| Streaming hops | `vocoder/stream_step` participants, `vocoder/stream_delta` finals, `tts_engine/stage_stream_chunk_sent` chunk ids | per hop: ready time (chunk 0 for 28 tokens, chunk n for 28 plus 25 n), start, run, queue delay, time to PCM yield; on the first hop of each request the time it was listed unstarted while the `scheduler/ready_candidates` marks refused admission, and how many of those marks it appeared in |
 | GPU idle gaps | kernel union gaps intersected with the AR states (execute, active gap, inactive) and the vocoder states | what each thread was doing while the GPU idled, exactly by interval intersection |
 | SM Active by kernels present | `GPU_METRICS` samples labeled with every stage whose kernels overlap the 100 µs sampling interval | spatial efficiency of each stage's kernels |
 
