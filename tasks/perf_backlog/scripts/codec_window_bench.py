@@ -84,6 +84,19 @@ def main():
     dtype = next(tokenizer.model.decoder.parameters()).dtype
     arena = Qwen3TTSCodecStateArena(decoder, num_slots=8, device=device, dtype=dtype)
     all_widths = tuple(sorted({1, 2, *widths}))
+    if args.compile:
+        # note(ratish): the decoder compiles one shape per width and bucket
+        # through a single function, and Dynamo refuses more than eight per
+        # function by default; the warm runner never asks for more, this does.
+        import torch._dynamo
+
+        shapes = len(all_widths) * len(buckets) + 1
+        torch._dynamo.config.cache_size_limit = max(
+            torch._dynamo.config.cache_size_limit, shapes
+        )
+        torch._dynamo.config.accumulated_cache_size_limit = max(
+            torch._dynamo.config.accumulated_cache_size_limit, shapes
+        )
     # note(ratish): the same construction the vocoder uses for its window
     # runner, with every candidate cap's rungs captured at once.
     runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
