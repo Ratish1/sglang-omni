@@ -82,10 +82,6 @@ def _step_key(state: _CosyVoice3StreamState) -> tuple[int, int]:
 
 
 def _slack_s(state: _CosyVoice3StreamState, *, now: float, sample_rate: int) -> float:
-    # note(ratish): a stream that has emitted nothing has nothing to play, so
-    # it is as urgent as a stream whose buffer just ran out.
-    if state.first_emit_at is None:
-        return 0.0
     return state.speech_offset / sample_rate - (now - state.first_emit_at)
 
 
@@ -95,9 +91,11 @@ class FunCosyVoice3StreamingVocoderScheduler(
     """Decode CosyVoice3 speech tokens incrementally through Flow + HiFT.
 
     Messages only change per-request state. The serving loop runs one step
-    once the inbox is drained: the runnable stream with the least playback
-    slack goes first and every runnable stream with the same token window
-    joins it, so equal-shape hops share one causal Flow call.
+    once the inbox is drained: the started stream with the least playback
+    slack goes first, a new request's first hop is admitted only while every
+    started stream can afford one more step, and every runnable stream with
+    the same token window joins the step, so equal-shape hops share one
+    causal Flow call.
     """
 
     _can_batch_stream_chunks = True
@@ -129,6 +127,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self._disable_hop_growth = bool(disable_hop_growth)
         self._vocoder = vocoder
         self._clock: Callable[[], float] = time.monotonic
+        self._last_step_s = 0.0
         super().__init__(
             self._vocode_payload,
             batch_compute_fn=self._vocode_payloads,
@@ -293,42 +292,56 @@ class FunCosyVoice3StreamingVocoderScheduler(
         if state.ready_since is None and _step_kind(state) is not None:
             state.ready_since = self._clock()
 
-    def _ranked_candidates(self) -> list[_Candidate]:
-        now = self._clock()
+    def _runnable_candidates(self) -> list[_Candidate]:
         candidates: list[_Candidate] = []
         for request_id, state in self._stream_state_items():
             kind = _step_kind(state)
             if kind is not None and not self._is_aborted(request_id):
                 candidates.append(_Candidate(request_id, state, kind))
-        candidates.sort(
-            key=lambda candidate: (
-                _slack_s(candidate.state, now=now, sample_rate=self._sample_rate),
-                candidate.state.ready_since,
-                candidate.request_id,
-            )
-        )
         return candidates
 
     def _has_ready_work(self) -> bool:
         with self._state_lock:
-            return bool(self._ranked_candidates())
+            return bool(self._runnable_candidates())
 
     def select_step_participants(
         self,
     ) -> list[tuple[str, _CosyVoice3StreamState]]:
-        ranked = self._ranked_candidates()
-        if not ranked:
+        now = self._clock()
+        runnable = self._runnable_candidates()
+        started = sorted(
+            (c for c in runnable if c.state.first_emit_at is not None),
+            key=lambda c: (
+                _slack_s(c.state, now=now, sample_rate=self._sample_rate),
+                c.state.ready_since,
+                c.request_id,
+            ),
+        )
+        unstarted = sorted(
+            (c for c in runnable if c.state.first_emit_at is None),
+            key=lambda c: (c.state.ready_since, c.request_id),
+        )
+        pool = started
+        if unstarted and (not started or self._can_afford_a_step(started[0], now)):
+            pool = unstarted
+        if not pool:
             return []
-        head = ranked[0]
+        head = pool[0]
         if head.kind == FINAL:
             return [(head.request_id, head.state)]
         key = _step_key(head.state)
         peers = [
-            (candidate.request_id, candidate.state)
-            for candidate in ranked
-            if candidate.kind != FINAL and _step_key(candidate.state) == key
+            (c.request_id, c.state)
+            for c in pool
+            if c.kind != FINAL and _step_key(c.state) == key
         ]
         return peers[: self._max_batch_size]
+
+    def _can_afford_a_step(self, candidate: _Candidate, now: float) -> bool:
+        # note(ratish): admitting a new stream costs every started stream one
+        # step of wall time; the least-slack one must survive it.
+        slack = _slack_s(candidate.state, now=now, sample_rate=self._sample_rate)
+        return slack > self._last_step_s
 
     def build_step_plan(
         self, participants: list[tuple[str, _CosyVoice3StreamState]]
@@ -340,9 +353,11 @@ class FunCosyVoice3StreamingVocoderScheduler(
         participants: list[tuple[str, _CosyVoice3StreamState]],
         plan: str,
     ) -> dict[str, torch.Tensor]:
+        started_at = self._clock()
         if plan == FINAL:
             request_id, _ = participants[0]
             self._complete_stream_request(request_id, self._finish_stream(request_id))
+            self._last_step_s = self._clock() - started_at
             return {}
         # note (guozhihao-224): B>1 uses packed inference_causal; B=1 keeps
         # native CosyVoice Flow.inference. Packed singleton-vs-row tests
@@ -354,6 +369,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             delta = self._run_one_causal_hop(state)
             decoded = {request_id: delta} if delta.numel() > 0 else {}
         now = self._clock()
+        self._last_step_s = now - started_at
         for request_id, state in participants:
             if request_id in decoded and state.first_emit_at is None:
                 state.first_emit_at = now

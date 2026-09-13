@@ -664,29 +664,69 @@ def test_pump_drains_backlog_across_one_hop_steps() -> None:
     assert len(messages) == 3
 
 
-def test_steps_run_least_slack_first() -> None:
+def _started_stream_and_new_first_hop(
+    clock: _Clock,
+) -> tuple[_FakeFlow, FunCosyVoice3StreamingVocoderScheduler]:
+    flow, scheduler = _scheduler()
+    scheduler._clock = clock
+    for request_id in ("req-a", "req-b"):
+        scheduler._on_streaming_new_request(request_id, _stream_payload(request_id))
+    scheduler._ingest_stream_item("req-a", _item(list(range(28))))
+    assert _serve(scheduler) == 1
+    scheduler._ingest_stream_item("req-a", _item(list(range(28, 178))))
+    scheduler._ingest_stream_item("req-b", _item(list(range(28))))
+    return flow, scheduler
+
+
+def test_first_hop_is_admitted_while_the_started_stream_can_afford_a_step() -> None:
+    flow, scheduler = _started_stream_and_new_first_hop(_Clock())
+    assert _serve(scheduler) == 3
+    assert [int(call["token"].shape[1]) for call in flow.calls] == [28, 28, 78, 178]
+
+
+def test_started_stream_runs_first_once_it_cannot_afford_a_step() -> None:
+    clock = _Clock()
+    flow, scheduler = _started_stream_and_new_first_hop(clock)
+    clock.now += 1.0
+    assert _serve(scheduler) == 3
+    assert [int(call["token"].shape[1]) for call in flow.calls] == [28, 78, 178, 28]
+
+
+def test_first_hop_runs_when_no_started_stream_is_runnable() -> None:
     flow, scheduler = _scheduler()
     clock = _Clock()
     scheduler._clock = clock
-    for request_id in ("req-a", "req-b", "req-c"):
+    for request_id in ("req-a", "req-b"):
+        scheduler._on_streaming_new_request(request_id, _stream_payload(request_id))
+    scheduler._ingest_stream_item("req-a", _item(list(range(28))))
+    assert _serve(scheduler) == 1
+    clock.now += 1.0
+    scheduler._ingest_stream_item("req-b", _item(list(range(28))))
+    assert _serve(scheduler) == 1
+    assert [int(call["token"].shape[1]) for call in flow.calls] == [28, 28]
+
+
+def test_finals_rank_by_slack_with_the_other_started_streams() -> None:
+    flow, scheduler = _scheduler()
+    clock = _Clock()
+    scheduler._clock = clock
+    for request_id in ("req-a", "req-c"):
         scheduler._on_streaming_new_request(request_id, _stream_payload(request_id))
     scheduler._ingest_stream_item("req-a", _item(list(range(28))))
     assert _serve(scheduler) == 1
     scheduler._ingest_stream_item("req-c", _item(list(range(78))))
     assert _serve(scheduler) == 2
-    assert [int(call["token"].shape[1]) for call in flow.calls] == [28, 28, 78]
     a_samples = scheduler._stream_states["req-a"].speech_offset
     c_samples = scheduler._stream_states["req-c"].speech_offset
     assert 0 < a_samples < c_samples
 
     scheduler._ingest_stream_item("req-a", _item(list(range(28, 78))))
-    scheduler._ingest_stream_item("req-b", _item(list(range(28))))
     scheduler._on_done("req-c")
     clock.now += (a_samples + c_samples) / 2 / scheduler._sample_rate
-    assert _serve(scheduler) == 3
+    assert _serve(scheduler) == 2
     assert [
         (int(call["token"].shape[1]), call["finalize"]) for call in flow.calls[3:]
-    ] == [(78, False), (28, False), (78, True)]
+    ] == [(78, False), (78, True)]
     assert "req-c" not in scheduler._stream_states
 
 

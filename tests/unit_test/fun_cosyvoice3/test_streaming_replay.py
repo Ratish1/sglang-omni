@@ -144,10 +144,12 @@ def _replay(
             if request_id in stats.final_ready:
                 continue
             if _step_kind(state) == FINAL:
-                stats.final_ready[request_id] = (
-                    clock.now,
-                    _slack_s(state, now=clock.now, sample_rate=scheduler._sample_rate),
-                )
+                slack = 0.0
+                if state.first_emit_at is not None:
+                    slack = _slack_s(
+                        state, now=clock.now, sample_rate=scheduler._sample_rate
+                    )
+                stats.final_ready[request_id] = (clock.now, slack)
         while True:
             try:
                 message = scheduler.outbox.get_nowait()
