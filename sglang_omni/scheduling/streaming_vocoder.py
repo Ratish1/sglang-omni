@@ -222,7 +222,12 @@ class StreamingVocoderBase(
         item = self._validate_stream_chunk_item(request_id, item)
         self.on_stream_chunk_batch([(request_id, item)])
 
-    def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
+    def on_stream_done(self, request_id: str) -> list[OutgoingMessage] | None:
+        return self._finish_stream(request_id)
+
+    def _finish_stream(self, request_id: str) -> list[OutgoingMessage]:
+        """Flush the remainder (or the nothing-emitted fallback), then build
+        the terminal result; records the id as completed."""
         payload = self._stream_payloads[request_id]
         state = self._get_or_create_stream_state(request_id)
         if state is None:
