@@ -7,10 +7,19 @@ returned on 2026-09-13, sliced with the perfkit ([results](perfkit/RESULTS_20260
 line references are to this branch unless a file is named with `upstream/main:`.
 
 Goal as stated by the team: raise SM Active at concurrency 16 from the reported 2 to 3 percent to
-30 percent while raising goodput (successful audio seconds per wall second). The 2 to 3 percent
-figure has not been reproduced: the finite cohorts measure 16 to 31 percent SM Active over their
-HTTP windows. Task M2 below reproduces the team's number with its own method before it is used as
-the baseline. Everything else in this plan is anchored on the perfkit ledgers, which do not depend
+30 percent while raising goodput (successful audio seconds per wall second). The measured c16
+baseline, one definition each (results section 0):
+
+| c16 cell, eager | GR Active % | SMs Active % | Tensor Active % | nvidia-smi utilization % |
+|---|---:|---:|---:|---:|
+| streaming | 40 to 43 | 19.5 | 2.5 to 2.6 | 67 to 70 mean, 98 peak |
+| buffered | 53 to 54 | 28 to 31 | 3.9 to 4.4 | 66 to 75 mean, 98 peak |
+
+The Nsight counters are 100 µs samples averaged over the HTTP cohort window; nvidia-smi is the
+5 s sample mean over the profiler-off full-corpus run. No counter reads 2 to 3 percent except
+Tensor Active, so the team's figure is either that counter or a window this branch has not seen;
+task M2 reproduces it with the team's method before it is used. The plan's targets are the
+SMs Active values above. Everything else is anchored on the perfkit ledgers, which do not depend
 on that reproduction.
 
 ## 1. What the traces establish

@@ -942,6 +942,39 @@ def request_timeline(ranges, marks, threads, lo, hi):
     }
 
 
+def replay_sequence(marks, lo, hi):
+    """Vocoder inbox arrival order reconstructed from the AR side marks.
+
+    Each stream chunk is the tts_engine stage_stream_chunk_sent mark (28 tokens
+    for chunk 0, 25 for later chunks by the producer contract); stream_done is
+    the tts_engine stage_complete mark. This is the fixture a scheduler unit
+    test replays through the vocoder scheduler with a fake vocoder to assert
+    per-request token order and final-decode liveness.
+    """
+    events = []
+    for m in marks:
+        if not (lo <= m["start"] < hi) or m["stage"] != "tts_engine":
+            continue
+        rid = m.get("request_id")
+        if m["op"] == "stage_stream_chunk_sent":
+            cid = int(m["metadata"].get("chunk_id", 0))
+            events.append(
+                {
+                    "t_ns": m["start"],
+                    "request_id": rid,
+                    "type": "stream_chunk",
+                    "chunk_id": cid,
+                    "tokens": AR_FIRST_FLUSH if cid == 0 else AR_FOLLOWUP_FLUSH,
+                }
+            )
+        elif m["op"] == "stage_complete":
+            events.append(
+                {"t_ns": m["start"], "request_id": rid, "type": "stream_done"}
+            )
+    events.sort(key=lambda e: e["t_ns"])
+    return events
+
+
 def gap_attribution(kernels, ar, voc, lo, hi, min_gap_ns):
     all_union = union(clip([(k["start"], k["end"]) for k in kernels], lo, hi))
     g = [x for x in gaps(all_union, lo, hi) if x[1] - x[0] >= min_gap_ns]
@@ -1308,6 +1341,7 @@ def analyze(sqlite_path, device, start_ns, end_ns, min_gap_ms, name):
         "requests": reqs,
         "gaps": ga,
         "sm": sm,
+        "replay": replay_sequence(marks, lo, hi),
     }
     db.close()
     return result
@@ -1323,11 +1357,18 @@ def main():
     parser.add_argument("--name", default=None)
     parser.add_argument("--json", type=Path)
     parser.add_argument("--md", type=Path)
+    parser.add_argument(
+        "--replay-json",
+        type=Path,
+        help="write the reconstructed vocoder inbox sequence for scheduler replay tests",
+    )
     args = parser.parse_args()
     name = args.name or args.sqlite.parent.name
     result = analyze(
         args.sqlite, args.device, args.start_ns, args.end_ns, args.min_gap_ms, name
     )
+    if args.replay_json:
+        args.replay_json.write_text(json.dumps(result["replay"], indent=1) + "\n")
     text = markdown(result)
     if args.md:
         args.md.write_text(text)
@@ -1335,6 +1376,7 @@ def main():
         print(text)
     if args.json:
         slim = dict(result)
+        slim.pop("replay", None)
         slim["ar"] = {k: v for k, v in result["ar"].items() if k != "steps_detail"}
         slim["flow"] = {"table": result["flow"]["table"]}
         slim["hift"] = {"table": result["hift"]["table"]}

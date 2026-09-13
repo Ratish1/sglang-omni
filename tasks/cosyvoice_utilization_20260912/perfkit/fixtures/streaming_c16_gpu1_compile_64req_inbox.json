@@ -1,0 +1,2555 @@
+[
+ {
+  "t_ns": 207976317,
+  "request_id": "speech-1fd383e1-07a7-464c-95c2-f53e59f9e91e",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 208067076,
+  "request_id": "speech-94254fc6-cecb-41da-9825-fde4389b924e",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 287418040,
+  "request_id": "speech-1fd383e1-07a7-464c-95c2-f53e59f9e91e",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 287463843,
+  "request_id": "speech-94254fc6-cecb-41da-9825-fde4389b924e",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 332901680,
+  "request_id": "speech-1fd383e1-07a7-464c-95c2-f53e59f9e91e",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 333561021,
+  "request_id": "speech-1fd383e1-07a7-464c-95c2-f53e59f9e91e",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 390342596,
+  "request_id": "speech-94254fc6-cecb-41da-9825-fde4389b924e",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 399444772,
+  "request_id": "speech-94254fc6-cecb-41da-9825-fde4389b924e",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 399729673,
+  "request_id": "speech-94254fc6-cecb-41da-9825-fde4389b924e",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 714959397,
+  "request_id": "speech-ef2fbc2d-4905-4a7f-a48b-8614db5a5001",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 715033136,
+  "request_id": "speech-86543a68-c386-47c1-bdb0-d7049743f739",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 715078386,
+  "request_id": "speech-45df8423-98fd-4167-be3b-54194a9c5d0b",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 715125468,
+  "request_id": "speech-6802384b-04c4-4e2e-8940-9e321b24fa0d",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 715357201,
+  "request_id": "speech-2c40e9c6-dfad-41c0-a4b7-326c0ff336bf",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 715402881,
+  "request_id": "speech-5ed69c65-b02e-4b92-8d35-0f13aa0425ec",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 715739268,
+  "request_id": "speech-12b61733-492c-4dea-8573-8b9ff6e567c8",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 715786227,
+  "request_id": "speech-5e0d106b-0949-4c9a-8ccd-ad2db83fea97",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 1000285898,
+  "request_id": "speech-ef2fbc2d-4905-4a7f-a48b-8614db5a5001",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1000342071,
+  "request_id": "speech-86543a68-c386-47c1-bdb0-d7049743f739",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1000374356,
+  "request_id": "speech-45df8423-98fd-4167-be3b-54194a9c5d0b",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1000694018,
+  "request_id": "speech-6802384b-04c4-4e2e-8940-9e321b24fa0d",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1000732603,
+  "request_id": "speech-2c40e9c6-dfad-41c0-a4b7-326c0ff336bf",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1000937709,
+  "request_id": "speech-5ed69c65-b02e-4b92-8d35-0f13aa0425ec",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1000971442,
+  "request_id": "speech-12b61733-492c-4dea-8573-8b9ff6e567c8",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1001247677,
+  "request_id": "speech-5e0d106b-0949-4c9a-8ccd-ad2db83fea97",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1090264540,
+  "request_id": "speech-49a0ba3c-6a74-49f0-ac30-3acab8c93a76",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 1090322769,
+  "request_id": "speech-5dc0bc8d-87f3-4a9e-8d4b-e04dae7f4cad",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 1090620694,
+  "request_id": "speech-c46221de-fb2c-475d-86f5-9e7bea93d4a5",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 1090847194,
+  "request_id": "speech-93fce686-25d5-43af-a49c-dca0441c0008",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 1090890052,
+  "request_id": "speech-66dce057-1993-462f-be53-5891c677299e",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 1091073422,
+  "request_id": "speech-5e08de8d-a198-4d49-b899-e07fd2e4fbf3",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 1131677291,
+  "request_id": "speech-ef2fbc2d-4905-4a7f-a48b-8614db5a5001",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1131731617,
+  "request_id": "speech-86543a68-c386-47c1-bdb0-d7049743f739",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1131761011,
+  "request_id": "speech-45df8423-98fd-4167-be3b-54194a9c5d0b",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1132088692,
+  "request_id": "speech-6802384b-04c4-4e2e-8940-9e321b24fa0d",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1132127575,
+  "request_id": "speech-2c40e9c6-dfad-41c0-a4b7-326c0ff336bf",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1132154214,
+  "request_id": "speech-5ed69c65-b02e-4b92-8d35-0f13aa0425ec",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1132176340,
+  "request_id": "speech-12b61733-492c-4dea-8573-8b9ff6e567c8",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1132201892,
+  "request_id": "speech-5e0d106b-0949-4c9a-8ccd-ad2db83fea97",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1160111574,
+  "request_id": "speech-2c40e9c6-dfad-41c0-a4b7-326c0ff336bf",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1160162355,
+  "request_id": "speech-2c40e9c6-dfad-41c0-a4b7-326c0ff336bf",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1174114039,
+  "request_id": "speech-7c05325e-7793-40c2-a62e-96097bba9e09",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 1181244076,
+  "request_id": "speech-49a0ba3c-6a74-49f0-ac30-3acab8c93a76",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1181305518,
+  "request_id": "speech-5dc0bc8d-87f3-4a9e-8d4b-e04dae7f4cad",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1181343956,
+  "request_id": "speech-c46221de-fb2c-475d-86f5-9e7bea93d4a5",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1181377675,
+  "request_id": "speech-93fce686-25d5-43af-a49c-dca0441c0008",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1181642014,
+  "request_id": "speech-66dce057-1993-462f-be53-5891c677299e",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1181686360,
+  "request_id": "speech-5e08de8d-a198-4d49-b899-e07fd2e4fbf3",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1188991260,
+  "request_id": "speech-12b61733-492c-4dea-8573-8b9ff6e567c8",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1189068781,
+  "request_id": "speech-12b61733-492c-4dea-8573-8b9ff6e567c8",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1224007053,
+  "request_id": "speech-ef2fbc2d-4905-4a7f-a48b-8614db5a5001",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1224056679,
+  "request_id": "speech-86543a68-c386-47c1-bdb0-d7049743f739",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1224081076,
+  "request_id": "speech-45df8423-98fd-4167-be3b-54194a9c5d0b",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1224103631,
+  "request_id": "speech-6802384b-04c4-4e2e-8940-9e321b24fa0d",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1224123243,
+  "request_id": "speech-5ed69c65-b02e-4b92-8d35-0f13aa0425ec",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1224274685,
+  "request_id": "speech-5e0d106b-0949-4c9a-8ccd-ad2db83fea97",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1265707144,
+  "request_id": "speech-7c05325e-7793-40c2-a62e-96097bba9e09",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1278938846,
+  "request_id": "speech-49a0ba3c-6a74-49f0-ac30-3acab8c93a76",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1278999061,
+  "request_id": "speech-5dc0bc8d-87f3-4a9e-8d4b-e04dae7f4cad",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1279036438,
+  "request_id": "speech-c46221de-fb2c-475d-86f5-9e7bea93d4a5",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1279266088,
+  "request_id": "speech-93fce686-25d5-43af-a49c-dca0441c0008",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1279308168,
+  "request_id": "speech-66dce057-1993-462f-be53-5891c677299e",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1285828554,
+  "request_id": "speech-5e08de8d-a198-4d49-b899-e07fd2e4fbf3",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1292470462,
+  "request_id": "speech-5dc0bc8d-87f3-4a9e-8d4b-e04dae7f4cad",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1300848132,
+  "request_id": "speech-5ed69c65-b02e-4b92-8d35-0f13aa0425ec",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1300892740,
+  "request_id": "speech-5ed69c65-b02e-4b92-8d35-0f13aa0425ec",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1342051856,
+  "request_id": "speech-6802384b-04c4-4e2e-8940-9e321b24fa0d",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1342106228,
+  "request_id": "speech-6802384b-04c4-4e2e-8940-9e321b24fa0d",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1368373336,
+  "request_id": "speech-ef2fbc2d-4905-4a7f-a48b-8614db5a5001",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1368418081,
+  "request_id": "speech-86543a68-c386-47c1-bdb0-d7049743f739",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1368443035,
+  "request_id": "speech-45df8423-98fd-4167-be3b-54194a9c5d0b",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1368464184,
+  "request_id": "speech-5e0d106b-0949-4c9a-8ccd-ad2db83fea97",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1387469740,
+  "request_id": "speech-ef2fbc2d-4905-4a7f-a48b-8614db5a5001",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1387523075,
+  "request_id": "speech-ef2fbc2d-4905-4a7f-a48b-8614db5a5001",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1437642530,
+  "request_id": "speech-7c05325e-7793-40c2-a62e-96097bba9e09",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1451103185,
+  "request_id": "speech-49a0ba3c-6a74-49f0-ac30-3acab8c93a76",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1451159575,
+  "request_id": "speech-c46221de-fb2c-475d-86f5-9e7bea93d4a5",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1451182780,
+  "request_id": "speech-93fce686-25d5-43af-a49c-dca0441c0008",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1451201368,
+  "request_id": "speech-66dce057-1993-462f-be53-5891c677299e",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1451453587,
+  "request_id": "speech-5e08de8d-a198-4d49-b899-e07fd2e4fbf3",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1464121217,
+  "request_id": "speech-c46221de-fb2c-475d-86f5-9e7bea93d4a5",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1464178736,
+  "request_id": "speech-c46221de-fb2c-475d-86f5-9e7bea93d4a5",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1470047871,
+  "request_id": "speech-49a0ba3c-6a74-49f0-ac30-3acab8c93a76",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1470365114,
+  "request_id": "speech-49a0ba3c-6a74-49f0-ac30-3acab8c93a76",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1498784378,
+  "request_id": "speech-86543a68-c386-47c1-bdb0-d7049743f739",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1498841017,
+  "request_id": "speech-86543a68-c386-47c1-bdb0-d7049743f739",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1531723475,
+  "request_id": "speech-45df8423-98fd-4167-be3b-54194a9c5d0b",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1531776488,
+  "request_id": "speech-5e0d106b-0949-4c9a-8ccd-ad2db83fea97",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1571396248,
+  "request_id": "speech-7c05325e-7793-40c2-a62e-96097bba9e09",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1571452034,
+  "request_id": "speech-7c05325e-7793-40c2-a62e-96097bba9e09",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1588280222,
+  "request_id": "speech-93fce686-25d5-43af-a49c-dca0441c0008",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1588311110,
+  "request_id": "speech-66dce057-1993-462f-be53-5891c677299e",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1588332785,
+  "request_id": "speech-5e08de8d-a198-4d49-b899-e07fd2e4fbf3",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1598464187,
+  "request_id": "speech-5e08de8d-a198-4d49-b899-e07fd2e4fbf3",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1598795400,
+  "request_id": "speech-5e08de8d-a198-4d49-b899-e07fd2e4fbf3",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1624278019,
+  "request_id": "speech-66dce057-1993-462f-be53-5891c677299e",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1624332946,
+  "request_id": "speech-66dce057-1993-462f-be53-5891c677299e",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1628039456,
+  "request_id": "speech-45df8423-98fd-4167-be3b-54194a9c5d0b",
+  "type": "stream_chunk",
+  "chunk_id": 6,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1628069893,
+  "request_id": "speech-5e0d106b-0949-4c9a-8ccd-ad2db83fea97",
+  "type": "stream_chunk",
+  "chunk_id": 6,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1644760323,
+  "request_id": "speech-93fce686-25d5-43af-a49c-dca0441c0008",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1644820741,
+  "request_id": "speech-93fce686-25d5-43af-a49c-dca0441c0008",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1664685758,
+  "request_id": "speech-5e0d106b-0949-4c9a-8ccd-ad2db83fea97",
+  "type": "stream_chunk",
+  "chunk_id": 7,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1664742270,
+  "request_id": "speech-5e0d106b-0949-4c9a-8ccd-ad2db83fea97",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 1705723503,
+  "request_id": "speech-45df8423-98fd-4167-be3b-54194a9c5d0b",
+  "type": "stream_chunk",
+  "chunk_id": 7,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1778368248,
+  "request_id": "speech-45df8423-98fd-4167-be3b-54194a9c5d0b",
+  "type": "stream_chunk",
+  "chunk_id": 8,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1814579963,
+  "request_id": "speech-45df8423-98fd-4167-be3b-54194a9c5d0b",
+  "type": "stream_chunk",
+  "chunk_id": 9,
+  "tokens": 25
+ },
+ {
+  "t_ns": 1815328586,
+  "request_id": "speech-45df8423-98fd-4167-be3b-54194a9c5d0b",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 2879775989,
+  "request_id": "speech-6b0d4f3a-e94c-4321-aed4-6ead5af16b95",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 2978254970,
+  "request_id": "speech-6b0d4f3a-e94c-4321-aed4-6ead5af16b95",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3055849926,
+  "request_id": "speech-6b0d4f3a-e94c-4321-aed4-6ead5af16b95",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3104448233,
+  "request_id": "speech-6b0d4f3a-e94c-4321-aed4-6ead5af16b95",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3104521206,
+  "request_id": "speech-6b0d4f3a-e94c-4321-aed4-6ead5af16b95",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 3441598337,
+  "request_id": "speech-f7d3cb44-5ef9-48dc-9cba-f8652c40048f",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 3441677592,
+  "request_id": "speech-9d30add5-77c9-4c90-932a-185bc1f2a847",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 3540507023,
+  "request_id": "speech-f7d3cb44-5ef9-48dc-9cba-f8652c40048f",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3540560536,
+  "request_id": "speech-9d30add5-77c9-4c90-932a-185bc1f2a847",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3615456591,
+  "request_id": "speech-f7d3cb44-5ef9-48dc-9cba-f8652c40048f",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3615501754,
+  "request_id": "speech-9d30add5-77c9-4c90-932a-185bc1f2a847",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3695334779,
+  "request_id": "speech-f7d3cb44-5ef9-48dc-9cba-f8652c40048f",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3695402630,
+  "request_id": "speech-9d30add5-77c9-4c90-932a-185bc1f2a847",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3737668276,
+  "request_id": "speech-f7d3cb44-5ef9-48dc-9cba-f8652c40048f",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3738000623,
+  "request_id": "speech-f7d3cb44-5ef9-48dc-9cba-f8652c40048f",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 3795443400,
+  "request_id": "speech-9d30add5-77c9-4c90-932a-185bc1f2a847",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3815296852,
+  "request_id": "speech-9d30add5-77c9-4c90-932a-185bc1f2a847",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 3815671493,
+  "request_id": "speech-9d30add5-77c9-4c90-932a-185bc1f2a847",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 3973379201,
+  "request_id": "speech-966d71a1-488d-4946-8ab0-31cf1142b418",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 4017896465,
+  "request_id": "speech-8321dcb6-1ab6-4796-afa0-748d2b6e2533",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 4072975729,
+  "request_id": "speech-966d71a1-488d-4946-8ab0-31cf1142b418",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 4115476116,
+  "request_id": "speech-8321dcb6-1ab6-4796-afa0-748d2b6e2533",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 4162786641,
+  "request_id": "speech-966d71a1-488d-4946-8ab0-31cf1142b418",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 4162854596,
+  "request_id": "speech-966d71a1-488d-4946-8ab0-31cf1142b418",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 4194363903,
+  "request_id": "speech-8321dcb6-1ab6-4796-afa0-748d2b6e2533",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 4266089487,
+  "request_id": "speech-8321dcb6-1ab6-4796-afa0-748d2b6e2533",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 4344758075,
+  "request_id": "speech-8321dcb6-1ab6-4796-afa0-748d2b6e2533",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 4344841498,
+  "request_id": "speech-8321dcb6-1ab6-4796-afa0-748d2b6e2533",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 4538151938,
+  "request_id": "speech-987218dd-c0aa-44fd-8992-2a96fe8b5e69",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 4631331110,
+  "request_id": "speech-987218dd-c0aa-44fd-8992-2a96fe8b5e69",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 4713871378,
+  "request_id": "speech-987218dd-c0aa-44fd-8992-2a96fe8b5e69",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 4781686797,
+  "request_id": "speech-987218dd-c0aa-44fd-8992-2a96fe8b5e69",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 4857955524,
+  "request_id": "speech-987218dd-c0aa-44fd-8992-2a96fe8b5e69",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 4956719143,
+  "request_id": "speech-987218dd-c0aa-44fd-8992-2a96fe8b5e69",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 5073330314,
+  "request_id": "speech-987218dd-c0aa-44fd-8992-2a96fe8b5e69",
+  "type": "stream_chunk",
+  "chunk_id": 6,
+  "tokens": 25
+ },
+ {
+  "t_ns": 5079688606,
+  "request_id": "speech-987218dd-c0aa-44fd-8992-2a96fe8b5e69",
+  "type": "stream_chunk",
+  "chunk_id": 7,
+  "tokens": 25
+ },
+ {
+  "t_ns": 5080070441,
+  "request_id": "speech-987218dd-c0aa-44fd-8992-2a96fe8b5e69",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 5102896525,
+  "request_id": "speech-9d98e031-8065-402a-af73-a3f71847f054",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 5174982302,
+  "request_id": "speech-9d98e031-8065-402a-af73-a3f71847f054",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 5262454394,
+  "request_id": "speech-9d98e031-8065-402a-af73-a3f71847f054",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 5393844735,
+  "request_id": "speech-9d98e031-8065-402a-af73-a3f71847f054",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 5427217030,
+  "request_id": "speech-9d98e031-8065-402a-af73-a3f71847f054",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 5427542729,
+  "request_id": "speech-9d98e031-8065-402a-af73-a3f71847f054",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 5453087583,
+  "request_id": "speech-2bc17849-dd39-4a27-ace3-313215023999",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 5461818716,
+  "request_id": "speech-2bc17849-dd39-4a27-ace3-313215023999",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 5462129936,
+  "request_id": "speech-2bc17849-dd39-4a27-ace3-313215023999",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 5873388950,
+  "request_id": "speech-2eb04dc3-0e47-47a3-aceb-bd0b2c80d5e8",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 5943899140,
+  "request_id": "speech-2eb04dc3-0e47-47a3-aceb-bd0b2c80d5e8",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 6050958273,
+  "request_id": "speech-2eb04dc3-0e47-47a3-aceb-bd0b2c80d5e8",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 6078407051,
+  "request_id": "speech-bd108fa1-3b6c-449d-9d25-56be0c0ee813",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 6150598702,
+  "request_id": "speech-2eb04dc3-0e47-47a3-aceb-bd0b2c80d5e8",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 6159786666,
+  "request_id": "speech-2eb04dc3-0e47-47a3-aceb-bd0b2c80d5e8",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 6160221288,
+  "request_id": "speech-2eb04dc3-0e47-47a3-aceb-bd0b2c80d5e8",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 6180333850,
+  "request_id": "speech-bd108fa1-3b6c-449d-9d25-56be0c0ee813",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 6255021979,
+  "request_id": "speech-bd108fa1-3b6c-449d-9d25-56be0c0ee813",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 6313180421,
+  "request_id": "speech-bd108fa1-3b6c-449d-9d25-56be0c0ee813",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 6313241365,
+  "request_id": "speech-bd108fa1-3b6c-449d-9d25-56be0c0ee813",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 6660742341,
+  "request_id": "speech-1ef0691b-5d43-423c-9091-4d7e241bd114",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 6736285726,
+  "request_id": "speech-1ef0691b-5d43-423c-9091-4d7e241bd114",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 6736355741,
+  "request_id": "speech-23cf9589-281b-49ef-8ecb-d9afb4b90dd7",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 6833835373,
+  "request_id": "speech-1ef0691b-5d43-423c-9091-4d7e241bd114",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 6833888021,
+  "request_id": "speech-23cf9589-281b-49ef-8ecb-d9afb4b90dd7",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 6899086722,
+  "request_id": "speech-1ef0691b-5d43-423c-9091-4d7e241bd114",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 6899212902,
+  "request_id": "speech-1ef0691b-5d43-423c-9091-4d7e241bd114",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 6938415201,
+  "request_id": "speech-2a380e06-b7fa-4ff4-b8b9-0d032e2e35d0",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 6946822173,
+  "request_id": "speech-23cf9589-281b-49ef-8ecb-d9afb4b90dd7",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 7041023234,
+  "request_id": "speech-2a380e06-b7fa-4ff4-b8b9-0d032e2e35d0",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 7049239161,
+  "request_id": "speech-23cf9589-281b-49ef-8ecb-d9afb4b90dd7",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 7080107117,
+  "request_id": "speech-23cf9589-281b-49ef-8ecb-d9afb4b90dd7",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 7080167474,
+  "request_id": "speech-23cf9589-281b-49ef-8ecb-d9afb4b90dd7",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 7119085625,
+  "request_id": "speech-2a380e06-b7fa-4ff4-b8b9-0d032e2e35d0",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 7186471861,
+  "request_id": "speech-2a380e06-b7fa-4ff4-b8b9-0d032e2e35d0",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 7186540963,
+  "request_id": "speech-2a380e06-b7fa-4ff4-b8b9-0d032e2e35d0",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 7658440989,
+  "request_id": "speech-739a06ea-7687-4c00-b7ca-81197bfe7bc0",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 7755534597,
+  "request_id": "speech-739a06ea-7687-4c00-b7ca-81197bfe7bc0",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 7867622156,
+  "request_id": "speech-739a06ea-7687-4c00-b7ca-81197bfe7bc0",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 7903369465,
+  "request_id": "speech-49e9b8a9-a576-4531-94f2-d3e1f9dca168",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 7948569575,
+  "request_id": "speech-739a06ea-7687-4c00-b7ca-81197bfe7bc0",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 7989921821,
+  "request_id": "speech-49e9b8a9-a576-4531-94f2-d3e1f9dca168",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 8054908723,
+  "request_id": "speech-739a06ea-7687-4c00-b7ca-81197bfe7bc0",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 8094461126,
+  "request_id": "speech-49e9b8a9-a576-4531-94f2-d3e1f9dca168",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 8095155108,
+  "request_id": "speech-739a06ea-7687-4c00-b7ca-81197bfe7bc0",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 8095480998,
+  "request_id": "speech-739a06ea-7687-4c00-b7ca-81197bfe7bc0",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 8131733713,
+  "request_id": "speech-49e9b8a9-a576-4531-94f2-d3e1f9dca168",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 8132082526,
+  "request_id": "speech-49e9b8a9-a576-4531-94f2-d3e1f9dca168",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 10156818461,
+  "request_id": "speech-97ed4f4d-9c48-48d4-b442-fe28c189f39c",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 10247995686,
+  "request_id": "speech-97ed4f4d-9c48-48d4-b442-fe28c189f39c",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 10322278626,
+  "request_id": "speech-97ed4f4d-9c48-48d4-b442-fe28c189f39c",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 10404002008,
+  "request_id": "speech-97ed4f4d-9c48-48d4-b442-fe28c189f39c",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 10438120511,
+  "request_id": "speech-97ed4f4d-9c48-48d4-b442-fe28c189f39c",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 10438200395,
+  "request_id": "speech-97ed4f4d-9c48-48d4-b442-fe28c189f39c",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 10686251052,
+  "request_id": "speech-6bf6b5f2-6236-4154-bca5-a27094a348cd",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 10815822873,
+  "request_id": "speech-6bf6b5f2-6236-4154-bca5-a27094a348cd",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 10895590693,
+  "request_id": "speech-6bf6b5f2-6236-4154-bca5-a27094a348cd",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 10895650216,
+  "request_id": "speech-6a42ecbd-8776-4cb5-b3da-82a9089d4353",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 10970757532,
+  "request_id": "speech-6bf6b5f2-6236-4154-bca5-a27094a348cd",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 10970799741,
+  "request_id": "speech-6a42ecbd-8776-4cb5-b3da-82a9089d4353",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11066826363,
+  "request_id": "speech-6bf6b5f2-6236-4154-bca5-a27094a348cd",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11066859908,
+  "request_id": "speech-6a42ecbd-8776-4cb5-b3da-82a9089d4353",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11200122605,
+  "request_id": "speech-6bf6b5f2-6236-4154-bca5-a27094a348cd",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11200172780,
+  "request_id": "speech-6a42ecbd-8776-4cb5-b3da-82a9089d4353",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11222801146,
+  "request_id": "speech-6bf6b5f2-6236-4154-bca5-a27094a348cd",
+  "type": "stream_chunk",
+  "chunk_id": 6,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11222866082,
+  "request_id": "speech-6bf6b5f2-6236-4154-bca5-a27094a348cd",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 11235669574,
+  "request_id": "speech-6a42ecbd-8776-4cb5-b3da-82a9089d4353",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11235707390,
+  "request_id": "speech-6a42ecbd-8776-4cb5-b3da-82a9089d4353",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 11266206515,
+  "request_id": "speech-82591b2e-f800-47b3-9480-c0bfca641287",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 11336487613,
+  "request_id": "speech-82591b2e-f800-47b3-9480-c0bfca641287",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11423951620,
+  "request_id": "speech-82591b2e-f800-47b3-9480-c0bfca641287",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11555512294,
+  "request_id": "speech-82591b2e-f800-47b3-9480-c0bfca641287",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11629930116,
+  "request_id": "speech-df203112-824f-4778-bb87-8867d855f4f5",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 11636043224,
+  "request_id": "speech-82591b2e-f800-47b3-9480-c0bfca641287",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11654713679,
+  "request_id": "speech-82591b2e-f800-47b3-9480-c0bfca641287",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11654776569,
+  "request_id": "speech-82591b2e-f800-47b3-9480-c0bfca641287",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 11705332942,
+  "request_id": "speech-df203112-824f-4778-bb87-8867d855f4f5",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11793612870,
+  "request_id": "speech-df203112-824f-4778-bb87-8867d855f4f5",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11877895663,
+  "request_id": "speech-df203112-824f-4778-bb87-8867d855f4f5",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 11878521666,
+  "request_id": "speech-df203112-824f-4778-bb87-8867d855f4f5",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 11996896591,
+  "request_id": "speech-2d29035d-9fa8-41ee-a3fc-1c24ae47aea2",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 12096251269,
+  "request_id": "speech-2d29035d-9fa8-41ee-a3fc-1c24ae47aea2",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12147078441,
+  "request_id": "speech-6f8b9c5d-e789-487c-9987-bf870044d4b0",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 12192222941,
+  "request_id": "speech-2d29035d-9fa8-41ee-a3fc-1c24ae47aea2",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12242280627,
+  "request_id": "speech-6f8b9c5d-e789-487c-9987-bf870044d4b0",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12284171587,
+  "request_id": "speech-2d29035d-9fa8-41ee-a3fc-1c24ae47aea2",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12321139344,
+  "request_id": "speech-6f8b9c5d-e789-487c-9987-bf870044d4b0",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12358659543,
+  "request_id": "speech-2d29035d-9fa8-41ee-a3fc-1c24ae47aea2",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12396664397,
+  "request_id": "speech-6f8b9c5d-e789-487c-9987-bf870044d4b0",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12431880387,
+  "request_id": "speech-2d29035d-9fa8-41ee-a3fc-1c24ae47aea2",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12483030474,
+  "request_id": "speech-6f8b9c5d-e789-487c-9987-bf870044d4b0",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12531569607,
+  "request_id": "speech-2d29035d-9fa8-41ee-a3fc-1c24ae47aea2",
+  "type": "stream_chunk",
+  "chunk_id": 6,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12615197463,
+  "request_id": "speech-2d29035d-9fa8-41ee-a3fc-1c24ae47aea2",
+  "type": "stream_chunk",
+  "chunk_id": 7,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12615273820,
+  "request_id": "speech-2d29035d-9fa8-41ee-a3fc-1c24ae47aea2",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 12620029178,
+  "request_id": "speech-6f8b9c5d-e789-487c-9987-bf870044d4b0",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12687371194,
+  "request_id": "speech-5c1f36eb-791b-4015-8c79-77bacbf31d27",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 12699510020,
+  "request_id": "speech-6f8b9c5d-e789-487c-9987-bf870044d4b0",
+  "type": "stream_chunk",
+  "chunk_id": 6,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12767659114,
+  "request_id": "speech-5c1f36eb-791b-4015-8c79-77bacbf31d27",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12796153254,
+  "request_id": "speech-6f8b9c5d-e789-487c-9987-bf870044d4b0",
+  "type": "stream_chunk",
+  "chunk_id": 7,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12796225840,
+  "request_id": "speech-6f8b9c5d-e789-487c-9987-bf870044d4b0",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 12877174365,
+  "request_id": "speech-5c1f36eb-791b-4015-8c79-77bacbf31d27",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12889480039,
+  "request_id": "speech-5c1f36eb-791b-4015-8c79-77bacbf31d27",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 12889538151,
+  "request_id": "speech-5c1f36eb-791b-4015-8c79-77bacbf31d27",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 12894746212,
+  "request_id": "speech-1e79ef1c-090b-42cf-9743-84c15293d948",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 12987390742,
+  "request_id": "speech-1e79ef1c-090b-42cf-9743-84c15293d948",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 13060569795,
+  "request_id": "speech-1e79ef1c-090b-42cf-9743-84c15293d948",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 13137001534,
+  "request_id": "speech-1e79ef1c-090b-42cf-9743-84c15293d948",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 13239390593,
+  "request_id": "speech-1e79ef1c-090b-42cf-9743-84c15293d948",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 13259941729,
+  "request_id": "speech-1e79ef1c-090b-42cf-9743-84c15293d948",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 13260299213,
+  "request_id": "speech-1e79ef1c-090b-42cf-9743-84c15293d948",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 13382373928,
+  "request_id": "speech-69b2f092-6a6b-4a82-bd04-addd7951bd52",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 13469357084,
+  "request_id": "speech-69b2f092-6a6b-4a82-bd04-addd7951bd52",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 13549832341,
+  "request_id": "speech-69b2f092-6a6b-4a82-bd04-addd7951bd52",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 13549900021,
+  "request_id": "speech-69b2f092-6a6b-4a82-bd04-addd7951bd52",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 13692815281,
+  "request_id": "speech-68341927-1e2f-4f1c-8c57-b170ce173300",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 13798392424,
+  "request_id": "speech-68341927-1e2f-4f1c-8c57-b170ce173300",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 13911160555,
+  "request_id": "speech-68341927-1e2f-4f1c-8c57-b170ce173300",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 13917107924,
+  "request_id": "speech-bba27135-d862-41ba-b9d4-44f12d3e3bca",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 13985625178,
+  "request_id": "speech-68341927-1e2f-4f1c-8c57-b170ce173300",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 13994118801,
+  "request_id": "speech-bba27135-d862-41ba-b9d4-44f12d3e3bca",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14098574436,
+  "request_id": "speech-68341927-1e2f-4f1c-8c57-b170ce173300",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14107080518,
+  "request_id": "speech-bba27135-d862-41ba-b9d4-44f12d3e3bca",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14119919610,
+  "request_id": "speech-4a997cc6-936a-487d-98d3-6efe2b9e4696",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 14178353917,
+  "request_id": "speech-bba27135-d862-41ba-b9d4-44f12d3e3bca",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14178422759,
+  "request_id": "speech-bba27135-d862-41ba-b9d4-44f12d3e3bca",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 14210875219,
+  "request_id": "speech-68341927-1e2f-4f1c-8c57-b170ce173300",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14229992380,
+  "request_id": "speech-4a997cc6-936a-487d-98d3-6efe2b9e4696",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14289551016,
+  "request_id": "speech-68341927-1e2f-4f1c-8c57-b170ce173300",
+  "type": "stream_chunk",
+  "chunk_id": 6,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14304834202,
+  "request_id": "speech-4a997cc6-936a-487d-98d3-6efe2b9e4696",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14349751973,
+  "request_id": "speech-68341927-1e2f-4f1c-8c57-b170ce173300",
+  "type": "stream_chunk",
+  "chunk_id": 7,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14350056973,
+  "request_id": "speech-68341927-1e2f-4f1c-8c57-b170ce173300",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 14363567557,
+  "request_id": "speech-4a997cc6-936a-487d-98d3-6efe2b9e4696",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14364066996,
+  "request_id": "speech-4a997cc6-936a-487d-98d3-6efe2b9e4696",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 14621828868,
+  "request_id": "speech-05a6b53c-0457-42a9-8021-7a48f522d8c3",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 14694222670,
+  "request_id": "speech-05a6b53c-0457-42a9-8021-7a48f522d8c3",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14772245789,
+  "request_id": "speech-05a6b53c-0457-42a9-8021-7a48f522d8c3",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14848142480,
+  "request_id": "speech-05a6b53c-0457-42a9-8021-7a48f522d8c3",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 14848210830,
+  "request_id": "speech-05a6b53c-0457-42a9-8021-7a48f522d8c3",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 16725998676,
+  "request_id": "speech-cb1ed3dd-5ef0-4c77-9da1-87c83b68cc61",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 16817042496,
+  "request_id": "speech-cb1ed3dd-5ef0-4c77-9da1-87c83b68cc61",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 16889954966,
+  "request_id": "speech-cb1ed3dd-5ef0-4c77-9da1-87c83b68cc61",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 16898428432,
+  "request_id": "speech-cb1ed3dd-5ef0-4c77-9da1-87c83b68cc61",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 16898816515,
+  "request_id": "speech-cb1ed3dd-5ef0-4c77-9da1-87c83b68cc61",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 17216148303,
+  "request_id": "speech-8fa6ac56-b450-45df-ac2d-e4cc76e4f2fe",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 17346714706,
+  "request_id": "speech-8fa6ac56-b450-45df-ac2d-e4cc76e4f2fe",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17393353692,
+  "request_id": "speech-1f80ae96-b788-431a-b3be-67defde9649e",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 17424571240,
+  "request_id": "speech-8fa6ac56-b450-45df-ac2d-e4cc76e4f2fe",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17494034395,
+  "request_id": "speech-1f80ae96-b788-431a-b3be-67defde9649e",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17534553586,
+  "request_id": "speech-8fa6ac56-b450-45df-ac2d-e4cc76e4f2fe",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17559324553,
+  "request_id": "speech-39599665-619f-4593-af33-e8ba260cf0c7",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 17595802607,
+  "request_id": "speech-1f80ae96-b788-431a-b3be-67defde9649e",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17635520220,
+  "request_id": "speech-8fa6ac56-b450-45df-ac2d-e4cc76e4f2fe",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17652608179,
+  "request_id": "speech-1f80ae96-b788-431a-b3be-67defde9649e",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17652656570,
+  "request_id": "speech-1f80ae96-b788-431a-b3be-67defde9649e",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 17660705186,
+  "request_id": "speech-39599665-619f-4593-af33-e8ba260cf0c7",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17720796983,
+  "request_id": "speech-8fa6ac56-b450-45df-ac2d-e4cc76e4f2fe",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17724431539,
+  "request_id": "speech-8fa6ac56-b450-45df-ac2d-e4cc76e4f2fe",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 17739099105,
+  "request_id": "speech-39599665-619f-4593-af33-e8ba260cf0c7",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17815616228,
+  "request_id": "speech-39599665-619f-4593-af33-e8ba260cf0c7",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17876379480,
+  "request_id": "speech-39599665-619f-4593-af33-e8ba260cf0c7",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 17876459019,
+  "request_id": "speech-39599665-619f-4593-af33-e8ba260cf0c7",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 18139988862,
+  "request_id": "speech-96d4de82-fcca-4d2f-83eb-b1583be7993f",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 18140052092,
+  "request_id": "speech-2c4a0b40-d454-447c-8062-2e2218904ad1",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 18214029701,
+  "request_id": "speech-96d4de82-fcca-4d2f-83eb-b1583be7993f",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18214081613,
+  "request_id": "speech-2c4a0b40-d454-447c-8062-2e2218904ad1",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18299930094,
+  "request_id": "speech-96d4de82-fcca-4d2f-83eb-b1583be7993f",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18299993962,
+  "request_id": "speech-2c4a0b40-d454-447c-8062-2e2218904ad1",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18310620858,
+  "request_id": "speech-96d4de82-fcca-4d2f-83eb-b1583be7993f",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18311067808,
+  "request_id": "speech-96d4de82-fcca-4d2f-83eb-b1583be7993f",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 18358189986,
+  "request_id": "speech-2c4a0b40-d454-447c-8062-2e2218904ad1",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18358249214,
+  "request_id": "speech-2c4a0b40-d454-447c-8062-2e2218904ad1",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 18525299023,
+  "request_id": "speech-c2df7c25-f886-4415-96a4-577e9690b5b9",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 18634114140,
+  "request_id": "speech-c2df7c25-f886-4415-96a4-577e9690b5b9",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18659236946,
+  "request_id": "speech-a9c97ddf-98c0-446c-8acb-3123019237b9",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 18734446052,
+  "request_id": "speech-c2df7c25-f886-4415-96a4-577e9690b5b9",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18761972782,
+  "request_id": "speech-a9c97ddf-98c0-446c-8acb-3123019237b9",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18821347063,
+  "request_id": "speech-c2df7c25-f886-4415-96a4-577e9690b5b9",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18839040351,
+  "request_id": "speech-a9c97ddf-98c0-446c-8acb-3123019237b9",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18877534576,
+  "request_id": "speech-c2df7c25-f886-4415-96a4-577e9690b5b9",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18877594778,
+  "request_id": "speech-c2df7c25-f886-4415-96a4-577e9690b5b9",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 18914894749,
+  "request_id": "speech-a9c97ddf-98c0-446c-8acb-3123019237b9",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18989836322,
+  "request_id": "speech-a9c97ddf-98c0-446c-8acb-3123019237b9",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 18989920637,
+  "request_id": "speech-a9c97ddf-98c0-446c-8acb-3123019237b9",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 19205929222,
+  "request_id": "speech-0739c85f-af60-4521-b921-e787259f1dbf",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 19205999590,
+  "request_id": "speech-bf75bc1d-d92e-4ee3-ace2-2b920eb71aff",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 19306871338,
+  "request_id": "speech-0739c85f-af60-4521-b921-e787259f1dbf",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 19306922403,
+  "request_id": "speech-bf75bc1d-d92e-4ee3-ace2-2b920eb71aff",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 19387721355,
+  "request_id": "speech-0739c85f-af60-4521-b921-e787259f1dbf",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 19387780407,
+  "request_id": "speech-bf75bc1d-d92e-4ee3-ace2-2b920eb71aff",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 19465014906,
+  "request_id": "speech-0739c85f-af60-4521-b921-e787259f1dbf",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 19465065003,
+  "request_id": "speech-bf75bc1d-d92e-4ee3-ace2-2b920eb71aff",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 19490024376,
+  "request_id": "speech-bf75bc1d-d92e-4ee3-ace2-2b920eb71aff",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 19490102447,
+  "request_id": "speech-bf75bc1d-d92e-4ee3-ace2-2b920eb71aff",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 19566190556,
+  "request_id": "speech-0739c85f-af60-4521-b921-e787259f1dbf",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 19686264653,
+  "request_id": "speech-0739c85f-af60-4521-b921-e787259f1dbf",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 19689977627,
+  "request_id": "speech-0739c85f-af60-4521-b921-e787259f1dbf",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 19740300453,
+  "request_id": "speech-b4305cd0-78dd-428d-a399-919015ec61e3",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 19815938751,
+  "request_id": "speech-b4305cd0-78dd-428d-a399-919015ec61e3",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 19816007629,
+  "request_id": "speech-b4305cd0-78dd-428d-a399-919015ec61e3",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 19862717156,
+  "request_id": "speech-ffc8497f-a409-43c1-9329-b44b7f8ed732",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 19936515010,
+  "request_id": "speech-ffc8497f-a409-43c1-9329-b44b7f8ed732",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 19936798939,
+  "request_id": "speech-ffc8497f-a409-43c1-9329-b44b7f8ed732",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 20231301805,
+  "request_id": "speech-ac92338d-a752-477e-b7ce-3641e0326e5a",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 20329780815,
+  "request_id": "speech-ac92338d-a752-477e-b7ce-3641e0326e5a",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 20409993941,
+  "request_id": "speech-ac92338d-a752-477e-b7ce-3641e0326e5a",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 20481258347,
+  "request_id": "speech-ac92338d-a752-477e-b7ce-3641e0326e5a",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 20489892371,
+  "request_id": "speech-ac92338d-a752-477e-b7ce-3641e0326e5a",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 20490206805,
+  "request_id": "speech-ac92338d-a752-477e-b7ce-3641e0326e5a",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 22079657224,
+  "request_id": "speech-790c3e13-a925-489e-94f5-26840e9d2826",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 22164851589,
+  "request_id": "speech-790c3e13-a925-489e-94f5-26840e9d2826",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 22258667424,
+  "request_id": "speech-790c3e13-a925-489e-94f5-26840e9d2826",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 22363325078,
+  "request_id": "speech-790c3e13-a925-489e-94f5-26840e9d2826",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 22470650453,
+  "request_id": "speech-790c3e13-a925-489e-94f5-26840e9d2826",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 22488582099,
+  "request_id": "speech-25786147-0b8c-4e1a-b583-689ca873773b",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 22547437851,
+  "request_id": "speech-790c3e13-a925-489e-94f5-26840e9d2826",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 22564305373,
+  "request_id": "speech-25786147-0b8c-4e1a-b583-689ca873773b",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 22581935509,
+  "request_id": "speech-790c3e13-a925-489e-94f5-26840e9d2826",
+  "type": "stream_chunk",
+  "chunk_id": 6,
+  "tokens": 25
+ },
+ {
+  "t_ns": 22581999317,
+  "request_id": "speech-790c3e13-a925-489e-94f5-26840e9d2826",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 22628796694,
+  "request_id": "speech-25786147-0b8c-4e1a-b583-689ca873773b",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 22628863277,
+  "request_id": "speech-25786147-0b8c-4e1a-b583-689ca873773b",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 22819007204,
+  "request_id": "speech-e7c912b1-73bc-4ad9-8178-4df8e94cd794",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 22945006336,
+  "request_id": "speech-e7c912b1-73bc-4ad9-8178-4df8e94cd794",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23066568057,
+  "request_id": "speech-e7c912b1-73bc-4ad9-8178-4df8e94cd794",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23122609878,
+  "request_id": "speech-f87e3213-3602-4795-af0f-eb7398430c84",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 23140821141,
+  "request_id": "speech-e7c912b1-73bc-4ad9-8178-4df8e94cd794",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23244103682,
+  "request_id": "speech-f87e3213-3602-4795-af0f-eb7398430c84",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23269097712,
+  "request_id": "speech-e7c912b1-73bc-4ad9-8178-4df8e94cd794",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23323580651,
+  "request_id": "speech-090a302d-53a7-411f-b89d-3affe6788c9e",
+  "type": "stream_chunk",
+  "chunk_id": 0,
+  "tokens": 28
+ },
+ {
+  "t_ns": 23353761493,
+  "request_id": "speech-f87e3213-3602-4795-af0f-eb7398430c84",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23376854301,
+  "request_id": "speech-e7c912b1-73bc-4ad9-8178-4df8e94cd794",
+  "type": "stream_chunk",
+  "chunk_id": 5,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23416704582,
+  "request_id": "speech-090a302d-53a7-411f-b89d-3affe6788c9e",
+  "type": "stream_chunk",
+  "chunk_id": 1,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23429658747,
+  "request_id": "speech-e7c912b1-73bc-4ad9-8178-4df8e94cd794",
+  "type": "stream_chunk",
+  "chunk_id": 6,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23429716483,
+  "request_id": "speech-e7c912b1-73bc-4ad9-8178-4df8e94cd794",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 23437971775,
+  "request_id": "speech-f87e3213-3602-4795-af0f-eb7398430c84",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23460202130,
+  "request_id": "speech-f87e3213-3602-4795-af0f-eb7398430c84",
+  "type": "stream_chunk",
+  "chunk_id": 4,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23460250237,
+  "request_id": "speech-f87e3213-3602-4795-af0f-eb7398430c84",
+  "type": "stream_done"
+ },
+ {
+  "t_ns": 23494611895,
+  "request_id": "speech-090a302d-53a7-411f-b89d-3affe6788c9e",
+  "type": "stream_chunk",
+  "chunk_id": 2,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23587870569,
+  "request_id": "speech-090a302d-53a7-411f-b89d-3affe6788c9e",
+  "type": "stream_chunk",
+  "chunk_id": 3,
+  "tokens": 25
+ },
+ {
+  "t_ns": 23592990912,
+  "request_id": "speech-090a302d-53a7-411f-b89d-3affe6788c9e",
+  "type": "stream_done"
+ }
+]
