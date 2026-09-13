@@ -1355,7 +1355,8 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         )
 
     def first_hop_batch(self, items: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
-        """Causal Flow for equal-shape hops. HiFT stays per request.
+        """Causal Flow for one hop per row, padded to the longest window.
+        HiFT stays per request.
 
         # note (guozhihao-224): first hops and follow-up hops share this
         # path; the scheduler slices new frames at token_offset.
