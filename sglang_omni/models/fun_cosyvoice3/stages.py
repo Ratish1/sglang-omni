@@ -925,6 +925,51 @@ def load_cosyvoice3_flow_hift(
     return wrapped, hift
 
 
+def _patch_chunk_mask() -> None:
+    """Build the DiT attention mask without the host sync CosyVoice's
+    add_optional_chunk_mask pays to check for empty rows; the rows are
+    filled on the device instead, which is also what graph capture needs.
+    """
+    try:
+        from cosyvoice.flow.DiT import dit as cosyvoice_dit
+        from cosyvoice.utils.mask import add_optional_chunk_mask as cosyvoice_chunk_mask
+        from cosyvoice.utils.mask import subsequent_chunk_mask
+    except ImportError as exc:
+        raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
+
+    def _chunk_mask(
+        xs: torch.Tensor,
+        masks: torch.Tensor,
+        use_dynamic_chunk: bool,
+        use_dynamic_left_chunk: bool,
+        decoding_chunk_size: int,
+        static_chunk_size: int,
+        num_decoding_left_chunks: int,
+        enable_full_context: bool = True,
+    ) -> torch.Tensor:
+        if use_dynamic_chunk:
+            return cosyvoice_chunk_mask(
+                xs,
+                masks,
+                use_dynamic_chunk,
+                use_dynamic_left_chunk,
+                decoding_chunk_size,
+                static_chunk_size,
+                num_decoding_left_chunks,
+                enable_full_context,
+            )
+        if static_chunk_size > 0:
+            chunk = subsequent_chunk_mask(
+                xs.size(1), static_chunk_size, num_decoding_left_chunks, xs.device
+            )
+            masks = masks & chunk.unsqueeze(0)
+        empty_rows = masks.sum(dim=-1, keepdim=True) == 0
+        masks.masked_fill_(empty_rows, True)
+        return masks
+
+    cosyvoice_dit.add_optional_chunk_mask = _chunk_mask
+
+
 def _load_cosyvoice3_flow_hift_lightweight(
     checkpoint_dir: str,
     *,
@@ -1961,41 +2006,7 @@ def create_vocoder_executor(
     ):
         enable_flow_cuda_graph = False
 
-    if enable_flow_cuda_graph:
-        try:
-            from cosyvoice.flow.DiT import dit as cosyvoice_dit
-            from cosyvoice.utils.mask import (
-                add_optional_chunk_mask as cosyvoice_chunk_mask,
-            )
-        except ImportError as exc:
-            raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
-
-        def _chunk_mask(
-            xs: torch.Tensor,
-            masks: torch.Tensor,
-            use_dynamic_chunk: bool,
-            use_dynamic_left_chunk: bool,
-            decoding_chunk_size: int,
-            static_chunk_size: int,
-            num_decoding_left_chunks: int,
-            enable_full_context: bool = True,
-        ) -> torch.Tensor:
-            if use_dynamic_chunk or static_chunk_size > 0:
-                return cosyvoice_chunk_mask(
-                    xs,
-                    masks,
-                    use_dynamic_chunk,
-                    use_dynamic_left_chunk,
-                    decoding_chunk_size,
-                    static_chunk_size,
-                    num_decoding_left_chunks,
-                    enable_full_context,
-                )
-            empty_rows = masks.sum(dim=-1, keepdim=True) == 0
-            masks.masked_fill_(empty_rows, True)
-            return masks
-
-        cosyvoice_dit.add_optional_chunk_mask = _chunk_mask
+    _patch_chunk_mask()
 
     if enable_dit_torch_compile:
         compile_dit_backbone(flow, autocast_dtype=autocast_dtype)

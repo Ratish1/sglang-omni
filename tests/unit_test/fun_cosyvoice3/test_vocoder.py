@@ -719,6 +719,7 @@ def test_flow_admission_defers_request_after_long_singleton(monkeypatch) -> None
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
     )
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(stages, "_patch_chunk_mask", lambda: None)
     monkeypatch.setattr(
         stages,
         "load_cosyvoice3_flow_hift",
@@ -751,6 +752,7 @@ def test_create_vocoder_executor_defaults_batch_for_real_lengths(monkeypatch) ->
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
     )
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(stages, "_patch_chunk_mask", lambda: None)
     monkeypatch.setattr(
         stages,
         "load_cosyvoice3_flow_hift",
@@ -780,6 +782,7 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
     )
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(stages, "_patch_chunk_mask", lambda: None)
 
     def fake_load(checkpoint_dir, device, fp16, **kwargs):
         captured.update(
@@ -831,6 +834,7 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
     )
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(stages, "_patch_chunk_mask", lambda: None)
 
     def fake_load(checkpoint_dir, device, fp16, **kwargs):
         captured.update(
@@ -859,6 +863,7 @@ def _executor_compiles(monkeypatch, **kwargs) -> bool:
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
     )
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(stages, "_patch_chunk_mask", lambda: None)
     monkeypatch.setattr(
         stages,
         "load_cosyvoice3_flow_hift",
