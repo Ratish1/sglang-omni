@@ -2,15 +2,15 @@
 
 Two branches on upstream main 3060470a8.
 
-- `perf/qwen3-tts-codec-precompile` at b64dd1f71, three commits: the decoder traces a
+- `perf/qwen3-tts-codec-precompile` at b2c9abe13: the decoder traces a
   compiled shape on the codes and state the graph runner warms and captures with, so
   each shape compiles once instead of twice (0ba531872). Bit exact, verified by doc 34's
   bench (12 graphs for 12 shapes, capture 100.7 to 55.3 s). The review pass (4f7d9a32a)
   dropped the Dynamo limit raise (the warm runner's four shapes fit the default of 8)
   and the grad mode check (the runner is the only caller and runs under inference mode).
-  The ceiling of 8 traced shapes per function is noted at the compile call (b64dd1f71)
-  rather than raised: the warm buckets trace 4 and no knob adds a compiled shape.
-- `perf/qwen3-tts-bootstrap-graphs` at 8b66f41d4, twelve commits: the runner's window
+  The ceiling of 8 traced shapes per function is not raised: the warm buckets trace 4
+  and no knob adds a compiled shape.
+- `perf/qwen3-tts-bootstrap-graphs` at 5eb4e121e: the runner's window
   schedule and bucket queries (7e5e2aa48), the window runner and its knob (cb9cf8f46),
   the windowed decode path (1453ef538), no default until measured (fd54363d6), the
   precompile fix cherry-picked (c2212e459, 50830c2c3), the first bucket and compile
@@ -18,7 +18,7 @@ Two branches on upstream main 3060470a8.
   pass: the windowed decode fills one owned waveform per cohort and the scheduler
   counters are gone (8ba94ef0c), the window runner takes the warm runners' buckets and
   compiles only the steady stride they already trace (988fdcdfd), the planner and
-  docstrings trimmed (fa329e4f4), the ceiling note cherry-picked (8b66f41d4).
+  docstrings trimmed (fa329e4f4).
 
 Review decisions, 2026-09-13. One bucket was tuned to the seed-tts corpus, where
 reference lengths differ per request: a deployment with one fixed cloning voice makes
@@ -53,10 +53,10 @@ argument `incremental_codec_cuda_graph_window_frames`; an empty list turns windo
 off. The codec state line in the serve log carries a `window` runner entry next to
 `cold` and `warm` with its captured keys, footprint, `replays` and `fallback_counts`.
 
-## Step 1, unit tests on the box, full files, on 8b66f41d4
+## Step 1, unit tests on the box, full files, on 5eb4e121e
 
 ```bash
-git fetch origin perf/qwen3-tts-bootstrap-graphs && git worktree add tmp/bw 8b66f41d4
+git fetch origin perf/qwen3-tts-bootstrap-graphs && git worktree add tmp/bw 5eb4e121e
 cd tmp/bw
 python -m pytest tests/unit_test/qwen3_tts/test_incremental_codec.py -q
 python -m pytest tests/unit_test/qwen3_tts/test_incremental_codec_cuda_graph.py -q
@@ -69,7 +69,7 @@ boot. Archive the output. Every test on both branches is unrun until this step.
 ## Step 2, the pair that decides #2123 (2 boots)
 
 A: upstream main 3060470a8 plus `tasks/qwen3_tts_e4_investigation_20260912/early_ids.patch`.
-B: 8b66f41d4 plus the same patch (it touches model_runner.py only). Streaming c16.
+B: 5eb4e121e plus the same patch (it touches model_runner.py only). Streaming c16.
 
 Reads per arm from `first_chunk_anatomy.py` on the pass 2 events plus the client
 summary: TTFC mean and p99, req/s, inter chunk, preprocessing p50, the first frame to
@@ -95,7 +95,7 @@ between early ids and main, not within 10 ms of main; that gate needs item 3 as 
 
 ## Step 3, the pair for the default launch (2 boots)
 
-A: upstream main 3060470a8. B: 8b66f41d4. Same reads. Expected on B: the bootstrap
+A: upstream main 3060470a8. B: 5eb4e121e. Same reads. Expected on B: the bootstrap
 segment at ahead 0 from about 30 ms to 10 to 27 ms, req/s not below A.
 
 ## Step 4, the origin check, Nsight on step 2's two arms (1 window each)
