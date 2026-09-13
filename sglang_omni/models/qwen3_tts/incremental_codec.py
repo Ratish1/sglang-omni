@@ -9,10 +9,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-# note(ratish): the cache entry limits sglang's set_torch_compile_config raises
-# to before it compiles one model forward per batch bucket.
-_DYNAMO_CACHE_ENTRIES = 1024
-
 
 @dataclass(frozen=True)
 class Qwen3TTSIncrementalCodecStateSpec:
@@ -685,29 +681,10 @@ class Qwen3TTSIncrementalDecoder:
         precompiled here, so an unforeseen shape at serving time takes the eager
         path instead of a multi-second compile on a request's critical path.
 
-        The caller passes the codes and state it will decode with, under the
-        grad-disabling context it will decode in. Dynamo guards on the kind of
-        tensor it traced (an inference tensor and a plain one differ), so a
-        trace on stand-in tensors is thrown away at the first real call and
-        the shape compiles twice. The step writes the state's buffers, so pass
-        a state you can discard.
+        Pass the codes and state of a real decode, in its grad-disabling
+        context: Dynamo guards on both, and the step advances the state.
         """
-        if torch.is_grad_enabled():
-            raise RuntimeError(
-                "Qwen3-TTS incremental codec precompile runs under the caller's "
-                "no_grad or inference_mode context"
-            )
         if self._compiled_kernel is None:
-            from torch._dynamo import config as dynamo_config
-
-            # note(ratish): one compiled function serves every shape the graph
-            # runners capture, more than Dynamo admits per function by default.
-            dynamo_config.cache_size_limit = max(
-                dynamo_config.cache_size_limit, _DYNAMO_CACHE_ENTRIES
-            )
-            dynamo_config.accumulated_cache_size_limit = max(
-                dynamo_config.accumulated_cache_size_limit, _DYNAMO_CACHE_ENTRIES
-            )
             self._compiled_kernel = torch.compile(
                 self._decode_tensors, dynamic=False, fullgraph=True
             )

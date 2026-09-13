@@ -771,29 +771,6 @@ def _fresh_state(rows: int) -> Qwen3TTSIncrementalCodecState:
     return state
 
 
-def test_incremental_decoder_precompile_raises_the_dynamo_cache_limits(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from torch._dynamo import config as dynamo_config
-
-    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
-    codes = torch.randint(0, 16, (1, 2, 3))
-
-    monkeypatch.setattr(dynamo_config, "cache_size_limit", 8)
-    monkeypatch.setattr(dynamo_config, "accumulated_cache_size_limit", 8)
-    with torch.no_grad():
-        Qwen3TTSIncrementalDecoder(_Decoder()).precompile(codes, _fresh_state(1))
-    assert dynamo_config.cache_size_limit == 1024
-    assert dynamo_config.accumulated_cache_size_limit == 1024
-
-    monkeypatch.setattr(dynamo_config, "cache_size_limit", 4096)
-    monkeypatch.setattr(dynamo_config, "accumulated_cache_size_limit", 4096)
-    with torch.no_grad():
-        Qwen3TTSIncrementalDecoder(_Decoder()).precompile(codes, _fresh_state(1))
-    assert dynamo_config.cache_size_limit == 4096
-    assert dynamo_config.accumulated_cache_size_limit == 4096
-
-
 def test_incremental_decoder_routes_only_precompiled_shapes_to_the_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -811,8 +788,6 @@ def test_incremental_decoder_routes_only_precompiled_shapes_to_the_kernel(
 
     monkeypatch.setattr(torch, "compile", fake_compile)
     trace_codes = torch.randint(0, 16, (2, 2, 3))
-    with pytest.raises(RuntimeError, match="no_grad or inference_mode"):
-        incremental.precompile(trace_codes, _fresh_state(2))
     with torch.inference_mode():
         incremental.precompile(trace_codes, _fresh_state(2))
         incremental.precompile(trace_codes, _fresh_state(2))

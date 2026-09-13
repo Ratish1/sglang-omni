@@ -308,19 +308,15 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         static_codes: torch.Tensor,
         resources: _CaptureResourceSet,
     ) -> None:
-        """Run eager decodes that settle one shape before graph capture.
-
-        A compiled shape is traced first, on the static codes and a state
-        gathered the way the warmups and the capture gather theirs, so the
-        trace and the capture see the same tensors and the shape compiles
-        once.
-        """
+        """Run eager decodes that settle one shape before graph capture."""
 
         capture_stream = resources.stream
         compiled = key.fresh_frames in self._compile_fresh_frames
         capture_stream.wait_stream(torch.cuda.current_stream(self._device))
         with torch.cuda.stream(capture_stream), torch.inference_mode():
             if compiled:
+                # Trace on the tensors the warmups and the capture use; Dynamo
+                # guards on inference tensors and would recompile a plain trace.
                 trace_state = self._arena.gather_by_index(
                     self._scratch_index(key.batch_bucket)
                 )
