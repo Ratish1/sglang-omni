@@ -346,15 +346,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                     request_id, self._finish_stream(request_id)
                 )
             return {}
-        # note (guozhihao-224): B>1 uses packed inference_causal; B=1 keeps
-        # native CosyVoice Flow.inference. Packed singleton-vs-row tests
-        # cover the batch adapter; native hops stay on the official signature.
-        if len(participants) > 1:
-            decoded = self._run_causal_hop_batch(participants)
-        else:
-            request_id, state = participants[0]
-            delta = self._run_one_causal_hop(state)
-            decoded = {request_id: delta} if delta.numel() > 0 else {}
+        decoded = self._run_hop_batch(participants)
         now = self._clock()
         for request_id, state in participants:
             if request_id in decoded and state.first_emit_at is None:
@@ -363,7 +355,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             self._mark_ready(state)
         return decoded
 
-    def _run_causal_hop_batch(
+    def _run_hop_batch(
         self, participants: list[tuple[str, _CosyVoice3StreamState]]
     ) -> dict[str, torch.Tensor]:
         items = [
@@ -378,7 +370,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             for _, state in participants
         ]
         logger.info(f"Fun-CosyVoice3 causal Flow batch size={len(items)}")
-        mels = self._vocoder.first_hop_batch(items)
+        mels = self._vocoder.hop_batch(items)
         decoded: dict[str, torch.Tensor] = {}
         for (request_id, state), mel in zip(participants, mels, strict=True):
             delta, hift_mel, speech_offset = self._vocoder.hift_delta(
@@ -419,14 +411,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 )
             )
 
-    def _run_one_causal_hop(self, state: _CosyVoice3StreamState) -> torch.Tensor:
-        delta = self._run_flow_hift(
-            state, token_end=_window_end(state), streaming=True, finalize=False
-        )
-        state.token_offset += state.hop_len
-        self._advance_hop_len(state)
-        return delta
-
     def decode_delta(
         self,
         request_id: str,
@@ -434,37 +418,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
         *,
         is_final: bool,
     ) -> torch.Tensor | None:
+        # note(ratish): hops and leftovers run in steps, so the per-chunk
+        # decode never emits and the final flush returns the batched leftover.
         del request_id
-        if is_final:
-            return state.leftover
-        if not _is_hop_ready(state):
-            return None
-        delta = self._run_one_causal_hop(state)
-        return delta if delta.numel() > 0 else None
-
-    def _run_flow_hift(
-        self,
-        state: _CosyVoice3StreamState,
-        *,
-        token_end: int,
-        streaming: bool,
-        finalize: bool,
-    ) -> torch.Tensor:
-        token = torch.tensor(state.tokens[:token_end], dtype=torch.int32).unsqueeze(0)
-        wav, hift_mel, speech_offset = self._vocoder.token2wav_chunk(
-            token=token,
-            prompt_token=state.prompt_token,
-            prompt_feat=state.prompt_feat,
-            embedding=state.embedding,
-            token_offset=state.token_offset,
-            streaming=streaming,
-            finalize=finalize,
-            hift_mel=state.hift_mel,
-            speech_offset=state.speech_offset,
-        )
-        state.hift_mel = hift_mel
-        state.speech_offset = speech_offset
-        return wav
+        return state.leftover if is_final else None
 
     def fallback_full_decode(
         self,

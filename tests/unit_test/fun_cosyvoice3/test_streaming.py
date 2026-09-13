@@ -82,12 +82,6 @@ class _FakeFlow(_PackedFlow):
     def __init__(self) -> None:
         super().__init__(channels=80, max_frames=512)
         self.spk_embed_affine_layer = torch.nn.Linear(192, 80, bias=False)
-        self.calls: list[dict] = []
-
-    def inference(self, **kwargs):
-        self.calls.append(kwargs)
-        token_count = int(kwargs["token"].shape[1]) - PRE_LOOKAHEAD_LEN
-        return torch.ones(1, 80, token_count * TOKEN_MEL_RATIO), None
 
 
 class _FakeHiFT(torch.nn.Module):
@@ -158,6 +152,16 @@ def _stream_ids(messages: list[OutgoingMessage]) -> list[str]:
     return [m.request_id for m in messages if m.type == "stream"]
 
 
+def _hop_frames(flow: _FakeFlow) -> set[int]:
+    return {
+        int(call["x"].shape[-1]) for call in _estimator_calls(flow) if call["streaming"]
+    }
+
+
+def _window_frames(tokens: int) -> int:
+    return (TOKEN_HOP_LEN + tokens - PRE_LOOKAHEAD_LEN) * TOKEN_MEL_RATIO
+
+
 def _model_runner() -> FunCosyVoice3ModelRunner:
     runner = object.__new__(FunCosyVoice3ModelRunner)
     runner._token_hop_len = TOKEN_HOP_LEN
@@ -206,9 +210,7 @@ def test_streaming_vocoder_emits_causal_chunk_then_finalizes_remainder() -> None
     assert _serve(scheduler) == 1
     messages = _drain(scheduler)
     assert [message.type for message in messages] == ["stream"]
-    assert flow.calls[0]["streaming"] is True
-    assert flow.calls[0]["finalize"] is False
-    assert int(flow.calls[0]["token"].shape[1]) == 28
+    assert _hop_frames(flow) == {_window_frames(28)}
     assert _waveform(messages[0].data).shape == (50,)
 
     scheduler._on_done("req-stream")
@@ -217,7 +219,6 @@ def test_streaming_vocoder_emits_causal_chunk_then_finalizes_remainder() -> None
     assert _serve(scheduler) == 1
     messages = _drain(scheduler)
     assert [message.type for message in messages] == ["stream", "result"]
-    assert len(flow.calls) == 1
     assert _estimator_calls(flow)[-1]["streaming"] is False
     assert _waveform(messages[0].data).shape == (6,)
     assert messages[1].data.data["modality"] == "audio"
@@ -232,7 +233,7 @@ def test_streaming_vocoder_does_not_decode_before_lookahead_tokens_arrive() -> N
     assert not scheduler._has_ready_work()
     assert _serve(scheduler) == 0
     assert _drain(scheduler) == []
-    assert flow.calls == []
+    assert _estimator_calls(flow) == []
 
 
 def test_streaming_vocoder_pads_prompt_and_decodes_first_hop_at_28() -> None:
@@ -249,17 +250,15 @@ def test_streaming_vocoder_pads_prompt_and_decodes_first_hop_at_28() -> None:
     scheduler._on_chunk("req-pad", _item(list(range(27))))
     assert _serve(scheduler) == 0
     assert _drain(scheduler) == []
-    assert flow.calls == []
+    assert _estimator_calls(flow) == []
 
     scheduler._on_chunk("req-pad", _item([27]))
     assert _serve(scheduler) == 1
     messages = _drain(scheduler)
     assert [message.type for message in messages] == ["stream"]
-    assert int(flow.calls[0]["prompt_token"].shape[1]) == 25
-    assert int(flow.calls[0]["prompt_feat"].shape[1]) == 50
-    assert int(flow.calls[0]["token"].shape[1]) == 28
-    assert flow.calls[0]["streaming"] is True
-    assert flow.calls[0]["finalize"] is False
+    assert scheduler._stream_states["req-pad"].prompt_token.shape == (1, 25)
+    assert scheduler._stream_states["req-pad"].prompt_feat.shape == (1, 50, 80)
+    assert _hop_frames(flow) == {_window_frames(28)}
     assert _waveform(messages[0].data).shape == (TOKEN_HOP_LEN * TOKEN_MEL_RATIO,)
 
 
@@ -395,10 +394,8 @@ def test_ar_to_vocoder_grows_hops_then_finalizes_remainder() -> None:
             assert message.type == "stream"
             pcm_chunks.append(_waveform(message.data))
 
-    assert [int(call["token"].shape[1]) for call in flow.calls] == [28, 78]
-    assert all(
-        call["streaming"] is True and call["finalize"] is False for call in flow.calls
-    )
+    assert _hop_frames(flow) == {_window_frames(28), _window_frames(78)}
+    assert all(call["streaming"] for call in _estimator_calls(flow))
     assert [chunk.shape[0] for chunk in pcm_chunks] == [
         TOKEN_HOP_LEN * TOKEN_MEL_RATIO,
         2 * TOKEN_HOP_LEN * TOKEN_MEL_RATIO,
@@ -423,7 +420,6 @@ def test_ar_to_vocoder_grows_hops_then_finalizes_remainder() -> None:
     assert [message.type for message in final_messages] == ["stream", "result"]
     remainder = _waveform(final_messages[0].data)
     assert remainder.shape == (PRE_LOOKAHEAD_LEN * TOKEN_MEL_RATIO,)
-    assert len(flow.calls) == 2
     assert _estimator_calls(flow)[-1]["streaming"] is False
     total = np.concatenate(pcm_chunks + [remainder])
     assert total.shape == (len(generated) * TOKEN_MEL_RATIO,)
@@ -565,16 +561,14 @@ def test_backlogged_request_runs_one_hop_per_step() -> None:
     scheduler._ingest_stream_item("req-a", _item(list(range(178))))
     with scheduler._state_lock:
         assert scheduler._pump_one_step() == []
-    assert len(flow.calls) == 1
-    assert int(flow.calls[0]["token"].shape[1]) == 28
+    assert _hop_frames(flow) == {_window_frames(28)}
     state = scheduler._stream_states["req-a"]
     assert state.token_offset == TOKEN_HOP_LEN
     assert state.hop_len == next_stream_hop_len(TOKEN_HOP_LEN)
 
     with scheduler._state_lock:
         assert scheduler._pump_one_step() == []
-    assert len(flow.calls) == 2
-    assert int(flow.calls[1]["token"].shape[1]) == 78
+    assert _hop_frames(flow) == {_window_frames(28), _window_frames(78)}
     assert state.token_offset == TOKEN_HOP_LEN + next_stream_hop_len(TOKEN_HOP_LEN)
 
 
@@ -585,7 +579,11 @@ def test_pump_drains_backlog_across_one_hop_steps() -> None:
     with scheduler._state_lock:
         failed = scheduler._pump_streams()
     assert failed == []
-    assert [int(call["token"].shape[1]) for call in flow.calls] == [28, 78, 178]
+    assert _hop_frames(flow) == {
+        _window_frames(28),
+        _window_frames(78),
+        _window_frames(178),
+    }
     messages = [m for m in _drain(scheduler) if m.type == "stream"]
     assert len(messages) == 3
 
@@ -653,7 +651,8 @@ def test_first_hop_runs_when_no_started_stream_is_runnable() -> None:
     clock.now += 1.0
     scheduler._ingest_stream_item("req-b", _item(list(range(28))))
     assert _serve(scheduler) == 1
-    assert [int(call["token"].shape[1]) for call in flow.calls] == [28, 28]
+    assert _stream_ids(_drain(scheduler)) == ["req-a", "req-b"]
+    assert _hop_frames(flow) == {_window_frames(28)}
 
 
 def test_finals_rank_by_slack_with_the_other_started_streams() -> None:
@@ -676,7 +675,6 @@ def test_finals_rank_by_slack_with_the_other_started_streams() -> None:
     clock.now += (a_samples + c_samples) / 2 / scheduler._sample_rate
     assert _serve(scheduler) == 2
     assert _stream_ids(_drain(scheduler)) == ["req-a", "req-c"]
-    assert int(flow.calls[-1]["token"].shape[1]) == 78
     assert _estimator_calls(flow)[-1]["streaming"] is False
     assert "req-c" not in scheduler._stream_states
 
@@ -756,22 +754,22 @@ def test_backlogged_chunks_stay_ordered_before_stream_done(
         scheduler.inbox.put(
             IncomingMessage(request_id="req-a", type="stream_chunk", data=_item(codes))
         )
-    original_inference = flow.inference
+    vocoder = scheduler._vocoder
+    original_hop_batch = vocoder.hop_batch
+    hop_batches: list[int] = []
 
-    def inference(**kwargs):
-        result = original_inference(**kwargs)
-        if len(flow.calls) == 1:
-            # The AR producer adds a newer chunk and
-            # completion during Flow's first hop, with an older chunk deferred.
+    def hop_batch(items):
+        hop_batches.append(len(items))
+        if len(hop_batches) == 1:
             scheduler.inbox.put(
                 IncomingMessage(
                     request_id="req-a", type="stream_chunk", data=_item(tokens[53:])
                 )
             )
             scheduler.inbox.put(IncomingMessage(request_id="req-a", type="stream_done"))
-        return result
+        return original_hop_batch(items)
 
-    monkeypatch.setattr(flow, "inference", inference)
+    monkeypatch.setattr(vocoder, "hop_batch", hop_batch)
 
     _serve(scheduler)
 
@@ -868,7 +866,11 @@ def test_disable_hop_growth_keeps_fixed_follow_up_windows() -> None:
     scheduler._ingest_stream_item("req-a", _item(list(range(78))))
     with scheduler._state_lock:
         assert scheduler._pump_streams() == []
-    assert [int(call["token"].shape[1]) for call in flow.calls] == [28, 53, 78]
+    assert _hop_frames(flow) == {
+        _window_frames(28),
+        _window_frames(53),
+        _window_frames(78),
+    }
     state = scheduler._stream_states["req-a"]
     assert state.hop_len == TOKEN_HOP_LEN
 
@@ -880,6 +882,10 @@ def test_token_max_hop_len_caps_growth() -> None:
     scheduler._ingest_stream_item("req-a", _item(list(range(128))))
     with scheduler._state_lock:
         assert scheduler._pump_streams() == []
-    assert [int(call["token"].shape[1]) for call in flow.calls] == [28, 78, 128]
+    assert _hop_frames(flow) == {
+        _window_frames(28),
+        _window_frames(78),
+        _window_frames(128),
+    }
     state = scheduler._stream_states["req-a"]
     assert state.hop_len == 50
