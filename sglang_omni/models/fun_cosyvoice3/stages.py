@@ -819,6 +819,7 @@ def load_cosyvoice3_flow_hift(
     hift = cv.model.hift
     flow.to(device).eval()
     hift.to(device).eval()
+    _keep_hift_constants_on_device(hift, device)
     # note (Dayuxiaoshui): folding weight_norm is the only load-time step
     # batched decode needs.
     folded = 0
@@ -882,6 +883,18 @@ def _patch_chunk_mask() -> None:
         return masks
 
     cosyvoice_dit.add_optional_chunk_mask = _chunk_mask
+
+
+def _keep_hift_constants_on_device(hift: torch.nn.Module, device: str) -> None:
+    # note(ratish): plain attributes, not buffers, so hift.to(device) leaves
+    # them on the CPU and every HiFT call copies them to the device again.
+    hift.stft_window = hift.stft_window.to(device)
+    sine_gen = hift.m_source.l_sin_gen
+    sine_gen.rand_ini = sine_gen.rand_ini.to(device)
+    sine_gen.sine_waves = sine_gen.sine_waves.to(device)
+    # note(ratish): HiFT.inference casts the f0 predictor to float64 on every
+    # call; done once here the per-call cast finds nothing to convert.
+    hift.f0_predictor.to(torch.float64)
 
 
 def _load_cosyvoice3_flow_hift_lightweight(
