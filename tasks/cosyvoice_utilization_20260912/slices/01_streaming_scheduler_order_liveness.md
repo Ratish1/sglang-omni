@@ -85,13 +85,15 @@ kept; the mechanism is replaced.
    waiting stream's slack falls monotonically and every hop that runs raises the runner's
    slack by at least one hop of audio, so once a stream is the most urgent, every other
    in-flight stream can run at most once before it.
-4. Batch formation on top of urgency: the most urgent candidate defines the key `(hop, offset)`,
-   the token window of its next hop; every candidate of the same kind with that key joins in
-   urgency order up to the cap. Finals never share a step (finalize mode). The peer window
-   (30 ms today, `_peer_wait_ms`) is a delay before running a singleton whose expected peer,
-   a live stream with the same key that is still receiving tokens, is not ready yet; it is
-   expressed as the loop's blocking timeout, never as an inbox read, and it is skipped for a
-   stream that has emitted and whose slack is smaller than the window.
+4. Batch formation on top of urgency: the most urgent candidate defines the key
+   `(offset, hop)`, the token window of its next hop; every runnable hop with that key joins
+   in urgency order up to the cap. Finals never share a step (finalize mode). There is no
+   peer wait. The 30 ms `_first_hop_peer_wait_ms` came in with #1656 and neither #1656 nor
+   #1899 measured it (their bodies carry no peer-wait number); a constant no measurement pins
+   is a heuristic. It is also unnecessary under this loop: batches form from the backlog
+   whenever the vocoder is the bottleneck, which is exactly when batching matters, and when
+   the vocoder is ahead a singleton solve costs nothing anyone is waiting for. If c2 to c8
+   later shows singleton solves dominate, the fix is a cheaper solve (V2, V3), not a wait.
 
 ## 3. Changes by file
 
@@ -103,11 +105,10 @@ kept; the mechanism is replaced.
   The qwen3_omni scheduler's own `_next_message` override keeps working because it is the loop
   getter, not the collector.
 - Serving loop (`start`): when `_has_ready_work()` is true, take messages through
-  `_get_batch_message(timeout=self._ready_step_delay())` and handle each; on `Empty` call
-  `_run_ready_step()` and loop. When it is false, the loop is unchanged: `_next_message()`, which
-  now delegates to `_get_batch_message(0.1)`. Defaults: `_has_ready_work` False,
-  `_ready_step_delay` 0.0, `_run_ready_step` no-op, so every existing subclass, including the
-  ming_tts and qwen3_omni `_next_message` overrides, takes the unchanged branch.
+  `_get_batch_message()` (no wait) and handle each; on `Empty` call `_run_ready_step()` and
+  loop. When it is false, the loop is unchanged: `_next_message()`, which now delegates to
+  `_get_batch_message(0.1)`. Defaults: `_has_ready_work` False, `_run_ready_step` no-op, so
+  every existing subclass takes the unchanged branch.
 - `_handle_stream_done`: `on_stream_done` may return `None`, meaning completion is deferred; the
   existing tail (emit messages, `_clear_request_state`) is `_complete_stream_request(rid,
   messages)` so a subclass can complete a stream from inside a step. qwen3_tts's own
@@ -130,55 +131,71 @@ Removed: `_collect_new_request_batch`, `_collect_stream_chunk_batch`, `_first_ho
 `_has_joinable_first_hop_peer`, `_ingest_peer_message`, `_wait_for_first_hop_peers`,
 `_follow_up_group_size`, `_has_joinable_follow_up_peer`, `_wait_for_follow_up_peers`,
 `_ingest_ready_inbox`, `_pump_one_step`, `_pump_streams`, `_first_hop_key`, `_follow_up_key`,
-and the `on_streaming_new_request` and `_handle_new_request_batch` pump triggers.
+`_first_hop_peer_wait_ms`, `_can_batch_follow_up_hops` (an A/B knife from #1899 whose A/B is
+done), `should_decode` (only the non-coalescing base path consulted it), the pump triggers in
+`on_streaming_new_request` and `_handle_new_request_batch`, and the unreachable prompt and
+frame-count checks in the Flow paths (a hop is runnable only once prompts are latched).
 `_stream_chunk_batch_distinct_requests` returns to the base default False: all queued chunks of
-a request ingest in one ordered batch. `_first_hop_peer_wait_ms` is renamed `_peer_wait_ms`
-because it applies to follow-ups too. No inbox read is left in the file.
+a request ingest in one ordered batch. No inbox read is left in the file.
+
+State, from what each field is for:
+
+- `tokens`, `token_offset`, `hop_len`: the cursor. The next window is
+  `[token_offset, token_offset + hop_len + PRE_LOOKAHEAD_LEN)`; a hop is runnable when prompts
+  are latched and `tokens` cover it. `prompt_pad` was always 0 (`_latch_prompts` pads the
+  prompt tensors instead), so the field and the `stream_hop_len` and
+  `tokens_needed_for_causal_chunk` calls are gone; `_window_end(state)` is the arithmetic.
+- `prompt_token`, `prompt_feat`, `embedding`: latched once from the first chunk metadata or the
+  payload. `prompts_latched` was `prompt_token is not None`; the flag is gone.
+- `hift_mel`, `speech_offset`: HiFT history and the samples HiFT has produced, which is also the
+  audio emitted since every delta is emitted.
+- New: `done` (stream_done seen with the payload present), `ready_since` (clock when the next
+  step became runnable; cleared and restamped after every step), `first_emit_at`.
 
 Added or changed:
 
-- `_CosyVoice3StreamState` gains `done: bool`, `ready_since: float | None` (clock time the
-  current hop or final became runnable; cleared and restamped after every step) and
-  `first_emit_at: float | None`. `speech_offset` already counts emitted samples.
+- Module-level pure functions of state: `_window_end`, `_is_hop_ready`, `_step_kind` (`first`,
+  `follow_up`, `final` or None), `_step_key` (`(offset, hop)`), `_slack_s(state, now,
+  sample_rate)`.
 - `self._clock` (`time.monotonic`) is the one time source, replaceable by tests.
 - `on_stream_chunk_batch`: ingest only under `_state_lock`, no pump. `on_streaming_new_request`,
   `ingest` and `on_stream_done` end with `_mark_ready(state)`. `on_stream_done` marks
   `state.done` and returns `None`.
-- `_step_kind(state)`: `first` (offset zero, tokens ready), `follow_up` (ready, offset > 0),
-  `final` (done and no full hop left), else not runnable. `_step_key(state)`: `(hop, offset)`.
-  `_slack_s(state, now)`: the formula of invariant 3.
 - `_ranked_candidates()` sorts runnable streams by `(slack, ready_since, request_id)`;
-  `_select(ranked)` takes the head and fills same-kind same-key candidates up to the cap
-  (`_can_batch_stream_chunks` and `_can_batch_follow_up_hops` gate the fill as before).
-  `_has_ready_work`, `_ready_step_delay` and `select_step_participants` are built on these.
-- `build_step_plan` carries the kind; `run_step` for `final` calls `_finish_stream` and
-  `_complete_stream_request` and returns nothing to emit; for hops it runs the packed batch or
-  the native single hop as before, then stamps `first_emit_at` on the first emission and
-  restamps `ready_since`.
+  `_has_ready_work` is its non-emptiness; `select_step_participants` takes the head and, unless
+  it is a final, fills same-key hops up to the cap.
+- The step plan is the kind string. `run_step` for `final` calls `_finish_stream` and
+  `_complete_stream_request` and returns nothing to emit; for hops it runs the packed batch
+  (two or more rows) or the native single hop, then stamps `first_emit_at` on the first
+  emission and restamps `ready_since`.
 
 ## 4. Tests
 
+Admission rule: every case names the diff that would turn it red (a bug regression, a derived
+property, or bookkeeping); tautologies and mirrors are out.
+
 - New `tests/unit_test/fun_cosyvoice3/test_streaming_replay.py` with the two recorded inbox
   sequences copied to `tests/unit_test/fun_cosyvoice3/fixtures/`. The replay feeds the events at
-  their recorded times against a fake clock, drains and steps like the serving loop (honouring
-  `_ready_step_delay` by advancing the clock), and charges every step 20 ms. Asserts: no errors,
-  one result per request and last for that request, the finalize Flow call of every request
-  carries its chunks in arrival order, emitted samples equal tokens times frames times samples,
-  no state or parked message is left, packed batches occurred, and the wall time between a
-  request's final becoming runnable and its result is at most its slack at that moment plus one
-  round of (in-flight + 1) steps and peer windows.
-- Contract tests in `test_streaming.py` moved to the loop level (`_serve` helper: drain, then
-  ready steps until idle; `_Clock` fake): finals are deferred to a step, a first hop runs before
-  follow-ups that have slack, underrunning follow-ups run before a first hop, three-way least
-  slack ordering, queued peer chunks are ingested before the step, the peer delay and its
-  skip rules, pending before inbox order with the final after the last chunk, fallback errors
-  surface as error messages. Removed with their mechanism: the two peer-wait tests, the two
-  peer-reader tests, the streaming payload collection test, and the distinct-request chunk
-  collection expectation.
-- Base tests: the loop drains pending then inbox before the ready step; the ready-step delay
-  waits for late messages; `on_stream_done` returning `None` defers completion until
-  `_complete_stream_request`. Vocoder base: `_pump_one_step` returns `None` when idle;
-  `_run_ready_step` aborts a failed step's participants and runs the abort callback.
+  their recorded times against a fake clock, drains and steps like the serving loop, and charges
+  every step 20 ms. Asserts: no errors, one result per request and last for that request, the
+  finalize Flow call of every request carries its chunks in arrival order (the c16 reordering
+  bug), emitted samples equal tokens times frames times samples, no state or parked message is
+  left, packed batches occurred, and the wall time between a request's final becoming runnable
+  and its result is at most its slack at that moment plus one round of (in-flight + 1) steps
+  (the starvation bug).
+- `test_streaming.py` at the loop level (`_serve` helper: drain, then ready steps until idle;
+  `_Clock` fake): the final is deferred to a step; three-way least-slack order (underrunning
+  follow-up, then first hop, then buffered final); a queued peer chunk is ingested before the
+  step and shares the batch; payloads from the pending deque and the inbox share one first-hop
+  batch; the chunk collector keeps arrival order and stops at done; fallback errors surface as
+  error messages. Removed with their mechanism or configuration: the two peer-wait tests, the
+  two peer-reader tests, the streaming payload collection test, the distinct-request chunk
+  collection expectation, the default-flags test and the disabled-coalescing test (flipping
+  `_can_batch_stream_chunks` on a live instance is not a shipped configuration).
+- Base tests: the loop drains pending then inbox before the ready step; `on_stream_done`
+  returning `None` defers completion until `_complete_stream_request`. Vocoder base:
+  `_pump_one_step` returns `None` when idle; `_run_ready_step` aborts a failed step's
+  participants and runs the abort callback.
 - Every other existing test in the four files is unchanged.
 
 ## 5. Gates and measurement
