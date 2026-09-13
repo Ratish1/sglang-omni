@@ -99,6 +99,14 @@ class _FakeFlow(torch.nn.Module):
         return torch.ones(1, 80, token_count * TOKEN_MEL_RATIO), None
 
 
+def _hift_samples(frames: int, *, finalize: bool) -> int:
+    # CosyVoice3 causal HiFT: 480 samples per frame; a non-final call drops the
+    # f0 predictor's 3 right frames, conv_pre's 4, then one frame of samples.
+    if finalize:
+        return frames * 480
+    return (frames - 3 - 4) * 480 - 480
+
+
 class _FakeHiFT(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -106,10 +114,14 @@ class _FakeHiFT(torch.nn.Module):
         self.calls: list[tuple] = []
         self.upsample_rates = [8, 5, 3]
         self.istft_params = {"n_fft": 16, "hop_len": 4}
+        self.conv_pre_look_right = 4
+        self.f0_predictor = SimpleNamespace(condnet=[SimpleNamespace(causal_padding=3)])
 
     def inference(self, *, speech_feat, finalize):
         self.calls.append((speech_feat, finalize))
-        return torch.arange(speech_feat.shape[-1]).reshape(1, -1).float(), None
+        batch, _, frames = speech_feat.shape
+        row = torch.arange(_hift_samples(frames, finalize=finalize)).reshape(1, -1)
+        return row.float().repeat(batch, 1), None
 
 
 def _drain(scheduler: FunCosyVoice3StreamingVocoderScheduler) -> list[OutgoingMessage]:
@@ -210,7 +222,7 @@ def test_streaming_vocoder_emits_causal_chunk_then_finalizes_remainder() -> None
     assert flow.calls[0]["streaming"] is True
     assert flow.calls[0]["finalize"] is False
     assert int(flow.calls[0]["token"].shape[1]) == 28
-    assert _waveform(messages[0].data).shape == (50,)
+    assert _waveform(messages[0].data).shape == (_hift_samples(50, finalize=False),)
 
     scheduler._on_done("req-stream")
     assert _drain(scheduler) == []
@@ -221,7 +233,9 @@ def test_streaming_vocoder_emits_causal_chunk_then_finalizes_remainder() -> None
     assert LEFTOVER_FLOW_STREAMING is False
     assert flow.calls[1]["streaming"] is False
     assert flow.calls[1]["finalize"] is True
-    assert _waveform(messages[0].data).shape == (6,)
+    assert _waveform(messages[0].data).shape == (
+        _hift_samples(56, finalize=True) - _hift_samples(50, finalize=False),
+    )
     assert messages[1].data.data["modality"] == "audio"
     assert messages[1].data.data["sample_rate"] == 24000
     assert "req-stream" not in scheduler._stream_states
@@ -262,7 +276,9 @@ def test_streaming_vocoder_pads_prompt_and_decodes_first_hop_at_28() -> None:
     assert int(flow.calls[0]["token"].shape[1]) == 28
     assert flow.calls[0]["streaming"] is True
     assert flow.calls[0]["finalize"] is False
-    assert _waveform(messages[0].data).shape == (TOKEN_HOP_LEN * TOKEN_MEL_RATIO,)
+    assert _waveform(messages[0].data).shape == (
+        _hift_samples(TOKEN_HOP_LEN * TOKEN_MEL_RATIO, finalize=False),
+    )
 
 
 def test_model_runner_flushes_speech_tokens_and_skips_control_ids() -> None:
@@ -403,9 +419,11 @@ def test_ar_to_vocoder_grows_hops_then_finalizes_remainder() -> None:
     assert all(
         call["streaming"] is True and call["finalize"] is False for call in flow.calls
     )
+    first_hop = _hift_samples(50, finalize=False)
+    second_hop = _hift_samples(150, finalize=False)
     assert [chunk.shape[0] for chunk in pcm_chunks] == [
-        TOKEN_HOP_LEN * TOKEN_MEL_RATIO,
-        2 * TOKEN_HOP_LEN * TOKEN_MEL_RATIO,
+        first_hop,
+        second_hop - first_hop,
     ]
 
     scheduler._handle_message(
@@ -426,11 +444,12 @@ def test_ar_to_vocoder_grows_hops_then_finalizes_remainder() -> None:
     final_messages = _drain(scheduler)
     assert [message.type for message in final_messages] == ["stream", "result"]
     remainder = _waveform(final_messages[0].data)
-    assert remainder.shape == (PRE_LOOKAHEAD_LEN * TOKEN_MEL_RATIO,)
+    total_frames = len(generated) * TOKEN_MEL_RATIO
+    assert remainder.shape == (_hift_samples(total_frames, finalize=True) - second_hop,)
     assert flow.calls[-1]["streaming"] is False
     assert flow.calls[-1]["finalize"] is True
     total = np.concatenate(pcm_chunks + [remainder])
-    assert total.shape == (len(generated) * TOKEN_MEL_RATIO,)
+    assert total.shape == (_hift_samples(total_frames, finalize=True),)
 
 
 @pytest.mark.parametrize("codes", [None, []])
@@ -782,7 +801,9 @@ def test_backlogged_chunks_stay_ordered_before_stream_done(
     assert [m.type for m in messages].count("result") == 1
     assert messages[-1].type == "result"
     audio = np.concatenate([_waveform(m.data) for m in messages if m.type == "stream"])
-    np.testing.assert_array_equal(audio, np.arange(len(tokens) * TOKEN_MEL_RATIO))
+    np.testing.assert_array_equal(
+        audio, np.arange(_hift_samples(len(tokens) * TOKEN_MEL_RATIO, finalize=True))
+    )
     assert "req-a" not in scheduler._stream_states
 
 

@@ -45,8 +45,8 @@ from tests.unit_test.fun_cosyvoice3.test_streaming import (
 FIXTURES = Path(__file__).parent / "fixtures"
 # CosyVoice3 mel runs at 50 frames per second.
 SAMPLES_PER_FRAME = SAMPLE_RATE // 50
-# Arbitrary; the liveness bound scales with it and one hop of audio (1 s)
-# stays far above it, which is what the bound's argument needs.
+# Arbitrary; the liveness bound scales with it and one hop of audio (0.84 s
+# after the HiFT right context) stays far above it, which the bound needs.
 STEP_COST_S = 0.02
 PROMPT_TOKENS = TOKEN_HOP_LEN
 # The packed fake embeds 32 token ids.
@@ -65,13 +65,6 @@ class _ReplayFlow(_PackedFlow):
         if not kwargs["finalize"]:
             token_count = max(token_count - PRE_LOOKAHEAD_LEN, 0)
         return torch.ones(1, 80, token_count * TOKEN_MEL_RATIO), None
-
-
-class _ReplayHiFT(_FakeHiFT):
-    def inference(self, *, speech_feat, finalize):
-        frames = int(speech_feat.shape[-1])
-        self.calls.append((frames, finalize))
-        return torch.zeros(1, frames * SAMPLES_PER_FRAME), None
 
 
 @dataclass
@@ -99,7 +92,7 @@ def _replay(
 ) -> tuple[_ReplayFlow, FunCosyVoice3StreamingVocoderScheduler, _ReplayStats]:
     flow = _ReplayFlow()
     scheduler = FunCosyVoice3StreamingVocoderScheduler(
-        stages.CosyVoice3Vocoder(FunCosyVoice3Flow(flow), _ReplayHiFT()),
+        stages.CosyVoice3Vocoder(FunCosyVoice3Flow(flow), _FakeHiFT()),
         max_batch_size=8,
     )
     clock = _Clock(events[0]["t_ns"] / 1e9)

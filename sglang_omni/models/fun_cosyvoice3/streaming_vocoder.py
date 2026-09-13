@@ -403,14 +403,15 @@ class FunCosyVoice3StreamingVocoderScheduler(
         )
         mels = self._vocoder.first_hop_batch(items)
         offset_frames = token_offset * TOKEN_MEL_RATIO
+        hops = self._vocoder.hift_delta_batch(
+            [mel[:, :, offset_frames:] for mel in mels],
+            hift_mels=[state.hift_mel for _, state in participants],
+            speech_offsets=[state.speech_offset for _, state in participants],
+        )
         decoded: dict[str, torch.Tensor] = {}
-        for (request_id, state), mel in zip(participants, mels, strict=True):
-            delta, hift_mel, speech_offset = self._vocoder.hift_delta(
-                mel[:, :, offset_frames:],
-                hift_mel=state.hift_mel,
-                speech_offset=state.speech_offset,
-                finalize=False,
-            )
+        for (request_id, state), (delta, hift_mel, speech_offset) in zip(
+            participants, hops, strict=True
+        ):
             state.token_offset += hop
             self._advance_hop_len(state)
             state.hift_mel = hift_mel
