@@ -21,7 +21,6 @@ import torch
 from sglang_omni.models.fun_cosyvoice3 import stages
 from sglang_omni.models.fun_cosyvoice3.stages import FunCosyVoice3Flow
 from sglang_omni.models.fun_cosyvoice3.streaming import (
-    PRE_LOOKAHEAD_LEN,
     SAMPLE_RATE,
     TOKEN_HOP_LEN,
     TOKEN_MEL_RATIO,
@@ -57,10 +56,6 @@ class _ReplayFlow(_PackedFlow):
     def __init__(self) -> None:
         super().__init__(channels=80, max_frames=2048)
         self.spk_embed_affine_layer = torch.nn.Linear(192, 80, bias=False)
-
-    def inference(self, **kwargs):
-        token_count = int(kwargs["token"].shape[1]) - PRE_LOOKAHEAD_LEN
-        return torch.ones(1, 80, token_count * TOKEN_MEL_RATIO), None
 
 
 class _ReplayHiFT(_FakeHiFT):

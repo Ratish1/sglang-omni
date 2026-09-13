@@ -1354,15 +1354,10 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             tts_mel, hift_mel=hift_mel, speech_offset=speech_offset, finalize=finalize
         )
 
-    def first_hop_batch(self, items: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
-        """Causal Flow for one hop per row, padded to the longest window.
-        HiFT stays per request.
-
-        # note (guozhihao-224): first hops and follow-up hops share this
-        # path; the scheduler slices new frames at token_offset.
+    def hop_batch(self, items: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
+        """Causal Flow for one hop per row, padded to the longest window; the
+        scheduler keeps the frames past token_offset. HiFT stays per request.
         """
-        if not items:
-            raise ValueError("first-hop Flow batch must contain at least one input")
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=self.autocast_dtype,
