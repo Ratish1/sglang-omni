@@ -2202,37 +2202,11 @@ def test_qwen3_tts_stateful_codec_graph_shapes_follow_chunk_ramp(
         range(1, 9)
     )
     assert scheduler._initial_incremental_decode_graphs._fresh_frames == (2, 3)
-    assert scheduler._initial_window_decode_graphs._fresh_frames == (1, 2, 4, 8)
-    assert (
-        scheduler.codec_state_stats()["cuda_graphs"]["window"]["binding"]["mode"]
-        == "window"
-    )
+    assert scheduler._initial_window_decode_graphs is None
+    assert scheduler.codec_state_stats()["cuda_graphs"]["window"] == {"enabled": False}
 
 
-@pytest.mark.parametrize(
-    ("left_context", "followup_stride", "expected"),
-    [
-        (16, 8, (1, 2, 4, 8, 16)),
-        (16, 16, (1, 2, 4, 8, 16, 32)),
-        (0, 1, (1,)),
-    ],
-)
-def test_qwen3_tts_window_ladder_follows_the_decode_envelope(
-    monkeypatch: pytest.MonkeyPatch,
-    left_context: int,
-    followup_stride: int,
-    expected: tuple[int, ...],
-) -> None:
-    scheduler, _ = _stateful_qwen3_tts_scheduler(
-        monkeypatch,
-        stream_left_context_frames=left_context,
-        stream_followup_stride=followup_stride,
-    )
-
-    assert scheduler._initial_window_decode_graphs._fresh_frames == expected
-
-
-def test_qwen3_tts_explicit_window_frames_replace_the_ladder(
+def test_qwen3_tts_window_frames_build_the_window_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -2249,6 +2223,11 @@ def test_qwen3_tts_explicit_window_frames_replace_the_ladder(
     )
 
     assert scheduler._initial_window_decode_graphs._fresh_frames == (3, 12)
+    assert scheduler._initial_incremental_decode_graphs._fresh_frames == (1, 2)
+    assert (
+        scheduler.codec_state_stats()["cuda_graphs"]["window"]["binding"]["mode"]
+        == "window"
+    )
 
 
 def test_qwen3_tts_empty_window_frames_disable_the_window_runner(

@@ -99,21 +99,6 @@ def _decode_graph_frame_counts(
     return tuple(sorted(counts))
 
 
-def _window_frame_ladder(widest: int) -> tuple[int, ...]:
-    """Powers of two up to widest, the fewest widths that cover any count.
-
-    Consumed largest first, any frame count splits into at most count over
-    the widest width plus one window per smaller width, and the ladder
-    always holds width 1, so no count is left over.
-    """
-    ladder: list[int] = []
-    width = 1
-    while width <= widest:
-        ladder.append(width)
-        width *= 2
-    return tuple(ladder)
-
-
 @dataclass
 class _Qwen3TTSStreamState:
     code_chunks: list[torch.Tensor] = field(default_factory=list)
@@ -633,13 +618,11 @@ class Qwen3TTSStreamingVocoderScheduler(
             raise ValueError(
                 "incremental_codec_cuda_graph_cold_frames must be positive"
             )
+        # note(ratish): the window widths are a cost tradeoff, replays per
+        # bootstrap against capture memory, pinned by measuring the decoder;
+        # until a measured default exists, none means no window runner.
         if incremental_codec_cuda_graph_window_frames is None:
-            # note(ratish): the widest decode this scheduler already replays
-            # through a graph is a left context plus one steady chunk, so the
-            # window ladder stops there rather than at a width of its own.
-            incremental_codec_cuda_graph_window_frames = _window_frame_ladder(
-                int(stream_left_context_frames) + int(stream_followup_stride)
-            )
+            incremental_codec_cuda_graph_window_frames = ()
         if any(
             int(frames) <= 0 for frames in incremental_codec_cuda_graph_window_frames
         ):
