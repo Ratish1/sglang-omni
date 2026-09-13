@@ -60,10 +60,18 @@ def main():
     parser.add_argument("--widths", default="4,8,16,32,64")
     parser.add_argument("--totals", default="50,100,150")
     parser.add_argument("--reps", type=int, default=50)
+    parser.add_argument("--buckets", default="1,4")
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="capture every width from the compiled decoder step, as the warm "
+        "runner does for its steady stride",
+    )
     parser.add_argument("--out", default="codec_window_bench.json")
     args = parser.parse_args()
     widths = tuple(int(w) for w in args.widths.split(","))
     totals = tuple(int(t) for t in args.totals.split(","))
+    buckets = tuple(int(b) for b in args.buckets.split(","))
 
     device = torch.device("cuda", torch.cuda.current_device())
     tokenizer = qwen3_stages._load_qwen3_tts_tokenizer(
@@ -75,6 +83,7 @@ def main():
     num_quantizers = int(decoder_config.num_quantizers)
     dtype = next(tokenizer.model.decoder.parameters()).dtype
     arena = Qwen3TTSCodecStateArena(decoder, num_slots=8, device=device, dtype=dtype)
+    all_widths = tuple(sorted({1, 2, *widths}))
     # note(ratish): the same construction the vocoder uses for its window
     # runner, with every candidate cap's rungs captured at once.
     runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
@@ -83,31 +92,46 @@ def main():
         dtype=dtype,
         num_quantizers=num_quantizers,
         mode="window",
-        fresh_frames=tuple(sorted({1, 2, *widths})),
-        batch_sizes=(1, 2, 4, 8),
+        fresh_frames=all_widths,
+        batch_sizes=buckets,
+        compile_fresh_frames=all_widths if args.compile else (),
         arena=arena,
     )
     capture_start = time.perf_counter()
     runner.capture()
     stats = runner.stats()
+    spec = decoder.state_spec()
+    transformer = tokenizer.model.decoder.pre_transformer
     result = {
+        "compiled": bool(args.compile),
+        "buckets": list(buckets),
         "capture_s": time.perf_counter() - capture_start,
         "captured_keys": stats["build"]["captured_keys"],
         "graph_footprint_bytes": stats["memory"].get("graph_footprint_bytes"),
+        "decoder": {
+            "transformer_layers": spec.num_layers,
+            "window_size": int(transformer.window_size),
+            "retained_context": spec.retained_context,
+            "conv_history_frames": [
+                (key, length) for key, _, length in spec.conv_histories
+            ],
+        },
         "replay": {},
         "eager": {},
         "windowed": {},
     }
+    if not stats["enabled"]:
+        raise SystemExit(f"capture failed: {stats['disable_reason']}")
+    print("decoder:", result["decoder"])
     print(
         f"captured {len(stats['build']['captured_keys'])} keys in "
         f"{result['capture_s']:.1f} s, footprint "
         f"{(result['graph_footprint_bytes'] or 0) / 2**20:.0f} MiB"
     )
 
-    all_widths = tuple(sorted({1, 2, *widths}))
     with torch.inference_mode():
         for width in all_widths:
-            for bucket in (1, 4):
+            for bucket in buckets:
                 codes = torch.randint(
                     0, 2048, (bucket, num_quantizers, width), device=device
                 )
