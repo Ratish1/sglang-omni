@@ -1,6 +1,11 @@
 # Slice 01: streaming vocoder scheduler, message order and step liveness
 
-Base: upstream `main` at `f58228dfb`. Owners: `sglang_omni/scheduling/streaming_simple_scheduler.py`,
+Base: PR #2086 head `4de7afccc` (stacked on upstream `main` `f58228dfb`; byte-identical to the
+closed #2144, which measured the ordering defect on an H200 and reported zh c16 streaming corpus
+WER 6.7 to 7.2 percent falling to 0.4 to 0.8 and 300 s timeouts falling from 12 to 1 per 500).
+#2086 implements invariant 1 below in the collectors and in CosyVoice's three peer readers; this
+slice does not reimplement it. The residual timeout is the liveness defect this slice removes.
+Owners: `sglang_omni/scheduling/streaming_simple_scheduler.py`,
 `sglang_omni/scheduling/streaming_vocoder.py`, `sglang_omni/models/fun_cosyvoice3/streaming_vocoder.py`.
 Line references are to the analysis branch, which differs from main in these files only by the
 diagnostic marks.
@@ -88,13 +93,11 @@ kept; the mechanism is replaced.
 
 ### `scheduling/streaming_simple_scheduler.py` (shared by ten schedulers)
 
-- Add `_take_message(timeout)`: pop `_pending_messages` if non-empty, else `inbox.get`
-  (`get_nowait` when `timeout` is zero). Add `_park_front(messages)`: `extendleft(reversed(...))`.
-  `_next_message` calls `_take_message(0.1)`.
-- `_collect_new_request_batch` and `_collect_stream_chunk_batch` take messages only through
-  `_take_message` and park only through `_park_front`, collecting parked messages in a local list
-  during the scan. Their batching semantics are unchanged; the qwen3_omni scheduler's own
-  `_next_message` override keeps working because it is the loop getter, not the collector.
+- Ordered source: #2086's `_get_batch_message(timeout)` (pending first, then inbox) and its
+  hold-aside parking (`extendleft(reversed(deferred))`) are the primitives; `_next_message`
+  switches to `_get_batch_message(0.1)` so the loop getter and the collectors share one source.
+  The qwen3_omni scheduler's own `_next_message` override keeps working because it is the loop
+  getter, not the collector.
 - Serving loop: drain with `_take_message(0)` and handle each message; when the queue is empty and
   `_has_ready_work()` is true, call `_run_ready_step()`; when neither, block with
   `_take_message(self._ready_step_delay())`, where the default delay is 0.1 s. Defaults:
@@ -175,5 +178,7 @@ Added or changed:
 ## 6. Out of this slice
 
 The memory budget (C2) runs as a census on the box in parallel and is a config PR. The vocoder
-host path (V1 to V4) is unchanged here so the A/B isolates the scheduler. PR #2086 and #2110
-touch the same functions; their tests are carried over, their collector patches are superseded.
+host path (V1 to V4) is unchanged here so the A/B isolates the scheduler. The ordering fix is
+#2086 and is the base of this slice, not part of it; #2110's ingest rewrite is superseded by the
+loop change. The 30 ms peer window value is unchanged; whether it earns its place at c2 to c8 is a
+separate measured slice.
