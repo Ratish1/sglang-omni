@@ -1,5 +1,8 @@
 # 33. Runbook: the vocoder bootstrap through captured graphs (doc 32 item 1)
 
+Status 2026-09-13: session 1 is void, every arm imported main through the console script
+(doc 35). Rerun with the boot command and import gate below.
+
 Two branches on upstream main 3060470a8.
 
 - `perf/qwen3-tts-codec-precompile` at b2c9abe13: the decoder traces a
@@ -40,6 +43,17 @@ The steps below are the session that decides both PRs. Same session rules as doc
 plain server command, GPU 0, GPUs 1 to 3 recorded before every boot, dmon on every boot,
 full corpus, warmup 1, no seed, two passes per arm, event recorder in pass 2 stopped
 after 200 completions, decode log gap check on the first boot.
+
+Boot command and import gate, every arm. The server starts from the arm's worktree with
+`python -m sglang_omni.cli serve --model-path Qwen/Qwen3-TTS-12Hz-1.7B-Base --config
+examples/configs/qwen3_tts_1_7b.yaml --host 127.0.0.1 --port 31001`, never the `sgl-omni`
+console script, which imports the venv's editable install (the main checkout) from any
+directory. Before the boot, from the worktree, archive
+`python -c "import sglang_omni; print(sglang_omni.__file__)"` as `import_path.txt`; it
+must be under that worktree. On a B boot the serve log must carry
+`window_frames=(1, 2, 4, 8, 16, 32, 64)` on the graph shapes line and a third
+`graphs captured for` list of widths 1 to 64 before any pass runs. A boot failing either
+check is void.
 
 What the change does. A reference prefixed bootstrap (reference frames plus the first
 chunk) used to be one eager decode of an uncaptured width, about 860 host launches and
