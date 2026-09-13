@@ -112,11 +112,12 @@ Reads per arm and pass, from `measured/speed_results.json` and the dmon log: fai
 
 | arm | failures | WER | first audio | C50 | req/s | audio s/s |
 |---|---|---|---|---|---|---|
-| A, `51e2f7ec2` | 0 (findings item 5) | not measured | 11.1 s mean, 16.3 s p95 (item 4) | 98.7 with 14 underruns (item 4) | 1.37 (item 4) | 6.9 (item 4) |
-| previous B, `691c18371` | 0 (slice 02 line 14) | 1.6 percent (line 14) | 3.35 s (line 15) | 9 (line 15) | not measured | 9.5 (line 14) |
-| PR #2086 | not measured | not measured | not measured | not measured | not measured | not measured |
+| A, `51e2f7ec2` | 23 timeouts (findings item 11) | 6.82 percent on 1065 scored (item 11) | 0.91 s mean, 2.17 s p95 (item 11) | 79.8 (item 11) | 1.62 (item 11) | 7.40 (item 11) |
+| previous B, `691c18371` | 0 (slice 02 line 14) | 1.59 percent (item 11) | 3.35 s mean, 6.60 s p95 (item 11) | 9.3 (item 11) | 1.95 (item 11) | 9.47 (item 11) |
+| B, `a8700d833` | 0 (item 11) | 1.38 percent (item 11) | 3.32 s mean, 6.35 s p95 (item 11) | 13.2 (item 11) | 2.05 (item 11) | 9.72 (item 11) |
+| PR #2086 | 0 (item 11) | 1.27 percent (item 11) | 11.58 s mean, 15.39 s p95 (item 11) | 98.6 (item 11) | 1.32 (item 11) | 6.39 (item 11) |
 
-Items 4 and 5 are in [the findings](../FINDINGS_20260913.md); the slice 02 lines are in [the vocoder step cost slice](../slices/02_vocoder_step_cost.md). Three cautions on that table. The previous B row is the B side of the earlier slice 01 pair, whose A was the run on `645b472cd` with 22 to 23 timeouts, 7.4 audio s/s, C50 80 and 6.8 percent WER (slice 02 lines 13 to 15, findings item 5), not the A row above, so the two rows are not a pair and only the columns within a row are safe to read together. Slice 02 does not name the head it calls B; `691c18371` is the merge of upstream main into the branch. Nobody measured PR #2086's throughput and its reported speed decline has no numbers (findings item 8), so every cell in that row stays empty until a run fills it.
+Item 11 is in [the findings](../FINDINGS_20260913.md); the slice 02 line is in [the vocoder step cost slice](../slices/02_vocoder_step_cost.md). All four rows are one session on GPU 0, archived under `artifacts/full-20260913T171454Z/cosyvoice-ab-gpu0/<arm>/stream-c16/` in the local checkout's `artifacts/` directory, so the rows are a real pair and safe to read across.
 
 The buffered cells and c1 are collected the same way when the matrix is repeated. Compare each matching mode and concurrency separately, for example:
 
