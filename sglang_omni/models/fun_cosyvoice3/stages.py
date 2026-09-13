@@ -36,6 +36,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     TOKEN_MEL_RATIO,
 )
 from sglang_omni.platforms import current_platform
+from sglang_omni.profiler.pipeline_nvtx import ENABLED, trace_call, trace_range
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.pipeline_state import load_state as load_pipeline_state
@@ -241,6 +242,15 @@ def pack_flow_inputs(
     )
 
 
+@trace_call(
+    "flow",
+    "euler",
+    lambda decoder, noisy_mel, *args, **kwargs: {
+        "batch_size": noisy_mel.shape[0],
+        "frames": noisy_mel.shape[-1],
+        "streaming": kwargs.get("streaming", False),
+    },
+)
 def solve_flow_euler(
     decoder: ConditionalCFM,
     noisy_mel: torch.Tensor,
@@ -281,15 +291,16 @@ def solve_flow_euler(
         prompt_mel_cfg[:batch_size] = prompt_mel
         estimator = decoder.estimator
         if isinstance(estimator, torch.nn.Module):
-            vector_field = decoder.forward_estimator(
-                noisy_mel_cfg,
-                mel_mask_cfg,
-                token_condition_cfg,
-                flow_time,
-                speaker_embedding_cfg,
-                prompt_mel_cfg,
-                streaming=streaming,
-            )
+            with trace_range("flow", "estimator"):
+                vector_field = decoder.forward_estimator(
+                    noisy_mel_cfg,
+                    mel_mask_cfg,
+                    token_condition_cfg,
+                    flow_time,
+                    speaker_embedding_cfg,
+                    prompt_mel_cfg,
+                    streaming=streaming,
+                )
         else:
             # Packed Flow is CFG=2N; CosyVoice TRT hardcodes (2, 80, T).
             vector_field = execute_flow_estimator(
@@ -515,7 +526,10 @@ class FlowCudaGraphRunner:
                         captured.static_inputs, inputs, strict=True
                     ):
                         static.copy_(value)
-                    captured.graph.replay()
+                    with trace_range(
+                        "flow", "graph", batch_size=batch_size, frames=bucket_mel_frame
+                    ):
+                        captured.graph.replay()
                     return captured.static_output[..., :actual_mel_frame].clone()
 
 
@@ -709,6 +723,15 @@ class FunCosyVoice3Flow:
         self.cuda_graph_runner = runner
 
     @torch.inference_mode()
+    @trace_call(
+        "flow",
+        "packed_buffered",
+        lambda self, inputs: {
+            "batch_size": len(inputs),
+            "token_lengths": [x.token.shape[1] for x in inputs],
+            "prompt_lengths": [x.prompt_token.shape[1] for x in inputs],
+        },
+    )
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
         packed = pack_flow_inputs(self.flow, inputs)
         generated = generate_flow(self, packed)
@@ -721,6 +744,15 @@ class FunCosyVoice3Flow:
         )
 
     @torch.inference_mode()
+    @trace_call(
+        "flow",
+        "packed_causal",
+        lambda self, inputs: {
+            "batch_size": len(inputs),
+            "token_lengths": [x.token.shape[1] for x in inputs],
+            "prompt_lengths": [x.prompt_token.shape[1] for x in inputs],
+        },
+    )
     def inference_causal(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
         # note (guozhihao-224): causal hops (first and follow-up). Same
         # packing as buffered inference, but strip lookahead per row so
@@ -1233,10 +1265,19 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         )
         flow_device = next(self.flow.parameters()).device
         for flow_group in flow_groups:
-            with torch.autocast(
-                device_type=flow_device.type,
-                dtype=self.autocast_dtype,
-                enabled=self.autocast_dtype is not None,
+            with (
+                trace_range(
+                    "vocoder",
+                    "flow_group",
+                    buffered_item_indices=(
+                        [r.index for r in flow_group] if ENABLED else ()
+                    ),
+                ),
+                torch.autocast(
+                    device_type=flow_device.type,
+                    dtype=self.autocast_dtype,
+                    enabled=self.autocast_dtype is not None,
+                ),
             ):
                 mel_list = self.flow.inference(
                     [request.flow_input for request in flow_group]
@@ -1268,7 +1309,14 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             if group:
                 hift_groups.append(group)
             for group in hift_groups:
-                wavs = self.mel2wav_batch([mel for _, mel in group])
+                with trace_range(
+                    "vocoder",
+                    "hift_group",
+                    buffered_item_indices=(
+                        [r.index for r, _ in group] if ENABLED else ()
+                    ),
+                ):
+                    wavs = self.mel2wav_batch([mel for _, mel in group])
                 for (request, _), wav in zip(group, wavs, strict=True):
                     results[request.index] = (wav, request.sample_rate)
 
@@ -1329,10 +1377,22 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         device = next(native_flow.parameters()).device
         offset = max(int(token_offset), 0)
 
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=self.autocast_dtype,
-            enabled=self.autocast_dtype is not None,
+        with (
+            trace_range(
+                "flow",
+                "native",
+                batch_size=1,
+                tokens=token.shape[1],
+                prompt_tokens=prompt_token.shape[1],
+                offset=offset,
+                streaming=streaming,
+                finalize=finalize,
+            ),
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=self.autocast_dtype,
+                enabled=self.autocast_dtype is not None,
+            ),
         ):
             tts_mel, _ = native_flow.inference(
                 token=token.to(device, dtype=torch.int32),
@@ -1379,9 +1439,18 @@ class CosyVoice3Vocoder(BatchVocoderBase):
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         if hift_mel is not None:
             tts_mel = torch.cat([hift_mel.to(device=tts_mel.device), tts_mel], dim=2)
-        tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=finalize)
+        with trace_range(
+            "hift",
+            "inference",
+            batch_size=1,
+            frames=tts_mel.shape[-1],
+            finalize=finalize,
+            speech_offset=speech_offset,
+        ):
+            tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=finalize)
         held = max(int(speech_offset), 0)
-        delta = tts_speech[:, held:].detach().cpu()
+        with trace_range("d2h", "waveform", samples=tts_speech.shape[-1] - held):
+            delta = tts_speech[:, held:].detach().cpu()
         return delta, tts_mel.detach(), int(tts_speech.shape[1])
 
     def make_flow_input(
@@ -1429,9 +1498,19 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             enabled=self.hift_autocast_dtype is not None,
         )
         if len(mels) == 1:
-            with hift_autocast:
+            with (
+                trace_range(
+                    "hift",
+                    "inference",
+                    batch_size=1,
+                    frames=mels[0].shape[-1],
+                    finalize=True,
+                ),
+                hift_autocast,
+            ):
                 tts_speech, _ = self.hift.inference(speech_feat=mels[0], finalize=True)
-            return [tts_speech.detach().cpu()]
+            with trace_range("d2h", "waveform", samples=tts_speech.shape[-1]):
+                return [tts_speech.detach().cpu()]
         lengths = [int(mel.shape[2]) for mel in mels]
         longest = max(lengths)
         if min(lengths) == longest:
@@ -1444,7 +1523,17 @@ class CosyVoice3Vocoder(BatchVocoderBase):
                 ],
                 dim=0,
             )
-        with hift_autocast:
+        with (
+            trace_range(
+                "hift",
+                "inference",
+                batch_size=len(mels),
+                frames=longest,
+                lengths=lengths,
+                finalize=True,
+            ),
+            hift_autocast,
+        ):
             wav, _ = self.hift.inference(speech_feat=padded, finalize=True)
         wav = wav.detach()
         if self.hift_samples_per_mel_frame is None:
@@ -1453,10 +1542,11 @@ class CosyVoice3Vocoder(BatchVocoderBase):
                 stride *= int(rate)
             self.hift_samples_per_mel_frame = stride
         samples_per_frame = self.hift_samples_per_mel_frame
-        return [
-            wav[index : index + 1, : length * samples_per_frame].cpu()
-            for index, length in enumerate(lengths)
-        ]
+        with trace_range("d2h", "waveform_batch", batch_size=len(mels)):
+            return [
+                wav[index : index + 1, : length * samples_per_frame].cpu()
+                for index, length in enumerate(lengths)
+            ]
 
     def store_result(
         self,

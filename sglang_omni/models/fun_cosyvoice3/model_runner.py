@@ -18,8 +18,10 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     prompt_token_len,
 )
 from sglang_omni.platforms import current_platform
+from sglang_omni.profiler.pipeline_nvtx import mark, trace_call, trace_range
 from sglang_omni.sampling.seed import SAMPLING_SEED_MASK
 from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.types import ModelRunnerOutput, SchedulerOutput
 
 from .request_builders import accept_cosyvoice3_stream_token
 from .sglang_model import VOCAB_SIZE
@@ -50,6 +52,21 @@ class FunCosyVoice3ModelRunner(ModelRunner):
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
 
+    @trace_call(
+        "ar",
+        "execute",
+        lambda self, scheduler_output: {
+            "request_ids": scheduler_output.request_ids,
+            "batch_size": len(scheduler_output.requests),
+            "mode": str(getattr(scheduler_output.batch_data, "forward_mode", None)),
+        },
+    )
+    def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
+        result = super().execute(scheduler_output)
+        mark("ar", "result", graph=result.can_run_cuda_graph)
+        return result
+
+    @trace_call("ar", "prefill")
     def custom_prefill_forward(
         self,
         forward_batch: Any,
@@ -87,6 +104,18 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         """Sample the first speech token before collecting prefill output."""
         del forward_batch, schedule_batch, requests
         return True
+
+    @trace_call("ar", "sampling")
+    def _sample_next_token_ids(
+        self,
+        logits_output: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> Any:
+        return super()._sample_next_token_ids(
+            logits_output, forward_batch, schedule_batch, requests
+        )
 
     def sample_before_post_decode(
         self,
@@ -280,7 +309,8 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         if token_ids.ndim != 1:
             token_ids = token_ids.reshape(-1)
         # note (guozhihao-224): one batched D2H instead of per-request .item() syncs.
-        token_ids_cpu = token_ids.tolist()
+        with trace_range("ar", "codec_ids_d2h", batch_size=token_ids.numel()):
+            token_ids_cpu = token_ids.tolist()
         for idx, sched_req in enumerate(requests):
             token_id = int(token_ids_cpu[idx])
             if token_id >= VOCAB_SIZE:
@@ -348,6 +378,13 @@ class FunCosyVoice3ModelRunner(ModelRunner):
             chunk_metadata["flow_prompt_speech_feat"] = data.flow_prompt_speech_feat
             chunk_metadata["flow_embedding"] = data.flow_embedding
             data.stream_prompt_sent = True
+        mark(
+            "ar",
+            "chunk_emitted",
+            request_id=request_id,
+            tokens=int(codes.numel()),
+            tokens_seen=int(data.stream_code_seen),
+        )
         self._outbox.put(
             OutgoingMessage(
                 request_id=request_id,

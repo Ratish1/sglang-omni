@@ -27,6 +27,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     pad_flow_prompt_to_hop,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.profiler.pipeline_nvtx import ENABLED, mark, trace_call, trace_range
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
@@ -140,12 +141,19 @@ class FunCosyVoice3StreamingVocoderScheduler(
         )
 
     async def _vocode_payload(self, payload: StagePayload) -> StagePayload:
+        mark("vocoder", "buffered_inputs", request_ids=[payload.request_id])
         results = await self._vocoder.decode_payloads([payload])
         return results[0]
 
     async def _vocode_payloads(
         self, payloads: list[StagePayload]
     ) -> list[StagePayload]:
+        if ENABLED:
+            mark(
+                "vocoder",
+                "buffered_inputs",
+                request_ids=[payload.request_id for payload in payloads],
+            )
         return await self._vocoder.decode_payloads(payloads)
 
     def create_stream_state(self, request_id: str) -> _CosyVoice3StreamState:
@@ -276,7 +284,14 @@ class FunCosyVoice3StreamingVocoderScheduler(
         state: _CosyVoice3StreamState,
         codes: torch.Tensor,
     ) -> None:
-        del request_id
+        if ENABLED:
+            mark(
+                "vocoder",
+                "ingest",
+                request_id=request_id,
+                tokens=int(codes.numel()),
+                tokens_before=len(state.tokens),
+            )
         state.tokens.extend(int(token) for token in codes.tolist())
         self._mark_ready(state)
 
@@ -324,6 +339,15 @@ class FunCosyVoice3StreamingVocoderScheduler(
         pool = started
         if unstarted and (not started or self._can_afford_a_step(started[0], now)):
             pool = unstarted
+        if ENABLED:
+            mark(
+                "scheduler",
+                "ready_candidates",
+                started=[c.request_id for c in started],
+                unstarted=[c.request_id for c in unstarted],
+                admitting=pool is unstarted,
+                last_step_s=self._last_step_s,
+            )
         if not pool:
             return []
         head = pool[0]
@@ -348,6 +372,17 @@ class FunCosyVoice3StreamingVocoderScheduler(
     ) -> str:
         return _step_kind(participants[0][1])
 
+    @trace_call(
+        "vocoder",
+        "stream_step",
+        lambda self, participants, plan: {
+            "request_ids": [rid for rid, _ in participants],
+            "batch_size": len(participants),
+            "kind": plan,
+            "token_offset": participants[0][1].token_offset,
+            "hop": participants[0][1].hop_len,
+        },
+    )
     def run_step(
         self,
         participants: list[tuple[str, _CosyVoice3StreamState]],
@@ -405,12 +440,13 @@ class FunCosyVoice3StreamingVocoderScheduler(
         offset_frames = token_offset * TOKEN_MEL_RATIO
         decoded: dict[str, torch.Tensor] = {}
         for (request_id, state), mel in zip(participants, mels, strict=True):
-            delta, hift_mel, speech_offset = self._vocoder.hift_delta(
-                mel[:, :, offset_frames:],
-                hift_mel=state.hift_mel,
-                speech_offset=state.speech_offset,
-                finalize=False,
-            )
+            with trace_range("vocoder", "stream_hift", request_id=request_id):
+                delta, hift_mel, speech_offset = self._vocoder.hift_delta(
+                    mel[:, :, offset_frames:],
+                    hift_mel=state.hift_mel,
+                    speech_offset=state.speech_offset,
+                    finalize=False,
+                )
             state.token_offset += hop
             self._advance_hop_len(state)
             state.hift_mel = hift_mel
@@ -427,6 +463,16 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self._advance_hop_len(state)
         return delta
 
+    @trace_call(
+        "vocoder",
+        "stream_delta",
+        lambda self, request_id, state, *, is_final: {
+            "request_id": request_id,
+            "finalize": is_final,
+            "token_offset": state.token_offset,
+            "tokens_available": len(state.tokens),
+        },
+    )
     def decode_delta(
         self,
         request_id: str,
