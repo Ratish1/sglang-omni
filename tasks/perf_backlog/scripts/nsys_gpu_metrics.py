@@ -2,10 +2,11 @@
 
 Usage: python nsys_gpu_metrics.py <trace.sqlite> [<trace.sqlite> ...]
 
-Prints, per file, the mean over the sampled window of GR Active, SMs Active, Compute
-Warps in Flight (throughput percent and warps per cycle) and the GPC clock, with the
-sample count and the window length. The means are over every sample of the export, so
-start the capture only when traffic is steady.
+Prints, per file, the mean over the sampled window of GR Active (any engine work), SMs
+Active (share of SMs with a warp resident), SM Issue (share of issue slots used, the
+utilization rate), Tensor Active, warps in flight and unallocated warps (occupancy),
+DRAM bandwidth and the GPC clock, with the sample count and the window length. The means
+are over every sample of the export, so start the capture only when traffic is steady.
 """
 
 import sqlite3
@@ -14,7 +15,12 @@ import sys
 WANTED = (
     "GR Active",
     "SMs Active",
+    "SM Issue",
+    "Tensor Active",
     "Compute Warps in Flight",
+    "Unallocated Warps in Active SMs",
+    "DRAM Read Bandwidth",
+    "DRAM Write Bandwidth",
     "GPC Clock Frequency",
 )
 
