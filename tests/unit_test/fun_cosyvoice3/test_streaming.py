@@ -664,32 +664,60 @@ def test_pump_drains_backlog_across_one_hop_steps() -> None:
     assert len(messages) == 3
 
 
-def _started_stream_and_new_first_hop(
-    clock: _Clock,
-) -> tuple[_FakeFlow, FunCosyVoice3StreamingVocoderScheduler]:
-    flow, scheduler = _scheduler()
-    scheduler._clock = clock
+def _stream_ids(messages: list[OutgoingMessage]) -> list[str]:
+    return [m.request_id for m in messages if m.type == "stream"]
+
+
+def test_hops_of_different_token_windows_share_one_causal_flow_batch() -> None:
+    flow, scheduler = _packed_scheduler()
     for request_id in ("req-a", "req-b"):
-        scheduler._on_streaming_new_request(request_id, _stream_payload(request_id))
-    scheduler._ingest_stream_item("req-a", _item(list(range(28))))
+        scheduler._on_streaming_new_request(request_id, _aligned_payload(request_id))
+        scheduler._ingest_stream_item(request_id, _item(list(range(28))))
     assert _serve(scheduler) == 1
-    scheduler._ingest_stream_item("req-a", _item(list(range(28, 178))))
-    scheduler._ingest_stream_item("req-b", _item(list(range(28))))
-    return flow, scheduler
+    _drain(scheduler)
+    scheduler._ingest_stream_item("req-a", _item([i % 31 for i in range(28, 78)]))
+    scheduler._on_streaming_new_request("req-c", _aligned_payload("req-c"))
+    scheduler._ingest_stream_item("req-c", _item(list(range(28))))
+
+    assert _serve(scheduler) == 1
+    assert flow.decoder.estimator.calls[-1]["x"].shape[0] == 4
+    samples = {
+        m.request_id: _waveform(m.data).shape[0]
+        for m in _drain(scheduler)
+        if m.type == "stream"
+    }
+    assert samples == {
+        "req-a": 2 * TOKEN_HOP_LEN * TOKEN_MEL_RATIO,
+        "req-c": TOKEN_HOP_LEN * TOKEN_MEL_RATIO,
+    }
+    assert scheduler._stream_states["req-b"].token_offset == TOKEN_HOP_LEN
 
 
-def test_first_hop_is_admitted_while_the_started_stream_can_afford_a_step() -> None:
-    flow, scheduler = _started_stream_and_new_first_hop(_Clock())
-    assert _serve(scheduler) == 3
-    assert [int(call["token"].shape[1]) for call in flow.calls] == [28, 28, 78, 178]
+def test_step_takes_started_streams_before_new_ones_up_to_the_batch_size() -> None:
+    flow, scheduler = _packed_scheduler(max_batch_size=2)
+    scheduler._clock = _Clock()
+    for request_id in ("req-a", "req-b"):
+        scheduler._on_streaming_new_request(request_id, _aligned_payload(request_id))
+        scheduler._ingest_stream_item(request_id, _item(list(range(28))))
+    assert _serve(scheduler) == 1
+    for request_id in ("req-a", "req-b"):
+        scheduler._ingest_stream_item(
+            request_id, _item([i % 31 for i in range(28, 78)])
+        )
+    for request_id in ("req-c", "req-d"):
+        scheduler._on_streaming_new_request(request_id, _aligned_payload(request_id))
+        scheduler._ingest_stream_item(request_id, _item(list(range(28))))
 
-
-def test_started_stream_runs_first_once_it_cannot_afford_a_step() -> None:
-    clock = _Clock()
-    flow, scheduler = _started_stream_and_new_first_hop(clock)
-    clock.now += 1.0
-    assert _serve(scheduler) == 3
-    assert [int(call["token"].shape[1]) for call in flow.calls] == [28, 78, 178, 28]
+    assert _serve(scheduler) == 2
+    assert _stream_ids(_drain(scheduler)) == [
+        "req-a",
+        "req-b",
+        "req-a",
+        "req-b",
+        "req-c",
+        "req-d",
+    ]
+    assert {call["x"].shape[0] for call in flow.decoder.estimator.calls} == {4}
 
 
 def test_first_hop_runs_when_no_started_stream_is_runnable() -> None:

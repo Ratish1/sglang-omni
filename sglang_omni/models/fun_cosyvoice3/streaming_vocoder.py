@@ -77,10 +77,6 @@ def _step_kind(state: _CosyVoice3StreamState) -> str | None:
     return None
 
 
-def _step_key(state: _CosyVoice3StreamState) -> tuple[int, int]:
-    return state.token_offset, state.hop_len
-
-
 def _slack_s(state: _CosyVoice3StreamState, *, now: float, sample_rate: int) -> float:
     return state.speech_offset / sample_rate - (now - state.first_emit_at)
 
@@ -91,11 +87,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
     """Decode CosyVoice3 speech tokens incrementally through Flow + HiFT.
 
     Messages only change per-request state. The serving loop runs one step
-    once the inbox is drained: the started stream with the least playback
-    slack goes first, a new request's first hop is admitted only while every
-    started stream can afford one more step, and every runnable stream with
-    the same token window joins the step, so equal-shape hops share one
-    causal Flow call.
+    once the inbox is drained: started streams rank by playback slack, least
+    first, new streams by age, and every runnable hop joins the step up to
+    the batch size, so one packed causal Flow call carries hops of different
+    token windows. A final runs alone at the head.
     """
 
     _can_batch_stream_chunks = True
@@ -127,7 +122,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self._disable_hop_growth = bool(disable_hop_growth)
         self._vocoder = vocoder
         self._clock: Callable[[], float] = time.monotonic
-        self._last_step_s = 0.0
         super().__init__(
             self._vocode_payload,
             batch_compute_fn=self._vocode_payloads,
@@ -321,27 +315,13 @@ class FunCosyVoice3StreamingVocoderScheduler(
             (c for c in runnable if c.state.first_emit_at is None),
             key=lambda c: (c.state.ready_since, c.request_id),
         )
-        pool = started
-        if unstarted and (not started or self._can_afford_a_step(started[0], now)):
-            pool = unstarted
-        if not pool:
+        ranked = started + unstarted
+        if not ranked:
             return []
-        head = pool[0]
-        if head.kind == FINAL:
-            return [(head.request_id, head.state)]
-        key = _step_key(head.state)
-        peers = [
-            (c.request_id, c.state)
-            for c in pool
-            if c.kind != FINAL and _step_key(c.state) == key
-        ]
-        return peers[: self._max_batch_size]
-
-    def _can_afford_a_step(self, candidate: _Candidate, now: float) -> bool:
-        # note(ratish): admitting a new stream costs every started stream one
-        # step of wall time; the least-slack one must survive it.
-        slack = _slack_s(candidate.state, now=now, sample_rate=self._sample_rate)
-        return slack > self._last_step_s
+        if ranked[0].kind == FINAL:
+            return [(ranked[0].request_id, ranked[0].state)]
+        hops = [(c.request_id, c.state) for c in ranked if c.kind != FINAL]
+        return hops[: self._max_batch_size]
 
     def build_step_plan(
         self, participants: list[tuple[str, _CosyVoice3StreamState]]
@@ -353,11 +333,9 @@ class FunCosyVoice3StreamingVocoderScheduler(
         participants: list[tuple[str, _CosyVoice3StreamState]],
         plan: str,
     ) -> dict[str, torch.Tensor]:
-        started_at = self._clock()
         if plan == FINAL:
             request_id, _ = participants[0]
             self._complete_stream_request(request_id, self._finish_stream(request_id))
-            self._last_step_s = self._clock() - started_at
             return {}
         # note (guozhihao-224): B>1 uses packed inference_causal; B=1 keeps
         # native CosyVoice Flow.inference. Packed singleton-vs-row tests
@@ -369,7 +347,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
             delta = self._run_one_causal_hop(state)
             decoded = {request_id: delta} if delta.numel() > 0 else {}
         now = self._clock()
-        self._last_step_s = now - started_at
         for request_id, state in participants:
             if request_id in decoded and state.first_emit_at is None:
                 state.first_emit_at = now
@@ -380,14 +357,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
     def _run_causal_hop_batch(
         self, participants: list[tuple[str, _CosyVoice3StreamState]]
     ) -> dict[str, torch.Tensor]:
-        head = participants[0][1]
-        hop = head.hop_len
-        token_offset = head.token_offset
-        token_end = _window_end(head)
         items = [
             FlowBatchInput(
                 token=torch.tensor(
-                    state.tokens[:token_end], dtype=torch.int32
+                    state.tokens[: _window_end(state)], dtype=torch.int32
                 ).unsqueeze(0),
                 prompt_token=state.prompt_token,
                 prompt_feat=state.prompt_feat,
@@ -395,23 +368,17 @@ class FunCosyVoice3StreamingVocoderScheduler(
             )
             for _, state in participants
         ]
-        logger.info(
-            "Fun-CosyVoice3 causal Flow batch size=%d hop=%d token_offset=%d",
-            len(items),
-            hop,
-            token_offset,
-        )
+        logger.info("Fun-CosyVoice3 causal Flow batch size=%d", len(items))
         mels = self._vocoder.first_hop_batch(items)
-        offset_frames = token_offset * TOKEN_MEL_RATIO
         decoded: dict[str, torch.Tensor] = {}
         for (request_id, state), mel in zip(participants, mels, strict=True):
             delta, hift_mel, speech_offset = self._vocoder.hift_delta(
-                mel[:, :, offset_frames:],
+                mel[:, :, state.token_offset * TOKEN_MEL_RATIO :],
                 hift_mel=state.hift_mel,
                 speech_offset=state.speech_offset,
                 finalize=False,
             )
-            state.token_offset += hop
+            state.token_offset += state.hop_len
             self._advance_hop_len(state)
             state.hift_mel = hift_mel
             state.speech_offset = speech_offset
