@@ -21,7 +21,8 @@ The ledgers answer, per capture:
    HTTP layer yielded PCM. Queueing delay is start minus ready.
 5. GPU idle gaps attributed to the joint (AR thread state, vocoder thread state)
    at every instant, by exact interval intersection.
-6. SM Active samples conditioned on which stage's kernels cover the sample time.
+6. SMs Active, SM Issue and Tensor Active samples conditioned on which stage's kernels
+   cover the sample time.
 
 Nothing here is a benchmark result. Profiler-on timings describe the traced
 cohort only.
@@ -1071,16 +1072,27 @@ def stage_of_kernel(k, thread_index, threads):
     return r["stage"]
 
 
-def sm_by_stage(db, kernels, thread_index, threads, lo, hi, metric):
-    if metric is None:
+GPU_METRIC_COLUMNS = (
+    ("SMs Active", "sm_active_mean"),
+    ("SM Issue", "sm_issue_mean"),
+    ("Tensor Active", "tensor_active_mean"),
+)
+
+
+def sm_by_stage(db, kernels, thread_index, threads, lo, hi, metrics):
+    if not metrics:
         return {}
-    samples = [
-        (t, v)
-        for t, v in db.execute(
-            "SELECT timestamp, value FROM GPU_METRICS WHERE typeId=? AND metricId=? AND timestamp>=? AND timestamp<? ORDER BY timestamp",
-            (metric["typeId"], metric["metricId"], lo, hi),
-        )
-    ]
+    series = {
+        column: [
+            (t, v)
+            for t, v in db.execute(
+                "SELECT timestamp, value FROM GPU_METRICS WHERE typeId=? AND metricId=? AND timestamp>=? AND timestamp<? ORDER BY timestamp",
+                (m["typeId"], m["metricId"], lo, hi),
+            )
+        ]
+        for column, m in metrics.items()
+    }
+    samples = series.get("sm_active_mean") or []
     if not samples:
         return {}
     stage_union = defaultdict(list)
@@ -1102,35 +1114,48 @@ def sm_by_stage(db, kernels, thread_index, threads, lo, hi, metric):
             while i < len(times) and times[i] < b:
                 labels[i].add(s)
                 i += 1
-    agg = defaultdict(list)
-    for (t, v), lab in zip(samples, labels):
-        agg["+".join(sorted(lab)) if lab else "idle"].append(v)
-    rows = [
-        {
+    # The sampler writes every metric at the same tick, so the other columns
+    # are read at the SM Active timestamps.
+    by_time = {column: dict(points) for column, points in series.items()}
+    agg = defaultdict(lambda: defaultdict(list))
+    for (t, _), lab in zip(samples, labels):
+        name = "+".join(sorted(lab)) if lab else "idle"
+        for column, points in by_time.items():
+            if t in points:
+                agg[name][column].append(points[t])
+    rows = []
+    for name, columns in agg.items():
+        row = {
             "kernels_present": name,
-            "samples": len(vals),
-            "share_of_samples": len(vals) / len(samples),
-            "sm_active_mean": statistics.fmean(vals),
+            "samples": len(columns["sm_active_mean"]),
+            "share_of_samples": len(columns["sm_active_mean"]) / len(samples),
         }
-        for name, vals in agg.items()
-    ]
+        for column, vals in columns.items():
+            row[column] = statistics.fmean(vals)
+        rows.append(row)
     rows.sort(key=lambda r: -r["samples"])
     return {
-        "metric": metric,
+        "metrics": {column: m["name"] for column, m in metrics.items()},
         "samples": len(samples),
-        "overall_mean": statistics.fmean(v for _, v in samples),
+        "overall_mean": {
+            column: statistics.fmean(v for _, v in points)
+            for column, points in series.items()
+            if points
+        },
         "by_kernels_present": rows,
         "stage_gpu_union_ns": {s: total(v) for s, v in stage_union.items()},
     }
 
 
-def find_sm_metric(db):
-    for row in db.execute(
+def find_gpu_metrics(db):
+    found = {}
+    for type_id, metric_id, name in db.execute(
         "SELECT typeId, metricId, metricName FROM TARGET_INFO_GPU_METRICS"
     ):
-        if row[2] == "SMs Active [Throughput %]":
-            return {"typeId": row[0], "metricId": row[1], "name": row[2]}
-    return None
+        for prefix, column in GPU_METRIC_COLUMNS:
+            if name.startswith(prefix):
+                found[column] = {"typeId": type_id, "metricId": metric_id, "name": name}
+    return found
 
 
 # ---------------------------------------------------------------- report
@@ -1300,9 +1325,12 @@ def markdown(result):
     )
     sm = result["sm"]
     if sm:
-        out.append("## SM Active conditioned on kernels present\n")
+        columns = [c for c in sm["overall_mean"]]
+        out.append("## GPU metrics conditioned on kernels present\n")
         out.append(
-            f"overall mean {sm['overall_mean']:.2f} over {sm['samples']} samples\n"
+            "overall means "
+            + ", ".join(f"{c} {v:.2f}" for c, v in sm["overall_mean"].items())
+            + f" over {sm['samples']} samples\n"
         )
         out.append(
             fmt_table(
@@ -1310,11 +1338,11 @@ def markdown(result):
                     {
                         "kernels_present": r["kernels_present"],
                         "share_of_samples": round(r["share_of_samples"], 3),
-                        "sm_active_mean": round(r["sm_active_mean"], 2),
+                        **{c: round(r[c], 2) for c in columns if c in r},
                     }
                     for r in sm["by_kernels_present"][:12]
                 ],
-                ["kernels_present", "share_of_samples", "sm_active_mean"],
+                ["kernels_present", "share_of_samples", *columns],
             )
         )
         out.append(
@@ -1366,7 +1394,7 @@ def analyze(sqlite_path, device, start_ns, end_ns, min_gap_ms, name):
     prep = preprocessing_table(ranges, threads, lo, hi)
     reqs = request_timeline(ranges, marks, threads, lo, hi)
     ga = gap_attribution(kernels, ar, voc, lo, hi, int(min_gap_ms * 1e6))
-    sm = sm_by_stage(db, kernels, thread_index, threads, lo, hi, find_sm_metric(db))
+    sm = sm_by_stage(db, kernels, thread_index, threads, lo, hi, find_gpu_metrics(db))
     unattributed = sum(1 for k in kernels if k["launch_tid"] is None)
     result = {
         "name": name,

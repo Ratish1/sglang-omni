@@ -26,7 +26,7 @@ threshold, default 0.5).
 | Request timeline | HTTP, coordinator, `tts_engine` and `vocoder` marks per request | first-audio decomposition, AR span, drain after AR completion |
 | Streaming hops | `vocoder/stream_step` participants, `vocoder/stream_delta` finals, `tts_engine/stage_stream_chunk_sent` chunk ids | per hop: ready time (chunk 0 for 28 tokens, chunk n for 28 plus 25 n), start, run, queue delay, time to PCM yield; on the first hop of each request the time it was listed unstarted while the `scheduler/ready_candidates` marks refused admission, and how many of those marks it appeared in |
 | GPU idle gaps | kernel union gaps intersected with the AR states (execute, active gap, inactive) and the vocoder states | what each thread was doing while the GPU idled, exactly by interval intersection |
-| SM Active by kernels present | `GPU_METRICS` samples labeled with every stage whose kernels overlap the 100 µs sampling interval | spatial efficiency of each stage's kernels |
+| GPU metrics by kernels present | `GPU_METRICS` samples of SMs Active, SM Issue and Tensor Active labeled with every stage whose kernels overlap the 100 µs sampling interval | SM Issue is the utilization rate (issue slots used); SMs Active only says a warp was resident, so a stage with high SMs Active and low SM Issue is stalled, not busy |
 
 Attribution rules: a kernel belongs to the thread whose runtime API row shares its process and
 correlation id (graph-replayed node kernels share the id of their `cudaGraphLaunch`); a kernel's
@@ -43,8 +43,9 @@ launch row stay unattributed and are counted. Ranges are never inferred from ker
   contention between the two Python loops.
 - A large `queue_delay` on `final` hops is the pump loop starving finals; on batched follow-ups it
   is the serial vocoder falling behind the AR.
-- The window mean of SM Active equals the conditional means weighted by coverage; use the
-  conditional table to separate spatial from temporal loss.
+- The window mean of each GPU metric equals the conditional means weighted by coverage; use the
+  conditional table to separate spatial from temporal loss, and quote SM Issue as the
+  utilization rate.
 
 ## Capture protocol additions
 
