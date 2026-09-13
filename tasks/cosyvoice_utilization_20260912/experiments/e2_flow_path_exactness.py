@@ -102,12 +102,16 @@ def build_streams(checkpoint: str, device: str, samples: int) -> list[Stream]:
     )
     needed = PROMPT_TOKENS + hop_window(*HOPS[-1])
     streams: list[Stream] = []
+    references: set[str] = set()
     for sample in load_seedtts_samples(
         SEEDTTS_DATASET_ID,
         samples,
         split="en",
         revision=SEEDTTS_DATASET_REVISION,
     ):
+        if sample.ref_audio in references:
+            continue
+        references.add(sample.ref_audio)
         audio_16k = _load_prompt_audio(sample.ref_audio)
         audio_24k = _load_prompt_audio_24k(sample.ref_audio)
         token, feat = _align_flow_prompt(
@@ -133,26 +137,41 @@ def build_streams(checkpoint: str, device: str, samples: int) -> list[Stream]:
     )
 
 
-def compare(
-    name: str, value: torch.Tensor, reference: torch.Tensor
-) -> tuple[str, float, float, float]:
+Row = tuple[str, float, float, float, float]
+
+
+def compare(name: str, value: torch.Tensor, reference: torch.Tensor) -> Row:
     assert value.shape == reference.shape, (
         name,
         tuple(value.shape),
         tuple(reference.shape),
     )
     reference = reference.to(torch.float64)
-    diff = (value.to(torch.float64) - reference).abs()
-    max_abs = float(diff.max())
-    return name, max_abs, max_abs / float(reference.abs().max()), float(diff.mean())
+    diff = value.to(torch.float64) - reference
+    max_abs = float(diff.abs().max())
+    # note(ratish): max_rel blows up on near-silent samples, so the SNR of the
+    # whole tensor is the number that says whether a difference is audible.
+    snr_db = 20 * torch.log10(reference.norm() / diff.norm()).item()
+    return (
+        name,
+        max_abs,
+        max_abs / float(reference.abs().max()),
+        float(diff.abs().mean()),
+        snr_db,
+    )
 
 
-def print_table(title: str, rows: list[tuple[str, float, float, float]]) -> None:
+def print_table(title: str, rows: list[Row]) -> None:
     print(f"\n{title}")
-    print(f"{'row':<52}{'max_abs':>13}{'max_rel':>13}{'mean_abs':>13}")
-    for name, max_abs, max_rel, mean_abs in rows:
-        print(f"{name:<52}{max_abs:>13.3e}{max_rel:>13.3e}{mean_abs:>13.3e}")
-    print(f"largest max_rel: {max(row[2] for row in rows):.3e}")
+    print(f"{'row':<52}{'max_abs':>13}{'max_rel':>13}{'mean_abs':>13}{'snr_db':>10}")
+    for name, max_abs, max_rel, mean_abs, snr_db in rows:
+        print(
+            f"{name:<52}{max_abs:>13.3e}{max_rel:>13.3e}{mean_abs:>13.3e}{snr_db:>10.1f}"
+        )
+    print(
+        f"largest max_rel: {max(row[2] for row in rows):.3e}, "
+        f"lowest snr_db: {min(row[4] for row in rows):.1f}"
+    )
 
 
 def packed_chain(
@@ -197,10 +216,42 @@ def native_chain(
     return hift_mel, speech_offset
 
 
+def measure_repeat_noise(vocoder: CosyVoice3Vocoder, stream: Stream) -> list[Row]:
+    token_offset, hop_len = HOPS[0]
+    window = hop_window(token_offset, hop_len)
+    native = [
+        vocoder.token2wav_chunk(
+            token=stream.tokens[:, :window],
+            prompt_token=stream.prompt_token,
+            prompt_feat=stream.prompt_feat,
+            embedding=stream.embedding,
+            token_offset=token_offset,
+            streaming=True,
+            finalize=False,
+            hift_mel=None,
+            speech_offset=0,
+        )
+        for _ in range(2)
+    ]
+    packed = []
+    for _ in range(2):
+        mel = vocoder.hop_batch([flow_input(stream, window)])[0]
+        packed.append(
+            vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=False)
+        )
+    label = f"{stream.sample_id} offset={token_offset} win={window}"
+    return [
+        compare(f"{label} native twice mel", native[1][1], native[0][1]),
+        compare(f"{label} native twice wav", native[1][0], native[0][0]),
+        compare(f"{label} packed twice mel", packed[1][1], packed[0][1]),
+        compare(f"{label} packed twice wav", packed[1][0], packed[0][0]),
+    ]
+
+
 def measure_native_vs_packed_hops(
     vocoder: CosyVoice3Vocoder, streams: list[Stream]
-) -> list[tuple[str, float, float, float]]:
-    rows: list[tuple[str, float, float, float]] = []
+) -> list[Row]:
+    rows: list[Row] = []
     for stream in streams:
         native_mel: torch.Tensor | None = None
         native_offset = 0
@@ -241,7 +292,7 @@ def measure_native_vs_packed_hops(
 
 def measure_mixed_offset_batch(
     vocoder: CosyVoice3Vocoder, streams: list[Stream]
-) -> list[tuple[str, float, float, float]]:
+) -> list[Row]:
     plan = []
     for index, (stream, (token_offset, hop_len)) in enumerate(
         zip(streams, HOPS, strict=True)
@@ -259,7 +310,7 @@ def measure_mixed_offset_batch(
     mixed = vocoder.hop_batch(
         [flow_input(stream, window) for stream, _, window, _, _ in plan]
     )
-    rows: list[tuple[str, float, float, float]] = []
+    rows: list[Row] = []
     for (stream, token_offset, window, hift_mel, speech_offset), mixed_mel in zip(
         plan, mixed, strict=True
     ):
@@ -291,14 +342,14 @@ def measure_mixed_offset_batch(
 
 def measure_native_vs_packed_leftover(
     vocoder: CosyVoice3Vocoder, streams: list[Stream]
-) -> list[tuple[str, float, float, float]]:
+) -> list[Row]:
     token_offset = HOPS[-1][0] + HOPS[-1][1]
     native_state = [native_chain(vocoder, stream, HOPS) for stream in streams]
     packed_state = [packed_chain(vocoder, stream, HOPS) for stream in streams]
     batched = vocoder.leftover_batch(
         [flow_input(stream, stream.tokens.shape[1]) for stream in streams]
     )
-    rows: list[tuple[str, float, float, float]] = []
+    rows: list[Row] = []
     for stream, native, packed, batched_mel in zip(
         streams, native_state, packed_state, batched, strict=True
     ):
@@ -356,7 +407,7 @@ def measure_load_time_patches(
     vocoder: CosyVoice3Vocoder,
     stream: Stream,
     patched_conv_forward: Callable[..., torch.Tensor],
-) -> list[tuple[str, float, float, float]]:
+) -> list[Row]:
     token_offset, hop_len = HOPS[0]
     window = hop_window(token_offset, hop_len)
     item = flow_input(stream, window)
@@ -412,6 +463,10 @@ def main() -> None:
     print(f"streams {[stream.sample_id for stream in streams]}")
 
     with torch.inference_mode():
+        print_table(
+            "0. the same path run twice, the noise floor",
+            measure_repeat_noise(vocoder, streams[0]),
+        )
         print_table(
             "1. native token2wav_chunk hop vs packed hop_batch size 1",
             measure_native_vs_packed_hops(vocoder, streams),
