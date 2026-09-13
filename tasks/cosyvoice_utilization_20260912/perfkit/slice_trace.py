@@ -12,8 +12,8 @@ The ledgers answer, per capture:
    of the kernels that range launched, nested sampling and codec D2H host time,
    and the scheduler gap to the next step, grouped by forward mode and batch.
 2. Vocoder thread budget: exclusive time of the innermost annotated activity on
-   the vocoder thread (flow native, flow packed, hift, d2h, peer waits, glue,
-   idle) and the GPU kernel union each activity launched.
+   the vocoder thread (flow native, flow packed, hift, d2h, glue, idle) and the
+   GPU kernel union each activity launched.
 3. Flow and HiFT call table: host duration versus launched GPU union per call,
    grouped by op, batch and frame bucket. A ratio well below one is launch bound.
 4. Request hop timeline: for every streaming hop, when its tokens became ready
@@ -53,14 +53,6 @@ VOCODER_ORDER = [
     ),
     ("flow_native", lambda r: r["stage"] == "flow" and r["op"] == "native"),
     ("flow_graph", lambda r: r["stage"] == "flow" and r["op"] == "graph"),
-    (
-        "peer_wait",
-        lambda r: r["stage"] == "scheduler" and r["op"].endswith("peer_wait"),
-    ),
-    (
-        "payload_collection",
-        lambda r: r["stage"] == "scheduler" and r["op"] == "payload_collection",
-    ),
     ("vocoder_glue", lambda r: r["stage"] == "vocoder"),
 ]
 

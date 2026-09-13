@@ -20,7 +20,7 @@ threshold, default 0.5).
 | section | derived from | what it answers |
 |---|---|---|
 | AR thread | `ar/execute` ranges on the AR thread, nested `sampling`, `codec_ids_d2h`, `prefill`; kernels joined to their launch by (process, correlation) | host wall against GPU union per step by mode and batch; scheduler gap; eager against graph-node launches; GPU busy fraction while requests are admitted |
-| Vocoder thread budget | innermost range on the vocoder thread, subtracted in the order d2h, hift, flow estimator, euler glue, packed glue, flow native, peer wait, payload collection, vocoder glue, idle | where the vocoder thread's time goes and how much GPU each state launched |
+| Vocoder thread budget | innermost range on the vocoder thread, subtracted in the order d2h, hift, flow estimator, euler glue, packed glue, flow native, vocoder glue, idle | where the vocoder thread's time goes and how much GPU each state launched |
 | Flow calls, HiFT calls | `flow/native`, `flow/packed_*`, `hift/inference` ranges with launched kernels and runtime API calls in the range | host per call, GPU union per call, host µs per launch, kernel count, mean kernel duration, GPU tail after host return, synchronizing API counts (`cudaStreamSynchronize`, `cudaMemcpy`, `cudaStreamWaitEvent`, `cudaEventQuery`) |
 | Preprocessing | `preprocessing/request` and nested ranges | reference miss against hit, finalize lock wait, embedding preparation, cache key |
 | Request timeline | HTTP, coordinator, `tts_engine` and `vocoder` marks per request | first-audio decomposition, AR span, drain after AR completion |
