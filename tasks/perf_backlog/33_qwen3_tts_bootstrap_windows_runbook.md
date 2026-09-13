@@ -1,98 +1,93 @@
 # 33. Runbook: the vocoder bootstrap through captured graphs (doc 32 item 1)
 
-Branch `perf/qwen3-tts-bootstrap-graphs` at fd54363d6, four commits on upstream main
-3060470a8: the runner's window schedule and bucket queries (7e5e2aa48), the window
-runner and its knob (cb9cf8f46), the windowed decode path (1453ef538), no default
-widths until measured (fd54363d6). Same session rules as doc 31: plain server command,
-GPU 0, GPUs 1 to 3 recorded before every boot, dmon on every boot, full corpus, warmup
-1, no seed, two passes per arm, event recorder in pass 2 stopped after 200 completions,
-decode log gap check on the first boot.
+Two branches on upstream main 3060470a8.
+
+- `perf/qwen3-tts-codec-precompile` at 0ba531872, one commit: the decoder traces a
+  compiled shape on the codes and state the graph runner warms and captures with, so
+  each shape compiles once instead of twice, and raises Dynamo's cache entry limits the
+  way sglang does before compiling per bucket. Bit exact; verified by doc 34's bench
+  (12 graphs for 12 shapes, capture 100.7 to 55.3 s).
+- `perf/qwen3-tts-bootstrap-graphs` at 05683d8a4, seven commits: the runner's window
+  schedule and bucket queries (7e5e2aa48), the window runner and its knob (cb9cf8f46),
+  the windowed decode path (1453ef538), no default until measured (fd54363d6), the
+  precompile fix cherry-picked (c2212e459), the window runner compiling its rungs from
+  the steady stride up at one bucket with a cohort counter (1498c2078), the measured
+  default ladder 1 to 64 (05683d8a4).
+
+Step 0 of the earlier version of this runbook is done: doc 34 holds the bench readout.
+The steps below are the session that decides both PRs. Same session rules as doc 31:
+plain server command, GPU 0, GPUs 1 to 3 recorded before every boot, dmon on every boot,
+full corpus, warmup 1, no seed, two passes per arm, event recorder in pass 2 stopped
+after 200 completions, decode log gap check on the first boot.
 
 What the change does. A reference prefixed bootstrap (reference frames plus the first
-chunk) used to be one eager decode of an uncaptured width, about 860 host launches. The
-initial worker now owns a second graph runner, the window runner, and a same width
-cohort whose width no runner captured is consumed as a sequence of the window runner's
-widths against the cohort's arena slots, one replay per window, largest width first.
-The widths are a vocoder factory argument, `incremental_codec_cuda_graph_window_frames`.
-On the branch today there is no default: unset or empty means no window runner, so the
-default launch is unchanged until step 0 pins the widths. The serve log's codec state
-line carries `windowed_decodes: {rows, replays}` and a `window` runner entry next to
-`cold` and `warm`.
+chunk) used to be one eager decode of an uncaptured width, about 860 host launches and
+about a thousand lock handoffs. The initial worker now owns a second graph runner, the
+window runner, with widths 1, 2, 4, 8, 16, 32, 64 at one bucket, the rungs 8 and up
+captured from the compiled decoder step. A same width cohort whose width no runner
+captured is consumed as a sequence of those widths against its arena slots, largest
+first, one replay per window. The knob is the vocoder factory argument
+`incremental_codec_cuda_graph_window_frames`; an empty list turns windowing off. The
+codec state line in the serve log carries `windowed_decodes: {cohorts, rows, replays}`
+and a `window` runner entry next to `cold` and `warm`.
 
-What the widths are. Any set holding width 1 covers any count, so correctness does not
-depend on them. Powers of two are the fewest widths that cover any count with at most
-one small window per rung, so the set is a ladder 1, 2, 4, ... up to a cap. The cap is
-a cost tradeoff: fewer replays per bootstrap (each replay carries the fixed floor of the
-decoder's kernels) against capture memory and boot time. Only a measurement of the
-decoder on the GPU class pins it, which is step 0; the memory guard in the runner makes
-capture fail safe on smaller cards, with the cold shapes untouched.
-
-## Step 0, the replay cost per cap against the eager decode, before any boot
+## Step 1, unit tests on the box, full files, on 05683d8a4
 
 ```bash
-git fetch origin analysis/qwen3-omni-0518-numerics perf/qwen3-tts-bootstrap-graphs
-git worktree add tmp/bw fd54363d6
-cd tmp/bw && CUDA_VISIBLE_DEVICES=0 python ../../tasks/perf_backlog/scripts/codec_window_bench.py \
-  Qwen/Qwen3-TTS-12Hz-1.7B-Base --widths 4,8,16,32,64 --totals 40,80,120,160 --reps 50 \
-  --out ../../results/bw/codec_window_bench.json
-```
-
-(the script lives on the analysis branch; run it with the code branch's worktree on the
-import path.) The totals span reference clips of about 3 to 13 seconds at 12.5 frames
-per second plus the first chunk, the range the product serves, not a corpus. Read, per
-width: device and host ms of one replay at bucket 1 and 4. Per total: the eager
-decode's device and host ms, and for each cap the window sequence's device and host ms
-with its window list. Also the capture time and footprint per cap.
-
-Rule for the default: the smallest cap whose sequences cost no more device time than
-the eager decode at every total while cutting the host time by an order of magnitude.
-That number lands on the branch as its own commit, the ladder up to that cap as the
-default of the knob, with the bench numbers in the commit message; step 1 and the pair
-run on that commit. If no cap meets the rule, the finding is reported with the numbers
-and the pair does not run until the reason is understood.
-
-## Step 1, unit tests on the box, full files
-
-```bash
+git fetch origin perf/qwen3-tts-bootstrap-graphs && git worktree add tmp/bw 05683d8a4
+cd tmp/bw
+python -m pytest tests/unit_test/qwen3_tts/test_incremental_codec.py -q
 python -m pytest tests/unit_test/qwen3_tts/test_incremental_codec_cuda_graph.py -q
 python -m pytest tests/unit_test/qwen3_tts/test_pipeline.py -q
-python -m pytest tests/unit_test/qwen3_tts/test_incremental_codec.py -q
 ```
 
-The two accelerator tests in the graph file run on the box only. All must pass before a
-boot; archive the output.
+Three tests in the graph file run only with CUDA and run here. All must pass before a
+boot; archive the output. Every test on both branches is unrun until this step.
 
-## Step 2, the pair, default layout (2 boots)
+## Step 2, the pair that decides #2123 (2 boots)
 
-A: upstream main 3060470a8. B: the branch head. Streaming c16, doc 31 protocol. Reads,
-per arm, `first_chunk_anatomy.py` on the pass 2 events plus the client summary: TTFC
-mean and p99, req/s, inter chunk, the first frame to first audio segment at ahead 0 and
-its mean, the prefill by overlap table, preprocessing p50, the cadence, dmon GR active.
-From B's serve log: the window runner's captured keys and footprint at boot, and the
-last codec state line's `windowed_decodes` rows and replays, the window runner's
-`replays`, and the cold runner's `uncaptured_fresh_frames` counter. Expected on B: the
-cold counter near zero (only widths no ladder covers stay eager), `windowed_decodes.rows`
-about the number of reference prefixed requests, replays per row about the window count
-for the corpus's reference lengths under the pinned ladder.
+A: upstream main 3060470a8 plus `tasks/qwen3_tts_e4_investigation_20260912/early_ids.patch`.
+B: 05683d8a4 plus the same patch (it touches model_runner.py only). Streaming c16.
 
-## Step 3, the origin check, Nsight on both arms (1 window each)
+Reads per arm from `first_chunk_anatomy.py` on the pass 2 events plus the client
+summary: TTFC mean and p99, req/s, inter chunk, preprocessing p50, the first frame to
+first audio segment at ahead 0 and its mean, the prefill by overlap table, the cadence,
+dmon GR active during traffic. From B's serve log: boot time from launch to ready
+against A, the window runner's captured keys and footprint, the last codec state line's
+`windowed_decodes` cohorts, rows and replays, the window runner's `replays`, and the
+cold runner's `uncaptured_fresh_frames`.
+
+Expected on B, stated before the run: the bootstrap segment at ahead 0 from about 52 ms
+to 10 to 20 ms and its mean from 69 ms to a similar range; `uncaptured_fresh_frames`
+near zero; cohorts equal to rows (one row per windowed cohort on this corpus); boot
+time not longer than A by more than the window runner's capture (about 13 s of compile
+for the three rungs above 8, minus the 15 s the precompile fix returns from the warm
+runner). Not expected on B: the preprocessing segment, about 42 ms above main on early
+ids, which is doc 32's item 3. So B's first chunk should land roughly halfway between
+early ids and main, not within 10 ms of main; that gate needs item 3 as well.
+
+## Step 3, the pair for the default launch (2 boots)
+
+A: upstream main 3060470a8. B: 05683d8a4. Same reads. Expected on B: the bootstrap
+segment at ahead 0 from about 30 ms to 10 to 20 ms, req/s not below A.
+
+## Step 4, the origin check, Nsight on step 2's two arms (1 window each)
 
 The doc 29 default backend protocol, full preconditioning pass, 20 s window in pass 2,
 `--gpu-metrics-devices=0 --gpu-metrics-frequency=20000`, SQLite export, `nsys_threads.py`.
-Read per thread: launches in the window, launches per bootstrap on the initial worker
-(launches over decode done syncs), lock wait per bootstrap, the preprocessing workers'
-and the scheduler's lock wait, GR and SM active. The slice reached the origin only if
-the initial worker's launches per bootstrap fell from about 860 to tens and the other
-threads' lock waits fell with them. If the launches fell and the waits did not, say so:
-that is a finding about what the lock waits on, not a pass.
+Read per thread: launches over decode done syncs on the initial worker (launches per
+bootstrap, about 860 on A), lock wait per bootstrap, the preprocessing workers' and the
+scheduler's lock wait, GR and SM active. The slice reached the origin only if the
+initial worker's launches per bootstrap fell to tens and the other threads' lock waits
+fell with them; if launches fell and waits did not, report it as a finding about what
+the waits are on.
 
-## Step 4, quality, on B's pass 2
+## Step 5, quality, on step 3's B, pass 2
 
 WER and speaker similarity against the bands (WER about 1.0 percent, similarity about
-71.2). A seeded c1 non streaming pass is not informative here (the bootstrap path is
-streaming only); instead a seeded streaming c1 pass on A and B, identity count reported
-not gated, since window boundaries change reduction order inside the decoder.
+71.2). A seeded streaming c1 pass on A and B, identity count reported not gated: window
+boundaries and the compiled kernels change reduction order inside the decoder.
 
-Archive per boot: head, import path, server command, gpus before, dmon log, both passes'
-speed_results and client logs, every event file of pass 2, serve.log, the Nsight SQLite
-and the `nsys_threads.py` JSON, plus step 0's JSON and step 1's output.
+Archive per boot: head, import path, server command, gpus before, dmon log, launch to
+ready time, both passes' speed_results and client logs, every event file of pass 2,
+serve.log, the Nsight SQLite and `nsys_threads.py` JSON for step 4, plus step 1's output.
