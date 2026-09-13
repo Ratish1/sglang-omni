@@ -52,6 +52,7 @@ VOCODER_ORDER = [
         lambda r: r["stage"] == "flow" and r["op"].startswith("packed"),
     ),
     ("flow_native", lambda r: r["stage"] == "flow" and r["op"] == "native"),
+    ("flow_graph", lambda r: r["stage"] == "flow" and r["op"] == "graph"),
     (
         "peer_wait",
         lambda r: r["stage"] == "scheduler" and r["op"].endswith("peer_wait"),
@@ -748,6 +749,8 @@ def request_timeline(ranges, marks, threads, lo, hi):
     ]
     hops = defaultdict(list)
     for s in steps:
+        if s.get("kind") == "final":
+            continue
         for rid in s.get("request_ids", []):
             hops[rid].append(
                 {
