@@ -26,8 +26,6 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     as_flow_prompt_token,
     next_stream_hop_len,
     pad_flow_prompt_to_hop,
-    stream_hop_len,
-    tokens_needed_for_causal_chunk,
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage
@@ -43,11 +41,9 @@ class _CosyVoice3StreamState:
     tokens: list[int] = field(default_factory=list)
     token_offset: int = 0
     hop_len: int = TOKEN_HOP_LEN
-    prompt_pad: int = 0
     prompt_token: torch.Tensor | None = None
     prompt_feat: torch.Tensor | None = None
     embedding: torch.Tensor | None = None
-    prompts_latched: bool = False
     hift_mel: torch.Tensor | None = None
     speech_offset: int = 0
 
@@ -314,7 +310,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 continue
             if self._ready_for_causal_chunk(state):
                 continue
-            if state.prompts_latched and self._first_hop_key(state) != ready_key:
+            if (
+                state.prompt_token is not None
+                and self._first_hop_key(state) != ready_key
+            ):
                 continue
             return True
         return False
@@ -403,7 +402,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 continue
             if self._ready_for_causal_chunk(state):
                 continue
-            if not state.prompts_latched:
+            if state.prompt_token is None:
                 continue
             if self._follow_up_key(state) != ready_key:
                 continue
@@ -516,7 +515,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         # first generated hop stays hop+lookahead instead of waiting for
         # prompt_pad extra AR tokens.
         token, feat = pad_flow_prompt_to_hop(token, feat, hop_len=self._token_hop_len)
-        if state.prompts_latched:
+        if state.prompt_token is not None:
             # note (guozhihao-224): latch is shape-stable; payload and first
             # chunk metadata must carry the same prompt tensors.
             if (
@@ -531,8 +530,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
         state.prompt_token = token
         state.prompt_feat = feat
         state.embedding = spk
-        state.prompt_pad = 0
-        state.prompts_latched = True
 
     def validate_chunk(
         self,
@@ -565,18 +562,15 @@ class FunCosyVoice3StreamingVocoderScheduler(
         return self._ready_for_causal_chunk(state)
 
     def _ready_for_causal_chunk(self, state: _CosyVoice3StreamState) -> bool:
-        if not state.prompts_latched:
+        if state.prompt_token is None:
             return False
-        needed = tokens_needed_for_causal_chunk(
-            state.token_offset,
-            hop_len=state.hop_len,
-            prompt_pad=state.prompt_pad,
-        )
-        return len(state.tokens) >= needed
+        return len(state.tokens) >= self._window_end(state)
+
+    def _window_end(self, state: _CosyVoice3StreamState) -> int:
+        return state.token_offset + state.hop_len + PRE_LOOKAHEAD_LEN
 
     def _first_hop_key(self, state: _CosyVoice3StreamState) -> int:
-        hop = stream_hop_len(0, hop_len=state.hop_len, prompt_pad=state.prompt_pad)
-        return hop + PRE_LOOKAHEAD_LEN
+        return state.hop_len + PRE_LOOKAHEAD_LEN
 
     def select_step_participants(
         self,
@@ -616,14 +610,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self, participants: list[tuple[str, _CosyVoice3StreamState]]
     ) -> _CosyVoice3FirstHopPlan:
         state = participants[0][1]
-        hop = stream_hop_len(
-            state.token_offset,
-            hop_len=state.hop_len,
-            prompt_pad=state.prompt_pad,
-        )
+        hop = state.hop_len
         return _CosyVoice3FirstHopPlan(
             hop=hop,
-            token_end=state.token_offset + hop + PRE_LOOKAHEAD_LEN,
+            token_end=self._window_end(state),
             token_offset=state.token_offset,
             batched=len(participants) > 1,
         )
@@ -707,15 +697,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
         return decoded
 
     def _run_one_causal_hop(self, state: _CosyVoice3StreamState) -> torch.Tensor | None:
-        hop = stream_hop_len(
-            state.token_offset,
-            hop_len=state.hop_len,
-            prompt_pad=state.prompt_pad,
-        )
-        token_end = state.token_offset + hop + PRE_LOOKAHEAD_LEN
+        hop = state.hop_len
         delta = self._run_flow_hift(
             state,
-            token_end=token_end,
+            token_end=self._window_end(state),
             token_offset=state.token_offset,
             streaming=True,
             finalize=False,
