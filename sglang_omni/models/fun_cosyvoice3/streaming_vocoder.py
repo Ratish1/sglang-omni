@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 
 import torch
 
@@ -34,6 +35,10 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 
 logger = logging.getLogger(__name__)
 
+FIRST_HOP = "first"
+FOLLOW_UP_HOP = "follow_up"
+FINAL = "final"
+
 
 @dataclass
 class _CosyVoice3StreamState:
@@ -46,21 +51,54 @@ class _CosyVoice3StreamState:
     hift_mel: torch.Tensor | None = None
     speech_offset: int = 0
     done: bool = False
+    ready_since: float | None = None
+    first_emit_at: float | None = None
 
 
-@dataclass(frozen=True)
-class _CosyVoice3FirstHopPlan:
-    hop: int
-    token_end: int
-    token_offset: int
-    batched: bool
-    final: bool
+class _Candidate(NamedTuple):
+    request_id: str
+    state: _CosyVoice3StreamState
+    kind: str
+
+
+def _window_end(state: _CosyVoice3StreamState) -> int:
+    return state.token_offset + state.hop_len + PRE_LOOKAHEAD_LEN
+
+
+def _is_hop_ready(state: _CosyVoice3StreamState) -> bool:
+    return state.prompt_token is not None and len(state.tokens) >= _window_end(state)
+
+
+def _step_kind(state: _CosyVoice3StreamState) -> str | None:
+    if _is_hop_ready(state):
+        return FIRST_HOP if state.token_offset == 0 else FOLLOW_UP_HOP
+    if state.done:
+        return FINAL
+    return None
+
+
+def _step_key(state: _CosyVoice3StreamState) -> tuple[int, int]:
+    return state.token_offset, state.hop_len
+
+
+def _slack_s(state: _CosyVoice3StreamState, *, now: float, sample_rate: int) -> float:
+    # note(ratish): a stream that has emitted nothing has nothing to play, so
+    # it is as urgent as a stream whose buffer just ran out.
+    if state.first_emit_at is None:
+        return 0.0
+    return state.speech_offset / sample_rate - (now - state.first_emit_at)
 
 
 class FunCosyVoice3StreamingVocoderScheduler(
-    StreamingVocoderBase[_CosyVoice3StreamState, _CosyVoice3FirstHopPlan]
+    StreamingVocoderBase[_CosyVoice3StreamState, str]
 ):
-    """Decode CosyVoice3 speech tokens incrementally through Flow + HiFT."""
+    """Decode CosyVoice3 speech tokens incrementally through Flow + HiFT.
+
+    Messages only change per-request state. The serving loop runs one step
+    once the inbox is drained: the runnable stream with the least playback
+    slack goes first and every runnable stream with the same token window
+    joins it, so equal-shape hops share one causal Flow call.
+    """
 
     _can_batch_stream_chunks = True
 
@@ -90,6 +128,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self._token_max_hop_len = max_hop
         self._disable_hop_growth = bool(disable_hop_growth)
         self._vocoder = vocoder
+        self._clock: Callable[[], float] = time.monotonic
         super().__init__(
             self._vocode_payload,
             batch_compute_fn=self._vocode_payloads,
@@ -162,37 +201,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 embedding=metadata.get("flow_embedding"),
             )
 
-    def on_stream_chunk_batch(self, items: list[tuple[str, StreamItem]]) -> None:
-        failed: list[str] = []
-        with self._state_lock:
-            for request_id, item in items:
-                if self._is_aborted(request_id):
-                    continue
-                try:
-                    self._ingest_stream_item(request_id, item)
-                except Exception as exc:
-                    self._emit_error(request_id, exc)
-                    self._abort_state(request_id)
-                    failed.append(request_id)
-        for request_id in failed:
-            self._cleanup_aborted_request(request_id)
-
-    def on_stream_done(self, request_id: str) -> list[OutgoingMessage] | None:
-        state = self._get_or_create_stream_state(request_id)
-        if state is None:
-            return []
-        state.done = True
-        return None
-
-    def _has_ready_work(self) -> bool:
-        with self._state_lock:
-            return bool(self.select_step_participants())
-
-    def _follow_up_key(self, state: _CosyVoice3StreamState) -> tuple[int, int]:
-        # note (guozhihao-224): drop prompt_len so SeedTTS mixed prompts
-        # with the same hop/offset share one causal Flow call.
-        return int(state.hop_len), int(state.token_offset)
-
     def _latch_prompts(
         self,
         request_id: str,
@@ -242,6 +250,27 @@ class FunCosyVoice3StreamingVocoderScheduler(
             )
         return chunk.contiguous()
 
+    def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
+        super().on_streaming_new_request(request_id, payload)
+        state = self._stream_states.get(request_id)
+        if state is not None:
+            self._mark_ready(state)
+
+    def on_stream_chunk_batch(self, items: list[tuple[str, StreamItem]]) -> None:
+        failed: list[str] = []
+        with self._state_lock:
+            for request_id, item in items:
+                if self._is_aborted(request_id):
+                    continue
+                try:
+                    self._ingest_stream_item(request_id, item)
+                except Exception as exc:
+                    self._emit_error(request_id, exc)
+                    self._abort_state(request_id)
+                    failed.append(request_id)
+        for request_id in failed:
+            self._cleanup_aborted_request(request_id)
+
     def ingest(
         self,
         request_id: str,
@@ -250,121 +279,112 @@ class FunCosyVoice3StreamingVocoderScheduler(
     ) -> None:
         del request_id
         state.tokens.extend(int(token) for token in codes.tolist())
+        self._mark_ready(state)
 
-    def _ready_for_causal_chunk(self, state: _CosyVoice3StreamState) -> bool:
-        if state.prompt_token is None:
-            return False
-        return len(state.tokens) >= self._window_end(state)
+    def on_stream_done(self, request_id: str) -> list[OutgoingMessage] | None:
+        state = self._get_or_create_stream_state(request_id)
+        if state is None:
+            return []
+        state.done = True
+        self._mark_ready(state)
+        return None
 
-    def _window_end(self, state: _CosyVoice3StreamState) -> int:
-        return state.token_offset + state.hop_len + PRE_LOOKAHEAD_LEN
+    def _mark_ready(self, state: _CosyVoice3StreamState) -> None:
+        if state.ready_since is None and _step_kind(state) is not None:
+            state.ready_since = self._clock()
 
-    def _first_hop_key(self, state: _CosyVoice3StreamState) -> int:
-        return state.hop_len + PRE_LOOKAHEAD_LEN
+    def _ranked_candidates(self) -> list[_Candidate]:
+        now = self._clock()
+        candidates: list[_Candidate] = []
+        for request_id, state in self._stream_state_items():
+            kind = _step_kind(state)
+            if kind is not None and not self._is_aborted(request_id):
+                candidates.append(_Candidate(request_id, state, kind))
+        candidates.sort(
+            key=lambda candidate: (
+                _slack_s(candidate.state, now=now, sample_rate=self._sample_rate),
+                candidate.state.ready_since,
+                candidate.request_id,
+            )
+        )
+        return candidates
+
+    def _has_ready_work(self) -> bool:
+        with self._state_lock:
+            return bool(self._ranked_candidates())
 
     def select_step_participants(
         self,
     ) -> list[tuple[str, _CosyVoice3StreamState]]:
-        first_hops: list[tuple[str, _CosyVoice3StreamState]] = []
-        follow_ups: list[tuple[str, _CosyVoice3StreamState]] = []
-        finals: list[tuple[str, _CosyVoice3StreamState]] = []
-        for request_id, state in self._stream_state_items():
-            if self._is_aborted(request_id):
-                continue
-            if not self._ready_for_causal_chunk(state):
-                if state.done:
-                    finals.append((request_id, state))
-                continue
-            if state.token_offset == 0:
-                first_hops.append((request_id, state))
-            else:
-                follow_ups.append((request_id, state))
-        if first_hops:
-            if not self._can_batch_stream_chunks:
-                return first_hops[:1]
-            groups: dict[int, list[tuple[str, _CosyVoice3StreamState]]] = {}
-            for entry in first_hops:
-                groups.setdefault(self._first_hop_key(entry[1]), []).append(entry)
-            best = max(groups.values(), key=len)
-            return best[: self._max_batch_size]
-        if follow_ups:
-            if not self._can_batch_stream_chunks:
-                return follow_ups[:1]
-            follow_groups: dict[
-                tuple[int, int], list[tuple[str, _CosyVoice3StreamState]]
-            ] = {}
-            for entry in follow_ups:
-                follow_groups.setdefault(self._follow_up_key(entry[1]), []).append(
-                    entry
-                )
-            best_follow = max(follow_groups.values(), key=len)
-            return best_follow[: self._max_batch_size]
-        return finals[:1]
+        ranked = self._ranked_candidates()
+        if not ranked:
+            return []
+        head = ranked[0]
+        if head.kind == FINAL:
+            return [(head.request_id, head.state)]
+        key = _step_key(head.state)
+        peers = [
+            (candidate.request_id, candidate.state)
+            for candidate in ranked
+            if candidate.kind != FINAL and _step_key(candidate.state) == key
+        ]
+        return peers[: self._max_batch_size]
 
     def build_step_plan(
         self, participants: list[tuple[str, _CosyVoice3StreamState]]
-    ) -> _CosyVoice3FirstHopPlan:
-        state = participants[0][1]
-        hop = state.hop_len
-        return _CosyVoice3FirstHopPlan(
-            hop=hop,
-            token_end=self._window_end(state),
-            token_offset=state.token_offset,
-            batched=len(participants) > 1,
-            final=state.done and not self._ready_for_causal_chunk(state),
-        )
+    ) -> str:
+        return _step_kind(participants[0][1])
 
     def run_step(
         self,
         participants: list[tuple[str, _CosyVoice3StreamState]],
-        plan: _CosyVoice3FirstHopPlan,
+        plan: str,
     ) -> dict[str, torch.Tensor]:
-        if plan.final:
+        if plan == FINAL:
             request_id, _ = participants[0]
             self._complete_stream_request(request_id, self._finish_stream(request_id))
             return {}
         # note (guozhihao-224): B>1 uses packed inference_causal; B=1 keeps
         # native CosyVoice Flow.inference. Packed singleton-vs-row tests
         # cover the batch adapter; native hops stay on the official signature.
-        if plan.batched:
-            return self._run_causal_hop_batch(participants, plan)
-        request_id, state = participants[0]
-        waveform = self.decode_delta(request_id, state, is_final=False)
-        if waveform is None:
-            return {}
-        return {request_id: waveform}
+        if len(participants) > 1:
+            decoded = self._run_causal_hop_batch(participants)
+        else:
+            request_id, state = participants[0]
+            delta = self._run_one_causal_hop(state)
+            decoded = {request_id: delta} if delta.numel() > 0 else {}
+        now = self._clock()
+        for request_id, state in participants:
+            if request_id in decoded and state.first_emit_at is None:
+                state.first_emit_at = now
+            state.ready_since = None
+            self._mark_ready(state)
+        return decoded
 
     def _run_causal_hop_batch(
-        self,
-        participants: list[tuple[str, _CosyVoice3StreamState]],
-        plan: _CosyVoice3FirstHopPlan,
+        self, participants: list[tuple[str, _CosyVoice3StreamState]]
     ) -> dict[str, torch.Tensor]:
-        items: list[FlowBatchInput] = []
-        for _, state in participants:
-            generated = state.tokens[: plan.token_end]
-            items.append(
-                FlowBatchInput(
-                    token=torch.tensor(generated, dtype=torch.int32).unsqueeze(0),
-                    prompt_token=state.prompt_token,
-                    prompt_feat=state.prompt_feat,
-                    embedding=state.embedding,
-                )
+        head = participants[0][1]
+        hop = head.hop_len
+        token_offset = head.token_offset
+        token_end = _window_end(head)
+        items = [
+            FlowBatchInput(
+                token=torch.tensor(
+                    state.tokens[:token_end], dtype=torch.int32
+                ).unsqueeze(0),
+                prompt_token=state.prompt_token,
+                prompt_feat=state.prompt_feat,
+                embedding=state.embedding,
             )
-        if plan.token_offset == 0:
-            logger.info(
-                "Fun-CosyVoice3 first-hop Flow batch size=%d hop=%d",
-                len(items),
-                plan.hop,
-            )
-        else:
-            logger.info(
-                "Fun-CosyVoice3 follow-up Flow batch size=%d hop=%d token_offset=%d",
-                len(items),
-                plan.hop,
-                plan.token_offset,
-            )
+            for _, state in participants
+        ]
+        logger.info(
+            f"Fun-CosyVoice3 causal Flow batch size={len(items)} hop={hop} "
+            f"token_offset={token_offset}"
+        )
         mels = self._vocoder.first_hop_batch(items)
-        offset_frames = int(plan.token_offset) * TOKEN_MEL_RATIO
+        offset_frames = token_offset * TOKEN_MEL_RATIO
         decoded: dict[str, torch.Tensor] = {}
         for (request_id, state), mel in zip(participants, mels, strict=True):
             delta, hift_mel, speech_offset = self._vocoder.hift_delta(
@@ -373,24 +393,19 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 speech_offset=state.speech_offset,
                 finalize=False,
             )
-            state.token_offset += plan.hop
+            state.token_offset += hop
             self._advance_hop_len(state)
             state.hift_mel = hift_mel
             state.speech_offset = speech_offset
-            if delta is not None and delta.numel() > 0:
+            if delta.numel() > 0:
                 decoded[request_id] = delta
         return decoded
 
-    def _run_one_causal_hop(self, state: _CosyVoice3StreamState) -> torch.Tensor | None:
-        hop = state.hop_len
+    def _run_one_causal_hop(self, state: _CosyVoice3StreamState) -> torch.Tensor:
         delta = self._run_flow_hift(
-            state,
-            token_end=self._window_end(state),
-            token_offset=state.token_offset,
-            streaming=True,
-            finalize=False,
+            state, token_end=_window_end(state), streaming=True, finalize=False
         )
-        state.token_offset += hop
+        state.token_offset += state.hop_len
         self._advance_hop_len(state)
         return delta
 
@@ -402,35 +417,27 @@ class FunCosyVoice3StreamingVocoderScheduler(
         is_final: bool,
     ) -> torch.Tensor | None:
         del request_id
-        pieces: list[torch.Tensor] = []
         if not is_final:
-            # note (guozhihao-224): one hop per non-final step so a
-            # backlogged request cannot drain every ready hop inside one
-            # run_step. stream_done still catches up below.
-            if not self._ready_for_causal_chunk(state):
+            if not _is_hop_ready(state):
                 return None
             delta = self._run_one_causal_hop(state)
-            if delta is None or delta.numel() == 0:
-                return None
-            return delta
-        while self._ready_for_causal_chunk(state):
-            delta = self._run_one_causal_hop(state)
-            if delta is not None and delta.numel() > 0:
-                pieces.append(delta)
-        if not state.tokens:
-            return None if not pieces else torch.cat(pieces, dim=-1)
-        # note (guozhihao-224): leftover keeps finalize=True so HiFT
-        # flushes and pre_lookahead consumes the tail. DiT stays
-        # bidirectional; leftover streaming=True did not win the A/B.
-        delta = self._run_flow_hift(
-            state,
-            token_end=len(state.tokens),
-            token_offset=state.token_offset,
-            streaming=LEFTOVER_FLOW_STREAMING,
-            finalize=True,
-        )
-        if delta is not None and delta.numel() > 0:
-            pieces.append(delta)
+            return delta if delta.numel() > 0 else None
+        pieces: list[torch.Tensor] = []
+        while _is_hop_ready(state):
+            pieces.append(self._run_one_causal_hop(state))
+        if state.tokens:
+            # note (guozhihao-224): leftover keeps finalize=True so HiFT
+            # flushes and pre_lookahead consumes the tail. DiT stays
+            # bidirectional; leftover streaming=True did not win the A/B.
+            pieces.append(
+                self._run_flow_hift(
+                    state,
+                    token_end=len(state.tokens),
+                    streaming=LEFTOVER_FLOW_STREAMING,
+                    finalize=True,
+                )
+            )
+        pieces = [piece for piece in pieces if piece.numel() > 0]
         if not pieces:
             return None
         return torch.cat(pieces, dim=-1)
@@ -440,17 +447,16 @@ class FunCosyVoice3StreamingVocoderScheduler(
         state: _CosyVoice3StreamState,
         *,
         token_end: int,
-        token_offset: int,
         streaming: bool,
         finalize: bool,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor:
         token = torch.tensor(state.tokens[:token_end], dtype=torch.int32).unsqueeze(0)
         wav, hift_mel, speech_offset = self._vocoder.token2wav_chunk(
             token=token,
             prompt_token=state.prompt_token,
             prompt_feat=state.prompt_feat,
             embedding=state.embedding,
-            token_offset=token_offset,
+            token_offset=state.token_offset,
             streaming=streaming,
             finalize=finalize,
             hift_mel=state.hift_mel,
