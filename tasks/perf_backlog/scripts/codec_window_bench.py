@@ -75,15 +75,16 @@ def main():
     num_quantizers = int(decoder_config.num_quantizers)
     dtype = next(tokenizer.model.decoder.parameters()).dtype
     arena = Qwen3TTSCodecStateArena(decoder, num_slots=8, device=device, dtype=dtype)
+    # note(ratish): the same construction the vocoder uses for its window
+    # runner, with every candidate cap's rungs captured at once.
     runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
         decoder,
         device=device,
         dtype=dtype,
         num_quantizers=num_quantizers,
-        mode="cold",
-        fresh_frames=(1, 2),
+        mode="window",
+        fresh_frames=tuple(sorted({1, 2, *widths})),
         batch_sizes=(1, 2, 4, 8),
-        window_frames=widths,
         arena=arena,
     )
     capture_start = time.perf_counter()
