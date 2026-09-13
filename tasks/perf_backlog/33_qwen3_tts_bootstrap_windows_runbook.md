@@ -1,44 +1,55 @@
 # 33. Runbook: the vocoder bootstrap through captured graphs (doc 32 item 1)
 
-Branch `perf/qwen3-tts-bootstrap-graphs` at 1453ef538, three commits on upstream main
+Branch `perf/qwen3-tts-bootstrap-graphs` at fd54363d6, four commits on upstream main
 3060470a8: the runner's window schedule and bucket queries (7e5e2aa48), the window
-runner and its knob (cb9cf8f46), the windowed decode path (1453ef538). Same session
-rules as doc 31: plain server command, GPU 0, GPUs 1 to 3 recorded before every boot,
-dmon on every boot, full corpus, warmup 1, no seed, two passes per arm, event recorder
-in pass 2 stopped after 200 completions, decode log gap check on the first boot.
+runner and its knob (cb9cf8f46), the windowed decode path (1453ef538), no default
+widths until measured (fd54363d6). Same session rules as doc 31: plain server command,
+GPU 0, GPUs 1 to 3 recorded before every boot, dmon on every boot, full corpus, warmup
+1, no seed, two passes per arm, event recorder in pass 2 stopped after 200 completions,
+decode log gap check on the first boot.
 
 What the change does. A reference prefixed bootstrap (reference frames plus the first
 chunk) used to be one eager decode of an uncaptured width, about 860 host launches. The
 initial worker now owns a second graph runner, the window runner, and a same width
 cohort whose width no runner captured is consumed as a sequence of the window runner's
 widths against the cohort's arena slots, one replay per window, largest width first.
-The widths are the powers of two up to the widest decode the scheduler already replays
-through a graph, a left context plus one steady chunk (16 + 8 = 24 by default, so
-1, 2, 4, 8, 16). They are a vocoder factory argument,
-`incremental_codec_cuda_graph_window_frames`, and an empty list turns windowing off. The
-serve log's codec state line carries `windowed_decodes: {rows, replays}` and a `window`
-runner entry next to `cold` and `warm`.
+The widths are a vocoder factory argument, `incremental_codec_cuda_graph_window_frames`.
+On the branch today there is no default: unset or empty means no window runner, so the
+default launch is unchanged until step 0 pins the widths. The serve log's codec state
+line carries `windowed_decodes: {rows, replays}` and a `window` runner entry next to
+`cold` and `warm`.
 
-## Step 0, the replay cost of the ladder against the eager decode, before any boot
+What the widths are. Any set holding width 1 covers any count, so correctness does not
+depend on them. Powers of two are the fewest widths that cover any count with at most
+one small window per rung, so the set is a ladder 1, 2, 4, ... up to a cap. The cap is
+a cost tradeoff: fewer replays per bootstrap (each replay carries the fixed floor of the
+decoder's kernels) against capture memory and boot time. Only a measurement of the
+decoder on the GPU class pins it, which is step 0; the memory guard in the runner makes
+capture fail safe on smaller cards, with the cold shapes untouched.
+
+## Step 0, the replay cost per cap against the eager decode, before any boot
 
 ```bash
 git fetch origin analysis/qwen3-omni-0518-numerics perf/qwen3-tts-bootstrap-graphs
-git worktree add tmp/bw 1453ef538
+git worktree add tmp/bw fd54363d6
 cd tmp/bw && CUDA_VISIBLE_DEVICES=0 python ../../tasks/perf_backlog/scripts/codec_window_bench.py \
-  Qwen/Qwen3-TTS-12Hz-1.7B-Base --widths 4,8,16 --totals 50,100,150 --reps 50 \
+  Qwen/Qwen3-TTS-12Hz-1.7B-Base --widths 4,8,16,32,64 --totals 40,80,120,160 --reps 50 \
   --out ../../results/bw/codec_window_bench.json
 ```
 
 (the script lives on the analysis branch; run it with the code branch's worktree on the
-import path.) Read, per width: device and host ms of one replay at bucket 1 and 4. Per
-total: the eager decode's device and host ms, and the window sequence's device and host
-ms with its window list. Also the capture time and footprint.
+import path.) The totals span reference clips of about 3 to 13 seconds at 12.5 frames
+per second plus the first chunk, the range the product serves, not a corpus. Read, per
+width: device and host ms of one replay at bucket 1 and 4. Per total: the eager
+decode's device and host ms, and for each cap the window sequence's device and host ms
+with its window list. Also the capture time and footprint per cap.
 
-This is a gate, not a search. The ladder is derived, not tuned, so the bench answers one
-question: does the sequence for a 100 and a 150 frame bootstrap cost no more device time
-than the eager decode while cutting its host time by an order of magnitude. If yes, the
-pair runs. If no, the finding is reported with the numbers and the pair does not run
-until the reason is understood.
+Rule for the default: the smallest cap whose sequences cost no more device time than
+the eager decode at every total while cutting the host time by an order of magnitude.
+That number lands on the branch as its own commit, the ladder up to that cap as the
+default of the knob, with the bench numbers in the commit message; step 1 and the pair
+run on that commit. If no cap meets the rule, the finding is reported with the numbers
+and the pair does not run until the reason is understood.
 
 ## Step 1, unit tests on the box, full files
 
@@ -62,7 +73,7 @@ last codec state line's `windowed_decodes` rows and replays, the window runner's
 `replays`, and the cold runner's `uncaptured_fresh_frames` counter. Expected on B: the
 cold counter near zero (only widths no ladder covers stay eager), `windowed_decodes.rows`
 about the number of reference prefixed requests, replays per row about the window count
-for the corpus's reference lengths (a 100 frame bootstrap is 16, 16, 16, 16, 16, 16, 4).
+for the corpus's reference lengths under the pinned ladder.
 
 ## Step 3, the origin check, Nsight on both arms (1 window each)
 
