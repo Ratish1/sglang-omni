@@ -183,12 +183,16 @@ class StreamingSimpleScheduler:
         raise ValueError(f"Unsupported streaming scheduler message type: {msg.type}")
 
     def _next_message(self) -> IncomingMessage | None:
-        if self._pending_messages:
-            return self._pending_messages.popleft()
         try:
-            return self.inbox.get(timeout=0.1)
+            return self._get_batch_message(timeout=0.1)
         except _queue_mod.Empty:
             return None
+
+    def _get_batch_message(self, *, timeout: float = 0.0) -> IncomingMessage:
+        """The one ordered message source: parked messages, then the inbox."""
+        if self._pending_messages:
+            return self._pending_messages.popleft()
+        return self.inbox.get(timeout=timeout)
 
     # ------------------------------------------------------------------
     # Abort and cleanup
@@ -255,12 +259,6 @@ class StreamingSimpleScheduler:
         if self._request_cost_fn is None or msg.type != "new_request":
             return 0
         return max(int(self._request_cost_fn(msg.data)), 0)
-
-    def _get_batch_message(self, *, timeout: float = 0.0) -> IncomingMessage:
-        """Consume deferred work before new arrivals without running dispatch hooks."""
-        if self._pending_messages:
-            return self._pending_messages.popleft()
-        return self.inbox.get(timeout=timeout)
 
     def _collect_new_request_batch(
         self, first_msg: IncomingMessage
