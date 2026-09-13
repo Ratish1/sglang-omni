@@ -8,10 +8,12 @@ Evidence: doc 36 (session 2 archive `bw-session-results-no-wavs.tar.gz`), doc 34
 ### Mechanism
 
 A streaming request's first decode on the vocoder's initial worker is the reference
-frames plus the first chunk, a width no CUDA graph captured, so it ran eager: about 845
+frames plus the first chunk, a width no CUDA graph captured, so it ran eager: about 860
 kernel launches per request on one thread of a process where 18 threads share the
 interpreter lock. Every eager launch is a lock handoff, and the scheduler, the
-preprocessing workers and the prefill all paid for it in their own segments.
+preprocessing workers and the prefill all paid for it in their own segments. With this
+PR that decode is about 3 graph replays per request (9,632 replays for 3,264 requests
+on the census boot) and the cold runner's uncaptured width misses go from 2,688 to 0.
 
 This PR gives the initial worker a second graph runner with widths 1, 2, 4, 8, 16, 32, 64
 at the same batch buckets as the cold and warm runners. A bootstrap whose width no runner
@@ -54,44 +56,10 @@ Non streaming is untouched: the whole sequence path does not use the incremental
 | first frame to first audio, mean ms | 35.3 | 29.9 | -5.4 |
 | first frame to first audio, p95 ms | 65.2 | 48.8 | -16.4 |
 | cold graph misses (uncaptured width) | 2,688 | 0 | |
-| SM active during traffic, percent | 78.3 | 80.9 | +2.6 |
+| SM utilization during traffic, nvidia-smi dmon, percent | 78.3 | 80.9 | +2.6 |
 | launch to ready, s | 96 | 90 | -6 |
 
 Quality on this PR: WER 1.05 percent, speaker similarity 71.53, inside the bands.
 
-### With early ids (#2123 applied on both arms), same protocol
-
-| read | main + early ids | this PR + early ids | delta |
-| --- | ---: | ---: | ---: |
-| req/s | 15.55 | 17.94 | +15.4 percent |
-| audio s/s | 64.5 | 74.4 | +15.2 percent |
-| RTF mean | 0.2503 | 0.2171 | -13.3 percent |
-| TTFC mean ms | 234.0 | 140.5 | -93.5 |
-| TTFC p50 ms | 215.8 | 132.1 | -83.7 |
-| TTFC p99 ms | 508.4 | 367.9 | -140.5 |
-| inter chunk mean ms | 98.0 | 92.8 | -5.2 |
-| first frame to first audio, ahead 0 p50 ms | 63.2 | 28.4 | -34.8 |
-| first frame to first audio, mean ms | 89.6 | 34.2 | -55.4 |
-| prefill p50 with one bootstrap overlapping, ms | 28.8 | 13.2 | -15.6 |
-| preprocessing p50 ms | 85.6 | 57.8 | -27.8 |
-| initial worker launches per request (Nsight) | about 845 | about 47 + 2.5 replays | |
-| process launches per request (Nsight) | 2,157 | 1,387 | -36 percent |
-| GR active, percent (Nsight, 20 s window) | 72.7 | 79.0 | +6.3 |
-| SMs active, percent (Nsight) | 39.2 | 44.7 | +5.5 |
-
-Early ids with this PR lands 10.8 ms above main's TTFC mean at 16 percent more
-throughput; the remaining gap is the preprocessing segment, the next slice.
-
 Window runner footprint 2.1 GB at buckets 1, 2, 4, 8. Knob to disable:
 `incremental_codec_cuda_graph_window_frames=[]`.
-
-## Group message
-
-Qwen3-TTS streaming: the reference prefixed first decode now replays through captured
-window graphs instead of running eager (about 845 launches per request on the initial
-worker down to about 47 plus 2.5 graph replays). Default launch, streaming c16, full
-seed-tts corpus: TTFC mean 130 to 117 ms, p99 327 to 302 ms, req/s 15.4 to 15.8, SM
-active 78 to 81 percent, quality unchanged (WER 1.05, similarity 71.5). With early ids
-on top: req/s 15.6 to 17.9, TTFC mean 234 to 141 ms, p99 508 to 368 ms, GR active 73 to
-79 percent, SMs active 39 to 45 percent. The precompile double trace is fixed in the
-same PR, boot is 6 to 11 s faster. PR: <link>. Readout: tasks/perf_backlog/36.
