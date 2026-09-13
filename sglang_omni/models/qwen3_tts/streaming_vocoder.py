@@ -1745,24 +1745,145 @@ class Qwen3TTSStreamingVocoderScheduler(
             if stream is None:
                 _raise_for_bad_rows(bad_rows, len(plans))
                 if incremental is not None:
-                    cohort_state = incremental.gathered()
-                    waveform = incremental.decoder.decode(decoder_input, cohort_state)
-                    incremental.arena.scatter(incremental.slots, cohort_state)
-                    extract = self._extract_incremental_delta
+                    deltas, _ = self._decode_incremental_cohort(
+                        decoder_input, plans, incremental, stream
+                    )
                 else:
                     waveform = self._decoder.chunked_decode(decoder_input)
-                    extract = self._extract_delta
-                waveforms = self._split_batch_waveform(waveform, len(plans))
-                return _Qwen3TTSDecodeHandle(
-                    [
-                        extract(plan, waveform).detach().to(torch.float32).contiguous()
+                    waveforms = self._split_batch_waveform(waveform, len(plans))
+                    deltas = [
+                        self._extract_delta(plan, waveform)
                         for plan, waveform in zip(plans, waveforms)
-                    ],
+                    ]
+                return _Qwen3TTSDecodeHandle(
+                    [delta.detach().to(torch.float32).contiguous() for delta in deltas],
                     bad_rows=None,
                 )
             return self._launch_async(
                 plans, decoder_input, bad_rows, stream, incremental
             )
+
+    def _window_runner_for_stream(self, stream: Any) -> Any:
+        """The window runner, only on the initial worker's stream."""
+        if stream is self._decode_stream:
+            return self._initial_window_decode_graphs
+        return None
+
+    def _decode_incremental_cohort(
+        self,
+        gpu_input: torch.Tensor,
+        plans: list[_IncrementalDecodePlan],
+        incremental: _IncrementalDecodeBatch,
+        stream: torch.cuda.Stream | None,
+    ) -> tuple[list[torch.Tensor], list[Any]]:
+        """Decode one same-width cohort against the arena; return each row's
+        emitted samples.
+
+        In order: one replay on this stream's runner when it captured the
+        width, a sequence of replays on the window runner when it can cover
+        the width, else the eager decoder. The deltas either own their memory
+        or view a tensor in the second return value, which the caller keeps
+        alive until they are copied out.
+        """
+        width = plans[0].fresh_frames
+        if any(plan.fresh_frames != width for plan in plans):
+            raise RuntimeError("Qwen3-TTS incremental cohort mixes decode widths")
+        runner = self._runner_for_stream(
+            stream, self._initial_incremental_decode_graphs, "incremental_graphs"
+        )
+        window_runner = self._window_runner_for_stream(stream)
+        windows = (
+            None
+            if runner is not None and runner.available_batch_sizes(width)
+            else (
+                window_runner.plan_windows(width) if window_runner is not None else None
+            )
+        )
+        if windows is not None:
+            deltas = self._decode_incremental_windows(
+                gpu_input, plans, incremental, window_runner, windows
+            )
+            return deltas, []
+        waveform = (
+            runner.decode_slots(gpu_input, incremental.slots)
+            if runner is not None
+            else None
+        )
+        if waveform is None:
+            # note (luojiaxuan): on a graph miss the eager decoder works on a
+            # gathered copy of the rows, scattered back on the same stream so
+            # the arena stays stream-ordered.
+            cohort_state = incremental.gathered()
+            waveform = incremental.decoder.decode(gpu_input, cohort_state)
+            incremental.arena.scatter(incremental.slots, cohort_state)
+        rows = self._split_batch_waveform(waveform, len(plans))
+        return [
+            self._extract_incremental_delta(plan, row) for plan, row in zip(plans, rows)
+        ], [waveform]
+
+    def _decode_incremental_windows(
+        self,
+        gpu_input: torch.Tensor,
+        plans: list[_IncrementalDecodePlan],
+        incremental: _IncrementalDecodeBatch,
+        runner: Qwen3TTSIncrementalCodecCudaGraphRunner,
+        windows: tuple[int, ...],
+    ) -> list[torch.Tensor]:
+        """Replay the cohort's input one window at a time against its slots.
+
+        Every replay advances the same slots by one window, so the sequence
+        decodes exactly what one wide decode would. The samples of each row's
+        emitted frames are copied out of the borrowed graph output on the
+        decode stream, before a later replay of that shape overwrites it.
+        """
+        samples_per_frame = self._samples_per_frame
+        emit_start = [plan.reference_trim_frames for plan in plans]
+        deltas = []
+        for plan in plans:
+            emit_frames = plan.generated_frames - plan.emitted_generated_frames
+            if plan.reference_trim_frames + emit_frames != plan.fresh_frames:
+                raise RuntimeError(
+                    "Qwen3-TTS incremental decode plan emits frames outside its input"
+                )
+            deltas.append(
+                torch.empty(
+                    emit_frames * samples_per_frame,
+                    dtype=torch.float32,
+                    device=gpu_input.device,
+                )
+            )
+        offset = 0
+        for width in windows:
+            end = offset + width
+            waveform = runner.decode_slots(
+                gpu_input[:, :, offset:end], incremental.slots
+            )
+            if waveform is None:
+                raise RuntimeError(
+                    "Qwen3-TTS incremental Codec graph missed a planned window"
+                )
+            for row, samples in enumerate(
+                self._split_batch_waveform(waveform, len(plans))
+            ):
+                first = max(offset, emit_start[row])
+                if end <= first:
+                    continue
+                deltas[row][
+                    (first - emit_start[row])
+                    * samples_per_frame : (end - emit_start[row])
+                    * samples_per_frame
+                ].copy_(
+                    samples[
+                        (first - offset)
+                        * samples_per_frame : (end - offset)
+                        * samples_per_frame
+                    ]
+                )
+            offset = end
+        with self._codec_lock:
+            self._codec_windowed_rows += len(plans)
+            self._codec_window_replays += len(windows)
+        return deltas
 
     def _runner_for_stream(self, stream: Any, initial: Any, worker_attr: str) -> Any:
         """The graph runner that was built for this decode stream, if any."""
@@ -1804,24 +1925,10 @@ class Qwen3TTSStreamingVocoderScheduler(
                     decoder_input, slot if pinned else None
                 )
                 if incremental is not None:
-                    incremental_graphs = self._runner_for_stream(
-                        stream,
-                        self._initial_incremental_decode_graphs,
-                        "incremental_graphs",
+                    deltas, borrowed = self._decode_incremental_cohort(
+                        gpu_input, plans, incremental, stream
                     )
-                    waveform = (
-                        incremental_graphs.decode_slots(gpu_input, incremental.slots)
-                        if incremental_graphs is not None
-                        else None
-                    )
-                    if waveform is None:
-                        # note (luojiaxuan): graph miss: the eager decoder works on
-                        # a gathered copy of the rows, scattered back on the same
-                        # stream so the arena stays stream-ordered.
-                        cohort_state = incremental.gathered()
-                        waveform = incremental.decoder.decode(gpu_input, cohort_state)
-                        incremental.arena.scatter(incremental.slots, cohort_state)
-                    extract = self._extract_incremental_delta
+                    keepalives.extend(borrowed)
                 else:
                     graphs = self._runner_for_stream(
                         stream, self._initial_decode_graphs, "graphs"
@@ -1829,13 +1936,13 @@ class Qwen3TTSStreamingVocoderScheduler(
                     waveform = graphs.decode(gpu_input) if graphs is not None else None
                     if waveform is None:
                         waveform = self._decoder.chunked_decode(gpu_input)
-                    extract = self._extract_delta
-                keepalives.append(waveform)
-                waveforms = self._split_batch_waveform(waveform, len(plans))
-                deltas = [
-                    extract(plan, waveform).detach().to(torch.float32)
-                    for plan, waveform in zip(plans, waveforms)
-                ]
+                    keepalives.append(waveform)
+                    waveforms = self._split_batch_waveform(waveform, len(plans))
+                    deltas = [
+                        self._extract_delta(plan, waveform)
+                        for plan, waveform in zip(plans, waveforms)
+                    ]
+                deltas = [delta.detach().to(torch.float32) for delta in deltas]
                 keepalives.extend(deltas)
                 if not pinned:
                     host = [delta.contiguous().cpu() for delta in deltas]
@@ -2324,7 +2431,9 @@ class Qwen3TTSStreamingVocoderScheduler(
         # no reference prefix, so every bootstrap shares one width and batches.
         for cohort in self._group_decode_plans(planned_incremental):
             for group in self._split_incremental_group_for_graph(
-                cohort, runner=self._initial_incremental_decode_graphs
+                cohort,
+                runner=self._initial_incremental_decode_graphs,
+                window_runner=self._initial_window_decode_graphs,
             ):
                 decoded = self._decode_incremental_group(
                     group, stream=self._decode_stream
@@ -2377,15 +2486,24 @@ class Qwen3TTSStreamingVocoderScheduler(
         group: list[tuple[str, _Qwen3TTSStreamState, _IncrementalDecodePlan]],
         *,
         runner: Qwen3TTSIncrementalCodecCudaGraphRunner | None,
+        window_runner: Qwen3TTSIncrementalCodecCudaGraphRunner | None = None,
     ) -> list[list[tuple[str, _Qwen3TTSStreamState, _IncrementalDecodePlan]]]:
-        """Split cohorts above the largest captured bucket instead of falling back."""
+        """Split cohorts above the largest captured bucket instead of falling back.
 
-        if not group or runner is None:
-            return [group] if group else []
-        batch_sizes = runner.available_batch_sizes(group[0][2].fresh_frames)
-        if not batch_sizes:
+        A width the window runner covers splits at that runner's bucket.
+        """
+
+        if not group:
+            return []
+        width = group[0][2].fresh_frames
+        largest = 0
+        if runner is not None:
+            largest = max(runner.available_batch_sizes(width), default=0)
+        if not largest and window_runner is not None:
+            if window_runner.plan_windows(width) is not None:
+                largest = window_runner.largest_batch_bucket()
+        if not largest:
             return [group]
-        largest = max(batch_sizes)
         return [
             group[index : index + largest] for index in range(0, len(group), largest)
         ]

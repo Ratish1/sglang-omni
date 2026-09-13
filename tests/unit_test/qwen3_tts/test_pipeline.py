@@ -30,6 +30,9 @@ from sglang_omni.models.qwen3_tts.incremental_codec import (
     Qwen3TTSIncrementalCodecState,
     Qwen3TTSIncrementalCodecStateSpec,
 )
+from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
+    plan_decode_windows,
+)
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.models.qwen3_tts.request_builders import (
     Qwen3TTSPreparedRequest,
@@ -43,9 +46,11 @@ from sglang_omni.models.qwen3_tts.request_builders import (
 from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE,
     Qwen3TTSStreamingVocoderScheduler,
+    _IncrementalDecodePlan,
     _Qwen3TTSDecodePlan,
     _Qwen3TTSInitialDecodeGraphs,
     _Qwen3TTSInvalidCodeRows,
+    _Qwen3TTSStreamState,
 )
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
@@ -2273,6 +2278,278 @@ def test_qwen3_tts_window_frames_must_be_positive() -> None:
             device="cpu",
             incremental_codec_cuda_graph_window_frames=(4, 0),
         )
+
+
+class _FakeWindowRunner:
+    """A captured shape set that decodes against the real arena on the CPU."""
+
+    def __init__(
+        self,
+        scheduler: Qwen3TTSStreamingVocoderScheduler,
+        decoder: _FakeIncrementalQwen3TTSDecoder,
+        *,
+        widths: tuple[int, ...],
+        bucket: int,
+        miss_on_call: int | None = None,
+    ) -> None:
+        self._arena = scheduler._codec_arena
+        self._decoder = decoder
+        self._widths = widths
+        self._bucket = bucket
+        self._miss_on_call = miss_on_call
+        self.calls: list[tuple[tuple[int, ...], list[int]]] = []
+
+    def plan_windows(self, total_frames: int) -> tuple[int, ...] | None:
+        return plan_decode_windows(total_frames, self._widths)
+
+    def largest_batch_bucket(self) -> int:
+        return self._bucket
+
+    def available_batch_sizes(self, fresh_frames: int) -> tuple[int, ...]:
+        return (self._bucket, 1) if fresh_frames in self._widths else ()
+
+    def decode_slots(self, codes: torch.Tensor, slots) -> torch.Tensor | None:
+        self.calls.append((tuple(codes.shape), list(slots)))
+        if len(self.calls) == self._miss_on_call:
+            return None
+        state = self._arena.gather(list(slots))
+        waveform = self._decoder.decode(codes, state)
+        self._arena.scatter(list(slots), state)
+        return waveform
+
+
+def _windowed_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    widths: tuple[int, ...] = (1, 2),
+    bucket: int = 4,
+    miss_on_call: int | None = None,
+    cold_widths: tuple[int, ...] | None = None,
+) -> tuple[
+    Qwen3TTSStreamingVocoderScheduler,
+    _FakeIncrementalQwen3TTSDecoder,
+    _FakeWindowRunner,
+]:
+    scheduler, incremental = _stateful_qwen3_tts_scheduler(monkeypatch)
+    runner = _FakeWindowRunner(
+        scheduler,
+        incremental,
+        widths=widths,
+        bucket=bucket,
+        miss_on_call=miss_on_call,
+    )
+    scheduler._initial_window_decode_graphs = runner
+    if cold_widths is not None:
+        scheduler._initial_incremental_decode_graphs = _FakeWindowRunner(
+            scheduler, incremental, widths=cold_widths, bucket=bucket
+        )
+    scheduler._initial_worker = object()
+    return scheduler, incremental, runner
+
+
+def _admit_reference_stream(
+    scheduler: Qwen3TTSStreamingVocoderScheduler,
+    request_id: str,
+    codes: torch.Tensor,
+    *,
+    ref_code_len: int,
+) -> _Qwen3TTSStreamState:
+    state = scheduler.create_stream_state(request_id)
+    scheduler._stream_states[request_id] = state
+    scheduler.latch_stream_contract(
+        request_id,
+        state,
+        {"num_quantizers": int(codes.shape[1]), "ref_code_len": ref_code_len},
+        origin="stream metadata",
+    )
+    scheduler.ingest(
+        request_id, state, scheduler.validate_chunk(request_id, state, codes)
+    )
+    state.initial_pending = True
+    return state
+
+
+def _chunk_samples(message) -> list[float]:
+    return np.frombuffer(message.data["audio_waveform"], dtype=np.float32).tolist()
+
+
+def test_qwen3_tts_reference_bootstraps_replay_windows_across_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, incremental, runner = _windowed_scheduler(monkeypatch)
+    long = _admit_reference_stream(
+        scheduler,
+        "long",
+        torch.tensor([[10, 1], [20, 2], [30, 3], [40, 4]], dtype=torch.long),
+        ref_code_len=3,
+    )
+    short = _admit_reference_stream(
+        scheduler,
+        "short",
+        torch.tensor([[50, 5], [60, 6], [70, 7], [80, 8]], dtype=torch.long),
+        ref_code_len=3,
+    )
+
+    scheduler._run_initial_batch([("long", long), ("short", short)])
+
+    assert runner.calls == [
+        ((2, 2, 2), [long.codec_slot, short.codec_slot]),
+        ((2, 2, 2), [long.codec_slot, short.codec_slot]),
+    ]
+    assert incremental.decode_positions == [[0, 0], [2, 2]]
+    assert [item[:, 0].tolist() for item in incremental.decode_inputs] == [
+        [[10, 20], [50, 60]],
+        [[30, 40], [70, 80]],
+    ]
+    messages = {}
+    while not scheduler.outbox.empty():
+        message = scheduler.outbox.get_nowait()
+        messages[message.request_id] = message
+    assert _chunk_samples(messages["long"]) == [40.0] * 4
+    assert _chunk_samples(messages["short"]) == [80.0] * 4
+    positions = scheduler._codec_arena._storage.frame_positions
+    assert int(positions[long.codec_slot]) == 4
+    assert int(positions[short.codec_slot]) == 4
+    assert long.codec_frame_position == 4
+    assert long.emitted_generated_frames == 1
+    assert short.emitted_generated_frames == 1
+    assert scheduler.codec_state_stats()["windowed_decodes"] == {
+        "rows": 2,
+        "replays": 2,
+    }
+    assert scheduler.codec_state_stats()["left_context_fallbacks"] == 0
+
+
+def test_qwen3_tts_window_remainder_carries_the_emitted_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, incremental, runner = _windowed_scheduler(monkeypatch)
+    state = _admit_reference_stream(
+        scheduler,
+        "request",
+        torch.tensor([[10, 1], [20, 2], [30, 3]], dtype=torch.long),
+        ref_code_len=2,
+    )
+
+    scheduler._run_initial_batch([("request", state)])
+
+    assert runner.calls == [
+        ((1, 2, 2), [state.codec_slot]),
+        ((1, 2, 1), [state.codec_slot]),
+    ]
+    assert incremental.decode_positions == [[0], [2]]
+    assert _chunk_samples(scheduler.outbox.get_nowait()) == [30.0] * 4
+    assert state.codec_frame_position == 3
+    assert scheduler.codec_state_stats()["windowed_decodes"] == {
+        "rows": 1,
+        "replays": 2,
+    }
+
+
+def test_qwen3_tts_captured_bootstrap_width_replays_on_the_cold_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, incremental, runner = _windowed_scheduler(
+        monkeypatch, widths=(1, 2, 4), cold_widths=(1, 2)
+    )
+    cold = scheduler._initial_incremental_decode_graphs
+    first = _admit_reference_stream(
+        scheduler,
+        "first",
+        torch.tensor([[10, 1], [20, 2]], dtype=torch.long),
+        ref_code_len=1,
+    )
+    second = _admit_reference_stream(
+        scheduler,
+        "second",
+        torch.tensor([[30, 3], [40, 4]], dtype=torch.long),
+        ref_code_len=1,
+    )
+
+    scheduler._run_initial_batch([("first", first), ("second", second)])
+
+    assert cold.calls == [((2, 2, 2), [first.codec_slot, second.codec_slot])]
+    assert runner.calls == []
+    assert scheduler.codec_state_stats()["windowed_decodes"] == {
+        "rows": 0,
+        "replays": 0,
+    }
+    samples = sorted(_chunk_samples(scheduler.outbox.get_nowait()) for _ in range(2))
+    assert samples == [[20.0] * 4, [40.0] * 4]
+
+
+def test_qwen3_tts_window_miss_degrades_the_cohort_to_left_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, _, runner = _windowed_scheduler(monkeypatch, miss_on_call=2)
+    long = _admit_reference_stream(
+        scheduler,
+        "long",
+        torch.tensor([[10, 1], [20, 2], [30, 3], [40, 4]], dtype=torch.long),
+        ref_code_len=3,
+    )
+    short = _admit_reference_stream(
+        scheduler,
+        "short",
+        torch.tensor([[50, 5], [60, 6], [70, 7], [80, 8]], dtype=torch.long),
+        ref_code_len=3,
+    )
+
+    scheduler._run_initial_batch([("long", long), ("short", short)])
+
+    assert len(runner.calls) == 2
+    assert scheduler.outbox.empty()
+    assert long.incremental_codec_fallback is True
+    assert short.incremental_codec_fallback is True
+    assert long.codec_slot is None
+    assert short.codec_slot is None
+    assert scheduler._codec_arena.active_slots() == 0
+    assert scheduler._initial_queue.qsize() == 2
+    assert scheduler.codec_state_stats()["left_context_fallbacks"] == 2
+    assert scheduler.codec_state_stats()["windowed_decodes"] == {
+        "rows": 0,
+        "replays": 0,
+    }
+
+
+def test_qwen3_tts_windowed_cohorts_split_at_the_window_runner_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, _, runner = _windowed_scheduler(
+        monkeypatch, widths=(1, 2, 4), bucket=2, cold_widths=(1, 2)
+    )
+    cold = scheduler._initial_incremental_decode_graphs
+
+    def plan(fresh_frames: int, slot: int) -> _IncrementalDecodePlan:
+        return _IncrementalDecodePlan(
+            decoder_input=torch.zeros(1, 2, fresh_frames, dtype=torch.long),
+            slot=slot,
+            fresh_frames=fresh_frames,
+            reference_trim_frames=fresh_frames - 1,
+            generated_frames=1,
+            emitted_generated_frames=0,
+        )
+
+    windowed = [(name, None, plan(7, slot)) for slot, name in enumerate("abc")]
+    split = scheduler._split_incremental_group_for_graph(
+        windowed, runner=cold, window_runner=runner
+    )
+    assert [[entry[0] for entry in group] for group in split] == [["a", "b"], ["c"]]
+
+    direct = [(name, None, plan(2, slot)) for slot, name in enumerate("abc")]
+    split = scheduler._split_incremental_group_for_graph(
+        direct, runner=cold, window_runner=runner
+    )
+    assert [[entry[0] for entry in group] for group in split] == [["a", "b"], ["c"]]
+
+    uncovered = [(name, None, plan(7, slot)) for slot, name in enumerate("abc")]
+    runner._widths = (2, 4)
+    assert scheduler._split_incremental_group_for_graph(
+        uncovered, runner=cold, window_runner=runner
+    ) == [uncovered]
+    assert scheduler._split_incremental_group_for_graph(
+        uncovered, runner=cold, window_runner=None
+    ) == [uncovered]
 
 
 def test_qwen3_tts_stateful_codec_uses_reference_once_then_fresh_frames(
