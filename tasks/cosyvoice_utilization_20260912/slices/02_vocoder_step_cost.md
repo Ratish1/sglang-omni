@@ -82,7 +82,9 @@ shorter row's padded frames lie beyond that boundary; the only cross-boundary ef
 ISTFT overlap-add, and an ISTFT frame starting at sample p only writes samples at or after p, so
 samples before the row's boundary receive nothing from padded frames. Per row the valid sample
 count is `(frames_i - condnet_causal_padding - conv_pre_look_right) * 480 - 480`, computed from the
-module's own attributes, never from constants in our code.
+module's own attributes, never from constants in our code (the research report reads 3 and 4 for
+the two paddings and 480 samples per frame from `hop_len * prod(upsample_rates)`; E1 confirms the
+count against the single-row output length).
 
 Experiment E1 (bit exactness, box): for 32 corpus requests, run the current per-row path and the
 batched path at rows 2, 8 and 16 with the same histories; assert `torch.equal` on the emitted
@@ -119,6 +121,25 @@ Why the current runner does not apply. `FlowCudaGraphRunner` (`stages.py:344-520
 (`stages.py:630`). Its capture set is a table in `config.py:19-40` (batch 1: 304 to 640 frames in
 16-frame steps, batch 2: 384 to 544). Any shape outside the table runs eager, so the table encodes
 one benchmark's length distribution. The table is deleted by this change.
+
+Two prerequisites the research report (`research/FLOW_GRAPH_MECHANICS_20260913.md`) surfaced:
+
+- Singleton hops and every final do not go through `generate_flow` at all: `token2wav_chunk`
+  calls the native `flow.inference` (`stages.py:1337`). They must be routed through the packed
+  adapter at one row (`inference_causal` for hops, `inference` for the finalize call) before any
+  graph can apply to them. This is the old V2 item; it is the first commit of this change and it
+  is gated by bit exactness against the native call (the packed adapter already has singleton
+  versus row tests).
+- In streaming mode the DiT builds its mask through upstream `add_optional_chunk_mask`, which ends
+  with a host `.item()` check (`mask.py:236`), one sync per DiT forward and ten per hop, and a
+  host sync inside a capture aborts it. The omni `_chunk_mask` patch (`stages.py:1872-1893`)
+  bypasses only the non-streaming branch. The patch extends to the streaming branch: build the
+  chunk mask, AND the key padding mask, force empty rows true with `masked_fill_`, no `.item()`.
+  Exactness: same boolean mask, computed without the host round trip.
+
+Also noted: rows with different prompt lengths take the per-row `pre_lookahead` loop
+(`stages.py:549-570`), which is outside the captured solve and stays eager; its cost is one small
+layer per row.
 
 Mechanism.
 
