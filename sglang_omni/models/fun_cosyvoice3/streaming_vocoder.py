@@ -63,10 +63,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
 
     _can_batch_stream_chunks = True
     _stream_chunk_batch_distinct_requests = True
-    # note (guozhihao-224): follow-up hops are a separate knife from
-    # first-hop coalescing. Keep this on once equal-shape causal batch
-    # is the default; A/B turns it off to isolate ITL/C50.
-    _can_batch_follow_up_hops = True
     # note (guozhihao-224): c=1 has no joinable peer so this is a no-op.
     # c=16 holds a singleton first hop or follow-up hop up to this
     # window while equal-shape peers arrive, otherwise the vocoder
@@ -485,10 +481,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             if self._can_batch_stream_chunks:
                 if first:
                     self._wait_for_first_hop_peers()
-                    if (
-                        self._first_hop_group_size() == 0
-                        and self._can_batch_follow_up_hops
-                    ):
+                    if self._first_hop_group_size() == 0:
                         self._wait_for_follow_up_peers()
                 else:
                     self._ingest_ready_inbox()
@@ -557,10 +550,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
         del request_id
         state.tokens.extend(int(token) for token in codes.tolist())
 
-    def should_decode(self, state: _CosyVoice3StreamState, *, is_final: bool) -> bool:
-        del is_final
-        return self._ready_for_causal_chunk(state)
-
     def _ready_for_causal_chunk(self, state: _CosyVoice3StreamState) -> bool:
         if state.prompt_token is None:
             return False
@@ -593,7 +582,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             best = max(groups.values(), key=len)
             return best[: self._max_batch_size]
         if follow_ups:
-            if not self._can_batch_stream_chunks or not self._can_batch_follow_up_hops:
+            if not self._can_batch_stream_chunks:
                 return follow_ups[:1]
             follow_groups: dict[
                 tuple[int, int], list[tuple[str, _CosyVoice3StreamState]]
@@ -641,16 +630,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
     ) -> dict[str, torch.Tensor]:
         items: list[FlowBatchInput] = []
         for _, state in participants:
-            if state.prompt_token is None or state.prompt_feat is None:
-                raise RuntimeError(
-                    "Fun-CosyVoice3 streaming vocoder decoded before prompt "
-                    "conditioning was latched"
-                )
-            if state.embedding is None:
-                raise RuntimeError(
-                    "Fun-CosyVoice3 streaming vocoder decoded before speaker "
-                    "embedding was latched"
-                )
             generated = state.tokens[: plan.token_end]
             items.append(
                 FlowBatchInput(
@@ -677,11 +656,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
         offset_frames = int(plan.token_offset) * TOKEN_MEL_RATIO
         decoded: dict[str, torch.Tensor] = {}
         for (request_id, state), mel in zip(participants, mels, strict=True):
-            if mel.shape[-1] < offset_frames:
-                raise RuntimeError(
-                    "Fun-CosyVoice3 causal Flow batch returned "
-                    f"{mel.shape[-1]} frames, need offset {offset_frames}"
-                )
             delta, hift_mel, speech_offset = self._vocoder.hift_delta(
                 mel[:, :, offset_frames:],
                 hift_mel=state.hift_mel,
@@ -759,22 +733,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         streaming: bool,
         finalize: bool,
     ) -> torch.Tensor | None:
-        if state.prompt_token is None or state.prompt_feat is None:
-            raise RuntimeError(
-                "Fun-CosyVoice3 streaming vocoder decoded before prompt "
-                "conditioning was latched"
-            )
-        if state.embedding is None:
-            raise RuntimeError(
-                "Fun-CosyVoice3 streaming vocoder decoded before speaker "
-                "embedding was latched"
-            )
-        generated = state.tokens[:token_end]
-        if not generated:
-            raise RuntimeError(
-                "Fun-CosyVoice3 streaming vocoder has no speech tokens to decode"
-            )
-        token = torch.tensor(generated, dtype=torch.int32).unsqueeze(0)
+        token = torch.tensor(state.tokens[:token_end], dtype=torch.int32).unsqueeze(0)
         wav, hift_mel, speech_offset = self._vocoder.token2wav_chunk(
             token=token,
             prompt_token=state.prompt_token,
