@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import logging
-import queue as _queue_mod
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -27,8 +25,8 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     next_stream_hop_len,
     pad_flow_prompt_to_hop,
 )
+from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -62,12 +60,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
     """Decode CosyVoice3 speech tokens incrementally through Flow + HiFT."""
 
     _can_batch_stream_chunks = True
-    _stream_chunk_batch_distinct_requests = True
-    # note (guozhihao-224): c=1 has no joinable peer so this is a no-op.
-    # c=16 holds a singleton first hop or follow-up hop up to this
-    # window while equal-shape peers arrive, otherwise the vocoder
-    # decodes B=1 forever.
-    _first_hop_peer_wait_ms = 30
 
     def __init__(
         self,
@@ -167,330 +159,29 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 embedding=metadata.get("flow_embedding"),
             )
 
-    def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
-        super().on_streaming_new_request(request_id, payload)
-        # note (guozhihao-224): payload can arrive after buffered chunks.
-        # Serial path pumps immediately. Coalescing waits until
-        # _handle_new_request_batch has latched every queued streaming
-        # payload so equal-shape first hops share one causal Flow call.
-        if request_id in self._pending_done:
-            return
-        if self._can_batch_stream_chunks:
-            return
+    def on_stream_chunk_batch(self, items: list[tuple[str, StreamItem]]) -> None:
+        failed: list[str] = []
         with self._state_lock:
-            failed = self._pump_streams()
-        for failed_id in failed:
-            self._cleanup_aborted_request(failed_id)
+            for request_id, item in items:
+                if self._is_aborted(request_id):
+                    continue
+                try:
+                    self._ingest_stream_item(request_id, item)
+                except Exception as exc:
+                    self._emit_error(request_id, exc)
+                    self._abort_state(request_id)
+                    failed.append(request_id)
+        for request_id in failed:
+            self._cleanup_aborted_request(request_id)
 
-    def _collect_new_request_batch(
-        self, first_msg: IncomingMessage
-    ) -> list[IncomingMessage]:
-        if not self._can_batch_stream_chunks:
-            return super()._collect_new_request_batch(first_msg)
-        try:
-            first_is_streaming = self.is_streaming_payload(first_msg.data)
-        except Exception:
-            return super()._collect_new_request_batch(first_msg)
-        if not first_is_streaming:
-            return super()._collect_new_request_batch(first_msg)
-        batch = [first_msg]
-        seen = {first_msg.request_id}
-        cap = max(int(self._max_batch_size), 1)
-        while len(batch) < cap:
-            try:
-                msg = self._get_batch_message()
-            except _queue_mod.Empty:
-                break
-            if self._is_aborted(msg.request_id):
-                continue
-            if msg.type != "new_request":
-                self._pending_messages.appendleft(msg)
-                break
-            try:
-                is_streaming = self.is_streaming_payload(msg.data)
-            except Exception as exc:
-                self._emit_error(msg.request_id, exc)
-                self.abort(msg.request_id)
-                continue
-            if not is_streaming or msg.request_id in seen:
-                self._pending_messages.appendleft(msg)
-                break
-            seen.add(msg.request_id)
-            batch.append(msg)
-        return batch
-
-    def _handle_new_request_batch(
-        self,
-        batch: list[IncomingMessage],
-        loop: Any | None = None,
-    ) -> None:
-        super()._handle_new_request_batch(batch, loop)
-        if not self._can_batch_stream_chunks:
-            return
-        has_streaming = False
-        for msg in batch:
-            if msg.type != "new_request" or self._is_aborted(msg.request_id):
-                continue
-            try:
-                has_streaming = self.is_streaming_payload(msg.data)
-            except Exception:
-                continue
-            if has_streaming:
-                break
-        if not has_streaming:
-            return
+    def _has_ready_work(self) -> bool:
         with self._state_lock:
-            failed = self._pump_streams()
-        for failed_id in failed:
-            self._cleanup_aborted_request(failed_id)
-
-    def _collect_stream_chunk_batch(
-        self, first_msg: IncomingMessage
-    ) -> list[IncomingMessage]:
-        if not self._can_batch_stream_chunks:
-            return super()._collect_stream_chunk_batch(first_msg)
-        batch = [first_msg]
-        seen = {first_msg.request_id}
-        # Keep duplicate-request chunks aside until collection ends so they
-        # cannot be re-read while looking for compatible peers.
-        deferred: list[IncomingMessage] = []
-        leftover: IncomingMessage | None = None
-        cap = self._stream_chunk_batch_max or max(self._max_batch_size, 1)
-        while len(batch) < cap:
-            try:
-                msg = self._get_batch_message()
-            except _queue_mod.Empty:
-                break
-            if msg.type != "stream_chunk":
-                leftover = msg
-                break
-            if self._is_aborted(msg.request_id):
-                continue
-            if msg.request_id in seen:
-                # note (guozhihao-224): keep scanning for other requests'
-                # first hops instead of stopping behind this request's
-                # follow-up chunk.
-                deferred.append(msg)
-                continue
-            batch.append(msg)
-            seen.add(msg.request_id)
-        if leftover is not None:
-            self._pending_messages.appendleft(leftover)
-        for msg in reversed(deferred):
-            self._pending_messages.appendleft(msg)
-        return batch
-
-    def _first_hop_group_size(self) -> int:
-        groups: dict[int, int] = {}
-        for request_id, state in self._stream_state_items():
-            if self._is_aborted(request_id) or not self._ready_for_causal_chunk(state):
-                continue
-            if state.token_offset != 0:
-                continue
-            key = self._first_hop_key(state)
-            groups[key] = groups.get(key, 0) + 1
-        return max(groups.values(), default=0)
-
-    def _has_joinable_first_hop_peer(self) -> bool:
-        ready_keys: set[int] = set()
-        for request_id, state in self._stream_state_items():
-            if self._is_aborted(request_id) or not self._ready_for_causal_chunk(state):
-                continue
-            if state.token_offset == 0:
-                ready_keys.add(self._first_hop_key(state))
-        if len(ready_keys) != 1:
-            return False
-        ready_key = next(iter(ready_keys))
-        for request_id, state in self._stream_state_items():
-            if self._is_aborted(request_id) or state.token_offset != 0:
-                continue
-            if self._ready_for_causal_chunk(state):
-                continue
-            if (
-                state.prompt_token is not None
-                and self._first_hop_key(state) != ready_key
-            ):
-                continue
-            return True
-        return False
-
-    def _ingest_peer_message(self, msg: IncomingMessage) -> bool:
-        if self._is_aborted(msg.request_id):
-            return True
-        if msg.type == "stream_chunk":
-            try:
-                item = self._validate_stream_chunk_item(msg.request_id, msg.data)
-                self._ingest_stream_item(msg.request_id, item)
-            except Exception as exc:
-                self._emit_error(msg.request_id, exc)
-                self.abort(msg.request_id)
-            return True
-        if msg.type == "new_request":
-            try:
-                if self.is_streaming_payload(msg.data):
-                    self._handle_streaming_new_request(msg.request_id, msg.data)
-                    return True
-            except Exception as exc:
-                self._emit_error(msg.request_id, exc)
-                self.abort(msg.request_id)
-                return True
-            self._pending_messages.appendleft(msg)
-            return False
-        self._pending_messages.appendleft(msg)
-        return False
-
-    def _wait_for_first_hop_peers(self) -> None:
-        if self._first_hop_group_size() >= 2:
-            return
-        if not self._has_joinable_first_hop_peer():
-            return
-        wait_s = max(float(self._first_hop_peer_wait_ms), 0.0) / 1000.0
-        deadline = time.monotonic() + wait_s
-        while True:
-            if self._first_hop_group_size() >= 2:
-                return
-            if not self._has_joinable_first_hop_peer():
-                return
-            remaining = deadline - time.monotonic()
-            try:
-                if self._pending_messages:
-                    msg = self._pending_messages.popleft()
-                elif remaining <= 0:
-                    msg = self.inbox.get_nowait()
-                else:
-                    msg = self.inbox.get(timeout=remaining)
-            except _queue_mod.Empty:
-                if remaining <= 0:
-                    return
-                continue
-            if not self._ingest_peer_message(msg):
-                return
+            return bool(self.select_step_participants())
 
     def _follow_up_key(self, state: _CosyVoice3StreamState) -> tuple[int, int]:
         # note (guozhihao-224): drop prompt_len so SeedTTS mixed prompts
         # with the same hop/offset share one causal Flow call.
         return int(state.hop_len), int(state.token_offset)
-
-    def _follow_up_group_size(self) -> int:
-        groups: dict[tuple[int, int], int] = {}
-        for request_id, state in self._stream_state_items():
-            if self._is_aborted(request_id) or not self._ready_for_causal_chunk(state):
-                continue
-            if state.token_offset == 0:
-                continue
-            key = self._follow_up_key(state)
-            groups[key] = groups.get(key, 0) + 1
-        return max(groups.values(), default=0)
-
-    def _has_joinable_follow_up_peer(self) -> bool:
-        ready_keys: set[tuple[int, int]] = set()
-        for request_id, state in self._stream_state_items():
-            if self._is_aborted(request_id) or not self._ready_for_causal_chunk(state):
-                continue
-            if state.token_offset == 0:
-                continue
-            ready_keys.add(self._follow_up_key(state))
-        if len(ready_keys) != 1:
-            return False
-        ready_key = next(iter(ready_keys))
-        for request_id, state in self._stream_state_items():
-            if self._is_aborted(request_id) or state.token_offset == 0:
-                continue
-            if self._ready_for_causal_chunk(state):
-                continue
-            if state.prompt_token is None:
-                continue
-            if self._follow_up_key(state) != ready_key:
-                continue
-            return True
-        return False
-
-    def _wait_for_follow_up_peers(self) -> None:
-        # note (guozhihao-224): same 30ms window as first hops; without it
-        # equal follow-ups arrive staggered and stay B=1 native.
-        if self._follow_up_group_size() >= 2:
-            return
-        if not self._has_joinable_follow_up_peer():
-            return
-        wait_s = max(float(self._first_hop_peer_wait_ms), 0.0) / 1000.0
-        deadline = time.monotonic() + wait_s
-        while True:
-            if self._follow_up_group_size() >= 2:
-                return
-            if not self._has_joinable_follow_up_peer():
-                return
-            remaining = deadline - time.monotonic()
-            try:
-                if self._pending_messages:
-                    msg = self._pending_messages.popleft()
-                elif remaining <= 0:
-                    msg = self.inbox.get_nowait()
-                else:
-                    msg = self.inbox.get(timeout=remaining)
-            except _queue_mod.Empty:
-                if remaining <= 0:
-                    return
-                continue
-            if not self._ingest_peer_message(msg):
-                return
-
-    def _ingest_ready_inbox(self) -> None:
-        """Pull already-queued peers between hops without blocking.
-
-        The base pump drains every ready hop before returning to the
-        serving loop. CosyVoice first hops must be able to join after a
-        follow-up step, otherwise a backlogged request monopolizes the GPU.
-        """
-        while True:
-            try:
-                # The collector may have pushed back an older
-                # chunk or done marker. Consume it before newer inbox messages.
-                if self._pending_messages:
-                    msg = self._pending_messages.popleft()
-                else:
-                    msg = self.inbox.get_nowait()
-            except _queue_mod.Empty:
-                return
-            if not self._ingest_peer_message(msg):
-                return
-
-    def _pump_one_step(self) -> list[str] | None:
-        participants = self.select_step_participants()
-        if not participants:
-            return []
-        plan = self.build_step_plan(participants)
-        try:
-            decoded = self.run_step(participants, plan)
-        except Exception as exc:
-            return list(self.on_step_failure(participants, exc))
-        for request_id, _ in participants:
-            waveform = decoded.get(request_id)
-            if waveform is not None and not self._is_aborted(request_id):
-                self._mark_stream_emitted(request_id)
-                self.outbox.put(self._stream_chunk_message(request_id, waveform))
-        return None
-
-    def _pump_streams(self) -> list[str]:
-        # note (guozhihao-224): one hop per step. Keep looping while work
-        # remains so a lone request is not stalled until the next inbox
-        # message, but ingest between steps so a new first hop can preempt
-        # a follow-up backlog. 30ms peer wait stays at pump start and when
-        # a singleton first hop appears after ingest.
-        first = True
-        while True:
-            if self._can_batch_stream_chunks:
-                if first:
-                    self._wait_for_first_hop_peers()
-                    if self._first_hop_group_size() == 0:
-                        self._wait_for_follow_up_peers()
-                else:
-                    self._ingest_ready_inbox()
-                    if self._first_hop_group_size() == 1:
-                        self._wait_for_first_hop_peers()
-            first = False
-            failed = self._pump_one_step()
-            if failed is not None:
-                return failed
 
     def _latch_prompts(
         self,
