@@ -99,6 +99,21 @@ def _decode_graph_frame_counts(
     return tuple(sorted(counts))
 
 
+def _window_frame_ladder(widest: int) -> tuple[int, ...]:
+    """Powers of two up to widest, the fewest widths that cover any count.
+
+    Consumed largest first, any frame count splits into at most count over
+    the widest width plus one window per smaller width, and the ladder
+    always holds width 1, so no count is left over.
+    """
+    ladder: list[int] = []
+    width = 1
+    while width <= widest:
+        ladder.append(width)
+        width *= 2
+    return tuple(ladder)
+
+
 @dataclass
 class _Qwen3TTSStreamState:
     code_chunks: list[torch.Tensor] = field(default_factory=list)
@@ -531,6 +546,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         incremental_codec_cuda_graph: bool = False,
         incremental_codec_compile: bool = False,
         incremental_codec_cuda_graph_cold_frames: Sequence[int] | None = None,
+        incremental_codec_cuda_graph_window_frames: Sequence[int] | None = None,
         incremental_codec_cuda_graph_min_free_gb: float = 3.0,
         suppress_bootstrap_silence: bool = True,
         suppress_bootstrap_max_streams: int = 24,
@@ -616,6 +632,19 @@ class Qwen3TTSStreamingVocoderScheduler(
         ):
             raise ValueError(
                 "incremental_codec_cuda_graph_cold_frames must be positive"
+            )
+        if incremental_codec_cuda_graph_window_frames is None:
+            # note(ratish): the widest decode this scheduler already replays
+            # through a graph is a left context plus one steady chunk, so the
+            # window ladder stops there rather than at a width of its own.
+            incremental_codec_cuda_graph_window_frames = _window_frame_ladder(
+                int(stream_left_context_frames) + int(stream_followup_stride)
+            )
+        if any(
+            int(frames) <= 0 for frames in incremental_codec_cuda_graph_window_frames
+        ):
+            raise ValueError(
+                "incremental_codec_cuda_graph_window_frames must be positive"
             )
         self._tokenizer = tokenizer
         self._device = torch.device(device)
@@ -758,6 +787,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         )
         (
             self._initial_incremental_decode_graphs,
+            self._initial_window_decode_graphs,
             self._followup_incremental_graph_holders,
         ) = self._build_incremental_graph_runners(
             worker_count=worker_count,
@@ -770,7 +800,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             # exactly the first chunk, plus one frame when bootstrap silence
             # suppression bumps it, so those two widths are the COLD graphs a
             # CustomVoice deployment replays. Reference-prefixed bootstraps are
-            # ragged and stay eager whatever is captured.
+            # ragged and run as a sequence of the window widths instead.
             cold_frames=(
                 incremental_codec_cuda_graph_cold_frames
                 if incremental_codec_cuda_graph_cold_frames is not None
@@ -780,9 +810,14 @@ class Qwen3TTSStreamingVocoderScheduler(
                     else (int(initial_chunk_frames),)
                 )
             ),
+            window_frames=tuple(
+                int(frames) for frames in incremental_codec_cuda_graph_window_frames
+            ),
             min_free_gb=incremental_codec_cuda_graph_min_free_gb,
         )
         self._codec_fallback_count = 0
+        self._codec_windowed_rows = 0
+        self._codec_window_replays = 0
         self._codec_stats_last_log_s = time.monotonic()
         self._codec_lock = threading.Lock()
         # Note (Qihao Liu): in-flight holds slots handed to a launch that has
@@ -903,13 +938,15 @@ class Qwen3TTSStreamingVocoderScheduler(
         enabled: bool,
         compile_steady: bool,
         cold_frames: Sequence[int],
+        window_frames: Sequence[int],
         min_free_gb: float,
     ) -> tuple[
+        Qwen3TTSIncrementalCodecCudaGraphRunner | None,
         Qwen3TTSIncrementalCodecCudaGraphRunner | None,
         tuple[Qwen3TTSIncrementalCodecCudaGraphRunner, ...],
     ]:
         if self._incremental_decoder is None:
-            return None, ()
+            return None, None, ()
 
         graph_enabled = bool(
             enabled and self._async_decode and not self._deterministic_inference
@@ -936,6 +973,25 @@ class Qwen3TTSStreamingVocoderScheduler(
             arena=self._codec_arena,
             stream_priority=graph_priority,
         )
+        # note(ratish): a reference prefixed bootstrap is wider than any cold
+        # shape; these widths let the initial worker replay it in pieces.
+        window = (
+            Qwen3TTSIncrementalCodecCudaGraphRunner(
+                self._incremental_decoder,
+                device=self._device,
+                dtype=dtype,
+                num_quantizers=num_quantizers,
+                mode="window",
+                fresh_frames=tuple(sorted({int(frames) for frames in window_frames})),
+                batch_sizes=graph_batch_sizes,
+                min_free_gb=min_free_gb,
+                enabled=graph_enabled,
+                arena=self._codec_arena,
+                stream_priority=graph_priority,
+            )
+            if window_frames
+            else None
+        )
         # note (luojiaxuan): arrival jitter and terminal chunks hand the WARM
         # path every fresh-frame count from 1 up to the steady stride, not only
         # the ramp steps, so capture the whole span like the legacy holders do.
@@ -950,9 +1006,10 @@ class Qwen3TTSStreamingVocoderScheduler(
         if enabled:
             logger.info(
                 "Qwen3-TTS incremental Codec graph shapes: "
-                "cold_frames=%s cold_batch_sizes=%s "
+                "cold_frames=%s window_frames=%s cold_batch_sizes=%s "
                 "warm_frames=%s warm_batch_sizes=%s",
                 tuple(sorted({int(frames) for frames in cold_frames})),
+                tuple(sorted({int(frames) for frames in window_frames})),
                 graph_batch_sizes,
                 warm_fresh_frames,
                 graph_batch_sizes,
@@ -979,7 +1036,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             )
             for _ in range(worker_count)
         )
-        return initial, followups
+        return initial, window, followups
 
     def codec_state_stats(self) -> dict[str, Any]:
         """Snapshot of incremental Codec state usage."""
@@ -988,10 +1045,20 @@ class Qwen3TTSStreamingVocoderScheduler(
         stats = self._codec_arena.describe()
         stats["enabled"] = True
         stats["left_context_fallbacks"] = self._codec_fallback_count
+        with self._codec_lock:
+            stats["windowed_decodes"] = {
+                "rows": self._codec_windowed_rows,
+                "replays": self._codec_window_replays,
+            }
         stats["cuda_graphs"] = {
             "cold": (
                 self._initial_incremental_decode_graphs.stats()
                 if self._initial_incremental_decode_graphs is not None
+                else {"enabled": False}
+            ),
+            "window": (
+                self._initial_window_decode_graphs.stats()
+                if self._initial_window_decode_graphs is not None
                 else {"enabled": False}
             ),
             "warm": [
@@ -1037,6 +1104,8 @@ class Qwen3TTSStreamingVocoderScheduler(
             holder.capture()
         if self._initial_incremental_decode_graphs is not None:
             self._initial_incremental_decode_graphs.capture()
+        if self._initial_window_decode_graphs is not None:
+            self._initial_window_decode_graphs.capture()
 
     def on_serving_start(self) -> None:
         if not self._async_decode:

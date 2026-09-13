@@ -2048,6 +2048,7 @@ def test_qwen3_tts_vocoder_factory_forwards_incremental_graph_config(
         codec_state_slots=12,
         incremental_codec_cuda_graph=True,
         incremental_codec_cuda_graph_cold_frames=(24, 32),
+        incremental_codec_cuda_graph_window_frames=(8, 16),
         incremental_codec_cuda_graph_min_free_gb=1.5,
     )
 
@@ -2056,6 +2057,7 @@ def test_qwen3_tts_vocoder_factory_forwards_incremental_graph_config(
     assert captured["codec_state_slots"] == 12
     assert captured["incremental_codec_cuda_graph"] is True
     assert captured["incremental_codec_cuda_graph_cold_frames"] == (24, 32)
+    assert captured["incremental_codec_cuda_graph_window_frames"] == (8, 16)
     assert captured["incremental_codec_cuda_graph_min_free_gb"] == 1.5
     assert captured["warmed"] is True
 
@@ -2194,6 +2196,83 @@ def test_qwen3_tts_stateful_codec_graph_shapes_follow_chunk_ramp(
     assert scheduler._followup_incremental_graph_holders[0]._fresh_frames == tuple(
         range(1, 9)
     )
+    assert scheduler._initial_incremental_decode_graphs._fresh_frames == (2, 3)
+    assert scheduler._initial_window_decode_graphs._fresh_frames == (1, 2, 4, 8)
+    assert (
+        scheduler.codec_state_stats()["cuda_graphs"]["window"]["binding"]["mode"]
+        == "window"
+    )
+
+
+@pytest.mark.parametrize(
+    ("left_context", "followup_stride", "expected"),
+    [
+        (16, 8, (1, 2, 4, 8, 16)),
+        (16, 16, (1, 2, 4, 8, 16, 32)),
+        (0, 1, (1,)),
+    ],
+)
+def test_qwen3_tts_window_ladder_follows_the_decode_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    left_context: int,
+    followup_stride: int,
+    expected: tuple[int, ...],
+) -> None:
+    scheduler, _ = _stateful_qwen3_tts_scheduler(
+        monkeypatch,
+        stream_left_context_frames=left_context,
+        stream_followup_stride=followup_stride,
+    )
+
+    assert scheduler._initial_window_decode_graphs._fresh_frames == expected
+
+
+def test_qwen3_tts_explicit_window_frames_replace_the_ladder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        qwen3_streaming_vocoder,
+        "Qwen3TTSIncrementalDecoder",
+        _FakeIncrementalQwen3TTSDecoder,
+    )
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        async_decode=True,
+        enable_stateful_codec_decoder=True,
+        incremental_codec_cuda_graph_window_frames=(12, 3),
+    )
+
+    assert scheduler._initial_window_decode_graphs._fresh_frames == (3, 12)
+
+
+def test_qwen3_tts_empty_window_frames_disable_the_window_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        qwen3_streaming_vocoder,
+        "Qwen3TTSIncrementalDecoder",
+        _FakeIncrementalQwen3TTSDecoder,
+    )
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        async_decode=True,
+        enable_stateful_codec_decoder=True,
+        incremental_codec_cuda_graph_window_frames=(),
+    )
+
+    assert scheduler._initial_window_decode_graphs is None
+    assert scheduler.codec_state_stats()["cuda_graphs"]["window"] == {"enabled": False}
+
+
+def test_qwen3_tts_window_frames_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="window_frames must be positive"):
+        Qwen3TTSStreamingVocoderScheduler(
+            _FakeQwen3TTSTokenizer(),
+            device="cpu",
+            incremental_codec_cuda_graph_window_frames=(4, 0),
+        )
 
 
 def test_qwen3_tts_stateful_codec_uses_reference_once_then_fresh_frames(
