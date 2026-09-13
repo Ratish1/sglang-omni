@@ -1,4 +1,7 @@
-# PR draft: [Qwen3-TTS] Replay reference prefixed bootstraps through captured window graphs
+# PR #2151: [Qwen3-TTS] Replay reference prefixed bootstraps through captured window graphs
+
+Opened 2026-09-13 from f73586369. The dmon SM row below is not in the PR; the Nsight GR
+active and SMs active row from the default launch pair replaces it once measured.
 
 Branch `perf/qwen3-tts-bootstrap-graphs` at f73586369 on upstream main 3060470a8.
 Evidence: doc 36 (session 2 archive `bw-session-results-no-wavs.tar.gz`), doc 34 (bench).

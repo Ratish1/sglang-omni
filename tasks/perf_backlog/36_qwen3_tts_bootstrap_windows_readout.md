@@ -109,8 +109,10 @@ more than the 28 eager captures cost.
 
 ## 7. Next
 
-1. Open the precompile PR (b2c9abe13) and the window PR (f73586369) with the step 3 pair
-   as the census and the step 2 pair as the early ids evidence.
+1. One PR, #2151, from f73586369 (it contains the precompile fix), the step 3 pair as
+   the census. Pending on it: Nsight GR active and SMs active on the default launch pair
+   (main against the branch, no patch, c16, the step 4 protocol), read with
+   `scripts/nsys_gpu_metrics.py`, to replace the dmon SM row.
 2. Doc 32 item 3, the preprocessing segment: the reference encoder and preprocessing
    launches, 186 to 210 thousand per 20 s on the preprocessing thread, are now the largest
    eager launcher in the process and the remaining gap to the #2123 gate.
