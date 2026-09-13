@@ -10,7 +10,7 @@ Two branches on upstream main 3060470a8.
   and the grad mode check (the runner is the only caller and runs under inference mode).
   The ceiling of 8 traced shapes per function is not raised: the warm buckets trace 4
   and no knob adds a compiled shape.
-- `perf/qwen3-tts-bootstrap-graphs` at 5eb4e121e: the runner's window
+- `perf/qwen3-tts-bootstrap-graphs` at f73586369: the runner's window
   schedule and bucket queries (7e5e2aa48), the window runner and its knob (cb9cf8f46),
   the windowed decode path (1453ef538), no default until measured (fd54363d6), the
   precompile fix cherry-picked (c2212e459, 50830c2c3), the first bucket and compile
@@ -53,10 +53,10 @@ argument `incremental_codec_cuda_graph_window_frames`; an empty list turns windo
 off. The codec state line in the serve log carries a `window` runner entry next to
 `cold` and `warm` with its captured keys, footprint, `replays` and `fallback_counts`.
 
-## Step 1, unit tests on the box, full files, on 5eb4e121e
+## Step 1, unit tests on the box, full files, on f73586369
 
 ```bash
-git fetch origin perf/qwen3-tts-bootstrap-graphs && git worktree add tmp/bw 5eb4e121e
+git fetch origin perf/qwen3-tts-bootstrap-graphs && git worktree add tmp/bw f73586369
 cd tmp/bw
 python -m pytest tests/unit_test/qwen3_tts/test_incremental_codec.py -q
 python -m pytest tests/unit_test/qwen3_tts/test_incremental_codec_cuda_graph.py -q
@@ -69,7 +69,7 @@ boot. Archive the output. Every test on both branches is unrun until this step.
 ## Step 2, the pair that decides #2123 (2 boots)
 
 A: upstream main 3060470a8 plus `tasks/qwen3_tts_e4_investigation_20260912/early_ids.patch`.
-B: 5eb4e121e plus the same patch (it touches model_runner.py only). Streaming c16.
+B: f73586369 plus the same patch (it touches model_runner.py only). Streaming c16.
 
 Reads per arm from `first_chunk_anatomy.py` on the pass 2 events plus the client
 summary: TTFC mean and p99, req/s, inter chunk, preprocessing p50, the first frame to
@@ -95,7 +95,7 @@ between early ids and main, not within 10 ms of main; that gate needs item 3 as 
 
 ## Step 3, the pair for the default launch (2 boots)
 
-A: upstream main 3060470a8. B: 5eb4e121e. Same reads. Expected on B: the bootstrap
+A: upstream main 3060470a8. B: f73586369. Same reads. Expected on B: the bootstrap
 segment at ahead 0 from about 30 ms to 10 to 27 ms, req/s not below A.
 
 ## Step 4, the origin check, Nsight on step 2's two arms (1 window each)
