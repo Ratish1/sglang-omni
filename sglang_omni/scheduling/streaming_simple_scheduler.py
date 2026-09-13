@@ -129,6 +129,13 @@ class StreamingSimpleScheduler:
     def clear_stream_state(self, request_id: str) -> None:
         del request_id
 
+    def _has_ready_work(self) -> bool:
+        """True when a compute step can run on already-ingested state."""
+        return False
+
+    def _run_ready_step(self) -> None:
+        """One compute step on already-ingested state; runs off the inbox."""
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -138,9 +145,18 @@ class StreamingSimpleScheduler:
         loop = asyncio.new_event_loop()
         try:
             while self._running:
-                msg = self._next_message()
-                if msg is None:
-                    continue
+                if self._has_ready_work():
+                    # note(ratish): every queued message lands in state before a
+                    # step runs, so a step never decides on a stale view of the streams.
+                    try:
+                        msg = self._get_batch_message()
+                    except _queue_mod.Empty:
+                        self._run_ready_step()
+                        continue
+                else:
+                    msg = self._next_message()
+                    if msg is None:
+                        continue
                 if self._is_aborted(msg.request_id):
                     continue
                 try:
