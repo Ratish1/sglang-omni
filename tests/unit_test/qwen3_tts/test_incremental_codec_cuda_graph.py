@@ -10,6 +10,7 @@ from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalCo
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     IncrementalCodecGraphKey,
     Qwen3TTSIncrementalCodecCudaGraphRunner,
+    plan_decode_windows,
 )
 from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     Qwen3TTSStreamingVocoderScheduler,
@@ -104,6 +105,7 @@ def _async_incremental_scheduler(
     scheduler._decode_stream = torch.cuda.Stream(device=device)
     scheduler._followup_decode_stream = torch.cuda.Stream(device=device)
     scheduler._followup_decode_streams = (scheduler._followup_decode_stream,)
+    scheduler._initial_window_decode_graphs = None
     scheduler._worker_ctx = SimpleNamespace(graphs=None)
     return scheduler
 
@@ -199,6 +201,59 @@ def test_incremental_codec_graph_misses_uncaptured_frame_count() -> None:
     assert runner.stats()["runtime"]["fallback_counts"] == {
         "uncaptured_fresh_frames": 1
     }
+
+
+@pytest.mark.parametrize(
+    ("total", "widths", "expected"),
+    [
+        (7, (1, 2, 4), (4, 2, 1)),
+        (8, (1, 2, 4), (4, 4)),
+        (4, (1, 2, 4), (4,)),
+        (37, (1, 2, 4, 8, 16, 32), (32, 4, 1)),
+        (5, (2, 4), None),
+        (3, (4,), None),
+        (0, (1, 2), None),
+    ],
+)
+def test_plan_decode_windows_covers_the_count_largest_first(
+    total: int, widths: tuple[int, ...], expected: tuple[int, ...] | None
+) -> None:
+    assert plan_decode_windows(total, widths) == expected
+
+
+def test_incremental_codec_graph_accepts_the_window_mode() -> None:
+    runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
+        SimpleNamespace(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        num_quantizers=2,
+        mode="window",
+        fresh_frames=(8, 2, 4),
+        enabled=False,
+        arena=_FakeArena(),
+    )
+
+    assert runner.stats()["binding"]["mode"] == "window"
+    assert runner.stats()["graph_contract"]["fresh_frames"] == [2, 4, 8]
+
+
+def test_incremental_codec_graph_plans_windows_from_captured_keys_only() -> None:
+    runner = _runner(batch_sizes=(1, 4))
+    runner._graphs = {
+        IncrementalCodecGraphKey(8, 1): _entry(1),
+        IncrementalCodecGraphKey(8, 4): _entry(4),
+        IncrementalCodecGraphKey(4, 1): _entry(1),
+        IncrementalCodecGraphKey(4, 4): _entry(4),
+    }
+
+    assert runner.plan_windows(20) == (8, 8, 4)
+    assert runner.plan_windows(8) == (8,)
+    assert runner.plan_windows(6) is None
+    assert runner.largest_batch_bucket() == 4
+
+    runner._enabled = False
+    assert runner.plan_windows(8) is None
+    assert runner.largest_batch_bucket() == 0
 
 
 def test_incremental_codec_graph_replay_failure_disables_runner(
@@ -331,6 +386,9 @@ def test_incremental_codec_launch_uses_graph_state_and_waveform() -> None:
     class GraphRunner:
         calls = 0
 
+        def available_batch_sizes(self, fresh_frames):
+            return (1,) if fresh_frames == 2 else ()
+
         def decode_slots(self, codes, slots):
             self.calls += 1
             assert codes.shape == (1, 2, 2)
@@ -392,6 +450,9 @@ def test_incremental_codec_launch_falls_back_to_eager_on_graph_miss() -> None:
 
     class GraphRunner:
         calls = 0
+
+        def available_batch_sizes(self, fresh_frames):
+            return ()
 
         def decode_slots(self, codes, slots):
             self.calls += 1

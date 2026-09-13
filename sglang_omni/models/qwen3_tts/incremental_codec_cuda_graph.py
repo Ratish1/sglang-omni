@@ -51,6 +51,27 @@ class _CaptureFailure(RuntimeError):
     pass
 
 
+def plan_decode_windows(
+    total_frames: int, widths: Sequence[int]
+) -> tuple[int, ...] | None:
+    """Split a frame count into captured widths, largest first.
+
+    Returns None when the widths cannot cover the count exactly, which only
+    happens when the smallest width does not divide the remainder.
+    """
+    remaining = int(total_frames)
+    if remaining <= 0:
+        return None
+    windows: list[int] = []
+    for width in sorted({int(w) for w in widths if int(w) > 0}, reverse=True):
+        while remaining >= width:
+            windows.append(width)
+            remaining -= width
+    if remaining:
+        return None
+    return tuple(windows)
+
+
 class Qwen3TTSIncrementalCodecCudaGraphRunner:
     """Fixed-shape CUDA Graph runner for incremental Codec decoding.
 
@@ -61,7 +82,9 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
 
     COLD and WARM use separate instances because the initial and follow-up
     workers run on different CUDA streams; each mutable buffer set must be
-    replayed serially by only one worker.
+    replayed serially by only one worker. WINDOW is a second instance on the
+    initial worker's stream holding the widths a wider decode is split into,
+    so a failed capture there leaves the COLD shapes in place.
     """
 
     _WARMUP_ITERATIONS = 3
@@ -96,8 +119,10 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         self._dtype = dtype
         self._num_quantizers = int(num_quantizers)
         self._mode = str(mode).strip().lower()
-        if self._mode not in {"cold", "warm"}:
-            raise ValueError("incremental Codec graph mode must be 'cold' or 'warm'")
+        if self._mode not in {"cold", "warm", "window"}:
+            raise ValueError(
+                "incremental Codec graph mode must be 'cold', 'warm' or 'window'"
+            )
         self._fresh_frames = tuple(
             sorted({int(frames) for frames in fresh_frames if int(frames) > 0})
         )
@@ -435,6 +460,29 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             )
         )
 
+    def plan_windows(self, total_frames: int) -> tuple[int, ...] | None:
+        """Captured widths that consume total_frames in sequence, largest first.
+
+        None while disabled or when the captured widths cannot cover the
+        count exactly.
+        """
+        if not self._enabled:
+            return None
+        with self._graphs_lock:
+            widths = {key.fresh_frames for key in self._graphs}
+        return plan_decode_windows(total_frames, widths)
+
+    def largest_batch_bucket(self) -> int:
+        """The widest cohort one replay takes, 0 while disabled.
+
+        Capture publishes every configured key or none, so the bucket holds
+        for every captured width.
+        """
+        if not self._enabled:
+            return 0
+        with self._graphs_lock:
+            return max((key.batch_bucket for key in self._graphs), default=0)
+
     def _scratch_index(self, bucket: int) -> torch.Tensor:
         return torch.full(
             (int(bucket),),
@@ -575,4 +623,5 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
 __all__ = [
     "IncrementalCodecGraphKey",
     "Qwen3TTSIncrementalCodecCudaGraphRunner",
+    "plan_decode_windows",
 ]
