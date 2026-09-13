@@ -230,7 +230,7 @@ def main():
         "--reference", choices=("audio_text", "audio"), default="audio_text"
     )
     parser.add_argument("--concurrency", type=int, default=16)
-    parser.add_argument("--warmup", type=int, default=32)
+    parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--samples", type=int, help="Omit for the full English split")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument(
