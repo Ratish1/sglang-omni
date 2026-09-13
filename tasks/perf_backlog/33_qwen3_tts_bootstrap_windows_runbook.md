@@ -1,7 +1,7 @@
 # 33. Runbook: the vocoder bootstrap through captured graphs (doc 32 item 1)
 
-Status 2026-09-13: session 1 is void, every arm imported main through the console script
-(doc 35). Rerun with the boot command and import gate below.
+Status 2026-09-13: session 1 void (doc 35, console script imported main). Session 2 run
+with the import gate, readout in doc 36: the slice holds in both launches, PRs next.
 
 Two branches on upstream main 3060470a8.
 
