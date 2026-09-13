@@ -1,8 +1,35 @@
 # H100 capture and evaluation runbook
 
-These tools are an initial diagnostic implementation with static checks only. Run them in the H100 serving environment. No local pytest or profiling unit tests are required. Use branch `analysis/cosyvoice-utilization-20260912` and the same Python executable/package paths as the server.
+These tools are an initial diagnostic implementation with static checks only. Run them in the H100 serving environment. No local pytest or profiling unit tests are required. These scripts live on branch `analysis/cosyvoice-utilization-20260912` and run with the same Python executable and package paths as the server; the servers themselves boot from the arm worktrees of section 0.
 
-**Scope: English only (`en`), at c1 and c16, for streaming and buffered output.** The current task is baseline collection and small NSYS captures. Full performance A/B begins after an optimization candidate exists; a small annotation-off/on check only qualifies diagnostic overhead.
+**Scope: English only (`en`), at c1 and c16, for streaming and buffered output.** The current task is baseline collection, the B stream c16 pair of section 2, and small NSYS captures. A small annotation-off/on check only qualifies diagnostic overhead.
+
+## 0. Session protocol for an A/B pair
+
+Arms of the current pair: A is upstream `main` at `51e2f7ec2`, which is `f58228dfb` plus the Flow graph fix of #2147 and nothing else (`git log f58228dfb..51e2f7ec2` is that one commit); B is the PR branch head `a8700d833`. Nsight runs only on `622bcd198`, the same tree plus the pipeline NVTX instrumentation, and never on a measured boot.
+
+One server per arm, from that arm's worktree, started with `python -m sglang_omni.cli serve` and nothing but `CUDA_VISIBLE_DEVICES` in front of it. Never the `sgl-omni` console script: it imports the venv's editable install, which is the main checkout, from any directory. Every other environment variable on a measured server command, `SGLANG_OMNI_STRICT_PORT` in section 1 included, is a protocol change and is recorded in the readout; `SGLANG_OMNI_PIPELINE_NVTX` stays off, which is its default, on every measured boot. Before each boot, from the arm's worktree:
+
+```bash
+BOOT=artifacts/cosyvoice/b-stream-en-c16
+mkdir -p "$BOOT"
+git rev-parse HEAD > "$BOOT/head.txt"
+python -c "import sglang_omni; print(sglang_omni.__file__)" > "$BOOT/import_path.txt"
+nvidia-smi > "$BOOT/gpus_before.txt"
+nvidia-smi --query-compute-apps=gpu_uuid,pid,used_gpu_memory --format=csv >> "$BOOT/gpus_before.txt"
+nvidia-smi dmon -i 0 -s pucv -d 1 > "$BOOT/dmon.log" &
+```
+
+The path in `import_path.txt` must be under that worktree or the boot is void. The other GPUs are recorded, not required to be idle: a pair is valid when both arms ran under the same load, so the readout quotes the paired delta next to the census.
+
+Gate the B boot on a log line only `a8700d833` prints. Its one new logger call is `Fun-CosyVoice3 causal Flow batch size=%d hop=%d token_offset=%d` (`sglang_omni/models/fun_cosyvoice3/streaming_vocoder.py:398` at `a8700d833`); at `51e2f7ec2` the same site prints `first-hop Flow batch size=` or `follow-up Flow batch size=` (`streaming_vocoder.py:663` and `:670`) and never the causal line. After the first traffic reaches the vocoder:
+
+```bash
+grep -c "Fun-CosyVoice3 causal Flow batch size=" "$BOOT/serve.log"     # B nonzero, A zero
+grep -c "Fun-CosyVoice3 follow-up Flow batch size=" "$BOOT/serve.log"  # A nonzero, B zero
+```
+
+Two passes per arm at every point, pass 1 unprofiled and pass 2 with the event recorder. Both arms of a pair use the same warmup and no seed. Expected values are written into this runbook before the run, each with the file and line it comes from; the readout states the verdict first and the provenance second.
 
 ## 1. Establish identity and a profiler-off baseline
 
@@ -48,13 +75,50 @@ done
 
 **Omitting `--samples` and using offset zero selects the full English split.** Default dataset revision is `27f4c1adee83b5b29b7c4b375f6b976324bda308`; source order is preserved. `inputs.json` hashes each selected target/reference text and reference-audio bytes; `experiment.json` records the ordered identity, complete client configuration and run status. Native outputs are in `measured/`: `speed_results.json`, `generated.json`, `results.csv`, and all WAVs. Fresh output paths are mandatory. The model requires reference audio; `--reference audio` removes only its transcript, while the default uses audio and text.
 
-Default warmup is 32 copies of the first sample. It is excluded from native measured wall time. Preserve this cache policy across A/B; a warm-cache repeat and a fresh-server run answer different questions. Both concurrency 1 and 16 use the full English split for the baseline and each later PR A/B. Keep their results separate; c16 additionally carries the SM target. Repeat the same run order and cache policy for each variant, or restart consistently between matrix cells.
+The runner's default warmup is 1 copy of the first sample and no seed is set, the standing protocol since 2026-09-09 and the playbook's client read. The warmup is excluded from native measured wall time. Both arms of a pair must use the same warmup: arm A's recorded corpus run used warmup 1 ([findings](../FINDINGS_20260913.md), item 4), no file in this task directory records a run at warmup 32, and the runner defaulted to 32 until this change, so any earlier run that omitted `--warmup` is not comparable with these. A warm-cache repeat and a fresh-server run answer different questions; preserve the cache policy across A/B. Both concurrency 1 and 16 use the full English split for the baseline and each later PR A/B. Keep their results separate; c16 additionally carries the SM target. Repeat the same run order and cache policy for each variant, or restart consistently between matrix cells.
 
 Record any optional `--generation-json params.json` used for the baseline and reuse it unchanged for a future candidate. For example `{"seed":1234,"max_new_tokens":2048}`. An explicit seed selects a particular upstream deterministic sampling path; do not add one to only one side or assume it reproduces the team's unseeded baseline. The harness preserves benchmark max-new-token default 2048, which differs from an API request that omits it and lets Cosy derive its length bound. Record this distinction.
 
-### Later: compare an optimization candidate
+### The B stream c16 rerun
 
-Skip this subsection during initial baseline collection. Once an optimization candidate is implemented, restart with that one change and fresh matching state, set `COSY_VARIANT=candidate`, and repeat the complete c1/c16 matrix. Compare each matching mode/concurrency separately, for example:
+The candidate exists, so this is the pair that is owed: A `51e2f7ec2`, B `a8700d833`, streaming, English, full split, c16, warmup 1, no seed, two passes per arm, both arms in one session on the same GPU. Pass 1 is the unprofiled read:
+
+```bash
+python "$DIAG/run_seedtts.py" --mode streaming --lang en --concurrency 16 \
+  --output "$BOOT/pass1" || exit 1
+```
+
+Pass 2 repeats it with the request event recorder on. Start the recorder once the pass is running and stop it after about 200 completions, so the window is one steady-state cohort rather than ramp-up and drain:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/start_profile -H 'Content-Type: application/json' \
+  -d "{\"run_id\":\"pass2\",\"event_dir\":\"$BOOT/pass2/events\",\"enable_torch\":false}"
+# after about 200 completions
+curl -s -X POST http://127.0.0.1:8000/stop_profile -H 'Content-Type: application/json' \
+  -d '{"run_id":"pass2"}'
+```
+
+`enable_torch` false records the JSONL milestones without paying for a kernel trace; the HTTP surface and the file layout `<event_dir>/events_<stage>_<pid>.jsonl` are in `docs/developer_reference/profiler.md`. Read the events with the shipped views and with the anatomy script from the Qwen3-TTS backlog, fetched from its commit rather than copied here:
+
+```bash
+python -m sglang_omni.profiler "$BOOT/pass2/events" --format table
+git show fb590a2c3:tasks/perf_backlog/scripts/first_chunk_anatomy.py > /tmp/first_chunk_anatomy.py
+python /tmp/first_chunk_anatomy.py "B=$BOOT/pass2/events:$BOOT/pass2/measured/speed_results.json"
+```
+
+The anatomy script's `CHAIN` is a list of stage and event-name pairs, and the recorder is generic. CosyVoice's stage names are the same three the script expects, `preprocessing`, `tts_engine` and `vocoder` (`sglang_omni/models/fun_cosyvoice3/config.py:107-132` at `622bcd198`), and first audio is the vocoder's `stage_stream_chunk_sent`, which is what the script already reads. CosyVoice emits no recorder events of its own at `622bcd198` (no `emit`, `emit_model_path` or `get_recorder` call under `sglang_omni/models/fun_cosyvoice3`), so only the generic stage and `OmniScheduler` events appear; on the first event directory check which `CHAIN` segments come back empty and read the rest.
+
+Reads per arm and pass, from `measured/speed_results.json` and the dmon log: failures, requests per second, audio seconds per second, first audio (`audio_ttfp_s`) mean and p95, inter-chunk p99, C50, WER, and the dmon utilization mean during traffic. Expected values for the B stream c16 rerun, written before the run, every number with its source:
+
+| arm | failures | WER | first audio | C50 | req/s | audio s/s |
+|---|---|---|---|---|---|---|
+| A, `51e2f7ec2` | 0 (findings item 5) | not measured | 11.1 s mean, 16.3 s p95 (item 4) | 98.7 with 14 underruns (item 4) | 1.37 (item 4) | 6.9 (item 4) |
+| previous B, `691c18371` | 0 (slice 02 line 14) | 1.6 percent (line 14) | 3.35 s (line 15) | 9 (line 15) | not measured | 9.5 (line 14) |
+| PR #2086 | not measured | not measured | not measured | not measured | not measured | not measured |
+
+Items 4 and 5 are in [the findings](../FINDINGS_20260913.md); the slice 02 lines are in [the vocoder step cost slice](../slices/02_vocoder_step_cost.md). Three cautions on that table. The previous B row is the B side of the earlier slice 01 pair, whose A was the run on `645b472cd` with 22 to 23 timeouts, 7.4 audio s/s, C50 80 and 6.8 percent WER (slice 02 lines 13 to 15, findings item 5), not the A row above, so the two rows are not a pair and only the columns within a row are safe to read together. Slice 02 does not name the head it calls B; `691c18371` is the merge of upstream main into the branch. Nobody measured PR #2086's throughput and its reported speed decline has no numbers (findings item 8), so every cell in that row stays empty until a run fills it.
+
+The buffered cells and c1 are collected the same way when the matrix is repeated. Compare each matching mode and concurrency separately, for example:
 
 ```bash
 python "$DIAG/compare_ab.py" \
@@ -75,12 +139,12 @@ nsys start --help
 nsys start --gpu-metrics-devices=help
 ```
 
-The Python `nvtx` package must exist in the server environment for opt-in annotations. Check its installed version in the collector. The annotations use documented `nvtx.annotate` and `nvtx.mark`; no Torch profiling context is started. Use a **fresh named session** and launch the server before its child workers exist:
+The Python `nvtx` package must exist in the server environment for opt-in annotations. Check its installed version in the collector. The annotations use documented `nvtx.annotate` and `nvtx.mark`; no Torch profiling context is started. The capture runs from the `622bcd198` worktree, which is `a8700d833` plus those annotations, and never during a measured pass. Use a **fresh named session** and launch the server before its child workers exist:
 
 ```bash
 SGLANG_OMNI_PIPELINE_NVTX=1 SGLANG_OMNI_STRICT_PORT=1 \
 nsys launch --session-new=cosyStream01 \
-  --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=process-tree \
+  --trace=cuda,nvtx,osrt,python-gil --sample=none --cpuctxsw=process-tree \
   --cuda-graph-trace=node --trace-fork-before-exec=true \
   python -m sglang_omni.cli serve \
   --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --port 8000 \
@@ -99,7 +163,7 @@ python "$DIAG/run_seedtts.py" --mode streaming --lang en \
   --output artifacts/cosyvoice/profile-stream-en-c16
 ```
 
-The runner loads/stages/hashes the selected samples, checks health, sends a separate pre-capture warmup cohort of 32 copies of sample zero, starts only the named NSYS session, runs the native benchmark with internal warmup zero, then stops that same session in `finally`. `nsys start` receives the absolute output prefix and optional GPU metric device list; those options belong to `start`, not `launch`. Exact control commands/stdout/stderr are saved. The measured client opens a new HTTP session after pre-warm. Collection includes a small amount of client launch/result-writing slack; choose the actual workload interval below. An externally killed harness cannot guarantee cleanup—use the named `nsys stop --session=cosyStream01` if necessary.
+The runner loads/stages/hashes the selected samples, checks health, sends a separate pre-capture warmup cohort of `--warmup` copies of sample zero, starts only the named NSYS session, runs the native benchmark with internal warmup zero, then stops that same session in `finally`. The 32 above is deliberate and is not the benchmark warmup of section 2: it is the preconditioning pass the capture window needs, and with `--session` the measured benchmark runs at internal warmup zero regardless. `nsys start` receives the absolute output prefix and optional GPU metric device list; those options belong to `start`, not `launch`. The runner passes `--gpu-metrics-devices` only (`run_seedtts.py:56-62`), while the Qwen3-TTS layer-4 protocol also sets `--gpu-metrics-frequency=20000`; adding that flag to the runner is an open item, not done here. Exact control commands/stdout/stderr are saved. The measured client opens a new HTTP session after pre-warm. Collection includes a small amount of client launch/result-writing slack; choose the actual workload interval below. An externally killed harness cannot guarantee cleanup, so use the named `nsys stop --session=cosyStream01` if necessary.
 
 Use another fresh output/session for buffered c16 and c1. Select an offset covering longer prompts/outputs when the first cohort is unrepresentative, and add a cold unique-reference cohort. Thirty-two requests at c16 has ramp-up/drain; label it a **finite cohort**, not automatically steady state. A longer small cohort can supply an interior interval after verifying active request count. Full corpus profiling is intentionally not the acceptance benchmark.
 
@@ -129,6 +193,22 @@ The analyzer provides per-device compute union, summed kernel time, compute/copy
 
 Request markers share the Nsight clock. `input_identity` hashes target text to help match `inputs.json`; duplicate target texts remain ambiguous and must not be assigned by arrival order. Batched Flow time belongs to a group, not independently to each member. `request_ids` and nested scopes preserve group membership; buffered grouping indices and lengths must be inspected when splitting groups. Server first PCM yield is before client reception; the native benchmark's `audio_ttfp_s` follows HTTP chunk framing. Do not subtract client `perf_counter` or JSONL wall timestamps from Nsight ns.
 
+The same export feeds the two perfkit tools, which is where the thread and hop answers come from:
+
+```bash
+python tasks/cosyvoice_utilization_20260912/perfkit/slice_trace.py \
+  artifacts/cosyvoice/profile-stream-en-c16/trace.sqlite \
+  --md artifacts/cosyvoice/profile-stream-en-c16/slice.md \
+  --replay-json artifacts/cosyvoice/profile-stream-en-c16/replay.json
+python tasks/cosyvoice_utilization_20260912/perfkit/nsys_threads.py \
+  artifacts/cosyvoice/profile-stream-en-c16/trace.sqlite \
+  artifacts/cosyvoice/profile-stream-en-c16/threads.json
+```
+
+`nsys_threads.py` is the Qwen3-TTS script at `fb590a2c3`, copied unchanged. It reads `StringIds` (line 28), `ThreadNames` (31), `CUPTI_ACTIVITY_KIND_RUNTIME` (51), `CUPTI_ACTIVITY_KIND_KERNEL` (68) and `NVTX_EVENTS` (81). All but `ThreadNames` are tables `slice_trace.py` already reads from these exports, and `graphNodeId` in its kernel query needs `--cuda-graph-trace=node`, which the launch command above already passes. Its GIL wait and hold totals (lines 84 and 87) come from the `Waiting for GIL` and `Holding GIL` NVTX ranges, which need `python-gil` in the trace list; that is why section 3 adds it. `ThreadNames` is the one table nothing else here reads and no flag above demonstrably fills, so on the first export confirm it is populated before quoting a per-thread name.
+
+`perfkit.py` (`tasks/qwen3_omni_0518_numerics/scripts/perfkit.py` at `fb590a2c3`) is the layer-3 tool for chrome traces, not for these exports, and it needs one per-model change before it says anything about CosyVoice: its `--predictor-marker` defaults to `gather_codec_embedding|seeded_top_k_top_p|seeded_gumbel` (lines 1238 and 1254), the Qwen3-TTS code predictor kernels, which no CosyVoice kernel matches, and `steps` keeps only steps that matched a predictor, so `steps` and `census` come back empty until the marker names CosyVoice's second graph, the Flow replay.
+
 ## 5. Qualify the diagnostic slice before trusting its numbers
 
 On H100, verify one c1 request and a small c16 cohort in each mode:
@@ -136,7 +216,7 @@ On H100, verify one c1 request and a small c16 cohort in each mode:
 - Every accepted request has the expected stage handoffs, terminal event and HTTP endpoint marker; missing/error endpoints remain visible as null timings. No unexpected unrelated GPU process contributes.
 - AR graph node kernels are present. Compare a few eager and graph CUDA launch→kernel links against the GUI. Record dropped-event warnings and unattributed-kernel fraction; incomplete attribution blocks conclusions about stage shares.
 - Packed Flow, native Flow, HiFT and D2H are distinguished. Native Flow is an enclosing stage range, not a per-Euler trace. HiFT internal F0/FFT kernels are visible through CUDA but not individually annotated by this patch.
-- Realized AR/Flow/HiFT batch counts agree with launch shapes/logs; streaming ready-candidate/peer-wait/step markers explain cohort selection. Do not interpret an entered peer-wait function's entire host time as pure sleep.
+- Realized AR/Flow/HiFT batch counts agree with launch shapes/logs; the `scheduler/ready_candidates` mark, one per step selection at `622bcd198`, explains cohort selection and is what the hop ledger charges admission waits from. There is no peer wait at this head.
 - Compare the same small cohort with annotations off, annotations on/no collection, and NSYS collection. Record overhead and reject profiler-on timing as A/B performance evidence. NVTX registers dynamic strings, so use fresh short capture runs, not an indefinitely annotated production service.
 - Same model inputs yield the same output contract with annotations toggled. No additional synchronization, tensor materialization or model state mutation is introduced by annotations; verify actual runtime behavior rather than treating static inspection as certification.
 
