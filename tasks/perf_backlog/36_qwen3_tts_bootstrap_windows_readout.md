@@ -94,9 +94,13 @@ GPU metrics from the same windows: GR active 72.7 to 79.0 percent, SMs active 39
 c16 had no GR or SM read before this session; these are its first.
 
 Default launch Nsight pair, added after the PR opened, one extra boot per arm without
-the patch, 20 s windows at c16, GPU 1: GR active 66.5 to 72.3 percent, SMs active 36.2
-to 40.3 percent (main against the branch), req/s under the profiler 14.79 against 15.48
-in pass 2, zero failures, window gate passed on B. These replace the dmon row.
+the patch, 20 s windows at c16, GPU 1: GR active 66.5 to 72.3 percent, SM issue slot
+utilization 12.3 to 13.5 percent, SMs active 36.2 to 40.3 percent, warps in flight 12.1
+to 13.3 percent of capacity, tensor active 2.3 on both, DRAM read 12.7 to 12.9 percent
+(main against the branch), req/s under the profiler 14.79 against 15.48 in pass 2, zero
+failures, window gate passed on B. These replace the dmon row. SM issue is the
+utilization rate (issue slots used over all SMs); SMs active only counts SMs with a
+resident warp. On the early ids pair the same rows read 13.0 to 14.7 and 39.2 to 44.7.
 
 ## 5. Non streaming
 

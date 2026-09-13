@@ -65,6 +65,7 @@ Non streaming is untouched: the whole sequence path does not use the incremental
 | first frame to first audio, p95 ms | 65.2 | 48.8 | -16.4 |
 | cold graph misses (uncaptured width) | 2,688 | 0 | |
 | GR active, percent (Nsight, 20 s window at c16, separate boots) | 66.5 | 72.3 | +5.8 |
+| SM issue slot utilization, percent (Nsight, same windows) | 12.3 | 13.5 | +1.2 |
 | SMs active, percent (Nsight, same windows) | 36.2 | 40.3 | +4.1 |
 | launch to ready, s | 96 | 90 | -6 |
 

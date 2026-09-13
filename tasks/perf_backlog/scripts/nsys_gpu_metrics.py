@@ -42,6 +42,9 @@ def report(path: str) -> None:
         if count == 0:
             continue
         span_s = (last - first) / 1e9
+        if "Clock Frequency" in name:
+            # note(ratish): nsys names the clock metric MHz but stores Hz.
+            mean = mean / 1e6
         print(
             f"  {name:45s} mean {mean:12.1f}  samples {count:7d}  window {span_s:5.1f} s"
         )
