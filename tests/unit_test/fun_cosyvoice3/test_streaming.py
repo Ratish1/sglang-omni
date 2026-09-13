@@ -82,6 +82,7 @@ class _FakeFlow(_PackedFlow):
     def __init__(self) -> None:
         super().__init__(channels=80, max_frames=512)
         self.spk_embed_affine_layer = torch.nn.Linear(192, 80, bias=False)
+        self.input_embedding = torch.nn.Embedding(VOCAB_SIZE, 80)
 
 
 class _FakeHiFT(torch.nn.Module):
