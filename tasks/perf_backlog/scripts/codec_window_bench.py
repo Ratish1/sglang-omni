@@ -74,13 +74,20 @@ def main():
         help="with --compile: one dynamic shape trace of the decoder step serves "
         "every width and bucket instead of one trace per shape",
     )
+    parser.add_argument(
+        "--inference-precompile",
+        action="store_true",
+        help="with --compile: precompile each shape on a state gathered under "
+        "inference mode, the tensors warmup and capture use, so Dynamo traces "
+        "the shape once instead of twice",
+    )
     parser.add_argument("--out", default="codec_window_bench.json")
     args = parser.parse_args()
     widths = tuple(int(w) for w in args.widths.split(","))
     totals = tuple(int(t) for t in args.totals.split(","))
     buckets = tuple(int(b) for b in args.buckets.split(","))
-    if args.dynamic and not args.compile:
-        parser.error("--dynamic needs --compile")
+    if (args.dynamic or args.inference_precompile) and not args.compile:
+        parser.error("--dynamic and --inference-precompile need --compile")
 
     device = torch.device("cuda", torch.cuda.current_device())
     tokenizer = qwen3_stages._load_qwen3_tts_tokenizer(
@@ -114,9 +121,38 @@ def main():
             )
         original_precompile = decoder.precompile
 
+        def inference_precompile(batch_size, fresh_frames, *, num_quantizers):
+            # note(ratish): the runner's warmup and capture gather the state
+            # under inference mode; precompiling on the same kind of tensors
+            # keeps Dynamo's guards identical and the shape traces once.
+            if decoder._compiled_kernel is None:
+                decoder._compiled_kernel = torch.compile(
+                    decoder._decode_tensors, dynamic=False, fullgraph=True
+                )
+            shape = (int(batch_size), int(fresh_frames))
+            if shape in decoder._compiled_shapes:
+                return
+            codes = torch.zeros(
+                (shape[0], int(num_quantizers), shape[1]),
+                dtype=torch.long,
+                device=device,
+            )
+            with torch.inference_mode():
+                state = arena.gather_by_index(
+                    torch.full(
+                        (shape[0],), arena.scratch_slot, dtype=torch.long, device=device
+                    )
+                )
+                decoder._compiled_kernel(codes, state)
+            decoder._compiled_shapes.add(shape)
+
+        precompile = (
+            inference_precompile if args.inference_precompile else original_precompile
+        )
+
         def timed_precompile(batch_size, fresh_frames, *, num_quantizers):
             started = time.perf_counter()
-            original_precompile(batch_size, fresh_frames, num_quantizers=num_quantizers)
+            precompile(batch_size, fresh_frames, num_quantizers=num_quantizers)
             compile_s_per_shape[f"{fresh_frames}x{batch_size}"] = (
                 time.perf_counter() - started
             )
@@ -143,6 +179,7 @@ def main():
     result = {
         "compiled": bool(args.compile),
         "dynamic": bool(args.dynamic),
+        "inference_precompile": bool(args.inference_precompile),
         "buckets": list(buckets),
         "capture_s": time.perf_counter() - capture_start,
         "compile_s_per_shape": compile_s_per_shape,
