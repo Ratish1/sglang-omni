@@ -109,8 +109,8 @@ more than the 28 eager captures cost.
 
 ## 7. Next
 
-1. One PR, #2151, from f73586369 (it contains the precompile fix), the step 3 pair as
-   the census. Pending on it: Nsight GR active and SMs active on the default launch pair
+1. One PR, #2151, head d7f0b1386, two commits with a tree identical to the measured
+   f73586369 (it contains the precompile fix), the step 3 pair as the census. Pending on it: Nsight GR active and SMs active on the default launch pair
    (main against the branch, no patch, c16, the step 4 protocol), read with
    `scripts/nsys_gpu_metrics.py`, to replace the dmon SM row.
 2. Doc 32 item 3, the preprocessing segment: the reference encoder and preprocessing
