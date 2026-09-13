@@ -2,7 +2,10 @@
 
 Opened 2026-09-13 from f73586369; the branch was then rewritten as two commits on
 3060470a8, head d7f0b1386, with a tree identical to f73586369 (verified by git diff), so
-every measurement of f73586369 holds for the PR head. The dmon SM row below is not in the PR; the Nsight GR
+every measurement of f73586369 holds for the PR head. Review round 1 (2026-09-13):
+`plan_decode_windows` became `split_frames_by_width`, `plan_windows` became
+`split_frames`, our comments carry the note(ratish) prefix; the branch was rebased onto
+upstream main fd9cce4c7, head dbef8d539, three commits. The dmon SM row below is not in the PR; the Nsight GR
 active and SMs active row from the default launch pair replaces it once measured.
 
 Branch `perf/qwen3-tts-bootstrap-graphs` at f73586369 on upstream main 3060470a8.
