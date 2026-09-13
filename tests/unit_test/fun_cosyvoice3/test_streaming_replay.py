@@ -29,6 +29,8 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
 from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
     FINAL,
     FunCosyVoice3StreamingVocoderScheduler,
+    _slack_s,
+    _step_kind,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
@@ -141,10 +143,10 @@ def _replay(
         for request_id, state in scheduler._stream_state_items():
             if request_id in stats.final_ready:
                 continue
-            if scheduler._step_kind(state) == FINAL:
+            if _step_kind(state) == FINAL:
                 stats.final_ready[request_id] = (
                     clock.now,
-                    scheduler._slack_s(state, clock.now),
+                    _slack_s(state, now=clock.now, sample_rate=scheduler._sample_rate),
                 )
         while True:
             try:
