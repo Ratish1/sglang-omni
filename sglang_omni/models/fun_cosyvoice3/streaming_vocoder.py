@@ -27,6 +27,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -44,6 +45,7 @@ class _CosyVoice3StreamState:
     embedding: torch.Tensor | None = None
     hift_mel: torch.Tensor | None = None
     speech_offset: int = 0
+    done: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,7 @@ class _CosyVoice3FirstHopPlan:
     token_end: int
     token_offset: int
     batched: bool
+    final: bool
 
 
 class FunCosyVoice3StreamingVocoderScheduler(
@@ -174,6 +177,13 @@ class FunCosyVoice3StreamingVocoderScheduler(
         for request_id in failed:
             self._cleanup_aborted_request(request_id)
 
+    def on_stream_done(self, request_id: str) -> list[OutgoingMessage] | None:
+        state = self._get_or_create_stream_state(request_id)
+        if state is None:
+            return []
+        state.done = True
+        return None
+
     def _has_ready_work(self) -> bool:
         with self._state_lock:
             return bool(self.select_step_participants())
@@ -257,8 +267,13 @@ class FunCosyVoice3StreamingVocoderScheduler(
     ) -> list[tuple[str, _CosyVoice3StreamState]]:
         first_hops: list[tuple[str, _CosyVoice3StreamState]] = []
         follow_ups: list[tuple[str, _CosyVoice3StreamState]] = []
+        finals: list[tuple[str, _CosyVoice3StreamState]] = []
         for request_id, state in self._stream_state_items():
-            if self._is_aborted(request_id) or not self._ready_for_causal_chunk(state):
+            if self._is_aborted(request_id):
+                continue
+            if not self._ready_for_causal_chunk(state):
+                if state.done:
+                    finals.append((request_id, state))
                 continue
             if state.token_offset == 0:
                 first_hops.append((request_id, state))
@@ -284,7 +299,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 )
             best_follow = max(follow_groups.values(), key=len)
             return best_follow[: self._max_batch_size]
-        return []
+        return finals[:1]
 
     def build_step_plan(
         self, participants: list[tuple[str, _CosyVoice3StreamState]]
@@ -296,6 +311,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             token_end=self._window_end(state),
             token_offset=state.token_offset,
             batched=len(participants) > 1,
+            final=state.done and not self._ready_for_causal_chunk(state),
         )
 
     def run_step(
@@ -303,6 +319,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
         participants: list[tuple[str, _CosyVoice3StreamState]],
         plan: _CosyVoice3FirstHopPlan,
     ) -> dict[str, torch.Tensor]:
+        if plan.final:
+            request_id, _ = participants[0]
+            self._complete_stream_request(request_id, self._finish_stream(request_id))
+            return {}
         # note (guozhihao-224): B>1 uses packed inference_causal; B=1 keeps
         # native CosyVoice Flow.inference. Packed singleton-vs-row tests
         # cover the batch adapter; native hops stay on the official signature.
