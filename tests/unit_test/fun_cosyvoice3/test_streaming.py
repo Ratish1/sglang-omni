@@ -19,7 +19,6 @@ from sglang_omni.models.fun_cosyvoice3.sglang_model import EOS_ID, VOCAB_SIZE
 from sglang_omni.models.fun_cosyvoice3.streaming import (
     AR_FOLLOWUP_FLUSH_TOKENS,
     AR_INITIAL_FLUSH_TOKENS,
-    LEFTOVER_FLOW_STREAMING,
     PRE_LOOKAHEAD_LEN,
     TOKEN_HOP_LEN,
     TOKEN_MEL_RATIO,
@@ -36,6 +35,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from tests.unit_test.fun_cosyvoice3.test_flow_batch import _FakeFlow as _PackedFlow
 
 
 def test_stream_hop_math_matches_cosyvoice3() -> None:
@@ -78,24 +78,15 @@ def test_pad_flow_prompt_repeats_last_frame_to_hop_multiple() -> None:
     assert torch.equal(aligned_feat, padded_feat)
 
 
-class _FakeEstimator(torch.nn.Module):
-    def forward(self, *args, **kwargs):
-        del args, kwargs
-        raise AssertionError("causal hops must use CosyVoice Flow.inference")
-
-
-class _FakeFlow(torch.nn.Module):
+class _FakeFlow(_PackedFlow):
     def __init__(self) -> None:
-        super().__init__()
-        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        super().__init__(channels=80, max_frames=512)
+        self.spk_embed_affine_layer = torch.nn.Linear(192, 80, bias=False)
         self.calls: list[dict] = []
-        self.decoder = SimpleNamespace(estimator=_FakeEstimator())
 
     def inference(self, **kwargs):
         self.calls.append(kwargs)
-        token_count = int(kwargs["token"].shape[1])
-        if not kwargs.get("finalize", True):
-            token_count = max(token_count - PRE_LOOKAHEAD_LEN, 0)
+        token_count = int(kwargs["token"].shape[1]) - PRE_LOOKAHEAD_LEN
         return torch.ones(1, 80, token_count * TOKEN_MEL_RATIO), None
 
 
@@ -159,6 +150,14 @@ def _scheduler(
     )
 
 
+def _estimator_calls(flow: _FakeFlow) -> list[dict]:
+    return flow.decoder.estimator.calls
+
+
+def _stream_ids(messages: list[OutgoingMessage]) -> list[str]:
+    return [m.request_id for m in messages if m.type == "stream"]
+
+
 def _model_runner() -> FunCosyVoice3ModelRunner:
     runner = object.__new__(FunCosyVoice3ModelRunner)
     runner._token_hop_len = TOKEN_HOP_LEN
@@ -172,8 +171,8 @@ def _stream_payload(
     request_id: str = "req-stream",
     *,
     codes: list[int] | None = None,
-    prompt_feat_frames: int = 0,
-    prompt_token_len: int = 0,
+    prompt_feat_frames: int = TOKEN_HOP_LEN * TOKEN_MEL_RATIO,
+    prompt_token_len: int = TOKEN_HOP_LEN,
 ) -> StagePayload:
     state = FunCosyVoice3State(
         text="hello",
@@ -218,9 +217,8 @@ def test_streaming_vocoder_emits_causal_chunk_then_finalizes_remainder() -> None
     assert _serve(scheduler) == 1
     messages = _drain(scheduler)
     assert [message.type for message in messages] == ["stream", "result"]
-    assert LEFTOVER_FLOW_STREAMING is False
-    assert flow.calls[1]["streaming"] is False
-    assert flow.calls[1]["finalize"] is True
+    assert len(flow.calls) == 1
+    assert _estimator_calls(flow)[-1]["streaming"] is False
     assert _waveform(messages[0].data).shape == (6,)
     assert messages[1].data.data["modality"] == "audio"
     assert messages[1].data.data["sample_rate"] == 24000
@@ -374,12 +372,10 @@ def _to_stream_chunk(outgoing: OutgoingMessage, chunk_id: int) -> IncomingMessag
 def test_ar_to_vocoder_grows_hops_then_finalizes_remainder() -> None:
     request_id = "req-hops"
     runner = _model_runner()
-    # note (guozhihao-224): feat uses a non-empty time axis because (1, 0, 80)
-    # does not round-trip through the tensor_list wire codec.
     data = CosyVoice3SGLangRequestData(
         stream_metadata={"modality": "audio_codes", "stream": True},
-        flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
-        flow_prompt_speech_feat=torch.zeros(1, 1, 80),
+        flow_prompt_speech_token=torch.zeros(1, TOKEN_HOP_LEN, dtype=torch.int32),
+        flow_prompt_speech_feat=torch.zeros(1, TOKEN_HOP_LEN * TOKEN_MEL_RATIO, 80),
         flow_embedding=torch.ones(1, 192),
     )
     request = SimpleNamespace(request_id=request_id, data=data)
@@ -418,7 +414,7 @@ def test_ar_to_vocoder_grows_hops_then_finalizes_remainder() -> None:
         IncomingMessage(
             request_id=request_id,
             type="new_request",
-            data=_stream_payload(request_id, codes=generated, prompt_feat_frames=1),
+            data=_stream_payload(request_id, codes=generated),
         ),
         None,
     )
@@ -427,8 +423,8 @@ def test_ar_to_vocoder_grows_hops_then_finalizes_remainder() -> None:
     assert [message.type for message in final_messages] == ["stream", "result"]
     remainder = _waveform(final_messages[0].data)
     assert remainder.shape == (PRE_LOOKAHEAD_LEN * TOKEN_MEL_RATIO,)
-    assert flow.calls[-1]["streaming"] is False
-    assert flow.calls[-1]["finalize"] is True
+    assert len(flow.calls) == 2
+    assert _estimator_calls(flow)[-1]["streaming"] is False
     total = np.concatenate(pcm_chunks + [remainder])
     assert total.shape == (len(generated) * TOKEN_MEL_RATIO,)
 
@@ -447,35 +443,16 @@ def test_streaming_vocoder_fallback_errors_on_empty_audio_codes(codes) -> None:
 
 
 def test_equal_first_hops_share_one_causal_flow_batch() -> None:
-    from sglang_omni.models.fun_cosyvoice3.stages import FunCosyVoice3Flow
-    from tests.unit_test.fun_cosyvoice3.test_flow_batch import _FakeFlow as _PackedFlow
-
-    flow = _PackedFlow(channels=80, max_frames=128)
-    flow.spk_embed_affine_layer = torch.nn.Linear(192, 80, bias=False)
-    scheduler = FunCosyVoice3StreamingVocoderScheduler(
-        stages.CosyVoice3Vocoder(FunCosyVoice3Flow(flow), _FakeHiFT()),
-        max_batch_size=8,
-    )
-    scheduler._can_batch_stream_chunks = True
-    # note (guozhihao-224): empty (1, 0, 80) prompt_feat round-trips through
-    # tensor_list as [[]] and loses the channel dim; use a hop-aligned prompt.
-    prompt_len = TOKEN_HOP_LEN
-    payload_kwargs = {
-        "prompt_token_len": prompt_len,
-        "prompt_feat_frames": prompt_len * TOKEN_MEL_RATIO,
-    }
+    flow, scheduler = _scheduler(max_batch_size=8)
     for request_id in ("req-a", "req-b"):
-        scheduler._on_streaming_new_request(
-            request_id, _stream_payload(request_id, **payload_kwargs)
-        )
+        scheduler._on_streaming_new_request(request_id, _stream_payload(request_id))
     for request_id in ("req-a", "req-b"):
         scheduler._ingest_stream_item(request_id, _item(list(range(28))))
     with scheduler._state_lock:
         failed = scheduler._pump_streams()
     assert failed == []
-    assert flow.decoder.estimator.calls
-    assert flow.decoder.estimator.calls[0]["streaming"] is True
-    assert flow.decoder.estimator.calls[0]["x"].shape[0] == 4
+    assert _estimator_calls(flow)[0]["streaming"] is True
+    assert _estimator_calls(flow)[0]["x"].shape[0] == 4
     messages = _drain(scheduler)
     assert [message.type for message in messages] == ["stream", "stream"]
     assert {_waveform(message.data).shape[0] for message in messages} == {
@@ -484,56 +461,27 @@ def test_equal_first_hops_share_one_causal_flow_batch() -> None:
 
 
 def test_late_payloads_share_one_causal_flow_batch() -> None:
-    from sglang_omni.models.fun_cosyvoice3.stages import FunCosyVoice3Flow
-    from tests.unit_test.fun_cosyvoice3.test_flow_batch import _FakeFlow as _PackedFlow
-
-    flow = _PackedFlow(channels=80, max_frames=128)
-    flow.spk_embed_affine_layer = torch.nn.Linear(192, 80, bias=False)
-    scheduler = FunCosyVoice3StreamingVocoderScheduler(
-        stages.CosyVoice3Vocoder(FunCosyVoice3Flow(flow), _FakeHiFT()),
-        max_batch_size=8,
-    )
-    scheduler._can_batch_stream_chunks = True
-    prompt_len = TOKEN_HOP_LEN
-    payload_kwargs = {
-        "prompt_token_len": prompt_len,
-        "prompt_feat_frames": prompt_len * TOKEN_MEL_RATIO,
-    }
+    flow, scheduler = _scheduler(max_batch_size=8)
     for request_id in ("req-a", "req-b"):
         scheduler._ingest_stream_item(request_id, _item(list(range(28))))
         scheduler.inbox.put(
             IncomingMessage(
                 request_id=request_id,
                 type="new_request",
-                data=_stream_payload(request_id, **payload_kwargs),
+                data=_stream_payload(request_id),
             )
         )
     assert _serve(scheduler) == 1
-    assert flow.decoder.estimator.calls[0]["streaming"] is True
-    assert flow.decoder.estimator.calls[0]["x"].shape[0] == 4
+    assert _estimator_calls(flow)[0]["streaming"] is True
+    assert _estimator_calls(flow)[0]["x"].shape[0] == 4
     messages = _drain(scheduler)
     assert [message.type for message in messages] == ["stream", "stream"]
 
 
 def test_queued_peer_chunk_is_ingested_before_the_first_hop_step() -> None:
-    from sglang_omni.models.fun_cosyvoice3.stages import FunCosyVoice3Flow
-    from tests.unit_test.fun_cosyvoice3.test_flow_batch import _FakeFlow as _PackedFlow
-
-    flow = _PackedFlow(channels=80, max_frames=128)
-    flow.spk_embed_affine_layer = torch.nn.Linear(192, 80, bias=False)
-    scheduler = FunCosyVoice3StreamingVocoderScheduler(
-        stages.CosyVoice3Vocoder(FunCosyVoice3Flow(flow), _FakeHiFT()),
-        max_batch_size=8,
-    )
-    prompt_len = TOKEN_HOP_LEN
-    payload_kwargs = {
-        "prompt_token_len": prompt_len,
-        "prompt_feat_frames": prompt_len * TOKEN_MEL_RATIO,
-    }
+    flow, scheduler = _scheduler(max_batch_size=8)
     for request_id in ("req-a", "req-b"):
-        scheduler._on_streaming_new_request(
-            request_id, _stream_payload(request_id, **payload_kwargs)
-        )
+        scheduler._on_streaming_new_request(request_id, _stream_payload(request_id))
     scheduler._ingest_stream_item("req-a", _item(list(range(28))))
     scheduler.inbox.put(
         IncomingMessage(
@@ -543,35 +491,13 @@ def test_queued_peer_chunk_is_ingested_before_the_first_hop_step() -> None:
         )
     )
     assert _serve(scheduler) == 1
-    assert flow.decoder.estimator.calls[0]["x"].shape[0] == 4
-
-
-def _packed_scheduler(*, max_batch_size: int = 8):
-    from sglang_omni.models.fun_cosyvoice3.stages import FunCosyVoice3Flow
-    from tests.unit_test.fun_cosyvoice3.test_flow_batch import _FakeFlow as _PackedFlow
-
-    flow = _PackedFlow(channels=80, max_frames=512)
-    flow.spk_embed_affine_layer = torch.nn.Linear(192, 80, bias=False)
-    scheduler = FunCosyVoice3StreamingVocoderScheduler(
-        stages.CosyVoice3Vocoder(FunCosyVoice3Flow(flow), _FakeHiFT()),
-        max_batch_size=max_batch_size,
-    )
-    return flow, scheduler
-
-
-def _aligned_payload(request_id: str) -> StagePayload:
-    prompt_len = TOKEN_HOP_LEN
-    return _stream_payload(
-        request_id,
-        prompt_token_len=prompt_len,
-        prompt_feat_frames=prompt_len * TOKEN_MEL_RATIO,
-    )
+    assert _estimator_calls(flow)[0]["x"].shape[0] == 4
 
 
 def test_equal_follow_up_hops_share_one_causal_flow_batch() -> None:
-    flow, scheduler = _packed_scheduler()
+    flow, scheduler = _scheduler()
     for request_id in ("req-a", "req-b"):
-        scheduler._on_streaming_new_request(request_id, _aligned_payload(request_id))
+        scheduler._on_streaming_new_request(request_id, _stream_payload(request_id))
         scheduler._ingest_stream_item(request_id, _item(list(range(28))))
     with scheduler._state_lock:
         failed = scheduler._pump_streams()
@@ -596,7 +522,7 @@ def test_equal_follow_up_hops_share_one_causal_flow_batch() -> None:
 
 
 def test_mixed_prompt_follow_ups_share_one_causal_flow_batch() -> None:
-    flow, scheduler = _packed_scheduler()
+    flow, scheduler = _scheduler()
     payloads = {
         "req-a": _stream_payload(
             "req-a",
@@ -664,23 +590,19 @@ def test_pump_drains_backlog_across_one_hop_steps() -> None:
     assert len(messages) == 3
 
 
-def _stream_ids(messages: list[OutgoingMessage]) -> list[str]:
-    return [m.request_id for m in messages if m.type == "stream"]
-
-
 def test_hops_of_different_token_windows_share_one_causal_flow_batch() -> None:
-    flow, scheduler = _packed_scheduler()
+    flow, scheduler = _scheduler()
     for request_id in ("req-a", "req-b"):
-        scheduler._on_streaming_new_request(request_id, _aligned_payload(request_id))
+        scheduler._on_streaming_new_request(request_id, _stream_payload(request_id))
         scheduler._ingest_stream_item(request_id, _item(list(range(28))))
     assert _serve(scheduler) == 1
     _drain(scheduler)
     scheduler._ingest_stream_item("req-a", _item([i % 31 for i in range(28, 78)]))
-    scheduler._on_streaming_new_request("req-c", _aligned_payload("req-c"))
+    scheduler._on_streaming_new_request("req-c", _stream_payload("req-c"))
     scheduler._ingest_stream_item("req-c", _item(list(range(28))))
 
     assert _serve(scheduler) == 1
-    assert flow.decoder.estimator.calls[-1]["x"].shape[0] == 4
+    assert _estimator_calls(flow)[-1]["x"].shape[0] == 4
     samples = {
         m.request_id: _waveform(m.data).shape[0]
         for m in _drain(scheduler)
@@ -694,10 +616,10 @@ def test_hops_of_different_token_windows_share_one_causal_flow_batch() -> None:
 
 
 def test_step_takes_started_streams_before_new_ones_up_to_the_batch_size() -> None:
-    flow, scheduler = _packed_scheduler(max_batch_size=2)
+    flow, scheduler = _scheduler(max_batch_size=2)
     scheduler._clock = _Clock()
     for request_id in ("req-a", "req-b"):
-        scheduler._on_streaming_new_request(request_id, _aligned_payload(request_id))
+        scheduler._on_streaming_new_request(request_id, _stream_payload(request_id))
         scheduler._ingest_stream_item(request_id, _item(list(range(28))))
     assert _serve(scheduler) == 1
     for request_id in ("req-a", "req-b"):
@@ -705,7 +627,7 @@ def test_step_takes_started_streams_before_new_ones_up_to_the_batch_size() -> No
             request_id, _item([i % 31 for i in range(28, 78)])
         )
     for request_id in ("req-c", "req-d"):
-        scheduler._on_streaming_new_request(request_id, _aligned_payload(request_id))
+        scheduler._on_streaming_new_request(request_id, _stream_payload(request_id))
         scheduler._ingest_stream_item(request_id, _item(list(range(28))))
 
     assert _serve(scheduler) == 2
@@ -717,7 +639,7 @@ def test_step_takes_started_streams_before_new_ones_up_to_the_batch_size() -> No
         "req-c",
         "req-d",
     ]
-    assert {call["x"].shape[0] for call in flow.decoder.estimator.calls} == {4}
+    assert {call["x"].shape[0] for call in _estimator_calls(flow)} == {4}
 
 
 def test_first_hop_runs_when_no_started_stream_is_runnable() -> None:
@@ -747,14 +669,15 @@ def test_finals_rank_by_slack_with_the_other_started_streams() -> None:
     a_samples = scheduler._stream_states["req-a"].speech_offset
     c_samples = scheduler._stream_states["req-c"].speech_offset
     assert 0 < a_samples < c_samples
+    _drain(scheduler)
 
     scheduler._ingest_stream_item("req-a", _item(list(range(28, 78))))
     scheduler._on_done("req-c")
     clock.now += (a_samples + c_samples) / 2 / scheduler._sample_rate
     assert _serve(scheduler) == 2
-    assert [
-        (int(call["token"].shape[1]), call["finalize"]) for call in flow.calls[3:]
-    ] == [(78, False), (78, True)]
+    assert _stream_ids(_drain(scheduler)) == ["req-a", "req-c"]
+    assert int(flow.calls[-1]["token"].shape[1]) == 78
+    assert _estimator_calls(flow)[-1]["streaming"] is False
     assert "req-c" not in scheduler._stream_states
 
 
@@ -769,10 +692,58 @@ def test_stream_done_defers_the_final_to_a_step() -> None:
     assert _drain(scheduler) == []
     assert scheduler._has_ready_work()
     scheduler._run_ready_step()
-    assert flow.calls[-1]["finalize"] is True
+    assert _estimator_calls(flow)[-1]["streaming"] is False
     assert [m.type for m in _drain(scheduler)] == ["stream", "result"]
     assert "req-a" not in scheduler._stream_states
     assert not scheduler._has_ready_work()
+
+
+def test_finals_share_one_non_streaming_flow_batch() -> None:
+    flow, scheduler = _scheduler()
+    for request_id in ("req-a", "req-b"):
+        scheduler._on_streaming_new_request(request_id, _stream_payload(request_id))
+        scheduler._ingest_stream_item(request_id, _item(list(range(30))))
+    assert _serve(scheduler) == 1
+    _drain(scheduler)
+    for request_id in ("req-a", "req-b"):
+        scheduler._on_done(request_id)
+
+    assert _serve(scheduler) == 1
+    messages = _drain(scheduler)
+    assert [(m.request_id, m.type) for m in messages] == [
+        ("req-a", "stream"),
+        ("req-a", "result"),
+        ("req-b", "stream"),
+        ("req-b", "result"),
+    ]
+    assert _estimator_calls(flow)[-1]["streaming"] is False
+    assert _estimator_calls(flow)[-1]["x"].shape[0] == 4
+    assert {_waveform(m.data).shape[0] for m in messages if m.type == "stream"} == {
+        (30 - TOKEN_HOP_LEN) * TOKEN_MEL_RATIO
+    }
+    assert scheduler._stream_states == {}
+
+
+def test_stream_without_tokens_fails_in_its_own_step() -> None:
+    flow, scheduler = _scheduler()
+    scheduler._on_streaming_new_request("req-a", _stream_payload("req-a"))
+    scheduler._ingest_stream_item("req-a", _item(list(range(30))))
+    assert _serve(scheduler) == 1
+    _drain(scheduler)
+    scheduler._on_streaming_new_request(
+        "req-empty", _stream_payload("req-empty", codes=[])
+    )
+    scheduler._on_done("req-empty")
+    scheduler._on_done("req-a")
+
+    assert _serve(scheduler) == 2
+    assert [(m.request_id, m.type) for m in _drain(scheduler)] == [
+        ("req-a", "stream"),
+        ("req-a", "result"),
+        ("req-empty", "error"),
+    ]
+    assert scheduler._is_aborted("req-empty")
+    assert scheduler._stream_states == {}
 
 
 def test_backlogged_chunks_stay_ordered_before_stream_done(
@@ -804,8 +775,11 @@ def test_backlogged_chunks_stay_ordered_before_stream_done(
 
     _serve(scheduler)
 
-    assert flow.calls[-1]["finalize"] is True
-    assert flow.calls[-1]["token"].flatten().tolist() == tokens
+    assert _estimator_calls(flow)[-1]["streaming"] is False
+    assert (
+        _estimator_calls(flow)[-1]["x"].shape[-1]
+        == (TOKEN_HOP_LEN + len(tokens)) * TOKEN_MEL_RATIO
+    )
     messages = _drain(scheduler)
     assert [m.type for m in messages].count("result") == 1
     assert messages[-1].type == "result"
@@ -873,16 +847,16 @@ def test_non_streaming_fallback_batches_past_pending_done_with_cost_limit(
 
 
 def test_payloads_from_pending_and_inbox_share_one_first_hop_batch() -> None:
-    flow, scheduler = _packed_scheduler()
+    flow, scheduler = _scheduler()
     for rid in ("a", "b"):
         scheduler._ingest_stream_item(rid, _item(list(range(28))))
     scheduler._pending_messages.append(
-        IncomingMessage("b", "new_request", _aligned_payload("b"))
+        IncomingMessage("b", "new_request", _stream_payload("b"))
     )
-    scheduler.inbox.put(IncomingMessage("a", "new_request", _aligned_payload("a")))
+    scheduler.inbox.put(IncomingMessage("a", "new_request", _stream_payload("a")))
 
     assert _serve(scheduler) == 1
-    assert flow.decoder.estimator.calls[0]["x"].shape[0] == 4
+    assert _estimator_calls(flow)[0]["x"].shape[0] == 4
     assert len([msg for msg in _drain(scheduler) if msg.type == "stream"]) == 2
 
 

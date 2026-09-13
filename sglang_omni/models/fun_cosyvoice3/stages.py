@@ -1370,6 +1370,22 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         ):
             return self.flow.inference_causal(items)
 
+    def leftover_batch(self, items: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
+        """Non-streaming Flow over each row's whole token history for the
+        stream's last chunk; the scheduler keeps the frames past token_offset.
+        HiFT stays per request.
+
+        # note (guozhihao-224): the last chunk keeps DiT bidirectional;
+        # streaming=True did not move SeedTTS EN stream TTFC/QPS and dropped
+        # the tail 0.5 s cosine to about 0.29.
+        """
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=self.autocast_dtype,
+            enabled=self.autocast_dtype is not None,
+        ):
+            return self.flow.inference(items)
+
     def hift_delta(
         self,
         tts_mel: torch.Tensor,
