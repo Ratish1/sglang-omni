@@ -30,16 +30,20 @@ class _FakeHiFT(torch.nn.Module):
     # cosyvoice3.yaml: upsample_rates [8, 5, 3], istft_params.hop_len 4.
     upsample_rates: ClassVar[list[int]] = [8, 5, 3]
     istft_params: ClassVar[dict[str, int]] = {"n_fft": 16, "hop_len": 4}
+    # Causal HiFT right context: f0 predictor padding 3, conv_pre look right 4.
+    conv_pre_look_right: ClassVar[int] = 4
 
     def __init__(self):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(1))
         self.calls = []
+        self.f0_predictor = SimpleNamespace(condnet=[SimpleNamespace(causal_padding=3)])
 
     def inference(self, *, speech_feat, finalize):
         self.calls.append((speech_feat, finalize))
         batch, _, frames = speech_feat.shape
-        row = torch.arange(frames * 480, dtype=torch.float32).reshape(1, -1)
+        samples = frames * 480 if finalize else (frames - 3 - 4) * 480 - 480
+        row = torch.arange(samples, dtype=torch.float32).reshape(1, -1)
         return row.repeat(batch, 1), None
 
 
@@ -286,9 +290,9 @@ def test_cosyvoice3_token2wav_chunk_slices_mel_and_hift_delta() -> None:
     assert flow.calls[0]["streaming"] is True
     assert flow.calls[0]["finalize"] is False
     assert cached_mel.shape[-1] == 56
-    # speech_offset is waveform samples (mel_frames * HiFT stride=480).
-    assert speech_offset == 56 * 480
-    assert delta.shape[-1] == 56 * 480
+    # A non-final call holds back the 7 right-context frames and one frame.
+    assert speech_offset == (56 - 7) * 480 - 480
+    assert delta.shape[-1] == (56 - 7) * 480 - 480
 
     tail, cached_mel, speech_offset = vocoder.token2wav_chunk(
         token=token,
@@ -305,10 +309,43 @@ def test_cosyvoice3_token2wav_chunk_slices_mel_and_hift_delta() -> None:
     assert flow.calls[1]["streaming"] is False
     assert flow.calls[1]["finalize"] is True
     # note (guozhihao-224): leftover hop slices from offset 25*2, concat onto
-    # the 56-frame cache; HiFT emits the 6 new mel frames as 6*480 samples.
+    # the 56-frame cache; the final call flushes the held-back frames too.
     assert cached_mel.shape[-1] == 62
     assert speech_offset == 62 * 480
-    assert tail.shape[-1] == 6 * 480
+    assert tail.shape[-1] == 62 * 480 - ((56 - 7) * 480 - 480)
+
+
+def test_hift_delta_batch_matches_per_row_hift_delta() -> None:
+    vocoder = stages.CosyVoice3Vocoder(_FakeFlow(), _FakeHiFT())
+    histories = [None, torch.zeros(1, 80, 150), torch.zeros(1, 80, 350)]
+    new_mels = [
+        torch.zeros(1, 80, 50),
+        torch.zeros(1, 80, 200),
+        torch.zeros(1, 80, 200),
+    ]
+    offsets = [
+        0,
+        vocoder.hift_streaming_samples(150),
+        vocoder.hift_streaming_samples(350),
+    ]
+    expected = [
+        vocoder.hift_delta(
+            new_mel, hift_mel=history, speech_offset=offset, finalize=False
+        )
+        for new_mel, history, offset in zip(new_mels, histories, offsets, strict=True)
+    ]
+
+    batched = vocoder.hift_delta_batch(
+        new_mels, hift_mels=histories, speech_offsets=offsets
+    )
+
+    assert len(vocoder.hift.calls) == 4
+    for (delta, mel, offset), (want_delta, want_mel, want_offset) in zip(
+        batched, expected, strict=True
+    ):
+        assert torch.equal(delta, want_delta)
+        assert torch.equal(mel, want_mel)
+        assert offset == want_offset
 
 
 def test_cosyvoice3_vocoder_prepare_and_store_audio_payload() -> None:

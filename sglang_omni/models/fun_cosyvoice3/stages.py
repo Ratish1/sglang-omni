@@ -1397,6 +1397,70 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         delta = tts_speech[:, held:].detach().cpu()
         return delta, tts_mel.detach(), int(tts_speech.shape[1])
 
+    def hift_delta_batch(
+        self,
+        tts_mels: list[torch.Tensor],
+        *,
+        hift_mels: list[torch.Tensor | None],
+        speech_offsets: list[int],
+    ) -> list[tuple[torch.Tensor, torch.Tensor, int]]:
+        """One non-final HiFT call for several streams. Exact per row: the
+        causal HiFT reads a frame's past and a fixed right context only, and
+        the ISTFT writes forward, so a row's emitted samples never see the
+        padding after its own frames."""
+        histories = [
+            (
+                tts_mel
+                if hift_mel is None
+                else torch.cat([hift_mel.to(device=tts_mel.device), tts_mel], dim=2)
+            )
+            for tts_mel, hift_mel in zip(tts_mels, hift_mels, strict=True)
+        ]
+        lengths = [int(mel.shape[2]) for mel in histories]
+        longest = max(lengths)
+        padded = torch.cat(
+            [
+                F.pad(mel, (0, longest - length))
+                for mel, length in zip(histories, lengths)
+            ],
+            dim=0,
+        )
+        tts_speech, _ = self.hift.inference(speech_feat=padded, finalize=False)
+        tts_speech = tts_speech.detach()
+        assert int(tts_speech.shape[1]) == self.hift_streaming_samples(longest)
+        hops: list[tuple[torch.Tensor, torch.Tensor, int]] = []
+        for index, (mel, length, speech_offset) in enumerate(
+            zip(histories, lengths, speech_offsets, strict=True)
+        ):
+            samples = self.hift_streaming_samples(length)
+            held = max(int(speech_offset), 0)
+            hops.append(
+                (
+                    tts_speech[index : index + 1, held:samples].cpu(),
+                    mel.detach(),
+                    samples,
+                )
+            )
+        return hops
+
+    def hift_streaming_samples(self, frames: int) -> int:
+        """Samples a non-final HiFT call returns for a mel of this many frames:
+        the f0 predictor's right padding and conv_pre's right context are
+        dropped, then one frame of samples (generator.py inference and decode)."""
+        samples_per_frame = self._hift_samples_per_mel_frame()
+        right_context = int(self.hift.f0_predictor.condnet[0].causal_padding) + int(
+            self.hift.conv_pre_look_right
+        )
+        return (frames - right_context) * samples_per_frame - samples_per_frame
+
+    def _hift_samples_per_mel_frame(self) -> int:
+        if self.hift_samples_per_mel_frame is None:
+            stride = int(self.hift.istft_params["hop_len"])
+            for rate in self.hift.upsample_rates:
+                stride *= int(rate)
+            self.hift_samples_per_mel_frame = stride
+        return self.hift_samples_per_mel_frame
+
     def make_flow_input(
         self,
         state: FunCosyVoice3State,
@@ -1460,12 +1524,7 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         with hift_autocast:
             wav, _ = self.hift.inference(speech_feat=padded, finalize=True)
         wav = wav.detach()
-        if self.hift_samples_per_mel_frame is None:
-            stride = int(self.hift.istft_params["hop_len"])
-            for rate in self.hift.upsample_rates:
-                stride *= int(rate)
-            self.hift_samples_per_mel_frame = stride
-        samples_per_frame = self.hift_samples_per_mel_frame
+        samples_per_frame = self._hift_samples_per_mel_frame()
         return [
             wav[index : index + 1, : length * samples_per_frame].cpu()
             for index, length in enumerate(lengths)
