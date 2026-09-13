@@ -202,6 +202,13 @@ class FunCosyVoice3ModelRunner(ModelRunner):
             chunk_metadata["flow_prompt_speech_feat"] = data.flow_prompt_speech_feat
             chunk_metadata["flow_embedding"] = data.flow_embedding
             data.stream_prompt_sent = True
+        mark(
+            "ar",
+            "chunk_emitted",
+            request_id=request_id,
+            tokens=int(codes.numel()),
+            tokens_seen=int(data.stream_code_seen),
+        )
         self._outbox.put(
             OutgoingMessage(
                 request_id=request_id,

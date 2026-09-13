@@ -565,7 +565,14 @@ class FunCosyVoice3StreamingVocoderScheduler(
         state: _CosyVoice3StreamState,
         codes: torch.Tensor,
     ) -> None:
-        del request_id
+        if ENABLED:
+            mark(
+                "vocoder",
+                "ingest",
+                request_id=request_id,
+                tokens=int(codes.numel()),
+                tokens_before=len(state.tokens),
+            )
         state.tokens.extend(int(token) for token in codes.tolist())
 
     def should_decode(self, state: _CosyVoice3StreamState, *, is_final: bool) -> bool:
