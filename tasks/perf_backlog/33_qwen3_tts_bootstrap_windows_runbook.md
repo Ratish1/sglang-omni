@@ -51,8 +51,9 @@ console script, which imports the venv's editable install (the main checkout) fr
 directory. Before the boot, from the worktree, archive
 `python -c "import sglang_omni; print(sglang_omni.__file__)"` as `import_path.txt`; it
 must be under that worktree. On a B boot the serve log must carry
-`window_frames=(1, 2, 4, 8, 16, 32, 64)` on the graph shapes line and a third
-`graphs captured for` list of widths 1 to 64 before any pass runs. A boot failing either
+`window_frames=(1, 2, 4, 8, 16, 32, 64)` on the graph shapes line and, after the warm
+lines (one per follow-up worker) and the cold line, a `graphs captured for` list of 28
+keys, widths 1 to 64 at buckets 1, 2, 4, 8, before any pass runs. A boot failing either
 check is void.
 
 What the change does. A reference prefixed bootstrap (reference frames plus the first
