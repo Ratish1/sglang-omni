@@ -61,10 +61,12 @@ Non streaming is untouched: the whole sequence path does not use the incremental
 | first frame to first audio, mean ms | 35.3 | 29.9 | -5.4 |
 | first frame to first audio, p95 ms | 65.2 | 48.8 | -16.4 |
 | cold graph misses (uncaptured width) | 2,688 | 0 | |
-| SM utilization during traffic, nvidia-smi dmon, percent | 78.3 | 80.9 | +2.6 |
+| GR active, percent (Nsight, 20 s window at c16, separate boots) | 66.5 | 72.3 | +5.8 |
+| SMs active, percent (Nsight, same windows) | 36.2 | 40.3 | +4.1 |
 | launch to ready, s | 96 | 90 | -6 |
 
-Quality on this PR: WER 1.05 percent, speaker similarity 71.53, inside the bands.
+Quality on this PR: WER 1.05 percent, speaker similarity 71.53, inside the bands. The
+Nsight rows come from one extra boot per arm under the profiler, GPU metrics at 10 kHz.
 
 Window runner footprint 2.1 GB at buckets 1, 2, 4, 8. Knob to disable:
 `incremental_codec_cuda_graph_window_frames=[]`.

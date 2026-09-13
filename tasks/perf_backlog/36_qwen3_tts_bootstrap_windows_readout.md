@@ -93,6 +93,11 @@ GPU metrics from the same windows: GR active 72.7 to 79.0 percent, SMs active 39
 44.7 percent, warps in flight 16.7 to 19.0 per cycle, clock 1985 MHz on both. Streaming
 c16 had no GR or SM read before this session; these are its first.
 
+Default launch Nsight pair, added after the PR opened, one extra boot per arm without
+the patch, 20 s windows at c16, GPU 1: GR active 66.5 to 72.3 percent, SMs active 36.2
+to 40.3 percent (main against the branch), req/s under the profiler 14.79 against 15.48
+in pass 2, zero failures, window gate passed on B. These replace the dmon row.
+
 ## 5. Non streaming
 
 Not measured and not expected to move. The window runner lives on the streaming
