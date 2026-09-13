@@ -110,7 +110,9 @@ class StreamingSimpleScheduler:
                 self._emit_error(request_id, exc)
                 self.abort(request_id)
 
-    def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
+    def on_stream_done(self, request_id: str) -> list[OutgoingMessage] | None:
+        """Messages that complete the stream, or None to complete it later
+        through _complete_stream_request."""
         del request_id
         return []
 
@@ -533,7 +535,16 @@ class StreamingSimpleScheduler:
                     if not self._is_aborted(request_id):
                         self.outbox.put(out)
                 return
-            for out in self.on_stream_done(request_id):
+            messages = self.on_stream_done(request_id)
+            if messages is None:
+                return
+            self._complete_stream_request(request_id, messages)
+
+    def _complete_stream_request(
+        self, request_id: str, messages: list[OutgoingMessage]
+    ) -> None:
+        with self._state_lock:
+            for out in messages:
                 if not self._is_aborted(request_id):
                     self.outbox.put(out)
             if not self._is_aborted(request_id):

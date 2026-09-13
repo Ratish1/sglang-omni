@@ -412,3 +412,29 @@ def test_stream_chunk_batch_filters_request_aborted_during_validation() -> None:
     assert any(m.request_id == "bad" and m.type == "error" for m in out)
     assert scheduler._is_aborted("bad")
     assert "bad" not in scheduler.stream_state
+
+
+class _DeferredDoneScheduler(_TestStreamingScheduler):
+    def on_stream_done(self, request_id: str) -> None:
+        del request_id
+        return None
+
+
+def test_stream_done_returning_none_defers_completion() -> None:
+    scheduler = _DeferredDoneScheduler()
+    scheduler._on_streaming_new_request("req", _payload("req", stream=True))
+
+    scheduler._on_done("req")
+
+    assert "req" in scheduler.stream_state
+    assert "req" in scheduler._stream_payloads
+    assert "req" not in scheduler._pending_done
+    assert _drain_results(scheduler) == []
+
+    scheduler._complete_stream_request(
+        "req", [OutgoingMessage("req", "result", {"done": "req"})]
+    )
+
+    assert [msg.data for msg in _drain_results(scheduler)] == [{"done": "req"}]
+    assert "req" not in scheduler.stream_state
+    assert "req" not in scheduler._stream_payloads
