@@ -57,11 +57,36 @@ break-even, so an H100 constant does not need to be exact to hold on a neighbour
 
 ## 4. Decision
 
-Commit c7a12957a: a step admits rows in slack order while `rows * widest - useful` stays within
-`flow_step_pad_frames` (3,500, `DEFAULT_FLOW_STEP_PAD_FRAMES` in stages.py, pinned by E3 and the
-Nsight in-server floor). A wider row runs in its own step, as it does on main. The non-streaming
-admission frames and pad budget from #1899 stay untouched on their own path.
+The padding budget (c7a12957a, 3,500 padded frames) was withdrawn the same day: its constant is
+the ratio of a host launch floor to a GPU per frame rate and pins to the H100. The cost it bounded
+is a layout defect, the packed Flow adapter padding every row to the widest, which SGLang never
+does (flat token stream, `cu_seqlens`, ragged attention; its only padding rule is the prefill
+graph runner's post formation two times check, prefill_cuda_graph_runner.py:1190-1195).
 
-Gate for the next run at c7a12957a: zero failures, zero OOM, C50 at or above 71.5, req/s within
-2 percent of 3.954, WER within noise of 1.33 to 1.43, and the gap table above with no gap over 3 s
-outside a singleton step.
+Commit 8701415d8 on af843811b, `packed_dit.py`: the streaming hops and the finals run the DiT over
+the rows concatenated along the sequence. Per token modules (input projection, AdaLN, feed forward,
+long skip, output projection) are unchanged; the causal conv position embedding runs on the rows
+scattered to a padded layout and gathered back (exact, it is causal with left zero padding); rotary
+frequencies are gathered by per token position; attention runs within each row through
+flashinfer's ragged prefill kernel (`BatchPrefillWithRaggedKVCacheWrapper`, one plan per Flow
+call, a flattened per row boolean mask for the chunk causal streaming case, no mask for finals),
+with a per row SDPA loop as the CPU and exactness reference. The unconditional CFG twins are rows
+of the same packed call. The scheduler admits every runnable hop up to the batch size with no
+padding rule; a wide row costs its own frames only. The graphed non-streaming `inference` for
+buffered requests and the TensorRT estimator keep the padded layout.
+
+Local check on a tiny real DiT (vendored CosyVoice source, CPU, float64): packed forward against
+`DiT.forward` 2.7e-14, packed Euler solve against the padded solve 0.0, rows packed together
+against each row alone 3.2e-14, for both the chunk causal and the bidirectional mask. The same
+checks are `tests/unit_test/fun_cosyvoice3/test_packed_dit.py` (skipped where cosyvoice is not
+installed).
+
+Follow-ups in the same series: ecf1512d2 warms one hop and one final in the factory before
+readiness (the flashinfer kernel variants load there, not on the first request), 5f0f489e5
+guards the conv cache patch against a second install.
+
+Gate for the next run at 5f0f489e5: E2 tables 5 and 6 (packed rows against the padded call per
+row, flashinfer against the SDPA reference) at mel SNR in the 86 to 99 dB band the earlier packed
+versus native rows showed; then zero failures, zero OOM, C50 at or above 71.5, req/s within
+2 percent of 3.954, WER within noise of 1.33 to 1.43, and the serve.log gap table with no gap over
+3 s.

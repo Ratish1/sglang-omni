@@ -41,7 +41,10 @@ from sglang_omni.models.fun_cosyvoice3.stages import (
     CosyVoice3Vocoder,
     FlowBatchInput,
     _patch_chunk_mask,
+    generate_flow,
     load_cosyvoice3_flow_hift,
+    pack_flow_inputs,
+    split_generated_mels,
 )
 from sglang_omni.models.fun_cosyvoice3.streaming import (
     PRE_LOOKAHEAD_LEN,
@@ -403,6 +406,110 @@ def measure_native_vs_packed_leftover(
     return rows
 
 
+def _padded_hops(
+    vocoder: CosyVoice3Vocoder, items: list[FlowBatchInput]
+) -> list[torch.Tensor]:
+    flow = vocoder.flow
+    packed = pack_flow_inputs(flow.flow, items)
+    with torch.autocast(
+        device_type="cuda",
+        dtype=vocoder.autocast_dtype,
+        enabled=vocoder.autocast_dtype is not None,
+    ):
+        generated = generate_flow(flow, packed, streaming=True, finalize=False)
+    lookahead = flow.flow.pre_lookahead_len
+    return split_generated_mels(
+        flow.flow,
+        packed,
+        generated,
+        token_lengths=tuple(
+            max(length - lookahead, 0) for length in packed.combined_token_lengths
+        ),
+        target_token_lengths=tuple(
+            max(length - lookahead, 0) for length in packed.target_token_lengths
+        ),
+    )
+
+
+def _padded_finals(
+    vocoder: CosyVoice3Vocoder, items: list[FlowBatchInput]
+) -> list[torch.Tensor]:
+    flow = vocoder.flow
+    packed = pack_flow_inputs(flow.flow, items)
+    with torch.autocast(
+        device_type="cuda",
+        dtype=vocoder.autocast_dtype,
+        enabled=vocoder.autocast_dtype is not None,
+    ):
+        generated = generate_flow(flow, packed, streaming=False, finalize=True)
+    return split_generated_mels(
+        flow.flow,
+        packed,
+        generated,
+        token_lengths=packed.combined_token_lengths,
+        target_token_lengths=packed.target_token_lengths,
+    )
+
+
+def measure_packed_rows_vs_padded_rows(
+    vocoder: CosyVoice3Vocoder, streams: list[Stream]
+) -> list[Row]:
+    """The packed sequence with per row attention against the padded DiT
+    call on the same rows, mixed hop windows and then the finals."""
+    rows: list[Row] = []
+    hop_items = [
+        flow_input(stream, hop_window(*HOPS[index % len(HOPS)]))
+        for index, stream in enumerate(streams)
+    ]
+    for stream, packed_mel, padded_mel in zip(
+        streams,
+        vocoder.hop_batch(hop_items),
+        _padded_hops(vocoder, hop_items),
+        strict=True,
+    ):
+        rows.append(compare(f"{stream.sample_id} hop mel", packed_mel, padded_mel))
+    final_items = [flow_input(stream, stream.tokens.shape[1]) for stream in streams]
+    for stream, packed_mel, padded_mel in zip(
+        streams,
+        vocoder.leftover_batch(final_items),
+        _padded_finals(vocoder, final_items),
+        strict=True,
+    ):
+        rows.append(compare(f"{stream.sample_id} final mel", packed_mel, padded_mel))
+    return rows
+
+
+def measure_attention_kernels(
+    vocoder: CosyVoice3Vocoder, streams: list[Stream]
+) -> list[Row]:
+    """The flashinfer ragged kernel against the per row SDPA reference on the
+    same packed rows."""
+    estimator = vocoder.flow.packed_estimator
+    hop_items = [
+        flow_input(stream, hop_window(*HOPS[index % len(HOPS)]))
+        for index, stream in enumerate(streams)
+    ]
+    final_items = [flow_input(stream, stream.tokens.shape[1]) for stream in streams]
+    kernel_hops = vocoder.hop_batch(hop_items)
+    kernel_finals = vocoder.leftover_batch(final_items)
+    estimator.attention_reference = True
+    try:
+        reference_hops = vocoder.hop_batch(hop_items)
+        reference_finals = vocoder.leftover_batch(final_items)
+    finally:
+        estimator.attention_reference = False
+    rows: list[Row] = []
+    for stream, kernel, reference in zip(
+        streams, kernel_hops, reference_hops, strict=True
+    ):
+        rows.append(compare(f"{stream.sample_id} hop mel", kernel, reference))
+    for stream, kernel, reference in zip(
+        streams, kernel_finals, reference_finals, strict=True
+    ):
+        rows.append(compare(f"{stream.sample_id} final mel", kernel, reference))
+    return rows
+
+
 def measure_load_time_patches(
     vocoder: CosyVoice3Vocoder,
     stream: Stream,
@@ -482,6 +589,14 @@ def main() -> None:
         print_table(
             "4. load time patches vs the unpatched cosyvoice functions",
             measure_load_time_patches(vocoder, streams[0], patched_conv_forward),
+        )
+        print_table(
+            "5. packed rows with per row attention vs the padded DiT call",
+            measure_packed_rows_vs_padded_rows(vocoder, streams),
+        )
+        print_table(
+            "6. flashinfer ragged attention vs the per row SDPA reference",
+            measure_attention_kernels(vocoder, streams),
         )
 
 
