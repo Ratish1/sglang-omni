@@ -2076,7 +2076,7 @@ def create_vocoder_executor(
         hift_max_padding_waste=hift_max_padding_waste,
     )
 
-    return FunCosyVoice3StreamingVocoderScheduler(
+    scheduler = FunCosyVoice3StreamingVocoderScheduler(
         vocoder,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
@@ -2086,3 +2086,5 @@ def create_vocoder_executor(
         token_max_hop_len=token_max_hop_len,
         disable_hop_growth=disable_hop_growth,
     )
+    scheduler.warmup_now()
+    return scheduler

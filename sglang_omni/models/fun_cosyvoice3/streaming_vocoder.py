@@ -149,6 +149,34 @@ class FunCosyVoice3StreamingVocoderScheduler(
         del request_id
         return _CosyVoice3StreamState(hop_len=self._token_hop_len)
 
+    def warmup_now(self) -> None:
+        # note(ratish): one hop and one final through Flow and HiFT before the
+        # stage publishes readiness, as the sibling vocoders do, so the first
+        # request pays neither the attention kernel load nor the f0 cast.
+        item = self._warmup_input(self._token_hop_len + PRE_LOOKAHEAD_LEN)
+        started = time.monotonic()
+        mel = self._vocoder.hop_batch([item])[0]
+        self._vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=False)
+        hop_s = time.monotonic() - started
+        mel = self._vocoder.leftover_batch([item])[0]
+        self._vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=True)
+        logger.info(
+            "Fun-CosyVoice3 vocoder warmup: hop %.1f s, final %.1f s",
+            hop_s,
+            time.monotonic() - started - hop_s,
+        )
+
+    def _warmup_input(self, tokens: int) -> FlowBatchInput:
+        flow = self._vocoder.flow
+        return FlowBatchInput(
+            token=torch.zeros(1, tokens, dtype=torch.int32),
+            prompt_token=torch.zeros(1, self._token_hop_len, dtype=torch.int32),
+            prompt_feat=torch.zeros(
+                1, self._token_hop_len * TOKEN_MEL_RATIO, flow.output_size
+            ),
+            embedding=torch.zeros(1, flow.spk_embed_affine_layer.in_features),
+        )
+
     def _advance_hop_len(self, state: _CosyVoice3StreamState) -> None:
         state.hop_len = next_stream_hop_len(
             state.hop_len,
