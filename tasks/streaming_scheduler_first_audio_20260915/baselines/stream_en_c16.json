@@ -1,0 +1,74 @@
+{
+  "moss_tts_local": {
+    "model_path": "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5",
+    "a": {
+      "source": "user run, upstream main before 442e559b4, streaming en c16, 1088 requests",
+      "summary": {
+        "completed_requests": 1088,
+        "failed_requests": 0,
+        "throughput_qps": 12.945,
+        "rtf_mean": 0.2737,
+        "rtf_p95": 0.3301,
+        "rtf_p99": 0.3924,
+        "audio_ttfp_mean_s": 0.26,
+        "audio_ttfp_median_s": 0.256,
+        "audio_ttfp_p95_s": 0.38,
+        "audio_ttfp_p99_s": 0.546,
+        "c50": 100.0,
+        "c100": 100.0,
+        "latency_mean_s": 1.218
+      }
+    },
+    "pr1_head": {
+      "source": "user run, streaming scheduler branch head before merge, streaming en c16, 1088 requests",
+      "summary": {
+        "completed_requests": 1088,
+        "failed_requests": 0,
+        "throughput_qps": 12.425,
+        "rtf_mean": 0.2741,
+        "rtf_p95": 0.3591,
+        "rtf_p99": 0.4694,
+        "audio_ttfp_mean_s": 0.309,
+        "audio_ttfp_median_s": 0.282,
+        "audio_ttfp_p95_s": 0.555,
+        "audio_ttfp_p99_s": 0.792,
+        "c50": 99.17,
+        "c100": 99.63,
+        "latency_mean_s": 1.281
+      }
+    }
+  },
+  "qwen3_tts": {
+    "model_path": null,
+    "a": {
+      "source": "user run, upstream main before 442e559b4, streaming en c16, 1088 requests",
+      "summary": {
+        "completed_requests": 1088,
+        "failed_requests": 0,
+        "throughput_qps": 15.863,
+        "rtf_mean": 0.2443,
+        "rtf_p95": 0.2909,
+        "rtf_p99": 0.3281,
+        "audio_ttfp_mean_s": 0.1427,
+        "audio_ttfp_p95_s": 0.249,
+        "audio_ttfp_p99_s": 0.4105,
+        "c50": 99.91
+      }
+    },
+    "pr1_head": {
+      "source": "user run, streaming scheduler branch head before merge, streaming en c16, 1088 requests",
+      "summary": {
+        "completed_requests": 1088,
+        "failed_requests": 0,
+        "throughput_qps": 15.69,
+        "rtf_mean": 0.2462,
+        "rtf_p95": 0.2889,
+        "rtf_p99": 0.3194,
+        "audio_ttfp_mean_s": 0.1709,
+        "audio_ttfp_p95_s": 0.3214,
+        "audio_ttfp_p99_s": 0.5326,
+        "c50": 100.0
+      }
+    }
+  }
+}
