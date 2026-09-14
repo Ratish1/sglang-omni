@@ -845,6 +845,8 @@ def _patch_chunk_mask() -> None:
     """Build the DiT attention mask without the host sync CosyVoice's
     add_optional_chunk_mask pays to check for empty rows; the rows are
     filled on the device instead, which is also what graph capture needs.
+    The check is any, not sum: summing a bool mask first copies it to
+    int64, eight bytes per element of a batch by frames squared tensor.
     """
     try:
         from cosyvoice.flow.DiT import dit as cosyvoice_dit
@@ -879,7 +881,7 @@ def _patch_chunk_mask() -> None:
                 xs.size(1), static_chunk_size, num_decoding_left_chunks, xs.device
             )
             masks = masks & chunk.unsqueeze(0)
-        empty_rows = masks.sum(dim=-1, keepdim=True) == 0
+        empty_rows = ~masks.any(dim=-1, keepdim=True)
         masks.masked_fill_(empty_rows, True)
         return masks
 
