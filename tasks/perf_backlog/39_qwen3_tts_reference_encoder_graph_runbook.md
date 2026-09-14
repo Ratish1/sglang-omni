@@ -9,16 +9,38 @@ code is written, the way doc 34 did for the window widths. No server, no Nsight.
 
 ## Steps
 
-From `tmp/an` pulled to this doc's head, the venv active, GPU 1:
+PR #2151 is merged (squash 868a94d08), so the code under test is upstream main in
+`tmp/main`; the script comes from `tmp/an` at this doc's head. Venv active, GPU 1:
 
 ```bash
-cd /sgl-workspace/sglang-omni/tmp/an
-CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python tasks/perf_backlog/scripts/ref_encoder_graph_bench.py \
+cd /sgl-workspace/sglang-omni/tmp/main && git fetch -q upstream main && git checkout -q upstream/main
+cd /sgl-workspace/sglang-omni/tmp/an && git pull -q
+cd /sgl-workspace/sglang-omni/tmp/main
+PYTHONPATH=. python -c "import sglang_omni; print(sglang_omni.__file__)" | tee /sgl-workspace/sglang-omni/tmp/ref_encoder_import_path.txt
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python ../an/tasks/perf_backlog/scripts/ref_encoder_graph_bench.py \
   Qwen/Qwen3-TTS-12Hz-1.7B-Base --meta zhaochenyang20/seed-tts-eval-arrow --lang en \
   --samples 64 --bucket-frames 48,64,96,128,192 --batches 1,2 --reps 20 \
   --out /sgl-workspace/sglang-omni/tmp/ref_encoder_graph_bench.json 2>&1 \
   | tee /sgl-workspace/sglang-omni/tmp/ref_encoder_graph_bench.log
 ```
+
+The import path line must end in `tmp/main/sglang_omni/__init__.py`.
+
+Optional, same session, no GPU: the talker's lock wait on the default launch pair, from
+the Nsight boots that stayed on the box after doc 36 (main and the branch without the
+patch, the `s3a-nsys` and `s3b-nsys` directories):
+
+```bash
+for arm in s3a-nsys s3b-nsys; do
+  python ../an/tasks/perf_backlog/scripts/nsys_lock_waits.py \
+    /sgl-workspace/sglang-omni/tmp/bw-session/$arm/window.sqlite \
+    /sgl-workspace/sglang-omni/tmp/bw-session/$arm/threads.json --top 6 \
+    | tee /sgl-workspace/sglang-omni/tmp/bw-session/$arm/lock_waits.txt
+done
+```
+
+The thread with the most launches and no `sem_wait` is the talker; its
+`pthread_cond_timedwait` column is the row for the PR table.
 
 The script loads the speech tokenizer through `stages._load_qwen3_tts_tokenizer` in
 bfloat16 as the vocoder does, takes the first 64 distinct reference files of the
