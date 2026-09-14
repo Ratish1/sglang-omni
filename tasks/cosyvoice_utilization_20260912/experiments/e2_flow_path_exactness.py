@@ -32,7 +32,6 @@ from cosyvoice.utils.mask import add_optional_chunk_mask
 
 from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID, SEEDTTS_DATASET_REVISION
 from benchmarks.dataset.seedtts import load_seedtts_samples
-from sglang_omni.models.fun_cosyvoice3.packed_dit import RowAttention, pack_rows
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     _align_flow_prompt,
     _load_prompt_audio,
@@ -483,13 +482,10 @@ def measure_packed_rows_vs_padded_rows(
 def measure_bf16_paths_against_float32(
     vocoder: CosyVoice3Vocoder, flow: object, hift: object, streams: list[Stream]
 ) -> list[Row]:
-    """Every bfloat16 path against the same float32 padded call: the padded
-    call under bfloat16 autocast (the path that shipped), the packed rows
-    with the per row SDPA loop, and the packed rows with flashinfer. The
-    question is whether flashinfer's path sits as far from float32 as the
-    shipped path does, not how far two noisy paths sit from each other."""
+    """The padded call under bfloat16 autocast (the path that shipped) and
+    the packed rows under the same autocast, each against the float32 padded
+    call. The packed rows must sit exactly where the padded call sits."""
     serving = CosyVoice3Vocoder(flow, hift, autocast_dtype=torch.bfloat16)
-    estimator = serving.flow.packed_estimator
     hop_items = [
         flow_input(stream, hop_window(*HOPS[index % len(HOPS)]))
         for index, stream in enumerate(streams)
@@ -500,23 +496,15 @@ def measure_bf16_paths_against_float32(
         "final": _padded_finals(vocoder, final_items),
     }
     paths = {
-        "padded sdpa": (
+        "padded": (
             _padded_hops(serving, hop_items),
             _padded_finals(serving, final_items),
         ),
-        "packed flashinfer": (
+        "packed": (
             serving.hop_batch(hop_items),
             serving.leftover_batch(final_items),
         ),
     }
-    estimator.attention_reference = True
-    try:
-        paths["packed sdpa"] = (
-            serving.hop_batch(hop_items),
-            serving.leftover_batch(final_items),
-        )
-    finally:
-        estimator.attention_reference = False
     rows: list[Row] = []
     for kind_index, kind in enumerate(("hop", "final")):
         for name, mels in paths.items():
@@ -526,190 +514,6 @@ def measure_bf16_paths_against_float32(
                 rows.append(
                     compare(f"{stream.sample_id} {kind} {name}", mel, reference)
                 )
-    return rows
-
-
-@dataclass
-class _Call:
-    index: int
-    row: Row
-    query_max: float
-    key_max: float
-    value_max: float
-    nan_count: int
-
-
-class _KernelAndReference:
-    """Runs both attention implementations on the same query, key and value,
-    logs how far apart they are with the input magnitudes, keeps the worst
-    call's tensors, and returns the kernel's output so the trajectory stays
-    the kernel's."""
-
-    def __init__(self, kernel, reference, rows, chunk_size, state: dict) -> None:
-        self.kernel = kernel
-        self.reference = reference
-        self.rows = rows
-        self.chunk_size = chunk_size
-        self.state = state
-
-    def __call__(self, query, key, value):
-        out = self.kernel(query, key, value)
-        row = compare("call", out, self.reference(query, key, value))
-        call = _Call(
-            index=len(self.state["calls"]),
-            row=row,
-            query_max=float(query.abs().max()),
-            key_max=float(key.abs().max()),
-            value_max=float(value.abs().max()),
-            nan_count=int(torch.isnan(out).sum()),
-        )
-        self.state["calls"].append(call)
-        worst = self.state.get("worst")
-        if worst is None or row[4] < worst["snr"]:
-            self.state["worst"] = {
-                "snr": row[4],
-                "index": call.index,
-                "query": query.detach().clone(),
-                "key": key.detach().clone(),
-                "value": value.detach().clone(),
-                "lengths": self.rows.lengths,
-                "chunk_size": self.chunk_size,
-            }
-        return out
-
-
-def _fresh_kernel(backend: str, workspace, rows, chunk_size, heads, head_dim):
-    import flashinfer
-
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        workspace, "NHD", backend=backend
-    )
-    return RowAttention(
-        rows,
-        chunk_size=chunk_size,
-        heads=heads,
-        head_dim=head_dim,
-        dtype=torch.bfloat16,
-        wrapper=wrapper,
-    )
-
-
-def measure_kernel_per_call(
-    flow: object, hift: object, streams: list[Stream]
-) -> list[Row]:
-    """flashinfer against the per row SDPA reference on the real query, key
-    and value of every attention call of one hop batch and one final batch,
-    22 blocks by 10 Euler steps each, under bfloat16 autocast. Reports the
-    count of calls under 40 dB, the worst calls with their step, block and
-    input magnitudes, and then, on the worst call's saved tensors, both
-    kernels against a float32 SDPA truth, fresh wrappers per backend, and
-    the shared wrapper replanned."""
-    serving = CosyVoice3Vocoder(flow, hift, autocast_dtype=torch.bfloat16)
-    estimator = serving.flow.packed_estimator
-    attn = estimator.dit.transformer_blocks[0].attn
-    heads, head_dim = attn.heads, attn.inner_dim // attn.heads
-    depth = len(estimator.dit.transformer_blocks)
-    original = estimator.row_attention
-    state: dict = {}
-
-    def both(rows, *, streaming):
-        kernel = original(rows, streaming=streaming)
-        estimator.attention_reference = True
-        try:
-            reference = original(rows, streaming=streaming)
-        finally:
-            estimator.attention_reference = False
-        chunk_size = estimator.chunk_size if streaming else None
-        return _KernelAndReference(kernel, reference, rows, chunk_size, state)
-
-    hop_items = [
-        flow_input(stream, hop_window(*HOPS[index % len(HOPS)]))
-        for index, stream in enumerate(streams)
-    ]
-    final_items = [flow_input(stream, stream.tokens.shape[1]) for stream in streams]
-    rows: list[Row] = []
-    estimator.row_attention = both
-    try:
-        for kind, run in (
-            ("hop", lambda: serving.hop_batch(hop_items)),
-            ("final", lambda: serving.leftover_batch(final_items)),
-        ):
-            state.clear()
-            state["calls"] = []
-            run()
-            calls = sorted(state["calls"], key=lambda call: call.row[4])
-            bad = [call for call in calls if call.row[4] < 40.0]
-            rows.append(
-                (f"{kind}: {len(bad)} of {len(calls)} calls under 40 dB", 0, 0, 0, 0)
-            )
-            for call in calls[:5]:
-                rows.append(
-                    (
-                        f"{kind} step {call.index // depth} block {call.index % depth} "
-                        f"|q| {call.query_max:.0f} |k| {call.key_max:.0f} "
-                        f"|v| {call.value_max:.1f} nan {call.nan_count}",
-                    )
-                    + call.row[1:]
-                )
-            rows.append((f"{kind} median call",) + calls[len(calls) // 2].row[1:])
-            worst = state["worst"]
-            torch.save(worst, f"e2_worst_call_{kind}.pt")
-            query, key, value = worst["query"], worst["key"], worst["value"]
-            packed_rows = pack_rows(worst["lengths"], query.device)
-            truth = RowAttention(
-                packed_rows,
-                chunk_size=worst["chunk_size"],
-                heads=heads,
-                head_dim=head_dim,
-                dtype=torch.float32,
-            )(query.float(), key.float(), value.float())
-            reference = RowAttention(
-                packed_rows,
-                chunk_size=worst["chunk_size"],
-                heads=heads,
-                head_dim=head_dim,
-                dtype=torch.bfloat16,
-            )(query, key, value)
-            rows.append(
-                compare(f"{kind} worst: sdpa bf16 vs float32 truth", reference, truth)
-            )
-            shared = original(packed_rows, streaming=worst["chunk_size"] is not None)
-            rows.append(
-                compare(
-                    f"{kind} worst: shared wrapper replanned vs truth",
-                    shared(query, key, value),
-                    truth,
-                )
-            )
-            workspace = torch.empty(
-                128 * 1024 * 1024, dtype=torch.uint8, device=query.device
-            )
-            backends = ("fa2",) if worst["chunk_size"] is not None else ("fa2", "fa3")
-            for backend in backends + ("auto",):
-                fresh = _fresh_kernel(
-                    backend,
-                    workspace,
-                    packed_rows,
-                    worst["chunk_size"],
-                    heads,
-                    head_dim,
-                )
-                rows.append(
-                    compare(
-                        f"{kind} worst: fresh {backend} wrapper vs truth",
-                        fresh(query, key, value),
-                        truth,
-                    )
-                )
-                rows.append(
-                    compare(
-                        f"{kind} worst: fresh {backend} run twice, second vs first",
-                        fresh(query, key, value),
-                        fresh(query, key, value),
-                    )
-                )
-    finally:
-        del estimator.row_attention
     return rows
 
 
@@ -798,12 +602,8 @@ def main() -> None:
             measure_packed_rows_vs_padded_rows(vocoder, streams),
         )
         print_table(
-            "6. bfloat16 paths against the float32 padded call",
+            "6. the padded and the packed call under bfloat16 against the float32 call",
             measure_bf16_paths_against_float32(vocoder, flow, hift, streams),
-        )
-        print_table(
-            "7. per call, flashinfer vs the SDPA reference on the real activations",
-            measure_kernel_per_call(flow, hift, streams),
         )
 
 
