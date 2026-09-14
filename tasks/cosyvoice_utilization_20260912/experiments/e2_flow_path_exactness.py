@@ -32,7 +32,6 @@ from cosyvoice.utils.mask import add_optional_chunk_mask
 
 from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID, SEEDTTS_DATASET_REVISION
 from benchmarks.dataset.seedtts import load_seedtts_samples
-from sglang_omni.models.fun_cosyvoice3.packed_dit import RowAttention, pack_rows
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     _align_flow_prompt,
     _load_prompt_audio,
@@ -480,111 +479,112 @@ def measure_packed_rows_vs_padded_rows(
     return rows
 
 
-def measure_attention_kernels(
-    flow: object, hift: object, streams: list[Stream]
+def measure_bf16_paths_against_float32(
+    vocoder: CosyVoice3Vocoder, flow: object, hift: object, streams: list[Stream]
 ) -> list[Row]:
-    """The flashinfer ragged kernel against the per row SDPA reference on the
-    same packed rows, both under bfloat16 autocast, the serving dtype; a
-    float32 call never reaches flashinfer."""
-    vocoder = CosyVoice3Vocoder(flow, hift, autocast_dtype=torch.bfloat16)
-    estimator = vocoder.flow.packed_estimator
+    """Every bfloat16 path against the same float32 padded call: the padded
+    call under bfloat16 autocast (the path that shipped), the packed rows
+    with the per row SDPA loop, and the packed rows with flashinfer. The
+    question is whether flashinfer's path sits as far from float32 as the
+    shipped path does, not how far two noisy paths sit from each other."""
+    serving = CosyVoice3Vocoder(flow, hift, autocast_dtype=torch.bfloat16)
+    estimator = serving.flow.packed_estimator
     hop_items = [
         flow_input(stream, hop_window(*HOPS[index % len(HOPS)]))
         for index, stream in enumerate(streams)
     ]
     final_items = [flow_input(stream, stream.tokens.shape[1]) for stream in streams]
-    kernel_hops = vocoder.hop_batch(hop_items)
-    kernel_finals = vocoder.leftover_batch(final_items)
+    truth = {
+        "hop": _padded_hops(vocoder, hop_items),
+        "final": _padded_finals(vocoder, final_items),
+    }
+    paths = {
+        "padded sdpa": (
+            _padded_hops(serving, hop_items),
+            _padded_finals(serving, final_items),
+        ),
+        "packed flashinfer": (
+            serving.hop_batch(hop_items),
+            serving.leftover_batch(final_items),
+        ),
+    }
     estimator.attention_reference = True
     try:
-        reference_hops = vocoder.hop_batch(hop_items)
-        reference_finals = vocoder.leftover_batch(final_items)
+        paths["packed sdpa"] = (
+            serving.hop_batch(hop_items),
+            serving.leftover_batch(final_items),
+        )
     finally:
         estimator.attention_reference = False
     rows: list[Row] = []
-    for stream, kernel, reference in zip(
-        streams, kernel_hops, reference_hops, strict=True
-    ):
-        rows.append(compare(f"{stream.sample_id} hop mel", kernel, reference))
-    for stream, kernel, reference in zip(
-        streams, kernel_finals, reference_finals, strict=True
-    ):
-        rows.append(compare(f"{stream.sample_id} final mel", kernel, reference))
+    for kind_index, kind in enumerate(("hop", "final")):
+        for name, mels in paths.items():
+            for stream, mel, reference in zip(
+                streams, mels[kind_index], truth[kind], strict=True
+            ):
+                rows.append(
+                    compare(f"{stream.sample_id} {kind} {name}", mel, reference)
+                )
     return rows
 
 
-def measure_bf16_noise_floor(
-    vocoder: CosyVoice3Vocoder, flow: object, hift: object, streams: list[Stream]
+class _KernelAndReference:
+    """Runs both attention implementations on the same query, key and value,
+    records how far apart they are, and returns the kernel's output so the
+    trajectory stays the kernel's."""
+
+    def __init__(self, kernel: object, reference: object, log: list[Row]) -> None:
+        self.kernel = kernel
+        self.reference = reference
+        self.log = log
+
+    def __call__(self, query, key, value):
+        out = self.kernel(query, key, value)
+        self.log.append(compare("call", out, self.reference(query, key, value)))
+        return out
+
+
+def measure_kernel_per_call(
+    flow: object, hift: object, streams: list[Stream]
 ) -> list[Row]:
-    """How far the serving dtype alone moves the padded path: the padded DiT
-    call under bfloat16 autocast against the same call in float32. The
-    kernel table reads against this band, not against zero."""
+    """flashinfer against the per row SDPA reference on the real query, key
+    and value of every attention call of one hop batch and one final batch,
+    22 blocks by 10 Euler steps each, under bfloat16 autocast. Reports the
+    worst call and the median call."""
     serving = CosyVoice3Vocoder(flow, hift, autocast_dtype=torch.bfloat16)
+    estimator = serving.flow.packed_estimator
+    original = estimator.row_attention
+    log: list[Row] = []
+
+    def both(rows, *, streaming):
+        kernel = original(rows, streaming=streaming)
+        estimator.attention_reference = True
+        try:
+            reference = original(rows, streaming=streaming)
+        finally:
+            estimator.attention_reference = False
+        return _KernelAndReference(kernel, reference, log)
+
     hop_items = [
         flow_input(stream, hop_window(*HOPS[index % len(HOPS)]))
         for index, stream in enumerate(streams)
     ]
     final_items = [flow_input(stream, stream.tokens.shape[1]) for stream in streams]
     rows: list[Row] = []
-    for stream, half, full in zip(
-        streams,
-        _padded_hops(serving, hop_items),
-        _padded_hops(vocoder, hop_items),
-        strict=True,
-    ):
-        rows.append(compare(f"{stream.sample_id} padded hop mel", half, full))
-    for stream, half, full in zip(
-        streams,
-        _padded_finals(serving, final_items),
-        _padded_finals(vocoder, final_items),
-        strict=True,
-    ):
-        rows.append(compare(f"{stream.sample_id} padded final mel", half, full))
-    return rows
-
-
-def measure_single_attention_call(streams: list[Stream], device: str) -> list[Row]:
-    """One attention call, flashinfer against the per row SDPA reference on
-    the same bfloat16 query, key and value at the DiT's shapes (16 heads of
-    64), with the chunk causal mask and without it."""
-    lengths = (
-        tuple(
-            (PROMPT_TOKENS + hop_window(*HOPS[index % len(HOPS)]) - PRE_LOOKAHEAD_LEN)
-            * TOKEN_MEL_RATIO
-            for index, _ in enumerate(streams)
-        )
-        * 2
-    )
-    rows_packed = pack_rows(lengths, torch.device(device))
-    total = sum(lengths)
-    generator = torch.Generator(device=device).manual_seed(0)
-    query, key, value = (
-        torch.randn(total, 16, 64, device=device, generator=generator).to(
-            torch.bfloat16
-        )
-        for _ in range(3)
-    )
-    rows: list[Row] = []
-    for chunk_size in (TOKEN_HOP_LEN * TOKEN_MEL_RATIO, None):
-        kernel = RowAttention(
-            rows_packed,
-            chunk_size=chunk_size,
-            heads=16,
-            head_dim=64,
-            device=torch.device(device),
-            dtype=torch.bfloat16,
-        )(query, key, value)
-        reference = RowAttention(
-            rows_packed,
-            chunk_size=chunk_size,
-            heads=16,
-            head_dim=64,
-            device=torch.device(device),
-            dtype=torch.bfloat16,
-            reference=True,
-        )(query, key, value)
-        label = "chunk causal" if chunk_size else "bidirectional"
-        rows.append(compare(f"one call {label} lengths={lengths}", kernel, reference))
+    estimator.row_attention = both
+    try:
+        for kind, run in (
+            ("hop", lambda: serving.hop_batch(hop_items)),
+            ("final", lambda: serving.leftover_batch(final_items)),
+        ):
+            log.clear()
+            run()
+            by_snr = sorted(log, key=lambda row: row[4])
+            worst, median = by_snr[0], by_snr[len(by_snr) // 2]
+            rows.append((f"{kind} worst of {len(log)} calls",) + worst[1:])
+            rows.append((f"{kind} median call",) + median[1:])
+    finally:
+        del estimator.row_attention
     return rows
 
 
@@ -673,16 +673,12 @@ def main() -> None:
             measure_packed_rows_vs_padded_rows(vocoder, streams),
         )
         print_table(
-            "6. flashinfer ragged attention vs the per row SDPA reference, bfloat16",
-            measure_attention_kernels(flow, hift, streams),
+            "6. bfloat16 paths against the float32 padded call",
+            measure_bf16_paths_against_float32(vocoder, flow, hift, streams),
         )
         print_table(
-            "7. the padded call under bfloat16 vs the same call in float32",
-            measure_bf16_noise_floor(vocoder, flow, hift, streams),
-        )
-        print_table(
-            "8. one attention call, flashinfer vs the SDPA reference, bfloat16",
-            measure_single_attention_call(streams, args.device),
+            "7. per call, flashinfer vs the SDPA reference on the real activations",
+            measure_kernel_per_call(flow, hift, streams),
         )
 
 

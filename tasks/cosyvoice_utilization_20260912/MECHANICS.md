@@ -12,7 +12,8 @@ Origins are named by the line that pays, never by the symptom. Updated with ever
 | finals run as steps through the packed non streaming call | 4a8d6f8c6, leftover_batch | 1,088 serial native finals were 354 s of a 530 s run | 4a8d6f8c6 | done |
 | every hop in one packed causal call | 138c41980, hop_batch | native singleton call 280 ms host per 70 to 90 ms GPU | ad181263b | done |
 | rows packed along the sequence, attention per row | packed_dit.py; the padded adapter paid rows times widest row | E2 at 16ade9019: packed vs padded 90 dB hops, 0.0 finals (fp32); model: runaway 2,048 token rows stalled 135 s of 359 s | cd2e42a9b | pending E2 rerun, c16 run |
-| one flashinfer wrapper per mask mode | prefill.py plan keeps the last mask buffer, run uses it whenever set | E2 table 6 at 16ade9019: finals 16 dB after a masked hop plan | cd2e42a9b | fixed, pending E2 tables 6 to 8 |
+| one flashinfer wrapper per mask mode, owned by the PackedDiT | prefill.py plan keeps the last mask buffer, run uses it whenever set | E2 at 6befb4517: finals back in the hop band, 26 to 27 dB; one call on random tensors 54 dB | b78105e53 | fixed |
+| flashinfer bf16 path vs the shipped bf16 path, both against float32 | open: two bf16 trajectories 27 dB apart while the shipped one is 38 dB from float32 | E2 table 6 rewritten to measure each path against float32; table 7 per call on real activations | analysis 9cdeaccc9+ | pending E2 rerun |
 | chunk mask built without the host sync | stages.py _patch_chunk_mask | 10 of 12 .item() drains per Flow call | 33c8b2731 | done |
 | empty row check with any, not a summed int64 copy | mask.py:233 upstream; our patch kept the sum | 2.29 GiB alloc in the OOM traceback; profiler: 8 bytes per element | af843811b | done, OOM 0 |
 | HiFT constants resident (window, sine table, f0 float64) | generator.py:226,310 slice then copy per call | 4 of 83 syncs per HiFT call; costs 259 MB of pool | c03d7c226 | done, cost recorded |
