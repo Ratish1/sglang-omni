@@ -480,10 +480,12 @@ def measure_packed_rows_vs_padded_rows(
 
 
 def measure_attention_kernels(
-    vocoder: CosyVoice3Vocoder, streams: list[Stream]
+    flow: object, hift: object, streams: list[Stream]
 ) -> list[Row]:
     """The flashinfer ragged kernel against the per row SDPA reference on the
-    same packed rows."""
+    same packed rows, both under bfloat16 autocast, the serving dtype; a
+    float32 call never reaches flashinfer."""
+    vocoder = CosyVoice3Vocoder(flow, hift, autocast_dtype=torch.bfloat16)
     estimator = vocoder.flow.packed_estimator
     hop_items = [
         flow_input(stream, hop_window(*HOPS[index % len(HOPS)]))
@@ -595,8 +597,8 @@ def main() -> None:
             measure_packed_rows_vs_padded_rows(vocoder, streams),
         )
         print_table(
-            "6. flashinfer ragged attention vs the per row SDPA reference",
-            measure_attention_kernels(vocoder, streams),
+            "6. flashinfer ragged attention vs the per row SDPA reference, bfloat16",
+            measure_attention_kernels(flow, hift, streams),
         )
 
 
