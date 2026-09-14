@@ -140,7 +140,6 @@ class PackedFlowBatch:
     prompt_mel_lengths: tuple[int, ...]
     total_mel_lengths: tuple[int, ...]
     combined_token_lengths_tensor: torch.Tensor
-    prompt_mel_lengths_tensor: torch.Tensor
     prompt_feat: torch.Tensor
     embedding: torch.Tensor
 
@@ -198,9 +197,6 @@ def pack_flow_inputs(
     combined_token_lengths_tensor = torch.tensor(
         combined_lengths, dtype=torch.int64, device=device
     )
-    prompt_mel_lengths_tensor = torch.tensor(
-        prompt_mel_lengths, dtype=torch.int64, device=device
-    )
 
     max_tokens = max(combined_lengths)
     token = torch.zeros(len(inputs), max_tokens, dtype=torch.int32, device=device)
@@ -237,7 +233,6 @@ def pack_flow_inputs(
         prompt_mel_lengths=prompt_mel_lengths,
         total_mel_lengths=total_mel_lengths,
         combined_token_lengths_tensor=combined_token_lengths_tensor,
-        prompt_mel_lengths_tensor=prompt_mel_lengths_tensor,
         prompt_feat=prompt_feat,
         embedding=embedding,
     )
