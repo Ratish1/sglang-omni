@@ -67,7 +67,9 @@ class _ReplayHiFT(_FakeHiFT):
 
 class _ReplayVocoder(stages.CosyVoice3Vocoder):
     def __init__(self, flow: _ReplayFlow, hift: _ReplayHiFT) -> None:
-        super().__init__(FunCosyVoice3Flow(flow), hift)
+        super().__init__(
+            FunCosyVoice3Flow(flow, packed_estimator=flow.packed_estimator), hift
+        )
         self.leftover_tokens: list[list[int]] = []
 
     def leftover_batch(self, items):
@@ -216,4 +218,4 @@ def test_recorded_c16_inbox_replays_in_order_and_completes(fixture: str) -> None
         waited = stats.result_at[request_id] - ready_at
         assert waited <= max(slack, 0.0) + round_s + 1e-9, request_id
 
-    assert any(call["x"].shape[0] >= 4 for call in flow.decoder.estimator.calls)
+    assert any(len(call["lengths"]) >= 4 for call in flow.packed_estimator.calls)
