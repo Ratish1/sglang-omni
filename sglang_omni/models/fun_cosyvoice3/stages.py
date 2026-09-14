@@ -992,12 +992,15 @@ def _patch_causal_conv_cache() -> None:
         raise RuntimeError(COSYVOICE_INSTALL_HINT) from exc
 
     original_forward = CausalConv1d.forward
+    if getattr(original_forward, "_sglang_omni_patched", False):
+        return
 
     def forward(self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)):
         if cache.size(2) == 0:
             cache = x.new_zeros(x.shape[0], x.shape[1], self.causal_padding)
         return original_forward(self, x, cache)
 
+    forward._sglang_omni_patched = True
     CausalConv1d.forward = forward
 
 
