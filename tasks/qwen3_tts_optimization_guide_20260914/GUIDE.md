@@ -63,6 +63,14 @@ These came from corrections during the work. Each one cost a rerun or a rewrite 
     They do unpacking, greps, SQLite queries, tables and mechanics explanations. Design, decisions
     and final code stay with you. Only CONFIRMED findings enter a plan.
 13. **Do not delete any CosyVoice or Qwen3-TTS branch without the user's word.** Worktrees stay.
+14. **Continuity is 100 percent, for every streaming model, always.** C50 and C100 at 100.0 on the
+    full corpus with zero failures is a gate, not a metric to trade. A change that buys first audio
+    or throughput with a continuity point is withdrawn. Every fix is listed in the model's
+    MECHANICS ledger before it is designed, so nothing needed is forgotten and nothing is tried twice.
+15. **A and B are different trees, proven.** Archive `head.txt` per boot and diff the two heads
+    before believing a delta. A PR squash merged into main means an "upstream main" arm fetched after
+    the merge is the PR tree; the pair then measures run to run noise (this happened with #2169,
+    merged 23:33 IST 2026-09-14).
 
 ## 1. Machines, checkouts, remotes, worktrees
 
@@ -191,7 +199,13 @@ Open items on the stack, both recorded, neither blocking:
   Measure before designing: c32 streaming A/B, main against the stack head, first audio p95 and C50.
   If it bites, the principled ranking is one slack order where an unstarted stream's slack is minus
   its waiting time, not a second queue.
-- **F11, PR #2169.** `_collect_stream_chunk_batch` (scheduling/streaming_simple_scheduler.py:346)
+- **F11, PR #2169, closed by two whole file reads on 2026-09-14.** On a streaming run of
+  MOSS-TTS Local or dots.tts every hunk of #2169 is behaviour neutral: the loop's new branch is
+  gated by `_has_ready_work`, which only CosyVoice overrides; the parked queue is empty on every
+  chunk collector entry; the stream done path keeps the same lock holder and emission order. A
+  MOSS-TTS Local c16 pair that read req/s 12.945 to 12.425 and C50 100 to 99.17 cannot be this PR;
+  see `plans/10_streaming_scheduler_followups.md` on the CosyVoice analysis branch. Original note:
+  `_collect_stream_chunk_batch` (scheduling/streaming_simple_scheduler.py:346)
   pulls from `_get_batch_message` (parked messages first, then the inbox) where main read the inbox
   only and skipped parked messages. Affects the coalescing schedulers: dots.tts (vocoder.py:152,
   batch 4), MOSS-TTS Local (streaming_vocoder.py:312, batch 8), Ming (streaming_vocoder.py:115, but
