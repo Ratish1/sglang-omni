@@ -1000,7 +1000,7 @@ def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
 
     builder = engine_builder.FunCosyVoice3EngineBuilder(onnx_intra_op_threads=6)
     builder._checkpoint_root = "/tmp"
-    builder.setup_model(
+    builder.before_memory_pool(
         model_worker=SimpleNamespace(
             model_runner=SimpleNamespace(
                 model=_StubModel(),
