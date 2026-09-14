@@ -1,5 +1,9 @@
 # 37. Runbook: the preprocessing segment under early ids (doc 32 item 3, the reads)
 
+Run 2026-09-14, archive `pp-session-results.zip`, readout in doc 38. The lock held
+fraction this runbook asked for is not in a `--gil` record (doc 38 section 3); the
+`gil_share.py` call below no longer takes `--rate` and `--duration`.
+
 Doc 36 left one regression: with PR #2151, early ids still costs 23.5 ms of TTFC mean
 over the PR alone (117.0 to 140.5 ms) and the whole of it is the preprocessing segment,
 36.3 to 57.8 ms p50, 100.6 to 143.2 p95. Two mechanisms can produce that and the session
@@ -28,7 +32,7 @@ and it needs the stage process pid, printed at boot as `spawned 1 process(es) (p
 ```bash
 py-spy record --pid $STAGE_PID --gil --threads --nonblocking --rate 250 --duration 60 \
   --format raw -o $S/$ARM/gil_raw.txt
-python tmp/an/tasks/perf_backlog/scripts/gil_share.py $S/$ARM/gil_raw.txt --rate 250 --duration 60 \
+python tmp/an/tasks/perf_backlog/scripts/gil_share.py $S/$ARM/gil_raw.txt \
   | tee $S/$ARM/gil_share.txt
 ```
 
