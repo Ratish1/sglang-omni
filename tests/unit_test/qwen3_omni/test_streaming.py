@@ -97,13 +97,15 @@ def _drain_outbox(scheduler: StreamingDetokenizeScheduler) -> list[OutgoingMessa
     return out
 
 
-def _thinker_stage_payload(output_modalities: list[str] | None) -> StagePayload:
+def _thinker_stage_payload(
+    output_modalities: list[str] | None, *, stream: bool = True
+) -> StagePayload:
     metadata = {}
     if output_modalities is not None:
         metadata["output_modalities"] = output_modalities
     return StagePayload(
         request_id="req-1",
-        request=OmniRequest(inputs=[], params={"stream": True}, metadata=metadata),
+        request=OmniRequest(inputs=[], params={"stream": stream}, metadata=metadata),
         data={},
     )
 
@@ -195,57 +197,106 @@ def test_qwen_thinker_stream_builder_keeps_talker_when_modalities_missing():
     assert [msg.target for msg in messages] == ["decode", "talker_ar"]
 
 
-def test_qwen_thinker_stream_builder_prefers_embed_over_layer_hidden():
+def test_qwen_thinker_stream_builder_sends_token_only_talker_payload():
     builder = make_thinker_stream_output_builder()
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=0),
         stage_payload=_thinker_stage_payload(["audio"]),
     )
-    embed = torch.tensor([[1.0, 2.0]])
-    layer_hidden = torch.tensor([[3.0, 4.0]])
     req_output = SimpleNamespace(
         data=11,
-        extra={"hidden_states": {"embed": embed, 24: layer_hidden}},
+        extra={"hidden_states": {"embed": torch.tensor([[1.0, 2.0]])}},
     )
 
     messages = builder("req-1", req_data, req_output)
 
     talker_message = next(msg for msg in messages if msg.target == "talker_ar")
-    assert torch.equal(talker_message.data, embed[0])
+    assert talker_message.data.device.type == "cpu"
+    assert talker_message.data.dtype == torch.long
+    assert talker_message.data.shape == (1,)
+    assert int(talker_message.data[0]) == 11
     assert talker_message.metadata == {"token_id": 11}
 
 
-def test_qwen_thinker_stream_builder_falls_back_to_layer_hidden():
+def test_qwen_thinker_stream_builder_sends_talker_token_without_hidden_states():
+    """The send condition is the request's output modality, not the payload.
+
+    Previously the talker event existed only because captured hidden happened
+    to be attached, so an absent capture silently starved the talker.
+    """
     builder = make_thinker_stream_output_builder()
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=0),
         stage_payload=_thinker_stage_payload(["audio"]),
     )
-    layer_hidden = torch.tensor([[3.0, 4.0]])
-    req_output = SimpleNamespace(
-        data=11,
-        extra={"hidden_states": {24: layer_hidden}},
-    )
+    req_output = SimpleNamespace(data=11, extra=None)
 
     messages = builder("req-1", req_data, req_output)
 
     talker_message = next(msg for msg in messages if msg.target == "talker_ar")
-    assert torch.equal(talker_message.data, layer_hidden[0])
+    assert int(talker_message.data[0]) == 11
     assert talker_message.metadata == {"token_id": 11}
 
 
-def test_qwen_thinker_stream_embed_preserves_talker_prefill_contract():
+def test_qwen_thinker_stream_builder_keeps_talker_token_when_not_streaming():
+    """The two events keep separate gates.
+
+    The decode event follows API streaming; the talker needs every generated
+    token either way. Collapsing them into one condition is the failure this
+    locks out.
+    """
+    builder = make_thinker_stream_output_builder()
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(inflight_middle_chunks=0),
+        stage_payload=_thinker_stage_payload(["audio"], stream=False),
+    )
+    req_output = SimpleNamespace(data=11, extra=None)
+
+    messages = builder("req-1", req_data, req_output)
+
+    assert [msg.target for msg in messages] == ["talker_ar"]
+
+
+def test_qwen_thinker_stream_builder_emits_nothing_without_a_sampled_token():
+    """No sampled token, no event -- for either target.
+
+    This boundary carries more weight than it used to: the talker event is now
+    gated on the request's output modality rather than on an attached tensor,
+    so a missing token is the only thing left that can stop it.
+    """
     builder = make_thinker_stream_output_builder()
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=0),
         stage_payload=_thinker_stage_payload(["audio"]),
     )
+    req_output = SimpleNamespace(data=None, extra=None)
+
+    assert builder("req-1", req_data, req_output) == []
+
+
+def test_qwen_thinker_stream_builder_suppresses_everything_mid_chunked_prefill():
+    """Prompt-side rows must never be emitted as generated assistant tokens."""
+    builder = make_thinker_stream_output_builder()
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(inflight_middle_chunks=1),
+        stage_payload=_thinker_stage_payload(["audio"]),
+    )
+    req_output = SimpleNamespace(data=11, extra=None)
+
+    assert builder("req-1", req_data, req_output) == []
+
+
+def test_qwen_thinker_stream_token_preserves_talker_prefill_contract():
+    builder = make_thinker_stream_output_builder()
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(inflight_middle_chunks=0),
+        stage_payload=_thinker_stage_payload(["audio"]),
+    )
+    # embed/layer_hidden below only build the legacy chunk this test compares
+    # against; the producer itself no longer sends either.
     embed = torch.tensor([[7.0, 8.0]])
     layer_hidden = torch.tensor([[70.0, 80.0]])
-    req_output = SimpleNamespace(
-        data=11,
-        extra={"hidden_states": {"embed": embed, 24: layer_hidden}},
-    )
+    req_output = SimpleNamespace(data=11, extra=None)
 
     messages = builder("req-1", req_data, req_output)
     talker_chunk = next(msg for msg in messages if msg.target == "talker_ar")
@@ -331,7 +382,7 @@ def test_qwen_thinker_stream_embed_preserves_talker_prefill_contract():
         thinker_done=True,
     )
 
-    assert torch.equal(talker_chunk.data, embed[0])
+    assert int(talker_chunk.data[0]) == 11
     assert talker_chunk.metadata == {"token_id": 11}
     assert torch.equal(current["input_embeds"], legacy["input_embeds"])
     assert torch.equal(
