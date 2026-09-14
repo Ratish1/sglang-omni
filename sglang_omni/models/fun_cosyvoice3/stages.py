@@ -73,6 +73,7 @@ COSYVOICE_INSTALL_HINT = (
 )
 
 CHUNK_MASK_COMPILE_DISABLED = False
+CAUSAL_CONV_CACHE_PATCHED = False
 
 FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
 # Note (chenyang):
@@ -978,6 +979,9 @@ def _patch_causal_conv_cache() -> None:
     """Allocate CausalConv1d's zero cache on the device. CosyVoice builds it
     on the CPU and copies it in, one host sync per conv per HiFT call.
     """
+    global CAUSAL_CONV_CACHE_PATCHED
+    if CAUSAL_CONV_CACHE_PATCHED:
+        return
     try:
         from cosyvoice.transformer.convolution import CausalConv1d
     except ImportError as exc:
@@ -991,6 +995,7 @@ def _patch_causal_conv_cache() -> None:
         return original_forward(self, x, cache)
 
     CausalConv1d.forward = forward
+    CAUSAL_CONV_CACHE_PATCHED = True
 
 
 def _keep_hift_constants_on_device(hift: torch.nn.Module, device: str) -> None:
