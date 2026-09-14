@@ -32,6 +32,7 @@ from cosyvoice.utils.mask import add_optional_chunk_mask
 
 from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID, SEEDTTS_DATASET_REVISION
 from benchmarks.dataset.seedtts import load_seedtts_samples
+from sglang_omni.models.fun_cosyvoice3.packed_dit import RowAttention, pack_rows
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     _align_flow_prompt,
     _load_prompt_audio,
@@ -512,6 +513,81 @@ def measure_attention_kernels(
     return rows
 
 
+def measure_bf16_noise_floor(
+    vocoder: CosyVoice3Vocoder, flow: object, hift: object, streams: list[Stream]
+) -> list[Row]:
+    """How far the serving dtype alone moves the padded path: the padded DiT
+    call under bfloat16 autocast against the same call in float32. The
+    kernel table reads against this band, not against zero."""
+    serving = CosyVoice3Vocoder(flow, hift, autocast_dtype=torch.bfloat16)
+    hop_items = [
+        flow_input(stream, hop_window(*HOPS[index % len(HOPS)]))
+        for index, stream in enumerate(streams)
+    ]
+    final_items = [flow_input(stream, stream.tokens.shape[1]) for stream in streams]
+    rows: list[Row] = []
+    for stream, half, full in zip(
+        streams,
+        _padded_hops(serving, hop_items),
+        _padded_hops(vocoder, hop_items),
+        strict=True,
+    ):
+        rows.append(compare(f"{stream.sample_id} padded hop mel", half, full))
+    for stream, half, full in zip(
+        streams,
+        _padded_finals(serving, final_items),
+        _padded_finals(vocoder, final_items),
+        strict=True,
+    ):
+        rows.append(compare(f"{stream.sample_id} padded final mel", half, full))
+    return rows
+
+
+def measure_single_attention_call(streams: list[Stream], device: str) -> list[Row]:
+    """One attention call, flashinfer against the per row SDPA reference on
+    the same bfloat16 query, key and value at the DiT's shapes (16 heads of
+    64), with the chunk causal mask and without it."""
+    lengths = (
+        tuple(
+            (PROMPT_TOKENS + hop_window(*HOPS[index % len(HOPS)]) - PRE_LOOKAHEAD_LEN)
+            * TOKEN_MEL_RATIO
+            for index, _ in enumerate(streams)
+        )
+        * 2
+    )
+    rows_packed = pack_rows(lengths, torch.device(device))
+    total = sum(lengths)
+    generator = torch.Generator(device=device).manual_seed(0)
+    query, key, value = (
+        torch.randn(total, 16, 64, device=device, generator=generator).to(
+            torch.bfloat16
+        )
+        for _ in range(3)
+    )
+    rows: list[Row] = []
+    for chunk_size in (TOKEN_HOP_LEN * TOKEN_MEL_RATIO, None):
+        kernel = RowAttention(
+            rows_packed,
+            chunk_size=chunk_size,
+            heads=16,
+            head_dim=64,
+            device=torch.device(device),
+            dtype=torch.bfloat16,
+        )(query, key, value)
+        reference = RowAttention(
+            rows_packed,
+            chunk_size=chunk_size,
+            heads=16,
+            head_dim=64,
+            device=torch.device(device),
+            dtype=torch.bfloat16,
+            reference=True,
+        )(query, key, value)
+        label = "chunk causal" if chunk_size else "bidirectional"
+        rows.append(compare(f"one call {label} lengths={lengths}", kernel, reference))
+    return rows
+
+
 def measure_load_time_patches(
     vocoder: CosyVoice3Vocoder,
     stream: Stream,
@@ -599,6 +675,14 @@ def main() -> None:
         print_table(
             "6. flashinfer ragged attention vs the per row SDPA reference, bfloat16",
             measure_attention_kernels(flow, hift, streams),
+        )
+        print_table(
+            "7. the padded call under bfloat16 vs the same call in float32",
+            measure_bf16_noise_floor(vocoder, flow, hift, streams),
+        )
+        print_table(
+            "8. one attention call, flashinfer vs the SDPA reference, bfloat16",
+            measure_single_attention_call(streams, args.device),
         )
 
 
