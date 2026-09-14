@@ -29,7 +29,10 @@ Non streaming is untouched: the reference encode is the streaming prompt path on
 | preprocessing segment p95 ms | 106.9 | 46.8 | -60.1 |
 | admission to first audio p50 ms | 106.3 | 92.8 | -13.5 |
 | seeded c1 TTFC mean ms | 55.6 | 54.9 | -0.7 |
+| GR active, percent (Nsight, timed cohort window at c16, separate boots) | 74.5 | 78.2 | +3.7 |
+| SM issue slot utilization, percent (same windows) | 13.9 | 14.7 | +0.8 |
+| SMs active, percent (same windows) | 41.5 | 44.1 | +2.6 |
 
-Quality on this PR: WER 1.05 percent, speaker similarity 71.35, inside the bands. Throughput is flat because closed loop c16 is bound by the talker; the first chunk moves.
+Quality on this PR: WER 1.05 percent, speaker similarity 71.35, inside the bands. Throughput is flat because closed loop c16 is bound by the talker; the first chunk moves. The Nsight rows come from one extra boot per arm under the profiler, GPU metrics sampled over the whole c16 pass and averaged over the benchmark's timed cohort (from its "Benchmarking" line to its "Results saved" line).
 
 Graph footprint 7 keys x 32 MiB. Knob to disable: `reference_encoder_cuda_graph_bucket_frames=[]`.
