@@ -99,16 +99,27 @@ two defects and settled the kernel choice:
    minus 3.2 dB (finals), clustered on hop blocks 2 and 4 and final blocks 5 and 20 with key
    magnitudes of 500 to 1,000. On the saved worst call tensors fresh fa2, fa3 and auto wrappers
    reproduced it deterministically and disagreed with each other, while SDPA in bfloat16 agreed
-   with SDPA in float32 at 58 to 70 dB. A CPU replay of the same tensors reproduces the failure by
-   rounding only the scaled logits to bfloat16 before the softmax (2.4 and 1.3 dB); rounding the
-   probabilities, the exponent argument or the query does not. The DiT has no QK normalisation and
-   its logits reach 1.3e5 on those blocks, where a 16 bit logit has a spacing of 1,024.
+   with SDPA in float32 at 58 to 70 dB. The mechanism, read in flashinfer's source at the v0.6.18
+   tag and verified line by line: the kernels keep the logits in float32 (FA2 `DTypeQKAccum` is
+   float for bfloat16, prefill.cuh:2554; FA3 `tSrS` is float, mainloop_mma.cuh:73) but use a finite
+   sentinel for minus infinity, `constexpr float inf = 5e4` (math.cuh:33), as the running max
+   initialiser (prefill.cuh:949), the mask fill (prefill.cuh:350) and FA3's fill (hopper/
+   attention_updater.cuh:168), in the raw q.k domain before the scale. A query row whose raw
+   logits all sit below minus 5e4 never raises the max and the output guard zeroes it
+   (variant_helper.cuh:86). This DiT has no QK normalisation; on the worst hop call 81 percent of
+   query rows and on the worst final call 53 percent have every raw logit below minus 5e4. A CPU
+   replay of those semantics on the saved tensors gives 0.6 dB for the hop, the observed 0.6, and
+   3.7 dB for the final, the observed fresh FA2 value. flashinfer fixed it in PR #4401 (merged
+   2026-08-20, IEEE infinity on main), after the v0.6.18 tag SGLang pins; issues #4267, #4450,
+   #4451, #4452. Our usage was correct. An earlier reading of mine, bfloat16 rounding of the
+   logits, reproduced a similar SNR by coincidence and is withdrawn.
 
 Decision, commit ee699a4a5: the packed rows keep every per token module packed and run attention
 as the padded DiT runs it, SDPA on the rows scattered to the padded layout under the row key mask
-and the chunk causal mask, with the logits in float32. The packed forward is now bit identical to
-`DiT.forward` on the tiny real DiT (0.0 in float64) and carries no flashinfer, workspace, wrapper
-or dtype dispatch. The attention's own padded cost remains, about 8 percent of the per token work
+and the chunk causal mask, masked with IEEE minus infinity. The packed forward is now bit identical
+to `DiT.forward` on the tiny real DiT (0.0 in float64) and carries no flashinfer, workspace,
+wrapper or dtype dispatch. Any future ragged kernel for this model must be qualified on its raw
+logit range, below minus 1.8e5 and above 1.6e6 on the saved calls. The attention's own padded cost remains, about 8 percent of the per token work
 at typical hop widths and a third at a 4,196 frame runaway row; a ragged attention with float32
 logits (FlexAttention under torch.compile) is the follow up for that share.
 
