@@ -333,18 +333,29 @@ def measure(
     warmup: int = 2,
     repeats: int = 5,
     keep_trace: bool = True,
+    prepare: Callable[[], None] | None = None,
 ) -> dict:
+    # prepare runs before every run, outside the timed and profiled window: a
+    # call that consumes state (a prefill admits and finishes its requests)
+    # gets identical state each time.
+    def ready():
+        if prepare is not None:
+            prepare()
+        torch.cuda.synchronize()
+
     for _ in range(warmup):
+        ready()
         call()
         torch.cuda.synchronize()
     walls = []
     for _ in range(repeats):
-        torch.cuda.synchronize()
+        ready()
         started = time.perf_counter()
         call()
         torch.cuda.synchronize()
         walls.append((time.perf_counter() - started) * 1e3)
     call_label = f"call:{label}"
+    ready()
     with module_ranges(roots or {}), function_ranges(list(functions)):
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]

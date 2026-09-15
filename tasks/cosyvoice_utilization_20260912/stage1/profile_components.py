@@ -335,6 +335,7 @@ def main() -> None:
     components = set(args.components.split(","))
     os.makedirs(args.out, exist_ok=True)
     info = provenance(args.device)
+    info["sglang_omni"] = stages.__file__
     checkpoint, vocoder = load_vocoder(args.model, args.device, torch.bfloat16)
     stream = build_streams(
         checkpoint, args.device, count=1, prompt_tokens=PROMPT_TOKENS, min_generated=1

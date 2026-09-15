@@ -58,6 +58,32 @@ From the stage 0 c16 call ledger (readout 03, section 6):
 Prompts are real SeedTTS references; generated tokens are random ids of the stated length. Numerics are
 not measured here (stage 0 E2, E5, E6 did that).
 
+### AR (`profile_ar.py`, its own process)
+
+The engine comes from the serving factory (`create_sglang_tts_engine_executor`, bf16, 16 ONNX threads,
+hop 25) and is never started. One step is the event loop body without the inbox poll:
+`get_next_batch_to_run`, `run_batch`, `process_batch_result`. Requests enter through the real ingress
+(`preprocess_cosyvoice3_payload`, then `process_input_requests`) from the first 400 SeedTTS en samples,
+stream on.
+
+| point | shape | why |
+|---|---|---|
+| ar_prefill_rows1_prompt{min, p50, max} | one request | prefill cost against prompt length |
+| ar_prefill_rows16_median | 16 requests near the median prompt | c16 arrival cohort |
+| ar_prefill_admit_of32_median | 32 waiting, one step admits what max_prefill_tokens allows | the prefill ceiling |
+| ar_decode_rows{1, 16, 32}_graph and _eager | one decode step | replay against eager, launches per step |
+| ar_decode_hop25_rows{1, 16, 32}_graph | 25 steps as one call | one hop, one stream chunk per request |
+| ar_decode_rows32_graph_generated1000 | one step at 1,000 generated tokens | decode against KV length |
+
+- Each prefill repeat flushes the radix cache first, so no prefix is reused. Its requests carry
+  max_new_tokens 1, so the step finishes them through the normal path.
+- Decode requests hold stop tokens off with min_new_tokens equal to max_new_tokens.
+- Eager clears `decode_cuda_graph_runner`, the state `disable_cuda_graph` leaves.
+- `ar.md` lists the shape of every measured step (mode, rows, tokens), so a point that formed a
+  different batch is visible.
+- The KV pool is sized without the vocoder resident, so it is larger than in serving. Step cost does
+  not depend on pool size.
+
 ## What each ledger holds
 
 `trace_ledger.py` times the call without instrumentation (synchronized median of 5), then runs it once
@@ -95,15 +121,22 @@ S1=/sgl-workspace/wt/cosyvoice-analysis/tasks/cosyvoice_utilization_20260912/sta
 OUT=/sgl-workspace/wt/cosyvoice-analysis/artifacts/cosyvoice/stage1-$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$OUT"
 cd /sgl-workspace/wt/cosy-main
+export PYTHONPATH=/sgl-workspace/wt/cosy-main
 git rev-parse HEAD > "$OUT/head.txt"
 python -c "import sglang_omni; print(sglang_omni.__file__)" > "$OUT/import_path.txt"
 nvidia-smi -i 0 --query-compute-apps=pid,used_memory --format=csv
 CUDA_VISIBLE_DEVICES=0 python "$S1/profile_components.py" --device cuda:0 \
   --components flow,hift,preprocess --out "$OUT" 2>&1 | tee "$OUT/components.log"
+CUDA_VISIBLE_DEVICES=0 python "$S1/profile_ar.py" --device cuda:0 \
+  --out "$OUT" 2>&1 | tee "$OUT/ar.log"
 ```
 
-GPU 0 must list no process. Outputs: `components.md` (tables), `components.json` (every field),
-`traces/<point>.trace.json.gz` (the Chrome traces, for Perfetto or `chrome://tracing`).
+`PYTHONPATH` makes both scripts import the tree under test (a script's own directory, not the working
+directory, is first on its path); each JSON records the `sglang_omni` file it loaded, which must be
+under `/sgl-workspace/wt/cosy-main`. The two scripts run as separate processes, one after the other.
+GPU 0 must list no process. Outputs: `components.md` and `ar.md` (tables), `components.json` and
+`ar.json` (every field), `traces/<point>.trace.json.gz` (the Chrome traces, for Perfetto or
+`chrome://tracing`).
 
 ## Return
 
