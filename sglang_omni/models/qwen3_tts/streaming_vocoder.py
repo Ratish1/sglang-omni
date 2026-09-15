@@ -105,7 +105,8 @@ def _decode_graph_frame_counts(
 @dataclass
 class _Qwen3TTSStreamState:
     code_chunks: list[torch.Tensor] = field(default_factory=list)
-    codes_ready: Any = None
+    # note(ratish): the absolute end frame of each chunk and its producer's event.
+    chunk_ready_events: list[tuple[int, Any]] = field(default_factory=list)
     pending_codes_ready: Any = None
     total_frames: int = 0
     pruned_frames: int = 0
@@ -1283,8 +1284,9 @@ class Qwen3TTSStreamingVocoderScheduler(
             # streams; the workers' `set_stream` calls stay in their threads.
             codes_ready = torch.cuda.Event()
             codes_ready.record()
-        state.codes_ready = codes_ready
         state.total_frames += int(codes.shape[0])
+        if codes_ready is not None:
+            state.chunk_ready_events.append((state.total_frames, codes_ready))
 
     def should_decode(self, state: _Qwen3TTSStreamState, *, is_final: bool) -> bool:
         if is_final:
@@ -1379,8 +1381,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             raise RuntimeError(
                 "Qwen3-TTS incremental codec codes were pruned too early"
             )
-        self._wait_codes_ready(state)
-        codes = torch.cat(state.code_chunks, dim=0)
+        codes = self._codes_through(state, end_frame)
         decoder_input = (
             codes[
                 consumed_frames - state.pruned_frames : end_frame - state.pruned_frames
@@ -1490,8 +1491,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             )
 
         end_frame = state.ref_frames + generated_frames
-        self._wait_codes_ready(state)
-        codes = torch.cat(state.code_chunks, dim=0)
+        codes = self._codes_through(state, end_frame)
         decoder_input = (
             codes[
                 consumed_frames - state.pruned_frames : end_frame - state.pruned_frames
@@ -1617,8 +1617,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             and state.pruned_frames + int(state.code_chunks[0].shape[0]) <= window_start
         ):
             state.pruned_frames += int(state.code_chunks.pop(0).shape[0])
-        self._wait_codes_ready(state)
-        codes = torch.cat(state.code_chunks, dim=0)
+        codes = self._codes_through(state, window_end)
         decoder_input = (
             codes[window_start - state.pruned_frames : window_end - state.pruned_frames]
             .transpose(0, 1)
@@ -1633,11 +1632,22 @@ class Qwen3TTSStreamingVocoderScheduler(
             chunks=tuple(state.code_chunks),
         )
 
-    def _wait_codes_ready(self, state: _Qwen3TTSStreamState) -> None:
-        """Order this thread's stream after the talker's newest chunk."""
-        if state.codes_ready is None:
-            return
-        torch.cuda.current_stream(self._device).wait_event(state.codes_ready)
+    def _codes_through(
+        self, state: _Qwen3TTSStreamState, end_frame: int
+    ) -> torch.Tensor:
+        """Retained codes through the chunk holding end_frame, once it is written."""
+        for chunk_end, ready in state.chunk_ready_events:
+            if chunk_end >= end_frame:
+                torch.cuda.current_stream(self._device).wait_event(ready)
+                break
+        chunks = []
+        frames = state.pruned_frames
+        for chunk in state.code_chunks:
+            chunks.append(chunk)
+            frames += int(chunk.shape[0])
+            if frames >= end_frame:
+                break
+        return torch.cat(chunks, dim=0)
 
     @staticmethod
     def _decode_stream_priority() -> int:

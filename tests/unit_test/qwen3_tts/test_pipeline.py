@@ -3438,42 +3438,56 @@ def test_qwen3_tts_streaming_vocoder_avoids_accelerator_value_sync(
     assert scheduler.validate_chunk("request", state, Codes()) is chunk
 
 
-def test_qwen3_tts_decode_plan_waits_for_the_talker_chunk_event(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Planning orders the worker's stream after the newest chunk's event only."""
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen3_tts_decode_plan_does_not_wait_for_a_chunk_past_its_last_frame() -> None:
+    """A plan over the first chunk runs while a later chunk is still being written."""
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         _FakeQwen3TTSTokenizer(),
-        device="cpu",
+        device="cuda",
+        enable_stateful_codec_decoder=False,
     )
     state = scheduler.create_stream_state("request")
-    state.code_chunks.append(torch.ones((1, 2), dtype=torch.long))
-    state.total_frames = 1
-    ready = object()
-    state.codes_ready = ready
+    state.num_quantizers = 2
+    torch.cuda.synchronize()
+    first = torch.full((1, 2), 7, dtype=torch.long, device="cuda")
+    first_ready = torch.cuda.Event()
+    first_ready.record()
+    scheduler.latch_stream_contract(
+        "request",
+        state,
+        {"num_quantizers": 2, "codes_ready_event": first_ready},
+        origin="stream metadata",
+    )
+    scheduler.ingest("request", state, first)
+    torch.cuda._sleep(400_000_000)
+    second = torch.full((1, 2), 9, dtype=torch.long, device="cuda")
+    second_ready = torch.cuda.Event()
+    second_ready.record()
+    scheduler.latch_stream_contract(
+        "request",
+        state,
+        {"num_quantizers": 2, "codes_ready_event": second_ready},
+        origin="stream metadata",
+    )
+    scheduler.ingest("request", state, second)
 
-    waited: list[object] = []
+    worker = torch.cuda.Stream()
+    with torch.cuda.stream(worker):
+        plan = scheduler._build_decode_plan(
+            state, is_final=True, max_generated_frames=1
+        )
+    worker.synchronize()
+    talker_still_writing = not torch.cuda.current_stream().query()
+    torch.cuda.synchronize()
 
-    class WorkerStream:
-        def wait_event(self, event):
-            waited.append(event)
-
-    worker_stream = WorkerStream()
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: worker_stream)
-    plan = scheduler._build_decode_plan(state, is_final=True)
+    assert talker_still_writing
     assert plan is not None
-    assert waited == [ready]
-    # note (luojiaxuan): the plan keeps every retained chunk alive until it is
-    # committed, so the talker cannot reuse their storage under a queued read.
     assert plan.chunks == tuple(state.code_chunks)
-
-    state.codes_ready = None
-    waited.clear()
-    assert scheduler._build_decode_plan(state, is_final=True) is not None
-    assert waited == []
+    assert plan.decoder_input.shape == (1, 2, 1)
+    assert plan.decoder_input.eq(7).all().item()
 
 
-def test_qwen3_tts_ingest_keeps_the_newest_chunk_event() -> None:
+def test_qwen3_tts_ingest_keeps_each_chunk_event_at_its_end_frame() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         _FakeQwen3TTSTokenizer(),
         device="cpu",
@@ -3487,8 +3501,7 @@ def test_qwen3_tts_ingest_keeps_the_newest_chunk_event() -> None:
         {"num_quantizers": 2, "codes_ready_event": first},
         origin="stream metadata",
     )
-    scheduler.ingest("request", state, torch.ones((1, 2), dtype=torch.long))
-    assert state.codes_ready is first
+    scheduler.ingest("request", state, torch.ones((2, 2), dtype=torch.long))
     scheduler.latch_stream_contract(
         "request",
         state,
@@ -3496,12 +3509,13 @@ def test_qwen3_tts_ingest_keeps_the_newest_chunk_event() -> None:
         origin="stream metadata",
     )
     scheduler.ingest("request", state, torch.ones((1, 2), dtype=torch.long))
-    assert state.codes_ready is second
     scheduler.latch_stream_contract(
         "request", state, {"num_quantizers": 2}, origin="stream metadata"
     )
     scheduler.ingest("request", state, torch.ones((1, 2), dtype=torch.long))
-    assert state.codes_ready is None
+
+    assert state.chunk_ready_events == [(2, first), (3, second)]
+    assert state.total_frames == 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -3524,11 +3538,13 @@ def test_qwen3_tts_ingest_records_readiness_for_a_device_chunk_without_an_event(
 
     scheduler.ingest("request", state, codes)
 
-    assert isinstance(state.codes_ready, torch.cuda.Event)
+    ((end_frame, ready),) = state.chunk_ready_events
+    assert end_frame == 1
+    assert isinstance(ready, torch.cuda.Event)
     worker = torch.cuda.Stream()
-    worker.wait_event(state.codes_ready)
+    worker.wait_event(ready)
     worker.synchronize()
-    assert state.codes_ready.query()
+    assert ready.query()
     assert state.code_chunks == [codes]
 
 
