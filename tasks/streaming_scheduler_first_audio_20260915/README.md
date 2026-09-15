@@ -63,10 +63,5 @@ Qwen3-TTS:
 - `scripts/compare_to_a.py`: prints A, PR 1 head and B with B minus A for one `speed_results.json`.
 - `scripts/first_chunk_anatomy.py`: per hop first audio breakdown from the request event recorder,
   copied unchanged from `fb590a2c3:tasks/perf_backlog/scripts/first_chunk_anatomy.py`.
-- `runbooks/01_moss_tts_local_stream_c16.md`: B census plus the recorder pass and the breakdown.
-
-## Validation items before the first B run
-
-1. The client flags of each A run, so B uses the same: for MOSS-TTS Local, whether A passed
-   `--ref-format references --token-count auto`; for Qwen3-TTS, the model path.
-2. The commit hash each A run booted.
+- `runbooks/01_moss_tts_local_stream_c16.md`: B census plus the recorder pass and the breakdown,
+  with the benchmark at its default settings as in the A runs.
