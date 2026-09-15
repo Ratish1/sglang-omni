@@ -35,7 +35,8 @@ Origins are named by the line that pays, never by the symptom. Updated with ever
 |---|---|---|
 | Flow CUDA graphs capture 26 (batch, frames) shapes, 11 to 18 s of boot | config.py FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES, stages.py FlowCudaGraphRunner | SGLang buckets by batch and pads tokens; capture by total tokens after the packed layout |
 | 280 ms host floor per Flow call, 18,100 launches | solve_flow_euler_packed, 10 steps x 22 blocks | graph the packed step by total token buckets |
-| upsample encoder keeps 2 .item() syncs per call | upsample_encoder.py:286,299 via mask.py:233 | Nsight sync count per call |
+| 2 syncs per Flow call left after #2171; the upsample encoder origin was wrong, the CosyVoice3 flow has only a PreLookaheadLayer (cosyvoice3.yaml:38-51) | unknown; V0 in ROADMAP_20260915.md | per call sync ledger on the stack head |
+| every hop recomputes the prompt and all earlier frames, then drops them | reference model.py:436, streaming.py hop math | E5 prefix stability and cached hop exactness; ROADMAP_20260915.md 1.2 |
 | HiFT recomputes the full history per hop | hift_delta, reference does the same | hop window state; E1 exactness |
 | preprocessing: campplus provider, thread pools, finalize lock | request_builders, utils | per request preprocessing time at c16 |
 | runaway generations, 2,048 tokens for a 5 word text | benchmark client passes max_new_tokens=2048; the contract caps at 20x text | not ours; same rows on every arm |

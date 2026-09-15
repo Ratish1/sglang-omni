@@ -6,6 +6,9 @@ Worktree: `analysis/cosyvoice-utilization-20260912`, based on Omni `645b472cdb2d
 
 Status 2026-09-13: the H100 results returned under `artifacts/cosyvoice-results-20260913/` were sliced with the [perfkit](perfkit/README.md); the measured ledgers are in [perfkit/RESULTS_20260913.md](perfkit/RESULTS_20260913.md) and the resulting root-cause-ordered program is [OPTIMIZATION_PLAN.md](OPTIMIZATION_PLAN.md). That plan supersedes the conditional sequence in `plans/00_stack.md` where the two differ.
 
+Status 2026-09-15: the order of work after the stack, streaming and buffered, with its gates and
+validation tasks, is [ROADMAP_20260915.md](ROADMAP_20260915.md).
+
 Read these in order:
 
 1. [Architecture and runtime contracts](ARCHITECTURE.md): topology, model math, streaming, ownership, and existing SGLang reuse.
