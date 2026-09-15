@@ -14,12 +14,6 @@ PRE_LOOKAHEAD_LEN = 3
 TOKEN_MEL_RATIO = 2
 STREAM_SCALE_FACTOR = 2
 TOKEN_MAX_HOP_LEN = TOKEN_HOP_LEN * 4
-SAMPLE_RATE = 24000
-
-# note (guozhihao-224): pad=0 first flush is hop+lookahead; producer adds
-# prompt_token_pad so the first message matches the vocoder causal boundary.
-AR_INITIAL_FLUSH_TOKENS = TOKEN_HOP_LEN + PRE_LOOKAHEAD_LEN
-AR_FOLLOWUP_FLUSH_TOKENS = TOKEN_HOP_LEN
 
 
 def prompt_token_len(prompt_token: Any) -> int:

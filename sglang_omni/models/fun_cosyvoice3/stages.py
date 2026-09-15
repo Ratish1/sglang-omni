@@ -1844,7 +1844,7 @@ class _FunCosyVoice3MlxStreamingVocoderScheduler(
     ) -> dict[str, Any]:
         del request_id, state
         pipeline_state = FunCosyVoice3State.from_dict(payload.data)
-        result = {"modality": "audio", "sample_rate": self._sample_rate}
+        result = {"modality": "audio", "sample_rate": self.sample_rate}
         usage = build_usage(pipeline_state)
         if usage is not None:
             result["usage"] = usage
@@ -1854,7 +1854,7 @@ class _FunCosyVoice3MlxStreamingVocoderScheduler(
         del request_id
         return audio_waveform_payload(
             waveform,
-            sample_rate=self._sample_rate,
+            sample_rate=self.sample_rate,
             modality="audio",
             source_hint="Fun-CosyVoice3",
         )
