@@ -33,17 +33,11 @@ import argparse
 import json
 import os
 import statistics
-import sys
 import time
 from dataclasses import replace
 
 import torch
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.join(HERE, "..", "stage0"))
-
-from common import (  # noqa: E402
+from common import (
     FLOW_AUDIO_SR,
     MODEL_ID,
     PROMPT_AUDIO_SR,
@@ -52,13 +46,21 @@ from common import (  # noqa: E402
     load_vocoder,
     provenance,
 )
-from trace_ledger import measure, render_markdown  # noqa: E402
+from trace_ledger import measure, render_markdown
 
-from sglang_omni.models.fun_cosyvoice3 import packed_dit, stages  # noqa: E402
-from sglang_omni.models.fun_cosyvoice3.sglang_model import VOCAB_SIZE  # noqa: E402
-from sglang_omni.models.fun_cosyvoice3.streaming import (  # noqa: E402
-    PRE_LOOKAHEAD_LEN,
-    TOKEN_MEL_RATIO,
+from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID, SEEDTTS_DATASET_REVISION
+from benchmarks.dataset.seedtts import load_seedtts_samples
+from sglang_omni.models.fun_cosyvoice3 import packed_dit, stages
+from sglang_omni.models.fun_cosyvoice3.request_builders import (
+    _load_prompt_audio,
+    _load_prompt_audio_24k,
+)
+from sglang_omni.models.fun_cosyvoice3.sglang_model import VOCAB_SIZE
+from sglang_omni.models.fun_cosyvoice3.streaming import PRE_LOOKAHEAD_LEN
+from sglang_omni.models.fun_cosyvoice3.utils import (
+    SpeakerEncoder,
+    SpeechTokenizerV3,
+    extract_prompt_speech_feat,
 )
 
 PROMPT_TOKENS = 125
@@ -168,36 +170,36 @@ def profile_flow(vocoder, stream, device, out_dir, repeats):
         f"flow_buffered_rows16_graph_{bucket}": buffered(True),
         "flow_buffered_rows16_eager": buffered(False),
     }
+    # note(ratish): no outer inference_mode; the serving vocoder calls these
+    # without one and the Flow entry points carry their own.
     ledgers = []
-    with torch.inference_mode():
-        for label, call in points.items():
-            print(f"profiling {label}", flush=True)
-            ledgers.append(
-                measure(
-                    call,
-                    label=label,
-                    out_dir=out_dir,
-                    roots={"flow": vocoder.flow.flow},
-                    functions=flow_functions(),
-                    repeats=repeats,
-                )
+    for label, call in points.items():
+        print(f"profiling {label}", flush=True)
+        ledgers.append(
+            measure(
+                call,
+                label=label,
+                out_dir=out_dir,
+                roots={"flow": vocoder.flow.flow},
+                functions=flow_functions(),
+                repeats=repeats,
             )
+        )
     vocoder.flow.cuda_graph_runner = None
     return ledgers
 
 
 def profile_hift(vocoder, stream, out_dir, repeats):
-    with torch.inference_mode():
-        item = flow_input(
-            replace(
-                stream,
-                tokens=torch.randint(
-                    0, VOCAB_SIZE, (1, FIRST_HOP_WINDOW), dtype=torch.int32
-                ),
+    item = flow_input(
+        replace(
+            stream,
+            tokens=torch.randint(
+                0, VOCAB_SIZE, (1, FIRST_HOP_WINDOW), dtype=torch.int32
             ),
-            FIRST_HOP_WINDOW,
-        )
-        hop_mel = vocoder.hop_batch([item])[0]
+        ),
+        FIRST_HOP_WINDOW,
+    )
+    hop_mel = vocoder.hop_batch([item])[0]
     samples_per_frame = int(vocoder.hift.istft_params["hop_len"])
     for rate in vocoder.hift.upsample_rates:
         samples_per_frame *= int(rate)
@@ -222,35 +224,22 @@ def profile_hift(vocoder, stream, out_dir, repeats):
     batch_mel = hop_mel.repeat(1, 1, 250 // new_frames)
     points["hift_batch_rows16_250"] = lambda: vocoder.mel2wav_batch([batch_mel] * 16)
     ledgers = []
-    with torch.inference_mode():
-        for label, call in points.items():
-            print(f"profiling {label}", flush=True)
-            ledgers.append(
-                measure(
-                    call,
-                    label=label,
-                    out_dir=out_dir,
-                    roots={"hift": vocoder.hift},
-                    functions=hift_functions(vocoder.hift),
-                    repeats=repeats,
-                )
+    for label, call in points.items():
+        print(f"profiling {label}", flush=True)
+        ledgers.append(
+            measure(
+                call,
+                label=label,
+                out_dir=out_dir,
+                roots={"hift": vocoder.hift},
+                functions=hift_functions(vocoder.hift),
+                repeats=repeats,
             )
+        )
     return ledgers
 
 
 def profile_preprocess(checkpoint, device, repeats):
-    from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID, SEEDTTS_DATASET_REVISION
-    from benchmarks.dataset.seedtts import load_seedtts_samples
-    from sglang_omni.models.fun_cosyvoice3.request_builders import (
-        _load_prompt_audio,
-        _load_prompt_audio_24k,
-    )
-    from sglang_omni.models.fun_cosyvoice3.utils import (
-        SpeakerEncoder,
-        SpeechTokenizerV3,
-        extract_prompt_speech_feat,
-    )
-
     threads = max(1, min(16, os.cpu_count() or 1))
     tokenizer = SpeechTokenizerV3(
         os.path.join(checkpoint, "speech_tokenizer_v3.onnx"),

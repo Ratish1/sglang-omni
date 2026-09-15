@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import functools
 import gzip
 import json
 import os
@@ -33,6 +34,7 @@ from collections.abc import Callable, Iterable
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
+RUNTIME_CATEGORIES = ("cuda_runtime", "cuda_driver")
 SYNC_NAMES = ("cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize")
 BLOCKING_COPY_NAMES = ("cudaMemcpy",)
 LAUNCH = re.compile(r"LaunchKernel|GraphLaunch")
@@ -133,10 +135,12 @@ def parse_trace(path: str, call_label: str, top: int = 15) -> dict:
         for c in categories
         if c == "kernel" or (c.startswith("gpu_") and c != "gpu_user_annotation")
     }
+    # note(ratish): the same range also appears as gpu_user_annotation on the
+    # device stream's tid, with device timing; only the host range bounds the call.
     calls = [
         e
         for e in events
-        if e.get("name") == call_label and e.get("cat") not in device_categories
+        if e.get("name") == call_label and e.get("cat") == "user_annotation"
     ]
     if not calls:
         raise RuntimeError(f"no range named {call_label!r} in {path}")
@@ -157,7 +161,10 @@ def parse_trace(path: str, call_label: str, top: int = 15) -> dict:
         and inside(e)
         and str(e.get("name", "")).startswith(("mod:", "fn:"))
     ]
-    runtime = [e for e in events if e.get("cat") == "cuda_runtime" and inside(e)]
+    # note(ratish): cuBLAS and cuDNN launch through the driver API
+    # (cuLaunchKernel under cuda_driver); reading only cuda_runtime would drop
+    # their kernels from busy time and launches.
+    runtime = [e for e in events if e.get("cat") in RUNTIME_CATEGORIES and inside(e)]
     if runtime and not any("correlation" in e.get("args", {}) for e in runtime):
         raise RuntimeError("cuda_runtime events carry no args.correlation")
 
@@ -323,6 +330,16 @@ def parse_trace(path: str, call_label: str, top: int = 15) -> dict:
     }
 
 
+@functools.cache
+def warm_profiler() -> None:
+    # note(ratish): the first CUDA profiling session in a process initializes
+    # CUPTI and can drop device events; one throwaway session keeps it out of
+    # the first measured point.
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]):
+        torch.ones(1, device="cuda").add_(1)
+        torch.cuda.synchronize()
+
+
 def measure(
     call: Callable[[], object],
     *,
@@ -355,6 +372,7 @@ def measure(
         torch.cuda.synchronize()
         walls.append((time.perf_counter() - started) * 1e3)
     call_label = f"call:{label}"
+    warm_profiler()
     ready()
     with module_ranges(roots or {}), function_ranges(list(functions)):
         with profile(

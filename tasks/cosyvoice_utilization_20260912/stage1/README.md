@@ -112,31 +112,42 @@ wall does not.
 ```bash
 cd /sgl-workspace/sglang-omni
 git fetch https://github.com/sgl-project/sglang-omni.git main
-git worktree add --detach /sgl-workspace/wt/cosy-main cc85ddaa9
+[ -d /sgl-workspace/wt/cosy-main ] || git worktree add --detach /sgl-workspace/wt/cosy-main cc85ddaa9
+git -C /sgl-workspace/wt/cosy-main checkout --detach cc85ddaa9
 git fetch https://github.com/Ratish1/sglang-omni.git analysis/cosyvoice-utilization-20260912
 ANALYSIS=$(git rev-parse FETCH_HEAD)
+[ -d /sgl-workspace/wt/cosyvoice-analysis ] || git worktree add --detach /sgl-workspace/wt/cosyvoice-analysis "$ANALYSIS"
 git -C /sgl-workspace/wt/cosyvoice-analysis checkout --detach "$ANALYSIS"
 
 S1=/sgl-workspace/wt/cosyvoice-analysis/tasks/cosyvoice_utilization_20260912/stage1
 OUT=/sgl-workspace/wt/cosyvoice-analysis/artifacts/cosyvoice/stage1-$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$OUT"
 cd /sgl-workspace/wt/cosy-main
-export PYTHONPATH=/sgl-workspace/wt/cosy-main
+export PYTHONPATH="/sgl-workspace/wt/cosy-main:$S1/../stage0:$S1${PYTHONPATH:+:$PYTHONPATH}"
 git rev-parse HEAD > "$OUT/head.txt"
-python -c "import sglang_omni; print(sglang_omni.__file__)" > "$OUT/import_path.txt"
+python -c "import sglang_omni, cosyvoice; print(sglang_omni.__file__); print(cosyvoice.__file__)" > "$OUT/import_path.txt"
+nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv > "$OUT/gpus_before.csv"
 nvidia-smi -i 0 --query-compute-apps=pid,used_memory --format=csv
+uptime > "$OUT/host_load.txt"; nproc >> "$OUT/host_load.txt"
 CUDA_VISIBLE_DEVICES=0 python "$S1/profile_components.py" --device cuda:0 \
   --components flow,hift,preprocess --out "$OUT" 2>&1 | tee "$OUT/components.log"
 CUDA_VISIBLE_DEVICES=0 python "$S1/profile_ar.py" --device cuda:0 \
   --out "$OUT" 2>&1 | tee "$OUT/ar.log"
 ```
 
-`PYTHONPATH` makes both scripts import the tree under test (a script's own directory, not the working
-directory, is first on its path); each JSON records the `sglang_omni` file it loaded, which must be
-under `/sgl-workspace/wt/cosy-main`. The two scripts run as separate processes, one after the other.
+`PYTHONPATH` makes both scripts import the tree under test and the stage0 and stage1 helpers (a
+script's own directory, not the working directory, is first on its path), and keeps any existing
+entry such as the CosyVoice clone. Each JSON records the `sglang_omni` file it loaded, which must be
+under `/sgl-workspace/wt/cosy-main`. Host dispatch time depends on CPU contention, so `gpus_before.csv`
+and `host_load.txt` record what else ran. The two scripts run as separate processes, one after the other.
 GPU 0 must list no process. Outputs: `components.md` and `ar.md` (tables), `components.json` and
 `ar.json` (every field), `traces/<point>.trace.json.gz` (the Chrome traces, for Perfetto or
 `chrome://tracing`).
+
+To view a trace, gunzip it and open the `.json` at https://ui.perfetto.dev. The Python thread's track
+nests `call:<point>`, then `fn:` ranges (scheduler, runner and vocoder functions), then `mod:`
+ranges (module forwards). Each `cudaLaunchKernel` or `cuLaunchKernel` has a flow arrow to its kernel
+on the GPU stream track, and `gpu_user_annotation` repeats the same ranges on device time.
 
 ## Return
 

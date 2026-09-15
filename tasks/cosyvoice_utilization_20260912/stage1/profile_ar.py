@@ -3,11 +3,13 @@
 fixed batch and length, with each GPU activity attributed to the Python range
 that launched it.
 
-Run alone on the GPU, in its own process (one SGLang engine per process), from
-a worktree at the tree under test:
+Run alone on the GPU, in its own process (one SGLang engine per process), with
+PYTHONPATH holding the tree under test, stage0 and stage1 (see README.md):
 
-  python tasks/cosyvoice_utilization_20260912/stage1/profile_ar.py \
-      --device cuda:0 --out stage1-out
+  python profile_ar.py --device cuda:0 --out stage1-out
+
+Steps run in the grad mode the serving scheduler thread has (default, with the
+model forward under no_grad), so host dispatch cost matches serving.
 
 The engine is built by the serving factory with the serving factory arguments
 (create_sglang_tts_engine_executor, bf16, 16 ONNX threads, hop 25) and never
@@ -40,38 +42,25 @@ import json
 import os
 import queue
 import statistics
-import sys
 
-import torch
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.join(HERE, "..", "stage0"))
-
-from common import MODEL_ID, provenance  # noqa: E402
-from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
-from sglang.srt.managers.tp_worker import TpModelWorker  # noqa: E402
-from sglang.srt.model_executor.model_runner import (  # noqa: E402
-    ModelRunner as SGLangModelRunner,
-)
-from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (  # noqa: E402
+from common import MODEL_ID, provenance
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.model_runner import ModelRunner as SGLangModelRunner
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
-from trace_ledger import measure, render_markdown  # noqa: E402
+from trace_ledger import measure, render_markdown
 
-from sglang_omni.model_runner.base import ModelRunner  # noqa: E402
-from sglang_omni.models.fun_cosyvoice3 import request_builders  # noqa: E402
-from sglang_omni.models.fun_cosyvoice3.model_runner import (  # noqa: E402
-    FunCosyVoice3ModelRunner,
-)
-from sglang_omni.models.fun_cosyvoice3.stages import (  # noqa: E402
-    create_sglang_tts_engine_executor,
-)
-from sglang_omni.proto import OmniRequest, StagePayload  # noqa: E402
-from sglang_omni.scheduling import omni_scheduler  # noqa: E402
-from sglang_omni.scheduling.sglang_backend.output_processor import (  # noqa: E402
-    SGLangOutputProcessor,
-)
+from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID, SEEDTTS_DATASET_REVISION
+from benchmarks.dataset.seedtts import load_seedtts_samples
+from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.fun_cosyvoice3 import request_builders
+from sglang_omni.models.fun_cosyvoice3.model_runner import FunCosyVoice3ModelRunner
+from sglang_omni.models.fun_cosyvoice3.stages import create_sglang_tts_engine_executor
+from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling import omni_scheduler
+from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 
 SAMPLE_COUNT = 400
 HOP_STEPS = 25
@@ -217,6 +206,7 @@ class Engine:
             repeats=repeats,
             prepare=prepare,
         )
+        assert self.shapes, f"{label} ran no batch"
         ledger["step_shapes"] = sorted({shape[:3] for shape in self.shapes})
         ledger["max_sequence_tokens"] = max(shape[3] for shape in self.shapes)
         ledger["steps_per_call"] = len(self.shapes) // (repeats + 3)
@@ -329,9 +319,6 @@ def profile_decode(engine, ranked, out_dir, repeats):
 
 
 def main() -> None:
-    from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID, SEEDTTS_DATASET_REVISION
-    from benchmarks.dataset.seedtts import load_seedtts_samples
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL_ID)
     parser.add_argument("--device", default="cuda:0")
@@ -368,35 +355,34 @@ def main() -> None:
         }
     )
 
-    with torch.inference_mode():
-        ranked = sorted(
-            (engine.prompt_length(sample), index, sample)
-            for index, sample in enumerate(
-                load_seedtts_samples(
-                    SEEDTTS_DATASET_ID,
-                    SAMPLE_COUNT,
-                    split="en",
-                    revision=SEEDTTS_DATASET_REVISION,
-                )
+    ranked = sorted(
+        (engine.prompt_length(sample), index, sample)
+        for index, sample in enumerate(
+            load_seedtts_samples(
+                SEEDTTS_DATASET_ID,
+                SAMPLE_COUNT,
+                split="en",
+                revision=SEEDTTS_DATASET_REVISION,
             )
         )
-        ranked = [(length, sample) for length, _, sample in ranked]
-        lengths = [length for length, _ in ranked]
-        info["prompt_tokens"] = {
-            "samples": len(lengths),
-            "min": lengths[0],
-            "p50": lengths[len(lengths) // 2],
-            "mean": statistics.fmean(lengths),
-            "p95": lengths[int(0.95 * (len(lengths) - 1))],
-            "max": lengths[-1],
-        }
-        print(f"prompt tokens {info['prompt_tokens']}", flush=True)
+    )
+    ranked = [(length, sample) for length, _, sample in ranked]
+    lengths = [length for length, _ in ranked]
+    info["prompt_tokens"] = {
+        "samples": len(lengths),
+        "min": lengths[0],
+        "p50": lengths[len(lengths) // 2],
+        "mean": statistics.fmean(lengths),
+        "p95": lengths[int(0.95 * (len(lengths) - 1))],
+        "max": lengths[-1],
+    }
+    print(f"prompt tokens {info['prompt_tokens']}", flush=True)
 
-        ledgers = []
-        if "prefill" in parts:
-            ledgers += profile_prefill(engine, ranked, traces, args.repeats)
-        if "decode" in parts:
-            ledgers += profile_decode(engine, ranked, traces, args.repeats)
+    ledgers = []
+    if "prefill" in parts:
+        ledgers += profile_prefill(engine, ranked, traces, args.repeats)
+    if "decode" in parts:
+        ledgers += profile_decode(engine, ranked, traces, args.repeats)
     info["outbox_messages"] = engine.messages
 
     with open(os.path.join(args.out, "ar.json"), "w") as handle:
