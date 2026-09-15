@@ -1,5 +1,8 @@
 # Stage 1: component profiles of every Fun-CosyVoice3 serving call
 
+Method, faithfulness rules, validity checklist and pitfalls: `../profiling_guide/GUIDE.md`. Results
+and ranking: `../ROADMAP_20260915.md`, section "Stage 1 component profile".
+
 Written 2026-09-15 on upstream main `cc85ddaa9` (the #2169, #2170, #2171 stack merged; its tree equals
 the stage 0 tree `2eefbc476`). Targets: SM Issue about 30 percent at c16, RTF p99 below 1, first audio
 reasonable. Stage 0 baseline at stream c16: RTF p99 1.74, first audio p95 2.27 s, C50 72.4
