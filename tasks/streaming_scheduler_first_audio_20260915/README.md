@@ -65,3 +65,8 @@ Qwen3-TTS:
   copied unchanged from `fb590a2c3:tasks/perf_backlog/scripts/first_chunk_anatomy.py`.
 - `runbooks/01_moss_tts_local_stream_c16.md`: B census plus the recorder pass and the breakdown,
   with the benchmark at its default settings as in the A runs.
+- `runbooks/02_moss_tts_local_paired_ab_c16.md`: the same two passes for A (`1f6b6843e`) and B
+  (`442e559b4`) back to back on one GPU, with paired deltas.
+- `scripts/vocoder_event_timings.py`: vocoder-side timings from one recorder directory: first audio
+  after chunk 0 and chunk 1, later chunks, backlog stalls, first audio by requests in flight,
+  transport, and ten time windows.

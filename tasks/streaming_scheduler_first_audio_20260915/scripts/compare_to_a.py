@@ -46,15 +46,24 @@ def main() -> None:
         "--model", required=True, choices=("moss_tts_local", "qwen3_tts")
     )
     parser.add_argument("--speed-results", required=True)
+    parser.add_argument(
+        "--a-speed-results",
+        help="A paired A run's speed_results.json; defaults to the stored A.",
+    )
     args = parser.parse_args()
 
     baseline = json.loads(BASELINES.read_text())[args.model]
     run = json.loads(Path(args.speed_results).read_text())["summary"]
-    a = baseline["a"]["summary"]
+    if args.a_speed_results:
+        a = json.loads(Path(args.a_speed_results).read_text())["summary"]
+        a_source = args.a_speed_results
+    else:
+        a = baseline["a"]["summary"]
+        a_source = baseline["a"]["source"]
     pr1 = baseline["pr1_head"]["summary"]
 
     print(f"{args.model}")
-    print(f"A: {baseline['a']['source']}")
+    print(f"A: {a_source}")
     print(f"B: {args.speed_results}")
     print()
     print("| metric | A | PR 1 head | B | B - A | B vs A |")
