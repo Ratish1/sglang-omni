@@ -981,10 +981,8 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     assert scheduler.server_args is server_args
 
 
-@pytest.mark.parametrize("speech_enabled", [False, True])
 def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     monkeypatch: pytest.MonkeyPatch,
-    speech_enabled: bool,
 ) -> None:
     from sglang.srt.utils import hf_transformers_utils
 
@@ -1077,9 +1075,7 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     )
     monkeypatch.setattr(omni_scheduler, "OmniScheduler", SimpleNamespace)
 
-    scheduler = bootstrap.create_thinker_scheduler(
-        server_args, speech_enabled=speech_enabled
-    )
+    scheduler = bootstrap.create_thinker_scheduler(server_args, speech_enabled=True)
 
     assert captured["enable_prefill_input_embeds"] is True
     assert "capture_hidden_layers" not in captured

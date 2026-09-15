@@ -197,7 +197,14 @@ def test_qwen_thinker_stream_builder_keeps_talker_when_modalities_missing():
     assert [msg.target for msg in messages] == ["decode", "talker_ar"]
 
 
-def test_qwen_thinker_stream_builder_sends_token_only_talker_payload():
+@pytest.mark.parametrize(
+    "include_hidden_states",
+    [True, False],
+    ids=["with-hidden-states", "without-hidden-states"],
+)
+def test_qwen_thinker_stream_builder_sends_token_only_talker_payload(
+    include_hidden_states: bool,
+):
     builder = make_thinker_stream_output_builder()
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=0),
@@ -205,7 +212,11 @@ def test_qwen_thinker_stream_builder_sends_token_only_talker_payload():
     )
     req_output = SimpleNamespace(
         data=11,
-        extra={"hidden_states": {"embed": torch.tensor([[1.0, 2.0]])}},
+        extra=(
+            {"hidden_states": {"embed": torch.tensor([[1.0, 2.0]])}}
+            if include_hidden_states
+            else None
+        ),
     )
 
     messages = builder("req-1", req_data, req_output)
@@ -218,55 +229,30 @@ def test_qwen_thinker_stream_builder_sends_token_only_talker_payload():
     assert talker_message.metadata == {"token_id": 11}
 
 
-def test_qwen_thinker_stream_builder_sends_talker_token_without_hidden_states():
+@pytest.mark.parametrize(
+    ("stream", "token_id", "inflight_middle_chunks", "expected_targets"),
+    [
+        pytest.param(False, 11, 0, ["talker_ar"], id="non-streaming"),
+        pytest.param(True, None, 0, [], id="no-sampled-token"),
+        pytest.param(True, 11, 1, [], id="chunked-prefill"),
+    ],
+)
+def test_qwen_thinker_stream_builder_gates_token_emission(
+    stream: bool,
+    token_id: int | None,
+    inflight_middle_chunks: int,
+    expected_targets: list[str],
+):
     builder = make_thinker_stream_output_builder()
     req_data = SimpleNamespace(
-        req=SimpleNamespace(inflight_middle_chunks=0),
-        stage_payload=_thinker_stage_payload(["audio"]),
+        req=SimpleNamespace(inflight_middle_chunks=inflight_middle_chunks),
+        stage_payload=_thinker_stage_payload(["audio"], stream=stream),
     )
-    req_output = SimpleNamespace(data=11, extra=None)
+    req_output = SimpleNamespace(data=token_id, extra=None)
 
     messages = builder("req-1", req_data, req_output)
 
-    talker_message = next(msg for msg in messages if msg.target == "talker_ar")
-    assert int(talker_message.data[0]) == 11
-    assert talker_message.metadata == {"token_id": 11}
-
-
-def test_qwen_thinker_stream_builder_keeps_talker_token_when_not_streaming():
-    builder = make_thinker_stream_output_builder()
-    req_data = SimpleNamespace(
-        req=SimpleNamespace(inflight_middle_chunks=0),
-        stage_payload=_thinker_stage_payload(["audio"], stream=False),
-    )
-    req_output = SimpleNamespace(data=11, extra=None)
-
-    messages = builder("req-1", req_data, req_output)
-
-    assert [msg.target for msg in messages] == ["talker_ar"]
-
-
-def test_qwen_thinker_stream_builder_emits_nothing_without_a_sampled_token():
-    builder = make_thinker_stream_output_builder()
-    req_data = SimpleNamespace(
-        req=SimpleNamespace(inflight_middle_chunks=0),
-        stage_payload=_thinker_stage_payload(["audio"]),
-    )
-    req_output = SimpleNamespace(data=None, extra=None)
-
-    assert builder("req-1", req_data, req_output) == []
-
-
-def test_qwen_thinker_stream_builder_suppresses_everything_mid_chunked_prefill():
-    """Prompt-side rows must never be emitted as generated assistant tokens."""
-    builder = make_thinker_stream_output_builder()
-    req_data = SimpleNamespace(
-        req=SimpleNamespace(inflight_middle_chunks=1),
-        stage_payload=_thinker_stage_payload(["audio"]),
-    )
-    req_output = SimpleNamespace(data=11, extra=None)
-
-    assert builder("req-1", req_data, req_output) == []
+    assert [msg.target for msg in messages] == expected_targets
 
 
 def test_qwen_thinker_stream_token_preserves_talker_prefill_contract():
