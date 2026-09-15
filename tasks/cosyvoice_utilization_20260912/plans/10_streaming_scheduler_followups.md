@@ -52,9 +52,10 @@ decide each. Every fix here is an open row of MECHANICS.md; this file is the des
 
 ### 3. dots.tts census (F11 verification)
 
-- MOSS-TTS Local at c16 on the full corpus is measured (see the readout when the A commit is
-  confirmed). dots.tts is the other coalescing scheduler (batch 4, distinct requests). One streaming
-  c16 pair, main at 1f6b6843e against 442e559b4.
+- MOSS-TTS Local at c16 on the full corpus is measured as a pair, 1f6b6843e against 442e559b4, with no
+  regression (readout 02 of `streaming_scheduler_first_audio_20260915`). dots.tts is the other
+  coalescing scheduler (batch 4, distinct requests). One streaming c16 pair, main at 1f6b6843e against
+  442e559b4.
 
 ### 4. Remaining open rows of MECHANICS.md, unchanged
 
@@ -69,7 +70,7 @@ generations (client contract, not ours).
 | CosyVoice fix 1 | stack head vs fix 1 head | streaming c16, c32 | step wall, audio s/s, first audio, C50 |
 | CosyVoice fix 2 | fix 1 head vs fix 2 head | streaming c16, c32 | C50, C100, first audio, req/s |
 | dots.tts | 1f6b6843e vs 442e559b4 | streaming c16 | req/s, first audio, C50, C100, failures |
-| MOSS-TTS Local repeat | 1f6b6843e vs 442e559b4, `head.txt` archived | streaming c16 | same |
+| MOSS-TTS Local repeat | 1f6b6843e vs 442e559b4, `head.txt` archived | streaming c16 | measured 2026-09-15, no regression (readout 02) |
 
 ## Mechanics of #2169 for the other streaming models (read 2026-09-14)
 
@@ -98,7 +99,8 @@ participant and neither model overrides it.
 
 Consequence for the MOSS-TTS Local c16 result of 2026-09-14 (req/s 12.945 to 12.425, first audio
 p95 0.380 to 0.555 s, C50 100 to 99.17, RTF p99 0.392 to 0.469): no hunk can move these on the
-MOSS path. The pair is either the same tree twice (gate 3) or the run to run band of the shared
-box; the earlier 200 request pair of the same two arms read plus 85.7 percent req/s, which is the
-same band from the other side. The readout is void until `head.txt` of arm A is 1f6b6843e and the
-pair is repeated.
+MOSS path. Measured on 2026-09-15 as a pair on one GPU, `head.txt` 1f6b6843e against 442e559b4
+(`../../streaming_scheduler_first_audio_20260915/readouts/02_moss_tts_local_paired_ab_c16_20260915.md`):
+B read 13.08 req/s against A's 11.49, first audio p95 0.351 against 0.377 s, and the vocoder's own
+first audio p95 61.4 against 61.5 ms. The same tree read 11.49 and 13.28 req/s on two boots, so the
+2026-09-14 gap is inside the run to run spread of identical code.

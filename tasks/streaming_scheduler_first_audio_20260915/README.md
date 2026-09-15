@@ -1,15 +1,17 @@
 # Streaming scheduler first audio regression, 2026-09-15
 
-MOSS-TTS Local and Qwen3-TTS streaming c16 first audio rose after the streaming scheduler change
-merged into upstream main as `442e559b4`. The user's A runs below are the fixed reference: A is
-not run again. Every B run from this directory is compared with them by `scripts/compare_to_a.py`.
+MOSS-TTS Local and Qwen3-TTS streaming c16 first audio were reported to rise after the streaming
+scheduler change merged into upstream main as `442e559b4`. For MOSS-TTS Local a paired A/B on one
+GPU shows no regression: the gap is inside the run to run spread of identical code
+(`readouts/02_moss_tts_local_paired_ab_c16_20260915.md`). Qwen3-TTS is not paired yet. The user's A
+runs below stay as the reference `scripts/compare_to_a.py` compares against.
 
 ## Arms
 
 - **A**: upstream main before `442e559b4`, as run by the user. Numbers in the tables and in
   `baselines/stream_en_c16.json`.
-- **PR 1 head**: the user's runs of the streaming scheduler branch before it merged. Kept next to A
-  for reference.
+- **PR 1 head**: the user's runs of the streaming scheduler branch before it merged. Its runtime
+  tree equals `442e559b4`. Kept next to A for reference.
 - **B**: a boot from this branch's worktree. Since the merge commit `4bd0235cc` every file outside
   `tasks/` equals upstream main `442e559b4`; each runbook checks this on the box before booting.
 
@@ -54,19 +56,23 @@ Qwen3-TTS:
 - Changed lines both models run before first audio: the loop head `_has_ready_work()`
   (streaming_simple_scheduler.py:148) and `_next_message` through `_get_batch_message` (:203-213).
   MOSS-TTS Local also runs the chunk collector read (:362) and the split pump
-  (streaming_vocoder.py:362-389).
-- The mechanism has not been found by reading; runbook 01 locates the hop.
+  (streaming_vocoder.py:362-389). For both models these execute the same logic as A.
+- The paired measurement agrees with the reading: the vocoder's own first audio time is the same at
+  A and B (readout 02).
 
 ## Index
 
 - `baselines/stream_en_c16.json`: the two tables above, keyed by the benchmark's summary names.
-- `scripts/compare_to_a.py`: prints A, PR 1 head and B with B minus A for one `speed_results.json`.
+- `scripts/compare_to_a.py`: prints A, PR 1 head and B with B minus A for one `speed_results.json`;
+  `--a-speed-results` takes A from a paired run instead.
 - `scripts/first_chunk_anatomy.py`: per hop first audio breakdown from the request event recorder,
   copied unchanged from `fb590a2c3:tasks/perf_backlog/scripts/first_chunk_anatomy.py`.
+- `scripts/vocoder_event_timings.py`: vocoder-side timings from one recorder directory: first audio
+  after chunk 0 and chunk 1, later chunks, backlog stalls, first audio by requests in flight,
+  transport, and ten time windows.
 - `runbooks/01_moss_tts_local_stream_c16.md`: B census plus the recorder pass and the breakdown,
   with the benchmark at its default settings as in the A runs.
 - `runbooks/02_moss_tts_local_paired_ab_c16.md`: the same two passes for A (`1f6b6843e`) and B
   (`442e559b4`) back to back on one GPU, with paired deltas.
-- `scripts/vocoder_event_timings.py`: vocoder-side timings from one recorder directory: first audio
-  after chunk 0 and chunk 1, later chunks, backlog stalls, first audio by requests in flight,
-  transport, and ten time windows.
+- `readouts/02_moss_tts_local_paired_ab_c16_20260915.md`: the paired result, the six runs, the
+  first audio breakdown and the run to run variance.
