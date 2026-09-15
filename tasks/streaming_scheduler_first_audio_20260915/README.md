@@ -82,3 +82,6 @@ Qwen3-TTS:
   of batches 1 to 8, and of bursts of 16 through the production cache service and batch worker.
 - `scripts/pyspy_thread_top.py`: per thread inclusive and self sample shares from a py-spy raw
   profile.
+- `readouts/03_moss_tts_local_reference_encode_20260915.md`: the file work in the single encode
+  worker pays in bursts, the eager encoder pays at steady state; the capture slowed the live run;
+  parked.

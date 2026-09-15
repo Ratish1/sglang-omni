@@ -4,7 +4,10 @@ Usage: python pyspy_thread_top.py <profile.txt> [--top 25]
 """
 
 import argparse
+import re
 from collections import Counter, defaultdict
+
+LABEL = re.compile(r"^(process \d+:|thread \()")
 
 
 def main() -> None:
@@ -23,8 +26,8 @@ def main() -> None:
                 continue
             samples = int(count)
             frames = stack.split(";")
-            labels = [f for f in frames if f.startswith(("process", "thread"))]
-            body = [f for f in frames if not f.startswith(("process", "thread"))]
+            labels = [f for f in frames if LABEL.match(f)]
+            body = [f for f in frames if not LABEL.match(f)]
             thread = " ".join(labels) or "thread ?"
             totals[thread] += samples
             for frame in set(body):
