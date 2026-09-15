@@ -168,35 +168,6 @@ class _PredictorDecodeGraph:
         return self.result_codes[:live], self.summed_embeddings[:live]
 
 
-class _SamplingStagingSlot:
-    """Pinned host source of the sampling buffers and the event of its last copy."""
-
-    def __init__(self, buffers: list[torch.Tensor]) -> None:
-        self.cuda = buffers[0].is_cuda
-        # note(ratish): allocated outside inference mode so the source stays
-        # writable from every caller, whichever mode the first restage ran in.
-        with torch.inference_mode(False):
-            self.host = [
-                torch.empty(buffer.shape, dtype=buffer.dtype, pin_memory=self.cuda)
-                for buffer in buffers
-            ]
-        self.copied: torch.cuda.Event | None = None
-
-    def stage(
-        self, buffers: list[torch.Tensor], columns: list[list], batch_size: int
-    ) -> None:
-        # note(ratish): the source is rewritten only after its last copy landed.
-        if self.copied is not None:
-            self.copied.synchronize()
-            self.copied = None
-        for buffer, host, column in zip(buffers, self.host, columns):
-            host[:batch_size] = torch.tensor(column, dtype=host.dtype)
-            buffer[:batch_size].copy_(host[:batch_size], non_blocking=True)
-        if self.cuda:
-            self.copied = torch.cuda.Event()
-            self.copied.record()
-
-
 class Qwen3TTSTalkerDecoderLayer(nn.Module):
     def __init__(self, config: Any, layer_id: int, prefix: str = "") -> None:
         super().__init__()
@@ -856,9 +827,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
     # directly and use this marker to preserve that position contract.
     is_mrope_enabled = True
 
-    _sampling_staging_slots: list[_SamplingStagingSlot] | None = None
-    _sampling_staging_index: int = 0
-
     def __init__(self, config: Any, quant_config: Any = None, prefix: str = "") -> None:
         del quant_config
         super().__init__()
@@ -1103,37 +1071,21 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             self._decode_prep_rids = rids
             return
 
-        buffers = [
-            self._semantic_sampling_seed_tensor,
-            self._sub_temperature_tensor,
-            self._sub_top_p_tensor,
-            self._sub_top_k_tensor,
-            self._sub_sampling_seed_tensor,
-            self._sub_do_sample_tensor,
-        ]
-        columns = [
-            semantic_seeds,
-            sub_temperatures,
-            sub_top_ps,
-            sub_top_ks,
-            sub_seeds,
-            sub_do_samples,
-        ]
-        # note(ratish): copies from pinned memory do not block the host, a
-        # pageable copy waits for the predictor queued by the last step.
-        self._next_sampling_staging_slot(buffers).stage(buffers, columns, batch_size)
+        pin_memory = self._sub_temperature_tensor.is_cuda
+        for buffer, values in (
+            (self._semantic_sampling_seed_tensor, semantic_seeds),
+            (self._sub_temperature_tensor, sub_temperatures),
+            (self._sub_top_p_tensor, sub_top_ps),
+            (self._sub_top_k_tensor, sub_top_ks),
+            (self._sub_sampling_seed_tensor, sub_seeds),
+            (self._sub_do_sample_tensor, sub_do_samples),
+        ):
+            # note(ratish): a pageable source waits for the last step's predictor.
+            buffer[:batch_size].copy_(
+                torch.tensor(values, dtype=buffer.dtype, pin_memory=pin_memory),
+                non_blocking=True,
+            )
         self._decode_prep_rids = rids
-
-    def _next_sampling_staging_slot(
-        self, buffers: list[torch.Tensor]
-    ) -> _SamplingStagingSlot:
-        if self._sampling_staging_slots is None:
-            self._sampling_staging_slots = [
-                _SamplingStagingSlot(buffers) for _ in range(2)
-            ]
-        slot = self._sampling_staging_slots[self._sampling_staging_index]
-        self._sampling_staging_index ^= 1
-        return slot
 
     @torch.no_grad()
     def forward(
