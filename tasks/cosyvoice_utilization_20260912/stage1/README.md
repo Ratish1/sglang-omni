@@ -1,0 +1,113 @@
+# Stage 1: component profiles of every Fun-CosyVoice3 serving call
+
+Written 2026-09-15 on upstream main `cc85ddaa9` (the #2169, #2170, #2171 stack merged; its tree equals
+the stage 0 tree `2eefbc476`). Targets: SM Issue about 30 percent at c16, RTF p99 below 1, first audio
+reasonable. Stage 0 baseline at stream c16: RTF p99 1.74, first audio p95 2.27 s, C50 72.4
+(`../readouts/03_stage0_2eefbc476_20260915.md`).
+
+## Why component profiles, not concurrency runs
+
+A request's time is the sum of the calls that serve it plus the time it queues for them:
+
+```text
+request = reference encode + text prep            preprocessing
+        + one prefill + one decode step per token  tts_engine (AR)
+        + hops and a final (Flow, then HiFT)       vocoder
+        + queueing in front of each
+```
+
+Every call has the same anatomy:
+
+```text
+wall = host dispatch (Python, kernel launches)
+     + host blocked (syncs, blocking copies)
+     + device tail after the last launch
+device busy = union of the intervals the GPU executed this call's work
+```
+
+- busy / wall well below 1 with many launches: launch bound. Fewer launches is the fix (graph replay,
+  fusion, dead work removed). Kernel choice does not move it.
+- busy / wall well below 1 with blocked ms: sync bound. Removing the transfer or the read is the fix.
+- busy / wall near 1: device bound. Less device work is the fix (layout without padding, recompute
+  removed, better kernels, fusion of memory bound pointwise runs).
+
+SM Issue at c16 is the time weighted busy of the calls that run, divided by wall, times how full each
+kernel keeps the SM array. A call's anatomy at batch 1 and at the batch the workload forms, plus how
+often the workload forms each, determines it. So every call is measured alone at those batches, the way
+SGLang's `sglang.benchmark.one_batch` measures one prefill and single decode steps at fixed batch and
+length, and the concurrency run is kept for the final A/B.
+
+## The points, and where each comes from
+
+From the stage 0 c16 call ledger (readout 03, section 6):
+
+| point | shape | source |
+|---|---|---|
+| flow_hop_first_rows1 | 1 row, prompt 125 tokens, window 28 | first hop at c1; prompt p50 125 |
+| flow_hop_first_rows16 | 16 rows, window 28 | c16 first hop cohort; hop rows max 16 |
+| flow_hop_late_rows16 | 16 rows, window 378 (offset 275, hop 100) | hop length 100 is a third of hops |
+| flow_hop_runaway_rows16 | 15 rows window 78, 1 row window 2,051 | widest rows reach 4,250 frames; pad ratio p95 5.7 |
+| flow_final_rows1, flow_final_rows16 | 125 tokens | output tokens mean 125 |
+| flow_final_long_rows16 | 500 tokens | tail of the output length |
+| flow_buffered_rows16_graph and _eager | 16 rows, 125 tokens, one captured key | buffered groups run up to 15 rows |
+| hift_hop_history0, 1000, 4000 | 50 new frames on that history | HiFT reruns the whole history each hop |
+| hift_final_history1000 | finalize on 1,000 frames | the final flush |
+| hift_batch_rows16_250 | 16 mels of 250 frames | buffered HiFT batches |
+| preprocessing | shortest, median, longest reference: load 16k, load 24k, CAM++, S3 tokenizer, prompt mel; first call and repeat | a new reference length pays a first call |
+
+Prompts are real SeedTTS references; generated tokens are random ids of the stated length. Numerics are
+not measured here (stage 0 E2, E5, E6 did that).
+
+## What each ledger holds
+
+`trace_ledger.py` times the call without instrumentation (synchronized median of 5), then runs it once
+under torch.profiler with a range around the call, around every module forward and around the Flow and
+HiFT functions that are not modules (`pack_flow_inputs`, `prepare_flow_conditioning`,
+`solve_flow_euler_packed`, `RowAttention.__call__`, `scatter_rows`, `gather_rows`, `_stft`, `_istft`
+and the others listed in `profile_components.py`). From the Chrome trace:
+
+| field | meaning |
+|---|---|
+| wall_ms_median | synchronized wall of the call without ranges |
+| device_busy_ms, device_busy_share_of_wall | union of device intervals linked to this call's launches |
+| launches, graph_launches | CUDA runtime launch events, of which graph replays |
+| syncs, blocking_copies, host_blocked_ms | `cudaStreamSynchronize` / `cudaDeviceSynchronize` / `cudaEventSynchronize` and `cudaMemcpy`, with the host time inside them |
+| ranges | per range: launches, self and inclusive device ms, pointwise kernels, syncs, blocked ms |
+| top_kernels | kernel name, count, device ms, owning ranges |
+| repeated_sequences | ranges whose instances launch the identical kernel sequence: graph or fusion candidates |
+| trace_categories | the trace's category inventory, so a schema change is visible |
+
+A device event belongs to the runtime event with the same `args.correlation`; a runtime event belongs
+to the innermost range on its thread containing it. Profiled host time includes the ranges' own cost;
+wall does not.
+
+## Run
+
+```bash
+cd /sgl-workspace/sglang-omni
+git fetch https://github.com/sgl-project/sglang-omni.git main
+git worktree add --detach /sgl-workspace/wt/cosy-main cc85ddaa9
+git fetch https://github.com/Ratish1/sglang-omni.git analysis/cosyvoice-utilization-20260912
+ANALYSIS=$(git rev-parse FETCH_HEAD)
+git -C /sgl-workspace/wt/cosyvoice-analysis checkout --detach "$ANALYSIS"
+
+S1=/sgl-workspace/wt/cosyvoice-analysis/tasks/cosyvoice_utilization_20260912/stage1
+OUT=/sgl-workspace/wt/cosyvoice-analysis/artifacts/cosyvoice/stage1-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT"
+cd /sgl-workspace/wt/cosy-main
+git rev-parse HEAD > "$OUT/head.txt"
+python -c "import sglang_omni; print(sglang_omni.__file__)" > "$OUT/import_path.txt"
+nvidia-smi -i 0 --query-compute-apps=pid,used_memory --format=csv
+CUDA_VISIBLE_DEVICES=0 python "$S1/profile_components.py" --device cuda:0 \
+  --components flow,hift,preprocess --out "$OUT" 2>&1 | tee "$OUT/components.log"
+```
+
+GPU 0 must list no process. Outputs: `components.md` (tables), `components.json` (every field),
+`traces/<point>.trace.json.gz` (the Chrome traces, for Perfetto or `chrome://tracing`).
+
+## Return
+
+```bash
+cd /sgl-workspace/wt/cosyvoice-analysis
+tar -czf "$(basename "$OUT").tar.gz" -C "$(dirname "$OUT")" "$(basename "$OUT")"
+```
