@@ -33,10 +33,11 @@ Origins are named by the line that pays, never by the symptom. Updated with ever
 
 | item | origin to read | expected evidence |
 |---|---|---|
-| Flow CUDA graphs capture 26 (batch, frames) shapes, 11 to 18 s of boot | config.py FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES, stages.py FlowCudaGraphRunner | SGLang buckets by batch and pads tokens; capture by total tokens after the packed layout |
-| 280 ms host floor per Flow call, 18,100 launches | solve_flow_euler_packed, 10 steps x 22 blocks | graph the packed step by total token buckets |
-| 2 syncs per Flow call left after #2171; the upsample encoder origin was wrong, the CosyVoice3 flow has only a PreLookaheadLayer (cosyvoice3.yaml:38-51) | unknown; V0 in ROADMAP_20260915.md | per call sync ledger on the stack head |
-| every hop recomputes the prompt and all earlier frames, then drops them | reference model.py:436, streaming.py hop math | E5 prefix stability and cached hop exactness; ROADMAP_20260915.md 1.2 |
+| Flow CUDA graphs capture 55 (batch, frames) shapes for buffered calls only | config.py:19-75, stages.py:2054-2064 | G0 at 2eefbc476: 31.5 s boot, 142 MiB; ledger c16 buffered hits 37 of 204; hop and final calls never replay; replay over eager 1.9 to 2.6x at 1 row, 1.06 to 1.19x at 4 or more rows |
+| eager Flow call launches 16.3k to 17.3k kernels plus 1.8k cuBLAS | solve_flow_euler_packed, 10 steps x 22 blocks | V0 and G0 at 2eefbc476; replay 47 to 65 launches |
+| every Flow call issues 7 + 4 rows pageable host to device copies, each a stream sync | stages.py:198, 206, 209, 222, 226, 608; packed_dit.py:34, 38 (twice), 89; buffered stages.py:643 | V0 at 2eefbc476: 11 at 1 row, 39 at 8 rows; the upsample encoder origin of the earlier row was wrong |
+| every hop recomputes the prompt and all earlier frames, then drops them | reference model.py:436, streaming.py hop math | E5 at 2eefbc476: prefix bit identical in float64 and bf16, cached hop exact in float64; ledger c16: cache runs 49.1 percent of hop frames, 67.9 percent with finals |
+| row attention and conv position embed pay rows x widest | packed_dit.py:97-109, 161-163 | ledger c16: hops with rows x widest / total >= 3 take 1,348 ms p50 against 542 ms; E6: sgl_kernel FA3 varlen and page table at 53.3 dB min, production band 54.0, fastest |
 | HiFT recomputes the full history per hop | hift_delta, reference does the same | hop window state; E1 exactness |
 | preprocessing: campplus provider, thread pools, finalize lock | request_builders, utils | per request preprocessing time at c16 |
 | runaway generations, 2,048 tokens for a 5 word text | benchmark client passes max_new_tokens=2048; the contract caps at 20x text | not ours; same rows on every arm |

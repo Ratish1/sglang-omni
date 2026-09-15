@@ -165,7 +165,7 @@ Quality on the census WAVs, with no server on GPU 0:
 ```bash
 cd "$TREE"
 for point in stream-en-c16 buffered-en-c16; do
-  python -m benchmarks.eval.benchmark_tts_seedtts --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+  CUDA_VISIBLE_DEVICES=0 python -m benchmarks.eval.benchmark_tts_seedtts --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
     --lang en --meta zhaochenyang20/seed-tts-eval-arrow \
     --transcribe-only --asr-model-path Qwen/Qwen3-ASR-1.7B \
     --output-dir "$OUT/$point/bench" > "$OUT/$point/transcribe.log" 2>&1

@@ -66,23 +66,9 @@ ORIGINAL_CALL = packed_dit.RowAttention.__call__
 
 
 def fa3_provenance() -> dict[str, str]:
-    from sglang.kernels.ops.attention import flash_attention_v3
+    import sgl_kernel.flash_attn
 
-    info = {
-        "SGLANG_USE_SGL_FA3_KERNEL": os.environ.get(
-            "SGLANG_USE_SGL_FA3_KERNEL", "unset"
-        ),
-        "fa3_supported": str(flash_attention_v3._is_fa3_supported()),
-    }
-    kernels = flash_attention_v3._load_fa3_kernels()
-    for name, function in kernels.items():
-        module = getattr(function, "__module__", "?")
-        try:
-            source = inspect.getsourcefile(function) or "?"
-        except TypeError:
-            source = "compiled"
-        info[name] = f"{module} {source}"
-    return info
+    return {"sgl_kernel.flash_attn": inspect.getsourcefile(sgl_kernel.flash_attn)}
 
 
 def production(attention, query, key, value):
@@ -98,7 +84,7 @@ def padded_sdpa(attention, query, key, value, backend, dtype):
 
 
 def fa3_varlen(rows, query, key, value, heads):
-    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
 
     shape = (-1, heads, query.shape[-1] // heads)
     cu_seqlens = rows.starts_host.to(device=query.device, dtype=torch.int32)
@@ -111,7 +97,6 @@ def fa3_varlen(rows, query, key, value, heads):
         max_seqlen_q=rows.width,
         max_seqlen_k=rows.width,
         causal=False,
-        ver=3,
     )
     if isinstance(out, tuple):
         out = out[0]
@@ -142,7 +127,7 @@ def paged_layout(rows, chunk, device):
 
 
 def fa3_paged(layout, query, key, value, heads):
-    from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
     cu_seqlens_q, cache_seqlens, page_table, max_seqlen_q = layout
     head_dim = query.shape[-1] // heads
@@ -155,7 +140,6 @@ def fa3_paged(layout, query, key, value, heads):
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=max_seqlen_q,
         causal=False,
-        ver=3,
     )
     if isinstance(out, tuple):
         out = out[0]
