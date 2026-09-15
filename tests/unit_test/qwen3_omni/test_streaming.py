@@ -219,11 +219,6 @@ def test_qwen_thinker_stream_builder_sends_token_only_talker_payload():
 
 
 def test_qwen_thinker_stream_builder_sends_talker_token_without_hidden_states():
-    """The send condition is the request's output modality, not the payload.
-
-    Previously the talker event existed only because captured hidden happened
-    to be attached, so an absent capture silently starved the talker.
-    """
     builder = make_thinker_stream_output_builder()
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=0),
@@ -239,12 +234,6 @@ def test_qwen_thinker_stream_builder_sends_talker_token_without_hidden_states():
 
 
 def test_qwen_thinker_stream_builder_keeps_talker_token_when_not_streaming():
-    """The two events keep separate gates.
-
-    The decode event follows API streaming; the talker needs every generated
-    token either way. Collapsing them into one condition is the failure this
-    locks out.
-    """
     builder = make_thinker_stream_output_builder()
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=0),
@@ -258,12 +247,6 @@ def test_qwen_thinker_stream_builder_keeps_talker_token_when_not_streaming():
 
 
 def test_qwen_thinker_stream_builder_emits_nothing_without_a_sampled_token():
-    """No sampled token, no event -- for either target.
-
-    This boundary carries more weight than it used to: the talker event is now
-    gated on the request's output modality rather than on an attached tensor,
-    so a missing token is the only thing left that can stop it.
-    """
     builder = make_thinker_stream_output_builder()
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=0),
@@ -292,8 +275,7 @@ def test_qwen_thinker_stream_token_preserves_talker_prefill_contract():
         req=SimpleNamespace(inflight_middle_chunks=0),
         stage_payload=_thinker_stage_payload(["audio"]),
     )
-    # embed/layer_hidden below only build the legacy chunk this test compares
-    # against; the producer itself no longer sends either.
+    # These tensors are used only to build the legacy comparison chunk.
     embed = torch.tensor([[7.0, 8.0]])
     layer_hidden = torch.tensor([[70.0, 80.0]])
     req_output = SimpleNamespace(data=11, extra=None)

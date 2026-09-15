@@ -102,10 +102,7 @@ def test_qwen_pipeline_config_and_state_contracts() -> None:
     speech_talker = _stage(speech_config, "talker_ar")
     text_thinker = _stage(text_config, "thinker")
     preprocessing = _stage(speech_config, "preprocessing")
-    # Speech-mode thinker streams token ids to talker_ar AND to decode (for
-    # the streaming detokenizer); text-mode thinker streams only to decode.
-    # Lock both so a regression here can't silently disable per-token
-    # streaming for either path.
+    # Speech streams tokens to both talker_ar and decode; text only to decode.
     request_builders_path = "sglang_omni.models.qwen3_omni.request_builders"
     assert "mm_aggregate" not in {stage.name for stage in speech_config.stages}
     assert preprocessing.next == [
@@ -967,14 +964,10 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     )
 
     assert infrastructure_saw_graph_disabled == [False]
-    # Speech no longer implies auxiliary capture, so nothing asks to defer and
-    # the bootstrap no longer drives the graph helper itself. That graphs are
-    # still initialized when capture is not deferred is covered by the shared
-    # bootstrap tests, since create_sglang_infrastructure is faked here.
-    # Membership, not value: a keyword that is absent and one that is passed
-    # as None are different facts, and only the first is what changed here.
+    # Verify the capture kwargs are omitted rather than passed as None.
     assert "capture_hidden_layers" not in infrastructure_kwargs[0]
     assert "defer_cuda_graph_capture" not in infrastructure_kwargs[0]
+    # Shared infrastructure, not Qwen bootstrap, owns graph initialization.
     assert graph_init_workers == []
     assert infrastructure_saw_return_hidden == [False]
     assert server_args.enable_return_hidden_states is False
@@ -1089,17 +1082,11 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     )
 
     assert captured["enable_prefill_input_embeds"] is True
-    # Speech no longer asks for capture or for deferral, so neither keyword
-    # reaches the shared infrastructure at all.
     assert "capture_hidden_layers" not in captured
     assert "defer_cuda_graph_capture" not in captured
-    # create_sglang_infrastructure is faked here, so the graph helper it calls
-    # is invisible to this test. What matters is that the bootstrap no longer
-    # drives it directly; the shared bootstrap tests cover the rest.
+    # Shared infrastructure, not Qwen bootstrap, owns graph initialization.
     assert graph_init_workers == []
     assert attest_calls == [(model_worker.model_runner, False)]
-    # The output processor is constructed with its capture-free defaults, so
-    # there is no per-request hidden emission gate left to configure.
     assert output_proc_kwargs == [{}]
     assert qwen_runner_calls == [(model_worker, output_proc)]
     assert scheduler.server_args is server_args
