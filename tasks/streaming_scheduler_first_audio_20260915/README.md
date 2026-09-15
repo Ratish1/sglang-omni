@@ -3,7 +3,9 @@
 MOSS-TTS Local and Qwen3-TTS streaming c16 first audio were reported to rise after the streaming
 scheduler change merged into upstream main as `442e559b4`. For MOSS-TTS Local a paired A/B on one
 GPU shows no regression: the gap is inside the run to run spread of identical code
-(`readouts/02_moss_tts_local_paired_ab_c16_20260915.md`). Qwen3-TTS is not paired yet. The user's A
+(`readouts/02_moss_tts_local_paired_ab_c16_20260915.md`). Qwen3-TTS-1.7B paired in both orders
+shows none either: B against A req/s +2.1 and +0.2 percent, first audio p99 -13.9 and -28.8
+percent, RTF mean -1.5 and +2.7 percent (user's runs of 2026-09-15, archive pending). The user's A
 runs below stay as the reference `scripts/compare_to_a.py` compares against.
 
 ## Arms
