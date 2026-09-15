@@ -1586,6 +1586,11 @@ class Qwen3TTSStreamingVocoderScheduler(
             <= retention_start
         ):
             state.pruned_frames += int(state.code_chunks.pop(0).shape[0])
+        while (
+            state.chunk_ready_events
+            and state.chunk_ready_events[0][0] <= state.pruned_frames
+        ):
+            state.chunk_ready_events.pop(0)
 
     def _build_decode_plan(
         self,
@@ -1612,11 +1617,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         # Note (Jiaxin Deng): window_start only moves forward, so frames behind
         # it are dead; prune whole chunks to keep this cat O(window), not
         # O(stream) per decode. Slices below translate by the pruned offset.
-        while (
-            state.code_chunks
-            and state.pruned_frames + int(state.code_chunks[0].shape[0]) <= window_start
-        ):
-            state.pruned_frames += int(state.code_chunks.pop(0).shape[0])
+        self._prune_codes_before(state, absolute_emitted)
         codes = self._codes_through(state, window_end)
         decoder_input = (
             codes[window_start - state.pruned_frames : window_end - state.pruned_frames]

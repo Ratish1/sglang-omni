@@ -7449,6 +7449,40 @@ def test_qwen3_tts_stream_prune_matches_full_history_windows() -> None:
     assert len(state.code_chunks) < len(full_history)
 
 
+def test_qwen3_tts_stream_prune_keeps_one_event_per_retained_chunk() -> None:
+    """Events leave with their chunks over a long reference and a long decode."""
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        stream_left_context_frames=6,
+    )
+    state = scheduler.create_stream_state("request")
+    state.num_quantizers = 1
+    scheduler.latch_stream_contract(
+        "request",
+        state,
+        {"num_quantizers": 1, "ref_code_len": 40, "codes_ready_event": object()},
+        origin="stream metadata",
+    )
+    scheduler.ingest("request", state, torch.zeros((41, 1), dtype=torch.long))
+    for _ in range(200):
+        scheduler.latch_stream_contract(
+            "request",
+            state,
+            {"num_quantizers": 1, "codes_ready_event": object()},
+            origin="stream metadata",
+        )
+        scheduler.ingest("request", state, torch.zeros((1, 1), dtype=torch.long))
+        scheduler._prune_codes_before(state, state.total_frames)
+
+    chunk_ends = [
+        state.pruned_frames + index + 1 for index in range(len(state.code_chunks))
+    ]
+    assert state.pruned_frames == 235
+    assert len(state.code_chunks) == 6
+    assert [end for end, _ in state.chunk_ready_events] == chunk_ends
+
+
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_qwen3_tts_decode_isolates_rows_with_out_of_range_codes(
     deterministic: bool,
