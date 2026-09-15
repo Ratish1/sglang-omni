@@ -289,8 +289,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
                     now - state.first_emit_at
                 )
                 started.append((playback_slack, state.ready_since, request_id, state))
-        # note (ratish): started streams rank by playback slack, new streams by
-        # age; every peer of the head's decode kind joins, whatever its window.
         ranked = [(request_id, state) for _, _, request_id, state in sorted(started)]
         ranked += [(request_id, state) for _, request_id, state in sorted(unstarted)]
         if not ranked:
@@ -398,7 +396,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         *,
         is_final: bool,
     ) -> torch.Tensor | None:
-        # note (ratish): hops and leftovers run in steps, so the per-chunk
+        # note(ratish): hops and leftovers run in steps, so the per-chunk
         # decode never emits and the final flush returns the batched leftover.
         if is_final:
             return state.leftover
