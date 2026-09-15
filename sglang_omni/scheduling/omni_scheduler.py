@@ -470,10 +470,8 @@ class OmniScheduler:
         self.require_mlp_sync = False
         self.abort_on_priority_when_disabled = False
 
-        # Disaggregation / hybrid (disabled)
-        from sglang.srt.disaggregation.utils import DisaggregationMode
-
-        self.disaggregation_mode = DisaggregationMode.NULL
+        # Upstream processing mode; explicit Prefill remains NULL, Decode overrides.
+        self.disaggregation_mode = self._initial_disaggregation_mode()
         self.is_hybrid_swa = False
         self.is_hybrid_ssm = False
         self.offload_tags: set = set()
@@ -520,6 +518,11 @@ class OmniScheduler:
         self._first_emit_done: set[str] = set()
         self._prefill_start_done: set[str] = set()
         self._prefill_end_done: set[str] = set()
+
+    def _initial_disaggregation_mode(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+
+        return DisaggregationMode.NULL
 
     def bind_model_runner(self, model_runner: Any) -> None:
         """Attach a custom runner and its SGLang execution-contract bridge.
@@ -1677,17 +1680,17 @@ class OmniScheduler:
             try:
                 # Drain runner stream buffers before the terminal payload; both
                 # use this outbox, so remaining chunks stay ahead of stream done.
-                model_runner = self._model_runner
-                if model_runner is not None:
-                    model_runner.on_request_finished(rid, data)
-                data.output_ids = list(req.output_ids)
-                data.weight_version = get_serving().weight_version
                 finished_reason = req.finished_reason
                 data.finish_reason = (
                     finished_reason.to_json().get("type")
                     if finished_reason is not None
                     else None
                 )
+                model_runner = self._model_runner
+                if model_runner is not None:
+                    model_runner.on_request_finished(rid, data)
+                data.output_ids = list(req.output_ids)
+                data.weight_version = get_serving().weight_version
                 self._flush_stream_output(rid, data)
                 result = self._result_adapter(data)
             except Exception as exc:
@@ -1697,16 +1700,9 @@ class OmniScheduler:
                     rid,
                 )
             finally:
-                callback = self._request_finished_callback
-                if callback is not None:
-                    try:
-                        callback(rid)
-                    except Exception as exc:
-                        logger.exception(
-                            f"OmniScheduler: terminal cleanup failed for {rid}"
-                        )
-                        if terminal_error is None:
-                            terminal_error = exc
+                callback_error = self._run_request_finished_callback(rid)
+                if terminal_error is None:
+                    terminal_error = callback_error
                 data.prefill_input_embeds = None
                 data.decode_input_embeds = None
                 # Note: (Jiaxin Deng) close the model-path interval before
@@ -2343,6 +2339,19 @@ class OmniScheduler:
             callback(request_id)
         except Exception:
             logger.exception("OmniScheduler: abort cleanup failed for %s", request_id)
+
+    def _run_request_finished_callback(self, request_id: str) -> Exception | None:
+        callback = self._request_finished_callback
+        if callback is None:
+            return None
+        try:
+            callback(request_id)
+        except Exception as exc:
+            logger.exception(
+                "OmniScheduler: terminal cleanup failed for %s", request_id
+            )
+            return exc
+        return None
 
     def _release_request_kv_cache(self, req: Any) -> None:
         if not req.kv.holds_kv and not req.kv.holds_mamba:
