@@ -210,3 +210,18 @@ Deferred: the hop schedule (H2) with the HiFT plan; the final call (H9); hop CUD
 | V4 | ragged conv position embedding with tails equals the full padded conv | G0 per block trace on the first failure; exact by construction in float64 (E5 table 3) |
 | V5 | #2110 merge order | if it merges first, rebase and rerun G0 on its timestep layout |
 | V6 | HiFT output depends on batch shape (#1883) | HiFT stays per request in this plan, so G1 identity holds |
+
+## 9. Decisions pending
+
+Status 2026-09-16: plan written, nothing run, no runtime code. The owner decides these before the slice
+that depends on each; until then the values in section 6 are proposals only.
+
+| # | decision | proposal | options | blocks | takes effect in |
+|---|---|---|---|---|---|
+| P1 | G0 pass threshold | cached bf16 SNR against float32 at least today's bf16 minus 1 dB, at the minimum and at the median; no NaN or Inf; equal lengths | tighter (0.5 dB), looser, or a waveform level criterion instead of mel | slice 1.0 run | section 6, G0 |
+| P2 | G2 quality threshold | WER within 0.3 absolute and SIM within 0.005 of main, full English corpus | other bounds, or add UTMOS | slice 1.2 merge | section 6, G2 |
+| P3 | Flow cache memory budget | `flow_kv_cache_bytes` on the vocoder factory args; default from the V2 memory census; c16 ledger bound 17.1 GiB at 10,200 frames; the AR pool (60.3 GB at stage 0) shrinks to make room; shortage falls back to today's path | a fixed default, an explicit engine `kv_cache_bytes` for the AR pool alongside it, or opt in only | slice 1.2 implementation | section 5.2 |
+| P4 | D1, prompt padding to reference semantics | first hop waits hop + pad generated tokens with the real prompt; `first_ar_flush_tokens` prompt aware; own A/B on WER, SIM and first audio (derived cost at most 24 decode steps, about 60 ms) | proceed after 1.2, proceed before 1.2, or park | slice D1 | section 4 H1, section 7 |
+
+Deferred items that also need a later decision: the hop schedule (H2) with the HiFT plan, the final
+call (H9), hop CUDA graphs (roadmap 2.1).
