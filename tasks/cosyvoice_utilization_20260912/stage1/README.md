@@ -75,8 +75,9 @@ stream on.
 | ar_decode_hop25_rows{1, 16, 32}_graph | 25 steps as one call | one hop, one stream chunk per request |
 | ar_decode_rows32_graph_generated1000 | one step at 1,000 generated tokens | decode against KV length |
 
-- Each prefill repeat flushes the radix cache first, so no prefix is reused. Its requests carry
-  max_new_tokens 1, so the step finishes them through the normal path.
+- Before each prefill repeat, the previous requests are aborted and stepped out and the radix cache
+  is flushed, all outside the timed window. The measured step reuses no prefix and, like a served
+  prefill, finishes no request.
 - Decode requests hold stop tokens off with min_new_tokens equal to max_new_tokens.
 - Eager clears `decode_cuda_graph_runner`, the state `disable_cuda_graph` leaves.
 - `ar.md` lists the shape of every measured step (mode, rows, tokens), so a point that formed a
@@ -123,9 +124,10 @@ S1=/sgl-workspace/wt/cosyvoice-analysis/tasks/cosyvoice_utilization_20260912/sta
 OUT=/sgl-workspace/wt/cosyvoice-analysis/artifacts/cosyvoice/stage1-$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$OUT"
 cd /sgl-workspace/wt/cosy-main
-export PYTHONPATH="/sgl-workspace/wt/cosy-main:$S1/../stage0:$S1${PYTHONPATH:+:$PYTHONPATH}"
+COSYVOICE_PATH=/sgl-workspace/CosyVoice-utilization-20260912
+export PYTHONPATH="/sgl-workspace/wt/cosy-main:$S1/../stage0:$S1:$COSYVOICE_PATH:$COSYVOICE_PATH/third_party/Matcha-TTS"
 git rev-parse HEAD > "$OUT/head.txt"
-python -c "import sglang_omni, cosyvoice; print(sglang_omni.__file__); print(cosyvoice.__file__)" > "$OUT/import_path.txt"
+python -c "import sglang_omni, cosyvoice, matcha.utils.audio; print(sglang_omni.__file__); print(cosyvoice.__file__); print(matcha.__file__)" | tee "$OUT/import_path.txt"
 nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv > "$OUT/gpus_before.csv"
 nvidia-smi -i 0 --query-compute-apps=pid,used_memory --format=csv
 uptime > "$OUT/host_load.txt"; nproc >> "$OUT/host_load.txt"
@@ -136,8 +138,10 @@ CUDA_VISIBLE_DEVICES=0 python "$S1/profile_ar.py" --device cuda:0 \
 ```
 
 `PYTHONPATH` makes both scripts import the tree under test and the stage0 and stage1 helpers (a
-script's own directory, not the working directory, is first on its path), and keeps any existing
-entry such as the CosyVoice clone. Each JSON records the `sglang_omni` file it loaded, which must be
+script's own directory, not the working directory, is first on its path), plus the CosyVoice clone
+and its Matcha-TTS submodule, which the cookbook requires. Preprocessing imports Matcha only when it
+first computes a prompt mel, so the check line imports it up front instead of failing after the
+engine boots. Each JSON records the `sglang_omni` file it loaded, which must be
 under `/sgl-workspace/wt/cosy-main`. Host dispatch time depends on CPU contention, so `gpus_before.csv`
 and `host_load.txt` record what else ran. The two scripts run as separate processes, one after the other.
 GPU 0 must list no process. Outputs: `components.md` and `ar.md` (tables), `components.json` and

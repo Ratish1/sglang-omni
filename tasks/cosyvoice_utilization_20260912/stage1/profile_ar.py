@@ -26,8 +26,9 @@ Points, in the spirit of sglang.benchmark.one_batch:
   prefill, one request at the shortest, median and longest prompt of the
     first 400 SeedTTS en samples, 16 requests near the median, and 32 requests
     near the median, of which one step admits what max_prefill_tokens allows;
-    each repeat flushes the radix cache so no prefix is reused, and requests
-    carry max_new_tokens 1 so the step finishes them and leaves the engine idle
+    before each repeat the previous requests are aborted and stepped out and
+    the radix cache is flushed, outside the timed window, so the measured step
+    reuses no prefix and, like a served prefill, finishes no request
   decode, 1, 16 and 32 running requests: one step with graph replay, one step
     eager (decode_cuda_graph_runner cleared, the path disable_cuda_graph
     takes), and one hop of 25 steps (one stream chunk per request); at 32
@@ -100,6 +101,7 @@ class Engine:
         self.sglang_runner = scheduler._model_runner.tp_worker.model_runner
         self.issued = 0
         self.recording = False
+        self.live: list[str] = []
         self.shapes: list[tuple] = []
         self.messages = {"stream": 0, "result": 0}
 
@@ -132,6 +134,7 @@ class Engine:
             for sample in samples
         ]
         self.scheduler.process_input_requests(payloads)
+        self.live.extend(payload.request_id for payload in payloads)
         if hold:
             for req in self.scheduler.waiting_queue:
                 req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
@@ -141,18 +144,15 @@ class Engine:
         batch = scheduler.get_next_batch_to_run()
         scheduler.cur_batch = batch
         if batch:
-            rows = len(batch.reqs)
             if self.recording:
+                # note(ratish): attribute reads only; this runs inside the timed call.
+                rows = len(batch.reqs)
                 extend = batch.forward_mode.is_extend()
                 self.shapes.append(
                     (
                         "extend" if extend else "decode",
                         rows,
-                        int(batch.extend_num_tokens) if extend else rows,
-                        max(
-                            len(r.origin_input_ids) + len(r.output_ids)
-                            for r in batch.reqs
-                        ),
+                        batch.extend_num_tokens if extend else rows,
                     )
                 )
             result = scheduler.run_batch(batch)
@@ -181,8 +181,11 @@ class Engine:
             raise RuntimeError("engine not idle after draining")
 
     def stop_all(self) -> None:
-        for req in list(self.scheduler.running_batch.reqs):
-            self.scheduler.abort(req.rid)
+        # note(ratish): a request just prefilled sits in last_batch, not yet in
+        # running_batch, so abort by id; the next step finishes them.
+        for request_id in self.live:
+            self.scheduler.abort(request_id)
+        self.live.clear()
         self.idle()
 
     def run(self, label, call, out_dir, repeats, prepare):
@@ -208,8 +211,11 @@ class Engine:
             prepare=prepare,
         )
         assert self.shapes, f"{label} ran no batch"
-        ledger["step_shapes"] = sorted({shape[:3] for shape in self.shapes})
-        ledger["max_sequence_tokens"] = max(shape[3] for shape in self.shapes)
+        ledger["step_shapes"] = sorted(set(self.shapes))
+        ledger["max_sequence_tokens"] = max(
+            len(req.origin_input_ids) + len(req.output_ids)
+            for req in self.scheduler.last_batch.reqs
+        )
         ledger["steps_per_call"] = len(self.shapes) // (repeats + 3)
         return ledger
 
@@ -234,11 +240,11 @@ def profile_prefill(engine, ranked, out_dir, repeats):
     for label, samples in points.items():
 
         def prepare(samples=samples):
-            engine.idle()
-            engine.submit(samples, max_new_tokens=1, hold=False)
+            engine.stop_all()
+            engine.submit(samples, max_new_tokens=DECODE_MAX_NEW_TOKENS, hold=True)
 
         ledgers.append(engine.run(label, engine.step, out_dir, repeats, prepare))
-    engine.idle()
+    engine.stop_all()
     return ledgers
 
 
