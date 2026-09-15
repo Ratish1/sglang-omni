@@ -43,6 +43,7 @@ import os
 import queue
 import statistics
 
+import torch
 from common import MODEL_ID, provenance
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -331,9 +332,13 @@ def main() -> None:
     os.makedirs(args.out, exist_ok=True)
     traces = os.path.join(args.out, "traces")
     info = provenance(args.device)
+    # note(ratish): the stage factory takes the device type and the card index
+    # separately, as placement passes them; a spec like cuda:0 is rejected.
+    device = torch.device(args.device)
     scheduler = create_sglang_tts_engine_executor(
         args.model,
-        device=args.device,
+        device=device.type,
+        gpu_id=device.index,
         dtype="bfloat16",
         onnx_intra_op_threads=16,
         token_hop_len=25,
