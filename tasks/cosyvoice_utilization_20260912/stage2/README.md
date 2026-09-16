@@ -3,7 +3,7 @@
 Plan: `../plans/11_hop_prefix_cache.md`. This directory holds slice 1.0, the G0
 numerics gate, which runs before any runtime code is written.
 
-## Result, 2026-09-16
+## Result, 2026-09-16, H100 80GB
 
 Run `g0-20260916T061846Z`, H100 80GB, head `cc85ddaa9`, all eight GPUs idle,
 margin 1.0 dB, defaults otherwise.
@@ -41,6 +41,41 @@ Two defects the run exposed, both fixed here, neither in the cached path:
   scores -1.6 dB against the float32 truth while its mel scores 36.4 dB, and
   waveform SNR correlates with mel SNR at 0.11. The gate now uses the magnitude
   spectrum of the delta and keeps the raw waveform as a reported diagnostic.
+
+## Result, 2026-09-16, RTX 4090 D
+
+Run `g0-4090-20260916T193520Z`, card 5, main `27a8293c`, same margin and defaults.
+
+**Both gates fail on this card and the cache is not the reason.** Mel: cached
+-1.40 dB at the minimum and -1.11 dB at the median against production, where the
+H100 gave -0.21 and +0.15. Production itself barely moved between the two cards
+(minimum 23.78 to 24.80, median 36.38 to 36.10), so it is the cached path that
+diverges here.
+
+Two measurements locate it, and neither implicates the design:
+
+- **FA3 is not the cause.** The kernel the cached path uses scores 53.3 to
+  53.6 dB against float32 SDPA at every shape this run forms, from 100 to 2,300
+  keys, matching the H100's 53.3 to 54.0 (E6). Chunk alignment held and the
+  receptive field is identical to the H100's.
+- **The first hop diverges too**, by -0.88 dB on average, and the first hop
+  reads no cached state: it computes the whole window from scratch. Caching adds
+  almost nothing on top of that (-1.03 dB on the later hops). So what the gate
+  is measuring is the gap between two implementations of the same arithmetic,
+  the padded masked SDPA call against the paged FA3 call with a ragged conv,
+  and on Ada those two round about 1 dB apart where on Hopper they do not.
+
+So the H100 verdict stands for the H100, which is the deployment target, and
+this run says nothing against the cache. It does say the 1.0 dB margin is
+measuring an implementation-difference floor that is architecture dependent, so
+a G0 threshold cannot be carried between cards. If Ada ever becomes a target the
+gate has to be re-derived there, starting from a per stage isolation of the two
+call shapes rather than from this end to end number.
+
+Cost, for the record and not comparable to the H100's: the hop call falls from
+1,228 ms to 254 ms at step 5, 4.8x, against 3.7x on the H100 at the same point.
+The cache looks better here exactly as predicted, because this card is
+relatively more device bound.
 
 ## What G0 answers
 
@@ -152,10 +187,15 @@ so it is relatively more device bound: a cache that removes device work looks
 better here than it will in production. Quote a 4090 speedup as an H100 gain and
 it is wrong in the optimistic direction.
 
+Amended by the 4090 run above: numerics do not transfer either. Two
+implementations of the same arithmetic round about 1 dB apart on Ada and not on
+Hopper, so a G0 threshold is per card. Byte identity still transfers, because it
+compares one implementation against itself on one card.
+
 | transfers | does not transfer |
 |---|---|
-| numerics and correctness gates: G0 SNR, G1 byte identity | every wall time, the launch floor, the hop speedup |
-| launch and sync counts, which are architecture independent | busy over wall, so the device bound against launch bound ranking |
+| correctness gates that compare a path against itself: G1 byte identity | every wall time, the launch floor, the hop speedup |
+| launch and sync counts, which are architecture independent | busy over wall, so the device bound against launch bound ranking, and any SNR threshold |
 | WER and SIM as paired deltas between arms on the same box | the SM Issue target at c16 and RTF p99 below 1 |
 | whether the 1.2 fallback path is correct | P3, the Flow cache memory budget |
 
