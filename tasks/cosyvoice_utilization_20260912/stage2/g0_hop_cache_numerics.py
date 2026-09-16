@@ -687,7 +687,15 @@ def main() -> None:
     parser.add_argument("--gate-margin-db", type=float, default=1.0)
     parser.add_argument("--samples", type=int, default=1088)
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="smallest shapes that still exercise every path, for a first run",
+    )
     args = parser.parse_args()
+    if args.smoke:
+        args.streams, args.steps, args.stagger, args.repeats = 2, 2, 1, 1
+        args.samples = min(args.samples, 128)
 
     os.makedirs(args.out, exist_ok=True)
     info = provenance(args.device)
@@ -890,6 +898,11 @@ def main() -> None:
     with open(os.path.join(args.out, "g0.json"), "w") as out:
         json.dump(report, out, indent=1)
     write_report(os.path.join(args.out, "g0.md"), report)
+    # note(ratish): a writer that silently put its report somewhere else cost the
+    # 2026-09-16 run its g0.md, so the run fails rather than returning without it.
+    for name in ("g0.json", "g0.md"):
+        if os.path.getsize(os.path.join(args.out, name)) == 0:
+            raise RuntimeError(f"{name} was written empty into {args.out}")
     for name in GATED:
         gate = report["verdict"][name]
         print(

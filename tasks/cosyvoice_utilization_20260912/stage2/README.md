@@ -100,6 +100,22 @@ slots and 11.5 GiB of K/V. `--steps` and `--streams` move both.
 
 ## Run
 
+`run_box.sh` does the whole round trip: sync both worktrees, put the tree under
+test on the path, check every import before the checkpoint load, record
+provenance, run, archive. Run the smoke first; it exercises every path at two
+streams and two steps in seconds, so a broken script costs seconds instead of a
+booted engine.
+
+```bash
+cd /sgl-workspace/wt/cosyvoice-analysis/tasks/cosyvoice_utilization_20260912/stage2
+./run_box.sh g0_hop_cache_numerics.py --smoke
+./run_box.sh g0_hop_cache_numerics.py
+```
+
+It prints the archive path at the end. `MAIN_REV`, `MAIN_WT`, `ANALYSIS_WT`,
+`COSYVOICE` and `REPO` override the paths; the defaults are the ones below. The
+long form, for a first setup or when the layout differs:
+
 ```bash
 cd /sgl-workspace/sglang-omni
 git fetch https://github.com/sgl-project/sglang-omni.git main
