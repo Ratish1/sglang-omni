@@ -10,6 +10,8 @@
 #   REV        revision under test                       upstream main
 #   COSYVOICE  CosyVoice clone with its Matcha submodule /workspace/CosyVoice
 #   CARDS      cards this box lets us use                0 1 2 3
+#   CARD       one card, taken even if shared. Numerics do not care who else
+#              is on the card; timings do, so never set this for a timing run.
 #   MODEL      checkpoint, a local directory             /data/ms/.../master
 #   SCRIPT     experiment to run                         g0_hop_cache_numerics.py
 #   ARGS       extra arguments for it                    empty
@@ -59,11 +61,16 @@ T="$REPO/.tmp/wt/analysis/tasks/cosyvoice_utilization_20260912"
 
 # A card nobody else is on, from the ones this box lets us use. Idle cards report
 # 1 MiB here, so ownership is decided by compute processes, not by memory.
-BUSY=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | sort -u)
-CARD=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader \
-  | awk -F', ' -v busy="$BUSY" -v cards=" $CARDS " '
-      index(cards, " " $1 " ") && index(busy, $2) == 0 { print $1; exit }')
-[ -n "$CARD" ] || { echo "no free card among $CARDS:"; nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv; exit 1; }
+if [ -n "${CARD:-}" ]; then
+  echo "card $CARD taken explicitly; free memory on it:"
+  nvidia-smi --query-gpu=index,memory.total,memory.used --format=csv,noheader -i "$CARD"
+else
+  BUSY=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | sort -u)
+  CARD=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader \
+    | awk -F', ' -v busy="$BUSY" -v cards=" $CARDS " '
+        index(cards, " " $1 " ") && index(busy, $2) == 0 { print $1; exit }')
+  [ -n "$CARD" ] || { echo "no free card among $CARDS:"; nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv; exit 1; }
+fi
 
 OUT="$REPO/.tmp/out/$(basename "$SCRIPT" .py)-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
