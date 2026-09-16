@@ -94,6 +94,39 @@ Cost, for the record and not comparable to the H100's: the hop call falls from
 The cache looks better here exactly as predicted, because this card is
 relatively more device bound.
 
+## Correctness gate, 2026-09-16, RTX 4090 D
+
+Run `g0-4090-pooled-sdpa-20260916T201958Z`, `--attention pooled-sdpa`, 4 streams,
+4 steps, main `27a8293c`. The pool is written and read exactly as the shipping
+path does; only the kernel reading it is production's SDPA instead of FA3.
+
+**It passes: cached is +0.01 dB from production at the median, +0.33 dB at the
+minimum, over 10 hops.** Mean per hop is -0.018 dB, and the six hops that
+actually read cached K/V average +0.468 dB, so reading the cache carries no
+systematic penalty.
+
+What this gate does and does not prove, stated precisely because the
+distinction is the whole point:
+
+- It is **not** bit exact, and cannot be. Production attends over the padded
+  batch of all rows at once; the cached path attends over the new frames of one
+  row at a time, so even with identical mathematics the batch dimension differs
+  and the kernel tiles differently. The residual is +-1 to 2 dB per hop,
+  stdev 1.19, with a mean of zero.
+- Exactness **is** reachable on the first hop, where the cached path's rows are
+  production's rows, and there it was checked directly: swapping production's
+  own batched `RowAttention` into the cached path gives 36.13 against 36.13 dB
+  and 23.68 against 23.68 dB, delta +0.00 on every row. Bit identical.
+
+So the correctness case for the cache is four measurements, not one: bit
+identity on the first hop with the attention held fixed; no systematic bias on
+the hops that read the cache; FA3 qualified on its own at 53.3 to 54.0 dB on
+both Hopper and Ada; and E5's float64 exactness of the cached hop across the
+growth schedule on the H100.
+
+Cost here is not meaningful: `pooled-sdpa` loops SDPA per row per layer, 220
+times 2R calls, so the cached column is slower than production by construction.
+
 ## What G0 answers
 
 `g0_hop_cache_numerics.py` runs every hop of a staggered 8 row schedule three
