@@ -191,7 +191,7 @@ Thresholds below are proposals to agree before the first run, not after it.
 
 | slice | content | runtime change | gate |
 |---|---|---|---|
-| 1.0 | G0 script in `stage2/` | no | G0 |
+| 1.0 | `stage2/g0_hop_cache_numerics.py`, steps in `stage2/README.md`; written 2026-09-16, waiting on P1 | no | G0 |
 | 1.1 | state owner, chunk validation (H3), flow constants (H4), dead code (H5) | yes, no numeric change | G1 |
 | 1.2 | SGLang pool, cached hop call, fallback, budget argument | yes | G2 |
 | D1 | prompt padding to reference semantics (H1): first hop waits hop + pad tokens, prompt real; `first_ar_flush_tokens` becomes prompt aware | yes, output change | own A/B: WER, SIM, first audio (derived cost at most 24 decode steps, about 60 ms at 2.53 ms per step) |
@@ -213,8 +213,10 @@ Deferred: the hop schedule (H2) with the HiFT plan; the final call (H9); hop CUD
 
 ## 9. Decisions pending
 
-Status 2026-09-16: plan written, nothing run, no runtime code. The owner decides these before the slice
-that depends on each; until then the values in section 6 are proposals only.
+Status 2026-09-16: plan written, slice 1.0 written (`stage2/g0_hop_cache_numerics.py`), nothing run, no
+runtime code. The owner decides these before the slice that depends on each; until then the values in
+section 6 are proposals only. Only P1 blocks the first run: the script takes it as
+`--gate-margin-db`, default 1.0, and the run records the value it used.
 
 | # | decision | proposal | options | blocks | takes effect in |
 |---|---|---|---|---|---|

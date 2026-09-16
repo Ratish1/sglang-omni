@@ -27,7 +27,6 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import replace
 
 import torch
 import torch.nn.functional as F
@@ -39,6 +38,7 @@ from common import (  # noqa: E402
     Stream,
     build_streams,
     compare,
+    extend_tokens,
     flow_input,
     hop_window,
     load_vocoder,
@@ -63,20 +63,6 @@ SCHEDULES = {
     "growth 25,50,100": ((0, 25), (25, 50), (75, 100)),
     "fixed 25": tuple((offset, 25) for offset in range(0, 175, 25)),
 }
-
-
-def extend_tokens(streams: list[Stream], count: int, needed: int) -> list[Stream]:
-    extended = []
-    for index in range(count):
-        parts = [streams[index].tokens]
-        cursor = index + 1
-        while sum(part.shape[1] for part in parts) < needed:
-            parts.append(streams[cursor % len(streams)].tokens)
-            cursor += 1
-        extended.append(
-            replace(streams[index], tokens=torch.cat(parts, dim=1)[:, :needed])
-        )
-    return extended
 
 
 def ulp_mismatches(value: torch.Tensor, reference: torch.Tensor) -> int:

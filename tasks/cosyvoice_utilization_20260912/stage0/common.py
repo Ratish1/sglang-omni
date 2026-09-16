@@ -11,7 +11,8 @@ import importlib.metadata
 import math
 import os
 import subprocess
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -93,10 +94,12 @@ def build_streams(
     device: str,
     *,
     count: int,
-    prompt_tokens: int,
+    prompt_tokens: int | Sequence[int],
     min_generated: int,
     samples: int = 1088,
 ) -> list[Stream]:
+    """One stream per reference clip. ``prompt_tokens`` is the prompt length
+    every stream takes, or one length per stream in order."""
     speech_tokenizer = SpeechTokenizerV3(
         os.path.join(checkpoint, "speech_tokenizer_v3.onnx"), device=device
     )
@@ -117,23 +120,44 @@ def build_streams(
             speech_tokenizer.extract_speech_token(audio_16k, PROMPT_AUDIO_SR),
             extract_prompt_speech_feat(audio_24k, FLOW_AUDIO_SR),
         )
-        if token.shape[1] < prompt_tokens + min_generated:
+        if isinstance(prompt_tokens, int):
+            wanted = prompt_tokens
+        else:
+            wanted = int(prompt_tokens[len(streams)])
+        if token.shape[1] < wanted + min_generated:
             continue
         streams.append(
             Stream(
                 sample_id=sample.sample_id,
-                prompt_token=token[:, :prompt_tokens].contiguous(),
-                prompt_feat=feat[:, : prompt_tokens * TOKEN_MEL_RATIO].contiguous(),
+                prompt_token=token[:, :wanted].contiguous(),
+                prompt_feat=feat[:, : wanted * TOKEN_MEL_RATIO].contiguous(),
                 embedding=speaker_encoder.extract_embedding(audio_16k, PROMPT_AUDIO_SR),
-                tokens=token[:, prompt_tokens:].contiguous(),
+                tokens=token[:, wanted:].contiguous(),
             )
         )
         if len(streams) == count:
             return streams
     raise RuntimeError(
         f"only {len(streams)} of the first {samples} SeedTTS EN references carry "
-        f"{prompt_tokens + min_generated} speech tokens"
+        f"the requested prompt plus {min_generated} speech tokens"
     )
+
+
+def extend_tokens(streams: list[Stream], count: int, needed: int) -> list[Stream]:
+    """The first ``count`` streams with their generated tokens grown to
+    ``needed`` by appending the other streams' tokens; the causal structure
+    under test does not depend on the values."""
+    extended = []
+    for index in range(count):
+        parts = [streams[index].tokens]
+        cursor = index + 1
+        while sum(part.shape[1] for part in parts) < needed:
+            parts.append(streams[cursor % len(streams)].tokens)
+            cursor += 1
+        extended.append(
+            replace(streams[index], tokens=torch.cat(parts, dim=1)[:, :needed])
+        )
+    return extended
 
 
 def hop_window(token_offset: int, hop_len: int) -> int:
