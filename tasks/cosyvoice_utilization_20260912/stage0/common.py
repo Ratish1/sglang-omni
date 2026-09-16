@@ -27,8 +27,8 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
 from sglang_omni.models.fun_cosyvoice3.stages import (
     CosyVoice3Vocoder,
     FlowBatchInput,
-    _patch_chunk_mask,
     load_cosyvoice3_flow_hift,
+    patch_chunk_mask,
 )
 from sglang_omni.models.fun_cosyvoice3.streaming import (
     PRE_LOOKAHEAD_LEN,
@@ -86,7 +86,7 @@ def load_vocoder(
 ) -> tuple[str, CosyVoice3Vocoder]:
     checkpoint = resolve_checkpoint(model)
     flow, hift = load_cosyvoice3_flow_hift(checkpoint, device)
-    _patch_chunk_mask()
+    patch_chunk_mask()
     return checkpoint, CosyVoice3Vocoder(flow, hift, autocast_dtype=autocast_dtype)
 
 
