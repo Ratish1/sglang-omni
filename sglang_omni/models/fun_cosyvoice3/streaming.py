@@ -16,16 +16,6 @@ STREAM_SCALE_FACTOR = 2
 TOKEN_MAX_HOP_LEN = TOKEN_HOP_LEN * 4
 
 
-def prompt_token_len(prompt_token: Any) -> int:
-    """Time-axis length of a Flow prompt-token tensor, or 0 when missing."""
-    if prompt_token is None:
-        return 0
-    token = torch.as_tensor(prompt_token)
-    if token.ndim == 0:
-        return int(token.numel())
-    return int(token.shape[-1])
-
-
 def prompt_token_pad(prompt_token_len: int, *, hop_len: int = TOKEN_HOP_LEN) -> int:
     """Pad prompt length up to the next hop multiple."""
     if hop_len <= 0:
@@ -34,23 +24,6 @@ def prompt_token_pad(prompt_token_len: int, *, hop_len: int = TOKEN_HOP_LEN) -> 
     if length == 0:
         return 0
     return int((length + hop_len - 1) // hop_len * hop_len - length)
-
-
-def stream_hop_len(
-    token_offset: int,
-    *,
-    hop_len: int,
-    prompt_pad: int,
-) -> int:
-    """Generated-token hop for the next causal Flow window."""
-    if token_offset < 0:
-        raise ValueError(f"token_offset must be >= 0, got {token_offset}")
-    hop = int(hop_len)
-    if hop <= 0:
-        raise ValueError(f"hop_len must be positive, got {hop_len}")
-    if int(token_offset) == 0:
-        return hop + max(int(prompt_pad), 0)
-    return hop
 
 
 def next_stream_hop_len(
@@ -71,26 +44,13 @@ def next_stream_hop_len(
     return min(int(max_hop_len), hop * int(scale))
 
 
-def tokens_needed_for_causal_chunk(
-    token_offset: int,
-    *,
-    hop_len: int,
-    prompt_pad: int,
-    lookahead: int = PRE_LOOKAHEAD_LEN,
-) -> int:
-    """Minimum generated-token count to run one non-final causal chunk."""
-    hop = stream_hop_len(token_offset, hop_len=hop_len, prompt_pad=prompt_pad)
-    extra = max(int(lookahead), 0)
-    return int(token_offset) + hop + extra
-
-
-def first_ar_flush_tokens(prompt_len: int, *, hop_len: int = TOKEN_HOP_LEN) -> int:
+def first_ar_flush_tokens(*, hop_len: int = TOKEN_HOP_LEN) -> int:
     """Generated-token count for the first causal AR flush.
 
     Prompt hop alignment is applied on Flow prompt tensors, so the
-    producer always flushes hop+lookahead generated tokens.
+    producer always flushes hop+lookahead generated tokens regardless of
+    prompt length.
     """
-    del prompt_len
     hop = int(hop_len)
     if hop <= 0:
         raise ValueError(f"hop_len must be positive, got {hop_len}")

@@ -750,6 +750,10 @@ class FunCosyVoice3Flow:
         # note(ratish): the eager DiT over packed rows; None with the TensorRT
         # estimator, whose fixed (2, 80, T) profile keeps the padded layout.
         self.packed_estimator = packed_estimator
+        # note(ratish): read here, before attach_flow_estimator_trt can swap the
+        # estimator for a wrapper that does not carry it. A hop is sized against
+        # this, and the TensorRT plan was exported from this same DiT.
+        self.static_chunk_size = int(flow.decoder.estimator.static_chunk_size)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.flow, name)

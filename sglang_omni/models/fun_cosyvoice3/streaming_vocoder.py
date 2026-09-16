@@ -25,7 +25,6 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     PRE_LOOKAHEAD_LEN,
     TOKEN_HOP_LEN,
     TOKEN_MAX_HOP_LEN,
-    TOKEN_MEL_RATIO,
     as_flow_embedding,
     as_flow_prompt_feat,
     as_flow_prompt_token,
@@ -50,6 +49,7 @@ class CosyVoice3StreamState:
     tokens: list[int] = field(default_factory=list)
     token_offset: int = 0
     hop_len: int = TOKEN_HOP_LEN
+    lookahead: int = PRE_LOOKAHEAD_LEN
     prompt_token: torch.Tensor | None = None
     prompt_feat: torch.Tensor | None = None
     embedding: torch.Tensor | None = None
@@ -61,7 +61,7 @@ class CosyVoice3StreamState:
     first_emit_at: float | None = None
 
     def next_decode(self) -> NextDecode:
-        causal_token_end = self.token_offset + self.hop_len + PRE_LOOKAHEAD_LEN
+        causal_token_end = self.token_offset + self.hop_len + self.lookahead
         if self.prompt_token is not None and len(self.tokens) >= causal_token_end:
             return "causal_window"
         elif self.done and self.tokens:
@@ -95,6 +95,13 @@ class FunCosyVoice3StreamingVocoderScheduler(
     ) -> None:
         hop = int(token_hop_len)
         max_hop = int(token_max_hop_len)
+        flow = vocoder.flow
+        lookahead = int(flow.pre_lookahead_len)
+        mel_ratio = int(flow.token_mel_ratio)
+        # note(ratish): a hop that is not a whole number of attention chunks
+        # moves the chunk boundary of frames the stream already emitted, so the
+        # window silently changes audio behind the playhead.
+        chunk_tokens = flow.static_chunk_size // mel_ratio
         if hop <= 0:
             raise ValueError(f"token_hop_len must be positive, got {token_hop_len}")
         elif max_hop < hop:
@@ -102,9 +109,17 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 f"token_max_hop_len ({token_max_hop_len}) must be >= "
                 f"token_hop_len ({token_hop_len})"
             )
+        elif hop % chunk_tokens or max_hop % chunk_tokens:
+            raise ValueError(
+                f"token_hop_len ({token_hop_len}) and token_max_hop_len "
+                f"({token_max_hop_len}) must be multiples of {chunk_tokens} "
+                f"tokens, the Flow attention chunk"
+            )
         else:
             self.token_hop_len = hop
             self.token_max_hop_len = max_hop
+            self.lookahead = lookahead
+            self.mel_ratio = mel_ratio
             self.disable_hop_growth = bool(disable_hop_growth)
             self.vocoder = vocoder
             self.clock: Callable[[], float] = time.monotonic
@@ -127,7 +142,9 @@ class FunCosyVoice3StreamingVocoderScheduler(
         return await self.vocoder.decode_payloads(payloads)
 
     def create_stream_state(self, request_id: str) -> CosyVoice3StreamState:
-        return CosyVoice3StreamState(hop_len=self.token_hop_len)
+        return CosyVoice3StreamState(
+            hop_len=self.token_hop_len, lookahead=self.lookahead
+        )
 
     def warmup_now(self) -> None:
         # note(ratish): one hop and one final through Flow and HiFT before the
@@ -136,11 +153,11 @@ class FunCosyVoice3StreamingVocoderScheduler(
         flow = self.vocoder.flow
         item = FlowBatchInput(
             token=torch.zeros(
-                1, self.token_hop_len + PRE_LOOKAHEAD_LEN, dtype=torch.int32
+                1, self.token_hop_len + self.lookahead, dtype=torch.int32
             ),
             prompt_token=torch.zeros(1, self.token_hop_len, dtype=torch.int32),
             prompt_feat=torch.zeros(
-                1, self.token_hop_len * TOKEN_MEL_RATIO, flow.output_size
+                1, self.token_hop_len * self.mel_ratio, flow.output_size
             ),
             embedding=torch.zeros(1, flow.spk_embed_affine_layer.in_features),
         )
@@ -363,7 +380,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             for (_, state), mel in zip(participants, mels, strict=True):
                 state.leftover, state.hift_mel, state.speech_offset = (
                     self.vocoder.hift_delta(
-                        mel[:, :, state.token_offset * TOKEN_MEL_RATIO :],
+                        mel[:, :, state.token_offset * self.mel_ratio :],
                         hift_mel=state.hift_mel,
                         speech_offset=state.speech_offset,
                         finalize=True,
@@ -377,7 +394,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 FlowBatchInput(
                     token=torch.tensor(
                         state.tokens[
-                            : state.token_offset + state.hop_len + PRE_LOOKAHEAD_LEN
+                            : state.token_offset + state.hop_len + state.lookahead
                         ],
                         dtype=torch.int32,
                     ).unsqueeze(0),
@@ -392,7 +409,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             decoded: dict[str, torch.Tensor] = {}
             for (request_id, state), mel in zip(participants, mels, strict=True):
                 delta, state.hift_mel, state.speech_offset = self.vocoder.hift_delta(
-                    mel[:, :, state.token_offset * TOKEN_MEL_RATIO :],
+                    mel[:, :, state.token_offset * self.mel_ratio :],
                     hift_mel=state.hift_mel,
                     speech_offset=state.speech_offset,
                     finalize=False,

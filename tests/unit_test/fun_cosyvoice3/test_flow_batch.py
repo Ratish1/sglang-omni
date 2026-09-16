@@ -16,8 +16,9 @@ from sglang_omni.models.fun_cosyvoice3.stages import (
 
 
 class _RecordingEstimator(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, static_chunk_size: int = 50) -> None:
         super().__init__()
+        self.static_chunk_size = static_chunk_size
         self.calls: list[dict[str, torch.Tensor | bool]] = []
 
     def forward(
@@ -78,8 +79,9 @@ def _packed(flow: _FakeFlow) -> FunCosyVoice3Flow:
 
 
 class _RecordingTRTEstimator:
-    def __init__(self, max_batch: int = 16) -> None:
+    def __init__(self, max_batch: int = 16, static_chunk_size: int = 50) -> None:
         self.max_batch = max_batch
+        self.static_chunk_size = static_chunk_size
         self.calls: list[dict[str, torch.Tensor]] = []
 
     def execute(

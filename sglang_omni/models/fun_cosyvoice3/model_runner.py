@@ -15,7 +15,6 @@ from sglang_omni.model_runner.sglang_execution import attn_forward_context
 from sglang_omni.models.fun_cosyvoice3.streaming import (
     TOKEN_HOP_LEN,
     first_ar_flush_tokens,
-    prompt_token_len,
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.sampling.seed import SAMPLING_SEED_MASK
@@ -305,8 +304,7 @@ class FunCosyVoice3ModelRunner(ModelRunner):
             # note (guozhihao-224): first flush is hop+lookahead. Prompt hop
             # alignment is applied on Flow prompt tensors, not extra AR tokens.
             data.stream_code_next_flush = first_ar_flush_tokens(
-                prompt_token_len(data.flow_prompt_speech_token),
-                hop_len=self._token_hop_len,
+                hop_len=self._token_hop_len
             )
         if data.stream_code_seen >= data.stream_code_next_flush:
             self._flush_code_chunks(sched_req.request_id, data, force=False)
@@ -492,8 +490,7 @@ class FunCosyVoice3MlxSchedulerModelRunner(MlxSchedulerModelRunner):
         data.stream_code_seen += 1
         if int(data.stream_code_next_flush) <= 0:
             data.stream_code_next_flush = first_ar_flush_tokens(
-                prompt_token_len(data.flow_prompt_speech_token),
-                hop_len=getattr(self, "_token_hop_len", TOKEN_HOP_LEN),
+                hop_len=getattr(self, "_token_hop_len", TOKEN_HOP_LEN)
             )
         if data.stream_code_seen >= data.stream_code_next_flush:
             self._flush_code_chunks(sched_req.request_id, data, force=False)

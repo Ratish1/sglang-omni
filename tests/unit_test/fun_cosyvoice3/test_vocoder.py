@@ -45,6 +45,8 @@ class _FakeHiFT(torch.nn.Module):
 
 
 class _FakeEstimator(torch.nn.Module):
+    static_chunk_size = 50
+
     def forward(self, *args, **kwargs):
         del args, kwargs
         raise AssertionError("batch adapter should be mocked in vocoder unit tests")
@@ -140,7 +142,7 @@ def test_lightweight_loader_skips_llm_and_loads_flow_hift(
             return self
 
     flow = _Model()
-    flow.decoder = SimpleNamespace(estimator=torch.nn.Module())
+    flow.decoder = SimpleNamespace(estimator=_FakeEstimator())
     hift = _Model()
 
     def fake_load_hyperpyyaml(handle, overrides):
@@ -659,6 +661,8 @@ def test_vocoder_rejects_non_pytorch_flow_estimator() -> None:
 
 def test_vocoder_accepts_tensorrt_flow_estimator() -> None:
     class _FakeTRTEstimator:
+        static_chunk_size = 50
+
         def acquire_estimator(self):
             return [None, None], None
 
@@ -935,6 +939,7 @@ def test_attach_flow_estimator_trt_wraps_module_with_fallback(monkeypatch) -> No
     class _Decoder:
         def __init__(self) -> None:
             self.estimator = _Fallback()
+            self.estimator.static_chunk_size = 50
 
     class _Flow:
         def __init__(self) -> None:

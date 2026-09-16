@@ -24,8 +24,6 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     next_stream_hop_len,
     pad_flow_prompt_to_hop,
     prompt_token_pad,
-    stream_hop_len,
-    tokens_needed_for_causal_chunk,
 )
 from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
     FunCosyVoice3StreamingVocoderScheduler,
@@ -44,20 +42,24 @@ def test_stream_hop_math_matches_cosyvoice3() -> None:
     assert prompt_token_pad(10) == 15
     assert prompt_token_pad(25) == 0
     assert prompt_token_pad(26) == 24
-    assert stream_hop_len(0, hop_len=25, prompt_pad=15) == 40
-    assert stream_hop_len(40, hop_len=25, prompt_pad=15) == 25
     assert next_stream_hop_len(25) == 50
     assert next_stream_hop_len(50) == 100
     assert next_stream_hop_len(100) == 100
     assert next_stream_hop_len(25, max_hop_len=50) == 50
     assert next_stream_hop_len(50, max_hop_len=50) == 50
     assert next_stream_hop_len(25, disable_growth=True) == 25
-    assert tokens_needed_for_causal_chunk(0, hop_len=25, prompt_pad=0) == 28
-    assert tokens_needed_for_causal_chunk(0, hop_len=25, prompt_pad=15) == 43
-    assert first_ar_flush_tokens(0) == AR_INITIAL_FLUSH_TOKENS
-    assert first_ar_flush_tokens(10) == AR_INITIAL_FLUSH_TOKENS
-    assert first_ar_flush_tokens(25) == AR_INITIAL_FLUSH_TOKENS
-    assert first_ar_flush_tokens(0, hop_len=15) == 18
+    assert first_ar_flush_tokens() == AR_INITIAL_FLUSH_TOKENS
+    assert first_ar_flush_tokens(hop_len=15) == 18
+
+
+def test_hop_must_be_a_whole_number_of_attention_chunks() -> None:
+    # A hop that is not a chunk multiple moves the chunk boundary of frames the
+    # stream already emitted, which changes audio behind the playhead.
+    with pytest.raises(ValueError, match="attention chunk"):
+        _scheduler(token_hop_len=30)
+    with pytest.raises(ValueError, match="attention chunk"):
+        _scheduler(token_hop_len=25, token_max_hop_len=60)
+    _scheduler(token_hop_len=25, token_max_hop_len=100)
 
 
 def test_pad_flow_prompt_repeats_last_frame_to_hop_multiple() -> None:
@@ -330,7 +332,7 @@ def test_model_runner_first_flush_ignores_prompt_pad() -> None:
         flow_embedding=torch.ones(1, 192),
     )
     request = SimpleNamespace(request_id="req-pad", data=data)
-    first_flush = first_ar_flush_tokens(prompt_len)
+    first_flush = first_ar_flush_tokens()
     assert first_flush == AR_INITIAL_FLUSH_TOKENS
 
     early = _feed_tokens(runner, request, list(range(first_flush - 1)))
