@@ -24,6 +24,10 @@ ANALYSIS_BRANCH=${ANALYSIS_BRANCH:-analysis/cosyvoice-utilization-20260912}
 SCRIPT=${SCRIPT:-g0_hop_cache_numerics.py}
 ARGS=${ARGS:-}
 
+# The container exports both a SOCKS and an HTTP proxy; httpx prefers the SOCKS
+# one and then needs socksio, which is not installed. The HTTP proxy is enough.
+unset ALL_PROXY all_proxy
+
 cd "$REPO"
 mkdir -p .tmp
 grep -qx '.tmp/' .git/info/exclude 2>/dev/null || echo '.tmp/' >> .git/info/exclude
