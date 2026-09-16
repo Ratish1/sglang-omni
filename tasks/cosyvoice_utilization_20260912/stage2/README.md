@@ -52,25 +52,42 @@ H100 gave -0.21 and +0.15. Production itself barely moved between the two cards
 (minimum 23.78 to 24.80, median 36.38 to 36.10), so it is the cached path that
 diverges here.
 
-Two measurements locate it, and neither implicates the design:
+The cause is now isolated, and it is not the cache. Swapping production's
+attention into the cached path makes the two **bit identical**: 36.13 against
+36.13 dB and 23.68 against 23.68 dB, delta +0.00 on every row. So the conv
+tails, the RoPE positions, the slicing, the packing, the CFG twins and the Euler
+update in the cached path all reproduce production exactly, and the only thing
+that differs is the attention kernel. Put paged FA3 back and the same two rows
+move to +1.23 and +0.14 dB, better than production, not worse.
+
+The two kernels are equally accurate against a float32 truth, 53.3 to 53.5 dB
+each at every shape this run forms, with a measured difference of -0.0 dB. What
+they do not share is the per sample rounding, and ten Euler steps over 22 blocks
+amplify that into a few dB of jitter in either direction on the final mel. The
+H100's 36 hops happened to average +0.03 dB; this card's happened to average
+-0.99. Neither is evidence about the cache.
+
+This says the gate is measuring the wrong thing. A cached hop cannot be bit
+identical to production, because by design it attends through a different
+kernel, so an end to end SNR margin between them is really a jitter budget that
+has to be re-estimated per card. The sharper gate is the one this isolation
+used: hold the attention fixed and require the cached path to be **bit
+identical** to production, which is deterministic and architecture independent,
+then qualify the kernel swap separately on its own accuracy against float32,
+which E6 and this run both put at 53.3 to 54.0 dB.
+
+Two further measurements, neither implicating the design:
 
 - **FA3 is not the cause.** The kernel the cached path uses scores 53.3 to
   53.6 dB against float32 SDPA at every shape this run forms, from 100 to 2,300
   keys, matching the H100's 53.3 to 54.0 (E6). Chunk alignment held and the
   receptive field is identical to the H100's.
-- **The first hop diverges too**, by -0.88 dB on average, and the first hop
-  reads no cached state: it computes the whole window from scratch. Caching adds
-  almost nothing on top of that (-1.03 dB on the later hops). So what the gate
-  is measuring is the gap between two implementations of the same arithmetic,
-  the padded masked SDPA call against the paged FA3 call with a ragged conv,
-  and on Ada those two round about 1 dB apart where on Hopper they do not.
+- **The first hop diverges too**, by -0.88 dB on average, and it reads no cached
+  state: it computes the whole window from scratch. Caching adds almost nothing
+  on top (-1.03 dB on the later hops), which is what pointed at the kernel.
 
-So the H100 verdict stands for the H100, which is the deployment target, and
-this run says nothing against the cache. It does say the 1.0 dB margin is
-measuring an implementation-difference floor that is architecture dependent, so
-a G0 threshold cannot be carried between cards. If Ada ever becomes a target the
-gate has to be re-derived there, starting from a per stage isolation of the two
-call shapes rather than from this end to end number.
+So the H100 verdict stands, and this run is not evidence against the cache. It
+is evidence that the gate needs the split above before it is used again.
 
 Cost, for the record and not comparable to the H100's: the hop call falls from
 1,228 ms to 254 ms at step 5, 4.8x, against 3.7x on the H100 at the same point.
