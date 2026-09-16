@@ -813,9 +813,9 @@ def main() -> None:
         )
 
     dit = flow.decoder.estimator
-    attention = dit.transformer_blocks[0].attn
-    heads = int(attention.heads)
-    head_dim = int(attention.to_q.out_features) // heads
+    block_attention = dit.transformer_blocks[0].attn
+    heads = int(block_attention.heads)
+    head_dim = int(block_attention.to_q.out_features) // heads
     chunk = flow.packed_estimator.chunk_size
     with torch.inference_mode():
         probe = prepare_flow_conditioning(
