@@ -570,11 +570,13 @@ def write_report(path: str, report: dict) -> None:
             f"{record['waveform']['production']['snr_db']:.1f} | "
             f"{record['waveform']['cached']['snr_db']:.1f} |"
         )
-    for name, title in (("mel", "emitted mel"), ("waveform", "HiFT waveform")):
+    for section, (name, title) in enumerate(
+        (("mel", "Emitted mel"), ("waveform", "HiFT waveform")), start=2
+    ):
         summary = report["summary"][name]
         lines += [
             "",
-            f"## 2. {title}: summary and gate",
+            f"## {section}. {title}: summary and gate",
             "",
             "| path | calls | min dB | median dB | finite | shapes match |",
             "|---|---|---|---|---|---|",
@@ -595,7 +597,7 @@ def write_report(path: str, report: dict) -> None:
         ]
     lines += [
         "",
-        "## 3. Cost per hop call",
+        "## 4. Cost per hop call",
         "",
         "Synchronized median of the repeats, one step per row. The cached solve "
         "excludes the host layout, which is timed beside it; the float32 truth "
@@ -615,7 +617,7 @@ def write_report(path: str, report: dict) -> None:
     pool = report["pool"]
     lines += [
         "",
-        "## 4. Cache layout",
+        "## 5. Cache layout",
         "",
         f"- bytes per cached frame: {pool['bytes_per_frame']} "
         f"({pool['bytes_per_frame'] * 2} per mel frame with its CFG twin)",
@@ -740,7 +742,11 @@ def main() -> None:
                 end = (rows[index].prompt_len + offset + hop) * TOKEN_MEL_RATIO
                 held = cache.streams[index].frames if index in cache.streams else 0
                 spans.append((index, held, end))
-                chunk_aligned = chunk_aligned and emit_from % chunk == 0
+                # note(ratish): the cached boundary has to fall on a chunk edge
+                # or a new frame would attend keys the cache never wrote.
+                chunk_aligned = (
+                    chunk_aligned and emit_from % chunk == 0 and held % chunk == 0
+                )
             with autocast(False):
                 truth = flow.inference_causal(items)
             production, production_ms = timed(

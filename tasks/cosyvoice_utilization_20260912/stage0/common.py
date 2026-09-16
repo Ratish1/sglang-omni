@@ -1,8 +1,9 @@
 """Shared setup for the stage 0 experiments: the vocoder as the serving stage
 builds it, and SeedTTS EN reference clips turned into token streams.
 
-Each clip's own speech tokens are split into a hop aligned prompt and the
-sequence a stream would have generated, so the Flow sees real token statistics.
+Each clip's own speech tokens are split into a prompt of the length the caller
+asks for and the sequence a stream would have generated, so the Flow sees real
+token statistics.
 """
 
 from __future__ import annotations
