@@ -100,60 +100,73 @@ slots and 11.5 GiB of K/V. `--steps` and `--streams` move both.
 
 ## Run
 
-`run_box.sh` does the whole round trip: sync both worktrees, put the tree under
-test on the path, import everything the run needs before the checkpoint load,
-record provenance, run, archive. There is one run and it is the real one; the
-script asserts its own shapes, boundaries and outputs as it goes and raises
-rather than returning a result that cannot be trusted.
+From the Mac, one command:
 
 ```bash
-cd <analysis worktree>/tasks/cosyvoice_utilization_20260912/stage2
-./run_box.sh g0_hop_cache_numerics.py
+ssh moss 'docker exec -i sglang-omni-ratish bash -s' < stage2/run_box.sh
 ```
 
-It prints the archive path at the end. `MAIN_REV`, `MAIN_WT`, `ANALYSIS_WT`,
-`COSYVOICE` and `REPO` override the paths; the defaults are the ones below. The
-long form, for a first setup or when the layout differs:
+It adds two detached worktrees off the container's own repo, one for the
+revision under test and one for this branch, uses the repo's `.venv`, takes a
+card nobody is on from `CARDS`, and writes to `.tmp/out/<script>-<stamp>/`.
+There is one run and it is the real one: the script asserts its own shapes,
+boundaries and outputs as it goes and raises rather than returning a result that
+cannot be trusted. `REV`, `CARDS`, `SCRIPT` and `ARGS` override the defaults.
 
-```bash
-cd /sgl-workspace/sglang-omni
-git fetch https://github.com/sgl-project/sglang-omni.git main
-[ -d /sgl-workspace/wt/cosy-main ] || git worktree add --detach /sgl-workspace/wt/cosy-main cc85ddaa9
-git -C /sgl-workspace/wt/cosy-main checkout --detach cc85ddaa9
-git fetch https://github.com/Ratish1/sglang-omni.git analysis/cosyvoice-utilization-20260912
-ANALYSIS=$(git rev-parse FETCH_HEAD)
-[ -d /sgl-workspace/wt/cosyvoice-analysis ] || git worktree add --detach /sgl-workspace/wt/cosyvoice-analysis "$ANALYSIS"
-git -C /sgl-workspace/wt/cosyvoice-analysis checkout --detach "$ANALYSIS"
+Nothing is patched. The tree under test is upstream main as published, and the
+container's checkout stays on whatever branch it was on.
 
-S2=/sgl-workspace/wt/cosyvoice-analysis/tasks/cosyvoice_utilization_20260912/stage2
-OUT=/sgl-workspace/wt/cosyvoice-analysis/artifacts/cosyvoice/g0-$(date -u +%Y%m%dT%H%M%SZ)
-mkdir -p "$OUT"
-cd /sgl-workspace/wt/cosy-main
-COSYVOICE_PATH=/sgl-workspace/CosyVoice-utilization-20260912
-export PYTHONPATH="/sgl-workspace/wt/cosy-main:$S2/../stage0:$S2:$COSYVOICE_PATH:$COSYVOICE_PATH/third_party/Matcha-TTS"
-git rev-parse HEAD > "$OUT/head.txt"
-python -c "import sglang_omni, cosyvoice, matcha.utils.audio, sgl_kernel.flash_attn, sglang; print(sglang_omni.__file__); print(cosyvoice.__file__); print(sglang.__version__)" | tee "$OUT/import_path.txt"
-nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv > "$OUT/gpus_before.csv"
-nvidia-smi -i 0 --query-compute-apps=pid,used_memory --format=csv
-CUDA_VISIBLE_DEVICES=0 python "$S2/g0_hop_cache_numerics.py" --device cuda:0 \
-  --out "$OUT" 2>&1 | tee "$OUT/g0.log"
-```
+## The moss box
 
-GPU 0 must list no process: the float32 truth and the pool together need about
-20 GiB, and the wall of each path is reported. Outputs: `g0.md` (the tables),
-`g0.json` (every field, including the per hop records) and `g0.log`.
+8x RTX 4090 D, sm89, 24,564 MiB each, shared with other users. Same software as
+the H100: torch 2.13.0+cu130, sglang 0.5.19, sglang-kernel 0.4.6.post1.
 
-The 2026-09-16 run took about a minute of GPU work after the checkpoint load.
-`--repeats` sets how many times the two bfloat16 paths are timed; the numerics
-do not depend on it. The pool is sized to exactly what the schedule needs, so
-raising `--steps` or `--streams` raises the K/V footprint with it.
+What had to be true before any of this ran, each checked rather than assumed:
 
-## Return
+- **FA3 works on sm89.** sgl-kernel builds it for sm80/86/89/90a and
+  `is_fa3_supported` accepts capability major 8. The paged configuration plan
+  1.2 needs, page size 1, one query segment per (row, chunk), `cache_seqlens`
+  at the chunk end, `causal=False`, scores 53.5 dB against float32 SDPA here,
+  against 53.3 to 54.0 dB on the H100 (E6). The design survives the move.
+- **The code under test is the same.** `packed_dit.py`, `streaming_vocoder.py`
+  and `streaming.py` are byte identical between the H100 baseline `cc85ddaa9`
+  and main `27a8293c`. In `stages.py` the only change inside the range these
+  scripts import is 28 lines of underscore renames from the Ruff commit
+  (`_patch_chunk_mask` to `patch_chunk_mask`), which `stage0/common.py` follows.
+- **CosyVoice is a separate clone**, `/workspace/CosyVoice` at `074ca6dc`, the
+  revision the plan's line anchors were read against, with its Matcha submodule.
+  `matcha.utils.__init__` pulls lightning, gdown and matplotlib before
+  `matcha.utils.audio`, so those are in the venv.
+- **The container exports a SOCKS and an HTTP proxy.** httpx prefers SOCKS and
+  then wants socksio, which is absent; `run_box.sh` unsets `ALL_PROXY`. The
+  proxy is shared and congested, so the first checkpoint fetch is slow and
+  parallel workers stall; `max_workers=1` with retries gets through.
+- Cards report 1 MiB when idle, so a free card is one with no compute process,
+  not one at 0 MiB.
 
-```bash
-cd /sgl-workspace/wt/cosyvoice-analysis
-tar -czf "$(basename "$OUT").tar.gz" -C "$(dirname "$OUT")" "$(basename "$OUT")"
-```
+## What a 4090 number means
+
+Correctness transfers, speed does not. The 4090 has roughly a third of the H100's
+memory bandwidth and a quarter of its bfloat16 throughput against a similar host,
+so it is relatively more device bound: a cache that removes device work looks
+better here than it will in production. Quote a 4090 speedup as an H100 gain and
+it is wrong in the optimistic direction.
+
+| transfers | does not transfer |
+|---|---|
+| numerics and correctness gates: G0 SNR, G1 byte identity | every wall time, the launch floor, the hop speedup |
+| launch and sync counts, which are architecture independent | busy over wall, so the device bound against launch bound ranking |
+| WER and SIM as paired deltas between arms on the same box | the SM Issue target at c16 and RTF p99 below 1 |
+| whether the 1.2 fallback path is correct | P3, the Flow cache memory budget |
+
+Two consequences. P3 cannot be decided on 24 GB: the H100 sized its AR pool at
+60.3 GB and the c16 Flow cache alone wants 17.1 GiB, so they cannot coexist and
+c16 may not be reachable. And the 1.2 fallback, a stream releasing its cache and
+running today's full window, stops being a rare corner here and becomes the
+common case, so it gets real coverage instead of a counter that reads zero.
+
+The H100 stays the machine of record for speed. Every performance table carries
+the card it came from, and the existing H100 ledger is not overwritten.
 
 ## Reading the result
 
