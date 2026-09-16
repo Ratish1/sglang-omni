@@ -10,6 +10,7 @@
 #   REV        revision under test                       upstream main
 #   COSYVOICE  CosyVoice clone with its Matcha submodule /workspace/CosyVoice
 #   CARDS      cards this box lets us use                0 1 2 3
+#   HF_HOME    checkpoint cache, off the container root  /data/hf
 #   SCRIPT     experiment to run                         g0_hop_cache_numerics.py
 #   ARGS       extra arguments for it                    empty
 set -euo pipefail
@@ -18,6 +19,8 @@ REPO=${REPO:-/workspace/sglang-omni}
 COSYVOICE=${COSYVOICE:-/workspace/CosyVoice}
 ANALYSIS_BRANCH=${ANALYSIS_BRANCH:-analysis/cosyvoice-utilization-20260912}
 CARDS=${CARDS:-"0 1 2 3"}
+# The checkpoint is 8 GB and belongs on the data disk, not in the container root.
+export HF_HOME=${HF_HOME:-/data/hf}
 SCRIPT=${SCRIPT:-g0_hop_cache_numerics.py}
 ARGS=${ARGS:-}
 
