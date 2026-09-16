@@ -1,62 +1,61 @@
 #!/usr/bin/env bash
-# One command for a stage 2 box experiment on moss, run from the Mac:
+# Run a stage 2 experiment on the moss box, from the Mac:
 #
 #   ssh moss 'docker exec -i sglang-omni-ratish bash -s' < run_box.sh
-#   SCRIPT=g0_hop_cache_numerics.py ssh moss 'docker exec -i sglang-omni-ratish bash -s' < run_box.sh
 #
-# It reuses the container's own repo and its sglang python. It adds one detached
-# worktree for the revision under test, because the box's checkout sits on a feature branch,
-# and it materialises the experiment scripts as files rather than as a second
-# tree. Nothing else is created.
+# Two worktrees off the container's own repo, its own .venv, one free card.
+# Nothing is patched: the tree under test is upstream main as published.
 #
-#   REPO      container checkout, holds .git             /workspace/sglang-omni
-#   PY        interpreter, the box's sglang python       /opt/sglang/bin/python
-#   REV       revision under test                        upstream main
-#   COSYVOICE CosyVoice clone with its Matcha submodule  /workspace/CosyVoice
-#   SCRIPT    experiment to run                          g0_hop_cache_numerics.py
-#   ARGS      extra arguments for it                     empty
+#   REPO       container checkout, holds .git and .venv  /workspace/sglang-omni
+#   REV        revision under test                       upstream main
+#   COSYVOICE  CosyVoice clone with its Matcha submodule /workspace/CosyVoice
+#   CARDS      cards this box lets us use                0 1 2 3
+#   SCRIPT     experiment to run                         g0_hop_cache_numerics.py
+#   ARGS       extra arguments for it                    empty
 set -euo pipefail
 
 REPO=${REPO:-/workspace/sglang-omni}
-PY=${PY:-/opt/sglang/bin/python}
 COSYVOICE=${COSYVOICE:-/workspace/CosyVoice}
 ANALYSIS_BRANCH=${ANALYSIS_BRANCH:-analysis/cosyvoice-utilization-20260912}
+CARDS=${CARDS:-"0 1 2 3"}
 SCRIPT=${SCRIPT:-g0_hop_cache_numerics.py}
 ARGS=${ARGS:-}
 
-# The container exports both a SOCKS and an HTTP proxy; httpx prefers the SOCKS
-# one and then needs socksio, which is not installed. The HTTP proxy is enough.
+# The container exports both a SOCKS and an HTTP proxy; httpx prefers SOCKS and
+# then wants socksio, which is not installed. The HTTP proxy is enough.
 unset ALL_PROXY all_proxy
 
 cd "$REPO"
+source .venv/bin/activate
 mkdir -p .tmp
 grep -qx '.tmp/' .git/info/exclude 2>/dev/null || echo '.tmp/' >> .git/info/exclude
 
-# The revision under test. Objects only; the worktree is the one extra directory.
+worktree() {  # name, revision
+  if [ -d ".tmp/wt/$1" ]; then
+    git -C ".tmp/wt/$1" checkout --detach "$2"
+  else
+    git worktree add --detach ".tmp/wt/$1" "$2"
+  fi
+}
+
 git fetch --no-tags https://github.com/sgl-project/sglang-omni.git main
 REV=${REV:-$(git rev-parse FETCH_HEAD)}
-if [ -d .tmp/wt/main ]; then
-  git -C .tmp/wt/main checkout --detach "$REV"
-else
-  git worktree add --detach .tmp/wt/main "$REV"
-fi
-MAIN="$REPO/.tmp/wt/main"
+worktree main "$REV"
 
-# The experiment scripts, as files, from the analysis branch.
 git fetch --no-tags https://github.com/Ratish1/sglang-omni.git "$ANALYSIS_BRANCH"
 ANALYSIS=$(git rev-parse FETCH_HEAD)
-T=tasks/cosyvoice_utilization_20260912
-mkdir -p .tmp/stage0 .tmp/stage2
-for f in stage0/common.py stage2/"$SCRIPT"; do
-  git show "$ANALYSIS:$T/$f" > ".tmp/$f"
-done
+worktree analysis "$ANALYSIS"
 
-# A card nobody else is on. The box is shared and idle cards report 1 MiB here,
-# so ownership is decided by compute processes, not by a memory threshold.
+MAIN="$REPO/.tmp/wt/main"
+T="$REPO/.tmp/wt/analysis/tasks/cosyvoice_utilization_20260912"
+
+# A card nobody else is on, from the ones this box lets us use. Idle cards report
+# 1 MiB here, so ownership is decided by compute processes, not by memory.
 BUSY=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | sort -u)
-CARD=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' -v busy="$BUSY" '
-  { if (index(busy, $2) == 0) { print $1; exit } }')
-[ -n "$CARD" ] || { echo "every card is in use:"; nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv; exit 1; }
+CARD=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader \
+  | awk -F', ' -v busy="$BUSY" -v cards=" $CARDS " '
+      index(cards, " " $1 " ") && index(busy, $2) == 0 { print $1; exit }')
+[ -n "$CARD" ] || { echo "no free card among $CARDS:"; nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv; exit 1; }
 
 OUT="$REPO/.tmp/out/$(basename "$SCRIPT" .py)-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
@@ -66,8 +65,8 @@ nvidia-smi --query-gpu=index,name,compute_cap,memory.total,memory.used --format=
 uptime > "$OUT/host_load.txt"; nproc >> "$OUT/host_load.txt"
 
 cd "$MAIN"
-export PYTHONPATH="$MAIN:$REPO/.tmp/stage0:$REPO/.tmp/stage2:$COSYVOICE:$COSYVOICE/third_party/Matcha-TTS"
-"$PY" -c "
+export PYTHONPATH="$MAIN:$T/stage0:$T/stage2:$COSYVOICE:$COSYVOICE/third_party/Matcha-TTS"
+python -c "
 import sglang_omni, cosyvoice, matcha.utils.audio, sglang, sgl_kernel.flash_attn, common
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -76,6 +75,7 @@ print(sglang_omni.__file__); print(cosyvoice.__file__)
 " | tee "$OUT/import_path.txt"
 
 echo "card $CARD, revision $REV, out $OUT"
-CUDA_VISIBLE_DEVICES=$CARD "$PY" "$REPO/.tmp/stage2/$SCRIPT" \
+# -u so the log follows the run instead of arriving at the end.
+CUDA_VISIBLE_DEVICES=$CARD python -u "$T/stage2/$SCRIPT" \
   --device cuda:0 --out "$OUT" $ARGS 2>&1 | tee "$OUT/run.log"
 echo "OUT=$OUT"
