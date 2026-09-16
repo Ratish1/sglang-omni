@@ -101,14 +101,13 @@ slots and 11.5 GiB of K/V. `--steps` and `--streams` move both.
 ## Run
 
 `run_box.sh` does the whole round trip: sync both worktrees, put the tree under
-test on the path, check every import before the checkpoint load, record
-provenance, run, archive. Run the smoke first; it exercises every path at two
-streams and two steps in seconds, so a broken script costs seconds instead of a
-booted engine.
+test on the path, import everything the run needs before the checkpoint load,
+record provenance, run, archive. There is one run and it is the real one; the
+script asserts its own shapes, boundaries and outputs as it goes and raises
+rather than returning a result that cannot be trusted.
 
 ```bash
-cd /sgl-workspace/wt/cosyvoice-analysis/tasks/cosyvoice_utilization_20260912/stage2
-./run_box.sh g0_hop_cache_numerics.py --smoke
+cd <analysis worktree>/tasks/cosyvoice_utilization_20260912/stage2
 ./run_box.sh g0_hop_cache_numerics.py
 ```
 

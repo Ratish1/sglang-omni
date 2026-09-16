@@ -2,7 +2,6 @@
 # One command for a stage 2 box experiment: sync both worktrees, put the tree
 # under test on the path, record provenance, run, archive.
 #
-#   ./run_box.sh g0_hop_cache_numerics.py --smoke
 #   ./run_box.sh g0_hop_cache_numerics.py
 #
 # The environment the 2026-09-16 run used, overridable:

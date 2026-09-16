@@ -687,15 +687,7 @@ def main() -> None:
     parser.add_argument("--gate-margin-db", type=float, default=1.0)
     parser.add_argument("--samples", type=int, default=1088)
     parser.add_argument("--out", required=True)
-    parser.add_argument(
-        "--smoke",
-        action="store_true",
-        help="smallest shapes that still exercise every path, for a first run",
-    )
     args = parser.parse_args()
-    if args.smoke:
-        args.streams, args.steps, args.stagger, args.repeats = 2, 2, 1, 1
-        args.samples = min(args.samples, 128)
 
     os.makedirs(args.out, exist_ok=True)
     info = provenance(args.device)
