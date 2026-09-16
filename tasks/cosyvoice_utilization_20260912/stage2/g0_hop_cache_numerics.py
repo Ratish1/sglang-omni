@@ -14,10 +14,13 @@ inputs:
               SGLang MHATokenToKVPool through FA3 with a page table, in
               bfloat16 autocast
 
-Reported per hop and row: the emitted mel and the HiFT waveform delta of
-production and of cached, both against truth. Cached passes when it stays
+Reported per hop and row, for production and for cached against truth: the
+emitted mel, the magnitude spectrum of the HiFT waveform delta, and that raw
+waveform. The mel and the spectrum are gated, and cached passes when it stays
 within --gate-margin-db of production at the minimum and at the median, with
-no NaN or Inf and equal lengths.
+no NaN or Inf and equal lengths. The raw waveform is a diagnostic only: HiFT's
+excitation phase is a cumulative sum of the predicted F0, so it decorrelates
+for the shipped path too (2026-09-16: -1.6 dB, against 36.4 dB on the mel).
 
 The cached path drives production's own solver, DiT forward and Euler update
 (`solve_flow_euler_packed` over a `PackedDiT` subclass). Only attention, the
@@ -74,6 +77,9 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
 # padding runs and the batch carries mixed row widths.
 PROMPT_TOKENS = (40, 55, 63, 78, 91, 110, 127, 144)
 CACHE_DTYPE = torch.bfloat16
+STFT_SIZE, STFT_HOP = 1024, 256
+METRICS = ("mel", "spectrum", "waveform")
+GATED = ("mel", "spectrum")
 
 
 @dataclass
@@ -496,6 +502,21 @@ def conditioning_receptive_field(flow, item: FlowBatchInput) -> dict:
     }
 
 
+def spectrum(waveform: torch.Tensor) -> torch.Tensor:
+    """Magnitude STFT of one emitted delta. HiFT drives its excitation from a
+    phase that is a cumulative sum of the predicted F0, so a bfloat16 level mel
+    difference drifts the phase and the raw waveform decorrelates while sounding
+    the same; the 2026-09-16 run measures today's own path at -1.6 dB on the raw
+    waveform and 36.4 dB on the mel. Magnitude is what survives that drift."""
+    return torch.stft(
+        waveform.reshape(-1),
+        STFT_SIZE,
+        hop_length=STFT_HOP,
+        window=torch.hann_window(STFT_SIZE),
+        return_complex=True,
+    ).abs()
+
+
 def measure(value: torch.Tensor, truth: torch.Tensor) -> dict:
     if tuple(value.shape) != tuple(truth.shape):
         return {
@@ -544,39 +565,57 @@ def verdict(summary: dict[str, dict], margin: float) -> dict:
     }
 
 
-def write_report(path: str, report: dict) -> None:
+def write_report(destination: str, report: dict) -> None:
+    provenance = report["provenance"]
+    kernel = next(
+        (
+            provenance[name]
+            for name in ("sgl-kernel", "sglang-kernel")
+            if provenance.get(name, "absent") != "absent"
+        ),
+        "absent",
+    )
     lines = [
         "# G0: cached hop against the full window recompute",
         "",
-        f"head {report['provenance']['head']}, "
-        f"{report['provenance']['device']}, "
-        f"sgl-kernel {report['provenance'].get('sgl-kernel', 'absent')}",
+        f"head {provenance['head']}, {provenance['device']}, "
+        f"sglang {provenance['sglang']}, kernel {kernel}",
         "",
         f"streams {report['streams']}, steps {report['steps']}, "
         f"gate margin {report['gate_margin_db']} dB, repeats {report['repeats']}",
         "",
-        "## 1. Emitted mel and HiFT waveform against the float32 truth",
+        "## 1. Every hop against the float32 truth",
+        "",
+        "Mel and spectrum are gated. The raw waveform is a diagnostic: HiFT's "
+        "excitation phase is a cumulative sum of the predicted F0, so it "
+        "decorrelates for the shipped path too.",
         "",
         "| step | rows | row | hop | new frames | window frames | mel prod dB | "
-        "mel cached dB | wav prod dB | wav cached dB |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "mel cached dB | spec prod dB | spec cached dB | wav prod dB | "
+        "wav cached dB |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for record in report["hops"]:
+        cells = "".join(
+            f"{record[name][path]['snr_db']:.1f} | "
+            for name in METRICS
+            for path in ("production", "cached")
+        )
         lines.append(
             f"| {record['step']} | {record['rows']} | {record['sample_id']} | "
             f"{record['hop']} | {record['new_frames']} | {record['window_frames']} | "
-            f"{record['mel']['production']['snr_db']:.1f} | "
-            f"{record['mel']['cached']['snr_db']:.1f} | "
-            f"{record['waveform']['production']['snr_db']:.1f} | "
-            f"{record['waveform']['cached']['snr_db']:.1f} |"
+            f"{cells.rstrip()}"
         )
-    for section, (name, title) in enumerate(
-        (("mel", "Emitted mel"), ("waveform", "HiFT waveform")), start=2
-    ):
+    titles = {
+        "mel": "Emitted mel",
+        "spectrum": "Emitted spectrum magnitude",
+        "waveform": "Raw waveform, diagnostic only",
+    }
+    for section, name in enumerate(METRICS, start=2):
         summary = report["summary"][name]
         lines += [
             "",
-            f"## {section}. {title}: summary and gate",
+            f"## {section}. {titles[name]}",
             "",
             "| path | calls | min dB | median dB | finite | shapes match |",
             "|---|---|---|---|---|---|",
@@ -588,7 +627,9 @@ def write_report(path: str, report: dict) -> None:
                 f"{cell['median_snr_db']:.1f} | {cell['finite']} | "
                 f"{cell['shapes_match']} |"
             )
-        gate = report["verdict"][name]
+        gate = report["verdict"].get(name)
+        if gate is None:
+            continue
         lines += [
             "",
             f"cached minus production: {gate['min_margin_db']:+.2f} dB at the "
@@ -597,7 +638,7 @@ def write_report(path: str, report: dict) -> None:
         ]
     lines += [
         "",
-        "## 4. Cost per hop call",
+        "## 5. Cost per hop call",
         "",
         "Synchronized median of the repeats, one step per row. The cached solve "
         "excludes the host layout, which is timed beside it; the float32 truth "
@@ -617,7 +658,7 @@ def write_report(path: str, report: dict) -> None:
     pool = report["pool"]
     lines += [
         "",
-        "## 5. Cache layout",
+        "## 6. Cache layout",
         "",
         f"- bytes per cached frame: {pool['bytes_per_frame']} "
         f"({pool['bytes_per_frame'] * 2} per mel frame with its CFG twin)",
@@ -631,7 +672,7 @@ def write_report(path: str, report: dict) -> None:
         f"{field_info['right_context_tokens']} right",
         "",
     ]
-    with open(path, "w") as out:
+    with open(destination, "w") as out:
         out.write("\n".join(lines))
 
 
@@ -771,6 +812,8 @@ def main() -> None:
                     )
                     rows[index].hift[path] = (history, samples)
                     waves[path] = delta
+                spectra = {name: spectrum(wave) for name, wave in waves.items()}
+                values = {"mel": mels, "spectrum": spectra, "waveform": waves}
                 records.append(
                     {
                         "step": step,
@@ -781,13 +824,12 @@ def main() -> None:
                         "token_offset": offset,
                         "new_frames": end - start,
                         "window_frames": end,
-                        "mel": {
-                            path: measure(mels[path], mels["truth"])
-                            for path in ("production", "cached")
-                        },
-                        "waveform": {
-                            path: measure(waves[path], waves["truth"])
-                            for path in ("production", "cached")
+                        **{
+                            name: {
+                                path: measure(taken[path], taken["truth"])
+                                for path in ("production", "cached")
+                            }
+                            for name, taken in values.items()
                         },
                     }
                 )
@@ -809,7 +851,7 @@ def main() -> None:
                 f"production {production_ms:.1f} ms, cached {cached_ms:.1f} ms"
             )
 
-    summary = {name: summarize(records, name) for name in ("mel", "waveform")}
+    summary = {name: summarize(records, name) for name in METRICS}
     report = {
         "provenance": info,
         "streams": args.streams,
@@ -842,14 +884,13 @@ def main() -> None:
         "hops": records,
         "summary": summary,
         "verdict": {
-            name: verdict(summary[name], args.gate_margin_db)
-            for name in ("mel", "waveform")
+            name: verdict(summary[name], args.gate_margin_db) for name in GATED
         },
     }
     with open(os.path.join(args.out, "g0.json"), "w") as out:
         json.dump(report, out, indent=1)
     write_report(os.path.join(args.out, "g0.md"), report)
-    for name in ("mel", "waveform"):
+    for name in GATED:
         gate = report["verdict"][name]
         print(
             f"{name}: cached {gate['min_margin_db']:+.2f} dB at the minimum, "

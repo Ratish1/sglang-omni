@@ -16,6 +16,15 @@ measurements; unknowns are named validation tasks in section 8.
 - Derived: if hop Flow time follows frames, removing 50.9 percent of hop frames removes about 30
   percent of vocoder step time (0.585 x 0.509). Attention is superlinear in frames and conditioning is
   not, so this is an estimate to be replaced by the G2 census.
+- Measured 2026-09-16 (G0, 8 rows, staggered growth schedule, eager both sides): the hop call falls
+  from 1,774 ms to 843 ms over the schedule, 2.1x, at a new over window frame ratio of 0.348. Per step
+  the ratio runs 1.06x at 400 window frames to 3.70x at 6,850. This schedule caches a larger share of
+  frames than the c16 ledger (0.348 against 0.491), so G2 will show less.
+- Also measured: the cached call is flat at 138 to 143 ms whether it computes 400 or 1,600 new frames.
+  Both paths pay the same eager launch floor of about 140 ms, which is stage 1's 19,072 launches per
+  Flow call (`flow_hop_first_rows1`, wall 152.6 ms at busy over wall 0.41). The cache removes device
+  work, not launches, so after 1.2 the hop is launch bound and roadmap 2.1 (hop CUDA graphs) becomes
+  the next lever rather than a deferred one.
 - The cached call also attends through paged FA3 without padding, so the runaway hop (attention plus
   mask 77 percent of a 3,061 ms call in the stage 1 profile) stops paying rows x widest squared.
 
@@ -179,11 +188,19 @@ rows, release), `config.py` (the budget argument).
 
 ## 6. Gates, declared before any run
 
-Thresholds below are proposals to agree before the first run, not after it.
+Thresholds below were proposals agreed before the first run, not after it. G0 ran on 2026-09-16 at
+the proposed 1 dB margin and passed; G1 and G2 are still proposals.
+
+The raw HiFT waveform was in the G0 proposal and is no longer gated. HiFT is a deterministic function
+of the mel, but its excitation phase is a cumulative sum of the predicted F0, so a bf16 level mel
+difference drifts the phase and the waveform decorrelates in L2 for the shipped path too: production
+against the float32 truth scores -1.6 dB on the waveform while its mel scores 36.4 dB, and waveform
+SNR correlates with mel SNR at 0.11 over the 36 hops. The magnitude spectrum of the delta replaces it
+and the raw waveform stays a reported diagnostic.
 
 | gate | what | pass |
 |---|---|---|
-| G0 numerics (no runtime change) | box script: 8 real references with mixed prompt lengths, growth schedule, one packed multi-row call per hop; paths (a) production packed bf16 full window, (b) cached bf16 through the SGLang pool and FA3 with the production timestep dtype, (c) float32 full window truth; per emitted hop mel and its HiFT waveform: SNR against (c), max abs, NaN and Inf, lengths | (b) min SNR at least (a) min minus 1 dB and median at least (a) median minus 1 dB; no NaN or Inf; equal lengths. If it fails, trace per block before any runtime code |
+| G0 numerics (no runtime change) | box script: 8 real references with mixed prompt lengths, growth schedule, one packed multi-row call per hop; paths (a) production packed bf16 full window, (b) cached bf16 through the SGLang pool and FA3 with the production timestep dtype, (c) float32 full window truth; per emitted hop mel and the magnitude spectrum of its HiFT delta: SNR against (c), max abs, NaN and Inf, lengths | (b) min SNR at least (a) min minus 1 dB and median at least (a) median minus 1 dB; no NaN or Inf; equal lengths. If it fails, trace per block before any runtime code. **Passed 2026-09-16** on run `g0-20260916T061846Z`: mel -0.21 dB at the minimum, +0.15 dB at the median over 36 hops, unbiased (cached is closer in 18 of 36, mean +0.03 dB, spread 0.90 dB) |
 | G1 refactor (1.1) | seeded c1 stream, same boot shape as main | emitted audio byte identical to main; c16 census no regression beyond noise |
 | G2 cache (1.2) | stream c1 and c16, full English corpus, one boot per arm against main; memory census; stage 1 hop points rerun | req/s, audio s/s, first audio mean and p95, RTF p99, C50 reported; WER within 0.3 absolute and SIM within 0.005 of main; fallback counter 0 at c16 with the chosen budget; hop wall follows new frames |
 
@@ -191,7 +208,7 @@ Thresholds below are proposals to agree before the first run, not after it.
 
 | slice | content | runtime change | gate |
 |---|---|---|---|
-| 1.0 | `stage2/g0_hop_cache_numerics.py`, steps in `stage2/README.md`; written 2026-09-16, waiting on P1 | no | G0 |
+| 1.0 | `stage2/g0_hop_cache_numerics.py`, steps and results in `stage2/README.md`; ran 2026-09-16, G0 passed | no | G0, done |
 | 1.1 | state owner, chunk validation (H3), flow constants (H4), dead code (H5) | yes, no numeric change | G1 |
 | 1.2 | SGLang pool, cached hop call, fallback, budget argument | yes | G2 |
 | D1 | prompt padding to reference semantics (H1): first hop waits hop + pad tokens, prompt real; `first_ar_flush_tokens` becomes prompt aware | yes, output change | own A/B: WER, SIM, first audio (derived cost at most 24 decode steps, about 60 ms at 2.53 ms per step) |
@@ -204,19 +221,19 @@ Deferred: the hop schedule (H2) with the HiFT plan; the final call (H9); hop CUD
 
 | # | unknown | how it is settled |
 |---|---|---|
-| V1 | the bf16 cached hop against float32 (H8) | G0 |
+| V1 | the bf16 cached hop against float32 (H8) | G0. Settled 2026-09-16: cached is within -0.21 dB of production at the minimum and +0.15 dB at the median, unbiased over 36 hops |
 | V2 | the budget: live cached frames at c16 on the stack head, and the AR pool's actual need | memory census plus the ledger's per call frames on the G2 boots |
-| V3 | FA3 `causal=False` with `cache_seqlens` at chunk end reads exactly [0, chunk end) at C++ level (the FA3 C++ source is fetched at build time, not on disk) | G0 compares against float32 SDPA math, as E6 did |
-| V4 | ragged conv position embedding with tails equals the full padded conv | G0 per block trace on the first failure; exact by construction in float64 (E5 table 3) |
-| V5 | #2110 merge order | if it merges first, rebase and rerun G0 on its timestep layout |
+| V3 | FA3 `causal=False` with `cache_seqlens` at chunk end reads exactly [0, chunk end) at C++ level (the FA3 C++ source is fetched at build time, not on disk) | G0 compares against float32 SDPA math, as E6 did. Settled 2026-09-16: a wrong key range would collapse the SNR, and it did not on any of 36 hops with chunk alignment held throughout |
+| V4 | ragged conv position embedding with tails equals the full padded conv | G0 per block trace on the first failure; exact by construction in float64 (E5 table 3). Settled 2026-09-16: no trace needed, G0 passed with the tails as the only conv state carried |
+| V5 | #2110 merge order | if it merges first, rebase and rerun G0 on its timestep layout. G0 as run is on `cc85ddaa9`, before it |
 | V6 | HiFT output depends on batch shape (#1883) | HiFT stays per request in this plan, so G1 identity holds |
 
 ## 9. Decisions pending
 
-Status 2026-09-16: plan written, slice 1.0 written (`stage2/g0_hop_cache_numerics.py`), nothing run, no
-runtime code. The owner decides these before the slice that depends on each; until then the values in
-section 6 are proposals only. Only P1 blocks the first run: the script takes it as
-`--gate-margin-db`, default 1.0, and the run records the value it used.
+Status 2026-09-16: slice 1.0 ran at the proposed P1 margin of 1 dB and G0 passed, by a wide enough
+margin that a tighter threshold would also have passed (cached is -0.21 dB at the minimum and +0.15 dB
+at the median, and closer than production on 18 of 36 hops). P1 is therefore settled unless the owner
+wants it restated. No runtime code yet; P2, P3 and P4 are still open and block 1.2 and D1, not 1.1.
 
 | # | decision | proposal | options | blocks | takes effect in |
 |---|---|---|---|---|---|
