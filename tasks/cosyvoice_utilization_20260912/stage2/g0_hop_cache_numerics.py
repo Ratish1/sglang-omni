@@ -14,13 +14,21 @@ inputs:
               SGLang MHATokenToKVPool through FA3 with a page table, in
               bfloat16 autocast
 
+--attention picks what the cached path reads the pool with, and splits the
+question in two:
+
+  fa3          the kernel 1.2 ships. Against production this measures the
+               caching and the kernel together, so the margin it needs is a
+               jitter budget and has to be re-estimated per card.
+  pooled-sdpa  the same pool, read through production's own SDPA. What is left
+               against production is the caching logic alone, which is
+               deterministic, so this is the gate that decides correctness.
+
 Reported per hop and row, for production and for cached against truth: the
 emitted mel, the magnitude spectrum of the HiFT waveform delta, and that raw
-waveform. The mel and the spectrum are gated, and cached passes when it stays
-within --gate-margin-db of production at the minimum and at the median, with
-no NaN or Inf and equal lengths. The raw waveform is a diagnostic only: HiFT's
-excitation phase is a cumulative sum of the predicted F0, so it decorrelates
-for the shipped path too (2026-09-16: -1.6 dB, against 36.4 dB on the mel).
+waveform. The raw waveform is a diagnostic only: HiFT's excitation phase is a
+cumulative sum of the predicted F0, so it decorrelates for the shipped path too
+(2026-09-16: -1.6 dB, against 36.4 dB on the mel).
 
 The cached path drives production's own solver, DiT forward and Euler update
 (`solve_flow_euler_packed` over a `PackedDiT` subclass). Only attention, the
@@ -40,6 +48,7 @@ import time
 from dataclasses import dataclass, field, replace
 
 import torch
+import torch.nn.functional as F
 from common import (
     MODEL_ID,
     Stream,
@@ -101,7 +110,9 @@ class CachedCall:
     pool: MHATokenToKVPool
     heads: int
     head_dim: int
+    chunk: int
     entries: list[tuple[StreamCache, int]]
+    spans: tuple[tuple[int, int], ...]
     lengths_tensor: torch.Tensor
     slots: torch.Tensor
     positions: torch.Tensor
@@ -173,18 +184,68 @@ class CachedRowAttention:
         return out.reshape(1, -1, call.heads * call.head_dim).to(query.dtype)
 
 
+class PooledRowAttention:
+    """The same read as CachedRowAttention, through the SDPA production attends
+    with instead of FA3. Writes and reads the pool exactly as the cached path
+    does, so a run with this separates the caching from the kernel: what is left
+    against production is the caching logic alone."""
+
+    def __init__(self, call: CachedCall) -> None:
+        self.call = call
+        self.layer = 0
+
+    def __call__(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        call = self.call
+        shape = (-1, call.heads, call.head_dim)
+        call.pool.set_kv_buffer(
+            None,
+            call.slots,
+            key[0].reshape(shape).to(CACHE_DTYPE).contiguous(),
+            value[0].reshape(shape).to(CACHE_DTYPE).contiguous(),
+            layer_id_override=self.layer,
+        )
+        keys = call.pool.get_key_buffer(self.layer)
+        values = call.pool.get_value_buffer(self.layer)
+        queries = query[0].reshape(shape).to(CACHE_DTYPE)
+        out, cursor = [], 0
+        for (cache, lane), (start, end) in zip(call.entries, call.spans, strict=True):
+            slots = cache.slots[lane]
+            positions = torch.arange(start, end, device=queries.device)
+            visible = torch.arange(end, device=queries.device).unsqueeze(0) < (
+                (positions // call.chunk + 1) * call.chunk
+            ).unsqueeze(1)
+            out.append(
+                F.scaled_dot_product_attention(
+                    queries[cursor : cursor + end - start].transpose(0, 1),
+                    keys[slots].transpose(0, 1),
+                    values[slots].transpose(0, 1),
+                    attn_mask=visible.unsqueeze(0),
+                ).transpose(0, 1)
+            )
+            cursor += end - start
+        self.layer += 1
+        return (
+            torch.cat(out, dim=0)
+            .reshape(1, -1, call.heads * call.head_dim)
+            .to(query.dtype)
+        )
+
+
 class CachedDiT(PackedDiT):
     """PackedDiT over the new frames only. Same modules in the same order;
     attention reads the pool, the conv position embedding starts from the
     previous hop's tails and RoPE uses absolute frame positions."""
 
-    def __init__(self, dit: torch.nn.Module, call: CachedCall) -> None:
+    def __init__(self, dit: torch.nn.Module, call: CachedCall, attention) -> None:
         super().__init__(dit)
         self.call = call
+        self.attention = attention
         self.step = 0
 
-    def row_attention(self, rows, *, streaming: bool) -> CachedRowAttention:
-        return CachedRowAttention(self.call)
+    def row_attention(self, rows, *, streaming: bool):
+        return self.attention(self.call)
 
     def _rope(self, rows):
         freqs, scale = self.dit.rotary_embed.forward_from_seq_len(self.call.max_frames)
@@ -306,7 +367,9 @@ class FlowKVCache:
             pool=self.pool,
             heads=self.heads,
             head_dim=self.head_dim,
+            chunk=self.chunk,
             entries=entries,
+            spans=tuple((start, end) for _ in (0, 1) for _, start, end in rows),
             lengths_tensor=torch.tensor(lengths, dtype=torch.int64, device=self.device),
             slots=torch.cat(new_slots),
             positions=torch.cat(positions),
@@ -404,6 +467,7 @@ def cached_hop(
     spans: list[tuple[int, int, int]],
     cache: FlowKVCache,
     repeats: int,
+    attention,
 ) -> tuple[list[torch.Tensor], float, float]:
     """The hop over each row's new frames only. `spans` is (stream index,
     first new frame, end frame) per row. Returns the mels, the median solve
@@ -431,7 +495,7 @@ def cached_hop(
             return torch.cat(parts, dim=0).unsqueeze(0)
 
         rows = pack_rows([end - start for _, start, end in spans], packed.token.device)
-        estimator = CachedDiT(flow.decoder.estimator, call)
+        estimator = CachedDiT(flow.decoder.estimator, call, attention)
         # note(ratish): a repeat rewrites the same slots with the same K/V, so
         # only the conv tails have to be rolled back between them.
         snapshot = {id(entry): dict(entry.tails) for entry, _ in call.entries}
@@ -582,6 +646,7 @@ def write_report(destination: str, report: dict) -> None:
         f"sglang {provenance['sglang']}, kernel {kernel}",
         "",
         f"streams {report['streams']}, steps {report['steps']}, "
+        f"attention {report['attention']}, "
         f"gate margin {report['gate_margin_db']} dB, repeats {report['repeats']}",
         "",
         "## 1. Every hop against the float32 truth",
@@ -687,7 +752,18 @@ def main() -> None:
     parser.add_argument("--gate-margin-db", type=float, default=1.0)
     parser.add_argument("--samples", type=int, default=1088)
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--attention",
+        choices=("fa3", "pooled-sdpa"),
+        default="fa3",
+        help="fa3 is the path 1.2 ships; pooled-sdpa reads the same pool through "
+        "production's own kernel, so what is left against production is the "
+        "caching logic alone",
+    )
     args = parser.parse_args()
+    attention = {"fa3": CachedRowAttention, "pooled-sdpa": PooledRowAttention}[
+        args.attention
+    ]
 
     os.makedirs(args.out, exist_ok=True)
     info = provenance(args.device)
@@ -794,7 +870,7 @@ def main() -> None:
                 lambda: vocoder.hop_batch(items), args.repeats
             )
             cached, cached_ms, metadata_ms = cached_hop(
-                flow, items, spans, cache, args.repeats
+                flow, items, spans, cache, args.repeats, attention
             )
             for row, (index, offset, hop) in enumerate(participants):
                 emit_from = (rows[index].prompt_len + offset) * TOKEN_MEL_RATIO
@@ -858,6 +934,7 @@ def main() -> None:
         "steps": args.steps,
         "stagger": args.stagger,
         "repeats": args.repeats,
+        "attention": args.attention,
         "gate_margin_db": args.gate_margin_db,
         "chunk": chunk,
         "chunk_aligned": chunk_aligned,
