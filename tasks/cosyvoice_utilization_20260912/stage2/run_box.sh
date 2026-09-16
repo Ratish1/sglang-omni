@@ -12,6 +12,7 @@
 #   CARDS      cards this box lets us use                0 1 2 3
 #   CARD       one card, taken even if shared. Numerics do not care who else
 #              is on the card; timings do, so never set this for a timing run.
+#   NEED       MiB this run has to fit in, when every card is shared    9000
 #   MODEL      checkpoint, a local directory             /data/ms/.../master
 #   SCRIPT     experiment to run                         g0_hop_cache_numerics.py
 #   ARGS       extra arguments for it                    empty
@@ -65,11 +66,23 @@ if [ -n "${CARD:-}" ]; then
   echo "card $CARD taken explicitly; free memory on it:"
   nvidia-smi --query-gpu=index,memory.total,memory.used --format=csv,noheader -i "$CARD"
 else
+  # An idle card if there is one. Otherwise the one with the most memory free:
+  # the box is shared and every card carries someone, so refusing outright just
+  # means never running. NEED is what this run has to fit in.
+  NEED=${NEED:-9000}
   BUSY=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | sort -u)
   CARD=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader \
     | awk -F', ' -v busy="$BUSY" -v cards=" $CARDS " '
         index(cards, " " $1 " ") && index(busy, $2) == 0 { print $1; exit }')
-  [ -n "$CARD" ] || { echo "no free card among $CARDS:"; nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv; exit 1; }
+  if [ -z "$CARD" ]; then
+    CARD=$(nvidia-smi --query-gpu=index,memory.total,memory.used --format=csv,noheader \
+      | awk -F', ' -v cards=" $CARDS " -v need="$NEED" '
+          { gsub(" MiB", "", $2); gsub(" MiB", "", $3); free = $2 - $3 }
+          index(cards, " " $1 " ") && free > best && free > need { best = free; pick = $1 }
+          END { if (pick != "") print pick }')
+    [ -n "$CARD" ] && echo "no idle card; taking $CARD, the one with the most free memory"
+  fi
+  [ -n "$CARD" ] || { echo "no card among $CARDS has ${NEED} MiB free:"; nvidia-smi --query-gpu=index,memory.total,memory.used --format=csv; exit 1; }
 fi
 
 OUT="$REPO/.tmp/out/$(basename "$SCRIPT" .py)-$(date -u +%Y%m%dT%H%M%SZ)"
