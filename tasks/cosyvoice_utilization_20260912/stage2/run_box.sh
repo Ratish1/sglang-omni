@@ -10,7 +10,7 @@
 #   REV        revision under test                       upstream main
 #   COSYVOICE  CosyVoice clone with its Matcha submodule /workspace/CosyVoice
 #   CARDS      cards this box lets us use                0 1 2 3
-#   HF_HOME    checkpoint cache, off the container root  /data/hf
+#   MODEL      checkpoint, a local directory             /data/ms/.../master
 #   SCRIPT     experiment to run                         g0_hop_cache_numerics.py
 #   ARGS       extra arguments for it                    empty
 set -euo pipefail
@@ -19,8 +19,13 @@ REPO=${REPO:-/workspace/sglang-omni}
 COSYVOICE=${COSYVOICE:-/workspace/CosyVoice}
 ANALYSIS_BRANCH=${ANALYSIS_BRANCH:-analysis/cosyvoice-utilization-20260912}
 CARDS=${CARDS:-"0 1 2 3"}
-# The checkpoint is 8 GB and belongs on the data disk, not in the container root.
-export HF_HOME=${HF_HOME:-/data/hf}
+# The 9.1 GiB checkpoint lives on the data disk. resolve_checkpoint takes a
+# directory as is, so a run never touches the hub for it. Pulled from ModelScope:
+# the container's proxy stalls on large HuggingFace files and does not resume.
+MODEL=${MODEL:-/data/ms/models/FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/master}
+# A run reads the checkpoint and the cached SeedTTS arrow from disk. Offline so
+# it cannot silently reach for the network and stall there instead of measuring.
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 SCRIPT=${SCRIPT:-g0_hop_cache_numerics.py}
 ARGS=${ARGS:-}
 
@@ -77,8 +82,9 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT, solve_flow_e
 print(sglang_omni.__file__); print(cosyvoice.__file__)
 " | tee "$OUT/import_path.txt"
 
-echo "card $CARD, revision $REV, out $OUT"
+echo "card $CARD, revision $REV, model $MODEL"
+echo "out $OUT"
 # -u so the log follows the run instead of arriving at the end.
 CUDA_VISIBLE_DEVICES=$CARD python -u "$T/stage2/$SCRIPT" \
-  --device cuda:0 --out "$OUT" $ARGS 2>&1 | tee "$OUT/run.log"
+  --device cuda:0 --model "$MODEL" --out "$OUT" $ARGS 2>&1 | tee "$OUT/run.log"
 echo "OUT=$OUT"
