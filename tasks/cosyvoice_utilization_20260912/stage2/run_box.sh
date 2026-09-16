@@ -46,10 +46,12 @@ for f in stage0/common.py stage2/"$SCRIPT"; do
   git show "$ANALYSIS:$T/$f" > ".tmp/$f"
 done
 
-# A card nobody else is on. Never take one that is in use.
-CARD=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader \
-       | awk -F', ' '$2 ~ /^0 MiB/ {print $1; exit}')
-[ -n "$CARD" ] || { echo "no free card:"; nvidia-smi --query-gpu=index,memory.used --format=csv; exit 1; }
+# A card nobody else is on. The box is shared and idle cards report 1 MiB here,
+# so ownership is decided by compute processes, not by a memory threshold.
+BUSY=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | sort -u)
+CARD=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' -v busy="$BUSY" '
+  { if (index(busy, $2) == 0) { print $1; exit } }')
+[ -n "$CARD" ] || { echo "every card is in use:"; nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv; exit 1; }
 
 OUT="$REPO/.tmp/out/$(basename "$SCRIPT" .py)-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
