@@ -4,12 +4,13 @@
 #   ssh moss 'docker exec -i sglang-omni-ratish bash -s' < run_box.sh
 #   SCRIPT=g0_hop_cache_numerics.py ssh moss 'docker exec -i sglang-omni-ratish bash -s' < run_box.sh
 #
-# It reuses the container's own repo and venv. It adds one detached worktree for
-# the revision under test, because the box's checkout sits on a feature branch,
+# It reuses the container's own repo and its sglang python. It adds one detached
+# worktree for the revision under test, because the box's checkout sits on a feature branch,
 # and it materialises the experiment scripts as files rather than as a second
 # tree. Nothing else is created.
 #
-#   REPO      container checkout, holds .git and .venv   /workspace/sglang-omni
+#   REPO      container checkout, holds .git             /workspace/sglang-omni
+#   PY        interpreter, the box's sglang python       /opt/sglang/bin/python
 #   REV       revision under test                        upstream main
 #   COSYVOICE CosyVoice clone with its Matcha submodule  /workspace/CosyVoice
 #   SCRIPT    experiment to run                          g0_hop_cache_numerics.py
@@ -17,13 +18,13 @@
 set -euo pipefail
 
 REPO=${REPO:-/workspace/sglang-omni}
+PY=${PY:-/opt/sglang/bin/python}
 COSYVOICE=${COSYVOICE:-/workspace/CosyVoice}
 ANALYSIS_BRANCH=${ANALYSIS_BRANCH:-analysis/cosyvoice-utilization-20260912}
 SCRIPT=${SCRIPT:-g0_hop_cache_numerics.py}
 ARGS=${ARGS:-}
 
 cd "$REPO"
-source .venv/bin/activate
 mkdir -p .tmp
 grep -qx '.tmp/' .git/info/exclude 2>/dev/null || echo '.tmp/' >> .git/info/exclude
 
@@ -62,7 +63,7 @@ uptime > "$OUT/host_load.txt"; nproc >> "$OUT/host_load.txt"
 
 cd "$MAIN"
 export PYTHONPATH="$MAIN:$REPO/.tmp/stage0:$REPO/.tmp/stage2:$COSYVOICE:$COSYVOICE/third_party/Matcha-TTS"
-python -c "
+"$PY" -c "
 import sglang_omni, cosyvoice, matcha.utils.audio, sglang, sgl_kernel.flash_attn, common
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -71,6 +72,6 @@ print(sglang_omni.__file__); print(cosyvoice.__file__)
 " | tee "$OUT/import_path.txt"
 
 echo "card $CARD, revision $REV, out $OUT"
-CUDA_VISIBLE_DEVICES=$CARD python "$REPO/.tmp/stage2/$SCRIPT" \
+CUDA_VISIBLE_DEVICES=$CARD "$PY" "$REPO/.tmp/stage2/$SCRIPT" \
   --device cuda:0 --out "$OUT" $ARGS 2>&1 | tee "$OUT/run.log"
 echo "OUT=$OUT"
