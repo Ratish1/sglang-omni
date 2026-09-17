@@ -18,6 +18,7 @@
 #   SAMPLES  first N of the English split                        16
 #   SEED     sampling seed sent with every request               1234
 #   MODEL    checkpoint, a local directory                       /data/ms/.../master
+#   SERVE    extra serve arguments, the same string on both arms  empty
 set -euo pipefail
 
 REPO=${REPO:-/workspace/sglang-omni}
@@ -27,6 +28,7 @@ CARD=${CARD:?CARD is the card index}
 PORT=${PORT:-8000}
 SAMPLES=${SAMPLES:-16}
 SEED=${SEED:-1234}
+SERVE=${SERVE:-}
 MODEL=${MODEL:-/data/ms/models/FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/master}
 ANALYSIS_BRANCH=${ANALYSIS_BRANCH:-analysis/cosyvoice-utilization-20260912}
 # The checkpoint loader imports CosyVoice and its Matcha submodule, which the
@@ -91,8 +93,9 @@ trap teardown EXIT
 echo "arm $ARM, revision $(cat "$OUT/head.txt"), card $CARD, port $PORT"
 echo "out $OUT"
 (cd "$TREE" && setsid bash -c "echo \$\$ > '$OUT/server.pgid'; exec env CUDA_VISIBLE_DEVICES=$CARD \
-  PYTHONPATH='$SERVER_PATH' python -u -m sglang_omni.cli serve --model-path '$MODEL' --port $PORT" \
+  PYTHONPATH='$SERVER_PATH' python -u -m sglang_omni.cli serve --model-path '$MODEL' --port $PORT $SERVE" \
   > "$OUT/serve.log" 2>&1 &)
+echo "$SERVE" > "$OUT/serve_args.txt"
 
 cd "$REPO/.tmp/wt/analysis"
 python -u "$T/diagnostics/run_seedtts.py" \
