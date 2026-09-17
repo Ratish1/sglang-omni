@@ -101,8 +101,11 @@ nvidia-smi dmon -i "$CARD" -s u -d 1 > "$OUT/dmon.csv" 2>/dev/null &
 DMON_PID=$!
 echo "arm $ARM, revision $(cat "$OUT/head.txt"), card $CARD, port $PORT"
 echo "out $OUT"
+# note(ratish): without the strict port the server takes any free port when
+# this one is held, and the client then polls the asked for port until it times
+# out. Fail loudly on a clash instead.
 (cd "$TREE" && setsid bash -c "echo \$\$ > '$OUT/server.pgid'; exec env CUDA_VISIBLE_DEVICES=$CARD \
-  PYTHONPATH='$SERVER_PATH' python -u -m sglang_omni.cli serve --model-path '$MODEL' --port $PORT $SERVE" \
+  SGLANG_OMNI_STRICT_PORT=1 PYTHONPATH='$SERVER_PATH' python -u -m sglang_omni.cli serve --model-path '$MODEL' --port $PORT $SERVE" \
   > "$OUT/serve.log" 2>&1 &)
 echo "$SERVE" > "$OUT/serve_args.txt"
 
