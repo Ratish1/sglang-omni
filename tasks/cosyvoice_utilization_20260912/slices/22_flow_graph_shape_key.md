@@ -53,6 +53,40 @@ Three readings, and all three come from the same defect.
   eight frame values for batch 1 and running eager. The number a feature returns
   should not be a function of which corpus was traced to build it.
 
+## The shape distribution, measured rather than assumed
+
+`log_flow_solve` (branch `analysis/cosyvoice-flow-shapes`, one line per solve
+naming the path, the rows, the width, the total and the row lengths) and
+`../stage2/flow_shapes.py` aggregate it. Streaming c8, 32 English samples,
+4090 D card 6, KV pool pinned at 1 GiB:
+
+```
+21 Flow solves
+  packed_hop        13   61.9%
+  packed_final       8   38.1%
+
+  path           calls   rows  width p50  width max  total p50  total max   keys
+  packed_hop        13   1-8         400        650       2050       3500     11
+  packed_final       8   1-8         532        784       2900       4518      8
+```
+
+- **No streaming call is graph eligible.** Zero `padded` and zero `graph` solves
+  in the whole run, which is the code trace confirmed at runtime.
+- **The 2-D key cannot cover streaming.** 13 hop calls carry 11 distinct
+  `(rows, width)` keys, and 8 final calls carry 8. A table of exact pairs would
+  need one entry per call, which is why the streaming path was never given one.
+- **The derived buckets cover every call.** The 17 buckets that follow from the
+  chunk quantum, the admission ceiling and a 25 percent padding bound hold 100
+  percent of these calls, at 12.7 percent padding on hops and 19.6 percent on
+  finals, with none above the ceiling.
+
+The run also corrected an architectural claim made earlier in this document.
+Hop lengths are chunk quantised, as derived: the run's hops are 100, 250, 250
+frames. **Final lengths are not**: 106, 316, 312, 352. A stream final covers the
+whole token history and the AR stops where it stops, so nothing rounds it to the
+chunk. That is precisely why the key needs round-up rather than exact match, and
+it is the one thing a derivation from the hop schedule alone would have missed.
+
 ## The first principles fix
 
 ### Why the key has two dimensions today, and what removes one
