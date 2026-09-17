@@ -187,7 +187,7 @@ def test_a_stream_the_pool_cannot_grow_gives_its_slots_back() -> None:
     assert (cached, plain) == ([], [("r", state)])
     assert state.flow_cache is None
     assert cache.allocator.available_size() == cache.slots
-    assert cache.stats.fallback_hops == 1
+    assert cache.fallback_hops == 1
 
 
 def test_without_a_pool_every_row_recomputes_its_window() -> None:

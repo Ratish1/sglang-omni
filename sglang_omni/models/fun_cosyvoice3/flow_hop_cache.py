@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     PackedDiT,
@@ -102,7 +104,7 @@ class CachedHopCall:
     segment may read, and each row's conv tails. Built once per call and shared
     by all pool layers."""
 
-    pool: Any
+    pool: MHATokenToKVPool
     heads: int
     head_dim: int
     entries: list[tuple[StreamHopCache, int]]
@@ -150,6 +152,8 @@ class CachedRowAttention:
     def __call__(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     ) -> torch.Tensor:
+        # note(ratish): sgl_kernel is imported where it is used, as the rest of
+        # the tree does, so a platform without it can still import this module.
         from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
         call = self.call
@@ -213,13 +217,6 @@ class CachedDiT(PackedDiT):
         return gather_rows(conv2_out, rows)
 
 
-@dataclass
-class FlowHopCacheStats:
-    calls: int = 0
-    cached_frames: int = 0
-    fallback_hops: int = 0
-
-
 class FlowHopCache:
     """The pool behind the cached hops and the streams that hold slots in it."""
 
@@ -233,9 +230,6 @@ class FlowHopCache:
         chunk: int,
         device: str | torch.device,
     ) -> None:
-        from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-
         self.bytes_per_frame = (
             2 * layers * heads * head_dim * CACHE_DTYPE.itemsize
         )
@@ -263,7 +257,9 @@ class FlowHopCache:
         self.allocator = TokenToKVPoolAllocator(
             slots, CACHE_DTYPE, str(self.device), self.pool, need_sort=False
         )
-        self.stats = FlowHopCacheStats()
+        # note(ratish): hops that gave up their cache because the pool could not
+        # grow them; the cache gate requires this to stay at zero.
+        self.fallback_hops = 0
 
     def open_stream(self) -> StreamHopCache:
         return StreamHopCache(self)
@@ -319,8 +315,6 @@ class FlowHopCache:
             slots = entry.slots[lane]
             lane_table[row, : slots.numel()] = slots.to(torch.int32)
         as_int32 = {"dtype": torch.int32, "device": self.device}
-        self.stats.calls += 1
-        self.stats.cached_frames += sum(lengths)
         return CachedHopCall(
             pool=self.pool,
             heads=self.heads,

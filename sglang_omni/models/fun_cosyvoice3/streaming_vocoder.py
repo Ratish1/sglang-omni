@@ -403,10 +403,11 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 self.complete_stream_request(request_id, self.finish_stream(request_id))
             return {}
         else:
+            cache = self.vocoder.flow_hop_cache
             cached, plain = self.split_hop_participants(participants)
             logger.info(
                 f"Fun-CosyVoice3 causal Flow batch size={len(participants)} "
-                f"cached={len(cached)}"
+                f"cached={len(cached)} fallbacks={0 if cache is None else cache.fallback_hops}"
             )
             decoded: dict[str, torch.Tensor] = {}
             if cached:
@@ -491,7 +492,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             else:
                 free += state.flow_cache.frames * CFG_LANES if state.flow_cache else 0
                 self.release_flow_cache(state)
-                cache.stats.fallback_hops += 1
+                cache.fallback_hops += 1
                 plain.append((request_id, state))
         return cached, plain
 
