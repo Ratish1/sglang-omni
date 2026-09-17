@@ -85,6 +85,7 @@ uptime > "$OUT/host_load.txt"
 printf '{"seed": %d}\n' "$SEED" > "$OUT/generation.json"
 
 teardown() {
+  [ -n "${DMON_PID:-}" ] && kill "$DMON_PID" 2>/dev/null || true
   [ -f "$OUT/server.pgid" ] || return 0
   kill -- "-$(cat "$OUT/server.pgid")" 2>/dev/null || true
   sleep 5
@@ -94,6 +95,10 @@ teardown() {
 }
 trap teardown EXIT
 
+# Whole run utilization of the card under test. The sm column is the share of
+# time a kernel was resident, which is GR active, not SM occupancy.
+nvidia-smi dmon -i "$CARD" -s u -d 1 > "$OUT/dmon.csv" 2>/dev/null &
+DMON_PID=$!
 echo "arm $ARM, revision $(cat "$OUT/head.txt"), card $CARD, port $PORT"
 echo "out $OUT"
 (cd "$TREE" && setsid bash -c "echo \$\$ > '$OUT/server.pgid'; exec env CUDA_VISIBLE_DEVICES=$CARD \
