@@ -69,11 +69,12 @@ overrides: `adjust_overrides` (`scheduling/engine_factory.py:112, :273`) and `po
    sets it and `build_generation_batch_overrides` merges defaults before user overrides
    (`engine_factory.py:108-111`). `setdefault` keeps an operator `engine.max_total_tokens` and the
    MLX and MPS values.
-4. Add `post_scheduler_setup(self, scheduler: Any, model_runner: Any) -> None` mirroring the
-   Qwen3-TTS one on main (`models/qwen3_tts/engine_builder.py:203-215`) with the model name
-   changed, returning first when `use_mlx()` because the MLX worker sizes no SGLang pool
-   (`scheduling/bootstrap.py:163-167`); `use_mlx` is imported function locally in this file's other
-   hooks, follow that. Percent style log, the repo's stdlib logging rule.
+4. Extend the existing `post_scheduler_setup` (`engine_builder.py:273-274` on main, which wires
+   the stream outbox for both backends and stays first): after that line return when `use_mlx()`,
+   because the MLX worker sizes no SGLang pool (`scheduling/bootstrap.py:163-167`), then log the
+   pool against the bound as the Qwen3-TTS hook on main does
+   (`models/qwen3_tts/engine_builder.py:203-215`) with the model name changed. `use_mlx` is
+   imported function locally in this file's other hooks, follow that. Percent style log.
 
 Nothing else. `max_prefill_tokens: 4096` stays a literal (out of scope). The prefill graph
 `max_bs` cap that `max_total_tokens` also applies (`scheduling/generation_batch_policy.py:86-88`,
