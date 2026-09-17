@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """G1: is one arm's emitted audio byte identical to another's.
 
-Takes two directories written by g1_stream_identity.sh. Checks that the two runs
-asked the same thing (same ordered corpus, same client contract, both complete),
-then compares the generated audio file of every sample byte for byte. A slice
-with no numeric change passes; anything else names the samples that differ.
+Takes directories written by g1_stream_identity.sh. Checks that the runs asked
+the same thing (same ordered corpus, same client contract, all complete), then
+compares the generated audio file of every sample byte for byte.
+
+Not every request on this box is reproducible: a few diverge from their first
+audio sample between two boots of one revision, so identity against a single
+baseline confuses a real change with that. --control takes a second run of the
+baseline revision. Samples the two baseline runs disagree on are unstable, are
+named in the report and carry no verdict; the verdict is identity on the rest.
 """
 from __future__ import annotations
 
@@ -38,46 +43,59 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline", type=Path)
     parser.add_argument("candidate", type=Path)
+    parser.add_argument("--control", type=Path, help="a second run of the baseline")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
-    runs = [
-        read_json(path / "seedtts" / "experiment.json")
-        for path in (args.baseline, args.candidate)
-    ]
-    for label, path, run in zip(
-        ("baseline", "candidate"), (args.baseline, args.candidate), runs, strict=True
-    ):
+    paths = [args.baseline, args.candidate]
+    labels = ["baseline", "candidate"]
+    if args.control is not None:
+        paths.append(args.control)
+        labels.append("control")
+    runs = [read_json(path / "seedtts" / "experiment.json") for path in paths]
+    for label, path, run in zip(labels, paths, runs, strict=True):
         if run["status"] != "complete":
             raise SystemExit(f"{label} {path} is {run['status']}, not complete")
-    if runs[0]["ordered_inputs_sha256"] != runs[1]["ordered_inputs_sha256"]:
-        raise SystemExit("the two runs did not send the same ordered corpus")
+        if run["ordered_inputs_sha256"] != runs[0]["ordered_inputs_sha256"]:
+            raise SystemExit(f"{label} did not send the baseline's ordered corpus")
     contracts = [
         {k: v for k, v in run["client_config"].items() if k not in IGNORED_CONFIG}
         for run in runs
     ]
-    if contracts[0] != contracts[1]:
-        differing = sorted(k for k in contracts[0] if contracts[0][k] != contracts[1].get(k))
-        raise SystemExit("client contracts differ: " + ", ".join(differing))
+    for label, contract in zip(labels, contracts, strict=True):
+        if contract != contracts[0]:
+            differing = sorted(k for k in contract if contract[k] != contracts[0].get(k))
+            raise SystemExit(f"{label} client contract differs: " + ", ".join(differing))
     if contracts[0].get("seed") is None:
         raise SystemExit("G1 compares seeded runs; neither run set a seed")
 
-    baseline, candidate = (audio_digests(path) for path in (args.baseline, args.candidate))
-    if set(baseline) != set(candidate):
-        raise SystemExit("the two runs wrote different sample files")
-    differing = [name for name in baseline if baseline[name] != candidate[name]]
+    digests = [audio_digests(path) for path in paths]
+    for label, digest in zip(labels, digests, strict=True):
+        if set(digest) != set(digests[0]):
+            raise SystemExit(f"{label} wrote a different set of sample files")
+    baseline, candidate = digests[0], digests[1]
+    unstable = (
+        sorted(name for name in baseline if baseline[name] != digests[2][name])
+        if args.control is not None
+        else []
+    )
+    gated = [name for name in sorted(baseline) if name not in set(unstable)]
+    differing = [name for name in gated if baseline[name] != candidate[name]]
     report = {
         "baseline": str(args.baseline),
         "candidate": str(args.candidate),
+        "control": None if args.control is None else str(args.control),
         "baseline_head": (args.baseline / "head.txt").read_text().strip(),
         "candidate_head": (args.candidate / "head.txt").read_text().strip(),
         "ordered_inputs_sha256": runs[0]["ordered_inputs_sha256"],
         "seed": contracts[0]["seed"],
         "samples": len(baseline),
-        "identical": len(baseline) - len(differing),
+        "unstable": unstable,
+        "gated": len(gated),
+        "identical": len(gated) - len(differing),
         "differing": {
             name: {"baseline": baseline[name], "candidate": candidate[name]}
-            for name in sorted(differing)
+            for name in differing
         },
         "verdict": "pass" if not differing else "fail",
     }
