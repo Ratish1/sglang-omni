@@ -13,7 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 
-IGNORED_CONFIG = {"output_dir", "model"}
+IGNORED_CONFIG = {"output_dir", "model", "base_url"}
 
 
 def read_json(path: Path):
