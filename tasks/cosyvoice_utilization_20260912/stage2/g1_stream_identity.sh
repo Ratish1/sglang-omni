@@ -112,7 +112,9 @@ echo "out $OUT"
 # out. Fail loudly on a clash instead.
 LAUNCH=""
 if [ -n "$NSYS" ]; then
-  LAUNCH="nsys launch --session-new=$NSYS --trace=cuda --sample=none \
+  # Nsight dropped --sample and --trace from launch after 2021.5; they belong to
+  # start, which the runner issues around the measured window.
+  LAUNCH="nsys launch --session-new=$NSYS \
     --cuda-graph-trace=node --trace-fork-before-exec=true"
 fi
 (cd "$TREE" && setsid bash -c "echo \$\$ > '$OUT/server.pgid'; exec env CUDA_VISIBLE_DEVICES=$CARD \
