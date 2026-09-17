@@ -15,7 +15,7 @@
 #   REV      revision the arm boots from
 #   CARD     card index, taken as given
 #   PORT     server port
-#   SAMPLES  first N of the English split                        16
+#   SAMPLES  first N of the English split, empty for all of it     16
 #   CONC     client concurrency                                  1
 #   MODE     streaming or buffered                              streaming
 #   SEED     sampling seed sent with every request               1234
@@ -110,8 +110,11 @@ echo "out $OUT"
 echo "$SERVE" > "$OUT/serve_args.txt"
 
 cd "$REPO/.tmp/wt/analysis"
+# An empty SAMPLES omits the flag, which is what selects the whole split.
+SAMPLE_ARG=""
+[ -n "$SAMPLES" ] && SAMPLE_ARG="--samples $SAMPLES"
 python -u "$T/diagnostics/run_seedtts.py" \
-  --mode "$MODE" --lang en --concurrency "$CONC" --warmup 1 --samples "$SAMPLES" \
+  --mode "$MODE" --lang en --concurrency "$CONC" --warmup 1 $SAMPLE_ARG \
   --model "$MODEL" --base-url "http://127.0.0.1:$PORT" \
   --generation-json "$OUT/generation.json" --ready-timeout 900 \
   --output "$OUT/seedtts" 2>&1 | tee "$OUT/client.log"
