@@ -180,7 +180,7 @@ step is the loop counter.
 | slice | content | gate |
 |---|---|---|
 | 2.0 | the shape instrument and the aggregator, on `analysis/cosyvoice-flow-shapes` and `stage2/flow_shapes.py`; ran 2026-09-17 | none, it is a measurement |
-| 2.1 | ragged attention in the packed path | E6 protocol against float32 SDPA on real activations, then bit identity of the packed solve against today's on frozen inputs |
+| 2.1 | ragged attention in the packed path | the G0 harness run on this tree and on main: the shipped hop's SNR against the same float32 padded truth must not fall by more than the G0 margin. Not bit identity, which two attention kernels cannot reach (`../stage2/README.md`, the 4090 isolation) |
 | 2.2 | the derived bucket table over total frames, round up, waste guard, one table for buffered, finals and hops | replay bit identical to eager per bucket; coverage and padding reported from the instrument; memory census |
 | 2.3 | capture granularity, whichever V1 selects | same as 2.2, plus the per shape cost |
 
