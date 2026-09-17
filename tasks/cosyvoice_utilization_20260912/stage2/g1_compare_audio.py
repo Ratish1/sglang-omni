@@ -21,7 +21,7 @@ def read_json(path: Path):
 
 
 def audio_digests(run: Path) -> dict[str, tuple[str, int]]:
-    directory = run / "measured" / "audio"
+    directory = run / "seedtts" / "measured" / "audio"
     if not directory.is_dir():
         raise SystemExit(f"{run} holds no measured/audio directory")
     digests = {}
@@ -41,7 +41,10 @@ def main() -> None:
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
-    runs = [read_json(path / "experiment.json") for path in (args.baseline, args.candidate)]
+    runs = [
+        read_json(path / "seedtts" / "experiment.json")
+        for path in (args.baseline, args.candidate)
+    ]
     for label, path, run in zip(
         ("baseline", "candidate"), (args.baseline, args.candidate), runs, strict=True
     ):

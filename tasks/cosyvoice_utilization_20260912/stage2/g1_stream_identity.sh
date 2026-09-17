@@ -94,6 +94,6 @@ python -u "$T/diagnostics/run_seedtts.py" \
   --mode streaming --lang en --concurrency 1 --warmup 1 --samples "$SAMPLES" \
   --model "$MODEL" --base-url "http://127.0.0.1:$PORT" \
   --generation-json "$OUT/generation.json" --ready-timeout 900 \
-  --output "$OUT" 2>&1 | tee "$OUT/client.log"
+  --output "$OUT/seedtts" 2>&1 | tee "$OUT/client.log"
 
 echo "OUT=$OUT"
