@@ -32,6 +32,7 @@ SAMPLES=${SAMPLES-16}
 CONC=${CONC:-1}
 MODE=${MODE:-streaming}
 SEED=${SEED:-1234}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-}
 SERVE=${SERVE:-}
 # A session name turns the arm into an Nsight capture: the server launches under
 # nsys and the runner opens the window around the measured benchmark only. The
@@ -88,7 +89,11 @@ grep -c 'the Flow attention chunk' \
 nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv > "$OUT/gpus_before.csv"
 uptime > "$OUT/host_load.txt"
 
-printf '{"seed": %d}\n' "$SEED" > "$OUT/generation.json"
+if [[ -n "$MAX_NEW_TOKENS" ]]; then
+  printf '{"seed": %d, "max_new_tokens": %d}\n' "$SEED" "$MAX_NEW_TOKENS" > "$OUT/generation.json"
+else
+  printf '{"seed": %d}\n' "$SEED" > "$OUT/generation.json"
+fi
 
 teardown() {
   [ -n "${DMON_PID:-}" ] && kill "$DMON_PID" 2>/dev/null || true
