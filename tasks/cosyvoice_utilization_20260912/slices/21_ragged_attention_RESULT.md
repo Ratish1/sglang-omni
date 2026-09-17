@@ -106,18 +106,44 @@ Mixed in both directions, which is what an unchanged code path on a shared box
 looks like. It is useful as a noise floor: about 5 to 7 percent on c16 buffered
 throughput here, which puts the streaming gain at roughly three times the noise.
 
-## Utilization
+## Utilization, Nsight GPU metrics
 
-No DCGM on this box, so `nvidia-smi dmon` gives the `sm` column, the share of
-time a kernel was resident. That is GR active, **not** SM occupancy, and the
-task's SM target is the latter. Streaming c16, main: 141 samples over the arm, 99
-of them nonzero, mean 69.2 percent over the busy samples, median 96, peak 100.
+`nsys launch --session-new` around the server and the runner opening the window
+on the measured benchmark only, the protocol in `../diagnostics/README.md`
+section 3, `--gpu-metrics-devices=4` resolving to "General Metrics for NVIDIA
+AD10x". 32 requests at c16 streaming, a finite cohort under profiling overhead,
+not the acceptance benchmark, which is the full split above.
 
-A card that is kernel resident 96 percent of the time while RTF sits above 1 is
-the whole thesis of this task in one line: the GPU is busy and inefficient. The
-ragged arm's capture is missing, its container was OOM killed twice by other
-tenants, and true SM active needs an nsys run with `--gpu-metrics-devices`, which
-this box supports and which has not been run.
+Raw means over the capture window:
+
+| metric | main | ragged |
+|---|---|---|
+| GR Active | 51.04% | 48.40% |
+| SMs Active | 42.78% | 39.01% |
+| SM Issue | 8.62% | 6.57% |
+| Compute Warps in Flight | 20.19% | 15.59% |
+| Unallocated Warps in Active SMs | 22.63% | 23.47% |
+
+**Every number falls, and that is the result, not a regression.** Utilization as
+a percentage is the wrong headline when throughput moved 60 percent: the same
+audio is produced with less of the card. Normalised by the audio each arm
+produced:
+
+| per second of audio produced | main | ragged | |
+|---|---|---|---|
+| GR Active | 0.0548 s | 0.0457 s | -16.6% |
+| SMs Active | 0.0459 s | 0.0369 s | -19.6% |
+| SM Issue | 0.0092 s | 0.0062 s | -32.6% |
+
+19.6 percent less SM active time per second of audio, which is the same size as
+the 15 to 17 percent the isolated hop call moved, measured a different way.
+
+The standing story is in the absolute numbers rather than the delta. SM Issue is
+8.62 percent on main and 6.57 percent here, against SMs Active of 42.78 and
+39.01: the SMs are resident and barely issuing, and Unallocated Warps in Active
+SMs sits above 22 percent on both arms. The card is occupied, not working. That
+is a launch and occupancy bound, not a compute bound, so the next lever is the
+graph work of `../plans/12_flow_graph_redesign.md`, not another kernel.
 
 ## What this unblocks
 
