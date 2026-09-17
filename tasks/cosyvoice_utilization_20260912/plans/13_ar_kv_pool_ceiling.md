@@ -65,6 +65,11 @@ overrides: `adjust_overrides` (`scheduling/engine_factory.py:112, :273`) and `po
                int(overrides["max_running_requests"]) * self.context_length,
            )
    ```
+   No casts: the override arrives as an int through the schema (`config/schema.py:155`) and the
+   runtime context fields are typed. The ceiling reads `self.context_length` and the startup line
+   reads `get_model().context_length`; they are equal because this builder rejects a context
+   override (`engine_factory.py:114-117`), and the runtime context does not exist yet when
+   `adjust_overrides` runs, so the class attribute is the only source there.
    `overrides["max_running_requests"]` is always present: every branch of `generation_defaults`
    sets it and `build_generation_batch_overrides` merges defaults before user overrides
    (`engine_factory.py:108-111`). `setdefault` keeps an operator `engine.max_total_tokens` and the
