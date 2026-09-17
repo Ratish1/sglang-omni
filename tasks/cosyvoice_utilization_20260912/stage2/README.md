@@ -127,6 +127,44 @@ growth schedule on the H100.
 Cost here is not meaningful: `pooled-sdpa` loops SDPA per row per layer, 220
 times 2R calls, so the cached column is slower than production by construction.
 
+## G1, slice 1.1, 2026-09-17, RTX 4090 D
+
+`g1_stream_identity.sh` boots one arm and generates the first 16 English SeedTTS
+samples at c1, streaming, seed 1234, warmup 1, on a local checkpoint.
+`g1_compare_audio.py` compares the emitted WAVs byte for byte.
+Arms: main `27a8293c` and slice 1.1 `c652aa5e`. Report `g1.json`.
+
+**It passes: 14 of 14 gated samples byte identical, 0 differing.** The other two
+of the sixteen are excluded by the control and are not a slice 1.1 effect, see
+below. Run on card 5 the two arms are in fact identical on all 16.
+
+Four boots, because the first comparison said 14 of 16 and the answer to "which
+14" decides whether the gate means anything:
+
+| pair | identical |
+|---|---|
+| main card 4 against slice card 5 | 14 of 16 |
+| main card 4 against main card 5 | 14 of 16, the same two, the same hashes |
+| main card 4 against main card 4, a second boot | 14 of 16, the same two |
+| main card 5 against slice card 5 | 16 of 16 |
+
+So two of the sixteen requests are not reproducible from one boot to the next on
+this box, on the same card and the same revision, and the arms agree on
+everything else. Both unstable samples are the two that use reference clip
+`common_voice_en_1205005`; the other six references that appear twice are stable
+in both of their samples. They diverge from their first audio sample, not their
+last, and their generated lengths differ by 0.4 s, so the AR took a different
+token at or near the first step, not a different stop decision. The seed is
+applied: fourteen samples reproduce exactly across four boots, which unseeded
+sampling would not do. `--tts_engine.factory.onnx_intra_op_threads 1` does not
+change it, so it is not thread ordering in the ONNX preprocessing.
+
+The gate is therefore stated against a control: a second run of the baseline
+revision defines which samples are reproducible, and identity is demanded on
+those. That is the sound form of the gate, and it is the form the script
+implements. Chasing the last two is a separate question, filed for the reference
+audio path, and it is not a blocker for slice 1.1.
+
 ## What G0 answers
 
 `g0_hop_cache_numerics.py` runs every hop of a staggered 8 row schedule three

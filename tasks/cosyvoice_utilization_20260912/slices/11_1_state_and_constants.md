@@ -111,3 +111,10 @@ G1: seeded c1 stream, same boot shape as main, emitted audio byte identical to
 main. Nothing here changes a number, so byte identity is the whole gate, and it
 is the one gate a 4090 settles as well as an H100 because it compares one build
 against another on one card.
+
+**Passed 2026-09-17** on the moss box, commit `c652aa5e` against main
+`27a8293c`, 16 English SeedTTS samples at c1, streaming, seed 1234: 14 of 14
+gated samples byte identical, and 16 of 16 when both arms run on card 5. Two
+samples are excluded by a control boot of main, which does not reproduce them
+either; `../stage2/README.md` section "G1, slice 1.1" has the four pairs and
+what the instability is. The full unit suite is 196 passed, 3 skipped.

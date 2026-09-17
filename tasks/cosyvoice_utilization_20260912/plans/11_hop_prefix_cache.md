@@ -201,7 +201,7 @@ and the raw waveform stays a reported diagnostic.
 | gate | what | pass |
 |---|---|---|
 | G0 numerics (no runtime change) | box script: 8 real references with mixed prompt lengths, growth schedule, one packed multi-row call per hop; paths (a) production packed bf16 full window, (b) cached bf16 through the SGLang pool and FA3 with the production timestep dtype, (c) float32 full window truth; per emitted hop mel and the magnitude spectrum of its HiFT delta: SNR against (c), max abs, NaN and Inf, lengths | (b) min SNR at least (a) min minus 1 dB and median at least (a) median minus 1 dB; no NaN or Inf; equal lengths. If it fails, trace per block before any runtime code. **Passed 2026-09-16** on run `g0-20260916T061846Z`: mel -0.21 dB at the minimum, +0.15 dB at the median over 36 hops, unbiased (cached is closer in 18 of 36, mean +0.03 dB, spread 0.90 dB) |
-| G1 refactor (1.1) | seeded c1 stream, same boot shape as main | emitted audio byte identical to main; c16 census no regression beyond noise |
+| G1 refactor (1.1) | seeded c1 stream, same boot shape as main, and a control boot of main that names the samples this box reproduces | emitted audio byte identical to main on every reproducible sample. **Passed 2026-09-17** on the 4090: 14 of 14 gated samples identical, 16 of 16 with both arms on one card (`stage2/README.md`, "G1, slice 1.1"). The c16 census half is dropped: 24 GB does not reach c16, and nothing in 1.1 changes a shape |
 | G2 cache (1.2) | stream c1 and c16, full English corpus, one boot per arm against main; memory census; stage 1 hop points rerun | req/s, audio s/s, first audio mean and p95, RTF p99, C50 reported; WER within 0.3 absolute and SIM within 0.005 of main; fallback counter 0 at c16 with the chosen budget; hop wall follows new frames |
 
 ## 7. Slices
@@ -209,8 +209,8 @@ and the raw waveform stays a reported diagnostic.
 | slice | content | runtime change | gate |
 |---|---|---|---|
 | 1.0 | `stage2/g0_hop_cache_numerics.py`, steps and results in `stage2/README.md`; ran 2026-09-16, G0 passed | no | G0, done |
-| 1.1 | state owner, chunk validation (H3), flow constants (H4), dead code (H5) | yes, no numeric change | G1 |
-| 1.2 | SGLang pool, cached hop call, fallback, budget argument | yes | G2 |
+| 1.1 | state owner, chunk validation (H3), flow constants (H4), dead code (H5); written up in `../slices/11_1_state_and_constants.md`, ran 2026-09-17, G1 passed | yes, no numeric change | G1, done |
+| 1.2 | SGLang pool, cached hop call, fallback, budget argument; written up in `../slices/11_2_cached_hop_call.md` | yes | G2 |
 | D1 | prompt padding to reference semantics (H1): first hop waits hop + pad tokens, prompt real; `first_ar_flush_tokens` becomes prompt aware | yes, output change | own A/B: WER, SIM, first audio (derived cost at most 24 decode steps, about 60 ms at 2.53 ms per step) |
 
 Deferred: the hop schedule (H2) with the HiFT plan; the final call (H9); hop CUDA graphs (roadmap
