@@ -80,6 +80,39 @@ naming the path, the rows, the width, the total and the row lengths) and
   percent of these calls, at 12.7 percent padding on hops and 19.6 percent on
   finals, with none above the ceiling.
 
+Buffered c8, same instrument, card 4, KV pool at 2 GiB:
+
+```
+16 Flow solves
+  padded             9   56.2%
+  graph              5   31.2%
+  packed_hop         1    6.2%
+  packed_final       1    6.2%
+
+graph hit rate over the padded path: 5/14 = 35.7%
+
+  path      calls   rows  width p50  width max  total p50  total max   keys
+  padded        9    1-6        372        746        372       3230      9
+  graph         5    1-6        532        546        544       2782      5
+```
+
+**The traced table serves 35.7 percent of the calls it is eligible for, on the
+corpus it was traced from.** Nine of fourteen buffered calls run eager. The
+fourteen calls carry fourteen distinct keys. And at that coverage the table is
+still worth 1.67x on this point, which is the strongest argument for fixing the
+key rather than the feature: a third of the calls are buying all of that.
+
+The same 17 derived buckets cover all 16 calls, 22.0 percent padding on the
+eager ones and 12.2 percent on the graphed ones, none above the ceiling.
+
+| | traced table | derived buckets |
+|---|---|---|
+| captures | 54 | 17 |
+| buffered c8 coverage | 35.7 percent | 100 percent |
+| streaming c8 coverage | 0 percent | 100 percent |
+| keys a call needs | one per call, near enough | one number |
+| survives a new corpus or card | no, it was retraced once already in #2141 | yes, it has neither in it |
+
 The run also corrected an architectural claim made earlier in this document.
 Hop lengths are chunk quantised, as derived: the run's hops are 100, 250, 250
 frames. **Final lengths are not**: 106, 316, 312, 352. A stream final covers the
