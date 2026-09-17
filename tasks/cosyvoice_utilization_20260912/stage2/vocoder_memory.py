@@ -133,6 +133,9 @@ def main() -> None:
     del tokenizer, encoder
 
     if args.shapes:
+        # The factory installs the graph safe chunk mask before it captures;
+        # capture fails mid stream without it.
+        stages.patch_chunk_mask()
         shapes = SHAPES[: args.shapes]
         runner = stages.FlowCudaGraphRunner(
             flow,
