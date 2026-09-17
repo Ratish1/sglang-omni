@@ -17,6 +17,7 @@
 #   PORT     server port
 #   SAMPLES  first N of the English split                        16
 #   CONC     client concurrency                                  1
+#   MODE     streaming or buffered                              streaming
 #   SEED     sampling seed sent with every request               1234
 #   MODEL    checkpoint, a local directory                       /data/ms/.../master
 #   SERVE    extra serve arguments, the same string on both arms  empty
@@ -29,6 +30,7 @@ CARD=${CARD:?CARD is the card index}
 PORT=${PORT:-8000}
 SAMPLES=${SAMPLES:-16}
 CONC=${CONC:-1}
+MODE=${MODE:-streaming}
 SEED=${SEED:-1234}
 SERVE=${SERVE:-}
 MODEL=${MODEL:-/data/ms/models/FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/master}
@@ -101,7 +103,7 @@ echo "$SERVE" > "$OUT/serve_args.txt"
 
 cd "$REPO/.tmp/wt/analysis"
 python -u "$T/diagnostics/run_seedtts.py" \
-  --mode streaming --lang en --concurrency "$CONC" --warmup 1 --samples "$SAMPLES" \
+  --mode "$MODE" --lang en --concurrency "$CONC" --warmup 1 --samples "$SAMPLES" \
   --model "$MODEL" --base-url "http://127.0.0.1:$PORT" \
   --generation-json "$OUT/generation.json" --ready-timeout 900 \
   --output "$OUT/seedtts" 2>&1 | tee "$OUT/client.log"
