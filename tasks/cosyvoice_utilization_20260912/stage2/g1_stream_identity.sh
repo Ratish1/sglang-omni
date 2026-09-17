@@ -33,6 +33,12 @@ CONC=${CONC:-1}
 MODE=${MODE:-streaming}
 SEED=${SEED:-1234}
 SERVE=${SERVE:-}
+# A session name turns the arm into an Nsight capture: the server launches under
+# nsys and the runner opens the window around the measured benchmark only. The
+# metric device is the nsys ordinal, which is the physical card, not the ordinal
+# CUDA_VISIBLE_DEVICES leaves the process.
+NSYS=${NSYS-}
+NSYS_WARMUP=${NSYS_WARMUP:-32}
 MODEL=${MODEL:-/data/ms/models/FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/master}
 ANALYSIS_BRANCH=${ANALYSIS_BRANCH:-analysis/cosyvoice-utilization-20260912}
 # The checkpoint loader imports CosyVoice and its Matcha submodule, which the
@@ -104,8 +110,13 @@ echo "out $OUT"
 # note(ratish): without the strict port the server takes any free port when
 # this one is held, and the client then polls the asked for port until it times
 # out. Fail loudly on a clash instead.
+LAUNCH=""
+if [ -n "$NSYS" ]; then
+  LAUNCH="nsys launch --session-new=$NSYS --trace=cuda --sample=none \
+    --cuda-graph-trace=node --trace-fork-before-exec=true"
+fi
 (cd "$TREE" && setsid bash -c "echo \$\$ > '$OUT/server.pgid'; exec env CUDA_VISIBLE_DEVICES=$CARD \
-  SGLANG_OMNI_STRICT_PORT=1 PYTHONPATH='$SERVER_PATH' python -u -m sglang_omni.cli serve --model-path '$MODEL' --port $PORT $SERVE" \
+  SGLANG_OMNI_STRICT_PORT=1 PYTHONPATH='$SERVER_PATH' $LAUNCH python -u -m sglang_omni.cli serve --model-path '$MODEL' --port $PORT $SERVE" \
   > "$OUT/serve.log" 2>&1 &)
 echo "$SERVE" > "$OUT/serve_args.txt"
 
@@ -113,8 +124,17 @@ cd "$REPO/.tmp/wt/analysis"
 # An empty SAMPLES omits the flag, which is what selects the whole split.
 SAMPLE_ARG=""
 [ -n "$SAMPLES" ] && SAMPLE_ARG="--samples $SAMPLES"
+# With a session the runner sends its own pre capture cohort and runs the
+# measured benchmark at internal warmup zero, so the warmup here sizes that
+# cohort rather than the benchmark's.
+CAPTURE_ARG=""
+WARMUP=1
+if [ -n "$NSYS" ]; then
+  CAPTURE_ARG="--session $NSYS --metrics-devices $CARD"
+  WARMUP=$NSYS_WARMUP
+fi
 python -u "$T/diagnostics/run_seedtts.py" \
-  --mode "$MODE" --lang en --concurrency "$CONC" --warmup 1 $SAMPLE_ARG \
+  --mode "$MODE" --lang en --concurrency "$CONC" --warmup "$WARMUP" $SAMPLE_ARG $CAPTURE_ARG \
   --model "$MODEL" --base-url "http://127.0.0.1:$PORT" \
   --generation-json "$OUT/generation.json" --ready-timeout 900 \
   --output "$OUT/seedtts" 2>&1 | tee "$OUT/client.log"
