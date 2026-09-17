@@ -32,6 +32,11 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     scatter_rows,
     solve_flow_euler_packed,
 )
+from sglang_omni.models.fun_cosyvoice3.flow_hop_cache import (
+    CachedDiT,
+    FlowHopCache,
+    StreamHopCache,
+)
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     cleanup_prepared_cosyvoice3_request,
@@ -74,6 +79,11 @@ COSYVOICE_INSTALL_HINT = (
 
 CHUNK_MASK_COMPILE_DISABLED = False
 CAUSAL_CONV_CACHE_PATCHED = False
+
+# note(ratish): the Euler solve steps between these time points, so it runs
+# FLOW_TIME_POINTS - 1 DiT passes and the hop cache holds one pool layer per
+# (pass, block).
+FLOW_TIME_POINTS = 11
 
 FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
 # Note (chenyang):
@@ -369,7 +379,9 @@ class FlowCudaGraphRunner:
             .expand(batch_size, -1, -1)
             .clone()
         )
-        time_span = torch.linspace(0, 1, 11, device=model_device, dtype=parameter_dtype)
+        time_span = torch.linspace(
+            0, 1, FLOW_TIME_POINTS, device=model_device, dtype=parameter_dtype
+        )
         if decoder.t_scheduler == "cosine":
             time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
         token_condition = torch.zeros_like(noisy_mel)
@@ -610,7 +622,11 @@ def prepare_flow_conditioning(
         .clone()
     )
     unit_span = torch.linspace(
-        0, 1, 11, device=token_condition.device, dtype=token_condition.dtype
+        0,
+        1,
+        FLOW_TIME_POINTS,
+        device=token_condition.device,
+        dtype=token_condition.dtype,
     )
     if decoder.t_scheduler == "cosine":
         time_span = 1 - torch.cos(unit_span * 0.5 * torch.pi)
@@ -713,6 +729,17 @@ def generate_flow_packed(
         streaming=streaming,
     )
     return scatter_rows(generated, rows, token_condition.shape[2]).transpose(1, 2)
+
+
+def slice_new_frames(
+    padded: torch.Tensor, spans: Sequence[tuple[int, int]]
+) -> torch.Tensor:
+    """(rows, channels, frames) -> (1, new frames, channels), each row's
+    [start, end) concatenated in row order."""
+    return torch.cat(
+        [padded[row, :, start:end].transpose(0, 1) for row, (start, end) in enumerate(spans)],
+        dim=0,
+    ).unsqueeze(0)
 
 
 def split_generated_mels(
@@ -831,6 +858,52 @@ class FunCosyVoice3Flow:
             target_token_lengths=target_token_lengths,
         )
 
+    @torch.inference_mode()
+    def inference_cached_hop(
+        self,
+        inputs: Sequence[FlowBatchInput],
+        handles: Sequence[StreamHopCache],
+        cache: FlowHopCache,
+    ) -> list[torch.Tensor]:
+        """The causal hop over each row's new frames only, reading the frames
+        before them from the pool. Returns the frames each row emits, which is
+        the whole new block for a follow-up hop and the block past the prompt
+        for the first one."""
+        packed = pack_flow_inputs(self.flow, inputs)
+        conditioning = prepare_flow_conditioning(self, packed, finalize=False)
+        spans = [
+            (int(handle.frames), int(frames))
+            for handle, frames in zip(handles, conditioning.mel_lengths, strict=True)
+        ]
+        call = cache.begin_call(
+            [
+                (handle, start, end)
+                for handle, (start, end) in zip(handles, spans, strict=True)
+            ]
+        )
+        rows = pack_rows(
+            [end - start for start, end in spans], conditioning.token_condition.device
+        )
+        generated = solve_flow_euler_packed(
+            CachedDiT(self.flow.decoder.estimator, call),
+            slice_new_frames(conditioning.noisy_mel, spans),
+            conditioning.time_span,
+            slice_new_frames(conditioning.token_condition, spans),
+            conditioning.speaker_embedding,
+            slice_new_frames(conditioning.prompt_mel, spans),
+            rows,
+            cfg_rate=self.flow.decoder.inference_cfg_rate,
+            streaming=True,
+        )
+        outputs: list[torch.Tensor] = []
+        cursor = 0
+        for index, (start, end) in enumerate(spans):
+            mel = generated[0, cursor : cursor + end - start].transpose(0, 1)
+            cursor += end - start
+            prompt_frames = packed.prompt_mel_lengths[index]
+            outputs.append(mel[:, max(prompt_frames - start, 0) :].unsqueeze(0))
+        return outputs
+
 
 def attach_flow_estimator_trt(
     flow: FunCosyVoice3Flow,
@@ -870,6 +943,23 @@ def attach_flow_estimator_trt(
         "Fun-CosyVoice3 Flow DiT estimator is TensorRT Module (%s, max_cfg_batch=%d)",
         onnx_path,
         wrapper.max_batch,
+    )
+
+
+def build_flow_hop_cache(
+    flow: FunCosyVoice3Flow, device: str, budget_bytes: int
+) -> FlowHopCache:
+    """Size the hop K/V pool from the DiT the hops actually run."""
+    dit = flow.decoder.estimator
+    attention = dit.transformer_blocks[0].attn
+    heads = int(attention.heads)
+    return FlowHopCache(
+        budget_bytes=budget_bytes,
+        layers=(FLOW_TIME_POINTS - 1) * len(dit.transformer_blocks),
+        heads=heads,
+        head_dim=int(attention.to_q.out_features) // heads,
+        chunk=int(flow.static_chunk_size),
+        device=device,
     )
 
 
@@ -1345,6 +1435,7 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         hift_max_padding_waste: float = 1.5,
         flow_merge_max_gap_frames: int = 384,
         flow_merge_pad_budget_percent: float = 25.0,
+        flow_hop_cache: FlowHopCache | None = None,
     ) -> None:
         if hift_max_padding_waste < 1.0:
             raise ValueError("hift_max_padding_waste must be at least 1.0")
@@ -1366,6 +1457,7 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         )
         self.hift = hift
         self.autocast_dtype = autocast_dtype
+        self.flow_hop_cache = flow_hop_cache
         self.flow_merge_max_gap_frames = flow_merge_max_gap_frames
         self.flow_merge_pad_budget_percent = flow_merge_pad_budget_percent
         self.hift_autocast_dtype = AUTOCAST_DTYPES[hift_dtype]
@@ -1543,6 +1635,22 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             enabled=self.autocast_dtype is not None,
         ):
             return self.flow.inference_causal(items)
+
+    def hop_batch_cached(
+        self,
+        items: Sequence[FlowBatchInput],
+        handles: Sequence[StreamHopCache],
+    ) -> list[torch.Tensor]:
+        """The same hop over each row's new frames only, the frames before them
+        read from the K/V pool. Returns the frames each row emits, so the
+        scheduler hands them to HiFT without slicing again.
+        """
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=self.autocast_dtype,
+            enabled=self.autocast_dtype is not None,
+        ):
+            return self.flow.inference_cached_hop(items, handles, self.flow_hop_cache)
 
     def leftover_batch(self, items: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
         """Non-streaming Flow over each row's whole token history for the
@@ -1982,6 +2090,7 @@ def create_vocoder_executor(
     max_batch_size: int | None = None,
     max_batch_wait_ms: int = 30,
     flow_batch_admission_frames: int = DEFAULT_FLOW_BATCH_ADMISSION_FRAMES,
+    flow_kv_cache_bytes: int = 0,
     flow_merge_max_gap_frames: int = 384,
     flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = False,
@@ -2082,10 +2191,30 @@ def create_vocoder_executor(
         runner.capture(capture_shapes)
         flow.attach_cuda_graph_runner(runner)
 
+    if flow_kv_cache_bytes <= 0:
+        flow_hop_cache = None
+    elif flow.packed_estimator is None or device_obj.type != "cuda":
+        flow_hop_cache = None
+        logger.info(
+            "Fun-CosyVoice3 hop K/V cache is off: it needs the packed DiT on "
+            "CUDA, and this vocoder runs %s on %s",
+            type(flow.decoder.estimator).__name__,
+            device_obj.type,
+        )
+    else:
+        flow_hop_cache = build_flow_hop_cache(flow, device, flow_kv_cache_bytes)
+        logger.info(
+            "Fun-CosyVoice3 hop K/V cache holds %d frames (%d bytes each, %.1f GiB)",
+            flow_hop_cache.slots,
+            flow_hop_cache.bytes_per_frame,
+            flow_hop_cache.slots * flow_hop_cache.bytes_per_frame / 2**30,
+        )
+
     vocoder = CosyVoice3Vocoder(
         flow,
         hift,
         autocast_dtype=autocast_dtype,
+        flow_hop_cache=flow_hop_cache,
         flow_merge_max_gap_frames=flow_merge_max_gap_frames,
         flow_merge_pad_budget_percent=flow_merge_pad_budget_percent,
         hift_dtype=hift_dtype,
