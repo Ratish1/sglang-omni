@@ -29,6 +29,9 @@ SAMPLES=${SAMPLES:-16}
 SEED=${SEED:-1234}
 MODEL=${MODEL:-/data/ms/models/FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/master}
 ANALYSIS_BRANCH=${ANALYSIS_BRANCH:-analysis/cosyvoice-utilization-20260912}
+# The checkpoint loader imports CosyVoice and its Matcha submodule, which the
+# container keeps as a clone rather than a wheel.
+COSYVOICE=${COSYVOICE:-/workspace/CosyVoice}
 
 # The checkpoint and the SeedTTS arrow are on disk; offline so a boot cannot
 # stall on the hub. The container exports a SOCKS proxy httpx prefers and then
@@ -61,8 +64,10 @@ mkdir -p "$OUT"
 # Provenance of the code that will serve, not of the checkout the client runs
 # from: the revision, the module the server process imports, and whether the
 # hop contract of slice 1.1 is in that tree.
+SERVER_PATH="$TREE:$COSYVOICE:$COSYVOICE/third_party/Matcha-TTS"
 git -C "$TREE" rev-parse HEAD > "$OUT/head.txt"
-(cd "$TREE" && python -c "import sglang_omni; print(sglang_omni.__file__)") > "$OUT/import_path.txt"
+(cd "$TREE" && PYTHONPATH="$SERVER_PATH" python -c \
+  "import sglang_omni; print(sglang_omni.__file__)") > "$OUT/import_path.txt"
 grep -q "^$TREE/" "$OUT/import_path.txt" || {
   echo "server would import $(cat "$OUT/import_path.txt"), not $TREE"; exit 1;
 }
@@ -86,7 +91,7 @@ trap teardown EXIT
 echo "arm $ARM, revision $(cat "$OUT/head.txt"), card $CARD, port $PORT"
 echo "out $OUT"
 (cd "$TREE" && setsid bash -c "echo \$\$ > '$OUT/server.pgid'; exec env CUDA_VISIBLE_DEVICES=$CARD \
-  python -u -m sglang_omni.cli serve --model-path '$MODEL' --port $PORT" \
+  PYTHONPATH='$SERVER_PATH' python -u -m sglang_omni.cli serve --model-path '$MODEL' --port $PORT" \
   > "$OUT/serve.log" 2>&1 &)
 
 cd "$REPO/.tmp/wt/analysis"
