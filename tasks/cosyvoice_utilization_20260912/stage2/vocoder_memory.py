@@ -40,33 +40,38 @@ class Ledger:
 
     def __init__(self, index: int) -> None:
         self.index = index
-        self.rows: list[tuple[str, float, float, float, float]] = []
-        self.last_device = device_free_mb(index)
-        self.last_torch = torch.cuda.memory_reserved() / 2**20
+        self.rows: list[tuple[str, float, float, float, float, float]] = []
+        self.last = (device_free_mb(index), 0.0, 0.0)
 
     def mark(self, label: str) -> None:
         torch.cuda.synchronize()
         device = device_free_mb(self.index)
-        reserved = torch.cuda.memory_reserved() / 2**20
+        live = torch.cuda.memory_allocated() / 2**20
+        cached = torch.cuda.memory_reserved() / 2**20
         self.rows.append(
             (
                 label,
-                device - self.last_device,
-                reserved - self.last_torch,
+                device - self.last[0],
+                live - self.last[1],
+                cached - self.last[2],
                 device,
-                reserved,
+                cached - live,
             )
         )
-        self.last_device, self.last_torch = device, reserved
+        self.last = (device, live, cached)
 
     def report(self) -> None:
-        print(f"\n{'step':34s} {'device MiB':>11s} {'torch MiB':>10s} "
-              f"{'outside torch':>14s} {'device total':>13s}")
-        for label, device, reserved, total, _ in self.rows:
+        print(
+            f"\n{'step':32s} {'device':>8s} {'live':>8s} {'cached':>8s} "
+            f"{'outside torch':>14s} {'held':>7s} {'idle cache':>11s}"
+        )
+        for label, device, live, cached, total, idle in self.rows:
             print(
-                f"{label:34s} {device:11.0f} {reserved:10.0f} "
-                f"{device - reserved:14.0f} {total:13.0f}"
+                f"{label:32s} {device:8.0f} {live:8.0f} {cached:8.0f} "
+                f"{device - cached:14.0f} {total:7.0f} {idle:11.0f}"
             )
+        print("all columns MiB; device is nvidia-smi, live is torch allocated, "
+              "cached is torch reserved, idle cache is reserved minus allocated")
 
 
 def parameter_bytes(module: torch.nn.Module) -> tuple[int, Counter]:
