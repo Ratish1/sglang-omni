@@ -9,6 +9,7 @@ import os
 from typing import Any
 
 import torch
+from sglang.srt.runtime_context import get_model, get_schedule
 
 from sglang_omni.models.fun_cosyvoice3 import request_builders
 from sglang_omni.models.fun_cosyvoice3.streaming import TOKEN_HOP_LEN
@@ -19,6 +20,7 @@ from sglang_omni.models.fun_cosyvoice3.utils import (
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+from sglang_omni.scheduling.stage_kv_budget import peek_stage_kv_cache_bytes
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -119,11 +121,19 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
             "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
             "enable_torch_compile": False,
-            "mem_fraction_static": 0.85,
             "max_prefill_tokens": 4096,
             "sampling_backend": "pytorch",
             "trust_remote_code": True,
         }
+
+    def adjust_overrides(self, overrides: dict[str, Any]) -> None:
+        # note(ratish): the pool covers what admission can commit, the running
+        # cap times the context length. A stage byte budget sizes it instead.
+        if peek_stage_kv_cache_bytes() is None:
+            overrides.setdefault(
+                "max_total_tokens",
+                overrides["max_running_requests"] * self.context_length,
+            )
 
     def before_memory_pool(
         self,
@@ -271,4 +281,23 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
         return request_builders.cleanup_prepared_cosyvoice3_request
 
     def post_scheduler_setup(self, scheduler: Any, model_runner: Any) -> None:
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
         model_runner.set_stream_outbox(scheduler.outbox)
+        if use_mlx():
+            return
+        schedule = get_schedule()
+        running = schedule.max_running_requests
+        context = get_model().context_length
+        pool = scheduler.tp_worker.model_runner.token_to_kv_pool
+        k_bytes, v_bytes = pool.get_kv_size_bytes()
+        logger.info(
+            "Fun-CosyVoice3 KV pool holds %d tokens, %.2f GiB, against a configured "
+            "maximum demand of %d (%d running x %d context), mem_fraction_static %.3f",
+            scheduler.max_total_num_tokens,
+            (k_bytes + v_bytes) / (1 << 30),
+            running * context,
+            running,
+            context,
+            schedule.mem_fraction_static,
+        )
