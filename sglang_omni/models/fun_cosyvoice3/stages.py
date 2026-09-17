@@ -626,6 +626,20 @@ def prepare_flow_conditioning(
     )
 
 
+def log_flow_solve(path: str, mel_lengths: tuple[int, ...], width: int) -> None:
+    """One line per Flow solve: the shape the call had and the path that served
+    it. A graph shape key is derived from these, not from a traced table.
+    """
+    logger.info(
+        "Fun-CosyVoice3 Flow solve path=%s rows=%d width=%d total=%d lengths=%s",
+        path,
+        len(mel_lengths),
+        width,
+        sum(mel_lengths),
+        ",".join(str(length) for length in mel_lengths),
+    )
+
+
 @torch.inference_mode()
 def generate_flow(
     flow: FunCosyVoice3Flow,
@@ -654,23 +668,20 @@ def generate_flow(
         .to(token_condition.dtype)
     )
     if streaming or not finalize or flow.cuda_graph_runner is None:
-        return solve_flow_euler(
-            decoder,
+        generated = None
+    else:
+        generated = flow.cuda_graph_runner.run(
             conditioning.noisy_mel,
             conditioning.time_span,
             token_condition,
             mel_mask,
             conditioning.speaker_embedding,
             conditioning.prompt_mel,
-            streaming=streaming,
         )
-    generated = flow.cuda_graph_runner.run(
-        conditioning.noisy_mel,
-        conditioning.time_span,
-        token_condition,
-        mel_mask,
-        conditioning.speaker_embedding,
-        conditioning.prompt_mel,
+    log_flow_solve(
+        "graph" if generated is not None else "padded",
+        conditioning.mel_lengths,
+        int(token_condition.shape[2]),
     )
     if generated is not None:
         return generated
@@ -682,7 +693,7 @@ def generate_flow(
         mel_mask,
         conditioning.speaker_embedding,
         conditioning.prompt_mel,
-        streaming=False,
+        streaming=streaming,
     )
 
 
@@ -701,6 +712,11 @@ def generate_flow_packed(
     conditioning = prepare_flow_conditioning(flow, packed, finalize=finalize)
     token_condition = conditioning.token_condition
     rows = pack_rows(conditioning.mel_lengths, token_condition.device)
+    log_flow_solve(
+        "packed_hop" if streaming else "packed_final",
+        conditioning.mel_lengths,
+        rows.width,
+    )
     generated = solve_flow_euler_packed(
         flow.packed_estimator,
         gather_rows(conditioning.noisy_mel.transpose(1, 2), rows),
