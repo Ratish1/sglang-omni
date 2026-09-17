@@ -81,6 +81,38 @@ the roadmap's target of p99 below 1 is not reachable on this card. And c16 only
 boots here at all because the KV pool is declared: without it the pool takes 9.78
 GiB and the run fails on ONNX cuBLAS handles (`../MEMORY_TRACE_20260917.md`).
 
+## Buffered c16: unchanged, by design
+
+Buffered traffic never reaches the packed path. `decode_batch` goes through
+`inference` to `generate_flow` (`stages.py:778`), the padded and graphed path;
+this slice only changes `solve_flow_euler_packed`, which serves streaming hops
+and stream finals. So the expectation is no change, and the measurement agrees:
+
+| buffered c16 | main | ragged |
+|---|---|---|
+| completed / failed | 32 / 0 | 32 / 0 |
+| RTF mean | 0.6538 | 0.6247 |
+| RTF p99 | 1.0768 | 1.1023 |
+| req/s | 5.278 | 5.099 |
+| audio s/s | 24.919 | 23.060 |
+
+Mixed in both directions, which is what an unchanged code path on a shared box
+looks like. It is useful as a noise floor: about 5 to 7 percent on c16 buffered
+throughput here, which puts the streaming gain at roughly three times the noise.
+
+## Utilization
+
+No DCGM on this box, so `nvidia-smi dmon` gives the `sm` column, the share of
+time a kernel was resident. That is GR active, **not** SM occupancy, and the
+task's SM target is the latter. Streaming c16, main: 141 samples over the arm, 99
+of them nonzero, mean 69.2 percent over the busy samples, median 96, peak 100.
+
+A card that is kernel resident 96 percent of the time while RTF sits above 1 is
+the whole thesis of this task in one line: the GPU is busy and inefficient. The
+ragged arm's capture is missing, its container was OOM killed twice by other
+tenants, and true SM active needs an nsys run with `--gpu-metrics-devices`, which
+this box supports and which has not been run.
+
 ## What this unblocks
 
 The cost of a Flow call is now total frames in every module, so the graph shape
