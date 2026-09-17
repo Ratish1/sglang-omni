@@ -55,31 +55,37 @@ From the same two G0 runs, the wall of one production hop call:
 Consistent at every shape, and the absolute gap widens with the batch, 37.7 ms at
 one row to 48.9 ms at four: the `rows x width squared` term is what leaves.
 
-## c16 streaming, one boot per arm
+## c16 streaming, the whole English split, one boot per arm
 
-32 English SeedTTS samples, streaming, seed 1234, warmup 1, card 4, KV pool
-declared at 2 GiB on both arms so this is not a memory comparison. The other
-cards carried another tenant at about 24 GB throughout, equally for both arms,
-which ran back to back.
+1,088 requests, the full English SeedTTS split, streaming, seed 1234, warmup 1,
+card 4, KV pool declared at 2 GiB on both arms so this is not a memory
+comparison. The arms ran back to back on the same card.
 
 | | main | ragged | |
 |---|---|---|---|
-| completed / failed | 32 / 0 | 32 / 0 | |
-| RTF mean | 1.3567 | 1.1840 | -12.7% |
-| RTF p99 | 3.2589 | 2.9608 | -9.1% |
-| first audio mean | 2.562 s | 2.391 s | -6.7% |
-| first audio p95 | 3.277 s | 2.852 s | -13.0% |
-| inter chunk mean | 1.667 s | 1.324 s | -20.6% |
-| req/s | 2.589 | 2.978 | +15.0% |
-| audio s/s | 11.833 | 13.493 | +14.0% |
+| completed / failed | 1088 / 0 | 1088 / 0 | |
+| RTF mean | 1.7150 | 1.0838 | -36.8% |
+| RTF p99 | 6.8663 | 2.3578 | -65.7% |
+| first audio mean | 3.480 s | 2.175 s | -37.5% |
+| first audio p95 | 9.563 s | 3.307 s | -65.4% |
+| inter chunk mean | 2.089 s | 1.339 s | -35.9% |
+| req/s | 2.074 | 3.318 | +60.0% |
+| audio s/s | 10.332 | 15.780 | +52.7% |
 
-One boot per arm is the standing protocol, and a 13 to 15 percent delta is far
-outside the roughly 2 percent band that would call for a repeat.
+The tail moves most, which is the shape of the defect: the padded read charged
+every row for the widest row in its batch, so a batch holding one long request
+paid for it 16 times over. The stage 1 ledger measured that case directly, a
+16 row hop holding one row of 2,051 tokens spending 67 percent of a 3,061 ms
+call in padded attention and 10 percent in the mask.
 
-Two things this table is not. It is not an H100 number: RTF p99 stays near 3 and
-the roadmap's target of p99 below 1 is not reachable on this card. And c16 only
-boots here at all because the KV pool is declared: without it the pool takes 9.78
-GiB and the run fails on ONNX cuBLAS handles (`../MEMORY_TRACE_20260917.md`).
+An earlier pass of this same pair over the first 32 samples reported +15.0
+percent req/s. That subset is the head of the corpus and holds none of the long
+requests, so it understated the gain roughly fourfold. The full split is the
+number; the subset is recorded here only because it is why the protocol asks for
+the whole corpus.
+
+RTF p99 is still above 1, so the roadmap target is not met on this card, but it
+is 2.9x closer than main.
 
 ## Buffered c16: unchanged, by design
 
