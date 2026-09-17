@@ -116,17 +116,15 @@ def test_a_hop_that_skips_frames_is_rejected() -> None:
         cache.begin_call([(stream, 60, 110)])
 
 
-def test_the_pool_reports_what_it_can_still_serve() -> None:
+def test_the_pool_reports_the_slots_it_has_left() -> None:
     cache = _cache(frames=100)
     stream = cache.open_stream()
 
-    assert cache.can_serve(50)
-    assert not cache.can_serve(51)
+    assert cache.free_slots == 100
 
     cache.begin_call([(stream, 0, 30)])
 
-    assert cache.can_serve(20)
-    assert not cache.can_serve(21)
+    assert cache.free_slots == 40
 
 
 def _scheduler(cache: FlowHopCache | None):
@@ -147,8 +145,8 @@ def _scheduler(cache: FlowHopCache | None):
     )
 
 
-def _state(scheduler, *, token_offset: int, prompt_frames: int = 50):
-    state = scheduler.create_stream_state("r")
+def _state(scheduler, request_id="r", *, token_offset: int, prompt_frames: int = 50):
+    state = scheduler.create_stream_state(request_id)
     state.prompt_feat = torch.zeros(1, prompt_frames, 80)
     state.token_offset = token_offset
     return state
@@ -199,3 +197,16 @@ def test_without_a_pool_every_row_recomputes_its_window() -> None:
     cached, plain = scheduler.split_hop_participants([("r", state)])
 
     assert (cached, plain) == ([], [("r", state)])
+
+
+def test_rows_of_one_step_share_the_pool_instead_of_each_taking_it_all() -> None:
+    cache = _cache(frames=300)
+    scheduler = _scheduler(cache)
+    first = _state(scheduler, "a", token_offset=0)
+    second = _state(scheduler, "b", token_offset=0)
+
+    cached, plain = scheduler.split_hop_participants([("a", first), ("b", second)])
+
+    assert cached == [("a", first)]
+    assert plain == [("b", second)]
+    assert second.flow_cache is None

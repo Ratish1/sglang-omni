@@ -19,7 +19,7 @@ from typing import Any, Literal, Mapping
 
 import torch
 
-from sglang_omni.models.fun_cosyvoice3.flow_hop_cache import StreamHopCache
+from sglang_omni.models.fun_cosyvoice3.flow_hop_cache import CFG_LANES, StreamHopCache
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.stages import CosyVoice3Vocoder, FlowBatchInput
 from sglang_omni.models.fun_cosyvoice3.streaming import (
@@ -466,11 +466,13 @@ class FunCosyVoice3StreamingVocoderScheduler(
         """Rows whose new frames the K/V pool can hold, and rows that recompute
         their whole window. A stream only starts caching at its first hop: the
         frames of an earlier hop it ran without the cache were never stored, so
-        there is nothing for a later hop to read.
+        there is nothing for a later hop to read. The rows of one step share the
+        pool, so the free slots are spent as the rows are admitted.
         """
         cache = self.vocoder.flow_hop_cache
         cached: list[tuple[str, CosyVoice3StreamState]] = []
         plain: list[tuple[str, CosyVoice3StreamState]] = []
+        free = 0 if cache is None else cache.free_slots
         for request_id, state in participants:
             if cache is None or (state.flow_cache is None and state.token_offset):
                 plain.append((request_id, state))
@@ -480,11 +482,14 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 int(state.prompt_feat.shape[1])
                 + (state.token_offset + state.hop_len) * self.mel_ratio
             )
-            if cache.can_serve(end - start):
+            slots = (end - start) * CFG_LANES
+            if slots <= free:
+                free -= slots
                 if state.flow_cache is None:
                     state.flow_cache = cache.open_stream()
                 cached.append((request_id, state))
             else:
+                free += state.flow_cache.frames * CFG_LANES if state.flow_cache else 0
                 self.release_flow_cache(state)
                 cache.stats.fallback_hops += 1
                 plain.append((request_id, state))

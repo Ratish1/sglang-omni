@@ -268,8 +268,9 @@ class FlowHopCache:
     def open_stream(self) -> StreamHopCache:
         return StreamHopCache(self)
 
-    def can_serve(self, frames: int) -> bool:
-        return int(self.allocator.available_size()) >= frames * CFG_LANES
+    @property
+    def free_slots(self) -> int:
+        return int(self.allocator.available_size())
 
     def begin_call(
         self, rows: Sequence[tuple[StreamHopCache, int, int]]
