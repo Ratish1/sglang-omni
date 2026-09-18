@@ -5,7 +5,7 @@ record_predictor_inputs/sitecustomize.py.
 
 run      the shipped Qwen3TTSTalker predictor chain (whichever sglang_omni is on
          PYTHONPATH) at the checkpoint's dims with its weights, on the recorded inputs,
-         greedy and seeded-sampled, at bs 1, 2, 4, 8, 16; saves logits and codes
+         greedy and seeded-sampled, at --batches (default 1, 2, 4, 8, 16; up to 32); saves logits and codes
          (--fp32 runs the same chain in fp32: the truth)
 compare  the numerics table from three run files (base, pair, truth)
 time     CUDA graph replay ms and kernel count of the predictor chain per bucket
@@ -26,9 +26,9 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from torch import nn
 
-MAX_BS = 16
+MAX_BS = 32
 BUCKETS = (1, 2, 4, 8, 12, 16)
-EVAL_BATCHES = (1, 2, 4, 8, 16)
+
 PREFIX = "talker.code_predictor."
 
 
@@ -312,7 +312,7 @@ def run(args) -> None:
             lambda module, x, out: captured.append(out[0][:, -1, :].float().cpu())
         )
     results = {}
-    for batch in EVAL_BATCHES:
+    for batch in args.batches:
         for sampled in (False, True):
             logits, codes = [], []
             for start in range(0, steps - batch + 1, batch):
@@ -439,6 +439,7 @@ def main() -> None:
     parser.add_argument("--out")
     parser.add_argument("--fp32", action="store_true")
     parser.add_argument("--steps", type=int, default=320)
+    parser.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--reps", type=int, default=50)
     parser.add_argument("--base")
     parser.add_argument("--pair")

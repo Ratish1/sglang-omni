@@ -118,7 +118,29 @@ If b fails, stop and report (c to h need its output). Return: p1_stat.txt, md5.t
 import_paths.txt, the failure lines and summary of a and of the base log, and every
 other output file in full.
 
-## 4. Later runs
+## 4. Run 05: P1-e1b, V1-e5 and V2-e1 (no server)
+
+Same exports as run 04 (`W`, `P`, `S`, `MODEL`, HF offline) plus
+`export OUT=/workspace/sglang-omni/.tmp/omni_step_profiling/run05 R4=/workspace/sglang-omni/.tmp/omni_step_profiling/run04`,
+`mkdir -p $OUT`, `md5sum $S/predictor_pair_bench.py $S/predictor_pair_paired.py
+$S/vocoder_resident_bench.py $S/vocoder_attribution_bench.py > $OUT/md5.txt`. All from
+`cd $W` with `CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$W`, one at a time:
+
+| # | command | output |
+| --- | --- | --- |
+| a | `python $S/predictor_pair_bench.py run --model $MODEL --inputs $R4/predictor_inputs.pt --out $OUT/p1_base_bs32.pt --batches 32` | `$OUT/run_base_bs32.txt` |
+| b | same with `--fp32 --out $OUT/p1_truth_bs32.pt` | `$OUT/run_truth_bs32.txt` |
+| c | `python $S/predictor_pair_paired.py --base $OUT/p1_base_bs32.pt --pair $OUT/p1_base_bs32.pt --truth $OUT/p1_truth_bs32.pt` | `$OUT/p1e1b.txt` |
+| d | `python $S/vocoder_attribution_bench.py split --model $MODEL` | `$OUT/v1e5_split.txt` |
+| e | `python $S/vocoder_attribution_bench.py compile --model $MODEL --arm eager` | `$OUT/v2e1_eager.txt` |
+| f | `python $S/vocoder_attribution_bench.py compile --model $MODEL --arm static` | `$OUT/v2e1_static.txt` |
+| g | `python $S/vocoder_attribution_bench.py compile --model $MODEL --arm dynamic` | `$OUT/v2e1_dynamic.txt` |
+
+After c, delete `$OUT/p1_base_bs32.pt` and `$OUT/p1_truth_bs32.pt` (large, not needed
+further). Expected durations: a and b 1 to 3 min each, d under 10 min, e under 10 min,
+f 20 to 60 min (44 compiles), g 5 to 30 min.
+
+## 5. Later runs
 
 The matrix A/B runbook (section 2 of 00_PRINCIPLES_AND_AUDIT.md) is added here once
 P1-e1 passes; it is checked against both branch heads before the box runs it.
