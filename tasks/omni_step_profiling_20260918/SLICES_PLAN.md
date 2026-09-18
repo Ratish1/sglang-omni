@@ -1,6 +1,8 @@
 # Qwen3-TTS slices from the step profiles: plan
 
 Base: upstream 144bd6399 on moss (RTX 4090 D, sm89), Qwen3-TTS-12Hz-1.7B-Base, streaming.
+Per-slice plans, the code audit and the box steps now live in `slices/` (start at
+`slices/00_PRINCIPLES_AND_AUDIT.md`); this file keeps the measurements they build on.
 Evidence: READOUT_01.md and the ledger3 outputs. Every number below is a measured read
 from those traces or arithmetic on the checkpoint config; every open question is an
 experiment with a name.
