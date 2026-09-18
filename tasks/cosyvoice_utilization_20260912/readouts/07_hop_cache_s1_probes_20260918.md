@@ -88,6 +88,46 @@ ranges from 23 to 40 dB across rows.
 Consequence: no code fix exists or is needed; the serving quality metrics (WER, similarity,
 continuity) decide, and the breakable graph PR inherits nothing new from this.
 
+## 4a. The append change, applied (branch at 7b3e3c41e)
+
+`CachedHop.__call__` is one FA3 call with `k`, `v`, `cu_seqlens_k_new` and `cache_seqlens` as
+the lengths before the hop; the page shaped pool views are made once; `slots` is gone. Both
+SGLang wrappers pass the arguments straight to the kernel and ask only for contiguous inputs
+(`kernels/ops/attention/flash_attention.py`, `flash_attention_v3.py`). Raw: `s1-r10`.
+
+- Unit suite 213 passed, 2 skipped.
+- Append against store then attend: bit identical on the three layouts, and 0 mismatches in 200
+  repeats on fresh values per layout (output, K cache, V cache).
+- The small hop regression is gone: 201.0 ms cached against 201.2 ms main at step 0, 208.5
+  against 208.8 at step 1. The 8 x 6 schedule is 2,812 ms on main and 1,335 ms cached; pure
+  first hops still bit identical; later hops still -1.29 dB against main alone (section 4).
+
+## 4b. Serving, c16 only, whole English split, unseeded, memory fraction 0.3
+
+Branch with `--vocoder.factory.flow_kv_cache_bytes 6442450944` (6 GiB, 6,950 slots, 3,475
+frames) against the two main boots on disk (b5c3b44aa). Runaways are requests of 80 s or more.
+
+| run | runaways | req/s | audio s/s | latency mean | latency p95 | TTFP mean | TTFP p95 | inter chunk mean | underrun mean | c50 | c100 | c200 | failed |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| main boot 1 | 1 | 3.301 | 15.65 | 4.84 | 7.09 | 2.25 | 3.45 | 1.32 | 0.477 | 22.6 | 27.3 | 41.2 | 0 |
+| main boot 2 | 3 | 2.939 | 14.62 | 5.43 | 8.51 | 2.53 | 4.14 | 1.43 | 0.610 | 10.7 | 21.3 | 39.5 | 0 |
+| hop cache | 3 | 2.997 | 15.03 | 5.23 | 7.45 | 2.52 | 3.77 | 1.33 | 0.489 | 40.3 | 42.7 | 47.9 | 0 |
+
+- Against the main boot with the same runaway count: +2.0 % req/s, +2.8 % audio throughput,
+  latency mean -3.7 %, p95 -12 %, inter chunk mean -6.9 %, TTFP mean equal, TTFP p99 5.35
+  against 5.02 s. Against the one runaway boot it is lower on throughput, which is the draw
+  (readout 06: 12 % between boots of one tree).
+- Continuity is the clear gain: c50 40.3 against 22.6 and 10.7, c100 42.7 against 27.3 and
+  21.3.
+- The pool was far too small for c16 on this card, as expected: 59.4 % of hop rows ran cached
+  (1,313 of 2,212), 494 fallbacks, 167 of 228 hop steps were mixed (two Flow calls), 46 had no
+  cached row. So this run measures the fallback regime more than the cache.
+- Memory: peak on the card 23,766 of 24,564 MiB. With 6 GiB taken before the engine, SGLang's
+  AR pool came out at 27,537 tokens (0.32 GB); token usage peaked at 0.19, no retraction, a
+  queue on 5 of 405 decode log lines. No out of memory, no traceback.
+- Not available from this pair: per step hop times. Neither tree logs them, so the throughput
+  comparison stays exposed to the runaway draw.
+
 ## 5. Owed before S1 can be a PR
 
 1. The append change of section 3, then the first hop against main again.
