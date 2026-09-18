@@ -42,6 +42,7 @@ _MIN_GENERATION_TOKENS = 16
 
 @dataclass
 class FunASRRequestData(SGLangARRequestData):
+    enforce_request_limits: bool = True
     prompt_token_ids: list[int] | None = None
     output_ids: list[int] | None = None
     num_audio_tokens: int = 0
@@ -208,7 +209,7 @@ def make_fun_asr_scheduler_adapters(
                 (features.shape[0], features.shape[-1]), dtype=torch.long
             )
         num_lfr_frames = int(feature_attention_mask.sum().item())
-        num_audio_tokens = int(fun_asr_low_frame_rate_length(num_lfr_frames))
+        num_audio_tokens = fun_asr_low_frame_rate_length(num_lfr_frames)
         logger.debug(
             f"[fun-asr] lfr_frames={num_lfr_frames} "
             f"num_audio_tokens={num_audio_tokens} feat_shape={tuple(features.shape)}"
@@ -224,6 +225,14 @@ def make_fun_asr_scheduler_adapters(
             hotwords = [hotwords_raw]
         else:
             hotwords = list(hotwords_raw)
+        if not hotwords:
+            # Note(Audrey): the endpoint sends vocabulary hints as ``prompt``;
+            # comma-splitting round-trips through the ", " join below.
+            prompt_hint = params.get("prompt")
+            if prompt_hint:
+                hotwords = [
+                    term.strip() for term in str(prompt_hint).split(",") if term.strip()
+                ]
         prompt_text = _build_prompt_text(language, itn, hotwords)
         input_ids = _build_prompt_ids(num_audio_tokens, prompt_text)
 

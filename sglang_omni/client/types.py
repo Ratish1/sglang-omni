@@ -141,6 +141,7 @@ class GenerateChunk:
     stage_id: int | None = None
     stage_name: str | None = None
     modality: str = "text"
+    language: str | None = None
     audio_data: Any = None
     sample_rate: int | None = None
 
@@ -160,6 +161,7 @@ class GenerateChunk:
             "stage_id": self.stage_id,
             "stage_name": self.stage_name,
             "modality": self.modality,
+            "language": self.language,
             "audio_data": self.audio_data,
             "sample_rate": self.sample_rate,
         }
@@ -208,6 +210,7 @@ class CompletionResult:
     token_logprobs: list[dict[str, Any]] | None = None
     omni_rollout: dict[str, Any] | None = None
     weight_version: str | None = None
+    language: str | None = None
 
 
 @dataclass

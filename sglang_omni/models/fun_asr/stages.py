@@ -57,7 +57,7 @@ def _compile_fun_asr_audio_encoder(
         # inference-mode tensors fail, forcing a full recompile on the first
         # real request
         t = int(warmup_lfr_frames)
-        feat_dim = int(model.config.encoder_config.input_size)
+        feat_dim = int(model.config.audio_config.input_size)
 
         # note(guozhihao-224): Dynamo specializes B=0/1 and mask=None vs tensor;
         # B1/None + B1/mask + B2/mask cover the mask branch and the B>=2 dynamic graph.
@@ -93,7 +93,8 @@ def _compile_fun_asr_audio_encoder(
 def create_sglang_fun_asr_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    device: str | None = None,
+    gpu_id: int | None = None,
     dtype: str = "bfloat16",
     max_running_requests: int = 64,
     max_new_tokens: int = 200,
@@ -162,6 +163,7 @@ def create_sglang_fun_asr_executor(
     ).build(
         model_path,
         device=device,
+        gpu_id=gpu_id,
         dtype=dtype,
         server_args_overrides=server_args_overrides,
     )

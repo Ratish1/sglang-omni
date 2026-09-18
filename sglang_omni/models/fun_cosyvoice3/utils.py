@@ -11,7 +11,6 @@ import torch
 
 
 class CosyVoice3Tokenizer:
-
     def __init__(self, token_path: str, skip_special_tokens: bool = True):
         from transformers import AutoTokenizer
 
@@ -41,18 +40,27 @@ class CosyVoice3Tokenizer:
 
 
 class SpeechTokenizerV3:
-
-    def __init__(self, model_path: str, device: str = "cpu"):
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "cpu",
+        intra_op_threads: int = 8,
+    ):
         import onnxruntime
 
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = (
             onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         )
-        option.intra_op_num_threads = 1
+        option.intra_op_num_threads = max(1, int(intra_op_threads))
 
+        # note (db-ol): the cuDNN conv plan is rebuilt whenever the input shape differs
+        # from the previous call, and the default search setting makes rebuilds slow.
         providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            [
+                ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
+                "CPUExecutionProvider",
+            ]
             if device.startswith("cuda")
             else ["CPUExecutionProvider"]
         )
@@ -92,15 +100,19 @@ class SpeechTokenizerV3:
 
 
 class SpeakerEncoder:
-
-    def __init__(self, model_path: str, device: str = "cpu"):
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "cpu",
+        intra_op_threads: int = 8,
+    ):
         import onnxruntime
 
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = (
             onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         )
-        option.intra_op_num_threads = 1
+        option.intra_op_num_threads = max(1, int(intra_op_threads))
 
         self.session = onnxruntime.InferenceSession(
             model_path,
@@ -175,8 +187,7 @@ def extract_prompt_speech_feat(
     mel = _run_cosyvoice3_mel_spectrogram(waveform)
     if mel.ndim != 3 or mel.shape[0] != waveform.shape[0] or mel.shape[1] != 80:
         raise RuntimeError(
-            "CosyVoice3 mel extractor returned an unexpected shape: "
-            f"{tuple(mel.shape)}"
+            f"CosyVoice3 mel extractor returned an unexpected shape: {tuple(mel.shape)}"
         )
     return mel.transpose(1, 2).contiguous()
 

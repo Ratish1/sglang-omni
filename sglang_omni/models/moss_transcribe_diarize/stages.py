@@ -42,7 +42,7 @@ def _missing_additional_chat_templates_compat() -> Iterator[None]:
                     return []
                 raise
 
-        setattr(module, "list_repo_templates", wrapped)
+        module.list_repo_templates = wrapped
         patched.append((module, original))
 
     try:
@@ -51,7 +51,7 @@ def _missing_additional_chat_templates_compat() -> Iterator[None]:
         yield
     finally:
         for module, original in reversed(patched):
-            setattr(module, "list_repo_templates", original)
+            module.list_repo_templates = original
 
 
 def _default_context_length(model_path: str) -> int:
@@ -71,7 +71,8 @@ def _default_max_new_tokens(model_path: str) -> int:
 def create_sglang_moss_transcribe_diarize_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    device: str | None = None,
+    gpu_id: int | None = None,
     dtype: str = "bfloat16",
     max_running_requests: int = 16,
     max_new_tokens: int | None = None,
@@ -138,6 +139,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     ).build(
         model_path,
         device=device,
+        gpu_id=gpu_id,
         dtype=dtype,
         server_args_overrides=server_args_overrides,
     )

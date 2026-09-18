@@ -101,6 +101,7 @@ class Client:
         saw_token_logprobs = False
         omni_rollout: dict[str, Any] | None = None
         weight_version: str | None = None
+        language: str | None = None
 
         async for chunk in self.generate(request, request_id=request_id):
             last_chunk = chunk
@@ -122,6 +123,8 @@ class Client:
                 omni_rollout = chunk.omni_rollout
             if chunk.weight_version is not None:
                 weight_version = chunk.weight_version
+            if chunk.language is not None:
+                language = chunk.language
 
         if last_chunk is None:
             raise ClientError("No response from pipeline")
@@ -159,6 +162,7 @@ class Client:
             token_logprobs=token_logprobs_parts if saw_token_logprobs else None,
             omni_rollout=omni_rollout,
             weight_version=weight_version,
+            language=language,
         )
 
     # ------------------------------------------------------------------
@@ -540,6 +544,9 @@ class Client:
             modality = result.get("modality")
             if modality is not None:
                 chunk.modality = modality
+            language = result.get("language")
+            if isinstance(language, str):
+                chunk.language = language
             Client._set_audio_data(chunk, result)
             chunk.usage = Client._build_usage_info(result)
             return chunk

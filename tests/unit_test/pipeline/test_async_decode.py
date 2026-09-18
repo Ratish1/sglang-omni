@@ -154,7 +154,9 @@ def _sched_output(n):
             )
             for i in range(n)
         ],
-        batch_data=object(),
+        batch_data=types.SimpleNamespace(
+            forward_mode=types.SimpleNamespace(is_extend=lambda: False)
+        ),
     )
 
 
@@ -224,7 +226,9 @@ def test_resolve_recomputes_finished_overrun_skip_rids():
                 data=types.SimpleNamespace(req=skip_req),
             ),
         ],
-        batch_data=object(),
+        batch_data=types.SimpleNamespace(
+            forward_mode=types.SimpleNamespace(is_extend=lambda: False)
+        ),
     )
     with _patch_event(ready=True):
         step = r.execute_launch(sched_output)
@@ -256,7 +260,9 @@ def test_resolve_skips_retracted_row():
                 data=types.SimpleNamespace(req=retracted_req),
             ),
         ],
-        batch_data=object(),
+        batch_data=types.SimpleNamespace(
+            forward_mode=types.SimpleNamespace(is_extend=lambda: False)
+        ),
     )
     with _patch_event(ready=True):
         step = r.execute_launch(sched_output)
@@ -499,16 +505,16 @@ def _real_radix_pools(size=64):
 
 
 def _decoding_req(allocator, req_to_token_pool, rid, prompt, outputs):
-    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.sampling.sampling_params import SamplingParams
 
     req = Req(rid, "", list(prompt), SamplingParams(max_new_tokens=8))
     req_to_token_pool.alloc([req])
     n = len(prompt)
     slots = allocator.alloc(n)
-    req_to_token_pool.write((req.req_pool_idx, slice(0, n)), slots.to(torch.int32))
-    req.kv = ReqKvInfo(kv_allocated_len=n, swa_evicted_seqlen=0)
-    req.kv_committed_len = n
+    req_to_token_pool.write((req.kv.req_pool_idx, slice(0, n)), slots.to(torch.int32))
+    req.kv.kv_allocated_len = n
+    req.kv.kv_committed_len = n
     req.output_ids = [outputs[0]]
     for tok in outputs[1:]:
         _commit_step_slot(allocator, req_to_token_pool, req)
@@ -520,11 +526,53 @@ def _commit_step_slot(allocator, req_to_token_pool, req):
     slot = allocator.alloc(1)
     pos = req.kv.kv_allocated_len
     req_to_token_pool.write(
-        (req.req_pool_idx, slice(pos, pos + 1)), slot.to(torch.int32)
+        (req.kv.req_pool_idx, slice(pos, pos + 1)), slot.to(torch.int32)
     )
     req.kv.kv_allocated_len += 1
-    req.kv_committed_len += 1
+    req.kv.kv_committed_len += 1
     return int(slot[0])
+
+
+def test_prompt_only_radix_reuses_prompt_without_caching_tail():
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+    from sglang.srt.mem_cache.radix_cache import MatchPrefixParams, RadixKey
+    from sglang.srt.runtime_context import get_context
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    with get_context().override_server_args(page_size=1):
+        allocator, req_to_token_pool, cache = _real_radix_pools()
+        total = allocator.available_size()
+        prompt = [1, 2, 3]
+        first = _decoding_req(allocator, req_to_token_pool, "first", prompt, [20])
+        first.extra_key = "qwen3_tts:prompt:v1"
+        first.init_next_round_input(cache)
+        first.set_extend_range(0, len(prompt))
+        maybe_cache_unfinished_req(first, cache)
+
+        first.skip_radix_cache_insert = True
+        _commit_step_slot(allocator, req_to_token_pool, first)
+        first.output_ids.append(21)
+        release_kv_cache(first, cache)
+
+        second = Req(
+            "second",
+            "",
+            prompt,
+            SamplingParams(max_new_tokens=8),
+            extra_key="qwen3_tts:prompt:v1",
+        )
+        second.output_ids = []
+        second.init_next_round_input(cache)
+        tail_match = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(prompt + [20], extra_key="qwen3_tts:prompt:v1")
+            )
+        )
+
+        assert len(second.prefix_indices) == len(prompt) - 1
+        assert len(tail_match.device_indices) == cache.total_size() == len(prompt)
+        assert allocator.available_size() + cache.evictable_size() == total
 
 
 class _StaleDecodeBatch:
@@ -668,6 +716,7 @@ class _FakeBatch:
 
 def _new_scheduler_for_async_loop():
     s = OmniScheduler.__new__(OmniScheduler)
+    s._sleep_during_idle = lambda: None
     s._admin_lock = threading.Lock()
     s._admin_queue = queue.Queue()
     s._request_admission_lock = threading.RLock()
