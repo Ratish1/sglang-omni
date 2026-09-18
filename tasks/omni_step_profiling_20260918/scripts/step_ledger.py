@@ -46,21 +46,37 @@ class Step:
     sync_us: float = 0.0
     graph_kernels: list[int] = field(default_factory=list)
     graph_us: list[float] = field(default_factory=list)
+    bubbles: dict[str, float] = field(default_factory=dict)
     device_us: dict[str, float] = field(default_factory=dict)
 
 
-def union_us(intervals: list[tuple[float, float]]) -> float:
-    total = 0.0
-    cur_start = cur_end = None
+def merge(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
     for start, end in sorted(intervals):
-        if cur_end is None or start > cur_end:
-            if cur_end is not None:
-                total += cur_end - cur_start
-            cur_start, cur_end = start, end
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
-            cur_end = max(cur_end, end)
-    if cur_end is not None:
-        total += cur_end - cur_start
+            merged.append((start, end))
+    return merged
+
+
+def union_us(intervals: list[tuple[float, float]]) -> float:
+    return sum(end - start for start, end in merge(intervals))
+
+
+def intersect_us(left: list[tuple[float, float]], right: list[tuple[float, float]]) -> float:
+    """Overlap of two merged interval lists."""
+    total = 0.0
+    i = j = 0
+    while i < len(left) and j < len(right):
+        start = max(left[i][0], right[j][0])
+        end = min(left[i][1], right[j][1])
+        if end > start:
+            total += end - start
+        if left[i][1] < right[j][1]:
+            i += 1
+        else:
+            j += 1
     return total
 
 
@@ -173,6 +189,8 @@ def main() -> None:
         graph_events: dict[int, list[dict]] = defaultdict(list)
         busy_all: list[tuple[float, float]] = []
         busy_by_role: dict[str, list[tuple[float, float]]] = defaultdict(list)
+        sched_busy: list[tuple[float, float]] = []
+        other_busy: list[tuple[float, float]] = []
         for event in gpu:
             start = float(event["ts"])
             end = start + float(event["dur"])
@@ -180,6 +198,10 @@ def main() -> None:
                 clipped = (max(start, step.start), min(end, step.end))
                 busy_all.append(clipped)
                 busy_by_role[role(event["owner"])].append(clipped)
+                if event["owner"] == sched_tid:
+                    sched_busy.append(clipped)
+                else:
+                    other_busy.append(clipped)
             if event["owner"] != sched_tid or not (step.start <= event["launch_ts"] < step.end):
                 continue
             step.counts[event["cat"]] += 1
@@ -192,10 +214,45 @@ def main() -> None:
                 step.counts[event["name"].split(" (")[0]] += 1
         step.graph_kernels = [per_graph[c] for c in sorted(per_graph)]
         step.graph_us = [graph_us[c] for c in sorted(per_graph)]
+        replay_spans: list[tuple[float, float]] = []
         for index, corr in enumerate(sorted(per_graph)):
             graph_steps[index] += 1
+            kernels = [
+                (float(e["ts"]), float(e["ts"]) + float(e["dur"])) for e in graph_events[corr]
+            ]
+            span = (min(k[0] for k in kernels), max(k[1] for k in kernels))
+            replay_spans.append(span)
+            step.bubbles[f"replay #{index} span ms"] = span[1] - span[0]
+            step.bubbles[f"replay #{index} in-graph gaps ms"] = (span[1] - span[0]) - union_us(
+                kernels
+            )
             for event in graph_events[corr]:
                 graph_names[index][event["name"]].append(float(event["dur"]))
+        sched = merge(sched_busy)
+        other = merge(other_busy)
+        wall = step.end - step.start
+        in_graph = between = 0.0
+        for (_, gap_start), (gap_end, _) in zip(sched, sched[1:]):
+            gap = gap_end - gap_start
+            if any(lo <= gap_start and gap_end <= hi for lo, hi in replay_spans):
+                in_graph += gap
+            else:
+                between += gap
+        contention = intersect_us(sched, other)
+        step.bubbles.update(
+            {
+                "scheduler stream busy ms": union_us(sched),
+                "scheduler stream empty ms": wall - union_us(sched),
+                "  head: step start to first kernel ms": (sched[0][0] - step.start) if sched else wall,
+                "  gaps inside graph replays ms": in_graph,
+                "  gaps between scheduler activities ms": between,
+                "  tail: last kernel end to next step ms": (step.end - sched[-1][1]) if sched else 0.0,
+                "other threads concurrent with scheduler ms": contention,
+                "other threads in scheduler-empty time ms": union_us(other) - contention,
+                "device empty (no stream busy) ms": wall - union_us(busy_all),
+                "host loop outside run_batch ms": step.end - step.span_end,
+            }
+        )
         step.device_us = {"all": union_us(busy_all)}
         for name, intervals in busy_by_role.items():
             step.device_us[name] = union_us(intervals)
@@ -232,6 +289,8 @@ def main() -> None:
         rows[f"count {key}"] = [float(s.counts.get(key, 0)) for s in steady]
     for name in sorted({k for s in steady for k in s.device_us} - {"all", "scheduler"}):
         rows[f"device busy ms {name}"] = [s.device_us.get(name, 0.0) / 1e3 for s in steady]
+    for key in steady[0].bubbles:
+        rows[key] = [s.bubbles.get(key, 0.0) / 1e3 for s in steady]
     print(f"{'read':52s}{'p50':>10s}{'p95':>10s}{'mean':>10s}{'min':>10s}{'max':>10s}")
     for key, values in rows.items():
         print(
@@ -240,6 +299,22 @@ def main() -> None:
         )
     graph_shapes = Counter(tuple(s.graph_kernels) for s in steady)
     print(f"kernels per scheduler graph replay, per step: {dict(graph_shapes.most_common(5))}")
+    alone = [s for s in steady if s.bubbles["other threads concurrent with scheduler ms"] == 0.0]
+    shared = [s for s in steady if s.bubbles["other threads concurrent with scheduler ms"] > 0.0]
+    print(
+        f"\nsteps with no other-thread kernel concurrent: {len(alone)}, "
+        f"with some: {len(shared)}"
+    )
+    for label, group in (("alone", alone), ("shared", shared)):
+        if not group:
+            continue
+        cells = [f"wall p50 {quantile([(s.end - s.start) / 1e3 for s in group], .5):.3f}"]
+        for index in range(len(group[0].graph_us)):
+            cells.append(
+                f"replay #{index} kernel sum p50 "
+                f"{quantile([s.graph_us[index] / 1e3 for s in group if len(s.graph_us) > index], .5):.3f}"
+            )
+        print(f"  {label}: " + ", ".join(cells) + " (ms)")
     for index in sorted(graph_steps):
         kernel_ms = [s.graph_us[index] / 1e3 for s in steady if len(s.graph_us) > index]
         print(
