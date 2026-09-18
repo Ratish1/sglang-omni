@@ -125,6 +125,27 @@ def main() -> None:
             result["output_max_abs"] = float((out_stored - out_appended).abs().max())
             result["k_cache_equal"] = bool(torch.equal(k_stored, k_appended))
             result["v_cache_equal"] = bool(torch.equal(v_stored, v_appended))
+            # A later chunk reading an earlier chunk's append inside one call
+            # would be a race if the kernel did not append first; repeat on
+            # fresh values so a timing dependent miss has chances to show.
+            mismatches = 0
+            for _ in range(200):
+                key.normal_()
+                value.normal_()
+                query.normal_()
+                k_stored.copy_(prefix_k)
+                v_stored.copy_(prefix_v)
+                k_appended.copy_(prefix_k)
+                v_appended.copy_(prefix_v)
+                same = torch.equal(
+                    stored(k_stored, v_stored), appended(k_appended, v_appended)
+                )
+                mismatches += not (
+                    same
+                    and torch.equal(k_stored, k_appended)
+                    and torch.equal(v_stored, v_appended)
+                )
+            result["repeat_mismatches_of_200"] = mismatches
             for label, call in (("stored", stored), ("appended", appended)):
                 host, wall = [], []
                 for _ in range(7):

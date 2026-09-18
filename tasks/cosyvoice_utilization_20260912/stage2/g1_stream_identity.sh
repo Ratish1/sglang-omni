@@ -104,6 +104,7 @@ fi
 
 teardown() {
   [ -n "${DMON_PID:-}" ] && kill "$DMON_PID" 2>/dev/null || true
+  [ -n "${MEMORY_PID:-}" ] && kill "$MEMORY_PID" 2>/dev/null || true
   [ -f "$OUT/server.pgid" ] || return 0
   kill -- "-$(cat "$OUT/server.pgid")" 2>/dev/null || true
   sleep 5
@@ -117,6 +118,10 @@ trap teardown EXIT
 # time a kernel was resident, which is GR active, not SM occupancy.
 nvidia-smi dmon -i "$CARD" -s u -d 1 > "$OUT/dmon.csv" 2>/dev/null &
 DMON_PID=$!
+# Memory in use on the card once a second, for the peak of the run.
+nvidia-smi --query-gpu=timestamp,memory.used --format=csv,noheader -i "$CARD" -l 1 \
+  > "$OUT/memory.csv" 2>/dev/null &
+MEMORY_PID=$!
 echo "arm $ARM, revision $(cat "$OUT/head.txt"), card $CARD, port $PORT"
 echo "out $OUT"
 # note(ratish): without the strict port the server takes any free port when
