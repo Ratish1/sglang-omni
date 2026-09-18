@@ -192,8 +192,7 @@ PackedRowAttention = RowAttention | RaggedRowAttention
 
 class PackedDiT:
     """DiT.forward over a packed sequence with the same modules in the same
-    order; conv pos-emb stays padded, attention is ragged on FA3 half-precision
-    CUDA and padded elsewhere.
+    order; attention is ragged on FA3 half-precision CUDA and padded elsewhere.
     """
 
     def __init__(self, dit: torch.nn.Module, *, device: str | torch.device) -> None:
@@ -255,8 +254,23 @@ class PackedDiT:
         return dit.proj_out(h)
 
     def _conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
-        padded = scatter_rows(h, rows, rows.width)
-        return gather_rows(self.dit.input_embed.conv_pos_embed(padded), rows)
+        """The causal conv on the packed sequence: every row is preceded by the
+        zero frames the conv left pads it with, so no row reads another."""
+        embed = self.dit.input_embed.conv_pos_embed
+        gap = embed.kernel_size - 1
+        total, channels = h.shape[1], h.shape[2]
+        # note(ratish): a conv output lands gap frames before its last input.
+        outputs = torch.arange(total, device=h.device) + gap * rows.row_ids
+        inputs = outputs + gap
+        spaced = h.new_zeros(channels, total + gap * len(rows.lengths))
+        spaced.T[inputs] = h[0]
+        first = embed.conv1(spaced.unsqueeze(0))[0]
+        # note(ratish): the first conv writes into the gaps; the second must
+        # read zeros there, as it does past the left edge of a padded row.
+        spaced = torch.zeros_like(spaced)
+        spaced.T[inputs] = first.T[outputs]
+        second = embed.conv2(spaced.unsqueeze(0))[0]
+        return second.T[outputs].unsqueeze(0)
 
     def _rope(self, rows: PackedRows) -> tuple[torch.Tensor, Any]:
         freqs, scale = self.dit.rotary_embed.forward_from_seq_len(rows.width)

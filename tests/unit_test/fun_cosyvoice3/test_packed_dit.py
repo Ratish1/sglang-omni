@@ -174,6 +174,24 @@ def test_packed_forward_matches_the_padded_dit_per_row(streaming: bool) -> None:
         torch.testing.assert_close(actual, reference, rtol=1e-9, atol=1e-9)
 
 
+def test_packed_conv_position_embed_matches_the_padded_conv_per_row() -> None:
+    dit = _tiny_dit()
+    lengths = (70, 4, 31, 45)
+    rows = pack_rows(lengths, CPU)
+    torch.manual_seed(3)
+    padded = torch.randn(len(lengths), max(lengths), 32, dtype=torch.float64)
+    for index, length in enumerate(lengths):
+        padded[index, length:] = 0
+
+    with torch.inference_mode():
+        expected = dit.input_embed.conv_pos_embed(padded)
+        out = PackedDiT(dit, device=CPU)._conv_pos_embed(
+            gather_rows(padded, rows), rows
+        )
+
+    torch.testing.assert_close(out, gather_rows(expected, rows), rtol=1e-12, atol=1e-12)
+
+
 @pytest.mark.parametrize("streaming", [True, False])
 def test_packed_solve_matches_the_padded_solve_per_row(streaming: bool) -> None:
     dit = _tiny_dit()
