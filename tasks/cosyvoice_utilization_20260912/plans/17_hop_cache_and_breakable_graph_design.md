@@ -176,6 +176,24 @@ the per step times from `serve.log` by batch size, which do not depend on the dr
 | S3 | breakable graph over the cached step | V1 to V4 first; then replay bit identical to eager per bucket; launches and wall time per step; memory per bucket; serving pairs |
 | S4 | AR prefill port | c1 byte identity on the stable samples; first audio at c1 and c8 |
 
+## 6a. PR split and status, 2026-09-18
+
+One measured PR per slice, each on upstream main, none opened until the user says so.
+
+| PR | branch | content | status |
+|---|---|---|---|
+| hop prefix cache (S1) | `slice/cosyvoice-4-1-hop-prefix-cache` 439c62518 | `flow_hop_cache.py`, cached hop entry, scheduler split, `flow_kv_cache_bytes` (0 = off) | unit suite 213 passed on the box; probe: pure first hops bit identical, 8x6 schedule 2,794 to 1,407 ms, last step 965 to 251 ms. **Open:** first hop +22 ms against main (cause not found yet), -1 dB against the float32 truth on the 8 stream schedule (forensic running). Serving runs not started |
+| exact hoists (S2) | not started | rope once per call, import out of the step | can ride with S1 or S3, decided by its own probe |
+| breakable graph (S3) | not started | SGLang's diffusion runner over the cached step | after S1 lands; V1 to V6 first |
+| AR prefill port (S4) | not started | omni's breakable prefill contract | independent of S1 to S3 |
+| speech tokenizer fix | `fix/cosyvoice-speech-tokenizer-late-allocation` dc39da67f | unified stream, run lock, longest input before the pool | tested (readout 05); waits for the user's word |
+| DiT weight cast | `slice/cosyvoice-3-2-dit-weight-precast` 4a57f9a81 | Linear and Conv1d of the DiT cast once | tested (readout 06), c16 confounded by runaways; user decision pending |
+
+Serving gates still owed by S1, against the main boots already on disk (b5c3b44aa, memory
+fraction 0.3, c8 and c16, two boots each; no CosyVoice change on main since): seeded c1 for
+continuity and first audio, unseeded c8 and c16 with the fallback count, one starved budget run
+that must complete on the fallback.
+
 ## 7. Validation tasks, before the design of S3 is frozen
 
 | # | unknown | how |
