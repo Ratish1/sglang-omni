@@ -17,6 +17,9 @@ run; the runner does not edit them.
   while the PID is alive: send `py-spy dump --pid <pid>` if available, else the last 40
   lines, and wait for instructions.
 - Results come back verbatim. No interpretation, no reruns with changed arguments.
+- Every file a run writes stays in its `$OUT`; after the run the planner copies the whole
+  `.tmp/omni_step_profiling` tree to `artifacts/moss_omni_step_profiling/` on the Mac,
+  traces, logs and tensors included, and reads from that copy.
 
 ## 2. Run 03: V1-e0 to V1-e4 and P2-e1 (no server)
 
@@ -67,8 +70,11 @@ export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 mkdir -p $OUT
 git -C $P diff --stat > $OUT/p1_stat.txt
 md5sum .tmp/omni_step_profiling/p1_pair_pass.patch $S/predictor_pair_bench.py > $OUT/md5.txt
-for T in $W $P; do PYTHONPATH=$T python -c "import sglang_omni; print(sglang_omni.__file__)"; done > $OUT/import_paths.txt
+for T in $W $P; do (cd $T && PYTHONPATH=$T python -c "import sglang_omni; print(sglang_omni.__file__)"); done > $OUT/import_paths.txt
 ```
+
+(From `/workspace/sglang-omni` the current directory precedes PYTHONPATH on sys.path and
+the main checkout would be imported; every step below runs from inside its tree.)
 
 `import_paths.txt` must name `$W/...` then `$P/...`. Then, one at a time, each with
 `CUDA_VISIBLE_DEVICES=$CARD`:
