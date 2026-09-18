@@ -17,9 +17,11 @@ run; the runner does not edit them.
   while the PID is alive: send `py-spy dump --pid <pid>` if available, else the last 40
   lines, and wait for instructions.
 - Results come back verbatim. No interpretation, no reruns with changed arguments.
-- Every file a run writes stays in its `$OUT`; after the run the planner copies the whole
-  `.tmp/omni_step_profiling` tree to `artifacts/moss_omni_step_profiling/` on the Mac,
-  traces, logs and tensors included, and reads from that copy.
+- Every file a run writes stays in its `$OUT`. After the run the planner copies the run's
+  analysis outputs (traces, logs, tables, tensors; never WAVs) to
+  `artifacts/moss_omni_step_profiling/` on the Mac: a tarball built on the box with
+  `--exclude='*.wav'`, fetched with `docker exec ... cat`, md5 compared, traces checked
+  with `gzip -t`. Anything too slow to copy is skipped and named.
 
 ## 2. Run 03: V1-e0 to V1-e4 and P2-e1 (no server)
 
