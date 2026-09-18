@@ -1,7 +1,8 @@
 """P1-e1 and P1-e2 for slice P1 (slices/P1_PREDICTOR_PAIR_PASS.md).
 
-record   run the qwen-tts reference model on seed-tts voice clone requests and save the
-         predictor's first-step inputs (talker hidden, layer-0 code) of every decode step
+Inputs: the served talker's predictor inputs, recorded from a live server by
+record_predictor_inputs/sitecustomize.py.
+
 run      the shipped Qwen3TTSTalker predictor chain (whichever sglang_omni is on
          PYTHONPATH) at the checkpoint's dims with its weights, on the recorded inputs,
          greedy and seeded-sampled, at bs 1, 2, 4, 8, 16; saves logits and codes
@@ -29,49 +30,6 @@ MAX_BS = 16
 BUCKETS = (1, 2, 4, 8, 12, 16)
 EVAL_BATCHES = (1, 2, 4, 8, 16)
 PREFIX = "talker.code_predictor."
-
-
-def record(args) -> None:
-    from benchmarks.dataset.seedtts import load_seedtts_samples
-    from sglang_omni.models.qwen3_tts.compat import (
-        apply_qwen_tts_transformers_compatibility_patches,
-    )
-
-    apply_qwen_tts_transformers_compatibility_patches()
-    from qwen_tts import Qwen3TTSModel
-
-    wrapper = Qwen3TTSModel.from_pretrained(
-        args.model, device_map="cuda:0", dtype=torch.bfloat16
-    )
-    talker = wrapper.model.talker
-    embedding = talker.get_input_embeddings().weight
-    predictor = talker.code_predictor
-    original_generate = predictor.generate
-    recorded: list[torch.Tensor] = []
-
-    def recording_generate(*call_args, **kwargs):
-        recorded.append(kwargs["inputs_embeds"].detach().clone())
-        return original_generate(*call_args, **kwargs)
-
-    predictor.generate = recording_generate
-    samples = load_seedtts_samples(args.meta, split=args.lang)[: args.utterances]
-    for sample in samples:
-        wrapper.generate_voice_clone(
-            text=sample.target_text,
-            ref_audio=sample.ref_audio,
-            ref_text=sample.ref_text,
-            max_new_tokens=args.max_new_tokens,
-        )
-        print(f"{sample.sample_id}: {len(recorded)} steps so far", flush=True)
-    pairs = torch.cat([r.reshape(-1, 2, r.shape[-1]) for r in recorded], dim=0)
-    hidden, layer0_embed = pairs[:, 0], pairs[:, 1]
-    distance = torch.cdist(layer0_embed.float(), embedding.float())
-    codes = distance.argmin(dim=-1)
-    assert torch.equal(
-        embedding[codes], layer0_embed
-    ), "layer-0 embeddings are not table rows"
-    torch.save({"talker_hidden": hidden.cpu(), "layer0_codes": codes.cpu()}, args.out)
-    print(f"saved {hidden.shape[0]} steps to {args.out}")
 
 
 class TupleLinear(nn.Module):
@@ -475,25 +433,19 @@ def time_chain(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("record", "run", "compare", "time"))
+    parser.add_argument("mode", choices=("run", "compare", "time"))
     parser.add_argument("--model")
     parser.add_argument("--inputs")
     parser.add_argument("--out")
     parser.add_argument("--fp32", action="store_true")
     parser.add_argument("--steps", type=int, default=320)
     parser.add_argument("--reps", type=int, default=50)
-    parser.add_argument("--utterances", type=int, default=6)
-    parser.add_argument("--max-new-tokens", type=int, default=200)
-    parser.add_argument("--meta", default="zhaochenyang20/seed-tts-eval-arrow")
-    parser.add_argument("--lang", default="en")
     parser.add_argument("--base")
     parser.add_argument("--pair")
     parser.add_argument("--truth")
     args = parser.parse_args()
     torch.manual_seed(0)
-    {"record": record, "run": run, "compare": compare, "time": time_chain}[args.mode](
-        args
-    )
+    {"run": run, "compare": compare, "time": time_chain}[args.mode](args)
 
 
 if __name__ == "__main__":

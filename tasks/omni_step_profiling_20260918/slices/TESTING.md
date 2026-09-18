@@ -84,13 +84,32 @@ the main checkout would be imported; every step below runs from inside its tree.
 | # | from | command | output |
 | --- | --- | --- | --- |
 | a | `cd $P` | `PYTHONPATH=$P python -m pytest tests/unit_test/qwen3_tts -q -p no:cacheprovider` | `$OUT/pytest_p1_qwen3_tts.txt` |
-| b | `cd $W` | `PYTHONPATH=$W python $S/predictor_pair_bench.py record --model $MODEL --out $OUT/predictor_inputs.pt` | `$OUT/record.txt` |
+| b | `cd $W` | recording boot, below | `$OUT/record_serve.log`, `$OUT/record_driver.txt` |
 | c | `cd $W` | `PYTHONPATH=$W python $S/predictor_pair_bench.py run --model $MODEL --inputs $OUT/predictor_inputs.pt --out $OUT/p1_base.pt` | `$OUT/run_base.txt` |
 | d | `cd $P` | `PYTHONPATH=$P python $S/predictor_pair_bench.py run --model $MODEL --inputs $OUT/predictor_inputs.pt --out $OUT/p1_pair.pt` | `$OUT/run_pair.txt` |
 | e | `cd $W` | `PYTHONPATH=$W python $S/predictor_pair_bench.py run --model $MODEL --inputs $OUT/predictor_inputs.pt --out $OUT/p1_truth.pt --fp32` | `$OUT/run_truth.txt` |
 | f | `cd $W` | `python $S/predictor_pair_bench.py compare --base $OUT/p1_base.pt --pair $OUT/p1_pair.pt --truth $OUT/p1_truth.pt` | `$OUT/p1e1_compare.txt` |
 | g | `cd $W` | `PYTHONPATH=$W python $S/predictor_pair_bench.py time --model $MODEL --inputs $OUT/predictor_inputs.pt` | `$OUT/p1e2_time_base.txt` |
 | h | `cd $P` | `PYTHONPATH=$P python $S/predictor_pair_bench.py time --model $MODEL --inputs $OUT/predictor_inputs.pt` | `$OUT/p1e2_time_pair.txt` |
+
+Step b, the recording boot (the served talker's predictor inputs; the qwen-tts reference
+model does not run under the venv's transformers 5.12.1). `export PORT=8013`, then from
+`cd $W`:
+
+```bash
+setsid bash -c "echo \$\$ > $OUT/record_server.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD \
+  PYTHONPATH=$S/record_predictor_inputs:$W PREDICTOR_RECORD_OUT=$OUT/predictor_inputs.pt \
+  python -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT" > $OUT/record_serve.log 2>&1 &
+```
+
+Poll `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health` every 10 s
+until 200 (fail after 15 min: send the last 80 lines of record_serve.log). Then
+`PYTHONPATH=$W python $S/profile_workloads.py --url http://127.0.0.1:$PORT --model $MODEL
+--out $OUT/record_driver --kind decode --batch 16 --steps 40 --label record --no-capture
+> $OUT/record_driver.txt 2>&1`. Pass: record_serve.log has `predictor recorder: saved`
+and `$OUT/predictor_inputs.pt` exists. Teardown: `kill -TERM -- -$(cat
+$OUT/record_server.pgid)`, wait 10 s, `-KILL` only if the group is alive; the card must
+be back near 0 MiB before step c.
 
 Step a is compared against the base suite log of the same tests on `$W`
 (`.tmp/omni_step_profiling/pytest_base_qwen3_tts.log`): return both failure lists.
