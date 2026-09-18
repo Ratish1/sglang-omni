@@ -230,6 +230,46 @@ launches and device work without a graph, goes first.
 | V6 | SNR of the gapped packed conv against the padded conv on saved real activations | G0 harness, the conv alone and the whole hop |
 | V7 | busy over wall of a 16 row hop on main after #2224, 4090 | stage 1 profiler, one call |
 
+## 7b. Amendment 2026-09-18: the breakable graph is the fit, and it ships in the pinned SGLang
+
+Read and verified in SGLang `v0.5.19`:
+
+| fact | where |
+|---|---|
+| a breakable CUDA graph is N real `torch.cuda.CUDAGraph` segments with eager gaps; `eager_on_graph(True)(fn)` ends the current segment, runs `fn` eagerly into a bridge buffer with a stable address, and begins the next; replay interleaves `seg.replay()` and the break functions; all segments share one memory pool | `srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py:216-265, 281-290, 312-333` |
+| for LLM prefill the break is attention: metadata is rebuilt eagerly per replay, the key is `num_tokens` only, one request slot is captured, tokens round up to a bucket with a 2x waste cap | `layers/radix_attention.py:577-581`, `runner/prefill_cuda_graph_runner.py:407, 1192-1194`, `runner/shape_key.py:22-41` |
+| a runner for diffusion transformers exists: `DiffusionBreakableCudaGraphRunner(transformer, device, pool=None)`, `capture(**kwargs)` once per input signature, `__call__` replays on a hit and runs eager on a miss, never captures while serving; static buffers per tensor leaf, two warmup passes, 32 entries and 512 segments by default | `multimodal_gen/runtime/breakable_cuda_graph/runner.py:201-245, 260-369, 450-533` |
+| its break points are the attention modules: "varlen packing and dynamic or sparse attention kernels ... cannot (or should not) be captured" | `multimodal_gen/runtime/layers/attention/layer.py:1859-1897` |
+
+In omni `upstream/main` (27b5b0d4f): MiniMax Music3 runs its DiT under this runner, one fixed
+`mel_len`, exact signature, no padding, off by default, guarded by free memory
+(`minimax_music3/dit.py:372-407`, `acoustic.py:165-175, 227-239`). Fun-CosyVoice3's Flow graph is
+the whole ten step padded solver per exact `(batch, frames)`, 55 shapes, reached by buffered
+traffic only; hops, finals and `token2wav_chunk` never replay it (`stages.py:342-517, 656, 772-828`).
+`supports_breakable_prefill_cuda_graph=False` concerns the AR prefill, not the Flow, and is
+structural: the runner owns prefill through `custom_prefill_forward`
+(`fun_cosyvoice3/model_runner.py:53-61, 406-409`).
+
+What this gives the packed Flow: every per token module of a packed DiT step (projection, AdaLN,
+the three attention projections, rope application, feed forward, output) has shapes that depend
+on total frames alone. The two parts whose shapes depend on the rows, ragged attention and the
+conv position embed, are exactly what a break is for: they stay eager, with their metadata
+built once per call as today. The captured segments are then keyed by one number, total frames
+rounded up to a bucket, which is section 4's design without having to make attention or the conv
+capturable. 22 blocks give 23 breaks and 24 segments per step. Padded frames are real work in
+the segments and must be benign (zero inputs, no segment covering them), as section 4.3 says.
+
+Blocking host work to move out of the step first (all step invariant, all already listed in
+section 8 or 7a): `_rope` builds from a Python int every step (`packed_dit.py:261-266`), the
+`apply_rotary_pos_emb` import runs inside the step (`:275`), the conv index arithmetic runs twice
+per step (`scatter_rows`, `gather_rows`). The solver's own per call setup (`pack_rows`,
+`RaggedRowAttention.__init__`, the CFG concatenations) is outside the step and stays eager.
+
+Open, to measure before any design is fixed: V8, launches and wall time of one step with 24
+segments plus eager attention and conv against the 1,500 launches of today's step, at 1, 4 and
+16 rows; V9, whether the runner's exact signature keying can take a bucketed total (pad in the
+caller) without patching SGLang; V10, memory per captured bucket at one step granularity.
+
 ## 8. Found by the trace, independent of this plan
 
 Three defects the read turned up that cost time or memory on their own. None
