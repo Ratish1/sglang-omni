@@ -311,12 +311,18 @@ def test_cached_hops_match_the_hop_over_the_whole_prefix() -> None:
             stream.frames = stream.reserved
         return out
 
+    def snr_db(value, reference):
+        return 20 * torch.log10(reference.norm() / (value - reference).norm())
+
     with torch.inference_mode(), torch.autocast("cuda", dtype=DTYPE):
-        whole = solve(PackedDiT(dit, device=device), [(0, 16), (0, 16)], [0, 1])
+        packed_dit = PackedDiT(dit, device=device)
+        whole = solve(packed_dit, [(0, 16), (0, 16)], [0, 1])
         first, second = cache.open_stream(), cache.open_stream()
-        cached_hop([first], [8], [0])
+        first_hop = cached_hop([first], [8], [0])
         cached_hop([second], [12], [1])
         new = cached_hop([first, second], [16, 16], [0, 1])
+        uncached_first_hop = solve(packed_dit, [(0, 8)], [0])
 
-    torch.testing.assert_close(new[:, :8], whole[:, 8:16], rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(new[:, 8:], whole[:, 28:], rtol=2e-2, atol=2e-2)
+    assert torch.equal(first_hop, uncached_first_hop)
+    assert snr_db(new[:, :8], whole[:, 8:16]) > 30
+    assert snr_db(new[:, 8:], whole[:, 28:]) > 30
