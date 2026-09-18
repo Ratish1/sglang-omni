@@ -97,6 +97,7 @@ def main() -> None:
         "call under torch.profiler and write their op tables",
     )
     parser.add_argument("--production-alone", action="store_true")
+    parser.add_argument("--step-errors-step", type=int, default=None)
     parser.add_argument(
         "--cached-conv-float32",
         action="store_true",
@@ -234,6 +235,76 @@ def main() -> None:
         cached, cached_ms, cached_mib = measured(
             lambda: vocoder.hop_batch_cached(items, row_handles), args.repeats, rewind
         )
+
+        if step == args.step_errors_step:
+            # The DiT's output at each Euler step, new frames only, both CFG
+            # lanes: the cached call and main's hop on each row alone, both
+            # against the float32 hop on that row alone. At Euler step 0 every
+            # path starts from the same noise, so a gap there is per call; a
+            # gap that opens over the steps is accumulated.
+            from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
+
+            recorded: list[torch.Tensor] = []
+            plain_forward = PackedDiT.forward
+
+            def recording_forward(self, *forward_args):
+                out = plain_forward(self, *forward_args)
+                recorded.append(out.detach().float().cpu())
+                return out
+
+            PackedDiT.forward = recording_forward
+            ends = [handle.frames for handle in row_handles]
+            rewind()
+            vocoder.hop_batch_cached(items, row_handles)
+            cached_steps, recorded = recorded, []
+            for handle, end in zip(row_handles, ends, strict=True):
+                handle.frames = end
+            new_lengths = [end - start for end, start in zip(ends, starts, strict=True)]
+            totals = {"cached": {}, "alone": {}, "signal": {}}
+            for row, item in enumerate(items):
+                if starts[row] == 0:
+                    continue
+                vocoder.hop_batch([item])
+                alone_steps, recorded = recorded, []
+                with torch.autocast(device_type="cuda", enabled=False):
+                    flow.inference_causal([item])
+                truth_steps_out, recorded = recorded, []
+                new, end = new_lengths[row], ends[row]
+                before = sum(new_lengths[:row])
+                for euler in range(len(truth_steps_out)):
+                    whole = [
+                        slice(end - new, end),
+                        slice(2 * end - new, 2 * end),
+                    ]
+                    reference = torch.cat(
+                        [truth_steps_out[euler][0, part] for part in whole]
+                    )
+                    alone_out = torch.cat(
+                        [alone_steps[euler][0, part] for part in whole]
+                    )
+                    cached_out = torch.cat(
+                        [
+                            cached_steps[euler][0, before : before + new],
+                            cached_steps[euler][
+                                0,
+                                sum(new_lengths)
+                                + before : sum(new_lengths)
+                                + before
+                                + new,
+                            ],
+                        ]
+                    )
+                    for name, value in (
+                        ("cached", (cached_out - reference).pow(2).sum()),
+                        ("alone", (alone_out - reference).pow(2).sum()),
+                        ("signal", reference.pow(2).sum()),
+                    ):
+                        totals[name][euler] = totals[name].get(euler, 0.0) + float(
+                            value
+                        )
+            PackedDiT.forward = plain_forward
+            with open(os.path.join(args.out, "step_errors.json"), "w") as out:
+                json.dump(totals, out, indent=1)
 
         if step == args.profile_step:
             # After the timed calls, so the profiler's callbacks touch no wall
