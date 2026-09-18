@@ -30,6 +30,21 @@ equals the full recompute, and earlier frames never change (E5); in bfloat16 the
 | attention | `flash_attn_with_kvcache` with `page_table = req_to_token[rows, :max_frames]`, `cache_seqlens`, `cu_seqlens_q`, `max_seqlen_q`, K and V passed as `get_key_buffer(layer).view(-1, 1, 16, 64)` | the form of SGLang's extend path with a prefix (`flashattention_backend.py:1001-1054, 1565-1583`) and of `RaggedRowAttention` today. Segments are (lane, new chunk); `cache_seqlens` is the chunk's absolute end, so the chunk causal rule needs no mask |
 | radix tree | not used | it shares identical token prefixes across requests; a stream's history is its own and append only, which is what `ChunkCache` is: a `req_to_token` row and the allocator (`chunk_cache.py:60-92`) |
 
+Checked against the other candidate, SGLang's diffusion side, which ships a causal K/V cache for
+chunked video DiTs (`multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py`, driven by
+`pipelines_core/stages/causal_denoising.py`). It does not fit, for two reasons in its source:
+
+- it is one request's contiguous `(batch, cache_size, heads, dim)` buffer per block with a sliding
+  window, eviction and sink tokens (`causal_attention_cache.py:19-37, 136-335`): no allocator, no
+  slots shared between requests, so it cannot back a step that packs sixteen streams;
+- it holds one K/V per block, filled by an extra forward on the clean latent at `context_noise`
+  after the chunk is denoised (`causal_denoising.py:833-873, 949-964`). That is the contract those
+  models were trained with. CosyVoice3's DiT sees its prefix at each Euler step's own noise
+  level, so the K and V differ per step and the cache is per (step, block): the 220 layers above.
+
+So the cache comes from SRT and the breakable graph from the diffusion side, as two PRs: the
+cache first (S1), the graph over the cached step after it (S3).
+
 Per hop, for the rows that hold a cache: allocate slots for the new frames of both lanes, write
 them into the rows, run the ten steps over the new frames only (rope and noise at absolute
 positions, the conv position embed fed each row's new frames after the last 30 inputs of each of
@@ -48,6 +63,35 @@ is off. When `alloc` returns None the row runs today's uncached hop and its stre
 cache, which is the parked branch's fallback; a stream that missed its first hop stays uncached.
 Where the bytes come from on a given card is the operator's memory fraction, as for every other
 consumer; this plan adds no sizing logic.
+
+As built (branch `slice/cosyvoice-4-1-hop-prefix-cache`, 0dbcb01a3, new file
+`flow_hop_cache.py`):
+
+```
+scheduler.run_step (streaming_vocoder.py)
+  split_hop_participants ── cache.open_stream()      ReqToTokenPool.alloc_rows(2)
+        │                   cache.reserve(stream,end) allocator.alloc -> req_to_token[lanes, reserved:end]
+        │                   None / False -> release, fallback_hops += 1, row runs hop_batch
+        ├─ cached rows -> vocoder.hop_batch_cached -> flow.inference_cached_hop (stages.py)
+        │       prepare_flow_conditioning (whole prefix, unchanged)
+        │       cache.begin_hop(streams) -> CachedHop: slots, absolute positions, page_table =
+        │                                   req_to_token[lanes[segment rows], :max_end], cache_seqlens
+        │       solve_flow_euler_packed(CachedDiT, new frames only)
+        │           _conv_pos_embed: conv_tails[step][:, lanes] ++ new frames, tails written back
+        │           _rope: absolute positions
+        │           CachedHop(q, k, v): pool.set_kv_buffer(layer) + flash_attn_with_kvcache
+        └─ plain rows  -> vocoder.hop_batch (main's path)
+  leftover step: release_flow_cache first, then main's bidirectional final
+```
+
+The conv tails live in one tensor indexed by request table row, `(steps, 2, rows + 1, 30, 1024)`,
+read and written with one index each per step, and the byte budget covers slots, table rows and
+tails together: `slots = budget * chunk // (bytes_per_slot * chunk + bytes_per_row)`,
+`rows = slots // chunk`, because a lane that holds a row holds at least one chunk of slots. The
+scheduler refuses the cache when `token_hop_len` or `token_max_hop_len` does not cover whole
+chunks: a cached frame is final only once its chunk is complete. Since main now reads ragged
+FA3 too, a stream's first cached hop runs the same rows through the same kernels as main's hop,
+so the probe checks it for bit identity (`stage2/s1_hop_cache_gate.py`).
 
 What is reused from the parked branch `slice/cosyvoice-1-2-hop-cache`: the pool and allocator
 construction, the lane major layout, the conv tails, the fallback split in the scheduler. What
