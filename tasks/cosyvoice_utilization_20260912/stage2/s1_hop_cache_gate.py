@@ -253,10 +253,25 @@ def main() -> None:
                 return out
 
             PackedDiT.forward = recording_forward
+            # The hidden state entering each block, Euler step 0 only (nothing
+            # is in `recorded` until the first forward returns): where in the
+            # depth the cached call leaves main's.
+            block_inputs: list[torch.Tensor] = []
+
+            def record_block_input(module, hook_args):
+                if not recorded:
+                    block_inputs.append(hook_args[0].detach().float().cpu())
+
+            hooks = [
+                block.attn_norm.register_forward_pre_hook(record_block_input)
+                for block in flow.decoder.estimator.transformer_blocks
+            ]
+            block_totals = {"cached": {}, "alone": {}, "signal": {}}
             ends = [handle.frames for handle in row_handles]
             rewind()
             vocoder.hop_batch_cached(items, row_handles)
             cached_steps, recorded = recorded, []
+            cached_blocks, block_inputs = block_inputs, []
             for handle, end in zip(row_handles, ends, strict=True):
                 handle.frames = end
             new_lengths = [end - start for end, start in zip(ends, starts, strict=True)]
@@ -266,11 +281,35 @@ def main() -> None:
                     continue
                 vocoder.hop_batch([item])
                 alone_steps, recorded = recorded, []
+                alone_blocks, block_inputs = block_inputs, []
                 with torch.autocast(device_type="cuda", enabled=False):
                     flow.inference_causal([item])
                 truth_steps_out, recorded = recorded, []
+                truth_blocks, block_inputs = block_inputs, []
                 new, end = new_lengths[row], ends[row]
                 before = sum(new_lengths[:row])
+                for block in range(len(truth_blocks)):
+                    lanes_whole = [slice(end - new, end), slice(2 * end - new, 2 * end)]
+                    reference = torch.cat(
+                        [truth_blocks[block][0, part] for part in lanes_whole]
+                    )
+                    alone_in = torch.cat(
+                        [alone_blocks[block][0, part] for part in lanes_whole]
+                    )
+                    cached_in = torch.cat(
+                        [
+                            cached_blocks[block][0, before : before + new],
+                            cached_blocks[block][0][sum(new_lengths) + before :][:new],
+                        ]
+                    )
+                    for name, value in (
+                        ("cached", (cached_in - reference).pow(2).sum()),
+                        ("alone", (alone_in - reference).pow(2).sum()),
+                        ("signal", reference.pow(2).sum()),
+                    ):
+                        block_totals[name][block] = block_totals[name].get(
+                            block, 0.0
+                        ) + float(value)
                 for euler in range(len(truth_steps_out)):
                     whole = [
                         slice(end - new, end),
@@ -303,8 +342,12 @@ def main() -> None:
                             value
                         )
             PackedDiT.forward = plain_forward
+            for hook in hooks:
+                hook.remove()
             with open(os.path.join(args.out, "step_errors.json"), "w") as out:
                 json.dump(totals, out, indent=1)
+            with open(os.path.join(args.out, "block_errors.json"), "w") as out:
+                json.dump(block_totals, out, indent=1)
 
         if step == args.profile_step:
             # After the timed calls, so the profiler's callbacks touch no wall
