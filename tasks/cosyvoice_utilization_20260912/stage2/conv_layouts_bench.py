@@ -128,6 +128,30 @@ def tiled_once(embed, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
     return tiled_conv(embed.conv2, spaced, tiles, gap).T[positions].unsqueeze(0)
 
 
+def fixed_tiles(width: int):
+    """Tiles of one fixed width, the way SGLang's audio encoders feed their conv
+    stems fixed windows: cuDNN then sees one width and only the tile count
+    varies."""
+
+    def layout(embed, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
+        gap = embed.kernel_size - 1
+        key = (id(rows), "fixed")
+        if key not in STEP_INVARIANT:
+            STEP_INVARIANT[key] = torch.arange(h.shape[1], device=h.device) + gap * (
+                rows.row_ids + 1
+            )
+        positions = STEP_INVARIANT[key]
+        tiles = -(-(h.shape[1] + gap * len(rows.lengths)) // width)
+        spaced = h.new_zeros(h.shape[2], tiles * width)
+        spaced.T[positions] = h[0]
+        first = tiled_conv(embed.conv1, spaced, tiles, gap)
+        spaced = torch.zeros_like(spaced)
+        spaced.T[positions] = first.T[positions]
+        return tiled_conv(embed.conv2, spaced, tiles, gap).T[positions].unsqueeze(0)
+
+    return layout
+
+
 def snr_db(reference: torch.Tensor, other: torch.Tensor) -> float:
     noise = (reference.double() - other.double()).pow(2).sum()
     if noise == 0:
@@ -141,13 +165,24 @@ def main() -> None:
     args = parser.parse_args()
     flow, _ = load_cosyvoice3_flow_hift(args.model, device="cuda:0")
     embed = flow.decoder.estimator.input_embed.conv_pos_embed
-    layouts = {
-        "padded": padded,
-        "long": long,
-        "tiled": tiled,
+    parser_layouts = {
         "padded_once": padded_once,
         "tiled_once": tiled_once,
+        "fixed_250": fixed_tiles(250),
+        "fixed_500": fixed_tiles(500),
+        "fixed_1000": fixed_tiles(1000),
+        "fixed_2000": fixed_tiles(2000),
     }
+    layouts = dict(parser_layouts)
+    # The same layouts again with cuDNN choosing its algorithm by measurement
+    # instead of by heuristic; the five warmup calls absorb the search.
+    for key, layout in parser_layouts.items():
+
+        def searched(embed, h, rows, layout=layout):
+            with torch.backends.cudnn.flags(benchmark=True):
+                return layout(embed, h, rows)
+
+        layouts[f"{key}+search"] = searched
 
     report = []
     for name, lengths in SHAPES.items():
