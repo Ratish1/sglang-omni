@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -86,28 +87,43 @@ def main() -> None:
     options = dict(item.split("=", 1) for item in args.option)
 
     torch.zeros(1, device="cuda")
-    rows: list[tuple[str, float]] = [("cuda context", used_mib())]
+    rows: list[tuple[str, float, float]] = [("cuda context", used_mib(), 0.0)]
+    started = time.monotonic()
+
+    def mark(step: str) -> None:
+        nonlocal started
+        rows.append((step, used_mib(), time.monotonic() - started))
+        started = time.monotonic()
 
     tokenizer = build(args.onnx, options)
-    rows.append(("session built", used_mib()))
+    mark("session built")
 
     tokenizer.extract_speech_token(audio(3, 0), SAMPLE_RATE)
-    rows.append(("first run, 3 s, main thread", used_mib()))
+    mark("first run, 3 s, main thread")
 
     tokenizer.extract_speech_token(audio(3, 1), SAMPLE_RATE)
-    rows.append(("second run, 3 s, main thread", used_mib()))
+    mark("second run, 3 s, main thread")
 
     tokenizer.extract_speech_token(audio(30, 2), SAMPLE_RATE)
-    rows.append(("run, 30 s, main thread", used_mib()))
+    mark("run, 30 s, main thread")
 
     distinct = run_together(tokenizer, 8, 10)
-    rows.append((f"8 runs at once, 10 s, {distinct} threads", used_mib()))
+    mark(f"8 runs at once, 10 s, {distinct} threads")
 
     distinct = run_together(tokenizer, 8, 30)
-    rows.append((f"8 runs at once, 30 s, {distinct} threads", used_mib()))
+    mark(f"8 runs at once, 30 s, {distinct} threads")
 
     distinct = run_together(tokenizer, 32, 3)
-    rows.append((f"32 runs at once, 3 s, {distinct} threads", used_mib()))
+    mark(f"32 runs at once, 3 s, {distinct} threads")
+
+    # The steady state a server reaches: the same mixed load again, which
+    # should allocate nothing and shows what a warm run costs in time.
+    distinct = run_together(tokenizer, 8, 10)
+    mark(f"again, 8 runs at once, 10 s, {distinct} threads")
+
+    for index in range(8):
+        tokenizer.extract_speech_token(audio(10, index), SAMPLE_RATE)
+    mark("again, 8 runs in a row, 10 s, main thread")
 
     report = {
         "onnxruntime": onnxruntime.__version__,
@@ -119,8 +135,9 @@ def main() -> None:
                 "step": step,
                 "used_mib": round(used, 1),
                 "delta_mib": round(used - rows[max(index - 1, 0)][1], 1),
+                "seconds": round(seconds, 3),
             }
-            for index, (step, used) in enumerate(rows)
+            for index, (step, used, seconds) in enumerate(rows)
         ],
     }
     print(json.dumps(report, indent=2))
