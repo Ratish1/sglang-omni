@@ -160,7 +160,8 @@ with `CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$Q`:
 
 Trees (all upstream 144bd6399 plus `step_profiler_v2.patch`, the profiler as committed on
 `feat/omni-step-profiler`, md5 7f864b156cfd5623a7dd65f84c6a6384):
-`.tmp/wt/prof-base`; `.tmp/wt/prof-p1` (+ `p1_pair_pass.patch`); `.tmp/wt/prof-p2`
+`.tmp/wt/prof-base`; `.tmp/wt/prof-pf` (+ `pf_base_prefill_graph.patch`);
+`.tmp/wt/prof-p1` (+ `p1_pair_pass.patch`); `.tmp/wt/prof-p2`
 (+ `p2_sampler_noise.patch`). Memory: the shipped default `mem_fraction_static` 0.85
 (no fifth argument); `mem.csv` records the card's memory every second so the fraction
 can be sized from the measured peak afterwards.
@@ -173,7 +174,8 @@ cd /workspace/sglang-omni && source .venv/bin/activate
 S=/workspace/sglang-omni/.tmp/omni_step_profiling/scripts
 R=/workspace/sglang-omni/.tmp/omni_step_profiling/run07
 nohup bash $S/run_profile_boot.sh /workspace/sglang-omni/.tmp/wt/prof-base $R/base1 $CARD 8021 > $R/base1.log 2>&1 &
-# then prof-p1 -> $R/p1 (port 8022), prof-p2 -> $R/p2 (8023), prof-base -> $R/base2 (8024)
+# then prof-pf -> $R/pf (port 8026), prof-p1 -> $R/p1 (8022), prof-p2 -> $R/p2 (8023),
+# prof-base -> $R/base2 (8024)
 nohup bash $S/run_nsys_boot.sh /workspace/sglang-omni/.tmp/wt/prof-base $R/nsys_base $CARD 8025 > $R/nsys_base.log 2>&1 &
 ```
 
