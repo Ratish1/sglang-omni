@@ -22,6 +22,7 @@ from array import array
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
+from contextlib import AbstractContextManager, nullcontext
 from itertools import islice
 from typing import Any, Callable
 
@@ -38,10 +39,12 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler import Scheduler as _Upstream
 from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_model, get_serving
 from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.admission import QueueFullError
+from sglang_omni.platforms import current_platform
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import (
     emit_model_path_end as _emit_model_path_end,
@@ -65,6 +68,8 @@ from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.types import ARRequestData, DeferredAdmission
 
 logger = logging.getLogger(__name__)
+
+TORCH_PROFILER = current_platform.get_torch_profiler()
 
 _FAILED_BATCH_RESULT = object()
 
@@ -1468,6 +1473,25 @@ class OmniScheduler:
         self._sched_idled = False
         if batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
+        TORCH_PROFILER.count_forward(self)
+
+    def profile_step_span(
+        self, batch: ScheduleBatch, phase: str
+    ) -> AbstractContextManager[Any]:
+        """One trace span per scheduler forward; prefill and decode name the stage."""
+        if not TORCH_PROFILER.is_active():
+            return nullcontext()
+        mode = batch.forward_mode
+        if mode == ForwardMode.DECODE:
+            kind = "decode"
+        elif mode == ForwardMode.EXTEND:
+            kind = "prefill"
+        else:
+            kind = mode.name
+        name = f"omni.step {kind} {phase} fwd={batch.forward_iter} bs={len(batch.reqs)}"
+        if mode.is_extend():
+            name = f"{name} toks={batch.extend_num_tokens}"
+        return torch.profiler.record_function(name)
 
     def _run_batch(self, batch, pp_proxy_tensors=None):
         """Run a batch through the model runner.
@@ -1481,11 +1505,12 @@ class OmniScheduler:
         del pp_proxy_tensors
         self.emit_prefill_start_for_batch(batch)
         self.stamp_batch_launch(batch)
-        sched_output = self.build_sched_output(batch)
-        mr_output = self._model_runner.execute(sched_output)
-        self.emit_prefill_end_for_batch(batch)
-        self.emit_stream_output(sched_output, mr_output)
-        return self.make_batch_result(mr_output)
+        with self.profile_step_span(batch, "run"):
+            sched_output = self.build_sched_output(batch)
+            mr_output = self._model_runner.execute(sched_output)
+            self.emit_prefill_end_for_batch(batch)
+            self.emit_stream_output(sched_output, mr_output)
+            return self.make_batch_result(mr_output)
 
     def build_sched_output(self, batch):
         """Wrap a ScheduleBatch into the SchedulerOutput the model runner
@@ -1565,9 +1590,10 @@ class OmniScheduler:
         caller holds the pending step (launch-first keeps two steps in flight)."""
         self.emit_prefill_start_for_batch(batch)
         self.stamp_batch_launch(batch)
-        sched_output = self.build_sched_output(batch)
-        pending_step = self._model_runner.execute_launch(sched_output)
-        return sched_output, pending_step
+        with self.profile_step_span(batch, "launch"):
+            sched_output = self.build_sched_output(batch)
+            pending_step = self._model_runner.execute_launch(sched_output)
+            return sched_output, pending_step
 
     def run_batch_resolve(self, batch, sched_output, pending_step, skip_rids=()):
         """Async: resolve the given launched step (wait event, host collect),
@@ -1580,10 +1606,11 @@ class OmniScheduler:
         """
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
-        mr_output = self._model_runner.execute_resolve(pending_step)
-        if mr_output is None:
-            return _FAILED_BATCH_RESULT
-        self.emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
+        with self.profile_step_span(batch, "resolve"):
+            mr_output = self._model_runner.execute_resolve(pending_step)
+            if mr_output is None:
+                return _FAILED_BATCH_RESULT
+            self.emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
         return GenerationBatchResult(
             logits_output=None,
             next_token_ids=mr_output.next_token_ids,
