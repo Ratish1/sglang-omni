@@ -1,0 +1,660 @@
+diff --git a/sglang_omni/pipeline/stage/runtime.py b/sglang_omni/pipeline/stage/runtime.py
+index c92777b67..83d5271e5 100644
+--- a/sglang_omni/pipeline/stage/runtime.py
++++ b/sglang_omni/pipeline/stage/runtime.py
+@@ -35,6 +35,7 @@ from sglang_omni.profiler.comm_trace import emit as _comm_trace
+ from sglang_omni.profiler.event_recorder import emit as _emit_event
+ from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
+ from sglang_omni.profiler.event_recorder import set_active_stage as _set_active_stage
++from sglang_omni.profiler.torch_profiler import StepWindow
+ from sglang_omni.proto import (
+     AdminMessage,
+     AdminResult,
+@@ -1888,13 +1889,36 @@ class Stage:
+ 
+     def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
+         run_id = msg.run_id
+-        if msg.enable_torch and not TorchProfiler.is_active():
++        if msg.enable_torch:
+             base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
+             template = f"{base_tpl}_pid{os.getpid()}"
+             prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
+             if prof_dir and not os.path.isabs(template):
+                 template = os.path.join(prof_dir, template)
+-            TorchProfiler.start(template, run_id=run_id)
++            if msg.num_steps is not None:
++                if msg.step_stage == self.name:
++                    TorchProfiler.arm_step_window(
++                        StepWindow(
++                            counter=self.scheduler,
++                            trace_path_template=template,
++                            run_id=run_id,
++                            num_steps=msg.num_steps,
++                            with_stack=msg.with_stack,
++                            record_shapes=msg.record_shapes,
++                        )
++                    )
++                    logger.info(
++                        "Torch profiler armed for %d forwards of stage %s",
++                        msg.num_steps,
++                        self.name,
++                    )
++            elif not TorchProfiler.is_active():
++                TorchProfiler.start(
++                    template,
++                    run_id=run_id,
++                    with_stack=msg.with_stack,
++                    record_shapes=msg.record_shapes,
++                )
+         if msg.event_dir is not None:
+             try:
+                 _get_recorder().start(
+@@ -1909,10 +1933,7 @@ class Stage:
+ 
+     def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
+         # run_id=None is a wildcard (stop whatever's active).
+-        if TorchProfiler.is_active() and (
+-            msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
+-        ):
+-            TorchProfiler.stop(run_id=msg.run_id)
++        TorchProfiler.stop(run_id=msg.run_id)
+         recorder = _get_recorder()
+         if recorder.is_active() and (
+             msg.run_id is None or recorder.active_run_id() == msg.run_id
+diff --git a/sglang_omni/profiler/profiler_control.py b/sglang_omni/profiler/profiler_control.py
+index 9a5b02690..8ab2bf1b8 100644
+--- a/sglang_omni/profiler/profiler_control.py
++++ b/sglang_omni/profiler/profiler_control.py
+@@ -46,6 +46,10 @@ class ProfilerControlClient:
+         stages: list[str] | None = None,
+         event_dir: str | None = None,
+         enable_torch: bool = True,
++        num_steps: int | None = None,
++        step_stage: str | None = None,
++        with_stack: bool | None = None,
++        record_shapes: bool | None = None,
+     ) -> None:
+         await self.start()
+         assert self._socks is not None
+@@ -55,6 +59,10 @@ class ProfilerControlClient:
+             trace_path_template=trace_path_template,
+             event_dir=event_dir,
+             enable_torch=enable_torch,
++            num_steps=num_steps,
++            step_stage=step_stage,
++            with_stack=with_stack,
++            record_shapes=record_shapes,
+         )
+         for s in targets:
+             sock = self._socks.get(s)
+diff --git a/sglang_omni/profiler/torch_profiler.py b/sglang_omni/profiler/torch_profiler.py
+index 9b55f1cf8..17d6a449e 100644
+--- a/sglang_omni/profiler/torch_profiler.py
++++ b/sglang_omni/profiler/torch_profiler.py
+@@ -6,8 +6,14 @@ import os
+ import subprocess
+ import threading
+ from contextlib import nullcontext
++from dataclasses import dataclass
+ 
+-from torch.profiler import ProfilerActivity, profile, supported_activities
++from torch.profiler import (
++    ProfilerActivity,
++    _ExperimentalConfig,
++    profile,
++    supported_activities,
++)
+ 
+ from sglang_omni.platforms import current_platform
+ 
+@@ -37,6 +43,19 @@ def _profiler_activities() -> list[ProfilerActivity]:
+     return [ProfilerActivity.CPU, *device]
+ 
+ 
++@dataclass(kw_only=True)
++class StepWindow:
++    """A profile that starts at the counter's next forward and stops after num_steps."""
++
++    counter: object
++    trace_path_template: str
++    run_id: str
++    num_steps: int
++    with_stack: bool | None
++    record_shapes: bool | None
++    forwards_left: int | None = None
++
++
+ class TorchProfiler(ProfilerBase):
+     """
+     Torch-based profiler configured for End-to-End continuous recording.
+@@ -48,18 +67,52 @@ class TorchProfiler(ProfilerBase):
+     _trace_template: str = ""
+ 
+     _active_run_id: str | None = None
+-    _lock = threading.Lock()
++    _step_window: StepWindow | None = None
++    _lock = threading.RLock()
+ 
+     @classmethod
+     def get_active_run_id(cls) -> str | None:
+         return cls._active_run_id
+ 
+     @classmethod
+-    def start(cls, trace_path_template: str, run_id: str | None = None) -> str:
+-        """
+-        Start the profiler with the given trace path template.
+-        """
++    def arm_step_window(cls, window: StepWindow) -> None:
+         with cls._lock:
++            cls._step_window = window
++
++    @classmethod
++    def count_forward(cls, counter: object) -> None:
++        """Advance the armed window by one forward of counter, before it runs."""
++        window = cls._step_window
++        if window is None or window.counter is not counter:
++            return
++        with cls._lock:
++            if cls._step_window is not window:
++                return
++            if window.forwards_left is None:
++                cls.start(
++                    window.trace_path_template,
++                    window.run_id,
++                    with_stack=window.with_stack,
++                    record_shapes=window.record_shapes,
++                )
++                window.forwards_left = window.num_steps
++            if window.forwards_left == 0:
++                cls.stop(run_id=window.run_id)
++            else:
++                window.forwards_left -= 1
++
++    @classmethod
++    def start(
++        cls,
++        trace_path_template: str,
++        run_id: str | None = None,
++        *,
++        with_stack: bool | None = None,
++        record_shapes: bool | None = None,
++    ) -> str:
++        """Start the profiler; None flags fall back to their env vars."""
++        with cls._lock:
++            rank = cls._get_rank()
+ 
+             # 1. Cleanup any existing profiler
+             if cls._profiler is not None:
+@@ -82,8 +135,6 @@ class TorchProfiler(ProfilerBase):
+                 cls._active_run_id = None
+                 cls._trace_template = ""
+ 
+-            rank = cls._get_rank()
+-
+             # 2. Make path absolute
+             trace_path_template = os.path.abspath(trace_path_template)
+             cls._trace_template = trace_path_template
+@@ -122,18 +173,27 @@ class TorchProfiler(ProfilerBase):
+                 except Exception as e:
+                     logger.warning(f"[Rank {rank}] Failed to export trace: {e}")
+ 
++            if with_stack is None:
++                with_stack = os.environ.get("SGLANG_TORCH_PROFILER_WITH_STACK") == "1"
++            if record_shapes is None:
++                record_shapes = (
++                    os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES") == "1"
++                )
+             # No ``schedule``: record continuously between start/stop.
+-            # Expensive flags are env-var opt-in (default off keeps the
++            # Expensive flags are opt-in (default off keeps the
+             # trace tens of MB; all on can hit multi-GB).
++            # note(ratish): without profile_all_threads only the starting thread
++            # records cpu ops and spans; the scheduler and worker threads would be
++            # kernels without callers.
+             cls._profiler = profile(
+                 activities=_profiler_activities(),
+                 on_trace_ready=trace_handler,
+-                record_shapes=os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES")
+-                == "1",
++                record_shapes=record_shapes,
+                 profile_memory=os.environ.get("SGLANG_TORCH_PROFILER_PROFILE_MEMORY")
+                 == "1",
+-                with_stack=os.environ.get("SGLANG_TORCH_PROFILER_WITH_STACK") == "1",
++                with_stack=with_stack,
+                 with_flops=os.environ.get("SGLANG_TORCH_PROFILER_WITH_FLOPS") == "1",
++                experimental_config=_ExperimentalConfig(profile_all_threads=True),
+             )
+ 
+             # 5. Start profiling
+@@ -151,6 +211,9 @@ class TorchProfiler(ProfilerBase):
+           - only stop when active_run_id matches (otherwise ignore)
+         """
+         with cls._lock:
++            window = cls._step_window
++            if window is not None and run_id in (None, window.run_id):
++                cls._step_window = None
+             if cls._profiler is None:
+                 return None
+ 
+@@ -221,7 +284,18 @@ class TorchProfiler(ProfilerBase):
+ class TorchNPUProfiler(TorchProfiler):
+ 
+     @classmethod
+-    def start(cls, trace_path_template: str, run_id: str | None = None) -> str:
++    def start(
++        cls,
++        trace_path_template: str,
++        run_id: str | None = None,
++        *,
++        with_stack: bool | None = None,
++        record_shapes: bool | None = None,
++    ) -> str:
++        if with_stack is None:
++            with_stack = os.environ.get("SGLANG_TORCH_PROFILER_WITH_STACK") == "1"
++        if record_shapes is None:
++            record_shapes = os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES") == "1"
+         with cls._lock:
+             trace_path_template = os.path.abspath(trace_path_template)
+             rank = cls._get_rank()
+@@ -263,11 +337,10 @@ class TorchNPUProfiler(TorchProfiler):
+                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                     trace_path_template
+                 ),
+-                record_shapes=os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES")
+-                == "1",
++                record_shapes=record_shapes,
+                 profile_memory=os.environ.get("SGLANG_TORCH_PROFILER_PROFILE_MEMORY")
+                 == "1",
+-                with_stack=os.environ.get("SGLANG_TORCH_PROFILER_WITH_STACK") == "1",
++                with_stack=with_stack,
+                 with_flops=os.environ.get("SGLANG_TORCH_PROFILER_WITH_FLOPS") == "1",
+             )
+             cls._profiler.start()
+@@ -277,6 +350,9 @@ class TorchNPUProfiler(TorchProfiler):
+     @classmethod
+     def stop(cls, *, run_id: str | None = None) -> dict | None:
+         with cls._lock:
++            window = cls._step_window
++            if window is not None and run_id in (None, window.run_id):
++                cls._step_window = None
+             if cls._profiler is None:
+                 return None
+ 
+diff --git a/sglang_omni/proto/messages.py b/sglang_omni/proto/messages.py
+index 9717ab320..782ce716b 100644
+--- a/sglang_omni/proto/messages.py
++++ b/sglang_omni/proto/messages.py
+@@ -291,6 +291,10 @@ class ProfilerStartMessage:
+     trace_path_template: str  # e.g. "/tmp/profiles/{run_id}/{stage}/trace"
+     event_dir: str | None = None  # Per-stage JSONL event sink dir for request profiling
+     enable_torch: bool = True  # When False, only request-level events are captured
++    num_steps: int | None = None  # Forwards of step_stage to capture, then stop
++    step_stage: str | None = None
++    with_stack: bool | None = None  # None falls back to the env var
++    record_shapes: bool | None = None
+ 
+     def to_dict(self) -> dict[str, Any]:
+         return {
+@@ -299,6 +303,10 @@ class ProfilerStartMessage:
+             "trace_path_template": self.trace_path_template,
+             "event_dir": self.event_dir,
+             "enable_torch": self.enable_torch,
++            "num_steps": self.num_steps,
++            "step_stage": self.step_stage,
++            "with_stack": self.with_stack,
++            "record_shapes": self.record_shapes,
+         }
+ 
+     @classmethod
+@@ -308,6 +316,10 @@ class ProfilerStartMessage:
+             trace_path_template=d["trace_path_template"],
+             event_dir=d.get("event_dir"),
+             enable_torch=bool(d.get("enable_torch", True)),
++            num_steps=d.get("num_steps"),
++            step_stage=d.get("step_stage"),
++            with_stack=d.get("with_stack"),
++            record_shapes=d.get("record_shapes"),
+         )
+ 
+ 
+diff --git a/sglang_omni/scheduling/omni_scheduler.py b/sglang_omni/scheduling/omni_scheduler.py
+index ffc776604..9e04a0106 100644
+--- a/sglang_omni/scheduling/omni_scheduler.py
++++ b/sglang_omni/scheduling/omni_scheduler.py
+@@ -21,6 +21,7 @@ import types
+ from array import array
+ from collections import deque
+ from concurrent.futures import Future, ThreadPoolExecutor
++from contextlib import AbstractContextManager, nullcontext
+ from itertools import islice
+ from typing import Any, Callable
+ 
+@@ -37,10 +38,12 @@ from sglang.srt.managers.schedule_batch import (
+ from sglang.srt.managers.scheduler import Scheduler as _Upstream
+ from sglang.srt.managers.scheduler import validate_input_length
+ from sglang.srt.mem_cache.common import release_kv_cache
++from sglang.srt.model_executor.forward_batch_info import ForwardMode
+ from sglang.srt.runtime_context import get_model, get_serving
+ from sglang.srt.utils import broadcast_pyobj
+ 
+ from sglang_omni.admission import QueueFullError
++from sglang_omni.platforms import current_platform
+ from sglang_omni.profiler.event_recorder import emit as _emit_event
+ from sglang_omni.profiler.event_recorder import (
+     emit_model_path_end as _emit_model_path_end,
+@@ -65,6 +68,8 @@ from sglang_omni.scheduling.types import ARRequestData, DeferredAdmission
+ 
+ logger = logging.getLogger(__name__)
+ 
++TORCH_PROFILER = current_platform.get_torch_profiler()
++
+ _FAILED_BATCH_RESULT = object()
+ 
+ _ABORTED_REQUEST_ID_LIMIT = 10000
+@@ -1437,6 +1442,25 @@ class OmniScheduler:
+         batch.launch_ts = time.monotonic()
+         batch.after_idle_gap = self._sched_idled
+         self._sched_idled = False
++        TORCH_PROFILER.count_forward(self)
++
++    def profile_step_span(
++        self, batch: ScheduleBatch, phase: str
++    ) -> AbstractContextManager[Any]:
++        """One trace span per scheduler forward; prefill and decode name the stage."""
++        if not TORCH_PROFILER.is_active():
++            return nullcontext()
++        mode = batch.forward_mode
++        if mode == ForwardMode.DECODE:
++            kind = "decode"
++        elif mode == ForwardMode.EXTEND:
++            kind = "prefill"
++        else:
++            kind = mode.name
++        name = f"omni.step {kind} {phase} fwd={batch.forward_iter} bs={len(batch.reqs)}"
++        if mode.is_extend():
++            name = f"{name} toks={batch.extend_num_tokens}"
++        return torch.profiler.record_function(name)
+ 
+     def _run_batch(self, batch, pp_proxy_tensors=None):
+         """Run a batch through the model runner.
+@@ -1450,11 +1474,12 @@ class OmniScheduler:
+         del pp_proxy_tensors
+         self._emit_prefill_start_for_batch(batch)
+         self._stamp_batch_launch(batch)
+-        sched_output = self._build_sched_output(batch)
+-        mr_output = self._model_runner.execute(sched_output)
+-        self._emit_prefill_end_for_batch(batch)
+-        self._emit_stream_output(sched_output, mr_output)
+-        return self._make_batch_result(mr_output)
++        with self.profile_step_span(batch, "run"):
++            sched_output = self._build_sched_output(batch)
++            mr_output = self._model_runner.execute(sched_output)
++            self._emit_prefill_end_for_batch(batch)
++            self._emit_stream_output(sched_output, mr_output)
++            return self._make_batch_result(mr_output)
+ 
+     def _build_sched_output(self, batch):
+         """Wrap a ScheduleBatch into the SchedulerOutput the model runner
+@@ -1534,9 +1559,10 @@ class OmniScheduler:
+         caller holds the pending step (launch-first keeps two steps in flight)."""
+         self._emit_prefill_start_for_batch(batch)
+         self._stamp_batch_launch(batch)
+-        sched_output = self._build_sched_output(batch)
+-        pending_step = self._model_runner.execute_launch(sched_output)
+-        return sched_output, pending_step
++        with self.profile_step_span(batch, "launch"):
++            sched_output = self._build_sched_output(batch)
++            pending_step = self._model_runner.execute_launch(sched_output)
++            return sched_output, pending_step
+ 
+     def _run_batch_resolve(self, batch, sched_output, pending_step, skip_rids=()):
+         """Async: resolve the given launched step (wait event, host collect),
+@@ -1549,10 +1575,11 @@ class OmniScheduler:
+         """
+         from sglang.srt.managers.scheduler import GenerationBatchResult
+ 
+-        mr_output = self._model_runner.execute_resolve(pending_step)
+-        if mr_output is None:
+-            return _FAILED_BATCH_RESULT
+-        self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
++        with self.profile_step_span(batch, "resolve"):
++            mr_output = self._model_runner.execute_resolve(pending_step)
++            if mr_output is None:
++                return _FAILED_BATCH_RESULT
++            self._emit_stream_output(sched_output, mr_output, skip_rids=skip_rids)
+         return GenerationBatchResult(
+             logits_output=None,
+             next_token_ids=mr_output.next_token_ids,
+diff --git a/sglang_omni/serve/launcher.py b/sglang_omni/serve/launcher.py
+index cd01f2317..6ef8abe1f 100644
+--- a/sglang_omni/serve/launcher.py
++++ b/sglang_omni/serve/launcher.py
+@@ -37,7 +37,7 @@ from typing import Any
+ 
+ import uvicorn
+ from fastapi import APIRouter, HTTPException
+-from pydantic import BaseModel
++from pydantic import BaseModel, PositiveInt
+ 
+ from sglang_omni.client import Client
+ from sglang_omni.config import PipelineConfig
+@@ -242,6 +242,10 @@ class StartReq(BaseModel):
+     config: dict[str, Any] | None = None
+     event_dir: str | None = None
+     enable_torch: bool = True
++    num_steps: PositiveInt | None = None
++    step_stage: str | None = None
++    with_stack: bool | None = None
++    record_shapes: bool | None = None
+ 
+ 
+ class StopReq(BaseModel):
+@@ -264,6 +268,13 @@ def _mount_profiler_routes(
+ 
+     @router.post("/start_profile")
+     async def start(req: StartReq):
++        if req.num_steps is not None and (
++            req.step_stage is None or not req.enable_torch
++        ):
++            raise HTTPException(
++                status_code=400,
++                detail="num_steps needs step_stage and enable_torch=true",
++            )
+         run_id = req.run_id or _default_run_id()
+         event_dir = req.event_dir
+         if event_dir is None and profiler_dir is not None:
+@@ -307,12 +318,18 @@ def _mount_profiler_routes(
+             config=req.config,
+             event_dir=event_dir,
+             enable_torch=req.enable_torch,
++            num_steps=req.num_steps,
++            step_stage=req.step_stage,
++            with_stack=req.with_stack,
++            record_shapes=req.record_shapes,
+         )
+         return {
+             "run_id": run_id,
+             "trace_path_template": tpl,
+             "event_dir": event_dir,
+             "enable_torch": req.enable_torch,
++            "num_steps": req.num_steps,
++            "step_stage": req.step_stage,
+         }
+ 
+     @router.post("/start_request_profile")
+diff --git a/tests/unit_test/pipeline/test_ipc.py b/tests/unit_test/pipeline/test_ipc.py
+index 5605b58f9..4bd2b4445 100644
+--- a/tests/unit_test/pipeline/test_ipc.py
++++ b/tests/unit_test/pipeline/test_ipc.py
+@@ -611,6 +611,61 @@ def test_start_profile_torch_mode_still_requires_trace_template() -> None:
+     assert "trace_path_template is required" in resp.json()["detail"]
+ 
+ 
++def test_start_profile_step_window_needs_a_stage_and_reaches_every_stage(
++    tmp_path: Path,
++) -> None:
++    from sglang_omni.serve import launcher
++
++    class FakeProfilerControl:
++        def __init__(self) -> None:
++            self.starts: list[dict] = []
++
++        async def broadcast_start(self, **kwargs) -> None:
++            self.starts.append(kwargs)
++
++    app = FastAPI()
++    ctl = FakeProfilerControl()
++    launcher._mount_profiler_routes(app, ctl, profiler_dir=str(tmp_path))
++
++    try:
++        with TestClient(app) as client:
++            no_stage = client.post("/start_profile", json={"num_steps": 5})
++            no_torch = client.post(
++                "/start_profile",
++                json={
++                    "num_steps": 5,
++                    "step_stage": "tts_engine",
++                    "enable_torch": False,
++                },
++            )
++            zero = client.post(
++                "/start_profile", json={"num_steps": 0, "step_stage": "tts_engine"}
++            )
++            armed = client.post(
++                "/start_profile",
++                json={
++                    "num_steps": 5,
++                    "step_stage": "tts_engine",
++                    "with_stack": True,
++                },
++            )
++        assert no_stage.status_code == 400
++        assert no_torch.status_code == 400
++        assert zero.status_code == 422
++        assert armed.status_code == 200
++        assert armed.json()["num_steps"] == 5
++        assert len(ctl.starts) == 1
++        start = ctl.starts[0]
++        assert start["num_steps"] == 5
++        assert start["step_stage"] == "tts_engine"
++        assert start["with_stack"] is True
++        assert start["record_shapes"] is None
++    finally:
++        rec = get_recorder()
++        if rec.is_active():
++            rec.stop()
++
++
+ @pytest.mark.asyncio
+ async def test_launcher_stops_runner_when_server_raises(
+     tmp_path: Path,
+diff --git a/tests/unit_test/profiler/test_torch_profiler.py b/tests/unit_test/profiler/test_torch_profiler.py
+new file mode 100644
+index 000000000..11ec1a914
+--- /dev/null
++++ b/tests/unit_test/profiler/test_torch_profiler.py
+@@ -0,0 +1,104 @@
++# SPDX-License-Identifier: Apache-2.0
++"""TorchProfiler step windows and thread coverage on a real torch profiler."""
++
++from __future__ import annotations
++
++import gzip
++import json
++import threading
++import time
++from pathlib import Path
++
++import pytest
++import torch
++
++from sglang_omni.profiler.torch_profiler import StepWindow, TorchProfiler
++
++
++@pytest.fixture(autouse=True)
++def stop_profiler():
++    yield
++    TorchProfiler.stop()
++
++
++def read_spans(trace_path_template: str) -> list[tuple[str, int]]:
++    """Span names and tids from the exported trace, once the background gzip lands."""
++    json_path = Path(f"{trace_path_template}_rank0.trace.json")
++    gz_path = Path(f"{json_path}.gz")
++    deadline = time.monotonic() + 30
++    while json_path.exists() or not gz_path.exists():
++        assert time.monotonic() < deadline, f"no trace at {gz_path}"
++        time.sleep(0.1)
++    with gzip.open(gz_path, "rt") as handle:
++        events = json.load(handle)["traceEvents"]
++    return [
++        (event["name"], event["tid"])
++        for event in events
++        if event.get("cat") == "user_annotation"
++    ]
++
++
++def window(counter: object, template: str, num_steps: int) -> StepWindow:
++    return StepWindow(
++        counter=counter,
++        trace_path_template=template,
++        run_id="window",
++        num_steps=num_steps,
++        with_stack=None,
++        record_shapes=None,
++    )
++
++
++def test_step_window_records_exactly_its_forwards_then_stops(tmp_path: Path) -> None:
++    counter = object()
++    template = str(tmp_path / "trace")
++    TorchProfiler.arm_step_window(window(counter, template, num_steps=3))
++
++    TorchProfiler.count_forward(object())
++    assert not TorchProfiler.is_active()
++    for forward in range(1, 6):
++        TorchProfiler.count_forward(counter)
++        with torch.profiler.record_function(f"forward_{forward}"):
++            torch.ones(4).sum()
++
++    assert not TorchProfiler.is_active()
++    names = sorted(name for name, _ in read_spans(template))
++    assert names == ["forward_1", "forward_2", "forward_3"]
++
++
++def test_stop_before_the_first_forward_disarms_the_window(tmp_path: Path) -> None:
++    counter = object()
++    template = str(tmp_path / "trace")
++    TorchProfiler.arm_step_window(window(counter, template, num_steps=2))
++
++    TorchProfiler.stop(run_id="another-run")
++    TorchProfiler.stop()
++    TorchProfiler.count_forward(counter)
++
++    assert not TorchProfiler.is_active()
++    assert not list(tmp_path.iterdir())
++
++
++def test_a_thread_started_before_the_profiler_records_its_spans(
++    tmp_path: Path,
++) -> None:
++    template = str(tmp_path / "trace")
++    go = threading.Event()
++
++    def worker() -> None:
++        go.wait()
++        with torch.profiler.record_function("worker_span"):
++            torch.ones(4).sum()
++
++    thread = threading.Thread(target=worker)
++    thread.start()
++    TorchProfiler.start(template, run_id="threads")
++    with torch.profiler.record_function("main_span"):
++        torch.ones(4).sum()
++    go.set()
++    thread.join()
++    TorchProfiler.stop()
++
++    spans = dict(read_spans(template))
++    assert spans["worker_span"] == thread.native_id
++    assert spans["main_span"] == threading.get_native_id()
