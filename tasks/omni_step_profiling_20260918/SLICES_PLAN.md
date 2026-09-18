@@ -143,7 +143,79 @@ kernel cuBLAS picks depends on the card; SGLang's `--bf16-gemm-backend gemv` eng
 M = 1 on SM90 only. Recorded for the H100 pass; no change is designed on sm89 numbers
 alone.
 
-## 7. Order and runbooks
+## 7. Bench 01 results (moss GPU 6, `scripts/predictor_bench.py`, `scripts/vocoder_conv_bench.py`)
+
+P1a, GEMM chain in a CUDA graph, distinct weights per layer, median ms per replay:
+
+| bs | current (16 passes, 352 GEMMs) | folded (2-token pass + 14, 331 GEMMs) | delta |
+| ---: | ---: | ---: | ---: |
+| 1 | 3.626 | 3.367 | -0.259 |
+| 16 | 5.252 | 4.699 | -0.553 |
+
+The bench's current chain at bs 16 (5.25 ms, GEMMs plus residual adds) sits near the
+traced 4.92 ms of GEMM time per replay. The two-token pass runs its GEMMs at M = 32 on
+`wmma_..._32x32_64x1` and `16x16_64x1` kernels, no slower per GEMM than M = 16. The fold
+also drops one pass of the non-GEMM layer kernels (norm, rope, attention, adds), not in
+this bench.
+
+P2a: the fused sampler costs 40.8 us per call at bs 1 and bs 16 (the trace: 40.4).
+`tl.topk(k=64)` alone costs 2.75 / 3.28 / 5.20 / 10.37 us over 256 / 512 / 1024 / 2048
+keys, flat in batch size. Selection is a quarter of the kernel; the other 30 us is
+elsewhere in it (next read: the kernel's own stages, timed apart).
+
+V2: `torch.backends.cudnn.benchmark = True` against the heuristic on 22 decode shapes
+(bs 1 and 8, fresh frames 1 to 8, 16, 32, 64): waveform bit-identical on all 22, decode
+time within 1 percent. cuDNN's measured pick equals its heuristic pick; the algorithm is
+not the lever.
+
+V1 (bs 1, 1 fresh frame, 37 conv calls, 2.88 ms profiled GPU): every tensor-core conv
+call runs two `nchwToNhwc` kernels before and one `nhwcToNchw` after its compute kernel;
+the second input-side conversion is the constant weight, re-laid out on every call. The
+1-frame `ConvTranspose [1024,1024,k2]` without conversions costs 31.9 us, the 2-frame one
+with them 80.6 us; `ConvTranspose [1536,768,k16]` 160 us and `Conv [1024->1536,k7]`
+100 us at one frame. Convs at 96 and 192 channels over 600 to 2000 samples take the
+legacy `implicit_convolve_sgemm` without conversions, 36 to 68 us each. Next:
+`scripts/vocoder_layout_bench.py` times each call with the weight laid out channels-last
+once, and with input and weight both resident in that layout, with output identity.
+
+## 8. Bench 02 results (`scripts/vocoder_layout_bench.py`, run01 prefill trace)
+
+Every conv call of one incremental decode, device time per call from CUDA graph replays,
+summed over the 37 calls (us):
+
+| batch x fresh frames | current | weight channels-last once | weight and input resident | resident delta | bit-exact calls |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 1 x 1 | 1077.6 | 567.4 | 506.5 | -53% | 26/37 |
+| 1 x 4 | 1378.4 | 815.9 | 710.0 | -48% | 25/37 |
+| 1 x 64 | 7757.3 | 5429.4 | 3673.2 | -53% | 25/37 |
+| 8 x 1 | 1325.3 | 1303.1 | 1112.1 | -16% | 22/37 |
+| 8 x 4 | 3284.6 | 3240.4 | 2418.7 | -26% | 25/37 |
+| 8 x 8 | 6505.3 | 5328.6 | 3656.1 | -44% | 28/37 |
+
+- Bit-exact where cuDNN keeps the same tensor-core kernel and only the per-call layout
+  conversions go: the transposed convs and the wide k7 convs.
+- Not bit-exact: the depthwise ConvNeXt conv (groups 1024; the resident path picks a
+  different kernel, and it is slower there), some 1x1 convs, and the 96 / 192 channel k7
+  convs that today run `implicit_convolve_sgemm` (resident picks a tensor-core kernel, 3x
+  faster at long lengths, different rounding). Max abs differences are per-call activation
+  deltas; waveform-level error is not measured yet.
+- A few calls are slower resident (the 1-channel final conv at bs 8, one k7 conv at bs 8 x
+  86 samples), so a per-call layout choice has to come from measurement, not a blanket
+  switch.
+
+Server trace (run01 mapping prefill b1): per request the vocoder thread replays 3 to 5
+decode graphs of 1,120 to 1,146 kernels, 11.4, 7.0, 3.2 to 3.4, 2.8 ms, 21 to 26 ms per
+request in all. Eager vocoder kernels per request: 52 to 56 kernels, 0.06 ms. The first
+audio of a voice clone request pays the reference-prefix bootstrap (window graphs, #2151)
+and the first chunk through these graphs.
+
+Consequence for the order: slice V is the largest measured lever (vocoder device time is
+about 3.0 ms of a 13.3 ms decode step and 21 to 26 ms before the first audio, and its conv
+time falls 16 to 53 percent resident). Next for V: an end-to-end prototype decoder that
+keeps the conv chain channels-last, compared on full decode time and waveform error
+(SNR against the current decoder on the same codes and state) per captured shape.
+
+## 9. Order and runbooks
 
 1. V1 and P2a micro-benches, P1a micro-bench: one runbook, one card, no server.
 2. Design the slice whose measured headroom is largest; code on its own branch from
