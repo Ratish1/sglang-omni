@@ -37,7 +37,7 @@ def main() -> None:
     db = sqlite3.connect(args.report)
     strings = dict(db.execute("select id, value from StringIds"))
     kernels = db.execute(
-        "select start, end, deviceId, shortName from CUPTI_ACTIVITY_KIND_KERNEL order by start"
+        "select start, end, deviceId, demangledName from CUPTI_ACTIVITY_KIND_KERNEL order by start"
     ).fetchall()
     if not kernels:
         print("no kernel activity in the report")
@@ -61,7 +61,6 @@ def main() -> None:
         )
     )
     starts = [k[0] for k in kernels]
-    order_by_end = sorted(range(len(kernels)), key=lambda i: kernels[i][1])
     max_len = max(k[1] - k[0] for k in kernels)
     per_kernel = collections.defaultdict(lambda: collections.defaultdict(list))
     window = {}
@@ -85,13 +84,12 @@ def main() -> None:
                 index -= 1
             for name in names or {"<idle>"}:
                 per_kernel[name][metric].append(value)
-    del order_by_end
     print(
         "window means: "
         + ", ".join(f"{m.split(' [')[0]} {v:.1f}" for m, v in window.items())
     )
     header = " ".join(f"{m.split(' [')[0][:12]:>12}" for m in METRICS)
-    print(f"\n{'kernel':60s} {'calls':>7} {'ms':>9} {header}")
+    print(f"\n{'kernel':90s} {'calls':>7} {'ms':>9} {header}")
     ranked = sorted(busy.items(), key=lambda item: -item[1][1])[: args.top]
     for name, (calls, ms) in ranked + [("<idle>", (0, 0.0))]:
         cells = []
@@ -100,7 +98,7 @@ def main() -> None:
             cells.append(
                 f"{statistics.fmean(values):12.1f}" if values else f"{'-':>12}"
             )
-        print(f"{name[:60]:60s} {calls:>7} {ms:>9.2f} " + " ".join(cells))
+        print(f"{name[:90]:90s} {calls:>7} {ms:>9.2f} " + " ".join(cells))
 
 
 if __name__ == "__main__":
