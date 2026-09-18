@@ -199,6 +199,28 @@ its memory peak (their finals). No main boot exists under the same rule, so this
 with nothing on main. The pool still covers only 61 % of rows, so c16 on this card stays a
 memory question with or without runaways.
 
+## 4f. The clean c16 pair, `max_new_tokens` unset on both sides (raw: `s1-r14`, `s1-r15`)
+
+Main at 27b5b0d4f (the branch's base), memory fraction 0.28 on both, no request above 13.6 s
+on either side, one boot each.
+
+| metric | main | hop cache | delta |
+|---|---|---|---|
+| req/s | 3.624 | 3.749 | +3.4 % |
+| audio s/s | 16.92 | 17.41 | +2.8 % |
+| RTF mean | 1.000 | 0.967 | -3.4 % |
+| latency mean / p95 / p99 | 4.40 / 5.82 / 6.40 s | 4.25 / 5.80 / 7.19 s | -3.3 % / -0.3 % / +12.3 % |
+| TTFP mean / p95 / p99 | 2.06 / 2.69 / 3.09 s | 1.99 / 2.80 / 3.09 s | -3.0 % / +4.1 % / +0.1 % |
+| inter chunk mean | 1.206 s | 1.168 s | -3.2 % |
+| underrun mean | 0.339 s | 0.269 s | -20.8 % |
+| c50 / c100 / c200 | 20.4 / 33.2 / 48.3 | 55.2 / 58.7 / 61.1 | +34.8 / +25.5 / +12.9 points |
+| peak card memory | 18,008 MiB | 22,066 MiB | +4.1 GB (the 6 GiB pool less smaller hops) |
+| failed | 0 | 0 | |
+
+With the runaways gone the c16 result has the sign of the c8 one, at the size a pool that covers
+61 % of rows allows. The latency p99 is the one metric that moved the wrong way; with 70 % of
+steps mixed, a row in the second Flow call of a step waits for the first.
+
 ## 5. Owed before S1 can be a PR
 
 1. The append change of section 3, then the first hop against main again.
