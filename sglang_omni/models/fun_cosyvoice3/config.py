@@ -151,6 +151,10 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             factory=FunCosyVoice3VocoderFactoryArgs(
                 dtype="bfloat16",
                 flow_batch_admission_frames=8000,
+                # note(ratish): bytes the causal hop K/V cache may hold, taken
+                # before sglang sizes its own pool. Zero keeps every hop
+                # recomputing its whole prefix.
+                flow_kv_cache_bytes=0,
                 flow_merge_max_gap_frames=384,
                 flow_merge_pad_budget_percent=25.0,
                 # Note (chenyang): Adjacent length-sorted requests may share a Flow solve
