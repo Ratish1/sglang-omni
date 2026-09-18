@@ -18,7 +18,8 @@
 #   SAMPLES  first N of the English split, empty for all of it     16
 #   CONC     client concurrency                                  1
 #   MODE     streaming or buffered                              streaming
-#   SEED     sampling seed sent with every request               1234
+#   SEED     sampling seed sent with every request, empty for    1234
+#            the benchmark's default, which sends none
 #   MODEL    checkpoint, a local directory                       /data/ms/.../master
 #   SERVE    extra serve arguments, the same string on both arms  empty
 set -euo pipefail
@@ -31,7 +32,7 @@ PORT=${PORT:-8000}
 SAMPLES=${SAMPLES-16}
 CONC=${CONC:-1}
 MODE=${MODE:-streaming}
-SEED=${SEED:-1234}
+SEED=${SEED-1234}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-}
 SERVE=${SERVE:-}
 # A session name turns the arm into an Nsight capture: the server launches under
@@ -89,11 +90,17 @@ grep -c 'the Flow attention chunk' \
 nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv > "$OUT/gpus_before.csv"
 uptime > "$OUT/host_load.txt"
 
-if [[ -n "$MAX_NEW_TOKENS" ]]; then
+# An empty SEED and no token limit is the benchmark's own default request: no
+# generation json is written and the flag is left off.
+GENERATION_ARG=""
+if [[ -n "$SEED" && -n "$MAX_NEW_TOKENS" ]]; then
   printf '{"seed": %d, "max_new_tokens": %d}\n' "$SEED" "$MAX_NEW_TOKENS" > "$OUT/generation.json"
-else
+elif [[ -n "$SEED" ]]; then
   printf '{"seed": %d}\n' "$SEED" > "$OUT/generation.json"
+elif [[ -n "$MAX_NEW_TOKENS" ]]; then
+  printf '{"max_new_tokens": %d}\n' "$MAX_NEW_TOKENS" > "$OUT/generation.json"
 fi
+[ -f "$OUT/generation.json" ] && GENERATION_ARG="--generation-json $OUT/generation.json"
 
 teardown() {
   [ -n "${DMON_PID:-}" ] && kill "$DMON_PID" 2>/dev/null || true
@@ -143,7 +150,7 @@ fi
 python -u "$T/diagnostics/run_seedtts.py" \
   --mode "$MODE" --lang en --concurrency "$CONC" --warmup "$WARMUP" $SAMPLE_ARG $CAPTURE_ARG \
   --model "$MODEL" --base-url "http://127.0.0.1:$PORT" \
-  --generation-json "$OUT/generation.json" --ready-timeout 900 \
+  $GENERATION_ARG --ready-timeout 900 \
   --output "$OUT/seedtts" 2>&1 | tee "$OUT/client.log"
 
 echo "OUT=$OUT"
