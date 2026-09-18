@@ -63,6 +63,38 @@ T1 with T2 is the pair that would leave nothing lazy; whether both are needed is
 measures. A lock around `session.run` is not on the list: with the v1.30.0 pool a lock still leaves
 one stream per distinct thread.
 
+## 3a. Measured 2026-09-18, RTX 4090 D, onnxruntime-gpu 1.30.0, then parked
+
+Parked by decision: this is a correctness defect of small cards, not a throughput lever, and the
+work goes to GPU occupancy first. No code was written. What the probe found, MiB added per step:
+
+| step | default | unified stream | same as requested | serial, warm 30 s first, unified | serial, warm first, unified, same as requested |
+|---|---|---|---|---|---|
+| session built | 1,036 | 1,052 | 1,044 | 1,044 | 1,044 |
+| warm run, 30 s | | | | 1,024 | 138 |
+| first run, 3 s | 10 | 0 | 40 | 0 | 0 |
+| second run, 3 s | 0 or 1,024 | 0 | 22 | 0 | 0 |
+| one run, 30 s | 1,024 or 0 | 1,024 | 116 | 0 | 108 |
+| 8 at once, 10 s | 160 | 74 | 342 | 0 | 0 |
+| 8 at once, 30 s | 0 or 1,024 | 1,024 | 1,004 | 0 | 0 |
+| 32 threads, 3 s | 516 | 244 | 484 | 0 | 0 |
+| after the build, total | 1,710 to 2,734 | 2,366 | 2,008 | 1,024, all before the first request | 246, of which 108 after the warm run |
+
+- U1: 1.30.0, the per thread stream pool.
+- The handles are the small part, 10 to 20 MiB per stream. The arena is the large part: the
+  default strategy extends by 1 GiB once it has grown, whatever the run needs (a 30 s run needs
+  116 MiB), and eight concurrent 30 s runs really need about 1 GiB because each holds its own
+  activations.
+- Concurrency buys no time on this session: warm, eight 10 s runs in a row take 72 to 92 ms, the
+  same eight at once 116 to 159 ms.
+- Serialized, with the unified stream and one run at the 30 s bound before the first request,
+  nothing is allocated afterwards with the default arena. With same as requested the resident
+  cost falls from 1,024 to 246 MiB and one later 30 s input still extended by 108 MiB.
+
+If it is unparked, the technique the numbers support is: one run in flight on this session,
+`use_ep_level_unified_stream`, and the 30 s warm run inside `before_memory_pool`; the arena
+strategy is then a choice between 1 GiB resident with zero growth and 0.25 GiB with a small one.
+
 ## 4. The measurement that chooses
 
 `../stage2/onnx_tokenizer_memory.py` (pushed, 8fe1e22a1), one process per option set, on a free

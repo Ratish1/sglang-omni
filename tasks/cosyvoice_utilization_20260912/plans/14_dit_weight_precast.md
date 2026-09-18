@@ -94,3 +94,41 @@ stays float32 and behaves as today: no gain there, no change either.
 | V2 | the packed estimator and the padded path share one DiT object, so one cast covers both | `PackedDiT(flow.decoder.estimator)` at `stages.py:924`; confirm on the box that `flow.packed_estimator.dit is flow.decoder.estimator` |
 | V3 | the box's torch is 2.13.0 | `python -c "import torch; print(torch.__version__)"` in the venv |
 | V4 | the time this is worth at 1 row and at 16 rows on the 4090 | G-launch and G-c16; the H100 ledger's 19 percent at 1 row is the only number so far |
+
+## 7. Results, 2026-09-18, RTX 4090 D, branch `slice/cosyvoice-3-2-dit-weight-precast` at 4a57f9a81
+
+Decisions taken: D4 CUDA only, D1 the compile warmup reads the Flow's first parameter.
+
+| check | result |
+|---|---|
+| V1 | 322 parameter tensors, 322 in a Linear or Conv1d, all float32; the one buffer is `rotary_embed.inv_freq`, float32 |
+| V2 | `flow.packed_estimator.dit is flow.decoder.estimator`: True; the Flow's first parameter is `input_embedding.weight`, float32 |
+| V3 | torch 2.13.0+cu130 |
+| G-unit | 198 passed, 2 skipped |
+| G-launch, G-mem and Flow identity, `stage2/dit_precast_hop.py`, one process, serving entry points, hops and finals at 1, 4 and 16 rows | mel bit identical on all 8 calls, each weight state reproduces itself; dtype copies 5,064 to 1,844 per call, kernels 18,218 to 14,998: 3,220 fewer, which is 322 times ten; allocated memory 1,624 to 993 MiB |
+
+The wall times of that probe are not quoted: it profiled between its timings, and a process that
+has run the profiler pays its callbacks on every later launch (the one call timed before any
+profile read 200 ms, the same call class 257 to 263 ms afterwards). `stage2/dit_precast_time.py`
+times one weight state per process with no profiler.
+
+G-c1, end to end audio. Main boots disagree with each other on this box, always on both samples
+of one reference voice at once and with different audio lengths, so the difference is upstream of
+the Flow (the AR saw a different prompt):
+
+| voice pair | main boots, 5 | branch boots, 3 |
+|---|---|---|
+| 1205005 | two audios: one boot of 5 has the other | two audios: 2 of 3 have the other |
+| 103675 | two audios: one boot of 5 | two audios: 1 of 3 |
+| 10933823 | one audio in all 5 | a second audio in 1 of 3 |
+| the other 5 voices, 10 samples | one audio | the same audio |
+
+Two of three branch boots produced only audio some main boot also produced. The first produced a
+second audio for voice 10933823 that no main boot on record has. The Flow is proven bit identical
+in isolation, and the cast touches nothing before the Flow, so this is read as the same per voice
+boot instability; it stays an open observation until a main boot shows that second audio or the
+source of the instability is found. For a change confined to the Flow, identity of the Flow's
+output in one process is the stronger gate, because the end to end gate is confounded upstream.
+
+Open: the source of the per voice boot instability (reference conditioning is the suspect: it is
+computed once per voice per boot and cached, which is the pairing seen).
