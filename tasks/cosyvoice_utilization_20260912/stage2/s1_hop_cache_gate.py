@@ -86,8 +86,32 @@ def main() -> None:
     parser.add_argument("--truth-steps", type=int, default=None)
     parser.add_argument("--samples", type=int, default=1088)
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--profile-step",
+        type=int,
+        default=None,
+        help="after this step's timed calls, run one production and one cached "
+        "call under torch.profiler and write their op tables",
+    )
+    parser.add_argument(
+        "--cached-conv-float32",
+        action="store_true",
+        help="forensics: the cached path's conv position embedding in float32, "
+        "to see whether the conv algorithm cuDNN picks for short rows carries "
+        "the cached path's distance from the truth",
+    )
     args = parser.parse_args()
     truth_steps = args.steps if args.truth_steps is None else args.truth_steps
+    if args.cached_conv_float32:
+        from sglang_omni.models.fun_cosyvoice3.flow_hop_cache import CachedDiT
+
+        bfloat16_conv = CachedDiT._conv_pos_embed
+
+        def float32_conv(self, h, rows):
+            with torch.autocast(device_type="cuda", enabled=False):
+                return bfloat16_conv(self, h.float(), rows).to(h.dtype)
+
+        CachedDiT._conv_pos_embed = float32_conv
 
     os.makedirs(args.out, exist_ok=True)
     info = provenance(args.device)
@@ -199,6 +223,39 @@ def main() -> None:
             lambda: vocoder.hop_batch_cached(items, row_handles), args.repeats, rewind
         )
 
+        if step == args.profile_step:
+            # After the timed calls, so the profiler's callbacks touch no wall
+            # time this report quotes. The cached call rewrites the same slots.
+            for name, call in (
+                ("production", lambda: vocoder.hop_batch(items)),
+                ("cached", lambda: vocoder.hop_batch_cached(items, row_handles)),
+            ):
+                ends = [handle.frames for handle in row_handles]
+                rewind()
+                with torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ]
+                ) as profile:
+                    call()
+                    torch.cuda.synchronize()
+                for handle, end in zip(row_handles, ends, strict=True):
+                    handle.frames = end
+                events = profile.key_averages()
+                kernels = sum(
+                    event.count
+                    for event in events
+                    if event.device_type == torch.autograd.DeviceType.CUDA
+                )
+                with open(
+                    os.path.join(args.out, f"profile_{name}_step{step}.txt"), "w"
+                ) as out:
+                    out.write(f"device kernel launches {kernels}\n")
+                    out.write(events.table(sort_by="self_cpu_time_total", row_limit=60))
+                    out.write("\n")
+                    out.write(events.table(sort_by="cuda_time_total", row_limit=40))
+
         for row, (index, offset, hop) in enumerate(participants):
             emitted = production[row][:, :, offset * TOKEN_MEL_RATIO :]
             record = {
@@ -251,6 +308,58 @@ def main() -> None:
     free_before = cache.allocator.available_size()
     for handle in handles.values():
         cache.release(handle)
+
+    # What one hop pays to write its K and V, 220 layers, three ways: the
+    # pool's set_kv_buffer plus the two buffer getters (what the branch ships),
+    # SGLang's store_cache kernel on views made once, and two index_copy_.
+    from sglang.kernels.ops.kvcache.kvcache import store_cache
+
+    pool = cache.pool
+    layers = pool.layer_num
+    row_dim = cache.heads * cache.head_dim
+    slots = cache.allocator.alloc(400)
+    key = torch.randn(400, cache.heads, cache.head_dim, dtype=pool.dtype, device="cuda")
+    key_rows = key.view(-1, row_dim)
+    views = [
+        (pool.k_buffer[layer].view(-1, row_dim), pool.v_buffer[layer].view(-1, row_dim))
+        for layer in range(layers)
+    ]
+
+    def shipped():
+        for layer in range(layers):
+            pool.set_kv_buffer(None, slots, key, key, layer_id_override=layer)
+            pool.get_key_buffer(layer).view(-1, 1, cache.heads, cache.head_dim)
+            pool.get_value_buffer(layer).view(-1, 1, cache.heads, cache.head_dim)
+
+    def direct_kernel():
+        for k_rows, v_rows in views:
+            store_cache(key_rows, key_rows, k_rows, v_rows, slots)
+
+    def index_copy():
+        for k_rows, v_rows in views:
+            k_rows.index_copy_(0, slots, key_rows)
+            v_rows.index_copy_(0, slots, key_rows)
+
+    store_bench = {}
+    for name, call in (
+        ("shipped", shipped),
+        ("direct_kernel", direct_kernel),
+        ("index_copy", index_copy),
+    ):
+        host, wall = [], []
+        for _ in range(5):
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            call()
+            host.append((time.perf_counter() - started) * 1e3)
+            torch.cuda.synchronize()
+            wall.append((time.perf_counter() - started) * 1e3)
+        store_bench[name] = {
+            "host_ms": statistics.median(host),
+            "wall_ms": statistics.median(wall),
+        }
+        print(f"store bench {name}: {store_bench[name]}")
+    cache.allocator.free(slots)
     first = [record for record in hops if record["first_hop"]]
     later = [record for record in hops if not record["first_hop"]]
     with_truth = [record for record in hops if "cached_vs_truth_db" in record]
@@ -280,6 +389,7 @@ def main() -> None:
         "cached_vs_truth_min_db": min(
             record["cached_vs_truth_db"] for record in with_truth
         ),
+        "store_bench": store_bench,
         "slots_used_at_end": cache.slots - free_before,
         "slots_free_after_release": cache.allocator.available_size(),
         "rows_free_after_release": cache.rows.available_size(),
