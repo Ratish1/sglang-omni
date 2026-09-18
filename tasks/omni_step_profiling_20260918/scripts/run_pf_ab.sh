@@ -4,9 +4,10 @@
 # provenance and prefill-backend gate, serve, seed-tts full English corpus (warmup 1),
 # SGLang prefill log lines, stop its own process group, then WER and speaker similarity
 # on the boot's WAVs on the same card. Ends with the seeded c1 byte comparison.
-# usage: run_pf_ab.sh <out dir> <tree A> <tree B> [all|buffered]
+# usage: run_pf_ab.sh <out dir> <tree A> <tree B> [all|buffered] [mem_fraction_static]
 set -u
 OUT=$1 TREE_A=$2 TREE_B=$3 POINTS=${4:-all}
+MEM_ARGS=${5:+--tts_engine.engine.mem_fraction_static $5}
 PY=/workspace/sglang-omni/.venv/bin/python
 MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
 META=zhaochenyang20/seed-tts-eval-arrow
@@ -25,7 +26,7 @@ boot() {
   nvidia-smi dmon -i "$card" -s pucvm -d 1 > "$d/dmon.log" 2>&1 &
   dmon=$!
   (cd "$tree" && setsid bash -c "echo \$\$ > $d/server.pgid; exec env CUDA_VISIBLE_DEVICES=$card \
-    PYTHONPATH=$tree $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $port" \
+    PYTHONPATH=$tree $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $port $MEM_ARGS" \
     > "$d/serve.log" 2>&1 &)
   healthy=0
   for _ in $(seq 180); do
