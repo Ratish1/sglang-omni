@@ -140,7 +140,23 @@ After c, delete `$OUT/p1_base_bs32.pt` and `$OUT/p1_truth_bs32.pt` (large, not n
 further). Expected durations: a and b 1 to 3 min each, d under 10 min, e under 10 min,
 f 20 to 60 min (44 compiles), g 5 to 30 min.
 
-## 5. Later runs
+## 5. Run 06: P2 unit tests and P2-e2 (no server)
+
+Tree `$Q = /workspace/sglang-omni/.tmp/wt/p2`: upstream 144bd6399 plus
+`p2_sampler_noise.patch` (branch `perf/qwen3-tts-sampler-noise`; the touched files are
+identical at 144bd6399 and main 27b5b0d4f). Exports as run 04 plus `Q` and
+`OUT=/workspace/sglang-omni/.tmp/omni_step_profiling/run06`; `mkdir -p $OUT`;
+`md5sum .tmp/omni_step_profiling/p2_sampler_noise.patch $S/sampler_noise_bench.py >
+$OUT/md5.txt`; `(cd $Q && PYTHONPATH=$Q python -c "import sglang_omni;
+print(sglang_omni.__file__)") > $OUT/import_path.txt` (must name `$Q/...`). From `cd $Q`
+with `CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$Q`:
+
+| # | command | output |
+| --- | --- | --- |
+| a | `python -m pytest tests/unit_test/qwen3_tts -q -p no:cacheprovider` | `$OUT/pytest_p2_qwen3_tts.txt` |
+| b | `python $S/sampler_noise_bench.py` | `$OUT/p2e2_noise.txt` |
+
+## 6. Later runs
 
 The matrix A/B runbook (section 2 of 00_PRINCIPLES_AND_AUDIT.md) is added here once
 P1-e1 passes; it is checked against both branch heads before the box runs it.
