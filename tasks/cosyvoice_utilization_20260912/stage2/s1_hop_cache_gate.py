@@ -21,9 +21,12 @@ the peak allocated memory of both calls.
 from __future__ import annotations
 
 import argparse
+import cProfile
 import inspect
+import io
 import json
 import os
+import pstats
 import statistics
 import sys
 import time
@@ -102,16 +105,6 @@ def main() -> None:
     )
     args = parser.parse_args()
     truth_steps = args.steps if args.truth_steps is None else args.truth_steps
-    if args.cached_conv_float32:
-        from sglang_omni.models.fun_cosyvoice3.flow_hop_cache import CachedDiT
-
-        bfloat16_conv = CachedDiT._conv_pos_embed
-
-        def float32_conv(self, h, rows):
-            with torch.autocast(device_type="cuda", enabled=False):
-                return bfloat16_conv(self, h.float(), rows).to(h.dtype)
-
-        CachedDiT._conv_pos_embed = float32_conv
 
     os.makedirs(args.out, exist_ok=True)
     info = provenance(args.device)
@@ -171,6 +164,19 @@ def main() -> None:
     vocoder = scheduler.vocoder
     cache = vocoder.flow_hop_cache
     flow = vocoder.flow
+    if args.cached_conv_float32:
+        # After the factory's bfloat16 warmup: the tails move to float32 with
+        # the conv, so the write back into them keeps one dtype.
+        from sglang_omni.models.fun_cosyvoice3.flow_hop_cache import CachedDiT
+
+        bfloat16_conv = CachedDiT._conv_pos_embed
+
+        def float32_conv(self, h, rows):
+            with torch.autocast(device_type="cuda", enabled=False):
+                return bfloat16_conv(self, h.float(), rows).to(h.dtype)
+
+        CachedDiT._conv_pos_embed = float32_conv
+        cache.conv_tails = cache.conv_tails.float()
     info["sglang_omni"] = inspect.getsourcefile(type(vocoder))
     info["budget_gib"] = budget / 2**30
     info["slots"] = cache.slots
@@ -255,6 +261,26 @@ def main() -> None:
                     out.write(events.table(sort_by="self_cpu_time_total", row_limit=60))
                     out.write("\n")
                     out.write(events.table(sort_by="cuda_time_total", row_limit=40))
+                # The same call under cProfile, for the Python time the op
+                # table cannot see.
+                rewind()
+                python_profile = cProfile.Profile()
+                python_profile.enable()
+                call()
+                torch.cuda.synchronize()
+                python_profile.disable()
+                for handle, end in zip(row_handles, ends, strict=True):
+                    handle.frames = end
+                for order in ("tottime", "cumulative"):
+                    text = io.StringIO()
+                    pstats.Stats(python_profile, stream=text).sort_stats(
+                        order
+                    ).print_stats(60)
+                    with open(
+                        os.path.join(args.out, f"python_{name}_step{step}_{order}.txt"),
+                        "w",
+                    ) as out:
+                        out.write(text.getvalue())
 
         for row, (index, offset, hop) in enumerate(participants):
             emitted = production[row][:, :, offset * TOKEN_MEL_RATIO :]
