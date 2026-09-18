@@ -4,9 +4,9 @@
 # provenance and prefill-backend gate, serve, seed-tts full English corpus (warmup 1),
 # SGLang prefill log lines, stop its own process group, then WER and speaker similarity
 # on the boot's WAVs on the same card. Ends with the seeded c1 byte comparison.
-# usage: run_pf_ab.sh <out dir> <tree A> <tree B>
+# usage: run_pf_ab.sh <out dir> <tree A> <tree B> [all|buffered]
 set -u
-OUT=$1 TREE_A=$2 TREE_B=$3
+OUT=$1 TREE_A=$2 TREE_B=$3 POINTS=${4:-all}
 PY=/workspace/sglang-omni/.venv/bin/python
 MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
 META=zhaochenyang20/seed-tts-eval-arrow
@@ -53,12 +53,24 @@ boot() {
     --model $MODEL --meta $META --lang en --port $asr_port --skip-gpu-cleanup \
     --transcribe-only --output-dir "$d/bench") > "$d/wer.log" 2>&1
   echo "wer rc $? $(date +%T)" >> "$d/progress.txt"
+  # note(ratish): --skip-gpu-cleanup returns before the ASR server frees the card
+  for _ in $(seq 60); do
+    [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$card")" -lt 100 ] && break
+    sleep 2
+  done
   (cd "$TREE_A" && CUDA_VISIBLE_DEVICES=$card PYTHONPATH=$TREE_A $PY -m benchmarks.eval.benchmark_tts_seedtts \
     --model $MODEL --meta $META --lang en --similarity-only --output-dir "$d/bench") > "$d/sim.log" 2>&1
   echo "sim rc $? $(date +%T)" >> "$d/progress.txt"
   echo "done $(date +%T)" >> "$d/progress.txt"
 }
 
+if [ "$POINTS" = buffered ]; then
+  boot a_c16_buffered "$TREE_A" 5 8105 --concurrency 16 &
+  boot b_c16_buffered "$TREE_B" 6 8106 --concurrency 16 &
+  wait
+  echo "all done $(date +%T)" > "$OUT/DONE"
+  exit 0
+fi
 boot a_c16_stream "$TREE_A" 1 8101 --concurrency 16 --stream &
 boot b_c16_stream "$TREE_B" 2 8102 --concurrency 16 --stream &
 boot a_c1_stream_seeded "$TREE_A" 3 8103 --concurrency 1 --stream --seed 1234 &
