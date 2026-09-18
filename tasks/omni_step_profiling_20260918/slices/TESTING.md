@@ -156,7 +156,36 @@ with `CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$Q`:
 | a | `python -m pytest tests/unit_test/qwen3_tts -q -p no:cacheprovider` | `$OUT/pytest_p2_qwen3_tts.txt` |
 | b | `python $S/sampler_noise_bench.py` | `$OUT/p2e2_noise.txt` |
 
-## 6. Later runs
+## 6. Run 07: full server profiles of base, P1, P2 (and base again), then nsys
+
+Trees (all upstream 144bd6399 plus `step_profiler_v2.patch`, the profiler as committed on
+`feat/omni-step-profiler`, md5 7f864b156cfd5623a7dd65f84c6a6384):
+`.tmp/wt/prof-base`; `.tmp/wt/prof-p1` (+ `p1_pair_pass.patch`); `.tmp/wt/prof-p2`
+(+ `p2_sampler_noise.patch`). Memory: the shipped default `mem_fraction_static` 0.85
+(no fifth argument); `mem.csv` records the card's memory every second so the fraction
+can be sized from the measured peak afterwards.
+
+Each boot is one script call, run in the background with nohup, one boot at a time on
+one card, in this order (base twice brackets the arms for drift):
+
+```bash
+cd /workspace/sglang-omni && source .venv/bin/activate
+S=/workspace/sglang-omni/.tmp/omni_step_profiling/scripts
+R=/workspace/sglang-omni/.tmp/omni_step_profiling/run07
+nohup bash $S/run_profile_boot.sh /workspace/sglang-omni/.tmp/wt/prof-base $R/base1 $CARD 8021 > $R/base1.log 2>&1 &
+# then prof-p1 -> $R/p1 (port 8022), prof-p2 -> $R/p2 (8023), prof-base -> $R/base2 (8024)
+nohup bash $S/run_nsys_boot.sh /workspace/sglang-omni/.tmp/wt/prof-base $R/nsys_base $CARD 8025 > $R/nsys_base.log 2>&1 &
+```
+
+Per boot: `progress.txt` shows each capture's start, end and return code; check it every
+3 minutes with `serve.log` recency. A boot takes about 15 to 25 minutes; the nsys boot
+longer (server under nsys). `FAILED` in a boot dir means the server never became healthy:
+send the last 80 lines of its serve.log and go on to the next boot. Return per boot: its
+`progress.txt`, `armed_marker.txt`, `import_path.txt`, the `.err` files that are not
+empty, and `ls -la` of the boot dir; for nsys also `c6_probe.log`, `nsys_start.log`,
+`stats.log`. The planner reads the ledgers and traces from the copy.
+
+## 7. Later runs
 
 The matrix A/B runbook (section 2 of 00_PRINCIPLES_AND_AUDIT.md) is added here once
 P1-e1 passes; it is checked against both branch heads before the box runs it.
