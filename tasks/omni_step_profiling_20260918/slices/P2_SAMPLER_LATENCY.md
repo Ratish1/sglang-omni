@@ -1,5 +1,9 @@
 # Slice P2: seeded top-k sampler latency
 
+Status 2026-09-18: dropped as a PR by the user's decision. The seeded sampler's logic is
+referenced against SGLang's sampler and kernels instead; branch
+`perf/qwen3-tts-sampler-noise` stays as a record only.
+
 ## 1. What is measured
 
 `_seeded_top_k_top_p_sample_kernel` (`sampling_kernels.py:304`) runs 15 times per decode

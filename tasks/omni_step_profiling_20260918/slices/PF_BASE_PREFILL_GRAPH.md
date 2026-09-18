@@ -97,7 +97,7 @@ run01 prefill bs 1: the step span is 25.9 ms for 10.45 ms of device time, about 
 launches, 4 stream syncs; the step is host-bound. A replayed layer stack removes the
 per-kernel launches of 28 layers.
 
-## 3. Change (branch `perf/qwen3-tts-base-prefill-graph`, not committed)
+## 3. Change (branch `perf/qwen3-tts-base-prefill-graph`, `2f60fc1a8` on upstream `27b5b0d4f`, pushed)
 
 The breakable backend and ladder become defaults for every checkpoint; the now-unused
 `qwen3_tts_checkpoint_model_type` and the builder's `checkpoint_dir` default go; the
@@ -114,3 +114,26 @@ scoping test goes, the default test stays; the cookbook section is updated. 4 fi
   in serve.log; the fraction of prefills replayed at c1, c16 and c32 comes from those
   lines.
 - Then the matrix TTFC cells and the census.
+
+Run 07 (READOUT_07 section 3): prefill bs 1 step 26.06 to 13.73 ms, 91 of 93 prefills
+replayed, capture 31 buckets in 3.58 s and 0.20 GB. Decode unchanged.
+
+## 5. PR gate: run 09 (TESTING.md section 8)
+
+One boot per arm and point, all six at once on cards 1 to 6: stream c16, seeded stream
+c1, buffered c16; full English seed-tts, warmup 1; WER and similarity on each boot's
+WAVs. Validation tasks the run answers (no claim until read):
+
+1. Client deltas: req/s, audio s/s, RTF, TTFC mean/p50/p95/p99, inter-chunk, buffered
+   latency; B's prefill replay share and A's eager share from `prefill_lines.txt`.
+2. Finding 5: seeded c1 WAVs, A (eager) against B (replayed), byte identical or not. Not
+   identical is not a failure; the census is the gate.
+3. The ladder top (512) was sized for CustomVoice text prompts. Base coalesced prefills
+   reach 920 tokens in run01; the share of prefills and of prefill tokens above 512 at
+   c16 comes from B's prefill lines. A graph removes launch cost, which matters only
+   while the step is host-bound; extending the ladder is considered only if eager
+   extends above 512 are measured host-bound (ledger), with the capture memory stated.
+4. VoiceDesign also takes the default with this change. Its prompt is text only like
+   CustomVoice and nothing on the path depends on the checkpoint type (finding 6); the
+   box holds only the Base checkpoint, so a VoiceDesign boot (capture, a few requests)
+   needs the checkpoint downloaded first.

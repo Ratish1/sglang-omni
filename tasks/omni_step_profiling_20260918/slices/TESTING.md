@@ -202,7 +202,35 @@ $S/vocoder_attribution_bench.py > $OUT/md5.txt`. From `cd $W` with
 | c | `python $S/vocoder_chain_bench.py split --model $MODEL --depthwise resident` | `$OUT/ve6_split.txt` | under 15 min |
 | d | `python $S/vocoder_chain_bench.py numerics --model $MODEL --depthwise resident` | `$OUT/ve6_numerics.txt` | 10 to 30 min |
 
-## 8. Later runs
+## 8. Run 09: PF A/B, c16 stream first (six boots at once, cards 1 to 6)
+
+A is upstream main `27b5b0d4f`, B is `origin/perf/qwen3-tts-base-prefill-graph`
+`2f60fc1a8` (one commit on `27b5b0d4f`). Scripts come from the pushed
+`feat/omni-step-profiler`, not a copy. The node is free (census at 1 MiB on all 8 cards,
+128 CPUs); the census step still runs first and a busy card stops the run.
+
+```bash
+cd /workspace/sglang-omni
+git fetch origin perf/qwen3-tts-base-prefill-graph feat/omni-step-profiler && git fetch upstream main
+git worktree add --detach .tmp/wt/pf-a 27b5b0d4f
+git worktree add --detach .tmp/wt/pf-b origin/perf/qwen3-tts-base-prefill-graph
+git worktree add --detach .tmp/wt/step-prof-tools origin/feat/omni-step-profiler
+S=/workspace/sglang-omni/.tmp/wt/step-prof-tools/tasks/omni_step_profiling_20260918/scripts
+R=/workspace/sglang-omni/.tmp/omni_step_profiling/run09
+mkdir -p $R
+nohup bash $S/run_pf_ab.sh $R /workspace/sglang-omni/.tmp/wt/pf-a /workspace/sglang-omni/.tmp/wt/pf-b > $R/run.log 2>&1 &
+```
+
+Check: `git -C .tmp/wt/pf-a rev-parse HEAD` is `27b5b0d4f...`, `pf-b` is `2f60fc1a8...`.
+Per boot dir (`a_c16_stream`, `b_c16_stream`, `a_c1_stream_seeded`, `b_c1_stream_seeded`,
+`a_c16_buffered`, `b_c16_buffered`): `progress.txt` every 3 minutes with `serve.log` and
+`bench.log` recency. Expected: c16 generation 10 to 25 min, seeded c1 60 to 120 min, WER
+and similarity 10 to 20 min each after. `FAILED` means the server never became healthy.
+`$R/DONE` ends the run; then `$R/identity.txt`. Return per boot: `progress.txt`,
+`head.txt`, `import_path.txt`, `ls -la`, and any traceback. The planner copies
+`$R` without WAVs and reads everything.
+
+## 9. Later runs
 
 The matrix A/B runbook (section 2 of 00_PRINCIPLES_AND_AUDIT.md) is added here once
 P1-e1 passes; it is checked against both branch heads before the box runs it.
