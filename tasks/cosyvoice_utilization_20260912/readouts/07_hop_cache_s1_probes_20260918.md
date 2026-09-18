@@ -128,6 +128,31 @@ frames) against the two main boots on disk (b5c3b44aa). Runaways are requests of
 - Not available from this pair: per step hop times. Neither tree logs them, so the throughput
   comparison stays exposed to the runaway draw.
 
+## 4c. Second c16 boot and c8 (raw: `s1-r11`, `s1-r12`)
+
+Same branch, same 6 GiB cache, graphs on. The second c16 boot ran at memory fraction 0.28, the
+lowest that still boots beside the cache (AR pool 14,335 tokens, no retraction); c8 at 0.3.
+
+| run | runaways | req/s | audio s/s | latency mean | TTFP mean | inter chunk mean | underrun mean | c50 | c100 | c200 | cached rows | fallbacks | peak MiB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| c16 main boot 1 | 1 | 3.301 | 15.65 | 4.84 | 2.25 | 1.32 | 0.477 | 22.6 | 27.3 | 41.2 | | | |
+| c16 main boot 2 | 3 | 2.939 | 14.62 | 5.43 | 2.53 | 1.43 | 0.610 | 10.7 | 21.3 | 39.5 | | | |
+| c16 cache boot 1 | 3 | 2.997 | 15.03 | 5.23 | 2.52 | 1.33 | 0.489 | 40.3 | 42.7 | 47.9 | 59.4 % | 494 | 23,766 |
+| c16 cache boot 2 | 2 | 3.055 | 14.85 | 5.22 | 2.65 | 1.29 | 0.422 | 47.7 | 51.2 | 54.2 | 60.0 % | 480 | 24,082 |
+| c8 main boot 1 | 2 | 2.758 | 13.31 | 2.90 | 1.495 | 0.705 | 0.090 | 74.7 | 76.1 | 83.2 | | | |
+| c8 main boot 2 | 4 | 2.611 | 12.94 | 3.06 | 1.501 | 0.771 | 0.130 | 70.5 | 72.4 | 79.2 | | | |
+| c8 cache | 1 | 3.023 | 14.22 | 2.64 | 1.404 | 0.637 | 0.051 | 78.9 | 83.0 | 89.8 | 98.2 % | 22 | 23,992 |
+
+- c8, where the pool holds the traffic: +9.6 % req/s and +6.8 % audio throughput against main's
+  better boot, every latency and continuity metric better, 0 failed. The draw favours the cache
+  boot by one runaway.
+- c16 means of two boots each: req/s 3.026 against 3.120 (-3.0 %), audio throughput 14.94
+  against 15.13 (-1.3 %), TTFP mean 2.58 against 2.39 s, all inside the spread of main's own
+  two boots; continuity c50 44.0 against 16.6, c100 46.9 against 24.3. Only 60 % of rows fit
+  the 6 GiB pool and about 70 % of hop steps are mixed, which pays the launch floor twice.
+- Lowering the memory fraction frees nothing for the cache on this card: the AR pool was already
+  0.32 GB at 0.3 and the card peaks within 0.5 GB of full.
+
 ## 5. Owed before S1 can be a PR
 
 1. The append change of section 3, then the first hop against main again.
