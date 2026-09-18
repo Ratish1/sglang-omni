@@ -48,8 +48,50 @@ Then, one at a time, each with `CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$W`:
 If a command fails, send its traceback and continue with the next one. Return: head.txt,
 md5.txt, and each output file in full.
 
-## 3. Later runs
+## 3. Run 04: P1 unit tests, P1-e1 numerics, P1-e2 graph timing (no server)
 
-P1 (P1-e1 numerics, P1-e2 graph timing) and the matrix A/B runbook are added here once
-the P1 branch and its scripts exist; each is checked against the branch head before the
-box runs it.
+Trees: base `$W` (above); pair `$P = /workspace/sglang-omni/.tmp/wt/p1`, upstream
+144bd6399 plus `p1_pair_pass.patch` (branch `perf/qwen3-tts-predictor-pair-pass`; the
+qwen3_tts files are identical at 144bd6399 and at main 27b5b0d4f).
+
+```bash
+cd /workspace/sglang-omni
+source .venv/bin/activate
+export CARD=<card from the census>
+export W=/workspace/sglang-omni/.tmp/wt/step-prof
+export P=/workspace/sglang-omni/.tmp/wt/p1
+export S=/workspace/sglang-omni/.tmp/omni_step_profiling/scripts
+export OUT=/workspace/sglang-omni/.tmp/omni_step_profiling/run04
+export MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
+mkdir -p $OUT
+git -C $P diff --stat > $OUT/p1_stat.txt
+md5sum .tmp/omni_step_profiling/p1_pair_pass.patch $S/predictor_pair_bench.py > $OUT/md5.txt
+for T in $W $P; do PYTHONPATH=$T python -c "import sglang_omni; print(sglang_omni.__file__)"; done > $OUT/import_paths.txt
+```
+
+`import_paths.txt` must name `$W/...` then `$P/...`. Then, one at a time, each with
+`CUDA_VISIBLE_DEVICES=$CARD`:
+
+| # | from | command | output |
+| --- | --- | --- | --- |
+| a | `cd $P` | `PYTHONPATH=$P python -m pytest tests/unit_test/qwen3_tts -q -p no:cacheprovider` | `$OUT/pytest_p1_qwen3_tts.txt` |
+| b | `cd $W` | `PYTHONPATH=$W python $S/predictor_pair_bench.py record --model $MODEL --out $OUT/predictor_inputs.pt` | `$OUT/record.txt` |
+| c | `cd $W` | `PYTHONPATH=$W python $S/predictor_pair_bench.py run --model $MODEL --inputs $OUT/predictor_inputs.pt --out $OUT/p1_base.pt` | `$OUT/run_base.txt` |
+| d | `cd $P` | `PYTHONPATH=$P python $S/predictor_pair_bench.py run --model $MODEL --inputs $OUT/predictor_inputs.pt --out $OUT/p1_pair.pt` | `$OUT/run_pair.txt` |
+| e | `cd $W` | `PYTHONPATH=$W python $S/predictor_pair_bench.py run --model $MODEL --inputs $OUT/predictor_inputs.pt --out $OUT/p1_truth.pt --fp32` | `$OUT/run_truth.txt` |
+| f | `cd $W` | `python $S/predictor_pair_bench.py compare --base $OUT/p1_base.pt --pair $OUT/p1_pair.pt --truth $OUT/p1_truth.pt` | `$OUT/p1e1_compare.txt` |
+| g | `cd $W` | `PYTHONPATH=$W python $S/predictor_pair_bench.py time --model $MODEL --inputs $OUT/predictor_inputs.pt` | `$OUT/p1e2_time_base.txt` |
+| h | `cd $P` | `PYTHONPATH=$P python $S/predictor_pair_bench.py time --model $MODEL --inputs $OUT/predictor_inputs.pt` | `$OUT/p1e2_time_pair.txt` |
+
+Step a is compared against the base suite log of the same tests on `$W`
+(`.tmp/omni_step_profiling/pytest_base_qwen3_tts.log`): return both failure lists.
+Known on base (sm89): `test_eager_predictor_accepts_a_strided_input_and_leaves_its_neighbours`.
+If b fails, stop and report (c to h need its output). Return: p1_stat.txt, md5.txt,
+import_paths.txt, the failure lines and summary of a and of the base log, and every
+other output file in full.
+
+## 4. Later runs
+
+The matrix A/B runbook (section 2 of 00_PRINCIPLES_AND_AUDIT.md) is added here once
+P1-e1 passes; it is checked against both branch heads before the box runs it.

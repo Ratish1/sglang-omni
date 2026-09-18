@@ -81,14 +81,24 @@ Paths that must keep working:
   performance of the pair pass is unmeasured.
 - Batch invariant mode and the cutedsl GEMM backend: the o_proj fusion already steps
   aside for them (`:1811-1812`); nothing new.
+- lm_head input: the slot 1 rows of the pair output are strided. sglang 0.5.19's SM90
+  gemv and cutedsl bf16 backends call `x.view(-1, x.shape[-1])` on their input
+  (`python/sglang/srt/layers/quantization/unquant.py:271,277`), which succeeds on the
+  strided rows and hands the kernel a non-dense row stride. The rows are made dense with
+  one B x 1024 copy per step.
+- Qwen3-Omni's talker (`sglang_omni/models/qwen3_omni/components/talker.py:1606-1612`)
+  runs the same two one-token passes. Same mechanism, separate PR after this one is
+  measured.
 - Predictor graphs (`:1372`): the captured body is `_code_predictor_forward_incremental`,
   so the pair pass is captured with no graph code change. Graph memory: the pair pass
   allocates 2B-row intermediates once per replay; pool size is read from the capture log.
 
 ## 4. Experiments
 
-- P1-e1 numerics, one run. Record talker hiddens and layer-0 codes from a live decode
-  (bs 1, 2, 4, 8, 16, 16 steps each). Run the chain three ways on the same inputs and
+- P1-e1 numerics, one run (`scripts/predictor_pair_bench.py`). Record talker hiddens and
+  layer-0 codes from the qwen-tts reference model's own decode on seed-tts voice clone
+  requests (the predictor inputs it builds at `modeling_qwen3_tts.py:1672`), then batch
+  them at bs 1, 2, 4, 8, 16. Run the chain three ways on the same inputs and
   seeds: current bf16, pair bf16, current in fp32 (weights upcast). Per sub-step: logits
   max abs and mean abs vs fp32, and code agreement vs fp32 argmax where greedy. Pass:
   pair's error to fp32 is within current's error to fp32 (per bs, per sub-step). Also
@@ -98,9 +108,10 @@ Paths that must keep working:
 
 ## 5. Gates and A/B
 
-1. Unit tests: existing predictor tests on the box (`tests/unit_test/qwen3_tts`), plus a
-   test that the pair pass equals two one-token passes in fp32 on CUDA (a shipped
-   contract: same math, fewer passes).
+1. Unit tests (branch `perf/qwen3-tts-predictor-pair-pass`, TESTING.md run 04): the
+   qwen3_tts suite with the helpers' new signatures, plus three contract tests: the pair
+   pass equals two one-token passes (outputs and K/V cache), the fused rope KV store
+   writes the pair where the copy path writes it, and the pair query attends causally.
 2. P1-e1 pass.
 3. Matrix A/B (base vs P1), predicted cells: decode steps shorter by the P1-e2 delta at
    each bs; TTFC shorter by one pass in the prefill step.
