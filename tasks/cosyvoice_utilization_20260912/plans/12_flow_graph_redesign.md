@@ -198,6 +198,38 @@ lookup in `FlowCudaGraphRunner.run` (`stages.py:465-496`).
 | V4 | the waste bound | the instrument reports padding per bucket ladder; SGLang's guard allows 2x, the first proposal here is 25 percent |
 | V5 | does FA3 varlen capture and replay correctly in this repo's wheel | capture one bucket and compare replay against eager before anything else in 2.2 |
 
+## 7a. Amendment 2026-09-18, reread against main `7b49bc4b8`
+
+Slice 2.1 is merged (#2224, #2228). Rereading the packed step for what still depends on a shape
+other than total frames found that section 3's "only attention still scatters back to a padded
+layout" is wrong, and that the ragged read brought shapes of its own:
+
+| site | depends on | consequence for a key of total frames |
+|---|---|---|
+| `_conv_pos_embed` scatters to `(rows, width)`, runs the causal conv, gathers, on every step | row count and widest row (`packed_dit.py:257-259`) | blocks the one number key until the conv runs on the packed sequence |
+| `_rope` builds `forward_from_seq_len(rows.width)` and indexes it, on every step | widest row (`packed_dit.py:261-266`) | step invariant; built once per call outside the graph, contents copied into a buffer of total frames |
+| `RaggedRowAttention` metadata: `cache_seqlens (S)`, `cu_seqlens_q (S + 1)`, `page_table (S, widest segment end)`, host `max_seqlen_q` | segment count S and the widest row (`packed_dit.py:156-169`) | needs a capacity per bucket: S at most total / chunk plus the row capacity, page table width at most the bucket; padded segments must be zero length. V5 covers exactly this |
+
+The conv on the packed sequence is exact in arithmetic and needs no second key dimension. The
+module is two left padded convs, kernel 31, with no mask (`modules.py:129-144`, `dit.py:97`): a
+row's frame reads the 30 frames before it at each conv, and zeros before the row starts. Packed
+with a gap of 30 zero frames before every row, conv1 reads only the row and the gap. conv1's output
+on the gap is not zero (it is Mish of the bias and the previous row's tail), so the gap is zeroed
+again between conv1 and conv2, which means calling the two halves separately. The conv input is
+then `total + 30 x row capacity` frames, a function of the bucket alone. cuDNN may choose another
+algorithm for the new shape, so the gate is the G0 SNR protocol, not bit identity. V6.
+
+Order, given what is measured: the stage 1 ledger has 16 row hops device bound on the H100
+(busy over wall 0.87 to 0.99), where a graph removes little; #2224 removed padded device work and
+the SM Issue reading moved toward launch bound. How far is not measured on any card. So the
+census at main with per sample pairing runs before this plan is sized, and plan 14, which removes
+launches and device work without a graph, goes first.
+
+| # | unknown | how it is settled |
+|---|---|---|
+| V6 | SNR of the gapped packed conv against the padded conv on saved real activations | G0 harness, the conv alone and the whole hop |
+| V7 | busy over wall of a 16 row hop on main after #2224, 4090 | stage 1 profiler, one call |
+
 ## 8. Found by the trace, independent of this plan
 
 Three defects the read turned up that cost time or memory on their own. None

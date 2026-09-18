@@ -82,13 +82,16 @@ alone is 1,263 MiB. `hift`: 92 MiB, float32 plus a float64 F0 branch.
 
 `load_cosyvoice3_flow_hift` takes `fp16=(dtype == "float16")` (`stages.py:2054`),
 so the shipped `dtype="bfloat16"` loads float32 weights and every call runs under
-`torch.autocast(bfloat16)`, which casts them per forward and caches the casts.
-The weights are twice the size they need to be, and the cast is paid at runtime
-rather than once at load.
+`torch.autocast(bfloat16)`, which casts them on every call. Corrected
+2026-09-18: nothing is cached, because torch 2.13.0 excludes inference mode from
+the autocast weight cache (`aten/src/ATen/autocast_mode.cpp:129-133`) and every
+Flow entry point runs under it. The weights are twice the size they need to be,
+and the cast is paid ten times per Flow call rather than once at load.
 
-Not a free change: bfloat16 weights are a numeric change and need the G0
-protocol against a float32 truth, unlike the three defects above, which move no
-number at all.
+Corrected 2026-09-18: casting only the Linear and Conv1d parameters moves no
+number, since those are the tensors autocast already hands the kernels; a
+blanket `.to(bfloat16)` would, because it also takes the rope's `inv_freq`
+buffer. `plans/14_dit_weight_precast.md`.
 
 ## What this is worth
 
@@ -97,7 +100,7 @@ number at all.
 | graph granularity | 7.0 GiB | 0.2 to 0.7 GiB | no, replay is replay |
 | KV pool bound | 9.8 GiB | 1.6 GiB | no, the tokens are never used |
 | ONNX arena | 1.05 GiB | bounded, to be measured | no |
-| weight dtype | 1.36 GiB | 0.68 GiB | yes, needs G0 |
+| weight dtype | 1.36 GiB | 0.68 GiB | no for the DiT's Linear and Conv1d parameters (plan 14, gated by c1 identity); HiFT not touched |
 
 The first three are about 16 GiB of a 23.5 GiB card and none of them changes an
 output. That is the headroom every other optimization in this task has been
