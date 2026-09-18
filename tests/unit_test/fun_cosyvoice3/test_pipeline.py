@@ -48,6 +48,7 @@ def test_fun_cosyvoice3_config_and_registry_contract() -> None:
     assert vocoder.factory.max_batch_wait_ms == 30
     assert vocoder.factory.model_extra == {
         "flow_batch_admission_frames": 8000,
+        "flow_kv_cache_bytes": 0,
         "flow_merge_max_gap_frames": 384,
         "flow_merge_pad_budget_percent": 25.0,
         "flow_cuda_graph_capture_shapes": FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,

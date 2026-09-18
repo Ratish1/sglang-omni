@@ -19,6 +19,7 @@ from typing import Any, Literal, Mapping
 
 import torch
 
+from sglang_omni.models.fun_cosyvoice3.flow_hop_cache import StreamHopCache
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.stages import CosyVoice3Vocoder, FlowBatchInput
 from sglang_omni.models.fun_cosyvoice3.streaming import (
@@ -54,6 +55,7 @@ class CosyVoice3StreamState:
     prompt_feat: torch.Tensor | None = None
     embedding: torch.Tensor | None = None
     hift_mel: torch.Tensor | None = None
+    flow_cache: StreamHopCache | None = None
     speech_offset: int = 0
     leftover: torch.Tensor | None = None
     done: bool = False
@@ -102,6 +104,17 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 f"token_max_hop_len ({token_max_hop_len}) must be >= "
                 f"token_hop_len ({token_hop_len})"
             )
+        elif vocoder.flow_hop_cache is not None and any(
+            tokens * TOKEN_MEL_RATIO % vocoder.flow_hop_cache.chunk_size
+            for tokens in (hop, max_hop)
+        ):
+            # note(ratish): a cached frame's K and V are final only once its
+            # chunk is complete, so every hop must end on a chunk boundary.
+            raise ValueError(
+                f"the hop K/V cache needs token_hop_len ({token_hop_len}) and "
+                f"token_max_hop_len ({token_max_hop_len}) to cover whole Flow "
+                f"chunks of {vocoder.flow_hop_cache.chunk_size} frames"
+            )
         else:
             self.token_hop_len = hop
             self.token_max_hop_len = max_hop
@@ -147,6 +160,12 @@ class FunCosyVoice3StreamingVocoderScheduler(
         started = time.monotonic()
         mel = self.vocoder.hop_batch([item])[0]
         self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=False)
+        cache = self.vocoder.flow_hop_cache
+        if cache is not None:
+            stream = cache.open_stream()
+            cache.reserve(stream, 2 * self.token_hop_len * TOKEN_MEL_RATIO)
+            self.vocoder.hop_batch_cached([item], [stream])
+            cache.release(stream)
         hop_s = time.monotonic() - started
         mel = self.vocoder.leftover_batch([item])[0]
         self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=True)
@@ -359,6 +378,10 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 for _, state in participants
             ]
             logger.info(f"Fun-CosyVoice3 leftover Flow batch size={len(items)}")
+            # note(ratish): the last call is bidirectional over the whole
+            # history, so no causal cache serves it and the slots go back first.
+            for _, state in participants:
+                self.release_flow_cache(state)
             mels = self.vocoder.leftover_batch(items)
             for (_, state), mel in zip(participants, mels, strict=True):
                 state.leftover, state.hift_mel, state.speech_offset = (
@@ -373,26 +396,37 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 self.complete_stream_request(request_id, self.finish_stream(request_id))
             return {}
         else:
-            items = [
-                FlowBatchInput(
-                    token=torch.tensor(
-                        state.tokens[
-                            : state.token_offset + state.hop_len + PRE_LOOKAHEAD_LEN
-                        ],
-                        dtype=torch.int32,
-                    ).unsqueeze(0),
-                    prompt_token=state.prompt_token,
-                    prompt_feat=state.prompt_feat,
-                    embedding=state.embedding,
+            cached, plain = self.split_hop_participants(participants)
+            logger.info(
+                f"Fun-CosyVoice3 causal Flow batch size={len(participants)} "
+                f"cached={len(cached)}"
+            )
+            emitted: list[tuple[str, CosyVoice3StreamState, torch.Tensor]] = []
+            if cached:
+                mels = self.vocoder.hop_batch_cached(
+                    [self.hop_input(state) for _, state in cached],
+                    [state.flow_cache for _, state in cached],
                 )
-                for _, state in participants
-            ]
-            logger.info(f"Fun-CosyVoice3 causal Flow batch size={len(items)}")
-            mels = self.vocoder.hop_batch(items)
+                emitted += [
+                    (request_id, state, mel)
+                    for (request_id, state), mel in zip(cached, mels, strict=True)
+                ]
+            if plain:
+                mels = self.vocoder.hop_batch(
+                    [self.hop_input(state) for _, state in plain]
+                )
+                emitted += [
+                    (
+                        request_id,
+                        state,
+                        mel[:, :, state.token_offset * TOKEN_MEL_RATIO :],
+                    )
+                    for (request_id, state), mel in zip(plain, mels, strict=True)
+                ]
             decoded: dict[str, torch.Tensor] = {}
-            for (request_id, state), mel in zip(participants, mels, strict=True):
+            for request_id, state, mel in emitted:
                 delta, state.hift_mel, state.speech_offset = self.vocoder.hift_delta(
-                    mel[:, :, state.token_offset * TOKEN_MEL_RATIO :],
+                    mel,
                     hift_mel=state.hift_mel,
                     speech_offset=state.speech_offset,
                     finalize=False,
@@ -414,6 +448,58 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 else:
                     state.ready_since = None
             return decoded
+
+    def hop_input(self, state: CosyVoice3StreamState) -> FlowBatchInput:
+        return FlowBatchInput(
+            token=torch.tensor(
+                state.tokens[: state.token_offset + state.hop_len + PRE_LOOKAHEAD_LEN],
+                dtype=torch.int32,
+            ).unsqueeze(0),
+            prompt_token=state.prompt_token,
+            prompt_feat=state.prompt_feat,
+            embedding=state.embedding,
+        )
+
+    def split_hop_participants(
+        self, participants: list[tuple[str, CosyVoice3StreamState]]
+    ) -> tuple[
+        list[tuple[str, CosyVoice3StreamState]],
+        list[tuple[str, CosyVoice3StreamState]],
+    ]:
+        """Rows the K/V pool holds slots for, and rows that recompute their
+        whole prefix. A stream starts caching at its first hop or never: the
+        frames of a hop it ran without the cache were not stored. A stream the
+        pool cannot grow gives its slots back and stays uncached.
+        """
+        cache = self.vocoder.flow_hop_cache
+        cached: list[tuple[str, CosyVoice3StreamState]] = []
+        plain: list[tuple[str, CosyVoice3StreamState]] = []
+        for request_id, state in participants:
+            if cache is None or (state.flow_cache is None and state.token_offset):
+                plain.append((request_id, state))
+                continue
+            if state.flow_cache is None:
+                state.flow_cache = cache.open_stream()
+            end = (
+                int(state.prompt_feat.shape[1])
+                + (state.token_offset + state.hop_len) * TOKEN_MEL_RATIO
+            )
+            if state.flow_cache is not None and cache.reserve(state.flow_cache, end):
+                cached.append((request_id, state))
+            else:
+                self.release_flow_cache(state)
+                cache.fallback_hops += 1
+                logger.info(
+                    f"Fun-CosyVoice3 hop K/V cache is full: {request_id} recomputes "
+                    f"its prefix from here (fallbacks={cache.fallback_hops})"
+                )
+                plain.append((request_id, state))
+        return cached, plain
+
+    def release_flow_cache(self, state: CosyVoice3StreamState) -> None:
+        if state.flow_cache is not None:
+            self.vocoder.flow_hop_cache.release(state.flow_cache)
+            state.flow_cache = None
 
     def decode_delta(
         self,
@@ -487,6 +573,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self, request_id: str, state: CosyVoice3StreamState
     ) -> None:
         state.tokens.clear()
+        self.release_flow_cache(state)
         state.hift_mel = None
         state.prompt_token = None
         state.prompt_feat = None
