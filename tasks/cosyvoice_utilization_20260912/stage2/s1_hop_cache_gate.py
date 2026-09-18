@@ -135,9 +135,12 @@ def main() -> None:
         plan.append(participants)
 
     budget = int(sum(final_frames) * BYTES_PER_FRAME * 1.1)
+    # The factory takes the device type and the card index apart.
+    device_type, _, card = args.device.partition(":")
     scheduler = create_vocoder_executor(
         args.model,
-        device=args.device,
+        device=device_type,
+        gpu_id=int(card or 0),
         enable_flow_cuda_graph=False,
         flow_kv_cache_bytes=budget,
     )
