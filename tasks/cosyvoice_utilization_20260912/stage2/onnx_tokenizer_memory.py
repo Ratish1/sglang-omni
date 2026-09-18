@@ -79,10 +79,27 @@ def run_together(tokenizer: SpeechTokenizerV3, threads: int, seconds: float) -> 
     return len(names)
 
 
+class SerialSession:
+    """The session with one run in flight at a time, whoever calls."""
+
+    def __init__(self, session: onnxruntime.InferenceSession) -> None:
+        self.session = session
+        self.lock = threading.Lock()
+
+    def get_inputs(self):
+        return self.session.get_inputs()
+
+    def run(self, *args):
+        with self.lock:
+            return self.session.run(*args)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--onnx", required=True)
     parser.add_argument("--option", action="append", default=[])
+    parser.add_argument("--serial", action="store_true")
+    parser.add_argument("--warm-first", action="store_true")
     args = parser.parse_args()
     options = dict(item.split("=", 1) for item in args.option)
 
@@ -96,7 +113,15 @@ def main() -> None:
         started = time.monotonic()
 
     tokenizer = build(args.onnx, options)
+    if args.serial:
+        tokenizer.session = SerialSession(tokenizer.session)
     mark("session built")
+
+    if args.warm_first:
+        # What a server would do before the pool is sized: the longest run
+        # the tokenizer accepts, once, on the building thread.
+        tokenizer.extract_speech_token(audio(30, 9), SAMPLE_RATE)
+        mark("warm run, 30 s, main thread")
 
     tokenizer.extract_speech_token(audio(3, 0), SAMPLE_RATE)
     mark("first run, 3 s, main thread")
@@ -130,6 +155,8 @@ def main() -> None:
         "torch": torch.__version__,
         "device": torch.cuda.get_device_name(),
         "options": options,
+        "serial": args.serial,
+        "warm_first": args.warm_first,
         "rows": [
             {
                 "step": step,
