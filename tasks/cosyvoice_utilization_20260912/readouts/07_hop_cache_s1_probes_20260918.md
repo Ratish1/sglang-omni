@@ -175,6 +175,30 @@ with 60 % of rows cached, and continuity is better on every boot (c50 40 to 49 a
 20 x text bound (`request_builders.py:785-798`), so it runs to 82 s. The runner sets nothing
 beyond model, dataset, concurrency and streaming. The PR body carries the c8 pair only.
 
+## 4e. c16 with `max_new_tokens` left unset (raw: `s1-r14`)
+
+Branch only, memory fraction 0.28, same cache, the runbook's `MAX_NEW_TOKENS=unset` (the client
+sends no limit, the engine applies 20 tokens per text token).
+
+| | cap 2048, three boots | unset |
+|---|---|---|
+| requests of 80 s or more | 3, 2, 4 | 0 (longest audio 10.0 s) |
+| req/s | 2.997, 3.055, 2.871 | 3.749 |
+| audio s/s | 15.03, 14.85, 14.42 | 17.41 |
+| RTF mean | 1.152, 1.169, 1.212 | 0.967 |
+| latency mean / p95 | 5.23 / 7.45, 5.22 / 7.85, 5.55 / 8.77 s | 4.25 / 5.80 s |
+| TTFP mean / p95 | 2.52 / 3.77, 2.65 / 3.86, 2.84 / 4.95 s | 1.99 / 2.80 s |
+| underrun mean | 0.489, 0.422, 0.548 s | 0.269 s |
+| c50 / c100 / c200 | 40 to 49 / 43 to 51 / 48 to 54 | 55.2 / 58.7 / 61.1 |
+| cached rows, fallbacks | 59 to 60 %, 479 to 494 | 60.7 %, 485 |
+| peak card memory | 23,766 to 24,082 MiB | 22,066 MiB |
+| failed | 0 | 0 |
+
+The two to four runaways of a boot cost this tree about a fifth of its c16 throughput and set
+its memory peak (their finals). No main boot exists under the same rule, so this row compares
+with nothing on main. The pool still covers only 61 % of rows, so c16 on this card stays a
+memory question with or without runaways.
+
 ## 5. Owed before S1 can be a PR
 
 1. The append change of section 3, then the first hop against main again.
