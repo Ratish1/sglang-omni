@@ -291,6 +291,10 @@ class ProfilerStartMessage:
     trace_path_template: str  # e.g. "/tmp/profiles/{run_id}/{stage}/trace"
     event_dir: str | None = None  # Per-stage JSONL event sink dir for request profiling
     enable_torch: bool = True  # When False, only request-level events are captured
+    num_steps: int | None = None  # Forwards of step_stage to capture, then stop
+    step_stage: str | None = None
+    with_stack: bool | None = None  # None falls back to the env var
+    record_shapes: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -299,6 +303,10 @@ class ProfilerStartMessage:
             "trace_path_template": self.trace_path_template,
             "event_dir": self.event_dir,
             "enable_torch": self.enable_torch,
+            "num_steps": self.num_steps,
+            "step_stage": self.step_stage,
+            "with_stack": self.with_stack,
+            "record_shapes": self.record_shapes,
         }
 
     @classmethod
@@ -308,6 +316,10 @@ class ProfilerStartMessage:
             trace_path_template=d["trace_path_template"],
             event_dir=d.get("event_dir"),
             enable_torch=bool(d.get("enable_torch", True)),
+            num_steps=d.get("num_steps"),
+            step_stage=d.get("step_stage"),
+            with_stack=d.get("with_stack"),
+            record_shapes=d.get("record_shapes"),
         )
 
 

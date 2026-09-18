@@ -37,7 +37,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, PositiveInt
 
 from sglang_omni.client import Client
 from sglang_omni.config import PipelineConfig
@@ -242,6 +242,10 @@ class StartReq(BaseModel):
     config: dict[str, Any] | None = None
     event_dir: str | None = None
     enable_torch: bool = True
+    num_steps: PositiveInt | None = None
+    step_stage: str | None = None
+    with_stack: bool | None = None
+    record_shapes: bool | None = None
 
 
 class StopReq(BaseModel):
@@ -264,6 +268,13 @@ def mount_profiler_routes(
 
     @router.post("/start_profile")
     async def start(req: StartReq):
+        if req.num_steps is not None and (
+            req.step_stage is None or not req.enable_torch
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="num_steps needs step_stage and enable_torch=true",
+            )
         run_id = req.run_id or default_run_id()
         event_dir = req.event_dir
         if event_dir is None and profiler_dir is not None:
@@ -307,12 +318,18 @@ def mount_profiler_routes(
             config=req.config,
             event_dir=event_dir,
             enable_torch=req.enable_torch,
+            num_steps=req.num_steps,
+            step_stage=req.step_stage,
+            with_stack=req.with_stack,
+            record_shapes=req.record_shapes,
         )
         return {
             "run_id": run_id,
             "trace_path_template": tpl,
             "event_dir": event_dir,
             "enable_torch": req.enable_torch,
+            "num_steps": req.num_steps,
+            "step_stage": req.step_stage,
         }
 
     @router.post("/start_request_profile")
