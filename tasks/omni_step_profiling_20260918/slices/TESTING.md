@@ -187,7 +187,22 @@ send the last 80 lines of its serve.log and go on to the next boot. Return per b
 empty, and `ls -la` of the boot dir; for nsys also `c6_probe.log`, `nsys_start.log`,
 `stats.log`. The planner reads the ledgers and traces from the copy.
 
-## 7. Later runs
+## 7. Run 08: V-e6, the revised vocoder chain (no server; after run 07)
+
+Exports as run 03 (`W` is `.tmp/wt/step-prof`, the base tree) with
+`OUT=/workspace/sglang-omni/.tmp/omni_step_profiling/run08`; `mkdir -p $OUT`;
+`md5sum $S/vocoder_chain_bench.py $S/vocoder_resident_bench.py
+$S/vocoder_attribution_bench.py > $OUT/md5.txt`. From `cd $W` with
+`CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$W`, one at a time:
+
+| # | command | output | expected |
+| --- | --- | --- | --- |
+| a | `python $S/vocoder_chain_bench.py sweep --model $MODEL --depthwise resident` | `$OUT/ve6_sweep_dw_resident.txt` | 20 to 40 min |
+| b | `python $S/vocoder_chain_bench.py sweep --model $MODEL --depthwise ncl` | `$OUT/ve6_sweep_dw_ncl.txt` | 20 to 40 min |
+| c | `python $S/vocoder_chain_bench.py split --model $MODEL --depthwise resident` | `$OUT/ve6_split.txt` | under 15 min |
+| d | `python $S/vocoder_chain_bench.py numerics --model $MODEL --depthwise resident` | `$OUT/ve6_numerics.txt` | 10 to 30 min |
+
+## 8. Later runs
 
 The matrix A/B runbook (section 2 of 00_PRINCIPLES_AND_AUDIT.md) is added here once
 P1-e1 passes; it is checked against both branch heads before the box runs it.
