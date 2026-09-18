@@ -85,6 +85,7 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
 
     assert vocoder.factory.model_extra == {
         "flow_batch_admission_frames": 4000,
+        "flow_kv_cache_bytes": 0,
         "flow_merge_max_gap_frames": 40,
         "flow_merge_pad_budget_percent": 3,
         "flow_cuda_graph_capture_shapes": [[1, 496], [5, 544], [7, 576]],
