@@ -152,6 +152,47 @@ def fixed_tiles(width: int):
     return layout
 
 
+def gather_tables(rows: PackedRows, gap: int, tiles: int, device: torch.device):
+    """Index tables for the conv as gathers, built once per Flow call. The
+    sequence is laid out with gap zero frames before each row and cut into
+    equal tiles, each read with the gap frames before it. first[t, j] is the
+    packed frame a tile position reads, second[t, j] the first conv's output it
+    reads, frames the second conv's output of every packed frame; anything that
+    is not a frame reads the zero row appended to the source."""
+    total = rows.total
+    spaced = torch.arange(total, device=device) + gap * (rows.row_ids + 1)
+    width = -(-(total + gap * len(rows.lengths)) // tiles)
+    length = tiles * width
+    packed_at = torch.full((length + gap,), total, device=device)
+    packed_at[spaced + gap] = torch.arange(total, device=device)
+    output_at = torch.full((length + gap,), length, device=device)
+    output_at[spaced + gap] = spaced
+    return (
+        packed_at.unfold(0, width + gap, width).contiguous(),
+        output_at.unfold(0, width + gap, width).contiguous(),
+        spaced,
+    )
+
+
+def gathered(embed, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
+    gap = embed.kernel_size - 1
+    key = (id(rows), "gathered")
+    if key not in STEP_INVARIANT:
+        STEP_INVARIANT[key] = gather_tables(rows, gap, len(rows.lengths), h.device)
+    first, second, frames = STEP_INVARIANT[key]
+    tiles, width = first.shape[0], first.shape[1] - gap
+    channels = h.shape[2]
+    source = h.new_empty(h.shape[1] + 1, channels)
+    source[:-1] = h[0]
+    source[-1] = 0
+    out = embed.conv1(source[first].transpose(1, 2))
+    source = h.new_empty(tiles * width + 1, channels)
+    source[:-1].view(tiles, width, channels).copy_(out.transpose(1, 2))
+    source[-1] = 0
+    out = embed.conv2(source[second].transpose(1, 2))
+    return out.transpose(1, 2).reshape(tiles * width, channels)[frames].unsqueeze(0)
+
+
 def snr_db(reference: torch.Tensor, other: torch.Tensor) -> float:
     noise = (reference.double() - other.double()).pow(2).sum()
     if noise == 0:
@@ -165,24 +206,15 @@ def main() -> None:
     args = parser.parse_args()
     flow, _ = load_cosyvoice3_flow_hift(args.model, device="cuda:0")
     embed = flow.decoder.estimator.input_embed.conv_pos_embed
-    parser_layouts = {
+    # Measured and dropped: fixed tile widths of 250 to 2,000 cost the same as
+    # equal tiles, and cudnn.flags(benchmark=True) made every layout 2 to 4
+    # times slower (artifacts .../convlayouts3-20260918).
+    layouts = {
+        "padded": padded,
         "padded_once": padded_once,
         "tiled_once": tiled_once,
-        "fixed_250": fixed_tiles(250),
-        "fixed_500": fixed_tiles(500),
-        "fixed_1000": fixed_tiles(1000),
-        "fixed_2000": fixed_tiles(2000),
+        "gathered": gathered,
     }
-    layouts = dict(parser_layouts)
-    # The same layouts again with cuDNN choosing its algorithm by measurement
-    # instead of by heuristic; the five warmup calls absorb the search.
-    for key, layout in parser_layouts.items():
-
-        def searched(embed, h, rows, layout=layout):
-            with torch.backends.cudnn.flags(benchmark=True):
-                return layout(embed, h, rows)
-
-        layouts[f"{key}+search"] = searched
 
     report = []
     for name, lengths in SHAPES.items():
