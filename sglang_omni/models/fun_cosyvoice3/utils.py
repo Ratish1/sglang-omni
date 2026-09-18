@@ -4,10 +4,14 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Callable
 
 import numpy as np
 import torch
+
+SPEECH_TOKENIZER_SAMPLE_RATE = 16000
+SPEECH_TOKENIZER_MAX_SECONDS = 30
 
 
 class CosyVoice3Tokenizer:
@@ -56,9 +60,17 @@ class SpeechTokenizerV3:
 
         # note (db-ol): the cuDNN conv plan is rebuilt whenever the input shape differs
         # from the previous call, and the default search setting makes rebuilds slow.
+        # note(ratish): one stream for every thread, or each calling thread
+        # creates its own stream and handles after the KV pool is sized.
         providers = (
             [
-                ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
+                (
+                    "CUDAExecutionProvider",
+                    {
+                        "cudnn_conv_algo_search": "HEURISTIC",
+                        "use_ep_level_unified_stream": "1",
+                    },
+                ),
                 "CPUExecutionProvider",
             ]
             if device.startswith("cuda")
@@ -68,6 +80,9 @@ class SpeechTokenizerV3:
             model_path, sess_options=option, providers=providers
         )
         self.device = device
+        # note(ratish): concurrent runs each hold their own activations and
+        # measured slower than the same runs one after the other.
+        self.run_lock = threading.Lock()
 
     def extract_speech_token(
         self, audio: np.ndarray, sample_rate: int = 16000
@@ -82,20 +97,23 @@ class SpeechTokenizerV3:
         if audio.ndim == 1:
             audio = audio.reshape(1, -1)
 
-        if audio.shape[1] / sample_rate > 30:
+        if audio.shape[1] / sample_rate > SPEECH_TOKENIZER_MAX_SECONDS:
             raise ValueError(
                 "Audio longer than 30s is not supported for speech token extraction"
             )
 
         feat = whisper.log_mel_spectrogram(torch.from_numpy(audio), n_mels=128)
         feat_len = feat.shape[2]
-        result = self.session.run(
-            None,
-            {
-                self.session.get_inputs()[0].name: feat.detach().cpu().numpy(),
-                self.session.get_inputs()[1].name: np.array([feat_len], dtype=np.int32),
-            },
-        )[0]
+        with self.run_lock:
+            result = self.session.run(
+                None,
+                {
+                    self.session.get_inputs()[0].name: feat.detach().cpu().numpy(),
+                    self.session.get_inputs()[1].name: np.array(
+                        [feat_len], dtype=np.int32
+                    ),
+                },
+            )[0]
         return torch.tensor([result.flatten().tolist()], dtype=torch.int32)
 
 
