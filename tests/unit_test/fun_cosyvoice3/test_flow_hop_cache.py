@@ -110,7 +110,7 @@ def test_a_new_stream_starts_from_the_conv_left_padding() -> None:
     assert not cache.conv_tails[:, :, reopened.lanes].any()
 
 
-def test_a_follow_up_hop_reads_its_prefix_and_writes_only_its_new_frames() -> None:
+def test_a_follow_up_hop_appends_each_chunk_after_the_frames_its_lane_holds() -> None:
     cache = _cache(800)
     first, second = cache.open_stream(), cache.open_stream()
     cache.reserve(first, 100)
@@ -130,15 +130,13 @@ def test_a_follow_up_hop_reads_its_prefix_and_writes_only_its_new_frames() -> No
     ]
     assert hop.lengths.tolist() == [100, 50, 100, 50]
     assert hop.positions.tolist() == (list(range(100, 200)) + list(range(50, 100))) * 2
-    assert hop.cache_seqlens.tolist() == [150, 200, 100, 150, 200, 100]
+    assert hop.cache_seqlens.tolist() == [100, 150, 50, 100, 150, 50]
     assert hop.cu_seqlens_q.tolist() == [0, 50, 100, 150, 200, 250, 300]
     assert hop.max_seqlen_q == 50
     assert hop.max_end == 200
     assert torch.equal(hop.page_table[0], table[first.lanes[0], :200])
     assert torch.equal(hop.page_table[2], table[second.lanes[0], :200])
     assert torch.equal(hop.page_table[5], table[second.lanes[1], :200])
-    assert torch.equal(hop.slots[:100], table[first.lanes[0], 100:200].to(torch.int64))
-    assert torch.equal(hop.slots[250:], table[second.lanes[1], 50:100].to(torch.int64))
 
 
 def _scheduler(

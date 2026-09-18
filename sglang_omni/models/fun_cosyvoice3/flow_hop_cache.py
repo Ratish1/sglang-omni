@@ -44,13 +44,13 @@ class StreamHopCache:
 
 @dataclass
 class CachedHop:
-    """One hop's new frames in packed lane major order: where their K and V go,
-    what each (row, chunk) query segment reads, and the row attention itself."""
+    """One hop's new frames in packed lane major order: the (row, chunk) query
+    segments, the frames each one's lane holds before it, and the row attention
+    itself."""
 
     cache: "FlowHopCache"
     lanes: torch.Tensor
     lengths: torch.Tensor
-    slots: torch.Tensor
     positions: torch.Tensor
     max_end: int
     page_table: torch.Tensor
@@ -66,21 +66,20 @@ class CachedHop:
         same shape. Each call is the next (Euler step, block) pool layer."""
         cache = self.cache
         shape = (-1, cache.heads, cache.head_dim)
-        cache.pool.set_kv_buffer(
-            None,
-            self.slots,
-            key[0].reshape(shape),
-            value[0].reshape(shape),
-            layer_id_override=self.layer,
-        )
-        page_shape = (-1, FA3_PAGE_SIZE, cache.heads, cache.head_dim)
+        k_pages, v_pages = cache.pages[self.layer]
+        # note(ratish): FA3 appends each segment's K and V at cache_seqlens
+        # through the page table, then attends; a row's later chunk reads what
+        # its earlier chunk appended in the same call.
         out = flash_attn_with_kvcache(
             q=query[0].reshape(shape),
-            k_cache=cache.pool.get_key_buffer(self.layer).view(page_shape),
-            v_cache=cache.pool.get_value_buffer(self.layer).view(page_shape),
+            k_cache=k_pages,
+            v_cache=v_pages,
+            k=key[0].reshape(shape),
+            v=value[0].reshape(shape),
             cache_seqlens=self.cache_seqlens,
             page_table=self.page_table,
             cu_seqlens_q=self.cu_seqlens_q,
+            cu_seqlens_k_new=self.cu_seqlens_q,
             max_seqlen_q=self.max_seqlen_q,
             causal=False,
         )
@@ -143,6 +142,14 @@ class FlowHopCache:
         self.allocator = TokenToKVPoolAllocator(
             self.slots, dtype, str(self.device), self.pool, need_sort=False
         )
+        page_shape = (-1, FA3_PAGE_SIZE, heads, head_dim)
+        self.pages = [
+            (
+                self.pool.get_key_buffer(layer).view(page_shape),
+                self.pool.get_value_buffer(layer).view(page_shape),
+            )
+            for layer in range(layers)
+        ]
         self.rows = ReqToTokenPool(
             size=row_count,
             max_context_len=max_frames,
@@ -208,9 +215,6 @@ class FlowHopCache:
             cache=self,
             lanes=lanes,
             lengths=torch.tensor(rows.lengths, device=self.device),
-            slots=self.rows.req_to_token[lanes[rows.row_ids], positions].to(
-                torch.int64
-            ),
             positions=positions,
             max_end=max_end,
             page_table=self.rows.req_to_token[
@@ -218,8 +222,10 @@ class FlowHopCache:
             ],
             cache_seqlens=torch.tensor(
                 [
-                    spans[row][0] + end
-                    for row, end in zip(segment_rows, segment_ends, strict=True)
+                    spans[row][0] + end - (after - before)
+                    for row, end, (before, after) in zip(
+                        segment_rows, segment_ends, pairwise(offsets), strict=True
+                    )
                 ],
                 **as_int32,
             ),
