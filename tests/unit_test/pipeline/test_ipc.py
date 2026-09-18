@@ -611,6 +611,61 @@ def test_start_profile_torch_mode_still_requires_trace_template() -> None:
     assert "trace_path_template is required" in resp.json()["detail"]
 
 
+def test_start_profile_step_window_needs_a_stage_and_reaches_every_stage(
+    tmp_path: Path,
+) -> None:
+    from sglang_omni.serve import launcher
+
+    class FakeProfilerControl:
+        def __init__(self) -> None:
+            self.starts: list[dict] = []
+
+        async def broadcast_start(self, **kwargs) -> None:
+            self.starts.append(kwargs)
+
+    app = FastAPI()
+    ctl = FakeProfilerControl()
+    launcher._mount_profiler_routes(app, ctl, profiler_dir=str(tmp_path))
+
+    try:
+        with TestClient(app) as client:
+            no_stage = client.post("/start_profile", json={"num_steps": 5})
+            no_torch = client.post(
+                "/start_profile",
+                json={
+                    "num_steps": 5,
+                    "step_stage": "tts_engine",
+                    "enable_torch": False,
+                },
+            )
+            zero = client.post(
+                "/start_profile", json={"num_steps": 0, "step_stage": "tts_engine"}
+            )
+            armed = client.post(
+                "/start_profile",
+                json={
+                    "num_steps": 5,
+                    "step_stage": "tts_engine",
+                    "with_stack": True,
+                },
+            )
+        assert no_stage.status_code == 400
+        assert no_torch.status_code == 400
+        assert zero.status_code == 422
+        assert armed.status_code == 200
+        assert armed.json()["num_steps"] == 5
+        assert len(ctl.starts) == 1
+        start = ctl.starts[0]
+        assert start["num_steps"] == 5
+        assert start["step_stage"] == "tts_engine"
+        assert start["with_stack"] is True
+        assert start["record_shapes"] is None
+    finally:
+        rec = get_recorder()
+        if rec.is_active():
+            rec.stop()
+
+
 @pytest.mark.asyncio
 async def test_launcher_stops_runner_when_server_raises(
     tmp_path: Path,

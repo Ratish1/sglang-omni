@@ -46,6 +46,10 @@ class ProfilerControlClient:
         stages: list[str] | None = None,
         event_dir: str | None = None,
         enable_torch: bool = True,
+        num_steps: int | None = None,
+        step_stage: str | None = None,
+        with_stack: bool | None = None,
+        record_shapes: bool | None = None,
     ) -> None:
         await self.start()
         assert self._socks is not None
@@ -55,6 +59,10 @@ class ProfilerControlClient:
             trace_path_template=trace_path_template,
             event_dir=event_dir,
             enable_torch=enable_torch,
+            num_steps=num_steps,
+            step_stage=step_stage,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
         )
         for s in targets:
             sock = self._socks.get(s)

@@ -35,6 +35,7 @@ from sglang_omni.profiler.comm_trace import emit as _comm_trace
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
 from sglang_omni.profiler.event_recorder import set_active_stage as _set_active_stage
+from sglang_omni.profiler.torch_profiler import StepWindow
 from sglang_omni.proto import (
     AdminMessage,
     AdminResult,
@@ -1888,13 +1889,36 @@ class Stage:
 
     def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id
-        if msg.enable_torch and not TorchProfiler.is_active():
+        if msg.enable_torch:
             base_tpl = msg.trace_path_template.format(run_id=run_id, stage=self.name)
             template = f"{base_tpl}_pid{os.getpid()}"
             prof_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
             if prof_dir and not os.path.isabs(template):
                 template = os.path.join(prof_dir, template)
-            TorchProfiler.start(template, run_id=run_id)
+            if msg.num_steps is not None:
+                if msg.step_stage == self.name:
+                    TorchProfiler.arm_step_window(
+                        StepWindow(
+                            counter=self.scheduler,
+                            trace_path_template=template,
+                            run_id=run_id,
+                            num_steps=msg.num_steps,
+                            with_stack=msg.with_stack,
+                            record_shapes=msg.record_shapes,
+                        )
+                    )
+                    logger.info(
+                        "Torch profiler armed for %d forwards of stage %s",
+                        msg.num_steps,
+                        self.name,
+                    )
+            elif not TorchProfiler.is_active():
+                TorchProfiler.start(
+                    template,
+                    run_id=run_id,
+                    with_stack=msg.with_stack,
+                    record_shapes=msg.record_shapes,
+                )
         if msg.event_dir is not None:
             try:
                 _get_recorder().start(
@@ -1909,10 +1933,7 @@ class Stage:
 
     def _on_profiler_stop(self, msg: ProfilerStopMessage) -> None:
         # run_id=None is a wildcard (stop whatever's active).
-        if TorchProfiler.is_active() and (
-            msg.run_id is None or TorchProfiler.get_active_run_id() == msg.run_id
-        ):
-            TorchProfiler.stop(run_id=msg.run_id)
+        TorchProfiler.stop(run_id=msg.run_id)
         recorder = _get_recorder()
         if recorder.is_active() and (
             msg.run_id is None or recorder.active_run_id() == msg.run_id
