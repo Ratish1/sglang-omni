@@ -153,6 +153,28 @@ lowest that still boots beside the cache (AR pool 14,335 tokens, no retraction);
 - Lowering the memory fraction frees nothing for the cache on this card: the AR pool was already
   0.32 GB at 0.3 and the card peaks within 0.5 GB of full.
 
+## 4d. Third c16 boot, and what the five boots say together (raw: `s1-r13`)
+
+Cache boot 3, memory fraction 0.28, same cache: 4 runaways, 2.871 req/s, 14.42 audio s/s,
+latency mean 5.55 s, TTFP mean 2.84 s, c50 48.6, c100 49.5, c200 52.4, 0 failed, 59.5 % of rows
+cached, 479 fallbacks, peak 24,056 MiB.
+
+c16 req/s ordered by runaway count, all five boots:
+
+| runaways | 1 | 2 | 3 | 3 | 4 |
+|---|---|---|---|---|---|
+| tree | main | cache | main | cache | cache |
+| req/s | 3.301 | 3.055 | 2.939 | 2.997 | 2.871 |
+| c50 | 22.6 | 47.7 | 10.7 | 40.3 | 48.6 |
+
+Throughput follows the runaway count on one line for both trees, and at the one count both
+trees drew (3) the cache is +2.0 %. So at c16 on this card the cache is throughput neutral,
+with 60 % of rows cached, and continuity is better on every boot (c50 40 to 49 against 11 to
+23). A runaway is the AR model never sampling its stop token; the benchmark's default
+`max_new_tokens=2048` (`benchmarks/eval/benchmark_tts_seedtts.py:195`) overrides the engine's
+20 x text bound (`request_builders.py:785-798`), so it runs to 82 s. The runner sets nothing
+beyond model, dataset, concurrency and streaming. The PR body carries the c8 pair only.
+
 ## 5. Owed before S1 can be a PR
 
 1. The append change of section 3, then the first hop against main again.
