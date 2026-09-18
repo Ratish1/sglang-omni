@@ -96,6 +96,7 @@ def main() -> None:
         help="after this step's timed calls, run one production and one cached "
         "call under torch.profiler and write their op tables",
     )
+    parser.add_argument("--production-alone", action="store_true")
     parser.add_argument(
         "--cached-conv-float32",
         action="store_true",
@@ -307,6 +308,15 @@ def main() -> None:
                 record["cached_vs_truth_db"] = compare(
                     cached[row].float().cpu(), reference
                 )["snr_db"]
+                if args.production_alone:
+                    # Control: main's own hop on this row alone. If a smaller
+                    # batch moves main as far from the truth as the cached path
+                    # sits, the distance belongs to the batch, not the cache.
+                    alone = vocoder.hop_batch([items[row]])[0]
+                    record["production_alone_vs_truth_db"] = compare(
+                        alone[:, :, offset * TOKEN_MEL_RATIO :].float().cpu(),
+                        reference,
+                    )["snr_db"]
             hops.append(record)
         steps_detail.append(
             {
