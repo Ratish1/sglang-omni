@@ -1030,6 +1030,53 @@ def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
     assert seen == {"speech_tokenizer": 6, "speaker_encoder": 6}
 
 
+@pytest.mark.parametrize(("device", "expected_runs"), [("cuda:0", 1), ("cpu", 0)])
+def test_cuda_speech_tokenizer_runs_its_longest_input_before_the_memory_pool(
+    monkeypatch, device: str, expected_runs: int
+) -> None:
+    from sglang_omni.models.fun_cosyvoice3 import engine_builder, request_builders
+
+    events: list[tuple[str, int, int]] = []
+
+    class _RecordingTokenizer:
+        def __init__(self, model_path, device="cpu", intra_op_threads=1):
+            pass
+
+        def extract_speech_token(self, audio, sample_rate):
+            events.append(("run", audio.shape[0], sample_rate))
+
+    class _StubModel:
+        def load_weights(self, weights) -> None:
+            pass
+
+    monkeypatch.setattr(engine_builder, "SpeechTokenizerV3", _RecordingTokenizer)
+    monkeypatch.setattr(engine_builder, "SpeakerEncoder", lambda *a, **k: object())
+    monkeypatch.setattr(engine_builder, "CosyVoice3Tokenizer", lambda path: object())
+    monkeypatch.setattr(engine_builder.torch, "load", lambda *a, **k: {})
+    monkeypatch.setattr(
+        request_builders,
+        "set_cosyvoice3_preprocessing_context",
+        lambda **kwargs: events.append(("context", 0, 0)),
+    )
+
+    builder = engine_builder.FunCosyVoice3EngineBuilder()
+    builder._checkpoint_root = "/tmp"
+    builder.before_memory_pool(
+        model_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=_StubModel(),
+                model_config=SimpleNamespace(vocab_size=0),
+            )
+        ),
+        checkpoint_dir="/tmp",
+        device=device,
+        gpu_id=0,
+        server_args=object(),
+    )
+
+    assert events == [("run", 30 * 16000, 16000)] * expected_runs + [("context", 0, 0)]
+
+
 def test_create_vocoder_executor_rejects_non_positive_admission_budget(
     monkeypatch,
 ) -> None:

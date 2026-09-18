@@ -8,11 +8,14 @@ import logging
 import os
 from typing import Any
 
+import numpy as np
 import torch
 
 from sglang_omni.models.fun_cosyvoice3 import request_builders
 from sglang_omni.models.fun_cosyvoice3.streaming import TOKEN_HOP_LEN
 from sglang_omni.models.fun_cosyvoice3.utils import (
+    SPEECH_TOKENIZER_MAX_SECONDS,
+    SPEECH_TOKENIZER_SAMPLE_RATE,
     CosyVoice3Tokenizer,
     SpeakerEncoder,
     SpeechTokenizerV3,
@@ -166,6 +169,16 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
             device=device,
             intra_op_threads=self._onnx_intra_op_threads,
         )
+        if device.startswith("cuda"):
+            # note(ratish): the session allocates on its first run, so run its
+            # longest input now, before sglang reads free memory for the KV pool.
+            speech_tokenizer.extract_speech_token(
+                np.zeros(
+                    SPEECH_TOKENIZER_MAX_SECONDS * SPEECH_TOKENIZER_SAMPLE_RATE,
+                    dtype=np.float32,
+                ),
+                SPEECH_TOKENIZER_SAMPLE_RATE,
+            )
         speaker_encoder = SpeakerEncoder(
             campplus_path,
             device=device,

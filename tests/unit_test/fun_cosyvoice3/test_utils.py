@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -117,9 +120,63 @@ def test_cosyvoice3_reference_encoders_pin_onnx_providers(monkeypatch) -> None:
 
     assert captured == [
         [
-            ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
+            (
+                "CUDAExecutionProvider",
+                {
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "use_ep_level_unified_stream": "1",
+                },
+            ),
             "CPUExecutionProvider",
         ],
         ["CPUExecutionProvider"],
         ["CPUExecutionProvider"],
     ]
+
+
+def test_speech_tokenizer_runs_one_call_at_a_time(monkeypatch) -> None:
+    in_flight = 0
+    most_in_flight = 0
+    counter_lock = threading.Lock()
+
+    class _SlowSession:
+        def get_inputs(self):
+            return [
+                types.SimpleNamespace(name="feats"),
+                types.SimpleNamespace(name="len"),
+            ]
+
+        def run(self, outputs, feeds):
+            nonlocal in_flight, most_in_flight
+            with counter_lock:
+                in_flight += 1
+                most_in_flight = max(most_in_flight, in_flight)
+            time.sleep(0.02)
+            with counter_lock:
+                in_flight -= 1
+            return [np.arange(4, dtype=np.int64)]
+
+    fake_onnxruntime = types.SimpleNamespace(
+        SessionOptions=types.SimpleNamespace,
+        GraphOptimizationLevel=types.SimpleNamespace(ORT_ENABLE_ALL=99),
+        InferenceSession=lambda model_path, sess_options, providers: _SlowSession(),
+    )
+    fake_whisper = types.SimpleNamespace(
+        log_mel_spectrogram=lambda audio, n_mels: torch.zeros(1, n_mels, 8)
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnxruntime)
+    monkeypatch.setitem(sys.modules, "whisper", fake_whisper)
+    tokenizer = utils.SpeechTokenizerV3("speech_tokenizer_v3.onnx", device="cpu")
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        tokens = list(
+            pool.map(
+                lambda _: tokenizer.extract_speech_token(
+                    np.zeros(1600, dtype=np.float32), 16000
+                ),
+                range(8),
+            )
+        )
+
+    assert most_in_flight == 1
+    assert all(token.tolist() == [[0, 1, 2, 3]] for token in tokens)
