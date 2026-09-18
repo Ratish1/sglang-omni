@@ -301,13 +301,34 @@ if _has_triton_runtime():
         return scores, token_ids
 
     @triton.jit
+    def _seeded_gumbel_noise_kernel(
+        seeds,
+        positions,
+        out,
+        batch_size,
+        block_k: tl.constexpr,
+    ):
+        program = tl.program_id(0)
+        ranks = tl.arange(0, block_k)
+        seed = tl.load(seeds + program % batch_size).to(tl.uint64)
+        pos = tl.load(positions + program).to(tl.uint32)
+
+        h: tl.uint32 = 0
+        h = _murmur3_mix(h, (seed & 0xFFFFFFFF).to(tl.uint32))
+        h = _murmur3_mix(h, ((seed >> 32) & 0xFFFFFFFF).to(tl.uint32))
+        h = _murmur3_mix(h, pos)
+        h = _murmur3_mix(h, ranks.to(tl.uint32))
+        h ^= 16
+        h = _fmix32(h)
+        tl.store(out + program * block_k + ranks, _gumbel_from_hash(h))
+
+    @triton.jit
     def _seeded_top_k_top_p_sample_kernel(
         logits,
         temperatures,
         top_ks,
         top_ps,
-        seeds,
-        positions,
+        gumbel_noise,
         out,
         logits_stride_b: tl.constexpr,
         max_top_k: tl.constexpr,
@@ -420,19 +441,7 @@ if _has_triton_runtime():
 
         logprobs = tl.where(keep_top_k, tl.log(probs), -float("inf"))
 
-        seed = tl.load(seeds + row).to(tl.uint64)
-        pos = tl.load(positions + row).to(tl.uint32)
-        col = ranks.to(tl.uint32)
-
-        h: tl.uint32 = 0
-        h = _murmur3_mix(h, (seed & 0xFFFFFFFF).to(tl.uint32))
-        h = _murmur3_mix(h, ((seed >> 32) & 0xFFFFFFFF).to(tl.uint32))
-        h = _murmur3_mix(h, pos)
-        h = _murmur3_mix(h, col)
-        h ^= 16
-        h = _fmix32(h)
-
-        gumbel = _gumbel_from_hash(h)
+        gumbel = tl.load(gumbel_noise + row * block_k + ranks)
         sampled_scores = logprobs.to(tl.float64) + gumbel
         max_sampled_score = tl.max(sampled_scores, axis=0)
         candidates = tl.where(sampled_scores == max_sampled_score, ranks, block_k)
@@ -451,6 +460,7 @@ else:
     _seeded_gumbel_sample_sorted_kernel = None
     _bitonic_compare_selected_32_desc = None
     _bitonic_sort_selected_32_desc = None
+    _seeded_gumbel_noise_kernel = None
     _seeded_top_k_top_p_sample_kernel = None
 
 
@@ -630,20 +640,65 @@ def _fused_raw_logit_block_k(max_top_k: int) -> int | None:
     return _next_power_of_2(max_top_k)
 
 
+def seeded_gumbel_noise(
+    seeds: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    max_top_k: int,
+) -> torch.Tensor | None:
+    """The fused sampler's fp64 Gumbel noise for every (step, row), in one launch.
+
+    seeds is [B]; positions is [S, B] (or [B]). Returns [S, B, block_k] float64
+    (or [B, block_k]), or None where the fused sampler does not apply. The noise
+    depends only on seed, position and rank, so it is computed ahead of the
+    logits, once per step instead of once per warp inside the sampler.
+    """
+    block_k = _fused_raw_logit_block_k(int(max_top_k))
+    if (
+        _seeded_gumbel_noise_kernel is None
+        or block_k is None
+        or not seeds.is_cuda
+        or seeds.ndim != 1
+        or seeds.dtype is not torch.long
+        or positions.device != seeds.device
+        or positions.dtype is not torch.long
+        or positions.shape[-1] != seeds.shape[0]
+        or not seeds.is_contiguous()
+        or not positions.is_contiguous()
+    ):
+        return None
+    out = torch.empty(
+        (*positions.shape, block_k), device=seeds.device, dtype=torch.float64
+    )
+    if positions.numel() == 0:
+        return out
+    # note(ratish): one warp holds the whole rank vector, so no warp repeats
+    # another's fp64 work (block_k is at least 32).
+    _seeded_gumbel_noise_kernel[(positions.numel(),)](
+        seeds,
+        positions,
+        out,
+        int(seeds.shape[0]),
+        block_k,
+        num_warps=1,
+    )
+    return out
+
+
 def sample_from_logits_with_seed_top_k_top_p(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
-    seeds: torch.Tensor,
-    positions: torch.Tensor,
+    gumbel_noise: torch.Tensor,
     *,
     max_top_k: int,
     has_top_p: bool,
 ) -> torch.Tensor | None:
     """Fuse Qwen3-TTS's bounded seeded sampling path when its contract fits.
 
-    The caller owns the graph signature. This function deliberately returns
+    gumbel_noise is this step's [B, block_k] row of seeded_gumbel_noise. The
+    caller owns the graph signature. This function deliberately returns
     ``None`` for any unproven shape or layout so the production reference
     remains the fallback. It does not inspect device values because that would
     introduce a host synchronization during CUDA graph replay.
@@ -665,7 +720,7 @@ def sample_from_logits_with_seed_top_k_top_p(
     if batch_size == 0:
         return torch.empty((0,), device=logits.device, dtype=torch.long)
 
-    row_tensors = (temperatures, top_ks, top_ps, seeds, positions)
+    row_tensors = (temperatures, top_ks, top_ps)
     if any(
         tensor.device != logits.device
         or tensor.ndim != 1
@@ -678,8 +733,10 @@ def sample_from_logits_with_seed_top_k_top_p(
         temperatures.dtype is not torch.float32
         or top_ks.dtype is not torch.long
         or top_ps.dtype is not torch.float32
-        or seeds.dtype is not torch.long
-        or positions.dtype is not torch.long
+        or gumbel_noise.device != logits.device
+        or gumbel_noise.dtype is not torch.float64
+        or gumbel_noise.shape != (batch_size, block_k)
+        or not gumbel_noise.is_contiguous()
     ):
         return None
 
@@ -689,8 +746,7 @@ def sample_from_logits_with_seed_top_k_top_p(
         temperatures,
         top_ks,
         top_ps,
-        seeds,
-        positions,
+        gumbel_noise,
         out,
         logits.stride(0),
         int(max_top_k),

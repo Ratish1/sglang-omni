@@ -44,6 +44,7 @@ from sglang_omni.models.qwen3_tts.sampling_kernels import (
     sample_from_logits_with_seed_top_k_top_p,
     sample_from_logprobs_with_seed_npu,
     sample_from_sorted_logprobs_with_seed_small_k,
+    seeded_gumbel_noise,
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.vendor.sglang.core import ForwardBatch
@@ -1583,6 +1584,15 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 if self._sub_has_sampled_rows
                 else None
             )
+            sub_noise = (
+                seeded_gumbel_noise(
+                    self._sub_sampling_seed_tensor[:batch_size],
+                    sub_positions,
+                    max_top_k=int(self._sub_sampled_max_top_k),
+                )
+                if sub_positions is not None
+                else None
+            )
             for layer_idx in range(num_groups - 1):
                 logits, _ = self.code_predictor.lm_head[layer_idx](last_hidden)
                 next_code = self._sample_subtalker_token(
@@ -1590,6 +1600,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     sub_positions=(
                         None if sub_positions is None else sub_positions[layer_idx]
                     ),
+                    sub_noise=None if sub_noise is None else sub_noise[layer_idx],
                 )
                 pos_codes[:, layer_idx + 1].copy_(next_code)
                 codec_embedding = self.code_predictor.model.codec_embedding[layer_idx]
@@ -1656,6 +1667,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         logits: torch.Tensor,
         *,
         sub_positions: torch.Tensor | None,
+        sub_noise: torch.Tensor | None,
     ) -> torch.Tensor:
         if logits.shape[0] == 0:
             return torch.empty((0,), device=logits.device, dtype=torch.long)
@@ -1669,6 +1681,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         sampled_tokens = self._sample_subtalker_token_seeded(
             logits,
             sub_positions=sub_positions,
+            sub_noise=sub_noise,
         )
         if not self._sub_has_argmax_rows:
             return sampled_tokens
@@ -1684,6 +1697,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         logits: torch.Tensor,
         *,
         sub_positions: torch.Tensor,
+        sub_noise: torch.Tensor | None,
     ) -> torch.Tensor:
         batch_size = int(logits.shape[0])
         vocab_size = int(logits.shape[-1])
@@ -1694,14 +1708,13 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         max_top_k = int(self._sub_sampled_max_top_k)
         has_unbounded_top_k = bool(self._sub_sampled_has_unbounded_top_k)
 
-        if logits.is_cuda:
+        if sub_noise is not None:
             fused_sampled = sample_from_logits_with_seed_top_k_top_p(
                 logits,
                 temperatures,
                 top_ks,
                 top_ps,
-                seeds,
-                sub_positions,
+                sub_noise,
                 max_top_k=max_top_k,
                 has_top_p=bool(self._sub_sampled_has_top_p),
             )

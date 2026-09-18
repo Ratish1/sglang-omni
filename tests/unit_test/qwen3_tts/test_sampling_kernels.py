@@ -16,6 +16,7 @@ from sglang_omni.models.qwen3_tts import sglang_model as sglang_model_module
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
     sample_from_logits_with_seed_top_k_top_p,
     sample_from_sorted_logprobs_with_seed_small_k,
+    seeded_gumbel_noise,
 )
 from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
 
@@ -168,14 +169,55 @@ def test_fused_raw_logit_sampler_matches_reference_at_uint32_max_hash() -> None:
         temperatures,
         top_ks,
         top_ps,
-        seeds,
-        positions,
+        seeded_gumbel_noise(seeds, positions, max_top_k=max_top_k),
         max_top_k=max_top_k,
         has_top_p=False,
     )
 
     assert actual is not None
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "batch_size,max_top_k", [(1, 32), (3, 50), (16, 64), (2, 1024)]
+)
+def test_seeded_gumbel_noise_matches_the_seeded_hash_reference(
+    batch_size: int, max_top_k: int
+) -> None:
+    seeds = torch.arange(3, 3 + batch_size, device="cuda", dtype=torch.long) * 7919
+    positions = torch.arange(15 * batch_size, device="cuda", dtype=torch.long).view(
+        15, batch_size
+    )
+    block_k = sampling_kernels_module._fused_raw_logit_block_k(max_top_k)
+
+    noise = seeded_gumbel_noise(seeds, positions, max_top_k=max_top_k)
+
+    hashes = torch.stack(
+        [
+            murmur_hash32(
+                seeds.to(torch.uint64),
+                positions[step],
+                torch.arange(block_k, device="cuda"),
+            )
+            for step in range(15)
+        ]
+    )
+    uniform = hashes.to(torch.float64) / 4294967295.0
+    log_uniform = uniform.log().clamp(min=torch.finfo(torch.float64).min, max=-(2**-32))
+    assert noise.shape == (15, batch_size, block_k)
+    assert torch.equal(noise, -(-log_uniform).log())
+
+
+def test_seeded_gumbel_noise_rows_match_per_step_launches() -> None:
+    seeds = torch.tensor([5, 11, 17], device="cuda", dtype=torch.long)
+    positions = torch.arange(45, device="cuda", dtype=torch.long).view(15, 3) * 13
+
+    batched = seeded_gumbel_noise(seeds, positions, max_top_k=50)
+
+    for step in range(15):
+        assert torch.equal(
+            batched[step], seeded_gumbel_noise(seeds, positions[step], max_top_k=50)
+        )
 
 
 def test_seeded_small_k_sampler_falls_back_for_cpu() -> None:
@@ -223,9 +265,16 @@ def _production_seeded_tokens(
     layer_idx: int,
     semantic_positions: torch.Tensor,
 ) -> torch.Tensor:
+    sub_positions = talker._sub_seed_positions(semantic_positions)
+    sub_noise = seeded_gumbel_noise(
+        talker._sub_sampling_seed_tensor,
+        sub_positions,
+        max_top_k=talker._sub_sampled_max_top_k,
+    )
     return talker._sample_subtalker_token_seeded(
         logits,
-        sub_positions=talker._sub_seed_positions(semantic_positions)[layer_idx],
+        sub_positions=sub_positions[layer_idx],
+        sub_noise=None if sub_noise is None else sub_noise[layer_idx],
     )
 
 
@@ -266,8 +315,11 @@ def _fused_seeded_tokens(
         talker._sub_temperature_tensor,
         talker._sub_top_k_tensor,
         talker._sub_top_p_tensor,
-        talker._sub_sampling_seed_tensor,
-        sub_positions,
+        seeded_gumbel_noise(
+            talker._sub_sampling_seed_tensor,
+            sub_positions,
+            max_top_k=talker._sub_sampled_max_top_k,
+        ),
         max_top_k=talker._sub_sampled_max_top_k,
         has_top_p=talker._sub_sampled_has_top_p,
     )
@@ -604,8 +656,7 @@ def test_fused_raw_logit_sampler_falls_back_for_unproven_shapes() -> None:
     temperatures = torch.ones((1,), dtype=torch.float32)
     top_ks = torch.ones((1,), dtype=torch.long)
     top_ps = torch.ones((1,), dtype=torch.float32)
-    seeds = torch.ones((1,), dtype=torch.long)
-    positions = torch.zeros((1,), dtype=torch.long)
+    gumbel_noise = torch.zeros((1, 32), dtype=torch.float64)
 
     assert (
         sample_from_logits_with_seed_top_k_top_p(
@@ -613,8 +664,7 @@ def test_fused_raw_logit_sampler_falls_back_for_unproven_shapes() -> None:
             temperatures,
             top_ks,
             top_ps,
-            seeds,
-            positions,
+            gumbel_noise,
             max_top_k=32,
             has_top_p=False,
         )
@@ -627,8 +677,7 @@ def test_fused_raw_logit_sampler_falls_back_for_unsupported_cuda_inputs() -> Non
     temperatures = torch.ones((1,), device="cuda", dtype=torch.float32)
     top_ks = torch.ones((1,), device="cuda", dtype=torch.long)
     top_ps = torch.ones((1,), device="cuda", dtype=torch.float32)
-    seeds = torch.ones((1,), device="cuda", dtype=torch.long)
-    positions = torch.zeros((1,), device="cuda", dtype=torch.long)
+    gumbel_noise = torch.zeros((1, 32), device="cuda", dtype=torch.float64)
 
     assert (
         sample_from_logits_with_seed_top_k_top_p(
@@ -636,8 +685,7 @@ def test_fused_raw_logit_sampler_falls_back_for_unsupported_cuda_inputs() -> Non
             temperatures,
             top_ks,
             top_ps,
-            seeds,
-            positions,
+            gumbel_noise,
             max_top_k=1025,
             has_top_p=False,
         )
@@ -649,8 +697,7 @@ def test_fused_raw_logit_sampler_falls_back_for_unsupported_cuda_inputs() -> Non
             temperatures,
             top_ks,
             top_ps,
-            seeds,
-            positions,
+            gumbel_noise,
             max_top_k=32,
             has_top_p=False,
         )
@@ -665,8 +712,7 @@ def test_fused_raw_logit_sampler_falls_back_without_triton_gather(
     temperatures = torch.ones((1,), device="cuda", dtype=torch.float32)
     top_ks = torch.ones((1,), device="cuda", dtype=torch.long)
     top_ps = torch.ones((1,), device="cuda", dtype=torch.float32)
-    seeds = torch.ones((1,), device="cuda", dtype=torch.long)
-    positions = torch.zeros((1,), device="cuda", dtype=torch.long)
+    gumbel_noise = torch.zeros((1, 32), device="cuda", dtype=torch.float64)
     monkeypatch.setattr(sampling_kernels_module, "_TRITON_GATHER_SUPPORTED", False)
 
     assert (
@@ -675,8 +721,7 @@ def test_fused_raw_logit_sampler_falls_back_without_triton_gather(
             temperatures,
             top_ks,
             top_ps,
-            seeds,
-            positions,
+            gumbel_noise,
             max_top_k=32,
             has_top_p=False,
         )

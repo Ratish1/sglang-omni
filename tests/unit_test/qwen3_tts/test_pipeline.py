@@ -6711,6 +6711,7 @@ def test_qwen3_tts_prepare_decode_buffers_stages_the_temperature_floor(
         talker,
         logits,
         sub_positions=torch.arange(sampled_rows, dtype=torch.long),
+        sub_noise=None,
     )
 
     assert tokens.shape == (sampled_rows,)
@@ -6748,6 +6749,7 @@ def test_qwen3_tts_subtalker_sampling_batches_argmax_path(
         talker,
         torch.tensor([[0.1, 0.9], [0.7, 0.2]]),
         sub_positions=None,
+        sub_noise=None,
     )
 
     assert tokens.tolist() == [1, 0]
@@ -6805,6 +6807,7 @@ def test_qwen3_tts_subtalker_sampling_batches_sampled_path_without_global_rng(
         talker,
         torch.tensor([[0.0, 0.0], [0.0, 0.0]]),
         sub_positions=sub_positions[0],
+        sub_noise=None,
     )
 
     assert tokens.shape == (2,)
@@ -6817,6 +6820,7 @@ def test_qwen3_tts_subtalker_sampling_batches_sampled_path_without_global_rng(
         talker,
         torch.tensor([[0.0, 0.0], [0.0, 0.0]]),
         sub_positions=sub_positions[1],
+        sub_noise=None,
     )
 
     assert sampler_calls[1]["positions"].tolist() == [11, 11]
@@ -6853,6 +6857,7 @@ def test_qwen3_tts_subtalker_top_p_keeps_threshold_crossing_token(
         talker,
         torch.log(torch.tensor([[0.4, 0.35, 0.25]])),
         sub_positions=torch.tensor([1]),
+        sub_noise=None,
     )
 
     assert torch.isfinite(sampler_calls[0]).tolist() == [[True, True, False]]

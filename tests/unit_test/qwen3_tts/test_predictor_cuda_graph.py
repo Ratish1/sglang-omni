@@ -673,6 +673,7 @@ def test_mixed_sampled_argmax_rows_preserve_argmax_tie_break():
         sub_positions=talker._sub_seed_positions(
             torch.zeros(2, dtype=torch.long, device=device)
         )[0],
+        sub_noise=None,
     )
 
     assert tokens[1].item() == torch.argmax(logits[1]).item() == 5
@@ -1285,6 +1286,7 @@ def test_widened_top_k_masked_ranks_never_sampled():
         token = talker._sample_subtalker_token_seeded(
             logits,
             sub_positions=talker._sub_seed_positions(positions)[0],
+            sub_noise=None,
         )
         assert token.item() in allowed, (
             f"seed={seed} sampled rank outside the request's top_k=2: "
@@ -1365,6 +1367,7 @@ def test_top_p_removed_ranks_never_sampled():
         token = talker._sample_subtalker_token_seeded(
             logits,
             sub_positions=talker._sub_seed_positions(positions)[0],
+            sub_noise=None,
         )
         assert (
             token.item() == 3
