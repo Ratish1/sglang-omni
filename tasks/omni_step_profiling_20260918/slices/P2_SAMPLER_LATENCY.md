@@ -42,7 +42,35 @@ depends on everything before it: load and scale; + pack and topk; + unpack and s
 tokens on the same inputs (the copy is faithful). An attribution-only copy with an fp32
 Gumbel prices the fp64 part.
 
-## 5. Design options, chosen by P2-e1
+## 5a. Result (READOUT_03.md section 1) and the design it selects
+
+At `num_warps=8` the fp64 Gumbel adds 35.2 us (bs 1) and 31.7 us (bs 16) of the 43 us;
+an fp32 copy adds 0.8 us; the cost grows with the warp count. Selection is 6.8 us.
+
+The noise is a function of (seed, sub-step position, rank) only, not of the logits
+(`sampling_kernels.py:423-435`), and the 15 sub-step positions of a decode position are
+known before the first sub-step (`_sub_seed_positions`, `sglang_model.py:1644`, one
+(15, B) tensor per position). So:
+
+```
+_code_predictor_forward_incremental                      sglang_model.py:1518
+  sub_positions = _sub_seed_positions(...)   (15, B)     :1581
+  noise = seeded_gumbel_noise(seeds, sub_positions, block_k)   one launch, grid 15 x B,
+          (15, B, block_k) fp64, _gumbel_from_hash on the same murmur3 hash as today
+  15 x sample(logits, ..., noise[layer_idx])             the kernel loads its row of noise
+                                                         instead of computing it
+```
+
+Values are bit-identical by construction (same hash, same fp64 function, same ranks), so
+the tokens are. The fp64 work runs once per step on 15 x B programs spread over the
+SMs instead of 15 times serially inside one program per row. No constant depends on
+the card; on the H100 (full-rate fp64) the change removes less but adds only one small
+launch per step inside the captured graph. The torch fallback path is unchanged.
+
+P2-e2 (with the code): sampler us per call and the noise kernel's us at bs 1, 2, 4, 8,
+16 in a graph, tokens equal to the shipped kernel on the same inputs.
+
+## 5. Design options considered before P2-e1
 
 - fp64 Gumbel dominant: compute the 64 noise values once, not per warp (a layout where
   the rank axis spans the threads, or `num_warps` from a startup measurement on the
