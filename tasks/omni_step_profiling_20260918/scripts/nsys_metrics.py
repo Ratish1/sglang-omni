@@ -1,111 +1,106 @@
-"""Read GPU metrics and CUDA graph node activity from an nsys sqlite export (on the box).
+"""GPU metrics per kernel from an nsys profile sqlite export (run on the box).
 
-Prints the schema of CUDA_GRAPH_NODE_EVENTS and GPU_METRICS, then over the capture
-window: per metric, mean and percentiles across samples; and the same metrics split by
-which graphs are executing at each sample (graph id -> node count, so talker, predictor
-and vocoder graphs are told apart by their node counts), from the node event intervals.
+Takes the kernel executions (CUPTI_ACTIVITY_KIND_KERNEL, graph nodes included) and the
+GPU metric samples (GPU_METRICS, ad10x set) of one device over the collection window.
+Prints the window totals (kernel busy time, metric means), then attributes every metric
+sample to the kernel executing at its timestamp (kernels on the same device may overlap
+across streams; a sample counts for each) and prints, per kernel short name ranked by
+device time: calls, total ms, and the mean of SM Issue, SMs Active, Tensor Active, warps
+in flight and DRAM read / write bandwidth over its samples.
 
-usage: python nsys_metrics.py REPORT.sqlite
+usage: python nsys_metrics.py REPORT.sqlite [--top 30]
 """
 
 from __future__ import annotations
 
+import argparse
 import bisect
 import collections
 import sqlite3
 import statistics
-import sys
 
 METRICS = (
-    "SMs Active [Throughput %]",
     "SM Issue [Throughput %]",
+    "SMs Active [Throughput %]",
     "Tensor Active [Throughput %]",
     "Compute Warps in Flight [Throughput %]",
-    "Unallocated Warps in Active SMs [Throughput %]",
     "DRAM Read Bandwidth [Throughput %]",
     "DRAM Write Bandwidth [Throughput %]",
-    "GR Active [Throughput %]",
 )
 
 
-def pct(values, q):
-    values = sorted(values)
-    return values[min(len(values) - 1, int(q * len(values)))]
-
-
 def main() -> None:
-    db = sqlite3.connect(sys.argv[1])
-    for table in ("CUDA_GRAPH_NODE_EVENTS", "GPU_METRICS", "TARGET_INFO_GPU_METRICS"):
-        cols = [row[1] for row in db.execute(f"pragma table_info({table})")]
-        print(f"{table}: {cols}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("report")
+    parser.add_argument("--top", type=int, default=30)
+    args = parser.parse_args()
+    db = sqlite3.connect(args.report)
+    strings = dict(db.execute("select id, value from StringIds"))
+    kernels = db.execute(
+        "select start, end, deviceId, shortName from CUPTI_ACTIVITY_KIND_KERNEL order by start"
+    ).fetchall()
+    if not kernels:
+        print("no kernel activity in the report")
+        return
+    device = collections.Counter(k[2] for k in kernels).most_common(1)[0][0]
+    kernels = [k for k in kernels if k[2] == device]
+    t0, t1 = kernels[0][0], max(k[1] for k in kernels)
+    busy = collections.defaultdict(lambda: [0, 0.0])
+    for start, end, _, name_id in kernels:
+        entry = busy[strings.get(name_id, str(name_id))]
+        entry[0] += 1
+        entry[1] += (end - start) / 1e6
     print(
-        "sample node events:",
-        db.execute("select * from CUDA_GRAPH_NODE_EVENTS limit 3").fetchall(),
+        f"device {device}: {len(kernels)} kernels over {(t1 - t0) / 1e6:.1f} ms, busy sum {sum(v[1] for v in busy.values()):.1f} ms"
     )
 
-    ids = {
-        name: metric_id
+    ids = dict(
+        (name, metric_id)
         for metric_id, name in db.execute(
             "select metricId, metricName from TARGET_INFO_GPU_METRICS"
         )
-    }
-    node_cols = [
-        row[1] for row in db.execute("pragma table_info(CUDA_GRAPH_NODE_EVENTS)")
-    ]
-    graph_col = "graphId" if "graphId" in node_cols else None
-    intervals = []
-    if graph_col and "start" in node_cols and "end" in node_cols:
-        graph_sizes = collections.Counter(
-            gid
-            for (gid,) in db.execute(f"select {graph_col} from CUDA_GRAPH_NODE_EVENTS")
-        )
-        for start, end, gid in db.execute(
-            f"select start, end, {graph_col} from CUDA_GRAPH_NODE_EVENTS order by start"
-        ):
-            intervals.append((start, end, gid))
-        print("graphs by node events:", graph_sizes.most_common(20))
-    t0, t1 = (
-        (intervals[0][0], max(end for _, end, _ in intervals))
-        if intervals
-        else (None, None)
     )
-    starts = [s for s, _, _ in intervals]
-
-    print(f"\nwindow {((t1 - t0) / 1e6) if t0 else 'unknown'} ms")
-    print(f"{'metric':46s} {'mean':>7} {'p10':>7} {'p50':>7} {'p90':>7} {'samples':>8}")
-    for name in METRICS:
-        if name not in ids:
+    starts = [k[0] for k in kernels]
+    order_by_end = sorted(range(len(kernels)), key=lambda i: kernels[i][1])
+    max_len = max(k[1] - k[0] for k in kernels)
+    per_kernel = collections.defaultdict(lambda: collections.defaultdict(list))
+    window = {}
+    for metric in METRICS:
+        if metric not in ids:
             continue
-        rows = db.execute(
-            "select timestamp, value from GPU_METRICS where metricId = ?"
-            + (" and timestamp between ? and ?" if t0 else ""),
-            (ids[name], t0, t1) if t0 else (ids[name],),
+        samples = db.execute(
+            "select timestamp, value from GPU_METRICS where metricId = ? and timestamp between ? and ?",
+            (ids[metric], t0, t1),
         ).fetchall()
-        values = [v for _, v in rows]
-        if not values:
-            continue
-        print(
-            f"{name:46s} {statistics.fmean(values):7.1f} {pct(values, .1):7.1f} "
-            f"{pct(values, .5):7.1f} {pct(values, .9):7.1f} {len(values):>8}"
+        window[metric] = (
+            statistics.fmean(v for _, v in samples) if samples else float("nan")
         )
-        if not intervals:
-            continue
-        by_graph = collections.defaultdict(list)
-        for ts, value in rows:
+        for ts, value in samples:
             index = bisect.bisect_right(starts, ts) - 1
-            active = set()
-            probe = index
-            while probe >= 0 and len(active) < 3 and starts[probe] > ts - 5_000_000:
-                start, end, gid = intervals[probe]
+            names = set()
+            while index >= 0 and kernels[index][0] >= ts - max_len:
+                start, end, _, name_id = kernels[index]
                 if start <= ts <= end:
-                    active.add(gid)
-                probe -= 1
-            key = tuple(sorted(active)) if active else ("idle",)
-            by_graph[key].append(value)
-        for key, vals in sorted(by_graph.items(), key=lambda item: -len(item[1]))[:8]:
-            print(
-                f"    graphs {str(key):40s} mean {statistics.fmean(vals):6.1f} samples {len(vals)}"
+                    names.add(strings.get(name_id, str(name_id)))
+                index -= 1
+            for name in names or {"<idle>"}:
+                per_kernel[name][metric].append(value)
+    del order_by_end
+    print(
+        "window means: "
+        + ", ".join(f"{m.split(' [')[0]} {v:.1f}" for m, v in window.items())
+    )
+    header = " ".join(f"{m.split(' [')[0][:12]:>12}" for m in METRICS)
+    print(f"\n{'kernel':60s} {'calls':>7} {'ms':>9} {header}")
+    ranked = sorted(busy.items(), key=lambda item: -item[1][1])[: args.top]
+    for name, (calls, ms) in ranked + [("<idle>", (0, 0.0))]:
+        cells = []
+        for metric in METRICS:
+            values = per_kernel[name].get(metric)
+            cells.append(
+                f"{statistics.fmean(values):12.1f}" if values else f"{'-':>12}"
             )
+        print(f"{name[:60]:60s} {calls:>7} {ms:>9.2f} " + " ".join(cells))
 
 
 if __name__ == "__main__":
