@@ -161,3 +161,30 @@ slice 2.2, the derived bucket table, is what it was for.
   slice 1.2 branch. When 1.2 is unparked it should import this one rather than
   keep its own: the segment layout is a property of the packed sequence, not of
   the cache.
+
+## FA3 varlen for finals: measured, not worth a second path (2026-09-18)
+
+A final's keys do not overlap between rows, so `flash_attn_varlen_func` with
+`cu_seqlens_q = cu_seqlens_k = row starts` can express it, as SGLang's packed
+bidirectional attention does (`srt/layers/attention/vision.py:943-952`). A hop
+cannot: its (row, chunk) segments read overlapping prefixes of one row, which
+varlen's consecutive key ranges cannot describe; SGLang's own prefix read is the
+paged call too.
+
+`stage2/row_attention_kernels.py`, RTX 4090 D, bfloat16, 16 heads of 64, rows
+doubled for CFG, one attention call, clean run:
+
+| shape | paged ms | varlen ms | padded SDPA ms | page table build ms |
+|---|---|---|---|---|
+| 1 row, 400 | 0.049 | 0.046 | 0.137 | 0.145 |
+| 1 row, 1,200 | 0.113 | 0.110 | 0.242 | 0.100 |
+| 4 rows, 300 to 900 | 0.152 | 0.149 | 0.566 | 0.105 |
+| 8 rows, 300 to 1,500 | 0.513 | 0.504 | 2.524 | 0.111 |
+| 16 rows, 300 to 1,500 | 0.991 | 0.982 | 5.135 | 0.120 |
+| 16 rows, one of 4,000 | 1.344 | 1.313 | 24.993 | 0.147 |
+
+The two FA3 outputs are bit identical on every shape. varlen is 1 to 3 percent
+of one attention call faster; over the 220 attention calls of a Flow call that is
+about 2 ms at 16 rows plus 0.1 ms of page table build, under half a percent of
+the call. One kernel path for hops and finals stays. A second run shared the
+card with a server boot and is discarded.
