@@ -211,7 +211,9 @@ A is upstream main `27b5b0d4f`, B is `origin/perf/qwen3-tts-base-prefill-graph`
 
 ```bash
 cd /workspace/sglang-omni
-git fetch origin perf/qwen3-tts-base-prefill-graph feat/omni-step-profiler && git fetch upstream main
+# the container clone does not map named fetches to origin/*, so the refspecs are explicit
+git fetch origin +refs/heads/perf/qwen3-tts-base-prefill-graph:refs/remotes/origin/perf/qwen3-tts-base-prefill-graph \
+  +refs/heads/feat/omni-step-profiler:refs/remotes/origin/feat/omni-step-profiler && git fetch upstream main
 git worktree add --detach .tmp/wt/pf-a 27b5b0d4f
 git worktree add --detach .tmp/wt/pf-b origin/perf/qwen3-tts-base-prefill-graph
 git worktree add --detach .tmp/wt/step-prof-tools origin/feat/omni-step-profiler
