@@ -185,6 +185,11 @@ def main() -> None:
     print(f"budget {budget / 2**30:.2f} GiB, {cache.slots} slots")
 
     handles = {}
+    error_profile: dict[str, dict[int, float]] = {
+        "cached": {},
+        "alone": {},
+        "signal": {},
+    }
     hops: list[dict] = []
     steps_detail: list[dict] = []
     for step, participants in enumerate(plan):
@@ -313,10 +318,30 @@ def main() -> None:
                     # batch moves main as far from the truth as the cached path
                     # sits, the distance belongs to the batch, not the cache.
                     alone = vocoder.hop_batch([items[row]])[0]
-                    record["production_alone_vs_truth_db"] = compare(
-                        alone[:, :, offset * TOKEN_MEL_RATIO :].float().cpu(),
-                        reference,
-                    )["snr_db"]
+                    alone = alone[:, :, offset * TOKEN_MEL_RATIO :].float().cpu()
+                    record["production_alone_vs_truth_db"] = compare(alone, reference)[
+                        "snr_db"
+                    ]
+                    if not record["first_hop"]:
+                        # Where in the new span the error sits, in buckets of
+                        # ten frames from the cached boundary: a boundary
+                        # defect (conv tail, positions) piles up at the start,
+                        # amplified rounding spreads evenly.
+                        for name, value in (
+                            ("cached", cached[row].float().cpu()),
+                            ("alone", alone),
+                        ):
+                            squared = (value - reference).pow(2).sum(dim=(0, 1))
+                            for bucket, energy in enumerate(squared.split(10)):
+                                error_profile[name][bucket] = error_profile[name].get(
+                                    bucket, 0.0
+                                ) + float(energy.sum())
+                        for bucket, energy in enumerate(
+                            reference.pow(2).sum(dim=(0, 1)).split(10)
+                        ):
+                            error_profile["signal"][bucket] = error_profile[
+                                "signal"
+                            ].get(bucket, 0.0) + float(energy.sum())
             hops.append(record)
         steps_detail.append(
             {
@@ -426,6 +451,7 @@ def main() -> None:
             record["cached_vs_truth_db"] for record in with_truth
         ),
         "store_bench": store_bench,
+        "error_profile": error_profile,
         "slots_used_at_end": cache.slots - free_before,
         "slots_free_after_release": cache.allocator.available_size(),
         "rows_free_after_release": cache.rows.available_size(),
@@ -437,7 +463,7 @@ def main() -> None:
     with open(os.path.join(args.out, "s1_gate.json"), "w") as out:
         json.dump(report, out, indent=1)
     for key, value in report.items():
-        if key not in ("hops", "steps", "provenance", "args"):
+        if key not in ("hops", "steps", "provenance", "args", "error_profile"):
             print(f"{key} {value}")
 
 
