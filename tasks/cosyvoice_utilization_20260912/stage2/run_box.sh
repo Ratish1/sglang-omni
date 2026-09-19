@@ -105,6 +105,9 @@ print(sglang_omni.__file__); print(cosyvoice.__file__)
 echo "card $CARD, revision $REV, model $MODEL"
 echo "out $OUT"
 # -u so the log follows the run instead of arriving at the end.
-CUDA_VISIBLE_DEVICES=$CARD python -u "$T/stage2/$SCRIPT" \
+# WRAP runs the experiment under a launcher, for example an Nsight profile;
+# OUTDIR inside it stands for this run's output directory.
+WRAP=${WRAP:-}
+CUDA_VISIBLE_DEVICES=$CARD ${WRAP//OUTDIR/$OUT} python -u "$T/stage2/$SCRIPT" \
   --device cuda:0 --model "$MODEL" --out "$OUT" $ARGS 2>&1 | tee "$OUT/run.log"
 echo "OUT=$OUT"
