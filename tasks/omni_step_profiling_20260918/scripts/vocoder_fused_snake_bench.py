@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import copy
 import importlib.util
+import inspect
 import math
 import statistics
 
@@ -102,9 +103,17 @@ def main() -> None:
                 f"old kernel fused {old_kernels.fuse_vocoder_decoder(decoder)} modules"
             )
         if name == "new":
-            print(
-                f"new kernel fused {vocoder_kernels.fuse_vocoder_decoder(decoder, snake_cls)} modules"
+            # note(ratish): the rewrite takes the snake class, main's module does not
+            takes_class = (
+                len(inspect.signature(vocoder_kernels.fuse_vocoder_decoder).parameters)
+                == 2
             )
+            fused = (
+                vocoder_kernels.fuse_vocoder_decoder(decoder, snake_cls)
+                if takes_class
+                else vocoder_kernels.fuse_vocoder_decoder(decoder)
+            )
+            print(f"new kernel fused {fused} modules")
         arms[name] = (decoder, Qwen3TTSIncrementalDecoder(decoder))
     print(f"device {torch.cuda.get_device_name(device)}, torch {torch.__version__}")
     print(
