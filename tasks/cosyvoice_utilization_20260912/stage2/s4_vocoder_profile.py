@@ -217,13 +217,15 @@ def main() -> None:
             for name, call in calls.items():
                 call()
                 torch.cuda.synchronize()
-            torch.cuda.profiler.start()
+            # One capture range from the first profiled step to the end: Nsight
+            # ends its collection at the first stop.
+            if not scenarios:
+                torch.cuda.profiler.start()
             for name, call in calls.items():
                 nvtx.range_push(f"scenario:{name}:step{step}")
                 call()
                 torch.cuda.synchronize()
                 nvtx.range_pop()
-            torch.cuda.profiler.stop()
             new_frames = sum(
                 handle.reserved - start for handle, start in zip(row_handles, starts)
             )
@@ -252,6 +254,7 @@ def main() -> None:
             )
             history[index] = (hift_mel, speech_offset)
 
+    torch.cuda.profiler.stop()
     with open(os.path.join(args.out, "s4_scenarios.json"), "w") as out:
         json.dump({"info": info, "scenarios": scenarios}, out, indent=1)
 
