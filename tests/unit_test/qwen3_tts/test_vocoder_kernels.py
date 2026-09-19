@@ -60,6 +60,7 @@ def test_fuse_vocoder_decoder_keeps_originals_on_prewarm_failure(
         (2, 192, 96),
         (1, 384, 192),
         (1, 768, 257),
+        (1, 96, 122880),
     ],
 )
 def test_fused_snake_beta_cuda_parity_uses_kernel(
@@ -99,3 +100,22 @@ def test_fused_snake_beta_cuda_parity_uses_kernel(
     assert actual is not None
     assert launches == [(batch, channels, frames)]
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="fused SnakeBeta compile needs CUDA"
+)
+def test_fused_snake_beta_survives_a_fullgraph_compile() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    original = _StubSnakeBeta(96).to(device=device, dtype=torch.bfloat16)
+    decoder = torch.nn.Sequential(original)
+    x = torch.randn((2, 96, 320), device=device, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        expected = original(x)
+
+        assert vocoder_kernels.fuse_vocoder_decoder(decoder) == 1
+        compiled = torch.compile(decoder, dynamic=False, fullgraph=True)
+
+        assert torch.equal(compiled(x), expected)

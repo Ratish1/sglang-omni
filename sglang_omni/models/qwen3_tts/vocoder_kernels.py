@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 
 import torch
+from sglang.srt.utils.custom_op import register_custom_op
 
 try:  # keep the module importable when Triton is unavailable
     import triton
@@ -53,7 +54,9 @@ except Exception:  # pragma: no cover
 
 _ALLOWED_CHANNELS = frozenset((1536, 768, 384, 192, 96))
 _MAX_BATCH = 8
-_MAX_T = 65536
+# note(ratish): the launch puts cdiv(T, 1024) programs on its second axis, which
+# CUDA caps at 65,535; the 96 channel stage alone reaches 1,920 samples per frame
+_MAX_T = 65535 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +106,19 @@ def _block_for(t: int) -> int:
     return 1024
 
 
+def _fake_launch(
+    x: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+# note(ratish): an opaque op, so the decoder's torch.compile never traces the
+# device context or the Triton launch; tracing them fails the runner's capture
+@register_custom_op(
+    op_name="qwen3_tts_fused_snake_beta",
+    mutates_args=[],
+    fake_impl=_fake_launch,
+)
 def _launch(x: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
     batch, channels, t = x.shape
     out = torch.empty_like(x)
@@ -131,7 +147,7 @@ def fused_snake_beta(
 
     Envelope: x [B, C, T] bfloat16 contiguous CUDA, alpha/beta
     bfloat16 [C] on the same device, 1 <= B <= 8, C in {1536, 768, 384,
-    192, 96}, 1 <= T <= 65536. Inside the envelope the result is bitwise
+    192, 96}, 1 <= T <= 65535 * 1024. Inside the envelope the result is bitwise
     identical to the eager qwen-tts SnakeBeta.forward. Never raises and
     never synchronizes with the host (safe under CUDA graph capture).
     """
