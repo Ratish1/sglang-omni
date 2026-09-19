@@ -214,6 +214,9 @@ def per_call_us(fn):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--confirm", help="TILE,WARPS: only that tiled config, 3 rounds"
+    )
     args = parser.parse_args()
     device = torch.device("cuda", 0)
     tokenizer, incremental = load(args.model, device)
@@ -308,6 +311,52 @@ def main() -> None:
                 f"  C={channels}: candidates checked; today's kernel on all encodings: {'n/a' if old is None else torch.equal(old.view(torch.int16), module(sweep).view(torch.int16))}"
             )
     print(f"configs with any mismatch: {[label(c) for c in failed] or 'none'}")
+
+    if args.confirm:
+        block, warps = (int(part) for part in args.confirm.split(","))
+        fn = candidate(block, warps, False, False, "tile")
+        print(
+            f"\nconfirm tile {block} w{warps} against today's kernel: 3 alternating rounds per "
+            f"shape, the lowest median of each side, us per call"
+        )
+        print(
+            f"{'shape':>20} {'numel':>10} {'eager':>9} {'today':>9} {'tile':>9} {'ratio':>7}"
+        )
+        ratios = []
+        for shape in ordered:
+            module = by_channels[shape[1]]
+            a, r = constants[shape[1]]
+            x = torch.randn(shape, dtype=torch.bfloat16, device=device)
+            rejected = (
+                vocoder_kernels.fused_snake_beta(x, module.alpha, module.beta) is None
+            )
+            today_runs, tile_runs = [], []
+            for _ in range(3):
+                today_runs.append(
+                    per_call_us(
+                        (lambda: module(x))
+                        if rejected
+                        else (
+                            lambda: vocoder_kernels.fused_snake_beta(
+                                x, module.alpha, module.beta
+                            )
+                        )
+                    )
+                )
+                tile_runs.append(per_call_us(lambda: fn(x, a, r)))
+            eager_us = per_call_us(lambda: module(x))
+            ratios.append(min(tile_runs) / min(today_runs))
+            print(
+                f"{str(shape):>20} {math.prod(shape):>10} {eager_us:>9.2f} "
+                f"{min(today_runs):>8.2f}{'*' if rejected else ' '} {min(tile_runs):>9.2f} {ratios[-1]:>7.3f}",
+                flush=True,
+            )
+        geo = math.exp(statistics.fmean(math.log(v) for v in ratios))
+        print(
+            f"\ngeo {geo:.3f}, worst {max(ratios):.3f}, best {min(ratios):.3f}; "
+            f"above 1.00: {sum(v > 1.0 for v in ratios)}, above 1.02: {sum(v > 1.02 for v in ratios)} of {len(ratios)}"
+        )
+        return
 
     results: dict = {config: [] for config in configs}
     print(f"\nper call us in a CUDA graph ({CALLS} calls per graph, median of {REPS})")
