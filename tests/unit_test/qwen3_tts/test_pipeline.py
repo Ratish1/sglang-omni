@@ -3033,34 +3033,15 @@ class _StubSnakeBeta(torch.nn.Module):
         )
 
 
-_StubSnakeBeta.__name__ = "SnakeBeta"
-
-
-def test_qwen3_tts_fuse_vocoder_decoder_replaces_snake_beta_modules() -> None:
-    from sglang_omni.models.qwen3_tts.vocoder_kernels import (
-        FusedSnakeBeta,
-        fuse_vocoder_decoder,
-        fused_snake_beta,
-    )
-
-    torch.manual_seed(0)
-    decoder = torch.nn.Sequential(
-        torch.nn.Conv1d(4, 4, 1),
-        _StubSnakeBeta(4),
-        torch.nn.Sequential(_StubSnakeBeta(4)),
-    )
-    x = torch.randn(2, 4, 8)
-    expected = decoder(x)
-
-    assert fuse_vocoder_decoder(decoder) == 2
-    assert fuse_vocoder_decoder(decoder) == 0
-    assert isinstance(decoder[1], FusedSnakeBeta)
-    assert isinstance(decoder[2][0], FusedSnakeBeta)
-    assert torch.equal(decoder(x), expected)
-    assert fused_snake_beta(x, decoder[1].alpha, decoder[1].beta) is None
-
-
-def test_qwen3_tts_streaming_vocoder_fused_snake_activation_flag() -> None:
+def test_qwen3_tts_streaming_vocoder_fused_snake_activation_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2"
+    parts = module_name.split(".")
+    for depth in range(1, len(parts) + 1):
+        name = ".".join(parts[:depth])
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    sys.modules[module_name].SnakeBeta = _StubSnakeBeta
     tokenizer = _FakeQwen3TTSTokenizer()
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         tokenizer,

@@ -645,13 +645,17 @@ class Qwen3TTSStreamingVocoderScheduler(
         ):
             self._device = parameter.device
         if fused_snake_activation:
+            from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+                SnakeBeta,
+            )
+
             from sglang_omni.models.qwen3_tts.vocoder_kernels import (
                 fuse_vocoder_decoder,
             )
 
             logger.info(
                 "Qwen3-TTS vocoder fused SnakeBeta modules: %d",
-                fuse_vocoder_decoder(self._decoder),
+                fuse_vocoder_decoder(self._decoder, SnakeBeta),
             )
         tokenizer_config = getattr(tokenizer.model, "config", None)
         decoder_config = getattr(tokenizer_config, "decoder_config", tokenizer_config)

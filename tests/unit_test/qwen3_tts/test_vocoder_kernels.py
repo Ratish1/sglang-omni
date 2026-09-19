@@ -9,7 +9,7 @@ import sglang_omni.models.qwen3_tts.vocoder_kernels as vocoder_kernels
 
 
 class _StubSnakeBeta(torch.nn.Module):
-    """Stand-in with the qwen-tts SnakeBeta attribute layout."""
+    """Stand-in with the qwen-tts SnakeBeta attribute layout and arithmetic."""
 
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -26,76 +26,91 @@ class _StubSnakeBeta(torch.nn.Module):
         )
 
 
-_StubSnakeBeta.__name__ = "SnakeBeta"
-
-
-def test_fuse_vocoder_decoder_keeps_originals_on_prewarm_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_fuse_vocoder_decoder_leaves_a_cpu_decoder_untouched() -> None:
+    torch.manual_seed(0)
     first = _StubSnakeBeta(4)
     second = _StubSnakeBeta(4)
     decoder = torch.nn.Sequential(first, torch.nn.Sequential(second))
 
-    monkeypatch.setattr(vocoder_kernels, "_HAS_TRITON", True)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-
-    def fail_prewarm(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("prewarm failed")
-
-    monkeypatch.setattr(vocoder_kernels, "_prewarm_replacements", fail_prewarm)
-
-    assert vocoder_kernels.fuse_vocoder_decoder(decoder) == 0
+    assert vocoder_kernels.fuse_vocoder_decoder(decoder, _StubSnakeBeta) == 0
     assert decoder[0] is first
     assert decoder[1][0] is second
 
 
 @pytest.mark.accelerator
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="fused SnakeBeta parity needs CUDA"
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused snake needs CUDA")
+def test_fuse_vocoder_decoder_keeps_eager_when_the_kernel_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    first = _StubSnakeBeta(96).to(device=device, dtype=torch.bfloat16)
+    decoder = torch.nn.Sequential(first)
+    monkeypatch.setattr(vocoder_kernels, "fused_snake", lambda x, a, r: x.clone())
+
+    assert vocoder_kernels.fuse_vocoder_decoder(decoder, _StubSnakeBeta) == 0
+    assert decoder[0] is first
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused snake needs CUDA")
 @pytest.mark.parametrize(
     ("batch", "channels", "frames"),
     [
-        (1, 96, 33),
-        (2, 192, 96),
-        (1, 384, 192),
-        (1, 768, 257),
+        (1, 1536, 1),
+        (8, 1536, 8),
+        (1, 5, 33),
+        (9, 192, 96),
+        (1, 96, 122880),
     ],
 )
-def test_fused_snake_beta_cuda_parity_uses_kernel(
-    monkeypatch: pytest.MonkeyPatch,
-    batch: int,
-    channels: int,
-    frames: int,
+def test_fused_snake_beta_is_bitwise_identical_to_eager(
+    batch: int, channels: int, frames: int
 ) -> None:
-    # note (db-ol): on the accelerator runner a missing Triton must fail
-    # loudly, a skip here would hide the kernel from CI again.
     assert vocoder_kernels._HAS_TRITON, "Triton is required on accelerator CI"
 
     torch.manual_seed(0)
     device = torch.device("cuda")
     original = _StubSnakeBeta(channels).to(device=device, dtype=torch.bfloat16)
-    x = torch.randn(
-        (batch, channels, frames),
-        device=device,
-        dtype=torch.bfloat16,
-    )
+    decoder = torch.nn.Sequential(original)
+    x = torch.randn((batch, channels, frames), device=device, dtype=torch.bfloat16)
     expected = original(x)
-    launches: list[tuple[int, int, int]] = []
-    original_launch = vocoder_kernels._launch
 
-    def record_launch(
-        hidden_states: torch.Tensor,
-        alpha: torch.Tensor,
-        beta: torch.Tensor,
-    ) -> torch.Tensor:
-        launches.append(tuple(hidden_states.shape))
-        return original_launch(hidden_states, alpha, beta)
+    assert vocoder_kernels.fuse_vocoder_decoder(decoder, _StubSnakeBeta) == 1
+    assert vocoder_kernels.fuse_vocoder_decoder(decoder, _StubSnakeBeta) == 0
+    fused = decoder[0]
+    assert isinstance(fused, vocoder_kernels.FusedSnakeBeta)
+    assert vocoder_kernels.can_use_fused_snake(x, fused.a, fused.r)
+    assert torch.equal(fused(x).view(torch.int16), expected.view(torch.int16))
 
-    monkeypatch.setattr(vocoder_kernels, "_launch", record_launch)
 
-    actual = vocoder_kernels.fused_snake_beta(x, original.alpha, original.beta)
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused snake needs CUDA")
+def test_fused_snake_beta_matches_eager_on_every_bf16_encoding() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    original = _StubSnakeBeta(96).to(device=device, dtype=torch.bfloat16)
+    fused = vocoder_kernels.FusedSnakeBeta(original)
+    encodings = (
+        torch.arange(-32768, 32768, dtype=torch.int32, device=device)
+        .to(torch.int16)
+        .view(torch.bfloat16)
+    )
+    x = encodings.repeat(96).reshape(1, 96, 65536).contiguous()
 
-    assert actual is not None
-    assert launches == [(batch, channels, frames)]
-    assert torch.equal(actual, expected)
+    assert torch.equal(fused(x).view(torch.int16), original(x).view(torch.int16))
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused snake needs CUDA")
+def test_fused_snake_beta_runs_the_original_outside_the_kernel_contract() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    original = _StubSnakeBeta(96).to(device=device, dtype=torch.bfloat16)
+    fused = vocoder_kernels.FusedSnakeBeta(original)
+    strided = torch.randn((2, 33, 96), device=device, dtype=torch.bfloat16).transpose(
+        1, 2
+    )
+
+    assert not vocoder_kernels.can_use_fused_snake(strided, fused.a, fused.r)
+    assert torch.equal(fused(strided), original(strided))
