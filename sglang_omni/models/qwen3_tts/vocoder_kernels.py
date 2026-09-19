@@ -22,7 +22,6 @@ import torch
 try:  # keep the module importable when Triton is unavailable
     import triton
     import triton.language as tl
-    from sglang.kernels.ops.diffusion.common.numerics import round_bf16_to_fp32
     from triton.language.extra import libdevice
 
     _HAS_TRITON = True
@@ -33,21 +32,23 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
-SNAKE_BLOCK_SIZE = 1024
+SNAKE_TILE_ELEMENTS = 1024
+SNAKE_TILE_COLUMNS = (16, 64, 256, 1024)
 SNAKE_NUM_WARPS = 4
-SNAKE_SELF_CHECK_FRAMES = 257
+# note(ratish): a CUDA launch takes at most 65,535 programs on its second axis
+SNAKE_MAX_FRAMES = 65535 * SNAKE_TILE_COLUMNS[-1]
 
 if _HAS_TRITON:
 
-    # note(ratish): sizes and pointers stay unspecialized so one binary serves
-    # every shape and alignment; a second variant would compile at serving time.
+    # note(ratish): sizes and pointers stay unspecialized so one binary per tile
+    # shape serves every input; another variant would compile at serving time.
     @triton.jit(
         do_not_specialize=[
             "out_ptr",
             "x_ptr",
             "a_ptr",
             "r_ptr",
-            "numel",
+            "rows",
             "channels",
             "length",
         ]
@@ -57,22 +58,32 @@ if _HAS_TRITON:
         x_ptr,
         a_ptr,
         r_ptr,
-        numel,
+        rows,
         channels,
         length,
-        BLOCK: tl.constexpr,
+        ROWS: tl.constexpr,
+        COLS: tl.constexpr,
     ):
-        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < numel
-        channel = (offs // length) % channels
+        # note(ratish): one program is a ROWS x COLS tile of the [B * C, T] rows, so
+        # the channel costs one modulo per row and a short T still fills the tile
+        row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+        col = tl.program_id(1) * COLS + tl.arange(0, COLS)
+        row_mask = row < rows
+        if ROWS == 1:
+            mask = (col < length)[None, :]
+        else:
+            mask = row_mask[:, None] & (col < length)[None, :]
+        offs = row[:, None] * length + col[None, :]
+        channel = row % channels
+        a = tl.load(a_ptr + channel, mask=row_mask, other=0.0).to(tl.float32)[:, None]
+        r = tl.load(r_ptr + channel, mask=row_mask, other=0.0).to(tl.float32)[:, None]
         x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        a = tl.load(a_ptr + channel, mask=mask, other=0.0).to(tl.float32)
-        r = tl.load(r_ptr + channel, mask=mask, other=0.0).to(tl.float32)
-        scaled = round_bf16_to_fp32(x * a)
-        sine = round_bf16_to_fp32(libdevice.sin(scaled))
-        squared = round_bf16_to_fp32(sine * sine)
-        periodic = round_bf16_to_fp32(r * squared)
-        tl.store(out_ptr + offs, x + periodic, mask=mask)  # store rounds the add
+        # note(ratish): eager writes a bf16 tensor after each of these steps
+        scaled = (x * a).to(tl.bfloat16).to(tl.float32)
+        sine = libdevice.sin(scaled).to(tl.bfloat16).to(tl.float32)
+        squared = (sine * sine).to(tl.bfloat16).to(tl.float32)
+        periodic = (r * squared).to(tl.bfloat16).to(tl.float32)
+        tl.store(out_ptr + offs, x + periodic, mask=mask)
 
 
 def can_use_fused_snake(x: torch.Tensor, a: torch.Tensor, r: torch.Tensor) -> bool:
@@ -89,6 +100,7 @@ def can_use_fused_snake(x: torch.Tensor, a: torch.Tensor, r: torch.Tensor) -> bo
         and a.shape == (x.shape[1],)
         and r.shape == (x.shape[1],)
         and 0 < x.numel() < 2**31
+        and x.shape[2] <= SNAKE_MAX_FRAMES
     )
 
 
@@ -104,20 +116,26 @@ def _fake_snake(x: torch.Tensor, a: torch.Tensor, r: torch.Tensor) -> torch.Tens
 def fused_snake(x: torch.Tensor, a: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
     """x + r * sin(a * x)^2 over [B, C, T], bit-exact vs the eager bf16 chain."""
     out = torch.empty_like(x)
-    numel = x.numel()
+    rows = x.shape[0] * x.shape[1]
+    length = x.shape[2]
+    cols = next((c for c in SNAKE_TILE_COLUMNS if length <= c), SNAKE_TILE_COLUMNS[-1])
+    tile_rows = SNAKE_TILE_ELEMENTS // cols
     with torch.cuda.device(x.device):
-        # note(ratish): libdevice sin must keep denormals like the eager kernel
-        _snake_kernel[(triton.cdiv(numel, SNAKE_BLOCK_SIZE),)](
+        # note(ratish): sin keeps denormals and no mul-add is contracted, as in the
+        # eager kernels; without either flag the result differs from eager
+        _snake_kernel[(triton.cdiv(rows, tile_rows), triton.cdiv(length, cols))](
             out,
             x,
             a,
             r,
-            numel,
+            rows,
             x.shape[1],
-            x.shape[2],
-            BLOCK=SNAKE_BLOCK_SIZE,
+            length,
+            ROWS=tile_rows,
+            COLS=cols,
             num_warps=SNAKE_NUM_WARPS,
             enable_reflect_ftz=False,
+            enable_fp_fusion=False,
         )
     return out
 
@@ -147,9 +165,10 @@ class FusedSnakeBeta(torch.nn.Module):
 def fuse_vocoder_decoder(decoder: torch.nn.Module, snake_cls: type) -> int:
     """Replace every snake_cls module the kernel reproduces bit for bit.
 
-    Each candidate is run fused and eager on one random tensor before it is
-    installed, outside any graph capture; a mismatch keeps the eager module.
-    Returns the number of modules replaced.
+    Each candidate is run fused and eager on a random tensor per tile shape
+    before it is installed, which also compiles every kernel variant outside
+    any graph capture; a mismatch keeps the eager module. Returns the number of
+    modules replaced.
     """
     replaced = 0
     for parent in list(decoder.modules()):
@@ -159,15 +178,20 @@ def fuse_vocoder_decoder(decoder: torch.nn.Module, snake_cls: type) -> int:
             if not isinstance(child, snake_cls):
                 continue
             fused = FusedSnakeBeta(child)
-            probe = torch.randn(
-                (2, fused.a.shape[0], SNAKE_SELF_CHECK_FRAMES),
-                dtype=fused.a.dtype,
-                device=fused.a.device,
-            )
-            if not can_use_fused_snake(probe, fused.a, fused.r):
+            probes = [
+                torch.randn(
+                    (2, fused.a.shape[0], columns),
+                    dtype=fused.a.dtype,
+                    device=fused.a.device,
+                )
+                for columns in SNAKE_TILE_COLUMNS
+            ]
+            if not can_use_fused_snake(probes[0], fused.a, fused.r):
                 continue
             with torch.inference_mode():
-                identical = torch.equal(fused(probe), child(probe))
+                identical = all(
+                    torch.equal(fused(probe), child(probe)) for probe in probes
+                )
             if not identical:
                 logger.warning(
                     "Qwen3-TTS fused snake differs from eager on %s; keeping eager",
