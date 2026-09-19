@@ -4,20 +4,29 @@
 Flow is chunk causal, so a frame's K and V are final once its chunk is
 complete. The cache keeps them per (Euler step, block, CFG lane) in SGLang's
 paged pool, a stream's slots in two rows of SGLang's request table, and a hop
-computes only its new frames.
+computes only its new frames. One Euler step over those frames is captured as
+a breakable CUDA graph per step size, the attention and the conv position
+embedding left eager between its segments.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from bisect import bisect_left
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import Any
 
 import torch
+import torch.nn.functional as F
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+    BaseBreakableCudaGraphRunner,
+)
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     FA3_PAGE_SIZE,
@@ -30,6 +39,31 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
 )
 
 CFG_LANES = 2
+# Padding over the cached steps of a c16 SeedTTS stream run: 3.2 % of the real
+# frames with 21 sizes; 4 gives 6.1 % with 13, 16 gives 2.0 % with 33.
+STEP_SIZES_PER_DOUBLING = 8
+
+
+def step_sizes(unit: int, limit: int) -> tuple[int, ...]:
+    """Packed step sizes to capture, in frames over both CFG lanes: multiples
+    of unit whose spacing doubles every STEP_SIZES_PER_DOUBLING sizes, then the
+    largest multiple the limit holds."""
+    top = limit // unit * unit
+    sizes: list[int] = []
+    size = spacing = unit
+    while size < top:
+        sizes.append(size)
+        if size >= STEP_SIZES_PER_DOUBLING * spacing:
+            spacing *= 2
+        size += spacing
+    return (*sizes, top)
+
+
+def pad_frames(packed: torch.Tensor, frames: int) -> torch.Tensor:
+    """(1, total, channels) -> (1, frames, channels), zeros past total."""
+    if packed.shape[1] == frames:
+        return packed
+    return F.pad(packed, (0, 0, 0, frames - packed.shape[1]))
 
 
 @dataclass
@@ -45,10 +79,10 @@ class StreamHopCache:
 @dataclass
 class CachedHop:
     """One hop's new frames in packed lane major order: the (row, chunk) query
-    segments, the frames each one's lane holds before it, and the row attention
-    itself."""
+    segments, the frames each one's lane holds before it, and the next
+    (Euler step, block) pool layer."""
 
-    cache: "FlowHopCache"
+    rows: PackedRows
     lanes: torch.Tensor
     lengths: torch.Tensor
     positions: torch.Tensor
@@ -58,33 +92,6 @@ class CachedHop:
     cu_seqlens_q: torch.Tensor
     max_seqlen_q: int
     layer: int = 0
-
-    def __call__(
-        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
-    ) -> torch.Tensor:
-        """query, key, value: (1, new frames, heads * head_dim). Returns the
-        same shape. Each call is the next (Euler step, block) pool layer."""
-        cache = self.cache
-        shape = (-1, cache.heads, cache.head_dim)
-        k_pages, v_pages = cache.pages[self.layer]
-        # note(ratish): FA3 appends each segment's K and V at cache_seqlens
-        # through the page table, then attends; a row's later chunk reads what
-        # its earlier chunk appended in the same call.
-        out = flash_attn_with_kvcache(
-            q=query[0].reshape(shape),
-            k_cache=k_pages,
-            v_cache=v_pages,
-            k=key[0].reshape(shape),
-            v=value[0].reshape(shape),
-            cache_seqlens=self.cache_seqlens,
-            page_table=self.page_table,
-            cu_seqlens_q=self.cu_seqlens_q,
-            cu_seqlens_k_new=self.cu_seqlens_q,
-            max_seqlen_q=self.max_seqlen_q,
-            causal=False,
-        )
-        self.layer += 1
-        return out.reshape(1, -1, cache.heads * cache.head_dim)
 
 
 class FlowHopCache:
@@ -212,7 +219,7 @@ class FlowHopCache:
         max_end = max(end for _, end in spans)
         as_int32 = {"dtype": torch.int32, "device": self.device}
         return CachedHop(
-            cache=self,
+            rows=rows,
             lanes=lanes,
             lengths=torch.tensor(rows.lengths, device=self.device),
             positions=positions,
@@ -237,34 +244,150 @@ class FlowHopCache:
 class CachedDiT(PackedDiT):
     """PackedDiT over each row's new frames: attention reads the frames before
     them from the pool, the conv position embedding starts from the previous
-    hop's last inputs, and RoPE is taken at absolute frame positions."""
+    hop's last inputs, and RoPE is taken at absolute frame positions. With
+    capture_steps an Euler step replays from the breakable CUDA graph of its
+    step size; attention, the conv and RoPE are its eager breaks."""
 
     def __init__(
-        self, dit: torch.nn.Module, cache: FlowHopCache, *, device: str | torch.device
+        self,
+        dit: torch.nn.Module,
+        cache: FlowHopCache,
+        *,
+        device: str | torch.device,
+        capture_steps: bool,
     ) -> None:
         super().__init__(dit, device=device)
         self.cache = cache
         self.hop: CachedHop | None = None
+        self.rope: tuple[torch.Tensor, float] | None = None
+        self.step_frames = 0
+        self.run_step: Callable[..., torch.Tensor] = self.step
+        self.sizes: tuple[int, ...] = ()
+        self.graphs: BaseBreakableCudaGraphRunner | None = None
+        # note(ratish): the size the startup warmup is capturing; serving
+        # replays and never captures.
+        self.capture_size: int | None = None
+        if capture_steps:
+            # note(ratish): a cached step holds a slot per frame, so the pool
+            # bounds it; no capture is evicted, warmup alone decides the set.
+            self.sizes = step_sizes(CFG_LANES * cache.chunk_size, cache.slots)
+            self.graphs = BaseBreakableCudaGraphRunner(self.step, cache.device)
+            self.graphs.max_entries = 0
+
+    def begin_hop(self, streams: Sequence[StreamHopCache]) -> None:
+        """The hop over the streams' new frames: its segments, its RoPE at
+        absolute positions, and the captured step size it runs at, if any."""
+        hop = self.cache.begin_hop(streams)
+        index = bisect_left(self.sizes, hop.rows.total)
+        if self.capture_size is not None:
+            self.step_frames, self.run_step = self.capture_size, self.graphs
+        elif index < len(self.sizes):
+            self.step_frames, self.run_step = self.sizes[index], self.graphs
+        else:
+            self.step_frames, self.run_step = hop.rows.total, self.step
+        freqs, scale = self.dit.rotary_embed.forward_from_seq_len(hop.max_end)
+        assert not isinstance(scale, torch.Tensor), "the DiT's RoPE has no xpos scale"
+        self.hop = hop
+        self.rope = pad_frames(freqs[:, hop.positions], self.step_frames), scale
 
     def row_attention(
         self, rows: PackedRows, *, streaming: bool, dtype: torch.dtype
-    ) -> CachedHop:
-        return self.hop
+    ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+        return self.attend
 
-    def _rope(self, rows: PackedRows) -> tuple[torch.Tensor, Any]:
-        freqs, scale = self.dit.rotary_embed.forward_from_seq_len(self.hop.max_end)
-        freqs = freqs[:, self.hop.positions]
-        if isinstance(scale, torch.Tensor):
-            scale = scale[:, self.hop.positions]
-        return freqs, scale
+    def forward(
+        self,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+        t: torch.Tensor,
+        rows: PackedRows,
+        attention: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """One Euler step at the hop's step size, the frames past the hop's
+        own zero. The solver's rows and attention are the hop's, which the
+        breaks read from the hop itself."""
+        total = x.shape[1]
+        inputs = {
+            "x": pad_frames(x, self.step_frames),
+            "mu": pad_frames(mu, self.step_frames),
+            "spks": pad_frames(spks, self.step_frames),
+            "cond": pad_frames(cond, self.step_frames),
+            "t": t,
+        }
+        if self.capture_size is not None:
+            # note(ratish): a weight cast that autocast caches dies with its
+            # context, so the captured casts must be the graph's own.
+            device_type = x.device.type
+            with torch.autocast(
+                device_type,
+                dtype=torch.get_autocast_dtype(device_type),
+                cache_enabled=False,
+            ):
+                self.graphs.capture(**inputs)
+        return self.run_step(**inputs)[:, :total]
 
+    def step(
+        self,
+        *,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """x, mu, spks, cond: (1, step frames, channels). A captured step keeps
+        only tensor addresses, so everything else comes from the hop."""
+        return super().forward(x, mu, spks, cond, t, self.hop.rows, self.attend)
+
+    @eager_on_graph(True)
+    def attend(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        """query, key, value: (1, step frames, heads * head_dim), the hop's
+        frames first. Returns the same shape. Each call is the next
+        (Euler step, block) pool layer."""
+        hop, cache = self.hop, self.cache
+        total = hop.rows.total
+        shape = (-1, cache.heads, cache.head_dim)
+        k_pages, v_pages = cache.pages[hop.layer]
+        # note(ratish): FA3 appends each segment's K and V at cache_seqlens
+        # through the page table, then attends; a row's later chunk reads what
+        # its earlier chunk appended in the same call.
+        out = flash_attn_with_kvcache(
+            q=query[0, :total].reshape(shape),
+            k_cache=k_pages,
+            v_cache=v_pages,
+            k=key[0, :total].reshape(shape),
+            v=value[0, :total].reshape(shape),
+            cache_seqlens=hop.cache_seqlens,
+            page_table=hop.page_table,
+            cu_seqlens_q=hop.cu_seqlens_q,
+            cu_seqlens_k_new=hop.cu_seqlens_q,
+            max_seqlen_q=hop.max_seqlen_q,
+            causal=False,
+        )
+        hop.layer += 1
+        return pad_frames(out.reshape(1, total, -1), query.shape[1])
+
+    # note(ratish): rows is the hook's contract; the breaks below replay with
+    # the arguments of the capture, so they read this call's rows from the hop.
+    @eager_on_graph(True)
+    def _rope(self, rows: PackedRows) -> tuple[torch.Tensor, float]:
+        return self.rope
+
+    @eager_on_graph(True)
     def _conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
         hop = self.hop
+        rows = hop.rows
         conv = self.dit.input_embed.conv_pos_embed
         context = conv.kernel_size - 1
         tails = self.cache.conv_tails[hop.layer // self.cache.blocks]
         first_tail, second_tail = tails[:, hop.lanes]
-        first_in = torch.cat((first_tail, scatter_rows(h, rows, rows.width)), dim=1)
+        first_in = torch.cat(
+            (first_tail, scatter_rows(h[:, : rows.total], rows, rows.width)), dim=1
+        )
         first_out = conv.conv1(first_in.transpose(1, 2)).transpose(1, 2)
         second_in = torch.cat((second_tail, first_out), dim=1)
         second_out = conv.conv2(second_in.transpose(1, 2)).transpose(1, 2)
@@ -275,4 +398,4 @@ class CachedDiT(PackedDiT):
         tails[:, hop.lanes] = torch.stack(
             (first_in.gather(1, last), second_in.gather(1, last))
         )
-        return gather_rows(second_out, rows)
+        return pad_frames(gather_rows(second_out, rows), h.shape[1])

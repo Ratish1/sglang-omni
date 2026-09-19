@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
+
 import pytest
 import torch
 
@@ -10,6 +12,7 @@ from sglang_omni.models.fun_cosyvoice3.flow_hop_cache import (
     CFG_LANES,
     CachedDiT,
     FlowHopCache,
+    step_sizes,
 )
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     PackedDiT,
@@ -242,46 +245,67 @@ def test_hops_that_end_inside_a_chunk_are_rejected_with_the_cache(hops) -> None:
         _scheduler(_cache(400), **hops)
 
 
-@pytest.mark.accelerator
-def test_cached_hops_match_the_hop_over_the_whole_prefix() -> None:
-    from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
+def test_every_step_the_pool_holds_has_a_size_within_a_quarter_of_it() -> None:
+    unit, slots = CFG_LANES * CHUNK, 6950
+    sizes = step_sizes(unit, slots)
 
-    cosyvoice_dit = pytest.importorskip("cosyvoice.flow.DiT.dit")
-    if not _is_fa3_supported():
-        pytest.skip("FA3 is unavailable on this device")
-    device = torch.device("cuda")
-    chunk, channels, speaker = 4, 8, 8
-    torch.manual_seed(0)
-    dit = (
-        cosyvoice_dit.DiT(
-            dim=CONV_CHANNELS,
-            depth=BLOCKS,
-            heads=HEADS,
-            dim_head=HEAD_DIM,
-            ff_mult=2,
-            mel_dim=channels,
-            mu_dim=channels,
-            spk_dim=speaker,
-            out_channels=channels,
-            static_chunk_size=chunk,
-            num_decoding_left_chunks=-1,
-            long_skip_connection=True,
+    assert sizes[-1] == slots // unit * unit
+    assert all(size % unit == 0 for size in sizes)
+    for total in range(unit, sizes[-1] + 1, unit):
+        size = sizes[bisect_left(sizes, total)]
+        assert total <= size < total * 1.25
+
+
+TINY_CHUNK = 4
+TINY_CHANNELS = 8
+
+
+class _TinyFlow:
+    def __init__(self, rows: int) -> None:
+        from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
+
+        cosyvoice_dit = pytest.importorskip("cosyvoice.flow.DiT.dit")
+        if not _is_fa3_supported():
+            pytest.skip("FA3 is unavailable on this device")
+        self.device = torch.device("cuda")
+        torch.manual_seed(0)
+        self.dit = (
+            cosyvoice_dit.DiT(
+                dim=CONV_CHANNELS,
+                depth=BLOCKS,
+                heads=HEADS,
+                dim_head=HEAD_DIM,
+                ff_mult=2,
+                mel_dim=TINY_CHANNELS,
+                mu_dim=TINY_CHANNELS,
+                spk_dim=TINY_CHANNELS,
+                out_channels=TINY_CHANNELS,
+                static_chunk_size=TINY_CHUNK,
+                num_decoding_left_chunks=-1,
+                long_skip_connection=True,
+            )
+            .to(self.device)
+            .eval()
         )
-        .to(device)
-        .eval()
-    )
-    with torch.no_grad():
-        for parameter in dit.parameters():
-            parameter.normal_(0, 0.1)
-    cache = _cache(256, chunk_size=chunk, device="cuda")
-    cached_dit = CachedDiT(dit, cache, device=device)
-    noise, mu, cond = (
-        torch.randn(2, 16, channels, device=device, dtype=DTYPE) for _ in range(3)
-    )
-    spks = torch.randn(2, speaker, device=device, dtype=DTYPE)
-    time_span = torch.linspace(0, 1, STEPS + 1, device=device, dtype=DTYPE)
+        with torch.no_grad():
+            for parameter in self.dit.parameters():
+                parameter.normal_(0, 0.1)
+        as_input = {"device": self.device, "dtype": DTYPE}
+        self.noise, self.mu, self.cond = (
+            torch.randn(rows, 16, TINY_CHANNELS, **as_input) for _ in range(3)
+        )
+        self.spks = torch.randn(rows, TINY_CHANNELS, **as_input)
+        self.time_span = torch.linspace(0, 1, STEPS + 1, **as_input)
 
-    def solve(estimator, spans, rows_of):
+    def cached_dit(self, *, capture_steps: bool) -> CachedDiT:
+        return CachedDiT(
+            self.dit,
+            _cache(256, chunk_size=TINY_CHUNK, device="cuda"),
+            device=self.device,
+            capture_steps=capture_steps,
+        )
+
+    def solve(self, estimator, spans, rows_of) -> torch.Tensor:
         def take(part):
             return torch.cat(
                 [part[row, start:end] for row, (start, end) in zip(rows_of, spans)]
@@ -289,38 +313,73 @@ def test_cached_hops_match_the_hop_over_the_whole_prefix() -> None:
 
         return solve_flow_euler_packed(
             estimator,
-            take(noise),
-            time_span,
-            take(mu),
-            spks[rows_of],
-            take(cond),
-            pack_rows([end - start for start, end in spans], device),
+            take(self.noise),
+            self.time_span,
+            take(self.mu),
+            self.spks[rows_of],
+            take(self.cond),
+            pack_rows([end - start for start, end in spans], self.device),
             cfg_rate=0.7,
             streaming=True,
         )
 
-    def cached_hop(streams, ends, rows_of):
+    def cached_hop(self, estimator, streams, ends, rows_of) -> torch.Tensor:
         for stream, end in zip(streams, ends, strict=True):
-            assert cache.reserve(stream, end)
-        cached_dit.hop = cache.begin_hop(streams)
+            assert estimator.cache.reserve(stream, end)
+        estimator.begin_hop(streams)
         spans = [(stream.frames, stream.reserved) for stream in streams]
-        out = solve(cached_dit, spans, rows_of)
+        out = self.solve(estimator, spans, rows_of)
         for stream in streams:
             stream.frames = stream.reserved
         return out
 
-    def snr_db(value, reference):
-        return 20 * torch.log10(reference.norm() / (value - reference).norm())
+
+def _snr_db(value: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    return 20 * torch.log10(reference.norm() / (value - reference).norm())
+
+
+@pytest.mark.accelerator
+def test_cached_hops_match_the_hop_over_the_whole_prefix() -> None:
+    flow = _TinyFlow(rows=2)
+    cached_dit = flow.cached_dit(capture_steps=False)
+    cache = cached_dit.cache
 
     with torch.inference_mode(), torch.autocast("cuda", dtype=DTYPE):
-        packed_dit = PackedDiT(dit, device=device)
-        whole = solve(packed_dit, [(0, 16), (0, 16)], [0, 1])
+        packed_dit = PackedDiT(flow.dit, device=flow.device)
+        whole = flow.solve(packed_dit, [(0, 16), (0, 16)], [0, 1])
         first, second = cache.open_stream(), cache.open_stream()
-        first_hop = cached_hop([first], [8], [0])
-        cached_hop([second], [12], [1])
-        new = cached_hop([first, second], [16, 16], [0, 1])
-        uncached_first_hop = solve(packed_dit, [(0, 8)], [0])
+        first_hop = flow.cached_hop(cached_dit, [first], [8], [0])
+        flow.cached_hop(cached_dit, [second], [12], [1])
+        new = flow.cached_hop(cached_dit, [first, second], [16, 16], [0, 1])
+        uncached_first_hop = flow.solve(packed_dit, [(0, 8)], [0])
 
     assert torch.equal(first_hop, uncached_first_hop)
-    assert snr_db(new[:, :8], whole[:, 8:16]) > 30
-    assert snr_db(new[:, 8:], whole[:, 28:]) > 30
+    assert _snr_db(new[:, :8], whole[:, 8:16]) > 30
+    assert _snr_db(new[:, 8:], whole[:, 28:]) > 30
+
+
+@pytest.mark.accelerator
+def test_a_hop_replayed_from_its_captured_step_matches_the_eager_hop() -> None:
+    flow = _TinyFlow(rows=4)
+    eager = flow.cached_dit(capture_steps=False)
+    graphed = flow.cached_dit(capture_steps=True)
+    hops: dict[str, list[torch.Tensor]] = {}
+
+    with torch.inference_mode(), torch.autocast("cuda", dtype=DTYPE):
+        for size in (*reversed(graphed.sizes), None):
+            graphed.capture_size = size
+            stream = graphed.cache.open_stream()
+            flow.cached_hop(graphed, [stream], [TINY_CHUNK], [0])
+            graphed.cache.release(stream)
+        for name, estimator in (("eager", eager), ("graphed", graphed)):
+            streams = [estimator.cache.open_stream() for _ in range(4)]
+            hops[name] = [
+                flow.cached_hop(estimator, streams[:1], [8], [0]),
+                flow.cached_hop(estimator, streams[1:], [12, 12, 12], [1, 2, 3]),
+                flow.cached_hop(estimator, streams, [16] * 4, [0, 1, 2, 3]),
+            ]
+
+    assert len(graphed.graphs.entries) == len(graphed.sizes)
+    assert torch.equal(hops["graphed"][0], hops["eager"][0])
+    for replayed, reference in zip(hops["graphed"][1:], hops["eager"][1:]):
+        assert _snr_db(replayed, reference) > 30

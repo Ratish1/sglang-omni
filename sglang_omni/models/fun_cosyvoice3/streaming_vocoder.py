@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Mapping
 
 import torch
@@ -162,10 +162,26 @@ class FunCosyVoice3StreamingVocoderScheduler(
         self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=False)
         cache = self.vocoder.flow_hop_cache
         if cache is not None:
-            stream = cache.open_stream()
-            cache.reserve(stream, 2 * self.token_hop_len * TOKEN_MEL_RATIO)
-            self.vocoder.hop_batch_cached([item], [stream])
-            cache.release(stream)
+            # note(ratish): a hop with no prompt is the smallest step, so it
+            # fits every step size; each pass captures the size it is padded
+            # to, largest first, and the last pass replays unpadded.
+            estimator = flow.cached_estimator
+            smallest = replace(
+                item,
+                prompt_token=item.prompt_token[:, :0],
+                prompt_feat=item.prompt_feat[:, :0],
+            )
+            for size in (*reversed(estimator.sizes), None):
+                estimator.capture_size = size
+                stream = cache.open_stream()
+                cache.reserve(stream, self.token_hop_len * TOKEN_MEL_RATIO)
+                self.vocoder.hop_batch_cached([smallest], [stream])
+                cache.release(stream)
+            if estimator.graphs is not None:
+                logger.info(
+                    f"Fun-CosyVoice3 hop step graphs: {len(estimator.graphs.entries)} "
+                    f"of {len(estimator.sizes)} sizes up to {estimator.sizes[-1]} frames"
+                )
         hop_s = time.monotonic() - started
         mel = self.vocoder.leftover_batch([item])[0]
         self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=True)
