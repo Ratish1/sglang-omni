@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import sglang_omni.models.fun_cosyvoice3.model_runner as model_runner_module
+from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.models.fun_cosyvoice3.model_runner import (
     FunCosyVoice3MlxSchedulerModelRunner,
     FunCosyVoice3ModelRunner,
@@ -308,7 +309,7 @@ def test_cosyvoice3_load_weights_maps_custom_and_backbone_keys(
     assert torch.equal(forwarded[0][1], torch.full((3, 3), 3.0))
 
 
-def test_cosyvoice3_runner_builds_prefill_embedding_slice_after_prefix() -> None:
+def test_cosyvoice3_prefill_attaches_the_embedding_slice_after_the_prefix() -> None:
     runner = object.__new__(FunCosyVoice3ModelRunner)
     runner.model = torch.nn.Linear(3, 3, bias=False)
     requests = [
@@ -321,10 +322,16 @@ def test_cosyvoice3_runner_builds_prefill_embedding_slice_after_prefix() -> None
             )
         )
     ]
-    forward_batch = SimpleNamespace(input_ids=torch.zeros(2, dtype=torch.long))
+    forward_batch = SimpleNamespace(
+        input_ids=torch.zeros(2, dtype=torch.long),
+        input_embeds=None,
+        replace_embeds=None,
+    )
 
-    result = runner.build_prefill_input_embeds(forward_batch, requests)
+    runner.before_prefill(forward_batch, None, requests)
 
+    assert forward_batch.input_embeds is None
     assert torch.equal(
-        result, torch.tensor([[4, 5, 6, 7], [8, 9, 10, 11]], dtype=torch.float32)
+        get_omni_prefill_inputs(forward_batch).input_embeds,
+        torch.tensor([[4, 5, 6, 7], [8, 9, 10, 11]], dtype=torch.float32),
     )
