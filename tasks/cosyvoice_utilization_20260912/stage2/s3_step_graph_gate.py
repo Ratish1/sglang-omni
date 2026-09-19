@@ -107,6 +107,7 @@ def main() -> None:
     parser.add_argument("--stagger", type=int, default=4)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--samples", type=int, default=1088)
+    parser.add_argument("--spin-step", type=int, default=None)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -175,9 +176,28 @@ def main() -> None:
     flow.cached_estimator = CachedDiT(
         flow.decoder.estimator, cache, device=args.device, capture_steps=True
     )
-    scheduler.warmup_now()
-    torch.cuda.synchronize()
+    # The scheduler's own capture loop, one size at a time, so the card's free
+    # memory can be read after each.
     estimator = flow.cached_estimator
+    smallest = FlowBatchInput(
+        token=torch.zeros(1, TOKEN_HOP_LEN + PRE_LOOKAHEAD_LEN, dtype=torch.int32),
+        prompt_token=torch.zeros(1, 0, dtype=torch.int32),
+        prompt_feat=torch.zeros(1, 0, flow.output_size),
+        embedding=torch.zeros(1, flow.spk_embed_affine_layer.in_features),
+    )
+    info["capture_mib_by_size"] = {}
+    for size in (*reversed(estimator.sizes), None):
+        estimator.capture_size = size
+        free_at, _ = torch.cuda.mem_get_info()
+        handle = cache.open_stream()
+        cache.reserve(handle, TOKEN_HOP_LEN * TOKEN_MEL_RATIO)
+        vocoder.hop_batch_cached([smallest], [handle])
+        cache.release(handle)
+        torch.cuda.synchronize()
+        if size is not None:
+            info["capture_mib_by_size"][size] = (
+                free_at - torch.cuda.mem_get_info()[0]
+            ) / 2**20
     info["capture_s"] = time.perf_counter() - started
     info["capture_mib"] = (free_before - torch.cuda.mem_get_info()[0]) / 2**20
     info["sizes"] = list(estimator.sizes)
@@ -269,19 +289,21 @@ def main() -> None:
         poisoned = call()
         flow_hop_cache.pad_frames = zero_pad
 
-        stop.clear()
-        spinner = threading.Thread(target=spin, daemon=True)
-        spinner.start()
-        estimator.sizes = ()
-        _, row["eager_spin_returned_ms"], row["eager_spin_done_ms"] = timed(
-            call, args.repeats, rewind
-        )
-        estimator.sizes = sizes
-        _, row["replayed_spin_returned_ms"], row["replayed_spin_done_ms"] = timed(
-            call, args.repeats, rewind
-        )
-        stop.set()
-        spinner.join()
+        if step == args.spin_step:
+            # One repeat: an eager call beside a spinning thread takes minutes.
+            stop.clear()
+            spinner = threading.Thread(target=spin, daemon=True)
+            spinner.start()
+            estimator.sizes = ()
+            _, row["eager_spin_returned_ms"], row["eager_spin_done_ms"] = timed(
+                call, 1, rewind
+            )
+            estimator.sizes = sizes
+            _, row["replayed_spin_returned_ms"], row["replayed_spin_done_ms"] = timed(
+                call, 1, rewind
+            )
+            stop.set()
+            spinner.join()
 
         row["replayed_equals_eager"] = all(
             torch.equal(a, b) for a, b in zip(replayed, eager, strict=True)
