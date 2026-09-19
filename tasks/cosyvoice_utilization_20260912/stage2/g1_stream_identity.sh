@@ -104,7 +104,9 @@ fi
 # An empty SEED and no token limit is the benchmark's own default request: no
 # generation json is written and the flag is left off.
 GENERATION_ARG=""
-if [[ "$MAX_NEW_TOKENS" == "unset" ]]; then
+if [[ "$MAX_NEW_TOKENS" == "unset" && -n "$SEED" ]]; then
+  printf '{"seed": %d, "max_new_tokens": null}\n' "$SEED" > "$OUT/generation.json"
+elif [[ "$MAX_NEW_TOKENS" == "unset" ]]; then
   # The benchmark's own default sends max_new_tokens 2048, which overrides the
   # engine's bound of 20 tokens per text token. A null sends no limit at all,
   # which is what a client that passes only text does.
