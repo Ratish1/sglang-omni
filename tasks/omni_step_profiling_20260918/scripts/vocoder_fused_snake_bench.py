@@ -98,16 +98,17 @@ def main() -> None:
             codes = random_codes(batch, width, device)
             graphs, waves, kernels, states = {}, {}, {}, {}
             for name, (_, incremental) in arms.items():
-                # note(ratish): the decode rebinds the state's tensors, and a capture
-                # empties the allocator cache, so the tensors the graph reads are held
-                # here for as long as the graph lives
+                # note(ratish): the decode rebinds the state's tensors and the next
+                # capture empties the allocator cache, so the inputs, the rebound state
+                # and the output of a graph are all held for as long as it lives
                 state = incremental.init_state(
                     batch, device=device, dtype=torch.bfloat16
                 )
-                states[name] = state_tensors(state)
+                inputs = state_tensors(state)
                 graph, waveform = capture(incremental._decode_tensors, codes, state)
+                states[name] = (inputs, state, waveform)
                 with torch.inference_mode():
-                    for tensor in states[name]:
+                    for tensor in inputs:
                         tensor.zero_()
                 graph.replay()
                 torch.cuda.synchronize()
