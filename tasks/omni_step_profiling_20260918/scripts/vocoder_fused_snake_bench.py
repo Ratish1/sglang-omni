@@ -58,6 +58,7 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--old-kernels", required=True)
     parser.add_argument("--reps", type=int, default=30)
+    parser.add_argument("--arms", default="eager,old,new")
     args = parser.parse_args()
     device = torch.device("cuda", 0)
     spec = importlib.util.spec_from_file_location(
@@ -74,7 +75,7 @@ def main() -> None:
         type(m) for m in pristine.modules() if type(m).__name__ == "SnakeBeta"
     )
     arms = {}
-    for name in ("eager", "old", "new"):
+    for name in args.arms.split(","):
         decoder = copy.deepcopy(pristine)
         if name == "old":
             print(
@@ -126,6 +127,15 @@ def main() -> None:
                 for name in arms:
                     times[name].append(replay_ms(graphs[name], args.reps))
             best = {name: min(values) for name, values in times.items()}
+            if len(arms) < 3:
+                print(
+                    f"{width:>5} {batch:>5} "
+                    + " ".join(f"{n} {v:.3f}" for n, v in best.items()),
+                    flush=True,
+                )
+                del graphs, states
+                torch.cuda.empty_cache()
+                continue
             ratios.append(best["new"] / best["old"])
             print(
                 f"{width:>5} {batch:>5} {best['eager']:>9.3f} {best['old']:>9.3f} {best['new']:>9.3f} "
@@ -137,6 +147,9 @@ def main() -> None:
             )
             del graphs, states
             torch.cuda.empty_cache()
+    if not ratios:
+        print("\nnew against old: not measured (fewer than three arms)")
+        return
     geo = math.exp(statistics.fmean(math.log(v) for v in ratios))
     print(
         f"\nnew against old: geo {geo:.3f}, worst {max(ratios):.3f}, best {min(ratios):.3f}; "
