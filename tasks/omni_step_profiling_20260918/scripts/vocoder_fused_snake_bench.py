@@ -43,12 +43,15 @@ def measure(incremental, device, reps):
             codes = random_codes(batch, width, device)
             state = incremental.init_state(batch, device=device, dtype=torch.bfloat16)
             graph, waveform = capture(incremental._decode_tensors, codes, state)
-            for tensors in (state.conv_histories, state.transconv_overlaps):
-                for value in tensors.values():
-                    value.zero_()
-            for tensors in (state.transformer_keys, state.transformer_values):
-                for value in tensors.values():
-                    value.zero_()
+            with torch.inference_mode():
+                for tensors in (
+                    state.conv_histories,
+                    state.transconv_overlaps,
+                    state.transformer_keys,
+                    state.transformer_values,
+                ):
+                    for value in tensors.values():
+                        value.zero_()
             graph.replay()
             torch.cuda.synchronize()
             first = waveform.clone()
