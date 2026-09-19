@@ -38,15 +38,21 @@ boot() {
     if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$port/health)" = 200 ]; then healthy=1; break; fi
     sleep 5
   done
-  if [ $healthy = 0 ]; then
-    echo "server not healthy" > "$d/FAILED"
-  else
-    echo "healthy $(date +%T) startup_s $(( $(date +%s) - began ))" >> "$d/progress.txt"
+  [ $healthy = 0 ] && echo "server not healthy" > "$d/FAILED"
+  # note(ratish): both arms bench at the same time, so neither carries the
+  # other's startup compile or its scoring on the shared host
+  case $label in *_a) peer=$OUT/${label%_a}_b ;; *) peer=$OUT/${label%_b}_a ;; esac
+  touch "$d/READY"
+  for _ in $(seq 720); do [ -e "$peer/READY" ] && break; sleep 5; done
+  if [ $healthy = 1 ]; then
+    echo "healthy startup_s $(( $(date +%s) - began )), bench start $(date +%T)" >> "$d/progress.txt"
     (cd "$TREE_A" && CUDA_VISIBLE_DEVICES=$card PYTHONPATH=$TREE_A timeout 7200 $PY -m benchmarks.eval.benchmark_tts_seedtts \
       --model $MODEL --meta "$meta" --lang en --use-existing-server --host 127.0.0.1 --port $port \
       --warmup 1 --stream --generate-only --output-dir "$d/bench" "$@") > "$d/bench.log" 2>&1
     echo "bench rc $? $(date +%T)" >> "$d/progress.txt"
   fi
+  touch "$d/BENCHED"
+  for _ in $(seq 1440); do [ -e "$peer/BENCHED" ] && break; sleep 5; done
   kill -TERM -- -"$(cat "$d/server.pgid")" 2>/dev/null
   sleep 15
   kill -0 -- -"$(cat "$d/server.pgid")" 2>/dev/null && kill -KILL -- -"$(cat "$d/server.pgid")"
