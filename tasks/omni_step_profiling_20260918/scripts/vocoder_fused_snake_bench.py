@@ -94,9 +94,11 @@ def main() -> None:
         for batch in BATCHES:
             torch.manual_seed(width * 100 + batch)
             codes = random_codes(batch, width, device)
-            graphs, waves, kernels = {}, {}, {}
+            graphs, waves, kernels, states = {}, {}, {}, {}
             for name, (_, incremental) in arms.items():
-                state = incremental.init_state(
+                # note(ratish): a graph reads and writes its state in place on every
+                # replay, so the state lives as long as the graph
+                state = states[name] = incremental.init_state(
                     batch, device=device, dtype=torch.bfloat16
                 )
                 graph, waveform = capture(incremental._decode_tensors, codes, state)
@@ -128,7 +130,7 @@ def main() -> None:
                 f"{str(torch.equal(waves['new'], waves['eager'])):>9}",
                 flush=True,
             )
-            del graphs
+            del graphs, states
             torch.cuda.empty_cache()
     geo = math.exp(statistics.fmean(math.log(v) for v in ratios))
     print(
