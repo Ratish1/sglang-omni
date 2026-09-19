@@ -685,8 +685,10 @@ class Qwen3TTSIncrementalDecoder:
         context: Dynamo guards on both, and the step advances the state.
         """
         if self._compiled_kernel is None:
+            # note(ratish): one kernel with a symbolic batch and width serves every
+            # captured shape; a static compile per shape costs about 20 s each.
             self._compiled_kernel = torch.compile(
-                self._decode_tensors, dynamic=False, fullgraph=True
+                self._decode_tensors, dynamic=True, fullgraph=True
             )
         shape = (int(codes.shape[0]), int(codes.shape[-1]))
         if shape in self._compiled_shapes:
