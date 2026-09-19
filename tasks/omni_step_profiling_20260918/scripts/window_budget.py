@@ -212,6 +212,9 @@ def main() -> None:
                 "other": clipped_us(others, starts["other"], start, end),
                 "idle": (end - start)
                 - clipped_us(everything, starts["all"], start, end),
+                "idle_in": (span_end - start)
+                - clipped_us(everything, starts["all"], start, span_end),
+                "kind": kind,
             }
         )
     print(
@@ -242,6 +245,23 @@ def main() -> None:
         "wall share by kind: "
         + ", ".join(f"{k} {100 * v / window:.1f}%" for k, v in sorted(by_kind.items()))
     )
+
+    print(
+        "\ndevice empty by kind (ms): inside the run_batch span / in the host loop after it; "
+        "per-step distribution; share held by the emptiest tenth of the steps"
+    )
+    for kind in sorted(by_kind):
+        rows = [r for group in classes.values() for r in group if r["kind"] == kind]
+        idles = sorted(r["idle"] for r in rows)
+        inside = sum(r["idle_in"] for r in rows)
+        top = sum(idles[-max(1, len(idles) // 10) :])
+        print(
+            f"  {kind:8s} n={len(rows):<5d} total {sum(idles) / 1e3:8.1f} = {100 * sum(idles) / window:4.1f}% of window; "
+            f"in span {inside / 1e3:8.1f}, after span {(sum(idles) - inside) / 1e3:8.1f}; "
+            f"p50 {quantile(idles, .5) / 1e3:.2f} p90 {quantile(idles, .9) / 1e3:.2f} "
+            f"p99 {quantile(idles, .99) / 1e3:.2f} max {idles[-1] / 1e3:.2f}; "
+            f"emptiest tenth holds {100 * top / max(sum(idles), 1e-9):.0f}%"
+        )
 
     for owner, _ in sorted(
         merged.items(), key=lambda item: -sum(hi - lo for lo, hi in item[1])
