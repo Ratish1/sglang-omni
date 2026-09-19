@@ -127,5 +127,5 @@ def test_cuda_engine_prefills_through_breakable_graphs(
     )
     assert defaults["cuda_graph_backend_prefill"] == "breakable"
     assert defaults["cuda_graph_bs_prefill"] == build_default_prefill_cuda_graph_bs(
-        engine_builder_module.PREFILL_GRAPH_MAX_TOKENS
+        defaults["max_prefill_tokens"]
     )

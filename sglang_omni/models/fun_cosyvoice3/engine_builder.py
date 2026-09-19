@@ -27,8 +27,9 @@ from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoi
 
 logger = logging.getLogger(__name__)
 
-# The budget Higgs and Qwen3-TTS capture; a prefill above it runs eager.
-PREFILL_GRAPH_MAX_TOKENS = 512
+# The largest prefill the scheduler forms, which is also the largest captured:
+# at c16 a third of the prefill batches exceed 512 tokens and reach 1,207.
+MAX_PREFILL_TOKENS = 4096
 
 
 class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
@@ -130,11 +131,10 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
             "disable_overlap_schedule": True,
             "enable_torch_compile": False,
             "mem_fraction_static": 0.85,
-            "max_prefill_tokens": 4096,
-            # note(ratish): longer prefills run eager.
+            "max_prefill_tokens": MAX_PREFILL_TOKENS,
             "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
             "cuda_graph_bs_prefill": build_default_prefill_cuda_graph_bs(
-                PREFILL_GRAPH_MAX_TOKENS
+                MAX_PREFILL_TOKENS
             ),
             "sampling_backend": "pytorch",
             "trust_remote_code": True,
