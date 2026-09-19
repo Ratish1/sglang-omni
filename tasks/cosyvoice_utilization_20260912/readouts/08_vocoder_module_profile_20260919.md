@@ -80,6 +80,28 @@ About 1,200 kernels per row per call, the rows one after another, each over the 
 history (150 to 750 frames here). The f0 predictor's float64 convs are 19 % of the device time in
 2 % of the kernels; the Snake activations are 47 % of the launches for 15 % of the time.
 
+## 4a. The DiT weight precast under the same capture (raw: `s4-r2`)
+
+`stack/cosyvoice-4-2-precast` 2053189b0 (the step graph branch plus the precast commit; the
+precast alone on current main is `slice/cosyvoice-6-1-dit-weight-precast` b2089cf5c). Same
+schedule, same card, before to after:
+
+| call | step 0: wall / kernels / kernel ms | step 5 |
+|---|---|---|
+| plain hop | 372 to 299 / 16,910 to 13,690 / 92 to 72 | 981 to 946 / 17,044 to 13,824 / 982 to 950 |
+| cached hop, eager | 372 to 300 / 16,914 to 13,694 / 94 to 73 | 394 to 339 / 17,048 to 13,828 / 265 to 243 |
+| cached hop, replayed | 94 to 75 / same kernels / 89 to 72 | 255 to 230 / same kernels / 263 to 240 |
+| final | 363 to 295 / 16,885 to 13,665 / 86 to 68 | 955 to 922 / 16,879 to 13,659 / 960 to 929 |
+| HiFT | unchanged | unchanged |
+
+3,220 kernels fewer per Flow call, which is the 322 weight and bias tensors times ten Euler steps
+that plan 14 counted; the matmuls do not move (423 to 424 ms). Pointwise kernels 12,681 to 9,461
+and 376 to 340 ms on the large plain hop, 45 to 24 ms on the small one. One cast per Linear is
+left, the float32 input (`attn.to_q`: 660 pointwise kernels and 17.6 ms to 220 and 13.6 ms), so
+the input cast is the larger part of what a Linear pays. Small calls gain about 20 percent of
+their wall, eager or replayed; large device bound calls about 3.5 percent. Exactness is settled in
+plan 14 section 7: mel bit identical on hops and finals at 1, 4 and 16 rows in one process.
+
 ## 5. What this points at, by level
 
 High: nothing new; the cache and the captured step do what section 1 shows.
