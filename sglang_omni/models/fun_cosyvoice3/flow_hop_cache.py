@@ -79,8 +79,8 @@ class StreamHopCache:
 @dataclass
 class CachedHop:
     """One hop's new frames in packed lane major order: the (row, chunk) query
-    segments, the frames each one's lane holds before it, and the next
-    (Euler step, block) pool layer."""
+    segments, the frames each one's lane holds before it, and the Euler step
+    and block the solve is at."""
 
     rows: PackedRows
     lanes: torch.Tensor
@@ -91,7 +91,8 @@ class CachedHop:
     cache_seqlens: torch.Tensor
     cu_seqlens_q: torch.Tensor
     max_seqlen_q: int
-    layer: int = 0
+    step: int = 0
+    block: int = 0
 
 
 class FlowHopCache:
@@ -326,7 +327,9 @@ class CachedDiT(PackedDiT):
                 cache_enabled=False,
             ):
                 self.graphs.capture(**inputs)
-        return self.run_step(**inputs)[:, :total]
+        out = self.run_step(**inputs)[:, :total]
+        self.hop.step += 1
+        return out
 
     def step(
         self,
@@ -346,12 +349,12 @@ class CachedDiT(PackedDiT):
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     ) -> torch.Tensor:
         """query, key, value: (1, step frames, heads * head_dim), the hop's
-        frames first. Returns the same shape. Each call is the next
-        (Euler step, block) pool layer."""
+        frames first. Returns the same shape. Each call is the step's next
+        block, whose pool layer is step * blocks + block."""
         hop, cache = self.hop, self.cache
         total = hop.rows.total
         shape = (-1, cache.heads, cache.head_dim)
-        k_pages, v_pages = cache.pages[hop.layer]
+        k_pages, v_pages = cache.pages[hop.step * cache.blocks + hop.block]
         # note(ratish): FA3 appends each segment's K and V at cache_seqlens
         # through the page table, then attends; a row's later chunk reads what
         # its earlier chunk appended in the same call.
@@ -368,7 +371,7 @@ class CachedDiT(PackedDiT):
             max_seqlen_q=hop.max_seqlen_q,
             causal=False,
         )
-        hop.layer += 1
+        hop.block += 1
         return pad_frames(out.reshape(1, total, -1), query.shape[1])
 
     # note(ratish): rows is the hook's contract; the breaks below replay with
@@ -381,9 +384,12 @@ class CachedDiT(PackedDiT):
     def _conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
         hop = self.hop
         rows = hop.rows
+        # note(ratish): the conv opens every run of a step, the repeated runs
+        # of a capture too, so the step's block count restarts here.
+        hop.block = 0
         conv = self.dit.input_embed.conv_pos_embed
         context = conv.kernel_size - 1
-        tails = self.cache.conv_tails[hop.layer // self.cache.blocks]
+        tails = self.cache.conv_tails[hop.step]
         first_tail, second_tail = tails[:, hop.lanes]
         first_in = torch.cat(
             (first_tail, scatter_rows(h[:, : rows.total], rows, rows.width)), dim=1
