@@ -36,7 +36,7 @@ def test_fuse_vocoder_decoder_keeps_originals_on_prewarm_failure(
     second = _StubSnakeBeta(4)
     decoder = torch.nn.Sequential(first, torch.nn.Sequential(second))
 
-    monkeypatch.setattr(vocoder_kernels, "_HAS_TRITON", True)
+    monkeypatch.setattr(vocoder_kernels, "HAS_TRITON", True)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
     def fail_prewarm(*_args: object, **_kwargs: object) -> None:
@@ -71,7 +71,7 @@ def test_fused_snake_beta_cuda_parity_uses_kernel(
 ) -> None:
     # note (db-ol): on the accelerator runner a missing Triton must fail
     # loudly, a skip here would hide the kernel from CI again.
-    assert vocoder_kernels._HAS_TRITON, "Triton is required on accelerator CI"
+    assert vocoder_kernels.HAS_TRITON, "Triton is required on accelerator CI"
 
     torch.manual_seed(0)
     device = torch.device("cuda")
