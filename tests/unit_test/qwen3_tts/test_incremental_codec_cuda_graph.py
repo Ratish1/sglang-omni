@@ -409,7 +409,7 @@ def test_incremental_codec_warmup_traces_a_compiled_shape_on_its_own_tensors() -
                 frame_positions=torch.zeros(int(index.shape[0]), device=device),
             )
 
-    def runner(compile_fresh_frames):
+    def runner(compile_decode):
         return Qwen3TTSIncrementalCodecCudaGraphRunner(
             Decoder(),
             device=device,
@@ -418,7 +418,7 @@ def test_incremental_codec_warmup_traces_a_compiled_shape_on_its_own_tensors() -
             mode="cold",
             fresh_frames=(4,),
             batch_sizes=(1,),
-            compile_fresh_frames=compile_fresh_frames,
+            compile_decode=compile_decode,
             arena=Arena(),
             enabled=False,
         )
@@ -429,7 +429,7 @@ def test_incremental_codec_warmup_traces_a_compiled_shape_on_its_own_tensors() -
         pool=None, stream=torch.cuda.Stream(device=device), keepalives=[static_codes]
     )
 
-    runner((4,))._warmup_capture_shape(key, static_codes, resources)
+    runner(True)._warmup_capture_shape(key, static_codes, resources)
 
     assert len(traces) == 1
     codes, state, inference, grad = traces[0]
@@ -443,7 +443,7 @@ def test_incremental_codec_warmup_traces_a_compiled_shape_on_its_own_tensors() -
 
     traces.clear()
     decodes.clear()
-    runner(())._warmup_capture_shape(key, static_codes, resources)
+    runner(False)._warmup_capture_shape(key, static_codes, resources)
 
     assert traces == []
     assert [entry[2] for entry in decodes] == [False, False, False]
