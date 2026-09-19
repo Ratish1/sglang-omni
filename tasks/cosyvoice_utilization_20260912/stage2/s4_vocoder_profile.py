@@ -55,14 +55,20 @@ nvtx = torch.cuda.nvtx
 
 def name_modules(root: torch.nn.Module, prefix: str) -> None:
     """An NVTX range named by module path around every forward under root."""
+
+    # A hook's return value replaces the module's input or output, and the
+    # NVTX calls return the range depth, so both hooks return nothing.
+    def pop(module, args, output) -> None:
+        nvtx.range_pop()
+
     for path, module in root.named_modules():
         name = f"{prefix}.{path}" if path else prefix
-        module.register_forward_pre_hook(
-            lambda module, args, name=name: nvtx.range_push(name)
-        )
-        module.register_forward_hook(
-            lambda module, args, output: nvtx.range_pop(), always_call=True
-        )
+
+        def push(module, args, name=name) -> None:
+            nvtx.range_push(name)
+
+        module.register_forward_pre_hook(push)
+        module.register_forward_hook(pop, always_call=True)
 
 
 def main() -> None:
