@@ -194,6 +194,26 @@ fraction 0.3, c8 and c16, two boots each; no CosyVoice change on main since): se
 continuity and first audio, unseeded c8 and c16 with the fallback count, one starved budget run
 that must complete on the fallback.
 
+## 6b. Status, 2026-09-19: three parked branches, the vocoder is the bottleneck
+
+Every branch is pushed to the fork and keeps its worktree under `.worktrees/`. None is a PR.
+Raw runs: `artifacts/cosyvoice-4090-20260918/` (`s1-r14` to `s1-r17`, `s3-r1`, `s5-r1`).
+RTX 4090 D, streaming, English split, unseeded, `max_new_tokens` unset, memory fraction 0.28.
+
+| branch | head | worktree | what it is | measured |
+|---|---|---|---|---|
+| `slice/cosyvoice-4-1-hop-prefix-cache` | 7b3e3c41e | `cosy-4-1` | S1, the hop K/V cache | c8 +9.6 % req/s (98 % rows cached); c16 3.749 against main 3.624, latency p99 +12 % (61 % rows cached, mixed steps); readout 07 sections 4 to 4g |
+| `slice/cosyvoice-4-2-hop-step-graph` | 66e6ce77f | `cosy-4-2` | S3, stacked on S1: SGLang's `BaseBreakableCudaGraphRunner` and `eager_on_graph` over the cached step, step sizes up to the pool's slots | probe `s3-r1`: replay bit identical to the eager cached hop, padded frames inert; 195 to 91 ms at 800 packed frames, 279 to 253 ms at 3,200; CUDA runtime calls 20,761 to 5,281; capture 8.3 s and 5.28 GiB for 25 sizes up to 14,600 frames (about 80 KB per captured frame). Serving not run: with the 6 GiB pool the default launch did not fit the 24 GB card next to another tenant, and 0.28 left no AR pool with the 4 GiB pool. Needs a 24 GB yaml (memory fraction recomputed) on a clean card |
+| `slice/cosyvoice-5-1-ar-breakable-prefill` | b98fbfef4 | `cosy-5-1` | S4 on upstream main ebd577ea0: the Higgs and Qwen3-TTS sidecar contract, `custom_prefill_forward` removed, graphs up to `max_prefill_tokens` | capture 4.5 s, 0.39 GB; 486 of 487 prefill batches replay at c16; c16 3.660 req/s against 3.624, first audio p95 2.59 against 2.69 s; c1 inside the spread of two main boots (0.712 against 0.728 and 0.690 req/s); seeded c1: 9 of 64 samples differ between two main boots, 54 of the 55 stable ones byte identical. With a 512 cap 30 % of c16 prefill batches (57 % of the tokens) ran eager. Torch MPS path not run |
+
+Why S4 moves nothing here while it gave Qwen3-TTS +4 to +10 %: the c16 ledger (readout 07
+section 4g) has the vocoder thread inside a step for 284 of 297 s and the AR idle half of the
+time, so the AR side is not what a request waits for. Order from here: the vocoder first (S1 with
+S3, then the mixed step and HiFT), and S4 as its own PR once the AR is back on the critical path.
+
+Order of work agreed with the user on 2026-09-19: by how established the path is, reuse first,
+and one PR per slice; S3 is measured against S1 as A (3.749 req/s) from one 24 GB yaml.
+
 ## 7. Validation tasks, before the design of S3 is frozen
 
 | # | unknown | how |
