@@ -2411,7 +2411,7 @@ def test_qwen3_tts_window_frames_build_the_window_runner(
         scheduler._initial_window_decode_graphs._batch_sizes
         == scheduler._initial_incremental_decode_graphs._batch_sizes
     )
-    assert scheduler._initial_window_decode_graphs._compile_decode is False
+    assert scheduler._initial_window_decode_graphs._compile_fresh_frames == frozenset()
     assert scheduler._initial_incremental_decode_graphs._fresh_frames == (1, 2)
     assert (
         scheduler.codec_state_stats()["cuda_graphs"]["window"]["binding"]["mode"]
@@ -2427,9 +2427,15 @@ def test_qwen3_tts_window_frames_build_the_window_runner(
         incremental_codec_cuda_graph_window_frames=(1, 2, 4, 8, 16, 32),
     )
 
-    assert compiled._initial_window_decode_graphs._compile_decode is True
-    assert compiled._followup_incremental_graph_holders[0]._compile_decode is True
-    assert compiled._initial_incremental_decode_graphs._compile_decode is True
+    assert compiled._initial_window_decode_graphs._compile_fresh_frames == frozenset(
+        {1, 2, 4, 8}
+    )
+    assert compiled._followup_incremental_graph_holders[
+        0
+    ]._compile_fresh_frames == frozenset(range(1, 9))
+    assert compiled._initial_incremental_decode_graphs._compile_fresh_frames == (
+        frozenset(compiled._initial_incremental_decode_graphs._fresh_frames)
+    )
 
 
 def test_qwen3_tts_empty_window_frames_disable_the_window_runner(

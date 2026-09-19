@@ -93,12 +93,12 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         batch_sizes: tuple[int, ...] = (1, 2, 4, 8),
         min_free_gb: float = 3.0,
         enabled: bool = True,
-        compile_decode: bool = False,
+        compile_fresh_frames: Sequence[int] = (),
         arena: Qwen3TTSCodecStateArena,
         stream_priority: int = 0,
     ) -> None:
         self._decoder = decoder
-        self._compile_decode = bool(compile_decode)
+        self._compile_fresh_frames = frozenset(int(f) for f in compile_fresh_frames)
         # note (luojiaxuan): bound to an arena, a graph gathers its cohort's
         # rows from the arena, decodes, and scatters the advanced rows back,
         # all inside the replay. The host then only writes slot ids and codes.
@@ -281,6 +281,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         try:
             self._warmup_capture_shape(key, static_codes, resources)
             current_stream = torch.cuda.current_stream(self._device)
+            compiled = key.fresh_frames in self._compile_fresh_frames
             static_index = self._scratch_index(key.batch_bucket)
             resources.keepalives.append(static_index)
             graph = torch.cuda.CUDAGraph()
@@ -298,7 +299,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
                 ):
                     state = self._arena.gather_by_index(static_index)
                     waveform = self._decoder.decode(
-                        static_codes, state, compiled=self._compile_decode
+                        static_codes, state, compiled=compiled
                     )
                     self._arena.scatter_by_index(static_index, state)
             finally:
@@ -327,9 +328,10 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         """Run eager decodes that settle one shape before graph capture."""
 
         capture_stream = resources.stream
+        compiled = key.fresh_frames in self._compile_fresh_frames
         capture_stream.wait_stream(torch.cuda.current_stream(self._device))
         with torch.cuda.stream(capture_stream), torch.inference_mode():
-            if self._compile_decode:
+            if compiled:
                 # note(ratish): trace on the tensors the warmups and the capture
                 # use; Dynamo guards on inference tensors and would trace again.
                 trace_state = self._arena.gather_by_index(
@@ -342,9 +344,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
                     self._scratch_index(key.batch_bucket)
                 )
                 resources.keepalives.append(warmup_state)
-                self._decoder.decode(
-                    static_codes, warmup_state, compiled=self._compile_decode
-                )
+                self._decoder.decode(static_codes, warmup_state, compiled=compiled)
         capture_stream.synchronize()
         del resources.keepalives[1:]
 

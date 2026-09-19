@@ -780,7 +780,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             num_quantizers=num_quantizers,
             codec_state_slots=int(codec_state_slots),
             enabled=incremental_codec_cuda_graph,
-            compile_decode=bool(incremental_codec_compile),
+            compile_steady=bool(incremental_codec_compile),
             # note (luojiaxuan): with no reference prefix a bootstrap decode is
             # exactly the first chunk, plus one frame when bootstrap silence
             # suppression bumps it, so those two widths are the COLD graphs a
@@ -919,7 +919,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         num_quantizers: int,
         codec_state_slots: int,
         enabled: bool,
-        compile_decode: bool,
+        compile_steady: bool,
         cold_frames: Sequence[int],
         window_frames: Sequence[int],
         min_free_gb: float,
@@ -955,7 +955,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             batch_sizes=graph_batch_sizes,
             min_free_gb=min_free_gb,
             enabled=graph_enabled,
-            compile_decode=compile_decode,
+            compile_fresh_frames=tuple(cold_frames) if compile_steady else (),
             arena=self._codec_arena,
             stream_priority=graph_priority,
         )
@@ -972,7 +972,17 @@ class Qwen3TTSStreamingVocoderScheduler(
                 batch_sizes=graph_batch_sizes,
                 min_free_gb=min_free_gb,
                 enabled=graph_enabled,
-                compile_decode=compile_decode,
+                # note(ratish): windows up to the stride share the chunk kernel; a
+                # compiled wider window holds about five times the eager graph memory.
+                compile_fresh_frames=(
+                    tuple(
+                        frames
+                        for frames in window_frames
+                        if frames <= self._stream_followup_stride
+                    )
+                    if compile_steady
+                    else ()
+                ),
                 arena=self._codec_arena,
                 stream_priority=graph_priority,
             )
@@ -1015,7 +1025,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 batch_sizes=graph_batch_sizes,
                 min_free_gb=min_free_gb,
                 enabled=graph_enabled,
-                compile_decode=compile_decode,
+                compile_fresh_frames=warm_fresh_frames if compile_steady else (),
                 arena=self._codec_arena,
                 stream_priority=graph_priority,
             )
