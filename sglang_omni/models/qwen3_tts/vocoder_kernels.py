@@ -54,8 +54,7 @@ except Exception:  # pragma: no cover
 
 _ALLOWED_CHANNELS = frozenset((1536, 768, 384, 192, 96))
 _MAX_BATCH = 8
-# note(ratish): the launch puts cdiv(T, 1024) programs on its second axis, which
-# CUDA caps at 65,535; the 96 channel stage alone reaches 1,920 samples per frame
+# note (ratish): CUDA caps the launch's second axis, cdiv(T, 1024), at 65,535
 _MAX_T = 65535 * 1024
 
 logger = logging.getLogger(__name__)
@@ -106,19 +105,8 @@ def _block_for(t: int) -> int:
     return 1024
 
 
-def _fake_launch(
-    x: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor
-) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-# note(ratish): an opaque op, so the decoder's torch.compile never traces the
-# device context or the Triton launch; tracing them fails the runner's capture
-@register_custom_op(
-    op_name="qwen3_tts_fused_snake_beta",
-    mutates_args=[],
-    fake_impl=_fake_launch,
-)
+# note (ratish): opaque to torch.compile, which cannot trace the Triton launch
+@register_custom_op(op_name="qwen3_tts_fused_snake_beta", mutates_args=[], out_shape=0)
 def _launch(x: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
     batch, channels, t = x.shape
     out = torch.empty_like(x)

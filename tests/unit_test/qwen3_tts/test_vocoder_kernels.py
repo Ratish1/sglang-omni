@@ -107,6 +107,7 @@ def test_fused_snake_beta_cuda_parity_uses_kernel(
     not torch.cuda.is_available(), reason="fused SnakeBeta compile needs CUDA"
 )
 def test_fused_snake_beta_survives_a_fullgraph_compile() -> None:
+    """A fullgraph compile of a fused decoder raised Unsupported on the launch."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     original = _StubSnakeBeta(96).to(device=device, dtype=torch.bfloat16)
