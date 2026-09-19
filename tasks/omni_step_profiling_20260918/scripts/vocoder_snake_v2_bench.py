@@ -87,7 +87,80 @@ KERNELS = {
 }
 
 
+@triton.jit(
+    do_not_specialize=[
+        "out_ptr",
+        "x_ptr",
+        "a_ptr",
+        "r_ptr",
+        "rows",
+        "channels",
+        "length",
+    ]
+)
+def _snake_tile(
+    out_ptr,
+    x_ptr,
+    a_ptr,
+    r_ptr,
+    rows,
+    channels,
+    length,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+):
+    # note(ratish): one program is a ROWS x COLS tile; the channel is one modulo per
+    # row, and a long tensor runs one row per program like today's kernel
+    row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    col = tl.program_id(1) * COLS + tl.arange(0, COLS)
+    row_mask = row < rows
+    mask = row_mask[:, None] & (col < length)[None, :]
+    offs = row[:, None] * length + col[None, :]
+    channel = row % channels
+    a = tl.load(a_ptr + channel, mask=row_mask, other=0.0).to(tl.float32)[:, None]
+    r = tl.load(r_ptr + channel, mask=row_mask, other=0.0).to(tl.float32)[:, None]
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    s = (x * a).to(tl.bfloat16).to(tl.float32)
+    sn = libdevice.sin(s).to(tl.bfloat16).to(tl.float32)
+    p = (sn * sn).to(tl.bfloat16).to(tl.float32)
+    m = (r * p).to(tl.bfloat16).to(tl.float32)
+    tl.store(out_ptr + offs, x + m, mask=mask)
+
+
+def tile_cols(length: int, tile: int) -> int:
+    for cols in (16, 64, 256, 1024):
+        if length <= cols:
+            return cols
+    return tile
+
+
 def candidate(block, warps, wide, bits, pointers):
+    if pointers == "tile":
+
+        def run_tile(x, a, r):
+            out = torch.empty_like(x)
+            rows = x.shape[0] * x.shape[1]
+            cols = tile_cols(x.shape[2], block)
+            per_program = block // cols
+            _snake_tile[
+                (triton.cdiv(rows, per_program), triton.cdiv(x.shape[2], cols))
+            ](
+                out,
+                x,
+                a,
+                r,
+                rows,
+                x.shape[1],
+                x.shape[2],
+                ROWS=per_program,
+                COLS=cols,
+                num_warps=warps,
+                enable_reflect_ftz=False,
+                enable_fp_fusion=False,
+            )
+            return out
+
+        return run_tile
     kernel = KERNELS[pointers]
 
     def run(x, a, r):
@@ -181,15 +254,15 @@ def main() -> None:
             )
 
     configs = [
-        (block, warps, False, bits, "nospec")
-        for bits in (True, False)
-        for block in (256, 512, 1024, 2048)
-        for warps in (2, 4, 8)
-    ]
-    configs += [
-        (512, 4, True, True, "nospec"),
-        (512, 4, False, True, "spec"),
-        (512, 4, False, False, "spec"),
+        (1024, 2, False, False, "tile"),
+        (1024, 4, False, False, "tile"),
+        (1024, 8, False, False, "tile"),
+        (2048, 4, False, False, "tile"),
+        (2048, 8, False, False, "tile"),
+        (4096, 8, False, False, "tile"),
+        (512, 4, False, False, "nospec"),
+        (1024, 8, False, False, "nospec"),
+        (512, 4, False, True, "nospec"),
     ]
 
     def label(c) -> str:
