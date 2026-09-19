@@ -25,6 +25,10 @@ boot() {
   nvidia-smi > "$d/gpus_before.txt"
   nvidia-smi dmon -i "$card" -s pucvm -d 1 > "$d/dmon.log" 2>&1 &
   dmon=$!
+  # note(ratish): the box is shared; a foreign pid on the card voids the boot
+  uuid=$(nvidia-smi -i "$card" --query-gpu=uuid --format=csv,noheader)
+  (while true; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader | grep "$uuid" | sed "s/^/$(date +%T) /"; sleep 2; done) > "$d/apps.csv" 2>&1 &
+  apps=$!
   began=$(date +%s)
   (cd "$tree" && setsid bash -c "echo \$\$ > $d/server.pgid; exec env CUDA_VISIBLE_DEVICES=$card \
     PYTHONPATH=$tree $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $port" \
@@ -46,7 +50,8 @@ boot() {
   kill -TERM -- -"$(cat "$d/server.pgid")" 2>/dev/null
   sleep 15
   kill -0 -- -"$(cat "$d/server.pgid")" 2>/dev/null && kill -KILL -- -"$(cat "$d/server.pgid")"
-  kill $dmon 2>/dev/null
+  kill $dmon $apps 2>/dev/null
+  echo "pids on the card while serving: $(awk '{print $3}' "$d/apps.csv" | sort -u | tr '\n' ' ')" >> "$d/progress.txt"
   if [ -f "$d/FAILED" ] || [ "$quality" = no ]; then
     echo "done $(date +%T)" >> "$d/progress.txt"
     return
