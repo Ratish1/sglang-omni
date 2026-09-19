@@ -1,0 +1,6 @@
+main_default|/workspace/sglang-omni/.tmp/wt/v2-a|--tts_engine.engine.mem_fraction_static 0.80
+branch_default|/workspace/sglang-omni/.tmp/wt/snake-b|--tts_engine.engine.mem_fraction_static 0.80
+main_fused_on|/workspace/sglang-omni/.tmp/wt/v2-a|--tts_engine.engine.mem_fraction_static 0.80 --vocoder.factory.fused_snake_activation true
+main_fused_on_no_compile|/workspace/sglang-omni/.tmp/wt/v2-a|--tts_engine.engine.mem_fraction_static 0.80 --vocoder.factory.fused_snake_activation true --vocoder.factory.incremental_codec_compile false
+branch_no_compile|/workspace/sglang-omni/.tmp/wt/snake-b|--tts_engine.engine.mem_fraction_static 0.80 --vocoder.factory.incremental_codec_compile false
+main_fused_off_no_compile|/workspace/sglang-omni/.tmp/wt/v2-a|--tts_engine.engine.mem_fraction_static 0.80 --vocoder.factory.incremental_codec_compile false
