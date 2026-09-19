@@ -18,6 +18,7 @@ import time
 
 TARGET = "sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph"
 PREFIX = os.environ.get("OMNI_CAPTURE_TIMING")
+SKIP_GC = os.environ.get("OMNI_CAPTURE_SKIP_GC") == "1"
 
 
 def patch(module):
@@ -36,6 +37,7 @@ def patch(module):
         with write_lock:
             out.write(json.dumps(record) + "\n")
 
+    collect = gc.collect
     decode, precompile = decoder.decode, decoder.precompile
     warmup, capture_graph, capture = (
         runner._warmup_capture_shape,
@@ -62,7 +64,9 @@ def patch(module):
             if not getattr(local, "capture", False):
                 return fn(*args, **kwargs)
             began = time.perf_counter()
-            result = fn(*args, **kwargs)
+            # note(ratish): OMNI_CAPTURE_SKIP_GC=1 tests one collect per runner, not per key
+            skip = SKIP_GC and name == "gc_collect_s"
+            result = 0 if skip else fn(*args, **kwargs)
             local.row[name] = local.row.get(name, 0.0) + time.perf_counter() - began
             if name == "empty_cache_s":
                 write(local.row)
@@ -94,19 +98,26 @@ def patch(module):
             local.row["key_total_s"] = time.perf_counter() - began
 
     def capture_timed(self):
+        began = time.perf_counter()
+        if SKIP_GC:
+            collect()
+        first_gc_s = time.perf_counter() - began
         local.capture = True
         local.row = {}
-        began = time.perf_counter()
         try:
             return capture(self)
         finally:
             local.capture = False
+            memory = self._memory_stats
             write(
                 {
                     "mode": self._mode,
                     "runner_total_s": time.perf_counter() - began,
+                    "first_gc_s": first_gc_s,
                     "enabled": self._enabled,
                     "thread": threading.current_thread().name,
+                    "graph_footprint_bytes": memory.get("graph_footprint_bytes"),
+                    "free_after_bytes": memory.get("after", {}).get("free_bytes"),
                 }
             )
 

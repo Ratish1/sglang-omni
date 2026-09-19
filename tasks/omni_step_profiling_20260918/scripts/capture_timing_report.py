@@ -66,7 +66,10 @@ print("\nrunner totals (wall):")
 for record in runners:
     print(
         f"  {record['mode']:<8}{record['runner_total_s']:>8.2f} s  "
-        f"enabled={record['enabled']}  thread={record.get('thread')}"
+        f"enabled={record['enabled']}  thread={record.get('thread')}  "
+        f"first gc={record.get('first_gc_s', 0.0):.2f} s  "
+        f"graph MiB={(record.get('graph_footprint_bytes') or 0) / 2**20:.0f}  "
+        f"free after MiB={(record.get('free_after_bytes') or 0) / 2**20:.0f}"
     )
 
 print("\nslowest keys:")
