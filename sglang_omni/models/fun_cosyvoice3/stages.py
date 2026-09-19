@@ -862,7 +862,7 @@ class FunCosyVoice3Flow:
                     f"up to {stream.reserved}"
                 )
         estimator = self.cached_estimator
-        estimator.hop = estimator.cache.begin_hop(streams)
+        estimator.begin_hop(streams)
         device = conditioning.token_condition.device
         rows = pack_rows(
             [stream.reserved - stream.frames for stream in streams], device
@@ -2195,7 +2195,12 @@ def create_vocoder_executor(
             dtype=autocast_dtype,
             device=device,
         )
-        flow.cached_estimator = CachedDiT(dit, flow_hop_cache, device=device)
+        flow.cached_estimator = CachedDiT(
+            dit,
+            flow_hop_cache,
+            device=device,
+            capture_steps=enable_flow_cuda_graph,
+        )
         logger.info(
             f"Fun-CosyVoice3 hop K/V cache: {flow_hop_cache.slots} frame slots, "
             f"{flow_hop_cache.bytes_per_slot} bytes each"
