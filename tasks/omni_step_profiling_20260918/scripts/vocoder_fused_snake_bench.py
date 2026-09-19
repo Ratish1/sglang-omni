@@ -96,37 +96,36 @@ def main() -> None:
         for batch in BATCHES:
             torch.manual_seed(width * 100 + batch)
             codes = random_codes(batch, width, device)
-            graphs, waves, kernels, states = {}, {}, {}, {}
-            for name, (_, incremental) in arms.items():
-                # note(ratish): the decode rebinds the state's tensors and the next
-                # capture empties the allocator cache, so the inputs, the rebound state
-                # and the output of a graph are all held for as long as it lives
-                state = incremental.init_state(
-                    batch, device=device, dtype=torch.bfloat16
-                )
-                inputs = state_tensors(state)
-                graph, waveform = capture(incremental._decode_tensors, codes, state)
-                states[name] = (inputs, state, waveform)
-                with torch.inference_mode():
-                    for tensor in inputs:
-                        tensor.zero_()
-                graph.replay()
-                torch.cuda.synchronize()
-                waves[name] = waveform.clone()
-                with torch.profiler.profile(
-                    activities=[torch.profiler.ProfilerActivity.CUDA]
-                ) as prof:
+            waves, kernels = {}, {}
+            times = {name: [] for name in arms}
+            # note(ratish): one graph alive at a time; two graphs over two decoder
+            # copies fault on replay in this bench (unexplained, not seen in serving)
+            for round_index in range(3):
+                for name, (_, incremental) in arms.items():
+                    state = incremental.init_state(
+                        batch, device=device, dtype=torch.bfloat16
+                    )
+                    inputs = state_tensors(state)
+                    graph, waveform = capture(incremental._decode_tensors, codes, state)
+                    with torch.inference_mode():
+                        for tensor in inputs:
+                            tensor.zero_()
                     graph.replay()
                     torch.cuda.synchronize()
-                kernels[name] = sum(
-                    e.device_type == torch.autograd.DeviceType.CUDA
-                    for e in prof.events()
-                )
-                graphs[name] = graph
-            times = {name: [] for name in arms}
-            for _ in range(3):
-                for name in arms:
-                    times[name].append(replay_ms(graphs[name], args.reps))
+                    if round_index == 0:
+                        waves[name] = waveform.clone()
+                        with torch.profiler.profile(
+                            activities=[torch.profiler.ProfilerActivity.CUDA]
+                        ) as prof:
+                            graph.replay()
+                            torch.cuda.synchronize()
+                        kernels[name] = sum(
+                            e.device_type == torch.autograd.DeviceType.CUDA
+                            for e in prof.events()
+                        )
+                    times[name].append(replay_ms(graph, args.reps))
+                    del graph, waveform, state, inputs
+                    torch.cuda.empty_cache()
             best = {name: min(values) for name, values in times.items()}
             if len(arms) < 3:
                 print(
@@ -134,8 +133,6 @@ def main() -> None:
                     + " ".join(f"{n} {v:.3f}" for n, v in best.items()),
                     flush=True,
                 )
-                del graphs, states
-                torch.cuda.empty_cache()
                 continue
             ratios.append(best["new"] / best["old"])
             print(
@@ -146,8 +143,6 @@ def main() -> None:
                 f"{str(torch.equal(waves['new'], waves['eager'])):>9}",
                 flush=True,
             )
-            del graphs, states
-            torch.cuda.empty_cache()
     if not ratios:
         print("\nnew against old: not measured (fewer than three arms)")
         return
