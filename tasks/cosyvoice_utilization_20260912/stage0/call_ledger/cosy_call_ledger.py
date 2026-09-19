@@ -17,7 +17,9 @@ $COSY_CALL_LEDGER_DIR/ledger_<pid>.jsonl:
   hift_batch      CosyVoice3Vocoder.mel2wav_batch
 
 Shapes are read from host metadata only. host_ms is the wall time of the Python
-call; gpu_ms is the time between two CUDA events recorded on the current stream
+call and cpu_ms the CPU time of the calling thread inside it, so host_ms minus
+cpu_ms is time the thread was off the CPU (a GIL wait, a blocking wait);
+gpu_ms is the time between two CUDA events recorded on the current stream
 at entry and exit, resolved by a background thread without synchronizing, so it
 is the device time of the work queued between them. No call adds a sync.
 """
@@ -118,12 +120,16 @@ def _timed(kind: str, describe, *, after=None):
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
             began = time.perf_counter()
+            began_cpu = time.thread_time()
             result = None
             try:
                 result = function(*args, **kwargs)
                 return result
             finally:
                 entry["host_ms"] = (time.perf_counter() - began) * 1e3
+                # CPU time of the calling thread: a wait for the GIL is off
+                # the CPU, launching and a spinning CUDA sync are on it.
+                entry["cpu_ms"] = (time.thread_time() - began_cpu) * 1e3
                 if end is not None:
                     end.record()
                 if after is not None:
