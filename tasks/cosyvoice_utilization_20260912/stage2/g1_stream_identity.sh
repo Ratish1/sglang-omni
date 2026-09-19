@@ -22,6 +22,9 @@
 #            the benchmark's default, which sends none
 #   MODEL    checkpoint, a local directory                       /data/ms/.../master
 #   SERVE    extra serve arguments, the same string on both arms  empty
+#   LEDGER   non empty makes it a profiling boot: the stage 0 call   empty
+#            ledger wraps the vocoder calls and writes one JSON line
+#            per call under the run's ledger directory
 set -euo pipefail
 
 REPO=${REPO:-/workspace/sglang-omni}
@@ -35,6 +38,7 @@ MODE=${MODE:-streaming}
 SEED=${SEED-1234}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-}
 SERVE=${SERVE:-}
+LEDGER=${LEDGER:-}
 # A session name turns the arm into an Nsight capture: the server launches under
 # nsys and the runner opens the window around the measured benchmark only. The
 # metric device is the nsys ordinal, which is the physical card, not the ordinal
@@ -89,6 +93,13 @@ grep -c 'the Flow attention chunk' \
   "$TREE/sglang_omni/models/fun_cosyvoice3/streaming_vocoder.py" > "$OUT/marker.txt" || true
 nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv > "$OUT/gpus_before.csv"
 uptime > "$OUT/host_load.txt"
+# The ledger's sitecustomize has to be found before any other, so its directory
+# leads the server's path; it does nothing in a process without the variable.
+LEDGER_ENV=""
+if [ -n "$LEDGER" ]; then
+  SERVER_PATH="$T/stage0/call_ledger:$SERVER_PATH"
+  LEDGER_ENV="COSY_CALL_LEDGER_DIR=$OUT/ledger"
+fi
 
 # An empty SEED and no token limit is the benchmark's own default request: no
 # generation json is written and the flag is left off.
@@ -140,7 +151,7 @@ if [ -n "$NSYS" ]; then
     --cuda-graph-trace=node --trace-fork-before-exec=true"
 fi
 (cd "$TREE" && setsid bash -c "echo \$\$ > '$OUT/server.pgid'; exec env CUDA_VISIBLE_DEVICES=$CARD \
-  SGLANG_OMNI_STRICT_PORT=1 PYTHONPATH='$SERVER_PATH' $LAUNCH python -u -m sglang_omni.cli serve --model-path '$MODEL' --port $PORT $SERVE" \
+  SGLANG_OMNI_STRICT_PORT=1 $LEDGER_ENV PYTHONPATH='$SERVER_PATH' $LAUNCH python -u -m sglang_omni.cli serve --model-path '$MODEL' --port $PORT $SERVE" \
   > "$OUT/serve.log" 2>&1 &)
 echo "$SERVE" > "$OUT/serve_args.txt"
 

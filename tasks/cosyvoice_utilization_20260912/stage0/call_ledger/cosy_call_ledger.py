@@ -8,6 +8,7 @@ $COSY_CALL_LEDGER_DIR/ledger_<pid>.jsonl:
                   participant token_offset, hop_len, tokens so far, started,
                   wait since ready
   hop             CosyVoice3Vocoder.hop_batch
+  hop_cached      CosyVoice3Vocoder.hop_batch_cached, where the tree has it
   final           CosyVoice3Vocoder.leftover_batch
   buffered_flow   FunCosyVoice3Flow.inference (the buffered groups)
   graph_run       FlowCudaGraphRunner.run: key, captured, hit
@@ -148,6 +149,17 @@ def _patch_stages(module) -> None:
         "hop",
         lambda self, items: {**_flow_rows(items, LOOKAHEAD), **_step_context()},
     )(vocoder.hop_batch)
+    # The hop cache branch only: the frames a row computes are the ones past
+    # what its stream already holds.
+    if hasattr(vocoder, "hop_batch_cached"):
+        vocoder.hop_batch_cached = _timed(
+            "hop_cached",
+            lambda self, items, streams: {
+                **_flow_rows(items, LOOKAHEAD),
+                "new_frames": [stream.reserved - stream.frames for stream in streams],
+                **_step_context(),
+            },
+        )(vocoder.hop_batch_cached)
     vocoder.leftover_batch = _timed(
         "final", lambda self, items: {**_flow_rows(items, 0), **_step_context()}
     )(vocoder.leftover_batch)
