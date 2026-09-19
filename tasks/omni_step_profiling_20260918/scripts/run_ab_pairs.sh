@@ -4,9 +4,11 @@
 # own process group, and optionally scores WER and speaker similarity on the boot's WAVs.
 # A swapped round puts A on B's card and B on A's, so a card difference cannot pass as
 # the change. Rounds run one after another.
-# usage: run_ab_pairs.sh <out dir> <tree A> <tree B> <card 1> <card 2> <longform meta.lst>
+# usage: run_ab_pairs.sh <out dir> <tree A> <tree B> <card 1> <card 2> <longform meta.lst> [serve args for both arms...]
 set -u
 OUT=$1 TREE_A=$2 TREE_B=$3 CARD1=$4 CARD2=$5 LONGFORM=$6
+shift 6
+SERVE_ARGS="$*"
 PY=/workspace/sglang-omni/.venv/bin/python
 MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
 META=zhaochenyang20/seed-tts-eval-arrow
@@ -31,7 +33,7 @@ boot() {
   apps=$!
   began=$(date +%s)
   (cd "$tree" && setsid bash -c "echo \$\$ > $d/server.pgid; exec env CUDA_VISIBLE_DEVICES=$card \
-    PYTHONPATH=$tree $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $port" \
+    PYTHONPATH=$tree $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $port $SERVE_ARGS" \
     > "$d/serve.log" 2>&1 &)
   healthy=0
   for _ in $(seq 360); do
