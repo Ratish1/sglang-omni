@@ -221,6 +221,67 @@ With the runaways gone the c16 result has the sign of the c8 one, at the size a 
 61 % of rows allows. The latency p99 is the one metric that moved the wrong way; with 70 % of
 steps mixed, a row in the second Flow call of a step waits for the first.
 
+## 4g. Why the serving gain is small: the call ledger at c16 (2026-09-19, raw: `s1-r16`, `s1-r17`)
+
+Two profiling boots of the branch (7b3e3c41e, the settings of 4f) under the stage 0 call ledger,
+which now also wraps `hop_batch_cached` and records the calling thread's CPU time per call
+(`time.thread_time`). Profiling boots, 3.678 and 3.470 req/s, never compared with the census.
+Scripts: `stage2/step_gaps_from_log.py`, `stage2/ledger_step_split.py`.
+
+**The request shape bounds the cache.** Both c16 logs give 1.94 hops per request: hop 1 (prompt
+plus 25 tokens), hop 2 (50 tokens), then the final. Hop 1 has nothing to reuse. The final is
+bidirectional over the whole history, and upstream CosyVoice runs it the same way
+(`cosyvoice/cli/model.py:367-373` calls `token2wav` with `finalize=True` and no `stream`), so it
+is the model's behaviour. The cache can serve one Flow pass in three on this corpus.
+
+**The vocoder is the saturated stage.** Its thread is inside a step for 283.6 of 296.8 s (first
+boot). The AR decodes 2,300 to 3,100 tok/s when its batch is full and half of its decode steps
+hold 4 requests or fewer. Step time by call (first boot): cached hops 85.1 s, finals 73.2 s,
+HiFT 63.7 s (3,208 per row calls), plain hops 60.2 s, everything else 1.4 s.
+
+**Every Flow call has a launch floor, and AR activity stretches it.** Per call, p50, second boot;
+"AR active" means the AR logged a prefill or decode batch during the call:
+
+| call | computed frames | AR quiet: wall / CPU ms | AR active: wall / CPU / off CPU ms |
+|---|---|---|---|
+| cached hop | up to 2,500 | 230 / 226 | 659 / 356 / 290 |
+| cached hop | 2,500 to 4,000 (first hop cohorts) | 353 / 347 | 664 / 338 / 321 |
+| plain hop | up to 2,500 | 248 / 242 | 526 / 308 / 220 |
+| plain hop | 2,500 to 4,000 | 343 / 338 | 431 / 335 / 104 |
+| final | up to 2,500 | 229 / 225 | 463 / 289 / 169 |
+| final | above 4,000 | 881 / 875 | none in this boot |
+| HiFT | | 15.3 / 14.9 | 53.4 / 28.9 / 25.0 |
+
+- AR quiet, a call of up to 2,500 computed frames costs 229 to 248 ms whatever it computes: the
+  eager launches of the DiT. The typical cached hop computes 800 frames of a 3,050 frame window
+  (first boot, p50 of 55 calls) and lands on the same floor main's hop over the window does.
+- The finals above 4,000 frames wait for the GPU for most of their 881 ms and their CPU time is
+  875 ms, so a wait for the GPU is on the CPU (the sync spins). The 170 to 320 ms a call spends
+  off the CPU while the AR is active is therefore not the GPU. The three stages are threads of
+  one process; the signature (CPU over wall 0.52 to 0.65 with one other busy Python thread) is a
+  wait for the GIL. Certainty needs the `pthread_cond_timedwait` rows of the vocoder thread in an
+  Nsight OSRT capture.
+- Over the second boot the vocoder's steps are 302.5 s of wall and 247.0 s of CPU. Priced at
+  their AR quiet p50, the calls that ran while the AR was active would be 56 s instead of 119 s:
+  about a fifth of the vocoder's time is this stretch. First hops always run while their cohort's
+  AR is decoding, so they always pay it.
+- At a device bound rate of 0.123 ms per computed frame (the AR quiet finals above 4,000 frames),
+  the first boot's Flow calls hold 137 s of device work in 219 s of wall; 51 of the 81 s
+  difference sit in the cached hop calls.
+
+**Mixed steps.** Hop step p50 in the 4f cache boot: all rows cached 725 ms, mixed 1,039 ms (143
+of 203 hop steps); at 5 to 9 rows 926 against 1,188 ms, at 1 to 4 rows 684 against 1,089 ms. A
+mixed step makes two launch bound calls and both stretch under AR activity; a mixed first hop
+cohort of 10 to 16 rows is 1,168 ms p50 in the ledger against 1,028 ms for main's hop steps of
+that size (log gaps, 4f main boot). That is the first audio p95 and the latency p99 of 4f.
+
+**What this says.** The cache removes device work from a call whose cost is its launches, so
+little of it reaches the clock: all of it on long requests (section 2: 971 to 258 ms at a 6,850
+frame window), a third of the passes on this corpus. The cost that is left, on main and on the
+branch alike, is about 17,000 eager launches per Flow call, each holding the GIL the AR
+scheduler also needs. The breakable graph over the cached step (S3) removes exactly that, and the
+cached step is what makes it capturable, since its shapes are bounded by the new frames.
+
 ## 5. Owed before S1 can be a PR
 
 1. The append change of section 3, then the first hop against main again.
