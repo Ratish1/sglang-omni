@@ -14,6 +14,7 @@ usage: python vocoder_fused_snake_bench.py --model DIR --old-kernels FILE [--rep
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import math
 import statistics
@@ -22,6 +23,7 @@ import torch
 from vocoder_resident_bench import BATCHES, WIDTHS, load, random_codes, replay_ms
 
 from sglang_omni.models.qwen3_tts import vocoder_kernels
+from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalDecoder
 
 
 def capture(fn, codes, state):
@@ -63,22 +65,25 @@ def main() -> None:
     old_kernels = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(old_kernels)
 
+    # note(ratish): the tokenizer loader caches per process, so every arm fuses its
+    # own copy of the decoder
+    tokenizer, _ = load(args.model, device)
+    pristine = tokenizer.model.decoder
+    snake_cls = next(
+        type(m) for m in pristine.modules() if type(m).__name__ == "SnakeBeta"
+    )
     arms = {}
     for name in ("eager", "old", "new"):
-        tokenizer, incremental = load(args.model, device)
-        decoder = tokenizer.model.decoder
+        decoder = copy.deepcopy(pristine)
         if name == "old":
             print(
                 f"old kernel fused {old_kernels.fuse_vocoder_decoder(decoder)} modules"
             )
         if name == "new":
-            snake_cls = next(
-                type(m) for m in decoder.modules() if type(m).__name__ == "SnakeBeta"
-            )
             print(
                 f"new kernel fused {vocoder_kernels.fuse_vocoder_decoder(decoder, snake_cls)} modules"
             )
-        arms[name] = (tokenizer, incremental)
+        arms[name] = (decoder, Qwen3TTSIncrementalDecoder(decoder))
     print(f"device {torch.cuda.get_device_name(device)}, torch {torch.__version__}")
     print(
         f"{'width':>5} {'batch':>5} {'eager ms':>9} {'old ms':>9} {'new ms':>9} {'new/old':>8} "
