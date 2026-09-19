@@ -7,8 +7,12 @@ from types import SimpleNamespace
 import pytest
 from sglang.srt.hardware_backend.mlx import runtime as mlx_runtime
 
+from sglang_omni.models.fun_cosyvoice3 import CAPABILITIES
 from sglang_omni.models.fun_cosyvoice3 import engine_builder as engine_builder_module
 from sglang_omni.models.fun_cosyvoice3.engine_builder import FunCosyVoice3EngineBuilder
+from sglang_omni.scheduling.generation_batch_policy import (
+    build_default_prefill_cuda_graph_bs,
+)
 
 
 def _enable_mlx(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -104,3 +108,24 @@ def test_torch_mps_uses_single_request_native_attention(
 
     with pytest.raises(ValueError, match="max_running_requests=1"):
         builder.validate_before_infrastructure(SimpleNamespace(max_running_requests=2))
+    assert "cuda_graph_backend_prefill" not in defaults
+
+
+def test_cuda_engine_prefills_through_breakable_graphs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mlx_runtime, "use_mlx", lambda: False)
+    builder = FunCosyVoice3EngineBuilder()
+    builder.device = "cuda:0"
+
+    defaults = builder.generation_defaults(dtype="bfloat16")
+
+    assert (
+        type(builder).supports_breakable_prefill_cuda_graph
+        is CAPABILITIES.supports_breakable_prefill_cuda_graph
+        is True
+    )
+    assert defaults["cuda_graph_backend_prefill"] == "breakable"
+    assert defaults["cuda_graph_bs_prefill"] == build_default_prefill_cuda_graph_bs(
+        engine_builder_module.PREFILL_GRAPH_MAX_TOKENS
+    )

@@ -57,7 +57,10 @@ class FunCosyVoice3SGLangModel(Qwen2ForCausalLM):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[Any] = None,
+        omni_prefill_rids: list[str] | None = None,
     ) -> Any:
+        # note(ratish): omni_prefill_rids comes with every prefill that carries
+        # the embeddings sidecar; this model has no per request prefill state.
         fwd_mode = forward_batch.forward_mode
         is_decode = fwd_mode.is_decode()
 

@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from sglang_omni.models.fun_cosyvoice3 import request_builders
+from sglang_omni.models.fun_cosyvoice3 import CAPABILITIES, request_builders
 from sglang_omni.models.fun_cosyvoice3.streaming import TOKEN_HOP_LEN
 from sglang_omni.models.fun_cosyvoice3.utils import (
     CosyVoice3Tokenizer,
@@ -19,15 +19,25 @@ from sglang_omni.models.fun_cosyvoice3.utils import (
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+from sglang_omni.scheduling.generation_batch_policy import (
+    CudaGraphBackend,
+    build_default_prefill_cuda_graph_bs,
+)
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 logger = logging.getLogger(__name__)
+
+# The budget Higgs and Qwen3-TTS capture; a prefill above it runs eager.
+PREFILL_GRAPH_MAX_TOKENS = 512
 
 
 class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
     model_name = "Fun-CosyVoice3"
     context_length = 4096
     model_arch_override = "FunCosyVoice3SGLangModel"
+    supports_breakable_prefill_cuda_graph = (
+        CAPABILITIES.supports_breakable_prefill_cuda_graph
+    )
 
     def __init__(
         self,
@@ -121,6 +131,11 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
             "enable_torch_compile": False,
             "mem_fraction_static": 0.85,
             "max_prefill_tokens": 4096,
+            # note(ratish): longer prefills run eager.
+            "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
+            "cuda_graph_bs_prefill": build_default_prefill_cuda_graph_bs(
+                PREFILL_GRAPH_MAX_TOKENS
+            ),
             "sampling_backend": "pytorch",
             "trust_remote_code": True,
         }
