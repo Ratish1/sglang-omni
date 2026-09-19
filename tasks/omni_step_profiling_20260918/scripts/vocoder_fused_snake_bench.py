@@ -59,6 +59,10 @@ def main() -> None:
     parser.add_argument("--old-kernels", required=True)
     parser.add_argument("--reps", type=int, default=30)
     parser.add_argument("--arms", default="eager,old,new")
+    parser.add_argument("--widths", help="comma list; default every captured width")
+    parser.add_argument(
+        "--old-max-t", type=int, help="override the old kernel's _MAX_T length limit"
+    )
     args = parser.parse_args()
     device = torch.device("cuda", 0)
     spec = importlib.util.spec_from_file_location(
@@ -66,6 +70,22 @@ def main() -> None:
     )
     old_kernels = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(old_kernels)
+    if args.old_max_t is not None:
+        old_kernels._MAX_T = args.old_max_t
+        print(f"old kernel _MAX_T overridden to {args.old_max_t}")
+    widths = [int(w) for w in args.widths.split(",")] if args.widths else WIDTHS
+
+    # note(ratish): timer check: one device copy of a known size through the same
+    # graph-and-event timer gives an effective bandwidth to hold the numbers against
+    source = torch.empty(64 * 2**20, dtype=torch.uint8, device=device)
+    copy_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(copy_graph):
+        kept = source.clone()
+    copy_ms = replay_ms(copy_graph, 30)
+    print(
+        f"timer check: 64 MiB device copy {copy_ms * 1e3:.1f} us = {2 * 64 * 2**20 / (copy_ms * 1e-3) / 1e9:.0f} GB/s read plus write"
+    )
+    del copy_graph, kept, source
 
     # note(ratish): the tokenizer loader caches per process, so every arm fuses its
     # own copy of the decoder
@@ -92,7 +112,7 @@ def main() -> None:
         f"{'new/eager':>9} {'eager k':>8} {'old k':>6} {'new k':>6} {'old bits':>9} {'new bits':>9}"
     )
     ratios = []
-    for width in WIDTHS:
+    for width in widths:
         for batch in BATCHES:
             torch.manual_seed(width * 100 + batch)
             codes = random_codes(batch, width, device)
