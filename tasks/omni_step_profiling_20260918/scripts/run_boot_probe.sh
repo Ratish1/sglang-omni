@@ -19,7 +19,8 @@ UUID=$(nvidia-smi -i "$CARD" --query-gpu=uuid --format=csv,noheader)
 (while true; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader | grep "$UUID" | sed "s/^/$(date +%T) /"; sleep 2; done) > "$OUT/apps.csv" 2>&1 &
 APPS_PID=$!
 START=$(date +%s)
-setsid bash -c "echo \$\$ > $OUT/server.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE \
+# note(ratish): PROBE_PATH adds a directory (a sitecustomize probe) behind the tree
+setsid bash -c "echo \$\$ > $OUT/server.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE${PROBE_PATH:+:$PROBE_PATH} \
   TORCH_LOGS=recompiles $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT $EXTRA" > "$OUT/serve.log" 2>&1 &
 healthy=0
 for _ in $(seq 360); do
