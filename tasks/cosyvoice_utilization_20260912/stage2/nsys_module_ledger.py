@@ -76,6 +76,7 @@ def main() -> None:
         host_ns[key] += end - start
 
     kernels = defaultdict(Counter)
+    kernel_ns = defaultdict(Counter)
     gpu_ns = defaultdict(int)
     names = {
         row[1] for row in db.execute("PRAGMA table_info(CUPTI_ACTIVITY_KIND_KERNEL)")
@@ -88,6 +89,7 @@ def main() -> None:
         if key is None:
             continue
         kernels[key][strings[name_id][:80]] += 1
+        kernel_ns[key][strings[name_id][:80]] += end - start
         gpu_ns[key] += end - start
 
     ledger = defaultdict(dict)
@@ -100,6 +102,10 @@ def main() -> None:
             "gpu_ms": gpu_ns[key] / 1e6,
             "apis": dict(calls[key].most_common(6)),
             "top_kernels": dict(kernels[key].most_common(4)),
+            "kernel_ms_by_name": {
+                name: (ns / 1e6, kernels[key][name])
+                for name, ns in kernel_ns[key].most_common(8)
+            },
         }
     with open(args.json, "w") as out:
         json.dump(
