@@ -37,6 +37,13 @@ CALLS = 20
 REPS = 30
 
 
+@triton.jit
+def _round_keep_nan(value):
+    # note(ratish): sin(inf) is the all-ones NaN; the bit rounding would carry it into
+    # the sign bit, so a NaN passes through unrounded
+    return tl.where(value != value, value, round_bf16_to_fp32(value))
+
+
 def _snake(
     out_ptr,
     x_ptr,
@@ -59,10 +66,10 @@ def _snake(
     a = tl.load(a_ptr + channel, mask=mask, other=0.0).to(tl.float32)
     r = tl.load(r_ptr + channel, mask=mask, other=0.0).to(tl.float32)
     if BITS:
-        s = round_bf16_to_fp32(x * a)
-        sn = round_bf16_to_fp32(libdevice.sin(s))
-        p = round_bf16_to_fp32(sn * sn)
-        m = round_bf16_to_fp32(r * p)
+        s = _round_keep_nan(x * a)
+        sn = _round_keep_nan(libdevice.sin(s))
+        p = _round_keep_nan(sn * sn)
+        m = _round_keep_nan(r * p)
     else:
         s = (x * a).to(tl.bfloat16).to(tl.float32)
         sn = libdevice.sin(s).to(tl.bfloat16).to(tl.float32)
@@ -99,6 +106,7 @@ def candidate(block, warps, wide, bits, pointers):
             BITS=bits,
             num_warps=warps,
             enable_reflect_ftz=False,
+            enable_fp_fusion=False,
         )
         return out
 
@@ -173,14 +181,15 @@ def main() -> None:
             )
 
     configs = [
-        (block, warps, False, True, "spec")
-        for block in (256, 512, 1024, 2048, 4096)
-        for warps in (1, 2, 4, 8)
+        (block, warps, False, bits, "nospec")
+        for bits in (True, False)
+        for block in (256, 512, 1024, 2048)
+        for warps in (2, 4, 8)
     ]
     configs += [
-        (1024, 4, True, True, "spec"),
-        (1024, 4, False, False, "spec"),
-        (1024, 4, False, True, "nospec"),
+        (512, 4, True, True, "nospec"),
+        (512, 4, False, True, "spec"),
+        (512, 4, False, False, "spec"),
     ]
 
     def label(c) -> str:
