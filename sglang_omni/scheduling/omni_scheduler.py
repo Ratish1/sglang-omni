@@ -1451,6 +1451,8 @@ class OmniScheduler:
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
+        if batch.extend_num_tokens:
+            self.processed_tokens_counter += batch.extend_num_tokens
 
     def _run_batch(self, batch, pp_proxy_tensors=None):
         """Run a batch through the model runner.

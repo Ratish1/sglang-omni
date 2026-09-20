@@ -403,6 +403,7 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
         batch_is_full=True,
         is_prefill_only=True,
         is_extend_in_batch=False,
+        extend_num_tokens=None,
     )
     failed_reqs = list(batch.reqs)
     for req in failed_reqs:
@@ -897,8 +898,9 @@ def test_omni_scheduler_custom_runner_stamps_upstream_launch_metadata() -> None:
     scheduler._prefill_end_done = set()
     scheduler.forward_ct = 0
     scheduler._sched_idled = True
+    scheduler.processed_tokens_counter = 0
 
-    def _batch():
+    def _batch(extend_num_tokens: int | None):
         return SimpleNamespace(
             reqs=[
                 SimpleNamespace(
@@ -907,21 +909,24 @@ def test_omni_scheduler_custom_runner_stamps_upstream_launch_metadata() -> None:
             ],
             is_prefill_only=False,
             is_extend_in_batch=False,
+            extend_num_tokens=extend_num_tokens,
         )
 
-    sync_batch = _batch()
+    sync_batch = _batch(extend_num_tokens=7)
     scheduler.run_batch(sync_batch)
     assert scheduler.forward_ct == 1, "sync run_batch must advance forward_ct"
     assert sync_batch.forward_iter == 1
     assert isinstance(sync_batch.launch_ts, float)
     assert sync_batch.after_idle_gap is True
+    assert scheduler.processed_tokens_counter == 7
 
-    async_batch = _batch()
+    async_batch = _batch(extend_num_tokens=None)
     scheduler.run_batch_launch(async_batch)
     assert scheduler.forward_ct == 2, "async launch must advance forward_ct"
     assert async_batch.forward_iter == 2
     assert async_batch.launch_ts >= sync_batch.launch_ts
     assert async_batch.after_idle_gap is False
+    assert scheduler.processed_tokens_counter == 7
 
 
 def test_omni_scheduler_resolve_drops_retracted_req() -> None:
