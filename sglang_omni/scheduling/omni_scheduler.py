@@ -393,9 +393,10 @@ class OmniScheduler:
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
-        self.enable_dynamic_chunking = False
-        self.prefill_decode_interval = get_schedule().prefill_decode_interval
+        self.dynamic_chunk_sizer = None
+        self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
+        self.processed_tokens_counter = 0
 
         # Schedule policy
         from sglang.srt.managers.schedule_policy import SchedulePolicy
@@ -431,6 +432,7 @@ class OmniScheduler:
         self.enable_trace = False
         self.enable_hierarchical_cache = False
         self.enable_hicache_storage = False
+        self.enable_unified_cache_external_linker = False
         self.enable_kv_cache_events = False
         self.is_generation = True
         self.skip_tokenizer_init = True
@@ -501,6 +503,7 @@ class OmniScheduler:
         self.ipc_channels = OmniIpcChannels(self)
         self.init_metrics_collector(self.tp_rank, self.pp_rank, self.dp_rank)
         self.init_metrics_reporter(self.tp_rank, self.pp_rank, self.dp_rank)
+        self.scheduler_stage_metrics = self.metrics_reporter.scheduler_stage_metrics
         self.init_upstream_scheduler_components()
 
         self._running = False

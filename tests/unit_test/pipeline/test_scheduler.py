@@ -17,6 +17,9 @@ import pytest
 import sglang.srt.managers.scheduler as sglang_scheduler_module
 import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SchedulerStageMetricsRecorder,
+)
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -2076,6 +2079,7 @@ def _construct_omni_scheduler(
     *,
     return_runtime_context: bool = False,
     server_max_queued_requests: int | None = 7,
+    prefill_decode_interval: int | None = 0,
     **kwargs,
 ) -> OmniScheduler | tuple[OmniScheduler, object]:
     """Build an OmniScheduler over the minimum stub surface __init__ touches."""
@@ -2099,6 +2103,7 @@ def _construct_omni_scheduler(
             SimpleNamespace(
                 reset_metrics=lambda: None,
                 is_stats_logging_rank=False,
+                scheduler_stage_metrics=SchedulerStageMetricsRecorder(enabled=False),
             ),
         ),
         raising=False,
@@ -2129,7 +2134,7 @@ def _construct_omni_scheduler(
         schedule_conservativeness=1.0,
         enable_metrics=False,
         enable_metrics_for_all_schedulers=False,
-        prefill_decode_interval=0,
+        prefill_decode_interval=prefill_decode_interval,
     )
 
     class StrictParallelContext:
@@ -2234,6 +2239,16 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
         )
     ]
     assert scheduler._abort_on_queued_limit(object()) is False
+
+
+def test_unset_prefill_decode_interval_never_defers_prefill(monkeypatch) -> None:
+    """An unset interval leaves the borrowed prefill deferral disarmed."""
+    scheduler = _construct_omni_scheduler(monkeypatch, prefill_decode_interval=None)
+    extend_batch = SimpleNamespace(forward_mode=SimpleNamespace(is_extend=lambda: True))
+
+    scheduler._arm_prefill_decode_interval(extend_batch)
+
+    assert scheduler._should_defer_prefill() is False
 
 
 def test_refresh_upstream_parallel_state_reads_dcp_from_the_parallel_bag(
@@ -2354,6 +2369,7 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
             SimpleNamespace(
                 reset_metrics=lambda: None,
                 is_stats_logging_rank=False,
+                scheduler_stage_metrics=SchedulerStageMetricsRecorder(enabled=False),
             ),
         ),
         raising=False,
