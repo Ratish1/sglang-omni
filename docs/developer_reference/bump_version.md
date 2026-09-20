@@ -224,7 +224,8 @@ FlashInfer sources; changed sources remain newer and invalidate their objects.
 After rebuilding, run Ninja with `-n -d explain` in the copied `cached_ops`
 directories before GPU validation to catch unintended object recompilation.
 
-A bump therefore ships a new image: build `docker/Dockerfile` on the
+Whether a bump ships a new image follows from the pin diff. When torch, CUDA,
+Python or FlashInfer move, it does: build `docker/Dockerfile` on the
 `lmsysorg/sglang` digest for the new tag, populate the FlashInfer JIT cache
 on a GPU for the architectures CI runs on (Docker builds have none, so the
 Dockerfile copies the cache from a previous image), push it, and put the new
@@ -232,6 +233,15 @@ digest in the Dockerfile and the workflows. CI on the branch means nothing
 until the workflows point at the new image: on the old one the setup step
 installs the new torch into the virtualenv and nothing after that reflects
 the shipped stack.
+
+When only SGLang and the wheels it pins move (`sglang-kernel`,
+`sgl-deep-gemm`), the image stays. The setup step installs those pins into the
+virtualenv, whose site-packages precede the image's, and they are the same
+PyPI wheels upstream's CUDA image installs. The FlashInfer cache in the image
+is keyed by a version that did not change. `SGLANG_IMAGE` in
+`docker/Dockerfile` still moves to the new tag's digest so the next rebuild
+starts from the right base; the workflow digests and
+`FLASHINFER_CACHE_IMAGE` do not.
 
 ## Validation
 
