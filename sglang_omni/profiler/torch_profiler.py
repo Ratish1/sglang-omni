@@ -112,7 +112,7 @@ class TorchProfiler(ProfilerBase):
     ) -> str:
         """Start the profiler; None flags fall back to their env vars."""
         with cls._lock:
-            rank = cls._get_rank()
+            rank = cls.get_rank()
 
             # 1. Cleanup any existing profiler
             if cls._profiler is not None:
