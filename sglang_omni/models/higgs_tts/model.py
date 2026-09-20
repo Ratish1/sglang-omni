@@ -49,14 +49,14 @@ class HiggsGenParams:
 
 def resolve_max_running_requests() -> int:
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_schedule
 
-        return int(get_global_server_args().max_running_requests)
+        return int(get_schedule().max_running_requests)
     except (ImportError, AttributeError, TypeError, ValueError) as exc:
         fallback = 64
         logger.warning(
             f"Falling back to Higgs max_running_requests={fallback} because "
-            f"SGLang global server args are unavailable: {exc}"
+            f"the SGLang schedule config is unavailable: {exc}"
         )
         return fallback
 

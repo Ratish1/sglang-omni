@@ -117,9 +117,9 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
 
         max_batch_size = None
         try:
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_schedule
 
-            max_batch_size = get_global_server_args().max_running_requests
+            max_batch_size = get_schedule().max_running_requests
         except Exception:
             max_batch_size = None
         weight = self.first_embedding_weight()

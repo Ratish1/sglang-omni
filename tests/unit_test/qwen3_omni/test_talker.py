@@ -685,14 +685,8 @@ def test_qwen_predictor_decode_graph_uses_configured_batch_buckets(
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Qwen3-Omni predictor graph requires CUDA"
 )
-def test_qwen_predictor_decode_graph_matches_eager(monkeypatch: pytest.MonkeyPatch):
+def test_qwen_predictor_decode_graph_matches_eager():
     """Default graph replay matches eager predictor outputs for single-token decode."""
-    monkeypatch.setattr(
-        talker_module,
-        "get_global_server_args",
-        lambda: SimpleNamespace(max_running_requests=4),
-    )
-
     device = torch.device("cuda")
     talker = _build_fake_predictor_graph_talker(device)
     layer0_codes = torch.tensor([[1], [7]], dtype=torch.int, device=device)
@@ -766,16 +760,8 @@ def test_qwen_predictor_decode_graph_covers_real_incremental_step(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason="requires two visible CUDA devices",
 )
-def test_qwen_predictor_decode_graph_uses_tensor_device_when_current_device_differs(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_qwen_predictor_decode_graph_uses_tensor_device_when_current_device_differs():
     """Graph capture follows predictor tensors, not the process-current device."""
-    monkeypatch.setattr(
-        talker_module,
-        "get_global_server_args",
-        lambda: SimpleNamespace(max_running_requests=4),
-    )
-
     torch.cuda.set_device(0)
     device = torch.device("cuda:1")
     talker = _build_fake_predictor_graph_talker(device)

@@ -239,9 +239,9 @@ class Zonos2SGLangModel(nn.Module):
         )
 
         try:
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_schedule
 
-            max_bs = int(get_global_server_args().max_running_requests or 1)
+            max_bs = int(get_schedule().max_running_requests or 1)
         except Exception:
             max_bs = 256
         w = self.embedders[0].weight
