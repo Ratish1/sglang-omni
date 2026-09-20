@@ -1716,6 +1716,7 @@ def test_rollback_decode_prep_after_skip_is_noop_for_prefill_batches() -> None:
 def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) -> None:
     schedule_batch_mod = pytest.importorskip("sglang.srt.managers.schedule_batch")
     ScheduleBatch = schedule_batch_mod.ScheduleBatch
+    from sglang.srt.runtime_context import get_context
 
     batch = ScheduleBatch.__new__(ScheduleBatch)
     reqs = [
@@ -1760,9 +1761,9 @@ def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) ->
         "alloc_for_decode",
         _fake_alloc_for_decode,
     )
-    monkeypatch.setattr(schedule_batch_mod, "mamba_extra_buffer_enabled", lambda: False)
 
-    ScheduleBatch.prepare_for_decode(batch)
+    with get_context().override_server_args():
+        ScheduleBatch.prepare_for_decode(batch)
     assert batch.seq_lens_sum is None
     assert reqs[0].kv.kv_allocated_len == 12
     assert reqs[0].kv.kv_committed_len == 11
