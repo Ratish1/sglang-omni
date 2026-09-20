@@ -34,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _profiler_activities() -> list[ProfilerActivity]:
+def profiler_activities() -> list[ProfilerActivity]:
     """CPU plus whichever device activity this torch build supports."""
     device = sorted(
         (a for a in supported_activities() if a != ProfilerActivity.CPU),
@@ -162,7 +162,7 @@ class TorchProfiler(ProfilerBase):
             # records cpu ops and spans; the scheduler and worker threads would be
             # kernels without callers. stop() exports, so no on_trace_ready.
             cls._profiler = profile(
-                activities=_profiler_activities(),
+                activities=profiler_activities(),
                 record_shapes=record_shapes,
                 profile_memory=os.environ.get("SGLANG_TORCH_PROFILER_PROFILE_MEMORY")
                 == "1",
@@ -192,7 +192,7 @@ class TorchProfiler(ProfilerBase):
             if cls._profiler is None:
                 return None
 
-            rank = cls._get_rank()
+            rank = cls.get_rank()
             active = cls._active_run_id
 
             if run_id is not None and active is not None and active != run_id:
@@ -271,12 +271,12 @@ class TorchNPUProfiler(TorchProfiler):
             record_shapes = os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES") == "1"
         with cls._lock:
             trace_path_template = os.path.abspath(trace_path_template)
-            rank = cls._get_rank()
+            rank = cls.get_rank()
             if cls._profiler is not None:
                 if run_id is not None and cls._active_run_id == run_id:
                     return trace_path_template
 
-                rank = cls._get_rank()
+                rank = cls.get_rank()
                 logger.warning(
                     "[Rank %s] Torch profiler already active (run_id=%s), restarting for run_id=%s",
                     rank,
@@ -329,7 +329,7 @@ class TorchNPUProfiler(TorchProfiler):
             if cls._profiler is None:
                 return None
 
-            rank = cls._get_rank()
+            rank = cls.get_rank()
             active = cls._active_run_id
             trace_path = cls._trace_template
 
