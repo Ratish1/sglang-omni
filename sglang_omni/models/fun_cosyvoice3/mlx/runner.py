@@ -18,7 +18,6 @@ mx.eval(_SPEECH_IDS)
 class FunCosyVoice3MlxModelRunner:
     """Customize only prompt prefill; generic MLX cache/decode stays upstream."""
 
-    # note (ratish): the base runner calls this hook by this name from its constructor.
     def _load_model(self) -> None:
         from sglang.srt.hardware_backend.mlx.remote_code_gate import (
             ensure_remote_code_allowed,

@@ -21,7 +21,6 @@ class Qwen3ASRMlxModelRunner(AudioMlxModelRunner):
 
     model_name = "Qwen3-ASR"
 
-    # note (ratish): the base runner calls this hook by this name from its constructor.
     def _load_model(self) -> None:
         from mlx_lm.utils import load_model
         from sglang.srt.hardware_backend.mlx.remote_code_gate import (
