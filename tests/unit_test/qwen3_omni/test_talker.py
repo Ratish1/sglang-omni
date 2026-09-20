@@ -1539,6 +1539,7 @@ def test_abort_filters_subsequent_stream_messages_via_recv_requests() -> None:
     and driving the dispatch loop.
     """
     scheduler = object.__new__(QwenTalkerScheduler)
+    scheduler.is_entry_rank = True
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = deque()
     scheduler._pending_stream_ingress = {}

@@ -22,6 +22,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
 )
+from sglang.srt.runtime_context import get_context
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -41,6 +42,12 @@ def _serving_bag(monkeypatch):
     serving = SimpleNamespace(weight_version=None)
     monkeypatch.setattr(omni_scheduler_module, "get_serving", lambda: serving)
     monkeypatch.setattr(sglang_scheduler_module, "get_serving", lambda: serving)
+
+
+@pytest.fixture
+def published_config():
+    with get_context().override_server_args():
+        yield
 
 
 def _ingress(*chunks, done: bool = False) -> omni_scheduler_module.PendingStreamIngress:
@@ -65,6 +72,7 @@ def _init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler._async_pending = None
     scheduler.enable_priority_scheduling = False
     scheduler.abort_on_priority_when_disabled = False
+    scheduler.processed_tokens_counter = 0
     if not hasattr(scheduler, "max_queued_requests"):
         scheduler.max_queued_requests = None
     if not hasattr(scheduler, "_deferred_request_payloads"):
@@ -481,6 +489,7 @@ def _requeue_scheduler() -> OmniScheduler:
     scheduler.waiting_queue = []
     scheduler.enable_hicache_storage = False
     scheduler.enable_hierarchical_cache = False
+    scheduler.processed_tokens_counter = 0
     return scheduler
 
 
@@ -2830,6 +2839,7 @@ def test_omni_scheduler_follower_request_builder_errors_do_not_emit() -> None:
     assert scheduler._deferred_request_payloads == {}
 
 
+@pytest.mark.usefixtures("published_config")
 def test_omni_scheduler_prepares_custom_request_token_budget() -> None:
     """Preserves upstream max_new_tokens clamping for custom request builders."""
     scheduler = object.__new__(OmniScheduler)
@@ -2868,6 +2878,7 @@ def test_omni_scheduler_prepares_custom_request_token_budget() -> None:
     assert scheduler.outbox.empty()
 
 
+@pytest.mark.usefixtures("published_config")
 def test_omni_scheduler_clamps_request_to_strict_prefill_budget() -> None:
     """Clamp requests that pass the surface KV check but cannot be prefetched."""
     scheduler = object.__new__(OmniScheduler)
@@ -2924,6 +2935,7 @@ def test_omni_scheduler_clamps_request_to_strict_prefill_budget() -> None:
     assert scheduler.outbox.empty()
 
 
+@pytest.mark.usefixtures("published_config")
 def test_omni_scheduler_rejects_custom_request_over_context() -> None:
     """Covers context-length validation for custom request builders."""
     scheduler = object.__new__(OmniScheduler)
@@ -2977,6 +2989,7 @@ def test_omni_scheduler_rejects_custom_request_over_context() -> None:
     assert request_data.req is req
 
 
+@pytest.mark.usefixtures("published_config")
 def test_omni_scheduler_follower_rejections_do_not_emit_errors(monkeypatch) -> None:
     """Request-limit and KV-capacity rejections are entry-rank emissions only."""
     monkeypatch.setattr(
