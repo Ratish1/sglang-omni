@@ -828,6 +828,17 @@ class OmniScheduler:
 
     def recv_requests(self):
         """Drain inbox on rank 0 and broadcast scheduler inputs to TP followers."""
+        if self.is_entry_rank:
+            # note (ratish): only this rank reads the clock. The failed request
+            # makes the coordinator broadcast an abort, which reaches followers
+            # the way every other abort does.
+            for timeout_abort in self._poll_timeout_aborts():
+                if timeout_abort.rid in self._aborted_request_ids:
+                    continue
+                self.emit_request_error(
+                    timeout_abort.rid, RuntimeError(timeout_abort.abort_message)
+                )
+                self.abort(timeout_abort.rid)
         recv_msgs = self.recv_scheduler_messages()
         new_reqs: list = []
         for msg in recv_msgs:

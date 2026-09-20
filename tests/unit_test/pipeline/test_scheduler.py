@@ -6,6 +6,7 @@ import collections
 import gc
 import importlib
 import threading
+import time
 import weakref
 from array import array
 from collections import deque
@@ -16,6 +17,7 @@ from unittest.mock import Mock
 import pytest
 import sglang.srt.managers.scheduler as sglang_scheduler_module
 import torch
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
@@ -1903,6 +1905,75 @@ def test_completed_request_id_is_cleared_on_explicit_readmission(
     assert scheduler.outbox.empty()
     assert scheduler._idle_wait_message is None
     assert scheduler.recv_requests() == []
+
+
+@pytest.mark.parametrize(
+    "timeout_env,placement",
+    [
+        ("SGLANG_REQ_WAITING_TIMEOUT", "waiting"),
+        ("SGLANG_REQ_RUNNING_TIMEOUT", "running"),
+    ],
+)
+def test_request_timeout_fails_only_the_expired_request(
+    timeout_env: str, placement: str
+) -> None:
+    """The entry rank fails an expired request once and leaves its neighbor alone."""
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.tp_size = 1
+    scheduler.is_entry_rank = True
+    scheduler.ps = SimpleNamespace(pp_size=1)
+    scheduler.outbox = Queue()
+    scheduler.inbox = Queue()
+    scheduler._idle_wait_message = None
+    scheduler._abort_callback = None
+    scheduler._aborted_request_ids = set()
+    scheduler._aborted_request_id_order = deque()
+    scheduler._completed_request_ids = {}
+    scheduler._pending_stream_ingress = {}
+    scheduler._deferred_request_payloads = {}
+    scheduler._dirty_deferred_request_ids = set()
+    scheduler._first_emit_done = set()
+    scheduler._prefill_start_done = set()
+    scheduler._prefill_end_done = set()
+    _init_sync_request_build_state(scheduler)
+
+    long_ago = time.perf_counter() - 60.0
+    just_now = time.perf_counter()
+    expired = _make_abortable_req(
+        "req-expired",
+        time_stats=SimpleNamespace(
+            wait_queue_entry_time=long_ago, forward_entry_time=long_ago
+        ),
+    )
+    fresh = _make_abortable_req(
+        "req-fresh",
+        time_stats=SimpleNamespace(
+            wait_queue_entry_time=just_now, forward_entry_time=just_now
+        ),
+    )
+    queued = [expired, fresh] if placement == "waiting" else []
+    running = [expired, fresh] if placement == "running" else []
+    scheduler.waiting_queue = queued
+    scheduler.running_batch = SimpleNamespace(reqs=running, batch_is_full=False)
+    scheduler.cur_batch = None
+    scheduler.last_batch = None
+
+    with getattr(envs, timeout_env).override(30.0):
+        assert scheduler.recv_requests() == []
+        assert scheduler.recv_requests() == []
+
+    failures = []
+    while not scheduler.outbox.empty():
+        failures.append(scheduler.outbox.get_nowait())
+    assert [(out.request_id, out.type) for out in failures] == [
+        ("req-expired", "error")
+    ]
+    assert "timeout" in str(failures[0].data)
+    if placement == "waiting":
+        assert scheduler.waiting_queue == [fresh]
+    else:
+        assert expired.to_finish is not None
+        assert fresh.to_finish is None
 
 
 def test_pending_stream_requests_are_bounded(monkeypatch, caplog) -> None:
