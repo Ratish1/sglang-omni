@@ -2110,4 +2110,31 @@ def create_vocoder_executor(
         disable_hop_growth=disable_hop_growth,
     )
     scheduler.warmup_now()
+    if enable_flow_cuda_graph and flow.packed_estimator is not None:
+        from sglang_omni.models.fun_cosyvoice3.packed_step_graph import (
+            CFG_LANES,
+            StepGraphDiT,
+        )
+
+        # note(ratish): the largest step captured is the largest Flow batch the
+        # scheduler admits, a larger one runs eager; the smallest Flow call is
+        # a final of one token after a prompt of one hop.
+        step_graph = StepGraphDiT(
+            flow.decoder.estimator,
+            device=device_obj,
+            max_frames=CFG_LANES * flow_batch_admission_frames,
+        )
+        flow.packed_estimator = step_graph
+        smallest = FlowBatchInput(
+            token=torch.zeros(1, 1, dtype=torch.int32),
+            prompt_token=torch.zeros(1, token_hop_len, dtype=torch.int32),
+            prompt_feat=torch.zeros(
+                1, token_hop_len * TOKEN_MEL_RATIO, flow.output_size
+            ),
+            embedding=torch.zeros(1, flow.spk_embed_affine_layer.in_features),
+        )
+        step_graph.capture_sizes(
+            lambda: vocoder.leftover_batch([smallest]),
+            frames=CFG_LANES * TOKEN_MEL_RATIO * (token_hop_len + 1),
+        )
     return scheduler
