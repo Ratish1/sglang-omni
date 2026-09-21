@@ -149,6 +149,17 @@ def main() -> None:
 
     flow, hift = load_cosyvoice3_flow_hift(args.model, device=args.device)
     patch_chunk_mask()
+    inputs = {shape: items(*shape, flow) for shape in SHAPES}
+    # The float32 truth, before the DiT's weights are cast: the same entry
+    # points without autocast, which sends attention down the padded SDPA path.
+    float32 = {}
+    for shape, batch in inputs.items():
+        float32[f"hop {shape}"] = [
+            m.float().clone() for m in flow.inference_causal(batch)
+        ]
+        float32[f"final {shape}"] = [
+            m.float().clone() for m in flow.inference_leftover(batch)
+        ]
     for module in flow.decoder.estimator.modules():
         if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
             module.to(torch.bfloat16)
@@ -160,7 +171,6 @@ def main() -> None:
         sizes=step_sizes(2 * chunk, args.limit),
     )
     vocoder.flow.packed_estimator = estimator
-    inputs = {shape: items(*shape, flow) for shape in SHAPES}
     calls = {
         f"{kind} {shape}": call
         for shape, batch in inputs.items()
@@ -215,6 +225,8 @@ def main() -> None:
                     float((a - b).abs().max()) for a, b in zip(truth, mel)
                 ),
                 "snr_db": snr_db(truth, mel),
+                "eager_vs_float32_db": snr_db(float32[name], truth),
+                "replay_vs_float32_db": snr_db(float32[name], mel),
                 "poisoned_padding_inert": all(
                     torch.equal(a, b) for a, b in zip(mel, poisoned)
                 ),
