@@ -1488,6 +1488,10 @@ class Qwen3TTSStreamingVocoderScheduler(
         assert arena is not None
         if state.codec_slot is None:
             slot = arena.acquire()
+            if slot is None and prime:
+                # note (ratish): a full arena skips the prime, the reference
+                # then decodes with the first generated frames
+                return None
             if slot is None:
                 state.incremental_codec_fallback = True
                 self._codec_fallback_count += 1
