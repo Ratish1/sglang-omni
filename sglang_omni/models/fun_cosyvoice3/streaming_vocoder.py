@@ -118,6 +118,20 @@ class FunCosyVoice3StreamingVocoderScheduler(
             request_cost_fn=request_cost_fn,
             max_batch_cost=max_batch_cost,
         )
+        # note(ratish): the AR shares this process and the default stream; on
+        # its own stream a step's kernels and host copies do not queue behind
+        # the AR's.
+        device = next(vocoder.hift.parameters()).device
+        self.step_stream = (
+            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        )
+
+    def pump_one_step(self) -> list[str] | None:
+        if self.step_stream is None:
+            return super().pump_one_step()
+        else:
+            with torch.cuda.stream(self.step_stream):
+                return super().pump_one_step()
 
     async def vocode_payload(self, payload: StagePayload) -> StagePayload:
         results = await self.vocoder.decode_payloads([payload])
