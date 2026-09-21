@@ -20,9 +20,9 @@ import torch
 from benchmarks.dataset.prepare import SEEDTTS_DATASET_ID, SEEDTTS_DATASET_REVISION
 from benchmarks.dataset.seedtts import load_seedtts_samples
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
-    _align_flow_prompt,
-    _load_prompt_audio,
-    _load_prompt_audio_24k,
+    align_flow_prompt,
+    load_prompt_audio,
+    load_prompt_audio_24k,
 )
 from sglang_omni.models.fun_cosyvoice3.stages import (
     CosyVoice3Vocoder,
@@ -115,9 +115,9 @@ def build_streams(
         if sample.ref_audio in references:
             continue
         references.add(sample.ref_audio)
-        audio_16k = _load_prompt_audio(sample.ref_audio)
-        audio_24k = _load_prompt_audio_24k(sample.ref_audio)
-        token, feat = _align_flow_prompt(
+        audio_16k = load_prompt_audio(sample.ref_audio)
+        audio_24k = load_prompt_audio_24k(sample.ref_audio)
+        token, feat = align_flow_prompt(
             speech_tokenizer.extract_speech_token(audio_16k, PROMPT_AUDIO_SR),
             extract_prompt_speech_feat(audio_24k, FLOW_AUDIO_SR),
         )
