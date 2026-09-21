@@ -266,11 +266,23 @@ def main():
     parser.add_argument("--out", default="valid_width_grid.json")
     args = parser.parse_args()
     device = torch.device("cuda")
-    tokenizer = qwen3_stages.load_qwen3_tts_tokenizer(
-        args.model, device=str(device), dtype=args.dtype, attn_implementation=None
-    )
-    decoder = codec.Qwen3TTSIncrementalDecoder(tokenizer.model.decoder)
+    # note(ratish): TF32 convs and matmuls round at about 1e-3, which would hide a
+    # mechanism error in float32; float64 (loaded as float32, then widened) is the
+    # reference that separates the mechanism from kernel rounding
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
     dtype = getattr(torch, args.dtype)
+    load_dtype = "float32" if args.dtype == "float64" else args.dtype
+    tokenizer = qwen3_stages.load_qwen3_tts_tokenizer(
+        args.model, device=str(device), dtype=load_dtype, attn_implementation=None
+    )
+    raw_decoder = tokenizer.model.decoder.to(dtype)
+    if args.mode == "grid":
+        # note(ratish): the server fuses SnakeBeta before it captures its graphs
+        from sglang_omni.models.qwen3_tts.vocoder_kernels import fuse_vocoder_decoder
+
+        print(f"fused SnakeBeta modules: {fuse_vocoder_decoder(raw_decoder)}")
+    decoder = codec.Qwen3TTSIncrementalDecoder(raw_decoder)
     print(f"dtype {args.dtype}, total upsample {decoder.total_upsample}")
     with torch.inference_mode():
         if args.mode == "exact":
