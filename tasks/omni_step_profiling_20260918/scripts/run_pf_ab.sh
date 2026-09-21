@@ -65,19 +65,21 @@ boot() {
   echo "done $(date +%T)" >> "$d/progress.txt"
 }
 
+# note(ratish): CARDS picks the six cards, in boot order; the box is shared
+read -r C1 C2 C3 C4 C5 C6 <<< "${CARDS:-1 2 3 4 5 6}"
 if [ "$POINTS" = buffered ]; then
-  boot a_c16_buffered "$TREE_A" 5 8105 --concurrency 16 &
-  boot b_c16_buffered "$TREE_B" 6 8106 --concurrency 16 &
+  boot a_c16_buffered "$TREE_A" "$C5" 8105 --concurrency 16 &
+  boot b_c16_buffered "$TREE_B" "$C6" 8106 --concurrency 16 &
   wait
   echo "all done $(date +%T)" > "$OUT/DONE"
   exit 0
 fi
-boot a_c16_stream "$TREE_A" 1 8101 --concurrency 16 --stream &
-boot b_c16_stream "$TREE_B" 2 8102 --concurrency 16 --stream &
-boot a_c1_stream_seeded "$TREE_A" 3 8103 --concurrency 1 --stream --seed 1234 &
-boot b_c1_stream_seeded "$TREE_B" 4 8104 --concurrency 1 --stream --seed 1234 &
-boot a_c16_buffered "$TREE_A" 5 8105 --concurrency 16 &
-boot b_c16_buffered "$TREE_B" 6 8106 --concurrency 16 &
+boot a_c16_stream "$TREE_A" "$C1" 8101 --concurrency 16 --stream &
+boot b_c16_stream "$TREE_B" "$C2" 8102 --concurrency 16 --stream &
+boot a_c1_stream_seeded "$TREE_A" "$C3" 8103 --concurrency 1 --stream --seed 1234 &
+boot b_c1_stream_seeded "$TREE_B" "$C4" 8104 --concurrency 1 --stream --seed 1234 &
+boot a_c16_buffered "$TREE_A" "$C5" 8105 --concurrency 16 &
+boot b_c16_buffered "$TREE_B" "$C6" 8106 --concurrency 16 &
 wait
 
 (cd "$OUT/a_c1_stream_seeded/bench" && find . -name '*.wav' -exec md5sum {} + | sort -k2) > "$OUT/identity_a.txt"
