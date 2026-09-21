@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -60,7 +62,11 @@ class _Runner(MlxSchedulerModelRunner):
         self._execution_bridge = None
         self.finalized = []
 
-    def _finalize(
+    @staticmethod
+    def mlx_stream_context():
+        return nullcontext()
+
+    def finalize(
         self,
         batch_result,
         forward_batch,
@@ -181,6 +187,28 @@ def test_mlx_scheduler_runner_limits_lookahead_to_concurrency_one() -> None:
     )
 
 
+def test_mlx_scheduler_stream_is_valid_on_its_execution_thread() -> None:
+    mx = pytest.importorskip("mlx.core")
+    runner = object.__new__(MlxSchedulerModelRunner)
+    runner._mlx_thread_stream = mx.new_thread_local_stream(mx.gpu)
+    source = mx.arange(4)
+    mx.eval(source)
+    observed = []
+
+    def evaluate() -> None:
+        with runner.mlx_stream_context():
+            result = source + 1
+            mx.async_eval(result)
+            mx.eval(result)
+            observed.extend(result.tolist())
+
+    thread = threading.Thread(target=evaluate)
+    thread.start()
+    thread.join()
+
+    assert observed == [1, 2, 3, 4]
+
+
 def test_mlx_scheduler_runner_uses_future_map_bridge(monkeypatch) -> None:
     import sglang.srt.managers.overlap_utils as overlap_utils
 
@@ -206,3 +234,25 @@ def test_mlx_scheduler_runner_uses_future_map_bridge(monkeypatch) -> None:
 
     assert resolved == [(scheduler_output.batch_data, bridge.future_map)]
     assert bridge.published == [(pending.schedule_batch, "token-ids")]
+
+
+def test_native_mlx_runners_override_sglang_load_hook():
+    mlx_model_runner = pytest.importorskip(
+        "sglang.srt.hardware_backend.mlx.model_runner"
+    )
+    base = mlx_model_runner.MlxModelRunner
+
+    from sglang_omni.models.fun_cosyvoice3.mlx.runner import (
+        make_fun_cosyvoice3_mlx_runner_class,
+    )
+    from sglang_omni.models.qwen3_asr.mlx.runner import make_qwen3_asr_mlx_runner_class
+
+    for make_runner_class in (
+        make_qwen3_asr_mlx_runner_class,
+        make_fun_cosyvoice3_mlx_runner_class,
+    ):
+        runner_class = make_runner_class()
+        assert runner_class._load_model is not base._load_model, (
+            f"{runner_class.__name__} no longer overrides SGLang's _load_model hook; "
+            "the native MLX model would silently not load"
+        )
