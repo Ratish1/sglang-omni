@@ -12,7 +12,10 @@ PY=/workspace/sglang-omni/.venv/bin/python
 MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
 META=zhaochenyang20/seed-tts-eval-arrow
 BENCH_TREE=$(head -1 "$ARMS" | cut -d'|' -f2)
-PORT=8301
+# note(ratish): PORT lets cells run on several cards at once; BENCH_ARGS picks the mode
+# (default streaming; "" is non streaming; "--meta <list>" is another corpus)
+PORT=${PORT:-8301}
+BENCH_ARGS=${BENCH_ARGS---stream}
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 mkdir -p "$OUT"
 md5sum "$0" "$ARMS" > "$OUT/md5.txt"
@@ -47,7 +50,7 @@ for pass in $(seq "$PASSES"); do
     if [ $healthy = 1 ]; then
       (cd "$BENCH_TREE" && PYTHONPATH=$BENCH_TREE timeout 3600 $PY -m benchmarks.eval.benchmark_tts_seedtts \
         --model $MODEL --meta $META --lang en --use-existing-server --host 127.0.0.1 --port $PORT \
-        --warmup 1 --stream --generate-only --concurrency "$CONC" --output-dir "$d/bench") > "$d/bench.log" 2>&1
+        --warmup 1 --generate-only --concurrency "$CONC" --output-dir "$d/bench" $BENCH_ARGS) > "$d/bench.log" 2>&1
       echo "bench rc $? $(date +%T)" >> "$d/progress.txt"
       rm -rf "$d/bench/audio"
     fi
