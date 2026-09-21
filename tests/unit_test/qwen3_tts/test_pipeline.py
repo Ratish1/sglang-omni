@@ -2824,7 +2824,7 @@ def _stateful_stream(
     scheduler, incremental = _stateful_qwen3_tts_scheduler(monkeypatch)
     scheduler._initial_worker = SimpleNamespace(name="initial")
     state = scheduler.create_stream_state("request")
-    scheduler._stream_states["request"] = state
+    scheduler.stream_states["request"] = state
     return scheduler, incremental, state
 
 
@@ -2930,7 +2930,7 @@ def test_qwen3_tts_stream_ending_during_its_prime_finishes_without_audio(
     payload.data = Qwen3TTSState(
         audio_codes=torch.tensor([[10, 1]]), ref_code_len=1
     ).to_dict()
-    scheduler._stream_payloads["request"] = payload
+    scheduler.stream_payloads["request"] = payload
 
     _deliver_stream_chunk(
         scheduler, state, torch.tensor([[10, 1]], dtype=torch.long), ref_code_len=1
@@ -2945,7 +2945,7 @@ def test_qwen3_tts_stream_ending_during_its_prime_finishes_without_audio(
     assert result.type == "result"
     assert "audio_waveform" not in result.data.data
     assert scheduler.outbox.empty()
-    assert "request" not in scheduler._stream_states
+    assert "request" not in scheduler.stream_states
 
 
 def test_qwen3_tts_prime_commit_finishes_a_stream_that_ended_meanwhile(
@@ -2956,11 +2956,11 @@ def test_qwen3_tts_prime_commit_finishes_a_stream_that_ended_meanwhile(
     payload.data = Qwen3TTSState(
         audio_codes=torch.tensor([[10, 1]]), ref_code_len=1
     ).to_dict()
-    scheduler._stream_payloads["request"] = payload
+    scheduler.stream_payloads["request"] = payload
     _deliver_stream_chunk(
         scheduler, state, torch.tensor([[10, 1]], dtype=torch.long), ref_code_len=1
     )
-    with scheduler._state_lock:
+    with scheduler.state_lock:
         plan, incremental_plan = scheduler.plan_stream_decode(
             "request", state, is_final=False, max_generated_frames=1
         )
@@ -2980,7 +2980,7 @@ def test_qwen3_tts_prime_commit_finishes_a_stream_that_ended_meanwhile(
     result = scheduler.outbox.get_nowait()
     assert result.type == "result"
     assert scheduler.outbox.empty()
-    assert "request" not in scheduler._stream_states
+    assert "request" not in scheduler.stream_states
     assert scheduler._codec_arena.active_slots() == 0
 
 
