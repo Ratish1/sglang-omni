@@ -45,6 +45,7 @@ LEDGER=${LEDGER:-}
 # CUDA_VISIBLE_DEVICES leaves the process.
 NSYS=${NSYS-}
 NSYS_WARMUP=${NSYS_WARMUP:-32}
+NSYS_TRACE=${NSYS_TRACE:-cuda,nvtx,osrt,python-gil}
 MODEL=${MODEL:-/data/ms/models/FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/master}
 ANALYSIS_BRANCH=${ANALYSIS_BRANCH:-analysis/cosyvoice-utilization-20260912}
 # The checkpoint loader imports CosyVoice and its Matcha submodule, which the
@@ -147,9 +148,10 @@ echo "out $OUT"
 # out. Fail loudly on a clash instead.
 LAUNCH=""
 if [ -n "$NSYS" ]; then
-  # Nsight dropped --sample and --trace from launch after 2021.5; they belong to
-  # start, which the runner issues around the measured window.
-  LAUNCH="nsys launch --session-new=$NSYS \
+  # The traced APIs are an application scope option, so they go on launch; the
+  # runner's start only opens the window. python-gil records every GIL wait and
+  # hold per thread, which is what tells a thread off the CPU from one blocked.
+  LAUNCH="nsys launch --session-new=$NSYS --trace=$NSYS_TRACE \
     --cuda-graph-trace=node --trace-fork-before-exec=true"
 fi
 (cd "$TREE" && setsid bash -c "echo \$\$ > '$OUT/server.pgid'; exec env CUDA_VISIBLE_DEVICES=$CARD \
