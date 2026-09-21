@@ -12,7 +12,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import Any
 
 import torch
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
@@ -251,12 +250,11 @@ class CachedDiT(PackedDiT):
     ) -> CachedHop:
         return self.hop
 
-    def rope(self, rows: PackedRows) -> tuple[torch.Tensor, Any]:
+    def rope(self, rows: PackedRows) -> tuple[torch.Tensor, torch.Tensor]:
         freqs, scale = self.dit.rotary_embed.forward_from_seq_len(self.hop.max_end)
+        assert not isinstance(scale, torch.Tensor), "the DiT's RoPE has no xpos scale"
         freqs = freqs[:, self.hop.positions]
-        if isinstance(scale, torch.Tensor):
-            scale = scale[:, self.hop.positions]
-        return freqs, scale
+        return freqs.cos(), freqs.sin()
 
     def conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
         hop = self.hop
