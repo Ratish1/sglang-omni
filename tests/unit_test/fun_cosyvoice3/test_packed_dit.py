@@ -185,9 +185,7 @@ def test_packed_conv_position_embed_matches_the_padded_conv_per_row() -> None:
 
     with torch.inference_mode():
         expected = dit.input_embed.conv_pos_embed(padded)
-        out = PackedDiT(dit, device=CPU)._conv_pos_embed(
-            gather_rows(padded, rows), rows
-        )
+        out = PackedDiT(dit, device=CPU).conv_pos_embed(gather_rows(padded, rows), rows)
 
     torch.testing.assert_close(out, gather_rows(expected, rows), rtol=1e-12, atol=1e-12)
 
