@@ -36,8 +36,9 @@ for pass in $(seq "$PASSES"); do
     (while true; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader | grep "$uuid" | sed "s/^/$(date +%T) /"; sleep 2; done) > "$d/apps.csv" 2>&1 &
     apps=$!
     began=$(date +%s)
+    # note(ratish): PROBE_PATH adds a sitecustomize probe directory behind the tree
     (cd "$tree" && setsid bash -c "echo \$\$ > $d/server.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD \
-      PYTHONPATH=$tree $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT $serve_args" \
+      OMNI_FLOW_PROBE=$d/flow PYTHONPATH=$tree${PROBE_PATH:+:$PROBE_PATH} $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT $serve_args" \
       > "$d/serve.log" 2>&1 &)
     healthy=0
     for _ in $(seq 360); do
