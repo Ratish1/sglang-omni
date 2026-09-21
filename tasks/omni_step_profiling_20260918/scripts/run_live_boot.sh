@@ -90,12 +90,19 @@ live() {
     sleep 15
     if [ $pass = formal ]; then
       $PY "$S/live_window.py" --url $URL --out "$d/formal_pass" --label window --steps "$steps" \
-        > "$d/formal_pass/window.out" 2> "$d/formal_pass/window.err"
+        > "$d/formal_pass/window.out" 2> "$d/formal_pass/window.err" &
     else
       $PY "$S/live_window.py" --url $URL --out "$d/roles_pass" --label window --steps 60 --with-stack \
-        > "$d/roles_pass/window.out" 2> "$d/roles_pass/window.err"
+        > "$d/roles_pass/window.out" 2> "$d/roles_pass/window.err" &
     fi
+    local window_pid=$!
     wait $bench_pid
+    # note(ratish): a bench shorter than its window leaves the window waiting for
+    # steps that never come (long form, runs 10 and 28); stop it and keep what it has
+    sleep 5
+    kill -0 $window_pid 2>/dev/null && curl -s -X POST $URL/stop_profile \
+      -H 'content-type: application/json' -d '{}' > "$d/${pass}_pass/forced_stop.json"
+    wait $window_pid
     echo "end live $cell $pass rc=$? $(date +%T)" >> "$OUT/progress.txt"
   done
 }
@@ -106,9 +113,12 @@ capture formal_decode_b1 --kind decode --batch 1 --steps 40 --label formal
 capture formal_decode_b16 --kind decode --batch 16 --steps 40 --label formal
 capture uncaptured_decode_b16 --kind decode --batch 16 --steps 40 --label uncaptured --no-capture
 
-live seedtts_c16 600 --meta $META --concurrency 16
-live longform_c16 400 --meta "$OUT/longform/meta.lst" --concurrency 16
-live seedtts_c1 300 --meta $META --concurrency 1 --max-samples 120
+# note(ratish): LIVE_CELLS=0 stops after the degenerate captures (an A/A control boot)
+if [ "${LIVE_CELLS:-1}" = 1 ]; then
+  live seedtts_c16 600 --meta $META --concurrency 16
+  live longform_c16 400 --meta "$OUT/longform/meta.lst" --concurrency 16
+  live seedtts_c1 300 --meta $META --concurrency 1 --max-samples 120
+fi
 
 grep -m1 "Torch profiler armed" "$OUT/serve.log" > "$OUT/armed_marker.txt"
 teardown
