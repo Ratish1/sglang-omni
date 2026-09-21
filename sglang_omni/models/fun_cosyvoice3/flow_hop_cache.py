@@ -251,14 +251,14 @@ class CachedDiT(PackedDiT):
     ) -> CachedHop:
         return self.hop
 
-    def _rope(self, rows: PackedRows) -> tuple[torch.Tensor, Any]:
+    def rope(self, rows: PackedRows) -> tuple[torch.Tensor, Any]:
         freqs, scale = self.dit.rotary_embed.forward_from_seq_len(self.hop.max_end)
         freqs = freqs[:, self.hop.positions]
         if isinstance(scale, torch.Tensor):
             scale = scale[:, self.hop.positions]
         return freqs, scale
 
-    def _conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
+    def conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
         hop = self.hop
         conv = self.dit.input_embed.conv_pos_embed
         context = conv.kernel_size - 1
