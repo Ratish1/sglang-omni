@@ -260,7 +260,7 @@ class CachedDiT(PackedDiT):
         super().__init__(dit, device=device)
         self.cache = cache
         self.hop: CachedHop | None = None
-        self.hop_rope: tuple[torch.Tensor, float] | None = None
+        self.hop_rope: tuple[torch.Tensor, torch.Tensor] | None = None
         self.step_frames = 0
         self.run_step: Callable[..., torch.Tensor] = self.step
         self.sizes: tuple[int, ...] = ()
@@ -289,12 +289,13 @@ class CachedDiT(PackedDiT):
         freqs, scale = self.dit.rotary_embed.forward_from_seq_len(hop.max_end)
         assert not isinstance(scale, torch.Tensor), "the DiT's RoPE has no xpos scale"
         self.hop = hop
-        self.hop_rope = pad_frames(freqs[:, hop.positions], self.step_frames), scale
+        freqs = pad_frames(freqs[:, hop.positions], self.step_frames)
+        self.hop_rope = freqs.cos(), freqs.sin()
 
     def row_attention(
         self, rows: PackedRows, *, streaming: bool, dtype: torch.dtype
     ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
-        return self.attend
+        return self.append_and_attend
 
     def forward(
         self,
@@ -342,10 +343,12 @@ class CachedDiT(PackedDiT):
     ) -> torch.Tensor:
         """x, mu, spks, cond: (1, step frames, channels). A captured step keeps
         only tensor addresses, so everything else comes from the hop."""
-        return super().forward(x, mu, spks, cond, t, self.hop.rows, self.attend)
+        return super().forward(
+            x, mu, spks, cond, t, self.hop.rows, self.append_and_attend
+        )
 
     @eager_on_graph(True)
-    def attend(
+    def append_and_attend(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     ) -> torch.Tensor:
         """query, key, value: (1, step frames, heads * head_dim), the hop's
@@ -377,7 +380,7 @@ class CachedDiT(PackedDiT):
     # note(ratish): rows is the hook's contract; the breaks below replay with
     # the arguments of the capture, so they read this call's rows from the hop.
     @eager_on_graph(True)
-    def rope(self, rows: PackedRows) -> tuple[torch.Tensor, float]:
+    def rope(self, rows: PackedRows) -> tuple[torch.Tensor, torch.Tensor]:
         return self.hop_rope
 
     @eager_on_graph(True)
