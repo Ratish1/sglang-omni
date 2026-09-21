@@ -33,7 +33,9 @@ for point in $POINTS; do
   echo "point $name start $(date -u +%H:%M:%S)"
   # The arms share the repo's git state while they set their worktrees up, so
   # the second one starts once the first is past that.
+  # CAPTURE non empty makes both arms Nsight captures, one session per arm.
   MODE=$mode CONC=$conc SAMPLES=${samples:-} ARM="$TAG-a-$name" REV=$A_REV CARD=$A_CARD \
+    NSYS=${CAPTURE:+$TAG-a} \
     PORT=$((8500 + A_CARD)) bash "$G1" > ".tmp/logs/$TAG-a-$name.log" 2>&1 &
   a=$!
   until grep -q '^out ' ".tmp/logs/$TAG-a-$name.log" 2>/dev/null; do
@@ -41,6 +43,7 @@ for point in $POINTS; do
     sleep 1
   done
   MODE=$mode CONC=$conc SAMPLES=${samples:-} ARM="$TAG-b-$name" REV=$B_REV CARD=$B_CARD \
+    NSYS=${CAPTURE:+$TAG-b} \
     PORT=$((8500 + B_CARD)) bash "$G1" > ".tmp/logs/$TAG-b-$name.log" 2>&1 &
   b=$!
   wait $a && echo "point $name arm a ok" || echo "point $name arm a FAILED"
