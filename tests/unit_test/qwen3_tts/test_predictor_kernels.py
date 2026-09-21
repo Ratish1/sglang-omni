@@ -11,7 +11,7 @@ from sglang_omni.models.qwen3_tts import predictor_kernels
 from sglang_omni.models.qwen3_tts.predictor_kernels import (
     gather_codec_embedding_and_add,
 )
-from sglang_omni.models.qwen3_tts.sglang_model import _predictor_gqa_attention
+from sglang_omni.models.qwen3_tts.sglang_model import predictor_gqa_attention
 from sglang_omni.platforms import current_platform
 
 
@@ -21,7 +21,7 @@ def test_predictor_triton_kernel_is_disabled_on_npu(
     monkeypatch.setattr(predictor_kernels, "triton", object())
     monkeypatch.setattr(predictor_kernels.current_platform, "is_npu", lambda: True)
 
-    assert not predictor_kernels._has_triton_runtime()
+    assert not predictor_kernels.has_triton_runtime()
 
 
 def test_predictor_gqa_attention_cpu_matches_sdpa() -> None:
@@ -29,7 +29,7 @@ def test_predictor_gqa_attention_cpu_matches_sdpa() -> None:
     key = torch.randn(2, 2, 5, 8)
     value = torch.randn(2, 2, 5, 8)
 
-    actual = _predictor_gqa_attention(
+    actual = predictor_gqa_attention(
         q, key, value, num_heads=4, num_key_value_heads=2, is_causal=False
     )
     expected = F.scaled_dot_product_attention(
@@ -44,7 +44,7 @@ def test_predictor_gqa_attention_pair_attends_causally() -> None:
     key = torch.randn(2, 2, 2, 8)
     value = torch.randn(2, 2, 2, 8)
 
-    actual = _predictor_gqa_attention(
+    actual = predictor_gqa_attention(
         q, key, value, num_heads=4, num_key_value_heads=2, is_causal=True
     )
     first = F.scaled_dot_product_attention(
@@ -62,7 +62,7 @@ def test_predictor_npu_fused_attention_matches_sdpa() -> None:
     key = torch.randn(2, 2, 5, 128, device=device, dtype=torch.bfloat16)
     value = torch.randn(2, 2, 5, 128, device=device, dtype=torch.bfloat16)
 
-    actual = _predictor_gqa_attention(
+    actual = predictor_gqa_attention(
         q, key, value, num_heads=4, num_key_value_heads=2, is_causal=False
     )
     expected = F.scaled_dot_product_attention(

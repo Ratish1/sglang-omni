@@ -267,7 +267,7 @@ def _step_inputs(batch_size: int, device: torch.device, *, step: int = 0):
 
 def _run_eager(talker, layer0, hidden, positions):
     with torch.no_grad():
-        codes, embeds = talker._code_predictor_forward_incremental(
+        codes, embeds = talker.code_predictor_forward_incremental(
             layer0, hidden, semantic_positions=positions
         )
     return codes.detach().clone(), embeds.detach().clone()
@@ -415,7 +415,7 @@ def _predictor_one_token_out_of_place(
                 mlp_out.clone(), residual.reshape(-1, hidden_size).clone()
             )
             residual = residual.reshape(batch_size, 1, hidden_size)
-        attn_input = talker._predictor_cached_self_attention(
+        attn_input = talker.predictor_cached_self_attention(
             layer_idx=layer_idx,
             attn=layer.self_attn,
             hidden_states=normed.reshape(batch_size, 1, hidden_size),
@@ -423,7 +423,7 @@ def _predictor_one_token_out_of_place(
             cache_slots=talker._predictor_cache_slots[cache_len, :batch_size],
             cache_len=cache_len,
         )
-        residual = talker._predictor_o_proj_add_residual(
+        residual = talker.predictor_o_proj_add_residual(
             layer.self_attn.o_proj, attn_input, residual.clone()
         )
         normed = layer.post_attention_layernorm(residual.reshape(-1, hidden_size))
@@ -451,7 +451,7 @@ def test_eager_predictor_in_place_residual_norms_match_the_out_of_place_form(
         expected = _predictor_one_token_out_of_place(
             reference, embeds.clone(), cache_len=0
         )
-        actual = in_place._predictor_forward_tokens(
+        actual = in_place.predictor_forward_tokens(
             token_embeds=embeds.clone(), batch_size=batch_size, cache_len=0
         )
 
@@ -485,7 +485,7 @@ def test_eager_predictor_adds_each_residual_inside_the_norm_that_follows(
     monkeypatch.setattr(RMSNorm, "forward", recording_forward)
     embeds = torch.randn(2, 1, HIDDEN, device=device, dtype=DTYPE)
     with torch.no_grad():
-        talker._predictor_forward_tokens(token_embeds=embeds, batch_size=2, cache_len=0)
+        talker.predictor_forward_tokens(token_embeds=embeds, batch_size=2, cache_len=0)
 
     assert all(dim == 2 for dim, _ in calls)
     fused_calls = [fused for _, fused in calls]
@@ -505,11 +505,11 @@ def test_eager_predictor_output_survives_the_next_token():
     ]
 
     with torch.no_grad():
-        first = talker._predictor_forward_tokens(
+        first = talker.predictor_forward_tokens(
             token_embeds=embeds[0], batch_size=2, cache_len=0
         )
         snapshot = first.clone()
-        second = talker._predictor_forward_tokens(
+        second = talker.predictor_forward_tokens(
             token_embeds=embeds[1], batch_size=2, cache_len=1
         )
 
@@ -530,13 +530,13 @@ def test_the_pair_pass_matches_two_one_token_passes(batch_size: int):
     ).to(device, DTYPE)
 
     with torch.no_grad():
-        from_pair = pair._predictor_forward_tokens(
+        from_pair = pair.predictor_forward_tokens(
             token_embeds=embeds.clone(), batch_size=batch_size, cache_len=0
         )
-        first = serial._predictor_forward_tokens(
+        first = serial.predictor_forward_tokens(
             token_embeds=embeds[:, :1].clone(), batch_size=batch_size, cache_len=0
         )
-        second = serial._predictor_forward_tokens(
+        second = serial.predictor_forward_tokens(
             token_embeds=embeds[:, 1:].clone(), batch_size=batch_size, cache_len=1
         )
 
@@ -567,10 +567,10 @@ def test_eager_predictor_accepts_a_strided_input_and_leaves_its_neighbours():
     contiguous = strided.clone()
 
     with torch.no_grad():
-        from_strided = strided_talker._predictor_forward_tokens(
+        from_strided = strided_talker.predictor_forward_tokens(
             token_embeds=strided, batch_size=2, cache_len=0
         )
-        from_contiguous = contiguous_talker._predictor_forward_tokens(
+        from_contiguous = contiguous_talker.predictor_forward_tokens(
             token_embeds=contiguous, batch_size=2, cache_len=0
         )
 
@@ -673,14 +673,14 @@ def test_mixed_sampled_argmax_rows_use_graph_bit_identity(
     talker.prepare_decode_buffers(requests)
     layer0, hidden, positions = _step_inputs(2, device)
 
-    real_seeded = Qwen3TTSTalker._sample_subtalker_token_seeded
+    real_seeded = Qwen3TTSTalker.sample_subtalker_token_seeded
 
     def _sentinel_seeded(self, logits, *, sub_positions):
         del self, sub_positions
         return (torch.argmax(logits, dim=-1) + 1) % PRED_VOCAB
 
     monkeypatch.setattr(
-        Qwen3TTSTalker, "_sample_subtalker_token_seeded", _sentinel_seeded
+        Qwen3TTSTalker, "sample_subtalker_token_seeded", _sentinel_seeded
     )
 
     eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
@@ -690,9 +690,9 @@ def test_mixed_sampled_argmax_rows_use_graph_bit_identity(
     assert torch.equal(graph_codes, eager_codes)
     assert torch.equal(graph_embeds, eager_embeds)
 
-    monkeypatch.setattr(Qwen3TTSTalker, "_sample_subtalker_token_seeded", real_seeded)
+    monkeypatch.setattr(Qwen3TTSTalker, "sample_subtalker_token_seeded", real_seeded)
     talker.prepare_decode_buffers([_request(dosample=False), _request(dosample=False)])
-    argmax_codes, _ = talker._code_predictor_forward_incremental(
+    argmax_codes, _ = talker.code_predictor_forward_incremental(
         layer0, hidden, semantic_positions=positions
     )
 
@@ -714,9 +714,9 @@ def test_mixed_sampled_argmax_rows_preserve_argmax_tie_break():
     logits[1, 5] = 9.0
     logits[1, 7] = 9.0
 
-    tokens = talker._sample_subtalker_token(
+    tokens = talker.sample_subtalker_token(
         logits,
-        sub_positions=talker._sub_seed_positions(
+        sub_positions=talker.sub_seed_positions(
             torch.zeros(2, dtype=torch.long, device=device)
         )[0],
     )
@@ -803,15 +803,15 @@ def test_kill_switch_disables_graph_path():
 def test_env_switch_parsing(monkeypatch: pytest.MonkeyPatch):
     env = sglang_model_module.QTTS_PREDICTOR_GRAPH_ENV
     monkeypatch.delenv(env, raising=False)
-    assert sglang_model_module._predictor_graph_env_override() is None
+    assert sglang_model_module.predictor_graph_env_override() is None
     monkeypatch.setenv(env, "0")
-    assert sglang_model_module._predictor_graph_env_override() is False
+    assert sglang_model_module.predictor_graph_env_override() is False
     monkeypatch.setenv(env, "false")
-    assert sglang_model_module._predictor_graph_env_override() is False
+    assert sglang_model_module.predictor_graph_env_override() is False
     monkeypatch.setenv(env, "no")
-    assert sglang_model_module._predictor_graph_env_override() is False
+    assert sglang_model_module.predictor_graph_env_override() is False
     monkeypatch.setenv(env, "1")
-    assert sglang_model_module._predictor_graph_env_override() is True
+    assert sglang_model_module.predictor_graph_env_override() is True
 
 
 def test_a_declared_disable_also_drops_the_reference_encoder_buckets(
@@ -846,10 +846,10 @@ def test_a_declared_disable_also_drops_the_reference_encoder_buckets(
     )
     monkeypatch.setitem(sys.modules, "qwen_tts", qwen_tts_module)
     monkeypatch.setattr(
-        qwen3_stages, "_load_qwen3_tts_tokenizer", lambda *a, **k: object()
+        qwen3_stages, "load_qwen3_tts_tokenizer", lambda *a, **k: object()
     )
     monkeypatch.setattr(
-        qwen3_stages, "_load_qwen3_tts_generate_defaults", lambda path: {}
+        qwen3_stages, "load_qwen3_tts_generate_defaults", lambda path: {}
     )
     monkeypatch.setattr(
         AutoProcessor, "from_pretrained", staticmethod(lambda *a, **k: object())
@@ -884,9 +884,9 @@ def test_a_graph_signature_is_reachable_off_cuda():
     positions = torch.zeros(2, dtype=torch.long)
 
     assert talker._sub_has_sampled_rows is True
-    assert talker._predictor_graph_signature(2, positions) is not None
+    assert talker.predictor_graph_signature(2, positions) is not None
     elsewhere = torch.zeros(2, dtype=torch.long, device="meta")
-    assert talker._predictor_graph_signature(2, elsewhere) is None
+    assert talker.predictor_graph_signature(2, elsewhere) is None
 
 
 def test_both_gates_reject_another_card_of_the_same_kind() -> None:
@@ -898,13 +898,13 @@ def test_both_gates_reject_another_card_of_the_same_kind() -> None:
 
     same_card = SimpleNamespace(device=torch.device("xpu", 0), ndim=1, shape=(2,))
     other_card = SimpleNamespace(device=torch.device("xpu", 1), ndim=1, shape=(2,))
-    assert talker._predictor_graph_signature(2, same_card) is not None
-    assert talker._predictor_graph_signature(2, other_card) is None
+    assert talker.predictor_graph_signature(2, same_card) is not None
+    assert talker.predictor_graph_signature(2, other_card) is None
 
     elsewhere = SimpleNamespace(
         device=torch.device("xpu", 1), dtype=torch.long, shape=(2, 1)
     )
-    assert talker._predictor_forward_graphed(elsewhere, elsewhere, None) is None
+    assert talker.predictor_forward_graphed(elsewhere, elsewhere, None) is None
 
 
 def test_a_capture_that_fails_after_the_graph_exists_releases_it(
@@ -957,12 +957,12 @@ def test_a_capture_that_fails_after_the_graph_exists_releases_it(
     )
     monkeypatch.setattr(
         Qwen3TTSTalker,
-        "_code_predictor_forward_incremental",
+        "code_predictor_forward_incremental",
         lambda self, *a, **k: (talker._output_codes[:2], talker._output_embeds[:2]),
     )
 
     with pytest.raises(RuntimeError, match="simulated capture_end failure"):
-        talker._capture_predictor_graph(2, ("argmax", 0, False, False, False))
+        talker.capture_predictor_graph(2, ("argmax", 0, False, False, False))
 
     assert resets == [1]
 
@@ -991,7 +991,7 @@ def test_a_step_on_a_device_without_a_graph_backend_stays_eager(
     monkeypatch.delenv(sglang_model_module.QTTS_PREDICTOR_GRAPH_ENV, raising=False)
     layer0, hidden, positions = _step_inputs(2, torch.device("cpu"))
 
-    assert talker._predictor_forward_graphed(layer0, hidden, positions) is None
+    assert talker.predictor_forward_graphed(layer0, hidden, positions) is None
     assert not talker._predictor_graphs
 
 
@@ -1011,7 +1011,7 @@ def test_capture_failure_disables_key_and_falls_back(
             calls.append(1)
             raise RuntimeError("simulated capture failure")
 
-    monkeypatch.setattr(sglang_model_module, "_PredictorDecodeGraph", _BoomGraph)
+    monkeypatch.setattr(sglang_model_module, "PredictorDecodeGraph", _BoomGraph)
 
     eager_codes, eager_embeds = _run_eager(talker, layer0, hidden, positions)
     graph_codes, graph_embeds = _run_forward(talker, layer0, hidden, positions)
@@ -1037,7 +1037,7 @@ def test_capture_failure_restores_live_sub_state(monkeypatch: pytest.MonkeyPatch
     )
     layer0, hidden, positions = _step_inputs(2, device)
 
-    real_forward = Qwen3TTSTalker._code_predictor_forward_incremental
+    real_forward = Qwen3TTSTalker.code_predictor_forward_incremental
 
     def _boom_forward(self, *args, **kwargs):
         if torch.cuda.current_stream(device) != torch.cuda.default_stream(device):
@@ -1045,7 +1045,7 @@ def test_capture_failure_restores_live_sub_state(monkeypatch: pytest.MonkeyPatch
         return real_forward(self, *args, **kwargs)
 
     monkeypatch.setattr(
-        Qwen3TTSTalker, "_code_predictor_forward_incremental", _boom_forward
+        Qwen3TTSTalker, "code_predictor_forward_incremental", _boom_forward
     )
     _run_forward(talker, layer0, hidden, positions)
 
@@ -1119,7 +1119,7 @@ def test_no_host_readback_in_eager_chain():
     layer0, hidden, positions = _step_inputs(2, device)
 
     with torch.no_grad():
-        talker._code_predictor_forward_incremental(
+        talker.code_predictor_forward_incremental(
             layer0.as_subclass(_NoHostReadbackTensor),
             hidden.as_subclass(_NoHostReadbackTensor),
             semantic_positions=positions.as_subclass(_NoHostReadbackTensor),
@@ -1154,7 +1154,7 @@ def test_capture_uses_thread_local_error_mode():
 
 
 def test_normalize_predictor_graph_batch_sizes():
-    normalize = Qwen3TTSTalker._normalize_predictor_graph_batch_sizes
+    normalize = Qwen3TTSTalker.normalize_predictor_graph_batch_sizes
 
     def _args(bs):
         return SimpleNamespace(
@@ -1168,7 +1168,7 @@ def test_normalize_predictor_graph_batch_sizes():
 
 
 def test_quantize_predictor_top_k_ladder():
-    quantize = sglang_model_module._quantize_predictor_top_k
+    quantize = sglang_model_module.quantize_predictor_top_k
     assert quantize(1, 2048) == 4
     assert quantize(37, 2048) == 50
     assert quantize(50, 2048) == 50
@@ -1262,7 +1262,7 @@ def test_global_disable_after_max_capture_failures(monkeypatch: pytest.MonkeyPat
             calls.append(1)
             raise RuntimeError("simulated capture failure")
 
-    monkeypatch.setattr(sglang_model_module, "_PredictorDecodeGraph", _BoomGraph)
+    monkeypatch.setattr(sglang_model_module, "PredictorDecodeGraph", _BoomGraph)
 
     compositions = [(bs, True) for bs in (1, 2, 4, 8, 16)] + [
         (bs, False) for bs in (1, 2, 4)
@@ -1298,7 +1298,7 @@ def test_capture_failure_resets_cuda_graph(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(torch.cuda.CUDAGraph, "reset", spy_reset)
 
-    real_forward = Qwen3TTSTalker._code_predictor_forward_incremental
+    real_forward = Qwen3TTSTalker.code_predictor_forward_incremental
 
     def boom_forward(self, *args, **kwargs):
         if torch.cuda.is_current_stream_capturing():
@@ -1306,7 +1306,7 @@ def test_capture_failure_resets_cuda_graph(monkeypatch: pytest.MonkeyPatch):
         return real_forward(self, *args, **kwargs)
 
     monkeypatch.setattr(
-        Qwen3TTSTalker, "_code_predictor_forward_incremental", boom_forward
+        Qwen3TTSTalker, "code_predictor_forward_incremental", boom_forward
     )
     talker.prepare_decode_buffers(_uniform_requests(2))
     layer0, hidden, positions = _step_inputs(2, device)
@@ -1328,9 +1328,9 @@ def test_widened_top_k_masked_ranks_never_sampled():
     for seed in range(100):
         # top_k=2 quantizes to ladder width 4, leaving ranks 2-3 masked
         talker.prepare_decode_buffers([_request(top_k=2, sub_seed=seed)])
-        token = talker._sample_subtalker_token_seeded(
+        token = talker.sample_subtalker_token_seeded(
             logits,
-            sub_positions=talker._sub_seed_positions(positions)[0],
+            sub_positions=talker.sub_seed_positions(positions)[0],
         )
         assert token.item() in allowed, (
             f"seed={seed} sampled rank outside the request's top_k=2: "
@@ -1408,9 +1408,9 @@ def test_top_p_removed_ranks_never_sampled():
     for seed in range(100):
         # rank 0 alone holds ~0.97 mass, so top_p=0.5 removes ranks 1-3
         talker.prepare_decode_buffers([_request(top_k=4, top_p=0.5, sub_seed=seed)])
-        token = talker._sample_subtalker_token_seeded(
+        token = talker.sample_subtalker_token_seeded(
             logits,
-            sub_positions=talker._sub_seed_positions(positions)[0],
+            sub_positions=talker.sub_seed_positions(positions)[0],
         )
         assert (
             token.item() == 3
@@ -1432,9 +1432,7 @@ def test_capture_state_body_failure_restores_state():
     )
 
     with pytest.raises(RuntimeError, match="simulated capture failure"):
-        with talker._predictor_graph_capture_state(
-            4, ("sampled", 8, True, False, True)
-        ):
+        with talker.predictor_graph_capture_state(4, ("sampled", 8, True, False, True)):
             assert talker._sub_batch_size == 4
             assert talker._sub_has_sampled_rows is True
             assert talker._sub_has_argmax_rows is True
@@ -1475,26 +1473,26 @@ def test_resolve_predictor_graph_enabled(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.delenv(sglang_model_module.QTTS_PREDICTOR_GRAPH_ENV, raising=False)
 
-    assert talker._resolve_predictor_graph_enabled() is True
+    assert talker.resolve_predictor_graph_enabled() is True
     graph.disable_cuda_graph = True
-    assert talker._resolve_predictor_graph_enabled() is False
+    assert talker.resolve_predictor_graph_enabled() is False
     graph.disable_cuda_graph = False
     parallel.tp_size = 2
-    assert talker._resolve_predictor_graph_enabled() is False
+    assert talker.resolve_predictor_graph_enabled() is False
     parallel.tp_size = 1
     monkeypatch.setenv(sglang_model_module.QTTS_PREDICTOR_GRAPH_ENV, "0")
-    assert talker._resolve_predictor_graph_enabled() is False
+    assert talker.resolve_predictor_graph_enabled() is False
 
     platform["enabled"] = False
     monkeypatch.delenv(sglang_model_module.QTTS_PREDICTOR_GRAPH_ENV, raising=False)
-    assert talker._resolve_predictor_graph_enabled() is False
+    assert talker.resolve_predictor_graph_enabled() is False
     monkeypatch.setenv(sglang_model_module.QTTS_PREDICTOR_GRAPH_ENV, "1")
-    assert talker._resolve_predictor_graph_enabled() is True
+    assert talker.resolve_predictor_graph_enabled() is True
 
     platform.update(enabled=True, backend=None)
-    assert talker._resolve_predictor_graph_enabled() is False
+    assert talker.resolve_predictor_graph_enabled() is False
     monkeypatch.delenv(sglang_model_module.QTTS_PREDICTOR_GRAPH_ENV, raising=False)
-    assert talker._resolve_predictor_graph_enabled() is False
+    assert talker.resolve_predictor_graph_enabled() is False
 
 
 @pytest.mark.accelerator
@@ -1528,7 +1526,7 @@ def test_server_disable_cuda_graph_gates_predictor(monkeypatch: pytest.MonkeyPat
 def test_failed_capture_restores_the_current_stream(monkeypatch: pytest.MonkeyPatch):
     device = torch.device("cuda")
     talker = _build_talker(device)
-    real_forward = Qwen3TTSTalker._code_predictor_forward_incremental
+    real_forward = Qwen3TTSTalker.code_predictor_forward_incremental
 
     def _sync_inside_capture(self, *args, **kwargs):
         if torch.cuda.is_current_stream_capturing():
@@ -1536,7 +1534,7 @@ def test_failed_capture_restores_the_current_stream(monkeypatch: pytest.MonkeyPa
         return real_forward(self, *args, **kwargs)
 
     monkeypatch.setattr(
-        Qwen3TTSTalker, "_code_predictor_forward_incremental", _sync_inside_capture
+        Qwen3TTSTalker, "code_predictor_forward_incremental", _sync_inside_capture
     )
     talker.prepare_decode_buffers(_uniform_requests(2))
     layer0, hidden, positions = _step_inputs(2, device)
@@ -1627,7 +1625,7 @@ def test_startup_capture_failure_raises_and_restores_state(
 ):
     device = torch.device("cuda")
     talker = _build_talker(device)
-    real_forward = Qwen3TTSTalker._code_predictor_forward_incremental
+    real_forward = Qwen3TTSTalker.code_predictor_forward_incremental
 
     def _boom_forward(self, *args, **kwargs):
         if torch.cuda.current_stream(device) != torch.cuda.default_stream(device):
@@ -1635,7 +1633,7 @@ def test_startup_capture_failure_raises_and_restores_state(
         return real_forward(self, *args, **kwargs)
 
     monkeypatch.setattr(
-        Qwen3TTSTalker, "_code_predictor_forward_incremental", _boom_forward
+        Qwen3TTSTalker, "code_predictor_forward_incremental", _boom_forward
     )
 
     with pytest.raises(RuntimeError, match="simulated capture failure"):
@@ -1656,7 +1654,7 @@ def test_signature_rule_is_shared_by_batch_and_startup_paths(
         startup_keys.append((bucket_size, *signature))
         return object()
 
-    monkeypatch.setattr(Qwen3TTSTalker, "_capture_predictor_graph", _record_capture)
+    monkeypatch.setattr(Qwen3TTSTalker, "capture_predictor_graph", _record_capture)
     cases = [
         (True, 5, 1.0),
         (True, 5, 0.9),
@@ -1878,7 +1876,7 @@ def test_rope_store_writes_the_cache_the_copy_path_writes(
     # the actual normalized Q/K tensors handed to the upstream rotary.
     monkeypatch.setattr(sglang_model_module, "apply_qk_norm", apply_qk_norm)
     attn = _rope_attention(device)
-    stores = Qwen3TTSTalker._resolve_predictor_rope_store(attn, device=device)
+    stores = Qwen3TTSTalker.resolve_predictor_rope_store(attn, device=device)
     stored = _rope_store_talker(device, stores=stores)
     copied = _rope_store_talker(device, stores=False)
     # Allocate the old layout independently, not as another view of the new cache.
@@ -1898,7 +1896,7 @@ def test_rope_store_writes_the_cache_the_copy_path_writes(
     def run_attention(talker: Qwen3TTSTalker) -> torch.Tensor:
         return torch.stack(
             [
-                talker._predictor_cached_self_attention(
+                talker.predictor_cached_self_attention(
                     layer_idx=0,
                     attn=attn,
                     hidden_states=hidden_steps[slot],
@@ -1971,13 +1969,13 @@ def test_rope_store_writes_the_pair_where_the_copy_path_writes(
     torch.manual_seed(13)
     monkeypatch.setattr(sglang_model_module, "apply_qk_norm", apply_qk_norm)
     attn = _rope_attention(device)
-    stores = Qwen3TTSTalker._resolve_predictor_rope_store(attn, device=device)
+    stores = Qwen3TTSTalker.resolve_predictor_rope_store(attn, device=device)
     stored = _rope_store_talker(device, stores=stores)
     copied = _rope_store_talker(device, stores=False)
     hidden = torch.randn(batch_size, 2, ROPE_HIDDEN, device=device, dtype=DTYPE)
 
     def run_pair(talker: Qwen3TTSTalker) -> torch.Tensor:
-        return talker._predictor_cached_self_attention(
+        return talker.predictor_cached_self_attention(
             layer_idx=0,
             attn=attn,
             hidden_states=hidden,
