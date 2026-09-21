@@ -82,13 +82,14 @@ class StepGraphDiT(PackedDiT):
     def forward(self, x, mu, spks, cond, t, rows, attention):
         total = x.shape[1]
         index = bisect_left(self.sizes, total)
+        self.rows, self.attention = rows, attention
+        cos, sin = PackedDiT.rope(self, rows)
         if self.mode == "eager" or index == len(self.sizes):
+            self.step_rope = (cos, sin)
             return super().forward(x, mu, spks, cond, t, rows, attention)
         frames = self.sizes[index]
         is_new_size = frames not in self.used_sizes
         self.used_sizes.add(frames)
-        self.rows, self.attention = rows, attention
-        cos, sin = PackedDiT.rope(self, rows)
         inputs = {
             "x": pad_frames(x, frames, self.padding),
             "mu": pad_frames(mu, frames, self.padding),
