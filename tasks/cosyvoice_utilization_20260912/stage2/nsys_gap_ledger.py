@@ -355,7 +355,14 @@ def main():
             continue
         by_thread.setdefault(t, []).append((gs, ge))
 
-    states = ("a_wait_gil", "b_hold_gil", "c_cuda_sync", "d_osrt", "e_none")
+    states = (
+        "a_wait_gil",
+        "b_hold_gil",
+        "c_cuda_sync",
+        "d_osrt",
+        "e_none",
+        "x_any_cuda_runtime_call",
+    )
     agg = {r: {s: 0.0 for s in states} for r in ("AR", "vocoder", "other")}
     agg_total = {r: 0.0 for r in ("AR", "vocoder", "other")}
     agg_count = {r: 0 for r in ("AR", "vocoder", "other")}
@@ -396,6 +403,22 @@ def main():
         agg[rl]["d_osrt"] += overlap(gl, d) / NS
         cov = merge(sorted(a + b + csync + d))
         agg[rl]["e_none"] += (sum(e - s for s, e in gl) - overlap(gl, cov)) / NS
+        # note(ratish): cross check for e, the thread sitting in any traced CUDA
+        # runtime call, launches included.
+        anyrt = merge(
+            clip(
+                sorted(
+                    q(
+                        "select start, end from CUPTI_ACTIVITY_KIND_RUNTIME "
+                        "where globalTid%16777216=? and start<? and end>?",
+                        (tid, w1, w0),
+                    ).fetchall()
+                ),
+                w0,
+                w1,
+            )
+        )
+        agg[rl]["x_any_cuda_runtime_call"] += overlap(gl, anyrt) / NS
         for nm in set(r[2] for r in osrt_rows):
             iv = merge(
                 clip(sorted((r[0], r[1]) for r in osrt_rows if r[2] == nm), w0, w1)
@@ -581,13 +604,14 @@ def write_md(R, path):
         )
     )
     w(
-        "| ending role | gaps | gap ms | a wait gil | b hold gil | c cuda sync | d osrt | e none |"
+        "| ending role | gaps | gap ms | a wait gil | b hold gil | c cuda sync | "
+        "d osrt | e none | x any cuda runtime call |"
     )
-    w("|---|---|---|---|---|---|---|---|")
+    w("|---|---|---|---|---|---|---|---|---|")
     for r, v in R["q4"]["per_role"].items():
         s = v["states"]
         w(
-            "| %s | %d | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f |"
+            "| %s | %d | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f |"
             % (
                 r,
                 v["gaps"],
@@ -597,6 +621,7 @@ def write_md(R, path):
                 s["c_cuda_sync"],
                 s["d_osrt"],
                 s["e_none"],
+                s["x_any_cuda_runtime_call"],
             )
         )
     w("\n| ending role | osrt function | overlapped ms |")
