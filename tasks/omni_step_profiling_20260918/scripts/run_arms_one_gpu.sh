@@ -8,9 +8,10 @@
 #   arms file: one arm per line, "label|tree|serve args"
 set -u
 OUT=$1 CARD=$2 PASSES=$3 CONC=$4 ARMS=$5
-PY=/workspace/sglang-omni/.venv/bin/python
-MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
-META=zhaochenyang20/seed-tts-eval-arrow
+# note(ratish): moss defaults; the H100 container passes PY and MODEL
+PY=${PY:-/workspace/sglang-omni/.venv/bin/python}
+MODEL=${MODEL:-/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base}
+META=${META:-zhaochenyang20/seed-tts-eval-arrow}
 BENCH_TREE=$(head -1 "$ARMS" | cut -d'|' -f2)
 # note(ratish): PORT lets cells run on several cards at once; BENCH_ARGS picks the mode
 # (default streaming; "" is non streaming; "--meta <list>" is another corpus)

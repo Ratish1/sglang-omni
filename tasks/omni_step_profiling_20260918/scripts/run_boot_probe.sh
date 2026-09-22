@@ -6,8 +6,9 @@ set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4
 shift 4
 EXTRA="$*"
-PY=/workspace/sglang-omni/.venv/bin/python
-MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
+# note(ratish): moss defaults; the H100 container passes PY and MODEL
+PY=${PY:-/workspace/sglang-omni/.venv/bin/python}
+MODEL=${MODEL:-/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base}
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 mkdir -p "$OUT"
 cd "$TREE" || exit 1

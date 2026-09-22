@@ -7,8 +7,9 @@
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 CONC=$5 SAMPLES=$6 META=${7:-zhaochenyang20/seed-tts-eval-arrow}
 S=$(cd "$(dirname "$0")" && pwd)
-PY=/workspace/sglang-omni/.venv/bin/python
-MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
+# note(ratish): moss defaults; the H100 container passes PY and MODEL
+PY=${PY:-/workspace/sglang-omni/.venv/bin/python}
+MODEL=${MODEL:-/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base}
 URL=http://127.0.0.1:$PORT
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 mkdir -p "$OUT"
