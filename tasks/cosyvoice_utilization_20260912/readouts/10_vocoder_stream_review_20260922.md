@@ -137,7 +137,40 @@ measurement of that.
 4. `[open, not a finding]` Stream priority is the default 0. The Qwen3-Omni vocoder runs at a
    raised priority; no CosyVoice measurement exists either way, so nothing to set.
 
-## 5. Owed before a PR
+## 5. The fixed head and its PR pair
+
+Finding 1 and 2 fixed and the device read from the Flow's parameter: `exp/cosyvoice-vocoder-stream`
+87621ea6a, rebased onto upstream main 8c6d70c3d (two commits, the stream and the warmup under it).
+PR pair `s27`, upstream main 8c6d70c3d (card 4) against 87621ea6a (card 5), both at once:
+
+| streaming c16, 1,088 | main | fixed head | delta |
+|---|---|---|---|
+| req/s | 4.072 | 4.272 | +4.9 % |
+| audio s/s | 18.87 | 20.01 | +6.0 % |
+| RTF mean | 0.894 | 0.842 | -5.8 % |
+| latency mean / p95 / p99 | 3.92 / 4.96 / 6.25 s | 3.73 / 4.76 / 5.31 s | -4.8 / -4.0 / -15.2 % |
+| TTFP mean / p95 | 1.81 / 2.43 s | 1.61 / 2.13 s | -11.2 / -12.3 % |
+| inter chunk mean | 1.088 s | 1.090 s | +0.2 % |
+| max playback underrun mean | 0.258 s | 0.280 s | +8.5 % |
+
+| streaming c1, 64 | main | fixed head | delta |
+|---|---|---|---|
+| req/s | 1.072 | 1.130 | +5.4 % |
+| TTFP mean / p95 | 0.485 / 0.591 s | 0.450 / 0.535 s | -7.2 / -9.5 % |
+| inter chunk mean | 0.216 s | 0.210 s | -2.8 % |
+
+Identity of the fixed head: its c1 WAV is byte identical to one of four main boots (`s20-a`,
+`s21-a`, `s21-b`, `s27-a`) on 64 of 64 samples; the four main boots disagree among themselves
+on 8. Against its own pair's main boot alone, 58 of 64 equal, the other 6 all of different
+length (AR token count).
+
+The one number that moved the wrong way is the max playback underrun mean, +22 ms, while its
+p95 fell from 0.770 to 0.668 s; the `s17` pair had the same shape (mean 0.270 to 0.289 s, p95
+0.708 to 0.674 s). First audio arrives 200 ms earlier and the inter chunk time is unchanged,
+so playback starts earlier and the typical stall inside a request grows by a fraction of that,
+while the worst stalls shrink; a consequence of the earlier start, not of slower chunks.
+
+## 6. Owed before a PR (all done for 87621ea6a)
 
 - `s20`/`s21`: byte identity of the served audio against a control boot.
 - `s19`: buffered c16 unchanged.
