@@ -2,7 +2,8 @@
 # Server arms on ONE card, one boot after another, PASSES passes over the arm list so drift
 # shows as the spread between passes. Each boot: provenance, serve with the arm's args,
 # startup seconds, which vocoder graph runners captured or were disabled, the seed-tts
-# stream benchmark (full English corpus, warmup 1), stop by its own process group. The
+# stream benchmark (full English corpus, warmup 1), stop by its own process group, and with
+# QUALITY=1 WER and speaker similarity on the boot's WAVs. The
 # pids seen on the card are logged; more than one voids the boot.
 # usage: run_arms_one_gpu.sh <out dir> <card> <passes> <concurrency> <arms file>
 #   arms file: one arm per line, "label|tree|serve args"
@@ -52,7 +53,6 @@ for pass in $(seq "$PASSES"); do
         --model $MODEL --meta $META --lang en --use-existing-server --host 127.0.0.1 --port $PORT \
         --warmup 1 --generate-only --concurrency "$CONC" --output-dir "$d/bench" $BENCH_ARGS) > "$d/bench.log" 2>&1
       echo "bench rc $? $(date +%T)" >> "$d/progress.txt"
-      rm -rf "$d/bench/audio"
     fi
     kill -TERM -- -"$(cat "$d/server.pgid")" 2>/dev/null
     sleep 15
@@ -63,6 +63,22 @@ for pass in $(seq "$PASSES"); do
       [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$CARD")" -lt 100 ] && break
       sleep 2
     done
+    #QUALITY=1 scores WER and speaker similarity on the boot's WAVs once the server is gone
+    if [ "${QUALITY:-0}" = 1 ] && [ $healthy = 1 ]; then
+      (cd "$BENCH_TREE" && CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$BENCH_TREE $PY -m benchmarks.eval.benchmark_tts_seedtts \
+        --model $MODEL --meta $META --lang en --port $((PORT + 100)) --skip-gpu-cleanup \
+        --transcribe-only --output-dir "$d/bench") > "$d/wer.log" 2>&1
+      echo "wer rc $? $(date +%T)" >> "$d/progress.txt"
+      #--skip-gpu-cleanup returns before the ASR server frees the card
+      for _ in $(seq 60); do
+        [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$CARD")" -lt 100 ] && break
+        sleep 2
+      done
+      (cd "$BENCH_TREE" && CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$BENCH_TREE $PY -m benchmarks.eval.benchmark_tts_seedtts \
+        --model $MODEL --meta $META --lang en --similarity-only --output-dir "$d/bench") > "$d/sim.log" 2>&1
+      echo "sim rc $? $(date +%T)" >> "$d/progress.txt"
+    fi
+    rm -rf "$d/bench/audio"
     echo "done $(date +%T)" >> "$d/progress.txt"
   done 3< "$ARMS"
 done
