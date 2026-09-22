@@ -172,7 +172,7 @@ def cpu_ms(fn, reps: int) -> float:
 class BucketGraph:
     def __init__(self, encoder, width: int, device, dtype):
         self.mels = torch.zeros((1, NUM_MELS, width), device=device, dtype=dtype)
-        self.length = torch.zeros((1,), device=device, dtype=torch.long)
+        self.length = torch.full((1,), width, device=device, dtype=torch.long)
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
