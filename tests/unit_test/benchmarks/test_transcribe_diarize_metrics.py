@@ -50,6 +50,14 @@ def test_parse_args_defaults_to_movies800times_preset() -> None:
     assert args.output_dir == module.MOVIES800TIMES_OUTPUT_DIR
 
 
+def test_parse_args_can_omit_max_new_tokens() -> None:
+    module = _load_benchmark_module()
+
+    args = module.parse_args(["--omit-max-new-tokens"])
+
+    assert args.max_new_tokens is None
+
+
 def test_parse_args_uses_aishell4_long_preset() -> None:
     module = _load_benchmark_module()
 

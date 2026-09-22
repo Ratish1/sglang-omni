@@ -510,6 +510,13 @@ def _add_request_args(parser: argparse.ArgumentParser) -> None:
         help="Optional max_new_tokens forwarded to /v1/audio/transcriptions.",
     )
     parser.add_argument(
+        "--omit-max-new-tokens",
+        dest="max_new_tokens",
+        action="store_const",
+        const=None,
+        help="Let the worker choose its duration-scaled output budget.",
+    )
+    parser.add_argument(
         "--stream",
         action="store_true",
         help=(
