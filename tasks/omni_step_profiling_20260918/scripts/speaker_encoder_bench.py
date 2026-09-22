@@ -35,6 +35,7 @@ from librosa.filters import mel as librosa_mel_fn
 
 from benchmarks.dataset.seedtts import load_seedtts_samples
 from sglang_omni.models.qwen3_tts.prompt_frontend import load_qwen3_tts_prompt_frontend
+from sglang_omni.models.qwen3_tts.stages import register_qwen3_tts_hf_config
 
 N_FFT, NUM_MELS, HOP, WIN, FMIN, FMAX = 1024, 128, 256, 1024, 0, 12000
 CLIP_VAL = 1e-5
@@ -207,6 +208,7 @@ def main() -> None:
     parser.add_argument("--reps", type=int, default=5)
     args = parser.parse_args()
     device = torch.device("cuda")
+    register_qwen3_tts_hf_config()
     frontend = load_qwen3_tts_prompt_frontend(
         args.model, device=device, dtype=torch.bfloat16
     )
