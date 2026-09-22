@@ -170,6 +170,57 @@ p95 fell from 0.770 to 0.668 s; the `s17` pair had the same shape (mean 0.270 to
 so playback starts earlier and the typical stall inside a request grows by a fraction of that,
 while the worst stalls shrink; a consequence of the earlier start, not of slower chunks.
 
+## 5b. Plan 18: the vocoder owns the stream (`slice/cosyvoice-9-1-vocoder-stream` 37b2cd2d2)
+
+The stream moved from the streaming scheduler into `CosyVoice3Vocoder`, which enters it for
+`decode_batch` (buffered Flow graph replays and HiFT) and hands the context to the scheduler's
+pump and warmup; it waits once at creation for the default stream. Gates, A = 87621ea6a
+(#2300 head), B = 37b2cd2d2, both arms at once:
+
+| point | A | B | delta |
+|---|---|---|---|
+| buffered c16 `s28` (A card 4, B card 5) req/s | 6.111 | 6.543 | +7.1 % |
+| buffered c16 `s30` (B card 6, A card 7) req/s | 6.029 | 6.803 | +12.8 % |
+| buffered c16 latency p99 | 4.20 / 4.13 s | 4.02 / 3.77 s | |
+| streaming c16 `s28` (A card 4, B card 5) req/s | 4.164 | 4.090 | -1.8 % |
+| streaming c16 `s31` (B card 5, A card 4) req/s | 4.140 | 4.240 | +2.4 % |
+| buffered c1, 64 | 1.357 | 1.358 | |
+
+Buffered gains on both card orders: at buffered c16 the AR runs up to 32 decodes while the
+Flow graph replays queued behind them on the one stream. Streaming is the same mechanism under
+both heads and the two pairs straddle zero (+0.3 % mean). Buffered identity, seeded c1: B's
+WAV is byte identical to one of three A boots on 63 of 64; the 64th (`17147545-17147546`) is
+the sample whose length already varies between A boots (three lengths seen), the AR class.
+Compare script: 61 of 62 gated (A against A: 58 of 62).
+
+Folded into #2300 as one commit, `exp/cosyvoice-vocoder-stream` 46acca0a6 (same tree as
+37b2cd2d2, rebased on upstream main 8c6d70c3d). PR pairs, upstream main 8c6d70c3d against
+46acca0a6, both arms at once, 1,088 requests:
+
+| `s32` streaming c16 (cards 4/5) | main | PR | delta |
+|---|---|---|---|
+| req/s | 3.972 | 4.110 | +3.5 % |
+| audio s/s | 18.56 | 19.18 | +3.3 % |
+| RTF mean | 0.918 | 0.877 | -4.5 % |
+| latency mean / p95 / p99 | 4.01 / 5.15 / 6.26 s | 3.87 / 5.08 / 6.10 s | -3.5 / -1.4 / -2.5 % |
+| TTFP mean / p95 | 1.86 / 2.36 s | 1.66 / 2.34 s | -10.8 / -1.0 % |
+| inter chunk mean | 1.099 s | 1.129 s | +2.7 % |
+| max underrun mean / p95 | 0.260 / 0.966 s | 0.290 / 0.675 s | +11.5 / -30.1 % |
+
+| `s33` buffered c16 (cards 6/7) | main | PR | delta |
+|---|---|---|---|
+| req/s | 6.052 | 6.402 | +5.8 % |
+| audio s/s | 28.24 | 29.86 | +5.7 % |
+| RTF mean | 0.591 | 0.559 | -5.4 % |
+| latency mean / p95 / p99 | 2.63 / 3.67 / 4.15 s | 2.49 / 3.53 / 4.16 s | -5.4 / -3.9 / +0.3 % |
+
+The streaming pair of the final head is a little below the scheduler owned head's `s27`
+(+3.5 % against +4.9 % req/s), inside what `s28`/`s31` showed between the two heads (-1.8 %,
++2.4 %). Inter chunk mean +2.7 % and underrun mean +11.5 % against p95 -30 %: the same shape
+as `s17` and `s27` (earlier first audio, unchanged chunk cadence, the worst stalls shorter),
+with inter chunk a little higher on this head in every pair it appears in (`s28` +1.8 %,
+`s31` +1.1 %, `s32` +2.7 %); the step rule question of `DECISIONS.md` item 8 applies.
+
 ## 6. Owed before a PR (all done for 87621ea6a)
 
 - `s20`/`s21`: byte identity of the served audio against a control boot.
