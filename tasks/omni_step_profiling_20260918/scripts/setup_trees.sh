@@ -11,10 +11,12 @@ for spec in "$@"; do
   name=${spec%%=*} ref=${spec#*=}
   remote=${ref%%/*} branch=${ref#*/}
   git fetch -q "$remote" "$branch"
+  #FETCH_HEAD belongs to this checkout, so the tree gets the resolved commit
+  sha=$(git rev-parse FETCH_HEAD)
   if [ -d ".tmp/wt/$name" ]; then
-    git -C ".tmp/wt/$name" checkout -q --detach FETCH_HEAD
+    git -C ".tmp/wt/$name" checkout -q --detach "$sha"
   else
-    git worktree add -q --detach ".tmp/wt/$name" FETCH_HEAD
+    git worktree add -q --detach ".tmp/wt/$name" "$sha"
   fi
   echo "$name $(git -C ".tmp/wt/$name" log --oneline -1) ($ref)"
 done
