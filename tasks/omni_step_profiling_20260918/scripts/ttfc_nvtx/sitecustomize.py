@@ -14,6 +14,8 @@ stages into its critical path.
         pre.spk_encoder          ECAPA forward (GPU, eager)
   ref.encode n=S             reference codes on the batcher thread (S samples)
   ref.sync b=N               the batch's stream synchronize
+  sched.build rid=R          the request build on the scheduler side (embeds, Req)
+  mark sched.admit rid=R     the built request enters the waiting queue
   sched.batch extend|decode bs=B toks=T   one scheduler forward
     mark sched.prefill rid=R   one per request of an extend batch
   sched.result extend|decode bs=B         process_batch_result
@@ -151,6 +153,17 @@ def patch_scheduler(module):
         scheduler.process_batch_result,
         lambda self, batch, result: batch_label("sched.result", batch),
     )
+    scheduler.run_request_builder = ranged(
+        scheduler.run_request_builder,
+        lambda self, payload, active_stage: f"sched.build rid={payload.request_id}",
+    )
+    enqueue = scheduler.enqueue_built_request
+
+    def enqueue_marked(self, payload, pending_stream_done, req_data, **kwargs):
+        torch.cuda.nvtx.mark(f"sched.admit rid={payload.request_id}")
+        return enqueue(self, payload, pending_stream_done, req_data, **kwargs)
+
+    scheduler.enqueue_built_request = enqueue_marked
 
 
 def patch_runner(module):

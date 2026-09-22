@@ -324,7 +324,7 @@ def drift(kinds: dict[str, list[Range]]):
 
 
 def critical_path(by_thread, db, strings, t0, t1):
-    prepare, chunk, commit = {}, {}, {}
+    prepare, build, chunk, commit = {}, {}, {}, {}
     for ranges in by_thread.values():
         for r in ranges:
             rid = r.rid()
@@ -332,51 +332,72 @@ def critical_path(by_thread, db, strings, t0, t1):
                 continue
             if r.kind == "pre.prepare":
                 prepare.setdefault(rid, r)
+            elif r.kind == "sched.build":
+                build.setdefault(rid, r)
             elif r.kind == "voc.chunk":
                 chunk.setdefault(rid, r)
             elif r.kind == "voc.commit":
                 commit.setdefault(rid, r)
-    prefill = {}
+    prefill, admit = {}, {}
     for start, text, text_id in db.execute(
         "select start, text, textId from NVTX_EVENTS where eventType = ? and start between ? and ?",
         (NVTX_MARK, t0, t1),
     ):
         label = text if text is not None else strings.get(text_id, "")
-        match = re.match(r"sched\.prefill rid=(\S+)", label)
-        if match:
-            prefill.setdefault(match.group(1), start)
+        match = re.match(r"sched\.(prefill|admit) rid=(\S+)", label)
+        if match and match.group(1) == "prefill":
+            prefill.setdefault(match.group(2), start)
+        elif match:
+            admit.setdefault(match.group(2), start)
     joined = [
         rid for rid in prepare if rid in prefill and rid in chunk and rid in commit
     ]
     print(
         f"\nper request critical path: {len(joined)} requests joined "
-        f"(prepare {len(prepare)}, prefill marks {len(prefill)}, first chunk {len(chunk)}, commits {len(commit)})"
+        f"(prepare {len(prepare)}, builds {len(build)}, admits {len(admit)}, prefill marks {len(prefill)}, "
+        f"first chunk {len(chunk)}, commits {len(commit)})"
     )
     if not joined:
         return
     segments = {
         "prepare (preprocessing)": [prepare[r].wall_ns for r in joined],
         "prepare end -> prefill launch": [prefill[r] - prepare[r].end for r in joined],
-        "prefill launch -> first codes at vocoder": [
-            chunk[r].start - prefill[r] for r in joined
-        ],
-        "first codes -> initial decode start": [
-            (
-                commit[r].parent.start - chunk[r].start
-                if commit[r].parent is not None
-                else 0
-            )
-            for r in joined
-        ],
-        "initial decode start -> first chunk committed": [
-            commit[r].end
-            - (commit[r].parent.start if commit[r].parent else commit[r].start)
-            for r in joined
-        ],
-        "prepare start -> first chunk committed": [
-            commit[r].end - prepare[r].start for r in joined
-        ],
     }
+    split = [r for r in joined if r in build and r in admit]
+    if split:
+        segments.update(
+            {
+                "  prepare end -> build start": [
+                    build[r].start - prepare[r].end for r in split
+                ],
+                "  build (scheduler side)": [build[r].wall_ns for r in split],
+                "  build end -> admitted": [admit[r] - build[r].end for r in split],
+                "  admitted -> prefill launch": [prefill[r] - admit[r] for r in split],
+            }
+        )
+    segments.update(
+        {
+            "prefill launch -> first codes at vocoder": [
+                chunk[r].start - prefill[r] for r in joined
+            ],
+            "first codes -> initial decode start": [
+                (
+                    commit[r].parent.start - chunk[r].start
+                    if commit[r].parent is not None
+                    else 0
+                )
+                for r in joined
+            ],
+            "initial decode start -> first chunk committed": [
+                commit[r].end
+                - (commit[r].parent.start if commit[r].parent else commit[r].start)
+                for r in joined
+            ],
+            "prepare start -> first chunk committed": [
+                commit[r].end - prepare[r].start for r in joined
+            ],
+        }
+    )
     print(f"  {'segment':<46}{'mean ms':>9}{'p50':>8}{'p95':>8}")
     for name, values in segments.items():
         print(
