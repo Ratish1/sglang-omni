@@ -97,7 +97,8 @@ def load_ranges(db, strings, t0, t1):
         label = text if text is not None else strings.get(text_id, str(text_id))
         words = label.split(" ")
         # scheduler batches split by mode; the rest by the first word
-        kind = " ".join(words[:2]) if words[0].startswith("sched.") else words[0]
+        split_by_mode = words[0] in ("sched.batch", "sched.result")
+        kind = " ".join(words[:2]) if split_by_mode else words[0]
         by_thread[tid].append(Range(kind, label, start, end, tid))
     for ranges in by_thread.values():
         stack: list[Range] = []
