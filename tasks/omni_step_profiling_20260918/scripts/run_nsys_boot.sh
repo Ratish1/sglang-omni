@@ -21,7 +21,9 @@ echo "start $(date +%T)" > "$OUT/progress.txt"
 #PROBE_PATH adds a sitecustomize probe directory behind the tree (the
 # ttfc_nvtx probe needs OMNI_TTFC_NVTX=1 in PROBE_ENV); NSYS_ARGS replaces the profile
 # flags, e.g. "--sample=cpu" for host stacks instead of GPU metrics
-NSYS_ARGS=${NSYS_ARGS:---trace=cuda,nvtx --cuda-graph-trace=node --sample=none --cpuctxsw=none --gpu-metrics-devices=cuda-visible --gpu-metrics-set=ad10x --gpu-metrics-frequency=2000}
+# GPU metrics sampling (--gpu-metrics-devices=cuda-visible --gpu-metrics-set=<arch>) needs
+# a privileged container; pass it through NSYS_ARGS where it is allowed
+NSYS_ARGS=${NSYS_ARGS:---trace=cuda,nvtx --cuda-graph-trace=node --sample=none --cpuctxsw=none}
 cat /proc/loadavg > "$OUT/loadavg_before.txt"
 env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE${PROBE_PATH:+:$PROBE_PATH} ${PROBE_ENV:-} \
   nsys profile -o "$OUT/serve" --force-overwrite=true $NSYS_ARGS \
