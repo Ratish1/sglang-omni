@@ -145,4 +145,62 @@ measurement of that.
   589367020).
 - Coding style pass on the fixed head; PR body per the program's rules.
 
-## 6. Runs (filled when they finish)
+## 6. Runs
+
+All arms boot at the same time on two cards (`ab_pair.sh`), seed 1234, `max_new_tokens` unset,
+`mem_fraction_static 0.28`; main is 9f1260e66, the stream 589367020. Raw copies under
+`artifacts/cosyvoice-4090-20260918/s19-21/` (no audio).
+
+Identity, seeded streaming c1, 64 requests. `s20` main (card 6) against stream (card 7), `s21`
+main (card 2) against main (card 3), the control. Per sample, the stream boot's WAV is byte
+identical to at least one of the three main boots on 63 of 64 samples. The three main boots
+disagree among themselves on 6 samples (three voices, two samples each), the known per voice
+boot instability. The one sample where the stream's WAV matches no main boot
+(`17147545-17147546`) is 1,920 bytes shorter: one 40 ms token fewer, 5.76 against 5.80 s of
+audio, the same shape as the unstable six (a different token count), not a numerics difference
+(same length, different bytes) that a vocoder change would make. The same sample was the one
+that differed in `s5-r1` (AR prefill graph slice against main). By the compare script:
+`s20` 57 identical of 60 gated (3 differ, all with different lengths), `s21` 58 of 60 (2 differ,
+different lengths).
+
+Buffered c16, 1,088 requests, `s19` (main card 4, stream card 5):
+
+| metric | main | stream | delta |
+|---|---|---|---|
+| req/s | 6.149 | 6.055 | -1.5 % |
+| RTF mean | 0.579 | 0.589 | +1.7 % |
+| latency mean | 2.587 s | 2.627 s | +1.5 % |
+| latency p95 | 3.603 s | 3.592 s | -0.3 % |
+| latency p99 | 4.044 s | 4.188 s | +3.6 % |
+| audio s/s | 28.72 | 28.15 | -2.0 % |
+| failed | 0 | 0 | |
+
+`s22`, the same point with the cards swapped (main card 5, stream card 4): req/s 6.138 to 6.010
+(-2.1 %), RTF 0.585 to 0.594, latency mean 2.592 to 2.652 s, p99 4.109 to 4.281 s, 0 failed.
+
+The buffered path never calls `pump_one_step` (no stream state, `has_ready_work` is false), so
+the branch's only effect there is one unused `torch.cuda.Stream` object. Two pairs in one
+direction on a path the code does not execute: the record of buffered c16 boots of main alone
+spans 5.84 to 6.18 req/s (`s6`, `s9`, `s10b`, `s11`, `s19`, `s22`), and the arm that boots
+second is not systematically the slower one (`s9` b faster, `s11` pair 1 a slower). Two more
+pairs decide it (`s23`/`s24` were double launched after an ssh drop and discarded; rerun as
+`s25`/`s26`):
+
+| pair | arm a | arm b | req/s a | req/s b | delta b vs a |
+|---|---|---|---|---|---|
+| `s25`, cards 4/5 | main | main | 6.011 | 6.036 | +0.4 % |
+| `s26`, cards 6/7 | stream | main | 6.080 | 5.989 | -1.5 % (stream +1.5 %) |
+
+Over the four pairs the stream tree's buffered boots are 6.055, 6.010, 6.080 (mean 6.048) and
+main's 6.149, 6.138, 6.011, 6.036, 5.989 (mean 6.065): -0.3 %, with main against main itself
+spanning 5.99 to 6.15 in the same hour. Verdict: the buffered path is untouched, as the code
+says; the first two pairs' -1.5 % and -2.1 % were the boot spread, which this time landed on
+one side twice.
+
+Streaming c1, 64 requests (`s20`, `s21`):
+
+| metric | main | stream | main a | main b |
+|---|---|---|---|---|
+| req/s | 1.064 | 1.078 (+1.3 %) | 1.000 | 0.988 |
+| TTFP mean | 0.494 s | 0.477 s (-3.4 %) | 0.528 s | 0.531 s |
+| latency p99 | 1.768 s | 1.693 s | 1.945 s | 1.837 s |
