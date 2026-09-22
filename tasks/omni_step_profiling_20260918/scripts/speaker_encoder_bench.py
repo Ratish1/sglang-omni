@@ -193,6 +193,18 @@ class BucketGraph:
 
 def row(label: str, values: list[float]) -> None:
     values = sorted(values)
+    if label.startswith("cos"):
+        print(
+            f"  {label:<44}{len(values):>5}{statistics.fmean(values):>10.6f}"
+            f"{values[len(values) // 2]:>10.6f}{values[0]:>10.6f} (min)"
+        )
+        return
+    if label.startswith("max abs"):
+        print(
+            f"  {label:<44}{len(values):>5}{statistics.fmean(values):>10.2e}"
+            f"{values[len(values) // 2]:>10.2e}{values[-1]:>10.2e}"
+        )
+        return
     print(
         f"  {label:<44}{len(values):>5}{statistics.fmean(values):>10.3f}"
         f"{values[len(values) // 2]:>10.3f}{values[-1]:>10.3f}"
