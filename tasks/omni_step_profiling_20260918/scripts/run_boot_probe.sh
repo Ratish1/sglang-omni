@@ -6,21 +6,19 @@ set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4
 shift 4
 EXTRA="$*"
-# note(ratish): moss defaults; the H100 container passes PY and MODEL
-PY=${PY:-/workspace/sglang-omni/.venv/bin/python}
-MODEL=${MODEL:-/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base}
-export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
+PY=python3
+MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 mkdir -p "$OUT"
 cd "$TREE" || exit 1
 git -C "$TREE" rev-parse HEAD > "$OUT/head.txt"
 nvidia-smi -i "$CARD" --query-gpu=timestamp,memory.used --format=csv,noheader -l 1 > "$OUT/mem.csv" 2>&1 &
 MEM_PID=$!
-# note(ratish): the box is shared; a foreign pid on the card voids the probe
+#the box is shared; a foreign pid on the card voids the probe
 UUID=$(nvidia-smi -i "$CARD" --query-gpu=uuid --format=csv,noheader)
 (while true; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader | grep "$UUID" | sed "s/^/$(date +%T) /"; sleep 2; done) > "$OUT/apps.csv" 2>&1 &
 APPS_PID=$!
 START=$(date +%s)
-# note(ratish): PROBE_PATH adds a directory (a sitecustomize probe) behind the tree
+#PROBE_PATH adds a directory (a sitecustomize probe) behind the tree
 setsid bash -c "echo \$\$ > $OUT/server.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE${PROBE_PATH:+:$PROBE_PATH} \
   TORCH_LOGS=recompiles $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT $EXTRA" > "$OUT/serve.log" 2>&1 &
 healthy=0

@@ -10,11 +10,10 @@
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4
 S=$(cd "$(dirname "$0")" && pwd)
-PY=/workspace/sglang-omni/.venv/bin/python
-MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
+PY=python3
+MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 META=zhaochenyang20/seed-tts-eval-arrow
 URL=http://127.0.0.1:$PORT
-export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 mkdir -p "$OUT"
 cd "$TREE" || exit 1
 
@@ -97,7 +96,7 @@ live() {
     fi
     local window_pid=$!
     wait $bench_pid
-    # note(ratish): a bench shorter than its window leaves the window waiting for
+    #a bench shorter than its window leaves the window waiting for
     # steps that never come (long form, runs 10 and 28); stop it and keep what it has
     sleep 5
     kill -0 $window_pid 2>/dev/null && curl -s -X POST $URL/stop_profile \
@@ -113,7 +112,7 @@ capture formal_decode_b1 --kind decode --batch 1 --steps 40 --label formal
 capture formal_decode_b16 --kind decode --batch 16 --steps 40 --label formal
 capture uncaptured_decode_b16 --kind decode --batch 16 --steps 40 --label uncaptured --no-capture
 
-# note(ratish): LIVE_CELLS=0 stops after the degenerate captures (an A/A control boot)
+#LIVE_CELLS=0 stops after the degenerate captures (an A/A control boot)
 if [ "${LIVE_CELLS:-1}" = 1 ]; then
   live seedtts_c16 600 --meta $META --concurrency 16
   live longform_c16 400 --meta "$OUT/longform/meta.lst" --concurrency 16

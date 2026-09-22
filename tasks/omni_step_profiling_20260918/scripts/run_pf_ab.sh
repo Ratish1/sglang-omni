@@ -4,14 +4,12 @@
 # provenance and prefill-backend gate, serve, seed-tts full English corpus (warmup 1),
 # SGLang prefill log lines, stop its own process group, then WER and speaker similarity
 # on the boot's WAVs on the same card. Ends with the seeded c1 byte comparison.
-# usage: run_pf_ab.sh <out dir> <tree A> <tree B> [all|buffered] [mem_fraction_static]
+# usage: run_pf_ab.sh <out dir> <tree A> <tree B> [all|buffered]
 set -u
 OUT=$1 TREE_A=$2 TREE_B=$3 POINTS=${4:-all}
-MEM_ARGS=${5:+--tts_engine.engine.mem_fraction_static $5}
-PY=/workspace/sglang-omni/.venv/bin/python
-MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
+PY=python3
+MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 META=zhaochenyang20/seed-tts-eval-arrow
-export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 mkdir -p "$OUT"
 md5sum "$0" > "$OUT/md5.txt"
 
@@ -26,7 +24,7 @@ boot() {
   nvidia-smi dmon -i "$card" -s pucvm -d 1 > "$d/dmon.log" 2>&1 &
   dmon=$!
   (cd "$tree" && setsid bash -c "echo \$\$ > $d/server.pgid; exec env CUDA_VISIBLE_DEVICES=$card \
-    PYTHONPATH=$tree $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $port $MEM_ARGS" \
+    PYTHONPATH=$tree $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $port" \
     > "$d/serve.log" 2>&1 &)
   healthy=0
   for _ in $(seq 180); do
@@ -54,7 +52,7 @@ boot() {
     --model $MODEL --meta $META --lang en --port $asr_port --skip-gpu-cleanup \
     --transcribe-only --output-dir "$d/bench") > "$d/wer.log" 2>&1
   echo "wer rc $? $(date +%T)" >> "$d/progress.txt"
-  # note(ratish): --skip-gpu-cleanup returns before the ASR server frees the card
+  #--skip-gpu-cleanup returns before the ASR server frees the card
   for _ in $(seq 60); do
     [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$card")" -lt 100 ] && break
     sleep 2
@@ -65,7 +63,7 @@ boot() {
   echo "done $(date +%T)" >> "$d/progress.txt"
 }
 
-# note(ratish): CARDS picks the six cards, in boot order; the box is shared
+#CARDS picks the six cards, in boot order; the box is shared
 read -r C1 C2 C3 C4 C5 C6 <<< "${CARDS:-1 2 3 4 5 6}"
 if [ "$POINTS" = buffered ]; then
   boot a_c16_buffered "$TREE_A" "$C5" 8105 --concurrency 16 &

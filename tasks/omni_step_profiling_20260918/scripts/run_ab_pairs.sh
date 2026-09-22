@@ -9,10 +9,9 @@ set -u
 OUT=$1 TREE_A=$2 TREE_B=$3 CARD1=$4 CARD2=$5 LONGFORM=$6
 shift 6
 SERVE_ARGS="$*"
-PY=/workspace/sglang-omni/.venv/bin/python
-MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
+PY=python3
+MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 META=zhaochenyang20/seed-tts-eval-arrow
-export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 mkdir -p "$OUT"
 md5sum "$0" > "$OUT/md5.txt"
 
@@ -27,7 +26,7 @@ boot() {
   nvidia-smi > "$d/gpus_before.txt"
   nvidia-smi dmon -i "$card" -s pucvm -d 1 > "$d/dmon.log" 2>&1 &
   dmon=$!
-  # note(ratish): the box is shared; a foreign pid on the card voids the boot
+  #the box is shared; a foreign pid on the card voids the boot
   uuid=$(nvidia-smi -i "$card" --query-gpu=uuid --format=csv,noheader)
   (while true; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader | grep "$uuid" | sed "s/^/$(date +%T) /"; sleep 2; done) > "$d/apps.csv" 2>&1 &
   apps=$!
@@ -41,7 +40,7 @@ boot() {
     sleep 5
   done
   [ $healthy = 0 ] && echo "server not healthy" > "$d/FAILED"
-  # note(ratish): both arms bench at the same time, so neither carries the
+  #both arms bench at the same time, so neither carries the
   # other's startup compile or its scoring on the shared host
   case $label in *_a) peer=$OUT/${label%_a}_b ;; *) peer=$OUT/${label%_b}_a ;; esac
   touch "$d/READY"
@@ -72,7 +71,7 @@ boot() {
     --model $MODEL --meta "$meta" --lang en --port $((port + 100)) --skip-gpu-cleanup \
     --transcribe-only --output-dir "$d/bench") > "$d/wer.log" 2>&1
   echo "wer rc $? $(date +%T)" >> "$d/progress.txt"
-  # note(ratish): --skip-gpu-cleanup returns before the ASR server frees the card
+  #--skip-gpu-cleanup returns before the ASR server frees the card
   for _ in $(seq 60); do
     [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$card")" -lt 100 ] && break
     sleep 2

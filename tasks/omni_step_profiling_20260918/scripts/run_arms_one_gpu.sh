@@ -8,22 +8,20 @@
 #   arms file: one arm per line, "label|tree|serve args"
 set -u
 OUT=$1 CARD=$2 PASSES=$3 CONC=$4 ARMS=$5
-# note(ratish): moss defaults; the H100 container passes PY and MODEL
-PY=${PY:-/workspace/sglang-omni/.venv/bin/python}
-MODEL=${MODEL:-/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base}
-META=${META:-zhaochenyang20/seed-tts-eval-arrow}
+PY=python3
+MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+META=zhaochenyang20/seed-tts-eval-arrow
 BENCH_TREE=$(head -1 "$ARMS" | cut -d'|' -f2)
-# note(ratish): PORT lets cells run on several cards at once; BENCH_ARGS picks the mode
+#PORT lets cells run on several cards at once; BENCH_ARGS picks the mode
 # (default streaming; "" is non streaming; "--meta <list>" is another corpus)
 PORT=${PORT:-8301}
 BENCH_ARGS=${BENCH_ARGS---stream}
-export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 mkdir -p "$OUT"
 md5sum "$0" "$ARMS" > "$OUT/md5.txt"
 cp "$ARMS" "$OUT/arms.txt"
 
 for pass in $(seq "$PASSES"); do
-  # note(ratish): the arm list is read on fd 3 so nothing in the loop consumes it
+  #the arm list is read on fd 3 so nothing in the loop consumes it
   while IFS='|' read -r label tree serve_args <&3; do
     [ -n "$label" ] || continue
     d=$OUT/pass${pass}_$label; mkdir -p "$d"
@@ -37,7 +35,7 @@ for pass in $(seq "$PASSES"); do
     (while true; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader | grep "$uuid" | sed "s/^/$(date +%T) /"; sleep 2; done) > "$d/apps.csv" 2>&1 &
     apps=$!
     began=$(date +%s)
-    # note(ratish): PROBE_PATH adds a sitecustomize probe directory behind the tree
+    #PROBE_PATH adds a sitecustomize probe directory behind the tree
     (cd "$tree" && setsid bash -c "echo \$\$ > $d/server.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD \
       OMNI_FLOW_PROBE=$d/flow PYTHONPATH=$tree${PROBE_PATH:+:$PROBE_PATH} $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT $serve_args" \
       > "$d/serve.log" 2>&1 &)

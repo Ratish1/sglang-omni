@@ -7,11 +7,9 @@
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 CONC=$5 SAMPLES=$6 META=${7:-zhaochenyang20/seed-tts-eval-arrow}
 S=$(cd "$(dirname "$0")" && pwd)
-# note(ratish): moss defaults; the H100 container passes PY and MODEL
-PY=${PY:-/workspace/sglang-omni/.venv/bin/python}
-MODEL=${MODEL:-/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base}
+PY=python3
+MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 URL=http://127.0.0.1:$PORT
-export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 mkdir -p "$OUT"
 cd "$TREE" || exit 1
 git -C "$TREE" rev-parse HEAD > "$OUT/head.txt"
@@ -20,7 +18,7 @@ nsys --version > "$OUT/nsys_version.txt" 2>&1
 nvidia-smi > "$OUT/gpus_before.txt"
 echo "start $(date +%T)" > "$OUT/progress.txt"
 
-# note(ratish): PROBE_PATH adds a sitecustomize probe directory behind the tree (the
+#PROBE_PATH adds a sitecustomize probe directory behind the tree (the
 # ttfc_nvtx probe needs OMNI_TTFC_NVTX=1 in PROBE_ENV); NSYS_ARGS replaces the profile
 # flags, e.g. "--sample=cpu" for host stacks instead of GPU metrics
 NSYS_ARGS=${NSYS_ARGS:---trace=cuda,nvtx --cuda-graph-trace=node --sample=none --cpuctxsw=none --gpu-metrics-devices=cuda-visible --gpu-metrics-set=ad10x --gpu-metrics-frequency=2000}
@@ -46,7 +44,7 @@ else
   echo "server not healthy" > "$OUT/FAILED"
 fi
 
-# note(ratish): nsys carries the serve command line too; the serve is the first python
+#nsys carries the serve command line too; the serve is the first python
 SERVE_PID=$(for p in $(pgrep -f "sglang_omni.cli serve.*--port $PORT"); do
   if [[ "$(cat /proc/$p/comm)" == python* ]]; then echo $p; fi; done | head -1)
 echo "serve pid $SERVE_PID" >> "$OUT/progress.txt"

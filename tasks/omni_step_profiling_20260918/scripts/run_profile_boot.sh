@@ -1,28 +1,25 @@
 #!/usr/bin/env bash
 # One profiling boot of a Qwen3-TTS tree: server, GPU memory log, the fixed capture list,
 # the step ledger on every trace, teardown. Same list for every arm.
-# usage: run_profile_boot.sh <tree> <out dir> <card> <port> [mem_fraction_static]
+# usage: run_profile_boot.sh <tree> <out dir> <card> <port>
 set -u
-TREE=$1 OUT=$2 CARD=$3 PORT=$4 MFS=${5:-}
-S=/workspace/sglang-omni/.tmp/omni_step_profiling/scripts
-MODEL=/data/ratish/models/Qwen3-TTS-12Hz-1.7B-Base
+TREE=$1 OUT=$2 CARD=$3 PORT=$4
+S=$(cd "$(dirname "$0")" && pwd)
+MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 URL=http://127.0.0.1:$PORT
-export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 mkdir -p "$OUT"
 cd "$TREE" || exit 1
 
 git -C "$TREE" rev-parse HEAD > "$OUT/head.txt"
 git -C "$TREE" diff --stat > "$OUT/tree_stat.txt"
-PYTHONPATH=$TREE python -c "import sglang_omni; print(sglang_omni.__file__)" > "$OUT/import_path.txt"
+PYTHONPATH=$TREE python3 -c "import sglang_omni; print(sglang_omni.__file__)" > "$OUT/import_path.txt"
 md5sum "$S/profile_workloads.py" "$S/step_ledger.py" "$0" > "$OUT/md5.txt"
 nvidia-smi > "$OUT/gpus_before.txt"
 nvidia-smi -i "$CARD" --query-gpu=timestamp,memory.used,utilization.gpu --format=csv,noheader -l 1 > "$OUT/mem.csv" 2>&1 &
 MEM_PID=$!
 
-EXTRA=()
-[ -n "$MFS" ] && EXTRA=(--mem-fraction-static "$MFS")
 setsid bash -c "echo \$\$ > $OUT/server.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE \
-  python -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT ${EXTRA[*]}" > "$OUT/serve.log" 2>&1 &
+  python3 -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT" > "$OUT/serve.log" 2>&1 &
 
 teardown() {
   kill -TERM -- -"$(cat "$OUT/server.pgid")" 2>/dev/null
@@ -48,7 +45,7 @@ echo "healthy $(date +%T)" > "$OUT/progress.txt"
 capture() {
   local name=$1; shift
   echo "start $name $(date +%T)" >> "$OUT/progress.txt"
-  PYTHONPATH=$TREE python "$S/profile_workloads.py" --url $URL --model $MODEL --out "$OUT" "$@" \
+  PYTHONPATH=$TREE python3 "$S/profile_workloads.py" --url $URL --model $MODEL --out "$OUT" "$@" \
     > "$OUT/driver_$name.json" 2> "$OUT/driver_$name.err"
   echo "end $name rc=$? $(date +%T)" >> "$OUT/progress.txt"
 }
@@ -71,6 +68,6 @@ teardown
 
 for trace in "$OUT"/formal/*/b*/*.trace.json.gz "$OUT"/mapping/*/b*/*.trace.json.gz; do
   [ -e "$trace" ] || continue
-  python "$S/step_ledger.py" "$trace" --top 30 > "$(dirname "$trace")/ledger.txt" 2>&1
+  python3 "$S/step_ledger.py" "$trace" --top 30 > "$(dirname "$trace")/ledger.txt" 2>&1
 done
 echo "done $(date +%T)" >> "$OUT/progress.txt"
