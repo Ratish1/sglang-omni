@@ -11,6 +11,7 @@ the next step (or the stream-done flush) is when they become audio.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections.abc import Callable
@@ -121,17 +122,20 @@ class FunCosyVoice3StreamingVocoderScheduler(
         # note(ratish): the AR shares this process and the default stream; on
         # its own stream a step's kernels and host copies do not queue behind
         # the AR's.
-        device = next(vocoder.hift.parameters()).device
-        self.step_stream = (
+        device = next(vocoder.flow.parameters()).device
+        self.step_stream: torch.cuda.Stream | None = (
             torch.cuda.Stream(device=device) if device.type == "cuda" else None
         )
 
-    def pump_one_step(self) -> list[str] | None:
+    def step_context(self) -> contextlib.AbstractContextManager[Any]:
         if self.step_stream is None:
-            return super().pump_one_step()
+            return contextlib.nullcontext()
         else:
-            with torch.cuda.stream(self.step_stream):
-                return super().pump_one_step()
+            return torch.cuda.stream(self.step_stream)
+
+    def pump_one_step(self) -> list[str] | None:
+        with self.step_context():
+            return super().pump_one_step()
 
     async def vocode_payload(self, payload: StagePayload) -> StagePayload:
         results = await self.vocoder.decode_payloads([payload])
@@ -158,12 +162,16 @@ class FunCosyVoice3StreamingVocoderScheduler(
             ),
             embedding=torch.zeros(1, flow.spk_embed_affine_layer.in_features),
         )
+        # note(ratish): under the step stream, so the warmup and not the first
+        # request builds that stream's memory pool and cuBLAS workspaces, which
+        # PyTorch keeps per stream.
         started = time.monotonic()
-        mel = self.vocoder.hop_batch([item])[0]
-        self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=False)
-        hop_s = time.monotonic() - started
-        mel = self.vocoder.leftover_batch([item])[0]
-        self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=True)
+        with self.step_context():
+            mel = self.vocoder.hop_batch([item])[0]
+            self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=False)
+            hop_s = time.monotonic() - started
+            mel = self.vocoder.leftover_batch([item])[0]
+            self.vocoder.hift_delta(mel, hift_mel=None, speech_offset=0, finalize=True)
         final_s = time.monotonic() - started - hop_s
         logger.info(
             f"Fun-CosyVoice3 vocoder warmup: hop {hop_s:.1f} s, final {final_s:.1f} s"
