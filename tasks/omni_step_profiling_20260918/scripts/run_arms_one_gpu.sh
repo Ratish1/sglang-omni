@@ -74,6 +74,19 @@ for pass in $(seq "$PASSES"); do
         [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$CARD")" -lt 100 ] && break
         sleep 2
       done
+      #the WavLM scorer's attention grows with the square of clip length, so a runaway
+      # clip does not fit on the card; SIM skips a missing WAV, the same >50% WER
+      # exclusion the WER corpus figure uses, and the count lands in the log
+      $PY - "$d/bench" >> "$d/progress.txt" <<'PYEOF'
+import json, os, sys
+bench = sys.argv[1]
+wer = json.load(open(os.path.join(bench, "wer_results.json")))["per_sample"]
+above = {row["id"] for row in wer if row.get("wer") is not None and row["wer"] > 0.5}
+for entry in json.load(open(os.path.join(bench, "generated.json"))):
+    if entry.get("sample_id") in above and os.path.isfile(entry.get("wav_path") or ""):
+        os.remove(entry["wav_path"])
+print(f"sim excludes {len(above)} samples above 50% WER")
+PYEOF
       (cd "$BENCH_TREE" && CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$BENCH_TREE $PY -m benchmarks.eval.benchmark_tts_seedtts \
         --model $MODEL --meta $META --lang en --similarity-only --output-dir "$d/bench") > "$d/sim.log" 2>&1
       echo "sim rc $? $(date +%T)" >> "$d/progress.txt"
