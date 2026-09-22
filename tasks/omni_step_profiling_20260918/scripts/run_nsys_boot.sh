@@ -27,8 +27,9 @@ NSYS_ARGS=${NSYS_ARGS:---trace=cuda,nvtx --cuda-graph-trace=node --sample=none -
 cat /proc/loadavg > "$OUT/loadavg_before.txt"
 env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE${PROBE_PATH:+:$PROBE_PATH} ${PROBE_ENV:-} \
   nsys profile -o "$OUT/serve" --force-overwrite=true $NSYS_ARGS \
-  $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT > "$OUT/serve.log" 2>&1 &
+  $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT ${SERVE_ARGS:-} > "$OUT/serve.log" 2>&1 &
 NSYS_PID=$!
+echo "serve args: ${SERVE_ARGS:-}" >> "$OUT/progress.txt"
 
 healthy=0
 for _ in $(seq 180); do
