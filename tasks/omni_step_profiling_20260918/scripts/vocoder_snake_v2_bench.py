@@ -39,7 +39,7 @@ REPS = 30
 
 @triton.jit
 def _round_keep_nan(value):
-    # note(ratish): sin(inf) is the all-ones NaN; the bit rounding would carry it into
+    # sin(inf) is the all-ones NaN; the bit rounding would carry it into
     # the sign bit, so a NaN passes through unrounded
     return tl.where(value != value, value, round_bf16_to_fp32(value))
 
@@ -109,7 +109,7 @@ def _snake_tile(
     ROWS: tl.constexpr,
     COLS: tl.constexpr,
 ):
-    # note(ratish): one program is a ROWS x COLS tile; the channel is one modulo per
+    # one program is a ROWS x COLS tile; the channel is one modulo per
     # row, and a long tensor runs one row per program like today's kernel
     row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     col = tl.program_id(1) * COLS + tl.arange(0, COLS)

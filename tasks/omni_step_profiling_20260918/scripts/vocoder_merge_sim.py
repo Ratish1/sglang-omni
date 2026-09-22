@@ -60,7 +60,7 @@ def main():
         if c["rows"] <= 2 and c["width"] <= WINDOWS[-1]:
             window = next(w for w in WINDOWS if w >= c["width"])
             one = cost(window, c["rows"], "valid_ms")
-            # note(ratish): a chain that is already one window keeps today's cost
+            # a chain that is already one window keeps today's cost
             one = min(one, chain) if len(c["split"] or [0]) == 1 else one
             boot_merged += one
             merged_replays += 1

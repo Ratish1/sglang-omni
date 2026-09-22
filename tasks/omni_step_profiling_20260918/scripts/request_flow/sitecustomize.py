@@ -39,7 +39,7 @@ def write(record):
     record["thread"] = threading.current_thread().name
     with write_lock:
         if not sink:
-            # note(ratish): held open for the life of the server process
+            # held open for the life of the server process
             sink.append(
                 open(f"{PREFIX}.{os.getpid()}.jsonl", "a", buffering=1)  # noqa: SIM115
             )
@@ -68,7 +68,7 @@ def patch_builders(module):
         return result
 
     def part(name, fn):
-        # note(ratish): installed once; each thread adds to its own open record
+        # installed once; each thread adds to its own open record
         def wrapped(*args, **kwargs):
             result, wall, cpu = timed(fn, *args, **kwargs)
             parts = getattr(local, "parts", None)

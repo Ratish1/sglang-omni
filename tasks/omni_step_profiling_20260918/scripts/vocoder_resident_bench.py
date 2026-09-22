@@ -50,7 +50,7 @@ class ResidentDecoder:
     ) -> None:
         self.incremental = incremental
         self.decoder = incremental._decoder
-        # note(ratish): the copies hang off the conv modules under a per-arm name, so
+        # the copies hang off the conv modules under a per-arm name, so
         # torch.compile reads them as module attributes; two arms can coexist.
         self.attr = (
             "_bench_weight_resident" if depthwise_resident else "_bench_weight_dw_ncl"

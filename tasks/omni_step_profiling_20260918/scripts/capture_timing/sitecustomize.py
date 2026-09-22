@@ -28,7 +28,7 @@ def patch(module):
 
     runner = module.Qwen3TTSIncrementalCodecCudaGraphRunner
     decoder = module.Qwen3TTSIncrementalDecoder
-    # note(ratish): held open for the life of the server process
+    # held open for the life of the server process
     out = open(f"{PREFIX}.{os.getpid()}.jsonl", "a", buffering=1)  # noqa: SIM115
     write_lock = threading.Lock()
     local = threading.local()
@@ -64,7 +64,7 @@ def patch(module):
             if not getattr(local, "capture", False):
                 return fn(*args, **kwargs)
             began = time.perf_counter()
-            # note(ratish): OMNI_CAPTURE_SKIP_GC=1 tests one collect per runner, not per key
+            # OMNI_CAPTURE_SKIP_GC=1 tests one collect per runner, not per key
             skip = SKIP_GC and name == "gc_collect_s"
             result = 0 if skip else fn(*args, **kwargs)
             local.row[name] = local.row.get(name, 0.0) + time.perf_counter() - began

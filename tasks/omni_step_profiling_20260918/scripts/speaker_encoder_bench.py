@@ -234,7 +234,7 @@ def main() -> None:
 
     clips = []
     for sample in load_seedtts_samples(args.meta, args.samples, split="en"):
-        # note(ratish): the wrapper loads references this way, then resamples
+        # the wrapper loads references this way, then resamples
         waveform, sr = librosa.load(sample.ref_audio, sr=None, mono=True)
         waveform = waveform.astype(np.float32)
         if sr != rate:

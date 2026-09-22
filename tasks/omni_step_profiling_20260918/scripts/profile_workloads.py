@@ -82,7 +82,9 @@ async def speak(
     async with session.post(f"{url}/v1/audio/speech", json=body) as response:
         if response.status != 200:
             raise RuntimeError(f"HTTP {response.status}: {await response.text()}")
-        sample_rate, channels, width = _validate_raw_pcm_response_headers(response.headers)
+        sample_rate, channels, width = _validate_raw_pcm_response_headers(
+            response.headers
+        )
         bytes_per_frame = sample_rate / frame_rate * channels * width
         async for chunk in response.content.iter_any():
             received += len(chunk)
@@ -106,10 +108,14 @@ def decode_cadence_ms(streams: list[list[tuple[float, float]]]) -> float | None:
     return statistics.median(per_request) if per_request else None
 
 
-async def post(session: aiohttp.ClientSession, url: str, route: str, body: dict) -> dict:
+async def post(
+    session: aiohttp.ClientSession, url: str, route: str, body: dict
+) -> dict:
     async with session.post(f"{url}{route}", json=body) as response:
         if response.status != 200:
-            raise RuntimeError(f"{route} HTTP {response.status}: {await response.text()}")
+            raise RuntimeError(
+                f"{route} HTTP {response.status}: {await response.text()}"
+            )
         return await response.json()
 
 
@@ -118,7 +124,10 @@ async def run(args: argparse.Namespace) -> None:
     rounds = args.steps if args.kind == "prefill" and args.batch == 1 else 1
     captured_count = args.batch * rounds
     picked = pick_samples(samples, args.kind, args.batch * args.warmup + captured_count)
-    warmup, captured = picked[: args.batch * args.warmup], picked[args.batch * args.warmup :]
+    warmup, captured = (
+        picked[: args.batch * args.warmup],
+        picked[args.batch * args.warmup :],
+    )
     max_new_tokens = 1 if args.kind == "prefill" else args.decode_max_new_tokens
     trace_dir = Path(args.out).resolve() / args.label / args.kind / f"b{args.batch}"
     trace_dir.mkdir(parents=True, exist_ok=False)
@@ -144,30 +153,43 @@ async def run(args: argparse.Namespace) -> None:
 
     def speak_one(sample: SampleInput, event: asyncio.Event | None = None):
         return speak(
-            session, args.url, payload(args.model, sample, max_new_tokens), args.frame_rate, event
+            session,
+            args.url,
+            payload(args.model, sample, max_new_tokens),
+            args.frame_rate,
+            event,
         )
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None)
+    ) as session:
         for start in range(0, len(warmup), args.batch):
-            await asyncio.gather(*(speak_one(s) for s in warmup[start : start + args.batch]))
+            await asyncio.gather(
+                *(speak_one(s) for s in warmup[start : start + args.batch])
+            )
         if args.kind == "prefill":
             if not args.no_capture:
-                record["start_profile"] = await post(session, args.url, "/start_profile", arm)
+                record["start_profile"] = await post(
+                    session, args.url, "/start_profile", arm
+                )
             for start in range(0, len(captured), args.batch):
                 group = captured[start : start + args.batch]
                 streams.extend(await asyncio.gather(*(speak_one(s) for s in group)))
         else:
             firsts = [asyncio.Event() for _ in captured]
             tasks = [
-                asyncio.create_task(speak_one(s, event)) for s, event in zip(captured, firsts)
+                asyncio.create_task(speak_one(s, event))
+                for s, event in zip(captured, firsts)
             ]
             await asyncio.gather(*(event.wait() for event in firsts))
             if not args.no_capture:
-                record["start_profile"] = await post(session, args.url, "/start_profile", arm)
+                record["start_profile"] = await post(
+                    session, args.url, "/start_profile", arm
+                )
             streams = list(await asyncio.gather(*tasks))
             record["client_ms_per_frame"] = decode_cadence_ms(streams)
         if not args.no_capture:
-            # note(ratish): a window with no forward after its last one never closes
+            # a window with no forward after its last one never closes
             # itself; the stop exports it, and is a no-op when it already closed.
             await post(session, args.url, "/stop_profile", {"run_id": arm["run_id"]})
     for sample, stream in zip(captured, streams):
@@ -211,14 +233,20 @@ def main() -> None:
     parser.add_argument("--kind", choices=("prefill", "decode"), required=True)
     parser.add_argument("--batch", type=int, required=True)
     parser.add_argument("--steps", type=int, required=True, help="forwards to capture")
-    parser.add_argument("--label", required=True, help="formal, mapping, uncaptured, ...")
+    parser.add_argument(
+        "--label", required=True, help="formal, mapping, uncaptured, ..."
+    )
     parser.add_argument("--out", required=True)
-    parser.add_argument("--warmup", type=int, default=2, help="warmup rounds of --batch")
+    parser.add_argument(
+        "--warmup", type=int, default=2, help="warmup rounds of --batch"
+    )
     parser.add_argument("--meta", default="zhaochenyang20/seed-tts-eval-arrow")
     parser.add_argument("--lang", default="en")
     parser.add_argument("--step-stage", default="tts_engine")
     parser.add_argument("--decode-max-new-tokens", type=int, default=2048)
-    parser.add_argument("--frame-rate", type=float, default=12.5, help="codec frames per second")
+    parser.add_argument(
+        "--frame-rate", type=float, default=12.5, help="codec frames per second"
+    )
     parser.add_argument("--with-stack", action="store_true")
     parser.add_argument("--record-shapes", action="store_true")
     parser.add_argument("--no-capture", action="store_true")

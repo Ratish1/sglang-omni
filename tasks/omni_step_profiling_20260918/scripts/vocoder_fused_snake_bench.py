@@ -76,7 +76,7 @@ def main() -> None:
         print(f"old kernel _MAX_T overridden to {args.old_max_t}")
     widths = [int(w) for w in args.widths.split(",")] if args.widths else WIDTHS
 
-    # note(ratish): timer check: one device copy of a known size through the same
+    # timer check: one device copy of a known size through the same
     # graph-and-event timer gives an effective bandwidth to hold the numbers against
     source = torch.empty(64 * 2**20, dtype=torch.uint8, device=device)
     copy_graph = torch.cuda.CUDAGraph()
@@ -88,7 +88,7 @@ def main() -> None:
     )
     del copy_graph, kept, source
 
-    # note(ratish): the tokenizer loader caches per process, so every arm fuses its
+    # the tokenizer loader caches per process, so every arm fuses its
     # own copy of the decoder
     tokenizer, _ = load(args.model, device)
     pristine = tokenizer.model.decoder
@@ -103,7 +103,7 @@ def main() -> None:
                 f"old kernel fused {old_kernels.fuse_vocoder_decoder(decoder)} modules"
             )
         if name == "new":
-            # note(ratish): the rewrite takes the snake class, main's module does not
+            # the rewrite takes the snake class, main's module does not
             takes_class = (
                 len(inspect.signature(vocoder_kernels.fuse_vocoder_decoder).parameters)
                 == 2
@@ -127,7 +127,7 @@ def main() -> None:
             codes = random_codes(batch, width, device)
             waves, kernels = {}, {}
             times = {name: [] for name in arms}
-            # note(ratish): one graph alive at a time; two graphs over two decoder
+            # one graph alive at a time; two graphs over two decoder
             # copies fault on replay in this bench (unexplained, not seen in serving)
             for round_index in range(3):
                 for name, (_, incremental) in arms.items():

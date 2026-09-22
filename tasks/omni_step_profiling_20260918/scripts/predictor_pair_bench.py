@@ -375,7 +375,7 @@ def compare(args) -> None:
                 .mean()
                 .item()
             )
-            # note(ratish): sub-step j's logits share inputs with the truth only while codes 1..j agree.
+            # sub-step j's logits share inputs with the truth only while codes 1..j agree.
             agree = (
                 (candidate["codes"][:, 1:] == reference["codes"][:, 1:])
                 .int()

@@ -266,7 +266,7 @@ def main():
     parser.add_argument("--out", default="valid_width_grid.json")
     args = parser.parse_args()
     device = torch.device("cuda")
-    # note(ratish): TF32 convs and matmuls round at about 1e-3, which would hide a
+    # TF32 convs and matmuls round at about 1e-3, which would hide a
     # mechanism error in float32; float64 (loaded as float32, then widened) is the
     # reference that separates the mechanism from kernel rounding
     torch.backends.cudnn.allow_tf32 = False
@@ -278,7 +278,7 @@ def main():
     )
     raw_decoder = tokenizer.model.decoder.to(dtype)
     if args.mode == "grid":
-        # note(ratish): the server fuses SnakeBeta before it captures its graphs
+        # the server fuses SnakeBeta before it captures its graphs
         from sglang_omni.models.qwen3_tts.vocoder_kernels import fuse_vocoder_decoder
 
         print(f"fused SnakeBeta modules: {fuse_vocoder_decoder(raw_decoder)}")
