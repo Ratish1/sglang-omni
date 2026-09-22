@@ -221,6 +221,25 @@ as `s17` and `s27` (earlier first audio, unchanged chunk cadence, the worst stal
 with inter chunk a little higher on this head in every pair it appears in (`s28` +1.8 %,
 `s31` +1.1 %, `s32` +2.7 %); the step rule question of `DECISIONS.md` item 8 applies.
 
+## 5c. Final head 42b3e39c6: the context built once
+
+Review of the `stages.py` hunk against SGLang: SGLang builds a stream's context object once
+and re enters it (`scheduler.py:1572` `forward_stream_ctx`, entered at `:4052`, `:4215`,
+`:4327`); 46acca0a6 built a new `torch.cuda.StreamContext` per pump step through a
+`stream_context()` method. 42b3e39c6 stores `self.stream_context` (a `StreamContext`, or
+`nullcontext()` off CUDA) in `CosyVoice3Vocoder.__init__`, drops the method and the unread
+`stream` attribute, annotates `AbstractContextManager[None]`. Same stream, same enter and
+exit, one object less per step. Confirmation `s34` (46acca0a6 card 4 against 42b3e39c6 card
+5, seeded c1 64): buffered 1.396 against 1.398 req/s, streaming 1.164 against 1.131 (inside
+the c1 spread: main against main gave 1.000 against 0.988, other main boots 1.064 and 1.072).
+Audio of the new head against every earlier boot of the same path: streaming 63 of 64 (the
+64th is `17147545-17147546` at its third known length, 268,844 bytes, the digest `s5-r1` saw);
+buffered 61 of 64: the `1205005` pair at lengths the streaming boots had shown, and
+`17255102-17255101` at the same length with 99.75 % of samples different from t = 0 and a
+mean absolute difference (1,795) above the signal's (1,233): a different AR token sequence of
+equal length, not a numerics change (the Flow noise is a fixed buffer, nothing after the AR is
+random). PR #2300 head 42b3e39c6.
+
 ## 6. Owed before a PR (all done for 87621ea6a)
 
 - `s20`/`s21`: byte identity of the served audio against a control boot.
