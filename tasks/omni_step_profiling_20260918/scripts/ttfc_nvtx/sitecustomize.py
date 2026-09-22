@@ -83,10 +83,10 @@ def log_torch_settings():
 
 def patch_builders(module):
     log_torch_settings()
-    hook = module._Qwen3TTSAdhocReferenceHook
-    batcher = module._Qwen3TTSRefCodeBatcher
-    module._prepare_qwen3_tts_request = ranged(
-        module._prepare_qwen3_tts_request,
+    hook = module.Qwen3TTSAdhocReferenceHook
+    batcher = module.Qwen3TTSRefCodeBatcher
+    module.prepare_qwen3_tts_request = ranged(
+        module.prepare_qwen3_tts_request,
         lambda payload, **kwargs: f"pre.prepare rid={payload.request_id}",
     )
     encode_one = hook.encode_one
@@ -107,12 +107,12 @@ def patch_builders(module):
         return encode_one(self, item)
 
     hook.encode_one = ranged(encode_one_ranged, fixed("pre.reference"))
-    batcher._encode_waveform = ranged(
-        batcher._encode_waveform,
+    batcher.encode_waveform = ranged(
+        batcher.encode_waveform,
         lambda self, waveform, sample_rate: f"ref.encode n={len(waveform)}",
     )
-    batcher._synchronize_outcomes = ranged(
-        batcher._synchronize_outcomes,
+    batcher.synchronize_outcomes = ranged(
+        batcher.synchronize_outcomes,
         lambda self, outcomes: f"ref.sync b={len(outcomes)}",
     )
 
@@ -169,37 +169,37 @@ def patch_vocoder(module):
         scheduler.on_stream_chunk_batch,
         lambda self, items: f"voc.chunks n={len(items)}",
     )
-    scheduler._ingest_stream_item = ranged(
-        scheduler._ingest_stream_item,
+    scheduler.ingest_stream_item = ranged(
+        scheduler.ingest_stream_item,
         lambda self, request_id, item: f"voc.chunk rid={request_id}",
     )
-    scheduler._run_initial_batch = ranged(
-        scheduler._run_initial_batch,
+    scheduler.run_initial_batch = ranged(
+        scheduler.run_initial_batch,
         lambda self, batch: f"voc.initial rows={len(batch)}",
     )
-    scheduler._run_followup_batch = ranged(
-        scheduler._run_followup_batch,
+    scheduler.run_followup_batch = ranged(
+        scheduler.run_followup_batch,
         lambda self, batch: f"voc.followup rows={len(batch)}",
     )
-    scheduler._decode_incremental_cohort = ranged(
-        scheduler._decode_incremental_cohort,
+    scheduler.decode_incremental_cohort = ranged(
+        scheduler.decode_incremental_cohort,
         lambda self, gpu_input, plans, incremental, stream: (
             f"voc.cohort w={int(plans[0].fresh_frames)} rows={len(plans)} "
             f"init={int(stream is self._decode_stream)}"
         ),
     )
-    scheduler._decode_incremental_windows = ranged(
-        scheduler._decode_incremental_windows,
+    scheduler.decode_incremental_windows = ranged(
+        scheduler.decode_incremental_windows,
         lambda self, gpu_input, plans, incremental, runner, split: (
             f"voc.windows n={len(split)}"
         ),
     )
-    scheduler._commit_initial = ranged(
-        scheduler._commit_initial,
+    scheduler.commit_initial = ranged(
+        scheduler.commit_initial,
         lambda self, request_id, state, plan, delta: f"voc.commit rid={request_id}",
     )
-    scheduler._commit_followup = ranged(
-        scheduler._commit_followup,
+    scheduler.commit_followup = ranged(
+        scheduler.commit_followup,
         lambda self, request_id, *args, **kwargs: (
             f"voc.commit_followup rid={request_id}"
         ),
