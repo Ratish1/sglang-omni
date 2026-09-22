@@ -19,9 +19,13 @@ nsys --version > "$OUT/nsys_version.txt" 2>&1
 nvidia-smi > "$OUT/gpus_before.txt"
 echo "start $(date +%T)" > "$OUT/progress.txt"
 
-CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE nsys profile -o "$OUT/serve" --force-overwrite=true \
-  --trace=cuda,nvtx --cuda-graph-trace=node --sample=none --cpuctxsw=none \
-  --gpu-metrics-devices=cuda-visible --gpu-metrics-set=ad10x --gpu-metrics-frequency=2000 \
+# note(ratish): PROBE_PATH adds a sitecustomize probe directory behind the tree (the
+# ttfc_nvtx probe needs OMNI_TTFC_NVTX=1 in PROBE_ENV); NSYS_ARGS replaces the profile
+# flags, e.g. "--sample=cpu" for host stacks instead of GPU metrics
+NSYS_ARGS=${NSYS_ARGS:---trace=cuda,nvtx --cuda-graph-trace=node --sample=none --cpuctxsw=none --gpu-metrics-devices=cuda-visible --gpu-metrics-set=ad10x --gpu-metrics-frequency=2000}
+cat /proc/loadavg > "$OUT/loadavg_before.txt"
+env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE${PROBE_PATH:+:$PROBE_PATH} ${PROBE_ENV:-} \
+  nsys profile -o "$OUT/serve" --force-overwrite=true $NSYS_ARGS \
   $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT > "$OUT/serve.log" 2>&1 &
 NSYS_PID=$!
 
@@ -55,6 +59,8 @@ echo "nsys ended $(date +%T)" >> "$OUT/progress.txt"
 nvidia-smi > "$OUT/gpus_after.txt"
 [ -f "$OUT/FAILED" ] && exit 1
 
+cat /proc/loadavg > "$OUT/loadavg_after.txt"
 nsys export --type sqlite --force-overwrite=true -o "$OUT/serve.sqlite" "$OUT/serve.nsys-rep" > "$OUT/export.log" 2>&1
 $PY "$S/nsys_metrics.py" "$OUT/serve.sqlite" --bench-log "$OUT/bench.log" > "$OUT/metrics.txt" 2>&1
+$PY "$S/ttfc_census.py" "$OUT/serve.sqlite" --bench-log "$OUT/bench.log" > "$OUT/census.txt" 2>&1
 echo "done $(date +%T)" >> "$OUT/progress.txt"
