@@ -8,6 +8,7 @@ visual embeddings for Qwen3-Omni's thinker stage.
 from __future__ import annotations
 
 import logging
+import os
 from numbers import Integral
 from typing import Any
 
@@ -32,6 +33,7 @@ class ThinkerModelRunner(ModelRunner):
         self._th_slot = 0
         self._prompt_hidden_layer: int | None = None
         self._prompt_hidden_input: torch.Tensor | None = None
+        self._prompt_embed_input: torch.Tensor | None = None
 
         thinker_cfg = tp_worker.model_runner.model_config.hf_config.thinker_config
         self._image_token_id = thinker_cfg.image_token_id
@@ -56,10 +58,20 @@ class ThinkerModelRunner(ModelRunner):
             )
             return None
 
+        def capture_embeds(module, args, kwargs):
+            del module, kwargs
+            if args[2].forward_mode.is_extend():
+                self._prompt_embed_input = args[1]
+            return None
+
         self._prompt_hidden_layer = layer_id
         self._text_model.layers[layer_id].register_forward_pre_hook(
             capture, with_kwargs=True
         )
+        if os.environ.get("SGLANG_OMNI_DUMP_PROMPT_HIDDEN"):
+            self._text_model.layers[0].register_forward_pre_hook(
+                capture_embeds, with_kwargs=True
+            )
         logger.info("thinker keeps layer %d input at multimodal prompt rows", layer_id)
 
     def post_prefill(self, result, forward_batch, schedule_batch, requests):
@@ -67,6 +79,7 @@ class ThinkerModelRunner(ModelRunner):
         self._prompt_hidden_input = None
         if self._prompt_hidden_layer is None or layer_input is None:
             return
+        self.dump_prompt_layers(forward_batch, schedule_batch, layer_input)
         for req in schedule_batch.reqs:
             chunk = getattr(req, "_omni_prompt_hidden_chunk", None)
             if chunk is None:
@@ -81,6 +94,26 @@ class ThinkerModelRunner(ModelRunner):
                 collected = []
                 req._omni_prompt_hidden = collected
             collected.append((prompt_positions, rows))
+
+    def dump_prompt_layers(self, forward_batch, schedule_batch, layer_input) -> None:
+        dump_dir = os.environ.get("SGLANG_OMNI_DUMP_PROMPT_HIDDEN")
+        embed_input = self._prompt_embed_input
+        self._prompt_embed_input = None
+        if not dump_dir or embed_input is None:
+            return
+        extend_lens = list(forward_batch.extend_seq_lens_cpu)
+        prefix_lens = list(forward_batch.extend_prefix_lens_cpu)
+        start = 0
+        for req, length, prefix in zip(schedule_batch.reqs, extend_lens, prefix_lens):
+            torch.save(
+                {
+                    "prefix": int(prefix),
+                    "layer0": embed_input[start : start + length].float().cpu(),
+                    "layer24": layer_input[start : start + length].float().cpu(),
+                },
+                os.path.join(dump_dir, f"thinker_{req.rid}_{int(prefix)}.pt"),
+            )
+            start += length
 
     def custom_prefill_forward(self, forward_batch, schedule_batch, requests):
         if not schedule_batch.forward_mode.is_extend():
