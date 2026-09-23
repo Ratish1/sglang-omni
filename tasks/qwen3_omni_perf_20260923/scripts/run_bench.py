@@ -82,6 +82,7 @@ def mmsu_args(
 
 async def seeded_speech_requests(port: int, out: str, samples_per_input: int) -> dict:
     import base64
+    import hashlib
 
     import aiohttp
 
@@ -115,8 +116,6 @@ async def seeded_speech_requests(port: int, out: str, samples_per_input: int) ->
             )
         )
 
-    audio_dir = Path(out) / "audio"
-    audio_dir.mkdir(parents=True, exist_ok=True)
     per_sample = []
     url = f"http://127.0.0.1:{port}/v1/chat/completions"
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_S)
@@ -135,10 +134,15 @@ async def seeded_speech_requests(port: int, out: str, samples_per_input: int) ->
             async with session.post(url, json=payload) as response:
                 body = await response.json()
             message = body["choices"][0]["message"]
-            (audio_dir / f"{sample_id}.wav").write_bytes(
-                base64.b64decode(message["audio"]["data"])
+            wav_bytes = base64.b64decode(message["audio"]["data"])
+            per_sample.append(
+                {
+                    "id": sample_id,
+                    "text": message.get("content"),
+                    "audio_sha256": hashlib.sha256(wav_bytes).hexdigest(),
+                    "audio_bytes": len(wav_bytes),
+                }
             )
-            per_sample.append({"id": sample_id, "text": message.get("content")})
     results = {"per_sample": per_sample}
     (Path(out) / "speech_identity_results.json").write_text(
         json.dumps(results, indent=1)
