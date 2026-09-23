@@ -903,57 +903,31 @@ def make_thinker_stream_output_builder():
     def _build_stream_output(
         request_id: str, req_data: Any, req_output: Any
     ) -> list[OutgoingMessage]:
-        req = getattr(req_data, "req", None)
-        if req is not None and req.inflight_middle_chunks > 0:
-            # While chunked prefill is still consuming prompt tokens, suppress
-            # hidden-state streaming to the talker.
-            # Emitting chunks this early lets prompt-side states masquerade as the
-            # first assistant token and can leak the user/ref-text prompt into TTS.
-            return []
-        if req_output.data is None:
+        # note (ratish): a middle chunk of a chunked prefill samples a token the
+        # request discards; streaming it would put a prompt row into the answer
+        if req_data.req.inflight_middle_chunks > 0 or req_output.data is None:
             return []
 
         token_id = int(req_output.data)
-        messages: list[OutgoingMessage] = []
-
-        # Skip per-token decode emit when not streaming; talker_ar below stays
-        # unconditional since talker generates audio either way.
         stage_payload = req_data.stage_payload
-        is_streaming = bool(
-            stage_payload is not None
-            and (stage_payload.request.params or {}).get("stream", False)
-        )
-        if is_streaming:
-            # Wrap int; stream transport only accepts tensors.
-            messages.append(
-                OutgoingMessage(
-                    request_id=request_id,
-                    type="stream",
-                    data=torch.tensor([token_id], dtype=torch.long),
-                    target="decode",
-                    metadata={"token_id": token_id},
-                )
-            )
-
-        if not should_generate_audio_output(stage_payload):
-            return messages
-
-        # Speech mode: the talker rebuilds this assistant row from token_id
-        # through its own text embedding, so the event carries the token only.
-        # Unlike the decode event above, this one is not gated on API streaming:
-        # the talker needs every token either way.
-        messages.append(
+        targets: list[str] = []
+        if (stage_payload.request.params or {}).get("stream", False):
+            targets.append("decode")
+        if should_generate_audio_output(stage_payload):
+            targets.append("talker_ar")
+        # note (ratish): a cross-process stream chunk must be a tensor, and one
+        # this small is pickled inline with the control message
+        token_tensor = torch.tensor([token_id], dtype=torch.long)
+        return [
             OutgoingMessage(
                 request_id=request_id,
                 type="stream",
-                # Wrap int; stream transport only accepts tensors.
-                data=torch.tensor([token_id], dtype=torch.long),
-                target="talker_ar",
+                data=token_tensor,
+                target=target,
                 metadata={"token_id": token_id},
             )
-        )
-
-        return messages
+            for target in targets
+        ]
 
     return _build_stream_output
 
@@ -1001,7 +975,6 @@ def make_talker_scheduler_adapters(
     model: Any,
     model_path: str,
     thinker_config: Any,
-    required_aux_hidden_key: int,
     codec_bos_id: int = 2149,
     codec_eos_id: int | None = None,
     codec_nothink_id: int = 2155,

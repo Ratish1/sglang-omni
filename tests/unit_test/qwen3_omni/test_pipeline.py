@@ -102,7 +102,6 @@ def test_qwen_pipeline_config_and_state_contracts() -> None:
     speech_talker = _stage(speech_config, "talker_ar")
     text_thinker = _stage(text_config, "thinker")
     preprocessing = _stage(speech_config, "preprocessing")
-    # Speech streams tokens to both talker_ar and decode; text only to decode.
     request_builders_path = "sglang_omni.models.qwen3_omni.request_builders"
     assert "mm_aggregate" not in {stage.name for stage in speech_config.stages}
     assert preprocessing.next == [
@@ -932,9 +931,6 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     )
     monkeypatch.setattr(request_builders, "make_thinker_stream_output_builder", object)
     monkeypatch.setattr(
-        request_builders, "should_generate_audio_output", lambda payload: False
-    )
-    monkeypatch.setattr(
         sglang_backend, "SGLangOutputProcessor", lambda **kwargs: output_proc
     )
     monkeypatch.setattr(
@@ -962,10 +958,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     )
 
     assert infrastructure_saw_graph_disabled == [False]
-    # Verify the capture kwargs are omitted rather than passed as None.
-    assert "capture_hidden_layers" not in infrastructure_kwargs[0]
     assert "defer_cuda_graph_capture" not in infrastructure_kwargs[0]
-    # Shared infrastructure, not Qwen bootstrap, owns graph initialization.
     assert graph_init_workers == []
     assert infrastructure_saw_return_hidden == [False]
     assert server_args.enable_return_hidden_states is False
@@ -1055,11 +1048,6 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     )
     monkeypatch.setattr(request_builders, "make_thinker_stream_output_builder", object)
     monkeypatch.setattr(
-        request_builders,
-        "should_generate_audio_output",
-        lambda payload: False,
-    )
-    monkeypatch.setattr(
         sglang_backend,
         "SGLangOutputProcessor",
         lambda **kwargs: output_proc_kwargs.append(kwargs) or output_proc,
@@ -1076,9 +1064,7 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
     scheduler = bootstrap.create_thinker_scheduler(server_args, speech_enabled=True)
 
     assert captured["enable_prefill_input_embeds"] is True
-    assert "capture_hidden_layers" not in captured
     assert "defer_cuda_graph_capture" not in captured
-    # Shared infrastructure, not Qwen bootstrap, owns graph initialization.
     assert graph_init_workers == []
     assert attest_calls == [(model_worker.model_runner, False)]
     assert output_proc_kwargs == [{}]
