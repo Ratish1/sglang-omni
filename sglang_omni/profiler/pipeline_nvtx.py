@@ -20,7 +20,7 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 if ENABLED:
-    import nvtx
+    from torch.cuda import nvtx
 
 
 def metadata_summary(value: Any) -> Any:
@@ -46,10 +46,7 @@ def trace_range(stage: str, op: str, **metadata: Any) -> AbstractContextManager:
     """A synchronous host range. Never hold this context across an await."""
     if not ENABLED:
         return nullcontext()
-    return nvtx.annotate(
-        annotation_message(stage, op, {**metadata, "kind": "range"}),
-        domain="sglang_omni",
-    )
+    return nvtx.range(annotation_message(stage, op, {**metadata, "kind": "range"}))
 
 
 def trace_call(
@@ -76,7 +73,4 @@ def trace_call(
 
 def mark(stage: str, op: str, **metadata: Any) -> None:
     if ENABLED:
-        nvtx.mark(
-            annotation_message(stage, op, {**metadata, "kind": "mark"}),
-            domain="sglang_omni",
-        )
+        nvtx.mark(annotation_message(stage, op, {**metadata, "kind": "mark"}))
