@@ -5,16 +5,22 @@
 # for every arm that has speech. pids seen on the card are logged every 2 s; a second pid
 # while the omni server runs voids the boot.
 # MAX_SAMPLES=N runs the first N samples of every arm (identity smokes); unset is the full corpus.
-# usage: run_bench_boot.sh <tree> <out dir> <card> <port> <bf16|fp8> <concurrency> "<arm> <arm> ..."
+# minicpmo serves MiniCPM-o-4.5 with the Omni CI speech worker args (tests/test_model/conftest.py).
+# usage: run_bench_boot.sh <tree> <out dir> <card> <port> <bf16|fp8|minicpmo> <concurrency> "<arm> <arm> ..."
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 DTYPE=$5 CONC=$6 ARMS=$7
 S=$(cd "$(dirname "$0")" && pwd)
+QWEN_ARGS="--colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
 case $DTYPE in
-  bf16) MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct CONFIG=examples/configs/qwen3_omni_colocated_h100_bf16.yaml ;;
-  fp8) MODEL=marksverdhei/Qwen3-Omni-30B-A3B-FP8 CONFIG=examples/configs/qwen3_omni_colocated_h100_fp8.yaml ;;
-  *) echo "dtype must be bf16 or fp8"; exit 1 ;;
+  bf16) MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
+    SERVE_ARGS="--config examples/configs/qwen3_omni_colocated_h100_bf16.yaml $QWEN_ARGS" ;;
+  fp8) MODEL=marksverdhei/Qwen3-Omni-30B-A3B-FP8
+    SERVE_ARGS="--config examples/configs/qwen3_omni_colocated_h100_fp8.yaml $QWEN_ARGS" ;;
+  minicpmo) MODEL=openbmb/MiniCPM-o-4_5
+    SERVE_ARGS="--thinker.factory.max_seq_len 8192 --thinker.engine.mem_fraction_static 0.55 --talker.engine.mem_fraction_static 0.15" ;;
+  *) echo "dtype must be bf16, fp8 or minicpmo"; exit 1 ;;
 esac
-SERVE_ARGS="--config $CONFIG --colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768 ${EXTRA_SERVE_ARGS:-}"
+SERVE_ARGS="$SERVE_ARGS ${EXTRA_SERVE_ARGS:-}"
 ASR_MODEL=Qwen/Qwen3-ASR-1.7B
 # PIN_CPUS (e.g. 0-15,64-79) runs the server, the benchmark client and the scorer on those
 # cores with memory on NUMA node 0, so the two arms of a pair get identical, disjoint CPU
