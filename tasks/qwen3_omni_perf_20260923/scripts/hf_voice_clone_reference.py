@@ -5,12 +5,14 @@ parity:   for every omni dump (talker prompt ids, multimodal positions, rows; wr
           same SeedTTS voice-clone prompt and compare hidden_states[23..25] at those
           positions with omni's rows. Prints whether the prompt ids match, then per layer
           the mean and min cosine and the max relative row difference.
-generate: HF generate with audio output on the first N SeedTTS EN samples with the
-          benchmark's voice-clone prompt; writes OUT/seedtts_en/generated.json and wavs,
-          scored afterwards by run_bench.py sim.
+generate: HF generate with audio output on SeedTTS EN (all samples, or the first N) with
+          the benchmark's voice-clone prompt and thinker sampling; shard k of n writes
+          OUT/seedtts_en/generated_k.json and wavs.
+merge:    joins the shards into OUT/seedtts_en/generated.json for run_bench.py score/sim.
 
 usage: python hf_voice_clone_reference.py parity --dump-dir DIR
-       python hf_voice_clone_reference.py generate --samples 20 --out DIR
+       python hf_voice_clone_reference.py generate --out DIR --shard 0 --num-shards 3
+       python hf_voice_clone_reference.py merge --out DIR
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 SEEDTTS_META = "zhaochenyang20/seed-tts-eval-arrow"
 AUDIO_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 24000
+# benchmarks/tasks/tts.py sends this temperature with every SeedTTS request
+THINKER_TEMPERATURE = 0.7
 
 
 def voice_clone_prompt(sample) -> str:
@@ -133,7 +137,7 @@ def parity(dump_dir: str) -> None:
 
 
 @torch.no_grad()
-def generate(count: int, out: str) -> None:
+def generate(count: int | None, out: str, shard: int, num_shards: int) -> None:
     import soundfile
 
     processor, model = load_model()
@@ -141,10 +145,19 @@ def generate(count: int, out: str) -> None:
     audio_dir = arm_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     records = []
-    for sample in seedtts_samples(count):
+    for sample in seedtts_samples(count)[shard::num_shards]:
         inputs = build_inputs(processor, model, sample)
         began = time.perf_counter()
-        _, audio = model.generate(**inputs, speaker="Ethan", thinker_max_new_tokens=256)
+        # the benchmark's thinker sampling for omni: temperature 0.7, top-p 1, no top-k
+        _, audio = model.generate(
+            **inputs,
+            speaker="Ethan",
+            thinker_max_new_tokens=256,
+            thinker_do_sample=True,
+            thinker_temperature=THINKER_TEMPERATURE,
+            thinker_top_p=1.0,
+            thinker_top_k=0,
+        )
         latency = time.perf_counter() - began
         waveform = audio.reshape(-1).float().cpu().numpy()
         wav_path = audio_dir / f"{sample.sample_id}.wav"
@@ -163,20 +176,35 @@ def generate(count: int, out: str) -> None:
         print(
             f"{sample.sample_id}: {duration:.2f} s audio in {latency:.1f} s", flush=True
         )
+    (arm_dir / f"generated_{shard}.json").write_text(json.dumps(records, indent=1))
+
+
+def merge(out: str) -> None:
+    arm_dir = Path(out) / "seedtts_en"
+    records = [
+        record
+        for path in sorted(arm_dir.glob("generated_*.json"))
+        for record in json.loads(path.read_text())
+    ]
     (arm_dir / "generated.json").write_text(json.dumps(records, indent=1))
+    print(f"merged {len(records)} records")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("parity", "generate"))
+    parser.add_argument("mode", choices=("parity", "generate", "merge"))
     parser.add_argument("--dump-dir")
-    parser.add_argument("--samples", type=int, default=20)
+    parser.add_argument("--samples", type=int, help="first N samples; unset is all")
+    parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--out")
     args = parser.parse_args()
     if args.mode == "parity":
         parity(args.dump_dir)
+    elif args.mode == "generate":
+        generate(args.samples, args.out, args.shard, args.num_shards)
     else:
-        generate(args.samples, args.out)
+        merge(args.out)
 
 
 if __name__ == "__main__":
