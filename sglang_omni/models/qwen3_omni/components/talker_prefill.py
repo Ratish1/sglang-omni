@@ -210,12 +210,12 @@ class TalkerPrefillBuilder:
         prompt_hidden_chunks = [
             chunk
             for chunk in thinker_chunks
-            if "prompt_hidden_positions" in (chunk.metadata or {})
+            if "prompt_hidden_ranges" in (chunk.metadata or {})
         ]
         thinker_chunks = [
             chunk
             for chunk in thinker_chunks
-            if "prompt_hidden_positions" not in (chunk.metadata or {})
+            if "prompt_hidden_ranges" not in (chunk.metadata or {})
         ]
         self.place_prompt_hidden_rows(
             payload.request_id, prompt_ids, prompt_hidden, prompt_hidden_chunks
@@ -274,7 +274,7 @@ class TalkerPrefillBuilder:
             return
 
         metadata = chunk.metadata or {}
-        if "prompt_hidden_positions" in metadata:
+        if "prompt_hidden_ranges" in metadata:
             return
         token_id = metadata.get("token_id")
         if token_id is not None and int(token_id) == self._im_end_token_id:
@@ -332,8 +332,11 @@ class TalkerPrefillBuilder:
         filled: set[int] = set()
         row_norm = 0.0
         for chunk in prompt_hidden_chunks:
-            positions = torch.tensor(
-                chunk.metadata["prompt_hidden_positions"], dtype=torch.long
+            positions = torch.cat(
+                [
+                    torch.arange(start, start + length, dtype=torch.long)
+                    for start, length in chunk.metadata["prompt_hidden_ranges"]
+                ]
             )
             rows = chunk.data.to(device=prompt_hidden.device, dtype=prompt_hidden.dtype)
             prompt_hidden[positions.to(device=prompt_hidden.device)] = rows

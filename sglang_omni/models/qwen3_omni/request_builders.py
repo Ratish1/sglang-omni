@@ -929,7 +929,15 @@ def make_thinker_stream_output_builder(*, speech_enabled: bool):
             req_data.req._omni_prompt_hidden = None
             positions = torch.cat(
                 [chunk_positions for chunk_positions, _ in prompt_hidden]
-            )
+            ).tolist()
+            # note (ratish): multimodal positions come in contiguous runs, one per
+            # item; ranges keep the metadata inline-sized for any image or video
+            ranges: list[list[int]] = []
+            for position in positions:
+                if ranges and ranges[-1][0] + ranges[-1][1] == position:
+                    ranges[-1][1] += 1
+                else:
+                    ranges.append([position, 1])
             rows = torch.cat([chunk_rows for _, chunk_rows in prompt_hidden])
             messages.append(
                 OutgoingMessage(
@@ -937,7 +945,7 @@ def make_thinker_stream_output_builder(*, speech_enabled: bool):
                     type="stream",
                     data=rows,
                     target="talker_ar",
-                    metadata={"prompt_hidden_positions": positions.tolist()},
+                    metadata={"prompt_hidden_ranges": ranges},
                 )
             )
         messages.extend(
