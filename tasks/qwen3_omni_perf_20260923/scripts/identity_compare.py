@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 TIMING_KEY = re.compile(
-    r"latency|time|ttf|ttft|rtf|duration|throughput|_s$|_ms$|wav_path|audio_path|itl"
+    r"latency|time|ttf|ttft|rtf|duration|throughput|rate|_s$|_ms$|wav_path|audio_path|itl"
 )
 
 

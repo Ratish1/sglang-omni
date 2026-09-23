@@ -32,6 +32,15 @@ ARMS = (
     "videomme_talker",
     "videoamme",
     "videoamme_talker",
+    "speech_identity",
+)
+# speech_identity: the request seed also seeds the talker, whose default seed hashes the
+# server's random request id; any fixed value works as long as both arms use it
+SPEECH_IDENTITY_SEED = 1234
+SPEECH_IDENTITY_TEXT_PROMPTS = (
+    "Name three primary colors.",
+    "Say good morning to a friend in one sentence.",
+    "Count from one to five.",
 )
 MODEL = "qwen3-omni"
 TIMEOUT_S = 500
@@ -71,9 +80,77 @@ def mmsu_args(
     )
 
 
+async def seeded_speech_requests(port: int, out: str, samples_per_input: int) -> dict:
+    import base64
+
+    import aiohttp
+
+    from benchmarks.dataset.mmmu import load_mmmu_samples
+    from benchmarks.dataset.mmsu import load_mmsu_samples
+
+    requests = [
+        (f"text-{index}", {"messages": [{"role": "user", "content": prompt}]})
+        for index, prompt in enumerate(SPEECH_IDENTITY_TEXT_PROMPTS)
+    ]
+    for sample in load_mmsu_samples(max_samples=samples_per_input):
+        content = "Describe this audio in one sentence."
+        requests.append(
+            (
+                f"audio-{sample.sample_id}",
+                {
+                    "messages": [{"role": "user", "content": content}],
+                    "audios": [sample.audio_path],
+                },
+            )
+        )
+    for sample in load_mmmu_samples(max_samples=samples_per_input):
+        content = "Describe this image in one sentence."
+        requests.append(
+            (
+                f"image-{sample.sample_id}",
+                {
+                    "messages": [{"role": "user", "content": content}],
+                    "images": list(sample.image_data_uris),
+                },
+            )
+        )
+
+    audio_dir = Path(out) / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    per_sample = []
+    url = f"http://127.0.0.1:{port}/v1/chat/completions"
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT_S)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for sample_id, inputs in requests:
+            payload = {
+                "model": MODEL,
+                **inputs,
+                "modalities": ["text", "audio"],
+                "audio": {"format": "wav"},
+                "max_tokens": 64,
+                "temperature": 0.0,
+                "seed": SPEECH_IDENTITY_SEED,
+                "stream": False,
+            }
+            async with session.post(url, json=payload) as response:
+                body = await response.json()
+            message = body["choices"][0]["message"]
+            (audio_dir / f"{sample_id}.wav").write_bytes(
+                base64.b64decode(message["audio"]["data"])
+            )
+            per_sample.append({"id": sample_id, "text": message.get("content")})
+    results = {"per_sample": per_sample}
+    (Path(out) / "speech_identity_results.json").write_text(
+        json.dumps(results, indent=1)
+    )
+    return results
+
+
 async def generate(
     arm: str, port: int, out: str, concurrency: int, max_samples: int | None
 ) -> dict:
+    if arm == "speech_identity":
+        return await seeded_speech_requests(port, out, max_samples or 5)
     talker = arm.endswith("_talker")
     if arm == "seedtts_en":
         from benchmarks.eval.benchmark_omni_seedtts import (
