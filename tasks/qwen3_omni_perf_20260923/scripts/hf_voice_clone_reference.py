@@ -8,6 +8,8 @@ parity:   for every omni dump (talker prompt ids, multimodal positions, rows; wr
 generate: HF generate with audio output on SeedTTS EN (all samples, or the first N) with
           the benchmark's voice-clone prompt and thinker sampling; shard k of n writes
           OUT/seedtts_en/generated_k.json and wavs.
+layers:   with omni's thinker dumps (full prompt rows at the inputs of layers 0 and 24),
+          compares HF hidden_states[0] and [24] on text rows and audio rows separately.
 merge:    joins the shards into OUT/seedtts_en/generated.json for run_bench.py score/sim.
 
 usage: python hf_voice_clone_reference.py parity --dump-dir DIR
@@ -136,6 +138,79 @@ def parity(dump_dir: str) -> None:
             )
 
 
+def row_agreement(hf_rows: torch.Tensor, omni_rows: torch.Tensor) -> str:
+    cosine = torch.nn.functional.cosine_similarity(hf_rows, omni_rows, dim=-1)
+    relative = (hf_rows - omni_rows).norm(dim=-1) / hf_rows.norm(dim=-1).clamp_min(1e-6)
+    return (
+        f"cosine mean {cosine.mean():.4f} min {cosine.min():.4f}, "
+        f"relative diff mean {relative.mean():.4f} max {relative.max():.4f}"
+    )
+
+
+@torch.no_grad()
+def layers(dump_dir: str) -> None:
+    """Compare omni's full prompt rows at layer 0 and layer 24 with HF, text and audio apart."""
+    processor, model = load_model()
+    samples = seedtts_samples(None)
+    for talker_dump_path in sorted(Path(dump_dir).glob("*.pt")):
+        if talker_dump_path.name.startswith("thinker_"):
+            continue
+        request_id = talker_dump_path.stem
+        chunks = sorted(
+            (
+                torch.load(path)
+                for path in Path(dump_dir).glob(f"thinker_{request_id}_*.pt")
+            ),
+            key=lambda chunk: chunk["prefix"],
+        )
+        if not chunks or chunks[0]["prefix"] != 0:
+            print(f"{request_id}: no full thinker dump")
+            continue
+        talker_dump = torch.load(talker_dump_path)
+        prompt_text = processor.tokenizer.decode(talker_dump["prompt_ids"])
+        sample = next(
+            (
+                s
+                for s in samples
+                if s.target_text in prompt_text and s.ref_text in prompt_text
+            ),
+            None,
+        )
+        if sample is None:
+            continue
+        inputs = build_inputs(processor, model, sample)
+        if not torch.equal(inputs["input_ids"][0].cpu(), talker_dump["prompt_ids"]):
+            print(f"{sample.sample_id}: prompt ids differ, skipped")
+            continue
+        thinker_inputs = {
+            key: inputs[key]
+            for key in (
+                "input_ids",
+                "attention_mask",
+                "input_features",
+                "feature_attention_mask",
+            )
+            if key in inputs
+        }
+        hidden_states = model.thinker(
+            **thinker_inputs, output_hidden_states=True
+        ).hidden_states
+        prompt_len = talker_dump["prompt_ids"].numel()
+        audio_mask = torch.zeros(prompt_len, dtype=torch.bool)
+        audio_mask[talker_dump["positions"]] = True
+        print(f"{sample.sample_id}: {prompt_len} rows, {int(audio_mask.sum())} audio")
+        for layer in (0, 24):
+            omni_rows = torch.cat([chunk[f"layer{layer}"] for chunk in chunks])[
+                :prompt_len
+            ]
+            hf_rows = hidden_states[layer][0].float().cpu()
+            for region, mask in (("text", ~audio_mask), ("audio", audio_mask)):
+                print(
+                    f"  layer {layer:2d} {region:5s}: "
+                    f"{row_agreement(hf_rows[mask], omni_rows[mask])}"
+                )
+
+
 @torch.no_grad()
 def generate(count: int | None, out: str, shard: int, num_shards: int) -> None:
     import soundfile
@@ -192,7 +267,7 @@ def merge(out: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("parity", "generate", "merge"))
+    parser.add_argument("mode", choices=("parity", "layers", "generate", "merge"))
     parser.add_argument("--dump-dir")
     parser.add_argument("--samples", type=int, help="first N samples; unset is all")
     parser.add_argument("--shard", type=int, default=0)
@@ -201,6 +276,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.mode == "parity":
         parity(args.dump_dir)
+    elif args.mode == "layers":
+        layers(args.dump_dir)
     elif args.mode == "generate":
         generate(args.samples, args.out, args.shard, args.num_shards)
     else:
