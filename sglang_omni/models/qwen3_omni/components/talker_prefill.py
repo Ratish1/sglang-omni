@@ -8,6 +8,7 @@ This module mirrors HF's talker prefill layout, then keeps HF's
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,8 @@ from sglang_omni.models.qwen3_omni.pending_text_queue import (
     coerce_pending_text_queue,
 )
 from sglang_omni.models.weight_loader import resolve_model_path
+
+logger = logging.getLogger(__name__)
 
 _THINKER_EMBED_CANDIDATE_KEYS = (
     "thinker.model.embed_tokens.weight",
@@ -203,6 +206,19 @@ class TalkerPrefillBuilder:
         prompt_ids, prompt_embed, prompt_hidden, prompt_model_inputs = (
             self.reconstruct_prompt_states(state)
         )
+        prompt_hidden_chunks = [
+            chunk
+            for chunk in thinker_chunks
+            if "prompt_hidden_positions" in (chunk.metadata or {})
+        ]
+        thinker_chunks = [
+            chunk
+            for chunk in thinker_chunks
+            if "prompt_hidden_positions" not in (chunk.metadata or {})
+        ]
+        self.place_prompt_hidden_rows(
+            payload.request_id, prompt_ids, prompt_hidden, prompt_hidden_chunks
+        )
 
         assistant_token_ids = self.extract_chunk_token_ids(thinker_chunks)
         assistant_embed = self.load_prompt_token_embeddings(assistant_token_ids)
@@ -257,6 +273,8 @@ class TalkerPrefillBuilder:
             return
 
         metadata = chunk.metadata or {}
+        if "prompt_hidden_positions" in metadata:
+            return
         token_id = metadata.get("token_id")
         if token_id is not None and int(token_id) == self._im_end_token_id:
             return
@@ -299,6 +317,39 @@ class TalkerPrefillBuilder:
             ).unsqueeze(0)
         projected = self._model.text_projection(chunk_tensor)
         return projected[0].detach()
+
+    def place_prompt_hidden_rows(
+        self,
+        request_id: str,
+        prompt_ids: torch.Tensor,
+        prompt_hidden: torch.Tensor,
+        prompt_hidden_chunks: list[Any],
+    ) -> None:
+        multimodal_positions = torch.nonzero(
+            self.build_multimodal_mask(prompt_ids).cpu()
+        ).flatten()
+        filled: set[int] = set()
+        row_norm = 0.0
+        for chunk in prompt_hidden_chunks:
+            positions = torch.tensor(
+                chunk.metadata["prompt_hidden_positions"], dtype=torch.long
+            )
+            rows = chunk.data.to(device=prompt_hidden.device, dtype=prompt_hidden.dtype)
+            prompt_hidden[positions.to(device=prompt_hidden.device)] = rows
+            filled.update(positions.tolist())
+            row_norm = float(rows.float().norm(dim=-1).mean())
+        expected = set(multimodal_positions.tolist())
+        logger.info(
+            "talker prompt hidden rid=%s multimodal_rows=%d filled=%d match=%s "
+            "missing=%d extra=%d row_norm=%.2f",
+            request_id,
+            len(expected),
+            len(filled),
+            filled == expected,
+            len(expected - filled),
+            len(filled - expected),
+            row_norm,
+        )
 
     def build_multimodal_mask(self, token_ids: torch.Tensor) -> torch.Tensor:
         mask = torch.zeros(token_ids.shape[0], dtype=torch.bool, device=self._device)

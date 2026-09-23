@@ -923,7 +923,24 @@ def make_thinker_stream_output_builder(*, speech_enabled: bool):
         # note (ratish): a cross-process stream chunk must be a tensor, and one
         # this small is pickled inline with the control message
         token_tensor = torch.tensor([token_id], dtype=torch.long)
-        return [
+        messages = []
+        prompt_hidden = getattr(req_data.req, "_omni_prompt_hidden", None)
+        if prompt_hidden and "talker_ar" in stream_targets:
+            req_data.req._omni_prompt_hidden = None
+            positions = torch.cat(
+                [chunk_positions for chunk_positions, _ in prompt_hidden]
+            )
+            rows = torch.cat([chunk_rows for _, chunk_rows in prompt_hidden])
+            messages.append(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="stream",
+                    data=rows,
+                    target="talker_ar",
+                    metadata={"prompt_hidden_positions": positions.tolist()},
+                )
+            )
+        messages.extend(
             OutgoingMessage(
                 request_id=request_id,
                 type="stream",
@@ -932,7 +949,8 @@ def make_thinker_stream_output_builder(*, speech_enabled: bool):
                 metadata={"token_id": token_id},
             )
             for target in stream_targets
-        ]
+        )
+        return messages
 
     return _build_stream_output
 

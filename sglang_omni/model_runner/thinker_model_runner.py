@@ -30,11 +30,57 @@ class ThinkerModelRunner(ModelRunner):
         self._embed_tokens = self._text_model.embed_tokens
         self._th_host_bufs = None
         self._th_slot = 0
+        self._prompt_hidden_layer: int | None = None
+        self._prompt_hidden_input: torch.Tensor | None = None
 
         thinker_cfg = tp_worker.model_runner.model_config.hf_config.thinker_config
         self._image_token_id = thinker_cfg.image_token_id
         self._video_token_id = thinker_cfg.video_token_id
         self._audio_token_id = thinker_cfg.audio_token_id
+
+    def install_prompt_hidden_capture(self, layer_id: int) -> None:
+        """Keep the input of decoder layer ``layer_id`` from every prefill forward.
+
+        The talker projects the thinker's layer input at multimodal prompt rows
+        (HF ``hidden_states[layer_id]``: residual included, before the final norm).
+        """
+
+        def capture(module, args, kwargs):
+            del module, kwargs
+            forward_batch = args[2]
+            if not forward_batch.forward_mode.is_extend():
+                return None
+            hidden_states, residual = args[1], args[3]
+            self._prompt_hidden_input = (
+                hidden_states if residual is None else hidden_states + residual
+            )
+            return None
+
+        self._prompt_hidden_layer = layer_id
+        self._text_model.layers[layer_id].register_forward_pre_hook(
+            capture, with_kwargs=True
+        )
+        logger.info("thinker keeps layer %d input at multimodal prompt rows", layer_id)
+
+    def post_prefill(self, result, forward_batch, schedule_batch, requests):
+        layer_input = self._prompt_hidden_input
+        self._prompt_hidden_input = None
+        if self._prompt_hidden_layer is None or layer_input is None:
+            return
+        for req in schedule_batch.reqs:
+            chunk = getattr(req, "_omni_prompt_hidden_chunk", None)
+            if chunk is None:
+                continue
+            req._omni_prompt_hidden_chunk = None
+            batch_rows, prompt_positions = chunk
+            if not batch_rows.numel():
+                continue
+            rows = layer_input[batch_rows.to(device=layer_input.device)].clone()
+            collected = getattr(req, "_omni_prompt_hidden", None)
+            if collected is None:
+                collected = []
+                req._omni_prompt_hidden = collected
+            collected.append((prompt_positions, rows))
 
     def custom_prefill_forward(self, forward_batch, schedule_batch, requests):
         if not schedule_batch.forward_mode.is_extend():
@@ -313,6 +359,15 @@ class ThinkerModelRunner(ModelRunner):
                 if ds_embeds is not None:
                     deepstack_visual_embeds_list.append(ds_embeds)
                     visual_rows.append(visual_pos + start)
+
+            if self._prompt_hidden_layer is not None:
+                chunk_mm_rows = torch.cat(
+                    [chunk_positions[m] for m in ("image", "video", "audio")]
+                ).to(dtype=torch.long)
+                req._omni_prompt_hidden_chunk = (
+                    chunk_mm_rows + start,
+                    chunk_mm_rows + prefix,
+                )
 
             if req.inflight_middle_chunks == 0:
                 req.omni_model_inputs = None

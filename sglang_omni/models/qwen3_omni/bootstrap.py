@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 
@@ -74,6 +75,10 @@ def create_thinker_scheduler(
         model_runner = ThinkerModelRunner(model_worker, output_proc)
     else:
         model_runner = Qwen3OmniThinkerModelRunner(model_worker, output_proc)
+    if speech_enabled and os.environ.get("SGLANG_OMNI_TALKER_PROMPT_HIDDEN") == "1":
+        model_runner.install_prompt_hidden_capture(
+            model_config.hf_config.talker_config.accept_hidden_layer
+        )
 
     tokenizer = get_tokenizer(
         model_config.model_path,
