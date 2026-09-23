@@ -41,7 +41,8 @@ serve() {
   local began=$(date +%s) healthy=0
   for _ in $(seq 360); do
     if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$port/health)" = 200 ]; then healthy=1; break; fi
-    kill -0 -- -"$(cat "$OUT/$label.pgid" 2>/dev/null)" 2>/dev/null || break
+    # the container's pid 1 never reaps, so a dead server group is all zombies
+    ps -o stat= -g "$(cat "$OUT/$label.pgid" 2>/dev/null)" 2>/dev/null | grep -qv '^Z' || break
     sleep 5
   done
   echo "$label healthy=$healthy startup_s $(( $(date +%s) - began )) $(date +%T)" >> "$OUT/progress.txt"
