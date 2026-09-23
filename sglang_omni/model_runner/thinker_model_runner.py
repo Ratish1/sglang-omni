@@ -61,7 +61,9 @@ class ThinkerModelRunner(ModelRunner):
         def capture_embeds(module, args, kwargs):
             del module, kwargs
             if args[2].forward_mode.is_extend():
-                self._prompt_embed_input = args[1]
+                # layer 0 keeps its input as the residual, and later layers add
+                # into that residual in place
+                self._prompt_embed_input = args[1].clone()
             return None
 
         self._prompt_hidden_layer = layer_id
