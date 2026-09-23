@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -338,6 +339,18 @@ class TalkerPrefillBuilder:
             prompt_hidden[positions.to(device=prompt_hidden.device)] = rows
             filled.update(positions.tolist())
             row_norm = float(rows.float().norm(dim=-1).mean())
+        dump_dir = os.environ.get("SGLANG_OMNI_DUMP_PROMPT_HIDDEN")
+        if dump_dir and prompt_hidden_chunks:
+            torch.save(
+                {
+                    "prompt_ids": prompt_ids.cpu(),
+                    "positions": multimodal_positions,
+                    "rows": prompt_hidden[
+                        multimodal_positions.to(device=prompt_hidden.device)
+                    ].cpu(),
+                },
+                os.path.join(dump_dir, f"{request_id}.pt"),
+            )
         expected = set(multimodal_positions.tolist())
         logger.info(
             "talker prompt hidden rid=%s multimodal_rows=%d filled=%d match=%s "
