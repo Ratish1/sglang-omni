@@ -625,7 +625,7 @@ def test_start_profile_step_window_needs_a_stage_and_reaches_every_stage(
 
     app = FastAPI()
     ctl = FakeProfilerControl()
-    launcher._mount_profiler_routes(app, ctl, profiler_dir=str(tmp_path))
+    launcher.mount_profiler_routes(app, ctl, profiler_dir=str(tmp_path))
 
     try:
         with TestClient(app) as client:
