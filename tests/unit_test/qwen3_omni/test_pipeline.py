@@ -929,7 +929,11 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
         "make_thinker_scheduler_adapters",
         lambda **kwargs: (object(), object()),
     )
-    monkeypatch.setattr(request_builders, "make_thinker_stream_output_builder", object)
+    monkeypatch.setattr(
+        request_builders,
+        "make_thinker_stream_output_builder",
+        lambda *, speech_enabled: object(),
+    )
     monkeypatch.setattr(
         sglang_backend, "SGLangOutputProcessor", lambda **kwargs: output_proc
     )
@@ -1046,7 +1050,11 @@ def test_qwen_thinker_enables_and_attests_breakable_prefill_graphs(
         "make_thinker_scheduler_adapters",
         lambda **kwargs: (object(), object()),
     )
-    monkeypatch.setattr(request_builders, "make_thinker_stream_output_builder", object)
+    monkeypatch.setattr(
+        request_builders,
+        "make_thinker_stream_output_builder",
+        lambda *, speech_enabled: object(),
+    )
     monkeypatch.setattr(
         sglang_backend,
         "SGLangOutputProcessor",

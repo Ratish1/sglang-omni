@@ -149,21 +149,26 @@ def test_qwen_missing_output_modalities_uses_speech_active_subgraph():
 
 
 @pytest.mark.parametrize(
-    ("output_modalities", "stream", "expected_targets"),
+    ("speech_enabled", "output_modalities", "stream", "expected_targets"),
     [
-        (["text"], True, ["decode"]),
-        (["text"], False, []),
-        (["text", "audio"], True, ["decode", "talker_ar"]),
-        (["text", "audio"], False, ["talker_ar"]),
-        (None, True, ["decode", "talker_ar"]),
+        (True, ["text"], True, ["decode"]),
+        (True, ["text"], False, []),
+        (True, ["text", "audio"], True, ["decode", "talker_ar"]),
+        (True, ["text", "audio"], False, ["talker_ar"]),
+        (True, None, True, ["decode", "talker_ar"]),
+        (True, None, False, ["talker_ar"]),
+        (False, None, True, ["decode"]),
+        (False, None, False, []),
+        (False, ["text", "audio"], True, ["decode"]),
     ],
 )
 def test_qwen_thinker_stream_builder_sends_the_token_id_to_each_target(
+    speech_enabled: bool,
     output_modalities: list[str] | None,
     stream: bool,
     expected_targets: list[str],
 ):
-    builder = make_thinker_stream_output_builder()
+    builder = make_thinker_stream_output_builder(speech_enabled=speech_enabled)
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=0),
         stage_payload=_thinker_stage_payload(output_modalities, stream=stream),
@@ -188,7 +193,7 @@ def test_qwen_thinker_stream_builder_emits_nothing_without_an_answer_token(
     token_id: int | None,
     inflight_middle_chunks: int,
 ):
-    builder = make_thinker_stream_output_builder()
+    builder = make_thinker_stream_output_builder(speech_enabled=True)
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=inflight_middle_chunks),
         stage_payload=_thinker_stage_payload(["text", "audio"]),
@@ -197,33 +202,39 @@ def test_qwen_thinker_stream_builder_emits_nothing_without_an_answer_token(
     assert builder("req-1", req_data, SimpleNamespace(data=token_id)) == []
 
 
-def test_qwen_talker_prefill_builds_assistant_rows_from_token_ids_only():
-    builder = make_thinker_stream_output_builder()
+class _TokenMetadataOnlyChunk:
+    def __init__(self, message: OutgoingMessage):
+        self.metadata = message.metadata
+
+    @property
+    def data(self):
+        raise AssertionError("the talker must rebuild assistant rows from token ids")
+
+
+def _token_embedding_rows(token_ids: torch.Tensor) -> torch.Tensor:
+    token_ids = token_ids.to(torch.float32)
+    return torch.stack([token_ids, -token_ids], dim=1)
+
+
+def _text_projected(*token_ids: int) -> torch.Tensor:
+    return _token_embedding_rows(torch.tensor(token_ids)) * 2.0
+
+
+def test_qwen_talker_conditions_on_streamed_token_ids():
+    builder = make_thinker_stream_output_builder(speech_enabled=True)
     req_data = SimpleNamespace(
         req=SimpleNamespace(inflight_middle_chunks=0),
-        stage_payload=_thinker_stage_payload(["audio"]),
+        stage_payload=_thinker_stage_payload(["audio"], stream=False),
     )
-    embed = torch.tensor([[7.0, 8.0]])
 
-    messages = builder("req-1", req_data, SimpleNamespace(data=11))
-    talker_chunk = next(msg for msg in messages if msg.target == "talker_ar")
-
-    class _TokenMetadataOnlyChunk:
-        metadata = talker_chunk.metadata
-
-        @property
-        def data(self):
-            raise AssertionError("prompt prefill must reconstruct assistant rows")
-
-    embedded_token_ids: list[list[int]] = []
-
-    def load_prompt_token_embeddings(token_ids: torch.Tensor) -> torch.Tensor:
-        embedded_token_ids.append(token_ids.tolist())
-        return embed
+    def talker_chunk(token_id: int) -> _TokenMetadataOnlyChunk:
+        (message,) = builder("req-1", req_data, SimpleNamespace(data=token_id))
+        assert message.target == "talker_ar"
+        return _TokenMetadataOnlyChunk(message)
 
     prefill_builder = object.__new__(TalkerPrefillBuilder)
     prefill_builder._model = SimpleNamespace(
-        text_projection=lambda tensor: tensor,
+        text_projection=lambda tensor: tensor * 2.0,
         hidden_projection=lambda tensor: tensor + 100.0,
         get_input_embeddings=lambda: (
             lambda token_ids: torch.zeros((token_ids.numel(), 2))
@@ -247,8 +258,8 @@ def test_qwen_talker_prefill_builds_assistant_rows_from_token_ids_only():
     prefill_builder._tts_pad_token_id = 6
     prefill_builder._speaker_map = {}
 
-    prompt_ids = torch.tensor([10, 20, 30, 10, 40], dtype=torch.long)
-    prompt_embed = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+    prompt_ids = torch.tensor([10, 20, 30, 31, 10, 40, 41], dtype=torch.long)
+    prompt_embed = _token_embedding_rows(prompt_ids)
     prompt_hidden = prompt_embed.clone()
     prompt_hidden[2] = torch.tensor([5.0, 6.0])
     prefill_builder.reconstruct_prompt_states = lambda _state: (
@@ -257,26 +268,55 @@ def test_qwen_talker_prefill_builds_assistant_rows_from_token_ids_only():
         prompt_hidden,
         {},
     )
-    prefill_builder.load_prompt_token_embeddings = load_prompt_token_embeddings
-    zero_special = torch.zeros((1, 2), dtype=torch.float32)
-    prefill_builder.get_tts_special_embeds = lambda: (
-        zero_special,
-        zero_special,
-        zero_special,
-    )
+    prefill_builder.load_prompt_token_embeddings = _token_embedding_rows
+    tts_bos = torch.tensor([[1000.0, 1000.0]])
+    tts_eos = torch.tensor([[2000.0, 2000.0]])
+    tts_pad = torch.tensor([[3000.0, 3000.0]])
+    prefill_builder.get_tts_special_embeds = lambda: (tts_bos, tts_eos, tts_pad)
 
     payload = StagePayload(
         request_id="req-1",
         request=OmniRequest(inputs=[], params={}),
         data={},
     )
-    prefill_builder.build_prompt_prefill(
+    prefill = prefill_builder.build_prompt_prefill(
         payload,
-        [_TokenMetadataOnlyChunk()],
-        thinker_done=True,
+        [talker_chunk(11), talker_chunk(12), talker_chunk(13)],
+        thinker_done=False,
     )
 
-    assert embedded_token_ids == [[11]]
+    expected_user_rows = torch.cat(
+        [_text_projected(10, 20), torch.tensor([[105.0, 106.0]]), _text_projected(31)]
+    )
+    expected_assistant_rows = torch.cat(
+        [
+            _text_projected(10, 40, 41),
+            tts_pad.expand(4, -1),
+            tts_bos,
+            _text_projected(11),
+        ]
+    )
+    assert torch.equal(
+        prefill["input_embeds"],
+        torch.cat([expected_user_rows, expected_assistant_rows]),
+    )
+    assert torch.equal(
+        torch.stack(list(prefill["pending_text_queue"])), _text_projected(12, 13)
+    )
+
+    talker_req_data = SimpleNamespace(
+        thinker_chunks_done=False,
+        pending_text_queue=prefill["pending_text_queue"],
+        tts_eos_embed=prefill["tts_eos_embed"],
+    )
+    prefill_builder.append_text_chunk(talker_req_data, talker_chunk(14))
+    prefill_builder.append_text_chunk(talker_req_data, talker_chunk(99))
+    prefill_builder.mark_thinker_done(talker_req_data)
+
+    assert torch.equal(
+        torch.stack(list(talker_req_data.pending_text_queue)),
+        torch.cat([_text_projected(12, 13, 14), tts_eos]),
+    )
 
 
 def test_qwen_hidden_states_skip_only_explicit_text_output_requests():
