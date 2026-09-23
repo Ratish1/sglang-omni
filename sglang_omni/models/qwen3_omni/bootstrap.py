@@ -85,7 +85,9 @@ def create_thinker_scheduler(
         vocab_size=model_config.vocab_size,
         thinker_config=thinker_config,
     )
-    stream_output_builder = make_thinker_stream_output_builder()
+    stream_output_builder = make_thinker_stream_output_builder(
+        speech_enabled=speech_enabled
+    )
 
     return OmniScheduler(
         tp_worker=model_worker,

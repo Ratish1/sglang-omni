@@ -899,7 +899,7 @@ def apply_thinker_result(
     return thinker_out
 
 
-def make_thinker_stream_output_builder():
+def make_thinker_stream_output_builder(*, speech_enabled: bool):
     def _build_stream_output(
         request_id: str, req_data: Any, req_output: Any
     ) -> list[OutgoingMessage]:
@@ -908,13 +908,18 @@ def make_thinker_stream_output_builder():
         if req_data.req.inflight_middle_chunks > 0 or req_output.data is None:
             return []
 
-        token_id = int(req_output.data)
         stage_payload = req_data.stage_payload
-        targets: list[str] = []
+        stream_targets: list[str] = []
         if (stage_payload.request.params or {}).get("stream", False):
-            targets.append("decode")
-        if should_generate_audio_output(stage_payload):
-            targets.append("talker_ar")
+            stream_targets.append("decode")
+        # note (ratish): a request without output modalities defaults to audio,
+        # and a text-only deployment has no talker to receive it
+        if speech_enabled and should_generate_audio_output(stage_payload):
+            stream_targets.append("talker_ar")
+        if not stream_targets:
+            return []
+
+        token_id = int(req_output.data)
         # note (ratish): a cross-process stream chunk must be a tensor, and one
         # this small is pickled inline with the control message
         token_tensor = torch.tensor([token_id], dtype=torch.long)
@@ -926,7 +931,7 @@ def make_thinker_stream_output_builder():
                 target=target,
                 metadata={"token_id": token_id},
             )
-            for target in targets
+            for target in stream_targets
         ]
 
     return _build_stream_output
