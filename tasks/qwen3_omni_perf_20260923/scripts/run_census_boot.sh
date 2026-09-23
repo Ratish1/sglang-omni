@@ -15,7 +15,7 @@ esac
 SERVE_ARGS="--config $CONFIG --colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
 STACK=""
 if [ "$MODE" = mapping ]; then
-  SERVE_ARGS="$SERVE_ARGS --thinker.engine.disable_cuda_graph true --talker_ar.engine.disable_cuda_graph true --code2wav.factory.enable_cuda_graph false --audio_encoder.factory.enable_layer_cuda_graph false"
+  SERVE_ARGS="$SERVE_ARGS --thinker.engine.disable_cuda_graph true --thinker.engine.cuda_graph_backend_prefill disabled --talker_ar.engine.disable_cuda_graph true --code2wav.factory.enable_cuda_graph false --audio_encoder.factory.enable_layer_cuda_graph false"
   STACK=--with-stack
 fi
 URL=http://127.0.0.1:$PORT
