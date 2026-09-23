@@ -89,7 +89,6 @@ class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
         seq_lens = forward_batch.seq_lens
         prefix_lens = forward_batch.extend_prefix_lens
         wrappers = self.prefill_wrappers_paged
-        kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
         cached_left_pad_lens = torch.tensor(
             cached_pad_lens, dtype=seq_lens.dtype, device=seq_lens.device
         )
@@ -141,7 +140,6 @@ class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
                 False,
                 None,
                 fixed_split_size=self.prefill_split_tile_size,
-                kv_view=kv_view,
             )
             cfg_prefill_wrapper.begin_forward(
                 qo_indptr,
@@ -174,7 +172,6 @@ class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
                 True,
                 None,
                 fixed_split_size=self.prefill_split_tile_size,
-                kv_view=kv_view,
             )
 
         self.forward_metadata = PrefillMetadata(

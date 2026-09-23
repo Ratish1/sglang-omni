@@ -5,10 +5,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace as NS
+from unittest.mock import create_autospec
 
 import pytest
 import torch
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.layers.attention.flashinfer_backend import (
+    FlashInferIndicesUpdaterPrefill,
+)
 
 import sglang_omni.models.llada2_uni.cfg_attention_backend as cfg_attention_backend
 from sglang_omni.models.llada2_uni.low_confidence_cfg import LowConfidenceCFG
@@ -191,13 +195,11 @@ def test_attention_masks_local_and_cached_padding() -> None:
     backend.cfg_prefill_wrapper_ragged = RaggedWrapperStub()
     backend.prefill_wrappers_paged = [object()]
     backend.prefill_split_tile_size = None
-    calls = []
-    kv_view = object()
-    backend.kv_index_translator = NS(
-        index_table_for_batch=lambda _batch: kv_view,
-    )
+    begin_forward = create_autospec(
+        FlashInferIndicesUpdaterPrefill, instance=True
+    ).call_begin_forward
     backend.indices_updater_prefill = NS(
-        call_begin_forward=lambda *args, **kwargs: calls.append((args, kwargs)),
+        call_begin_forward=begin_forward,
         kv_indptr=[None],
         qo_indptr=[None],
         num_qo_heads=1,
@@ -219,10 +221,9 @@ def test_attention_masks_local_and_cached_padding() -> None:
 
     backend.init_forward_metadata(batch)
 
-    args, kwargs = calls[-1]
+    args = begin_forward.call_args.args
     assert args[3].tolist() == [4, 0]
     assert args[7].tolist() == [0, 4]
-    assert kwargs["kv_view"] is kv_view
     mask = backend.cfg_prefill_wrapper_ragged.plan[1]["custom_mask"].reshape(2, 4, 4)
     assert mask[0].all()
     assert not mask[1, 2:, :2].any()
@@ -234,7 +235,7 @@ def test_attention_masks_local_and_cached_padding() -> None:
     batch.extend_prefix_lens += 4
     backend.init_forward_metadata(batch)
     assert not backend.cfg_local_left_pad_active
-    assert calls[-1][0][3].tolist() == [8, 2]
+    assert begin_forward.call_args.args[3].tolist() == [8, 2]
 
 
 @pytest.mark.parametrize("cached", [False, True])
