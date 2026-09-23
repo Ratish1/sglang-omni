@@ -87,7 +87,7 @@ def prefill_prompts(args: argparse.Namespace, count: int) -> list[dict]:
 
 def request_body(args: argparse.Namespace, base: dict) -> dict:
     body = {"model": args.model, "stream": True, "temperature": 0.0, **base}
-    speech = args.stage == "talker_ar"
+    speech = args.stage == "talker_ar" or args.speech
     body["modalities"] = ["text", "audio"] if speech else ["text"]
     if speech:
         body["audio"] = {"format": "wav"}
@@ -169,8 +169,9 @@ async def post(
 
 
 async def run(args: argparse.Namespace) -> None:
-    speech = args.stage == "talker_ar"
-    name = f"{args.stage}_{args.kind}_{args.modality}"
+    count_audio = args.stage == "talker_ar"
+    output = "speech" if args.stage == "talker_ar" or args.speech else "text"
+    name = f"{args.stage}_{args.kind}_{args.modality}_{output}"
     trace_dir = Path(args.out).resolve() / args.label / name / f"b{args.batch}"
     trace_dir.mkdir(parents=True, exist_ok=False)
     arm = {
@@ -185,6 +186,7 @@ async def run(args: argparse.Namespace) -> None:
         "stage": args.stage,
         "kind": args.kind,
         "modality": args.modality,
+        "output": output,
         "batch": args.batch,
         "steps": args.steps,
         "warmup": args.warmup,
@@ -205,7 +207,7 @@ async def run(args: argparse.Namespace) -> None:
                 await asyncio.gather(
                     *(
                         stream_one(
-                            session, args.url, request_body(args, b), 0, None, speech
+                            session, args.url, request_body(args, b), 0, None, count_audio
                         )
                         for b in warmup[start : start + args.batch]
                     )
@@ -219,7 +221,7 @@ async def run(args: argparse.Namespace) -> None:
                     await asyncio.gather(
                         *(
                             stream_one(
-                                session, args.url, request_body(args, b), 0, None, speech
+                                session, args.url, request_body(args, b), 0, None, count_audio
                             )
                             for b in captured[start : start + args.batch]
                         )
@@ -236,7 +238,7 @@ async def run(args: argparse.Namespace) -> None:
                         request_body(args, base),
                         args.warmup,
                         event,
-                        speech,
+                        count_audio,
                     )
                 )
                 for event in ready
@@ -248,7 +250,7 @@ async def run(args: argparse.Namespace) -> None:
                     session, args.url, "/start_profile", arm
                 )
             records = list(await asyncio.gather(*tasks))
-            if not speech:
+            if not count_audio:
                 workload["client_ms_per_text_chunk"] = text_cadence_ms(records)
         if not args.no_capture:
             # a window with no forward after its last one never closes itself;
@@ -337,6 +339,9 @@ def main() -> None:
     parser.add_argument("--with-stack", action="store_true")
     parser.add_argument("--record-shapes", action="store_true")
     parser.add_argument("--no-capture", action="store_true")
+    parser.add_argument(
+        "--speech", action="store_true", help="thinker requests also ask for audio"
+    )
     args = parser.parse_args()
     if args.kind == "prefill" and args.modality != "text" and not args.media_list:
         parser.error("--media-list is required for media prefill")

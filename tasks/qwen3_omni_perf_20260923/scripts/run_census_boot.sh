@@ -2,8 +2,9 @@
 # One census boot of a Qwen3-Omni tree on one card: colocated server, GPU memory log, the
 # fixed capture list of omni_captures.py, the step ledger on every trace, teardown.
 # MODE formal serves the shipped config; MODE mapping turns every CUDA graph off and
-# records python stacks, so each kernel maps to its launch line.
-# usage: run_census_boot.sh <tree> <out dir> <card> <port> <bf16|fp8> <formal|mapping>
+# records python stacks, so each kernel maps to its launch line. MODE speech serves the
+# shipped config and captures thinker decode with and without audio output.
+# usage: run_census_boot.sh <tree> <out dir> <card> <port> <bf16|fp8> <formal|mapping|speech>
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 DTYPE=$5 MODE=$6
 S=$(cd "$(dirname "$0")" && pwd)
@@ -72,19 +73,30 @@ capture() {
   echo "end $name rc=$? $(date +%T)" >> "$OUT/progress.txt"
 }
 
-if [ "$MODE" = formal ]; then
-  capture uncaptured_td_b16_1 --stage thinker --kind decode --batch 16 --label uncaptured1 --no-capture
-  capture uncaptured_td_b1 --stage thinker --kind decode --batch 1 --label uncaptured --no-capture
-fi
 L=$MODE
-capture td_b1 --stage thinker --kind decode --batch 1 --label $L $STACK
-capture td_b16 --stage thinker --kind decode --batch 16 --label $L $STACK
-capture tp_b1 --stage thinker --kind prefill --batch 1 --label $L $STACK
-capture kd_b1 --stage talker_ar --kind decode --batch 1 --warmup 1 --label $L $STACK
-capture kd_b16 --stage talker_ar --kind decode --batch 16 --warmup 1 --label $L $STACK
-capture kp_b1 --stage talker_ar --kind prefill --batch 1 --max-tokens 8 --label $L $STACK
-if [ "$MODE" = formal ]; then
-  capture uncaptured_td_b16_2 --stage thinker --kind decode --batch 16 --label uncaptured2 --no-capture
+if [ "$MODE" = speech ]; then
+  # thinker decode of requests that also ask for audio, against the same text-only batch
+  for pass in 1 2; do
+    capture uncaptured_tds_b16_$pass --stage thinker --kind decode --batch 16 --speech --max-tokens 512 --label uncaptured$pass --no-capture
+    capture uncaptured_td_b16_$pass --stage thinker --kind decode --batch 16 --max-tokens 512 --label uncaptured$pass --no-capture
+  done
+  capture tds_b4 --stage thinker --kind decode --batch 4 --speech --max-tokens 512 --label $L
+  capture tds_b16 --stage thinker --kind decode --batch 16 --speech --max-tokens 512 --label $L
+  capture td_b16 --stage thinker --kind decode --batch 16 --max-tokens 512 --label $L
+else
+  if [ "$MODE" = formal ]; then
+    capture uncaptured_td_b16_1 --stage thinker --kind decode --batch 16 --label uncaptured1 --no-capture
+    capture uncaptured_td_b1 --stage thinker --kind decode --batch 1 --label uncaptured --no-capture
+  fi
+  capture td_b1 --stage thinker --kind decode --batch 1 --label $L $STACK
+  capture td_b16 --stage thinker --kind decode --batch 16 --label $L $STACK
+  capture tp_b1 --stage thinker --kind prefill --batch 1 --label $L $STACK
+  capture kd_b1 --stage talker_ar --kind decode --batch 1 --warmup 1 --label $L $STACK
+  capture kd_b16 --stage talker_ar --kind decode --batch 16 --warmup 1 --label $L $STACK
+  capture kp_b1 --stage talker_ar --kind prefill --batch 1 --max-tokens 8 --label $L $STACK
+  if [ "$MODE" = formal ]; then
+    capture uncaptured_td_b16_2 --stage thinker --kind decode --batch 16 --label uncaptured2 --no-capture
+  fi
 fi
 
 grep -m1 "Torch profiler armed" "$OUT/serve.log" > "$OUT/armed_marker.txt"
