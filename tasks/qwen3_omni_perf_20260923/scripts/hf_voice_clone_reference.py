@@ -53,7 +53,7 @@ def load_model():
     return processor, model
 
 
-def build_inputs(processor, model, sample):
+def build_inputs(processor, model, sample, waveform=None):
     import librosa
 
     conversation = [
@@ -68,7 +68,8 @@ def build_inputs(processor, model, sample):
     text = processor.apply_chat_template(
         conversation, add_generation_prompt=True, tokenize=False
     )
-    waveform, _ = librosa.load(sample.ref_audio, sr=AUDIO_SAMPLE_RATE)
+    if waveform is None:
+        waveform, _ = librosa.load(sample.ref_audio, sr=AUDIO_SAMPLE_RATE)
     inputs = processor(text=text, audio=[waveform], return_tensors="pt", padding=True)
     inputs = inputs.to(model.device)
     inputs["input_features"] = inputs["input_features"].to(model.dtype)
@@ -212,6 +213,69 @@ def layers(dump_dir: str) -> None:
 
 
 @torch.no_grad()
+def frontend(dump_dir: str) -> None:
+    """HF thinker layer 0 audio rows from omni's waveform loader against librosa's."""
+    import librosa
+
+    from sglang_omni.preprocessing.audio import load_audio_path
+
+    processor, model = load_model()
+    samples = seedtts_samples(None)
+    for talker_dump_path in sorted(Path(dump_dir).glob("*.pt")):
+        if talker_dump_path.name.startswith("thinker_"):
+            continue
+        thinker_dump = torch.load(
+            next(Path(dump_dir).glob(f"thinker_{talker_dump_path.stem}_0.pt"))
+        )
+        talker_dump = torch.load(talker_dump_path)
+        prompt_text = processor.tokenizer.decode(talker_dump["prompt_ids"])
+        sample = next(
+            s
+            for s in samples
+            if s.target_text in prompt_text and s.ref_text in prompt_text
+        )
+        omni_waveform = load_audio_path(sample.ref_audio, target_sr=AUDIO_SAMPLE_RATE)
+        librosa_waveform, _ = librosa.load(sample.ref_audio, sr=AUDIO_SAMPLE_RATE)
+        length = min(omni_waveform.shape[0], librosa_waveform.shape[0])
+        waveform_relative = float(
+            torch.tensor(omni_waveform[:length] - librosa_waveform[:length]).norm()
+            / torch.tensor(librosa_waveform[:length]).norm()
+        )
+        print(
+            f"{sample.sample_id}: samples omni {omni_waveform.shape[0]} librosa "
+            f"{librosa_waveform.shape[0]}, waveform relative diff {waveform_relative:.4f}"
+        )
+        positions = talker_dump["positions"]
+        omni_rows = thinker_dump["layer0"][positions]
+        for loader, waveform in (
+            ("omni", omni_waveform),
+            ("librosa", librosa_waveform),
+        ):
+            inputs = build_inputs(processor, model, sample, waveform)
+            if not torch.equal(inputs["input_ids"][0].cpu(), talker_dump["prompt_ids"]):
+                print(f"  hf on {loader} waveform: prompt ids differ, skipped")
+                continue
+            thinker_inputs = {
+                key: inputs[key]
+                for key in (
+                    "input_ids",
+                    "attention_mask",
+                    "input_features",
+                    "feature_attention_mask",
+                )
+                if key in inputs
+            }
+            hidden_states = model.thinker(
+                **thinker_inputs, output_hidden_states=True
+            ).hidden_states
+            hf_rows = hidden_states[0][0].float().cpu()[positions]
+            print(
+                f"  hf on {loader:7s} waveform vs omni layer 0 audio rows: "
+                f"{row_agreement(hf_rows, omni_rows)}"
+            )
+
+
+@torch.no_grad()
 def generate(count: int | None, out: str, shard: int, num_shards: int) -> None:
     import soundfile
 
@@ -267,7 +331,9 @@ def merge(out: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("parity", "layers", "generate", "merge"))
+    parser.add_argument(
+        "mode", choices=("parity", "layers", "frontend", "generate", "merge")
+    )
     parser.add_argument("--dump-dir")
     parser.add_argument("--samples", type=int, help="first N samples; unset is all")
     parser.add_argument("--shard", type=int, default=0)
@@ -278,6 +344,8 @@ def main() -> None:
         parity(args.dump_dir)
     elif args.mode == "layers":
         layers(args.dump_dir)
+    elif args.mode == "frontend":
+        frontend(args.dump_dir)
     elif args.mode == "generate":
         generate(args.samples, args.out, args.shard, args.num_shards)
     else:
