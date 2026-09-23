@@ -619,7 +619,7 @@ def test_asr_engine_builder_phase_order_and_failure_cleanup(monkeypatch) -> None
         )
 
     def fake_output_processor(**kwargs: Any) -> Any:
-        assert isinstance(kwargs["model"], FakeModel)
+        assert kwargs == {}
         events.append("output_processor")
         return object()
 
