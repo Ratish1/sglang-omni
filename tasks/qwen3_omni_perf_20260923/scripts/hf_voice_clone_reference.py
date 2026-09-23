@@ -64,7 +64,9 @@ def build_inputs(processor, model, sample):
     )
     waveform, _ = librosa.load(sample.ref_audio, sr=AUDIO_SAMPLE_RATE)
     inputs = processor(text=text, audio=[waveform], return_tensors="pt", padding=True)
-    return inputs.to(model.device)
+    inputs = inputs.to(model.device)
+    inputs["input_features"] = inputs["input_features"].to(model.dtype)
+    return inputs
 
 
 def seedtts_samples(count: int | None):
