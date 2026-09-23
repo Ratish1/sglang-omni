@@ -15,6 +15,9 @@ case $DTYPE in
 esac
 SERVE_ARGS="--config $CONFIG --colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768 ${EXTRA_SERVE_ARGS:-}"
 ASR_MODEL=Qwen/Qwen3-ASR-1.7B
+# PIN_CPUS (e.g. 0-15,64-79) runs the server, the benchmark client and the scorer on those
+# cores with memory on NUMA node 0, so the two arms of a pair get identical, disjoint CPU
+PIN=${PIN_CPUS:+numactl --physcpubind=$PIN_CPUS --membind=0}
 mkdir -p "$OUT"
 cd "$TREE" || exit 1
 
@@ -24,6 +27,7 @@ git -C "$TREE" status --short > "$OUT/tree_status.txt"
 CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 -c "import sglang_omni, sglang; print(sglang_omni.__file__, sglang.__version__)" > "$OUT/import_path.txt" 2>&1
 md5sum "$S/run_bench.py" "$0" > "$OUT/md5.txt"
 echo "$SERVE_ARGS" > "$OUT/serve_args.txt"
+echo "cpu pin: ${PIN:-none}" >> "$OUT/progress.txt"
 nvidia-smi > "$OUT/gpus_before.txt"
 nvidia-smi dmon -i "$CARD" -s pucvm -d 1 > "$OUT/dmon.log" 2>&1 &
 DMON_PID=$!
@@ -37,7 +41,7 @@ LOAD_PID=$!
 serve() {
   local label=$1 model=$2 port=$3; shift 3
   setsid bash -c "echo \$\$ > $OUT/$label.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE \
-    python3 -u -m sglang_omni.cli serve --model-path $model $* --host 127.0.0.1 --port $port" > "$OUT/$label.log" 2>&1 &
+    $PIN python3 -u -m sglang_omni.cli serve --model-path $model $* --host 127.0.0.1 --port $port" > "$OUT/$label.log" 2>&1 &
   local began=$(date +%s) healthy=0
   for _ in $(seq 360); do
     if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$port/health)" = 200 ]; then healthy=1; break; fi
@@ -64,7 +68,7 @@ stop() {
 if serve serve "$MODEL" "$PORT" $SERVE_ARGS; then
   for arm in $ARMS; do
     echo "gen $arm start $(date +%T)" >> "$OUT/progress.txt"
-    CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" gen --arm "$arm" --port "$PORT" --concurrency "$CONC" --out "$OUT" \
+    CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$arm" --port "$PORT" --concurrency "$CONC" --out "$OUT" \
       > "$OUT/gen_$arm.log" 2>&1
     echo "gen $arm rc $? $(date +%T)" >> "$OUT/progress.txt"
   done
@@ -82,7 +86,7 @@ if [ "${SCORE:-0}" = 1 ] && [ -n "$SPEECH" ] && [ ! -f "$OUT/FAILED" ]; then
   if serve asr "$ASR_MODEL" $((PORT + 100)); then
     for arm in $SPEECH; do
       echo "score $arm start $(date +%T)" >> "$OUT/progress.txt"
-      CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" score --arm "$arm" --asr-port $((PORT + 100)) --out "$OUT" \
+      CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" score --arm "$arm" --asr-port $((PORT + 100)) --out "$OUT" \
         > "$OUT/score_$arm.log" 2>&1
       echo "score $arm rc $? $(date +%T)" >> "$OUT/progress.txt"
     done
@@ -90,7 +94,7 @@ if [ "${SCORE:-0}" = 1 ] && [ -n "$SPEECH" ] && [ ! -f "$OUT/FAILED" ]; then
   stop asr
   # the similarity model needs the card the ASR server held
   if [ -d "$OUT/seedtts_en" ]; then
-    CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" sim --arm seedtts_en --out "$OUT" \
+    CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" sim --arm seedtts_en --out "$OUT" \
       > "$OUT/sim_seedtts_en.log" 2>&1
     echo "sim seedtts_en rc $? $(date +%T)" >> "$OUT/progress.txt"
   fi
