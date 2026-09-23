@@ -41,10 +41,6 @@ def create_thinker_scheduler(
     from sglang_omni.scheduling.sglang_backend import SGLangOutputProcessor
     from sglang_omni.utils import cuda_graph_batch_validator
 
-    # The talker rebuilds every generated assistant row from the sampled
-    # token_id, so the thinker streams token ids only and installs no auxiliary
-    # hidden capture. Prompt multimodal conditioning is unaffected: it reaches
-    # the talker through StagePayload, not through this capture.
     prefill_graph_backend = get_prefill_cuda_graph_backend(server_args)
     enable_prefill_input_embeds = prefill_graph_backend == CudaGraphBackend.BREAKABLE
 
@@ -181,11 +177,7 @@ def create_talker_scheduler(
         # prefill graphs later cannot silently miss the embeds view.
         init_sglang_cuda_graphs(model_worker)
 
-    output_proc = SGLangOutputProcessor(
-        capture_hidden=False,
-        capture_hidden_layers=None,
-        model=model_worker.model_runner.model,
-    )
+    output_proc = SGLangOutputProcessor()
 
     tokenizer = get_tokenizer(
         model_config.model_path,
@@ -206,7 +198,6 @@ def create_talker_scheduler(
         model=model_worker.model_runner.model,
         model_path=model_config.model_path,
         thinker_config=thinker_config,
-        required_aux_hidden_key=talker_config.accept_hidden_layer,
         codec_bos_id=talker_config.codec_bos_id,
         codec_eos_id=talker_config.codec_eos_token_id,
         codec_nothink_id=talker_config.codec_nothink_id,

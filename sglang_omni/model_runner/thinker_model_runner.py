@@ -54,23 +54,6 @@ class ThinkerModelRunner(ModelRunner):
             )
         return None
 
-    # note (jingwen): thinker streaming captures hidden states through local
-    # forward hooks; both SGLang hooks must return NULL because LAST can disable
-    # CUDA-graph replay.
-    def requested_capture_hidden_mode_prefill(
-        self, schedule_batch: Any, requests: list
-    ):
-        del schedule_batch, requests
-        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-
-        return CaptureHiddenMode.NULL
-
-    def requested_capture_hidden_mode_decode(self, schedule_batch: Any, requests: list):
-        del schedule_batch, requests
-        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-
-        return CaptureHiddenMode.NULL
-
     # ------------------------------------------------------------------
     # Multimodal embedding injection
     # ------------------------------------------------------------------
@@ -409,39 +392,24 @@ class ThinkerModelRunner(ModelRunner):
         )
 
     def lookahead_eligible(self, batch: Any) -> bool:
-        """Reject batches whose state would diverge under one-step lookahead.
-
-        Audio can overwrite hidden-state capture before resolve; stateful or
-        unsupported sampling options use the synchronous path for parity.
-        """
-        from sglang_omni.models.qwen3_omni.request_builders import (
-            should_generate_audio_output,
-        )
-
+        """Keep a batch synchronous where the one-step lag would change its outputs."""
         for req in batch.reqs:
-            # note (jiaxin deng): fail closed if the request data is missing or None
-            # so a hidden-capture batch can never slip onto the async path.
-            try:
-                data = req._omni_data
-            except AttributeError:
-                data = None
-            if data is None or should_generate_audio_output(data.stage_payload):
+            request_data = req._omni_data
+            if request_data.return_logprob:
                 return False
-            try:
-                needs_logprob = data.return_logprob
-            except AttributeError:
-                needs_logprob = False
-            if needs_logprob:
+            # note (ratish): the next launch replays the graph over this step's
+            # hidden states before resolve reads them
+            if self.output_processor.emits_hidden_states(request_data):
                 return False
-            sp = req.sampling_params
+            sampling_params = req.sampling_params
             if (
-                sp.repetition_penalty != 1.0
-                or sp.presence_penalty != 0.0
-                or sp.frequency_penalty != 0.0
-                or sp.min_new_tokens > 0
-                or sp.sampling_seed is not None
-                or sp.logit_bias is not None
-                or sp.custom_params
+                sampling_params.repetition_penalty != 1.0
+                or sampling_params.presence_penalty != 0.0
+                or sampling_params.frequency_penalty != 0.0
+                or sampling_params.min_new_tokens > 0
+                or sampling_params.sampling_seed is not None
+                or sampling_params.logit_bias is not None
+                or sampling_params.custom_params
             ):
                 return False
         return True

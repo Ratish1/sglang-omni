@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
     from sglang_omni.scheduling.omni_scheduler import OmniScheduler
-    from sglang_omni.scheduling.types import SchedulerRequest
+    from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 
 
 def create_talker_scheduler(
@@ -75,11 +75,7 @@ def create_talker_scheduler(
     if want_cuda_graph:
         init_sglang_cuda_graphs(model_worker)
 
-    output_proc = SGLangOutputProcessor(
-        capture_hidden=False,
-        capture_hidden_layers=None,
-        model=model,
-    )
+    output_proc = SGLangOutputProcessor()
     model_runner = MiniCPMOTalkerModelRunner(model_worker, output_proc)
 
     tokenizer = get_tokenizer(model_config.model_path, trust_remote_code=True)
@@ -179,13 +175,11 @@ def create_thinker_scheduler(
         model_config,
     ) = infrastructure
 
-    def _should_emit_hidden(request: SchedulerRequest) -> bool:
-        return should_generate_audio_output(request.data.stage_payload)
+    def _should_emit_hidden(request_data: SGLangARRequestData) -> bool:
+        return should_generate_audio_output(request_data.stage_payload)
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=speech_enabled,
-        capture_hidden_layers=None,
-        model=None,
         should_emit_hidden=_should_emit_hidden if speech_enabled else None,
     )
     model_runner = MiniCPMOThinkerModelRunner(model_worker, output_proc)
