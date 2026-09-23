@@ -4,6 +4,7 @@
 # group; then, with SCORE=1, a Qwen3-ASR server on the same card and run_bench.py score
 # for every arm that has speech. pids seen on the card are logged every 2 s; a second pid
 # while the omni server runs voids the boot.
+# MAX_SAMPLES=N runs the first N samples of every arm (identity smokes); unset is the full corpus.
 # usage: run_bench_boot.sh <tree> <out dir> <card> <port> <bf16|fp8> <concurrency> "<arm> <arm> ..."
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 DTYPE=$5 CONC=$6 ARMS=$7
@@ -68,7 +69,7 @@ stop() {
 if serve serve "$MODEL" "$PORT" $SERVE_ARGS; then
   for arm in $ARMS; do
     echo "gen $arm start $(date +%T)" >> "$OUT/progress.txt"
-    CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$arm" --port "$PORT" --concurrency "$CONC" --out "$OUT" \
+    CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$arm" --port "$PORT" --concurrency "$CONC" --out "$OUT" ${MAX_SAMPLES:+--max-samples $MAX_SAMPLES} \
       > "$OUT/gen_$arm.log" 2>&1
     echo "gen $arm rc $? $(date +%T)" >> "$OUT/progress.txt"
   done

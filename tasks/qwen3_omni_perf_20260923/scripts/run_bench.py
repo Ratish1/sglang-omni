@@ -39,7 +39,9 @@ SEEDTTS_META = "zhaochenyang20/seed-tts-eval-arrow"
 VIDEO_ARGS = dict(video_fps=2, video_max_frames=128, video_max_pixels=401408)
 
 
-def mmsu_args(port: int, out: str, concurrency: int, talker: bool) -> argparse.Namespace:
+def mmsu_args(
+    port: int, out: str, concurrency: int, talker: bool, max_samples: int | None
+) -> argparse.Namespace:
     from tests.test_model.test_qwen3_omni_mmsu_talker_ci import MMSU_TTS_PROMPT
 
     return argparse.Namespace(
@@ -49,7 +51,7 @@ def mmsu_args(port: int, out: str, concurrency: int, talker: bool) -> argparse.N
         model=MODEL,
         modalities="text+audio" if talker else "text",
         output_dir=out,
-        max_samples=None,
+        max_samples=max_samples,
         task_names=None,
         categories=None,
         prompt=MMSU_TTS_PROMPT if talker else None,
@@ -69,7 +71,9 @@ def mmsu_args(port: int, out: str, concurrency: int, talker: bool) -> argparse.N
     )
 
 
-async def generate(arm: str, port: int, out: str, concurrency: int) -> dict:
+async def generate(
+    arm: str, port: int, out: str, concurrency: int, max_samples: int | None
+) -> dict:
     talker = arm.endswith("_talker")
     if arm == "seedtts_en":
         from benchmarks.eval.benchmark_omni_seedtts import (
@@ -88,6 +92,7 @@ async def generate(arm: str, port: int, out: str, concurrency: int) -> dict:
             output_dir=out,
             warmup=1,
             max_concurrency=concurrency,
+            max_samples=max_samples,
             disable_tqdm=True,
         )
         return await run_omni_seedtts_benchmark(config)
@@ -107,13 +112,14 @@ async def generate(arm: str, port: int, out: str, concurrency: int) -> dict:
             enable_audio=talker,
             max_tokens=256 if talker else 2048,
             prompt_override=MMMU_TTS_PROMPT if talker else None,
+            max_samples=max_samples,
         )
         return await run_mmmu_eval(config, compute_wer=False)
     if arm.startswith("mmsu"):
         from benchmarks.eval.benchmark_omni_mmsu import run as run_mmsu
 
         return await run_mmsu(
-            mmsu_args(port, out, concurrency, talker), compute_wer=False
+            mmsu_args(port, out, concurrency, talker, max_samples), compute_wer=False
         )
     from benchmarks.eval.benchmark_omni_videomme import VideoEvalConfig, run_video_eval
 
@@ -128,6 +134,7 @@ async def generate(arm: str, port: int, out: str, concurrency: int) -> dict:
         timeout_s=TIMEOUT_S,
         enable_audio=talker,
         max_tokens=256,
+        max_samples=max_samples,
         **VIDEO_ARGS,
     )
     if arm.startswith("videoamme"):
@@ -141,7 +148,9 @@ async def generate(arm: str, port: int, out: str, concurrency: int) -> dict:
             SHORT_ANSWER_PROMPT,
         )
 
-        samples = load_videomme_samples(repo_id=None, split="test", max_samples=None)
+        samples = load_videomme_samples(
+            repo_id=None, split="test", max_samples=max_samples
+        )
         for sample in samples:
             sample.prompt = f"{sample.prompt}\n{SHORT_ANSWER_PROMPT}"
     return await run_video_eval(
@@ -202,22 +211,31 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("gen", "score", "sim"))
     parser.add_argument("--arm", choices=ARMS, required=True)
-    parser.add_argument("--out", required=True, help="run dir; the arm writes OUT/<arm>")
+    parser.add_argument(
+        "--out", required=True, help="run dir; the arm writes OUT/<arm>"
+    )
     parser.add_argument("--port", type=int)
     parser.add_argument("--concurrency", type=int, default=16)
     parser.add_argument("--asr-port", type=int)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--max-samples", type=int, help="first N samples; unset is the full corpus"
+    )
     args = parser.parse_args()
     out = str(Path(args.out) / args.arm)
     Path(out).mkdir(parents=True, exist_ok=True)
     began = time.time()
     if args.mode == "gen":
-        asyncio.run(generate(args.arm, args.port, out, args.concurrency))
+        asyncio.run(
+            generate(args.arm, args.port, out, args.concurrency, args.max_samples)
+        )
     else:
         result = score(args.arm, args.asr_port, out, args.device, args.mode == "sim")
         name = "sim_summary.json" if args.mode == "sim" else "score_summary.json"
         (Path(out) / name).write_text(json.dumps(result, indent=1))
-    print(json.dumps({"arm": args.arm, "mode": args.mode, "wall_s": time.time() - began}))
+    print(
+        json.dumps({"arm": args.arm, "mode": args.mode, "wall_s": time.time() - began})
+    )
 
 
 if __name__ == "__main__":
