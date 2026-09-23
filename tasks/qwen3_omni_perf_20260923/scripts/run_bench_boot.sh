@@ -6,6 +6,7 @@
 # while the omni server runs voids the boot.
 # MAX_SAMPLES=N runs the first N samples of every arm (identity smokes); unset is the full corpus.
 # minicpmo serves MiniCPM-o-4.5 with the Omni CI speech worker args (tests/test_model/conftest.py).
+# SERVER_PYTHONPATH is prepended for the omni server only (memdiag/ loads the memory diagnostics).
 # usage: run_bench_boot.sh <tree> <out dir> <card> <port> <bf16|fp8|minicpmo> <concurrency> "<arm> <arm> ..."
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 DTYPE=$5 CONC=$6 ARMS=$7
@@ -47,7 +48,7 @@ LOAD_PID=$!
 # serve <label> <model> <port> <args...>: starts a server in its own process group
 serve() {
   local label=$1 model=$2 port=$3; shift 3
-  setsid bash -c "echo \$\$ > $OUT/$label.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE \
+  setsid bash -c "echo \$\$ > $OUT/$label.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=${SERVER_PYTHONPATH:+$SERVER_PYTHONPATH:}$TREE \
     $PIN python3 -u -m sglang_omni.cli serve --model-path $model $* --host 127.0.0.1 --port $port" > "$OUT/$label.log" 2>&1 &
   local began=$(date +%s) healthy=0
   for _ in $(seq 360); do
