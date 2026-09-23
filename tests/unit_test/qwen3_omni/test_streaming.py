@@ -32,7 +32,7 @@ from sglang_omni.models.qwen3_omni.request_builders import (
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
-from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangOutputProcessor
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import SchedulerOutput, SchedulerRequest
@@ -318,13 +318,13 @@ def test_qwen_thinker_stream_token_preserves_talker_prefill_contract():
     prompt_embed = torch.arange(10, dtype=torch.float32).reshape(5, 2)
     prompt_hidden = prompt_embed.clone()
     prompt_hidden[2] = torch.tensor([5.0, 6.0])
-    prefill_builder._reconstruct_prompt_states = lambda _state: (
+    prefill_builder.reconstruct_prompt_states = lambda _state: (
         prompt_ids,
         prompt_embed,
         prompt_hidden,
         {},
     )
-    prefill_builder._load_prompt_token_embeddings = lambda _token_ids: embed
+    prefill_builder.load_prompt_token_embeddings = lambda _token_ids: embed
     zero_special = torch.zeros((1, 2), dtype=torch.float32)
     prefill_builder.get_tts_special_embeds = lambda: (
         zero_special,
@@ -485,12 +485,12 @@ def test_qwen_static_aux_hidden_prefill_keeps_token_major_ambiguous_shape():
     scheduler_output = _static_aux_scheduler_output(2, 0, is_extend=True)
     tensor = torch.arange(4, dtype=torch.float32).reshape(2, 2)
 
-    first = SGLangOutputProcessor._slice_static_aux_hidden_tensor(
+    first = SGLangOutputProcessor.slice_static_aux_hidden_tensor(
         tensor,
         request_index=0,
         scheduler_output=scheduler_output,
     )
-    second = SGLangOutputProcessor._slice_static_aux_hidden_tensor(
+    second = SGLangOutputProcessor.slice_static_aux_hidden_tensor(
         tensor,
         request_index=1,
         scheduler_output=scheduler_output,
@@ -562,7 +562,7 @@ def test_qwen_static_aux_hidden_rejects_wrong_row_count(
         RuntimeError,
         match=rf"{layout}.*expected {expected_rows} rows, got {actual_rows}",
     ):
-        SGLangOutputProcessor._slice_static_aux_hidden_tensor(
+        SGLangOutputProcessor.slice_static_aux_hidden_tensor(
             torch.zeros(actual_rows, 2),
             request_index=0,
             scheduler_output=scheduler_output,
@@ -930,7 +930,7 @@ def test_send_stream_to_coordinator_raises_on_non_terminal():
     s = _bare_stage(is_terminal=False)
     with pytest.raises(RuntimeError, match="terminal"):
         asyncio.run(
-            s._send_stream_to_coordinator(
+            s.send_stream_to_coordinator(
                 request_id="req-1",
                 data={"text": "hi"},
                 metadata={"modality": "text"},
@@ -942,7 +942,7 @@ def test_send_stream_to_coordinator_short_circuits_for_followers():
     """TP follower (owns_external_io=False) must drop silently, not raise."""
     s = _bare_stage(is_terminal=True, owns_io=False)
     asyncio.run(
-        s._send_stream_to_coordinator(
+        s.send_stream_to_coordinator(
             request_id="req-1",
             data={"text": "hi"},
             metadata={"modality": "text"},
@@ -955,7 +955,7 @@ def test_queue_stream_error_fast_fails_when_no_queue():
     coordinator failure rather than silently dropping the error."""
     s = _bare_stage(is_terminal=True)
     asyncio.run(
-        s._queue_stream_error("req-1", from_stage="thinker", error=RuntimeError("boom"))
+        s.queue_stream_error("req-1", from_stage="thinker", error=RuntimeError("boom"))
     )
     assert len(s.control_plane.completions) == 1
     assert s.control_plane.completions[0].request_id == "req-1"
@@ -968,7 +968,7 @@ def test_queue_stream_error_aborted_request_no_op():
     s = _bare_stage(is_terminal=True)
     s._aborted.add("req-1")
     asyncio.run(
-        s._queue_stream_error("req-1", from_stage="thinker", error=RuntimeError("late"))
+        s.queue_stream_error("req-1", from_stage="thinker", error=RuntimeError("late"))
     )
     assert s.control_plane.completions == []
 
@@ -978,8 +978,8 @@ def test_queue_stream_error_repeated_calls_are_idempotent_at_handler():
     s = _bare_stage(is_terminal=True)
 
     async def _drive():
-        await s._queue_stream_error("req-1", "thinker", RuntimeError("first"))
-        await s._queue_stream_error("req-1", "thinker", RuntimeError("second"))
+        await s.queue_stream_error("req-1", "thinker", RuntimeError("first"))
+        await s.queue_stream_error("req-1", "thinker", RuntimeError("second"))
 
     asyncio.run(_drive())
     assert len(s.control_plane.completions) == 1

@@ -20,7 +20,7 @@ from sglang_omni.models.minicpm_o.routing import (
     payload_with_state,
 )
 from sglang_omni.proto.request import StagePayload
-from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.types import RequestOutput
 
 if TYPE_CHECKING:
@@ -62,7 +62,7 @@ def build_encoder_request(
     )
 
 
-def _apply_mm_pad_values(
+def apply_mm_pad_values(
     input_ids: torch.Tensor,
     *,
     mm_inputs: dict[str, Any],
@@ -150,7 +150,7 @@ def build_sglang_thinker_request(
     input_ids = input_ids.to(dtype=torch.long)
     mm_positions = None
     if model_inputs:
-        input_ids, mm_positions = _apply_mm_pad_values(
+        input_ids, mm_positions = apply_mm_pad_values(
             input_ids,
             mm_inputs=state.mm_inputs,
             model_inputs=model_inputs,

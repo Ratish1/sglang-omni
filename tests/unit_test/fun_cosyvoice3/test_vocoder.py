@@ -23,7 +23,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
-from sglang_omni.scheduling.messages import IncomingMessage
+from sglang_omni.scheduling.message import IncomingMessage
 from tests.unit_test.fun_cosyvoice3.test_flow_batch import _FakeFlow as _PackedFlow
 
 
@@ -364,7 +364,7 @@ def test_mlx_vocoder_audio_payload_survives_state_storage() -> None:
 
     mlx_vocoder = object.__new__(stages.CosyVoice3MlxVocoderAdapter)
     stored = mlx_vocoder.store_result(_payload(state), state, waveform, 24000)
-    result = Client._default_result_builder(stored.request_id, stored.data)
+    result = Client.default_result_builder(stored.request_id, stored.data)
 
     np.testing.assert_array_equal(result.audio_data, waveform.reshape(-1))
     assert result.sample_rate == 24000

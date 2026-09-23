@@ -239,12 +239,12 @@ class PackedDiT:
         dit = self.dit
         t = dit.time_embed(t)
         h = dit.input_embed.proj(torch.cat((x, cond, mu, spks), dim=-1))
-        h = self._conv_pos_embed(h, rows) + h
-        rope = self._rope(rows)
+        h = self.conv_pos_embed(h, rows) + h
+        rope = self.rope(rows)
         residual = h
         for block in dit.transformer_blocks:
             norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(h, emb=t)
-            h = h + gate_msa.unsqueeze(1) * self._attend(
+            h = h + gate_msa.unsqueeze(1) * self.attend(
                 block.attn, norm, rope, attention
             )
             ff_norm = block.ff_norm(h) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
@@ -254,34 +254,44 @@ class PackedDiT:
         h = dit.norm_out(h, t)
         return dit.proj_out(h)
 
-    def _conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
+    def conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
         padded = scatter_rows(h, rows, rows.width)
         return gather_rows(self.dit.input_embed.conv_pos_embed(padded), rows)
 
-    def _rope(self, rows: PackedRows) -> tuple[torch.Tensor, Any]:
+    def rope(self, rows: PackedRows) -> tuple[torch.Tensor, torch.Tensor]:
+        """cos and sin, (1, total, rotary dims) each, in float32."""
         freqs, scale = self.dit.rotary_embed.forward_from_seq_len(rows.width)
+        assert not isinstance(scale, torch.Tensor), "the DiT's RoPE has no xpos scale"
         freqs = freqs[:, rows.positions]
-        if isinstance(scale, torch.Tensor):
-            scale = scale[:, rows.positions]
-        return freqs, scale
+        return freqs.cos(), freqs.sin()
 
     @staticmethod
-    def _attend(
+    def attend(
         attn: torch.nn.Module,
         x: torch.Tensor,
-        rope: tuple[torch.Tensor, Any],
+        rope: tuple[torch.Tensor, torch.Tensor],
         attention: PackedRowAttention,
     ) -> torch.Tensor:
-        from x_transformers.x_transformers import apply_rotary_pos_emb
-
-        freqs, scale = rope
+        # note (ratish): under autocast to_q, to_k and to_v would each cast the
+        # float32 norm output again.
+        x = x.to(attn.to_q.weight.dtype)
         query = attn.to_q(x)
         key = attn.to_k(x)
         value = attn.to_v(x)
-        query = apply_rotary_pos_emb(query, freqs, scale)
-        key = apply_rotary_pos_emb(key, freqs, scale**-1.0)
+        rotate_in_place(query, *rope)
+        rotate_in_place(key, *rope)
         out = attention(query, key, value).to(query.dtype)
         return attn.to_out[1](attn.to_out[0](out))
+
+
+def rotate_in_place(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> None:
+    """x: (1, total, heads * head_dim). Interleaved RoPE in float32 on the
+    rotary dims, rounded back into x."""
+    # note (ratish): the DiT rotates only the first rotary dims of the
+    # flattened heads, so the rest of x is never copied.
+    rotary = x[..., : cos.shape[-1]]
+    half = torch.stack((-rotary[..., 1::2], rotary[..., ::2]), dim=-1).flatten(-2)
+    rotary.copy_(rotary * cos + half * sin)
 
 
 def solve_flow_euler_packed(

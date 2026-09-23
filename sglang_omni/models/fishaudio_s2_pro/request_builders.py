@@ -12,7 +12,7 @@ import torch
 
 from sglang_omni.models.fishaudio_s2_pro.payload_types import S2ProState
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
 _S2PRO_GRAPH_TOP_K = 30
@@ -57,7 +57,7 @@ def validate_s2pro_top_k(top_k: int) -> None:
         )
 
 
-def _ref_vq_fingerprint(vq_parts: list[torch.Tensor] | None) -> str | None:
+def ref_vq_fingerprint(vq_parts: list[torch.Tensor] | None) -> str | None:
     # note (Gaokai): only cb0 of the ref VQ codes becomes prompt token ids;
     # cb1..N ride in as embeddings, so extra_key must hash all codebooks to keep
     # same-cb0 prompts from sharing radix KV across different reference audio.
@@ -145,7 +145,7 @@ def build_sglang_tts_request(
         sampling_params=sampling_params,
         vocab_size=vocab_size,
         eos_token_ids={im_end_token_id},
-        extra_key=_ref_vq_fingerprint(vq_parts),
+        extra_key=ref_vq_fingerprint(vq_parts),
     )
     req.tokenizer = tokenizer
     req._codec_suppress_tokens = None
