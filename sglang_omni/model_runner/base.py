@@ -15,6 +15,7 @@ import torch
 
 from sglang_omni.model_runner.prefill_inputs import clear_omni_prefill_inputs
 from sglang_omni.platforms import current_platform
+from sglang_omni.profiler.pipeline_nvtx import trace_call, trace_range
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
     derive_sampling_seed,
@@ -60,6 +61,14 @@ def resolve_deferred_prefill_inputs(schedule_batch: Any, device: torch.device) -
 
     schedule_batch.input_ids = staged_input_ids.to(device, non_blocking=True)
     schedule_batch.prefill_input_ids_cpu = None
+
+
+def step_annotation(scheduler_output: Any) -> dict[str, Any]:
+    batch_data = scheduler_output.batch_data
+    return {
+        "batch_size": len(scheduler_output.requests),
+        "mode": batch_data.forward_mode.name if batch_data is not None else None,
+    }
 
 
 @dataclass
@@ -294,6 +303,11 @@ class ModelRunner:
             realloc_on_grow=True,
         )
 
+    @trace_call(
+        "runner",
+        "execute",
+        lambda self, scheduler_output: step_annotation(scheduler_output),
+    )
     def execute(self, scheduler_output: Any) -> ModelRunnerOutput:
         """Full synchronous pipeline: build → prepare → forward → post →
         sample → output.
@@ -348,6 +362,11 @@ class ModelRunner:
             scheduler_output,
         )
 
+    @trace_call(
+        "runner",
+        "launch",
+        lambda self, scheduler_output: step_annotation(scheduler_output),
+    )
     def execute_launch(self, scheduler_output: Any) -> "PendingStep | None":
         """Enqueue a decode step's forward + on-GPU sample, call
         ``post_decode_launch`` to publish a model-specific resolve payload
@@ -411,6 +430,13 @@ class ModelRunner:
             batch_result=batch_result,
         )
 
+    @trace_call(
+        "runner",
+        "resolve",
+        lambda self, pending: (
+            step_annotation(pending.scheduler_output) if pending is not None else {}
+        ),
+    )
     def execute_resolve(
         self, pending: "PendingStep | None"
     ) -> ModelRunnerOutput | None:
@@ -426,7 +452,8 @@ class ModelRunner:
         if pending.event.query():
             self._async_query_hit += 1
         else:
-            pending.event.synchronize()
+            with trace_range("runner", "resolve_wait"):
+                pending.event.synchronize()
             self._async_query_miss += 1
         # Skip reqs finished or retracted in a prior (lagged) step so _finalize
         # neither re-emits nor re-frees their KV (mirrors _resolve_and_process).

@@ -25,6 +25,7 @@ from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
+from sglang_omni.profiler.pipeline_nvtx import trace_call
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
@@ -991,6 +992,11 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             return [1] * len(participants)
         return self.decompose_batch(len(participants), sizes)
 
+    @trace_call(
+        "code2wav",
+        "run_step",
+        lambda self, participants, plan: {"streams": len(participants)},
+    )
     def run_step(
         self,
         participants: list[tuple[str, Code2WavStreamState]],

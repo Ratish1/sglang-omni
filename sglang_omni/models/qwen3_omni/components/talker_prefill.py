@@ -21,6 +21,7 @@ from sglang_omni.models.qwen3_omni.pending_text_queue import (
     coerce_pending_text_queue,
 )
 from sglang_omni.models.weight_loader import resolve_model_path
+from sglang_omni.profiler.pipeline_nvtx import trace_call
 
 _THINKER_EMBED_CANDIDATE_KEYS = (
     "thinker.model.embed_tokens.weight",
@@ -189,6 +190,14 @@ class TalkerPrefillBuilder:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
 
+    @trace_call(
+        "talker",
+        "build_prompt_prefill",
+        lambda self, payload, thinker_chunks, *, thinker_done: {
+            "chunks": len(thinker_chunks),
+            "thinker_done": thinker_done,
+        },
+    )
     def build_prompt_prefill(
         self,
         payload,

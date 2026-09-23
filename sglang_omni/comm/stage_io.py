@@ -21,6 +21,7 @@ from sglang_omni.comm.data_ref import (
     TensorMeta,
     TransportKind,
 )
+from sglang_omni.profiler.pipeline_nvtx import trace_call
 from sglang_omni.proto import DataReadyMessage, StagePayload
 from sglang_omni.relay.base import Relay
 
@@ -153,6 +154,7 @@ def payload_has_cuda_tensor(payload: Any) -> bool:
     return contains_cuda_tensor(payload)
 
 
+@trace_call("stage_io", "cuda_ipc_payload_export")
 def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
     if not isinstance(payload, StagePayload):
         raise TypeError(
@@ -187,6 +189,7 @@ def is_direct_cuda_ipc_payload_ref(value: Any) -> bool:
     )
 
 
+@trace_call("stage_io", "cuda_ipc_payload_import")
 def deserialize_direct_cuda_ipc_payload(data_ref: dict[str, Any]) -> StagePayload:
     if data_ref.get("_type") != _DIRECT_CUDA_IPC_PAYLOAD_TYPE:
         raise ValueError("data_ref is not a direct CUDA IPC payload")
@@ -249,6 +252,7 @@ def deserialize_direct_cuda_ipc_payload(data_ref: dict[str, Any]) -> StagePayloa
     )
 
 
+@trace_call("stage_io", "cuda_ipc_export", lambda data, metadata: {"data": data})
 def serialize_direct_cuda_ipc_stream_chunk(
     data: Any,
     metadata: dict[str, Any] | None,
@@ -269,6 +273,7 @@ _INLINE_STREAM_CHUNK_TYPE = "InlineStreamChunk"
 _INLINE_STREAM_CHUNK_BYTES_LIMIT = 16 * 1024
 
 
+@trace_call("stage_io", "inline_pickle", lambda data, metadata: {"data": data})
 def serialize_inline_stream_chunk(
     data: Any, metadata: dict[str, Any] | None
 ) -> dict[str, Any] | None:
@@ -295,6 +300,7 @@ def is_inline_stream_chunk_ref(value: Any) -> bool:
     return isinstance(value, dict) and value.get("_type") == _INLINE_STREAM_CHUNK_TYPE
 
 
+@trace_call("stage_io", "inline_unpickle")
 def deserialize_inline_stream_chunk(
     data_ref: dict[str, Any],
 ) -> tuple[torch.Tensor, dict[str, Any] | None]:
@@ -341,6 +347,7 @@ def is_direct_cuda_ipc_stream_chunk_ref(value: Any) -> bool:
     )
 
 
+@trace_call("stage_io", "cuda_ipc_import")
 def deserialize_direct_cuda_ipc_stream_chunk(
     data_ref: dict[str, Any],
 ) -> tuple[Any, dict[str, Any] | None]:

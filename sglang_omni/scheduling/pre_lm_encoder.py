@@ -14,6 +14,8 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
+from sglang_omni.profiler.pipeline_nvtx import trace_call
+
 ItemT = TypeVar("ItemT")
 EncodedT = TypeVar("EncodedT")
 EmbeddingT = TypeVar("EmbeddingT")
@@ -134,6 +136,7 @@ class PreLMEncoderService(ABC, Generic[ItemT, EncodedT, EmbeddingT]):
     ) -> None:
         pass
 
+    @trace_call("encoder", "execute_batch", lambda self, items: {"items": len(items)})
     def execute_batch(self, items: list[ItemT]) -> list[EmbeddingT]:
         attach_before_synchronize = self.attach_before_synchronize()
         with self.batch_context():
