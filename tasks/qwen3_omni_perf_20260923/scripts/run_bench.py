@@ -6,8 +6,9 @@ the given concurrency, timeout 500 s where the eval takes one (seed-tts has no t
 field and keeps its 300 s).
 
 gen:   generation against the omni server; results land in OUT/<arm>/
-score: WER of a talker arm or of seed-tts against a Qwen3-ASR server on --asr-port, and
-       seed-tts speaker similarity on --device; run after the omni server is stopped.
+score: WER of a talker arm or of seed-tts against a Qwen3-ASR server on --asr-port; run
+       after the omni server is stopped.
+sim:   seed-tts speaker similarity on --device; run after the ASR server is stopped too.
 
 usage: python run_bench.py gen --arm mmmu_talker --port 8000 --concurrency 16 --out DIR
        python run_bench.py score --arm mmmu_talker --asr-port 8100 --out DIR
@@ -153,7 +154,7 @@ async def generate(arm: str, port: int, out: str, concurrency: int) -> dict:
     )
 
 
-def score(arm: str, asr_port: int, out: str, device: str) -> dict:
+def score(arm: str, asr_port: int | None, out: str, device: str, sim: bool) -> dict:
     if arm == "seedtts_en":
         from benchmarks.eval.benchmark_omni_seedtts import (
             OmniSeedttsBenchmarkConfig,
@@ -170,10 +171,11 @@ def score(arm: str, asr_port: int, out: str, device: str) -> dict:
             port=asr_port,
             asr_concurrency=32,
         )
+        if sim:
+            return {"similarity": run_seedtts_similarity(config)["summary"]}
         evaluate_generated_audio(config)
         return {
-            "wer": json.loads((Path(out) / "wer_results.json").read_text())["summary"],
-            "similarity": run_seedtts_similarity(config)["summary"],
+            "wer": json.loads((Path(out) / "wer_results.json").read_text())["summary"]
         }
     from benchmarks.tasks.asr import compute_text_audio_consistency_from_records
 
@@ -198,7 +200,7 @@ def score(arm: str, asr_port: int, out: str, device: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("gen", "score"))
+    parser.add_argument("mode", choices=("gen", "score", "sim"))
     parser.add_argument("--arm", choices=ARMS, required=True)
     parser.add_argument("--out", required=True, help="run dir; the arm writes OUT/<arm>")
     parser.add_argument("--port", type=int)
@@ -212,8 +214,9 @@ def main() -> None:
     if args.mode == "gen":
         asyncio.run(generate(args.arm, args.port, out, args.concurrency))
     else:
-        result = score(args.arm, args.asr_port, out, args.device)
-        (Path(out) / "score_summary.json").write_text(json.dumps(result, indent=1))
+        result = score(args.arm, args.asr_port, out, args.device, args.mode == "sim")
+        name = "sim_summary.json" if args.mode == "sim" else "score_summary.json"
+        (Path(out) / name).write_text(json.dumps(result, indent=1))
     print(json.dumps({"arm": args.arm, "mode": args.mode, "wall_s": time.time() - began}))
 
 

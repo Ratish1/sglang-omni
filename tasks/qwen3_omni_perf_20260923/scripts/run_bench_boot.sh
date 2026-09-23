@@ -88,6 +88,12 @@ if [ "${SCORE:-0}" = 1 ] && [ -n "$SPEECH" ] && [ ! -f "$OUT/FAILED" ]; then
     done
   fi
   stop asr
+  # the similarity model needs the card the ASR server held
+  if [ -d "$OUT/seedtts_en" ]; then
+    CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" sim --arm seedtts_en --out "$OUT" \
+      > "$OUT/sim_seedtts_en.log" 2>&1
+    echo "sim seedtts_en rc $? $(date +%T)" >> "$OUT/progress.txt"
+  fi
   find "$OUT" -name '*.wav' -path '*/audio/*' -delete
 fi
 kill "$DMON_PID" "$APPS_PID" "$LOAD_PID" 2>/dev/null
