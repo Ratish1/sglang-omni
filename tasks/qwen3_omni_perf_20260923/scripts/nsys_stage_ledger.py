@@ -112,6 +112,12 @@ def main() -> None:
     stage_by_pid = {
         pid: votes.most_common(1)[0][0] for pid, votes in stage_votes.items()
     }
+    # a range is named by the process that ran it, so runner/execute splits per stage
+    for global_tid, ranges in ranges_by_thread.items():
+        process = stage_by_pid.get(pid_of(global_tid), "?")
+        ranges_by_thread[global_tid] = [
+            (start, end, f"{process}:{op}") for start, end, op in ranges
+        ]
 
     kernels = db.execute(
         """
@@ -192,7 +198,7 @@ def main() -> None:
             host_ns_by_op[op].append(end - start)
     print()
     print(
-        "op                                   ranges   host_ms  host_mean_us  device_ms"
+        "process:op                                        ranges   host_ms  host_mean_us  device_ms"
     )
     ops = set(host_ns_by_op) | set(device_ns_by_op)
     for op in sorted(ops, key=lambda name: -device_ns_by_op[name])[: args.top]:
@@ -200,8 +206,30 @@ def main() -> None:
         host_ms = sum(durations) / 1e6
         mean_us = host_ms * 1e3 / len(durations) if durations else 0.0
         print(
-            f"{op:36s} {len(durations):7d} {host_ms:9.1f} {mean_us:13.1f} "
+            f"{op:48s} {len(durations):7d} {host_ms:9.1f} {mean_us:13.1f} "
             f"{device_ns_by_op[op] / 1e6:10.1f}"
+        )
+
+    # CUDA runtime calls per process: syncs, copies and launches with their host time
+    api_rows = db.execute(
+        """
+        select r.globalTid, s.value, r.end - r.start from CUPTI_ACTIVITY_KIND_RUNTIME r
+        join StringIds s on r.nameId = s.id where r.start >= ? and r.start < ?
+        """,
+        (t0, t1),
+    ).fetchall()
+    api_by_stage: dict[tuple[str, str], list[int]] = collections.defaultdict(list)
+    for global_tid, name, duration in api_rows:
+        stage = stage_by_pid.get(pid_of(global_tid), "?")
+        api_by_stage[(stage, name.split("_v")[0])].append(duration)
+    print()
+    print("process:cuda api                                 calls   host_ms  mean_us")
+    ordered = sorted(api_by_stage.items(), key=lambda item: -sum(item[1]))
+    for (stage, name), durations in ordered[: args.top]:
+        total_ms = sum(durations) / 1e6
+        print(
+            f"{stage + ':' + name:48s} {len(durations):7d} {total_ms:9.1f} "
+            f"{total_ms * 1e3 / len(durations):8.1f}"
         )
 
 
