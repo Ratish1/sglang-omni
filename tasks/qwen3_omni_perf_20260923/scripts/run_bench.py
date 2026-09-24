@@ -77,6 +77,7 @@ def mmsu_args(
         asr_device="cuda:0",
         asr_concurrency=32,
         timeout_s=TIMEOUT_S,
+        fingerprint=False,
     )
 
 
