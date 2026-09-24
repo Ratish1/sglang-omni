@@ -13,6 +13,9 @@ ratio every 5 s; MEMDIAG_NO_RATIO_RESET=1 also turns the talker's resets into no
 (diagnostic arm only). MEMDIAG_ADMISSION=1 logs, in the talker process only, each request's
 answer tokens and prompt rows at build and its frames at finish, every PrefillAdder
 admission attempt with its budget terms, and every decode retraction.
+MEMDIAG_SYNC_STACKS=1 turns on torch's synchronizing-op warnings in the talker process and
+logs, every 10 s, the Python call sites (innermost omni and sglang frames) that issued
+host syncs, with counts.
 """
 
 import gc
@@ -273,7 +276,49 @@ def patch_retract(module):
     batch_cls.retract_decode = retract_decode
 
 
+def patch_sync_stacks(module):
+    """Count the talker's synchronizing CUDA ops by the Python call site that issued them."""
+    if not is_talker_process():
+        return
+    import collections
+    import threading
+    import time
+    import traceback
+    import warnings
+
+    import torch
+
+    stacks = collections.Counter()
+    show_original = warnings.showwarning
+
+    def showwarning(message, category, filename, lineno, file=None, line=None):
+        if "synchronizing CUDA operation" not in str(message):
+            return show_original(message, category, filename, lineno, file, line)
+        frames = [
+            f"{frame.filename.rsplit('/site-packages/', 1)[-1]}:{frame.lineno}:{frame.name}"
+            for frame in traceback.extract_stack()[:-2]
+            if "sglang" in frame.filename and "sitecustomize" not in frame.filename
+        ]
+        stacks[" <- ".join(reversed(frames[-4:]))] += 1
+
+    warnings.showwarning = showwarning
+    warnings.simplefilter("always", UserWarning)
+
+    def report():
+        while not torch.cuda.is_initialized():
+            time.sleep(1)
+        torch.cuda.set_sync_debug_mode("warn")
+        while True:
+            time.sleep(10)
+            for stack, count in stacks.most_common(12):
+                log(f"sync x{count} {stack}")
+
+    threading.Thread(target=report, daemon=True).start()
+
+
 TARGETS = {TARGET: patch}
+if os.environ.get("MEMDIAG_SYNC_STACKS") == "1":
+    TARGETS["sglang_omni.models.qwen3_omni.talker_scheduler"] = patch_sync_stacks
 if os.environ.get("MEMDIAG_ADMISSION") == "1":
     TARGETS["sglang_omni.models.qwen3_omni.request_builders"] = patch_talker_builder
     TARGETS["sglang_omni.models.qwen3_omni.talker_model_runner"] = patch_talker_runner
