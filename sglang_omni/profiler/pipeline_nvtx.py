@@ -11,7 +11,8 @@ from __future__ import annotations
 import functools
 import json
 import os
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Callable, ParamSpec, TypeVar
 
 ENABLED = os.environ.get("SGLANG_OMNI_PIPELINE_NVTX", "0") == "1"
@@ -42,11 +43,19 @@ def annotation_message(stage: str, op: str, metadata: dict[str, Any]) -> str:
     )
 
 
-def trace_range(stage: str, op: str, **metadata: Any) -> AbstractContextManager:
+@contextmanager
+def trace_range(stage: str, op: str, **metadata: Any) -> Iterator[None]:
     """A synchronous host range. Never hold this context across an await."""
     if not ENABLED:
-        return nullcontext()
-    return nvtx.range(annotation_message(stage, op, {**metadata, "kind": "range"}))
+        yield
+        return
+    # note(ratish): push and pop directly; torch.cuda.nvtx.range runs str.format on its
+    # message, and the braces of the JSON annotation raise KeyError there
+    nvtx.range_push(annotation_message(stage, op, {**metadata, "kind": "range"}))
+    try:
+        yield
+    finally:
+        nvtx.range_pop()
 
 
 def trace_call(
