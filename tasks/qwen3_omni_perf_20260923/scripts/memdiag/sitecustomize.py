@@ -6,7 +6,8 @@ NVML process bytes, torch allocated and reserved, before KV sizing and around gr
 MEMDIAG_GC=1 runs gc.collect() and torch.cuda.empty_cache() before the KV sizing reads memory
 (the order sglang's own KVCacheConfigurator._profile_available_bytes uses); otherwise the
 collection runs after sizing, so the pool is sized exactly as on main and the log shows how
-much was collectable.
+much was collectable. MEMDIAG_FIND=1 first lists the CUDA tensors that only reference cycles
+keep alive at sizing, with the frames and objects holding them (that collection frees them).
 """
 
 import gc
@@ -44,6 +45,65 @@ def collect():
     return collected
 
 
+def report_cycle_garbage(stage):
+    """Collect with DEBUG_SAVEALL and print the CUDA tensors that only cycles kept alive."""
+    import collections
+    import types
+
+    import torch
+
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    gc.collect()
+    garbage = list(gc.garbage)
+    gc.garbage.clear()
+    gc.set_debug(0)
+    garbage_ids = {id(obj) for obj in garbage}
+    storages = {}
+    for obj in garbage:
+        if isinstance(obj, torch.Tensor) and obj.is_cuda:
+            storage = obj.untyped_storage()
+            storages.setdefault(storage.data_ptr(), (storage.nbytes(), obj))
+    total = sum(nbytes for nbytes, _ in storages.values())
+    log(
+        f"{stage} cycle_garbage objects={len(garbage)} cuda_storages={len(storages)} "
+        f"bytes_gib={total / GIB:.3f}"
+    )
+    types_count = collections.Counter(type(obj).__qualname__ for obj in garbage)
+    log(f"{stage} cycle_types {types_count.most_common(15)}")
+    frames = collections.Counter(
+        f"{obj.f_code.co_filename}:{obj.f_code.co_firstlineno}:{obj.f_code.co_name}"
+        for obj in garbage
+        if isinstance(obj, types.FrameType)
+    )
+    for frame, count in frames.most_common(20):
+        log(f"{stage} cycle_frame x{count} {frame}")
+    biggest = sorted(storages.values(), key=lambda item: -item[0])[:10]
+    for nbytes, tensor in biggest:
+        holders = []
+        for referrer in gc.get_referrers(tensor):
+            if id(referrer) not in garbage_ids:
+                continue
+            if isinstance(referrer, types.FrameType):
+                code = referrer.f_code
+                holders.append(f"frame {code.co_filename}:{code.co_name}")
+            elif isinstance(referrer, dict):
+                owners = [
+                    type(owner).__qualname__
+                    for owner in gc.get_referrers(referrer)
+                    if id(owner) in garbage_ids
+                    and getattr(owner, "__dict__", None) is referrer
+                ]
+                holders.append(f"dict keys={list(referrer)[:6]} owners={owners}")
+            else:
+                holders.append(type(referrer).__qualname__)
+        log(
+            f"{stage} cycle_tensor {tuple(tensor.shape)} {tensor.dtype} "
+            f"mib={nbytes / (1 << 20):.1f} held_by={holders[:4]}"
+        )
+    del garbage, storages, biggest
+    gc.collect()
+
+
 def patch(module):
     configurator = module.OmniKVCacheConfigurator
     profile_original = configurator._profile_available_bytes
@@ -53,6 +113,8 @@ def patch(module):
         log(
             f"{stage} before_kv_sizing {snapshot(self.gpu_id)} gc_count={gc.get_count()}"
         )
+        if os.environ.get("MEMDIAG_FIND") == "1":
+            report_cycle_garbage(stage)
         if os.environ.get("MEMDIAG_GC") == "1":
             log(f"{stage} collected={collect()} after_gc {snapshot(self.gpu_id)}")
             result = profile_original(self, pre_model_load_memory)
