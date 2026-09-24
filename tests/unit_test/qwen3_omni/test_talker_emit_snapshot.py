@@ -99,3 +99,61 @@ def test_two_batched_clones_rows_share_storage() -> None:
     }
     assert len(code_ptrs) == 1
     assert len(embed_ptrs) == 1
+
+
+class DeviceCodesTensor(torch.Tensor):
+    """CPU tensor that reports a CUDA device to the sender."""
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda")
+
+
+def test_every_code_message_carries_one_event_recorded_after_the_snapshot(
+    monkeypatch,
+) -> None:
+    log: list[object] = []
+    talker_stream = object()
+
+    class _RecordingEvent:
+        def record(self, stream: object) -> None:
+            log.append(("record", stream))
+
+    original_clone = torch.Tensor.clone
+
+    def _logging_clone(self, *args, **kwargs):
+        log.append("clone")
+        return original_clone(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "Event", _RecordingEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: talker_stream)
+    monkeypatch.setattr(torch.Tensor, "clone", _logging_clone)
+    n = 3
+    model = fake_model(n, 3, 2)
+    model.output_codes = torch.Tensor._make_subclass(  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+        DeviceCodesTensor, model.output_codes
+    )
+    runner = make_runner(model)
+
+    runner.emit_code_chunks_and_feedback(
+        schedule_batch=sched_batch(n), requests=make_requests(n)
+    )
+
+    assert len(runner.outbox.sent) == n
+    events = [msg.metadata["codes_ready_event"] for msg in runner.outbox.sent]
+    assert all(event is events[0] for event in events)
+    assert log.count(("record", talker_stream)) == 1
+    assert log[-1] == ("record", talker_stream)
+    assert "clone" in log
+
+
+def test_cpu_code_messages_carry_no_event() -> None:
+    n = 2
+    runner = make_runner(fake_model(n, 3, 2))
+
+    runner.emit_code_chunks_and_feedback(
+        schedule_batch=sched_batch(n), requests=make_requests(n)
+    )
+
+    assert len(runner.outbox.sent) == n
+    assert all(msg.metadata == {"stream": False} for msg in runner.outbox.sent)
