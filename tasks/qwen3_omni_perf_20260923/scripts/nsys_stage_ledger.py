@@ -13,7 +13,13 @@ Prints:
      range that encloses the runtime call it correlates with, on the calling thread;
      graph node kernels correlate with their cudaGraphLaunch.
 
+  3. per process, CUDA runtime calls with their host time.
+  4. with --api-in-ranges STAGE: that process's runtime calls per innermost NVTX range
+     (calls and host ms per range and call name), so syncs and copies land on the step
+     part that issued them.
+
 usage: python nsys_stage_ledger.py REPORT.sqlite [--window window.txt] [--top 40]
+       [--api-in-ranges talker_ar]
 """
 
 from __future__ import annotations
@@ -88,6 +94,7 @@ def main() -> None:
     parser.add_argument("report")
     parser.add_argument("--window")
     parser.add_argument("--top", type=int, default=40)
+    parser.add_argument("--api-in-ranges")
     args = parser.parse_args()
     db = sqlite3.connect(args.report)
     t0, t1 = session_window(db, args.window)
@@ -168,6 +175,22 @@ def main() -> None:
         tid: [start for start, _, _ in ranges]
         for tid, ranges in ranges_by_thread.items()
     }
+
+    def innermost_range(global_tid: int, call_start: int) -> str:
+        ranges = ranges_by_thread.get(global_tid)
+        if not ranges:
+            return "(no range)"
+        else:
+            pass
+        index = bisect.bisect_right(starts_by_thread[global_tid], call_start) - 1
+        for candidate in range(index, max(index - RANGE_SCAN_LIMIT, -1), -1):
+            start, end, op = ranges[candidate]
+            if start <= call_start <= end:
+                return op
+            else:
+                pass
+        return "(no range)"
+
     device_ns_by_op: dict[str, int] = collections.Counter()
     for call_start, global_tid, correlation in db.execute(
         """
@@ -179,18 +202,7 @@ def main() -> None:
         kernel_ns = kernel_ns_by_correlation.get((pid_of(global_tid), correlation))
         if not kernel_ns:
             continue
-        ranges = ranges_by_thread.get(global_tid)
-        if not ranges:
-            device_ns_by_op["(no range)"] += kernel_ns
-            continue
-        index = bisect.bisect_right(starts_by_thread[global_tid], call_start) - 1
-        owner = "(no range)"
-        for candidate in range(index, max(index - RANGE_SCAN_LIMIT, -1), -1):
-            start, end, op = ranges[candidate]
-            if start <= call_start <= end:
-                owner = op
-                break
-        device_ns_by_op[owner] += kernel_ns
+        device_ns_by_op[innermost_range(global_tid, call_start)] += kernel_ns
 
     host_ns_by_op: dict[str, list[int]] = collections.defaultdict(list)
     for ranges in ranges_by_thread.values():
@@ -229,6 +241,37 @@ def main() -> None:
         total_ms = sum(durations) / 1e6
         print(
             f"{stage + ':' + name:48s} {len(durations):7d} {total_ms:9.1f} "
+            f"{total_ms * 1e3 / len(durations):8.1f}"
+        )
+
+    if args.api_in_ranges is None:
+        return
+    else:
+        pass
+    api_by_range: dict[tuple[str, str], list[int]] = collections.defaultdict(list)
+    for call_start, global_tid, name, duration in db.execute(
+        """
+        select r.start, r.globalTid, s.value, r.end - r.start
+        from CUPTI_ACTIVITY_KIND_RUNTIME r join StringIds s on r.nameId = s.id
+        where r.start >= ? and r.start < ?
+        """,
+        (t0, t1),
+    ):
+        if stage_by_pid.get(pid_of(global_tid)) != args.api_in_ranges:
+            continue
+        else:
+            pass
+        owner = innermost_range(global_tid, call_start)
+        api_by_range[(owner, name.split("_v")[0])].append(duration)
+    print()
+    print(
+        f"{args.api_in_ranges} cuda api per innermost range         calls   host_ms  mean_us"
+    )
+    ordered = sorted(api_by_range.items(), key=lambda item: -sum(item[1]))
+    for (owner, name), durations in ordered[: args.top]:
+        total_ms = sum(durations) / 1e6
+        print(
+            f"{owner + ' ' + name:56s} {len(durations):7d} {total_ms:9.1f} "
             f"{total_ms * 1e3 / len(durations):8.1f}"
         )
 
