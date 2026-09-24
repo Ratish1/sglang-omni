@@ -27,8 +27,11 @@ def test_factory_installs_shared_snake_before_graph_capture(
     monkeypatch: pytest.MonkeyPatch, enabled: bool
 ) -> None:
     original = SnakeBeta(96).eval()
+    decoder = torch.nn.Sequential(original)
     model = SimpleNamespace(
-        decoder=torch.nn.Sequential(original),
+        decoder=decoder,
+        parameters=decoder.parameters,
+        buffers=decoder.buffers,
         config=SimpleNamespace(num_quantizers=16),
         total_upsample=1920,
     )

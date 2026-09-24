@@ -216,6 +216,7 @@ def build_runner(
         num_quantizers=16,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
         graph_keys=DEFAULT_GRAPH_KEYS,
+        model_footprint_bytes=100,
         device_api=backend,
     )
     return runner, backend, model
@@ -246,6 +247,7 @@ def test_build_captures_only_the_explicit_graph_keys() -> None:
         num_quantizers=16,
         total_gpu_memory_fraction=0.5,
         graph_keys=graph_keys,
+        model_footprint_bytes=100,
         device_api=backend,
     )
 
@@ -469,6 +471,7 @@ def test_real_cuda_shared_pool_replays_batch_sizes_with_eager_parity() -> None:
         num_quantizers=2,
         total_gpu_memory_fraction=1.0,
         graph_keys=graph_keys,
+        model_footprint_bytes=0,
     )
 
     stats = runner.stats()
@@ -521,6 +524,7 @@ def test_real_cuda_output_overlap_pipeline_matches_sync_bitwise() -> None:
             num_quantizers=2,
             total_gpu_memory_fraction=1.0,
             graph_keys=DEFAULT_GRAPH_KEYS,
+            model_footprint_bytes=0,
         )
         scheduler = Code2WavScheduler(
             model,
@@ -826,8 +830,35 @@ def build_tiered_runner(
         num_quantizers=16,
         total_gpu_memory_fraction=0.5,
         graph_keys=TIERED_GRAPH_KEYS,
+        model_footprint_bytes=100,
         device_api=backend,
     )
+
+
+def test_process_allocation_above_the_stage_budget_still_captures() -> None:
+    backend = SequencedBackend(
+        snapshots=[
+            (900, 950),  # before: another stage in the process holds 800
+            (960, 1010),  # after the serial keys
+        ],
+    )
+    runner = Code2WavCudaGraphRunner.build(
+        FakeModel(),
+        device="cuda:0",
+        num_quantizers=16,
+        total_gpu_memory_fraction=0.5,
+        graph_keys=DEFAULT_GRAPH_KEYS,
+        model_footprint_bytes=100,
+        device_api=backend,
+    )
+
+    stats = runner.stats()
+    assert stats["enabled"] is True
+    assert stats["build"]["published_graph_count"] == len(DEFAULT_GRAPH_KEYS)
+    assert stats["memory"]["stage_budget_bytes"] == 500
+    assert stats["memory"]["loaded_model_footprint_bytes"] == 100
+    assert stats["memory"]["graph_budget_bytes"] == 400
+    assert stats["memory"]["graph_footprint_bytes"] == 60
 
 
 def test_tier1_publishes_full_matrix_within_budget() -> None:
@@ -1119,6 +1150,7 @@ def test_a_device_whose_platform_names_no_graph_backend_is_refused_at_build() ->
             total_gpu_memory_fraction=0.5,
             graph_keys=DEFAULT_GRAPH_KEYS,
             device_api=NoBackend(),
+            model_footprint_bytes=100,
         )
 
 
@@ -1131,6 +1163,7 @@ def test_an_indexless_device_is_refused_at_build() -> None:
             total_gpu_memory_fraction=0.5,
             graph_keys=DEFAULT_GRAPH_KEYS,
             device_api=FakeCudaBackend(),
+            model_footprint_bytes=100,
         )
 
 
@@ -1202,6 +1235,7 @@ def test_capture_pins_cover_warmup_capture_and_the_equivalence_check(
         total_gpu_memory_fraction=0.5,
         graph_keys=(GraphKey(batch_size=1, frames=10),),
         device_api=PhaseRecordingBackend(phase),
+        model_footprint_bytes=100,
     )
 
     assert runner.stats()["build"]["published_graph_count"] == 1

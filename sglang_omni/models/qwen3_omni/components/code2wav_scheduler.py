@@ -6,6 +6,7 @@ runs vocoder incrementally, outputs final audio via outbox.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import queue
@@ -1252,6 +1253,10 @@ def create_code2wav_scheduler(
             num_quantizers=int(model.config.num_quantizers),
             total_gpu_memory_fraction=total_gpu_memory_fraction,
             graph_keys=graph_keys,
+            model_footprint_bytes=sum(
+                tensor.nbytes
+                for tensor in itertools.chain(model.parameters(), model.buffers())
+            ),
         )
         startup_stats = cuda_graph_runner.stats()
         if enable_batching and (not startup_stats["enabled"]):
