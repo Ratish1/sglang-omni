@@ -26,8 +26,9 @@ esac
 SERVE_ARGS="$SERVE_ARGS ${EXTRA_SERVE_ARGS:-}"
 ASR_MODEL=Qwen/Qwen3-ASR-1.7B
 # PIN_CPUS (e.g. 0-15,64-79) runs the server, the benchmark client and the scorer on those
-# cores with memory on NUMA node 0, so the two arms of a pair get identical, disjoint CPU
-PIN=${PIN_CPUS:+numactl --physcpubind=$PIN_CPUS --membind=0}
+# cores with memory on NUMA node PIN_NODE (the card's node, default 0), so the two arms of a
+# pair get identical, disjoint CPU
+PIN=${PIN_CPUS:+numactl --physcpubind=$PIN_CPUS --membind=${PIN_NODE:-0}}
 mkdir -p "$OUT"
 cd "$TREE" || exit 1
 

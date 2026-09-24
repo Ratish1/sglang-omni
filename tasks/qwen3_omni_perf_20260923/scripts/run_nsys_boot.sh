@@ -18,7 +18,7 @@ esac
 SERVE_ARGS="--config $CONFIG --colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768 ${EXTRA_SERVE_ARGS:-}"
 # GPU metrics and CPU sampling need a privileged container; NSYS_ARGS replaces the flags
 NSYS_ARGS=${NSYS_ARGS:---trace=cuda,nvtx,osrt --cuda-graph-trace=node --sample=none --cpuctxsw=none}
-PIN=${PIN_CPUS:+numactl --physcpubind=$PIN_CPUS --membind=0}
+PIN=${PIN_CPUS:+numactl --physcpubind=$PIN_CPUS --membind=${PIN_NODE:-0}}
 mkdir -p "$OUT"
 cd "$TREE" || exit 1
 

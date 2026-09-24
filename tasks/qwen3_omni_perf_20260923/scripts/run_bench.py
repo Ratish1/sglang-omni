@@ -1,9 +1,8 @@
 """One Qwen3-Omni benchmark arm against a running server, or its quality scoring after.
 
 Arms are the CI arms (same eval functions, same prompts imported from the CI modules,
-the talker arms with compute_wer=False) on the full corpus: no max_samples, warmup 1,
-the given concurrency, timeout 500 s where the eval takes one (seed-tts has no timeout
-field and keeps its 300 s).
+the talker arms with compute_wer=False) on the full corpus: no max_samples, warmup 1, the
+given concurrency; sampling, length and timeout fields keep each benchmark's defaults.
 
 gen:   generation against the omni server; results land in OUT/<arm>/
 score: WER of a talker arm or of seed-tts against a Qwen3-ASR server on --asr-port; run
@@ -43,7 +42,6 @@ SPEECH_IDENTITY_TEXT_PROMPTS = (
     "Count from one to five.",
 )
 MODEL = "qwen3-omni"
-TIMEOUT_S = 500
 SEEDTTS_META = "zhaochenyang20/seed-tts-eval-arrow"
 VIDEO_ARGS = dict(video_fps=2, video_max_frames=128, video_max_pixels=401408)
 
@@ -64,7 +62,7 @@ def mmsu_args(
         task_names=None,
         categories=None,
         prompt=MMSU_TTS_PROMPT if talker else None,
-        max_tokens=256 if talker else 32,
+        max_tokens=32,
         temperature=0.0,
         warmup=1,
         max_concurrency=concurrency,
@@ -76,7 +74,7 @@ def mmsu_args(
         lang="en",
         asr_device="cuda:0",
         asr_concurrency=32,
-        timeout_s=TIMEOUT_S,
+        timeout_s=300,
         fingerprint=False,
     )
 
@@ -119,16 +117,13 @@ async def seeded_speech_requests(port: int, out: str, samples_per_input: int) ->
 
     per_sample = []
     url = f"http://127.0.0.1:{port}/v1/chat/completions"
-    timeout = aiohttp.ClientTimeout(total=TIMEOUT_S)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession() as session:
         for sample_id, inputs in requests:
             payload = {
                 "model": MODEL,
                 **inputs,
                 "modalities": ["text", "audio"],
                 "audio": {"format": "wav"},
-                "max_tokens": 64,
-                "temperature": 0.0,
                 "seed": SPEECH_IDENTITY_SEED,
                 "stream": False,
             }
@@ -190,9 +185,7 @@ async def generate(
             max_concurrency=concurrency,
             warmup=1,
             disable_tqdm=True,
-            timeout_s=TIMEOUT_S,
             enable_audio=talker,
-            max_tokens=256 if talker else 2048,
             prompt_override=MMMU_TTS_PROMPT if talker else None,
             max_samples=max_samples,
         )
@@ -213,9 +206,7 @@ async def generate(
         max_concurrency=concurrency,
         warmup=1,
         disable_tqdm=True,
-        timeout_s=TIMEOUT_S,
         enable_audio=talker,
-        max_tokens=256,
         max_samples=max_samples,
         **VIDEO_ARGS,
     )
