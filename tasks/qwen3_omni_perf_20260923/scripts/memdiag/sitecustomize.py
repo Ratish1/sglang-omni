@@ -8,6 +8,9 @@ MEMDIAG_GC=1 runs gc.collect() and torch.cuda.empty_cache() before the KV sizing
 collection runs after sizing, so the pool is sized exactly as on main and the log shows how
 much was collectable. MEMDIAG_FIND=1 first lists the CUDA tensors that only reference cycles
 keep alive at sizing, with the frames and objects holding them (that collection frees them).
+MEMDIAG_RATIO=1 counts the talker's new-token-ratio resets and decays and logs the current
+ratio every 5 s; MEMDIAG_NO_RATIO_RESET=1 also turns the talker's resets into no-ops
+(diagnostic arm only).
 """
 
 import gc
@@ -139,9 +142,58 @@ def patch(module):
     runner.init_cuda_graphs = init_cuda_graphs
 
 
+def patch_ratio(module):
+    """Talker only: count new-token-ratio resets and decays and log the current ratio."""
+    if multiprocessing.current_process().name != "stage-talker_ar":
+        return
+    import threading
+    import time
+
+    tracker_cls = module.NewTokenRatioTracker
+    counts = {"reset": 0, "decay": 0}
+    trackers = []
+    reset_original = tracker_cls.reset
+    decay_original = tracker_cls.decay_step
+    skip_reset = os.environ.get("MEMDIAG_NO_RATIO_RESET") == "1"
+
+    def reset(self):
+        counts["reset"] += 1
+        if self not in trackers:
+            trackers.append(self)
+        if not skip_reset:
+            reset_original(self)
+
+    def decay_step(self):
+        counts["decay"] += 1
+        if self not in trackers:
+            trackers.append(self)
+        decay_original(self)
+
+    tracker_cls.reset = reset
+    tracker_cls.decay_step = decay_step
+
+    def report():
+        while True:
+            time.sleep(5)
+            current = trackers[0].current if trackers else None
+            log(
+                f"ratio talker resets={counts['reset']} decays={counts['decay']} "
+                f"current={current} skip_reset={skip_reset}"
+            )
+
+    threading.Thread(target=report, daemon=True).start()
+
+
+TARGETS = {TARGET: patch}
+if os.environ.get("MEMDIAG_RATIO") == "1":
+    TARGETS["sglang.srt.managers.scheduler_components.new_token_ratio_tracker"] = (
+        patch_ratio
+    )
+
+
 class PatchOnImport(importlib.abc.MetaPathFinder):
     def find_spec(self, name, path, target=None):
-        if name != TARGET:
+        if name not in TARGETS:
             return None
         sys.meta_path.remove(self)
         try:
@@ -152,7 +204,7 @@ class PatchOnImport(importlib.abc.MetaPathFinder):
 
         def exec_module(module):
             exec_original(module)
-            patch(module)
+            TARGETS[name](module)
 
         spec.loader.exec_module = exec_module
         return spec
