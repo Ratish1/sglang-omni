@@ -14,6 +14,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.common import is_pin_memory_available
 from torch import nn
 
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
@@ -1223,39 +1224,49 @@ class Qwen3OmniTalker(nn.Module):
         self.sampling_top_ks[:batch_size].copy_(staging_gpu[4, :batch_size])
         self.sampling_seeds[:batch_size].copy_(staging_gpu[5, :batch_size])
 
-        if rep_rows:
-            rep_pairs = torch.tensor(
-                rep_rows + rep_toks, dtype=torch.long, device=device
+        rep_active_rows = [
+            row_idx for row_idx, penalty in enumerate(rep_penalties) if penalty != 1.0
+        ]
+        mask_index_values = rep_rows + rep_toks + sup_rows + sup_toks + rep_active_rows
+        if mask_index_values:
+            rep_count = len(rep_rows)
+            sup_count = len(sup_rows)
+            sup_start = 2 * rep_count
+            rep_active_start = sup_start + 2 * sup_count
+            # note (ratish): a pinned source keeps this one copy asynchronous
+            mask_indices = torch.tensor(
+                mask_index_values,
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(device),
+            ).to(device, non_blocking=True)
+            if rep_rows:
+                self.repetition_mask.index_put_(
+                    (mask_indices[:rep_count], mask_indices[rep_count:sup_start]),
+                    self.mask_true_value,
+                )
+            else:
+                pass
+            if sup_rows:
+                self.suppress_mask.index_put_(
+                    (
+                        mask_indices[sup_start : sup_start + sup_count],
+                        mask_indices[sup_start + sup_count : rep_active_start],
+                    ),
+                    self.mask_true_value,
+                )
+            else:
+                pass
+            self.decode_prep_rep_rows = (
+                mask_indices[rep_active_start:] if rep_active_rows else None
             )
-            self.repetition_mask[
-                rep_pairs[: len(rep_rows)], rep_pairs[len(rep_rows) :]
-            ] = True
         else:
-            pass
-
-        if sup_rows:
-            sup_pairs = torch.tensor(
-                sup_rows + sup_toks, dtype=torch.long, device=device
-            )
-            self.suppress_mask[
-                sup_pairs[: len(sup_rows)], sup_pairs[len(sup_rows) :]
-            ] = True
-        else:
-            pass
+            self.decode_prep_rep_rows = None
 
         self.decode_prep_rids = [sched_req.data.req.rid for sched_req in requests]
         self.decode_prep_out_lens = [
             len(sched_req.data.req.output_ids) if sched_req.data.req.output_ids else 0
             for sched_req in requests
         ]
-        rep_active_rows = [
-            row_idx for row_idx, penalty in enumerate(rep_penalties) if penalty != 1.0
-        ]
-        self.decode_prep_rep_rows = (
-            torch.tensor(rep_active_rows, dtype=torch.long, device=device)
-            if rep_active_rows
-            else None
-        )
 
     def prepare_input_embeds(
         self,
