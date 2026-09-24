@@ -2496,6 +2496,124 @@ def test_talker_steady_step_issues_no_blocking_device_sync() -> None:
     ]
 
 
+def expected_decode_masks(
+    requests: list[SimpleNamespace], *, vocab: int = 8
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Masks a fresh batch must hold: penalized rows mark their output tokens,
+    every row marks its suppress tokens, tokens outside the vocab are dropped."""
+    repetition_mask = torch.zeros(len(requests), vocab, dtype=torch.bool)
+    suppress_mask = torch.zeros(len(requests), vocab, dtype=torch.bool)
+    for row_idx, sched_req in enumerate(requests):
+        req = sched_req.data.req
+        if req.sampling_params.repetition_penalty != 1.0:
+            for token in req.output_ids:
+                if 0 <= token < vocab:
+                    repetition_mask[row_idx, token] = True
+                else:
+                    pass
+        else:
+            pass
+        for token in sched_req.data.suppress_tokens or []:
+            if 0 <= token < vocab:
+                suppress_mask[row_idx, token] = True
+            else:
+                pass
+    return repetition_mask, suppress_mask
+
+
+def assert_decode_masks(fake: SimpleNamespace, requests: list[SimpleNamespace]) -> None:
+    batch_size = len(requests)
+    repetition_mask, suppress_mask = expected_decode_masks(requests)
+    assert torch.equal(fake.repetition_mask[:batch_size].cpu(), repetition_mask)
+    assert torch.equal(fake.suppress_mask[:batch_size].cpu(), suppress_mask)
+
+
+def test_talker_batch_change_masks_hold_duplicate_and_out_of_vocab_tokens() -> None:
+    fake = talker_seed_self()
+    requests = [
+        talker_prep_req("a", penalty=1.5, output_ids=[2, 2, 5, 9], suppress=[3, 3, 7]),
+        talker_prep_req("b", penalty=1.2, output_ids=[2, 5], suppress=[3, -1]),
+        talker_prep_req("c", penalty=1.0, output_ids=[1], suppress=None),
+    ]
+
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+
+    assert_decode_masks(fake, requests)
+    assert fake.decode_prep_rep_rows.tolist() == [0, 1]
+
+
+def test_talker_batch_change_with_empty_index_lists_clears_the_masks() -> None:
+    fake = talker_seed_self()
+    marked = [
+        talker_prep_req("a", penalty=1.5, output_ids=[2], suppress=[3]),
+        talker_prep_req("b", penalty=1.5, output_ids=[4], suppress=[5]),
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, marked)
+
+    unmarked = [
+        talker_prep_req("c", output_ids=[1]),
+        talker_prep_req("d", output_ids=[6]),
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, unmarked)
+
+    assert_decode_masks(fake, unmarked)
+    assert fake.decode_prep_rep_rows is None
+
+
+def test_talker_batch_change_to_a_larger_batch_keeps_masks() -> None:
+    fake = talker_seed_self()
+    small = [talker_prep_req("a", penalty=1.5, output_ids=[1], suppress=[2])]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, small)
+    assert_decode_masks(fake, small)
+
+    large = [
+        talker_prep_req(
+            f"r{row_idx}",
+            penalty=1.25,
+            output_ids=list(range(row_idx, 8)),
+            suppress=list(range(8 - row_idx)),
+        )
+        for row_idx in range(4)
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, large)
+    assert_decode_masks(fake, large)
+    assert fake.decode_prep_rep_rows.tolist() == [0, 1, 2, 3]
+
+    fake.sampling_temperatures[0, 0] = 123.0
+    advance_decode_step(fake, large, [0, 0, 0, 0])
+    Qwen3OmniTalker.prepare_decode_buffers(fake, large)
+
+    assert float(fake.sampling_temperatures[0, 0]) == 123.0
+    assert_decode_masks(fake, large)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="sync debug mode requires CUDA"
+)
+def test_talker_batch_change_issues_no_blocking_device_sync() -> None:
+    device = torch.device("cuda")
+    fake = talker_seed_self(device=device)
+    batches = [
+        [talker_prep_req("a", penalty=1.5, output_ids=[1], suppress=[2])],
+        [
+            talker_prep_req("b", penalty=1.5, output_ids=[2, 2, 5], suppress=[3, 7]),
+            talker_prep_req("c", penalty=1.2, output_ids=[2, 6], suppress=[3]),
+            talker_prep_req("d", output_ids=[4]),
+        ],
+        [talker_prep_req("e", output_ids=[3])],
+    ]
+    torch.cuda.synchronize(device)
+
+    for requests in batches:
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        assert_decode_masks(fake, requests)
+
+
 @pytest.mark.accelerator
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="sampling staging regression requires CUDA"
