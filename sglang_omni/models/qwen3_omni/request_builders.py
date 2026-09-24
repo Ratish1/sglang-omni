@@ -841,7 +841,6 @@ def build_sglang_talker_request(
     ) = None,
     tts_pad_embed: torch.Tensor | None = None,
     thinker_chunks_done: bool = True,
-    thinker_config: Any = None,
     talker_model_inputs: dict[str, Any] | None = None,
     seed: int | None = None,
 ) -> "SGLangARRequestData":
@@ -859,7 +858,7 @@ def build_sglang_talker_request(
         thinker_layer_hidden: Optional layer-N hidden states for dual-layer mode.
         thinker_token_ids: Optional thinker output token ids aligned with hidden states.
     """
-    from sglang.srt.managers.schedule_batch import MultimodalInputs, Req
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.sampling.sampling_params import SamplingParams
 
     # SGLangARRequestData already imported at module level
@@ -913,29 +912,8 @@ def build_sglang_talker_request(
         if suppress_tokens
         else None
     )
-    if thinker_config is not None and talker_model_inputs:
-        from sglang_omni.models.qwen3_omni.mrope_positions import (
-            linear_mrope_positions,
-            talker_can_use_linear_mrope,
-        )
-
-        ids = input_ids_tensor.to(dtype=torch.long)
-        mm_model_inputs = talker_model_inputs or {}
-        if talker_can_use_linear_mrope(ids, mm_model_inputs, thinker_config):
-            mrope_positions, mrope_position_delta = linear_mrope_positions(
-                int(ids.numel())
-            )
-        else:
-            mrope_positions, mrope_position_delta = compute_mrope_positions(
-                ids, mm_model_inputs, thinker_config
-            )
-        mm_inputs = MultimodalInputs(mm_items=[])
-        mm_inputs.mrope_positions = mrope_positions
-        mm_inputs.mrope_position_delta = mrope_position_delta
-        req.multimodal_inputs = mm_inputs
-    else:
-        pass
-
+    # note (ratish): no multimodal_inputs: the talker rotary is not mrope and reads
+    # forward_batch.positions only, so per-step mrope positions would go unread
     multimodal_mask: torch.Tensor | None = None
     if thinker_token_ids is not None:
         token_ids = torch.as_tensor(thinker_token_ids, dtype=torch.long)
@@ -1113,7 +1091,6 @@ def make_talker_scheduler_adapters(
     codec_vocab_size: int,
     model: Any,
     model_path: str,
-    thinker_config: Any,
     codec_bos_id: int = 2149,
     codec_eos_id: int | None = None,
     codec_nothink_id: int = 2155,
@@ -1184,7 +1161,6 @@ def make_talker_scheduler_adapters(
             audio_token_id=audio_token_id,
             image_token_id=image_token_id,
             video_token_id=video_token_id,
-            thinker_config=thinker_config,
             resolve_sampling_config=_resolve_talker_sampling_config,
         )
 
@@ -1214,7 +1190,6 @@ def build_talker_request_data(
     audio_token_id: int | None,
     image_token_id: int | None,
     video_token_id: int | None,
-    thinker_config: Any,
     resolve_sampling_config: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> SGLangARRequestData:
     params = payload.request.params
@@ -1275,7 +1250,6 @@ def build_talker_request_data(
         pending_text_queue=pending_text_queue,
         tts_pad_embed=prompt_prefill["tts_pad_embed"],
         thinker_chunks_done=thinker_done,
-        thinker_config=thinker_config,
         talker_model_inputs=prompt_prefill["prompt_model_inputs"],
         seed=sampling_cfg.get("seed"),
     )
