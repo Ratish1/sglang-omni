@@ -17,9 +17,11 @@ case $DTYPE in
     SERVE_ARGS="--config examples/configs/qwen3_omni_colocated_h100_bf16.yaml $QWEN_ARGS" ;;
   fp8) MODEL=marksverdhei/Qwen3-Omni-30B-A3B-FP8
     SERVE_ARGS="--config examples/configs/qwen3_omni_colocated_h100_fp8.yaml $QWEN_ARGS" ;;
+  h200) MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
+    SERVE_ARGS="--config examples/configs/qwen3_omni_colocated_h200.yaml $QWEN_ARGS" ;;
   minicpmo) MODEL=openbmb/MiniCPM-o-4_5
     SERVE_ARGS="--thinker.factory.max_seq_len 8192 --thinker.engine.mem_fraction_static 0.55 --talker.engine.mem_fraction_static 0.15" ;;
-  *) echo "dtype must be bf16, fp8 or minicpmo"; exit 1 ;;
+  *) echo "dtype must be bf16, fp8, h200 or minicpmo"; exit 1 ;;
 esac
 SERVE_ARGS="$SERVE_ARGS ${EXTRA_SERVE_ARGS:-}"
 ASR_MODEL=Qwen/Qwen3-ASR-1.7B

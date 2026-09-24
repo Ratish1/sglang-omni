@@ -12,7 +12,8 @@ S=$(cd "$(dirname "$0")" && pwd)
 case $DTYPE in
   bf16) MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct CONFIG=examples/configs/qwen3_omni_colocated_h100_bf16.yaml ;;
   fp8) MODEL=marksverdhei/Qwen3-Omni-30B-A3B-FP8 CONFIG=examples/configs/qwen3_omni_colocated_h100_fp8.yaml ;;
-  *) echo "dtype must be bf16 or fp8"; exit 1 ;;
+  h200) MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct CONFIG=examples/configs/qwen3_omni_colocated_h200.yaml ;;
+  *) echo "dtype must be bf16, fp8 or h200"; exit 1 ;;
 esac
 SERVE_ARGS="--config $CONFIG --colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768 ${EXTRA_SERVE_ARGS:-}"
 # GPU metrics and CPU sampling need a privileged container; NSYS_ARGS replaces the flags
