@@ -57,6 +57,7 @@ from sglang_omni.profiler.event_recorder import (
     emit_model_path_start as _emit_model_path_start,
 )
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
+from sglang_omni.profiler.pipeline_nvtx import trace_range
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
     ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
@@ -3056,10 +3057,11 @@ class OmniScheduler:
         # (which is mostly Python-side dispatch into many small CUDA kernels)
         # slows ~600x, dropping audio QPS from >10 to <0.5.
         while self.running:
-            self.process_admin_requests()
-            recv_reqs = self.recv_requests()
-            recv_reqs.extend(self.take_deferred_request_payloads())
-            self.process_input_requests(recv_reqs)
+            with trace_range("scheduler", "recv"):
+                self.process_admin_requests()
+                recv_reqs = self.recv_requests()
+                recv_reqs.extend(self.take_deferred_request_payloads())
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:  # noqa: leading-underscore
                 self.process_admin_requests()
                 time.sleep(0.001)
@@ -3067,13 +3069,15 @@ class OmniScheduler:
             else:
                 pass
 
-            batch = self.get_next_batch_to_run()
+            with trace_range("scheduler", "next_batch"):
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             if batch:
                 result = self.run_batch(batch)
                 if result is not _FAILED_BATCH_RESULT:
-                    self.process_batch_result(batch, result)
+                    with trace_range("scheduler", "process_result"):
+                        self.process_batch_result(batch, result)
                 else:
                     pass
             else:

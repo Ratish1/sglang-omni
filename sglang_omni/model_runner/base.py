@@ -352,7 +352,8 @@ class ModelRunner:
         else:
             pass
         with self.execution_context(schedule_batch, isolate_sampling=True):
-            built = self.build_forward_batch(scheduler_output)
+            with trace_range("runner", "build"):
+                built = self.build_forward_batch(scheduler_output)
             if built is None:
                 return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
             else:
@@ -361,38 +362,41 @@ class ModelRunner:
             batch_result = self.prepare_and_forward(
                 forward_batch, schedule_batch, scheduler_output.requests, is_prefill
             )
-            if is_prefill:
-                self.post_prefill(
+            with trace_range("runner", "post"):
+                if is_prefill:
+                    self.post_prefill(
+                        batch_result,
+                        forward_batch,
+                        schedule_batch,
+                        scheduler_output.requests,
+                    )
+                else:
+                    self.post_decode(
+                        batch_result,
+                        forward_batch,
+                        schedule_batch,
+                        scheduler_output.requests,
+                    )
+            with trace_range("runner", "publish"):
+                self.ensure_next_token_ids(
+                    batch_result,
+                    forward_batch,
+                    schedule_batch,
+                    scheduler_output,
+                )
+                self.publish_next_tokens(
                     batch_result,
                     forward_batch,
                     schedule_batch,
                     scheduler_output.requests,
                 )
-            else:
-                self.post_decode(
-                    batch_result,
-                    forward_batch,
-                    schedule_batch,
-                    scheduler_output.requests,
-                )
-            self.ensure_next_token_ids(
+        with trace_range("runner", "finalize"):
+            return self.finalize(
                 batch_result,
                 forward_batch,
                 schedule_batch,
                 scheduler_output,
             )
-            self.publish_next_tokens(
-                batch_result,
-                forward_batch,
-                schedule_batch,
-                scheduler_output.requests,
-            )
-        return self.finalize(
-            batch_result,
-            forward_batch,
-            schedule_batch,
-            scheduler_output,
-        )
 
     @trace_call(
         "runner",
@@ -573,25 +577,31 @@ class ModelRunner:
         """Prepare hook → standard forward (if not custom) → sample-before-post
         block. Returns ``batch_result``."""
         try:
-            if is_prefill:
-                self.before_prefill(forward_batch, schedule_batch, requests)
-                batch_result = self.custom_prefill_forward(
-                    forward_batch, schedule_batch, requests
-                )
-            else:
-                self.before_decode(
-                    forward_batch,
-                    schedule_batch,
-                    requests,
-                    is_lookahead=is_lookahead,
-                )
-                batch_result = self.custom_decode_forward(
-                    forward_batch, schedule_batch, requests
-                )
-            if batch_result is None:
-                batch_result = self.tp_worker.forward_batch_generation(forward_batch)
-            else:
-                pass
+            with trace_range("runner", "before"):
+                if is_prefill:
+                    self.before_prefill(forward_batch, schedule_batch, requests)
+                else:
+                    self.before_decode(
+                        forward_batch,
+                        schedule_batch,
+                        requests,
+                        is_lookahead=is_lookahead,
+                    )
+            with trace_range("runner", "forward"):
+                if is_prefill:
+                    batch_result = self.custom_prefill_forward(
+                        forward_batch, schedule_batch, requests
+                    )
+                else:
+                    batch_result = self.custom_decode_forward(
+                        forward_batch, schedule_batch, requests
+                    )
+                if batch_result is None:
+                    batch_result = self.tp_worker.forward_batch_generation(
+                        forward_batch
+                    )
+                else:
+                    pass
 
             if (
                 not schedule_batch.is_prefill_only
@@ -606,12 +616,13 @@ class ModelRunner:
                     )
                 )
             ):
-                batch_result.next_token_ids = self.sample_next_token_ids(
-                    batch_result.logits_output,
-                    forward_batch,
-                    schedule_batch,
-                    requests,
-                )
+                with trace_range("runner", "sample"):
+                    batch_result.next_token_ids = self.sample_next_token_ids(
+                        batch_result.logits_output,
+                        forward_batch,
+                        schedule_batch,
+                        requests,
+                    )
             else:
                 pass
             return batch_result

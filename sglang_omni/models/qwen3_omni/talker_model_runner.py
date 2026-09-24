@@ -12,6 +12,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
+from sglang_omni.profiler.pipeline_nvtx import trace_range
 from sglang_omni.scheduling.message import OutgoingMessage
 
 if TYPE_CHECKING:
@@ -89,8 +90,10 @@ class QwenTalkerModelRunner(ModelRunner):
         else:
             pass
 
-        self.model.prepare_decode_buffers(requests)
-        self.write_feedback_buffers(requests)
+        with trace_range("talker", "prepare_decode_buffers"):
+            self.model.prepare_decode_buffers(requests)
+        with trace_range("talker", "write_feedback_buffers"):
+            self.write_feedback_buffers(requests)
 
     def post_prefill(
         self,
@@ -141,11 +144,13 @@ class QwenTalkerModelRunner(ModelRunner):
 
         batch_size = len(requests)
         result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
-        self.stage_token_ids(result, result.next_token_ids)
-        self.emit_code_chunks_and_feedback(
-            schedule_batch=schedule_batch,
-            requests=requests,
-        )
+        with trace_range("talker", "stage_token_ids"):
+            self.stage_token_ids(result, result.next_token_ids)
+        with trace_range("talker", "emit_code_chunks"):
+            self.emit_code_chunks_and_feedback(
+                schedule_batch=schedule_batch,
+                requests=requests,
+            )
 
     def emit_code_chunks_and_feedback(
         self,
