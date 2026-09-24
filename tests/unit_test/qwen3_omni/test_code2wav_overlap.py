@@ -149,6 +149,7 @@ def _make_gpu_scheduler(
             num_quantizers=2,
             total_gpu_memory_fraction=1.0,
             graph_keys=code2wav_scheduler.serial_threshold_graph_keys(10, 1),
+            model_footprint_bytes=0,
         )
         assert runner.stats()["enabled"] is True
     scheduler = Code2WavScheduler(

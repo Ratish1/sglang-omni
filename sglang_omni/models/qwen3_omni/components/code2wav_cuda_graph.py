@@ -250,6 +250,7 @@ class Code2WavCudaGraphRunner:
         num_quantizers: int,
         total_gpu_memory_fraction: float | None,
         graph_keys: tuple[GraphKey, ...],
+        model_footprint_bytes: int,
         device_api: Any | None = None,
     ) -> Code2WavCudaGraphRunner:
         """Build the configured serving-reachable serial graphs."""
@@ -260,10 +261,12 @@ class Code2WavCudaGraphRunner:
             graph_keys=graph_keys,
             device_api=TorchDeviceApi() if device_api is None else device_api,
         )
-        runner._build(total_gpu_memory_fraction)
+        runner._build(total_gpu_memory_fraction, model_footprint_bytes)
         return runner
 
-    def _build(self, total_gpu_memory_fraction: float | None) -> None:
+    def _build(
+        self, total_gpu_memory_fraction: float | None, model_footprint_bytes: int
+    ) -> None:
         fraction = self.valid_fraction(total_gpu_memory_fraction)
         if fraction is None:
             self.disable_reason = "invalid_total_gpu_memory_fraction"
@@ -293,12 +296,13 @@ class Code2WavCudaGraphRunner:
             return
         self.memory_stats["before"] = before
         stage_budget = int(before["total_bytes"] * fraction)
-        loaded_model_footprint = before["allocated_bytes"]
-        graph_budget = max(0, stage_budget - loaded_model_footprint)
+        # note (ratish): the stage budget covers this model alone, so allocations
+        # of other stages sharing the process must not shrink it.
+        graph_budget = max(0, stage_budget - model_footprint_bytes)
         self.memory_stats.update(
             {
                 "stage_budget_bytes": stage_budget,
-                "loaded_model_footprint_bytes": loaded_model_footprint,
+                "loaded_model_footprint_bytes": model_footprint_bytes,
                 "graph_budget_bytes": graph_budget,
             }
         )
