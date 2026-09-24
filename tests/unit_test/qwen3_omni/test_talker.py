@@ -2289,6 +2289,7 @@ def _talker_seed_self(
     fake = SimpleNamespace(
         repetition_mask=torch.zeros(max_bs, vocab, dtype=torch.bool, device=device),
         suppress_mask=torch.zeros(max_bs, vocab, dtype=torch.bool, device=device),
+        mask_true_value=torch.ones((), dtype=torch.bool, device=device),
         repetition_penalties=torch.ones(max_bs, 1, device=device),
         sampling_temperatures=torch.ones(max_bs, 1, device=device),
         sampling_top_ps=torch.ones(max_bs, device=device),
@@ -2425,6 +2426,68 @@ def test_talker_prepare_decode_buffers_steady_state_reuse() -> None:
     Qwen3OmniTalker.prepare_decode_buffers(fresh, requests)
     assert torch.equal(fake.repetition_mask, fresh.repetition_mask)
     assert torch.equal(fake.suppress_mask, fresh.suppress_mask)
+
+
+def advance_decode_step(
+    fake: SimpleNamespace,
+    requests: list[SimpleNamespace],
+    sampled_tokens: list[int],
+) -> None:
+    fake.sampled_token_ids[: len(sampled_tokens)] = torch.tensor(
+        sampled_tokens, device=fake.sampled_token_ids.device
+    )
+    for sched_req, token in zip(requests, sampled_tokens):
+        sched_req.data.req.output_ids.append(token)
+
+
+def test_talker_steady_step_marks_repetition_like_advanced_indexing() -> None:
+    fake = _talker_seed_self()
+    requests = [
+        _talker_prep_req("a", penalty=1.5, output_ids=[2]),
+        _talker_prep_req("b", penalty=1.0, output_ids=[4]),
+        _talker_prep_req("c", penalty=1.2, output_ids=[2]),
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    fake.sampling_temperatures[0, 0] = 123.0
+
+    # Row a resamples a token it already holds; row b has no penalty.
+    advance_decode_step(fake, requests, [2, 6, 7])
+    expected = fake.repetition_mask.clone()
+    penalized_rows = torch.tensor([0, 2])
+    expected[penalized_rows, fake.sampled_token_ids[penalized_rows]] = True
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+
+    assert float(fake.sampling_temperatures[0, 0]) == 123.0
+    assert torch.equal(fake.repetition_mask, expected)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="sync debug mode requires CUDA"
+)
+def test_talker_steady_step_issues_no_blocking_device_sync() -> None:
+    device = torch.device("cuda")
+    fake = _talker_seed_self(device=device)
+    requests = [
+        _talker_prep_req("a", penalty=1.5, output_ids=[2]),
+        _talker_prep_req("b", penalty=1.2, output_ids=[4]),
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    advance_decode_step(fake, requests, [5, 6])
+    fake.sampling_temperatures[0, 0] = 123.0
+    torch.cuda.synchronize(device)
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert float(fake.sampling_temperatures[0, 0]) == 123.0
+    assert fake.repetition_mask[:2, [2, 4, 5, 6]].tolist() == [
+        [True, False, True, False],
+        [False, True, False, True],
+    ]
 
 
 @pytest.mark.accelerator

@@ -969,6 +969,11 @@ class Qwen3OmniTalker(nn.Module):
             dtype=torch.bool,
             device=device,
         )
+        # note (ratish): a Python True written through advanced indexing is a
+        # blocking host to device copy, so the mask writes take this instead
+        self.mask_true_value: torch.Tensor = torch.ones(
+            (), dtype=torch.bool, device=device
+        )
         self.sampling_temperatures = torch.ones(
             max_batch_size,
             1,
@@ -1086,7 +1091,9 @@ class Qwen3OmniTalker(nn.Module):
 
         rep_rows = self.decode_prep_rep_rows
         if rep_rows is not None:
-            self.repetition_mask[rep_rows, self.sampled_token_ids[rep_rows]] = True
+            self.repetition_mask.index_put_(
+                (rep_rows, self.sampled_token_ids[rep_rows]), self.mask_true_value
+            )
         else:
             pass
         for row_idx in range(len(prev_lens)):
