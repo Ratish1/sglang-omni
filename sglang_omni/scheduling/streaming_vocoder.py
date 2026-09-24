@@ -87,6 +87,17 @@ def resolve_initial_codec_chunk_frames(
     return min(frames, int(steady_chunk_frames))
 
 
+def vocoder_decode_stream_priority() -> int:
+    """The second-highest stream priority: ahead of the talker's default-priority
+    stream, with the top level left free. A device with two levels uses the top one."""
+    least_priority, greatest_priority = torch.cuda.Stream.priority_range()
+    if greatest_priority + 1 < least_priority:
+        return greatest_priority + 1
+    else:
+        pass
+    return greatest_priority
+
+
 class StreamingVocoderBase(
     StreamingSimpleScheduler, ABC, Generic[StreamStateT, StepPlanT]
 ):
@@ -588,4 +599,5 @@ __all__ = [
     "INITIAL_CODEC_CHUNK_FRAMES_PARAM",
     "StreamingVocoderBase",
     "resolve_initial_codec_chunk_frames",
+    "vocoder_decode_stream_priority",
 ]

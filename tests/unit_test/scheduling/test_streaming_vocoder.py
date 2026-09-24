@@ -257,6 +257,21 @@ def test_resolve_initial_codec_chunk_frames() -> None:
         resolve_initial_codec_chunk_frames({}, steady_chunk_frames=0)
 
 
+@pytest.mark.parametrize(
+    ("priority_range", "expected_priority"),
+    [((0, -3), -2), ((0, -1), -1), ((0, 0), 0)],
+)
+def test_vocoder_decode_stream_priority_leaves_the_top_level_free(
+    monkeypatch: pytest.MonkeyPatch,
+    priority_range: tuple[int, int],
+    expected_priority: int,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda.Stream, "priority_range", staticmethod(lambda: priority_range)
+    )
+    assert streaming_vocoder.vocoder_decode_stream_priority() == expected_priority
+
+
 def test_is_streaming_payload_gate_names_subclass() -> None:
     scheduler = _FakeStreamingVocoder()
     assert scheduler.is_streaming_payload(_payload())

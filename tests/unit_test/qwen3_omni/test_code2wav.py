@@ -54,6 +54,20 @@ def _pin_cuda_platform(monkeypatch) -> None:
     )
 
 
+class _FakeDecodeStream:
+    def __init__(self, *, device: torch.device, priority: int) -> None:
+        self.device = device
+        self.priority = priority
+
+    @staticmethod
+    def priority_range() -> tuple[int, int]:
+        return (0, -3)
+
+
+def _fake_decode_stream(monkeypatch) -> None:
+    monkeypatch.setattr(code2wav_scheduler.torch.cuda, "Stream", _FakeDecodeStream)
+
+
 class _FakeCudaGraphRunner:
     def __init__(self, model, *, replay_error: Exception | None = None) -> None:
         self.model = model
@@ -215,6 +229,7 @@ def test_qwen_code2wav_factory_allows_batching_with_cuda_graph(
     monkeypatch,
 ) -> None:
     _pin_cuda_platform(monkeypatch)
+    _fake_decode_stream(monkeypatch)
     model = _FactoryModel(num_quantizers=12)
     runner = SimpleNamespace(
         available_batch_sizes=lambda frames: (8, 4, 2, 1),
@@ -247,6 +262,7 @@ def test_qwen_code2wav_factory_combines_batching_with_cuda_graph(
     monkeypatch,
 ) -> None:
     _pin_cuda_platform(monkeypatch)
+    _fake_decode_stream(monkeypatch)
     captured_keys: list[tuple] = []
 
     class _RecordingRunner:
@@ -295,6 +311,7 @@ def test_qwen_code2wav_factory_disables_batching_when_runner_disabled(
     monkeypatch,
 ) -> None:
     _pin_cuda_platform(monkeypatch)
+    _fake_decode_stream(monkeypatch)
     build_calls: list[tuple] = []
 
     class _DisabledRunner:
@@ -376,6 +393,7 @@ def test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys(
     build_call: dict = {}
     import sglang_omni.platforms as platforms
 
+    _fake_decode_stream(monkeypatch)
     monkeypatch.setattr(
         platforms.current_platform, "device_type", "cuda", raising=False
     )
@@ -428,7 +446,10 @@ def test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys(
         "total_gpu_memory_fraction": 0.02,
         "graph_keys": expected_graph_keys,
         "model_footprint_bytes": 3 * 4 + 2 * 8,
+        "decode_stream": scheduler.decode_stream,
     }
+    assert scheduler.decode_stream.device == torch.device("cuda:3")
+    assert scheduler.decode_stream.priority == -2
     assert scheduler.device == torch.device("cuda:3")
     assert scheduler.stream_chunk_size == 20
     assert scheduler.left_context_size == 25
@@ -462,6 +483,7 @@ def test_qwen_code2wav_enabled_factory_logs_disabled_build_reason(
     )
     import sglang_omni.platforms as platforms
 
+    _fake_decode_stream(monkeypatch)
     monkeypatch.setattr(
         platforms.current_platform, "device_type", "cuda", raising=False
     )
@@ -929,6 +951,53 @@ def test_eos_chunk_is_skipped_and_never_decoded() -> None:
     audio = np.frombuffer(message.data.data["audio_waveform"], dtype=np.float32)
     assert model.calls == [(1, 2, 2)]
     assert audio.shape == (4,)
+
+
+class _RecordingDecodeStream:
+    def __init__(self, log: list[object]) -> None:
+        self.log = log
+
+    def wait_stream(self, stream: object) -> None:
+        self.log.append(("wait_stream", stream))
+
+    def wait_event(self, event: object) -> None:
+        self.log.append(("wait_event", event))
+
+
+class _LoggingCode2WavModel(FakeCode2WavModel):
+    def __init__(self, log: list[object]) -> None:
+        super().__init__(total_upsample=2)
+        self.log = log
+
+    def __call__(self, codes: torch.Tensor) -> torch.Tensor:
+        self.log.append("forward")
+        return super().__call__(codes)
+
+
+def test_serving_thread_decodes_after_the_receiving_stream(monkeypatch) -> None:
+    log: list[object] = []
+    selected: list[object] = []
+    receiving_stream = object()
+    monkeypatch.setattr(code2wav_scheduler.torch.cuda, "set_stream", selected.append)
+    monkeypatch.setattr(
+        code2wav_scheduler.torch.cuda, "default_stream", lambda device: receiving_stream
+    )
+    decode_stream = _RecordingDecodeStream(log)
+    scheduler = Code2WavScheduler(
+        _LoggingCode2WavModel(log),
+        device="cpu",
+        stream_chunk_size=2,
+        left_context_size=1,
+        decode_stream=decode_stream,
+    )
+
+    scheduler.on_serving_start()
+    scheduler.stream_payloads["req-1"] = make_qwen_payload(request_id="req-1")
+    _feed(scheduler, "req-1", (1, 2), stream=True)
+
+    assert selected == [decode_stream]
+    assert log.count("forward") == 1
+    assert log[log.index("forward") - 1] == ("wait_stream", receiving_stream)
 
 
 def test_qwen_code2wav_emits_full_chunk_despite_model_output_deficit() -> None:
