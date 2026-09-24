@@ -9,53 +9,6 @@ import numpy as np
 import torch
 
 
-def linear_mrope_positions(
-    seq_len: int,
-    *,
-    device: torch.device | None = None,
-    dtype: torch.dtype = torch.long,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """arange broadcast to [3, seq] with delta 0."""
-    # Note (guozhihao): clone so MultimodalInputs owns a contiguous buffer
-    # (expand returns a view).
-    positions = (
-        torch.arange(seq_len, device=device, dtype=dtype)
-        .unsqueeze(0)
-        .expand(3, -1)
-        .clone()
-    )
-    delta = torch.zeros((1, 1), device=device, dtype=dtype)
-    return positions, delta
-
-
-def talker_can_use_linear_mrope(
-    input_ids: torch.Tensor,
-    model_inputs: dict[str, Any],
-    thinker_config: Any,
-) -> bool:
-    """True when linear arange+delta0 matches full mm MRoPE."""
-    # Note (guozhihao): talker uses MRotaryEmbedding; decode is
-    # seq_len + delta - 1. Mm placeholders + grids make positions/delta
-    # diverge from arange+0 (#1149 Part B), so only short-circuit when no
-    # multimodal segment would be emitted (no grids, or grids but no
-    # vision_start/audio_start in input_ids).
-    has_image = model_inputs.get("image_grid_thw") is not None
-    has_video = model_inputs.get("video_grid_thw") is not None
-    if not has_image and not has_video:
-        return True
-    else:
-        pass
-
-    ids = input_ids.view(-1)
-    vision_start = int(thinker_config.vision_start_token_id)
-    audio_start = int(thinker_config.audio_start_token_id)
-    if not (ids == vision_start).any() and not (ids == audio_start).any():
-        return True
-    else:
-        pass
-    return False
-
-
 def feat_extract_output_lengths(input_lengths: int) -> int:
     """Audio encoder output length (matches HF / sglang port)."""
     input_lengths_leave = input_lengths % 100

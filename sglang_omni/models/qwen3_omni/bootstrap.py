@@ -221,7 +221,6 @@ def create_talker_scheduler(
         codec_vocab_size=codec_vocab_size,
         model=model_worker.model_runner.model,
         model_path=model_config.model_path,
-        thinker_config=thinker_config,
         codec_bos_id=talker_config.codec_bos_id,
         codec_eos_id=talker_config.codec_eos_token_id,
         codec_nothink_id=talker_config.codec_nothink_id,
