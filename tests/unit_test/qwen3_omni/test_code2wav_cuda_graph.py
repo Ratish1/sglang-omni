@@ -1180,7 +1180,6 @@ def test_a_device_whose_platform_names_no_graph_backend_is_refused_at_build() ->
             graph_keys=_DEFAULT_GRAPH_KEYS,
             model_footprint_bytes=100,
             decode_stream=None,
-            decode_stream=None,
             device_api=_NoBackend(),
         )
 
@@ -1194,7 +1193,6 @@ def test_an_indexless_device_is_refused_at_build() -> None:
             total_gpu_memory_fraction=0.5,
             graph_keys=_DEFAULT_GRAPH_KEYS,
             model_footprint_bytes=100,
-            decode_stream=None,
             decode_stream=None,
             device_api=_FakeCudaBackend(),
         )
