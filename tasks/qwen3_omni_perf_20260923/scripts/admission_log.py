@@ -4,7 +4,9 @@ Pairs each request's build line (answer tokens, prompt rows) with its finish lin
 then prints the frame and frames-per-answer-token distributions, the admission verdicts,
 the budget terms of rejected attempts, and the retractions.
 
-usage: python admission_log.py <serve.log> [<serve.log> ...]
+usage: python admission_log.py <serve.log> [builds per segment ...]
+With counts, requests are split into consecutive segments by build order (one per arm run
+back to back on the server, warmups included); the last segment takes the rest.
 """
 
 from __future__ import annotations
@@ -35,7 +37,15 @@ def quantiles(values: list[float]) -> str:
     return f"n={len(values)} mean={statistics.fmean(values):.2f} {body} max={ordered[-1]:.2f}"
 
 
-def summarize(path: str) -> None:
+def read_log(
+    path: str,
+) -> tuple[
+    dict[str, dict[str, str]],
+    dict[str, dict[str, str]],
+    Counter[str],
+    list[dict[str, str]],
+    list[dict[str, str]],
+]:
     builds: dict[str, dict[str, str]] = {}
     finishes: dict[str, dict[str, str]] = {}
     verdicts: Counter[str] = Counter()
@@ -62,14 +72,19 @@ def summarize(path: str) -> None:
                 retractions.append(values)
             else:
                 pass
+    return builds, finishes, verdicts, rejected, retractions
 
+
+def summarize(
+    label: str, builds: dict[str, dict[str, str]], finishes: dict[str, dict[str, str]]
+) -> None:
     paired = [rid for rid in finishes if rid in builds]
     frames = [float(finishes[rid]["frames"]) for rid in paired]
     answers = [float(builds[rid]["answer_tokens"]) for rid in paired]
     prompts = [float(builds[rid]["prompt_rows"]) for rid in paired]
     per_token = [f / a for f, a in zip(frames, answers) if a > 0]
     reasons = Counter(finishes[rid]["reason"] for rid in paired)
-    print(f"== {path}")
+    print(f"== {label}")
     print(f"requests built={len(builds)} finished={len(finishes)} paired={len(paired)}")
     print(f"finish reasons {dict(reasons)}")
     print(f"frames            {quantiles(frames)}")
@@ -78,17 +93,28 @@ def summarize(path: str) -> None:
     print(f"frames per token  {quantiles(per_token)}")
     above = sum(1 for value in frames if value > 256)
     print(f"frames above 256: {above} of {len(frames)}")
+
+
+def main() -> None:
+    path = sys.argv[1]
+    counts = [int(value) for value in sys.argv[2:]]
+    builds, finishes, verdicts, rejected, retractions = read_log(path)
+    order = list(builds)
+    start = 0
+    for index, count in enumerate([*counts, len(order)]):
+        segment = order[start : start + count] if index < len(counts) else order[start:]
+        start += len(segment)
+        summarize(
+            f"{path} segment {index}",
+            {rid: builds[rid] for rid in segment},
+            finishes,
+        )
     print(f"admission verdicts {dict(verdicts)}")
     for values in rejected[:5]:
         print(f"  rejected {values}")
     print(f"retractions {len(retractions)}")
     for values in retractions[:5]:
         print(f"  retract {values}")
-
-
-def main() -> None:
-    for path in sys.argv[1:]:
-        summarize(path)
 
 
 if __name__ == "__main__":
