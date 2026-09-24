@@ -1292,7 +1292,6 @@ def drive_real_builder(
             audio_token_id=151646,
             image_token_id=151647,
             video_token_id=151648,
-            thinker_config=SimpleNamespace(),
             resolve_sampling_config=resolve_sampling_config,
         )
         return req_data, captured
@@ -1988,6 +1987,56 @@ class TestBuildTalkerRequestTensorStorage:
         assert (
             data.req._input_embeds_are_projected is False
         )  # noqa: leading-underscore  # production name
+
+
+@pytest.mark.usefixtures("patch_sampling")
+def test_talker_request_with_image_grids_carries_no_multimodal_inputs() -> None:
+    """The talker reads plain positions, so even an image prompt attaches no
+    multimodal inputs, and the sampling and model inputs are kept as given."""
+    vision_start_token_id, image_token_id, vision_end_token_id = 151652, 151655, 151653
+    input_ids = torch.tensor(
+        [10, vision_start_token_id]
+        + [image_token_id] * 4
+        + [vision_end_token_id, 11, 151675, 151675],
+        dtype=torch.long,
+    )
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+
+    data = build_sglang_talker_request(
+        thinker_hidden_states=torch.empty(0),
+        tokenizer=FakeQwenTokenizer(),
+        codec_vocab_size=4096,
+        max_new_tokens=64,
+        temperature=0.9,
+        top_k=50,
+        top_p=0.8,
+        repetition_penalty=1.05,
+        codec_eos_id=2150,
+        talker_input_embeds=torch.zeros(input_ids.numel(), 8),
+        talker_input_ids=input_ids,
+        input_embeds_are_projected=True,
+        talker_model_inputs={"image_grid_thw": image_grid_thw},
+        seed=7,
+    )
+
+    assert data.req.multimodal_inputs is None
+    sampling_params = data.req.sampling_params
+    assert sampling_params.max_new_tokens == 64
+    assert sampling_params.temperature == pytest.approx(0.9)
+    assert sampling_params.top_k == 50
+    assert sampling_params.top_p == pytest.approx(0.8)
+    assert sampling_params.repetition_penalty == pytest.approx(1.05)
+    assert sampling_params.stop_token_ids == {2150}
+    assert sampling_params.sampling_seed == 7
+    omni_model_inputs = data.req.omni_model_inputs
+    assert set(omni_model_inputs) == {
+        "image_grid_thw",
+        "talker_layer_hidden_states",
+        "talker_multimodal_mask",
+    }
+    assert omni_model_inputs["image_grid_thw"] is image_grid_thw
+    assert omni_model_inputs["talker_layer_hidden_states"] is None
+    assert omni_model_inputs["talker_multimodal_mask"] is None
 
 
 def test_projected_prefill_reads_tensor_from_data() -> None:

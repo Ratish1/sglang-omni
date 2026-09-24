@@ -656,8 +656,7 @@ that happened to contain an older version of the test.
     bit-identical differential coverage vs the sglang HF-port oracle for
     image / video / audio / audio-in-video / interleaved / mixed prompts,
     non-integer vision timescales, AIV end-of-sequence `st_idx` semantics,
-    `_compute_mrope_positions` wiring, and the talker
-    `talker_can_use_linear_mrope` safe gate
+    and `_compute_mrope_positions` wiring
   - talker behavior, including partial-prefix startup gate, the real
     `_build_talker_request_data` propagation contract (input_ids,
     tts_pad_embed, sampling_seed, fallback chunks, thinker_done), and the
