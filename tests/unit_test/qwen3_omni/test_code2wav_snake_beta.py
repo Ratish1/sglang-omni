@@ -128,6 +128,7 @@ def test_real_code2wav_pcm_equal(monkeypatch: pytest.MonkeyPatch) -> None:
             total_gpu_memory_fraction=0.2,
             graph_keys=graph_keys,
             model_footprint_bytes=model_footprint_bytes,
+            decode_stream=None,
         )
         assert eager_runner.stats()["enabled"], eager_runner.stats()
 
@@ -180,6 +181,7 @@ def test_real_code2wav_pcm_equal(monkeypatch: pytest.MonkeyPatch) -> None:
             total_gpu_memory_fraction=0.2,
             graph_keys=graph_keys,
             model_footprint_bytes=model_footprint_bytes,
+            decode_stream=None,
         )
         assert fused_runner.stats()["enabled"], fused_runner.stats()
         for value, pcm in zip(codes, graph_expected):
