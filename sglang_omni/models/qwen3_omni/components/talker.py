@@ -359,30 +359,9 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
 class Qwen3OmniMoeTalkerDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
     """Talker decoder layer: inherit from Thinker, only replace MLP with Shared Expert MoE."""
 
-    def __init__(
-        self,
-        config: Qwen3OmniMoeTalkerTextConfig,
-        layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
-    ) -> None:
-        # Call parent's __init__ (Thinker's DecoderLayer)
-        super().__init__(
-            config=config,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=prefix,
-            alt_stream=alt_stream,
-        )
-
-        # Replace MLP with Talker's Shared Expert MoE
-        self.mlp = Qwen3OmniMoeTalkerSparseMoeBlock(
-            layer_id=layer_id,
-            config=config,
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
-        )
+    # note(ratish): the layer builds only this block; a replaced block keeps its experts
+    # alive in a reference cycle until gc, which shrinks the KV pool sized before that
+    sparse_moe_block_cls = Qwen3OmniMoeTalkerSparseMoeBlock
 
     def forward(
         self,
