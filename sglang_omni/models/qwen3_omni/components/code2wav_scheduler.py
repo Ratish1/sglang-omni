@@ -156,6 +156,7 @@ class Code2WavStreamState:
     due_since: float | None = None
     checked: int = 0
     pending: PendingWindow | None = None
+    codes_ready_event: torch.cuda.Event | None = None
     _critical_ingest_profile: dict[str, Any] | None = None
 
 
@@ -239,14 +240,16 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         else:
             pass
 
-    def wait_codes_ready(self) -> None:
-        """Order the decode stream after the stream the chunks were received on."""
-        if self.decode_stream is not None:
+    def wait_codes_ready(self, state: Code2WavStreamState) -> None:
+        """Order the decode stream after the producer of the request's newest chunk."""
+        if self.decode_stream is None:
+            pass
+        elif state.codes_ready_event is None:
             # note (ratish): a chunk from another process is made ready on the
             # receiving thread's default stream.
             self.decode_stream.wait_stream(torch.cuda.default_stream(self.device))
         else:
-            pass
+            self.decode_stream.wait_event(state.codes_ready_event)
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
         del payload
@@ -269,6 +272,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             return
         else:
             pass
+        state.codes_ready_event = source.get("codes_ready_event")
         if state.stream_enabled is None:
             state.stream_enabled = bool(source["stream"])
         else:
@@ -283,6 +287,12 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     def ingest(
         self, request_id: str, state: Code2WavStreamState, codes: torch.Tensor
     ) -> None:
+        if self.decode_stream is not None and codes.is_cuda:
+            # note (ratish): an aborted request drops its chunks while a window may
+            # still read them on the decode stream; the producer must not reuse them.
+            codes.record_stream(self.decode_stream)
+        else:
+            pass
         profile = None
         if _get_event_recorder().is_active():
             profile = self.start_ingest_profile(state)
@@ -294,7 +304,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         elif self.eos_lazy_scan:
             state.chunks.append(codes)
         elif codes.ndim >= 1:
-            self.wait_codes_ready()
+            self.wait_codes_ready(state)
             if profile is None:
                 is_eos = codes[0].item() == self.codec_eos_token_id
             else:
@@ -435,7 +445,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         else:
             pass
         unchecked = chunks[start:]
-        self.wait_codes_ready()
+        self.wait_codes_ready(state)
         if all((codes.ndim == 1 for codes in unchecked)):
             heads = torch.stack([codes[0] for codes in unchecked])
             is_eos = (heads == self.codec_eos_token_id).tolist()
@@ -490,7 +500,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             )
         else:
             pass
-        self.wait_codes_ready()
+        self.wait_codes_ready(state)
         window = torch.stack(state.chunks[start - context : end], dim=0)
         codes = window.transpose(0, 1).unsqueeze(0)
         wav, execution_metadata = self.forward_codes(codes, graph_eligible=not is_final)
@@ -1164,12 +1174,12 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         sample count and the execution metadata of the forward."""
         rows = []
         window_ends: list[int] = []
-        self.wait_codes_ready()
         for _, state in group:
             start = state.emitted
             end = start + self.step_frames(state)
             window_ends.append(end)
             context = min(self.left_context_size, start)
+            self.wait_codes_ready(state)
             rows.append(
                 torch.stack(state.chunks[start - context : end], dim=0).transpose(0, 1)
             )

@@ -1000,6 +1000,38 @@ def test_serving_thread_decodes_after_the_receiving_stream(monkeypatch) -> None:
     assert log[log.index("forward") - 1] == ("wait_stream", receiving_stream)
 
 
+@pytest.mark.parametrize("enable_output_overlap", [False, True])
+def test_decode_stream_waits_on_the_newest_codes_event_before_the_forward(
+    enable_output_overlap: bool,
+) -> None:
+    log: list[object] = []
+    scheduler = Code2WavScheduler(
+        _LoggingCode2WavModel(log),
+        device="cpu",
+        stream_chunk_size=2,
+        left_context_size=1,
+        enable_output_overlap=enable_output_overlap,
+        decode_stream=_RecordingDecodeStream(log),
+    )
+    scheduler.stream_payloads["req-1"] = make_qwen_payload(request_id="req-1")
+    first_event, second_event = object(), object()
+
+    for chunk_id, event in enumerate((first_event, second_event)):
+        scheduler.handle_stream_chunk(
+            "req-1",
+            StreamItem(
+                chunk_id,
+                torch.tensor([chunk_id + 1, 10]),
+                "talker",
+                metadata={"stream": True, "codes_ready_event": event},
+            ),
+        )
+
+    assert log.count("forward") == 1
+    assert log[log.index("forward") - 1] == ("wait_event", second_event)
+    assert all(entry[0] == "wait_event" for entry in log if entry != "forward")
+
+
 def test_qwen_code2wav_emits_full_chunk_despite_model_output_deficit() -> None:
     model = FakeCode2WavModel(total_upsample=2, output_deficit=1)
     scheduler = _make_scheduler(model)

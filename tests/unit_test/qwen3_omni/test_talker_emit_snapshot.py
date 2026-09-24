@@ -99,3 +99,61 @@ def test_two_batched_clones_rows_share_storage() -> None:
     }
     assert len(code_ptrs) == 1
     assert len(embed_ptrs) == 1
+
+
+class _DeviceCodesTensor(torch.Tensor):
+    """CPU tensor that reports itself as a CUDA tensor to the sender."""
+
+    @property
+    def is_cuda(self) -> bool:
+        return True
+
+
+def test_every_code_message_carries_one_event_recorded_after_the_snapshot(
+    monkeypatch,
+) -> None:
+    log: list[object] = []
+    talker_stream = object()
+
+    class _RecordingEvent:
+        def record(self, stream: object) -> None:
+            log.append(("record", stream))
+
+    original_clone = torch.Tensor.clone
+
+    def _logging_clone(self, *args, **kwargs):
+        log.append("clone")
+        return original_clone(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "Event", _RecordingEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: talker_stream)
+    monkeypatch.setattr(torch.Tensor, "clone", _logging_clone)
+    n = 3
+    model = _fake_model(n, 3, 2)
+    model.output_codes = torch.Tensor._make_subclass(
+        _DeviceCodesTensor, model.output_codes
+    )
+    runner = _runner(model)
+
+    runner.emit_code_chunks_and_feedback(
+        schedule_batch=_sched_batch(n), requests=_requests(n)
+    )
+
+    assert len(runner.outbox.sent) == n
+    events = [msg.metadata["codes_ready_event"] for msg in runner.outbox.sent]
+    assert all(event is events[0] for event in events)
+    assert log.count(("record", talker_stream)) == 1
+    assert log[-1] == ("record", talker_stream)
+    assert "clone" in log
+
+
+def test_cpu_code_messages_carry_no_event() -> None:
+    n = 2
+    runner = _runner(_fake_model(n, 3, 2))
+
+    runner.emit_code_chunks_and_feedback(
+        schedule_batch=_sched_batch(n), requests=_requests(n)
+    )
+
+    assert len(runner.outbox.sent) == n
+    assert all(msg.metadata == {"stream": False} for msg in runner.outbox.sent)
