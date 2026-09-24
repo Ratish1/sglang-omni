@@ -426,6 +426,14 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             chunks[start:] = [codes for codes, eos in zip(unchecked, is_eos) if not eos]
         state.checked = len(chunks)
 
+    @trace_call(
+        "code2wav",
+        "decode_delta",
+        lambda self, request_id, state, *, is_final: {
+            "final": is_final,
+            "first": state.emitted == 0,
+        },
+    )
     def decode_delta(
         self, request_id: str, state: Code2WavStreamState, *, is_final: bool
     ) -> torch.Tensor | None:
