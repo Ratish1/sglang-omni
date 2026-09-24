@@ -74,12 +74,19 @@ stop() {
 }
 
 if serve serve "$MODEL" "$PORT" $SERVE_ARGS; then
+  # EVENTS=1 records request events (no torch trace) over the timed arms into $OUT/events
+  [ "${EVENTS:-0}" = 1 ] && curl -s -X POST "http://127.0.0.1:$PORT/start_request_profile" \
+    -H 'Content-Type: application/json' -d "{\"run_id\": \"bench\", \"event_dir\": \"$OUT/events\"}" >> "$OUT/progress.txt"
   for arm in $ARMS; do
     echo "gen $arm start $(date +%T)" >> "$OUT/progress.txt"
     CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$arm" --port "$PORT" --concurrency "$CONC" --out "$OUT" ${MAX_SAMPLES:+--max-samples $MAX_SAMPLES} \
       > "$OUT/gen_$arm.log" 2>&1
     echo "gen $arm rc $? $(date +%T)" >> "$OUT/progress.txt"
   done
+  if [ "${EVENTS:-0}" = 1 ]; then
+    curl -s -X POST "http://127.0.0.1:$PORT/stop_request_profile" -H 'Content-Type: application/json' -d '{}' >> "$OUT/progress.txt"
+    python3 "$S/events_first_audio.py" "$OUT/events" > "$OUT/first_audio.txt" 2>&1
+  fi
 else
   echo "server not healthy" > "$OUT/FAILED"
 fi
