@@ -35,6 +35,12 @@ class FactoryModel(FakeCode2WavModel):
         self.config = SimpleNamespace(num_quantizers=num_quantizers)
         self.eval_calls = 0
 
+    def parameters(self) -> list[torch.Tensor]:
+        return [torch.zeros(3, dtype=torch.float32)]
+
+    def buffers(self) -> list[torch.Tensor]:
+        return [torch.zeros(2, dtype=torch.long)]
+
     def eval(self):
         self.eval_calls += 1
         return self
@@ -421,6 +427,7 @@ def test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys(
         "num_quantizers": 12,
         "total_gpu_memory_fraction": 0.02,
         "graph_keys": expected_graph_keys,
+        "model_footprint_bytes": 3 * 4 + 2 * 8,
     }
     assert scheduler.device == torch.device("cuda:3")
     assert scheduler.stream_chunk_size == 20
