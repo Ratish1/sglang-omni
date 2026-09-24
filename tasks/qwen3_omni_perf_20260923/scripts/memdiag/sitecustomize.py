@@ -10,7 +10,9 @@ much was collectable. MEMDIAG_FIND=1 first lists the CUDA tensors that only refe
 keep alive at sizing, with the frames and objects holding them (that collection frees them).
 MEMDIAG_RATIO=1 counts the talker's new-token-ratio resets and decays and logs the current
 ratio every 5 s; MEMDIAG_NO_RATIO_RESET=1 also turns the talker's resets into no-ops
-(diagnostic arm only).
+(diagnostic arm only). MEMDIAG_ADMISSION=1 logs, in the talker process only, each request's
+answer tokens and prompt rows at build and its frames at finish, every PrefillAdder
+admission attempt with its budget terms, and every decode retraction.
 """
 
 import gc
@@ -184,7 +186,99 @@ def patch_ratio(module):
     threading.Thread(target=report, daemon=True).start()
 
 
+def is_talker_process():
+    return multiprocessing.current_process().name == "stage-talker_ar"
+
+
+def patch_talker_builder(module):
+    """Answer tokens and prompt rows of every talker request at build."""
+    if not is_talker_process():
+        return
+    build_original = module.build_talker_request_data
+
+    def build_talker_request_data(payload, **kwargs):
+        req_data = build_original(payload, **kwargs)
+        log(
+            f"admission build rid={payload.request_id} "
+            f"answer_tokens={len(payload.prefetched_chunks)} "
+            f"prompt_rows={len(req_data.req.origin_input_ids)} "
+            f"thinker_done={bool(payload.prefetched_stream_done)}"
+        )
+        return req_data
+
+    module.build_talker_request_data = build_talker_request_data
+
+
+def patch_talker_runner(module):
+    """Frames and finish reason of every talker request at finish."""
+    if not is_talker_process():
+        return
+    runner = module.QwenTalkerModelRunner
+    finished_original = runner.on_request_finished
+
+    def on_request_finished(self, request_id, req_data):
+        log(
+            f"admission finish rid={request_id} frames={len(req_data.req.output_ids)} "
+            f"reason={req_data.finish_reason}"
+        )
+        return finished_original(self, request_id, req_data)
+
+    runner.on_request_finished = on_request_finished
+
+
+def patch_prefill_adder(module):
+    """Every talker admission attempt: free tokens, reservation terms, verdict."""
+    if not is_talker_process():
+        return
+    adder_cls = module.PrefillAdder
+    add_original = adder_cls.add_one_req
+
+    def add_one_req(self, req, has_chunked_req, truncation_align_size):
+        max_new = min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            module.CLIP_MAX_NEW_TOKENS,
+        )
+        extend = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+        running = len(self.running_batch.reqs) if self.running_batch else 0
+        before = self.rem_total_tokens
+        offset = self.rem_total_token_offset
+        result = add_original(self, req, has_chunked_req, truncation_align_size)
+        log(
+            f"admission try rid={req.rid} running={running} "
+            f"admitted_this_pass={len(self.can_run_list)} ratio={self.new_token_ratio:.4f} "
+            f"rem_total={before:.0f} offset={offset:.0f} extend={extend} "
+            f"max_new={max_new} clip={module.CLIP_MAX_NEW_TOKENS} result={result.name}"
+        )
+        return result
+
+    adder_cls.add_one_req = add_one_req
+
+
+def patch_retract(module):
+    """Every talker decode retraction."""
+    if not is_talker_process():
+        return
+    batch_cls = module.ScheduleBatch
+    retract_original = batch_cls.retract_decode
+
+    def retract_decode(self):
+        running = len(self.reqs)
+        retracted, ratio, aborted = retract_original(self)
+        log(
+            f"admission retract running={running} retracted={len(retracted)} "
+            f"aborted={len(aborted)} new_ratio={ratio:.4f}"
+        )
+        return retracted, ratio, aborted
+
+    batch_cls.retract_decode = retract_decode
+
+
 TARGETS = {TARGET: patch}
+if os.environ.get("MEMDIAG_ADMISSION") == "1":
+    TARGETS["sglang_omni.models.qwen3_omni.request_builders"] = patch_talker_builder
+    TARGETS["sglang_omni.models.qwen3_omni.talker_model_runner"] = patch_talker_runner
+    TARGETS["sglang.srt.managers.schedule_policy"] = patch_prefill_adder
+    TARGETS["sglang.srt.managers.schedule_batch"] = patch_retract
 if os.environ.get("MEMDIAG_RATIO") == "1":
     TARGETS["sglang.srt.managers.scheduler_components.new_token_ratio_tracker"] = (
         patch_ratio
