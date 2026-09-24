@@ -1289,7 +1289,6 @@ def _drive_real_builder(
             audio_token_id=151646,
             image_token_id=151647,
             video_token_id=151648,
-            thinker_config=SimpleNamespace(),
             resolve_sampling_config=resolve_sampling_config,
         )
         return req_data, captured
@@ -1983,6 +1982,56 @@ class TestBuildTalkerRequestTensorStorage:
         assert data.req._input_embeds_are_projected is False
 
 
+@pytest.mark.usefixtures("_patch_sampling")
+def test_talker_request_with_image_grids_carries_no_multimodal_inputs() -> None:
+    """The talker reads plain positions, so even an image prompt attaches no
+    multimodal inputs, and the sampling and model inputs are kept as given."""
+    vision_start_token_id, image_token_id, vision_end_token_id = 151652, 151655, 151653
+    input_ids = torch.tensor(
+        [10, vision_start_token_id]
+        + [image_token_id] * 4
+        + [vision_end_token_id, 11, 151675, 151675],
+        dtype=torch.long,
+    )
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+
+    data = build_sglang_talker_request(
+        thinker_hidden_states=torch.empty(0),
+        tokenizer=FakeQwenTokenizer(),
+        codec_vocab_size=4096,
+        max_new_tokens=64,
+        temperature=0.9,
+        top_k=50,
+        top_p=0.8,
+        repetition_penalty=1.05,
+        codec_eos_id=2150,
+        talker_input_embeds=torch.zeros(input_ids.numel(), 8),
+        talker_input_ids=input_ids,
+        input_embeds_are_projected=True,
+        talker_model_inputs={"image_grid_thw": image_grid_thw},
+        seed=7,
+    )
+
+    assert data.req.multimodal_inputs is None
+    sampling_params = data.req.sampling_params
+    assert sampling_params.max_new_tokens == 64
+    assert sampling_params.temperature == pytest.approx(0.9)
+    assert sampling_params.top_k == 50
+    assert sampling_params.top_p == pytest.approx(0.8)
+    assert sampling_params.repetition_penalty == pytest.approx(1.05)
+    assert sampling_params.stop_token_ids == {2150}
+    assert sampling_params.sampling_seed == 7
+    omni_model_inputs = data.req.omni_model_inputs
+    assert set(omni_model_inputs) == {
+        "image_grid_thw",
+        "talker_layer_hidden_states",
+        "talker_multimodal_mask",
+    }
+    assert omni_model_inputs["image_grid_thw"] is image_grid_thw
+    assert omni_model_inputs["talker_layer_hidden_states"] is None
+    assert omni_model_inputs["talker_multimodal_mask"] is None
+
+
 def test_projected_prefill_reads_tensor_from_data() -> None:
     """Model runner reads prefill_input_embeds, not Req.input_embeds."""
     embeds = torch.randn(10, 64)
@@ -2289,6 +2338,7 @@ def _talker_seed_self(
     fake = SimpleNamespace(
         repetition_mask=torch.zeros(max_bs, vocab, dtype=torch.bool, device=device),
         suppress_mask=torch.zeros(max_bs, vocab, dtype=torch.bool, device=device),
+        mask_true_value=torch.ones((), dtype=torch.bool, device=device),
         repetition_penalties=torch.ones(max_bs, 1, device=device),
         sampling_temperatures=torch.ones(max_bs, 1, device=device),
         sampling_top_ps=torch.ones(max_bs, device=device),
@@ -2425,6 +2475,186 @@ def test_talker_prepare_decode_buffers_steady_state_reuse() -> None:
     Qwen3OmniTalker.prepare_decode_buffers(fresh, requests)
     assert torch.equal(fake.repetition_mask, fresh.repetition_mask)
     assert torch.equal(fake.suppress_mask, fresh.suppress_mask)
+
+
+def advance_decode_step(
+    fake: SimpleNamespace,
+    requests: list[SimpleNamespace],
+    sampled_tokens: list[int],
+) -> None:
+    fake.sampled_token_ids[: len(sampled_tokens)] = torch.tensor(
+        sampled_tokens, device=fake.sampled_token_ids.device
+    )
+    for sched_req, token in zip(requests, sampled_tokens):
+        sched_req.data.req.output_ids.append(token)
+
+
+def test_talker_steady_step_marks_repetition_like_advanced_indexing() -> None:
+    fake = _talker_seed_self()
+    requests = [
+        _talker_prep_req("a", penalty=1.5, output_ids=[2]),
+        _talker_prep_req("b", penalty=1.0, output_ids=[4]),
+        _talker_prep_req("c", penalty=1.2, output_ids=[2]),
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    fake.sampling_temperatures[0, 0] = 123.0
+
+    # Row a resamples a token it already holds; row b has no penalty.
+    advance_decode_step(fake, requests, [2, 6, 7])
+    expected = fake.repetition_mask.clone()
+    penalized_rows = torch.tensor([0, 2])
+    expected[penalized_rows, fake.sampled_token_ids[penalized_rows]] = True
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+
+    assert float(fake.sampling_temperatures[0, 0]) == 123.0
+    assert torch.equal(fake.repetition_mask, expected)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="sync debug mode requires CUDA"
+)
+def test_talker_steady_step_issues_no_blocking_device_sync() -> None:
+    device = torch.device("cuda")
+    fake = _talker_seed_self(device=device)
+    requests = [
+        _talker_prep_req("a", penalty=1.5, output_ids=[2]),
+        _talker_prep_req("b", penalty=1.2, output_ids=[4]),
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    advance_decode_step(fake, requests, [5, 6])
+    fake.sampling_temperatures[0, 0] = 123.0
+    torch.cuda.synchronize(device)
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert float(fake.sampling_temperatures[0, 0]) == 123.0
+    assert fake.repetition_mask[:2, [2, 4, 5, 6]].tolist() == [
+        [True, False, True, False],
+        [False, True, False, True],
+    ]
+
+
+def expected_decode_masks(
+    requests: list[SimpleNamespace], *, vocab: int = 8
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Masks a fresh batch must hold: penalized rows mark their output tokens,
+    every row marks its suppress tokens, tokens outside the vocab are dropped."""
+    repetition_mask = torch.zeros(len(requests), vocab, dtype=torch.bool)
+    suppress_mask = torch.zeros(len(requests), vocab, dtype=torch.bool)
+    for row_idx, sched_req in enumerate(requests):
+        req = sched_req.data.req
+        if req.sampling_params.repetition_penalty != 1.0:
+            for token in req.output_ids:
+                if 0 <= token < vocab:
+                    repetition_mask[row_idx, token] = True
+                else:
+                    pass
+        else:
+            pass
+        for token in sched_req.data.suppress_tokens or []:
+            if 0 <= token < vocab:
+                suppress_mask[row_idx, token] = True
+            else:
+                pass
+    return repetition_mask, suppress_mask
+
+
+def assert_decode_masks(fake: SimpleNamespace, requests: list[SimpleNamespace]) -> None:
+    batch_size = len(requests)
+    repetition_mask, suppress_mask = expected_decode_masks(requests)
+    assert torch.equal(fake.repetition_mask[:batch_size].cpu(), repetition_mask)
+    assert torch.equal(fake.suppress_mask[:batch_size].cpu(), suppress_mask)
+
+
+def test_talker_batch_change_masks_hold_duplicate_and_out_of_vocab_tokens() -> None:
+    fake = _talker_seed_self()
+    requests = [
+        _talker_prep_req("a", penalty=1.5, output_ids=[2, 2, 5, 9], suppress=[3, 3, 7]),
+        _talker_prep_req("b", penalty=1.2, output_ids=[2, 5], suppress=[3, -1]),
+        _talker_prep_req("c", penalty=1.0, output_ids=[1], suppress=None),
+    ]
+
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+
+    assert_decode_masks(fake, requests)
+    assert fake.decode_prep_rep_rows.tolist() == [0, 1]
+
+
+def test_talker_batch_change_with_empty_index_lists_clears_the_masks() -> None:
+    fake = _talker_seed_self()
+    marked = [
+        _talker_prep_req("a", penalty=1.5, output_ids=[2], suppress=[3]),
+        _talker_prep_req("b", penalty=1.5, output_ids=[4], suppress=[5]),
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, marked)
+
+    unmarked = [
+        _talker_prep_req("c", output_ids=[1]),
+        _talker_prep_req("d", output_ids=[6]),
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, unmarked)
+
+    assert_decode_masks(fake, unmarked)
+    assert fake.decode_prep_rep_rows is None
+
+
+def test_talker_batch_change_to_a_larger_batch_keeps_masks() -> None:
+    fake = _talker_seed_self()
+    small = [_talker_prep_req("a", penalty=1.5, output_ids=[1], suppress=[2])]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, small)
+    assert_decode_masks(fake, small)
+
+    large = [
+        _talker_prep_req(
+            f"r{row_idx}",
+            penalty=1.25,
+            output_ids=list(range(row_idx, 8)),
+            suppress=list(range(8 - row_idx)),
+        )
+        for row_idx in range(4)
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, large)
+    assert_decode_masks(fake, large)
+    assert fake.decode_prep_rep_rows.tolist() == [0, 1, 2, 3]
+
+    fake.sampling_temperatures[0, 0] = 123.0
+    advance_decode_step(fake, large, [0, 0, 0, 0])
+    Qwen3OmniTalker.prepare_decode_buffers(fake, large)
+
+    assert float(fake.sampling_temperatures[0, 0]) == 123.0
+    assert_decode_masks(fake, large)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="sync debug mode requires CUDA"
+)
+def test_talker_batch_change_issues_no_blocking_device_sync() -> None:
+    device = torch.device("cuda")
+    fake = _talker_seed_self(device=device)
+    batches = [
+        [_talker_prep_req("a", penalty=1.5, output_ids=[1], suppress=[2])],
+        [
+            _talker_prep_req("b", penalty=1.5, output_ids=[2, 2, 5], suppress=[3, 7]),
+            _talker_prep_req("c", penalty=1.2, output_ids=[2, 6], suppress=[3]),
+            _talker_prep_req("d", output_ids=[4]),
+        ],
+        [_talker_prep_req("e", output_ids=[3])],
+    ]
+    torch.cuda.synchronize(device)
+
+    for requests in batches:
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        assert_decode_masks(fake, requests)
 
 
 @pytest.mark.accelerator
