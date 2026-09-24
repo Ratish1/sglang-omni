@@ -127,3 +127,82 @@ def test_pure_text_qwen_mrope_is_ordinary_sequential_positions():
         positions,
         torch.arange(sequence_length, dtype=torch.long).repeat(3, 1),
     )
+
+
+def _thinker_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2, tokens_per_second=25),
+        image_token_id=55,
+        video_token_id=66,
+        vision_start_token_id=44,
+        audio_token_id=77,
+        audio_start_token_id=88,
+        position_id_per_seconds=25,
+    )
+
+
+def _state_with_model_inputs(
+    input_ids: torch.Tensor, model_inputs: dict
+) -> Qwen3OmniPipelineState:
+    return make_qwen_state(
+        prompt={"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)},
+        thinker_inputs={"model_inputs": model_inputs},
+    )
+
+
+def test_audio_only_request_carries_no_multimodal_inputs(monkeypatch):
+    _patch_sampling_validation(monkeypatch)
+    monkeypatch.setattr(
+        "sglang_omni.models.qwen3_omni.request_builders.compute_mrope_positions",
+        lambda *args: pytest.fail("audio-only prompts take sglang's text positions"),
+    )
+    input_ids = torch.tensor([10, 88, 77, 77, 11], dtype=torch.long)
+    state = _state_with_model_inputs(
+        input_ids,
+        {
+            "audio_embeds": torch.ones((2, 4)),
+            "audio_feature_lengths": torch.tensor([8]),
+        },
+    )
+
+    sglang_request = build_sglang_thinker_request(
+        state,
+        params={"max_new_tokens": 3},
+        tokenizer=FakeQwenTokenizer(),
+        vocab_size=256,
+        request_id="audio-only",
+        thinker_config=_thinker_config(),
+    )
+
+    assert sglang_request.req.multimodal_inputs is None
+    assert sglang_request.req.omni_model_inputs["audio_feature_lengths"].tolist() == [8]
+
+
+def test_image_request_carries_its_mrope_positions(monkeypatch):
+    _patch_sampling_validation(monkeypatch)
+    input_ids = torch.tensor([10, 44, 55, 55, 55, 55, 11], dtype=torch.long)
+    state = _state_with_model_inputs(
+        input_ids,
+        {
+            "image_embeds": torch.ones((4, 4)),
+            "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        },
+    )
+
+    sglang_request = build_sglang_thinker_request(
+        state,
+        params={"max_new_tokens": 3},
+        tokenizer=FakeQwenTokenizer(),
+        vocab_size=256,
+        request_id="image",
+        thinker_config=_thinker_config(),
+    )
+
+    mm_inputs = sglang_request.req.multimodal_inputs
+    assert mm_inputs.mm_items == []
+    assert mm_inputs.mrope_positions.tolist() == [
+        [0, 1, 2, 2, 2, 2, 4],
+        [0, 1, 2, 2, 3, 3, 4],
+        [0, 1, 2, 3, 2, 3, 4],
+    ]
+    assert int(mm_inputs.mrope_position_delta) == -2

@@ -1453,13 +1453,16 @@ def test_qwen_sglang_request_hashes_media_tokens_without_changing_mrope_ids(
         fake_mrope,
     )
 
-    audio_token_id = 77
-    input_ids = torch.tensor([10, audio_token_id, 11], dtype=torch.long)
+    image_token_id = 55
+    input_ids = torch.tensor([10, image_token_id, 11], dtype=torch.long)
     state = make_qwen_state(
         prompt={"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)},
         thinker_inputs={
-            "model_inputs": {"audio_embeds": torch.ones((1, 4))},
-            "media_cache_keys": {"audio": "audio:cache"},
+            "model_inputs": {
+                "image_embeds": torch.ones((1, 4)),
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            },
+            "media_cache_keys": {"image": "image:cache"},
         },
     )
     req_data = build_sglang_thinker_request(
@@ -1469,15 +1472,15 @@ def test_qwen_sglang_request_hashes_media_tokens_without_changing_mrope_ids(
         vocab_size=256,
         request_id="rid-1",
         thinker_config=SimpleNamespace(
-            image_token_id=55,
+            image_token_id=image_token_id,
             video_token_id=66,
-            audio_token_id=audio_token_id,
+            audio_token_id=77,
         ),
     )
 
     pad_values = req_data.req.omni_model_inputs["pad_values"]
-    assert pad_values["audio"] >= 256
-    assert int(req_data.input_ids[1]) == pad_values["audio"]
+    assert pad_values["image"] >= 256
+    assert int(req_data.input_ids[1]) == pad_values["image"]
     assert captured["input_ids"].tolist() == input_ids.tolist()
 
 
@@ -1493,13 +1496,6 @@ def test_qwen_sglang_request_records_mm_token_positions(
     monkeypatch.setattr(
         "sglang.srt.sampling.sampling_params.SamplingParams.verify",
         lambda self, vocab_size: None,
-    )
-    monkeypatch.setattr(
-        "sglang_omni.models.qwen3_omni.request_builders.compute_mrope_positions",
-        lambda input_ids, model_inputs, thinker_config: (
-            torch.zeros((3, input_ids.numel()), dtype=torch.long),
-            torch.tensor(0),
-        ),
     )
 
     image_token_id, audio_token_id = 55, 77
