@@ -36,7 +36,7 @@ ENABLE_TALKER_START_TOPOLOGY = False
 # policy once that exists outside import-time environment globals.
 _DEEPGEMM_PRECOMPILE_ENV_DEFAULTS = {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}
 
-# A colocated worker launches seven stage processes. Letting every PyTorch
+# A colocated worker launches six stage processes. Letting every PyTorch
 # process size its OpenMP pool to the full host oversubscribes launch-side CPU
 # work when multiple workers share a node. Preprocessing handles one prompt per
 # scheduler call, so a host-wide tokenizer Rayon pool only adds contention.
@@ -311,7 +311,7 @@ def speech_stages(
     ]
 
 
-_SPEECH_DEFAULT_PROCESSES = {
+SPEECH_DEFAULT_PROCESSES = {
     "preprocessing": "preprocessing",
     "image_encoder": "image_encoder",
     "audio_encoder": "audio_encoder",
@@ -320,6 +320,11 @@ _SPEECH_DEFAULT_PROCESSES = {
     "talker_ar": "talker_ar",
     "code2wav": "code2wav",
 }
+
+# note (ratish): on one card the GPU time-slices between the stage processes,
+# so code2wav decodes inside the talker's process on a priority stream instead
+# of waiting for its own turn.
+COLOCATED_SPEECH_PROCESSES = {**SPEECH_DEFAULT_PROCESSES, "code2wav": "talker_ar"}
 
 
 class Qwen3OmniBasePipelineConfig(PipelineConfig):
@@ -390,7 +395,7 @@ class Qwen3OmniSpeechPipelineConfig(Qwen3OmniBasePipelineConfig):
         default_factory=lambda: speech_stages(
             thinker_gpu=0,
             talker_gpu=1,
-            process_by_stage=_SPEECH_DEFAULT_PROCESSES,
+            process_by_stage=SPEECH_DEFAULT_PROCESSES,
             enable_partial_start=True,
         )
     )
@@ -422,10 +427,10 @@ class Qwen3OmniSpeechColocatedPipelineConfig(Qwen3OmniSpeechPipelineConfig):
     """7-stage speech pipeline for single-GPU stage colocation.
 
     The topology places image_encoder, audio_encoder, thinker, talker_ar, and
-    code2wav on the same GPU while keeping preprocessing and decode as CPU
-    stages. Per-stage memory budgets are supplied by the selected config
-    file so deployments can use hardware-appropriate stage fractions and
-    SGLang AR cache fractions.
+    code2wav on the same GPU, with code2wav inside the talker's process, while
+    keeping preprocessing and decode as CPU stages. Per-stage memory budgets
+    are supplied by the selected config file so deployments can use
+    hardware-appropriate stage fractions and SGLang AR cache fractions.
     """
 
     env_defaults: dict[str, str] = Field(
@@ -436,7 +441,7 @@ class Qwen3OmniSpeechColocatedPipelineConfig(Qwen3OmniSpeechPipelineConfig):
         default_factory=lambda: speech_stages(
             thinker_gpu=0,
             talker_gpu=0,
-            process_by_stage=_SPEECH_DEFAULT_PROCESSES,
+            process_by_stage=COLOCATED_SPEECH_PROCESSES,
             enable_partial_start=False,
         )
     )
