@@ -23,6 +23,7 @@ from pathlib import Path
 
 ARMS = (
     "seedtts_en",
+    "seedtts_en_nostream",
     "mmmu",
     "mmmu_talker",
     "mmsu",
@@ -152,7 +153,7 @@ async def generate(
     if arm == "speech_identity":
         return await seeded_speech_requests(port, out, max_samples or 5)
     talker = arm.endswith("_talker")
-    if arm == "seedtts_en":
+    if arm in ("seedtts_en", "seedtts_en_nostream"):
         from benchmarks.eval.benchmark_omni_seedtts import (
             OmniSeedttsBenchmarkConfig,
             run_omni_seedtts_benchmark,
@@ -165,7 +166,7 @@ async def generate(
             port=port,
             lang="en",
             voice_clone=True,
-            stream=True,
+            stream=arm == "seedtts_en",
             output_dir=out,
             warmup=1,
             max_concurrency=concurrency,
@@ -237,7 +238,7 @@ async def generate(
 
 
 def score(arm: str, asr_port: int | None, out: str, device: str, sim: bool) -> dict:
-    if arm == "seedtts_en":
+    if arm in ("seedtts_en", "seedtts_en_nostream"):
         from benchmarks.eval.benchmark_omni_seedtts import (
             OmniSeedttsBenchmarkConfig,
             evaluate_generated_audio,
