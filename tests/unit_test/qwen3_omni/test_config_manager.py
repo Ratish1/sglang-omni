@@ -381,3 +381,49 @@ def test_talker_start_topology_reaches_bootstrap(monkeypatch, enabled):
     assert received["enable_talker_start_topology"] is enabled
     assert received["enable_partial_start"] is True
     assert received["partial_start_min_chunks"] == 5
+
+
+def patch_talker_startup(monkeypatch) -> list[dict[str, object]]:
+    from sglang.srt import runtime_context
+
+    from sglang_omni.models.qwen3_omni import bootstrap, stages
+
+    received: list[dict[str, object]] = []
+    monkeypatch.setattr(stages, "avail_gpu_mem", lambda *_: 0)
+    monkeypatch.setattr(stages, "get_process_gpu_memory_bytes", lambda *_: 0)
+    monkeypatch.setattr(stages, "validate_generation_batch_policy", lambda **_: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "create_talker_scheduler",
+        lambda server_args, gpu_id, **kwargs: received.append(
+            {**kwargs, "server_args": server_args}
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_context,
+        "get_schedule",
+        lambda: SimpleNamespace(mem_fraction_static=0.5),
+    )
+    return received
+
+
+@pytest.mark.parametrize(
+    ("engine_overrides", "operator_selected"),
+    [
+        ({}, False),
+        ({"talker_ar.engine.cuda_graph_backend_prefill": "disabled"}, True),
+    ],
+)
+def test_talker_stage_forwards_the_operator_prefill_backend_choice(
+    monkeypatch, engine_overrides, operator_selected
+):
+    from sglang_omni.models.qwen3_omni import stages
+
+    received = patch_talker_startup(monkeypatch)
+    manager = ConfigManager(Qwen3OmniSpeechColocatedPipelineConfig(model_path="dummy"))
+    config = manager.merge_config(engine_overrides)
+    args = resolve_stage_factory_args(make_stage(config, "talker_ar"), config)
+
+    stages.create_talker_ar_executor_from_config(**args)
+
+    assert received[0]["operator_selected_prefill_backend"] is operator_selected
