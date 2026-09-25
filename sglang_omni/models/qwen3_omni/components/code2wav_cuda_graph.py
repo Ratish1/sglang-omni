@@ -191,7 +191,7 @@ class Code2WavCudaGraphRunner:
     serving already relies on.
     """
 
-    WARMUP_ITERATIONS = 3
+    WARMUP_ITERATIONS = 2
 
     def __init__(
         self,

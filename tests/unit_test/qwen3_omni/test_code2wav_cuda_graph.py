@@ -267,10 +267,10 @@ def test_build_captures_only_the_explicit_graph_keys() -> None:
     }
 
 
-def test_build_uses_three_warmups_one_private_pool_and_atomic_publication() -> None:
+def test_build_uses_two_warmups_one_private_pool_and_atomic_publication() -> None:
     runner, backend, model = build_runner()
 
-    assert backend.warmup_iterations == [3] * 4
+    assert backend.warmup_iterations == [2] * 4
     assert [tuple(graph.static_input.shape) for graph in backend.graphs] == [
         (1, 16, 35),
         (1, 16, 30),
@@ -1269,7 +1269,7 @@ def test_capture_pins_cover_warmup_capture_and_the_equivalence_check(
     )
 
     assert runner.stats()["build"]["published_graph_count"] == 1
-    inner = ["warmup"] * 3 + ["capture", "eager", "replay"]
+    inner = ["warmup"] * 2 + ["capture", "eager", "replay"]
     if is_xpu:
         assert events == ["pin_enter", *inner, "pin_exit"]
         assert all(probe is not original_probe for probe in seen_probe)
