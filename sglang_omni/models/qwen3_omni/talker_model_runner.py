@@ -29,6 +29,7 @@ class QwenTalkerModelRunner(ModelRunner):
         outbox: Any,
         *,
         code2wav_target: str = "code2wav",
+        code2wav_in_process: bool = False,
         feedback_enabled: bool = True,
         codec_coalesce_frames: int = 0,
         codec_coalesce_first_frames: int = 0,
@@ -37,6 +38,7 @@ class QwenTalkerModelRunner(ModelRunner):
         super().__init__(tp_worker, output_processor)
         self.outbox = outbox
         self.code2wav_target = code2wav_target
+        self.code2wav_in_process = code2wav_in_process
         self.feedback_enabled = bool(feedback_enabled)
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
@@ -209,9 +211,15 @@ class QwenTalkerModelRunner(ModelRunner):
         """Send the messages with one ready event recorded after all their codes.
 
         The event is recorded once every snapshot and stack the messages carry
-        is enqueued, and before any message is visible to the consumer.
+        is enqueued, and before any message is visible to the consumer. Only a
+        code2wav in this process can wait on it; another process orders its
+        reads on the receiving stream instead.
         """
-        if code_messages and code_messages[0].data.device.type == "cuda":
+        if (
+            self.code2wav_in_process
+            and code_messages
+            and code_messages[0].data.device.type == "cuda"
+        ):
             device = code_messages[0].data.device
             device_module = torch.get_device_module(device)
             codes_ready_event = device_module.Event()

@@ -103,6 +103,25 @@ def test_colocated_topology_is_opt_in_and_uses_one_gpu() -> None:
         assert make_stage(config, stage_name).process == stage_name
 
 
+def test_factory_kwargs_follow_whether_code2wav_shares_the_talker_process() -> None:
+    def sharing_flags(config) -> tuple[bool, bool]:
+        talker_args = resolve_stage_factory_args(
+            make_stage(config, "talker_ar"), config
+        )
+        code2wav_args = resolve_stage_factory_args(
+            make_stage(config, "code2wav"), config
+        )
+        return (talker_args["code2wav_in_process"], code2wav_args["talker_in_process"])
+
+    assert sharing_flags(Qwen3OmniSpeechPipelineConfig(model_path="dummy")) == (
+        False,
+        False,
+    )
+    shared = Qwen3OmniSpeechColocatedPipelineConfig(model_path="dummy")
+    make_stage(shared, "code2wav").process = "talker_ar"
+    assert sharing_flags(shared) == (True, True)
+
+
 @pytest.mark.parametrize(
     "config_cls",
     [Qwen3OmniSpeechPipelineConfig, Qwen3OmniSpeechColocatedPipelineConfig],

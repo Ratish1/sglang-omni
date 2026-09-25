@@ -1276,6 +1276,7 @@ def create_code2wav_scheduler(
     enable_cuda_graph: bool = False,
     total_gpu_memory_fraction: float | None = None,
     fused_snake_activation: bool = True,
+    talker_in_process: bool = False,
 ):
     """Factory: returns Code2WavScheduler."""
     from sglang_omni.utils.device import resolve_concrete_device
@@ -1297,7 +1298,10 @@ def create_code2wav_scheduler(
     else:
         pass
     decode_stream: torch.Stream | None = None
-    if concrete_device.type == "cuda":
+    # note (ratish): the priority stream only orders code2wav ahead of the
+    # talker's stream in the same context; alone in its process code2wav keeps
+    # the default stream.
+    if talker_in_process and concrete_device.type == "cuda":
         device_module = torch.get_device_module(concrete_device)
         decode_stream = device_module.Stream(
             device=concrete_device,

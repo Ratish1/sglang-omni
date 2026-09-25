@@ -396,16 +396,22 @@ class Qwen3OmniSpeechPipelineConfig(Qwen3OmniBasePipelineConfig):
     )
 
     def stage_factory_kwargs(self, stage_name: str) -> dict[str, Any]:
+        process_by_stage = {stage.name: stage.process for stage in self.stages}
+        code2wav_shares_talker_process = (
+            process_by_stage["code2wav"] == process_by_stage["talker_ar"]
+        )
         if stage_name == "talker_ar":
             return {
                 "speech_enabled": True,
                 "feedback_enabled": True,
+                "code2wav_in_process": code2wav_shares_talker_process,
             }
         else:
             pass
         if stage_name == "code2wav":
             return {
                 "enable_cuda_graph": current_platform.enable_code2wav_graph(),
+                "talker_in_process": code2wav_shares_talker_process,
             }
         else:
             pass
