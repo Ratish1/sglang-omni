@@ -149,6 +149,16 @@ class PendingWindow:
 
 
 @dataclass
+class RetiredChunks:
+    """A dropped request's codec chunks, held until the event recorded after
+    their last queued window read completes; freeing them earlier would let the
+    producer reuse memory a window is still reading."""
+
+    event: torch.cuda.Event
+    chunks: list[torch.Tensor]
+
+
+@dataclass
 class Code2WavStreamState:
     chunks: list[torch.Tensor] = field(default_factory=list)
     emitted: int = 0
@@ -220,6 +230,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         self.pinned_created = 0
         self.pinned_retired: list[PinnedTransferSlot] = []
         self.pinned_quarantined: list[PinnedTransferSlot] = []
+        self.retired_chunks: list[RetiredChunks] = []
         self.max_pinned_slots = self.MAX_PINNED_SLOTS + self.batch_ceiling
 
     @property
@@ -290,12 +301,6 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
     def ingest(
         self, request_id: str, state: Code2WavStreamState, codes: torch.Tensor
     ) -> None:
-        if self.decode_stream is not None and codes.device.type != "cpu":
-            # note (ratish): an aborted request drops its chunks while a window may
-            # still read them on the decode stream; the producer must not reuse them.
-            codes.record_stream(self.decode_stream)
-        else:
-            pass
         profile = None
         if _get_event_recorder().is_active():
             profile = self.start_ingest_profile(state)
@@ -671,7 +676,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         return (wait_ns, torch.from_numpy(audio))
 
     def acquire_slot(self, samples: int) -> PinnedTransferSlot | None:
-        self.reap_retired_slots()
+        self.reap_retired()
         if self.pinned_free:
             slot = self.pinned_free.pop()
             try:
@@ -704,12 +709,16 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         self.pinned_quarantined.append(slot)
         self.pipeline_active = False
 
-    def reap_retired_slots(self) -> None:
-        """Non-blockingly return completed retired slots to the free pool.
+    def reap_retired(self) -> None:
+        """Non-blockingly return completed retired slots to the free pool and
+        drop retired chunks the device has finished reading.
 
-        Callers hold ``state_lock``. An event-query error leaves the buffer
-        owned by the scheduler but permanently unavailable for reuse.
+        Callers hold state_lock. An event-query error leaves the buffer owned
+        by the scheduler but permanently unavailable for reuse.
         """
+        self.retired_chunks = [
+            held for held in self.retired_chunks if not held.event.query()
+        ]
         if not self.pinned_retired:
             return
         else:
@@ -808,7 +817,7 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
 
     def next_message(self):
         with self.state_lock:
-            self.reap_retired_slots()
+            self.reap_retired()
         if self.can_batch_stream_chunks:
             first_chunks: list = []
             for msg in self.drain_inbox():
@@ -986,16 +995,29 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         self, request_id: str, state: Code2WavStreamState
     ) -> None:
         del request_id
-        pending = state.pending
-        if pending is None:
-            return
+        if state.pending is not None:
+            self.retire_slot(state.pending.slot)
+            state.pending = None
         else:
             pass
-        self.retire_slot(pending.slot)
-        state.pending = None
+        if state.chunks and self.device.type == "cuda":
+            # note (ratish): windows read the chunks on the decode stream, or on
+            # the default stream when the serving thread has none of its own.
+            read_stream = self.decode_stream
+            if read_stream is None:
+                read_stream = torch.cuda.default_stream(self.device)
+            else:
+                pass
+            event = torch.cuda.Event()
+            event.record(read_stream)
+            self.retired_chunks.append(RetiredChunks(event=event, chunks=state.chunks))
+            state.chunks = []
+        else:
+            pass
 
     def on_serving_stop(self) -> None:
-        """Drain retired slots at shutdown, when blocking costs no latency."""
+        """Drain retired slots and chunks at shutdown, when blocking costs no
+        latency."""
         retired = self.pinned_retired
         self.pinned_retired = []
         for slot in retired:
@@ -1008,6 +1030,9 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
                 self.pinned_quarantined.append(slot)
             else:
                 self.release_slot(slot)
+        for held in self.retired_chunks:
+            held.event.synchronize()
+        self.retired_chunks = []
 
     def select_step_participants(self) -> list[tuple[str, Code2WavStreamState]]:
         now = time.monotonic()
