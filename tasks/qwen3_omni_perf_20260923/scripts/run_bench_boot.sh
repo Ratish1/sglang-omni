@@ -86,6 +86,8 @@ if serve serve "$MODEL" "$PORT" $SERVE_ARGS; then
       > "$OUT/gen_$arm.log" 2>&1
     echo "gen $arm rc $? $(date +%T)" >> "$OUT/progress.txt"
   done
+  # MODEL_INFO=1 saves the server's model_info (prefill graph usage counters) after the arms
+  [ "${MODEL_INFO:-0}" = 1 ] && curl -s "http://127.0.0.1:$PORT/model_info" > "$OUT/model_info.json"
   if [ "${EVENTS:-0}" = 1 ]; then
     curl -s -X POST "http://127.0.0.1:$PORT/stop_request_profile" -H 'Content-Type: application/json' -d '{}' >> "$OUT/progress.txt"
     python3 "$S/events_first_audio.py" "$OUT/events" > "$OUT/first_audio.txt" 2>&1
