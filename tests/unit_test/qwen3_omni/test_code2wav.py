@@ -64,10 +64,6 @@ class FakeDecodeStream:
         return (0, -3)
 
 
-def fake_decode_stream(monkeypatch) -> None:
-    monkeypatch.setattr(code2wav_scheduler.torch.cuda, "Stream", FakeDecodeStream)
-
-
 class FakeCudaGraphRunner:
     def __init__(self, model, *, replay_error: Exception | None = None) -> None:
         self.model = model
@@ -229,7 +225,6 @@ def test_qwen_code2wav_factory_allows_batching_with_cuda_graph(
     monkeypatch,
 ) -> None:
     pin_cuda_platform(monkeypatch)
-    fake_decode_stream(monkeypatch)
     model = FactoryModel(num_quantizers=12)
     runner = SimpleNamespace(
         available_batch_sizes=lambda frames: (8, 4, 2, 1),
@@ -256,13 +251,13 @@ def test_qwen_code2wav_factory_allows_batching_with_cuda_graph(
     assert scheduler.enable_batching is True
     assert scheduler.cuda_graph_runner is runner
     assert scheduler.chunk_aligned_dispatch is True
+    assert scheduler.decode_stream is None, "alone in its process: default stream"
 
 
 def test_qwen_code2wav_factory_combines_batching_with_cuda_graph(
     monkeypatch,
 ) -> None:
     pin_cuda_platform(monkeypatch)
-    fake_decode_stream(monkeypatch)
     captured_keys: list[tuple] = []
 
     class RecordingRunner:
@@ -311,7 +306,6 @@ def test_qwen_code2wav_factory_disables_batching_when_runner_disabled(
     monkeypatch,
 ) -> None:
     pin_cuda_platform(monkeypatch)
-    fake_decode_stream(monkeypatch)
     build_calls: list[tuple] = []
 
     class DisabledRunner:
@@ -432,6 +426,7 @@ def test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys(
             total_gpu_memory_fraction=0.02,
             stream_chunk_size=20,
             left_context_size=25,
+            talker_in_process=True,
         )
 
     assert model.eval_calls == 1
@@ -484,7 +479,6 @@ def test_qwen_code2wav_enabled_factory_logs_disabled_build_reason(
     )
     import sglang_omni.platforms as platforms
 
-    fake_decode_stream(monkeypatch)
     monkeypatch.setattr(
         platforms.current_platform, "device_type", "cuda", raising=False
     )

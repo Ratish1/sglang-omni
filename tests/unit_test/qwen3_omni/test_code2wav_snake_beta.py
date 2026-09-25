@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,6 +85,9 @@ def test_real_code2wav_pcm_equal(monkeypatch: pytest.MonkeyPatch) -> None:
     model = code2wav_scheduler.load_code2wav_model(
         checkpoint, device="cuda:0", dtype="bfloat16"
     )
+    model_footprint_bytes = sum(
+        tensor.nbytes for tensor in itertools.chain(model.parameters(), model.buffers())
+    )
     graph_keys = tuple(
         dict.fromkeys(
             code2wav_scheduler.batched_graph_keys(10, 25, 16)
@@ -123,6 +127,8 @@ def test_real_code2wav_pcm_equal(monkeypatch: pytest.MonkeyPatch) -> None:
             num_quantizers=model.config.num_quantizers,
             total_gpu_memory_fraction=0.2,
             graph_keys=graph_keys,
+            model_footprint_bytes=model_footprint_bytes,
+            decode_stream=None,
         )
         assert eager_runner.stats()["enabled"], eager_runner.stats()
 
@@ -174,6 +180,8 @@ def test_real_code2wav_pcm_equal(monkeypatch: pytest.MonkeyPatch) -> None:
             num_quantizers=model.config.num_quantizers,
             total_gpu_memory_fraction=0.2,
             graph_keys=graph_keys,
+            model_footprint_bytes=model_footprint_bytes,
+            decode_stream=None,
         )
         assert fused_runner.stats()["enabled"], fused_runner.stats()
         for value, pcm in zip(codes, graph_expected):

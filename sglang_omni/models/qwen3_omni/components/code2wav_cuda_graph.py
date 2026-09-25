@@ -191,8 +191,6 @@ class Code2WavCudaGraphRunner:
     serving already relies on.
     """
 
-    # note (ratish): two warmups before a capture, as sglang's graph backends run
-    # them, load the kernels and pay the one-time setup
     WARMUP_ITERATIONS = 2
 
     def __init__(
