@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -44,6 +45,7 @@ class QwenTalkerModelRunner(ModelRunner):
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
+        self.prefill_dump_count = 0
 
     def execute(self, scheduler_output: Any):
         return super().execute(scheduler_output)
@@ -113,6 +115,31 @@ class QwenTalkerModelRunner(ModelRunner):
 
         if result.next_token_ids is None:
             return
+        else:
+            pass
+        dump_root = os.environ.get("TALKER_PREFILL_LOGITS_DIR")
+        if dump_root:
+            # note (ratish): profiling tree only; one file per prefill batch with
+            # the first codec logits, the hidden rows and the sampled ids, so an
+            # eager arm and a graph arm can be compared on the same requests.
+            dump_dir = os.path.join(
+                dump_root, os.environ.get("CUDA_VISIBLE_DEVICES", "all")
+            )
+            os.makedirs(dump_dir, exist_ok=True)
+            self.prefill_dump_count += 1
+            torch.save(
+                {
+                    "rids": [req.request_id for req in requests],
+                    "extend_lens": [
+                        int(req.data.req.extend_range.length) for req in requests
+                    ],
+                    "num_tokens": int(forward_batch.input_ids.shape[0]),
+                    "logits": result.logits_output.next_token_logits.float().cpu(),
+                    "hidden": result.logits_output.hidden_states.float().cpu(),
+                    "next_token_ids": result.next_token_ids.cpu(),
+                },
+                os.path.join(dump_dir, f"prefill_{self.prefill_dump_count:05d}.pt"),
+            )
         else:
             pass
         layer0_codes = result.next_token_ids
