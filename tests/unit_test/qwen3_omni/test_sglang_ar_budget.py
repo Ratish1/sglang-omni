@@ -548,6 +548,17 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
 
     qwen_stages.create_talker_ar_executor_from_config("dummy")
 
+    if current_platform.enable_talker_graph():
+        prefill_ladder = qwen_stages.build_default_prefill_cuda_graph_bs(
+            qwen_stages.TALKER_PREFILL_CUDA_GRAPH_MAX_TOKENS
+        )
+        prefill_graph_keys = {
+            "cuda_graph_backend_prefill": "breakable",
+            "cuda_graph_bs_prefill": prefill_ladder,
+            "cuda_graph_max_bs_prefill": max(prefill_ladder),
+        }
+    else:
+        prefill_graph_keys = {"cuda_graph_backend_prefill": "disabled"}
     assert build_calls == [
         {
             "cuda_graph_bs": [1, 2, 4, 8, 12, 16, 24, 32],
@@ -558,6 +569,7 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
             "sampling_backend": "pytorch",
             "torch_compile_max_bs": 32,
             "tp_size": 1,
+            **prefill_graph_keys,
         }
     ]
     assert scheduler_calls == [

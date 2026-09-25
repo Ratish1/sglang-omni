@@ -393,10 +393,17 @@ def patch_talker_startup(monkeypatch) -> list[dict[str, object]]:
     monkeypatch.setattr(stages, "get_process_gpu_memory_bytes", lambda *_: 0)
     monkeypatch.setattr(stages, "validate_generation_batch_policy", lambda **_: None)
     monkeypatch.setattr(
+        stages,
+        "build_sglang_server_args",
+        lambda model_path, context_length, **overrides: SimpleNamespace(
+            mem_fraction_static=0.5, overrides=overrides
+        ),
+    )
+    monkeypatch.setattr(
         bootstrap,
         "create_talker_scheduler",
         lambda server_args, gpu_id, **kwargs: received.append(
-            {**kwargs, "server_args": server_args}
+            {**kwargs, **server_args.overrides}
         ),
     )
     monkeypatch.setattr(
@@ -408,17 +415,31 @@ def patch_talker_startup(monkeypatch) -> list[dict[str, object]]:
 
 
 @pytest.mark.parametrize(
-    ("engine_overrides", "operator_selected"),
+    ("engine_overrides", "backend", "ladder_top", "operator_selected"),
     [
-        ({}, False),
-        ({"talker_ar.engine.cuda_graph_backend_prefill": "disabled"}, True),
+        ({}, "breakable", 2048, False),
+        ({"talker_ar.engine.cuda_graph_max_bs_prefill": 512}, "breakable", 512, False),
+        (
+            {"talker_ar.engine.disable_prefill_cuda_graph": True},
+            "disabled",
+            None,
+            False,
+        ),
+        (
+            {"talker_ar.engine.cuda_graph_backend_prefill": "disabled"},
+            "disabled",
+            2048,
+            True,
+        ),
     ],
 )
-def test_talker_stage_forwards_the_operator_prefill_backend_choice(
-    monkeypatch, engine_overrides, operator_selected
+def test_talker_stage_defaults_the_prefill_graph_and_the_operator_wins(
+    monkeypatch, engine_overrides, backend, ladder_top, operator_selected
 ):
     from sglang_omni.models.qwen3_omni import stages
+    from sglang_omni.platforms import current_platform
 
+    monkeypatch.setattr(current_platform, "enable_talker_graph", lambda: True)
     received = patch_talker_startup(monkeypatch)
     manager = ConfigManager(Qwen3OmniSpeechColocatedPipelineConfig(model_path="dummy"))
     config = manager.merge_config(engine_overrides)
@@ -426,4 +447,9 @@ def test_talker_stage_forwards_the_operator_prefill_backend_choice(
 
     stages.create_talker_ar_executor_from_config(**args)
 
-    assert received[0]["operator_selected_prefill_backend"] is operator_selected
+    (built,) = received
+    assert built["cuda_graph_backend_prefill"] == backend
+    assert built.get("cuda_graph_max_bs_prefill") == ladder_top
+    ladder = built.get("cuda_graph_bs_prefill")
+    assert (max(ladder) if ladder else None) == ladder_top
+    assert built["operator_selected_prefill_backend"] is operator_selected
