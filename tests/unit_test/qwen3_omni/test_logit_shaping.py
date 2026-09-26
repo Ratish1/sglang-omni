@@ -55,6 +55,37 @@ def test_codec_suppress_tokens_matches_reference(share_rows):
         assert torch.equal(logits_output.next_token_logits, expected)
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="sync debug mode requires CUDA"
+)
+@pytest.mark.parametrize("share_rows", [True, False])
+def test_codec_suppress_tokens_issues_no_blocking_device_sync(share_rows):
+    shared = [5, 90, 95]
+    if share_rows:
+        suppress_per_row = [shared] * 3
+    else:
+        suppress_per_row = [shared, [1, 2], shared]
+    requests = make_suppress_requests(suppress_per_row)
+    runner = types.SimpleNamespace()
+    logits = torch.randn(3, 96, device="cuda")
+    ModelRunner.apply_codec_suppress_tokens(
+        runner, types.SimpleNamespace(next_token_logits=logits.clone()), requests
+    )
+    logits_output = types.SimpleNamespace(next_token_logits=logits.clone())
+    torch.cuda.synchronize()
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        ModelRunner.apply_codec_suppress_tokens(runner, logits_output, requests)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert torch.equal(
+        logits_output.next_token_logits, suppress_reference(logits, requests)
+    )
+
+
 def test_suppress_cache_holds_one_entry_across_requests():
     """Fresh list objects with identical content must share one device tensor."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
