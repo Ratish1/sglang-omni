@@ -4,21 +4,28 @@
 # MODE formal serves the shipped config; MODE mapping turns every CUDA graph off and
 # records python stacks, so each kernel maps to its launch line. MODE speech serves the
 # shipped config and captures thinker decode with and without audio output.
-# usage: run_census_boot.sh <tree> <out dir> <card> <port> <bf16|fp8> <formal|mapping|speech>
+# MODE shapes captures the extremes of every stage: the smallest prefill, the largest
+# replayable one (2000 tokens, bucket 2048) and the largest chunk (8000, eager), decode at
+# batch 1 and at each engine's max_running_requests. EXTRA_SERVE_ARGS is appended to the
+# server args (formal on the h200 profile adds the thinker graph flags there); PIN_CPUS and
+# PIN_NODE pin the server and the driver like run_bench_boot.sh.
+# usage: run_census_boot.sh <tree> <out dir> <card> <port> <bf16|fp8|h200> <formal|mapping|speech|shapes-formal|shapes-mapping>
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 DTYPE=$5 MODE=$6
 S=$(cd "$(dirname "$0")" && pwd)
 case $DTYPE in
   bf16) MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct CONFIG=examples/configs/qwen3_omni_colocated_h100_bf16.yaml ;;
   fp8) MODEL=marksverdhei/Qwen3-Omni-30B-A3B-FP8 CONFIG=examples/configs/qwen3_omni_colocated_h100_fp8.yaml ;;
-  *) echo "dtype must be bf16 or fp8"; exit 1 ;;
+  h200) MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct CONFIG=examples/configs/qwen3_omni_colocated_h200.yaml ;;
+  *) echo "dtype must be bf16, fp8 or h200"; exit 1 ;;
 esac
-SERVE_ARGS="--config $CONFIG --colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
+SERVE_ARGS="--config $CONFIG --colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768 ${EXTRA_SERVE_ARGS:-}"
+PIN=${PIN_CPUS:+numactl --physcpubind=$PIN_CPUS --membind=${PIN_NODE:-0}}
 STACK=""
-if [ "$MODE" = mapping ]; then
-  SERVE_ARGS="$SERVE_ARGS --thinker.engine.disable_cuda_graph true --thinker.engine.cuda_graph_backend_prefill disabled --talker_ar.engine.disable_cuda_graph true --code2wav.factory.enable_cuda_graph false --audio_encoder.factory.enable_layer_cuda_graph false"
-  STACK=--with-stack
-fi
+case $MODE in *mapping)
+  SERVE_ARGS="$SERVE_ARGS --thinker.engine.disable_cuda_graph true --thinker.engine.cuda_graph_backend_prefill disabled --talker_ar.engine.disable_cuda_graph true --talker_ar.engine.cuda_graph_backend_prefill disabled --code2wav.factory.enable_cuda_graph false --audio_encoder.factory.enable_layer_cuda_graph false"
+  STACK=--with-stack ;;
+esac
 URL=http://127.0.0.1:$PORT
 mkdir -p "$OUT"
 cd "$TREE" || exit 1
@@ -28,6 +35,7 @@ git -C "$TREE" status --short > "$OUT/tree_status.txt"
 PYTHONPATH=$TREE python3 -c "import sglang_omni, sglang; print(sglang_omni.__file__, sglang.__version__)" > "$OUT/import_path.txt"
 md5sum "$S/omni_captures.py" "$S/step_ledger.py" "$0" > "$OUT/md5.txt"
 echo "$SERVE_ARGS" > "$OUT/serve_args.txt"
+echo "cpu pin: ${PIN:-none}" > "$OUT/progress.txt"
 nvidia-smi > "$OUT/gpus_before.txt"
 nvidia-smi -i "$CARD" --query-gpu=timestamp,memory.used,utilization.gpu --format=csv,noheader -l 1 > "$OUT/mem.csv" 2>&1 &
 MEM_PID=$!
@@ -39,7 +47,7 @@ LOAD_PID=$!
 
 began=$(date +%s)
 setsid bash -c "echo \$\$ > $OUT/server.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE \
-  python3 -u -m sglang_omni.cli serve --model-path $MODEL $SERVE_ARGS --host 127.0.0.1 --port $PORT" > "$OUT/serve.log" 2>&1 &
+  $PIN python3 -u -m sglang_omni.cli serve --model-path $MODEL $SERVE_ARGS --host 127.0.0.1 --port $PORT" > "$OUT/serve.log" 2>&1 &
 
 teardown() {
   kill -TERM -- -"$(cat "$OUT/server.pgid")" 2>/dev/null
@@ -63,18 +71,29 @@ if [ $healthy = 0 ]; then
   teardown
   exit 1
 fi
-echo "healthy startup_s $(( $(date +%s) - began )) $(date +%T)" > "$OUT/progress.txt"
+echo "healthy startup_s $(( $(date +%s) - began )) $(date +%T)" >> "$OUT/progress.txt"
 
 capture() {
   local name=$1; shift
   echo "start $name $(date +%T)" >> "$OUT/progress.txt"
-  PYTHONPATH=$TREE python3 "$S/omni_captures.py" --url $URL --model $MODEL --out "$OUT" "$@" \
+  PYTHONPATH=$TREE $PIN python3 "$S/omni_captures.py" --url $URL --model $MODEL --out "$OUT" "$@" \
     > "$OUT/driver_$name.json" 2> "$OUT/driver_$name.err"
   echo "end $name rc=$? $(date +%T)" >> "$OUT/progress.txt"
 }
 
-L=$MODE
-if [ "$MODE" = speech ]; then
+L=${MODE#shapes-}
+if [ "${MODE%-*}" = shapes ]; then
+  capture tp_min --stage thinker --kind prefill --batch 1 --prompt-tokens 1 --label ${L}_min $STACK
+  capture tp_2k --stage thinker --kind prefill --batch 1 --prompt-tokens 2000 --label ${L}_2k $STACK
+  capture tp_8k --stage thinker --kind prefill --batch 1 --prompt-tokens 8000 --label ${L}_8k $STACK
+  capture td_b1 --stage thinker --kind decode --batch 1 --label $L $STACK
+  capture td_b64 --stage thinker --kind decode --batch 64 --label $L $STACK
+  capture kp_min --stage talker_ar --kind prefill --batch 1 --prompt-tokens 1 --max-tokens 8 --label ${L}_min $STACK
+  capture kp_2k --stage talker_ar --kind prefill --batch 1 --prompt-tokens 2000 --max-tokens 8 --label ${L}_2k $STACK
+  capture kp_8k --stage talker_ar --kind prefill --batch 1 --prompt-tokens 8000 --max-tokens 8 --label ${L}_8k $STACK
+  capture kd_b1 --stage talker_ar --kind decode --batch 1 --warmup 1 --max-tokens 512 --label $L $STACK
+  capture kd_b32 --stage talker_ar --kind decode --batch 32 --warmup 1 --max-tokens 512 --label $L $STACK
+elif [ "$MODE" = speech ]; then
   # thinker decode of requests that also ask for audio, against the same text-only batch
   for pass in 1 2; do
     capture uncaptured_tds_b16_$pass --stage thinker --kind decode --batch 16 --speech --max-tokens 512 --label uncaptured$pass --no-capture
@@ -102,7 +121,7 @@ fi
 grep -m1 "Torch profiler armed" "$OUT/serve.log" > "$OUT/armed_marker.txt"
 teardown
 
-for trace in "$OUT"/"$L"/*/b*/*.trace.json.gz; do
+for trace in "$OUT"/"$L"*/*/b*/*.trace.json.gz; do
   [ -e "$trace" ] || continue
   python3 "$S/step_ledger.py" "$trace" --top 30 > "${trace%.trace.json.gz}.ledger.txt" 2>&1
 done
