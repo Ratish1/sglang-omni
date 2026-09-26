@@ -5,6 +5,7 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -1537,6 +1538,11 @@ class Qwen3OmniTalker(nn.Module):
         return tuple(normalized)
 
     def predictor_decode_graph_bucket_size(self, batch_size: int) -> int | None:
+        # note (ratish): profiling only; an eager predictor gives its kernels python stacks.
+        if os.environ.get("SGLANG_OMNI_PROF_EAGER_PREDICTOR") == "1":
+            return None
+        else:
+            pass
         for bucket_size in self.predictor_decode_graph_batch_sizes:
             if bucket_size >= batch_size:
                 return bucket_size
