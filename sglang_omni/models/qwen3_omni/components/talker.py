@@ -1694,36 +1694,35 @@ class Qwen3OmniTalker(nn.Module):
         cache_len: int,
     ) -> torch.Tensor:
         """Process one predictor token against the cached prefix."""
-        hidden_states = token_embeds
-        hidden_size = hidden_states.shape[-1]
+        hidden_size = token_embeds.shape[-1]
+        hidden_states = token_embeds.reshape(-1, hidden_size)
+        residual = None
         positions = self.predictor_positions[cache_len : cache_len + 1].repeat(
             batch_size
         )
 
+        # note (ratish): the norms take the residual and return the sum, so each
+        # layer's two residual adds are folded into its two norm launches.
         for layer_idx, layer in enumerate(self.code_predictor.model.layers):
-            residual = hidden_states
-            normed = layer.input_layernorm(hidden_states.reshape(-1, hidden_size))
-            normed = normed.reshape(batch_size, 1, hidden_size)
+            if residual is None:
+                residual = hidden_states
+                normed = layer.input_layernorm(hidden_states)
+            else:
+                normed, residual = layer.input_layernorm(hidden_states, residual)
             attn_out = self.predictor_cached_self_attention(
                 layer_idx=layer_idx,
                 attn=layer.self_attn,
-                hidden_states=normed,
+                hidden_states=normed.reshape(batch_size, 1, hidden_size),
                 positions=positions,
                 batch_size=batch_size,
                 cache_len=cache_len,
             )
-            hidden_states = residual + attn_out
-
-            residual = hidden_states
-            normed = layer.post_attention_layernorm(
-                hidden_states.reshape(-1, hidden_size)
+            normed, residual = layer.post_attention_layernorm(
+                attn_out.reshape(-1, hidden_size), residual
             )
-            mlp_out = layer.mlp(normed).reshape(batch_size, 1, hidden_size)
-            hidden_states = residual + mlp_out
+            hidden_states = layer.mlp(normed)
 
-        hidden_states = self.code_predictor.model.norm(
-            hidden_states.reshape(-1, hidden_size)
-        )
+        hidden_states, _ = self.code_predictor.model.norm(hidden_states, residual)
         return hidden_states.reshape(batch_size, 1, hidden_size)
 
     def predictor_cached_self_attention(

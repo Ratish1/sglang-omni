@@ -22,6 +22,19 @@ class TupleLinear(nn.Module):
         return self.proj(hidden_states), None
 
 
+class IdentityResidualNorm(nn.Module):
+    """Identity norm with the SGLang RMSNorm residual contract: returns the sum twice."""
+
+    def forward(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return hidden_states
+        else:
+            summed = hidden_states + residual
+            return summed, summed
+
+
 class IdentityRotary(nn.Module):
     def forward(
         self,
@@ -83,8 +96,8 @@ def build_real_step_predictor_graph_talker(
     talker.predictor_decode_graph_disabled = set()
 
     layer = SimpleNamespace(
-        input_layernorm=nn.Identity(),
-        post_attention_layernorm=nn.Identity(),
+        input_layernorm=IdentityResidualNorm(),
+        post_attention_layernorm=IdentityResidualNorm(),
         mlp=nn.Linear(hidden_size, hidden_size, bias=False).to(device),
     )
     layer.self_attn = SimpleNamespace(
@@ -105,7 +118,7 @@ def build_real_step_predictor_graph_talker(
     talker.code_predictor = SimpleNamespace(
         model=SimpleNamespace(
             layers=[layer],
-            norm=nn.Identity(),
+            norm=IdentityResidualNorm(),
             codec_embedding=nn.ModuleList(
                 [nn.Embedding(vocab_size, hidden_size).to(device) for _ in range(3)]
             ),
