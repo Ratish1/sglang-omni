@@ -780,6 +780,7 @@ def test_qwen_predictor_one_token_step_keeps_the_pre_norm_residual_chain(
             attn=layer.self_attn,
             hidden_states=token_embeds,
             positions=positions,
+            cache_slots=talker.predictor_cache_slots[0, :batch_size],
             batch_size=batch_size,
             cache_len=0,
         )
