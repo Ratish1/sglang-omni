@@ -96,6 +96,26 @@ def test_rejects_seeded_flashinfer_top_p_before_upstream_sampler(monkeypatch):
         runner.install_sampling_seeds(make_fb(top_p=True), [req(42)])
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="sync debug mode requires CUDA"
+)
+def test_installs_seeds_without_blocking_device_sync():
+    runner = object.__new__(ModelRunner)
+    fb = make_fb()
+    fb.sampling_info.device = "cuda"
+    torch.cuda.synchronize()
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        runner.install_sampling_seeds(fb, [req(42, "a"), req(7, "b")])
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert fb.sampling_info.sampling_seed.device.type == "cuda"
+    assert fb.sampling_info.sampling_seed.tolist() == [42, 7]
+
+
 def test_allows_seeded_pytorch_top_p(monkeypatch):
     monkeypatch.setattr(
         "sglang_omni.model_runner.base.current_sglang_sampling_backend",
