@@ -560,6 +560,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         followup_max_batch_size: int = 8,
         followup_batch_wait_ms: int = 1,
         followup_worker_count: int = 2,
+        followup_urgent_slack_ms: int = 0,
         initial_cuda_graph: bool = True,
         enable_deterministic_inference: bool = False,
         followup_cuda_graph: bool = True,
@@ -667,6 +668,10 @@ class Qwen3TTSStreamingVocoderScheduler(
             pass
         if initial_batch_wait_ms < 0 or followup_batch_wait_ms < 0:
             raise ValueError("async batch waits must be >= 0")
+        else:
+            pass
+        if followup_urgent_slack_ms < 0:
+            raise ValueError("followup_urgent_slack_ms must be >= 0")
         else:
             pass
         if codec_state_slots <= 0:
@@ -797,6 +802,11 @@ class Qwen3TTSStreamingVocoderScheduler(
         self.initial_batch_wait_s = float(initial_batch_wait_ms) / 1000.0
         self.followup_max_batch_size = int(followup_max_batch_size)
         self.followup_batch_wait_s = float(followup_batch_wait_ms) / 1000.0
+        # note (Haoling Pu): deterministic runs keep the scheduling they qualified on.
+        if self.deterministic_inference:
+            self.followup_urgent_slack_s = 0.0
+        else:
+            self.followup_urgent_slack_s = float(followup_urgent_slack_ms) / 1000.0
         self.default_initial_chunk_frames = int(initial_chunk_frames)
         self.stream_left_context_frames = int(stream_left_context_frames)
         self.async_decode = (
@@ -2917,7 +2927,9 @@ class Qwen3TTSStreamingVocoderScheduler(
         self, *, first_timeout: float | None = None
     ) -> list[tuple[str, Qwen3TTSStreamState]] | None:
         try:
-            _, _, request_id, state = self.followup_queue.get(timeout=first_timeout)
+            earliest_playback_deadline_s, _, request_id, state = (
+                self.followup_queue.get(timeout=first_timeout)
+            )
         except queue.Empty:
             return None
         if state is None or self.async_stop.is_set():
@@ -2925,21 +2937,37 @@ class Qwen3TTSStreamingVocoderScheduler(
         else:
             pass
         batch = [(request_id, state)]
-        deadline = time.monotonic() + self.followup_batch_wait_s
+        window_end_s = time.monotonic() + self.followup_batch_wait_s
         while len(batch) < self.followup_max_batch_size:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
+            now_s = time.monotonic()
+            if self.followup_urgent_slack_s > 0.0:
+                urgent_from_s = (
+                    earliest_playback_deadline_s - self.followup_urgent_slack_s
+                )
             else:
-                pass
+                urgent_from_s = float("inf")
+            wake_s = min(window_end_s, urgent_from_s)
             try:
-                _, _, request_id, state = self.followup_queue.get(timeout=remaining)
+                # note (Haoling Pu): urgent batches still take queued work to stay full.
+                if urgent_from_s <= now_s:
+                    playback_deadline_s, _, request_id, state = (
+                        self.followup_queue.get_nowait()
+                    )
+                elif wake_s > now_s:
+                    playback_deadline_s, _, request_id, state = self.followup_queue.get(
+                        timeout=wake_s - now_s
+                    )
+                else:
+                    break
             except queue.Empty:
                 break
             if state is None:
                 return None
             else:
                 pass
+            earliest_playback_deadline_s = min(
+                earliest_playback_deadline_s, playback_deadline_s
+            )
             batch.append((request_id, state))
         return batch
 
@@ -2983,16 +3011,46 @@ class Qwen3TTSStreamingVocoderScheduler(
                 else:
                     planned.append((request_id, state, plan))
         stream = getattr(self.worker_ctx, "stream", self.followup_decode_stream)
-        for cohort in self.group_decode_plans(planned_incremental):
+        cohorts = self.group_decode_plans(planned_incremental)
+        if self.followup_urgent_slack_s > 0.0 and cohorts:
+            # note (Haoling Pu): streams run in launch order; earliest deadline first.
+            cohorts = sorted(
+                (
+                    sorted(cohort, key=lambda entry: entry[1].playback_deadline_s)
+                    for cohort in cohorts
+                ),
+                key=lambda cohort: cohort[0][1].playback_deadline_s,
+            )
+            # note (Haoling Pu): with a full batch queued, isolating costs throughput.
+            should_isolate_urgent_group = (
+                cohorts[0][0][1].playback_deadline_s - time.monotonic()
+                < self.followup_urgent_slack_s
+                and self.followup_queue.qsize() < self.followup_max_batch_size
+            )
+        else:
+            should_isolate_urgent_group = False
+        launch_groups = (
+            group
+            for cohort in cohorts
             for group in self.split_incremental_group_for_graph(
                 cohort, runner=getattr(self.worker_ctx, "incremental_graphs", None)
-            ):
+            )
+        )
+        for position, group in enumerate(launch_groups):
+            is_isolated_urgent_group = should_isolate_urgent_group and position == 0
+            # note (Haoling Pu): alone in flight, the urgent group commits once decoded.
+            if is_isolated_urgent_group:
+                self.drain_pending_incremental(keep=0)
+            else:
                 self.drain_pending_incremental(keep=1)
-                pending = self.launch_incremental_group(group, stream=stream)
-                if pending is not None:
-                    self.pending_incremental().append(pending)
-                else:
-                    pass
+            pending = self.launch_incremental_group(group, stream=stream)
+            if pending is None:
+                continue
+            elif is_isolated_urgent_group:
+                self.pending_incremental().append(pending)
+                self.drain_pending_incremental(keep=0)
+            else:
+                self.pending_incremental().append(pending)
         if planned:
             self.drain_pending_incremental(keep=0)
         else:
