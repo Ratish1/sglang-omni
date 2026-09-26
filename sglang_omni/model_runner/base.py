@@ -1169,7 +1169,14 @@ class ModelRunner:
                 group[1].append(row_idx)
         for toks_t, rows in row_groups.values():
             if len(rows) == logits.shape[0]:
-                logits[:, toks_t] = float("-inf")
+                logits.index_fill_(1, toks_t, float("-inf"))
             else:
-                rows_t = torch.tensor(rows, dtype=torch.long, device=device)
-                logits[rows_t[:, None], toks_t[None, :]] = float("-inf")
+                rows_t = torch.tensor(
+                    rows,
+                    dtype=torch.long,
+                    pin_memory=current_platform.is_pin_memory_available(device),
+                ).to(device, non_blocking=True)
+                logits.index_put_(
+                    (rows_t[:, None], toks_t[None, :]),
+                    torch.full((), float("-inf"), dtype=logits.dtype, device=device),
+                )
