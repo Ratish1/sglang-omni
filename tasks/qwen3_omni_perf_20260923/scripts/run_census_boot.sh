@@ -9,7 +9,7 @@
 # batch 1 and at each engine's max_running_requests. EXTRA_SERVE_ARGS is appended to the
 # server args (formal on the h200 profile adds the thinker graph flags there); PIN_CPUS and
 # PIN_NODE pin the server and the driver like run_bench_boot.sh.
-# usage: run_census_boot.sh <tree> <out dir> <card> <port> <bf16|fp8|h200> <formal|mapping|speech|shapes-formal|shapes-mapping>
+# usage: run_census_boot.sh <tree> <out dir> <card> <port> <bf16|fp8|h200> <formal|mapping|speech|shapes-formal|shapes-mapping|talker-mapping>
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 DTYPE=$5 MODE=$6
 S=$(cd "$(dirname "$0")" && pwd)
@@ -91,6 +91,10 @@ if [ "${MODE%-*}" = shapes ]; then
   capture kp_min --stage talker_ar --kind prefill --batch 1 --prompt-tokens 1 --max-tokens 8 --label ${L}_min $STACK
   capture kp_2k --stage talker_ar --kind prefill --batch 1 --prompt-tokens 2000 --max-tokens 8 --label ${L}_2k $STACK
   capture kp_8k --stage talker_ar --kind prefill --batch 1 --prompt-tokens 8000 --max-tokens 8 --label ${L}_8k $STACK
+  capture kd_b1 --stage talker_ar --kind decode --batch 1 --warmup 1 --max-tokens 512 --label $L $STACK
+  capture kd_b32 --stage talker_ar --kind decode --batch 32 --warmup 1 --max-tokens 512 --label $L $STACK
+elif [ "$MODE" = talker-mapping ]; then
+  # the predictor eager (SGLANG_OMNI_PROF_EAGER_PREDICTOR=1 on the prof tree) so its kernels carry lines
   capture kd_b1 --stage talker_ar --kind decode --batch 1 --warmup 1 --max-tokens 512 --label $L $STACK
   capture kd_b32 --stage talker_ar --kind decode --batch 32 --warmup 1 --max-tokens 512 --label $L $STACK
 elif [ "$MODE" = speech ]; then
