@@ -1017,8 +1017,10 @@ class ModelRunner:
                 pass
             row_seeds.append(seed)
         sampling_info.sampling_seed = torch.tensor(
-            row_seeds, dtype=torch.long, device=sampling_info.device
-        )
+            row_seeds,
+            dtype=torch.long,
+            pin_memory=current_platform.is_pin_memory_available(sampling_info.device),
+        ).to(sampling_info.device, non_blocking=True)
 
     @staticmethod
     def validate_seeded_sampling_supported(sampling_info: Any) -> None:
