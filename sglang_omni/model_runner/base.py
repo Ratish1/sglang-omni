@@ -15,6 +15,7 @@ import torch
 
 from sglang_omni.model_runner.prefill_inputs import clear_omni_prefill_inputs
 from sglang_omni.platforms import current_platform
+from sglang_omni.profiler.pipeline_nvtx import trace_call, trace_range
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
     derive_sampling_seed,
@@ -64,6 +65,14 @@ def resolve_deferred_prefill_inputs(schedule_batch: Any, device: torch.device) -
 
     schedule_batch.input_ids = staged_input_ids.to(device, non_blocking=True)
     schedule_batch.prefill_input_ids_cpu = None
+
+
+def step_annotation(scheduler_output: Any) -> dict[str, Any]:
+    batch_data = scheduler_output.batch_data
+    return {
+        "batch_size": len(scheduler_output.requests),
+        "mode": batch_data.forward_mode.name if batch_data is not None else None,
+    }
 
 
 @dataclass
@@ -322,6 +331,11 @@ class ModelRunner:
             realloc_on_grow=True,
         )
 
+    @trace_call(
+        "runner",
+        "execute",
+        lambda self, scheduler_output: step_annotation(scheduler_output),
+    )
     def execute(self, scheduler_output: Any) -> ModelRunnerOutput:
         """Full synchronous pipeline: build → prepare → forward → post →
         sample → output.
@@ -338,7 +352,8 @@ class ModelRunner:
         else:
             pass
         with self.execution_context(schedule_batch, isolate_sampling=True):
-            built = self.build_forward_batch(scheduler_output)
+            with trace_range("runner", "build"):
+                built = self.build_forward_batch(scheduler_output)
             if built is None:
                 return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
             else:
@@ -347,39 +362,47 @@ class ModelRunner:
             batch_result = self.prepare_and_forward(
                 forward_batch, schedule_batch, scheduler_output.requests, is_prefill
             )
-            if is_prefill:
-                self.post_prefill(
+            with trace_range("runner", "post"):
+                if is_prefill:
+                    self.post_prefill(
+                        batch_result,
+                        forward_batch,
+                        schedule_batch,
+                        scheduler_output.requests,
+                    )
+                else:
+                    self.post_decode(
+                        batch_result,
+                        forward_batch,
+                        schedule_batch,
+                        scheduler_output.requests,
+                    )
+            with trace_range("runner", "publish"):
+                self.ensure_next_token_ids(
+                    batch_result,
+                    forward_batch,
+                    schedule_batch,
+                    scheduler_output,
+                )
+                self.publish_next_tokens(
                     batch_result,
                     forward_batch,
                     schedule_batch,
                     scheduler_output.requests,
                 )
-            else:
-                self.post_decode(
-                    batch_result,
-                    forward_batch,
-                    schedule_batch,
-                    scheduler_output.requests,
-                )
-            self.ensure_next_token_ids(
+        with trace_range("runner", "finalize"):
+            return self.finalize(
                 batch_result,
                 forward_batch,
                 schedule_batch,
                 scheduler_output,
             )
-            self.publish_next_tokens(
-                batch_result,
-                forward_batch,
-                schedule_batch,
-                scheduler_output.requests,
-            )
-        return self.finalize(
-            batch_result,
-            forward_batch,
-            schedule_batch,
-            scheduler_output,
-        )
 
+    @trace_call(
+        "runner",
+        "launch",
+        lambda self, scheduler_output: step_annotation(scheduler_output),
+    )
     def execute_launch(self, scheduler_output: Any) -> "PendingStep | None":
         """Enqueue a decode step's forward + on-GPU sample, call
         ``post_decode_launch`` to publish a model-specific resolve payload
@@ -447,6 +470,13 @@ class ModelRunner:
             batch_result=batch_result,
         )
 
+    @trace_call(
+        "runner",
+        "resolve",
+        lambda self, pending: (
+            step_annotation(pending.scheduler_output) if pending is not None else {}
+        ),
+    )
     def execute_resolve(
         self, pending: "PendingStep | None"
     ) -> ModelRunnerOutput | None:
@@ -464,7 +494,8 @@ class ModelRunner:
         if pending.event.query():
             self.async_query_hit += 1
         else:
-            pending.event.synchronize()
+            with trace_range("runner", "resolve_wait"):
+                pending.event.synchronize()
             self.async_query_miss += 1
         # Skip reqs finished or retracted in a prior (lagged) step so _finalize
         # neither re-emits nor re-frees their KV (mirrors _resolve_and_process).
@@ -546,25 +577,31 @@ class ModelRunner:
         """Prepare hook → standard forward (if not custom) → sample-before-post
         block. Returns ``batch_result``."""
         try:
-            if is_prefill:
-                self.before_prefill(forward_batch, schedule_batch, requests)
-                batch_result = self.custom_prefill_forward(
-                    forward_batch, schedule_batch, requests
-                )
-            else:
-                self.before_decode(
-                    forward_batch,
-                    schedule_batch,
-                    requests,
-                    is_lookahead=is_lookahead,
-                )
-                batch_result = self.custom_decode_forward(
-                    forward_batch, schedule_batch, requests
-                )
-            if batch_result is None:
-                batch_result = self.tp_worker.forward_batch_generation(forward_batch)
-            else:
-                pass
+            with trace_range("runner", "before"):
+                if is_prefill:
+                    self.before_prefill(forward_batch, schedule_batch, requests)
+                else:
+                    self.before_decode(
+                        forward_batch,
+                        schedule_batch,
+                        requests,
+                        is_lookahead=is_lookahead,
+                    )
+            with trace_range("runner", "forward"):
+                if is_prefill:
+                    batch_result = self.custom_prefill_forward(
+                        forward_batch, schedule_batch, requests
+                    )
+                else:
+                    batch_result = self.custom_decode_forward(
+                        forward_batch, schedule_batch, requests
+                    )
+                if batch_result is None:
+                    batch_result = self.tp_worker.forward_batch_generation(
+                        forward_batch
+                    )
+                else:
+                    pass
 
             if (
                 not schedule_batch.is_prefill_only
@@ -579,12 +616,13 @@ class ModelRunner:
                     )
                 )
             ):
-                batch_result.next_token_ids = self.sample_next_token_ids(
-                    batch_result.logits_output,
-                    forward_batch,
-                    schedule_batch,
-                    requests,
-                )
+                with trace_range("runner", "sample"):
+                    batch_result.next_token_ids = self.sample_next_token_ids(
+                        batch_result.logits_output,
+                        forward_batch,
+                        schedule_batch,
+                        requests,
+                    )
             else:
                 pass
             return batch_result

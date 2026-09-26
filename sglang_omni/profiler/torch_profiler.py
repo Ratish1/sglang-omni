@@ -5,8 +5,14 @@ import os
 import subprocess
 import threading
 from contextlib import nullcontext
+from dataclasses import dataclass
 
-from torch.profiler import ProfilerActivity, profile, supported_activities
+from torch.profiler import (
+    ProfilerActivity,
+    _ExperimentalConfig,
+    profile,
+    supported_activities,
+)
 
 from sglang_omni.platforms import current_platform
 
@@ -32,6 +38,19 @@ def profiler_activities() -> list[ProfilerActivity]:
     return [ProfilerActivity.CPU, *device]
 
 
+@dataclass(kw_only=True)
+class StepWindow:
+    """A profile that starts at the counter's next forward and stops after num_steps."""
+
+    counter: object
+    trace_path_template: str
+    run_id: str
+    num_steps: int
+    with_stack: bool | None
+    record_shapes: bool | None
+    forwards_left: int | None = None
+
+
 class TorchProfiler(ProfilerBase):
     """
     Torch-based profiler configured for End-to-End continuous recording.
@@ -42,18 +61,58 @@ class TorchProfiler(ProfilerBase):
     profiler: profile | None = None
     trace_template: str = ""
     active_run_id: str | None = None
-    lock = threading.Lock()
+    step_window: StepWindow | None = None
+    lock = threading.RLock()
 
     @classmethod
     def get_active_run_id(cls) -> str | None:
         return cls.active_run_id
 
     @classmethod
-    def start(cls, trace_path_template: str, run_id: str | None = None) -> str:
-        """
-        Start the profiler with the given trace path template.
-        """
+    def arm_step_window(cls, window: StepWindow) -> None:
         with cls.lock:
+            cls.step_window = window
+
+    @classmethod
+    def count_forward(cls, counter: object) -> None:
+        """Advance the armed window by one forward of counter, before it runs."""
+        window = cls.step_window
+        if window is None or window.counter is not counter:
+            return
+        else:
+            pass
+        with cls.lock:
+            if cls.step_window is not window:
+                return
+            else:
+                pass
+            if window.forwards_left is None:
+                cls.start(
+                    window.trace_path_template,
+                    window.run_id,
+                    with_stack=window.with_stack,
+                    record_shapes=window.record_shapes,
+                )
+                window.forwards_left = window.num_steps
+            else:
+                pass
+            if window.forwards_left == 0:
+                cls.stop(run_id=window.run_id)
+            else:
+                window.forwards_left -= 1
+
+    @classmethod
+    def start(
+        cls,
+        trace_path_template: str,
+        run_id: str | None = None,
+        *,
+        with_stack: bool | None = None,
+        record_shapes: bool | None = None,
+    ) -> str:
+        """Start the profiler; None flags fall back to their env vars."""
+        with cls.lock:
+            rank = cls.get_rank()
             if cls.profiler is not None:
                 if run_id is not None and cls.active_run_id == run_id:
                     return f"{cls.trace_template}_rank{rank}.trace.json.gz"
@@ -76,7 +135,6 @@ class TorchProfiler(ProfilerBase):
                 cls.trace_template = ""
             else:
                 pass
-            rank = cls.get_rank()
             trace_path_template = os.path.abspath(trace_path_template)
             cls.trace_template = trace_path_template
             cls.active_run_id = run_id
@@ -85,34 +143,27 @@ class TorchProfiler(ProfilerBase):
             logger.info(
                 "[Rank %s] Starting End-to-End Torch profiler (run_id=%s)", rank, run_id
             )
-
-            def trace_handler(p):
-                nonlocal json_file
-                try:
-                    p.export_chrome_trace(json_file)
-                    logger.info(f"[Rank {rank}] Trace exported to {json_file}")
-                    try:
-                        subprocess.Popen(["gzip", "-f", json_file])
-                        logger.info(
-                            f"[Rank {rank}] Triggered background compression for {json_file}"
-                        )
-                        json_file = f"{json_file}.gz"
-                    except Exception as compress_err:
-                        logger.warning(
-                            f"[Rank {rank}] Background gzip failed to start: {compress_err}"
-                        )
-                except Exception as e:
-                    logger.warning(f"[Rank {rank}] Failed to export trace: {e}")
-
+            if with_stack is None:
+                with_stack = os.environ.get("SGLANG_TORCH_PROFILER_WITH_STACK") == "1"
+            else:
+                pass
+            if record_shapes is None:
+                record_shapes = (
+                    os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES") == "1"
+                )
+            else:
+                pass
+            # note(ratish): without profile_all_threads only the starting thread
+            # records cpu ops and spans; the scheduler and worker threads would be
+            # kernels without callers. stop() exports, so no on_trace_ready.
             cls.profiler = profile(
                 activities=profiler_activities(),
-                on_trace_ready=trace_handler,
-                record_shapes=os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES")
-                == "1",
+                record_shapes=record_shapes,
                 profile_memory=os.environ.get("SGLANG_TORCH_PROFILER_PROFILE_MEMORY")
                 == "1",
-                with_stack=os.environ.get("SGLANG_TORCH_PROFILER_WITH_STACK") == "1",
+                with_stack=with_stack,
                 with_flops=os.environ.get("SGLANG_TORCH_PROFILER_WITH_FLOPS") == "1",
+                experimental_config=_ExperimentalConfig(profile_all_threads=True),
             )
             cls.profiler.start()
             return f"{trace_path_template}_rank{rank}.trace.json.gz"
@@ -126,6 +177,11 @@ class TorchProfiler(ProfilerBase):
           - only stop when active_run_id matches (otherwise ignore)
         """
         with cls.lock:
+            window = cls.step_window
+            if window is not None and run_id in (None, window.run_id):
+                cls.step_window = None
+            else:
+                pass
             if cls.profiler is None:
                 return None
             else:
@@ -191,7 +247,22 @@ class TorchProfiler(ProfilerBase):
 class TorchNPUProfiler(TorchProfiler):
 
     @classmethod
-    def start(cls, trace_path_template: str, run_id: str | None = None) -> str:
+    def start(
+        cls,
+        trace_path_template: str,
+        run_id: str | None = None,
+        *,
+        with_stack: bool | None = None,
+        record_shapes: bool | None = None,
+    ) -> str:
+        if with_stack is None:
+            with_stack = os.environ.get("SGLANG_TORCH_PROFILER_WITH_STACK") == "1"
+        else:
+            pass
+        if record_shapes is None:
+            record_shapes = os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES") == "1"
+        else:
+            pass
         with cls.lock:
             trace_path_template = os.path.abspath(trace_path_template)
             rank = cls.get_rank()
@@ -232,11 +303,10 @@ class TorchNPUProfiler(TorchProfiler):
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     trace_path_template
                 ),
-                record_shapes=os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES")
-                == "1",
+                record_shapes=record_shapes,
                 profile_memory=os.environ.get("SGLANG_TORCH_PROFILER_PROFILE_MEMORY")
                 == "1",
-                with_stack=os.environ.get("SGLANG_TORCH_PROFILER_WITH_STACK") == "1",
+                with_stack=with_stack,
                 with_flops=os.environ.get("SGLANG_TORCH_PROFILER_WITH_FLOPS") == "1",
             )
             cls.profiler.start()
@@ -245,6 +315,11 @@ class TorchNPUProfiler(TorchProfiler):
     @classmethod
     def stop(cls, *, run_id: str | None = None) -> dict | None:
         with cls.lock:
+            window = cls.step_window
+            if window is not None and run_id in (None, window.run_id):
+                cls.step_window = None
+            else:
+                pass
             if cls.profiler is None:
                 return None
             else:
