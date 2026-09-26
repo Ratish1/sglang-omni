@@ -329,6 +329,8 @@ def create_vocoder_executor(
     followup_max_batch_size: int = 8,
     followup_batch_wait_ms: int = 4,
     followup_worker_count: int = 2,
+    # note (Haoling Pu): above the 23-28 ms p90 enqueue-to-arrival gap on L40S/A6000.
+    followup_urgent_slack_ms: int = 30,
     initial_cuda_graph: bool = True,
     enable_deterministic_inference: bool = False,
     followup_cuda_graph: bool = True,
@@ -379,6 +381,7 @@ def create_vocoder_executor(
         followup_max_batch_size=followup_max_batch_size,
         followup_batch_wait_ms=followup_batch_wait_ms,
         followup_worker_count=followup_worker_count,
+        followup_urgent_slack_ms=followup_urgent_slack_ms,
         initial_cuda_graph=initial_cuda_graph,
         async_decode=async_decode,
         enable_deterministic_inference=enable_deterministic_inference,
