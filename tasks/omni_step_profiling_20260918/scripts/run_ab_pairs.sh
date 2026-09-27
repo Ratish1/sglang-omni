@@ -92,9 +92,14 @@ round() {
   echo "round $name end $(date +%T)" >> "$OUT/rounds.txt"
 }
 
-round c16 "$CARD1" "$CARD2" yes $META --concurrency 16
-round c16_swapped "$CARD2" "$CARD1" no $META --concurrency 16
-round longform_c16 "$CARD1" "$CARD2" no "$LONGFORM" --concurrency 16
-round longform_c16_swapped "$CARD2" "$CARD1" no "$LONGFORM" --concurrency 16
-round c1_seeded "$CARD1" "$CARD2" yes $META --concurrency 1 --seed 1234
+#ROUNDS picks the rounds by name; the longform meta is "-" when its rounds are left out
+for name in ${ROUNDS:-c16 c16_swapped longform_c16 longform_c16_swapped c1_seeded}; do
+  case $name in
+    c16) round c16 "$CARD1" "$CARD2" yes $META --concurrency 16 ;;
+    c16_swapped) round c16_swapped "$CARD2" "$CARD1" no $META --concurrency 16 ;;
+    longform_c16) round longform_c16 "$CARD1" "$CARD2" no "$LONGFORM" --concurrency 16 ;;
+    longform_c16_swapped) round longform_c16_swapped "$CARD2" "$CARD1" no "$LONGFORM" --concurrency 16 ;;
+    c1_seeded) round c1_seeded "$CARD1" "$CARD2" yes $META --concurrency 1 --seed 1234 ;;
+  esac
+done
 echo "all done $(date +%T)" > "$OUT/DONE"
