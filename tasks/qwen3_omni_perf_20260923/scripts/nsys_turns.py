@@ -20,6 +20,7 @@ usage: python nsys_turns.py REPORT.sqlite --window window.txt [--strip-ms 200] [
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
 import html
 import sqlite3
@@ -53,8 +54,26 @@ def intersection_ns(a: list[tuple[int, int]], b: list[tuple[int, int]]) -> int:
     return total
 
 
-def clipped(union: list[tuple[int, int]], t0: int, t1: int) -> list[tuple[int, int]]:
-    return [(max(s, t0), min(e, t1)) for s, e in union if e > t0 and s < t1]
+class UnionIndex:
+    """A sorted union with its start times, so clipping bisects instead of scanning."""
+
+    def __init__(self, intervals: list[tuple[int, int]]) -> None:
+        self.intervals = intervals
+        self.starts = [s for s, _ in intervals]
+
+
+def clipped(union: UnionIndex, t0: int, t1: int) -> list[tuple[int, int]]:
+    """Intervals of the union that overlap [t0, t1), clipped to it."""
+    first = max(0, bisect.bisect_right(union.starts, t0) - 1)
+    out = []
+    for s, e in union.intervals[first:]:
+        if s >= t1:
+            break
+        elif e > t0:
+            out.append((max(s, t0), min(e, t1)))
+        else:
+            pass
+    return out
 
 
 def quantiles(values: list[float]) -> str:
@@ -116,19 +135,20 @@ def main() -> None:
     first, second = busiest
     label = {pid: f"{stage_by_pid.get(pid, '?')} ({pid})" for pid in busiest}
     unions = {
-        pid: intervals_union([(s, e) for s, e, _ in by_pid[pid]]) for pid in busiest
+        pid: UnionIndex(intervals_union([(s, e) for s, e, _ in by_pid[pid]]))
+        for pid in busiest
     }
-    contended = intersection_ns(unions[first], unions[second])
+    contended = intersection_ns(unions[first].intervals, unions[second].intervals)
     print(f"window {window_ms:.1f} ms")
     print("1. busy and contended time")
     for pid in busiest:
-        busy = union_ns(unions[pid])
+        busy = union_ns(unions[pid].intervals)
         print(
             f"  {label[pid]:28s} kernels {len(by_pid[pid]):7d} busy {busy / 1e6:8.1f} ms "
             f"({busy / 1e6 / window_ms:5.1%}) of which under the other's kernels "
             f"{contended / 1e6:8.1f} ms ({contended / max(busy, 1):5.1%})"
         )
-    both = union_ns(unions[first] + unions[second])
+    both = union_ns(unions[first].intervals + unions[second].intervals)
     print(f"  card busy (either) {both / 1e6:.1f} ms ({both / 1e6 / window_ms:.1%})")
 
     print("2. turns (runs of kernel starts from one process)")
