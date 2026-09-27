@@ -895,6 +895,14 @@ class Qwen3OmniTalker(nn.Module):
             .expand(predictor_len, max_batch_size)
             .contiguous()
         )
+        # note (ratish): the talker hidden and the layer-0 embedding run as one
+        # causal pass of two tokens per row, laid out (row, token) major.
+        self.predictor_pair_positions = self.predictor_positions[:2].repeat(
+            max_batch_size
+        )
+        self.predictor_pair_cache_slots = (
+            self.predictor_cache_slots[:2, :].t().reshape(-1).contiguous()
+        )
         # note (ratish): cuBLAS runs o_proj at four rows and below in 12 us from the
         # (N, K) weight and in 5 us from a (K, N) copy, with the same bits; the copy
         # is refreshed when the weights load.
@@ -1687,18 +1695,13 @@ class Qwen3OmniTalker(nn.Module):
             pos_summed.add_(layer0_embed[:, 0, :])
 
             cache_len = 0
-            self.predictor_forward_one_token(
-                token_embeds=predictor_input[:, 0:1, :],
+            pair_hidden = self.predictor_forward_tokens(
+                token_embeds=predictor_input[:, 0:2, :],
                 batch_size=batch_size,
                 cache_len=cache_len,
             )
-            cache_len += 1
-            last_hidden = self.predictor_forward_one_token(
-                token_embeds=predictor_input[:, 1:2, :],
-                batch_size=batch_size,
-                cache_len=cache_len,
-            )
-            cache_len += 1
+            last_hidden = pair_hidden[:, 1:2, :].contiguous()
+            cache_len += 2
 
             for layer_idx in range(num_groups - 1):
                 logits, _ = self.code_predictor.lm_head[layer_idx](last_hidden)
@@ -1710,7 +1713,7 @@ class Qwen3OmniTalker(nn.Module):
                 ).to(dtype=predictor_input.dtype)
                 pos_summed.add_(new_embed[:, 0, :])
                 if layer_idx < num_groups - 2:
-                    last_hidden = self.predictor_forward_one_token(
+                    last_hidden = self.predictor_forward_tokens(
                         token_embeds=new_embed,
                         batch_size=batch_size,
                         cache_len=cache_len,
@@ -1721,18 +1724,29 @@ class Qwen3OmniTalker(nn.Module):
 
         return result_codes, summed_embeddings
 
-    def predictor_forward_one_token(
+    def predictor_forward_tokens(
         self,
         *,
         token_embeds: torch.Tensor,
         batch_size: int,
         cache_len: int,
     ) -> torch.Tensor:
-        """Process one predictor token against the cached prefix."""
-        hidden_size = token_embeds.shape[-1]
+        """Run one token per row against the cached prefix, or the opening pair of
+        tokens per row as one causal pass when the cache is empty."""
+        seq_len, hidden_size = token_embeds.shape[1:]
+        if seq_len == 1:
+            positions = self.predictor_position_rows[cache_len, :batch_size]
+            cache_slots = self.predictor_cache_slots[cache_len, :batch_size]
+        elif seq_len == 2 and cache_len == 0:
+            positions = self.predictor_pair_positions[: 2 * batch_size]
+            cache_slots = self.predictor_pair_cache_slots[: 2 * batch_size]
+        else:
+            raise ValueError(
+                "the predictor runs one token per row, or two at an empty cache: "
+                f"got seq_len={seq_len} at cache_len={cache_len}"
+            )
         hidden_states = token_embeds.reshape(-1, hidden_size)
         residual = None
-        positions = self.predictor_position_rows[cache_len, :batch_size]
 
         # note (ratish): the norms take the residual and return the sum, so each
         # layer's two residual adds are folded into its two norm launches.
@@ -1745,9 +1759,9 @@ class Qwen3OmniTalker(nn.Module):
             attn_out = self.predictor_cached_self_attention(
                 layer_idx=layer_idx,
                 attn=layer.self_attn,
-                hidden_states=normed.reshape(batch_size, 1, hidden_size),
+                hidden_states=normed.reshape(batch_size, seq_len, hidden_size),
                 positions=positions,
-                cache_slots=self.predictor_cache_slots[cache_len, :batch_size],
+                cache_slots=cache_slots,
                 batch_size=batch_size,
                 cache_len=cache_len,
             )
@@ -1757,7 +1771,7 @@ class Qwen3OmniTalker(nn.Module):
             hidden_states = layer.mlp(normed)
 
         hidden_states, _ = self.code_predictor.model.norm(hidden_states, residual)
-        return hidden_states.reshape(batch_size, 1, hidden_size)
+        return hidden_states.reshape(batch_size, seq_len, hidden_size)
 
     @staticmethod
     def resolve_predictor_o_proj_layout(o_proj: RowParallelLinear) -> bool:
@@ -1794,11 +1808,13 @@ class Qwen3OmniTalker(nn.Module):
         batch_size: int,
         cache_len: int,
     ) -> torch.Tensor:
-        """Append one token to the per-layer KV cache and attend over the cached prefix."""
+        """Append the rows' tokens to the per-layer KV cache and attend over the
+        cached prefix; several tokens per row attend causally from an empty cache."""
         _, seq_len, hidden_size = hidden_states.shape
-        if seq_len != 1:
+        if seq_len > 1 and cache_len != 0:
             raise ValueError(
-                f"Cached predictor attention expects exactly one token, got seq_len={seq_len}"
+                "several tokens per row attend causally only from an empty cache: "
+                f"got seq_len={seq_len} at cache_len={cache_len}"
             )
         else:
             pass
@@ -1829,18 +1845,20 @@ class Qwen3OmniTalker(nn.Module):
             k,
             fused_set_kv_buffer_arg=store,
         )
-        end = cache_len + 1
+        end = cache_len + seq_len
         if store is None:
             self.predictor_k_cache[layer_idx, :batch_size, cache_len:end].copy_(
-                k.view(batch_size, 1, attn.num_kv_heads, attn.head_dim)
+                k.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
             )
             self.predictor_v_cache[layer_idx, :batch_size, cache_len:end].copy_(
-                v.view(batch_size, 1, attn.num_kv_heads, attn.head_dim)
+                v.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
             )
         else:
             pass
 
-        q = q.reshape(batch_size, 1, attn.num_heads, attn.head_dim).transpose(1, 2)
+        q = q.reshape(batch_size, seq_len, attn.num_heads, attn.head_dim).transpose(
+            1, 2
+        )
         cached_k = self.predictor_k_cache[layer_idx, :batch_size, :end].transpose(1, 2)
         cached_v = self.predictor_v_cache[layer_idx, :batch_size, :end].transpose(1, 2)
 
@@ -1849,11 +1867,11 @@ class Qwen3OmniTalker(nn.Module):
             q,
             cached_k,
             cached_v,
-            is_causal=False,
+            is_causal=seq_len > 1,
             enable_gqa=attn.num_heads != attn.num_kv_heads,
         )
         attn_output = attn_output.transpose(1, 2).reshape(
-            batch_size, attn.num_heads * attn.head_dim
+            batch_size * seq_len, attn.num_heads * attn.head_dim
         )
         if self.predictor_o_proj_transposed:
             attn_output = torch.matmul(
@@ -1861,7 +1879,7 @@ class Qwen3OmniTalker(nn.Module):
             )
         else:
             attn_output, _ = attn.o_proj(attn_output)
-        return attn_output.reshape(batch_size, 1, hidden_size)
+        return attn_output.reshape(batch_size, seq_len, hidden_size)
 
     @torch.no_grad()
     def code_predictor_forward(

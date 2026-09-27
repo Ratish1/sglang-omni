@@ -110,6 +110,12 @@ def build_real_step_predictor_graph_talker(
         .expand(predictor_len, max_batch_size)
         .contiguous()
     )
+    talker.predictor_pair_positions = talker.predictor_positions[:2].repeat(
+        max_batch_size
+    )
+    talker.predictor_pair_cache_slots = (
+        talker.predictor_cache_slots[:2, :].t().reshape(-1).contiguous()
+    )
     talker.predictor_o_proj_transposed = False
     talker.predictor_o_proj_weights_t = []
     talker.predictor_decode_graph_batch_sizes = (1, 2, 4)
