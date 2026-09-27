@@ -84,11 +84,11 @@ def patch_builders(module):
             if not getattr(self, "flow_probe_installed", False):
                 import librosa
 
-                self._wrapper._normalize_audio_inputs = part(
-                    "normalize", self._wrapper._normalize_audio_inputs
+                self.wrapper._normalize_audio_inputs = part(
+                    "normalize", self.wrapper._normalize_audio_inputs
                 )
-                self._model.extract_speaker_embedding = part(
-                    "speaker", self._model.extract_speaker_embedding
+                self.model.extract_speaker_embedding = part(
+                    "speaker", self.model.extract_speaker_embedding
                 )
                 librosa.resample = part("resample", librosa.resample)
                 self.flow_probe_installed = True
@@ -108,7 +108,7 @@ def patch_builders(module):
                 "encode_wall_s": wall,
                 "encode_cpu_s": cpu,
                 "samples": int(len(waveform)),
-                "graph": self._graph_runner is not None,
+                "graph": self.graph_runner is not None,
             }
         )
         return result
@@ -131,12 +131,12 @@ def patch_runner(module):
     def decode_slots_timed(self, codes, slots):
         rows, width = int(codes.shape[0]), int(codes.shape[2])
         result, wall, _ = timed(decode_slots, self, codes, slots)
-        bucket = next((size for size in self._batch_sizes if size >= rows), None)
+        bucket = next((size for size in self.batch_sizes if size >= rows), None)
         local.replays = getattr(local, "replays", 0) + (result is not None)
         write(
             {
                 "kind": "replay",
-                "mode": self._mode,
+                "mode": self.mode,
                 "width": width,
                 "rows": rows,
                 "bucket": bucket,
@@ -174,7 +174,7 @@ def patch_vocoder(module):
                 "kind": "cohort",
                 "width": int(plans[0].fresh_frames),
                 "rows": len(plans),
-                "initial_stream": stream is self._decode_stream,
+                "initial_stream": stream is self.decode_stream,
                 "path": path,
                 "split": local.split,
                 "wall_s": wall,

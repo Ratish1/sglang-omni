@@ -98,11 +98,11 @@ def patch_builders(module):
             if not getattr(self, "ttfc_nvtx_installed", False):
                 import librosa
 
-                self._wrapper._normalize_audio_inputs = ranged(
-                    self._wrapper._normalize_audio_inputs, fixed("pre.normalize")
+                self.wrapper._normalize_audio_inputs = ranged(
+                    self.wrapper._normalize_audio_inputs, fixed("pre.normalize")
                 )
-                self._model.extract_speaker_embedding = ranged(
-                    self._model.extract_speaker_embedding, fixed("pre.speaker")
+                self.model.extract_speaker_embedding = ranged(
+                    self.model.extract_speaker_embedding, fixed("pre.speaker")
                 )
                 librosa.resample = ranged(librosa.resample, fixed("pre.resample"))
                 self.ttfc_nvtx_installed = True
@@ -171,7 +171,7 @@ def patch_runner(module):
     runner.decode_slots = ranged(
         runner.decode_slots,
         lambda self, codes, slots: (
-            f"voc.replay {self._mode} w={int(codes.shape[2])} rows={int(codes.shape[0])}"
+            f"voc.replay {self.mode} w={int(codes.shape[2])} rows={int(codes.shape[0])}"
         ),
     )
 
@@ -198,7 +198,7 @@ def patch_vocoder(module):
         scheduler.decode_incremental_cohort,
         lambda self, gpu_input, plans, incremental, stream: (
             f"voc.cohort w={int(plans[0].fresh_frames)} rows={len(plans)} "
-            f"init={int(stream is self._decode_stream)}"
+            f"init={int(stream is self.decode_stream)}"
         ),
     )
     scheduler.decode_incremental_windows = ranged(
