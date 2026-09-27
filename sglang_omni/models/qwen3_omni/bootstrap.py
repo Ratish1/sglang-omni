@@ -5,6 +5,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from sglang_omni.scheduling.card_turn import (
+    CardTurnWaiter,
+    card_turn_dir,
+    process_publisher,
+)
+
 
 def create_thinker_scheduler(
     server_args: Any,
@@ -76,6 +82,12 @@ def create_thinker_scheduler(
         model_runner = ThinkerModelRunner(model_worker, output_proc)
     else:
         model_runner = Qwen3OmniThinkerModelRunner(model_worker, output_proc)
+    if card_turn_dir() is not None:
+        model_runner.card_turn_waiter = CardTurnWaiter(
+            card_turn_dir(), model_runner.device
+        )
+    else:
+        pass
 
     tokenizer = get_tokenizer(
         model_config.model_path,
@@ -267,5 +279,6 @@ def create_talker_scheduler(
         codec_coalesce_first_frames=codec_coalesce_first_frames,
         codec_coalesce_early_frames=codec_coalesce_early_frames,
     )
+    model_runner.card_turn_publisher = process_publisher(model_runner.device)
     scheduler.bind_model_runner(model_runner)
     return scheduler

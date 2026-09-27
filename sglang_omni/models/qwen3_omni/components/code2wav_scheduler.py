@@ -27,6 +27,7 @@ from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recor
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
 from sglang_omni.profiler.pipeline_nvtx import trace_call
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.card_turn import process_publisher
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.streaming_vocoder import (
     StreamingVocoderBase,
@@ -586,6 +587,11 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
             )
             slot.record(torch.cuda.current_stream(self.device))
             event_recorded = True
+            publisher = process_publisher(self.device)
+            if publisher is not None:
+                publisher.record_window(torch.cuda.current_stream(self.device))
+            else:
+                pass
             if profile_metadata is not None:
                 _emit_event(
                     request_id=request_id,

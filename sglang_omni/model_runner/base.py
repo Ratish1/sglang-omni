@@ -21,6 +21,7 @@ from sglang_omni.sampling.seed import (
     derive_sampling_seed,
     resolve_row_seed,
 )
+from sglang_omni.scheduling.card_turn import CardTurnPublisher, CardTurnWaiter
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
     RequestOutput,
@@ -116,6 +117,8 @@ class ModelRunner:
         self.device = current_platform.get_device(tp_worker.gpu_id)
         self.model = tp_worker.model_runner.model
         self.execution_bridge: Any | None = None
+        self.card_turn_waiter: CardTurnWaiter | None = None
+        self.card_turn_publisher: CardTurnPublisher | None = None
 
         # Async decode (one-step lookahead). Inert unless ``_async_enabled`` is set.
         self.async_enabled: bool = False
@@ -390,6 +393,12 @@ class ModelRunner:
                     schedule_batch,
                     scheduler_output.requests,
                 )
+                if self.card_turn_publisher is not None:
+                    self.card_turn_publisher.record_step(
+                        torch.cuda.current_stream(self.device)
+                    )
+                else:
+                    pass
         with trace_range("runner", "finalize"):
             return self.finalize(
                 batch_result,
@@ -578,6 +587,10 @@ class ModelRunner:
         block. Returns ``batch_result``."""
         try:
             with trace_range("runner", "before"):
+                if self.card_turn_waiter is not None:
+                    self.card_turn_waiter.wait(torch.cuda.current_stream(self.device))
+                else:
+                    pass
                 if is_prefill:
                     self.before_prefill(forward_batch, schedule_batch, requests)
                 else:
