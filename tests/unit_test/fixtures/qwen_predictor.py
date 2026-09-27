@@ -78,6 +78,17 @@ def build_real_step_predictor_graph_talker(
         device=device,
     )
     talker.predictor_v_cache = torch.zeros_like(talker.predictor_k_cache)
+    talker.predictor_position_rows = (
+        talker.predictor_positions[:, None]
+        .expand(predictor_len, max_batch_size)
+        .contiguous()
+    )
+    talker.predictor_pair_positions = talker.predictor_positions[:2].repeat(
+        max_batch_size
+    )
+    talker.predictor_o_proj_transposed = False
+    talker.predictor_o_proj_weights_t = []
+    talker.predictor_exact_add_norm = False
     talker.predictor_decode_graph_batch_sizes = (1, 2, 4)
     talker.predictor_decode_graphs = {}
     talker.predictor_decode_graph_disabled = set()

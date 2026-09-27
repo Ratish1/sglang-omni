@@ -3,17 +3,28 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
 import torch
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
+from sglang.srt.runtime_context import get_context
 
 import sglang_omni.models.qwen3_omni.components.talker as talker_module
 from sglang_omni.models.qwen3_omni.components.talker import (
     Qwen3OmniMoeTalkerCodePredictor,
     Qwen3OmniTalker,
 )
+from sglang_omni.platforms import current_platform
+from sglang_omni.vendor.sglang.layers import RMSNorm
 from tests.unit_test.fixtures.qwen_predictor import (
+    TupleLinear,
     build_real_step_predictor_graph_talker,
 )
 
@@ -190,3 +201,104 @@ def test_qwen_predictor_cached_attention_gqa_matches_materialized_kv(
                 cache_len=cache_len,
             )
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+LAYOUT_HEAD_DIM = 128
+LAYOUT_NUM_HEADS = 16
+LAYOUT_NUM_KV_HEADS = 8
+LAYOUT_HIDDEN = 1024
+LAYOUT_PREDICTOR_LEN = 17
+LAYOUT_MAX_BS = 16
+LAYOUT_DTYPE = torch.bfloat16
+
+
+@pytest.fixture
+def published_server_args() -> Iterator[None]:
+    with get_context().override_server_args(
+        cuda_graph_config=CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.DISABLED)
+        ),
+    ):
+        yield
+
+
+def layout_talker(device: torch.device) -> Qwen3OmniTalker:
+    talker = object.__new__(Qwen3OmniTalker)
+    positions = torch.arange(LAYOUT_PREDICTOR_LEN, device=device, dtype=torch.long)
+    talker.predictor_positions = positions
+    talker.predictor_position_rows = (
+        positions[:, None].expand(LAYOUT_PREDICTOR_LEN, LAYOUT_MAX_BS).contiguous()
+    )
+    talker.predictor_pair_positions = positions[:2].repeat(LAYOUT_MAX_BS)
+    talker.predictor_k_cache = torch.zeros(
+        1,
+        LAYOUT_MAX_BS,
+        LAYOUT_NUM_KV_HEADS,
+        LAYOUT_PREDICTOR_LEN,
+        LAYOUT_HEAD_DIM,
+        device=device,
+        dtype=LAYOUT_DTYPE,
+    )
+    talker.predictor_v_cache = torch.zeros_like(talker.predictor_k_cache)
+    talker.predictor_o_proj_transposed = False
+    talker.predictor_o_proj_weights_t = []
+    talker.predictor_exact_add_norm = False
+    return talker
+
+
+def layout_attention(device: torch.device) -> SimpleNamespace:
+    return SimpleNamespace(
+        q_size=LAYOUT_NUM_HEADS * LAYOUT_HEAD_DIM,
+        kv_size=LAYOUT_NUM_KV_HEADS * LAYOUT_HEAD_DIM,
+        num_heads=LAYOUT_NUM_HEADS,
+        num_kv_heads=LAYOUT_NUM_KV_HEADS,
+        head_dim=LAYOUT_HEAD_DIM,
+        q_norm=RMSNorm(LAYOUT_HEAD_DIM, eps=1e-6).to(device, LAYOUT_DTYPE),
+        k_norm=RMSNorm(LAYOUT_HEAD_DIM, eps=1e-6).to(device, LAYOUT_DTYPE),
+        alt_stream=None,
+        qkv_proj=TupleLinear(
+            LAYOUT_HIDDEN,
+            (LAYOUT_NUM_HEADS + 2 * LAYOUT_NUM_KV_HEADS) * LAYOUT_HEAD_DIM,
+        ).to(device, LAYOUT_DTYPE),
+        o_proj=TupleLinear(LAYOUT_NUM_HEADS * LAYOUT_HEAD_DIM, LAYOUT_HIDDEN).to(
+            device, LAYOUT_DTYPE
+        ),
+        rotary_emb=RotaryEmbedding(
+            LAYOUT_HEAD_DIM, LAYOUT_HEAD_DIM, 64, 10000, True, LAYOUT_DTYPE
+        ).to(device),
+    )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the cuBLAS layouts are compared on CUDA"
+)
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+def test_o_proj_on_the_transposed_weight_matches_the_linear(
+    batch_size: int, published_server_args: None
+) -> None:
+    """The (K, N) weight copy changes the cuBLAS kernel, not the bits."""
+    del published_server_args
+    device = torch.device("cuda")
+    talker = layout_talker(device)
+    attn = layout_attention(device)
+    torch.manual_seed(0)
+    hidden = torch.randn(
+        batch_size, 1, LAYOUT_HIDDEN, device=device, dtype=LAYOUT_DTYPE
+    )
+    positions = talker.predictor_position_rows[0, :batch_size]
+
+    def run_attention() -> torch.Tensor:
+        return talker.predictor_cached_self_attention(
+            layer_idx=0,
+            attn=attn,
+            hidden_states=hidden,
+            positions=positions,
+            batch_size=batch_size,
+            cache_len=0,
+        )
+
+    through_linear = run_attention()
+    talker.predictor_o_proj_transposed = True
+    talker.predictor_o_proj_weights_t = [attn.o_proj.proj.weight.t().contiguous()]
+    assert torch.equal(run_attention(), through_linear)

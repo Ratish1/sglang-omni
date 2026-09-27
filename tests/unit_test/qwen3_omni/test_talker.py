@@ -605,7 +605,7 @@ def build_fake_predictor_graph_talker(device: torch.device) -> Qwen3OmniTalker:
         lm_head=nn.ModuleList([FakePredictorLmHead().to(device) for _ in range(3)]),
     )
 
-    def fake_forward_one_token(
+    def fake_forward_tokens(
         *,
         token_embeds: torch.Tensor,
         batch_size: int,
@@ -613,7 +613,7 @@ def build_fake_predictor_graph_talker(device: torch.device) -> Qwen3OmniTalker:
     ) -> torch.Tensor:
         return token_embeds[:batch_size] + float(cache_len + 1)
 
-    talker.predictor_forward_one_token = fake_forward_one_token
+    talker.predictor_forward_tokens = fake_forward_tokens
     return talker
 
 
@@ -1901,6 +1901,8 @@ def test_qwen_talker_load_weights_converts_fp8_scales_after_name_mapping() -> No
             "weight_block_size": [128, 128],
         }
     )
+    talker.predictor_o_proj_weights_t = []
+    talker.code_predictor = SimpleNamespace(model=SimpleNamespace(layers=[]))
     talker.cached_params_dict = {
         "model.layers.0.self_attn.qkv_proj.weight_scale_inv": qkv_param,
         "model.layers.0.mlp.experts.w13_weight_scale_inv": expert_param,
@@ -2647,3 +2649,47 @@ def test_partial_start_default_keeps_configured_threshold(monkeypatch) -> None:
     assert not scheduler.is_request_build_ready(
         make_payload(prefetched_chunks=[object()]), pending_stream_done=False
     )
+
+
+def test_qwen_predictor_opening_pair_matches_two_single_token_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The causal pair pass leaves the same second-token hidden and cache as two steps."""
+    monkeypatch.setattr(talker_module, "apply_qk_norm", lambda q, k, **_: (q, k))
+    device = torch.device("cpu")
+    torch.manual_seed(5)
+    batch_size, hidden_size = 3, 8
+    tokens = torch.randn(batch_size, 2, hidden_size, device=device)
+
+    paired = build_real_step_predictor_graph_talker(device)
+    with torch.no_grad():
+        pair_hidden = paired.predictor_forward_tokens(
+            token_embeds=tokens, batch_size=batch_size, cache_len=0
+        )
+
+    single = build_real_step_predictor_graph_talker(device)
+    with torch.no_grad():
+        single.predictor_forward_tokens(
+            token_embeds=tokens[:, 0:1], batch_size=batch_size, cache_len=0
+        )
+        second_hidden = single.predictor_forward_tokens(
+            token_embeds=tokens[:, 1:2], batch_size=batch_size, cache_len=1
+        )
+
+    torch.testing.assert_close(pair_hidden[:, 1:2], second_hidden)
+    torch.testing.assert_close(
+        paired.predictor_k_cache[:, :batch_size, :, :2],
+        single.predictor_k_cache[:, :batch_size, :, :2],
+    )
+    torch.testing.assert_close(
+        paired.predictor_v_cache[:, :batch_size, :, :2],
+        single.predictor_v_cache[:, :batch_size, :, :2],
+    )
+
+
+def test_qwen_predictor_rejects_several_tokens_on_a_filled_cache() -> None:
+    device = torch.device("cpu")
+    talker = build_real_step_predictor_graph_talker(device)
+    tokens = torch.randn(2, 2, 8, device=device)
+    with pytest.raises(ValueError, match="empty cache"):
+        talker.predictor_forward_tokens(token_embeds=tokens, batch_size=2, cache_len=1)
