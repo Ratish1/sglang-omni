@@ -1117,6 +1117,7 @@ def _parse_response_headers(result: RequestResult, headers: dict) -> None:
         result.completion_tokens = int(comp_tok)
     if eng_time is not None:
         result.engine_time_s = float(eng_time)
+    result.finish_reason = headers.get("X-Finish-Reason")
     if result.completion_tokens > 0 and result.engine_time_s > 0:
         result.tok_per_s = result.completion_tokens / result.engine_time_s
 
