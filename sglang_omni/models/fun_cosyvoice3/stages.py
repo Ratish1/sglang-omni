@@ -2105,6 +2105,7 @@ class FunCosyVoice3MlxStreamingVocoderScheduler(
         del request_id, state
         pipeline_state = FunCosyVoice3State.from_dict(payload.data)
         result = {"modality": "audio", "sample_rate": self.sample_rate}
+        result["finish_reason"] = pipeline_state.finish_reason
         usage = build_usage(pipeline_state)
         if usage is not None:
             result["usage"] = usage

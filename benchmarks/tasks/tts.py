@@ -1122,6 +1122,39 @@ def _parse_response_headers(result: RequestResult, headers: dict) -> None:
         result.tok_per_s = result.completion_tokens / result.engine_time_s
 
 
+async def fetch_stream_outcome(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    request_id: str,
+    result: RequestResult,
+) -> None:
+    # note (Yucheng Hu): a raw PCM stream carries no trailing metadata, so the
+    # server keeps the terminal state for a follow-up GET. It holds the fields a
+    # non-streaming response sends as headers; a server without the route, or an
+    # evicted entry, answers 404 and leaves the result unchanged.
+    async with session.get(f"{api_url}/{request_id}") as response:
+        if response.status == 404:
+            return
+        elif response.status != 200:
+            logger.warning(
+                f"[{result.request_id}] stream outcome lookup returned HTTP "
+                f"{response.status}"
+            )
+            return
+        else:
+            outcome = await response.json()
+    usage = outcome.get("usage") or {}
+    _parse_response_headers(
+        result,
+        {
+            "X-Prompt-Tokens": usage.get("prompt_tokens"),
+            "X-Completion-Tokens": usage.get("completion_tokens"),
+            "X-Engine-Time": usage.get("engine_time_s"),
+            "X-Finish-Reason": outcome.get("finish_reason"),
+        },
+    )
+
+
 def _parse_pcm_response_format(
     headers: aiohttp.typedefs.LooseHeaders,
 ) -> tuple[int, int, int]:
@@ -1358,6 +1391,7 @@ def make_tts_send_fn(
             **gen_kwargs,
         )
         start_time = time.perf_counter()
+        stream_request_id: str | None = None
         try:
             async with session.post(api_url, json=payload) as response:
                 if response.status != 200:
@@ -1366,6 +1400,7 @@ def make_tts_send_fn(
                     await _handle_raw_pcm_streaming_response(
                         response, result, start_time, save_audio_dir
                     )
+                    stream_request_id = response.headers.get("X-Request-Id")
                 else:
                     await _handle_non_streaming_response(
                         response, result, start_time, save_audio_dir
@@ -1374,6 +1409,16 @@ def make_tts_send_fn(
             result.error = str(exc)
         finally:
             result.latency_s = time.perf_counter() - start_time
+        # note (Yucheng Hu): the follow-up lookup stays outside the latency window.
+        if result.is_success and stream_request_id is not None:
+            try:
+                await fetch_stream_outcome(session, api_url, stream_request_id, result)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.warning(
+                    f"[{result.request_id}] stream outcome lookup failed: {exc}"
+                )
+        else:
+            pass
         return result
 
     return send_fn
