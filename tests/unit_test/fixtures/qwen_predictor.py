@@ -105,6 +105,13 @@ def build_real_step_predictor_graph_talker(
         + talker.predictor_positions[:, None]
     ).contiguous()
     talker.predictor_rope_stores_kv = False
+    talker.predictor_position_rows = (
+        talker.predictor_positions[:, None]
+        .expand(predictor_len, max_batch_size)
+        .contiguous()
+    )
+    talker.predictor_o_proj_transposed = False
+    talker.predictor_o_proj_weights_t = []
     talker.predictor_decode_graph_batch_sizes = (1, 2, 4)
     talker.predictor_decode_graphs = {}
     talker.predictor_decode_graph_disabled = set()

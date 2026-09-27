@@ -1931,6 +1931,8 @@ def test_qwen_talker_load_weights_converts_fp8_scales_after_name_mapping() -> No
             "weight_block_size": [128, 128],
         }
     )
+    talker.predictor_o_proj_weights_t = []
+    talker.code_predictor = SimpleNamespace(model=SimpleNamespace(layers=[]))
     talker.cached_params_dict = {
         "model.layers.0.self_attn.qkv_proj.weight_scale_inv": qkv_param,
         "model.layers.0.mlp.experts.w13_weight_scale_inv": expert_param,

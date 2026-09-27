@@ -258,6 +258,8 @@ def rope_store_talker(device: torch.device, *, stores: bool) -> Qwen3OmniTalker:
         + positions[:, None]
     ).contiguous()
     talker.predictor_rope_stores_kv = stores
+    talker.predictor_o_proj_transposed = False
+    talker.predictor_o_proj_weights_t = []
     return talker
 
 
@@ -428,3 +430,35 @@ def test_rope_store_writes_the_cache_the_copy_path_writes(
             hidden_steps.normal_()
             graph.replay()
             assert_matches_reference(replay_output)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the cuBLAS layouts are compared on CUDA"
+)
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+def test_o_proj_on_the_transposed_weight_matches_the_linear(batch_size: int) -> None:
+    """The (K, N) weight copy changes the cuBLAS kernel, not the bits."""
+    device = torch.device("cuda")
+    talker = rope_store_talker(device, stores=False)
+    attn = rope_attention(device)
+    torch.manual_seed(0)
+    hidden = torch.randn(batch_size, 1, ROPE_HIDDEN, device=device, dtype=ROPE_DTYPE)
+    positions = talker.predictor_positions[0:1].repeat(batch_size)
+    cache_slots = talker.predictor_cache_slots[0, :batch_size]
+
+    def run_attention() -> torch.Tensor:
+        return talker.predictor_cached_self_attention(
+            layer_idx=0,
+            attn=attn,
+            hidden_states=hidden,
+            positions=positions,
+            cache_slots=cache_slots,
+            batch_size=batch_size,
+            cache_len=0,
+        )
+
+    through_linear = run_attention()
+    talker.predictor_o_proj_transposed = True
+    talker.predictor_o_proj_weights_t = [attn.o_proj.proj.weight.t().contiguous()]
+    assert torch.equal(run_attention(), through_linear)
