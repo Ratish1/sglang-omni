@@ -42,6 +42,7 @@ RUNNER = "sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph"
 VOCODER = "sglang_omni.models.qwen3_tts.streaming_vocoder"
 SCHEDULER = "sglang_omni.scheduling.omni_scheduler"
 REFERENCE = "qwen_tts.core.models.modeling_qwen3_tts"
+SPEAKER = "sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph"
 
 install_lock = threading.Lock()
 
@@ -123,6 +124,13 @@ def patch_reference(module):
     module.mel_spectrogram = ranged(module.mel_spectrogram, fixed("pre.mel"))
     encoder = module.Qwen3TTSSpeakerEncoder
     encoder.forward = ranged(encoder.forward, fixed("pre.spk_encoder"))
+
+
+def patch_speaker(module):
+    # the bucketed runner (T3 branch): its mel is pre.mel, the replay or the eager
+    # miss stays inside pre.speaker, which wraps extract_speaker_embedding
+    runner = module.Qwen3TTSSpeakerEncoderCudaGraphRunner
+    runner.mel = ranged(runner.mel, fixed("pre.mel"))
 
 
 def batch_label(prefix, batch):
@@ -225,6 +233,7 @@ PATCHES = {
     SCHEDULER: patch_scheduler,
     RUNNER: patch_runner,
     VOCODER: patch_vocoder,
+    SPEAKER: patch_speaker,
 }
 
 
