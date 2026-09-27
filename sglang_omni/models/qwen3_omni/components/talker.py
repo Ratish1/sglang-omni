@@ -19,6 +19,10 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import add_prefix
 from torch import nn
 
+from sglang_omni.models.qwen3_omni.components.predictor_norm import (
+    add_rmsnorm_rounded,
+    supports_exact_add_rmsnorm,
+)
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextDecoderLayer,
@@ -909,6 +913,11 @@ class Qwen3OmniTalker(nn.Module):
         self.predictor_o_proj_transposed = self.resolve_predictor_o_proj_layout(
             predictor_attention.o_proj
         )
+        # note (ratish): the residual add and the norm in one launch with the plain
+        # path's rounding; where the kernel does not apply the two launches stay.
+        self.predictor_exact_add_norm = supports_exact_add_rmsnorm(
+            hidden_size, self.model.codec_embedding.weight.dtype, device
+        )
         if self.predictor_o_proj_transposed:
             self.predictor_o_proj_weights_t = [
                 layer.self_attn.o_proj.weight.t().contiguous()
@@ -1748,14 +1757,14 @@ class Qwen3OmniTalker(nn.Module):
         hidden_states = token_embeds.reshape(-1, hidden_size)
         residual = None
 
-        # note (ratish): the norms take the residual and return the sum, so each
-        # layer's two residual adds are folded into its two norm launches.
         for layer_idx, layer in enumerate(self.code_predictor.model.layers):
             if residual is None:
                 residual = hidden_states
                 normed = layer.input_layernorm(hidden_states)
             else:
-                normed, residual = layer.input_layernorm(hidden_states, residual)
+                normed, residual = self.predictor_add_norm(
+                    layer.input_layernorm, hidden_states, residual
+                )
             attn_out = self.predictor_cached_self_attention(
                 layer_idx=layer_idx,
                 attn=layer.self_attn,
@@ -1765,13 +1774,30 @@ class Qwen3OmniTalker(nn.Module):
                 batch_size=batch_size,
                 cache_len=cache_len,
             )
-            normed, residual = layer.post_attention_layernorm(
-                attn_out.reshape(-1, hidden_size), residual
+            normed, residual = self.predictor_add_norm(
+                layer.post_attention_layernorm,
+                attn_out.reshape(-1, hidden_size),
+                residual,
             )
             hidden_states = layer.mlp(normed)
 
-        hidden_states, _ = self.code_predictor.model.norm(hidden_states, residual)
+        hidden_states, _ = self.predictor_add_norm(
+            self.code_predictor.model.norm, hidden_states, residual
+        )
         return hidden_states.reshape(batch_size, seq_len, hidden_size)
+
+    def predictor_add_norm(
+        self, norm: RMSNorm, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """residual + hidden_states, then the norm of the rounded sum, as the plain
+        path computes it; one launch where the exact kernel applies, else two."""
+        if self.predictor_exact_add_norm:
+            return add_rmsnorm_rounded(
+                hidden_states, residual, norm.weight, norm.variance_epsilon
+            )
+        else:
+            summed = residual + hidden_states
+            return norm(summed), summed
 
     @staticmethod
     def resolve_predictor_o_proj_layout(o_proj: RowParallelLinear) -> bool:

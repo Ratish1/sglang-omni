@@ -118,6 +118,7 @@ def build_real_step_predictor_graph_talker(
     )
     talker.predictor_o_proj_transposed = False
     talker.predictor_o_proj_weights_t = []
+    talker.predictor_exact_add_norm = False
     talker.predictor_decode_graph_batch_sizes = (1, 2, 4)
     talker.predictor_decode_graphs = {}
     talker.predictor_decode_graph_disabled = set()
