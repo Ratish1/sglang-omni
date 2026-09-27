@@ -21,9 +21,9 @@ else
 fi
 bp=$(pin $BC); ap=$(pin $AC)
 setsid env PIN_CPUS=${bp% *} PIN_NODE=${bp#* } ${12:+MAX_SAMPLES=${12}} EXTRA_SERVE_ARGS="$BEXTRA" \
-  bash $S/run_bench_boot.sh $BT $R/base_c$BC $BC 8${BC}00 $DTYPE $CONC $ARM > $R/base_c$BC.boot.log 2>&1 < /dev/null &
+  bash $S/run_bench_boot.sh $BT $R/base_c$BC $BC 8${BC}00 $DTYPE $CONC "$ARM" > $R/base_c$BC.boot.log 2>&1 < /dev/null &
 echo "base_c$BC pgid $!" >> $R/launch.txt
 setsid env PIN_CPUS=${ap% *} PIN_NODE=${ap#* } ${12:+MAX_SAMPLES=${12}} EXTRA_SERVE_ARGS="$AEXTRA" \
-  bash $S/run_bench_boot.sh $AT $R/${AN}_c$AC $AC 8${AC}00 $DTYPE $CONC $ARM > $R/${AN}_c$AC.boot.log 2>&1 < /dev/null &
+  bash $S/run_bench_boot.sh $AT $R/${AN}_c$AC $AC 8${AC}00 $DTYPE $CONC "$ARM" > $R/${AN}_c$AC.boot.log 2>&1 < /dev/null &
 echo "${AN}_c$AC pgid $!" >> $R/launch.txt
 sleep 2; cat $R/launch.txt $R/base_head.txt $R/arm_head.txt
