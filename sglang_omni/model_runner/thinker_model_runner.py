@@ -472,9 +472,6 @@ class ThinkerModelRunner(ModelRunner):
         overwrote them; a Qwen speech lookahead takes GPU time from the colocated
         talker. History-dependent or unsupported sampling needs sync for parity.
         """
-        from sglang_omni.models.qwen3_omni.request_builders import (
-            should_generate_audio_output,
-        )
 
         for req in batch.reqs:
             # note (jiaxin deng): fail closed if the request data is missing or None
@@ -485,7 +482,8 @@ class ThinkerModelRunner(ModelRunner):
                 )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             except AttributeError:
                 data = None
-            if data is None or should_generate_audio_output(data.stage_payload):
+            # note (ratish): experiment only, speech batches take the lookahead too.
+            if data is None:
                 return False
             else:
                 pass
