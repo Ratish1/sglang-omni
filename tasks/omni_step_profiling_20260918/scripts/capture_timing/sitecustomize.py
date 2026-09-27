@@ -85,7 +85,7 @@ def patch(module):
 
     def capture_graph_timed(self, key, **kwargs):
         local.row = {
-            "mode": self._mode,
+            "mode": self.mode,
             "frames": key.fresh_frames,
             "batch": key.batch_bucket,
             "compiled": key.fresh_frames in self._compile_fresh_frames,
@@ -111,7 +111,7 @@ def patch(module):
             memory = self._memory_stats
             write(
                 {
-                    "mode": self._mode,
+                    "mode": self.mode,
                     "runner_total_s": time.perf_counter() - began,
                     "first_gc_s": first_gc_s,
                     "enabled": self._enabled,
