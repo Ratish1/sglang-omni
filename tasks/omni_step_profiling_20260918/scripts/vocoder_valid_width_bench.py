@@ -279,7 +279,7 @@ def main():
     raw_decoder = tokenizer.model.decoder.to(dtype)
     if args.mode == "grid":
         # the server fuses SnakeBeta before it captures its graphs
-        from sglang_omni.models.qwen3_tts.vocoder_kernels import fuse_vocoder_decoder
+        from sglang_omni.utils.snake_beta import fuse_vocoder_decoder
 
         print(f"fused SnakeBeta modules: {fuse_vocoder_decoder(raw_decoder)}")
     decoder = codec.Qwen3TTSIncrementalDecoder(raw_decoder)

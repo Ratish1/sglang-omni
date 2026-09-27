@@ -23,8 +23,8 @@ import statistics
 import torch
 from vocoder_resident_bench import BATCHES, WIDTHS, load, random_codes, replay_ms
 
-from sglang_omni.models.qwen3_tts import vocoder_kernels
 from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalDecoder
+from sglang_omni.utils import snake_beta as vocoder_kernels
 
 
 def capture(fn, codes, state):

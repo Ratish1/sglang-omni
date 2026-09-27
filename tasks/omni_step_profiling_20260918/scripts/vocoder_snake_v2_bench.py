@@ -31,7 +31,7 @@ from sglang.kernels.ops.diffusion.common.numerics import round_bf16_to_fp32
 from triton.language.extra import libdevice
 from vocoder_resident_bench import BATCHES, WIDTHS, load, random_codes
 
-from sglang_omni.models.qwen3_tts import vocoder_kernels
+from sglang_omni.utils import snake_beta as vocoder_kernels
 
 CALLS = 20
 REPS = 30

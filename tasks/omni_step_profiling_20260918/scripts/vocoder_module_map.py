@@ -173,7 +173,7 @@ def main() -> None:
     tokenizer, incremental = load(args.model, device)
     decoder = tokenizer.model.decoder
     if args.fused:
-        from sglang_omni.models.qwen3_tts.vocoder_kernels import fuse_vocoder_decoder
+        from sglang_omni.utils.snake_beta import fuse_vocoder_decoder
 
         print(f"fused {fuse_vocoder_decoder(decoder)} SnakeBeta modules")
     instrument(decoder)
