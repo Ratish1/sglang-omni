@@ -759,6 +759,37 @@ def test_qwen_predictor_decode_graph_covers_real_incremental_step(
     torch.testing.assert_close(graph_embeds, eager_embeds)
 
 
+def test_qwen_predictor_one_token_step_keeps_the_pre_norm_residual_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(talker_module, "apply_qk_norm", lambda q, k, **_: (q, k))
+    device = torch.device("cpu")
+    talker = build_real_step_predictor_graph_talker(device)
+    layer = talker.code_predictor.model.layers[0]
+    batch_size, hidden_size = 2, 8
+    torch.manual_seed(3)
+    token_embeds = torch.randn(batch_size, 1, hidden_size, device=device)
+
+    with torch.no_grad():
+        actual = talker.predictor_forward_one_token(
+            token_embeds=token_embeds, batch_size=batch_size, cache_len=0
+        )
+        positions = talker.predictor_positions[0:1].repeat(batch_size)
+        attn_out = talker.predictor_cached_self_attention(
+            layer_idx=0,
+            attn=layer.self_attn,
+            hidden_states=token_embeds,
+            positions=positions,
+            cache_slots=talker.predictor_cache_slots[0, :batch_size],
+            batch_size=batch_size,
+            cache_len=0,
+        )
+        after_attention = token_embeds + attn_out
+        expected = after_attention + layer.mlp(after_attention)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.accelerator
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
@@ -1901,6 +1932,8 @@ def test_qwen_talker_load_weights_converts_fp8_scales_after_name_mapping() -> No
             "weight_block_size": [128, 128],
         }
     )
+    talker.predictor_o_proj_weights_t = []
+    talker.code_predictor = SimpleNamespace(model=SimpleNamespace(layers=[]))
     talker.cached_params_dict = {
         "model.layers.0.self_attn.qkv_proj.weight_scale_inv": qkv_param,
         "model.layers.0.mlp.experts.w13_weight_scale_inv": expert_param,

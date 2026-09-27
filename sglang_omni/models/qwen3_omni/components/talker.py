@@ -9,7 +9,10 @@ import os
 from typing import Iterable, Optional, Tuple
 
 import torch
+from sglang.kernels.fused_op import get_fused_op_backend
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_context, get_schedule
@@ -45,7 +48,7 @@ from sglang_omni.vendor.sglang.layers import (
     SiluAndMul,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang_omni.vendor.sglang.models import apply_qk_norm
+from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
 from sglang_omni.vendor.sglang.utils import make_layers
 
 logger = logging.getLogger(__name__)
@@ -844,9 +847,11 @@ class Qwen3OmniTalker(nn.Module):
         self.cp_enabled = self.model.cp_enabled
         self.feedback_buffer = self.model.feedback_buffer
         self.feedback_mask = self.model.feedback_mask
+        # note (ratish): two slots, the talker hidden and the layer-0 embedding;
+        # the later codebook embeddings feed their forwards directly.
         self.predictor_input_buffer = torch.zeros(
             max_batch_size,
-            predictor_len,
+            2,
             hidden_size,
             device=device,
             dtype=self.model.codec_embedding.weight.dtype,
@@ -857,20 +862,53 @@ class Qwen3OmniTalker(nn.Module):
             dtype=torch.long,
         )
         predictor_num_layers = len(self.code_predictor.model.layers)
-        predictor_num_kv_heads = self.code_predictor.model.layers[
-            0
-        ].self_attn.num_kv_heads
-        predictor_head_dim = self.code_predictor.model.layers[0].self_attn.head_dim
+        predictor_attention = self.code_predictor.model.layers[0].self_attn
+        # note (ratish): slot major, so the rope kernel stores k and v as one row
+        # per (batch row, slot) and the attention reads a transposed view.
         self.predictor_k_cache = torch.zeros(
             predictor_num_layers,
             max_batch_size,
-            predictor_num_kv_heads,
             predictor_len,
-            predictor_head_dim,
+            predictor_attention.num_kv_heads,
+            predictor_attention.head_dim,
             device=device,
             dtype=self.model.codec_embedding.weight.dtype,
         )
         self.predictor_v_cache = torch.zeros_like(self.predictor_k_cache)
+        self.predictor_k_rows = [
+            layer_cache.view(max_batch_size * predictor_len, -1)
+            for layer_cache in self.predictor_k_cache
+        ]
+        self.predictor_v_rows = [
+            layer_cache.view(max_batch_size * predictor_len, -1)
+            for layer_cache in self.predictor_v_cache
+        ]
+        self.predictor_cache_slots = (
+            torch.arange(max_batch_size, device=device, dtype=torch.long)[None, :]
+            * predictor_len
+            + self.predictor_positions[:, None]
+        ).contiguous()
+        self.predictor_rope_stores_kv = self.resolve_predictor_rope_store(
+            predictor_attention, device=device
+        )
+        self.predictor_position_rows = (
+            self.predictor_positions[:, None]
+            .expand(predictor_len, max_batch_size)
+            .contiguous()
+        )
+        # note (ratish): cuBLAS runs o_proj at four rows and below in 12 us from the
+        # (N, K) weight and in 5 us from a (K, N) copy, with the same bits; the copy
+        # is refreshed when the weights load.
+        self.predictor_o_proj_transposed = self.resolve_predictor_o_proj_layout(
+            predictor_attention.o_proj
+        )
+        if self.predictor_o_proj_transposed:
+            self.predictor_o_proj_weights_t = [
+                layer.self_attn.o_proj.weight.t().contiguous()
+                for layer in self.code_predictor.model.layers
+            ]
+        else:
+            self.predictor_o_proj_weights_t = []
         self.sampled_token_ids = torch.zeros(
             max_batch_size,
             dtype=torch.long,
@@ -1621,7 +1659,6 @@ class Qwen3OmniTalker(nn.Module):
             pass
 
         predictor_input = self.predictor_input_buffer[:batch_size]
-        predictor_input.zero_()
         num_groups = self.config.num_code_groups
         runtime_single_token = seq_len == 1
         if runtime_single_token:
@@ -1635,7 +1672,7 @@ class Qwen3OmniTalker(nn.Module):
                 dtype=torch.long,
                 device=layer0_codes.device,
             )
-            summed_embeddings = torch.empty(
+            summed_embeddings = torch.zeros(
                 (batch_size, seq_len, predictor_input.shape[-1]),
                 dtype=predictor_input.dtype,
                 device=predictor_input.device,
@@ -1648,7 +1685,6 @@ class Qwen3OmniTalker(nn.Module):
             )
             pos_codes = result_codes[:, :, pos]
             pos_summed = summed_embeddings[:, pos, :]
-            pos_summed.zero_()
             predictor_input[:, 0, :] = talker_hidden[:, pos, :].to(
                 dtype=predictor_input.dtype
             )
@@ -1678,7 +1714,6 @@ class Qwen3OmniTalker(nn.Module):
                 new_embed = self.code_predictor.model.codec_embedding[layer_idx](
                     next_code
                 ).to(dtype=predictor_input.dtype)
-                predictor_input[:, layer_idx + 2, :] = new_embed[:, 0, :]
                 pos_summed.add_(new_embed[:, 0, :])
                 if layer_idx < num_groups - 2:
                     last_hidden = self.predictor_forward_one_token(
@@ -1700,37 +1735,59 @@ class Qwen3OmniTalker(nn.Module):
         cache_len: int,
     ) -> torch.Tensor:
         """Process one predictor token against the cached prefix."""
-        hidden_states = token_embeds
-        hidden_size = hidden_states.shape[-1]
-        positions = self.predictor_positions[cache_len : cache_len + 1].repeat(
-            batch_size
-        )
+        hidden_size = token_embeds.shape[-1]
+        hidden_states = token_embeds.reshape(-1, hidden_size)
+        residual = None
+        positions = self.predictor_position_rows[cache_len, :batch_size]
 
+        # note (ratish): the norms take the residual and return the sum, so each
+        # layer's two residual adds are folded into its two norm launches.
         for layer_idx, layer in enumerate(self.code_predictor.model.layers):
-            residual = hidden_states
-            normed = layer.input_layernorm(hidden_states.reshape(-1, hidden_size))
-            normed = normed.reshape(batch_size, 1, hidden_size)
+            if residual is None:
+                residual = hidden_states
+                normed = layer.input_layernorm(hidden_states)
+            else:
+                normed, residual = layer.input_layernorm(hidden_states, residual)
             attn_out = self.predictor_cached_self_attention(
                 layer_idx=layer_idx,
                 attn=layer.self_attn,
-                hidden_states=normed,
+                hidden_states=normed.reshape(batch_size, 1, hidden_size),
                 positions=positions,
+                cache_slots=self.predictor_cache_slots[cache_len, :batch_size],
                 batch_size=batch_size,
                 cache_len=cache_len,
             )
-            hidden_states = residual + attn_out
-
-            residual = hidden_states
-            normed = layer.post_attention_layernorm(
-                hidden_states.reshape(-1, hidden_size)
+            normed, residual = layer.post_attention_layernorm(
+                attn_out.reshape(-1, hidden_size), residual
             )
-            mlp_out = layer.mlp(normed).reshape(batch_size, 1, hidden_size)
-            hidden_states = residual + mlp_out
+            hidden_states = layer.mlp(normed)
 
-        hidden_states = self.code_predictor.model.norm(
-            hidden_states.reshape(-1, hidden_size)
-        )
+        hidden_states, _ = self.code_predictor.model.norm(hidden_states, residual)
         return hidden_states.reshape(batch_size, 1, hidden_size)
+
+    @staticmethod
+    def resolve_predictor_o_proj_layout(o_proj: RowParallelLinear) -> bool:
+        """Whether o_proj can run as a plain GEMM on a transposed weight copy:
+        an unquantized bf16 or fp16 weight without a bias."""
+        return (
+            isinstance(o_proj.quant_method, UnquantizedLinearMethod)
+            and o_proj.bias is None
+            and o_proj.weight.dtype in (torch.bfloat16, torch.float16)
+        )
+
+    @staticmethod
+    def resolve_predictor_rope_store(
+        attention: Qwen3OmniMoeThinkerTextAttention, *, device: torch.device
+    ) -> bool:
+        """Whether the rope kernel can store K and V: a supported CUDA head size
+        does not imply CUDA dispatch when the backend override selects Torch."""
+        return (
+            device.type == "cuda"
+            and attention.compatible_with_fused_kv_buffer
+            and not attention.rotary_emb.use_fallback_kernel
+            and get_fused_op_backend()
+            not in (KernelBackend.TORCH, KernelBackend.TORCH_COMPILE)
+        )
 
     def predictor_cached_self_attention(
         self,
@@ -1739,6 +1796,7 @@ class Qwen3OmniTalker(nn.Module):
         attn: Qwen3OmniMoeThinkerTextAttention,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        cache_slots: torch.Tensor,
         batch_size: int,
         cache_len: int,
     ) -> torch.Tensor:
@@ -1762,24 +1820,35 @@ class Qwen3OmniTalker(nn.Module):
             head_dim=attn.head_dim,
             alt_stream=attn.alt_stream,
         )
+        if self.predictor_rope_stores_kv:
+            store = FusedSetKVBufferArg(
+                value=v,
+                k_buffer=self.predictor_k_rows[layer_idx],
+                v_buffer=self.predictor_v_rows[layer_idx],
+                cache_loc=cache_slots,
+            )
+        else:
+            store = None
         q, k = attn.rotary_emb(
             positions.to(device=flat_hidden.device, dtype=torch.long),
             q,
             k,
-            fused_set_kv_buffer_arg=None,
+            fused_set_kv_buffer_arg=store,
         )
+        end = cache_len + 1
+        if store is None:
+            self.predictor_k_cache[layer_idx, :batch_size, cache_len:end].copy_(
+                k.view(batch_size, 1, attn.num_kv_heads, attn.head_dim)
+            )
+            self.predictor_v_cache[layer_idx, :batch_size, cache_len:end].copy_(
+                v.view(batch_size, 1, attn.num_kv_heads, attn.head_dim)
+            )
+        else:
+            pass
 
         q = q.reshape(batch_size, 1, attn.num_heads, attn.head_dim).transpose(1, 2)
-        k = k.reshape(batch_size, 1, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-        v = v.reshape(batch_size, 1, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-
-        layer_k_cache = self.predictor_k_cache[layer_idx, :batch_size]
-        layer_v_cache = self.predictor_v_cache[layer_idx, :batch_size]
-        layer_k_cache[:, :, cache_len : cache_len + 1, :].copy_(k)
-        layer_v_cache[:, :, cache_len : cache_len + 1, :].copy_(v)
-
-        cached_k = layer_k_cache[:, :, : cache_len + 1, :]
-        cached_v = layer_v_cache[:, :, : cache_len + 1, :]
+        cached_k = self.predictor_k_cache[layer_idx, :batch_size, :end].transpose(1, 2)
+        cached_v = self.predictor_v_cache[layer_idx, :batch_size, :end].transpose(1, 2)
 
         # note (EdwardZhang1108): enable_gqa broadcasts KV heads in-kernel (#1145)
         attn_output = torch.nn.functional.scaled_dot_product_attention(
@@ -1792,7 +1861,12 @@ class Qwen3OmniTalker(nn.Module):
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, attn.num_heads * attn.head_dim
         )
-        attn_output, _ = attn.o_proj(attn_output)
+        if self.predictor_o_proj_transposed:
+            attn_output = torch.matmul(
+                attn_output, self.predictor_o_proj_weights_t[layer_idx]
+            )
+        else:
+            attn_output, _ = attn.o_proj(attn_output)
         return attn_output.reshape(batch_size, 1, hidden_size)
 
     @torch.no_grad()
@@ -1896,3 +1970,7 @@ class Qwen3OmniTalker(nn.Module):
                 param.weight_loader(param, loaded_weight)
             else:
                 pass
+        for weight_t, layer in zip(
+            self.predictor_o_proj_weights_t, self.code_predictor.model.layers
+        ):
+            weight_t.copy_(layer.self_attn.o_proj.weight.t())
