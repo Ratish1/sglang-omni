@@ -23,6 +23,7 @@ from sglang_omni.models.qwen3_omni.components.talker import (
     Qwen3OmniMoeTalkerCodePredictor,
     Qwen3OmniTalker,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.vendor.sglang.layers import RMSNorm
 from sglang_omni.vendor.sglang.models import apply_qk_norm
 from tests.unit_test.fixtures.qwen_predictor import (
@@ -333,7 +334,9 @@ def predictor_rope_dispatch(request: pytest.FixtureRequest) -> Iterator[str]:
 
 
 @pytest.mark.accelerator
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="rope store requires CUDA")
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the rope kernel stores K and V on CUDA only"
+)
 @pytest.mark.parametrize("batch_size", [1, 16])
 def test_rope_store_writes_the_cache_the_copy_path_writes(
     batch_size: int,
