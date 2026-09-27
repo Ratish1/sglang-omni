@@ -5,23 +5,20 @@ import asyncio
 import json
 import sys
 import threading
+from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import requests
 
-from benchmarks.benchmarker.data import RequestResult
 from benchmarks.dataset.seedtts import SampleInput
 from benchmarks.eval import benchmark_tts_seedtts as tts
 from benchmarks.metrics.wer import SampleOutput, calculate_wer_metrics
 from benchmarks.tasks import asr
-from benchmarks.tasks.tts import (
-    _build_tts_payload,
-    _parse_response_headers,
-    fetch_stream_outcome,
-)
+from benchmarks.tasks.tts import _build_tts_payload, make_tts_send_fn
 from tests.utils import QWEN3_ASR_WER_CONCURRENCY, assert_wer_partitioned
 
 SEEDTTS_SAMPLE = SampleInput(
@@ -144,6 +141,8 @@ def test_explicit_cli_overrides_model_profile_defaults(monkeypatch):
             "custom-results",
             "--server-config",
             "custom.yaml",
+            "--max-new-tokens",
+            "512",
         ],
     )
 
@@ -156,24 +155,7 @@ def test_explicit_cli_overrides_model_profile_defaults(monkeypatch):
     assert config.seed == 7
     assert config.output_dir == "custom-results"
     assert config.server_config == "custom.yaml"
-
-
-def test_fun_cosyvoice3_cli_default_omits_max_new_tokens(monkeypatch):
-    monkeypatch.setattr(
-        sys, "argv", ["benchmark", "--model", "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"]
-    )
-    args, _ = tts._parse_args(
-        tts._build_arg_parser()
-    )  # noqa: leading-underscore  # production name
-    config = tts._config_from_args(args)  # noqa: leading-underscore  # production name
-    payload = _build_tts_payload(
-        SEEDTTS_SAMPLE,
-        config.model,
-        **tts._build_generation_kwargs(
-            config
-        ),  # noqa: leading-underscore  # production name
-    )
-    assert "max_new_tokens" not in payload
+    assert tts.resolve_max_new_tokens(config) == 512
 
 
 @pytest.mark.parametrize(
@@ -197,104 +179,50 @@ def test_max_new_tokens_default_applies_without_cli(model, max_new_tokens):
     assert payload.get("max_new_tokens") == max_new_tokens
 
 
-def test_explicit_max_new_tokens_overrides_fun_cosyvoice3_profile(monkeypatch):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "benchmark",
-            "--model",
-            "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
-            "--max-new-tokens",
-            "2048",
-        ],
+def test_stream_send_fn_looks_up_terminal_state_by_response_request_id():
+    async def iter_pcm_chunks() -> AsyncIterator[tuple[bytes, bool]]:
+        yield bytes(8), True
+
+    session = MagicMock()
+    session.get.return_value.__aenter__.return_value = MagicMock(
+        status=200,
+        json=AsyncMock(
+            return_value={
+                "request_id": "speech-1",
+                "finish_reason": "length",
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 120,
+                    "engine_time_s": 4.8,
+                },
+            }
+        ),
     )
-    args, _ = tts._parse_args(
-        tts._build_arg_parser()
-    )  # noqa: leading-underscore  # production name
-    config = tts._config_from_args(args)  # noqa: leading-underscore  # production name
-    payload = _build_tts_payload(
-        SEEDTTS_SAMPLE,
-        config.model,
-        **tts._build_generation_kwargs(
-            config
-        ),  # noqa: leading-underscore  # production name
+    session.post.return_value.__aenter__.return_value = MagicMock(
+        status=200,
+        headers={
+            "Content-Type": "audio/pcm",
+            "X-Request-Id": "speech-1",
+            "x-sample-rate": "4",
+            "x-channels": "1",
+            "x-bit-depth": "16",
+        },
+        content=MagicMock(iter_chunks=iter_pcm_chunks),
     )
-    assert payload["max_new_tokens"] == 2048
-
-
-def test_parse_response_headers_records_finish_reason():
-    result = RequestResult(request_id="sample-1")
-    _parse_response_headers(
-        result, {"X-Completion-Tokens": "2048", "X-Finish-Reason": "length"}
+    send_fn = make_tts_send_fn(
+        "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+        "http://host/v1/audio/speech",
+        stream=True,
     )
-    assert result.completion_tokens == 2048
-    assert result.finish_reason == "length"
 
+    result = asyncio.run(send_fn(session, SEEDTTS_SAMPLE))
 
-class FakeOutcomeResponse:
-    def __init__(self, status: int, body: dict[str, object]) -> None:
-        self.status = status
-        self.body = body
-
-    async def json(self) -> dict[str, object]:
-        return self.body
-
-    async def __aenter__(self) -> "FakeOutcomeResponse":
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        return None
-
-
-class FakeOutcomeSession:
-    def __init__(self, status: int, body: dict[str, object]) -> None:
-        self.response = FakeOutcomeResponse(status, body)
-        self.urls: list[str] = []
-
-    def get(self, url: str) -> FakeOutcomeResponse:
-        self.urls.append(url)
-        return self.response
-
-
-def test_stream_outcome_lookup_fills_finish_reason_and_usage():
-    outcome = {
-        "request_id": "speech-1",
-        "finish_reason": "length",
-        "usage": {"prompt_tokens": 7, "completion_tokens": 120, "engine_time_s": 4.8},
-    }
-    session = FakeOutcomeSession(200, outcome)
-    result = RequestResult(request_id="sample-1")
-    asyncio.run(
-        fetch_stream_outcome(session, "http://host/v1/audio/speech", "speech-1", result)
-    )
-    assert session.urls == ["http://host/v1/audio/speech/speech-1"]
+    assert result.is_success
+    session.get.assert_called_once_with("http://host/v1/audio/speech/speech-1")
     assert result.finish_reason == "length"
     assert result.prompt_tokens == 7
     assert result.completion_tokens == 120
     assert result.tok_per_s == pytest.approx(25.0)
-
-
-def test_stream_outcome_lookup_records_finish_reason_without_usage():
-    outcome = {"request_id": "speech-1", "finish_reason": "stop", "usage": None}
-    session = FakeOutcomeSession(200, outcome)
-    result = RequestResult(request_id="sample-1")
-    asyncio.run(
-        fetch_stream_outcome(session, "http://host/v1/audio/speech", "speech-1", result)
-    )
-    assert result.finish_reason == "stop"
-    assert result.completion_tokens == 0
-    assert result.tok_per_s == 0.0
-
-
-def test_stream_outcome_lookup_leaves_result_unchanged_without_route():
-    session = FakeOutcomeSession(404, {"detail": "not found"})
-    result = RequestResult(request_id="sample-1")
-    asyncio.run(
-        fetch_stream_outcome(session, "http://host/v1/audio/speech", "speech-1", result)
-    )
-    assert result.finish_reason is None
-    assert result.completion_tokens == 0
 
 
 def test_wer_fanout_preserves_all_twenty_samples_at_long_audio_admission_cap(

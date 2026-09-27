@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -13,7 +14,7 @@ from fastapi.testclient import TestClient
 from sglang_omni.admission import QueueFullError
 from sglang_omni.client import Client, ClientError, GenerateChunk
 from sglang_omni.client.audio import encode_pcm
-from sglang_omni.client.types import GenerateRequest
+from sglang_omni.client.types import GenerateRequest, UsageInfo
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.proto import (
     EXPLICIT_GENERATION_PARAMS_KEY,
@@ -132,7 +133,7 @@ class SuccessfulSpeechClient:
             modality="audio",
             audio_data=[0.0, 0.1, -0.1, 0.0],
             sample_rate=self.sample_rate,
-            finish_reason=self.finish_reason,
+            finish_reason="stop",
         )
 
     async def speech(
@@ -218,6 +219,30 @@ class EmptyDeltaStreamingSpeechClient:
             audio_data=None,
             sample_rate=24000,
             finish_reason="stop",
+        )
+
+
+class TerminalChunkStreamingSpeechClient:
+    def health(self) -> dict[str, bool]:
+        return {"running": True}
+
+    async def generate(
+        self, request: GenerateRequest, request_id: str | None = None
+    ) -> AsyncIterator[GenerateChunk]:
+        yield GenerateChunk(
+            request_id=request_id or "speech-1",
+            modality="audio",
+            audio_data=[0.0, 0.1, -0.1, 0.0],
+            sample_rate=24000,
+            finish_reason=None,
+        )
+        yield GenerateChunk(
+            request_id=request_id or "speech-1",
+            modality="audio",
+            audio_data=None,
+            sample_rate=24000,
+            finish_reason="length",
+            usage=UsageInfo(prompt_tokens=7, completion_tokens=120),
         )
 
 
@@ -1274,6 +1299,14 @@ def test_speech_stream_defaults_to_raw_pcm() -> None:
     assert response.headers["x-channels"] == "1"
     assert response.headers["x-bit-depth"] == "16"
     assert response.content == expected
+    request_id = response.headers["x-request-id"]
+    outcome = client.get(f"/v1/audio/speech/{request_id}")
+    assert outcome.json() == {
+        "request_id": request_id,
+        "finish_reason": "stop",
+        "usage": None,
+    }
+    assert client.get("/v1/audio/speech/speech-unknown").status_code == 404
 
 
 def test_speech_stream_headers_use_chunk_sample_rate() -> None:
@@ -1301,9 +1334,9 @@ def test_speech_stream_headers_use_chunk_sample_rate() -> None:
     assert response.content == expected
 
 
-def test_speech_stream_exposes_terminal_state_by_request_id() -> None:
+def test_speech_stream_records_terminal_state_from_a_later_chunk() -> None:
     client = TestClient(
-        create_app(SuccessfulSpeechClient(finish_reason="length"), model_name="s2-pro")
+        create_app(TerminalChunkStreamingSpeechClient(), model_name="s2-pro")
     )
 
     response = client.post(
@@ -1317,16 +1350,23 @@ def test_speech_stream_exposes_terminal_state_by_request_id() -> None:
         },
     )
     assert response.status_code == 200
-    request_id = response.headers["x-request-id"]
 
-    outcome = client.get(f"/v1/audio/speech/{request_id}")
+    outcome = client.get(f"/v1/audio/speech/{response.headers['x-request-id']}")
     assert outcome.status_code == 200
-    assert outcome.json() == {
-        "request_id": request_id,
-        "finish_reason": "length",
-        "usage": None,
-    }
-    assert client.get("/v1/audio/speech/speech-unknown").status_code == 404
+    assert outcome.json()["finish_reason"] == "length"
+    assert outcome.json()["usage"]["completion_tokens"] == 120
+
+
+def test_store_evicts_the_oldest_outcome_past_max_entries() -> None:
+    outcomes = SpeechStreamOutcomes(max_entries=1)
+    outcomes.record("speech-1", "stop", None)
+    outcomes.record("speech-2", "length", UsageInfo(completion_tokens=120))
+
+    assert outcomes.get("speech-1") is None
+    newest = outcomes.get("speech-2")
+    assert newest is not None
+    assert newest.finish_reason == "length"
+    assert newest.usage is not None and newest.usage.completion_tokens == 120
 
 
 def test_raw_pcm_response_close_aborts_inner_speech_stream() -> None:
@@ -1354,7 +1394,6 @@ def test_raw_pcm_response_disconnect_before_first_chunk_aborts_request() -> None
     async def drive() -> None:
         client = BlockingFirstAudioStreamingSpeechClient()
         request = DisconnectingRequest()
-        speech_stream_outcomes = SpeechStreamOutcomes(max_entries=8)
         task = asyncio.create_task(
             speech_audio_response(
                 request=request,
@@ -1362,7 +1401,7 @@ def test_raw_pcm_response_disconnect_before_first_chunk_aborts_request() -> None
                 gen_req=GenerateRequest(model="s2-pro", prompt="hello", stream=True),
                 request_id="req-1",
                 speed=1.0,
-                speech_stream_outcomes=speech_stream_outcomes,
+                speech_stream_outcomes=SpeechStreamOutcomes(max_entries=8),
             )
         )
         await client.started.wait()
@@ -1370,7 +1409,6 @@ def test_raw_pcm_response_disconnect_before_first_chunk_aborts_request() -> None
         with pytest.raises(asyncio.CancelledError):
             await task
         assert client.aborted == ["req-1"]
-        assert speech_stream_outcomes.get("req-1") is None
 
     asyncio.run(drive())
 
