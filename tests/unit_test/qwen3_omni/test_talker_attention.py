@@ -24,6 +24,7 @@ from sglang_omni.models.qwen3_omni.components.talker import (
 from sglang_omni.platforms import current_platform
 from sglang_omni.vendor.sglang.layers import RMSNorm
 from tests.unit_test.fixtures.qwen_predictor import (
+    TupleLinear,
     build_real_step_predictor_graph_talker,
 )
 
