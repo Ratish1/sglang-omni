@@ -47,12 +47,14 @@ from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recor
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
 from sglang_omni.serve.openai_api import create_app
 from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
+from sglang_omni.serve.realtime.manager import RealtimeDeployment
 from sglang_omni.utils.gpu_compat import apply_gpu_compat_env_defaults
 from sglang_omni.utils.gpu_memory import (
     GpuDeviceInfo,
     format_bytes_gib,
     get_gpu_device_info,
 )
+from sglang_omni.utils.imports import import_string
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,8 @@ class PipelineUvicornServer(uvicorn.Server):
         if threading.current_thread() is not threading.main_thread():
             yield
             return
+        else:
+            pass
 
         original_handlers = {
             sig: signal.signal(sig, self.handle_exit) for sig in _HANDLED_SIGNALS
@@ -82,7 +86,7 @@ class PipelineUvicornServer(uvicorn.Server):
         finally:
             for sig, handler in original_handlers.items():
                 signal.signal(sig, handler)
-            self._captured_signals.clear()
+            self._captured_signals.clear()  # noqa: leading-underscore
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +111,8 @@ def find_available_port(host: str, port: int) -> int:
                 f"port {port} is already in use on {host} and "
                 "SGLANG_OMNI_STRICT_PORT=1 forbids falling back"
             ) from exc
+        else:
+            pass
     logger.warning(f"Port {port} is already in use on {host}.")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
@@ -138,6 +144,8 @@ def stage_runtime_log_summary(pipeline_config: PipelineConfig) -> dict[str, Any]
         )
         if stage.gpu is None and fraction is None and kv_cache_bytes is None:
             continue
+        else:
+            pass
         summary[stage.name] = {
             "gpu": stage.gpu,
             "total_gpu_memory_fraction": fraction,
@@ -207,9 +215,13 @@ def model_capabilities_log_summary(
     architecture = getattr(type(pipeline_config), "architecture", None)
     if architecture is None:
         return None
+    else:
+        pass
     capabilities = get_model_capabilities(architecture)
     if capabilities is None:
         return None
+    else:
+        pass
     return {
         "architecture": architecture,
         "reference_audio": capabilities.supports_reference_audio,
@@ -234,6 +246,8 @@ def log_model_capabilities(pipeline_config: PipelineConfig) -> None:
         return
     if summary is not None:
         logger.info("Model capabilities: %s", json.dumps(summary, sort_keys=True))
+    else:
+        pass
 
 
 class StartReq(BaseModel):
@@ -275,10 +289,14 @@ def mount_profiler_routes(
                 status_code=400,
                 detail="num_steps needs step_stage and enable_torch=true",
             )
+        else:
+            pass
         run_id = req.run_id or default_run_id()
         event_dir = req.event_dir
         if event_dir is None and profiler_dir is not None:
             event_dir = default_event_dir(profiler_dir, run_id)
+        else:
+            pass
         if req.enable_torch:
             if req.trace_path_template is not None:
                 tpl = req.trace_path_template
@@ -301,6 +319,8 @@ def mount_profiler_routes(
                         "SGLANG_TORCH_PROFILER_DIR is not set"
                     ),
                 )
+            else:
+                pass
             tpl = req.trace_path_template or ""
         if event_dir is not None:
             try:
@@ -312,6 +332,8 @@ def mount_profiler_routes(
                     "Failed to start coordinator request event recorder",
                     exc_info=True,
                 )
+        else:
+            pass
         await profiler_ctl.broadcast_start(
             run_id=run_id,
             trace_path_template=tpl,
@@ -346,7 +368,11 @@ def mount_profiler_routes(
                         "SGLANG_TORCH_PROFILER_DIR is not set"
                     ),
                 )
+            else:
+                pass
             event_dir = default_event_dir(profiler_dir, run_id)
+        else:
+            pass
         try:
             _get_event_recorder().start(
                 run_id=run_id, event_dir=event_dir, stage="coordinator"
@@ -372,6 +398,8 @@ def mount_profiler_routes(
         active = recorder.active_run_id() if recorder.is_active() else None
         if recorder.is_active() and (run_id is None or active == run_id):
             recorder.stop(run_id=active)
+        else:
+            pass
         await profiler_ctl.broadcast_stop(run_id=run_id)
         return {"run_id": run_id or active}
 
@@ -383,6 +411,8 @@ def mount_profiler_routes(
         active = recorder.active_run_id() if recorder.is_active() else None
         if recorder.is_active() and (run_id is None or active == run_id):
             recorder.stop(run_id=active)
+        else:
+            pass
         await profiler_ctl.broadcast_stop(run_id=run_id)
         return {"run_id": run_id or active}
 
@@ -438,6 +468,13 @@ async def run_server(
     try:
         cl_kwargs = client_kwargs or {}
         client = Client(coordinator, **cl_kwargs)
+        deployment_factory = type(pipeline_config).realtime_deployment_factory
+        if enable_realtime and deployment_factory is not None:
+            realtime_deployment: RealtimeDeployment | None = import_string(
+                deployment_factory
+            )(client)
+        else:
+            realtime_deployment = None
         app = create_app(
             client,
             model_name=model_name or pipeline_config.name,
@@ -461,6 +498,7 @@ async def run_server(
             additional_speech_languages=pipeline_config.additional_speech_languages,
             max_speech_input_chars=pipeline_config.max_speech_input_chars,
             enable_realtime=enable_realtime,
+            realtime_deployment=realtime_deployment,
             supports_realtime_audio_output=(
                 type(pipeline_config).code2wav_stage() is not None
             ),
@@ -508,6 +546,8 @@ async def serve_with_failure_watch(
         if server_task in done:
             await server_task
             return
+        else:
+            pass
 
         server.should_exit = True
         with suppress(asyncio.CancelledError):
@@ -516,16 +556,24 @@ async def serve_with_failure_watch(
         for task in done:
             if task is server_task:
                 continue
+            else:
+                pass
             if task.cancelled():
                 raise RuntimeError("Pipeline runtime task was cancelled")
+            else:
+                pass
             exc = task.exception()
             if exc is not None:
                 raise exc
+            else:
+                pass
             raise RuntimeError("Pipeline runtime task exited unexpectedly")
     finally:
         for task in watcher_tasks:
             if not task.done():
                 task.cancel()
+            else:
+                pass
 
 
 def launch_server(
