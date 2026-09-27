@@ -25,8 +25,8 @@ import torch.nn.functional as F
 
 from benchmarks.dataset.seedtts import load_seedtts_samples
 from sglang_omni.models.qwen3_tts.prompt_frontend import load_qwen3_tts_prompt_frontend
-from sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph import (
-    DEFAULT_QWEN3_TTS_SPEAKER_ENCODER_BUCKET_FRAMES,
+from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
+    DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES,
 )
 from sglang_omni.models.qwen3_tts.stages import register_qwen3_tts_hf_config
 from sglang_omni.utils.checkpoint import resolve_checkpoint
@@ -51,8 +51,9 @@ def main() -> None:
         frontend = load_qwen3_tts_prompt_frontend(
             resolve_checkpoint(args.model), device=device, dtype=torch.bfloat16
         )
+        # the codec hop of the 12 Hz tokenizer, 1920 samples per codec frame
         frontend.speaker_encoder_graph_runner.capture(
-            DEFAULT_QWEN3_TTS_SPEAKER_ENCODER_BUCKET_FRAMES
+            DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES, 1920
         )
     encoder = frontend.speaker_encoder.eval()
     runner = frontend.speaker_encoder_graph_runner
