@@ -45,18 +45,22 @@ def add_rmsnorm_rounded_kernel(
 ):
     row = tl.program_id(0)
     lane = tl.arange(0, 32)
+    j = tl.arange(0, LANE_VEC)
     row_base = row * HIDDEN
     acc = tl.zeros([32], dtype=tl.float32)
     for block in tl.static_range(BLOCKS):
-        for j in tl.static_range(LANE_VEC):
-            col = LANE_VEC * lane + 32 * LANE_VEC * block + j
-            total = tl.load(X + row_base + col).to(tl.float32) + tl.load(
-                RESIDUAL + row_base + col
-            ).to(tl.float32)
-            rounded = total.to(tl.bfloat16)
-            tl.store(RESIDUAL + row_base + col, rounded)
-            value = rounded.to(tl.float32)
-            acc += value * value
+        # One 16-byte vector per lane; the lane's eight squares are then added in
+        # element order, each through a masked sum, which is exact.
+        col = LANE_VEC * lane[:, None] + 32 * LANE_VEC * block + j[None, :]
+        total = tl.load(X + row_base + col).to(tl.float32) + tl.load(
+            RESIDUAL + row_base + col
+        ).to(tl.float32)
+        rounded = total.to(tl.bfloat16)
+        tl.store(RESIDUAL + row_base + col, rounded)
+        value = rounded.to(tl.float32)
+        squares = value * value
+        for element in tl.static_range(LANE_VEC):
+            acc += tl.sum(tl.where(j[None, :] == element, squares, 0.0), 1)
     sum_sq = butterfly_sum(acc)
     rstd = libdevice.rsqrt(sum_sq / HIDDEN + eps)
     block = tl.arange(0, BLOCKS)
