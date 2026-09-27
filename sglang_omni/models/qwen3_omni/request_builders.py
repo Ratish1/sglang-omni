@@ -761,8 +761,13 @@ def build_sglang_thinker_request(
     )
     req.tokenizer = tokenizer
 
-    # Compute M-RoPE positions and attach multimodal_inputs to Req
-    if thinker_config is not None and model_inputs:
+    # note (ratish): an audio-only prompt gets the same arange and zero delta from
+    # sglang's text positions, and carrying them costs a host copy of the delta
+    # before every decode step, so only image and video prompts attach them
+    if thinker_config is not None and (
+        model_inputs.get("image_grid_thw") is not None
+        or model_inputs.get("video_grid_thw") is not None
+    ):
         mrope_result = compute_mrope_positions(
             original_input_ids.to(dtype=torch.long), model_inputs, thinker_config
         )
