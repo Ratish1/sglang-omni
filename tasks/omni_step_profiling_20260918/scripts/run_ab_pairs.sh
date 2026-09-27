@@ -12,6 +12,8 @@ SERVE_ARGS="$*"
 PY=python3
 MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 META=zhaochenyang20/seed-tts-eval-arrow
+#STREAM_ARG="" benchmarks non streaming
+STREAM_ARG=${STREAM_ARG---stream}
 mkdir -p "$OUT"
 md5sum "$0" > "$OUT/md5.txt"
 
@@ -49,7 +51,7 @@ boot() {
     echo "healthy startup_s $(( $(date +%s) - began )), bench start $(date +%T)" >> "$d/progress.txt"
     (cd "$TREE_A" && CUDA_VISIBLE_DEVICES=$card PYTHONPATH=$TREE_A timeout 7200 $PY -m benchmarks.eval.benchmark_tts_seedtts \
       --model $MODEL --meta "$meta" --lang en --use-existing-server --host 127.0.0.1 --port $port \
-      --warmup 1 --stream --generate-only --output-dir "$d/bench" "$@") > "$d/bench.log" 2>&1
+      --warmup 1 $STREAM_ARG --generate-only --output-dir "$d/bench" "$@") > "$d/bench.log" 2>&1
     echo "bench rc $? $(date +%T)" >> "$d/progress.txt"
   fi
   touch "$d/BENCHED"
