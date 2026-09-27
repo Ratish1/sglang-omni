@@ -437,8 +437,11 @@ def test_rope_store_writes_the_cache_the_copy_path_writes(
     not current_platform.is_cuda(), reason="the cuBLAS layouts are compared on CUDA"
 )
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
-def test_o_proj_on_the_transposed_weight_matches_the_linear(batch_size: int) -> None:
+def test_o_proj_on_the_transposed_weight_matches_the_linear(
+    batch_size: int, predictor_rope_dispatch: str
+) -> None:
     """The (K, N) weight copy changes the cuBLAS kernel, not the bits."""
+    del predictor_rope_dispatch
     device = torch.device("cuda")
     talker = rope_store_talker(device, stores=False)
     attn = rope_attention(device)
