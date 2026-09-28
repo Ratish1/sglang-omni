@@ -167,6 +167,7 @@ def test_packed_forward_matches_the_padded_dit_per_row(streaming: bool) -> None:
             packed["t"],
             packed["rows"],
             attention,
+            estimator.rope(packed["rows"]),
         )
     out = scatter_rows(out, packed["rows"], 19).transpose(1, 2)
 
@@ -234,9 +235,7 @@ def test_packed_compile_requires_ragged_half_precision(monkeypatch) -> None:
     assert not estimator.compile(torch.float32)
     assert compile_options == []
     assert estimator.compile(torch.bfloat16)
-    assert len(compile_options) == 2
-    assert estimator.compiled_causal_forward is not None
-    assert estimator.compiled_full_forward is not None
+    assert len(compile_options) == 1
     assert all(
         call["backend"] == "inductor"
         and call["dynamic"] is True
@@ -263,6 +262,7 @@ def test_a_wide_row_does_not_change_the_rows_packed_beside_it() -> None:
             estimator.row_attention(
                 packed["rows"], streaming=True, dtype=packed["x"].dtype
             ),
+            estimator.rope(packed["rows"]),
         )
         for index, length in enumerate(LENGTHS):
             rows = pack_rows((length,), CPU)
@@ -274,6 +274,7 @@ def test_a_wide_row_does_not_change_the_rows_packed_beside_it() -> None:
                 padded["t"],
                 rows,
                 estimator.row_attention(rows, streaming=True, dtype=packed["x"].dtype),
+                estimator.rope(rows),
             )
             start = int(packed["rows"].starts_host[index])
             torch.testing.assert_close(

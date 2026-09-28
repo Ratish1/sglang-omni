@@ -75,14 +75,10 @@ class GraphRunnableFakeFlow(RunnableFakeFlow):
 class RecordingPackedDiT(PackedDiT):
     def __init__(self) -> None:
         self.is_ragged = True
-        self.disable_calls = 0
 
     def compile(self, dtype: torch.dtype | None) -> bool:
         del dtype
         return True
-
-    def disable_compile(self) -> None:
-        self.disable_calls += 1
 
 
 def packed_compile_scheduler(
@@ -137,7 +133,7 @@ def test_packed_dit_compile_warmup_materializes_serving_variants() -> None:
     assert len(hop_batches) == len(leftover_batches) == 1
 
 
-def test_packed_dit_compile_warmup_failure_disables_compiled_path() -> None:
+def test_packed_dit_compile_warmup_failure_fails_startup() -> None:
     packed_estimator = RecordingPackedDiT()
     scheduler, _, leftover_batches = packed_compile_scheduler(
         packed_estimator,
@@ -147,7 +143,6 @@ def test_packed_dit_compile_warmup_failure_disables_compiled_path() -> None:
     with pytest.raises(RuntimeError, match="causal materialization failed"):
         scheduler.warmup_packed_dit_compile()
 
-    assert packed_estimator.disable_calls == 1
     assert leftover_batches == []
 
 
