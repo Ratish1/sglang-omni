@@ -117,6 +117,10 @@ def main() -> None:
             report[f"buffered rows={rows} tokens={HOP_TOKENS[-1]}"] = measure(
                 buffered, items
             )
+        # Captured (requests, frames) shapes: these replay the buffered CUDA graph.
+        for rows, frames in ((16, 576), (9, 560), (5, 544), (3, 528)):
+            items = make_items(rows, frames // 2 - PROMPT_TOKENS, vocoder.flow)
+            report[f"graphed rows={rows} frames={frames}"] = measure(buffered, items)
     for name, values in report.items():
         print(
             name, {key: value for key, value in values.items() if key != "top_kernels"}
