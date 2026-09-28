@@ -8,6 +8,7 @@ import gc
 import importlib
 import logging
 import os
+import types
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -1172,7 +1173,6 @@ def compile_dit_backbone(
     flow: FunCosyVoice3Flow,
     *,
     warmup_mel_frames: int = 128,
-    warmup_steps: int = 3,
     autocast_dtype: torch.dtype | None = None,
 ) -> None:
 
@@ -1192,36 +1192,47 @@ def compile_dit_backbone(
     torch._inductor.config.fx_graph_cache = True  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.accumulated_cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-    # note(ratish): the repeated blocks share one traced graph; DiT.forward, with
-    # its chunk mask and RoPE, stays eager.
+    # note(ratish): the block is traced once and inlined back into one flat
+    # graph; calling it as a subgraph costs host time on every step.
+    torch._dynamo.config.inline_invoke_subgraph = True  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    block_forward = torch.compiler.nested_compile_region(
+        type(estimator.transformer_blocks[0]).forward
+    )
     for block in estimator.transformer_blocks:
-        block.compile(dynamic=True)
+        block.forward = types.MethodType(block_forward, block)
+    # note(ratish): not dynamic=True, which makes the hidden size symbolic and the
+    # nested block region then fails to trace.
+    estimator.forward = torch.compile(estimator.forward, fullgraph=True)
     # note(chenye): synthetic inputs must use the dtype serving presents to
     # the estimator, including the effective autocast dtype.
     param = next(flow.parameters())
     device = param.device
     parameter_dtype = param.dtype
     warmup_dtype = autocast_dtype or parameter_dtype
-    mel_frame = int(warmup_mel_frames)
     with torch.inference_mode():
         for streaming in (False, True):
-            for _ in range(warmup_steps):
-                # CFG batch 2; mel dim 80 matches pinned checkpoint proj_out.
+            # note(ratish): two batch and frame sizes, so both become symbolic here
+            # and do not recompile on a request.
+            for batch_size, mel_frame in (
+                (2, warmup_mel_frames),
+                (4, 2 * warmup_mel_frames),
+            ):
+                # CFG batch; mel dim 80 matches pinned checkpoint proj_out.
                 noisy_mel = torch.randn(
-                    2, 80, mel_frame, device=device, dtype=warmup_dtype
+                    batch_size, 80, mel_frame, device=device, dtype=warmup_dtype
                 )
                 mel_mask = torch.ones(
-                    2, 1, mel_frame, device=device, dtype=warmup_dtype
+                    batch_size, 1, mel_frame, device=device, dtype=warmup_dtype
                 )
                 token_condition = torch.randn(
-                    2, 80, mel_frame, device=device, dtype=warmup_dtype
+                    batch_size, 80, mel_frame, device=device, dtype=warmup_dtype
                 )
                 flow_time = torch.zeros(1, device=device, dtype=warmup_dtype)
                 speaker_embedding = torch.randn(
-                    2, 80, device=device, dtype=warmup_dtype
+                    batch_size, 80, device=device, dtype=warmup_dtype
                 )
                 prompt_mel = torch.randn(
-                    2, 80, mel_frame, device=device, dtype=warmup_dtype
+                    batch_size, 80, mel_frame, device=device, dtype=warmup_dtype
                 )
                 with torch.autocast(
                     device_type=current_platform.device_type,
@@ -1239,8 +1250,7 @@ def compile_dit_backbone(
                     )
     logger.info(
         "Compiled Fun-CosyVoice3 DiT backbone "
-        f"(dynamic=True, autocast_dtype={autocast_dtype}, "
-        f"warmup_mel_frames={warmup_mel_frames}, warmup_steps={warmup_steps}, "
+        f"(autocast_dtype={autocast_dtype}, warmup_mel_frames={warmup_mel_frames}, "
         "streaming=False/True)"
     )
 

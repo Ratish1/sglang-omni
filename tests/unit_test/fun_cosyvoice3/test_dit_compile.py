@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch._dynamo as dynamo
 
 import sglang_omni.models.fun_cosyvoice3.stages as stages
 
@@ -47,40 +48,45 @@ class NonModuleEstimator:
     pass
 
 
-def test_compile_dit_backbone_compiles_each_block_and_keeps_forward_eager(
+def test_compile_dit_backbone_compiles_the_forward_with_blocks_as_one_region(
     monkeypatch,
 ) -> None:
     estimator = FakeDiTEstimator()
     flow = FakeFlow(estimator)
     param_names = set(dict(estimator.named_parameters()))
-    compile_dynamic: list[bool | None] = []
+    compile_options: list[dict[str, object]] = []
 
-    def fake_compile(fn, dynamic=None):
-        compile_dynamic.append(dynamic)
+    def fake_compile(fn, **kwargs):
+        compile_options.append(kwargs)
         return fn
 
     monkeypatch.setattr(torch, "compile", fake_compile)
+    monkeypatch.setattr(dynamo.config, "inline_invoke_subgraph", False)
 
     stages.compile_dit_backbone(flow, warmup_mel_frames=16)
 
-    assert compile_dynamic == [True, True]
-    assert "forward" not in vars(estimator)
+    assert compile_options == [{"fullgraph": True}]
+    assert dynamo.config.inline_invoke_subgraph
+    first, second = estimator.transformer_blocks
+    assert vars(first)["forward"].__func__ is vars(second)["forward"].__func__
     assert set(dict(estimator.named_parameters())) == param_names
-    # Warmup runs the CFG [2, 80, T] signature for buffered and causal hops.
-    assert estimator.calls == (
-        [((2, 80, 16), (2, 1, 16), False)] * 3 + [((2, 80, 16), (2, 1, 16), True)] * 3
-    )
+    # CFG batches of two sizes per mode, so batch and frames become symbolic.
+    assert estimator.calls == [
+        ((2, 80, 16), (2, 1, 16), False),
+        ((4, 80, 32), (4, 1, 32), False),
+        ((2, 80, 16), (2, 1, 16), True),
+        ((4, 80, 32), (4, 1, 32), True),
+    ]
 
 
 def test_compile_dit_backbone_warmup_matches_serving_grad_mode(monkeypatch) -> None:
     # flow.inference is @torch.inference_mode(); warmup must match (Dynamo
     # guards on grad mode) so the first request reuses the warmed graph.
     estimator = FakeDiTEstimator()
-    monkeypatch.setattr(torch, "compile", lambda fn, dynamic=None: fn)
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
+    monkeypatch.setattr(dynamo.config, "inline_invoke_subgraph", False)
 
-    stages.compile_dit_backbone(
-        FakeFlow(estimator), warmup_mel_frames=16, warmup_steps=2
-    )
+    stages.compile_dit_backbone(FakeFlow(estimator), warmup_mel_frames=16)
 
     assert estimator.modes == [(True, True)] * 4
 
@@ -99,16 +105,14 @@ def test_compile_dit_backbone_warmup_uses_serving_dtype(
     expected_dtype: torch.dtype,
 ) -> None:
     estimator = FakeDiTEstimator().to(parameter_dtype)
-    monkeypatch.setattr(torch, "compile", lambda fn, dynamic=None: fn)
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
+    monkeypatch.setattr(dynamo.config, "inline_invoke_subgraph", False)
 
     stages.compile_dit_backbone(
-        FakeFlow(estimator),
-        autocast_dtype=autocast_dtype,
-        warmup_steps=1,
-        warmup_mel_frames=16,
+        FakeFlow(estimator), autocast_dtype=autocast_dtype, warmup_mel_frames=16
     )
 
-    assert estimator.dtypes == [(expected_dtype,) * 6] * 2
+    assert estimator.dtypes == [(expected_dtype,) * 6] * 4
 
 
 def test_compile_dit_backbone_rejects_non_module_estimator(monkeypatch) -> None:
@@ -128,13 +132,14 @@ def test_compile_dit_backbone_rejects_non_module_estimator(monkeypatch) -> None:
 
 def test_compile_dit_backbone_compile_failure_fails_startup(monkeypatch) -> None:
     # torch.compile is lazy: a failure surfaces on the first warmup call.
-    def fail_compile(fn, dynamic=None):
+    def fail_compile(fn, **kwargs):
         def wrapped(*args, **kwargs):
             raise RuntimeError("synthetic compile failure")
 
         return wrapped
 
     monkeypatch.setattr(torch, "compile", fail_compile)
+    monkeypatch.setattr(dynamo.config, "inline_invoke_subgraph", False)
 
     with pytest.raises(RuntimeError, match="synthetic compile failure"):
         stages.compile_dit_backbone(FakeFlow(FakeDiTEstimator()), warmup_mel_frames=16)
