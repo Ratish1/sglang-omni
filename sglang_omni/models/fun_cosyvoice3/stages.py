@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import importlib
 import logging
 import os
@@ -423,6 +424,10 @@ class FlowCudaGraphRunner:
     def capture(self, capture_shapes: tuple[tuple[int, int], ...]) -> None:
         # Note (chenyang): Capture on a side stream so other
         # kernels on default-stream are not recorded.
+        # note(ratish): CosyVoice's loader leaves its frontend's onnxruntime CUDA
+        # session in a reference cycle; a collection inside the capture would free
+        # it there and invalidate the graph.
+        gc.collect()
         graphs: dict[tuple[int, int], CapturedFlowCudaGraph] = {}
         current_stream = torch.cuda.current_stream(self.device)
         stream = torch.cuda.Stream(device=self.device)
