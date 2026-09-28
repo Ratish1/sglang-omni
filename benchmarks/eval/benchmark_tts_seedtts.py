@@ -159,13 +159,13 @@ _AUK_BENCHMARK_PROFILE = _ModelBenchmarkProfile(
     },
     forward_sglang_engine=False,
 )
-# note (Yucheng Hu): Fun-CosyVoice3 caps generation at min(2048, 20x target text
-# tokens) unless the request sets max_new_tokens; a flat 2048 lets a runaway run 82 s.
-_FUN_COSYVOICE3_BENCHMARK_PROFILE = _ModelBenchmarkProfile(max_new_tokens=None)
 _MODEL_BENCHMARK_PROFILES: dict[str, _ModelBenchmarkProfile] = {
     "auk": _AUK_BENCHMARK_PROFILE,
     "auk-flash": _AUK_BENCHMARK_PROFILE,
-    "fun-cosyvoice3-0.5b-2512": _FUN_COSYVOICE3_BENCHMARK_PROFILE,
+    # note (Yucheng Hu): Fun-CosyVoice3 caps generation at min(2048, 20x target
+    # text tokens) unless the request sets max_new_tokens; a flat 2048 lets a
+    # runaway run 82 s.
+    "fun-cosyvoice3-0.5b-2512": _ModelBenchmarkProfile(max_new_tokens=None),
 }
 
 

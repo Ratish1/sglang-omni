@@ -3,7 +3,7 @@
 
 A raw PCM stream sends its headers before generation ends and has no in-band
 channel for trailing metadata, so the server keeps each finished stream's
-terminal state by request id for ``GET /v1/audio/speech/{request_id}``.
+terminal state by request id for GET /v1/audio/speech/{request_id}.
 """
 
 from __future__ import annotations
