@@ -324,17 +324,19 @@ class PackedDiT:
             return False
         else:
             pass
+        # note(ratish): automatic dynamic, as SGLang's install_torch_compiled; with
+        # dynamic=True the nested region cannot stamp out the block (symbolic
+        # hidden size, symbolic layer norm eps).
         self.forward = torch.compile(
             self.forward,
             backend="inductor",
-            dynamic=True,
             fullgraph=True,
             options=dict(PACKED_INDUCTOR_OPTIONS),
         )
         self.is_compiled = True
         logger.info(
             "Compiled the Fun-CosyVoice3 PackedDiT forward "
-            f"(dynamic=True, fullgraph=True, emulate_precision_casts=True, dtype={dtype})"
+            f"(fullgraph=True, emulate_precision_casts=True, dtype={dtype})"
         )
         return True
 
@@ -421,7 +423,7 @@ def layer_norm(module: torch.nn.LayerNorm, h: torch.Tensor) -> torch.Tensor:
     # note(ratish): Inductor rewrites the layer norm and Mish into its own
     # arithmetic; the custom ops keep the eager kernels inside the compiled forward.
     if torch.compiler.is_compiling():
-        return native_layer_norm(h, module.normalized_shape[0], module.eps)
+        return native_layer_norm(h, module.normalized_shape[0], float(module.eps))
     else:
         return module(h)
 
