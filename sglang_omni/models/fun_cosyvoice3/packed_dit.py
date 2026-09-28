@@ -107,8 +107,8 @@ class PackedRows:
     starts_host: torch.Tensor
     row_ids: torch.Tensor
     positions: torch.Tensor
-    # note(ratish): plain ints, not read from lengths, so a compiled forward
-    # traces them as symbols instead of guarding on every row count.
+    # note(ratish): the compiled forward reads these, not lengths, which it would
+    # guard on for every row count.
     row_count: int
     width: int
 
@@ -324,12 +324,11 @@ class PackedDiT:
             return False
         else:
             pass
-        # note(ratish): Dynamo traces the block once, then inlines its 22 calls into
-        # one flat graph; a called subgraph costs host time on every step.
+        # note(ratish): the block is traced once and inlined back into one flat
+        # graph; calling it as a subgraph costs host time on every step.
         dynamo.config.inline_invoke_subgraph = True
-        # note(ratish): automatic dynamic, as SGLang's install_torch_compiled; with
-        # dynamic=True the nested region cannot stamp out the block (symbolic
-        # hidden size, symbolic layer norm eps).
+        # note(ratish): not dynamic=True, which makes the hidden size and the layer
+        # norm eps symbolic and the nested block region then fails to trace.
         self.forward = torch.compile(
             self.forward,
             backend="inductor",
@@ -388,8 +387,6 @@ class PackedDiT:
         return freqs.cos(), freqs.sin()
 
 
-# note(ratish): the blocks share one traced and compiled subgraph inside the
-# compiled forward, which then pays one guard check per step, not one per block.
 @torch.compiler.nested_compile_region
 def forward_block(
     block: torch.nn.Module,

@@ -1192,8 +1192,8 @@ def compile_dit_backbone(
     torch._inductor.config.fx_graph_cache = True  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.accumulated_cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-    # note(ratish): SGLang's regional compile: the repeated blocks share one traced
-    # graph, and DiT.forward, with its chunk mask and RoPE, stays eager.
+    # note(ratish): the repeated blocks share one traced graph; DiT.forward, with
+    # its chunk mask and RoPE, stays eager.
     for block in estimator.transformer_blocks:
         block.compile(dynamic=True)
     # note(chenye): synthetic inputs must use the dtype serving presents to

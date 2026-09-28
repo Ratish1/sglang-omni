@@ -169,8 +169,8 @@ class FunCosyVoice3StreamingVocoderScheduler(
             pass
         hop_tokens = self.token_hop_len + PRE_LOOKAHEAD_LEN
         first = [self.make_warmup_flow_input(hop_tokens)]
-        # note(ratish): a second batch of other row count and lengths, so the sizes
-        # serving varies turn symbolic in the one recompile here, not on a request.
+        # note(ratish): a second row count and length, so the sizes serving varies
+        # become symbolic here and do not recompile on a request.
         second = [
             self.make_warmup_flow_input(hop_tokens),
             self.make_warmup_flow_input(hop_tokens + self.token_hop_len),
