@@ -67,11 +67,18 @@ def measure(call, items) -> dict[str, float]:
     kernels = [
         event for event in events if event.name != "Memcpy HtoD (Pageable -> Device)"
     ]
+    by_name: dict[str, list[float]] = {}
+    for event in kernels:
+        count_and_ms = by_name.setdefault(event.name[:90], [0, 0.0])
+        count_and_ms[0] += 1
+        count_and_ms[1] += event.device_time / 1e3
+    top = sorted(by_name.items(), key=lambda pair: -pair[1][1])[:25]
     return {
         "wall_ms_median": round(statistics.median(walls), 2),
         "host_ms_median": round(statistics.median(hosts), 2),
         "kernels": len(kernels),
         "device_ms": round(sum(event.device_time for event in kernels) / 1e3, 2),
+        "top_kernels": [[name, count, round(ms, 2)] for name, (count, ms) in top],
     }
 
 
@@ -111,7 +118,9 @@ def main() -> None:
                 buffered, items
             )
     for name, values in report.items():
-        print(name, values)
+        print(
+            name, {key: value for key, value in values.items() if key != "top_kernels"}
+        )
     with open(args.out, "w") as handle:
         json.dump(report, handle, indent=1)
 
