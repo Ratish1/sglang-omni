@@ -8,7 +8,6 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import Protocol
 
 import torch
 import torch._dynamo as dynamo
@@ -87,20 +86,35 @@ def fake_native_layer_norm(
     return torch.empty_like(x, dtype=torch.float32)
 
 
+@torch.library.custom_op(
+    "sglang_omni_fun_cosyvoice3::native_mish",
+    mutates_args=(),
+    device_types="cuda",
+)
+def native_mish(x: torch.Tensor) -> torch.Tensor:
+    """Preserve eager CUDA Mish arithmetic across the Inductor boundary."""
+    return F.mish(x)
+
+
+@native_mish.register_fake
+def fake_native_mish(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 @dataclass(frozen=True)
 class PackedRows:
     lengths: tuple[int, ...]
     starts_host: torch.Tensor
     row_ids: torch.Tensor
     positions: torch.Tensor
+    # note(ratish): plain ints, not read from lengths, so a compiled forward
+    # traces them as symbols instead of guarding on every row count.
+    row_count: int
+    width: int
 
     @property
     def total(self) -> int:
         return sum(self.lengths)
-
-    @property
-    def width(self) -> int:
-        return max(self.lengths)
 
 
 def pack_rows(lengths: Sequence[int], device: torch.device) -> PackedRows:
@@ -119,6 +133,8 @@ def pack_rows(lengths: Sequence[int], device: torch.device) -> PackedRows:
         starts_host=starts_host.to(torch.int32),
         row_ids=row_ids,
         positions=positions,
+        row_count=len(lengths),
+        width=max(lengths),
     )
 
 
@@ -134,9 +150,9 @@ def scatter_rows(packed: torch.Tensor, rows: PackedRows, width: int) -> torch.Te
     """(1, total, channels) -> (rows, width, channels), zero past each row's
     length."""
     channels = packed.shape[2]
-    flat = packed.new_zeros(len(rows.lengths) * width, channels)
+    flat = packed.new_zeros(rows.row_count * width, channels)
     flat[rows.row_ids * width + rows.positions] = packed[0]
-    return flat.view(len(rows.lengths), width, channels)
+    return flat.view(rows.row_count, width, channels)
 
 
 def chunk_causal_mask(
@@ -254,19 +270,6 @@ class RaggedRowAttention:
 PackedRowAttention = RowAttention | RaggedRowAttention
 
 
-class PackedBlockForward(Protocol):
-    """One DiT block over the packed sequence, eager or compiled."""
-
-    def __call__(
-        self,
-        block: torch.nn.Module,
-        h: torch.Tensor,
-        t: torch.Tensor,
-        rope: tuple[torch.Tensor, torch.Tensor],
-        attention: PackedRowAttention,
-    ) -> torch.Tensor: ...
-
-
 class PackedDiT:
     """DiT.forward over a packed sequence with the same modules in the same
     order; conv pos-emb stays padded, attention is ragged on FA3 half-precision
@@ -277,7 +280,7 @@ class PackedDiT:
         self.dit = dit
         device = torch.device(device)
         self.is_ragged = device.type == "cuda" and _is_fa3_supported()
-        self.block_forward: PackedBlockForward = forward_block
+        self.is_compiled = False
         logger.info(
             "Fun-CosyVoice3 Flow row attention on %s: %s",
             device,
@@ -300,7 +303,7 @@ class PackedDiT:
                 heads=attention.heads,
                 head_dim=attention.inner_dim // attention.heads,
             )
-            if self.block_forward is not forward_block:
+            if self.is_compiled:
                 dynamo.mark_dynamic(attention.page_table, (0, 1))
                 dynamo.mark_dynamic(attention.cu_seqlens_q, 0)
                 dynamo.mark_dynamic(attention.cache_seqlens, 0)
@@ -312,7 +315,8 @@ class PackedDiT:
         return RowAttention(rows, chunk_size=chunk_size, heads=attention.heads)
 
     def compile(self, dtype: torch.dtype | None) -> bool:
-        """Compile the block once for every block, hop and final; eager elsewhere."""
+        """Compile the forward once for hops and finals; the blocks inside it are
+        one nested region, traced once."""
         if not self.is_ragged or dtype not in FA3_DTYPES:
             logger.debug(
                 f"Skipping PackedDiT torch.compile (ragged={self.is_ragged}, dtype={dtype})"
@@ -320,17 +324,16 @@ class PackedDiT:
             return False
         else:
             pass
-        # note(ratish): one region per repeated block, as SGLang's regional compile,
-        # so Dynamo traces one block instead of all of them unrolled.
-        self.block_forward = torch.compile(
-            forward_block,
+        self.forward = torch.compile(
+            self.forward,
             backend="inductor",
             dynamic=True,
             fullgraph=True,
             options=dict(PACKED_INDUCTOR_OPTIONS),
         )
+        self.is_compiled = True
         logger.info(
-            "Compiled the Fun-CosyVoice3 PackedDiT block "
+            "Compiled the Fun-CosyVoice3 PackedDiT forward "
             f"(dynamic=True, fullgraph=True, emulate_precision_casts=True, dtype={dtype})"
         )
         return True
@@ -354,17 +357,23 @@ class PackedDiT:
         h = self.conv_pos_embed(h, rows) + h
         residual = h
         for block in dit.transformer_blocks:
-            h = self.block_forward(block, h, t, rope, attention)
+            h = forward_block(block, h, t, rope, attention)
         if dit.long_skip_connection is not None:
             h = dit.long_skip_connection(torch.cat((h, residual), dim=-1))
         else:
             pass
-        h = dit.norm_out(h, t)
+        norm_out = dit.norm_out
+        scale, shift = torch.chunk(norm_out.linear(norm_out.silu(t)), 2, dim=1)
+        h = layer_norm(norm_out.norm, h) * (1 + scale)[:, None, :] + shift[:, None, :]
         return dit.proj_out(h)
 
     def conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
-        padded = scatter_rows(h, rows, rows.width)
-        return gather_rows(self.dit.input_embed.conv_pos_embed(padded), rows)
+        """CausalConvPositionEmbedding.forward on the rows scattered padded."""
+        module = self.dit.input_embed.conv_pos_embed
+        x = scatter_rows(h, rows, rows.width).permute(0, 2, 1)
+        x = mish(module.conv1[0](F.pad(x, (module.kernel_size - 1, 0, 0, 0))))
+        x = mish(module.conv2[0](F.pad(x, (module.kernel_size - 1, 0, 0, 0))))
+        return gather_rows(x.permute(0, 2, 1), rows)
 
     def rope(self, rows: PackedRows) -> tuple[torch.Tensor, torch.Tensor]:
         """cos and sin, (1, total, rotary dims) each, in float32."""
@@ -374,6 +383,9 @@ class PackedDiT:
         return freqs.cos(), freqs.sin()
 
 
+# note(ratish): the blocks share one traced and compiled subgraph inside the
+# compiled forward, which then pays one guard check per step, not one per block.
+@torch.compiler.nested_compile_region
 def forward_block(
     block: torch.nn.Module,
     h: torch.Tensor,
@@ -406,12 +418,19 @@ def forward_block(
 
 
 def layer_norm(module: torch.nn.LayerNorm, h: torch.Tensor) -> torch.Tensor:
-    # note(ratish): Inductor rewrites the layer norm into its own arithmetic; the
-    # custom op keeps autocast's eager float32 kernel inside the compiled block.
+    # note(ratish): Inductor rewrites the layer norm and Mish into its own
+    # arithmetic; the custom ops keep the eager kernels inside the compiled forward.
     if torch.compiler.is_compiling():
         return native_layer_norm(h, module.normalized_shape[0], module.eps)
     else:
         return module(h)
+
+
+def mish(x: torch.Tensor) -> torch.Tensor:
+    if torch.compiler.is_compiling():
+        return native_mish(x)
+    else:
+        return F.mish(x)
 
 
 def rotate_in_place(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> None:
