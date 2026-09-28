@@ -101,10 +101,15 @@ def main() -> None:
         for warps, stages, split in itertools.product((4, 8), (2, 3, 4), (1, 2, 4, 8)):
             predictor_layer.NUM_WARPS = warps
             predictor_layer.NUM_STAGES = stages
-            talker.predictor_layer_shape = replace(shape, split_hidden=split)
+            talker.predictor_layer_shape = replace(
+                shape, split_hidden=split, split_qkv=split
+            )
             talker.predictor_partials = torch.zeros(
-                predictor_layer.partials_rows(talker.predictor_layer_shape, 64),
-                shape.hidden_size,
+                predictor_layer.partials_numel(talker.predictor_layer_shape, 64),
+                device=device,
+            )
+            talker.predictor_sum_sq_partials = torch.zeros(
+                predictor_layer.sum_sq_partials_numel(talker.predictor_layer_shape, 64),
                 device=device,
             )
             times = []
