@@ -111,45 +111,34 @@ def test_production_packed_dit_compile_matches_eager(streaming: bool) -> None:
     )
     estimator = PackedDiT(dit, device="cuda")
     assert estimator.is_ragged
-    assert estimator.compile(torch.bfloat16)
 
+    def run(rows, inputs) -> torch.Tensor:
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            return estimator.forward(
+                inputs["x"],
+                inputs["mu"],
+                inputs["spks"],
+                inputs["cond"],
+                inputs["t"],
+                rows,
+                estimator.row_attention(
+                    rows, streaming=streaming, dtype=torch.bfloat16
+                ),
+                estimator.rope(rows),
+            )
+
+    cases = []
     for lengths in ((11, 7), (13, 5, 9)):
         rows = pack_rows(lengths, torch.device("cuda"))
         inputs = {
-            "x": torch.randn(1, rows.total, 8, device="cuda", dtype=torch.bfloat16),
-            "mu": torch.randn(1, rows.total, 8, device="cuda", dtype=torch.bfloat16),
-            "spks": torch.randn(1, rows.total, 8, device="cuda", dtype=torch.bfloat16),
-            "cond": torch.randn(1, rows.total, 8, device="cuda", dtype=torch.bfloat16),
-            "t": torch.full((1,), 0.37, device="cuda", dtype=torch.bfloat16),
+            name: torch.randn(1, rows.total, 8, device="cuda", dtype=torch.bfloat16)
+            for name in ("x", "mu", "spks", "cond")
         }
+        inputs["t"] = torch.full((1,), 0.37, device="cuda", dtype=torch.bfloat16)
+        cases.append((rows, inputs, run(rows, inputs)))
 
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            eager_attention = estimator.row_attention(
-                rows, streaming=streaming, dtype=torch.bfloat16
-            )
-            eager = estimator.forward(
-                inputs["x"],
-                inputs["mu"],
-                inputs["spks"],
-                inputs["cond"],
-                inputs["t"],
-                rows,
-                eager_attention,
-            )
-            compiled_attention = estimator.row_attention(
-                rows, streaming=streaming, dtype=torch.bfloat16
-            )
-            compiled = estimator.forward_for_mode(
-                streaming,
-                attention=compiled_attention,
-            )(
-                inputs["x"],
-                inputs["mu"],
-                inputs["spks"],
-                inputs["cond"],
-                inputs["t"],
-                rows,
-                compiled_attention,
-            )
+    assert estimator.compile(torch.bfloat16)
+    for rows, inputs, eager in cases:
+        compiled = run(rows, inputs)
         torch.cuda.synchronize()
         assert torch.equal(compiled, eager)

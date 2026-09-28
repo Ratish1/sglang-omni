@@ -169,17 +169,13 @@ class FunCosyVoice3StreamingVocoderScheduler(
             pass
         item = self.make_warmup_flow_input()
         started = time.monotonic()
-        try:
-            with self.vocoder.stream_context:
-                self.vocoder.hop_batch([item])
-                self.vocoder.leftover_batch([item])
-        except Exception:
-            packed_estimator.disable_compile()
-            raise
+        with self.vocoder.stream_context:
+            self.vocoder.hop_batch([item])
+            self.vocoder.leftover_batch([item])
         logger.info(
-            f"Fun-CosyVoice3 PackedDiT causal/full compile warmup completed "
-            f"during process startup with torch_num_threads="
-            f"{torch.get_num_threads()} ({time.monotonic() - started:.1f} s)"
+            f"Fun-CosyVoice3 PackedDiT compile warmup, hop and final, with "
+            f"torch_num_threads={torch.get_num_threads()} "
+            f"({time.monotonic() - started:.1f} s)"
         )
 
     def make_warmup_flow_input(self) -> FlowBatchInput:
