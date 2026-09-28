@@ -76,7 +76,6 @@ COSYVOICE_INSTALL_HINT = (
     "in the serving environment before launching Fun-CosyVoice3."
 )
 
-CHUNK_MASK_COMPILE_DISABLED = False
 CAUSAL_CONV_CACHE_PATCHED = False
 
 FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
@@ -1190,75 +1189,54 @@ def compile_dit_backbone(
     else:
         pass
 
-    original_forward = estimator.forward
     torch._inductor.config.fx_graph_cache = True  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.accumulated_cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-    # note (guozhihao-224): inductor NaN-compares subsequent_chunk_mask in
-    # DiT.forward; keep the mask eager.
-    global CHUNK_MASK_COMPILE_DISABLED
-    if not CHUNK_MASK_COMPILE_DISABLED:
-        try:
-            import cosyvoice.flow.DiT.dit as dit_mod
-        except ImportError:
-            dit_mod = None
-        if dit_mod is not None:
-            dit_mod.add_optional_chunk_mask = torch.compiler.disable(
-                dit_mod.add_optional_chunk_mask
-            )
-            CHUNK_MASK_COMPILE_DISABLED = True
-        else:
-            pass
-    else:
-        pass
-    try:
-        estimator.forward = torch.compile(original_forward, dynamic=True)
-        # note(chenye): synthetic inputs must use the dtype serving presents to
-        # the estimator, including the effective autocast dtype.
-        param = next(flow.parameters())
-        device = param.device
-        parameter_dtype = param.dtype
-        warmup_dtype = autocast_dtype or parameter_dtype
-        mel_frame = int(warmup_mel_frames)
-        with torch.inference_mode():
-            for streaming in (False, True):
-                for _ in range(warmup_steps):
-                    # CFG batch 2; mel dim 80 matches pinned checkpoint proj_out.
-                    noisy_mel = torch.randn(
-                        2, 80, mel_frame, device=device, dtype=warmup_dtype
+    # note(ratish): SGLang's regional compile: the repeated blocks share one traced
+    # graph, and DiT.forward, with its chunk mask and RoPE, stays eager.
+    for block in estimator.transformer_blocks:
+        block.compile(dynamic=True)
+    # note(chenye): synthetic inputs must use the dtype serving presents to
+    # the estimator, including the effective autocast dtype.
+    param = next(flow.parameters())
+    device = param.device
+    parameter_dtype = param.dtype
+    warmup_dtype = autocast_dtype or parameter_dtype
+    mel_frame = int(warmup_mel_frames)
+    with torch.inference_mode():
+        for streaming in (False, True):
+            for _ in range(warmup_steps):
+                # CFG batch 2; mel dim 80 matches pinned checkpoint proj_out.
+                noisy_mel = torch.randn(
+                    2, 80, mel_frame, device=device, dtype=warmup_dtype
+                )
+                mel_mask = torch.ones(
+                    2, 1, mel_frame, device=device, dtype=warmup_dtype
+                )
+                token_condition = torch.randn(
+                    2, 80, mel_frame, device=device, dtype=warmup_dtype
+                )
+                flow_time = torch.zeros(1, device=device, dtype=warmup_dtype)
+                speaker_embedding = torch.randn(
+                    2, 80, device=device, dtype=warmup_dtype
+                )
+                prompt_mel = torch.randn(
+                    2, 80, mel_frame, device=device, dtype=warmup_dtype
+                )
+                with torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=autocast_dtype,
+                    enabled=autocast_dtype is not None,
+                ):
+                    estimator(
+                        noisy_mel,
+                        mel_mask,
+                        token_condition,
+                        flow_time,
+                        speaker_embedding,
+                        prompt_mel,
+                        streaming=streaming,
                     )
-                    mel_mask = torch.ones(
-                        2, 1, mel_frame, device=device, dtype=warmup_dtype
-                    )
-                    token_condition = torch.randn(
-                        2, 80, mel_frame, device=device, dtype=warmup_dtype
-                    )
-                    flow_time = torch.zeros(1, device=device, dtype=warmup_dtype)
-                    speaker_embedding = torch.randn(
-                        2, 80, device=device, dtype=warmup_dtype
-                    )
-                    prompt_mel = torch.randn(
-                        2, 80, mel_frame, device=device, dtype=warmup_dtype
-                    )
-                    with torch.autocast(
-                        device_type=current_platform.device_type,
-                        dtype=autocast_dtype,
-                        enabled=autocast_dtype is not None,
-                    ):
-                        estimator(
-                            noisy_mel,
-                            mel_mask,
-                            token_condition,
-                            flow_time,
-                            speaker_embedding,
-                            prompt_mel,
-                            streaming=streaming,
-                        )
-    except Exception as exc:
-        estimator.forward = original_forward
-        raise RuntimeError(
-            "Fun-CosyVoice3 native DiT torch.compile startup warmup failed"
-        ) from exc
     logger.info(
         "Compiled Fun-CosyVoice3 DiT backbone "
         f"(dynamic=True, autocast_dtype={autocast_dtype}, "
