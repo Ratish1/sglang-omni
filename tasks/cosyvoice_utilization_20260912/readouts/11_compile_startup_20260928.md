@@ -115,7 +115,18 @@ eager, both modes) passes on v5; 211 unit tests pass on the node.
 Open: buffered c16 and streaming c1 regress in serving while every isolated call is as fast or
 faster. h7 swaps the cards and logs recompiles in both servers.
 
-## 7. Not a problem
+## 7. v5 and v6 rejected; step 1 on main's compile structure
+
+v5/v6 regressed in serving because every nested region guards on the size of
+torch.utils._pytree.SUPPORTED_NODES, which the engine grows after the vocoder compiles (h8: buffered
+c16 -5.3 %, streaming c1 -6.8 %). Dropped. The plan, SGLang's compile mechanics read whole at
+v0.5.20, and the step 1 gates (d04f4400f to 36f14d351: the dynamic=True copy before FA3, found in
+Inductor's generated code; automatic dynamic; the eager FA3 dispatch) are in
+`tasks/cosyvoice-perf/COMPILE_2372.md`. At 36f14d351: warm startup 123.9 s against 149.1 s, one
+call equal or faster at every size compile on and off, h9 streaming c16 8.787 against 8.550 req/s
+with no recompile while serving.
+
+## 8. Not a problem
 
 OMP_NUM_THREADS=1 at spawn: Dynamo's GLOBAL_STATE guard includes num_threads (a 4 to 1 change
 recompiles, checked), and sglang's load_model sets one thread after the vocoder is built. The pin
