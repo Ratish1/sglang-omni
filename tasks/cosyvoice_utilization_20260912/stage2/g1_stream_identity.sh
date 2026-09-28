@@ -20,7 +20,7 @@
 #   MODE     streaming or buffered                              streaming
 #   SEED     sampling seed sent with every request, empty for    1234
 #            the benchmark's default, which sends none
-#   MODEL    checkpoint, a local directory                       /data/ms/.../master
+#   MODEL    checkpoint, a hub id or a local directory     FunAudioLLM/Fun-CosyVoice3-0.5B-2512
 #   SERVE    extra serve arguments, the same string on both arms  empty
 #   LEDGER   non empty makes it a profiling boot: the stage 0 call   empty
 #            ledger wraps the vocoder calls and writes one JSON line
@@ -46,20 +46,13 @@ LEDGER=${LEDGER:-}
 NSYS=${NSYS-}
 NSYS_WARMUP=${NSYS_WARMUP:-32}
 NSYS_TRACE=${NSYS_TRACE:-cuda,nvtx,osrt,python-gil}
-MODEL=${MODEL:-/data/ms/models/FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/master}
+MODEL=${MODEL:-FunAudioLLM/Fun-CosyVoice3-0.5B-2512}
 ANALYSIS_BRANCH=${ANALYSIS_BRANCH:-analysis/cosyvoice-utilization-20260912}
 # The checkpoint loader imports CosyVoice and its Matcha submodule, which the
 # container keeps as a clone rather than a wheel.
-COSYVOICE=${COSYVOICE:-/workspace/CosyVoice}
-
-# The checkpoint and the SeedTTS arrow are on disk; offline so a boot cannot
-# stall on the hub. The container exports a SOCKS proxy httpx prefers and then
-# wants socksio for, which is not installed.
-export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
-unset ALL_PROXY all_proxy
+COSYVOICE=${COSYVOICE:-/data/src/CosyVoice}
 
 cd "$REPO"
-source .venv/bin/activate
 mkdir -p .tmp
 grep -qx '.tmp/' .git/info/exclude 2>/dev/null || echo '.tmp/' >> .git/info/exclude
 
@@ -155,7 +148,7 @@ if [ -n "$NSYS" ]; then
     --cuda-graph-trace=node --trace-fork-before-exec=true"
 fi
 (cd "$TREE" && setsid bash -c "echo \$\$ > '$OUT/server.pgid'; exec env CUDA_VISIBLE_DEVICES=$CARD \
-  SGLANG_OMNI_STRICT_PORT=1 $LEDGER_ENV PYTHONPATH='$SERVER_PATH' $LAUNCH python -u -m sglang_omni.cli serve --model-path '$MODEL' --port $PORT $SERVE" \
+  SGLANG_OMNI_STRICT_PORT=1 $LEDGER_ENV PYTHONPATH='$SERVER_PATH' $LAUNCH python -u -m sglang_omni.cli serve --model-path '$MODEL' --host 127.0.0.1 --port $PORT $SERVE" \
   > "$OUT/serve.log" 2>&1 &)
 echo "$SERVE" > "$OUT/serve_args.txt"
 
