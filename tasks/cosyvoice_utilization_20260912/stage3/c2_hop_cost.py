@@ -102,6 +102,14 @@ def main() -> None:
             report[f"final rows={rows} tokens={HOP_TOKENS[-1]}"] = measure(
                 vocoder.leftover_batch, items
             )
+
+            def buffered(batch: list[FlowBatchInput]) -> list[torch.Tensor]:
+                with torch.autocast("cuda", dtype=vocoder.autocast_dtype):
+                    return vocoder.flow.inference(batch)
+
+            report[f"buffered rows={rows} tokens={HOP_TOKENS[-1]}"] = measure(
+                buffered, items
+            )
     for name, values in report.items():
         print(name, values)
     with open(args.out, "w") as handle:
