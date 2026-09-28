@@ -22,8 +22,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.runtime_context import get_context
 from torch.profiler import ProfilerActivity, profile
 
-from sglang_omni.models.qwen3_omni.components import predictor_layer
-from tests.unit_test.qwen3_omni.test_predictor_layer import (
+from sglang_omni.models.qwen3_omni.components import predictor_kernels
+from tests.unit_test.qwen3_omni.test_predictor_kernels import (
     Reference,
     build_talker,
     fuse,
@@ -55,11 +55,13 @@ def main() -> None:
     device = torch.device("cuda")
     talker = build_talker(device, seed=3)
     print(
-        torch.cuda.get_device_name(device), "triton", predictor_layer.triton.__version__
+        torch.cuda.get_device_name(device),
+        "triton",
+        predictor_kernels.triton.__version__,
     )
     for batch in BATCHES:
         steps = predictor_inputs(device, batch, seed=4)
-        talker.predictor_layer_shape = None
+        talker.predictor_fused = None
         plain_us, plain_launches, plain_by_name = kernel_time(
             lambda: run_sequence(talker, steps)
         )
@@ -70,7 +72,7 @@ def main() -> None:
         print(
             f"batch {batch:2d}: plain {plain_us:7.0f} us in {plain_launches:4d} launches;"
             f" fused {fused_us:7.0f} us in {fused_launches:4d} launches"
-            f" ({fused_us / plain_us:.2f}x time, shape {talker.predictor_layer_shape})"
+            f" ({fused_us / plain_us:.2f}x time, shape {talker.predictor_fused.shape})"
         )
         for label, by_name in (("plain", plain_by_name), ("fused", fused_by_name)):
             for name, us in sorted(by_name.items(), key=lambda item: -item[1])[:8]:
@@ -80,7 +82,7 @@ def main() -> None:
     )
     for batch in (1, 12):
         steps = predictor_inputs(device, batch, seed=4)
-        talker.predictor_layer_shape = None
+        talker.predictor_fused = None
         plain = run_sequence(talker, steps)
         fuse(talker)
         fused = run_sequence(talker, steps)
@@ -96,21 +98,16 @@ def main() -> None:
                 cache_len += step.shape[1]
         print(f"  batch {batch}: " + " ".join(rows))
     if "sweep" in sys.argv[1:]:
-        shape = talker.predictor_layer_shape
+        shape = talker.predictor_fused.shape
         results = []
         for warps, stages, split in itertools.product((4, 8), (2, 3, 4), (1, 2, 4, 8)):
-            predictor_layer.NUM_WARPS = warps
-            predictor_layer.NUM_STAGES = stages
-            talker.predictor_layer_shape = replace(
-                shape, split_hidden=split, split_qkv=split
-            )
-            talker.predictor_partials = torch.zeros(
-                predictor_layer.partials_numel(talker.predictor_layer_shape, 64),
-                device=device,
-            )
-            talker.predictor_sum_sq_partials = torch.zeros(
-                predictor_layer.sum_sq_partials_numel(talker.predictor_layer_shape, 64),
-                device=device,
+            predictor_kernels.NUM_WARPS = warps
+            predictor_kernels.NUM_STAGES = stages
+            talker.predictor_fused = predictor_kernels.FusedPredictorLayer(
+                replace(shape, split_hidden=split, split_qkv=split),
+                64,
+                device,
+                torch.bfloat16,
             )
             times = []
             for batch in (1, 12, 32):
