@@ -18,6 +18,10 @@ class TupleLinear(nn.Module):
         super().__init__()
         self.proj = nn.Linear(in_features, out_features, bias=False)
 
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.proj.weight
+
     def forward(self, hidden_states: torch.Tensor):
         return self.proj(hidden_states), None
 
@@ -86,6 +90,7 @@ def build_real_step_predictor_graph_talker(
     talker.predictor_pair_positions = talker.predictor_positions[:2].repeat(
         max_batch_size
     )
+    talker.predictor_layer_shape = None
     talker.predictor_o_proj_transposed = False
     talker.predictor_o_proj_weights_t = []
     talker.predictor_exact_add_norm = False

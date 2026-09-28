@@ -240,6 +240,7 @@ def layout_talker(device: torch.device) -> Qwen3OmniTalker:
         dtype=LAYOUT_DTYPE,
     )
     talker.predictor_v_cache = torch.zeros_like(talker.predictor_k_cache)
+    talker.predictor_layer_shape = None
     talker.predictor_o_proj_transposed = False
     talker.predictor_o_proj_weights_t = []
     talker.predictor_exact_add_norm = False
