@@ -30,6 +30,8 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from triton.language.extra import libdevice
 
+from sglang_omni.platforms import current_platform
+
 HIDDEN_SIZE = 1024
 LANES = 32
 VEC = 8
@@ -104,7 +106,10 @@ def supports_exact_add_rmsnorm(
 ) -> bool:
     """The kernel reproduces flashinfer's tree for the predictor's shape only."""
     return (
-        hidden_size == HIDDEN_SIZE and dtype == torch.bfloat16 and device.type == "cuda"
+        hidden_size == HIDDEN_SIZE
+        and dtype == torch.bfloat16
+        and device.type == "cuda"
+        and current_platform.is_cuda()
     )
 
 
