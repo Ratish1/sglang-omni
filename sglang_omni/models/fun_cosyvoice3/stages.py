@@ -2241,6 +2241,10 @@ def create_vocoder_executor(
         pass
 
     if enable_dit_torch_compile:
+        # note(ratish): the engine's model registry registers pytree nodes on import;
+        # the compiled graphs guard on that registry, so it has to be final first.
+        import sglang.srt.models.registry  # noqa: F401  # imported for its registrations
+
         compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
     else:
         pass
