@@ -143,6 +143,8 @@ echo "out $OUT"
 # note(ratish): without the strict port the server takes any free port when
 # this one is held, and the client then polls the asked for port until it times
 # out. Fail loudly on a clash instead.
+# The previous point's server may still hold the port while it shuts down.
+until ! (echo > "/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; do sleep 2; done
 LAUNCH=""
 if [ -n "$NSYS" ]; then
   # The traced APIs are an application scope option, so they go on launch; the
