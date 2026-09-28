@@ -70,7 +70,52 @@ entries per call, about 135 us each, against 10 on main) and +69 kernels per ste
 more device time (eager prologue and epilogue; on the native path the per block attention mask
 work that a whole forward compile shares across the 22 blocks).
 
-## 6. Not a problem
+## 6. Whole forward compile, repeated block traced once (v5, 4a4318b17)
+
+Packed: PackedDiT.forward compiled whole with the block as torch.compiler.nested_compile_region,
+inlined back into one flat graph (dynamo.config.inline_invoke_subgraph); RoPE computed once per
+Flow call outside the graph (the AOT cache then hits); one forward, the conv position embed,
+the norms and Mish written once with custom ops chosen under torch.compiler.is_compiling(); one
+contract for hops and finals; automatic dynamic, warmed on two batch shapes. Native: DiT.forward
+compiled whole with DiTBlock.forward as one nested region (bound per instance), the chunk mask
+compiled (no graph break, no restart), automatic dynamic, warmed on two batch and frame sizes.
+
+Dead ends on the way, torch 2.13: nested regions under dynamic=True fail (KeyError on the
+symbolic hidden size; the layer norm eps becomes SymFloat); a nested region with a graph break
+inside fails (KeyError); a nested region left as a called subgraph costs about 1.7 ms of host time
+per step (v3).
+
+Startup, vocoder build (stage3/c1_compile_startup.py):
+
+| build | warm | cold |
+|---|---|---|
+| main | 148 s | 216 s |
+| v5 | 70.4 s (native 29.5, packed 17.6, capture 11.4) | 141.3 s |
+| compile off | 45 s | 45 s |
+
+One Flow call (stage3/c2_hop_cost.py), v5 against main: packed hop and final equal at 1 row
+(53.5 against 53.5 ms) and 1.5 to 2 % faster at 16 rows; buffered 150.0 against 169.7 ms at
+16 x 356, and 245.7 against 283.5 ms (16 x 576), 80.4 against 91.6 ms (5 x 544, replayed).
+
+h6, main 7dc8909e7 against v5, same time, full set, compile on both:
+
+| point | main | v5 |
+|---|---|---|
+| streaming c16 req/s | 8.605 | 8.780 (+2.0 %), latency p95 2.38 against 2.65 s |
+| buffered c16 req/s | 14.353 | 13.290 (-7.4 %) |
+| streaming c1 req/s | 2.080 | 1.973 (-5.1 %) |
+| buffered c1 req/s | 2.245 | 2.229 |
+
+Identity: streaming c1 61 of 64 (two AR length changes, one sample with a whole file difference of
+at most 0.0015 on near silence); buffered c1 0 of 64, as expected: the native compile is inexact
+against eager on both trees (max abs 1.7 on main, the same order between main and v5), so that
+path needs WER and similarity, not byte identity. The packed GPU parity test (torch.equal against
+eager, both modes) passes on v5; 211 unit tests pass on the node.
+
+Open: buffered c16 and streaming c1 regress in serving while every isolated call is as fast or
+faster. h7 swaps the cards and logs recompiles in both servers.
+
+## 7. Not a problem
 
 OMP_NUM_THREADS=1 at spawn: Dynamo's GLOBAL_STATE guard includes num_threads (a 4 to 1 change
 recompiles, checked), and sglang's load_model sets one thread after the vocoder is built. The pin
