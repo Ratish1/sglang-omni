@@ -160,12 +160,21 @@ echo "$SERVE" > "$OUT/serve_args.txt"
 # so an arm that boots slower (a compile) never runs beside the other's benchmark.
 if [ -n "$BARRIER" ]; then
   until curl -sf "http://127.0.0.1:$PORT/health" > /dev/null; do
-    kill -0 -- "-$(cat "$OUT/server.pgid")" 2>/dev/null || { echo "server exited"; exit 1; }
-    sleep 2
+    if ! kill -0 -- "-$(cat "$OUT/server.pgid")" 2>/dev/null; then
+      mkdir -p "$BARRIER/failed" && echo "server exited" && exit 1
+    else
+      sleep 2
+    fi
   done
   echo "ready $(date -u +%H:%M:%S)"
   touch "$BARRIER/$ARM"
-  until [ "$(ls "$BARRIER" | wc -l)" -ge "$PEERS" ]; do sleep 1; done
+  until [ "$(ls "$BARRIER" | wc -l)" -ge "$PEERS" ]; do
+    if [ -d "$BARRIER/failed" ]; then
+      echo "peer failed" && exit 1
+    else
+      sleep 1
+    fi
+  done
   echo "barrier passed $(date -u +%H:%M:%S)"
 fi
 
