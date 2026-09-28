@@ -22,6 +22,8 @@
 #            the benchmark's default, which sends none
 #   MODEL    checkpoint, a hub id or a local directory     FunAudioLLM/Fun-CosyVoice3-0.5B-2512
 #   SERVE    extra serve arguments, the same string on both arms  empty
+#   BARRIER  directory the arms of a pair meet in once their         empty
+#            servers answer /health; PEERS arms must arrive            2
 #   LEDGER   non empty makes it a profiling boot: the stage 0 call   empty
 #            ledger wraps the vocoder calls and writes one JSON line
 #            per call under the run's ledger directory
@@ -39,6 +41,8 @@ SEED=${SEED-1234}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-}
 SERVE=${SERVE:-}
 LEDGER=${LEDGER:-}
+BARRIER=${BARRIER:-}
+PEERS=${PEERS:-2}
 # A session name turns the arm into an Nsight capture: the server launches under
 # nsys and the runner opens the window around the measured benchmark only. The
 # metric device is the nsys ordinal, which is the physical card, not the ordinal
@@ -151,6 +155,19 @@ fi
   SGLANG_OMNI_STRICT_PORT=1 $LEDGER_ENV PYTHONPATH='$SERVER_PATH' $LAUNCH python -u -m sglang_omni.cli serve --model-path '$MODEL' --host 127.0.0.1 --port $PORT $SERVE" \
   > "$OUT/serve.log" 2>&1 &)
 echo "$SERVE" > "$OUT/serve_args.txt"
+
+# With a barrier the client starts only once every arm's server answers /health,
+# so an arm that boots slower (a compile) never runs beside the other's benchmark.
+if [ -n "$BARRIER" ]; then
+  until curl -sf "http://127.0.0.1:$PORT/health" > /dev/null; do
+    kill -0 -- "-$(cat "$OUT/server.pgid")" 2>/dev/null || { echo "server exited"; exit 1; }
+    sleep 2
+  done
+  echo "ready $(date -u +%H:%M:%S)"
+  touch "$BARRIER/$ARM"
+  until [ "$(ls "$BARRIER" | wc -l)" -ge "$PEERS" ]; do sleep 1; done
+  echo "barrier passed $(date -u +%H:%M:%S)"
+fi
 
 cd "$REPO/.tmp/wt/analysis"
 # An empty SAMPLES omits the flag, which is what selects the whole split.

@@ -34,6 +34,8 @@ for point in $POINTS; do
   IFS=: read -r mode conc samples <<< "$point"
   name="$mode-c$conc"
   echo "point $name start $(date -u +%H:%M:%S)"
+  export BARRIER="$REPO/.tmp/barrier/$TAG-$name"
+  rm -rf "$BARRIER" && mkdir -p "$BARRIER"
   # The arms share the repo's git state while they set their worktrees up, so
   # the second one starts once the first is past that.
   # CAPTURE non empty makes both arms Nsight captures, one session per arm.
