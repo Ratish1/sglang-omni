@@ -309,11 +309,13 @@ class PackedDiT:
                 head_dim=attention.inner_dim // attention.heads,
             )
             if self.is_compiled:
-                dynamo.mark_dynamic(attention.page_table, (0, 1))
-                dynamo.mark_dynamic(attention.cu_seqlens_q, 0)
-                dynamo.mark_dynamic(attention.cache_seqlens, 0)
-                dynamo.mark_dynamic(rows.row_ids, 0)
-                dynamo.mark_dynamic(rows.positions, 0)
+                # note(ratish): a hint, not a constraint; the total frames of x are
+                # specialized on the first call, and these share that size.
+                dynamo.maybe_mark_dynamic(attention.page_table, (0, 1))
+                dynamo.maybe_mark_dynamic(attention.cu_seqlens_q, 0)
+                dynamo.maybe_mark_dynamic(attention.cache_seqlens, 0)
+                dynamo.maybe_mark_dynamic(rows.row_ids, 0)
+                dynamo.maybe_mark_dynamic(rows.positions, 0)
             else:
                 pass
             return attention
