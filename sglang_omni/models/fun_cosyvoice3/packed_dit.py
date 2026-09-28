@@ -324,6 +324,9 @@ class PackedDiT:
             return False
         else:
             pass
+        # note(ratish): Dynamo traces the block once, then inlines its 22 calls into
+        # one flat graph; a called subgraph costs host time on every step.
+        dynamo.config.inline_invoke_subgraph = True
         # note(ratish): automatic dynamic, as SGLang's install_torch_compiled; with
         # dynamic=True the nested region cannot stamp out the block (symbolic
         # hidden size, symbolic layer norm eps).
