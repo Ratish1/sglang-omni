@@ -65,7 +65,8 @@ def main() -> None:
     start = time.perf_counter()
     stages.create_vocoder_executor(
         args.model,
-        device="cuda:0",
+        device="cuda",
+        gpu_id=0,
         enable_dit_torch_compile=not args.no_compile,
         flow_cuda_graph_capture_shapes=FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
     )
