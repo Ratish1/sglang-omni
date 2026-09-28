@@ -23,12 +23,7 @@ FA3_DTYPES = (torch.float16, torch.bfloat16)
 PACKED_INDUCTOR_OPTIONS: dict[str, bool] = {"emulate_precision_casts": True}
 
 
-@torch.library.custom_op(
-    "sglang_omni_fun_cosyvoice3::packed_fa3",
-    mutates_args=(),
-    device_types="cuda",
-)
-def packed_fa3(
+def ragged_fa3(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -37,7 +32,6 @@ def packed_fa3(
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
 ) -> torch.Tensor:
-    """Alias-free FA3 boundary for the compiled PackedDiT path."""
     return flash_attn_with_kvcache(
         q=q,
         k_cache=k_cache,
@@ -48,6 +42,13 @@ def packed_fa3(
         max_seqlen_q=max_seqlen_q,
         causal=False,
     )
+
+
+# note(ratish): the compiled forward calls FA3 through this alias-free op; eager
+# calls ragged_fa3 directly, which skips the custom op dispatch on every block.
+packed_fa3 = torch.library.custom_op(
+    "sglang_omni_fun_cosyvoice3::packed_fa3", mutates_args=(), device_types="cuda"
+)(ragged_fa3)
 
 
 @packed_fa3.register_fake
@@ -255,7 +256,11 @@ class RaggedRowAttention:
         """query, key, value: (1, total, heads * head_dim). Returns the same
         shape."""
         page_shape = (-1, FA3_PAGE_SIZE, self.heads, self.head_dim)
-        out = packed_fa3(
+        if torch.compiler.is_compiling():
+            fa3 = packed_fa3
+        else:
+            fa3 = ragged_fa3
+        out = fa3(
             query[0].reshape(-1, self.heads, self.head_dim),
             key[0].reshape(page_shape),
             value[0].reshape(page_shape),
@@ -393,7 +398,16 @@ class PackedDiT:
         freqs, scale = self.dit.rotary_embed.forward_from_seq_len(rows.width)
         assert not isinstance(scale, torch.Tensor), "the DiT's RoPE has no xpos scale"
         freqs = freqs[:, rows.positions]
-        return freqs.cos(), freqs.sin()
+        cos, sin = freqs.cos(), freqs.sin()
+        if self.is_compiled:
+            # note(ratish): the rotary width is fixed by the checkpoint; as a symbol
+            # it stops Inductor fusing the in place rotation, which then rebuilds
+            # the whole query and key with a second copy kernel on every block.
+            dynamo.mark_static(cos, 2)
+            dynamo.mark_static(sin, 2)
+        else:
+            pass
+        return cos, sin
 
     @staticmethod
     def attend(
