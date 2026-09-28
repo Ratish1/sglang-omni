@@ -48,7 +48,29 @@ before the capture, which hides it. Fix: one gc.collect() before the capture, as
 codec capture does (fix/cosyvoice-flow-capture-gc 8ba709c6b). Confirmed: the compile off arm of
 h4 boots on it.
 
-## 4. Not a problem
+## 4. What the compile buys (h4: one revision 8ba709c6b, compile off against on, same time, full set)
+
+| point | compile off | compile on | delta |
+|---|---|---|---|
+| streaming c16 req/s | 7.563 | 8.903 | +17.7 % |
+| streaming c16 RTF / TTFP mean | 0.478 / 0.999 s | 0.407 / 0.827 s | |
+| buffered c16 req/s | 10.184 | 14.695 | +44.3 % |
+| buffered c16 RTF / latency p95 | 0.351 / 2.16 s | 0.241 / 1.49 s | |
+
+Seeded c1 streaming 57 of 64 byte identical, the rest AR token changes (lengths differ).
+Both compiles pay for themselves: the fix has to keep the kernels and drop the startup.
+
+## 5. First fix attempt: per block regional compile (9505bc641), rejected
+
+Startup 216 s cold and 148 s warm on main, 40 s and 34 s here (2 graphs, no recompile, no break).
+But h5 (main+gc 8ba709c6b against it, same time, full set): streaming c16 8.898 against 8.119
+(-8.8 %), buffered c16 14.424 against 12.853 (-10.9 %), streaming c1 2.099 against 1.744.
+One Flow call (stage3/c2_hop_cost.py): +30 ms of host time per call (220 compiled region
+entries per call, about 135 us each, against 10 on main) and +69 kernels per step with 7 to 26 %
+more device time (eager prologue and epilogue; on the native path the per block attention mask
+work that a whole forward compile shares across the 22 blocks).
+
+## 6. Not a problem
 
 OMP_NUM_THREADS=1 at spawn: Dynamo's GLOBAL_STATE guard includes num_threads (a 4 to 1 change
 recompiles, checked), and sglang's load_model sets one thread after the vocoder is built. The pin
