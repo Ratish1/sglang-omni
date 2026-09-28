@@ -98,13 +98,14 @@ def main() -> None:
     if "sweep" in sys.argv[1:]:
         shape = talker.predictor_layer_shape
         results = []
-        for warps, stages, block_hidden, block_intermediate in itertools.product(
-            (4, 8), (2, 3, 4), (16, 32, 64), (16, 32, 64)
-        ):
+        for warps, stages, split in itertools.product((4, 8), (2, 3, 4), (1, 2, 4, 8)):
             predictor_layer.NUM_WARPS = warps
             predictor_layer.NUM_STAGES = stages
-            talker.predictor_layer_shape = replace(
-                shape, block_hidden=block_hidden, block_intermediate=block_intermediate
+            talker.predictor_layer_shape = replace(shape, split_hidden=split)
+            talker.predictor_partials = torch.zeros(
+                predictor_layer.partials_rows(talker.predictor_layer_shape, 64),
+                shape.hidden_size,
+                device=device,
             )
             times = []
             for batch in (1, 12, 32):
@@ -112,20 +113,16 @@ def main() -> None:
                 times.append(
                     kernel_time(lambda: run_sequence(talker, steps), iters=10)[0]
                 )
-            results.append((warps, stages, block_hidden, block_intermediate, times))
+            results.append((warps, stages, split, times))
             print(
-                f"warps {warps} stages {stages} block_hidden {block_hidden:3d}"
-                f" block_intermediate {block_intermediate:3d}:"
+                f"warps {warps} stages {stages} split {split}:"
                 + "".join(f" {t:7.0f}" for t in times),
                 flush=True,
             )
         print("best by the sum over batches:")
-        for warps, stages, block_hidden, block_intermediate, times in sorted(
-            results, key=lambda r: sum(r[4])
-        )[:8]:
+        for warps, stages, split, times in sorted(results, key=lambda r: sum(r[3]))[:8]:
             print(
-                f"  warps {warps} stages {stages} block_hidden {block_hidden:3d}"
-                f" block_intermediate {block_intermediate:3d}:"
+                f"  warps {warps} stages {stages} split {split}:"
                 + "".join(f" {t:7.0f}" for t in times)
             )
     else:
