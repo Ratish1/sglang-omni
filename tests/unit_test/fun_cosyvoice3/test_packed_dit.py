@@ -235,14 +235,15 @@ def test_packed_compile_requires_ragged_half_precision(monkeypatch) -> None:
     assert not estimator.compile(torch.float32)
     assert compile_options == []
     assert estimator.compile(torch.bfloat16)
-    assert len(compile_options) == 1
-    assert all(
-        call["backend"] == "inductor"
-        and call["dynamic"] is True
-        and call["fullgraph"] is True
-        and call["options"]["emulate_precision_casts"] is True
-        for call in compile_options
-    )
+    assert estimator.is_compiled
+    # Automatic dynamic: the head count and head size must stay static.
+    assert compile_options == [
+        {
+            "backend": "inductor",
+            "fullgraph": True,
+            "options": {"emulate_precision_casts": True},
+        }
+    ]
 
 
 def test_a_wide_row_does_not_change_the_rows_packed_beside_it() -> None:

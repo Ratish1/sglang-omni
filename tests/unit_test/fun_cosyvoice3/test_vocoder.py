@@ -130,7 +130,10 @@ def test_packed_dit_compile_warmup_materializes_serving_variants() -> None:
 
     scheduler.warmup_packed_dit_compile()
 
-    assert len(hop_batches) == len(leftover_batches) == 1
+    # A second batch of another row count and length makes those sizes symbolic.
+    assert [len(batch) for batch in hop_batches] == [1, 2]
+    assert [len(batch) for batch in leftover_batches] == [1, 2]
+    assert hop_batches[1][0].token.shape != hop_batches[1][1].token.shape
 
 
 def test_packed_dit_compile_warmup_failure_fails_startup() -> None:

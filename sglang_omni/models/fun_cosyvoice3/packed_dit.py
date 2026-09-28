@@ -330,17 +330,19 @@ class PackedDiT:
             return False
         else:
             pass
+        # note(ratish): automatic dynamic, not dynamic=True: that also makes the head
+        # count and head size symbols, and the reshape into FA3's layout then copies
+        # the whole query and key on every block.
         self.forward = torch.compile(
             self.forward,
             backend="inductor",
-            dynamic=True,
             fullgraph=True,
             options=dict(PACKED_INDUCTOR_OPTIONS),
         )
         self.is_compiled = True
         logger.info(
             "Compiled the Fun-CosyVoice3 PackedDiT forward "
-            f"(dynamic=True, fullgraph=True, emulate_precision_casts=True, dtype={dtype})"
+            f"(fullgraph=True, emulate_precision_casts=True, dtype={dtype})"
         )
         return True
 
@@ -398,16 +400,7 @@ class PackedDiT:
         freqs, scale = self.dit.rotary_embed.forward_from_seq_len(rows.width)
         assert not isinstance(scale, torch.Tensor), "the DiT's RoPE has no xpos scale"
         freqs = freqs[:, rows.positions]
-        cos, sin = freqs.cos(), freqs.sin()
-        if self.is_compiled:
-            # note(ratish): the rotary width is fixed by the checkpoint; as a symbol
-            # it stops Inductor fusing the in place rotation, which then rebuilds
-            # the whole query and key with a second copy kernel on every block.
-            dynamo.mark_static(cos, 2)
-            dynamo.mark_static(sin, 2)
-        else:
-            pass
-        return cos, sin
+        return freqs.cos(), freqs.sin()
 
     @staticmethod
     def attend(
