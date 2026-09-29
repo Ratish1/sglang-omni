@@ -49,6 +49,10 @@ import threading
 
 ENABLED = os.environ.get("OMNI_PIPE_NVTX") == "1"
 LINES = os.environ.get("OMNI_PIPE_LINES", "")
+# what-if, not a probe: OMNI_WHATIF_FOLLOWUP_PRIORITY=least runs the follow-up vocoder
+# decodes at the device's lowest stream priority, the level of the engine's default
+# stream, while initial decodes keep theirs
+WHATIF_FOLLOWUP = os.environ.get("OMNI_WHATIF_FOLLOWUP_PRIORITY", "")
 ROOTS = (
     "sglang_omni/",
     "sglang/",
@@ -551,6 +555,39 @@ def patch_vocoder(module):
     handle.resolve_partial = ranged(handle.resolve_partial, fixed("voc.resolve"))
 
 
+def whatif_followup_priority(module):
+    import torch
+
+    scheduler = module.Qwen3TTSStreamingVocoderScheduler
+    serving_start = scheduler.on_serving_start
+
+    @functools.wraps(serving_start)
+    def serving_start_low(self):
+        streams = getattr(self, "followup_decode_streams", ())
+        if streams:
+            least, _ = torch.cuda.Stream.priority_range()
+            self.followup_decode_streams = tuple(
+                torch.cuda.Stream(device=self.device, priority=least) for _ in streams
+            )
+            self.followup_decode_stream = self.followup_decode_streams[0]
+            print(
+                f"whatif follow-up streams at priority {least}, initial stays "
+                f"{self.decode_stream.priority}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return serving_start(self)
+
+    scheduler.on_serving_start = serving_start_low
+
+
+def patch_vocoder_and_whatif(module):
+    if ENABLED:
+        patch_vocoder(module)
+    if WHATIF_FOLLOWUP == "least":
+        whatif_followup_priority(module)
+
+
 PATCHES = {
     "torch": patch_torch,
     "torch.cuda.graphs": patch_graphs,
@@ -564,8 +601,12 @@ PATCHES = {
     "sglang_omni.model_runner.model_worker": patch_worker,
     "sglang_omni.models.qwen3_tts.model_runner": patch_qwen_runner,
     "sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph": patch_runner,
-    "sglang_omni.models.qwen3_tts.streaming_vocoder": patch_vocoder,
+    "sglang_omni.models.qwen3_tts.streaming_vocoder": patch_vocoder_and_whatif,
 }
+if not ENABLED:
+    PATCHES = {
+        "sglang_omni.models.qwen3_tts.streaming_vocoder": patch_vocoder_and_whatif
+    }
 
 
 class PatchOnImport(importlib.abc.MetaPathFinder):
@@ -589,6 +630,11 @@ class PatchOnImport(importlib.abc.MetaPathFinder):
         return spec
 
 
-if ENABLED:
+if ENABLED or WHATIF_FOLLOWUP:
     sys.meta_path.insert(0, PatchOnImport())
-    print(f"pipeline_nvtx on, lines={LINES or 'off'}", file=sys.stderr, flush=True)
+    print(
+        f"pipeline_nvtx {'on' if ENABLED else 'off'}, lines={LINES or 'off'}, "
+        f"whatif follow-up priority={WHATIF_FOLLOWUP or 'off'}",
+        file=sys.stderr,
+        flush=True,
+    )
