@@ -24,6 +24,7 @@ from pathlib import Path
 ARMS = (
     "seedtts_en",
     "seedtts_en_nostream",
+    "seedtts_en_seeded",
     "mmmu",
     "mmmu_talker",
     "mmsu",
@@ -35,7 +36,9 @@ ARMS = (
     "speech_identity",
 )
 # speech_identity: the request seed also seeds the talker, whose default seed hashes the
-# server's random request id; any fixed value works as long as both arms use it
+# server's random request id; any fixed value works as long as both arms use it.
+# seedtts_en_seeded: the streaming SeedTTS arm with that seed on every request, for a
+# whole-corpus identity pass at concurrency 1 (identity_compare.py), not for timing
 SPEECH_IDENTITY_SEED = 1234
 SPEECH_IDENTITY_TEXT_PROMPTS = (
     "Name three primary colors.",
@@ -153,7 +156,7 @@ async def generate(
     if arm == "speech_identity":
         return await seeded_speech_requests(port, out, max_samples or 5)
     talker = arm.endswith("_talker")
-    if arm in ("seedtts_en", "seedtts_en_nostream"):
+    if arm in ("seedtts_en", "seedtts_en_nostream", "seedtts_en_seeded"):
         from benchmarks.eval.benchmark_omni_seedtts import (
             OmniSeedttsBenchmarkConfig,
             run_omni_seedtts_benchmark,
@@ -166,12 +169,13 @@ async def generate(
             port=port,
             lang="en",
             voice_clone=True,
-            stream=arm == "seedtts_en",
+            stream=arm != "seedtts_en_nostream",
             output_dir=out,
             warmup=1,
             max_concurrency=concurrency,
             max_samples=max_samples,
             disable_tqdm=True,
+            seed=SPEECH_IDENTITY_SEED if arm == "seedtts_en_seeded" else None,
         )
         return await run_omni_seedtts_benchmark(config)
     if arm.startswith("mmmu"):
