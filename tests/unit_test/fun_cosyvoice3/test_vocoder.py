@@ -1126,7 +1126,7 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
     assert ("packed_warmup" in startup_events) is enable_dit_torch_compile
 
 
-def test_create_vocoder_executor_trt_alone_skips_the_default_compile(
+def test_create_vocoder_executor_trt_without_compile_skips_the_compile(
     monkeypatch,
 ) -> None:
     compiled, _scheduler = create_scheduler_recording_native_compile(
@@ -1298,7 +1298,6 @@ def test_pipeline_config_sets_flow_batch_admission_by_default() -> None:
         "max_batch_size": 16,
         "max_batch_wait_ms": 30,
         "enable_flow_cuda_graph": True,
-        "enable_dit_torch_compile": True,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,
