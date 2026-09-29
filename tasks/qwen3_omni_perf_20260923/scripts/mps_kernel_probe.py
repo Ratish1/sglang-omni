@@ -14,7 +14,7 @@ import os
 
 import torch
 
-LAUNCHES = 1000
+LAUNCHES = 200
 REPLAYS = 20
 
 
@@ -64,6 +64,52 @@ def main() -> None:
         "fa3 decode 1 x 512 us "
         f"{per_launch_us(lambda: flash_attn_with_kvcache(q=q, k_cache=k_cache, v_cache=v_cache, page_table=page_table, cache_seqlens=cache_seqlens, causal=True)):.2f}"
     )
+    print(
+        f"sglang fused_experts M=1, a PDL chain of seven kernels, us {moe_chain_us():.2f}"
+    )
+
+
+def moe_chain_us() -> float:
+    from sglang.srt.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29652")
+    init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
+    initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        expert_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        backend="gloo",
+    )
+    device = torch.device("cuda")
+    w13 = (torch.randn(128, 1536, 2048, device=device) * 0.02).to(torch.bfloat16)
+    w2 = (torch.randn(128, 2048, 768, device=device) * 0.02).to(torch.bfloat16)
+    x = torch.randn(1, 2048, device=device).to(torch.bfloat16)
+    logits = torch.randn(1, 128, device=device).to(torch.bfloat16)
+    top, ids = torch.topk(logits.float(), 8, dim=-1)
+    topk_output = StandardTopKOutput(
+        topk_weights=torch.softmax(top, dim=-1),
+        topk_ids=ids.to(torch.int32),
+        router_logits=logits,
+    )
+    config = MoeRunnerConfig(
+        num_experts=128,
+        top_k=8,
+        hidden_size=2048,
+        intermediate_size_per_partition=768,
+        params_dtype=torch.bfloat16,
+        activation="silu",
+        inplace=False,
+    )
+    return per_launch_us(lambda: fused_experts(x, w13, w2, topk_output, config))
 
 
 if __name__ == "__main__":
