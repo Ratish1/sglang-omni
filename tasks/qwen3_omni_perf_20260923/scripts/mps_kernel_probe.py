@@ -132,6 +132,18 @@ def main() -> None:
     graph = capture(mixed, rounds)
     print(f"mixed round of all us {per_launch_us(graph, rounds):.2f}")
     print(kernel_means(graph, rounds))
+    # the split decode attention right after one other body, pair after pair: which
+    # predecessor makes it slow
+    for name in list(bodies)[:4]:
+
+        def pair(before=bodies[name]) -> None:
+            before()
+            decode_attention()
+
+        rounds = LAUNCHES // 2
+        graph = capture(pair, rounds)
+        print(f"after {name}: pair us {per_launch_us(graph, rounds):.2f}")
+        print(kernel_means(graph, rounds))
     print(sm_reach(props.multi_processor_count))
     print(pdl_early_start(props.multi_processor_count))
 
