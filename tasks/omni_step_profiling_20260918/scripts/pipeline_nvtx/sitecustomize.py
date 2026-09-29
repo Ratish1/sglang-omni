@@ -308,9 +308,20 @@ def patch_builders(module):
     module.adopt_prepared_tensors = ranged(
         module.adopt_prepared_tensors, fixed("sched.adopt")
     )
-    module.stream_output_builder = ranged(
-        module.stream_output_builder, fixed("sched.stream_builder")
-    )
+    make_adapters = module.make_qwen3_tts_scheduler_adapters
+
+    @functools.wraps(make_adapters)
+    def make_adapters_ranged(*args, **kwargs):
+        request_builder, result_adapter, stream_output_builder = make_adapters(
+            *args, **kwargs
+        )
+        return (
+            request_builder,
+            result_adapter,
+            ranged(stream_output_builder, fixed("sched.stream_builder")),
+        )
+
+    module.make_qwen3_tts_scheduler_adapters = make_adapters_ranged
     encode_one = hook.encode_one
 
     def encode_one_ranged(self, item):
