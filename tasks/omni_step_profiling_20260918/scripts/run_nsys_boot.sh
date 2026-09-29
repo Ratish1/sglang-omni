@@ -24,10 +24,19 @@ echo "start $(date +%T)" > "$OUT/progress.txt"
 # GPU metrics sampling (--gpu-metrics-devices=cuda-visible --gpu-metrics-set=<arch>) needs
 # a privileged container; pass it through NSYS_ARGS where it is allowed
 NSYS_ARGS=${NSYS_ARGS:---trace=cuda,nvtx --cuda-graph-trace=node --sample=none --cpuctxsw=none}
+#NSYS_ARGS=none serves without nsys: the clean boot of the same cell
+if [ "$NSYS_ARGS" = none ]; then
+  WRAP=""
+else
+  WRAP="nsys profile -o $OUT/serve --force-overwrite=true $NSYS_ARGS"
+fi
 cat /proc/loadavg > "$OUT/loadavg_before.txt"
+(while true; do cat /proc/loadavg; sleep 30; done) > "$OUT/loadavg.log" 2>&1 &
+LOADS=$!
+nvidia-smi dmon -i "$CARD" -s pucm -d 1 > "$OUT/dmon.log" 2>&1 &
+DMON=$!
 env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE${PROBE_PATH:+:$PROBE_PATH} ${PROBE_ENV:-} \
-  nsys profile -o "$OUT/serve" --force-overwrite=true $NSYS_ARGS \
-  $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT ${SERVE_ARGS:-} > "$OUT/serve.log" 2>&1 &
+  $WRAP $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $PORT ${SERVE_ARGS:-} > "$OUT/serve.log" 2>&1 &
 NSYS_PID=$!
 echo "serve args: ${SERVE_ARGS:-}" >> "$OUT/progress.txt"
 
@@ -58,11 +67,15 @@ for _ in $(seq 120); do
 done
 kill -0 $NSYS_PID 2>/dev/null && echo "nsys still running after 10 min" >> "$OUT/progress.txt"
 echo "nsys ended $(date +%T)" >> "$OUT/progress.txt"
+kill $LOADS $DMON 2>/dev/null
 nvidia-smi > "$OUT/gpus_after.txt"
 [ -f "$OUT/FAILED" ] && exit 1
 
 cat /proc/loadavg > "$OUT/loadavg_after.txt"
-nsys export --type sqlite --force-overwrite=true -o "$OUT/serve.sqlite" "$OUT/serve.nsys-rep" > "$OUT/export.log" 2>&1
-$PY "$S/nsys_metrics.py" "$OUT/serve.sqlite" --bench-log "$OUT/bench.log" > "$OUT/metrics.txt" 2>&1
-$PY "$S/ttfc_census.py" "$OUT/serve.sqlite" --bench-log "$OUT/bench.log" > "$OUT/census.txt" 2>&1
+if [ "$NSYS_ARGS" != none ]; then
+  nsys export --type sqlite --force-overwrite=true -o "$OUT/serve.sqlite" "$OUT/serve.nsys-rep" > "$OUT/export.log" 2>&1
+  echo "exported $(date +%T)" >> "$OUT/progress.txt"
+  #CENSUS picks the analysis, e.g. pipeline_census.py with the pipeline_nvtx probe
+  $PY "$S/${CENSUS:-ttfc_census.py}" "$OUT/serve.sqlite" --bench-log "$OUT/bench.log" > "$OUT/census.txt" 2>&1
+fi
 echo "done $(date +%T)" >> "$OUT/progress.txt"
