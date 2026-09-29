@@ -136,6 +136,8 @@ def build_talker(device: torch.device) -> Qwen3TTSTalker:
     talker.predictor_embedding_buffer = torch.empty(
         MAX_BS, HIDDEN, device=device, dtype=DTYPE
     )
+    talker.predictor_projected_embeddings = None
+    talker.predictor_projected_buffer = None
     talker.sampled_token_ids = torch.zeros(MAX_BS, dtype=torch.long, device=device)
 
     talker.sub_batch_size = 0
@@ -360,6 +362,56 @@ def test_missing_embedding_buffer_uses_original_graph_path():
 
     assert torch.equal(fused_codes, fallback_codes)
     assert torch.equal(fused_embeds, fallback_embeds)
+
+
+def with_projected_tables(talker: Qwen3TTSTalker) -> Qwen3TTSTalker:
+    device = talker.predictor_k_cache.device
+    talker.predictor_projected_embeddings = torch.empty(
+        NUM_CODE_GROUPS - 1, PRED_VOCAB, HIDDEN, device=device, dtype=DTYPE
+    )
+    talker.predictor_projected_buffer = torch.empty(
+        MAX_BS, HIDDEN, device=device, dtype=DTYPE
+    )
+    talker.post_load_weights()
+    return talker
+
+
+@pytest.mark.accelerator
+def test_projected_tables_are_the_projected_codec_embeddings():
+    talker = with_projected_tables(build_talker(torch.device("cuda")))
+
+    for table, embedding in zip(
+        talker.predictor_projected_embeddings,
+        talker.code_predictor.model.codec_embedding,
+    ):
+        with torch.no_grad():
+            expected = talker.code_predictor.project_input(embedding.weight)
+        assert torch.equal(table, expected)
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+def test_projected_tables_graph_matches_eager_and_the_unfused_gather(batch_size: int):
+    device = torch.device("cuda")
+    fused_talker = with_projected_tables(build_talker(device))
+    unfused_talker = with_projected_tables(build_talker(device))
+    object.__delattr__(unfused_talker, "predictor_embedding_buffer")
+    requests = uniform_requests(batch_size, top_k=5, top_p=0.9)
+    fused_talker.prepare_decode_buffers(requests)
+    unfused_talker.prepare_decode_buffers(requests)
+    layer0, hidden, positions = step_inputs(batch_size, device)
+
+    eager_codes, eager_embeds = run_eager(fused_talker, layer0, hidden, positions)
+    graph_codes, graph_embeds = run_forward(fused_talker, layer0, hidden, positions)
+    unfused_codes, unfused_embeds = run_forward(
+        unfused_talker, layer0, hidden, positions
+    )
+
+    assert fused_talker.predictor_graphs
+    assert torch.equal(graph_codes, eager_codes)
+    assert torch.equal(graph_embeds, eager_embeds)
+    assert torch.equal(unfused_codes, eager_codes)
+    assert torch.equal(unfused_embeds, eager_embeds)
 
 
 @pytest.mark.accelerator
