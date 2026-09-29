@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import math
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -64,6 +65,7 @@ def graph_time_us(fns) -> float:
 def load_2413(path: str):
     spec = importlib.util.spec_from_file_location("predictor_kernels_2413", path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
