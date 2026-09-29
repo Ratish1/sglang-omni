@@ -161,6 +161,10 @@ Startup causes, each fix emulated on the probe (stage3/c7, c8, c9, c10, c11):
 - All three: warm 66.5 s (main 149, step 1 123), cold 158.7 s (main 196). The one remaining
   miss is a Dynamo restart of native frame 0/0: under dynamic=True the LayerNorm eps become
   SymFloats that the tensorify pass cannot handle (_tensorify_python_scalars.py:458).
+- Native on automatic dynamic with maybe_mark_dynamic hints (stage3/c11), with the three
+  above: warm 48.4 / 51.0 s, cold 129.7 s, all 5 AOT hits, no restart; one call within about
+  3 % of the mask only variant and faster than main at 6 of 8 shapes; distance to eager as
+  main's. Serving and WER / SIM not yet measured.
 
 TensorRT (#2402): the exclusion is forced only for the estimator slot; #2372's default made an
 explicit TRT opt-in fail, which #1969's review had prevented. The engine is batch 2 (N requests
