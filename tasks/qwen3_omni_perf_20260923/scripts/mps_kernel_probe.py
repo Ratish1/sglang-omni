@@ -3,7 +3,8 @@ GEMM at the thinker's decode shape (1 x 2048 -> 5120), a chain of tiny elementwi
 and the sglang FA3 decode call at a thinker-like shape, each captured in one CUDA graph
 of many launches and timed per launch. Run once with CUDA_MPS_PIPE_DIRECTORY pointing at
 a running MPS control daemon and once without, alone on the card, to tell whether MPS by
-itself changes these kernels. Prints the SM count the process sees.
+itself changes these kernels. Prints the SM count the process sees, and the SMs a spinning
+kernel of the process actually lands on.
 
 usage: python mps_kernel_probe.py
 """
@@ -13,6 +14,9 @@ from __future__ import annotations
 import os
 
 import torch
+import triton
+import triton.language as tl
+from triton.language.extra.cuda import globaltimer, smid
 
 LAUNCHES = 200
 REPLAYS = 20
@@ -66,6 +70,34 @@ def main() -> None:
     )
     print(
         f"sglang fused_experts M=1, a PDL chain of seven kernels, us {moe_chain_us():.2f}"
+    )
+    print(sm_reach(props.multi_processor_count))
+
+
+@triton.jit
+def spin_record(sm_ptr, start_ptr, spin_ns):
+    start = globaltimer()
+    now = start
+    while now - start < spin_ns:
+        now = globaltimer()
+    tl.store(sm_ptr + tl.program_id(0), smid())
+    tl.store(start_ptr + tl.program_id(0), start)
+
+
+def sm_reach(sms: int) -> str:
+    """Four CTAs per SM spin 20 us each and record their SM id and start time: the SMs a
+    kernel of this process can reach, and the spread of CTA start times (one wave or two).
+    """
+    ctas = 4 * sms
+    sm_ids = torch.empty(ctas, device="cuda", dtype=torch.int32)
+    starts = torch.empty(ctas, device="cuda", dtype=torch.int64)
+    for _ in range(3):
+        spin_record[(ctas,)](sm_ids, starts, 20_000, num_warps=4)
+    torch.cuda.synchronize()
+    spread_us = (starts.max() - starts.min()).item() / 1e3
+    return (
+        f"sm reach: {ctas} ctas on {torch.unique(sm_ids).numel()} distinct SMs of {sms}, "
+        f"start spread us {spread_us:.1f}"
     )
 
 
