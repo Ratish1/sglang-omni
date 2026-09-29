@@ -119,6 +119,11 @@ def main() -> None:
         # Skips the torch.compiler.disable wrap; the rest is main's compile.
         stages.CHUNK_MASK_COMPILE_DISABLED = True
         stages.compile_dit_backbone(flow, autocast_dtype=dtype)
+    elif args.variant == "auto_dynamic":
+        from c11_native_auto_dynamic import install
+
+        install()
+        stages.compile_dit_backbone(flow, autocast_dtype=dtype)
     elif args.variant in ("nested", "nested_disable"):
         from cosyvoice.flow.DiT import dit as dit_module
         from cosyvoice.flow.DiT.modules import DiTBlock
