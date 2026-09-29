@@ -32,6 +32,9 @@ def main() -> None:
     parser.add_argument("--sms", type=int, default=132)
     parser.add_argument("--bench-log")
     parser.add_argument("--sequence", type=int, default=75)
+    parser.add_argument(
+        "--bs", type=int, help="batch size to detail; default the most common"
+    )
     args = parser.parse_args()
     db = sqlite3.connect(args.report)
     strings = dict(db.execute("select id, value from StringIds"))
@@ -160,7 +163,7 @@ def main() -> None:
             f"{bs:>4}{len(rows):>9}{count:>9.0f}{span:>10.0f}{busy:>11.0f}{span - busy:>9.0f}{100 * (span - busy) / span:>7.1f}%"
         )
 
-    bs = max(by_bs, key=lambda b: len(by_bs[b]))
+    bs = args.bs if args.bs in by_bs else max(by_bs, key=lambda b: len(by_bs[b]))
     rows = sorted(by_bs[bs])
     corr = rows[len(rows) // 2][3]
     kernels = replays[corr]
