@@ -8,7 +8,7 @@ import json
 import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, Callable
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
@@ -44,6 +44,7 @@ from sglang_omni_router.python.worker import (
     HEALTH_STATE_UNKNOWN,
     Worker,
     build_workers,
+    find_worker,
 )
 
 logger = logging.getLogger(__name__)
@@ -775,6 +776,11 @@ def register_data_routes(
     async def audio_speech(request: Request) -> Response:
         return await _forward(request, "/v1/audio/speech")
 
+    @app.get("/v1/audio/speech/{request_id}")
+    async def audio_speech_outcome(request_id: str, request: Request) -> Response:
+        path = f"/v1/audio/speech/{quote(request_id, safe='')}"
+        return await _forward(request, path)
+
     @app.post("/v1/audio/transcriptions")
     async def audio_transcriptions(request: Request) -> Response:
         return await _forward(request, "/v1/audio/transcriptions")
@@ -1225,14 +1231,6 @@ def decode_response_payload(response: httpx.Response) -> Any:
         return response.json()
     except Exception:
         return response.text
-
-
-def find_worker(workers: list[Worker], worker_id: str) -> Worker | None:
-    decoded = unquote(worker_id)
-    for worker in workers:
-        if worker.worker_id == worker_id or worker.url == decoded:
-            return worker
-    return None
 
 
 async def read_json_object(
