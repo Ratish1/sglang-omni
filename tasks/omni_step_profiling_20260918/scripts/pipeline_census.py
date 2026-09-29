@@ -585,8 +585,8 @@ def section_c(r: Report):
                         continue
                     gaps.append(tb - ta)
                     if len(gaps) <= 3000 and tid in r.top_level:
-                        tops, starts = r.top_level[tid]
-                        i = max(bisect.bisect_right(starts, ta) - 1, 0)
+                        tops, top_starts = r.top_level[tid]
+                        i = max(bisect.bisect_right(top_starts, ta) - 1, 0)
                         covered = 0
                         while i < len(tops) and tops[i].start < tb:
                             item = tops[i]
