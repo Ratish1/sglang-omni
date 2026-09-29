@@ -15,6 +15,7 @@ usage: [PROBE_FOOTPRINT_GB=100] python mps_kernel_probe.py
 from __future__ import annotations
 
 import os
+import re
 
 import torch
 import triton
@@ -24,6 +25,9 @@ from triton.language.extra.cuda import globaltimer, smid
 
 LAUNCHES = 200
 REPLAYS = 20
+FA3_TILE = re.compile(
+    r"tuple<cute::C<\(int\)(\d+)>, cute::C<\(int\)(\d+)>, cute::C<\(int\)(\d+)>>"
+)
 
 
 def capture(body, launches: int) -> torch.cuda.CUDAGraph:
@@ -61,10 +65,15 @@ def kernel_means(graph: torch.cuda.CUDAGraph, launches: int) -> str:
         if row.self_device_time_total > 0 and row.count >= 3 * launches
     ]
     rows.sort(key=lambda row: -row.self_device_time_total)
-    return "\n".join(
-        f"    {row.count // (3 * launches)}/round mean us {row.self_device_time_total / row.count:7.2f}  {row.key[:60]}"
-        for row in rows[:10]
-    )
+    lines = []
+    for row in rows[:10]:
+        # the second cute tuple of an FA3 forward name is its tile shape
+        tiles = FA3_TILE.findall(row.key)
+        tile = f" tile {'x'.join(tiles[1])}" if len(tiles) > 1 else ""
+        lines.append(
+            f"    {row.count // (3 * launches)}/round mean us {row.self_device_time_total / row.count:7.2f}  {row.key[:60]}{tile}"
+        )
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -88,6 +97,7 @@ def main() -> None:
     q = torch.randn(1, 1, heads_q, dim, device=device, dtype=torch.bfloat16)
     page_table = torch.arange(pages, device=device, dtype=torch.int32)[None, :512]
     cache_seqlens = torch.tensor([512], device=device, dtype=torch.int32)
+    decode_attention = sglang_decode_attention_body(device)
     bodies = {
         "cublas 1x2048x5120": lambda: torch.matmul(x, weight.t(), out=out),
         "elementwise add 2048": lambda: small.add_(1.0),
@@ -100,17 +110,20 @@ def main() -> None:
             causal=True,
         ),
         "sglang fused_experts M=1, a PDL chain of seven kernels": moe_body(),
+        "fa3 as the sglang decode graph calls it, split kv and combine": decode_attention,
     }
     for name, body in bodies.items():
-        print(f"{name} us {per_launch_us(capture(body, LAUNCHES), LAUNCHES):.2f}")
+        graph = capture(body, LAUNCHES)
+        print(f"{name} us {per_launch_us(graph, LAUNCHES):.2f}")
+        print(kernel_means(graph, LAUNCHES))
 
     def mixed() -> None:
         for body in bodies.values():
             body()
 
-    rounds = LAUNCHES // 4
+    rounds = LAUNCHES // len(bodies)
     graph = capture(mixed, rounds)
-    print(f"mixed round of the four us {per_launch_us(graph, rounds):.2f}")
+    print(f"mixed round of all us {per_launch_us(graph, rounds):.2f}")
     print(kernel_means(graph, rounds))
     print(sm_reach(props.multi_processor_count))
 
@@ -139,6 +152,52 @@ def sm_reach(sms: int) -> str:
     return (
         f"sm reach: {ctas} ctas on {torch.unique(sm_ids).numel()} distinct SMs of {sms}, "
         f"start spread us {spread_us:.1f}"
+    )
+
+
+def sglang_decode_attention_body(device: torch.device):
+    """One thinker decode attention call as sglang's FA3 backend makes it in the decode
+    graph: page size 1 over a 200k token pool, a varlen query of one token, automatic
+    split count, and scheduler metadata computed before the call."""
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache, get_scheduler_metadata
+
+    pool, heads_q, heads_kv, dim, seqlen = 200_000, 32, 4, 128, 300
+    k_cache = torch.randn(pool, 1, heads_kv, dim, device=device, dtype=torch.bfloat16)
+    v_cache = torch.randn_like(k_cache)
+    q = torch.randn(1, heads_q, dim, device=device, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    page_table = torch.arange(
+        150_000, 150_000 + seqlen, device=device, dtype=torch.int32
+    )[None, :]
+    cache_seqlens = torch.tensor([seqlen], device=device, dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    scheduler_metadata = get_scheduler_metadata(
+        batch_size=1,
+        max_seqlen_q=1,
+        max_seqlen_k=seqlen,
+        num_heads=heads_q,
+        num_heads_k=heads_kv,
+        headdim=dim,
+        cache_seqlens=cache_seqlens,
+        qkv_dtype=torch.bfloat16,
+        cu_seqlens_q=cu_seqlens_q,
+        page_size=1,
+        causal=True,
+        num_splits=0,
+    )
+    return lambda: flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=1,
+        softmax_scale=dim**-0.5,
+        causal=True,
+        num_splits=0,
+        out=out,
+        scheduler_metadata=scheduler_metadata,
     )
 
 
