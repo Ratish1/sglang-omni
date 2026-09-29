@@ -35,6 +35,24 @@ def find_guarded_entry(cls, key, local, remote_cache, evaluate_guards, hints):
     return graph, content, info
 
 
+original_lookup_graph = (
+    codecache.FxGraphCache._lookup_graph
+)  # noqa: leading-underscore  # upstream spelling
+
+
+def lookup_graph(
+    key, example_inputs, local, remote_cache, constants, evaluate_guards=None
+):
+    graph, info = original_lookup_graph(
+        key, example_inputs, local, remote_cache, constants, evaluate_guards
+    )
+    print(f"FXLOOKUP key={key[:12]} loaded={graph is not None} info={info}", flush=True)
+    return graph, info
+
+
 codecache.FxGraphCache.find_guarded_entry = classmethod(find_guarded_entry)
+codecache.FxGraphCache._lookup_graph = staticmethod(
+    lookup_graph
+)  # noqa: leading-underscore  # upstream spelling
 sys.argv[0] = str(Path(__file__).with_name("c1_compile_startup.py"))
 runpy.run_path(sys.argv[0], run_name="__main__")
