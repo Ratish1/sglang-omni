@@ -382,7 +382,7 @@ class Report:
             while item is not None:
                 item.copies[label] += 1
                 item = item.parent
-        self.device.sort()
+        self.device.sort(key=lambda d: (d[0], d[1]))
 
     def load_host_states(self):
         self.os_wait: dict[int, list] = collections.defaultdict(list)
