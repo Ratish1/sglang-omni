@@ -216,6 +216,7 @@ class Report:
         self.gil_hold: dict[int, list] = collections.defaultdict(list)
         self.thread_names: dict[int, str] = {}
         self.marks: list[tuple[int, int, str]] = []
+        last_mark: dict[int, tuple[int, str]] = {}
         for start, end, tid, text, text_id, kind in self.db.execute(
             "select start, end, globalTid, text, textId, eventType from NVTX_EVENTS "
             "where eventType in (?, ?) order by start",
@@ -228,6 +229,16 @@ class Report:
                 if label.startswith("thread name="):
                     self.thread_names[tid] = label.split(" ")[1][5:]
                 elif self.t0 <= start <= self.t1:
+                    # a probe before 09-29 marked a get_nowait twice, back to back
+                    previous = last_mark.get(tid)
+                    last_mark[tid] = (start, label)
+                    if (
+                        previous is not None
+                        and previous[1] == label
+                        and ".get " in label
+                        and start - previous[0] < 20_000
+                    ):
+                        continue
                     self.marks.append((start, tid, label))
                 continue
             if end is None:

@@ -138,7 +138,7 @@ def instrument_queue(q, label):
     if getattr(q, "pipe_nvtx_label", None):
         return
     q.pipe_nvtx_label = label
-    put, get, get_nowait = q.put, q.get, q.get_nowait
+    put, get = q.put, q.get
 
     def put_marked(item, *args, **kwargs):
         mark(f"q {label}.put rid={rid_of(item)} t={getattr(item, 'type', '-')}")
@@ -149,12 +149,9 @@ def instrument_queue(q, label):
         mark(f"q {label}.get rid={rid_of(item)} t={getattr(item, 'type', '-')}")
         return item
 
-    def get_nowait_marked():
-        item = get_nowait()
-        mark(f"q {label}.get rid={rid_of(item)} t={getattr(item, 'type', '-')}")
-        return item
-
-    q.put, q.get, q.get_nowait = put_marked, get_marked, get_nowait_marked
+    # note: the stdlib put_nowait and get_nowait call self.put and self.get, so the
+    # instance wrappers see them too; wrapping them as well would mark twice
+    q.put, q.get = put_marked, get_marked
 
 
 def call_sites():
