@@ -179,6 +179,17 @@ One row regression and a variance source (c21 to c25, h15):
   10.1), a few percent of a run decided at warmup. h15 (streaming c16 9.076 against 9.074,
   c1 1.963 against 1.995) is not a clean code comparison until that is pinned.
 
+Implemented on fix/cosyvoice-dit-compile-startup 0b354a67c (user chose pointwise autotune off):
+per compile triton.autotune_pointwise=False for both DiT compiles; the native changes (libdevice
+set before any lookup, RoPE without autocast regions, chunk mask compiled, automatic dynamic);
+the compile default yields to an explicit TensorRT choice. Tests 220 passed. Startup (fresh
+cache, alone): warm 49.0 / 57.7 s, cold 147.4 s (main 149 / 196). Serving against main, both
+orientations, shared cache: streaming c16 8.375 / 8.669 and 9.082 / 9.374 req/s, buffered c16
+14.883 / 15.362 and 15.069 / 15.721, streaming c1 1.997 / 2.096, buffered c1 2.193 / 2.225.
+WER / SIM (full set): buffered 1.725 / 1.708 % and 69.99 / 69.86 (h18), 1.348 / 1.532 % and
+70.16 / 70.08 (h19); identical code differs by up to 0.38 WER points and 0.22 SIM points across
+runs. Raw: artifacts/radix-h100-20260929/h18, h19, probes3.
+
 TensorRT (#2402): the exclusion is forced only for the estimator slot; #2372's default made an
 explicit TRT opt-in fail, which #1969's review had prevented. The engine is batch 2 (N requests
 are N serial calls per step), full attention (streaming loses the chunk mask; the hub ONNX is
