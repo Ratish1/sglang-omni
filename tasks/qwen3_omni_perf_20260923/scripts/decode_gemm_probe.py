@@ -1,10 +1,11 @@
-"""The thinker's batch-1 decode GEMMs (qkv 2048 -> 5120, o_proj 4096 -> 2048, router gate
-2048 -> 128) through cuBLAS (F.linear, the path sglang takes) and through sglang's Hopper
-bf16 GEMV, each over 48 distinct weights in one CUDA graph as the 48 layers would read them,
-so the weights stream from DRAM. Prints per-call time, the kernels each path launches, and
-how many output elements differ between the two paths.
+"""The thinker's decode GEMMs (qkv 2048 -> 5120, o_proj 4096 -> 2048, router gate
+2048 -> 128) at the small graph buckets through cuBLAS (F.linear, the path sglang takes),
+sglang's Hopper bf16 GEMV (batch 1 only) and sglang's tiny GEMM (batch up to 16), each over
+48 distinct weights in one CUDA graph as the 48 layers would read them, so the weights stream
+from DRAM. Prints per-call time and kernels per path, how many outputs differ from cuBLAS,
+and whether the tiny GEMM gives row 0 the same bits at every batch size.
 
-usage: [CUBLASLT_LOG_LEVEL=5] python decode_gemm_probe.py
+usage: python decode_gemm_probe.py
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from torch.profiler import ProfilerActivity, profile
 
 LAYERS = 48
 REPLAYS = 20
+BATCHES = (1, 2, 4, 8)
 SHAPES = {"qkv": (2048, 5120), "o_proj": (4096, 2048), "gate": (2048, 128)}
 
 
@@ -47,9 +49,32 @@ def kernel_names(graph: torch.cuda.CUDAGraph) -> str:
         torch.cuda.synchronize()
     rows = [row for row in prof.key_averages() if row.self_device_time_total > 0]
     return ", ".join(
-        f"{row.key[:48]} x{row.count // LAYERS} {row.self_device_time_total / row.count:.2f} us"
+        f"{row.key[:40]} x{row.count // LAYERS} {row.self_device_time_total / row.count:.2f} us"
         for row in sorted(rows, key=lambda row: -row.self_device_time_total)
     )
+
+
+def timed(label: str, gemm, x: torch.Tensor, weights: list[torch.Tensor]) -> None:
+    def body() -> None:
+        for w in weights:
+            gemm(x, w)
+
+    graph = capture(body)
+    print(f"    {label:6s} us {per_call_us(graph):6.2f}  [{kernel_names(graph)}]")
+
+
+def differ_from_cublas(gemm, x: torch.Tensor, weights: list[torch.Tensor]) -> str:
+    # eager, since a split-K graph replayed after later captures may read a stale
+    # cuBLAS workspace
+    differ = largest = 0
+    for w in weights:
+        reference, candidate = F.linear(x, w), gemm(x, w)
+        differ += (reference != candidate).sum().item()
+        largest = max(
+            largest, (reference.float() - candidate.float()).abs().max().item()
+        )
+    total = x.shape[0] * weights[0].shape[0] * len(weights)
+    return f"{differ} of {total} differ from cuBLAS, max {largest:.1e}"
 
 
 def main() -> None:
@@ -57,6 +82,7 @@ def main() -> None:
         hopper_bf16_gemv,
         use_hopper_bf16_gemv,
     )
+    from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm, tiny_gemm_bf16
 
     device = torch.device("cuda")
     torch.manual_seed(0)
@@ -65,42 +91,32 @@ def main() -> None:
             (torch.randn(n, k, device=device) * 0.02).to(torch.bfloat16)
             for _ in range(LAYERS)
         ]
-        x = torch.randn(1, k, device=device).to(torch.bfloat16)
-        cublas_out = [torch.empty(1, n, device=device, dtype=torch.bfloat16)]
-        gemv_out = [torch.empty(1, n, device=device, dtype=torch.bfloat16)]
-
-        def cublas() -> None:
-            for w in weights:
-                cublas_out[0] = F.linear(x, w)
-
-        def gemv() -> None:
-            for w in weights:
-                gemv_out[0] = hopper_bf16_gemv(x, w)
-
-        graph_cublas = capture(cublas)
-        print(
-            f"{name} ({k} -> {n}) cublas us {per_call_us(graph_cublas):.2f}  [{kernel_names(graph_cublas)}]"
-        )
-        if use_hopper_bf16_gemv(1, n, k):
-            graph_gemv = capture(gemv)
-            print(
-                f"{name} ({k} -> {n}) gemv   us {per_call_us(graph_gemv):.2f}  [{kernel_names(graph_gemv)}]"
+        rows = torch.randn(max(BATCHES), k, device=device).to(torch.bfloat16)
+        print(f"{name} ({k} -> {n}), tiny GEMM eligible {can_use_tiny_gemm(n, k)}")
+        for batch in BATCHES:
+            x = rows[:batch].contiguous()
+            print(f"  batch {batch}")
+            timed("cublas", F.linear, x, weights)
+            if batch == 1 and use_hopper_bf16_gemv(1, n, k):
+                timed("gemv", hopper_bf16_gemv, x, weights)
+                print(f"    gemv   {differ_from_cublas(hopper_bf16_gemv, x, weights)}")
+            else:
+                pass
+            if can_use_tiny_gemm(n, k):
+                timed("tiny", tiny_gemm_bf16, x, weights)
+                print(f"    tiny   {differ_from_cublas(tiny_gemm_bf16, x, weights)}")
+            else:
+                pass
+        if can_use_tiny_gemm(n, k):
+            first = [tiny_gemm_bf16(rows[:1].contiguous(), w) for w in weights]
+            stable = all(
+                torch.equal(tiny_gemm_bf16(rows[:batch].contiguous(), w)[:1], one)
+                for batch in BATCHES
+                for w, one in zip(weights, first)
             )
-            # eager, since a split-K graph replayed after later captures may read a stale
-            # cuBLAS workspace
-            differ = largest = 0
-            for w in weights:
-                reference, candidate = F.linear(x, w), hopper_bf16_gemv(x, w)
-                differ += (reference != candidate).sum().item()
-                largest = max(
-                    largest,
-                    (reference.float() - candidate.float()).abs().max().item(),
-                )
-            print(
-                f"{name} over {LAYERS} layers: {differ} of {n * LAYERS} outputs differ, max abs difference {largest:.3e}"
-            )
+            print(f"  tiny GEMM row 0 identical at every batch: {stable}")
         else:
-            print(f"{name} ({k} -> {n}) not eligible for the Hopper GEMV")
+            pass
 
 
 if __name__ == "__main__":
