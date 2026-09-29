@@ -53,11 +53,18 @@ def compare_compiled_chunk_mask(chunk_size: int) -> dict[str, object]:
     chunk_mask = dit_module.add_optional_chunk_mask
 
     # DiT.forward passes its chunk size as a module attribute, which Dynamo
-    # specializes; a closure constant keeps it static here too.
-    def masks_for(static: int):
-        def eager(xs, masks):
-            return chunk_mask(xs, masks, False, False, 0, static, -1)
+    # specializes even under dynamic=True; a closure or argument int becomes a
+    # symbol, and Inductor's range analysis of the division then fails.
+    class ChunkMask(torch.nn.Module):
+        def __init__(self, static_chunk_size: int) -> None:
+            super().__init__()
+            self.static_chunk_size = static_chunk_size
 
+        def forward(self, xs, masks):
+            return chunk_mask(xs, masks, False, False, 0, self.static_chunk_size, -1)
+
+    def masks_for(static: int):
+        eager = ChunkMask(static)
         return eager, torch.compile(eager, dynamic=True)
 
     variants = {static: masks_for(static) for static in (chunk_size, 0)}
