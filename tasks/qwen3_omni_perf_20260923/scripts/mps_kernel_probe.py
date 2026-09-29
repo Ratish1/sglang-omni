@@ -1,12 +1,15 @@
 """Single-process timing of the kernel families that slow down under MPS at c1: a cuBLAS
 GEMM at the thinker's decode shape (1 x 2048 -> 5120), a chain of tiny elementwise adds,
-and the sglang FA3 decode call at a thinker-like shape, each captured in one CUDA graph
-of many launches and timed per launch. Run once with CUDA_MPS_PIPE_DIRECTORY pointing at
-a running MPS control daemon and once without, alone on the card, to tell whether MPS by
-itself changes these kernels. Prints the SM count the process sees, and the SMs a spinning
-kernel of the process actually lands on.
+the sglang FA3 decode call at a thinker-like shape, and the sglang fused_experts call at
+M=1, each captured alone in one CUDA graph of many launches and timed per launch, then
+all four interleaved in one graph as a decode step interleaves them, timed per round with
+each kernel's mean duration inside the mix from the torch profiler. Run once with
+CUDA_MPS_PIPE_DIRECTORY pointing at a running MPS control daemon and once without to tell
+whether MPS by itself changes these kernels. PROBE_FOOTPRINT_GB holds that much device
+memory in the process first, as a stage process holds its weights and KV pool. Prints the
+SM count the process sees, and the SMs a spinning kernel of the process lands on.
 
-usage: python mps_kernel_probe.py
+usage: [PROBE_FOOTPRINT_GB=100] python mps_kernel_probe.py
 """
 
 from __future__ import annotations
@@ -16,22 +19,27 @@ import os
 import torch
 import triton
 import triton.language as tl
+from torch.profiler import ProfilerActivity, profile
 from triton.language.extra.cuda import globaltimer, smid
 
 LAUNCHES = 200
 REPLAYS = 20
 
 
-def per_launch_us(body) -> float:
+def capture(body, launches: int) -> torch.cuda.CUDAGraph:
     for _ in range(3):
         body()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        for _ in range(LAUNCHES):
+        for _ in range(launches):
             body()
     graph.replay()
     torch.cuda.synchronize()
+    return graph
+
+
+def per_launch_us(graph: torch.cuda.CUDAGraph, launches: int) -> float:
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -39,23 +47,39 @@ def per_launch_us(body) -> float:
         graph.replay()
     end.record()
     end.synchronize()
-    return start.elapsed_time(end) * 1000 / (REPLAYS * LAUNCHES)
+    return start.elapsed_time(end) * 1000 / (REPLAYS * launches)
+
+
+def kernel_means(graph: torch.cuda.CUDAGraph, launches: int) -> str:
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+    rows = [
+        row
+        for row in prof.key_averages()
+        if row.self_device_time_total > 0 and row.count >= 3 * launches
+    ]
+    rows.sort(key=lambda row: -row.self_device_time_total)
+    return "\n".join(
+        f"    {row.count // (3 * launches)}/round mean us {row.self_device_time_total / row.count:7.2f}  {row.key[:60]}"
+        for row in rows[:10]
+    )
 
 
 def main() -> None:
     device = torch.device("cuda")
+    footprint_gb = float(os.environ.get("PROBE_FOOTPRINT_GB", "0"))
+    held = torch.empty(int(footprint_gb * 2**30), dtype=torch.uint8, device=device)
     props = torch.cuda.get_device_properties(device)
     print(
-        f"mps pipe {os.environ.get('CUDA_MPS_PIPE_DIRECTORY', 'none')} sms {props.multi_processor_count}"
+        f"mps pipe {os.environ.get('CUDA_MPS_PIPE_DIRECTORY', 'none')} sms {props.multi_processor_count} "
+        f"held GB {held.numel() / 2**30:.0f}"
     )
     x = torch.randn(1, 2048, device=device, dtype=torch.bfloat16)
     weight = torch.randn(5120, 2048, device=device, dtype=torch.bfloat16)
     out = torch.empty(1, 5120, device=device, dtype=torch.bfloat16)
-    print(
-        f"cublas 1x2048x5120 us {per_launch_us(lambda: torch.matmul(x, weight.t(), out=out)):.2f}"
-    )
     small = torch.randn(2048, device=device, dtype=torch.bfloat16)
-    print(f"elementwise add 2048 us {per_launch_us(lambda: small.add_(1.0)):.2f}")
     from sglang.kernels.ops.attention.flash_attention_v3 import flash_attn_with_kvcache
 
     pages, heads_q, heads_kv, dim = 4096, 32, 4, 128
@@ -64,13 +88,30 @@ def main() -> None:
     q = torch.randn(1, 1, heads_q, dim, device=device, dtype=torch.bfloat16)
     page_table = torch.arange(pages, device=device, dtype=torch.int32)[None, :512]
     cache_seqlens = torch.tensor([512], device=device, dtype=torch.int32)
-    print(
-        "fa3 decode 1 x 512 us "
-        f"{per_launch_us(lambda: flash_attn_with_kvcache(q=q, k_cache=k_cache, v_cache=v_cache, page_table=page_table, cache_seqlens=cache_seqlens, causal=True)):.2f}"
-    )
-    print(
-        f"sglang fused_experts M=1, a PDL chain of seven kernels, us {moe_chain_us():.2f}"
-    )
+    bodies = {
+        "cublas 1x2048x5120": lambda: torch.matmul(x, weight.t(), out=out),
+        "elementwise add 2048": lambda: small.add_(1.0),
+        "fa3 decode 1 x 512": lambda: flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            causal=True,
+        ),
+        "sglang fused_experts M=1, a PDL chain of seven kernels": moe_body(),
+    }
+    for name, body in bodies.items():
+        print(f"{name} us {per_launch_us(capture(body, LAUNCHES), LAUNCHES):.2f}")
+
+    def mixed() -> None:
+        for body in bodies.values():
+            body()
+
+    rounds = LAUNCHES // 4
+    graph = capture(mixed, rounds)
+    print(f"mixed round of the four us {per_launch_us(graph, rounds):.2f}")
+    print(kernel_means(graph, rounds))
     print(sm_reach(props.multi_processor_count))
 
 
@@ -101,7 +142,7 @@ def sm_reach(sms: int) -> str:
     )
 
 
-def moe_chain_us() -> float:
+def moe_body():
     from sglang.srt.distributed.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,
@@ -141,7 +182,7 @@ def moe_chain_us() -> float:
         activation="silu",
         inplace=False,
     )
-    return per_launch_us(lambda: fused_experts(x, w13, w2, topk_output, config))
+    return lambda: fused_experts(x, w13, w2, topk_output, config)
 
 
 if __name__ == "__main__":
