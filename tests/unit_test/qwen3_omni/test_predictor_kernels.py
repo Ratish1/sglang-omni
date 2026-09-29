@@ -21,6 +21,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.runtime_context import get_context
 from torch import nn
 
+from sglang_omni.models.qwen3_omni.components import predictor_kernels
 from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
     HIDDEN_SIZE,
     add_rmsnorm_rounded,
@@ -31,6 +32,8 @@ from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
 )
 from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
 from sglang_omni.platforms import current_platform
+from sglang_omni.platforms.cuda import CUDAOmniPlatform
+from sglang_omni.platforms.rocm import ROCMOmniPlatform
 from tests.unit_test.fixtures.qwen_predictor import TupleLinear
 
 HIDDEN = 1024
@@ -543,8 +546,13 @@ def test_add_rmsnorm_rounded_matches_add_then_rmsnorm_bit_for_bit(rows: int) -> 
         assert torch.equal(normed, expected)
 
 
-def test_exact_add_rmsnorm_applies_to_the_predictor_shape_only() -> None:
+def test_exact_add_rmsnorm_applies_to_the_predictor_shape_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     cuda = torch.device("cuda")
+    monkeypatch.setattr(predictor_kernels, "current_platform", ROCMOmniPlatform())
+    assert not supports_exact_add_rmsnorm(HIDDEN_SIZE, torch.bfloat16, cuda)
+    monkeypatch.setattr(predictor_kernels, "current_platform", CUDAOmniPlatform())
     assert supports_exact_add_rmsnorm(HIDDEN_SIZE, torch.bfloat16, cuda)
     assert not supports_exact_add_rmsnorm(2048, torch.bfloat16, cuda)
     assert not supports_exact_add_rmsnorm(HIDDEN_SIZE, torch.float16, cuda)
