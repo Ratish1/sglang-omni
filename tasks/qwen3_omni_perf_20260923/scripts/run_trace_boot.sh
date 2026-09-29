@@ -5,13 +5,13 @@
 # MODE mapping turns every CUDA graph off and records python stacks, so each kernel maps
 # to its launch line. WARM requests of the arm run first so every shape bucket is warm,
 # then WINDOW requests run inside the profiled window. One trace per process lands as
-# <out>/<stage>_rank0.trace.json.gz once its background gzip is done.
+# <out>/<stage>_rank0.trace.json.gz once its background gzip is done. EXTRA_SERVE_ARGS is appended.
 # usage: run_trace_boot.sh <tree> <out dir> <card> <port> <formal|mapping> <concurrency> <arm>
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 MODE=$5 CONC=$6 ARM=$7
 S=$(cd "$(dirname "$0")" && pwd)
 MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct
-SERVE_ARGS="--config examples/configs/qwen3_omni_colocated_h200.yaml --colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768"
+SERVE_ARGS="--config examples/configs/qwen3_omni_colocated_h200.yaml --colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768 ${EXTRA_SERVE_ARGS:-}"
 STACK=0
 case $MODE in
   mapping)
