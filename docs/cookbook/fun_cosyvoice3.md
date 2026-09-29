@@ -271,7 +271,7 @@ The TTS engine stage accepts `onnx_intra_op_threads` (16) for the speech tokeniz
 
 ### torch.compile for the DiT backbone
 
-`torch.compile` is on by default. It reduces DiT kernel-launch overhead for supported TTS execution paths, including streaming PackedDiT. The compiled path uses symbolic dynamic shapes (`dynamic=True`) to support varying utterance lengths. Existing CUDA Graph behavior is unchanged. Pass `enable_dit_torch_compile=false` to run the DiT eager.
+`torch.compile` is on by default. It reduces DiT kernel-launch overhead for supported TTS execution paths, including streaming PackedDiT. The compiled graphs are warmed at startup on symbolic batch and length dimensions, so varying utterance lengths do not recompile. Existing CUDA Graph behavior is unchanged. Pass `enable_dit_torch_compile=false` to run the DiT eager.
 
 ```bash
 sgl-omni serve \
