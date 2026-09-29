@@ -166,6 +166,19 @@ Startup causes, each fix emulated on the probe (stage3/c7, c8, c9, c10, c11):
   3 % of the mask only variant and faster than main at 6 of 8 shapes; distance to eager as
   main's. Serving and WER / SIM not yet measured.
 
+One row regression and a variance source (c21 to c25, h15):
+- At one row both trees are host bound (wall about 64 ms, device 30 to 53 ms). Step 1 launched
+  230 more kernels per call (6,305 against 6,075): its in-place RoPE write becomes a full copy
+  of q and k before the FA3 custom op when compiled. Wall slower at 20 of 30 c1 shapes (up to
+  +1.6 %) with device faster at all 30.
+- Fix (exp/cosyvoice-rope-where 841fd8c1f): the compiled path rotates with one pointwise
+  torch.where over every channel (a cat did not fuse: 440 copy launches, rejected). Exact
+  (torch.equal parity test). 5,864 kernels; c1 shapes wall -5.6 % mean against main, 30 of 30.
+- Triton's pointwise autotune picks the GELU kernel's config per process: 6.5 or 10.0 ms per
+  16 row hop whatever the code (gate1 main 10.0, gate4 step 1 6.5, c25 main 6.6, c25 where
+  10.1), a few percent of a run decided at warmup. h15 (streaming c16 9.076 against 9.074,
+  c1 1.963 against 1.995) is not a clean code comparison until that is pinned.
+
 TensorRT (#2402): the exclusion is forced only for the estimator slot; #2372's default made an
 explicit TRT opt-in fail, which #1969's review had prevented. The engine is batch 2 (N requests
 are N serial calls per step), full attention (streaming loses the chunk mask; the hub ONNX is
