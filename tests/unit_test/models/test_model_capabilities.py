@@ -244,6 +244,7 @@ def test_launcher_model_capabilities_log_summary() -> None:
         "cuda_graph": True,
         "torch_compile": False,
         "breakable_prefill_cuda_graph": True,
+        "full_prefill_cuda_graph": True,
     }
 
 
