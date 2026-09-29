@@ -19,6 +19,10 @@ import sys
 
 POINTS = [
     ("admission", "coordinator", "request_admission"),
+    ("thinker_queue_enter", "thinker", "scheduler_queue_enter"),
+    ("thinker_prefill_start", "thinker", "scheduler_prefill_start"),
+    ("thinker_prefill_end", "thinker", "scheduler_prefill_end"),
+    ("thinker_first_chunk_sent", "thinker", "stage_first_stream_chunk_sent"),
     ("thinker_done", "thinker", "stage_complete"),
     ("talker_build_start", "talker_ar", "scheduler_request_build_start"),
     ("talker_build_end", "talker_ar", "scheduler_request_build_end"),
@@ -59,7 +63,9 @@ def main() -> None:
         if times["admission"] is not None and times["audio_sent"] is not None:
             rows.append(times)
     print(f"requests with a first audio chunk: {len(rows)} of {len(first)}")
-    print(f"{'segment':50s} {'n':>5s} {'median_ms':>10s} {'p90_ms':>9s} {'p99_ms':>9s}")
+    print(
+        f"{'segment':50s} {'n':>5s} {'mean_ms':>9s} {'median_ms':>10s} {'p90_ms':>9s} {'p99_ms':>9s}"
+    )
     segments = list(zip(names, names[1:])) + [("admission", "audio_sent")]
     for begin, end in segments:
         values = [
@@ -71,7 +77,8 @@ def main() -> None:
             print(f"{begin + ' -> ' + end:50s} {0:5d}")
             continue
         print(
-            f"{begin + ' -> ' + end:50s} {len(values):5d} {statistics.median(values):10.1f} "
+            f"{begin + ' -> ' + end:50s} {len(values):5d} {statistics.fmean(values):9.1f} "
+            f"{statistics.median(values):10.1f} "
             f"{percentile(values, 0.9):9.1f} {percentile(values, 0.99):9.1f}"
         )
 
