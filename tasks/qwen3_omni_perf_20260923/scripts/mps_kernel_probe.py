@@ -21,12 +21,17 @@ import torch
 import triton
 import triton.language as tl
 from torch.profiler import ProfilerActivity, profile
-from triton.language.extra.cuda import globaltimer, smid
+from triton.language.extra.cuda import (
+    gdc_launch_dependents,
+    gdc_wait,
+    globaltimer,
+    smid,
+)
 
 LAUNCHES = 200
 REPLAYS = 20
 FA3_TILE = re.compile(
-    r"tuple<cute::C<\(int\)(\d+)>, cute::C<\(int\)(\d+)>, cute::C<\(int\)(\d+)>>"
+    r"tuple<cute::C<(?:\(int\))?(\d+)>, cute::C<(?:\(int\))?(\d+)>, cute::C<(?:\(int\))?(\d+)>>"
 )
 
 
@@ -126,6 +131,7 @@ def main() -> None:
     print(f"mixed round of all us {per_launch_us(graph, rounds):.2f}")
     print(kernel_means(graph, rounds))
     print(sm_reach(props.multi_processor_count))
+    print(pdl_early_start(props.multi_processor_count))
 
 
 @triton.jit
@@ -136,6 +142,49 @@ def spin_record(sm_ptr, start_ptr, spin_ns):
         now = globaltimer()
     tl.store(sm_ptr + tl.program_id(0), smid())
     tl.store(start_ptr + tl.program_id(0), start)
+
+
+@triton.jit
+def pdl_primary(start_ptr, spin_ns):
+    start = globaltimer()
+    gdc_launch_dependents()
+    now = start
+    while now - start < spin_ns:
+        now = globaltimer()
+    tl.store(start_ptr + tl.program_id(0), start)
+
+
+@triton.jit
+def pdl_secondary(start_ptr):
+    tl.store(start_ptr + tl.program_id(0), globaltimer())
+    gdc_wait()
+
+
+def pdl_early_start(sms: int) -> str:
+    """A primary kernel releases its dependents at once and then spins 10 us; a secondary
+    launched with programmatic dependent launch records when its CTAs start. With PDL
+    working the secondary starts about 1 us after the primary, without it after 10 us.
+    Measured eager and inside a CUDA graph."""
+    primary = torch.empty(sms, device="cuda", dtype=torch.int64)
+    secondary = torch.empty(sms, device="cuda", dtype=torch.int64)
+
+    def pair() -> None:
+        pdl_primary[(sms,)](primary, 10_000, num_warps=4)
+        pdl_secondary[(sms,)](secondary, num_warps=4, launch_pdl=True)
+
+    def lead_us() -> float:
+        return (secondary.min() - primary.min()).item() / 1e3
+
+    for _ in range(3):
+        pair()
+    torch.cuda.synchronize()
+    eager = lead_us()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        pair()
+    graph.replay()
+    torch.cuda.synchronize()
+    return f"pdl: secondary starts after the primary by us, eager {eager:.1f}, graph {lead_us():.1f} (spin 10)"
 
 
 def sm_reach(sms: int) -> str:
@@ -157,11 +206,13 @@ def sm_reach(sms: int) -> str:
 
 def sglang_decode_attention_body(device: torch.device):
     """One thinker decode attention call as sglang's FA3 backend makes it in the decode
-    graph: page size 1 over a 200k token pool, a varlen query of one token, automatic
-    split count, and scheduler metadata computed before the call."""
+    graph: page size 1 over a 200k token pool, a varlen query of one token, the static
+    max_seqlen_k of the graph (the thinker's 32768 context), automatic split count, and
+    scheduler metadata computed before the call."""
     from sgl_kernel.flash_attn import flash_attn_with_kvcache, get_scheduler_metadata
 
     pool, heads_q, heads_kv, dim, seqlen = 200_000, 32, 4, 128, 300
+    max_seqlen_k = 32768
     k_cache = torch.randn(pool, 1, heads_kv, dim, device=device, dtype=torch.bfloat16)
     v_cache = torch.randn_like(k_cache)
     q = torch.randn(1, heads_q, dim, device=device, dtype=torch.bfloat16)
@@ -174,7 +225,7 @@ def sglang_decode_attention_body(device: torch.device):
     scheduler_metadata = get_scheduler_metadata(
         batch_size=1,
         max_seqlen_q=1,
-        max_seqlen_k=seqlen,
+        max_seqlen_k=max_seqlen_k,
         num_heads=heads_q,
         num_heads_k=heads_kv,
         headdim=dim,
@@ -193,6 +244,7 @@ def sglang_decode_attention_body(device: torch.device):
         cache_seqlens=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=1,
+        max_seqlen_k=max_seqlen_k,
         softmax_scale=dim**-0.5,
         causal=True,
         num_splits=0,
