@@ -92,34 +92,37 @@ def main() -> None:
         pid: votes.most_common(1)[0][0] for pid, votes in stage_votes.items()
     }
 
+    # context switch records are device wide and carry host pids, while kernels carry the
+    # container's pids: slices are kept per (gpu, context) and named by the kernels they hold
     events = db.execute(
-        "select timestamp, tag, contextId, globalPid from GPU_CONTEXT_SWITCH_EVENTS order by timestamp, seqNo"
+        "select timestamp, tag, contextId, gpuId from GPU_CONTEXT_SWITCH_EVENTS order by gpuId, timestamp, seqNo"
     ).fetchall()
-    open_since: dict[int, int] = {}
-    last_ack: dict[int, str] = {}
-    pid_by_context: dict[int, int] = {}
-    slices: dict[int, list[tuple[int, int, str]]] = collections.defaultdict(list)
-    switch_gaps: list[float] = []
-    last_save: int | None = None
-    for timestamp, tag, context, global_pid in events:
-        pid_by_context[context] = pid_of(global_pid)
+    open_since: dict[tuple[int, int], int] = {}
+    last_ack: dict[tuple[int, int], str] = {}
+    raw_slices: dict[tuple[int, int], list[tuple[int, int, str]]] = (
+        collections.defaultdict(list)
+    )
+    gaps_by_gpu: dict[int, list[float]] = collections.defaultdict(list)
+    last_save: dict[int, int] = {}
+    for timestamp, tag, context, gpu in events:
+        key = (gpu, context)
         if tag in ACK_TAGS:
-            last_ack[context] = ACK_TAGS[tag]
+            last_ack[key] = ACK_TAGS[tag]
         elif tag == RESTORE_START:
-            open_since[context] = timestamp
-            if last_save is not None and t0 <= timestamp <= t1:
-                switch_gaps.append((timestamp - last_save) / 1e3)
+            open_since[key] = timestamp
+            if gpu in last_save and t0 <= timestamp <= t1:
+                gaps_by_gpu[gpu].append((timestamp - last_save[gpu]) / 1e3)
             else:
                 pass
-        elif tag == SAVE_END and context in open_since:
-            start = open_since.pop(context)
+        elif tag == SAVE_END and key in open_since:
+            start = open_since.pop(key)
             if timestamp > t0 and start < t1:
-                slices[context].append(
-                    (max(start, t0), min(timestamp, t1), last_ack.pop(context, "none"))
+                raw_slices[key].append(
+                    (max(start, t0), min(timestamp, t1), last_ack.pop(key, "none"))
                 )
             else:
                 pass
-            last_save = timestamp
+            last_save[gpu] = timestamp
         else:
             pass
 
@@ -130,9 +133,43 @@ def main() -> None:
     ):
         kernels_by_pid[pid_of(global_pid)].append((start, end))
     kernel_union = {pid: merged(intervals) for pid, intervals in kernels_by_pid.items()}
+    kernel_starts = {
+        pid: [start for start, _ in spans] for pid, spans in kernel_union.items()
+    }
+
+    pid_by_key: dict[tuple[int, int], int] = {}
+    covered_by_gpu: dict[int, int] = collections.Counter()
+    for key, key_slices in raw_slices.items():
+        best_pid, best_ns = None, 0
+        for pid, spans in kernel_union.items():
+            covered = sum(
+                overlap_ns(spans, kernel_starts[pid], start, end)
+                for start, end, _ in key_slices
+            )
+            if covered > best_ns:
+                best_pid, best_ns = pid, covered
+            else:
+                pass
+        if best_pid is not None:
+            pid_by_key[key] = best_pid
+            covered_by_gpu[key[0]] += best_ns
+        else:
+            pass
+    session_gpu = covered_by_gpu.most_common(1)[0][0]
+    slices: dict[int, list[tuple[int, int, str]]] = collections.defaultdict(list)
+    pid_by_context: dict[int, int] = {}
+    for (gpu, context), key_slices in raw_slices.items():
+        if gpu == session_gpu and (gpu, context) in pid_by_key:
+            slices[context].extend(key_slices)
+            pid_by_context[context] = pid_by_key[(gpu, context)]
+        else:
+            pass
+    switch_gaps = gaps_by_gpu[session_gpu]
 
     name = lambda pid: f"{stage_by_pid.get(pid, '?')} ({pid})"
-    print(f"window {window_ns / 1e6:.1f} ms, context switch events {len(events)}")
+    print(
+        f"window {window_ns / 1e6:.1f} ms, gpu {session_gpu}, context switch events {len(events)} (all gpus)"
+    )
     print("1. residency per context")
     residency_by_pid: dict[int, list[tuple[int, int]]] = {}
     for context, context_slices in sorted(
@@ -140,7 +177,7 @@ def main() -> None:
     ):
         pid = pid_by_context[context]
         spans = merged([(start, end) for start, end, _ in context_slices])
-        residency_by_pid[pid] = spans
+        residency_by_pid[pid] = merged(residency_by_pid.get(pid, []) + spans)
         resident = sum(end - start for start, end in spans)
         own = kernel_union.get(pid, [])
         own_starts = [start for start, _ in own]
@@ -210,6 +247,17 @@ def main() -> None:
                 f"  {name(pid):28s} {mode:8s} ranges {len(rows):6d} wall {means[0]:7.2f} own resident {means[1]:7.2f} "
                 f"others resident {means[2]:7.2f} switches in {means[3]:6.2f} own kernels {means[4]:7.2f}"
             )
+    print("5. share of each process's kernel time inside its own residency")
+    for pid, spans in sorted(kernel_union.items(), key=lambda item: name(item[0])):
+        own_res = residency_by_pid.get(pid, [])
+        own_res_starts = [start for start, _ in own_res]
+        total = sum(end - start for start, end in spans)
+        inside = sum(
+            overlap_ns(own_res, own_res_starts, start, end) for start, end in spans
+        )
+        print(
+            f"  {name(pid):28s} kernels {total / 1e6:9.1f} ms, inside residency {inside / max(total, 1):6.1%}"
+        )
     all_resident = merged(
         [span for spans in residency_by_pid.values() for span in spans]
     )
