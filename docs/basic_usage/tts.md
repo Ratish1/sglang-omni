@@ -320,7 +320,10 @@ in response headers. It does not include in-band JSON events, final usage, or a
 terminal sentinel; instead the response carries `X-Request-Id`, and once the
 stream ends `GET /v1/audio/speech/{request_id}` returns its terminal state
 (`finish_reason`, which is `unknown` when the model reported none, and `usage`).
-Only the most recent streams are kept in memory.
+A caller-supplied `X-Request-Id` (at most 128 visible ASCII bytes, no `/`)
+becomes that id, so the id a router assigns can be looked up; concurrent
+requests sharing an id overwrite each other's outcome. Only the most recent
+streams are kept in memory.
 When the client does not set `initial_codec_chunk_frames`,
 the model selects a continuity-safe first vocoder chunk. Set the field explicitly
 to override that default, or set it to `0` to use the model's steady chunk size

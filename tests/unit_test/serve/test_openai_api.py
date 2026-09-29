@@ -748,6 +748,7 @@ def test_speech_endpoint_returns_binary_audio() -> None:
     assert response.content == b"RIFF"
     assert response.headers["content-type"] == "audio/wav"
     assert response.headers["x-finish-reason"] == "length"
+    assert response.headers["x-request-id"].startswith("speech-")
     assert speech_client.speech_requests[0].model == "tts"
     assert speech_client.speech_requests[0].metadata["tts_params"]["voice"] == "default"
 
@@ -1282,15 +1283,15 @@ def test_speech_stream_defaults_to_raw_pcm() -> None:
         create_app(SuccessfulSpeechClient(), model_name="higgs-audio-v2")
     )
 
+    payload = {
+        "model": "higgs-audio-v2",
+        "input": "hello",
+        "voice": "default",
+        "stream": True,
+        "response_format": "pcm",
+    }
     response = client.post(
-        "/v1/audio/speech",
-        json={
-            "model": "higgs-audio-v2",
-            "input": "hello",
-            "voice": "default",
-            "stream": True,
-            "response_format": "pcm",
-        },
+        "/v1/audio/speech", json=payload, headers={"x-request-id": "caller-1"}
     )
 
     expected = encode_pcm([0.0, 0.1, -0.1, 0.0], sample_rate=24000)
@@ -1300,14 +1301,22 @@ def test_speech_stream_defaults_to_raw_pcm() -> None:
     assert response.headers["x-channels"] == "1"
     assert response.headers["x-bit-depth"] == "16"
     assert response.content == expected
-    request_id = response.headers["x-request-id"]
-    outcome = client.get(f"/v1/audio/speech/{request_id}")
-    assert outcome.json() == {
-        "request_id": request_id,
+    # A caller (or router) supplied id keys the outcome so the caller can find it.
+    assert response.headers["x-request-id"] == "caller-1"
+    assert client.get("/v1/audio/speech/caller-1").json() == {
+        "request_id": "caller-1",
         "finish_reason": "unknown",
         "usage": None,
     }
     assert client.get("/v1/audio/speech/speech-unknown").status_code == 404
+
+    # An id the lookup path cannot carry falls back to the worker's own.
+    response = client.post(
+        "/v1/audio/speech", json=payload, headers={"x-request-id": "a/b"}
+    )
+    request_id = response.headers["x-request-id"]
+    assert request_id.startswith("speech-")
+    assert client.get(f"/v1/audio/speech/{request_id}").status_code == 200
 
 
 def test_speech_stream_headers_use_chunk_sample_rate() -> None:
@@ -1379,6 +1388,7 @@ def test_raw_pcm_response_close_aborts_inner_speech_stream() -> None:
             client=client,
             gen_req=GenerateRequest(model="s2-pro", prompt="hello", stream=True),
             request_id="req-1",
+            public_request_id="req-1",
             speed=1.0,
             speech_stream_outcomes=speech_stream_outcomes,
         )
@@ -1401,6 +1411,7 @@ def test_raw_pcm_response_disconnect_before_first_chunk_aborts_request() -> None
                 client=client,
                 gen_req=GenerateRequest(model="s2-pro", prompt="hello", stream=True),
                 request_id="req-1",
+                public_request_id="req-1",
                 speed=1.0,
                 speech_stream_outcomes=SpeechStreamOutcomes(max_entries=8),
             )

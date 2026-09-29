@@ -119,6 +119,7 @@ from sglang_omni.serve.speech_errors import (
     speech_generation_error,
 )
 from sglang_omni.serve.speech_limits import (
+    MAX_SPEECH_REQUEST_ID_BYTES,
     MAX_SPEECH_STREAM_OUTCOMES,
     MAX_VOICE_UPLOAD_BODY_BYTES,
     MAX_VOICE_UPLOAD_BYTES,
@@ -1483,6 +1484,20 @@ def register_speech(app: FastAPI) -> None:
         speech_service: SpeechRequestValidator = app.state.speech_service
 
         request_id = f"speech-{uuid.uuid4()}"
+        # note (Yucheng Hu): the stream outcome is keyed by the id the caller
+        # sees, which a router may have assigned; the engine keeps its own.
+        caller_request_ids = request.headers.getlist("x-request-id")
+        if (
+            len(caller_request_ids) == 1
+            and 0 < len(caller_request_ids[0]) <= MAX_SPEECH_REQUEST_ID_BYTES
+            and all(
+                0x21 <= ord(character) <= 0x7E and character != "/"
+                for character in caller_request_ids[0]
+            )
+        ):
+            public_request_id = caller_request_ids[0]
+        else:
+            public_request_id = request_id
         try:
             payload = await request.json()
             prepared = await asyncio.to_thread(
@@ -1509,6 +1524,7 @@ def register_speech(app: FastAPI) -> None:
                     client=client,
                     gen_req=gen_req,
                     request_id=request_id,
+                    public_request_id=public_request_id,
                     speed=req.speed,
                     speech_stream_outcomes=app.state.speech_stream_outcomes,
                 )
@@ -1545,6 +1561,7 @@ def register_speech(app: FastAPI) -> None:
 
         headers = {
             "Content-Disposition": f'attachment; filename="speech.{result.format}"',
+            "X-Request-Id": public_request_id,
             # note (Junnan Li): the body is binary audio, so the terminal state
             # travels in the same X- header channel as usage.
             "X-Finish-Reason": result.finish_reason,
@@ -1706,6 +1723,7 @@ async def speech_audio_response(
     client: Client,
     gen_req: GenerateRequest,
     request_id: str,
+    public_request_id: str,
     speed: float,
     *,
     speech_stream_outcomes: SpeechStreamOutcomes,
@@ -1834,7 +1852,7 @@ async def speech_audio_response(
                     pass
                 yield audio_bytes
             active_request = False
-            speech_stream_outcomes.record(request_id, finish_reason, usage)
+            speech_stream_outcomes.record(public_request_id, finish_reason, usage)
         finally:
             if active_request:
                 await abort_and_close_speech_stream(client, request_id, chunk_stream)
@@ -1845,7 +1863,7 @@ async def speech_audio_response(
         _body(),
         media_type="audio/pcm",
         headers={
-            "X-Request-Id": request_id,
+            "X-Request-Id": public_request_id,
             "X-Sample-Rate": str(stream_sample_rate),
             "X-Channels": "1",
             "X-Bit-Depth": "16",

@@ -13,6 +13,9 @@ _BASE64_ENCODED_REFERENCE_AUDIO_BYTES = ((MAX_REFERENCE_AUDIO_BYTES + 2) // 3) *
 # note (Yucheng Hu): finished raw PCM stream outcomes kept for GET
 # /v1/audio/speech/{request_id}; older ones are evicted first.
 MAX_SPEECH_STREAM_OUTCOMES = 1024
+# note (Yucheng Hu): a caller-supplied X-Request-Id becomes the outcome key;
+# the router's canonical ids fit this bound.
+MAX_SPEECH_REQUEST_ID_BYTES = 128
 
 SPEECH_WS_CONFIG_TIMEOUT_S = 10.0
 MAX_SPEECH_WS_CONFIG_MESSAGE_BYTES = _BASE64_ENCODED_REFERENCE_AUDIO_BYTES + 1024 * 1024
