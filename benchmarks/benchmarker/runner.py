@@ -18,6 +18,9 @@ from benchmarks.benchmarker.data import RequestResult
 logger = logging.getLogger(__name__)
 
 SendFn = Callable[[aiohttp.ClientSession, Any], Coroutine[Any, Any, RequestResult]]
+AfterSendFn = Callable[
+    [aiohttp.ClientSession, RequestResult], Coroutine[Any, Any, None]
+]
 
 
 def resolve_warmup(warmup: int | None, max_concurrency: int) -> int:
@@ -61,7 +64,13 @@ class BenchmarkRunner:
         self.config = config
         self.wall_clock_s: float = 0.0
 
-    async def run(self, samples: list, send_fn: SendFn) -> list[RequestResult]:
+    async def run(
+        self,
+        samples: list,
+        send_fn: SendFn,
+        *,
+        after_send: AfterSendFn | None = None,
+    ) -> list[RequestResult]:
         timeout = aiohttp.ClientTimeout(total=self.config.timeout_s)
         # note (guozhihao): Closed-loop runs are bounded by max_concurrency.
         # Open-loop (max_concurrency=0) must not inherit aiohttp's default
@@ -81,8 +90,13 @@ class BenchmarkRunner:
                 self.config.max_concurrency,
             )
             t0 = time.perf_counter()
-            results = await self._dispatch(session, samples, send_fn)
+            results, follow_up_tasks = await self._dispatch(
+                session, samples, send_fn, after_send
+            )
             self.wall_clock_s = time.perf_counter() - t0
+            # note (Yucheng Hu): follow-ups stay outside the timed window but
+            # need the session, so they finish before it closes.
+            await asyncio.gather(*follow_up_tasks)
         return results
 
     async def _warmup(
@@ -125,7 +139,9 @@ class BenchmarkRunner:
         session: aiohttp.ClientSession,
         samples: list,
         send_fn: SendFn,
-    ) -> list[RequestResult]:
+        after_send: AfterSendFn | None,
+    ) -> tuple[list[RequestResult], list[asyncio.Task[None]]]:
+        follow_up_tasks: list[asyncio.Task[None]] = []
         semaphore = (
             asyncio.Semaphore(self.config.max_concurrency)
             if self.config.max_concurrency
@@ -160,6 +176,10 @@ class BenchmarkRunner:
                 result = await send_fn(session, sample)
             if open_loop:
                 result.dispatch_lateness_s = sent_at - planned_at
+            if after_send is not None:
+                # note (Yucheng Hu): started after the slot is released, so a
+                # follow-up never holds a generation slot or extends the window.
+                follow_up_tasks.append(asyncio.create_task(after_send(session, result)))
             pbar.update(1)
             return result
 
@@ -174,4 +194,4 @@ class BenchmarkRunner:
             results: list[RequestResult] = list(await asyncio.gather(*tasks))
         finally:
             pbar.close()
-        return results
+        return results, follow_up_tasks

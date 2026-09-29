@@ -28,7 +28,7 @@ import torch
 from tqdm import tqdm
 
 from benchmarks.benchmarker.data import FinishReason, RequestResult
-from benchmarks.benchmarker.runner import SendFn
+from benchmarks.benchmarker.runner import AfterSendFn, SendFn
 from benchmarks.benchmarker.utils import (
     WAV_HEADER_SIZE,
     get_wav_duration,
@@ -1107,6 +1107,22 @@ def _resolve_tts_generation_kwargs(
     return resolved
 
 
+def finish_reason_from_server(value: str | None) -> FinishReason:
+    try:
+        return FinishReason(value)
+    except ValueError:
+        # note (Yucheng Hu): absent from servers without the field; other
+        # values are engine states this metric does not classify.
+        return FinishReason.UNKNOWN
+
+
+def set_token_rate(result: RequestResult) -> None:
+    if result.completion_tokens > 0 and result.engine_time_s > 0:
+        result.tok_per_s = result.completion_tokens / result.engine_time_s
+    else:
+        pass
+
+
 def _parse_response_headers(result: RequestResult, headers: dict) -> None:
     prompt_tok = headers.get("X-Prompt-Tokens")
     comp_tok = headers.get("X-Completion-Tokens")
@@ -1117,27 +1133,25 @@ def _parse_response_headers(result: RequestResult, headers: dict) -> None:
         result.completion_tokens = int(comp_tok)
     if eng_time is not None:
         result.engine_time_s = float(eng_time)
-    try:
-        result.finish_reason = FinishReason(headers.get("X-Finish-Reason"))
-    except ValueError:
-        # note (Yucheng Hu): absent from servers without the header; other
-        # values are engine states this metric does not classify.
-        result.finish_reason = FinishReason.UNKNOWN
-    if result.completion_tokens > 0 and result.engine_time_s > 0:
-        result.tok_per_s = result.completion_tokens / result.engine_time_s
+    result.finish_reason = finish_reason_from_server(headers.get("X-Finish-Reason"))
+    set_token_rate(result)
 
 
 async def fetch_stream_outcome(
-    session: aiohttp.ClientSession,
-    api_url: str,
-    request_id: str,
-    result: RequestResult,
+    session: aiohttp.ClientSession, api_url: str, result: RequestResult
 ) -> None:
     # note (Yucheng Hu): a raw PCM stream carries no trailing metadata, so the
-    # server keeps the terminal state for a follow-up GET. It holds the fields a
-    # non-streaming response sends as headers; a server without the route, or an
-    # evicted entry, answers 404 and leaves the result unchanged.
-    async with session.get(f"{api_url}/{request_id}") as response:
+    # server keeps the terminal state for a follow-up GET, and a router needs
+    # the answering worker echoed back to reach it. A server without the route,
+    # or an evicted entry, answers 404 and leaves the result unchanged.
+    headers = (
+        {"x-sglang-omni-route-worker": result.server_worker_id}
+        if result.server_worker_id
+        else {}
+    )
+    async with session.get(
+        f"{api_url}/{result.server_request_id}", headers=headers
+    ) as response:
         if response.status == 404:
             return
         elif response.status != 200:
@@ -1149,15 +1163,28 @@ async def fetch_stream_outcome(
         else:
             outcome = await response.json()
     usage = outcome.get("usage") or {}
-    _parse_response_headers(
-        result,
-        {
-            "X-Prompt-Tokens": usage.get("prompt_tokens"),
-            "X-Completion-Tokens": usage.get("completion_tokens"),
-            "X-Engine-Time": usage.get("engine_time_s"),
-            "X-Finish-Reason": outcome.get("finish_reason"),
-        },
-    )
+    result.prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    result.completion_tokens = int(usage.get("completion_tokens") or 0)
+    result.engine_time_s = float(usage.get("engine_time_s") or 0.0)
+    result.finish_reason = finish_reason_from_server(outcome.get("finish_reason"))
+    set_token_rate(result)
+
+
+def make_stream_outcome_collector(api_url: str) -> AfterSendFn:
+    """Return an after_send hook that fetches a raw PCM stream's terminal state."""
+
+    async def collect(session: aiohttp.ClientSession, result: RequestResult) -> None:
+        if result.is_success and result.server_request_id:
+            try:
+                await fetch_stream_outcome(session, api_url, result)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.warning(
+                    f"[{result.request_id}] stream outcome lookup failed: {exc}"
+                )
+        else:
+            pass
+
+    return collect
 
 
 def _parse_pcm_response_format(
@@ -1396,7 +1423,6 @@ def make_tts_send_fn(
             **gen_kwargs,
         )
         start_time = time.perf_counter()
-        stream_request_id: str | None = None
         try:
             async with session.post(api_url, json=payload) as response:
                 if response.status != 200:
@@ -1405,7 +1431,10 @@ def make_tts_send_fn(
                     await _handle_raw_pcm_streaming_response(
                         response, result, start_time, save_audio_dir
                     )
-                    stream_request_id = response.headers.get("X-Request-Id")
+                    result.server_request_id = response.headers.get("X-Request-Id", "")
+                    result.server_worker_id = response.headers.get(
+                        "X-SGLang-Omni-Worker", ""
+                    )
                 else:
                     await _handle_non_streaming_response(
                         response, result, start_time, save_audio_dir
@@ -1414,16 +1443,6 @@ def make_tts_send_fn(
             result.error = str(exc)
         finally:
             result.latency_s = time.perf_counter() - start_time
-        # note (Yucheng Hu): the follow-up lookup stays outside the latency window.
-        if result.is_success and stream_request_id is not None:
-            try:
-                await fetch_stream_outcome(session, api_url, stream_request_id, result)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                logger.warning(
-                    f"[{result.request_id}] stream outcome lookup failed: {exc}"
-                )
-        else:
-            pass
         return result
 
     return send_fn

@@ -14,12 +14,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import requests
 
-from benchmarks.benchmarker.data import FinishReason
+from benchmarks.benchmarker.data import FinishReason, RequestResult
 from benchmarks.dataset.seedtts import SampleInput
 from benchmarks.eval import benchmark_tts_seedtts as tts
 from benchmarks.metrics.wer import SampleOutput, calculate_wer_metrics
 from benchmarks.tasks import asr
-from benchmarks.tasks.tts import _build_tts_payload, make_tts_send_fn
+from benchmarks.tasks.tts import (
+    _build_tts_payload,
+    make_stream_outcome_collector,
+    make_tts_send_fn,
+)
 from tests.utils import QWEN3_ASR_WER_CONCURRENCY, assert_wer_partitioned
 
 SEEDTTS_SAMPLE = SampleInput(
@@ -180,30 +184,17 @@ def test_max_new_tokens_default_applies_without_cli(model, max_new_tokens):
     assert payload.get("max_new_tokens") == max_new_tokens
 
 
-def test_stream_send_fn_looks_up_terminal_state_by_response_request_id():
+def test_stream_send_fn_records_the_ids_the_outcome_collector_needs():
     async def iter_pcm_chunks() -> AsyncIterator[tuple[bytes, bool]]:
         yield bytes(8), True
 
     session = MagicMock()
-    session.get.return_value.__aenter__.return_value = MagicMock(
-        status=200,
-        json=AsyncMock(
-            return_value={
-                "request_id": "speech-1",
-                "finish_reason": "length",
-                "usage": {
-                    "prompt_tokens": 7,
-                    "completion_tokens": 120,
-                    "engine_time_s": 4.8,
-                },
-            }
-        ),
-    )
     session.post.return_value.__aenter__.return_value = MagicMock(
         status=200,
         headers={
             "Content-Type": "audio/pcm",
             "X-Request-Id": "speech-1",
+            "X-SGLang-Omni-Worker": "worker-b",
             "x-sample-rate": "4",
             "x-channels": "1",
             "x-bit-depth": "16",
@@ -219,11 +210,50 @@ def test_stream_send_fn_looks_up_terminal_state_by_response_request_id():
     result = asyncio.run(send_fn(session, SEEDTTS_SAMPLE))
 
     assert result.is_success
-    session.get.assert_called_once_with("http://host/v1/audio/speech/speech-1")
+    assert result.server_request_id == "speech-1"
+    assert result.server_worker_id == "worker-b"
+    # The lookup is the runner's after_send job, outside the timed window.
+    session.get.assert_not_called()
+
+
+def test_stream_outcome_collector_reads_the_outcome_json():
+    session = MagicMock()
+    session.get.return_value.__aenter__.return_value = MagicMock(
+        status=200,
+        json=AsyncMock(
+            return_value={
+                "finish_reason": "length",
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 120,
+                    "engine_time_s": 4.8,
+                },
+            }
+        ),
+    )
+    collect = make_stream_outcome_collector("http://host/v1/audio/speech")
+    result = RequestResult(
+        request_id="sample-1",
+        is_success=True,
+        server_request_id="speech-1",
+        server_worker_id="worker-b",
+    )
+
+    asyncio.run(collect(session, result))
+
+    session.get.assert_called_once_with(
+        "http://host/v1/audio/speech/speech-1",
+        headers={"x-sglang-omni-route-worker": "worker-b"},
+    )
     assert result.finish_reason is FinishReason.LENGTH
     assert result.prompt_tokens == 7
     assert result.completion_tokens == 120
     assert result.tok_per_s == pytest.approx(25.0)
+
+    # A failed request or a response without an id has nothing to look up.
+    asyncio.run(collect(session, RequestResult(request_id="sample-2")))
+    asyncio.run(collect(session, RequestResult(request_id="sample-3", is_success=True)))
+    session.get.assert_called_once()
 
 
 def test_wer_fanout_preserves_all_twenty_samples_at_long_audio_admission_cap(

@@ -119,6 +119,7 @@ from benchmarks.tasks.asr import (
 from benchmarks.tasks.tts import (
     MOSS_TTS_TOKEN_COUNT_AUTO,
     build_base_url,
+    make_stream_outcome_collector,
     make_tts_send_fn,
     run_seedtts_similarity,
     run_seedtts_transcribe,
@@ -445,7 +446,11 @@ async def run_tts_seedtts_benchmark(
             arrival_seed=config.arrival_seed,
         )
     )
-    outputs = await runner.run(samples, send_fn)
+    outputs = await runner.run(
+        samples,
+        send_fn,
+        after_send=make_stream_outcome_collector(api_url) if config.stream else None,
+    )
     warn_if_tail_percentile_is_thin(len(outputs))
 
     metrics = compute_speed_metrics(outputs, wall_clock_s=runner.wall_clock_s)

@@ -28,6 +28,11 @@ class RequestResult:
     engine_time_s: float = 0.0
     tok_per_s: float = 0.0
     finish_reason: FinishReason = FinishReason.UNKNOWN
+    # note (Yucheng Hu): the server's X-Request-Id and, behind a router, the
+    # X-SGLang-Omni-Worker that answered; a stream's terminal state is fetched
+    # from that worker under that id after the request leaves the timed window.
+    server_request_id: str = ""
+    server_worker_id: str = ""
     wav_path: str = ""
     error: str = ""
     audio_ttfp_s: float | None = None

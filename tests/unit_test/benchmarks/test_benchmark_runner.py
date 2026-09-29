@@ -85,6 +85,9 @@ async def test_open_loop_arrivals_overlap_in_flight_requests(
         def exponential(self, scale, size):
             return np.full(size, 0.02)
 
+    async def after_send(_session, _result: RequestResult) -> None:
+        await asyncio.sleep(0.3)
+
     monkeypatch.setattr(np.random, "default_rng", lambda _seed: _FixedGaps())
     runner = BenchmarkRunner(
         RunConfig(
@@ -94,10 +97,14 @@ async def test_open_loop_arrivals_overlap_in_flight_requests(
             disable_tqdm=True,
         )
     )
-    await runner.run(["a", "b", "c", "d", "e", "f", "g", "h"], send)
+    await runner.run(
+        ["a", "b", "c", "d", "e", "f", "g", "h"], send, after_send=after_send
+    )
 
     assert len(starts) == 8
     assert max(starts) - min(starts) < 0.25
+    # The 0.3 s follow-ups would double a window that ends with the last send.
+    assert runner.wall_clock_s < 0.6
 
 
 @pytest.mark.asyncio
@@ -124,6 +131,34 @@ async def test_requests_that_get_a_slot_at_once_are_not_marked() -> None:
     results = await runner.run(["a", "b", "c"], _send)
 
     assert not any(r.waited_for_slot for r in results)
+
+
+@pytest.mark.asyncio
+async def test_after_send_runs_outside_the_slot_and_the_timed_window() -> None:
+    second_started = asyncio.Event()
+    followed: list[str] = []
+
+    async def send(_session, sample: str) -> RequestResult:
+        if sample == "b":
+            second_started.set()
+        return RequestResult(request_id=sample, is_success=True)
+
+    async def after_send(_session, result: RequestResult) -> None:
+        if result.request_id == "a":
+            # note (Yucheng Hu): a slot still held here would keep "b" from starting.
+            await asyncio.wait_for(second_started.wait(), timeout=1)
+        await asyncio.sleep(0.2)
+        followed.append(result.request_id)
+
+    runner = BenchmarkRunner(RunConfig(max_concurrency=1, warmup=2, disable_tqdm=True))
+    results = await asyncio.wait_for(
+        runner.run(["a", "b"], send, after_send=after_send), timeout=2
+    )
+
+    assert [r.request_id for r in results] == ["a", "b"]
+    # Warmup requests get no follow-up; the run waits for the measured ones.
+    assert sorted(followed) == ["a", "b"]
+    assert runner.wall_clock_s < 0.1
 
 
 def arrival_offsets(seed: int, rate: float, count: int) -> np.ndarray:
