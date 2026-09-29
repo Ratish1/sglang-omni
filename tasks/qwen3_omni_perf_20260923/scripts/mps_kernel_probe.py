@@ -150,6 +150,18 @@ def main() -> None:
     graph = capture(mixed, rounds)
     print(f"mixed round of all us {per_launch_us(graph, rounds):.2f}")
     print(kernel_means(graph, rounds))
+    single_split = sglang_decode_attention_body(device, num_splits=1)
+
+    def mixed_single_split() -> None:
+        for body in list(bodies.values())[:-1]:
+            body()
+        single_split()
+
+    graph = capture(mixed_single_split, rounds)
+    print(
+        f"mixed round with the decode attention in one split us {per_launch_us(graph, rounds):.2f}"
+    )
+    print(kernel_means(graph, rounds))
     # one byte from each of 8192 pages 2 MB apart over 16 GB, against the same gather
     # from contiguous bytes: equal work, only the address translations touched differ
     sweep = torch.empty(16 * 2**30, dtype=torch.uint8, device=device)
@@ -248,11 +260,11 @@ def sm_reach(sms: int) -> str:
     )
 
 
-def sglang_decode_attention_body(device: torch.device):
+def sglang_decode_attention_body(device: torch.device, num_splits: int = 0):
     """One thinker decode attention call as sglang's FA3 backend makes it in the decode
     graph: page size 1 over a 200k token pool, a varlen query of one token, automatic
-    split count, and scheduler metadata computed before the call against the thinker's
-    32768 context."""
+    split count (or the given one), and scheduler metadata computed before the call
+    against the thinker's 32768 context."""
     from sgl_kernel.flash_attn import flash_attn_with_kvcache, get_scheduler_metadata
 
     pool, heads_q, heads_kv, dim, seqlen = 200_000, 32, 4, 128, 300
@@ -280,7 +292,7 @@ def sglang_decode_attention_body(device: torch.device):
         cu_seqlens_q=cu_seqlens_q,
         page_size=1,
         causal=True,
-        num_splits=0,
+        num_splits=num_splits,
     )
     return lambda: flash_attn_with_kvcache(
         q=q,
@@ -292,7 +304,7 @@ def sglang_decode_attention_body(device: torch.device):
         max_seqlen_q=1,
         softmax_scale=dim**-0.5,
         causal=True,
-        num_splits=0,
+        num_splits=num_splits,
         out=out,
         scheduler_metadata=scheduler_metadata,
     )
