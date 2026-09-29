@@ -45,6 +45,37 @@ def inputs(batch: int, frames: int, dtype: torch.dtype) -> tuple[torch.Tensor, .
     )
 
 
+def compare_compiled_chunk_mask(chunk_size: int) -> dict[str, object]:
+    """The patched chunk mask, eager against compiled with main's options, over
+    the batch and frame sizes serving presents, both streaming modes."""
+    from cosyvoice.flow.DiT import dit as dit_module
+
+    chunk_mask = dit_module.add_optional_chunk_mask
+    compiled = torch.compile(chunk_mask, dynamic=True)
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    checked, mismatches = 0, []
+    for batch in (1, 2, 5, 16, 32):
+        for frames in range(4, 1300, 37):
+            lengths = torch.randint(
+                1, frames + 1, (batch,), device="cuda", generator=generator
+            )
+            valid = torch.arange(frames, device="cuda")[None] < lengths[:, None]
+            xs = torch.empty(batch, frames, 8, device="cuda")
+            for static in (chunk_size, 0):
+                expected = chunk_mask(
+                    xs, valid[:, None].clone(), False, False, 0, static, -1
+                )
+                actual = compiled(
+                    xs, valid[:, None].clone(), False, False, 0, static, -1
+                )
+                checked += 1
+                if not torch.equal(expected, actual):
+                    mismatches.append([batch, frames, static])
+                else:
+                    pass
+    return {"chunk_size": chunk_size, "checked": checked, "mismatches": mismatches}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="FunAudioLLM/Fun-CosyVoice3-0.5B-2512")
@@ -67,6 +98,14 @@ def main() -> None:
 
     start = time.perf_counter()
     if args.variant == "main":
+        stages.compile_dit_backbone(flow, autocast_dtype=dtype)
+    elif args.variant == "mask_compiled":
+        mask_report = compare_compiled_chunk_mask(estimator.static_chunk_size)
+        (args.out / "mask_compiled_mask.json").write_text(json.dumps(mask_report))
+        print(json.dumps(mask_report))
+        start = time.perf_counter()
+        # Skips the torch.compiler.disable wrap; the rest is main's compile.
+        stages.CHUNK_MASK_COMPILE_DISABLED = True
         stages.compile_dit_backbone(flow, autocast_dtype=dtype)
     elif args.variant in ("nested", "nested_disable"):
         from cosyvoice.flow.DiT import dit as dit_module
@@ -122,6 +161,9 @@ def main() -> None:
         "compile_and_warmup_s": round(compile_s, 2),
         "warmup_s": round(warm_s, 2),
         "forward_ms": timings,
+        "nonfinite": {
+            name: int((~torch.isfinite(out)).sum()) for name, out in outputs.items()
+        },
         "counters": {
             k: {str(a)[:80]: b for a, b in v.items()} for k, v in counters.items()
         },
