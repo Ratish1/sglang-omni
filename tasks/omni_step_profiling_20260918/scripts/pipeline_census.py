@@ -221,6 +221,8 @@ class Report:
             (PUSH_POP, MARK),
         ):
             label = self.text(text, text_id)
+            if not label:
+                continue
             if kind == MARK:
                 if label.startswith("thread name="):
                     self.thread_names[tid] = label.split(" ")[1][5:]
