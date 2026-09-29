@@ -14,6 +14,8 @@ usage: [PROBE_FOOTPRINT_GB=100] python mps_kernel_probe.py
 
 from __future__ import annotations
 
+import collections
+import json
 import os
 import re
 
@@ -58,27 +60,43 @@ def per_launch_us(graph: torch.cuda.CUDAGraph, launches: int) -> float:
 
 
 def kernel_means(graph: torch.cuda.CUDAGraph, launches: int) -> str:
+    """Per kernel name over three replays: launches per round, mean duration, and mean
+    start minus the previous kernel's end (negative: started before it ended)."""
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         for _ in range(3):
             graph.replay()
         torch.cuda.synchronize()
-    rows = [
-        row
-        for row in prof.key_averages()
-        if row.self_device_time_total > 0 and row.count >= 3 * launches
-    ]
-    rows.sort(key=lambda row: -row.self_device_time_total)
+    path = f"/tmp/mps_kernel_probe_{os.getpid()}.json"
+    prof.export_chrome_trace(path)
+    with open(path) as handle:
+        kernels = [
+            event
+            for event in json.load(handle)["traceEvents"]
+            if event.get("cat") == "kernel"
+        ]
+    os.remove(path)
+    kernels.sort(key=lambda event: event["ts"])
+    stats: dict[str, list[float]] = collections.defaultdict(lambda: [0, 0.0, 0.0])
+    previous_end = kernels[0]["ts"]
+    for event in kernels:
+        row = stats[event["name"]]
+        row[0] += 1
+        row[1] += event["dur"]
+        row[2] += event["ts"] - previous_end
+        previous_end = max(previous_end, event["ts"] + event["dur"])
     lines = []
-    for row in rows[:10]:
+    for name, (count, duration, lead) in sorted(
+        stats.items(), key=lambda item: -item[1][1]
+    )[:10]:
         # an FA3 forward name lists its cluster shape, then its tile shape
-        constants = CUTE_CONSTANT.findall(row.key)
+        constants = CUTE_CONSTANT.findall(name)
         tile = (
             f" tile {'x'.join(constants[3:6])}"
-            if "FlashAttnFwdSm90" in row.key and len(constants) >= 6
+            if "FlashAttnFwdSm90" in name and len(constants) >= 6
             else ""
         )
         lines.append(
-            f"    {row.count // (3 * launches)}/round mean us {row.self_device_time_total / row.count:7.2f}  {row.key[:60]}{tile}"
+            f"    {int(count) // (3 * launches)}/round mean us {duration / count:7.2f} start-prev_end {lead / count:6.2f}  {name[:60]}{tile}"
         )
     return "\n".join(lines)
 
