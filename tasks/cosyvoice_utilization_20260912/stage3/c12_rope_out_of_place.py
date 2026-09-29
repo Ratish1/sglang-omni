@@ -23,10 +23,16 @@ from sglang_omni.models.fun_cosyvoice3 import packed_dit
 
 
 def rotated(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    rotary = x[..., : cos.shape[-1]]
-    half = torch.stack((-rotary[..., 1::2], rotary[..., ::2]), dim=-1).flatten(-2)
-    turned = (rotary * cos + half * sin).to(x.dtype)
-    return torch.cat((turned, x[..., cos.shape[-1] :]), dim=-1)
+    # One pointwise expression over every channel, so Inductor writes the
+    # result in one kernel: the rotary channels as rotate_in_place computes
+    # them, the rest x itself (a cat realized the rotary part, then copied).
+    rotary_dims, width = cos.shape[-1], x.shape[-1]
+    cos = torch.nn.functional.pad(cos, (0, width - rotary_dims))
+    sin = torch.nn.functional.pad(sin, (0, width - rotary_dims))
+    half = torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).flatten(-2)
+    turned = (x * cos + half * sin).to(x.dtype)
+    is_rotary = torch.arange(width, device=x.device) < rotary_dims
+    return torch.where(is_rotary, turned, x)
 
 
 def attend(attn, x, rope, attention):
