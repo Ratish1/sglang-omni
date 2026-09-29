@@ -29,6 +29,10 @@ from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from torch import nn
 
 import sglang_omni.models.qwen3_tts.sglang_model as sglang_model_module
+from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
+    allocate_split_scratch,
+    resolve_predictor_layer_shape,
+)
 from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
 from sglang_omni.vendor.sglang.layers import RMSNorm
 from sglang_omni.vendor.sglang.models import apply_qk_norm
@@ -129,6 +133,7 @@ def build_talker(device: torch.device) -> Qwen3TTSTalker:
         talker.predictor_k_cache.device
     )
     talker.predictor_rope_stores_kv = False
+    talker.predictor_layer_shape = None
     talker.output_codes = torch.zeros(
         MAX_BS, NUM_CODE_GROUPS, dtype=torch.long, device=device
     )
@@ -2048,3 +2053,182 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+FUSED_HIDDEN = 1024
+FUSED_INTERMEDIATE = 3072
+FUSED_NUM_HEADS = 16
+FUSED_NUM_KV_HEADS = 8
+FUSED_HEAD_DIM = 128
+FUSED_PREDICTOR_LEN = 17
+FUSED_MAX_BS = 64
+
+
+class GatedMLP(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+        super().__init__()
+        self.gate_up_proj = TupleLinear(hidden_size, 2 * intermediate_size)
+        self.down_proj = TupleLinear(intermediate_size, hidden_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate, up = self.gate_up_proj(hidden_states)[0].chunk(2, dim=-1)
+        return self.down_proj(torch.nn.functional.silu(gate) * up)[0]
+
+
+def real_shape_norm(size: int, device: torch.device) -> RMSNorm:
+    norm = RMSNorm(size, eps=1e-6).to(device, DTYPE)
+    with torch.no_grad():
+        norm.weight.normal_(1.0, 0.1)
+    return norm
+
+
+def real_shape_layer(device: torch.device) -> SimpleNamespace:
+    attention = SimpleNamespace(
+        hidden_size=FUSED_HIDDEN,
+        q_size=FUSED_NUM_HEADS * FUSED_HEAD_DIM,
+        kv_size=FUSED_NUM_KV_HEADS * FUSED_HEAD_DIM,
+        num_heads=FUSED_NUM_HEADS,
+        num_kv_heads=FUSED_NUM_KV_HEADS,
+        head_dim=FUSED_HEAD_DIM,
+        q_norm=real_shape_norm(FUSED_HEAD_DIM, device),
+        k_norm=real_shape_norm(FUSED_HEAD_DIM, device),
+        alt_stream=None,
+        qkv_proj=TupleLinear(
+            FUSED_HIDDEN, (FUSED_NUM_HEADS + 2 * FUSED_NUM_KV_HEADS) * FUSED_HEAD_DIM
+        ).to(device, DTYPE),
+        o_proj=TupleLinear(FUSED_NUM_HEADS * FUSED_HEAD_DIM, FUSED_HIDDEN).to(
+            device, DTYPE
+        ),
+        rotary_emb=RotaryEmbedding(
+            FUSED_HEAD_DIM, FUSED_HEAD_DIM, 64, 10000, True, DTYPE
+        ).to(device),
+    )
+    return SimpleNamespace(
+        input_layernorm=real_shape_norm(FUSED_HIDDEN, device),
+        post_attention_layernorm=real_shape_norm(FUSED_HIDDEN, device),
+        self_attn=attention,
+        mlp=GatedMLP(FUSED_HIDDEN, FUSED_INTERMEDIATE).to(device, DTYPE),
+    )
+
+
+def real_shape_talker(
+    device: torch.device,
+    layers: list[SimpleNamespace],
+    final_norm: RMSNorm,
+    *,
+    fused: bool,
+) -> Qwen3TTSTalker:
+    """A predictor at the checkpoint's shapes; fused runs the Triton layer launches."""
+    talker = object.__new__(Qwen3TTSTalker)
+    talker.training = False
+    positions = torch.arange(FUSED_PREDICTOR_LEN, device=device, dtype=torch.long)
+    talker.predictor_position_rows = (
+        positions[:, None].expand(FUSED_PREDICTOR_LEN, FUSED_MAX_BS).contiguous()
+    )
+    talker.predictor_cache_slots = (
+        torch.arange(FUSED_MAX_BS, device=device, dtype=torch.long)[None, :]
+        * FUSED_PREDICTOR_LEN
+        + positions[:, None]
+    ).contiguous()
+    talker.predictor_pair_positions = positions[:2].repeat(FUSED_MAX_BS)
+    talker.predictor_pair_cache_slots = talker.predictor_cache_slots[:2].t().reshape(-1)
+    talker.predictor_k_cache = torch.zeros(
+        len(layers),
+        FUSED_MAX_BS,
+        FUSED_PREDICTOR_LEN,
+        FUSED_NUM_KV_HEADS,
+        FUSED_HEAD_DIM,
+        device=device,
+        dtype=DTYPE,
+    )
+    talker.predictor_v_cache = torch.zeros_like(talker.predictor_k_cache)
+    talker.predictor_rope_stores_kv = False
+    talker.code_predictor = SimpleNamespace(
+        model=SimpleNamespace(layers=layers, norm=final_norm)
+    )
+    if fused:
+        shape = resolve_predictor_layer_shape(
+            talker.code_predictor, FUSED_PREDICTOR_LEN, device
+        )
+        assert shape is not None
+        rows = 2 * FUSED_MAX_BS
+        talker.predictor_layer_shape = shape
+        talker.predictor_q_buffer = torch.zeros(
+            rows, FUSED_NUM_HEADS * FUSED_HEAD_DIM, device=device, dtype=DTYPE
+        )
+        talker.predictor_residual = torch.zeros(
+            rows, FUSED_HIDDEN, device=device, dtype=DTYPE
+        )
+        talker.predictor_activated = torch.zeros(
+            rows, FUSED_INTERMEDIATE, device=device, dtype=DTYPE
+        )
+        (
+            talker.predictor_partials,
+            talker.predictor_sum_sq_partials,
+            talker.predictor_tile_counters,
+        ) = allocate_split_scratch(shape, rows, device)
+    else:
+        talker.predictor_layer_shape = None
+    return talker
+
+
+def relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    return float((actual.float() - expected.float()).norm() / expected.float().norm())
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("batch_size", [1, 5, 64])
+def test_fused_predictor_layers_track_the_plain_layers(
+    monkeypatch: pytest.MonkeyPatch, batch_size: int
+) -> None:
+    """The Triton layer launches compute the plain predictor pass: the opening pair
+    and the single-token passes after it, and the K and V cache rows they write."""
+    from sglang.srt.model_executor.cuda_graph_config import (
+        Backend,
+        CudaGraphConfig,
+        PhaseConfig,
+    )
+    from sglang.srt.runtime_context import get_context
+
+    monkeypatch.setattr(sglang_model_module, "apply_qk_norm", apply_qk_norm)
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    layers = [real_shape_layer(device) for _ in range(2)]
+    final_norm = real_shape_norm(FUSED_HIDDEN, device)
+    talkers = [
+        real_shape_talker(device, layers, final_norm, fused=fused)
+        for fused in (False, True)
+    ]
+    pair = torch.randn(batch_size, 2, FUSED_HIDDEN, device=device, dtype=DTYPE)
+    singles = torch.randn(4, batch_size, 1, FUSED_HIDDEN, device=device, dtype=DTYPE)
+    results = []
+    with (
+        get_context().override_server_args(
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+        ),
+        torch.no_grad(),
+    ):
+        for talker in talkers:
+            outputs = [
+                talker.predictor_forward_tokens(
+                    token_embeds=pair.clone(), batch_size=batch_size, cache_len=0
+                ).clone()
+            ]
+            for step, token in enumerate(singles):
+                outputs.append(
+                    talker.predictor_forward_tokens(
+                        token_embeds=token.clone(),
+                        batch_size=batch_size,
+                        cache_len=2 + step,
+                    ).clone()
+                )
+            results.append(outputs)
+
+    for plain, fused in zip(*results):
+        assert relative_error(fused, plain) < 2e-2
+    for cache in ("predictor_k_cache", "predictor_v_cache"):
+        plain_cache = getattr(talkers[0], cache)[:, :batch_size, :6]
+        fused_cache = getattr(talkers[1], cache)[:, :batch_size, :6]
+        assert relative_error(fused_cache, plain_cache) < 2e-2
