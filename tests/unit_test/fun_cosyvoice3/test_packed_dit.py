@@ -262,7 +262,10 @@ def test_packed_compile_requires_ragged_half_precision(monkeypatch) -> None:
         {
             "backend": "inductor",
             "fullgraph": True,
-            "options": {"emulate_precision_casts": True},
+            "options": {
+                "triton.autotune_pointwise": False,
+                "emulate_precision_casts": True,
+            },
         }
     ]
 

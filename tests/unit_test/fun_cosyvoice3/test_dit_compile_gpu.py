@@ -78,6 +78,40 @@ def test_compile_dit_backbone_dynamic_shapes_match_eager() -> None:
     assert set(dict(estimator.named_parameters())) == param_names
 
 
+class ChunkMask(torch.nn.Module):
+    """The DiT's chunk mask call, its chunk size a module attribute as in DiT."""
+
+    def __init__(self, chunk_mask, static_chunk_size: int) -> None:
+        super().__init__()
+        self.chunk_mask = chunk_mask
+        self.static_chunk_size = static_chunk_size
+
+    def forward(self, xs: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+        return self.chunk_mask(xs, masks, False, False, 0, self.static_chunk_size, -1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("static_chunk_size", [50, 0])
+def test_the_compiled_chunk_mask_matches_eager(static_chunk_size: int) -> None:
+    cosyvoice_dit = pytest.importorskip("cosyvoice.flow.DiT.dit")
+    from sglang_omni.models.fun_cosyvoice3.packed_dit import DIT_INDUCTOR_OPTIONS
+    from sglang_omni.models.fun_cosyvoice3.stages import patch_chunk_mask
+
+    patch_chunk_mask()
+    eager = ChunkMask(cosyvoice_dit.add_optional_chunk_mask, static_chunk_size)
+    compiled = torch.compile(eager, options=dict(DIT_INDUCTOR_OPTIONS))
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    for batch, frames in ((1, 7), (2, 128), (5, 301), (16, 1033)):
+        lengths = torch.randint(
+            1, frames + 1, (batch,), device="cuda", generator=generator
+        )
+        valid = torch.arange(frames, device="cuda")[None] < lengths[:, None]
+        xs = torch.empty(batch, frames, 8, device="cuda")
+        # The mask fills empty rows in place, so each call gets its own copy.
+        expected = eager(xs, valid[:, None].clone())
+        assert torch.equal(compiled(xs, valid[:, None].clone()), expected)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("streaming", [True, False])
 def test_production_packed_dit_compile_matches_eager(streaming: bool) -> None:

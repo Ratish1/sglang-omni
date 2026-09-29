@@ -6,12 +6,17 @@ import pytest
 import torch
 
 import sglang_omni.models.fun_cosyvoice3.stages as stages
+from sglang_omni.models.fun_cosyvoice3.packed_dit import DIT_INDUCTOR_OPTIONS
+
+pytest.importorskip("cosyvoice.flow.DiT.modules")
+x_transformers = pytest.importorskip("x_transformers.x_transformers")
 
 
 class FakeDiTEstimator(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.scale = torch.nn.Parameter(torch.ones(1))
+        self.rotary_embed = x_transformers.RotaryEmbedding(64)
 
     def forward(self, x, mask, mu, t, spks=None, cond=None, streaming=False):
         del mask, mu, t, spks, cond, streaming
@@ -29,7 +34,7 @@ class NonModuleEstimator:
     pass
 
 
-def test_compile_dit_backbone_compiles_estimator_forward_dynamic(monkeypatch) -> None:
+def test_compile_dit_backbone_compiles_the_estimator_forward(monkeypatch) -> None:
     estimator = FakeDiTEstimator()
     flow = FakeFlow(estimator)
     original_forward = estimator.forward
@@ -38,8 +43,8 @@ def test_compile_dit_backbone_compiles_estimator_forward_dynamic(monkeypatch) ->
     compile_calls = []
     forward_shapes = []
 
-    def fake_compile(fn, dynamic=None):
-        compile_calls.append({"fn": fn, "dynamic": dynamic})
+    def fake_compile(fn, options=None):
+        compile_calls.append({"fn": fn, "options": options})
 
         def wrapped(x, mask, mu, t, spks, cond, streaming):
             forward_shapes.append(
@@ -53,7 +58,8 @@ def test_compile_dit_backbone_compiles_estimator_forward_dynamic(monkeypatch) ->
 
     stages.compile_dit_backbone(flow, warmup_mel_frames=16)
 
-    assert [call["dynamic"] for call in compile_calls] == [True]
+    # Automatic dynamic (no dynamic=True) with the shared DiT Inductor options.
+    assert [call["options"] for call in compile_calls] == [DIT_INDUCTOR_OPTIONS]
     assert compile_calls[0]["fn"] == original_forward
     # Bound-method compile keeps parameter names stable (no _orig_mod prefix).
     assert set(dict(estimator.named_parameters())) == param_names
@@ -64,6 +70,23 @@ def test_compile_dit_backbone_compiles_estimator_forward_dynamic(monkeypatch) ->
     )
 
 
+def test_compile_dit_backbone_keeps_the_rope_frequencies_bit_for_bit(
+    monkeypatch,
+) -> None:
+    estimator = FakeDiTEstimator()
+    expected_freqs, expected_scale = estimator.rotary_embed.forward_from_seq_len(37)
+    monkeypatch.setattr(torch, "compile", lambda fn, options=None: fn)
+
+    stages.compile_dit_backbone(
+        FakeFlow(estimator), warmup_mel_frames=16, warmup_steps=1
+    )
+    freqs, scale = estimator.rotary_embed.forward_from_seq_len(37)
+
+    assert freqs.dtype == torch.float32
+    assert torch.equal(freqs, expected_freqs)
+    assert scale == expected_scale
+
+
 def test_compile_dit_backbone_warmup_matches_serving_grad_mode(monkeypatch) -> None:
     # flow.inference is @torch.inference_mode(); warmup must match (Dynamo
     # guards on grad mode) so the first request reuses the warmed graph.
@@ -71,7 +94,7 @@ def test_compile_dit_backbone_warmup_matches_serving_grad_mode(monkeypatch) -> N
     flow = FakeFlow(estimator)
     modes = []
 
-    def fake_compile(fn, dynamic=None):
+    def fake_compile(fn, options=None):
         def wrapped(x, mask, mu, t, spks, cond, streaming):
             modes.append((torch.is_inference_mode_enabled(), torch.is_inference(x)))
             return fn(x, mask, mu, t, spks, cond, streaming)
@@ -101,8 +124,7 @@ def test_compile_dit_backbone_warmup_uses_serving_dtype(
     flow = FakeFlow(estimator)
     argument_dtypes: list[tuple[torch.dtype, ...]] = []
 
-    def fake_compile(fn, dynamic=None):
-        del dynamic
+    def fake_compile(fn, options=None):
 
         def wrapped(x, mask, mu, t, spks, cond, streaming):
             argument_dtypes.append(
@@ -127,7 +149,7 @@ def test_compile_dit_backbone_warmup_uses_serving_dtype(
 def test_compile_dit_backbone_rejects_non_module_estimator(monkeypatch) -> None:
     flow = FakeFlow(NonModuleEstimator())
 
-    def fail_compile(fn, dynamic=None):
+    def fail_compile(fn, options=None):
         raise AssertionError("torch.compile must not run for a non-module estimator")
 
     monkeypatch.setattr(torch, "compile", fail_compile)
@@ -148,7 +170,7 @@ def test_compile_dit_backbone_raises_and_restores_eager_on_compile_failure(
     flow = FakeFlow(estimator)
     original_forward = estimator.forward
 
-    def fail_compile(fn, dynamic=None):
+    def fail_compile(fn, options=None):
         def wrapped(x, mask, mu, t, spks, cond, streaming):
             raise RuntimeError("synthetic compile failure")
 
@@ -171,7 +193,7 @@ def test_compile_dit_backbone_raises_and_restores_eager_on_compile_failure(
 def test_compile_dit_backbone_rejects_degenerate_warmup_length(monkeypatch) -> None:
     flow = FakeFlow(FakeDiTEstimator())
 
-    def fail_compile(fn, dynamic=None):
+    def fail_compile(fn, options=None):
         raise AssertionError("torch.compile must not run for invalid warmup")
 
     monkeypatch.setattr(torch, "compile", fail_compile)

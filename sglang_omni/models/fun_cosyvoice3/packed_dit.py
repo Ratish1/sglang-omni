@@ -20,7 +20,14 @@ logger = logging.getLogger(__name__)
 # note (ratish, chenyang): a row's chunks share a key prefix, so FA3 pages are one frame.
 FA3_PAGE_SIZE = 1
 FA3_DTYPES = (torch.float16, torch.bfloat16)
-PACKED_INDUCTOR_OPTIONS: dict[str, bool] = {"emulate_precision_casts": True}
+# note(ratish): Inductor's heuristic launch config is the faster one at serving sizes; a
+# first call benchmark runs at a warmup shape where the configs tie, and the cache then
+# keeps whichever it drew.
+DIT_INDUCTOR_OPTIONS: dict[str, bool] = {"triton.autotune_pointwise": False}
+PACKED_INDUCTOR_OPTIONS: dict[str, bool] = {
+    **DIT_INDUCTOR_OPTIONS,
+    "emulate_precision_casts": True,
+}
 
 
 def ragged_fa3(
