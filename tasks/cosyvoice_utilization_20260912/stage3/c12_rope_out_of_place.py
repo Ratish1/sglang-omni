@@ -47,6 +47,11 @@ def attend(attn, x, rope, attention):
 packed_dit.PackedDiT.attend = staticmethod(attend)
 
 if __name__ == "__main__":
+    # runpy replaces __main__'s globals, which Dynamo's guards look the patch
+    # up in; installed from an importable module instead.
+    sys.path.insert(0, str(Path(__file__).parent))
+    import c12_rope_out_of_place  # noqa: F401
+
     mode, rest = sys.argv[1], sys.argv[2:]
     if mode == "test":
         import pytest
