@@ -18,6 +18,7 @@ Sections:
   E GIL            hold and wait per thread, waiter by holder
   F first chunk    per request critical path
   G attribution    graph and eager kernels by capture site and op call site
+  H playback       per chunk margin at the coordinator: audio delivered against time
 
 usage: python pipeline_census.py REPORT.sqlite --bench-log bench.log [--top 25]
        [--sections ABCDEFG]
@@ -818,6 +819,45 @@ def section_f(r: Report):
         )
 
 
+def section_h(r: Report, sample_rate: int = 24000):
+    print(
+        "\n## H. playback margin at the coordinator (ms; audio delivered minus time since the first chunk)"
+    )
+    arrivals = collections.defaultdict(list)
+    for t, tid, label in r.marks:
+        match = re.match(r"coord\.recv rid=(\S+) n=(\d+)", label)
+        if match:
+            arrivals[match.group(1)].append((t, int(match.group(2))))
+    if not arrivals:
+        print("  no coord.recv marks with a sample count in this report")
+        return
+    margins, late, stalls, gaps = [], 0, [], []
+    for rid, chunks in arrivals.items():
+        chunks.sort()
+        first = chunks[0][0]
+        delivered = 0.0
+        stall = 0.0
+        for index, (t, samples) in enumerate(chunks):
+            if index:
+                margin = first + delivered * 1e9 + stall - t
+                margins.append(margin)
+                gaps.append(t - chunks[index - 1][0])
+                if margin < 0:
+                    late += 1
+                    stall += -margin
+            delivered += samples / sample_rate
+        stalls.append(stall)
+    print(
+        f"  requests {len(arrivals)}, chunks after the first {len(margins)}, late {late} ({100 * late / max(len(margins), 1):.2f}%)"
+    )
+    print(
+        f"  margin p5 {ms(pct(margins, .05)):.1f}  p50 {ms(pct(margins, .5)):.1f}  min {ms(min(margins)) if margins else 0:.1f}"
+    )
+    print(
+        f"  inter chunk gap p50 {ms(pct(gaps, .5)):.1f}  p95 {ms(pct(gaps, .95)):.1f}; stall per request mean {ms(statistics.fmean(stalls)):.2f}  max {ms(max(stalls)):.1f}"
+    )
+
+
 def section_g(r: Report, top: int):
     print("\n## G. attribution: device time by capture site and op call site")
     node_rows = (
@@ -918,7 +958,7 @@ def main() -> None:
     parser.add_argument("report")
     parser.add_argument("--bench-log")
     parser.add_argument("--top", type=int, default=25)
-    parser.add_argument("--sections", default="ABCDEFG")
+    parser.add_argument("--sections", default="ABCDEFGH")
     args = parser.parse_args()
     r = Report(args.report, args.bench_log)
     print(
@@ -932,6 +972,7 @@ def main() -> None:
         "E": lambda: section_e(r),
         "F": lambda: section_f(r),
         "G": lambda: section_g(r, args.top),
+        "H": lambda: section_h(r),
     }
     for key in args.sections:
         steps[key]()

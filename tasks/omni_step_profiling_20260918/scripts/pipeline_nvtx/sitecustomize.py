@@ -282,11 +282,18 @@ def patch_runtime(module):
     stage.start = start_marked
 
 
+def coordinator_label(self, msg):
+    """The request and the chunk's sample count, from the audio payload's shape."""
+    chunk = getattr(msg, "chunk", None)
+    shape = chunk.get("audio_waveform_shape") if isinstance(chunk, dict) else None
+    samples = shape[0] if shape else "-"
+    return f"coord.recv rid={getattr(msg, 'request_id', None)} n={samples}"
+
+
 def patch_coordinator(module):
     coordinator = module.Coordinator
     coordinator.handle_stream = marked_async(
-        coordinator.handle_stream,
-        lambda self, msg: f"coord.recv rid={getattr(msg, 'request_id', None)}",
+        coordinator.handle_stream, coordinator_label
     )
 
 
