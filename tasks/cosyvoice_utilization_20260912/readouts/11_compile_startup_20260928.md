@@ -126,7 +126,49 @@ Inductor's generated code; automatic dynamic; the eager FA3 dispatch) are in
 call equal or faster at every size compile on and off, h9 streaming c16 8.787 against 8.550 req/s
 with no recompile while serving.
 
-## 8. Not a problem
+## 8. 2026-09-29: step 1 serving complete, startup root causes
+
+New lease, same H100 host. Raw: `artifacts/radix-h100-20260929/` (h10 to h14, probes c12 to c20).
+
+Step 1 (36f14d351) against main 7dc8909e7, same time pairs, full set at c16, 64 seeded at c1:
+
+| point | main | step 1 |
+|---|---|---|
+| streaming c16, h10 (swapped) / h11 (ledger) | 8.595 / 8.726 | 8.819 / 9.135 req/s |
+| buffered c16, h12 / h13 (swapped) | 14.249 / 14.868 | 13.983 / 15.221 req/s |
+| streaming c1, h14 | 1.962 | 2.024 req/s |
+| buffered c1, h14 | 2.190 | 2.202 req/s |
+
+Buffered runs identical code on both trees; the card 0 arm was about 2 % faster in both
+orientations. Streaming inter chunk p99 (h9 +7 %): higher from p95 up in h9 and h10, lower in
+h11; per final call device time (ledger) step 1 is faster in every frame bucket (-11 % to
+-1.6 %), per step too; the tail moves with batch composition. Identity: streaming c1 60 / 64,
+every difference a length change (AR tokens); buffered 55 / 64 with identical Flow code.
+
+Startup causes, each fix emulated on the probe (stage3/c7, c8, c9, c10, c11):
+- libdevice: torch 2.13 sets TRITON_LIBDEVICE_PATH lazily on the first Triton compile
+  (runtime/compile_tasks.py:74-106, async_compile.py:453-455) and every FX entry records the
+  libdevice hash (codecache.py:2086-2094). Warm native graphs hit without compiling, so the
+  first packed lookup sees Triton's bundled file while its entry holds CUDA's: miss, recompile,
+  one more entry per boot. Pinned before the first compile: packed warm 16 -> 7 s, all hits.
+- chunk mask: the "NaN compare" is Inductor's range analysis of a trunc division by a symbolic
+  chunk size; DiT.forward passes a module attribute, which Dynamo specializes, and then the mask
+  compiles exactly (0 of 360 mismatches). No graph break, native warm 83 -> 58 s, forward 3 to
+  11 % faster, distance to eager unchanged.
+- RoPE: x_transformers' @autocast(enabled=False) regions (rotary forward, apply_rotary_pos_emb)
+  bypass the AOTAutograd cache; replacements without the region are bit identical in eager (12
+  shapes). Native warm 58 -> 35 s.
+- All three: warm 66.5 s (main 149, step 1 123), cold 158.7 s (main 196). The one remaining
+  miss is a Dynamo restart of native frame 0/0: under dynamic=True the LayerNorm eps become
+  SymFloats that the tensorify pass cannot handle (_tensorify_python_scalars.py:458).
+
+TensorRT (#2402): the exclusion is forced only for the estimator slot; #2372's default made an
+explicit TRT opt-in fail, which #1969's review had prevented. The engine is batch 2 (N requests
+are N serial calls per step), full attention (streaming loses the chunk mask; the hub ONNX is
+exported without streaming), fp32 under TRT 11. The cookbook numbers predate CUDA graphs and
+PackedDiT; untested in CI. Details in tasks/cosyvoice-perf/COMPILE_2372.md.
+
+## 9. Not a problem
 
 OMP_NUM_THREADS=1 at spawn: Dynamo's GLOBAL_STATE guard includes num_threads (a 4 to 1 change
 recompiles, checked), and sglang's load_model sets one thread after the vocoder is built. The pin
