@@ -1,13 +1,13 @@
 """Every conv of one Qwen3-TTS incremental decode: its shape, the cuDNN kernels it runs,
-and what a channels-last input and weight change.
+and what a channels-last layout or another algorithm changes.
 
 Loads the checkpoint's speech tokenizer as the vocoder stage does, runs two chained
 incremental decodes of random codes (so conv histories exist), and records each
-Conv1d call and each conv_transpose1d call with its input shape. Each recorded conv
-is then timed as served (NCL contiguous input, the module's weight) and with the input
-and weight laid out channels last (strides of NLC over the same shape), in a CUDA
-graph of 10 calls, with the kernels each launches and whether the outputs match bit
-for bit.
+Conv1d call and each conv_transpose1d call with its input shape. Each recorded conv is
+then run, in a CUDA graph of 10 calls, as served (NCL contiguous input), as a 4D
+channels-last conv over (N, C, 1, L), and for dilated convs as one GEMM over the
+concatenated taps and under cuDNN's benchmark search; each with its kernels, whether
+it matches the served output bit for bit, and its distance to an fp32 conv.
 
 usage: python vocoder_conv_census.py [--rows 16] [--frames 8]
 """
@@ -22,10 +22,6 @@ import torch.nn.functional as F
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 CALLS = 10
-
-
-def channels_last(t: torch.Tensor) -> torch.Tensor:
-    return t.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 def graph_time_us(fn) -> float:
@@ -155,57 +151,112 @@ def main() -> None:
             x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
             weight = module.weight
             bias = module.bias
+            stride, padding = module.stride[0], module.padding[0]
+            dilation, groups = module.dilation[0], module.groups
+            x4 = x.unsqueeze(2).contiguous(memory_format=torch.channels_last)
+            w4 = weight.unsqueeze(2).contiguous(memory_format=torch.channels_last)
             if kind == "conv":
-
-                def run(x, w):
-                    return F.conv1d(
-                        x,
-                        w,
-                        bias,
-                        module.stride,
-                        module.padding,
-                        module.dilation,
-                        module.groups,
-                    )
-
+                variants = {
+                    "served": lambda: F.conv1d(
+                        x, weight, bias, stride, padding, dilation, groups
+                    ),
+                    "nhwc 4d": lambda: F.conv2d(
+                        x4, w4, bias, (1, stride), (0, padding), (1, dilation), groups
+                    ).squeeze(2),
+                }
+                reference = F.conv1d(
+                    x.float(),
+                    weight.float(),
+                    None if bias is None else bias.float(),
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                )
             else:
-
-                def run(x, w):
-                    return F.conv_transpose1d(
+                output_padding = module.output_padding[0]
+                variants = {
+                    "served": lambda: F.conv_transpose1d(
                         x,
-                        w,
+                        weight,
                         None,
-                        module.stride,
-                        module.padding,
-                        module.output_padding,
-                        module.groups,
-                        module.dilation,
-                    )
+                        stride,
+                        padding,
+                        output_padding,
+                        groups,
+                        dilation,
+                    ),
+                    "nhwc 4d": lambda: F.conv_transpose2d(
+                        x4,
+                        w4,
+                        None,
+                        (1, stride),
+                        (0, padding),
+                        (0, output_padding),
+                        groups,
+                        (1, dilation),
+                    ).squeeze(2),
+                }
+                reference = F.conv_transpose1d(
+                    x.float(),
+                    weight.float(),
+                    None,
+                    stride,
+                    padding,
+                    output_padding,
+                    groups,
+                    dilation,
+                )
+            if kind == "conv" and dilation > 1 and groups == 1:
+                taps = module.kernel_size[0]
+                length = shape[-1] - (taps - 1) * dilation
+                folded = (
+                    weight.permute(0, 2, 1).reshape(weight.shape[0], -1).contiguous()
+                )
 
-            x_cl = channels_last(x)
-            w_cl = channels_last(weight)
-            served = run(x, weight)
-            layout = run(x_cl, w_cl)
-            identical = torch.equal(served, layout)
-            served_us = graph_time_us(lambda: run(x, weight))
-            layout_us = graph_time_us(lambda: run(x_cl, w_cl))
-            totals["served"] += served_us
-            totals["channels last"] += layout_us
+                def unfolded_gemm():
+                    columns = torch.cat(
+                        [
+                            x[:, :, t * dilation : t * dilation + length]
+                            for t in range(taps)
+                        ],
+                        dim=1,
+                    )
+                    return torch.matmul(folded, columns) + bias.view(1, -1, 1)
+
+                variants["unfold gemm"] = unfolded_gemm
+
+                def benchmarked():
+                    torch.backends.cudnn.benchmark = True
+                    output = F.conv1d(
+                        x, weight, bias, stride, padding, dilation, groups
+                    )
+                    torch.backends.cudnn.benchmark = False
+                    return output
+
+                variants["cudnn benchmark"] = benchmarked
+            else:
+                pass
             print(
                 f"{name:<34}{kind:<10} in {module.in_channels:>5} out {module.out_channels:>5} "
-                f"k {module.kernel_size[0]} d {module.dilation[0]} g {module.groups:>4} "
-                f"x {tuple(shape)}"
+                f"k {module.kernel_size[0]} d {dilation} g {groups:>4} x {tuple(shape)}"
             )
-            print(
-                f"    served        {served_us:8.1f}  {' '.join(kernels(lambda: run(x, weight)))}"
-            )
-            print(
-                f"    channels last {layout_us:8.1f}  {' '.join(kernels(lambda: run(x_cl, w_cl)))}"
-                f"  bit identical {identical}"
-            )
+            served = variants["served"]()
+            for label, fn in variants.items():
+                output = fn()
+                time_us = graph_time_us(fn)
+                totals[label] += time_us
+                identical = torch.equal(output, served)
+                error = float((output.float() - reference).abs().max())
+                print(
+                    f"    {label:<16}{time_us:9.1f}  identical {identical!s:<5} "
+                    f"max abs vs fp32 {error:.1e}  {' '.join(kernels(fn))}"
+                )
     print(
-        f"\nsum over the decode's convs: served {totals['served']:.1f} us, "
-        f"channels last {totals['channels last']:.1f} us"
+        "\nsum over the decode's convs: "
+        + ", ".join(
+            f"{label} {value:.1f} us" for label, value in totals.items() if value
+        )
     )
 
 
