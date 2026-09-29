@@ -172,8 +172,8 @@ class FunCosyVoice3StreamingVocoderScheduler(
         # note(ratish): a second row count and length,
         # so the sizes serving varies turn symbolic at startup, not on a request.
         second = [
-            self.make_warmup_flow_input(hop_tokens),
-            self.make_warmup_flow_input(hop_tokens + self.token_hop_len),
+            self.make_warmup_flow_input(hop_tokens + index % 2 * self.token_hop_len)
+            for index in range(self.max_batch_size)
         ]
         started = time.monotonic()
         with self.vocoder.stream_context:

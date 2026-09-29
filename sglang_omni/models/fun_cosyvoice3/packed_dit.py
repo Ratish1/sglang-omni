@@ -22,7 +22,7 @@ FA3_PAGE_SIZE = 1
 FA3_DTYPES = (torch.float16, torch.bfloat16)
 # note(ratish): the first call benchmark runs at a warmup shape where configs tie;
 # the heuristic config is the faster one at serving sizes, measured on H100.
-DIT_INDUCTOR_OPTIONS: dict[str, bool] = {"triton.autotune_pointwise": False}
+DIT_INDUCTOR_OPTIONS: dict[str, bool] = {}
 PACKED_INDUCTOR_OPTIONS: dict[str, bool] = {
     **DIT_INDUCTOR_OPTIONS,
     "emulate_precision_casts": True,
