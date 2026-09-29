@@ -67,7 +67,8 @@ class SGLangGenerationEngineBuilder(ABC):
         """
         if self.supports_full_prefill_cuda_graph:
             return (CudaGraphBackend.BREAKABLE, CudaGraphBackend.FULL)
-        return (CudaGraphBackend.BREAKABLE,)
+        else:
+            return (CudaGraphBackend.BREAKABLE,)
 
     def build(
         self,
