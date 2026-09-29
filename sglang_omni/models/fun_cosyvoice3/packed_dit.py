@@ -20,9 +20,8 @@ logger = logging.getLogger(__name__)
 # note (ratish, chenyang): a row's chunks share a key prefix, so FA3 pages are one frame.
 FA3_PAGE_SIZE = 1
 FA3_DTYPES = (torch.float16, torch.bfloat16)
-# note(ratish): Inductor's heuristic launch config is the faster one at serving sizes; a
-# first call benchmark runs at a warmup shape where the configs tie, and the cache then
-# keeps whichever it drew.
+# note(ratish): the first call benchmark runs at a warmup shape where configs tie;
+# the heuristic config is the faster one at serving sizes, measured on H100.
 DIT_INDUCTOR_OPTIONS: dict[str, bool] = {"triton.autotune_pointwise": False}
 PACKED_INDUCTOR_OPTIONS: dict[str, bool] = {
     **DIT_INDUCTOR_OPTIONS,
@@ -51,8 +50,8 @@ def ragged_fa3(
     )
 
 
-# note(ratish): the compiled forward calls FA3 through this alias-free op; eager
-# calls ragged_fa3 directly, which skips the custom op dispatch on every block.
+# note(ratish): the compiled forward calls FA3 through this alias-free op;
+# eager calls ragged_fa3 directly and skips the custom op dispatch per block.
 packed_fa3 = torch.library.custom_op(
     "sglang_omni_fun_cosyvoice3::packed_fa3", mutates_args=(), device_types="cuda"
 )(ragged_fa3)
@@ -115,8 +114,8 @@ class PackedRows:
     starts_host: torch.Tensor
     row_ids: torch.Tensor
     positions: torch.Tensor
-    # note(ratish): the compiled forward reads these, not lengths, which it would
-    # guard on for every row count.
+    # note(ratish): the compiled forward reads these instead of lengths,
+    # which it would guard on for every row count.
     row_count: int
     width: int
 
@@ -316,8 +315,8 @@ class PackedDiT:
                 head_dim=attention.inner_dim // attention.heads,
             )
             if self.is_compiled:
-                # note(ratish): hints, not constraints: these share the total frames of
-                # x, which the first call specializes, and mark_dynamic would then fail.
+                # note(ratish): hints, not constraints; they share x's total frames,
+                # which the first call specializes, so mark_dynamic would fail.
                 dynamo.maybe_mark_dynamic(attention.page_table, (0, 1))
                 dynamo.maybe_mark_dynamic(attention.cu_seqlens_q, 0)
                 dynamo.maybe_mark_dynamic(attention.cache_seqlens, 0)
@@ -331,7 +330,6 @@ class PackedDiT:
         return RowAttention(rows, chunk_size=chunk_size, heads=attention.heads)
 
     def compile(self, dtype: torch.dtype | None) -> bool:
-        """Compile the forward once for hops and finals."""
         if not self.is_ragged or dtype not in FA3_DTYPES:
             logger.debug(
                 f"Skipping PackedDiT torch.compile (ragged={self.is_ragged}, dtype={dtype})"
@@ -339,9 +337,8 @@ class PackedDiT:
             return False
         else:
             pass
-        # note(ratish): automatic dynamic, not dynamic=True: that also makes the head
-        # count and head size symbols, and the reshape into FA3's layout then copies
-        # the whole query and key on every block.
+        # note(ratish): not dynamic=True, which makes the head count and size symbolic;
+        # the reshape into FA3's layout then copies query and key in every block.
         self.forward = torch.compile(
             self.forward,
             backend="inductor",
@@ -366,8 +363,8 @@ class PackedDiT:
         attention: PackedRowAttention,
         rope: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """x, mu, cond, spks: (1, total, channels); t: (1,); rope from
-        PackedDiT.rope for the same rows. Returns (1, total, out_channels)."""
+        """x, mu, cond, spks: (1, total, channels); t: (1,); rope: rope(rows).
+        Returns (1, total, out_channels)."""
         dit = self.dit
         t = dit.time_embed(t)
         h = dit.input_embed.proj(torch.cat((x, cond, mu, spks), dim=-1))
@@ -397,7 +394,6 @@ class PackedDiT:
         return dit.proj_out(h)
 
     def conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
-        """The DiT's causal conv position embedding, on the rows padded."""
         module = self.dit.input_embed.conv_pos_embed
         x = scatter_rows(h, rows, rows.width).permute(0, 2, 1)
         x = mish(module.conv1[0](F.pad(x, (module.kernel_size - 1, 0, 0, 0))))
@@ -435,8 +431,8 @@ class PackedDiT:
 
 
 def layer_norm(module: torch.nn.LayerNorm, h: torch.Tensor) -> torch.Tensor:
-    # note(ratish): Inductor rewrites the layer norm and Mish into its own
-    # arithmetic; the custom ops keep the eager kernels inside the compiled forward.
+    # note(ratish): Inductor rewrites the layer norm and Mish in its own arithmetic;
+    # the custom ops keep the eager kernels, so the compiled forward stays exact.
     if torch.compiler.is_compiling():
         return native_layer_norm(h, module.normalized_shape[0], module.eps)
     else:
@@ -461,9 +457,8 @@ def rotate_in_place(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> No
 
 
 def rotated(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """rotate_in_place's values as one pointwise expression over every channel."""
-    # note(ratish): compiled, the in-place write becomes a full copy of x before
-    # FA3; one where lets Inductor write the rotated tensor in a single kernel.
+    # note(ratish): the same values as rotate_in_place; compiled, its in-place write
+    # becomes a full copy of x before FA3, while this where is one kernel.
     rotary_dims, width = cos.shape[-1], x.shape[-1]
     cos = F.pad(cos, (0, width - rotary_dims))
     sin = F.pad(sin, (0, width - rotary_dims))
@@ -497,8 +492,8 @@ def solve_flow_euler_packed(
     spks_cfg = torch.cat((spks, torch.zeros_like(spks)), dim=0)
     spks_cfg = spks_cfg[twin_rows.row_ids].unsqueeze(0)
     flow_time = torch.zeros(1, device=noise.device, dtype=spks.dtype)
-    # note(ratish): computed outside the compiled forward, whose graph would
-    # otherwise hold RoPE's autocast region and bypass the AOTAutograd cache.
+    # note(ratish): once per solve and outside the compiled forward,
+    # whose graph would otherwise hold RoPE's autocast region and miss the AOT cache.
     rope = estimator.rope(twin_rows)
     x = noise
     t, dt = time_span[0], time_span[1] - time_span[0]

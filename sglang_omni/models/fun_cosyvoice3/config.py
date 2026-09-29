@@ -205,8 +205,8 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             pass
         vocoder = next(stage for stage in self.stages if stage.name == "vocoder")
         extras = vocoder.factory.model_extra
-        # note(ratish): only explicit flags reach here; the compile default is in
-        # stage_factory_kwargs.
+        # note(ratish): only explicit flags reach here;
+        # stage_factory_kwargs sets the compile default.
         reject_conflicting_dit_accelerators(
             enable_dit_torch_compile=bool(extras.get("enable_dit_torch_compile")),
             enable_flow_estimator_trt=bool(extras.get("enable_flow_estimator_trt")),
@@ -218,8 +218,8 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
         else:
             pass
         vocoder_factory = self.stage_named("vocoder").factory
-        # note(ratish): not in the stage literal, which the resolver would read back as
-        # explicit next to TensorRT; a set enable_dit_torch_compile overrides this.
+        # note(ratish): the resolver reads a stage literal back as an explicit choice;
+        # a set enable_dit_torch_compile overrides this default.
         kwargs: dict[str, Any] = {
             "enable_dit_torch_compile": not bool(
                 vocoder_factory.model_extra.get("enable_flow_estimator_trt")

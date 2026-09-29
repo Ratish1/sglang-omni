@@ -428,9 +428,8 @@ class FlowCudaGraphRunner:
     def capture(self, capture_shapes: tuple[tuple[int, int], ...]) -> None:
         # Note (chenyang): Capture on a side stream so other
         # kernels on default-stream are not recorded.
-        # note(ratish): CosyVoice's loader leaves its frontend's onnxruntime CUDA
-        # session in a reference cycle; a collection inside the capture would free
-        # it there and invalidate the graph.
+        # note(ratish): CosyVoice's loader leaves an onnxruntime session in a cycle;
+        # a collection inside the capture would free it there and invalidate the graph.
         gc.collect()
         graphs: dict[tuple[int, int], CapturedFlowCudaGraph] = {}
         current_stream = torch.cuda.current_stream(self.device)
@@ -1203,14 +1202,12 @@ def compile_dit_backbone(
     inductor_config.fx_graph_cache = True
     dynamo.config.cache_size_limit = 1024
     dynamo.config.accumulated_cache_size_limit = 1024
-    # note(ratish): the packed compile switches Triton to CUDA's libdevice on its first
-    # kernel build, and every cache entry records the file; a warm boot builds nothing
-    # before the packed graph's lookup, which then misses. Switch before any lookup.
+    # note(ratish): Inductor picks CUDA's libdevice on its first kernel build;
+    # cache entries record the file, so a warm boot's first lookups would miss.
     with inductor_config.patch({"eager_numerics.use_pytorch_libdevice": True}):
         _set_triton_libdevice_path()
-    # note(ratish): the DiT's RoPE runs in autocast-disabled regions, which the
-    # AOTAutograd cache refuses. The same values without them: the rotary einsum is an
-    # outer product, and applying it is elementwise, which autocast leaves alone.
+    # note(ratish): the AOT cache refuses the autocast-disabled regions around RoPE;
+    # these match without them: an outer product and elementwise ops.
     rotary = estimator.rotary_embed
     assert rotary.scale is None, "the DiT's RoPE has no xpos scale"
 
@@ -1222,8 +1219,8 @@ def compile_dit_backbone(
     rotary.forward = rotary_frequencies
     cosyvoice_dit_modules.apply_rotary_pos_emb = apply_rotary_pos_emb.__wrapped__
     try:
-        # note(ratish): automatic dynamic, not dynamic=True, which also makes the
-        # LayerNorm eps a symbol that Inductor cannot keep and restarts the compile.
+        # note(ratish): not dynamic=True, which makes the LayerNorm eps a symbol;
+        # Inductor cannot keep it and restarts the compile.
         estimator.forward = torch.compile(
             original_forward, options=dict(DIT_INDUCTOR_OPTIONS)
         )
@@ -1254,8 +1251,8 @@ def compile_dit_backbone(
                     prompt_mel = torch.randn(
                         2, 80, mel_frame, device=device, dtype=warmup_dtype
                     )
-                    # note(ratish): hints, not constraints: batch and length start
-                    # symbolic instead of being learned from the shapes that follow.
+                    # note(ratish): hints, not constraints;
+                    # batch and length start symbolic, not learned from later calls.
                     for tensor in (noisy_mel, mel_mask, token_condition, prompt_mel):
                         dynamo.maybe_mark_dynamic(tensor, (0, 2))
                     dynamo.maybe_mark_dynamic(speaker_embedding, 0)
