@@ -190,6 +190,12 @@ WER / SIM (full set): buffered 1.725 / 1.708 % and 69.99 / 69.86 (h18), 1.348 / 
 70.16 / 70.08 (h19); identical code differs by up to 0.38 WER points and 0.22 SIM points across
 runs. Raw: artifacts/radix-h100-20260929/h18, h19, probes3.
 
+History rewritten as four tested commits on ce7ccc015 (96fe1949a head). TensorRT measured (h20,
+same code, compile against TensorRT 11 fp32 as the cookbook installs it, same time): streaming
+c16 9.271 / 2.162 req/s, buffered c16 14.917 / 6.026, streaming c1 2.063 / 1.571, buffered c1
+2.195 / 2.032; WER / SIM equal within run spread. Upstream recommends fp32 TensorRT for its one
+request at a time serving (Flow batch 1 everywhere) and never compared torch.compile.
+
 TensorRT (#2402): the exclusion is forced only for the estimator slot; #2372's default made an
 explicit TRT opt-in fail, which #1969's review had prevented. The engine is batch 2 (N requests
 are N serial calls per step), full attention (streaming loses the chunk mask; the hub ONNX is
