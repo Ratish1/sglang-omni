@@ -30,9 +30,7 @@ from triton.language.extra.cuda import (
 
 LAUNCHES = 200
 REPLAYS = 20
-FA3_TILE = re.compile(
-    r"tuple<cute::C<(?:\(int\))?(\d+)>, cute::C<(?:\(int\))?(\d+)>, cute::C<(?:\(int\))?(\d+)>>"
-)
+CUTE_CONSTANT = re.compile(r"cute::C<(?:\(int\))?(\d+)>")
 
 
 def capture(body, launches: int) -> torch.cuda.CUDAGraph:
@@ -72,9 +70,13 @@ def kernel_means(graph: torch.cuda.CUDAGraph, launches: int) -> str:
     rows.sort(key=lambda row: -row.self_device_time_total)
     lines = []
     for row in rows[:10]:
-        # the second cute tuple of an FA3 forward name is its tile shape
-        tiles = FA3_TILE.findall(row.key)
-        tile = f" tile {'x'.join(tiles[1])}" if len(tiles) > 1 else ""
+        # an FA3 forward name lists its cluster shape, then its tile shape
+        constants = CUTE_CONSTANT.findall(row.key)
+        tile = (
+            f" tile {'x'.join(constants[3:6])}"
+            if "FlashAttnFwdSm90" in row.key and len(constants) >= 6
+            else ""
+        )
         lines.append(
             f"    {row.count // (3 * launches)}/round mean us {row.self_device_time_total / row.count:7.2f}  {row.key[:60]}{tile}"
         )
@@ -217,9 +219,11 @@ def sglang_decode_attention_body(device: torch.device):
     v_cache = torch.randn_like(k_cache)
     q = torch.randn(1, heads_q, dim, device=device, dtype=torch.bfloat16)
     out = torch.empty_like(q)
-    page_table = torch.arange(
+    # the graph's page table spans the whole context, which sizes the split count
+    page_table = torch.zeros(1, max_seqlen_k, device=device, dtype=torch.int32)
+    page_table[0, :seqlen] = torch.arange(
         150_000, 150_000 + seqlen, device=device, dtype=torch.int32
-    )[None, :]
+    )
     cache_seqlens = torch.tensor([seqlen], device=device, dtype=torch.int32)
     cu_seqlens_q = torch.tensor([0, 1], device=device, dtype=torch.int32)
     scheduler_metadata = get_scheduler_metadata(
