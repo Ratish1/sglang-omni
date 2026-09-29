@@ -14,6 +14,8 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     chunk_causal_mask,
     gather_rows,
     pack_rows,
+    rotate_in_place,
+    rotated,
     scatter_rows,
     solve_flow_euler_packed,
 )
@@ -104,6 +106,25 @@ def test_gather_then_scatter_keeps_the_valid_frames_and_zeroes_the_pad() -> None
     for index, length in enumerate(LENGTHS):
         torch.testing.assert_close(restored[index, :length], padded[index, :length])
         assert torch.count_nonzero(restored[index, length:]) == 0
+
+
+@pytest.mark.parametrize(
+    "dtype, bits", [(torch.bfloat16, torch.int16), (torch.float32, torch.int32)]
+)
+def test_rotated_matches_rotate_in_place_bit_for_bit(
+    dtype: torch.dtype, bits: torch.dtype
+) -> None:
+    torch.manual_seed(4)
+    x = torch.randn(1, 41, 2 * 16, dtype=dtype)
+    # A negative zero past the rotary dims must come back unchanged.
+    x[0, 0, 20] = -0.0
+    angles = torch.randn(1, 41, 8)
+    expected = x.clone()
+    rotate_in_place(expected, angles.cos(), angles.sin())
+
+    actual = rotated(x, angles.cos(), angles.sin())
+
+    assert torch.equal(actual.view(bits), expected.view(bits))
 
 
 def test_chunk_causal_mask_matches_cosyvoice() -> None:
