@@ -63,13 +63,21 @@ def programs(path: str) -> dict[tuple[str, int], list[str]]:
     by_capture = collections.defaultdict(list)
     for node, key in capture_of.items():
         by_capture[key].append(kernels[node])
-    ordered = collections.defaultdict(list)
-    for (site, start), nodes in by_capture.items():
-        ordered[site].append((start, [name for _, name in sorted(nodes)]))
+    # note: captures are numbered among every capture at their site, replayed or not,
+    # since two workloads replay different buckets of the same ladder
+    order = {}
+    for site in {site for site, _ in by_capture}:
+        starts_at_site = sorted(
+            start
+            for items in caps.values()
+            for start, _, label in items
+            if label == site
+        )
+        for index, start in enumerate(starts_at_site):
+            order[(site, start)] = index
     result = {}
-    for site, entries in ordered.items():
-        for index, (_, names) in enumerate(sorted(entries)):
-            result[(site, index)] = names
+    for (site, start), nodes in by_capture.items():
+        result[(site, order[(site, start)])] = [name for _, name in sorted(nodes)]
     return result
 
 
