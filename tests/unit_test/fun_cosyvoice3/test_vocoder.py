@@ -130,9 +130,11 @@ def test_packed_dit_compile_warmup_materializes_serving_variants() -> None:
 
     scheduler.warmup_packed_dit_compile()
 
-    # A second batch of another row count and length makes those sizes symbolic.
-    assert [len(batch) for batch in hop_batches] == [1, 2]
-    assert [len(batch) for batch in leftover_batches] == [1, 2]
+    # A second batch of another row count and length makes those sizes symbolic;
+    # it is serving sized, since its first call picks the kernels' launch configs.
+    batch_sizes = [1, scheduler.max_batch_size]
+    assert [len(batch) for batch in hop_batches] == batch_sizes
+    assert [len(batch) for batch in leftover_batches] == batch_sizes
     assert hop_batches[1][0].token.shape != hop_batches[1][1].token.shape
 
 

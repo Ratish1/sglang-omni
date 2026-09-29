@@ -170,10 +170,11 @@ class FunCosyVoice3StreamingVocoderScheduler(
         hop_tokens = self.token_hop_len + PRE_LOOKAHEAD_LEN
         first = [self.make_warmup_flow_input(hop_tokens)]
         # note(ratish): a second row count and length, so the sizes serving varies
-        # become symbolic here and do not recompile on a request.
+        # become symbolic here and do not recompile on a request. Serving sized:
+        # this first call of the symbolic graph picks each kernel's launch config.
         second = [
-            self.make_warmup_flow_input(hop_tokens),
-            self.make_warmup_flow_input(hop_tokens + self.token_hop_len),
+            self.make_warmup_flow_input(hop_tokens + index % 2 * self.token_hop_len)
+            for index in range(self.max_batch_size)
         ]
         started = time.monotonic()
         with self.vocoder.stream_context:
