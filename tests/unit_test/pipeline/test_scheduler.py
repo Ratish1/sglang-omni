@@ -696,7 +696,7 @@ def admission_req(rid: str):
 def test_enqueue_built_request_sends_the_stream_prefix_before_queueing(
     monkeypatch,
 ) -> None:
-    scheduler, events, aborts = _enqueue_limit_scheduler(monkeypatch)
+    scheduler, events, aborts = enqueue_limit_scheduler(monkeypatch)
     scheduler.max_queued_requests = 4
     seen: list[tuple] = []
 
@@ -725,7 +725,7 @@ def test_enqueue_built_request_sends_the_stream_prefix_before_queueing(
 def test_enqueue_built_request_fails_the_request_when_its_prefix_fails(
     monkeypatch,
 ) -> None:
-    scheduler, events, aborts = _enqueue_limit_scheduler(monkeypatch)
+    scheduler, events, aborts = enqueue_limit_scheduler(monkeypatch)
     scheduler.max_queued_requests = 4
 
     def stream_prefix_builder(rid, data):
