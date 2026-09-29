@@ -30,8 +30,8 @@ Names (rid = request id, the first word is the kind the census groups by):
                                           sample, collect, predictor, stage_d2h, wait_d2h,
                                           post, feedback, decode_buffers, finalize)
   voc.ingest rid=R                        one codec frame message ingested
-  mark voc.put <initial|followup> rid=R   decode work queued
-  voc.collect <initial|followup> n=N      batch gather window, marks voc.take rid=R
+  q voc_<initial|followup>.<put|get> rid=R   decode work queued and taken
+  voc.collect <initial|followup>          batch gather window of a decode worker
   voc.initial, voc.followup, voc.group, voc.launch, voc.finish, voc.drain,
   voc.cohort, voc.windows, voc.replay, voc.resolve, voc.commit rid=R,
   voc.commit_followup rid=R
@@ -479,39 +479,27 @@ def patch_vocoder(module):
         scheduler.ingest_stream_item,
         lambda self, request_id, item: f"voc.ingest rid={request_id}",
     )
-    schedule_initial = scheduler.schedule_initial
+    serving_start = scheduler.on_serving_start
 
-    def schedule_initial_marked(self, request_id, state):
-        mark(f"voc.put initial rid={request_id}")
-        return schedule_initial(self, request_id, state)
+    # note: the work queues themselves are marked; schedule_initial returns early on
+    # a stream already pending, so a mark on the call would count calls, not enqueues
+    @functools.wraps(serving_start)
+    def serving_start_marked(self):
+        serving_start(self)
+        for attr, label in (
+            ("initial_queue", "voc_initial"),
+            ("followup_queue", "voc_followup"),
+        ):
+            q = getattr(self, attr, None)
+            if q is not None:
+                instrument_queue(q, label)
 
-    scheduler.schedule_initial = schedule_initial_marked
-    enqueue_followup = scheduler.enqueue_followup
-
-    def enqueue_followup_marked(self, request_id, state):
-        mark(f"voc.put followup rid={request_id}")
-        return enqueue_followup(self, request_id, state)
-
-    scheduler.enqueue_followup = enqueue_followup_marked
-
-    def taking(fn, which):
-        @functools.wraps(fn)
-        def wrapped(self, *args, **kwargs):
-            note_thread()
-            torch_nvtx().range_push(f"voc.collect {which}")
-            try:
-                batch = fn(self, *args, **kwargs)
-            finally:
-                torch_nvtx().range_pop()
-            for entry in batch or ():
-                mark(f"voc.take {which} rid={entry[0]}")
-            return batch
-
-        return wrapped
-
-    scheduler.collect_async_batch = taking(scheduler.collect_async_batch, "initial")
-    scheduler.collect_followup_batch = taking(
-        scheduler.collect_followup_batch, "followup"
+    scheduler.on_serving_start = serving_start_marked
+    scheduler.collect_async_batch = ranged(
+        scheduler.collect_async_batch, fixed("voc.collect initial")
+    )
+    scheduler.collect_followup_batch = ranged(
+        scheduler.collect_followup_batch, fixed("voc.collect followup")
     )
     scheduler.run_initial_batch = ranged(
         scheduler.run_initial_batch,

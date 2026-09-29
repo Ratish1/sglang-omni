@@ -537,8 +537,8 @@ FRAME_HOPS = (
     ("vocoder.in.get:stream_chunk", "voc.ingest", "vocoder get to ingest"),
 )
 CHUNK_HOPS = (
-    ("voc.put", "voc.take", "decode queue wait (gather window included)"),
-    ("voc.take", "voc.commit*", "take to commit start (plan, launch, gpu, resolve)"),
+    ("voc.q.put", "voc.q.get", "decode queue wait (gather window included)"),
+    ("voc.q.get", "voc.commit*", "taken to commit start (plan, launch, gpu, resolve)"),
     ("voc.commit*", "vocoder.out.put:stream", "commit start to outbox put"),
     ("vocoder.out.put:stream", "vocoder.out.get:stream", "chunk outbox drain wake"),
     ("vocoder.out.get:stream", "coord.recv", "loop, zmq, coordinator"),
@@ -550,6 +550,7 @@ def section_c(r: Report):
     points: dict[str, dict[str, list[tuple[int, int]]]] = collections.defaultdict(
         lambda: collections.defaultdict(list)
     )
+    seen_initial: set[tuple[str, str]] = set()
     for t, tid, label in r.marks:
         match = re.match(r"q (\S+) rid=(\S+) t=(\S+)", label)
         if match:
@@ -557,10 +558,21 @@ def section_c(r: Report):
                 (t, tid)
             )
             points[match.group(1)][match.group(2)].append((t, tid))
+            if match.group(1).startswith("voc_"):
+                queue_op = "voc.q." + match.group(1).rsplit(".", 1)[1]
+                points[queue_op][match.group(2)].append((t, tid))
             continue
-        match = re.match(r"(voc\.put|voc\.take) \S+ rid=(\S+)", label)
+        # reports before 09-29 12:30 marked voc.put on every schedule_initial call,
+        # which returns early on a pending stream: only the first initial put counts
+        match = re.match(r"(voc\.put|voc\.take) (\S+) rid=(\S+)", label)
         if match:
-            points[match.group(1)][match.group(2)].append((t, tid))
+            key = "voc.q.put" if match.group(1) == "voc.put" else "voc.q.get"
+            rid = match.group(3)
+            if match.group(2) == "initial" and (key, rid) in seen_initial:
+                continue
+            if match.group(2) == "initial":
+                seen_initial.add((key, rid))
+            points[key][rid].append((t, tid))
             continue
         match = re.match(r"(\S+) rid=(\S+)", label)
         if match:
@@ -631,8 +643,8 @@ def section_c(r: Report):
             "tts_engine.out.put:stream",
             "vocoder.in.get:stream_chunk",
             "voc.ingest",
-            "voc.put",
-            "voc.take",
+            "voc.q.put",
+            "voc.q.get",
             "voc.commit*",
             "vocoder.out.put:stream",
             "coord.recv",
@@ -811,8 +823,8 @@ def section_f(r: Report):
                 "vocoder ingest",
                 kinds["voc.ingest"].start if "voc.ingest" in kinds else None,
             ),
-            ("decode queued", m.get("voc.put")),
-            ("decode taken", m.get("voc.take")),
+            ("decode queued", m.get("q voc_initial.put:-", m.get("voc.put"))),
+            ("decode taken", m.get("q voc_initial.get:-", m.get("voc.take"))),
             ("first chunk committed", commit.end),
             ("chunk at coordinator", m.get("coord.recv")),
         ]
