@@ -51,7 +51,16 @@ def compare_compiled_chunk_mask(chunk_size: int) -> dict[str, object]:
     from cosyvoice.flow.DiT import dit as dit_module
 
     chunk_mask = dit_module.add_optional_chunk_mask
-    compiled = torch.compile(chunk_mask, dynamic=True)
+
+    # DiT.forward passes its chunk size as a module attribute, which Dynamo
+    # specializes; a closure constant keeps it static here too.
+    def masks_for(static: int):
+        def eager(xs, masks):
+            return chunk_mask(xs, masks, False, False, 0, static, -1)
+
+        return eager, torch.compile(eager, dynamic=True)
+
+    variants = {static: masks_for(static) for static in (chunk_size, 0)}
     generator = torch.Generator(device="cuda").manual_seed(0)
     checked, mismatches = 0, []
     for batch in (1, 2, 5, 16, 32):
@@ -61,13 +70,9 @@ def compare_compiled_chunk_mask(chunk_size: int) -> dict[str, object]:
             )
             valid = torch.arange(frames, device="cuda")[None] < lengths[:, None]
             xs = torch.empty(batch, frames, 8, device="cuda")
-            for static in (chunk_size, 0):
-                expected = chunk_mask(
-                    xs, valid[:, None].clone(), False, False, 0, static, -1
-                )
-                actual = compiled(
-                    xs, valid[:, None].clone(), False, False, 0, static, -1
-                )
+            for static, (eager, compiled) in variants.items():
+                expected = eager(xs, valid[:, None].clone())
+                actual = compiled(xs, valid[:, None].clone())
                 checked += 1
                 if not torch.equal(expected, actual):
                     mismatches.append([batch, frames, static])
