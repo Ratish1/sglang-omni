@@ -132,11 +132,23 @@ def main() -> None:
     graph = capture(mixed, rounds)
     print(f"mixed round of all us {per_launch_us(graph, rounds):.2f}")
     print(kernel_means(graph, rounds))
+    # one byte from each of 8192 pages 2 MB apart over 16 GB, against the same gather
+    # from contiguous bytes: equal work, only the address translations touched differ
+    sweep = torch.empty(16 * 2**30, dtype=torch.uint8, device=device)
+    strided = torch.arange(0, sweep.numel(), 2 * 2**20, device=device)
+    contiguous = torch.arange(strided.numel(), device=device)
+    predecessors = {name: bodies[name] for name in list(bodies)[:4]}
+    predecessors["gather over 8192 pages 2 MB apart"] = lambda: sweep.index_select(
+        0, strided
+    )
+    predecessors["gather over contiguous bytes"] = lambda: sweep.index_select(
+        0, contiguous
+    )
     # the split decode attention right after one other body, pair after pair: which
     # predecessor makes it slow
-    for name in list(bodies)[:4]:
+    for name in predecessors:
 
-        def pair(before=bodies[name]) -> None:
+        def pair(before=predecessors[name]) -> None:
             before()
             decode_attention()
 
