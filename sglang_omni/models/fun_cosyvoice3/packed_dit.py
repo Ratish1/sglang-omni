@@ -417,8 +417,12 @@ class PackedDiT:
         query = attn.to_q(x)
         key = attn.to_k(x)
         value = attn.to_v(x)
-        rotate_in_place(query, *rope)
-        rotate_in_place(key, *rope)
+        if torch.compiler.is_compiling():
+            query = rotated(query, *rope)
+            key = rotated(key, *rope)
+        else:
+            rotate_in_place(query, *rope)
+            rotate_in_place(key, *rope)
         out = attention(query, key, value).to(query.dtype)
         return attn.to_out[1](attn.to_out[0](out))
 
@@ -447,6 +451,19 @@ def rotate_in_place(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> No
     rotary = x[..., : cos.shape[-1]]
     half = torch.stack((-rotary[..., 1::2], rotary[..., ::2]), dim=-1).flatten(-2)
     rotary.copy_(rotary * cos + half * sin)
+
+
+def rotated(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """rotate_in_place's values as one pointwise expression over every channel."""
+    # note(ratish): compiled, the in-place write becomes a full copy of x before
+    # FA3; one where lets Inductor write the rotated tensor in a single kernel.
+    rotary_dims, width = cos.shape[-1], x.shape[-1]
+    cos = F.pad(cos, (0, width - rotary_dims))
+    sin = F.pad(sin, (0, width - rotary_dims))
+    half = torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).flatten(-2)
+    turned = (x * cos + half * sin).to(x.dtype)
+    is_rotary = torch.arange(width, device=x.device) < rotary_dims
+    return torch.where(is_rotary, turned, x)
 
 
 def solve_flow_euler_packed(
