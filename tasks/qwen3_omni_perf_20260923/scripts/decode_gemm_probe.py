@@ -86,13 +86,18 @@ def main() -> None:
             print(
                 f"{name} ({k} -> {n}) gemv   us {per_call_us(graph_gemv):.2f}  [{kernel_names(graph_gemv)}]"
             )
-            graph_cublas.replay()
-            graph_gemv.replay()
-            torch.cuda.synchronize()
-            differ = (cublas_out[0] != gemv_out[0]).sum().item()
-            largest = (cublas_out[0].float() - gemv_out[0].float()).abs().max().item()
+            # eager, since a split-K graph replayed after later captures may read a stale
+            # cuBLAS workspace
+            differ = largest = 0
+            for w in weights:
+                reference, candidate = F.linear(x, w), hopper_bf16_gemv(x, w)
+                differ += (reference != candidate).sum().item()
+                largest = max(
+                    largest,
+                    (reference.float() - candidate.float()).abs().max().item(),
+                )
             print(
-                f"{name} last layer: {differ} of {n} outputs differ, max abs difference {largest:.3e}"
+                f"{name} over {LAYERS} layers: {differ} of {n * LAYERS} outputs differ, max abs difference {largest:.3e}"
             )
         else:
             print(f"{name} ({k} -> {n}) not eligible for the Hopper GEMV")
