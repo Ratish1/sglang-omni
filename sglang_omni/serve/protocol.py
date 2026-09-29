@@ -10,6 +10,8 @@ from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
+from sglang_omni.client.types import UsageInfo
+
 
 class UsageResponse(BaseModel):
     """Token usage statistics."""
@@ -456,6 +458,14 @@ class SpeechBatchResult(BaseModel):
     media_type: str | None = None
     finish_reason: str | None = None
     error: dict[str, Any] | None = None
+
+
+class SpeechStreamOutcome(BaseModel):
+    """Terminal state of a finished raw PCM speech stream."""
+
+    request_id: str
+    finish_reason: str
+    usage: UsageInfo | None = None
 
 
 class SpeechBatchResponse(BaseModel):

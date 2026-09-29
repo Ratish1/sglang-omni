@@ -4,6 +4,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
+
+
+class FinishReason(str, Enum):
+    """Why a generation ended; UNKNOWN when the server reported no reason."""
+
+    UNKNOWN = "unknown"
+    STOP = "stop"
+    LENGTH = "length"
 
 
 @dataclass
@@ -18,7 +27,7 @@ class RequestResult:
     completion_tokens: int = 0
     engine_time_s: float = 0.0
     tok_per_s: float = 0.0
-    finish_reason: str | None = None
+    finish_reason: FinishReason = FinishReason.UNKNOWN
     wav_path: str = ""
     error: str = ""
     audio_ttfp_s: float | None = None

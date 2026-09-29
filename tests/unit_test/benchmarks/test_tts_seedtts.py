@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import requests
 
+from benchmarks.benchmarker.data import FinishReason
 from benchmarks.dataset.seedtts import SampleInput
 from benchmarks.eval import benchmark_tts_seedtts as tts
 from benchmarks.metrics.wer import SampleOutput, calculate_wer_metrics
@@ -219,7 +220,7 @@ def test_stream_send_fn_looks_up_terminal_state_by_response_request_id():
 
     assert result.is_success
     session.get.assert_called_once_with("http://host/v1/audio/speech/speech-1")
-    assert result.finish_reason == "length"
+    assert result.finish_reason is FinishReason.LENGTH
     assert result.prompt_tokens == 7
     assert result.completion_tokens == 120
     assert result.tok_per_s == pytest.approx(25.0)

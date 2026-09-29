@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+# note (Yucheng Hu): finish reason reported on speech surfaces when the model
+# did not say how generation ended.
+UNKNOWN_FINISH_REASON = "unknown"
+
 
 @dataclass
 class Message:
@@ -139,6 +143,9 @@ class GenerateChunk:
     output_token_logprobs: list[Any] | None = None
     omni_rollout: dict[str, Any] | None = None
     finish_reason: str | None = None
+    # note (Yucheng Hu): the reason the model itself reported; empty when it
+    # reported none and finish_reason is only the builder's terminal marker.
+    model_finish_reason: str = ""
     usage: UsageInfo | None = None
     weight_version: str | None = None
     stage_id: int | None = None
@@ -236,7 +243,7 @@ class SpeechResult:
     format: str
     sample_rate: int | None = None
     usage: UsageInfo | None = None
-    finish_reason: str | None = None
+    finish_reason: str = UNKNOWN_FINISH_REASON
 
 
 class ClientError(Exception):

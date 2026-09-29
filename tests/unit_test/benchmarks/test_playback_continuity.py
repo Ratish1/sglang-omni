@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from benchmarks.benchmarker.data import RequestResult
+from benchmarks.benchmarker.data import FinishReason, RequestResult
 from benchmarks.metrics.performance import compute_speed_metrics
 from benchmarks.metrics.playback_continuity import (
     compute_max_playback_underrun_s,
@@ -164,9 +164,9 @@ def test_compute_speed_metrics_reports_all_single_chunk_streams() -> None:
 
 
 def test_compute_speed_metrics_counts_max_token_hits() -> None:
-    def request_result(request_id: str, finish_reason: str | None) -> RequestResult:
+    def request_result(finish_reason: FinishReason) -> RequestResult:
         return RequestResult(
-            request_id=request_id,
+            request_id=finish_reason.value,
             is_success=True,
             latency_s=1.0,
             audio_duration_s=1.0,
@@ -174,19 +174,11 @@ def test_compute_speed_metrics_counts_max_token_hits() -> None:
             finish_reason=finish_reason,
         )
 
-    metrics = compute_speed_metrics(
-        [
-            request_result("stop", "stop"),
-            request_result("hit", "length"),
-            request_result("unknown", None),
-        ]
-    )
+    metrics = compute_speed_metrics([request_result(reason) for reason in FinishReason])
     assert metrics["max_token_hits"] == 1
-    assert metrics["max_token_hit_rate"] == pytest.approx(0.5)
+    assert metrics["finish_reason_observed"] == 2
 
-    # A run whose responses carried no finish reason reports None, not zero.
-    unknown = compute_speed_metrics(
-        [request_result("a", None), request_result("b", None)]
-    )
-    assert unknown["max_token_hits"] is None
-    assert unknown["max_token_hit_rate"] is None
+    # A run whose responses carried no finish reason observed nothing.
+    unknown = compute_speed_metrics([request_result(FinishReason.UNKNOWN)])
+    assert unknown["max_token_hits"] == 0
+    assert unknown["finish_reason_observed"] == 0

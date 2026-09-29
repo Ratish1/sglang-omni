@@ -60,6 +60,7 @@ from sglang_omni.client.audio import (
     encode_pcm,
     select_audio_delta,
 )
+from sglang_omni.client.types import UNKNOWN_FINISH_REASON
 from sglang_omni.config import (
     CustomVoiceConfig,
     RealtimeTranscriptionConfig,
@@ -1544,13 +1545,10 @@ def register_speech(app: FastAPI) -> None:
 
         headers = {
             "Content-Disposition": f'attachment; filename="speech.{result.format}"',
-        }
-        if result.finish_reason is not None:
             # note (Junnan Li): the body is binary audio, so the terminal state
             # travels in the same X- header channel as usage.
-            headers["X-Finish-Reason"] = str(result.finish_reason)
-        else:
-            pass
+            "X-Finish-Reason": result.finish_reason,
+        }
         if result.usage is not None:
             if result.usage.prompt_tokens is not None:
                 headers["X-Prompt-Tokens"] = str(result.usage.prompt_tokens)
@@ -1582,7 +1580,7 @@ def register_speech(app: FastAPI) -> None:
                 detail=f"No finished speech stream with request id {request_id}",
             )
         else:
-            return JSONResponse(stream_outcome.to_dict())
+            return JSONResponse(stream_outcome.model_dump())
 
 
 def register_speech_batch(app: FastAPI) -> None:
@@ -1714,15 +1712,15 @@ async def speech_audio_response(
 ) -> StreamingResponse:
     """Build a raw PCM stream after deriving headers from the first audio chunk."""
     emitted_samples = 0
-    finish_reason: str | None = None
+    finish_reason = UNKNOWN_FINISH_REASON
     usage: UsageInfo | None = None
 
     def record_terminal_chunk_state(chunk: GenerateChunk) -> None:
-        # note (Yucheng Hu): the terminal chunk carries these; the last non-None
+        # note (Yucheng Hu): the terminal chunk carries these; the last reported
         # value wins so the outcome can be served once the stream has ended.
         nonlocal finish_reason, usage
-        if chunk.finish_reason is not None:
-            finish_reason = chunk.finish_reason
+        if chunk.model_finish_reason:
+            finish_reason = chunk.model_finish_reason
         else:
             pass
         if chunk.usage is not None:

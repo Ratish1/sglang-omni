@@ -9,23 +9,9 @@ terminal state by request id for GET /v1/audio/speech/{request_id}.
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
 
 from sglang_omni.client.types import UsageInfo
-
-
-@dataclass(frozen=True, kw_only=True)
-class SpeechStreamOutcome:
-    request_id: str
-    finish_reason: str | None
-    usage: UsageInfo | None
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "request_id": self.request_id,
-            "finish_reason": self.finish_reason,
-            "usage": self.usage.to_dict() if self.usage is not None else None,
-        }
+from sglang_omni.serve.protocol import SpeechStreamOutcome
 
 
 class SpeechStreamOutcomes:
@@ -38,7 +24,7 @@ class SpeechStreamOutcomes:
         )
 
     def record(
-        self, request_id: str, finish_reason: str | None, usage: UsageInfo | None
+        self, request_id: str, finish_reason: str, usage: UsageInfo | None
     ) -> None:
         self.outcomes_by_request_id[request_id] = SpeechStreamOutcome(
             request_id=request_id, finish_reason=finish_reason, usage=usage

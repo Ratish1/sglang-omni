@@ -33,10 +33,10 @@ class PipelineStateBase:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     engine_time_s: float = 0.0
-    # note (Yucheng Hu): engine terminal state (stop, length, abort). It rides
-    # with the usage fields so a client can tell a generation that hit its
-    # max-token limit from a natural stop.
-    finish_reason: str | None = None
+    # note (Yucheng Hu): engine terminal state (stop, length, abort), empty until
+    # the engine reports one. It rides with the usage fields so a client can
+    # tell a generation that hit its max-token limit from a natural stop.
+    finish_reason: str = ""
 
     # Note(Chenchen Hong): subclasses must override; the stub turns a forgotten
     # override into a clear contract error rather than an AttributeError in store_state.

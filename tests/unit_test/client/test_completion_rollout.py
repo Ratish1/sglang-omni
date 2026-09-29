@@ -76,6 +76,13 @@ def test_speech_surfaces_finish_reason() -> None:
     assert result.finish_reason == "length"
     assert result.mime_type == "audio/pcm"
 
+    unreported = asyncio.run(
+        Client(
+            SubmitStubCoordinator({"audio_data": [0.0, 0.1], "sample_rate": 24000})
+        ).speech(GenerateRequest(prompt="hello"), request_id="speech-2")
+    )
+    assert unreported.finish_reason == "unknown"
+
 
 def test_completion_surfaces_omni_rollout() -> None:
     rollout = {

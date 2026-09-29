@@ -242,6 +242,7 @@ class TerminalChunkStreamingSpeechClient:
             audio_data=None,
             sample_rate=24000,
             finish_reason="length",
+            model_finish_reason="length",
             usage=UsageInfo(prompt_tokens=7, completion_tokens=120),
         )
 
@@ -1303,7 +1304,7 @@ def test_speech_stream_defaults_to_raw_pcm() -> None:
     outcome = client.get(f"/v1/audio/speech/{request_id}")
     assert outcome.json() == {
         "request_id": request_id,
-        "finish_reason": "stop",
+        "finish_reason": "unknown",
         "usage": None,
     }
     assert client.get("/v1/audio/speech/speech-unknown").status_code == 404

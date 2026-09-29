@@ -27,7 +27,7 @@ import soundfile as sf
 import torch
 from tqdm import tqdm
 
-from benchmarks.benchmarker.data import RequestResult
+from benchmarks.benchmarker.data import FinishReason, RequestResult
 from benchmarks.benchmarker.runner import SendFn
 from benchmarks.benchmarker.utils import (
     WAV_HEADER_SIZE,
@@ -1117,7 +1117,12 @@ def _parse_response_headers(result: RequestResult, headers: dict) -> None:
         result.completion_tokens = int(comp_tok)
     if eng_time is not None:
         result.engine_time_s = float(eng_time)
-    result.finish_reason = headers.get("X-Finish-Reason")
+    try:
+        result.finish_reason = FinishReason(headers.get("X-Finish-Reason"))
+    except ValueError:
+        # note (Yucheng Hu): absent from servers without the header; other
+        # values are engine states this metric does not classify.
+        result.finish_reason = FinishReason.UNKNOWN
     if result.completion_tokens > 0 and result.engine_time_s > 0:
         result.tok_per_s = result.completion_tokens / result.engine_time_s
 
