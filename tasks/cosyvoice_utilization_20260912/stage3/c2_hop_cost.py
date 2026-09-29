@@ -30,16 +30,18 @@ LOOKAHEAD = 3
 REPEATS = 20
 
 
-def make_items(rows: int, target_tokens: int, flow) -> list[FlowBatchInput]:
+def make_items(
+    rows: int, target_tokens: int, flow, prompt_tokens: int = PROMPT_TOKENS
+) -> list[FlowBatchInput]:
     generator = torch.Generator().manual_seed(rows * 1000 + target_tokens)
     return [
         FlowBatchInput(
             token=torch.randint(0, 6561, (1, target_tokens), generator=generator),
             prompt_token=torch.randint(
-                0, 6561, (1, PROMPT_TOKENS), generator=generator
+                0, 6561, (1, prompt_tokens), generator=generator
             ),
             prompt_feat=torch.randn(
-                1, PROMPT_TOKENS * 2, flow.output_size, generator=generator
+                1, prompt_tokens * 2, flow.output_size, generator=generator
             ),
             embedding=torch.randn(
                 1, flow.spk_embed_affine_layer.in_features, generator=generator
@@ -86,6 +88,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="FunAudioLLM/Fun-CosyVoice3-0.5B-2512")
     parser.add_argument("--no-compile", action="store_true")
+    # One row, the shapes streaming c1 presents: every hop size and finals over
+    # the whole utterance range, at three prompt lengths.
+    parser.add_argument("--c1-sweep", action="store_true")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -99,7 +104,18 @@ def main() -> None:
     vocoder = scheduler.vocoder
     report: dict[str, dict[str, float]] = {}
     with vocoder.stream_context:
-        for rows in (1, 4, 16):
+        for prompt in (50, 100, 150) if args.c1_sweep else ():
+            for target in HOP_TOKENS:
+                items = make_items(1, target + LOOKAHEAD, vocoder.flow, prompt)
+                report[f"hop prompt={prompt} tokens={target}"] = measure(
+                    vocoder.hop_batch, items
+                )
+            for target in (50, 100, 150, 200, 250, 300, 350):
+                items = make_items(1, target, vocoder.flow, prompt)
+                report[f"final prompt={prompt} tokens={target}"] = measure(
+                    vocoder.leftover_batch, items
+                )
+        for rows in () if args.c1_sweep else (1, 4, 16):
             for target in HOP_TOKENS:
                 items = make_items(rows, target + LOOKAHEAD, vocoder.flow)
                 report[f"hop rows={rows} tokens={target}"] = measure(
@@ -118,7 +134,8 @@ def main() -> None:
                 buffered, items
             )
         # Captured (requests, frames) shapes: these replay the buffered CUDA graph.
-        for rows, frames in ((16, 576), (9, 560), (5, 544), (3, 528)):
+        graphed = () if args.c1_sweep else ((16, 576), (9, 560), (5, 544), (3, 528))
+        for rows, frames in graphed:
             items = make_items(rows, frames // 2 - PROMPT_TOKENS, vocoder.flow)
             report[f"graphed rows={rows} frames={frames}"] = measure(buffered, items)
     for name, values in report.items():
