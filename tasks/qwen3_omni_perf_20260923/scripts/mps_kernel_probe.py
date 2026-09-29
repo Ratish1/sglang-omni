@@ -206,9 +206,9 @@ def sm_reach(sms: int) -> str:
 
 def sglang_decode_attention_body(device: torch.device):
     """One thinker decode attention call as sglang's FA3 backend makes it in the decode
-    graph: page size 1 over a 200k token pool, a varlen query of one token, the static
-    max_seqlen_k of the graph (the thinker's 32768 context), automatic split count, and
-    scheduler metadata computed before the call."""
+    graph: page size 1 over a 200k token pool, a varlen query of one token, automatic
+    split count, and scheduler metadata computed before the call against the thinker's
+    32768 context."""
     from sgl_kernel.flash_attn import flash_attn_with_kvcache, get_scheduler_metadata
 
     pool, heads_q, heads_kv, dim, seqlen = 200_000, 32, 4, 128, 300
@@ -244,7 +244,6 @@ def sglang_decode_attention_body(device: torch.device):
         cache_seqlens=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=1,
-        max_seqlen_k=max_seqlen_k,
         softmax_scale=dim**-0.5,
         causal=True,
         num_splits=0,
