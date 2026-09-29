@@ -53,6 +53,9 @@ LINES = os.environ.get("OMNI_PIPE_LINES", "")
 # decodes at the device's lowest stream priority, the level of the engine's default
 # stream, while initial decodes keep theirs
 WHATIF_FOLLOWUP = os.environ.get("OMNI_WHATIF_FOLLOWUP_PRIORITY", "")
+# check, not a probe: OMNI_DUMP_REFERENCE=<dir> saves each encoded reference's speaker
+# embedding and codes as served, keyed by the reference file's content hash
+DUMP_REFERENCE = os.environ.get("OMNI_DUMP_REFERENCE", "")
 ROOTS = (
     "sglang_omni/",
     "sglang/",
@@ -581,6 +584,41 @@ def whatif_followup_priority(module):
     scheduler.on_serving_start = serving_start_low
 
 
+def dump_reference(module):
+    import torch
+
+    hook = module.Qwen3TTSAdhocReferenceHook
+    encode_one = hook.encode_one
+    os.makedirs(DUMP_REFERENCE, exist_ok=True)
+
+    @functools.wraps(encode_one)
+    def encode_one_dumped(self, item):
+        artifact = encode_one(self, item)
+        try:
+            prompt, ref_text = artifact
+            codes = prompt["ref_code"][0]
+            torch.save(
+                {
+                    "embedding": prompt["ref_spk_embedding"][0].detach().float().cpu(),
+                    "codes": None if codes is None else codes.detach().cpu(),
+                    "ref_text": ref_text,
+                },
+                os.path.join(DUMP_REFERENCE, f"{self.input_key(item)}.pt"),
+            )
+        except Exception as exc:
+            print(f"reference dump failed: {exc!r}", file=sys.stderr)
+        return artifact
+
+    hook.encode_one = encode_one_dumped
+
+
+def patch_builders_and_dump(module):
+    if ENABLED:
+        patch_builders(module)
+    if DUMP_REFERENCE:
+        dump_reference(module)
+
+
 def patch_vocoder_and_whatif(module):
     if ENABLED:
         patch_vocoder(module)
@@ -593,7 +631,7 @@ PATCHES = {
     "torch.cuda.graphs": patch_graphs,
     "sglang_omni.pipeline.stage.runtime": patch_runtime,
     "sglang_omni.pipeline.coordinator": patch_coordinator,
-    "sglang_omni.models.qwen3_tts.request_builders": patch_builders,
+    "sglang_omni.models.qwen3_tts.request_builders": patch_builders_and_dump,
     "sglang_omni.models.qwen3_tts.sglang_model": patch_model,
     "sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph": patch_speaker,
     "sglang_omni.scheduling.omni_scheduler": patch_scheduler,
@@ -605,7 +643,8 @@ PATCHES = {
 }
 if not ENABLED:
     PATCHES = {
-        "sglang_omni.models.qwen3_tts.streaming_vocoder": patch_vocoder_and_whatif
+        "sglang_omni.models.qwen3_tts.streaming_vocoder": patch_vocoder_and_whatif,
+        "sglang_omni.models.qwen3_tts.request_builders": patch_builders_and_dump,
     }
 
 
@@ -630,11 +669,12 @@ class PatchOnImport(importlib.abc.MetaPathFinder):
         return spec
 
 
-if ENABLED or WHATIF_FOLLOWUP:
+if ENABLED or WHATIF_FOLLOWUP or DUMP_REFERENCE:
     sys.meta_path.insert(0, PatchOnImport())
     print(
         f"pipeline_nvtx {'on' if ENABLED else 'off'}, lines={LINES or 'off'}, "
-        f"whatif follow-up priority={WHATIF_FOLLOWUP or 'off'}",
+        f"whatif follow-up priority={WHATIF_FOLLOWUP or 'off'}, "
+        f"reference dump={DUMP_REFERENCE or 'off'}",
         file=sys.stderr,
         flush=True,
     )
