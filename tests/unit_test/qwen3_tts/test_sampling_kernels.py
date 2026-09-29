@@ -484,9 +484,12 @@ def test_fused_raw_logit_sampler_matches_reference_for_signed_zero_order(
         assert torch.equal(actual, expected), f"seed_offset={seed_offset}"
 
 
+@pytest.mark.parametrize("max_top_k", [32, 50])
 def test_fused_raw_logit_sampler_captures_without_reference_top_k(
     monkeypatch: pytest.MonkeyPatch,
+    max_top_k: int,
 ) -> None:
+    """Both the one-kernel path and the chunked two-kernel path capture."""
     batch_size = 4
     logits = torch.randn(
         batch_size,
@@ -497,7 +500,7 @@ def test_fused_raw_logit_sampler_captures_without_reference_top_k(
     temperatures = torch.tensor(
         [0.7, 0.8, 0.9, 1.0], device="cuda", dtype=torch.float32
     )
-    top_ks = torch.tensor([32, 31, 30, 29], device="cuda", dtype=torch.long)
+    top_ks = max_top_k - torch.arange(batch_size, device="cuda", dtype=torch.long)
     top_ps = torch.full((batch_size,), 0.8, device="cuda", dtype=torch.float32)
     seeds = torch.arange(700, 700 + batch_size, device="cuda", dtype=torch.long)
     positions = torch.arange(30, 30 + batch_size, device="cuda", dtype=torch.long)
@@ -506,7 +509,7 @@ def test_fused_raw_logit_sampler_captures_without_reference_top_k(
         top_ks,
         top_ps,
         seeds,
-        max_top_k=32,
+        max_top_k=max_top_k,
     )
 
     expected = reference_seeded_tokens(
