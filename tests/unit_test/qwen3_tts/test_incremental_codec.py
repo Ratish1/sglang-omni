@@ -895,7 +895,9 @@ def test_arena_bound_graph_replays_match_eager_and_advance_the_arena() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_windowed_replays_match_one_eager_decode_and_its_arena_state() -> None:
+def test_windowed_replays_match_one_eager_decode_and_its_arena_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A bootstrap split across captured windows, with one window replayed twice, leaves
     the waveform and every arena row where a single eager decode of the width would."""
     from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
@@ -908,6 +910,9 @@ def test_windowed_replays_match_one_eager_decode_and_its_arena_state() -> None:
     )
 
     torch.manual_seed(23)
+    # note (ratish): the windows and the whole width pick different channels-last
+    # cuDNN engines, whose TF32 rounding differs by about 1e-3 in fp32.
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     device = torch.device("cuda", torch.cuda.current_device())
     decoder = Decoder().to(device).eval()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
