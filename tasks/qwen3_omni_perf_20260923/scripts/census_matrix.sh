@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The census matrix on one card: cells one after another, each a run_probe_boot.sh boot of the
-# same tree on the H200 profile. A cell is config:arm:concurrency:mode[:samples], where config is default
-# (talker prefill graph only) or both (the thinker prefill graph too), and mode is probe (nsys
+# same tree. A cell is config:arm:concurrency:mode[:samples], where config is default (the
+# profile as shipped: talker prefill graph only on the H200, both graphs on the H100), both
+# (adds the thinker prefill graph) or talkeronly (removes it), and mode is probe (nsys
 # with the probe, the census), clean (no profiler, no probe: the same cell's baseline), or lines
 # (probe plus op labels at graph capture, for attribution); samples overrides MAX_SAMPLES for
 # the cell. Each cell lands in
@@ -12,6 +13,7 @@ set -u
 TREE=$1 ROOT=$2 CARD=$3 PORT=$4 CELLS=$5
 S=$(cd "$(dirname "$0")" && pwd)
 BOTH="--thinker.engine.cuda_graph_backend_prefill breakable --thinker.engine.cuda_graph_max_bs_prefill 2048"
+TALKER_ONLY="--thinker.engine.cuda_graph_backend_prefill disabled"
 mkdir -p "$ROOT"
 for cell in $CELLS; do
   IFS=: read -r config arm conc mode samples <<< "$cell"
@@ -19,6 +21,7 @@ for cell in $CELLS; do
   case $config in
     default) extra="" ;;
     both) extra="$BOTH" ;;
+    talkeronly) extra="$TALKER_ONLY" ;;
     *) echo "unknown config $config" >> "$ROOT/matrix.log"; continue ;;
   esac
   case $mode in
