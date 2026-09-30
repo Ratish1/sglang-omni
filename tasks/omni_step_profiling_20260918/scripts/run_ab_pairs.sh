@@ -114,6 +114,10 @@ for name in ${ROUNDS:-c16 c16_swapped longform_c16 longform_c16_swapped c1_seede
     longform_c16) round longform_c16 "$CARD1" "$CARD2" no "$LONGFORM" --concurrency 16 ;;
     longform_c16_swapped) round longform_c16_swapped "$CARD2" "$CARD1" no "$LONGFORM" --concurrency 16 ;;
     c1_seeded) round c1_seeded "$CARD1" "$CARD2" yes $META --concurrency 1 --seed 1234 ;;
+    c1_seeded_swapped) round c1_seeded_swapped "$CARD2" "$CARD1" yes $META --concurrency 1 --seed 1234 ;;
+    #seeded c16 scores quality in both card orders, so neither arm owns a card in the score
+    c16_seeded) round c16_seeded "$CARD1" "$CARD2" yes $META --concurrency 16 --seed 1234 ;;
+    c16_seeded_swapped) round c16_seeded_swapped "$CARD2" "$CARD1" yes $META --concurrency 16 --seed 1234 ;;
   esac
 done
 echo "all done $(date +%T)" > "$OUT/DONE"
