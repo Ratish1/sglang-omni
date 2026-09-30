@@ -212,10 +212,11 @@ def main() -> None:
         activation="silu",
         inplace=False,
     )
+    # tile rows, K per load and warps: more programs and longer loads put more bytes in flight
     shapes = [
-        (block_i, 256, warps_up, block_h, 256, warps_down)
-        for block_i, warps_up, block_h, warps_down in itertools.product(
-            (8, 16, 32), (2, 4), (8, 16, 32), (2, 4)
+        (block_i, block_k, warps_up, block_h, block_k_down, warps_down)
+        for block_i, block_k, warps_up, block_h, block_k_down, warps_down in itertools.product(
+            (4, 8), (256, 1024), (4, 8), (4, 8), (256,), (4, 8)
         )
     ]
     for tokens in args.tokens:
