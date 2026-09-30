@@ -5,8 +5,10 @@
 # whose four leased cards all sit on NUMA node 0 (CPUs 0-31,64-95).
 DTYPE=${DTYPE:-h200}
 # PORT_BASE moves the servers off 8000 to 8300 (and their scorers off 8100 to 8400) when another
-# tenant on the host network holds those ports.
+# tenant on the host network holds those ports. A card's scorer takes its server port plus 100,
+# which is the next card's server port; PORT_STEP=200 keeps a pair on adjacent cards apart.
 PORT_BASE=${PORT_BASE:-8000}
+PORT_STEP=${PORT_STEP:-100}
 W=/workspace/sglang-omni/.tmp
 S=$W/wt/tools/tasks/qwen3_omni_perf_20260923/scripts
 R=$W/$1/r$2
@@ -24,9 +26,9 @@ else
 fi
 bp=$(pin $BC); ap=$(pin $AC)
 setsid env PIN_CPUS=${bp% *} PIN_NODE=${bp#* } ${12:+MAX_SAMPLES=${12}} EXTRA_SERVE_ARGS="$BEXTRA" \
-  bash $S/run_bench_boot.sh $BT $R/base_c$BC $BC $((PORT_BASE + BC * 100)) $DTYPE $CONC "$ARM" > $R/base_c$BC.boot.log 2>&1 < /dev/null &
+  bash $S/run_bench_boot.sh $BT $R/base_c$BC $BC $((PORT_BASE + BC * PORT_STEP)) $DTYPE $CONC "$ARM" > $R/base_c$BC.boot.log 2>&1 < /dev/null &
 echo "base_c$BC pgid $!" >> $R/launch.txt
 setsid env PIN_CPUS=${ap% *} PIN_NODE=${ap#* } ${12:+MAX_SAMPLES=${12}} EXTRA_SERVE_ARGS="$AEXTRA" \
-  bash $S/run_bench_boot.sh $AT $R/${AN}_c$AC $AC $((PORT_BASE + AC * 100)) $DTYPE $CONC "$ARM" > $R/${AN}_c$AC.boot.log 2>&1 < /dev/null &
+  bash $S/run_bench_boot.sh $AT $R/${AN}_c$AC $AC $((PORT_BASE + AC * PORT_STEP)) $DTYPE $CONC "$ARM" > $R/${AN}_c$AC.boot.log 2>&1 < /dev/null &
 echo "${AN}_c$AC pgid $!" >> $R/launch.txt
 sleep 2; cat $R/launch.txt $R/base_head.txt $R/arm_head.txt
