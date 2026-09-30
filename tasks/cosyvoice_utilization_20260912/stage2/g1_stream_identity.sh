@@ -47,6 +47,8 @@ PEERS=${PEERS:-2}
 # nsys and the runner opens the window around the measured benchmark only. The
 # metric device is the nsys ordinal, which is the physical card, not the ordinal
 # CUDA_VISIBLE_DEVICES leaves the process.
+# META is a local meta.lst to serve instead of the SeedTTS split (the long form cell).
+META=${META:-}
 NSYS=${NSYS-}
 NSYS_WARMUP=${NSYS_WARMUP:-32}
 NSYS_TRACE=${NSYS_TRACE:-cuda,nvtx,osrt,python-gil}
@@ -198,6 +200,7 @@ if [ -n "$NSYS" ]; then
 fi
 python -u "$T/diagnostics/run_seedtts.py" \
   --mode "$MODE" --lang en --concurrency "$CONC" --warmup "$WARMUP" $SAMPLE_ARG $CAPTURE_ARG \
+  ${META:+--meta $META} \
   --model "$MODEL" --base-url "http://127.0.0.1:$PORT" \
   $GENERATION_ARG --ready-timeout 900 \
   --output "$OUT/seedtts" 2>&1 | tee "$OUT/client.log"
