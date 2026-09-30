@@ -300,7 +300,7 @@ async def generate(
 
 
 def score(arm: str, asr_port: int | None, out: str, device: str, sim: bool) -> dict:
-    if arm in ("seedtts_en", "seedtts_en_nostream"):
+    if arm in ("seedtts_en", "seedtts_en_nostream", "seedtts_en_seeded"):
         from benchmarks.eval.benchmark_omni_seedtts import (
             OmniSeedttsBenchmarkConfig,
             evaluate_generated_audio,
