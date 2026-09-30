@@ -49,6 +49,8 @@ PEERS=${PEERS:-2}
 # CUDA_VISIBLE_DEVICES leaves the process.
 # META is a local meta.lst to serve instead of the SeedTTS split (the long form cell).
 META=${META:-}
+# REQUEST_RATE makes the client open loop at that many arrivals per second.
+REQUEST_RATE=${REQUEST_RATE:-}
 NSYS=${NSYS-}
 NSYS_WARMUP=${NSYS_WARMUP:-32}
 NSYS_TRACE=${NSYS_TRACE:-cuda,nvtx,osrt,python-gil}
@@ -200,7 +202,7 @@ if [ -n "$NSYS" ]; then
 fi
 python -u "$T/diagnostics/run_seedtts.py" \
   --mode "$MODE" --lang en --concurrency "$CONC" --warmup "$WARMUP" $SAMPLE_ARG $CAPTURE_ARG \
-  ${META:+--meta $META} \
+  ${META:+--meta $META} ${REQUEST_RATE:+--request-rate $REQUEST_RATE} \
   --model "$MODEL" --base-url "http://127.0.0.1:$PORT" \
   $GENERATION_ARG --ready-timeout 900 \
   --output "$OUT/seedtts" 2>&1 | tee "$OUT/client.log"

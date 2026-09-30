@@ -142,6 +142,7 @@ async def run(args):
         max_samples=args.samples,
         sample_offset=args.offset,
         concurrency=args.concurrency,
+        request_rate=args.request_rate,
         warmup=0 if args.session else args.warmup,
         stream=args.mode == "streaming",
         response_format="pcm" if args.mode == "streaming" else "wav",
@@ -230,6 +231,13 @@ def main():
         "--reference", choices=("audio_text", "audio"), default="audio_text"
     )
     parser.add_argument("--concurrency", type=int, default=16)
+    parser.add_argument(
+        "--request-rate",
+        type=float,
+        default=float("inf"),
+        help="Open loop arrivals per second (Poisson, seeded so every arm gets the "
+        "same schedule); concurrency then only caps requests in flight",
+    )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--samples", type=int, help="Omit for the full English split")
     parser.add_argument("--offset", type=int, default=0)
@@ -259,6 +267,10 @@ def main():
     if args.output.exists():
         parser.error("Output already exists; use a fresh run directory")
     args.output.mkdir(parents=True)
+    # The runner draws open loop arrival gaps from numpy's global generator.
+    import numpy as np
+
+    np.random.seed(0)
     asyncio.run(run(args))
 
 
