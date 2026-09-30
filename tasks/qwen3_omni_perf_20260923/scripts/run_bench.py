@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import functools
 import inspect
 import json
@@ -46,6 +47,8 @@ ARMS = (
 # seedtts_en_seeded: the streaming SeedTTS arm with that seed on every request, for a
 # whole-corpus identity pass at concurrency 1 (identity_compare.py), not for timing
 SPEECH_IDENTITY_SEED = 1234
+# open-loop runs draw their arrival times from this seed, the same for both arms of a pair
+ARRIVAL_SEED = 0
 SPEECH_IDENTITY_TEXT_PROMPTS = (
     "Name three primary colors.",
     "Say good morning to a friend in one sentence.",
@@ -173,6 +176,20 @@ def skip_first_samples(module, name: str, skip: int) -> None:
         return load(*bound.args, **bound.kwargs)[skip:]
 
     setattr(module, name, load_after_skip)
+
+
+def install_arrival_seed(seed: int) -> None:
+    """Seed the benchmark runner's open-loop arrival times, which it draws unseeded, so the two
+    arms of a pair see the same arrivals."""
+    import benchmarks.benchmarker.runner as runner_module
+
+    original = runner_module.BenchmarkRunner.__init__
+
+    @functools.wraps(original)
+    def init(self, config, *args, **kwargs):
+        original(self, dataclasses.replace(config, arrival_seed=seed), *args, **kwargs)
+
+    runner_module.BenchmarkRunner.__init__ = init
 
 
 def install_sample_skip(skip: int) -> None:
@@ -360,6 +377,10 @@ def main() -> None:
     if args.mode == "gen":
         if args.skip_samples:
             install_sample_skip(args.skip_samples)
+        else:
+            pass
+        if args.request_rate != float("inf"):
+            install_arrival_seed(ARRIVAL_SEED)
         else:
             pass
         asyncio.run(
