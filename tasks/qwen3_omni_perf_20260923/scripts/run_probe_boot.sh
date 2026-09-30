@@ -4,7 +4,8 @@
 # context switches, the GIL and OS runtime, one run_bench.py arm as the load, then
 # omni_census.py over the generation window. NSYS_ARGS=none serves the same tree with the
 # probe off and no profiler: the clean boot of the same cell (K10). LINES=capture adds the
-# op labels at graph capture. MAX_SAMPLES (default 128) bounds the report. Only the serve
+# op labels at graph capture. WARM_SAMPLES (default 32) run before the window; MAX_SAMPLES
+# (default 128) bound the report. Only the serve
 # is sent TERM; nsys finalizes by itself. Export and census run here, in the container.
 # usage: run_probe_boot.sh <tree> <out dir> <card> <port> <h200|bf16|fp8> <concurrency> <arm>
 set -u
@@ -54,6 +55,11 @@ for _ in $(seq 360); do
 done
 if [ $healthy = 1 ]; then
   echo "healthy $(date +%T)" >> "$OUT/progress.txt"
+  # the warm pass runs the arm's first samples at the same concurrency outside the window,
+  # so one-time costs (lazy compiles, first shapes) land before it
+  CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
+    --concurrency "$CONC" --out "$OUT/warm" --max-samples "${WARM_SAMPLES:-32}" > "$OUT/warm_$ARM.log" 2>&1
+  echo "warm rc $? $(date +%T)" >> "$OUT/progress.txt"
   date +%s.%N > "$OUT/window.txt"
   CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
     --concurrency "$CONC" --out "$OUT" --max-samples "${MAX_SAMPLES:-128}" > "$OUT/gen_$ARM.log" 2>&1

@@ -310,6 +310,7 @@ class Report:
         self.owner: dict[tuple[int, int], Range | None] = {}
         self.api_tid: dict[tuple[int, int], int] = {}
         self.api_start: dict[tuple[int, int], int] = {}
+        self.api_end: dict[tuple[int, int], int] = {}
         self.api_by_tid: dict[int, list] = collections.defaultdict(list)
         for start, end, tid, corr, name_id in self.db.execute(
             "select start, end, globalTid, correlationId, nameId from CUPTI_ACTIVITY_KIND_RUNTIME "
@@ -322,6 +323,7 @@ class Report:
             self.owner[key] = item
             self.api_tid[key] = tid
             self.api_start[key] = start
+            self.api_end[key] = end
             is_launch = name.startswith(LAUNCH)
             is_graph = name.startswith(GRAPH_LAUNCH)
             is_sync = name.startswith(SYNC)
@@ -493,6 +495,15 @@ def section_a(r: Report):
     )
     print("marks: " + ", ".join(f"{k} {v}" for k, v in sorted(points.items())))
     print(f"completed requests (coord.done): {len(r.completed_requests())}")
+    spawned = collections.Counter()
+    for tid, calls in r.os_wait.items():
+        for start, end, name in calls:
+            if name.startswith("waitpid") or name.startswith("wait4"):
+                spawned[r.thread_label(tid)] += 1
+    print(
+        "subprocess waits inside the window (a compile or a tool run; must be 0 in steady state): "
+        + (", ".join(f"{k} {v}" for k, v in spawned.most_common()) or "none")
+    )
 
 
 def section_b(r: Report, top: int):
@@ -565,16 +576,24 @@ def request_points(r: Report) -> dict[str, dict[str, list[tuple[int, int]]]]:
         if match:
             points[f"coord.recv {match.group(3)}"][match.group(2)].append((t, tid))
             continue
+        match = re.match(r"(coord\.done) rid=(\S+) from=(\S+)", label)
+        if match:
+            points[f"coord.done {match.group(3)}"][match.group(2)].append((t, tid))
+            continue
         match = re.match(r"(\S+) rid=(\S+)", label)
         if match:
-            points[match.group(1)][match.group(2)].append((t, tid))
-    for items in r.ranges.values():
+            name = match.group(1)
+            if not name.startswith("coord."):
+                name = f"{r.stage_of_tid(tid)}:{name}"
+            points[name][match.group(2)].append((t, tid))
+    for tid, items in r.ranges.items():
+        stage = r.stage_of_tid(tid)
         for item in items:
             rid = item.rid()
             if rid is None:
                 continue
-            points[item.kind][rid].append((item.start, item.tid))
-            points[item.kind + "/end"][rid].append((item.end, item.tid))
+            points[f"{stage}:{item.kind}"][rid].append((item.start, item.tid))
+            points[f"{stage}:{item.kind}/end"][rid].append((item.end, item.tid))
     for series in points.values():
         for values in series.values():
             values.sort()
@@ -773,6 +792,39 @@ def section_d(r: Report, top: int):
     )
     for owner, value in cost.most_common():
         print(f"    {owner:<24} extra device time from sharing {ms(value):.0f} ms")
+    # card wait: a kernel ready to run (its launch call returned and the previous kernel of
+    # its stream ended) that has not started while another process had a kernel in flight
+    by_stream = collections.defaultdict(list)
+    for s, e, owner, name, stream, identity, key, node, pid in r.device:
+        by_stream[(pid, stream)].append((s, e, owner, key))
+    card_wait, ready_gap = collections.Counter(), collections.Counter()
+    for (pid, stream), items in by_stream.items():
+        items.sort()
+        previous_end = None
+        for s, e, owner, key in items:
+            ready = r.api_end.get(key)
+            if ready is not None:
+                if previous_end is not None:
+                    ready = max(ready, previous_end)
+                if s > ready:
+                    ready_gap[owner] += s - ready
+                    card_wait[owner] += sum(
+                        b - a
+                        for a, b in clip(
+                            other_by_pid[pid], starts_by_pid[pid], ready, s
+                        )
+                    )
+            previous_end = e if previous_end is None else max(previous_end, e)
+    completed = max(len(r.completed_requests()), 1)
+    print(
+        "  card wait per owner: ready-but-not-started time with another process's kernel in "
+        "flight, and all ready-but-not-started time (ms total, ms per completed request):"
+    )
+    for owner, value in card_wait.most_common(top):
+        print(
+            f"    {owner:<40}{ms(value):>9.0f}{ms(value) / completed:>9.2f}   ready gap "
+            f"{ms(ready_gap[owner]):>9.0f}{ms(ready_gap[owner]) / completed:>9.2f}"
+        )
     rows.sort(key=lambda row: -(row[2] - row[1]) * row[4])
     for (owner, identity), ma, mb, na, nb in rows[:top]:
         print(
@@ -857,6 +909,43 @@ def section_f(r: Report, points) -> dict[str, list[int]]:
                 segment = f"{ms(pct(values, .5)):>7.2f}{ms(pct(values, .9)):>8.2f}"
         print(
             f"  {name[:48]:<48}{ms(pct(offsets[name], .5)):>11.2f}{ms(pct(offsets[name], .9)):>9.2f}   {'':>17}{segment}"
+        )
+    chain = (
+        "coord.submit",
+        "q thinker.in.get:new_request",
+        "thinker:sched.prefill",
+        "q thinker.out.put:stream",
+        "coord.recv decode",
+        "q talker_ar.in.put:stream_done",
+        "talker_ar:tk.build",
+        "talker_ar:tk.build/end",
+        "talker_ar:sched.prefill",
+        "q talker_ar.out.put:stream",
+        "q code2wav.in.get:stream_chunk",
+        "code2wav:c2w.decode",
+        "code2wav:c2w.decode/end",
+        "coord.recv code2wav",
+    )
+    fixed = collections.defaultdict(list)
+    totals = []
+    for rid in counted:
+        named = by_rid[rid]
+        known = [(name, named[name]) for name in chain if name in named]
+        for (name_a, ta), (name_b, tb) in zip(known, known[1:]):
+            fixed[(name_a, name_b)].append(tb - ta)
+        if "coord.recv code2wav" in named:
+            totals.append(named["coord.recv code2wav"] - named["coord.submit"])
+    print("  first audio chain (first occurrence of each point per request; ms):")
+    print(f"    {'segment':<72}{'n':>5}{'mean':>9}{'p50':>9}{'p90':>9}")
+    for (name_a, name_b), values in fixed.items():
+        print(
+            f"    {(name_a + ' -> ' + name_b)[:72]:<72}{len(values):>5}"
+            f"{ms(statistics.fmean(values)):>9.2f}{ms(pct(values, .5)):>9.2f}{ms(pct(values, .9)):>9.2f}"
+        )
+    if totals:
+        print(
+            f"    {'TOTAL coord.submit -> coord.recv code2wav':<72}{len(totals):>5}"
+            f"{ms(statistics.fmean(totals)):>9.2f}{ms(pct(totals, .5)):>9.2f}{ms(pct(totals, .9)):>9.2f}"
         )
     return {f"{a} -> {b}": v for (a, b), v in segments.items()}
 
