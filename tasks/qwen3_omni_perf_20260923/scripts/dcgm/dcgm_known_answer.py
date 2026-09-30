@@ -1,5 +1,5 @@
 """Known answer for the DCGM counters before any served number is read from them (run in the
-container on one card while dcgm_sampler.py watches the same card from the host).
+container on one card while dcgm_sampler.py watches the same card from the host at 100 ms).
 
 Phases of known shape, each bracketed by host epoch markers:
   - idle: every field 0;
@@ -7,11 +7,13 @@ Phases of known shape, each bracketed by host epoch markers:
     n = 1, SMs/4, SMs/2, SMs: GR active 1, SM active n / SMs if the CTA scheduler spreads CTAs
     over SMs, tensor and DRAM near 0;
   - a bf16 8192^3 matmul chain: GR active 1, SM active near 1, tensor high;
-  - a square wave, 20 ms of matmuls then 20 ms idle: if DCGM really samples at the requested
-    interval (10 ms), the per-sample GR values are bimodal; if it averages over a longer window
-    they sit near 0.5.
-The check also reports the lag between the markers and the first and last busy sample, the
-offset any alignment with a trace must allow for.
+  - a square wave, 20 ms of matmuls then 20 ms idle: GR active near the duty, 0.5.
+
+First reading (H100, 2026-09-30): DCGM reads its profiling counters every 100 ms whatever the
+watch interval; at 10 ms nine samples in ten read 0, so the sampler runs at 100 ms. The check
+fits the lag between a sample's timestamp and the window it covers (value at ts covers
+[ts - lag - period, ts - lag]) against the markers, then reads each phase from the samples whose
+window lies inside it. Any alignment with a trace uses the fitted lag.
 
 usage (container): python3 dcgm_known_answer.py run --markers markers.txt
        (container): python3 dcgm_known_answer.py check --markers markers.txt --samples s.tsv --gpu 0
@@ -27,11 +29,11 @@ import torch
 import triton
 import triton.language as tl
 
-PHASE_SECONDS = 0.4
-IDLE_SECONDS = 0.3
-WAVE_PERIODS = 25
+PHASE_SECONDS = 1.0
+IDLE_SECONDS = 0.5
+WAVE_PERIODS = 50
 WAVE_HALF_SECONDS = 0.02
-EDGE_GUARD_US = 50_000
+MAX_LAG_US = 300_000
 
 
 @triton.jit
@@ -103,6 +105,10 @@ def run(markers_path: str) -> None:
     print(f"{len(markers)} phases written to {markers_path}")
 
 
+def overlap_us(low: int, high: int, spans) -> int:
+    return sum(max(0, min(high, finish) - max(low, begin)) for begin, finish in spans)
+
+
 def check(markers_path: str, samples_path: str, gpu: int) -> None:
     with open(markers_path) as f:
         header = f.readline().split()
@@ -122,52 +128,46 @@ def check(markers_path: str, samples_path: str, gpu: int) -> None:
         values.sort()
     fields = sorted(samples)
     gr = samples["gr_active"]
-    intervals = [b - a for (a, _), (b, _) in zip(gr, gr[1:])]
-    intervals.sort()
+    intervals = sorted(b - a for (a, _), (b, _) in zip(gr, gr[1:]))
+    period = intervals[len(intervals) // 2]
+    busy = [(b, f) for name, b, f in markers if name not in ("idle", "square_wave")]
+    wave = [(b, f) for name, b, f in markers if name == "square_wave"]
+    first, last = markers[0][1], markers[-1][2]
+    fits = []
+    for lag in range(0, MAX_LAG_US + 1, 2_000):
+        errors = [
+            (value - overlap_us(ts - lag - period, ts - lag, busy) / period) ** 2
+            for ts, value in gr
+            if ts - lag - period >= first
+            and ts - lag <= last
+            and overlap_us(ts - lag - period, ts - lag, wave) == 0
+        ]
+        fits.append(((sum(errors) / len(errors)) ** 0.5, lag))
+    rms, lag = min(fits)
     print(
-        f"{len(gr)} gr_active samples, interval p50 {intervals[len(intervals) // 2] / 1000:.1f} ms "
-        f"p95 {intervals[int(len(intervals) * 0.95)] / 1000:.1f} ms"
+        f"{len(gr)} gr_active samples, period {period / 1000:.1f} ms; fitted lag "
+        f"{lag / 1000:.0f} ms (the value at ts covers [ts - lag - period, ts - lag]), rms "
+        f"against the markers {rms:.3f}"
     )
     print(
-        f"{'phase':<14}{'expected sm':>12}"
+        f"{'phase':<14}{'n':>3}{'expected sm':>12}"
         + "".join(f"{field:>15}" for field in fields)
     )
     for name, begin, finish in markers:
-        expected = (
-            f"{int(name.split('_')[1]) / sms:.3f}" if name.startswith("spin_") else ""
-        )
-        row = f"{name:<14}{expected:>12}"
+        expected = {"square_wave": "gr 0.5"}.get(name, "")
+        if name.startswith("spin_"):
+            expected = f"{int(name.split('_')[1]) / sms:.3f}"
+        row = ""
+        count = 0
         for field in fields:
             inside = [
                 value
                 for ts, value in samples[field]
-                if begin + EDGE_GUARD_US <= ts <= finish - EDGE_GUARD_US // 2
+                if ts - lag - period >= begin and ts - lag <= finish
             ]
+            count = len(inside)
             row += f"{sum(inside) / len(inside):15.3f}" if inside else f"{'none':>15}"
-        print(row)
-    for name, begin, finish in markers:
-        if name != "matmul":
-            continue
-        busy = [
-            ts
-            for ts, value in gr
-            if begin - 100_000 <= ts <= finish + 100_000 and value > 0.5
-        ]
-        print(
-            f"matmul edges: first busy sample {(busy[0] - begin) / 1000:+.1f} ms after start, "
-            f"last busy sample {(busy[-1] - finish) / 1000:+.1f} ms after end"
-        )
-    for name, begin, finish in markers:
-        if name != "square_wave":
-            continue
-        inside = [value for ts, value in gr if begin <= ts <= finish]
-        low = sum(value < 0.2 for value in inside)
-        high = sum(value > 0.8 for value in inside)
-        print(
-            f"square wave (20 ms on, 20 ms off): {len(inside)} samples, {low} below 0.2, "
-            f"{high} above 0.8, {len(inside) - low - high} between; mean "
-            f"{sum(inside) / len(inside):.3f}"
-        )
+        print(f"{name:<14}{count:>3}{expected:>12}" + row)
 
 
 def main() -> None:

@@ -9,7 +9,7 @@ no host engine.
 
 Run on the host with the system python3 (the bindings live in /usr/local/dcgm).
 
-usage: python3 dcgm_sampler.py --gpus 0 1 --interval-ms 10 --out samples.tsv [--seconds S]
+usage: python3 dcgm_sampler.py --gpus 0 1 --interval-ms 100 --out samples.tsv [--seconds S]
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ POLL_SECONDS = 0.2
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpus", type=int, nargs="+", required=True)
-    parser.add_argument("--interval-ms", type=float, default=10.0)
+    parser.add_argument("--interval-ms", type=float, default=100.0)
     parser.add_argument("--fields", type=int, nargs="+", default=list(FIELDS))
     parser.add_argument("--out", required=True)
     parser.add_argument("--seconds", type=float, default=0.0)
