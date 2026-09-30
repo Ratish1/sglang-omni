@@ -22,6 +22,8 @@ NSYS_ARGS=${NSYS_ARGS:-none}
 mkdir -p "$OUT"
 git -C "$TREE" rev-parse HEAD > "$OUT/head.txt"
 git -C "$T" rev-parse HEAD > "$OUT/tools_head.txt"
+(cd "$TREE" && PYTHONPATH="$TREE" $PY -c "import sglang_omni; print(sglang_omni.__file__)") > "$OUT/import_path.txt"
+grep -q "^$TREE/" "$OUT/import_path.txt" || { echo "server would import $(cat "$OUT/import_path.txt")" > "$OUT/FAILED"; exit 1; }
 nvidia-smi > "$OUT/gpus_before.txt"
 echo "start $(date +%T) cells=$CELLS nsys=$NSYS_ARGS probe=${PROBE:-0} lines=${LINES:-}" > "$OUT/progress.txt"
 
