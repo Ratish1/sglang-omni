@@ -22,9 +22,10 @@ Sections:
   H playback       per chunk margin at the coordinator: audio delivered against time
   I final wait     per request final chunk gap: AR tail, queue behind other steps, the
                    leftover step (Flow, HiFT) and delivery, for all and for the tail
+  J first hop gap  chunk 1 to chunk 2: AR wait for hop 2's tokens, queue, the step, delivery
 
 usage: python pipeline_census.py REPORT.sqlite --bench-log bench.log [--top 25]
-       [--sections ABCDEFGHI]
+       [--sections ABCDEFGHIJ]
 """
 
 from __future__ import annotations
@@ -1067,6 +1068,98 @@ def section_i(r: Report):
     )
 
 
+def section_j(r: Report):
+    print(
+        "\n## J. first hop gap (ms, per streaming request): chunk 1 to chunk 2 when chunk 2 is a hop"
+    )
+    arrivals = collections.defaultdict(list)
+    hop_marks = collections.defaultdict(list)
+    ready_marks = collections.defaultdict(list)
+    for t, tid, label in r.marks:
+        match = re.match(r"coord\.recv rid=(\S+) n=\d+", label)
+        if match:
+            arrivals[match.group(1)].append(t)
+            continue
+        match = re.match(r"voc\.steprid rid=(\S+) plan=causal_window", label)
+        if match:
+            hop_marks[match.group(1)].append((t, tid))
+            continue
+        match = re.match(
+            r"voc\.ready rid=(\S+) plan=causal_window tokens=\d+ at=(\S+)", label
+        )
+        if match:
+            ready_marks[match.group(1)].append((t, match.group(2)))
+    steps = sorted(
+        (
+            item
+            for items in r.ranges.values()
+            for item in items
+            if item.kind.startswith("voc.step ")
+        ),
+        key=lambda item: item.start,
+    )
+    step_starts = [item.start for item in steps]
+
+    def step_at(t: int, tid: int) -> Range | None:
+        index = bisect.bisect_right(step_starts, t) - 1
+        while index >= 0 and steps[index].tid != tid:
+            index -= 1
+        return steps[index] if index >= 0 and steps[index].end >= t else None
+
+    rows = []
+    for rid, times in arrivals.items():
+        times.sort()
+        hops = sorted(hop_marks.get(rid, []))
+        if len(times) < 3 or len(hops) < 2:
+            continue
+        first_step, second_step = step_at(*hops[0]), step_at(*hops[1])
+        readies = (
+            [t for t, _ in sorted(ready_marks.get(rid, [])) if t <= second_step.start]
+            if second_step
+            else []
+        )
+        if first_step is None or second_step is None or not readies:
+            continue
+        ready = max(readies[-1], first_step.end)
+        rows.append(
+            {
+                "gap": times[1] - times[0],
+                "lead": first_step.end - times[0],
+                "ar wait": ready - first_step.end,
+                "queue": second_step.start - ready,
+                "step": second_step.wall,
+                "deliver": times[1] - second_step.end,
+                "rows in step": int(second_step.label.rsplit("rows=", 1)[-1]),
+                "ready at step end": float(readies[-1] <= first_step.end),
+                "steps waited": sum(
+                    1 for s in steps if ready <= s.start < second_step.start
+                ),
+            }
+        )
+    if not rows:
+        print("  no request with two hop steps and a readiness mark")
+        return
+    rows.sort(key=lambda row: row["gap"])
+    counts = ("rows in step", "ready at step end", "steps waited")
+    groups = (
+        ("all", rows),
+        ("gap >= p50", rows[int(0.50 * len(rows)) :]),
+        ("gap >= p90", rows[int(0.90 * len(rows)) :]),
+    )
+    print(f"  requests {len(rows)}; mean per group (counts are plain means)")
+    print(f"  {'':<22}" + "".join(f"{name:>14}" for name, _ in groups))
+    for key in rows[0]:
+        cells = []
+        for _, members in groups:
+            value = statistics.fmean(row[key] for row in members)
+            cells.append(f"{value:>14.2f}" if key in counts else f"{ms(value):>14.1f}")
+        print(f"  {key:<22}" + "".join(cells))
+    print(
+        "  gap = lead + ar wait + queue + step + deliver; ar wait is hop 2 turning runnable after"
+        " the hop 1 step ended, 0 when its tokens were already in"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("report")
@@ -1088,6 +1181,7 @@ def main() -> None:
         "G": lambda: section_g(r, args.top),
         "H": lambda: section_h(r),
         "I": lambda: section_i(r),
+        "J": lambda: section_j(r),
     }
     for key in args.sections:
         steps[key]()

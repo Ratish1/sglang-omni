@@ -30,6 +30,7 @@ Names (rid = request id, the first word is the kind the census groups by):
   voc.chunks n=N, voc.buffered n=N         one chunk batch, one buffered batch
   voc.select, voc.step <plan> rows=N       one streaming step and its participant pick
   mark voc.steprid rid=R plan=P            one participant of that step
+  mark voc.ready rid=R plan=P tokens=N at=ingest|step  a stream turns runnable
   voc.done rid=R, voc.finish rid=R         stream end and its flush
   flow.hop rows=N tok=T                    causal packed Flow over N rows
   flow.leftover rows=N tok=T               full context packed Flow (stream finals)
@@ -540,8 +541,19 @@ def patch_vocoder_base(module):
 
 def patch_cosy_vocoder(module):
     scheduler = module.FunCosyVoice3StreamingVocoderScheduler
+    ingest = scheduler.ingest
+
+    def ingest_marked(self, request_id, state, codes):
+        waiting = state.next_decode() == "wait"
+        ingest(self, request_id, state, codes)
+        if waiting and state.next_decode() != "wait":
+            mark(
+                f"voc.ready rid={request_id} plan={state.next_decode()} "
+                f"tokens={len(state.tokens)} at=ingest"
+            )
+
     scheduler.ingest = ranged(
-        scheduler.ingest,
+        ingest_marked,
         lambda self, request_id, state, codes: f"voc.ingest rid={request_id}",
     )
     scheduler.select_step_participants = ranged(
@@ -552,7 +564,15 @@ def patch_cosy_vocoder(module):
     def run_step_marked(self, participants, plan):
         for request_id, _ in participants:
             mark(f"voc.steprid rid={request_id} plan={plan}")
-        return run_step(self, participants, plan)
+        decoded = run_step(self, participants, plan)
+        # a stream whose next hop's tokens arrived during the step is ready at its end
+        for request_id, state in participants:
+            if state.next_decode() == "causal_window":
+                mark(
+                    f"voc.ready rid={request_id} plan=causal_window "
+                    f"tokens={len(state.tokens)} at=step"
+                )
+        return decoded
 
     scheduler.run_step = ranged(
         run_step_marked,
