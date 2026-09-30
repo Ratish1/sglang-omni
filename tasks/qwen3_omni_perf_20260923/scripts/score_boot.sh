@@ -2,9 +2,11 @@
 # Score an existing SeedTTS generation dir (OUT/seedtts_en/generated.json and wavs) the
 # way run_bench_boot.sh scores its own: WER from a Qwen3-ASR server on the card, then
 # speaker similarity after that server stops. The wavs are deleted afterwards.
+# ARM (default seedtts_en) names the generation to score, e.g. seedtts_en_seeded.
 # usage: score_boot.sh <tree> <out dir> <card> <asr port>
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4
+ARM=${ARM:-seedtts_en}
 S=$(cd "$(dirname "$0")" && pwd)
 cd "$TREE" || exit 1
 echo "score start $(date +%T)" >> "$OUT/progress.txt"
@@ -18,13 +20,13 @@ for _ in $(seq 180); do
 done
 echo "asr healthy=$healthy $(date +%T)" >> "$OUT/progress.txt"
 if [ $healthy = 1 ]; then
-  CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" score --arm seedtts_en --asr-port "$PORT" --out "$OUT" > "$OUT/score_seedtts_en.log" 2>&1
+  CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" score --arm "$ARM" --asr-port "$PORT" --out "$OUT" > "$OUT/score_$ARM.log" 2>&1
   echo "score rc $? $(date +%T)" >> "$OUT/progress.txt"
 fi
 kill -TERM -- -"$(cat "$OUT/asr.pgid")" 2>/dev/null
 sleep 15
 kill -0 -- -"$(cat "$OUT/asr.pgid")" 2>/dev/null && kill -KILL -- -"$(cat "$OUT/asr.pgid")"
-CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" sim --arm seedtts_en --out "$OUT" > "$OUT/sim_seedtts_en.log" 2>&1
+CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" sim --arm "$ARM" --out "$OUT" > "$OUT/sim_$ARM.log" 2>&1
 echo "sim rc $? $(date +%T)" >> "$OUT/progress.txt"
 find "$OUT" -name '*.wav' -path '*/audio/*' -delete
 echo "done $(date +%T)" >> "$OUT/progress.txt"
