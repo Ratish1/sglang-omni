@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The census matrix on one card: cells one after another, each a run_probe_boot.sh boot of the
-# same tree on the H200 profile. A cell is config:arm:concurrency:mode, where config is default
+# same tree on the H200 profile. A cell is config:arm:concurrency:mode[:samples], where config is default
 # (talker prefill graph only) or both (the thinker prefill graph too), and mode is probe (nsys
 # with the probe, the census), clean (no profiler, no probe: the same cell's baseline), or lines
-# (probe plus op labels at graph capture, for attribution). Each cell lands in
+# (probe plus op labels at graph capture, for attribution); samples overrides MAX_SAMPLES for
+# the cell. Each cell lands in
 # OUT/<config>_<arm>_c<concurrency>_<mode>. PROFILE (default h200) picks the serve profile of
 # run_probe_boot.sh (bf16 is the H100 profile, for tool checks off the H200).
 # usage: census_matrix.sh <tree> <out root> <card> <port> "<cell> <cell> ..."
@@ -13,7 +14,7 @@ S=$(cd "$(dirname "$0")" && pwd)
 BOTH="--thinker.engine.cuda_graph_backend_prefill breakable --thinker.engine.cuda_graph_max_bs_prefill 2048"
 mkdir -p "$ROOT"
 for cell in $CELLS; do
-  IFS=: read -r config arm conc mode <<< "$cell"
+  IFS=: read -r config arm conc mode samples <<< "$cell"
   out="$ROOT/${config}_${arm}_c${conc}_${mode}"
   case $config in
     default) extra="" ;;
@@ -28,6 +29,7 @@ for cell in $CELLS; do
   esac
   echo "$(date +%T) start $cell" >> "$ROOT/matrix.log"
   env EXTRA_SERVE_ARGS="$extra" LINES="$lines" ${nsys_args:+NSYS_ARGS=$nsys_args} \
+    ${samples:+MAX_SAMPLES=$samples} \
     bash "$S/run_probe_boot.sh" "$TREE" "$out" "$CARD" "$PORT" "${PROFILE:-h200}" "$conc" "$arm"
   echo "$(date +%T) end $cell rc $?" >> "$ROOT/matrix.log"
 done
