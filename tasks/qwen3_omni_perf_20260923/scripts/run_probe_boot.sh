@@ -63,10 +63,16 @@ else
   echo "server not healthy" > "$OUT/FAILED"
 fi
 
-# the serve is the python process on our port inside our process group; nsys, when
+# the serve is the python process on our port among the wrapper's descendants (nsys starts
+# it in a session of its own, so it is not in the wrapper's process group); nsys, when
 # present, finalizes after it exits
-SERVE_PID=$(for p in $(pgrep -g "$WRAP_PID" -f "sglang_omni.cli serve.*--port $PORT"); do
-  if [[ "$(cat /proc/$p/comm)" == python* ]]; then echo $p; fi; done | head -1)
+descendants() {
+  local child
+  for child in $(pgrep -P "$1"); do echo "$child"; descendants "$child"; done
+}
+SERVE_PID=$(for p in $WRAP_PID $(descendants "$WRAP_PID"); do
+  if [[ "$(cat /proc/$p/comm 2>/dev/null)" == python* ]] && grep -qa -- "--port.$PORT" /proc/$p/cmdline; then echo $p; fi
+done | head -1)
 echo "serve pid $SERVE_PID" >> "$OUT/progress.txt"
 kill -TERM "$SERVE_PID"
 for _ in $(seq 120); do
