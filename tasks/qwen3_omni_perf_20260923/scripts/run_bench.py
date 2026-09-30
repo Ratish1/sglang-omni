@@ -186,7 +186,12 @@ def install_sample_skip(skip: int) -> None:
 
 
 async def generate(
-    arm: str, port: int, out: str, concurrency: int, max_samples: int | None
+    arm: str,
+    port: int,
+    out: str,
+    concurrency: int,
+    max_samples: int | None,
+    request_rate: float,
 ) -> dict:
     if arm == "speech_identity":
         return await seeded_speech_requests(port, out, max_samples or 5)
@@ -208,6 +213,7 @@ async def generate(
             output_dir=out,
             warmup=1,
             max_concurrency=concurrency,
+            request_rate=request_rate,
             max_samples=max_samples,
             disable_tqdm=True,
             seed=SPEECH_IDENTITY_SEED if arm == "seedtts_en_seeded" else None,
@@ -335,6 +341,13 @@ def main() -> None:
         "--max-samples", type=int, help="first N samples; unset is the full corpus"
     )
     parser.add_argument(
+        "--request-rate",
+        type=float,
+        default=float("inf"),
+        help="gen, SeedTTS arms: open-loop arrivals per second under the concurrency cap "
+        "(a diagnostic at equal load between arms; inf, the default, is closed loop)",
+    )
+    parser.add_argument(
         "--skip-samples",
         type=int,
         default=0,
@@ -350,7 +363,14 @@ def main() -> None:
         else:
             pass
         asyncio.run(
-            generate(args.arm, args.port, out, args.concurrency, args.max_samples)
+            generate(
+                args.arm,
+                args.port,
+                out,
+                args.concurrency,
+                args.max_samples,
+                args.request_rate,
+            )
         )
     else:
         result = score(args.arm, args.asr_port, out, args.device, args.mode == "sim")

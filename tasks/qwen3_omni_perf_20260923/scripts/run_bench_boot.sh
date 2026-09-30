@@ -5,6 +5,8 @@
 # for every arm that has speech. pids seen on the card are logged every 2 s; a second pid
 # while the omni server runs voids the boot.
 # MAX_SAMPLES=N runs the first N samples of every arm (identity smokes); unset is the full corpus.
+# REQUEST_RATE=R sends SeedTTS arms open loop at R per second under the concurrency cap, a
+# diagnostic at equal load between two arms; unset is closed loop.
 # minicpmo serves MiniCPM-o-4.5 with the Omni CI speech worker args (tests/test_model/conftest.py).
 # SERVER_PYTHONPATH is prepended for the omni server only (memdiag/ loads the memory diagnostics).
 # usage: run_bench_boot.sh <tree> <out dir> <card> <port> <bf16|fp8|minicpmo> <concurrency> "<arm> <arm> ..."
@@ -82,7 +84,7 @@ if serve serve "$MODEL" "$PORT" $SERVE_ARGS; then
     -H 'Content-Type: application/json' -d "{\"run_id\": \"bench\", \"event_dir\": \"$OUT/events\"}" >> "$OUT/progress.txt"
   for arm in $ARMS; do
     echo "gen $arm start $(date +%T)" >> "$OUT/progress.txt"
-    CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$arm" --port "$PORT" --concurrency "$CONC" --out "$OUT" ${MAX_SAMPLES:+--max-samples $MAX_SAMPLES} \
+    CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$arm" --port "$PORT" --concurrency "$CONC" --out "$OUT" ${MAX_SAMPLES:+--max-samples $MAX_SAMPLES} ${REQUEST_RATE:+--request-rate $REQUEST_RATE} \
       > "$OUT/gen_$arm.log" 2>&1
     echo "gen $arm rc $? $(date +%T)" >> "$OUT/progress.txt"
   done
