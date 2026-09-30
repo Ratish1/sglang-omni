@@ -10,16 +10,21 @@ census is trusted until this passes on the node's nsys, driver, container and to
      ka.cap.A, the relu and the sum to ka.cap.B), each kernel name to one range (the
      census G join, verbatim)
   K3 eager kernels launched from a late thread resolve to that thread's range
-  K5 python-gil: the main thread waits for the GIL while a worker spins
+  K5 python-gil: the main thread waits for the GIL while a worker spins (at least one 5 ms
+     switch interval of waiting inside the contended range)
   K6 OS runtime: a 100 ms queue timeout is recorded with its duration
   K7 node tracing inflates graph gaps: gaps between replayed nodes against the eager chain
      of the same kernels (read, not gated: gaps are never read as launch cost)
   K8 two processes: correlation ids repeat across processes, and keying by (pid, id)
      attributes every child kernel to its own process's range
-  K9 time slicing: two processes each run 150 sleep kernels of 1 ms at once on one GPU;
-     the context residency (--gpuctxsw) of each is about its 150 ms of work, and kernels
-     that ran while the other process had a kernel in flight are longer than 1 ms, so a
-     kernel's duration includes time its context was switched out
+  K9 time slicing: two processes each run the same chain of 100 bf16 8192 cube matmuls at
+     once on one GPU, after the parent ran the chain alone; the context residency
+     (--gpuctxsw) of each child is about its work (100 times the matmul alone), the two
+     chains take about twice the work in wall time, and a matmul that ran while the other
+     process had one in flight is longer than alone, so a kernel's duration includes time
+     its context was switched out; prints the residency slice length (the timeslice). A
+     clock spin kernel (torch.cuda._sleep) cannot answer this: it ends on elapsed cycles
+     whether or not its context is resident
 
 usage:
   nsys profile -o ka --trace=cuda,nvtx,osrt,python-gil --cuda-graph-trace=node \\
@@ -42,7 +47,8 @@ import time
 
 REPLAYS = 50
 PUSH_POP = 59
-SLEEP_KERNELS = 150
+MATMULS = 100
+MATMUL_SIZE = 8192
 RESTORE_START = 8
 SAVE_END = 7
 
@@ -56,21 +62,21 @@ def name_os_thread(name: str) -> None:
     libc.prctl(15, name.encode()[:15], 0, 0, 0)
 
 
-def cycles_per_ms() -> int:
+def matmul_chain(label: str) -> None:
     import torch
 
+    nvtx = torch.cuda.nvtx
+    a = torch.randn(MATMUL_SIZE, MATMUL_SIZE, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(MATMUL_SIZE, MATMUL_SIZE, device="cuda", dtype=torch.bfloat16)
     torch.cuda.synchronize()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-        enable_timing=True
-    )
-    start.record()
-    torch.cuda._sleep(10_000_000)
-    end.record()
+    nvtx.range_push(label)
+    for _ in range(MATMULS):
+        torch.matmul(a, b)
     torch.cuda.synchronize()
-    return int(10_000_000 / start.elapsed_time(end))
+    nvtx.range_pop()
 
 
-def child(index: int, barrier, cycles: int) -> None:
+def child(index: int, barrier) -> None:
     import torch
 
     nvtx = torch.cuda.nvtx
@@ -79,13 +85,10 @@ def child(index: int, barrier, cycles: int) -> None:
         nvtx.range_push(f"ka.proc{index} i={i}")
         torch.add(x, float(i))
         nvtx.range_pop()
+    torch.matmul(x.bfloat16(), x.bfloat16())
     torch.cuda.synchronize()
     barrier.wait()
-    nvtx.range_push(f"ka.slice{index}")
-    for _ in range(SLEEP_KERNELS):
-        torch.cuda._sleep(cycles)
-    torch.cuda.synchronize()
-    nvtx.range_pop()
+    matmul_chain(f"ka.slice{index}")
 
 
 def run() -> None:
@@ -154,17 +157,16 @@ def run() -> None:
         pass
     nvtx.range_pop()
 
-    cycles = cycles_per_ms()
+    matmul_chain("ka.warm")
+    matmul_chain("ka.alone")
     context = multiprocessing.get_context("spawn")
     barrier = context.Barrier(2)
-    children = [
-        context.Process(target=child, args=(i, barrier, cycles)) for i in range(2)
-    ]
+    children = [context.Process(target=child, args=(i, barrier)) for i in range(2)]
     for process in children:
         process.start()
     for process in children:
         process.join()
-    print(f"done {float(z):.3f} cycles/ms {cycles}", flush=True)
+    print(f"done {float(z):.3f}", flush=True)
 
 
 def analyze(path: str) -> None:
@@ -281,7 +283,7 @@ def analyze(path: str) -> None:
             ):
                 waits += w_end - w_start
     print(
-        f"K5 {'pass' if waits > 50e6 else 'FAIL'}: main thread GIL wait inside the contended range {waits / 1e6:.1f} ms"
+        f"K5 {'pass' if waits > 5e6 else 'FAIL'}: main thread GIL wait inside the contended range {waits / 1e6:.1f} ms"
     )
 
     queue_wait = (
@@ -346,18 +348,30 @@ def analyze(path: str) -> None:
     if "GPU_CONTEXT_SWITCH_EVENTS" not in tables:
         print("K9 FAIL: no GPU_CONTEXT_SWITCH_EVENTS (profile with --gpuctxsw=true)")
         return
-    sleeps = collections.defaultdict(list)
-    for start, end, corr, name_id, node, global_pid in kernels:
-        if (
-            "sleep" in strings.get(name_id, "").lower()
-            and pid_of(global_pid) in children.values()
-        ):
-            sleeps[pid_of(global_pid)].append((start, end))
-    if len(sleeps) != 2:
-        print(f"K9 FAIL: sleep kernels found for {len(sleeps)} processes")
+
+    def kernels_in(kind):
+        found = collections.defaultdict(list)
+        for start, end, corr, name_id, node, global_pid in kernels:
+            launch = api.get((pid_of(global_pid), corr))
+            label = launch and enclosing(launch[2], launch[0], kind)
+            if label:
+                found[pid_of(global_pid)].append((start, end))
+        return found
+
+    alone = [e - s for spans in kernels_in("ka.alone").values() for s, e in spans]
+    chains = {}
+    for kind in ("ka.slice0", "ka.slice1"):
+        for pid, spans in kernels_in(kind).items():
+            chains[pid] = spans
+    if len(chains) != 2 or not alone:
+        print(
+            f"K9 FAIL: matmul chains found for {len(chains)} children, alone {len(alone)}"
+        )
         return
-    t0 = min(s for v in sleeps.values() for s, _ in v)
-    t1 = max(e for v in sleeps.values() for _, e in v)
+    matmul_alone = statistics.median(alone)
+    expected = MATMULS * matmul_alone
+    t0 = min(s for v in chains.values() for s, _ in v)
+    t1 = max(e for v in chains.values() for _, e in v)
     open_since, raw = {}, collections.defaultdict(list)
     for timestamp, tag, context, gpu in db.execute(
         "select timestamp, tag, contextId, gpuId from GPU_CONTEXT_SWITCH_EVENTS order by gpuId, timestamp, seqNo"
@@ -369,10 +383,10 @@ def analyze(path: str) -> None:
             start = open_since.pop(key)
             if timestamp > t0 and start < t1:
                 raw[key].append((max(start, t0), min(timestamp, t1)))
-    residency = {}
+    residency, slice_lengths = {}, []
     for key, slices in raw.items():
         best, best_ns = None, 0
-        for pid, spans in sleeps.items():
+        for pid, spans in chains.items():
             covered = sum(
                 max(0, min(e, se) - max(s, ss)) for s, e in slices for ss, se in spans
             )
@@ -380,25 +394,32 @@ def analyze(path: str) -> None:
                 best, best_ns = pid, covered
         if best is not None:
             residency[best] = residency.get(best, 0) + sum(e - s for s, e in slices)
+            slice_lengths += [e - s for s, e in slices]
     other = {
-        pid: [iv for p, v in sleeps.items() if p != pid for iv in v] for pid in sleeps
+        pid: [iv for p, v in chains.items() if p != pid for iv in v] for pid in chains
     }
-    stretched, alone = [], []
-    for pid, spans in sleeps.items():
+    contended = []
+    for pid, spans in chains.items():
         for s, e in spans:
             overlap = sum(max(0, min(e, oe) - max(s, os_)) for os_, oe in other[pid])
-            (stretched if overlap > 0.5 * (e - s) else alone).append((e - s) / 1e6)
-    expected_ms = SLEEP_KERNELS * 1.0
-    k9 = len(residency) == 2 and all(
-        0.85 * expected_ms <= value / 1e6 <= 1.25 * expected_ms
-        for value in residency.values()
+            if overlap > 0.5 * (e - s):
+                contended.append(e - s)
+    k9 = (
+        len(residency) == 2
+        and all(
+            0.85 * expected <= value <= 1.25 * expected for value in residency.values()
+        )
+        and (t1 - t0) >= 1.7 * expected
+        and bool(contended)
+        and statistics.median(contended) > matmul_alone
     )
     print(
-        f"K9 {'pass' if k9 else 'FAIL'}: residency per process "
-        f"{[round(v / 1e6, 1) for v in residency.values()]} ms against {expected_ms:.0f} ms of work each; "
-        f"window {(t1 - t0) / 1e6:.1f} ms; sleep kernel ms alone p50 "
-        f"{statistics.median(alone) if alone else float('nan'):.3f} (n {len(alone)}), with the other in "
-        f"flight p50 {statistics.median(stretched) if stretched else float('nan'):.3f} (n {len(stretched)})"
+        f"K9 {'pass' if k9 else 'FAIL'}: matmul alone {matmul_alone / 1e6:.3f} ms, work per child "
+        f"{expected / 1e6:.1f} ms; residency per child {[round(v / 1e6, 1) for v in residency.values()]} ms; "
+        f"both chains {(t1 - t0) / 1e6:.1f} ms of wall; contended matmul p50 "
+        f"{statistics.median(contended) / 1e6 if contended else float('nan'):.3f} ms (n {len(contended)}); "
+        f"residency slice p50 {statistics.median(slice_lengths) / 1e6 if slice_lengths else float('nan'):.3f} ms, "
+        f"max {max(slice_lengths) / 1e6 if slice_lengths else float('nan'):.3f} ms"
     )
 
 
