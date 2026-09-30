@@ -40,6 +40,7 @@ Names (rid = request id, the first word is the kind the census groups by):
   flow.cond, flow.pack, flow.split         conditioning, input packing, mel split
   hift.delta frames=F final=X              streaming HiFT over one request's history
   hift.batch n=N                           buffered HiFT group
+  hift.step rows=N final=X, hift.group rows=N  batched streaming HiFT step and its decodes
   cap <site>                               one CUDA graph capture
     op <aten op> @<library site> <omni site>
   compiled                                 a compiled callable run with labels popped
@@ -489,6 +490,20 @@ def patch_cosy_stages(module):
     vocoder.mel2wav_batch = ranged(
         vocoder.mel2wav_batch, lambda self, mels: f"hift.batch n={len(mels)}"
     )
+    # the batched streaming HiFT step of #2392, rows as tuples on its head and as
+    # HiftStepRow after it; a group is (plans, members) there and (windows) here
+    if hasattr(vocoder, "hift_step"):
+        vocoder.hift_step = ranged(
+            vocoder.hift_step,
+            lambda self, rows: (
+                f"hift.step rows={len(rows)} final="
+                f"{int(any(row.is_final if hasattr(row, 'is_final') else row[2] for row in rows))}"
+            ),
+        )
+        vocoder.hift_group = ranged(
+            vocoder.hift_group,
+            lambda self, *args: f"hift.group rows={len(args[-1])}",
+        )
     vocoder.decode_batch = ranged_async(
         vocoder.decode_batch, lambda self, items: f"voc.decode_batch n={len(items)}"
     )

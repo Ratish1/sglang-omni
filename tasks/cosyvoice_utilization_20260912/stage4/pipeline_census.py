@@ -20,9 +20,11 @@ Sections:
   F first chunk    per request critical path
   G attribution    graph and eager kernels by capture site and op call site
   H playback       per chunk margin at the coordinator: audio delivered against time
+  I final wait     per request final chunk gap: AR tail, queue behind other steps, the
+                   leftover step (Flow, HiFT) and delivery, for all and for the tail
 
 usage: python pipeline_census.py REPORT.sqlite --bench-log bench.log [--top 25]
-       [--sections ABCDEFG]
+       [--sections ABCDEFGHI]
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ OWNER_RULES = (
     ("flow.leftover", "flow.final"),
     ("flow.buffered", "flow.buffered"),
     ("hift.delta", "hift.stream"),
+    ("hift.step", "hift.stream"),
     ("hift.batch", "hift.buffered"),
     ("voc", "voc.other"),
     ("mr.sample", "ar.sampler"),
@@ -964,6 +967,106 @@ def section_g(r: Report, top: int):
         )
 
 
+def section_i(r: Report):
+    print(
+        "\n## I. final chunk wait (ms, per streaming request): the gap from the previous chunk to the final one"
+    )
+    arrivals = collections.defaultdict(list)
+    step_marks = collections.defaultdict(list)
+    for t, tid, label in r.marks:
+        match = re.match(r"coord\.recv rid=(\S+) n=(\d+)", label)
+        if match:
+            arrivals[match.group(1)].append(t)
+            continue
+        match = re.match(r"voc\.steprid rid=(\S+) plan=(\S+)", label)
+        if match:
+            step_marks[match.group(1)].append((t, tid, match.group(2)))
+    done = {}
+    steps = []
+    for items in r.ranges.values():
+        for item in items:
+            if item.kind == "voc.done":
+                done.setdefault(item.rid(), item.start)
+            elif item.kind.startswith("voc.step "):
+                steps.append(item)
+    steps.sort(key=lambda item: item.start)
+    step_starts = [item.start for item in steps]
+
+    def step_at(t: int, tid: int) -> Range | None:
+        index = bisect.bisect_right(step_starts, t) - 1
+        while index >= 0 and steps[index].tid != tid:
+            index -= 1
+        return steps[index] if index >= 0 and steps[index].end >= t else None
+
+    inside: dict[tuple[int, str], int] = collections.Counter()
+    for items in r.ranges.values():
+        for item in items:
+            if item.kind in ("flow.leftover", "hift.step"):
+                parent = item.parent
+                while parent is not None and not parent.kind.startswith("voc.step "):
+                    parent = parent.parent
+                if parent is not None:
+                    inside[(id(parent), item.kind)] += item.wall
+
+    def child_wall(step: Range, kind: str) -> int:
+        return inside[(id(step), kind)]
+
+    rows = []
+    for rid, times in arrivals.items():
+        times.sort()
+        marks = sorted(step_marks.get(rid, []))
+        finals = [(t, tid) for t, tid, plan in marks if plan == "leftover"]
+        hops = [(t, tid) for t, tid, plan in marks if plan == "causal_window"]
+        if len(times) < 2 or not finals or not hops or rid not in done:
+            continue
+        final_step = step_at(*finals[0])
+        hop_step = step_at(*hops[-1])
+        if final_step is None or hop_step is None:
+            continue
+        ready = max(done[rid], hop_step.end)
+        between = [s for s in steps if ready <= s.start < final_step.start]
+        rows.append(
+            {
+                "gap": times[-1] - times[-2],
+                "lead": hop_step.end - times[-2],
+                "ar tail": max(0, done[rid] - hop_step.end),
+                "queue": final_step.start - ready,
+                "leftover flow": child_wall(final_step, "flow.leftover"),
+                "leftover hift": child_wall(final_step, "hift.step"),
+                "leftover rest": final_step.wall
+                - child_wall(final_step, "flow.leftover")
+                - child_wall(final_step, "hift.step"),
+                "deliver": times[-1] - final_step.end,
+                "finals in step": int(final_step.label.rsplit("rows=", 1)[-1]),
+                "steps waited": len(between),
+                "hop steps waited": sum(1 for s in between if "causal" in s.kind),
+                "waited step wall": sum(s.wall for s in between),
+            }
+        )
+    if not rows:
+        print("  no request with a hop step, a leftover step and a stream end mark")
+        return
+    rows.sort(key=lambda row: row["gap"])
+    counts = ("finals in step", "steps waited", "hop steps waited")
+    groups = (
+        ("all", rows),
+        ("gap >= p90", rows[int(0.90 * len(rows)) :]),
+        ("gap >= p99", rows[int(0.99 * len(rows)) :]),
+    )
+    print(f"  requests {len(rows)}; mean per group (counts are plain means)")
+    print(f"  {'':<22}" + "".join(f"{name:>14}" for name, _ in groups))
+    for key in rows[0]:
+        cells = []
+        for _, members in groups:
+            value = statistics.fmean(row[key] for row in members)
+            cells.append(f"{value:>14.2f}" if key in counts else f"{ms(value):>14.1f}")
+        print(f"  {key:<22}" + "".join(cells))
+    print(
+        "  gap = lead + ar tail + queue + leftover (flow, hift, rest) + deliver; lead is the"
+        " previous chunk's transport, negative"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("report")
@@ -984,6 +1087,7 @@ def main() -> None:
         "F": lambda: section_f(r),
         "G": lambda: section_g(r, args.top),
         "H": lambda: section_h(r),
+        "I": lambda: section_i(r),
     }
     for key in args.sections:
         steps[key]()
