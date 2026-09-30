@@ -1331,10 +1331,11 @@ def section_k(
         return
     else:
         print(f"  DCGM, card {gpu}:")
-    # the known answer's lag, refitted on this run: the lag whose windows best match the
-    # trace's busy fraction
+    # the lag is refitted on this run, the one whose windows best match the trace's busy
+    # fraction: it holds DCGM's own delay (the known answer's) and the offset between the
+    # trace clock and its session start epoch
     fits = []
-    for lag_step in range(-10, 11):
+    for lag_step in range(-30, 31):
         lag = int((lag_ms + 10 * lag_step) * 1e6)
         values = load_dcgm(r, samples_path, gpu, lag, period)
         windows = sorted(w for w in values if "gr_active" in values[w])
@@ -1347,15 +1348,18 @@ def section_k(
         print(f"  no DCGM sample of card {gpu} inside the window")
         return
     correlation, lag, values = max(fits, key=lambda fit: fit[0])
+    # DCGM stamps each field on its own, so each field's samples are its own windows
     windows = sorted(values)
     fields = sorted({name for fields in values.values() for name in fields})
     measured = {
         name: numpy.array([values[w].get(name, numpy.nan) for w in windows])
         for name in fields
     }
-    trace_gr = numpy.array([busy(card, card_starts, w) for w in windows])
+    has_gr = ~numpy.isnan(measured["gr_active"])
+    trace_gr = numpy.array([busy(card, card_starts, w) for w in windows])[has_gr]
     print(
-        f"  card {gpu}, {len(windows)} windows of {period_ms:.0f} ms; lag {lag / 1e6:.0f} ms "
+        f"  card {gpu}, {has_gr.sum()} GR samples of "
+        f"{period_ms:.0f} ms; lag {lag / 1e6:.0f} ms "
         f"(known answer {lag_ms:.0f}), per-window correlation of DCGM GR with the trace "
         f"{correlation:.3f}"
     )
