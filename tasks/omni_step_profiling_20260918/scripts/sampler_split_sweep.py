@@ -8,7 +8,8 @@ seeded_top_k_top_p_sample_kernel at 2, 4, 8 and 16 warps; the served single kern
 8 warps. A "topk_merge" variant re-sorts the chunk runs with tl.topk, as the first split did.
 
 Each cell is the median us per call of 15 calls in one CUDA graph over 30 replays, taken
-from 3 separate captures; the spread of the 3 is the cell's noise. Rows use the model's
+from 3 separate captures; the spread of the 3 is the cell's noise. A GPU sleep queued ahead
+of each replay's start event keeps the graph launch's host latency out of the time. Rows use the model's
 default sampling (temperature 0.9, top_k 50 at width 64, top_p 1.0) unless --top-p is set.
 Every configuration's tokens are checked against the single kernel first on 512 rows with
 normal logits, integer logits (ties) and signed zeros, at random per-row top_k.
@@ -43,6 +44,7 @@ from sglang_omni.models.qwen3_tts.sampling_kernels import (
 CALLS = 15
 REPLAYS = 30
 CAPTURES = 3
+SLEEP_CYCLES = 1_000_000
 BATCHES = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512)
 BLOCK_KS = (64, 128, 256, 512, 1024)
 CHUNKS = (2, 4, 8, 16, 32)
@@ -234,6 +236,7 @@ def graph_times(run) -> list[float]:
         end = torch.cuda.Event(enable_timing=True)
         replays = []
         for _ in range(REPLAYS):
+            torch.cuda._sleep(SLEEP_CYCLES)
             start.record()
             graph.replay()
             end.record()
