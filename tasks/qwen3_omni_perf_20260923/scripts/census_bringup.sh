@@ -2,8 +2,11 @@
 # Bring a fresh container to the Qwen3-Omni census and start it (run inside the container):
 # the main and tools trees, main's pinned dependencies, the checkpoint and the corpora, the
 # known answers on the fourth card, then the census matrices on cards 0 to 2, three servers
-# at most: card 0 the default profile, card 1 both prefill graphs, card 2 the clean baselines
-# (K10) and the capture label boots (attribution). Everything lands under OUT.
+# at most: card 0 the default profile, card 1 CONFIG_B (default both: the thinker prefill graph
+# added, the H200 question; talkeronly on the H100, whose profile ships both graphs), card 2
+# the clean baselines (K10) and the capture label boots (attribution). PROFILE (default h200)
+# is the serve profile; SKIP_MMMU=1 drops the MMMU talker cells (the H100 bf16 thinker pool
+# cannot hold its image prompts at c16). Everything lands under OUT.
 # usage: census_bringup.sh <out>
 set -u
 OUT=$1
@@ -28,14 +31,17 @@ mkdir -p "$OUT/ka"
   && python3 "$S/omni_known_answer.py" analyze ka.sqlite > analyze.txt 2>&1)
 echo "known answers done $(date +%T)" >> "$OUT/bringup.log"
 
+B=${CONFIG_B:-both}
+export PROFILE=${PROFILE:-h200}
 cells() {
-  local config=$1
-  echo "$config:seedtts_en:16:probe:128 $config:seedtts_en_nostream:16:probe:128 $config:mmsu_talker:16:probe:128 $config:mmmu_talker:16:probe:48 $config:seedtts_en:1:probe:48"
+  local config=$1 mmmu=""
+  [ "${SKIP_MMMU:-0}" = 1 ] || mmmu="$config:mmmu_talker:16:probe:48"
+  echo "$config:seedtts_en:16:probe:128 $config:seedtts_en_nostream:16:probe:128 $config:mmsu_talker:16:probe:128 $mmmu $config:seedtts_en:1:probe:48"
 }
 bash "$S/census_matrix.sh" "$MAIN" "$OUT/card0" 0 8000 "$(cells default)" > "$OUT/card0.log" 2>&1 &
-bash "$S/census_matrix.sh" "$MAIN" "$OUT/card1" 1 9000 "$(cells both)" > "$OUT/card1.log" 2>&1 &
+bash "$S/census_matrix.sh" "$MAIN" "$OUT/card1" 1 9000 "$(cells "$B")" > "$OUT/card1.log" 2>&1 &
 bash "$S/census_matrix.sh" "$MAIN" "$OUT/card2" 2 10000 \
-  "default:seedtts_en:16:clean:128 both:seedtts_en:16:clean:128 default:seedtts_en:16:lines:128 both:seedtts_en:16:lines:128" \
+  "default:seedtts_en:16:clean:128 $B:seedtts_en:16:clean:128 default:seedtts_en:16:lines:128 $B:seedtts_en:16:lines:128" \
   > "$OUT/card2.log" 2>&1 &
 echo "matrices started $(date +%T)" >> "$OUT/bringup.log"
 wait
