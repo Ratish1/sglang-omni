@@ -145,7 +145,7 @@ def main() -> None:
     for frames in args.frames:
         codes = torch.randint(0, codebook, (1, QUANTIZERS, frames), device="cuda")
         row = [f"frames {frames:3d}"]
-        for name, model in (("served", served), ("candidate", candidate)):
+        for name, model in (("candidate", candidate), ("served", served)):
             first = timed_ms(model, codes)
             second = timed_ms(model, codes)
             row.append(f"{name} first {first:8.1f} ms second {second:6.1f} ms")
