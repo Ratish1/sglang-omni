@@ -704,22 +704,27 @@ def section_d(r: Report, top: int):
                 if timestamp > r.t0 and start < r.t1:
                     raw[key].append((max(start, r.t0), min(timestamp, r.t1)))
                 last_save[gpu] = timestamp
-        # note: switch records are device wide with host context ids, kernels carry the
-        # container's; a context is the process whose kernels its slices cover most
-        union_starts = {pid: [a for a, _ in v] for pid, v in unions.items()}
+        # note: switch records cover every GPU in the container with host context ids, and
+        # kernels carry container pids; a kernel's interval includes time switched out, so a
+        # context is named by the process whose kernel starts fall inside its slices (work
+        # starts only while its own context is resident)
+        starts_of_pid = collections.defaultdict(list)
+        for s, e, owner, name, stream, identity, key, node, pid in r.device:
+            starts_of_pid[pid].append(s)
+        for values in starts_of_pid.values():
+            values.sort()
         pid_of_key, covered_by_gpu = {}, collections.Counter()
         for key, slices in raw.items():
-            best, best_ns = None, 0
-            for pid, spans in unions.items():
-                covered = sum(
-                    sum(b - a for a, b in clip(spans, union_starts[pid], s, e))
+            counts = collections.Counter()
+            for pid, values in starts_of_pid.items():
+                counts[pid] = sum(
+                    bisect.bisect_left(values, e) - bisect.bisect_left(values, s)
                     for s, e in slices
                 )
-                if covered > best_ns:
-                    best, best_ns = pid, covered
-            if best is not None:
+            best, best_count = counts.most_common(1)[0] if counts else (None, 0)
+            if best_count > 0:
                 pid_of_key[key] = best
-                covered_by_gpu[key[0]] += best_ns
+                covered_by_gpu[key[0]] += best_count
         session_gpu = covered_by_gpu.most_common(1)[0][0] if covered_by_gpu else None
         resident = {key: v for key, v in raw.items() if key[0] == session_gpu}
         switches = switches.get(session_gpu, [])
@@ -732,7 +737,7 @@ def section_d(r: Report, top: int):
         ):
             pid = pid_of_key.get(key)
             name = (
-                r.stage_of_pid(pid) if pid is not None else f"ctx{key[1]} (no kernels)"
+                r.stage_of_pid(pid) if pid is not None else f"ctx{key[1]} (no starts)"
             )
             total = sum(b - a for a, b in slices)
             lengths = [b - a for a, b in slices]
