@@ -7,7 +7,8 @@ execution plans, benchmark searches); a second call at the same length is the st
 call (served NCL, channels last (1 x k), phase width (k x 1) over (B, C, L / d, d)), summed per form
 and per conv kind, to say which setup the first-call time is.
 
---arm served|candidate loads one arm only, so no setup one arm pays (the shared transformer's, a
+Each call also reports its peak allocation above the memory held before it (activations, cuDNN
+workspace). --arm served|candidate loads one arm only, so no setup one arm pays (the shared transformer's, a
 shared conv shape's) is charged to the other; compare two processes.
 
 usage: PYTHONPATH=<tree> python3 code2wav_first_call.py [--frames 23 27 31] [--benchmark] [--per-conv]
@@ -43,6 +44,15 @@ def timed_ms(model, codes: torch.Tensor) -> float:
         model(codes)
     torch.cuda.synchronize()
     return (time.perf_counter() - start) * 1000
+
+
+def peak_mib(model, codes: torch.Tensor) -> tuple[float, float]:
+    """(ms, peak allocated MiB above the allocation before the call) of one call."""
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    elapsed = timed_ms(model, codes)
+    return elapsed, (torch.cuda.max_memory_allocated() - before) / 2**20
 
 
 def timed_call_ms(fn) -> float:
@@ -158,9 +168,12 @@ def main() -> None:
         codes = torch.randint(0, codebook, (1, QUANTIZERS, frames), device="cuda")
         row = [f"frames {frames:3d}"]
         for name, model in arms.items():
-            first = timed_ms(model, codes)
-            second = timed_ms(model, codes)
-            row.append(f"{name} first {first:8.1f} ms second {second:6.1f} ms")
+            first, first_peak = peak_mib(model, codes)
+            second, second_peak = peak_mib(model, codes)
+            row.append(
+                f"{name} first {first:8.1f} ms peak {first_peak:7.0f} MiB second "
+                f"{second:6.1f} ms peak {second_peak:6.0f} MiB"
+            )
         print(" | ".join(row), flush=True)
 
 
