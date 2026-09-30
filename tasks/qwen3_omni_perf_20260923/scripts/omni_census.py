@@ -506,6 +506,33 @@ class Report:
         own = self.resident.get(pid, [])
         return sum(b - a for a, b in spans) - minus_len(spans, own)
 
+    def charged_durations(self) -> list[int]:
+        """Per device interval, the time charged to it: from the later of its start and the
+        end of its stream predecessor (a kernel launched with programmatic dependent launch
+        starts early and waits for the predecessor inside its own interval), counted only
+        while its own context was resident (the rest is another process's turn)."""
+        resident_starts = {
+            pid: [a for a, _ in spans] for pid, spans in self.resident.items()
+        }
+        stream_end: dict[tuple[int, int], int] = {}
+        charged = []
+        for start, end, owner, name, stream, identity, key, node, pid in self.device:
+            previous_end = stream_end.get((pid, stream), start)
+            begin = min(max(start, previous_end), end)
+            stream_end[(pid, stream)] = max(previous_end, end)
+            if pid in self.resident:
+                charged.append(
+                    sum(
+                        b - a
+                        for a, b in clip(
+                            self.resident[pid], resident_starts[pid], begin, end
+                        )
+                    )
+                )
+            else:
+                charged.append(end - begin)
+        return charged
+
     def load_host_states(self):
         self.os_wait: dict[int, list] = collections.defaultdict(list)
         if "OSRT_API" not in self.tables:
@@ -1103,29 +1130,11 @@ def section_g(r: Report, top: int):
     )
     labeled = unlabeled = 0
     owner_total = collections.Counter()
-    resident_starts = {pid: [a for a, _ in spans] for pid, spans in r.resident.items()}
-    # a kernel launched with programmatic dependent launch starts before its predecessor on
-    # the stream ends and waits for it, so its interval overlaps the predecessor's; each
-    # kernel is charged from the later of its start and the stream predecessor's end
-    effective_start = []
-    stream_end: dict[tuple[int, int], int] = {}
-    for start, end, owner, name, stream, identity, key, node, pid in r.device:
-        previous_end = stream_end.get((pid, stream), start)
-        effective_start.append(min(max(start, previous_end), end))
-        stream_end[(pid, stream)] = max(previous_end, end)
+    charged = r.charged_durations()
     for index, (start, end, owner, name, stream, identity, key, node, pid) in enumerate(
         r.device
     ):
-        start = effective_start[index]
-        # a kernel's weight is the time its own context was resident while it ran; the rest
-        # of its interval is another process's turn on the card
-        if pid in r.resident:
-            duration = sum(
-                b - a
-                for a, b in clip(r.resident[pid], resident_starts[pid], start, end)
-            )
-        else:
-            duration = end - start
+        duration = charged[index]
         stage = owner.split(":")[0]
         owner_total[stage] += duration
         cap = op = None

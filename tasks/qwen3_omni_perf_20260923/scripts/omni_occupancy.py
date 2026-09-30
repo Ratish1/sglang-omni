@@ -6,7 +6,8 @@ shared memory and block size allow (the Hopper limits: 64 warps, 65,536 register
 228 KiB shared memory and 32 blocks per SM), and from those the resident warps per SM
 it can reach. Weighted by kernel time per owner (stage:component, as in omni_census.py),
 this bounds the SM active and SM occupancy DCGM reads, and shows which owner leaves SMs
-empty. Ported from the Qwen3-TTS kit's occupancy_census.py; joins keyed by process.
+empty. Kernel time is the census's charged time: resident, and a PDL kernel from its stream
+predecessor's end. Ported from the Qwen3-TTS kit's occupancy_census.py; joins keyed by process.
 
 usage: python omni_occupancy.py REPORT.sqlite --window window.txt [--sms 132]
 """
@@ -76,12 +77,17 @@ def main() -> None:
     owners = collections.defaultdict(lambda: collections.Counter())
     buckets = collections.defaultdict(lambda: collections.Counter())
     families = collections.defaultdict(lambda: collections.Counter())
-    for start, end, owner, name, stream, identity, key, node, pid in r.device:
+    charged = r.charged_durations()
+    for index, (start, end, owner, name, stream, identity, key, node, pid) in enumerate(
+        r.device
+    ):
         entry = config.get((start, *key))
         if entry is None:
             continue
         ctas, threads, regs, shared = entry
-        duration = end - start
+        duration = charged[index]
+        if duration <= 0:
+            continue
         limit = blocks_per_sm(threads, regs, shared)
         warps = max(1, math.ceil(threads / 32))
         coverage = min(1.0, ctas / sms)
