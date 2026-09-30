@@ -2,7 +2,8 @@
 # One benchmark boot of a Qwen3-Omni tree on one card. Provenance, the colocated server,
 # every arm of ARMS one after another (run_bench.py gen), stop by the server's own process
 # group; then, with SCORE=1, a Qwen3-ASR server on the same card and run_bench.py score
-# for every arm that has speech. pids seen on the card are logged every 2 s; a second pid
+# for every arm that has speech. pids seen on the card are logged every 2 s, and card memory beyond
+# our processes (another container's process, invisible to our nvidia-smi) over 1 GiB voids the boot; a second pid
 # while the omni server runs voids the boot.
 # MAX_SAMPLES=N runs the first N samples of every arm (identity smokes); unset is the full corpus.
 # REQUEST_RATE=R sends SeedTTS arms open loop at R per second under the concurrency cap, a
@@ -47,6 +48,15 @@ DMON_PID=$!
 uuid=$(nvidia-smi -i "$CARD" --query-gpu=uuid --format=csv,noheader)
 (while true; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader | grep "$uuid" | sed "s/^/$(date +%T) /"; sleep 2; done) > "$OUT/apps.csv" 2>&1 &
 APPS_PID=$!
+# the container lists only its own pids, so a process from another container on this card
+# shows only as card memory beyond our processes' sum
+(while true; do
+  total=$(nvidia-smi -i "$CARD" --query-gpu=memory.used --format=csv,noheader,nounits)
+  ours=$(nvidia-smi --query-compute-apps=gpu_uuid,used_memory --format=csv,noheader,nounits | grep "$uuid" | awk -F', ' '{s += $2} END {print s + 0}')
+  echo "$(date +%T) $total $ours"
+  sleep 2
+done) > "$OUT/card_memory.log" 2>&1 &
+CARD_MEMORY_PID=$!
 (while true; do echo "$(date +%T) $(cat /proc/loadavg) | $(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader | tr '\n' ' ')"; sleep 30; done) > "$OUT/host_load.txt" 2>&1 &
 LOAD_PID=$!
 
@@ -99,6 +109,11 @@ else
 fi
 stop serve
 echo "pids on the card: $(awk '{print $3}' "$OUT/apps.csv" | sort -u | tr '\n' ' ')" >> "$OUT/progress.txt"
+foreign=$(awk '$3 > 0 && $2 - $3 > max {max = $2 - $3} END {print max + 0}' "$OUT/card_memory.log")
+echo "most card memory outside our processes while the server ran: $foreign MiB" >> "$OUT/progress.txt"
+if [ "$foreign" -gt 1024 ]; then
+  echo "foreign process on the card: $foreign MiB outside our processes" >> "$OUT/FAILED"
+fi
 
 SPEECH=""
 for arm in $ARMS; do
@@ -122,6 +137,6 @@ if [ "${SCORE:-0}" = 1 ] && [ -n "$SPEECH" ] && [ ! -f "$OUT/FAILED" ]; then
   fi
   find "$OUT" -name '*.wav' -path '*/audio/*' -delete
 fi
-kill "$DMON_PID" "$APPS_PID" "$LOAD_PID" 2>/dev/null
+kill "$DMON_PID" "$APPS_PID" "$CARD_MEMORY_PID" "$LOAD_PID" 2>/dev/null
 echo "done $(date +%T)" >> "$OUT/progress.txt"
 touch "$OUT/DONE"
