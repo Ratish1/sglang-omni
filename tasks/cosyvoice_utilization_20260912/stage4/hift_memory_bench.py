@@ -81,6 +81,7 @@ def main() -> None:
                     stream["emitted"] = max(total - HOLD_FRAMES, 0) * SAMPLES_PER_FRAME
     torch.cuda.synchronize()
     report = {
+        "stages_file": stages.__file__,
         "peak_allocated_mib": round(
             (torch.cuda.max_memory_allocated() - base_allocated) / 2**20
         ),
