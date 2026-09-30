@@ -10,7 +10,10 @@ Then each Conv1d and ConvTranspose1d of the steady 35-frame window is recorded w
 shape and run, in a CUDA graph of 10 calls, as served (NCL contiguous), as a 4D channels-last conv
 over (N, C, 1, L), and for dilated convs with one group as a polyphase batch: the input's d phases
 x[..., p::d] stacked on the batch and convolved undilated in one call, the outputs interleaved
-back. Each variant: time, whether it equals the served output bit for bit, and its distance to an
+back. Dilated convs also run as a phase-width conv: the (B, L, C) activation, right padded to a
+multiple of d, viewed without a copy as the channels-last (B, C, L/d, d) tensor, so the dilated
+conv along L is an undilated (k x 1) conv along L/d and each column of the width is one phase.
+Each variant: time, whether it equals the served output bit for bit, and its distance to an
 fp32 conv of the same input.
 
 usage: python3 code2wav_conv_census.py [--model-path Qwen/Qwen3-Omni-30B-A3B-Instruct]
@@ -108,6 +111,23 @@ def polyphase_conv(x, weight, bias, dilation: int):
     )
 
 
+def phase_width_conv(x_blc, weight_kx1, bias, dilation: int, output_length: int):
+    """A dilated conv (stride 1, no padding) of a (B, L, C) activation as an undilated (k x 1)
+    conv over its channels-last (B, C, L/d, d) view; returns (B, C_out, L_out)."""
+    batch, length, channels = x_blc.shape
+    padded = F.pad(x_blc, (0, 0, 0, (-length) % dilation))
+    out = F.conv2d(
+        padded.view(batch, -1, dilation, channels).permute(0, 3, 1, 2),
+        weight_kx1,
+        bias,
+    )
+    return (
+        out.permute(0, 2, 3, 1)
+        .reshape(batch, -1, out.shape[1])[:, :output_length]
+        .transpose(1, 2)
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default="Qwen/Qwen3-Omni-30B-A3B-Instruct")
@@ -176,6 +196,14 @@ def main() -> None:
                 if dilation > 1 and groups == 1 and stride == 1 and padding == 0:
                     variants["polyphase"] = lambda: polyphase_conv(
                         x, weight, bias, dilation
+                    )
+                    x_blc = x.transpose(1, 2).contiguous()
+                    weight_kx1 = weight.unsqueeze(-1).contiguous(
+                        memory_format=torch.channels_last
+                    )
+                    output_length = shape[-1] - (weight.shape[-1] - 1) * dilation
+                    variants["phase width"] = lambda: phase_width_conv(
+                        x_blc, weight_kx1, bias, dilation, output_length
                     )
             else:
                 output_padding = module.output_padding[0]
