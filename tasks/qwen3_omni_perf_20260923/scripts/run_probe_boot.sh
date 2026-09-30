@@ -104,10 +104,16 @@ cat /proc/loadavg > "$OUT/loadavg_after.txt"
 find "$OUT" -name '*.wav' -delete
 [ -f "$OUT/FAILED" ] && exit 1
 
+# the card is free once the serve has stopped: export and census run on the CPU in the
+# background, so the next cell boots at once; CENSUS_DONE marks their end
 if [ "$NSYS_ARGS" != none ]; then
-  nsys export --type sqlite --force-overwrite=true -o "$OUT/serve.sqlite" "$OUT/serve.nsys-rep" > "$OUT/export.log" 2>&1
-  echo "exported $(date +%T)" >> "$OUT/progress.txt"
-  (cd "$S" && python3 omni_census.py "$OUT/serve.sqlite" --window "$OUT/window.txt") > "$OUT/census.txt" 2>&1
+  (
+    nsys export --type sqlite --force-overwrite=true -o "$OUT/serve.sqlite" "$OUT/serve.nsys-rep" > "$OUT/export.log" 2>&1
+    echo "exported $(date +%T)" >> "$OUT/progress.txt"
+    (cd "$S" && python3 omni_census.py "$OUT/serve.sqlite" --window "$OUT/window.txt") > "$OUT/census.txt" 2>&1
+    echo "census done $(date +%T)" >> "$OUT/progress.txt"
+    touch "$OUT/CENSUS_DONE"
+  ) &
 fi
 echo "done $(date +%T)" >> "$OUT/progress.txt"
 touch "$OUT/DONE"
