@@ -7,7 +7,11 @@ execution plans, benchmark searches); a second call at the same length is the st
 call (served NCL, channels last (1 x k), phase width (k x 1) over (B, C, L / d, d)), summed per form
 and per conv kind, to say which setup the first-call time is.
 
+--arm served|candidate loads one arm only, so no setup one arm pays (the shared transformer's, a
+shared conv shape's) is charged to the other; compare two processes.
+
 usage: PYTHONPATH=<tree> python3 code2wav_first_call.py [--frames 23 27 31] [--benchmark] [--per-conv]
+       [--arm served|candidate|both]
 """
 
 from __future__ import annotations
@@ -116,6 +120,9 @@ def main() -> None:
     parser.add_argument("--frames", type=int, nargs="+", default=[23, 27, 31, 26])
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--per-conv", action="store_true")
+    parser.add_argument(
+        "--arm", choices=("served", "candidate", "both"), default="both"
+    )
     args = parser.parse_args()
     torch.backends.cudnn.benchmark = args.benchmark
     config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
@@ -137,15 +144,20 @@ def main() -> None:
         return
     else:
         pass
+    arms = {"served": served, "candidate": candidate}
+    if args.arm != "both":
+        arms = {args.arm: arms[args.arm]}
+    else:
+        arms = {"candidate": candidate, "served": served}
     # a warm call at a length outside the list, so one-time process setup is not charged
     warm = torch.randint(0, codebook, (1, QUANTIZERS, 10), device="cuda")
-    timed_ms(served, warm)
-    timed_ms(candidate, warm)
+    for model in arms.values():
+        timed_ms(model, warm)
     print(torch.cuda.get_device_name(), "cudnn.benchmark", args.benchmark)
     for frames in args.frames:
         codes = torch.randint(0, codebook, (1, QUANTIZERS, frames), device="cuda")
         row = [f"frames {frames:3d}"]
-        for name, model in (("candidate", candidate), ("served", served)):
+        for name, model in arms.items():
             first = timed_ms(model, codes)
             second = timed_ms(model, codes)
             row.append(f"{name} first {first:8.1f} ms second {second:6.1f} ms")
