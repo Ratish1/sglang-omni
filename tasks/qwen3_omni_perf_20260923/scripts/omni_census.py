@@ -1069,7 +1069,7 @@ def section_h(r: Report, sample_rate: int):
 
 
 def section_g(r: Report, top: int):
-    print("\n## G. attribution: device time by capture site and op call site")
+    print("\n## G. attribution: resident device time by capture site and op call site")
     node_rows = (
         r.db.execute(
             "select start, globalTid, graphNodeId, originalGraphNodeId from CUDA_GRAPH_NODE_EVENTS"
@@ -1103,8 +1103,17 @@ def section_g(r: Report, top: int):
     )
     labeled = unlabeled = 0
     owner_total = collections.Counter()
+    resident_starts = {pid: [a for a, _ in spans] for pid, spans in r.resident.items()}
     for start, end, owner, name, stream, identity, key, node, pid in r.device:
-        duration = end - start
+        # a kernel's weight is the time its own context was resident while it ran; the rest
+        # of its interval is another process's turn on the card
+        if pid in r.resident:
+            duration = sum(
+                b - a
+                for a, b in clip(r.resident[pid], resident_starts[pid], start, end)
+            )
+        else:
+            duration = end - start
         stage = owner.split(":")[0]
         owner_total[stage] += duration
         cap = op = None
