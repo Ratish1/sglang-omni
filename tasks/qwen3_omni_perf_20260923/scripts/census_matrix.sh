@@ -4,7 +4,8 @@
 # (talker prefill graph only) or both (the thinker prefill graph too), and mode is probe (nsys
 # with the probe, the census), clean (no profiler, no probe: the same cell's baseline), or lines
 # (probe plus op labels at graph capture, for attribution). Each cell lands in
-# OUT/<config>_<arm>_c<concurrency>_<mode>.
+# OUT/<config>_<arm>_c<concurrency>_<mode>. PROFILE (default h200) picks the serve profile of
+# run_probe_boot.sh (bf16 is the H100 profile, for tool checks off the H200).
 # usage: census_matrix.sh <tree> <out root> <card> <port> "<cell> <cell> ..."
 set -u
 TREE=$1 ROOT=$2 CARD=$3 PORT=$4 CELLS=$5
@@ -27,7 +28,7 @@ for cell in $CELLS; do
   esac
   echo "$(date +%T) start $cell" >> "$ROOT/matrix.log"
   env EXTRA_SERVE_ARGS="$extra" LINES="$lines" ${nsys_args:+NSYS_ARGS=$nsys_args} \
-    bash "$S/run_probe_boot.sh" "$TREE" "$out" "$CARD" "$PORT" h200 "$conc" "$arm"
+    bash "$S/run_probe_boot.sh" "$TREE" "$out" "$CARD" "$PORT" "${PROFILE:-h200}" "$conc" "$arm"
   echo "$(date +%T) end $cell rc $?" >> "$ROOT/matrix.log"
 done
 echo "$(date +%T) matrix done" >> "$ROOT/matrix.log"
