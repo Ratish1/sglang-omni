@@ -7,6 +7,8 @@
 # op labels at graph capture. WARM_SAMPLES (default 32) run before the window; MAX_SAMPLES
 # (default 128) bound the report. Only the serve
 # is sent TERM; nsys finalizes by itself. Export and census run here, in the container.
+# DCGM_SAMPLES names the samples file a host-side dcgm/dcgm_sampler.py writes for this card
+# (H100 host only): the census adds section K, and a clean boot gets dcgm.txt, the window means.
 # usage: run_probe_boot.sh <tree> <out dir> <card> <port> <h200|bf16|fp8> <concurrency> <arm>
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 DTYPE=$5 CONC=$6 ARM=$7
@@ -110,10 +112,14 @@ if [ "$NSYS_ARGS" != none ]; then
   (
     nsys export --type sqlite --force-overwrite=true -o "$OUT/serve.sqlite" "$OUT/serve.nsys-rep" > "$OUT/export.log" 2>&1
     echo "exported $(date +%T)" >> "$OUT/progress.txt"
-    (cd "$S" && python3 omni_census.py "$OUT/serve.sqlite" --window "$OUT/window.txt") > "$OUT/census.txt" 2>&1
+    (cd "$S" && python3 omni_census.py "$OUT/serve.sqlite" --window "$OUT/window.txt" \
+      ${DCGM_SAMPLES:+--dcgm "$DCGM_SAMPLES" --dcgm-gpu "$CARD" --sections ABCDEFGHIJK}) > "$OUT/census.txt" 2>&1
     echo "census done $(date +%T)" >> "$OUT/progress.txt"
     touch "$OUT/CENSUS_DONE"
   ) &
+fi
+if [ "$NSYS_ARGS" = none ] && [ -n "${DCGM_SAMPLES:-}" ]; then
+  python3 "$S/dcgm/dcgm_window.py" "$DCGM_SAMPLES" "$OUT/window.txt" --gpu "$CARD" > "$OUT/dcgm.txt" 2>&1
 fi
 echo "done $(date +%T)" >> "$OUT/progress.txt"
 touch "$OUT/DONE"
