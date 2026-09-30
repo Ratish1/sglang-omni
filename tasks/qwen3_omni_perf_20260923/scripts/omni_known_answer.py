@@ -12,7 +12,8 @@ census is trusted until this passes on the node's nsys, driver, container and to
   K3 eager kernels launched from a late thread resolve to that thread's range
   K5 python-gil: the main thread waits for the GIL while a worker spins (at least one 5 ms
      switch interval of waiting inside the contended range)
-  K6 OS runtime: a 100 ms queue timeout is recorded with its duration
+  K6 OS runtime: the main thread's 100 ms queue timeout inside ka.queue.wait is recorded
+     with its duration
   K7 node tracing inflates graph gaps: gaps between replayed nodes against the eager chain
      of the same kernels (read, not gated: gaps are never read as launch cost)
   K8 two processes: correlation ids repeat across processes, and keying by (pid, id)
@@ -25,6 +26,10 @@ census is trusted until this passes on the node's nsys, driver, container and to
      its context was switched out; prints the residency slice length (the timeslice). A
      clock spin kernel (torch.cuda._sleep) cannot answer this: it ends on elapsed cycles
      whether or not its context is resident
+  K10 read, stream priority: one process runs two matmul streams at once, first both at the
+     default priority (ka.equal), then one at the device's highest priority (ka.prio); prints
+     how many hardware contexts (switch-record context ids) hold the process's kernel starts in
+     each, so a priority stream that the GPU schedules as its own time-sliced context shows up
 
 usage:
   nsys profile -o ka --trace=cuda,nvtx,osrt,python-gil --cuda-graph-trace=node \\
@@ -72,6 +77,25 @@ def matmul_chain(label: str) -> None:
     nvtx.range_push(label)
     for _ in range(MATMULS):
         torch.matmul(a, b)
+    torch.cuda.synchronize()
+    nvtx.range_pop()
+
+
+def matmul_pair(label: str, high_priority: bool) -> None:
+    import torch
+
+    nvtx = torch.cuda.nvtx
+    least, greatest = torch.cuda.Stream.priority_range()
+    first = torch.cuda.Stream(priority=least)
+    second = torch.cuda.Stream(priority=greatest if high_priority else least)
+    a = torch.randn(MATMUL_SIZE, MATMUL_SIZE, device="cuda", dtype=torch.bfloat16)
+    torch.cuda.synchronize()
+    nvtx.range_push(label)
+    for _ in range(MATMULS // 2):
+        with torch.cuda.stream(first):
+            torch.matmul(a, a)
+        with torch.cuda.stream(second):
+            torch.matmul(a, a)
     torch.cuda.synchronize()
     nvtx.range_pop()
 
@@ -166,6 +190,8 @@ def run() -> None:
         process.start()
     for process in children:
         process.join()
+    matmul_pair("ka.equal", high_priority=False)
+    matmul_pair("ka.prio", high_priority=True)
     print(f"done {float(z):.3f}", flush=True)
 
 
@@ -272,7 +298,9 @@ def analyze(path: str) -> None:
     if contended:
         start, end, tid, _ = contended[0]
         for w_start, w_end, w_tid, text, text_id in db.execute(
-            "select start, end, globalTid, text, textId from NVTX_EVENTS where end is not null"
+            "select start, end, globalTid, text, textId from NVTX_EVENTS "
+            "where end is not null and eventType = ?",
+            (PUSH_POP,),
         ):
             label = text if text is not None else strings.get(text_id, "")
             if (
@@ -286,19 +314,23 @@ def analyze(path: str) -> None:
         f"K5 {'pass' if waits > 5e6 else 'FAIL'}: main thread GIL wait inside the contended range {waits / 1e6:.1f} ms"
     )
 
-    queue_wait = (
-        [
+    waits_range = ranges.get("ka.queue.wait", [])
+    queue_wait = []
+    if waits_range and "OSRT_API" in tables:
+        w_start, w_end, w_tid, _ = waits_range[0]
+        queue_wait = [
             (end - start) / 1e6
             for start, end, tid, name_id in db.execute(
                 "select start, end, globalTid, nameId from OSRT_API"
             )
-            if 90e6 < end - start < 200e6
+            if tid == w_tid
+            and start >= w_start
+            and end <= w_end
+            and 90e6 < end - start < 200e6
         ]
-        if "OSRT_API" in tables
-        else []
-    )
     print(
-        f"K6 {'pass' if queue_wait else 'FAIL'}: OS runtime waits of 90 to 200 ms {queue_wait[:4]}"
+        f"K6 {'pass' if queue_wait else 'FAIL'}: OS runtime wait of 90 to 200 ms on the main "
+        f"thread inside ka.queue.wait {queue_wait[:4]}"
     )
 
     def span_gaps(kind):
@@ -385,13 +417,11 @@ def analyze(path: str) -> None:
                 raw[key].append((max(start, t0), min(timestamp, t1)))
     residency, slice_lengths = {}, []
     for key, slices in raw.items():
-        best, best_ns = None, 0
+        best, best_count = None, 0
         for pid, spans in chains.items():
-            covered = sum(
-                max(0, min(e, se) - max(s, ss)) for s, e in slices for ss, se in spans
-            )
-            if covered > best_ns:
-                best, best_ns = pid, covered
+            count = sum(1 for s, e in slices for ss, _ in spans if s <= ss <= e)
+            if count > best_count:
+                best, best_count = pid, count
         if best is not None:
             residency[best] = residency.get(best, 0) + sum(e - s for s, e in slices)
             slice_lengths += [e - s for s, e in slices]
@@ -411,7 +441,7 @@ def analyze(path: str) -> None:
         )
         and (t1 - t0) >= 1.7 * expected
         and bool(contended)
-        and statistics.median(contended) > matmul_alone
+        and statistics.median(contended) > 1.5 * matmul_alone
     )
     print(
         f"K9 {'pass' if k9 else 'FAIL'}: matmul alone {matmul_alone / 1e6:.3f} ms, work per child "
@@ -421,6 +451,39 @@ def analyze(path: str) -> None:
         f"residency slice p50 {statistics.median(slice_lengths) / 1e6 if slice_lengths else float('nan'):.3f} ms, "
         f"max {max(slice_lengths) / 1e6 if slice_lengths else float('nan'):.3f} ms"
     )
+
+    switch_rows = db.execute(
+        "select timestamp, tag, contextId, gpuId, (globalPid >> 24) & 16777215 "
+        "from GPU_CONTEXT_SWITCH_EVENTS order by gpuId, timestamp, seqNo"
+    ).fetchall()
+    for label in ("ka.equal", "ka.prio"):
+        spans = ranges.get(label, [])
+        if not spans:
+            print(f"K10 read: no {label} range")
+            continue
+        w_start, w_end, w_tid, _ = spans[0]
+        starts = sorted(
+            start
+            for start, end, corr, name_id, node, global_pid in kernels
+            if pid_of(global_pid) == pid_of(w_tid) and w_start <= start <= w_end
+        )
+        open_since, holders = {}, collections.Counter()
+        for timestamp, tag, context, gpu, host_pid in switch_rows:
+            key = (gpu, context, host_pid)
+            if tag == RESTORE_START:
+                open_since[key] = timestamp
+            elif tag == SAVE_END and key in open_since:
+                begin = open_since.pop(key)
+                if timestamp > w_start and begin < w_end:
+                    inside = sum(
+                        1 for k_start in starts if begin <= k_start <= timestamp
+                    )
+                    if inside:
+                        holders[key] += inside
+        print(
+            f"K10 read: {label}: {len(starts)} kernel starts held by "
+            f"{len(holders)} contexts {[(k[1], k[2], v) for k, v in holders.most_common(4)]}"
+        )
 
 
 def main() -> None:

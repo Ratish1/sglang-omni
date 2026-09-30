@@ -309,6 +309,21 @@ def patch_stage(module):
             f"io.chunk rid={msg.request_id} {msg.from_stage}->{self.name}"
         ),
     )
+    # note: stages sharing a process (talker_ar and code2wav) hand payloads and chunks to
+    # each other through the local dispatcher, which calls these instead of on_data_ready
+    # and on_stream_chunk
+    stage.receive_local_payload = bracketed_async(
+        stage.receive_local_payload,
+        lambda self, request_id, from_stage, *args, **kwargs: (
+            f"io.recv rid={request_id} {from_stage}->{self.name}"
+        ),
+    )
+    stage.receive_local_stream_chunk = bracketed_async(
+        stage.receive_local_stream_chunk,
+        lambda self, request_id, from_stage, *args, **kwargs: (
+            f"io.chunk rid={request_id} {from_stage}->{self.name}"
+        ),
+    )
     stage.send_to_stage = bracketed_async(
         stage.send_to_stage,
         lambda self, request_id, target, *args, **kwargs: (

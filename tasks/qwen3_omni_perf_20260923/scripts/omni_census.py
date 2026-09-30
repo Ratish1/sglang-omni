@@ -218,6 +218,7 @@ class Report:
         self.load_nvtx()
         self.load_api()
         self.load_device()
+        self.load_residency()
         self.load_host_states()
         self.index_host_states()
 
@@ -235,7 +236,7 @@ class Report:
         self.window_captures = 0
         for start, end, tid, text, text_id, kind in self.db.execute(
             "select start, end, globalTid, text, textId, eventType from NVTX_EVENTS "
-            "where eventType in (?, ?) order by start",
+            "where eventType in (?, ?) order by start, end desc",
             (PUSH_POP, MARK),
         ):
             label = self.text(text, text_id)
@@ -272,7 +273,7 @@ class Report:
             for items in table.values():
                 stack: list[Range] = []
                 for item in items:
-                    while stack and stack[-1].end < item.start:
+                    while stack and stack[-1].end <= item.start:
                         stack.pop()
                     item.parent = stack[-1] if stack else None
                     stack.append(item)
@@ -288,11 +289,11 @@ class Report:
         if name.startswith("scheduler-"):
             return name[len("scheduler-") :]
         stages = self.stages_of_pid.get(pid_of(tid))
-        return "+".join(stages) if stages else f"pid{pid_of(tid)}"
+        return "+".join(sorted(stages)) if stages else f"pid{pid_of(tid)}"
 
     def stage_of_pid(self, pid: int) -> str:
         stages = self.stages_of_pid.get(pid)
-        return "+".join(stages) if stages else f"pid{pid}"
+        return "+".join(sorted(stages)) if stages else f"pid{pid}"
 
     def innermost(self, table, starts, tid, t):
         items = table.get(tid)
@@ -404,17 +405,106 @@ class Report:
             while item is not None:
                 item.kernels.append((start, end))
                 item = item.parent
-        for start, end, corr, kind, global_pid in self.db.execute(
-            "select start, end, correlationId, copyKind, globalPid from CUPTI_ACTIVITY_KIND_MEMCPY "
+        self.copies_by_stream: dict[tuple[int, int], list] = collections.defaultdict(
+            list
+        )
+        for start, end, corr, kind, global_pid, stream in self.db.execute(
+            "select start, end, correlationId, copyKind, globalPid, streamId from CUPTI_ACTIVITY_KIND_MEMCPY "
             "where end > ? and start < ?",
             (self.t0, self.t1),
         ):
+            self.copies_by_stream[(pid_of(global_pid), stream)].append((start, end))
             item = self.owner.get((pid_of(global_pid), corr))
             label = COPY_KINDS.get(kind, str(kind))
             while item is not None:
                 item.copies[label] += 1
                 item = item.parent
         self.device.sort(key=lambda d: (d[0], d[1]))
+
+    def load_residency(self):
+        """Context residency slices per process on the session GPU (--gpuctxsw).
+
+        Switch records cover every GPU in the container with host context ids and host pids,
+        and kernels carry container pids. A kernel's interval includes time its context was
+        switched out, so a context is named by the process whose kernel starts fall inside its
+        slices (work starts only while its own context is resident); the contexts of one host
+        pid (a process can hold several, e.g. streams of different priority) take the process
+        most of their starts name."""
+        self.resident: dict[int, list] = {}
+        self.context_rows: list = []
+        self.switch_gaps: list[int] = []
+        self.has_residency = "GPU_CONTEXT_SWITCH_EVENTS" in self.tables
+        if not self.has_residency:
+            return
+        open_since, raw, host_of, gaps = (
+            {},
+            collections.defaultdict(list),
+            {},
+            collections.defaultdict(list),
+        )
+        last_save = {}
+        for timestamp, tag, context, gpu, host_pid in self.db.execute(
+            "select timestamp, tag, contextId, gpuId, (globalPid >> 24) & 16777215 "
+            "from GPU_CONTEXT_SWITCH_EVENTS order by gpuId, timestamp, seqNo"
+        ):
+            key = (gpu, context)
+            host_of[key] = host_pid
+            if tag == RESTORE_START:
+                open_since[key] = timestamp
+                if gpu in last_save and self.t0 <= timestamp <= self.t1:
+                    gaps[gpu].append(timestamp - last_save[gpu])
+            elif tag == SAVE_END and key in open_since:
+                start = open_since.pop(key)
+                if timestamp > self.t0 and start < self.t1:
+                    raw[key].append((max(start, self.t0), min(timestamp, self.t1)))
+                last_save[gpu] = timestamp
+        starts_of_pid = collections.defaultdict(list)
+        for start, *_rest, pid in self.device:
+            starts_of_pid[pid].append(start)
+        for values in starts_of_pid.values():
+            values.sort()
+        counts_of_key = {}
+        by_gpu = collections.Counter()
+        for key, slices in raw.items():
+            counts = collections.Counter()
+            for pid, values in starts_of_pid.items():
+                counts[pid] = sum(
+                    bisect.bisect_left(values, e) - bisect.bisect_left(values, s)
+                    for s, e in slices
+                )
+            counts_of_key[key] = counts
+            by_gpu[key[0]] += max(counts.values(), default=0)
+        if not by_gpu:
+            return
+        session_gpu = by_gpu.most_common(1)[0][0]
+        by_host = collections.defaultdict(collections.Counter)
+        for key, counts in counts_of_key.items():
+            if key[0] == session_gpu:
+                by_host[host_of[key]].update(counts)
+        pid_of_host = {
+            host: counts.most_common(1)[0][0]
+            for host, counts in by_host.items()
+            if counts and counts.most_common(1)[0][1] > 0
+        }
+        slices_of_pid = collections.defaultdict(list)
+        for key, slices in raw.items():
+            if key[0] != session_gpu:
+                continue
+            pid = pid_of_host.get(host_of[key])
+            self.context_rows.append((key, host_of[key], pid, slices))
+            if pid is not None:
+                slices_of_pid[pid] += slices
+        self.resident = {pid: merged(v) for pid, v in slices_of_pid.items()}
+        self.switch_gaps = gaps.get(session_gpu, [])
+
+    def resident_ns(self, intervals, pid: int) -> int:
+        """Time of intervals (kernels of pid) during which pid's own context was resident; the
+        plain union when the report has no residency."""
+        spans = merged(intervals)
+        if not self.has_residency or not self.resident:
+            return sum(b - a for a, b in spans)
+        own = self.resident.get(pid, [])
+        return sum(b - a for a, b in spans) - minus_len(spans, own)
 
     def load_host_states(self):
         self.os_wait: dict[int, list] = collections.defaultdict(list)
@@ -538,7 +628,9 @@ def section_b(r: Report, top: int):
         m = len(sample)
         walls = [x.wall for x in items]
         wall = statistics.fmean(walls)
-        device = statistics.fmean(union_ns(x.kernels) for x in items)
+        device = statistics.fmean(
+            r.resident_ns(x.kernels, pid_of(x.tid)) for x in items
+        )
         top_call = ",".join(f"{k}:{ms(v) / m:.2f}" for k, v in calls.most_common(2))
         print(
             f"{stage[:18]:<18}{kind[:24]:<24}{count:>7}{ms(wall):>8.2f}{ms(pct(walls, .5)):>7.2f}"
@@ -659,106 +751,71 @@ def section_d(r: Report, top: int):
     print("\n## D. card (ms over the window)")
     window = r.t1 - r.t0
     by_pid = collections.defaultdict(list)
+    owners = collections.defaultdict(list)
     for s, e, owner, name, stream, identity, key, node, pid in r.device:
-        by_pid[pid].append((max(s, r.t0), min(e, r.t1)))
+        span = (max(s, r.t0), min(e, r.t1))
+        by_pid[pid].append(span)
+        owners[(owner, pid)].append(span)
     unions = {pid: merged(v) for pid, v in by_pid.items()}
     everything = merged([iv for v in by_pid.values() for iv in v])
     busy = sum(b - a for a, b in everything)
     print(
         f"window {ms(window):.0f}, device busy {ms(busy):.0f} ({100 * busy / window:.1f}%)"
     )
-    print(f"  {'process':<24}{'busy':>9}{'share':>7}{'contended':>11}")
+    print(
+        "  kernels = union of the process's kernel intervals (switched-out time included);"
+    )
+    print(
+        "  resident = the part of it while its own context was resident (the card it used);"
+    )
+    print("  contended = kernels while another process also had a kernel in flight")
+    print(
+        f"  {'process':<24}{'kernels':>9}{'resident':>10}{'share':>7}{'contended':>11}"
+    )
     for pid, spans in sorted(
         unions.items(), key=lambda kv: -sum(b - a for a, b in kv[1])
     ):
         own = sum(b - a for a, b in spans)
         others = merged([iv for other, v in unions.items() if other != pid for iv in v])
         contended = own - minus_len(spans, others)
+        resident = r.resident_ns(spans, pid)
         print(
-            f"  {r.stage_of_pid(pid)[:24]:<24}{ms(own):>9.0f}{100 * own / window:>6.1f}%{ms(contended):>11.0f}"
+            f"  {r.stage_of_pid(pid)[:24]:<24}{ms(own):>9.0f}{ms(resident):>10.0f}"
+            f"{100 * resident / window:>6.1f}%{ms(contended):>11.0f}"
         )
-    print("  per owner (stage:component) device union:")
-    owners = collections.defaultdict(list)
-    for s, e, owner, *_ in r.device:
-        owners[owner].append((max(s, r.t0), min(e, r.t1)))
-    for owner, spans in sorted(owners.items(), key=lambda kv: -union_ns(kv[1]))[:top]:
-        print(f"    {owner:<40}{ms(union_ns(spans)):>9.0f}")
-    if "GPU_CONTEXT_SWITCH_EVENTS" in r.tables:
-        events = r.db.execute(
-            "select timestamp, tag, contextId, gpuId from GPU_CONTEXT_SWITCH_EVENTS order by gpuId, timestamp, seqNo"
-        ).fetchall()
-        open_since, raw, switches = (
-            {},
-            collections.defaultdict(list),
-            collections.defaultdict(list),
-        )
-        last_save = {}
-        for timestamp, tag, context, gpu in events:
-            key = (gpu, context)
-            if tag == RESTORE_START:
-                open_since[key] = timestamp
-                if gpu in last_save and r.t0 <= timestamp <= r.t1:
-                    switches[gpu].append(timestamp - last_save[gpu])
-            elif tag == SAVE_END and key in open_since:
-                start = open_since.pop(key)
-                if timestamp > r.t0 and start < r.t1:
-                    raw[key].append((max(start, r.t0), min(timestamp, r.t1)))
-                last_save[gpu] = timestamp
-        # note: switch records cover every GPU in the container with host context ids, and
-        # kernels carry container pids; a kernel's interval includes time switched out, so a
-        # context is named by the process whose kernel starts fall inside its slices (work
-        # starts only while its own context is resident)
-        starts_of_pid = collections.defaultdict(list)
-        for s, e, owner, name, stream, identity, key, node, pid in r.device:
-            starts_of_pid[pid].append(s)
-        for values in starts_of_pid.values():
-            values.sort()
-        pid_of_key, covered_by_gpu = {}, collections.Counter()
-        for key, slices in raw.items():
-            counts = collections.Counter()
-            for pid, values in starts_of_pid.items():
-                counts[pid] = sum(
-                    bisect.bisect_left(values, e) - bisect.bisect_left(values, s)
-                    for s, e in slices
-                )
-            best, best_count = counts.most_common(1)[0] if counts else (None, 0)
-            if best_count > 0:
-                pid_of_key[key] = best
-                covered_by_gpu[key[0]] += best_count
-        session_gpu = covered_by_gpu.most_common(1)[0][0] if covered_by_gpu else None
-        resident = {key: v for key, v in raw.items() if key[0] == session_gpu}
-        switches = switches.get(session_gpu, [])
-        print("  context residency (--gpuctxsw):")
+    print("  per owner (stage:component), resident device time:")
+    rows = sorted(
+        ((owner, r.resident_ns(spans, pid)) for (owner, pid), spans in owners.items()),
+        key=lambda row: -row[1],
+    )
+    for owner, value in rows[:top]:
+        print(f"    {owner:<40}{ms(value):>9.0f}")
+    if r.has_residency and r.context_rows:
+        print("  context residency (--gpuctxsw), session GPU:")
         print(
-            f"    {'process':<24}{'slices':>8}{'resident':>10}{'share':>7}{'slice p50':>10}{'p90':>8}{'own kernels':>12}"
+            f"    {'process':<24}{'host pid':>9}{'slices':>8}{'resident':>10}{'share':>7}"
+            f"{'slice p50':>10}{'p90':>8}{'max':>8}"
         )
-        for key, slices in sorted(
-            resident.items(), key=lambda kv: -sum(b - a for a, b in kv[1])
+        for key, host_pid, pid, slices in sorted(
+            r.context_rows, key=lambda row: -sum(b - a for a, b in row[3])
         ):
-            pid = pid_of_key.get(key)
             name = (
                 r.stage_of_pid(pid) if pid is not None else f"ctx{key[1]} (no starts)"
             )
             total = sum(b - a for a, b in slices)
             lengths = [b - a for a, b in slices]
-            own = (
-                total - minus_len(merged(slices), unions.get(pid, []))
-                if pid in unions
-                else 0
-            )
             print(
-                f"    {name[:24]:<24}{len(slices):>8}{ms(total):>10.0f}{100 * total / window:>6.1f}%"
-                f"{ms(pct(lengths, .5)):>10.3f}{ms(pct(lengths, .9)):>8.3f}{ms(own):>12.0f}"
+                f"    {name[:24]:<24}{host_pid:>9}{len(slices):>8}{ms(total):>10.0f}"
+                f"{100 * total / window:>6.1f}%{ms(pct(lengths, .5)):>10.3f}"
+                f"{ms(pct(lengths, .9)):>8.3f}{ms(max(lengths)):>8.3f}"
             )
-        if switches:
+        if r.switch_gaps:
             print(
-                f"    switch gap (save end to next restore start): n {len(switches)}, "
-                f"p50 {pct(switches, .5) / 1e3:.1f} us, p90 {pct(switches, .9) / 1e3:.1f} us"
+                f"    switch gap (save end to next restore start): n {len(r.switch_gaps)}, "
+                f"p50 {pct(r.switch_gaps, .5) / 1e3:.1f} us, p90 {pct(r.switch_gaps, .9) / 1e3:.1f} us"
             )
     else:
-        print(
-            "  no GPU_CONTEXT_SWITCH_EVENTS (profile with --gpuctxsw=true for residency)"
-        )
+        print("  no context residency (profile with --gpuctxsw=true)")
     other_by_pid = {
         pid: merged([iv for other, v in unions.items() if other != pid for iv in v])
         for pid in unions
@@ -782,56 +839,70 @@ def section_d(r: Report, top: int):
             alone[entry].append(duration)
         elif overlap > 0.5 * duration:
             contended[entry].append(duration)
-    rows = []
+    stretch_rows = []
     for entry, total in weight.most_common(5000):
         a, b = alone.get(entry, []), contended.get(entry, [])
         if len(a) >= 10 and len(b) >= 10:
-            rows.append(
+            stretch_rows.append(
                 (entry, statistics.median(a), statistics.median(b), len(a), len(b))
             )
     cost = collections.Counter()
-    for (owner, identity), ma, mb, na, nb in rows:
+    for (owner, identity), ma, mb, na, nb in stretch_rows:
         cost[owner.split(":")[0]] += (mb - ma) * nb
     print(
-        f"  kernel duration alone against with another process's kernel in flight ({len(rows)} identities with 10+ each):"
+        "  kernel duration alone against with another process's kernel in flight "
+        f"({len(stretch_rows)} identities with 10+ each; the excess is time switched out):"
     )
     for owner, value in cost.most_common():
-        print(f"    {owner:<24} extra device time from sharing {ms(value):.0f} ms")
-    # card wait: a kernel ready to run (its launch call returned and the previous kernel of
-    # its stream ended) that has not started while another process had a kernel in flight
-    by_stream = collections.defaultdict(list)
-    for s, e, owner, name, stream, identity, key, node, pid in r.device:
-        by_stream[(pid, stream)].append((s, e, owner, key))
-    card_wait, ready_gap = collections.Counter(), collections.Counter()
-    for (pid, stream), items in by_stream.items():
-        items.sort()
-        previous_end = None
-        for s, e, owner, key in items:
-            ready = r.api_end.get(key)
-            if ready is not None:
-                if previous_end is not None:
-                    ready = max(ready, previous_end)
-                if s > ready:
-                    ready_gap[owner] += s - ready
-                    card_wait[owner] += sum(
-                        b - a
-                        for a, b in clip(
-                            other_by_pid[pid], starts_by_pid[pid], ready, s
-                        )
-                    )
-            previous_end = e if previous_end is None else max(previous_end, e)
+        print(f"    {owner:<24} excess over alone {ms(value):.0f} ms")
+    # card wait: a kernel ready to run (its launch call returned and the previous kernel or
+    # copy of its stream ended) that has not started while another process's context was
+    # resident; unioned per owner so waits on parallel streams count once
+    others_resident = {}
+    if r.has_residency and r.resident:
+        for pid in unions:
+            others_resident[pid] = merged(
+                [iv for other, v in r.resident.items() if other != pid for iv in v]
+            )
     completed = max(len(r.completed_requests()), 1)
-    print(
-        "  card wait per owner: ready-but-not-started time with another process's kernel in "
-        "flight, and all ready-but-not-started time (ms total, ms per completed request):"
-    )
-    for owner, value in card_wait.most_common(top):
+    if not others_resident:
+        print("  card wait needs context residency")
+    else:
+        other_starts = {pid: [a for a, _ in v] for pid, v in others_resident.items()}
+        by_stream = collections.defaultdict(list)
+        for s, e, owner, name, stream, identity, key, node, pid in r.device:
+            by_stream[(pid, stream)].append((s, e, owner, key))
+        waits = collections.defaultdict(list)
+        for (pid, stream), items in by_stream.items():
+            copies = sorted(r.copies_by_stream.get((pid, stream), []))
+            copy_ends = [e for _, e in copies]
+            copy_starts = [s for s, _ in copies]
+            items.sort()
+            previous_end = None
+            for s, e, owner, key in items:
+                ready = r.api_end.get(key)
+                if ready is not None:
+                    if previous_end is not None:
+                        ready = max(ready, previous_end)
+                    index = bisect.bisect_left(copy_starts, s) - 1
+                    if index >= 0:
+                        ready = max(ready, min(copy_ends[index], s))
+                    if s > ready:
+                        waits[owner] += clip(
+                            others_resident[pid], other_starts[pid], ready, s
+                        )
+                previous_end = e if previous_end is None else max(previous_end, e)
         print(
-            f"    {owner:<40}{ms(value):>9.0f}{ms(value) / completed:>9.2f}   ready gap "
-            f"{ms(ready_gap[owner]):>9.0f}{ms(ready_gap[owner]) / completed:>9.2f}"
+            "  card wait per owner: ready to run but not started while another process's "
+            "context was resident (ms total, ms per completed request):"
         )
-    rows.sort(key=lambda row: -(row[2] - row[1]) * row[4])
-    for (owner, identity), ma, mb, na, nb in rows[:top]:
+        for owner, spans in sorted(waits.items(), key=lambda kv: -union_ns(kv[1]))[
+            :top
+        ]:
+            value = union_ns(spans)
+            print(f"    {owner:<40}{ms(value):>9.0f}{ms(value) / completed:>9.2f}")
+    stretch_rows.sort(key=lambda row: -(row[2] - row[1]) * row[4])
+    for (owner, identity), ma, mb, na, nb in stretch_rows[:top]:
         print(
             f"    {owner[:26]:<26}{str(identity[0])[:56]:<58} alone {ma / 1e3:7.1f} us x{na:<6} "
             f"contended {mb / 1e3:7.1f} us x{nb:<6} +{100 * (mb - ma) / ma:5.1f}%"
@@ -1119,7 +1190,7 @@ def section_i(r: Report):
         print(
             f"  {stage[:14]:<14}{kind[:22]:<22}{len(items):>7}{pct(rows, .5):>9}{statistics.fmean(rows):>7.2f}"
             f"{pct(tokens, .5) if tokens else '-':>9}{ms(wall):>8.2f}"
-            f"{ms(statistics.fmean(union_ns(x.kernels) for x in items)):>7.2f}"
+            f"{ms(statistics.fmean(r.resident_ns(x.kernels, pid_of(x.tid)) for x in items)):>7.2f}"
             f"{statistics.fmean(len(x.kernels) for x in items):>6.0f}"
             f"{statistics.fmean(x.graph_launches for x in items):>6.1f}{ms(api / m):>7.2f}{ms(gil / m):>6.2f}"
             f"{ms(wall - (api + gil + os_ns) / m):>7.2f}{ms(pct(periods, .5)):>11.2f}"
@@ -1130,7 +1201,7 @@ def section_i(r: Report):
         for (stage, kind), items in sorted(steps.items()):
             print(
                 f"    {stage[:14]:<14}{kind[:22]:<22}{len(items) / completed:>8.1f} steps, "
-                f"{ms(sum(union_ns(x.kernels) for x in items)) / completed:>8.1f} ms device, "
+                f"{ms(sum(r.resident_ns(x.kernels, pid_of(x.tid)) for x in items)) / completed:>8.1f} ms device, "
                 f"{ms(sum(x.wall for x in items)) / completed:>8.1f} ms wall"
             )
 
@@ -1142,14 +1213,16 @@ def section_j(r: Report, segments: dict[str, list[int]]):
         print("  no completed requests in the window")
         return
     owners = collections.defaultdict(list)
-    for s, e, owner, *_ in r.device:
-        owners[owner].append((max(s, r.t0), min(e, r.t1)))
-    total = sum(union_ns(v) for v in owners.values())
+    for s, e, owner, name, stream, identity, key, node, pid in r.device:
+        owners[(owner, pid)].append((max(s, r.t0), min(e, r.t1)))
+    values = {
+        owner: r.resident_ns(spans, pid) for (owner, pid), spans in owners.items()
+    }
+    total = sum(values.values())
     print(
-        f"  device time per request by owner (card throughput view), {completed} requests:"
+        f"  resident device time per request by owner (card throughput view), {completed} requests:"
     )
-    for owner, spans in sorted(owners.items(), key=lambda kv: -union_ns(kv[1]))[:20]:
-        value = union_ns(spans)
+    for owner, value in sorted(values.items(), key=lambda kv: -kv[1])[:20]:
         print(
             f"    {owner:<40}{ms(value) / completed:>9.2f} ms {100 * value / max(total, 1):>6.1f}%"
         )

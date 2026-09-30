@@ -26,7 +26,13 @@ else
   PROBE="OMNI_PIPE_NVTX=1 OMNI_PIPE_LINES=${LINES:-}"
 fi
 mkdir -p "$OUT"
+OUT=$(cd "$OUT" && pwd)
 cd "$TREE" || exit 1
+# a server already answering on the port would be benchmarked under this cell's name
+if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health)" = 200 ]; then
+  echo "port $PORT already serves" > "$OUT/FAILED"
+  exit 1
+fi
 
 echo "start $(date +%T) card $CARD dtype $DTYPE conc $CONC arm $ARM samples ${MAX_SAMPLES:-128}" > "$OUT/progress.txt"
 git -C "$TREE" rev-parse HEAD > "$OUT/head.txt"
@@ -56,13 +62,15 @@ done
 if [ $healthy = 1 ]; then
   echo "healthy $(date +%T)" >> "$OUT/progress.txt"
   # the warm pass runs the arm's first samples at the same concurrency outside the window,
-  # so one-time costs (lazy compiles, first shapes) land before it
+  # so one-time costs (lazy compiles, first shapes) land before it; the measured pass skips
+  # them, so no measured prompt hits the thinker's radix cache from the warm pass
   CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
     --concurrency "$CONC" --out "$OUT/warm" --max-samples "${WARM_SAMPLES:-32}" > "$OUT/warm_$ARM.log" 2>&1
   echo "warm rc $? $(date +%T)" >> "$OUT/progress.txt"
   date +%s.%N > "$OUT/window.txt"
   CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
-    --concurrency "$CONC" --out "$OUT" --max-samples "${MAX_SAMPLES:-128}" > "$OUT/gen_$ARM.log" 2>&1
+    --concurrency "$CONC" --out "$OUT" --max-samples "${MAX_SAMPLES:-128}" \
+    --skip-samples "${WARM_SAMPLES:-32}" > "$OUT/gen_$ARM.log" 2>&1
   echo "gen rc $? $(date +%T)" >> "$OUT/progress.txt"
   date +%s.%N >> "$OUT/window.txt"
 else
@@ -77,15 +85,18 @@ descendants() {
   for child in $(pgrep -P "$1"); do echo "$child"; descendants "$child"; done
 }
 SERVE_PID=$(for p in $WRAP_PID $(descendants "$WRAP_PID"); do
-  if [[ "$(cat /proc/$p/comm 2>/dev/null)" == python* ]] && grep -qa -- "--port.$PORT" /proc/$p/cmdline; then echo $p; fi
+  if [[ "$(cat /proc/$p/comm 2>/dev/null)" == python* ]] && tr '\0' ' ' < /proc/$p/cmdline | grep -qE -- "--port $PORT( |$)"; then echo $p; fi
 done | head -1)
 echo "serve pid $SERVE_PID" >> "$OUT/progress.txt"
-kill -TERM "$SERVE_PID"
+[ -n "$SERVE_PID" ] && kill -TERM "$SERVE_PID"
 for _ in $(seq 120); do
   kill -0 $WRAP_PID 2>/dev/null || break
   sleep 5
 done
-kill -0 $WRAP_PID 2>/dev/null && echo "wrapper still running after 10 min" >> "$OUT/progress.txt"
+if kill -0 $WRAP_PID 2>/dev/null || { [ -n "$SERVE_PID" ] && kill -0 "$SERVE_PID" 2>/dev/null; }; then
+  echo "serve or wrapper still running after 10 min; cell void" >> "$OUT/progress.txt"
+  echo "serve not stopped" > "$OUT/FAILED"
+fi
 echo "serve ended $(date +%T)" >> "$OUT/progress.txt"
 kill $LOADS $DMON 2>/dev/null
 nvidia-smi > "$OUT/gpus_after.txt"

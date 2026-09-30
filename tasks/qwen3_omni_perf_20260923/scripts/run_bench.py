@@ -9,6 +9,10 @@ score: WER of a talker arm or of seed-tts against a Qwen3-ASR server on --asr-po
        after the omni server is stopped.
 sim:   seed-tts speaker similarity on --device; run after the ASR server is stopped too.
 
+--skip-samples K drops the corpus's first K samples (gen only), so a warm pass over the first
+K samples and a measured pass over the next ones share no prompt (the thinker keeps its radix
+cache): the loaders the benchmarks bound at import are wrapped to load K more and drop them.
+
 usage: python run_bench.py gen --arm mmmu_talker --port 8000 --concurrency 16 --out DIR
        python run_bench.py score --arm mmmu_talker --asr-port 8100 --out DIR
 """
@@ -17,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
+import inspect
 import json
 import time
 from pathlib import Path
@@ -148,6 +154,35 @@ async def seeded_speech_requests(port: int, out: str, samples_per_input: int) ->
         json.dumps(results, indent=1)
     )
     return results
+
+
+def skip_first_samples(module, name: str, skip: int) -> None:
+    """Replace module.name, a sample loader taking max_samples, by one that drops the first
+    skip samples of the corpus."""
+    load = getattr(module, name)
+    signature = inspect.signature(load)
+
+    @functools.wraps(load)
+    def load_after_skip(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        max_samples = bound.arguments.get("max_samples")
+        if max_samples is not None:
+            bound.arguments["max_samples"] = max_samples + skip
+        else:
+            pass
+        return load(*bound.args, **bound.kwargs)[skip:]
+
+    setattr(module, name, load_after_skip)
+
+
+def install_sample_skip(skip: int) -> None:
+    import benchmarks.eval.benchmark_omni_mmmu as mmmu_benchmark
+    import benchmarks.eval.benchmark_omni_mmsu as mmsu_benchmark
+    import benchmarks.eval.benchmark_omni_seedtts as seedtts_benchmark
+
+    skip_first_samples(seedtts_benchmark, "load_seedtts_samples", skip)
+    skip_first_samples(mmsu_benchmark, "load_mmsu_samples", skip)
+    skip_first_samples(mmmu_benchmark, "load_mmmu_samples", skip)
 
 
 async def generate(
@@ -299,11 +334,21 @@ def main() -> None:
     parser.add_argument(
         "--max-samples", type=int, help="first N samples; unset is the full corpus"
     )
+    parser.add_argument(
+        "--skip-samples",
+        type=int,
+        default=0,
+        help="gen: drop the corpus's first K samples before taking --max-samples",
+    )
     args = parser.parse_args()
     out = str(Path(args.out) / args.arm)
     Path(out).mkdir(parents=True, exist_ok=True)
     began = time.time()
     if args.mode == "gen":
+        if args.skip_samples:
+            install_sample_skip(args.skip_samples)
+        else:
+            pass
         asyncio.run(
             generate(args.arm, args.port, out, args.concurrency, args.max_samples)
         )

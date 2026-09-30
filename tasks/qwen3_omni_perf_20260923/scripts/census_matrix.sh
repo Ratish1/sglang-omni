@@ -34,7 +34,13 @@ for cell in $CELLS; do
   env EXTRA_SERVE_ARGS="$extra" LINES="$lines" ${nsys_args:+NSYS_ARGS=$nsys_args} \
     ${samples:+MAX_SAMPLES=$samples} \
     bash "$S/run_probe_boot.sh" "$TREE" "$out" "$CARD" "$PORT" "${PROFILE:-h200}" "$conc" "$arm"
-  echo "$(date +%T) end $cell rc $?" >> "$ROOT/matrix.log"
+  rc=$?
+  echo "$(date +%T) end $cell rc $rc" >> "$ROOT/matrix.log"
+  # a cell that could not stop its server leaves the card to it; the rest would run on top
+  if [ -f "$out/FAILED" ] && grep -q "not stopped" "$out/FAILED"; then
+    echo "$(date +%T) stop: $cell left its server running" >> "$ROOT/matrix.log"
+    break
+  fi
 done
 echo "$(date +%T) matrix done" >> "$ROOT/matrix.log"
 touch "$ROOT/MATRIX_DONE"
