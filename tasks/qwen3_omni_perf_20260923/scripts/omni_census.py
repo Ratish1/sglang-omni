@@ -1104,7 +1104,19 @@ def section_g(r: Report, top: int):
     labeled = unlabeled = 0
     owner_total = collections.Counter()
     resident_starts = {pid: [a for a, _ in spans] for pid, spans in r.resident.items()}
+    # a kernel launched with programmatic dependent launch starts before its predecessor on
+    # the stream ends and waits for it, so its interval overlaps the predecessor's; each
+    # kernel is charged from the later of its start and the stream predecessor's end
+    effective_start = []
+    stream_end: dict[tuple[int, int], int] = {}
     for start, end, owner, name, stream, identity, key, node, pid in r.device:
+        previous_end = stream_end.get((pid, stream), start)
+        effective_start.append(min(max(start, previous_end), end))
+        stream_end[(pid, stream)] = max(previous_end, end)
+    for index, (start, end, owner, name, stream, identity, key, node, pid) in enumerate(
+        r.device
+    ):
+        start = effective_start[index]
         # a kernel's weight is the time its own context was resident while it ran; the rest
         # of its interval is another process's turn on the card
         if pid in r.resident:
