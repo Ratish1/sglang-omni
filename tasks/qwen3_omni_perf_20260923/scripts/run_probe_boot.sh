@@ -113,7 +113,7 @@ if [ "$NSYS_ARGS" != none ]; then
     nsys export --type sqlite --force-overwrite=true -o "$OUT/serve.sqlite" "$OUT/serve.nsys-rep" > "$OUT/export.log" 2>&1
     echo "exported $(date +%T)" >> "$OUT/progress.txt"
     (cd "$S" && python3 omni_census.py "$OUT/serve.sqlite" --window "$OUT/window.txt" \
-      ${DCGM_SAMPLES:+--dcgm "$DCGM_SAMPLES" --dcgm-gpu "$CARD" --sections ABCDEFGHIJK}) > "$OUT/census.txt" 2>&1
+      ${DCGM_SAMPLES:+--dcgm "$DCGM_SAMPLES" --dcgm-gpu "$CARD"}) > "$OUT/census.txt" 2>&1
     echo "census done $(date +%T)" >> "$OUT/progress.txt"
     touch "$OUT/CENSUS_DONE"
   ) &

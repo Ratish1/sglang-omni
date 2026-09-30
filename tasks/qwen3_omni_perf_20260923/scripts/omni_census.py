@@ -29,12 +29,13 @@ Sections:
                    graph launches, host split, step period
   J table          per completed request: device ms by owner, and the request path's
                    segments ranked; the census's ranking in one place
-  K counters       with --dcgm (H100 host engine): DCGM GR active against the trace's charged
-                   kernel time, where idle time went, each field's mean, and per owner the
-                   value of each field while its kernels run (fitted over 100 ms windows)
+  K activity       where the window went: a charged kernel, a resident context with no kernel,
+                   switching, no context; with --dcgm (H100 host engine) DCGM GR active
+                   against the trace's charged kernel time, each field's mean, and per owner
+                   the value of each field while its kernels run (fitted over 100 ms windows)
 
 usage: python omni_census.py REPORT.sqlite --window window.txt [--top 25] [--sections ABCDEFGHIJ]
-       [--sample-rate 24000] [--dcgm samples.tsv --dcgm-gpu 0 --sections ABCDEFGHIJK]
+       [--sample-rate 24000] [--dcgm samples.tsv --dcgm-gpu 0]
 """
 
 from __future__ import annotations
@@ -1284,8 +1285,10 @@ def load_dcgm(r: Report, samples_path: str, gpu: int, lag: int, period: int):
     return values
 
 
-def section_k(r: Report, samples_path: str, gpu: int, lag_ms: float, period_ms: float):
-    print("\n## K. counters: DCGM GR and SM active against the trace")
+def section_k(
+    r: Report, samples_path: str | None, gpu: int, lag_ms: float, period_ms: float
+):
+    print("\n## K. card activity: where the window went, and DCGM GR and SM active")
     period = int(period_ms * 1e6)
     owner_spans = collections.defaultdict(list)
     for row, spans in zip(r.device, r.charged_spans()):
@@ -1303,6 +1306,31 @@ def section_k(r: Report, samples_path: str, gpu: int, lag_ms: float, period_ms: 
             sum(b - a for a, b in clip(spans, starts, start, start + period)) / period
         )
 
+    window = r.t1 - r.t0
+    resident = merged([span for spans in r.resident.values() for span in spans])
+    gaps, cursor = [], r.t0
+    for a, b in resident:
+        if a > cursor:
+            gaps.append(a - cursor)
+        cursor = max(cursor, b)
+    if r.t1 > cursor:
+        gaps.append(r.t1 - cursor)
+    busy_ns = sum(b - a for a, b in card)
+    resident_ns = sum(b - a for a, b in resident)
+    switching = sum(gap for gap in gaps if gap <= SWITCH_GAP_NS)
+    print("  where the window went (trace):")
+    for label, value in (
+        ("a kernel charged", busy_ns),
+        ("a context resident, no kernel (host turn, copies)", resident_ns - busy_ns),
+        (f"switching (gaps up to {SWITCH_GAP_NS // 1000} us)", switching),
+        ("no context resident (no process had work)", window - resident_ns - switching),
+    ):
+        print(f"    {label:<52}{ms(value):9.0f} ms {100 * value / window:6.1f} %")
+    if samples_path is None:
+        print("  no DCGM samples (--dcgm): counters not read")
+        return
+    else:
+        print(f"  DCGM, card {gpu}:")
     # the known answer's lag, refitted on this run: the lag whose windows best match the
     # trace's busy fraction
     fits = []
@@ -1335,26 +1363,6 @@ def section_k(r: Report, samples_path: str, gpu: int, lag_ms: float, period_ms: 
         f"  GR active: DCGM {100 * numpy.nanmean(measured['gr_active']):.1f} %, trace "
         f"(charged kernels) {100 * trace_gr.mean():.1f} %"
     )
-    window = r.t1 - r.t0
-    resident = merged([span for spans in r.resident.values() for span in spans])
-    gaps, cursor = [], r.t0
-    for a, b in resident:
-        if a > cursor:
-            gaps.append(a - cursor)
-        cursor = max(cursor, b)
-    if r.t1 > cursor:
-        gaps.append(r.t1 - cursor)
-    busy_ns = sum(b - a for a, b in card)
-    resident_ns = sum(b - a for a, b in resident)
-    switching = sum(gap for gap in gaps if gap <= SWITCH_GAP_NS)
-    print("  where the window went (trace):")
-    for label, value in (
-        ("a kernel charged", busy_ns),
-        ("a context resident, no kernel (host turn, copies)", resident_ns - busy_ns),
-        (f"switching (gaps up to {SWITCH_GAP_NS // 1000} us)", switching),
-        ("no context resident (no process had work)", window - resident_ns - switching),
-    ):
-        print(f"    {label:<52}{ms(value):9.0f} ms {100 * value / window:6.1f} %")
     print("  DCGM means over the windows:")
     for name in fields:
         print(f"    {name:<16}{100 * numpy.nanmean(measured[name]):6.1f} %")
@@ -1391,9 +1399,9 @@ def main() -> None:
     parser.add_argument("report")
     parser.add_argument("--window")
     parser.add_argument("--top", type=int, default=25)
-    parser.add_argument("--sections", default="ABCDEFGHIJ")
+    parser.add_argument("--sections", default="ABCDEFGHIJK")
     parser.add_argument("--sample-rate", type=int, default=24000)
-    parser.add_argument("--dcgm", help="dcgm_sampler.py samples; adds section K")
+    parser.add_argument("--dcgm", help="dcgm_sampler.py samples for section K")
     parser.add_argument("--dcgm-gpu", type=int, default=0)
     parser.add_argument("--dcgm-lag-ms", type=float, default=122.0)
     parser.add_argument("--dcgm-period-ms", type=float, default=100.0)
@@ -1425,12 +1433,12 @@ def main() -> None:
             section_i(r)
         elif key == "J":
             section_j(r, segments)
-        elif key == "K" and args.dcgm:
+        elif key == "K":
             section_k(
                 r, args.dcgm, args.dcgm_gpu, args.dcgm_lag_ms, args.dcgm_period_ms
             )
         else:
-            print(f"\n## {key}: skipped (unknown, or K without --dcgm)")
+            print(f"\n## {key}: unknown section")
 
 
 if __name__ == "__main__":
