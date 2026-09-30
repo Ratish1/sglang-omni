@@ -58,6 +58,7 @@ def main() -> None:
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base_allocated = torch.cuda.memory_allocated()
+    base_reserved = torch.cuda.memory_reserved()
     largest = 0
     with torch.inference_mode(), vocoder.stream_context:
         for _ in range(STEPS):
@@ -87,6 +88,9 @@ def main() -> None:
         ),
         "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20),
         "reserved_at_end_mib": round(torch.cuda.memory_reserved() / 2**20),
+        "reserved_growth_mib": round(
+            (torch.cuda.max_memory_reserved() - base_reserved) / 2**20
+        ),
         "largest_step_history_frames": largest,
     }
     print(report, flush=True)
