@@ -7,8 +7,8 @@ it gives every number. Each side runs in its own process so the eager side never
 a process with Inductor's state. Both write into --out (mapping/, formal/), which
 analyze_llm_torch_profile.py --mapping-input --formal-input reads.
 
-    cd <tree> && python vocoder_trace_pair.py --side mapping --case hop16 --out /data/p1/hop16
-    cd <tree> && python vocoder_trace_pair.py --side formal  --case hop16 --out /data/p1/hop16
+    cd <tree> && python vocoder_trace_pair.py --side mapping --cases hop1 hop16 --out /data/p1
+    cd <tree> && python vocoder_trace_pair.py --side formal  --cases hop1 hop16 --out /data/p1
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="FunAudioLLM/Fun-CosyVoice3-0.5B-2512")
     parser.add_argument("--side", choices=("mapping", "formal"), required=True)
-    parser.add_argument("--case", choices=sorted(CASES), required=True)
+    parser.add_argument("--cases", nargs="+", choices=sorted(CASES), required=True)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--out", required=True)
@@ -84,7 +84,19 @@ def main() -> None:
         flow_cuda_graph_capture_shapes=FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
     )
     vocoder = scheduler.vocoder
-    kind, rows, size = CASES[args.case]
+    for case in args.cases:
+        capture(
+            output_dir=Path(args.out) / case,
+            tag=args.side,
+            body=case_body(vocoder, case),
+            iters=args.iters,
+            warmup=args.warmup,
+            with_stack=not serving,
+        )
+
+
+def case_body(vocoder, case: str):
+    kind, rows, size = CASES[case]
     if kind == "hift":
         mel = torch.randn(1, vocoder.flow.output_size, size, device="cuda")
 
@@ -110,14 +122,7 @@ def main() -> None:
         with vocoder.stream_context:
             return body()
 
-    capture(
-        output_dir=args.out,
-        tag=args.side,
-        body=in_stream,
-        iters=args.iters,
-        warmup=args.warmup,
-        with_stack=not serving,
-    )
+    return in_stream
 
 
 if __name__ == "__main__":
