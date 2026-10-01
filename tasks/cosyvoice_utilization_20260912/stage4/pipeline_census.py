@@ -25,9 +25,11 @@ Sections:
   J first hop gap  chunk 1 to chunk 2: AR wait for hop 2's tokens, queue, the step, delivery
   K final ranking  per runnable leftover: slack when it turned runnable, selections that
                    passed it (another plan led the step, or the row cap) and its wait
+  L step kinds     causal steps by their Flow calls (cached only, mixed, whole history
+                   only) and the finals' queue time spent behind each
 
 usage: python pipeline_census.py REPORT.sqlite --bench-log bench.log [--top 25]
-       [--sections ABCDEFGHIJK]
+       [--sections ABCDEFGHIJKL]
 """
 
 from __future__ import annotations
@@ -1245,6 +1247,100 @@ def section_k(r: Report):
             )
 
 
+def section_l(r: Report):
+    print(
+        "\n## L. causal steps by their Flow calls (ms): cached only, mixed, whole history"
+        " only, and the share of the finals' queue spent behind each"
+    )
+    steps = []
+    for items in r.ranges.values():
+        for item in items:
+            if item.kind == "voc.step causal_window":
+                steps.append(item)
+    calls = collections.defaultdict(collections.Counter)
+    for items in r.ranges.values():
+        for item in items:
+            if item.kind in ("flow.hop", "flow.hop.prefix"):
+                parent = item.parent
+                while parent is not None and parent.kind != "voc.step causal_window":
+                    parent = parent.parent
+                if parent is not None:
+                    calls[id(parent)][item.kind] += 1
+
+    def kind_of_step(step: Range) -> str:
+        counter = calls[id(step)]
+        if counter["flow.hop.prefix"] and counter["flow.hop"]:
+            return "mixed"
+        elif counter["flow.hop.prefix"]:
+            return "cached only"
+        else:
+            return "whole history only"
+
+    by_kind = collections.defaultdict(list)
+    for step in steps:
+        by_kind[kind_of_step(step)].append(step)
+    print(f"  {'step':<22}{'n':>6}{'share':>8}{'wall mean':>11}{'p50':>8}{'p95':>8}")
+    for kind, members in sorted(by_kind.items()):
+        walls = [s.wall for s in members]
+        print(
+            f"  {kind:<22}{len(members):>6}{100 * len(members) / len(steps):>7.1f}%"
+            f"{ms(statistics.fmean(walls)):>11.1f}{ms(pct(walls, .5)):>8.1f}{ms(pct(walls, .95)):>8.1f}"
+        )
+    done = {}
+    for items in r.ranges.values():
+        for item in items:
+            if item.kind == "voc.done":
+                done.setdefault(item.rid(), item.start)
+    finals = {}
+    last_hop = {}
+    for t, tid, label in r.marks:
+        match = re.match(r"voc\.steprid rid=(\S+) plan=(\S+)", label)
+        if match:
+            rid, plan = match.groups()
+            if plan == "leftover":
+                finals.setdefault(rid, t)
+            else:
+                last_hop[rid] = t
+    all_steps = sorted(
+        (
+            item
+            for items in r.ranges.values()
+            for item in items
+            if item.kind.startswith("voc.step ")
+        ),
+        key=lambda item: item.start,
+    )
+    starts = [s.start for s in all_steps]
+    hop_end = {}
+    for rid, t in last_hop.items():
+        index = bisect.bisect_right(starts, t) - 1
+        if index >= 0:
+            hop_end[rid] = all_steps[index].end
+    behind = collections.Counter()
+    for rid, final_t in finals.items():
+        if rid not in done or rid not in hop_end:
+            continue
+        ready = max(done[rid], hop_end[rid])
+        index = bisect.bisect_right(starts, final_t) - 1
+        if index < 0:
+            continue
+        final_start = all_steps[index].start
+        for step in all_steps:
+            if ready <= step.start < final_start:
+                if step.kind == "voc.step causal_window":
+                    behind[kind_of_step(step)] += step.wall
+                else:
+                    behind["leftover"] += step.wall
+    total = sum(behind.values()) or 1
+    print(
+        "  finals' queue spent behind: "
+        + ", ".join(
+            f"{kind} {ms(value):.0f} ms ({100 * value / total:.0f}%)"
+            for kind, value in behind.most_common()
+        )
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("report")
@@ -1268,6 +1364,7 @@ def main() -> None:
         "I": lambda: section_i(r),
         "J": lambda: section_j(r),
         "K": lambda: section_k(r),
+        "L": lambda: section_l(r),
     }
     for key in args.sections:
         steps[key]()
