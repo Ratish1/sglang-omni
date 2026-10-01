@@ -1075,6 +1075,11 @@ def make_tiny_code2wav(device: str, dtype: torch.dtype) -> Qwen3OmniCode2Wav:
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.normal_(0.0, 0.05)
+        for parameter in model.pre_transformer.parameters():
+            if parameter.dim() == 1:
+                parameter.uniform_(0.5, 1.5)
+            else:
+                parameter.normal_(0.0, parameter.shape[1] ** -0.5)
     return model.to(device=device, dtype=dtype)
 
 
