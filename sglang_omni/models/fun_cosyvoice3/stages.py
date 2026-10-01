@@ -1394,7 +1394,7 @@ def build_prefix_pool(
     # Note (Jiaxin Deng): built before the AR engine sizes its KV pool from free
     # memory, so a quarter of the device is the ceiling.
     total = torch.cuda.get_device_properties(device).total_memory
-    budget = min(float(budget_gb) * 2**30, 0.25 * total)
+    budget = float(budget_gb) * 2**30
     frames = int(budget // per_frame)
     pool = PrefixKVPool(
         layers=layers,
