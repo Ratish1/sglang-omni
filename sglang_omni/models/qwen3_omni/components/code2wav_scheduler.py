@@ -133,6 +133,11 @@ def load_code2wav_model(
         device=device,
         strict=False,
     )
+    from sglang_omni.models.qwen3_omni.components.code2wav_fused_transformer import (
+        fuse_code2wav_transformer,
+    )
+
+    logger.info("Code2Wav fused transformer: %s", fuse_code2wav_transformer(model))
     return model.eval()
 
 

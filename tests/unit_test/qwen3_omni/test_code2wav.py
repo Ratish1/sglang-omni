@@ -10,12 +10,22 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeCode2WavConfig,
+)
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeCode2Wav,
+)
 
 from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.qwen3_omni.components import code2wav_scheduler
 from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
     Code2WavRunResult,
     GraphKey,
+)
+from sglang_omni.models.qwen3_omni.components.code2wav_fused_transformer import (
+    FusedCode2WavTransformer,
+    fuse_code2wav_transformer,
 )
 from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
     Code2WavScheduler,
@@ -33,6 +43,7 @@ class FactoryModel(FakeCode2WavModel):
     def __init__(self, *, num_quantizers: int = 16) -> None:
         super().__init__()
         self.config = SimpleNamespace(num_quantizers=num_quantizers)
+        self.code_embedding = torch.nn.Embedding(4, 2)
         self.eval_calls = 0
 
     def parameters(self) -> list[torch.Tensor]:
@@ -1048,3 +1059,55 @@ def test_qwen_code2wav_emits_full_chunk_despite_model_output_deficit() -> None:
     assert second_audio.shape == (4,)
 
     assert first_audio.shape[0] + second_audio.shape[0] == 4 * 2 - 1
+
+
+def make_tiny_hf_code2wav(device: str, dtype: torch.dtype) -> Qwen3OmniMoeCode2Wav:
+    # A 4-frame sliding window, so 9 frames take the masked attention path.
+    config = Qwen3OmniMoeCode2WavConfig(
+        codebook_size=16,
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        num_quantizers=2,
+        upsample_rates=[2],
+        upsampling_ratios=[2],
+        decoder_dim=32,
+        sliding_window=4,
+    )
+    torch.manual_seed(0)
+    model = Qwen3OmniMoeCode2Wav(config).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(0.0, 0.05)
+    return model.to(device=device, dtype=dtype)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("frames", [3, 9])
+def test_fused_code2wav_transformer_matches_the_hf_transformer(frames: int) -> None:
+    model = make_tiny_hf_code2wav("cuda", torch.bfloat16)
+    codes = torch.randint(0, 16, (2, 2, frames), device="cuda")
+    hidden_states = torch.randn(2, frames, 128, device="cuda", dtype=torch.bfloat16)
+
+    with torch.inference_mode():
+        expected = model.pre_transformer(inputs_embeds=hidden_states).last_hidden_state
+        expected_waveform = model(codes)
+        assert fuse_code2wav_transformer(model)
+        actual = model.pre_transformer(inputs_embeds=hidden_states).last_hidden_state
+        actual_waveform = model(codes)
+
+    assert isinstance(model.pre_transformer, FusedCode2WavTransformer)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+    assert actual_waveform.shape == expected_waveform.shape
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_code2wav_keeps_the_hf_transformer_off_cuda(dtype: torch.dtype) -> None:
+    model = make_tiny_hf_code2wav("cpu", dtype)
+    transformer = model.pre_transformer
+
+    assert not fuse_code2wav_transformer(model)
+    assert model.pre_transformer is transformer
