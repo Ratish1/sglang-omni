@@ -13,25 +13,21 @@ import torch
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeCode2WavConfig,
 )
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeCode2Wav,
-)
 
 from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.qwen3_omni.components import code2wav_scheduler
+from sglang_omni.models.qwen3_omni.components.code2wav import Qwen3OmniCode2Wav
 from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
     Code2WavRunResult,
     GraphKey,
-)
-from sglang_omni.models.qwen3_omni.components.code2wav_fused_transformer import (
-    FusedCode2WavTransformer,
-    fuse_code2wav_transformer,
 )
 from sglang_omni.models.qwen3_omni.components.code2wav_scheduler import (
     Code2WavScheduler,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.message import IncomingMessage
+from sglang_omni.utils import snake_beta
 from tests.unit_test.fixtures.qwen_fakes import FakeCode2WavModel, make_qwen_payload
 
 DEFAULT_GRAPH_KEYS = tuple(
@@ -43,7 +39,6 @@ class FactoryModel(FakeCode2WavModel):
     def __init__(self, *, num_quantizers: int = 16) -> None:
         super().__init__()
         self.config = SimpleNamespace(num_quantizers=num_quantizers)
-        self.code_embedding = torch.nn.Embedding(4, 2)
         self.eval_calls = 0
 
     def parameters(self) -> list[torch.Tensor]:
@@ -1061,8 +1056,7 @@ def test_qwen_code2wav_emits_full_chunk_despite_model_output_deficit() -> None:
     assert first_audio.shape[0] + second_audio.shape[0] == 4 * 2 - 1
 
 
-def make_tiny_hf_code2wav(device: str, dtype: torch.dtype) -> Qwen3OmniMoeCode2Wav:
-    # A 4-frame sliding window, so 9 frames take the masked attention path.
+def make_tiny_code2wav(device: str, dtype: torch.dtype) -> Qwen3OmniCode2Wav:
     config = Qwen3OmniMoeCode2WavConfig(
         codebook_size=16,
         hidden_size=128,
@@ -1071,13 +1065,13 @@ def make_tiny_hf_code2wav(device: str, dtype: torch.dtype) -> Qwen3OmniMoeCode2W
         num_key_value_heads=2,
         num_hidden_layers=2,
         num_quantizers=2,
-        upsample_rates=[2],
+        upsample_rates=[2, 3],
         upsampling_ratios=[2],
         decoder_dim=32,
         sliding_window=4,
     )
     torch.manual_seed(0)
-    model = Qwen3OmniMoeCode2Wav(config).eval()
+    model = Qwen3OmniCode2Wav(config).eval()
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.normal_(0.0, 0.05)
@@ -1086,28 +1080,75 @@ def make_tiny_hf_code2wav(device: str, dtype: torch.dtype) -> Qwen3OmniMoeCode2W
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("frames", [3, 9])
-def test_fused_code2wav_transformer_matches_the_hf_transformer(frames: int) -> None:
-    model = make_tiny_hf_code2wav("cuda", torch.bfloat16)
-    codes = torch.randint(0, 16, (2, 2, frames), device="cuda")
-    hidden_states = torch.randn(2, frames, 128, device="cuda", dtype=torch.bfloat16)
+@pytest.mark.parametrize(
+    ("batch_size", "frames"),
+    [(1, 7), (3, 10)],
+)
+def test_channels_last_code2wav_matches_the_hf_forward(
+    monkeypatch: pytest.MonkeyPatch, batch_size: int, frames: int
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    model = make_tiny_code2wav("cuda", torch.float32)
+    codes = torch.randint(0, 16, (batch_size, 2, frames), device="cuda")
 
     with torch.inference_mode():
-        expected = model.pre_transformer(inputs_embeds=hidden_states).last_hidden_state
-        expected_waveform = model(codes)
-        assert fuse_code2wav_transformer(model)
-        actual = model.pre_transformer(inputs_embeds=hidden_states).last_hidden_state
-        actual_waveform = model(codes)
+        expected = model(codes)
+        model.use_channels_last()
+        actual = model(codes)
 
-    assert isinstance(model.pre_transformer, FusedCode2WavTransformer)
-    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
-    assert actual_waveform.shape == expected_waveform.shape
+    assert actual.shape == expected.shape
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-6)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_code2wav_keeps_the_hf_transformer_off_cuda(dtype: torch.dtype) -> None:
-    model = make_tiny_hf_code2wav("cpu", dtype)
-    transformer = model.pre_transformer
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_channels_last_code2wav_runs_every_snake_on_the_fused_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = make_tiny_code2wav("cuda", torch.bfloat16)
+    model.use_channels_last()
+    replaced = snake_beta.fuse_vocoder_decoder(model.decoder)
+    assert replaced > 0
+    launches: list[tuple[int, ...]] = []
+    original_launch = snake_beta.launch
 
-    assert not fuse_code2wav_transformer(model)
-    assert model.pre_transformer is transformer
+    def counted_launch(
+        x: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor, eps: float
+    ) -> torch.Tensor:
+        launches.append(x.stride())
+        return original_launch(x, alpha, beta, eps)
+
+    monkeypatch.setattr(snake_beta, "launch", counted_launch)
+    codes = torch.randint(0, 16, (2, 2, 9), device="cuda")
+
+    with torch.inference_mode():
+        model(codes)
+
+    assert len(launches) == replaced
+    assert all(stride[1] == 1 for stride in launches)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("frames", [3, 9])
+def test_fused_code2wav_transformer_is_as_close_to_fp32_as_the_hf_transformer(
+    frames: int,
+) -> None:
+    model = make_tiny_code2wav("cuda", torch.float32)
+    hidden_states = torch.randn(2, frames, 128, device="cuda")
+
+    with torch.inference_mode():
+        reference = model.pre_transformer(inputs_embeds=hidden_states).last_hidden_state
+        model.to(torch.bfloat16)
+        expected = model.pre_transformer(
+            inputs_embeds=hidden_states.bfloat16()
+        ).last_hidden_state
+        model.use_fused_transformer(current_platform.get_joint_rope_inplace_kernel())
+        actual = model.pre_transformer(
+            inputs_embeds=hidden_states.bfloat16()
+        ).last_hidden_state
+
+    hf_error = (expected.float() - reference).norm() / reference.norm()
+    fused_error = (actual.float() - reference).norm() / reference.norm()
+    assert fused_error <= 1.5 * hf_error
