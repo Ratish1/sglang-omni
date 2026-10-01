@@ -37,6 +37,9 @@ PROBE_PATH=""
 if [ "${PROBE:-0}" = 1 ]; then
   PROBE_ENV="OMNI_PIPE_NVTX=1 OMNI_PIPE_LINES=${LINES:-}"
   PROBE_PATH=":$S/cosy_nvtx"
+elif [ "${COUNT:-0}" = 1 ]; then
+  PROBE_ENV="OMNI_PREFIX_COUNT=1"
+  PROBE_PATH=":$S/prefix_count"
 fi
 if [ -n "$SEED" ]; then
   printf '{"seed": %d, "max_new_tokens": null}\n' "$SEED" > "$OUT/generation.json"
