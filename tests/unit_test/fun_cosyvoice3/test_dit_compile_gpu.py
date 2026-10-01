@@ -132,6 +132,10 @@ def test_production_packed_dit_compile_is_as_close_to_float32_as_eager() -> None
         .cuda()
         .eval()
     )
+    with torch.no_grad():
+        for block in dit.transformer_blocks:
+            block.attn_norm.linear.bias.fill_(0.5)
+        dit.norm_out.linear.bias.fill_(0.5)
     for module in dit.modules():
         if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
             module.to(torch.bfloat16)
