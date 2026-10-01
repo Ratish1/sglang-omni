@@ -10,6 +10,7 @@
 #   PROBE=1   the cosy_nvtx probe on the server's path (LINES= passes OMNI_PIPE_LINES)
 #   SERVE_ARGS extra serve arguments
 #   META      a local meta.lst in place of the SeedTTS split (long form)
+#   REQUEST_RATE  open loop arrivals per second (concurrency is then the cap)
 #   SEED      sampling seed of every request, empty for none                  1234
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 CELLS=$5
@@ -71,7 +72,7 @@ if [ $healthy = 1 ]; then
     IFS=: read -r mode conc samples <<< "$cell"
     name="$mode-c$conc${samples:+-n$samples}"
     (cd "$T/../.." && $PY -u "$T/diagnostics/run_seedtts.py" --mode "$mode" --lang en \
-      --concurrency "$conc" --warmup 1 ${samples:+--samples $samples} ${META:+--meta $META} --model $MODEL \
+      --concurrency "$conc" --warmup 1 ${samples:+--samples $samples} ${META:+--meta $META} ${REQUEST_RATE:+--request-rate $REQUEST_RATE} --model $MODEL \
       --base-url $URL --generation-json "$OUT/generation.json" --ready-timeout 900 \
       --output "$OUT/$name") > "$OUT/$name.log" 2>&1
     echo "cell $name rc $? $(date +%T)" >> "$OUT/progress.txt"
