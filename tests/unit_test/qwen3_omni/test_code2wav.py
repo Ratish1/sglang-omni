@@ -1135,23 +1135,27 @@ def test_channels_last_code2wav_runs_every_snake_on_the_fused_kernel(
 
 
 @pytest.mark.accelerator
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform.is_cuda(),
+    reason="requires NVIDIA CUDA",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("frames", [3, 9])
-def test_fused_code2wav_transformer_is_as_close_to_fp32_as_the_hf_transformer(
-    frames: int,
+def test_fused_code2wav_transformer_error_to_fp32_is_bounded_by_the_hf_error(
+    dtype: torch.dtype, frames: int
 ) -> None:
     model = make_tiny_code2wav("cuda", torch.float32)
     hidden_states = torch.randn(2, frames, 128, device="cuda")
 
     with torch.inference_mode():
         reference = model.pre_transformer(inputs_embeds=hidden_states).last_hidden_state
-        model.to(torch.bfloat16)
+        model.to(dtype)
         expected = model.pre_transformer(
-            inputs_embeds=hidden_states.bfloat16()
+            inputs_embeds=hidden_states.to(dtype)
         ).last_hidden_state
         model.use_fused_transformer(current_platform.get_joint_rope_inplace_kernel())
         actual = model.pre_transformer(
-            inputs_embeds=hidden_states.bfloat16()
+            inputs_embeds=hidden_states.to(dtype)
         ).last_hidden_state
 
     hf_error = (expected.float() - reference).norm() / reference.norm()
