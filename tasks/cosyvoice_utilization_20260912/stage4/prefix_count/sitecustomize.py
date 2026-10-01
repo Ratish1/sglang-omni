@@ -18,11 +18,22 @@ def patch(module):
     run_step = scheduler.run_step
 
     def timed_step(self, participants, plan):
+        now = self.clock()
+        waits = [
+            (now - state.ready_since) * 1e3
+            for _, state in participants
+            if state.ready_since is not None
+        ]
+        ready = sum(
+            state.next_decode() != "wait" for _, state in self.stream_state_items()
+        )
         started = time.perf_counter()
         decoded = run_step(self, participants, plan)
         print(
             f"voc.step t={time.time():.3f} plan={plan} rows={len(participants)} "
-            f"ms={(time.perf_counter() - started) * 1e3:.1f}",
+            f"ms={(time.perf_counter() - started) * 1e3:.1f} "
+            f"wait_max={max(waits, default=0):.1f} "
+            f"wait_mean={sum(waits) / max(len(waits), 1):.1f} ready={ready}",
             file=sys.stderr,
             flush=True,
         )
