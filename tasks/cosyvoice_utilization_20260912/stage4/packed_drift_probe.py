@@ -3,7 +3,9 @@
 
 The vocoder is built by its own factory (compile on); each case runs the compiled hop or
 final, then the same call with the instance's compiled forward removed (the class's
-eager forward), and reports bit equality, max abs and relative L2 of the mel.
+eager forward), and reports bit equality, max abs and relative L2 of the mel. A last
+pass runs every case eager in float32 (the same bf16-rounded weights, autocast off) as
+the arithmetic reference both bf16 paths are measured against.
 
 usage: cd <tree> && python packed_drift_probe.py --out <json>
 """
@@ -66,6 +68,7 @@ def main() -> None:
     estimator = vocoder.flow.packed_estimator
     compiled_forward = estimator.forward
     results = {}
+    kept = {}
     with torch.inference_mode(), vocoder.stream_context:
         for name, (kind, rows, tokens) in CASES.items():
             items = make_items(vocoder.flow, rows, tokens)
@@ -75,6 +78,7 @@ def main() -> None:
             del estimator.forward
             eager = torch.cat([mel.float() for mel in call(items)], dim=2)
             estimator.forward = compiled_forward
+            kept[name] = (items, call, compiled.cpu(), eager.cpu())
             results[name] = dict(
                 equal=bool(torch.equal(compiled, eager)),
                 max_abs=float((compiled - eager).abs().max()),
@@ -84,6 +88,20 @@ def main() -> None:
                 ),
             )
             print(name, results[name], flush=True)
+    del estimator.forward
+    estimator.dit.float()
+    vocoder.autocast_dtype = None
+    with torch.inference_mode(), vocoder.stream_context:
+        for name, (items, call, compiled, eager) in kept.items():
+            truth = torch.cat([mel.float() for mel in call(items)], dim=2).cpu()
+            norm = torch.linalg.vector_norm(truth)
+            results[name]["compiled_vs_fp32"] = float(
+                torch.linalg.vector_norm(compiled - truth) / norm
+            )
+            results[name]["eager_vs_fp32"] = float(
+                torch.linalg.vector_norm(eager - truth) / norm
+            )
+            print(name, "vs fp32", results[name], flush=True)
     with open(args.out, "w") as handle:
         json.dump(results, handle, indent=1)
 
