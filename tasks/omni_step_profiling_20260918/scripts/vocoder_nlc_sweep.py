@@ -10,6 +10,8 @@ of a real incremental decode, then runs each conv:
   weight, conv2d / conv_transpose2d, the layout the channels-last decoder runs;
 - for dilated convs also:
   - polyphase: the d decimated sequences as a batch of non-dilated convs;
+  - phase view: the (B, L, C) input viewed as (B, C, L / d, d) channels last, one
+    non-dilated conv along L / d with the phases as columns, no copies;
   - unfold: one GEMM over the k shifted copies of the input;
   - nlc search: cuDNN's benchmark over every engine (benchmark_limit 0).
 
@@ -226,6 +228,9 @@ def main() -> None:
                         pad = (-length) % dilation
                         cout = weight.shape[0]
                         folded = weight.permute(0, 2, 1).reshape(cout, -1).t()
+                        w4_phase = weight.unsqueeze(3).contiguous(
+                            memory_format=torch.channels_last
+                        )
 
                         def polyphase():
                             padded = F.pad(x_nlc, (0, 0, 0, pad))
@@ -245,6 +250,19 @@ def main() -> None:
                                 .reshape(rows, -1, cout)
                             )
                             return y[:, :out_len]
+
+                        def phase_view():
+                            padded = F.pad(x_nlc, (0, 0, 0, pad))
+                            y = F.conv2d(
+                                padded.view(rows, -1, dilation, shape[1]).permute(
+                                    0, 3, 1, 2
+                                ),
+                                w4_phase,
+                                bias,
+                            )
+                            return y.permute(0, 2, 3, 1).reshape(rows, -1, cout)[
+                                :, :out_len
+                            ]
 
                         def unfold():
                             columns = torch.cat(
@@ -267,6 +285,7 @@ def main() -> None:
                             return output
 
                         variants["polyphase"] = polyphase
+                        variants["phase view"] = phase_view
                         variants["unfold"] = unfold
                         variants["nlc search"] = searched
                     else:
@@ -297,6 +316,7 @@ def main() -> None:
                 f"  width {frames} bucket {rows}: served {totals[(frames, rows, 'served')]:.0f}"
                 f" nlc {totals[(frames, rows, 'nlc')]:.0f}"
                 f" polyphase {totals[(frames, rows, 'polyphase')]:.0f}"
+                f" phase view {totals[(frames, rows, 'phase view')]:.0f}"
                 f" unfold {totals[(frames, rows, 'unfold')]:.0f}"
                 f" nlc search {totals[(frames, rows, 'nlc search')]:.0f}"
             )
