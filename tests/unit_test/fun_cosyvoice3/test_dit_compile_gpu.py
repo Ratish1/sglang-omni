@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
@@ -20,7 +22,7 @@ cosyvoice_dit = pytest.importorskip("cosyvoice.flow.DiT.dit")
 pytestmark = pytest.mark.accelerator
 
 TOL = 1e-4
-PACKED_COMPILE_REL_L2_TOL = 2e-2
+COMPILED_OVER_EAGER_ERROR = 2.0
 
 
 def native_inputs(batch: int, frames: int) -> tuple[torch.Tensor, ...]:
@@ -107,7 +109,7 @@ def test_the_compiled_chunk_mask_matches_eager(static_chunk_size: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_production_packed_dit_compile_has_bounded_drift_from_eager() -> None:
+def test_production_packed_dit_compile_is_as_close_to_float32_as_eager() -> None:
     if not _is_fa3_supported():
         pytest.skip("FA3 is unavailable on this device")
 
@@ -137,6 +139,7 @@ def test_production_packed_dit_compile_has_bounded_drift_from_eager() -> None:
             pass
     estimator = PackedDiT(dit, device="cuda")
     assert estimator.is_ragged
+    reference = PackedDiT(copy.deepcopy(dit).float(), device="cuda")
 
     def run(rows, inputs, streaming: bool) -> torch.Tensor:
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -153,6 +156,26 @@ def test_production_packed_dit_compile_has_bounded_drift_from_eager() -> None:
                 estimator.rope(rows),
             )
 
+    def run_float32(rows, inputs, streaming: bool) -> torch.Tensor:
+        floats = {name: value.float() for name, value in inputs.items()}
+        with torch.inference_mode():
+            return reference.forward(
+                floats["x"],
+                floats["mu"],
+                floats["spks"],
+                floats["cond"],
+                floats["t"],
+                rows,
+                reference.row_attention(rows, streaming=streaming, dtype=torch.float32),
+                reference.rope(rows),
+            )
+
+    def error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+        return float(
+            torch.linalg.vector_norm(actual.float() - expected)
+            / torch.linalg.vector_norm(expected)
+        )
+
     cases = []
     for streaming in (True, False):
         for lengths in ((11, 7), (13, 5, 9), (21,)):
@@ -165,17 +188,20 @@ def test_production_packed_dit_compile_has_bounded_drift_from_eager() -> None:
                 1, rows.total, 8, device="cuda", dtype=torch.bfloat16
             )
             inputs["t"] = torch.full((1,), 0.37, device="cuda", dtype=torch.bfloat16)
-            cases.append((rows, inputs, streaming, run(rows, inputs, streaming)))
+            cases.append(
+                (
+                    rows,
+                    inputs,
+                    streaming,
+                    run(rows, inputs, streaming),
+                    run_float32(rows, inputs, streaming),
+                )
+            )
 
     assert estimator.rope(cases[0][0])[0].dtype == torch.float32
     assert estimator.compile(torch.bfloat16)
-    for rows, inputs, streaming, eager in cases:
+    for rows, inputs, streaming, eager, float32 in cases:
         compiled = run(rows, inputs, streaming)
-        torch.cuda.synchronize()
-        assert compiled.shape == eager.shape
-        assert compiled.dtype == eager.dtype
-        assert torch.isfinite(compiled).all()
-        relative_l2 = torch.linalg.vector_norm(
-            compiled.float() - eager.float()
-        ) / torch.linalg.vector_norm(eager.float())
-        assert relative_l2 < PACKED_COMPILE_REL_L2_TOL
+        assert error(compiled, float32) <= COMPILED_OVER_EAGER_ERROR * error(
+            eager, float32
+        ), (rows.lengths, streaming)
