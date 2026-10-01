@@ -70,21 +70,6 @@ def fake_packed_fa3(
     return torch.empty_like(q)
 
 
-@torch.library.custom_op(
-    "sglang_omni_fun_cosyvoice3::native_mish",
-    mutates_args=(),
-    device_types="cuda",
-)
-def native_mish(x: torch.Tensor) -> torch.Tensor:
-    """Preserve eager CUDA Mish arithmetic across the Inductor boundary."""
-    return F.mish(x)
-
-
-@native_mish.register_fake
-def fake_native_mish(x: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
 @dataclass(frozen=True)
 class PackedRows:
     lengths: tuple[int, ...]
@@ -364,8 +349,8 @@ class PackedDiT:
     def conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
         module = self.dit.input_embed.conv_pos_embed
         x = scatter_rows(h, rows, rows.width).permute(0, 2, 1)
-        x = mish(module.conv1[0](F.pad(x, (module.kernel_size - 1, 0, 0, 0))))
-        x = mish(module.conv2[0](F.pad(x, (module.kernel_size - 1, 0, 0, 0))))
+        x = module.conv1(F.pad(x, (module.kernel_size - 1, 0, 0, 0)))
+        x = module.conv2(F.pad(x, (module.kernel_size - 1, 0, 0, 0)))
         return gather_rows(x.permute(0, 2, 1), rows)
 
     def rope(self, rows: PackedRows) -> tuple[torch.Tensor, torch.Tensor]:
@@ -396,13 +381,6 @@ class PackedDiT:
             rotate_in_place(key, *rope)
         out = attention(query, key, value).to(query.dtype)
         return attn.to_out[1](attn.to_out[0](out))
-
-
-def mish(x: torch.Tensor) -> torch.Tensor:
-    if torch.compiler.is_compiling():
-        return native_mish(x)
-    else:
-        return F.mish(x)
 
 
 def rotate_in_place(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> None:
