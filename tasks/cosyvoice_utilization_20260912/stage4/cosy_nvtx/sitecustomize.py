@@ -31,8 +31,13 @@ Names (rid = request id, the first word is the kind the census groups by):
   voc.select, voc.step <plan> rows=N       one streaming step and its participant pick
   mark voc.steprid rid=R plan=P            one participant of that step
   mark voc.ready rid=R plan=P tokens=N at=ingest|step  a stream turns runnable
+  mark voc.rank rid=R plan=P slack=S chosen=C sel=K  every runnable stream at selection
+                                           K, its playback slack in ms (u = no audio
+                                           yet) and whether the step took it
   voc.done rid=R, voc.finish rid=R         stream end and its flush
   flow.hop rows=N tok=T                    causal packed Flow over N rows
+  flow.hop.prefix rows=N tok=T             the same over the frames past each row's
+                                           cached prefix (#2406)
   flow.leftover rows=N tok=T               full context packed Flow (stream finals)
   flow.buffered rows=N                     padded Flow of a buffered group
   flow.graph rows=B frames=F               Flow CUDA graph replay
@@ -476,6 +481,13 @@ def patch_cosy_stages(module):
         vocoder.hop_batch,
         lambda self, items: f"flow.hop rows={len(items)} tok={token_count(items)}",
     )
+    if hasattr(vocoder, "hop_batch_prefix"):
+        vocoder.hop_batch_prefix = ranged(
+            vocoder.hop_batch_prefix,
+            lambda self, items, caches: (
+                f"flow.hop.prefix rows={len(items)} tok={token_count(items)}"
+            ),
+        )
     vocoder.leftover_batch = ranged(
         vocoder.leftover_batch,
         lambda self, items: f"flow.leftover rows={len(items)} tok={token_count(items)}",
@@ -556,9 +568,29 @@ def patch_cosy_vocoder(module):
         ingest_marked,
         lambda self, request_id, state, codes: f"voc.ingest rid={request_id}",
     )
-    scheduler.select_step_participants = ranged(
-        scheduler.select_step_participants, fixed("voc.select")
-    )
+    select = scheduler.select_step_participants
+    selections = iter(range(1 << 62))
+
+    def select_marked(self):
+        chosen = select(self)
+        taken = {request_id for request_id, _ in chosen}
+        now = self.clock()
+        sel = next(selections)
+        for request_id, state in self.stream_state_items():
+            plan = state.next_decode()
+            if plan == "wait" or self.is_aborted(request_id):
+                continue
+            if state.first_emit_at is None:
+                slack = "u"
+            else:
+                slack = f"{(state.speech_offset / self.sample_rate - (now - state.first_emit_at)) * 1e3:.0f}"
+            mark(
+                f"voc.rank rid={request_id} plan={plan} slack={slack} "
+                f"chosen={int(request_id in taken)} sel={sel}"
+            )
+        return chosen
+
+    scheduler.select_step_participants = ranged(select_marked, fixed("voc.select"))
     run_step = scheduler.run_step
 
     def run_step_marked(self, participants, plan):

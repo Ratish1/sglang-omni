@@ -23,9 +23,11 @@ Sections:
   I final wait     per request final chunk gap: AR tail, queue behind other steps, the
                    leftover step (Flow, HiFT) and delivery, for all and for the tail
   J first hop gap  chunk 1 to chunk 2: AR wait for hop 2's tokens, queue, the step, delivery
+  K final ranking  per runnable leftover: slack when it turned runnable, selections that
+                   passed it (another plan led the step, or the row cap) and its wait
 
 usage: python pipeline_census.py REPORT.sqlite --bench-log bench.log [--top 25]
-       [--sections ABCDEFGHIJ]
+       [--sections ABCDEFGHIJK]
 """
 
 from __future__ import annotations
@@ -1160,6 +1162,89 @@ def section_j(r: Report):
     )
 
 
+def section_k(r: Report):
+    print(
+        "\n## K. final ranking (per streaming request, from voc.rank marks): why a runnable"
+        " leftover waits"
+    )
+    selections = collections.defaultdict(list)
+    for t, tid, label in r.marks:
+        match = re.match(
+            r"voc\.rank rid=(\S+) plan=(\S+) slack=(\S+) chosen=(\d) sel=(\d+)", label
+        )
+        if match:
+            rid, plan, slack, chosen, sel = match.groups()
+            selections[int(sel)].append(
+                (t, rid, plan, None if slack == "u" else float(slack), chosen == "1")
+            )
+    if not selections:
+        print("  no voc.rank marks in this report")
+        return
+    finals = collections.defaultdict(list)
+    for sel in sorted(selections):
+        entries = selections[sel]
+        taken = [e for e in entries if e[4]]
+        step_plan = taken[0][2] if taken else None
+        head_slacks = [e[3] for e in taken if e[3] is not None]
+        head = min(head_slacks) if head_slacks else None
+        for t, rid, plan, slack, chosen in entries:
+            if plan == "leftover":
+                finals[rid].append((t, slack, chosen, step_plan, head, len(taken)))
+    rows = []
+    for rid, events in finals.items():
+        events.sort()
+        taken_at = next((i for i, e in enumerate(events) if e[2]), None)
+        if taken_at is None:
+            continue
+        first, taken = events[0], events[taken_at]
+        passes = events[:taken_at]
+        rows.append(
+            {
+                "wait": taken[0] - first[0],
+                "slack at ready": first[1] if first[1] is not None else 0.0,
+                "passes": len(passes),
+                "passed for a hop step": sum(1 for e in passes if e[3] != "leftover"),
+                "passed at the row cap": sum(1 for e in passes if e[3] == "leftover"),
+                "head slack at pass": (
+                    statistics.fmean(e[4] for e in passes if e[4] is not None)
+                    if any(e[4] is not None for e in passes)
+                    else 0.0
+                ),
+            }
+        )
+    if not rows:
+        print("  no leftover was taken inside the window")
+        return
+    rows.sort(key=lambda row: row["wait"])
+    groups = (
+        ("all", rows),
+        ("wait >= p90", rows[int(0.90 * len(rows)) :]),
+        ("wait >= p99", rows[int(0.99 * len(rows)) :]),
+    )
+    counts = ("passes", "passed for a hop step", "passed at the row cap")
+    print(f"  finals {len(rows)}; mean per group (slacks in ms, waits in ms)")
+    print(f"  {'':<24}" + "".join(f"{name:>14}" for name, _ in groups))
+    for key in rows[0]:
+        cells = []
+        for _, members in groups:
+            value = statistics.fmean(row[key] for row in members)
+            cells.append(
+                f"{value:>14.2f}"
+                if key in counts
+                else f"{ms(value):>14.1f}" if key == "wait" else f"{value:>14.0f}"
+            )
+        print(f"  {key:<24}" + "".join(cells))
+    print("  wait by slack at ready (ms): n, mean wait, p90 wait")
+    for low, high in ((-1e9, 0), (0, 500), (500, 1000), (1000, 2000), (2000, 1e9)):
+        members = [row for row in rows if low <= row["slack at ready"] < high]
+        if members:
+            waits = [row["wait"] for row in members]
+            print(
+                f"    slack [{low:>6.0f}, {high:>6.0f}) n {len(members):>5}  mean"
+                f" {ms(statistics.fmean(waits)):>8.1f}  p90 {ms(pct(waits, .9)):>8.1f}"
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("report")
@@ -1182,6 +1267,7 @@ def main() -> None:
         "H": lambda: section_h(r),
         "I": lambda: section_i(r),
         "J": lambda: section_j(r),
+        "K": lambda: section_k(r),
     }
     for key in args.sections:
         steps[key]()
