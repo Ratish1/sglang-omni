@@ -128,10 +128,12 @@ class FusedCode2WavTransformer(torch.nn.Module):
         rope: JointRopeInplaceKernel,
     ) -> None:
         super().__init__()
+        rotary = transformer.rotary_emb
         assert not transformer.config.attention_bias, "code2wav attention has no bias"
+        assert transformer.config.hidden_act == "silu", "code2wav's MLP is SwiGLU"
+        assert rotary.rope_type == "default", "the cos/sin table is built once"
         self.transformer = transformer
         self.rope = rope
-        rotary = transformer.rotary_emb
         positions = torch.arange(
             transformer.config.max_position_embeddings,
             device=rotary.inv_freq.device,
