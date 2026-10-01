@@ -55,10 +55,22 @@ def patch(module):
             before[id(state)] and state.flow_cache is None for _, state in participants
         )
         free = -1 if pool is None else pool.free_frames
+        held = 0
+        spent = 0
+        spent_streams = 0
+        for _, state in self.stream_state_items():
+            if state.flow_cache is None:
+                continue
+            frames = sum(row.capacity for row in state.flow_cache)
+            held += frames
+            if state.next_decode() == "leftover":
+                spent += frames
+                spent_streams += 1
         print(
             f"prefix.step t={time.time():.3f} rows={len(participants)} cached={cached} "
             f"plain={len(participants) - cached} dropped={dropped} free_frames={free} "
-            f"host_ms={host_ms:.1f}",
+            f"host_ms={host_ms:.1f} held={held} spent={spent} "
+            f"spent_streams={spent_streams}",
             file=sys.stderr,
             flush=True,
         )
