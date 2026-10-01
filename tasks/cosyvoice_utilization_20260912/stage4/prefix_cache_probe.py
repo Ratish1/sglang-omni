@@ -94,13 +94,23 @@ def frames_of(item):
     ) * TOKEN_MEL_RATIO
 
 
-def cached_hop(vocoder, streams, items):
+def grow_all(vocoder, streams, items):
     for stream, item in zip(streams, items, strict=True):
         if stream["cache"] is None:
             stream["cache"] = vocoder.prefix_cache_rows(frames_of(item))
-            assert stream["cache"] is not None
+            if stream["cache"] is None:
+                return False
+            else:
+                pass
+        elif not vocoder.grow_prefix_cache(stream["cache"], frames_of(item)):
+            return False
         else:
-            assert vocoder.grow_prefix_cache(stream["cache"], frames_of(item))
+            pass
+    return True
+
+
+def cached_hop(vocoder, streams, items):
+    assert grow_all(vocoder, streams, items)
     return vocoder.hop_batch_prefix(items, [stream["cache"] for stream in streams])
 
 
@@ -157,13 +167,14 @@ def step_times(vocoder, prompt_lengths, rounds):
     whole: dict[int, list[float]] = {}
     cached: dict[int, list[float]] = {}
     mixed: dict[int, list[float]] = {}
+    exhausted: list[int] = []
     for round_index in range(rounds):
         streams = make_streams(vocoder, prompt_lengths, total, 25, seed=round_index)
         for hop_index, (offset, length) in enumerate(plan):
             items = items_at(streams, offset, length)
             _, whole_ms = timed(lambda: vocoder.hop_batch(items))
             whole.setdefault(hop_index, []).append(whole_ms)
-            if hop_index == 3:
+            if hop_index == 2:
                 saved = [
                     (
                         s["cache"][0].frames,
@@ -190,14 +201,22 @@ def step_times(vocoder, prompt_lengths, rounds):
                         s["cache"][0].conv_context, s["cache"][1].conv_context = c0, c1
             else:
                 pass
-            _, cached_ms = timed(lambda: cached_hop(vocoder, streams, items))
+            if not grow_all(vocoder, streams, items):
+                exhausted.append(hop_index)
+                break
+            else:
+                pass
+            _, cached_ms = timed(
+                lambda: vocoder.hop_batch_prefix(items, [s["cache"] for s in streams])
+            )
             cached.setdefault(hop_index, []).append(cached_ms)
         release(vocoder, streams)
     return dict(
         plan=plan,
         whole_ms={k: statistics.median(v) for k, v in whole.items()},
         cached_ms={k: statistics.median(v) for k, v in cached.items()},
-        mixed_hop3_ms={k: statistics.median(v) for k, v in mixed.items()},
+        mixed_hop2_ms={k: statistics.median(v) for k, v in mixed.items()},
+        pool_exhausted_at_hop=exhausted,
     )
 
 
@@ -225,17 +244,21 @@ def main() -> None:
     with torch.inference_mode(), vocoder.stream_context:
         result["exactness"] = []
         for hop, max_hop in ((25, 100), (25, 60), (10, 40), (20, 80), (15, 60)):
-            result["exactness"] += exactness(vocoder, hop, max_hop, prompt_lengths, 5)
+            rows = exactness(vocoder, hop, max_hop, prompt_lengths, 5)
+            result["exactness"] += rows
+            for row in rows:
+                print(
+                    f"hop {row['hop']}/{row['max_hop']} offset {row['offset']:4d} "
+                    f"len {row['length']:3d} row {row['row']} "
+                    f"prefix {row['prefix_frames']:4d} aligned {row['prefix_on_chunk']!s:5} "
+                    f"equal {row['equal']!s:5} max_abs {row['max_abs']:.4g} "
+                    f"snr {row['snr_db']:.1f}",
+                    flush=True,
+                )
         sixteen = [37, 61, 80, 113, 50, 75, 98, 140, 44, 66, 90, 120, 55, 70, 85, 105]
         result["step"] = step_times(vocoder, sixteen, args.rounds)
     with open(args.out, "w") as handle:
         json.dump(result, handle, indent=1, default=str)
-    for row in result["exactness"]:
-        print(
-            f"hop {row['hop']}/{row['max_hop']} offset {row['offset']:4d} len {row['length']:3d} "
-            f"row {row['row']} prefix {row['prefix_frames']:4d} aligned {row['prefix_on_chunk']!s:5} "
-            f"equal {row['equal']!s:5} max_abs {row['max_abs']:.4g} snr {row['snr_db']:.1f}"
-        )
     print(json.dumps(result["step"], indent=1, default=str))
 
 
