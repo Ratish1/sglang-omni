@@ -209,7 +209,8 @@ def main() -> None:
     args = parser.parse_args()
     scheduler = create_vocoder_executor(
         MODEL,
-        device="cuda:0",
+        device="cuda",
+        gpu_id=0,
         enable_flow_cuda_graph=False,
         enable_dit_torch_compile=not args.eager,
     )
