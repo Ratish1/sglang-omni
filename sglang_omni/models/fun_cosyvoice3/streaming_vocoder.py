@@ -443,11 +443,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
             self.complete_stream_request(request_id, self.finish_stream(request_id))
             return {}
         elif plan == "leftover":
-            # note(ratish): the leftover solves the whole history bidirectionally
-            # and never reads the prefix cache.
-            for _, state in participants:
-                self.vocoder.release_prefix_cache(state.flow_cache)
-                state.flow_cache = None
             items = [
                 FlowBatchInput(
                     token=torch.tensor(state.tokens, dtype=torch.int32).unsqueeze(0),
