@@ -61,6 +61,9 @@ def make_estimator() -> PackedDiT:
             dit.input_embed.conv_pos_embed.conv2[0],
         ):
             conv.bias.fill_(0.5)
+        for block in dit.transformer_blocks:
+            block.attn_norm.linear.bias.fill_(0.5)
+        dit.norm_out.linear.bias.fill_(0.5)
     for module in dit.modules():
         if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
             module.to(torch.bfloat16)
