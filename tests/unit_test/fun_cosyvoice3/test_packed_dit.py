@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang_omni.models.fun_cosyvoice3 import prefix_cache
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     PackedDiT,
     RaggedRowAttention,
@@ -18,6 +19,10 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     rotated,
     scatter_rows,
     solve_flow_euler_packed,
+)
+from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
+    CONV_CONTEXT_FRAMES,
+    forward_prefix,
 )
 from sglang_omni.models.fun_cosyvoice3.stages import solve_flow_euler
 
@@ -232,6 +237,95 @@ def test_packed_fused_qkv_matches_unfused_eager(streaming: bool) -> None:
         )
 
     torch.testing.assert_close(fused, unfused, rtol=1e-9, atol=1e-9)
+
+
+def test_compiled_prefix_uses_fused_qk_and_original_v(monkeypatch) -> None:
+    estimator = PackedDiT(tiny_dit(), device=CPU)
+    estimator.materialize_fused_qkv()
+    attention_module = estimator.dit.transformer_blocks[0].attn
+    value_projection_inputs: list[torch.Tensor] = []
+    original_value_projection = attention_module.to_v.forward
+
+    def record_value_projection(value_input: torch.Tensor) -> torch.Tensor:
+        value_projection_inputs.append(value_input)
+        return original_value_projection(value_input)
+
+    monkeypatch.setattr(attention_module.to_v, "forward", record_value_projection)
+    qkv_weight = estimator.qkv_weights[0]
+    qkv_bias = estimator.qkv_biases[0]
+    assert qkv_weight is not None
+    query_key_size = 2 * attention_module.inner_dim
+    query_key_weight = qkv_weight[:query_key_size]
+    query_key_calls: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+    original_linear = prefix_cache.F.linear
+
+    def record_query_key_linear(
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if weight.data_ptr() == query_key_weight.data_ptr():
+            query_key_calls.append((weight, bias))
+        else:
+            pass
+        return original_linear(input_tensor, weight, bias)
+
+    monkeypatch.setattr(prefix_cache.F, "linear", record_query_key_linear)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    rows = pack_rows((2,), CPU)
+    hidden_size = int(estimator.dit.input_embed.proj.out_features)
+    x = torch.randn(1, rows.total, CHANNELS, dtype=torch.float64)
+    mu = torch.randn(1, rows.total, CHANNELS, dtype=torch.float64)
+    speaker_embeddings = torch.randn(1, rows.total, SPEAKER, dtype=torch.float64)
+    mel_conditioning = torch.randn(1, rows.total, CHANNELS, dtype=torch.float64)
+    t = torch.full((1,), 0.37, dtype=torch.float64)
+
+    def identity_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_pool: torch.Tensor,
+        value_pool: torch.Tensor,
+        head_num: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        del key, value, key_pool, value_pool, head_num, head_dim
+        return query
+
+    identity_attention.slots = torch.tensor([[0, 1]])
+    identity_attention.tail_index = torch.arange(2, 2 + CONV_CONTEXT_FRAMES).unsqueeze(
+        0
+    )
+    rope = estimator.rope(rows)
+    contexts = torch.zeros(1, CONV_CONTEXT_FRAMES, hidden_size, dtype=torch.float64)
+
+    with torch.inference_mode():
+        output, _, _ = forward_prefix(
+            estimator,
+            [torch.empty(1)],
+            [torch.empty(1)],
+            x,
+            mu,
+            speaker_embeddings,
+            mel_conditioning,
+            t,
+            rows,
+            identity_attention,
+            rope,
+            contexts,
+            contexts,
+        )
+
+    assert output.shape == (1, rows.total, CHANNELS)
+    assert len(value_projection_inputs) == 1
+    assert len(query_key_calls) == 1
+    query_key_call_weight, query_key_call_bias = query_key_calls[0]
+    assert query_key_call_weight.data_ptr() == query_key_weight.data_ptr()
+    if qkv_bias is None:
+        assert query_key_call_bias is None
+    else:
+        assert query_key_call_bias is not None
+        assert query_key_call_bias.data_ptr() == qkv_bias[:query_key_size].data_ptr()
 
 
 @pytest.mark.parametrize("streaming", [True, False])
