@@ -49,6 +49,15 @@ class RecordingPackedEstimator:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.is_ragged = False
+        self.materialize_fused_qkv_calls = 0
+        self.startup_events: list[str] | None = None
+
+    def materialize_fused_qkv(self) -> None:
+        self.materialize_fused_qkv_calls += 1
+        if self.startup_events is not None:
+            self.startup_events.append("qkv_materialize")
+        else:
+            pass
 
     def row_attention(
         self, rows: PackedRows, *, streaming: bool, dtype: torch.dtype

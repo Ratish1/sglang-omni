@@ -91,10 +91,22 @@ class RunnableFakeFlow(_PackedFlow):
         self.spk_embed_affine_layer = torch.nn.Linear(192, 80)
 
 
+def loaded_runnable_fake_flow(
+    *, enable_flow_estimator_trt: bool = False
+) -> RunnableFakeFlow:
+    flow = RunnableFakeFlow()
+    if enable_flow_estimator_trt:
+        flow.packed_estimator = None
+    else:
+        pass
+    return flow
+
+
 class GraphRunnableFakeFlow(RunnableFakeFlow):
     def __init__(self, events: list[str] | None = None) -> None:
         super().__init__()
         self.events = events
+        self.packed_estimator.startup_events = events
         self.attached_runner: stages.FlowCudaGraphRunner | None = None
 
     def attach_cuda_graph_runner(self, runner: stages.FlowCudaGraphRunner) -> None:
@@ -266,7 +278,9 @@ def test_lightweight_loader_skips_llm_and_loads_flow_hift(
             return self
 
     flow = Model()
-    flow.decoder = SimpleNamespace(estimator=torch.nn.Module())
+    estimator = torch.nn.Module()
+    estimator.transformer_blocks = torch.nn.ModuleList()
+    flow.decoder = SimpleNamespace(estimator=estimator)
     hift = Model()
 
     def fake_load_hyperpyyaml(handle, overrides):
@@ -999,7 +1013,14 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
                 "enable_flow_estimator_trt": kwargs.get("enable_flow_estimator_trt"),
             }
         )
-        return RunnableFakeFlow(), FakeHiFT()
+        return (
+            loaded_runnable_fake_flow(
+                enable_flow_estimator_trt=bool(
+                    kwargs.get("enable_flow_estimator_trt", False)
+                )
+            ),
+            FakeHiFT(),
+        )
 
     monkeypatch.setattr(stages, "load_cosyvoice3_flow_hift", fake_load)
 
@@ -1020,19 +1041,23 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
 def create_scheduler_recording_native_compile(
     monkeypatch,
     **kwargs,
-) -> tuple[list[torch.nn.Module], FunCosyVoice3StreamingVocoderScheduler]:
+) -> tuple[
+    list[torch.nn.Module],
+    FunCosyVoice3StreamingVocoderScheduler,
+    RunnableFakeFlow,
+]:
     monkeypatch.setattr(
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
     )
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
     monkeypatch.setattr(stages, "patch_chunk_mask", lambda: None)
+    fake_flow = loaded_runnable_fake_flow(
+        enable_flow_estimator_trt=bool(kwargs.get("enable_flow_estimator_trt", False))
+    )
     monkeypatch.setattr(
         stages,
         "load_cosyvoice3_flow_hift",
-        lambda checkpoint_dir, device, fp16, **_: (
-            RunnableFakeFlow(),
-            FakeHiFT(),
-        ),
+        lambda checkpoint_dir, device, fp16, **_: (fake_flow, FakeHiFT()),
     )
     compiled: list[torch.nn.Module] = []
 
@@ -1044,11 +1069,11 @@ def create_scheduler_recording_native_compile(
     scheduler = stages.create_vocoder_executor(
         "model", device="cpu", flow_prefix_cache_gb=0.0, **kwargs
     )
-    return compiled, scheduler
+    return compiled, scheduler, fake_flow
 
 
 @pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
-def test_create_vocoder_executor_compile_flag_controls_startup_materialization(
+def test_create_vocoder_executor_materializes_qkv_independent_of_compile(
     monkeypatch,
     enable_dit_torch_compile: bool,
 ) -> None:
@@ -1059,10 +1084,12 @@ def test_create_vocoder_executor_compile_flag_controls_startup_materialization(
         lambda scheduler: packed_warmups.append(scheduler),
     )
 
-    compiled, _scheduler = create_scheduler_recording_native_compile(
+    compiled, _scheduler, fake_flow = create_scheduler_recording_native_compile(
         monkeypatch,
         enable_dit_torch_compile=enable_dit_torch_compile,
     )
+    assert fake_flow.packed_estimator is not None
+    assert fake_flow.packed_estimator.materialize_fused_qkv_calls == 1
     assert len(compiled) == (1 if enable_dit_torch_compile else 0)
     assert len(packed_warmups) == (1 if enable_dit_torch_compile else 0)
 
@@ -1157,7 +1184,14 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
     )
 
     assert startup_events.count("graph_capture") == 1
+    assert startup_events.count("qkv_materialize") == 1
+    assert startup_events.index("qkv_materialize") < startup_events.index(
+        "graph_capture"
+    )
     if enable_dit_torch_compile:
+        assert startup_events.index("qkv_materialize") < startup_events.index(
+            "native_compile"
+        )
         assert startup_events.index("native_compile") < startup_events.index(
             "graph_capture"
         )
@@ -1169,12 +1203,13 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
 def test_create_vocoder_executor_trt_without_compile_skips_the_compile(
     monkeypatch,
 ) -> None:
-    compiled, _scheduler = create_scheduler_recording_native_compile(
+    compiled, _scheduler, fake_flow = create_scheduler_recording_native_compile(
         monkeypatch,
         enable_dit_torch_compile=False,
         enable_flow_estimator_trt=True,
     )
     assert compiled == []
+    assert fake_flow.packed_estimator is None
 
 
 def test_create_vocoder_executor_rejects_trt_and_compile() -> None:

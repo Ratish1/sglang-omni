@@ -143,6 +143,9 @@ def test_production_packed_dit_compile_is_as_close_to_float32_as_eager() -> None
             pass
     estimator = PackedDiT(dit, device="cuda")
     assert estimator.is_ragged
+    estimator.materialize_fused_qkv()
+    assert not estimator.is_compiled
+    assert all(weight is not None for weight in estimator.qkv_weights)
     reference = PackedDiT(copy.deepcopy(dit).float(), device="cuda")
 
     def run(rows, inputs, streaming: bool) -> torch.Tensor:

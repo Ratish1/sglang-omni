@@ -196,6 +196,45 @@ def test_packed_forward_matches_the_padded_dit_per_row(streaming: bool) -> None:
 
 
 @pytest.mark.parametrize("streaming", [True, False])
+def test_packed_fused_qkv_matches_unfused_eager(streaming: bool) -> None:
+    dit = tiny_dit()
+    padded = padded_inputs()
+    packed = packed_inputs(padded)
+    estimator = PackedDiT(dit, device=CPU)
+
+    with torch.inference_mode():
+        unfused = estimator.forward(
+            packed["x"],
+            packed["mu"],
+            packed["spks"],
+            packed["cond"],
+            packed["t"],
+            packed["rows"],
+            estimator.row_attention(
+                packed["rows"], streaming=streaming, dtype=packed["x"].dtype
+            ),
+            estimator.rope(packed["rows"]),
+        )
+        estimator.materialize_fused_qkv()
+        assert not estimator.is_compiled
+        assert all(weight is not None for weight in estimator.qkv_weights)
+        fused = estimator.forward(
+            packed["x"],
+            packed["mu"],
+            packed["spks"],
+            packed["cond"],
+            packed["t"],
+            packed["rows"],
+            estimator.row_attention(
+                packed["rows"], streaming=streaming, dtype=packed["x"].dtype
+            ),
+            estimator.rope(packed["rows"]),
+        )
+
+    torch.testing.assert_close(fused, unfused, rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("streaming", [True, False])
 def test_packed_solve_matches_the_padded_solve_per_row(streaming: bool) -> None:
     dit = tiny_dit()
     padded = padded_inputs()
@@ -254,8 +293,13 @@ def test_packed_compile_requires_ragged_half_precision(monkeypatch) -> None:
     estimator.is_ragged = True
     assert not estimator.compile(torch.float32)
     assert compile_options == []
+    estimator.materialize_fused_qkv()
+    fused_weights = estimator.qkv_weights
+    fused_biases = estimator.qkv_biases
     assert estimator.compile(torch.bfloat16)
     assert estimator.is_compiled
+    assert estimator.qkv_weights is fused_weights
+    assert estimator.qkv_biases is fused_biases
     assert compile_options == [
         {
             "backend": "inductor",
