@@ -2648,6 +2648,11 @@ def create_vocoder_executor(
     else:
         pass
 
+    if flow.packed_estimator is not None:
+        flow.packed_estimator.materialize_fused_qkv()
+    else:
+        pass
+
     if enable_dit_torch_compile:
         compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
     else:

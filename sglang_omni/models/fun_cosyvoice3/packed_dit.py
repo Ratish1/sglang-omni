@@ -254,6 +254,9 @@ class PackedDiT:
         device = torch.device(device)
         self.is_ragged = device.type == "cuda" and _is_fa3_supported()
         self.is_compiled = False
+        blocks = len(self.dit.transformer_blocks)
+        self.qkv_weights: tuple[torch.Tensor | None, ...] = (None,) * blocks
+        self.qkv_biases: tuple[torch.Tensor | None, ...] = (None,) * blocks
         logger.info(
             "Fun-CosyVoice3 Flow row attention on %s: %s",
             device,
@@ -290,6 +293,50 @@ class PackedDiT:
         else:
             pass
         return RowAttention(rows, chunk_size=chunk_size, heads=attention.heads)
+
+    def materialize_fused_qkv(self) -> None:
+        fused_weights: list[torch.Tensor] = []
+        fused_biases: list[torch.Tensor | None] = []
+        fused_bytes = 0
+        with torch.no_grad():
+            for block in self.dit.transformer_blocks:
+                attn = block.attn
+                qkv_weight = torch.cat(
+                    (
+                        attn.to_q.weight,
+                        attn.to_k.weight,
+                        attn.to_v.weight,
+                    ),
+                    dim=0,
+                )
+                if attn.to_q.bias is None:
+                    qkv_bias = None
+                else:
+                    assert attn.to_k.bias is not None
+                    assert attn.to_v.bias is not None
+                    qkv_bias = torch.cat(
+                        (
+                            attn.to_q.bias,
+                            attn.to_k.bias,
+                            attn.to_v.bias,
+                        ),
+                        dim=0,
+                    )
+
+                fused_weights.append(qkv_weight)
+                fused_biases.append(qkv_bias)
+                fused_bytes += qkv_weight.nbytes
+                if qkv_bias is not None:
+                    fused_bytes += qkv_bias.nbytes
+                else:
+                    pass
+
+        self.qkv_weights = tuple(fused_weights)
+        self.qkv_biases = tuple(fused_biases)
+        logger.info(
+            f"Materialized PackedDiT fused QKV weights+biases for "
+            f"{len(self.qkv_weights)} blocks ({fused_bytes / (1024 * 1024):.1f} MiB)"
+        )
 
     def compile(self, dtype: torch.dtype | None) -> bool:
         if not self.is_ragged or dtype not in FA3_DTYPES:
@@ -332,10 +379,15 @@ class PackedDiT:
         h = dit.input_embed.proj(torch.cat((x, cond, mu, spks), dim=-1))
         h = self.conv_pos_embed(h, rows) + h
         residual = h
-        for block in dit.transformer_blocks:
+        for block_index, block in enumerate(dit.transformer_blocks):
             norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(h, emb=t)
             h = h + gate_msa.unsqueeze(1) * self.attend(
-                block.attn, norm, rope, attention
+                block.attn,
+                norm,
+                rope,
+                attention,
+                self.qkv_weights[block_index],
+                self.qkv_biases[block_index],
             )
             ff_norm = block.ff_norm(h) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
             h = h + gate_mlp.unsqueeze(1) * block.ff(ff_norm)
@@ -366,13 +418,19 @@ class PackedDiT:
         x: torch.Tensor,
         rope: tuple[torch.Tensor, torch.Tensor],
         attention: PackedRowAttention,
+        qkv_weight: torch.Tensor | None,
+        qkv_bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        # note (ratish): under autocast to_q, to_k and to_v would each cast the
-        # float32 norm output again.
-        x = x.to(attn.to_q.weight.dtype)
-        query = attn.to_q(x)
-        key = attn.to_k(x)
-        value = attn.to_v(x)
+        if qkv_weight is None:
+            # note (ratish): under autocast to_q, to_k and to_v would each cast the
+            # float32 norm output again.
+            x = x.to(attn.to_q.weight.dtype)
+            query = attn.to_q(x)
+            key = attn.to_k(x)
+            value = attn.to_v(x)
+        else:
+            x = x.to(qkv_weight.dtype)
+            query, key, value = F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
         if torch.compiler.is_compiling():
             query = rotated(query, *rope)
             key = rotated(key, *rope)
