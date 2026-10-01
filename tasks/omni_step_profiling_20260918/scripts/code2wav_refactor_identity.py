@@ -28,6 +28,7 @@ SHAPES = ((1, 8), (1, 33), (3, 24), (4, 120))
 def load_old(path: str):
     spec = importlib.util.spec_from_file_location("old_code2wav", path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
