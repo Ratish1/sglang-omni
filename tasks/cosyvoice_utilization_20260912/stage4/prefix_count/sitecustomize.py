@@ -61,7 +61,7 @@ def patch(module):
         for _, state in self.stream_state_items():
             if state.flow_cache is None:
                 continue
-            frames = sum(row.capacity for row in state.flow_cache)
+            frames = sum(row.allocated_frames for row in state.flow_cache)
             held += frames
             if state.next_decode() == "leftover":
                 spent += frames
