@@ -2090,6 +2090,7 @@ def test_projected_prefill_reads_tensor_from_data() -> None:
         input_embeds_are_projected=True,
         prefill_input_embeds=embeds,
         req=SimpleNamespace(
+            rid="r0",
             input_embeds=None,
             prefix_indices=[],
             extend_range=SimpleNamespace(length=10),
@@ -2111,6 +2112,7 @@ def test_projected_prefill_slices_tensor_by_prefix_indices() -> None:
         input_embeds_are_projected=True,
         prefill_input_embeds=full_embeds,
         req=SimpleNamespace(
+            rid="r0",
             input_embeds=None,
             prefix_indices=list(range(prefix_len)),
             extend_range=SimpleNamespace(length=7),
@@ -2135,6 +2137,7 @@ def test_projected_prefill_slices_tensor_by_extend_range() -> None:
         input_embeds_are_projected=True,
         prefill_input_embeds=full_embeds,
         req=SimpleNamespace(
+            rid="r0",
             input_embeds=None,
             prefix_indices=list(range(prefix_len)),
             extend_range=SimpleNamespace(length=extend_len),
@@ -2159,6 +2162,7 @@ def test_projected_prefill_list_fallback_slices_by_extend_range() -> None:
         input_embeds_are_projected=True,
         prefill_input_embeds=None,
         req=SimpleNamespace(
+            rid="r0",
             input_embeds=full_embeds.tolist(),
             prefix_indices=list(range(prefix_len)),
             extend_range=SimpleNamespace(length=extend_len),
@@ -2180,13 +2184,17 @@ def test_projected_prefill_rejects_mixed_projected_and_list_batch() -> None:
         input_embeds_are_projected=True,
         prefill_input_embeds=torch.randn(2, 8),
         req=SimpleNamespace(
-            input_embeds=None, prefix_indices=[], extend_range=SimpleNamespace(length=2)
+            rid="r0",
+            input_embeds=None,
+            prefix_indices=[],
+            extend_range=SimpleNamespace(length=2),
         ),
     )
     list_req = make_sched_req(
         input_embeds_are_projected=False,
         prefill_input_embeds=None,
         req=SimpleNamespace(
+            rid="r1",
             input_embeds=torch.randn(2, 8).tolist(),
             prefix_indices=[],
             extend_range=SimpleNamespace(length=2),
@@ -2205,6 +2213,7 @@ def test_projected_prefill_full_prefix_hit_returns_none() -> None:
         input_embeds_are_projected=True,
         prefill_input_embeds=embeds,
         req=SimpleNamespace(
+            rid="r0",
             input_embeds=None,
             prefix_indices=list(range(5)),
             extend_range=SimpleNamespace(length=0),
@@ -2245,6 +2254,7 @@ def test_projected_prefill_survives_decode_retract() -> None:
         input_embeds_are_projected=True,
         prefill_input_embeds=full_embeds,
         req=SimpleNamespace(
+            rid="r0",
             input_embeds=None,
             prefix_indices=[],
             extend_range=SimpleNamespace(length=10),
@@ -2319,6 +2329,7 @@ def test_projected_prefill_retract_replays_generated_decode_inputs() -> None:
         pending_feedback_queue=deque([torch.tensor([3.0, 4.0])]),
         pending_text_queue=deque([torch.tensor([30.0, 40.0])]),
         req=SimpleNamespace(
+            rid="r0",
             input_embeds=None,
             prefix_indices=list(range(8)),
             extend_range=SimpleNamespace(length=5),

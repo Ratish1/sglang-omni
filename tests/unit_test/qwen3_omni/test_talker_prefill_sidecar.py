@@ -31,6 +31,7 @@ def projected_req(
         input_embeds_are_projected=True,
         prefill_input_embeds=embeds,
         req=SimpleNamespace(
+            rid="r0",
             input_embeds=None,
             prefix_indices=list(range(prefix_len)),
             extend_range=SimpleNamespace(length=extend_len),
@@ -43,6 +44,7 @@ def unprojected_req(extend_len: int) -> SimpleNamespace:
         input_embeds_are_projected=False,
         prefill_input_embeds=None,
         req=SimpleNamespace(
+            rid="r0",
             input_embeds=None,
             prefix_indices=[],
             extend_range=SimpleNamespace(length=extend_len),
@@ -92,6 +94,7 @@ def test_before_prefill_preserves_unprojected_tensor_embeds() -> None:
         input_embeds_are_projected=False,
         prefill_input_embeds=embeds,
         req=SimpleNamespace(
+            rid="r0",
             input_embeds=None,
             prefix_indices=[],
             extend_range=SimpleNamespace(length=6),
