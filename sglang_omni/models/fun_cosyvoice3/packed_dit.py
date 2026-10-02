@@ -323,8 +323,8 @@ class PackedDiT:
                         dim=0,
                     )
 
-                fused_weights.append(qkv_weight)
-                fused_biases.append(qkv_bias)
+                fused_weights.append(torch.nn.Parameter(qkv_weight, requires_grad=False))
+                fused_biases.append(torch.nn.Parameter(qkv_bias, requires_grad=False))
                 fused_bytes += qkv_weight.nbytes
                 if qkv_bias is not None:
                     fused_bytes += qkv_bias.nbytes
