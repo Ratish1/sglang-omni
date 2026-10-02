@@ -44,7 +44,10 @@ def kernel_resources(predictor_kernels) -> None:
         rows = []
         for entry in getattr(fn, "device_caches", {}).values():
             for kernel in entry[0].values():
-                kernel._init_handles()
+                try:
+                    kernel._init_handles()
+                except Exception:  # noqa: BLE001
+                    pass
                 constants = {}
                 for key, value in kernel.src.constants.items():
                     index = key[0] if isinstance(key, tuple) else key
@@ -55,8 +58,8 @@ def kernel_resources(predictor_kernels) -> None:
                     (
                         constants.get("BLOCK_M"),
                         constants.get("N"),
-                        kernel.n_regs,
-                        kernel.n_spills,
+                        getattr(kernel, "n_regs", "not loaded"),
+                        getattr(kernel, "n_spills", "not loaded"),
                         kernel.metadata.shared,
                     )
                 )
