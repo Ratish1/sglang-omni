@@ -23,7 +23,7 @@ from sglang_omni.models.fun_cosyvoice3 import stages
 from sglang_omni.models.fun_cosyvoice3.config import (
     FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
 )
-from sglang_omni.models.fun_cosyvoice3.stages import FlowBatchInput
+from sglang_omni.models.fun_cosyvoice3.stages import FlowBatchInput, HiftStepRow
 
 # run from the root of the tree under test, as the skill documents
 sys.path.insert(0, str(Path.cwd() / ".claude/skills/omni-gpu-deep-dive/scripts"))
@@ -43,6 +43,12 @@ CASES = {
     "buffered_miss2": ("buffered", 2, 400),
     "hift_short": ("hift", 1, 56),
     "hift_long": ("hift", 1, 800),
+    # the batched streaming HiFT step (#2392) at 1 and 16 rows: a hop whose history
+    # is 150 frames with 92 already emitted, a final at 250 with 192 emitted
+    "hiftstep_hop1": ("hiftstep", 1, (150, 92, False)),
+    "hiftstep_hop16": ("hiftstep", 16, (150, 92, False)),
+    "hiftstep_final1": ("hiftstep", 1, (250, 192, True)),
+    "hiftstep_final16": ("hiftstep", 16, (250, 192, True)),
 }
 
 
@@ -100,7 +106,23 @@ def main() -> None:
 
 def case_body(vocoder, case: str):
     kind, rows, size = CASES[case]
-    if kind == "hift":
+    if kind == "hiftstep":
+        history_frames, emitted_frames, is_final = size
+        step_rows = [
+            HiftStepRow(
+                history=torch.randn(
+                    1, vocoder.flow.output_size, history_frames, device="cuda"
+                ),
+                emitted_samples=emitted_frames * vocoder.hift_samples_per_mel_frame,
+                is_final=is_final,
+            )
+            for _ in range(rows)
+        ]
+
+        def body():
+            return vocoder.hift_step(step_rows)
+
+    elif kind == "hift":
         mel = torch.randn(1, vocoder.flow.output_size, size, device="cuda")
 
         def body():
