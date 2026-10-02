@@ -57,8 +57,11 @@ def main() -> None:
     parser.add_argument(
         "--cases", nargs="+", default=list(PREFIX_CASES + VOCODER_CASES)
     )
+    # serving runs the vocoder with one torch CPU thread (SGLang pins its GPU process)
+    parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+    torch.set_num_threads(args.torch_threads)
     scheduler = stages.create_vocoder_executor(
         args.model,
         device="cuda",
