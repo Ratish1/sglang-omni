@@ -2409,6 +2409,9 @@ def talker_seed_self(
         decode_prep_rep_rows=None,
     )
     fake.reuse_decode_buffers = Qwen3OmniTalker.reuse_decode_buffers.__get__(fake)
+    fake.can_reuse_decode_buffers = Qwen3OmniTalker.can_reuse_decode_buffers.__get__(
+        fake
+    )
     fake.invalidate_decode_buffers = Qwen3OmniTalker.invalidate_decode_buffers.__get__(
         fake
     )
@@ -2560,6 +2563,42 @@ def test_talker_steady_step_marks_repetition_like_advanced_indexing() -> None:
 
     assert float(fake.sampling_temperatures[0, 0]) == 123.0
     assert torch.equal(fake.repetition_mask, expected)
+
+
+def test_talker_lookahead_reuses_decode_buffers_across_the_resolve_lag() -> None:
+    fake = talker_seed_self()
+    requests = [
+        talker_prep_req("a", penalty=1.5, output_ids=[2]),
+        talker_prep_req("b", penalty=1.2, output_ids=[4]),
+    ]
+    inflight_steps: dict[str, int] = {}
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests, inflight_steps)
+    fake.sampling_temperatures[0, 0] = 123.0
+    advance_decode_step(fake, requests, [5, 6])
+
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests, inflight_steps)
+    inflight_steps.update(a=1, b=1)
+    fake.sampled_token_ids[:2] = torch.tensor([7, 3])
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests, inflight_steps)
+    for sched_req, token in zip(requests, [7, 3]):
+        sched_req.data.req.output_ids.append(token)
+    fake.sampled_token_ids[:2] = torch.tensor([1, 0])
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests, inflight_steps)
+    for sched_req, token in zip(requests, [1, 0]):
+        sched_req.data.req.output_ids.append(token)
+
+    assert float(fake.sampling_temperatures[0, 0]) == 123.0
+    fresh = talker_seed_self()
+    Qwen3OmniTalker.prepare_decode_buffers(fresh, requests)
+    assert torch.equal(fake.repetition_mask, fresh.repetition_mask)
+
+
+def test_talker_rebuild_refuses_a_row_with_a_step_in_flight() -> None:
+    fake = talker_seed_self()
+    requests = [talker_prep_req("a", penalty=1.5, output_ids=[2])]
+
+    with pytest.raises(RuntimeError, match="in flight"):
+        Qwen3OmniTalker.prepare_decode_buffers(fake, requests, {"a": 1})
 
 
 @pytest.mark.accelerator

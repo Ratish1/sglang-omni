@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Set
 from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.scheduler import TEST_RETRACT
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -16,6 +18,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
+from sglang_omni.models.qwen3_omni.components.talker import sampled_length
 from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
@@ -69,6 +72,8 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         self.codec_coalesce_frames = max(int(codec_coalesce_frames), 0)
         self.codec_coalesce_first_frames = max(int(codec_coalesce_first_frames), 0)
         self.codec_coalesce_early_frames = max(int(codec_coalesce_early_frames), 0)
+        # Launched, unresolved decode steps per request id (one-step lookahead).
+        self.inflight_steps: dict[str, int] = {}
 
     def execute(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return super().execute(scheduler_output)
@@ -117,7 +122,7 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         else:
             pass
 
-        self.model.prepare_decode_buffers(requests)
+        self.model.prepare_decode_buffers(requests, self.inflight_steps)
         self.write_feedback_buffers(requests)
 
     def post_prefill(
@@ -175,24 +180,122 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             requests=requests,
         )
 
+    def lookahead_eligible(self, batch: ScheduleBatch) -> bool:
+        """A lookahead launch reuses the last prepare's buffers.
+
+        The rebuild reads the repetition history from output_ids, which lack the
+        tokens of launched, unresolved steps, so only a step on the same rows, each
+        one sampled token further, launches ahead. SGLang's forced test retraction
+        can drop an in-flight row that the talker has already fed forward, so it
+        runs synchronously.
+        """
+        if (
+            not self.feedback_enabled
+            or TEST_RETRACT
+            or not super().lookahead_eligible(batch)
+        ):
+            return False
+        else:
+            pass
+        return self.model.can_reuse_decode_buffers(
+            [request.rid for request in batch.reqs],
+            [sampled_length(request, self.inflight_steps) for request in batch.reqs],
+        )
+
+    def post_decode_launch(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        requests: list[SchedulerRequest],
+    ) -> torch.Tensor:
+        """Publish the sampled codes and queue each row's feedback for the next
+        launch; the code rows are emitted at resolve, once the rows still alive
+        are known."""
+        batch_size = len(requests)
+        result.next_token_ids = self.model.sampled_token_ids[:batch_size].clone()
+        self.stage_token_ids(result, result.next_token_ids)
+        codes_snap, embeds_snap = self.snapshot_step_outputs(batch_size)
+        self.queue_feedback_rows(requests, embeds_snap)
+        for sched_req in requests:
+            request_id = sched_req.data.req.rid
+            self.inflight_steps[request_id] = self.inflight_steps.get(request_id, 0) + 1
+        return codes_snap
+
+    def post_decode_resolve(
+        self,
+        launch_buf: torch.Tensor,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        for sched_req in requests:
+            request_id = sched_req.data.req.rid
+            remaining = self.inflight_steps[request_id] - 1
+            if remaining:
+                self.inflight_steps[request_id] = remaining
+            else:
+                self.inflight_steps.pop(request_id)
+        # note (ratish): a row that finished in the previous step ran one step past
+        # its end; its codes are never sent.
+        overrun_request_ids = {
+            request.rid
+            for request in schedule_batch.reqs
+            if request.finished() or self.req_is_retracted(request)
+        }
+        self.emit_code_chunks(
+            schedule_batch=schedule_batch,
+            requests=requests,
+            codes_snap=launch_buf,
+            skip_request_ids=overrun_request_ids,
+        )
+
     def emit_code_chunks_and_feedback(
         self,
         *,
         schedule_batch: ScheduleBatch,
         requests: list[SchedulerRequest],
     ) -> None:
-        bs = len(requests)
+        codes_snap, embeds_snap = self.snapshot_step_outputs(len(requests))
+        self.queue_feedback_rows(requests, embeds_snap)
+        self.emit_code_chunks(
+            schedule_batch=schedule_batch, requests=requests, codes_snap=codes_snap
+        )
+
+    def snapshot_step_outputs(
+        self, batch_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Note (wenyao): one batched clone per buffer, not one per row: the
         # snapshot must be a fresh allocation so its rows survive the next
         # in-graph write to the fixed-address _output_codes/_output_embeds.
-        codes_snap = self.model.output_codes[:bs].detach().clone()
-        embeds_snap = self.model.output_embeds[:bs].detach().clone()
+        codes_snap = self.model.output_codes[:batch_size].detach().clone()
+        embeds_snap = self.model.output_embeds[:batch_size].detach().clone()
+        return codes_snap, embeds_snap
+
+    @staticmethod
+    def queue_feedback_rows(
+        requests: list[SchedulerRequest], embeds_snap: torch.Tensor
+    ) -> None:
+        for idx, sched_req in enumerate(requests):
+            sched_req.data.pending_feedback_queue.append(embeds_snap[idx])
+
+    def emit_code_chunks(
+        self,
+        *,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+        codes_snap: torch.Tensor,
+        skip_request_ids: Set[str] = frozenset(),
+    ) -> None:
         coalesce = self.codec_coalesce_frames
         code_messages: list[OutgoingMessage] = []
         for idx, sched_req in enumerate(requests):
             req = schedule_batch.reqs[idx]
+            if req.rid in skip_request_ids:
+                continue
+            else:
+                pass
             code_chunk = codes_snap[idx]
-            feedback_row = embeds_snap[idx]
             if coalesce > 1:
                 data = sched_req.data
                 pending = data.pending_codec_rows
@@ -230,7 +333,6 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
                         metadata={"stream": self.is_streaming(sched_req.data)},
                     )
                 )
-            sched_req.data.pending_feedback_queue.append(feedback_row)
         self.put_code_messages(code_messages)
 
     def put_code_messages(self, code_messages: list[OutgoingMessage]) -> None:

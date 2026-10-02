@@ -1374,6 +1374,8 @@ def create_talker_ar_executor_from_config(
     codec_coalesce_frames: int = 0,
     codec_coalesce_first_frames: int = 0,
     codec_coalesce_early_frames: int = 0,
+    enable_async_decode: bool = True,
+    async_decode_min_batch_size: int = 2,
 ) -> QwenTalkerScheduler:
     """Returns OmniScheduler for talker."""
     from sglang_omni.models.qwen3_omni.bootstrap import create_talker_scheduler
@@ -1464,6 +1466,8 @@ def create_talker_ar_executor_from_config(
         codec_coalesce_frames=codec_coalesce_frames,
         codec_coalesce_first_frames=codec_coalesce_first_frames,
         codec_coalesce_early_frames=codec_coalesce_early_frames,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
     )
     from sglang.srt.runtime_context import get_schedule
 

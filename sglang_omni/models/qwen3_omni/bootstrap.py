@@ -137,6 +137,8 @@ def create_talker_scheduler(
     codec_coalesce_frames: int = 0,
     codec_coalesce_first_frames: int = 0,
     codec_coalesce_early_frames: int = 0,
+    enable_async_decode: bool = True,
+    async_decode_min_batch_size: int = 2,
 ) -> "QwenTalkerScheduler":
     """Create the Qwen talker scheduler."""
     del speech_enabled
@@ -264,6 +266,8 @@ def create_talker_scheduler(
         partial_start_min_chunks=partial_start_min_chunks,
         enable_talker_start_topology=enable_talker_start_topology,
         im_end_token_id=root_config.im_end_token_id,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
     )
 
     model_runner = QwenTalkerModelRunner(

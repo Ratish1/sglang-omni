@@ -164,6 +164,17 @@ class QwenTalkerScheduler(OmniScheduler[SGLangARRequestData]):
         )
 
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
+        running_batch = self.running_batch
+        if self.async_pending is not None and (
+            (self.waiting_queue and not running_batch.batch_is_full)
+            or not running_batch.check_decode_mem()
+        ):
+            # note (ratish): a prefill would wait behind rows that finished in the
+            # launched step, and a retract would drop that step's rows after their
+            # feedback was queued; both run on resolved rows.
+            self.resolve_pending_async()
+        else:
+            pass
         batch = super().get_next_batch_to_run()
         if batch is not None and (not self.is_batch_ready_to_run(batch)):
             self.rollback_decode_prep_after_skip(batch)

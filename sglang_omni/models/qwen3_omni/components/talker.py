@@ -5,12 +5,15 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Iterable, Optional, Tuple
 
 import torch
 from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_context, get_schedule
@@ -52,6 +55,14 @@ from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
 from sglang_omni.vendor.sglang.utils import make_layers
 
 logger = logging.getLogger(__name__)
+
+NO_INFLIGHT_STEPS: Mapping[str, int] = MappingProxyType({})
+
+
+def sampled_length(request: Req, inflight_steps: Mapping[str, int]) -> int:
+    """Tokens a row has sampled: those resolved into output_ids plus its launched,
+    unresolved decode steps."""
+    return len(request.output_ids or ()) + inflight_steps.get(request.rid, 0)
 
 
 def bind_default_weight_loaders(module: nn.Module) -> None:
@@ -1069,26 +1080,34 @@ class Qwen3OmniTalker(nn.Module):
             pass
         return next_code
 
-    def reuse_decode_buffers(self, requests: list) -> bool:
-        # Note (akazaakane): sampling params/suppress mask are static per
-        # request, so only the repetition mask needs updating here.
-        prev_rids = self.decode_prep_rids
-        if prev_rids is None or len(prev_rids) != len(requests):
+    def can_reuse_decode_buffers(
+        self, rids: list[str], sampled_lens: list[int]
+    ) -> bool:
+        """The same rows as the last prepare, each one sampled token further."""
+        if self.decode_prep_rids != rids:
             return False
         else:
             pass
-        prev_lens = self.decode_prep_out_lens
-        for row_idx, sched_req in enumerate(requests):
-            req = sched_req.data.req
-            if req.rid != prev_rids[row_idx]:
-                return False
-            else:
-                pass
-            out_len = len(req.output_ids) if req.output_ids else 0
-            if out_len != prev_lens[row_idx] + 1:
-                return False
-            else:
-                pass
+        return all(
+            sampled_len == prev_len + 1
+            for sampled_len, prev_len in zip(sampled_lens, self.decode_prep_out_lens)
+        )
+
+    def reuse_decode_buffers(
+        self, requests: list, inflight_steps: Mapping[str, int]
+    ) -> bool:
+        # Note (akazaakane): sampling params/suppress mask are static per
+        # request, so only the repetition mask needs updating here.
+        sglang_requests = [sched_req.data.req for sched_req in requests]
+        sampled_lens = [
+            sampled_length(request, inflight_steps) for request in sglang_requests
+        ]
+        if not self.can_reuse_decode_buffers(
+            [request.rid for request in sglang_requests], sampled_lens
+        ):
+            return False
+        else:
+            pass
 
         rep_rows = self.decode_prep_rep_rows
         if rep_rows is not None:
@@ -1097,8 +1116,7 @@ class Qwen3OmniTalker(nn.Module):
             )
         else:
             pass
-        for row_idx in range(len(prev_lens)):
-            prev_lens[row_idx] += 1
+        self.decode_prep_out_lens = sampled_lens
         return True
 
     def invalidate_decode_buffers(self) -> None:
@@ -1106,15 +1124,25 @@ class Qwen3OmniTalker(nn.Module):
         # _sampled_token_ids, so the fast path must not run right after one.
         self.decode_prep_rids = None
 
-    def prepare_decode_buffers(self, requests: list) -> None:
+    def prepare_decode_buffers(
+        self, requests: list, inflight_steps: Mapping[str, int] = NO_INFLIGHT_STEPS
+    ) -> None:
         batch_size = len(requests)
         if batch_size == 0:
             return
         else:
             pass
 
-        if self.reuse_decode_buffers(requests):
+        if self.reuse_decode_buffers(requests, inflight_steps):
             return
+        else:
+            pass
+        if any(inflight_steps.get(sched_req.data.req.rid, 0) for sched_req in requests):
+            # note (ratish): the rebuild reads the repetition history from output_ids,
+            # which lack the tokens of launched, unresolved steps.
+            raise RuntimeError(
+                "talker decode buffers cannot be rebuilt while a decode step is in flight"
+            )
         else:
             pass
 
