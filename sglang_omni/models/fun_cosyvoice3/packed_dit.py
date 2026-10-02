@@ -430,7 +430,11 @@ class PackedDiT:
             value = attn.to_v(x)
         else:
             x = x.to(qkv_weight.dtype)
-            query, key, value = F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
+            query_key_size = 2 * attn.inner_dim
+            query, key = F.linear(
+                x, qkv_weight[:query_key_size], qkv_bias[:query_key_size]
+            ).chunk(2, dim=-1)
+            value = attn.to_v(x)
         if torch.compiler.is_compiling():
             query = rotated(query, *rope)
             key = rotated(key, *rope)

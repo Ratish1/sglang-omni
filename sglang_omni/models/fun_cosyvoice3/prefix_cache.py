@@ -374,21 +374,11 @@ def forward_prefix(
             value = attn.to_v(normed)
         else:
             normed = norm.to(qkv_weight.dtype)
-            if torch.compiler.is_compiling():
-                # note(chenye): compiled prefix graphs use fused QK and a separate V projection.
-                query_key_size = 2 * attn.inner_dim
-                query_key_bias = None if qkv_bias is None else qkv_bias[:query_key_size]
-                query, key = F.linear(
-                    normed,
-                    qkv_weight[:query_key_size],
-                    query_key_bias,
-                ).chunk(2, dim=-1)
-                value = attn.to_v(normed)
-            else:
-                # note(chenye): uncompiled prefix graphs use fused QKV projection.
-                query, key, value = F.linear(normed, qkv_weight, qkv_bias).chunk(
-                    3, dim=-1
-                )
+            query_key_size = 2 * attn.inner_dim
+            query, key = F.linear(
+                normed, qkv_weight[:query_key_size], qkv_bias[:query_key_size]
+            ).chunk(2, dim=-1)
+            value = attn.to_v(normed)
         if torch.compiler.is_compiling():
             query = rotated(query, *rope)
             key = rotated(key, *rope)
