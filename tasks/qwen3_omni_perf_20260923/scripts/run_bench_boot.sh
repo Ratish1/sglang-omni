@@ -116,7 +116,10 @@ else
 fi
 stop serve
 echo "pids on the card: $(awk '{print $3}' "$OUT/apps.csv" | sort -u | tr '\n' ' ')" >> "$OUT/progress.txt"
-foreign=$(awk '$3 > 0 && $2 - $3 > max {max = $2 - $3} END {print max + 0}' "$OUT/card_memory.log")
+# the two nvidia-smi reads of a sample are not simultaneous, so while a server ramps by 100 GiB in
+# seconds one sample can show any gap; a foreign process persists, so the excess must hold for three
+# consecutive samples
+foreign=$(awk '$3 > 0 {e = $2 - $3; if (n >= 2) {m = e; if (p1 < m) m = p1; if (p2 < m) m = p2; if (m > max) max = m}; p2 = p1; p1 = e; n++} END {print max + 0}' "$OUT/card_memory.log")
 echo "most card memory outside our processes while the server ran: $foreign MiB" >> "$OUT/progress.txt"
 if [ "$foreign" -gt 1024 ]; then
   echo "foreign process on the card: $foreign MiB outside our processes" >> "$OUT/FAILED"
