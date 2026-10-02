@@ -53,8 +53,11 @@ if [ $healthy = 1 ]; then
   echo "warm rc $? $(date +%T)" >> "$OUT/progress.txt"
   curl -s -X POST $URL/start_profile -H 'Content-Type: application/json' \
     -d "{\"run_id\": \"trace\", \"trace_path_template\": \"$OUT/{stage}\", \"enable_torch\": true}" >> "$OUT/progress.txt"
+  # the window takes the samples after the warm pass: a warm sample's media would hit the encoder
+  # cache and its prompt the thinker's radix cache, so the window would trace neither
   CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
-    --concurrency "$CONC" --out "$OUT/window" --max-samples "${WINDOW:-16}" > "$OUT/gen_window.log" 2>&1
+    --concurrency "$CONC" --out "$OUT/window" --max-samples "${WINDOW:-16}" --skip-samples "${WARM:-32}" \
+    > "$OUT/gen_window.log" 2>&1
   echo "window rc $? $(date +%T)" >> "$OUT/progress.txt"
   curl -s -X POST $URL/stop_profile -H 'Content-Type: application/json' -d '{}' >> "$OUT/progress.txt"
   # a trace is complete when gzip has removed its .trace.json; the profiler first writes
