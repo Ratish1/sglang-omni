@@ -365,9 +365,13 @@ def forward_prefix(
             hidden_states, emb=t
         )
         attn = block.attn
-        query, key, value = F.linear(
-            norm, estimator.qkv_weights[layer], estimator.qkv_biases[layer]
-        ).chunk(3, dim=-1)
+        qkv_weight = estimator.qkv_weights[layer]
+        qkv_bias = estimator.qkv_biases[layer]
+        query_key = 2 * attn.inner_dim
+        query, key = F.linear(
+            norm, qkv_weight[:query_key], qkv_bias[:query_key]
+        ).chunk(2, dim=-1)
+        value = F.linear(norm, qkv_weight[query_key:], qkv_bias[query_key:])
         if torch.compiler.is_compiling():
             query = rotated(query, *rope)
             key = rotated(key, *rope)
