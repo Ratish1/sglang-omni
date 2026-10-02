@@ -31,18 +31,27 @@ def time_ms(fn, inputs) -> float:
     return statistics.median(times[3:])
 
 
-def graph_step_ms(talker, batch: int, pair, single) -> float:
+def graph_step_ms(talker, batch: int, pair, single, max_fused_rows=None) -> float:
     """One served predictor step, the opening pair then 14 single-token passes,
-    captured in a CUDA graph; the median replay time."""
+    captured in a CUDA graph; the median replay time. With max_fused_rows, a fused
+    talker runs a pass plain when its rows exceed it."""
+    fused = talker.predictor_fused_layers
+
+    def run(tokens, cache_len):
+        rows = tokens.shape[0] * tokens.shape[1]
+        if max_fused_rows is not None and rows > max_fused_rows:
+            talker.predictor_fused_layers = None
+        else:
+            talker.predictor_fused_layers = fused
+        talker.predictor_forward_tokens(
+            token_embeds=tokens, batch_size=batch, cache_len=cache_len
+        )
+        talker.predictor_fused_layers = fused
 
     def step():
-        talker.predictor_forward_tokens(
-            token_embeds=pair, batch_size=batch, cache_len=0
-        )
+        run(pair, 0)
         for cache_len in range(2, 16):
-            talker.predictor_forward_tokens(
-                token_embeds=single, batch_size=batch, cache_len=cache_len
-            )
+            run(single, cache_len)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -179,6 +188,19 @@ def main() -> None:
                         f"{path} pair {pair_ms:.3f} ms single {single_ms:.3f} ms "
                         f"graph step {step_ms:.3f} ms"
                     )
+                    if path == "fused":
+                        rule_ms = graph_step_ms(
+                            talker,
+                            batch,
+                            pair[:batch].clone(),
+                            single[:batch].clone(),
+                            max_fused_rows=64,
+                        )
+                        line.append(
+                            f"fused within 64 rows: graph step {rule_ms:.3f} ms"
+                        )
+                    else:
+                        pass
                     if path == "fused":
                         rows = (out_pair[:1], out_single[:1], k_row, v_row)
                         if reference is None:
