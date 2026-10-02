@@ -18,9 +18,6 @@ reproduces Qwen3TTSTalker.predictor_forward_tokens bit for bit, and whether rope
 
 Reports:
   A  per layer and boundary, the propagated chain's relative error to fp32 (plain, fused)
-  B  local stages, both arms from the same bf16 stage inputs (the plain chain's real
-     activations), output error to fp32 from those inputs: the add and norm into q, k, v;
-     o_proj with the residual; the norm into the MLP activation; the final norm
   C  per codebook, the sampling distribution (temperature, top k as served) against the
      reference's: total variation, signed entropy shift, top 1 agreement, logit error
 
