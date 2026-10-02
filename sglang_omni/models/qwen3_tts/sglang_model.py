@@ -28,6 +28,9 @@ from sglang.srt.utils import add_prefix
 from sglang.srt.utils.common import is_pin_memory_available
 from torch import nn
 
+from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
+    resolve_fused_predictor_layers,
+)
 from sglang_omni.models.qwen3_omni.components.talker import (  # noqa: E501
     Qwen3OmniMoeTalkerDenseMLP,
     ResizeMLP,
@@ -53,7 +56,6 @@ from sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph import (
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import ReplayableGraph
 from sglang_omni.scheduling.types import SchedulerRequest
-from sglang_omni.utils import predictor_layers
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.layers import ReplicatedLinear, RMSNorm
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
@@ -1062,11 +1064,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.predictor_rope_stores_kv = self.resolve_predictor_rope_store(
             cp_attn, device=device
         )
-        self.predictor_fused_layers = predictor_layers.resolve_fused_predictor_layers(
+        self.predictor_fused_layers = resolve_fused_predictor_layers(
             self.code_predictor, predictor_len, max_batch_size, device, dtype
         )
-        predictor_path = "fused" if self.predictor_fused_layers is not None else "plain"
-        logger.info(f"Qwen3-TTS predictor layers: {predictor_path}")
         self.sampled_token_ids = torch.zeros(
             max_batch_size, dtype=torch.long, device=device
         )

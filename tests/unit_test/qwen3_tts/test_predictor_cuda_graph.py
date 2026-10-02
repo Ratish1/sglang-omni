@@ -30,8 +30,10 @@ from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from torch import nn
 
 import sglang_omni.models.qwen3_tts.sglang_model as sglang_model_module
+from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
+    resolve_fused_predictor_layers,
+)
 from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
-from sglang_omni.utils.predictor_layers import resolve_fused_predictor_layers
 from sglang_omni.vendor.sglang.layers import RMSNorm
 from sglang_omni.vendor.sglang.models import apply_qk_norm
 
