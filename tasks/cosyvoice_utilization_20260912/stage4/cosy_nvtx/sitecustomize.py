@@ -465,6 +465,14 @@ def patch_cosy_stages(module):
         ),
     ):
         setattr(module, name, ranged(getattr(module, name), label))
+    # the prefix cached solve of #2406, looked up through the stages module
+    if hasattr(module, "solve_flow_euler_prefix"):
+        module.solve_flow_euler_prefix = ranged(
+            module.solve_flow_euler_prefix,
+            lambda estimator, pool, noise, *args, **kwargs: (
+                f"flow.euler_prefix frames={int(noise.shape[1])}"
+            ),
+        )
     runner = module.FlowCudaGraphRunner
     runner.run = ranged(
         runner.run,
@@ -610,6 +618,17 @@ def patch_cosy_vocoder(module):
         run_step_marked,
         lambda self, participants, plan: f"voc.step {plan} rows={len(participants)}",
     )
+    # the scheduler side of #2406 (cached rows plus the whole history fallback) and
+    # of #2392 (one HiFT call per step)
+    if hasattr(scheduler, "hop_batch_with_prefix"):
+        scheduler.hop_batch_with_prefix = ranged(
+            scheduler.hop_batch_with_prefix,
+            lambda self, participants, items: (
+                f"voc.hop_with_prefix rows={len(participants)}"
+            ),
+        )
+    if hasattr(scheduler, "hift_step"):
+        scheduler.hift_step = ranged(scheduler.hift_step, fixed("voc.hift_step"))
 
 
 PATCHES = {
