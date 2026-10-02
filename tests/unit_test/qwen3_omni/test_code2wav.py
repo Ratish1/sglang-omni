@@ -447,6 +447,11 @@ def test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys(
         "num_quantizers": 12,
         "total_gpu_memory_fraction": 0.02,
         "graph_keys": expected_graph_keys,
+        "best_effort_keys": tuple(
+            GraphKey(batch_size=1, frames=frames)
+            for frames in range(26, 45)
+            if frames != 40
+        ),
         "model_footprint_bytes": 3 * 4 + 2 * 8,
         "decode_stream": scheduler.decode_stream,
     }
@@ -560,7 +565,7 @@ def test_qwen_code2wav_threshold_context_windows_hit_cuda_graph(monkeypatch) -> 
     ]
 
 
-def test_qwen_code2wav_stream_done_tail_is_eager_when_shape_matches_graph(
+def test_qwen_code2wav_stream_done_tail_replays_the_graph_of_its_shape(
     monkeypatch,
 ) -> None:
     model = FakeCode2WavModel(total_upsample=2)
@@ -588,16 +593,16 @@ def test_qwen_code2wav_stream_done_tail_is_eager_when_shape_matches_graph(
         )
     scheduler.handle_stream_done("req-1")
 
-    assert runner.calls == [((1, 2, 6), True), ((1, 2, 10), False)]
+    assert runner.calls == [((1, 2, 6), True), ((1, 2, 10), True)]
     decode_ends = [
         event for event in events if event["event_name"] == "code2wav_decode_end"
     ]
     tail_metadata = decode_ends[-1]["metadata"]
     assert tail_metadata["trigger"] == "stream_done"
     assert tail_metadata["window_frames"] == 10
-    assert tail_metadata["execution_mode"] == "eager"
-    assert tail_metadata["graph_key"] is None
-    assert tail_metadata["fallback_reason"] == "ineligible"
+    assert tail_metadata["execution_mode"] == "cuda_graph"
+    assert tail_metadata["graph_key"] == {"batch_size": 1, "frames": 10}
+    assert tail_metadata["fallback_reason"] is None
 
 
 def test_qwen_code2wav_request_events_are_symmetric_and_keep_start_metadata(
@@ -767,7 +772,7 @@ def test_qwen_code2wav_graph_output_protocol_matches_eager_exactly() -> None:
         for item in graph_snapshot
         if item[0] == "stream"
     ] == [20, 2]
-    assert runner.calls == [((1, 2, 10), True), ((1, 2, 2), False)]
+    assert runner.calls == [((1, 2, 10), True), ((1, 2, 2), True)]
 
 
 def test_qwen_code2wav_consumes_borrowed_output_under_state_lock() -> None:
