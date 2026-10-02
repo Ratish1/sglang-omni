@@ -28,14 +28,6 @@ from sglang.srt.utils import add_prefix
 from sglang.srt.utils.common import is_pin_memory_available
 from torch import nn
 
-from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
-    allocate_split_scratch,
-    attention_inputs,
-    down_add,
-    mlp_up,
-    o_proj_add,
-    resolve_predictor_layer_shape,
-)
 from sglang_omni.models.qwen3_omni.components.talker import (  # noqa: E501
     Qwen3OmniMoeTalkerDenseMLP,
     ResizeMLP,
@@ -61,6 +53,7 @@ from sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph import (
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import ReplayableGraph
 from sglang_omni.scheduling.types import SchedulerRequest
+from sglang_omni.utils import predictor_layers
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.layers import ReplicatedLinear, RMSNorm
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
@@ -1069,40 +1062,11 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.predictor_rope_stores_kv = self.resolve_predictor_rope_store(
             cp_attn, device=device
         )
-        # note (ratish): the fused layer's buffers hold a row per token of the opening pair.
-        self.predictor_layer_shape = resolve_predictor_layer_shape(
-            self.code_predictor, predictor_len, device
+        self.predictor_fused_layers = predictor_layers.resolve_fused_predictor_layers(
+            self.code_predictor, predictor_len, max_batch_size, device, dtype
         )
-        if self.predictor_layer_shape is None:
-            logger.info("Qwen3-TTS predictor layers: plain")
-        else:
-            predictor_rows = 2 * max_batch_size
-            self.predictor_q_buffer = torch.zeros(
-                predictor_rows,
-                cp_attn.num_heads * cp_attn.head_dim,
-                device=device,
-                dtype=dtype,
-            )
-            self.predictor_residual = torch.zeros(
-                predictor_rows,
-                self.predictor_layer_shape.hidden_size,
-                device=device,
-                dtype=dtype,
-            )
-            self.predictor_activated = torch.zeros(
-                predictor_rows,
-                self.predictor_layer_shape.intermediate_size,
-                device=device,
-                dtype=dtype,
-            )
-            (
-                self.predictor_partials,
-                self.predictor_sum_sq_partials,
-                self.predictor_tile_counters,
-            ) = allocate_split_scratch(
-                self.predictor_layer_shape, predictor_rows, device
-            )
-            logger.info("Qwen3-TTS predictor layers: fused")
+        predictor_path = "fused" if self.predictor_fused_layers is not None else "plain"
+        logger.info(f"Qwen3-TTS predictor layers: {predictor_path}")
         self.sampled_token_ids = torch.zeros(
             max_batch_size, dtype=torch.long, device=device
         )
@@ -2066,12 +2030,16 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             assert (num_tokens, cache_len) == (2, 0), "pair tables hold slots 0 and 1"
             positions = self.predictor_pair_positions[: 2 * batch_size]
             cache_slots = self.predictor_pair_cache_slots[: 2 * batch_size]
-        if self.predictor_layer_shape is not None:
-            return self.predictor_forward_tokens_fused(
+        if self.predictor_fused_layers is not None:
+            return self.predictor_fused_layers.forward(
+                layers=self.code_predictor.model.layers,
+                final_norm=self.code_predictor.model.norm,
                 token_embeds=token_embeds,
                 batch_size=batch_size,
                 cache_len=cache_len,
                 positions=positions,
+                k_cache=self.predictor_k_cache,
+                v_cache=self.predictor_v_cache,
             )
         else:
             pass
@@ -2106,85 +2074,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         normed, _ = self.code_predictor.model.norm(
             mlp_out, residual.reshape(-1, hidden_size)
         )
-        return normed.reshape(batch_size, num_tokens, hidden_size)
-
-    def predictor_forward_tokens_fused(
-        self,
-        *,
-        token_embeds: torch.Tensor,
-        batch_size: int,
-        cache_len: int,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        """The rows through the fused launches; the residual stream lives in
-        predictor_residual, the down projection adds into it, and the result is its
-        final norm. The caches are (row, slot, kv head, head dim), the slot being
-        the position."""
-        shape = self.predictor_layer_shape
-        num_tokens, hidden_size = token_embeds.shape[1:]
-        rows = batch_size * num_tokens
-        end = cache_len + num_tokens
-        hidden = token_embeds.reshape(rows, hidden_size)
-        residual = self.predictor_residual[:rows]
-        q_out = self.predictor_q_buffer[:rows]
-        activated = self.predictor_activated[:rows]
-        for layer_idx, layer in enumerate(self.code_predictor.model.layers):
-            attention = layer.self_attn
-            layer_k_cache = self.predictor_k_cache[layer_idx, :batch_size]
-            layer_v_cache = self.predictor_v_cache[layer_idx, :batch_size]
-            attention_inputs(
-                x=hidden,
-                tokens_per_row=num_tokens,
-                norm=layer.input_layernorm,
-                attention=attention,
-                q_out=q_out,
-                positions=positions,
-                k_cache=layer_k_cache,
-                v_cache=layer_v_cache,
-                partials=self.predictor_partials,
-                sum_sq_partials=self.predictor_sum_sq_partials,
-                counters=self.predictor_tile_counters,
-                shape=shape,
-            )
-            attention_output = predictor_gqa_attention(
-                q_out.view(
-                    batch_size, num_tokens, shape.num_q_heads, shape.head_dim
-                ).transpose(1, 2),
-                layer_k_cache[:, :end].transpose(1, 2),
-                layer_v_cache[:, :end].transpose(1, 2),
-                num_heads=shape.num_q_heads,
-                num_key_value_heads=shape.num_kv_heads,
-                is_causal=num_tokens > 1,
-            )
-            # note (ratish): rounds the projection before the residual add, where the
-            # plain path's addmm rounds once.
-            o_proj_add(
-                attention_output=attention_output,
-                tokens_per_row=num_tokens,
-                weight=attention.o_proj.weight,
-                residual_in=hidden,
-                residual_out=residual,
-                partials=self.predictor_partials,
-                counters=self.predictor_tile_counters,
-                shape=shape,
-            )
-            hidden = residual
-            mlp_up(
-                residual=residual,
-                norm=layer.post_attention_layernorm,
-                weight=layer.mlp.gate_up_proj.weight,
-                activated=activated,
-                shape=shape,
-            )
-            down_add(
-                activated=activated,
-                weight=layer.mlp.down_proj.weight,
-                residual=residual,
-                partials=self.predictor_partials,
-                counters=self.predictor_tile_counters,
-                shape=shape,
-            )
-        normed = self.code_predictor.model.norm(residual)
         return normed.reshape(batch_size, num_tokens, hidden_size)
 
     @staticmethod

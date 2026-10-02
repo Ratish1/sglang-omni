@@ -30,11 +30,8 @@ from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from torch import nn
 
 import sglang_omni.models.qwen3_tts.sglang_model as sglang_model_module
-from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
-    allocate_split_scratch,
-    resolve_predictor_layer_shape,
-)
 from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+from sglang_omni.utils.predictor_layers import resolve_fused_predictor_layers
 from sglang_omni.vendor.sglang.layers import RMSNorm
 from sglang_omni.vendor.sglang.models import apply_qk_norm
 
@@ -139,7 +136,7 @@ def build_talker(device: torch.device) -> Qwen3TTSTalker:
         talker.predictor_k_cache.device
     )
     talker.predictor_rope_stores_kv = False
-    talker.predictor_layer_shape = None
+    talker.predictor_fused_layers = None
     talker.output_codes = torch.zeros(
         MAX_BS, NUM_CODE_GROUPS, dtype=torch.long, device=device
     )
@@ -2205,28 +2202,12 @@ def real_shape_talker(
         model=SimpleNamespace(layers=layers, norm=final_norm)
     )
     if fused:
-        shape = resolve_predictor_layer_shape(
-            talker.code_predictor, FUSED_PREDICTOR_LEN, device
+        talker.predictor_fused_layers = resolve_fused_predictor_layers(
+            talker.code_predictor, FUSED_PREDICTOR_LEN, FUSED_MAX_BS, device, DTYPE
         )
-        assert shape is not None
-        rows = 2 * FUSED_MAX_BS
-        talker.predictor_layer_shape = shape
-        talker.predictor_q_buffer = torch.zeros(
-            rows, FUSED_NUM_HEADS * FUSED_HEAD_DIM, device=device, dtype=DTYPE
-        )
-        talker.predictor_residual = torch.zeros(
-            rows, FUSED_HIDDEN, device=device, dtype=DTYPE
-        )
-        talker.predictor_activated = torch.zeros(
-            rows, FUSED_INTERMEDIATE, device=device, dtype=DTYPE
-        )
-        (
-            talker.predictor_partials,
-            talker.predictor_sum_sq_partials,
-            talker.predictor_tile_counters,
-        ) = allocate_split_scratch(shape, rows, device)
+        assert talker.predictor_fused_layers is not None
     else:
-        talker.predictor_layer_shape = None
+        talker.predictor_fused_layers = None
     return talker
 
 
