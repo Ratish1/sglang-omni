@@ -61,7 +61,9 @@ def make_forward_batch(num_tokens: int, *, input_embeds=None) -> SimpleNamespace
 
 def make_runner(dtype: torch.dtype = torch.float32) -> QwenTalkerModelRunner:
     runner = object.__new__(QwenTalkerModelRunner)
-    runner.model = SimpleNamespace(activation_dtype=dtype)
+    runner.model = SimpleNamespace(
+        activation_dtype=dtype, forget_decode_rows=lambda request_ids: None
+    )
     return runner
 
 

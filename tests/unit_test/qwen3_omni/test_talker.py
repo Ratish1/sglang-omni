@@ -62,7 +62,9 @@ def make_sched_req(**data_kwargs: object) -> SimpleNamespace:
 def prefill_runner() -> QwenTalkerModelRunner:
     """Runner stub for prefill paths, which read the model's activation dtype."""
     runner = object.__new__(QwenTalkerModelRunner)
-    runner.model = SimpleNamespace(activation_dtype=torch.float32)
+    runner.model = SimpleNamespace(
+        activation_dtype=torch.float32, forget_decode_rows=lambda request_ids: None
+    )
     return runner
 
 
