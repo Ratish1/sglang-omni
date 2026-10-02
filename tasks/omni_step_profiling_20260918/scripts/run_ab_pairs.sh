@@ -34,7 +34,7 @@ boot() {
   apps=$!
   began=$(date +%s)
   (cd "$tree" && setsid bash -c "echo \$\$ > $d/server.pgid; exec env CUDA_VISIBLE_DEVICES=$card \
-    PYTHONPATH=$tree $PY -u -m sglang_omni.cli serve --model-path $MODEL --port $port $SERVE_ARGS" \
+    PYTHONPATH=$tree $PY -u -m sglang_omni.cli serve --model-path $MODEL --host 127.0.0.1 --port $port $SERVE_ARGS" \
     > "$d/serve.log" 2>&1 &)
   healthy=0
   for _ in $(seq 360); do
