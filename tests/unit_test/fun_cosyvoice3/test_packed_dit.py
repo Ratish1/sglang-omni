@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang_omni.models.fun_cosyvoice3 import prefix_cache
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     PackedDiT,
     RaggedRowAttention,
@@ -19,10 +18,6 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     rotated,
     scatter_rows,
     solve_flow_euler_packed,
-)
-from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
-    CONV_CONTEXT_FRAMES,
-    forward_prefix,
 )
 from sglang_omni.models.fun_cosyvoice3.stages import solve_flow_euler
 
@@ -201,153 +196,6 @@ def test_packed_forward_matches_the_padded_dit_per_row(streaming: bool) -> None:
 
 
 @pytest.mark.parametrize("streaming", [True, False])
-def test_packed_fused_qkv_matches_unfused_eager(streaming: bool) -> None:
-    dit = tiny_dit()
-    padded = padded_inputs()
-    packed = packed_inputs(padded)
-    estimator = PackedDiT(dit, device=CPU)
-
-    with torch.inference_mode():
-        unfused = estimator.forward(
-            packed["x"],
-            packed["mu"],
-            packed["spks"],
-            packed["cond"],
-            packed["t"],
-            packed["rows"],
-            estimator.row_attention(
-                packed["rows"], streaming=streaming, dtype=packed["x"].dtype
-            ),
-            estimator.rope(packed["rows"]),
-        )
-        estimator.materialize_fused_qkv()
-        assert not estimator.is_compiled
-        assert all(weight is not None for weight in estimator.qkv_weights)
-        fused = estimator.forward(
-            packed["x"],
-            packed["mu"],
-            packed["spks"],
-            packed["cond"],
-            packed["t"],
-            packed["rows"],
-            estimator.row_attention(
-                packed["rows"], streaming=streaming, dtype=packed["x"].dtype
-            ),
-            estimator.rope(packed["rows"]),
-        )
-
-    torch.testing.assert_close(fused, unfused, rtol=1e-9, atol=1e-9)
-
-
-@pytest.mark.parametrize(
-    ("compiling", "expected_fused_parts", "expected_value_calls"),
-    [(False, 3, 0), (True, 2, 1)],
-)
-def test_prefix_projection_policy_matches_execution_mode(
-    monkeypatch: pytest.MonkeyPatch,
-    compiling: bool,
-    expected_fused_parts: int,
-    expected_value_calls: int,
-) -> None:
-    estimator = PackedDiT(tiny_dit(), device=CPU)
-    estimator.materialize_fused_qkv()
-    attention_module = estimator.dit.transformer_blocks[0].attn
-    value_projection_inputs: list[torch.Tensor] = []
-    original_value_projection = attention_module.to_v.forward
-
-    def record_value_projection(value_input: torch.Tensor) -> torch.Tensor:
-        value_projection_inputs.append(value_input)
-        return original_value_projection(value_input)
-
-    monkeypatch.setattr(attention_module.to_v, "forward", record_value_projection)
-    qkv_weight = estimator.qkv_weights[0]
-    qkv_bias = estimator.qkv_biases[0]
-    assert qkv_weight is not None
-    fused_projection_calls: list[tuple[torch.Tensor, torch.Tensor | None]] = []
-    original_linear = prefix_cache.F.linear
-
-    def record_fused_projection(
-        input_tensor: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if weight.data_ptr() == qkv_weight.data_ptr():
-            fused_projection_calls.append((weight, bias))
-        else:
-            pass
-        return original_linear(input_tensor, weight, bias)
-
-    monkeypatch.setattr(prefix_cache.F, "linear", record_fused_projection)
-
-    def is_compiling() -> bool:
-        return compiling
-
-    monkeypatch.setattr(torch.compiler, "is_compiling", is_compiling)
-    rows = pack_rows((2,), CPU)
-    hidden_size = int(estimator.dit.input_embed.proj.out_features)
-    x = torch.randn(1, rows.total, CHANNELS, dtype=torch.float64)
-    mu = torch.randn(1, rows.total, CHANNELS, dtype=torch.float64)
-    speaker_embeddings = torch.randn(1, rows.total, SPEAKER, dtype=torch.float64)
-    mel_conditioning = torch.randn(1, rows.total, CHANNELS, dtype=torch.float64)
-    t = torch.full((1,), 0.37, dtype=torch.float64)
-
-    def identity_attention(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        key_pool: torch.Tensor,
-        value_pool: torch.Tensor,
-        head_num: int,
-        head_dim: int,
-    ) -> torch.Tensor:
-        del key, value, key_pool, value_pool, head_num, head_dim
-        return query
-
-    identity_attention.slots = torch.tensor([[0, 1]])
-    identity_attention.tail_index = torch.arange(2, 2 + CONV_CONTEXT_FRAMES).unsqueeze(
-        0
-    )
-    rope = estimator.rope(rows)
-    contexts = torch.zeros(1, CONV_CONTEXT_FRAMES, hidden_size, dtype=torch.float64)
-    layer_count = len(estimator.dit.transformer_blocks)
-    keys = [torch.empty(1) for _ in range(layer_count)]
-    values = [torch.empty(1) for _ in range(layer_count)]
-
-    with torch.inference_mode():
-        output, _, _ = forward_prefix(
-            estimator,
-            keys,
-            values,
-            x,
-            mu,
-            speaker_embeddings,
-            mel_conditioning,
-            t,
-            rows,
-            identity_attention,
-            rope,
-            contexts,
-            contexts,
-        )
-
-    assert output.shape == (1, rows.total, CHANNELS)
-    assert len(value_projection_inputs) == expected_value_calls
-    assert len(fused_projection_calls) == 1
-    recorded_weight, recorded_bias = fused_projection_calls[0]
-    assert recorded_weight.data_ptr() == qkv_weight.data_ptr()
-    assert recorded_weight.shape[0] == expected_fused_parts * attention_module.inner_dim
-    assert recorded_weight.shape[1:] == qkv_weight.shape[1:]
-    if qkv_bias is None:
-        assert recorded_bias is None
-    else:
-        assert recorded_bias is not None
-        assert recorded_bias.data_ptr() == qkv_bias.data_ptr()
-        assert recorded_bias.shape == (
-            expected_fused_parts * attention_module.inner_dim,
-        )
-
-
-@pytest.mark.parametrize("streaming", [True, False])
 def test_packed_solve_matches_the_padded_solve_per_row(streaming: bool) -> None:
     dit = tiny_dit()
     padded = padded_inputs()
@@ -406,13 +254,8 @@ def test_packed_compile_requires_ragged_half_precision(monkeypatch) -> None:
     estimator.is_ragged = True
     assert not estimator.compile(torch.float32)
     assert compile_options == []
-    estimator.materialize_fused_qkv()
-    fused_weights = estimator.qkv_weights
-    fused_biases = estimator.qkv_biases
     assert estimator.compile(torch.bfloat16)
     assert estimator.is_compiled
-    assert estimator.qkv_weights is fused_weights
-    assert estimator.qkv_biases is fused_biases
     assert compile_options == [
         {
             "backend": "inductor",

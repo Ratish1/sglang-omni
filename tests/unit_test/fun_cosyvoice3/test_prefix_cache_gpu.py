@@ -34,7 +34,7 @@ HEADS, HEAD_DIM, LAYERS = 4, 32, 3
 COMPILED_OVER_EAGER_ERROR = 2.0
 
 
-def make_estimator(*, materialize_qkv: bool = False) -> PackedDiT:
+def make_estimator() -> PackedDiT:
     torch.manual_seed(0)
     dit = (
         cosyvoice_dit.DiT(
@@ -74,73 +74,7 @@ def make_estimator(*, materialize_qkv: bool = False) -> PackedDiT:
         pytest.skip("requires FA3")
     else:
         pass
-    if materialize_qkv:
-        estimator.materialize_fused_qkv()
-    else:
-        pass
     return estimator
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_prefix_fused_qkv_matches_unfused_eager() -> None:
-    unfused_estimator = make_estimator()
-    fused_estimator = make_estimator(materialize_qkv=True)
-    assert not fused_estimator.is_compiled
-    assert all(weight is not None for weight in fused_estimator.qkv_weights)
-
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    new_frames = [70, 80]
-    total_new_frames = sum(new_frames)
-    torch.manual_seed(1)
-    noise = torch.randn(1, total_new_frames, CHANNELS, device=device, dtype=dtype)
-    mu = torch.randn_like(noise)
-    mel_conditioning = torch.randn_like(noise)
-    speaker_embeddings = torch.randn(
-        len(new_frames), CHANNELS, device=device, dtype=dtype
-    )
-    unit = torch.linspace(0, 1, 11, device=device, dtype=dtype)
-    time_span = 1 - torch.cos(unit * 0.5 * torch.pi)
-
-    def run(
-        estimator: PackedDiT,
-    ) -> tuple[torch.Tensor, list[tuple[PrefixCacheRow, PrefixCacheRow]]]:
-        pool = PrefixKVPool(
-            layer_num=LAYERS,
-            euler_steps=10,
-            head_num=HEADS,
-            head_dim=HEAD_DIM,
-            capacity_frames=32 * BLOCK_FRAMES,
-            device=device,
-            dtype=dtype,
-        )
-        caches = [(PrefixCacheRow(), PrefixCacheRow()) for _ in new_frames]
-        for pair in caches:
-            assert grow_rows(pool, list(pair), new_frames)
-        with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
-            output = solve_flow_euler_prefix(
-                estimator,
-                pool,
-                noise,
-                time_span,
-                mu,
-                speaker_embeddings,
-                mel_conditioning,
-                new_frames,
-                caches,
-                cfg_rate=0.7,
-            )
-        return output, caches
-
-    unfused_output, unfused_caches = run(unfused_estimator)
-    fused_output, fused_caches = run(fused_estimator)
-
-    assert unfused_output.shape == fused_output.shape
-    assert torch.isfinite(fused_output).all()
-    torch.testing.assert_close(fused_output, unfused_output, rtol=2e-2, atol=2e-2)
-    assert [
-        (row.blocks, row.committed_frames) for pair in unfused_caches for row in pair
-    ] == [(row.blocks, row.committed_frames) for pair in fused_caches for row in pair]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -228,8 +162,7 @@ def test_compiled_prefix_hops_follow_each_row_across_batches() -> None:
     one joining fresh beside a cached one and the order flipped on a later hop,
     stay as close to each row's float32 whole-history solve as its bf16 eager
     solve is."""
-    estimator = make_estimator(materialize_qkv=True)
-    assert all(weight is not None for weight in estimator.qkv_weights)
+    estimator = make_estimator()
     reference_estimator = PackedDiT(copy.deepcopy(estimator.dit).float(), device="cuda")
     device = torch.device("cuda")
     dtype = torch.bfloat16

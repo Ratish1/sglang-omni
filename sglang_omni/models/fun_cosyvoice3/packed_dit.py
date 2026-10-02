@@ -254,9 +254,37 @@ class PackedDiT:
         device = torch.device(device)
         self.is_ragged = device.type == "cuda" and _is_fa3_supported()
         self.is_compiled = False
-        blocks = len(self.dit.transformer_blocks)
-        self.qkv_weights: tuple[torch.Tensor | None, ...] = (None,) * blocks
-        self.qkv_biases: tuple[torch.Tensor | None, ...] = (None,) * blocks
+        # note (ratish): Parameters, whose shapes Dynamo keeps static under the dynamic
+        # prefix compile. to_q, to_k and to_v become row views of them, so the DiT
+        # must already hold its serving dtype.
+        qkv_weights: list[torch.nn.Parameter] = []
+        qkv_biases: list[torch.nn.Parameter] = []
+        with torch.no_grad():
+            for block in dit.transformer_blocks:
+                attention = block.attn
+                projections = (attention.to_q, attention.to_k, attention.to_v)
+                qkv_weight = torch.nn.Parameter(
+                    torch.cat([projection.weight for projection in projections]),
+                    requires_grad=False,
+                )
+                qkv_bias = torch.nn.Parameter(
+                    torch.cat([projection.bias for projection in projections]),
+                    requires_grad=False,
+                )
+                for index, projection in enumerate(projections):
+                    rows = slice(
+                        index * attention.inner_dim, (index + 1) * attention.inner_dim
+                    )
+                    projection.weight = torch.nn.Parameter(
+                        qkv_weight[rows], requires_grad=False
+                    )
+                    projection.bias = torch.nn.Parameter(
+                        qkv_bias[rows], requires_grad=False
+                    )
+                qkv_weights.append(qkv_weight)
+                qkv_biases.append(qkv_bias)
+        self.qkv_weights = tuple(qkv_weights)
+        self.qkv_biases = tuple(qkv_biases)
         logger.info(
             "Fun-CosyVoice3 Flow row attention on %s: %s",
             device,
@@ -293,50 +321,6 @@ class PackedDiT:
         else:
             pass
         return RowAttention(rows, chunk_size=chunk_size, heads=attention.heads)
-
-    def materialize_fused_qkv(self) -> None:
-        fused_weights: list[torch.Tensor] = []
-        fused_biases: list[torch.Tensor | None] = []
-        fused_bytes = 0
-        with torch.no_grad():
-            for block in self.dit.transformer_blocks:
-                attn = block.attn
-                qkv_weight = torch.cat(
-                    (
-                        attn.to_q.weight,
-                        attn.to_k.weight,
-                        attn.to_v.weight,
-                    ),
-                    dim=0,
-                )
-                if attn.to_q.bias is None:
-                    qkv_bias = None
-                else:
-                    assert attn.to_k.bias is not None
-                    assert attn.to_v.bias is not None
-                    qkv_bias = torch.cat(
-                        (
-                            attn.to_q.bias,
-                            attn.to_k.bias,
-                            attn.to_v.bias,
-                        ),
-                        dim=0,
-                    )
-
-                fused_weights.append(qkv_weight)
-                fused_biases.append(qkv_bias)
-                fused_bytes += qkv_weight.nbytes
-                if qkv_bias is not None:
-                    fused_bytes += qkv_bias.nbytes
-                else:
-                    pass
-
-        self.qkv_weights = tuple(fused_weights)
-        self.qkv_biases = tuple(fused_biases)
-        logger.info(
-            f"Materialized PackedDiT fused QKV weights+biases for "
-            f"{len(self.qkv_weights)} blocks ({fused_bytes / (1024 * 1024):.1f} MiB)"
-        )
 
     def compile(self, dtype: torch.dtype | None) -> bool:
         if not self.is_ragged or dtype not in FA3_DTYPES:
@@ -418,19 +402,10 @@ class PackedDiT:
         x: torch.Tensor,
         rope: tuple[torch.Tensor, torch.Tensor],
         attention: PackedRowAttention,
-        qkv_weight: torch.Tensor | None,
-        qkv_bias: torch.Tensor | None,
+        qkv_weight: torch.Tensor,
+        qkv_bias: torch.Tensor,
     ) -> torch.Tensor:
-        if qkv_weight is None:
-            # note (ratish): under autocast to_q, to_k and to_v would each cast the
-            # float32 norm output again.
-            x = x.to(attn.to_q.weight.dtype)
-            query = attn.to_q(x)
-            key = attn.to_k(x)
-            value = attn.to_v(x)
-        else:
-            x = x.to(qkv_weight.dtype)
-            query, key, value = F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
+        query, key, value = F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
         if torch.compiler.is_compiling():
             query = rotated(query, *rope)
             key = rotated(key, *rope)

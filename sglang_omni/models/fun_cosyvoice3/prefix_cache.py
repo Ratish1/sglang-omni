@@ -365,30 +365,9 @@ def forward_prefix(
             hidden_states, emb=t
         )
         attn = block.attn
-        qkv_weight = estimator.qkv_weights[layer]
-        qkv_bias = estimator.qkv_biases[layer]
-        if qkv_weight is None:
-            normed = norm.to(attn.to_q.weight.dtype)
-            query = attn.to_q(normed)
-            key = attn.to_k(normed)
-            value = attn.to_v(normed)
-        else:
-            normed = norm.to(qkv_weight.dtype)
-            if torch.compiler.is_compiling():
-                # note(chenye): compiled prefix graphs use fused QK and a separate V projection.
-                query_key_size = 2 * attn.inner_dim
-                query_key_bias = None if qkv_bias is None else qkv_bias[:query_key_size]
-                query, key = F.linear(
-                    normed,
-                    qkv_weight[:query_key_size],
-                    query_key_bias,
-                ).chunk(2, dim=-1)
-                value = attn.to_v(normed)
-            else:
-                # note(chenye): uncompiled prefix graphs use fused QKV projection.
-                query, key, value = F.linear(normed, qkv_weight, qkv_bias).chunk(
-                    3, dim=-1
-                )
+        query, key, value = F.linear(
+            norm, estimator.qkv_weights[layer], estimator.qkv_biases[layer]
+        ).chunk(3, dim=-1)
         if torch.compiler.is_compiling():
             query = rotated(query, *rope)
             key = rotated(key, *rope)
