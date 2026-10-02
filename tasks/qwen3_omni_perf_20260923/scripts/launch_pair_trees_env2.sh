@@ -29,10 +29,21 @@ else
   pin() { case $1 in 0) echo "0-7,64-71 0";; 1) echo "8-15,72-79 0";; 2) echo "16-23,80-87 0";; 3) echo "24-31,88-95 0";; esac; }
 fi
 bp=$(pin $BC); ap=$(pin $AC)
-setsid env PIN_CPUS=${bp% *} PIN_NODE=${bp#* } ${12:+MAX_SAMPLES=${12}} EXTRA_SERVE_ARGS="$BEXTRA" \
-  bash $S/run_bench_boot.sh $BT $R/base_c$BC $BC $((PORT_BASE + BC * PORT_STEP)) $DTYPE $CONC "$ARM" > $R/base_c$BC.boot.log 2>&1 < /dev/null &
-echo "base_c$BC pgid $!" >> $R/launch.txt
-setsid env PIN_CPUS=${ap% *} PIN_NODE=${ap#* } ${12:+MAX_SAMPLES=${12}} EXTRA_SERVE_ARGS="$AEXTRA" \
-  bash $S/run_bench_boot.sh $AT $R/${AN}_c$AC $AC $((PORT_BASE + AC * PORT_STEP)) $DTYPE $CONC "$ARM" > $R/${AN}_c$AC.boot.log 2>&1 < /dev/null &
-echo "${AN}_c$AC pgid $!" >> $R/launch.txt
+launch_base() {
+  setsid env PIN_CPUS=${bp% *} PIN_NODE=${bp#* } ${12:+MAX_SAMPLES=${12}} EXTRA_SERVE_ARGS="$BEXTRA" \
+    bash $S/run_bench_boot.sh $BT $R/base_c$BC $BC $((PORT_BASE + BC * PORT_STEP)) $DTYPE $CONC "$ARM" > $R/base_c$BC.boot.log 2>&1 < /dev/null &
+  echo "base_c$BC pgid $!" >> $R/launch.txt
+}
+launch_arm() {
+  setsid env PIN_CPUS=${ap% *} PIN_NODE=${ap#* } ${12:+MAX_SAMPLES=${12}} EXTRA_SERVE_ARGS="$AEXTRA" \
+    bash $S/run_bench_boot.sh $AT $R/${AN}_c$AC $AC $((PORT_BASE + AC * PORT_STEP)) $DTYPE $CONC "$ARM" > $R/${AN}_c$AC.boot.log 2>&1 < /dev/null &
+  echo "${AN}_c$AC pgid $!" >> $R/launch.txt
+}
+# LAUNCH_ORDER=arm_first starts the arm's boot before the base's (the A/A launch-order check)
+if [ "${LAUNCH_ORDER:-base_first}" = arm_first ]; then
+  launch_arm "$@"; launch_base "$@"
+else
+  launch_base "$@"; launch_arm "$@"
+fi
+echo "launch order ${LAUNCH_ORDER:-base_first}" >> $R/launch.txt
 sleep 2; cat $R/launch.txt $R/base_head.txt $R/arm_head.txt
