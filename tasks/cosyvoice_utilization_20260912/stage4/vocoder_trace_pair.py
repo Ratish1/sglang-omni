@@ -39,6 +39,8 @@ CASES = {
     "final16": ("final", 16, 100),
     "buffered_small": ("buffered", 1, 416 // 2 - PROMPT_TOKENS),
     "buffered_large": ("buffered", 16, 576 // 2 - PROMPT_TOKENS),
+    "buffered_miss8": ("buffered", 8, 80),
+    "buffered_miss2": ("buffered", 2, 400),
     "hift_short": ("hift", 1, 56),
     "hift_long": ("hift", 1, 800),
 }
