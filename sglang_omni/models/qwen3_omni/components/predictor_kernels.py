@@ -13,14 +13,13 @@ to qkv, norms and rotates q and k, writes q to a buffer and k and v into the row
 slots. o_proj_add and down_add multiply by the projection and add the residual. mlp_up
 norms the residual, projects it to gate and up and applies silu(gate) * up. Every bf16
 rounding sits where Qwen3-Omni's plain path rounds. Qwen3-TTS's plain path rounds later
-at two boundaries: its o_proj adds the residual before its one rounding, and its
-add-norm after down normalizes the fp32 sum of the residual and the projection while
-storing the sum in bf16, where the fused path normalizes the stored bf16 residual.
-Beyond those roundings, what differs is the GEMMs' fp32 accumulation order (K blocks on
-the tensor cores, fp32 split partials summed in index order, so deterministic), the
-norm's row scale applied to the accumulated product instead of to the input, and
-libdevice's exp in the activation. Rows never mix, so a row's result does not depend on
-the batch.
+at two boundaries: its o_proj adds the residual before its one rounding, and its add-norm
+after down normalizes the fp32 sum of the residual and the projection while storing the
+sum in bf16, where the fused path normalizes the stored bf16 residual. Beyond those
+roundings, what differs is the GEMMs' fp32 accumulation order (K blocks on the tensor
+cores, fp32 split partials summed in index order, so deterministic), the norm's row scale
+applied to the accumulated product instead of to the input, and libdevice's exp in the
+activation. Rows never mix, so a row's result does not depend on the batch.
 
 One program covers a launch's rows, so the launch reads each weight once, as the GEMM it
 replaces does. FusedPredictorLayers owns the launches' buffers, runs the layer loop, and
@@ -64,8 +63,8 @@ BLOCK_N = 32
 # per-block cost of the norm scale small.
 MLP_BLOCK_K = 256
 MIN_BLOCK_M = 16
-# note (ratish): a qkv program holds (rows^2 + rows * head_dim) / 128 fp32 accumulators
-# per thread: 96 registers at 64 rows, 256 at 128, past the 255 a thread can address.
+# note (ratish): above 64 rows the qkv launch's fp32 accumulators, the rows' square and
+# their head, exceed 255 registers per thread; a second program rereads the weights.
 MAX_FUSED_ROWS = 64
 NUM_WARPS = 4
 NUM_STAGES = 3
@@ -516,9 +515,8 @@ def resolve_predictor_layer_shape(
     mlp = layers[0].mlp
     hidden_size = attention.hidden_size
     intermediate_size = mlp.down_proj.weight.shape[1]
-    # note (ratish): the row bound and the launches' resources hold for a 128-wide head.
     dims_divide = (
-        attention.head_dim == BLOCK_K
+        attention.head_dim % BLOCK_K == 0
         and hidden_size % BLOCK_K == 0
         and hidden_size % BLOCK_N == 0
         and hidden_size % MLP_BLOCK_K == 0

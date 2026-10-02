@@ -351,33 +351,23 @@ def test_fused_layer_is_deterministic_and_batch_invariant() -> None:
 @accelerator
 @pytest.mark.accelerator
 @pytest.mark.usefixtures("published_server_args")
-def test_the_opening_pair_runs_fused_up_to_the_fused_rows() -> None:
-    device = torch.device("cuda")
-    talker = fuse(build_talker(device, seed=21))
-    fused = talker.predictor_fused_layers
-    for batch_size, runs_fused in (
-        (MAX_FUSED_ROWS // 2, True),
-        (MAX_FUSED_ROWS // 2 + 1, False),
-    ):
-        fused.residual.fill_(7.0)
-        run_sequence(talker, predictor_inputs(device, batch_size, seed=22)[:1])
-        assert bool(torch.all(fused.residual == 7.0)) is not runs_fused
-
-
-@accelerator
-@pytest.mark.accelerator
-@pytest.mark.usefixtures("published_server_args")
-def test_passes_beyond_the_fused_rows_run_the_plain_path_bit_for_bit() -> None:
+def test_a_pass_runs_fused_up_to_the_fused_rows_and_plain_above() -> None:
+    """A pass above MAX_FUSED_ROWS rows, the opening pair or a single token, must equal
+    the plain path bit for bit; a pass of exactly MAX_FUSED_ROWS rows runs fused."""
     device = torch.device("cuda")
     batch_size = MAX_FUSED_ROWS + 1
-    steps = predictor_inputs(device, batch_size, seed=24)
-    plain_talker = build_talker(device, seed=23, max_bs=batch_size)
-    fused_talker = fuse(build_talker(device, seed=23, max_bs=batch_size))
+    plain_talker = build_talker(device, seed=21, max_bs=batch_size)
+    fused_talker = fuse(build_talker(device, seed=21, max_bs=batch_size))
+    steps = predictor_inputs(device, batch_size, seed=22)
     plain = run_sequence(plain_talker, steps)
     fused = run_sequence(fused_talker, steps)
     assert all(torch.equal(a, b) for a, b in zip(plain, fused))
     assert torch.equal(plain_talker.predictor_k_cache, fused_talker.predictor_k_cache)
     assert torch.equal(plain_talker.predictor_v_cache, fused_talker.predictor_v_cache)
+    pair = [steps[0][: MAX_FUSED_ROWS // 2]]
+    assert not torch.equal(
+        run_sequence(plain_talker, pair)[0], run_sequence(fused_talker, pair)[0]
+    )
 
 
 @accelerator
@@ -446,19 +436,6 @@ def test_resolver_keeps_the_plain_path_for_a_quantized_projection() -> None:
     device = torch.device("cuda")
     talker = build_talker(device, seed=12)
     talker.code_predictor.model.layers[2].mlp.down_proj.quant_method = SimpleNamespace()
-    assert (
-        resolve_predictor_layer_shape(talker.code_predictor, PREDICTOR_LEN, device)
-        is None
-    )
-
-
-@accelerator
-@pytest.mark.accelerator
-def test_resolver_keeps_the_plain_path_for_a_wider_head() -> None:
-    device = torch.device("cuda")
-    talker = build_talker(device, seed=12)
-    assert resolve_predictor_layer_shape(talker.code_predictor, PREDICTOR_LEN, device)
-    talker.code_predictor.model.layers[0].self_attn.head_dim = 2 * HEAD_DIM
     assert (
         resolve_predictor_layer_shape(talker.code_predictor, PREDICTOR_LEN, device)
         is None
