@@ -210,11 +210,60 @@ def kernel_count(fn) -> int:
     )
 
 
+def compiled_arm(args) -> None:
+    device = torch.device("cuda")
+    transformer = load_qwen3_tts_tokenizer(
+        MODEL, device="cuda", dtype="bfloat16", attn_implementation=None
+    ).model.decoder.pre_transformer.eval()
+    fused = FusedTransformer(transformer)
+    compiled = torch.compile(
+        lambda x, keys, values, positions: current_call(
+            transformer, x, keys, values, positions
+        ),
+        dynamic=False,
+        fullgraph=True,
+    )
+    print(f"{'width':>5} {'rows':>4} {'compiled us':>12} {'fused us':>9}")
+    with torch.inference_mode():
+        for width in args.widths:
+            for rows in args.rows:
+                generator = torch.Generator(device=device).manual_seed(
+                    width * 100 + rows
+                )
+                keys, values, positions = warm_state(
+                    transformer, rows, torch.bfloat16, device, generator
+                )
+                x = torch.randn(
+                    rows,
+                    width,
+                    transformer.input_proj.in_features,
+                    device=device,
+                    generator=generator,
+                ).to(torch.bfloat16)
+                compiled_us = graph_time(lambda: compiled(x, keys, values, positions))
+                fused_us = graph_time(lambda: fused(x, keys, values, positions))
+                print(
+                    f"{width:>5} {rows:>4} {compiled_us:>12.1f} {fused_us:>9.1f}",
+                    flush=True,
+                )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--widths", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4, 8, 16])
+    parser.add_argument(
+        "--compiled",
+        action="store_true",
+        help="time today's path under torch.compile(dynamic=False, fullgraph=True), as "
+        "the decoder's precompile builds it, instead of the eager and fused arms",
+    )
     args = parser.parse_args()
+    if args.compiled:
+        compiled_arm(args)
+        return
+    else:
+        pass
     device = torch.device("cuda")
     tokenizer = load_qwen3_tts_tokenizer(
         MODEL, device="cuda", dtype="bfloat16", attn_implementation=None
