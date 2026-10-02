@@ -2,10 +2,11 @@
 the importable one.
 
 Builds two code2wav models from the real Qwen3-Omni code2wav config with one seeded set
-of weights, runs use_channels_last on each (old code on one, new on the other) and, as
-serving does, then fuses the decoder's SnakeBeta, checks
-the conv weights are equal with equal strides, then runs both channels-last forwards on
-the same codes, with the HF SnakeBeta and with the fused one, and checks torch.equal.
+of weights, runs use_channels_last on each (old code on one, new on the other), checks the
+conv weights are equal with equal strides, then runs both channels-last forwards on the
+same codes and checks torch.equal. Two builds: the HF pre-transformer and SnakeBeta, and
+serving's, which since #2466 also swaps in the fused pre-transformer when the module has
+one, then fuses the decoder's SnakeBeta.
 
 usage: python code2wav_refactor_identity.py OLD_FILE
 """
@@ -19,6 +20,7 @@ import torch
 from transformers import AutoConfig
 
 from sglang_omni.models.qwen3_omni.components import code2wav as new_code2wav
+from sglang_omni.platforms import current_platform
 from sglang_omni.utils.snake_beta import fuse_vocoder_decoder
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -39,6 +41,12 @@ def build(module, config, state_dict, fused: bool):
     model = model.to("cuda", torch.bfloat16).eval()
     model.use_channels_last()
     if fused:
+        if hasattr(model, "use_fused_transformer"):
+            model.use_fused_transformer(
+                current_platform.get_joint_rope_inplace_kernel()
+            )
+        else:
+            pass
         fuse_vocoder_decoder(model.decoder)
     else:
         pass
@@ -64,7 +72,9 @@ def main() -> None:
             if isinstance(old, (torch.nn.Conv1d, torch.nn.ConvTranspose1d))
         )
         print(
-            f"fused snake {fused}: conv weights equal with equal strides {weights_equal}"
+            f"serving build {fused} (fused transformer "
+            f"{type(new_model.pre_transformer).__name__}): conv weights equal with "
+            f"equal strides {weights_equal}"
         )
         for batch, frames in SHAPES:
             codes = torch.randint(
