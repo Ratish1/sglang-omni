@@ -26,21 +26,23 @@ from sglang_omni.models.fun_cosyvoice3.stages import FlowBatchInput
 sys.path.insert(0, str(Path.cwd() / ".claude/skills/omni-gpu-deep-dive/scripts"))
 PROMPT_TOKENS = 75
 LOOKAHEAD = 3
-ROWS = 16
-# (path, cached tokens before the hop, hop tokens): the first three hops of the default
-# plan (25, 50, 100), each on the cache and as the whole-history hop
+# (path, cached tokens before the hop, hop tokens, rows): the first three hops of the
+# default plan (25, 50, 100), each on the cache and as the whole-history hop, at the
+# largest step (16 rows), and hop 2 on the cache at 1 and 4 rows for the per step floor
 CASES = {
-    "prefix_first": ("prefix", 0, 25),
-    "whole_first": ("whole", 0, 25),
-    "prefix_hop2": ("prefix", 25, 50),
-    "whole_hop2": ("whole", 25, 50),
-    "prefix_hop3": ("prefix", 75, 100),
-    "whole_hop3": ("whole", 75, 100),
+    "prefix_first": ("prefix", 0, 25, 16),
+    "whole_first": ("whole", 0, 25, 16),
+    "prefix_hop2": ("prefix", 25, 50, 16),
+    "whole_hop2": ("whole", 25, 50, 16),
+    "prefix_hop3": ("prefix", 75, 100, 16),
+    "whole_hop3": ("whole", 75, 100, 16),
+    "prefix_hop2_r1": ("prefix", 25, 50, 1),
+    "prefix_hop2_r4": ("prefix", 25, 50, 4),
 }
 
 
-def make_streams(flow, total_tokens: int) -> list[dict]:
-    generator = torch.Generator().manual_seed(ROWS * 1000 + total_tokens)
+def make_streams(flow, total_tokens: int, rows: int) -> list[dict]:
+    generator = torch.Generator().manual_seed(rows * 1000 + total_tokens)
     return [
         dict(
             token=torch.randint(0, 6561, (1, total_tokens), generator=generator),
@@ -54,7 +56,7 @@ def make_streams(flow, total_tokens: int) -> list[dict]:
                 1, flow.spk_embed_affine_layer.in_features, generator=generator
             ),
         )
-        for _ in range(ROWS)
+        for _ in range(rows)
     ]
 
 
@@ -75,8 +77,8 @@ def frames_of(tokens: int) -> int:
 
 
 def case_body(vocoder, case: str):
-    path, offset, hop = CASES[case]
-    streams = make_streams(vocoder.flow, offset + hop + LOOKAHEAD)
+    path, offset, hop, rows = CASES[case]
+    streams = make_streams(vocoder.flow, offset + hop + LOOKAHEAD, rows)
     items = items_until(streams, offset + hop)
     caches: list = []
     if path == "whole":

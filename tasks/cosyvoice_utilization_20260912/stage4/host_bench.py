@@ -25,7 +25,13 @@ from vocoder_trace_pair import case_body as vocoder_case_body  # noqa: E402
 
 from sglang_omni.models.fun_cosyvoice3 import stages  # noqa: E402
 
-PREFIX_CASES = ("prefix_first", "prefix_hop2", "prefix_hop3")
+PREFIX_CASES = (
+    "prefix_first",
+    "prefix_hop2",
+    "prefix_hop3",
+    "prefix_hop2_r1",
+    "prefix_hop2_r4",
+)
 VOCODER_CASES = (
     "hop1",
     "hop16",
@@ -35,6 +41,10 @@ VOCODER_CASES = (
     "buffered_large",
     "buffered_miss8",
     "buffered_miss2",
+    "hiftstep_hop1",
+    "hiftstep_hop16",
+    "hiftstep_final1",
+    "hiftstep_final16",
 )
 
 
