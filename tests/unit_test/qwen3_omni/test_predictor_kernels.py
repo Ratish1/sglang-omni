@@ -364,10 +364,10 @@ def test_a_pass_runs_fused_up_to_the_fused_rows_and_plain_above() -> None:
     assert all(torch.equal(a, b) for a, b in zip(plain, fused))
     assert torch.equal(plain_talker.predictor_k_cache, fused_talker.predictor_k_cache)
     assert torch.equal(plain_talker.predictor_v_cache, fused_talker.predictor_v_cache)
-    pair = [steps[0][: MAX_FUSED_ROWS // 2]]
-    assert not torch.equal(
-        run_sequence(plain_talker, pair)[0], run_sequence(fused_talker, pair)[0]
-    )
+    residual = fused_talker.predictor_fused_layers.residual
+    residual.fill_(float("nan"))
+    run_sequence(fused_talker, [steps[0][: MAX_FUSED_ROWS // 2]])
+    assert not torch.any(torch.isnan(residual))
 
 
 @accelerator
