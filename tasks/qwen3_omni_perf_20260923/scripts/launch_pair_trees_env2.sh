@@ -1,7 +1,7 @@
 #!/bin/sh
 # Two trees, each arm with its own extra serve args. Usage:
 #   sh launch_pair_trees_env2.sh <out_root> <round> <base_tree> <arm_tree> <base_card> <arm_card> <arm_name> "<base extra args>" "<arm extra args>" <bench_arm> [conc] [MAX_SAMPLES]
-# DTYPE picks the config and the CPU pin map: h200 (default) or bf16 / fp8 on the H100 host,
+# DTYPE picks the config and the CPU pin map: h200 (default), h200text (thinker only) or bf16 / fp8 on the H100 host,
 # PIN_LAYOUT=numa1 the H200 map for cards that all sit on NUMA node 1,
 # whose four leased cards all sit on NUMA node 0 (CPUs 0-31,64-95).
 DTYPE=${DTYPE:-h200}
@@ -20,10 +20,10 @@ git -C $BT log --oneline -1 > $R/base_head.txt
 git -C $AT log --oneline -1 > $R/arm_head.txt
 echo "$BEXTRA" > $R/base_extra_args.txt
 echo "$AEXTRA" > $R/arm_extra_args.txt
-if [ "$DTYPE" = h200 ] && [ "${PIN_LAYOUT:-}" = numa1 ]; then
+if [ "${DTYPE%text}" = h200 ] && [ "${PIN_LAYOUT:-}" = numa1 ]; then
   # node-radixark-16-0001's leased cards 4 to 7: all on NUMA node 1 (CPUs 56-111,168-223)
   pin() { case $1 in 0) echo "56-69,168-181 1";; 1) echo "70-83,182-195 1";; 2) echo "84-97,196-209 1";; 3) echo "98-111,210-223 1";; esac; }
-elif [ "$DTYPE" = h200 ]; then
+elif [ "${DTYPE%text}" = h200 ]; then
   pin() { case $1 in 0) echo "0-13,112-125 0";; 1) echo "14-27,126-139 0";; 2) echo "28-41,140-153 0";; 3) echo "56-69,168-181 1";; esac; }
 else
   pin() { case $1 in 0) echo "0-7,64-71 0";; 1) echo "8-15,72-79 0";; 2) echo "16-23,80-87 0";; 3) echo "24-31,88-95 0";; esac; }
