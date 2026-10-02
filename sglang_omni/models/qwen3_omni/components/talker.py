@@ -1745,8 +1745,9 @@ class Qwen3OmniTalker(nn.Module):
                 "the predictor runs one token per row, or two at an empty cache: "
                 f"got seq_len={seq_len} at cache_len={cache_len}"
             )
-        if self.predictor_fused_layers is not None:
-            return self.predictor_fused_layers.forward(
+        fused = self.predictor_fused_layers
+        if fused is not None and fused.covers(batch_size * seq_len):
+            return fused.forward(
                 layers=self.code_predictor.model.layers,
                 final_norm=self.code_predictor.model.norm,
                 token_embeds=token_embeds,

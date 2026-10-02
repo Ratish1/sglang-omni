@@ -24,6 +24,7 @@ from torch import nn
 from sglang_omni.models.qwen3_omni.components import predictor_kernels
 from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
     HIDDEN_SIZE,
+    MAX_FUSED_ROWS,
     add_rmsnorm_rounded,
     resolve_fused_predictor_layers,
     resolve_predictor_layer_shape,
@@ -107,7 +108,9 @@ def build_layer(device: torch.device) -> SimpleNamespace:
     )
 
 
-def build_talker(device: torch.device, seed: int) -> Qwen3OmniTalker:
+def build_talker(
+    device: torch.device, seed: int, max_bs: int = MAX_BS
+) -> Qwen3OmniTalker:
     """A talker whose predictor layers are real-shape modules with seeded weights."""
     torch.manual_seed(seed)
     talker = object.__new__(Qwen3OmniTalker)
@@ -120,12 +123,12 @@ def build_talker(device: torch.device, seed: int) -> Qwen3OmniTalker:
     positions = torch.arange(PREDICTOR_LEN, device=device, dtype=torch.long)
     talker.predictor_positions = positions
     talker.predictor_position_rows = (
-        positions[:, None].expand(PREDICTOR_LEN, MAX_BS).contiguous()
+        positions[:, None].expand(PREDICTOR_LEN, max_bs).contiguous()
     )
-    talker.predictor_pair_positions = positions[:2].repeat(MAX_BS)
+    talker.predictor_pair_positions = positions[:2].repeat(max_bs)
     talker.predictor_k_cache = torch.zeros(
         NUM_LAYERS,
-        MAX_BS,
+        max_bs,
         PREDICTOR_LEN,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -134,13 +137,13 @@ def build_talker(device: torch.device, seed: int) -> Qwen3OmniTalker:
     )
     talker.predictor_v_cache = torch.zeros_like(talker.predictor_k_cache)
     talker.predictor_k_rows = [
-        layer.view(MAX_BS * PREDICTOR_LEN, -1) for layer in talker.predictor_k_cache
+        layer.view(max_bs * PREDICTOR_LEN, -1) for layer in talker.predictor_k_cache
     ]
     talker.predictor_v_rows = [
-        layer.view(MAX_BS * PREDICTOR_LEN, -1) for layer in talker.predictor_v_cache
+        layer.view(max_bs * PREDICTOR_LEN, -1) for layer in talker.predictor_v_cache
     ]
     talker.predictor_cache_slots = (
-        torch.arange(MAX_BS, device=device, dtype=torch.long)[None, :] * PREDICTOR_LEN
+        torch.arange(max_bs, device=device, dtype=torch.long)[None, :] * PREDICTOR_LEN
         + positions[:, None]
     ).contiguous()
     talker.predictor_pair_cache_slots = (
@@ -160,7 +163,11 @@ def fuse(talker: Qwen3OmniTalker) -> Qwen3OmniTalker:
     torch.set_default_dtype(torch.bfloat16)
     try:
         fused = resolve_fused_predictor_layers(
-            talker.code_predictor, PREDICTOR_LEN, MAX_BS, device, DTYPE
+            talker.code_predictor,
+            PREDICTOR_LEN,
+            talker.predictor_k_cache.shape[1],
+            device,
+            DTYPE,
         )
     finally:
         torch.set_default_dtype(default_dtype)
@@ -344,6 +351,38 @@ def test_fused_layer_is_deterministic_and_batch_invariant() -> None:
 @accelerator
 @pytest.mark.accelerator
 @pytest.mark.usefixtures("published_server_args")
+def test_the_opening_pair_runs_fused_up_to_the_fused_rows() -> None:
+    device = torch.device("cuda")
+    talker = fuse(build_talker(device, seed=21))
+    fused = talker.predictor_fused_layers
+    for batch_size, runs_fused in (
+        (MAX_FUSED_ROWS // 2, True),
+        (MAX_FUSED_ROWS // 2 + 1, False),
+    ):
+        fused.residual.fill_(7.0)
+        run_sequence(talker, predictor_inputs(device, batch_size, seed=22)[:1])
+        assert bool(torch.all(fused.residual == 7.0)) is not runs_fused
+
+
+@accelerator
+@pytest.mark.accelerator
+@pytest.mark.usefixtures("published_server_args")
+def test_passes_beyond_the_fused_rows_run_the_plain_path_bit_for_bit() -> None:
+    device = torch.device("cuda")
+    batch_size = MAX_FUSED_ROWS + 1
+    steps = predictor_inputs(device, batch_size, seed=24)
+    plain_talker = build_talker(device, seed=23, max_bs=batch_size)
+    fused_talker = fuse(build_talker(device, seed=23, max_bs=batch_size))
+    plain = run_sequence(plain_talker, steps)
+    fused = run_sequence(fused_talker, steps)
+    assert all(torch.equal(a, b) for a, b in zip(plain, fused))
+    assert torch.equal(plain_talker.predictor_k_cache, fused_talker.predictor_k_cache)
+    assert torch.equal(plain_talker.predictor_v_cache, fused_talker.predictor_v_cache)
+
+
+@accelerator
+@pytest.mark.accelerator
+@pytest.mark.usefixtures("published_server_args")
 def test_fused_opening_pair_matches_two_single_token_passes() -> None:
     """The second token of a pair, fed as a strided view, must equal a single pass at
     cache length 1: the residual add once read the view with the wrong row stride."""
@@ -407,6 +446,19 @@ def test_resolver_keeps_the_plain_path_for_a_quantized_projection() -> None:
     device = torch.device("cuda")
     talker = build_talker(device, seed=12)
     talker.code_predictor.model.layers[2].mlp.down_proj.quant_method = SimpleNamespace()
+    assert (
+        resolve_predictor_layer_shape(talker.code_predictor, PREDICTOR_LEN, device)
+        is None
+    )
+
+
+@accelerator
+@pytest.mark.accelerator
+def test_resolver_keeps_the_plain_path_for_a_wider_head() -> None:
+    device = torch.device("cuda")
+    talker = build_talker(device, seed=12)
+    assert resolve_predictor_layer_shape(talker.code_predictor, PREDICTOR_LEN, device)
+    talker.code_predictor.model.layers[0].self_attn.head_dim = 2 * HEAD_DIM
     assert (
         resolve_predictor_layer_shape(talker.code_predictor, PREDICTOR_LEN, device)
         is None
@@ -533,6 +585,7 @@ def test_exact_add_rmsnorm_applies_to_the_predictor_shape_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cuda = torch.device("cuda")
+    monkeypatch.setattr(predictor_kernels, "HAS_TRITON", True)
     monkeypatch.setattr(predictor_kernels, "current_platform", ROCMOmniPlatform())
     assert not supports_exact_add_rmsnorm(HIDDEN_SIZE, torch.bfloat16, cuda)
     monkeypatch.setattr(predictor_kernels, "current_platform", CUDAOmniPlatform())

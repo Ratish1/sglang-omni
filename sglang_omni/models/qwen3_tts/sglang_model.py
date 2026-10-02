@@ -2030,8 +2030,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             assert (num_tokens, cache_len) == (2, 0), "pair tables hold slots 0 and 1"
             positions = self.predictor_pair_positions[: 2 * batch_size]
             cache_slots = self.predictor_pair_cache_slots[: 2 * batch_size]
-        if self.predictor_fused_layers is not None:
-            return self.predictor_fused_layers.forward(
+        num_rows = batch_size * num_tokens
+        fused = self.predictor_fused_layers
+        if fused is not None and fused.covers(num_rows):
+            return fused.forward(
                 layers=self.code_predictor.model.layers,
                 final_norm=self.code_predictor.model.norm,
                 token_embeds=token_embeds,
@@ -2043,7 +2045,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             )
         else:
             pass
-        num_rows = batch_size * num_tokens
         # note(ratish): 2D rows for the fused add and norm, which every
         # backend's kernel expects and which writes both operands in place.
         residual = token_embeds.reshape(num_rows, 1, hidden_size)

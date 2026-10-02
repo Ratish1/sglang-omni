@@ -27,6 +27,12 @@ from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.quantization.unquant import Bf16GemmBackend
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
+from sglang.srt.runtime_context import get_context
 from torch import nn
 
 import sglang_omni.models.qwen3_tts.sglang_model as sglang_model_module
@@ -1955,13 +1961,6 @@ def rope_copy_reference(
 
 @pytest.fixture(params=["cuda", "torch"])
 def predictor_rope_dispatch(request: pytest.FixtureRequest) -> Iterator[str]:
-    from sglang.srt.model_executor.cuda_graph_config import (
-        Backend,
-        CudaGraphConfig,
-        PhaseConfig,
-    )
-    from sglang.srt.runtime_context import get_context
-
     mode = request.param
     with get_context().override_server_args(
         cuda_graph_config=CudaGraphConfig(
@@ -2280,13 +2279,6 @@ def fused_and_plain_errors_to_fp32(
 ) -> dict[str, tuple[float, float]]:
     """Each path's relative error to the fp32 pass over the opening pair and the
     fourteen single-token passes: (outputs, K and V cache rows)."""
-    from sglang.srt.model_executor.cuda_graph_config import (
-        Backend,
-        CudaGraphConfig,
-        PhaseConfig,
-    )
-    from sglang.srt.runtime_context import get_context
-
     device = torch.device("cuda")
     torch.manual_seed(seed)
     layers = [real_shape_layer(device) for _ in range(FUSED_LAYERS)]
