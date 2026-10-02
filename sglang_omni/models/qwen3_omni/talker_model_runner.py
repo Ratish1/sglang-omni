@@ -85,6 +85,9 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         requests: list[SchedulerRequest],
     ) -> None:
         del schedule_batch
+        self.model.forget_decode_rows(
+            [sched_req.data.req.rid for sched_req in requests]
+        )
         composed = self.compose_prefill_embeds(forward_batch, requests)
         if composed is None:
             return
@@ -181,13 +184,13 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         )
 
     def lookahead_eligible(self, batch: ScheduleBatch) -> bool:
-        """A lookahead launch reuses the last prepare's buffers.
+        """A lookahead launch carries the last prepare's buffers for the rows it kept.
 
-        The rebuild reads the repetition history from output_ids, which lack the
-        tokens of launched, unresolved steps, so only a step on the same rows, each
-        one sampled token further, launches ahead. SGLang's forced test retraction
-        can drop an in-flight row that the talker has already fed forward, so it
-        runs synchronously.
+        A rebuilt row reads its repetition history from output_ids, which lack the
+        tokens of launched, unresolved steps, so only rows with nothing in flight are
+        rebuilt; rows that finished leave and prefilled rows join without a drain.
+        SGLang's forced test retraction can drop an in-flight row that the talker has
+        already fed forward, so it runs synchronously.
         """
         if (
             not self.feedback_enabled
@@ -197,9 +200,14 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
             return False
         else:
             pass
-        return self.model.can_reuse_decode_buffers(
-            [request.rid for request in batch.reqs],
+        request_ids = [request.rid for request in batch.reqs]
+        carried_rows = self.model.carried_decode_rows(
+            request_ids,
             [sampled_length(request, self.inflight_steps) for request in batch.reqs],
+        )
+        return carried_rows is not None and not any(
+            self.inflight_steps.get(request_id, 0)
+            for request_id in request_ids[len(carried_rows) :]
         )
 
     def post_decode_launch(

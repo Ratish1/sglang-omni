@@ -2404,17 +2404,11 @@ def talker_seed_self(
         sampling_staging_gpu=torch.zeros(6, max_bs, dtype=torch.int64, device=device),
         sampling_staging_event=(torch.cuda.Event() if device.type == "cuda" else None),
         sampled_token_ids=torch.zeros(max_bs, dtype=torch.long, device=device),
-        decode_prep_rids=None,
-        decode_prep_out_lens=[],
+        decode_prep_rows={},
         decode_prep_rep_rows=None,
     )
-    fake.reuse_decode_buffers = Qwen3OmniTalker.reuse_decode_buffers.__get__(fake)
-    fake.can_reuse_decode_buffers = Qwen3OmniTalker.can_reuse_decode_buffers.__get__(
-        fake
-    )
-    fake.invalidate_decode_buffers = Qwen3OmniTalker.invalidate_decode_buffers.__get__(
-        fake
-    )
+    fake.carried_decode_rows = Qwen3OmniTalker.carried_decode_rows.__get__(fake)
+    fake.forget_decode_rows = Qwen3OmniTalker.forget_decode_rows.__get__(fake)
     return fake
 
 
@@ -2593,6 +2587,127 @@ def test_talker_lookahead_reuses_decode_buffers_across_the_resolve_lag() -> None
     assert torch.equal(fake.repetition_mask, fresh.repetition_mask)
 
 
+DECODE_ROW_BUFFERS = (
+    "repetition_mask",
+    "suppress_mask",
+    "repetition_penalties",
+    "sampling_temperatures",
+    "sampling_top_ps",
+    "sampling_top_ks",
+    "sampling_min_ps",
+    "sampling_seeds",
+)
+
+
+def assert_rows_match_a_fresh_rebuild(
+    fake: SimpleNamespace,
+    requests: list[SimpleNamespace],
+    unresolved_steps: list[tuple[list[SimpleNamespace], list[int]]],
+) -> None:
+    unresolved_tokens: dict[str, list[int]] = {}
+    for step_requests, tokens in unresolved_steps:
+        for sched_req, token in zip(step_requests, tokens):
+            unresolved_tokens.setdefault(sched_req.data.req.rid, []).append(token)
+    resolved_lengths = [len(sched_req.data.req.output_ids) for sched_req in requests]
+    for sched_req in requests:
+        sched_req.data.req.output_ids.extend(
+            unresolved_tokens.get(sched_req.data.req.rid, [])
+        )
+    fresh = talker_seed_self()
+    Qwen3OmniTalker.prepare_decode_buffers(fresh, requests)
+    for sched_req, resolved_length in zip(requests, resolved_lengths):
+        del sched_req.data.req.output_ids[resolved_length:]
+
+    batch_size = len(requests)
+    for name in DECODE_ROW_BUFFERS:
+        assert torch.equal(
+            getattr(fake, name)[:batch_size], getattr(fresh, name)[:batch_size]
+        ), name
+    assert (
+        None
+        if fake.decode_prep_rep_rows is None
+        else fake.decode_prep_rep_rows.tolist()
+    ) == (
+        None
+        if fresh.decode_prep_rep_rows is None
+        else fresh.decode_prep_rep_rows.tolist()
+    )
+
+
+def test_talker_rows_that_leave_and_join_match_a_fresh_rebuild() -> None:
+    fake = talker_seed_self()
+    a = talker_prep_req(
+        "a",
+        penalty=1.5,
+        temperature=0.6,
+        top_k=10,
+        seed=11,
+        output_ids=[2],
+        suppress=[3],
+    )
+    b = talker_prep_req(
+        "b", temperature=0.7, top_k=12, seed=12, output_ids=[4], suppress=[5]
+    )
+    c = talker_prep_req(
+        "c",
+        penalty=1.2,
+        temperature=0.8,
+        top_k=14,
+        seed=13,
+        output_ids=[1],
+        suppress=[6],
+    )
+    d = talker_prep_req(
+        "d",
+        penalty=1.3,
+        temperature=0.9,
+        top_k=16,
+        seed=14,
+        output_ids=[6],
+        suppress=[0],
+    )
+    e = talker_prep_req("e", temperature=0.5, top_k=18, seed=15, output_ids=[7])
+    inflight_steps: dict[str, int] = {}
+    unresolved_steps: list[tuple[list[SimpleNamespace], list[int]]] = []
+
+    def launch(requests: list[SimpleNamespace], tokens: list[int]) -> None:
+        Qwen3OmniTalker.prepare_decode_buffers(fake, requests, inflight_steps)
+        assert_rows_match_a_fresh_rebuild(fake, requests, unresolved_steps)
+        fake.sampled_token_ids[: len(tokens)] = torch.tensor(tokens)
+        for sched_req in requests:
+            request_id = sched_req.data.req.rid
+            inflight_steps[request_id] = inflight_steps.get(request_id, 0) + 1
+        unresolved_steps.append((requests, tokens))
+
+    def resolve() -> None:
+        requests, tokens = unresolved_steps.pop(0)
+        for sched_req, token in zip(requests, tokens):
+            sched_req.data.req.output_ids.append(token)
+            request_id = sched_req.data.req.rid
+            inflight_steps[request_id] -= 1
+            if not inflight_steps[request_id]:
+                inflight_steps.pop(request_id)
+            else:
+                pass
+
+    launch([a, b, c], [5, 6, 7])
+    launch([a, b, c], [1, 2, 3])
+    resolve()
+    launch([a, c], [4, 0])
+    resolve()
+    resolve()
+    launch([a, c, d], [3, 5, 2])
+    launch([a, c, d], [6, 1, 0])
+    resolve()
+    resolve()
+    launch([c, d, e], [2, 2, 2])
+    resolve()
+    fake.forget_decode_rows(["c"])
+    c.data.req.output_ids.append(4)
+    launch([d, e, c], [3, 3, 3])
+    resolve()
+
+
 def test_talker_rebuild_refuses_a_row_with_a_step_in_flight() -> None:
     fake = talker_seed_self()
     requests = [talker_prep_req("a", penalty=1.5, output_ids=[2])]
@@ -2750,6 +2865,36 @@ def test_talker_batch_change_issues_no_blocking_device_sync() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="sync debug mode requires CUDA"
+)
+def test_talker_rows_that_leave_and_join_issue_no_blocking_device_sync() -> None:
+    device = torch.device("cuda")
+    fake = talker_seed_self(device=device)
+    requests = [
+        talker_prep_req("a", penalty=1.5, output_ids=[1], suppress=[2]),
+        talker_prep_req("b", penalty=1.2, output_ids=[2], suppress=[3]),
+        talker_prep_req("c", penalty=1.5, output_ids=[3], suppress=[4]),
+    ]
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    advance_decode_step(fake, requests, [5, 6, 7])
+    kept_and_joined = [
+        requests[0],
+        requests[2],
+        talker_prep_req("d", penalty=1.2, output_ids=[4], suppress=[5]),
+    ]
+    torch.cuda.synchronize(device)
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        Qwen3OmniTalker.prepare_decode_buffers(fake, kept_and_joined)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert_decode_masks(fake, kept_and_joined)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
     not torch.cuda.is_available(), reason="sampling staging regression requires CUDA"
 )
 def test_talker_prepare_decode_buffers_cuda_matches_fresh_rebuild() -> None:
@@ -2857,65 +3002,6 @@ def test_talker_prepare_decode_buffers_rebuild_triggers() -> None:
     advance(requests)
     requests[0].data.req.output_ids.append(6)
     Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
-    assert float(fake.sampling_temperatures[0, 0]) == pytest.approx(0.8)
-
-
-def test_talker_prefill_forward_invalidates_next_decode_reuse() -> None:
-    class FakeForwardMode:
-        def __init__(self, *, is_extend: bool) -> None:
-            self.is_extend_value = is_extend
-
-        def is_extend(self) -> bool:
-            return self.is_extend_value
-
-        def is_decode(self) -> bool:
-            return not self.is_extend_value
-
-    fake = talker_seed_self()
-    requests = [talker_prep_req("a", penalty=1.5, output_ids=[2])]
-    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
-    fake.sampling_temperatures[0, 0] = 123.0
-    fake.sampled_token_ids[0] = 3
-    requests[0].data.req.output_ids.append(3)
-
-    fake.uses_mrope = False
-    fake.model = lambda **_: torch.zeros(1, 2)
-    fake.manual_extend_logits = lambda hidden_states, forward_batch: SimpleNamespace(
-        hidden_states=hidden_states
-    )
-    fake.manual_decode_logits = lambda hidden_states: SimpleNamespace(
-        next_token_logits=torch.zeros(1, 8), hidden_states=hidden_states
-    )
-    fake.sample_decode_tokens = lambda logits, forward_batch: torch.tensor([4])
-    fake.code_predictor_forward = lambda token_ids, hidden_states: None
-    positions = torch.zeros(1, dtype=torch.long)
-    extend_batch = SimpleNamespace(
-        forward_mode=FakeForwardMode(is_extend=True),
-        mrope_positions=None,
-        positions=positions,
-    )
-    decode_batch = SimpleNamespace(
-        forward_mode=FakeForwardMode(is_extend=False),
-        mrope_positions=None,
-        positions=positions,
-    )
-
-    Qwen3OmniTalker.forward(
-        fake,
-        input_ids=torch.zeros(1, dtype=torch.long),
-        positions=positions,
-        forward_batch=extend_batch,
-        input_embeds=torch.zeros(1, 2),
-        input_embeds_are_projected=True,
-    )
-    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
-    Qwen3OmniTalker.forward(
-        fake,
-        input_ids=torch.zeros(1, dtype=torch.long),
-        positions=positions,
-        forward_batch=decode_batch,
-    )
-
     assert float(fake.sampling_temperatures[0, 0]) == pytest.approx(0.8)
 
 

@@ -7,7 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
+from sglang_omni.models.qwen3_omni.components.talker import (
+    DecodePrepRow,
+    Qwen3OmniTalker,
+)
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
 from sglang_omni.models.qwen3_omni.talker_scheduler import QwenTalkerScheduler
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
@@ -94,20 +97,46 @@ def test_launch_queues_feedback_and_resolve_sends_only_live_rows() -> None:
     assert runner.inflight_steps == {}
 
 
-def test_lookahead_needs_the_same_rows_one_sampled_token_further() -> None:
-    model = SimpleNamespace(decode_prep_rids=["a", "b"], decode_prep_out_lens=[3, 3])
-    model.can_reuse_decode_buffers = Qwen3OmniTalker.can_reuse_decode_buffers.__get__(
-        model
+def test_lookahead_carries_kept_rows_and_rebuilds_only_rows_with_nothing_in_flight() -> (
+    None
+):
+    model = SimpleNamespace(
+        decode_prep_rows={
+            "a": DecodePrepRow(0, 3),
+            "b": DecodePrepRow(1, 3),
+            "c": DecodePrepRow(2, 3),
+        }
     )
+    model.carried_decode_rows = Qwen3OmniTalker.carried_decode_rows.__get__(model)
     runner = make_runner(model)
-    batch = SimpleNamespace(reqs=[sglang_req("a"), sglang_req("b")])
+    runner.inflight_steps = {"a": 1, "b": 1, "c": 1}
+    a, b, c, d = (sglang_req(request_id) for request_id in "abcd")
 
-    assert not runner.lookahead_eligible(batch)
-    runner.inflight_steps = {"a": 1, "b": 1}
-    assert runner.lookahead_eligible(batch)
-    assert not runner.lookahead_eligible(SimpleNamespace(reqs=batch.reqs[::-1]))
-    model.decode_prep_rids = None
-    assert not runner.lookahead_eligible(batch)
+    assert runner.lookahead_eligible(SimpleNamespace(reqs=[a, b, c]))
+    assert runner.lookahead_eligible(SimpleNamespace(reqs=[a, c]))
+    assert not runner.lookahead_eligible(SimpleNamespace(reqs=[c, a]))
+    assert runner.lookahead_eligible(SimpleNamespace(reqs=[a, c, d]))
+    runner.inflight_steps["d"] = 1
+    assert not runner.lookahead_eligible(SimpleNamespace(reqs=[a, c, d]))
+
+
+def test_prefill_forgets_the_decode_rows_of_the_prefilled_requests() -> None:
+    forgotten: list[list[str]] = []
+    runner = make_runner(SimpleNamespace(forget_decode_rows=forgotten.append))
+    requests = [
+        SimpleNamespace(
+            data=SimpleNamespace(
+                req=sglang_req(request_id),
+                input_embeds_are_projected=False,
+                prefill_input_embeds=None,
+            )
+        )
+        for request_id in ("x", "y")
+    ]
+
+    runner.before_prefill(None, None, requests)
+
+    assert forgotten == [["x", "y"]]
 
 
 @pytest.mark.parametrize(

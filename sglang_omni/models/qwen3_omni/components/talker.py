@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, NamedTuple, Optional, Tuple
 
 import torch
 from sglang.kernels.fused_op import get_fused_op_backend
@@ -57,6 +57,13 @@ from sglang_omni.vendor.sglang.utils import make_layers
 logger = logging.getLogger(__name__)
 
 NO_INFLIGHT_STEPS: Mapping[str, int] = MappingProxyType({})
+
+
+class DecodePrepRow(NamedTuple):
+    """Where a request's decode buffers sit and how many tokens they account for."""
+
+    row: int
+    sampled_length: int
 
 
 def sampled_length(request: Req, inflight_steps: Mapping[str, int]) -> int:
@@ -1033,8 +1040,7 @@ class Qwen3OmniTalker(nn.Module):
         self.sampling_staging_event = (
             torch.get_device_module().Event() if device.type != "cpu" else None
         )
-        self.decode_prep_rids: list[str] | None = None
-        self.decode_prep_out_lens: list[int] = []
+        self.decode_prep_rows: dict[str, DecodePrepRow] = {}
         self.decode_prep_rep_rows: torch.Tensor | None = None
         self.output_codes = torch.zeros(
             max_batch_size,
@@ -1080,49 +1086,34 @@ class Qwen3OmniTalker(nn.Module):
             pass
         return next_code
 
-    def can_reuse_decode_buffers(
-        self, rids: list[str], sampled_lens: list[int]
-    ) -> bool:
-        """The same rows as the last prepare, each one sampled token further."""
-        if self.decode_prep_rids != rids:
-            return False
-        else:
-            pass
-        return all(
-            sampled_len == prev_len + 1
-            for sampled_len, prev_len in zip(sampled_lens, self.decode_prep_out_lens)
-        )
-
-    def reuse_decode_buffers(
-        self, requests: list, inflight_steps: Mapping[str, int]
-    ) -> bool:
-        # Note (akazaakane): sampling params/suppress mask are static per
-        # request, so only the repetition mask needs updating here.
-        sglang_requests = [sched_req.data.req for sched_req in requests]
-        sampled_lens = [
-            sampled_length(request, inflight_steps) for request in sglang_requests
-        ]
-        if not self.can_reuse_decode_buffers(
-            [request.rid for request in sglang_requests], sampled_lens
-        ):
-            return False
-        else:
-            pass
-
-        rep_rows = self.decode_prep_rep_rows
-        if rep_rows is not None:
-            self.repetition_mask.index_put_(
-                (rep_rows, self.sampled_token_ids[rep_rows]), self.mask_true_value
+    def carried_decode_rows(
+        self, request_ids: list[str], sampled_lens: list[int]
+    ) -> list[int] | None:
+        """Last-prepare rows of the leading requests whose buffers carry over, each one
+        sampled token further; None when a carried request would follow a rebuilt one.
+        """
+        carried_rows: list[int] = []
+        rebuilding = False
+        for request_id, sampled_len in zip(request_ids, sampled_lens):
+            previous = self.decode_prep_rows.get(request_id)
+            carriable = (
+                previous is not None and sampled_len == previous.sampled_length + 1
             )
-        else:
-            pass
-        self.decode_prep_out_lens = sampled_lens
-        return True
+            if carriable and (
+                rebuilding or (carried_rows and previous.row <= carried_rows[-1])
+            ):
+                return None
+            elif carriable:
+                carried_rows.append(previous.row)
+            else:
+                rebuilding = True
+        return carried_rows
 
-    def invalidate_decode_buffers(self) -> None:
-        # Note (akazaakane): a prefill's sampled token bypasses
-        # _sampled_token_ids, so the fast path must not run right after one.
-        self.decode_prep_rids = None
+    def forget_decode_rows(self, request_ids: list[str]) -> None:
+        # note (ratish): a prefill samples its token outside sampled_token_ids, so
+        # its rows are rebuilt from the host at the next decode.
+        for request_id in request_ids:
+            self.decode_prep_rows.pop(request_id, None)
 
     def prepare_decode_buffers(
         self, requests: list, inflight_steps: Mapping[str, int] = NO_INFLIGHT_STEPS
@@ -1132,12 +1123,22 @@ class Qwen3OmniTalker(nn.Module):
             return
         else:
             pass
-
-        if self.reuse_decode_buffers(requests, inflight_steps):
-            return
-        else:
-            pass
-        if any(inflight_steps.get(sched_req.data.req.rid, 0) for sched_req in requests):
+        request_ids = [sched_req.data.req.rid for sched_req in requests]
+        sampled_lens = [
+            sampled_length(sched_req.data.req, inflight_steps) for sched_req in requests
+        ]
+        carried_rows = self.carried_decode_rows(request_ids, sampled_lens) or []
+        carried_count = len(carried_rows)
+        next_prep_rows = {
+            request_id: DecodePrepRow(row, sampled_len)
+            for row, (request_id, sampled_len) in enumerate(
+                zip(request_ids, sampled_lens)
+            )
+        }
+        if any(
+            inflight_steps.get(request_id, 0)
+            for request_id in request_ids[carried_count:]
+        ):
             # note (ratish): the rebuild reads the repetition history from output_ids,
             # which lack the tokens of launched, unresolved steps.
             raise RuntimeError(
@@ -1146,12 +1147,26 @@ class Qwen3OmniTalker(nn.Module):
         else:
             pass
 
+        previous_rep_rows = self.decode_prep_rep_rows
+        if carried_count and previous_rep_rows is not None:
+            # Note (akazaakane): sampling params/suppress mask are static per
+            # request, so only the repetition mask needs updating here.
+            self.repetition_mask.index_put_(
+                (previous_rep_rows, self.sampled_token_ids[previous_rep_rows]),
+                self.mask_true_value,
+            )
+        else:
+            pass
+        if carried_count == batch_size == len(self.decode_prep_rows):
+            self.decode_prep_rows = next_prep_rows
+            return
+        else:
+            pass
+
         device = self.repetition_mask.device
         rep_vocab = self.repetition_mask.shape[1]
         sup_vocab = self.suppress_mask.shape[1]
-
-        self.repetition_mask[:batch_size] = False
-        self.suppress_mask[:batch_size] = False
+        compact = carried_rows != list(range(carried_count))
 
         rep_penalties: list[float] = []
         temperatures: list[float] = []
@@ -1164,8 +1179,8 @@ class Qwen3OmniTalker(nn.Module):
         sup_rows: list[int] = []
         sup_toks: list[int] = []
 
-        for row_idx, sched_req in enumerate(requests):
-            data = sched_req.data
+        for row_idx in range(carried_count, batch_size):
+            data = requests[row_idx].data
             req = data.req
             sp = req.sampling_params
 
@@ -1218,82 +1233,106 @@ class Qwen3OmniTalker(nn.Module):
             else:
                 pass
 
-        if self.sampling_staging_event is not None:
-            # Note (akazaakane): guards the prior async copy still reading
-            # this buffer before we overwrite it.
-            self.sampling_staging_event.synchronize()
-        else:
-            pass
-        staging_cpu = self.sampling_staging_cpu
-        staging_cpu_f64 = staging_cpu.view(torch.float64)
-        staging_cpu_f64[0, :batch_size] = torch.tensor(
-            rep_penalties, dtype=torch.float64
-        )
-        staging_cpu_f64[1, :batch_size] = torch.tensor(
-            temperatures, dtype=torch.float64
-        )
-        staging_cpu_f64[2, :batch_size] = torch.tensor(top_ps, dtype=torch.float64)
-        staging_cpu_f64[3, :batch_size] = torch.tensor(min_ps, dtype=torch.float64)
-        staging_cpu[4, :batch_size] = torch.tensor(top_ks, dtype=torch.int64)
-        staging_cpu[5, :batch_size] = torch.tensor(sampling_seeds, dtype=torch.int64)
-        staging_gpu = self.sampling_staging_gpu
-        staging_gpu.copy_(staging_cpu, non_blocking=True)
-        if self.sampling_staging_event is not None:
-            self.sampling_staging_event.record()
-        else:
-            pass
-        staging_gpu_f64 = staging_gpu.view(torch.float64)
-        self.repetition_penalties[:batch_size, 0].copy_(staging_gpu_f64[0, :batch_size])
-        self.sampling_temperatures[:batch_size, 0].copy_(
-            staging_gpu_f64[1, :batch_size]
-        )
-        self.sampling_top_ps[:batch_size].copy_(staging_gpu_f64[2, :batch_size])
-        self.sampling_min_ps[:batch_size].copy_(staging_gpu_f64[3, :batch_size])
-        self.sampling_top_ks[:batch_size].copy_(staging_gpu[4, :batch_size])
-        self.sampling_seeds[:batch_size].copy_(staging_gpu[5, :batch_size])
-
         rep_active_rows = [
-            row_idx for row_idx, penalty in enumerate(rep_penalties) if penalty != 1.0
+            row_idx
+            for row_idx, sched_req in enumerate(requests)
+            if float(sched_req.data.repetition_penalty) != 1.0
         ]
-        mask_index_values = rep_rows + rep_toks + sup_rows + sup_toks + rep_active_rows
+        keep_rows = carried_rows if compact else []
+        mask_index_values = (
+            keep_rows + rep_rows + rep_toks + sup_rows + sup_toks + rep_active_rows
+        )
         if mask_index_values:
-            rep_count = len(rep_rows)
-            sup_count = len(sup_rows)
-            sup_start = 2 * rep_count
-            rep_active_start = sup_start + 2 * sup_count
             mask_indices = torch.tensor(
                 mask_index_values,
                 dtype=torch.int64,
                 pin_memory=current_platform.is_pin_memory_available(device),
             ).to(device, non_blocking=True)
-            if rep_rows:
-                self.repetition_mask.index_put_(
-                    (mask_indices[:rep_count], mask_indices[rep_count:sup_start]),
-                    self.mask_true_value,
-                )
+        else:
+            mask_indices = None
+        keep_count = len(keep_rows)
+        rep_count = len(rep_rows)
+        sup_count = len(sup_rows)
+        rep_start = keep_count
+        sup_start = rep_start + 2 * rep_count
+        rep_active_start = sup_start + 2 * sup_count
+
+        if compact:
+            keep_index = mask_indices[:keep_count]
+            for buffer in (
+                self.repetition_mask,
+                self.suppress_mask,
+                self.repetition_penalties,
+                self.sampling_temperatures,
+                self.sampling_top_ps,
+                self.sampling_min_ps,
+                self.sampling_top_ks,
+                self.sampling_seeds,
+            ):
+                buffer[:carried_count] = buffer[keep_index]
+        else:
+            pass
+        self.repetition_mask[carried_count:batch_size] = False
+        self.suppress_mask[carried_count:batch_size] = False
+
+        if carried_count < batch_size:
+            if self.sampling_staging_event is not None:
+                # Note (akazaakane): guards the prior async copy still reading
+                # this buffer before we overwrite it.
+                self.sampling_staging_event.synchronize()
             else:
                 pass
-            if sup_rows:
-                self.suppress_mask.index_put_(
-                    (
-                        mask_indices[sup_start : sup_start + sup_count],
-                        mask_indices[sup_start + sup_count : rep_active_start],
-                    ),
-                    self.mask_true_value,
-                )
+            joined = slice(carried_count, batch_size)
+            staging_cpu = self.sampling_staging_cpu
+            staging_cpu_f64 = staging_cpu.view(torch.float64)
+            staging_cpu_f64[0, joined] = torch.tensor(
+                rep_penalties, dtype=torch.float64
+            )
+            staging_cpu_f64[1, joined] = torch.tensor(temperatures, dtype=torch.float64)
+            staging_cpu_f64[2, joined] = torch.tensor(top_ps, dtype=torch.float64)
+            staging_cpu_f64[3, joined] = torch.tensor(min_ps, dtype=torch.float64)
+            staging_cpu[4, joined] = torch.tensor(top_ks, dtype=torch.int64)
+            staging_cpu[5, joined] = torch.tensor(sampling_seeds, dtype=torch.int64)
+            staging_gpu = self.sampling_staging_gpu
+            staging_gpu.copy_(staging_cpu, non_blocking=True)
+            if self.sampling_staging_event is not None:
+                self.sampling_staging_event.record()
             else:
                 pass
-            self.decode_prep_rep_rows = (
-                mask_indices[rep_active_start:] if rep_active_rows else None
+            staging_gpu_f64 = staging_gpu.view(torch.float64)
+            self.repetition_penalties[joined, 0].copy_(staging_gpu_f64[0, joined])
+            self.sampling_temperatures[joined, 0].copy_(staging_gpu_f64[1, joined])
+            self.sampling_top_ps[joined].copy_(staging_gpu_f64[2, joined])
+            self.sampling_min_ps[joined].copy_(staging_gpu_f64[3, joined])
+            self.sampling_top_ks[joined].copy_(staging_gpu[4, joined])
+            self.sampling_seeds[joined].copy_(staging_gpu[5, joined])
+        else:
+            pass
+
+        if rep_rows:
+            self.repetition_mask.index_put_(
+                (
+                    mask_indices[rep_start : rep_start + rep_count],
+                    mask_indices[rep_start + rep_count : sup_start],
+                ),
+                self.mask_true_value,
             )
         else:
-            self.decode_prep_rep_rows = None
-
-        self.decode_prep_rids = [sched_req.data.req.rid for sched_req in requests]
-        self.decode_prep_out_lens = [
-            len(sched_req.data.req.output_ids) if sched_req.data.req.output_ids else 0
-            for sched_req in requests
-        ]
+            pass
+        if sup_rows:
+            self.suppress_mask.index_put_(
+                (
+                    mask_indices[sup_start : sup_start + sup_count],
+                    mask_indices[sup_start + sup_count : rep_active_start],
+                ),
+                self.mask_true_value,
+            )
+        else:
+            pass
+        self.decode_prep_rep_rows = (
+            mask_indices[rep_active_start:] if rep_active_rows else None
+        )
+        self.decode_prep_rows = next_prep_rows
 
     def prepare_input_embeds(
         self,
@@ -1369,10 +1408,6 @@ class Qwen3OmniTalker(nn.Module):
             LogitsProcessorOutput with codec logits
         """
         del omni_prefill_rids
-        if forward_batch.forward_mode.is_extend():
-            self.invalidate_decode_buffers()
-        else:
-            pass
 
         if input_embeds is not None and not input_embeds_are_projected:
             # Prefill: project thinker hidden states → talker dimension
