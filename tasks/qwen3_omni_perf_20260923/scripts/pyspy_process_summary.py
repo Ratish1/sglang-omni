@@ -27,12 +27,18 @@ per_process: dict[str, dict] = defaultdict(
         "cmd": "",
     }
 )
+# A frame string that carries a newline (a command line, a thread name) splits its record across
+# lines; those pieces end in no sample count and are counted here, not parsed.
+broken_lines = 0
 with open(args.raw, errors="replace") as raw:
     for line in raw:
         line = line.rstrip("\n")
         if not line:
             continue
         stack, _, count_text = line.rpartition(" ")
+        if not count_text.isdigit():
+            broken_lines += 1
+            continue
         count = int(count_text)
         frames = stack.split(";")
         process_frames = [frame for frame in frames if PROCESS_TAG.match(frame)]
@@ -59,4 +65,4 @@ for key, entry in sorted(per_process.items(), key=lambda item: -item[1]["busy"])
     print("  self:")
     for frame, count in entry["self"].most_common(10):
         print(f"    {count:6d} {count / max(entry['busy'], 1):6.1%}  {frame[:150]}")
-print(f"total samples {total}")
+print(f"total samples {total}, broken record lines skipped {broken_lines}")
