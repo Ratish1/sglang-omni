@@ -61,6 +61,7 @@ OWNER_RULES = (
     ("flow.pack", "flow.cond"),
     ("flow.split", "flow.split"),
     ("flow.graph", "flow.graph"),
+    ("flow.hop.prefix", "flow.hop.prefix"),
     ("flow.hop", "flow.hop"),
     ("flow.leftover", "flow.final"),
     ("flow.buffered", "flow.buffered"),
