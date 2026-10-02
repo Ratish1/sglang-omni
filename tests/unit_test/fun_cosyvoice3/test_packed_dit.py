@@ -309,12 +309,15 @@ def test_prefix_projection_policy_matches_execution_mode(
     )
     rope = estimator.rope(rows)
     contexts = torch.zeros(1, CONV_CONTEXT_FRAMES, hidden_size, dtype=torch.float64)
+    layer_count = len(estimator.dit.transformer_blocks)
+    keys = [torch.empty(1) for _ in range(layer_count)]
+    values = [torch.empty(1) for _ in range(layer_count)]
 
     with torch.inference_mode():
         output, _, _ = forward_prefix(
             estimator,
-            [torch.empty(1)],
-            [torch.empty(1)],
+            keys,
+            values,
             x,
             mu,
             speaker_embeddings,
