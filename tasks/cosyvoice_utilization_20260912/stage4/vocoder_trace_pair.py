@@ -82,6 +82,7 @@ def main() -> None:
         enable_dit_torch_compile=serving,
         enable_flow_cuda_graph=serving,
         flow_cuda_graph_capture_shapes=FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
+        flow_prefix_cache_gb=24.0,
     )
     vocoder = scheduler.vocoder
     for case in args.cases:

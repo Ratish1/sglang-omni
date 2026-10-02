@@ -94,12 +94,15 @@ def case_body(vocoder, case: str):
                 done += length
                 length = min(100, length * 2)
             assert done == offset, (done, offset)
-        saved = [[(row.frames, row.conv_context) for row in pair] for pair in caches]
+        saved = [
+            [(row.committed_frames, row.conv_context) for row in pair]
+            for pair in caches
+        ]
 
         def body():
             for pair, rows in zip(caches, saved, strict=True):
                 for row, (frames, context) in zip(pair, rows, strict=True):
-                    row.frames, row.conv_context = frames, context
+                    row.committed_frames, row.conv_context = frames, context
             return vocoder.hop_batch_prefix(items, caches)
 
     def in_stream():
@@ -129,6 +132,7 @@ def main() -> None:
         gpu_id=0,
         enable_dit_torch_compile=serving,
         enable_flow_cuda_graph=False,
+        flow_prefix_cache_gb=24.0,
     )
     vocoder = scheduler.vocoder
     assert vocoder.flow.prefix_pool is not None
