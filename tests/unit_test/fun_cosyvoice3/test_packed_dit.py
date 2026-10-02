@@ -239,7 +239,16 @@ def test_packed_fused_qkv_matches_unfused_eager(streaming: bool) -> None:
     torch.testing.assert_close(fused, unfused, rtol=1e-9, atol=1e-9)
 
 
-def test_compiled_prefix_uses_fused_qk_and_original_v(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("compiling", "expected_fused_parts", "expected_value_calls"),
+    [(False, 3, 0), (True, 2, 1)],
+)
+def test_prefix_projection_policy_matches_execution_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    compiling: bool,
+    expected_fused_parts: int,
+    expected_value_calls: int,
+) -> None:
     estimator = PackedDiT(tiny_dit(), device=CPU)
     estimator.materialize_fused_qkv()
     attention_module = estimator.dit.transformer_blocks[0].attn
@@ -254,24 +263,26 @@ def test_compiled_prefix_uses_fused_qk_and_original_v(monkeypatch) -> None:
     qkv_weight = estimator.qkv_weights[0]
     qkv_bias = estimator.qkv_biases[0]
     assert qkv_weight is not None
-    query_key_size = 2 * attention_module.inner_dim
-    query_key_weight = qkv_weight[:query_key_size]
-    query_key_calls: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+    fused_projection_calls: list[tuple[torch.Tensor, torch.Tensor | None]] = []
     original_linear = prefix_cache.F.linear
 
-    def record_query_key_linear(
+    def record_fused_projection(
         input_tensor: torch.Tensor,
         weight: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if weight.data_ptr() == query_key_weight.data_ptr():
-            query_key_calls.append((weight, bias))
+        if weight.data_ptr() == qkv_weight.data_ptr():
+            fused_projection_calls.append((weight, bias))
         else:
             pass
         return original_linear(input_tensor, weight, bias)
 
-    monkeypatch.setattr(prefix_cache.F, "linear", record_query_key_linear)
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(prefix_cache.F, "linear", record_fused_projection)
+
+    def is_compiling() -> bool:
+        return compiling
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", is_compiling)
     rows = pack_rows((2,), CPU)
     hidden_size = int(estimator.dit.input_embed.proj.out_features)
     x = torch.randn(1, rows.total, CHANNELS, dtype=torch.float64)
@@ -317,15 +328,20 @@ def test_compiled_prefix_uses_fused_qk_and_original_v(monkeypatch) -> None:
         )
 
     assert output.shape == (1, rows.total, CHANNELS)
-    assert len(value_projection_inputs) == 1
-    assert len(query_key_calls) == 1
-    query_key_call_weight, query_key_call_bias = query_key_calls[0]
-    assert query_key_call_weight.data_ptr() == query_key_weight.data_ptr()
+    assert len(value_projection_inputs) == expected_value_calls
+    assert len(fused_projection_calls) == 1
+    recorded_weight, recorded_bias = fused_projection_calls[0]
+    assert recorded_weight.data_ptr() == qkv_weight.data_ptr()
+    assert recorded_weight.shape[0] == expected_fused_parts * attention_module.inner_dim
+    assert recorded_weight.shape[1:] == qkv_weight.shape[1:]
     if qkv_bias is None:
-        assert query_key_call_bias is None
+        assert recorded_bias is None
     else:
-        assert query_key_call_bias is not None
-        assert query_key_call_bias.data_ptr() == qkv_bias[:query_key_size].data_ptr()
+        assert recorded_bias is not None
+        assert recorded_bias.data_ptr() == qkv_bias.data_ptr()
+        assert recorded_bias.shape == (
+            expected_fused_parts * attention_module.inner_dim,
+        )
 
 
 @pytest.mark.parametrize("streaming", [True, False])
