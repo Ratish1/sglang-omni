@@ -26,7 +26,16 @@ from vocoder_trace_pair import case_body as vocoder_case_body  # noqa: E402
 from sglang_omni.models.fun_cosyvoice3 import stages  # noqa: E402
 
 PREFIX_CASES = ("prefix_first", "prefix_hop2", "prefix_hop3")
-VOCODER_CASES = ("hop1", "hop16", "final1", "final16")
+VOCODER_CASES = (
+    "hop1",
+    "hop16",
+    "final1",
+    "final16",
+    "buffered_small",
+    "buffered_large",
+    "buffered_miss8",
+    "buffered_miss2",
+)
 
 
 def main() -> None:
@@ -35,6 +44,9 @@ def main() -> None:
     parser.add_argument("--calls", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--disable-gc", action="store_true")
+    parser.add_argument(
+        "--cases", nargs="+", default=list(PREFIX_CASES + VOCODER_CASES)
+    )
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     scheduler = stages.create_vocoder_executor(
@@ -57,7 +69,7 @@ def main() -> None:
 
     gc.callbacks.append(on_gc)
     results = {}
-    for case in PREFIX_CASES + VOCODER_CASES:
+    for case in args.cases:
         caches: list = []
         if case in PREFIX_CASES:
             body, caches = prefix_case_body(vocoder, case)
