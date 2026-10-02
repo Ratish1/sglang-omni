@@ -923,12 +923,21 @@ def build_sglang_talker_request(
 
         prefill_embeds_tensor = thinker_hidden_states
 
+    if not 0.0 < repetition_penalty <= 2.0:
+        raise ValueError(
+            "talker repetition_penalty must be in (0, 2] (1.0 = no penalty), "
+            f"got {repetition_penalty}."
+        )
+    else:
+        pass
+    # note (ratish): the talker applies its own penalty; one set here would also run
+    # SGLang's penalizer on every decode step, whose result the talker never reads.
     sampling_params = SamplingParams(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
-        repetition_penalty=repetition_penalty,
+        repetition_penalty=1.0,
         stop_token_ids=[int(codec_eos_id)] if codec_eos_id is not None else None,
         logit_bias=None,
         sampling_seed=seed,
@@ -1007,6 +1016,7 @@ def build_sglang_talker_request(
         temperature=temperature,
         output_ids=req.output_ids,
         req=req,
+        repetition_penalty=repetition_penalty,
         prefill_input_embeds=prefill_embeds_tensor,
     )
     data.suppress_tokens = list(

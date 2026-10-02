@@ -6,13 +6,19 @@ import ast
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.sampling.penaltylib import (
+    BatchedPenalizerOrchestrator,
+    BatchedRepetitionPenalizer,
+)
 from torch import nn
 
 import sglang_omni.models.qwen3_omni.components.talker as talker_module
@@ -2057,12 +2063,22 @@ class TestBuildTalkerRequestTensorStorage:
             codec_vocab_size=4096,
         )
 
-        assert data.req.sampling_params.repetition_penalty == 1.05
+        assert data.req.sampling_params.repetition_penalty == 1.0
+        assert data.repetition_penalty == 1.05
         assert data.prefill_input_embeds is hidden_states
         assert data.req.input_embeds is None
         assert (
             data.req._input_embeds_are_projected is False
         )  # noqa: leading-underscore  # production name
+
+    def test_rejects_a_repetition_penalty_outside_the_sampler_range(self) -> None:
+        with pytest.raises(ValueError, match="repetition_penalty"):
+            build_sglang_talker_request(
+                thinker_hidden_states=torch.randn(4, 8),
+                tokenizer=FakeQwenTokenizer(),
+                codec_vocab_size=4096,
+                repetition_penalty=0.0,
+            )
 
 
 def test_projected_prefill_reads_tensor_from_data() -> None:
@@ -2401,7 +2417,6 @@ def talker_seed_self(
 
 def talker_seed_req(seed: int | None, rid: str) -> SimpleNamespace:
     sp = SimpleNamespace(
-        repetition_penalty=1.0,  # keep rep/suppress branches off
         temperature=0.8,
         top_p=0.9,
         top_k=20,
@@ -2411,7 +2426,9 @@ def talker_seed_req(seed: int | None, rid: str) -> SimpleNamespace:
     req = SimpleNamespace(
         sampling_params=sp, output_ids=[], _codec_suppress_tokens=None, rid=rid
     )
-    return SimpleNamespace(data=SimpleNamespace(req=req, suppress_tokens=None))
+    return SimpleNamespace(
+        data=SimpleNamespace(req=req, suppress_tokens=None, repetition_penalty=1.0)
+    )
 
 
 def test_talker_prepare_decode_buffers_unseeded_seed_is_rank_shared() -> None:
@@ -2457,7 +2474,6 @@ def talker_prep_req(
     suppress: list[int] | None = None,
 ) -> SimpleNamespace:
     sp = SimpleNamespace(
-        repetition_penalty=penalty,
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
@@ -2471,7 +2487,11 @@ def talker_prep_req(
         rid=rid,
     )
     return SimpleNamespace(
-        data=SimpleNamespace(req=req, suppress_tokens=list(suppress or []) or None)
+        data=SimpleNamespace(
+            req=req,
+            suppress_tokens=list(suppress or []) or None,
+            repetition_penalty=penalty,
+        )
     )
 
 
@@ -2580,7 +2600,7 @@ def expected_decode_masks(
     suppress_mask = torch.zeros(len(requests), vocab, dtype=torch.bool)
     for row_idx, sched_req in enumerate(requests):
         req = sched_req.data.req
-        if req.sampling_params.repetition_penalty != 1.0:
+        if sched_req.data.repetition_penalty != 1.0:
             for token in req.output_ids:
                 if 0 <= token < vocab:
                     repetition_mask[row_idx, token] = True
@@ -2858,6 +2878,67 @@ def test_talker_prefill_forward_invalidates_next_decode_reuse() -> None:
     )
 
     assert float(fake.sampling_temperatures[0, 0]) == pytest.approx(0.8)
+
+
+@dataclass
+class PenalizerBatch:
+    reqs: list[SimpleNamespace]
+    device: torch.device
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="compares against the CUDA penalizer"
+)
+def test_talker_resumed_history_penalty_matches_sglang_repetition_penalizer() -> None:
+    device = torch.device("cuda")
+    vocab_size = 64
+    histories = [
+        [3, 3, 7, 1, 60, 7, 12, 3, 45, 9, 22, 1],
+        [2, 5, 5, 9, 14, 2, 30, 31, 33, 5, 2, 9],
+        [0, 63, 8, 8, 17, 40, 41, 0, 52, 19, 63, 8],
+    ]
+    generator = torch.Generator().manual_seed(0)
+    logits = (torch.randn(4, vocab_size, generator=generator) * 8).to(torch.bfloat16)
+    logits[0, 3] = 0.0
+    logits[0, 7] = float("-inf")
+    logits[2, 0] = -0.0
+    logits = logits.to(device)
+
+    talker_requests = [
+        SimpleNamespace(
+            data=SimpleNamespace(
+                repetition_penalty=penalty,
+                req=SimpleNamespace(output_ids=list(output_ids)),
+            )
+        )
+        for penalty, output_ids in zip([1.05, 1.0, 1.3, 1.05], histories + [[]])
+    ]
+    talker_logits = logits.clone()
+    QwenTalkerModelRunner.process_sampling_logits(
+        prefill_runner(),
+        LogitsProcessorOutput(next_token_logits=talker_logits),
+        talker_requests,
+    )
+
+    batch = PenalizerBatch(
+        reqs=[
+            SimpleNamespace(sampling_params=SimpleNamespace(repetition_penalty=penalty))
+            for penalty in [1.05, 1.0, 1.3, 1.0]
+        ],
+        device=device,
+    )
+    orchestrator = BatchedPenalizerOrchestrator(
+        vocab_size=vocab_size,
+        batch=batch,
+        penalizers={BatchedRepetitionPenalizer},
+    )
+    for step_tokens in zip(*histories, histories[0]):
+        orchestrator.cumulate_output_tokens(torch.tensor(step_tokens, device=device))
+    sglang_logits = logits.clone()
+    orchestrator.apply(sglang_logits)
+
+    assert torch.equal(talker_logits, sglang_logits)
 
 
 @pytest.mark.parametrize(("is_rocm", "expected"), [(True, False), (False, True)])

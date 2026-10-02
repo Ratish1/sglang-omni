@@ -8,6 +8,7 @@ from queue import Queue
 from typing import TYPE_CHECKING, TypeAlias
 
 import torch
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -15,6 +16,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.types import (
@@ -329,6 +331,53 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
     ) -> bool:
         del forward_batch, schedule_batch, requests
         return False
+
+    def process_sampling_logits(
+        self, logits_output: LogitsProcessorOutput, requests: list[SchedulerRequest]
+    ) -> None:
+        # note (ratish): a retract re-prefill resumes with output history, which the
+        # talker penalizes here in float32 as SGLang's repetition penalizer would.
+        logits = logits_output.next_token_logits
+        vocab_size = logits.shape[1]
+        history_rows: list[int] = []
+        history_token_ids: list[int] = []
+        history_penalties: list[float] = []
+        for row_idx, sched_req in enumerate(requests):
+            request_data = sched_req.data
+            if request_data.repetition_penalty != 1.0:
+                token_ids = {
+                    token_id
+                    for token_id in request_data.req.output_ids
+                    if 0 <= token_id < vocab_size
+                }
+                history_rows.extend([row_idx] * len(token_ids))
+                history_token_ids.extend(token_ids)
+                history_penalties.extend(
+                    [request_data.repetition_penalty] * len(token_ids)
+                )
+            else:
+                pass
+        if not history_rows:
+            return
+        else:
+            pass
+        device = logits.device
+        pin_memory = current_platform.is_pin_memory_available(device)
+        history_index = torch.tensor(
+            [history_rows, history_token_ids], dtype=torch.int64, pin_memory=pin_memory
+        ).to(device, non_blocking=True)
+        penalties = torch.tensor(
+            history_penalties, dtype=torch.float32, pin_memory=pin_memory
+        ).to(device, non_blocking=True)
+        history_logits = logits[history_index[0], history_index[1]]
+        logits.index_put_(
+            (history_index[0], history_index[1]),
+            torch.where(
+                history_logits > 0,
+                history_logits / penalties,
+                history_logits * penalties,
+            ).to(logits.dtype),
+        )
 
     def is_decode_batch_ready(self, schedule_batch: ScheduleBatch) -> bool:
         if not self.feedback_enabled or not schedule_batch.forward_mode.is_decode():

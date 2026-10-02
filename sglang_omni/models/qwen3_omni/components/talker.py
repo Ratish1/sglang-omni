@@ -1141,7 +1141,7 @@ class Qwen3OmniTalker(nn.Module):
             req = data.req
             sp = req.sampling_params
 
-            penalty = float(sp.repetition_penalty)
+            penalty = float(data.repetition_penalty)
             rep_penalties.append(penalty)
             temperatures.append(float(sp.temperature))
             top_ps.append(float(sp.top_p))
