@@ -63,6 +63,13 @@ LOAD_PID=$!
 # serve <label> <model> <port> <args...>: starts a server in its own process group
 serve() {
   local label=$1 model=$2 port=$3; shift 3
+  # the node's network is shared by every container on it: a port that already accepts
+  # connections belongs to someone else, and its health check would pass for our server
+  if (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+    echo "$label port $port already in use by another process $(date +%T)" >> "$OUT/progress.txt"
+    echo "$label port $port already in use" >> "$OUT/FAILED"
+    return 1
+  fi
   setsid bash -c "echo \$\$ > $OUT/$label.pgid; exec env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=${SERVER_PYTHONPATH:+$SERVER_PYTHONPATH:}$TREE \
     $PIN python3 -u -m sglang_omni.cli serve --model-path $model $* --host 127.0.0.1 --port $port" > "$OUT/$label.log" 2>&1 &
   local began=$(date +%s) healthy=0

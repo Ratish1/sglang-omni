@@ -5,10 +5,10 @@
 # PIN_LAYOUT=numa1 the H200 map for cards that all sit on NUMA node 1,
 # whose four leased cards all sit on NUMA node 0 (CPUs 0-31,64-95).
 DTYPE=${DTYPE:-h200}
-# PORT_BASE moves the servers off 8000 to 8300 (and their scorers off 8100 to 8400) when another
-# tenant on the host network holds those ports. A card's scorer takes its server port plus 100,
+# PORT_BASE (default 18000, off the 8000s other tenants serve on) sets the servers' ports
+# 18000 to 18300 and their scorers' 18100 to 18400; run_bench_boot.sh refuses a port in use. A card's scorer takes its server port plus 100,
 # which is the next card's server port; PORT_STEP=200 keeps a pair on adjacent cards apart.
-PORT_BASE=${PORT_BASE:-8000}
+PORT_BASE=${PORT_BASE:-18000}
 PORT_STEP=${PORT_STEP:-100}
 W=/workspace/sglang-omni/.tmp
 S=$W/wt/tools/tasks/qwen3_omni_perf_20260923/scripts

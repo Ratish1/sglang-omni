@@ -26,6 +26,12 @@ mkdir -p "$OUT"
 cd "$TREE" || exit 1
 
 echo "start $(date +%T) card $CARD mode $MODE conc $CONC arm $ARM warm ${WARM:-32} window ${WINDOW:-16}" > "$OUT/progress.txt"
+# the node's network is shared by every container on it: a port that already accepts
+# connections belongs to someone else
+if (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
+  echo "port $PORT already in use by another process" > "$OUT/FAILED"
+  exit 1
+fi
 git -C "$TREE" rev-parse HEAD > "$OUT/head.txt"
 echo "$SERVE_ARGS" > "$OUT/serve_args.txt"
 md5sum "$0" "$S/run_bench.py" > "$OUT/md5.txt"
