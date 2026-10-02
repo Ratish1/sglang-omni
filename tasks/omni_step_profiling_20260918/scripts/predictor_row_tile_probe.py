@@ -154,6 +154,7 @@ def main() -> None:
     else:
 
         def build(batch, fused):
+            tts.FUSED_MAX_BS = batch
             return tts.real_shape_talker(device, layers, final_norm, fused=fused)
 
     reference = None
