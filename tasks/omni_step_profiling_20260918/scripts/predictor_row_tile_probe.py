@@ -31,6 +31,40 @@ def time_ms(fn, inputs) -> float:
     return statistics.median(times[3:])
 
 
+def graph_step_ms(talker, batch: int, pair, single) -> float:
+    """One served predictor step, the opening pair then 14 single-token passes,
+    captured in a CUDA graph; the median replay time."""
+
+    def step():
+        talker.predictor_forward_tokens(
+            token_embeds=pair, batch_size=batch, cache_len=0
+        )
+        for cache_len in range(2, 16):
+            talker.predictor_forward_tokens(
+                token_embeds=single, batch_size=batch, cache_len=cache_len
+            )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step()
+        step()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    times = []
+    for _ in range(23):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end))
+    return statistics.median(times[3:])
+
+
 def kernel_resources(predictor_kernels) -> None:
     device = torch.cuda.current_device()
     optin = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
@@ -138,8 +172,12 @@ def main() -> None:
                     single_ms = time_ms(
                         run_single, [single[:batch].clone() for _ in range(33)]
                     )
+                    step_ms = graph_step_ms(
+                        talker, batch, pair[:batch].clone(), single[:batch].clone()
+                    )
                     line.append(
-                        f"{path} pair {pair_ms:.3f} ms single {single_ms:.3f} ms"
+                        f"{path} pair {pair_ms:.3f} ms single {single_ms:.3f} ms "
+                        f"graph step {step_ms:.3f} ms"
                     )
                     if path == "fused":
                         rows = (out_pair[:1], out_single[:1], k_row, v_row)
