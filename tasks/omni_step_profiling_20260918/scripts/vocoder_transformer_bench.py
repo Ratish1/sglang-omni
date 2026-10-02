@@ -216,6 +216,10 @@ def compiled_arm(args) -> None:
         MODEL, device="cuda", dtype="bfloat16", attn_implementation=None
     ).model.decoder.pre_transformer.eval()
     fused = FusedTransformer(transformer)
+    torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+    torch._dynamo.config.accumulated_recompile_limit = max(
+        torch._dynamo.config.accumulated_recompile_limit, 256
+    )
     compiled = torch.compile(
         lambda x, keys, values, positions: current_call(
             transformer, x, keys, values, positions
