@@ -21,8 +21,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.runtime_context import get_context
 from torch import nn
 
-from sglang_omni.models.qwen3_omni.components import predictor_kernels
-from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
+from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
+from sglang_omni.platforms import current_platform
+from sglang_omni.platforms.cuda import CUDAOmniPlatform
+from sglang_omni.platforms.rocm import ROCMOmniPlatform
+from sglang_omni.utils import predictor_layers
+from sglang_omni.utils.predictor_layers import (
     HIDDEN_SIZE,
     MAX_FUSED_ROWS,
     add_rmsnorm_rounded,
@@ -31,10 +35,6 @@ from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
     split_count,
     supports_exact_add_rmsnorm,
 )
-from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
-from sglang_omni.platforms import current_platform
-from sglang_omni.platforms.cuda import CUDAOmniPlatform
-from sglang_omni.platforms.rocm import ROCMOmniPlatform
 from tests.unit_test.fixtures.qwen_predictor import TupleLinear
 
 HIDDEN = 1024
@@ -513,7 +513,7 @@ def test_resolver_keeps_the_plain_path_for_a_partitioned_projection() -> None:
 def test_without_triton_the_predictor_keeps_the_plain_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(predictor_kernels, "HAS_TRITON", False)
+    monkeypatch.setattr(predictor_layers, "HAS_TRITON", False)
     cuda = torch.device("cuda")
     assert not supports_exact_add_rmsnorm(HIDDEN_SIZE, torch.bfloat16, cuda)
     assert (
@@ -562,10 +562,10 @@ def test_exact_add_rmsnorm_applies_to_the_predictor_shape_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cuda = torch.device("cuda")
-    monkeypatch.setattr(predictor_kernels, "HAS_TRITON", True)
-    monkeypatch.setattr(predictor_kernels, "current_platform", ROCMOmniPlatform())
+    monkeypatch.setattr(predictor_layers, "HAS_TRITON", True)
+    monkeypatch.setattr(predictor_layers, "current_platform", ROCMOmniPlatform())
     assert not supports_exact_add_rmsnorm(HIDDEN_SIZE, torch.bfloat16, cuda)
-    monkeypatch.setattr(predictor_kernels, "current_platform", CUDAOmniPlatform())
+    monkeypatch.setattr(predictor_layers, "current_platform", CUDAOmniPlatform())
     assert supports_exact_add_rmsnorm(HIDDEN_SIZE, torch.bfloat16, cuda)
     assert not supports_exact_add_rmsnorm(2048, torch.bfloat16, cuda)
     assert not supports_exact_add_rmsnorm(HIDDEN_SIZE, torch.float16, cuda)

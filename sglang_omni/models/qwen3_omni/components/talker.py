@@ -19,7 +19,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import add_prefix
 from torch import nn
 
-from sglang_omni.models.qwen3_omni.components import predictor_kernels
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextDecoderLayer,
@@ -35,6 +34,11 @@ from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
     derive_sampling_seed,
     resolve_row_seed,
+)
+from sglang_omni.utils.predictor_layers import (
+    add_rmsnorm_rounded,
+    resolve_fused_predictor_layers,
+    supports_exact_add_rmsnorm,
 )
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.distributed import tensor_model_parallel_all_reduce
@@ -904,7 +908,7 @@ class Qwen3OmniTalker(nn.Module):
         self.predictor_pair_cache_slots = (
             self.predictor_cache_slots[:2, :].t().reshape(-1).contiguous()
         )
-        self.predictor_fused_layers = predictor_kernels.resolve_fused_predictor_layers(
+        self.predictor_fused_layers = resolve_fused_predictor_layers(
             self.code_predictor,
             predictor_len,
             max_batch_size,
@@ -913,7 +917,7 @@ class Qwen3OmniTalker(nn.Module):
         )
         # note (ratish): where the exact kernel does not apply, the add and the norm
         # stay two launches.
-        self.predictor_exact_add_norm = predictor_kernels.supports_exact_add_rmsnorm(
+        self.predictor_exact_add_norm = supports_exact_add_rmsnorm(
             hidden_size, self.model.codec_embedding.weight.dtype, device
         )
         self.sampled_token_ids = torch.zeros(
@@ -1797,7 +1801,7 @@ class Qwen3OmniTalker(nn.Module):
         """residual + hidden_states, then the norm of the rounded sum, as the plain
         path computes it; one launch where the exact kernel applies, else two."""
         if self.predictor_exact_add_norm:
-            return predictor_kernels.add_rmsnorm_rounded(
+            return add_rmsnorm_rounded(
                 hidden_states, residual, norm.weight, norm.variance_epsilon
             )
         else:

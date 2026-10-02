@@ -28,9 +28,6 @@ from sglang.srt.utils import add_prefix
 from sglang.srt.utils.common import is_pin_memory_available
 from torch import nn
 
-from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
-    resolve_fused_predictor_layers,
-)
 from sglang_omni.models.qwen3_omni.components.talker import (  # noqa: E501
     Qwen3OmniMoeTalkerDenseMLP,
     ResizeMLP,
@@ -56,6 +53,7 @@ from sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph import (
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import ReplayableGraph
 from sglang_omni.scheduling.types import SchedulerRequest
+from sglang_omni.utils.predictor_layers import resolve_fused_predictor_layers
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.layers import ReplicatedLinear, RMSNorm
 from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
