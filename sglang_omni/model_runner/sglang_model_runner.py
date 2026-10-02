@@ -6,8 +6,8 @@ import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any
 
+import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -52,9 +52,9 @@ def install_prefill_runner_dispatch() -> None:
 
 
 def filter_weights_by_prefix(
-    weights: Iterator[tuple[str, Any]],
+    weights: Iterator[tuple[str, torch.Tensor]],
     prefix: str | None,
-) -> Iterator[tuple[str, Any]]:
+) -> Iterator[tuple[str, torch.Tensor]]:
     """Filter weight iterator by prefix, stripping matched prefix from names."""
     if not prefix:
         yield from weights
@@ -68,7 +68,7 @@ def filter_weights_by_prefix(
             pass
 
 
-def free_gpu_memory_bytes(device: Any, gpu_id: int) -> int:
+def free_gpu_memory_bytes(device: str, gpu_id: int) -> int:
     """Currently free GPU memory in bytes, min-reduced across the world group."""
     from sglang.srt.distributed.parallel_state import get_world_group
     from sglang.srt.utils.common import get_available_gpu_memory
@@ -650,6 +650,7 @@ class SGLModelRunner(ModelRunner):
             "FunCosyVoice3SGLangModel": "sglang_omni.models.fun_cosyvoice3.sglang_model:FunCosyVoice3SGLangModel",
             "NemotronVoiceChatForCausalLM": "sglang_omni.models.nemotron_voicechat.thinker:NemotronVoiceChatForCausalLM",
             "NemotronVoiceChatTalker": "sglang_omni.models.nemotron_voicechat.talker:NemotronVoiceChatTalker",
+            "PersonaPlexForCausalLM": "sglang_omni.models.personaplex.sglang_model:PersonaPlexForCausalLM",
             "MiniCPMO": "sglang_omni.models.minicpm_o.components.sglang_thinker:MiniCPMOThinkerForCausalLM",
         }
         for arch, path in sglang_omni_models.items():
