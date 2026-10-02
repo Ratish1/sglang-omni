@@ -35,6 +35,7 @@ from dataclasses import dataclass
 import torch
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.runtime_context import get_exec
 
 from sglang_omni.platforms import current_platform
 
@@ -879,7 +880,9 @@ def resolve_fused_predictor_layers(
     opening pair runs as one pass of two rows per request; the layers cover passes of
     up to MAX_FUSED_ROWS rows."""
     shape = resolve_predictor_layer_shape(code_predictor, predictor_len, device)
-    if shape is None:
+    # note (ratish): deterministic inference promises the same bits at every batch size,
+    # and a pass above MAX_FUSED_ROWS runs plain.
+    if shape is None or get_exec().deterministic.enable_deterministic_inference:
         return None
     else:
         max_rows = min(2 * max_batch_size, MAX_FUSED_ROWS)

@@ -524,6 +524,22 @@ def test_without_triton_the_predictor_keeps_the_plain_path(
     )
 
 
+@accelerator
+@pytest.mark.accelerator
+def test_deterministic_inference_keeps_the_plain_path() -> None:
+    """Deterministic inference promises a request the same bits at every batch size; a
+    pass above MAX_FUSED_ROWS runs plain, so the fused layers must stay off."""
+    device = torch.device("cuda")
+    talker = build_talker(device, seed=25)
+    with get_context().override_server_args(enable_deterministic_inference=True):
+        assert (
+            resolve_fused_predictor_layers(
+                talker.code_predictor, PREDICTOR_LEN, MAX_BS, device, DTYPE
+            )
+            is None
+        )
+
+
 def test_split_count_lands_the_program_count_nearest_the_sms() -> None:
     assert split_count(32, 16, 132) == 4
     assert split_count(32, 24, 132) == 4

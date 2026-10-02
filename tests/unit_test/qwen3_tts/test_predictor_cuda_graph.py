@@ -2281,10 +2281,6 @@ def fused_and_plain_errors_to_fp32(
     torch.manual_seed(seed)
     layers = [real_shape_layer(device) for _ in range(FUSED_LAYERS)]
     final_norm = real_shape_norm(FUSED_HIDDEN, device)
-    talkers = {
-        "plain": real_shape_talker(device, layers, final_norm, fused=False),
-        "fused": real_shape_talker(device, layers, final_norm, fused=True),
-    }
     steps = [torch.randn(batch_size, 2, FUSED_HIDDEN, device=device, dtype=DTYPE)]
     steps += [
         torch.randn(batch_size, 1, FUSED_HIDDEN, device=device, dtype=DTYPE)
@@ -2309,6 +2305,10 @@ def fused_and_plain_errors_to_fp32(
         ),
         torch.no_grad(),
     ):
+        talkers = {
+            "plain": real_shape_talker(device, layers, final_norm, fused=False),
+            "fused": real_shape_talker(device, layers, final_norm, fused=True),
+        }
         cache_len = 0
         for step in steps:
             for name, talker in talkers.items():
