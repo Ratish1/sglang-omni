@@ -2,7 +2,7 @@
 OLD_FILE against the importable one.
 
 Builds both incremental decoders over one real Qwen3-TTS decoder, checks their
-channels-last weight copies hold the same values and reach cuDNN as the same 4D views,
+channels-last weights hold the same values with the same strides,
 then for widths 1, 2 and 8 frames at buckets 1, 2, 4 and 8 decodes three chained steps
 from a full-width state with each and checks torch.equal on every waveform and every
 conv history and transposed-conv overlap.
@@ -49,14 +49,14 @@ def main() -> None:
         old_decoder.channels_last_weights.keys()
         == new_decoder.channels_last_weights.keys()
     )
-    views_equal = True
-    for key, old_weight in old_decoder.channels_last_weights.items():
-        new_weight = new_decoder.channels_last_weights[key]
-        new_view = new_weight.unsqueeze(3 if old_weight.shape[2] != 1 else 2)
-        views_equal &= torch.equal(old_weight, new_view)
-        views_equal &= new_view.is_contiguous(memory_format=torch.channels_last)
+    weights_equal = all(
+        torch.equal(old_weight, new_decoder.channels_last_weights[key])
+        and old_weight.stride() == new_decoder.channels_last_weights[key].stride()
+        for key, old_weight in old_decoder.channels_last_weights.items()
+    )
     print(
-        f"weight copies: {len(new_decoder.channels_last_weights)} keys, equal 4D channels-last views {views_equal}"
+        f"channels-last weights: {len(new_decoder.channels_last_weights)} keys, "
+        f"equal values and strides {weights_equal}"
     )
     torch.manual_seed(0)
     all_identical = True
