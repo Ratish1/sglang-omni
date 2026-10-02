@@ -120,6 +120,8 @@ for name in ${ROUNDS:-c16 c16_swapped longform_c16 longform_c16_swapped c1_seede
     c16_seeded_swapped) round c16_seeded_swapped "$CARD2" "$CARD1" yes $META --concurrency 16 --seed 1234 ;;
     #c1_seed_<n>: a seeded c1 pair at seed n, an independent deterministic draw per seed
     c1_seed_*) round "$name" "$CARD1" "$CARD2" yes $META --concurrency 1 --seed "${name#c1_seed_}" ;;
+    #conc_<n>: a scored pair at concurrency n
+    conc_*) round "$name" "$CARD1" "$CARD2" yes $META --concurrency "${name#conc_}" ;;
   esac
 done
 echo "all done $(date +%T)" > "$OUT/DONE"
