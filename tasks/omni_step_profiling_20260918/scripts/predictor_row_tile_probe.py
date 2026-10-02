@@ -7,7 +7,7 @@ exception, the median time of each pass, and whether request 0's fused outputs a
 rows equal the batch-1 run bit for bit. Then every compiled kernel's BLOCK_M, registers,
 spills and shared memory, against the device's opt-in shared memory per block.
 
-usage: PYTHONPATH=<tree> python predictor_row_tile_probe.py 1,8,16,32,64,65,128,256,513
+usage: PYTHONPATH=<tree> python predictor_row_tile_probe.py 1,8,16,32,64,65,128 [tts|omni]
 """
 
 from __future__ import annotations
@@ -142,6 +142,20 @@ def main() -> None:
         largest, 1, tts.FUSED_HIDDEN, device=device, generator=generator
     )
     pair, single = pair.to(tts.DTYPE), single.to(tts.DTYPE)
+    model = sys.argv[2] if len(sys.argv) > 2 else "tts"
+    if model == "omni":
+        from tests.unit_test.qwen3_omni import test_predictor_kernels as omni
+
+        def build(batch, fused):
+            sized = {"max_bs": batch} if batch > omni.MAX_BS else {}
+            talker = omni.build_talker(device, seed=0, **sized)
+            return omni.fuse(talker) if fused else talker
+
+    else:
+
+        def build(batch, fused):
+            return tts.real_shape_talker(device, layers, final_norm, fused=fused)
+
     reference = None
     with (
         get_context().override_server_args(
@@ -152,13 +166,10 @@ def main() -> None:
         torch.no_grad(),
     ):
         for batch in batches:
-            tts.FUSED_MAX_BS = batch
             line = [f"batch {batch:4d} (pair rows {2 * batch:4d})"]
             for path in ("plain", "fused"):
                 try:
-                    talker = tts.real_shape_talker(
-                        device, layers, final_norm, fused=path == "fused"
-                    )
+                    talker = build(batch, path == "fused")
 
                     def run_pair(tokens):
                         return talker.predictor_forward_tokens(
