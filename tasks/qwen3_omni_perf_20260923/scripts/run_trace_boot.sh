@@ -25,7 +25,7 @@ URL=http://127.0.0.1:$PORT
 mkdir -p "$OUT"
 cd "$TREE" || exit 1
 
-echo "start $(date +%T) card $CARD mode $MODE conc $CONC arm $ARM warm ${WARM:-32} window ${WINDOW:-48}" > "$OUT/progress.txt"
+echo "start $(date +%T) card $CARD mode $MODE conc $CONC arm $ARM warm ${WARM:-32} window ${WINDOW:-16}" > "$OUT/progress.txt"
 git -C "$TREE" rev-parse HEAD > "$OUT/head.txt"
 echo "$SERVE_ARGS" > "$OUT/serve_args.txt"
 md5sum "$0" "$S/run_bench.py" > "$OUT/md5.txt"
@@ -48,16 +48,17 @@ if [ $healthy = 1 ]; then
   curl -s -X POST $URL/start_profile -H 'Content-Type: application/json' \
     -d "{\"run_id\": \"trace\", \"trace_path_template\": \"$OUT/{stage}\", \"enable_torch\": true}" >> "$OUT/progress.txt"
   CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
-    --concurrency "$CONC" --out "$OUT/window" --max-samples "${WINDOW:-48}" > "$OUT/gen_window.log" 2>&1
+    --concurrency "$CONC" --out "$OUT/window" --max-samples "${WINDOW:-16}" > "$OUT/gen_window.log" 2>&1
   echo "window rc $? $(date +%T)" >> "$OUT/progress.txt"
   curl -s -X POST $URL/stop_profile -H 'Content-Type: application/json' -d '{}' >> "$OUT/progress.txt"
-  # a trace is complete when gzip has removed its .trace.json; processes export one after
-  # another, so wait until no .trace.json is left and the .gz set held for a minute
+  # a trace is complete when gzip has removed its .trace.json; the profiler first writes
+  # .trace.json.tmp and renames it, and processes export one after another, so wait until
+  # neither is left and the .gz set held for a minute
   last="" still=0
-  for _ in $(seq 360); do
+  for _ in $(seq 720); do
     sleep 5
     now=$(ls "$OUT"/*.trace.json.gz 2>/dev/null | tr '\n' ' ')
-    if [ -n "$now" ] && [ "$now" = "$last" ] && ! ls "$OUT"/*.trace.json >/dev/null 2>&1; then
+    if [ -n "$now" ] && [ "$now" = "$last" ] && ! ls "$OUT"/*.trace.json "$OUT"/*.trace.json.tmp >/dev/null 2>&1; then
       still=$((still + 1))
     else
       still=0
