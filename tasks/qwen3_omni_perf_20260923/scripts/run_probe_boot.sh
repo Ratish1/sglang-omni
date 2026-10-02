@@ -7,6 +7,8 @@
 # op labels at graph capture. WARM_SAMPLES (default 32) run before the window; MAX_SAMPLES
 # (default 128) bound the report. Only the serve
 # is sent TERM; nsys finalizes by itself. Export and census run here, in the container.
+# PIN_CPUS (e.g. 56-69,168-181) runs the server and the load on those cores with memory on NUMA
+# node PIN_NODE, as run_bench_boot.sh does, so cells on different cards do not share cores.
 # DCGM_SAMPLES names the samples file a host-side dcgm/dcgm_sampler.py writes for this card
 # (H100 host only): the census adds section K, and a clean boot gets dcgm.txt, the window means.
 # usage: run_probe_boot.sh <tree> <out dir> <card> <port> <h200|bf16|fp8> <concurrency> <arm>
@@ -20,6 +22,7 @@ case $DTYPE in
   *) echo "dtype must be bf16, fp8 or h200"; exit 1 ;;
 esac
 SERVE_ARGS="--config $CONFIG --colocate --preprocessing.factory.max_seq_len 32768 --thinker.factory.max_seq_len 32768 ${EXTRA_SERVE_ARGS:-}"
+PIN=${PIN_CPUS:+numactl --physcpubind=$PIN_CPUS --membind=${PIN_NODE:-0}}
 NSYS_ARGS=${NSYS_ARGS:---trace=cuda,nvtx,osrt,python-gil --cuda-graph-trace=node --gpuctxsw=true --sample=none --cpuctxsw=none}
 if [ "$NSYS_ARGS" = none ]; then
   WRAP="" PROBE=""
@@ -37,6 +40,7 @@ if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health)" =
 fi
 
 echo "start $(date +%T) card $CARD dtype $DTYPE conc $CONC arm $ARM samples ${MAX_SAMPLES:-128}" > "$OUT/progress.txt"
+echo "cpu pin: ${PIN:-none}" >> "$OUT/progress.txt"
 git -C "$TREE" rev-parse HEAD > "$OUT/head.txt"
 git -C "$TREE" status --short > "$OUT/tree_status.txt"
 md5sum "$0" "$S/run_bench.py" "$S/omni_census.py" "$S/omni_pipeline_nvtx/sitecustomize.py" > "$OUT/md5.txt"
@@ -50,7 +54,7 @@ nvidia-smi dmon -i "$CARD" -s pucm -d 1 > "$OUT/dmon.log" 2>&1 &
 DMON=$!
 
 env CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE${PROBE:+:$S/omni_pipeline_nvtx} $PROBE \
-  setsid $WRAP python3 -u -m sglang_omni.cli serve --model-path $MODEL $SERVE_ARGS --host 127.0.0.1 --port $PORT \
+  setsid $PIN $WRAP python3 -u -m sglang_omni.cli serve --model-path $MODEL $SERVE_ARGS --host 127.0.0.1 --port $PORT \
   > "$OUT/serve.log" 2>&1 &
 WRAP_PID=$!
 echo "pgid $WRAP_PID" >> "$OUT/progress.txt"
@@ -66,11 +70,11 @@ if [ $healthy = 1 ]; then
   # the warm pass runs the arm's first samples at the same concurrency outside the window,
   # so one-time costs (lazy compiles, first shapes) land before it; the measured pass skips
   # them, so no measured prompt hits the thinker's radix cache from the warm pass
-  CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
+  CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
     --concurrency "$CONC" --out "$OUT/warm" --max-samples "${WARM_SAMPLES:-32}" > "$OUT/warm_$ARM.log" 2>&1
   echo "warm rc $? $(date +%T)" >> "$OUT/progress.txt"
   date +%s.%N > "$OUT/window.txt"
-  CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
+  CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
     --concurrency "$CONC" --out "$OUT" --max-samples "${MAX_SAMPLES:-128}" \
     --skip-samples "${WARM_SAMPLES:-32}" > "$OUT/gen_$ARM.log" 2>&1
   echo "gen rc $? $(date +%T)" >> "$OUT/progress.txt"
