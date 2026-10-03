@@ -7,10 +7,11 @@ import json
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, cast
+from typing import cast
 
 from fastapi import Request
 
+from sglang_omni.utils.json import JsonValue
 from sglang_omni_router.python.config import DEFAULT_CAPABILITIES, Capability
 from sglang_omni_router.python.worker import ServiceClass
 
@@ -109,6 +110,7 @@ class LargeJsonMetadata:
     request_id: str | None = None
     model: str | None = None
     stream: bool | None = None
+    stream_format: str | None = None
 
 
 def extract_route_metadata(
@@ -135,7 +137,7 @@ def extract_route_metadata(
         len(body) > ROUTE_METADATA_JSON_LIMIT_BYTES
     )
 
-    payload: dict[str, Any] | None = None
+    payload: dict[str, JsonValue] | None = None
     large_json_metadata: LargeJsonMetadata | None = None
     if has_json_body and body and not is_body_over_metadata_limit:
         payload = parse_json_object(body)
@@ -155,7 +157,9 @@ def extract_route_metadata(
             if speech_facts is not None
             else string_or_none(payload.get("model"))
         )
-        stream = payload.get("stream") is True
+        stream = payload.get("stream") is True or (
+            route_kind is RouteKind.SPEECH and payload.get("stream_format") == "sse"
+        )
         capabilities = required_capabilities(
             route_kind,
             payload,
@@ -177,7 +181,10 @@ def extract_route_metadata(
     elif large_json_metadata is not None:
         request_id = request_id or large_json_metadata.request_id
         model = large_json_metadata.model
-        stream = large_json_metadata.stream is True
+        stream = large_json_metadata.stream is True or (
+            route_kind is RouteKind.SPEECH
+            and large_json_metadata.stream_format == "sse"
+        )
         capabilities = required_capabilities(
             route_kind,
             payload,
@@ -206,8 +213,7 @@ def extract_route_metadata(
             if form.model is not None:
                 if has_route_model_header and route_model != form.model:
                     raise RouteMetadataError(
-                        f"{ROUTE_MODEL_HEADER} conflicts with the multipart "
-                        "form model"
+                        f"{ROUTE_MODEL_HEADER} conflicts with the multipart form model"
                     )
                 model = form.model
             if form.stream is not None:
@@ -328,7 +334,7 @@ def is_json_request(request: Request) -> bool:
     return "json" in request.headers.get("content-type", "").lower()
 
 
-def parse_json_object(body: bytes) -> dict[str, Any]:
+def parse_json_object(body: bytes) -> dict[str, JsonValue]:
     try:
         payload = json.loads(body)
     except Exception:
@@ -347,7 +353,7 @@ def scan_large_json_metadata(body: bytes) -> LargeJsonMetadata:
 
 
 class JsonTopLevelScanner:
-    _METADATA_KEYS = {"model", "request_id", "stream"}
+    _METADATA_KEYS = {"model", "request_id", "stream", "stream_format"}
 
     def __init__(self, body: bytes):
         self._body = body
@@ -413,6 +419,8 @@ class JsonTopLevelScanner:
             if value:
                 if key == "model":
                     metadata.model = value
+                elif key == "stream_format":
+                    metadata.stream_format = value
                 else:
                     metadata.request_id = value
             return next_index
@@ -625,7 +633,7 @@ def content_disposition_name(header_block: bytes) -> tuple[str | None, bool]:
 
 def required_capabilities(
     route_kind: RouteKind,
-    payload: dict[str, Any] | None,
+    payload: dict[str, JsonValue] | None,
     *,
     stream: bool,
     route_capabilities: set[Capability],
@@ -660,7 +668,7 @@ def required_capabilities(
 
 def infer_payload_capabilities(
     route_kind: RouteKind,
-    payload: dict[str, Any],
+    payload: dict[str, JsonValue],
     *,
     speech_facts: SpeechRouteFacts | None,
 ) -> set[Capability]:
@@ -689,7 +697,7 @@ def service_class_for_route(route_kind: RouteKind) -> ServiceClass:
 
 
 def extract_speech_route_facts(
-    payload: dict[str, Any],
+    payload: dict[str, JsonValue],
     route_kind: RouteKind,
 ) -> SpeechRouteFacts:
     if route_kind is RouteKind.SPEECH:
@@ -699,7 +707,7 @@ def extract_speech_route_facts(
     raise ValueError(f"{route_kind.value} is not a speech route")
 
 
-def speech_route_facts(payload: dict[str, Any]) -> SpeechRouteFacts:
+def speech_route_facts(payload: dict[str, JsonValue]) -> SpeechRouteFacts:
     resolved_voice_name = voice_name(payload)
     has_explicit_reference = has_explicit_speech_reference(payload)
     return SpeechRouteFacts(
@@ -713,7 +721,7 @@ def speech_route_facts(payload: dict[str, Any]) -> SpeechRouteFacts:
     )
 
 
-def speech_batch_route_facts(payload: dict[str, Any]) -> SpeechRouteFacts:
+def speech_batch_route_facts(payload: dict[str, JsonValue]) -> SpeechRouteFacts:
     items = payload.get("items")
     if not isinstance(items, list):
         return speech_route_facts(payload)
@@ -753,7 +761,7 @@ def speech_batch_route_facts(payload: dict[str, Any]) -> SpeechRouteFacts:
     )
 
 
-def voice_name(payload: dict[str, Any]) -> str | None:
+def voice_name(payload: dict[str, JsonValue]) -> str | None:
     value = payload.get("voice", payload.get("speaker"))
     if not isinstance(value, str):
         return None
@@ -761,7 +769,7 @@ def voice_name(payload: dict[str, Any]) -> str | None:
     return normalized or None
 
 
-def infer_input_field_capabilities(payload: dict[str, Any]) -> set[Capability]:
+def infer_input_field_capabilities(payload: dict[str, JsonValue]) -> set[Capability]:
     capabilities: set[Capability] = set()
     for field, capability in INPUT_FIELD_CAPABILITIES.items():
         if has_non_empty(payload.get(field)):
@@ -769,11 +777,11 @@ def infer_input_field_capabilities(payload: dict[str, Any]) -> set[Capability]:
     return capabilities
 
 
-def string_or_none(value: Any) -> str | None:
+def string_or_none(value: JsonValue) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def has_non_empty(value: Any) -> bool:
+def has_non_empty(value: JsonValue) -> bool:
     if value is None or value is False:
         return False
     if isinstance(value, (str, list, dict)):
@@ -781,7 +789,7 @@ def has_non_empty(value: Any) -> bool:
     return True
 
 
-def modalities_include_audio(payload: dict[str, Any]) -> bool:
+def modalities_include_audio(payload: dict[str, JsonValue]) -> bool:
     for field in OUTPUT_MODALITY_FIELDS:
         modalities = payload.get(field)
         if isinstance(modalities, list) and any(item == "audio" for item in modalities):
@@ -789,7 +797,7 @@ def modalities_include_audio(payload: dict[str, Any]) -> bool:
     return False
 
 
-def speech_has_reference_audio(payload: dict[str, Any]) -> bool:
+def speech_has_reference_audio(payload: dict[str, JsonValue]) -> bool:
     reference_fields = ("audio_path", "ref_audio", "audio", "data")
     if has_non_empty(payload.get("ref_audio")):
         return True
@@ -803,11 +811,11 @@ def speech_has_reference_audio(payload: dict[str, Any]) -> bool:
     )
 
 
-def has_explicit_speech_reference(payload: dict[str, Any]) -> bool:
+def has_explicit_speech_reference(payload: dict[str, JsonValue]) -> bool:
     return payload.get("ref_audio") is not None or bool(payload.get("references"))
 
 
-def infer_message_part_capabilities(messages: Any) -> set[Capability]:
+def infer_message_part_capabilities(messages: JsonValue) -> set[Capability]:
     capabilities: set[Capability] = set()
     if not isinstance(messages, list):
         return capabilities
