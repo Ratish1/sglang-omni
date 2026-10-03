@@ -128,13 +128,13 @@ from benchmarks.tasks.tts import (
     stream_outcome_collector,
 )
 from sglang_omni.admission import QueueFullError
-from sglang_omni.utils.logging import configure_hf_hub_logger
+from sglang_omni.utils.logging import configure_dependency_loggers
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
-configure_hf_hub_logger()
+configure_dependency_loggers()
 logger = logging.getLogger(__name__)
 
 DEFAULT_TTS_BENCHMARK_CONCURRENCY = int(os.getenv("TTS_BENCHMARK_CONCURRENCY", "16"))

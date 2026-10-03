@@ -43,7 +43,7 @@ from sglang_omni.utils.gpu_compat import (
 from sglang_omni.utils.gpu_memory import gpu_startup_lock
 from sglang_omni.utils.imports import import_string
 from sglang_omni.utils.ipc_weights import prepare_weight_share_process_compat
-from sglang_omni.utils.logging import configure_hf_hub_logger
+from sglang_omni.utils.logging import configure_dependency_loggers
 
 logger = logging.getLogger(__name__)
 
@@ -498,7 +498,7 @@ def stage_process_main(
         stream=sys.stdout,
     )
     logging.getLogger().setLevel(spec.log_level)
-    configure_hf_hub_logger()
+    configure_dependency_loggers()
     if not spec.stage_specs:
         raise ValueError(f"Process {spec.process_name!r} requires at least one stage")
     else:

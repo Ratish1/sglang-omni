@@ -25,7 +25,7 @@ from __future__ import annotations
 import argparse
 import logging
 
-from sglang_omni.utils.logging import configure_hf_hub_logger
+from sglang_omni.utils.logging import configure_dependency_loggers
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +152,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    configure_hf_hub_logger()
+    configure_dependency_loggers()
     download_dataset(DATASETS[args.dataset], revision=args.revision)
 
 

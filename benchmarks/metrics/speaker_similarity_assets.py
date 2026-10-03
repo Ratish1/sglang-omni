@@ -43,7 +43,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from sglang_omni.utils.logging import configure_hf_hub_logger
+from sglang_omni.utils.logging import configure_dependency_loggers
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +361,7 @@ def _main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    configure_hf_hub_logger()
+    configure_dependency_loggers()
     parser = argparse.ArgumentParser(
         description=(
             "Pre-download SeedTTS speaker-similarity assets into the cache "

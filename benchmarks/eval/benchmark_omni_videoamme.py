@@ -93,13 +93,13 @@ from benchmarks.metrics.performance import print_speed_summary
 from benchmarks.metrics.video import print_videomme_accuracy_summary
 from benchmarks.metrics.wer import print_wer_summary
 from benchmarks.tasks.video_understanding import VIDEOAMME_REQUEST_TEXT
-from sglang_omni.utils.logging import configure_hf_hub_logger
+from sglang_omni.utils.logging import configure_dependency_loggers
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
-configure_hf_hub_logger()
+configure_dependency_loggers()
 
 
 async def run_videoamme_eval(

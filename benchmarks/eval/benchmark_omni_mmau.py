@@ -27,7 +27,7 @@ from benchmarks.tasks.audio_understanding import (
     make_mmsu_send_fn,
     save_mmsu_results,
 )
-from sglang_omni.utils.logging import configure_hf_hub_logger
+from sglang_omni.utils.logging import configure_dependency_loggers
 
 DEFAULT_PROMPT = (
     "Listen to the audio and answer the multiple-choice question. "
@@ -38,7 +38,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
-configure_hf_hub_logger()
+configure_dependency_loggers()
 
 
 async def run(

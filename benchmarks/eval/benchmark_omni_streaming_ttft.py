@@ -52,13 +52,13 @@ from benchmarks.tasks.tts import (  # noqa: E402
     TalkerSamplingParams,
     talker_sampling_params,
 )
-from sglang_omni.utils.logging import configure_hf_hub_logger
+from sglang_omni.utils.logging import configure_dependency_loggers
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
-configure_hf_hub_logger()
+configure_dependency_loggers()
 logger = logging.getLogger(__name__)
 
 DEFAULT_STREAMING_TTFT_SEED = 1000
