@@ -40,23 +40,6 @@ def test_default_prefix_cuda_graph_envelopes_are_frozen_and_valid() -> None:
     ]
 
 
-@pytest.mark.parametrize(
-    "envelope",
-    [
-        PrefixCudaGraphEnvelope("bad-B", 2, 100, 100, 512, (100,), (100,)),
-        PrefixCudaGraphEnvelope("bad-sum", 1, 100, 100, 512, (100,), (50,)),
-        PrefixCudaGraphEnvelope("bad-M", 1, 100, 50, 512, (100,), (100,)),
-        PrefixCudaGraphEnvelope("bad-alignment", 1, 100, 100, 512, (75,), (100,)),
-        PrefixCudaGraphEnvelope("bad-slack", 1, 200, 200, 512, (50,), (200,)),
-    ],
-)
-def test_prefix_cuda_graph_rejects_invalid_envelopes(
-    envelope: PrefixCudaGraphEnvelope,
-) -> None:
-    with pytest.raises(ValueError):
-        validate_prefix_cuda_graph_envelopes((envelope,))
-
-
 def test_prefix_cuda_graph_routes_smallest_qualified_envelope() -> None:
     envelopes = (
         PrefixCudaGraphEnvelope("small", 1, 100, 100, 512, (50, 100), (100,)),

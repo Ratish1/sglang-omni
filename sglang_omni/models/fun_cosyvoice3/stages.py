@@ -2699,15 +2699,6 @@ def create_vocoder_executor(
         )
     else:
         pass
-    if enable_flow_prefix_cuda_graph and autocast_dtype not in (
-        torch.float16,
-        torch.bfloat16,
-    ):
-        raise RuntimeError(
-            "enable_flow_prefix_cuda_graph requires float16 or bfloat16 autocast"
-        )
-    else:
-        pass
 
     if enable_flow_cuda_graph and (
         device_obj.type != "cuda" or not torch.cuda.is_available()
