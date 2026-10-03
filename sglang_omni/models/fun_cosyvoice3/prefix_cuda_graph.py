@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -43,8 +42,8 @@ class PrefixCudaGraphEnvelope:
     new_frame_count: int
     max_new_frame_count: int
     max_total_frame_count: int
-    real_new_frame_counts: tuple[int, ...]
-    capture_new_frame_counts: tuple[int, ...]
+    qualified_new_frame_totals: tuple[int, ...]
+    capture_row_new_frames: tuple[int, ...]
 
 
 DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES: tuple[PrefixCudaGraphEnvelope, ...] = (
@@ -150,15 +149,6 @@ class PrefixCudaGraphCaptureStats:
     scratch_reserved_frames: int
 
 
-@dataclass(frozen=True)
-class PrefixCudaGraphRuntimeCounters:
-    hits: int
-    misses: int
-    hit_rate_pct: float
-    hits_by_envelope: dict[str, int]
-    misses_by_reason: dict[str, int]
-
-
 @dataclass
 class PreparedPrefixCudaGraph:
     noise: torch.Tensor
@@ -198,84 +188,6 @@ class CapturedPrefixCudaGraph:
     capture_s: float
 
 
-def validate_prefix_cuda_graph_envelopes(
-    envelopes: Sequence[PrefixCudaGraphEnvelope],
-    *,
-    chunk_size: int = PREFIX_CUDA_GRAPH_CHUNK_FRAMES,
-) -> None:
-    """Validate the frozen envelope contract without selecting new entries."""
-    names: set[str] = set()
-    for envelope in envelopes:
-        if not envelope.name or envelope.name in names:
-            raise ValueError(f"{envelope.name}: envelope names must be unique")
-        else:
-            pass
-        names.add(envelope.name)
-        if envelope.batch_size <= 0:
-            raise ValueError(f"{envelope.name}: batch_size must be positive")
-        else:
-            pass
-        if envelope.new_frame_count <= 0:
-            raise ValueError(f"{envelope.name}: N must be positive")
-        else:
-            pass
-        if envelope.max_new_frame_count <= 0:
-            raise ValueError(f"{envelope.name}: M must be positive")
-        else:
-            pass
-        if envelope.max_total_frame_count <= 0:
-            raise ValueError(f"{envelope.name}: E must be positive")
-        else:
-            pass
-        if len(envelope.capture_new_frame_counts) != envelope.batch_size:
-            raise ValueError(f"{envelope.name}: capture row count does not match B")
-        else:
-            pass
-        if sum(envelope.capture_new_frame_counts) != envelope.new_frame_count:
-            raise ValueError(f"{envelope.name}: capture rows do not sum to N")
-        else:
-            pass
-        if max(envelope.capture_new_frame_counts) > envelope.max_new_frame_count:
-            raise ValueError(f"{envelope.name}: capture M exceeds envelope M")
-        else:
-            pass
-        if max(envelope.capture_new_frame_counts) > envelope.max_total_frame_count:
-            raise ValueError(f"{envelope.name}: capture E exceeds envelope E")
-        else:
-            pass
-        for capture_frame_count in envelope.capture_new_frame_counts:
-            if capture_frame_count <= 0:
-                raise ValueError(
-                    f"{envelope.name}: capture frame counts must be positive"
-                )
-            else:
-                pass
-            if capture_frame_count % chunk_size:
-                raise ValueError(
-                    f"{envelope.name}: capture frame counts must be chunk aligned"
-                )
-            else:
-                pass
-        for real_frame_count in envelope.real_new_frame_counts:
-            if real_frame_count <= 0:
-                raise ValueError(f"{envelope.name}: real N must be positive")
-            else:
-                pass
-            if real_frame_count % chunk_size:
-                raise ValueError(f"{envelope.name}: real N must be chunk aligned")
-            else:
-                pass
-            slack_frame_count = envelope.new_frame_count - real_frame_count
-            if not 0 <= slack_frame_count <= MAX_SLACK_FRAMES:
-                raise ValueError(f"{envelope.name}: real N has invalid slack")
-            else:
-                pass
-            if slack_frame_count % chunk_size:
-                raise ValueError(f"{envelope.name}: real N slack is not chunk aligned")
-            else:
-                pass
-
-
 def route_prefix_cuda_graph_envelope(
     *,
     batch_size: int,
@@ -291,7 +203,7 @@ def route_prefix_cuda_graph_envelope(
         envelope
         for envelope in envelopes
         if envelope.batch_size == batch_size
-        and total_new_frame_count in envelope.real_new_frame_counts
+        and total_new_frame_count in envelope.qualified_new_frame_totals
         and 0 <= envelope.new_frame_count - total_new_frame_count <= MAX_SLACK_FRAMES
         and (envelope.new_frame_count - total_new_frame_count) % chunk_size == 0
         and max_new_frame_count <= envelope.max_new_frame_count
@@ -300,62 +212,15 @@ def route_prefix_cuda_graph_envelope(
     if not candidates:
         return None
     else:
-        pass
-    return min(
-        candidates,
-        key=lambda envelope: (
-            envelope.new_frame_count,
-            envelope.max_new_frame_count,
-            envelope.max_total_frame_count,
-            envelope.name,
-        ),
-    )
-
-
-def prefix_cuda_graph_miss_reason(
-    *,
-    batch_size: int,
-    total_new_frame_count: int,
-    max_new_frame_count: int,
-    max_total_frame_count: int,
-    envelopes: Sequence[PrefixCudaGraphEnvelope] = DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES,
-) -> str:
-    """Classify a normal graph miss for runtime counters."""
-    batch_envelopes = [
-        envelope for envelope in envelopes if envelope.batch_size == batch_size
-    ]
-    if not batch_envelopes:
-        return "unsupported_B"
-    else:
-        pass
-    new_frame_envelopes = [
-        envelope
-        for envelope in batch_envelopes
-        if total_new_frame_count in envelope.real_new_frame_counts
-    ]
-    if not new_frame_envelopes:
-        return "no_N_bucket"
-    else:
-        pass
-    max_new_envelopes = [
-        envelope
-        for envelope in new_frame_envelopes
-        if max_new_frame_count <= envelope.max_new_frame_count
-    ]
-    if not max_new_envelopes:
-        return "M_too_large"
-    else:
-        pass
-    total_frame_envelopes = [
-        envelope
-        for envelope in max_new_envelopes
-        if max_total_frame_count <= envelope.max_total_frame_count
-    ]
-    if not total_frame_envelopes:
-        return "E_too_large"
-    else:
-        pass
-    return "other"
+        return min(
+            candidates,
+            key=lambda envelope: (
+                envelope.new_frame_count,
+                envelope.max_new_frame_count,
+                envelope.max_total_frame_count,
+                envelope.name,
+            ),
+        )
 
 
 class PrefixCudaGraphCache:
@@ -392,11 +257,6 @@ class PrefixCudaGraphCache:
         self.capture_order: list[str] = []
         self.net_capture_allocated_delta_mib = 0.0
         self.net_capture_reserved_delta_mib = 0.0
-        self.hits = 0
-        self.misses = 0
-        self.hits_by_envelope: Counter[str] = Counter()
-        self.misses_by_reason: Counter[str] = Counter()
-        self.validate_constructor_inputs()
         self.time_span = time_span.to(
             device=self.device, dtype=self.input_dtype
         ).clone()
@@ -412,62 +272,19 @@ class PrefixCudaGraphCache:
         ):
             raise RuntimeError("prefix pool cannot reserve graph scratch pair")
         else:
-            pass
-        self.scratch_pair: tuple[PrefixCacheRow, PrefixCacheRow] | None = scratch_pair
-        self.scratch_reserved_frames = free_frames_before_scratch - int(
-            self.pool.free_frames
-        )
-
-    def validate_constructor_inputs(self) -> None:
-        if not self.estimator.is_ragged:
-            raise RuntimeError("prefix CUDA Graph cache requires ragged FA3 PackedDiT")
-        else:
-            pass
-        if not self.estimator.is_compiled:
-            raise RuntimeError("prefix CUDA Graph cache requires compiled PackedDiT")
-        else:
-            pass
-        if self.autocast_dtype not in (torch.float16, torch.bfloat16):
-            raise RuntimeError("prefix CUDA Graph cache requires float16 or bfloat16")
-        else:
-            pass
-        if self.estimator.chunk_size != PREFIX_CUDA_GRAPH_CHUNK_FRAMES:
-            raise RuntimeError(
-                "prefix CUDA Graph cache requires a 50-frame PackedDiT chunk size"
+            self.scratch_pair: tuple[PrefixCacheRow, PrefixCacheRow] | None = (
+                scratch_pair
             )
-        else:
-            pass
-        validate_prefix_cuda_graph_envelopes(
-            self.envelopes,
-            chunk_size=PREFIX_CUDA_GRAPH_CHUNK_FRAMES,
-        )
+            self.scratch_reserved_frames = free_frames_before_scratch - int(
+                self.pool.free_frames
+            )
 
     def close(self) -> None:
-        if self.scratch_pair is not None:
+        if self.scratch_pair is None:
+            return
+        else:
             release_rows(self.pool, list(self.scratch_pair))
             self.scratch_pair = None
-        else:
-            pass
-
-    def reset_counters(self) -> None:
-        self.hits = 0
-        self.misses = 0
-        self.hits_by_envelope.clear()
-        self.misses_by_reason.clear()
-
-    def counters(self) -> PrefixCudaGraphRuntimeCounters:
-        total_calls = self.hits + self.misses
-        if total_calls:
-            hit_rate_pct = 100.0 * self.hits / total_calls
-        else:
-            hit_rate_pct = 0.0
-        return PrefixCudaGraphRuntimeCounters(
-            hits=self.hits,
-            misses=self.misses,
-            hit_rate_pct=hit_rate_pct,
-            hits_by_envelope=dict(sorted(self.hits_by_envelope.items())),
-            misses_by_reason=dict(sorted(self.misses_by_reason.items())),
-        )
 
     def capture_stats(self) -> PrefixCudaGraphCaptureStats:
         return PrefixCudaGraphCaptureStats(
@@ -484,52 +301,45 @@ class PrefixCudaGraphCache:
         if self.entries:
             raise RuntimeError("prefix CUDA Graph cache already captured")
         else:
-            pass
-        capture_envelopes = sorted(
-            self.envelopes,
-            key=lambda envelope: (
-                envelope.new_frame_count,
-                envelope.batch_size,
-                envelope.max_new_frame_count,
-                envelope.max_total_frame_count,
-            ),
-            reverse=True,
-        )
-        # Largest-first capture improves reuse of the single shared graph pool.
-        self.capture_order = [envelope.name for envelope in capture_envelopes]
-        with torch.cuda.device(self.device):
-            graph_pool = torch.cuda.graph_pool_handle()
-            torch.cuda.synchronize(self.device)
-            allocated_before = torch.cuda.memory_allocated(self.device)
-            reserved_before = torch.cuda.memory_reserved(self.device)
-            for envelope in capture_envelopes:
-                self.entries.append(self.capture_one(envelope, graph_pool))
-            torch.cuda.synchronize(self.device)
-            self.net_capture_allocated_delta_mib = (
-                torch.cuda.memory_allocated(self.device) - allocated_before
-            ) / BYTES_PER_MIB
-            self.net_capture_reserved_delta_mib = (
-                torch.cuda.memory_reserved(self.device) - reserved_before
-            ) / BYTES_PER_MIB
-        stats = self.capture_stats()
-        logger.info(
-            f"Fun-CosyVoice3 causal prefix CUDA Graph cache: "
-            f"graphs={stats.graph_count} capture_s={stats.capture_s:.1f} "
-            f"net_allocated_delta_mib={stats.net_capture_allocated_delta_mib:.2f} "
-            f"scratch_reserved_frames={stats.scratch_reserved_frames}"
-        )
+            capture_envelopes = sorted(
+                self.envelopes,
+                key=lambda envelope: (
+                    envelope.new_frame_count,
+                    envelope.batch_size,
+                    envelope.max_new_frame_count,
+                    envelope.max_total_frame_count,
+                ),
+                reverse=True,
+            )
+            # Largest-first capture improves reuse of the single shared graph pool.
+            self.capture_order = [envelope.name for envelope in capture_envelopes]
+            with torch.cuda.device(self.device):
+                graph_pool = torch.cuda.graph_pool_handle()
+                torch.cuda.synchronize(self.device)
+                allocated_before = torch.cuda.memory_allocated(self.device)
+                reserved_before = torch.cuda.memory_reserved(self.device)
+                for envelope in capture_envelopes:
+                    self.entries.append(self.capture_one(envelope, graph_pool))
+                torch.cuda.synchronize(self.device)
+                self.net_capture_allocated_delta_mib = (
+                    torch.cuda.memory_allocated(self.device) - allocated_before
+                ) / BYTES_PER_MIB
+                self.net_capture_reserved_delta_mib = (
+                    torch.cuda.memory_reserved(self.device) - reserved_before
+                ) / BYTES_PER_MIB
+            stats = self.capture_stats()
+            logger.info(
+                f"Fun-CosyVoice3 causal prefix CUDA Graph cache: "
+                f"graphs={stats.graph_count} capture_s={stats.capture_s:.1f} "
+                f"net_allocated_delta_mib={stats.net_capture_allocated_delta_mib:.2f} "
+                f"net_reserved_delta_mib={stats.net_capture_reserved_delta_mib:.2f} "
+                f"scratch_reserved_frames={stats.scratch_reserved_frames}"
+            )
 
     def capture_inputs(
         self, new_frame_counts: tuple[int, ...]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         total_new_frame_count = sum(new_frame_counts)
-        if total_new_frame_count > self.noise_template.shape[2]:
-            raise ValueError(
-                f"noise_template supports {self.noise_template.shape[2]} frames, "
-                f"but capture requires {total_new_frame_count}"
-            )
-        else:
-            pass
         noise = (
             self.noise_template[:, :, :total_new_frame_count]
             .to(device=self.device, dtype=self.input_dtype)
@@ -573,12 +383,12 @@ class PrefixCudaGraphCache:
         envelope: PrefixCudaGraphEnvelope,
         graph_pool: tuple[int, int],
     ) -> CapturedPrefixCudaGraph:
-        real_pairs = self.allocate_capture_pairs(envelope.capture_new_frame_counts)
+        real_pairs = self.allocate_capture_pairs(envelope.capture_row_new_frames)
         try:
-            capture_inputs = self.capture_inputs(envelope.capture_new_frame_counts)
+            capture_inputs = self.capture_inputs(envelope.capture_row_new_frames)
             prepared = self.prepare(
                 *capture_inputs,
-                list(envelope.capture_new_frame_counts),
+                list(envelope.capture_row_new_frames),
                 real_pairs,
                 envelope,
             )
@@ -657,13 +467,12 @@ class PrefixCudaGraphCache:
         if envelope is None:
             return None
         else:
-            pass
-        for entry in self.entries:
-            if entry.envelope == envelope:
-                return entry
-            else:
-                pass
-        return None
+            for entry in self.entries:
+                if entry.envelope != envelope:
+                    continue
+                else:
+                    return entry
+            return None
 
     def prepare(
         self,
@@ -685,31 +494,27 @@ class PrefixCudaGraphCache:
         for pair, prefix_frame_count in zip(
             real_pairs, prefix_frame_counts, strict=True
         ):
-            if pair[1].committed_frames != prefix_frame_count:
-                raise RuntimeError(
-                    "CFG prefix cache twins have different committed frames"
-                )
-            else:
-                pass
+            assert (
+                pair[1].committed_frames == prefix_frame_count
+            ), "CFG prefix cache twins have different committed frames"
 
         def append_slack(tensor: torch.Tensor) -> torch.Tensor:
             if slack_frame_count == 0:
                 return tensor
             else:
-                pass
-            return torch.cat(
-                (
-                    tensor,
-                    torch.zeros(
-                        tensor.shape[0],
-                        slack_frame_count,
-                        tensor.shape[2],
-                        device=tensor.device,
-                        dtype=tensor.dtype,
+                return torch.cat(
+                    (
+                        tensor,
+                        torch.zeros(
+                            tensor.shape[0],
+                            slack_frame_count,
+                            tensor.shape[2],
+                            device=tensor.device,
+                            dtype=tensor.dtype,
+                        ),
                     ),
-                ),
-                dim=1,
-            )
+                    dim=1,
+                )
 
         all_pairs = list(real_pairs) + [self.scratch_pair]
         logical_new_frame_counts = new_frame_counts + [slack_frame_count]
@@ -859,39 +664,33 @@ class PrefixCudaGraphCache:
             > static.attention.page_table.shape[1]
         ):
             raise RuntimeError("prefix CUDA Graph page table width exceeded envelope E")
-        else:
-            pass
-        if prepared.attention.slots.shape[1] > static.attention.slots.shape[1]:
+        elif prepared.attention.slots.shape[1] > static.attention.slots.shape[1]:
             raise RuntimeError("prefix CUDA Graph slots width exceeded envelope M")
-        else:
-            pass
-        if static.attention.max_seqlen_q != prepared.attention.max_seqlen_q:
+        elif static.attention.max_seqlen_q != prepared.attention.max_seqlen_q:
             raise RuntimeError("prefix CUDA Graph query segment width changed")
         else:
-            pass
-
-        static.noise.copy_(prepared.noise)
-        static.time_span.copy_(prepared.time_span)
-        static.mu.copy_(prepared.mu)
-        static.speaker_embeddings.copy_(prepared.speaker_embeddings)
-        static.mel_conditioning.copy_(prepared.mel_conditioning)
-        static.twin_rows.row_ids.copy_(prepared.twin_rows.row_ids)
-        static.twin_rows.positions.copy_(prepared.twin_rows.positions)
-        static.attention.cache_seqlens.copy_(prepared.attention.cache_seqlens)
-        static.attention.cu_seqlens_q.copy_(prepared.attention.cu_seqlens_q)
-        static.attention.write_index.copy_(prepared.attention.write_index)
-        static.attention.slots.fill_(-1)
-        static.attention.slots[:, : prepared.attention.slots.shape[1]].copy_(
-            prepared.attention.slots
-        )
-        static.attention.tail_index.copy_(prepared.attention.tail_index)
-        static.attention.page_table.zero_()
-        static.attention.page_table[:, : prepared.attention.page_table.shape[1]].copy_(
-            prepared.attention.page_table
-        )
-        static.rope[0].copy_(prepared.rope[0])
-        static.rope[1].copy_(prepared.rope[1])
-        static.context.copy_(prepared.context)
+            static.noise.copy_(prepared.noise)
+            static.time_span.copy_(prepared.time_span)
+            static.mu.copy_(prepared.mu)
+            static.speaker_embeddings.copy_(prepared.speaker_embeddings)
+            static.mel_conditioning.copy_(prepared.mel_conditioning)
+            static.twin_rows.row_ids.copy_(prepared.twin_rows.row_ids)
+            static.twin_rows.positions.copy_(prepared.twin_rows.positions)
+            static.attention.cache_seqlens.copy_(prepared.attention.cache_seqlens)
+            static.attention.cu_seqlens_q.copy_(prepared.attention.cu_seqlens_q)
+            static.attention.write_index.copy_(prepared.attention.write_index)
+            static.attention.slots.fill_(-1)
+            static.attention.slots[:, : prepared.attention.slots.shape[1]].copy_(
+                prepared.attention.slots
+            )
+            static.attention.tail_index.copy_(prepared.attention.tail_index)
+            static.attention.page_table.zero_()
+            static.attention.page_table[
+                :, : prepared.attention.page_table.shape[1]
+            ].copy_(prepared.attention.page_table)
+            static.rope[0].copy_(prepared.rope[0])
+            static.rope[1].copy_(prepared.rope[1])
+            static.context.copy_(prepared.context)
 
     def run_static_body(self, static: StaticPrefixCudaGraph) -> torch.Tensor:
         total_new_frame_count = static.noise.shape[1]
@@ -983,12 +782,7 @@ class PrefixCudaGraphCache:
         new_frames: list[int],
         total_frames: list[int],
         caches: Sequence[tuple[PrefixCacheRow, PrefixCacheRow]],
-        cfg_rate: float,
     ) -> torch.Tensor | None:
-        if float(cfg_rate) != self.cfg_rate:
-            raise RuntimeError("prefix CUDA Graph CFG rate changed after capture")
-        else:
-            pass
         (
             batch_size,
             total_new_frame_count,
@@ -1003,43 +797,31 @@ class PrefixCudaGraphCache:
         )
         if entry is None:
             # Misses are expected; replay and staging failures intentionally escape.
-            self.misses += 1
-            reason = prefix_cuda_graph_miss_reason(
-                batch_size=batch_size,
-                total_new_frame_count=total_new_frame_count,
-                max_new_frame_count=max_new_frame_count,
-                max_total_frame_count=max_total_frame_count,
-                envelopes=self.envelopes,
-            )
-            self.misses_by_reason[reason] += 1
             return None
         else:
-            pass
-        with (
-            torch.cuda.device(self.device),
-            torch.autocast(
-                device_type="cuda",
-                dtype=self.autocast_dtype,
-                enabled=self.autocast_dtype is not None,
-            ),
-        ):
-            prepared = self.prepare(
-                noise,
-                time_span,
-                mu,
-                speaker_embeddings,
-                mel_conditioning,
-                new_frames,
-                caches,
-                entry.envelope,
-            )
-            static = entry.static
-            self.stage(static, prepared)
-            graph = static.graph
-            assert graph is not None
-            graph.replay()
-            generated = self.materialize_output(static, prepared.real_frame_count)
-            self.commit_real(static, prepared, caches)
-        self.hits += 1
-        self.hits_by_envelope[entry.envelope.name] += 1
-        return generated
+            with (
+                torch.cuda.device(self.device),
+                torch.autocast(
+                    device_type="cuda",
+                    dtype=self.autocast_dtype,
+                    enabled=self.autocast_dtype is not None,
+                ),
+            ):
+                prepared = self.prepare(
+                    noise,
+                    time_span,
+                    mu,
+                    speaker_embeddings,
+                    mel_conditioning,
+                    new_frames,
+                    caches,
+                    entry.envelope,
+                )
+                static = entry.static
+                self.stage(static, prepared)
+                graph = static.graph
+                assert graph is not None
+                graph.replay()
+                generated = self.materialize_output(static, prepared.real_frame_count)
+                self.commit_real(static, prepared, caches)
+            return generated

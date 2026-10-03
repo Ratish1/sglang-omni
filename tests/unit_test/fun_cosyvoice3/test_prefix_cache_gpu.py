@@ -377,7 +377,6 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
                 new_frames=[50],
                 total_frames=[50],
                 caches=[graph_pair],
-                cfg_rate=0.7,
             )
             first_reference = solve_flow_euler_prefix(
                 estimator,
@@ -406,7 +405,6 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
                 new_frames=[50],
                 total_frames=[100],
                 caches=[graph_pair],
-                cfg_rate=0.7,
             )
             second_reference = solve_flow_euler_prefix(
                 estimator,
@@ -438,7 +436,6 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
                 new_frames=[100],
                 total_frames=[100],
                 caches=[graph_pair],
-                cfg_rate=0.7,
             )
             third_reference = solve_flow_euler_prefix(
                 estimator,
@@ -456,8 +453,6 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
             assert torch.equal(third_graph, third_reference)
             assert_cached_rows_match(graph_pair, reference_pair, 100)
 
-        assert graph_cache.counters().hits == 3
-        assert graph_cache.counters().misses == 0
         assert graph_cache.scratch_pair is not None
         assert graph_cache.scratch_pair[0].committed_frames == 0
         assert graph_cache.scratch_pair[1].committed_frames == 0

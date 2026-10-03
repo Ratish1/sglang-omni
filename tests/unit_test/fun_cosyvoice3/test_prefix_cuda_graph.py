@@ -8,18 +8,18 @@ import torch
 from sglang_omni.models.fun_cosyvoice3 import stages
 from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import (
     DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES,
+    MAX_SLACK_FRAMES,
+    PREFIX_CUDA_GRAPH_CHUNK_FRAMES,
     PrefixCudaGraphEnvelope,
-    prefix_cuda_graph_miss_reason,
     route_prefix_cuda_graph_envelope,
-    validate_prefix_cuda_graph_envelopes,
 )
 
 
 def test_default_prefix_cuda_graph_envelopes_are_frozen_and_valid() -> None:
-    validate_prefix_cuda_graph_envelopes(DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES)
-
     assert len(DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES) == 17
-    assert [envelope.name for envelope in DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES] == [
+    names = [envelope.name for envelope in DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES]
+    assert len(set(names)) == len(names)
+    assert names == [
         "B1-N300-M300-E3072",
         "B1-N450-M450-E512",
         "B3-N400-M200-E1536",
@@ -38,6 +38,25 @@ def test_default_prefix_cuda_graph_envelopes_are_frozen_and_valid() -> None:
         "B4-N700-M300-E1024",
         "B6-N1450-M400-E2048",
     ]
+    for envelope in DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES:
+        assert envelope.batch_size > 0
+        assert envelope.new_frame_count > 0
+        assert envelope.max_new_frame_count > 0
+        assert envelope.max_total_frame_count > 0
+        assert len(envelope.capture_row_new_frames) == envelope.batch_size
+        assert sum(envelope.capture_row_new_frames) == envelope.new_frame_count
+        assert max(envelope.capture_row_new_frames) <= envelope.max_new_frame_count
+        assert max(envelope.capture_row_new_frames) <= envelope.max_total_frame_count
+        assert all(
+            frame_count > 0 and frame_count % PREFIX_CUDA_GRAPH_CHUNK_FRAMES == 0
+            for frame_count in envelope.capture_row_new_frames
+        )
+        for qualified_total in envelope.qualified_new_frame_totals:
+            assert qualified_total > 0
+            assert qualified_total % PREFIX_CUDA_GRAPH_CHUNK_FRAMES == 0
+            slack_frame_count = envelope.new_frame_count - qualified_total
+            assert 0 <= slack_frame_count <= MAX_SLACK_FRAMES
+            assert slack_frame_count % PREFIX_CUDA_GRAPH_CHUNK_FRAMES == 0
 
 
 def test_prefix_cuda_graph_routes_smallest_qualified_envelope() -> None:
@@ -45,8 +64,6 @@ def test_prefix_cuda_graph_routes_smallest_qualified_envelope() -> None:
         PrefixCudaGraphEnvelope("small", 1, 100, 100, 512, (50, 100), (100,)),
         PrefixCudaGraphEnvelope("large", 1, 150, 150, 1024, (100, 150), (150,)),
     )
-    validate_prefix_cuda_graph_envelopes(envelopes)
-
     assert (
         route_prefix_cuda_graph_envelope(
             batch_size=1,
@@ -56,6 +73,36 @@ def test_prefix_cuda_graph_routes_smallest_qualified_envelope() -> None:
             envelopes=envelopes,
         )
         == envelopes[0]
+    )
+    assert (
+        route_prefix_cuda_graph_envelope(
+            batch_size=2,
+            total_new_frame_count=100,
+            max_new_frame_count=100,
+            max_total_frame_count=512,
+            envelopes=envelopes,
+        )
+        is None
+    )
+    assert (
+        route_prefix_cuda_graph_envelope(
+            batch_size=1,
+            total_new_frame_count=150,
+            max_new_frame_count=151,
+            max_total_frame_count=1024,
+            envelopes=envelopes,
+        )
+        is None
+    )
+    assert (
+        route_prefix_cuda_graph_envelope(
+            batch_size=1,
+            total_new_frame_count=150,
+            max_new_frame_count=150,
+            max_total_frame_count=1025,
+            envelopes=envelopes,
+        )
+        is None
     )
     assert (
         route_prefix_cuda_graph_envelope(
@@ -86,29 +133,6 @@ def test_prefix_cuda_graph_routes_smallest_qualified_envelope() -> None:
             envelopes=envelopes,
         )
         == envelopes[0]
-    )
-
-
-@pytest.mark.parametrize(
-    ("geometry", "expected"),
-    [
-        ((9, 100, 100, 512), "unsupported_B"),
-        ((1, 999, 100, 512), "no_N_bucket"),
-        ((1, 200, 301, 3072), "M_too_large"),
-        ((1, 200, 300, 3073), "E_too_large"),
-    ],
-)
-def test_prefix_cuda_graph_miss_reason(
-    geometry: tuple[int, int, int, int], expected: str
-) -> None:
-    assert (
-        prefix_cuda_graph_miss_reason(
-            batch_size=geometry[0],
-            total_new_frame_count=geometry[1],
-            max_new_frame_count=geometry[2],
-            max_total_frame_count=geometry[3],
-        )
-        == expected
     )
 
 

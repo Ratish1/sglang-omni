@@ -59,7 +59,10 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
     release_rows,
     solve_flow_euler_prefix,
 )
-from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import PrefixCudaGraphCache
+from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import (
+    PREFIX_CUDA_GRAPH_CHUNK_FRAMES,
+    PrefixCudaGraphCache,
+)
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     CosyVoice3SGLangRequestData,
     cleanup_prepared_cosyvoice3_request,
@@ -965,10 +968,7 @@ class FunCosyVoice3Flow:
             total - start
             for total, start in zip(total_frames, prefix_frames, strict=True)
         ]
-        if min(new_frames) <= 0:
-            raise RuntimeError("Fun-CosyVoice3 prefix hop adds no frames")
-        else:
-            pass
+        assert min(new_frames) > 0, "Fun-CosyVoice3 prefix hop adds no frames"
         new_frame_index = torch.cat(
             [
                 torch.arange(start, total, device=device)
@@ -986,9 +986,8 @@ class FunCosyVoice3Flow:
         noise = take_new_frames(conditioning.noisy_mel)
         mu = take_new_frames(token_condition)
         mel_conditioning = take_new_frames(conditioning.prompt_mel)
-        generated = None
-        if self.prefix_cuda_graph_cache is not None:
-            generated = self.prefix_cuda_graph_cache.run(
+        generated = (
+            self.prefix_cuda_graph_cache.run(
                 noise=noise,
                 time_span=conditioning.time_span,
                 mu=mu,
@@ -997,12 +996,12 @@ class FunCosyVoice3Flow:
                 new_frames=new_frames,
                 total_frames=total_frames,
                 caches=caches,
-                cfg_rate=self.flow.decoder.inference_cfg_rate,
             )
-        else:
-            pass
-        if generated is None:
-            generated = solve_flow_euler_prefix(
+            if self.prefix_cuda_graph_cache is not None
+            else None
+        )
+        generated = (
+            solve_flow_euler_prefix(
                 self.packed_estimator,
                 self.prefix_pool,
                 noise,
@@ -1014,8 +1013,9 @@ class FunCosyVoice3Flow:
                 list(caches),
                 cfg_rate=self.flow.decoder.inference_cfg_rate,
             )
-        else:
-            pass
+            if generated is None
+            else generated
+        )
         padded = generated.new_zeros(
             len(inputs), token_condition.shape[2], generated.shape[2]
         )
@@ -2687,19 +2687,6 @@ def create_vocoder_executor(
         enable_flow_estimator_trt=enable_flow_estimator_trt,
     )
 
-    if enable_flow_prefix_cuda_graph and flow.packed_estimator is None:
-        raise RuntimeError(
-            "enable_flow_prefix_cuda_graph requires a PackedDiT estimator"
-        )
-    else:
-        pass
-    if enable_flow_prefix_cuda_graph and not flow.packed_estimator.is_ragged:
-        raise RuntimeError(
-            "enable_flow_prefix_cuda_graph requires the ragged FA3 PackedDiT path"
-        )
-    else:
-        pass
-
     if enable_flow_cuda_graph and (
         device_obj.type != "cuda" or not torch.cuda.is_available()
     ):
@@ -2771,33 +2758,40 @@ def create_vocoder_executor(
         scheduler.warmup_packed_dit_compile()
     else:
         pass
-    if enable_flow_prefix_cuda_graph:
-        assert flow.packed_estimator is not None and flow.prefix_pool is not None
-        parameter_dtype = next(flow.parameters()).dtype
-        time_span = torch.linspace(
-            0,
-            1,
-            FLOW_EULER_STEPS + 1,
-            device=device_obj,
-            dtype=parameter_dtype,
-        )
-        if flow.decoder.t_scheduler == "cosine":
-            time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
-        else:
-            pass
-        prefix_cache = PrefixCudaGraphCache(
-            flow.packed_estimator,
-            flow.prefix_pool,
-            device=device_obj,
-            autocast_dtype=autocast_dtype,
-            noise_template=flow.decoder.rand_noise,
-            time_span=time_span,
-            speaker_embedding_width=int(flow.spk_embed_affine_layer.out_features),
-            cfg_rate=float(flow.decoder.inference_cfg_rate),
-        )
-        prefix_cache.capture()
-        flow.attach_prefix_cuda_graph_cache(prefix_cache)
+    if not enable_flow_prefix_cuda_graph:
+        scheduler.warmup_now()
+        return scheduler
     else:
-        pass
+        assert flow.packed_estimator is not None and flow.prefix_pool is not None
+        if flow.packed_estimator.chunk_size != PREFIX_CUDA_GRAPH_CHUNK_FRAMES:
+            raise RuntimeError(
+                "enable_flow_prefix_cuda_graph requires a 50-frame PackedDiT chunk size"
+            )
+        else:
+            parameter_dtype = next(flow.parameters()).dtype
+            time_span = torch.linspace(
+                0,
+                1,
+                FLOW_EULER_STEPS + 1,
+                device=device_obj,
+                dtype=parameter_dtype,
+            )
+            time_span = (
+                1 - torch.cos(time_span * 0.5 * torch.pi)
+                if flow.decoder.t_scheduler == "cosine"
+                else time_span
+            )
+            prefix_cache = PrefixCudaGraphCache(
+                flow.packed_estimator,
+                flow.prefix_pool,
+                device=device_obj,
+                autocast_dtype=autocast_dtype,
+                noise_template=flow.decoder.rand_noise,
+                time_span=time_span,
+                speaker_embedding_width=int(flow.spk_embed_affine_layer.out_features),
+                cfg_rate=float(flow.decoder.inference_cfg_rate),
+            )
+            prefix_cache.capture()
+            flow.attach_prefix_cuda_graph_cache(prefix_cache)
     scheduler.warmup_now()
     return scheduler
