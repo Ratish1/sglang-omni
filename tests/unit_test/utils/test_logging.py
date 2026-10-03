@@ -34,8 +34,8 @@ logging.getLogger('application').error('visible error')
         [sys.executable, "-c", script, module],
         capture_output=True,
         text=True,
-        check=True,
     )
+    assert result.returncode == 0, result.stderr
     assert result.stdout == "visible error\n"
 
 
@@ -77,8 +77,8 @@ assert root.handlers == [root_console]
         [sys.executable, "-c", script, str(tmp_path / "application.log")],
         capture_output=True,
         text=True,
-        check=True,
     )
+    assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
         "root WARNING warning retained",
         "root ERROR error retained",
