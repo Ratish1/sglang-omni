@@ -27,11 +27,6 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
 
 logger = logging.getLogger(__name__)
 
-# note(chenye): regular causal Flow hops are aligned to
-# TOKEN_HOP_LEN * TOKEN_MEL_RATIO (25 * 2 = 50) mel frames;
-# final leftovers may differ.
-PREFIX_CUDA_GRAPH_CHUNK_FRAMES = 50
-MAX_SLACK_FRAMES = 100
 CAPTURE_WARMUP_ITERATIONS = 1
 BYTES_PER_MIB = 1024 * 1024
 
@@ -47,6 +42,35 @@ PrefixCudaGraphCaptureInputFactory = Callable[
     [tuple[int, ...]],
     PrefixCudaGraphCaptureInputs,
 ]
+
+
+def resolve_prefix_cuda_graph_max_slack(
+    chunk_frames: int,
+    configured_max_slack_frames: int | None,
+) -> int:
+    """Resolve and validate the prefix graph slack serving policy."""
+    chunk_frames = int(chunk_frames)
+    if chunk_frames <= 0:
+        raise ValueError(f"PackedDiT chunk size must be positive, got {chunk_frames}")
+    else:
+        pass
+    max_slack_frames = (
+        2 * chunk_frames
+        if configured_max_slack_frames is None
+        else int(configured_max_slack_frames)
+    )
+    if max_slack_frames <= 0:
+        raise ValueError(
+            "flow_prefix_cuda_graph_max_slack_frames must be greater than zero; "
+            f"got {max_slack_frames}"
+        )
+    elif max_slack_frames % chunk_frames != 0:
+        raise ValueError(
+            "flow_prefix_cuda_graph_max_slack_frames must be a multiple of "
+            f"chunk size {chunk_frames}; got {max_slack_frames}"
+        )
+    else:
+        return max_slack_frames
 
 
 @dataclass(frozen=True)
@@ -141,6 +165,8 @@ def route_prefix_cuda_graph_envelope(
     new_frame_counts: Sequence[int],
     total_frame_counts: Sequence[int],
     envelopes: Sequence[PrefixCudaGraphEnvelope],
+    chunk_frames: int,
+    max_slack_frames: int,
 ) -> PrefixCudaGraphEnvelope | None:
     """Return the smallest physical envelope compatible with real row geometry."""
     if not new_frame_counts or len(new_frame_counts) != len(total_frame_counts):
@@ -148,7 +174,7 @@ def route_prefix_cuda_graph_envelope(
     else:
         pass
     if not all(
-        frame_count > 0 and frame_count % PREFIX_CUDA_GRAPH_CHUNK_FRAMES == 0
+        frame_count > 0 and frame_count % chunk_frames == 0
         for frame_count in new_frame_counts
     ):
         return None
@@ -162,10 +188,8 @@ def route_prefix_cuda_graph_envelope(
         envelope
         for envelope in envelopes
         if envelope.batch_size == batch_size
-        and 0 <= envelope.new_frame_count - total_new_frame_count <= MAX_SLACK_FRAMES
-        and (envelope.new_frame_count - total_new_frame_count)
-        % PREFIX_CUDA_GRAPH_CHUNK_FRAMES
-        == 0
+        and 0 <= envelope.new_frame_count - total_new_frame_count <= max_slack_frames
+        and (envelope.new_frame_count - total_new_frame_count) % chunk_frames == 0
         and max_new_frame_count <= envelope.max_new_frame_count
         and max_total_frame_count <= envelope.max_total_frame_count
     ]
@@ -193,21 +217,19 @@ class PrefixCudaGraphCache:
         *,
         device: torch.device,
         autocast_dtype: torch.dtype | None,
-        noise_template: torch.Tensor,
-        time_span: torch.Tensor,
-        speaker_embedding_width: int,
         cfg_rate: float,
         envelopes: tuple[PrefixCudaGraphEnvelope, ...],
+        max_slack_frames: int,
         capture_warmup_iterations: int = CAPTURE_WARMUP_ITERATIONS,
     ) -> None:
         self.estimator = estimator
         self.pool = pool
         self.device = torch.device(device)
         self.autocast_dtype = autocast_dtype
-        self.input_dtype = autocast_dtype or noise_template.dtype
-        self.noise_template = noise_template
-        self.time_span = time_span
-        self.speaker_embedding_width = int(speaker_embedding_width)
+        self.chunk_frames = int(estimator.chunk_size)
+        self.max_slack_frames = resolve_prefix_cuda_graph_max_slack(
+            self.chunk_frames, max_slack_frames
+        )
         self.cfg_rate = float(cfg_rate)
         self.envelopes = envelopes
         self.capture_warmup_iterations = int(capture_warmup_iterations)
@@ -215,9 +237,6 @@ class PrefixCudaGraphCache:
         self.capture_order: list[str] = []
         self.net_capture_allocated_delta_mib = 0.0
         self.net_capture_reserved_delta_mib = 0.0
-        self.time_span = time_span.to(
-            device=self.device, dtype=self.input_dtype
-        ).clone()
         self.capture_stream: torch.cuda.Stream = torch.cuda.Stream(device=self.device)
 
         # This isolated CFG twin pair supplies slack rows without aliasing a request.
@@ -226,7 +245,7 @@ class PrefixCudaGraphCache:
         if not grow_rows(
             self.pool,
             list(scratch_pair),
-            [MAX_SLACK_FRAMES, MAX_SLACK_FRAMES],
+            [self.max_slack_frames, self.max_slack_frames],
         ):
             raise RuntimeError("prefix pool cannot reserve graph scratch pair")
         else:
@@ -395,6 +414,8 @@ class PrefixCudaGraphCache:
             new_frame_counts=new_frame_counts,
             total_frame_counts=total_frame_counts,
             envelopes=self.envelopes,
+            chunk_frames=self.chunk_frames,
+            max_slack_frames=self.max_slack_frames,
         )
         if envelope is None:
             return None
@@ -470,7 +491,7 @@ class PrefixCudaGraphCache:
             prefix_frames=twin_prefix_frame_counts,
             new_frames=twin_new_frame_counts,
             pages=[cache_row.pages(device) for cache_row in twin_caches],
-            chunk_size=self.estimator.chunk_size,
+            chunk_size=self.chunk_frames,
             device=device,
         )
         if self.pool.forward is not forward_prefix:
@@ -557,7 +578,7 @@ class PrefixCudaGraphCache:
                 )
                 for _ in prepared.twin_rows.lengths
             ],
-            chunk_size=self.estimator.chunk_size,
+            chunk_size=self.chunk_frames,
             device=self.device,
         )
         static_attention.page_table = torch.zeros(

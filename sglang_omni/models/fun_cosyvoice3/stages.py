@@ -60,11 +60,11 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
     solve_flow_euler_prefix,
 )
 from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import (
-    PREFIX_CUDA_GRAPH_CHUNK_FRAMES,
     PrefixCudaGraphCache,
     PrefixCudaGraphCaptureInputs,
     PrefixCudaGraphCaptureShape,
     prefix_cuda_graph_envelopes_from_capture_shapes,
+    resolve_prefix_cuda_graph_max_slack,
 )
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     CosyVoice3SGLangRequestData,
@@ -431,7 +431,14 @@ def verify_flow_cuda_graph_capture_shapes(
 
 def verify_prefix_cuda_graph_capture_shapes(
     capture_shapes: Sequence[PrefixCudaGraphCaptureShape] | None,
+    *,
+    chunk_frames: int,
 ) -> Sequence[PrefixCudaGraphCaptureShape]:
+    chunk_frames = int(chunk_frames)
+    if chunk_frames <= 0:
+        raise ValueError(f"PackedDiT chunk size must be positive, got {chunk_frames}")
+    else:
+        pass
     if not capture_shapes:
         raise ValueError("flow_prefix_cuda_graph_capture_shapes must not be empty")
     else:
@@ -472,12 +479,12 @@ def verify_prefix_cuda_graph_capture_shapes(
                 f"got {capture_shape!r}"
             )
         elif any(
-            frame_count % PREFIX_CUDA_GRAPH_CHUNK_FRAMES != 0
-            for frame_count in capture_row_new_frames
+            frame_count % chunk_frames != 0 for frame_count in capture_row_new_frames
         ):
             raise ValueError(
                 "flow_prefix_cuda_graph_capture_shapes capture rows must be "
-                f"multiples of {PREFIX_CUDA_GRAPH_CHUNK_FRAMES}; got {capture_shape!r}"
+                "multiples of PackedDiT chunk size "
+                f"{chunk_frames}; got {capture_shape!r}"
             )
         elif sum(capture_row_new_frames) != new_frame_count:
             raise ValueError(
@@ -2721,6 +2728,7 @@ def create_vocoder_executor(
     flow_prefix_cuda_graph_capture_shapes: (
         Sequence[PrefixCudaGraphCaptureShape] | None
     ) = None,
+    flow_prefix_cuda_graph_max_slack_frames: int | None = None,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",
     hift_max_padding_waste: float = 1.5,
@@ -2904,50 +2912,49 @@ def create_vocoder_executor(
         pass
     if enable_flow_prefix_cuda_graph:
         assert flow.packed_estimator is not None and flow.prefix_pool is not None
-        if flow.packed_estimator.chunk_size != PREFIX_CUDA_GRAPH_CHUNK_FRAMES:
-            raise RuntimeError(
-                "enable_flow_prefix_cuda_graph requires a 50-frame PackedDiT chunk size"
-            )
-        else:
-            prefix_capture_shapes = verify_prefix_cuda_graph_capture_shapes(
-                flow_prefix_cuda_graph_capture_shapes
-            )
-            prefix_envelopes = prefix_cuda_graph_envelopes_from_capture_shapes(
-                prefix_capture_shapes
-            )
-            parameter_dtype = next(flow.parameters()).dtype
-            time_span = torch.linspace(
-                0,
-                1,
-                FLOW_EULER_STEPS + 1,
+        chunk_frames = int(flow.packed_estimator.chunk_size)
+        max_slack_frames = resolve_prefix_cuda_graph_max_slack(
+            chunk_frames,
+            flow_prefix_cuda_graph_max_slack_frames,
+        )
+        prefix_capture_shapes = verify_prefix_cuda_graph_capture_shapes(
+            flow_prefix_cuda_graph_capture_shapes,
+            chunk_frames=chunk_frames,
+        )
+        prefix_envelopes = prefix_cuda_graph_envelopes_from_capture_shapes(
+            prefix_capture_shapes
+        )
+        parameter_dtype = next(flow.parameters()).dtype
+        time_span = torch.linspace(
+            0,
+            1,
+            FLOW_EULER_STEPS + 1,
+            device=device_obj,
+            dtype=parameter_dtype,
+        )
+        time_span = (
+            1 - torch.cos(time_span * 0.5 * torch.pi)
+            if flow.decoder.t_scheduler == "cosine"
+            else time_span
+        )
+        prefix_cache = PrefixCudaGraphCache(
+            flow.packed_estimator,
+            flow.prefix_pool,
+            device=device_obj,
+            autocast_dtype=autocast_dtype,
+            cfg_rate=float(flow.decoder.inference_cfg_rate),
+            envelopes=prefix_envelopes,
+            max_slack_frames=max_slack_frames,
+        )
+        prefix_cache.capture(
+            lambda new_frame_counts: prepare_prefix_cuda_graph_capture_inputs(
+                flow,
+                scheduler,
+                new_frame_counts,
                 device=device_obj,
-                dtype=parameter_dtype,
             )
-            time_span = (
-                1 - torch.cos(time_span * 0.5 * torch.pi)
-                if flow.decoder.t_scheduler == "cosine"
-                else time_span
-            )
-            prefix_cache = PrefixCudaGraphCache(
-                flow.packed_estimator,
-                flow.prefix_pool,
-                device=device_obj,
-                autocast_dtype=autocast_dtype,
-                noise_template=flow.decoder.rand_noise,
-                time_span=time_span,
-                speaker_embedding_width=int(flow.spk_embed_affine_layer.out_features),
-                cfg_rate=float(flow.decoder.inference_cfg_rate),
-                envelopes=prefix_envelopes,
-            )
-            prefix_cache.capture(
-                lambda new_frame_counts: prepare_prefix_cuda_graph_capture_inputs(
-                    flow,
-                    scheduler,
-                    new_frame_counts,
-                    device=device_obj,
-                )
-            )
-            flow.attach_prefix_cuda_graph_cache(prefix_cache)
+        )
+        flow.attach_prefix_cuda_graph_cache(prefix_cache)
     else:
         pass
     scheduler.warmup_now()

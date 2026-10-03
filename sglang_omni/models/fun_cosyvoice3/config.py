@@ -131,6 +131,7 @@ class FunCosyVoice3VocoderFactoryArgs(FactoryArgs):
 
     mlx_model_path: str | None = Field(default=None)
     mlx_model_revision: str | None = Field(default=None)
+    flow_prefix_cuda_graph_max_slack_frames: int | None = Field(default=None, gt=0)
 
 
 class FunCosyVoice3VocoderStageConfig(StageConfig):

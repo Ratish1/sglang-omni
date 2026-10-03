@@ -145,9 +145,11 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
             "vocoder.factory.flow_prefix_cuda_graph_capture_shapes": [
                 [1, 100, 100, 512, [100]],
             ],
+            "vocoder.factory.flow_prefix_cuda_graph_max_slack_frames": 50,
         }
     )
     vocoder = next(stage for stage in merged.stages if stage.name == "vocoder")
+    assert vocoder.factory.flow_prefix_cuda_graph_max_slack_frames == 50
 
     assert vocoder.factory.model_extra == {
         "flow_batch_admission_frames": 4000,
@@ -173,6 +175,7 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
         [7, 576],
     ]
     assert args["flow_prefix_cuda_graph_capture_shapes"] == [[1, 100, 100, 512, [100]]]
+    assert args["flow_prefix_cuda_graph_max_slack_frames"] == 50
 
 
 def test_fun_cosyvoice3_prefix_cuda_graph_flag_uses_factory_path() -> None:

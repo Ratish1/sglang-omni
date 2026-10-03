@@ -327,11 +327,9 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
         graph_pool,
         device=device,
         autocast_dtype=dtype,
-        noise_template=noise_template,
-        time_span=time_span,
-        speaker_embedding_width=CHANNELS,
         cfg_rate=0.7,
         envelopes=(envelope,),
+        max_slack_frames=100,
         capture_warmup_iterations=1,
     )
 
@@ -516,11 +514,9 @@ def test_prefix_cuda_graph_matches_compiled_solver_for_b2_physical_reuse() -> No
         graph_pool,
         device=device,
         autocast_dtype=dtype,
-        noise_template=noise_template,
-        time_span=time_span,
-        speaker_embedding_width=CHANNELS,
         cfg_rate=0.7,
         envelopes=(envelope,),
+        max_slack_frames=100,
         capture_warmup_iterations=1,
     )
 

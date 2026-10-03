@@ -16,6 +16,7 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import (
     PrefixCudaGraphCache,
     PrefixCudaGraphEnvelope,
     prefix_cuda_graph_envelopes_from_capture_shapes,
+    resolve_prefix_cuda_graph_max_slack,
     route_prefix_cuda_graph_envelope,
 )
 
@@ -150,7 +151,8 @@ def test_default_prefix_cuda_graph_capture_shapes_are_frozen_and_valid() -> None
         expected_capture_shapes
     )
     stages.verify_prefix_cuda_graph_capture_shapes(
-        FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES
+        FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES,
+        chunk_frames=50,
     )
     envelopes = prefix_cuda_graph_envelopes_from_capture_shapes(
         FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES
@@ -205,7 +207,83 @@ def test_verify_prefix_cuda_graph_capture_shapes_rejects_invalid_overrides(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        stages.verify_prefix_cuda_graph_capture_shapes(capture_shapes)
+        stages.verify_prefix_cuda_graph_capture_shapes(
+            capture_shapes,
+            chunk_frames=50,
+        )
+
+
+def test_prefix_cuda_graph_router_uses_supplied_chunk_frames() -> None:
+    envelope = PrefixCudaGraphEnvelope("B1-N40-M40-E80", 1, 40, 40, 80, (40,))
+    assert (
+        route_prefix_cuda_graph_envelope(
+            new_frame_counts=[40],
+            total_frame_counts=[40],
+            envelopes=(envelope,),
+            chunk_frames=40,
+            max_slack_frames=40,
+        )
+        == envelope
+    )
+    assert (
+        route_prefix_cuda_graph_envelope(
+            new_frame_counts=[50],
+            total_frame_counts=[50],
+            envelopes=(envelope,),
+            chunk_frames=40,
+            max_slack_frames=40,
+        )
+        is None
+    )
+
+
+def test_prefix_cuda_graph_shape_validation_uses_supplied_chunk_frames() -> None:
+    valid_shapes = ((2, 120, 80, 160, (80, 40)),)
+    assert (
+        stages.verify_prefix_cuda_graph_capture_shapes(
+            valid_shapes,
+            chunk_frames=40,
+        )
+        == valid_shapes
+    )
+    with pytest.raises(ValueError, match="chunk size 40"):
+        stages.verify_prefix_cuda_graph_capture_shapes(
+            ((2, 120, 100, 160, (100, 20)),),
+            chunk_frames=40,
+        )
+
+
+def test_prefix_cuda_graph_router_uses_configured_max_slack() -> None:
+    envelope = PrefixCudaGraphEnvelope("B1-N200-M200-E200", 1, 200, 200, 200, (200,))
+    assert (
+        route_prefix_cuda_graph_envelope(
+            new_frame_counts=[100],
+            total_frame_counts=[100],
+            envelopes=(envelope,),
+            chunk_frames=50,
+            max_slack_frames=50,
+        )
+        is None
+    )
+    assert (
+        route_prefix_cuda_graph_envelope(
+            new_frame_counts=[100],
+            total_frame_counts=[100],
+            envelopes=(envelope,),
+            chunk_frames=50,
+            max_slack_frames=100,
+        )
+        == envelope
+    )
+
+
+def test_prefix_cuda_graph_max_slack_defaults_to_two_chunks() -> None:
+    assert resolve_prefix_cuda_graph_max_slack(50, None) == 100
+    assert resolve_prefix_cuda_graph_max_slack(50, 50) == 50
+    with pytest.raises(ValueError, match="greater than zero"):
+        resolve_prefix_cuda_graph_max_slack(50, 0)
+    with pytest.raises(ValueError, match="chunk size 50"):
+        resolve_prefix_cuda_graph_max_slack(50, 75)
 
 
 def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
@@ -218,6 +296,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             new_frame_counts=[50],
             total_frame_counts=[50],
             envelopes=envelopes,
+            chunk_frames=50,
+            max_slack_frames=100,
         )
         == envelopes[0]
     )
@@ -226,6 +306,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             new_frame_counts=[50, 50],
             total_frame_counts=[50, 50],
             envelopes=envelopes,
+            chunk_frames=50,
+            max_slack_frames=100,
         )
         == envelopes[1]
     )
@@ -234,6 +316,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             new_frame_counts=[50, 50],
             total_frame_counts=[50, 50],
             envelopes=(envelopes[0],),
+            chunk_frames=50,
+            max_slack_frames=100,
         )
         is None
     )
@@ -242,6 +326,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             new_frame_counts=[100, 50],
             total_frame_counts=[100, 50],
             envelopes=envelopes,
+            chunk_frames=50,
+            max_slack_frames=100,
         )
         == envelopes[1]
     )
@@ -250,6 +336,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             new_frame_counts=[100, 100],
             total_frame_counts=[100, 100],
             envelopes=envelopes,
+            chunk_frames=50,
+            max_slack_frames=100,
         )
         == envelopes[1]
     )
@@ -258,6 +346,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             new_frame_counts=[100],
             total_frame_counts=[100],
             envelopes=envelopes,
+            chunk_frames=50,
+            max_slack_frames=100,
         )
         == envelopes[0]
     )
@@ -266,6 +356,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             new_frame_counts=[75],
             total_frame_counts=[75],
             envelopes=envelopes,
+            chunk_frames=50,
+            max_slack_frames=100,
         )
         is None
     )
@@ -276,6 +368,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             envelopes=(
                 PrefixCudaGraphEnvelope("B1-N200-M200-E512", 1, 200, 200, 512, (200,)),
             ),
+            chunk_frames=50,
+            max_slack_frames=100,
         )
         is None
     )
@@ -286,6 +380,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             envelopes=(
                 PrefixCudaGraphEnvelope("B1-N125-M100-E512", 1, 125, 100, 512, (125,)),
             ),
+            chunk_frames=50,
+            max_slack_frames=100,
         )
         is None
     )
@@ -296,6 +392,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             envelopes=(
                 PrefixCudaGraphEnvelope("B1-N200-M100-E512", 1, 200, 100, 512, (200,)),
             ),
+            chunk_frames=50,
+            max_slack_frames=100,
         )
         is None
     )
@@ -304,6 +402,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             new_frame_counts=[50],
             total_frame_counts=[600],
             envelopes=envelopes,
+            chunk_frames=50,
+            max_slack_frames=100,
         )
         is None
     )
@@ -319,6 +419,8 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
                     "B2-N300-M150-E1024", 2, 300, 150, 1024, (150, 150)
                 ),
             ),
+            chunk_frames=50,
+            max_slack_frames=100,
         ).name
         == "B2-N200-M100-E512"
     )
