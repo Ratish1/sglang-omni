@@ -25,6 +25,7 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
 )
 from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import (
     PrefixCudaGraphCache,
+    PrefixCudaGraphCaptureInputs,
     PrefixCudaGraphEnvelope,
 )
 
@@ -317,7 +318,7 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
     envelope = PrefixCudaGraphEnvelope("B1-N100-M100-E128", 1, 100, 100, 128, (100,))
     noise_template = torch.randn(1, CHANNELS, 100, device=device, dtype=dtype)
     mu = torch.randn(1, 100, CHANNELS, device=device, dtype=dtype)
-    mel_conditioning = torch.zeros_like(mu)
+    mel_conditioning = torch.randn_like(mu)
     speaker_embeddings = torch.randn(1, CHANNELS, device=device, dtype=dtype)
     unit = torch.linspace(0, 1, 11, device=device, dtype=dtype)
     time_span = 1 - torch.cos(unit * 0.5 * torch.pi)
@@ -333,6 +334,19 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
         envelopes=(envelope,),
         capture_warmup_iterations=1,
     )
+
+    def capture_inputs(
+        new_frame_counts: tuple[int, ...],
+    ) -> PrefixCudaGraphCaptureInputs:
+        total_new_frame_count = sum(new_frame_counts)
+        return (
+            noise_template[:, :, :total_new_frame_count].transpose(1, 2).contiguous(),
+            time_span.clone(),
+            mu[:, :total_new_frame_count],
+            speaker_embeddings,
+            mel_conditioning[:, :total_new_frame_count],
+        )
+
     graph_pair = (PrefixCacheRow(), PrefixCacheRow())
     reference_pair = (PrefixCacheRow(), PrefixCacheRow())
 
@@ -360,7 +374,7 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
                     )
 
     try:
-        graph_cache.capture()
+        graph_cache.capture(capture_inputs)
         assert graph_cache.capture_stats().graph_count == 1
         assert graph_cache.capture_stats().scratch_reserved_frames == 256
         assert grow_rows(graph_pool, list(graph_pair), [50, 50])
@@ -493,7 +507,7 @@ def test_prefix_cuda_graph_matches_compiled_solver_for_b2_physical_reuse() -> No
     )
     noise_template = torch.randn(1, CHANNELS, 200, device=device, dtype=dtype)
     mu = torch.randn(1, 200, CHANNELS, device=device, dtype=dtype)
-    mel_conditioning = torch.zeros_like(mu)
+    mel_conditioning = torch.randn_like(mu)
     speaker_embeddings = torch.randn(2, CHANNELS, device=device, dtype=dtype)
     unit = torch.linspace(0, 1, 11, device=device, dtype=dtype)
     time_span = 1 - torch.cos(unit * 0.5 * torch.pi)
@@ -509,6 +523,19 @@ def test_prefix_cuda_graph_matches_compiled_solver_for_b2_physical_reuse() -> No
         envelopes=(envelope,),
         capture_warmup_iterations=1,
     )
+
+    def capture_inputs(
+        new_frame_counts: tuple[int, ...],
+    ) -> PrefixCudaGraphCaptureInputs:
+        total_new_frame_count = sum(new_frame_counts)
+        return (
+            noise_template[:, :, :total_new_frame_count].transpose(1, 2).contiguous(),
+            time_span.clone(),
+            mu[:, :total_new_frame_count],
+            speaker_embeddings,
+            mel_conditioning[:, :total_new_frame_count],
+        )
+
     graph_pairs = [
         (PrefixCacheRow(), PrefixCacheRow()),
         (PrefixCacheRow(), PrefixCacheRow()),
@@ -549,7 +576,7 @@ def test_prefix_cuda_graph_matches_compiled_solver_for_b2_physical_reuse() -> No
                         )
 
     try:
-        graph_cache.capture()
+        graph_cache.capture(capture_inputs)
         assert graph_cache.capture_stats().graph_count == 1
         for new_frame_counts_tuple in ((50, 50), (100, 50), (100, 100)):
             new_frame_counts = list(new_frame_counts_tuple)

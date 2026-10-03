@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -10,10 +13,117 @@ from sglang_omni.models.fun_cosyvoice3.config import (
     FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES,
 )
 from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import (
+    PrefixCudaGraphCache,
     PrefixCudaGraphEnvelope,
     prefix_cuda_graph_envelopes_from_capture_shapes,
     route_prefix_cuda_graph_envelope,
 )
+
+
+def test_prefix_cuda_graph_capture_requires_input_factory() -> None:
+    parameter = inspect.signature(PrefixCudaGraphCache.capture).parameters[
+        "capture_input_factory"
+    ]
+    assert parameter.default is inspect.Parameter.empty
+
+
+def test_prepare_prefix_cuda_graph_capture_inputs_uses_warmup_conditioning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameter = torch.nn.Parameter(torch.zeros(1))
+    fake_flow = SimpleNamespace(
+        token_mel_ratio=2,
+        pre_lookahead_len=1,
+        output_size=2,
+        spk_embed_affine_layer=torch.nn.Linear(3, 2),
+        parameters=lambda: iter((parameter,)),
+    )
+    fake_flow.flow = fake_flow
+
+    warmup_token_counts: list[int] = []
+
+    def make_warmup_flow_input(token_count: int) -> stages.FlowBatchInput:
+        warmup_token_counts.append(token_count)
+        return stages.FlowBatchInput(
+            token=torch.full((1, token_count), 3, dtype=torch.int32),
+            prompt_token=torch.full((1, 1), 2, dtype=torch.int32),
+            prompt_feat=torch.full((1, 2, 2), 4.0),
+            embedding=torch.full((1, 3), 5.0),
+        )
+
+    scheduler = SimpleNamespace(
+        token_hop_len=1,
+        make_warmup_flow_input=make_warmup_flow_input,
+    )
+    packed_batches: list[stages.PackedFlowBatch] = []
+    original_pack_flow_inputs = stages.pack_flow_inputs
+
+    def recording_pack_flow_inputs(
+        flow_model: stages.FunCosyVoice3Flow,
+        inputs: list[stages.FlowBatchInput],
+    ) -> stages.PackedFlowBatch:
+        packed = original_pack_flow_inputs(flow_model, inputs)
+        packed_batches.append(packed)
+        return packed
+
+    monkeypatch.setattr(stages, "pack_flow_inputs", recording_pack_flow_inputs)
+
+    token_condition = torch.arange(1, 25, dtype=torch.float32).reshape(2, 2, 6)
+    noisy_mel = token_condition + 100
+    prompt_mel = token_condition + 200
+    speaker_embedding = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    time_span = torch.tensor([0.0, 0.5, 1.0])
+    finalize_values: list[bool] = []
+
+    def fake_prepare_flow_conditioning(
+        flow_model: stages.FunCosyVoice3Flow,
+        packed: stages.PackedFlowBatch,
+        *,
+        finalize: bool,
+    ) -> stages.FlowConditioning:
+        del flow_model, packed
+        finalize_values.append(finalize)
+        return stages.FlowConditioning(
+            token_condition=token_condition,
+            mel_lengths=(4, 6),
+            speaker_embedding=speaker_embedding,
+            prompt_mel=prompt_mel,
+            noisy_mel=noisy_mel,
+            time_span=time_span,
+        )
+
+    monkeypatch.setattr(
+        stages, "prepare_flow_conditioning", fake_prepare_flow_conditioning
+    )
+
+    capture_inputs = stages.prepare_prefix_cuda_graph_capture_inputs(
+        fake_flow,
+        scheduler,
+        (4, 6),
+        device=torch.device("cpu"),
+    )
+
+    assert warmup_token_counts == [2, 3]
+    assert len(packed_batches) == 1
+    assert packed_batches[0].target_token_lengths == (2, 3)
+    assert packed_batches[0].prompt_mel_lengths == (2, 2)
+    assert finalize_values == [False]
+    assert capture_inputs[0].shape == (1, 10, 2)
+    assert capture_inputs[2].shape == (1, 10, 2)
+    assert capture_inputs[4].shape == (1, 10, 2)
+    assert torch.equal(capture_inputs[1], time_span)
+    assert torch.equal(capture_inputs[3], speaker_embedding)
+    assert torch.equal(
+        capture_inputs[2],
+        torch.cat(
+            (
+                token_condition[0, :, :4].transpose(0, 1),
+                token_condition[1, :, :6].transpose(0, 1),
+            ),
+            dim=0,
+        ).unsqueeze(0),
+    )
+    assert all(torch.count_nonzero(value) > 0 for value in capture_inputs)
 
 
 def test_default_prefix_cuda_graph_capture_shapes_are_frozen_and_valid() -> None:

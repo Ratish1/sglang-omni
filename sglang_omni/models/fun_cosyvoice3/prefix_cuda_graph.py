@@ -254,7 +254,7 @@ class PrefixCudaGraphCache:
     @torch.inference_mode()
     def capture(
         self,
-        capture_input_factory: PrefixCudaGraphCaptureInputFactory | None = None,
+        capture_input_factory: PrefixCudaGraphCaptureInputFactory,
     ) -> None:
         if self.entries:
             raise RuntimeError("prefix CUDA Graph cache already captured")
@@ -300,26 +300,6 @@ class PrefixCudaGraphCache:
                 f"scratch_reserved_frames={stats.scratch_reserved_frames}"
             )
 
-    def capture_inputs(
-        self, new_frame_counts: tuple[int, ...]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        total_new_frame_count = sum(new_frame_counts)
-        noise = (
-            self.noise_template[:, :, :total_new_frame_count]
-            .to(device=self.device, dtype=self.input_dtype)
-            .transpose(1, 2)
-            .contiguous()
-        )
-        mu = torch.zeros_like(noise)
-        mel_conditioning = torch.zeros_like(noise)
-        speaker_embeddings = torch.zeros(
-            len(new_frame_counts),
-            self.speaker_embedding_width,
-            device=self.device,
-            dtype=self.input_dtype,
-        )
-        return noise, self.time_span.clone(), mu, speaker_embeddings, mel_conditioning
-
     def allocate_capture_pairs(
         self, new_frame_counts: tuple[int, ...]
     ) -> list[tuple[PrefixCacheRow, PrefixCacheRow]]:
@@ -346,15 +326,11 @@ class PrefixCudaGraphCache:
         self,
         envelope: PrefixCudaGraphEnvelope,
         graph_pool: tuple[int, int],
-        capture_input_factory: PrefixCudaGraphCaptureInputFactory | None,
+        capture_input_factory: PrefixCudaGraphCaptureInputFactory,
     ) -> CapturedPrefixCudaGraph:
         real_pairs = self.allocate_capture_pairs(envelope.capture_row_new_frames)
         try:
-            capture_inputs = (
-                self.capture_inputs(envelope.capture_row_new_frames)
-                if capture_input_factory is None
-                else capture_input_factory(envelope.capture_row_new_frames)
-            )
+            capture_inputs = capture_input_factory(envelope.capture_row_new_frames)
             prepared = self.prepare(
                 *capture_inputs,
                 list(envelope.capture_row_new_frames),

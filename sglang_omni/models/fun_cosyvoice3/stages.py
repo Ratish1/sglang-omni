@@ -62,6 +62,7 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
 from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import (
     PREFIX_CUDA_GRAPH_CHUNK_FRAMES,
     PrefixCudaGraphCache,
+    PrefixCudaGraphCaptureInputs,
     PrefixCudaGraphCaptureShape,
     prefix_cuda_graph_envelopes_from_capture_shapes,
 )
@@ -807,6 +808,69 @@ def prepare_flow_conditioning(
         prompt_mel=prompt_mel,
         noisy_mel=noisy_mel,
         time_span=time_span,
+    )
+
+
+def prepare_prefix_cuda_graph_capture_inputs(
+    flow: FunCosyVoice3Flow,
+    scheduler: FunCosyVoice3StreamingVocoderScheduler,
+    new_frame_counts: tuple[int, ...],
+    *,
+    device: torch.device,
+) -> PrefixCudaGraphCaptureInputs:
+    """Build prefix graph inputs through the scheduler's warmup path."""
+    ratio = int(flow.token_mel_ratio)
+    prompt_token_count = int(scheduler.token_hop_len)
+    lookahead_token_count = int(flow.pre_lookahead_len)
+    items: list[FlowBatchInput] = []
+    for new_frame_count in new_frame_counts:
+        if new_frame_count % ratio != 0:
+            raise RuntimeError(
+                "prefix CUDA Graph capture frames must align to "
+                f"token_mel_ratio={ratio}; got {new_frame_count}"
+            )
+        else:
+            token_count = (
+                new_frame_count // ratio - prompt_token_count + lookahead_token_count
+            )
+        if token_count <= 0:
+            raise RuntimeError(
+                "prefix CUDA Graph capture geometry cannot be "
+                f"represented by the warmup prompt: {new_frame_count}"
+            )
+        else:
+            items.append(scheduler.make_warmup_flow_input(token_count))
+
+    packed = pack_flow_inputs(flow.flow, items)
+    conditioning = prepare_flow_conditioning(flow, packed, finalize=False)
+    if tuple(int(value) for value in conditioning.mel_lengths) != tuple(
+        new_frame_counts
+    ):
+        raise RuntimeError(
+            "prefix CUDA Graph warmup conditioning changed capture "
+            f"geometry: {conditioning.mel_lengths} vs {new_frame_counts}"
+        )
+    else:
+        pass
+
+    padded_width = int(conditioning.token_condition.shape[2])
+    frame_index = torch.cat(
+        [
+            torch.arange(new_frame_count, device=device) + row * padded_width
+            for row, new_frame_count in enumerate(new_frame_counts)
+        ]
+    )
+
+    def take_new_frames(padded: torch.Tensor) -> torch.Tensor:
+        flat = padded.transpose(1, 2).reshape(-1, padded.shape[1])
+        return flat[frame_index].unsqueeze(0)
+
+    return (
+        take_new_frames(conditioning.noisy_mel),
+        conditioning.time_span,
+        take_new_frames(conditioning.token_condition),
+        conditioning.speaker_embedding,
+        take_new_frames(conditioning.prompt_mel),
     )
 
 
@@ -2875,81 +2939,14 @@ def create_vocoder_executor(
                 cfg_rate=float(flow.decoder.inference_cfg_rate),
                 envelopes=prefix_envelopes,
             )
-            ratio = int(flow.token_mel_ratio)
-            prompt_token_count = int(scheduler.token_hop_len)
-            lookahead_token_count = int(flow.pre_lookahead_len)
-
-            def prefix_capture_inputs(
-                new_frame_counts: tuple[int, ...],
-            ) -> tuple[
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-            ]:
-                items: list[FlowBatchInput] = []
-                for new_frame_count in new_frame_counts:
-                    if new_frame_count % ratio != 0:
-                        raise RuntimeError(
-                            "prefix CUDA Graph capture frames must align to "
-                            f"token_mel_ratio={ratio}; got {new_frame_count}"
-                        )
-                    else:
-                        token_count = (
-                            new_frame_count // ratio
-                            - prompt_token_count
-                            + lookahead_token_count
-                        )
-                    if token_count <= 0:
-                        raise RuntimeError(
-                            "prefix CUDA Graph capture geometry cannot be "
-                            f"represented by the warmup prompt: {new_frame_count}"
-                        )
-                    else:
-                        items.append(scheduler.make_warmup_flow_input(token_count))
-
-                packed = pack_flow_inputs(flow.flow, items)
-                conditioning = prepare_flow_conditioning(
+            prefix_cache.capture(
+                lambda new_frame_counts: prepare_prefix_cuda_graph_capture_inputs(
                     flow,
-                    packed,
-                    finalize=False,
+                    scheduler,
+                    new_frame_counts,
+                    device=device_obj,
                 )
-                if tuple(int(value) for value in conditioning.mel_lengths) != tuple(
-                    new_frame_counts
-                ):
-                    raise RuntimeError(
-                        "prefix CUDA Graph warmup conditioning changed capture "
-                        f"geometry: {conditioning.mel_lengths} vs {new_frame_counts}"
-                    )
-                else:
-                    pass
-
-                padded_width = int(conditioning.token_condition.shape[2])
-                frame_index = torch.cat(
-                    [
-                        torch.arange(
-                            new_frame_count,
-                            device=device_obj,
-                        )
-                        + row * padded_width
-                        for row, new_frame_count in enumerate(new_frame_counts)
-                    ]
-                )
-
-                def take_new_frames(padded: torch.Tensor) -> torch.Tensor:
-                    flat = padded.transpose(1, 2).reshape(-1, padded.shape[1])
-                    return flat[frame_index].unsqueeze(0)
-
-                return (
-                    take_new_frames(conditioning.noisy_mel),
-                    conditioning.time_span,
-                    take_new_frames(conditioning.token_condition),
-                    conditioning.speaker_embedding,
-                    take_new_frames(conditioning.prompt_mel),
-                )
-
-            prefix_cache.capture(prefix_capture_inputs)
+            )
             flow.attach_prefix_cuda_graph_cache(prefix_cache)
     else:
         pass
