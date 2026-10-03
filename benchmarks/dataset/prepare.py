@@ -148,7 +148,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
     configure_hf_hub_logger()
     download_dataset(DATASETS[args.dataset], revision=args.revision)
 
