@@ -20,6 +20,7 @@ import os
 import time
 import wave
 from typing import AsyncIterator, Literal, Protocol, TypedDict
+from urllib.parse import quote
 
 import aiohttp
 import numpy as np
@@ -1150,7 +1151,7 @@ async def fetch_stream_outcome(
         else {}
     )
     async with session.get(
-        f"{api_url}/{result.server_request_id}", headers=headers
+        f"{api_url}/{quote(result.speech_outcome_id, safe='')}", headers=headers
     ) as response:
         if response.status == 404:
             return
@@ -1174,7 +1175,7 @@ def make_stream_outcome_collector(api_url: str) -> AfterSendFn:
     """Return an after_send hook that fetches a raw PCM stream's terminal state."""
 
     async def collect(session: aiohttp.ClientSession, result: RequestResult) -> None:
-        if result.is_success and result.server_request_id:
+        if result.is_success and result.speech_outcome_id:
             try:
                 await fetch_stream_outcome(session, api_url, result)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -1431,7 +1432,9 @@ def make_tts_send_fn(
                     await _handle_raw_pcm_streaming_response(
                         response, result, start_time, save_audio_dir
                     )
-                    result.server_request_id = response.headers.get("X-Request-Id", "")
+                    result.speech_outcome_id = response.headers.get(
+                        "X-SGLang-Omni-Speech-Id", ""
+                    )
                     result.server_worker_id = response.headers.get(
                         "X-SGLang-Omni-Worker", ""
                     )

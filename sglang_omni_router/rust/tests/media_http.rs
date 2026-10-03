@@ -210,7 +210,7 @@ fn handle_connection(
             });
         let response: &[u8] = match path.as_str() {
         "/v1/audio/speech" if contains_bytes(&body, b"\"stream\":true") => {
-            b"HTTP/1.1 200 OK\r\nContent-Type: audio/pcm\r\nContent-Length: 4\r\nX-Sample-Rate: 24000\r\nX-Channels: 1\r\nX-Bit-Depth: 16\r\n\r\nPCM!"
+            b"HTTP/1.1 200 OK\r\nContent-Type: audio/pcm\r\nContent-Length: 4\r\nX-Sample-Rate: 24000\r\nX-Channels: 1\r\nX-Bit-Depth: 16\r\nX-SGLang-Omni-Speech-Id: speech-resource\r\n\r\nPCM!"
         }
         "/v1/audio/speech" if contains_bytes(&body, b"\"response_format\":\"opus\"") => {
             b"HTTP/1.1 200 OK\r\nContent-Type: audio/opus\r\nContent-Length: 4\r\n\r\nOPUS"
@@ -978,6 +978,40 @@ fn media_accepts_chunked_uploads_and_standard_continue() {
         .read_to_end(&mut response)
         .expect("read final response");
     assert!(response.starts_with(b"HTTP/1.1 200"));
+}
+
+#[test]
+fn speech_resource_identity_survives_canonical_request_headers() {
+    let _guard = socket_guard();
+    let worker = Worker::start();
+    let router = RouterProcess::start(&[MediaRoute::Speech], &[(&worker, false)]);
+    for caller_id in ["trace/a", "batch", "stream", "a#b", "a?b", "a%2Fb"] {
+        let response = request_with_extra_headers(
+            router.address,
+            "POST",
+            "/v1/audio/speech",
+            Some("application/json"),
+            &format!("x-request-id: {caller_id}\r\n"),
+            br#"{"input":"hello","stream":true}"#,
+        )
+        .expect("speech response");
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(header(&response, "x-request-id"), Some(caller_id));
+        let speech_id = header(&response, "x-sglang-omni-speech-id").expect("speech identity");
+        let worker_id = header(&response, "x-sglang-omni-worker").expect("worker identity");
+        let path = format!("/v1/audio/speech/{speech_id}");
+        let outcome = request_with_extra_headers(
+            router.address,
+            "GET",
+            &path,
+            None,
+            &format!("x-sglang-omni-route-worker: {worker_id}\r\n"),
+            b"",
+        )
+        .expect("speech outcome");
+        assert!(outcome.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(worker.captures().last().expect("lookup").path, path);
+    }
 }
 
 #[test]

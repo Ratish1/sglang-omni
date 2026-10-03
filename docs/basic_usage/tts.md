@@ -327,11 +327,13 @@ covers depends on the model: Qwen3-TTS counts reference-audio codec frames, not
 text tokens.
 
 
-For raw PCM, the response carries X-Request-Id. After the stream ends,
-GET /v1/audio/speech/{request_id} returns its finish_reason and usage.
-A caller-supplied X-Request-Id (at most 128 visible ASCII bytes, no /)
-is used as the lookup key; reusing it overwrites the previous outcome.
-Only the most recent outcomes are kept in memory.
+For raw PCM, use the response's `X-SGLang-Omni-Speech-Id` with
+`GET /v1/audio/speech/{request_id}` after the stream ends to retrieve its
+`finish_reason` and `usage`. This generated speech ID is independent of the
+`X-Request-Id` correlation header. Behind a router, also echo the response's
+`X-SGLang-Omni-Worker` as `X-SGLang-Omni-Route-Worker` on the GET.
+Only the most recent outcomes are retained; missing outcomes do not establish
+a natural stop or a cap hit.
 
 When the client does not set `initial_codec_chunk_frames`,
 the model selects a continuity-safe first vocoder chunk. Set the field explicitly

@@ -193,7 +193,8 @@ def test_stream_send_fn_records_the_ids_the_outcome_collector_needs():
         status=200,
         headers={
             "Content-Type": "audio/pcm",
-            "X-Request-Id": "speech-1",
+            "X-Request-Id": "correlation-1",
+            "X-SGLang-Omni-Speech-Id": "speech-1",
             "X-SGLang-Omni-Worker": "worker-b",
             "x-sample-rate": "4",
             "x-channels": "1",
@@ -210,7 +211,7 @@ def test_stream_send_fn_records_the_ids_the_outcome_collector_needs():
     result = asyncio.run(send_fn(session, SEEDTTS_SAMPLE))
 
     assert result.is_success
-    assert result.server_request_id == "speech-1"
+    assert result.speech_outcome_id == "speech-1"
     assert result.server_worker_id == "worker-b"
     # The lookup is the runner's after_send job, outside the timed window.
     session.get.assert_not_called()
@@ -235,7 +236,7 @@ def test_stream_outcome_collector_reads_the_outcome_json():
     result = RequestResult(
         request_id="sample-1",
         is_success=True,
-        server_request_id="speech-1",
+        speech_outcome_id="speech-1",
         server_worker_id="worker-b",
     )
 

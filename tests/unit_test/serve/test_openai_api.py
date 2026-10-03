@@ -1368,22 +1368,39 @@ def test_speech_stream_defaults_to_raw_pcm() -> None:
     assert response.headers["x-channels"] == "1"
     assert response.headers["x-bit-depth"] == "16"
     assert response.content == expected
-    # A caller (or router) supplied id keys the outcome so the caller can find it.
-    assert response.headers["x-request-id"] == "caller-1"
-    assert client.get("/v1/audio/speech/caller-1").json() == {
-        "request_id": "caller-1",
+    outcome_id = response.headers["x-sglang-omni-speech-id"]
+    assert client.get(f"/v1/audio/speech/{outcome_id}").json() == {
+        "request_id": outcome_id,
         "finish_reason": "unknown",
         "usage": None,
     }
     assert client.get("/v1/audio/speech/speech-unknown").status_code == 404
 
-    # An id the lookup path cannot carry falls back to the worker's own.
-    response = client.post(
-        "/v1/audio/speech", json=payload, headers={"x-request-id": "a/b"}
+
+@pytest.mark.parametrize(
+    "caller_id", ["trace/a", "batch", "stream", "a#b", "a?b", "a%2Fb"]
+)
+def test_speech_outcome_identity_is_independent_of_reused_correlation_ids(
+    caller_id: str,
+) -> None:
+    client = TestClient(
+        create_app(TerminalChunkStreamingSpeechClient(), model_name="s2-pro")
     )
-    request_id = response.headers["x-request-id"]
-    assert request_id.startswith("speech-")
-    assert client.get(f"/v1/audio/speech/{request_id}").status_code == 200
+    outcome_ids: set[str] = set()
+    for _ in range(2):
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "hello", "stream": True, "response_format": "pcm"},
+            headers={"x-request-id": caller_id},
+        )
+        assert response.status_code == 200
+        outcome_id = response.headers["x-sglang-omni-speech-id"]
+        outcome_ids.add(outcome_id)
+        outcome = client.get(f"/v1/audio/speech/{outcome_id}")
+        assert outcome.status_code == 200
+        assert outcome.json()["request_id"] == outcome_id
+        assert outcome.json()["finish_reason"] == "length"
+    assert len(outcome_ids) == 2
 
 
 def test_speech_stream_headers_use_chunk_sample_rate() -> None:
@@ -1428,7 +1445,9 @@ def test_speech_stream_records_terminal_state_from_a_later_chunk() -> None:
     )
     assert response.status_code == 200
 
-    outcome = client.get(f"/v1/audio/speech/{response.headers['x-request-id']}")
+    outcome = client.get(
+        f"/v1/audio/speech/{response.headers['x-sglang-omni-speech-id']}"
+    )
     assert outcome.status_code == 200
     assert outcome.json()["finish_reason"] == "length"
     assert outcome.json()["usage"]["completion_tokens"] == 120
@@ -1455,7 +1474,6 @@ def test_raw_pcm_response_close_aborts_inner_speech_stream() -> None:
             client=client,
             gen_req=GenerateRequest(model="s2-pro", prompt="hello", stream=True),
             request_id="req-1",
-            public_request_id="req-1",
             speed=1.0,
             speech_stream_outcomes=speech_stream_outcomes,
             stream_format="audio",
@@ -1479,7 +1497,6 @@ def test_raw_pcm_response_disconnect_before_first_chunk_aborts_request() -> None
                 client=client,
                 gen_req=GenerateRequest(model="s2-pro", prompt="hello", stream=True),
                 request_id="req-1",
-                public_request_id="req-1",
                 speed=1.0,
                 speech_stream_outcomes=SpeechStreamOutcomes(max_entries=8),
                 stream_format="audio",
@@ -1562,7 +1579,6 @@ def test_sse_speech_response_close_aborts_inner_speech_stream() -> None:
             request_id="req-1",
             speed=1.0,
             stream_format="sse",
-            public_request_id="req-1",
             speech_stream_outcomes=SpeechStreamOutcomes(max_entries=8),
         )
         body = response.body_iterator
