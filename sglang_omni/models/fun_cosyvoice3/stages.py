@@ -71,11 +71,7 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
     cleanup_prepared_cosyvoice3_request,
     preprocess_cosyvoice3_payload,
 )
-from sglang_omni.models.fun_cosyvoice3.streaming import (
-    TOKEN_HOP_LEN,
-    TOKEN_MAX_HOP_LEN,
-    TOKEN_MEL_RATIO,
-)
+from sglang_omni.models.fun_cosyvoice3.streaming import TOKEN_HOP_LEN, TOKEN_MAX_HOP_LEN
 from sglang_omni.platforms import current_platform
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
@@ -2057,7 +2053,7 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
                 streaming=streaming,
                 finalize=finalize,
             )
-        tts_mel = tts_mel[:, :, offset * TOKEN_MEL_RATIO :]
+        tts_mel = tts_mel[:, :, offset * int(self.flow.token_mel_ratio) :]
         return self.hift_delta(
             tts_mel, hift_mel=hift_mel, speech_offset=speech_offset, finalize=finalize
         )
