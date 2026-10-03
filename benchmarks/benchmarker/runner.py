@@ -7,7 +7,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Protocol
 
 import aiohttp
 import numpy as np
@@ -18,9 +18,10 @@ from benchmarks.benchmarker.data import RequestResult
 logger = logging.getLogger(__name__)
 
 SendFn = Callable[[aiohttp.ClientSession, Any], Coroutine[Any, Any, RequestResult]]
-AfterSendFn = Callable[
-    [aiohttp.ClientSession, RequestResult], Coroutine[Any, Any, None]
-]
+
+
+class AfterSendFn(Protocol):
+    async def __call__(self, result: RequestResult) -> None: ...
 
 
 def resolve_warmup(warmup: int | None, max_concurrency: int) -> int:
@@ -94,8 +95,7 @@ class BenchmarkRunner:
                 session, samples, send_fn, after_send
             )
             self.wall_clock_s = time.perf_counter() - t0
-            # note (Yucheng Hu): follow-ups stay outside the timed window but
-            # need the session, so they finish before it closes.
+            # note (ratish): only the final collection drain is outside the timed window.
             await asyncio.gather(*follow_up_tasks)
         return results
 
@@ -177,9 +177,7 @@ class BenchmarkRunner:
             if open_loop:
                 result.dispatch_lateness_s = sent_at - planned_at
             if after_send is not None:
-                # note (Yucheng Hu): started after the slot is released, so a
-                # follow-up never holds a generation slot or extends the window.
-                follow_up_tasks.append(asyncio.create_task(after_send(session, result)))
+                follow_up_tasks.append(asyncio.create_task(after_send(result)))
             pbar.update(1)
             return result
 

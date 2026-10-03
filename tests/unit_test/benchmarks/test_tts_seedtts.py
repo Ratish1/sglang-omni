@@ -3,26 +3,29 @@
 
 import asyncio
 import json
+import socket
 import sys
 import threading
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 import requests
+from aiohttp import web
 
-from benchmarks.benchmarker.data import FinishReason, RequestResult
+from benchmarks.benchmarker.data import FinishReason
+from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
 from benchmarks.dataset.seedtts import SampleInput
 from benchmarks.eval import benchmark_tts_seedtts as tts
 from benchmarks.metrics.wer import SampleOutput, calculate_wer_metrics
 from benchmarks.tasks import asr
 from benchmarks.tasks.tts import (
     _build_tts_payload,
-    make_stream_outcome_collector,
     make_tts_send_fn,
+    stream_outcome_collector,
 )
 from tests.utils import QWEN3_ASR_WER_CONCURRENCY, assert_wer_partitioned
 
@@ -213,16 +216,49 @@ def test_stream_send_fn_records_the_ids_the_outcome_collector_needs():
     assert result.is_success
     assert result.speech_outcome_id == "speech-1"
     assert result.server_worker_id == "worker-b"
-    # The lookup is the runner's after_send job, outside the timed window.
+
     session.get.assert_not_called()
 
 
-def test_stream_outcome_collector_reads_the_outcome_json():
-    session = MagicMock()
-    session.get.return_value.__aenter__.return_value = MagicMock(
-        status=200,
-        json=AsyncMock(
-            return_value={
+@pytest.mark.asyncio
+async def test_slow_outcomes_do_not_occupy_generation_connections() -> None:
+    lookup_started = asyncio.Event()
+    generations_finished = asyncio.Event()
+    release_lookups = asyncio.Event()
+    completed = 0
+    request_count = 120
+    lookup_ids: list[str] = []
+
+    async def speech(request: web.Request) -> web.Response:
+        nonlocal completed
+        if completed:
+            await lookup_started.wait()
+        else:
+            pass
+        completed += 1
+        if completed == request_count:
+            generations_finished.set()
+        else:
+            pass
+        return web.Response(
+            body=bytes(8),
+            content_type="audio/pcm",
+            headers={
+                "X-SGLang-Omni-Speech-Id": f"speech#{completed}?%",
+                "X-SGLang-Omni-Worker": "worker-b",
+                "X-Sample-Rate": "4",
+                "X-Channels": "1",
+                "X-Bit-Depth": "16",
+            },
+        )
+
+    async def outcome(request: web.Request) -> web.Response:
+        lookup_ids.append(request.match_info["speech_id"])
+        assert request.headers["x-sglang-omni-route-worker"] == "worker-b"
+        lookup_started.set()
+        await release_lookups.wait()
+        return web.json_response(
+            {
                 "finish_reason": "length",
                 "usage": {
                     "prompt_tokens": 7,
@@ -230,31 +266,48 @@ def test_stream_outcome_collector_reads_the_outcome_json():
                     "engine_time_s": 4.8,
                 },
             }
-        ),
-    )
-    collect = make_stream_outcome_collector("http://host/v1/audio/speech")
-    result = RequestResult(
-        request_id="sample-1",
-        is_success=True,
-        speech_outcome_id="speech-1",
-        server_worker_id="worker-b",
-    )
+        )
 
-    asyncio.run(collect(session, result))
-
-    session.get.assert_called_once_with(
-        "http://host/v1/audio/speech/speech-1",
-        headers={"x-sglang-omni-route-worker": "worker-b"},
-    )
-    assert result.finish_reason is FinishReason.LENGTH
-    assert result.prompt_tokens == 7
-    assert result.completion_tokens == 120
-    assert result.tok_per_s == pytest.approx(25.0)
-
-    # A failed request or a response without an id has nothing to look up.
-    asyncio.run(collect(session, RequestResult(request_id="sample-2")))
-    asyncio.run(collect(session, RequestResult(request_id="sample-3", is_success=True)))
-    session.get.assert_called_once()
+    application = web.Application()
+    application.router.add_post("/v1/audio/speech", speech)
+    application.router.add_get("/v1/audio/speech/{speech_id}", outcome)
+    server = web.AppRunner(application)
+    await server.setup()
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.setblocking(False)
+        api_url = f"http://127.0.0.1:{listener.getsockname()[1]}/v1/audio/speech"
+        await web.SockSite(server, listener).start()
+        try:
+            runner = BenchmarkRunner(
+                RunConfig(max_concurrency=1, warmup=0, disable_tqdm=True)
+            )
+            send = make_tts_send_fn(
+                "tts", api_url, stream=True, no_ref_audio=True, no_ref_text=True
+            )
+            async with stream_outcome_collector(api_url) as collect:
+                task = asyncio.create_task(
+                    runner.run(
+                        [SEEDTTS_SAMPLE] * request_count, send, after_send=collect
+                    )
+                )
+                try:
+                    await asyncio.wait_for(generations_finished.wait(), timeout=3)
+                    assert not task.done()
+                finally:
+                    release_lookups.set()
+                    results = await asyncio.wait_for(task, timeout=5)
+            assert all(result.is_success for result in results)
+            assert all(
+                result.finish_reason is FinishReason.LENGTH for result in results
+            )
+            assert all(result.completion_tokens == 120 for result in results)
+            assert all(result.tok_per_s == pytest.approx(25.0) for result in results)
+            assert set(lookup_ids) == {
+                f"speech#{index}?%" for index in range(1, request_count + 1)
+            }
+        finally:
+            await server.cleanup()
 
 
 def test_wer_fanout_preserves_all_twenty_samples_at_long_audio_admission_cap(

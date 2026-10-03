@@ -119,13 +119,13 @@ from benchmarks.tasks.asr import (
 from benchmarks.tasks.tts import (
     MOSS_TTS_TOKEN_COUNT_AUTO,
     build_base_url,
-    make_stream_outcome_collector,
     make_tts_send_fn,
     run_seedtts_similarity,
     run_seedtts_transcribe,
     run_seedtts_utmos,
     save_generated_audio_metadata,
     save_speed_results,
+    stream_outcome_collector,
 )
 from sglang_omni.admission import QueueFullError
 
@@ -227,6 +227,7 @@ class TtsSeedttsBenchmarkConfig:
     request_rate: float = float("inf")
     arrival_seed: int | None = None
     stream: bool = False
+    collect_stream_outcomes: bool = True
     initial_codec_chunk_frames: int | None = None
     disable_tqdm: bool = False
     max_running_requests: int = 64
@@ -312,6 +313,7 @@ def _build_results_config(
         "task_type": config.task_type,
         "instructions": config.instructions,
         "stream": config.stream,
+        "collect_stream_outcomes": config.stream and config.collect_stream_outcomes,
         "max_samples": config.max_samples,
         "sample_offset": config.sample_offset,
         "max_new_tokens": resolve_max_new_tokens(config),
@@ -446,11 +448,11 @@ async def run_tts_seedtts_benchmark(
             arrival_seed=config.arrival_seed,
         )
     )
-    outputs = await runner.run(
-        samples,
-        send_fn,
-        after_send=make_stream_outcome_collector(api_url) if config.stream else None,
-    )
+    if config.stream and config.collect_stream_outcomes:
+        async with stream_outcome_collector(api_url) as collect:
+            outputs = await runner.run(samples, send_fn, after_send=collect)
+    else:
+        outputs = await runner.run(samples, send_fn)
     warn_if_tail_percentile_is_thin(len(outputs))
 
     metrics = compute_speed_metrics(outputs, wall_clock_s=runner.wall_clock_s)
@@ -489,6 +491,7 @@ def run_tts_seedtts_transcribe(
         "seed": config.seed,
         "max_samples": config.max_samples,
         "stream": config.stream,
+        "collect_stream_outcomes": config.stream and config.collect_stream_outcomes,
         "initial_codec_chunk_frames": config.initial_codec_chunk_frames,
         "concurrency": config.concurrency,
         "asr_concurrency": config.asr_concurrency,
@@ -534,6 +537,7 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         request_rate=args.request_rate,
         arrival_seed=args.arrival_seed,
         stream=args.stream,
+        collect_stream_outcomes=args.collect_stream_outcomes,
         initial_codec_chunk_frames=args.initial_codec_chunk_frames,
         disable_tqdm=args.disable_tqdm,
         max_running_requests=args.max_running_requests,
@@ -978,6 +982,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--stream",
         action="store_true",
         help="Use streaming for TTS generation.",
+    )
+    parser.add_argument(
+        "--collect-stream-outcomes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Collect raw PCM finish reasons with background GETs; disable to measure their overhead.",
     )
     parser.add_argument(
         "--initial-codec-chunk-frames",

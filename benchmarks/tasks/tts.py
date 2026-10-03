@@ -19,6 +19,7 @@ import logging
 import os
 import time
 import wave
+from contextlib import asynccontextmanager
 from typing import AsyncIterator, Literal, Protocol, TypedDict
 from urllib.parse import quote
 
@@ -63,6 +64,8 @@ from benchmarks.tasks.asr import (
 
 logger = logging.getLogger(__name__)
 
+STREAM_OUTCOME_TIMEOUT_S = 5.0
+STREAM_OUTCOME_CONNECTIONS = 1
 TEXT_PREVIEW_LENGTH = 60
 SPEAKER_SIMILARITY_BATCH_SIZE = 8
 MOSS_TTS_TOKEN_COUNT_AUTO = "auto"
@@ -1171,21 +1174,24 @@ async def fetch_stream_outcome(
     set_token_rate(result)
 
 
-def make_stream_outcome_collector(api_url: str) -> AfterSendFn:
-    """Return an after_send hook that fetches a raw PCM stream's terminal state."""
+@asynccontextmanager
+async def stream_outcome_collector(api_url: str) -> AsyncIterator[AfterSendFn]:
+    timeout = aiohttp.ClientTimeout(total=STREAM_OUTCOME_TIMEOUT_S)
+    connector = aiohttp.TCPConnector(limit=STREAM_OUTCOME_CONNECTIONS)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
 
-    async def collect(session: aiohttp.ClientSession, result: RequestResult) -> None:
-        if result.is_success and result.speech_outcome_id:
-            try:
-                await fetch_stream_outcome(session, api_url, result)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                logger.warning(
-                    f"[{result.request_id}] stream outcome lookup failed: {exc}"
-                )
-        else:
-            pass
+        async def collect(result: RequestResult) -> None:
+            if result.is_success and result.speech_outcome_id:
+                try:
+                    await fetch_stream_outcome(session, api_url, result)
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    logger.warning(
+                        f"[{result.request_id}] stream outcome lookup failed: {exc}"
+                    )
+            else:
+                pass
 
-    return collect
+        yield collect
 
 
 def _parse_pcm_response_format(

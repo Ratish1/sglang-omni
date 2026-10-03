@@ -335,6 +335,13 @@ For raw PCM, use the response's `X-SGLang-Omni-Speech-Id` with
 Only the most recent outcomes are retained; missing outcomes do not establish
 a natural stop or a cap hit.
 
+The SeedTTS benchmark collects raw PCM outcomes over a separate connection pool.
+Collection still consumes server resources during generation. Use
+`--no-collect-stream-outcomes` for an instrumentation control, and keep the setting
+identical between performance arms. The setting is saved with the results.
+Missing reasons remain unknown and are excluded from the observed-reason count;
+a cap hit does not by itself establish poor audio quality.
+
 When the client does not set `initial_codec_chunk_frames`,
 the model selects a continuity-safe first vocoder chunk. Set the field explicitly
 to override that default, or set it to `0` to use the model's steady chunk size
