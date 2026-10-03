@@ -62,6 +62,8 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
 from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import (
     PREFIX_CUDA_GRAPH_CHUNK_FRAMES,
     PrefixCudaGraphCache,
+    PrefixCudaGraphCaptureShape,
+    prefix_cuda_graph_envelopes_from_capture_shapes,
 )
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     CosyVoice3SGLangRequestData,
@@ -420,6 +422,79 @@ def verify_flow_cuda_graph_capture_shapes(
             raise ValueError(
                 "flow_cuda_graph_capture_shapes mel_frame values must be multiples "
                 f"of {FLOW_CUDA_GRAPH_FRAME_BUCKET}; got {(batch_size, mel_frame)!r}"
+            )
+        else:
+            pass
+    return capture_shapes
+
+
+def verify_prefix_cuda_graph_capture_shapes(
+    capture_shapes: Sequence[PrefixCudaGraphCaptureShape] | None,
+) -> Sequence[PrefixCudaGraphCaptureShape]:
+    if not capture_shapes:
+        raise ValueError("flow_prefix_cuda_graph_capture_shapes must not be empty")
+    else:
+        pass
+    for capture_shape in capture_shapes:
+        (
+            batch_size,
+            new_frame_count,
+            max_new_frame_count,
+            max_total_frame_count,
+            capture_row_new_frames,
+        ) = capture_shape
+        if any(
+            value <= 0
+            for value in (
+                batch_size,
+                new_frame_count,
+                max_new_frame_count,
+                max_total_frame_count,
+            )
+        ):
+            raise ValueError(
+                "flow_prefix_cuda_graph_capture_shapes entries must have positive "
+                f"B, N, M, and E values; got {capture_shape!r}"
+            )
+        elif len(capture_row_new_frames) != batch_size:
+            raise ValueError(
+                "flow_prefix_cuda_graph_capture_shapes capture row count must "
+                f"equal B; got {capture_shape!r}"
+            )
+        elif not capture_row_new_frames:
+            raise ValueError(
+                "flow_prefix_cuda_graph_capture_shapes capture rows must not be empty"
+            )
+        elif any(frame_count <= 0 for frame_count in capture_row_new_frames):
+            raise ValueError(
+                "flow_prefix_cuda_graph_capture_shapes capture rows must be positive; "
+                f"got {capture_shape!r}"
+            )
+        elif any(
+            frame_count % PREFIX_CUDA_GRAPH_CHUNK_FRAMES != 0
+            for frame_count in capture_row_new_frames
+        ):
+            raise ValueError(
+                "flow_prefix_cuda_graph_capture_shapes capture rows must be "
+                f"multiples of {PREFIX_CUDA_GRAPH_CHUNK_FRAMES}; got {capture_shape!r}"
+            )
+        elif sum(capture_row_new_frames) != new_frame_count:
+            raise ValueError(
+                "flow_prefix_cuda_graph_capture_shapes capture rows must sum to N; "
+                f"got {capture_shape!r}"
+            )
+        else:
+            pass
+        max_capture_row_new_frames = max(capture_row_new_frames)
+        if max_capture_row_new_frames > max_new_frame_count:
+            raise ValueError(
+                "flow_prefix_cuda_graph_capture_shapes capture rows must fit M; "
+                f"got {capture_shape!r}"
+            )
+        elif max_capture_row_new_frames > max_total_frame_count:
+            raise ValueError(
+                "flow_prefix_cuda_graph_capture_shapes capture rows must fit E; "
+                f"got {capture_shape!r}"
             )
         else:
             pass
@@ -2579,6 +2654,9 @@ def create_vocoder_executor(
     enable_flow_cuda_graph: bool = True,
     enable_flow_prefix_cuda_graph: bool = False,
     flow_cuda_graph_capture_shapes: tuple[tuple[int, int], ...] | None = None,
+    flow_prefix_cuda_graph_capture_shapes: (
+        Sequence[PrefixCudaGraphCaptureShape] | None
+    ) = None,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",
     hift_max_padding_waste: float = 1.5,
@@ -2767,6 +2845,12 @@ def create_vocoder_executor(
                 "enable_flow_prefix_cuda_graph requires a 50-frame PackedDiT chunk size"
             )
         else:
+            prefix_capture_shapes = verify_prefix_cuda_graph_capture_shapes(
+                flow_prefix_cuda_graph_capture_shapes
+            )
+            prefix_envelopes = prefix_cuda_graph_envelopes_from_capture_shapes(
+                prefix_capture_shapes
+            )
             parameter_dtype = next(flow.parameters()).dtype
             time_span = torch.linspace(
                 0,
@@ -2789,6 +2873,7 @@ def create_vocoder_executor(
                 time_span=time_span,
                 speaker_embedding_width=int(flow.spk_embed_affine_layer.out_features),
                 cfg_rate=float(flow.decoder.inference_cfg_rate),
+                envelopes=prefix_envelopes,
             )
             prefix_cache.capture()
             flow.attach_prefix_cuda_graph_cache(prefix_cache)

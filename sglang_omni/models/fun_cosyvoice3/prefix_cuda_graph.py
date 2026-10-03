@@ -32,111 +32,45 @@ MAX_SLACK_FRAMES = 100
 CAPTURE_WARMUP_ITERATIONS = 3
 BYTES_PER_MIB = 1024 * 1024
 
+PrefixCudaGraphCaptureShape = tuple[int, int, int, int, Sequence[int]]
+
 
 @dataclass(frozen=True)
 class PrefixCudaGraphEnvelope:
-    """One qualified physical graph envelope and its allowed real totals."""
+    """One physical prefix CUDA Graph envelope."""
 
     name: str
     batch_size: int
     new_frame_count: int
     max_new_frame_count: int
     max_total_frame_count: int
-    qualified_new_frame_totals: tuple[int, ...]
     capture_row_new_frames: tuple[int, ...]
 
 
-DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES: tuple[PrefixCudaGraphEnvelope, ...] = (
-    PrefixCudaGraphEnvelope(
-        "B1-N300-M300-E3072", 1, 300, 300, 3072, (200, 250, 300), (300,)
-    ),
-    PrefixCudaGraphEnvelope(
-        "B1-N450-M450-E512", 1, 450, 450, 512, (350, 400, 450), (450,)
-    ),
-    PrefixCudaGraphEnvelope(
-        "B3-N400-M200-E1536", 3, 400, 200, 1536, (300, 350, 400), (200, 100, 100)
-    ),
-    PrefixCudaGraphEnvelope(
-        "B4-N900-M400-E2048",
-        4,
-        900,
-        400,
-        2048,
-        (800, 850, 900),
-        (400, 200, 150, 150),
-    ),
-    PrefixCudaGraphEnvelope(
-        "B2-N500-M350-E2048", 2, 500, 350, 2048, (400, 450, 500), (350, 150)
-    ),
-    PrefixCudaGraphEnvelope(
-        "B3-N650-M350-E3072", 3, 650, 350, 3072, (550, 600, 650), (350, 150, 150)
-    ),
-    PrefixCudaGraphEnvelope(
-        "B3-N1100-M400-E512",
-        3,
-        1100,
-        400,
-        512,
-        (1000, 1050, 1100),
-        (400, 350, 350),
-    ),
-    PrefixCudaGraphEnvelope("B1-N100-M100-E512", 1, 100, 100, 512, (100,), (100,)),
-    PrefixCudaGraphEnvelope("B2-N200-M100-E512", 2, 200, 100, 512, (200,), (100, 100)),
-    PrefixCudaGraphEnvelope(
-        "B3-N500-M300-E1024", 3, 500, 300, 1024, (400, 450, 500), (300, 100, 100)
-    ),
-    PrefixCudaGraphEnvelope(
-        "B4-N1200-M400-E1024",
-        4,
-        1200,
-        400,
-        1024,
-        (1100, 1150, 1200),
-        (400, 300, 250, 250),
-    ),
-    PrefixCudaGraphEnvelope(
-        "B3-N850-M350-E1024", 3, 850, 350, 1024, (750, 800, 850), (350, 250, 250)
-    ),
-    PrefixCudaGraphEnvelope(
-        "B5-N1150-M350-E512",
-        5,
-        1150,
-        350,
-        512,
-        (1050, 1100, 1150),
-        (350, 200, 200, 200, 200),
-    ),
-    PrefixCudaGraphEnvelope(
-        "B8-N1700-M300-E1536",
-        8,
-        1700,
-        300,
-        1536,
-        (1600, 1650, 1700),
-        (300, 300, 250, 200, 200, 150, 150, 150),
-    ),
-    PrefixCudaGraphEnvelope(
-        "B2-N600-M300-E512", 2, 600, 300, 512, (550, 600), (300, 300)
-    ),
-    PrefixCudaGraphEnvelope(
-        "B4-N700-M300-E1024",
-        4,
-        700,
-        300,
-        1024,
-        (600, 650, 700),
-        (300, 150, 150, 100),
-    ),
-    PrefixCudaGraphEnvelope(
-        "B6-N1450-M400-E2048",
-        6,
-        1450,
-        400,
-        2048,
-        (1350, 1400, 1450),
-        (400, 250, 200, 200, 200, 200),
-    ),
-)
+def prefix_cuda_graph_envelopes_from_capture_shapes(
+    capture_shapes: Sequence[PrefixCudaGraphCaptureShape],
+) -> tuple[PrefixCudaGraphEnvelope, ...]:
+    """Convert serializable capture specs into runtime graph envelopes."""
+    return tuple(
+        PrefixCudaGraphEnvelope(
+            name=(
+                f"B{batch_size}-N{new_frame_count}-M{max_new_frame_count}"
+                f"-E{max_total_frame_count}"
+            ),
+            batch_size=batch_size,
+            new_frame_count=new_frame_count,
+            max_new_frame_count=max_new_frame_count,
+            max_total_frame_count=max_total_frame_count,
+            capture_row_new_frames=tuple(capture_row_new_frames),
+        )
+        for (
+            batch_size,
+            new_frame_count,
+            max_new_frame_count,
+            max_total_frame_count,
+            capture_row_new_frames,
+        ) in capture_shapes
+    )
 
 
 @dataclass(frozen=True)
@@ -190,19 +124,34 @@ class CapturedPrefixCudaGraph:
 
 def route_prefix_cuda_graph_envelope(
     *,
-    batch_size: int,
-    total_new_frame_count: int,
-    max_new_frame_count: int,
-    max_total_frame_count: int,
-    envelopes: Sequence[PrefixCudaGraphEnvelope] = DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES,
+    new_frame_counts: Sequence[int],
+    total_frame_counts: Sequence[int],
+    envelopes: Sequence[PrefixCudaGraphEnvelope],
 ) -> PrefixCudaGraphEnvelope | None:
-    """Return the smallest qualified envelope for one real causal geometry."""
-    # A mathematically fitting N is not qualified unless the frozen table lists it.
+    """Return the smallest physical envelope compatible with real row geometry."""
+    if not new_frame_counts or len(new_frame_counts) != len(total_frame_counts):
+        return None
+    else:
+        pass
+    if not all(
+        frame_count > 0 and frame_count % PREFIX_CUDA_GRAPH_CHUNK_FRAMES == 0
+        for frame_count in new_frame_counts
+    ):
+        return None
+    else:
+        pass
+    batch_size = len(new_frame_counts)
+    total_new_frame_count = sum(new_frame_counts)
+    max_new_frame_count = max(new_frame_counts)
+    max_total_frame_count = max(total_frame_counts)
     candidates = [
         envelope
         for envelope in envelopes
         if envelope.batch_size == batch_size
-        and total_new_frame_count in envelope.qualified_new_frame_totals
+        and 0 <= envelope.new_frame_count - total_new_frame_count <= MAX_SLACK_FRAMES
+        and (envelope.new_frame_count - total_new_frame_count)
+        % PREFIX_CUDA_GRAPH_CHUNK_FRAMES
+        == 0
         and max_new_frame_count <= envelope.max_new_frame_count
         and max_total_frame_count <= envelope.max_total_frame_count
     ]
@@ -234,9 +183,7 @@ class PrefixCudaGraphCache:
         time_span: torch.Tensor,
         speaker_embedding_width: int,
         cfg_rate: float,
-        envelopes: tuple[
-            PrefixCudaGraphEnvelope, ...
-        ] = DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES,
+        envelopes: tuple[PrefixCudaGraphEnvelope, ...],
         capture_warmup_iterations: int = CAPTURE_WARMUP_ITERATIONS,
     ) -> None:
         self.estimator = estimator
@@ -435,30 +382,14 @@ class PrefixCudaGraphCache:
             cache_row.committed_frames = 0
             cache_row.conv_context = None
 
-    def geometry(
+    def route(
         self,
         new_frame_counts: Sequence[int],
         total_frame_counts: Sequence[int],
-    ) -> tuple[int, int, int, int]:
-        return (
-            len(new_frame_counts),
-            sum(new_frame_counts),
-            max(new_frame_counts),
-            max(total_frame_counts),
-        )
-
-    def route(
-        self,
-        batch_size: int,
-        total_new_frame_count: int,
-        max_new_frame_count: int,
-        max_total_frame_count: int,
     ) -> CapturedPrefixCudaGraph | None:
         envelope = route_prefix_cuda_graph_envelope(
-            batch_size=batch_size,
-            total_new_frame_count=total_new_frame_count,
-            max_new_frame_count=max_new_frame_count,
-            max_total_frame_count=max_total_frame_count,
+            new_frame_counts=new_frame_counts,
+            total_frame_counts=total_frame_counts,
             envelopes=self.envelopes,
         )
         if envelope is None:
@@ -786,18 +717,7 @@ class PrefixCudaGraphCache:
         total_frames: list[int],
         caches: Sequence[tuple[PrefixCacheRow, PrefixCacheRow]],
     ) -> torch.Tensor | None:
-        (
-            batch_size,
-            total_new_frame_count,
-            max_new_frame_count,
-            max_total_frame_count,
-        ) = self.geometry(new_frames, total_frames)
-        entry = self.route(
-            batch_size,
-            total_new_frame_count,
-            max_new_frame_count,
-            max_total_frame_count,
-        )
+        entry = self.route(new_frames, total_frames)
         if entry is None:
             # Misses are expected; replay and staging failures intentionally escape.
             return None

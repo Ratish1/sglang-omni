@@ -314,9 +314,7 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
     )
     graph_pool.forward = compile_forward_prefix()
     reference_pool.forward = compile_forward_prefix()
-    envelope = PrefixCudaGraphEnvelope(
-        "B1-N100-M100-E128", 1, 100, 100, 128, (50, 100), (100,)
-    )
+    envelope = PrefixCudaGraphEnvelope("B1-N100-M100-E128", 1, 100, 100, 128, (100,))
     noise_template = torch.randn(1, CHANNELS, 100, device=device, dtype=dtype)
     mu = torch.randn(1, 100, CHANNELS, device=device, dtype=dtype)
     mel_conditioning = torch.zeros_like(mu)
@@ -461,4 +459,156 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
     finally:
         release_rows(graph_pool, list(graph_pair))
         release_rows(reference_pool, list(reference_pair))
+        graph_cache.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prefix_cuda_graph_matches_compiled_solver_for_b2_physical_reuse() -> None:
+    estimator = make_estimator()
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    assert estimator.compile(dtype)
+    graph_pool = PrefixKVPool(
+        layer_num=LAYERS,
+        euler_steps=10,
+        head_num=HEADS,
+        head_dim=HEAD_DIM,
+        capacity_frames=32 * BLOCK_FRAMES,
+        device=device,
+        dtype=dtype,
+    )
+    reference_pool = PrefixKVPool(
+        layer_num=LAYERS,
+        euler_steps=10,
+        head_num=HEADS,
+        head_dim=HEAD_DIM,
+        capacity_frames=32 * BLOCK_FRAMES,
+        device=device,
+        dtype=dtype,
+    )
+    graph_pool.forward = compile_forward_prefix()
+    reference_pool.forward = compile_forward_prefix()
+    envelope = PrefixCudaGraphEnvelope(
+        "B2-N200-M100-E128", 2, 200, 100, 128, (100, 100)
+    )
+    noise_template = torch.randn(1, CHANNELS, 200, device=device, dtype=dtype)
+    mu = torch.randn(1, 200, CHANNELS, device=device, dtype=dtype)
+    mel_conditioning = torch.zeros_like(mu)
+    speaker_embeddings = torch.randn(2, CHANNELS, device=device, dtype=dtype)
+    unit = torch.linspace(0, 1, 11, device=device, dtype=dtype)
+    time_span = 1 - torch.cos(unit * 0.5 * torch.pi)
+    graph_cache = PrefixCudaGraphCache(
+        estimator,
+        graph_pool,
+        device=device,
+        autocast_dtype=dtype,
+        noise_template=noise_template,
+        time_span=time_span,
+        speaker_embedding_width=CHANNELS,
+        cfg_rate=0.7,
+        envelopes=(envelope,),
+        capture_warmup_iterations=1,
+    )
+    graph_pairs = [
+        (PrefixCacheRow(), PrefixCacheRow()),
+        (PrefixCacheRow(), PrefixCacheRow()),
+    ]
+    reference_pairs = [
+        (PrefixCacheRow(), PrefixCacheRow()),
+        (PrefixCacheRow(), PrefixCacheRow()),
+    ]
+
+    def assert_cached_rows_match(
+        graph_rows: list[tuple[PrefixCacheRow, PrefixCacheRow]],
+        reference_rows: list[tuple[PrefixCacheRow, PrefixCacheRow]],
+        committed_frame_counts: tuple[int, ...],
+    ) -> None:
+        for (
+            graph_pair,
+            reference_pair,
+            committed_frame_count,
+        ) in zip(graph_rows, reference_rows, committed_frame_counts, strict=True):
+            for graph_row, reference_row in zip(
+                graph_pair, reference_pair, strict=True
+            ):
+                assert graph_row.committed_frames == reference_row.committed_frames
+                assert graph_row.conv_context is not None
+                assert reference_row.conv_context is not None
+                assert torch.equal(graph_row.conv_context, reference_row.conv_context)
+                graph_pages = graph_row.pages(device)[:committed_frame_count]
+                reference_pages = reference_row.pages(device)[:committed_frame_count]
+                for euler_step in range(10):
+                    for layer in range(LAYERS):
+                        assert torch.equal(
+                            graph_pool.keys[euler_step][layer][graph_pages],
+                            reference_pool.keys[euler_step][layer][reference_pages],
+                        )
+                        assert torch.equal(
+                            graph_pool.values[euler_step][layer][graph_pages],
+                            reference_pool.values[euler_step][layer][reference_pages],
+                        )
+
+    try:
+        graph_cache.capture()
+        assert graph_cache.capture_stats().graph_count == 1
+        for new_frame_counts_tuple in ((50, 50), (100, 50), (100, 100)):
+            new_frame_counts = list(new_frame_counts_tuple)
+            total_new_frame_count = sum(new_frame_counts)
+            graph_rows = [row for pair in graph_pairs for row in pair]
+            reference_rows = [row for pair in reference_pairs for row in pair]
+            allocated_frames = [
+                frame_count for frame_count in new_frame_counts for _ in range(2)
+            ]
+            assert grow_rows(graph_pool, graph_rows, allocated_frames)
+            assert grow_rows(reference_pool, reference_rows, allocated_frames)
+            with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
+                graph_output = graph_cache.run(
+                    noise=noise_template[:, :, :total_new_frame_count]
+                    .transpose(1, 2)
+                    .contiguous(),
+                    time_span=time_span,
+                    mu=mu[:, :total_new_frame_count],
+                    speaker_embeddings=speaker_embeddings,
+                    mel_conditioning=mel_conditioning[:, :total_new_frame_count],
+                    new_frames=new_frame_counts,
+                    total_frames=new_frame_counts,
+                    caches=graph_pairs,
+                )
+                reference_output = solve_flow_euler_prefix(
+                    estimator,
+                    reference_pool,
+                    noise_template[:, :, :total_new_frame_count]
+                    .transpose(1, 2)
+                    .contiguous(),
+                    time_span,
+                    mu[:, :total_new_frame_count],
+                    speaker_embeddings,
+                    mel_conditioning[:, :total_new_frame_count],
+                    new_frame_counts,
+                    reference_pairs,
+                    cfg_rate=0.7,
+                )
+            assert graph_output is not None
+            assert torch.equal(graph_output, reference_output)
+            assert_cached_rows_match(
+                graph_pairs,
+                reference_pairs,
+                tuple(new_frame_counts),
+            )
+            assert graph_cache.scratch_pair is not None
+            assert graph_cache.scratch_pair[0].committed_frames == 0
+            assert graph_cache.scratch_pair[1].committed_frames == 0
+            assert graph_cache.scratch_pair[0].conv_context is None
+            assert graph_cache.scratch_pair[1].conv_context is None
+            release_rows(graph_pool, graph_rows)
+            release_rows(reference_pool, reference_rows)
+    finally:
+        release_rows(
+            graph_pool,
+            [row for pair in graph_pairs for row in pair],
+        )
+        release_rows(
+            reference_pool,
+            [row for pair in reference_pairs for row in pair],
+        )
         graph_cache.close()
