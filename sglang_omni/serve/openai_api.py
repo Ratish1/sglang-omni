@@ -1771,8 +1771,8 @@ async def speech_audio_response(
         # note (Yucheng Hu): the terminal chunk carries these; the last reported
         # value wins so the outcome can be served once the stream has ended.
         nonlocal finish_reason, final_usage
-        if chunk.model_finish_reason:
-            finish_reason = chunk.model_finish_reason
+        if chunk.reported_finish_reason:
+            finish_reason = chunk.reported_finish_reason
         else:
             pass
         if chunk.usage is not None:
@@ -1886,7 +1886,10 @@ async def speech_audio_response(
                     pass
                 yield audio_bytes
             active_request = False
-            speech_stream_outcomes.record(request_id, finish_reason, final_usage)
+            if stream_format == "audio":
+                speech_stream_outcomes.record(request_id, finish_reason, final_usage)
+            else:
+                pass
         finally:
             if active_request:
                 await abort_and_close_speech_stream(client, request_id, chunk_stream)
@@ -1921,12 +1924,15 @@ async def speech_audio_response(
                     "output_tokens": final_usage.completion_tokens,
                     "total_tokens": final_usage.total_tokens,
                 }
-            done = {"type": "speech.audio.done", "usage": usage}
+            done = {
+                "type": "speech.audio.done",
+                "usage": usage,
+                "finish_reason": finish_reason,
+            }
             yield f"data: {json.dumps(done)}\n\n"
 
     headers = {
         "X-Request-Id": request_id,
-        "X-SGLang-Omni-Speech-Id": request_id,
         "X-Sample-Rate": str(stream_sample_rate),
         "X-Channels": "1",
         "X-Bit-Depth": "16",
@@ -1936,6 +1942,7 @@ async def speech_audio_response(
             _sse_body(), media_type="text/event-stream", headers=headers
         )
     else:
+        headers["X-SGLang-Omni-Speech-Id"] = request_id
         return StreamingResponse(_body(), media_type="audio/pcm", headers=headers)
 
 

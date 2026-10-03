@@ -155,9 +155,8 @@ class GenerateChunk:
     output_token_logprobs: list[list[float | int]] | None = None
     omni_rollout: dict[str, object] | None = None
     finish_reason: str | None = None
-    # note (Yucheng Hu): the reason the model itself reported; empty when it
-    # reported none and finish_reason is only the builder's terminal marker.
-    model_finish_reason: str = ""
+    # note (ratish): None preserves typed producers; empty marks a synthetic terminal reason.
+    model_finish_reason: str | None = None
     usage: UsageInfo | None = None
     weight_version: str | None = None
     stage_id: int | None = None
@@ -166,6 +165,13 @@ class GenerateChunk:
     language: str | None = None
     audio_data: object = None
     sample_rate: int | None = None
+
+    @property
+    def reported_finish_reason(self) -> str:
+        if self.model_finish_reason is None:
+            return self.finish_reason or ""
+        else:
+            return self.model_finish_reason
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -177,6 +183,7 @@ class GenerateChunk:
             "output_token_logprobs": self.output_token_logprobs,
             "omni_rollout": self.omni_rollout,
             "finish_reason": self.finish_reason,
+            "model_finish_reason": self.reported_finish_reason,
             "usage": self.usage.to_dict() if self.usage else None,
             "weight_version": self.weight_version,
             "stage_id": self.stage_id,

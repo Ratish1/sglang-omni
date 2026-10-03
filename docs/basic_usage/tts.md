@@ -320,7 +320,7 @@ in response headers. It does not include in-band JSON events, final usage, or a
 terminal sentinel. Set `"stream_format": "sse"` to receive the same PCM as
 Server-Sent Events instead; `sse` streams even when `stream` is omitted. Each
 `speech.audio.delta` event carries base64 PCM in `audio`, and the stream ends
-with one `speech.audio.done` event carrying `usage`, or with an `error` event if
+with one `speech.audio.done` event carrying `usage` and `finish_reason`, or with an `error` event if
 generation fails mid-stream. The sample-rate headers are the same for both
 formats. `usage` reports the model's own token counts, so what `input_tokens`
 covers depends on the model: Qwen3-TTS counts reference-audio codec frames, not

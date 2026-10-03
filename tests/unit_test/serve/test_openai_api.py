@@ -244,7 +244,6 @@ class TerminalChunkStreamingSpeechClient:
             audio_data=None,
             sample_rate=24000,
             finish_reason="length",
-            model_finish_reason="length",
             usage=UsageInfo(prompt_tokens=7, completion_tokens=120),
         )
 
@@ -1371,7 +1370,7 @@ def test_speech_stream_defaults_to_raw_pcm() -> None:
     outcome_id = response.headers["x-sglang-omni-speech-id"]
     assert client.get(f"/v1/audio/speech/{outcome_id}").json() == {
         "request_id": outcome_id,
-        "finish_reason": "unknown",
+        "finish_reason": "stop",
         "usage": None,
     }
     assert client.get("/v1/audio/speech/speech-unknown").status_code == 404
@@ -1541,6 +1540,8 @@ def test_speech_sse_stream_sends_deltas_then_done_with_usage(
     ]
     assert base64.b64decode(events[0]["audio"]) == encode_pcm([0.0, 0.1], 24000)
     assert base64.b64decode(events[1]["audio"]) == encode_pcm([-0.1, 0.0], 24000)
+    assert events[2]["finish_reason"] == "stop"
+    assert "x-sglang-omni-speech-id" not in response.headers
     assert events[2]["usage"] == {
         "input_tokens": 3,
         "output_tokens": 2,
