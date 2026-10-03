@@ -59,6 +59,7 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
     release_rows,
     solve_flow_euler_prefix,
 )
+from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import PrefixCudaGraphCache
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     CosyVoice3SGLangRequestData,
     cleanup_prepared_cosyvoice3_request,
@@ -870,6 +871,7 @@ class FunCosyVoice3Flow:
         # estimator, whose fixed (2, 80, T) profile keeps the padded layout.
         self.packed_estimator = packed_estimator
         self.prefix_pool: PrefixKVPool | None = None
+        self.prefix_cuda_graph_cache: PrefixCudaGraphCache | None = None
 
     def __getattr__(self, name: str) -> object:
         return getattr(self.flow, name)
@@ -907,6 +909,9 @@ class FunCosyVoice3Flow:
 
     def attach_cuda_graph_runner(self, runner: FlowCudaGraphRunner) -> None:
         self.cuda_graph_runner = runner
+
+    def attach_prefix_cuda_graph_cache(self, cache: PrefixCudaGraphCache) -> None:
+        self.prefix_cuda_graph_cache = cache
 
     @torch.inference_mode()
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
@@ -978,18 +983,39 @@ class FunCosyVoice3Flow:
             flat = padded.transpose(1, 2).reshape(-1, padded.shape[1])
             return flat[new_frame_index].unsqueeze(0)
 
-        generated = solve_flow_euler_prefix(
-            self.packed_estimator,
-            self.prefix_pool,
-            take_new_frames(conditioning.noisy_mel),
-            conditioning.time_span,
-            take_new_frames(token_condition),
-            conditioning.speaker_embedding,
-            take_new_frames(conditioning.prompt_mel),
-            new_frames,
-            list(caches),
-            cfg_rate=self.flow.decoder.inference_cfg_rate,
-        )
+        noise = take_new_frames(conditioning.noisy_mel)
+        mu = take_new_frames(token_condition)
+        mel_conditioning = take_new_frames(conditioning.prompt_mel)
+        generated = None
+        if self.prefix_cuda_graph_cache is not None:
+            generated = self.prefix_cuda_graph_cache.run(
+                noise=noise,
+                time_span=conditioning.time_span,
+                mu=mu,
+                speaker_embeddings=conditioning.speaker_embedding,
+                mel_conditioning=mel_conditioning,
+                new_frames=new_frames,
+                total_frames=total_frames,
+                caches=caches,
+                cfg_rate=self.flow.decoder.inference_cfg_rate,
+            )
+        else:
+            pass
+        if generated is None:
+            generated = solve_flow_euler_prefix(
+                self.packed_estimator,
+                self.prefix_pool,
+                noise,
+                conditioning.time_span,
+                mu,
+                conditioning.speaker_embedding,
+                mel_conditioning,
+                new_frames,
+                list(caches),
+                cfg_rate=self.flow.decoder.inference_cfg_rate,
+            )
+        else:
+            pass
         padded = generated.new_zeros(
             len(inputs), token_condition.shape[2], generated.shape[2]
         )
@@ -2549,6 +2575,7 @@ def create_vocoder_executor(
     flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = True,
     enable_flow_cuda_graph: bool = True,
+    enable_flow_prefix_cuda_graph: bool = False,
     flow_cuda_graph_capture_shapes: tuple[tuple[int, int], ...] | None = None,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",
@@ -2578,6 +2605,27 @@ def create_vocoder_executor(
         enable_flow_estimator_trt=enable_flow_estimator_trt,
     )
     device = str(resolve_concrete_device(device, gpu_id))
+    device_obj = torch.device(device)
+    if enable_flow_prefix_cuda_graph and not enable_dit_torch_compile:
+        raise ValueError(
+            "enable_flow_prefix_cuda_graph requires enable_dit_torch_compile=True"
+        )
+    else:
+        pass
+    if enable_flow_prefix_cuda_graph and flow_prefix_cache_gb <= 0:
+        raise ValueError(
+            "enable_flow_prefix_cuda_graph requires flow_prefix_cache_gb > 0"
+        )
+    else:
+        pass
+    if enable_flow_prefix_cuda_graph and (
+        device_obj.type != "cuda" or not torch.cuda.is_available()
+    ):
+        raise RuntimeError(
+            "enable_flow_prefix_cuda_graph requires an available CUDA device"
+        )
+    else:
+        pass
 
     from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
@@ -2639,7 +2687,28 @@ def create_vocoder_executor(
         enable_flow_estimator_trt=enable_flow_estimator_trt,
     )
 
-    device_obj = torch.device(device)
+    if enable_flow_prefix_cuda_graph and flow.packed_estimator is None:
+        raise RuntimeError(
+            "enable_flow_prefix_cuda_graph requires a PackedDiT estimator"
+        )
+    else:
+        pass
+    if enable_flow_prefix_cuda_graph and not flow.packed_estimator.is_ragged:
+        raise RuntimeError(
+            "enable_flow_prefix_cuda_graph requires the ragged FA3 PackedDiT path"
+        )
+    else:
+        pass
+    if enable_flow_prefix_cuda_graph and autocast_dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        raise RuntimeError(
+            "enable_flow_prefix_cuda_graph requires float16 or bfloat16 autocast"
+        )
+    else:
+        pass
+
     if enable_flow_cuda_graph and (
         device_obj.type != "cuda" or not torch.cuda.is_available()
     ):
@@ -2663,6 +2732,12 @@ def create_vocoder_executor(
     ):
         flow.prefix_pool = build_prefix_pool(
             flow, device_obj, autocast_dtype, flow_prefix_cache_gb
+        )
+    else:
+        pass
+    if enable_flow_prefix_cuda_graph and flow.prefix_pool is None:
+        raise RuntimeError(
+            "enable_flow_prefix_cuda_graph requires a successfully created prefix pool"
         )
     else:
         pass
@@ -2703,6 +2778,34 @@ def create_vocoder_executor(
     )
     if enable_dit_torch_compile:
         scheduler.warmup_packed_dit_compile()
+    else:
+        pass
+    if enable_flow_prefix_cuda_graph:
+        assert flow.packed_estimator is not None and flow.prefix_pool is not None
+        parameter_dtype = next(flow.parameters()).dtype
+        time_span = torch.linspace(
+            0,
+            1,
+            FLOW_EULER_STEPS + 1,
+            device=device_obj,
+            dtype=parameter_dtype,
+        )
+        if flow.decoder.t_scheduler == "cosine":
+            time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
+        else:
+            pass
+        prefix_cache = PrefixCudaGraphCache(
+            flow.packed_estimator,
+            flow.prefix_pool,
+            device=device_obj,
+            autocast_dtype=autocast_dtype,
+            noise_template=flow.decoder.rand_noise,
+            time_span=time_span,
+            speaker_embedding_width=int(flow.spk_embed_affine_layer.out_features),
+            cfg_rate=float(flow.decoder.inference_cfg_rate),
+        )
+        prefix_cache.capture()
+        flow.attach_prefix_cuda_graph_cache(prefix_cache)
     else:
         pass
     scheduler.warmup_now()
