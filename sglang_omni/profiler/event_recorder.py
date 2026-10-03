@@ -127,18 +127,6 @@ class RequestEventBuffer(threading.local):
                 )
             )
 
-    def emit(
-        self,
-        event_name: str,
-        snapshots: Iterable[RequestEventSnapshot],
-        metadata: dict[str, int | float | str],
-        *,
-        stage: str | None,
-    ) -> None:
-        """Capture and flush on callers outside serving locks."""
-        self.capture(event_name, snapshots, metadata)
-        self.flush(stage=stage)
-
     def flush(self, *, stage: str | None) -> None:
         for record in self.records:
             emit(

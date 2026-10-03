@@ -194,12 +194,12 @@ def test_buffer_flush_preserves_thread_ownership_and_capture_snapshot(
         completion = executor.submit(worker)
         try:
             assert captured.wait(timeout=5)
-            buffer.emit(
+            buffer.capture(
                 "decode_enqueued",
                 (RequestEventSnapshot(request_id="ingest", metadata={"frames": 1}),),
                 {},
-                stage="vocoder",
             )
+            buffer.flush(stage="vocoder")
             assert [event["request_id"] for event in read_events(path)] == ["ingest"]
         finally:
             release.set()
@@ -234,7 +234,7 @@ def test_buffer_checks_activity_before_consuming_snapshots(tmp_path: Path) -> No
         yield RequestEventSnapshot(request_id=request_id, metadata={"frames": 1})
 
     buffer.capture("decode_enqueued", snapshots("inactive-capture"), {})
-    buffer.emit("decode_dispatched", snapshots("inactive-emit"), {}, stage="vocoder")
+    buffer.flush(stage="vocoder")
     assert visited == []
 
     path = recorder.start(run_id="buffered", event_dir=str(tmp_path), stage="thinker")
@@ -248,6 +248,34 @@ def test_buffer_checks_activity_before_consuming_snapshots(tmp_path: Path) -> No
     assert visited == ["active"]
     events = read_events(path)
     assert [event["request_id"] for event in events] == ["active"]
+
+
+def test_buffer_flush_after_stop_does_not_leak_into_next_run(tmp_path: Path) -> None:
+    recorder = get_recorder()
+    buffer = RequestEventBuffer()
+    first_path = recorder.start("first", str(tmp_path / "first"), "vocoder")
+    buffer.capture(
+        "decode_enqueued",
+        (RequestEventSnapshot(request_id="old", metadata={"frames": 1}),),
+        {},
+    )
+    recorder.stop()
+    buffer.flush(stage="vocoder")
+
+    second_path = recorder.start("second", str(tmp_path / "second"), "vocoder")
+    buffer.capture(
+        "decode_enqueued",
+        (RequestEventSnapshot(request_id="new", metadata={"frames": 2}),),
+        {},
+    )
+    buffer.flush(stage="vocoder")
+    recorder.stop()
+
+    assert read_events(first_path) == []
+    events = read_events(second_path)
+    assert [event["request_id"] for event in events] == ["new"]
+    assert events[0]["run_id"] == "second"
+    assert events[0]["metadata"]["frames"] == 2
 
 
 def test_multi_stage_same_process_share_one_file(tmp_path: Path) -> None:
