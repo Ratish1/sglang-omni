@@ -65,6 +65,23 @@ def test_seedtts_benchmark_batch_args_are_independent() -> None:
     assert results_config["max_queued_requests"] == 16
 
 
+@pytest.mark.parametrize(
+    "arguments, expected",
+    [
+        ([], False),
+        (["--stream"], True),
+        (["--stream", "--no-collect-stream-outcomes"], False),
+    ],
+)
+def test_outcome_collection_control_is_preserved_in_results(
+    arguments: list[str],
+    expected: bool,
+) -> None:
+    config = config_from_cli(*arguments)
+    results_config = _build_results_config(config, base_url="http://localhost:8000")
+    assert results_config["collect_stream_outcomes"] is expected
+
+
 def test_seedtts_benchmark_records_quantization() -> None:
     config = config_from_cli("--quantization", "fp8")
     assert config.quantization == "fp8"

@@ -85,7 +85,7 @@ async def test_open_loop_arrivals_overlap_in_flight_requests(
         def exponential(self, scale, size):
             return np.full(size, 0.02)
 
-    async def after_send(_session, _result: RequestResult) -> None:
+    async def after_send(result: RequestResult) -> None:
         await asyncio.sleep(0.3)
 
     monkeypatch.setattr(np.random, "default_rng", lambda _seed: _FixedGaps())
