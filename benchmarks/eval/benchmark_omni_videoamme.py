@@ -95,12 +95,6 @@ from benchmarks.metrics.wer import print_wer_summary
 from benchmarks.tasks.video_understanding import VIDEOAMME_REQUEST_TEXT
 from sglang_omni.utils.logging import configure_dependency_loggers
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-)
-configure_dependency_loggers()
-
 
 async def run_videoamme_eval(
     config: VideoEvalConfig,
@@ -145,6 +139,11 @@ async def benchmark(args: argparse.Namespace) -> dict:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    configure_dependency_loggers()
     parser = argparse.ArgumentParser(
         description="Video-AMME benchmark for video + audio question models."
     )

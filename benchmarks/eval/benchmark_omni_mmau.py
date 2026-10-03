@@ -34,12 +34,6 @@ DEFAULT_PROMPT = (
     "Reply with only the option letter."
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-)
-configure_dependency_loggers()
-
 
 async def run(
     args: argparse.Namespace,
@@ -115,6 +109,11 @@ async def run(
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    configure_dependency_loggers()
     p = argparse.ArgumentParser(description="MMAU benchmark.")
     p.add_argument("--base-url", type=str, default=None)
     p.add_argument("--host", type=str, default="localhost")

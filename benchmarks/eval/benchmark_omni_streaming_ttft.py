@@ -54,11 +54,6 @@ from benchmarks.tasks.tts import (  # noqa: E402
 )
 from sglang_omni.utils.logging import configure_dependency_loggers
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-)
-configure_dependency_loggers()
 logger = logging.getLogger(__name__)
 
 DEFAULT_STREAMING_TTFT_SEED = 1000
@@ -305,6 +300,11 @@ def _default_output_path(label: str) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    configure_dependency_loggers()
     parser = argparse.ArgumentParser(
         description="Measure streaming TTFT for Qwen3-Omni speech.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

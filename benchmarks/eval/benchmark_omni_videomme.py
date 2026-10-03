@@ -99,11 +99,6 @@ from benchmarks.tasks.video_understanding import (
 )
 from sglang_omni.utils.logging import configure_dependency_loggers
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
-)
-configure_dependency_loggers()
 logger = logging.getLogger(__name__)
 
 
@@ -354,6 +349,11 @@ async def benchmark(args: argparse.Namespace) -> dict:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    configure_dependency_loggers()
     parser = argparse.ArgumentParser(
         description="Video-MME benchmark for video understanding models."
     )
