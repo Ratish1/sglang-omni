@@ -968,7 +968,10 @@ class FunCosyVoice3Flow:
             total - start
             for total, start in zip(total_frames, prefix_frames, strict=True)
         ]
-        assert min(new_frames) > 0, "Fun-CosyVoice3 prefix hop adds no frames"
+        if min(new_frames) <= 0:
+            raise RuntimeError("Fun-CosyVoice3 prefix hop adds no frames")
+        else:
+            pass
         new_frame_index = torch.cat(
             [
                 torch.arange(start, total, device=device)
@@ -986,8 +989,9 @@ class FunCosyVoice3Flow:
         noise = take_new_frames(conditioning.noisy_mel)
         mu = take_new_frames(token_condition)
         mel_conditioning = take_new_frames(conditioning.prompt_mel)
-        generated = (
-            self.prefix_cuda_graph_cache.run(
+        generated = None
+        if self.prefix_cuda_graph_cache is not None:
+            generated = self.prefix_cuda_graph_cache.run(
                 noise=noise,
                 time_span=conditioning.time_span,
                 mu=mu,
@@ -997,11 +1001,10 @@ class FunCosyVoice3Flow:
                 total_frames=total_frames,
                 caches=caches,
             )
-            if self.prefix_cuda_graph_cache is not None
-            else None
-        )
-        generated = (
-            solve_flow_euler_prefix(
+        else:
+            pass
+        if generated is None:
+            generated = solve_flow_euler_prefix(
                 self.packed_estimator,
                 self.prefix_pool,
                 noise,
@@ -1013,9 +1016,8 @@ class FunCosyVoice3Flow:
                 list(caches),
                 cfg_rate=self.flow.decoder.inference_cfg_rate,
             )
-            if generated is None
-            else generated
-        )
+        else:
+            pass
         padded = generated.new_zeros(
             len(inputs), token_condition.shape[2], generated.shape[2]
         )
@@ -2758,10 +2760,7 @@ def create_vocoder_executor(
         scheduler.warmup_packed_dit_compile()
     else:
         pass
-    if not enable_flow_prefix_cuda_graph:
-        scheduler.warmup_now()
-        return scheduler
-    else:
+    if enable_flow_prefix_cuda_graph:
         assert flow.packed_estimator is not None and flow.prefix_pool is not None
         if flow.packed_estimator.chunk_size != PREFIX_CUDA_GRAPH_CHUNK_FRAMES:
             raise RuntimeError(
@@ -2793,5 +2792,7 @@ def create_vocoder_executor(
             )
             prefix_cache.capture()
             flow.attach_prefix_cuda_graph_cache(prefix_cache)
+    else:
+        pass
     scheduler.warmup_now()
     return scheduler

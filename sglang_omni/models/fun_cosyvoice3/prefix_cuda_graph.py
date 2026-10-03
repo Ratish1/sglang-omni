@@ -195,7 +195,6 @@ def route_prefix_cuda_graph_envelope(
     max_new_frame_count: int,
     max_total_frame_count: int,
     envelopes: Sequence[PrefixCudaGraphEnvelope] = DEFAULT_PREFIX_CUDA_GRAPH_ENVELOPES,
-    chunk_size: int = PREFIX_CUDA_GRAPH_CHUNK_FRAMES,
 ) -> PrefixCudaGraphEnvelope | None:
     """Return the smallest qualified envelope for one real causal geometry."""
     # A mathematically fitting N is not qualified unless the frozen table lists it.
@@ -204,8 +203,6 @@ def route_prefix_cuda_graph_envelope(
         for envelope in envelopes
         if envelope.batch_size == batch_size
         and total_new_frame_count in envelope.qualified_new_frame_totals
-        and 0 <= envelope.new_frame_count - total_new_frame_count <= MAX_SLACK_FRAMES
-        and (envelope.new_frame_count - total_new_frame_count) % chunk_size == 0
         and max_new_frame_count <= envelope.max_new_frame_count
         and max_total_frame_count <= envelope.max_total_frame_count
     ]
@@ -494,9 +491,12 @@ class PrefixCudaGraphCache:
         for pair, prefix_frame_count in zip(
             real_pairs, prefix_frame_counts, strict=True
         ):
-            assert (
-                pair[1].committed_frames == prefix_frame_count
-            ), "CFG prefix cache twins have different committed frames"
+            if pair[1].committed_frames != prefix_frame_count:
+                raise RuntimeError(
+                    "CFG prefix cache twins have different committed frames"
+                )
+            else:
+                pass
 
         def append_slack(tensor: torch.Tensor) -> torch.Tensor:
             if slack_frame_count == 0:
@@ -553,9 +553,12 @@ class PrefixCudaGraphCache:
         angles, scale = self.estimator.dit.rotary_embed.forward_from_seq_len(
             max_end_frame
         )
-        assert not isinstance(
-            scale, torch.Tensor
-        ), "prefix CUDA Graph cache does not support RoPE xpos scale"
+        if isinstance(scale, torch.Tensor):
+            raise RuntimeError(
+                "prefix CUDA Graph cache does not support RoPE xpos scale"
+            )
+        else:
+            pass
         angles = angles[:, absolute_positions]
         rope = (angles.cos(), angles.sin())
         hidden_size = int(self.estimator.dit.input_embed.proj.out_features)
