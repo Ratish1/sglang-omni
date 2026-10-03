@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -33,6 +33,17 @@ CAPTURE_WARMUP_ITERATIONS = 3
 BYTES_PER_MIB = 1024 * 1024
 
 PrefixCudaGraphCaptureShape = tuple[int, int, int, int, Sequence[int]]
+PrefixCudaGraphCaptureInputs = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+PrefixCudaGraphCaptureInputFactory = Callable[
+    [tuple[int, ...]],
+    PrefixCudaGraphCaptureInputs,
+]
 
 
 @dataclass(frozen=True)
@@ -241,7 +252,10 @@ class PrefixCudaGraphCache:
         )
 
     @torch.inference_mode()
-    def capture(self) -> None:
+    def capture(
+        self,
+        capture_input_factory: PrefixCudaGraphCaptureInputFactory | None = None,
+    ) -> None:
         if self.entries:
             raise RuntimeError("prefix CUDA Graph cache already captured")
         else:
@@ -263,7 +277,13 @@ class PrefixCudaGraphCache:
                 allocated_before = torch.cuda.memory_allocated(self.device)
                 reserved_before = torch.cuda.memory_reserved(self.device)
                 for envelope in capture_envelopes:
-                    self.entries.append(self.capture_one(envelope, graph_pool))
+                    self.entries.append(
+                        self.capture_one(
+                            envelope,
+                            graph_pool,
+                            capture_input_factory,
+                        )
+                    )
                 torch.cuda.synchronize(self.device)
                 self.net_capture_allocated_delta_mib = (
                     torch.cuda.memory_allocated(self.device) - allocated_before
@@ -326,10 +346,15 @@ class PrefixCudaGraphCache:
         self,
         envelope: PrefixCudaGraphEnvelope,
         graph_pool: tuple[int, int],
+        capture_input_factory: PrefixCudaGraphCaptureInputFactory | None,
     ) -> CapturedPrefixCudaGraph:
         real_pairs = self.allocate_capture_pairs(envelope.capture_row_new_frames)
         try:
-            capture_inputs = self.capture_inputs(envelope.capture_row_new_frames)
+            capture_inputs = (
+                self.capture_inputs(envelope.capture_row_new_frames)
+                if capture_input_factory is None
+                else capture_input_factory(envelope.capture_row_new_frames)
+            )
             prepared = self.prepare(
                 *capture_inputs,
                 list(envelope.capture_row_new_frames),
