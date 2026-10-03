@@ -338,8 +338,12 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
     graph_pair = (PrefixCacheRow(), PrefixCacheRow())
     reference_pair = (PrefixCacheRow(), PrefixCacheRow())
 
-    def assert_cached_rows_match(committed_frames: int) -> None:
-        for graph_row, reference_row in zip(graph_pair, reference_pair, strict=True):
+    def assert_cached_rows_match(
+        graph_rows: tuple[PrefixCacheRow, PrefixCacheRow],
+        reference_rows: tuple[PrefixCacheRow, PrefixCacheRow],
+        committed_frames: int,
+    ) -> None:
+        for graph_row, reference_row in zip(graph_rows, reference_rows, strict=True):
             assert graph_row.committed_frames == reference_row.committed_frames
             assert graph_row.conv_context is not None
             assert reference_row.conv_context is not None
@@ -389,7 +393,7 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
             )
             assert first_graph is not None
             assert torch.equal(first_graph, first_reference)
-            assert_cached_rows_match(50)
+            assert_cached_rows_match(graph_pair, reference_pair, 50)
 
             assert grow_rows(graph_pool, list(graph_pair), [100, 100])
             assert grow_rows(reference_pool, list(reference_pair), [100, 100])
@@ -418,9 +422,41 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
             )
             assert second_graph is not None
             assert torch.equal(second_graph, second_reference)
-            assert_cached_rows_match(100)
+            assert_cached_rows_match(graph_pair, reference_pair, 100)
 
-        assert graph_cache.counters().hits == 2
+            # Reusing fresh rows makes the N=100 call exercise zero slack.
+            release_rows(graph_pool, list(graph_pair))
+            release_rows(reference_pool, list(reference_pair))
+            assert grow_rows(graph_pool, list(graph_pair), [100, 100])
+            assert grow_rows(reference_pool, list(reference_pair), [100, 100])
+            third_graph = graph_cache.run(
+                noise=noise_template.transpose(1, 2).contiguous(),
+                time_span=time_span,
+                mu=mu,
+                speaker_embeddings=speaker_embeddings,
+                mel_conditioning=mel_conditioning,
+                new_frames=[100],
+                total_frames=[100],
+                caches=[graph_pair],
+                cfg_rate=0.7,
+            )
+            third_reference = solve_flow_euler_prefix(
+                estimator,
+                reference_pool,
+                noise_template.transpose(1, 2).contiguous(),
+                time_span,
+                mu,
+                speaker_embeddings,
+                mel_conditioning,
+                [100],
+                [reference_pair],
+                cfg_rate=0.7,
+            )
+            assert third_graph is not None
+            assert torch.equal(third_graph, third_reference)
+            assert_cached_rows_match(graph_pair, reference_pair, 100)
+
+        assert graph_cache.counters().hits == 3
         assert graph_cache.counters().misses == 0
         assert graph_cache.scratch_pair is not None
         assert graph_cache.scratch_pair[0].committed_frames == 0
