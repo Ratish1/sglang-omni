@@ -13,6 +13,8 @@ import torchaudio
 from filelock import FileLock
 from huggingface_hub import hf_hub_download
 
+from sglang_omni.utils.logging import configure_hf_hub_logger
+
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
@@ -210,6 +212,7 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    configure_hf_hub_logger()
     parser = argparse.ArgumentParser(
         description=(
             "Pre-download UTMOS model weights into the cache directory "

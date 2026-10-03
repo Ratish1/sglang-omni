@@ -49,6 +49,7 @@ from benchmarks.benchmarker.utils import save_json_results, wait_for_service
 from benchmarks.dataset.mmmu import MMMUSample, load_mmmu_samples
 from benchmarks.metrics.performance import compute_speed_metrics, print_speed_summary
 from benchmarks.tasks.tts import TalkerSamplingParams, talker_sampling_params
+from sglang_omni.utils.logging import configure_hf_hub_logger
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +333,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    configure_hf_hub_logger()
     parser = argparse.ArgumentParser(
         description="Stress Qwen3-Omni with same-prompt multi-rollout traffic."
     )

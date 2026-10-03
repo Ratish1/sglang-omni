@@ -96,11 +96,13 @@ from benchmarks.tasks.visual_understand import (
     build_mmmu_result_records,
     make_mmmu_send_fn,
 )
+from sglang_omni.utils.logging import configure_hf_hub_logger
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
+configure_hf_hub_logger()
 logger = logging.getLogger(__name__)
 
 
