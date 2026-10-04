@@ -1,0 +1,36 @@
+[
+  {
+    "module": "sglang_omni.models.qwen3_tts.streaming_vocoder",
+    "functions": [
+      "Qwen3TTSStreamingVocoderScheduler.collect_followup_batch",
+      "Qwen3TTSStreamingVocoderScheduler.run_followup_batch",
+      "Qwen3TTSStreamingVocoderScheduler.run_initial_batch",
+      "Qwen3TTSStreamingVocoderScheduler.build_incremental_plan",
+      "Qwen3TTSStreamingVocoderScheduler.wait_codes_ready",
+      "Qwen3TTSStreamingVocoderScheduler.launch_incremental_group",
+      "Qwen3TTSStreamingVocoderScheduler.finish_incremental_group",
+      "Qwen3TTSStreamingVocoderScheduler.drain_pending_incremental",
+      "Qwen3TTSStreamingVocoderScheduler.commit_followup",
+      "Qwen3TTSStreamingVocoderScheduler.commit_initial",
+      "Qwen3TTSStreamingVocoderScheduler.stage_deltas",
+      "Qwen3TTSDecodeHandle.resolve_partial",
+      "Qwen3TTSDecodeHandle.wait_and_release"
+    ]
+  },
+  {
+    "module": "sglang_omni.models.qwen3_tts.model_runner",
+    "functions": ["Qwen3TTSModelRunner.collect_codes", "Qwen3TTSModelRunner.post_process_outputs"]
+  },
+  {
+    "module": "sglang_omni.models.qwen3_tts.sglang_model",
+    "functions": ["Qwen3TTSTalker.forward", "Qwen3TTSTalker.code_predictor_forward"]
+  },
+  {
+    "module": "sglang_omni.models.qwen3_tts.request_builders",
+    "functions": ["Qwen3TTSRefCodeBatcher.encode", "Qwen3TTSRefCodeBatcher.encode_waveform"]
+  },
+  {
+    "module": "sglang_omni.profiler.event_recorder",
+    "functions": ["RequestEventBuffer.capture", "RequestEventBuffer.flush"]
+  }
+]
