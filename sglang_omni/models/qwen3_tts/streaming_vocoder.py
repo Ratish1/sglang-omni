@@ -2906,6 +2906,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         else:
             pass
         while True:
+            self.drain_pending_incremental(keep=0)
             in_flight = bool(getattr(self.worker_ctx, "pending_incremental", None))
             if in_flight:
                 if not self.followup_collect_lock.acquire(
