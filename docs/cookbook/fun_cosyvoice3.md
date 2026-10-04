@@ -275,8 +275,9 @@ The TTS engine stage accepts `onnx_intra_op_threads` (16) for the speech tokeniz
 
 Causal streaming reuses the prefix K/V cache. On CUDA, reusable causal Prefix CUDA
 Graphs are enabled by default with 15 selected resident envelopes. Graph misses
-transparently use the Packed compiled prefix path. This optimization applies to
-the streaming causal Flow path; the buffered full-context Flow CUDA Graph table
+transparently use the Packed prefix path, eager or compiled according to the DiT
+compile setting. This optimization applies to the streaming causal Flow path;
+the buffered full-context Flow CUDA Graph table
 is separate. Prefix CUDA Graphs are automatically disabled on unsupported or
 non-CUDA devices, including Torch/MPS and MLX on Apple Silicon.
 
@@ -289,9 +290,13 @@ sgl-omni serve \
   --port 8000
 ```
 
-The prefix K/V cache and Packed compiled prefix fallback remain available.
-Prefix CUDA Graphs require DiT `torch.compile` and a positive `flow_prefix_cache_gb`;
-disable the prefix graph flag when disabling DiT compilation or using TensorRT.
+Disabling Prefix CUDA Graphs does not disable the prefix K/V cache or Packed prefix
+fallback. Prefix CUDA Graphs capture the PrefixKV/PackedDiT path independently of
+the regular Flow estimator backend, DiT `torch.compile`, and buffered Flow CUDA
+Graphs. They use whichever eager or compiled prefix implementation is installed.
+TensorRT, when enabled, continues to serve the regular Flow estimator path.
+If the supported CUDA/ragged FA3 dtype path or prefix K/V pool is unavailable,
+prefix graphs are skipped and serving continues through the existing plain path.
 
 ### torch.compile for the DiT backbone
 
@@ -301,7 +306,6 @@ disable the prefix graph flag when disabling DiT compilation or using TensorRT.
 sgl-omni serve \
   --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
   --vocoder.factory.enable_dit_torch_compile false \
-  --vocoder.factory.enable_flow_prefix_cuda_graph false \
   --port 8000
 ```
 
@@ -322,7 +326,6 @@ Enable the flag:
 sgl-omni serve \
   --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
   --vocoder.factory.enable_flow_estimator_trt true \
-  --vocoder.factory.enable_flow_prefix_cuda_graph false \
   --port 8000
 ```
 

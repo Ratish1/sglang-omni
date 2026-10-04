@@ -19,6 +19,7 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
     PrefixCacheRow,
     PrefixKVPool,
     compile_forward_prefix,
+    forward_prefix,
     grow_rows,
     release_rows,
     solve_flow_euler_prefix,
@@ -290,11 +291,11 @@ def test_grow_rows_takes_nothing_on_a_shortfall() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
+@pytest.mark.parametrize("compile_prefix", [False, True], ids=["eager", "compiled"])
+def test_prefix_cuda_graph_matches_prefix_solver(compile_prefix: bool) -> None:
     estimator = make_estimator()
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    assert estimator.compile(dtype)
     graph_pool = PrefixKVPool(
         layer_num=LAYERS,
         euler_steps=10,
@@ -313,8 +314,13 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
         device=device,
         dtype=dtype,
     )
-    graph_pool.forward = compile_forward_prefix()
-    reference_pool.forward = compile_forward_prefix()
+    if compile_prefix:
+        assert estimator.compile(dtype)
+        graph_pool.forward = compile_forward_prefix()
+        reference_pool.forward = compile_forward_prefix()
+    else:
+        assert graph_pool.forward is forward_prefix
+        assert reference_pool.forward is forward_prefix
     envelope = PrefixCudaGraphEnvelope("B1-N100-M100-E128", 1, 100, 100, 128, (100,))
     noise_template = torch.randn(1, CHANNELS, 100, device=device, dtype=dtype)
     mu = torch.randn(1, 100, CHANNELS, device=device, dtype=dtype)
@@ -475,11 +481,13 @@ def test_prefix_cuda_graph_matches_compiled_prefix_solver() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_prefix_cuda_graph_matches_compiled_solver_for_b2_physical_reuse() -> None:
+@pytest.mark.parametrize("compile_prefix", [False, True], ids=["eager", "compiled"])
+def test_prefix_cuda_graph_matches_prefix_solver_for_b2_physical_reuse(
+    compile_prefix: bool,
+) -> None:
     estimator = make_estimator()
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    assert estimator.compile(dtype)
     graph_pool = PrefixKVPool(
         layer_num=LAYERS,
         euler_steps=10,
@@ -498,8 +506,13 @@ def test_prefix_cuda_graph_matches_compiled_solver_for_b2_physical_reuse() -> No
         device=device,
         dtype=dtype,
     )
-    graph_pool.forward = compile_forward_prefix()
-    reference_pool.forward = compile_forward_prefix()
+    if compile_prefix:
+        assert estimator.compile(dtype)
+        graph_pool.forward = compile_forward_prefix()
+        reference_pool.forward = compile_forward_prefix()
+    else:
+        assert graph_pool.forward is forward_prefix
+        assert reference_pool.forward is forward_prefix
     envelope = PrefixCudaGraphEnvelope(
         "B2-N200-M100-E128", 2, 200, 100, 128, (100, 100)
     )

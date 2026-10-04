@@ -1009,8 +1009,6 @@ class FunCosyVoice3Flow:
     ) -> None:
         self.flow: CausalMaskedDiffWithDiT = flow
         self.cuda_graph_runner: FlowCudaGraphRunner | None = None
-        # note(ratish): the eager DiT over packed rows; None with the TensorRT
-        # estimator, whose fixed (2, 80, T) profile keeps the padded layout.
         self.packed_estimator = packed_estimator
         self.prefix_pool: PrefixKVPool | None = None
         self.prefix_cuda_graph_cache: PrefixCudaGraphCache | None = None
@@ -1055,6 +1053,11 @@ class FunCosyVoice3Flow:
     def attach_prefix_cuda_graph_cache(self, cache: PrefixCudaGraphCache) -> None:
         self.prefix_cuda_graph_cache = cache
 
+    def can_use_packed_regular_flow(self) -> bool:
+        return self.packed_estimator is not None and not is_flow_estimator_trt(
+            self.decoder.estimator
+        )
+
     @torch.inference_mode()
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
         packed = pack_flow_inputs(self.flow, inputs)
@@ -1074,7 +1077,7 @@ class FunCosyVoice3Flow:
         """Non-streaming Flow over each row's whole token history, the rows
         packed along the sequence; the buffered `inference` keeps the graphed
         padded call."""
-        if self.packed_estimator is None:
+        if not self.can_use_packed_regular_flow():
             return self.inference(inputs)
         else:
             pass
@@ -1182,7 +1185,7 @@ class FunCosyVoice3Flow:
         # mixed prompt lengths can share one DiT call. streaming=True
         # keeps the chunk mask aligned with CosyVoice3Model hops.
         packed = pack_flow_inputs(self.flow, inputs)
-        if self.packed_estimator is None:
+        if not self.can_use_packed_regular_flow():
             generated = generate_flow(self, packed, streaming=True, finalize=False)
         else:
             generated = generate_flow_packed(
@@ -1241,7 +1244,6 @@ def attach_flow_estimator_trt(
     # delete first so assigning the TRT wrapper does not raise TypeError.
     del flow.decoder.estimator
     flow.decoder.estimator = wrapper
-    flow.packed_estimator = None
     logger.info(
         "Fun-CosyVoice3 Flow DiT estimator is TensorRT Module (%s, max_cfg_batch=%d)",
         onnx_path,
@@ -1627,7 +1629,8 @@ def build_prefix_pool(
     dtype: torch.dtype,
     budget_gb: float,
 ) -> PrefixKVPool:
-    estimator = flow.decoder.estimator
+    assert flow.packed_estimator is not None
+    estimator = flow.packed_estimator.dit
     attention = estimator.transformer_blocks[0].attn
     layer_num = len(estimator.transformer_blocks)
     head_num = int(attention.heads)
@@ -2738,8 +2741,6 @@ def create_vocoder_executor(
 
     if flow_batch_admission_frames <= 0:
         raise ValueError("flow_batch_admission_frames must be greater than zero")
-    elif flow_prefix_cache_gb < 0:
-        raise ValueError("flow_prefix_cache_gb must be >= 0")
     else:
         pass
 
@@ -2749,22 +2750,6 @@ def create_vocoder_executor(
     )
     device = str(resolve_concrete_device(device, gpu_id))
     device_obj = torch.device(device)
-    if enable_flow_prefix_cuda_graph and (
-        device_obj.type != "cuda" or not torch.cuda.is_available()
-    ):
-        enable_flow_prefix_cuda_graph = False
-    else:
-        pass
-    if enable_flow_prefix_cuda_graph and not enable_dit_torch_compile:
-        raise ValueError(
-            "enable_flow_prefix_cuda_graph requires enable_dit_torch_compile=True"
-        )
-    elif enable_flow_prefix_cuda_graph and flow_prefix_cache_gb <= 0:
-        raise ValueError(
-            "enable_flow_prefix_cuda_graph requires flow_prefix_cache_gb > 0"
-        )
-    else:
-        pass
     from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
     if use_mlx():
@@ -2842,6 +2827,7 @@ def create_vocoder_executor(
     if (
         flow_prefix_cache_gb > 0
         and device_obj.type == "cuda"
+        and torch.cuda.is_available()
         and flow.packed_estimator is not None
         and flow.packed_estimator.is_ragged
         and autocast_dtype in (torch.float16, torch.bfloat16)
@@ -2851,13 +2837,6 @@ def create_vocoder_executor(
         )
     else:
         pass
-    if enable_flow_prefix_cuda_graph and flow.prefix_pool is None:
-        raise RuntimeError(
-            "enable_flow_prefix_cuda_graph requires a successfully created prefix pool"
-        )
-    else:
-        pass
-
     if enable_flow_cuda_graph:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
             flow_cuda_graph_capture_shapes,
@@ -2892,12 +2871,12 @@ def create_vocoder_executor(
         token_max_hop_len=token_max_hop_len,
         disable_hop_growth=disable_hop_growth,
     )
-    if enable_dit_torch_compile:
+    if enable_dit_torch_compile and flow.packed_estimator is not None:
         scheduler.warmup_packed_dit_compile()
     else:
         pass
-    if enable_flow_prefix_cuda_graph:
-        assert flow.packed_estimator is not None and flow.prefix_pool is not None
+    if enable_flow_prefix_cuda_graph and flow.prefix_pool is not None:
+        assert flow.packed_estimator is not None
         chunk_frames = int(flow.packed_estimator.chunk_size)
         prefix_capture_shapes = verify_prefix_cuda_graph_capture_shapes(
             flow_prefix_cuda_graph_capture_shapes,
@@ -2924,6 +2903,8 @@ def create_vocoder_executor(
             )
         )
         flow.attach_prefix_cuda_graph_cache(prefix_cache)
+    elif enable_flow_prefix_cuda_graph:
+        logger.info("Fun-CosyVoice3 prefix CUDA Graph skipped: prefix KV unavailable")
     else:
         pass
     scheduler.warmup_now()

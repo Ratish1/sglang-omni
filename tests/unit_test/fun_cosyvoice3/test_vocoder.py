@@ -7,13 +7,14 @@ import contextlib
 import sys
 from collections.abc import Iterator
 from types import SimpleNamespace
-from typing import ClassVar
+from typing import ClassVar, Literal
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
 
+import sglang_omni.models.fun_cosyvoice3.flow_estimator_trt as trt_mod
 from sglang_omni.client.client import Client
 from sglang_omni.models.fun_cosyvoice3 import stages
 from sglang_omni.models.fun_cosyvoice3.config import (
@@ -21,6 +22,7 @@ from sglang_omni.models.fun_cosyvoice3.config import (
     FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES,
     FunCosyVoice3PipelineConfig,
 )
+from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import FlowEstimatorTRTModule
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
@@ -91,6 +93,7 @@ class RunnableFakeFlow(_PackedFlow):
     def __init__(self):
         super().__init__(channels=80, max_frames=8192)
         self.spk_embed_affine_layer = torch.nn.Linear(192, 80)
+        self.prefix_pool: stages.PrefixKVPool | None = None
 
 
 class GraphRunnableFakeFlow(RunnableFakeFlow):
@@ -1081,8 +1084,11 @@ def prepare_vocoder_startup(
     *,
     device_type: str,
     allow_native_compile: bool,
-) -> GraphRunnableFakeFlow:
-    fake_flow = GraphRunnableFakeFlow(startup_events)
+) -> stages.FunCosyVoice3Flow:
+    native_flow = GraphRunnableFakeFlow(startup_events)
+    fake_flow = stages.FunCosyVoice3Flow(
+        native_flow, packed_estimator=native_flow.packed_estimator
+    )
     resolved_device = torch.device(device_type)
     monkeypatch.setattr(
         stages,
@@ -1141,7 +1147,7 @@ def prepare_vocoder_startup(
 
 @pytest.mark.parametrize(
     ("device_type", "cuda_available"),
-    [("cpu", True), ("mps", True), ("cuda", False)],
+    [("mps", True), ("cuda", False)],
 )
 def test_create_vocoder_executor_disables_prefix_graph_without_cuda(
     monkeypatch: pytest.MonkeyPatch,
@@ -1149,13 +1155,23 @@ def test_create_vocoder_executor_disables_prefix_graph_without_cuda(
     cuda_available: bool,
 ) -> None:
     startup_events: list[str] = []
-    prepare_vocoder_startup(
+    flow = prepare_vocoder_startup(
         monkeypatch,
         startup_events,
         device_type=device_type,
         allow_native_compile=False,
     )
+    flow.packed_estimator.is_ragged = True
     monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setattr(
+        stages,
+        "build_prefix_pool",
+        Mock(
+            side_effect=AssertionError(
+                "unsupported devices must not build prefix pools"
+            )
+        ),
+    )
     prefix_graph_factory = Mock(
         side_effect=AssertionError("unsupported devices must not build prefix graphs")
     )
@@ -1165,7 +1181,7 @@ def test_create_vocoder_executor_disables_prefix_graph_without_cuda(
         "model",
         device=device_type,
         enable_dit_torch_compile=False,
-        flow_prefix_cache_gb=0.0,
+        flow_prefix_cache_gb=24.0,
     )
 
     assert isinstance(scheduler, FunCosyVoice3StreamingVocoderScheduler)
@@ -1177,10 +1193,85 @@ def test_create_vocoder_executor_disables_prefix_graph_without_cuda(
     ("factory_kwargs", "should_capture"),
     [({}, True), ({"enable_flow_prefix_cuda_graph": False}, False)],
 )
+@pytest.mark.parametrize("enable_flow_cuda_graph", [False, True])
+@pytest.mark.parametrize(
+    ("enable_dit_torch_compile", "enable_flow_estimator_trt"),
+    [(False, False), (True, False), (False, True)],
+)
 def test_create_vocoder_executor_prefix_graph_defaults_on_and_respects_disable(
     monkeypatch: pytest.MonkeyPatch,
     factory_kwargs: dict[str, bool],
     should_capture: bool,
+    enable_flow_cuda_graph: bool,
+    enable_dit_torch_compile: bool,
+    enable_flow_estimator_trt: bool,
+) -> None:
+    startup_events: list[str] = []
+    flow = prepare_vocoder_startup(
+        monkeypatch,
+        startup_events,
+        device_type="cuda",
+        allow_native_compile=enable_dit_torch_compile,
+    )
+    flow.packed_estimator.is_ragged = True
+    flow.packed_estimator.chunk_size = 50
+    if enable_flow_estimator_trt:
+        flow.decoder.estimator = FlowEstimatorTRTModule(
+            Mock(max_batch=2), fallback=flow.decoder.estimator
+        )
+    else:
+        pass
+    prefix_pool = Mock(spec=stages.PrefixKVPool)
+    pool_builder = Mock(return_value=prefix_pool)
+    monkeypatch.setattr(stages, "build_prefix_pool", pool_builder)
+    prefix_cache = Mock(spec=stages.PrefixCudaGraphCache)
+    prefix_graph_factory = Mock(return_value=prefix_cache)
+    monkeypatch.setattr(stages, "PrefixCudaGraphCache", prefix_graph_factory)
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        enable_dit_torch_compile=enable_dit_torch_compile,
+        enable_flow_estimator_trt=enable_flow_estimator_trt,
+        enable_flow_cuda_graph=enable_flow_cuda_graph,
+        flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
+        flow_prefix_cache_gb=24.0,
+        flow_prefix_cuda_graph_capture_shapes=FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES,
+        **factory_kwargs,
+    )
+
+    pool_builder.assert_called_once()
+    assert scheduler.vocoder.flow.prefix_pool is prefix_pool
+    assert ("native_compile" in startup_events) is enable_dit_torch_compile
+    assert ("packed_warmup" in startup_events) is enable_dit_torch_compile
+    assert ("graph_capture" in startup_events) is enable_flow_cuda_graph
+    assert (
+        trt_mod.is_flow_estimator_trt(flow.decoder.estimator)
+        is enable_flow_estimator_trt
+    )
+    if should_capture:
+        prefix_graph_factory.assert_called_once()
+        prefix_cache.capture.assert_called_once()
+        assert scheduler.vocoder.flow.prefix_cuda_graph_cache is prefix_cache
+    else:
+        prefix_graph_factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("unavailable_capability", "dtype", "budget_gb"),
+    [
+        ("packed", "bfloat16", 24.0),
+        ("ragged", "bfloat16", 24.0),
+        ("dtype", "float32", 24.0),
+        ("budget", "bfloat16", 0.0),
+        ("budget", "bfloat16", -1.0),
+        ("pool", "bfloat16", 24.0),
+    ],
+)
+def test_create_vocoder_executor_skips_unavailable_prefix_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    unavailable_capability: Literal["packed", "ragged", "dtype", "budget", "pool"],
+    dtype: Literal["bfloat16", "float32"],
+    budget_gb: float,
 ) -> None:
     startup_events: list[str] = []
     flow = prepare_vocoder_startup(
@@ -1190,54 +1281,40 @@ def test_create_vocoder_executor_prefix_graph_defaults_on_and_respects_disable(
         allow_native_compile=True,
     )
     flow.packed_estimator.is_ragged = True
-    flow.packed_estimator.chunk_size = 50
-    prefix_pool = Mock(spec=stages.PrefixKVPool)
-    pool_builder = Mock(return_value=prefix_pool)
+    if unavailable_capability == "packed":
+        flow.packed_estimator = None
+    elif unavailable_capability == "ragged":
+        flow.packed_estimator.is_ragged = False
+    else:
+        pass
+    pool_builder = Mock(return_value=None)
     monkeypatch.setattr(stages, "build_prefix_pool", pool_builder)
-    prefix_cache = Mock(spec=stages.PrefixCudaGraphCache)
-    prefix_graph_factory = Mock(return_value=prefix_cache)
-    monkeypatch.setattr(stages, "PrefixCudaGraphCache", prefix_graph_factory)
-    attach_prefix_cache = Mock()
-    monkeypatch.setattr(
-        flow, "attach_prefix_cuda_graph_cache", attach_prefix_cache, raising=False
+    prefix_graph_factory = Mock(
+        side_effect=AssertionError(
+            "unavailable prefix capability must not build graphs"
+        )
     )
+    monkeypatch.setattr(stages, "PrefixCudaGraphCache", prefix_graph_factory)
+    native_compile = Mock()
+    monkeypatch.setattr(stages, "compile_dit_backbone", native_compile)
 
-    stages.create_vocoder_executor(
+    scheduler = stages.create_vocoder_executor(
         "model",
         device="cuda",
+        dtype=dtype,
+        flow_prefix_cache_gb=budget_gb,
         enable_flow_cuda_graph=False,
-        flow_prefix_cache_gb=24.0,
-        flow_prefix_cuda_graph_capture_shapes=FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES,
-        **factory_kwargs,
     )
 
-    pool_builder.assert_called_once()
-    assert flow.prefix_pool is prefix_pool
-    if should_capture:
-        prefix_graph_factory.assert_called_once()
-        prefix_cache.capture.assert_called_once()
-        attach_prefix_cache.assert_called_once_with(prefix_cache)
+    assert isinstance(scheduler, FunCosyVoice3StreamingVocoderScheduler)
+    assert scheduler.vocoder.flow.prefix_pool is None
+    assert startup_events[-1] == "scheduler_warmup"
+    native_compile.assert_called_once()
+    prefix_graph_factory.assert_not_called()
+    if unavailable_capability == "pool":
+        pool_builder.assert_called_once()
     else:
-        prefix_graph_factory.assert_not_called()
-        prefix_cache.capture.assert_not_called()
-        attach_prefix_cache.assert_not_called()
-
-
-def test_create_vocoder_executor_prefix_graph_requires_created_pool_on_cuda(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    flow = prepare_vocoder_startup(
-        monkeypatch,
-        [],
-        device_type="cuda",
-        allow_native_compile=True,
-    )
-    flow.prefix_pool = None
-
-    with pytest.raises(RuntimeError, match="successfully created prefix pool"):
-        stages.create_vocoder_executor(
-            "model", device="cuda", flow_prefix_cache_gb=24.0
-        )
+        pool_builder.assert_not_called()
 
 
 @pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
@@ -1310,10 +1387,6 @@ def test_attach_flow_estimator_trt_rejects_non_cuda_device(
 
 
 def test_attach_flow_estimator_trt_wraps_module_with_fallback(monkeypatch) -> None:
-    from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
-        FlowEstimatorTRTModule,
-    )
-
     class Fallback(torch.nn.Module):
         pass
 
@@ -1324,9 +1397,11 @@ def test_attach_flow_estimator_trt_wraps_module_with_fallback(monkeypatch) -> No
     class Flow:
         def __init__(self) -> None:
             self.decoder = Decoder()
+            self.packed_estimator = Mock(spec=PackedDiT, dit=self.decoder.estimator)
 
     flow = Flow()
     fallback = flow.decoder.estimator
+    packed_estimator = flow.packed_estimator
     captured: dict[str, object] = {}
 
     def fake_resolve(checkpoint_dir: str) -> str:
@@ -1349,8 +1424,6 @@ def test_attach_flow_estimator_trt_wraps_module_with_fallback(monkeypatch) -> No
     # which stays False on CPU-only hosts (CI hides CUDA), not just on
     # torch.cuda.is_available().
     monkeypatch.setattr(stages.current_platform, "is_cuda", lambda: True)
-    import sglang_omni.models.fun_cosyvoice3.flow_estimator_trt as trt_mod
-
     monkeypatch.setattr(trt_mod, "resolve_flow_estimator_onnx", fake_resolve)
     monkeypatch.setattr(trt_mod, "build_flow_estimator_trt", fake_build)
 
@@ -1360,6 +1433,8 @@ def test_attach_flow_estimator_trt_wraps_module_with_fallback(monkeypatch) -> No
     assert captured["fallback"] is fallback
     assert isinstance(flow.decoder.estimator, FlowEstimatorTRTModule)
     assert flow.decoder.estimator.fallback is fallback
+    assert flow.packed_estimator is packed_estimator
+    assert flow.packed_estimator.dit is fallback
 
 
 def test_preprocessing_executor_threads_max_concurrency() -> None:

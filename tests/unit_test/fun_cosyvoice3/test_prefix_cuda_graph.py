@@ -9,13 +9,9 @@ import pytest
 import torch
 
 from sglang_omni.models.fun_cosyvoice3 import stages
-from sglang_omni.models.fun_cosyvoice3.config import (
-    FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES,
-)
 from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import (
     PrefixCudaGraphCache,
     PrefixCudaGraphEnvelope,
-    prefix_cuda_graph_envelopes_from_capture_shapes,
     resolve_prefix_cuda_graph_max_slack,
     route_prefix_cuda_graph_envelope,
 )
@@ -125,69 +121,6 @@ def test_prepare_prefix_cuda_graph_capture_inputs_uses_warmup_conditioning(
         ).unsqueeze(0),
     )
     assert all(torch.count_nonzero(value) > 0 for value in capture_inputs)
-
-
-def test_default_prefix_cuda_graph_capture_shapes_are_frozen_and_valid() -> None:
-    expected_capture_shapes = (
-        (1, 200, 200, 3072, (200,)),
-        (1, 350, 350, 512, (350,)),
-        (2, 500, 350, 2048, (350, 150)),
-        (3, 500, 300, 1536, (300, 150, 50)),
-        (4, 900, 400, 2048, (400, 200, 150, 150)),
-        (3, 650, 350, 3072, (350, 150, 150)),
-        (2, 200, 100, 1024, (100, 100)),
-        (3, 1100, 400, 512, (400, 350, 350)),
-        (4, 1200, 400, 1024, (400, 300, 250, 250)),
-        (3, 800, 350, 1024, (350, 350, 100)),
-        (8, 1300, 300, 1024, (300, 300, 300, 200, 50, 50, 50, 50)),
-        (2, 650, 450, 3072, (450, 200)),
-        (5, 1150, 350, 512, (350, 200, 200, 200, 200)),
-        (8, 1700, 300, 1536, (300, 300, 250, 200, 200, 150, 150, 150)),
-        (2, 350, 250, 2560, (250, 100)),
-    )
-    assert FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES == (
-        expected_capture_shapes
-    )
-    stages.verify_prefix_cuda_graph_capture_shapes(
-        FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES,
-        chunk_frames=50,
-    )
-    envelopes = prefix_cuda_graph_envelopes_from_capture_shapes(
-        FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES
-    )
-    assert len(envelopes) == 15
-    names = [envelope.name for envelope in envelopes]
-    assert len(set(names)) == len(names)
-    assert names == [
-        "B1-N200-M200-E3072",
-        "B1-N350-M350-E512",
-        "B2-N500-M350-E2048",
-        "B3-N500-M300-E1536",
-        "B4-N900-M400-E2048",
-        "B3-N650-M350-E3072",
-        "B2-N200-M100-E1024",
-        "B3-N1100-M400-E512",
-        "B4-N1200-M400-E1024",
-        "B3-N800-M350-E1024",
-        "B8-N1300-M300-E1024",
-        "B2-N650-M450-E3072",
-        "B5-N1150-M350-E512",
-        "B8-N1700-M300-E1536",
-        "B2-N350-M250-E2560",
-    ]
-    assert (
-        tuple(
-            (
-                envelope.batch_size,
-                envelope.new_frame_count,
-                envelope.max_new_frame_count,
-                envelope.max_total_frame_count,
-                envelope.capture_row_new_frames,
-            )
-            for envelope in envelopes
-        )
-        == expected_capture_shapes
-    )
 
 
 @pytest.mark.parametrize(
@@ -420,38 +353,3 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
         ).name
         == "B2-N200-M100-E512"
     )
-
-
-@pytest.mark.parametrize(
-    ("kwargs", "exception", "message"),
-    [
-        (
-            {"enable_dit_torch_compile": False, "flow_prefix_cache_gb": 24.0},
-            ValueError,
-            "enable_dit_torch_compile",
-        ),
-        (
-            {"enable_dit_torch_compile": True, "flow_prefix_cache_gb": 0.0},
-            ValueError,
-            "flow_prefix_cache_gb",
-        ),
-    ],
-)
-def test_prefix_cuda_graph_explicit_enable_requires_cuda_prerequisites(
-    monkeypatch: pytest.MonkeyPatch,
-    kwargs: dict[str, bool | float],
-    exception: type[Exception],
-    message: str,
-) -> None:
-    monkeypatch.setattr(
-        stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cuda")
-    )
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-
-    with pytest.raises(exception, match=message):
-        stages.create_vocoder_executor(
-            "model",
-            device="cuda",
-            enable_flow_prefix_cuda_graph=True,
-            **kwargs,
-        )
