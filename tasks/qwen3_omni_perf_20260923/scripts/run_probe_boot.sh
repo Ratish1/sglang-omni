@@ -9,6 +9,7 @@
 # is sent TERM; nsys finalizes by itself. Export and census run here, in the container.
 # PIN_CPUS (e.g. 56-69,168-181) runs the server and the load on those cores with memory on NUMA
 # node PIN_NODE, as run_bench_boot.sh does, so cells on different cards do not share cores.
+# REQUEST_RATE=R sends the measured pass open loop at R per second (the warm pass stays closed loop).
 # DCGM_SAMPLES names the samples file a host-side dcgm/dcgm_sampler.py writes for this card
 # (H100 host only): the census adds section K, and a clean boot gets dcgm.txt, the window means.
 # usage: run_probe_boot.sh <tree> <out dir> <card> <port> <h200|bf16|fp8> <concurrency> <arm>
@@ -76,7 +77,7 @@ if [ $healthy = 1 ]; then
   date +%s.%N > "$OUT/window.txt"
   CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" gen --arm "$ARM" --port "$PORT" \
     --concurrency "$CONC" --out "$OUT" --max-samples "${MAX_SAMPLES:-128}" \
-    --skip-samples "${WARM_SAMPLES:-32}" > "$OUT/gen_$ARM.log" 2>&1
+    --skip-samples "${WARM_SAMPLES:-32}" ${REQUEST_RATE:+--request-rate $REQUEST_RATE} > "$OUT/gen_$ARM.log" 2>&1
   echo "gen rc $? $(date +%T)" >> "$OUT/progress.txt"
   date +%s.%N >> "$OUT/window.txt"
 else
