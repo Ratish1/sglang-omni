@@ -171,9 +171,7 @@ def route_prefix_cuda_graph_envelope(
     """Return the smallest physical envelope compatible with real row geometry."""
     if not new_frame_counts or len(new_frame_counts) != len(total_frame_counts):
         return None
-    else:
-        pass
-    if not all(
+    elif not all(
         frame_count > 0 and frame_count % chunk_frames == 0
         for frame_count in new_frame_counts
     ):
@@ -281,6 +279,8 @@ class PrefixCudaGraphCache:
         if self.entries:
             raise RuntimeError("prefix CUDA Graph cache already captured")
         else:
+            # note(chenye): capture order is largest first, to improve memory
+            # efficiency of the single shared graph pool.
             capture_envelopes = sorted(
                 self.envelopes,
                 key=lambda envelope: (
@@ -291,7 +291,6 @@ class PrefixCudaGraphCache:
                 ),
                 reverse=True,
             )
-            # Largest-first capture improves reuse of the single shared graph pool.
             self.capture_order = [envelope.name for envelope in capture_envelopes]
             with torch.cuda.device(self.device):
                 graph_pool = torch.cuda.graph_pool_handle()

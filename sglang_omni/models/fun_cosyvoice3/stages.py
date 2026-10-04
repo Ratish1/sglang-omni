@@ -432,9 +432,7 @@ def verify_prefix_cuda_graph_capture_shapes(
     chunk_frames = int(chunk_frames)
     if chunk_frames <= 0:
         raise ValueError(f"PackedDiT chunk size must be positive, got {chunk_frames}")
-    else:
-        pass
-    if not capture_shapes:
+    elif not capture_shapes:
         raise ValueError("flow_prefix_cuda_graph_capture_shapes must not be empty")
     else:
         pass
