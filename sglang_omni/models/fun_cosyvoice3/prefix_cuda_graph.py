@@ -743,7 +743,8 @@ class PrefixCudaGraphCache:
     ) -> torch.Tensor | None:
         entry = self.route(new_frames, total_frames)
         if entry is None:
-            # Misses are expected; replay and staging failures intentionally escape.
+            # note(chenye) Misses are expected; replay and staging failures
+            # intentionally escape.
             return None
         else:
             with (

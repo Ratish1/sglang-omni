@@ -129,23 +129,21 @@ def test_prepare_prefix_cuda_graph_capture_inputs_uses_warmup_conditioning(
 
 def test_default_prefix_cuda_graph_capture_shapes_are_frozen_and_valid() -> None:
     expected_capture_shapes = (
-        (1, 300, 300, 3072, (300,)),
-        (1, 450, 450, 512, (450,)),
-        (3, 400, 200, 1536, (200, 100, 100)),
-        (4, 900, 400, 2048, (400, 200, 150, 150)),
+        (1, 200, 200, 3072, (200,)),
+        (1, 350, 350, 512, (350,)),
         (2, 500, 350, 2048, (350, 150)),
+        (3, 500, 300, 1536, (300, 150, 50)),
+        (4, 900, 400, 2048, (400, 200, 150, 150)),
         (3, 650, 350, 3072, (350, 150, 150)),
+        (2, 200, 100, 1024, (100, 100)),
         (3, 1100, 400, 512, (400, 350, 350)),
-        (1, 100, 100, 512, (100,)),
-        (2, 200, 100, 512, (100, 100)),
-        (3, 500, 300, 1024, (300, 100, 100)),
         (4, 1200, 400, 1024, (400, 300, 250, 250)),
-        (3, 850, 350, 1024, (350, 250, 250)),
+        (3, 800, 350, 1024, (350, 350, 100)),
+        (8, 1300, 300, 1024, (300, 300, 300, 200, 50, 50, 50, 50)),
+        (2, 650, 450, 3072, (450, 200)),
         (5, 1150, 350, 512, (350, 200, 200, 200, 200)),
         (8, 1700, 300, 1536, (300, 300, 250, 200, 200, 150, 150, 150)),
-        (2, 600, 300, 512, (300, 300)),
-        (4, 700, 300, 1024, (300, 150, 150, 100)),
-        (6, 1450, 400, 2048, (400, 250, 200, 200, 200, 200)),
+        (2, 350, 250, 2560, (250, 100)),
     )
     assert FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES == (
         expected_capture_shapes
@@ -157,27 +155,25 @@ def test_default_prefix_cuda_graph_capture_shapes_are_frozen_and_valid() -> None
     envelopes = prefix_cuda_graph_envelopes_from_capture_shapes(
         FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES
     )
-    assert len(envelopes) == 17
+    assert len(envelopes) == 15
     names = [envelope.name for envelope in envelopes]
     assert len(set(names)) == len(names)
     assert names == [
-        "B1-N300-M300-E3072",
-        "B1-N450-M450-E512",
-        "B3-N400-M200-E1536",
-        "B4-N900-M400-E2048",
+        "B1-N200-M200-E3072",
+        "B1-N350-M350-E512",
         "B2-N500-M350-E2048",
+        "B3-N500-M300-E1536",
+        "B4-N900-M400-E2048",
         "B3-N650-M350-E3072",
+        "B2-N200-M100-E1024",
         "B3-N1100-M400-E512",
-        "B1-N100-M100-E512",
-        "B2-N200-M100-E512",
-        "B3-N500-M300-E1024",
         "B4-N1200-M400-E1024",
-        "B3-N850-M350-E1024",
+        "B3-N800-M350-E1024",
+        "B8-N1300-M300-E1024",
+        "B2-N650-M450-E3072",
         "B5-N1150-M350-E512",
         "B8-N1700-M300-E1536",
-        "B2-N600-M300-E512",
-        "B4-N700-M300-E1024",
-        "B6-N1450-M400-E2048",
+        "B2-N350-M250-E2560",
     ]
     assert (
         tuple(
@@ -439,11 +435,6 @@ def test_prefix_cuda_graph_routes_physical_envelopes() -> None:
             ValueError,
             "flow_prefix_cache_gb",
         ),
-        (
-            {"enable_dit_torch_compile": True, "flow_prefix_cache_gb": 24.0},
-            RuntimeError,
-            "available CUDA",
-        ),
     ],
 )
 def test_prefix_cuda_graph_explicit_enable_requires_cuda_prerequisites(
@@ -453,13 +444,14 @@ def test_prefix_cuda_graph_explicit_enable_requires_cuda_prerequisites(
     message: str,
 ) -> None:
     monkeypatch.setattr(
-        stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
+        stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cuda")
     )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
     with pytest.raises(exception, match=message):
         stages.create_vocoder_executor(
             "model",
-            device="cpu",
+            device="cuda",
             enable_flow_prefix_cuda_graph=True,
             **kwargs,
         )

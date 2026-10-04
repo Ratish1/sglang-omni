@@ -8,6 +8,7 @@ import sys
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import ClassVar
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -1138,6 +1139,107 @@ def prepare_vocoder_startup(
     return fake_flow
 
 
+@pytest.mark.parametrize(
+    ("device_type", "cuda_available"),
+    [("cpu", True), ("mps", True), ("cuda", False)],
+)
+def test_create_vocoder_executor_disables_prefix_graph_without_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+    device_type: str,
+    cuda_available: bool,
+) -> None:
+    startup_events: list[str] = []
+    prepare_vocoder_startup(
+        monkeypatch,
+        startup_events,
+        device_type=device_type,
+        allow_native_compile=False,
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    prefix_graph_factory = Mock(
+        side_effect=AssertionError("unsupported devices must not build prefix graphs")
+    )
+    monkeypatch.setattr(stages, "PrefixCudaGraphCache", prefix_graph_factory)
+
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device=device_type,
+        enable_dit_torch_compile=False,
+        flow_prefix_cache_gb=0.0,
+    )
+
+    assert isinstance(scheduler, FunCosyVoice3StreamingVocoderScheduler)
+    assert startup_events == ["scheduler_warmup"]
+    prefix_graph_factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("factory_kwargs", "should_capture"),
+    [({}, True), ({"enable_flow_prefix_cuda_graph": False}, False)],
+)
+def test_create_vocoder_executor_prefix_graph_defaults_on_and_respects_disable(
+    monkeypatch: pytest.MonkeyPatch,
+    factory_kwargs: dict[str, bool],
+    should_capture: bool,
+) -> None:
+    startup_events: list[str] = []
+    flow = prepare_vocoder_startup(
+        monkeypatch,
+        startup_events,
+        device_type="cuda",
+        allow_native_compile=True,
+    )
+    flow.packed_estimator.is_ragged = True
+    flow.packed_estimator.chunk_size = 50
+    prefix_pool = Mock(spec=stages.PrefixKVPool)
+    pool_builder = Mock(return_value=prefix_pool)
+    monkeypatch.setattr(stages, "build_prefix_pool", pool_builder)
+    prefix_cache = Mock(spec=stages.PrefixCudaGraphCache)
+    prefix_graph_factory = Mock(return_value=prefix_cache)
+    monkeypatch.setattr(stages, "PrefixCudaGraphCache", prefix_graph_factory)
+    attach_prefix_cache = Mock()
+    monkeypatch.setattr(
+        flow, "attach_prefix_cuda_graph_cache", attach_prefix_cache, raising=False
+    )
+
+    stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        enable_flow_cuda_graph=False,
+        flow_prefix_cache_gb=24.0,
+        flow_prefix_cuda_graph_capture_shapes=FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES,
+        **factory_kwargs,
+    )
+
+    pool_builder.assert_called_once()
+    assert flow.prefix_pool is prefix_pool
+    if should_capture:
+        prefix_graph_factory.assert_called_once()
+        prefix_cache.capture.assert_called_once()
+        attach_prefix_cache.assert_called_once_with(prefix_cache)
+    else:
+        prefix_graph_factory.assert_not_called()
+        prefix_cache.capture.assert_not_called()
+        attach_prefix_cache.assert_not_called()
+
+
+def test_create_vocoder_executor_prefix_graph_requires_created_pool_on_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flow = prepare_vocoder_startup(
+        monkeypatch,
+        [],
+        device_type="cuda",
+        allow_native_compile=True,
+    )
+    flow.prefix_pool = None
+
+    with pytest.raises(RuntimeError, match="successfully created prefix pool"):
+        stages.create_vocoder_executor(
+            "model", device="cuda", flow_prefix_cache_gb=24.0
+        )
+
+
 @pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
 def test_create_vocoder_executor_compiles_before_flow_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
@@ -1157,6 +1259,7 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
         device="cuda",
         enable_dit_torch_compile=enable_dit_torch_compile,
         enable_flow_cuda_graph=True,
+        enable_flow_prefix_cuda_graph=False,
         flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
     )
 
@@ -1345,7 +1448,7 @@ def test_pipeline_config_sets_flow_batch_admission_by_default() -> None:
         "max_batch_size": 16,
         "max_batch_wait_ms": 30,
         "enable_flow_cuda_graph": True,
-        "enable_flow_prefix_cuda_graph": False,
+        "enable_flow_prefix_cuda_graph": True,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,

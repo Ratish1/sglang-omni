@@ -114,7 +114,7 @@ def test_fun_cosyvoice3_config_and_registry_contract() -> None:
         "flow_cuda_graph_capture_shapes": FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
         "flow_prefix_cuda_graph_capture_shapes": FUN_COSYVOICE3_DEFAULT_PREFIX_CUDA_GRAPH_CAPTURE_SHAPES,
         "enable_flow_cuda_graph": True,
-        "enable_flow_prefix_cuda_graph": False,
+        "enable_flow_prefix_cuda_graph": True,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,
@@ -158,7 +158,7 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
         "flow_cuda_graph_capture_shapes": [[1, 496], [5, 544], [7, 576]],
         "flow_prefix_cuda_graph_capture_shapes": [[1, 100, 100, 512, [100]]],
         "enable_flow_cuda_graph": True,
-        "enable_flow_prefix_cuda_graph": False,
+        "enable_flow_prefix_cuda_graph": True,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,
@@ -178,14 +178,14 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
     assert args["flow_prefix_cuda_graph_max_slack_frames"] == 50
 
 
-def test_fun_cosyvoice3_prefix_cuda_graph_flag_uses_factory_path() -> None:
+def test_fun_cosyvoice3_prefix_cuda_graph_can_be_disabled_via_factory_path() -> None:
     merged = ConfigManager(
         FunCosyVoice3PipelineConfig(model_path="model")
-    ).merge_config({"vocoder.factory.enable_flow_prefix_cuda_graph": True})
+    ).merge_config({"vocoder.factory.enable_flow_prefix_cuda_graph": False})
     vocoder = next(stage for stage in merged.stages if stage.name == "vocoder")
 
-    assert vocoder.factory.model_extra["enable_flow_prefix_cuda_graph"] is True
-    assert resolve_stage_typed_kwargs(vocoder)["enable_flow_prefix_cuda_graph"] is True
+    assert vocoder.factory.model_extra["enable_flow_prefix_cuda_graph"] is False
+    assert resolve_stage_typed_kwargs(vocoder)["enable_flow_prefix_cuda_graph"] is False
 
 
 @pytest.mark.parametrize(

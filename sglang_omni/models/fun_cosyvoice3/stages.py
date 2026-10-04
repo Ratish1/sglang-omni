@@ -2716,7 +2716,7 @@ def create_vocoder_executor(
     flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = True,
     enable_flow_cuda_graph: bool = True,
-    enable_flow_prefix_cuda_graph: bool = False,
+    enable_flow_prefix_cuda_graph: bool = True,
     flow_cuda_graph_capture_shapes: tuple[tuple[int, int], ...] | None = None,
     flow_prefix_cuda_graph_capture_shapes: (
         Sequence[PrefixCudaGraphCaptureShape] | None
@@ -2738,9 +2738,7 @@ def create_vocoder_executor(
 
     if flow_batch_admission_frames <= 0:
         raise ValueError("flow_batch_admission_frames must be greater than zero")
-    else:
-        pass
-    if flow_prefix_cache_gb < 0:
+    elif flow_prefix_cache_gb < 0:
         raise ValueError("flow_prefix_cache_gb must be >= 0")
     else:
         pass
@@ -2751,27 +2749,22 @@ def create_vocoder_executor(
     )
     device = str(resolve_concrete_device(device, gpu_id))
     device_obj = torch.device(device)
+    if enable_flow_prefix_cuda_graph and (
+        device_obj.type != "cuda" or not torch.cuda.is_available()
+    ):
+        enable_flow_prefix_cuda_graph = False
+    else:
+        pass
     if enable_flow_prefix_cuda_graph and not enable_dit_torch_compile:
         raise ValueError(
             "enable_flow_prefix_cuda_graph requires enable_dit_torch_compile=True"
         )
-    else:
-        pass
-    if enable_flow_prefix_cuda_graph and flow_prefix_cache_gb <= 0:
+    elif enable_flow_prefix_cuda_graph and flow_prefix_cache_gb <= 0:
         raise ValueError(
             "enable_flow_prefix_cuda_graph requires flow_prefix_cache_gb > 0"
         )
     else:
         pass
-    if enable_flow_prefix_cuda_graph and (
-        device_obj.type != "cuda" or not torch.cuda.is_available()
-    ):
-        raise RuntimeError(
-            "enable_flow_prefix_cuda_graph requires an available CUDA device"
-        )
-    else:
-        pass
-
     from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
     if use_mlx():
