@@ -246,6 +246,7 @@ class DecodeSlot:
     """
 
     input_codes: GrowablePinnedBuffer
+    invalid_rows: GrowablePinnedBuffer
     output_transfer: PinnedTransferSlot
     busy: bool = False
     broken: bool = False
@@ -422,6 +423,10 @@ class Qwen3TTSDecodeHandle:
             raise
         try:
             self.deltas = [delta.clone() for delta in self.deltas]
+            if self.bad_rows is not None:
+                self.bad_rows = self.bad_rows.clone()
+            else:
+                pass
         except BaseException:
             self.deltas = []
             raise
@@ -1955,6 +1960,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 )
             )
             * self.samples_per_frame,
+            row_count=len(plans),
         )
         gpu_input: torch.Tensor | None = None
         keepalives: list[torch.Tensor] = []
@@ -1987,6 +1993,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 keepalives.extend(deltas)
                 if not pinned:
                     host = [delta.contiguous().cpu() for delta in deltas]
+                    bad_rows = bad_rows.cpu()
                     stream.synchronize()
                     return Qwen3TTSDecodeHandle(
                         host,
@@ -1998,10 +2005,13 @@ class Qwen3TTSStreamingVocoderScheduler(
                 else:
                     pass
                 staged = self.stage_deltas(deltas, slot)
+                keepalives.append(bad_rows)
+                host_bad_rows = slot.invalid_rows.view(len(plans))
+                host_bad_rows.copy_(bad_rows, non_blocking=True)
                 slot.output_transfer.record(stream)
             return Qwen3TTSDecodeHandle(
                 staged,
-                bad_rows,
+                host_bad_rows,
                 slot=slot,
                 owner=self,
                 stream=stream,
@@ -2056,6 +2066,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 (
                     DecodeSlot(
                         input_codes=GrowablePinnedBuffer(torch.long),
+                        invalid_rows=GrowablePinnedBuffer(torch.bool),
                         output_transfer=PinnedTransferSlot(slot_device, torch.float32),
                     )
                     for _ in range(2)
@@ -2072,7 +2083,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         return slots[0]
 
     def reserve_slot(
-        self, slot: DecodeSlot, *, input_numel: int, output_numel: int
+        self, slot: DecodeSlot, *, input_numel: int, output_numel: int, row_count: int
     ) -> bool:
         """Grow and acquire the thread's slot before any async work is enqueued.
 
@@ -2091,6 +2102,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             pass
         try:
             slot.input_codes.ensure_capacity(input_numel)
+            slot.invalid_rows.ensure_capacity(row_count)
             slot.output_transfer.ensure_capacity(output_numel)
         except RuntimeError:
             self.pinned_staging_disabled = True
