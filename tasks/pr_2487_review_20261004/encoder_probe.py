@@ -53,6 +53,23 @@ def main() -> None:
                 tgt_sizes=optimized["tgt_sizes"][0],
             )["image_embeds"].float()
             difference = modified_embedding - original_embedding
+            repeated_embedding = encoder(
+                pixel_values=baseline["pixel_values"][0],
+                tgt_sizes=baseline["tgt_sizes"][0],
+            )["image_embeds"].float()
+            pixel_differences = torch.cat(
+                [
+                    (
+                        expected.to("cuda:0", dtype=torch.bfloat16)
+                        != actual.to("cuda:0", dtype=torch.bfloat16)
+                    ).flatten()
+                    for expected, actual in zip(
+                        baseline["pixel_values"][0],
+                        optimized["pixel_values"][0],
+                        strict=True,
+                    )
+                ]
+            )
             cosine = torch.nn.functional.cosine_similarity(
                 original_embedding, modified_embedding, dim=-1
             )
@@ -63,6 +80,11 @@ def main() -> None:
                 "max_abs_difference": difference.abs().max().item(),
                 "mean_abs_difference": difference.abs().mean().item(),
                 "relative_l2": (difference.norm() / original_embedding.norm()).item(),
+                "baseline_repeat_max_abs": (repeated_embedding - original_embedding)
+                .abs()
+                .max()
+                .item(),
+                "bf16_changed_pixel_fraction": pixel_differences.float().mean().item(),
                 "min_token_cosine": cosine.min().item(),
                 "mean_token_cosine": cosine.mean().item(),
             }
