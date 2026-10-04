@@ -4406,6 +4406,54 @@ def test_qwen3_tts_decode_slot_reuses_event_on_cuda(
     assert not slot.busy and not slot.broken
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen3_tts_invalid_rows_remain_with_their_pending_decode_on_cuda() -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        FakeQwen3TTSSpeechTokenizer(), device="cuda", initial_cuda_graph=False
+    )
+    with torch.cuda.stream(scheduler.decode_stream):
+        batches = [
+            [
+                Qwen3TTSDecodePlan(
+                    decoder_input=torch.full(
+                        (1, 1, 1), code, dtype=torch.long, device="cuda"
+                    ),
+                    absolute_emitted_frames=0,
+                    generated_frames=1,
+                    window_start=0,
+                    emitted_generated_frames=0,
+                )
+                for code in codes
+            ]
+            for codes in ((-1, 7, 2048), (8, -1, 9), (11,))
+        ]
+        first = scheduler.launch_decode_plans(
+            batches[0], stream=scheduler.decode_stream
+        )
+        second = scheduler.launch_decode_plans(
+            batches[1], stream=scheduler.decode_stream
+        )
+        first_audio, first_invalid = first.resolve_partial()
+        third = scheduler.launch_decode_plans(
+            batches[2], stream=scheduler.decode_stream
+        )
+        second_audio, second_invalid = second.resolve_partial()
+        third_audio, third_invalid = third.resolve_partial()
+
+    assert first_invalid == (0, 2)
+    assert second_invalid == (1,)
+    assert third_invalid == ()
+    assert first.resolve_partial()[1] == (0, 2)
+    for audio, expected in (
+        (first_audio[1], 7),
+        (second_audio[0], 8),
+        (second_audio[2], 9),
+        (third_audio[0], 11),
+    ):
+        assert torch.equal(audio, torch.full((4,), expected, dtype=torch.float32))
+
+
 def test_qwen3_tts_streaming_vocoder_decodes_initial_chunk_early() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         FakeQwen3TTSSpeechTokenizer(),
