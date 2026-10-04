@@ -206,7 +206,7 @@ def route_prefix_cuda_graph_envelope(
 
 
 class PrefixCudaGraphCache:
-    """Reusable causal prefix graphs with compiled-prefix miss fallback."""
+    """Reusable causal prefix graphs with prefix-solver miss fallback."""
 
     def __init__(
         self,

@@ -295,8 +295,9 @@ fallback. Prefix CUDA Graphs capture the PrefixKV/PackedDiT path independently o
 the regular Flow estimator backend, DiT `torch.compile`, and buffered Flow CUDA
 Graphs. They use whichever eager or compiled prefix implementation is installed.
 TensorRT, when enabled, continues to serve the regular Flow estimator path.
-If the supported CUDA/ragged FA3 dtype path or prefix K/V pool is unavailable,
-prefix graphs are skipped and serving continues through the existing plain path.
+If the CUDA/ragged FA3/dtype prerequisites are unavailable, or the prefix-cache
+budget is zero, the prefix optimization is skipped and serving continues through
+the regular path.
 
 ### torch.compile for the DiT backbone
 

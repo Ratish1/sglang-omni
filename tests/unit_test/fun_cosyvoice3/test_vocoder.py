@@ -1263,13 +1263,11 @@ def test_create_vocoder_executor_prefix_graph_defaults_on_and_respects_disable(
         ("ragged", "bfloat16", 24.0),
         ("dtype", "float32", 24.0),
         ("budget", "bfloat16", 0.0),
-        ("budget", "bfloat16", -1.0),
-        ("pool", "bfloat16", 24.0),
     ],
 )
 def test_create_vocoder_executor_skips_unavailable_prefix_capability(
     monkeypatch: pytest.MonkeyPatch,
-    unavailable_capability: Literal["packed", "ragged", "dtype", "budget", "pool"],
+    unavailable_capability: Literal["packed", "ragged", "dtype", "budget"],
     dtype: Literal["bfloat16", "float32"],
     budget_gb: float,
 ) -> None:
@@ -1287,7 +1285,9 @@ def test_create_vocoder_executor_skips_unavailable_prefix_capability(
         flow.packed_estimator.is_ragged = False
     else:
         pass
-    pool_builder = Mock(return_value=None)
+    pool_builder = Mock(
+        side_effect=AssertionError("unavailable prefix capability must not build pools")
+    )
     monkeypatch.setattr(stages, "build_prefix_pool", pool_builder)
     prefix_graph_factory = Mock(
         side_effect=AssertionError(
@@ -1311,10 +1311,7 @@ def test_create_vocoder_executor_skips_unavailable_prefix_capability(
     assert startup_events[-1] == "scheduler_warmup"
     native_compile.assert_called_once()
     prefix_graph_factory.assert_not_called()
-    if unavailable_capability == "pool":
-        pool_builder.assert_called_once()
-    else:
-        pool_builder.assert_not_called()
+    pool_builder.assert_not_called()
 
 
 @pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
@@ -1505,6 +1502,11 @@ def test_create_vocoder_executor_rejects_non_positive_admission_budget(
             flow_batch_admission_frames=0,
             enable_dit_torch_compile=False,
         )
+
+
+def test_create_vocoder_executor_rejects_negative_prefix_cache_budget() -> None:
+    with pytest.raises(ValueError, match="flow_prefix_cache_gb must be >= 0"):
+        stages.create_vocoder_executor("model", flow_prefix_cache_gb=-1.0)
 
 
 def test_pipeline_config_sets_flow_batch_admission_by_default() -> None:

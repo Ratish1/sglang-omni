@@ -2741,6 +2741,8 @@ def create_vocoder_executor(
 
     if flow_batch_admission_frames <= 0:
         raise ValueError("flow_batch_admission_frames must be greater than zero")
+    elif flow_prefix_cache_gb < 0:
+        raise ValueError("flow_prefix_cache_gb must be >= 0")
     else:
         pass
 
