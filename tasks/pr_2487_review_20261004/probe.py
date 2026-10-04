@@ -55,6 +55,7 @@ def main() -> None:
     arguments.output.mkdir(parents=True, exist_ok=True)
     checkpoint = snapshot_download(
         arguments.model,
+        revision="503e754207c94da6bb26850b4469f367c9ea3582",
         allow_patterns=["*.py", "*.json", "*.txt", "*.jinja", "*.model"],
     )
     processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)

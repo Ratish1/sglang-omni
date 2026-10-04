@@ -30,6 +30,7 @@ def main() -> None:
     torch.set_num_threads(1)
     checkpoint = snapshot_download(
         "openbmb/MiniCPM-o-4_5",
+        revision="503e754207c94da6bb26850b4469f367c9ea3582",
         allow_patterns=["*.py", "*.json", "*.txt", "*.jinja", "*.model"],
     )
     processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
