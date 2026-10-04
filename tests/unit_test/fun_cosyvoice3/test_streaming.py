@@ -161,6 +161,28 @@ def test_streaming_vocoder_uses_flow_token_mel_ratio() -> None:
     )
 
 
+def test_streaming_vocoder_latches_prompt_feat_with_flow_token_mel_ratio() -> None:
+    flow, scheduler = make_scheduler()
+    flow.token_mel_ratio = 3
+    state = scheduler.create_stream_state("req-prompt-ratio")
+
+    scheduler.latch_prompts(
+        "req-prompt-ratio",
+        state,
+        prompt_token=torch.zeros(1, 10, dtype=torch.int32),
+        prompt_feat=torch.zeros(1, 30, 80),
+        embedding=torch.ones(1, 192),
+    )
+
+    latched_token = state.prompt_token
+    latched_feat = state.prompt_feat
+    assert latched_token is not None
+    assert latched_feat is not None
+    assert latched_token.shape == (1, 25)
+    assert latched_feat.shape == (1, 75, 80)
+    assert latched_feat.shape[1] == latched_token.shape[1] * int(flow.token_mel_ratio)
+
+
 def estimator_calls(flow: FakeFlow) -> list[dict]:
     return flow.packed_estimator.calls
 

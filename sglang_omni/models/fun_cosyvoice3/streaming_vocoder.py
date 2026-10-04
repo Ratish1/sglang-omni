@@ -315,7 +315,13 @@ class FunCosyVoice3StreamingVocoderScheduler(
         # note (guozhihao-224): pad prompt to a hop multiple here so the
         # first generated hop stays hop+lookahead instead of waiting for
         # prompt_pad extra AR tokens.
-        token, feat = pad_flow_prompt_to_hop(token, feat, hop_len=self.token_hop_len)
+        token_mel_ratio = int(self.vocoder.flow.token_mel_ratio)
+        token, feat = pad_flow_prompt_to_hop(
+            token,
+            feat,
+            hop_len=self.token_hop_len,
+            token_mel_ratio=token_mel_ratio,
+        )
         if state.prompt_token is None:
             state.prompt_token = token
             state.prompt_feat = feat

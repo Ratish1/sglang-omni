@@ -219,7 +219,7 @@ class PrefixCudaGraphCache:
         autocast_dtype: torch.dtype | None,
         cfg_rate: float,
         envelopes: tuple[PrefixCudaGraphEnvelope, ...],
-        max_slack_frames: int,
+        max_slack_frames: int | None,
         capture_warmup_iterations: int = CAPTURE_WARMUP_ITERATIONS,
     ) -> None:
         self.estimator = estimator

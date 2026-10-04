@@ -64,7 +64,6 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import (
     PrefixCudaGraphCaptureInputs,
     PrefixCudaGraphCaptureShape,
     prefix_cuda_graph_envelopes_from_capture_shapes,
-    resolve_prefix_cuda_graph_max_slack,
 )
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     CosyVoice3SGLangRequestData,
@@ -2909,29 +2908,12 @@ def create_vocoder_executor(
     if enable_flow_prefix_cuda_graph:
         assert flow.packed_estimator is not None and flow.prefix_pool is not None
         chunk_frames = int(flow.packed_estimator.chunk_size)
-        max_slack_frames = resolve_prefix_cuda_graph_max_slack(
-            chunk_frames,
-            flow_prefix_cuda_graph_max_slack_frames,
-        )
         prefix_capture_shapes = verify_prefix_cuda_graph_capture_shapes(
             flow_prefix_cuda_graph_capture_shapes,
             chunk_frames=chunk_frames,
         )
         prefix_envelopes = prefix_cuda_graph_envelopes_from_capture_shapes(
             prefix_capture_shapes
-        )
-        parameter_dtype = next(flow.parameters()).dtype
-        time_span = torch.linspace(
-            0,
-            1,
-            FLOW_EULER_STEPS + 1,
-            device=device_obj,
-            dtype=parameter_dtype,
-        )
-        time_span = (
-            1 - torch.cos(time_span * 0.5 * torch.pi)
-            if flow.decoder.t_scheduler == "cosine"
-            else time_span
         )
         prefix_cache = PrefixCudaGraphCache(
             flow.packed_estimator,
@@ -2940,7 +2922,7 @@ def create_vocoder_executor(
             autocast_dtype=autocast_dtype,
             cfg_rate=float(flow.decoder.inference_cfg_rate),
             envelopes=prefix_envelopes,
-            max_slack_frames=max_slack_frames,
+            max_slack_frames=flow_prefix_cuda_graph_max_slack_frames,
         )
         prefix_cache.capture(
             lambda new_frame_counts: prepare_prefix_cuda_graph_capture_inputs(
