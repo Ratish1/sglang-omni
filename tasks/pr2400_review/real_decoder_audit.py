@@ -112,7 +112,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     arguments.output.mkdir(parents=True, exist_ok=True)
-    scheduler = create_vocoder_executor(arguments.checkpoint, device="cuda:0")
+    scheduler = create_vocoder_executor(arguments.checkpoint, device="cuda", gpu_id=0)
     generator = torch.Generator().manual_seed(731)
     codes = [
         torch.randint(
