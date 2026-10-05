@@ -1121,6 +1121,79 @@ def test_chat_stream_failure_reports_error_before_done_sentinel() -> None:
     }
 
 
+class TextDeltaCoordinator:
+    """Answer chat with fixed text: whole when buffered, as deltas when streamed."""
+
+    def __init__(self, deltas: list[str]) -> None:
+        self.deltas = deltas
+
+    async def submit(self, request_id: str, omni_request: OmniRequest) -> object:
+        return {"text": "".join(self.deltas), "finish_reason": "stop"}
+
+    async def stream(
+        self, request_id: str, omni_request: OmniRequest
+    ) -> AsyncIterator[StreamMessage]:
+        for index, delta in enumerate(self.deltas):
+            chunk: dict[str, object] = {"text": delta, "modality": "text"}
+            if index == len(self.deltas) - 1:
+                chunk["finish_reason"] = "stop"
+            else:
+                pass
+            yield StreamMessage(
+                request_id=request_id,
+                from_stage="decode",
+                chunk=chunk,
+                stage_name="decode",
+                modality="text",
+            )
+
+
+def test_chat_answer_excludes_the_matched_stop_string() -> None:
+    coordinator = TextDeltaCoordinator(["1, 2", ", 3"])
+    app = create_app(Client(coordinator), model_name="qwen3-omni")
+    body = {"messages": [{"role": "user", "content": "count"}], "stop": [", 3"]}
+
+    response = TestClient(app).post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "1, 2"
+
+
+@pytest.mark.parametrize(
+    ("deltas", "stop", "expected"),
+    [
+        pytest.param(["1, 2", ", 3"], [", 3"], "1, 2", id="whole"),
+        pytest.param(["a", "\n", "b\n", "\nc"], ["\n\n"], "a\nb", id="across-deltas"),
+        pytest.param(["a", "\n"], ["\n\n"], "a\n", id="never-completed"),
+    ],
+)
+def test_chat_stream_never_sends_a_stop_string(
+    deltas: list[str], stop: list[str], expected: str
+) -> None:
+    app = create_app(Client(TextDeltaCoordinator(deltas)), model_name="qwen3-omni")
+    body = {
+        "messages": [{"role": "user", "content": "count"}],
+        "stop": stop,
+        "stream": True,
+    }
+
+    response = TestClient(app).post("/v1/chat/completions", json=body)
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    content = [
+        choice["delta"]["content"]
+        for event in events
+        for choice in event["choices"]
+        if choice["delta"].get("content")
+    ]
+
+    assert "".join(content) == expected
+    assert events[-1]["choices"][0]["finish_reason"] == "stop"
+
+
 def test_chat_asgi_send_failure_aborts_backend_and_cleans_state() -> None:
     async def run() -> None:
         client, coordinator, control_plane = streaming_client()
