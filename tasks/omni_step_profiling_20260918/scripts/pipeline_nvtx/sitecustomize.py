@@ -393,6 +393,20 @@ def batch_label(prefix, batch):
 def patch_scheduler(module):
     scheduler = module.OmniScheduler
     run_batch = scheduler._run_batch
+    put_messages = getattr(module, "put_messages", None)
+    if put_messages is not None:
+        # note: one put of a whole step bypasses the queue's instance put, so mark each
+        # message here, before the put, as put_marked does
+        def put_messages_marked(outbox, messages):
+            label = getattr(outbox, "pipe_nvtx_label", None)
+            if label is not None:
+                for message in messages:
+                    mark(
+                        f"q {label}.put rid={rid_of(message)} t={getattr(message, 'type', '-')}"
+                    )
+            return put_messages(outbox, messages)
+
+        module.put_messages = put_messages_marked
 
     def run_batch_marked(self, batch, pp_proxy_tensors=None):
         if batch.forward_mode.is_extend():
