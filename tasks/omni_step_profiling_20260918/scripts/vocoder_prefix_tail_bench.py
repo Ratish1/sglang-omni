@@ -402,6 +402,154 @@ def float64_norm(self, hidden_states):
     return self.weight * (hidden_states * torch.rsqrt(variance + self.variance_epsilon))
 
 
+def varlen_metadata(lengths, width, packed, device):
+    """Static varlen metadata built outside the graph, as SGLang's FA3 backend keeps its
+    graph metadata in static buffers."""
+    if packed:
+        starts = [0]
+        for n in lengths:
+            starts.append(starts[-1] + n)
+        token_index = torch.cat(
+            [i * width + torch.arange(n, device=device) for i, n in enumerate(lengths)]
+        )
+        positions = torch.cat([torch.arange(n, device=device) for n in lengths])
+        cu = torch.tensor(starts, dtype=torch.int32, device=device)
+        return token_index, positions, cu, max(lengths)
+    rows = len(lengths)
+    positions = torch.arange(width, device=device).repeat(rows)
+    cu = torch.arange(0, (rows + 1) * width, width, dtype=torch.int32, device=device)
+    return None, positions, cu, width
+
+
+def frame_part_varlen(incremental, codes, metadata):
+    """frame_part with SGLang's FA3 varlen kernel for the attention (causal, window 72).
+    packed=False: rows padded to W, cu_seqlens of W each. packed=True: the transformer
+    runs on the real frames only, concatenated, cu_seqlens of each row's n (host list
+    `lengths`, static per graph)."""
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+    decoder = incremental.decoder
+    transformer = decoder.pre_transformer
+    batch, width = int(codes.shape[0]), int(codes.shape[-1])
+    device = codes.device
+    hidden = decoder.quantizer.decode(codes).transpose(1, 2)
+    history = torch.zeros(
+        batch,
+        int(decoder.pre_conv.padding),
+        hidden.shape[2],
+        device=device,
+        dtype=hidden.dtype,
+    )
+    combined = torch.cat((history, hidden), dim=1)
+    out = codec.channels_last_conv1d(
+        combined,
+        decoder.pre_conv.conv,
+        incremental.channels_last_weights["pre_conv"],
+        width,
+    )
+    hidden = transformer.input_proj(out).reshape(batch * width, -1)
+    token_index, positions, cu, max_len = metadata
+    if token_index is not None:
+        hidden = hidden.index_select(0, token_index)
+    tokens = int(hidden.shape[0])
+    cos, sin = transformer.rotary_emb(hidden.unsqueeze(0), positions.unsqueeze(0))
+    window = int(transformer.window_size)
+    for layer in transformer.layers:
+        attention = layer.self_attn
+        head_dim = int(attention.head_dim)
+        residual = hidden
+        normalized = layer.input_layernorm(hidden)
+        query = (
+            attention.q_proj(normalized).view(1, tokens, -1, head_dim).transpose(1, 2)
+        )
+        key = attention.k_proj(normalized).view(1, tokens, -1, head_dim).transpose(1, 2)
+        value = attention.v_proj(normalized).view(tokens, -1, head_dim)
+        query, key = codec.apply_rotary_pos_emb(query, key, cos, sin)
+        attended = flash_attn_varlen_func(
+            query[0].transpose(0, 1).contiguous(),
+            key[0].transpose(0, 1).contiguous(),
+            value,
+            cu,
+            cu,
+            max_seqlen_q=max_len,
+            max_seqlen_k=max_len,
+            softmax_scale=float(attention.scaling),
+            causal=True,
+            window_size=(window - 1, 0),
+        )
+        attended = attention.o_proj(attended.reshape(tokens, -1))
+        hidden = residual + layer.self_attn_layer_scale(attended)
+        residual = hidden
+        hidden = residual + layer.mlp_layer_scale(
+            layer.mlp(layer.post_attention_layernorm(hidden))
+        )
+    return transformer.output_proj(transformer.norm(hidden))
+
+
+def run_varlen(incremental, device):
+    """Frame part ms: today's manual attention (padded), FA3 varlen padded, FA3 varlen
+    packed; rows of n spread over [W/2, W] as first chunks are; and the bf16 distance of
+    the varlen frame outputs to today's at the real frames."""
+    print(
+        f"{'W':>4} {'rows':>4} {'today ms':>9} {'fa padded':>10} {'fa packed':>10} {'max rel':>9}"
+    )
+    for padded in (48, 64, 128, 256):
+        for rows in (1, 2, 4, 8):
+            lengths = [
+                padded - (padded // 2) * i // max(rows - 1, 1) for i in range(rows)
+            ]
+            codes = torch.randint(0, 2048, (rows, 16, padded), device=device)
+            valid = torch.tensor(lengths, device=device)
+            today = graph_ms(lambda: frame_part(incremental, codes, valid)[0])[1]
+            padded_meta = varlen_metadata(lengths, padded, False, device)
+            packed_meta = varlen_metadata(lengths, padded, True, device)
+            fa_padded = graph_ms(
+                lambda: frame_part_varlen(incremental, codes, padded_meta)
+            )[1]
+            fa_packed = graph_ms(
+                lambda: frame_part_varlen(incremental, codes, packed_meta)
+            )[1]
+            reference = frame_part(incremental, codes, valid)[0]
+            got = frame_part_varlen(incremental, codes, packed_meta)
+            worst, start = 0.0, 0
+            for row, n in enumerate(lengths):
+                worst = max(worst, max_rel(got[start : start + n], reference[row, :n]))
+                start += n
+            print(
+                f"{padded:>4} {rows:>4} {today:>9.3f} {fa_padded:>10.3f} {fa_packed:>10.3f} {worst:>9.2e}",
+                flush=True,
+            )
+            torch.cuda.empty_cache()
+
+
+def run_split(incremental, device):
+    """Captured ms of the frame part at W against the conv stack at the tail, and the
+    attention's share of the frame part (graph of the frame part with attention removed).
+    """
+    decoder = incremental.decoder
+    dtype = decoder.pre_conv.conv.weight.dtype
+    tail = tail_frames(decoder, 1)
+    print(f"{'W':>4} {'rows':>4} {'frame ms':>9} {'conv ms':>8} {'whole ms':>9}")
+    for padded in (48, 64, 128, 256):
+        for rows in (1, 2, 4, 8):
+            codes = torch.randint(0, 2048, (rows, 16, padded), device=device)
+            valid = torch.full((rows,), padded, device=device)
+            hidden = torch.randn(rows, tail, 1024, device=device, dtype=dtype)
+
+            def conv_only():
+                state = incremental.init_state(rows, device=device, dtype=dtype)
+                return conv_part(incremental, hidden, state)
+
+            frame = graph_ms(lambda: frame_part(incremental, codes, valid)[0])[1]
+            conv = graph_ms(conv_only)[1]
+            whole = graph_ms(lambda: tail_decode(incremental, codes, valid, tail))[1]
+            print(
+                f"{padded:>4} {rows:>4} {frame:>9.3f} {conv:>8.3f} {whole:>9.3f}",
+                flush=True,
+            )
+            torch.cuda.empty_cache()
+
+
 def run_capture(incremental, device):
     """The tail runner's graphs as the runner would hold them: one pool, largest key
     first, 3 warmups per key; seconds and memory for the whole set."""
@@ -592,7 +740,16 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
     parser.add_argument(
         "--mode",
-        choices=("field", "exact", "cost", "width", "numerics", "capture"),
+        choices=(
+            "field",
+            "exact",
+            "cost",
+            "width",
+            "numerics",
+            "capture",
+            "split",
+            "varlen",
+        ),
         required=True,
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -633,6 +790,8 @@ def main():
             "cost": lambda: run_cost(incremental, device),
             "width": lambda: run_width(incremental, device),
             "capture": lambda: run_capture(incremental, device),
+            "split": lambda: run_split(incremental, device),
+            "varlen": lambda: run_varlen(incremental, device),
         }[args.mode]()
 
 
