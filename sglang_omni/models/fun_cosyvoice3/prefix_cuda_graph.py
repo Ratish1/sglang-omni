@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 
 import torch
+from sglang.srt.utils.common import get_available_gpu_memory
 
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
@@ -26,14 +27,12 @@ from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGra
 
 logger = logging.getLogger(__name__)
 
-# note(ratish): kernels load and one-time setup is paid before a capture records.
+# note(ratish): kernel loads and one-time allocations happen here, not in the recorded run.
 CAPTURE_WARMUP_RUNS = 2
 
 
 @dataclass(kw_only=True)
 class CapturedPrefixSolve:
-    """One frame tier's graph and the buffers its replays fill and read."""
-
     layout: PrefixStepLayout
     graph: ReplayableGraph
     noise: torch.Tensor
@@ -48,9 +47,6 @@ class CapturedPrefixSolve:
 
 
 class PrefixCudaGraphRunner:
-    """The prefix solve captured once per frame tier; a step replays the
-    smallest tier that holds its new frames and runs eagerly above the largest."""
-
     def __init__(
         self,
         estimator: PackedDiT,
@@ -82,8 +78,7 @@ class PrefixCudaGraphRunner:
         self.euler_steps = euler_steps
         self.mel_channels = mel_channels
         self.speaker_channels = speaker_channels
-        # note(ratish): the decode capture ladder over a step's rows, doubling to 8, then 12,
-        # then every 8 up to the row cap; a tier holds that many rows of the longest hop.
+        # note(ratish): the decode batch size ladder, over a step's rows.
         row_ladder = sorted(
             {
                 rows
@@ -96,14 +91,14 @@ class PrefixCudaGraphRunner:
         chunk_size = estimator.chunk_size
         self.layouts: list[PrefixStepLayout] = []
         for frames in self.tier_frames:
-            # every row adds at least the shortest hop
+            # note(ratish): a row adds at least the shortest hop.
             row_slots = min(max_rows, frames // min_hop_frames)
             self.layouts.append(
                 PrefixStepLayout(
                     half_frames=frames,
                     row_slots=row_slots,
-                    # per CFG half: the frames' chunks, one partial chunk per row and
-                    # one for the padding frames
+                    # note(ratish): per CFG half, the frames' chunks, a partial chunk
+                    # per row and one padding segment.
                     segment_count=2 * (-(-frames // chunk_size) + row_slots + 1),
                     page_table_width=max_frames,
                 )
@@ -115,14 +110,14 @@ class PrefixCudaGraphRunner:
 
     @torch.inference_mode()
     def capture(self) -> None:
-        """Capture every tier, the largest first so the smaller ones reuse its pool memory."""
+        """Largest tier first, so the smaller ones reuse its pool memory."""
         started = time.perf_counter()
-        free_before, _ = self.device_module.mem_get_info(self.device)
+        before_mem = get_available_gpu_memory(self.device.type, self.device.index)
         graph_pool = self.backend.graph_pool_handle()
         stream = self.device_module.Stream(device=self.device)
-        hidden_size = int(self.estimator.dit.input_embed.proj.out_features)
-        # note(ratish): a collection inside a capture frees whatever a reference cycle holds,
-        # an onnxruntime session among them, and invalidates the graph.
+        hidden_size = self.estimator.dit.input_embed.proj.out_features
+        # note(ratish): a collection during capture can free what a reference cycle holds,
+        # an onnxruntime session among them, and invalidate the graph.
         gc.collect()
         gc.freeze()
         try:
@@ -224,11 +219,11 @@ class PrefixCudaGraphRunner:
             gc.unfreeze()
             gc.collect()
         self.captured.reverse()
-        free_after, _ = self.device_module.mem_get_info(self.device)
+        after_mem = get_available_gpu_memory(self.device.type, self.device.index)
         logger.info(
-            f"Fun-CosyVoice3 prefix solve graphs: tiers {self.tier_frames} frames "
-            f"in {time.perf_counter() - started:.1f} s, "
-            f"{(free_before - free_after) / 2**20:.0f} MiB"
+            f"Fun-CosyVoice3 prefix solve graphs captured: tiers={self.tier_frames} "
+            f"frames, elapsed={time.perf_counter() - started:.2f} s, "
+            f"mem usage={before_mem - after_mem:.2f} GB, avail mem={after_mem:.2f} GB."
         )
 
     @torch.inference_mode()
@@ -243,8 +238,8 @@ class PrefixCudaGraphRunner:
         new_frames: list[int],
         caches: list[tuple[PrefixCacheRow, PrefixCacheRow]],
     ) -> torch.Tensor | None:
-        """solve_flow_euler_prefix from the smallest tier holding the step's new
-        frames, or None above the largest tier."""
+        """The solve replayed from the smallest tier holding the step's new frames;
+        None above the largest tier."""
         frame_count = sum(new_frames)
         tier = bisect.bisect_left(self.tier_frames, frame_count)
         if tier == len(self.tier_frames):
@@ -261,8 +256,8 @@ class PrefixCudaGraphRunner:
         twin_caches = [pair[0] for pair in caches] + [pair[1] for pair in caches]
         twin_new_frames = list(new_frames) * 2
         chunk_size = self.estimator.chunk_size
-        # note(ratish): a replay reads a segment's pages up to its end only, so the
-        # captured table is filled no wider than this step's widest row.
+        # note(ratish): a segment reads pages only up to its end, a padding one at most a
+        # chunk, so columns past this width stay stale and unread.
         page_table_width = max(
             chunk_size,
             *(

@@ -289,12 +289,10 @@ def test_grow_rows_takes_nothing_on_a_shortfall() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("compile_prefix", [False, True], ids=["eager", "compiled"])
 def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> None:
-    """Replays from the smallest tier holding a step, its padding frames and
-    unused row slots included, give the eager solve's mel, committed frames,
-    conv contexts and K/V pages, also as rows reorder and join; a step above
-    the largest tier is left to the eager solve."""
+    """Replays with padding frames and unused row slots equal the eager solve;
+    a step above the largest tier is left to it."""
     estimator = make_estimator()
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     dtype = torch.bfloat16
     pools = [
         PrefixKVPool(

@@ -2732,8 +2732,8 @@ def create_vocoder_executor(
             longest_hop_tokens = token_hop_len
         else:
             longest_hop_tokens = token_max_hop_len
-        # note(ratish): a graph replays the dtypes it captured, and a hop's frames keep
-        # the token embedding's dtype under autocast while its speaker embedding does not.
+        # note(ratish): a graph replays its captured dtypes; under autocast a hop's frames
+        # keep the token embedding's dtype and its speaker embedding does not.
         with (
             torch.inference_mode(),
             torch.autocast(device_type=device_obj.type, dtype=autocast_dtype),

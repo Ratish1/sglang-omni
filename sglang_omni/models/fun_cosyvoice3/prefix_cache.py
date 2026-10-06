@@ -33,8 +33,8 @@ BLOCK_FRAMES = 64
 # Note (Jiaxin Deng): each positional conv has kernel 31, so it reads the 30
 # frames before its input frame.
 CONV_CONTEXT_FRAMES = 30
-# note(ratish): one KV split, the split FA3 picks for these segments when the page table
-# is as wide as the rows; fixed, a graph's table at the frame ceiling cannot change it.
+# note(ratish): FA3's pick for these segments with a tight page table; pinned, since a
+# graph's wider table would change the pick and the result.
 PREFIX_FA3_SPLITS = 1
 
 
@@ -59,8 +59,7 @@ class PrefixForward(Protocol):
 class PrefixKVPool:
     """K and V for every (Euler step, layer) in blocks of BLOCK_FRAMES pages;
     keys[euler_step][layer] is a (pages, 1, head_num, head_dim) tensor of its
-    own. One block past the capacity is never handed out: padding frames of a
-    graph replay write and read it."""
+    own."""
 
     def __init__(
         self,
@@ -74,6 +73,7 @@ class PrefixKVPool:
         dtype: torch.dtype,
     ) -> None:
         block_count = max(int(capacity_frames) // BLOCK_FRAMES, 0)
+        # note(ratish): never handed out; padding frames of a step write and read it.
         self.padding_block = block_count
         shape = ((block_count + 1) * BLOCK_FRAMES, FA3_PAGE_SIZE, head_num, head_dim)
         # Note (Jiaxin Deng): separate storages, not views of one slab: the
@@ -176,8 +176,7 @@ def release_rows(pool: PrefixKVPool, rows: list[PrefixCacheRow]) -> None:
 
 @dataclass(frozen=True, kw_only=True)
 class PrefixStepLayout:
-    """Frames and row slots per CFG half, query segments and page table width a
-    prefix step is laid out to; frames past the step's own are padding."""
+    """Frames and row slots are per CFG half; frames past a step's own are padding."""
 
     half_frames: int
     row_slots: int
@@ -188,9 +187,8 @@ class PrefixStepLayout:
 class PrefixRowAttention:
     """Queries are each row's new frames in chunk segments; keys are the row's
     cached prefix plus its new frames, all addressed through pool pages. The
-    positional convs read one packed sequence: the unused row slots' contexts,
-    then per CFG half each row's context and new frames and the half's padding
-    frames. Padding frames key themselves on the pool's padding block."""
+    convs read one packed sequence: unused slots' contexts, then per CFG half
+    each row's context and new frames, then the half's padding frames."""
 
     def __init__(
         self,
@@ -409,7 +407,7 @@ def conv_pos_embed_prefix(
     """The two causal positional convs over each row's new frames, each fed
     the last CONV_CONTEXT_FRAMES of its own input from the prefix (zeros for
     an empty prefix, the padding the whole-sequence call uses); each context
-    is (row slots, CONV_CONTEXT_FRAMES, hidden_size). Returns the new frames'
+    is (twin row slots, CONV_CONTEXT_FRAMES, hidden_size). Returns the new frames'
     embedding and the two next contexts."""
     # Note (Jiaxin Deng): the whole-sequence call zero-pads conv2's input,
     # not conv1's output, so the second conv needs its own cached tail.
@@ -533,10 +531,8 @@ def run_prefix_solve(
     *,
     cfg_rate: float,
 ) -> torch.Tensor:
-    """Euler steps over a laid out prefix step with classifier free guidance,
-    eager or under graph capture. noise, mu, mel_conditioning: (1, half frames,
-    channels); speaker_embeddings: (row slots, channels); angles: RoPE angles by
-    position; context, next_context: (euler_steps, twin row slots, 2,
+    """noise, mu, mel_conditioning: (1, half frames, channels); speaker_embeddings:
+    (row slots, channels); context, next_context: (euler_steps, twin row slots, 2,
     CONV_CONTEXT_FRAMES, hidden_size)."""
     half_frames = noise.shape[1]
     mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=1)
