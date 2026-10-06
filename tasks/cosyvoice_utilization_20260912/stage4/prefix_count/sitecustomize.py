@@ -79,6 +79,34 @@ def patch(module):
     scheduler.hop_batch_with_prefix = counted
 
 
+def patch_prefix_graph() -> None:
+    """One stderr line per prefix graph call (#2516 and its rework): hit or miss, the
+    step's rows and new frames."""
+    module = sys.modules.get("sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph")
+    if module is None:
+        return
+    for name in ("PrefixCudaGraphCache", "PrefixCudaGraphRunner"):
+        cls = getattr(module, name, None)
+        if cls is None:
+            continue
+        run = cls.run
+
+        def counted_run(self, *args, _run=run, **kwargs):
+            started = time.perf_counter()
+            generated = _run(self, *args, **kwargs)
+            new_frames = kwargs["new_frames"]
+            print(
+                f"graph.call t={time.time():.3f} hit={int(generated is not None)} "
+                f"rows={len(new_frames)} frames={sum(new_frames)} "
+                f"host_ms={(time.perf_counter() - started) * 1e3:.1f}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return generated
+
+        cls.run = counted_run
+
+
 class PatchOnImport(importlib.abc.MetaPathFinder):
     seen = False
 
@@ -92,6 +120,7 @@ class PatchOnImport(importlib.abc.MetaPathFinder):
         def exec_and_patch(module):
             exec_module(module)
             patch(module)
+            patch_prefix_graph()
 
         spec.loader.exec_module = exec_and_patch
         return spec
