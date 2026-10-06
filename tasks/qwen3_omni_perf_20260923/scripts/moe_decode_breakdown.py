@@ -60,12 +60,7 @@ def main() -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29655")
     init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
-    initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        expert_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        backend="gloo",
-    )
+    initialize_model_parallel(backend="gloo")
     device = torch.device("cuda")
     print(torch.cuda.get_device_name())
     flush = torch.empty(64 * 1024 * 1024, dtype=torch.int32, device=device)
