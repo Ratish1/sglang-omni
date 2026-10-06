@@ -52,12 +52,10 @@ class PrefixCudaGraphRunner:
         pool: PrefixKVPool,
         *,
         backend: DeviceGraphBackend,
-        device: torch.device,
         autocast_dtype: torch.dtype,
         frame_dtype: torch.dtype,
         speaker_dtype: torch.dtype,
         cfg_rate: float,
-        euler_steps: int,
         mel_channels: int,
         speaker_channels: int,
         max_rows: int,
@@ -68,13 +66,13 @@ class PrefixCudaGraphRunner:
         self.estimator = estimator
         self.pool = pool
         self.backend = backend
-        self.device = device
-        self.device_module = torch.get_device_module(device)
+        self.device = pool.device
+        self.device_module = torch.get_device_module(pool.device)
         self.autocast_dtype = autocast_dtype
         self.frame_dtype = frame_dtype
         self.speaker_dtype = speaker_dtype
         self.cfg_rate = cfg_rate
-        self.euler_steps = euler_steps
+        self.euler_steps = len(pool.keys)
         self.mel_channels = mel_channels
         self.speaker_channels = speaker_channels
         row_ladder = sorted(
