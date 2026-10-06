@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 # note (ratish, chenyang): a row's chunks share a key prefix, so FA3 pages are one frame.
 FA3_PAGE_SIZE = 1
 FA3_DTYPES = (torch.float16, torch.bfloat16)
-FA3_AUTO_SPLITS = 0
 # note(ratish): the first call benchmark runs at a warmup shape, not a serving one,
 # so its pick can change between boots; the heuristic config is the same on every boot.
 DIT_INDUCTOR_OPTIONS: dict[str, bool] = {"triton.autotune_pointwise": False}
@@ -38,7 +37,7 @@ def ragged_fa3(
     page_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
-    num_splits: int,
+    num_splits: int = 0,
 ) -> torch.Tensor:
     return flash_attn_with_kvcache(
         q=q,
@@ -69,7 +68,7 @@ def fake_packed_fa3(
     page_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
-    num_splits: int,
+    num_splits: int = 0,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -240,7 +239,6 @@ class RaggedRowAttention:
             self.page_table,
             self.cu_seqlens_q,
             self.max_seqlen_q,
-            FA3_AUTO_SPLITS,
         )
         return out.reshape(1, -1, self.heads * self.head_dim)
 
