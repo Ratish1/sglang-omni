@@ -25,10 +25,7 @@ from sglang_omni.models.fun_asr.tool_funcs.audio_lengths import (
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.proto.request import StagePayload
-from sglang_omni.sampling.compiled_calls import (
-    CompiledSamplerCall,
-    scaling_penalty_calls,
-)
+from sglang_omni.sampling.sampler_compile import SamplerCompileForms
 from sglang_omni.scheduling.engine_factory import (
     AsrEngineBuilder,
     GenerationDefaults,
@@ -57,11 +54,12 @@ logger = logging.getLogger(__name__)
 class FunASRModelRunner(ModelRunner[request_builders.FunASRRequestData]):
     """The base runner, with the scaling penalty realtime sessions apply by default."""
 
-    def compiled_sampler_calls(self) -> tuple[CompiledSamplerCall, ...]:
-        return scaling_penalty_calls(
+    def sampler_compile_forms(self) -> SamplerCompileForms:
+        # note (ratish): SGLang's logits processor returns float32 logits.
+        return SamplerCompileForms(
             device=self.device,
-            logits_dtype=torch.float32,
             vocab_size=int(self.tp_worker.model_runner.model_config.vocab_size),
+            penalized_logits_dtype=torch.float32,
         )
 
 
