@@ -488,6 +488,11 @@ def stage_process_main(
     startup_error_channel: Queue[str] | None = None,
 ) -> None:
     """Subprocess entrypoint: construct stage(s) from *spec* and run them."""
+    from sglang.srt.utils import kill_itself_when_parent_died
+
+    # note (Richard Wang): exit with the parent, so a killed server does not
+    # leave its stage workers holding the GPUs.
+    kill_itself_when_parent_died()
     # note (Dayuxiaoshui): a spawned process starts with fresh logging, and
     # importing sglang already installs a root handler at INFO, which turns
     # basicConfig into a no-op. Set the level explicitly so the stage follows
