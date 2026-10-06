@@ -7,6 +7,7 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import torch
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.server_args import ServerArgs
 from transformers import AutoFeatureExtractor, AutoTokenizer, PreTrainedTokenizerBase
@@ -24,6 +25,10 @@ from sglang_omni.models.fun_asr.tool_funcs.audio_lengths import (
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.proto.request import StagePayload
+from sglang_omni.sampling.compiled_calls import (
+    CompiledSamplerCall,
+    scaling_penalty_calls,
+)
 from sglang_omni.scheduling.engine_factory import (
     AsrEngineBuilder,
     GenerationDefaults,
@@ -47,6 +52,17 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+class FunASRModelRunner(ModelRunner[request_builders.FunASRRequestData]):
+    """The base runner, with the scaling penalty realtime sessions apply by default."""
+
+    def compiled_sampler_calls(self) -> tuple[CompiledSamplerCall, ...]:
+        return scaling_penalty_calls(
+            device=self.device,
+            logits_dtype=torch.float32,
+            vocab_size=int(self.tp_worker.model_runner.model_config.vocab_size),
+        )
 
 
 class FunASREngineBuilder(AsrEngineBuilder[request_builders.FunASRRequestData]):
@@ -198,7 +214,7 @@ class FunASREngineBuilder(AsrEngineBuilder[request_builders.FunASRRequestData]):
             return self.torch_mps_model_runner
         else:
             pass
-        return super().make_model_runner(model_worker, output_proc)
+        return FunASRModelRunner(model_worker, output_proc)
 
     def setup_model(
         self,
