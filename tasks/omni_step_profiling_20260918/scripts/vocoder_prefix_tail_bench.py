@@ -522,6 +522,150 @@ def run_varlen(incremental, device):
             torch.cuda.empty_cache()
 
 
+class VarlenMetadata:
+    """Live attention metadata read by the eager break at every replay."""
+
+    def __init__(self, cu, max_len, scale, window):
+        self.cu, self.max_len, self.scale, self.window = cu, max_len, scale, window
+
+
+def bcg_attention(query, key, value, meta):
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+    return flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        meta.cu,
+        meta.cu,
+        max_seqlen_q=meta.max_len,
+        max_seqlen_k=meta.max_len,
+        softmax_scale=meta.scale,
+        causal=True,
+        window_size=(meta.window - 1, 0),
+    )
+
+
+def frame_part_bcg(incremental, codes, metadata, live, attention):
+    """frame_part_varlen packed, with the attention as a BCG break."""
+    decoder = incremental.decoder
+    transformer = decoder.pre_transformer
+    batch, width = int(codes.shape[0]), int(codes.shape[-1])
+    hidden = decoder.quantizer.decode(codes).transpose(1, 2)
+    history = torch.zeros(
+        batch,
+        int(decoder.pre_conv.padding),
+        hidden.shape[2],
+        device=codes.device,
+        dtype=hidden.dtype,
+    )
+    out = codec.channels_last_conv1d(
+        torch.cat((history, hidden), dim=1),
+        decoder.pre_conv.conv,
+        incremental.channels_last_weights["pre_conv"],
+        width,
+    )
+    token_index, positions, _, _ = metadata
+    hidden = transformer.input_proj(out).reshape(batch * width, -1)
+    hidden = hidden.index_select(0, token_index)
+    tokens = int(hidden.shape[0])
+    cos, sin = transformer.rotary_emb(hidden.unsqueeze(0), positions.unsqueeze(0))
+    for layer in transformer.layers:
+        attn = layer.self_attn
+        head_dim = int(attn.head_dim)
+        residual = hidden
+        normalized = layer.input_layernorm(hidden)
+        query = attn.q_proj(normalized).view(1, tokens, -1, head_dim).transpose(1, 2)
+        key = attn.k_proj(normalized).view(1, tokens, -1, head_dim).transpose(1, 2)
+        value = attn.v_proj(normalized).view(tokens, -1, head_dim)
+        query, key = codec.apply_rotary_pos_emb(query, key, cos, sin)
+        attended = attention(
+            query[0].transpose(0, 1).contiguous(),
+            key[0].transpose(0, 1).contiguous(),
+            value,
+            live,
+        )
+        attended = attn.o_proj(attended.reshape(tokens, -1))
+        hidden = residual + layer.self_attn_layer_scale(attended)
+        residual = hidden
+        hidden = residual + layer.mlp_layer_scale(
+            layer.mlp(layer.post_attention_layernorm(hidden))
+        )
+    return transformer.output_proj(transformer.norm(hidden))
+
+
+def timed_replay(replay, reps=30):
+    """Median device span (events) and host wall per replay, ms."""
+    spans, walls = [], []
+    for _ in range(reps):
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        began = time.perf_counter()
+        start.record()
+        replay()
+        end.record()
+        launched = time.perf_counter()
+        end.synchronize()
+        spans.append(start.elapsed_time(end))
+        walls.append(1000 * (launched - began))
+    return statistics.median(spans), statistics.median(walls)
+
+
+def run_bcg(incremental, device):
+    """Frame part, rows packed: a full graph with static FA3 metadata against a breakable
+    graph whose 8 attention calls run eagerly between segments (SGLang's BCG), and
+    today's full graph with the manual attention. Device span and host launch ms."""
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        BreakableCUDAGraph,
+        BreakableCUDAGraphCapture,
+        eager_on_graph,
+    )
+
+    window = int(incremental.decoder.pre_transformer.window_size)
+    scale = float(incremental.decoder.pre_transformer.layers[0].self_attn.scaling)
+    broken = eager_on_graph(True)(bcg_attention)
+    print(
+        f"{'W':>4} {'rows':>4} {'today span/host':>16} {'full fa span/host':>18} {'bcg span/host':>16}"
+    )
+    for padded in (64, 128):
+        for rows in (1, 4, 8):
+            lengths = [
+                padded - (padded // 2) * i // max(rows - 1, 1) for i in range(rows)
+            ]
+            codes = torch.randint(0, 2048, (rows, 16, padded), device=device)
+            valid = torch.tensor(lengths, device=device)
+            meta = varlen_metadata(lengths, padded, True, device)
+            live = VarlenMetadata(meta[2], meta[3], scale, window)
+            cells = []
+            for fn in (
+                lambda: frame_part(incremental, codes, valid)[0],
+                lambda: frame_part_varlen(incremental, codes, meta),
+            ):
+                graph, _ = graph_ms(fn)
+                cells.append(timed_replay(graph.replay))
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    frame_part_bcg(incremental, codes, meta, live, bcg_attention)
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            graph = BreakableCUDAGraph()
+            with BreakableCUDAGraphCapture(
+                graph, pool=torch.cuda.graph_pool_handle(), stream=stream
+            ):
+                frame_part_bcg(incremental, codes, meta, live, broken)
+            torch.cuda.synchronize()
+            cells.append(timed_replay(graph.replay))
+            print(
+                f"{padded:>4} {rows:>4} "
+                + " ".join(f"{s:>8.3f}/{w:<7.3f}" for s, w in cells),
+                flush=True,
+            )
+            torch.cuda.empty_cache()
+
+
 def run_split(incremental, device):
     """Captured ms of the frame part at W against the conv stack at the tail, and the
     attention's share of the frame part (graph of the frame part with attention removed).
@@ -749,6 +893,7 @@ def main():
             "capture",
             "split",
             "varlen",
+            "bcg",
         ),
         required=True,
     )
@@ -792,6 +937,7 @@ def main():
             "capture": lambda: run_capture(incremental, device),
             "split": lambda: run_split(incremental, device),
             "varlen": lambda: run_varlen(incremental, device),
+            "bcg": lambda: run_bcg(incremental, device),
         }[args.mode]()
 
 
