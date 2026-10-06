@@ -59,6 +59,7 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
     release_rows,
     solve_flow_euler_prefix,
 )
+from sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph import PrefixCudaGraphRunner
 from sglang_omni.models.fun_cosyvoice3.request_builders import (
     CosyVoice3SGLangRequestData,
     cleanup_prepared_cosyvoice3_request,
@@ -870,6 +871,7 @@ class FunCosyVoice3Flow:
         # estimator, whose fixed (2, 80, T) profile keeps the padded layout.
         self.packed_estimator = packed_estimator
         self.prefix_pool: PrefixKVPool | None = None
+        self.prefix_cuda_graph_runner: PrefixCudaGraphRunner | None = None
 
     def __getattr__(self, name: str) -> object:
         return getattr(self.flow, name)
@@ -978,18 +980,36 @@ class FunCosyVoice3Flow:
             flat = padded.transpose(1, 2).reshape(-1, padded.shape[1])
             return flat[new_frame_index].unsqueeze(0)
 
-        generated = solve_flow_euler_prefix(
-            self.packed_estimator,
-            self.prefix_pool,
-            take_new_frames(conditioning.noisy_mel),
-            conditioning.time_span,
-            take_new_frames(token_condition),
-            conditioning.speaker_embedding,
-            take_new_frames(conditioning.prompt_mel),
-            new_frames,
-            list(caches),
-            cfg_rate=self.flow.decoder.inference_cfg_rate,
-        )
+        noise = take_new_frames(conditioning.noisy_mel)
+        mu = take_new_frames(token_condition)
+        mel_conditioning = take_new_frames(conditioning.prompt_mel)
+        if self.prefix_cuda_graph_runner is None:
+            generated = None
+        else:
+            generated = self.prefix_cuda_graph_runner.run(
+                noise=noise,
+                time_span=conditioning.time_span,
+                mu=mu,
+                speaker_embeddings=conditioning.speaker_embedding,
+                mel_conditioning=mel_conditioning,
+                new_frames=new_frames,
+                caches=list(caches),
+            )
+        if generated is None:
+            generated = solve_flow_euler_prefix(
+                self.packed_estimator,
+                self.prefix_pool,
+                noise,
+                conditioning.time_span,
+                mu,
+                conditioning.speaker_embedding,
+                mel_conditioning,
+                new_frames,
+                list(caches),
+                cfg_rate=self.flow.decoder.inference_cfg_rate,
+            )
+        else:
+            pass
         padded = generated.new_zeros(
             len(inputs), token_condition.shape[2], generated.shape[2]
         )
@@ -2550,6 +2570,7 @@ def create_vocoder_executor(
     flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = True,
     enable_flow_cuda_graph: bool = True,
+    enable_flow_prefix_cuda_graph: bool = True,
     flow_cuda_graph_capture_shapes: tuple[tuple[int, int], ...] | None = None,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",
@@ -2704,6 +2725,34 @@ def create_vocoder_executor(
     )
     if enable_dit_torch_compile:
         scheduler.warmup_packed_dit_compile()
+    else:
+        pass
+    if enable_flow_prefix_cuda_graph and flow.prefix_pool is not None:
+        graph_backend = current_platform.get_device_graph_backend(device_obj)
+        assert graph_backend is not None and flow.packed_estimator is not None
+        assert autocast_dtype is not None
+        token_mel_ratio = int(flow.token_mel_ratio)
+        if disable_hop_growth:
+            longest_hop_tokens = token_hop_len
+        else:
+            longest_hop_tokens = token_max_hop_len
+        prefix_cuda_graph_runner = PrefixCudaGraphRunner(
+            flow.packed_estimator,
+            flow.prefix_pool,
+            backend=graph_backend,
+            device=device_obj,
+            dtype=autocast_dtype,
+            cfg_rate=float(flow.decoder.inference_cfg_rate),
+            euler_steps=FLOW_EULER_STEPS,
+            mel_channels=int(flow.output_size),
+            speaker_channels=int(flow.spk_embed_affine_layer.out_features),
+            max_rows=max_batch_size,
+            hop_frames=longest_hop_tokens * token_mel_ratio,
+            min_hop_frames=token_hop_len * token_mel_ratio,
+            max_frames=int(flow.decoder.rand_noise.shape[2]),
+        )
+        prefix_cuda_graph_runner.capture()
+        flow.prefix_cuda_graph_runner = prefix_cuda_graph_runner
     else:
         pass
     scheduler.warmup_now()
