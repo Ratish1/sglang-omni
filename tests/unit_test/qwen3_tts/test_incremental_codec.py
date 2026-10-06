@@ -637,14 +637,18 @@ def test_arena_cohort_matches_per_stream_decodes() -> None:
 
 def test_tail_frames_bounds_what_the_kept_samples_and_state_read() -> None:
     """A change one frame before the tail leaves the kept samples and the conv-stack
-    state bit for bit; a change to the tail's first frame reaches the kept samples."""
+    state bit for bit; a change to the tail's first frame reaches the kept samples.
+
+    In float64: the first tail frame reaches them through the earliest tap of every
+    conv, an effect below float32 resolution.
+    """
     torch.manual_seed(41)
-    decoder = Decoder()
+    decoder = Decoder().double()
     incremental = Qwen3TTSIncrementalDecoder(decoder)
     emit_frames = 1
     tail_frames = incremental.tail_frames(emit_frames)
     frames = tail_frames + 4
-    hidden_states = torch.randn(1, 2, frames) * 0.1
+    hidden_states = torch.randn(1, 2, frames, dtype=torch.float64) * 0.1
 
     def run_conv_stack(
         changed_frame: int | None,
@@ -655,7 +659,7 @@ def test_tail_frames_bounds_what_the_kept_samples_and_state_read() -> None:
         else:
             pass
         state = incremental.init_state(
-            1, device=torch.device("cpu"), dtype=torch.float32
+            1, device=torch.device("cpu"), dtype=torch.float64
         )
         waveform = incremental.conv_stack_tensors(inputs, state)
         return waveform[..., -emit_frames * decoder.total_upsample :], state

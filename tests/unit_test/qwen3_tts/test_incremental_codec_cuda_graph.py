@@ -190,6 +190,7 @@ def make_entry(bucket: int, graph=None) -> SimpleNamespace:
         static_codes=torch.full((bucket, 2, 8), -1, dtype=torch.long),
         static_index=torch.full((bucket,), -1, dtype=torch.long),
         waveform=torch.arange(bucket * 32, dtype=torch.float32).view(bucket, 1, 32),
+        static_valid_frames=None,
     )
 
 
@@ -463,7 +464,7 @@ def test_incremental_codec_warmup_traces_a_compiled_shape_on_its_own_tensors() -
         keepalives=[static_codes],
     )
 
-    runner((4,)).warmup_capture_shape(key, static_codes, resources)
+    runner((4,)).warmup_capture_shape(key, static_codes, None, resources)
 
     assert len(traces) == 1
     codes, state, inference, grad = traces[0]
@@ -477,7 +478,7 @@ def test_incremental_codec_warmup_traces_a_compiled_shape_on_its_own_tensors() -
 
     traces.clear()
     decodes.clear()
-    runner(()).warmup_capture_shape(key, static_codes, resources)
+    runner(()).warmup_capture_shape(key, static_codes, None, resources)
 
     assert traces == []
     assert [entry[2] for entry in decodes] == [False, False, False]
