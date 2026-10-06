@@ -60,7 +60,12 @@ VIDEO_ARGS = dict(video_fps=2, video_max_frames=128, video_max_pixels=401408)
 
 
 def mmsu_args(
-    port: int, out: str, concurrency: int, talker: bool, max_samples: int | None
+    port: int,
+    out: str,
+    concurrency: int,
+    talker: bool,
+    max_samples: int | None,
+    request_rate: float = float("inf"),
 ) -> argparse.Namespace:
     from tests.test_model.test_qwen3_omni_mmsu_talker_ci import MMSU_TTS_PROMPT
 
@@ -79,7 +84,7 @@ def mmsu_args(
         temperature=0.0,
         warmup=1,
         max_concurrency=concurrency,
-        request_rate=float("inf"),
+        request_rate=request_rate,
         save_audio=talker,
         disable_tqdm=True,
         seed=None,
@@ -257,7 +262,8 @@ async def generate(
         from benchmarks.eval.benchmark_omni_mmsu import run as run_mmsu
 
         return await run_mmsu(
-            mmsu_args(port, out, concurrency, talker, max_samples), compute_wer=False
+            mmsu_args(port, out, concurrency, talker, max_samples, request_rate),
+            compute_wer=False,
         )
     from benchmarks.eval.benchmark_omni_videomme import VideoEvalConfig, run_video_eval
 
