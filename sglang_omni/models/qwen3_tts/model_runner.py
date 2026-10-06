@@ -15,10 +15,9 @@ from sglang_omni.model_runner.prefill_inputs import (
     attach_omni_prefill_inputs,
 )
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
-from sglang_omni.sampling.compiled_calls import (
-    CompiledSamplerCall,
-    scaling_penalty_calls,
-    seeded_sampling_call,
+from sglang_omni.sampling.sampler_compile import (
+    SAMPLER_LOG_PROBABILITY_DTYPE,
+    SamplerCompileForms,
 )
 from sglang_omni.scheduling.types import (
     RequestOutput,
@@ -158,23 +157,14 @@ class Qwen3TTSModelRunner(ModelRunner):
     ) -> None:
         self.collect_codes(result, forward_batch, schedule_batch, requests)
 
-    def compiled_sampler_calls(self) -> tuple[CompiledSamplerCall, ...]:
-        # note (ratish): every request is seeded and penalized by default; top-k sampling
-        # hands the sampler float64 log-probabilities and this runner's seed buffer rows.
-        vocab_size = int(self.model.config.vocab_size)
-        return (
-            seeded_sampling_call(
-                device=self.device,
-                log_probability_dtype=torch.float64,
-                vocab_size=vocab_size,
-                seed_buffer=self.model.semantic_sampling_seed_tensor,
-                grad_enabled=True,
-            ),
-            *scaling_penalty_calls(
-                device=self.device,
-                logits_dtype=self.tp_worker.model_runner.dtype,
-                vocab_size=vocab_size,
-            ),
+    def sampler_compile_forms(self) -> SamplerCompileForms:
+        # note (ratish): every request is seeded and carries a repetition penalty by
+        # default; the codec head's logits come in the activation dtype.
+        return SamplerCompileForms(
+            device=self.device,
+            vocab_size=int(self.model.config.vocab_size),
+            seeded_log_probability_dtype=SAMPLER_LOG_PROBABILITY_DTYPE,
+            penalized_logits_dtype=self.tp_worker.model_runner.dtype,
         )
 
     def sample_before_post_prefill(

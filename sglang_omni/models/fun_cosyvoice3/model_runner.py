@@ -32,10 +32,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     prompt_token_len,
 )
 from sglang_omni.platforms import current_platform
-from sglang_omni.sampling.compiled_calls import (
-    CompiledSamplerCall,
-    scaling_penalty_calls,
-)
+from sglang_omni.sampling.sampler_compile import SamplerCompileForms
 from sglang_omni.sampling.seed import SAMPLING_SEED_MASK
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
@@ -112,13 +109,13 @@ class FunCosyVoice3ModelRunner(ModelRunner):
     ) -> None:
         self.collect_tokens(result, forward_batch, schedule_batch, requests)
 
-    def compiled_sampler_calls(self) -> tuple[CompiledSamplerCall, ...]:
+    def sampler_compile_forms(self) -> SamplerCompileForms:
         # note (ratish): every request carries the 1.21 repetition penalty by default;
         # a seed comes only from the client.
-        return scaling_penalty_calls(
+        return SamplerCompileForms(
             device=self.device,
-            logits_dtype=self.tp_worker.model_runner.dtype,
             vocab_size=int(self.model.llm_decoder.out_features),
+            penalized_logits_dtype=self.tp_worker.model_runner.dtype,
         )
 
     def sample_before_post_prefill(

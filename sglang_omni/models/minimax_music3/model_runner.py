@@ -14,10 +14,7 @@ import torch
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
-from sglang_omni.sampling.compiled_calls import (
-    CompiledSamplerCall,
-    seeded_sampling_call,
-)
+from sglang_omni.sampling.sampler_compile import SamplerCompileForms
 from sglang_omni.sampling.seed import derive_sampling_seed
 from sglang_omni.scheduling.types import SchedulerRequest
 
@@ -131,17 +128,13 @@ class MiniMaxMusic3ModelRunner(ModelRunner["MiniMaxMusic3SGLangRequestData"]):
         else:
             pass
 
-    def compiled_sampler_calls(self) -> tuple[CompiledSamplerCall, ...]:
+    def sampler_compile_forms(self) -> SamplerCompileForms:
         # note (ratish): c0 samples eagerly every step, always seeded, on float32
         # values over the c0 ids; the depth codebooks sample inside their graphs.
-        return (
-            seeded_sampling_call(
-                device=self.device,
-                log_probability_dtype=torch.float32,
-                vocab_size=int(self.model.c0_logit_ids.numel()),
-                seed_buffer=None,
-                grad_enabled=True,
-            ),
+        return SamplerCompileForms(
+            device=self.device,
+            vocab_size=int(self.model.c0_logit_ids.numel()),
+            seeded_log_probability_dtype=torch.float32,
         )
 
     def requested_capture_hidden_mode_prefill(

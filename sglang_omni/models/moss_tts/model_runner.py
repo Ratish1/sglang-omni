@@ -24,10 +24,7 @@ from sglang_omni.models.moss_tts.sampler import DelayGraphBatch
 from sglang_omni.models.moss_tts.sampling_kernels import (
     multinomial_with_seed_and_token_ids,
 )
-from sglang_omni.sampling.compiled_calls import (
-    CompiledSamplerCall,
-    seeded_sampling_call,
-)
+from sglang_omni.sampling.sampler_compile import SamplerCompileForms
 from sglang_omni.scheduling.types import (
     RequestOutput,
     SchedulerOutput,
@@ -287,17 +284,13 @@ class MossTTSModelRunner(ModelRunner):
         available = getattr(self.model, "sampling_graph_available", None)
         return bool(callable(available) and available(batch_size))
 
-    def compiled_sampler_calls(self) -> tuple[CompiledSamplerCall, ...]:
+    def sampler_compile_forms(self) -> SamplerCompileForms:
         # note (ratish): every request is seeded and every text step samples eagerly
         # in sample_rows, on float32 scores.
-        return (
-            seeded_sampling_call(
-                device=self.device,
-                log_probability_dtype=torch.float32,
-                vocab_size=int(self.tp_worker.model_runner.model_config.vocab_size),
-                seed_buffer=None,
-                grad_enabled=True,
-            ),
+        return SamplerCompileForms(
+            device=self.device,
+            vocab_size=int(self.tp_worker.model_runner.model_config.vocab_size),
+            seeded_log_probability_dtype=torch.float32,
         )
 
     def sample_rows_graphed(

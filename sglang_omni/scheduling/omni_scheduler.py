@@ -81,7 +81,7 @@ from sglang_omni.proto.admin import (
 )
 from sglang_omni.proto.request import StagePayload
 from sglang_omni.proto.session import find_session_operation
-from sglang_omni.sampling.compiled_calls import warm_compiled_sampler_calls
+from sglang_omni.sampling.sampler_compile import compile_sampler_functions
 from sglang_omni.scheduling.message import (
     IncomingMessage,
     OutgoingMessage,
@@ -711,7 +711,7 @@ class OmniScheduler(Generic[RequestDataT]):
         # but make the custom ModelRunner the sole owner of relay.
         self.model_runner = model_runner
         self.execution_bridge = bridge
-        warm_compiled_sampler_calls(model_runner.compiled_sampler_calls())
+        compile_sampler_functions(model_runner.sampler_compile_forms())
 
     def init_upstream_compat_flags(self, server_args: ServerArgs) -> None:
         self.enable_hisparse = bool(server_args.enable_hisparse)

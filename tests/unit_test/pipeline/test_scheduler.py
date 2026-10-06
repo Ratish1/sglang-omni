@@ -2866,7 +2866,7 @@ def test_omni_scheduler_binds_one_execution_bridge_to_any_runner(
     )
     model_runner = SimpleNamespace(
         bind_execution_bridge=lambda bridge: observed.append(bridge),
-        compiled_sampler_calls=lambda: (),
+        sampler_compile_forms=lambda: None,
     )
     tp_worker = SimpleNamespace(
         gpu_id=0,
