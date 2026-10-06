@@ -349,12 +349,13 @@ class FakeFlow(torch.nn.Module):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(1))
         self.calls = []
+        self.token_mel_ratio = 2
         self.decoder = SimpleNamespace(estimator=FakeEstimator())
 
     def inference(self, **kwargs):
         self.calls.append(kwargs)
         token_count = kwargs["token"].shape[1]
-        return torch.ones(1, 80, token_count * 2), None
+        return torch.ones(1, 80, token_count * self.token_mel_ratio), None
 
 
 def make_payload(state: FunCosyVoice3State) -> StagePayload:
@@ -1562,7 +1563,7 @@ def prefix_pool_scheduler(
         return [torch.full((1, 1, 1), -1.0) for _ in items]
 
     vocoder = SimpleNamespace(
-        flow=SimpleNamespace(prefix_pool=object()),
+        flow=SimpleNamespace(prefix_pool=object(), token_mel_ratio=2),
         prefix_cache_rows=prefix_cache_rows,
         grow_prefix_cache=grow_prefix_cache,
         release_prefix_cache=released.append,
