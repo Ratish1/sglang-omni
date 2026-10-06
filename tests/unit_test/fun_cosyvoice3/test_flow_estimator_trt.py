@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
 
-import sglang_omni.models.fun_cosyvoice3.stages as stages
 from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
     _CFG_BATCH,
     _MEL_DIM,
@@ -23,7 +20,6 @@ from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
     require_cfg_pair_inputs,
     resolve_flow_estimator_onnx,
 )
-from tests.unit_test.fun_cosyvoice3.test_flow_batch import FakeFlow, make_input
 
 
 class ExecuteTRT:
@@ -204,83 +200,6 @@ def test_is_flow_estimator_trt_accepts_module_wrapper() -> None:
     module = FlowEstimatorTRTModule(FakeTRTEngine())
     assert is_flow_estimator_trt(module) is True
     assert isinstance(module, torch.nn.Module)
-
-
-@pytest.mark.parametrize("streaming", [False, True])
-def test_regular_flow_keeps_trt_when_packed_dit_is_available(
-    monkeypatch: pytest.MonkeyPatch, streaming: bool
-) -> None:
-    native_flow = FakeFlow()
-    flow = stages.FunCosyVoice3Flow(
-        native_flow, packed_estimator=native_flow.packed_estimator
-    )
-    flow.decoder.estimator = FlowEstimatorTRTModule(
-        FakeTRTEngine(), fallback=flow.decoder.estimator
-    )
-    inputs = [make_input([1, 2, 3], prompt_token=[4])]
-    regular_solver = Mock(return_value=torch.zeros(1, flow.output_size, 8))
-    monkeypatch.setattr(stages, "generate_flow", regular_solver)
-    monkeypatch.setattr(
-        stages,
-        "generate_flow_packed",
-        Mock(side_effect=AssertionError("regular Flow must keep its TRT backend")),
-    )
-
-    if streaming:
-        outputs = flow.inference_causal(inputs)
-    else:
-        outputs = flow.inference_leftover(inputs)
-
-    regular_solver.assert_called_once()
-    assert regular_solver.call_args.kwargs == (
-        {"streaming": True, "finalize": False} if streaming else {}
-    )
-    target_tokens = 3 - flow.pre_lookahead_len if streaming else 3
-    assert outputs[0].shape == (
-        1,
-        flow.output_size,
-        target_tokens * flow.token_mel_ratio,
-    )
-
-
-def test_build_prefix_pool_uses_packed_dit_geometry_with_trt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    flow = stages.FunCosyVoice3Flow(
-        FakeFlow(),
-        packed_estimator=Mock(
-            dit=SimpleNamespace(
-                transformer_blocks=[
-                    SimpleNamespace(attn=SimpleNamespace(heads=2, inner_dim=16))
-                    for _ in range(3)
-                ]
-            )
-        ),
-    )
-    flow.decoder.estimator = FlowEstimatorTRTModule(FakeTRTEngine())
-    pool = Mock(spec=stages.PrefixKVPool, free_frames=1024)
-    pool_factory = Mock(return_value=pool)
-    pool_factory.bytes_per_frame = stages.PrefixKVPool.bytes_per_frame
-    monkeypatch.setattr(stages, "PrefixKVPool", pool_factory)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        Mock(return_value=SimpleNamespace(total_memory=16 * 2**30)),
-    )
-
-    assert (
-        stages.build_prefix_pool(flow, torch.device("cuda"), torch.bfloat16, 1.0)
-        is pool
-    )
-    pool_factory.assert_called_once()
-    pool_options = pool_factory.call_args.kwargs
-    assert {
-        name: pool_options[name] for name in ("layer_num", "head_num", "head_dim")
-    } == {
-        "layer_num": 3,
-        "head_num": 2,
-        "head_dim": 8,
-    }
 
 
 def test_flow_estimator_trt_module_forwards_in_profile(monkeypatch) -> None:

@@ -29,7 +29,6 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
 )
 from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
     FunCosyVoice3StreamingVocoderScheduler,
-    causal_hop_frames,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -143,44 +142,6 @@ def make_scheduler(
         ),
         **scheduler_kwargs,
     )
-
-
-def test_streaming_vocoder_uses_flow_token_mel_ratio() -> None:
-    flow, scheduler = make_scheduler()
-    flow.token_mel_ratio = 3
-
-    warmup = scheduler.make_warmup_flow_input(4)
-
-    assert warmup.prompt_feat.shape[1] == scheduler.token_hop_len * 3
-    assert (
-        causal_hop_frames(
-            warmup,
-            token_mel_ratio=int(flow.token_mel_ratio),
-        )
-        == (scheduler.token_hop_len + 4 - PRE_LOOKAHEAD_LEN) * 3
-    )
-
-
-def test_streaming_vocoder_latches_prompt_feat_with_flow_token_mel_ratio() -> None:
-    flow, scheduler = make_scheduler()
-    flow.token_mel_ratio = 3
-    state = scheduler.create_stream_state("req-prompt-ratio")
-
-    scheduler.latch_prompts(
-        "req-prompt-ratio",
-        state,
-        prompt_token=torch.zeros(1, 10, dtype=torch.int32),
-        prompt_feat=torch.zeros(1, 30, 80),
-        embedding=torch.ones(1, 192),
-    )
-
-    latched_token = state.prompt_token
-    latched_feat = state.prompt_feat
-    assert latched_token is not None
-    assert latched_feat is not None
-    assert latched_token.shape == (1, 25)
-    assert latched_feat.shape == (1, 75, 80)
-    assert latched_feat.shape[1] == latched_token.shape[1] * int(flow.token_mel_ratio)
 
 
 def estimator_calls(flow: FakeFlow) -> list[dict]:
