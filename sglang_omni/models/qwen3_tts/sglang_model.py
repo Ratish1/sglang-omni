@@ -465,7 +465,8 @@ class Qwen3TTSCodePredictor(nn.Module):
 @dataclass(frozen=True, kw_only=True)
 class Qwen3TTSPromptConstants:
     """Prompt rows that depend on the checkpoint alone, each embedded once the way a
-    request embeds it; rows are (1, rows, hidden) unless named otherwise."""
+    request embeds it, as (1, rows, hidden); feedback_pad_embed is the one (hidden,)
+    row decode reads after the text ends, in the feedback buffer's dtype."""
 
     tts_bos_embed: torch.Tensor
     tts_eos_embed: torch.Tensor
