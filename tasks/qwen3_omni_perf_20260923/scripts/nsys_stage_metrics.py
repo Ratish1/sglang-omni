@@ -29,9 +29,14 @@ MARK = 34
 
 def stages_by_pid(db: sqlite3.Connection, strings: dict[int, str]) -> dict[int, str]:
     stages: dict[int, list[str]] = collections.defaultdict(list)
-    for tid, text, text_id in db.execute(
-        "select globalTid, text, textId from NVTX_EVENTS where eventType = ?", (MARK,)
-    ):
+    try:
+        marks = db.execute(
+            "select globalTid, text, textId from NVTX_EVENTS where eventType = ?",
+            (MARK,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        marks = []
+    for tid, text, text_id in marks:
         label = text if text is not None else strings.get(text_id, "")
         if label and label.startswith("proc stage="):
             stage = label.split("=", 1)[1]
