@@ -1372,7 +1372,10 @@ def test_qwen_talker_enables_and_attests_breakable_prefill_graphs(
     )
 
     bootstrap.create_talker_scheduler(
-        server_args, operator_selected_prefill_backend=True
+        server_args,
+        operator_selected_prefill_backend=True,
+        enable_async_decode=True,
+        async_decode_min_batch_size=1,
     )
 
     is_breakable = prefill_backend == CudaGraphBackend.BREAKABLE

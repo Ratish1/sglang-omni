@@ -16,6 +16,8 @@ import sglang_omni.models.qwen3_omni.bootstrap as qwen_bootstrap
 import sglang_omni.models.qwen3_omni.stages as qwen_stages
 from sglang_omni.platforms import current_platform
 
+TALKER_ASYNC_DECODE = {"enable_async_decode": True, "async_decode_min_batch_size": 1}
+
 
 @pytest.fixture(autouse=True)
 def schedule_bag(monkeypatch):
@@ -546,7 +548,7 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
         lambda gpu_id: None,
     )
 
-    qwen_stages.create_talker_ar_executor_from_config("dummy")
+    qwen_stages.create_talker_ar_executor_from_config("dummy", **TALKER_ASYNC_DECODE)
 
     prefill_ladder = qwen_stages.build_default_prefill_cuda_graph_bs(
         qwen_stages.TALKER_PREFILL_CUDA_GRAPH_MAX_TOKENS
@@ -618,11 +620,13 @@ def test_talker_ar_default_running_batch_width_is_32(monkeypatch) -> None:
         qwen_stages, "get_process_gpu_memory_bytes", lambda gpu_id: None
     )
 
-    qwen_stages.create_talker_ar_executor_from_config("dummy")
+    qwen_stages.create_talker_ar_executor_from_config("dummy", **TALKER_ASYNC_DECODE)
     assert captured[-1]["max_running_requests"] == 32
 
     qwen_stages.create_talker_ar_executor_from_config(
-        "dummy", server_args_overrides={"max_running_requests": 8}
+        "dummy",
+        server_args_overrides={"max_running_requests": 8},
+        **TALKER_ASYNC_DECODE,
     )
     assert captured[-1]["max_running_requests"] == 8
 
@@ -717,7 +721,9 @@ def talker_overrides(monkeypatch, *, allows: bool, **kwargs) -> dict[str, object
     )
     monkeypatch.setattr(current_platform, "enable_talker_graph", lambda: allows)
 
-    qwen_stages.create_talker_ar_executor_from_config("dummy", **kwargs)
+    qwen_stages.create_talker_ar_executor_from_config(
+        "dummy", **TALKER_ASYNC_DECODE, **kwargs
+    )
     return captured[-1]
 
 

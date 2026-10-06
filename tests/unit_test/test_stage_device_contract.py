@@ -399,6 +399,12 @@ SELF_BUILT_SERVER_ARGS_FACTORIES = [
     "sglang_omni.models.qwen3_omni.stages.create_sglang_thinker_executor_from_config",
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config",
 ]
+FACTORY_REQUIRED_ARGS: dict[str, dict[str, bool | int]] = {
+    "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config": {
+        "enable_async_decode": True,
+        "async_decode_min_batch_size": 1,
+    },
+}
 
 
 @pytest.mark.parametrize(
@@ -437,13 +443,18 @@ def test_self_built_server_args_carry_the_resolved_device_type(
         platforms.current_platform, "device_type", "cuda", raising=False
     )
 
+    required_args = FACTORY_REQUIRED_ARGS.get(factory_path, {})
     with pytest.raises(Stop):
-        factory("unused", device=None, gpu_id=2)
+        factory("unused", device=None, gpu_id=2, **required_args)
     assert captured["device"] == "cuda"
 
     with pytest.raises(ValueError, match="stage placement"):
         factory(
-            "unused", device=None, gpu_id=2, server_args_overrides={"device": "xpu"}
+            "unused",
+            device=None,
+            gpu_id=2,
+            server_args_overrides={"device": "xpu"},
+            **required_args,
         )
 
 

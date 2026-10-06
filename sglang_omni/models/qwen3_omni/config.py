@@ -237,6 +237,10 @@ def talker_stage(
             codec_coalesce_frames=10,
             codec_coalesce_early_frames=10,
             codec_coalesce_first_frames=0,
+            enable_async_decode=True,
+            # note (ratish): a one-row talker step still has milliseconds of host work to
+            # overlap with the previous step's device time, so the lookahead pays from one row.
+            async_decode_min_batch_size=1,
         ),
         gpu=gpu,
         next="code2wav",

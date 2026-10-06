@@ -447,6 +447,38 @@ def test_talker_start_topology_reaches_bootstrap(monkeypatch, enabled):
 
 
 @pytest.mark.parametrize(
+    ("overrides", "min_batch_size"),
+    [({}, 1), ({"talker_ar.factory.async_decode_min_batch_size": 2}, 2)],
+)
+def test_talker_lookahead_minimum_reaches_bootstrap(
+    monkeypatch, overrides, min_batch_size
+):
+    from sglang.srt import runtime_context
+
+    from sglang_omni.models.qwen3_omni import bootstrap, stages
+
+    manager = ConfigManager(Qwen3OmniSpeechColocatedPipelineConfig(model_path="dummy"))
+    config = manager.merge_config(
+        {"talker_ar.engine.disable_cuda_graph": True, **overrides}
+    )
+    args = resolve_stage_factory_args(make_stage(config, "talker_ar"), config)
+    monkeypatch.setattr(stages, "avail_gpu_mem", lambda *_: 0)
+    monkeypatch.setattr(stages, "get_process_gpu_memory_bytes", lambda *_: 0)
+    monkeypatch.setattr(stages, "validate_generation_batch_policy", lambda **_: None)
+    monkeypatch.setattr(
+        bootstrap, "create_talker_scheduler", lambda *_, **kwargs: kwargs
+    )
+    monkeypatch.setattr(
+        runtime_context,
+        "get_schedule",
+        lambda: SimpleNamespace(mem_fraction_static=0.5),
+    )
+    received = stages.create_talker_ar_executor_from_config(**args)
+    assert received["enable_async_decode"] is True
+    assert received["async_decode_min_batch_size"] == min_batch_size
+
+
+@pytest.mark.parametrize(
     ("engine_overrides", "is_nvidia", "backend", "ladder_top", "operator_selected"),
     [
         ({}, True, "breakable", 2048, False),
