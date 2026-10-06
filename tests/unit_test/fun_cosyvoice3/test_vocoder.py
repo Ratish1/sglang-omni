@@ -89,6 +89,7 @@ class RunnableFakeFlow(_PackedFlow):
     def __init__(self):
         super().__init__(channels=80, max_frames=8192)
         self.spk_embed_affine_layer = torch.nn.Linear(192, 80)
+        self.prefix_pool: stages.PrefixKVPool | None = None
 
 
 class GraphRunnableFakeFlow(RunnableFakeFlow):
