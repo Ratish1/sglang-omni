@@ -2565,6 +2565,29 @@ class FakeIncrementalQwen3TTSDecoder:
             .repeat_interleave(self.decoder.total_upsample, dim=-1)
         )
 
+    def tail_frames(self, emit_frames: int) -> int:
+        return emit_frames + 1
+
+    def decode_tail(
+        self,
+        codes: torch.Tensor,
+        valid_frames: torch.Tensor,
+        state: Qwen3TTSIncrementalCodecState,
+        emit_frames: int,
+    ) -> torch.Tensor:
+        self.decode_inputs.append(codes.detach().clone())
+        self.decode_positions.append(state.frame_positions.tolist())
+        rows = [
+            codes[row, :1, width - emit_frames : width]
+            for row, width in enumerate(valid_frames.tolist())
+        ]
+        state.frame_positions = state.frame_positions + valid_frames
+        return (
+            torch.stack(rows)
+            .to(torch.float32)
+            .repeat_interleave(self.decoder.total_upsample, dim=-1)
+        )
+
 
 def stateful_qwen3_tts_scheduler(
     monkeypatch: pytest.MonkeyPatch,
@@ -2964,6 +2987,142 @@ def test_qwen3_tts_windowed_cohorts_split_at_the_window_runner_bucket(
     assert scheduler.split_incremental_group_for_graph(
         uncovered, runner=cold, window_runner=None
     ) == [uncovered]
+
+
+class FakeTailRunner:
+    """Tail graphs that decode against the real arena on the CPU."""
+
+    def __init__(
+        self,
+        scheduler: Qwen3TTSStreamingVocoderScheduler,
+        decoder: FakeIncrementalQwen3TTSDecoder,
+        *,
+        widths: tuple[int, ...],
+        bucket: int,
+        miss: bool = False,
+    ) -> None:
+        self.arena = scheduler.codec_arena
+        self.decoder = decoder
+        self.enabled = True
+        self.fresh_frames = widths
+        self.bucket = bucket
+        self.emit_frames = 1
+        self.tail_frames = decoder.tail_frames(1)
+        self.miss = miss
+        self.calls: list[tuple[tuple[int, ...], list[int], list[int]]] = []
+
+    def largest_batch_bucket(self) -> int:
+        return self.bucket
+
+    def stats(self) -> dict[str, bool]:
+        return {"enabled": True}
+
+    def decode_slots(
+        self, codes: torch.Tensor, slots: list[int], valid_frames: list[int]
+    ) -> torch.Tensor | None:
+        self.calls.append((tuple(codes.shape), list(slots), list(valid_frames)))
+        if self.miss:
+            return None
+        else:
+            pass
+        state = self.arena.gather(list(slots))
+        waveform = self.decoder.decode_tail(
+            codes, torch.tensor(valid_frames), state, self.emit_frames
+        )
+        self.arena.scatter(list(slots), state)
+        return waveform
+
+
+def test_qwen3_tts_reference_first_chunks_of_different_widths_share_tail_replays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, incremental, window = windowed_scheduler(
+        monkeypatch, widths=(1, 2, 4, 8)
+    )
+    tail = FakeTailRunner(scheduler, incremental, widths=(4, 6), bucket=2)
+    scheduler.initial_tail_decode_graphs = tail
+    first = admit_reference_stream(
+        scheduler,
+        "first",
+        torch.tensor([[10, 1], [20, 2], [30, 3], [40, 4]], dtype=torch.long),
+        ref_code_len=3,
+    )
+    second = admit_reference_stream(
+        scheduler,
+        "second",
+        torch.tensor([[50, 5], [60, 6], [70, 7]], dtype=torch.long),
+        ref_code_len=2,
+    )
+    third = admit_reference_stream(
+        scheduler,
+        "third",
+        torch.tensor([[80, 8], [90, 9]], dtype=torch.long),
+        ref_code_len=1,
+    )
+    wide = admit_reference_stream(
+        scheduler,
+        "wide",
+        torch.arange(100, 180, 10).repeat_interleave(2).view(8, 2),
+        ref_code_len=7,
+    )
+
+    scheduler.run_initial_batch(
+        [("first", first), ("second", second), ("third", third), ("wide", wide)]
+    )
+
+    assert tail.calls == [
+        ((2, 2, 4), [first.codec_slot, second.codec_slot], [4, 3]),
+        ((1, 2, 2), [third.codec_slot], [2]),
+    ]
+    assert incremental.decode_inputs[0][:, 0].tolist() == [
+        [10, 20, 30, 40],
+        [50, 60, 70, 0],
+    ]
+    assert window.calls == [((1, 2, 8), [wide.codec_slot])]
+    messages = {}
+    while not scheduler.outbox.empty():
+        message = scheduler.outbox.get_nowait()
+        messages[message.request_id] = message
+    assert chunk_samples(messages["first"]) == [40.0] * 4
+    assert chunk_samples(messages["second"]) == [70.0] * 4
+    assert chunk_samples(messages["third"]) == [90.0] * 4
+    assert chunk_samples(messages["wide"]) == [170.0] * 4
+    positions = scheduler.codec_arena.storage.frame_positions
+    for state, width in ((first, 4), (second, 3), (third, 2), (wide, 8)):
+        assert int(positions[state.codec_slot]) == width
+        assert state.codec_frame_position == width
+        assert state.emitted_generated_frames == 1
+
+
+def test_qwen3_tts_tail_miss_degrades_the_cohort_to_left_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, incremental, _ = windowed_scheduler(monkeypatch)
+    scheduler.initial_tail_decode_graphs = FakeTailRunner(
+        scheduler, incremental, widths=(4,), bucket=2, miss=True
+    )
+    first = admit_reference_stream(
+        scheduler,
+        "first",
+        torch.tensor([[10, 1], [20, 2], [30, 3], [40, 4]], dtype=torch.long),
+        ref_code_len=3,
+    )
+    second = admit_reference_stream(
+        scheduler,
+        "second",
+        torch.tensor([[50, 5], [60, 6], [70, 7]], dtype=torch.long),
+        ref_code_len=2,
+    )
+
+    scheduler.run_initial_batch([("first", first), ("second", second)])
+
+    assert scheduler.outbox.empty()
+    assert first.incremental_codec_fallback is True
+    assert second.incremental_codec_fallback is True
+    assert first.codec_slot is None and second.codec_slot is None
+    assert scheduler.codec_arena.active_slots() == 0
+    assert scheduler.initial_queue.qsize() == 2
+    assert scheduler.codec_state_stats()["left_context_fallbacks"] == 2
 
 
 def test_qwen3_tts_stateful_codec_uses_reference_once_then_fresh_frames(
