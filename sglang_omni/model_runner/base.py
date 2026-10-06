@@ -18,6 +18,7 @@ from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.prefill_inputs import clear_omni_prefill_inputs
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
 from sglang_omni.platforms import current_platform
+from sglang_omni.sampling.compiled_calls import CompiledSamplerCall
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
     derive_sampling_seed,
@@ -960,6 +961,11 @@ class ModelRunner(Generic[RequestDataInput]):
         else:
             pass
         result.next_token_ids = launch_buf[: len(requests)]
+
+    def compiled_sampler_calls(self) -> tuple[CompiledSamplerCall, ...]:
+        """Compiled sampler calls this runner's default requests make outside graph
+        replay; the scheduler compiles them before serving. None by default."""
+        return ()
 
     def sample_before_post_prefill(
         self,

@@ -15,6 +15,11 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
+from sglang_omni.sampling.compiled_calls import (
+    CompiledSamplerCall,
+    scaling_penalty_calls,
+    seeded_sampling_call,
+)
 from sglang_omni.scheduling.message import OutgoingMessage, put_messages
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.types import (
@@ -310,6 +315,25 @@ class QwenTalkerModelRunner(ModelRunner["SGLangARRequestData"]):
         pending.append(last_row)
         self.flush_codec_rows(request_id, req_data, code_messages)
         self.put_code_messages(code_messages)
+
+    def compiled_sampler_calls(self) -> tuple[CompiledSamplerCall, ...]:
+        # note (ratish): prefill samples on the base path, seeded and penalized by
+        # default; decode samples inside its captured graph, which capture compiles.
+        vocab_size = int(self.model.config.text_config.vocab_size)
+        return (
+            seeded_sampling_call(
+                device=self.device,
+                log_probability_dtype=torch.float64,
+                vocab_size=vocab_size,
+                seed_buffer=None,
+                grad_enabled=True,
+            ),
+            *scaling_penalty_calls(
+                device=self.device,
+                logits_dtype=self.tp_worker.model_runner.dtype,
+                vocab_size=vocab_size,
+            ),
+        )
 
     def sample_before_post_prefill(
         self,
