@@ -54,6 +54,8 @@ def main() -> None:
     parser.add_argument("--calls", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--disable-gc", action="store_true")
+    # with a device sync after every call the wall time includes the GPU work
+    parser.add_argument("--synchronize", action="store_true")
     parser.add_argument(
         "--cases", nargs="+", default=list(PREFIX_CASES + VOCODER_CASES)
     )
@@ -100,6 +102,10 @@ def main() -> None:
         for _ in range(args.calls):
             cpu_start, wall_start = time.thread_time(), time.perf_counter()
             body()
+            if args.synchronize:
+                torch.cuda.synchronize()
+            else:
+                pass
             cpu.append((time.thread_time() - cpu_start) * 1e3)
             wall.append((time.perf_counter() - wall_start) * 1e3)
         torch.cuda.synchronize()
