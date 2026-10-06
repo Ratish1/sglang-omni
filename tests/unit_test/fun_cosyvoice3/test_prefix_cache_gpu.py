@@ -289,8 +289,8 @@ def test_grow_rows_takes_nothing_on_a_shortfall() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("compile_prefix", [False, True], ids=["eager", "compiled"])
 def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> None:
-    """Replays with padding frames and unused row slots equal the eager solve;
-    a step above the largest tier is left to it."""
+    """Replays with padding frames and unused row slots equal the eager solve,
+    also when they resume from a step above the largest tier that ran eagerly."""
     estimator = make_estimator()
     device = torch.device("cuda", torch.cuda.current_device())
     dtype = torch.bfloat16
@@ -336,13 +336,13 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
     torch.manual_seed(3)
     streams = {}
     for name, prompt_frames in (("a", 100), ("b", 50), ("c", 50)):
-        mel_conditioning = torch.zeros(CHANNELS, 600, device=device, dtype=dtype)
+        mel_conditioning = torch.zeros(CHANNELS, 650, device=device, dtype=dtype)
         mel_conditioning[:, :prompt_frames] = torch.randn(
             CHANNELS, prompt_frames, device=device, dtype=dtype
         )
         streams[name] = {
-            "noise": torch.randn(CHANNELS, 600, device=device, dtype=dtype),
-            "mu": torch.randn(CHANNELS, 600, device=device, dtype=dtype),
+            "noise": torch.randn(CHANNELS, 650, device=device, dtype=dtype),
+            "mu": torch.randn(CHANNELS, 650, device=device, dtype=dtype),
             "mel_conditioning": mel_conditioning,
             "speaker_embeddings": torch.randn(CHANNELS, device=device, dtype=dtype),
         }
@@ -357,6 +357,7 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
         [("a", 450), ("c", 70), ("b", 200)],
         [("c", 150), ("b", 400)],
         [("a", 600), ("b", 600), ("c", 300)],
+        [("a", 650)],
     ]
     with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
         for step in steps:
