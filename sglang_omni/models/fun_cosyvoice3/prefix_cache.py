@@ -33,6 +33,9 @@ BLOCK_FRAMES = 64
 # Note (Jiaxin Deng): each positional conv has kernel 31, so it reads the 30
 # frames before its input frame.
 CONV_CONTEXT_FRAMES = 30
+# note(ratish): one KV split, the split FA3 picks for these segments when the page table
+# is as wide as the rows; fixed, a graph's table at the frame ceiling cannot change it.
+PREFIX_FA3_SPLITS = 1
 
 
 class PrefixForward(Protocol):
@@ -377,6 +380,7 @@ class PrefixRowAttention:
             self.page_table,
             self.cu_seqlens_q,
             self.max_seqlen_q,
+            PREFIX_FA3_SPLITS,
         )
         return out.reshape(1, -1, head_num * head_dim)
 
