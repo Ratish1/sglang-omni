@@ -258,15 +258,18 @@ def test_streaming_vocoder_does_not_decode_before_lookahead_tokens_arrive() -> N
     assert estimator_calls(flow) == []
 
 
-def test_streaming_vocoder_pads_prompt_and_decodes_first_hop_at_28() -> None:
-    flow, scheduler = make_scheduler()
+@pytest.mark.parametrize("token_mel_ratio", [TOKEN_MEL_RATIO, 3])
+def test_streaming_vocoder_pads_prompt_and_decodes_first_hop_at_28(
+    token_mel_ratio: int,
+) -> None:
+    flow, scheduler = make_scheduler(token_mel_ratio=token_mel_ratio)
     prompt_len = 10
     scheduler.handle_streaming_new_request(
         "req-pad",
         stream_payload(
             "req-pad",
             prompt_token_len=prompt_len,
-            prompt_feat_frames=prompt_len * TOKEN_MEL_RATIO,
+            prompt_feat_frames=prompt_len * token_mel_ratio,
         ),
     )
     scheduler.handle_stream_chunk("req-pad", item(list(range(27))))
@@ -279,10 +282,14 @@ def test_streaming_vocoder_pads_prompt_and_decodes_first_hop_at_28() -> None:
     messages = drain(scheduler)
     assert [message.type for message in messages] == ["stream"]
     assert scheduler.stream_states["req-pad"].prompt_token.shape == (1, 25)
-    assert scheduler.stream_states["req-pad"].prompt_feat.shape == (1, 50, 80)
+    assert scheduler.stream_states["req-pad"].prompt_feat.shape == (
+        1,
+        TOKEN_HOP_LEN * token_mel_ratio,
+        80,
+    )
     assert hop_frames(flow) == {window_frames(flow, 28)}
     assert waveform(messages[0].data).shape == (
-        TOKEN_HOP_LEN * TOKEN_MEL_RATIO - scheduler.vocoder.hift_hold_frames,
+        TOKEN_HOP_LEN * token_mel_ratio - scheduler.vocoder.hift_hold_frames,
     )
 
 
