@@ -312,10 +312,14 @@ def patch_builders(module):
         module.prepare_qwen3_tts_request,
         lambda payload, **kwargs: f"pre.prepare rid={payload.request_id}",
     )
-    module.build_embedding_cache_key_ids = ranged(
-        module.build_embedding_cache_key_ids,
-        lambda embeds: f"pre.key_ids n={int(embeds.shape[0])}",
-    )
+    # note: trees before the prompt row keys hash in this module; later ones in cache_key
+    if hasattr(module, "build_embedding_cache_key_ids"):
+        module.build_embedding_cache_key_ids = ranged(
+            module.build_embedding_cache_key_ids,
+            lambda embeds: f"pre.key_ids n={int(embeds.shape[0])}",
+        )
+    else:
+        pass
     module.adopt_prepared_tensors = ranged(
         module.adopt_prepared_tensors, fixed("sched.adopt")
     )
@@ -360,6 +364,13 @@ def patch_builders(module):
         lambda self, outcomes: f"ref.sync b={len(outcomes)}",
     )
     batcher.drain = ranged(batcher.drain, fixed("ref.drain"))
+
+
+def patch_cache_key(module):
+    keys = module.PromptRowCacheKeys
+    keys.key_ids = ranged(
+        keys.key_ids, lambda self, rows: f"pre.key_ids n={int(rows.shape[0])}"
+    )
 
 
 def patch_model(module):
@@ -646,6 +657,7 @@ PATCHES = {
     "sglang_omni.pipeline.stage.runtime": patch_runtime,
     "sglang_omni.pipeline.coordinator": patch_coordinator,
     "sglang_omni.models.qwen3_tts.request_builders": patch_builders_and_dump,
+    "sglang_omni.preprocessing.cache_key": patch_cache_key,
     "sglang_omni.models.qwen3_tts.sglang_model": patch_model,
     "sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph": patch_speaker,
     "sglang_omni.scheduling.omni_scheduler": patch_scheduler,
