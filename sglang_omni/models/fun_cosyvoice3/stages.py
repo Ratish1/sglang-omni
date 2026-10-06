@@ -2731,25 +2731,40 @@ def create_vocoder_executor(
         graph_backend = current_platform.get_device_graph_backend(device_obj)
         assert graph_backend is not None and flow.packed_estimator is not None
         assert autocast_dtype is not None
-        token_mel_ratio = int(flow.token_mel_ratio)
+        token_mel_ratio = flow.token_mel_ratio
         if disable_hop_growth:
             longest_hop_tokens = token_hop_len
         else:
             longest_hop_tokens = token_max_hop_len
+        # note(ratish): a graph replays the dtypes it captured, and a hop's frames keep
+        # the token embedding's dtype under autocast while its speaker embedding does not.
+        with (
+            torch.inference_mode(),
+            torch.autocast(device_type=device_obj.type, dtype=autocast_dtype),
+        ):
+            conditioning = prepare_flow_conditioning(
+                flow,
+                pack_flow_inputs(
+                    flow.flow, [scheduler.make_warmup_flow_input(token_hop_len)]
+                ),
+                finalize=False,
+            )
         prefix_cuda_graph_runner = PrefixCudaGraphRunner(
             flow.packed_estimator,
             flow.prefix_pool,
             backend=graph_backend,
             device=device_obj,
-            dtype=autocast_dtype,
-            cfg_rate=float(flow.decoder.inference_cfg_rate),
+            autocast_dtype=autocast_dtype,
+            frame_dtype=conditioning.noisy_mel.dtype,
+            speaker_dtype=conditioning.speaker_embedding.dtype,
+            cfg_rate=flow.decoder.inference_cfg_rate,
             euler_steps=FLOW_EULER_STEPS,
-            mel_channels=int(flow.output_size),
-            speaker_channels=int(flow.spk_embed_affine_layer.out_features),
+            mel_channels=flow.output_size,
+            speaker_channels=flow.spk_embed_affine_layer.out_features,
             max_rows=max_batch_size,
             hop_frames=longest_hop_tokens * token_mel_ratio,
             min_hop_frames=token_hop_len * token_mel_ratio,
-            max_frames=int(flow.decoder.rand_noise.shape[2]),
+            max_frames=flow.decoder.rand_noise.shape[2],
         )
         prefix_cuda_graph_runner.capture()
         flow.prefix_cuda_graph_runner = prefix_cuda_graph_runner

@@ -58,7 +58,9 @@ class PrefixCudaGraphRunner:
         *,
         backend: DeviceGraphBackend,
         device: torch.device,
-        dtype: torch.dtype,
+        autocast_dtype: torch.dtype,
+        frame_dtype: torch.dtype,
+        speaker_dtype: torch.dtype,
         cfg_rate: float,
         euler_steps: int,
         mel_channels: int,
@@ -73,7 +75,9 @@ class PrefixCudaGraphRunner:
         self.backend = backend
         self.device = device
         self.device_module = torch.get_device_module(device)
-        self.dtype = dtype
+        self.autocast_dtype = autocast_dtype
+        self.frame_dtype = frame_dtype
+        self.speaker_dtype = speaker_dtype
         self.cfg_rate = cfg_rate
         self.euler_steps = euler_steps
         self.mel_channels = mel_channels
@@ -140,17 +144,17 @@ class PrefixCudaGraphRunner:
                     layout.half_frames,
                     self.mel_channels,
                     device=self.device,
-                    dtype=self.dtype,
+                    dtype=self.frame_dtype,
                 )
                 time_span = torch.zeros(
-                    self.euler_steps + 1, device=self.device, dtype=self.dtype
+                    self.euler_steps + 1, device=self.device, dtype=self.frame_dtype
                 )
                 mu = torch.zeros_like(noise)
                 speaker_embeddings = torch.zeros(
                     layout.row_slots,
                     self.speaker_channels,
                     device=self.device,
-                    dtype=self.dtype,
+                    dtype=self.speaker_dtype,
                 )
                 mel_conditioning = torch.zeros_like(noise)
                 context = torch.zeros(
@@ -160,7 +164,7 @@ class PrefixCudaGraphRunner:
                     CONV_CONTEXT_FRAMES,
                     hidden_size,
                     device=self.device,
-                    dtype=self.dtype,
+                    dtype=self.speaker_dtype,
                 )
                 next_context = torch.empty_like(context)
 
@@ -183,7 +187,9 @@ class PrefixCudaGraphRunner:
                 stream.wait_stream(self.device_module.current_stream(self.device))
                 with (
                     self.device_module.stream(stream),
-                    torch.autocast(device_type=self.device.type, dtype=self.dtype),
+                    torch.autocast(
+                        device_type=self.device.type, dtype=self.autocast_dtype
+                    ),
                 ):
                     for _ in range(CAPTURE_WARMUP_RUNS):
                         solve()
@@ -193,7 +199,9 @@ class PrefixCudaGraphRunner:
                     self.backend.capture(
                         pool=graph_pool, stream=stream, thread_local_errors=True
                     ) as graph,
-                    torch.autocast(device_type=self.device.type, dtype=self.dtype),
+                    torch.autocast(
+                        device_type=self.device.type, dtype=self.autocast_dtype
+                    ),
                 ):
                     output = solve()
                 self.device_module.synchronize(self.device)
@@ -245,7 +253,11 @@ class PrefixCudaGraphRunner:
             captured = self.captured[tier]
         row_count = len(new_frames)
         row_slots = captured.layout.row_slots
-        assert row_count <= row_slots and noise.dtype == captured.noise.dtype
+        assert row_count <= row_slots, "every row adds at least the shortest hop"
+        assert (
+            noise.dtype == self.frame_dtype
+            and speaker_embeddings.dtype == self.speaker_dtype
+        )
         twin_caches = [pair[0] for pair in caches] + [pair[1] for pair in caches]
         twin_new_frames = list(new_frames) * 2
         chunk_size = self.estimator.chunk_size

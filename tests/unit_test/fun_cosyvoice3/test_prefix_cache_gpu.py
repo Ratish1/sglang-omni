@@ -322,7 +322,9 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
         graph_pool,
         backend=backend,
         device=device,
-        dtype=dtype,
+        autocast_dtype=dtype,
+        frame_dtype=torch.float32,
+        speaker_dtype=dtype,
         cfg_rate=0.7,
         euler_steps=10,
         mel_channels=CHANNELS,
@@ -366,12 +368,16 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
             new_frames = [total - start for start, total in zip(starts, totals)]
 
             def take(key: str) -> torch.Tensor:
-                return torch.cat(
-                    [
-                        streams[name][key][:, start:total].transpose(0, 1)
-                        for name, start, total in zip(names, starts, totals)
-                    ]
-                ).unsqueeze(0)
+                return (
+                    torch.cat(
+                        [
+                            streams[name][key][:, start:total].transpose(0, 1)
+                            for name, start, total in zip(names, starts, totals)
+                        ]
+                    )
+                    .unsqueeze(0)
+                    .float()
+                )
 
             outputs = []
             for pool_index, pool in enumerate(pools):
@@ -380,7 +386,7 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
                     assert grow_rows(pool, list(pair), [total, total])
                 inputs = dict(
                     noise=take("noise"),
-                    time_span=time_span,
+                    time_span=time_span.float(),
                     mu=take("mu"),
                     speaker_embeddings=torch.stack(
                         [streams[name]["speaker_embeddings"] for name in names]
