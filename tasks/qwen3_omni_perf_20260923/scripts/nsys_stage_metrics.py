@@ -10,24 +10,21 @@ kernel name inside each stage for the top kernels. A sample is the mean of its p
 stage's means are exact only for slices long against the period; samples that straddle a
 switch mix two stages and are counted for each.
 
-usage: python nsys_stage_metrics.py REPORT.sqlite [--bench-log bench.log] [--top 8]
+usage: python nsys_stage_metrics.py REPORT.sqlite [--window window.txt] [--top 8]
 """
 
 from __future__ import annotations
 
 import argparse
-import bisect
 import collections
+import heapq
 import sqlite3
 import statistics
 
-from nsys_metrics import METRICS, bench_window
+from nsys_metrics import METRICS
+from nsys_stage_ledger import pid_of, session_window
 
 MARK = 34
-
-
-def pid_of(global_id: int) -> int:
-    return (global_id >> 24) & 0xFFFFFF
 
 
 def stages_by_pid(db: sqlite3.Connection, strings: dict[int, str]) -> dict[int, str]:
@@ -46,17 +43,12 @@ def stages_by_pid(db: sqlite3.Connection, strings: dict[int, str]) -> dict[int, 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("report")
-    parser.add_argument("--bench-log")
+    parser.add_argument("--window")
     parser.add_argument("--top", type=int, default=8)
     args = parser.parse_args()
     db = sqlite3.connect(args.report)
     strings = dict(db.execute("select id, value from StringIds"))
-    if args.bench_log:
-        t0, t1 = bench_window(db, args.bench_log)
-    else:
-        t0, t1 = db.execute(
-            "select min(start), max(end) from CUPTI_ACTIVITY_KIND_KERNEL"
-        ).fetchone()
+    t0, t1 = session_window(db, args.window)
     stage_of = stages_by_pid(db, strings)
     kernels = db.execute(
         "select start, end, deviceId, demangledName, globalPid from CUPTI_ACTIVITY_KIND_KERNEL "
@@ -93,42 +85,46 @@ def main() -> None:
         for metric in METRICS:
             if str(name).startswith(metric):
                 metric_ids[metric] = metric_id
-    starts = [k[0] for k in kernels]
-    longest = max(k[1] - k[0] for k in kernels)
-
-    def running_at(timestamp: int) -> set[tuple[str, str]]:
-        found = set()
-        index = bisect.bisect_right(starts, timestamp) - 1
-        while index >= 0 and kernels[index][0] >= timestamp - longest:
-            start, end, _, name_id, global_pid = kernels[index]
-            if start <= timestamp <= end:
-                found.add((stage_name(global_pid), strings.get(name_id, str(name_id))))
-            index -= 1
-        return found
-
+    metric_of_id = {metric_id: metric for metric, metric_id in metric_ids.items()}
     by_stage: dict[str, dict[str, list[float]]] = collections.defaultdict(
         lambda: collections.defaultdict(list)
     )
     by_kernel: dict[tuple[str, str], dict[str, list[float]]] = collections.defaultdict(
         lambda: collections.defaultdict(list)
     )
-    sample_count: dict[str, collections.Counter] = {}
-    for metric, metric_id in metric_ids.items():
-        counter: collections.Counter = collections.Counter()
-        for timestamp, value in db.execute(
-            "select timestamp, value from GPU_METRICS where metricId = ? and timestamp between ? and ?",
-            (metric_id, t0, t1),
-        ):
-            running = running_at(timestamp)
-            stages = {stage for stage, _ in running} or {"no kernel"}
-            for stage in stages:
-                by_stage[stage][metric].append(value)
-                counter[stage] += 1
-            for key in running:
-                by_kernel[key][metric].append(value)
-        sample_count[metric] = counter
+    # one sweep in time order: kernels enter the running set at their start and leave it
+    # once a sample is past their end
+    running_ends: list[tuple[int, int]] = []
+    next_kernel = 0
+    sampled_at = None
+    running: set[tuple[str, str]] = set()
+    placeholders = ",".join("?" for _ in metric_of_id)
+    for timestamp, metric_id, value in db.execute(
+        f"select timestamp, metricId, value from GPU_METRICS where metricId in ({placeholders}) "
+        "and timestamp between ? and ? order by timestamp",
+        (*metric_of_id, t0, t1),
+    ):
+        if timestamp != sampled_at:
+            sampled_at = timestamp
+            while next_kernel < len(kernels) and kernels[next_kernel][0] <= timestamp:
+                heapq.heappush(running_ends, (kernels[next_kernel][1], next_kernel))
+                next_kernel += 1
+            while running_ends and running_ends[0][0] < timestamp:
+                heapq.heappop(running_ends)
+            running = {
+                (
+                    stage_name(kernels[index][4]),
+                    strings.get(kernels[index][3], str(kernels[index][3])),
+                )
+                for _, index in running_ends
+            }
+        metric = metric_of_id[metric_id]
+        for stage in {stage for stage, _ in running} or {"no kernel"}:
+            by_stage[stage][metric].append(value)
+        for key in running:
+            by_kernel[key][metric].append(value)
 
-    total_samples = sum(sample_count["SM Issue"].values()) or 1
+    total_samples = sum(len(metrics["SM Issue"]) for metrics in by_stage.values()) or 1
     header = " ".join(f"{metric[:13]:>13}" for metric in metric_ids)
     print(
         f"\n{'stage':34s} {'samples %':>9} {'kernel ms':>10} {'kernel %':>8} {header}"
