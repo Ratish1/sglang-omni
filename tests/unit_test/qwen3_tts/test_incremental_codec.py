@@ -20,6 +20,9 @@ from sglang_omni.models.qwen3_tts.incremental_codec import (
     incremental_causal_transconv1d,
     incremental_transformer,
 )
+from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
+    Qwen3TTSIncrementalCodecCudaGraphRunner,
+)
 from sglang_omni.platforms import current_platform
 from sglang_omni.utils import channels_last_conv, snake_beta
 from sglang_omni.utils.channels_last_conv import channels_last_weight
@@ -632,6 +635,91 @@ def test_arena_cohort_matches_per_stream_decodes() -> None:
         torch.testing.assert_close(batched[row : row + 1], single, rtol=2e-5, atol=2e-6)
 
 
+def test_tail_frames_bounds_what_the_kept_samples_and_state_read() -> None:
+    """A change one frame before the tail leaves the kept samples and the conv-stack
+    state bit for bit; a change to the tail's first frame reaches the kept samples."""
+    torch.manual_seed(41)
+    decoder = Decoder()
+    incremental = Qwen3TTSIncrementalDecoder(decoder)
+    emit_frames = 1
+    tail_frames = incremental.tail_frames(emit_frames)
+    frames = tail_frames + 4
+    hidden_states = torch.randn(1, 2, frames) * 0.1
+
+    def run_conv_stack(
+        changed_frame: int | None,
+    ) -> tuple[torch.Tensor, Qwen3TTSIncrementalCodecState]:
+        inputs = hidden_states.clone()
+        if changed_frame is not None:
+            inputs[..., changed_frame] += 0.05
+        else:
+            pass
+        state = incremental.init_state(
+            1, device=torch.device("cpu"), dtype=torch.float32
+        )
+        waveform = incremental.conv_stack_tensors(inputs, state)
+        return waveform[..., -emit_frames * decoder.total_upsample :], state
+
+    baseline_waveform, baseline_state = run_conv_stack(None)
+    before_waveform, before_state = run_conv_stack(frames - tail_frames - 1)
+    first_waveform, _ = run_conv_stack(frames - tail_frames)
+
+    assert torch.equal(before_waveform, baseline_waveform)
+    for name in ("conv_histories", "transconv_overlaps"):
+        for key, value in getattr(baseline_state, name).items():
+            assert torch.equal(getattr(before_state, name)[key], value), key
+    assert not torch.equal(first_waveform, baseline_waveform)
+
+
+def test_tail_decode_matches_each_row_decoded_whole() -> None:
+    """Rows of different widths padded into one tail decode keep each row's emitted
+    samples, every state tensor and its next decode, as the row decoded alone does."""
+    torch.manual_seed(42)
+    decoder = Decoder()
+    incremental, arena = make_arena(decoder, slots=6)
+    emit_frames = 1
+    tail_frames = incremental.tail_frames(emit_frames)
+    widths = [tail_frames + 7, tail_frames + 3, tail_frames]
+    codes = torch.randint(0, 16, (3, 2, max(widths)))
+    tail_slots = [arena.acquire() for _ in widths]
+    alone_slots = [arena.acquire() for _ in widths]
+
+    state = arena.gather(tail_slots)
+    waveform = incremental.decode_tail(codes, torch.tensor(widths), state, emit_frames)
+    arena.scatter(tail_slots, state)
+
+    samples = emit_frames * decoder.total_upsample
+    follow_codes = torch.randint(0, 16, (1, 2, 2))
+    for row, (width, tail_slot, alone_slot) in enumerate(
+        zip(widths, tail_slots, alone_slots)
+    ):
+        expected = arena_decode(
+            incremental, arena, [alone_slot], [0], codes[row : row + 1, :, :width]
+        )
+        torch.testing.assert_close(
+            waveform[row : row + 1], expected[..., -samples:], rtol=2e-5, atol=2e-6
+        )
+        tail_state = arena.gather([tail_slot])
+        alone_state = arena.gather([alone_slot])
+        assert tail_state.frame_positions.tolist() == [width]
+        for name in (
+            "conv_histories",
+            "transconv_overlaps",
+            "transformer_keys",
+            "transformer_values",
+        ):
+            for key, value in getattr(alone_state, name).items():
+                torch.testing.assert_close(
+                    getattr(tail_state, name)[key], value, rtol=2e-5, atol=2e-6
+                )
+        torch.testing.assert_close(
+            arena_decode(incremental, arena, [tail_slot], [width], follow_codes),
+            arena_decode(incremental, arena, [alone_slot], [width], follow_codes),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+
+
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
@@ -1116,6 +1204,73 @@ def test_windowed_replays_match_one_eager_decode_and_its_arena_state(
         for key in graph_mapping:
             torch.testing.assert_close(graph_mapping[key], eager_mapping[key])
     assert arena.gather([bystander]).frame_positions.tolist() == [0]
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tail_graph_replays_match_eager_tail_decodes_and_reuse_their_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Captured tail widths serve rows of different widths, replay after replay, and
+    leave the arena rows where the eager tail decode does; pad rows touch only scratch.
+    """
+    torch.manual_seed(43)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    device = torch.device("cuda", torch.cuda.current_device())
+    decoder = Decoder().to(device).eval()
+    incremental = Qwen3TTSIncrementalDecoder(decoder)
+    arena = Qwen3TTSCodecStateArena(
+        incremental, num_slots=10, device=device, dtype=torch.float32
+    )
+    tail_frames = incremental.tail_frames(1)
+    runner = Qwen3TTSIncrementalCodecCudaGraphRunner(
+        incremental,
+        device=device,
+        dtype=torch.float32,
+        num_quantizers=2,
+        mode="tail",
+        fresh_frames=(tail_frames + 2, tail_frames + 8),
+        batch_sizes=(1, 4),
+        min_free_gb=0.0,
+        arena=arena,
+        emit_frames=1,
+    )
+    runner.capture()
+    assert len(runner.stats()["build"]["captured_keys"]) == 4
+    bystander = arena.acquire()
+
+    for widths in ([tail_frames + 6, tail_frames + 1, tail_frames], [tail_frames + 2]):
+        slots = [arena.acquire() for _ in widths]
+        reference_slots = [arena.acquire() for _ in widths]
+        codes = torch.randint(0, 16, (len(widths), 2, max(widths)), device=device)
+        reference_state = arena.gather(reference_slots)
+        expected = incremental.decode_tail(
+            codes, torch.tensor(widths, device=device), reference_state, 1
+        )
+        arena.scatter(reference_slots, reference_state)
+
+        waveform = runner.decode_slots(codes, slots, valid_frames=widths)
+        assert waveform is not None
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(waveform, expected, rtol=2e-4, atol=2e-5)
+        graph_state = arena.gather(slots)
+        eager_state = arena.gather(reference_slots)
+        assert graph_state.frame_positions.tolist() == widths
+        for name in (
+            "conv_histories",
+            "transconv_overlaps",
+            "transformer_keys",
+            "transformer_values",
+        ):
+            for key, value in getattr(eager_state, name).items():
+                torch.testing.assert_close(
+                    getattr(graph_state, name)[key], value, rtol=2e-4, atol=2e-5
+                )
+
+    assert runner.stats()["runtime"]["replays"] == 2
+    untouched = arena.gather([bystander])
+    assert untouched.frame_positions.tolist() == [0]
+    assert torch.count_nonzero(untouched.transformer_keys[0]).item() == 0
 
 
 @pytest.mark.benchmark

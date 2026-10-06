@@ -28,6 +28,9 @@ from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     Qwen3TTSIncrementalCodecCudaGraphRunner,
 )
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+from sglang_omni.models.qwen3_tts.reference_encoder_cuda_graph import (
+    DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES,
+)
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGraph
 from sglang_omni.profiler.event_recorder import (
@@ -190,12 +193,17 @@ class IncrementalDecodePlan:
 
 @dataclass(eq=False)
 class IncrementalDecodeBatch:
-    """Cohort-wide arena bookkeeping for one incremental launch."""
+    """Cohort-wide arena bookkeeping for one incremental launch.
+
+    A cohort with a tail_runner holds reference-prefixed first chunks of different
+    widths, decoded by one decode_tail replay.
+    """
 
     decoder: Qwen3TTSIncrementalDecoder
     arena: Qwen3TTSCodecStateArena
     slots: list[int]
     cohort_state: Qwen3TTSIncrementalCodecState | None = None
+    tail_runner: Qwen3TTSIncrementalCodecCudaGraphRunner | None = None
 
     def gathered(self) -> Qwen3TTSIncrementalCodecState:
         """The cohort's rows on the host-driven path; the graph path skips this."""
@@ -831,6 +839,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         (
             self.initial_incremental_decode_graphs,
             self.initial_window_decode_graphs,
+            self.initial_tail_decode_graphs,
             self.followup_incremental_graph_holders,
         ) = self.build_incremental_graph_runners(
             worker_count=worker_count,
@@ -964,10 +973,11 @@ class Qwen3TTSStreamingVocoderScheduler(
     ) -> tuple[
         Qwen3TTSIncrementalCodecCudaGraphRunner | None,
         Qwen3TTSIncrementalCodecCudaGraphRunner | None,
+        Qwen3TTSIncrementalCodecCudaGraphRunner | None,
         tuple[Qwen3TTSIncrementalCodecCudaGraphRunner, ...],
     ]:
         if self.incremental_decoder is None:
-            return (None, None, ())
+            return (None, None, None, ())
         else:
             pass
         graph_enabled = bool(
@@ -1016,6 +1026,22 @@ class Qwen3TTSStreamingVocoderScheduler(
             if window_frames
             else None
         )
+        # note (ratish): reference codes come at the reference encoder's lengths, so the
+        # first chunks they prefix pad to that ladder; padding costs only the frame part.
+        tail = Qwen3TTSIncrementalCodecCudaGraphRunner(
+            self.incremental_decoder,
+            device=self.device,
+            dtype=dtype,
+            num_quantizers=num_quantizers,
+            mode="tail",
+            fresh_frames=DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES,
+            batch_sizes=graph_batch_sizes,
+            min_free_gb=min_free_gb,
+            enabled=graph_enabled,
+            arena=self.codec_arena,
+            stream_priority=graph_priority,
+            emit_frames=self.default_initial_chunk_frames or self.stream_stride,
+        )
         warm_fresh_frames = tuple(
             sorted(
                 {*self.followup_stride_ramp, *range(1, self.stream_followup_stride + 1)}
@@ -1053,7 +1079,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 for _ in range(worker_count)
             )
         )
-        return (initial, window, followups)
+        return (initial, window, tail, followups)
 
     def codec_state_stats(self) -> CodecStateStats:
         """Snapshot of incremental Codec state usage."""
@@ -1073,6 +1099,11 @@ class Qwen3TTSStreamingVocoderScheduler(
             "window": (
                 self.initial_window_decode_graphs.stats()
                 if self.initial_window_decode_graphs is not None
+                else {"enabled": False}
+            ),
+            "tail": (
+                self.initial_tail_decode_graphs.stats()
+                if self.initial_tail_decode_graphs is not None
                 else {"enabled": False}
             ),
             "warm": [
@@ -1128,6 +1159,10 @@ class Qwen3TTSStreamingVocoderScheduler(
             pass
         if self.initial_window_decode_graphs is not None:
             self.initial_window_decode_graphs.capture()
+        else:
+            pass
+        if self.initial_tail_decode_graphs is not None:
+            self.initial_tail_decode_graphs.capture()
         else:
             pass
 
@@ -1786,7 +1821,19 @@ class Qwen3TTSStreamingVocoderScheduler(
             return Qwen3TTSDecodeHandle(deltas, bad_rows=None)
         else:
             pass
-        decoder_input = torch.cat([plan.decoder_input for plan in plans], dim=0)
+        if incremental is not None and incremental.tail_runner is not None:
+            width = max(plan.fresh_frames for plan in plans)
+            decoder_input = torch.cat(
+                [
+                    torch.nn.functional.pad(
+                        plan.decoder_input, (0, width - plan.fresh_frames)
+                    )
+                    for plan in plans
+                ],
+                dim=0,
+            )
+        else:
+            decoder_input = torch.cat([plan.decoder_input for plan in plans], dim=0)
         bad_rows = self.screen_out_of_range_codes(decoder_input)
         with torch.inference_mode():
             if stream is None:
@@ -1824,6 +1871,21 @@ class Qwen3TTSStreamingVocoderScheduler(
         Returns each row's new samples and the waveform they view, which the
         caller keeps alive until they are copied out.
         """
+        if incremental.tail_runner is not None:
+            waveform = incremental.tail_runner.decode_slots(
+                gpu_input,
+                incremental.slots,
+                valid_frames=[plan.fresh_frames for plan in plans],
+            )
+            if waveform is None:
+                raise RuntimeError(
+                    "Qwen3-TTS incremental Codec tail graph missed a captured shape"
+                )
+            else:
+                pass
+            return (self.split_batch_waveform(waveform, len(plans)), waveform)
+        else:
+            pass
         width = plans[0].fresh_frames
         runner = self.runner_for_stream(
             stream, self.initial_incremental_decode_graphs, "incremental_graphs"
@@ -2530,22 +2592,60 @@ class Qwen3TTSStreamingVocoderScheduler(
                     planned_incremental.append((request_id, state, plan))
                 else:
                     planned.append((request_id, state, plan))
-        for cohort in self.group_decode_plans(planned_incremental):
-            for group in self.split_incremental_group_for_graph(
-                cohort,
-                runner=self.initial_incremental_decode_graphs,
-                window_runner=self.initial_window_decode_graphs,
+        tail_runner = self.initial_tail_decode_graphs
+        tail_entries: list[tuple[str, Qwen3TTSStreamState, IncrementalDecodePlan]] = []
+        other_entries: list[tuple[str, Qwen3TTSStreamState, IncrementalDecodePlan]] = []
+        for entry in planned_incremental:
+            plan = entry[2]
+            emit_frames = plan.generated_frames - plan.emitted_generated_frames
+            # note (ratish): a cold first chunk whose frames before the emitted ones are
+            # all reference frames; the tail graphs decode it without that audio.
+            if (
+                tail_runner is not None
+                and tail_runner.enabled
+                and plan.reference_trim_frames == plan.fresh_frames - emit_frames > 0
+                and emit_frames == tail_runner.emit_frames
+                and tail_runner.tail_frames
+                <= plan.fresh_frames
+                <= tail_runner.fresh_frames[-1]
             ):
-                decoded = self.decode_incremental_group(
-                    group, stream=self.decode_stream
+                tail_entries.append(entry)
+            else:
+                other_entries.append(entry)
+        incremental_groups: list[
+            tuple[
+                list[tuple[str, Qwen3TTSStreamState, IncrementalDecodePlan]],
+                Qwen3TTSIncrementalCodecCudaGraphRunner | None,
+            ]
+        ] = []
+        if tail_entries:
+            bucket = tail_runner.largest_batch_bucket()
+            incremental_groups.extend(
+                (tail_entries[index : index + bucket], tail_runner)
+                for index in range(0, len(tail_entries), bucket)
+            )
+        else:
+            pass
+        for cohort in self.group_decode_plans(other_entries):
+            incremental_groups.extend(
+                (group, None)
+                for group in self.split_incremental_group_for_graph(
+                    cohort,
+                    runner=self.initial_incremental_decode_graphs,
+                    window_runner=self.initial_window_decode_graphs,
                 )
-                if decoded is None:
-                    continue
-                else:
-                    pass
-                for decoded_entry, delta in zip(*decoded):
-                    request_id, state, plan = decoded_entry
-                    self.commit_initial(request_id, state, plan, delta)
+            )
+        for group, group_tail_runner in incremental_groups:
+            decoded = self.decode_incremental_group(
+                group, stream=self.decode_stream, tail_runner=group_tail_runner
+            )
+            if decoded is None:
+                continue
+            else:
+                pass
+            for decoded_entry, delta in zip(*decoded):
+                request_id, state, plan = decoded_entry
+                self.commit_initial(request_id, state, plan, delta)
         for group in self.group_decode_plans(planned):
             decoded = self.decode_group(group, stream=self.decode_stream)
             if decoded is None:
@@ -2654,6 +2754,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         group: list[tuple[str, Qwen3TTSStreamState, IncrementalDecodePlan]],
         *,
         stream: torch.Stream | None,
+        tail_runner: Qwen3TTSIncrementalCodecCudaGraphRunner | None = None,
     ) -> (
         tuple[
             list[tuple[str, Qwen3TTSStreamState, IncrementalDecodePlan]],
@@ -2662,7 +2763,9 @@ class Qwen3TTSStreamingVocoderScheduler(
         | None
     ):
         """Decode a cohort and return the surviving entries with their deltas."""
-        pending = self.launch_incremental_group(group, stream=stream)
+        pending = self.launch_incremental_group(
+            group, stream=stream, tail_runner=tail_runner
+        )
         if pending is None:
             return None
         else:
@@ -2674,6 +2777,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         group: list[tuple[str, Qwen3TTSStreamState, IncrementalDecodePlan]],
         *,
         stream: torch.Stream | None,
+        tail_runner: Qwen3TTSIncrementalCodecCudaGraphRunner | None = None,
     ) -> PendingIncrementalGroup | None:
         """Launch one cohort and return it pending, or None after a fallback.
 
@@ -2693,7 +2797,10 @@ class Qwen3TTSStreamingVocoderScheduler(
                     [entry[2] for entry in group],
                     stream=stream,
                     incremental=IncrementalDecodeBatch(
-                        decoder=decoder, arena=arena, slots=slots
+                        decoder=decoder,
+                        arena=arena,
+                        slots=slots,
+                        tail_runner=tail_runner,
                     ),
                 )
             except Qwen3TTSInvalidCodeRows as exc:

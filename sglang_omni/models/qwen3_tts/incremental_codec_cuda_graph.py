@@ -57,6 +57,7 @@ class CapturedIncrementalCodecGraph:
     static_codes: torch.Tensor
     static_index: torch.Tensor
     waveform: torch.Tensor
+    static_valid_frames: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -102,7 +103,9 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
     workers run on different CUDA streams; each mutable buffer set must be
     replayed serially by only one worker. WINDOW is a second instance on the
     initial worker's stream holding the widths a wider decode is split into,
-    so a failed capture there leaves the COLD shapes in place.
+    so a failed capture there leaves the COLD shapes in place. TAIL, also on
+    the initial worker's stream, decodes reference-prefixed first chunks of
+    different widths padded to one captured width (decode_tail).
     """
 
     WARMUP_ITERATIONS = 3
@@ -114,7 +117,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         device: torch.device,
         dtype: torch.dtype,
         num_quantizers: int,
-        mode: Literal["cold", "warm", "window"],
+        mode: Literal["cold", "warm", "window", "tail"],
         fresh_frames: tuple[int, ...],
         batch_sizes: tuple[int, ...] = (1, 2, 4, 8),
         min_free_gb: float = 3.0,
@@ -122,6 +125,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         compile_fresh_frames: Sequence[int] = (),
         arena: Qwen3TTSCodecStateArena,
         stream_priority: int = 0,
+        emit_frames: int = 0,
     ) -> None:
         self.decoder = decoder
         self.compile_fresh_frames = frozenset((int(f) for f in compile_fresh_frames))
@@ -131,15 +135,30 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         self.dtype = dtype
         self.num_quantizers = int(num_quantizers)
         self.mode = str(mode).strip().lower()
-        if self.mode not in {"cold", "warm", "window"}:
+        if self.mode not in {"cold", "warm", "window", "tail"}:
             raise ValueError(
-                "incremental Codec graph mode must be 'cold', 'warm' or 'window'"
+                "incremental Codec graph mode must be 'cold', 'warm', 'window' or 'tail'"
             )
         else:
             pass
         self.fresh_frames = tuple(
             sorted({int(frames) for frames in fresh_frames if int(frames) > 0})
         )
+        self.emit_frames = int(emit_frames)
+        if self.mode == "tail":
+            if self.emit_frames <= 0:
+                raise ValueError("a tail incremental Codec graph needs emit_frames > 0")
+            else:
+                pass
+            self.tail_frames = decoder.tail_frames(self.emit_frames)
+            if self.fresh_frames and self.fresh_frames[0] < self.tail_frames:
+                raise ValueError(
+                    f"tail incremental Codec graph widths must be >= {self.tail_frames}, got {self.fresh_frames}"
+                )
+            else:
+                pass
+        else:
+            self.tail_frames = 0
         self.batch_sizes = tuple(
             sorted({int(size) for size in batch_sizes if int(size) > 0})
         )
@@ -286,16 +305,30 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             dtype=torch.long,
             device=self.device,
         )
+        static_valid_frames = (
+            torch.full(
+                (key.batch_bucket,),
+                key.fresh_frames,
+                dtype=torch.long,
+                device=self.device,
+            )
+            if self.mode == "tail"
+            else None
+        )
         resources = CaptureResourceSet(
             pool=pool, stream=capture_stream, keepalives=[static_codes]
         )
         graph: ReplayableGraph | None = None
         try:
-            self.warmup_capture_shape(key, static_codes, resources)
+            self.warmup_capture_shape(key, static_codes, static_valid_frames, resources)
             current_stream = self.device_module.current_stream(self.device)
             compiled = key.fresh_frames in self.compile_fresh_frames
             static_index = self.scratch_index(key.batch_bucket)
             resources.keepalives.append(static_index)
+            if static_valid_frames is not None:
+                resources.keepalives.append(static_valid_frames)
+            else:
+                pass
             capture_stream.wait_stream(current_stream)
             try:
                 with (
@@ -308,8 +341,8 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
                 ):
                     resources.keepalives.append(graph)
                     state = self.arena.gather_by_index(static_index)
-                    waveform = self.decoder.decode(
-                        static_codes, state, compiled=compiled
+                    waveform = self.decode_captured(
+                        static_codes, static_valid_frames, state, compiled=compiled
                     )
                     self.arena.scatter_by_index(static_index, state)
             finally:
@@ -322,6 +355,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
                 static_codes=static_codes,
                 static_index=static_index,
                 waveform=waveform,
+                static_valid_frames=static_valid_frames,
             )
         except BaseException:
             synchronized = self.retain_capture_resources_if_unsynchronized(resources)
@@ -335,6 +369,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         self,
         key: IncrementalCodecGraphKey,
         static_codes: torch.Tensor,
+        static_valid_frames: torch.Tensor | None,
         resources: CaptureResourceSet,
     ) -> None:
         """Run eager decodes that settle one shape before graph capture."""
@@ -355,9 +390,27 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
                     self.scratch_index(key.batch_bucket)
                 )
                 resources.keepalives.append(warmup_state)
-                self.decoder.decode(static_codes, warmup_state, compiled=compiled)
+                self.decode_captured(
+                    static_codes, static_valid_frames, warmup_state, compiled=compiled
+                )
         capture_stream.synchronize()
         del resources.keepalives[1:]
+
+    def decode_captured(
+        self,
+        codes: torch.Tensor,
+        valid_frames: torch.Tensor | None,
+        state: Qwen3TTSIncrementalCodecState,
+        *,
+        compiled: bool,
+    ) -> torch.Tensor:
+        """The decode a captured graph holds: decode_tail in tail mode, decode otherwise."""
+        if valid_frames is not None:
+            return self.decoder.decode_tail(
+                codes, valid_frames, state, self.emit_frames
+            )
+        else:
+            return self.decoder.decode(codes, state, compiled=compiled)
 
     def retain_capture_resources_if_unsynchronized(
         self, resources: CaptureResourceSet
@@ -488,12 +541,16 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         )
 
     def decode_slots(
-        self, codes: torch.Tensor, slots: Sequence[int]
+        self,
+        codes: torch.Tensor,
+        slots: Sequence[int],
+        valid_frames: Sequence[int] | None = None,
     ) -> torch.Tensor | None:
         """Replay the bucket that fits this cohort directly against the arena.
 
         Returns the borrowed waveform rows, or None on a graph miss. Rows past
-        the cohort read and write the arena's scratch row.
+        the cohort read and write the arena's scratch row. A tail runner takes each
+        row's valid width and replays the smallest captured width that holds the codes.
         """
         if os.getpid() != self.owner_pid:
             raise RuntimeError(
@@ -508,15 +565,38 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         else:
             pass
         self.validate_codes(codes)
-        if int(codes.shape[2]) not in self.fresh_frames:
+        batch_size = int(codes.shape[0])
+        code_frames = int(codes.shape[2])
+        if batch_size != len(slots):
+            raise ValueError("decode_slots needs one slot per code row")
+        elif self.mode == "tail" and (
+            valid_frames is None
+            or len(valid_frames) != batch_size
+            or not all(
+                self.tail_frames <= int(frames) <= code_frames
+                for frames in valid_frames
+            )
+        ):
+            raise ValueError(
+                f"a tail incremental Codec graph needs one valid width per row in [{self.tail_frames}, {code_frames}], got {valid_frames}"
+            )
+        elif self.mode != "tail" and valid_frames is not None:
+            raise ValueError("only a tail incremental Codec graph takes valid widths")
+        else:
+            pass
+        width = next(
+            (
+                frames
+                for frames in self.fresh_frames
+                if frames == code_frames
+                or (self.mode == "tail" and frames > code_frames)
+            ),
+            None,
+        )
+        if width is None:
             with self.graphs_lock:
                 self.misses["uncaptured_fresh_frames"] += 1
             return None
-        else:
-            pass
-        batch_size = int(codes.shape[0])
-        if batch_size != len(slots):
-            raise ValueError("decode_slots needs one slot per code row")
         else:
             pass
         bucket = next(
@@ -524,7 +604,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
                 size
                 for size in self.batch_sizes
                 if size >= batch_size
-                and IncrementalCodecGraphKey(int(codes.shape[2]), size) in self.graphs
+                and IncrementalCodecGraphKey(width, size) in self.graphs
             ),
             None,
         )
@@ -534,14 +614,25 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             return None
         else:
             pass
-        entry = self.graphs[IncrementalCodecGraphKey(int(codes.shape[2]), bucket)]
+        entry = self.graphs[IncrementalCodecGraphKey(width, bucket)]
         entry.static_index[:batch_size].copy_(self.arena.stage_index(slots))
         if batch_size < bucket:
             entry.static_index[batch_size:].fill_(int(self.arena.scratch_slot))
             entry.static_codes[batch_size:].zero_()
         else:
             pass
-        entry.static_codes[:batch_size].copy_(codes)
+        entry.static_codes[:batch_size, :, :code_frames].copy_(codes)
+        if code_frames < width:
+            entry.static_codes[:batch_size, :, code_frames:].zero_()
+        else:
+            pass
+        if entry.static_valid_frames is not None:
+            entry.static_valid_frames[:batch_size].copy_(
+                self.arena.staged("valid_frames", valid_frames)
+            )
+            entry.static_valid_frames[batch_size:].fill_(width)
+        else:
+            pass
         try:
             entry.graph.replay()
         except Exception as exc:

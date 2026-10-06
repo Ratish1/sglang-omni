@@ -117,7 +117,9 @@ def async_incremental_scheduler(
 
 
 def test_incremental_codec_graph_rejects_unknown_mode() -> None:
-    with pytest.raises(ValueError, match="mode must be 'cold', 'warm' or 'window'"):
+    with pytest.raises(
+        ValueError, match="mode must be 'cold', 'warm', 'window' or 'tail'"
+    ):
         Qwen3TTSIncrementalCodecCudaGraphRunner(
             SimpleNamespace(),
             device=torch.device("cpu"),
@@ -394,6 +396,7 @@ def test_incremental_codec_graphs_capture_during_vocoder_warmup() -> None:
     scheduler.followup_graph_holders = (graph_holder("whole-sequence-followup"),)
     scheduler.initial_incremental_decode_graphs = graph_holder("cold")
     scheduler.initial_window_decode_graphs = graph_holder("window")
+    scheduler.initial_tail_decode_graphs = graph_holder("tail")
     scheduler.followup_incremental_graph_holders = (graph_holder("warm"),)
 
     scheduler.warmup_now()
@@ -404,6 +407,7 @@ def test_incremental_codec_graphs_capture_during_vocoder_warmup() -> None:
         "warm",
         "cold",
         "window",
+        "tail",
     ]
 
 
