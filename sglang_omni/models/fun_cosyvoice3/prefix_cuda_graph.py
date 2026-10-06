@@ -27,7 +27,6 @@ from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGra
 
 logger = logging.getLogger(__name__)
 
-# note(ratish): kernel loads and one-time allocations happen here, not in the recorded run.
 CAPTURE_WARMUP_RUNS = 2
 
 
@@ -78,7 +77,6 @@ class PrefixCudaGraphRunner:
         self.euler_steps = euler_steps
         self.mel_channels = mel_channels
         self.speaker_channels = speaker_channels
-        # note(ratish): the decode batch size ladder, over a step's rows.
         row_ladder = sorted(
             {
                 rows
@@ -91,7 +89,6 @@ class PrefixCudaGraphRunner:
         chunk_size = estimator.chunk_size
         self.layouts: list[PrefixStepLayout] = []
         for frames in self.tier_frames:
-            # note(ratish): a row adds at least the shortest hop.
             row_slots = min(max_rows, frames // min_hop_frames)
             self.layouts.append(
                 PrefixStepLayout(

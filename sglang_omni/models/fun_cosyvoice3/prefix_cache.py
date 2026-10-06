@@ -73,7 +73,6 @@ class PrefixKVPool:
         dtype: torch.dtype,
     ) -> None:
         block_count = max(int(capacity_frames) // BLOCK_FRAMES, 0)
-        # note(ratish): never handed out; padding frames of a step write and read it.
         self.padding_block = block_count
         shape = ((block_count + 1) * BLOCK_FRAMES, FA3_PAGE_SIZE, head_num, head_dim)
         # Note (Jiaxin Deng): separate storages, not views of one slab: the
