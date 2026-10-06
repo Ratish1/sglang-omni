@@ -122,6 +122,10 @@ for name in ${ROUNDS:-c16 c16_swapped longform_c16 longform_c16_swapped c1_seede
     c1_seed_*) round "$name" "$CARD1" "$CARD2" yes $META --concurrency 1 --seed "${name#c1_seed_}" ;;
     #conc_<n>: a scored pair at concurrency n
     conc_*) round "$name" "$CARD1" "$CARD2" yes $META --concurrency "${name#conc_}" ;;
+    #rate_<r>: open loop at r requests per second under a c64 cap, the same arrival times on both arms,
+    # so both serve equal load; rate_<r>_swapped swaps the cards
+    rate_*_swapped) r=${name#rate_}; round "$name" "$CARD2" "$CARD1" no $META --concurrency 64 --request-rate "${r%_swapped}" --arrival-seed 1234 ;;
+    rate_*) round "$name" "$CARD1" "$CARD2" no $META --concurrency 64 --request-rate "${name#rate_}" --arrival-seed 1234 ;;
   esac
 done
 echo "all done $(date +%T)" > "$OUT/DONE"
