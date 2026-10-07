@@ -12,6 +12,8 @@ import torch
 from sglang.srt.sampling.penaltylib import BatchedRepetitionPenalizer
 
 from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+from sglang_omni.scheduling import omni_scheduler
+from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 
 
 class TinyModel(torch.nn.Module):
@@ -345,3 +347,56 @@ def test_fresh_prefill_still_uses_prompt_only_buffer() -> None:
     out = make_runner().build_prefill_input_embeds(forward_batch, [sched_req])
 
     assert torch.equal(out, prompt[1:5])
+
+
+def chunking_scheduler() -> OmniScheduler:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.arange(20, dtype=torch.int32).view(2, 10)
+    )
+    return scheduler
+
+
+def chunked_req(*, has_output: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        skip_radix_cache_insert=has_output,
+        _omni_prompt_only_radix=True,
+        kv=SimpleNamespace(req_pool_idx=1),
+        extend_range=SimpleNamespace(end=3),
+        prefix_indices=torch.empty((0,), dtype=torch.int64),
+    )
+
+
+def test_a_retracted_reprefill_chunk_advances_without_a_tree_insert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sglang_stash_calls = []
+    monkeypatch.setattr(
+        omni_scheduler._Upstream,  # noqa: leading-underscore  # production name
+        "stash_chunked_request",
+        lambda scheduler, req: sglang_stash_calls.append(req),
+    )
+    req = chunked_req(has_output=True)
+
+    chunking_scheduler().stash_chunked_request(req)
+
+    assert req.prefix_indices.tolist() == [10, 11, 12]
+    assert req.prefix_indices.dtype == torch.int64
+    assert sglang_stash_calls == []
+
+
+def test_a_fresh_prompt_chunk_keeps_sglangs_stash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sglang_stash_calls = []
+    monkeypatch.setattr(
+        omni_scheduler._Upstream,  # noqa: leading-underscore  # production name
+        "stash_chunked_request",
+        lambda scheduler, req: sglang_stash_calls.append(req),
+    )
+    req = chunked_req(has_output=False)
+
+    chunking_scheduler().stash_chunked_request(req)
+
+    assert sglang_stash_calls == [req]
+    assert req.prefix_indices.numel() == 0
