@@ -74,6 +74,20 @@ class CaptureResourceSet:
     ] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class IncrementalCodecGraphPool:
+    """One graph memory pool and capture stream for runners that replay on one stream.
+
+    Graphs captured on one stream into one pool reuse each other's intermediate
+    memory, which is safe only while each replay's output is copied out on that
+    stream before the next replay. The first capture creates the pool and stream.
+    """
+
+    stream_priority: int
+    handle: DeviceGraphPool | None = None
+    capture_stream: torch.Stream | None = None
+
+
 class CaptureFailure(RuntimeError):
     pass
 
@@ -105,7 +119,8 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
     initial worker's stream holding the widths a wider decode is split into,
     so a failed capture there leaves the COLD shapes in place. TAIL, also on
     the initial worker's stream, decodes reference-prefixed first chunks of
-    different widths padded to one captured width (decode_tail).
+    different widths padded to one captured width (decode_tail). Runners that
+    replay on one stream share their graph_pool.
     """
 
     WARMUP_ITERATIONS = 3
@@ -124,13 +139,13 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         enabled: bool = True,
         compile_fresh_frames: Sequence[int] = (),
         arena: Qwen3TTSCodecStateArena,
-        stream_priority: int = 0,
+        graph_pool: IncrementalCodecGraphPool,
         emit_frames: int = 0,
     ) -> None:
         self.decoder = decoder
         self.compile_fresh_frames = frozenset((int(f) for f in compile_fresh_frames))
         self.arena = arena
-        self.stream_priority = int(stream_priority)
+        self.graph_pool = graph_pool
         self.device = torch.device(device)
         self.dtype = dtype
         self.num_quantizers = int(num_quantizers)
@@ -185,8 +200,6 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         self.owner_pid = os.getpid()
         self.graphs: dict[IncrementalCodecGraphKey, CapturedIncrementalCodecGraph] = {}
         self.capture_complete = False
-        self.pool: DeviceGraphPool | None = None
-        self.capture_stream: torch.Stream | None = None
         self.memory_stats: dict[str, int | dict[str, int]] = {
             "min_free_bytes": self.min_free_bytes
         }
@@ -217,10 +230,15 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
                 before = self.memory_snapshot()
                 self.memory_stats["before"] = before
                 self.require_headroom(before["free_bytes"])
-                pool = self.graph_backend.graph_pool_handle()
-                capture_stream = self.device_module.Stream(
-                    device=self.device, priority=self.stream_priority
-                )
+                if self.graph_pool.handle is None:
+                    self.graph_pool.handle = self.graph_backend.graph_pool_handle()
+                    self.graph_pool.capture_stream = self.device_module.Stream(
+                        device=self.device, priority=self.graph_pool.stream_priority
+                    )
+                else:
+                    pass
+                pool = self.graph_pool.handle
+                capture_stream = self.graph_pool.capture_stream
                 for key in sorted(
                     keys,
                     key=lambda item: (item.batch_bucket, item.fresh_frames),
@@ -254,8 +272,6 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             return
         with self.graphs_lock:
             self.graphs = temporary
-        self.pool = pool
-        self.capture_stream = capture_stream
         self.enabled = bool(self.graphs)
         self.disable_reason = None if self.enabled else "no_graphs_captured"
         logger.info(
@@ -446,8 +462,6 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
     ) -> None:
         with self.graphs_lock:
             self.graphs.clear()
-        self.pool = None
-        self.capture_stream = None
         self.enabled = False
         self.disable_reason = reason
         if not self.synchronize_device("capture rollback"):
@@ -683,8 +697,6 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         with self.graphs_lock:
             graphs = dict(self.graphs)
             self.graphs.clear()
-        self.pool = None
-        self.capture_stream = None
         self.tear_down_graphs(graphs, context="runtime disable")
 
     def stats(self) -> IncrementalCodecGraphStats:
@@ -727,6 +739,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
 
 __all__ = [
     "IncrementalCodecGraphKey",
+    "IncrementalCodecGraphPool",
     "Qwen3TTSIncrementalCodecCudaGraphRunner",
     "split_frames_by_width",
 ]

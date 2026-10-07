@@ -432,6 +432,11 @@ def test_qwen3_tts_engine_attaches_the_vocoder_speech_tokenizer_before_the_pool(
     )
     monkeypatch.setattr(qwen3_stages, "_SPEECH_TOKENIZERS", {})
     monkeypatch.setattr(
+        qwen3_stages,
+        "load_qwen3_tts_checkpoint_config",
+        lambda model_path: {"tts_model_type": "base"},
+    )
+    monkeypatch.setattr(
         qwen3_stages, "Qwen3TTSStreamingVocoderScheduler", FakeScheduler
     )
     monkeypatch.setattr(
@@ -2301,6 +2306,11 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
         "load_qwen3_tts_tokenizer",
         lambda *args, **kwargs: FakeTokenizer(),
     )
+    monkeypatch.setattr(
+        stages,
+        "load_qwen3_tts_checkpoint_config",
+        lambda model_path: {"tts_model_type": "base"},
+    )
     warmed_schedulers: list[Qwen3TTSStreamingVocoderScheduler] = []
     monkeypatch.setattr(
         Qwen3TTSStreamingVocoderScheduler,
@@ -2373,6 +2383,11 @@ def test_qwen3_tts_vocoder_factory_forwards_incremental_graph_config(
         "Qwen3TTSStreamingVocoderScheduler",
         FakeScheduler,
     )
+    monkeypatch.setattr(
+        qwen3_stages,
+        "load_qwen3_tts_checkpoint_config",
+        lambda model_path: {"tts_model_type": "base"},
+    )
 
     scheduler = qwen3_stages.create_vocoder_executor(
         "model",
@@ -2396,7 +2411,7 @@ def test_qwen3_tts_vocoder_factory_forwards_incremental_graph_config(
 
 
 def vocoder_factory_capture(
-    monkeypatch: pytest.MonkeyPatch, **factory_kwargs
+    monkeypatch: pytest.MonkeyPatch, *, tts_model_type: str = "base", **factory_kwargs
 ) -> dict[str, object]:
     """Build the vocoder stage against a stand-in scheduler and return its kwargs."""
     captured: dict[str, object] = {}
@@ -2417,6 +2432,11 @@ def vocoder_factory_capture(
     )
     monkeypatch.setattr(
         qwen3_stages, "Qwen3TTSStreamingVocoderScheduler", FakeScheduler
+    )
+    monkeypatch.setattr(
+        qwen3_stages,
+        "load_qwen3_tts_checkpoint_config",
+        lambda model_path: {"tts_model_type": tts_model_type},
     )
     qwen3_stages.create_vocoder_executor("model", device="cpu", **factory_kwargs)
     return captured
@@ -2475,6 +2495,23 @@ def test_qwen3_tts_vocoder_factory_forwards_an_async_decode_opt_out(
     captured = vocoder_factory_capture(monkeypatch, async_decode=False)
 
     assert captured["async_decode"] is False
+
+
+@pytest.mark.parametrize(
+    ("tts_model_type", "has_reference_prefixed_first_chunks"),
+    [("base", True), ("custom_voice", False), ("voice_design", False)],
+)
+def test_qwen3_tts_vocoder_factory_expects_reference_codes_only_from_base(
+    monkeypatch: pytest.MonkeyPatch,
+    tts_model_type: str,
+    has_reference_prefixed_first_chunks: bool,
+) -> None:
+    captured = vocoder_factory_capture(monkeypatch, tts_model_type=tts_model_type)
+
+    assert (
+        captured["has_reference_prefixed_first_chunks"]
+        is has_reference_prefixed_first_chunks
+    )
 
 
 class FakeQwen3TTSDecoder(torch.nn.Module):
@@ -2716,6 +2753,53 @@ def test_qwen3_tts_empty_window_frames_disable_the_window_runner(
 
     assert scheduler.initial_window_decode_graphs is None
     assert scheduler.codec_state_stats()["cuda_graphs"]["window"] == {"enabled": False}
+
+
+def test_qwen3_tts_initial_worker_graph_runners_share_one_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        qwen3_streaming_vocoder,
+        "Qwen3TTSIncrementalDecoder",
+        FakeIncrementalQwen3TTSDecoder,
+    )
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        FakeQwen3TTSSpeechTokenizer(),
+        device="cpu",
+        async_decode=True,
+        enable_stateful_codec_decoder=True,
+        has_reference_prefixed_first_chunks=True,
+    )
+
+    initial_pool = scheduler.initial_incremental_decode_graphs.graph_pool
+    assert scheduler.initial_window_decode_graphs.graph_pool is initial_pool
+    assert scheduler.initial_tail_decode_graphs.graph_pool is initial_pool
+    followup_pools = [
+        runner.graph_pool for runner in scheduler.followup_incremental_graph_holders
+    ]
+    assert len({id(pool) for pool in (initial_pool, *followup_pools)}) == (
+        1 + len(followup_pools)
+    )
+
+
+def test_qwen3_tts_tail_graphs_need_reference_prefixed_first_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        qwen3_streaming_vocoder,
+        "Qwen3TTSIncrementalDecoder",
+        FakeIncrementalQwen3TTSDecoder,
+    )
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        FakeQwen3TTSSpeechTokenizer(),
+        device="cpu",
+        async_decode=True,
+        enable_stateful_codec_decoder=True,
+        has_reference_prefixed_first_chunks=False,
+    )
+
+    assert scheduler.initial_tail_decode_graphs is None
+    assert scheduler.codec_state_stats()["cuda_graphs"]["tail"] == {"enabled": False}
 
 
 def test_qwen3_tts_window_frames_must_be_positive() -> None:
@@ -4974,6 +5058,11 @@ def test_qwen3_tts_vocoder_factory_forwards_chunk_ramp(
         stages,
         "load_qwen3_tts_tokenizer",
         lambda *args, **kwargs: FakeQwen3TTSSpeechTokenizer(),
+    )
+    monkeypatch.setattr(
+        stages,
+        "load_qwen3_tts_checkpoint_config",
+        lambda model_path: {"tts_model_type": "base"},
     )
     monkeypatch.setattr(
         Qwen3TTSStreamingVocoderScheduler, "warmup_now", lambda scheduler: None

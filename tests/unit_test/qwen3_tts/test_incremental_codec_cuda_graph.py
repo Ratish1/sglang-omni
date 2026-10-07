@@ -12,6 +12,7 @@ from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalCo
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     CaptureResourceSet,
     IncrementalCodecGraphKey,
+    IncrementalCodecGraphPool,
     Qwen3TTSIncrementalCodecCudaGraphRunner,
     split_frames_by_width,
 )
@@ -129,6 +130,7 @@ def test_incremental_codec_graph_rejects_unknown_mode() -> None:
             fresh_frames=(8,),
             enabled=False,
             arena=SimpleNamespace(scratch_slot=0),
+            graph_pool=IncrementalCodecGraphPool(stream_priority=0),
         )
 
 
@@ -149,6 +151,7 @@ def make_runner(**kwargs) -> Qwen3TTSIncrementalCodecCudaGraphRunner:
         fresh_frames=(8,),
         enabled=False,
         arena=FakeArena(),
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
         **kwargs,
     )
     runner.enabled = True
@@ -269,6 +272,7 @@ def test_incremental_codec_graph_accepts_the_window_mode() -> None:
         fresh_frames=(8, 2, 4),
         enabled=False,
         arena=FakeArena(),
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
     )
 
     assert runner.stats()["binding"]["mode"] == "window"
@@ -327,6 +331,7 @@ def test_incremental_codec_capture_rollback_retains_unsynchronized_resources(
         fresh_frames=(8,),
         enabled=False,
         arena=FakeArena(),
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
     )
     key = IncrementalCodecGraphKey(8, 1)
     temporary = {key: SimpleNamespace()}
@@ -365,6 +370,7 @@ def test_incremental_codec_capture_rollback_resets_temporary_graphs(
         fresh_frames=(8,),
         enabled=False,
         arena=FakeArena(),
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
     )
     graph = FakeGraph()
     key = IncrementalCodecGraphKey(8, 1)
@@ -453,6 +459,7 @@ def test_incremental_codec_warmup_traces_a_compiled_shape_on_its_own_tensors() -
             batch_sizes=(1,),
             compile_fresh_frames=compile_fresh_frames,
             arena=Arena(),
+            graph_pool=IncrementalCodecGraphPool(stream_priority=0),
             enabled=False,
         )
 

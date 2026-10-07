@@ -25,6 +25,7 @@ from sglang_omni.models.qwen3_tts.incremental_codec import (
     Qwen3TTSIncrementalDecoder,
 )
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
+    IncrementalCodecGraphPool,
     Qwen3TTSIncrementalCodecCudaGraphRunner,
 )
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
@@ -597,6 +598,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         incremental_codec_cuda_graph_min_free_gb: float = 3.0,
         suppress_bootstrap_silence: bool = True,
         suppress_bootstrap_max_streams: int = 24,
+        has_reference_prefixed_first_chunks: bool = False,
     ) -> None:
         if stream_stride <= 0 or stream_followup_stride <= 0:
             raise ValueError("stream strides must be > 0")
@@ -861,6 +863,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 (int(frames) for frames in incremental_codec_cuda_graph_window_frames)
             ),
             min_free_gb=incremental_codec_cuda_graph_min_free_gb,
+            has_reference_prefixed_first_chunks=has_reference_prefixed_first_chunks,
         )
         self.codec_fallback_count = 0
         self.codec_stats_last_log_s = time.monotonic()
@@ -970,6 +973,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         cold_frames: Sequence[int],
         window_frames: Sequence[int],
         min_free_gb: float,
+        has_reference_prefixed_first_chunks: bool,
     ) -> tuple[
         Qwen3TTSIncrementalCodecCudaGraphRunner | None,
         Qwen3TTSIncrementalCodecCudaGraphRunner | None,
@@ -991,6 +995,9 @@ class Qwen3TTSStreamingVocoderScheduler(
         graph_batch_sizes = self.resolve_incremental_warm_graph_batch_sizes(
             max_batch_size=min(self.followup_max_batch_size, codec_state_slots)
         )
+        # note (ratish): the initial worker replays its cold, window and tail graphs one at a
+        # time on its stream and copies each output out before the next, so they share a pool.
+        initial_graph_pool = IncrementalCodecGraphPool(stream_priority=graph_priority)
         cold_widths = tuple(sorted({int(frames) for frames in cold_frames}))
         initial = Qwen3TTSIncrementalCodecCudaGraphRunner(
             self.incremental_decoder,
@@ -1004,7 +1011,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             enabled=graph_enabled,
             compile_fresh_frames=cold_widths if compile_kernels else (),
             arena=self.codec_arena,
-            stream_priority=graph_priority,
+            graph_pool=initial_graph_pool,
         )
         window = (
             Qwen3TTSIncrementalCodecCudaGraphRunner(
@@ -1021,26 +1028,30 @@ class Qwen3TTSStreamingVocoderScheduler(
                     (self.stream_followup_stride,) if compile_kernels else ()
                 ),
                 arena=self.codec_arena,
-                stream_priority=graph_priority,
+                graph_pool=initial_graph_pool,
             )
             if window_frames
             else None
         )
         # note (ratish): reference codes come at the reference encoder's lengths, so the
         # first chunks they prefix pad to that ladder; padding costs only the frame part.
-        tail = Qwen3TTSIncrementalCodecCudaGraphRunner(
-            self.incremental_decoder,
-            device=self.device,
-            dtype=dtype,
-            num_quantizers=num_quantizers,
-            mode="tail",
-            fresh_frames=DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES,
-            batch_sizes=graph_batch_sizes,
-            min_free_gb=min_free_gb,
-            enabled=graph_enabled,
-            arena=self.codec_arena,
-            stream_priority=graph_priority,
-            emit_frames=self.default_initial_chunk_frames or self.stream_stride,
+        tail = (
+            Qwen3TTSIncrementalCodecCudaGraphRunner(
+                self.incremental_decoder,
+                device=self.device,
+                dtype=dtype,
+                num_quantizers=num_quantizers,
+                mode="tail",
+                fresh_frames=DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES,
+                batch_sizes=graph_batch_sizes,
+                min_free_gb=min_free_gb,
+                enabled=graph_enabled,
+                arena=self.codec_arena,
+                graph_pool=initial_graph_pool,
+                emit_frames=self.default_initial_chunk_frames or self.stream_stride,
+            )
+            if has_reference_prefixed_first_chunks
+            else None
         )
         warm_fresh_frames = tuple(
             sorted(
@@ -1074,7 +1085,9 @@ class Qwen3TTSStreamingVocoderScheduler(
                         (self.stream_followup_stride,) if compile_kernels else ()
                     ),
                     arena=self.codec_arena,
-                    stream_priority=graph_priority,
+                    graph_pool=IncrementalCodecGraphPool(
+                        stream_priority=graph_priority
+                    ),
                 )
                 for _ in range(worker_count)
             )

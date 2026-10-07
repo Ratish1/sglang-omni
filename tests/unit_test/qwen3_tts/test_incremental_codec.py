@@ -21,6 +21,7 @@ from sglang_omni.models.qwen3_tts.incremental_codec import (
     incremental_transformer,
 )
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
+    IncrementalCodecGraphPool,
     Qwen3TTSIncrementalCodecCudaGraphRunner,
 )
 from sglang_omni.platforms import current_platform
@@ -770,6 +771,7 @@ def test_incremental_codec_cuda_graph_matches_eager_state(
         batch_sizes=(batch_bucket,),
         min_free_gb=0,
         arena=arena,
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
     )
     runner.capture()
     stats = runner.stats()
@@ -835,6 +837,7 @@ def test_incremental_codec_cuda_graph_alternates_shared_pool_keys() -> None:
         batch_sizes=(1, 4),
         min_free_gb=0,
         arena=arena,
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
     )
     runner.capture()
     assert len(runner.graphs) == 2
@@ -876,6 +879,73 @@ def test_incremental_codec_cuda_graph_alternates_shared_pool_keys() -> None:
                 torch.testing.assert_close(
                     graph_mapping[key], eager_mapping[key], rtol=2e-4, atol=2e-5
                 )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_incremental_codec_cuda_graph_runners_alternate_in_one_pool() -> None:
+    torch.manual_seed(19)
+    device = torch.device("cuda", torch.cuda.current_device())
+    decoder = Decoder().to(device).eval()
+    incremental = Qwen3TTSIncrementalDecoder(decoder)
+    arena = Qwen3TTSCodecStateArena(
+        incremental, num_slots=5, device=device, dtype=torch.float32
+    )
+    graph_pool = IncrementalCodecGraphPool(stream_priority=0)
+    window = Qwen3TTSIncrementalCodecCudaGraphRunner(
+        incremental,
+        device=device,
+        dtype=torch.float32,
+        num_quantizers=2,
+        mode="window",
+        fresh_frames=(2,),
+        batch_sizes=(4,),
+        min_free_gb=0,
+        arena=arena,
+        graph_pool=graph_pool,
+    )
+    cold = Qwen3TTSIncrementalCodecCudaGraphRunner(
+        incremental,
+        device=device,
+        dtype=torch.float32,
+        num_quantizers=2,
+        mode="cold",
+        fresh_frames=(1,),
+        batch_sizes=(4,),
+        min_free_gb=0,
+        arena=arena,
+        graph_pool=graph_pool,
+    )
+    window.capture()
+    cold.capture()
+    assert window.enabled and cold.enabled
+    slots = [arena.acquire() for _ in range(4)]
+    eager_state = arena.gather(slots)
+    for step, (runner, frames) in enumerate(
+        ((window, 2), (cold, 1), (window, 2), (cold, 1))
+    ):
+        codes = (
+            torch.arange(4 * 2 * frames, device=device)
+            .view(4, 2, frames)
+            .add(step)
+            .remainder(16)
+        )
+        expected = incremental.decode(codes, eager_state)
+        waveform = runner.decode_slots(codes, slots)
+        assert waveform is not None
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(waveform, expected, rtol=2e-4, atol=2e-5)
+    graph_state = arena.gather(slots)
+    for graph_mapping, eager_mapping in (
+        (graph_state.transformer_keys, eager_state.transformer_keys),
+        (graph_state.transformer_values, eager_state.transformer_values),
+        (graph_state.conv_histories, eager_state.conv_histories),
+        (graph_state.transconv_overlaps, eager_state.transconv_overlaps),
+    ):
+        for key in graph_mapping:
+            torch.testing.assert_close(
+                graph_mapping[key], eager_mapping[key], rtol=2e-4, atol=2e-5
+            )
 
 
 def test_arena_slot_reuse_starts_from_a_cold_state() -> None:
@@ -999,6 +1069,7 @@ def test_arena_bound_graph_replays_match_eager_and_advance_the_arena() -> None:
         batch_sizes=(1, 2),
         min_free_gb=0.0,
         arena=arena,
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
     )
     runner.capture()
     assert runner.stats()["build"]["capture_complete"]
@@ -1145,6 +1216,7 @@ def test_windowed_replays_match_one_eager_decode_and_its_arena_state(
         batch_sizes=(1, 2),
         min_free_gb=0.0,
         arena=arena,
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
     )
     runner.capture()
     assert len(runner.stats()["build"]["captured_keys"]) == 8
@@ -1237,6 +1309,7 @@ def test_tail_graph_replays_match_eager_tail_decodes_and_reuse_their_buffers(
         batch_sizes=(1, 4),
         min_free_gb=0.0,
         arena=arena,
+        graph_pool=IncrementalCodecGraphPool(stream_priority=0),
         emit_frames=1,
     )
     runner.capture()
