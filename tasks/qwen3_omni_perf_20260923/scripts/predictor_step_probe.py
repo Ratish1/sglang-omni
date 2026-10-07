@@ -75,6 +75,14 @@ def build_predictor_step(device: torch.device) -> Qwen3OmniTalker:
         MAX_BS, NUM_CODE_GROUPS, device=device, dtype=torch.long
     )
     talker.output_embeds = torch.zeros(MAX_BS, HIDDEN, device=device, dtype=DTYPE)
+    # a tree with the fused codebook step gates it at load as the talker does
+    supports_codebook_step = getattr(predictor_layers, "supports_codebook_step", None)
+    if supports_codebook_step is not None:
+        talker.predictor_fused_codebook_step = supports_codebook_step(
+            talker.code_predictor.model.codec_embedding[0].weight, DTYPE
+        )
+    else:
+        pass
     return talker
 
 
@@ -261,14 +269,24 @@ def main() -> None:
         default=[],
         help="NAME=VALUE: a predictor_layers module constant for this run (True, False or an int)",
     )
+    parser.add_argument(
+        "--talker",
+        action="append",
+        default=[],
+        help="NAME=True|False: a talker attribute after the build (predictor_fused_codebook_step)",
+    )
     args = parser.parse_args()
     for assignment in args.set:
         name, value = assignment.split("=", 1)
         parsed = {"True": True, "False": False}.get(value)
         setattr(predictor_layers, name, int(value) if parsed is None else parsed)
         print(f"predictor_layers.{name} = {getattr(predictor_layers, name)}")
+    parser_talker = [assignment.split("=", 1) for assignment in args.talker]
     device = torch.device("cuda")
     talker = build_predictor_step(device)
+    for name, value in parser_talker:
+        setattr(talker, name, {"True": True, "False": False}[value])
+        print(f"talker.{name} = {getattr(talker, name)}")
     print(
         torch.cuda.get_device_name(device),
         "fused shape",
