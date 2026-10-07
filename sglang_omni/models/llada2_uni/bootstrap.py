@@ -31,7 +31,7 @@ def register_llada2_uni_cfg() -> None:
     register_llada2_cfg_flashinfer_backend()
 
 
-def validate_cfg(server_args: Any) -> None:
+def validate_cfg(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.model_override_base import (
         attention_backends_of,
         resolved_view,
