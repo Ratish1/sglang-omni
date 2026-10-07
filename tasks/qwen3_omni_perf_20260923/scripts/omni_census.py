@@ -33,6 +33,14 @@ Sections:
                    switching, no context; with --dcgm (H100 host engine) DCGM GR active
                    against the trace's charged kernel time, each field's mean, and per owner
                    the value of each field while its kernels run (fitted over 100 ms windows)
+  L gaps           inter-chunk gaps by band: talker steps, code2wav busy, other stages' work
+  M thread time    ranges of the profiling branch that carry their thread's schedstat: wall
+                   split into on a CPU, runnable but waiting for one, and off a CPU (GIL,
+                   locks, syncs, sleeps), next to the trace's own api, gil, os split
+
+In-tree ranges of the profiling branch (SGLANG_OMNI_PIPELINE_NVTX=1, labels
+"omni.pipeline:{json}") are read as kind "<stage>.<op>"; their sched marks attach to the
+range of the same kind that ended just before the mark on the same thread.
 
 usage: python omni_census.py REPORT.sqlite --window window.txt [--top 25] [--sections ABCDEFGHIJ]
        [--sample-rate 24000] [--dcgm samples.tsv --dcgm-gpu 0]
@@ -43,6 +51,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import collections
+import json
 import re
 import sqlite3
 import statistics
@@ -63,6 +72,7 @@ GRAPH_LAUNCH = "cudaGraphLaunch"
 SYNC = ("cudaStreamSynchronize", "cudaEventSynchronize", "cudaDeviceSynchronize")
 COPY_KINDS = {1: "h2d", 2: "d2h", 8: "d2d"}
 CAPTURE_KINDS = ("cap", "op", "compiled")
+IN_TREE_PREFIX = "omni.pipeline:"
 RESTORE_START = 8
 SAVE_END = 7
 # a gap between two residency slices up to this long is the context switch itself
@@ -95,6 +105,8 @@ class Range:
     end: int
     tid: int
     parent: "Range | None" = None
+    on_cpu_ns: int | None = None
+    run_queue_ns: int | None = None
     launches: int = 0
     graph_launches: int = 0
     syncs: int = 0
@@ -117,6 +129,15 @@ class Range:
             kinds.append(item.kind)
             item = item.parent
         return kinds
+
+
+def in_tree_label(label: str) -> tuple[str, str, dict]:
+    """An in-tree annotation as (probe style label, its kind field, its fields)."""
+    fields = json.loads(label[len(IN_TREE_PREFIX) :])
+    name = f"{fields.pop('stage')}.{fields.pop('op')}"
+    kind = fields.pop("kind", "range")
+    words = " ".join(f"{key}={value}" for key, value in fields.items())
+    return (f"{name} {words}" if words else name), kind, fields
 
 
 def kind_of(label: str) -> str:
@@ -240,6 +261,7 @@ class Report:
         self.thread_names: dict[int, str] = {}
         self.stages_of_pid: dict[int, list[str]] = collections.defaultdict(list)
         self.marks: list[tuple[int, int, str]] = []
+        self.sched_marks: dict[int, list] = collections.defaultdict(list)
         self.window_captures = 0
         for start, end, tid, text, text_id, kind in self.db.execute(
             "select start, end, globalTid, text, textId, eventType from NVTX_EVENTS "
@@ -249,6 +271,19 @@ class Report:
             label = self.text(text, text_id)
             if not label:
                 continue
+            if label.startswith(IN_TREE_PREFIX):
+                label, in_tree_kind, fields = in_tree_label(label)
+                if in_tree_kind == "sched":
+                    if self.t0 <= start <= self.t1:
+                        self.sched_marks[tid].append(
+                            (
+                                start,
+                                kind_of(label),
+                                int(fields["on_cpu_ns"]),
+                                int(fields["run_queue_ns"]),
+                            )
+                        )
+                    continue
             if kind == MARK:
                 if label.startswith("thread name="):
                     self.thread_names[tid] = label.split(" ")[1][5:]
@@ -284,6 +319,18 @@ class Report:
                         stack.pop()
                     item.parent = stack[-1] if stack else None
                     stack.append(item)
+        for tid, marks in self.sched_marks.items():
+            ends_by_kind: dict[str, list] = collections.defaultdict(list)
+            for item in self.ranges.get(tid, []):
+                ends_by_kind[item.kind].append((item.end, item))
+            for ends in ends_by_kind.values():
+                ends.sort(key=lambda pair: pair[0])
+            end_keys = {k: [e for e, _ in v] for k, v in ends_by_kind.items()}
+            for t, kind, on_cpu_ns, run_queue_ns in marks:
+                index = bisect.bisect_right(end_keys.get(kind, []), t) - 1
+                if index >= 0:
+                    item = ends_by_kind[kind][index][1]
+                    item.on_cpu_ns, item.run_queue_ns = on_cpu_ns, run_queue_ns
         self.starts = {
             tid: [r.start for r in items] for tid, items in self.ranges.items()
         }
@@ -1483,6 +1530,74 @@ def section_l(r: Report):
             pass
 
 
+def section_m(r: Report):
+    """Ranges that carry their thread's schedstat: where each one's wall went, by thread and kind, then the
+    serving ranges split by wall band with their child ranges."""
+    print("\n## M. thread time inside sched ranges (ms per instance, profiling branch)")
+    print(
+        "  cpu = on a CPU, runq = runnable but waiting for a CPU, off = neither (GIL, locks, syncs,"
+    )
+    print("  sleeps); api, gil, os, py = the trace's split of the same wall")
+    groups: dict[tuple[str, str], list[Range]] = collections.defaultdict(list)
+    children: dict[int, list[Range]] = collections.defaultdict(list)
+    for tid, items in r.ranges.items():
+        for item in items:
+            if item.parent is not None:
+                children[id(item.parent)].append(item)
+            if item.on_cpu_ns is not None and item.start >= r.t0 and item.end <= r.t1:
+                groups[(r.thread_label(tid), item.kind)].append(item)
+
+    def row(items: list[Range]) -> str:
+        sample = items if len(items) <= 3000 else items[:: len(items) // 3000 + 1]
+        split = [r.host_split(x.tid, x.start, x.end)[:3] for x in sample]
+        wall = statistics.fmean(x.wall for x in items)
+        cpu = statistics.fmean(x.on_cpu_ns for x in items)
+        runq = statistics.fmean(x.run_queue_ns for x in items)
+        api = statistics.fmean(s[0] for s in split)
+        gil = statistics.fmean(s[1] for s in split)
+        os_ns = statistics.fmean(s[2] for s in split)
+        sample_wall = statistics.fmean(x.wall for x in sample)
+        return (
+            f"{len(items):>7}{ms(wall):>8.2f}{ms(pct([x.wall for x in items], .99)):>8.2f}"
+            f"{ms(cpu):>7.2f}{ms(runq):>7.2f}{ms(max(wall - cpu - runq, 0)):>7.2f}"
+            f"{ms(api):>7.2f}{ms(gil):>7.2f}{ms(os_ns):>6.2f}"
+            f"{ms(sample_wall - api - gil - os_ns):>7.2f}"
+        )
+
+    header = (
+        f"{'n':>7}{'wall':>8}{'p99':>8}{'cpu':>7}{'runq':>7}{'off':>7}{'api':>7}{'gil':>7}"
+        f"{'os':>6}{'py':>7}"
+    )
+    print(f"  {'thread':<36}{'kind':<34}{header}")
+    for (thread, kind), items in sorted(
+        groups.items(), key=lambda pair: -sum(x.wall for x in pair[1])
+    ):
+        print(f"  {thread[:36]:<36}{kind[:34]:<34}{row(items)}")
+    bands = ((0, 2e6, "< 2 ms"), (2e6, 10e6, "2 to 10 ms"), (10e6, float("inf"), "> 10 ms"))
+    for (thread, kind), items in sorted(groups.items()):
+        if kind not in (
+            "code2wav.decode_delta",
+            "stream.handle_chunk",
+            "code2wav.next_prep",
+            "scheduler.run_batch",
+        ):
+            continue
+        print(f"\n  {thread} {kind} by wall band")
+        print(f"    {'band':<14}{header}  children (mean wall ms per instance)")
+        for low, high, name in bands:
+            band = [x for x in items if low <= x.wall < high]
+            if not band:
+                continue
+            child_wall: collections.Counter = collections.Counter()
+            for x in band:
+                for child in children.get(id(x), []):
+                    child_wall[child.kind] += child.wall
+            child_text = ", ".join(
+                f"{k} {ms(v) / len(band):.2f}" for k, v in child_wall.most_common(6)
+            )
+            print(f"    {name:<14}{row(band)}  {child_text}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("report")
@@ -1528,6 +1643,8 @@ def main() -> None:
             )
         elif key == "L":
             section_l(r)
+        elif key == "M":
+            section_m(r)
         else:
             print(f"\n## {key}: unknown section")
 

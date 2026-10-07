@@ -12,6 +12,8 @@
 # REQUEST_RATE=R sends the measured pass open loop at R per second (the warm pass stays closed loop).
 # DCGM_SAMPLES names the samples file a host-side dcgm/dcgm_sampler.py writes for this card
 # (H100 host only): the census adds section K, and a clean boot gets dcgm.txt, the window means.
+# IN_TREE_NVTX=1 also turns on the tree's own ranges (a profiling branch's SGLANG_OMNI_PIPELINE_NVTX);
+# CENSUS_SECTIONS picks the census sections (default ABCDEFGHIJK).
 # usage: run_probe_boot.sh <tree> <out dir> <card> <port> <h200|bf16|fp8> <concurrency> <arm>
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 DTYPE=$5 CONC=$6 ARM=$7
@@ -29,7 +31,7 @@ if [ "$NSYS_ARGS" = none ]; then
   WRAP="" PROBE=""
 else
   WRAP="nsys profile -o $OUT/serve --force-overwrite=true $NSYS_ARGS"
-  PROBE="OMNI_PIPE_NVTX=1 OMNI_PIPE_LINES=${LINES:-}"
+  PROBE="OMNI_PIPE_NVTX=1 OMNI_PIPE_LINES=${LINES:-}${IN_TREE_NVTX:+ SGLANG_OMNI_PIPELINE_NVTX=1}"
 fi
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
@@ -118,6 +120,7 @@ if [ "$NSYS_ARGS" != none ]; then
     nsys export --type sqlite --force-overwrite=true -o "$OUT/serve.sqlite" "$OUT/serve.nsys-rep" > "$OUT/export.log" 2>&1
     echo "exported $(date +%T)" >> "$OUT/progress.txt"
     (cd "$S" && python3 omni_census.py "$OUT/serve.sqlite" --window "$OUT/window.txt" \
+      --sections "${CENSUS_SECTIONS:-ABCDEFGHIJK}" \
       ${DCGM_SAMPLES:+--dcgm "$DCGM_SAMPLES" --dcgm-gpu "$CARD"}) > "$OUT/census.txt" 2>&1
     echo "census done $(date +%T)" >> "$OUT/progress.txt"
     touch "$OUT/CENSUS_DONE"
