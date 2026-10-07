@@ -37,7 +37,7 @@ def main() -> None:
     t0, t1 = session_window(db, args.window)
     sent: dict[str, list[int]] = collections.defaultdict(list)
     arrived: dict[str, list[int]] = collections.defaultdict(list)
-    text: dict[str, list[int]] = collections.defaultdict(list)
+    thinker_chunks: dict[str, list[int]] = collections.defaultdict(list)
     for start, text, text_id in db.execute(
         "select start, text, textId from NVTX_EVENTS where eventType = ? order by start", (MARK,)
     ):
@@ -48,7 +48,7 @@ def main() -> None:
             continue
         match = re.match(r"q talker_ar\.in\.put rid=(\S+) t=stream_chunk", label)
         if match:
-            text[match.group(1)].append(start)
+            thinker_chunks[match.group(1)].append(start)
             continue
         match = re.match(r"coord\.recv rid=(\S+) from=code2wav n=(\d+)", label)
         if match and int(match.group(2)) > 0:
@@ -65,7 +65,7 @@ def main() -> None:
             gap = arrivals[k] - arrivals[k - 1]
             talker = windows[k] - windows[k - 1]
             delay = (arrivals[k] - windows[k]) - (arrivals[k - 1] - windows[k - 1])
-            inputs = text.get(request_id, [])
+            inputs = thinker_chunks.get(request_id, [])
             inside = [windows[k - 1]] + [t for t in inputs if windows[k - 1] < t < windows[k]] + [windows[k]]
             longest_text_wait = max(b - a for a, b in zip(inside, inside[1:]))
             streaming = bool(inputs) and inputs[-1] > windows[k]
