@@ -16,6 +16,12 @@ TARGET = "sglang_omni.models.fun_cosyvoice3.streaming_vocoder"
 def patch(module):
     scheduler = module.FunCosyVoice3StreamingVocoderScheduler
     run_step = scheduler.run_step
+    ingest = scheduler.ingest
+    first_chunk_at = {}
+
+    def timed_ingest(self, request_id, state, codes):
+        first_chunk_at.setdefault(request_id, self.clock())
+        return ingest(self, request_id, state, codes)
 
     def timed_step(self, participants, plan):
         now = self.clock()
@@ -24,21 +30,54 @@ def patch(module):
             for _, state in participants
             if state.ready_since is not None
         ]
+        taken = {request_id for request_id, _ in participants}
+        unstarted = {
+            request_id: (now - state.ready_since) * 1e3
+            for request_id, state in participants
+            if state.first_emit_at is None and state.ready_since is not None
+        }
+        left_unstarted = [
+            (now - state.ready_since) * 1e3
+            for request_id, state in self.stream_state_items()
+            if request_id not in taken
+            and state.first_emit_at is None
+            and state.ready_since is not None
+            and state.next_decode() == "causal_window"
+        ]
         ready = sum(
             state.next_decode() != "wait" for _, state in self.stream_state_items()
         )
         started = time.perf_counter()
         decoded = run_step(self, participants, plan)
+        step_ms = (time.perf_counter() - started) * 1e3
         print(
             f"voc.step t={time.time():.3f} plan={plan} rows={len(participants)} "
-            f"ms={(time.perf_counter() - started) * 1e3:.1f} "
+            f"ms={step_ms:.1f} "
             f"wait_max={max(waits, default=0):.1f} "
-            f"wait_mean={sum(waits) / max(len(waits), 1):.1f} ready={ready}",
+            f"wait_mean={sum(waits) / max(len(waits), 1):.1f} ready={ready} "
+            f"first_rows={len(unstarted)} "
+            f"first_wait_max={max(unstarted.values(), default=0):.1f} "
+            f"first_left={len(left_unstarted)} "
+            f"first_left_wait_max={max(left_unstarted, default=0):.1f}",
             file=sys.stderr,
             flush=True,
         )
+        for request_id, state in participants:
+            if request_id in unstarted and state.first_emit_at is not None:
+                chunk_at = first_chunk_at.get(request_id, now)
+                print(
+                    f"voc.first t={time.time():.3f} "
+                    f"chunk_to_ready_ms={(now - unstarted[request_id] / 1e3 - chunk_at) * 1e3:.1f} "
+                    f"ready_to_step_ms={unstarted[request_id]:.1f} step_ms={step_ms:.1f} "
+                    f"rows={len(participants)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                pass
         return decoded
 
+    scheduler.ingest = timed_ingest
     scheduler.run_step = timed_step
     if not hasattr(scheduler, "hop_batch_with_prefix"):
         return
