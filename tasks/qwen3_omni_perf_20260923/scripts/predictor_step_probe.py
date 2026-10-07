@@ -23,7 +23,9 @@ usage, from the tools tree with PYTHONPATH set to the tree under test:
 from __future__ import annotations
 
 import argparse
+import itertools
 import statistics
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
@@ -37,6 +39,7 @@ from torch import nn
 from torch.profiler import ProfilerActivity, profile
 
 from sglang_omni.models.qwen3_omni.components.talker import Qwen3OmniTalker
+from sglang_omni.utils import predictor_layers
 from tests.unit_test.fixtures.qwen_predictor import TupleLinear
 from tests.unit_test.qwen3_omni.test_predictor_kernels import (
     DTYPE,
@@ -86,7 +89,9 @@ def step_inputs(device: torch.device, batch: int) -> tuple[torch.Tensor, torch.T
     return layer0_codes, talker_hidden
 
 
-def time_batch(talker: Qwen3OmniTalker, device: torch.device, batch: int) -> None:
+def capture_step(
+    talker: Qwen3OmniTalker, device: torch.device, batch: int
+) -> torch.cuda.CUDAGraph:
     layer0_codes, talker_hidden = step_inputs(device, batch)
 
     def step() -> None:
@@ -106,6 +111,37 @@ def time_batch(talker: Qwen3OmniTalker, device: torch.device, batch: int) -> Non
     for _ in range(20):
         graph.replay()
     torch.cuda.synchronize()
+    return graph
+
+
+def replay_p50_us(graph: torch.cuda.CUDAGraph, replays: int = 100) -> float:
+    singles = []
+    for _ in range(replays):
+        one_begin = torch.cuda.Event(enable_timing=True)
+        one_end = torch.cuda.Event(enable_timing=True)
+        one_begin.record()
+        graph.replay()
+        one_end.record()
+        torch.cuda.synchronize()
+        singles.append(one_begin.elapsed_time(one_end) * 1000)
+    return statistics.median(singles)
+
+
+def kernel_table(graph: torch.cuda.CUDAGraph) -> list[tuple[str, float, float]]:
+    """(name, launches per step, device us per step), largest first."""
+    with profile(activities=[ProfilerActivity.CUDA]) as trace:
+        for _ in range(20):
+            graph.replay()
+        torch.cuda.synchronize()
+    events = [e for e in trace.key_averages() if e.device_type.name == "CUDA"]
+    return sorted(
+        ((e.key, e.count / 20, e.self_device_time_total / 20) for e in events),
+        key=lambda item: -item[2],
+    )
+
+
+def time_batch(talker: Qwen3OmniTalker, device: torch.device, batch: int) -> None:
+    graph = capture_step(talker, device, batch)
     begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
         enable_timing=True
     )
@@ -114,32 +150,71 @@ def time_batch(talker: Qwen3OmniTalker, device: torch.device, batch: int) -> Non
         graph.replay()
     end.record()
     torch.cuda.synchronize()
-    singles = []
-    for _ in range(100):
-        one_begin = torch.cuda.Event(enable_timing=True)
-        one_end = torch.cuda.Event(enable_timing=True)
-        one_begin.record()
-        graph.replay()
-        one_end.record()
-        torch.cuda.synchronize()
-        singles.append(one_begin.elapsed_time(one_end) * 1000)
-    with profile(activities=[ProfilerActivity.CUDA]) as trace:
-        for _ in range(20):
-            graph.replay()
-        torch.cuda.synchronize()
-    events = [e for e in trace.key_averages() if e.device_type.name == "CUDA"]
-    kernels = sorted(
-        ((e.key, e.count / 20, e.self_device_time_total / 20) for e in events),
-        key=lambda item: -item[2],
-    )
+    p50 = replay_p50_us(graph)
+    kernels = kernel_table(graph)
     device_us = sum(us for _, _, us in kernels)
     print(
         f"batch {batch:2d}: replay {begin.elapsed_time(end) * 1000 / 200:7.1f} us mean,"
-        f" {statistics.median(singles):7.1f} us p50 single; kernels {sum(c for _, c, _ in kernels):5.0f}"
-        f" per step, device sum {device_us:7.1f} us ({device_us / statistics.median(singles):.0%} of p50)"
+        f" {p50:7.1f} us p50 single; kernels {sum(c for _, c, _ in kernels):5.0f}"
+        f" per step, device sum {device_us:7.1f} us ({device_us / p50:.0%} of p50)"
     )
     for name, count, us in kernels:
         print(f"    {us:7.1f} us  {count:4.0f} x {us / count:6.2f}  {name[:110]}")
+
+
+def sweep(talker: Qwen3OmniTalker, device: torch.device, batches: list[int]) -> None:
+    """Replay p50 per batch over the fused layers' launch constants: warps, stages,
+    the output tile, and the K splits of the qkv and residual launches."""
+    shape = talker.predictor_fused_layers.shape
+    max_rows = talker.predictor_fused_layers.max_rows
+    results = []
+    for warps, stages, block_n, split_qkv, split_hidden in itertools.product(
+        (4, 8), (2, 3, 4), (16, 32), (2, 4, 8), (2, 4, 8)
+    ):
+        predictor_layers.NUM_WARPS = warps
+        predictor_layers.NUM_STAGES = stages
+        predictor_layers.BLOCK_N = block_n
+        talker.predictor_fused_layers = predictor_layers.FusedPredictorLayers(
+            replace(shape, split_qkv=split_qkv, split_hidden=split_hidden),
+            max_rows,
+            device,
+            DTYPE,
+        )
+        config = (warps, stages, block_n, split_qkv, split_hidden)
+        try:
+            times = [
+                replay_p50_us(capture_step(talker, device, b), 50) for b in batches
+            ]
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001  # a launch configuration the kernels refuse is a sweep result
+            print(
+                f"config {config}: failed {type(exc).__name__}: {str(exc)[:120]}",
+                flush=True,
+            )
+            continue
+        results.append((config, times))
+        print(f"config {config}:" + "".join(f" {t:7.1f}" for t in times), flush=True)
+    print(
+        "best by the sum over batches (warps, stages, block_n, split_qkv, split_hidden):"
+    )
+    for config, times in sorted(results, key=lambda r: sum(r[1]))[:10]:
+        print(f"  {config}:" + "".join(f" {t:7.1f}" for t in times))
+    best = min(results, key=lambda r: sum(r[1]))[0]
+    warps, stages, block_n, split_qkv, split_hidden = best
+    predictor_layers.NUM_WARPS = warps
+    predictor_layers.NUM_STAGES = stages
+    predictor_layers.BLOCK_N = block_n
+    talker.predictor_fused_layers = predictor_layers.FusedPredictorLayers(
+        replace(shape, split_qkv=split_qkv, split_hidden=split_hidden),
+        max_rows,
+        device,
+        DTYPE,
+    )
+    for batch in batches:
+        print(f"best config {best}, batch {batch}:")
+        for name, count, us in kernel_table(capture_step(talker, device, batch))[:8]:
+            print(f"    {us:7.1f} us  {count:4.0f} x {us / count:6.2f}  {name[:90]}")
 
 
 def ncu_batch(talker: Qwen3OmniTalker, device: torch.device, batch: int) -> None:
@@ -160,7 +235,7 @@ def ncu_batch(talker: Qwen3OmniTalker, device: torch.device, batch: int) -> None
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("time", "ncu"))
+    parser.add_argument("mode", choices=("time", "ncu", "sweep"))
     parser.add_argument("--batches", default="1,4,8,16,32")
     args = parser.parse_args()
     device = torch.device("cuda")
@@ -170,11 +245,15 @@ def main() -> None:
         "fused shape",
         talker.predictor_fused_layers.shape,
     )
-    for batch in (int(value) for value in args.batches.split(",")):
-        if args.mode == "time":
-            time_batch(talker, device, batch)
-        else:
-            ncu_batch(talker, device, batch)
+    batches = [int(value) for value in args.batches.split(",")]
+    if args.mode == "sweep":
+        sweep(talker, device, batches)
+    else:
+        for batch in batches:
+            if args.mode == "time":
+                time_batch(talker, device, batch)
+            else:
+                ncu_batch(talker, device, batch)
 
 
 if __name__ == "__main__":
