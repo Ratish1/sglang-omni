@@ -255,7 +255,18 @@ def main() -> None:
     parser.add_argument("mode", choices=("time", "ncu", "sweep", "dump"))
     parser.add_argument("--batches", default="1,4,8,16,32")
     parser.add_argument("--out", default="predictor_step.pt")
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        help="NAME=VALUE: a predictor_layers module constant for this run (True, False or an int)",
+    )
     args = parser.parse_args()
+    for assignment in args.set:
+        name, value = assignment.split("=", 1)
+        parsed = {"True": True, "False": False}.get(value)
+        setattr(predictor_layers, name, int(value) if parsed is None else parsed)
+        print(f"predictor_layers.{name} = {getattr(predictor_layers, name)}")
     device = torch.device("cuda")
     talker = build_predictor_step(device)
     print(
