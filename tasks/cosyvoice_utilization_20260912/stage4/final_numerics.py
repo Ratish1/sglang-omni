@@ -48,6 +48,11 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = False
     half = vocoder(args.model, "bfloat16")
     full = vocoder(args.model, "float32")
+    # the decoder draws its noise buffer at construction, so the second load gets other noise
+    full.flow.decoder.rand_noise = half.flow.decoder.rand_noise.clone()
+    noise_sum = float(half.flow.decoder.rand_noise.double().sum())
+    print(json.dumps({"rand_noise_sum": noise_sum}), flush=True)
+    saved = {}
     results = []
     for name, token_counts in CASES:
         generator = torch.Generator().manual_seed(sum(token_counts))
@@ -78,11 +83,20 @@ def main() -> None:
             )
             for a, b in zip(bf16_mels, float32_mels, strict=True)
         ]
-        row = {"case": name, "relative_error_per_row": errors}
+        row = {
+            "case": name,
+            "relative_error_per_row": errors,
+            "float32_norm_per_row": [float(m.float().norm()) for m in float32_mels],
+        }
         print(json.dumps(row), flush=True)
         results.append(row)
+        saved[name] = {
+            "bfloat16": [m.float().cpu() for m in bf16_mels],
+            "float32": [m.float().cpu() for m in float32_mels],
+        }
+    torch.save(saved, args.out.replace(".json", ".pt"))
     with open(args.out, "w") as handle:
-        json.dump(results, handle, indent=1)
+        json.dump({"rand_noise_sum": noise_sum, "cases": results}, handle, indent=1)
 
 
 if __name__ == "__main__":
