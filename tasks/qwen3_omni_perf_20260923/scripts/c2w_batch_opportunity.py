@@ -40,6 +40,7 @@ def main() -> None:
     puts: dict[str, list[int]] = collections.defaultdict(list)
     gets: dict[str, list[int]] = collections.defaultdict(list)
     decodes: list[tuple[int, int, str]] = []
+    replay_rows: collections.Counter = collections.Counter()
     for start, end, text, text_id, kind in db.execute(
         "select start, end, text, textId, eventType from NVTX_EVENTS where eventType in (?, ?) order by start",
         (PUSH_POP, MARK),
@@ -52,9 +53,10 @@ def main() -> None:
             else:
                 pass
         else:
-            match = re.match(r"c2w\.decode rid=(\S+) final=0", label)
+            match = re.match(r"c2w\.decode rid=(\S+) final=0(?: rows=(\d+))?", label)
             if match and t0 <= start <= t1:
                 decodes.append((start, end, match.group(1)))
+                replay_rows[int(match.group(2) or 1)] += 1
             else:
                 pass
     # every window-completing chunk: (put time, get time, request, frames)
@@ -84,6 +86,11 @@ def main() -> None:
             pass
     total = sum(rows_all.values())
     print(f"window {(t1 - t0) / 1e9:.1f} s, threshold decodes {total}, window chunks {len(windows)}")
+    windows_decoded = sum(rows * count for rows, count in replay_rows.items())
+    print(
+        f"  replays {sum(replay_rows.values())} decoding {windows_decoded} windows; rows per replay: "
+        + ", ".join(f"{rows}: {count}" for rows, count in sorted(replay_rows.items()))
+    )
     for name, counter in (("any frames", rows_all), ("same frames", rows_same)):
         mean = sum(k * v for k, v in counter.items()) / max(total, 1)
         shares = ", ".join(f"{k}: {100 * v / total:.1f}%" for k, v in sorted(counter.items()))
