@@ -217,6 +217,23 @@ def sweep(talker: Qwen3OmniTalker, device: torch.device, batches: list[int]) -> 
             print(f"    {us:7.1f} us  {count:4.0f} x {us / count:6.2f}  {name[:90]}")
 
 
+def dump_batches(
+    talker: Qwen3OmniTalker, device: torch.device, batches: list[int], out: str
+) -> None:
+    """One eager step per batch; the codes and summed embeddings saved for a bitwise
+    comparison between trees."""
+    results = {}
+    with torch.no_grad():
+        for batch in batches:
+            layer0_codes, talker_hidden = step_inputs(device, batch)
+            codes, embeds = talker.code_predictor_forward_incremental_eager(
+                layer0_codes=layer0_codes, talker_hidden=talker_hidden
+            )
+            results[batch] = (codes.cpu().clone(), embeds.cpu().clone())
+    torch.save(results, out)
+    print(f"dumped batches {batches} to {out}")
+
+
 def ncu_batch(talker: Qwen3OmniTalker, device: torch.device, batch: int) -> None:
     layer0_codes, talker_hidden = step_inputs(device, batch)
     with torch.no_grad():
@@ -235,8 +252,9 @@ def ncu_batch(talker: Qwen3OmniTalker, device: torch.device, batch: int) -> None
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("time", "ncu", "sweep"))
+    parser.add_argument("mode", choices=("time", "ncu", "sweep", "dump"))
     parser.add_argument("--batches", default="1,4,8,16,32")
+    parser.add_argument("--out", default="predictor_step.pt")
     args = parser.parse_args()
     device = torch.device("cuda")
     talker = build_predictor_step(device)
@@ -248,6 +266,8 @@ def main() -> None:
     batches = [int(value) for value in args.batches.split(",")]
     if args.mode == "sweep":
         sweep(talker, device, batches)
+    elif args.mode == "dump":
+        dump_batches(talker, device, batches, args.out)
     else:
         for batch in batches:
             if args.mode == "time":
