@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import subprocess
 import sys
@@ -215,6 +216,11 @@ async def run(args):
 
 
 def main():
+    # the census tools cut each cell's window from the benchmarker's Benchmarking and
+    # Results saved lines, which need its INFO logs on stderr
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
+    )
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="FunAudioLLM/Fun-CosyVoice3-0.5B-2512")
     parser.add_argument("--meta", default="zhaochenyang20/seed-tts-eval-arrow")
