@@ -6,8 +6,10 @@
 #
 # usage: ab_boot.sh <tree> <out dir> <card> <port> <cpus> [inductor cache dir]
 #   EXTRA_ENV  extra server environment, e.g. the GPU core dump variables
-#   CELLS      "name:concurrency:samples:seed:stream ...", stream 1 or 0
+#   CELLS      "name:concurrency:samples:seed:stream[:meta] ...", stream 1 or 0, meta a local
+#              meta.lst in place of the SeedTTS split
 #              (default "c1:1:64:1234:1 c16:16:::1"; b16:16:::0 adds buffered c16)
+#   SERVE_ARGS extra serve arguments
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 CPUS=$5 CACHE=${6:-}
 CELLS=${CELLS:-"c1:1:64:1234:1 c16:16:::1"}
@@ -30,9 +32,9 @@ if [ -n "$CACHE" ]; then
 else
   :
 fi
-echo "taskset -c $CPUS env ${SERVE_ENV[*]} python3 -u -m sglang_omni.cli serve --model-path $MODEL --host 127.0.0.1 --port $PORT" > "$OUT/serve_cmd.txt"
+echo "taskset -c $CPUS env ${SERVE_ENV[*]} python3 -u -m sglang_omni.cli serve --model-path $MODEL --host 127.0.0.1 --port $PORT ${SERVE_ARGS:-}" > "$OUT/serve_cmd.txt"
 (cd "$TREE" && taskset -c "$CPUS" env "${SERVE_ENV[@]}" python3 -u -m sglang_omni.cli serve \
-  --model-path $MODEL --host 127.0.0.1 --port $PORT > "$OUT/serve.log" 2>&1) &
+  --model-path $MODEL --host 127.0.0.1 --port $PORT ${SERVE_ARGS:-} > "$OUT/serve.log" 2>&1) &
 LAUNCH=$!
 
 healthy=0
@@ -44,12 +46,12 @@ done
 if [ $healthy = 1 ]; then
   echo "healthy $(date +%T)" >> "$OUT/progress.txt"
   for cell in $CELLS; do
-    IFS=: read -r name concurrency samples seed stream <<< "$cell"
+    IFS=: read -r name concurrency samples seed stream meta <<< "$cell"
     if [ "$stream" = 1 ]; then STREAM=--stream; else STREAM=; fi
     (cd "$CLIENT" && taskset -c "$CPUS" env CUDA_VISIBLE_DEVICES= python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
       --model $MODEL --port $PORT --lang en --max-concurrency "$concurrency" --warmup 1 \
       --use-existing-server --generate-only $STREAM ${samples:+--max-samples $samples} ${seed:+--seed $seed} \
-      --output-dir "$OUT/$name") > "$OUT/$name.log" 2>&1
+      ${meta:+--meta $meta} --output-dir "$OUT/$name") > "$OUT/$name.log" 2>&1
     echo "cell $name rc $? $(date +%T)" >> "$OUT/progress.txt"
   done
 else
