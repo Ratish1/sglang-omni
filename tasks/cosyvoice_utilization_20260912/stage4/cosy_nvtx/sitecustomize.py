@@ -631,6 +631,18 @@ def patch_cosy_vocoder(module):
         scheduler.hift_step = ranged(scheduler.hift_step, fixed("voc.hift_step"))
 
 
+def patch_cosy_prefix_graph(module):
+    runner = module.PrefixCudaGraphRunner
+    runner.run = ranged(
+        runner.run,
+        lambda self, **kwargs: (
+            f"flow.prefix_graph rows={len(kwargs['new_frames'])} "
+            f"frames={sum(kwargs['new_frames'])}"
+        ),
+    )
+    runner.capture = ranged(runner.capture, fixed("flow.prefix_graph_capture"))
+
+
 PATCHES = {
     "torch": patch_torch,
     "torch.cuda.graphs": patch_graphs,
@@ -644,6 +656,7 @@ PATCHES = {
     "sglang_omni.models.fun_cosyvoice3.utils": patch_cosy_utils,
     "sglang_omni.models.fun_cosyvoice3.request_builders": patch_cosy_builders,
     "sglang_omni.models.fun_cosyvoice3.model_runner": patch_cosy_runner,
+    "sglang_omni.models.fun_cosyvoice3.prefix_cuda_graph": patch_cosy_prefix_graph,
     "sglang_omni.models.fun_cosyvoice3.stages": patch_cosy_stages,
     "sglang_omni.models.fun_cosyvoice3.streaming_vocoder": patch_cosy_vocoder,
 }

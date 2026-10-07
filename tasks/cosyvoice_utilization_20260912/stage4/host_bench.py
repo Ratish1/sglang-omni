@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Host cost of one vocoder Flow call in the serving configuration (DiT compile on, Flow
-graph off), measured without a profiler: per call thread CPU time and wall time over
-back to back calls with no sync between them, and the Python GC collections that ran
-inside the calls. Reuses the trace pair cases, so the work is the traced work.
+"""Host cost of one vocoder Flow call in the serving configuration (DiT compile on, prefix
+graphs on unless --eager-prefix, buffered Flow graph off), measured without a profiler: per
+call thread CPU time and wall time over back to back calls with no sync between them, and
+the Python GC collections that ran inside the calls. Reuses the trace pair cases, so the
+work is the traced work.
 
-    cd <tree> && python host_bench.py --out <json> [--disable-gc]
+    cd <tree> && python host_bench.py --out <json> [--disable-gc] [--eager-prefix]
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ def main() -> None:
     )
     # serving runs the vocoder with one torch CPU thread (SGLang pins its GPU process)
     parser.add_argument("--torch-threads", type=int, default=1)
+    parser.add_argument("--eager-prefix", action="store_true")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     torch.set_num_threads(args.torch_threads)
@@ -70,6 +72,7 @@ def main() -> None:
         gpu_id=0,
         enable_dit_torch_compile=True,
         enable_flow_cuda_graph=False,
+        enable_flow_prefix_cuda_graph=not args.eager_prefix,
         flow_prefix_cache_gb=24.0,
     )
     vocoder = scheduler.vocoder

@@ -134,6 +134,7 @@ def main() -> None:
         gpu_id=0,
         enable_dit_torch_compile=serving,
         enable_flow_cuda_graph=False,
+        enable_flow_prefix_cuda_graph=serving,
         flow_prefix_cache_gb=24.0,
     )
     vocoder = scheduler.vocoder
