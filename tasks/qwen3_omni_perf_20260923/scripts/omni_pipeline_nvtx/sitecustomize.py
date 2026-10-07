@@ -580,14 +580,24 @@ def patch_code2wav(module):
         scheduler.decode_and_emit,
         lambda self, request_id, state: f"c2w.emit rid={request_id}",
     )
-    scheduler.run_step = ranged(
-        scheduler.run_step,
-        lambda self, participants, plan: f"c2w.step rows={len(participants)}",
-    )
-    scheduler.run_sub_batch = ranged(
-        scheduler.run_sub_batch,
-        lambda self, group, decoded: f"c2w.sub rows={len(group)}",
-    )
+    # a tree that decodes queued windows together has decode_windows; one with the opt-in
+    # batched path has run_step and run_sub_batch
+    if hasattr(scheduler, "decode_windows"):
+        scheduler.decode_windows = ranged(
+            scheduler.decode_windows,
+            lambda self, participants: (
+                f"c2w.decode rid={participants[0][0]} final=0 rows={len(participants)}"
+            ),
+        )
+    if hasattr(scheduler, "run_sub_batch"):
+        scheduler.run_step = ranged(
+            scheduler.run_step,
+            lambda self, participants, plan: f"c2w.step rows={len(participants)}",
+        )
+        scheduler.run_sub_batch = ranged(
+            scheduler.run_sub_batch,
+            lambda self, group, decoded: f"c2w.sub rows={len(group)}",
+        )
 
 
 def patch_code2wav_graph(module):
