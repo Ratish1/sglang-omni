@@ -20,11 +20,11 @@ CASES = (("1 row", (100,)), ("4 rows", (60, 100, 140, 180)), ("1 long row", (480
 PROMPT_TOKENS = 75
 
 
-def vocoder(model: str, dtype: str):
+def vocoder(model: str, dtype: str, *, compile_dit: bool = False):
     kwargs = dict(
         enable_flow_prefix_cuda_graph=False,
         flow_prefix_cache_gb=0.0,
-        enable_dit_torch_compile=False,
+        enable_dit_torch_compile=compile_dit,
         enable_flow_cuda_graph=False,
     )
     if (
@@ -43,11 +43,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="FunAudioLLM/Fun-CosyVoice3-0.5B-2512")
     parser.add_argument("--out", required=True)
+    # the reference is the same tree's compiled bf16 final instead of its float32 final
+    parser.add_argument("--against-compiled", action="store_true")
     args = parser.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     half = vocoder(args.model, "bfloat16")
-    full = vocoder(args.model, "float32")
+    if args.against_compiled:
+        full = vocoder(args.model, "bfloat16", compile_dit=True)
+    else:
+        full = vocoder(args.model, "float32")
     # the decoder draws its noise buffer at construction, so the second load gets other noise
     full.flow.decoder.rand_noise = half.flow.decoder.rand_noise.clone()
     noise_sum = float(half.flow.decoder.rand_noise.double().sum())
