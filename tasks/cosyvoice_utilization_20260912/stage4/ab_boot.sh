@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # One A/B arm boot: the server from the arm's tree, pinned to the card's cores, then the
-# repo's SeedTTS benchmark against it, streaming, warmup 1: a seeded c1 pass over the first
+# repo's SeedTTS benchmark against it, warmup 1: by default a seeded streaming c1 pass over the first
 # 64 English samples (identity and c1 speed), then an unseeded c16 pass over the whole
 # English split. The client code is the main tree's for every arm. Scoring is score_arm.sh.
 #
 # usage: ab_boot.sh <tree> <out dir> <card> <port> <cpus> [inductor cache dir]
 #   EXTRA_ENV  extra server environment, e.g. the GPU core dump variables
+#   CELLS      "name:concurrency:samples:seed:stream ...", stream 1 or 0
+#              (default "c1:1:64:1234:1 c16:16:::1"; b16:16:::0 adds buffered c16)
 set -u
 TREE=$1 OUT=$2 CARD=$3 PORT=$4 CPUS=$5 CACHE=${6:-}
+CELLS=${CELLS:-"c1:1:64:1234:1 c16:16:::1"}
 CLIENT=/workspace/sglang-omni
 MODEL=FunAudioLLM/Fun-CosyVoice3-0.5B-2512
 mkdir -p "$OUT"
@@ -40,11 +43,12 @@ for _ in $(seq 360); do
 done
 if [ $healthy = 1 ]; then
   echo "healthy $(date +%T)" >> "$OUT/progress.txt"
-  for cell in "c1:1:64:1234" "c16:16::"; do
-    IFS=: read -r name concurrency samples seed <<< "$cell"
+  for cell in $CELLS; do
+    IFS=: read -r name concurrency samples seed stream <<< "$cell"
+    if [ "$stream" = 1 ]; then STREAM=--stream; else STREAM=; fi
     (cd "$CLIENT" && taskset -c "$CPUS" env CUDA_VISIBLE_DEVICES= python3 -u -m benchmarks.eval.benchmark_tts_seedtts \
       --model $MODEL --port $PORT --lang en --max-concurrency "$concurrency" --warmup 1 \
-      --use-existing-server --generate-only --stream ${samples:+--max-samples $samples} ${seed:+--seed $seed} \
+      --use-existing-server --generate-only $STREAM ${samples:+--max-samples $samples} ${seed:+--seed $seed} \
       --output-dir "$OUT/$name") > "$OUT/$name.log" 2>&1
     echo "cell $name rc $? $(date +%T)" >> "$OUT/progress.txt"
   done
