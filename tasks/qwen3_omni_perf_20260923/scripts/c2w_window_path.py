@@ -7,8 +7,8 @@ window, and reaches the coordinator ("coord.recv ... from=code2wav n>0"). Splits
 message to the coordinator into inbox (put to get), code2wav (get to the audio's put: waiting among the ready windows,
 the replay, the copy to the host) and after (outbox to the coordinator), by percentile and by band of the whole delay.
 Then each band's inbox wait by what code2wav's scheduler thread did meanwhile, in this priority: a CUDA synchronize
-call, a wait for the GIL (python-gil trace), a c2w range of the probe, anything else (its own Python outside the probe's
-ranges, or sleeping on a launched window).
+call, a wait for the GIL (python-gil trace), a final window's decode, another decode, another c2w range of the probe,
+anything else (its own Python outside the probe's ranges, or sleeping on a launched window).
 
 usage: python3 c2w_window_path.py REPORT.sqlite --window window.txt
 """
@@ -183,13 +183,25 @@ def main() -> None:
         for a, b, label in thread_ranges[code2wav]
         if label.startswith("Waiting for GIL")
     ]
+    decodes = [
+        (a, b, "final=1" in label)
+        for a, b, label in thread_ranges[code2wav]
+        if label.startswith("c2w.decode")
+    ]
+    final = [(a, b) for a, b, is_final in decodes if is_final]
+    window = [(a, b) for a, b, is_final in decodes if not is_final]
     ranged = [
         (a, b) for a, b, label in thread_ranges[code2wav] if label.startswith("c2w.")
     ]
-    layers = [merged(sync), merged(sync + gil), merged(sync + gil + ranged)]
+    groups = (sync, gil, final, window, ranged)
+    layers = [
+        merged([span for group in groups[: depth + 1] for span in group])
+        for depth in range(len(groups))
+    ]
     layer_starts = [[span[0] for span in layer] for layer in layers]
     print(
-        "  inbox wait by what code2wav's thread did meanwhile, mean ms: sync, gil, c2w range, else"
+        "  inbox wait by what code2wav's thread did meanwhile, mean ms: sync, gil, final decode,"
+        " window decode, other c2w, else"
     )
     for name, lo, hi in (
         ("<= p50", 0, n // 2),
@@ -202,17 +214,16 @@ def main() -> None:
             continue
         else:
             pass
-        parts = [0.0, 0.0, 0.0, 0.0]
+        parts = [0.0] * (len(layers) + 1)
         for row in band:
             a, b = row[4], row[5]
             levels = [
                 covered(layer, starts, a, b)
                 for layer, starts in zip(layers, layer_starts)
             ]
-            parts[0] += levels[0]
-            parts[1] += levels[1] - levels[0]
-            parts[2] += levels[2] - levels[1]
-            parts[3] += (b - a) - levels[2]
+            for depth, level in enumerate(levels):
+                parts[depth] += level - (levels[depth - 1] if depth else 0)
+            parts[-1] += (b - a) - levels[-1]
         print(
             f"  {name:<12}{len(band):>6}"
             + "".join(f"{value / len(band) / 1e6:>9.1f}" for value in parts)
