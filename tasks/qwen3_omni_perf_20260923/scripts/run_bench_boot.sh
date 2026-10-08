@@ -131,7 +131,7 @@ fi
 
 SPEECH=""
 for arm in $ARMS; do
-  case $arm in seedtts_en|*_talker) [ -d "$OUT/$arm" ] && SPEECH="$SPEECH $arm" ;; esac
+  case $arm in seedtts_en|seedtts_zh|*_talker) [ -d "$OUT/$arm" ] && SPEECH="$SPEECH $arm" ;; esac
 done
 if [ "${SCORE:-0}" = 1 ] && [ -n "$SPEECH" ] && [ ! -f "$OUT/FAILED" ]; then
   if serve asr "$ASR_MODEL" $((PORT + 100)); then
@@ -144,11 +144,13 @@ if [ "${SCORE:-0}" = 1 ] && [ -n "$SPEECH" ] && [ ! -f "$OUT/FAILED" ]; then
   fi
   stop asr
   # the similarity model needs the card the ASR server held
-  if [ -d "$OUT/seedtts_en" ]; then
-    CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" sim --arm seedtts_en --out "$OUT" \
-      > "$OUT/sim_seedtts_en.log" 2>&1
-    echo "sim seedtts_en rc $? $(date +%T)" >> "$OUT/progress.txt"
-  fi
+  for arm in seedtts_en seedtts_zh; do
+    if [ -d "$OUT/$arm" ]; then
+      CUDA_VISIBLE_DEVICES=$CARD PYTHONPATH=$TREE $PIN python3 "$S/run_bench.py" sim --arm $arm --out "$OUT" \
+        > "$OUT/sim_$arm.log" 2>&1
+      echo "sim $arm rc $? $(date +%T)" >> "$OUT/progress.txt"
+    fi
+  done
   find "$OUT" -name '*.wav' -path '*/audio/*' -delete
 fi
 kill "$DMON_PID" "$APPS_PID" "$CARD_MEMORY_PID" "$LOAD_PID" 2>/dev/null

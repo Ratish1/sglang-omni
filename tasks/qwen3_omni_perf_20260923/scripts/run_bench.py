@@ -36,6 +36,7 @@ ARMS = (
     "seedtts_en",
     "seedtts_en_nostream",
     "seedtts_en_seeded",
+    "seedtts_zh",
     "mmmu",
     "mmmu_talker",
     "mmsu",
@@ -222,7 +223,7 @@ async def generate(
     if arm == "speech_identity":
         return await seeded_speech_requests(port, out, max_samples or 5)
     talker = arm.endswith("_talker")
-    if arm in ("seedtts_en", "seedtts_en_nostream", "seedtts_en_seeded"):
+    if arm in ("seedtts_en", "seedtts_en_nostream", "seedtts_en_seeded", "seedtts_zh"):
         from benchmarks.eval.benchmark_omni_seedtts import (
             OmniSeedttsBenchmarkConfig,
             run_omni_seedtts_benchmark,
@@ -233,7 +234,7 @@ async def generate(
             meta=SEEDTTS_META,
             host="127.0.0.1",
             port=port,
-            lang="en",
+            lang="zh" if arm == "seedtts_zh" else "en",
             voice_clone=True,
             stream=arm != "seedtts_en_nostream",
             output_dir=out,
@@ -311,7 +312,7 @@ async def generate(
 
 
 def score(arm: str, asr_port: int | None, out: str, device: str, sim: bool) -> dict:
-    if arm in ("seedtts_en", "seedtts_en_nostream", "seedtts_en_seeded"):
+    if arm in ("seedtts_en", "seedtts_en_nostream", "seedtts_en_seeded", "seedtts_zh"):
         from benchmarks.eval.benchmark_omni_seedtts import (
             OmniSeedttsBenchmarkConfig,
             evaluate_generated_audio,
@@ -322,7 +323,7 @@ def score(arm: str, asr_port: int | None, out: str, device: str, sim: bool) -> d
             model=MODEL,
             meta=SEEDTTS_META,
             output_dir=out,
-            lang="en",
+            lang="zh" if arm == "seedtts_zh" else "en",
             device=device,
             port=asr_port,
             asr_concurrency=32,
