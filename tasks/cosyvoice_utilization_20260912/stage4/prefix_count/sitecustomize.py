@@ -2,7 +2,10 @@
 wall time, and on a tree with the prefix cache one line per causal step with the
 rows that ran on the cache, the rows that fell back to the whole-history hop and
 the pool's free frames. Put this directory on PYTHONPATH and set
-OMNI_PREFIX_COUNT=1. No runtime code changes."""
+OMNI_PREFIX_COUNT=1. With OMNI_MEMORY_PROBE=1 each voc.step line also carries the device
+memory allocated before the step, the peak allocated during it (the process's, so AR
+work in the same window counts), the reserved memory after it, and the step's history
+tokens (prompt plus generated, summed and largest row). No runtime code changes."""
 
 import importlib.abc
 import importlib.util
@@ -11,6 +14,8 @@ import sys
 import time
 
 TARGET = "sglang_omni.models.fun_cosyvoice3.streaming_vocoder"
+MEMORY_PROBE = os.environ.get("OMNI_MEMORY_PROBE") == "1"
+GIB = 2**30
 
 
 def patch(module):
@@ -47,12 +52,30 @@ def patch(module):
         ready = sum(
             state.next_decode() != "wait" for _, state in self.stream_state_items()
         )
+        memory = ""
+        if MEMORY_PROBE:
+            import torch
+
+            history = [
+                len(state.tokens)
+                + (0 if state.prompt_token is None else state.prompt_token.shape[1])
+                for _, state in participants
+            ]
+            torch.cuda.reset_peak_memory_stats()
+            allocated_before = torch.cuda.memory_allocated()
         started = time.perf_counter()
         decoded = run_step(self, participants, plan)
         step_ms = (time.perf_counter() - started) * 1e3
+        if MEMORY_PROBE:
+            memory = (
+                f"alloc_gib={allocated_before / GIB:.3f} "
+                f"peak_gib={torch.cuda.max_memory_allocated() / GIB:.3f} "
+                f"reserved_gib={torch.cuda.memory_reserved() / GIB:.3f} "
+                f"tokens={sum(history)} max_tokens={max(history, default=0)} "
+            )
         print(
             f"voc.step t={time.time():.3f} plan={plan} rows={len(participants)} "
-            f"ms={step_ms:.1f} "
+            f"ms={step_ms:.1f} {memory}"
             f"wait_max={max(waits, default=0):.1f} "
             f"wait_mean={sum(waits) / max(len(waits), 1):.1f} ready={ready} "
             f"first_rows={len(unstarted)} "
@@ -79,6 +102,28 @@ def patch(module):
 
     scheduler.ingest = timed_ingest
     scheduler.run_step = timed_step
+    if MEMORY_PROBE:
+        vocode_payloads = scheduler.vocode_payloads
+
+        async def measured_payloads(self, payloads):
+            import torch
+
+            torch.cuda.reset_peak_memory_stats()
+            allocated_before = torch.cuda.memory_allocated()
+            started = time.perf_counter()
+            decoded = await vocode_payloads(self, payloads)
+            print(
+                f"voc.batch t={time.time():.3f} rows={len(payloads)} "
+                f"ms={(time.perf_counter() - started) * 1e3:.1f} "
+                f"alloc_gib={allocated_before / GIB:.3f} "
+                f"peak_gib={torch.cuda.max_memory_allocated() / GIB:.3f} "
+                f"reserved_gib={torch.cuda.memory_reserved() / GIB:.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return decoded
+
+        scheduler.vocode_payloads = measured_payloads
     if not hasattr(scheduler, "hop_batch_with_prefix"):
         return
     hop_batch_with_prefix = scheduler.hop_batch_with_prefix
