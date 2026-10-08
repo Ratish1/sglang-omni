@@ -1,3 +1,4 @@
+import argparse
 import json
 from array import array
 from types import SimpleNamespace
@@ -13,6 +14,9 @@ from sglang_omni.scheduling.dllm_scheduler import DllmForwardBatch
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pool-tokens", type=int, default=512)
+    arguments = parser.parse_args()
     scheduler = create_sglang_dllm_thinker_executor_from_config(
         "inclusionAI/LLaDA2.0-Uni",
         device="cuda",
@@ -23,13 +27,17 @@ def main() -> None:
             "enable_torch_compile": False,
             "max_running_requests": 3,
             "max_prefill_tokens": 512,
-            "max_total_tokens": 512,
+            "max_total_tokens": arguments.pool_tokens,
         },
     )
     allocator = scheduler.token_to_kv_pool_allocator
     pool = scheduler.req_to_token_pool
     initial_tokens = allocator.available_size()
     initial_rows = len(pool.free_slots)
+    print(
+        json.dumps({"pool_tokens": initial_tokens, "page_size": allocator.page_size}),
+        flush=True,
+    )
     scheduler.result_adapter = lambda result: result.output_ids
 
     def admit(name: str, branches: int) -> Req:
@@ -108,7 +116,7 @@ def main() -> None:
         scheduler.post_step(batch)
         return True
 
-    for branches in (1, 2, 3):
+    for branches in (1, 2, 3) if initial_tokens >= 512 else ():
         name = f"complete-{branches}"
         conditional = admit(name, branches)
         for iteration in range(5):
@@ -131,14 +139,22 @@ def main() -> None:
     assert len(pool.free_slots) == initial_rows
     print(json.dumps({"case": name, "recovery": "pass"}), flush=True)
 
-    occupied = allocator.alloc(initial_tokens - 336)
-    name = "three-branches-336-tokens"
+    name = f"three-branches-{initial_tokens}-tokens"
     conditional = admit(name, 3)
-    for iteration in range(7):
-        step(name, iteration)
+    try:
+        for iteration in range(7):
+            step(name, iteration)
+            if conditional.finished():
+                break
+    except (RuntimeError, AssertionError) as error:
+        print(
+            json.dumps(
+                {"case": name, "error": type(error).__name__, "message": str(error)}
+            ),
+            flush=True,
+        )
     scheduler.abort(conditional.rid)
     scheduler.drain_and_purge()
-    allocator.free(occupied)
     assert allocator.available_size() == initial_tokens
     assert len(pool.free_slots) == initial_rows
     print(json.dumps({"case": name, "cleanup": "pass"}), flush=True)
