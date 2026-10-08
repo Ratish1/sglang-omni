@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from sglang_omni.models.llada2_uni.components.thinker import LLaDA2MoeGate
+from sglang_omni.models.llada2_uni.components.thinker import (
+    LLaDA2MoeGate,
+    LLaDA2MoeTextModel,
+)
 
 
 def test_router_computes_logits_in_fp32() -> None:
@@ -36,7 +39,11 @@ def test_expert_bias_loads_without_a_config_flag() -> None:
     assert torch.count_nonzero(gate.expert_bias) == 0
 
     expert_bias = torch.arange(8, dtype=torch.float32)
-    gate.load_state_dict(
-        {"weight": torch.zeros_like(gate.weight), "expert_bias": expert_bias}
-    )
+    model = LLaDA2MoeTextModel.__new__(LLaDA2MoeTextModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_experts=8)
+    model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.layers[0].mlp = torch.nn.Module()
+    model.layers[0].mlp.gate = gate
+    model.load_weights([("model.layers.0.mlp.gate.expert_bias", expert_bias)])
     torch.testing.assert_close(gate.expert_bias, expert_bias, rtol=0, atol=0)

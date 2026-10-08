@@ -313,14 +313,13 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             router_logits=router_logits,
         )
         y = self.experts(hidden_states, topk_output)
-        output_dtype = y.dtype
 
         if self.shared_experts is not None:
-            y = y.float() + self.shared_experts(identity).float()
+            y = y + self.shared_experts(identity)
         else:
             pass
 
-        return y.to(output_dtype)
+        return y
 
     def group_limited_topk(
         self, scores: torch.Tensor

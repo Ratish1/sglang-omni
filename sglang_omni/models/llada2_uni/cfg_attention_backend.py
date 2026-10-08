@@ -11,7 +11,10 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     PrefillMetadata,
     merge_state,
 )
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import (
     ATTENTION_BACKEND_CHOICES,
     add_attention_backend_choices,
@@ -23,8 +26,10 @@ CFG_ATTENTION_BACKEND = "llada2_uni_cfg_flashinfer"
 class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
     """Stock FlashInfer plus opt-in image-edit CFG left-pad masking."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self, model_runner: ModelRunner, *, init_new_workspace: bool = False
+    ) -> None:
+        super().__init__(model_runner, init_new_workspace=init_new_workspace)
         if self.num_wrappers != 1:
             raise ValueError("DLLM CFG requires one attention wrapper")
         else:
@@ -39,9 +44,9 @@ class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
         self.cfg_local_left_pad_active = False
         self.cfg_has_cached_prefix = False
 
-    def init_forward_metadata(self, forward_batch):
+    def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         self.cfg_local_left_pad_active = False
-        # FlashInfer keeps the previous custom mask on its reusable wrapper.
+        # note (Anmuliar): FlashInfer retains custom masks between wrapper plans.
         for attr in ("_custom_mask_buf", "_mask_indptr_buf"):
             setattr(self.cfg_prefill_wrapper_ragged, attr, None)
         if not forward_batch.forward_mode.is_dllm_extend():
@@ -80,7 +85,7 @@ class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
 
     def plan_cfg_attention(
         self,
-        forward_batch,
+        forward_batch: ForwardBatch,
         query_lens: tuple[int, ...],
         cached_pad_lens: tuple[int, ...],
         local_pad_lens: tuple[int, ...],
@@ -110,7 +115,7 @@ class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
                 )
                 if local_left_pad_length:
                     request_attention_mask[:, :local_left_pad_length] = False
-                    # Give discarded pad queries a diagonal key to avoid invalid softmax.
+                    # note (Anmuliar): discarded pad queries still need a valid softmax.
                     pad_indices = torch.arange(
                         local_left_pad_length, device=seq_lens.device
                     )
@@ -125,7 +130,7 @@ class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
                 device=seq_lens.device,
             )
             qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
-            # Exclude edit pads from cached-prefix attention without replacing the custom mask.
+            # note (Anmuliar): planning cached KV must preserve the local padding mask.
             prefill_indices_updater.call_begin_forward(
                 cfg_prefill_wrapper,
                 wrappers[0],
@@ -182,13 +187,13 @@ class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
 
     def forward_extend(
         self,
-        q,
-        k,
-        v,
-        layer,
-        forward_batch,
-        save_kv_cache=True,
-    ):
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ) -> torch.Tensor:
         if not self.cfg_local_left_pad_active:
             return super().forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
@@ -259,7 +264,7 @@ class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
 def register_llada2_cfg_flashinfer_backend() -> None:
     """Register DLLM pad masking without changing stock/text-condition backends."""
 
-    def _create_backend(runner):
+    def _create_backend(runner: ModelRunner) -> LLaDA2CFGFlashInferAttnBackend:
         if runner.use_mla_backend:
             raise ValueError("LLaDA2 CFG attention does not use an MLA backend")
         else:

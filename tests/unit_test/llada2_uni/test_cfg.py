@@ -9,10 +9,19 @@ from unittest.mock import create_autospec
 
 import pytest
 import torch
+from flashinfer.prefill import (
+    BatchPrefillWithPagedKVCacheWrapper,
+    BatchPrefillWithRaggedKVCacheWrapper,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferIndicesUpdaterPrefill,
 )
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 import sglang_omni.models.llada2_uni.cfg_attention_backend as cfg_attention_backend
 from sglang_omni.models.llada2_uni.low_confidence_cfg import LowConfidenceCFG
@@ -72,12 +81,10 @@ def make_cfg_group(size: int) -> list[RequestStub]:
 
 
 @pytest.mark.parametrize("size", [1, 2, 3])
-@pytest.mark.parametrize("threshold,rescale", [(1.0, 0.0), (0.2, 0.7)])
-def test_guidance_updates_all_cfg_branches(
-    size: int, threshold: float, rescale: float
-) -> None:
+@pytest.mark.parametrize("rescale", [0.0, 1.0])
+def test_guidance_updates_all_cfg_branches(size: int, rescale: float) -> None:
     algorithm = LowConfidenceCFG(make_config())
-    algorithm.threshold = threshold
+    algorithm.threshold = 0.94 if size == 3 else 0.8
     requests = make_cfg_group(size)
     requests[0]._task_kind = (
         "edit" if size == 3 else "t2i"
@@ -90,29 +97,22 @@ def test_guidance_updates_all_cfg_branches(
     input_ids = torch.tensor([1, 9, 9, 9] * size)
     if size > 1:
         input_ids[4] = 9
-    branch_logits = torch.tensor(
-        [
-            [100.0, 1.0, 1.0, 2.0, 1.0, 0.0],
-            [100.0, 1.0, 1.0, 3.0, 0.0, 1.0],
-            [100.0, 1.0, 1.0, 5.0, 2.0, 0.0],
-        ]
-    )[:size]
-    guided_logits = branch_logits[0].clone()
-    if size >= 2:
-        guided_logits = branch_logits[1] + 2.0 * (branch_logits[0] - branch_logits[1])
-    if size == 3:
-        guided_logits += 1.5 * (branch_logits[1] - branch_logits[2])
-    if size >= 2 and rescale:
-        normalized = guided_logits * (
-            branch_logits[0].std() / (guided_logits.std() + 1e-6)
-        )
-        guided_logits = rescale * normalized + (1 - rescale) * guided_logits
-    guided_logits[:3] = -torch.inf
+    initial_ids = input_ids.view(size, 4).clone()
+    observed_inputs: list[torch.Tensor] = []
 
-    def forward(batch, **_kwargs):
+    def forward(batch: ForwardBatch, pp_proxy_tensors: None = None) -> NS:
+        observed_inputs.append(batch.input_ids.view(size, 4).clone())
+        conditional_logits = torch.zeros(4, 6)
+        conditional_logits[:, 3] = torch.tensor([0.0, 1.5, 2.0, 3.0])
+        if batch.input_ids[3] != 9:
+            conditional_logits[1, 3] = 0.0
+            conditional_logits[1, 4] = 1.5
+        branch_scales = torch.tensor([1.0, 0.25, -0.25])[:size]
         return NS(
             logits_output=NS(
-                full_logits=branch_logits.repeat_interleave(4, dim=0).clone()
+                full_logits=(
+                    conditional_logits[None] * branch_scales[:, None, None]
+                ).reshape(-1, 6)
             ),
             can_run_graph=False,
         )
@@ -124,10 +124,21 @@ def test_guidance_updates_all_cfg_branches(
 
     assert result[2:] == (None, None, False)
     assert len(result[1]) == size
-    expected_id = guided_logits.argmax().item()
-    assert all(row.tolist() == [expected_id] * 3 for row in result[1])
-    if size > 1:
-        assert input_ids[4].item() == 9
+    if size == 1 or rescale:
+        partial_ids = initial_ids.clone()
+        partial_ids[:, 2:] = 3
+        final_ids = initial_ids.clone()
+        final_ids[:, 1:] = torch.tensor([4, 3, 3])
+        expected_inputs = [initial_ids, partial_ids, final_ids]
+    else:
+        final_ids = initial_ids.clone()
+        final_ids[:, 1:] = 3
+        expected_inputs = [initial_ids, final_ids]
+    assert len(observed_inputs) == len(expected_inputs)
+    for actual, expected in zip(observed_inputs, expected_inputs, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual, expected in zip(result[1], final_ids[:, 1:], strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_cfg_prefill_only_builds_kv_state() -> None:
@@ -139,7 +150,7 @@ def test_cfg_prefill_only_builds_kv_state() -> None:
     original = input_ids.clone()
     calls = 0
 
-    def forward(*_args, **_kwargs):
+    def forward(batch: ForwardBatch, pp_proxy_tensors: None = None) -> NS:
         nonlocal calls
         calls += 1
         return NS(logits_output=None, can_run_graph=False)
@@ -236,6 +247,118 @@ def test_attention_masks_local_and_cached_padding() -> None:
     backend.init_forward_metadata(batch)
     assert not backend.cfg_local_left_pad_active
     assert begin_forward.call_args.args[3].tolist() == [8, 2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer requires CUDA")
+@pytest.mark.parametrize("initial_prefix", [0, 4])
+def test_attention_matches_dense_across_padding_boundary(initial_prefix: int) -> None:
+    device, dtype = "cuda", torch.bfloat16
+    heads, head_dim, block_size = 2, 64, 4
+    pool = MHATokenToKVPool(64, 1, dtype, heads, head_dim, 1, device, False)
+    req_pool = ReqToTokenPool(2, 16, device, False)
+    req_pool.req_to_token[:2] = torch.arange(1, 33, device=device).view(2, 16)
+    allocator = TokenToKVPoolAllocator(64, dtype, device, pool, False)
+    workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=device)
+    backend = object.__new__(cfg_attention_backend.LLaDA2CFGFlashInferAttnBackend)
+    backend.token_to_kv_pool = pool
+    backend.num_wrappers = 1
+    backend.is_dllm_model = True
+    backend.prefill_uses_dequant_workspace = False
+    backend.kv_cache_quant_method = NS(needs_global_scale=lambda: False)
+    backend.prefill_split_tile_size = None
+    backend.cfg_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="fa2"
+    )
+    backend.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="fa2"
+    )
+    backend.prefill_wrappers_paged = [
+        BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa2")
+    ]
+    backend.kv_index_translator = KVIndexTranslator(
+        req_to_token=req_pool.req_to_token,
+        token_to_kv_pool_allocator=allocator,
+        token_to_kv_pool=pool,
+        page_size=1,
+        device=device,
+    )
+    updater = object.__new__(FlashInferIndicesUpdaterPrefill)
+    updater.attn_backend = backend
+    updater.num_qo_heads = updater.num_kv_heads = heads
+    updater.head_dim = head_dim
+    updater.q_data_type = updater.data_type = dtype
+    updater.kv_indptr = [torch.zeros(3, dtype=torch.int32, device=device)]
+    updater.qo_indptr = [torch.zeros(3, dtype=torch.int32, device=device)]
+    updater.kv_last_page_len = torch.ones(2, dtype=torch.int32, device=device)
+    updater.prefill_wrapper_ragged = backend.prefill_wrapper_ragged
+    backend.indices_updater_prefill = updater
+    layer = RadixAttention(
+        heads, head_dim, head_dim**-0.5, heads, 0, attn_type=AttentionType.ENCODER_ONLY
+    )
+    generator = torch.Generator(device=device).manual_seed(42)
+    keys, values = torch.randn(
+        2, 2, 16, heads, head_dim, dtype=dtype, device=device, generator=generator
+    )
+    cached_keys, cached_values = pool.get_kv_buffer(0)
+    slots = req_pool.req_to_token[:2].long()
+    cached_keys[slots[:, :initial_prefix]] = keys[:, :initial_prefix]
+    cached_values[slots[:, :initial_prefix]] = values[:, :initial_prefix]
+    left_padding = (0, initial_prefix + 2)
+
+    for prefix in (initial_prefix, initial_prefix + block_size):
+        batch = NS(
+            dllm_left_pad_lens_cpu=left_padding,
+            extend_prefix_lens_cpu=[prefix, prefix],
+            extend_seq_lens_cpu=[block_size, block_size],
+            forward_mode=ForwardMode.DLLM_EXTEND,
+            seq_lens=torch.full(
+                (2,), prefix + block_size, dtype=torch.int32, device=device
+            ),
+            extend_prefix_lens=torch.full(
+                (2,), prefix, dtype=torch.int32, device=device
+            ),
+            req_pool_indices=torch.arange(2, dtype=torch.int32, device=device),
+            out_cache_loc=slots[:, prefix : prefix + block_size].flatten(),
+        )
+        queries = torch.randn(
+            2,
+            block_size,
+            heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        current_keys = keys[:, prefix : prefix + block_size].contiguous()
+        current_values = values[:, prefix : prefix + block_size].contiguous()
+        backend.init_forward_metadata(batch)
+        actual = backend.forward_extend(
+            queries.flatten(0, 1),
+            current_keys.flatten(0, 1),
+            current_values.flatten(0, 1),
+            layer,
+            batch,
+        ).view_as(queries)
+        for row, pad in enumerate(left_padding):
+            mask = torch.arange(prefix + block_size, device=device)[None, :] >= pad
+            mask = mask.expand(block_size, -1).clone()
+            for query in range(max(pad - prefix, 0)):
+                mask[query, prefix + query] = True
+            scores = (
+                torch.einsum(
+                    "qhd,khd->hqk",
+                    queries[row].float(),
+                    keys[row, : prefix + block_size].float(),
+                )
+                * layer.scaling
+            )
+            probabilities = scores.masked_fill(~mask, -torch.inf).softmax(-1)
+            expected = torch.einsum(
+                "hqk,khd->qhd",
+                probabilities,
+                values[row, : prefix + block_size].float(),
+            ).to(dtype)
+            torch.testing.assert_close(actual[row], expected, atol=0.016, rtol=0.016)
 
 
 @pytest.mark.parametrize("cached", [False, True])

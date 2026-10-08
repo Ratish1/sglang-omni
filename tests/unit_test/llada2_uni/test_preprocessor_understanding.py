@@ -9,7 +9,6 @@ from PIL import Image
 
 from sglang_omni.models.llada2_uni.components.preprocessor import (
     BOI_TOKEN,
-    DEFAULT_SYSTEM_PROMPT,
     DUMMY_IMAGE_TOKEN_ID,
     EOI_TOKEN,
     SOI_TOKEN,
@@ -31,7 +30,6 @@ class Tokenizer:
         return self.tokens[token]
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        del add_special_tokens
         ids: list[int] = []
         for part in re.split(r"(<\|reserved_token_\d+\|>|<\|/?image\|>|<boi>)", text):
             if part in self.tokens:
@@ -59,7 +57,6 @@ def make_preprocessor() -> LLaDA2Preprocessor:
     preprocessor.factor = 32
 
     def process_images(**kwargs: object) -> dict[str, torch.Tensor]:
-        del kwargs
         return {
             "pixel_values": torch.zeros(16, 8),
             "image_grid_thw": torch.tensor([[1, 4, 4]]),
@@ -86,7 +83,10 @@ def test_understanding_prompt_and_sigvq_patch_count() -> None:
     state = LLaDA2UniPipelineState.from_dict(result.data)
     input_ids = state.prompt["input_ids"].flatten().tolist()
 
-    assert DEFAULT_SYSTEM_PROMPT in preprocessor.tokenizer.decode(input_ids)
+    assert (
+        "You are a multimodal understanding assistant."
+        in preprocessor.tokenizer.decode(input_ids)
+    )
     assert input_ids.count(DUMMY_IMAGE_TOKEN_ID) == 16
 
 

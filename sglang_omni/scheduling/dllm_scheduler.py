@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_schedule
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -104,7 +105,6 @@ class DllmScheduler:
         self.waiting_queue: list[Req] = []
         self.staging_queue: list[Req] = []
 
-        # CFG tracking: cond_rid <-> uncond_rid(s)
         self.cond_to_unconds: dict[str, list[str]] = {}
         self.uncond_to_cond: dict[str, str] = {}
         self.uncond_rids: set[str] = set()
@@ -161,7 +161,6 @@ class DllmScheduler:
                 messages.append(self.inbox.get_nowait())
             except _queue_mod.Empty:
                 break
-        # Aborting any member of a CFG group must purge the whole group.
         aborted_groups: set[str] = set()
         for rid in aborted:
             cond_rid = self.uncond_to_cond.get(rid, rid)
@@ -192,8 +191,6 @@ class DllmScheduler:
                 self.rid_to_req_data[req.rid] = req_data
                 self.waiting_queue.append(req)
 
-                # CFG: create companion uncond Reqs (text guidance always; image
-                # guidance only when cfg_image_scale > 0).
                 uncond_ids = getattr(
                     req, "_uncond_input_ids", None
                 )  # noqa: leading-underscore  # DLLM protocol
@@ -278,8 +275,6 @@ class DllmScheduler:
         mark_img: bool,
     ) -> None:
         """Create a companion uncond Req for CFG and add to waiting queue."""
-        from sglang.srt.sampling.sampling_params import SamplingParams
-
         uncond_rid = f"{cond_req.rid}{rid_suffix}"
         uncond_input_ids = list(uncond_input_ids)
         if len(uncond_input_ids) != len(cond_req.origin_input_ids):
@@ -298,7 +293,6 @@ class DllmScheduler:
             max_new_tokens=cond_req.sampling_params.max_new_tokens,
             temperature=0.0,
         )
-        # The companion still needs normalized SGLang sampling metadata.
         uncond_sampling_params.normalize(None)
         uncond_sampling_params.verify(cond_req.vocab_size)
         uncond_req = Req(
@@ -314,12 +308,6 @@ class DllmScheduler:
         uncond_req._is_uncond = True  # noqa: leading-underscore  # DLLM protocol
         uncond_req._dllm_left_pad_len = int(
             left_pad_len
-        )  # noqa: leading-underscore  # DLLM protocol
-        uncond_req._cfg_scale = getattr(
-            cond_req, "_cfg_scale", 4.0
-        )  # noqa: leading-underscore  # DLLM protocol
-        uncond_req._cfg_rescale = getattr(
-            cond_req, "_cfg_rescale", 0.7
         )  # noqa: leading-underscore  # DLLM protocol
         cond_req._cfg_group_rid = (
             cond_req.rid
@@ -486,7 +474,7 @@ class DllmScheduler:
         block_size = self.dllm_config.block_size
         max_prefill_tokens = get_schedule().max_prefill_tokens
         page_size = get_schedule().page_size
-        # Chunked DLLM admission charges one block per branch, not its full prompt.
+        # note (Anmuliar): prefill budgets cover one block; KV survives across blocks.
         block_charge = (block_size + page_size - 1) // page_size * page_size
         required_prefill_tokens = len(reqs) * block_charge
         if (
@@ -497,6 +485,27 @@ class DllmScheduler:
                 "CFG request group requires at least "
                 f"{required_prefill_tokens} max_prefill_tokens, but configured "
                 f"value is {max_prefill_tokens}"
+            )
+        else:
+            pass
+
+        required_kv_tokens = 0
+        for request in reqs:
+            token_count = (
+                len(request.origin_input_ids) + request.sampling_params.max_new_tokens
+            )
+            block_tokens = (token_count + block_size - 1) // block_size * block_size
+            required_kv_tokens += (
+                (block_tokens + page_size - 1) // page_size * page_size
+            )
+        physical_kv_tokens = (
+            self.token_to_kv_pool_allocator.size_full // page_size * page_size
+        )
+        if required_kv_tokens > physical_kv_tokens:
+            raise RuntimeError(
+                f"CFG request group requires {required_kv_tokens} KV tokens for "
+                f"the prompt and requested generation, but the physical pool "
+                f"holds {physical_kv_tokens}"
             )
         else:
             pass
@@ -527,7 +536,7 @@ class DllmScheduler:
         source_queue = self.staging_queue if self.staging_queue else self.waiting_queue
         request_group = self.get_request_group(source_queue)
         self.validate_request_group_capacity(request_group)
-        # Admission mutates Req.kv as well as top-level phase/range fields.
+        # note (Anmuliar): admission also mutates the nested Req.kv state.
         request_snapshots = [
             (req, {**req.__dict__, "kv": copy(req.kv)}) for req in request_group
         ]
@@ -595,7 +604,6 @@ class DllmScheduler:
         else:
             pass
 
-        # Reschedule the same logical request until all of its blocks finish.
         staging_rids = {r.rid for r in self.staging_queue}
         for req in adder.can_run_list:
             if req.rid not in staging_rids:
@@ -623,7 +631,7 @@ class DllmScheduler:
     def apply_results(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ) -> None:
-        # Mask-token left padding is prompt data, never generated output.
+        # note (Anmuliar): companion mask padding must not be emitted as output.
         if len(batch.reqs) > 1 and all(req.is_dllm_prefill() for req in batch.reqs):
             return
         else:
@@ -640,7 +648,6 @@ class DllmScheduler:
             if hasattr(next_token_ids, "tolist")
             else next_token_ids
         )
-        # CFG returns one token row per physical branch.
         if len(batch.reqs) == 1 and (not token_ids or isinstance(token_ids[0], int)):
             token_ids_per_req = [token_ids]
         else:

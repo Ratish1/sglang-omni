@@ -466,3 +466,36 @@ def test_abort_between_blocks_releases_cached_tokens(
     assert allocator.available_size() == 512
     assert pool.available_size() == 2
     assert req.kv.is_kv_released
+
+
+@pytest.mark.parametrize("max_new_tokens,accepted", [(128, True), (129, False)])
+def test_cfg_group_must_fit_physical_kv_pool(
+    chunked_scheduler: DllmScheduler, max_new_tokens: int, accepted: bool
+) -> None:
+    scheduler = chunked_scheduler
+    request = scheduler.waiting_queue[0]
+    scheduler.waiting_queue.clear()
+    request.sampling_params.max_new_tokens = max_new_tokens
+    request._uncond_input_ids = list(
+        request.origin_input_ids
+    )  # noqa: leading-underscore  # DLLM protocol
+    scheduler.request_builder = lambda payload: SimpleNamespace(req=request)
+    errors = []
+    scheduler.outbox = SimpleNamespace(put=errors.append)
+    scheduler.inbox.put(
+        IncomingMessage(request_id=request.rid, type="new_request", data=None)
+    )
+
+    with get_context().override_server_args(page_size=32, max_prefill_tokens=64):
+        scheduler.drain_and_purge()
+
+    if accepted:
+        assert not errors
+        assert [req.rid for req in scheduler.waiting_queue] == ["cond", "cond-uncond"]
+    else:
+        assert len(errors) == 1
+        assert errors[0].request_id == "cond" and errors[0].type == "error"
+        assert "requires 576 KV tokens" in errors[0].data
+        assert not scheduler.waiting_queue and not scheduler.rid_to_req_data
+        assert not scheduler.cond_to_unconds and not scheduler.uncond_to_cond
+    assert scheduler.token_to_kv_pool_allocator.available_size() == 512

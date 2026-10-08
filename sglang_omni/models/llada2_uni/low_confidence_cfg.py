@@ -10,11 +10,12 @@ import torch.nn.functional as F
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm, DllmRunOutput
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-def finite_cfg_value(req: object, name: str, default: float) -> float:
+def finite_cfg_value(req: Req, name: str, default: float) -> float:
     value = float(getattr(req, name, default))
     if not math.isfinite(value):
         raise ValueError(f"{name} must be finite")
@@ -26,7 +27,7 @@ def finite_cfg_value(req: object, name: str, default: float) -> float:
 class LowConfidenceCFG(DllmAlgorithm):
     """LowConfidence unmasking with per-step Classifier-Free Guidance."""
 
-    def __init__(self, config: DllmConfig):
+    def __init__(self, config: DllmConfig) -> None:
         super().__init__(config)
         if self.fdfo:
             raise ValueError("LowConfidenceCFG requires synchronous DLLM, not FDFO")
@@ -67,7 +68,7 @@ class LowConfidenceCFG(DllmAlgorithm):
         else:
             pass
         if is_cfg:
-            # Companion mask-token padding is not part of the generated suffix.
+            # note (Anmuliar): companion mask padding is outside the generated suffix.
             starts = [starts[cond_idx]] * forward_batch.batch_size
         else:
             pass
@@ -137,8 +138,7 @@ class LowConfidenceCFG(DllmAlgorithm):
                 confidence = confidence.masked_fill(~row_mask, -torch.inf)
                 top_indices = confidence.topk(num_to_transfer).indices
                 keep = (confidence > self.threshold).scatter(0, top_indices, True)
-                # Top-k is a subset of high-confidence positions whenever those
-                # already meet the quota; masking also handles a shorter suffix.
+                # note (Anmuliar): the quota may exceed the remaining masked suffix.
                 keep &= row_mask
                 row.copy_(torch.where(keep, predicted_ids, row))
                 if is_cfg:
@@ -163,7 +163,7 @@ class LowConfidenceCFG(DllmAlgorithm):
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
-        algo_states=None,
+        algo_states: None = None,
     ) -> DllmRunOutput:
         """Run synchronous CFG generation through SGLang's DLLM contract."""
         if algo_states is not None:
