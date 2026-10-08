@@ -837,9 +837,12 @@ class Qwen3OmniPreprocessor:
                     resource_connector=connector,
                     video_decode_threads=self.video_decode_threads,
                 ),
+                # note (ratish): the HF processor takes each waveform as already at the
+                # target rate, and the reference loads it through librosa's soxr filter.
                 ensure_audio_list_async(
                     request_audios,
                     target_sr=audio_target_sr,
+                    band_limited=True,
                     resource_connector=connector,
                 ),
             ]

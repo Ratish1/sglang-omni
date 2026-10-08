@@ -567,6 +567,67 @@ def test_qwen_preprocessor_passes_embedded_video_audio_to_processor(
     assert state.mm_inputs["video"].get("use_audio_in_video") is expected_video_audio
 
 
+def test_qwen_preprocessor_band_limits_request_audio(monkeypatch, tmp_path) -> None:
+    """Request audio reaches the HF processor at 16 kHz with nothing folded down from above 8 kHz."""
+    from scipy.io import wavfile
+
+    from sglang_omni.models.qwen3_omni.components import (
+        preprocessor as preprocessor_mod,
+    )
+
+    path = tmp_path / "reference.wav"
+    times = np.arange(24000) / 24000
+    wavfile.write(
+        path, 24000, (0.5 * np.sin(2 * np.pi * 10000 * times)).astype(np.float32)
+    )
+    processor_calls = []
+
+    class FakeProcessor:
+        def apply_chat_template(self, *_args, **_kwargs):
+            return "prompt"
+
+        def __call__(self, **kwargs):
+            processor_calls.append(kwargs)
+            return {
+                "input_ids": torch.tensor([[1, 2]]),
+                "attention_mask": torch.tensor([[1, 1]]),
+                "input_features": torch.ones((1, 2, 3)),
+            }
+
+    async def no_images(_value, **_kwargs):
+        return []
+
+    async def no_videos(_value, **_kwargs):
+        return [], None, None
+
+    monkeypatch.setattr(preprocessor_mod, "ensure_image_list_async", no_images)
+    monkeypatch.setattr(preprocessor_mod, "ensure_video_list_async", no_videos)
+    pre = object.__new__(preprocessor_mod.Qwen3OmniPreprocessor)
+    pre.max_seq_len = None
+    pre.default_video_fps = None
+    pre.default_video_max_frames = None
+    pre.default_video_min_pixels = None
+    pre.default_video_max_pixels = None
+    pre.default_video_total_pixels = None
+    pre.processor = FakeProcessor()
+    payload = StagePayload(
+        request_id="band-limited-audio",
+        request=OmniRequest(
+            inputs={
+                "messages": [{"role": "user", "content": "hello"}],
+                "audios": [str(path)],
+            }
+        ),
+        data={},
+    )
+
+    asyncio.run(pre.call_impl(payload))
+
+    (waveform,) = processor_calls[0]["audio"]
+    assert waveform.shape == (16000,)
+    assert np.sqrt(np.mean(np.square(waveform, dtype=np.float64))) < 0.01
+
+
 def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
     from sglang_omni.client import Client
     from sglang_omni.models.qwen3_omni.components import (
